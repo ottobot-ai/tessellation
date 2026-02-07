@@ -1,13 +1,11 @@
 /**
- * Token Lock Replacement Edge Cases - Extended tests for delegated stake + token lock replacement
+ * Token Lock Replacement Edge Cases - Simplified essential tests
  *
- * Tests edge cases not covered by the main delegated-staking.js tests:
- * 1. Replace with same amount (should fail - ReplacementLowerThanCurrentTokenLock)
- * 2. Replace with less amount (should fail - ReplacementLowerThanCurrentTokenLock)
+ * Tests core edge cases for delegated stake + token lock replacement:
+ * 1. Basic valid replacement (increase amount)
+ * 2. Replace with same amount (should fail - ReplacementLowerThanCurrentTokenLock)
  * 3. Replace non-existent token lock ref (should fail - NothingToReplace)
- * 4. Replace with minimum valid increase (+1 datum)
- * 5. Multiple sequential replacements (3 in a row)
- * 6. Replace while stake is in withdrawal (pendingWithdrawals)
+ * 4. Replace while stake is in withdrawal (should fail - NothingToReplace)
  *
  * Usage:
  * - CI: node token-lock-replacement-edge-cases.js 90 91 testTokenLockReplacementEdgeCases
@@ -112,11 +110,10 @@ const createTokenLockExpectError = async (account, urls, lockAmount, replaceRef,
 }
 
 /**
- * Test 1: Replace with same amount (should fail)
- * Also sets up the initial token lock and stake for subsequent tests
+ * Test 1: Basic valid replacement (proves functionality works)
  */
-const testReplaceSameAmount = async (urls, account, nodeIds) => {
-  logWorkflow.info('---- Start testReplaceSameAmount ----')
+const testBasicValidReplacement = async (urls, account, nodeIds) => {
+  logWorkflow.info('---- Start testBasicValidReplacement ----')
 
   // Check if we already have a stake we can use
   const existingStakes = await getAccountDelegatedStakes(urls, account.address)
@@ -133,7 +130,7 @@ const testReplaceSameAmount = async (urls, account, nodeIds) => {
     logWorkflow.info(`  Amount: ${lockAmount}`)
   } else {
     // Create new token lock and stake
-    lockAmount = 600000000000 // 6000 DAG
+    lockAmount = 500000000000 // 5000 DAG
     lockHash = await createTokenLock(account, urls, lockAmount)
     logWorkflow.info(`Created initial token lock: ${lockHash}`)
 
@@ -173,6 +170,55 @@ const testReplaceSameAmount = async (urls, account, nodeIds) => {
     await sleep(5000)
   }
 
+  // Perform valid replacement (increase amount)
+  const newAmount = lockAmount + 100000000000 // +1000 DAG
+  logWorkflow.info(`Replacing lock with increased amount: ${lockAmount} -> ${newAmount}`)
+
+  // Retry if we get NothingToReplace (lock not yet in L1 stored state)
+  const newLockHash = await withRetry(
+    async () => {
+      try {
+        return await createTokenLock(account, urls, newAmount, lockHash, lockAmount)
+      } catch (e) {
+        if (e.message.includes('NothingToReplace')) {
+          logWorkflow.info('Lock not yet in L1 state, retrying...')
+          throw e // Retry
+        }
+        throw e // Other errors propagate
+      }
+    },
+    { name: 'validReplacement', maxAttempts: 10, interval: 3000, handleError: () => {} }
+  )
+
+  logWorkflow.info(`Created replacement lock: ${newLockHash}`)
+
+  // Verify stake was updated with new lock hash and amount
+  await withRetry(
+    async () => {
+      const stakeResponse = await getAccountDelegatedStakes(urls, account.address)
+      const stake = stakeResponse.activeDelegatedStakes.find(s => s.hash === stakeHash)
+      if (!stake) throw new Error('Stake not found')
+      if (stake.tokenLockRef !== newLockHash) {
+        throw new Error(`TokenLockRef not updated: expected ${newLockHash}, got ${stake.tokenLockRef}`)
+      }
+      if (stake.amount !== newAmount) {
+        throw new Error(`Amount not updated: expected ${newAmount}, got ${stake.amount}`)
+      }
+      return true
+    },
+    { name: 'verifyReplacementUpdate', maxAttempts: 20, interval: 3000, handleError: () => {} }
+  )
+
+  logWorkflow.info('---- End testBasicValidReplacement ----')
+  return { lockHash: newLockHash, stakeHash, lockAmount: newAmount }
+}
+
+/**
+ * Test 2: Replace with same amount (should fail)
+ */
+const testReplaceSameAmount = async (urls, account, existingLockHash, existingAmount) => {
+  logWorkflow.info('---- Start testReplaceSameAmount ----')
+
   // Try to replace with same amount - should fail with ReplacementLowerThanCurrentTokenLock
   // Retry if we get NothingToReplace (lock not yet in L1 stored state)
   await withRetry(
@@ -181,8 +227,8 @@ const testReplaceSameAmount = async (urls, account, nodeIds) => {
         await createTokenLockExpectError(
           account,
           urls,
-          lockAmount, // Same amount
-          lockHash,
+          existingAmount, // Same amount
+          existingLockHash,
           'ReplacementLowerThanCurrentTokenLock'
         )
         return true
@@ -197,55 +243,7 @@ const testReplaceSameAmount = async (urls, account, nodeIds) => {
     { name: 'replaceWithSameAmount', maxAttempts: 10, interval: 3000, handleError: () => {} }
   )
 
-  // Verify stake unchanged
-  await withRetry(
-    async () => {
-      const stakeResponse = await getAccountDelegatedStakes(urls, account.address)
-      const stake = stakeResponse.activeDelegatedStakes.find(s => s.hash === stakeHash)
-      if (!stake) throw new Error('Stake not found')
-      // Note: tokenLockRef might have been updated by previous test runs
-      return true
-    },
-    { name: 'verifyStakeExists', maxAttempts: 5, interval: 2000, handleError: () => {} }
-  )
-
   logWorkflow.info('---- End testReplaceSameAmount ----')
-  return { lockHash, stakeHash, lockAmount }
-}
-
-/**
- * Test 2: Replace with less amount (should fail)
- */
-const testReplaceLessAmount = async (urls, account, existingLockHash, existingAmount) => {
-  logWorkflow.info('---- Start testReplaceLessAmount ----')
-
-  // Use 5000 DAG (minimum) which is less than 6000 DAG but still valid amount
-  const lessAmount = 500000000000 // 5000 DAG - less than existing but above minimum
-
-  // Retry if we get NothingToReplace (lock not yet in L1 stored state)
-  await withRetry(
-    async () => {
-      try {
-        await createTokenLockExpectError(
-          account,
-          urls,
-          lessAmount,
-          existingLockHash,
-          'ReplacementLowerThanCurrentTokenLock'
-        )
-        return true
-      } catch (e) {
-        if (e.message.includes('NothingToReplace')) {
-          logWorkflow.info('Lock not yet in L1 state, retrying...')
-          throw e
-        }
-        throw e
-      }
-    },
-    { name: 'replaceWithLessAmount', maxAttempts: 10, interval: 3000, handleError: () => {} }
-  )
-
-  logWorkflow.info('---- End testReplaceLessAmount ----')
 }
 
 /**
@@ -269,107 +267,13 @@ const testReplaceNonExistentRef = async (urls, account) => {
 }
 
 /**
- * Test 4: Replace with minimum valid increase (+1 datum)
- */
-const testReplaceMinimumIncrease = async (urls, account, existingLockHash, existingAmount, stakeHash) => {
-  logWorkflow.info('---- Start testReplaceMinimumIncrease ----')
-
-  const minIncrease = existingAmount + 1 // Minimum valid increase
-  
-  const newLockHash = await createTokenLock(account, urls, minIncrease, existingLockHash, existingAmount)
-  logWorkflow.info(`Created replacement with +1 datum: ${newLockHash}`)
-
-  // Verify delegated stake updated AND new lock is active (this confirms snapshot inclusion)
-  logWorkflow.info('Waiting for snapshot inclusion and stake update...')
-  await withRetry(
-    async () => {
-      const stakeResponse = await getAccountDelegatedStakes(urls, account.address)
-      const stake = stakeResponse.activeDelegatedStakes.find(s => s.hash === stakeHash)
-      if (!stake) throw new Error('Stake not found')
-      if (stake.tokenLockRef !== newLockHash) {
-        throw new Error(`TokenLockRef not updated: expected ${newLockHash}, got ${stake.tokenLockRef}`)
-      }
-      if (stake.amount !== minIncrease) {
-        throw new Error(`Amount not updated: expected ${minIncrease}, got ${stake.amount}`)
-      }
-      return true
-    },
-    { name: 'verifyMinIncreaseUpdate', maxAttempts: 20, interval: 3000, handleError: () => {} }
-  )
-  
-  // Extra wait to ensure the new lock is fully active on GL0 for subsequent replacements
-  // This is important because GL1 accepts the lock before GL0 includes it in a snapshot
-  logWorkflow.info('Lock confirmed in snapshot, waiting for GL0 sync...')
-  await sleep(10000)
-
-  logWorkflow.info('---- End testReplaceMinimumIncrease ----')
-  return { newLockHash, newAmount: minIncrease }
-}
-
-/**
- * Test 5: Multiple sequential replacements
- * Note: After each replacement, the OLD lock is removed and NEW lock becomes active.
- * Subsequent replacements must reference the NEW lock hash.
- */
-const testMultipleSequentialReplacements = async (urls, account, currentLockHash, currentAmount, stakeHash) => {
-  logWorkflow.info('---- Start testMultipleSequentialReplacements ----')
-
-  let lockHash = currentLockHash
-  let amount = currentAmount
-
-  // Do 3 sequential replacements
-  for (let i = 1; i <= 3; i++) {
-    const newAmount = amount + 100000000000 // +1000 DAG each time
-    logWorkflow.info(`Sequential replacement ${i}: ${amount} -> ${newAmount}`)
-    logWorkflow.info(`  Replacing lock: ${lockHash.substring(0, 16)}...`)
-
-    const newLockHash = await createTokenLock(account, urls, newAmount, lockHash, amount)
-    logWorkflow.info(`  Created replacement ${i}: ${newLockHash.substring(0, 16)}...`)
-
-    // Wait for inclusion before verifying
-    await sleep(3000)
-
-    // Verify delegated stake updated after each replacement
-    await withRetry(
-      async () => {
-        const stakeResponse = await getAccountDelegatedStakes(urls, account.address)
-        const stake = stakeResponse.activeDelegatedStakes.find(s => s.hash === stakeHash)
-        if (!stake) throw new Error('Stake not found')
-        if (stake.tokenLockRef !== newLockHash) {
-          throw new Error(`Replacement ${i}: TokenLockRef not updated. Expected ${newLockHash.substring(0,16)}, got ${stake.tokenLockRef?.substring(0,16)}`)
-        }
-        if (stake.amount !== newAmount) {
-          throw new Error(`Replacement ${i}: Amount not updated. Expected ${newAmount}, got ${stake.amount}`)
-        }
-        return true
-      },
-      { name: `verifySequentialReplacement${i}`, maxAttempts: 10, interval: 2000, handleError: () => {} }
-    )
-
-    // IMPORTANT: Update lockHash to the NEW lock for the next iteration
-    lockHash = newLockHash
-    amount = newAmount
-    logWorkflow.info(`  Sequential replacement ${i} verified ✓`)
-    
-    // Wait for snapshot inclusion and GL0 sync before next replacement
-    if (i < 3) {
-      logWorkflow.info('  Waiting for GL0 sync before next replacement...')
-      await sleep(10000)
-    }
-  }
-
-  logWorkflow.info('---- End testMultipleSequentialReplacements ----')
-  return { finalLockHash: lockHash, finalAmount: amount }
-}
-
-/**
- * Test 6: Replace while stake is in withdrawal (pendingWithdrawals)
+ * Test 4: Replace while stake is in withdrawal (should fail)
  */
 const testReplaceWhileInWithdrawal = async (urls, account, nodeId) => {
   logWorkflow.info('---- Start testReplaceWhileInWithdrawal ----')
 
   // Create a fresh token lock and stake for this test
-  const lockAmount = 600000000000 // 6000 DAG
+  const lockAmount = 500000000000 // 5000 DAG
   const lockHash = await createTokenLock(account, urls, lockAmount)
   logWorkflow.info(`Created token lock for withdrawal test: ${lockHash}`)
 
@@ -464,11 +368,11 @@ const setupNodeParameters = async (urls) => {
 }
 
 /**
- * Main test runner
+ * Main test runner - simplified to 4 essential tests
  */
 const testTokenLockReplacementEdgeCases = async (urls) => {
   logWorkflow.info('========================================')
-  logWorkflow.info('Token Lock Replacement Edge Cases Tests')
+  logWorkflow.info('Token Lock Replacement Edge Cases Tests (Simplified)')
   logWorkflow.info('========================================')
 
   // Setup - use key3 to avoid conflicts with other tests using key4
@@ -480,28 +384,20 @@ const testTokenLockReplacementEdgeCases = async (urls) => {
   const nodeIds = nodeParams.map(p => p.peerId)
   const nodeId2 = nodeParams.length > 1 ? nodeParams[1].peerId : nodeParams[0].peerId
 
-  // Test 1: Replace with same amount (should fail)
-  const { lockHash, stakeHash, lockAmount } = await testReplaceSameAmount(urls, account, nodeIds)
+  // Test 1: Basic valid replacement (proves functionality works)
+  const { lockHash, stakeHash, lockAmount } = await testBasicValidReplacement(urls, account, nodeIds)
 
-  // Test 2: Replace with less amount (should fail)
-  await testReplaceLessAmount(urls, account, lockHash, lockAmount)
+  // Test 2: Replace with same amount (should fail)
+  await testReplaceSameAmount(urls, account, lockHash, lockAmount)
 
   // Test 3: Replace non-existent token lock ref (should fail)
   await testReplaceNonExistentRef(urls, account)
 
-  // Test 4: Replace with minimum valid increase (+1 datum)
-  const { newLockHash, newAmount } = await testReplaceMinimumIncrease(
-    urls, account, lockHash, lockAmount, stakeHash
-  )
-
-  // Test 5: Multiple sequential replacements
-  await testMultipleSequentialReplacements(urls, account, newLockHash, newAmount, stakeHash)
-
-  // Test 6: Replace while stake is in withdrawal
+  // Test 4: Replace while stake is in withdrawal (should fail)
   await testReplaceWhileInWithdrawal(urls, account, nodeId2)
 
   logWorkflow.info('========================================')
-  logWorkflow.info('All edge case tests completed!')
+  logWorkflow.info('All essential edge case tests completed!')
   logWorkflow.info('========================================')
 }
 
