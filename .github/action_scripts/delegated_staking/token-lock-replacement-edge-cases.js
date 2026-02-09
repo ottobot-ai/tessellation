@@ -30,6 +30,7 @@ const {
   PRIVATE_KEYS,
   sleep,
   withRetry,
+  withRetryOrdinal,
   createNetworkConfig,
   logWorkflow,
 } = require('../shared')
@@ -48,6 +49,9 @@ const {
   createTokenLock,
   assertBalanceChange,
   getNodeParams,
+  waitForStakeInclusion,
+  waitForStakeWithdrawal,
+  waitForTokenLockInclusion,
 } = require('./lib')
 
 const throwUsage = () => {
@@ -163,26 +167,15 @@ const testReplaceSameAmount = async (urls, account, nodeIds) => {
       throw new Error('Could not create stake on any node')
     }
 
-    // Wait for stake to be included in global snapshot (required for replacement validation)
+    // Wait for stake to be included using ordinal-aware retry (detects dropped txs)
     logWorkflow.info('Waiting for stake inclusion in global snapshot...')
-    await withRetry(
-      async () => {
-        const stakeResponse = await getAccountDelegatedStakes(urls, account.address)
-        const stake = stakeResponse.activeDelegatedStakes.find(s => s.hash === stakeHash)
-        if (!stake) throw new Error('Stake not yet in global snapshot')
-        logWorkflow.info(`Stake confirmed in snapshot: ${stake.hash.substring(0, 16)}...`)
-        return true
-      },
-      { name: 'waitForStakeInclusion', maxAttempts: 15, interval: 2000, handleError: () => {} }
-    )
-    
-    // Additional wait for L1 state propagation
-    await sleep(5000)
+    const stake = await waitForStakeInclusion(urls, account.address, stakeHash)
+    logWorkflow.info(`Stake confirmed in snapshot: ${stake.hash.substring(0, 16)}...`)
   }
 
   // Try to replace with same amount - should fail with ReplacementLowerThanCurrentTokenLock
-  // Retry if we get NothingToReplace (lock not yet in L1 stored state)
-  await withRetry(
+  // Use ordinal-aware retry to handle L1 state propagation
+  await withRetryOrdinal(
     async () => {
       try {
         await createTokenLockExpectError(
@@ -195,25 +188,24 @@ const testReplaceSameAmount = async (urls, account, nodeIds) => {
         return true
       } catch (e) {
         if (e.message.includes('NothingToReplace')) {
-          logWorkflow.info('Lock not yet in L1 state, retrying...')
-          throw e // Retry
+          logWorkflow.info('Lock not yet in L1 state, waiting for ordinal progression...')
+          throw e // Retry after ordinal check
         }
         throw e // Other errors propagate
       }
     },
-    { name: 'replaceWithSameAmount', maxAttempts: 10, interval: 3000, handleError: () => {} }
+    { globalL0Url: urls.globalL0Url, name: 'replaceWithSameAmount', maxOrdinalMisses: 5 }
   )
 
-  // Verify stake unchanged
-  await withRetry(
+  // Verify stake unchanged using ordinal-aware retry
+  await withRetryOrdinal(
     async () => {
       const stakeResponse = await getAccountDelegatedStakes(urls, account.address)
       const stake = stakeResponse.activeDelegatedStakes.find(s => s.hash === stakeHash)
       if (!stake) throw new Error('Stake not found')
-      // Note: tokenLockRef might have been updated by previous test runs
       return true
     },
-    { name: 'verifyStakeExists', maxAttempts: 5, interval: 2000, handleError: () => {} }
+    { globalL0Url: urls.globalL0Url, name: 'verifyStakeExists', maxOrdinalMisses: 3 }
   )
 
   logWorkflow.info('---- End testReplaceSameAmount ----')
@@ -229,8 +221,8 @@ const testReplaceLessAmount = async (urls, account, existingLockHash, existingAm
   // Use 5000 DAG (minimum) which is less than 6000 DAG but still valid amount
   const lessAmount = 500000000000 // 5000 DAG - less than existing but above minimum
 
-  // Retry if we get NothingToReplace (lock not yet in L1 stored state)
-  await withRetry(
+  // Use ordinal-aware retry to handle L1 state propagation
+  await withRetryOrdinal(
     async () => {
       try {
         await createTokenLockExpectError(
@@ -243,13 +235,13 @@ const testReplaceLessAmount = async (urls, account, existingLockHash, existingAm
         return true
       } catch (e) {
         if (e.message.includes('NothingToReplace')) {
-          logWorkflow.info('Lock not yet in L1 state, retrying...')
+          logWorkflow.info('Lock not yet in L1 state, waiting for ordinal progression...')
           throw e
         }
         throw e
       }
     },
-    { name: 'replaceWithLessAmount', maxAttempts: 10, interval: 3000, handleError: () => {} }
+    { globalL0Url: urls.globalL0Url, name: 'replaceWithLessAmount', maxOrdinalMisses: 5 }
   )
 
   logWorkflow.info('---- End testReplaceLessAmount ----')
@@ -286,9 +278,9 @@ const testReplaceMinimumIncrease = async (urls, account, existingLockHash, exist
   const newLockHash = await createTokenLock(account, urls, minIncrease, existingLockHash, existingAmount)
   logWorkflow.info(`Created replacement with +1 datum: ${newLockHash}`)
 
-  // Verify delegated stake updated AND new lock is active (this confirms snapshot inclusion)
+  // Verify delegated stake updated using ordinal-aware retry
   logWorkflow.info('Waiting for snapshot inclusion and stake update...')
-  await withRetry(
+  await withRetryOrdinal(
     async () => {
       const stakeResponse = await getAccountDelegatedStakes(urls, account.address)
       const stake = stakeResponse.activeDelegatedStakes.find(s => s.hash === stakeHash)
@@ -301,13 +293,12 @@ const testReplaceMinimumIncrease = async (urls, account, existingLockHash, exist
       }
       return true
     },
-    { name: 'verifyMinIncreaseUpdate', maxAttempts: 20, interval: 3000, handleError: () => {} }
+    { globalL0Url: urls.globalL0Url, name: 'verifyMinIncreaseUpdate', maxOrdinalMisses: 5, maxStalledChecks: 15 }
   )
   
-  // Extra wait to ensure the new lock is fully active on GL0 for subsequent replacements
-  // This is important because GL1 accepts the lock before GL0 includes it in a snapshot
+  // Brief wait for L1 sync after ordinal progression confirmed
   logWorkflow.info('Lock confirmed in snapshot, waiting for GL0 sync...')
-  await sleep(10000)
+  await sleep(5000)
 
   logWorkflow.info('---- End testReplaceMinimumIncrease ----')
   return { newLockHash, newAmount: minIncrease }
@@ -333,11 +324,8 @@ const testMultipleSequentialReplacements = async (urls, account, currentLockHash
     const newLockHash = await createTokenLock(account, urls, newAmount, lockHash, amount)
     logWorkflow.info(`  Created replacement ${i}: ${newLockHash.substring(0, 16)}...`)
 
-    // Wait for inclusion before verifying
-    await sleep(3000)
-
-    // Verify delegated stake updated after each replacement
-    await withRetry(
+    // Verify delegated stake updated using ordinal-aware retry
+    await withRetryOrdinal(
       async () => {
         const stakeResponse = await getAccountDelegatedStakes(urls, account.address)
         const stake = stakeResponse.activeDelegatedStakes.find(s => s.hash === stakeHash)
@@ -350,7 +338,7 @@ const testMultipleSequentialReplacements = async (urls, account, currentLockHash
         }
         return true
       },
-      { name: `verifySequentialReplacement${i}`, maxAttempts: 10, interval: 2000, handleError: () => {} }
+      { globalL0Url: urls.globalL0Url, name: `verifySequentialReplacement${i}`, maxOrdinalMisses: 5 }
     )
 
     // IMPORTANT: Update lockHash to the NEW lock for the next iteration
@@ -358,10 +346,10 @@ const testMultipleSequentialReplacements = async (urls, account, currentLockHash
     amount = newAmount
     logWorkflow.info(`  Sequential replacement ${i} verified ✓`)
     
-    // Wait for snapshot inclusion and GL0 sync before next replacement
+    // Brief wait for L1 sync before next replacement
     if (i < 3) {
       logWorkflow.info('  Waiting for GL0 sync before next replacement...')
-      await sleep(10000)
+      await sleep(5000)
     }
   }
 
@@ -383,39 +371,22 @@ const testReplaceWhileInWithdrawal = async (urls, account, nodeId) => {
   const stakeHash = await createDelegatedStake(account, lockHash, lockAmount, nodeId)
   logWorkflow.info(`Created delegated stake: ${stakeHash}`)
 
-  // Wait for stake to be included in global snapshot before withdrawing
-  // (Using withRetry instead of fixed sleep to handle variable snapshot timing)
+  // Wait for stake to be included using ordinal-aware retry
   logWorkflow.info('Waiting for stake inclusion in global snapshot...')
-  await withRetry(
-    async () => {
-      const stakeResponse = await getAccountDelegatedStakes(urls, account.address)
-      const stake = stakeResponse.activeDelegatedStakes.find(s => s.hash === stakeHash)
-      if (!stake) throw new Error('Stake not yet in activeDelegatedStakes')
-      logWorkflow.info(`Stake confirmed in snapshot: ${stake.hash.substring(0, 16)}...`)
-      return true
-    },
-    { name: 'waitForStakeBeforeWithdraw', maxAttempts: 15, interval: 2000, handleError: () => {} }
-  )
+  const stake = await waitForStakeInclusion(urls, account.address, stakeHash)
+  logWorkflow.info(`Stake confirmed in snapshot: ${stake.hash.substring(0, 16)}...`)
 
   // Initiate withdrawal
   await withdrawDelegatedStake(account, stakeHash)
   logWorkflow.info('Initiated stake withdrawal')
 
-  // Verify stake is in pendingWithdrawals
-  await withRetry(
-    async () => {
-      const stakeResponse = await getAccountDelegatedStakes(urls, account.address)
-      const pending = stakeResponse.pendingWithdrawals.find(s => s.hash === stakeHash)
-      if (!pending) throw new Error('Stake not in pendingWithdrawals')
-      logWorkflow.info('Stake confirmed in pendingWithdrawals')
-      return true
-    },
-    { name: 'verifyPendingWithdrawal', maxAttempts: 10, interval: 2000, handleError: () => {} }
-  )
+  // Wait for stake to move to pendingWithdrawals using ordinal-aware retry
+  const pending = await waitForStakeWithdrawal(urls, account.address, stakeHash)
+  logWorkflow.info('Stake confirmed in pendingWithdrawals')
 
-  // Wait for DAG L1 to sync state from GL0 after withdrawal
+  // Wait for L1 state sync (ordinal-aware retry ensures GL0 has progressed)
   logWorkflow.info('Waiting for L1 state sync after withdrawal...')
-  await sleep(5000)
+  await sleep(3000) // Reduced from 5s since ordinal-aware retry already waited for GL0
 
   // Token locks remain in activeTokenLocks during the withdrawal period.
   // They are only removed when withdrawal completes. Therefore, replacement
