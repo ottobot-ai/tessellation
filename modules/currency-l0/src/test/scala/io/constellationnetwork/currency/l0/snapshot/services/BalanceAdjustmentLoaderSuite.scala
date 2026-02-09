@@ -18,12 +18,24 @@ import weaver.scalacheck.Checkers
 
 object BalanceAdjustmentLoaderSuite extends SimpleIOSuite with Checkers {
 
+  // Non-empty alphanumeric string generator that doesn't use filter (avoids discards)
+  val nonEmptyAlphaNumStr: Gen[String] = for {
+    head <- Gen.alphaNumChar
+    tail <- Gen.alphaNumStr
+  } yield s"$head$tail"
+
+  // Non-empty list of non-empty strings with proper composition (no .sample anti-pattern)
+  def nonEmptyStringList(minSize: Int, maxSize: Int): Gen[List[String]] = for {
+    size <- Gen.chooseNum(minSize, maxSize)
+    list <- Gen.listOfN(size, nonEmptyAlphaNumStr)
+  } yield list
+
   // Generator for JsonAdjustment
   val jsonAdjustmentIncreaseGen: Gen[BalanceAdjustmentLoader.JsonAdjustment] = for {
     address <- addressGen
     amount <- Gen.chooseNum(1L, 1000000L)
-    reason <- Gen.alphaNumStr.filter(_.nonEmpty)
-    reference <- Gen.listOfN(Gen.chooseNum(1, 3).sample.getOrElse(1), Gen.alphaNumStr.filter(_.nonEmpty))
+    reason <- nonEmptyAlphaNumStr
+    reference <- nonEmptyStringList(1, 3)
   } yield
     BalanceAdjustmentLoader.JsonAdjustment(
       address = address,
@@ -36,8 +48,8 @@ object BalanceAdjustmentLoaderSuite extends SimpleIOSuite with Checkers {
   val jsonAdjustmentDecreaseGen: Gen[BalanceAdjustmentLoader.JsonAdjustment] = for {
     address <- addressGen
     amount <- Gen.chooseNum(1L, 1000000L)
-    reason <- Gen.alphaNumStr.filter(_.nonEmpty)
-    reference <- Gen.listOfN(Gen.chooseNum(1, 3).sample.getOrElse(1), Gen.alphaNumStr.filter(_.nonEmpty))
+    reason <- nonEmptyAlphaNumStr
+    reference <- nonEmptyStringList(1, 3)
   } yield
     BalanceAdjustmentLoader.JsonAdjustment(
       address = address,
@@ -69,8 +81,8 @@ object BalanceAdjustmentLoaderSuite extends SimpleIOSuite with Checkers {
     address <- addressGen
     deductAmount <- Gen.chooseNum(1L, 1000000L)
     increaseAmount <- Gen.chooseNum(1L, 1000000L)
-    reason <- Gen.alphaNumStr.filter(_.nonEmpty)
-    reference <- Gen.listOfN(1, Gen.alphaNumStr.filter(_.nonEmpty))
+    reason <- nonEmptyAlphaNumStr
+    reference <- nonEmptyStringList(1, 1)
   } yield
     BalanceAdjustmentLoader.JsonAdjustment(
       address = address,
@@ -83,8 +95,8 @@ object BalanceAdjustmentLoaderSuite extends SimpleIOSuite with Checkers {
   // Generator for invalid JsonAdjustment (neither deduct nor increase)
   val invalidJsonAdjustmentNeitherGen: Gen[BalanceAdjustmentLoader.JsonAdjustment] = for {
     address <- addressGen
-    reason <- Gen.alphaNumStr.filter(_.nonEmpty)
-    reference <- Gen.listOfN(1, Gen.alphaNumStr.filter(_.nonEmpty))
+    reason <- nonEmptyAlphaNumStr
+    reference <- nonEmptyStringList(1, 1)
   } yield
     BalanceAdjustmentLoader.JsonAdjustment(
       address = address,
