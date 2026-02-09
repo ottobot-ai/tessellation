@@ -174,7 +174,7 @@ jobs:
         run: |
           RELEASE_TAG="${{ needs.build.outputs.release_tag }}"
           echo "Publishing with tag: $RELEASE_TAG"
-          sbt tessellation-ci-release
+          sbt ci-release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PGP_PASSPHRASE: ${{ secrets.PGP_PASSPHRASE }}
