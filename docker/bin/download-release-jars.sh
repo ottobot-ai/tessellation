@@ -70,7 +70,7 @@ for release_name in "${!JAR_MAP[@]}"; do
         exit 1
     fi
     
-    actual_checksum=$(sha256sum "$dest" | awk '{print $1}')
+    actual_checksum=$( (shasum -a 256 "$dest" 2>/dev/null || sha256sum "$dest") | awk '{print $1}')
     
     if [ "$expected_checksum" != "$actual_checksum" ]; then
         echo "Error: Checksum verification failed for ${local_name}!"

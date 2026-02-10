@@ -75,7 +75,7 @@ if [ "$SKIP_HYPERGRAPH_BUILD" != "true" ]; then
   do
     path=$(ls -1t modules/${module}/target/scala-2.13/tessellation-${module}-assembly*.jar | head -n1)
     dest="$PROJECT_ROOT/docker/jars/${module}.jar"
-    cp $path $dest
+    cp "$path" "$dest"
   done
 
   mv ./docker/jars/dag-l0.jar ./docker/jars/gl0.jar
@@ -110,7 +110,7 @@ move_metagraph_jar() {
   local destination=$2
   path=$(ls -1t modules/${module}/target/scala-2.13/*-assembly*.jar | head -n1)
   dest="$PROJECT_ROOT/docker/jars/${destination}.jar"
-  cp $path $dest
+  cp "$path" "$dest"
 }
 
 
