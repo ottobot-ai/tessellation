@@ -40,11 +40,16 @@ ThisBuild / version := {
     val buildId = sys.env.getOrElse("GITHUB_RUN_NUMBER", "local")
     
     dynverOutput match {
+      case Some(out) if out.hasNoTags =>
+        // Repository has no version tags - use fallback
+        val sha = out.commitSuffix.sha
+        s"0.0.0+notags.$sha.$buildId"
+        
       case Some(out) =>
         val baseVersion = out.ref.dropPrefix
         val distance = out.commitSuffix.distance
         val sha = out.commitSuffix.sha
-        val isDirty = out.hasNoTags || out.isDirty()
+        val isDirty = out.isDirty()
         
         if (distance == 0 && !isDirty) {
           // Exactly on a tag with clean working directory
