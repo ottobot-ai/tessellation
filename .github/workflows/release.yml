@@ -188,4 +188,3 @@ jobs:
           PGP_SECRET: ${{ secrets.PGP_SECRET }}
           SONATYPE_PASSWORD: ${{ secrets.MVN_PASSWORD }}
           SONATYPE_USERNAME: ${{ secrets.MVN_USERNAME }}
-          RELEASE_TAG: ${{ needs.build.outputs.release_tag }}

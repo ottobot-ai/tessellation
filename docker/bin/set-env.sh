@@ -46,13 +46,25 @@ export USE_TEST_METAGRAPH=${USE_TEST_METAGRAPH:-false}
 
 
 # Explicitly set TESSELLATION_VERSION based on the project's version
+# Priority: 1) Already set, 2) RELEASE_TAG env var, 3) sbt version (dynver), 4) fallback
 if [ -z "${TESSELLATION_VERSION:-}" ]; then
     if [ -n "$RELEASE_TAG" ]; then
         export TESSELLATION_VERSION="${RELEASE_TAG#v}"
+        echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (from RELEASE_TAG)"
+    elif command -v sbt &> /dev/null && [ -f "build.sbt" ]; then
+        # Get version from sbt (uses dynver for git-based versioning)
+        SBT_VERSION=$(sbt -error "print version" 2>/dev/null | tail -1)
+        if [ -n "$SBT_VERSION" ] && [ "$SBT_VERSION" != "" ]; then
+            export TESSELLATION_VERSION="$SBT_VERSION"
+            echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (from sbt/dynver)"
+        else
+            export TESSELLATION_VERSION="99.99.99-SNAPSHOT"
+            echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (fallback - sbt version failed)"
+        fi
     else
         export TESSELLATION_VERSION="99.99.99-SNAPSHOT"
+        echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (fallback - sbt not available)"
     fi
-    echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION"
 fi
 
 
