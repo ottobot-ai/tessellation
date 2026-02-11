@@ -53,8 +53,9 @@ if [ -z "${TESSELLATION_VERSION:-}" ]; then
         echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (from RELEASE_TAG)"
     elif command -v sbt &> /dev/null && [ -f "build.sbt" ]; then
         # Get version from sbt (uses dynver for git-based versioning)
-        SBT_VERSION=$(sbt -error "print version" 2>/dev/null | tail -1)
-        if [ -n "$SBT_VERSION" ] && [ "$SBT_VERSION" != "" ]; then
+        # Use -Dsbt.log.noformat=true for clean output, with fallback on failure
+        SBT_VERSION=$(sbt -Dsbt.log.noformat=true "print version" 2>/dev/null | grep -v "^\[" | tail -1 || echo "")
+        if [ -n "$SBT_VERSION" ]; then
             export TESSELLATION_VERSION="$SBT_VERSION"
             echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (from sbt/dynver)"
         else
