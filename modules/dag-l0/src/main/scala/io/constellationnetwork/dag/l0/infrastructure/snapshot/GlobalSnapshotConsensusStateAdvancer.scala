@@ -432,20 +432,25 @@ object GlobalSnapshotConsensusStateAdvancer {
     private def recordProposalAffinity(allHashes: List[Hash], ownHash: Hash): F[Unit] =
       Metrics[F].recordDistribution("dag_consensus_proposal_affinity", proposalAffinity(allHashes, ownHash))
 
-    private def logInvalidSignatures(key: GlobalSnapshotKey, total: Int, valid: Int): F[Unit] =
-      logger
-        .warn(s"Removed ${total - valid} invalid signatures for key=${key.show}, $valid valid remaining")
-        .whenA(total != valid)
+    private def logInvalidSignatures(key: GlobalSnapshotKey, total: Int, valid: Int): F[Unit] = {
+      val invalidCount = total - valid
+      Metrics[F].incrementCounterBy("dag_signature_invalid_total", invalidCount).whenA(invalidCount > 0) >>
+        logger
+          .warn(s"Removed $invalidCount invalid signatures for key=${key.show}, $valid valid remaining")
+          .whenA(invalidCount > 0)
+    }
 
     private def recordMetrics(signed: Signed[GlobalIncrementalSnapshot]): F[Unit] = {
       val activeTips = signed.tips.remainedActive.size + signed.blocks.size
       val deprecatedTips = signed.tips.deprecated.size
       val txCount = signed.blocks.toList.map(_.block.transactions.size).sum
       val scCount = signed.stateChannelSnapshots.values.map(_.size).sum
+      val nowMillis = System.currentTimeMillis()
 
       Metrics[F].updateGauge("dag_global_snapshot_ordinal", signed.ordinal.value) >>
         Metrics[F].updateGauge("dag_global_snapshot_height", signed.height.value) >>
         Metrics[F].updateGauge("dag_global_snapshot_signature_count", signed.proofs.size) >>
+        Metrics[F].updateGauge("dag_global_snapshot_timestamp", nowMillis) >>
         Metrics[F].updateGauge("dag_global_snapshot_tips_count", deprecatedTips, Seq(("tip_type", "deprecated"))) >>
         Metrics[F].updateGauge("dag_global_snapshot_tips_count", activeTips, Seq(("tip_type", "active"))) >>
         Metrics[F].incrementCounterBy("dag_global_snapshot_blocks_total", signed.blocks.size) >>

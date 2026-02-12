@@ -474,8 +474,21 @@ object CurrencySnapshotConsensusStateAdvancer {
           state.lastOutcome.facilitators.value,
           context
         ) >>
+          recordMetrics(signedArtifact) >>
           gossipForkInfo(gossip, signedArtifact) >>
           notifyDataApplication(signedArtifact)
+
+      private def recordMetrics(signed: Signed[CurrencySnapshotArtifact]): F[Unit] = {
+        val txCount = signed.blocks.toList.map(_.block.transactions.size).sum
+        val nowMillis = System.currentTimeMillis()
+
+        Metrics[F].updateGauge("dag_currency_snapshot_ordinal", signed.ordinal.value) >>
+          Metrics[F].updateGauge("dag_currency_snapshot_height", signed.height.value) >>
+          Metrics[F].updateGauge("dag_currency_snapshot_signature_count", signed.proofs.size) >>
+          Metrics[F].updateGauge("dag_currency_snapshot_timestamp", nowMillis) >>
+          Metrics[F].incrementCounterBy("dag_currency_snapshot_blocks_total", signed.blocks.size) >>
+          Metrics[F].incrementCounterBy("dag_currency_snapshot_transactions_total", txCount)
+      }
 
       private def notifyDataApplication(signedArtifact: Signed[CurrencySnapshotArtifact]): F[Unit] =
         maybeDataApplication.traverse_ { da =>
@@ -500,14 +513,20 @@ object CurrencySnapshotConsensusStateAdvancer {
       private def recordProposalAffinity(allHashes: List[Hash], ownHash: Hash): F[Unit] =
         Metrics[F].recordDistribution("dag_consensus_proposal_affinity", proposalAffinity(allHashes, ownHash))
 
-      private def logInvalidSignatures(key: CurrencySnapshotKey, total: Int, valid: Int): F[Unit] =
-        logger
-          .warn(s"Removed ${total - valid} invalid signatures for key=${key.show}, $valid valid remaining")
-          .whenA(total != valid)
+      private def logInvalidSignatures(key: CurrencySnapshotKey, total: Int, valid: Int): F[Unit] = {
+        val invalidCount = total - valid
+        Metrics[F].incrementCounterBy("dag_signature_invalid_total", invalidCount).whenA(invalidCount > 0) >>
+          logger
+            .warn(s"Removed $invalidCount invalid signatures for key=${key.show}, $valid valid remaining")
+            .whenA(invalidCount > 0)
+      }
 
-      private def logInvalidBinarySignatures(key: CurrencySnapshotKey, total: Int, valid: Int): F[Unit] =
-        logger
-          .warn(s"Removed ${total - valid} invalid binary signatures for key=${key.show}, $valid valid remaining")
-          .whenA(total != valid)
+      private def logInvalidBinarySignatures(key: CurrencySnapshotKey, total: Int, valid: Int): F[Unit] = {
+        val invalidCount = total - valid
+        Metrics[F].incrementCounterBy("dag_binary_signature_invalid_total", invalidCount).whenA(invalidCount > 0) >>
+          logger
+            .warn(s"Removed $invalidCount invalid binary signatures for key=${key.show}, $valid valid remaining")
+            .whenA(invalidCount > 0)
+      }
     }
 }
