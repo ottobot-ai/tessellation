@@ -216,7 +216,9 @@ We use the upstream [sbt-ci-release](https://github.com/sbt/sbt-ci-release) plug
 - Handles GPG setup for signing
 - Manages Sonatype Central publishing (supported since v1.11.0)
 - Validates version is releasable before publish
-- Brings sbt-dynver, sbt-pgp, sbt-git, and sbt-sonatype as dependencies
+- Brings sbt-dynver, sbt-pgp, and sbt-git as transitive dependencies
+
+Note: sbt-sonatype is declared explicitly in `project/plugins.sbt` (not transitive from sbt-ci-release).
 
 The CI release command is `ci-release` (standard sbt-ci-release command).
 

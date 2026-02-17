@@ -46,25 +46,27 @@ export USE_TEST_METAGRAPH=${USE_TEST_METAGRAPH:-false}
 
 
 # Explicitly set TESSELLATION_VERSION based on the project's version
-# Priority: 1) Already set, 2) RELEASE_TAG env var, 3) sbt version (dynver), 4) fallback
+# Priority: 1) Already set, 2) RELEASE_TAG env var, 3) git describe, 4) fallback
 if [ -z "${TESSELLATION_VERSION:-}" ]; then
     if [ -n "$RELEASE_TAG" ]; then
         export TESSELLATION_VERSION="${RELEASE_TAG#v}"
         echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (from RELEASE_TAG)"
-    elif command -v sbt &> /dev/null && [ -f "build.sbt" ]; then
-        # Get version from sbt (uses dynver for git-based versioning)
-        # Use -Dsbt.log.noformat=true for clean output, with fallback on failure
-        SBT_VERSION=$(sbt -Dsbt.log.noformat=true "print version" 2>/dev/null | grep -v "^\[" | tail -1 || echo "")
-        if [ -n "$SBT_VERSION" ]; then
-            export TESSELLATION_VERSION="$SBT_VERSION"
-            echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (from sbt/dynver)"
+    elif command -v git &> /dev/null && git rev-parse --git-dir &> /dev/null; then
+        # Get version from git describe (fast, matches dynver format)
+        # Output: v4.1.0 (on tag) or v4.1.0-3-gabc1234 (3 commits after tag)
+        GIT_DESC=$(git describe --tags --abbrev=7 2>/dev/null || echo "")
+        if [ -n "$GIT_DESC" ]; then
+            # Strip leading 'v' and convert to dynver-like format
+            # v4.1.0-3-gabc1234 -> 4.1.0+3.abc1234
+            export TESSELLATION_VERSION=$(echo "$GIT_DESC" | sed 's/^v//; s/-\([0-9]*\)-g\([a-f0-9]*\)$/+\1.\2/')
+            echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (from git describe)"
         else
             export TESSELLATION_VERSION="99.99.99-SNAPSHOT"
-            echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (fallback - sbt version failed)"
+            echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (fallback - no git tags)"
         fi
     else
         export TESSELLATION_VERSION="99.99.99-SNAPSHOT"
-        echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (fallback - sbt not available)"
+        echo "Setting TESSELLATION_VERSION=$TESSELLATION_VERSION (fallback - git not available)"
     fi
 fi
 
