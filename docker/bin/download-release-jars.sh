@@ -5,7 +5,7 @@
 # Example: ./download-release-jars.sh v3.5.11 ./docker/jars
 #
 
-set -e
+set -eo pipefail
 
 RELEASE_TAG="${1:-}"
 OUTPUT_DIR="${2:-./docker/jars}"

@@ -7,6 +7,9 @@ export DATA_ONLY_METAGRAPH=${DATA_ONLY_METAGRAPH:-false}
 # When set, downloads pre-built JARs from GitHub releases instead of building from source
 export HYPERGRAPH_RELEASE=${HYPERGRAPH_RELEASE:-""}
 
+# Release tag (set via --version flag or RELEASE_TAG env var)
+export RELEASE_TAG=${RELEASE_TAG:-""}
+
 export EXTRA_ENV_PATH=${EXTRA_ENV_PATH:-""}
 export EXIT_CODE=${EXIT_CODE:-0}
 export CL_DOCKER_BIND_INTERFACE=${CL_DOCKER_BIND_INTERFACE:-""}

@@ -85,7 +85,9 @@ fi
 
 if [ "$PUBLISH" == "true" ]; then
   if [ -n "$HYPERGRAPH_RELEASE" ]; then
-    echo "Skipping sdk/publishLocal - using release $HYPERGRAPH_RELEASE (SDK should be available from Maven)"
+    echo "Skipping sdk/publishLocal - using release ${HYPERGRAPH_RELEASE}"
+    echo "  Note: Metagraph builds require tessellation-sdk ${HYPERGRAPH_RELEASE#v} from Maven Central."
+    echo "  SNAPSHOT versions are not published - use a tagged release."
   else
     echo "Publishing local"
     sbt --error sdk/publishLocal
