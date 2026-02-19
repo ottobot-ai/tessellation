@@ -176,12 +176,23 @@ tessellation-sdk-4.1.0+3.abc1234.build42.jar  # Development
 
 ## Troubleshooting
 
-### "Version shows 99.99.99-SNAPSHOT"
+### "Version shows 0.0.0+notags..." (sbt)
 
-This happens when:
+When using sbt, this happens when:
 - No git tags exist in the repository
 - Running in a shallow clone (`git fetch --unshallow` to fix)
-- Git is not available
+- Git is not available (`0.0.0+unknown.local`)
+
+Example: `0.0.0+notags.abc1234.local`
+
+### "Version shows 99.99.99-SNAPSHOT" (Docker)
+
+This fallback only appears in Docker scripts (`docker/bin/set-env.sh`) when:
+- No git tags matching `v*` exist
+- Git is not available in the container
+- The `RELEASE_TAG` env var is not set
+
+To fix: Set `RELEASE_TAG=vX.Y.Z` or ensure the Docker build context includes git tags.
 
 ### "Version doesn't match expected tag"
 
