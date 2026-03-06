@@ -311,7 +311,9 @@ object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
             currentOrdinal = SnapshotOrdinal.MinValue
             expected = hashed.map { binary =>
               ConfirmedBinary(
-                PendingBinary(binary, currentOrdinal, currentOrdinal, NonNegLong.unsafeFrom(0L)), // Changed from 0L to 1L
+                // sendsSoFar = 1 because process() delegates to another peer (binaryGen uses random
+                // signers, none of which equal selfId=0000…) and our fix now calls markAsSent there.
+                PendingBinary(binary, currentOrdinal, currentOrdinal, NonNegLong.unsafeFrom(1L)),
                 GlobalSnapshotConfirmationProof.fromGlobalSnapshot(globalSnapshot)
               )
             }
@@ -365,6 +367,40 @@ object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
                 case ConfirmedBinary(pendingBinary, _) => pendingBinary.binary
               }.toSet.subsetOf(hashed.toSet)))
               .and(expect(posted.toSet.subsetOf(hashed.toSet)))
+        )
+      } yield result).use(IO.pure)
+    }
+  }
+
+  test("normal mode - should mark binary as sent when delegated to another peer (regression: sendsSoFar must not stay 0 forever)") { res =>
+    implicit val (_, hs, sp, metrics, j) = res
+
+    // selfId is deliberately NOT in the binary's signers, so PeerSelector will pick another peer.
+    // Before the fix, markAsSent was skipped in that branch, leaving sendsSoFar==0 and causing
+    // processNormalMode to endlessly re-process the same "unsent" binaries.
+    val selfId = PeerId(Hex("0000000000000000"))
+
+    forall(Gen.nonEmptyListOf(binaryGen)) { binaries =>
+      (for {
+        kp <- Resource.eval(KeyPairGenerator.makeKeyPair)
+        (sender, tracker, postedRef) <- mkService(
+          kp.getPublic.toAddress,
+          currentOrdinal = SnapshotOrdinal.MinValue,
+          state = TrackerState.empty.copy(retryMode = false),
+          selfId = selfId
+        )
+        result <- Resource.eval(
+          for {
+            hashed <- binaries.traverse(_.toHashed)
+            _ <- hashed.traverse(binary => sender.asInstanceOf[TestStateChannelBinarySender[IO]].process(binary, none))
+            state <- tracker.getState
+            posted <- postedRef.get
+            pendingBinaries = state.tracked.collect { case p: PendingBinary => p }
+          } yield
+            // Nothing should have been posted (another peer is the sender)
+            expect(posted.isEmpty)
+              // All pending binaries should have sendsSoFar > 0 after delegation
+              .and(expect(pendingBinaries.forall(_.sendsSoFar.value >= 1L)))
         )
       } yield result).use(IO.pure)
     }

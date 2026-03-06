@@ -97,7 +97,11 @@ class BinaryPoster[F[_]: Async](
       logger.info(s"[Queue] Self selected to send binary ${binary.hash}") >>
         performPost(binary, lastGlobalSnapshotSigners).as(peerToSendSnapshot.some)
     } else {
-      logger.info(s"[Queue] Peer $peerToSendSnapshot selected to send binary ${binary.hash}") >>
+      // Another peer is the deterministic sender for this binary.
+      // Still mark it as "sent" so processNormalMode doesn't keep retrying it as unsent.
+      // If the delegated peer fails, retry mode will eventually re-enqueue all pending binaries.
+      logger.info(s"[Queue] Delegating binary ${binary.hash} to peer $peerToSendSnapshot") >>
+        binaryTracker.markAsSent(binary.hash) >>
         peerToSendSnapshot.some.pure
     }
   }
