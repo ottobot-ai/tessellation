@@ -117,8 +117,16 @@ object ConsensusEventLoop {
       )
     } yield {
 
+      // Main command processing loop with error recovery.
+      // Unhandled exceptions in FSM handling are logged and the loop continues.
+      // This prevents a single bad command from killing the entire consensus engine.
       val commandStream: Stream[F, Unit] =
-        Stream.repeatEval(queue.take).evalMap(fsm.handle)
+        Stream.repeatEval(queue.take).evalMap { cmd =>
+          fsm.handle(cmd).handleErrorWith { e =>
+            ctx.logger.error(e)(s"Error handling consensus command: $cmd") >>
+              Metrics[F].incrementCounter("dag_consensus_command_error")
+          }
+        }
 
       val peerRegistrationStream: Stream[F, Unit] =
         clusterStorage.peerChanges.mapFilter {

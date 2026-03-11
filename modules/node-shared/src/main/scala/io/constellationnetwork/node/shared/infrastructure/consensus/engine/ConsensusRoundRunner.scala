@@ -152,7 +152,8 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
       noChangeCount: Int,
       stallCycleCount: Int,
       roundHadStall: Boolean,
-      lastSummaryTime: FiniteDuration
+      lastSummaryTime: FiniteDuration,
+      roundStartTime: FiniteDuration  // Track round start for maxRoundDuration enforcement
     )
 
     val basePollInterval = 100L
@@ -280,13 +281,20 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
                   else newStallCycleCount
                 newRoundHadStall = ms.roundHadStall || didLock
 
-                // Abandon round if stall budget exhausted and still locked (unlock never succeeded)
-                shouldAbandon = finalStallCycleCount >= config.maxStallCycles && isLocked
+                // Abandon round if:
+                // 1. Stall budget exhausted and still locked (unlock never succeeded), OR
+                // 2. Round has exceeded maxRoundDuration (hard wall-clock cap)
+                roundDuration = now - ms.roundStartTime
+                stallBudgetExhausted = finalStallCycleCount >= config.maxStallCycles && isLocked
+                roundTimeoutExceeded = roundDuration >= config.maxRoundDuration
+                shouldAbandon = stallBudgetExhausted || roundTimeoutExceeded
+
+                abandonReason =
+                  if (roundTimeoutExceeded) s"exceeded maxRoundDuration (${roundDuration.toSeconds}s > ${config.maxRoundDuration.toSeconds}s)"
+                  else s"stuck after $finalStallCycleCount stall cycles in Closed state"
 
                 _ <- (
-                  logger.error(
-                    s"Round key=$key stuck after $finalStallCycleCount stall cycles in Closed state, abandoning round"
-                  ) >>
+                  logger.error(s"Round key=$key abandoned: $abandonReason") >>
                     Metrics[F].incrementCounter("dag_consensus_round_abandoned") >>
                     // Remove stale Closed state so the next round can start fresh with the same key.
                     // Only removes if still Closed — if another fiber unlocked it in the meantime, leave it.
@@ -334,7 +342,8 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
                       noChangeCount = newNoChangeCount,
                       stallCycleCount = finalStallCycleCount,
                       roundHadStall = newRoundHadStall,
-                      lastSummaryTime = newSummaryTime
+                      lastSummaryTime = newSummaryTime,
+                      roundStartTime = ms.roundStartTime  // Preserve original start time
                     )
                   )
           }
@@ -344,14 +353,15 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
       now <- Async[F].monotonic
       _ <- Async[F].tailRecM(
         MonitorState(
-          0,
-          None,
-          now,
+          lastResourcesHash = 0,
+          lastStatus = None,
+          statusStartTime = now,
           lockedForStatus = false,
           noChangeCount = 0,
           stallCycleCount = 0,
           roundHadStall = false,
-          lastSummaryTime = now
+          lastSummaryTime = now,
+          roundStartTime = now  // Track when round started for maxRoundDuration
         )
       )(monitorStep)
     } yield ()

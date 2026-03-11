@@ -148,7 +148,11 @@ object types {
     maxFacilitatorCount: Option[PosInt] = None,
     reStallTimeout: Option[FiniteDuration] = None,
     noProgressTimeout: Option[FiniteDuration] = None,
-    maxStallCycles: Int = 3
+    maxStallCycles: Int = 3,
+    // Hard wall-clock cap on round duration. If a round exceeds this, it's abandoned
+    // regardless of stall cycle count. Prevents pathological rounds from looping indefinitely.
+    // Default: 5 minutes
+    maxRoundDuration: FiniteDuration = FiniteDuration(5, "minutes")
   )
 
   case class EventCutterConfig(
