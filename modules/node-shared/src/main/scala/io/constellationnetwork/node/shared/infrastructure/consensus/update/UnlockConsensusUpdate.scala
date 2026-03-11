@@ -58,6 +58,10 @@ object UnlockConsensusUpdate {
           val keepThreshold = (facilitators.size + 1) / 2
           val removeThreshold = facilitators.size / 2 + 1
 
+          // Minimum facilitators required to maintain consensus viability.
+          // If unlock would reduce below this, abort to prevent cluster death.
+          val minFacilitatorCount = 2
+
           facilitators.traverse { peerId =>
             votingResult.get(peerId).flatMap {
               case (votesKeep, votesRemove) =>
@@ -72,17 +76,25 @@ object UnlockConsensusUpdate {
             _.partitionMap {
               case (peerId, decision) => Either.cond(decision, peerId, peerId)
             }
-          }.map {
+          }.flatMap {
             case (removedFacilitators, keptFacilitators) =>
-              val updateState =
-                _lockStatus.modify {
-                  case LockStatus.Closed => LockStatus.Reopened
-                  case other             => other
-                }
-                  .andThen(_facilitators.replace(Facilitators(keptFacilitators)))
-                  .andThen(_removedFacilitators.modify(r => RemovedFacilitators(r.value.union(removedFacilitators.toSet))))
+              // Safety check: never reduce facilitators below minimum viable count.
+              // If we would, abort the unlock entirely - the cluster will remain locked
+              // but at least it won't enter an irrecoverable state.
+              if (keptFacilitators.size < minFacilitatorCount) {
+                // Abort unlock - would kill consensus permanently
+                none
+              } else {
+                val updateState =
+                  _lockStatus.modify {
+                    case LockStatus.Closed => LockStatus.Reopened
+                    case other             => other
+                  }
+                    .andThen(_facilitators.replace(Facilitators(keptFacilitators)))
+                    .andThen(_removedFacilitators.modify(r => RemovedFacilitators(r.value.union(removedFacilitators.toSet))))
 
-              updateState(state)
+                updateState(state).some
+              }
           }
         }
           .getOrElse(state)
