@@ -25,6 +25,11 @@ import monocle.Lens
   */
 object UnlockConsensusUpdate {
 
+  /** Minimum facilitator count to prevent cluster death.
+    * If unlock would reduce below this, abort the unlock.
+    */
+  private val MinFacilitatorCount: Int = 2
+
   def tryUnlock[F[_]: Monad, S, K](acksMap: Map[(PeerId, K), Set[PeerId]])(maybeCollectingKind: S => Option[K])(
     implicit _lockStatus: Lens[S, LockStatus],
     _facilitators: Lens[S, Facilitators],
@@ -58,10 +63,6 @@ object UnlockConsensusUpdate {
           val keepThreshold = (facilitators.size + 1) / 2
           val removeThreshold = facilitators.size / 2 + 1
 
-          // Minimum facilitators required to maintain consensus viability.
-          // If unlock would reduce below this, abort to prevent cluster death.
-          val minFacilitatorCount = 2
-
           facilitators.traverse { peerId =>
             votingResult.get(peerId).flatMap {
               case (votesKeep, votesRemove) =>
@@ -81,7 +82,7 @@ object UnlockConsensusUpdate {
               // Safety check: never reduce facilitators below minimum viable count.
               // If we would, abort the unlock entirely - the cluster will remain locked
               // but at least it won't enter an irrecoverable state.
-              if (keptFacilitators.size < minFacilitatorCount) {
+              if (keptFacilitators.size < MinFacilitatorCount) {
                 // Abort unlock - would kill consensus permanently
                 none
               } else {
