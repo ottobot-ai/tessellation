@@ -323,11 +323,16 @@ object DataApplicationTraverse {
                           (latestState, latestOrdinal).some
                         }
                     case false =>
+                      // Raise error rather than returning none - callers need to distinguish
+                      // "nothing to recover" from "state set failed". Returning none would
+                      // silently skip data-application state initialization.
                       logger
                         .error(
-                          s"setCalculatedState returned false for ordinal=${latestOrdinal.show}, skipping storage cleanup to avoid inconsistency"
-                        )
-                        .as(none[(DataState.Base, SnapshotOrdinal)])
+                          s"setCalculatedState returned false for ordinal=${latestOrdinal.show}"
+                        ) >>
+                        (new Exception(
+                          s"Failed to set calculated state for ordinal=${latestOrdinal.show} during loadChain"
+                        )).raiseError[F, Option[(DataState.Base, SnapshotOrdinal)]]
                   }
               }
             } yield result

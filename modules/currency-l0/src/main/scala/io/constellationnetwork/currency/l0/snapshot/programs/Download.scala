@@ -119,12 +119,14 @@ object Download {
                 (new Exception(s"No peers to fetch off-chain state from")).raiseError[F, (SnapshotOrdinal, DataCalculatedState)]
               case peer :: _ => p2pClient.dataApplication.getCalculatedState.run(peer)
             }
-        }.flatTap {
-          case (_, calculatedState) =>
-            da.hashCalculatedState(calculatedState).flatMap { calculatedStateHash =>
-              (new Exception(s"Downloaded calculated state does not match the proof stored in snapshot")
-                .raiseError[F, Unit])
-                .unlessA(snapshot.dataApplication.map(_.calculatedStateProof) === calculatedStateHash.some)
+            // Hash validation inside retry block so mismatch triggers retry with different peer
+            .flatTap {
+              case (_, calculatedState) =>
+                da.hashCalculatedState(calculatedState).flatMap { calculatedStateHash =>
+                  (new Exception(s"Downloaded calculated state does not match the proof stored in snapshot")
+                    .raiseError[F, Unit])
+                    .unlessA(snapshot.dataApplication.map(_.calculatedStateProof) === calculatedStateHash.some)
+                }
             }
         }.flatMap { case (ordinal, calculatedState) => da.setCalculatedState(ordinal, calculatedState) }.void
       }.getOrElse(Applicative[F].unit)

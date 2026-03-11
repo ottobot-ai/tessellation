@@ -206,7 +206,8 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
                   if (statusChanged) false
                   else if (reopened) false
                   else ms.lockedForStatus
-                newStallCycleCount = if (statusChanged) 0 else ms.stallCycleCount
+                // Reset stall cycles on status change or reopen (facilitator set changed = fresh attempt)
+                newStallCycleCount = if (statusChanged || reopened) 0 else ms.stallCycleCount
 
                 _ <- queue.offer(ConsensusCommand.CheckUpdate(key)).whenA(resourcesChanged || statusChanged || isLocked)
 
@@ -217,6 +218,12 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
                   else
                     declarationTimeout
                 withinStallBudget = ms.stallCycleCount < config.maxStallCycles
+                budgetJustExhausted = !withinStallBudget && ms.stallCycleCount === config.maxStallCycles
+
+                _ <- (
+                  logger.warn(s"Stall budget exhausted for key=$key after ${config.maxStallCycles} cycles, locking suppressed until facilitator change") >>
+                    Metrics[F].incrementCounter("dag_consensus_stall_budget_exhausted")
+                ).whenA(budgetJustExhausted)
 
                 didLock <- handleStall(
                   key = key,
