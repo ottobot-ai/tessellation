@@ -152,7 +152,8 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
       noChangeCount: Int,
       stallCycleCount: Int,
       roundHadStall: Boolean,
-      lastSummaryTime: FiniteDuration
+      lastSummaryTime: FiniteDuration,
+      roundStartTime: FiniteDuration  // Track round start for maxRoundDuration enforcement
     )
 
     val basePollInterval = 100L
@@ -222,18 +223,32 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
                   if (statusChanged) false
                   else if (reopened) false
                   else ms.lockedForStatus
-                newStallCycleCount = if (statusChanged) 0 else ms.stallCycleCount
+                // Reset stall cycles on status change OR successful unlock (reopened)
+                // A successful unlock means the round can continue with reduced facilitators
+                // and deserves a fresh stall budget
+                newStallCycleCount = if (statusChanged || reopened) 0 else ms.stallCycleCount
+
+                // Track successful unlocks for observability
+                _ <- Metrics[F].incrementCounter("dag_consensus_unlock_succeeded").whenA(reopened)
 
                 _ <- queue.offer(ConsensusCommand.CheckUpdate(key)).whenA(resourcesChanged || statusChanged || isLocked)
 
                 declarationTimeout <- getCurrentDeclarationTimeout
-                // Use shorter re-stall timeout only for repeated stalls within the SAME status.
-                // stallCycleCount resets on status change, so a new phase always gets the full declarationTimeout.
+                // Graduated timeout based on declaration progress:
+                // - Re-stall: short timeout after previous stall (recovery mode)
+                // - No progress: short timeout when no declarations received
+                // - Near completion (>75%): extend timeout 50% to wait for slow peers
+                // - Normal: standard timeout
+                declarationProgress = if (info.activeCount > 0) info.declaredCount.toDouble / info.activeCount else 0.0
+                nearCompletion = declarationProgress >= 0.75 && info.declaredCount < info.activeCount
                 effectiveTimeout =
                   if (ms.stallCycleCount > 0)
                     config.reStallTimeout.getOrElse(declarationTimeout)
                   else if (info.declaredCount == 0)
                     config.noProgressTimeout.getOrElse(declarationTimeout)
+                  else if (nearCompletion)
+                    // Give 50% more time when close to completion - slow peers may just need more time
+                    declarationTimeout + (declarationTimeout / 2)
                   else
                     declarationTimeout
                 withinStallBudget = ms.stallCycleCount < config.maxStallCycles
@@ -269,13 +284,20 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
                   else newStallCycleCount
                 newRoundHadStall = ms.roundHadStall || didLock
 
-                // Abandon round if stall budget exhausted and still locked (unlock never succeeded)
-                shouldAbandon = finalStallCycleCount >= config.maxStallCycles && isLocked
+                // Abandon round if:
+                // 1. Stall budget exhausted and still locked (unlock never succeeded), OR
+                // 2. Round has exceeded maxRoundDuration (hard wall-clock cap)
+                roundDuration = now - ms.roundStartTime
+                stallBudgetExhausted = finalStallCycleCount >= config.maxStallCycles && isLocked
+                roundTimeoutExceeded = roundDuration >= config.maxRoundDuration
+                shouldAbandon = stallBudgetExhausted || roundTimeoutExceeded
+
+                abandonReason =
+                  if (roundTimeoutExceeded) s"exceeded maxRoundDuration (${roundDuration.toSeconds}s > ${config.maxRoundDuration.toSeconds}s)"
+                  else s"stuck after $finalStallCycleCount stall cycles in Closed state"
 
                 _ <- (
-                  logger.error(
-                    s"Round key=$key stuck after $finalStallCycleCount stall cycles in Closed state, abandoning round"
-                  ) >>
+                  logger.error(s"Round key=$key abandoned: $abandonReason") >>
                     Metrics[F].incrementCounter("dag_consensus_round_abandoned") >>
                     // Remove stale Closed state so the next round can start fresh with the same key.
                     // Only removes if still Closed — if another fiber unlocked it in the meantime, leave it.
@@ -323,7 +345,8 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
                       noChangeCount = newNoChangeCount,
                       stallCycleCount = finalStallCycleCount,
                       roundHadStall = newRoundHadStall,
-                      lastSummaryTime = newSummaryTime
+                      lastSummaryTime = newSummaryTime,
+                      roundStartTime = ms.roundStartTime  // Preserve original start time
                     )
                   )
           }
@@ -333,14 +356,15 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
       now <- Async[F].monotonic
       _ <- Async[F].tailRecM(
         MonitorState(
-          0,
-          None,
-          now,
+          lastResourcesHash = 0,
+          lastStatus = None,
+          statusStartTime = now,
           lockedForStatus = false,
           noChangeCount = 0,
           stallCycleCount = 0,
           roundHadStall = false,
-          lastSummaryTime = now
+          lastSummaryTime = now,
+          roundStartTime = now  // Track when round started for maxRoundDuration
         )
       )(monitorStep)
     } yield ()
