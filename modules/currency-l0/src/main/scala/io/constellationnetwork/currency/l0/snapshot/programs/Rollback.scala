@@ -113,8 +113,13 @@ object Rollback {
         .hasCollateral(nodeId)
         .flatMap(OwnCollateralNotSatisfied.raiseError[F, Unit].unlessA)
 
-      _ <- snapshotStorage.prepend(lastIncremental, lastInfo)
-      _ <- logger.info(s"Prepended last currency snapshot ordinal=${lastIncremental.ordinal.show} to snapshot storage before loadChain")
+      _ <- snapshotStorage.prepend(lastIncremental, lastInfo).flatMap { prepended =>
+        if (!prepended)
+          (new Exception(s"Failed to prepend currency snapshot ordinal=${lastIncremental.ordinal.show} to storage during rollback"))
+            .raiseError[F, Unit]
+        else
+          logger.info(s"Prepended last currency snapshot ordinal=${lastIncremental.ordinal.show} to snapshot storage before loadChain")
+      }
 
       _ <- dataApplication.map {
         case (da, cs) =>
