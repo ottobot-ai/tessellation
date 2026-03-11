@@ -121,6 +121,9 @@ else
     mkdir -p ./nodes/$i
   done
 
+  # Copy keytool and wallet jars to nodes directory for key generation
+  cp ./docker/jars/keytool.jar ./docker/jars/wallet.jar ./nodes/
+
   source ./docker/bin/node-key-env-setup.sh
   source ./docker/bin/docker-env-setup.sh
 
