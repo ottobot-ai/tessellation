@@ -153,7 +153,7 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
       stallCycleCount: Int,
       roundHadStall: Boolean,
       lastSummaryTime: FiniteDuration,
-      roundStartTime: FiniteDuration  // Track round start for maxRoundDuration enforcement
+      roundStartTime: FiniteDuration // Track round start for maxRoundDuration enforcement
     )
 
     val basePollInterval = 100L
@@ -293,7 +293,8 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
                 shouldAbandon = stallBudgetExhausted || roundTimeoutExceeded
 
                 abandonReason =
-                  if (roundTimeoutExceeded) s"exceeded maxRoundDuration (${roundDuration.toSeconds}s > ${config.maxRoundDuration.toSeconds}s)"
+                  if (roundTimeoutExceeded)
+                    s"exceeded maxRoundDuration (${roundDuration.toSeconds}s > ${config.maxRoundDuration.toSeconds}s)"
                   else s"stuck after $finalStallCycleCount stall cycles in Closed state"
 
                 _ <- (
@@ -346,7 +347,7 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
                       stallCycleCount = finalStallCycleCount,
                       roundHadStall = newRoundHadStall,
                       lastSummaryTime = newSummaryTime,
-                      roundStartTime = ms.roundStartTime  // Preserve original start time
+                      roundStartTime = ms.roundStartTime // Preserve original start time
                     )
                   )
           }
@@ -364,7 +365,7 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
           stallCycleCount = 0,
           roundHadStall = false,
           lastSummaryTime = now,
-          roundStartTime = now  // Track when round started for maxRoundDuration
+          roundStartTime = now // Track when round started for maxRoundDuration
         )
       )(monitorStep)
     } yield ()

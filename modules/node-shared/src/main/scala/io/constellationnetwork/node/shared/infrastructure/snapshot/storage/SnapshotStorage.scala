@@ -178,11 +178,11 @@ object SnapshotStorage {
                     MonadThrow[F].raiseError[Unit](e)
               }
             } >>
-            snapshotInfoCutoffQueue.offer(snapshot.ordinal) >>
-            snapshot.ordinal
-              .partialPreviousN(inMemoryCapacity)
-              .fold(Applicative[F].unit)(offloadQueue.offer) >>
-            combinedSnapshotCheckpointFileSystemStorage.tryWrite(snapshot.ordinal, snapshot, snapshotInfo, hash)
+          snapshotInfoCutoffQueue.offer(snapshot.ordinal) >>
+          snapshot.ordinal
+            .partialPreviousN(inMemoryCapacity)
+            .fold(Applicative[F].unit)(offloadQueue.offer) >>
+          combinedSnapshotCheckpointFileSystemStorage.tryWrite(snapshot.ordinal, snapshot, snapshotInfo, hash)
       }
 
     def snapshotExists(snapshot: Signed[S])(implicit hasher: Hasher[F]): F[Boolean] =
