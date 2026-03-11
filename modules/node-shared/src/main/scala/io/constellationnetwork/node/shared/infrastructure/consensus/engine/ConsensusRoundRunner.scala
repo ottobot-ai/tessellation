@@ -222,16 +222,32 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
                   if (statusChanged) false
                   else if (reopened) false
                   else ms.lockedForStatus
-                newStallCycleCount = if (statusChanged) 0 else ms.stallCycleCount
+                // Reset stall cycles on status change OR successful unlock (reopened)
+                // A successful unlock means the round can continue with reduced facilitators
+                // and deserves a fresh stall budget
+                newStallCycleCount = if (statusChanged || reopened) 0 else ms.stallCycleCount
+
+                // Track successful unlocks for observability
+                _ <- Metrics[F].incrementCounter("dag_consensus_unlock_succeeded").whenA(reopened)
 
                 _ <- queue.offer(ConsensusCommand.CheckUpdate(key)).whenA(resourcesChanged || statusChanged || isLocked)
 
                 declarationTimeout <- getCurrentDeclarationTimeout
+                // Graduated timeout based on declaration progress:
+                // - Re-stall: short timeout after previous stall (recovery mode)
+                // - No progress: short timeout when no declarations received
+                // - Near completion (>75%): extend timeout 50% to wait for slow peers
+                // - Normal: standard timeout
+                declarationProgress = if (info.activeCount > 0) info.declaredCount.toDouble / info.activeCount else 0.0
+                nearCompletion = declarationProgress >= 0.75 && info.declaredCount < info.activeCount
                 effectiveTimeout =
                   if (ms.stallCycleCount > 0 || ms.roundHadStall)
                     config.reStallTimeout.getOrElse(declarationTimeout)
                   else if (info.declaredCount == 0)
                     config.noProgressTimeout.getOrElse(declarationTimeout)
+                  else if (nearCompletion)
+                    // Give 50% more time when close to completion - slow peers may just need more time
+                    declarationTimeout + (declarationTimeout / 2)
                   else
                     declarationTimeout
                 withinStallBudget = ms.stallCycleCount < config.maxStallCycles
