@@ -174,3 +174,43 @@ Alternative approaches:
 
 ### New Issue Found
 - 🐛 facilitatorCount=0 possible under quorum loss
+
+---
+
+## UPDATE: Recovery Testing (11:40)
+
+### Single Node Restart
+- **Result:** Does NOT recover
+- State briefly shows `facilitatorCount=3` (loaded from snapshot)
+- Then recomputes back to `facilitatorCount=0`
+- The unlock decision is persisted
+
+### Full Cluster Restart (all 8 nodes)
+- **Result:** Does NOT recover
+- Same behavior - state replays to `facilitatorCount=0`
+- API stops responding
+- **CLUSTER IS IRRECOVERABLE**
+
+### Bug Severity Upgrade: CRITICAL → CATASTROPHIC
+
+This is not just a stall - it's **permanent cluster death**:
+
+| Recovery Attempt | Result |
+|------------------|--------|
+| Wait | ❌ No recovery |
+| Restore network | ❌ No recovery |
+| Restart single node | ❌ No recovery |
+| Restart all nodes | ❌ No recovery |
+
+The only recovery would be:
+1. Manual state surgery, or
+2. Rollback to pre-bug snapshot ordinal
+
+### Operational Impact
+
+If this bug occurs on mainnet:
+- **Immediate:** Network halts, no new snapshots
+- **Recovery:** Requires coordinated manual intervention across all validators
+- **Downtime:** Hours to days depending on coordination speed
+
+### MUST FIX BEFORE v4 RETRY
