@@ -156,4 +156,43 @@ object FacilitatorSelectorSuite extends SimpleIOSuite with Checkers {
       expect.same(20, result.size)
     }
   }
+
+  // === Empty list guard tests ===
+
+  test("selectLeader throws on empty facilitators list") {
+    IO {
+      val caught = scala.util.Try(selector.selectLeader(List.empty, Hash.empty))
+      expect(caught.isFailure) && expect(caught.failed.get.isInstanceOf[IllegalArgumentException])
+    }
+  }
+
+  test("selectLeaderWeighted throws on empty facilitators list") {
+    IO {
+      val caught = scala.util.Try(selector.selectLeaderWeighted(List.empty, Hash.empty))
+      expect(caught.isFailure) && expect(caught.failed.get.isInstanceOf[IllegalArgumentException])
+    }
+  }
+
+  // === Entropy-based selection tests ===
+
+  test("select produces different subsets with different entropy") {
+    IO {
+      val smallSelector = FacilitatorSelector.make(Some(3))
+      val peers = (1 to 10).map(i => pid(s"peer$i")).toList
+      val entropies = (0 until 10).map(i => Hash.fromBytes(s"entropy$i".getBytes("UTF-8")))
+      val subsets = entropies.map(e => smallSelector.select(peers, e))
+      // Not all subsets should be identical (extremely unlikely with different entropies)
+      expect(subsets.distinct.size > 1)
+    }
+  }
+
+  test("selectLeader changes with different entropy") {
+    IO {
+      val peers = (1 to 10).map(i => pid(s"peer$i")).toList
+      val entropies = (0 until 10).map(i => Hash.fromBytes(s"entropy$i".getBytes("UTF-8")))
+      val leaders = entropies.map(e => selector.selectLeader(peers, e))
+      // Not all leaders should be the same with different entropy
+      expect(leaders.distinct.size > 1)
+    }
+  }
 }

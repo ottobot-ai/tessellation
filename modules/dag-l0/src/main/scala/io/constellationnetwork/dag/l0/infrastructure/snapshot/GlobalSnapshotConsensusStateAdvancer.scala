@@ -17,6 +17,7 @@ import io.constellationnetwork.ext.collection.FoldableOps.pickMajority
 import io.constellationnetwork.ext.crypto._
 import io.constellationnetwork.node.shared.config.types.ConsensusConfig
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
+import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions.InvalidArtifact
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
@@ -29,6 +30,7 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{Con
 import io.constellationnetwork.node.shared.infrastructure.fork.ExitOnFork
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
+import io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalArtifactMismatch
 import io.constellationnetwork.node.shared.infrastructure.snapshot.SnapshotConsensusFunctions.gossipForkInfo
 import io.constellationnetwork.node.shared.logger.LoggerBundle
 import io.constellationnetwork.schema.gossip.Ordinal
@@ -193,12 +195,11 @@ object GlobalSnapshotConsensusStateAdvancer {
         role = if (isLeader) "LEADER" else "FOLLOWER"
         withdrawnCount = state.withdrawnFacilitators.value.size
         _ <- logger.info(
-          s"[CONSENSUS:$role] FACILITIES→PROPOSALS\n" +
-            s"  key=${state.key.show} ordinal=${artifact.ordinal.show} trigger=$majorityTrigger\n" +
-            s"  hash=${hash.show.take(8)}... facilitators=${state.facilitators.value.size} candidates=${candidates.size}\n" +
-            s"  leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}" +
+          s"[CONSENSUS:$role] FACILITIES->PROPOSALS key=${state.key.show} ordinal=${artifact.ordinal.show} trigger=$majorityTrigger " +
+            s"hash=${hash.show.take(8)}... facilitators=${state.facilitators.value.size} candidates=${candidates.size} " +
+            s"leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}" +
             (if (withdrawnCount > 0) s" withdrawn=$withdrawnCount" else "") +
-            s"\n  facilitatorsHash=${facilitatorsHash.show.take(8)}... lastSnapshotHash=${state.lastOutcome.finished.snapshotHash.show
+            s" facilitatorsHash=${facilitatorsHash.show.take(8)}... lastSnapshotHash=${state.lastOutcome.finished.snapshotHash.show
                 .take(8)}... entropy=${state.entropy.show.take(8)}..."
         )
       } yield
@@ -257,8 +258,7 @@ object GlobalSnapshotConsensusStateAdvancer {
               if (selfId === state.leader)
                 // Leader (possibly after view change) — spread proposal so peers can advance
                 logger.info(
-                  s"[CONSENSUS:LEADER] Re-spreading proposal\n" +
-                    s"  key=${state.key.show} hash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
+                  s"[CONSENSUS:LEADER] Re-spreading proposal key=${state.key.show} hash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
                     s"targets=${state.facilitators.value.size} view=${state.viewNumber}"
                 ) >>
                   spreadProposal(
@@ -285,31 +285,37 @@ object GlobalSnapshotConsensusStateAdvancer {
       if (leaderProposal.hash === status.proposalArtifactInfo.hash) {
         // Leader's artifact matches our own — use local ArtifactInfo (avoids re-validation)
         logger.info(
-          s"[CONSENSUS:$role] PROPOSALS→SIGNATURES\n" +
-            s"  key=${state.key.show} matchesOwn=true hash=${leaderProposal.hash.show.take(8)}...\n" +
-            s"  trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
+          s"[CONSENSUS:$role] PROPOSALS->SIGNATURES key=${state.key.show} matchesOwn=true hash=${leaderProposal.hash.show.take(8)}... " +
+            s"trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
         ) >>
+          Metrics[F].incrementCounter("dag_consensus_proposal_affinity_match") >>
           buildSignatureTransition(state, status, status.proposalArtifactInfo, List(leaderProposal.hash)).map(_.some)
       } else {
         // Leader proposed a different artifact — validate theirs
         resources.artifacts.get(leaderProposal.hash) match {
           case Some(leaderArtifact) =>
             validateLeaderArtifact(state, status, leaderArtifact, leaderProposal.hash).flatMap {
-              case Some(leaderInfo) =>
+              case Right(leaderInfo) =>
                 logger.info(
-                  s"[CONSENSUS:$role] PROPOSALS→SIGNATURES\n" +
-                    s"  key=${state.key.show} matchesOwn=false\n" +
-                    s"  leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}...\n" +
-                    s"  trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
+                  s"[CONSENSUS:$role] PROPOSALS->SIGNATURES key=${state.key.show} matchesOwn=false " +
+                    s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
+                    s"trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
                 ) >>
+                  Metrics[F].incrementCounter("dag_consensus_proposal_affinity_mismatch_accepted") >>
                   buildSignatureTransition(state, status, leaderInfo, List(leaderProposal.hash)).map(_.some)
-              case None =>
+              case Left(invalidArtifact) =>
+                val diffDetail = describeInvalidArtifact(invalidArtifact)
                 logger.warn(
-                  s"[CONSENSUS:$role] Leader proposal FAILED validation\n" +
-                    s"  key=${state.key.show} leaderHash=${leaderProposal.hash.show
-                        .take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}...\n" +
-                    s"  leader=${state.leader.show.take(8)}... view=${state.viewNumber}"
+                  s"[CONSENSUS:$role] Leader proposal FAILED validation key=${state.key.show} " +
+                    s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
+                    s"leader=${state.leader.show.take(8)}... view=${state.viewNumber} reason=$diffDetail"
                 ) >>
+                  logger.info(
+                    s"[CONSENSUS:$role] Withdrawing from round key=${state.key.show} reason=proposal_validation_failed"
+                  ) >>
+                  gossip.spread(ConsensusWithdrawPeerDeclaration(state.key, GlobalConsensusKind.Signature: GlobalConsensusKind)) >>
+                  Metrics[F].incrementCounter("dag_consensus_proposal_validation_failure") >>
+                  Metrics[F].incrementCounter("dag_consensus_withdrawal_sent") >>
                   none[Transition].pure[F]
             }
           case None =>
@@ -324,7 +330,7 @@ object GlobalSnapshotConsensusStateAdvancer {
       status: CollectingProposals,
       artifact: GlobalSnapshotArtifact,
       hash: Hash
-    )(implicit hasher: Hasher[F]): F[Option[ArtifactInfo[GlobalSnapshotArtifact, GlobalSnapshotContext]]] =
+    )(implicit hasher: Hasher[F]): F[Either[InvalidArtifact, ArtifactInfo[GlobalSnapshotArtifact, GlobalSnapshotContext]]] =
       state.lastOutcome.finished.signedMajorityArtifact.toHashed.flatMap { hashedLast =>
         consensusFns
           .validateArtifact(
@@ -337,11 +343,47 @@ object GlobalSnapshotConsensusStateAdvancer {
           )
           .map {
             case Right((validatedArtifact, context)) =>
-              ArtifactInfo(validatedArtifact, context, hash).some
-            case Left(_) =>
-              none
+              ArtifactInfo(validatedArtifact, context, hash).asRight[InvalidArtifact]
+            case Left(err) =>
+              err.asLeft[ArtifactInfo[GlobalSnapshotArtifact, GlobalSnapshotContext]]
           }
       }
+
+    /** Produces a human-readable description of why the leader's artifact failed validation. */
+    private def describeInvalidArtifact(err: InvalidArtifact): String = err match {
+      case GlobalArtifactMismatch(leader, own) =>
+        val diffs = List.newBuilder[String]
+        if (leader.ordinal =!= own.ordinal) diffs += s"ordinal(leader=${leader.ordinal.show},own=${own.ordinal.show})"
+        if (leader.height =!= own.height) diffs += s"height(leader=${leader.height.show},own=${own.height.show})"
+        if (leader.subHeight =!= own.subHeight) diffs += s"subHeight(leader=${leader.subHeight.show},own=${own.subHeight.show})"
+        if (leader.lastSnapshotHash =!= own.lastSnapshotHash)
+          diffs += s"lastSnapshotHash(leader=${leader.lastSnapshotHash.show.take(8)},own=${own.lastSnapshotHash.show.take(8)})"
+        if (leader.blocks.size != own.blocks.size) diffs += s"blocks(leader=${leader.blocks.size},own=${own.blocks.size})"
+        if (leader.stateChannelSnapshots.size != own.stateChannelSnapshots.size)
+          diffs += s"stateChannels(leader=${leader.stateChannelSnapshots.size},own=${own.stateChannelSnapshots.size})"
+        val leaderScAddrs = leader.stateChannelSnapshots.keySet
+        val ownScAddrs = own.stateChannelSnapshots.keySet
+        val onlyLeader = leaderScAddrs -- ownScAddrs
+        val onlyOwn = ownScAddrs -- leaderScAddrs
+        if (onlyLeader.nonEmpty) diffs += s"scOnlyInLeader=[${onlyLeader.toList.map(_.show.take(8)).mkString(",")}]"
+        if (onlyOwn.nonEmpty) diffs += s"scOnlyInOwn=[${onlyOwn.toList.map(_.show.take(8)).mkString(",")}]"
+        if (leader.rewards.size != own.rewards.size) diffs += s"rewards(leader=${leader.rewards.size},own=${own.rewards.size})"
+        if (leader.epochProgress =!= own.epochProgress)
+          diffs += s"epochProgress(leader=${leader.epochProgress.show},own=${own.epochProgress.show})"
+        if (leader.tips =!= own.tips) diffs += "tipsDiffer"
+        if (leader.stateProof =!= own.stateProof) diffs += "stateProofDiffers"
+        val leaderAllowSpend = leader.allowSpendBlocks.map(_.size).getOrElse(0)
+        val ownAllowSpend = own.allowSpendBlocks.map(_.size).getOrElse(0)
+        if (leaderAllowSpend != ownAllowSpend) diffs += s"allowSpendBlocks(leader=$leaderAllowSpend,own=$ownAllowSpend)"
+        val leaderTokenLock = leader.tokenLockBlocks.map(_.size).getOrElse(0)
+        val ownTokenLock = own.tokenLockBlocks.map(_.size).getOrElse(0)
+        if (leaderTokenLock != ownTokenLock) diffs += s"tokenLockBlocks(leader=$leaderTokenLock,own=$ownTokenLock)"
+        val result = diffs.result()
+        if (result.isEmpty) "GlobalArtifactMismatch(no field-level diff detected — possible serialization difference)"
+        else s"GlobalArtifactMismatch[${result.mkString(",")}]"
+      case other =>
+        other.getClass.getSimpleName
+    }
 
     private def buildSignatureTransition(
       state: GlobalSnapshotConsensusState,
@@ -401,10 +443,9 @@ object GlobalSnapshotConsensusStateAdvancer {
         _ <- logInvalidSignatures(state.key, proofs.size, valid.size)
         role = if (selfId === state.leader) "LEADER" else "FOLLOWER"
         _ <- logger.info(
-          s"[CONSENSUS:$role] SIGNATURES→FINISHED\n" +
-            s"  key=${state.key.show} ordinal=${status.majorityArtifactInfo.artifact.ordinal.show}\n" +
-            s"  signatures=${valid.size}/${proofs.size} hash=${status.majorityArtifactInfo.hash.show.take(8)}...\n" +
-            s"  trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
+          s"[CONSENSUS:$role] SIGNATURES->FINISHED key=${state.key.show} ordinal=${status.majorityArtifactInfo.artifact.ordinal.show} " +
+            s"signatures=${valid.size}/${proofs.size} hash=${status.majorityArtifactInfo.hash.show.take(8)}... " +
+            s"trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
         )
         result <- buildFinishedTransition(state, status, valid)
       } yield result

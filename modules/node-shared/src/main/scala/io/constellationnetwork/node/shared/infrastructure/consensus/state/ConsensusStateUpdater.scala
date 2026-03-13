@@ -105,10 +105,11 @@ object ConsensusStateUpdater {
             val oldStatusName = oldState.status.getClass.getSimpleName.stripSuffix("$")
             val newStatusName = newState.status.getClass.getSimpleName.stripSuffix("$")
             val statusTransition = if (oldStatusName =!= newStatusName) s"$oldStatusName→$newStatusName" else newStatusName
-            logger.debug(
-              s"[CONSENSUS] State advanced key=${newState.key.show} status=$statusTransition " +
-                s"facilitators=${newState.facilitators.value.size} leader=${newState.leader.show.take(8)}... view=${newState.viewNumber}"
-            )
+            logger.info(s"State updated ${newState.show}") >>
+              logger.debug(
+                s"[CONSENSUS] State advanced key=${newState.key.show} status=$statusTransition " +
+                  s"facilitators=${newState.facilitators.value.size} leader=${newState.leader.show.take(8)}... view=${newState.viewNumber}"
+              )
         }.void
 
       private def updateConsensus(resources: ConsensusResources[Artifact, Kind])(

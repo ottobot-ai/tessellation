@@ -165,4 +165,33 @@ object PeerQualityTrackerSuite extends SimpleIOSuite with Checkers {
       } yield expect(scores.values.forall(s => s >= 0.0 && s <= 1.0))
     }
   }
+
+  // === Recovery behavior ===
+
+  test("bad score recovers after many successful rounds") {
+    for {
+      tracker <- PeerQualityTracker.make[IO]
+      p = pid("recovering")
+      // Trash the score first
+      _ <- (1 to 5).toList.traverse_(_ => tracker.recordRoundAbandoned(Set(p)))
+      _ <- (1 to 3).toList.traverse_(_ => tracker.recordViewChange(p))
+      badScore <- tracker.getQualityScore(p)
+      // Now many successful rounds
+      _ <- (1 to 50).toList.traverse_(_ => tracker.recordRoundSuccess(Set(p)))
+      recoveredScore <- tracker.getQualityScore(p)
+    } yield expect(badScore < 0.2) && expect(recoveredScore > 0.8)
+  }
+
+  // === Concurrent peer tracking ===
+
+  test("peer not involved in round is not affected") {
+    for {
+      tracker <- PeerQualityTracker.make[IO]
+      active = pid("active")
+      bystander = pid("bystander")
+      _ <- tracker.recordRoundSuccess(Set(active))
+      _ <- tracker.recordRoundAbandoned(Set(active))
+      bystanderScore <- tracker.getQualityScore(bystander)
+    } yield expect.same(1.0, bystanderScore)
+  }
 }

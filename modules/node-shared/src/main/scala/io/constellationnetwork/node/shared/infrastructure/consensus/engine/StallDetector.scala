@@ -148,12 +148,20 @@ class StallDetector[F[_]: Async: Metrics, Event, Key, Artifact, Ctx, Status, Out
               roundTimedOut = config.maxRoundDuration.exists(roundElapsed >= _)
               shouldAbandon = finalStallCount >= config.maxStallCycles || roundTimedOut
 
+              abandonReasonLabel =
+                if (roundTimedOut) "timeout" else "max_stalls"
               abandonReason =
                 if (roundTimedOut)
                   s"round timed out after ${roundElapsed.toSeconds}s (max=${config.maxRoundDuration.map(_.toSeconds)}s)"
                 else s"stuck after $finalStallCount stall cycles"
 
-              _ <- abandonRound(key, abandonReason).whenA(shouldAbandon)
+              _ <- (
+                abandonRound(key, abandonReason) >>
+                  Metrics[F].incrementCounter(
+                    "dag_consensus_stall_abandon_reason",
+                    Seq((Metrics.unsafeLabelName("reason"), abandonReasonLabel))
+                  )
+              ).whenA(shouldAbandon)
 
               summaryInterval = 10.seconds
               timeSinceLastSummary = now - ms.lastSummaryTime
@@ -164,13 +172,12 @@ class StallDetector[F[_]: Async: Metrics, Event, Key, Artifact, Ctx, Status, Out
               roundElapsedTotal = now - ms.roundStartTime
               _ <- logger
                 .info(
-                  s"[CONSENSUS] Round monitor\n" +
-                    s"  key=$key status=$statusName declared=${info.declaredCount}/${info.activeCount}\n" +
-                    s"  elapsed=${statusDuration.toSeconds}s roundElapsed=${roundElapsedTotal.toSeconds}s stallCount=$finalStallCount\n" +
-                    s"  leader=${state.leader.show.take(8)}... leaderScore=${f"$leaderQuality%.2f"} facilitators=${state.facilitators.value.size}" +
+                  s"[CONSENSUS] Round monitor key=$key status=$statusName declared=${info.declaredCount}/${info.activeCount} " +
+                    s"elapsed=${statusDuration.toSeconds}s roundElapsed=${roundElapsedTotal.toSeconds}s stallCount=$finalStallCount " +
+                    s"leader=${state.leader.show.take(8)}... leaderScore=${f"$leaderQuality%.2f"} facilitators=${state.facilitators.value.size}" +
                     (if (state.viewNumber > 0) s" view=${state.viewNumber}" else "") +
                     (if (withdrawnCount > 0) s" withdrawn=$withdrawnCount" else "") +
-                    (if (info.missingPeerIds.nonEmpty) s"\n  missing=[${info.missingPeerIds.mkString(",")}]" else "")
+                    (if (info.missingPeerIds.nonEmpty) s" missing=[${info.missingPeerIds.mkString(",")}]" else "")
                 )
                 .whenA(shouldLogSummary && !shouldAbandon)
 
@@ -263,27 +270,31 @@ class StallDetector[F[_]: Async: Metrics, Event, Key, Artifact, Ctx, Status, Out
     if (shouldHandle) {
       val statusName = state.status.getClass.getSimpleName.stripSuffix("$")
       val missingInfo =
-        if (missingPeerIds.nonEmpty) s"\n  missing=[${missingPeerIds.mkString(",")}]"
+        if (missingPeerIds.nonEmpty) s" missing=[${missingPeerIds.mkString(",")}]"
         else ""
+
+      val phaseLabel = Seq((Metrics.unsafeLabelName("phase"), statusName))
 
       if (ops.isProposalPhase(state.status)) {
         // Proposal phase stall: leader failed to propose → view change
         logger.warn(
-          s"[CONSENSUS] Leader stall — performing view change\n" +
-            s"  key=$key status=$statusName elapsed=${statusDuration.toSeconds}s timeout=${declarationTimeout.toSeconds}s\n" +
-            s"  declared=$declaredCount/$activeCount leader=${state.leader.show.take(8)}... view=${state.viewNumber}" +
+          s"[CONSENSUS] Leader stall — performing view change key=$key status=$statusName " +
+            s"elapsed=${statusDuration.toSeconds}s timeout=${declarationTimeout.toSeconds}s " +
+            s"declared=$declaredCount/$activeCount leader=${state.leader.show.take(8)}... view=${state.viewNumber}" +
             missingInfo
         ) >>
           Metrics[F].incrementCounter("dag_consensus_view_change") >>
+          Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
           performViewChange(key, state).as(true)
       } else {
         // Non-proposal stall: just log and count towards abandon
         logger.warn(
-          s"[CONSENSUS] Stall detected\n" +
-            s"  key=$key status=$statusName elapsed=${statusDuration.toSeconds}s timeout=${declarationTimeout.toSeconds}s\n" +
-            s"  declared=$declaredCount/$activeCount" + missingInfo
+          s"[CONSENSUS] Stall detected key=$key status=$statusName " +
+            s"elapsed=${statusDuration.toSeconds}s timeout=${declarationTimeout.toSeconds}s " +
+            s"declared=$declaredCount/$activeCount" + missingInfo
         ) >>
           Metrics[F].incrementCounter("dag_consensus_stall_detected") >>
+          Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
           true.pure[F]
       }
     } else {
@@ -304,9 +315,8 @@ class StallDetector[F[_]: Async: Metrics, Event, Key, Artifact, Ctx, Status, Out
     )
 
     logger.info(
-      s"[CONSENSUS] View change\n" +
-        s"  key=$key view=${currentState.viewNumber}→$newViewNumber\n" +
-        s"  leader=${currentState.leader.show.take(8)}...→${newLeader.show.take(8)}... facilitators=${currentState.facilitators.value.size}"
+      s"[CONSENSUS] View change key=$key view=${currentState.viewNumber}->${newViewNumber} " +
+        s"oldLeader=${currentState.leader.show.take(8)}... newLeader=${newLeader.show.take(8)}... facilitators=${currentState.facilitators.value.size}"
     ) >>
       peerQualityTracker.recordViewChange(currentState.leader) >>
       Metrics[F].updateGauge("dag_consensus_view_number", newViewNumber) >>

@@ -114,11 +114,12 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
             "dag_consensus_outcome_finalized",
             Seq(unsafeLabelName("trigger_type") -> trigger.toString)
           ) >>
+            Metrics[F].updateGauge("dag_consensus_round_facilitator_count", newState.facilitators.value.size) >>
+            Metrics[F].updateGauge("dag_consensus_round_eligible_count", newState.eligibleFacilitators.value.size) >>
             log.info(
-              s"[CONSENSUS] Round COMPLETED\n" +
-                s"  key=$key trigger=$trigger duration=${duration.toMillis}ms\n" +
-                s"  facilitators=${newState.facilitators.value.size} leader=${newState.leader.show
-                    .take(8)}... leaderScore=${f"$leaderScore%.2f"} view=${newState.viewNumber}" +
+              s"[CONSENSUS] Round COMPLETED key=$key trigger=$trigger duration=${duration.toMillis}ms " +
+                s"facilitators=${newState.facilitators.value.size} leader=${newState.leader.show.take(8)}... " +
+                s"leaderScore=${f"$leaderScore%.2f"} view=${newState.viewNumber}" +
                 (if (withdrawnCount > 0) s" withdrawn=$withdrawnCount" else "") +
                 (if (removedCount > 0) s" removed=$removedCount" else "")
             ) >>

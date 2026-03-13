@@ -61,9 +61,8 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
         val nextKey = outcomeKey.get(outcome).next
         val lastKey = outcomeKey.get(outcome)
         logger.info(
-          s"[CONSENSUS] Facilitating round\n" +
-            s"  key=$nextKey trigger=$trigger lastKey=$lastKey\n" +
-            s"  declarationTimeout=${config.declarationTimeout} timeTriggerInterval=${config.timeTriggerInterval}"
+          s"[CONSENSUS] Facilitating consensus round at key=$nextKey with trigger=$trigger lastKey=$lastKey " +
+            s"declarationTimeout=${config.declarationTimeout} timeTriggerInterval=${config.timeTriggerInterval}"
         ) >>
           facilitateRound(outcome, nextKey, trigger)
     }

@@ -120,6 +120,7 @@ class FacilitatorSelector private (maxFacilitatorCount: Option[Int]) {
     entropy: Hash,
     viewNumber: Int = 0
   ): PeerId = {
+    require(facilitators.nonEmpty, "selectLeader called with empty facilitators list — consensus cannot proceed without facilitators")
     implicit val scoreOrder: Order[PeerId] = FacilitatorSelector.orderByScore(entropy)
     val sorted = facilitators.sorted(scoreOrder.toOrdering)
     val index = viewNumber % sorted.size
@@ -156,6 +157,10 @@ class FacilitatorSelector private (maxFacilitatorCount: Option[Int]) {
     qualityScores: Map[PeerId, Double] = Map.empty,
     qualityWeight: Double = 0.3
   ): PeerId = {
+    require(
+      facilitators.nonEmpty,
+      "selectLeaderWeighted called with empty facilitators list — consensus cannot proceed without facilitators"
+    )
     // Tiered ordering: quality determines the tier (inverted so high quality = tier 0 = first),
     // rendezvous score breaks ties within same tier. qualityWeight controls tier granularity:
     // weight=0 → all tiers are 0 → pure rendezvous; weight=1 → full quality tiers.

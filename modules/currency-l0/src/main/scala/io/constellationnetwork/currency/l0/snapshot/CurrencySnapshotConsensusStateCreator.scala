@@ -193,14 +193,13 @@ object CurrencySnapshotConsensusStateCreator {
         role = if (leader === selfId) "LEADER" else "FOLLOWER"
         leaderScore <- peerQualityTracker.getQualityScore(leader)
         _ <- logger.info(
-          s"[CONSENSUS:$role] Round STARTED\n" +
-            s"  key=$key trigger=${maybeTrigger.getOrElse("none")} lastGlobalOrd=${lastGlobalSnapshotOrdinal.show}\n" +
-            s"  facilitators=${active.size} eligible=${allEligible.size} candidates=${filteredCandidates.size}\n" +
-            s"  leader=${leader.show.take(8)}... leaderScore=${f"$leaderScore%.2f"} self=${selfId.show.take(8)}... view=0" +
-            (if (withdrawn.nonEmpty) s"\n  withdrawn=${withdrawn.size}" else "") +
+          s"[CONSENSUS:$role] Round STARTED key=$key trigger=${maybeTrigger.getOrElse("none")} lastGlobalOrd=${lastGlobalSnapshotOrdinal.show} " +
+            s"facilitators=${active.size} eligible=${allEligible.size} candidates=${filteredCandidates.size} " +
+            s"leader=${leader.show.take(8)}... leaderScore=${f"$leaderScore%.2f"} self=${selfId.show.take(8)}... view=0" +
+            (if (withdrawn.nonEmpty) s" withdrawn=${withdrawn.size}" else "") +
             (if (penalizedPeers.nonEmpty) s" penalized=${penalizedPeers.size}" else "") +
             (if (previouslyRemoved.nonEmpty) s" previouslyRemoved=${previouslyRemoved.size}" else "") +
-            s"\n  entropy=${entropy.show.take(8)}..."
+            s" entropy=${entropy.show.take(8)}..."
         )
 
       } yield (state, effect)
