@@ -766,6 +766,16 @@ object GlobalSnapshotAcceptanceManager {
               withdrawalRewardTxs ++ nodeOperatorRewards ++ reservedAddressRewards
             )
 
+            _ <-
+              loggerBundle.app.info(
+                s"[MPT.Debug] ordinal=$ordinal REWARDS\n" +
+                  s"  currencyAcceptanceBalanceUpdate: ${currencyAcceptanceBalanceUpdate}\n" +
+                  s"  withdrawalRewardTxs: ${withdrawalRewardTxs}\n" +
+                  s"  nodeOperatorRewards: ${nodeOperatorRewards}\n" +
+                  s"  reservedAddressRewards: ${reservedAddressRewards}\n"
+              )
+                .whenA(sys.env.get("CL_MPT_DEBUG_DUMP").exists(_.toLowerCase == "true"))
+
             globalBalances = Map(none[Address] -> updatedBalancesByRewards)
 
             spendActions = sharedArtifacts
