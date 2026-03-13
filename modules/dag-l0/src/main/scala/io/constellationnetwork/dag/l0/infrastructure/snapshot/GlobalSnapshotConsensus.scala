@@ -183,7 +183,8 @@ object GlobalSnapshotConsensus {
           lastGlobalSnapshotStorage,
           getGlobalSnapshotByOrdinal,
           clusterStorage,
-          loggerBundle
+          loggerBundle,
+          mptStore
         )
 
       facilitatorSelector = FacilitatorSelector.make(

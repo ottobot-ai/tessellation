@@ -123,21 +123,24 @@ class StallDetector[F[_]: Async: Metrics, Event, Key, Artifact, Ctx, Status, Out
                   FiniteDuration((baseEffectiveTimeout.toMillis * config.leaderQualityTimeoutMultiplier).toLong, MILLISECONDS)
                 else baseEffectiveTimeout
 
-              // Handle stall: view change for proposal phase, or count towards abandon
-              didViewChange <- handleStall(
+              // Handle stall: view change for proposal phase, or count towards abandon.
+              // Returns true if a stall was detected (view change or non-proposal stall).
+              didStall <- handleStall(
                 key = key,
                 state = state,
                 declarationTimeout = effectiveTimeout,
                 statusDuration = statusDuration,
-                alreadyHandled = newStallCount > 0 && !statusChanged,
                 declaredCount = info.declaredCount,
                 activeCount = info.activeCount,
                 missingPeerIds = info.missingPeerIds
               )
 
-              adjustedStatusStartTime = if (didViewChange) now else newStatusStartTime
+              // Reset statusStartTime on any stall detection (not just view changes).
+              // This naturally rate-limits re-stalls: after detection, the timer restarts
+              // and another full declarationTimeout must elapse before the next stall fires.
+              adjustedStatusStartTime = if (didStall) now else newStatusStartTime
               finalStallCount =
-                if (didViewChange) newStallCount + 1
+                if (didStall) newStallCount + 1
                 else newStallCount
 
               _ <- Metrics[F].updateGauge("dag_consensus_stall_cycle", finalStallCount)
@@ -202,7 +205,7 @@ class StallDetector[F[_]: Async: Metrics, Event, Key, Artifact, Ctx, Status, Out
                 } else logger.debug("[CONSENSUS] Peer quality scores: no peers tracked yet")
               }.whenA(shouldLogScores && !shouldAbandon)
 
-              changed = resourcesChanged || statusChanged || didViewChange
+              changed = resourcesChanged || statusChanged || didStall
               newNoChangeCount = if (changed) 0 else ms.noChangeCount + 1
               sleepMs = if (changed) basePollInterval else math.min(basePollInterval * (newNoChangeCount + 1), maxPollInterval)
               _ <- Temporal[F].sleep(sleepMs.millis).unlessA(shouldAbandon)
@@ -254,18 +257,17 @@ class StallDetector[F[_]: Async: Metrics, Event, Key, Artifact, Ctx, Status, Out
     }
   }
 
-  /** Handle a stall condition. Returns true if a view change was performed. */
+  /** Handle a stall condition. Returns true if a stall was detected (view change or non-proposal timeout). */
   private def handleStall(
     key: Key,
     state: ConsensusState[Key, Status, Outcome, Kind],
     declarationTimeout: FiniteDuration,
     statusDuration: FiniteDuration,
-    alreadyHandled: Boolean,
     declaredCount: Int,
     activeCount: Int,
     missingPeerIds: Set[String]
   ): F[Boolean] = {
-    val shouldHandle = statusDuration >= declarationTimeout && !alreadyHandled
+    val shouldHandle = statusDuration >= declarationTimeout
 
     if (shouldHandle) {
       val statusName = state.status.getClass.getSimpleName.stripSuffix("$")

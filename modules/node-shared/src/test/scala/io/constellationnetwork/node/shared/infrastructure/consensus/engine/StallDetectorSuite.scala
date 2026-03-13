@@ -123,13 +123,12 @@ object StallDetectorSuite extends SimpleIOSuite with Checkers {
 
   // === handleStall decision logic tests ===
 
-  test("shouldHandle is true when statusDuration >= declarationTimeout and not already handled") {
+  test("shouldHandle is true when statusDuration >= declarationTimeout") {
     IO {
       val declarationTimeout = 35.seconds
       val statusDuration = 36.seconds
-      val alreadyHandled = false
 
-      val shouldHandle = statusDuration >= declarationTimeout && !alreadyHandled
+      val shouldHandle = statusDuration >= declarationTimeout
       expect(shouldHandle)
     }
   }
@@ -138,21 +137,32 @@ object StallDetectorSuite extends SimpleIOSuite with Checkers {
     IO {
       val declarationTimeout = 35.seconds
       val statusDuration = 34.seconds
-      val alreadyHandled = false
 
-      val shouldHandle = statusDuration >= declarationTimeout && !alreadyHandled
+      val shouldHandle = statusDuration >= declarationTimeout
       expect(!shouldHandle)
     }
   }
 
-  test("shouldHandle is false when already handled") {
+  test("shouldHandle fires again after statusStartTime resets (no alreadyHandled guard)") {
     IO {
+      // After Phase 2 fix: alreadyHandled was removed. handleStall fires every time
+      // statusDuration >= declarationTimeout. The natural rate-limiting comes from
+      // resetting statusStartTime to `now` after each stall detection.
       val declarationTimeout = 35.seconds
       val statusDuration = 36.seconds
-      val alreadyHandled = true
 
-      val shouldHandle = statusDuration >= declarationTimeout && !alreadyHandled
-      expect(!shouldHandle)
+      // First stall
+      val shouldHandle1 = statusDuration >= declarationTimeout
+      // After statusStartTime reset, time must elapse again before next stall fires
+      val statusDurationAfterReset = 2.seconds // just reset, barely any time elapsed
+      val shouldHandle2 = statusDurationAfterReset >= declarationTimeout
+      // After another full timeout elapses
+      val statusDurationAfterWait = 36.seconds
+      val shouldHandle3 = statusDurationAfterWait >= declarationTimeout
+
+      expect(shouldHandle1) && // first stall fires
+      expect(!shouldHandle2) && // too soon after reset
+      expect(shouldHandle3) // fires again after full timeout
     }
   }
 
@@ -169,15 +179,25 @@ object StallDetectorSuite extends SimpleIOSuite with Checkers {
     }
   }
 
-  test("statusStartTime resets on view change") {
+  test("statusStartTime resets on any stall detection (view change or non-proposal)") {
     IO {
       val now = 100.seconds
-      val didViewChange = true
       val previousStartTime = 50.seconds
 
-      // After view change, the adjustedStatusStartTime is set to now
-      val adjustedStatusStartTime = if (didViewChange) now else previousStartTime
-      expect.same(now, adjustedStatusStartTime)
+      // After Phase 2 fix: statusStartTime resets on ANY stall, not just view changes.
+      // This naturally rate-limits re-stalls.
+      val didStallViewChange = true
+      val adjustedOnViewChange = if (didStallViewChange) now else previousStartTime
+
+      val didStallNonProposal = true
+      val adjustedOnNonProposal = if (didStallNonProposal) now else previousStartTime
+
+      val noStall = false
+      val adjustedNoStall = if (noStall) now else previousStartTime
+
+      expect.same(now, adjustedOnViewChange) &&
+      expect.same(now, adjustedOnNonProposal) &&
+      expect.same(previousStartTime, adjustedNoStall)
     }
   }
 
@@ -191,13 +211,19 @@ object StallDetectorSuite extends SimpleIOSuite with Checkers {
     }
   }
 
-  test("stallCount increments on view change") {
+  test("stallCount increments on any stall (view change or non-proposal)") {
     IO {
-      val didViewChange = true
       val previousStallCount = 2
 
-      val finalStallCount = if (didViewChange) previousStallCount + 1 else previousStallCount
-      expect.same(3, finalStallCount)
+      // After Phase 2 fix: stallCount increments on ANY stall type, not just view changes.
+      val didStall = true
+      val finalStallCount = if (didStall) previousStallCount + 1 else previousStallCount
+
+      val noStall = false
+      val unchangedStallCount = if (noStall) previousStallCount + 1 else previousStallCount
+
+      expect.same(3, finalStallCount) &&
+      expect.same(2, unchangedStallCount)
     }
   }
 
@@ -419,6 +445,147 @@ object StallDetectorSuite extends SimpleIOSuite with Checkers {
       expect.same(200L, sleepMs1) &&
       expect.same(600L, sleepMs5) &&
       expect.same(1000L, sleepMs20) // capped at maxPollInterval
+    }
+  }
+
+  // === Stall cycle progression (Phase 2 fix verification) ===
+  // These tests verify the full stall cycle accumulation logic after removing
+  // the alreadyHandled guard. The key invariant: each stall detection resets
+  // statusStartTime, so another full declarationTimeout must elapse before the
+  // next stall fires. stallCount increments on EVERY stall type (view change
+  // or non-proposal), not just view changes.
+
+  test("stall count increments on each detection cycle") {
+    IO {
+      val declarationTimeout = 35.seconds
+      val maxStallCycles = 5
+
+      // Simulate the state machine through multiple stall detection cycles.
+      // Each cycle: wait declarationTimeout → stall fires → statusStartTime resets → stallCount increments.
+      case class SimState(stallCount: Int, statusStartTime: FiniteDuration)
+
+      def simulateStep(sim: SimState, now: FiniteDuration, statusChanged: Boolean): SimState = {
+        val newStallCount = if (statusChanged) 0 else sim.stallCount
+        val newStatusStartTime = if (statusChanged) now else sim.statusStartTime
+        val statusDuration = now - newStatusStartTime
+        val shouldHandle = statusDuration >= declarationTimeout
+        val didStall = shouldHandle // non-proposal phase always returns true when shouldHandle
+
+        val adjustedStatusStartTime = if (didStall) now else newStatusStartTime
+        val finalStallCount = if (didStall) newStallCount + 1 else newStallCount
+
+        SimState(finalStallCount, adjustedStatusStartTime)
+      }
+
+      val start = SimState(stallCount = 0, statusStartTime = 0.seconds)
+
+      // Cycle 1: at t=36s, stall fires → stallCount=1
+      val after1 = simulateStep(start, 36.seconds, statusChanged = false)
+      // Cycle 2: statusStartTime reset to 36s, at t=72s → stall fires → stallCount=2
+      val after2 = simulateStep(after1, 72.seconds, statusChanged = false)
+      // Cycle 3: statusStartTime reset to 72s, at t=108s → stall fires → stallCount=3
+      val after3 = simulateStep(after2, 108.seconds, statusChanged = false)
+      // Cycle 4: at t=144s → stallCount=4
+      val after4 = simulateStep(after3, 144.seconds, statusChanged = false)
+      // Cycle 5: at t=180s → stallCount=5 = maxStallCycles → should abandon
+      val after5 = simulateStep(after4, 180.seconds, statusChanged = false)
+
+      expect.same(1, after1.stallCount) &&
+      expect.same(2, after2.stallCount) &&
+      expect.same(3, after3.stallCount) &&
+      expect.same(4, after4.stallCount) &&
+      expect.same(5, after5.stallCount) &&
+      expect(after5.stallCount >= maxStallCycles) // abandon condition met
+    }
+  }
+
+  test("round abandoned after exactly maxStallCycles stall detections") {
+    IO {
+      val maxStallCycles = 5
+      val maxRoundDuration = Some(300.seconds)
+      val declarationTimeout = 35.seconds
+
+      // Verify that stallCount reaches maxStallCycles after exactly maxStallCycles stall detections,
+      // triggering abandon.
+      val stallCounts = (1 to 6).scanLeft(0) {
+        case (count, _) =>
+          // Each step simulates: didStall = true, so count increments
+          count + 1
+      }
+
+      // stallCounts: 0, 1, 2, 3, 4, 5, 6
+      val beforeMaxStalls = stallCounts(4) // after 4 stalls
+      val atMaxStalls = stallCounts(5) // after 5 stalls
+
+      val roundElapsed = (5 * 36).seconds // well within maxRoundDuration
+      val roundTimedOut = maxRoundDuration.exists(roundElapsed >= _)
+
+      val shouldAbandonBefore = beforeMaxStalls >= maxStallCycles || roundTimedOut
+      val shouldAbandonAt = atMaxStalls >= maxStallCycles || roundTimedOut
+
+      expect(!shouldAbandonBefore) && // 4 stalls: not yet
+      expect(shouldAbandonAt) && // 5 stalls: abandon
+      expect(!roundTimedOut) // abandon was from stall count, not timeout
+    }
+  }
+
+  test("statusStartTime resets after each stall — next stall needs full timeout") {
+    IO {
+      val declarationTimeout = 35.seconds
+
+      // Simulate: stall at t=36s, statusStartTime resets to 36s
+      // At t=50s (14s after reset), should NOT fire again
+      // At t=72s (36s after reset), SHOULD fire again
+      val statusStartAfterReset = 36.seconds
+
+      val tooSoon = 50.seconds - statusStartAfterReset
+      val longEnough = 72.seconds - statusStartAfterReset
+
+      val shouldHandleTooSoon = tooSoon >= declarationTimeout
+      val shouldHandleLongEnough = longEnough >= declarationTimeout
+
+      expect(!shouldHandleTooSoon) && // 14s < 35s: too soon
+      expect(shouldHandleLongEnough) // 36s >= 35s: fires
+    }
+  }
+
+  test("non-proposal stall increments stallCount (previously only view changes did)") {
+    IO {
+      // Before Phase 2 fix: only didViewChange=true incremented stallCount.
+      // Non-proposal stalls (where we don't do a view change) never incremented,
+      // so maxStallCycles was dead code for non-proposal phases.
+      // After fix: didStall=true for BOTH proposal (view change) and non-proposal stalls.
+      val isProposalPhase = false
+      val statusDuration = 36.seconds
+      val declarationTimeout = 35.seconds
+      val previousStallCount = 2
+
+      // handleStall returns true for non-proposal phase when statusDuration >= timeout
+      val shouldHandle = statusDuration >= declarationTimeout
+      val didStall = shouldHandle // non-proposal just logs and returns true
+
+      val finalStallCount = if (didStall) previousStallCount + 1 else previousStallCount
+
+      expect(didStall) &&
+      expect.same(3, finalStallCount) // incremented even for non-proposal stall
+    }
+  }
+
+  test("status change resets stallCount — stall progression restarts from 0") {
+    IO {
+      // When the consensus advances to a new status (e.g., from Facility to Proposal),
+      // stallCount resets to 0. Stall detection starts fresh for the new phase.
+      val stallCountBeforeStatusChange = 3
+      val statusChanged = true
+
+      val newStallCount = if (statusChanged) 0 else stallCountBeforeStatusChange
+
+      // Then if a stall fires in the new status, it starts at 1
+      val didStall = true
+      val finalStallCount = if (didStall) newStallCount + 1 else newStallCount
+
+      expect.same(0, newStallCount) &&
+      expect.same(1, finalStallCount) // fresh start
     }
   }
 }

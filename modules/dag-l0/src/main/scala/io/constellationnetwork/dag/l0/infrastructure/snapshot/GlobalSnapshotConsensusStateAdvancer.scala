@@ -34,6 +34,7 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalArtifac
 import io.constellationnetwork.node.shared.infrastructure.snapshot.SnapshotConsensusFunctions.gossipForkInfo
 import io.constellationnetwork.node.shared.logger.LoggerBundle
 import io.constellationnetwork.schema.gossip.Ordinal
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security._
@@ -83,7 +84,8 @@ object GlobalSnapshotConsensusStateAdvancer {
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     clusterStorageInstance: ClusterStorage[F],
-    loggerBundle: LoggerBundle[F]
+    loggerBundle: LoggerBundle[F],
+    mptStore: MptStore[F, GlobalStateKey]
   ): GlobalSnapshotConsensusStateAdvancer[F] = new GlobalSnapshotConsensusStateAdvancer[F] {
 
     private val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromClass[F](getClass)
@@ -237,40 +239,52 @@ object GlobalSnapshotConsensusStateAdvancer {
     ): F[Option[Transition]] =
       loggerBundle.app.withOrdinal(status.proposalArtifactInfo.artifact.ordinal) {
         HasherSelector[F].withCurrent { implicit hasher =>
-          val leader = state.leader
-          val maybeLeaderProposal = resources.peerDeclarationsMap.get(leader).flatMap(_.proposal)
+          // Guard: if we already withdrew from this round, don't re-enter validation.
+          // Without this, a validation failure (which returns none[Transition]) causes a hot loop:
+          // the leader's proposal stays in resources, so every checkUpdate re-enters here,
+          // re-validates, re-fails, and re-withdraws (7+/sec observed in production).
+          val alreadyWithdrawn =
+            resources.withdrawalsMap.get(selfId).contains(GlobalConsensusKind.Signature: GlobalConsensusKind) ||
+              state.withdrawnFacilitators.value.contains(selfId)
 
-          maybeLeaderProposal match {
-            case Some(leaderProposal) =>
-              for {
-                _ <- loggerBundle.consensus.collectingProposals(List(leader))
-                _ <- checkForkByFacilitatorsHash(
-                  SortedMap(leader -> leaderProposal),
-                  status.facilitatorsHash
-                )(_.facilitatorsHash)
-                _ <- checkForkByLastSnapshotHash(
-                  SortedMap(leader -> leaderProposal),
-                  status.lastSnapshotHash
-                )
-                result <- resolveLeaderProposal(state, status, resources, leaderProposal)
-              } yield result
-            case None =>
-              if (selfId === state.leader)
-                // Leader (possibly after view change) — spread proposal so peers can advance
-                logger.info(
-                  s"[CONSENSUS:LEADER] Re-spreading proposal key=${state.key.show} hash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
-                    s"targets=${state.facilitators.value.size} view=${state.viewNumber}"
-                ) >>
-                  spreadProposal(
-                    state,
-                    state.key,
-                    status.proposalArtifactInfo.hash,
-                    status.facilitatorsHash,
-                    status.proposalArtifactInfo.artifact,
+          if (alreadyWithdrawn)
+            none[Transition].pure[F]
+          else {
+            val leader = state.leader
+            val maybeLeaderProposal = resources.peerDeclarationsMap.get(leader).flatMap(_.proposal)
+
+            maybeLeaderProposal match {
+              case Some(leaderProposal) =>
+                for {
+                  _ <- loggerBundle.consensus.collectingProposals(List(leader))
+                  _ <- checkForkByFacilitatorsHash(
+                    SortedMap(leader -> leaderProposal),
+                    status.facilitatorsHash
+                  )(_.facilitatorsHash)
+                  _ <- checkForkByLastSnapshotHash(
+                    SortedMap(leader -> leaderProposal),
                     status.lastSnapshotHash
-                  ).as(none[Transition])
-              else
-                none[Transition].pure[F]
+                  )
+                  result <- resolveLeaderProposal(state, status, resources, leaderProposal)
+                } yield result
+              case None =>
+                if (selfId === state.leader)
+                  // Leader (possibly after view change) — spread proposal so peers can advance
+                  logger.info(
+                    s"[CONSENSUS:LEADER] Re-spreading proposal key=${state.key.show} hash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
+                      s"targets=${state.facilitators.value.size} view=${state.viewNumber}"
+                  ) >>
+                    spreadProposal(
+                      state,
+                      state.key,
+                      status.proposalArtifactInfo.hash,
+                      status.facilitatorsHash,
+                      status.proposalArtifactInfo.artifact,
+                      status.lastSnapshotHash
+                    ).as(none[Transition])
+                else
+                  none[Transition].pure[F]
+            }
           }
         }
       }
@@ -291,32 +305,40 @@ object GlobalSnapshotConsensusStateAdvancer {
           Metrics[F].incrementCounter("dag_consensus_proposal_affinity_match") >>
           buildSignatureTransition(state, status, status.proposalArtifactInfo, List(leaderProposal.hash)).map(_.some)
       } else {
-        // Leader proposed a different artifact — validate theirs
+        // Leader proposed a different artifact — validate theirs.
+        // Validation calls createProposalArtifact which mutates the shared MptStore.
+        // We take a savepoint before validation and restore on failure to prevent
+        // contaminated state from cascading to future rounds (stateProofDiffers).
         resources.artifacts.get(leaderProposal.hash) match {
           case Some(leaderArtifact) =>
-            validateLeaderArtifact(state, status, leaderArtifact, leaderProposal.hash).flatMap {
-              case Right(leaderInfo) =>
-                logger.info(
-                  s"[CONSENSUS:$role] PROPOSALS->SIGNATURES key=${state.key.show} matchesOwn=false " +
-                    s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
-                    s"trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
-                ) >>
-                  Metrics[F].incrementCounter("dag_consensus_proposal_affinity_mismatch_accepted") >>
-                  buildSignatureTransition(state, status, leaderInfo, List(leaderProposal.hash)).map(_.some)
-              case Left(invalidArtifact) =>
-                val diffDetail = describeInvalidArtifact(invalidArtifact)
-                logger.warn(
-                  s"[CONSENSUS:$role] Leader proposal FAILED validation key=${state.key.show} " +
-                    s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
-                    s"leader=${state.leader.show.take(8)}... view=${state.viewNumber} reason=$diffDetail"
-                ) >>
+            mptStore.savepoint.flatMap { sp =>
+              validateLeaderArtifact(state, status, leaderArtifact, leaderProposal.hash).flatMap {
+                case Right(leaderInfo) =>
+                  // Validation succeeded — MptStore mutations are correct, keep them
                   logger.info(
-                    s"[CONSENSUS:$role] Withdrawing from round key=${state.key.show} reason=proposal_validation_failed"
+                    s"[CONSENSUS:$role] PROPOSALS->SIGNATURES key=${state.key.show} matchesOwn=false " +
+                      s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
+                      s"trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
                   ) >>
-                  gossip.spread(ConsensusWithdrawPeerDeclaration(state.key, GlobalConsensusKind.Signature: GlobalConsensusKind)) >>
-                  Metrics[F].incrementCounter("dag_consensus_proposal_validation_failure") >>
-                  Metrics[F].incrementCounter("dag_consensus_withdrawal_sent") >>
-                  none[Transition].pure[F]
+                    Metrics[F].incrementCounter("dag_consensus_proposal_affinity_mismatch_accepted") >>
+                    buildSignatureTransition(state, status, leaderInfo, List(leaderProposal.hash)).map(_.some)
+                case Left(invalidArtifact) =>
+                  // Validation failed — restore MptStore to pre-validation state
+                  val diffDetail = describeInvalidArtifact(invalidArtifact)
+                  sp.restore >>
+                    logger.warn(
+                      s"[CONSENSUS:$role] Leader proposal FAILED validation key=${state.key.show} " +
+                        s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
+                        s"leader=${state.leader.show.take(8)}... view=${state.viewNumber} reason=$diffDetail"
+                    ) >>
+                    logger.info(
+                      s"[CONSENSUS:$role] Withdrawing from round key=${state.key.show} reason=proposal_validation_failed (MptStore restored)"
+                    ) >>
+                    gossip.spread(ConsensusWithdrawPeerDeclaration(state.key, GlobalConsensusKind.Signature: GlobalConsensusKind)) >>
+                    Metrics[F].incrementCounter("dag_consensus_proposal_validation_failure") >>
+                    Metrics[F].incrementCounter("dag_consensus_withdrawal_sent") >>
+                    none[Transition].pure[F]
+              }
             }
           case None =>
             // Leader's artifact not yet received via gossip — wait

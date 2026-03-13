@@ -451,7 +451,8 @@ ConsensusConfig(
 |---|---|---|
 | `PeerQualityTrackerSuite` | 12 | Score computation, multi-peer tracking, decay, formula |
 | `FacilitatorSelectorSuite` | 11 | Deterministic selection, view rotation, weighted selection |
-| `StallDetectorSuite` | 16 | Timeout logic, view change transitions, abandon conditions |
+| `StallDetectorSuite` | 28 | Timeout logic, view change transitions, abandon conditions, stall cycle progression |
+| `MptStoreSavepointSuite` | 4 | Savepoint capture/restore for producer and MptStore |
 | `QuorumDeclarationsSuite` | 17 | Quorum thresholds, safe majority, backward compatibility |
 
 ---
@@ -685,10 +686,18 @@ ConsensusStateAdvancer (during each phase transition)
 
 ```
 resolveLeaderProposal()
-  └── validateLeaderArtifact() returns None
-        └── Log: [CONSENSUS:FOLLOWER] Leader proposal FAILED validation
+  └── mptStore.savepoint (capture state before validation)
+        └── validateLeaderArtifact() returns Left(invalidArtifact)
+              ├── savepoint.restore (rollback MptStore mutations)
+              ├── Log: [CONSENSUS:FOLLOWER] Leader proposal FAILED validation
+              ├── Send withdrawal (prevents hot-loop re-entry)
               └── Wait for StallDetector to trigger view change
 ```
+
+> **Note:** See [CONSENSUS_PRODUCTION_FIXES.md](CONSENSUS_PRODUCTION_FIXES.md) for detailed
+> documentation of the 5 production bugs fixed in this area (hot loop guard,
+> stall detector re-stalling, facilitator cluster state filter, MptStore
+> savepoint/restore).
 
 ### Logging Conventions
 

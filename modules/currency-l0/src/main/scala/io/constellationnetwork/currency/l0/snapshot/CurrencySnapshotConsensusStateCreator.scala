@@ -85,6 +85,9 @@ object CurrencySnapshotConsensusStateCreator {
 
         // Full base WITHOUT removal filter — so removed peers can re-enter in future rounds.
         // The removal filter is only applied for active selection THIS round (see eligibleThisRound below).
+        // Note: we do NOT filter by cluster state here because each node has a different local view
+        // of peer states, making such filtering non-deterministic across the network. Instead, the
+        // StallDetector handles unreachable peers via view change (proposal phase) and round abandon.
         fullBase = (filteredPreviousEligible ++ filteredCandidates :+ selfId).distinct
 
         _ <- logger.debug(

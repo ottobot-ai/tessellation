@@ -238,39 +238,51 @@ object CurrencySnapshotConsensusStateAdvancer {
         status: CollectingProposals,
         resources: ConsensusResources[CurrencySnapshotArtifact, CurrencyConsensusKind]
       )(implicit hasher: Hasher[F]): F[Option[Transition]] = {
-        val leader = state.leader
-        val maybeLeaderProposal = resources.peerDeclarationsMap.get(leader).flatMap(_.proposal)
+        // Guard: if we already withdrew from this round, don't re-enter validation.
+        // Without this, a validation failure (which returns none[Transition]) causes a hot loop:
+        // the leader's proposal stays in resources, so every checkUpdate re-enters here,
+        // re-validates, re-fails, and re-withdraws (7+/sec observed in production).
+        val alreadyWithdrawn =
+          resources.withdrawalsMap.get(selfId).contains(CurrencyConsensusKind.Signature: CurrencyConsensusKind) ||
+            state.withdrawnFacilitators.value.contains(selfId)
 
-        maybeLeaderProposal match {
-          case Some(leaderProposal) =>
-            for {
-              _ <- checkForkByFacilitatorsHash(
-                SortedMap(leader -> leaderProposal),
-                status.facilitatorsHash
-              )(_.facilitatorsHash)
-              _ <- checkForkByLastSnapshotHash(
-                SortedMap(leader -> leaderProposal),
-                status.lastSnapshotHash
-              )
-              result <- resolveLeaderProposal(state, status, resources, leaderProposal)
-            } yield result
-          case None =>
-            if (selfId === state.leader)
-              // Leader (possibly after view change) — spread proposal so peers can advance
-              logger.info(
-                s"[CONSENSUS:LEADER] Re-spreading proposal key=${state.key.show} hash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
-                  s"targets=${state.facilitators.value.size} view=${state.viewNumber}"
-              ) >>
-                spreadProposal(
-                  state,
-                  state.key,
-                  status.proposalArtifactInfo.hash,
-                  status.facilitatorsHash,
-                  status.proposalArtifactInfo.artifact,
+        if (alreadyWithdrawn)
+          none[Transition].pure[F]
+        else {
+          val leader = state.leader
+          val maybeLeaderProposal = resources.peerDeclarationsMap.get(leader).flatMap(_.proposal)
+
+          maybeLeaderProposal match {
+            case Some(leaderProposal) =>
+              for {
+                _ <- checkForkByFacilitatorsHash(
+                  SortedMap(leader -> leaderProposal),
+                  status.facilitatorsHash
+                )(_.facilitatorsHash)
+                _ <- checkForkByLastSnapshotHash(
+                  SortedMap(leader -> leaderProposal),
                   status.lastSnapshotHash
-                ).as(none[Transition])
-            else
-              none[Transition].pure[F]
+                )
+                result <- resolveLeaderProposal(state, status, resources, leaderProposal)
+              } yield result
+            case None =>
+              if (selfId === state.leader)
+                // Leader (possibly after view change) — spread proposal so peers can advance
+                logger.info(
+                  s"[CONSENSUS:LEADER] Re-spreading proposal key=${state.key.show} hash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
+                    s"targets=${state.facilitators.value.size} view=${state.viewNumber}"
+                ) >>
+                  spreadProposal(
+                    state,
+                    state.key,
+                    status.proposalArtifactInfo.hash,
+                    status.facilitatorsHash,
+                    status.proposalArtifactInfo.artifact,
+                    status.lastSnapshotHash
+                  ).as(none[Transition])
+              else
+                none[Transition].pure[F]
+          }
         }
       }
 
