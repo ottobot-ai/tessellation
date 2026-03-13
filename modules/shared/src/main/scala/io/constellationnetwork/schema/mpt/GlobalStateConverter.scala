@@ -29,8 +29,15 @@ import io.constellationnetwork.security.signature.Signed
 
 import io.circe.syntax.EncoderOps
 import io.circe.{Encoder, Json}
+import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object GlobalStateConverter {
+
+  private val MptDebugEnabled: Boolean =
+    sys.env.get("CL_MPT_DEBUG_DUMP").exists(_.toLowerCase == "true")
+
+  private val MptDebugDir: java.nio.file.Path =
+    java.nio.file.Paths.get(sys.env.getOrElse("CL_MPT_DEBUG_DIR", "/tmp/mpt-debug"))
 
   case class StateChangesAccumulator(
     lastStateChannelSnapshotHashes: SortedMap[Address, Hash] = SortedMap.empty,
@@ -58,6 +65,84 @@ object GlobalStateConverter {
     removedNodeCollateralKeys: Set[Address] = Set.empty,
     removedNodeCollateralWithdrawalKeys: Set[Address] = Set.empty
   )
+
+  /** Temporary debug function: dumps MPT delta inputs and full state fingerprint to disk for cross-node comparison. Enable with
+    * CL_MPT_DEBUG_DUMP=true env var. Output dir: CL_MPT_DEBUG_DIR (default /tmp/mpt-debug).
+    *
+    * Files per ordinal:
+    *   - {ordinal}-delta.txt: sorted hex_key + value_hash + fieldId for entries being upserted
+    *   - {ordinal}-removals.txt: sorted hex_key + fieldId for keys being removed
+    *   - {ordinal}-full-state.txt: sorted hex_key + value_hash for ALL entries after sync
+    *
+    * Diff these files between nodes to find exactly which entries diverge.
+    */
+  private def dumpMptDebugSnapshot[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    snapshotOrdinal: SnapshotOrdinal,
+    store: MptStore[F, GlobalStateKey],
+    deltaEntries: Map[GlobalStateKey, Json],
+    removalKeys: Set[GlobalStateKey]
+  ): F[Unit] = {
+    val debugLogger = Slf4jLogger.getLoggerFromName[F]("MPT.Debug")
+    val ordStr = snapshotOrdinal.value.value.toString
+
+    def writeFile(name: String, content: String): F[Unit] =
+      Async[F].blocking {
+        val _ = java.nio.file.Files.createDirectories(MptDebugDir)
+        val _ = java.nio.file.Files.writeString(
+          MptDebugDir.resolve(name),
+          content,
+          java.nio.charset.StandardCharsets.UTF_8
+        )
+      }
+
+    (for {
+      _ <- debugLogger.info(s"[MPT.Debug] Dumping debug snapshot for ordinal=$ordStr")
+
+      // 1. Delta entries: hex_key value_hash fieldId
+      deltaLines <- deltaEntries.toList.parTraverse {
+        case (key, json) =>
+          for {
+            hex <- GlobalStateKey.toHex[F](key)
+            bytes <- JsonSerializer[F].serialize(json)
+            hash <- Hasher[F].hashBytes(bytes)
+          } yield s"${hex.value} ${hash.value} ${key.fieldId}"
+      }
+      _ <- writeFile(
+        s"$ordStr-delta.txt",
+        s"# ordinal=$ordStr upserts=${deltaLines.size}\n" +
+          deltaLines.sorted.mkString("\n") + "\n"
+      )
+
+      // 2. Removal keys: hex_key fieldId
+      removalLines <- removalKeys.toList.parTraverse { key =>
+        GlobalStateKey.toHex[F](key).map(hex => s"${hex.value} ${key.fieldId}")
+      }
+      _ <- writeFile(
+        s"$ordStr-removals.txt",
+        s"# ordinal=$ordStr removals=${removalLines.size}\n" +
+          removalLines.sorted.mkString("\n") + "\n"
+      )
+
+      // 3. Full state fingerprint after sync: hex_key value_hash
+      allEntries <- store.underlying.entries
+      fullStateLines <- allEntries.toList.parTraverse {
+        case (hex, bytes) =>
+          Hasher[F].hashBytes(bytes).map(hash => s"${hex.value} ${hash.value}")
+      }
+      rootHash <- store.underlying.getRootHashForOrdinal(snapshotOrdinal)
+      _ <- writeFile(
+        s"$ordStr-full-state.txt",
+        s"# ordinal=$ordStr totalEntries=${allEntries.size} rootHash=${rootHash.map(_.value.show).getOrElse("none")}\n" +
+          fullStateLines.sorted.mkString("\n") + "\n"
+      )
+
+      _ <- debugLogger.info(
+        s"[MPT.Debug] Dumped ordinal=$ordStr: delta=${deltaLines.size} removals=${removalLines.size} fullState=${allEntries.size}"
+      )
+    } yield ()).handleErrorWith { err =>
+      debugLogger.error(err)(s"[MPT.Debug] Failed to dump debug snapshot for ordinal=$ordStr")
+    }
+  }
 
   private def convertRequiredHypergraph[F[_]: Sync: Parallel, A: Encoder](
     data: SortedMap[Address, A],
@@ -382,6 +467,7 @@ object GlobalStateConverter {
       def syncFromStateChanges(acc: StateChangesAccumulator, snapshotOrdinal: SnapshotOrdinal)(
         implicit stateProofSelector: StateProofSelector
       ): F[Unit] = {
+        val syncLogger = org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("MPT.Sync")
         val BatchSize = 5000
 
         // Convert removal keys from accumulator to GlobalStateKey
@@ -416,6 +502,26 @@ object GlobalStateConverter {
         for {
           entries <- acc.toStateEntries[F]
           keysToRemove = toRemovalGlobalStateKeys
+
+          // Log per-category entry counts for divergence diagnosis
+          _ <- syncLogger.info(
+            s"[MPT.Sync] ordinal=$snapshotOrdinal delta: " +
+              s"scHashes=${acc.lastStateChannelSnapshotHashes.size} " +
+              s"txRefs=${acc.lastTxRefs.size} " +
+              s"balances=${acc.balances.size} " +
+              s"currencySnapshots=${acc.lastCurrencySnapshots.size} " +
+              s"currencyProofs=${acc.lastCurrencySnapshotsProofs.size} " +
+              s"allowSpends=${acc.activeAllowSpends.values.map(_.values.map(_.size).sum).sum} " +
+              s"tokenLocks=${acc.activeTokenLocks.values.map(_.size).sum} " +
+              s"tokenLockBal=${acc.tokenLockBalances.size} " +
+              s"delegStakes=${acc.activeDelegatedStakes.size} " +
+              s"delegWithdrawals=${acc.delegatedStakesWithdrawals.size} " +
+              s"nodeCollaterals=${acc.activeNodeCollaterals.size} " +
+              s"collateralWithdrawals=${acc.nodeCollateralWithdrawals.size} " +
+              s"metagraphSync=${acc.metagraphSyncData.size} " +
+              s"totalEntries=${entries.size} removals=${keysToRemove.size}"
+          )
+
           // Remove stale keys first (entries that are now empty: AllowSpends, TokenLocks,
           // TokenLockBalances, DelegatedStakes, DelegatedStakeWithdrawals, NodeCollaterals, NodeCollateralWithdrawals)
           _ <- store.remove(keysToRemove.toList).whenA(keysToRemove.nonEmpty)
@@ -432,6 +538,17 @@ object GlobalStateConverter {
                   store.insert[Json](batch.toMap) >> Async[F].cede
                 } >> store.sync[Json](batches.last.toMap, snapshotOrdinal)
             }
+
+          // Log total MPT entry count after sync for cross-node comparison
+          totalMptEntries <- store.underlying.entries.map(_.size)
+          rootHash <- store.underlying.getRootHashForOrdinal(snapshotOrdinal)
+          _ <- syncLogger.info(
+            s"[MPT.Sync] ordinal=$snapshotOrdinal AFTER: totalMptEntries=$totalMptEntries " +
+              s"rootHash=${rootHash.map(_.show.take(12)).getOrElse("none")}"
+          )
+
+          // Dump debug snapshot to disk when CL_MPT_DEBUG_DUMP=true
+          _ <- dumpMptDebugSnapshot(snapshotOrdinal, store, entries, keysToRemove).whenA(MptDebugEnabled)
         } yield ()
       }
     }

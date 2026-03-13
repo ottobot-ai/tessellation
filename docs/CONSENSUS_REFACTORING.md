@@ -694,10 +694,12 @@ resolveLeaderProposal()
               └── Wait for StallDetector to trigger view change
 ```
 
-> **Note:** See [CONSENSUS_PRODUCTION_FIXES.md](CONSENSUS_PRODUCTION_FIXES.md) for detailed
-> documentation of the 5 production bugs fixed in this area (hot loop guard,
-> stall detector re-stalling, facilitator cluster state filter, MptStore
-> savepoint/restore).
+> **Note:** See [CONSENSUS_TECHNICAL_SPEC.md](CONSENSUS_TECHNICAL_SPEC.md) §14 for detailed
+> documentation of the production bugs fixed in this area (hot loop guard,
+> stall detector re-stalling, MptStore savepoint/restore). The cluster state
+> filter was implemented then reverted — local peer state views are non-deterministic
+> across nodes, causing `facilitatorsHash` forks. Unreachable peers are instead handled
+> by the StallDetector via view change and round abandon.
 
 ### Logging Conventions
 

@@ -73,9 +73,11 @@ object GlobalSnapshotConsensusStateCreator {
         filteredCandidates = approvedCandidates
           .filter(peerId => seedlist.isEmpty || seedlistPeerIds.contains(peerId))
 
-        // Peers removed by unlock consensus in the previous round.
-        // Deterministic: all nodes agreed on removedFacilitators via majority vote.
-        previouslyRemoved = lastOutcome.removedFacilitators.value
+        // Peers removed or withdrawn in the previous round.
+        // Deterministic: all nodes agreed on removedFacilitators and withdrawnFacilitators via majority vote.
+        // Including withdrawnFacilitators prevents re-selecting peers that couldn't participate
+        // (e.g., offline/unreachable) — avoids infinite retry loops with the same unresponsive facilitators.
+        previouslyRemoved = lastOutcome.removedFacilitators.value ++ lastOutcome.withdrawnFacilitators.value
 
         // Full base WITHOUT removal filter — so removed peers can re-enter in future rounds.
         // The removal filter is only applied for active selection THIS round (see eligibleThisRound below).

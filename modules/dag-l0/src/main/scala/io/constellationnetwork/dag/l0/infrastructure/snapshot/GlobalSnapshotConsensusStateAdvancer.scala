@@ -33,10 +33,10 @@ import io.constellationnetwork.node.shared.infrastructure.node.RestartService
 import io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalArtifactMismatch
 import io.constellationnetwork.node.shared.infrastructure.snapshot.SnapshotConsensusFunctions.gossipForkInfo
 import io.constellationnetwork.node.shared.logger.LoggerBundle
+import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.gossip.Ordinal
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
@@ -204,6 +204,12 @@ object GlobalSnapshotConsensusStateAdvancer {
             s" facilitatorsHash=${facilitatorsHash.show.take(8)}... lastSnapshotHash=${state.lastOutcome.finished.snapshotHash.show
                 .take(8)}... entropy=${state.entropy.show.take(8)}..."
         )
+        _ <- logger.info(
+          s"[CONSENSUS:$role] Proposal stateProof key=${state.key.show}: ${describeStateProof(artifact.stateProof)}"
+        )
+        _ <- logger.info(
+          s"[CONSENSUS:$role] Proposal context key=${state.key.show}: ${contextDigest(context)}"
+        )
       } yield
         Transition(
           newState = state.copy(status =
@@ -325,11 +331,16 @@ object GlobalSnapshotConsensusStateAdvancer {
                 case Left(invalidArtifact) =>
                   // Validation failed — restore MptStore to pre-validation state
                   val diffDetail = describeInvalidArtifact(invalidArtifact)
+                  val ownCtx = status.proposalArtifactInfo.context
+                  val ctxDigest = contextDigest(ownCtx)
                   sp.restore >>
                     logger.warn(
                       s"[CONSENSUS:$role] Leader proposal FAILED validation key=${state.key.show} " +
                         s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
                         s"leader=${state.leader.show.take(8)}... view=${state.viewNumber} reason=$diffDetail"
+                    ) >>
+                    logger.info(
+                      s"[CONSENSUS:$role] Own context digest key=${state.key.show}: $ctxDigest"
                     ) >>
                     logger.info(
                       s"[CONSENSUS:$role] Withdrawing from round key=${state.key.show} reason=proposal_validation_failed (MptStore restored)"
@@ -393,18 +404,150 @@ object GlobalSnapshotConsensusStateAdvancer {
         if (leader.epochProgress =!= own.epochProgress)
           diffs += s"epochProgress(leader=${leader.epochProgress.show},own=${own.epochProgress.show})"
         if (leader.tips =!= own.tips) diffs += "tipsDiffer"
-        if (leader.stateProof =!= own.stateProof) diffs += "stateProofDiffers"
+        if (leader.stateProof =!= own.stateProof) {
+          val lp = leader.stateProof
+          val op = own.stateProof
+          val spDiffs = List.newBuilder[String]
+          if (lp.lastStateChannelSnapshotHashesProof =!= op.lastStateChannelSnapshotHashesProof)
+            spDiffs += s"scHashesProof(l=${lp.lastStateChannelSnapshotHashesProof.show.take(8)},o=${op.lastStateChannelSnapshotHashesProof.show
+                .take(8)})"
+          if (lp.lastTxRefsProof =!= op.lastTxRefsProof)
+            spDiffs += s"txRefsProof(l=${lp.lastTxRefsProof.show.take(8)},o=${op.lastTxRefsProof.show.take(8)})"
+          if (lp.balancesProof =!= op.balancesProof)
+            spDiffs += s"balancesProof(l=${lp.balancesProof.show.take(8)},o=${op.balancesProof.show.take(8)})"
+          if (lp.lastCurrencySnapshotsProof =!= op.lastCurrencySnapshotsProof)
+            spDiffs += "currencySnapshotsProof"
+          if (lp.activeAllowSpends =!= op.activeAllowSpends)
+            spDiffs += s"activeAllowSpends(l=${lp.activeAllowSpends.map(_.show.take(8))},o=${op.activeAllowSpends.map(_.show.take(8))})"
+          if (lp.activeTokenLocks =!= op.activeTokenLocks)
+            spDiffs += s"activeTokenLocks(l=${lp.activeTokenLocks.map(_.show.take(8))},o=${op.activeTokenLocks.map(_.show.take(8))})"
+          if (lp.tokenLockBalances =!= op.tokenLockBalances)
+            spDiffs += s"tokenLockBalances(l=${lp.tokenLockBalances.map(_.show.take(8))},o=${op.tokenLockBalances.map(_.show.take(8))})"
+          if (lp.lastAllowSpendRefs =!= op.lastAllowSpendRefs)
+            spDiffs += s"lastAllowSpendRefs(l=${lp.lastAllowSpendRefs.map(_.show.take(8))},o=${op.lastAllowSpendRefs.map(_.show.take(8))})"
+          if (lp.lastTokenLockRefs =!= op.lastTokenLockRefs)
+            spDiffs += s"lastTokenLockRefs(l=${lp.lastTokenLockRefs.map(_.show.take(8))},o=${op.lastTokenLockRefs.map(_.show.take(8))})"
+          if (lp.updateNodeParameters =!= op.updateNodeParameters)
+            spDiffs += s"updateNodeParams(l=${lp.updateNodeParameters.map(_.show.take(8))},o=${op.updateNodeParameters.map(_.show.take(8))})"
+          if (lp.activeDelegatedStakes =!= op.activeDelegatedStakes)
+            spDiffs += s"activeDelegatedStakes(l=${lp.activeDelegatedStakes
+                .map(_.show.take(8))},o=${op.activeDelegatedStakes.map(_.show.take(8))})"
+          if (lp.delegatedStakesWithdrawals =!= op.delegatedStakesWithdrawals)
+            spDiffs += s"delegatedStakesWithdrawals(l=${lp.delegatedStakesWithdrawals.map(_.show.take(8))},o=${op.delegatedStakesWithdrawals
+                .map(_.show.take(8))})"
+          if (lp.activeNodeCollaterals =!= op.activeNodeCollaterals)
+            spDiffs += s"activeNodeCollaterals(l=${lp.activeNodeCollaterals
+                .map(_.show.take(8))},o=${op.activeNodeCollaterals.map(_.show.take(8))})"
+          if (lp.nodeCollateralWithdrawals =!= op.nodeCollateralWithdrawals)
+            spDiffs += s"nodeCollateralWithdrawals(l=${lp.nodeCollateralWithdrawals.map(_.show.take(8))},o=${op.nodeCollateralWithdrawals
+                .map(_.show.take(8))})"
+          if (lp.priceState =!= op.priceState)
+            spDiffs += s"priceState(l=${lp.priceState.map(_.show.take(8))},o=${op.priceState.map(_.show.take(8))})"
+          if (lp.lastGlobalSnapshotsWithCurrency =!= op.lastGlobalSnapshotsWithCurrency)
+            spDiffs += s"lastGlobalSnapshotsWithCurrency(l=${lp.lastGlobalSnapshotsWithCurrency.map(_.show.take(8))},o=${op.lastGlobalSnapshotsWithCurrency
+                .map(_.show.take(8))})"
+          if (lp.mptRoot =!= op.mptRoot)
+            spDiffs += s"mptRoot(l=${lp.mptRoot.map(_.show.take(8))},o=${op.mptRoot.map(_.show.take(8))})"
+          val spResult = spDiffs.result()
+          if (spResult.isEmpty) diffs += "stateProofDiffers(no sub-field diff — possible serialization difference)"
+          else diffs += s"stateProofDiffers{${spResult.mkString(",")}}"
+        }
+        if (leader.nextFacilitators =!= own.nextFacilitators)
+          diffs += s"nextFacilitators(leader=${leader.nextFacilitators.size},own=${own.nextFacilitators.size})"
+        if (leader.delegateRewards =!= own.delegateRewards) {
+          val leaderDR = leader.delegateRewards.map(_.size).getOrElse(0)
+          val ownDR = own.delegateRewards.map(_.size).getOrElse(0)
+          diffs += s"delegateRewards(leader=$leaderDR,own=$ownDR)"
+        }
         val leaderAllowSpend = leader.allowSpendBlocks.map(_.size).getOrElse(0)
         val ownAllowSpend = own.allowSpendBlocks.map(_.size).getOrElse(0)
         if (leaderAllowSpend != ownAllowSpend) diffs += s"allowSpendBlocks(leader=$leaderAllowSpend,own=$ownAllowSpend)"
         val leaderTokenLock = leader.tokenLockBlocks.map(_.size).getOrElse(0)
         val ownTokenLock = own.tokenLockBlocks.map(_.size).getOrElse(0)
         if (leaderTokenLock != ownTokenLock) diffs += s"tokenLockBlocks(leader=$leaderTokenLock,own=$ownTokenLock)"
+        if (leader.spendActions =!= own.spendActions) {
+          val leaderSA = leader.spendActions.map(_.size).getOrElse(0)
+          val ownSA = own.spendActions.map(_.size).getOrElse(0)
+          diffs += s"spendActions(leader=$leaderSA,own=$ownSA)"
+        }
+        if (leader.activeDelegatedStakes =!= own.activeDelegatedStakes) {
+          val leaderADS = leader.activeDelegatedStakes.map(_.size).getOrElse(0)
+          val ownADS = own.activeDelegatedStakes.map(_.size).getOrElse(0)
+          diffs += s"activeDelegatedStakes(leader=$leaderADS,own=$ownADS)"
+        }
+        if (leader.delegatedStakesWithdrawals =!= own.delegatedStakesWithdrawals) {
+          val leaderDSW = leader.delegatedStakesWithdrawals.map(_.size).getOrElse(0)
+          val ownDSW = own.delegatedStakesWithdrawals.map(_.size).getOrElse(0)
+          diffs += s"delegatedStakesWithdrawals(leader=$leaderDSW,own=$ownDSW)"
+        }
+        if (leader.activeNodeCollaterals =!= own.activeNodeCollaterals) {
+          val leaderANC = leader.activeNodeCollaterals.map(_.size).getOrElse(0)
+          val ownANC = own.activeNodeCollaterals.map(_.size).getOrElse(0)
+          diffs += s"activeNodeCollaterals(leader=$leaderANC,own=$ownANC)"
+        }
+        if (leader.nodeCollateralWithdrawals =!= own.nodeCollateralWithdrawals) {
+          val leaderNCW = leader.nodeCollateralWithdrawals.map(_.size).getOrElse(0)
+          val ownNCW = own.nodeCollateralWithdrawals.map(_.size).getOrElse(0)
+          diffs += s"nodeCollateralWithdrawals(leader=$leaderNCW,own=$ownNCW)"
+        }
+        if (leader.updateNodeParameters =!= own.updateNodeParameters) {
+          val leaderUNP = leader.updateNodeParameters.map(_.size).getOrElse(0)
+          val ownUNP = own.updateNodeParameters.map(_.size).getOrElse(0)
+          diffs += s"updateNodeParameters(leader=$leaderUNP,own=$ownUNP)"
+        }
+        if (leader.version =!= own.version)
+          diffs += s"version(leader=${leader.version.show},own=${own.version.show})"
         val result = diffs.result()
         if (result.isEmpty) "GlobalArtifactMismatch(no field-level diff detected — possible serialization difference)"
         else s"GlobalArtifactMismatch[${result.mkString(",")}]"
       case other =>
         other.getClass.getSimpleName
+    }
+
+    /** Produces a compact representation of all stateProof sub-field hash prefixes for comparing leader vs follower. */
+    private def describeStateProof(sp: GlobalSnapshotStateProof): String = {
+      val parts = List.newBuilder[String]
+      parts += s"scHashes=${sp.lastStateChannelSnapshotHashesProof.show.take(8)}"
+      parts += s"txRefs=${sp.lastTxRefsProof.show.take(8)}"
+      parts += s"balances=${sp.balancesProof.show.take(8)}"
+      parts += s"currSnapshotsProof=${sp.lastCurrencySnapshotsProof.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"allowSpends=${sp.activeAllowSpends.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"tokenLocks=${sp.activeTokenLocks.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"tokenLockBal=${sp.tokenLockBalances.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"allowSpendRefs=${sp.lastAllowSpendRefs.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"tokenLockRefs=${sp.lastTokenLockRefs.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"nodeParams=${sp.updateNodeParameters.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"delegStakes=${sp.activeDelegatedStakes.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"delegWithdrawals=${sp.delegatedStakesWithdrawals.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"nodeCollaterals=${sp.activeNodeCollaterals.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"collateralWithdrawals=${sp.nodeCollateralWithdrawals.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"priceState=${sp.priceState.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"globalSnapsWithCurrency=${sp.lastGlobalSnapshotsWithCurrency.map(_.show.take(8)).getOrElse("none")}"
+      parts += s"mptRoot=${sp.mptRoot.map(_.show.take(8)).getOrElse("none")}"
+      parts.result().mkString(" ")
+    }
+
+    /** Produces a compact digest of GlobalSnapshotInfo field sizes/counts for diagnostic logging. Does NOT log actual data (state can be
+      * 90MB+), only counts and hash prefixes of the stateProof.
+      */
+    private def contextDigest(ctx: GlobalSnapshotContext): String = {
+      val parts = List.newBuilder[String]
+      parts += s"scHashes=${ctx.lastStateChannelSnapshotHashes.size}"
+      parts += s"txRefs=${ctx.lastTxRefs.size}"
+      parts += s"balances=${ctx.balances.size}"
+      parts += s"currencySnapshots=${ctx.lastCurrencySnapshots.size}"
+      parts += s"currencyProofs=${ctx.lastCurrencySnapshotsProofs.size}"
+      parts += s"allowSpends=${ctx.activeAllowSpends.map(_.values.map(_.values.map(_.size).sum).sum).getOrElse(0)}"
+      parts += s"tokenLocks=${ctx.activeTokenLocks.map(_.values.map(_.size).sum).getOrElse(0)}"
+      parts += s"tokenLockBal=${ctx.tokenLockBalances.map(_.size).getOrElse(0)}"
+      parts += s"delegStakes=${ctx.activeDelegatedStakes.map(_.size).getOrElse(0)}"
+      parts += s"delegWithdrawals=${ctx.delegatedStakesWithdrawals.map(_.size).getOrElse(0)}"
+      parts += s"nodeCollaterals=${ctx.activeNodeCollaterals.map(_.size).getOrElse(0)}"
+      parts += s"collateralWithdrawals=${ctx.nodeCollateralWithdrawals.map(_.size).getOrElse(0)}"
+      parts += s"updateNodeParams=${ctx.updateNodeParameters.map(_.size).getOrElse(0)}"
+      parts += s"priceState=${ctx.priceState.map(_.size).getOrElse(0)}"
+      parts += s"metagraphSync=${ctx.metagraphSyncData.map(_.size).getOrElse(0)}"
+      parts.result().mkString(" ")
     }
 
     private def buildSignatureTransition(
