@@ -200,7 +200,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         events.groupByNel(_.address).view.mapValues(_.map(_.snapshotBinary)).toSortedMap,
         SortedMap.empty,
         Set.empty,
-        Map.empty,
+        SortedMap.empty,
         SortedMap.empty
       )
     )
@@ -211,7 +211,10 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
       getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
     )(implicit hasher: Hasher[F]): IO[
-      SortedMap[Address, (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], Map[Address, Balance])]
+      SortedMap[
+        Address,
+        (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], SortedMap[Address, Balance])
+      ]
     ] = ???
 
   }

@@ -831,7 +831,7 @@ object GlobalSnapshotAcceptanceManager {
               .mapValues(SortedSet.from(_))
               .to(SortedMap)
 
-            allAcceptedSpendTxns = acceptedSpendActions.values.flatten
+            allAcceptedSpendTxns = acceptedSpendActions.toSortedMap.values.flatten
               .flatMap(spendAction => spendAction.spendTransactions.toList)
               .toList
 
@@ -992,7 +992,7 @@ object GlobalSnapshotAcceptanceManager {
                   }
               }
 
-            globalSpendTransactions = acceptedSpendActions.flatMap {
+            globalSpendTransactions = acceptedSpendActions.toSortedMap.flatMap {
               case (_, spendActions) =>
                 spendActions
                   .flatMap(_.spendTransactions.toList)
@@ -1091,6 +1091,23 @@ object GlobalSnapshotAcceptanceManager {
                 updatedBalancesByAllowSpendsDeltas ++
                 updatedBalancesByTokenLocksDeltas ++
                 updatedBalancesBySpendTransactionsDeltas
+
+            _ <- {
+              def fmtGroup(name: String, m: Map[Address, Balance]): String = {
+                val entries = m.toList.sortBy(_._1.value.value).map { case (a, b) => s"${a.show}=${b.value.value}" }
+                s"$name(${m.size}): ${if (entries.isEmpty) "-" else entries.mkString(",")}"
+              }
+              loggerBundle.app.info(
+                s"[MPT.Debug] ordinal=$ordinal balanceDelta\n" +
+                  s"  ${fmtGroup("txs", initialData.blockResult.contextUpdate.balances)}\n" +
+                  s"  ${fmtGroup("scFees", currencyAcceptanceBalanceUpdate)}\n" +
+                  s"  ${fmtGroup("rewards", rewardBalancesDelta)}\n" +
+                  s"  ${fmtGroup("allowSpends", updatedBalancesByAllowSpendsDeltas)}\n" +
+                  s"  ${fmtGroup("tokenLocks", updatedBalancesByTokenLocksDeltas)}\n" +
+                  s"  ${fmtGroup("spendTxs", updatedBalancesBySpendTransactionsDeltas)}\n" +
+                  s"  total=${balanceChanges.size}"
+              )
+            }.whenA(sys.env.get("CL_MPT_DEBUG_DUMP").exists(_.toLowerCase == "true"))
 
             currencySnapshotsDeltas = incomingCurrencySnapshots.collect {
               case (address, snapshots) if snapshots.nonEmpty => address -> snapshots.last

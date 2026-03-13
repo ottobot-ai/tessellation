@@ -260,7 +260,7 @@ object GlobalSnapshotConsensusFunctions {
         }
 
         (scEvents, blocksForAcceptance) <- eventCutter.cut(
-          scEventsBeforeCut.toList,
+          scEventsBeforeCut.toList.sortBy(_.value.address),
           dagEvents.toList,
           snapshotContext,
           currentOrdinal
