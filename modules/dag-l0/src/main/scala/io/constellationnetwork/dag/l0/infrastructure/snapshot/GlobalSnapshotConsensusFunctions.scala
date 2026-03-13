@@ -85,6 +85,15 @@ object GlobalSnapshotConsensusFunctions {
       facilitators: Set[PeerId],
       getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
     )(implicit hasher: Hasher[F]): F[Either[InvalidArtifact, (GlobalSnapshotArtifact, GlobalSnapshotContext)]] = {
+      // Derive the trigger from the artifact itself rather than trusting the local consensus
+      // trigger, which may differ across nodes. TimeTrigger advances the epoch; EventTrigger
+      // keeps it the same. Using the wrong trigger causes reward divergence between validators.
+      val artifactTrigger: ConsensusTrigger =
+        if (artifact.epochProgress.value.value > lastSignedArtifact.epochProgress.value.value)
+          TimeTrigger
+        else
+          trigger
+
       val dagEvents = artifact.blocks.unsorted.map(_.block).map(DAGEvent(_))
       val scEvents = artifact.stateChannelSnapshots.toList.flatMap {
         case (address, stateChannelBinaries) => stateChannelBinaries.map(StateChannelOutput(address, _)).map(StateChannelEvent(_)).toList
@@ -118,7 +127,7 @@ object GlobalSnapshotConsensusFunctions {
         lastSignedArtifact,
         lastContext,
         Hasher.forJson[F],
-        trigger,
+        artifactTrigger,
         events,
         facilitators,
         getGlobalSnapshotByOrdinal

@@ -311,10 +311,10 @@ object GlobalSnapshotConsensusStateAdvancer {
           Metrics[F].incrementCounter("dag_consensus_proposal_affinity_match") >>
           buildSignatureTransition(state, status, status.proposalArtifactInfo, List(leaderProposal.hash)).map(_.some)
       } else {
-        // Leader proposed a different artifact — validate theirs.
-        // Validation calls createProposalArtifact which mutates the shared MptStore.
-        // We take a savepoint before validation and restore on failure to prevent
-        // contaminated state from cascading to future rounds (stateProofDiffers).
+        // Leader proposed a different artifact — apply it via the follower path.
+        // createContext (follower path) mutates the shared MptStore.
+        // We take a savepoint so we can restore on IO-level failure to prevent
+        // partial state from cascading to future rounds.
         resources.artifacts.get(leaderProposal.hash) match {
           case Some(leaderArtifact) =>
             mptStore.savepoint.flatMap { sp =>
@@ -365,6 +365,11 @@ object GlobalSnapshotConsensusStateAdvancer {
       hash: Hash
     )(implicit hasher: Hasher[F]): F[Either[InvalidArtifact, ArtifactInfo[GlobalSnapshotArtifact, GlobalSnapshotContext]]] =
       state.lastOutcome.finished.signedMajorityArtifact.toHashed.flatMap { hashedLast =>
+        // Re-derive the artifact locally and compare it to the leader's proposal.
+        // validateArtifact already derives the trigger from artifact.epochProgress (not from
+        // status.majorityTrigger), so trigger divergence cannot cause a false mismatch.
+        // The full recompute-and-compare approach is kept so that validators can reject
+        // a malicious or buggy leader artifact before signing it.
         consensusFns
           .validateArtifact(
             hashedLast.signed,
