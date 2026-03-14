@@ -522,6 +522,13 @@ object GlobalStateConverter {
               s"totalEntries=${entries.size} removals=${keysToRemove.size}"
           )
 
+          // When debug dump is enabled, log the full balance delta for divergence diagnosis
+          _ <- acc.balances.toList.traverse_ {
+            case (address, balance) =>
+              syncLogger.info(s"[MPT.Debug] ordinal=$snapshotOrdinal balance delta: address=${address.show} balance=${balance.value.value}")
+          }
+            .whenA(MptDebugEnabled)
+
           // Remove stale keys first (entries that are now empty: AllowSpends, TokenLocks,
           // TokenLockBalances, DelegatedStakes, DelegatedStakeWithdrawals, NodeCollaterals, NodeCollateralWithdrawals)
           _ <- store.remove(keysToRemove.toList).whenA(keysToRemove.nonEmpty)

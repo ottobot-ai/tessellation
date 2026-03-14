@@ -296,7 +296,17 @@ object GlobalSnapshotStateChannelEventsProcessor {
                             // Fee deduction: if fee is required, we need a fee address (owner address from
                             // currency messages). Without one we reject. With one, we check the local balance
                             // accumulator first (to account for fees already deducted earlier in this batch),
-                            // falling back to MptStore for the initial balance lookup.
+                            // falling back to lastGlobalSnapshotInfo.balances for the initial balance lookup.
+                            //
+                            // We deliberately use lastGlobalSnapshotInfo.balances (the deterministic context
+                            // passed into accept()) rather than mptStore.getBalance, because accept() mutates
+                            // the MptStore as a side-effect (syncFromStateChanges). When validateArtifact
+                            // calls accept() a second time (to validate the leader's artifact), the MptStore
+                            // has already been updated by the validator's own proposal computation, producing
+                            // a different balance than the leader saw — causing currencyAcceptanceBalanceUpdate
+                            // to diverge. Using the immutable context snapshot avoids this entirely, and also
+                            // correctly reflects block-level balance changes (updatedGlobalBalances) that the
+                            // MptStore does not yet contain at the time of fee calculation.
                             maybeFeeAddress
                               .filter(_ => isFeeRequired)
                               .fold(
@@ -306,17 +316,17 @@ object GlobalSnapshotStateChannelEventsProcessor {
                                   current.asRight[Agg].pure[F]
                               ) { feeAddress =>
                                 val localBalance = balanceUpdate.get(feeAddress)
-                                localBalance.fold(mptStore.getBalance(feeAddress).map(_.getOrElse(Balance.empty)))(_.pure[F]).map {
-                                  balance =>
-                                    // We're inside the Some(feeAddress) handler, so isFeeRequired is always true here.
-                                    // If fee deduction succeeds, continue processing; otherwise reject remaining binaries.
-                                    (balance.minus(head.fee).toOption.map(uBalance => balanceUpdate + (feeAddress -> uBalance)) match {
-                                      case Some(newBalanceUpdate) =>
-                                        ((nel.prepend((head, (snapshot, state).asRight.some)), newBalanceUpdate).some, tail)
-                                          .asLeft[Result]
-                                      case None => // insufficient balance to cover fee — reject remaining binaries
-                                        current.asRight[Agg]
-                                    }): Either[Agg, Result]
+                                val contextBalance = lastGlobalSnapshotInfo.balances.getOrElse(feeAddress, Balance.empty)
+                                localBalance.getOrElse(contextBalance).pure[F].map { balance =>
+                                  // We're inside the Some(feeAddress) handler, so isFeeRequired is always true here.
+                                  // If fee deduction succeeds, continue processing; otherwise reject remaining binaries.
+                                  (balance.minus(head.fee).toOption.map(uBalance => balanceUpdate + (feeAddress -> uBalance)) match {
+                                    case Some(newBalanceUpdate) =>
+                                      ((nel.prepend((head, (snapshot, state).asRight.some)), newBalanceUpdate).some, tail)
+                                        .asLeft[Result]
+                                    case None => // insufficient balance to cover fee — reject remaining binaries
+                                      current.asRight[Agg]
+                                  }): Either[Agg, Result]
                                 }
                               }
                           }.handleErrorWith { e => // we don't accept neither binary nor incremental
