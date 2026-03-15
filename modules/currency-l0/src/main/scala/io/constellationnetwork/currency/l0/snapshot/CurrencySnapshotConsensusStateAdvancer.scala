@@ -107,8 +107,9 @@ object CurrencySnapshotConsensusStateAdvancer {
         state.status match {
           case f: Finished =>
             // Compute removal penalties: decrement previous, add new removals
+            // Uses SortedMap for deterministic iteration when filtering penalized peers.
             val previousPenalties = state.lastOutcome.removalPenalties
-            val decrementedPenalties = previousPenalties.view.mapValues(_ - 1).filter(_._2 > 0).toMap
+            val decrementedPenalties = previousPenalties.view.mapValues(_ - 1).filter(_._2 > 0).to(SortedMap)
             val newPenalties = state.removedFacilitators.value.foldLeft(decrementedPenalties) { (acc, pid) =>
               acc.updated(pid, config.removalPenaltyRounds)
             }
@@ -119,7 +120,7 @@ object CurrencySnapshotConsensusStateAdvancer {
               state.withdrawnFacilitators,
               state.eligibleFacilitators,
               f,
-              removalPenalties = if (config.removalPenaltyRounds > 0) newPenalties else Map.empty
+              removalPenalties = if (config.removalPenaltyRounds > 0) newPenalties else SortedMap.empty
             )
             (Previous(state.lastOutcome.key), outcome).some
           case _ =>

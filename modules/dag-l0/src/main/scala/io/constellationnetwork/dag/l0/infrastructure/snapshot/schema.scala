@@ -3,6 +3,8 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot
 import cats.Show
 import cats.syntax.show._
 
+import scala.collection.immutable.SortedMap
+
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.ConsensusTrigger
 import io.constellationnetwork.schema.peer.PeerId
@@ -17,6 +19,15 @@ import monocle.macros.GenLens
 
 object schema {
 
+  /** Consensus status phases for the Global L0 snapshot consensus state machine.
+    *
+    * {{{
+    * CollectingFacilities → CollectingProposals → CollectingSignatures → Finished
+    * }}}
+    *
+    * Each phase collects peer declarations (facilities, proposals, signatures) until quorum is reached, then advances to the next phase.
+    * The `Finished` state carries the signed artifact and context forward as `lastOutcome` for the next consensus round.
+    */
   @derive(eqv)
   sealed trait GlobalConsensusStep
 
@@ -65,6 +76,11 @@ object schema {
     snapshotHash: Hash
   ) extends GlobalConsensusStep
 
+  /** Outcome of a completed consensus round, carried forward as `lastOutcome` into the next round.
+    *
+    * `removalPenalties` uses `SortedMap` to ensure deterministic iteration when computing penalty decrements and filtering penalized peers
+    * in the next round.
+    */
   @derive(encoder, decoder, eqv)
   final case class GlobalConsensusOutcome(
     key: GlobalSnapshotKey,
@@ -73,7 +89,7 @@ object schema {
     withdrawnFacilitators: WithdrawnFacilitators,
     eligibleFacilitators: EligibleFacilitators,
     finished: Finished,
-    removalPenalties: Map[PeerId, Int] = Map.empty
+    removalPenalties: SortedMap[PeerId, Int] = SortedMap.empty
   ) {
     def eligibleOrFacilitators: List[PeerId] =
       if (eligibleFacilitators.value.nonEmpty) eligibleFacilitators.value

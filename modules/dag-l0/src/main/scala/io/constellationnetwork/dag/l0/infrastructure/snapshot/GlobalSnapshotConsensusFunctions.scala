@@ -39,7 +39,6 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.transaction.Transaction
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.security.signature.signature.SignatureProof
 import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelValidationType}
 import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
 
@@ -47,6 +46,16 @@ import eu.timepit.refined.auto._
 import eu.timepit.refined.types.all.NonNegLong
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
+/** Core consensus functions for Global Snapshot creation and validation.
+  *
+  * Both the leader and every follower independently call `createProposalArtifact` from the same inputs (events, lastArtifact, context,
+  * facilitators). If any step is non-deterministic, followers produce a different artifact hash than the leader, triggering the slower
+  * validation path (which mutates MptStore twice) and potentially causing cascading state divergence.
+  *
+  * '''Determinism contract''': Given identical `(lastArtifact, context, events, facilitators)`, every peer MUST produce byte-identical
+  * `(GlobalSnapshotArtifact, GlobalSnapshotContext)`. All collections passed to the acceptance pipeline must be in canonical order
+  * (sorted).
+  */
 abstract class GlobalSnapshotConsensusFunctions[F[_]: Async: SecurityProvider]
     extends SnapshotConsensusFunctions[
       F,
@@ -72,11 +81,22 @@ object GlobalSnapshotConsensusFunctions {
     mptStore: MptStore[F, GlobalStateKey]
   ): GlobalSnapshotConsensusFunctions[F] = new GlobalSnapshotConsensusFunctions[F] {
 
+    private val logger = Slf4jLogger.getLoggerFromClass[F](getClass)
+
     def getRequiredCollateral: Amount = collateral
 
     def getBalance(context: GlobalSnapshotContext, address: Address): F[Balance] =
       mptStore.getBalance(address).map(_.getOrElse(Balance.empty))
 
+    /** Validates a leader's proposed artifact by independently reconstructing it from the same inputs.
+      *
+      * Called by followers when their locally-built artifact hash differs from the leader's proposal. Re-derives the consensus trigger from
+      * `artifact.epochProgress` (not the local trigger) to prevent trigger-divergence false mismatches. If the reconstructed artifact
+      * equals the leader's, returns Right with the validated artifact and context; otherwise returns Left with the mismatch.
+      *
+      * '''Side effect''': Calls `createProposalArtifact` which mutates the shared MptStore. The caller must take a savepoint before calling
+      * and restore on failure to prevent partial state leaking.
+      */
     override def validateArtifact(
       lastSignedArtifact: Signed[GlobalSnapshotArtifact],
       lastContext: GlobalSnapshotContext,
@@ -146,6 +166,25 @@ object GlobalSnapshotConsensusFunctions {
       check(usingJson)
     }
 
+    /** Builds a new GlobalIncrementalSnapshot proposal from the previous snapshot and pending events.
+      *
+      * '''Determinism''': This method MUST produce byte-identical output on every peer given the same inputs. All event lists extracted
+      * from the unordered `events: Set[GlobalSnapshotEvent]` are sorted before being passed to the acceptance pipeline to guarantee
+      * canonical processing order.
+      *
+      * The pipeline:
+      *   1. Extract and sort events by type (DAG blocks, state channels, allow spends, token locks, etc.) 2. Cut events to fit within
+      *      bounds (eventCutter) 3. Derive facilitators from the consensus facility declarations (not from proof signatures) 4. Pass sorted
+      *      event lists to `GlobalSnapshotAcceptanceManager.accept()` 5. Build the `GlobalIncrementalSnapshot` artifact with all accepted
+      *      data
+      *
+      * @param events
+      *   Unordered set of events — iteration order is non-deterministic. Events are sorted after extraction to ensure deterministic
+      *   acceptance.
+      * @param facilitators
+      *   Current round's facilitators (deterministic: all nodes must receive all facility declarations before advancing from
+      *   CollectingFacilities).
+      */
     def createProposalArtifact(
       lastKey: GlobalSnapshotKey,
       lastArtifact: Signed[GlobalSnapshotArtifact],
@@ -281,9 +320,45 @@ object GlobalSnapshotConsensusFunctions {
         lastActiveTips <- lastArtifact.activeTips(Async[F], lastArtifactHasher)
         lastDeprecatedTips = lastArtifact.tips.deprecated
 
-        lastFacilitators <- lastArtifact.proofs.toList.traverse {
-          case SignatureProof(id, _) => id.toAddress.map(_ -> id.toPeerId)
+        // Derive lastFacilitators from the current-round facilitators set rather than
+        // lastArtifact.proofs. Different nodes collect different numbers of signatures
+        // for the same snapshot (gossip is non-deterministic), so proofs.size varies
+        // per node. This causes divergent nodeOperatorRewards counts (and amounts)
+        // because the facilitator pool is split by facilitators.size. Using the
+        // current-round facilitators is deterministic: all nodes must receive all
+        // facility declarations before advancing from CollectingFacilities, so
+        // state.facilitators is identical across all consensus participants.
+        lastFacilitators <- facilitators.toList.traverse { peerId =>
+          PeerId._Id.get(peerId).toAddress.map(_ -> peerId)
         }
+        _ <- logger
+          .info(
+            s"[REWARDS.Debug] ordinal=${currentOrdinal.show} lastFacilitators.size=${lastFacilitators.size} " +
+              s"lastProofs.size=${lastArtifact.proofs.size} facilitators.size=${facilitators.size} " +
+              s"addrs=[${lastFacilitators.map(_._1.show.take(8)).sorted.mkString(",")}]"
+          )
+          .whenA(sys.env.get("CL_MPT_DEBUG_DUMP").exists(_.toLowerCase == "true"))
+
+        // Sort all event lists before passing to accept() to ensure deterministic ordering.
+        // Events are extracted from Set[GlobalSnapshotEvent] (line 114) which has non-deterministic
+        // iteration order. Without sorting, different nodes may process events in different orders,
+        // causing divergent acceptance results (e.g. first-wins duplicate logic in delegated stakes).
+        // Signed[T] provides Order when T has Order, ensuring canonical ordering across all peers.
+        sortedAllowSpendEvents = allowSpendEventsForAcceptance.toList.map(_.value).sorted
+        sortedTokenLockEvents = tokenLockEventsForAcceptance.toList.map(_.value).sorted
+        sortedCdsEvents = cdsEventsForAcceptance.toList.map(_.value).sortBy(_.show)
+        sortedWdsEvents = wdsEventsForAcceptance.toList.map(_.value).sortBy(_.show)
+        sortedCncEvents = cncEventsForAcceptance.toList.map(_.value).sortBy(_.show)
+        sortedWncEvents = wncEventsForAcceptance.toList.map(_.value).sortBy(_.show)
+
+        _ <- logger.info(
+          s"[CONSENSUS:PROPOSAL] ordinal=${currentOrdinal.show} trigger=$trigger " +
+            s"events.total=${events.size} dag=${blocksForAcceptance.size} sc=${scEvents.size} " +
+            s"allowSpend=${sortedAllowSpendEvents.size} tokenLock=${sortedTokenLockEvents.size} " +
+            s"unp=${unpEventsForAcceptance.size} " +
+            s"delegStakeCreate=${sortedCdsEvents.size} delegStakeWithdraw=${sortedWdsEvents.size} " +
+            s"nodeCollCreate=${sortedCncEvents.size} nodeCollWithdraw=${sortedWncEvents.size}"
+        )
 
         (
           acceptanceResult,
@@ -306,14 +381,14 @@ object GlobalSnapshotConsensusFunctions {
               currentOrdinal,
               currentEpochProgress,
               blocksForAcceptance.map(_.value),
-              allowSpendEventsForAcceptance.toList.map(_.value),
-              tokenLockEventsForAcceptance.toList.map(_.value),
+              sortedAllowSpendEvents,
+              sortedTokenLockEvents,
               scEvents.map(_.value),
               unpEventsForAcceptance.map(_.updateNodeParameters),
-              cdsEventsForAcceptance.toList.map(_.value),
-              wdsEventsForAcceptance.toList.map(_.value),
-              cncEventsForAcceptance.toList.map(_.value),
-              wncEventsForAcceptance.toList.map(_.value),
+              sortedCdsEvents,
+              sortedWdsEvents,
+              sortedCncEvents,
+              sortedWncEvents,
               snapshotContext,
               lastActiveTips,
               lastDeprecatedTips,
@@ -321,6 +396,22 @@ object GlobalSnapshotConsensusFunctions {
               StateChannelValidationType.Full,
               getGlobalSnapshotByOrdinal
             )
+        _ <- logger.info(
+          s"[CONSENSUS:PROPOSAL] ordinal=${currentOrdinal.show} acceptance results: " +
+            s"blocks.accepted=${acceptanceResult.accepted.size} blocks.notAccepted=${acceptanceResult.notAccepted.size} " +
+            s"allowSpend.accepted=${allowSpendBlockAcceptanceResult.accepted.size} " +
+            s"tokenLock.accepted=${tokenLockBlockAcceptanceResult.accepted.size} " +
+            s"delegStakeCreate.accepted=${delegatedStakeAcceptanceResult.acceptedCreates.size} " +
+            s"delegStakeCreate.rejected=${delegatedStakeAcceptanceResult.notAcceptedCreates.size} " +
+            s"delegStakeWithdraw.accepted=${delegatedStakeAcceptanceResult.acceptedWithdrawals.size} " +
+            s"delegStakeWithdraw.rejected=${delegatedStakeAcceptanceResult.notAcceptedWithdrawals.size} " +
+            s"nodeCollCreate.accepted=${nodeCollateralAcceptanceResult.acceptedCreates.size} " +
+            s"nodeCollCreate.rejected=${nodeCollateralAcceptanceResult.notAcceptedCreates.size} " +
+            s"nodeCollWithdraw.accepted=${nodeCollateralAcceptanceResult.acceptedWithdrawals.size} " +
+            s"nodeCollWithdraw.rejected=${nodeCollateralAcceptanceResult.notAcceptedWithdrawals.size} " +
+            s"scSnapshots=${scSnapshots.size} rewards=${acceptedRewardTxs.size}"
+        )
+
         (deprecated, remainedActive, accepted) = getUpdatedTips(
           lastActiveTips,
           lastDeprecatedTips,
@@ -364,6 +455,15 @@ object GlobalSnapshotConsensusFunctions {
           acceptedNnodeCollateralWithdrawals.some
         )
         returnedEvents = returnedSCEvents.map(StateChannelEvent(_)) ++ returnedDAGEvents
+        _ <- logger.info(
+          s"[CONSENSUS:PROPOSAL] ordinal=${currentOrdinal.show} artifact built: " +
+            s"height=${globalSnapshot.height.show} subHeight=${globalSnapshot.subHeight.show} " +
+            s"epoch=${globalSnapshot.epochProgress.show} " +
+            s"stateProof.mptRoot=${globalSnapshot.stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")} " +
+            s"stateProof.balances=${globalSnapshot.stateProof.balancesProof.show.take(12)} " +
+            s"stateProof.delegStakes=${globalSnapshot.stateProof.activeDelegatedStakes.map(_.show.take(12)).getOrElse("none")} " +
+            s"stateProof.nodeCollaterals=${globalSnapshot.stateProof.activeNodeCollaterals.map(_.show.take(12)).getOrElse("none")}"
+        )
         _ <- rewardsService.calculateAndStoreRewardsInfo(globalSnapshot, snapshotInfo)
       } yield (globalSnapshot, snapshotInfo, returnedEvents)
     }

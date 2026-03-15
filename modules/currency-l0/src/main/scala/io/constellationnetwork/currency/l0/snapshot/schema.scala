@@ -3,6 +3,8 @@ package io.constellationnetwork.currency.l0.snapshot
 import cats.Show
 import cats.syntax.show._
 
+import scala.collection.immutable.SortedMap
+
 import io.constellationnetwork.currency.schema.currency.CurrencySnapshotContext
 import io.constellationnetwork.node.shared.infrastructure.consensus._
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
@@ -102,7 +104,7 @@ object schema {
     withdrawnFacilitators: WithdrawnFacilitators,
     eligibleFacilitators: EligibleFacilitators,
     finished: Finished,
-    removalPenalties: Map[PeerId, Int] = Map.empty
+    removalPenalties: SortedMap[PeerId, Int] = SortedMap.empty
   ) {
     def eligibleOrFacilitators: List[PeerId] =
       if (eligibleFacilitators.value.nonEmpty) eligibleFacilitators.value
