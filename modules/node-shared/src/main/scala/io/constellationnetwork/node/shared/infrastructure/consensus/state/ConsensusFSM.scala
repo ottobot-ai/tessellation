@@ -54,8 +54,8 @@ class ConsensusFSM[F[_]: Async: Metrics: HasherSelector: Random, Event, Key: Eq:
 
   import ctx.{isRoundRunning => isRunning, logger => log, nodeStorage, pending}
 
-  /** Node states where consensus rounds are allowed to start. */
-  private val roundAllowedStates: Set[NodeState] = Set(NodeState.Ready, NodeState.Leaving)
+  /** Node states where consensus rounds must NOT start (recovery / download in progress). */
+  private val roundBlockedStates: Set[NodeState] = Set(NodeState.WaitingForDownload, NodeState.DownloadInProgress)
 
   def handle(cmd: ConsensusCommand): F[Unit] =
     Metrics[F].incrementCounter(
@@ -119,7 +119,7 @@ class ConsensusFSM[F[_]: Async: Metrics: HasherSelector: Random, Event, Key: Eq:
     isRunning.get.ifM(
       ifTrue = log.debug(s"Ignoring StartRound($trigger) — round already running"),
       ifFalse = nodeStorage.getNodeState.flatMap { state =>
-        if (roundAllowedStates.contains(state))
+        if (!roundBlockedStates.contains(state))
           log.info(
             ConsensusLog.format(
               ConsensusLog.Lifecycle,
