@@ -11,6 +11,7 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.engine._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger._
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics.unsafeLabelName
+import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.security.HasherSelector
 import io.constellationnetwork.security.signature.Signed
 
@@ -51,7 +52,10 @@ class ConsensusFSM[F[_]: Async: Metrics: HasherSelector: Random, Event, Key: Eq:
   private val rumorHandler = new RumorHandler[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind](ctx)
   private val transitions = new StateTransitions[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind](ctx)
 
-  import ctx.{isRoundRunning => isRunning, logger => log, pending}
+  import ctx.{isRoundRunning => isRunning, logger => log, nodeStorage, pending}
+
+  /** Node states where consensus rounds are allowed to start. */
+  private val roundAllowedStates: Set[NodeState] = Set(NodeState.Ready, NodeState.Leaving)
 
   def handle(cmd: ConsensusCommand): F[Unit] =
     Metrics[F].incrementCounter(
@@ -114,22 +118,36 @@ class ConsensusFSM[F[_]: Async: Metrics: HasherSelector: Random, Event, Key: Eq:
   private def startRound(trigger: Option[ConsensusTrigger]): F[Unit] =
     isRunning.get.ifM(
       ifTrue = log.debug(s"Ignoring StartRound($trigger) — round already running"),
-      ifFalse = log.info(
-        ConsensusLog.format(
-          ConsensusLog.Lifecycle,
-          "n/a",
-          "n/a",
-          "event" -> "FSM_ROUND_START",
-          "trigger" -> trigger.map(_.toString).getOrElse("none")
-        )
-      ) >>
-        Metrics[F].incrementCounter(
-          "dag_consensus_fsm_round_started",
-          Seq(unsafeLabelName("trigger_type") -> trigger.map(_.toString).getOrElse("none"))
-        ) >>
-        Metrics[F].updateGauge("dag_consensus_fsm_round_running", 1) >>
-        isRunning.set(true) >>
-        roundRunner.runRound(trigger)
+      ifFalse = nodeStorage.getNodeState.flatMap { state =>
+        if (roundAllowedStates.contains(state))
+          log.info(
+            ConsensusLog.format(
+              ConsensusLog.Lifecycle,
+              "n/a",
+              "n/a",
+              "event" -> "FSM_ROUND_START",
+              "trigger" -> trigger.map(_.toString).getOrElse("none")
+            )
+          ) >>
+            Metrics[F].incrementCounter(
+              "dag_consensus_fsm_round_started",
+              Seq(unsafeLabelName("trigger_type") -> trigger.map(_.toString).getOrElse("none"))
+            ) >>
+            Metrics[F].updateGauge("dag_consensus_fsm_round_running", 1) >>
+            isRunning.set(true) >>
+            roundRunner.runRound(trigger)
+        else
+          ConsensusLog.warn(
+            log,
+            ConsensusLog.Lifecycle,
+            "n/a",
+            "n/a",
+            "event" -> "ROUND_BLOCKED_BY_STATE",
+            "nodeState" -> state.show,
+            "trigger" -> trigger.map(_.toString).getOrElse("none")
+          ) >>
+            Metrics[F].incrementCounter("dag_consensus_round_blocked_by_state")
+      }
     )
 
   private def completeRound(preAction: F[Unit]): F[Unit] =

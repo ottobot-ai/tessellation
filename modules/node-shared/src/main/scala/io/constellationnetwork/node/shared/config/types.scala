@@ -157,7 +157,9 @@ object types {
     facilitiesTimeoutMultiplier: Double = 0.5,
     proposalsTimeoutMultiplier: Double = 1.5,
     signaturesTimeoutMultiplier: Double = 0.75,
-    maxConsecutiveAbandonments: Int = 5
+    maxConsecutiveAbandonments: Int = 5,
+    monitorSummaryInterval: FiniteDuration = FiniteDuration(10, "s"),
+    peerScoreLogInterval: FiniteDuration = FiniteDuration(60, "s")
   ) {
     quorumThreshold.foreach { t =>
       require(t > 2.0 / 3.0 && t <= 1.0, s"quorumThreshold must be in (2/3, 1.0], got $t")

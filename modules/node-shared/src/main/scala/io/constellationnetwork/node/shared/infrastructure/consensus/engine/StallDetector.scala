@@ -9,42 +9,41 @@ import scala.concurrent.duration._
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.{ConsensusLog, ConsensusResources}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
-import io.constellationnetwork.schema.node.{NodeState, NodeStateTransition}
 import io.constellationnetwork.schema.peer.{PeerId, PeerResponsiveness, Unresponsive}
 
 import eu.timepit.refined.auto._
 
 /** Monitors a consensus round for stalls and manages recovery.
   *
+  * ==Architecture==
+  *
+  * StallDetector is the orchestrator that polls state periodically and delegates to focused components:
+  *   - '''ViewChangeManager''': deterministic leader re-election on proposal stalls
+  *   - '''AbandonmentTracker''': consecutive failure tracking, resource cleanup, recovery download
+  *   - '''ConsensusHealthStatus''': observable health snapshot for HTTP endpoint + metrics
+  *
   * ==Stall Detection Flow==
   * {{{
-  *   Wait declarationTimeout
-  *     → If in proposal phase: view change (new leader)
-  *     → Otherwise: abandon round after maxStallCycles
-  *     → After maxRoundDuration: abandon round (wall-clock safety net)
+  *   Poll (100ms-1000ms adaptive)
+  *     → Detect status/resource changes → queue CheckUpdate
+  *     → Calculate phase-adaptive timeout
+  *     → If leader unresponsive → early view change (ViewChangeManager)
+  *     → If timeout exceeded:
+  *         → Proposal phase: view change (ViewChangeManager)
+  *         → Other phases: count toward abandon
+  *     → After maxStallCycles or maxRoundDuration → abandon (AbandonmentTracker)
+  *     → Update health snapshot on each cycle
   * }}}
-  *
-  * ==View Change==
-  *
-  * When the leader fails to propose within the timeout, the view number is incremented and a new leader is selected deterministically using
-  * rendezvous hashing. The new leader's advanceFromProposals will detect that it should spread its proposal.
-  *
-  * ==Abandon==
-  *
-  * For non-proposal phases (facilities, signatures, etc.), stalls indicate slow peers rather than leader failure. After maxStallCycles
-  * timeouts, the round is abandoned and a fresh round starts.
   */
 @scala.annotation.nowarn("msg=type parameter Outcome.*shadows")
 class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status, Outcome, Kind](
-  ctx: ConsensusEngineContext[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind]
+  ctx: ConsensusEngineContext[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind],
+  viewChangeManager: ViewChangeManager[F, Key, Status, Outcome, Kind],
+  abandonmentTracker: AbandonmentTracker[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind],
+  healthRef: Ref[F, ConsensusHealthStatus]
 ) {
 
   import ctx.{clusterStorage, config, logger, ops, peerQualityTracker, queue, storage}
-
-  /** Tracks consecutive abandonments at the same key to detect infinite stuck loops. When the same key is abandoned
-    * `maxConsecutiveAbandonments` times, the node initiates a restart.
-    */
-  private val consecutiveAbandonCountRef: Ref[F, (Option[Key], Int)] = Ref.unsafe((none[Key], 0))
 
   private case class MonitorState(
     lastResourcesHash: Int,
@@ -86,6 +85,7 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
     storage.getState(key).flatMap {
       case None =>
         ConsensusLog.debug(logger, ConsensusLog.Lifecycle, key.toString, "n/a", "event" -> "MONITOR_STATE_GONE") >>
+          healthRef.update(_.copy(isRunning = false, key = None, phase = None)) >>
           Async[F].pure(Right(()))
 
       case Some(state) =>
@@ -95,210 +95,244 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
               Async[F].pure(Right(()))
 
           case None =>
-            for {
-              now <- Async[F].monotonic
-              resources <- storage.getResources(key)
-
-              info = getResourcesInfo(state, resources)
-              currentHash = info.hash
-              statusChanged = !ms.lastStatus.contains(state.status)
-              resourcesChanged = currentHash != ms.lastResourcesHash
-
-              newStatusStartTime = if (statusChanged) now else ms.statusStartTime
-              statusDuration = now - newStatusStartTime
-              newStallCount = if (statusChanged) 0 else ms.stallCount
-
-              _ <- queue.offer(ConsensusCommand.CheckUpdate(key)).whenA(resourcesChanged || statusChanged)
-
-              declarationTimeout <- getCurrentDeclarationTimeout
-              baseTimeout =
-                if (ms.stallCount > 0)
-                  config.reStallTimeout.getOrElse(declarationTimeout)
-                else if (info.declaredCount == 0)
-                  config.noProgressTimeout.getOrElse(declarationTimeout)
-                else
-                  declarationTimeout
-              declarationProgress = if (info.activeCount > 0) info.declaredCount.toDouble / info.activeCount else 0.0
-              nearCompletion = declarationProgress >= 0.75 && info.declaredCount < info.activeCount
-              baseEffectiveTimeout =
-                if (nearCompletion && ms.stallCount == 0)
-                  baseTimeout + (baseTimeout / 2)
-                else baseTimeout
-
-              // Quality-adjusted timeouts are disabled: local quality scores differ across nodes,
-              // causing different timeout behavior. While this is safe (view changes are deterministic),
-              // it creates confusing log divergence. Use a fixed timeout for all leaders.
-              // Quality tracking is kept for observability (score logging below) but does not affect
-              // consensus timing.
-
-              // Phase-adaptive timeout: shorter for lightweight phases (facilities),
-              // longer for expensive phases (proposals with artifact creation).
-              phaseMultiplier = ops.phaseIndex(state.status) match {
-                case 0 => config.facilitiesTimeoutMultiplier // CollectingFacilities
-                case 1 => config.proposalsTimeoutMultiplier // CollectingProposals
-                case 2 => config.signaturesTimeoutMultiplier // CollectingSignatures
-                case _ => 1.0 // BinarySignatures, Finished
-              }
-              effectiveTimeout = FiniteDuration((baseEffectiveTimeout.toMillis * phaseMultiplier).toLong, MILLISECONDS)
-
-              // Early view change shortcut: if the leader is already marked unresponsive by
-              // LocalHealthcheck, don't wait for the full timeout — trigger view change immediately.
-              // This saves an entire declarationTimeout cycle when we already know the leader is down.
-              leaderUnresponsive <- clusterStorage.getPeer(state.leader).map {
-                case Some(peer) =>
-                  peer.responsiveness === (Unresponsive: PeerResponsiveness)
-                case None => true // peer gone from cluster = treat as unresponsive
-              }
-              earlyViewChange = leaderUnresponsive && ops.isProposalPhase(state.status) && ms.stallCount == 0
-              _ <- (
-                ConsensusLog.warn(
-                  logger,
-                  ConsensusLog.Stall,
-                  key.toString,
-                  "n/a",
-                  "event" -> "EARLY_VIEW_CHANGE",
-                  "leader" -> ConsensusLog.pid(state.leader),
-                  "reason" -> "leader_unresponsive"
-                ) >>
-                  performViewChange(key, state)
-              ).whenA(earlyViewChange)
-
-              // Handle stall: view change for proposal phase, or count towards abandon.
-              // Returns true if a stall was detected (view change or non-proposal stall).
-              didStall <-
-                if (earlyViewChange) true.pure[F]
-                else
-                  handleStall(
-                    key = key,
-                    state = state,
-                    declarationTimeout = effectiveTimeout,
-                    statusDuration = statusDuration,
-                    declaredCount = info.declaredCount,
-                    activeCount = info.activeCount,
-                    missingPeerIds = info.missingPeerIds
-                  )
-
-              // Reset statusStartTime on any stall detection (not just view changes).
-              // This naturally rate-limits re-stalls: after detection, the timer restarts
-              // and another full declarationTimeout must elapse before the next stall fires.
-              adjustedStatusStartTime = if (didStall) now else newStatusStartTime
-              finalStallCount =
-                if (didStall) newStallCount + 1
-                else newStallCount
-
-              _ <- Metrics[F].updateGauge("dag_consensus_stall_cycle", finalStallCount)
-              _ <- Metrics[F].updateGauge("dag_consensus_stall_declaration_progress", declarationProgress)
-
-              roundElapsed = now - ms.roundStartTime
-              _ <- Metrics[F].updateGauge("dag_consensus_round_elapsed_seconds", roundElapsed.toSeconds.toInt)
-              roundTimedOut = config.maxRoundDuration.exists(roundElapsed >= _)
-              shouldAbandon = finalStallCount >= config.maxStallCycles || roundTimedOut
-
-              abandonReasonLabel =
-                if (roundTimedOut) "timeout" else "max_stalls"
-              abandonReason =
-                if (roundTimedOut)
-                  s"round timed out after ${roundElapsed.toSeconds}s (max=${config.maxRoundDuration.map(_.toSeconds)}s)"
-                else s"stuck after $finalStallCount stall cycles"
-
-              _ <- (
-                peerQualityTracker.recordAbandonedMissingPeers(info.missingPeers).whenA(info.missingPeers.nonEmpty) >>
-                  ConsensusLog
-                    .info(
-                      logger,
-                      ConsensusLog.Facilitator,
-                      key.toString,
-                      "n/a",
-                      "event" -> "RECORDING_MISSING_PEERS",
-                      "count" -> info.missingPeers.size.toString,
-                      "peers" -> s"[${info.missingPeers.toList.map(ConsensusLog.pid).mkString(",")}]"
-                    )
-                    .whenA(info.missingPeers.nonEmpty) >>
-                  abandonRound(key, abandonReason) >>
-                  Metrics[F].incrementCounter(
-                    "dag_consensus_stall_abandon_reason",
-                    Seq((Metrics.unsafeLabelName("reason"), abandonReasonLabel))
-                  )
-              ).whenA(shouldAbandon)
-
-              summaryInterval = 10.seconds
-              timeSinceLastSummary = now - ms.lastSummaryTime
-              shouldLogSummary = statusChanged || (timeSinceLastSummary >= summaryInterval && info.declaredCount < info.activeCount)
-              newSummaryTime = if (shouldLogSummary) now else ms.lastSummaryTime
-              statusName = state.status.getClass.getSimpleName.stripSuffix("$")
-              withdrawnCount = state.withdrawnFacilitators.value.size
-              roundElapsedTotal = now - ms.roundStartTime
-              summaryPairs = Seq(
-                "event" -> "ROUND_MONITOR",
-                "status" -> statusName,
-                "declared" -> s"${info.declaredCount}/${info.activeCount}",
-                "elapsed" -> s"${statusDuration.toSeconds}s",
-                "roundElapsed" -> s"${roundElapsedTotal.toSeconds}s",
-                "stallCount" -> finalStallCount.toString,
-                "leader" -> ConsensusLog.pid(state.leader),
-                "facilitators" -> state.facilitators.value.size.toString
-              ) ++
-                (if (state.viewNumber > 0) Seq("view" -> state.viewNumber.toString) else Seq.empty) ++
-                (if (withdrawnCount > 0) Seq("withdrawn" -> withdrawnCount.toString) else Seq.empty) ++
-                (if (info.missingPeerIds.nonEmpty) Seq("missing" -> s"[${info.missingPeerIds.mkString(",")}]") else Seq.empty)
-              _ <- ConsensusLog
-                .info(logger, ConsensusLog.Stall, key.toString, "n/a", summaryPairs: _*)
-                .whenA(shouldLogSummary && !shouldAbandon)
-
-              // Peer quality score logging every 60 seconds
-              scoreLogInterval = 60.seconds
-              timeSinceLastScoreLog = now - ms.lastScoreLogTime
-              shouldLogScores = timeSinceLastScoreLog >= scoreLogInterval
-              newScoreLogTime = if (shouldLogScores) now else ms.lastScoreLogTime
-              _ <- peerQualityTracker.getQualityScores.flatMap { scores =>
-                if (scores.nonEmpty) {
-                  val sorted = scores.toList.sortBy(-_._2)
-                  val total = sorted.size
-                  val top3 = sorted.take(3).map { case (pid, score) => s"${ConsensusLog.pid(pid)}:${f"$score%.2f"}" }
-                  val bottom3 = sorted.takeRight(3).map { case (pid, score) => s"${ConsensusLog.pid(pid)}:${f"$score%.2f"}" }
-                  val topIds = sorted.take(3).map(_._1).toSet
-                  val bottomEntries =
-                    if (total > 6) bottom3.filterNot(e => topIds.exists(id => e.startsWith(ConsensusLog.pid(id)))) else Nil
-                  val display =
-                    if (bottomEntries.nonEmpty) s"best=[${top3.mkString(",")}],worst=[${bottomEntries.mkString(",")}]"
-                    else s"[${top3.mkString(",")}]"
-                  ConsensusLog.info(
-                    logger,
-                    ConsensusLog.Facilitator,
-                    key.toString,
-                    "n/a",
-                    "event" -> "PEER_QUALITY",
-                    "scores" -> display,
-                    "trackedPeers" -> total.toString
-                  )
-                } else
-                  ConsensusLog
-                    .debug(logger, ConsensusLog.Facilitator, key.toString, "n/a", "event" -> "PEER_QUALITY", "trackedPeers" -> "0")
-              }.whenA(shouldLogScores && !shouldAbandon)
-
-              changed = resourcesChanged || statusChanged || didStall
-              newNoChangeCount = if (changed) 0 else ms.noChangeCount + 1
-              sleepMs = if (changed) basePollInterval else math.min(basePollInterval * (newNoChangeCount + 1), maxPollInterval)
-              _ <- Temporal[F].sleep(sleepMs.millis).unlessA(shouldAbandon)
-
-            } yield
-              if (shouldAbandon)
-                Right(())
-              else
-                Left(
-                  MonitorState(
-                    lastResourcesHash = currentHash,
-                    lastStatus = Some(state.status),
-                    statusStartTime = adjustedStatusStartTime,
-                    roundStartTime = ms.roundStartTime,
-                    noChangeCount = newNoChangeCount,
-                    stallCount = finalStallCount,
-                    lastSummaryTime = newSummaryTime,
-                    lastScoreLogTime = newScoreLogTime
-                  )
-                )
+            runMonitorCycle(key, ms, state)
         }
     }
+
+  /** Core monitoring cycle: detect changes, check timeouts, handle stalls, update health. */
+  private def runMonitorCycle(
+    key: Key,
+    ms: MonitorState,
+    state: ConsensusState[Key, Status, Outcome, Kind]
+  ): F[Either[MonitorState, Unit]] =
+    for {
+      now <- Async[F].monotonic
+      resources <- storage.getResources(key)
+
+      info = getResourcesInfo(state, resources)
+      statusChanged = !ms.lastStatus.contains(state.status)
+      resourcesChanged = info.hash != ms.lastResourcesHash
+
+      newStatusStartTime = if (statusChanged) now else ms.statusStartTime
+      statusDuration = now - newStatusStartTime
+      newStallCount = if (statusChanged) 0 else ms.stallCount
+
+      _ <- queue.offer(ConsensusCommand.CheckUpdate(key)).whenA(resourcesChanged || statusChanged)
+
+      // --- Timeout calculation ---
+      effectiveTimeout <- calculateTimeout(ms.stallCount, info, state)
+
+      // --- Early view change for unresponsive leader ---
+      leaderUnresponsive <- isLeaderUnresponsive(state.leader)
+      earlyViewChange = leaderUnresponsive && ops.isProposalPhase(state.status) && ms.stallCount == 0
+      _ <- (
+        ConsensusLog.warn(
+          logger,
+          ConsensusLog.Stall,
+          key.toString,
+          "n/a",
+          "event" -> "EARLY_VIEW_CHANGE",
+          "leader" -> ConsensusLog.pid(state.leader),
+          "reason" -> "leader_unresponsive"
+        ) >>
+          viewChangeManager.performViewChange(key, state)
+      ).whenA(earlyViewChange)
+
+      // --- Handle stall: view change for proposal phase, count toward abandon for others ---
+      didStall <-
+        if (earlyViewChange) true.pure[F]
+        else
+          handleStall(
+            key = key,
+            state = state,
+            declarationTimeout = effectiveTimeout,
+            statusDuration = statusDuration,
+            declaredCount = info.declaredCount,
+            activeCount = info.activeCount,
+            missingPeerIds = info.missingPeerIds
+          )
+
+      adjustedStatusStartTime = if (didStall) now else newStatusStartTime
+      finalStallCount = if (didStall) newStallCount + 1 else newStallCount
+
+      _ <- Metrics[F].updateGauge("dag_consensus_stall_cycle", finalStallCount)
+
+      declarationProgress = if (info.activeCount > 0) info.declaredCount.toDouble / info.activeCount else 0.0
+      _ <- Metrics[F].updateGauge("dag_consensus_stall_declaration_progress", declarationProgress)
+
+      // --- Round timeout / abandon check ---
+      roundElapsed = now - ms.roundStartTime
+      _ <- Metrics[F].updateGauge("dag_consensus_round_elapsed_seconds", roundElapsed.toSeconds.toInt)
+      roundTimedOut = config.maxRoundDuration.exists(roundElapsed >= _)
+      shouldAbandon = finalStallCount >= config.maxStallCycles || roundTimedOut
+
+      abandonReason =
+        if (roundTimedOut)
+          s"round timed out after ${roundElapsed.toSeconds}s (max=${config.maxRoundDuration.map(_.toSeconds)}s)"
+        else s"stuck after $finalStallCount stall cycles"
+      abandonReasonLabel = if (roundTimedOut) "timeout" else "max_stalls"
+
+      _ <- (
+        peerQualityTracker.recordAbandonedMissingPeers(info.missingPeers).whenA(info.missingPeers.nonEmpty) >>
+          ConsensusLog
+            .info(
+              logger,
+              ConsensusLog.Facilitator,
+              key.toString,
+              "n/a",
+              "event" -> "RECORDING_MISSING_PEERS",
+              "count" -> info.missingPeers.size.toString,
+              "peers" -> s"[${info.missingPeers.toList.map(ConsensusLog.pid).mkString(",")}]"
+            )
+            .whenA(info.missingPeers.nonEmpty) >>
+          abandonmentTracker.abandonRound(key, abandonReason) >>
+          Metrics[F].incrementCounter(
+            "dag_consensus_stall_abandon_reason",
+            Seq((Metrics.unsafeLabelName("reason"), abandonReasonLabel))
+          )
+      ).whenA(shouldAbandon)
+
+      // --- Update health snapshot ---
+      statusName = state.status.getClass.getSimpleName.stripSuffix("$")
+      _ <- healthRef.update(
+        _.copy(
+          key = key.toString.some,
+          phase = statusName.some,
+          phaseIndex = ops.phaseIndex(state.status).some,
+          facilitatorCount = state.facilitators.value.size,
+          declaredCount = info.declaredCount,
+          activeCount = info.activeCount,
+          leader = ConsensusLog.pid(state.leader).some,
+          viewNumber = state.viewNumber,
+          roundElapsedMs = roundElapsed.toMillis,
+          phaseElapsedMs = statusDuration.toMillis,
+          stallCount = finalStallCount,
+          isRunning = true
+        )
+      )
+
+      // --- Periodic summary logging ---
+      timeSinceLastSummary = now - ms.lastSummaryTime
+      shouldLogSummary = statusChanged || (timeSinceLastSummary >= config.monitorSummaryInterval && info.declaredCount < info.activeCount)
+      newSummaryTime = if (shouldLogSummary) now else ms.lastSummaryTime
+      _ <- logSummary(key, state, info, statusDuration, roundElapsed, finalStallCount, statusName)
+        .whenA(shouldLogSummary && !shouldAbandon)
+
+      // --- Periodic peer quality score logging ---
+      timeSinceLastScoreLog = now - ms.lastScoreLogTime
+      shouldLogScores = timeSinceLastScoreLog >= config.peerScoreLogInterval
+      newScoreLogTime = if (shouldLogScores) now else ms.lastScoreLogTime
+      _ <- logPeerQualityScores(key).whenA(shouldLogScores && !shouldAbandon)
+
+      // --- Adaptive sleep ---
+      changed = resourcesChanged || statusChanged || didStall
+      newNoChangeCount = if (changed) 0 else ms.noChangeCount + 1
+      sleepMs = if (changed) basePollInterval else math.min(basePollInterval * (newNoChangeCount + 1), maxPollInterval)
+      _ <- Temporal[F].sleep(sleepMs.millis).unlessA(shouldAbandon)
+
+    } yield
+      if (shouldAbandon)
+        Right(())
+      else
+        Left(
+          MonitorState(
+            lastResourcesHash = info.hash,
+            lastStatus = Some(state.status),
+            statusStartTime = adjustedStatusStartTime,
+            roundStartTime = ms.roundStartTime,
+            noChangeCount = newNoChangeCount,
+            stallCount = finalStallCount,
+            lastSummaryTime = newSummaryTime,
+            lastScoreLogTime = newScoreLogTime
+          )
+        )
+
+  // ── Timeout Calculation ───────────────────────────────────────────
+
+  private def calculateTimeout(
+    stallCount: Int,
+    info: ResourcesInfo,
+    state: ConsensusState[Key, Status, Outcome, Kind]
+  ): F[FiniteDuration] =
+    getCurrentDeclarationTimeout.map { declarationTimeout =>
+      val baseTimeout =
+        if (stallCount > 0)
+          config.reStallTimeout.getOrElse(declarationTimeout)
+        else if (info.declaredCount == 0)
+          config.noProgressTimeout.getOrElse(declarationTimeout)
+        else
+          declarationTimeout
+
+      val declarationProgress = if (info.activeCount > 0) info.declaredCount.toDouble / info.activeCount else 0.0
+      val nearCompletion = declarationProgress >= 0.75 && info.declaredCount < info.activeCount
+      val baseEffective =
+        if (nearCompletion && stallCount == 0)
+          baseTimeout + (baseTimeout / 2)
+        else baseTimeout
+
+      val phaseMultiplier = ops.phaseIndex(state.status) match {
+        case 0 => config.facilitiesTimeoutMultiplier
+        case 1 => config.proposalsTimeoutMultiplier
+        case 2 => config.signaturesTimeoutMultiplier
+        case _ => 1.0
+      }
+      FiniteDuration((baseEffective.toMillis * phaseMultiplier).toLong, MILLISECONDS)
+    }
+
+  // ── Stall Handling ────────────────────────────────────────────────
+
+  /** Handle a stall condition. Returns true if a stall was detected (view change or non-proposal timeout). */
+  private def handleStall(
+    key: Key,
+    state: ConsensusState[Key, Status, Outcome, Kind],
+    declarationTimeout: FiniteDuration,
+    statusDuration: FiniteDuration,
+    declaredCount: Int,
+    activeCount: Int,
+    missingPeerIds: Set[String]
+  ): F[Boolean] =
+    if (statusDuration >= declarationTimeout) {
+      val statusName = state.status.getClass.getSimpleName.stripSuffix("$")
+      val phaseLabel = Seq((Metrics.unsafeLabelName("phase"), statusName))
+
+      if (ops.isProposalPhase(state.status)) {
+        ConsensusLog.warn(
+          logger,
+          ConsensusLog.Stall,
+          key.toString,
+          "n/a",
+          "event" -> "LEADER_STALL",
+          "status" -> statusName,
+          "elapsed" -> s"${statusDuration.toSeconds}s",
+          "timeout" -> s"${declarationTimeout.toSeconds}s",
+          "declared" -> s"$declaredCount/$activeCount",
+          "leader" -> ConsensusLog.pid(state.leader),
+          "view" -> state.viewNumber.toString
+        ) >>
+          Metrics[F].incrementCounter("dag_consensus_view_change") >>
+          Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
+          viewChangeManager.performViewChange(key, state).as(true)
+      } else {
+        ConsensusLog.warn(
+          logger,
+          ConsensusLog.Stall,
+          key.toString,
+          "n/a",
+          "event" -> "STALL_DETECTED",
+          "status" -> statusName,
+          "elapsed" -> s"${statusDuration.toSeconds}s",
+          "timeout" -> s"${declarationTimeout.toSeconds}s",
+          "declared" -> s"$declaredCount/$activeCount"
+        ) >>
+          Metrics[F].incrementCounter("dag_consensus_stall_detected") >>
+          Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
+          true.pure[F]
+      }
+    } else {
+      false.pure[F]
+    }
+
+  // ── Resource Info ─────────────────────────────────────────────────
 
   private def getResourcesInfo(
     state: ConsensusState[Key, Status, Outcome, Kind],
@@ -330,203 +364,71 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
     }
   }
 
-  /** Handle a stall condition. Returns true if a stall was detected (view change or non-proposal timeout). */
-  private def handleStall(
-    key: Key,
-    state: ConsensusState[Key, Status, Outcome, Kind],
-    declarationTimeout: FiniteDuration,
-    statusDuration: FiniteDuration,
-    declaredCount: Int,
-    activeCount: Int,
-    missingPeerIds: Set[String]
-  ): F[Boolean] = {
-    val shouldHandle = statusDuration >= declarationTimeout
+  // ── Helpers ───────────────────────────────────────────────────────
 
-    if (shouldHandle) {
-      val statusName = state.status.getClass.getSimpleName.stripSuffix("$")
-      val missingInfo =
-        if (missingPeerIds.nonEmpty) s" missing=[${missingPeerIds.mkString(",")}]"
-        else ""
-
-      val phaseLabel = Seq((Metrics.unsafeLabelName("phase"), statusName))
-
-      if (ops.isProposalPhase(state.status)) {
-        // Proposal phase stall: leader failed to propose → view change
-        ConsensusLog.warn(
-          logger,
-          ConsensusLog.Stall,
-          key.toString,
-          "n/a",
-          "event" -> "LEADER_STALL",
-          "status" -> statusName,
-          "elapsed" -> s"${statusDuration.toSeconds}s",
-          "timeout" -> s"${declarationTimeout.toSeconds}s",
-          "declared" -> s"$declaredCount/$activeCount",
-          "leader" -> ConsensusLog.pid(state.leader),
-          "view" -> state.viewNumber.toString
-        ) >>
-          Metrics[F].incrementCounter("dag_consensus_view_change") >>
-          Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
-          performViewChange(key, state).as(true)
-      } else {
-        // Non-proposal stall: just log and count towards abandon
-        ConsensusLog.warn(
-          logger,
-          ConsensusLog.Stall,
-          key.toString,
-          "n/a",
-          "event" -> "STALL_DETECTED",
-          "status" -> statusName,
-          "elapsed" -> s"${statusDuration.toSeconds}s",
-          "timeout" -> s"${declarationTimeout.toSeconds}s",
-          "declared" -> s"$declaredCount/$activeCount"
-        ) >>
-          Metrics[F].incrementCounter("dag_consensus_stall_detected") >>
-          Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
-          true.pure[F]
-      }
-    } else {
-      false.pure[F]
+  private def isLeaderUnresponsive(leader: PeerId): F[Boolean] =
+    clusterStorage.getPeer(leader).map {
+      case Some(peer) => peer.responsiveness === (Unresponsive: PeerResponsiveness)
+      case None       => true
     }
-  }
-
-  /** Perform a view change: increment viewNumber, select new leader, update state. */
-  private def performViewChange(
-    key: Key,
-    currentState: ConsensusState[Key, Status, Outcome, Kind]
-  ): F[Unit] = {
-    val newViewNumber = currentState.viewNumber + 1
-    val newLeader = ctx.facilitatorSelector.selectLeader(
-      currentState.facilitators.value,
-      currentState.entropy,
-      newViewNumber
-    )
-
-    ConsensusLog.info(
-      logger,
-      ConsensusLog.Phase,
-      key.toString,
-      "n/a",
-      "event" -> "VIEW_CHANGE",
-      "oldView" -> currentState.viewNumber.toString,
-      "newView" -> newViewNumber.toString,
-      "oldLeader" -> ConsensusLog.pid(currentState.leader),
-      "newLeader" -> ConsensusLog.pid(newLeader),
-      "facilitators" -> currentState.facilitators.value.size.toString
-    ) >>
-      peerQualityTracker.recordViewChange(currentState.leader) >>
-      Metrics[F].updateGauge("dag_consensus_view_number", newViewNumber) >>
-      storage
-        .condModifyState[Unit](key) {
-          case Some(state) if state.viewNumber === currentState.viewNumber =>
-            val updated: ConsensusState[Key, Status, Outcome, Kind] =
-              state.copy(viewNumber = newViewNumber, leader = newLeader)
-            (updated.some, ()).some.pure[F]
-          case _ =>
-            none[(Option[ConsensusState[Key, Status, Outcome, Kind]], Unit)].pure[F]
-        }
-        .void >>
-      queue.offer(ConsensusCommand.CheckUpdate(key))
-  }
-
-  private def abandonRound(key: Key, reason: String): F[Unit] =
-    ConsensusLog.error(logger, ConsensusLog.Lifecycle, key.toString, "n/a", "event" -> "ROUND_ABANDONED", "reason" -> reason) >>
-      Metrics[F].incrementCounter("dag_consensus_round_abandoned") >>
-      storage
-        .condModifyState[Unit](key) {
-          case Some(state) =>
-            peerQualityTracker
-              .recordRoundAbandoned(state.facilitators.value.toSet)
-              .as((none[ConsensusState[Key, Status, Outcome, Kind]], ()).some)
-          case _ =>
-            none[(Option[ConsensusState[Key, Status, Outcome, Kind]], Unit)].pure[F]
-        }
-        .void >>
-      // Clear stale peer declarations, artifacts, and withdrawal maps to prevent poisoned retries.
-      // Without this, abandoned rounds leave resources that interfere with the next attempt at the same key.
-      storage.clearResources(key) >>
-      trackConsecutiveAbandonments(key).flatMap { consecutiveCount =>
-        val shouldRecover = consecutiveCount >= config.maxConsecutiveAbandonments
-        ConsensusLog.info(
-          logger,
-          ConsensusLog.Lifecycle,
-          key.toString,
-          "n/a",
-          "event" -> "ROUND_ABANDONED_TRACKED",
-          "consecutiveAbandonments" -> consecutiveCount.toString,
-          "maxConsecutiveAbandonments" -> config.maxConsecutiveAbandonments.toString,
-          "triggerRecovery" -> shouldRecover.toString
-        ) >>
-          (if (shouldRecover)
-             triggerRecoveryDownload(key, consecutiveCount)
-           else
-             queue.offer(ConsensusCommand.RoundCompleted) >>
-               queue.offer(ConsensusCommand.TimeTick))
-      }
-
-  /** Track consecutive abandonments at the same key. Returns the new count. Resets to 1 when the key changes (different ordinal).
-    */
-  private def trackConsecutiveAbandonments(key: Key): F[Int] =
-    consecutiveAbandonCountRef.modify {
-      case (Some(lastKey), count) if lastKey === key =>
-        val newCount = count + 1
-        ((key.some, newCount), newCount)
-      case _ =>
-        ((key.some, 1), 1)
-    }
-
-  /** Trigger a recovery download when consecutive abandonments at the same ordinal exceed the threshold.
-    *
-    * Transitions the node from Ready → WaitingForDownload, which the DownloadDaemon watches for and automatically starts a full state
-    * download from peers. This breaks the infinite loop of abandon → retry → abandon at the same stuck ordinal.
-    *
-    * If the state transition fails (node not in Ready state), falls back to normal round restart.
-    */
-  private def triggerRecoveryDownload(key: Key, consecutiveCount: Int): F[Unit] =
-    ConsensusLog.error(
-      logger,
-      ConsensusLog.Lifecycle,
-      key.toString,
-      "n/a",
-      "event" -> "RECOVERY_DOWNLOAD_TRIGGERED",
-      "consecutiveAbandonments" -> consecutiveCount.toString,
-      "reason" -> s"stuck at same ordinal for $consecutiveCount consecutive rounds"
-    ) >>
-      Metrics[F].incrementCounter("dag_consensus_recovery_download_triggered") >>
-      ctx.nodeStorage.tryModifyStateGetResult(NodeState.Ready, NodeState.WaitingForDownload).flatMap {
-        case NodeStateTransition.Success =>
-          ConsensusLog.info(
-            logger,
-            ConsensusLog.Lifecycle,
-            key.toString,
-            "n/a",
-            "event" -> "RECOVERY_STATE_TRANSITION",
-            "from" -> "Ready",
-            "to" -> "WaitingForDownload"
-          ) >>
-            consecutiveAbandonCountRef.set((none[Key], 0)) >>
-            // Clear pending triggers to prevent completeRound from starting a new round
-            // at the same stale ordinal while we're downloading.
-            ctx.pending.clear() >>
-            // Signal FSM to transition BUSY → IDLE so it can handle InitializeFromDownload
-            // when the DownloadDaemon finishes. Without this, InitializeFromDownload is silently
-            // dropped by handleWhileBusy (catch-all case).
-            queue.offer(ConsensusCommand.RoundCompleted)
-        case _ =>
-          ConsensusLog.warn(
-            logger,
-            ConsensusLog.Lifecycle,
-            key.toString,
-            "n/a",
-            "event" -> "RECOVERY_TRANSITION_FAILED",
-            "reason" -> "node not in Ready state"
-          ) >>
-            queue.offer(ConsensusCommand.RoundCompleted) >>
-            queue.offer(ConsensusCommand.TimeTick)
-      }
 
   private def getCurrentDeclarationTimeout: F[FiniteDuration] =
     ctx.nodeStorage.isInJoiningGracePeriod.map { isInJoiningGracePeriod =>
       if (isInJoiningGracePeriod) config.timeTriggerInterval else config.declarationTimeout
+    }
+
+  // ── Logging ───────────────────────────────────────────────────────
+
+  private def logSummary(
+    key: Key,
+    state: ConsensusState[Key, Status, Outcome, Kind],
+    info: ResourcesInfo,
+    statusDuration: FiniteDuration,
+    roundElapsed: FiniteDuration,
+    stallCount: Int,
+    statusName: String
+  ): F[Unit] = {
+    val withdrawnCount = state.withdrawnFacilitators.value.size
+    val summaryPairs = Seq(
+      "event" -> "ROUND_MONITOR",
+      "status" -> statusName,
+      "declared" -> s"${info.declaredCount}/${info.activeCount}",
+      "elapsed" -> s"${statusDuration.toSeconds}s",
+      "roundElapsed" -> s"${roundElapsed.toSeconds}s",
+      "stallCount" -> stallCount.toString,
+      "leader" -> ConsensusLog.pid(state.leader),
+      "facilitators" -> state.facilitators.value.size.toString
+    ) ++
+      (if (state.viewNumber > 0) Seq("view" -> state.viewNumber.toString) else Seq.empty) ++
+      (if (withdrawnCount > 0) Seq("withdrawn" -> withdrawnCount.toString) else Seq.empty) ++
+      (if (info.missingPeerIds.nonEmpty) Seq("missing" -> s"[${info.missingPeerIds.mkString(",")}]") else Seq.empty)
+    ConsensusLog.info(logger, ConsensusLog.Stall, key.toString, "n/a", summaryPairs: _*)
+  }
+
+  private def logPeerQualityScores(key: Key): F[Unit] =
+    peerQualityTracker.getQualityScores.flatMap { scores =>
+      if (scores.nonEmpty) {
+        val sorted = scores.toList.sortBy(-_._2)
+        val total = sorted.size
+        val top3 = sorted.take(3).map { case (pid, score) => s"${ConsensusLog.pid(pid)}:${f"$score%.2f"}" }
+        val bottom3 = sorted.takeRight(3).map { case (pid, score) => s"${ConsensusLog.pid(pid)}:${f"$score%.2f"}" }
+        val topIds = sorted.take(3).map(_._1).toSet
+        val bottomEntries =
+          if (total > 6) bottom3.filterNot(e => topIds.exists(id => e.startsWith(ConsensusLog.pid(id)))) else Nil
+        val display =
+          if (bottomEntries.nonEmpty) s"best=[${top3.mkString(",")}],worst=[${bottomEntries.mkString(",")}]"
+          else s"[${top3.mkString(",")}]"
+        ConsensusLog.info(
+          logger,
+          ConsensusLog.Facilitator,
+          key.toString,
+          "n/a",
+          "event" -> "PEER_QUALITY",
+          "scores" -> display,
+          "trackedPeers" -> total.toString
+        )
+      } else
+        ConsensusLog
+          .debug(logger, ConsensusLog.Facilitator, key.toString, "n/a", "event" -> "PEER_QUALITY", "trackedPeers" -> "0")
     }
 }

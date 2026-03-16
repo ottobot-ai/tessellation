@@ -61,7 +61,8 @@ object ConsensusEventLoop {
   final case class BuiltConsensusLoop[F[_], Event, Key, Artifact, Ctx, Status, Outcome, Kind](
     run: Stream[F, Unit],
     manager: ConsensusManager[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind],
-    queue: Queue[F, ConsensusCommand]
+    queue: Queue[F, ConsensusCommand],
+    healthRef: Ref[F, ConsensusHealthStatus]
   )
 
   def build[
@@ -114,7 +115,21 @@ object ConsensusEventLoop {
         facilitatorSelector,
         peerQualityTracker
       )
-      stallDetector = new StallDetector[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind](ctx)
+      healthRef <- ConsensusHealthStatus.ref[F]
+      viewChangeManager = new ViewChangeManager[F, Key, Status, Outcome, Kind](
+        storage,
+        facilitatorSelector,
+        peerQualityTracker,
+        queue,
+        org.typelevel.log4cats.slf4j.Slf4jLogger.getLogger[F]
+      )
+      abandonmentTracker = new AbandonmentTracker[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind](ctx, healthRef)
+      stallDetector = new StallDetector[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind](
+        ctx,
+        viewChangeManager,
+        abandonmentTracker,
+        healthRef
+      )
       roundFibersRef <- Ref.of[F, List[Fiber[F, Throwable, Unit]]](Nil)
       cancelSignalRef <- Ref.of[F, Option[Deferred[F, Unit]]](None)
       roundRunner = new ConsensusRoundRunner[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind](
@@ -173,7 +188,7 @@ object ConsensusEventLoop {
       val run: Stream[F, Unit] =
         Stream(commandStream, peerRegistrationStream, leavingStream).parJoinUnbounded
 
-      BuiltConsensusLoop(run, manager, queue)
+      BuiltConsensusLoop(run, manager, queue, healthRef)
     }
 
   private def collectRegistration[F[_]: Async: Metrics, Event, Key, Artifact, Ctx, Status, Outcome, Kind](

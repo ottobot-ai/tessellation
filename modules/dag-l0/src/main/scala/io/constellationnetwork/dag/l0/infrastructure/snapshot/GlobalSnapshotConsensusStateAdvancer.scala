@@ -952,9 +952,10 @@ object GlobalSnapshotConsensusStateAdvancer {
 
       persist.ifM(
         recordMetrics(signedArtifact) >> gossipFork,
-        logger.error(s"[CONSENSUS] Cannot persist GlobalSnapshot ordinal=${signedArtifact.ordinal.show}") >> MonadThrow[F].raiseError(
-          new RuntimeException("Persist failed")
-        )
+        ConsensusLog.error(logger, ConsensusLog.Lifecycle, signedArtifact.ordinal.show, "n/a", "event" -> "PERSIST_FAILED") >> MonadThrow[F]
+          .raiseError(
+            new RuntimeException("Persist failed")
+          )
       )
     }
 

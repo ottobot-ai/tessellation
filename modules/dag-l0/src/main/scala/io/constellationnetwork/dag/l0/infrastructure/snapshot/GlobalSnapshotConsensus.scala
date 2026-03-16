@@ -264,6 +264,6 @@ object GlobalSnapshotConsensus {
       ](consensusStorage, rumorQueue)
 
       _ <- supervisor.supervise(loop.run.compile.drain)
-      consensus = new Consensus(handler, consensusStorage, loop.manager, routes, consensusFunctions)
+      consensus = new Consensus(handler, consensusStorage, loop.manager, routes, consensusFunctions, Some(loop.healthRef))
     } yield consensus
 }

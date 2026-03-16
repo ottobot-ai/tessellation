@@ -199,7 +199,7 @@ object CurrencySnapshotConsensus {
       ](consensusStorage, rumorQueue)
 
       _ <- supervisor.supervise(loop.run.compile.drain)
-      consensus = new Consensus(handler, consensusStorage, loop.manager, routes, consensusFns)
+      consensus = new Consensus(handler, consensusStorage, loop.manager, routes, consensusFns, Some(loop.healthRef))
     } yield consensus
   }
 }
