@@ -125,10 +125,22 @@ object GlobalSnapshotConsensusStateCreator {
           )
           .whenA(penalizedPeers.nonEmpty)
 
-        // For THIS round only: exclude recently removed AND penalized peers from active selection.
+        // Check for peers that were missing during an abandoned round.
+        // After 5+ stall cycles (65s+), all honest nodes will have the same view of who's missing.
+        // The facilitatorsHash check in the Proposals phase catches any rare disagreement.
+        abandonedMissing <- peerQualityTracker.getAndClearAbandonedMissingPeers
+
+        _ <- logger
+          .info(
+            s"[CONSENSUS] Excluding ${abandonedMissing.size} peers missing from abandoned round for key=$key: " +
+              s"[${abandonedMissing.toList.map(_.value.value.take(8)).mkString(",")}]"
+          )
+          .whenA(abandonedMissing.nonEmpty)
+
+        // For THIS round only: exclude recently removed, penalized, AND abandoned-missing peers from active selection.
         // They remain in allEligible so they can be re-selected in future rounds.
         eligibleThisRound = {
-          val excluded = previouslyRemoved ++ penalizedPeers
+          val excluded = previouslyRemoved ++ penalizedPeers ++ abandonedMissing
           val filtered = allEligible.filterNot(excluded.contains)
           if (filtered.isEmpty) List(selfId) else filtered
         }
@@ -205,6 +217,7 @@ object GlobalSnapshotConsensusStateCreator {
             (if (withdrawn.nonEmpty) s" withdrawn=${withdrawn.size}" else "") +
             (if (penalizedPeers.nonEmpty) s" penalized=${penalizedPeers.size}" else "") +
             (if (previouslyRemoved.nonEmpty) s" previouslyRemoved=${previouslyRemoved.size}" else "") +
+            (if (abandonedMissing.nonEmpty) s" abandonedMissing=${abandonedMissing.size}" else "") +
             s" entropy=${entropy.show.take(8)}..."
         )
 

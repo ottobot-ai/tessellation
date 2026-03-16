@@ -9,7 +9,7 @@ import scala.concurrent.duration._
 import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusResources
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
-import io.constellationnetwork.schema.peer.{PeerResponsiveness, Unresponsive}
+import io.constellationnetwork.schema.peer.{PeerId, PeerResponsiveness, Unresponsive}
 
 import eu.timepit.refined.auto._
 
@@ -59,7 +59,7 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
   private val basePollInterval = 100L
   private val maxPollInterval = 1000L
 
-  private case class ResourcesInfo(hash: Int, declaredCount: Int, activeCount: Int, missingPeerIds: Set[String])
+  private case class ResourcesInfo(hash: Int, declaredCount: Int, activeCount: Int, missingPeerIds: Set[String], missingPeers: Set[PeerId])
 
   def monitor(key: Key, cancelSignal: Deferred[F, Unit]): F[Unit] =
     for {
@@ -194,7 +194,14 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
                 else s"stuck after $finalStallCount stall cycles"
 
               _ <- (
-                abandonRound(key, abandonReason) >>
+                peerQualityTracker.recordAbandonedMissingPeers(info.missingPeers).whenA(info.missingPeers.nonEmpty) >>
+                  logger
+                    .info(
+                      s"[CONSENSUS] Recording ${info.missingPeers.size} missing peers from abandoned round key=$key: " +
+                        s"[${info.missingPeers.toList.map(_.show.take(8)).mkString(",")}]"
+                    )
+                    .whenA(info.missingPeers.nonEmpty) >>
+                  abandonRound(key, abandonReason) >>
                   Metrics[F].incrementCounter(
                     "dag_consensus_stall_abandon_reason",
                     Seq((Metrics.unsafeLabelName("reason"), abandonReasonLabel))
@@ -275,19 +282,21 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
         val respondedPeers = resources.peerDeclarationsMap.collect {
           case (pid, decls) if active.contains(pid) && getter(decls).isDefined => pid
         }.toSet
-        val missingPeers = active -- respondedPeers
+        val missing = active -- respondedPeers
         ResourcesInfo(
           hash = respondedPeers.hashCode(),
           declaredCount = respondedPeers.size,
           activeCount = active.size,
-          missingPeerIds = missingPeers.toList.map(_.value.value.take(8)).toSet
+          missingPeerIds = missing.toList.map(_.value.value.take(8)).toSet,
+          missingPeers = missing
         )
       case None =>
         ResourcesInfo(
           hash = resources.peerDeclarationsMap.keySet.hashCode(),
           declaredCount = resources.peerDeclarationsMap.size,
           activeCount = active.size,
-          missingPeerIds = Set.empty
+          missingPeerIds = Set.empty,
+          missingPeers = Set.empty
         )
     }
   }

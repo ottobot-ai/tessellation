@@ -46,6 +46,19 @@ trait PeerQualityTracker[F[_]] {
   /** Record that all facilitators in a round experienced an abandoned round. */
   def recordRoundAbandoned(facilitators: Set[PeerId]): F[Unit]
 
+  /** Record peers that were missing (didn't declare) when a round was abandoned. These peers should be excluded from the next round's
+    * facilitator selection to prevent the same deadlock from repeating.
+    *
+    * While this is local (not consensus-agreed), after 5+ stall cycles (65s+) all honest nodes will have the same view of who's missing.
+    * The facilitatorsHash check in the Proposals phase catches any rare disagreement.
+    */
+  def recordAbandonedMissingPeers(missing: Set[PeerId]): F[Unit]
+
+  /** Get and atomically clear the set of peers missing from abandoned rounds. Used by ConsensusStateCreator to exclude these peers from the
+    * retry's facilitator set.
+    */
+  def getAndClearAbandonedMissingPeers: F[Set[PeerId]]
+
   /** Get quality score for a single peer (0.0 = worst, 1.0 = best). */
   def getQualityScore(peerId: PeerId): F[Double]
 
@@ -75,7 +88,10 @@ object PeerQualityTracker {
   private val decayThreshold: Long = 10000L
 
   def make[F[_]: Async]: F[PeerQualityTracker[F]] =
-    Ref.of[F, Map[PeerId, PeerMetrics]](Map.empty).map { ref =>
+    for {
+      ref <- Ref.of[F, Map[PeerId, PeerMetrics]](Map.empty)
+      abandonedRef <- Ref.of[F, Set[PeerId]](Set.empty)
+    } yield
       new PeerQualityTracker[F] {
 
         def recordRoundSuccess(facilitators: Set[PeerId]): F[Unit] =
@@ -116,13 +132,18 @@ object PeerQualityTracker {
             )
           }
 
+        def recordAbandonedMissingPeers(missing: Set[PeerId]): F[Unit] =
+          abandonedRef.update(_ ++ missing)
+
+        def getAndClearAbandonedMissingPeers: F[Set[PeerId]] =
+          abandonedRef.getAndSet(Set.empty)
+
         def getQualityScore(peerId: PeerId): F[Double] =
           ref.get.map(_.getOrElse(peerId, emptyMetrics).qualityScore)
 
         def getQualityScores: F[Map[PeerId, Double]] =
           ref.get.map(_.map { case (pid, m) => (pid, m.qualityScore) })
       }
-    }
 
   /** Halve all counters when any peer exceeds the decay threshold to keep recent data relevant. */
   private def maybeDecay(metrics: Map[PeerId, PeerMetrics]): Map[PeerId, PeerMetrics] =
