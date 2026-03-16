@@ -13,6 +13,7 @@ import cats.syntax.functor._
 import io.constellationnetwork.dag.l0.config.types.AppConfig
 import io.constellationnetwork.dag.l0.domain.cell.L0Cell
 import io.constellationnetwork.dag.l0.domain.statechannel.StateChannelService
+import io.constellationnetwork.dag.l0.infrastructure.mempool.GlobalEventMempool
 import io.constellationnetwork.dag.l0.infrastructure.rewards._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.trust.TrustStorageUpdater
@@ -30,12 +31,15 @@ import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.domain.snapshot.services.AddressService
 import io.constellationnetwork.node.shared.infrastructure.collateral.MptStoreCollateral
 import io.constellationnetwork.node.shared.infrastructure.delegatedStake.{RewardsInfoCalculator, RewardsInfoStorage}
+import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
 import io.constellationnetwork.node.shared.infrastructure.snapshot.services.AddressService
 import io.constellationnetwork.node.shared.logger.LoggerBundle
 import io.constellationnetwork.node.shared.modules.{SharedServices, SharedStorages, SharedValidators}
+import io.constellationnetwork.node.shared.snapshot.global.GlobalSnapshotEvent
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, GlobalStateProofSelector}
 import io.constellationnetwork.security.{Hasher, HasherSelector, SecurityProvider}
@@ -95,6 +99,10 @@ object Services {
         rewardsInfoStorage
       )
 
+      eventMempool <- HasherSelector[F].withCurrent { implicit hasher =>
+        GlobalEventMempool.make[F](GlobalEventMempool.defaultConfig)
+      }
+
       consensus <- HasherSelector[F].withCurrent { implicit hs =>
         GlobalSnapshotConsensus
           .make[F, R](
@@ -123,6 +131,7 @@ object Services {
             sharedStorages.lastGlobalSnapshot,
             storages.globalSnapshot.getHashed,
             sharedStorages.mptStore,
+            eventMempool,
             loggerBundle,
             queues.rumor
           )

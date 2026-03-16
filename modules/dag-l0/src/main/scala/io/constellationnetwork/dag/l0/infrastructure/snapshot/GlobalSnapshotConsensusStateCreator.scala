@@ -13,6 +13,9 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.declaration.
 import io.constellationnetwork.node.shared.infrastructure.consensus.message.ConsensusPeerDeclaration
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.ConsensusTrigger
+import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
+import io.constellationnetwork.node.shared.snapshot.global.GlobalSnapshotEvent
+import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 
@@ -39,7 +42,8 @@ object GlobalSnapshotConsensusStateCreator {
     seedlist: Option[Set[SeedlistEntry]],
     facilitatorSelector: FacilitatorSelector,
     consensusConfigHash: Hash,
-    peerQualityTracker: PeerQualityTracker[F]
+    peerQualityTracker: PeerQualityTracker[F],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey]
   ): GlobalSnapshotConsensusStateCreator[F] = new GlobalSnapshotConsensusStateCreator[F] {
 
     val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
@@ -181,12 +185,13 @@ object GlobalSnapshotConsensusStateCreator {
 
         time <- Clock[F].monotonic
 
-        effect = consensusStorage.getUpperBound.flatMap { bound =>
-          gossip.spread(
+        effect = for {
+          eventHashes <- eventMempool.getEventHashes
+          _ <- gossip.spread(
             ConsensusPeerDeclaration(
               key,
               Facility(
-                bound,
+                eventHashes,
                 candidates,
                 maybeTrigger,
                 lastOutcome.finished.facilitatorsHash,
@@ -196,7 +201,7 @@ object GlobalSnapshotConsensusStateCreator {
               )
             )
           )
-        }
+        } yield ()
 
         // Quality-weighted leader selection: use consensus-agreed quality scores
         // so all nodes compute the same leader deterministically.

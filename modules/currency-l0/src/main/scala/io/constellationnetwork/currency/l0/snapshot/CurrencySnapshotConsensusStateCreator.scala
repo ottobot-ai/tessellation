@@ -5,6 +5,7 @@ import cats.effect.{Async, Sync}
 import cats.syntax.all._
 
 import io.constellationnetwork.currency.l0.snapshot.schema.{CollectingFacilities, CurrencyConsensusKind, CurrencyConsensusOutcome}
+import io.constellationnetwork.currency.schema.CurrencyStateKey
 import io.constellationnetwork.currency.schema.currency.CurrencySnapshotContext
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
@@ -15,6 +16,7 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.declaration.
 import io.constellationnetwork.node.shared.infrastructure.consensus.message.ConsensusPeerDeclaration
 import io.constellationnetwork.node.shared.infrastructure.consensus.state.{ConsensusStateCreator, _}
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.ConsensusTrigger
+import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.snapshot.currency._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, SnapshotOrdinal}
@@ -45,7 +47,8 @@ object CurrencySnapshotConsensusStateCreator {
     seedlist: Option[Set[SeedlistEntry]],
     facilitatorSelector: FacilitatorSelector,
     consensusConfigHash: Hash,
-    peerQualityTracker: PeerQualityTracker[F]
+    peerQualityTracker: PeerQualityTracker[F],
+    eventMempool: EventMempool[F, CurrencySnapshotEvent, CurrencyStateKey]
   ): CurrencySnapshotConsensusStateCreator[F] = new CurrencySnapshotConsensusStateCreator[F] {
 
     val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
@@ -172,12 +175,13 @@ object CurrencySnapshotConsensusStateCreator {
         time <- Clock[F].monotonic
         lastGlobalSnapshotOrdinal <- lastGlobalSnapshotStorage.getOrdinal.map(_.getOrElse(SnapshotOrdinal.MinValue))
 
-        effect = consensusStorage.getUpperBound.flatMap { bound =>
-          gossip.spread(
+        effect = for {
+          eventHashes <- eventMempool.getEventHashes
+          _ <- gossip.spread(
             ConsensusPeerDeclaration(
               key,
               Facility(
-                bound,
+                eventHashes,
                 candidates,
                 maybeTrigger,
                 lastOutcome.finished.facilitatorsHash,
@@ -187,7 +191,7 @@ object CurrencySnapshotConsensusStateCreator {
               )
             )
           )
-        }
+        } yield ()
 
         // Quality-weighted leader selection using consensus-agreed quality scores
         qualityScores = lastOutcome.peerQuality.map {

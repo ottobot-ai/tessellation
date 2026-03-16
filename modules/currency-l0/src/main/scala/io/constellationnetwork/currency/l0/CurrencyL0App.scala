@@ -32,7 +32,6 @@ import io.constellationnetwork.node.shared.snapshot.currency.CurrencySnapshotEve
 import io.constellationnetwork.node.shared.{NodeSharedOrSharedRegistrationIdRange, nodeSharedKryoRegistrar}
 import io.constellationnetwork.schema.artifact.SharedArtifact
 import io.constellationnetwork.schema.cluster.ClusterId
-import io.constellationnetwork.schema.gossip.{Ordinal => GossipOrdinal}
 import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.semver.{MetagraphVersion, TessellationVersion}
 import io.constellationnetwork.security._
@@ -426,11 +425,7 @@ abstract class CurrencyL0App(
                           _ <- logger.info(s"Setting owner address filled on path: ${m.metagraphOwnerMessagePath}")
                           maybeOwnerEvent <- services.currencyMessages.validateInitialCurrencyOwner(m.metagraphOwnerMessagePath)
                           _ <- logger.info(s"Owner address set")
-                          _ <- maybeOwnerEvent.traverse_ { event =>
-                            services.consensus.storage.addEvents(
-                              Map(nodeId -> List((GossipOrdinal.MinValue, event)))
-                            )
-                          }
+                          _ <- maybeOwnerEvent.traverse_(mkCell(_).run())
                         } yield ()
                       } else IO.unit
                     hashedSnapshot <- currencySnapshot.toHashed[IO]

@@ -10,9 +10,10 @@ import cats.syntax.all._
 
 import scala.collection.immutable.SortedSet
 
-import io.constellationnetwork.currency.dataApplication.BaseDataApplicationL0Service
+import io.constellationnetwork.currency.dataApplication._
 import io.constellationnetwork.currency.l0.config.types.AppConfig
 import io.constellationnetwork.currency.l0.http.p2p.P2PClient
+import io.constellationnetwork.currency.l0.infrastructure.mempool.CurrencyEventMempool
 import io.constellationnetwork.currency.l0.infrastructure.snapshot.services.CurrencyMessagesService
 import io.constellationnetwork.currency.l0.node.L0NodeContext
 import io.constellationnetwork.currency.l0.snapshot._
@@ -49,6 +50,7 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.signature.{Signed, SignedValidator}
 
+import io.circe.Encoder
 import org.http4s.client.Client
 
 object Services {
@@ -82,7 +84,19 @@ object Services {
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     currencyStateProofSelector: CurrencyStateProofSelector
-  ): F[Services[F, R]] =
+  ): F[Services[F, R]] = {
+    // Build CurrencySnapshotEvent encoder needed by CurrencyEventMempool.
+    // Constructed eagerly to avoid implicit resolution circularity inside the for-comp.
+    val currencyEventEncoder: Encoder[CurrencySnapshotEvent] = {
+      val dtEncoder: Encoder[DataTransaction] =
+        maybeDataApplication.map { da =>
+          implicit val due: Encoder[DataUpdate] = da.dataEncoder
+          DataTransaction.encoder
+        }.getOrElse(Encoder.instance[DataTransaction](_ => io.circe.Json.Null))
+      implicit val dte: Encoder[DataTransaction] = dtEncoder
+      CurrencySnapshotEvent.encoder
+    }
+
     for {
       implicit0(hasher: Hasher[F]) <- hasherSelector.getCurrent.pure[F]
 
@@ -154,6 +168,11 @@ object Services {
         sharedStorages.lastGlobalSnapshot
       )
 
+      eventMempool <- {
+        implicit val cee: Encoder[CurrencySnapshotEvent] = currencyEventEncoder
+        CurrencyEventMempool.make[F](CurrencyEventMempool.defaultConfig)
+      }
+
       consensus <- CurrencySnapshotConsensus
         .make[F](
           sharedServices.gossip,
@@ -177,6 +196,7 @@ object Services {
           cfg.shared.leavingDelay,
           globalL0Service.pullGlobalSnapshot,
           maybeCustomArtifacts,
+          eventMempool,
           queues.rumor
         )
     } yield
@@ -197,6 +217,7 @@ object Services {
         restart = sharedServices.restart,
         currencyMessages = currencyMessagesService
       ) {}
+  }
 }
 
 sealed abstract class Services[F[_], R <: CliMethod] private (

@@ -7,7 +7,6 @@ import scala.reflect.runtime.universe.TypeTag
 
 import io.constellationnetwork.node.shared.domain.Daemon
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
-import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusStorage
 import io.constellationnetwork.node.shared.infrastructure.consensus.message.ConsensusEvent
 
 import fs2.Stream
@@ -21,15 +20,13 @@ trait SnapshotEventsPublisherDaemon[F[_]] {
 object SnapshotEventsPublisherDaemon {
   def make[F[_]: Async: Supervisor, E: TypeTag: Encoder](
     gossip: Gossip[F],
-    consensusEvents: Stream[F, E],
-    consensusStorage: ConsensusStorage[F, E, _, _, _, _, _, _]
+    consensusEvents: Stream[F, E]
   ): SnapshotEventsPublisherDaemon[F] =
     new SnapshotEventsPublisherDaemon[F] {
       def spawn: Daemon[F] = Daemon.spawn {
         consensusEvents
-          .evalFilterNot(consensusStorage.containsEvent)
           .map(ConsensusEvent(_))
-          .evalMap(gossip.spread[ConsensusEvent[E]])
+          .evalMap(e => gossip.spread(e))
           .compile
           .drain
       }

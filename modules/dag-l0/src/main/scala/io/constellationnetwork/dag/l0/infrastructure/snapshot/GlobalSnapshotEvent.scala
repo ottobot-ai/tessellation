@@ -1,55 +1,41 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot
 
-import io.constellationnetwork.schema.Block
-import io.constellationnetwork.schema.delegatedStake.UpdateDelegatedStake
-import io.constellationnetwork.schema.node.UpdateNodeParameters
-import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
-import io.constellationnetwork.schema.swap.AllowSpendBlock
-import io.constellationnetwork.schema.tokenLock.TokenLockBlock
-import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.statechannel.StateChannelOutput
-
-import derevo.cats.{eqv, show}
-import derevo.circe.magnolia.{decoder, encoder}
-import derevo.derive
-
-/** Event types that can be included in a Global Snapshot.
+/** Re-exports GlobalSnapshotEvent types from node-shared.
   *
-  * '''Ordering note''': These events do NOT have `Order` instances. They are collected into `Set[GlobalSnapshotEvent]` which has
-  * non-deterministic iteration order. When extracted from the Set for processing, they MUST be sorted at the point of consumption (e.g. via
-  * `Signed[T].order` on the wrapped values) to ensure deterministic acceptance across peers.
+  * These types were moved to `io.constellationnetwork.node.shared.snapshot.global` so they can be referenced by the generic event mempool
+  * and gossip infrastructure in node-shared. This object preserves backward compatibility for existing dag-l0 code.
   */
 object event {
+  type GlobalSnapshotEvent = io.constellationnetwork.node.shared.snapshot.global.GlobalSnapshotEvent
 
-  @derive(eqv, decoder, encoder, show)
-  sealed trait GlobalSnapshotEvent
+  type DAGEvent = io.constellationnetwork.node.shared.snapshot.global.DAGEvent
+  val DAGEvent = io.constellationnetwork.node.shared.snapshot.global.DAGEvent
 
-  @derive(eqv, decoder, encoder, show)
-  case class DAGEvent(value: Signed[Block]) extends GlobalSnapshotEvent
+  type StateChannelEvent = io.constellationnetwork.node.shared.snapshot.global.StateChannelEvent
+  val StateChannelEvent = io.constellationnetwork.node.shared.snapshot.global.StateChannelEvent
 
-  @derive(eqv, decoder, encoder, show)
-  case class StateChannelEvent(value: StateChannelOutput) extends GlobalSnapshotEvent
+  type AllowSpendEvent = io.constellationnetwork.node.shared.snapshot.global.AllowSpendEvent
+  val AllowSpendEvent = io.constellationnetwork.node.shared.snapshot.global.AllowSpendEvent
 
-  @derive(eqv, decoder, encoder, show)
-  case class AllowSpendEvent(value: Signed[AllowSpendBlock]) extends GlobalSnapshotEvent
+  type TokenLockEvent = io.constellationnetwork.node.shared.snapshot.global.TokenLockEvent
+  val TokenLockEvent = io.constellationnetwork.node.shared.snapshot.global.TokenLockEvent
 
-  @derive(eqv, decoder, encoder, show)
-  case class TokenLockEvent(value: Signed[TokenLockBlock]) extends GlobalSnapshotEvent
+  type UpdateNodeParametersEvent = io.constellationnetwork.node.shared.snapshot.global.UpdateNodeParametersEvent
+  val UpdateNodeParametersEvent = io.constellationnetwork.node.shared.snapshot.global.UpdateNodeParametersEvent
 
-  @derive(eqv, decoder, encoder, show)
-  case class UpdateNodeParametersEvent(updateNodeParameters: Signed[UpdateNodeParameters]) extends GlobalSnapshotEvent
+  type UpdateDelegatedStakeEvent = io.constellationnetwork.node.shared.snapshot.global.UpdateDelegatedStakeEvent
 
-  @derive(eqv, decoder, encoder, show)
-  sealed trait UpdateDelegatedStakeEvent extends GlobalSnapshotEvent
-  @derive(eqv, decoder, encoder, show)
-  case class CreateDelegatedStakeEvent(value: Signed[UpdateDelegatedStake.Create]) extends UpdateDelegatedStakeEvent
-  @derive(eqv, decoder, encoder, show)
-  case class WithdrawDelegatedStakeEvent(value: Signed[UpdateDelegatedStake.Withdraw]) extends UpdateDelegatedStakeEvent
+  type CreateDelegatedStakeEvent = io.constellationnetwork.node.shared.snapshot.global.CreateDelegatedStakeEvent
+  val CreateDelegatedStakeEvent = io.constellationnetwork.node.shared.snapshot.global.CreateDelegatedStakeEvent
 
-  @derive(eqv, decoder, encoder, show)
-  sealed trait UpdateNodeCollateralEvent extends GlobalSnapshotEvent
-  @derive(eqv, decoder, encoder, show)
-  case class CreateNodeCollateralEvent(value: Signed[UpdateNodeCollateral.Create]) extends UpdateNodeCollateralEvent
-  @derive(eqv, decoder, encoder, show)
-  case class WithdrawNodeCollateralEvent(value: Signed[UpdateNodeCollateral.Withdraw]) extends UpdateNodeCollateralEvent
+  type WithdrawDelegatedStakeEvent = io.constellationnetwork.node.shared.snapshot.global.WithdrawDelegatedStakeEvent
+  val WithdrawDelegatedStakeEvent = io.constellationnetwork.node.shared.snapshot.global.WithdrawDelegatedStakeEvent
+
+  type UpdateNodeCollateralEvent = io.constellationnetwork.node.shared.snapshot.global.UpdateNodeCollateralEvent
+
+  type CreateNodeCollateralEvent = io.constellationnetwork.node.shared.snapshot.global.CreateNodeCollateralEvent
+  val CreateNodeCollateralEvent = io.constellationnetwork.node.shared.snapshot.global.CreateNodeCollateralEvent
+
+  type WithdrawNodeCollateralEvent = io.constellationnetwork.node.shared.snapshot.global.WithdrawNodeCollateralEvent
+  val WithdrawNodeCollateralEvent = io.constellationnetwork.node.shared.snapshot.global.WithdrawNodeCollateralEvent
 }

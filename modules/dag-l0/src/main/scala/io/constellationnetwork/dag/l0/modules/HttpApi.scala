@@ -16,12 +16,14 @@ import io.constellationnetwork.env.AppEnvironment._
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.config.types.{HttpConfig, RouteRateLimiterConfig, SharedConfig}
 import io.constellationnetwork.node.shared.http.p2p.middlewares.{MetricsMiddleware, PeerAuthMiddleware, `X-Id-Middleware`}
-import io.constellationnetwork.node.shared.http.routes._
+import io.constellationnetwork.node.shared.http.routes.{EventGossipRoutes, MempoolRoutes, _}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.CombinedSnapshotCheckpointFileSystemStorage
 import io.constellationnetwork.node.shared.modules.SharedValidators
+import io.constellationnetwork.node.shared.snapshot.global.GlobalSnapshotEvent
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.TessellationVersion
@@ -192,6 +194,17 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
   }
   private val tokenLockRoutes = GL0TokenLockRoutes(storages.globalSnapshot)
 
+  private val mempoolRoutes: HttpRoutes[F] =
+    MempoolRoutes.make(services.consensus.eventMempool).publicRoutes
+
+  private val eventGossipRoutes: HttpRoutes[F] =
+    EventGossipRoutes
+      .make[F, GlobalSnapshotEvent, GlobalStateKey](
+        services.consensus.eventMempool,
+        Some(services.consensus.manager.triggerEventConsensus)
+      )
+      .p2pRoutes
+
   private val walletRoutes = WalletRoutes[F, GlobalIncrementalSnapshot]("/dag", services.address)
   private val consensusInfoRoutes =
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -240,7 +253,8 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
                 tokenLockBlockRoutes.publicRoutes <+>
                 nodeParametersRoutes.publicRoutes <+>
                 delegatedStakesRoutes.publicRoutes <+>
-                nodeCollateralsRoutes.publicRoutes
+                nodeCollateralsRoutes.publicRoutes <+>
+                mempoolRoutes
             }
           }
       }
@@ -259,7 +273,8 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
                   gossipRoutes.p2pRoutes <+>
                   trustRoutes.p2pRoutes <+>
                   snapshotRoutes.p2pRoutes <+>
-                  consensusRoutes
+                  consensusRoutes <+>
+                  eventGossipRoutes
               )
             )
           )

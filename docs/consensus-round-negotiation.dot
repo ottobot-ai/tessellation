@@ -1,0 +1,209 @@
+// Tessellation Global Snapshot Consensus - Round Negotiation & Non-Responsive Node Handling
+// Render: dot -Tpng consensus-round-negotiation.dot -o consensus-round-negotiation.png
+
+digraph consensus_round {
+  rankdir=TB;
+  compound=true;
+  fontname="Helvetica";
+  node [fontname="Helvetica", fontsize=10];
+  edge [fontname="Helvetica", fontsize=9];
+  newrank=true;
+
+  // ── Title ──
+  labelloc="t";
+  label=<<B>Tessellation Global Snapshot Consensus — Round Negotiation with Non-Responsive Node</B><BR/><I>5-node cluster, Node C becomes unresponsive during Phase 2</I>>;
+  fontsize=14;
+
+  // ═══════════════════════════════════════════════════════════
+  // CLUSTER NODES
+  // ═══════════════════════════════════════════════════════════
+
+  subgraph cluster_nodes {
+    label="Cluster Nodes";
+    style=invis;
+
+    subgraph cluster_nodeA {
+      label=<<B>Node A</B> (Follower)>;
+      style=rounded; color="#4a90d9"; fontcolor="#4a90d9";
+      A_facility [label="Spread\nFacility", shape=box, style=filled, fillcolor="#d4e6f1"];
+      A_wait_prop [label="Wait for\nLeader Proposal", shape=box, style=filled, fillcolor="#d4e6f1"];
+      A_sign [label="Validate &\nSign Artifact", shape=box, style=filled, fillcolor="#d4e6f1"];
+      A_finish [label="Outcome\nFinished", shape=doubleoctagon, style=filled, fillcolor="#a9dfbf"];
+    }
+
+    subgraph cluster_nodeB {
+      label=<<B>Node B</B> (Leader, view=0)>;
+      style=rounded; color="#e67e22"; fontcolor="#e67e22";
+      B_facility [label="Spread\nFacility", shape=box, style=filled, fillcolor="#fdebd0"];
+      B_propose [label="Create Artifact\n+ Spread Proposal", shape=box, style=filled, fillcolor="#fdebd0", penwidth=2];
+      B_sign [label="Collect\nSignatures", shape=box, style=filled, fillcolor="#fdebd0"];
+      B_finish [label="Outcome\nFinished", shape=doubleoctagon, style=filled, fillcolor="#a9dfbf"];
+    }
+
+    subgraph cluster_nodeC {
+      label=<<B>Node C</B> (Non-Responsive)>;
+      style=rounded; color="#e74c3c"; fontcolor="#e74c3c";
+      C_facility [label="Spread\nFacility", shape=box, style=filled, fillcolor="#fadbd8"];
+      C_disconnect [label="⚡ Network\nPartition", shape=diamond, style=filled, fillcolor="#e74c3c", fontcolor="white"];
+      C_stalled [label="Stalled\n(no majority fork\ndata to compare)", shape=box, style=filled, fillcolor="#e74c3c", fontcolor="white"];
+      C_abandon [label="Consecutive\nAbandonments\n(same ordinal)", shape=box, style=filled, fillcolor="#f5b7b1"];
+      C_recovery [label="Recovery\nDownload\nTriggered", shape=box, style=filled, fillcolor="#f9e79f"];
+      C_rejoin [label="WaitingForDownload\n→ Download fresh\nsnapshot from peers", shape=box, style=filled, fillcolor="#f9e79f"];
+      C_stuck [label="❌ STUCK\nCan't reach peers\nfor download", shape=box, style=filled, fillcolor="#e74c3c", fontcolor="white", penwidth=3];
+    }
+
+    subgraph cluster_nodeD {
+      label=<<B>Node D</B> (Follower)>;
+      style=rounded; color="#4a90d9"; fontcolor="#4a90d9";
+      D_facility [label="Spread\nFacility", shape=box, style=filled, fillcolor="#d4e6f1"];
+      D_wait_prop [label="Wait for\nLeader Proposal", shape=box, style=filled, fillcolor="#d4e6f1"];
+      D_sign [label="Validate &\nSign Artifact", shape=box, style=filled, fillcolor="#d4e6f1"];
+      D_finish [label="Outcome\nFinished", shape=doubleoctagon, style=filled, fillcolor="#a9dfbf"];
+    }
+
+    subgraph cluster_nodeE {
+      label=<<B>Node E</B> (Follower)>;
+      style=rounded; color="#4a90d9"; fontcolor="#4a90d9";
+      E_facility [label="Spread\nFacility", shape=box, style=filled, fillcolor="#d4e6f1"];
+      E_wait_prop [label="Wait for\nLeader Proposal", shape=box, style=filled, fillcolor="#d4e6f1"];
+      E_sign [label="Validate &\nSign Artifact", shape=box, style=filled, fillcolor="#d4e6f1"];
+      E_finish [label="Outcome\nFinished", shape=doubleoctagon, style=filled, fillcolor="#a9dfbf"];
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // PHASE 1: CollectingFacilities (all-to-all exchange)
+  // ═══════════════════════════════════════════════════════════
+
+  subgraph cluster_phase1 {
+    label=<<B>Phase 1: CollectingFacilities</B><BR/>All peers exchange: event bounds, candidates, trigger, config hash<BR/>Quorum: ≥75% facilities → advance>;
+    style=dashed; color="#7f8c8d";
+    rank=same;
+
+    phase1_quorum [label="Quorum Check\n4/5 declared\n(C missing → still ≥75%)", shape=diamond, style=filled, fillcolor="#f0f3f4"];
+  }
+
+  // Phase 1 flows
+  A_facility -> phase1_quorum [style=dashed, color="#4a90d9", label="facility"];
+  B_facility -> phase1_quorum [style=dashed, color="#e67e22", label="facility"];
+  C_facility -> C_disconnect [color="#e74c3c", label="partial\nsend"];
+  D_facility -> phase1_quorum [style=dashed, color="#4a90d9", label="facility"];
+  E_facility -> phase1_quorum [style=dashed, color="#4a90d9", label="facility"];
+
+  // ═══════════════════════════════════════════════════════════
+  // PHASE 2: CollectingProposals (leader-based)
+  // ═══════════════════════════════════════════════════════════
+
+  phase1_quorum -> A_wait_prop [label="advance"];
+  phase1_quorum -> B_propose [label="advance\n(I am leader)"];
+  phase1_quorum -> D_wait_prop [label="advance"];
+  phase1_quorum -> E_wait_prop [label="advance"];
+
+  // Leader pushes proposal directly
+  B_propose -> A_wait_prop [color="#e67e22", style=bold, label="  direct push\n  proposal+artifact"];
+  B_propose -> D_wait_prop [color="#e67e22", style=bold, label="direct push"];
+  B_propose -> E_wait_prop [color="#e67e22", style=bold, label="direct push"];
+
+  // ═══════════════════════════════════════════════════════════
+  // PHASE 3: CollectingSignatures
+  // ═══════════════════════════════════════════════════════════
+
+  A_wait_prop -> A_sign [label="validate\n+ sign"];
+  B_propose -> B_sign [label="self-sign"];
+  D_wait_prop -> D_sign [label="validate\n+ sign"];
+  E_wait_prop -> E_sign [label="validate\n+ sign"];
+
+  // Signature collection
+  subgraph cluster_phase3 {
+    label=<<B>Phase 3: CollectingSignatures</B><BR/>Quorum: ≥75% valid signatures → Finished<BR/>C withdrawn/removed, 4/4 active sign>;
+    style=dashed; color="#7f8c8d";
+    phase3_quorum [label="Quorum Check\n4/4 signatures\n(C removed from\nactive set)", shape=diamond, style=filled, fillcolor="#f0f3f4"];
+  }
+
+  A_sign -> phase3_quorum [style=dashed, color="#4a90d9", label="vote"];
+  B_sign -> phase3_quorum [style=dashed, color="#e67e22", label="vote"];
+  D_sign -> phase3_quorum [style=dashed, color="#4a90d9", label="vote"];
+  E_sign -> phase3_quorum [style=dashed, color="#4a90d9", label="vote"];
+
+  phase3_quorum -> A_finish;
+  phase3_quorum -> B_finish;
+  phase3_quorum -> D_finish;
+  phase3_quorum -> E_finish;
+
+  // ═══════════════════════════════════════════════════════════
+  // NODE C: STALLED PATH (the bug Marcus is investigating)
+  // ═══════════════════════════════════════════════════════════
+
+  C_disconnect -> C_stalled [label="alone on\nminority fork"];
+  C_stalled -> C_abandon [label="stallCount ≥ maxStallCycles\n(3 cycles, no progress)"];
+  C_abandon -> C_abandon [label="retry round at\nsame ordinal\n(still alone)", style=dashed, color="#e74c3c"];
+  C_abandon -> C_recovery [label="consecutiveAbandonments\n≥ threshold (5)"];
+  C_recovery -> C_rejoin [label="Ready →\nWaitingForDownload"];
+  C_rejoin -> C_stuck [label="still partitioned\n→ can't reach peers", color="#e74c3c", style=bold];
+  C_rejoin -> C_facility [label="network restored\n→ download succeeds\n→ rejoin next round", color="#27ae60", style=bold, constraint=false];
+
+  // ═══════════════════════════════════════════════════════════
+  // STALL DETECTOR DETAIL
+  // ═══════════════════════════════════════════════════════════
+
+  subgraph cluster_stall {
+    label=<<B>StallDetector Decision Tree</B><BR/>(runs every 100-1000ms per round)>;
+    style=dashed; color="#8e44ad"; fontcolor="#8e44ad";
+
+    sd_poll [label="Poll State\n+ Resources", shape=box, style=filled, fillcolor="#e8daef"];
+    sd_leader_check [label="Leader\nUnresponsive?", shape=diamond, style=filled, fillcolor="#e8daef"];
+    sd_timeout [label="Phase Timeout\nExceeded?", shape=diamond, style=filled, fillcolor="#e8daef"];
+    sd_proposal_phase [label="In Proposal\nPhase?", shape=diamond, style=filled, fillcolor="#e8daef"];
+    sd_view_change [label="View Change\n(rotate leader,\nviewNumber++)", shape=box, style=filled, fillcolor="#f9e79f", penwidth=2];
+    sd_stall_count [label="Increment\nstallCount", shape=box, style=filled, fillcolor="#fadbd8"];
+    sd_max_stalls [label="stallCount ≥\nmaxStallCycles?", shape=diamond, style=filled, fillcolor="#fadbd8"];
+    sd_abandon [label="Abandon Round\n(clear state,\nclear resources)", shape=box, style=filled, fillcolor="#e74c3c", fontcolor="white"];
+    sd_continue [label="Continue\nMonitoring", shape=box, style=filled, fillcolor="#d5f5e3"];
+
+    sd_poll -> sd_leader_check;
+    sd_leader_check -> sd_view_change [label="YES\n(early)", color="#e67e22"];
+    sd_leader_check -> sd_timeout [label="NO"];
+    sd_timeout -> sd_proposal_phase [label="YES"];
+    sd_timeout -> sd_continue [label="NO"];
+    sd_proposal_phase -> sd_view_change [label="YES"];
+    sd_proposal_phase -> sd_stall_count [label="NO"];
+    sd_stall_count -> sd_max_stalls;
+    sd_max_stalls -> sd_abandon [label="YES"];
+    sd_max_stalls -> sd_continue [label="NO"];
+    sd_view_change -> sd_continue [label="new leader\nrespreads"];
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // LEADER SELECTION DETAIL
+  // ═══════════════════════════════════════════════════════════
+
+  subgraph cluster_leader {
+    label=<<B>Leader Selection (Rendezvous Hashing)</B><BR/>Deterministic: all nodes compute same leader from shared entropy>;
+    style=dashed; color="#2c3e50"; fontcolor="#2c3e50";
+
+    ls_entropy [label="Entropy =\nHash(previous\noutcome artifact)", shape=box, style=filled, fillcolor="#ebedef"];
+    ls_score [label="For each facilitator:\nscore = SHA256(entropy ‖ peerId)\nas positive BigInt", shape=box, style=filled, fillcolor="#ebedef"];
+    ls_rank [label="Sort by score\n(descending)", shape=box, style=filled, fillcolor="#ebedef"];
+    ls_pick [label="leader = sorted[viewNumber % N]\n\nview=0 → rank 0 (top scorer)\nview=1 → rank 1\nview=2 → rank 2\n...", shape=box, style=filled, fillcolor="#fef9e7"];
+
+    ls_entropy -> ls_score -> ls_rank -> ls_pick;
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // LEGEND
+  // ═══════════════════════════════════════════════════════════
+
+  subgraph cluster_legend {
+    label=<<B>Legend</B>>;
+    style=rounded; color="#95a5a6";
+
+    leg1 [label="Leader node", shape=box, style=filled, fillcolor="#fdebd0", penwidth=2];
+    leg2 [label="Follower node", shape=box, style=filled, fillcolor="#d4e6f1"];
+    leg3 [label="Non-responsive\nnode", shape=box, style=filled, fillcolor="#e74c3c", fontcolor="white"];
+    leg4 [label="Outcome\nFinished", shape=doubleoctagon, style=filled, fillcolor="#a9dfbf"];
+    leg5 [label="View change\n(leader rotation)", shape=box, style=filled, fillcolor="#f9e79f"];
+    leg6 [label="Round\nabandoned", shape=box, style=filled, fillcolor="#e74c3c", fontcolor="white"];
+
+    leg1 -> leg2 -> leg3 -> leg4 -> leg5 -> leg6 [style=invis];
+  }
+}

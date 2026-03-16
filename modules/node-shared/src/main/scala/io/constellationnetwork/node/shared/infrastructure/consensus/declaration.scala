@@ -1,6 +1,6 @@
 package io.constellationnetwork.node.shared.infrastructure.consensus
 
-import io.constellationnetwork.node.shared.infrastructure.consensus.state._
+import io.constellationnetwork.node.shared.infrastructure.consensus.state.Candidates
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.ConsensusTrigger
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.security.hash.Hash
@@ -20,7 +20,7 @@ object declaration {
 
   @derive(eqv, show, encoder, decoder)
   case class Facility(
-    upperBound: Bound,
+    eventHashes: Set[Hash],
     candidates: Candidates,
     trigger: Option[ConsensusTrigger],
     facilitatorsHash: Hash,

@@ -39,6 +39,7 @@ trait ConsensusManager[F[_], Event, Key, Artifact, Context, Status, Outcome, Kin
   def startFacilitatingAfterDownload(key: Key, lastArtifact: Signed[Artifact], lastContext: Context): F[Unit]
   def startFacilitatingAfterRollback(lastKey: Key, initialOutcome: Outcome): F[Unit]
   def withdrawFromConsensus: F[Unit]
+  def triggerEventConsensus: F[Unit]
 }
 
 object ConsensusManager {
@@ -67,6 +68,9 @@ object ConsensusManager {
 
         def withdrawFromConsensus: F[Unit] =
           queue.offer(WithdrawFromConsensus)
+
+        def triggerEventConsensus: F[Unit] =
+          queue.offer(FacilitateByEvent)
       }
     }
 }

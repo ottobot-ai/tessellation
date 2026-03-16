@@ -12,6 +12,7 @@ import scala.concurrent.duration.FiniteDuration
 import io.constellationnetwork.currency.dataApplication._
 import io.constellationnetwork.currency.l0.snapshot.schema._
 import io.constellationnetwork.currency.l0.snapshot.services.StateChannelSnapshotService
+import io.constellationnetwork.currency.schema.CurrencyStateKey
 import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.node.shared.config.types.SnapshotConfig
@@ -24,6 +25,7 @@ import io.constellationnetwork.node.shared.domain.snapshot.storage.LastSyncGloba
 import io.constellationnetwork.node.shared.infrastructure.consensus._
 import io.constellationnetwork.node.shared.infrastructure.consensus.engine.ConsensusEventLoop
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
+import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
 import io.constellationnetwork.node.shared.infrastructure.snapshot.{CurrencySnapshotCreator, CurrencySnapshotValidator}
@@ -36,7 +38,7 @@ import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdina
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, HasherSelector, SecurityProvider}
 
-import io.circe.Decoder
+import io.circe.{Decoder, Encoder}
 import org.http4s.client.Client
 
 /** Factory for creating the Currency L0 consensus engine.
@@ -71,6 +73,7 @@ object CurrencySnapshotConsensus {
     leavingDelay: FiniteDuration,
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     maybeCustomArtifacts: Option[Signed[CurrencyIncrementalSnapshot] => Option[SortedSet[SharedArtifact]]],
+    eventMempool: EventMempool[F, CurrencySnapshotEvent, CurrencyStateKey],
     rumorQueue: cats.effect.std.Queue[F, Hashed[RumorRaw]]
   )(implicit supervisor: Supervisor[F]): F[CurrencySnapshotConsensus[F]] = {
     def noopDecoder: Decoder[DataTransaction] =
@@ -83,6 +86,17 @@ object CurrencySnapshotConsensus {
       }.getOrElse(noopDecoder)
 
     implicit val hs: HasherSelector[F] = hasherSelector
+
+    // Need an encoder for DataTransaction for mempool hashing
+    implicit def daEncoder: Encoder[DataTransaction] =
+      maybeDataApplication.map { da =>
+        implicit val dataUpdateEncoder: Encoder[DataUpdate] = da.dataEncoder
+        DataTransaction.encoder
+      }.getOrElse(Encoder.instance(_ => io.circe.Json.Null))
+
+    // Derive CurrencySnapshotEvent encoder/decoder from DataTransaction encoder/decoder
+    implicit val currencyEventEncoder: Encoder[CurrencySnapshotEvent] = CurrencySnapshotEvent.encoder
+    implicit val currencyEventDecoder: Decoder[CurrencySnapshotEvent] = CurrencySnapshotEvent.decoder
 
     for {
       consensusStorage <- ConsensusStorage.make[
@@ -118,7 +132,10 @@ object CurrencySnapshotConsensus {
           nodeStorage,
           leavingDelay,
           getGlobalSnapshotByOrdinal,
-          clusterStorage
+          clusterStorage,
+          eventMempool,
+          client,
+          session
         )
 
       facilitatorSelector = FacilitatorSelector.make(
@@ -137,7 +154,8 @@ object CurrencySnapshotConsensus {
           seedlist,
           facilitatorSelector,
           snapshotConfig.consensus.deterministicConfigHash,
-          peerQualityTracker
+          peerQualityTracker,
+          eventMempool
         )
 
       consensusStateRemover =
@@ -200,7 +218,7 @@ object CurrencySnapshotConsensus {
       ](consensusStorage, rumorQueue)
 
       _ <- supervisor.supervise(loop.run.compile.drain)
-      consensus = new Consensus(handler, consensusStorage, loop.manager, routes, consensusFns, Some(loop.healthRef))
+      consensus = new Consensus(handler, consensusStorage, loop.manager, routes, consensusFns, eventMempool, Some(loop.healthRef))
     } yield consensus
   }
 }

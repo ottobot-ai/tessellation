@@ -6,6 +6,7 @@ import cats.syntax.all._
 
 import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.{ForkRecoveryDetector, RecoveryPeerHint}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.schema.node.{NodeState, NodeStateTransition}
 
@@ -30,7 +31,9 @@ import eu.timepit.refined.auto._
   */
 class AbandonmentTracker[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status, Outcome, Kind](
   ctx: ConsensusEngineContext[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind],
-  healthRef: Ref[F, ConsensusHealthStatus]
+  healthRef: Ref[F, ConsensusHealthStatus],
+  maybeForkRecoveryDetector: Option[ForkRecoveryDetector[F]] = None,
+  maybeRecoveryPeerHint: Option[RecoveryPeerHint[F]] = None
 ) {
 
   import ctx.{config, logger, peerQualityTracker, queue, storage}
@@ -100,6 +103,9 @@ class AbandonmentTracker[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, St
       "reason" -> s"stuck at same ordinal for $consecutiveCount consecutive rounds"
     ) >>
       Metrics[F].incrementCounter("dag_consensus_recovery_download_triggered") >>
+      (maybeForkRecoveryDetector, maybeRecoveryPeerHint).mapN { (detector, hint) =>
+        detector.detectForkDivergence.flatMap(_.traverse_(info => hint.setPreferredPeers(info.majorityPeers)))
+      }.sequence_ >>
       ctx.nodeStorage.tryModifyStateGetResult(NodeState.Ready, NodeState.WaitingForDownload).flatMap {
         case NodeStateTransition.Success =>
           ConsensusLog.info(

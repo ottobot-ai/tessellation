@@ -10,22 +10,18 @@ import scala.concurrent.duration.DurationInt
 
 import io.constellationnetwork.block.generators.signedBlockGen
 import io.constellationnetwork.currency.dataApplication.DataUpdate
-import io.constellationnetwork.currency.l0.snapshot.schema.{CurrencyConsensusKind, CurrencyConsensusOutcome}
-import io.constellationnetwork.currency.schema.currency.CurrencySnapshotContext
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.config.types.{ConsensusConfig, EventCutterConfig}
-import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusStorage
 import io.constellationnetwork.node.shared.infrastructure.gossip.Gossip
 import io.constellationnetwork.node.shared.infrastructure.metrics.NoOpMetrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot.daemon.SnapshotEventsPublisherDaemon
-import io.constellationnetwork.node.shared.snapshot.currency.{BlockEvent, CurrencySnapshotArtifact, CurrencySnapshotEvent}
+import io.constellationnetwork.node.shared.snapshot.currency.{BlockEvent, CurrencySnapshotEvent}
 import io.constellationnetwork.schema.generation.Generation
 import io.constellationnetwork.schema.gossip.{Counter, Ordinal, RumorRaw}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hex.Hex
 
-import eu.timepit.refined.types.numeric.{NonNegLong, PosInt, PosLong}
+import eu.timepit.refined.types.numeric.PosLong
 import fs2.Stream
 import io.circe.{Encoder, Json}
 import weaver.MutableIOSuite
@@ -58,7 +54,7 @@ object SnapshotEventsPublisherDaemonSuite extends MutableIOSuite with Checkers {
         }
     } yield res
 
-  test("should publish events to gossip without duplicates") { res =>
+  test("should publish events to gossip") { res =>
     implicit val (s, h, sp, keyPair) = res
 
     implicit val m = NoOpMetrics.make
@@ -75,50 +71,20 @@ object SnapshotEventsPublisherDaemonSuite extends MutableIOSuite with Checkers {
 
     val selfId = PeerId(Hex("0000000000000000"))
 
-    val consensusConfig = ConsensusConfig(
-      timeTriggerInterval = 10.seconds,
-      declarationTimeout = 10.seconds,
-      declarationRangeLimit = NonNegLong(10),
-      lockDuration = 10.seconds,
-      eventCutter = EventCutterConfig(
-        maxBinarySizeBytes = PosInt(5000000),
-        maxUpdateNodeParametersSize = PosInt(100)
-      )
-    )
-
     for {
-      consensusStorage <- ConsensusStorage.make[
-        IO,
-        CurrencySnapshotEvent,
-        CurrencySnapshotKey,
-        CurrencySnapshotArtifact,
-        CurrencySnapshotContext,
-        CurrencySnapshotStatus,
-        CurrencyConsensusOutcome,
-        CurrencyConsensusKind
-      ](consensusConfig)
-
-      _ <- consensusStorage.addEvents(Map(selfId -> List((Ordinal(Generation(PosLong(1)), Counter(PosLong(1))), blockEvent1))))
-
       rumorQueue: Queue[IO, Hashed[RumorRaw]] <- Queue.unbounded[IO, Hashed[RumorRaw]]
 
       l1OutputQueue <- Queue.unbounded[IO, Option[CurrencySnapshotEvent]]
-      _ <- l1OutputQueue.offer(Some(blockEvent1))
       _ <- l1OutputQueue.offer(Some(blockEvent1))
       _ <- l1OutputQueue.offer(Some(blockEvent2))
       _ <- l1OutputQueue.offer(None)
 
       events = Stream.fromQueueNoneTerminated(l1OutputQueue)
       gossip <- Gossip.make[IO](rumorQueue, selfId, Generation(PosLong(1)), keyPair)
-      _ <- SnapshotEventsPublisherDaemon.make(gossip, events, consensusStorage).spawn.start
+      _ <- SnapshotEventsPublisherDaemon.make(gossip, events).spawn.start
       _ <- waitUntilQueueSize(l1OutputQueue, 0)
-      _ <- waitUntilQueueSize(rumorQueue, 1)
+      _ <- waitUntilQueueSize(rumorQueue, 2)
       rumorQueueSize <- rumorQueue.size
-      maybeRumor <- rumorQueue.tryTake
-      maybeEitherBlockEvent = maybeRumor.map { rumor =>
-        val cur = rumor.signed.value.content.hcursor
-        cur.downField("value").get[BlockEvent]("BlockEvent")
-      }
-    } yield expect.eql(1, rumorQueueSize).and(expect(maybeEitherBlockEvent.contains(Right(blockEvent2))))
+    } yield expect.eql(2, rumorQueueSize)
   }
 }
