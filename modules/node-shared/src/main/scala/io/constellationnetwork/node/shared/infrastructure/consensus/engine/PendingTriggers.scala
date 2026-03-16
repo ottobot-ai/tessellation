@@ -55,6 +55,11 @@ final class PendingTriggersF[F[_]: Functor] private[engine] (
 
   def setTime(): F[Unit] = stateRef.set(TimePending)
 
+  /** Clears any pending trigger without returning it. Used during recovery to prevent stale triggers from starting a new round while the
+    * node is downloading state.
+    */
+  def clear(): F[Unit] = stateRef.set(NoPending)
+
   /** Atomically retrieves and clears the pending trigger. */
   def pullNext: F[Option[TriggerPriority]] =
     stateRef.getAndSet(NoPending).map {

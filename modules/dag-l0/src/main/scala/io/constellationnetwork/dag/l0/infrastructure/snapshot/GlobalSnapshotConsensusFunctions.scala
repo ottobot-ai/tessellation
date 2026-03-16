@@ -335,20 +335,6 @@ object GlobalSnapshotConsensusFunctions {
         lastFacilitators <- facilitators.toList.traverse { peerId =>
           PeerId._Id.get(peerId).toAddress.map(_ -> peerId)
         }
-        _ <- ConsensusLog
-          .info(
-            logger,
-            ConsensusLog.Proposal,
-            currentOrdinal.show,
-            "n/a",
-            "event" -> "REWARDS_DEBUG",
-            "lastFacilitators" -> lastFacilitators.size.toString,
-            "lastProofs" -> lastArtifact.proofs.size.toString,
-            "facilitators" -> facilitators.size.toString,
-            "addrs" -> lastFacilitators.map(_._1.show.take(8)).sorted.mkString(",")
-          )
-          .whenA(sys.env.get("CL_MPT_DEBUG_DUMP").exists(_.toLowerCase == "true"))
-
         // Sort all event lists before passing to accept() to ensure deterministic ordering.
         // Events are extracted from Set[GlobalSnapshotEvent] (line 114) which has non-deterministic
         // iteration order. Without sorting, different nodes may process events in different orders,

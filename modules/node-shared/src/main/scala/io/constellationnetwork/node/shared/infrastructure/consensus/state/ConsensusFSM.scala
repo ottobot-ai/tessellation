@@ -103,7 +103,10 @@ class ConsensusFSM[F[_]: Async: Metrics: HasherSelector: Random, Event, Key: Eq:
       case RoundCompleted =>
         completeRound(log.debug(ConsensusLog.format(ConsensusLog.Lifecycle, "n/a", "n/a", "event" -> "ROUND_COMPLETED_NO_OUTCOME")))
       case ConsensusFinished(key, _, trigger) =>
-        completeRound(log.info(s"Consensus finished at key=$key") >> roundRunner.afterConsensusFinish(trigger))
+        completeRound(
+          log.info(ConsensusLog.format(ConsensusLog.Lifecycle, key.toString, "n/a", "event" -> "CONSENSUS_FINISHED")) >>
+            roundRunner.afterConsensusFinish(trigger)
+        )
       case WithdrawFromConsensus => pending.setEvent()
       case _                     => Async[F].unit
     }

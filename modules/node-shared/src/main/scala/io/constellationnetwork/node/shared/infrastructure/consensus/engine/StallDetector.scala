@@ -9,6 +9,7 @@ import scala.concurrent.duration._
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.{ConsensusLog, ConsensusResources}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
+import io.constellationnetwork.schema.node.{NodeState, NodeStateTransition}
 import io.constellationnetwork.schema.peer.{PeerId, PeerResponsiveness, Unresponsive}
 
 import eu.timepit.refined.auto._
@@ -441,17 +442,26 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
             none[(Option[ConsensusState[Key, Status, Outcome, Kind]], Unit)].pure[F]
         }
         .void >>
+      // Clear stale peer declarations, artifacts, and withdrawal maps to prevent poisoned retries.
+      // Without this, abandoned rounds leave resources that interfere with the next attempt at the same key.
+      storage.clearResources(key) >>
       trackConsecutiveAbandonments(key).flatMap { consecutiveCount =>
+        val shouldRecover = consecutiveCount >= config.maxConsecutiveAbandonments
         ConsensusLog.info(
           logger,
           ConsensusLog.Lifecycle,
           key.toString,
           "n/a",
           "event" -> "ROUND_ABANDONED_TRACKED",
-          "consecutiveAbandonments" -> consecutiveCount.toString
+          "consecutiveAbandonments" -> consecutiveCount.toString,
+          "maxConsecutiveAbandonments" -> config.maxConsecutiveAbandonments.toString,
+          "triggerRecovery" -> shouldRecover.toString
         ) >>
-          queue.offer(ConsensusCommand.RoundCompleted) >>
-          queue.offer(ConsensusCommand.TimeTick)
+          (if (shouldRecover)
+             triggerRecoveryDownload(key, consecutiveCount)
+           else
+             queue.offer(ConsensusCommand.RoundCompleted) >>
+               queue.offer(ConsensusCommand.TimeTick))
       }
 
   /** Track consecutive abandonments at the same key. Returns the new count. Resets to 1 when the key changes (different ordinal).
@@ -464,6 +474,56 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
       case _ =>
         ((key.some, 1), 1)
     }
+
+  /** Trigger a recovery download when consecutive abandonments at the same ordinal exceed the threshold.
+    *
+    * Transitions the node from Ready → WaitingForDownload, which the DownloadDaemon watches for and automatically starts a full state
+    * download from peers. This breaks the infinite loop of abandon → retry → abandon at the same stuck ordinal.
+    *
+    * If the state transition fails (node not in Ready state), falls back to normal round restart.
+    */
+  private def triggerRecoveryDownload(key: Key, consecutiveCount: Int): F[Unit] =
+    ConsensusLog.error(
+      logger,
+      ConsensusLog.Lifecycle,
+      key.toString,
+      "n/a",
+      "event" -> "RECOVERY_DOWNLOAD_TRIGGERED",
+      "consecutiveAbandonments" -> consecutiveCount.toString,
+      "reason" -> s"stuck at same ordinal for $consecutiveCount consecutive rounds"
+    ) >>
+      Metrics[F].incrementCounter("dag_consensus_recovery_download_triggered") >>
+      ctx.nodeStorage.tryModifyStateGetResult(NodeState.Ready, NodeState.WaitingForDownload).flatMap {
+        case NodeStateTransition.Success =>
+          ConsensusLog.info(
+            logger,
+            ConsensusLog.Lifecycle,
+            key.toString,
+            "n/a",
+            "event" -> "RECOVERY_STATE_TRANSITION",
+            "from" -> "Ready",
+            "to" -> "WaitingForDownload"
+          ) >>
+            consecutiveAbandonCountRef.set((none[Key], 0)) >>
+            // Clear pending triggers to prevent completeRound from starting a new round
+            // at the same stale ordinal while we're downloading.
+            ctx.pending.clear() >>
+            // Signal FSM to transition BUSY → IDLE so it can handle InitializeFromDownload
+            // when the DownloadDaemon finishes. Without this, InitializeFromDownload is silently
+            // dropped by handleWhileBusy (catch-all case).
+            queue.offer(ConsensusCommand.RoundCompleted)
+        case _ =>
+          ConsensusLog.warn(
+            logger,
+            ConsensusLog.Lifecycle,
+            key.toString,
+            "n/a",
+            "event" -> "RECOVERY_TRANSITION_FAILED",
+            "reason" -> "node not in Ready state"
+          ) >>
+            queue.offer(ConsensusCommand.RoundCompleted) >>
+            queue.offer(ConsensusCommand.TimeTick)
+      }
 
   private def getCurrentDeclarationTimeout: F[FiniteDuration] =
     ctx.nodeStorage.isInJoiningGracePeriod.map { isInJoiningGracePeriod =>
