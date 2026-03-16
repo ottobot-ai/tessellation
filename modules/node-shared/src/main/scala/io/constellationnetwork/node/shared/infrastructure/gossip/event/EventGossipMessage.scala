@@ -14,8 +14,8 @@ sealed trait EventGossipMessage
 
 /** Chain tip metadata for fork recovery detection.
   *
-  * Piggybacked on IHave messages so peers can detect when they are on a fork by comparing their local ordinal/hash
-  * against the majority of their peers.
+  * Piggybacked on IHave messages so peers can detect when they are on a fork by comparing their local ordinal/hash against the majority of
+  * their peers.
   */
 @derive(encoder, decoder, eqv, show)
 case class ChainTip(
@@ -36,8 +36,8 @@ case class EventPush[Event](
 
 /** Announce event hashes (lazy pull to non-mesh peers).
   *
-  * Sent periodically to announce available events without sending full data. Optionally includes chain tip metadata for
-  * fork recovery detection.
+  * Sent periodically to announce available events without sending full data. Optionally includes chain tip metadata for fork recovery
+  * detection.
   */
 @derive(encoder, decoder, eqv, show)
 case class IHave(

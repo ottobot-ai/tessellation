@@ -40,6 +40,7 @@ import io.constellationnetwork.node.shared.infrastructure.consensus._
 import io.constellationnetwork.node.shared.infrastructure.consensus.engine.{ConsensusEventLoop, _}
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.gossip.RumorHandler
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.RecoveryPeerHint
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
@@ -103,7 +104,8 @@ object GlobalSnapshotConsensus {
     mptStore: MptStore[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     loggerBundle: LoggerBundle[F],
-    rumorQueue: cats.effect.std.Queue[F, Hashed[RumorRaw]]
+    rumorQueue: cats.effect.std.Queue[F, Hashed[RumorRaw]],
+    maybeRecoveryPeerHint: Option[RecoveryPeerHint[F]] = None
   )(implicit supervisor: Supervisor[F], globalStateProofSelector: GlobalStateProofSelector): F[GlobalSnapshotConsensus[F]] =
     for {
       globalStateChannelManager <- GlobalSnapshotStateChannelAcceptanceManager
@@ -256,7 +258,8 @@ object GlobalSnapshotConsensus {
           consensusClient,
           appConfig.snapshot.consensus,
           facilitatorSelector,
-          peerQualityTracker
+          peerQualityTracker,
+          maybeRecoveryPeerHint
         )
 
       handler = GlobalConsensusHandler.make(loop.queue)

@@ -10,6 +10,7 @@ import scala.concurrent.duration._
 import io.constellationnetwork.node.shared.domain.cluster.services.Session
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
 import io.constellationnetwork.node.shared.infrastructure.mempool.{EventMempool, MempoolRejectionReason}
+import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.peer.{Peer, PeerId}
 import io.constellationnetwork.security.hash.Hash
@@ -345,6 +346,14 @@ object EventGossipDaemon {
     *
     * This is the primary factory method for production use. Events will be gossiped to mesh peers via the HTTP client.
     */
+  /** Result of creating an EventGossipDaemon, including the fork recovery detector (if configured) so it can be shared with the consensus
+    * AbandonmentTracker.
+    */
+  case class DaemonWithForkRecovery[F[_], Event, Key](
+    daemon: EventGossipDaemon[F, Event, Key],
+    maybeForkRecoveryDetector: Option[ForkRecoveryDetector[F]]
+  )
+
   def make[F[_]: Async: Parallel: SecurityProvider, Event: Encoder: Decoder, Key](
     mempool: EventMempool[F, Event, Key],
     clusterStorage: ClusterStorage[F],
@@ -352,9 +361,10 @@ object EventGossipDaemon {
     session: Session[F],
     config: EventGossipConfig = EventGossipConfig(),
     getLocalChainTip: Option[F[Option[ChainTip]]] = None,
-    maybeForkRecoveryDetector: Option[ForkRecoveryDetector[F]] = None,
-    onForkDetected: Option[ForkRecoveryInfo => F[Unit]] = None
-  )(implicit S: Supervisor[F]): F[EventGossipDaemon[F, Event, Key]] =
+    getLocalOrdinal: Option[F[Option[SnapshotOrdinal]]] = None,
+    onForkDetected: Option[ForkRecoveryInfo => F[Unit]] = None,
+    forkLagThreshold: Long = 5
+  )(implicit S: Supervisor[F]): F[DaemonWithForkRecovery[F, Event, Key]] =
     for {
       incomingQueue <- Queue.unbounded[F, Hashed[Event]]
       seenCache <- SeenHashCache.make[F](config.maxSeenHashes, config.seenHashTtlMs)
@@ -370,6 +380,8 @@ object EventGossipDaemon {
       meshState <- MeshState.make[F](meshConfig)
       gossipClient = EventGossipClient.make[F, Event](client, session)
 
+      maybeForkDetector = getLocalOrdinal.map(ord => ForkRecoveryDetector.make(meshState, ord, forkLagThreshold))
+
       getGossipEligiblePeers: F[Set[Peer]] = clusterStorage.getResponsivePeers.map { peers =>
         peers.filter(p => p.state == NodeState.Ready || p.state == NodeState.Observing)
       }
@@ -378,18 +390,21 @@ object EventGossipDaemon {
       puller = GossipPuller.make[F, Event, Key](meshState, gossipClient, mempool, seenCache, getGossipEligiblePeers, config)
       graftSyncer = GraftSyncer.make[F, Event, Key](gossipClient, mempool, meshState)
     } yield
-      new EventGossipDaemonImpl[F, Event, Key](
-        incomingQueue,
-        seenCache,
-        running,
-        meshState,
-        config,
-        publisher,
-        puller,
-        graftSyncer,
-        getGossipEligiblePeers,
-        maybeForkRecoveryDetector,
-        onForkDetected
+      DaemonWithForkRecovery(
+        new EventGossipDaemonImpl[F, Event, Key](
+          incomingQueue,
+          seenCache,
+          running,
+          meshState,
+          config,
+          publisher,
+          puller,
+          graftSyncer,
+          getGossipEligiblePeers,
+          maybeForkDetector,
+          onForkDetected
+        ),
+        maybeForkDetector
       )
 }
 

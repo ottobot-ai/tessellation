@@ -32,9 +32,8 @@ case class ForkRecoveryInfo(
 
 /** Detects fork divergence by comparing local chain tip against peer chain tips collected via gossip.
   *
-  * When a node is on a fork, its ordinal will fall behind the majority of peers. This detector identifies that
-  * situation by comparing the local ordinal against the majority ordinal reported by peers through IHave chain tip
-  * metadata.
+  * When a node is on a fork, its ordinal will fall behind the majority of peers. This detector identifies that situation by comparing the
+  * local ordinal against the majority ordinal reported by peers through IHave chain tip metadata.
   */
 trait ForkRecoveryDetector[F[_]] {
   def detectForkDivergence: F[Option[ForkRecoveryInfo]]
@@ -69,11 +68,13 @@ object ForkRecoveryDetector {
                 localOrdinal = localOrdinal,
                 lag = lag
               )
-              logger.warn(
-                s"Fork divergence detected: local=${localOrdinal.value.value} " +
-                  s"majority=${majorityOrdinal.value.value} lag=$lag " +
-                  s"majorityPeers=${majorityGroup.size}/${chainTips.size}"
-              ).as(info.some)
+              logger
+                .warn(
+                  s"Fork divergence detected: local=${localOrdinal.value.value} " +
+                    s"majority=${majorityOrdinal.value.value} lag=$lag " +
+                    s"majorityPeers=${majorityGroup.size}/${chainTips.size}"
+                )
+                .as(info.some)
             } else none[ForkRecoveryInfo].pure[F]
           case _ => none[ForkRecoveryInfo].pure[F]
         }

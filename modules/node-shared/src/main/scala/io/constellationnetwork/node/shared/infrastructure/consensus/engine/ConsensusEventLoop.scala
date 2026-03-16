@@ -14,6 +14,7 @@ import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger._
 import io.constellationnetwork.node.shared.infrastructure.consensus.{FacilitatorSelector, _}
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.RecoveryPeerHint
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.peer.{Peer, PeerId}
@@ -88,7 +89,8 @@ object ConsensusEventLoop {
     consensusClient: ConsensusClient[F, Key, Outcome],
     config: ConsensusConfig,
     facilitatorSelector: FacilitatorSelector,
-    peerQualityTracker: PeerQualityTracker[F]
+    peerQualityTracker: PeerQualityTracker[F],
+    maybeRecoveryPeerHint: Option[RecoveryPeerHint[F]] = None
   )(
     implicit _key: monocle.Lens[Outcome, Key],
     _context: monocle.Lens[Outcome, Ctx],
@@ -125,7 +127,11 @@ object ConsensusEventLoop {
         queue,
         org.typelevel.log4cats.slf4j.Slf4jLogger.getLogger[F]
       )
-      abandonmentTracker = new AbandonmentTracker[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind](ctx, healthRef)
+      abandonmentTracker = new AbandonmentTracker[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind](
+        ctx,
+        healthRef,
+        maybeRecoveryPeerHint
+      )
       stallDetector = new StallDetector[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind](
         ctx,
         viewChangeManager,

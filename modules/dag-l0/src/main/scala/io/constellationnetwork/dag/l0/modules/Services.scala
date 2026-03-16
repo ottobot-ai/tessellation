@@ -31,6 +31,7 @@ import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.domain.snapshot.services.AddressService
 import io.constellationnetwork.node.shared.infrastructure.collateral.MptStoreCollateral
 import io.constellationnetwork.node.shared.infrastructure.delegatedStake.{RewardsInfoCalculator, RewardsInfoStorage}
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.RecoveryPeerHint
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
@@ -103,6 +104,8 @@ object Services {
         GlobalEventMempool.make[F](GlobalEventMempool.defaultConfig)
       }
 
+      recoveryPeerHint <- RecoveryPeerHint.make[F]
+
       consensus <- HasherSelector[F].withCurrent { implicit hs =>
         GlobalSnapshotConsensus
           .make[F, R](
@@ -133,7 +136,8 @@ object Services {
             sharedStorages.mptStore,
             eventMempool,
             loggerBundle,
-            queues.rumor
+            queues.rumor,
+            maybeRecoveryPeerHint = Some(recoveryPeerHint)
           )
       }
       addressService = AddressService.make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
@@ -168,7 +172,8 @@ object Services {
         stateChannel = stateChannelService,
         trustStorageUpdater = trustUpdaterService,
         restart = sharedServices.restart,
-        rewards = rewardsService
+        rewards = rewardsService,
+        recoveryPeerHint = recoveryPeerHint
       ) {}
 }
 
@@ -183,5 +188,6 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   val stateChannel: StateChannelService[F],
   val trustStorageUpdater: TrustStorageUpdater[F],
   val restart: RestartService[F, R],
-  val rewards: RewardsService[F]
+  val rewards: RewardsService[F],
+  val recoveryPeerHint: RecoveryPeerHint[F]
 )

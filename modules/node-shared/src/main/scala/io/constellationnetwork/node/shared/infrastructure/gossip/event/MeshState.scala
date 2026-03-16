@@ -371,7 +371,12 @@ object MeshState {
             case Some(ps) =>
               state + (peerId -> ps.copy(lastKnownOrdinal = tip.ordinal.some, lastKnownHash = tip.snapshotHash.some))
             case None =>
-              state + (peerId -> PeerGossipState(peerId, lastSeenMs = now, lastKnownOrdinal = tip.ordinal.some, lastKnownHash = tip.snapshotHash.some))
+              state + (peerId -> PeerGossipState(
+                peerId,
+                lastSeenMs = now,
+                lastKnownOrdinal = tip.ordinal.some,
+                lastKnownHash = tip.snapshotHash.some
+              ))
           }
         }
       }
