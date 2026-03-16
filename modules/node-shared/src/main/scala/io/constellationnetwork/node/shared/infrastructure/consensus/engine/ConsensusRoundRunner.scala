@@ -7,6 +7,7 @@ import cats.kernel.Next
 import cats.syntax.all._
 
 import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
+import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger, TimeTrigger}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
@@ -53,16 +54,23 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
   def runRound(trigger: Option[ConsensusTrigger]): F[Unit] =
     storage.getLastConsensusOutcome.flatMap {
       case None =>
-        logger.warn("[CONSENSUS] No previous outcome; cannot start round.") >>
+        ConsensusLog.warn(logger, ConsensusLog.Lifecycle, "n/a", "n/a", "event" -> "NO_PREVIOUS_OUTCOME") >>
           Metrics[F].incrementCounter("dag_consensus_round_no_outcome") >>
           queue.offer(ConsensusCommand.RoundCompleted)
 
       case Some(outcome) =>
         val nextKey = outcomeKey.get(outcome).next
         val lastKey = outcomeKey.get(outcome)
-        logger.info(
-          s"[CONSENSUS] Facilitating consensus round at key=$nextKey with trigger=$trigger lastKey=$lastKey " +
-            s"declarationTimeout=${config.declarationTimeout} timeTriggerInterval=${config.timeTriggerInterval}"
+        ConsensusLog.info(
+          logger,
+          ConsensusLog.Lifecycle,
+          nextKey.toString,
+          "n/a",
+          "event" -> "ROUND_FACILITATING",
+          "trigger" -> trigger.toString,
+          "lastKey" -> lastKey.toString,
+          "declarationTimeout" -> config.declarationTimeout.toString,
+          "timeTriggerInterval" -> config.timeTriggerInterval.toString
         ) >>
           facilitateRound(outcome, nextKey, trigger)
     }
@@ -78,9 +86,14 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
             "dag_consensus_round_facilitated",
             Seq(unsafeLabelName("outcome") -> "success")
           ) >>
-            logger.info(
-              s"[CONSENSUS] Round facilitated key=$key, monitoring started " +
-                s"maxStallCycles=${config.maxStallCycles} maxRoundDuration=${config.maxRoundDuration.map(d => s"${d.toSeconds}s").getOrElse("none")}"
+            ConsensusLog.info(
+              logger,
+              ConsensusLog.Lifecycle,
+              key.toString,
+              "n/a",
+              "event" -> "ROUND_FACILITATED",
+              "maxStallCycles" -> config.maxStallCycles.toString,
+              "maxRoundDuration" -> config.maxRoundDuration.map(d => s"${d.toSeconds}s").getOrElse("none")
             ) >>
             startRoundMonitor(key) >>
             doInitialCheck(key)
@@ -98,7 +111,7 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
           "dag_consensus_round_facilitated",
           Seq(unsafeLabelName("outcome") -> "existing")
         ) >>
-          logger.debug(s"[CONSENSUS] State already exists for key=$key status=$statusName, checking progress") >>
+          ConsensusLog.debug(logger, ConsensusLog.Lifecycle, key.toString, "n/a", "event" -> "STATE_EXISTS", "status" -> statusName) >>
           startRoundMonitor(key) >>
           doInitialCheck(key)
 
@@ -107,7 +120,7 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
           "dag_consensus_round_facilitated",
           Seq(unsafeLabelName("outcome") -> "no_state")
         ) >>
-          logger.warn(s"[CONSENSUS] Could not facilitate and no existing state for key=$key") >>
+          ConsensusLog.warn(logger, ConsensusLog.Lifecycle, key.toString, "n/a", "event" -> "NO_STATE") >>
           queue.offer(ConsensusCommand.RoundCompleted)
     }
 
@@ -122,9 +135,15 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
           advancer.getConsensusOutcome(newState) match {
             case Some(_) => queue.offer(ConsensusCommand.CheckUpdate(key))
             case None =>
-              logger.debug(
-                s"[CONSENSUS] Initial check: key=$key status=$statusName " +
-                  s"facilitators=${newState.facilitators.value.size} leader=${newState.leader.show.take(8)}... waiting for declarations"
+              ConsensusLog.debug(
+                logger,
+                ConsensusLog.Lifecycle,
+                key.toString,
+                "n/a",
+                "event" -> "INITIAL_CHECK",
+                "status" -> statusName,
+                "facilitators" -> newState.facilitators.value.size.toString,
+                "leader" -> ConsensusLog.pid(newState.leader)
               )
           }
       }

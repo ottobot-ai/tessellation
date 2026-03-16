@@ -13,8 +13,8 @@ import io.constellationnetwork.ext.collection.FoldableOps.pickMajority
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusStorage.ModifyStateFn
-import io.constellationnetwork.node.shared.infrastructure.consensus._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.ConsensusTrigger
+import io.constellationnetwork.node.shared.infrastructure.consensus.{ConsensusLog, _}
 import io.constellationnetwork.node.shared.infrastructure.fork.ExitOnFork
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics.unsafeLabelName
@@ -105,11 +105,17 @@ object ConsensusStateUpdater {
             val oldStatusName = oldState.status.getClass.getSimpleName.stripSuffix("$")
             val newStatusName = newState.status.getClass.getSimpleName.stripSuffix("$")
             val statusTransition = if (oldStatusName =!= newStatusName) s"$oldStatusName→$newStatusName" else newStatusName
-            logger.info(s"State updated ${newState.show}") >>
-              logger.debug(
-                s"[CONSENSUS] State advanced key=${newState.key.show} status=$statusTransition " +
-                  s"facilitators=${newState.facilitators.value.size} leader=${newState.leader.show.take(8)}... view=${newState.viewNumber}"
-              )
+            ConsensusLog.info(
+              logger,
+              ConsensusLog.Phase,
+              newState.key.show,
+              "n/a",
+              "event" -> "STATE_UPDATED",
+              "status" -> statusTransition,
+              "facilitators" -> newState.facilitators.value.size.toString,
+              "leader" -> ConsensusLog.pid(newState.leader),
+              "view" -> newState.viewNumber.toString
+            )
         }.void
 
       private def updateConsensus(resources: ConsensusResources[Artifact, Kind])(

@@ -7,6 +7,7 @@ import cats.{Eq, Show}
 
 import scala.concurrent.duration._
 
+import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog
 import io.constellationnetwork.node.shared.infrastructure.consensus.engine.ConsensusCommand._
 import io.constellationnetwork.node.shared.infrastructure.consensus.message.GetConsensusOutcomeRequest
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger._
@@ -83,7 +84,7 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
           advancer
             .getConsensusOutcome(newState)
             .map { case (prevKey, outcome) => finalizeAndNotify(newState, prevKey, outcome) }
-            .getOrElse(log.debug(s"[CONSENSUS] State updated for key=$key"))
+            .getOrElse(log.debug(ConsensusLog.format(ConsensusLog.Phase, key.show, "n/a", "event" -> "STATE_UPDATED")))
       }
     } yield ()
 
@@ -116,12 +117,22 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
           ) >>
             Metrics[F].updateGauge("dag_consensus_round_facilitator_count", newState.facilitators.value.size) >>
             Metrics[F].updateGauge("dag_consensus_round_eligible_count", newState.eligibleFacilitators.value.size) >>
-            log.info(
-              s"[CONSENSUS] Round COMPLETED key=$key trigger=$trigger duration=${duration.toMillis}ms " +
-                s"facilitators=${newState.facilitators.value.size} leader=${newState.leader.show.take(8)}... " +
-                s"leaderScore=${f"$leaderScore%.2f"} view=${newState.viewNumber}" +
-                (if (withdrawnCount > 0) s" withdrawn=$withdrawnCount" else "") +
-                (if (removedCount > 0) s" removed=$removedCount" else "")
+            ConsensusLog.info(
+              log,
+              ConsensusLog.Lifecycle,
+              key.show,
+              "n/a",
+              (Seq(
+                "event" -> "ROUND_COMPLETED",
+                "trigger" -> trigger.toString,
+                "duration" -> s"${duration.toMillis}ms",
+                "facilitators" -> newState.facilitators.value.size.toString,
+                "leader" -> ConsensusLog.pid(newState.leader),
+                "leaderScore" -> f"$leaderScore%.2f",
+                "view" -> newState.viewNumber.toString
+              ) ++
+                (if (withdrawnCount > 0) Seq("withdrawn" -> withdrawnCount.toString) else Seq.empty) ++
+                (if (removedCount > 0) Seq("removed" -> removedCount.toString) else Seq.empty)): _*
             ) >>
             ctx.nodeStorage.tryModifyStateGetResult(NodeState.WaitingForReady, NodeState.Ready).void >>
             queue.offer(ConsensusFinished(key, outcome, trigger))
@@ -203,15 +214,20 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
         outcomeContext.get(outcome) === context
       }.pure[F]
 
-    def onFailure(maybeOutcome: Option[Outcome], retryDetails: RetryDetails): F[Unit] =
-      maybeOutcome.map { outcome =>
-        val sameArtifact = outcomeArtifact.get(outcome) === artifact
-        val sameContext = outcomeContext.get(outcome) === context
-        log.info(
-          s"Observed outcome {key=${key.show}, outcomeKey=${outcomeKey
-              .get(outcome)}, sameArtifact=${sameArtifact.show}, sameContext=${sameContext.show}, attempt=${retryDetails.retriesSoFar}}"
-        )
-      }.getOrElse(log.info(s"Outcome not observed {key=${key.show}, attempt=${retryDetails.retriesSoFar}}"))
+    def onFailure(maybeOutcome: Option[Outcome], retryDetails: RetryDetails): F[Unit] = {
+      val attempt = retryDetails.retriesSoFar
+      // Reduce noise: log every 5th attempt and the last attempt to avoid 20 nearly-identical lines
+      if (attempt % 5 == 0 || attempt >= 19) {
+        maybeOutcome.map { outcome =>
+          val sameArtifact = outcomeArtifact.get(outcome) === artifact
+          val sameContext = outcomeContext.get(outcome) === context
+          log.info(
+            s"[DownloadInit] Observed outcome {key=${key.show}, outcomeKey=${outcomeKey
+                .get(outcome)}, sameArtifact=${sameArtifact.show}, sameContext=${sameContext.show}, attempt=$attempt}"
+          )
+        }.getOrElse(log.info(s"[DownloadInit] Outcome not observed {key=${key.show}, attempt=$attempt}"))
+      } else Async[F].unit
+    }
 
     def onError(err: Throwable, retryDetails: RetryDetails): F[Unit] =
       log.error(err)(s"Error when trying to observe consensus outcome {attempt=${retryDetails.retriesSoFar}}")

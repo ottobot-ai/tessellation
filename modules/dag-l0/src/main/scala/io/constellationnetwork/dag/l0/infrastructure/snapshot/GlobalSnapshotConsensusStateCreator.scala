@@ -125,22 +125,30 @@ object GlobalSnapshotConsensusStateCreator {
           )
           .whenA(penalizedPeers.nonEmpty)
 
-        // Check for peers that were missing during an abandoned round.
-        // After 5+ stall cycles (65s+), all honest nodes will have the same view of who's missing.
-        // The facilitatorsHash check in the Proposals phase catches any rare disagreement.
+        // Clear abandoned-missing tracking (but don't use it for exclusion — it's local-only and
+        // causes non-deterministic facilitator sets across nodes, leading to fork detection failures).
+        // The deterministic mechanisms (previouslyRemoved + penalizedPeers from consensus-agreed
+        // lastOutcome) already handle unresponsive peer exclusion.
         abandonedMissing <- peerQualityTracker.getAndClearAbandonedMissingPeers
 
-        _ <- logger
+        _ <- ConsensusLog
           .info(
-            s"[CONSENSUS] Excluding ${abandonedMissing.size} peers missing from abandoned round for key=$key: " +
-              s"[${abandonedMissing.toList.map(_.value.value.take(8)).mkString(",")}]"
+            logger,
+            ConsensusLog.Facilitator,
+            key.show,
+            "n/a",
+            "event" -> "ABANDONED_MISSING_LOGGED",
+            "count" -> abandonedMissing.size.toString,
+            "peers" -> abandonedMissing.toList.map(_.value.value.take(8)).mkString(",")
           )
           .whenA(abandonedMissing.nonEmpty)
 
-        // For THIS round only: exclude recently removed, penalized, AND abandoned-missing peers from active selection.
+        // For THIS round only: exclude recently removed and penalized peers from active selection.
         // They remain in allEligible so they can be re-selected in future rounds.
+        // NOTE: abandonedMissing is intentionally NOT included — it's a local-only tracker that
+        // can diverge between nodes, causing different facilitator sets → fork detection → Leaving state.
         eligibleThisRound = {
-          val excluded = previouslyRemoved ++ penalizedPeers ++ abandonedMissing
+          val excluded = previouslyRemoved ++ penalizedPeers
           val filtered = allEligible.filterNot(excluded.contains)
           if (filtered.isEmpty) List(selfId) else filtered
         }
@@ -150,10 +158,16 @@ object GlobalSnapshotConsensusStateCreator {
         entropy = lastOutcome.finished.snapshotHash
         activeFacilitators = facilitatorSelector.select(eligibleThisRound, entropy)
 
-        _ <- logger
+        _ <- ConsensusLog
           .info(
-            s"Facilitator subsetting for key=$key: " +
-              s"allEligible=${allEligible.size}, eligibleThisRound=${eligibleThisRound.size}, selected=${activeFacilitators.size}"
+            logger,
+            ConsensusLog.Facilitator,
+            key.show,
+            "n/a",
+            "event" -> "FACILITATOR_SUBSETTING",
+            "allEligible" -> allEligible.size.toString,
+            "eligibleThisRound" -> eligibleThisRound.size.toString,
+            "selected" -> activeFacilitators.size.toString
           )
           .whenA(activeFacilitators.size < allEligible.size)
 
@@ -192,6 +206,18 @@ object GlobalSnapshotConsensusStateCreator {
         }
         leader = facilitatorSelector.selectLeaderWeighted(active, entropy, qualityScores = qualityScores, qualityWeight = 0.3)
 
+        _ <- ConsensusLog.info(
+          logger,
+          ConsensusLog.Facilitator,
+          key.show,
+          if (leader === selfId) "Leader" else "Validator",
+          "event" -> "FACILITATORS_FINALIZED",
+          "eligible" -> allEligible.size.toString,
+          "active" -> active.size.toString,
+          "excluded" -> (allEligible.size - eligibleThisRound.size).toString,
+          "leader" -> ConsensusLog.pid(leader)
+        )
+
         state = ConsensusState[GlobalSnapshotKey, GlobalSnapshotStatus, GlobalConsensusOutcome, GlobalConsensusKind](
           key,
           lastOutcome,
@@ -208,18 +234,27 @@ object GlobalSnapshotConsensusStateCreator {
           entropy = entropy
         )
 
-        role = if (leader === selfId) "LEADER" else "FOLLOWER"
+        role = ConsensusLog.role(selfId, leader)
         leaderScore <- peerQualityTracker.getQualityScore(leader)
-        _ <- logger.info(
-          s"[CONSENSUS:$role] Round STARTED key=$key trigger=${maybeTrigger.getOrElse("none")} " +
-            s"facilitators=${active.size} eligible=${allEligible.size} candidates=${filteredCandidates.size} " +
-            s"leader=${leader.show.take(8)}... leaderScore=${f"$leaderScore%.2f"} self=${selfId.show.take(8)}... view=0" +
-            (if (withdrawn.nonEmpty) s" withdrawn=${withdrawn.size}" else "") +
-            (if (penalizedPeers.nonEmpty) s" penalized=${penalizedPeers.size}" else "") +
-            (if (previouslyRemoved.nonEmpty) s" previouslyRemoved=${previouslyRemoved.size}" else "") +
-            (if (abandonedMissing.nonEmpty) s" abandonedMissing=${abandonedMissing.size}" else "") +
-            s" entropy=${entropy.show.take(8)}..."
-        )
+        _ <- {
+          val basePairs = Seq(
+            "event" -> "ROUND_STARTED",
+            "trigger" -> maybeTrigger.map(_.toString).getOrElse("none"),
+            "facilitators" -> active.size.toString,
+            "eligible" -> allEligible.size.toString,
+            "candidates" -> filteredCandidates.size.toString,
+            "leader" -> ConsensusLog.pid(leader),
+            "leaderScore" -> f"$leaderScore%.2f",
+            "self" -> ConsensusLog.pid(selfId),
+            "view" -> "0"
+          )
+          val optionalPairs =
+            (if (withdrawn.nonEmpty) Seq("withdrawn" -> withdrawn.size.toString) else Seq.empty) ++
+              (if (penalizedPeers.nonEmpty) Seq("penalized" -> penalizedPeers.size.toString) else Seq.empty) ++
+              (if (previouslyRemoved.nonEmpty) Seq("previouslyRemoved" -> previouslyRemoved.size.toString) else Seq.empty) ++
+              (if (abandonedMissing.nonEmpty) Seq("abandonedMissing" -> abandonedMissing.size.toString) else Seq.empty)
+          ConsensusLog.info(logger, ConsensusLog.Lifecycle, key.show, role, (basePairs ++ optionalPairs): _*)
+        }
 
       } yield (state, effect)
   }

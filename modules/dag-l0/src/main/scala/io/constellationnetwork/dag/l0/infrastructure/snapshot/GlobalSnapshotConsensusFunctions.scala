@@ -22,6 +22,7 @@ import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegated
 import io.constellationnetwork.node.shared.domain.event.EventCutter
 import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.domain.snapshot.services.GlobalL0Service
+import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger, TimeTrigger}
 import io.constellationnetwork.node.shared.infrastructure.delegatedStake.RewardsInfoStorage
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.GlobalSnapshotAcceptanceManager
@@ -32,7 +33,6 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake.UpdateDelegatedStake
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
@@ -86,8 +86,11 @@ object GlobalSnapshotConsensusFunctions {
 
     def getRequiredCollateral: Amount = collateral
 
+    // Read from consensus-agreed context (deterministic), NOT from MptStore (local mutable state).
+    // After an abandoned round the MptStore may contain partial mutations that differ across nodes,
+    // causing facilitatorFilter to compute different eligibility sets → fork.
     def getBalance(context: GlobalSnapshotContext, address: Address): F[Balance] =
-      mptStore.getBalance(address).map(_.getOrElse(Balance.empty))
+      context.balances.getOrElse(address, Balance.empty).pure[F]
 
     /** Validates a leader's proposed artifact by independently reconstructing it from the same inputs.
       *
@@ -332,11 +335,17 @@ object GlobalSnapshotConsensusFunctions {
         lastFacilitators <- facilitators.toList.traverse { peerId =>
           PeerId._Id.get(peerId).toAddress.map(_ -> peerId)
         }
-        _ <- logger
+        _ <- ConsensusLog
           .info(
-            s"[REWARDS.Debug] ordinal=${currentOrdinal.show} lastFacilitators.size=${lastFacilitators.size} " +
-              s"lastProofs.size=${lastArtifact.proofs.size} facilitators.size=${facilitators.size} " +
-              s"addrs=[${lastFacilitators.map(_._1.show.take(8)).sorted.mkString(",")}]"
+            logger,
+            ConsensusLog.Proposal,
+            currentOrdinal.show,
+            "n/a",
+            "event" -> "REWARDS_DEBUG",
+            "lastFacilitators" -> lastFacilitators.size.toString,
+            "lastProofs" -> lastArtifact.proofs.size.toString,
+            "facilitators" -> facilitators.size.toString,
+            "addrs" -> lastFacilitators.map(_._1.show.take(8)).sorted.mkString(",")
           )
           .whenA(sys.env.get("CL_MPT_DEBUG_DUMP").exists(_.toLowerCase == "true"))
 
@@ -359,15 +368,26 @@ object GlobalSnapshotConsensusFunctions {
           .map(_.value)
           .sorted(Signed.ordering(Order[UpdateNodeCollateral.Withdraw].toOrdering))
 
-        _ <- logger.info(
-          s"[CONSENSUS:PROPOSAL] ordinal=${currentOrdinal.show} trigger=$trigger " +
-            s"events.total=${events.size} dag=${blocksForAcceptance.size} sc=${scEvents.size} " +
-            s"allowSpend=${sortedAllowSpendEvents.size} tokenLock=${sortedTokenLockEvents.size} " +
-            s"unp=${unpEventsForAcceptance.size} " +
-            s"delegStakeCreate=${sortedCdsEvents.size} delegStakeWithdraw=${sortedWdsEvents.size} " +
-            s"nodeCollCreate=${sortedCncEvents.size} nodeCollWithdraw=${sortedWncEvents.size}"
+        _ <- ConsensusLog.info(
+          logger,
+          ConsensusLog.Proposal,
+          currentOrdinal.show,
+          "n/a",
+          "event" -> "PROPOSAL_EVENTS",
+          "trigger" -> trigger.toString,
+          "events.total" -> events.size.toString,
+          "dag" -> blocksForAcceptance.size.toString,
+          "sc" -> scEvents.size.toString,
+          "allowSpend" -> sortedAllowSpendEvents.size.toString,
+          "tokenLock" -> sortedTokenLockEvents.size.toString,
+          "unp" -> unpEventsForAcceptance.size.toString,
+          "delegStakeCreate" -> sortedCdsEvents.size.toString,
+          "delegStakeWithdraw" -> sortedWdsEvents.size.toString,
+          "nodeCollCreate" -> sortedCncEvents.size.toString,
+          "nodeCollWithdraw" -> sortedWncEvents.size.toString
         )
 
+        acceptStartMs <- Async[F].monotonic.map(_.toMillis)
         (
           acceptanceResult,
           allowSpendBlockAcceptanceResult,
@@ -404,20 +424,35 @@ object GlobalSnapshotConsensusFunctions {
               StateChannelValidationType.Full,
               getGlobalSnapshotByOrdinal
             )
-        _ <- logger.info(
-          s"[CONSENSUS:PROPOSAL] ordinal=${currentOrdinal.show} acceptance results: " +
-            s"blocks.accepted=${acceptanceResult.accepted.size} blocks.notAccepted=${acceptanceResult.notAccepted.size} " +
-            s"allowSpend.accepted=${allowSpendBlockAcceptanceResult.accepted.size} " +
-            s"tokenLock.accepted=${tokenLockBlockAcceptanceResult.accepted.size} " +
-            s"delegStakeCreate.accepted=${delegatedStakeAcceptanceResult.acceptedCreates.size} " +
-            s"delegStakeCreate.rejected=${delegatedStakeAcceptanceResult.notAcceptedCreates.size} " +
-            s"delegStakeWithdraw.accepted=${delegatedStakeAcceptanceResult.acceptedWithdrawals.size} " +
-            s"delegStakeWithdraw.rejected=${delegatedStakeAcceptanceResult.notAcceptedWithdrawals.size} " +
-            s"nodeCollCreate.accepted=${nodeCollateralAcceptanceResult.acceptedCreates.size} " +
-            s"nodeCollCreate.rejected=${nodeCollateralAcceptanceResult.notAcceptedCreates.size} " +
-            s"nodeCollWithdraw.accepted=${nodeCollateralAcceptanceResult.acceptedWithdrawals.size} " +
-            s"nodeCollWithdraw.rejected=${nodeCollateralAcceptanceResult.notAcceptedWithdrawals.size} " +
-            s"scSnapshots=${scSnapshots.size} rewards=${acceptedRewardTxs.size}"
+        acceptEndMs <- Async[F].monotonic.map(_.toMillis)
+        _ <- ConsensusLog.info(
+          logger,
+          ConsensusLog.Proposal,
+          currentOrdinal.show,
+          "n/a",
+          "event" -> "ACCEPT_TIMING",
+          "acceptDurationMs" -> (acceptEndMs - acceptStartMs).toString
+        )
+        _ <- ConsensusLog.info(
+          logger,
+          ConsensusLog.Proposal,
+          currentOrdinal.show,
+          "n/a",
+          "event" -> "ACCEPTANCE_RESULTS",
+          "blocks.accepted" -> acceptanceResult.accepted.size.toString,
+          "blocks.notAccepted" -> acceptanceResult.notAccepted.size.toString,
+          "allowSpend.accepted" -> allowSpendBlockAcceptanceResult.accepted.size.toString,
+          "tokenLock.accepted" -> tokenLockBlockAcceptanceResult.accepted.size.toString,
+          "delegStakeCreate.accepted" -> delegatedStakeAcceptanceResult.acceptedCreates.size.toString,
+          "delegStakeCreate.rejected" -> delegatedStakeAcceptanceResult.notAcceptedCreates.size.toString,
+          "delegStakeWithdraw.accepted" -> delegatedStakeAcceptanceResult.acceptedWithdrawals.size.toString,
+          "delegStakeWithdraw.rejected" -> delegatedStakeAcceptanceResult.notAcceptedWithdrawals.size.toString,
+          "nodeCollCreate.accepted" -> nodeCollateralAcceptanceResult.acceptedCreates.size.toString,
+          "nodeCollCreate.rejected" -> nodeCollateralAcceptanceResult.notAcceptedCreates.size.toString,
+          "nodeCollWithdraw.accepted" -> nodeCollateralAcceptanceResult.acceptedWithdrawals.size.toString,
+          "nodeCollWithdraw.rejected" -> nodeCollateralAcceptanceResult.notAcceptedWithdrawals.size.toString,
+          "scSnapshots" -> scSnapshots.size.toString,
+          "rewards" -> acceptedRewardTxs.size.toString
         )
 
         (deprecated, remainedActive, accepted) = getUpdatedTips(
@@ -463,14 +498,19 @@ object GlobalSnapshotConsensusFunctions {
           acceptedNnodeCollateralWithdrawals.some
         )
         returnedEvents = returnedSCEvents.map(StateChannelEvent(_)) ++ returnedDAGEvents
-        _ <- logger.info(
-          s"[CONSENSUS:PROPOSAL] ordinal=${currentOrdinal.show} artifact built: " +
-            s"height=${globalSnapshot.height.show} subHeight=${globalSnapshot.subHeight.show} " +
-            s"epoch=${globalSnapshot.epochProgress.show} " +
-            s"stateProof.mptRoot=${globalSnapshot.stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")} " +
-            s"stateProof.balances=${globalSnapshot.stateProof.balancesProof.show.take(12)} " +
-            s"stateProof.delegStakes=${globalSnapshot.stateProof.activeDelegatedStakes.map(_.show.take(12)).getOrElse("none")} " +
-            s"stateProof.nodeCollaterals=${globalSnapshot.stateProof.activeNodeCollaterals.map(_.show.take(12)).getOrElse("none")}"
+        _ <- ConsensusLog.info(
+          logger,
+          ConsensusLog.Proposal,
+          currentOrdinal.show,
+          "n/a",
+          "event" -> "ARTIFACT_BUILT",
+          "height" -> globalSnapshot.height.show,
+          "subHeight" -> globalSnapshot.subHeight.show,
+          "epoch" -> globalSnapshot.epochProgress.show,
+          "stateProof.mptRoot" -> globalSnapshot.stateProof.mptRoot.map(_.show.take(12)).getOrElse("none"),
+          "stateProof.balances" -> globalSnapshot.stateProof.balancesProof.show.take(12),
+          "stateProof.delegStakes" -> globalSnapshot.stateProof.activeDelegatedStakes.map(_.show.take(12)).getOrElse("none"),
+          "stateProof.nodeCollaterals" -> globalSnapshot.stateProof.activeNodeCollaterals.map(_.show.take(12)).getOrElse("none")
         )
         _ <- rewardsService.calculateAndStoreRewardsInfo(globalSnapshot, snapshotInfo)
       } yield (globalSnapshot, snapshotInfo, returnedEvents)

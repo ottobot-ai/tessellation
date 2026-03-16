@@ -6,8 +6,8 @@ import cats.syntax.all._
 
 import scala.concurrent.duration._
 
-import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusResources
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
+import io.constellationnetwork.node.shared.infrastructure.consensus.{ConsensusLog, ConsensusResources}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.schema.peer.{PeerId, PeerResponsiveness, Unresponsive}
 
@@ -84,13 +84,13 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
   private def monitorStep(key: Key, ms: MonitorState): F[Either[MonitorState, Unit]] =
     storage.getState(key).flatMap {
       case None =>
-        logger.debug(s"[CONSENSUS] Round monitor: state gone for key=$key, stopping") >>
+        ConsensusLog.debug(logger, ConsensusLog.Lifecycle, key.toString, "n/a", "event" -> "MONITOR_STATE_GONE") >>
           Async[F].pure(Right(()))
 
       case Some(state) =>
         ctx.advancer.getConsensusOutcome(state) match {
           case Some(_) =>
-            logger.debug(s"[CONSENSUS] Round monitor: outcome ready for key=$key, stopping") >>
+            ConsensusLog.debug(logger, ConsensusLog.Lifecycle, key.toString, "n/a", "event" -> "MONITOR_OUTCOME_READY") >>
               Async[F].pure(Right(()))
 
           case None =>
@@ -150,9 +150,16 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
               }
               earlyViewChange = leaderUnresponsive && ops.isProposalPhase(state.status) && ms.stallCount == 0
               _ <- (
-                logger.warn(
-                  s"[CONSENSUS] Early view change: leader ${state.leader.show.take(8)}... is unresponsive key=$key"
-                ) >> performViewChange(key, state)
+                ConsensusLog.warn(
+                  logger,
+                  ConsensusLog.Stall,
+                  key.toString,
+                  "n/a",
+                  "event" -> "EARLY_VIEW_CHANGE",
+                  "leader" -> ConsensusLog.pid(state.leader),
+                  "reason" -> "leader_unresponsive"
+                ) >>
+                  performViewChange(key, state)
               ).whenA(earlyViewChange)
 
               // Handle stall: view change for proposal phase, or count towards abandon.
@@ -195,10 +202,15 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
 
               _ <- (
                 peerQualityTracker.recordAbandonedMissingPeers(info.missingPeers).whenA(info.missingPeers.nonEmpty) >>
-                  logger
+                  ConsensusLog
                     .info(
-                      s"[CONSENSUS] Recording ${info.missingPeers.size} missing peers from abandoned round key=$key: " +
-                        s"[${info.missingPeers.toList.map(_.show.take(8)).mkString(",")}]"
+                      logger,
+                      ConsensusLog.Facilitator,
+                      key.toString,
+                      "n/a",
+                      "event" -> "RECORDING_MISSING_PEERS",
+                      "count" -> info.missingPeers.size.toString,
+                      "peers" -> s"[${info.missingPeers.toList.map(ConsensusLog.pid).mkString(",")}]"
                     )
                     .whenA(info.missingPeers.nonEmpty) >>
                   abandonRound(key, abandonReason) >>
@@ -215,15 +227,21 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
               statusName = state.status.getClass.getSimpleName.stripSuffix("$")
               withdrawnCount = state.withdrawnFacilitators.value.size
               roundElapsedTotal = now - ms.roundStartTime
-              _ <- logger
-                .info(
-                  s"[CONSENSUS] Round monitor key=$key status=$statusName declared=${info.declaredCount}/${info.activeCount} " +
-                    s"elapsed=${statusDuration.toSeconds}s roundElapsed=${roundElapsedTotal.toSeconds}s stallCount=$finalStallCount " +
-                    s"leader=${state.leader.show.take(8)}... facilitators=${state.facilitators.value.size}" +
-                    (if (state.viewNumber > 0) s" view=${state.viewNumber}" else "") +
-                    (if (withdrawnCount > 0) s" withdrawn=$withdrawnCount" else "") +
-                    (if (info.missingPeerIds.nonEmpty) s" missing=[${info.missingPeerIds.mkString(",")}]" else "")
-                )
+              summaryPairs = Seq(
+                "event" -> "ROUND_MONITOR",
+                "status" -> statusName,
+                "declared" -> s"${info.declaredCount}/${info.activeCount}",
+                "elapsed" -> s"${statusDuration.toSeconds}s",
+                "roundElapsed" -> s"${roundElapsedTotal.toSeconds}s",
+                "stallCount" -> finalStallCount.toString,
+                "leader" -> ConsensusLog.pid(state.leader),
+                "facilitators" -> state.facilitators.value.size.toString
+              ) ++
+                (if (state.viewNumber > 0) Seq("view" -> state.viewNumber.toString) else Seq.empty) ++
+                (if (withdrawnCount > 0) Seq("withdrawn" -> withdrawnCount.toString) else Seq.empty) ++
+                (if (info.missingPeerIds.nonEmpty) Seq("missing" -> s"[${info.missingPeerIds.mkString(",")}]") else Seq.empty)
+              _ <- ConsensusLog
+                .info(logger, ConsensusLog.Stall, key.toString, "n/a", summaryPairs: _*)
                 .whenA(shouldLogSummary && !shouldAbandon)
 
               // Peer quality score logging every 60 seconds
@@ -235,16 +253,26 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
                 if (scores.nonEmpty) {
                   val sorted = scores.toList.sortBy(-_._2)
                   val total = sorted.size
-                  // Show top 3 and bottom 3 (if different) to keep log manageable
-                  val top3 = sorted.take(3).map { case (pid, score) => s"${pid.show.take(8)}:${f"$score%.2f"}" }
-                  val bottom3 = sorted.takeRight(3).map { case (pid, score) => s"${pid.show.take(8)}:${f"$score%.2f"}" }
+                  val top3 = sorted.take(3).map { case (pid, score) => s"${ConsensusLog.pid(pid)}:${f"$score%.2f"}" }
+                  val bottom3 = sorted.takeRight(3).map { case (pid, score) => s"${ConsensusLog.pid(pid)}:${f"$score%.2f"}" }
                   val topIds = sorted.take(3).map(_._1).toSet
-                  val bottomEntries = if (total > 6) bottom3.filterNot(e => topIds.exists(id => e.startsWith(id.show.take(8)))) else Nil
+                  val bottomEntries =
+                    if (total > 6) bottom3.filterNot(e => topIds.exists(id => e.startsWith(ConsensusLog.pid(id)))) else Nil
                   val display =
-                    if (bottomEntries.nonEmpty) s"best=[${top3.mkString(",")}] worst=[${bottomEntries.mkString(",")}]"
+                    if (bottomEntries.nonEmpty) s"best=[${top3.mkString(",")}],worst=[${bottomEntries.mkString(",")}]"
                     else s"[${top3.mkString(",")}]"
-                  logger.info(s"[CONSENSUS] Peer quality scores: $display trackedPeers=$total")
-                } else logger.debug("[CONSENSUS] Peer quality scores: no peers tracked yet")
+                  ConsensusLog.info(
+                    logger,
+                    ConsensusLog.Facilitator,
+                    key.toString,
+                    "n/a",
+                    "event" -> "PEER_QUALITY",
+                    "scores" -> display,
+                    "trackedPeers" -> total.toString
+                  )
+                } else
+                  ConsensusLog
+                    .debug(logger, ConsensusLog.Facilitator, key.toString, "n/a", "event" -> "PEER_QUALITY", "trackedPeers" -> "0")
               }.whenA(shouldLogScores && !shouldAbandon)
 
               changed = resourcesChanged || statusChanged || didStall
@@ -323,21 +351,34 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
 
       if (ops.isProposalPhase(state.status)) {
         // Proposal phase stall: leader failed to propose → view change
-        logger.warn(
-          s"[CONSENSUS] Leader stall — performing view change key=$key status=$statusName " +
-            s"elapsed=${statusDuration.toSeconds}s timeout=${declarationTimeout.toSeconds}s " +
-            s"declared=$declaredCount/$activeCount leader=${state.leader.show.take(8)}... view=${state.viewNumber}" +
-            missingInfo
+        ConsensusLog.warn(
+          logger,
+          ConsensusLog.Stall,
+          key.toString,
+          "n/a",
+          "event" -> "LEADER_STALL",
+          "status" -> statusName,
+          "elapsed" -> s"${statusDuration.toSeconds}s",
+          "timeout" -> s"${declarationTimeout.toSeconds}s",
+          "declared" -> s"$declaredCount/$activeCount",
+          "leader" -> ConsensusLog.pid(state.leader),
+          "view" -> state.viewNumber.toString
         ) >>
           Metrics[F].incrementCounter("dag_consensus_view_change") >>
           Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
           performViewChange(key, state).as(true)
       } else {
         // Non-proposal stall: just log and count towards abandon
-        logger.warn(
-          s"[CONSENSUS] Stall detected key=$key status=$statusName " +
-            s"elapsed=${statusDuration.toSeconds}s timeout=${declarationTimeout.toSeconds}s " +
-            s"declared=$declaredCount/$activeCount" + missingInfo
+        ConsensusLog.warn(
+          logger,
+          ConsensusLog.Stall,
+          key.toString,
+          "n/a",
+          "event" -> "STALL_DETECTED",
+          "status" -> statusName,
+          "elapsed" -> s"${statusDuration.toSeconds}s",
+          "timeout" -> s"${declarationTimeout.toSeconds}s",
+          "declared" -> s"$declaredCount/$activeCount"
         ) >>
           Metrics[F].incrementCounter("dag_consensus_stall_detected") >>
           Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
@@ -360,9 +401,17 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
       newViewNumber
     )
 
-    logger.info(
-      s"[CONSENSUS] View change key=$key view=${currentState.viewNumber}->${newViewNumber} " +
-        s"oldLeader=${currentState.leader.show.take(8)}... newLeader=${newLeader.show.take(8)}... facilitators=${currentState.facilitators.value.size}"
+    ConsensusLog.info(
+      logger,
+      ConsensusLog.Phase,
+      key.toString,
+      "n/a",
+      "event" -> "VIEW_CHANGE",
+      "oldView" -> currentState.viewNumber.toString,
+      "newView" -> newViewNumber.toString,
+      "oldLeader" -> ConsensusLog.pid(currentState.leader),
+      "newLeader" -> ConsensusLog.pid(newLeader),
+      "facilitators" -> currentState.facilitators.value.size.toString
     ) >>
       peerQualityTracker.recordViewChange(currentState.leader) >>
       Metrics[F].updateGauge("dag_consensus_view_number", newViewNumber) >>
@@ -380,7 +429,7 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
   }
 
   private def abandonRound(key: Key, reason: String): F[Unit] =
-    logger.error(s"[CONSENSUS] ABANDONING round key=$key reason=$reason") >>
+    ConsensusLog.error(logger, ConsensusLog.Lifecycle, key.toString, "n/a", "event" -> "ROUND_ABANDONED", "reason" -> reason) >>
       Metrics[F].incrementCounter("dag_consensus_round_abandoned") >>
       storage
         .condModifyState[Unit](key) {
@@ -393,7 +442,14 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
         }
         .void >>
       trackConsecutiveAbandonments(key).flatMap { consecutiveCount =>
-        logger.info(s"[CONSENSUS] Abandoned round key=$key consecutiveAbandonments=$consecutiveCount") >>
+        ConsensusLog.info(
+          logger,
+          ConsensusLog.Lifecycle,
+          key.toString,
+          "n/a",
+          "event" -> "ROUND_ABANDONED_TRACKED",
+          "consecutiveAbandonments" -> consecutiveCount.toString
+        ) >>
           queue.offer(ConsensusCommand.RoundCompleted) >>
           queue.offer(ConsensusCommand.TimeTick)
       }

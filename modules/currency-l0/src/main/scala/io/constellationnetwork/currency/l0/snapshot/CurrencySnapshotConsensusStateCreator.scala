@@ -131,20 +131,22 @@ object CurrencySnapshotConsensusStateCreator {
           )
           .whenA(penalizedPeers.nonEmpty)
 
-        // Check for peers that were missing during an abandoned round.
+        // Clear abandoned-missing tracking (but don't use it for exclusion — it's local-only and
+        // causes non-deterministic facilitator sets across nodes, leading to fork detection failures).
         abandonedMissing <- peerQualityTracker.getAndClearAbandonedMissingPeers
 
         _ <- logger
           .info(
-            s"[CONSENSUS] Excluding ${abandonedMissing.size} peers missing from abandoned round for key=$key: " +
+            s"[CONSENSUS] Abandoned-missing peers (not excluded, logged only) for key=$key: " +
               s"[${abandonedMissing.toList.map(_.value.value.take(8)).mkString(",")}]"
           )
           .whenA(abandonedMissing.nonEmpty)
 
-        // For THIS round only: exclude recently removed, penalized, AND abandoned-missing peers from active selection.
+        // For THIS round only: exclude recently removed and penalized peers from active selection.
         // They remain in allEligible so they can be re-selected in future rounds.
+        // NOTE: abandonedMissing is intentionally NOT included — it's local-only and non-deterministic.
         eligibleThisRound = {
-          val excluded = previouslyRemoved ++ penalizedPeers ++ abandonedMissing
+          val excluded = previouslyRemoved ++ penalizedPeers
           val filtered = allEligible.filterNot(excluded.contains)
           if (filtered.isEmpty) List(selfId) else filtered
         }

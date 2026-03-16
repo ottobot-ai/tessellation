@@ -1,7 +1,7 @@
 package io.constellationnetwork.schema.mpt
 
 import cats.Parallel
-import cats.effect.{Async, Sync}
+import cats.effect.{Async, Spawn, Sync}
 import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
@@ -500,7 +500,9 @@ object GlobalStateConverter {
         }
 
         for {
+          t0 <- Async[F].monotonic.map(_.toMillis)
           entries <- acc.toStateEntries[F]
+          t1 <- Async[F].monotonic.map(_.toMillis)
           keysToRemove = toRemovalGlobalStateKeys
 
           // Log per-category entry counts for divergence diagnosis
@@ -545,17 +547,19 @@ object GlobalStateConverter {
                   store.insert[Json](batch.toMap) >> Async[F].cede
                 } >> store.sync[Json](batches.last.toMap, snapshotOrdinal)
             }
+          t2 <- Async[F].monotonic.map(_.toMillis)
 
           // Log total MPT entry count after sync for cross-node comparison
           totalMptEntries <- store.underlying.entries.map(_.size)
           rootHash <- store.underlying.getRootHashForOrdinal(snapshotOrdinal)
           _ <- syncLogger.info(
             s"[MPT.Sync] ordinal=$snapshotOrdinal AFTER: totalMptEntries=$totalMptEntries " +
-              s"rootHash=${rootHash.map(_.show.take(12)).getOrElse("none")}"
+              s"rootHash=${rootHash.map(_.show.take(12)).getOrElse("none")} " +
+              s"toStateEntriesMs=${t1 - t0} syncMs=${t2 - t1} totalMs=${t2 - t0}"
           )
 
-          // Dump debug snapshot to disk when CL_MPT_DEBUG_DUMP=true
-          _ <- dumpMptDebugSnapshot(snapshotOrdinal, store, entries, keysToRemove).whenA(MptDebugEnabled)
+          // Dump debug snapshot to disk when CL_MPT_DEBUG_DUMP=true (fire-and-forget to avoid blocking consensus)
+          _ <- Spawn[F].start(dumpMptDebugSnapshot(snapshotOrdinal, store, entries, keysToRemove)).void.whenA(MptDebugEnabled)
         } yield ()
       }
     }

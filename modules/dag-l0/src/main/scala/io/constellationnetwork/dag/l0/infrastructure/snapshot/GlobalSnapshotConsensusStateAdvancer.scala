@@ -229,6 +229,17 @@ object GlobalSnapshotConsensusStateAdvancer {
             _ <- maybeFacilities.traverse_(checkForkByFacilitatorsHash(_, status.facilitatorsHash)(_.facilitatorsHash))
             _ <- maybeFacilities.traverse_(checkForkByLastSnapshotHash(_, status.lastSnapshotHash))
             _ <- maybeFacilities.traverse_(checkForkByConsensusConfigHash)
+            _ <- maybeFacilities.traverse_ { _ =>
+              ConsensusLog.debug(
+                logger,
+                ConsensusLog.Fork,
+                state.key.show,
+                "n/a",
+                "event" -> "FORK_CHECKS_PASSED",
+                "facilitatorsHash" -> status.facilitatorsHash.show.take(8),
+                "lastSnapshotHash" -> status.lastSnapshotHash.show.take(8)
+              )
+            }
             result <- maybeFacilities.flatTraverse(toProposalsPhase(state, _))
           } yield result
         }
@@ -260,7 +271,7 @@ object GlobalSnapshotConsensusStateAdvancer {
         previousSp <- proposalSavepointRef.getAndSet(none)
         _ <- previousSp.traverse_ { sp =>
           sp.restore >>
-            logger.info(s"[CONSENSUS] Restored MptStore savepoint from previous abandoned round key=${state.key.show}")
+            ConsensusLog.info(logger, ConsensusLog.Lifecycle, state.key.show, "n/a", "event" -> "MPT_SAVEPOINT_RESTORED")
         }
         // Take a fresh savepoint before mutations. If this round is abandoned and retried,
         // the next buildProposalTransition will restore this savepoint.
@@ -275,19 +286,40 @@ object GlobalSnapshotConsensusStateAdvancer {
         isLeader = selfId === state.leader
         role = if (isLeader) "LEADER" else "FOLLOWER"
         withdrawnCount = state.withdrawnFacilitators.value.size
-        _ <- logger.info(
-          s"[CONSENSUS:$role] FACILITIES->PROPOSALS key=${state.key.show} ordinal=${artifact.ordinal.show} trigger=$majorityTrigger " +
-            s"hash=${hash.show.take(8)}... facilitators=${state.facilitators.value.size} candidates=${candidates.size} " +
-            s"leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}" +
-            (if (withdrawnCount > 0) s" withdrawn=$withdrawnCount" else "") +
-            s" facilitatorsHash=${facilitatorsHash.show.take(8)}... lastSnapshotHash=${state.lastOutcome.finished.snapshotHash.show
-                .take(8)}... entropy=${state.entropy.show.take(8)}..."
+        _ <- ConsensusLog.info(
+          logger,
+          ConsensusLog.Phase,
+          state.key.show,
+          role,
+          (Seq(
+            "event" -> "FACILITIES_TO_PROPOSALS",
+            "ordinal" -> artifact.ordinal.show,
+            "trigger" -> majorityTrigger.toString,
+            "hash" -> hash.show.take(8),
+            "facilitators" -> state.facilitators.value.size.toString,
+            "candidates" -> candidates.size.toString,
+            "leader" -> ConsensusLog.pid(state.leader),
+            "self" -> ConsensusLog.pid(selfId),
+            "view" -> state.viewNumber.toString,
+            "facilitatorsHash" -> facilitatorsHash.show.take(8),
+            "lastSnapshotHash" -> state.lastOutcome.finished.snapshotHash.show.take(8)
+          ) ++ (if (withdrawnCount > 0) Seq("withdrawn" -> withdrawnCount.toString) else Seq.empty)): _*
         )
-        _ <- logger.info(
-          s"[CONSENSUS:$role] Proposal stateProof key=${state.key.show}: ${describeStateProof(artifact.stateProof)}"
+        _ <- ConsensusLog.info(
+          logger,
+          ConsensusLog.Proposal,
+          state.key.show,
+          role,
+          "event" -> "PROPOSAL_STATE_PROOF",
+          "detail" -> describeStateProof(artifact.stateProof)
         )
-        _ <- logger.info(
-          s"[CONSENSUS:$role] Proposal context key=${state.key.show}: ${contextDigest(context)}"
+        _ <- ConsensusLog.info(
+          logger,
+          ConsensusLog.Proposal,
+          state.key.show,
+          role,
+          "event" -> "PROPOSAL_CONTEXT_DIGEST",
+          "detail" -> contextDigest(context)
         )
       } yield
         Transition(
@@ -363,9 +395,15 @@ object GlobalSnapshotConsensusStateAdvancer {
               case None =>
                 if (selfId === state.leader)
                   // Leader (possibly after view change) — spread proposal so peers can advance
-                  logger.info(
-                    s"[CONSENSUS:LEADER] Re-spreading proposal key=${state.key.show} hash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
-                      s"targets=${state.facilitators.value.size} view=${state.viewNumber}"
+                  ConsensusLog.info(
+                    logger,
+                    ConsensusLog.Phase,
+                    state.key.show,
+                    "Leader",
+                    "event" -> "PROPOSAL_RESPREAD",
+                    "hash" -> status.proposalArtifactInfo.hash.show.take(8),
+                    "targets" -> state.facilitators.value.size.toString,
+                    "view" -> state.viewNumber.toString
                   ) >>
                     spreadProposal(
                       state,
@@ -391,10 +429,27 @@ object GlobalSnapshotConsensusStateAdvancer {
       val role = if (selfId === state.leader) "LEADER" else "FOLLOWER"
       if (leaderProposal.hash === status.proposalArtifactInfo.hash) {
         // Leader's artifact matches our own — use local ArtifactInfo (avoids re-validation)
-        logger.info(
-          s"[CONSENSUS:$role] PROPOSALS->SIGNATURES key=${state.key.show} matchesOwn=true hash=${leaderProposal.hash.show.take(8)}... " +
-            s"trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
+        ConsensusLog.info(
+          logger,
+          ConsensusLog.Validation,
+          state.key.show,
+          role,
+          "event" -> "ARTIFACT_HASH_MATCH",
+          "hash" -> leaderProposal.hash.show.take(12),
+          "match" -> "true"
         ) >>
+          ConsensusLog.info(
+            logger,
+            ConsensusLog.Phase,
+            state.key.show,
+            role,
+            "event" -> "PROPOSALS_TO_SIGNATURES",
+            "matchesOwn" -> "true",
+            "hash" -> leaderProposal.hash.show.take(8),
+            "trigger" -> status.majorityTrigger.toString,
+            "leader" -> ConsensusLog.pid(state.leader),
+            "view" -> state.viewNumber.toString
+          ) >>
           Metrics[F].incrementCounter("dag_consensus_proposal_affinity_match") >>
           buildSignatureTransition(state, status, status.proposalArtifactInfo, List(leaderProposal.hash)).map(_.some)
       } else {
@@ -406,18 +461,30 @@ object GlobalSnapshotConsensusStateAdvancer {
           case Some(leaderArtifact) =>
             mptStore.savepoint.flatMap { sp =>
               val validate =
-                logger.info(
-                  s"[CONSENSUS:FOLLOWER] Validating leader artifact key=${state.key.show} " +
-                    s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
-                    s"mptSavepoint=created"
+                ConsensusLog.info(
+                  logger,
+                  ConsensusLog.Validation,
+                  state.key.show,
+                  "Validator",
+                  "event" -> "VALIDATING_LEADER_ARTIFACT",
+                  "leaderHash" -> leaderProposal.hash.show.take(8),
+                  "ownHash" -> status.proposalArtifactInfo.hash.show.take(8)
                 ) >>
                   validateLeaderArtifact(state, status, leaderArtifact, leaderProposal.hash).flatMap {
                     case Right(leaderInfo) =>
                       // Validation succeeded — MptStore mutations are correct, keep them
-                      logger.info(
-                        s"[CONSENSUS:$role] PROPOSALS->SIGNATURES key=${state.key.show} matchesOwn=false " +
-                          s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
-                          s"trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
+                      ConsensusLog.info(
+                        logger,
+                        ConsensusLog.Validation,
+                        state.key.show,
+                        role,
+                        "event" -> "ARTIFACT_REVALIDATED",
+                        "matchesOwn" -> "false",
+                        "leaderHash" -> leaderProposal.hash.show.take(8),
+                        "ownHash" -> status.proposalArtifactInfo.hash.show.take(8),
+                        "trigger" -> status.majorityTrigger.toString,
+                        "leader" -> ConsensusLog.pid(state.leader),
+                        "view" -> state.viewNumber.toString
                       ) >>
                         Metrics[F].incrementCounter("dag_consensus_proposal_affinity_mismatch_accepted") >>
                         buildSignatureTransition(state, status, leaderInfo, List(leaderProposal.hash)).map(_.some)
@@ -427,16 +494,34 @@ object GlobalSnapshotConsensusStateAdvancer {
                       val ownCtx = status.proposalArtifactInfo.context
                       val ctxDigest = contextDigest(ownCtx)
                       sp.restore >>
-                        logger.warn(
-                          s"[CONSENSUS:$role] Leader proposal FAILED validation key=${state.key.show} " +
-                            s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
-                            s"leader=${state.leader.show.take(8)}... view=${state.viewNumber} reason=$diffDetail"
+                        ConsensusLog.warn(
+                          logger,
+                          ConsensusLog.Validation,
+                          state.key.show,
+                          role,
+                          "event" -> "VALIDATION_FAILED",
+                          "leaderHash" -> leaderProposal.hash.show.take(8),
+                          "ownHash" -> status.proposalArtifactInfo.hash.show.take(8),
+                          "leader" -> ConsensusLog.pid(state.leader),
+                          "view" -> state.viewNumber.toString,
+                          "reason" -> diffDetail
                         ) >>
-                        logger.info(
-                          s"[CONSENSUS:$role] Own context digest key=${state.key.show}: $ctxDigest"
+                        ConsensusLog.info(
+                          logger,
+                          ConsensusLog.Validation,
+                          state.key.show,
+                          role,
+                          "event" -> "OWN_CONTEXT_DIGEST",
+                          "detail" -> ctxDigest
                         ) >>
-                        logger.info(
-                          s"[CONSENSUS:$role] Withdrawing from round key=${state.key.show} reason=proposal_validation_failed (MptStore restored)"
+                        ConsensusLog.info(
+                          logger,
+                          ConsensusLog.Phase,
+                          state.key.show,
+                          role,
+                          "event" -> "WITHDRAW_VALIDATION_FAIL",
+                          "reason" -> "proposal_validation_failed",
+                          "mptStoreRestored" -> "true"
                         ) >>
                         gossip.spread(ConsensusWithdrawPeerDeclaration(state.key, GlobalConsensusKind.Signature: GlobalConsensusKind)) >>
                         Metrics[F].incrementCounter("dag_consensus_proposal_validation_failure") >>
@@ -450,9 +535,7 @@ object GlobalSnapshotConsensusStateAdvancer {
               Async[F].guaranteeCase(validate) {
                 case Outcome.Errored(_) | Outcome.Canceled() =>
                   sp.restore >>
-                    logger.error(
-                      s"[CONSENSUS:$role] MptStore restored after unexpected failure key=${state.key.show}"
-                    )
+                    ConsensusLog.error(logger, ConsensusLog.Lifecycle, state.key.show, role, "event" -> "MPT_RESTORED_AFTER_FAILURE")
                 case Outcome.Succeeded(_) =>
                   Applicative[F].unit
               }
@@ -732,11 +815,20 @@ object GlobalSnapshotConsensusStateAdvancer {
       for {
         valid <- proofs.filterA(verifySignatureProof(status.majorityArtifactInfo.hash, _))
         _ <- logInvalidSignatures(state.key, proofs.size, valid.size)
-        role = if (selfId === state.leader) "LEADER" else "FOLLOWER"
-        _ <- logger.info(
-          s"[CONSENSUS:$role] SIGNATURES->FINISHED key=${state.key.show} ordinal=${status.majorityArtifactInfo.artifact.ordinal.show} " +
-            s"signatures=${valid.size}/${proofs.size} hash=${status.majorityArtifactInfo.hash.show.take(8)}... " +
-            s"trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
+        role = ConsensusLog.role(selfId, state.leader)
+        _ <- ConsensusLog.info(
+          logger,
+          ConsensusLog.Phase,
+          state.key.show,
+          role,
+          "event" -> "SIGNATURES_TO_FINISHED",
+          "ordinal" -> status.majorityArtifactInfo.artifact.ordinal.show,
+          "signatures" -> s"${valid.size}/${proofs.size}",
+          "hash" -> status.majorityArtifactInfo.hash.show.take(8),
+          "trigger" -> status.majorityTrigger.toString,
+          "leader" -> ConsensusLog.pid(state.leader),
+          "self" -> ConsensusLog.pid(selfId),
+          "view" -> state.viewNumber.toString
         )
         result <- buildFinishedTransition(state, status, valid)
       } yield result

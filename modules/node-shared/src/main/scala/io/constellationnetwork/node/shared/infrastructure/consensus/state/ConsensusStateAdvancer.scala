@@ -8,7 +8,7 @@ import scala.collection.immutable.SortedMap
 
 import io.constellationnetwork.node.shared.config.types.ConsensusConfig
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
-import io.constellationnetwork.node.shared.infrastructure.consensus.{ConsensusResources, PeerDeclarations}
+import io.constellationnetwork.node.shared.infrastructure.consensus.{ConsensusLog, ConsensusResources, PeerDeclarations}
 import io.constellationnetwork.schema.peer.PeerId
 
 import org.typelevel.log4cats.SelfAwareStructuredLogger
@@ -146,7 +146,21 @@ trait ConsensusStateAdvancer[F[_], Key, Artifact, Context, Status, Outcome, Kind
         }
       }
     } else {
-      none[SortedMap[PeerId, A]].pure[F]
+      // Only log when there's some progress to avoid noise on empty checks
+      logger
+        .debug(
+          ConsensusLog.format(
+            ConsensusLog.Quorum,
+            state.key.toString,
+            "n/a",
+            "event" -> "QUORUM_WAITING",
+            "declared" -> s"$receivedCount/$totalRequired",
+            "quorum" -> quorumSize.toString,
+            "status" -> statusName
+          )
+        )
+        .whenA(receivedCount > 0) >>
+        none[SortedMap[PeerId, A]].pure[F]
     }
   }
 }

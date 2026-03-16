@@ -5,6 +5,7 @@ import cats.effect.std.Random
 import cats.syntax.all._
 import cats.{Eq, Show}
 
+import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog
 import io.constellationnetwork.node.shared.infrastructure.consensus.engine.ConsensusCommand._
 import io.constellationnetwork.node.shared.infrastructure.consensus.engine._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger._
@@ -63,7 +64,7 @@ class ConsensusFSM[F[_]: Async: Metrics: HasherSelector: Random, Event, Key: Eq:
           case CheckUpdate(key)         => transitions.checkUpdate(key.asInstanceOf[Key])
           case InternalScheduled(inner) => handle(inner)
           case PeerObserved(peer)       => transitions.registerPeer(peer)
-          case IgnoreUnexpectedRumor(r) => log.warn(s"Ignoring unexpected rumor: $r")
+          case IgnoreUnexpectedRumor(r) => log.warn(s"Ignoring unexpected rumor: ${r.getClass.getSimpleName}")
 
           case _ if running => handleWhileBusy(cmd)
           case _            => handleWhileIdle(cmd)
@@ -72,11 +73,12 @@ class ConsensusFSM[F[_]: Async: Metrics: HasherSelector: Random, Event, Key: Eq:
 
   private def handleWhileIdle(cmd: ConsensusCommand): F[Unit] =
     cmd match {
-      case StartRound(trigger)        => startRound(trigger)
-      case TimeTick                   => startRound(Some(TimeTrigger))
-      case FacilitateByEvent          => startRound(Some(EventTrigger))
-      case RoundCompleted             => log.warn("Received RoundCompleted while idle; ignoring.")
-      case ConsensusFinished(_, _, _) => log.warn("Received ConsensusFinished while idle; ignoring.")
+      case StartRound(trigger) => startRound(trigger)
+      case TimeTick            => startRound(Some(TimeTrigger))
+      case FacilitateByEvent   => startRound(Some(EventTrigger))
+      case RoundCompleted      => log.warn(ConsensusLog.format(ConsensusLog.Lifecycle, "n/a", "n/a", "event" -> "IDLE_ROUND_COMPLETED"))
+      case ConsensusFinished(_, _, _) =>
+        log.warn(ConsensusLog.format(ConsensusLog.Lifecycle, "n/a", "n/a", "event" -> "IDLE_CONSENSUS_FINISHED"))
       case InitializeFromDownload(key, art, c) =>
         transitions.initFromDownload(key.asInstanceOf[Key], art.asInstanceOf[Signed[Artifact]], c.asInstanceOf[Ctx])
       case InitializeFromRollback(key, outcome) => transitions.initFromRollback(key.asInstanceOf[Key], outcome.asInstanceOf[Outcome])
@@ -98,7 +100,8 @@ class ConsensusFSM[F[_]: Async: Metrics: HasherSelector: Random, Event, Key: Eq:
       case StartRound(_) =>
         Metrics[F].incrementCounter("dag_consensus_fsm_pending_deferred", Seq(unsafeLabelName("trigger_type") -> "event")) >>
           pending.setEvent()
-      case RoundCompleted => completeRound(log.debug("Round completed without outcome"))
+      case RoundCompleted =>
+        completeRound(log.debug(ConsensusLog.format(ConsensusLog.Lifecycle, "n/a", "n/a", "event" -> "ROUND_COMPLETED_NO_OUTCOME")))
       case ConsensusFinished(key, _, trigger) =>
         completeRound(log.info(s"Consensus finished at key=$key") >> roundRunner.afterConsensusFinish(trigger))
       case WithdrawFromConsensus => pending.setEvent()
@@ -108,7 +111,15 @@ class ConsensusFSM[F[_]: Async: Metrics: HasherSelector: Random, Event, Key: Eq:
   private def startRound(trigger: Option[ConsensusTrigger]): F[Unit] =
     isRunning.get.ifM(
       ifTrue = log.debug(s"Ignoring StartRound($trigger) — round already running"),
-      ifFalse = log.info(s"Starting consensus round with trigger=$trigger") >>
+      ifFalse = log.info(
+        ConsensusLog.format(
+          ConsensusLog.Lifecycle,
+          "n/a",
+          "n/a",
+          "event" -> "FSM_ROUND_START",
+          "trigger" -> trigger.map(_.toString).getOrElse("none")
+        )
+      ) >>
         Metrics[F].incrementCounter(
           "dag_consensus_fsm_round_started",
           Seq(unsafeLabelName("trigger_type") -> trigger.map(_.toString).getOrElse("none"))
