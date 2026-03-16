@@ -207,7 +207,9 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
           roundElapsedMs = roundElapsed.toMillis,
           phaseElapsedMs = statusDuration.toMillis,
           stallCount = finalStallCount,
-          isRunning = true
+          isRunning = true,
+          missingPeers = info.missingPeers.toList.map(ConsensusLog.pid),
+          facilitatorIds = state.facilitators.value.map(ConsensusLog.pid)
         )
       )
 
@@ -294,6 +296,7 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
     if (statusDuration >= declarationTimeout) {
       val statusName = state.status.getClass.getSimpleName.stripSuffix("$")
       val phaseLabel = Seq((Metrics.unsafeLabelName("phase"), statusName))
+      val missingDisplay = if (missingPeerIds.nonEmpty) s"[${missingPeerIds.mkString(",")}]" else "none"
 
       if (ops.isProposalPhase(state.status)) {
         ConsensusLog.warn(
@@ -305,9 +308,10 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
           "status" -> statusName,
           "elapsed" -> s"${statusDuration.toSeconds}s",
           "timeout" -> s"${declarationTimeout.toSeconds}s",
-          "declared" -> s"$declaredCount/$activeCount",
+          "progress" -> s"$declaredCount/$activeCount",
           "leader" -> ConsensusLog.pid(state.leader),
-          "view" -> state.viewNumber.toString
+          "view" -> state.viewNumber.toString,
+          "missing" -> missingDisplay
         ) >>
           Metrics[F].incrementCounter("dag_consensus_view_change") >>
           Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
@@ -322,7 +326,8 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
           "status" -> statusName,
           "elapsed" -> s"${statusDuration.toSeconds}s",
           "timeout" -> s"${declarationTimeout.toSeconds}s",
-          "declared" -> s"$declaredCount/$activeCount"
+          "progress" -> s"$declaredCount/$activeCount",
+          "missing" -> missingDisplay
         ) >>
           Metrics[F].incrementCounter("dag_consensus_stall_detected") >>
           Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
@@ -367,10 +372,13 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
   // ── Helpers ───────────────────────────────────────────────────────
 
   private def isLeaderUnresponsive(leader: PeerId): F[Boolean] =
-    clusterStorage.getPeer(leader).map {
-      case Some(peer) => peer.responsiveness === (Unresponsive: PeerResponsiveness)
-      case None       => true
-    }
+    if (leader == ctx.selfId)
+      false.pure[F] // Local node is always responsive to itself
+    else
+      clusterStorage.getPeer(leader).map {
+        case Some(peer) => peer.responsiveness === (Unresponsive: PeerResponsiveness)
+        case None       => true
+      }
 
   private def getCurrentDeclarationTimeout: F[FiniteDuration] =
     ctx.nodeStorage.isInJoiningGracePeriod.map { isInJoiningGracePeriod =>
@@ -387,29 +395,55 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
     roundElapsed: FiniteDuration,
     stallCount: Int,
     statusName: String
-  ): F[Unit] = {
-    val withdrawnCount = state.withdrawnFacilitators.value.size
-    val summaryPairs = Seq(
-      "event" -> "ROUND_MONITOR",
-      "status" -> statusName,
-      "declared" -> s"${info.declaredCount}/${info.activeCount}",
-      "elapsed" -> s"${statusDuration.toSeconds}s",
-      "roundElapsed" -> s"${roundElapsed.toSeconds}s",
-      "stallCount" -> stallCount.toString,
-      "leader" -> ConsensusLog.pid(state.leader),
-      "facilitators" -> state.facilitators.value.size.toString
-    ) ++
-      (if (state.viewNumber > 0) Seq("view" -> state.viewNumber.toString) else Seq.empty) ++
-      (if (withdrawnCount > 0) Seq("withdrawn" -> withdrawnCount.toString) else Seq.empty) ++
-      (if (info.missingPeerIds.nonEmpty) Seq("missing" -> s"[${info.missingPeerIds.mkString(",")}]") else Seq.empty)
-    ConsensusLog.info(logger, ConsensusLog.Stall, key.toString, "n/a", summaryPairs: _*)
-  }
+  ): F[Unit] =
+    peerQualityTracker.getQualityScores.flatMap { scores =>
+      val withdrawnCount = state.withdrawnFacilitators.value.size
+
+      // Build facilitator roster: each peer shows declared status and quality
+      val roster = state.facilitators.value.map { pid =>
+        val tag = ConsensusLog.pid(pid)
+        val isLeader = pid == state.leader
+        val isDeclared = !info.missingPeers.contains(pid)
+        val isWithdrawn = state.withdrawnFacilitators.value.contains(pid)
+        val score = scores.get(pid).map(s => f"$s%.2f").getOrElse("?")
+        val status =
+          if (isWithdrawn) "W"
+          else if (isDeclared) "ok"
+          else "MISS"
+        val leaderMark = if (isLeader) "*" else ""
+        s"$tag$leaderMark($status,$score)"
+      }
+
+      // Missing peers with their quality scores for quick identification
+      val missingWithScores = info.missingPeers.toList.map { pid =>
+        val score = scores.get(pid).map(s => f"$s%.2f").getOrElse("?")
+        s"${ConsensusLog.pid(pid)}(q=$score)"
+      }
+
+      val summaryPairs = Seq(
+        "event" -> "ROUND_MONITOR",
+        "status" -> statusName,
+        "progress" -> s"${info.declaredCount}/${info.activeCount}",
+        "phaseElapsed" -> s"${statusDuration.toSeconds}s",
+        "roundElapsed" -> s"${roundElapsed.toSeconds}s",
+        "stallCount" -> stallCount.toString,
+        "leader" -> ConsensusLog.pid(state.leader),
+        "peers" -> s"[${roster.mkString(" ")}]"
+      ) ++
+        (if (state.viewNumber > 0) Seq("view" -> state.viewNumber.toString) else Seq.empty) ++
+        (if (withdrawnCount > 0) Seq("withdrawn" -> withdrawnCount.toString) else Seq.empty) ++
+        (if (missingWithScores.nonEmpty) Seq("unhealthy" -> s"[${missingWithScores.mkString(",")}]") else Seq.empty)
+      ConsensusLog.info(logger, ConsensusLog.Stall, key.toString, "n/a", summaryPairs: _*)
+    }
 
   private def logPeerQualityScores(key: Key): F[Unit] =
     peerQualityTracker.getQualityScores.flatMap { scores =>
       if (scores.nonEmpty) {
         val sorted = scores.toList.sortBy(-_._2)
         val total = sorted.size
+        val healthy = sorted.count(_._2 >= 0.7)
+        val degraded = sorted.count(s => s._2 >= 0.3 && s._2 < 0.7)
+        val unhealthy = sorted.count(_._2 < 0.3)
         val top3 = sorted.take(3).map { case (pid, score) => s"${ConsensusLog.pid(pid)}:${f"$score%.2f"}" }
         val bottom3 = sorted.takeRight(3).map { case (pid, score) => s"${ConsensusLog.pid(pid)}:${f"$score%.2f"}" }
         val topIds = sorted.take(3).map(_._1).toSet
@@ -425,6 +459,7 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status,
           "n/a",
           "event" -> "PEER_QUALITY",
           "scores" -> display,
+          "summary" -> s"healthy=$healthy,degraded=$degraded,unhealthy=$unhealthy",
           "trackedPeers" -> total.toString
         )
       } else

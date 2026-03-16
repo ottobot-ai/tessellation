@@ -10,6 +10,7 @@ import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.infrastructure.consensus.engine.{ConsensusCommand, PendingTriggersF}
 import io.constellationnetwork.node.shared.infrastructure.consensus.{FacilitatorSelector, _}
+import io.constellationnetwork.schema.peer.PeerId
 
 import org.typelevel.log4cats.SelfAwareStructuredLogger
 
@@ -46,6 +47,7 @@ import org.typelevel.log4cats.SelfAwareStructuredLogger
   *   - `ops` - Status-specific operations
   */
 final case class ConsensusEngineContext[F[_], Event, Key, Artifact, Context, Status, Outcome, Kind](
+  selfId: PeerId,
   queue: Queue[F, ConsensusCommand],
   isRoundRunning: Ref[F, Boolean],
   pending: PendingTriggersF[F],
@@ -68,6 +70,7 @@ final case class ConsensusEngineContext[F[_], Event, Key, Artifact, Context, Sta
 object ConsensusEngineContext {
 
   def create[F[_]: Async, Event, Key, Artifact, Ctx, Status, Outcome, Kind](
+    selfId: PeerId,
     queue: Queue[F, ConsensusCommand],
     pending: PendingTriggersF[F],
     storage: ConsensusStorage[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind],
@@ -89,6 +92,7 @@ object ConsensusEngineContext {
       running <- Ref.of[F, Boolean](false)
     } yield
       ConsensusEngineContext(
+        selfId,
         queue,
         running,
         pending,

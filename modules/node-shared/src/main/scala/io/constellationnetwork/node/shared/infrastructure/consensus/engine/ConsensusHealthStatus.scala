@@ -47,7 +47,9 @@ final case class ConsensusHealthStatus(
   phaseElapsedMs: Long = 0,
   stallCount: Int = 0,
   consecutiveAbandonments: Int = 0,
-  isRunning: Boolean = false
+  isRunning: Boolean = false,
+  missingPeers: List[String] = Nil,
+  facilitatorIds: List[String] = Nil
 )
 
 object ConsensusHealthStatus {

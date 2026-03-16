@@ -138,7 +138,14 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
             queue.offer(ConsensusFinished(key, outcome, trigger))
         } else {
           Metrics[F].incrementCounter("dag_consensus_outcome_conflict") >>
-            log.warn("[CONSENSUS] Could not update last outcome; another thread may have finalized.")
+            ConsensusLog.warn(
+              log,
+              ConsensusLog.Lifecycle,
+              "n/a",
+              "n/a",
+              "event" -> "OUTCOME_CONFLICT",
+              "reason" -> "concurrent_finalization"
+            )
         }
     } yield ()
 
@@ -162,7 +169,7 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
 
   def initFromDownload(key: Key, artifact: Signed[Artifact], context: Ctx): F[Unit] =
     for {
-      _ <- log.info(s"[DownloadInit] Initializing consensus at key=$key")
+      _ <- ConsensusLog.info(log, ConsensusLog.Lifecycle, key.toString, "n/a", "event" -> "DOWNLOAD_INIT_START")
       outcome <- fetchOutcomeFromCluster(key, artifact, context)
         .flatMap(_.liftTo[F](new Throwable(s"[DownloadInit] Could not observe outcome for key=$key")))
       _ <- storage
@@ -177,7 +184,7 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
 
   def initFromRollback(key: Key, outcome: Outcome): F[Unit] =
     for {
-      _ <- log.info(s"[RollbackInit] Initializing consensus after rollback at key=$key")
+      _ <- ConsensusLog.info(log, ConsensusLog.Lifecycle, key.toString, "n/a", "event" -> "ROLLBACK_INIT_START")
       _ <- storage.trySetInitialConsensusOutcome(outcome)
       _ <- queue.offer(StartRound(TimeTrigger.some))
     } yield ()
@@ -193,8 +200,15 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
         val candidates = if (readyPeers.nonEmpty) readyPeers else observingPeers
 
         if (candidates.isEmpty) {
-          val peerStates = allPeers.map(p => s"${p.id.show.take(8)}=${p.state}").mkString(", ")
-          log.warn(s"[DownloadInit] No Ready/Observing peers available. Peer states: $peerStates") >>
+          val peerStates = allPeers.toList.map(p => s"${ConsensusLog.pid(p.id)}=${p.state}").mkString(", ")
+          ConsensusLog.warn(
+            log,
+            ConsensusLog.Lifecycle,
+            "n/a",
+            "n/a",
+            "event" -> "DOWNLOAD_INIT_NO_PEERS",
+            "peerStates" -> s"[$peerStates]"
+          ) >>
             new NoValidPeersException(
               s"No peers in Ready or Observing state. Available: ${allPeers.size} peers"
             ).raiseError[F, Peer]
@@ -204,7 +218,15 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
       }
 
     def fetch(peer: Peer): F[Option[Outcome]] =
-      log.debug(s"[DownloadInit] Fetching outcome from peer ${peer.id.show.take(8)} (${peer.state})") >>
+      ConsensusLog.debug(
+        log,
+        ConsensusLog.Lifecycle,
+        key.toString,
+        "n/a",
+        "event" -> "DOWNLOAD_INIT_FETCH",
+        "peer" -> ConsensusLog.pid(peer.id),
+        "state" -> peer.state.toString
+      ) >>
         ctx.consensusClient.getSpecificConsensusOutcome(GetConsensusOutcomeRequest(key)).run(peer)
 
     def wasSuccessful(maybeOutcome: Option[Outcome]): F[Boolean] =
@@ -221,16 +243,40 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
         maybeOutcome.map { outcome =>
           val sameArtifact = outcomeArtifact.get(outcome) === artifact
           val sameContext = outcomeContext.get(outcome) === context
-          log.info(
-            s"[DownloadInit] Observed outcome {key=${key.show}, outcomeKey=${outcomeKey
-                .get(outcome)}, sameArtifact=${sameArtifact.show}, sameContext=${sameContext.show}, attempt=$attempt}"
+          ConsensusLog.info(
+            log,
+            ConsensusLog.Lifecycle,
+            key.show,
+            "n/a",
+            "event" -> "DOWNLOAD_INIT_MISMATCH",
+            "sameArtifact" -> sameArtifact.show,
+            "sameContext" -> sameContext.show,
+            "attempt" -> attempt.toString
           )
-        }.getOrElse(log.info(s"[DownloadInit] Outcome not observed {key=${key.show}, attempt=$attempt}"))
+        }.getOrElse(
+          ConsensusLog.info(
+            log,
+            ConsensusLog.Lifecycle,
+            key.show,
+            "n/a",
+            "event" -> "DOWNLOAD_INIT_WAITING",
+            "attempt" -> attempt.toString
+          )
+        )
       } else Async[F].unit
     }
 
     def onError(err: Throwable, retryDetails: RetryDetails): F[Unit] =
-      log.error(err)(s"Error when trying to observe consensus outcome {attempt=${retryDetails.retriesSoFar}}")
+      log.error(err)(
+        ConsensusLog.format(
+          ConsensusLog.Lifecycle,
+          key.show,
+          "n/a",
+          "event" -> "DOWNLOAD_INIT_ERROR",
+          "attempt" -> retryDetails.retriesSoFar.toString,
+          "error" -> err.getMessage
+        )
+      )
 
     (selectPeer >>= fetch).retryingOnFailuresAndAllErrors(
       wasSuccessful = wasSuccessful,

@@ -82,19 +82,32 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
 
       _ <- facilitated match {
         case Some(_) =>
-          Metrics[F].incrementCounter(
-            "dag_consensus_round_facilitated",
-            Seq(unsafeLabelName("outcome") -> "success")
-          ) >>
-            ConsensusLog.info(
-              logger,
-              ConsensusLog.Lifecycle,
-              key.toString,
-              "n/a",
-              "event" -> "ROUND_FACILITATED",
-              "maxStallCycles" -> config.maxStallCycles.toString,
-              "maxRoundDuration" -> config.maxRoundDuration.map(d => s"${d.toSeconds}s").getOrElse("none")
+          storage.getState(key).flatMap { maybeState =>
+            val facilitatorInfo = maybeState.map { s =>
+              val peers = s.facilitators.value.map { pid =>
+                val mark = if (pid == s.leader) "*" else ""
+                s"${ConsensusLog.pid(pid)}$mark"
+              }
+              s"[${peers.mkString(" ")}]"
+            }.getOrElse("[]")
+            val leaderInfo = maybeState.map(s => ConsensusLog.pid(s.leader)).getOrElse("unknown")
+            val count = maybeState.map(_.facilitators.value.size).getOrElse(0)
+
+            Metrics[F].incrementCounter(
+              "dag_consensus_round_facilitated",
+              Seq(unsafeLabelName("outcome") -> "success")
             ) >>
+              ConsensusLog.info(
+                logger,
+                ConsensusLog.Lifecycle,
+                key.toString,
+                "n/a",
+                "event" -> "ROUND_FACILITATED",
+                "leader" -> leaderInfo,
+                "facilitators" -> count.toString,
+                "peers" -> facilitatorInfo
+              )
+          } >>
             startRoundMonitor(key) >>
             doInitialCheck(key)
 

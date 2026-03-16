@@ -16,7 +16,7 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.trigger._
 import io.constellationnetwork.node.shared.infrastructure.consensus.{FacilitatorSelector, _}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.schema.node.NodeState
-import io.constellationnetwork.schema.peer.Peer
+import io.constellationnetwork.schema.peer.{Peer, PeerId}
 import io.constellationnetwork.security.HasherSelector
 import io.constellationnetwork.security.signature.Signed
 
@@ -75,6 +75,7 @@ object ConsensusEventLoop {
     Outcome,
     Kind
   ](
+    selfId: PeerId,
     storage: ConsensusStorage[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind],
     stateCreator: ConsensusStateCreator[F, Key, Artifact, Ctx, Status, Outcome, Kind],
     stateUpdater: ConsensusStateUpdater[F, Key, Artifact, Ctx, Status, Outcome, Kind],
@@ -98,6 +99,7 @@ object ConsensusEventLoop {
       queue <- Queue.unbounded[F, ConsensusCommand]
       pending <- PendingTriggers.create[F]
       ctx <- ConsensusEngineContext.create(
+        selfId,
         queue,
         pending,
         storage,

@@ -236,6 +236,7 @@ object GlobalSnapshotConsensus {
           GlobalConsensusOutcome,
           GlobalConsensusKind
         ](
+          selfId,
           consensusStorage,
           stateCreator,
           stateUpdater,

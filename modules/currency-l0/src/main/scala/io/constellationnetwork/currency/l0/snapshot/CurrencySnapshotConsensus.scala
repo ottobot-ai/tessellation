@@ -171,6 +171,7 @@ object CurrencySnapshotConsensus {
           CurrencyConsensusOutcome,
           CurrencyConsensusKind
         ](
+          selfId,
           consensusStorage,
           consensusStateCreator,
           stateUpdater,
