@@ -177,8 +177,16 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
           queue.offer(ConsensusCommand.StartRound(Some(TimeTrigger)))
         else if (maybeTimeTrigger.isEmpty)
           scheduleTimeTrigger >> queue.offer(ConsensusCommand.StartRound(None))
-        else
-          Async[F].unit
+        else {
+          // Time trigger exists but hasn't elapsed yet. The timer fiber that would
+          // have fired it was cancelled by cleanupRound, so we must re-spawn it
+          // for the remaining duration. Without this, the node goes permanently idle.
+          val remaining = maybeTimeTrigger.get - currentTime
+          spawnTracked {
+            Temporal[F].sleep(remaining) >>
+              checkAndTriggerTime.handleErrorWith(err => logger.error(err)("Error triggering consensus with time trigger"))
+          }
+        }
     } yield ()
 
   private def afterTimeTrigger: F[Unit] =
