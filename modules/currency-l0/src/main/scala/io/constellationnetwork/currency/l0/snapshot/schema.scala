@@ -104,7 +104,8 @@ object schema {
     withdrawnFacilitators: WithdrawnFacilitators,
     eligibleFacilitators: EligibleFacilitators,
     finished: Finished,
-    removalPenalties: SortedMap[PeerId, Int] = SortedMap.empty
+    removalPenalties: SortedMap[PeerId, Int] = SortedMap.empty,
+    peerQuality: SortedMap[PeerId, (Int, Int)] = SortedMap.empty
   ) {
     def eligibleOrFacilitators: List[PeerId] =
       if (eligibleFacilitators.value.nonEmpty) eligibleFacilitators.value

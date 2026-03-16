@@ -80,6 +80,10 @@ object schema {
     *
     * `removalPenalties` uses `SortedMap` to ensure deterministic iteration when computing penalty decrements and filtering penalized peers
     * in the next round.
+    *
+    * `peerQuality` tracks consensus-agreed quality scores: `(roundsCompleted, roundsParticipated)` per peer. Because all nodes in a round
+    * agree on the same facilitator list, removals, and withdrawals, these counters are deterministic across the network — enabling
+    * quality-weighted leader selection without local score divergence.
     */
   @derive(encoder, decoder, eqv)
   final case class GlobalConsensusOutcome(
@@ -89,7 +93,8 @@ object schema {
     withdrawnFacilitators: WithdrawnFacilitators,
     eligibleFacilitators: EligibleFacilitators,
     finished: Finished,
-    removalPenalties: SortedMap[PeerId, Int] = SortedMap.empty
+    removalPenalties: SortedMap[PeerId, Int] = SortedMap.empty,
+    peerQuality: SortedMap[PeerId, (Int, Int)] = SortedMap.empty
   ) {
     def eligibleOrFacilitators: List[PeerId] =
       if (eligibleFacilitators.value.nonEmpty) eligibleFacilitators.value

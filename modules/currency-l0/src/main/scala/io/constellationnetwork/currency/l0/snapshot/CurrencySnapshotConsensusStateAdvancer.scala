@@ -113,6 +113,25 @@ object CurrencySnapshotConsensusStateAdvancer {
             val newPenalties = state.removedFacilitators.value.foldLeft(decrementedPenalties) { (acc, pid) =>
               acc.updated(pid, config.removalPenaltyRounds)
             }
+            // Compute consensus-agreed peer quality: (roundsCompleted, roundsParticipated) per peer.
+            val thisRoundQuality: SortedMap[PeerId, (Int, Int)] = SortedMap.from(
+              state.facilitators.value.map { pid =>
+                val completed =
+                  if (state.withdrawnFacilitators.value.contains(pid) || state.removedFacilitators.value.contains(pid)) 0
+                  else 1
+                pid -> (completed, 1)
+              }
+            )
+            val accumulatedQuality: SortedMap[PeerId, (Int, Int)] = {
+              val previous = state.lastOutcome.peerQuality
+              val allPeerIds = (previous.keySet.toList ::: thisRoundQuality.keySet.toList).distinct
+              SortedMap.from(allPeerIds.map { pid =>
+                val (pc, pp) = previous.getOrElse(pid, (0, 0))
+                val (tc, tp) = thisRoundQuality.getOrElse(pid, (0, 0))
+                pid -> (pc + tc, pp + tp)
+              })
+            }
+
             val outcome = CurrencyConsensusOutcome(
               state.key,
               state.facilitators,
@@ -120,7 +139,8 @@ object CurrencySnapshotConsensusStateAdvancer {
               state.withdrawnFacilitators,
               state.eligibleFacilitators,
               f,
-              removalPenalties = if (config.removalPenaltyRounds > 0) newPenalties else SortedMap.empty
+              removalPenalties = if (config.removalPenaltyRounds > 0) newPenalties else SortedMap.empty,
+              peerQuality = accumulatedQuality
             )
             (Previous(state.lastOutcome.key), outcome).some
           case _ =>
