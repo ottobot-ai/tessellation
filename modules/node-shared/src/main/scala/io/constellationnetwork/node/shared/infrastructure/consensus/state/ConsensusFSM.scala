@@ -128,10 +128,12 @@ class ConsensusFSM[F[_]: Async: Metrics: HasherSelector: Random, Event, Key: Eq:
       _ <- Metrics[F].incrementCounter("dag_consensus_fsm_round_completed")
       _ <- Metrics[F].updateGauge("dag_consensus_fsm_round_running", 0)
       _ <- isRunning.set(false)
+      // Direct invocation instead of queue roundtrip — isRunning is already false,
+      // so startRound will proceed immediately without an extra queue poll interval.
       next <- pending.pullNext
       _ <- next.traverse_ {
-        case TriggerPriority.Time  => ctx.queue.offer(StartRound(Some(TimeTrigger)))
-        case TriggerPriority.Event => ctx.queue.offer(StartRound(Some(EventTrigger)))
+        case TriggerPriority.Time  => startRound(Some(TimeTrigger))
+        case TriggerPriority.Event => startRound(Some(EventTrigger))
       }
     } yield ()
 }

@@ -1,5 +1,6 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot
 
+import cats.Order
 import cats.data.NonEmptySet
 import cats.effect.Async
 import cats.syntax.all._
@@ -343,13 +344,20 @@ object GlobalSnapshotConsensusFunctions {
         // Events are extracted from Set[GlobalSnapshotEvent] (line 114) which has non-deterministic
         // iteration order. Without sorting, different nodes may process events in different orders,
         // causing divergent acceptance results (e.g. first-wins duplicate logic in delegated stakes).
-        // Signed[T] provides Order when T has Order, ensuring canonical ordering across all peers.
+        // All types derive Order, and Signed[T] provides Order when T has Order, ensuring
+        // canonical ordering across all peers. Using .sorted (Order-based) instead of
+        // .sortBy(_.show) (String-based) avoids collisions when distinct events have identical
+        // Show representations.
         sortedAllowSpendEvents = allowSpendEventsForAcceptance.toList.map(_.value).sorted
         sortedTokenLockEvents = tokenLockEventsForAcceptance.toList.map(_.value).sorted
-        sortedCdsEvents = cdsEventsForAcceptance.toList.map(_.value).sortBy(_.show)
-        sortedWdsEvents = wdsEventsForAcceptance.toList.map(_.value).sortBy(_.show)
-        sortedCncEvents = cncEventsForAcceptance.toList.map(_.value).sortBy(_.show)
-        sortedWncEvents = wncEventsForAcceptance.toList.map(_.value).sortBy(_.show)
+        sortedCdsEvents = cdsEventsForAcceptance.toList.map(_.value).sorted(Signed.ordering(Order[UpdateDelegatedStake.Create].toOrdering))
+        sortedWdsEvents = wdsEventsForAcceptance.toList
+          .map(_.value)
+          .sorted(Signed.ordering(Order[UpdateDelegatedStake.Withdraw].toOrdering))
+        sortedCncEvents = cncEventsForAcceptance.toList.map(_.value).sorted(Signed.ordering(Order[UpdateNodeCollateral.Create].toOrdering))
+        sortedWncEvents = wncEventsForAcceptance.toList
+          .map(_.value)
+          .sorted(Signed.ordering(Order[UpdateNodeCollateral.Withdraw].toOrdering))
 
         _ <- logger.info(
           s"[CONSENSUS:PROPOSAL] ordinal=${currentOrdinal.show} trigger=$trigger " +

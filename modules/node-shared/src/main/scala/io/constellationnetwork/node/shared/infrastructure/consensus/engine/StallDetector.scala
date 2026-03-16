@@ -1,6 +1,7 @@
 package io.constellationnetwork.node.shared.infrastructure.consensus.engine
 
-import cats.effect.kernel.{Async, Deferred, Temporal}
+import cats.Eq
+import cats.effect.kernel._
 import cats.syntax.all._
 
 import scala.concurrent.duration._
@@ -8,6 +9,7 @@ import scala.concurrent.duration._
 import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusResources
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
+import io.constellationnetwork.schema.peer.{PeerResponsiveness, Unresponsive}
 
 import eu.timepit.refined.auto._
 
@@ -31,11 +33,17 @@ import eu.timepit.refined.auto._
   * For non-proposal phases (facilities, signatures, etc.), stalls indicate slow peers rather than leader failure. After maxStallCycles
   * timeouts, the round is abandoned and a fresh round starts.
   */
-class StallDetector[F[_]: Async: Metrics, Event, Key, Artifact, Ctx, Status, Outcome, Kind](
+@scala.annotation.nowarn("msg=type parameter Outcome.*shadows")
+class StallDetector[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, Status, Outcome, Kind](
   ctx: ConsensusEngineContext[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind]
 ) {
 
-  import ctx.{config, logger, ops, peerQualityTracker, queue, storage}
+  import ctx.{clusterStorage, config, logger, ops, peerQualityTracker, queue, storage}
+
+  /** Tracks consecutive abandonments at the same key to detect infinite stuck loops. When the same key is abandoned
+    * `maxConsecutiveAbandonments` times, the node initiates a restart.
+    */
+  private val consecutiveAbandonCountRef: Ref[F, (Option[Key], Int)] = Ref.unsafe((none[Key], 0))
 
   private case class MonitorState(
     lastResourcesHash: Int,
@@ -116,24 +124,51 @@ class StallDetector[F[_]: Async: Metrics, Event, Key, Artifact, Ctx, Status, Out
                   baseTimeout + (baseTimeout / 2)
                 else baseTimeout
 
-              // Reduce patience for known-bad leaders during proposal phase
-              leaderQuality <- peerQualityTracker.getQualityScore(state.leader)
-              effectiveTimeout =
-                if (ops.isProposalPhase(state.status) && leaderQuality < config.leaderQualityThreshold)
-                  FiniteDuration((baseEffectiveTimeout.toMillis * config.leaderQualityTimeoutMultiplier).toLong, MILLISECONDS)
-                else baseEffectiveTimeout
+              // Quality-adjusted timeouts are disabled: local quality scores differ across nodes,
+              // causing different timeout behavior. While this is safe (view changes are deterministic),
+              // it creates confusing log divergence. Use a fixed timeout for all leaders.
+              // Quality tracking is kept for observability (score logging below) but does not affect
+              // consensus timing.
+
+              // Phase-adaptive timeout: shorter for lightweight phases (facilities),
+              // longer for expensive phases (proposals with artifact creation).
+              phaseMultiplier = ops.phaseIndex(state.status) match {
+                case 0 => config.facilitiesTimeoutMultiplier // CollectingFacilities
+                case 1 => config.proposalsTimeoutMultiplier // CollectingProposals
+                case 2 => config.signaturesTimeoutMultiplier // CollectingSignatures
+                case _ => 1.0 // BinarySignatures, Finished
+              }
+              effectiveTimeout = FiniteDuration((baseEffectiveTimeout.toMillis * phaseMultiplier).toLong, MILLISECONDS)
+
+              // Early view change shortcut: if the leader is already marked unresponsive by
+              // LocalHealthcheck, don't wait for the full timeout — trigger view change immediately.
+              // This saves an entire declarationTimeout cycle when we already know the leader is down.
+              leaderUnresponsive <- clusterStorage.getPeer(state.leader).map {
+                case Some(peer) =>
+                  peer.responsiveness === (Unresponsive: PeerResponsiveness)
+                case None => true // peer gone from cluster = treat as unresponsive
+              }
+              earlyViewChange = leaderUnresponsive && ops.isProposalPhase(state.status) && ms.stallCount == 0
+              _ <- (
+                logger.warn(
+                  s"[CONSENSUS] Early view change: leader ${state.leader.show.take(8)}... is unresponsive key=$key"
+                ) >> performViewChange(key, state)
+              ).whenA(earlyViewChange)
 
               // Handle stall: view change for proposal phase, or count towards abandon.
               // Returns true if a stall was detected (view change or non-proposal stall).
-              didStall <- handleStall(
-                key = key,
-                state = state,
-                declarationTimeout = effectiveTimeout,
-                statusDuration = statusDuration,
-                declaredCount = info.declaredCount,
-                activeCount = info.activeCount,
-                missingPeerIds = info.missingPeerIds
-              )
+              didStall <-
+                if (earlyViewChange) true.pure[F]
+                else
+                  handleStall(
+                    key = key,
+                    state = state,
+                    declarationTimeout = effectiveTimeout,
+                    statusDuration = statusDuration,
+                    declaredCount = info.declaredCount,
+                    activeCount = info.activeCount,
+                    missingPeerIds = info.missingPeerIds
+                  )
 
               // Reset statusStartTime on any stall detection (not just view changes).
               // This naturally rate-limits re-stalls: after detection, the timer restarts
@@ -177,7 +212,7 @@ class StallDetector[F[_]: Async: Metrics, Event, Key, Artifact, Ctx, Status, Out
                 .info(
                   s"[CONSENSUS] Round monitor key=$key status=$statusName declared=${info.declaredCount}/${info.activeCount} " +
                     s"elapsed=${statusDuration.toSeconds}s roundElapsed=${roundElapsedTotal.toSeconds}s stallCount=$finalStallCount " +
-                    s"leader=${state.leader.show.take(8)}... leaderScore=${f"$leaderQuality%.2f"} facilitators=${state.facilitators.value.size}" +
+                    s"leader=${state.leader.show.take(8)}... facilitators=${state.facilitators.value.size}" +
                     (if (state.viewNumber > 0) s" view=${state.viewNumber}" else "") +
                     (if (withdrawnCount > 0) s" withdrawn=$withdrawnCount" else "") +
                     (if (info.missingPeerIds.nonEmpty) s" missing=[${info.missingPeerIds.mkString(",")}]" else "")
@@ -348,8 +383,22 @@ class StallDetector[F[_]: Async: Metrics, Event, Key, Artifact, Ctx, Status, Out
             none[(Option[ConsensusState[Key, Status, Outcome, Kind]], Unit)].pure[F]
         }
         .void >>
-      queue.offer(ConsensusCommand.RoundCompleted) >>
-      queue.offer(ConsensusCommand.TimeTick)
+      trackConsecutiveAbandonments(key).flatMap { consecutiveCount =>
+        logger.info(s"[CONSENSUS] Abandoned round key=$key consecutiveAbandonments=$consecutiveCount") >>
+          queue.offer(ConsensusCommand.RoundCompleted) >>
+          queue.offer(ConsensusCommand.TimeTick)
+      }
+
+  /** Track consecutive abandonments at the same key. Returns the new count. Resets to 1 when the key changes (different ordinal).
+    */
+  private def trackConsecutiveAbandonments(key: Key): F[Int] =
+    consecutiveAbandonCountRef.modify {
+      case (Some(lastKey), count) if lastKey === key =>
+        val newCount = count + 1
+        ((key.some, newCount), newCount)
+      case _ =>
+        ((key.some, 1), 1)
+    }
 
   private def getCurrentDeclarationTimeout: F[FiniteDuration] =
     ctx.nodeStorage.isInJoiningGracePeriod.map { isInJoiningGracePeriod =>

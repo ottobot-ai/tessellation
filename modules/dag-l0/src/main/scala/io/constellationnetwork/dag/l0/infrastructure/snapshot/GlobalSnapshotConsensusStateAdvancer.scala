@@ -4,7 +4,7 @@ import java.security.KeyPair
 import java.time.Instant
 
 import cats.data.{NonEmptySet, StateT}
-import cats.effect.Async
+import cats.effect.{Async, Outcome, Ref}
 import cats.syntax.all._
 import cats.{Applicative, MonadThrow}
 
@@ -35,7 +35,7 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.SnapshotConse
 import io.constellationnetwork.node.shared.logger.LoggerBundle
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.gossip.Ordinal
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, MptStoreSavepoint}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -124,6 +124,11 @@ object GlobalSnapshotConsensusStateAdvancer {
     private val facilitatorsHashObservationName = "facilitators-hash"
     private val consensusConfigHashObservationName = "consensus-config-hash"
 
+    /** Savepoint taken before `createArtifact()` mutations. On round abandonment + retry at the same ordinal, this is restored before
+      * re-building the proposal to ensure the MptStore starts from a clean pre-mutation state.
+      */
+    private val proposalSavepointRef: Ref[F, Option[MptStoreSavepoint[F]]] = Ref.unsafe(none)
+
     protected val clusterStorage: ClusterStorage[F] = clusterStorageInstance
     protected val config: ConsensusConfig = consensusConfig
 
@@ -142,6 +147,29 @@ object GlobalSnapshotConsensusStateAdvancer {
             acc.updated(pid, config.removalPenaltyRounds)
           }
           val finalPenalties = if (config.removalPenaltyRounds > 0) newPenalties else SortedMap.empty[PeerId, Int]
+
+          // Compute consensus-agreed peer quality: (roundsCompleted, roundsParticipated) per peer.
+          // A peer "completed" if it wasn't withdrawn or removed. This is deterministic because
+          // all nodes agree on the same facilitator list, removals, and withdrawals.
+          val thisRoundQuality: SortedMap[PeerId, (Int, Int)] = SortedMap.from(
+            state.facilitators.value.map { pid =>
+              val completed =
+                if (state.withdrawnFacilitators.value.contains(pid) || state.removedFacilitators.value.contains(pid)) 0
+                else 1
+              pid -> (completed, 1)
+            }
+          )
+          // Accumulate with previous rounds: merge (completed, participated) tuples
+          val accumulatedQuality: SortedMap[PeerId, (Int, Int)] = {
+            val previous = state.lastOutcome.peerQuality
+            val allPeerIds = (previous.keySet.toList ::: thisRoundQuality.keySet.toList).distinct
+            SortedMap.from(allPeerIds.map { pid =>
+              val (pc, pp) = previous.getOrElse(pid, (0, 0))
+              val (tc, tp) = thisRoundQuality.getOrElse(pid, (0, 0))
+              pid -> (pc + tc, pp + tp)
+            })
+          }
+
           val outcome = GlobalConsensusOutcome(
             state.key,
             state.facilitators,
@@ -149,7 +177,8 @@ object GlobalSnapshotConsensusStateAdvancer {
             state.withdrawnFacilitators,
             state.eligibleFacilitators,
             Finished(f.signedMajorityArtifact, f.context, f.majorityTrigger, f.candidates, f.facilitatorsHash, f.snapshotHash),
-            removalPenalties = finalPenalties
+            removalPenalties = finalPenalties,
+            peerQuality = accumulatedQuality
           )
           (Previous(state.lastOutcome.key), outcome).some
         case _ =>
@@ -225,6 +254,18 @@ object GlobalSnapshotConsensusStateAdvancer {
         _ <- clearTimeTriggerIfNeeded(majorityTrigger)
         facilitatorsHash <- hashFacilitators(state)
         peerEvents <- consensusStorage.pullEvents(bound)
+
+        // Restore any previous savepoint from an abandoned round at the same ordinal,
+        // ensuring MptStore is in a clean pre-mutation state before createArtifact().
+        previousSp <- proposalSavepointRef.getAndSet(none)
+        _ <- previousSp.traverse_ { sp =>
+          sp.restore >>
+            logger.info(s"[CONSENSUS] Restored MptStore savepoint from previous abandoned round key=${state.key.show}")
+        }
+        // Take a fresh savepoint before mutations. If this round is abandoned and retried,
+        // the next buildProposalTransition will restore this savepoint.
+        sp <- mptStore.savepoint
+        _ <- proposalSavepointRef.set(sp.some)
 
         (artifact, context, returnedEvents) <- createArtifact(state, majorityTrigger, extractEvents(peerEvents))
 
@@ -364,43 +405,57 @@ object GlobalSnapshotConsensusStateAdvancer {
         resources.artifacts.get(leaderProposal.hash) match {
           case Some(leaderArtifact) =>
             mptStore.savepoint.flatMap { sp =>
-              logger.info(
-                s"[CONSENSUS:FOLLOWER] Validating leader artifact key=${state.key.show} " +
-                  s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
-                  s"mptSavepoint=created"
-              ) >>
-                validateLeaderArtifact(state, status, leaderArtifact, leaderProposal.hash).flatMap {
-                  case Right(leaderInfo) =>
-                    // Validation succeeded — MptStore mutations are correct, keep them
-                    logger.info(
-                      s"[CONSENSUS:$role] PROPOSALS->SIGNATURES key=${state.key.show} matchesOwn=false " +
-                        s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
-                        s"trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
-                    ) >>
-                      Metrics[F].incrementCounter("dag_consensus_proposal_affinity_mismatch_accepted") >>
-                      buildSignatureTransition(state, status, leaderInfo, List(leaderProposal.hash)).map(_.some)
-                  case Left(invalidArtifact) =>
-                    // Validation failed — restore MptStore to pre-validation state
-                    val diffDetail = describeInvalidArtifact(invalidArtifact)
-                    val ownCtx = status.proposalArtifactInfo.context
-                    val ctxDigest = contextDigest(ownCtx)
-                    sp.restore >>
-                      logger.warn(
-                        s"[CONSENSUS:$role] Leader proposal FAILED validation key=${state.key.show} " +
+              val validate =
+                logger.info(
+                  s"[CONSENSUS:FOLLOWER] Validating leader artifact key=${state.key.show} " +
+                    s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
+                    s"mptSavepoint=created"
+                ) >>
+                  validateLeaderArtifact(state, status, leaderArtifact, leaderProposal.hash).flatMap {
+                    case Right(leaderInfo) =>
+                      // Validation succeeded — MptStore mutations are correct, keep them
+                      logger.info(
+                        s"[CONSENSUS:$role] PROPOSALS->SIGNATURES key=${state.key.show} matchesOwn=false " +
                           s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
-                          s"leader=${state.leader.show.take(8)}... view=${state.viewNumber} reason=$diffDetail"
+                          s"trigger=${status.majorityTrigger} leader=${state.leader.show.take(8)}... self=${selfId.show.take(8)}... view=${state.viewNumber}"
                       ) >>
-                      logger.info(
-                        s"[CONSENSUS:$role] Own context digest key=${state.key.show}: $ctxDigest"
-                      ) >>
-                      logger.info(
-                        s"[CONSENSUS:$role] Withdrawing from round key=${state.key.show} reason=proposal_validation_failed (MptStore restored)"
-                      ) >>
-                      gossip.spread(ConsensusWithdrawPeerDeclaration(state.key, GlobalConsensusKind.Signature: GlobalConsensusKind)) >>
-                      Metrics[F].incrementCounter("dag_consensus_proposal_validation_failure") >>
-                      Metrics[F].incrementCounter("dag_consensus_withdrawal_sent") >>
-                      none[Transition].pure[F]
-                }
+                        Metrics[F].incrementCounter("dag_consensus_proposal_affinity_mismatch_accepted") >>
+                        buildSignatureTransition(state, status, leaderInfo, List(leaderProposal.hash)).map(_.some)
+                    case Left(invalidArtifact) =>
+                      // Validation failed — restore MptStore to pre-validation state
+                      val diffDetail = describeInvalidArtifact(invalidArtifact)
+                      val ownCtx = status.proposalArtifactInfo.context
+                      val ctxDigest = contextDigest(ownCtx)
+                      sp.restore >>
+                        logger.warn(
+                          s"[CONSENSUS:$role] Leader proposal FAILED validation key=${state.key.show} " +
+                            s"leaderHash=${leaderProposal.hash.show.take(8)}... ownHash=${status.proposalArtifactInfo.hash.show.take(8)}... " +
+                            s"leader=${state.leader.show.take(8)}... view=${state.viewNumber} reason=$diffDetail"
+                        ) >>
+                        logger.info(
+                          s"[CONSENSUS:$role] Own context digest key=${state.key.show}: $ctxDigest"
+                        ) >>
+                        logger.info(
+                          s"[CONSENSUS:$role] Withdrawing from round key=${state.key.show} reason=proposal_validation_failed (MptStore restored)"
+                        ) >>
+                        gossip.spread(ConsensusWithdrawPeerDeclaration(state.key, GlobalConsensusKind.Signature: GlobalConsensusKind)) >>
+                        Metrics[F].incrementCounter("dag_consensus_proposal_validation_failure") >>
+                        Metrics[F].incrementCounter("dag_consensus_withdrawal_sent") >>
+                        none[Transition].pure[F]
+                  }
+
+              // Use guaranteeCase to restore MptStore on any unexpected exception.
+              // Without this, an IO-level failure in validateLeaderArtifact would skip
+              // sp.restore, leaving partial MptStore state that poisons future rounds.
+              Async[F].guaranteeCase(validate) {
+                case Outcome.Errored(_) | Outcome.Canceled() =>
+                  sp.restore >>
+                    logger.error(
+                      s"[CONSENSUS:$role] MptStore restored after unexpected failure key=${state.key.show}"
+                    )
+                case Outcome.Succeeded(_) =>
+                  Applicative[F].unit
+              }
             }
           case None =>
             // Leader's artifact not yet received via gossip — wait
@@ -624,6 +679,8 @@ object GlobalSnapshotConsensusStateAdvancer {
         facilitatorsHash <- state.facilitators.value.hash
         signature <- Signature.fromHash(keyPair.getPrivate, majorityInfo.hash)
         _ <- recordProposalAffinity(proposalHashes, status.proposalArtifactInfo.hash)
+        // Round succeeded — discard the proposal savepoint so it won't be restored on the next ordinal
+        _ <- proposalSavepointRef.set(none)
       } yield
         Transition(
           newState = state.copy(status =

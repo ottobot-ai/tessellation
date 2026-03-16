@@ -150,10 +150,13 @@ object types {
     noProgressTimeout: Option[FiniteDuration] = None,
     maxStallCycles: Int = 3,
     maxRoundDuration: Option[FiniteDuration] = None,
-    quorumThreshold: Option[Double] = None,
-    removalPenaltyRounds: Int = 0,
+    quorumThreshold: Option[Double] = Some(0.75),
+    removalPenaltyRounds: Int = 3,
     leaderQualityThreshold: Double = 0.5,
-    leaderQualityTimeoutMultiplier: Double = 0.5
+    leaderQualityTimeoutMultiplier: Double = 0.5,
+    facilitiesTimeoutMultiplier: Double = 0.5,
+    proposalsTimeoutMultiplier: Double = 1.5,
+    signaturesTimeoutMultiplier: Double = 0.75
   ) {
     quorumThreshold.foreach { t =>
       require(t > 2.0 / 3.0 && t <= 1.0, s"quorumThreshold must be in (2/3, 1.0], got $t")
@@ -173,6 +176,7 @@ object types {
       *
       * '''Non-critical fields''' (excluded — affect timing/performance, not deterministic outcomes):
       *   - `timeTriggerInterval`, `declarationTimeout`, `lockDuration`, `reStallTimeout`, `noProgressTimeout`: timing only
+      *   - `facilitiesTimeoutMultiplier`, `proposalsTimeoutMultiplier`, `signaturesTimeoutMultiplier`: timing multipliers only
       *   - `maxRoundDuration`: safety net, not consensus logic
       *   - `declarationRangeLimit`, `eventCutter`: event filtering, not consensus decisions
       *

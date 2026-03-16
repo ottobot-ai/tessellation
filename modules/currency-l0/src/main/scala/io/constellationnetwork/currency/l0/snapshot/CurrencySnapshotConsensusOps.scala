@@ -45,5 +45,13 @@ object CurrencySnapshotConsensusOps {
       case _: CollectingProposals => true
       case _                      => false
     }
+
+    override def phaseIndex(status: CurrencySnapshotStatus): Int = status match {
+      case _: CollectingFacilities       => 0
+      case _: CollectingProposals        => 1
+      case _: CollectingSignatures       => 2
+      case _: CollectingBinarySignatures => 3
+      case _: Finished                   => 4
+    }
   }
 }

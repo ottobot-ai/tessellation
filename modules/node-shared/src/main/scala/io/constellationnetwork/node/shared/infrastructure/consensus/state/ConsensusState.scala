@@ -126,6 +126,11 @@ trait ConsensusOps[S, Kind] {
   def kindGetter: Kind => PeerDeclarations => Option[PeerDeclaration]
   def isFinished(status: S): Boolean
   def isProposalPhase(status: S): Boolean
+
+  /** Phase index for adaptive timeout multipliers. 0 = CollectingFacilities, 1 = CollectingProposals, 2 = CollectingSignatures, 3 =
+    * CollectingBinarySignatures (currency only), higher = Finished.
+    */
+  def phaseIndex(status: S): Int
 }
 
 @derive(eqv)
