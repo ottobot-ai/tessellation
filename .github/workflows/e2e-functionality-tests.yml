@@ -1,7 +1,9 @@
 name: E2E Functionality Tests
 
 on:
-  pull_request: {}
+  pull_request:
+    branches-ignore:
+      - release/testnet
 
 jobs:
   calculate-version:
