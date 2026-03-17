@@ -145,7 +145,7 @@ else
     --subnet=${NET_PREFIX}.0/24 \
     tessellation_common
 
-  # Phase 1: Setup compose files and start GL0 nodes
+  # Phase 1: Setup compose files and start GL0 genesis node first
   for i in $(seq 0 $((MAX_NODES - 1))); do
     cd ./nodes/$i/
 
@@ -161,14 +161,48 @@ else
     cp ../../docker/docker-compose.metagraph-test.yaml . ;
     cp ../../docker/docker-compose.metagraph-genesis.yaml . ;
 
-    if [ "$i" -lt "$NUM_GL0_NODES" ]; then
-      docker compose -f docker-compose.test.yaml \
+    cd ../../
+  done
+
+  # Start genesis GL0 node (node 0) first and wait for it to produce snapshots.
+  # Validators need downloadable snapshots to transition from Observing → Ready.
+  # Without this, they retry snapshot downloads for minutes before catching up.
+  if [ "$NUM_GL0_NODES" -gt 0 ]; then
+    echo "Starting GL0 genesis node (gl0-0)..."
+    cd ./nodes/0/
+    docker compose -f docker-compose.test.yaml \
       -f docker-compose.yaml \
       -f docker-compose.volumes.yaml \
       --profile l0 \
       up -d
-    fi
+    cd ../../
 
+    GL0_GENESIS_MIN_ORDINAL=${GL0_GENESIS_MIN_ORDINAL:-8}
+    gl0_url="${TEST_HOST:-http://localhost}:${DAG_L0_PORT_PREFIX}00"
+    echo "Waiting for gl0-0 to reach ordinal $GL0_GENESIS_MIN_ORDINAL before starting validators..."
+    for attempt in $(seq 1 120); do
+      ordinal=$(curl -s "${gl0_url}/global-snapshots/latest" 2>/dev/null | jq -r '.value.ordinal // empty' 2>/dev/null || echo "")
+      if [ -n "$ordinal" ] && [ "$ordinal" -ge "$GL0_GENESIS_MIN_ORDINAL" ]; then
+        echo "GL0 genesis reached ordinal $ordinal — starting validators"
+        break
+      fi
+      if [ "$attempt" -eq 120 ]; then
+        echo "ERROR: GL0 genesis did not reach ordinal $GL0_GENESIS_MIN_ORDINAL within 600s"
+        docker logs gl0-0 || true
+        exit 1
+      fi
+      sleep 5
+    done
+  fi
+
+  # Start remaining GL0 validator nodes
+  for i in $(seq 1 $((NUM_GL0_NODES - 1))); do
+    cd ./nodes/$i/
+    docker compose -f docker-compose.test.yaml \
+      -f docker-compose.yaml \
+      -f docker-compose.volumes.yaml \
+      --profile l0 \
+      up -d
     cd ../../
   done
 
