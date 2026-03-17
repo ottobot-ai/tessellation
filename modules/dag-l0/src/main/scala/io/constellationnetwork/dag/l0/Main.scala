@@ -21,10 +21,12 @@ import io.constellationnetwork.node.shared.ext.pureconfig._
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.EventTrigger
 import io.constellationnetwork.node.shared.infrastructure.genesis.{GenesisFS => GenesisLoader}
+import io.constellationnetwork.node.shared.infrastructure.gossip.event._
 import io.constellationnetwork.node.shared.infrastructure.gossip.{GossipDaemon, RumorHandlers}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.GlobalSnapshotLocalFileSystemStorage
 import io.constellationnetwork.node.shared.resources.MkHttpServer
 import io.constellationnetwork.node.shared.resources.MkHttpServer.ServerName
+import io.constellationnetwork.node.shared.snapshot.global.GlobalSnapshotEvent
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.cluster.ClusterId
@@ -126,8 +128,39 @@ object Main
         .handlers <+>
         trustHandler(storages.trust) <+> ordinalTrustHandler(storages.trust) <+> services.consensus.handler
 
+      daemonWithRecovery <- {
+        val getLocalChainTip = sharedStorages.lastGlobalSnapshot.getCombined.map(
+          _.map { case (hashed, _) => ChainTip(hashed.ordinal, hashed.hash) }
+        )
+        val getLocalOrdinal = sharedStorages.lastGlobalSnapshot.getOrdinal
+
+        val onForkDetected = { (info: ForkRecoveryInfo) =>
+          logger.warn(
+            s"Fork divergence detected: local=${info.localOrdinal.value.value} " +
+              s"majority=${info.majorityOrdinal.value.value} lag=${info.lag} " +
+              s"majorityPeers=${info.majorityPeers.size}"
+          ) >>
+            services.recoveryPeerHint.setPreferredPeers(info.majorityPeers) >>
+            storages.node.tryModifyState(NodeState.Ready, NodeState.WaitingForDownload)
+        }
+
+        EventGossipDaemon
+          .make[IO, GlobalSnapshotEvent, GlobalStateKey](
+            services.eventMempool,
+            storages.cluster,
+            sharedResources.client,
+            sharedServices.session,
+            getLocalChainTip = Some(getLocalChainTip),
+            getLocalOrdinal = Some(getLocalOrdinal),
+            onForkDetected = Some(onForkDetected)
+          )
+          .asResource
+      }
+
+      eventGossipDaemon = daemonWithRecovery.daemon
+
       _ <- Daemons
-        .start(storages, services, programs, queues, nodeId, cfg, hasherSelector)
+        .start(storages, services, programs, queues, nodeId, cfg, hasherSelector, eventGossipDaemon)
         .asResource
 
       api <- Resource.eval(
@@ -170,6 +203,7 @@ object Main
       _ <- (method match {
         case m: RunValidator =>
           gossipDaemon.startAsRegularValidator >>
+            eventGossipDaemon.start >>
             storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin) >>
             services.restart.setNodeForkedRestartMethod(
               RunValidatorWithJoinAttempt(
@@ -189,6 +223,7 @@ object Main
             )
         case m: RunValidatorWithJoinAttempt =>
           gossipDaemon.startAsRegularValidator >>
+            eventGossipDaemon.start >>
             storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin) >>
             programs.joining.joinOneOf(m.peerToJoinPool) >>
             services.restart.setClusterLeaveRestartMethod(
@@ -250,6 +285,7 @@ object Main
               .hasCollateral(nodeShared.nodeId)
               .flatMap(OwnCollateralNotSatisfied.raiseError[IO, Unit].unlessA) >>
             gossipDaemon.startAsInitialValidator >>
+            eventGossipDaemon.start >>
             services.cluster.createSession >>
             services.session.createSession >>
             storages.node.setNodeState(NodeState.Ready) >>
@@ -359,6 +395,7 @@ object Main
             }
           } >>
             gossipDaemon.startAsInitialValidator >>
+            eventGossipDaemon.start >>
             services.cluster.createSession >>
             services.session.createSession >>
             storages.node.setNodeState(NodeState.Ready) >>

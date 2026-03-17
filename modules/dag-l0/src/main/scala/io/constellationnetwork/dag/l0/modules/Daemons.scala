@@ -12,6 +12,7 @@ import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.domain.Daemon
 import io.constellationnetwork.node.shared.infrastructure.cluster.daemon.NodeStateDaemon
 import io.constellationnetwork.node.shared.infrastructure.collateral.daemon.CollateralDaemon
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.EventGossipDaemon
 import io.constellationnetwork.node.shared.infrastructure.snapshot.daemon.{DownloadDaemon, SelectablePeerDiscoveryDelay}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.HasherSelector
@@ -25,7 +26,8 @@ object Daemons {
     queues: Queues[F],
     nodeId: PeerId,
     cfg: AppConfig,
-    hasherSelector: HasherSelector[F]
+    hasherSelector: HasherSelector[F],
+    eventGossipDaemon: EventGossipDaemon[F, _, _]
   ): F[Unit] = {
     val pddCfg = cfg.peerDiscovery.delay
     val peerDiscoveryDelay = SelectablePeerDiscoveryDelay.make(

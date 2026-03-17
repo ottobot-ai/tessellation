@@ -30,12 +30,16 @@ import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.domain.snapshot.services.AddressService
 import io.constellationnetwork.node.shared.infrastructure.collateral.MptStoreCollateral
 import io.constellationnetwork.node.shared.infrastructure.delegatedStake.{RewardsInfoCalculator, RewardsInfoStorage}
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.RecoveryPeerHint
+import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
 import io.constellationnetwork.node.shared.infrastructure.snapshot.services.AddressService
 import io.constellationnetwork.node.shared.logger.LoggerBundle
 import io.constellationnetwork.node.shared.modules.{SharedServices, SharedStorages, SharedValidators}
+import io.constellationnetwork.node.shared.snapshot.global.GlobalSnapshotEvent
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, GlobalStateProofSelector}
 import io.constellationnetwork.security.{Hasher, HasherSelector, SecurityProvider}
@@ -147,6 +151,15 @@ object Services {
         )
       getOrdinal = storages.globalSnapshot.headSnapshot.map(_.map(_.ordinal))
       trustUpdaterService = TrustStorageUpdater.make(getOrdinal, sharedServices.gossip, storages.trust)
+      recoveryPeerHintService <- RecoveryPeerHint.make[F]
+      eventMempoolService <- HasherSelector[F].withCurrent { implicit hasher =>
+        io.constellationnetwork.dag.l0.infrastructure.mempool.GlobalEventMempool.make[F](
+          io.constellationnetwork.node.shared.infrastructure.mempool.MempoolConfig(
+            maxSize = 10000,
+            maxEventAge = scala.concurrent.duration.FiniteDuration(5, "minutes")
+          )
+        )
+      }
     } yield
       new Services[F, R](
         localHealthcheck = sharedServices.localHealthcheck,
@@ -159,7 +172,9 @@ object Services {
         stateChannel = stateChannelService,
         trustStorageUpdater = trustUpdaterService,
         restart = sharedServices.restart,
-        rewards = rewardsService
+        rewards = rewardsService,
+        recoveryPeerHint = recoveryPeerHintService,
+        eventMempool = eventMempoolService
       ) {}
 }
 
@@ -174,5 +189,7 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   val stateChannel: StateChannelService[F],
   val trustStorageUpdater: TrustStorageUpdater[F],
   val restart: RestartService[F, R],
-  val rewards: RewardsService[F]
+  val rewards: RewardsService[F],
+  val recoveryPeerHint: RecoveryPeerHint[F],
+  val eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey]
 )
