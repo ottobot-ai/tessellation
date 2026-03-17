@@ -36,11 +36,11 @@ object ForkRecoveryDetectorSuite extends SimpleIOSuite {
       detector = ForkRecoveryDetector.make[IO](mesh, ordinal(10).some.pure[IO], forkLagThreshold = 5)
       result <- detector.detectForkDivergence
     } yield
-      expect(result.isDefined, "Should detect fork divergence") and
-        expect(result.get.majorityOrdinal == ordinal(20), "Majority ordinal should be 20") and
-        expect(result.get.majorityHash == majorityHash, "Majority hash should match") and
-        expect(result.get.lag == 10L, s"Lag should be 10, got ${result.get.lag}") and
-        expect(result.get.majorityPeers.size == 5, s"Should have 5 majority peers, got ${result.get.majorityPeers.size}")
+      expect(result.isDefined, "Should detect fork divergence")
+        .and(expect(result.get.majorityOrdinal == ordinal(20), "Majority ordinal should be 20"))
+        .and(expect(result.get.majorityHash == majorityHash, "Majority hash should match"))
+        .and(expect(result.get.lag == 10L, s"Lag should be 10, got ${result.get.lag}"))
+        .and(expect(result.get.majorityPeers.size == 5, s"Should have 5 majority peers, got ${result.get.majorityPeers.size}"))
   }
 
   test("does not detect fork when lag is below threshold") {
@@ -105,8 +105,6 @@ object ForkRecoveryDetectorSuite extends SimpleIOSuite {
       detector = ForkRecoveryDetector.make[IO](mesh, ordinal(10).some.pure[IO], forkLagThreshold = 5)
       result <- detector.detectForkDivergence
       expectedPeers = (1 to 4).map(makePeerId).toSet
-    } yield
-      expect(result.isDefined) and
-        expect(result.get.majorityPeers == expectedPeers, "Majority should be peers 1-4")
+    } yield expect(result.isDefined).and(expect(result.get.majorityPeers == expectedPeers, "Majority should be peers 1-4"))
   }
 }
