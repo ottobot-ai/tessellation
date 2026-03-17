@@ -107,32 +107,44 @@ private[event] trait SeenHashCache[F[_]] {
 
 private[event] object SeenHashCache {
 
+  /** Create a SeenHashCache backed by a Map + insertion-order Vector for O(1) FIFO eviction.
+    *
+    * When at capacity, the oldest 25% of entries are dropped in O(k) time (k = entries to remove)
+    * rather than O(n log n) from sorting the entire map. TTL-expired entries are also pruned lazily.
+    */
   def make[F[_]: Async](maxSize: Int, ttlMs: Long): F[SeenHashCache[F]] =
-    Ref.of[F, Map[Hash, Long]](Map.empty).map { ref =>
+    Ref.of[F, (Map[Hash, Long], Vector[Hash])]((Map.empty, Vector.empty)).map { ref =>
       new SeenHashCache[F] {
 
         override def hasSeen(hash: Hash): F[Boolean] =
           for {
             nowMs <- Clock[F].realTime.map(_.toMillis)
-            seen <- ref.get
-          } yield seen.get(hash).exists(ts => (nowMs - ts) < ttlMs)
+            state <- ref.get
+          } yield state._1.get(hash).exists(ts => (nowMs - ts) < ttlMs)
 
         override def markSeen(hash: Hash): F[Unit] =
           for {
             nowMs <- Clock[F].realTime.map(_.toMillis)
-            _ <- ref.update { current =>
-              val pruned = current.filter { case (_, ts) => (nowMs - ts) < ttlMs }
-              val evicted = if (pruned.size >= maxSize) {
-                val toRemove = pruned.size / 4
-                pruned.toList.sortBy(_._2).drop(toRemove).toMap
-              } else pruned
-              evicted + (hash -> nowMs)
+            _ <- ref.update { case (map, order) =>
+              if (map.contains(hash)) {
+                // Already tracked, just update timestamp
+                (map + (hash -> nowMs), order)
+              } else {
+                // FIFO eviction: drop oldest 25% when at capacity
+                val (evictedMap, evictedOrder) = if (map.size >= maxSize) {
+                  val toRemove = map.size / 4
+                  val (dropped, kept) = order.splitAt(toRemove)
+                  val newMap = dropped.foldLeft(map)(_ - _)
+                  (newMap, kept)
+                } else (map, order)
+                (evictedMap + (hash -> nowMs), evictedOrder :+ hash)
+              }
             }
           } yield ()
 
-        override def size: F[Int] = ref.get.map(_.size)
+        override def size: F[Int] = ref.get.map(_._1.size)
 
-        override def keySet: F[Set[Hash]] = ref.get.map(_.keySet)
+        override def keySet: F[Set[Hash]] = ref.get.map(_._1.keySet)
       }
     }
 }

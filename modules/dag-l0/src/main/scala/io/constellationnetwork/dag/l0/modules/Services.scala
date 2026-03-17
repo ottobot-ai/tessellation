@@ -154,10 +154,7 @@ object Services {
       recoveryPeerHintService <- RecoveryPeerHint.make[F]
       eventMempoolService <- HasherSelector[F].withCurrent { implicit hasher =>
         io.constellationnetwork.dag.l0.infrastructure.mempool.GlobalEventMempool.make[F](
-          io.constellationnetwork.node.shared.infrastructure.mempool.MempoolConfig(
-            maxSize = 10000,
-            maxEventAge = scala.concurrent.duration.FiniteDuration(5, "minutes")
-          )
+          io.constellationnetwork.dag.l0.infrastructure.mempool.GlobalEventMempool.defaultConfig
         )
       }
     } yield

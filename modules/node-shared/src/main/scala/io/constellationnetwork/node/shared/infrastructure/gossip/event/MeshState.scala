@@ -166,18 +166,20 @@ object MeshState {
     scoreDecay: Double = 0.9, // Score decay factor per heartbeat
     staleThresholdMs: Long = 60000, // 60 seconds stale threshold
     rotationEnabled: Boolean = true, // Enable periodic mesh rotation for diversity
-    rotationThreshold: Double = 5.0 // Score margin required to justify rotation
+    rotationThreshold: Double = 5.0, // Score margin required to justify rotation
+    rotationCooldownMs: Long = 30000 // Minimum time between rotations (30s) to prevent oscillation
   )
 
   /** Create a new MeshState.
     */
   def make[F[_]: Async](config: MeshConfig): F[MeshState[F]] =
-    Ref.of[F, Map[PeerId, PeerGossipState]](Map.empty).map { stateRef =>
-      new MeshStateImpl[F](stateRef, config)
+    (Ref.of[F, Map[PeerId, PeerGossipState]](Map.empty), Ref.of[F, Long](0L)).mapN { (stateRef, lastRotationRef) =>
+      new MeshStateImpl[F](stateRef, lastRotationRef, config)
     }
 
   private class MeshStateImpl[F[_]: Async](
     stateRef: Ref[F, Map[PeerId, PeerGossipState]],
+    lastRotationRef: Ref[F, Long],
     config: MeshConfig
   ) extends MeshState[F] {
 
@@ -244,8 +246,11 @@ object MeshState {
       }
 
     override def heartbeat(availablePeers: Set[PeerId]): F[MeshHeartbeatResult] =
-      nowMs.flatMap { now =>
-        stateRef.modify { state =>
+      for {
+        now <- nowMs
+        lastRotation <- lastRotationRef.get
+        rotationAllowed = config.rotationEnabled && (now - lastRotation >= config.rotationCooldownMs)
+        result <- stateRef.modify { state =>
           // 1. Apply score decay
           val decayed = state.map { case (id, ps) => id -> ps.decayScore(config.scoreDecay) }
 
@@ -314,9 +319,10 @@ object MeshState {
 
           // 7. Rotation for diversity: if mesh is full and a non-mesh peer has significantly better score,
           //    swap out the lowest-scoring mesh peer. This prevents mesh stagnation in stable networks.
-          val (finalState, rotatedOut, rotatedIn) = {
+          //    A cooldown prevents oscillation in high-churn environments.
+          val (finalState, rotatedOut, rotatedIn, didRotate) = {
             val currentMeshSize = afterMaxPrune.count(_._2.inMesh)
-            if (config.rotationEnabled && currentMeshSize >= config.targetMeshSize) {
+            if (rotationAllowed && currentMeshSize >= config.targetMeshSize) {
               val meshPeers = afterMaxPrune.filter(_._2.inMesh).toList.sortBy(_._2.score)
               val nonMeshCandidates = availablePeers
                 .diff(afterMaxPrune.filter(_._2.inMesh).keySet)
@@ -331,12 +337,12 @@ object MeshState {
                   val rotated = afterMaxPrune
                     .updated(lowestId, lowestState.copy(inMesh = false))
                     .updated(candidateId, candidateState.copy(inMesh = true))
-                  (rotated, Some(lowestId), Some(candidateId))
+                  (rotated, Some(lowestId), Some(candidateId), true)
                 case _ =>
-                  (afterMaxPrune, None, None)
+                  (afterMaxPrune, None, None, false)
               }
             } else {
-              (afterMaxPrune, None, None)
+              (afterMaxPrune, None, None, false)
             }
           }
 
@@ -346,9 +352,10 @@ object MeshState {
             meshSize = finalState.count(_._2.inMesh)
           )
 
-          (finalState, result)
+          (finalState, (result, didRotate))
         }
-      }
+        _ <- if (result._2) lastRotationRef.set(now) else Async[F].unit
+      } yield result._1
 
     override def meshSize: F[Int] =
       stateRef.get.map(_.count(_._2.inMesh))
