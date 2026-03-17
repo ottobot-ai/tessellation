@@ -17,6 +17,8 @@ import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.config.types.{HttpConfig, RouteRateLimiterConfig, SharedConfig}
 import io.constellationnetwork.node.shared.http.p2p.middlewares.{MetricsMiddleware, PeerAuthMiddleware, `X-Id-Middleware`}
 import io.constellationnetwork.node.shared.http.routes._
+import io.constellationnetwork.node.shared.snapshot.global.GlobalSnapshotEvent
+import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.CombinedSnapshotCheckpointFileSystemStorage
 import io.constellationnetwork.node.shared.modules.SharedValidators
@@ -151,6 +153,9 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
 
   private val registrationRoutes = RegistrationRoutes[F](services.cluster)
   private val gossipRoutes = GossipRoutes[F](storages.rumor, services.gossip, sharedConfig.gossip.timeouts)
+  private val eventGossipRoutes = EventGossipRoutes.make[F, GlobalSnapshotEvent, GlobalStateKey](
+    services.eventMempool
+  )
   private val trustRoutes = TrustRoutes[F](storages.trust, programs.trustPush)
   private val stateChannelRoutes =
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -257,6 +262,7 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
                 clusterRoutes.p2pRoutes <+>
                   nodeRoutes.p2pRoutes <+>
                   gossipRoutes.p2pRoutes <+>
+                  eventGossipRoutes.p2pRoutes <+>
                   trustRoutes.p2pRoutes <+>
                   snapshotRoutes.p2pRoutes <+>
                   consensusRoutes
