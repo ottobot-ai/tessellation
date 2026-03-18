@@ -148,6 +148,7 @@ object Main
           .make[IO, GlobalSnapshotEvent, GlobalStateKey](
             services.eventMempool,
             storages.cluster,
+            storages.node,
             sharedResources.client,
             sharedServices.session,
             getLocalChainTip = Some(getLocalChainTip),
@@ -203,7 +204,6 @@ object Main
       _ <- (method match {
         case m: RunValidator =>
           gossipDaemon.startAsRegularValidator >>
-            eventGossipDaemon.start >>
             storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin) >>
             services.restart.setNodeForkedRestartMethod(
               RunValidatorWithJoinAttempt(
@@ -223,7 +223,6 @@ object Main
             )
         case m: RunValidatorWithJoinAttempt =>
           gossipDaemon.startAsRegularValidator >>
-            eventGossipDaemon.start >>
             storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin) >>
             programs.joining.joinOneOf(m.peerToJoinPool) >>
             services.restart.setClusterLeaveRestartMethod(
@@ -285,7 +284,6 @@ object Main
               .hasCollateral(nodeShared.nodeId)
               .flatMap(OwnCollateralNotSatisfied.raiseError[IO, Unit].unlessA) >>
             gossipDaemon.startAsInitialValidator >>
-            eventGossipDaemon.start >>
             services.cluster.createSession >>
             services.session.createSession >>
             storages.node.setNodeState(NodeState.Ready) >>
@@ -395,7 +393,6 @@ object Main
             }
           } >>
             gossipDaemon.startAsInitialValidator >>
-            eventGossipDaemon.start >>
             services.cluster.createSession >>
             services.session.createSession >>
             storages.node.setNodeState(NodeState.Ready) >>

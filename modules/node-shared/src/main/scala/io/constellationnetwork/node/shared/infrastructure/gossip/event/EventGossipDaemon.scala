@@ -9,6 +9,7 @@ import scala.concurrent.duration._
 
 import io.constellationnetwork.node.shared.domain.cluster.services.Session
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
+import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.infrastructure.mempool.{EventMempool, MempoolRejectionReason}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.node.NodeState
@@ -369,6 +370,7 @@ object EventGossipDaemon {
   def make[F[_]: Async: Parallel: SecurityProvider, Event: Encoder: Decoder, Key](
     mempool: EventMempool[F, Event, Key],
     clusterStorage: ClusterStorage[F],
+    nodeStorage: NodeStorage[F],
     client: Client[F],
     session: Session[F],
     config: EventGossipConfig = EventGossipConfig(),
@@ -414,7 +416,8 @@ object EventGossipDaemon {
           graftSyncer,
           getGossipEligiblePeers,
           maybeForkDetector,
-          onForkDetected
+          onForkDetected,
+          nodeStorage
         ),
         maybeForkDetector
       )
@@ -433,17 +436,36 @@ private class EventGossipDaemonImpl[F[_]: Async: Parallel, Event, Key](
   graftSyncer: GraftSyncer[F, Event, Key],
   getGossipEligiblePeers: F[Set[Peer]],
   maybeForkRecoveryDetector: Option[ForkRecoveryDetector[F]],
-  onForkDetected: Option[ForkRecoveryInfo => F[Unit]]
+  onForkDetected: Option[ForkRecoveryInfo => F[Unit]],
+  nodeStorage: NodeStorage[F]
 )(implicit S: Supervisor[F])
     extends EventGossipDaemon[F, Event, Key] {
 
   private val logger = Slf4jLogger.getLogger[F]
 
+  /** Start the daemon. Waits for the node to reach Ready state before
+    * beginning heartbeat and pull loops. This prevents the gossip daemon
+    * from generating P2P traffic during snapshot download and chain building,
+    * which would compete with consensus HTTP calls on the shared client pool.
+    *
+    * The daemon can still receive events via routes (receiveEvent) before
+    * Ready — those are buffered in the incoming queue.
+    *
+    * This method blocks until Ready, then spawns the loops. It should be
+    * called within a Supervisor (e.g. via Daemon.spawn) so the wait doesn't
+    * block node startup.
+    */
   override def start: F[Unit] =
-    running.set(true) >>
+    logger.info("EventGossipDaemon waiting for node to reach Ready state...") >>
+      nodeStorage.nodeStates
+        .filter(_ === NodeState.Ready)
+        .head
+        .compile
+        .drain >>
+      running.set(true) >>
       startHeartbeatLoop >>
       startPullLoop >>
-      logger.info("EventGossipDaemon started")
+      logger.info("EventGossipDaemon started (node is Ready)")
 
   override def stop: F[Unit] =
     running.set(false) >>

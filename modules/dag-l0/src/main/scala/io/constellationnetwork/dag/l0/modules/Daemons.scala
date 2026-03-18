@@ -56,7 +56,8 @@ object Daemons {
           services.consensus.storage
         ),
       CollateralDaemon.make(services.collateral, storages.globalSnapshot, storages.cluster),
-      TrustStorageUpdater.daemon(services.trustStorageUpdater)
+      TrustStorageUpdater.daemon(services.trustStorageUpdater),
+      Daemon.spawn(eventGossipDaemon.start)
     ).traverse(_.start).void
   }
 
