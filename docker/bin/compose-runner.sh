@@ -174,10 +174,18 @@ else
   #                              metagraph tests because all nodes receive state
   #                              channel snapshots at the same time, avoiding
   #                              non-deterministic divergence.
-  GL0_STAGED_STARTUP=${GL0_STAGED_STARTUP:-false}
+  # Staged GL0 startup: genesis starts first, produces snapshots, then
+  # validators join. This prevents validators from getting stuck in Observing
+  # because they need downloadable snapshots to transition to Ready.
+  #
+  # GL0_GENESIS_MIN_ORDINAL controls how many ordinals genesis produces before
+  # validators start. Default is 2 (just enough for validators to download).
+  # Fork-recovery tests use 8 for a larger gap.
+  GL0_GENESIS_MIN_ORDINAL=${GL0_GENESIS_MIN_ORDINAL:-2}
+  GL0_GENESIS_WAIT_ATTEMPTS=${GL0_GENESIS_WAIT_ATTEMPTS:-120}
 
-  if [ "$GL0_STAGED_STARTUP" = "true" ] && [ "$NUM_GL0_NODES" -gt 0 ]; then
-    echo "Starting GL0 genesis node (gl0-0) with staged startup..."
+  if [ "$NUM_GL0_NODES" -gt 0 ]; then
+    echo "Starting GL0 genesis node (gl0-0)..."
     cd ./nodes/0/
     docker compose -f docker-compose.test.yaml \
       -f docker-compose.yaml \
@@ -186,8 +194,6 @@ else
       up -d
     cd ../../
 
-    GL0_GENESIS_MIN_ORDINAL=${GL0_GENESIS_MIN_ORDINAL:-8}
-    GL0_GENESIS_WAIT_ATTEMPTS=${GL0_GENESIS_WAIT_ATTEMPTS:-120}
     gl0_url="${TEST_HOST:-http://localhost}:${DAG_L0_PORT_PREFIX}00"
     wait_timeout=$((GL0_GENESIS_WAIT_ATTEMPTS * 5))
     echo "Waiting for gl0-0 to reach ordinal $GL0_GENESIS_MIN_ORDINAL before starting validators (timeout: ${wait_timeout}s)..."
@@ -207,17 +213,6 @@ else
 
     # Start remaining GL0 validator nodes
     for i in $(seq 1 $((NUM_GL0_NODES - 1))); do
-      cd ./nodes/$i/
-      docker compose -f docker-compose.test.yaml \
-        -f docker-compose.yaml \
-        -f docker-compose.volumes.yaml \
-        --profile l0 \
-        up -d
-      cd ../../
-    done
-  else
-    # Start all GL0 nodes together (default)
-    for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
       cd ./nodes/$i/
       docker compose -f docker-compose.test.yaml \
         -f docker-compose.yaml \

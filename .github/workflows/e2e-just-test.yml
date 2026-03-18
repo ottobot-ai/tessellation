@@ -78,7 +78,7 @@ jobs:
           - { name: dag-cluster,            tests: "dag-cluster" }
           - { name: delegated-staking,      tests: "delegated-staking" }
           - { name: token-lock-replacement, tests: "token-lock-replacement" }
-          - { name: fork-recovery,          tests: "fork-recovery", num-gl0: "4", staged-startup: "true" }
+          - { name: fork-recovery,          tests: "fork-recovery", num-gl0: "4", genesis-min-ordinal: "8" }
           - { name: currency,               tests: "currency" }
           - { name: rewards,                tests: "rewards" }
           - { name: token-locks,            tests: "token-locks" }
@@ -143,8 +143,8 @@ jobs:
           if [ -n "${{ matrix.test-group.num-gl0 }}" ]; then
             EXTRA_ARGS="--num-gl0=${{ matrix.test-group.num-gl0 }}"
           fi
-          if [ "${{ matrix.test-group.staged-startup }}" = "true" ]; then
-            export GL0_STAGED_STARTUP=true
+          if [ -n "${{ matrix.test-group.genesis-min-ordinal }}" ]; then
+            export GL0_GENESIS_MIN_ORDINAL=${{ matrix.test-group.genesis-min-ordinal }}
           fi
           just test --skip-assembly --test=${{ matrix.test-group.tests }} $EXTRA_ARGS
 
