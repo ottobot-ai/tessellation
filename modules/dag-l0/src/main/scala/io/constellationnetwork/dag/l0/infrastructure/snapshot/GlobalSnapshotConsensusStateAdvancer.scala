@@ -28,6 +28,8 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.state.Consen
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger, TimeTrigger}
 import io.constellationnetwork.node.shared.infrastructure.fork.ExitOnFork
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.{EventGossipClient, IWantRequest}
+import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
 import io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalArtifactMismatch
@@ -36,7 +38,7 @@ import io.constellationnetwork.node.shared.logger.LoggerBundle
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.gossip.Ordinal
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, MptStoreSavepoint}
-import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.schema.peer.{Peer, PeerId}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
@@ -115,6 +117,8 @@ object GlobalSnapshotConsensusStateAdvancer {
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     clusterStorageInstance: ClusterStorage[F],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
+    eventGossipClient: EventGossipClient[F, GlobalSnapshotEvent],
     loggerBundle: LoggerBundle[F],
     mptStore: MptStore[F, GlobalStateKey]
   ): GlobalSnapshotConsensusStateAdvancer[F] = new GlobalSnapshotConsensusStateAdvancer[F] {
@@ -314,29 +318,95 @@ object GlobalSnapshotConsensusStateAdvancer {
       state: GlobalSnapshotConsensusState,
       facilities: SortedMap[PeerId, Facility]
     ): F[Option[Transition]] = {
-      val (bound, candidates, triggers) = facilities.foldMap(f => (f.upperBound, f.candidates.value, f.trigger.toList))
+      val (candidates, triggers) = facilities.foldMap(f => (f.candidates.value, f.trigger.toList))
+
+      // Compute hash UNION - include events ANY facilitator has, then sync missing
+      val allHashSets = facilities.values.map(_.eventHashes).toList
+      val unionHashes = allHashSets.reduceOption(_ union _).getOrElse(Set.empty[Hash])
 
       val trigger = pickMajority(triggers).getOrElse(EventTrigger)
-      buildProposalTransition(state, bound, candidates, trigger).map(_.some)
+
+      // Build map of hash -> peer who has it (for fetching missing events)
+      val hashToPeer: Map[Hash, PeerId] = facilities.toList.flatMap {
+        case (peerId, facility) => facility.eventHashes.map(_ -> peerId)
+      }.toMap
+
+      for {
+        // Get local hashes and identify what we're missing
+        localHashes <- eventMempool.getEventHashes
+        missingHashes = unionHashes -- localHashes
+
+        _ <- logger.debug(
+          s"[HashUnion] Ordinal=${state.key.value} facilitators=${facilities.size} " +
+            s"unionHashes=${unionHashes.size} localHashes=${localHashes.size} missing=${missingHashes.size}"
+        )
+
+        // Sync missing events from peers before building proposal
+        _ <- syncMissingEvents(missingHashes, hashToPeer).whenA(missingHashes.nonEmpty)
+
+        result <- buildProposalTransition(state, unionHashes, candidates, trigger)
+      } yield result.some
     }
+
+    /** Sync missing events from peers who have them. */
+    private def syncMissingEvents(
+      missingHashes: Set[Hash],
+      hashToPeer: Map[Hash, PeerId]
+    ): F[Unit] = {
+      val hashesPerPeer: Map[PeerId, Set[Hash]] = missingHashes
+        .flatMap(h => hashToPeer.get(h).map(peerId => (peerId, h)))
+        .groupMap(_._1)(_._2)
+
+      for {
+        _ <- logger.info(s"[EventSync] Syncing ${missingHashes.size} missing events from ${hashesPerPeer.size} peers")
+        _ <- hashesPerPeer.toList.traverse_ {
+          case (peerId, hashes) =>
+            fetchEventsFromPeer(peerId, hashes)
+        }
+        _ <- logger.debug(s"[EventSync] Sync complete")
+      } yield ()
+    }
+
+    /** Fetch specific events from a peer using IWANT and add to local mempool. */
+    private def fetchEventsFromPeer(peerId: PeerId, hashes: Set[Hash]): F[Unit] =
+      for {
+        maybePeer <- clusterStorage.getPeer(peerId)
+        _ <- maybePeer.traverse_ { peer =>
+          eventGossipClient
+            .requestEvents(IWantRequest(hashes))
+            .run(Peer.toP2PContext(peer))
+            .flatMap { response =>
+              response.events.traverse_ {
+                case (_, signedEvent) =>
+                  eventMempool.add(signedEvent).void
+              }
+            }
+            .handleErrorWith { err =>
+              logger.warn(s"[EventSync] Failed to fetch events from peer ${peerId.show.take(8)}: ${err.getMessage}")
+            }
+        }
+      } yield ()
 
     private def buildProposalTransition(
       state: GlobalSnapshotConsensusState,
-      bound: Bound,
+      commonHashes: Set[Hash],
       candidates: Set[PeerId],
       majorityTrigger: ConsensusTrigger
     ): F[Transition] =
       for {
         _ <- clearTimeTriggerIfNeeded(majorityTrigger)
         facilitatorsHash <- hashFacilitators(state)
-        peerEvents <- consensusStorage.pullEvents(bound)
+
+        // Pull events from mempool using hash union
+        mempoolData <- eventMempool.getMultiple(commonHashes).map { hashToHashed =>
+          val events = hashToHashed.values.map(_.signed.value).toSet
+          val hashToEvent = hashToHashed.map { case (h, hashed) => h -> hashed.signed.value }
+          (events, hashToEvent)
+        }
+        (mempoolEvents, mempoolHashToEvent) = mempoolData
 
         // Restore any previous savepoint from an abandoned round at the SAME ordinal,
         // ensuring MptStore is in a clean pre-mutation state before createArtifact().
-        // CRITICAL: Only restore if the savepoint was taken for this exact key. After a recovery
-        // download, the MptStore has been completely replaced with fresh state — restoring a stale
-        // savepoint from a different ordinal would revert the MptStore to pre-download state,
-        // corrupting all subsequent rounds.
         previousSp <- proposalSavepointRef.getAndSet(none)
         _ <- previousSp.traverse_ {
           case (spKey, sp) =>
@@ -354,14 +424,20 @@ object GlobalSnapshotConsensusStateAdvancer {
                 "currentKey" -> state.key.show
               )
         }
-        // Take a fresh savepoint before mutations. If this round is abandoned and retried,
-        // the next buildProposalTransition will restore this savepoint.
+        // Take a fresh savepoint before mutations
         sp <- mptStore.savepoint
         _ <- proposalSavepointRef.set((state.key, sp).some)
 
-        (artifact, context, returnedEvents) <- createArtifact(state, majorityTrigger, extractEvents(peerEvents))
+        (artifact, context, returnedEvents) <- createArtifact(state, majorityTrigger, mempoolEvents)
 
-        _ <- storeReturnedEvents(peerEvents, returnedEvents)
+        // Clear included events from mempool
+        includedHashes = {
+          val returnedSet = returnedEvents.toSet
+          mempoolHashToEvent.collect {
+            case (hash, event) if !returnedSet.contains(event) => hash
+          }.toSet
+        }
+        _ <- eventMempool.clearIncluded(includedHashes)
         hash <- hashArtifact(artifact)
         _ <- checkFollowerExit(state)
         isLeader = selfId === state.leader
@@ -962,9 +1038,6 @@ object GlobalSnapshotConsensusStateAdvancer {
     private def hashArtifact(artifact: GlobalSnapshotArtifact): F[Hash] =
       HasherSelector[F].withCurrent(implicit h => artifact.hash)
 
-    private def extractEvents(peerEvents: Map[PeerId, List[(Ordinal, GlobalSnapshotEvent)]]): Set[GlobalSnapshotEvent] =
-      peerEvents.values.flatten.map(_._2).toSet
-
     private def createArtifact(
       state: GlobalSnapshotConsensusState,
       trigger: ConsensusTrigger,
@@ -985,15 +1058,6 @@ object GlobalSnapshotConsensusStateAdvancer {
           )
         }
       }
-
-    private def storeReturnedEvents(
-      peerEvents: Map[PeerId, List[(Ordinal, GlobalSnapshotEvent)]],
-      returnedEvents: Set[GlobalSnapshotEvent]
-    ): F[Unit] = {
-      val filtered = peerEvents.map { case (pid, evts) => (pid, evts.filter { case (_, e) => returnedEvents.contains(e) }) }
-        .filter(_._2.nonEmpty)
-      consensusStorage.addEvents(filtered)
-    }
 
     private val selfId: PeerId = PeerId.fromPublic(keyPair.getPublic)
 
@@ -1060,17 +1124,12 @@ object GlobalSnapshotConsensusStateAdvancer {
         declarations.map { case (pid, decl) => (pid, extractHash(decl)) }
       )
 
-    private def checkForkByConsensusConfigHash(facilities: SortedMap[PeerId, Facility]): F[Unit] = {
-      val ownConfigHash = config.deterministicConfigHash
-      val peerConfigHashes = facilities.flatMap {
-        case (pid, f) => f.consensusConfigHash.map(pid -> _)
-      }
-      if (peerConfigHashes.nonEmpty)
-        recoverIfForking[F](ownConfigHash, consensusConfigHashObservationName, restartService, nodeStorage, leavingDelay)(
-          SortedMap.from(peerConfigHashes)
-        )
-      else Applicative[F].unit
-    }
+    /** @note
+      *   consensusConfigHash was removed from Facility in the mempool migration. Config mismatch is still detectable via facilitatorsHash
+      *   divergence.
+      */
+    private def checkForkByConsensusConfigHash(facilities: SortedMap[PeerId, Facility]): F[Unit] =
+      Applicative[F].unit
 
     private implicit val extractFacilityHash: Facility => Hash = _.lastSnapshotHash
     private implicit val extractProposalHash: Proposal => Hash = _.lastSnapshotHash

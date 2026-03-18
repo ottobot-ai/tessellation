@@ -29,18 +29,19 @@ trait ConsensusStorage[F[_], Event, Key, Artifact, Context, Status, Outcome, Kin
 
   def condModifyState[B](key: Key)(modifyStateFn: ModifyStateFn[F, Key, Status, Outcome, Kind, B]): F[Option[B]]
 
-  private[consensus] def containsTriggerEvent: F[Boolean]
-
-  private[consensus] def addTriggerEvent(peerId: PeerId, peerEvent: (Ordinal, Event)): F[Unit]
-
-  private[consensus] def addEvent(peerId: PeerId, peerEvent: (Ordinal, Event)): F[Unit]
-
+  /** @deprecated
+    *   Events are now propagated via EventMempool, not ConsensusStorage. Retained for CurrencyL0 compatibility. Always returns false for
+    *   Global L0.
+    */
   def containsEvent(events: Event): F[Boolean]
 
+  /** @deprecated Retained for CurrencyL0 compatibility. No-op for Global L0. */
   def addEvents(events: Map[PeerId, List[(Ordinal, Event)]]): F[Unit]
 
+  /** @deprecated Retained for CurrencyL0 compatibility. Always returns empty for Global L0. */
   def pullEvents(upperBound: Bound): F[Map[PeerId, List[(Ordinal, Event)]]]
 
+  /** @deprecated Retained for CurrencyL0 compatibility. Always returns empty for Global L0. */
   def getUpperBound: F[Bound]
 
   def getResources(key: Key): F[ConsensusResources[Artifact, Kind]]
@@ -123,13 +124,6 @@ trait ConsensusStorage[F[_], Event, Key, Artifact, Context, Status, Outcome, Kin
     * resource entries except the current key, preventing unbounded memory growth. Should be called after each successful consensus round.
     */
   private[consensus] def pruneStaleResources(activeKey: Key): F[Unit]
-
-  /** Remove event entries for peers that are no longer in the cluster.
-    *
-    * When peers depart the cluster, their entries in the events map persist indefinitely. This method removes entries for peers not in the
-    * provided active set.
-    */
-  private[consensus] def pruneStaleEvents(activePeers: Set[PeerId]): F[Unit]
 
   /** Prune peer registrations for peers no longer in the cluster.
     *
@@ -276,14 +270,6 @@ object ConsensusStorage {
             (none[ConsensusState[Key, Status, Outcome, Kind]], ()).some.pure[F]
           }.void >> clearResources(key)
 
-        def containsTriggerEvent: F[Boolean] =
-          eventsR.keys.flatMap { keys =>
-            keys.existsM { peerId =>
-              eventsR(peerId).get
-                .map(_.flatMap(_.trigger).isDefined)
-            }
-          }
-
         def containsEvent(event: Event): F[Boolean] =
           eventsR.keys.flatMap { keys =>
             keys.existsM { peerId =>
@@ -292,38 +278,17 @@ object ConsensusStorage {
             }
           }
 
-        def addTriggerEvent(peerId: PeerId, peerEvent: (Ordinal, Event)): F[Unit] =
-          addEvents(peerId, List(peerEvent), updateTrigger = true)
-
-        def addEvent(peerId: PeerId, peerEvent: (Ordinal, Event)): F[Unit] =
-          addEvents(peerId, List(peerEvent), updateTrigger = false)
-
         def addEvents(events: Map[PeerId, List[(Ordinal, Event)]]): F[Unit] =
           events.toList.traverse {
             case (peerId, peerEvents) =>
-              addEvents(peerId, peerEvents, updateTrigger = false)
-          }.void
-
-        private def addEvents(peerId: PeerId, events: List[(Ordinal, Event)], updateTrigger: Boolean): F[Unit] =
-          eventsR(peerId).update { maybePeerEvents =>
-            maybePeerEvents
-              .getOrElse(PeerEvents.empty[Event])
-              .focus(_.events)
-              .modify(events ++ _)
-              .focus(_.trigger)
-              .modify { maybeCurrentTrigger =>
-                if (updateTrigger) {
-                  val maybeNewTrigger = events.map(_._1).maximumOption
-
-                  (maybeCurrentTrigger, maybeNewTrigger)
-                    .mapN(Order[Ordinal].max)
-                    .orElse(maybeCurrentTrigger)
-                    .orElse(maybeNewTrigger)
-                } else
-                  maybeCurrentTrigger
+              eventsR(peerId).update { maybePeerEvents =>
+                maybePeerEvents
+                  .getOrElse(PeerEvents.empty[Event])
+                  .focus(_.events)
+                  .modify(peerEvents ++ _)
+                  .some
               }
-              .some
-          }
+          }.void
 
         def pullEvents(upperBound: Bound): F[Map[PeerId, List[(Ordinal, Event)]]] =
           upperBound.toList.traverse {
@@ -491,13 +456,6 @@ object ConsensusStorage {
         def pruneStaleResources(activeKey: Key): F[Unit] =
           resourcesR.keys.flatMap { keys =>
             keys.filterNot(_ === activeKey).traverse_(k => resourcesR(k).set(none))
-          }
-
-        def pruneStaleEvents(activePeers: Set[PeerId]): F[Unit] =
-          eventsR.keys.flatMap { peerIds =>
-            peerIds.filterNot(activePeers.contains).traverse_ { stalePeerId =>
-              eventsR(stalePeerId).set(none)
-            }
           }
 
         def pruneStalePeerRegistrations(activePeers: Set[PeerId]): F[Unit] =

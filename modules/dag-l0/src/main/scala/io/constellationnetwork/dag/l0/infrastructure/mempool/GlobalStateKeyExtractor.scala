@@ -3,8 +3,8 @@ package io.constellationnetwork.dag.l0.infrastructure.mempool
 import cats.Applicative
 import cats.syntax.all._
 
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
 import io.constellationnetwork.node.shared.infrastructure.mempool.StateKeyExtractor
-import io.constellationnetwork.node.shared.snapshot.global._
 import io.constellationnetwork.schema.Block
 import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, PartitionNamespace}

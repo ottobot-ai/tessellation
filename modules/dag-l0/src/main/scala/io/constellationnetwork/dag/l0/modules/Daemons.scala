@@ -1,5 +1,7 @@
 package io.constellationnetwork.dag.l0.modules
 
+import java.security.KeyPair
+
 import cats.effect.Async
 import cats.effect.std.Supervisor
 import cats.syntax.functor._
@@ -7,6 +9,7 @@ import cats.syntax.traverse._
 
 import io.constellationnetwork.dag.l0.config.types.AppConfig
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotEventsPublisherDaemon
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.dag.l0.infrastructure.trust.TrustStorageUpdater
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.domain.Daemon
@@ -14,20 +17,23 @@ import io.constellationnetwork.node.shared.infrastructure.cluster.daemon.NodeSta
 import io.constellationnetwork.node.shared.infrastructure.collateral.daemon.CollateralDaemon
 import io.constellationnetwork.node.shared.infrastructure.gossip.event.EventGossipDaemon
 import io.constellationnetwork.node.shared.infrastructure.snapshot.daemon.{DownloadDaemon, SelectablePeerDiscoveryDelay}
+import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.security.HasherSelector
+import io.constellationnetwork.security.{HasherSelector, SecurityProvider}
 
 object Daemons {
 
-  def start[F[_]: Async: Supervisor, R <: CliMethod](
+  def start[F[_]: Async: Supervisor: HasherSelector: SecurityProvider, R <: CliMethod](
     storages: Storages[F],
     services: Services[F, R],
     programs: Programs[F],
     queues: Queues[F],
     nodeId: PeerId,
+    keyPair: KeyPair,
     cfg: AppConfig,
     hasherSelector: HasherSelector[F],
-    eventGossipDaemon: EventGossipDaemon[F, _, _]
+    eventGossipDaemon: EventGossipDaemon[F, GlobalSnapshotEvent, GlobalStateKey],
+    triggerEventConsensus: F[Unit]
   ): F[Unit] = {
     val pddCfg = cfg.peerDiscovery.delay
     val peerDiscoveryDelay = SelectablePeerDiscoveryDelay.make(
@@ -52,8 +58,10 @@ object Daemons {
           queues.updateNodeParametersOutput,
           queues.delegatedStakeOutput,
           queues.nodeCollateralOutput,
-          services.gossip,
-          services.consensus.storage
+          keyPair,
+          services.eventMempool,
+          eventGossipDaemon,
+          triggerEventConsensus
         ),
       CollateralDaemon.make(services.collateral, storages.globalSnapshot, storages.cluster),
       TrustStorageUpdater.daemon(services.trustStorageUpdater),

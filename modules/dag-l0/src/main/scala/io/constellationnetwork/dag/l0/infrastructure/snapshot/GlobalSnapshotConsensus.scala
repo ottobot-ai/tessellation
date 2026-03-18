@@ -37,9 +37,11 @@ import io.constellationnetwork.node.shared.domain.swap.block.AllowSpendBlockAcce
 import io.constellationnetwork.node.shared.domain.tokenlock.block.TokenLockBlockAcceptanceManager
 import io.constellationnetwork.node.shared.infrastructure.block.processing.BlockAcceptanceManager
 import io.constellationnetwork.node.shared.infrastructure.consensus._
-import io.constellationnetwork.node.shared.infrastructure.consensus.engine.{ConsensusEventLoop, _}
+import io.constellationnetwork.node.shared.infrastructure.consensus.engine.{ConsensusCommand, ConsensusEventLoop, _}
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.gossip.RumorHandler
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.EventGossipClient
+import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
 import io.constellationnetwork.node.shared.infrastructure.snapshot._
@@ -99,6 +101,8 @@ object GlobalSnapshotConsensus {
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     mptStore: MptStore[F, GlobalStateKey],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
+    eventGossipClient: EventGossipClient[F, GlobalSnapshotEvent],
     loggerBundle: LoggerBundle[F],
     rumorQueue: cats.effect.std.Queue[F, Hashed[RumorRaw]]
   )(implicit supervisor: Supervisor[F], globalStateProofSelector: GlobalStateProofSelector): F[GlobalSnapshotConsensus[F]] =
@@ -183,6 +187,8 @@ object GlobalSnapshotConsensus {
           lastGlobalSnapshotStorage,
           getGlobalSnapshotByOrdinal,
           clusterStorage,
+          eventMempool,
+          eventGossipClient,
           loggerBundle,
           mptStore
         )
@@ -205,7 +211,8 @@ object GlobalSnapshotConsensus {
           facilitatorSelector,
           appConfig.snapshot.consensus.deterministicConfigHash,
           peerQualityTracker,
-          tcaFilter
+          tcaFilter,
+          eventMempool
         )
 
       stateRemover =
@@ -267,7 +274,17 @@ object GlobalSnapshotConsensus {
         GlobalConsensusKind
       ](consensusStorage, rumorQueue)
 
+      triggerEvent = loop.queue.offer(ConsensusCommand.FacilitateByEvent)
+
       _ <- supervisor.supervise(loop.run.compile.drain)
-      consensus = new Consensus(handler, consensusStorage, loop.manager, routes, consensusFunctions, Some(loop.healthRef))
+      consensus = new Consensus(
+        handler,
+        consensusStorage,
+        loop.manager,
+        routes,
+        consensusFunctions,
+        Some(loop.healthRef),
+        Some(triggerEvent)
+      )
     } yield consensus
 }

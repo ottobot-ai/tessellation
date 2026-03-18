@@ -10,6 +10,7 @@ import io.constellationnetwork.dag.l0.domain.delegatedStake.DelegatedStakeOutput
 import io.constellationnetwork.dag.l0.domain.nodeCollateral.NodeCollateralOutput
 import io.constellationnetwork.dag.l0.http.routes._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotKey
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.schema.GlobalConsensusOutcome
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.env.AppEnvironment._
@@ -20,7 +21,6 @@ import io.constellationnetwork.node.shared.http.routes._
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.CombinedSnapshotCheckpointFileSystemStorage
 import io.constellationnetwork.node.shared.modules.SharedValidators
-import io.constellationnetwork.node.shared.snapshot.global.GlobalSnapshotEvent
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateKey

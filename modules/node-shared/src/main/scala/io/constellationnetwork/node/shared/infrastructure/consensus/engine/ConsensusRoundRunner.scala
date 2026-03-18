@@ -172,27 +172,21 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
     for {
       maybeTimeTrigger <- storage.getTimeTrigger
       currentTime <- Async[F].monotonic
-      containsTriggerEvent <- storage.containsTriggerEvent
 
       _ <-
         if (maybeTimeTrigger.exists(currentTime >= _))
           queue.offer(ConsensusCommand.StartRound(Some(TimeTrigger)))
         else if (maybeTimeTrigger.isEmpty)
           scheduleTimeTrigger >> queue.offer(ConsensusCommand.StartRound(None))
-        else if (containsTriggerEvent)
-          queue.offer(ConsensusCommand.StartRound(Some(EventTrigger)))
         else
-          // No timer expired, timer is scheduled, no events — the supervised timer fiber
-          // will fire TimeTick when the interval elapses. Nothing to do.
+          // No timer expired, timer is scheduled — the supervised timer fiber
+          // will fire TimeTick when the interval elapses. New events will offer
+          // FacilitateByEvent directly via GlobalSnapshotEventsPublisherDaemon.
           Async[F].unit
     } yield ()
 
   private def afterTimeTrigger: F[Unit] =
-    for {
-      _ <- scheduleTimeTrigger
-      containsTriggerEvent <- storage.containsTriggerEvent
-      _ <- queue.offer(ConsensusCommand.StartRound(Some(EventTrigger))).whenA(containsTriggerEvent)
-    } yield ()
+    scheduleTimeTrigger
 
   /** Schedule the next time-triggered round.
     *

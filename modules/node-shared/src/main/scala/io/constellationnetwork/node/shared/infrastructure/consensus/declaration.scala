@@ -26,7 +26,8 @@ object declaration {
     facilitatorsHash: Hash,
     lastGlobalSnapshotOrdinal: SnapshotOrdinal,
     lastSnapshotHash: Hash,
-    consensusConfigHash: Option[Hash] = None
+    consensusConfigHash: Option[Hash] = None,
+    eventHashes: Set[Hash] = Set.empty
   ) extends PeerDeclaration
 
   @derive(eqv, show, encoder, decoder)

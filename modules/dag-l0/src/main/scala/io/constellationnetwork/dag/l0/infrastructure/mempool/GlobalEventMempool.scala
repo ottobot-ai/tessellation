@@ -4,8 +4,8 @@ import cats.effect.Async
 
 import scala.concurrent.duration._
 
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.node.shared.infrastructure.mempool._
-import io.constellationnetwork.node.shared.snapshot.global.GlobalSnapshotEvent
 import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.security.Hasher
 

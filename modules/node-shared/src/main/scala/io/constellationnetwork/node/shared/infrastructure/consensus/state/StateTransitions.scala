@@ -107,12 +107,11 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
       // This prevents memory growth from abandoned rounds leaving behind resource entries.
       activeKey = outcomeKey.get(outcome)
       _ <- storage.pruneStaleResources(activeKey)
-      // Prune events and peer registrations from peers no longer in the cluster.
+      // Prune peer registrations from peers no longer in the cluster.
       // Peer registrations must be pruned to prevent stale departed-peer entries from
       // corrupting lagging detection in StallDetector (peersAtDifferentKey count).
       responsivePeers <- ctx.clusterStorage.getResponsivePeers
       activePeerIds = responsivePeers.map(_.id) + ctx.selfId
-      _ <- storage.pruneStaleEvents(activePeerIds)
       _ <- storage.pruneStalePeerRegistrations(activePeerIds)
       _ <-
         if (updated) {

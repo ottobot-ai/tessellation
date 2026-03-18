@@ -9,6 +9,7 @@ import io.constellationnetwork.dag.l0.StoragesInitializer.initializeStorages
 import io.constellationnetwork.dag.l0.cli.method._
 import io.constellationnetwork.dag.l0.config.types._
 import io.constellationnetwork.dag.l0.http.p2p.P2PClient
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.schema.{Finished, GlobalConsensusOutcome}
 import io.constellationnetwork.dag.l0.infrastructure.trust.handler.{ordinalTrustHandler, trustHandler}
 import io.constellationnetwork.dag.l0.modules._
@@ -26,7 +27,6 @@ import io.constellationnetwork.node.shared.infrastructure.gossip.{GossipDaemon, 
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.GlobalSnapshotLocalFileSystemStorage
 import io.constellationnetwork.node.shared.resources.MkHttpServer
 import io.constellationnetwork.node.shared.resources.MkHttpServer.ServerName
-import io.constellationnetwork.node.shared.snapshot.global.GlobalSnapshotEvent
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.cluster.ClusterId
@@ -161,7 +161,18 @@ object Main
       eventGossipDaemon = daemonWithRecovery.daemon
 
       _ <- Daemons
-        .start(storages, services, programs, queues, nodeId, cfg, hasherSelector, eventGossipDaemon)
+        .start(
+          storages,
+          services,
+          programs,
+          queues,
+          nodeId,
+          keyPair,
+          cfg,
+          hasherSelector,
+          eventGossipDaemon,
+          services.consensus.triggerEventConsensus.getOrElse(IO.unit)
+        )
         .asResource
 
       api <- Resource.eval(

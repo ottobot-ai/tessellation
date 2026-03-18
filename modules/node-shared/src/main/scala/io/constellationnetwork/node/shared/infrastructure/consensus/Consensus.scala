@@ -12,5 +12,6 @@ class Consensus[F[_], Event, Key, Artifact, Context, Status, Outcome, Kind](
   val manager: ConsensusManager[F, Event, Key, Artifact, Context, Status, Outcome, Kind],
   val routes: ConsensusRoutes[F, Key, Artifact, Context, Status, Outcome, Kind],
   val consensusFns: ConsensusFunctions[F, Event, Key, Artifact, Context],
-  val healthRef: Option[Ref[F, ConsensusHealthStatus]] = None
+  val healthRef: Option[Ref[F, ConsensusHealthStatus]] = None,
+  val triggerEventConsensus: Option[F[Unit]] = None
 )

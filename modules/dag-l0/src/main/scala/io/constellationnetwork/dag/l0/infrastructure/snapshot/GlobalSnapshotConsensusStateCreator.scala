@@ -4,6 +4,7 @@ import cats.effect.Async
 import cats.effect.kernel.{Clock, Sync}
 import cats.syntax.all._
 
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.schema.{CollectingFacilities, GlobalConsensusKind, GlobalConsensusOutcome}
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
@@ -13,6 +14,8 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.declaration.
 import io.constellationnetwork.node.shared.infrastructure.consensus.message.ConsensusPeerDeclaration
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.ConsensusTrigger
+import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
+import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 
@@ -40,7 +43,8 @@ object GlobalSnapshotConsensusStateCreator {
     facilitatorSelector: FacilitatorSelector,
     consensusConfigHash: Hash,
     peerQualityTracker: PeerQualityTracker[F],
-    tcaFilter: TrailingCommonAncestorFilter[F]
+    tcaFilter: TrailingCommonAncestorFilter[F],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey]
   ): GlobalSnapshotConsensusStateCreator[F] = new GlobalSnapshotConsensusStateCreator[F] {
 
     val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
@@ -214,22 +218,24 @@ object GlobalSnapshotConsensusStateCreator {
 
         time <- Clock[F].monotonic
 
-        effect = consensusStorage.getUpperBound.flatMap { bound =>
-          gossip.spread(
+        effect = for {
+          eventHashes <- eventMempool.getEventHashes
+
+          _ <- gossip.spread(
             ConsensusPeerDeclaration(
               key,
               Facility(
-                bound,
-                candidates,
-                maybeTrigger,
-                lastOutcome.finished.facilitatorsHash,
-                lastOutcome.key,
-                lastOutcome.finished.snapshotHash,
-                consensusConfigHash = consensusConfigHash.some
+                upperBound = Map.empty,
+                candidates = candidates,
+                trigger = maybeTrigger,
+                facilitatorsHash = lastOutcome.finished.facilitatorsHash,
+                lastGlobalSnapshotOrdinal = lastOutcome.key,
+                lastSnapshotHash = lastOutcome.finished.snapshotHash,
+                eventHashes = eventHashes
               )
             )
           )
-        }
+        } yield ()
 
         // Quality-weighted leader selection: use consensus-agreed quality scores
         // so all nodes compute the same leader deterministically.
