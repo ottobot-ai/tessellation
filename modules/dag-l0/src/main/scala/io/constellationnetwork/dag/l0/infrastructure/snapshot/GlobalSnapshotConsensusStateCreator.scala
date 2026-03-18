@@ -225,13 +225,12 @@ object GlobalSnapshotConsensusStateCreator {
             ConsensusPeerDeclaration(
               key,
               Facility(
-                upperBound = Map.empty,
-                candidates = candidates,
-                trigger = maybeTrigger,
-                facilitatorsHash = lastOutcome.finished.facilitatorsHash,
-                lastGlobalSnapshotOrdinal = lastOutcome.key,
-                lastSnapshotHash = lastOutcome.finished.snapshotHash,
-                eventHashes = eventHashes
+                eventHashes,
+                candidates,
+                maybeTrigger,
+                lastOutcome.finished.facilitatorsHash,
+                lastOutcome.key,
+                lastOutcome.finished.snapshotHash
               )
             )
           )

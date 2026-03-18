@@ -170,8 +170,7 @@ object Main
           keyPair,
           cfg,
           hasherSelector,
-          eventGossipDaemon,
-          services.consensus.triggerEventConsensus.getOrElse(IO.unit)
+          eventGossipDaemon
         )
         .asResource
 

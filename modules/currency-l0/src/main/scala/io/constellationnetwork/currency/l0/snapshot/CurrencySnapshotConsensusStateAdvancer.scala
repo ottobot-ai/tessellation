@@ -13,10 +13,12 @@ import scala.concurrent.duration.FiniteDuration
 import io.constellationnetwork.currency.dataApplication.BaseDataApplicationL0Service
 import io.constellationnetwork.currency.l0.snapshot.schema._
 import io.constellationnetwork.currency.l0.snapshot.services.StateChannelSnapshotService
+import io.constellationnetwork.currency.schema.CurrencyStateKey
 import io.constellationnetwork.currency.schema.currency.CurrencySnapshotContext
 import io.constellationnetwork.ext.collection.FoldableOps.pickMajority
 import io.constellationnetwork.ext.crypto._
 import io.constellationnetwork.node.shared.config.types.ConsensusConfig
+import io.constellationnetwork.node.shared.domain.cluster.services.Session
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions.InvalidArtifact
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
@@ -27,6 +29,8 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.message._
 import io.constellationnetwork.node.shared.infrastructure.consensus.state.ConsensusStateUpdater._
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger, TimeTrigger}
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.{EventGossipClient, IWantRequest}
+import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
 import io.constellationnetwork.node.shared.infrastructure.snapshot.SnapshotConsensusFunctions.gossipForkInfo
@@ -37,8 +41,7 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.{
 }
 import io.constellationnetwork.node.shared.snapshot.currency._
 import io.constellationnetwork.schema.currencyMessage.fetchStakingAddress
-import io.constellationnetwork.schema.gossip.Ordinal
-import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.schema.peer.{Peer, PeerId}
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -48,6 +51,8 @@ import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 import io.constellationnetwork.syntax.sortedCollection.sortedSetSyntax
 
 import eu.timepit.refined.auto._
+import io.circe.{Decoder, Encoder}
+import org.http4s.client.Client
 import org.typelevel.log4cats.SelfAwareStructuredLogger
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
@@ -87,12 +92,20 @@ object CurrencySnapshotConsensusStateAdvancer {
     nodeStorage: NodeStorage[F],
     leavingDelay: FiniteDuration,
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
-    clusterStorageInstance: ClusterStorage[F]
+    clusterStorageInstance: ClusterStorage[F],
+    eventMempool: EventMempool[F, CurrencySnapshotEvent, CurrencyStateKey],
+    client: Client[F],
+    session: Session[F]
+  )(
+    implicit eventEncoder: Encoder[CurrencySnapshotEvent],
+    eventDecoder: Decoder[CurrencySnapshotEvent]
   ): CurrencySnapshotConsensusStateAdvancer[F] =
     new CurrencySnapshotConsensusStateAdvancer[F] {
 
       private val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromClass[F](getClass)
       private val lastSnapshotHashObservationName = "last-snapshot-hash"
+      private val eventGossipClient: EventGossipClient[F, CurrencySnapshotEvent] =
+        EventGossipClient.make[F, CurrencySnapshotEvent](client, session)
       private val facilitatorsHashObservationName = "facilitators-hash"
       private val consensusConfigHashObservationName = "consensus-config-hash"
 
@@ -252,15 +265,69 @@ object CurrencySnapshotConsensusStateAdvancer {
         state: CurrencySnapshotConsensusState,
         facilities: SortedMap[PeerId, Facility]
       ): F[Option[Transition]] = {
-        val (bound, candidates, triggers) = facilities.foldMap(f => (f.upperBound, f.candidates.value, f.trigger.toList))
+        val (candidates, triggers) = facilities.foldMap(f => (f.candidates.value, f.trigger.toList))
+
+        // Compute hash UNION - include events ANY facilitator has, then sync missing
+        val allHashSets = facilities.values.map(_.eventHashes).toList
+        val unionHashes = allHashSets.reduceOption(_ union _).getOrElse(Set.empty[Hash])
 
         val trigger = pickMajority(triggers).getOrElse(EventTrigger)
-        buildProposalTransition(state, bound, candidates, trigger).map(_.some)
+
+        // Build map of hash -> peer who has it (for fetching missing events)
+        val hashToPeer: Map[Hash, PeerId] = facilities.toList.flatMap {
+          case (peerId, facility) => facility.eventHashes.map(_ -> peerId)
+        }.toMap
+
+        for {
+          // Get local hashes and identify what we're missing
+          localHashes <- eventMempool.getEventHashes
+          missingHashes = unionHashes -- localHashes
+
+          // Sync missing events from peers before building proposal
+          _ <- syncMissingEvents(missingHashes, hashToPeer).whenA(missingHashes.nonEmpty)
+
+          result <- buildProposalTransition(state, unionHashes, candidates, trigger)
+        } yield result.some
       }
+
+      /** Sync missing events from peers who have them. */
+      private def syncMissingEvents(
+        missingHashes: Set[Hash],
+        hashToPeer: Map[Hash, PeerId]
+      ): F[Unit] = {
+        val hashesPerPeer: Map[PeerId, Set[Hash]] = missingHashes
+          .flatMap(h => hashToPeer.get(h).map(peerId => (peerId, h)))
+          .groupMap(_._1)(_._2)
+
+        hashesPerPeer.toList.traverse_ {
+          case (peerId, hashes) =>
+            fetchEventsFromPeer(peerId, hashes)
+        }
+      }
+
+      /** Fetch specific events from a peer using IWANT and add to local mempool. */
+      private def fetchEventsFromPeer(peerId: PeerId, hashes: Set[Hash]): F[Unit] =
+        for {
+          maybePeer <- clusterStorage.getPeer(peerId)
+          _ <- maybePeer.traverse_ { peer =>
+            eventGossipClient
+              .requestEvents(IWantRequest(hashes))
+              .run(Peer.toP2PContext(peer))
+              .flatMap { response =>
+                response.events.traverse_ {
+                  case (_, signedEvent) =>
+                    eventMempool.add(signedEvent).void
+                }
+              }
+              .handleErrorWith { err =>
+                logger.warn(s"[EventSync] Failed to fetch events from peer ${peerId.show.take(8)}: ${err.getMessage}")
+              }
+          }
+        } yield ()
 
       private def buildProposalTransition(
         state: CurrencySnapshotConsensusState,
-        bound: Bound,
+        commonHashes: Set[Hash],
         candidates: Set[PeerId],
         majorityTrigger: ConsensusTrigger
       ): F[Transition] =
@@ -268,11 +335,26 @@ object CurrencySnapshotConsensusStateAdvancer {
           for {
             _ <- clearTimeTriggerIfNeeded(majorityTrigger)
             facilitatorsHash <- hashFacilitators(state)
-            peerEvents <- consensusStorage.pullEvents(bound)
 
-            (artifact, context, returnedEvents) <- createArtifact(state, majorityTrigger, extractEvents(peerEvents))
+            // Pull events from mempool using hash intersection for consensus safety
+            mempoolData <- eventMempool.getMultiple(commonHashes).map { hashToHashed =>
+              val events = hashToHashed.values.map(_.signed.value).toSet
+              val hashToEvent = hashToHashed.map { case (h, hashed) => h -> hashed.signed.value }
+              (events, hashToEvent)
+            }
+            (mempoolEvents, mempoolHashToEvent) = mempoolData
 
-            _ <- storeReturnedEvents(peerEvents, returnedEvents)
+            (artifact, context, returnedEvents) <- createArtifact(state, majorityTrigger, mempoolEvents)
+
+            // Clear included events from mempool (events not returned were included)
+            includedHashes = {
+              val returnedSet = returnedEvents.toSet
+              mempoolHashToEvent.collect {
+                case (hash, event) if !returnedSet.contains(event) => hash
+              }.toSet
+            }
+            _ <- eventMempool.clearIncluded(includedHashes)
+
             hash <- hashArtifact(artifact)
             isLeader = selfId === state.leader
             role = if (isLeader) "LEADER" else "FOLLOWER"
@@ -664,9 +746,6 @@ object CurrencySnapshotConsensusStateAdvancer {
       private def hashArtifact(artifact: CurrencySnapshotArtifact): F[Hash] =
         HasherSelector[F].withCurrent(implicit h => artifact.hash)
 
-      private def extractEvents(peerEvents: Map[PeerId, List[(Ordinal, CurrencySnapshotEvent)]]): Set[CurrencySnapshotEvent] =
-        peerEvents.values.flatten.map(_._2).toSet
-
       private def createArtifact(
         state: CurrencySnapshotConsensusState,
         trigger: ConsensusTrigger,
@@ -682,15 +761,6 @@ object CurrencySnapshotConsensusStateAdvancer {
           state.facilitators.value.toSet,
           getGlobalSnapshotByOrdinal
         )
-
-      private def storeReturnedEvents(
-        peerEvents: Map[PeerId, List[(Ordinal, CurrencySnapshotEvent)]],
-        returnedEvents: Set[CurrencySnapshotEvent]
-      ): F[Unit] = {
-        val filtered = peerEvents.map { case (pid, evts) => (pid, evts.filter { case (_, e) => returnedEvents.contains(e) }) }
-          .filter(_._2.nonEmpty)
-        consensusStorage.addEvents(filtered)
-      }
 
       private val selfId: PeerId = PeerId.fromPublic(keyPair.getPublic)
 

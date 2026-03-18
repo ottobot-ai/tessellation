@@ -12,6 +12,7 @@ import scala.concurrent.duration.FiniteDuration
 import io.constellationnetwork.currency.dataApplication._
 import io.constellationnetwork.currency.l0.snapshot.schema._
 import io.constellationnetwork.currency.l0.snapshot.services.StateChannelSnapshotService
+import io.constellationnetwork.currency.schema.CurrencyStateKey
 import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.node.shared.config.types.SnapshotConfig
@@ -24,6 +25,7 @@ import io.constellationnetwork.node.shared.domain.snapshot.storage.LastSyncGloba
 import io.constellationnetwork.node.shared.infrastructure.consensus._
 import io.constellationnetwork.node.shared.infrastructure.consensus.engine.ConsensusEventLoop
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
+import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
 import io.constellationnetwork.node.shared.infrastructure.snapshot.{CurrencySnapshotCreator, CurrencySnapshotValidator}
@@ -36,7 +38,7 @@ import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdina
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, HasherSelector, SecurityProvider}
 
-import io.circe.Decoder
+import io.circe.{Decoder, Encoder}
 import org.http4s.client.Client
 
 /** Factory for creating the Currency L0 consensus engine.
@@ -70,8 +72,8 @@ object CurrencySnapshotConsensus {
     restartService: RestartService[F, _],
     leavingDelay: FiniteDuration,
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
-    getSnapshotByOrdinal: SnapshotOrdinal => F[Option[Signed[CurrencySnapshotArtifact]]],
     maybeCustomArtifacts: Option[Signed[CurrencyIncrementalSnapshot] => Option[SortedSet[SharedArtifact]]],
+    eventMempool: EventMempool[F, CurrencySnapshotEvent, CurrencyStateKey],
     rumorQueue: cats.effect.std.Queue[F, Hashed[RumorRaw]]
   )(implicit supervisor: Supervisor[F]): F[CurrencySnapshotConsensus[F]] = {
     def noopDecoder: Decoder[DataTransaction] =
@@ -84,6 +86,15 @@ object CurrencySnapshotConsensus {
       }.getOrElse(noopDecoder)
 
     implicit val hs: HasherSelector[F] = hasherSelector
+
+    def noopEncoder: Encoder[DataTransaction] =
+      Encoder.instance(_ => io.circe.Json.Null)
+
+    implicit def daEncoder: Encoder[DataTransaction] =
+      maybeDataApplication.map { da =>
+        implicit val dataUpdateEncoder: Encoder[DataUpdate] = da.dataEncoder
+        DataTransaction.encoder
+      }.getOrElse(noopEncoder)
 
     for {
       consensusStorage <- ConsensusStorage.make[
@@ -119,7 +130,10 @@ object CurrencySnapshotConsensus {
           nodeStorage,
           leavingDelay,
           getGlobalSnapshotByOrdinal,
-          clusterStorage
+          clusterStorage,
+          eventMempool,
+          client,
+          session
         )
 
       facilitatorSelector = FacilitatorSelector.make(
@@ -141,7 +155,8 @@ object CurrencySnapshotConsensus {
           facilitatorSelector,
           snapshotConfig.consensus.deterministicConfigHash,
           peerQualityTracker,
-          tcaFilter
+          tcaFilter,
+          eventMempool
         )
 
       consensusStateRemover =
@@ -204,7 +219,18 @@ object CurrencySnapshotConsensus {
       ](consensusStorage, rumorQueue)
 
       _ <- supervisor.supervise(loop.run.compile.drain)
-      consensus = new Consensus(handler, consensusStorage, loop.manager, routes, consensusFns, Some(loop.healthRef))
+      triggerEventConsensus = loop.queue.offer(
+        io.constellationnetwork.node.shared.infrastructure.consensus.engine.ConsensusCommand.FacilitateByEvent
+      )
+      consensus = new Consensus(
+        handler,
+        consensusStorage,
+        loop.manager,
+        routes,
+        consensusFns,
+        Some(loop.healthRef),
+        Some(triggerEventConsensus)
+      )
     } yield consensus
   }
 }

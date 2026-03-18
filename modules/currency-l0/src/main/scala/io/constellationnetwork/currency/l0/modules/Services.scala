@@ -176,8 +176,8 @@ object Services {
           sharedServices.restart,
           cfg.shared.leavingDelay,
           globalL0Service.pullGlobalSnapshot,
-          storages.snapshot.get,
           maybeCustomArtifacts,
+          storages.eventMempool,
           queues.rumor
         )
     } yield

@@ -20,14 +20,13 @@ object declaration {
 
   @derive(eqv, show, encoder, decoder)
   case class Facility(
-    upperBound: Bound,
+    eventHashes: Set[Hash],
     candidates: Candidates,
     trigger: Option[ConsensusTrigger],
     facilitatorsHash: Hash,
     lastGlobalSnapshotOrdinal: SnapshotOrdinal,
     lastSnapshotHash: Hash,
-    consensusConfigHash: Option[Hash] = None,
-    eventHashes: Set[Hash] = Set.empty
+    consensusConfigHash: Option[Hash] = None
   ) extends PeerDeclaration
 
   @derive(eqv, show, encoder, decoder)

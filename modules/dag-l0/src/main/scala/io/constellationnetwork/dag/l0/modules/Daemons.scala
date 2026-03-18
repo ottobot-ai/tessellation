@@ -32,8 +32,7 @@ object Daemons {
     keyPair: KeyPair,
     cfg: AppConfig,
     hasherSelector: HasherSelector[F],
-    eventGossipDaemon: EventGossipDaemon[F, GlobalSnapshotEvent, GlobalStateKey],
-    triggerEventConsensus: F[Unit]
+    eventGossipDaemon: EventGossipDaemon[F, GlobalSnapshotEvent, GlobalStateKey]
   ): F[Unit] = {
     val pddCfg = cfg.peerDiscovery.delay
     val peerDiscoveryDelay = SelectablePeerDiscoveryDelay.make(
@@ -61,7 +60,8 @@ object Daemons {
           keyPair,
           services.eventMempool,
           eventGossipDaemon,
-          triggerEventConsensus
+          storages.cluster,
+          services.consensus.triggerEventConsensus
         ),
       CollateralDaemon.make(services.collateral, storages.globalSnapshot, storages.cluster),
       TrustStorageUpdater.daemon(services.trustStorageUpdater),

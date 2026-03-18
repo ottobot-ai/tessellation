@@ -20,14 +20,11 @@ import org.http4s.dsl.Http4sDsl
   *   - GET /events/ihave - Get hashes of events we have
   *   - POST /events/iwant - Request specific events by hash
   *
-  * @param triggerEventConsensus
-  *   Optional callback to trigger consensus when events are received
   * @tparam Key
   *   The state key type (unused by routes, but required for EventMempool type)
   */
 final case class EventGossipRoutes[F[_]: Async, Event: Encoder: Decoder, Key](
   mempool: EventMempool[F, Event, Key],
-  triggerEventConsensus: Option[F[Unit]] = None,
   getLocalChainTip: Option[F[Option[ChainTip]]] = None
 ) extends Http4sDsl[F]
     with P2PRoutes[F] {
@@ -65,7 +62,6 @@ final case class EventGossipRoutes[F[_]: Async, Event: Encoder: Decoder, Key](
   private def handlePush(push: EventPush[Event]): F[Either[String, Unit]] =
     mempool
       .add(push.event)
-      .flatTap(_.traverse_(_ => triggerEventConsensus.traverse_(identity)))
       .map(_.bimap(MempoolRejectionReason.show.show, _ => ()))
 }
 
@@ -73,8 +69,7 @@ object EventGossipRoutes {
 
   def make[F[_]: Async, Event: Encoder: Decoder, Key](
     mempool: EventMempool[F, Event, Key],
-    triggerEventConsensus: Option[F[Unit]] = None,
     getLocalChainTip: Option[F[Option[ChainTip]]] = None
   ): EventGossipRoutes[F, Event, Key] =
-    new EventGossipRoutes[F, Event, Key](mempool, triggerEventConsensus, getLocalChainTip)
+    new EventGossipRoutes[F, Event, Key](mempool, getLocalChainTip)
 }

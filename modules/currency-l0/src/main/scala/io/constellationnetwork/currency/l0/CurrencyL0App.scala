@@ -15,6 +15,7 @@ import io.constellationnetwork.currency.l0.http.p2p.P2PClient
 import io.constellationnetwork.currency.l0.modules._
 import io.constellationnetwork.currency.l0.node.L0NodeContext
 import io.constellationnetwork.currency.l0.snapshot.schema.{CurrencyConsensusOutcome, Finished}
+import io.constellationnetwork.currency.schema.CurrencyStateKey
 import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.ext.cats.effect.ResourceIO
@@ -24,6 +25,7 @@ import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.ext.pureconfig._
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.EventTrigger
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.EventGossipDaemon
 import io.constellationnetwork.node.shared.infrastructure.gossip.{GossipDaemon, RumorHandlers}
 import io.constellationnetwork.node.shared.infrastructure.statechannel.StateChannelAllowanceLists
 import io.constellationnetwork.node.shared.resources.MkHttpServer
@@ -170,8 +172,35 @@ abstract class CurrencyL0App(
         .make[IO](storages.cluster, services.localHealthcheck, sharedStorages.forkInfo)
         .handlers <+>
         services.consensus.handler
+
+      daemonWithRecovery <- {
+        import io.constellationnetwork.currency.dataApplication._
+        import io.circe.{Encoder => CEncoder, Decoder => CDecoder, Json => CJson}
+        def noopDtEncoder: CEncoder[DataTransaction] = (_: DataTransaction) => CJson.Null
+        def noopDtDecoder: CDecoder[DataTransaction] = CDecoder.failedWithMessage("DataTransaction decoder not provided")
+        implicit val dtEncoder: CEncoder[DataTransaction] = dataApplicationService.map { da =>
+          implicit val duEnc: CEncoder[DataUpdate] = da.dataEncoder
+          DataTransaction.encoder
+        }.getOrElse(noopDtEncoder)
+        implicit val dtDecoder: CDecoder[DataTransaction] = dataApplicationService.map { da =>
+          implicit val duDec: CDecoder[DataUpdate] = da.dataDecoder
+          DataTransaction.decoder
+        }.getOrElse(noopDtDecoder)
+        EventGossipDaemon
+          .make[IO, CurrencySnapshotEvent, CurrencyStateKey](
+            storages.eventMempool,
+            storages.cluster,
+            storages.node,
+            sharedResources.gossipClient,
+            sharedServices.session
+          )
+          .asResource
+      }
+
+      eventGossipDaemon = daemonWithRecovery.daemon
+
       _ <- Daemons
-        .start(storages, services, programs, queues, services.dataApplication, cfg, hasherSelectorAlwaysCurrent)
+        .start(storages, services, programs, queues, keyPair, services.dataApplication, eventGossipDaemon, cfg, hasherSelectorAlwaysCurrent)
         .asResource
 
       api <- Resource.eval(
@@ -427,9 +456,21 @@ abstract class CurrencyL0App(
                           maybeOwnerEvent <- services.currencyMessages.validateInitialCurrencyOwner(m.metagraphOwnerMessagePath)
                           _ <- logger.info(s"Owner address set")
                           _ <- maybeOwnerEvent.traverse_ { event =>
-                            services.consensus.storage.addEvents(
-                              Map(nodeId -> List((GossipOrdinal.MinValue, event)))
-                            )
+                            import io.constellationnetwork.currency.dataApplication._
+                            import io.circe.{Encoder => CEnc, Json => CJson}
+                            def noopDtEnc: CEnc[DataTransaction] = (_: DataTransaction) => CJson.Null
+                            implicit val dtEnc: CEnc[DataTransaction] = dataApplicationService.map { da =>
+                              implicit val duEnc: CEnc[DataUpdate] = da.dataEncoder
+                              DataTransaction.encoder
+                            }.getOrElse(noopDtEnc)
+                            hasherSelectorAlwaysCurrent.withCurrent { implicit hasher =>
+                              Signed.forAsyncHasher[IO, CurrencySnapshotEvent](event, keyPair).flatMap { signedEvent =>
+                                signedEvent.toHashed[IO].flatMap { hashedEvent =>
+                                  storages.eventMempool.add(signedEvent).void >>
+                                    eventGossipDaemon.publish(hashedEvent)
+                                }
+                              }
+                            }
                           }
                         } yield ()
                       } else IO.unit
