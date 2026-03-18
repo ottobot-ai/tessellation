@@ -165,62 +165,67 @@ else
   done
 
   # Start GL0 nodes.
-  # Two modes:
-  #   GL0_STAGED_STARTUP=true  — genesis starts first, produces snapshots,
-  #                              then validators join (needed for fork-recovery
-  #                              tests with 4+ nodes where validators need
-  #                              downloadable snapshots immediately).
-  #   GL0_STAGED_STARTUP=false — all nodes start together (default). Safer for
-  #                              metagraph tests because all nodes receive state
-  #                              channel snapshots at the same time, avoiding
-  #                              non-deterministic divergence.
-  # Staged GL0 startup: genesis starts first, produces snapshots, then
-  # validators join. This prevents validators from getting stuck in Observing
-  # because they need downloadable snapshots to transition to Ready.
+  # Default: all nodes start together (original behavior). This ensures
+  # validators can complete the /join handshake before reaching Ready state,
+  # which populates the local cluster registry correctly.
   #
-  # GL0_GENESIS_MIN_ORDINAL controls how many ordinals genesis produces before
-  # validators start. Default is 2 (just enough for validators to download).
-  # Fork-recovery tests use 8 for a larger gap.
-  GL0_GENESIS_MIN_ORDINAL=${GL0_GENESIS_MIN_ORDINAL:-2}
+  # GL0_STAGED_STARTUP=true: genesis starts first, produces snapshots, then
+  # validators join. Only needed for fork-recovery tests with 4+ nodes where
+  # validators need downloadable snapshots to catch up from a gap.
+  GL0_STAGED_STARTUP=${GL0_STAGED_STARTUP:-false}
+  GL0_GENESIS_MIN_ORDINAL=${GL0_GENESIS_MIN_ORDINAL:-8}
   GL0_GENESIS_WAIT_ATTEMPTS=${GL0_GENESIS_WAIT_ATTEMPTS:-120}
 
   if [ "$NUM_GL0_NODES" -gt 0 ]; then
-    echo "Starting GL0 genesis node (gl0-0)..."
-    cd ./nodes/0/
-    docker compose -f docker-compose.test.yaml \
-      -f docker-compose.yaml \
-      -f docker-compose.volumes.yaml \
-      --profile l0 \
-      up -d
-    cd ../../
-
-    gl0_url="${TEST_HOST:-http://localhost}:${DAG_L0_PORT_PREFIX}00"
-    wait_timeout=$((GL0_GENESIS_WAIT_ATTEMPTS * 5))
-    echo "Waiting for gl0-0 to reach ordinal $GL0_GENESIS_MIN_ORDINAL before starting validators (timeout: ${wait_timeout}s)..."
-    for attempt in $(seq 1 $GL0_GENESIS_WAIT_ATTEMPTS); do
-      ordinal=$(curl -s "${gl0_url}/global-snapshots/latest" 2>/dev/null | jq -r '.value.ordinal // empty' 2>/dev/null || echo "")
-      if [ -n "$ordinal" ] && [ "$ordinal" -ge "$GL0_GENESIS_MIN_ORDINAL" ]; then
-        echo "GL0 genesis reached ordinal $ordinal — starting validators"
-        break
-      fi
-      if [ "$attempt" -eq "$GL0_GENESIS_WAIT_ATTEMPTS" ]; then
-        echo "ERROR: GL0 genesis did not reach ordinal $GL0_GENESIS_MIN_ORDINAL within ${wait_timeout}s"
-        docker logs gl0-0 || true
-        exit 1
-      fi
-      sleep 5
-    done
-
-    # Start remaining GL0 validator nodes
-    for i in $(seq 1 $((NUM_GL0_NODES - 1))); do
-      cd ./nodes/$i/
+    if [ "$GL0_STAGED_STARTUP" = "true" ]; then
+      # Staged mode: genesis first, wait for snapshots, then validators
+      echo "Starting GL0 genesis node (gl0-0) in staged mode..."
+      cd ./nodes/0/
       docker compose -f docker-compose.test.yaml \
         -f docker-compose.yaml \
         -f docker-compose.volumes.yaml \
         --profile l0 \
         up -d
       cd ../../
-    done
+
+      gl0_url="${TEST_HOST:-http://localhost}:${DAG_L0_PORT_PREFIX}00"
+      wait_timeout=$((GL0_GENESIS_WAIT_ATTEMPTS * 5))
+      echo "Waiting for gl0-0 to reach ordinal $GL0_GENESIS_MIN_ORDINAL before starting validators (timeout: ${wait_timeout}s)..."
+      for attempt in $(seq 1 $GL0_GENESIS_WAIT_ATTEMPTS); do
+        ordinal=$(curl -s "${gl0_url}/global-snapshots/latest" 2>/dev/null | jq -r '.value.ordinal // empty' 2>/dev/null || echo "")
+        if [ -n "$ordinal" ] && [ "$ordinal" -ge "$GL0_GENESIS_MIN_ORDINAL" ]; then
+          echo "GL0 genesis reached ordinal $ordinal — starting validators"
+          break
+        fi
+        if [ "$attempt" -eq "$GL0_GENESIS_WAIT_ATTEMPTS" ]; then
+          echo "ERROR: GL0 genesis did not reach ordinal $GL0_GENESIS_MIN_ORDINAL within ${wait_timeout}s"
+          docker logs gl0-0 || true
+          exit 1
+        fi
+        sleep 5
+      done
+
+      for i in $(seq 1 $((NUM_GL0_NODES - 1))); do
+        cd ./nodes/$i/
+        docker compose -f docker-compose.test.yaml \
+          -f docker-compose.yaml \
+          -f docker-compose.volumes.yaml \
+          --profile l0 \
+          up -d
+        cd ../../
+      done
+    else
+      # Default: start all GL0 nodes together
+      for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
+        cd ./nodes/$i/
+        docker compose -f docker-compose.test.yaml \
+          -f docker-compose.yaml \
+          -f docker-compose.volumes.yaml \
+          --profile l0 \
+          up -d
+        cd ../../
+      done
+    fi
   fi
 
   # Wait for GL0 cluster to be ready before starting GL1
