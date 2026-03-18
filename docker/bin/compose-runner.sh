@@ -164,11 +164,20 @@ else
     cd ../../
   done
 
-  # Start genesis GL0 node (node 0) first and wait for it to produce snapshots.
-  # Validators need downloadable snapshots to transition from Observing → Ready.
-  # Without this, they retry snapshot downloads for minutes before catching up.
-  if [ "$NUM_GL0_NODES" -gt 0 ]; then
-    echo "Starting GL0 genesis node (gl0-0)..."
+  # Start GL0 nodes.
+  # Two modes:
+  #   GL0_STAGED_STARTUP=true  — genesis starts first, produces snapshots,
+  #                              then validators join (needed for fork-recovery
+  #                              tests with 4+ nodes where validators need
+  #                              downloadable snapshots immediately).
+  #   GL0_STAGED_STARTUP=false — all nodes start together (default). Safer for
+  #                              metagraph tests because all nodes receive state
+  #                              channel snapshots at the same time, avoiding
+  #                              non-deterministic divergence.
+  GL0_STAGED_STARTUP=${GL0_STAGED_STARTUP:-false}
+
+  if [ "$GL0_STAGED_STARTUP" = "true" ] && [ "$NUM_GL0_NODES" -gt 0 ]; then
+    echo "Starting GL0 genesis node (gl0-0) with staged startup..."
     cd ./nodes/0/
     docker compose -f docker-compose.test.yaml \
       -f docker-compose.yaml \
@@ -195,18 +204,29 @@ else
       fi
       sleep 5
     done
-  fi
 
-  # Start remaining GL0 validator nodes
-  for i in $(seq 1 $((NUM_GL0_NODES - 1))); do
-    cd ./nodes/$i/
-    docker compose -f docker-compose.test.yaml \
-      -f docker-compose.yaml \
-      -f docker-compose.volumes.yaml \
-      --profile l0 \
-      up -d
-    cd ../../
-  done
+    # Start remaining GL0 validator nodes
+    for i in $(seq 1 $((NUM_GL0_NODES - 1))); do
+      cd ./nodes/$i/
+      docker compose -f docker-compose.test.yaml \
+        -f docker-compose.yaml \
+        -f docker-compose.volumes.yaml \
+        --profile l0 \
+        up -d
+      cd ../../
+    done
+  else
+    # Start all GL0 nodes together (default)
+    for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
+      cd ./nodes/$i/
+      docker compose -f docker-compose.test.yaml \
+        -f docker-compose.yaml \
+        -f docker-compose.volumes.yaml \
+        --profile l0 \
+        up -d
+      cd ../../
+    done
+  fi
 
   # Wait for GL0 cluster to be ready before starting GL1
   # GL1 needs GL0 for L0PeerDiscovery; without this, GL1's join state machine
