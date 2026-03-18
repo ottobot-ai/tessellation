@@ -149,7 +149,7 @@ object Main
             services.eventMempool,
             storages.cluster,
             storages.node,
-            sharedResources.client,
+            sharedResources.gossipClient,
             sharedServices.session,
             getLocalChainTip = Some(getLocalChainTip),
             getLocalOrdinal = Some(getLocalOrdinal),

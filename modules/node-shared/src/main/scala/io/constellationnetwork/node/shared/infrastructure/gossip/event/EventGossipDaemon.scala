@@ -76,12 +76,12 @@ case class EventGossipConfig(
   meshDegree: Int = 6, // D parameter (target peers in mesh)
   meshLow: Int = 4, // D_lo - minimum mesh size
   meshHigh: Int = 12, // D_hi - maximum mesh size
-  heartbeatInterval: FiniteDuration = 5.seconds,
+  heartbeatInterval: FiniteDuration = EventGossipConfig.defaultHeartbeatInterval,
   messageWindowSize: Int = 5, // History window for deduplication
   gossipFactor: Int = 3, // IHAVE to D_lazy peers
   publishTimeout: FiniteDuration = 5.seconds,
   fetchTimeout: FiniteDuration = 5.seconds,
-  pullInterval: FiniteDuration = 10.seconds, // How often to pull from peers
+  pullInterval: FiniteDuration = EventGossipConfig.defaultPullInterval,
   maxConcurrentPulls: Int = 3, // Max concurrent IHAVE/IWANT operations
   minPeerScore: Double = -100.0, // Minimum score before pruning
   scoreDecay: Double = 0.9, // Score decay factor per heartbeat
@@ -91,6 +91,23 @@ case class EventGossipConfig(
   pullRetryAttempts: Int = 3, // Number of retry attempts for pull operations
   pullRetryBackoff: FiniteDuration = 500.millis // Initial backoff delay for retries
 )
+
+object EventGossipConfig {
+
+  /** Default intervals, configurable via environment variables for resource-constrained CI environments.
+    *
+    * CL_EVENT_GOSSIP_HEARTBEAT_SECONDS — heartbeat interval (default 10) CL_EVENT_GOSSIP_PULL_SECONDS — pull interval (default 20)
+    */
+  val defaultHeartbeatInterval: FiniteDuration = {
+    val seconds = sys.env.getOrElse("CL_EVENT_GOSSIP_HEARTBEAT_SECONDS", "10").toLongOption.getOrElse(10L)
+    seconds.seconds
+  }
+
+  val defaultPullInterval: FiniteDuration = {
+    val seconds = sys.env.getOrElse("CL_EVENT_GOSSIP_PULL_SECONDS", "20").toLongOption.getOrElse(20L)
+    seconds.seconds
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Component 1: SeenHashCache — TTL-based dedup cache
@@ -181,7 +198,7 @@ private[event] object GossipPublisher {
             .ifM(
               ifTrue = {
                 val push = EventPush(event.hash, event.signed)
-                meshPeers.parTraverse_ { peer =>
+                meshPeers.traverse_ { peer =>
                   client
                     .pushEvent(push)
                     .run(Peer.toP2PContext(peer))
@@ -305,7 +322,7 @@ private[event] object GraftSyncer {
     new GraftSyncer[F, Event, Key] {
 
       override def syncMissingToNewPeers(newPeers: List[Peer]): F[Unit] =
-        newPeers.parTraverse_ { peer =>
+        newPeers.traverse_ { peer =>
           (for {
             theirHashes <- client.getIHave.run(Peer.toP2PContext(peer))
             _ <- theirHashes.chainTip.traverse_(tip => meshState.updateChainTip(peer.id, tip))
@@ -447,8 +464,8 @@ private class EventGossipDaemonImpl[F[_]: Async: Parallel, Event, Key](
   /** Start the daemon. Waits for the node to reach Ready state AND for the cluster to have at least one other Ready peer before beginning
     * heartbeat and pull loops. This prevents the gossip daemon from generating P2P traffic during:
     *   - Snapshot download and chain building (would compete with consensus HTTP calls on the shared client pool)
-    *   - Solo genesis rounds (genesis produces snapshots alone before validators join; gossip traffic during this window can shift consensus
-    *     timing enough to cause facilitators-hash divergence, which triggers fork detection)
+    *   - Solo genesis rounds (genesis produces snapshots alone before validators join; gossip traffic during this window can shift
+    *     consensus timing enough to cause facilitators-hash divergence, which triggers fork detection)
     *
     * The daemon can still receive events via routes (receiveEvent) before starting — those are buffered in the incoming queue.
     *
@@ -531,7 +548,7 @@ private class EventGossipDaemonImpl[F[_]: Async: Parallel, Event, Key](
         .awakeEvery[F](config.heartbeatInterval)
         .evalMap(_ => running.get)
         .filter(identity)
-        .evalMap(_ => runHeartbeat)
+        .evalMap(_ => runHeartbeat >> Async[F].cede)
         .compile
         .drain
     }.void
@@ -569,7 +586,7 @@ private class EventGossipDaemonImpl[F[_]: Async: Parallel, Event, Key](
         .awakeEvery[F](config.pullInterval)
         .evalMap(_ => running.get)
         .filter(identity)
-        .evalMap(_ => puller.pullFromPeers)
+        .evalMap(_ => puller.pullFromPeers >> Async[F].cede)
         .compile
         .drain
     }.void

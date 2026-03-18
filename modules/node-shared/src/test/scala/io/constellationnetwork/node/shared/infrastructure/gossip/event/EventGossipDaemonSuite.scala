@@ -23,11 +23,11 @@ object EventGossipDaemonSuite extends SimpleIOSuite {
         config.meshDegree == 6,
         config.meshLow == 4,
         config.meshHigh == 12,
-        config.heartbeatInterval == 5.seconds,
+        config.heartbeatInterval == EventGossipConfig.defaultHeartbeatInterval,
         config.gossipFactor == 3,
         config.publishTimeout == 5.seconds,
         config.fetchTimeout == 5.seconds,
-        config.pullInterval == 10.seconds,
+        config.pullInterval == EventGossipConfig.defaultPullInterval,
         config.maxConcurrentPulls == 3
       )
     }
