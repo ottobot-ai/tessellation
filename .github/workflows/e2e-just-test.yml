@@ -143,12 +143,6 @@ jobs:
           if [ -n "${{ matrix.test-group.num-gl0 }}" ]; then
             EXTRA_ARGS="--num-gl0=${{ matrix.test-group.num-gl0 }}"
           fi
-          if [ -n "${{ matrix.test-group.staged-startup }}" ]; then
-            export GL0_STAGED_STARTUP=${{ matrix.test-group.staged-startup }}
-          fi
-          if [ -n "${{ matrix.test-group.genesis-min-ordinal }}" ]; then
-            export GL0_GENESIS_MIN_ORDINAL=${{ matrix.test-group.genesis-min-ordinal }}
-          fi
           just test --skip-assembly --test=${{ matrix.test-group.tests }} $EXTRA_ARGS
 
       - name: Collect Docker container logs
