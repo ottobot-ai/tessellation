@@ -75,12 +75,12 @@ case class EventGossipConfig(
   meshDegree: Int = 6, // D parameter (target peers in mesh)
   meshLow: Int = 4, // D_lo - minimum mesh size
   meshHigh: Int = 12, // D_hi - maximum mesh size
-  heartbeatInterval: FiniteDuration = 1.second,
+  heartbeatInterval: FiniteDuration = 5.seconds,
   messageWindowSize: Int = 5, // History window for deduplication
   gossipFactor: Int = 3, // IHAVE to D_lazy peers
   publishTimeout: FiniteDuration = 5.seconds,
   fetchTimeout: FiniteDuration = 5.seconds,
-  pullInterval: FiniteDuration = 2.seconds, // How often to pull from peers
+  pullInterval: FiniteDuration = 10.seconds, // How often to pull from peers
   maxConcurrentPulls: Int = 3, // Max concurrent IHAVE/IWANT operations
   minPeerScore: Double = -100.0, // Minimum score before pruning
   scoreDecay: Double = 0.9, // Score decay factor per heartbeat

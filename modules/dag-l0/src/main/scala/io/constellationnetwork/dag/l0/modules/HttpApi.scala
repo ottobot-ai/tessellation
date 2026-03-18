@@ -17,13 +17,13 @@ import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.config.types.{HttpConfig, RouteRateLimiterConfig, SharedConfig}
 import io.constellationnetwork.node.shared.http.p2p.middlewares.{MetricsMiddleware, PeerAuthMiddleware, `X-Id-Middleware`}
 import io.constellationnetwork.node.shared.http.routes._
-import io.constellationnetwork.node.shared.snapshot.global.GlobalSnapshotEvent
-import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.CombinedSnapshotCheckpointFileSystemStorage
 import io.constellationnetwork.node.shared.modules.SharedValidators
+import io.constellationnetwork.node.shared.snapshot.global.GlobalSnapshotEvent
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.TessellationVersion
