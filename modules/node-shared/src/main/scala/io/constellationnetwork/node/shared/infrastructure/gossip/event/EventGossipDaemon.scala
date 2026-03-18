@@ -110,8 +110,8 @@ private[event] object SeenHashCache {
 
   /** Create a SeenHashCache backed by a Map + insertion-order Vector for O(1) FIFO eviction.
     *
-    * When at capacity, the oldest 25% of entries are dropped in O(k) time (k = entries to remove)
-    * rather than O(n log n) from sorting the entire map. TTL-expired entries are also pruned lazily.
+    * When at capacity, the oldest 25% of entries are dropped in O(k) time (k = entries to remove) rather than O(n log n) from sorting the
+    * entire map. TTL-expired entries are also pruned lazily.
     */
   def make[F[_]: Async](maxSize: Int, ttlMs: Long): F[SeenHashCache[F]] =
     Ref.of[F, (Map[Hash, Long], Vector[Hash])]((Map.empty, Vector.empty)).map { ref =>
@@ -126,20 +126,21 @@ private[event] object SeenHashCache {
         override def markSeen(hash: Hash): F[Unit] =
           for {
             nowMs <- Clock[F].realTime.map(_.toMillis)
-            _ <- ref.update { case (map, order) =>
-              if (map.contains(hash)) {
-                // Already tracked, just update timestamp
-                (map + (hash -> nowMs), order)
-              } else {
-                // FIFO eviction: drop oldest 25% when at capacity
-                val (evictedMap, evictedOrder) = if (map.size >= maxSize) {
-                  val toRemove = map.size / 4
-                  val (dropped, kept) = order.splitAt(toRemove)
-                  val newMap = dropped.foldLeft(map)(_ - _)
-                  (newMap, kept)
-                } else (map, order)
-                (evictedMap + (hash -> nowMs), evictedOrder :+ hash)
-              }
+            _ <- ref.update {
+              case (map, order) =>
+                if (map.contains(hash)) {
+                  // Already tracked, just update timestamp
+                  (map + (hash -> nowMs), order)
+                } else {
+                  // FIFO eviction: drop oldest 25% when at capacity
+                  val (evictedMap, evictedOrder) = if (map.size >= maxSize) {
+                    val toRemove = map.size / 4
+                    val (dropped, kept) = order.splitAt(toRemove)
+                    val newMap = dropped.foldLeft(map)(_ - _)
+                    (newMap, kept)
+                  } else (map, order)
+                  (evictedMap + (hash -> nowMs), evictedOrder :+ hash)
+                }
             }
           } yield ()
 
@@ -443,17 +444,16 @@ private class EventGossipDaemonImpl[F[_]: Async: Parallel, Event, Key](
 
   private val logger = Slf4jLogger.getLogger[F]
 
-  /** Start the daemon. Waits for the node to reach Ready state before
-    * beginning heartbeat and pull loops. This prevents the gossip daemon
-    * from generating P2P traffic during snapshot download and chain building,
-    * which would compete with consensus HTTP calls on the shared client pool.
+  /** Start the daemon. Waits for the node to reach Ready state AND for the cluster to have at least one other Ready peer before beginning
+    * heartbeat and pull loops. This prevents the gossip daemon from generating P2P traffic during:
+    *   - Snapshot download and chain building (would compete with consensus HTTP calls on the shared client pool)
+    *   - Solo genesis rounds (genesis produces snapshots alone before validators join; gossip traffic during this window can shift consensus
+    *     timing enough to cause facilitators-hash divergence, which triggers fork detection)
     *
-    * The daemon can still receive events via routes (receiveEvent) before
-    * Ready — those are buffered in the incoming queue.
+    * The daemon can still receive events via routes (receiveEvent) before starting — those are buffered in the incoming queue.
     *
-    * This method blocks until Ready, then spawns the loops. It should be
-    * called within a Supervisor (e.g. via Daemon.spawn) so the wait doesn't
-    * block node startup.
+    * This method blocks until both conditions are met, then spawns the loops. It should be called within a Supervisor (e.g. via
+    * Daemon.spawn) so the wait doesn't block node startup.
     */
   override def start: F[Unit] =
     logger.info("EventGossipDaemon waiting for node to reach Ready state...") >>
@@ -462,10 +462,23 @@ private class EventGossipDaemonImpl[F[_]: Async: Parallel, Event, Key](
         .head
         .compile
         .drain >>
+      logger.info("EventGossipDaemon node is Ready, waiting for cluster peers...") >>
+      waitForClusterPeers >>
       running.set(true) >>
       startHeartbeatLoop >>
       startPullLoop >>
-      logger.info("EventGossipDaemon started (node is Ready)")
+      logger.info("EventGossipDaemon started (node is Ready with cluster peers)")
+
+  /** Wait until at least one other peer is in Ready state. This ensures the gossip daemon doesn't generate P2P traffic during solo genesis
+    * rounds. Polls every 5 seconds.
+    */
+  private def waitForClusterPeers: F[Unit] =
+    getGossipEligiblePeers.flatMap { peers =>
+      if (peers.nonEmpty)
+        logger.info(s"EventGossipDaemon found ${peers.size} eligible peer(s), proceeding")
+      else
+        Async[F].sleep(5.seconds) >> waitForClusterPeers
+    }
 
   override def stop: F[Unit] =
     running.set(false) >>

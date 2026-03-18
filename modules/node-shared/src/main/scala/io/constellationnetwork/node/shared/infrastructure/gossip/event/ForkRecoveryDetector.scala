@@ -35,9 +35,9 @@ case class ForkRecoveryInfo(
   * When a node is on a fork, its ordinal will fall behind the majority of peers. This detector identifies that situation by comparing the
   * local ordinal against the majority ordinal reported by peers through IHave chain tip metadata.
   *
-  * The majority threshold uses strict majority (> 50% of reporting peers). This is intentional: with 4+ nodes required for quorum
-  * (clusters of 3 can't tolerate any loss with 67% quorum), > 50% of chain tip reporters is a reliable signal that the node has diverged.
-  * A higher threshold (e.g., 2/3) would reduce false positives but delay recovery in split-brain scenarios.
+  * The majority threshold uses strict majority (> 50% of reporting peers). This is intentional: with 4+ nodes required for quorum (clusters
+  * of 3 can't tolerate any loss with 67% quorum), > 50% of chain tip reporters is a reliable signal that the node has diverged. A higher
+  * threshold (e.g., 2/3) would reduce false positives but delay recovery in split-brain scenarios.
   */
 trait ForkRecoveryDetector[F[_]] {
   def detectForkDivergence: F[Option[ForkRecoveryInfo]]

@@ -73,9 +73,8 @@ class GlobalStateKeyExtractor[F[_]: Applicative] extends StateKeyExtractor[F, Gl
 
   /** Extract state keys for AllowSpend transactions.
     *
-    * NOTE: Creates keys for all approvers, which is correct for conflict detection. However, AllowSpends
-    * with many approvers may create pathological conflict patterns where unrelated transactions appear
-    * to conflict because they share an approver. Monitor in production.
+    * NOTE: Creates keys for all approvers, which is correct for conflict detection. However, AllowSpends with many approvers may create
+    * pathological conflict patterns where unrelated transactions appear to conflict because they share an approver. Monitor in production.
     */
   private def extractAllowSpendKeys(block: AllowSpendBlock): Set[GlobalStateKey] =
     block.transactions.toList.flatMap { signedAs: Signed[AllowSpend] =>

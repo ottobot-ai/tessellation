@@ -89,31 +89,71 @@ pass() {
 }
 
 # ── Phase 1: Wait for cluster stability ────────────────────────
+# Genesis runs solo consensus (~43s/round) until validators download its
+# snapshots and join.  We must wait until ALL nodes are producing rounds
+# together before isolating — otherwise the lagging genesis node is on a
+# different ordinal and consensus stalls after isolation.
 
-echo "Phase 1: Waiting for cluster stability (${STABILIZE_WAIT}s)..."
+echo "Phase 1: Waiting for ALL $NUM_GL0 GL0 nodes to synchronise (${STABILIZE_WAIT}s)..."
 
 deadline=$(($(date +%s) + STABILIZE_WAIT))
 stable=false
 while [ "$(date +%s)" -lt "$deadline" ]; do
-  ord=$(get_ordinal "$MONITOR_NODE")
-  fac=$(get_facilitator_count "$MONITOR_NODE")
-  if [ -n "$ord" ] && [ "$ord" -gt 5 ] && [ -n "$fac" ] && [ "$fac" -ge 3 ]; then
-    echo "  Cluster stable: ordinal=$ord facilitators=$fac"
+  all_synced=true
+  min_ord=999999
+  max_ord=0
+  status_line=""
+
+  for i in $(seq 0 $((NUM_GL0 - 1))); do
+    node="gl0-${i}"
+    ord=$(get_ordinal "$node")
+    fac=$(get_facilitator_count "$node")
+    status_line="${status_line} ${node}:ord=${ord:-?}/fac=${fac:-?}"
+
+    # Every node must report an ordinal, facilitators == NUM_GL0, and ordinal > 5
+    if [ -z "$ord" ] || [ "$ord" -le 5 ] || [ -z "$fac" ] || [ "$fac" -lt "$NUM_GL0" ]; then
+      all_synced=false
+    fi
+
+    # Track ordinal spread
+    if [ -n "$ord" ]; then
+      [ "$ord" -lt "$min_ord" ] && min_ord=$ord
+      [ "$ord" -gt "$max_ord" ] && max_ord=$ord
+    fi
+  done
+
+  # All nodes must be within 1 ordinal of each other (same round or adjacent)
+  spread=$((max_ord - min_ord))
+  if [ "$all_synced" = true ] && [ "$spread" -le 1 ]; then
+    echo "  Cluster synchronised: $status_line (spread=$spread)"
     stable=true
     break
   fi
-  echo "  Waiting... ordinal=${ord:-?} facilitators=${fac:-?}"
+
+  echo "  Waiting...${status_line} spread=${spread}"
   sleep 10
 done
 
 if [ "$stable" != "true" ]; then
-  fail "Cluster did not stabilize within ${STABILIZE_WAIT}s"
+  fail "Cluster did not synchronise within ${STABILIZE_WAIT}s"
 fi
 
-# Record pre-isolation state
+# Give one extra round for any lingering lag to settle
+echo "  Waiting one extra consensus round (45s) for safety..."
+sleep 45
+
+# Record pre-isolation state — use the node with the LOWEST ordinal as reference
 pre_ordinal=$(get_ordinal "$MONITOR_NODE")
 pre_isolation_ordinal=$(get_ordinal "$ISOLATION_NODE" 2>/dev/null || echo "$pre_ordinal")
 echo "  Pre-isolation ordinal: $pre_ordinal (monitor), $pre_isolation_ordinal (isolated node)"
+
+# Final sanity: verify all nodes still in sync after the safety wait
+for i in $(seq 0 $((NUM_GL0 - 1))); do
+  node="gl0-${i}"
+  ord=$(get_ordinal "$node")
+  fac=$(get_facilitator_count "$node")
+  echo "    $node: ordinal=$ord facilitators=$fac"
+done
 
 # ── Phase 2: Isolate node ──────────────────────────────────────
 
