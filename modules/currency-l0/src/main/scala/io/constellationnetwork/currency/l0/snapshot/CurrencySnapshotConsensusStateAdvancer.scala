@@ -418,11 +418,12 @@ object CurrencySnapshotConsensusStateAdvancer {
           maybeLeaderProposal match {
             case Some(leaderProposal) =>
               for {
-                // Skip facilitatorsHash fork check when view > 0 (eviction happened)
+                // Skip facilitatorsHash fork check when view > 0 (eviction) or solo→multi transition
+                lastSolo <- wasLastRoundSolo
                 _ <- checkForkByFacilitatorsHash(
                   SortedMap(leader -> leaderProposal),
                   status.facilitatorsHash
-                )(_.facilitatorsHash).whenA(state.viewNumber === 0)
+                )(_.facilitatorsHash).whenA(state.viewNumber === 0 && !lastSolo)
                 _ <- checkForkByLastSnapshotHash(
                   SortedMap(leader -> leaderProposal),
                   status.lastSnapshotHash
@@ -586,10 +587,11 @@ object CurrencySnapshotConsensusStateAdvancer {
         for {
           maybeSignatures <- maybeGetQuorumDeclarations(state, resources)(_.signature)(_.facilitatorsHash)
           maybeFacilities <- maybeGetQuorumDeclarations(state, resources)(_.facility)(_.trigger)
-          // Skip facilitatorsHash fork check when view > 0 (eviction happened)
+          // Skip facilitatorsHash fork check when view > 0 (eviction) or solo→multi transition
+          lastSolo2 <- wasLastRoundSolo
           _ <- maybeSignatures
             .traverse_(checkForkByFacilitatorsHash(_, status.facilitatorsHash)(_.facilitatorsHash))
-            .whenA(state.viewNumber === 0)
+            .whenA(state.viewNumber === 0 && !lastSolo2)
           _ <- maybeSignatures.traverse_(checkForkByLastSnapshotHash(_, status.lastSnapshotHash))
           maybeGlobalOrd = extractGlobalSnapshotOrdinal(maybeFacilities)
           result <- (maybeGlobalOrd, maybeSignatures) match {
@@ -677,10 +679,11 @@ object CurrencySnapshotConsensusStateAdvancer {
       ): F[Option[Transition]] =
         for {
           maybeBinarySignatures <- maybeGetQuorumDeclarations(state, resources)(_.binarySignature)(_.facilitatorsHash)
-          // Skip facilitatorsHash fork check when view > 0 (eviction happened)
+          // Skip facilitatorsHash fork check when view > 0 (eviction) or solo→multi transition
+          lastSolo3 <- wasLastRoundSolo
           _ <- maybeBinarySignatures
             .traverse_(checkForkByFacilitatorsHash(_, status.facilitatorsHash)(_.facilitatorsHash))
-            .whenA(state.viewNumber === 0)
+            .whenA(state.viewNumber === 0 && !lastSolo3)
           _ <- maybeBinarySignatures.traverse_(checkForkByLastSnapshotHash(_, status.lastSnapshotHash))
           result <- maybeBinarySignatures.flatTraverse(toFinishedPhase(state, status, _))
         } yield result
@@ -938,6 +941,15 @@ object CurrencySnapshotConsensusStateAdvancer {
         recoverIfForking[F](ownHash, lastSnapshotHashObservationName, restartService, nodeStorage, leavingDelay)(
           declarations.map { case (pid, decl) => (pid, extract(decl)) }
         )
+
+      /** Skip facilitatorsHash fork check when transitioning from solo genesis (facilitators=1) to multi-node consensus. PeerQualityTracker
+        * penalty state is node-local, causing different facilitatorsHash values on the first multi-node round.
+        */
+      private def wasLastRoundSolo: F[Boolean] =
+        consensusStorage.getLastConsensusOutcome.map {
+          case Some(outcome) => outcome.facilitators.value.size <= 1
+          case None          => true
+        }
 
       private def checkForkByFacilitatorsHash[A](
         declarations: SortedMap[PeerId, A],

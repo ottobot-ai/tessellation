@@ -539,12 +539,13 @@ object GlobalSnapshotConsensusStateAdvancer {
               case Some(leaderProposal) =>
                 for {
                   _ <- loggerBundle.consensus.collectingProposals(List(leader))
-                  // Skip facilitatorsHash fork check when view > 0 (eviction happened) — different
-                  // nodes may have different facilitator sets after stall-based eviction.
+                  // Skip facilitatorsHash fork check when view > 0 (eviction happened) or when
+                  // transitioning from solo genesis to multi-node consensus (penalty state diverges).
+                  lastSolo <- wasLastRoundSolo
                   _ <- checkForkByFacilitatorsHash(
                     SortedMap(leader -> leaderProposal),
                     status.facilitatorsHash
-                  )(_.facilitatorsHash).whenA(state.viewNumber === 0)
+                  )(_.facilitatorsHash).whenA(state.viewNumber === 0 && !lastSolo)
                   _ <- checkForkByLastSnapshotHash(
                     SortedMap(leader -> leaderProposal),
                     status.lastSnapshotHash
@@ -957,10 +958,11 @@ object GlobalSnapshotConsensusStateAdvancer {
             maybeSignatures <- maybeGetQuorumDeclarations(state, resources)(_.signature)(_.facilitatorsHash)
             facilitators = maybeSignatures.map(_.keys.toList).getOrElse(List.empty[PeerId])
             _ <- loggerBundle.consensus.collectingSignatures(facilitators)
-            // Skip facilitatorsHash fork check when view > 0 (eviction happened)
+            // Skip facilitatorsHash fork check when view > 0 (eviction happened) or solo→multi transition
+            lastSolo2 <- wasLastRoundSolo
             _ <- maybeSignatures
               .traverse_(checkForkByFacilitatorsHash(_, status.facilitatorsHash)(_.facilitatorsHash))
-              .whenA(state.viewNumber === 0)
+              .whenA(state.viewNumber === 0 && !lastSolo2)
             _ <- maybeSignatures.traverse_(checkForkByLastSnapshotHash(_, status.lastSnapshotHash))
             result <- maybeSignatures.flatTraverse(toFinishedPhase(state, status, _))
           } yield result
@@ -1115,6 +1117,16 @@ object GlobalSnapshotConsensusStateAdvancer {
       recoverIfForking[F](ownHash, lastSnapshotHashObservationName, restartService, nodeStorage, leavingDelay)(
         declarations.map { case (pid, decl) => (pid, extract(decl)) }
       )
+
+    /** Skip facilitatorsHash fork check when transitioning from solo genesis (facilitators=1) to multi-node consensus. During solo rounds,
+      * PeerQualityTracker penalty state diverges between genesis and downloading validators (it's node-local, not shared via consensus).
+      * This causes different facilitatorsHash values on the first multi-node round.
+      */
+    private def wasLastRoundSolo: F[Boolean] =
+      consensusStorage.getLastConsensusOutcome.map {
+        case Some(outcome) => outcome.facilitators.value.size <= 1
+        case None          => true // No previous round — genesis, treat as solo
+      }
 
     private def checkForkByFacilitatorsHash[A](
       declarations: SortedMap[PeerId, A],
