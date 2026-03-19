@@ -33,7 +33,7 @@ const sleep = (ms) => {
 const checkIfNodeIsReady = async (url, name) => {
   console.log(`Checking if ${name} is ready`);
   const checkInterval = 10 * 1000;
-  const maxAttempts = 24; // 240s total (increased from 120s for CI reliability)
+  const maxAttempts = 36; // 360s total — genesis needs ~5 ordinals at 43s each before validators can reach Ready
   for (let idx = 0; idx < maxAttempts; idx++) {
     try {
       // Use minimal retries in fetchData since outer loop handles retry-over-time
