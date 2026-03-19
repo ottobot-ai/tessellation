@@ -149,40 +149,65 @@ const getNodeParamsNodeIdVerify = async (
   expectedRewardFraction,
   expectedOrdinal,
 ) => {
-  await sleep(5000);
-  const response = await axios.get(
-    `${urls.globalL0Url}/node-params/${nodeId}?t=${Date.now()}`,
-    {
-      headers: {
-        'Cache-Control': 'no-cache, no-store, must-revalidate',
-        Pragma: 'no-cache',
-        Expires: '0',
-      },
-    },
-  )
-  if (response.status !== 200)
-    throw new Error(`NodeParamsNode returned ${response.status} instead of 200`)
-  const receivedRewardFraction =
-    response.data.latest.value.delegatedStakeRewardParameters.rewardFraction
-  if (receivedRewardFraction !== expectedRewardFraction)
-    throw new Error(
-      `Node parameters node rewardFraction expected ${expectedRewardFraction} but received ${receivedRewardFraction}`,
-    )
+  const maxAttempts = 30;
+  const intervalMs = 5000;
 
-  const receivedName = response.data.latest.value.nodeMetadataParameters.name
-  if (receivedName !== expectedName) {
-    throw new Error(
-      `Node parameters node name expected ${expectedName} but received ${receivedName}`,
-    )
-  }
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    await sleep(intervalMs);
+    let response;
+    try {
+      response = await axios.get(
+        `${urls.globalL0Url}/node-params/${nodeId}?t=${Date.now()}`,
+        {
+          headers: {
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            Pragma: 'no-cache',
+            Expires: '0',
+          },
+        },
+      )
+    } catch (err) {
+      if (err.response && err.response.status === 404 && attempt < maxAttempts) {
+        logWorkflow.info(`Waiting for node-params/${nodeId} to appear (attempt ${attempt}/${maxAttempts}): 404`)
+        continue;
+      }
+      throw err;
+    }
 
-  const receivedOrdinal = response.data.latest.value.parent.ordinal
-  if (receivedOrdinal !== expectedOrdinal) {
-    throw new Error(
-      `Node parameters node name expected expected 0 ordinal but received ${receivedOrdinal}`,
-    )
+    if (response.status !== 200)
+      throw new Error(`NodeParamsNode returned ${response.status} instead of 200`)
+
+    const receivedRewardFraction =
+      response.data.latest.value.delegatedStakeRewardParameters.rewardFraction
+    const receivedName = response.data.latest.value.nodeMetadataParameters.name
+    const receivedOrdinal = response.data.latest.value.parent.ordinal
+
+    const fractionOk = receivedRewardFraction === expectedRewardFraction;
+    const nameOk = receivedName === expectedName;
+    const ordinalOk = receivedOrdinal === expectedOrdinal;
+
+    if (fractionOk && nameOk && ordinalOk) {
+      return;
+    }
+
+    if (attempt < maxAttempts) {
+      const reasons = [];
+      if (!nameOk) reasons.push(`name=${receivedName} expected=${expectedName}`);
+      if (!fractionOk) reasons.push(`fraction=${receivedRewardFraction} expected=${expectedRewardFraction}`);
+      if (!ordinalOk) reasons.push(`ordinal=${receivedOrdinal} expected=${expectedOrdinal}`);
+      logWorkflow.info(`Waiting for node-params/${nodeId} to update (attempt ${attempt}/${maxAttempts}): ${reasons.join(', ')}`)
+      continue;
+    }
+
+    if (!fractionOk)
+      throw new Error(`Node parameters node rewardFraction expected ${expectedRewardFraction} but received ${receivedRewardFraction}`)
+    if (!nameOk)
+      throw new Error(`Node parameters node name expected ${expectedName} but received ${receivedName}`)
+    if (!ordinalOk)
+      throw new Error(`Node parameters node name expected expected 0 ordinal but received ${receivedOrdinal}`)
   }
 }
+
 
 const firstNodeParameterName1 = 'FirstNode1'
 const firstNodeFraction1 = 10000000
