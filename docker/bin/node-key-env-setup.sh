@@ -76,12 +76,12 @@ populate_test_keys() {
   cp ./nodes/1/id_ecdsa.hex $VALIDATOR_1_DIR/id_ecdsa.hex
   cp ./nodes/2/id_ecdsa.hex $VALIDATOR_2_DIR/id_ecdsa.hex
 
-  # Alternative for overriding github checked in keys if needed
-  # DELEGATED_STAKING_KEYS_DIR=$PROJECT_ROOT/.github/action_scripts/delegated_staking/keys
-  # mkdir -p $DELEGATED_STAKING_KEYS_DIR
-  # cp ./nodes/0/id_ecdsa.hex $DELEGATED_STAKING_KEYS_DIR/genesis-node.hex
-  # cp ./nodes/1/id_ecdsa.hex $DELEGATED_STAKING_KEYS_DIR/validator-1-node.hex
-  # cp ./nodes/2/id_ecdsa.hex $DELEGATED_STAKING_KEYS_DIR/validator-2-node.hex
+  # Copy generated keys to delegated staking test directory for local test runs
+  DELEGATED_STAKING_KEYS_DIR=$PROJECT_ROOT/.github/action_scripts/delegated_staking/keys
+  mkdir -p $DELEGATED_STAKING_KEYS_DIR
+  cp ./nodes/0/id_ecdsa.hex $DELEGATED_STAKING_KEYS_DIR/genesis-node.hex
+  cp ./nodes/1/id_ecdsa.hex $DELEGATED_STAKING_KEYS_DIR/validator-1-node.hex
+  cp ./nodes/2/id_ecdsa.hex $DELEGATED_STAKING_KEYS_DIR/validator-2-node.hex
 
 }
 
