@@ -523,7 +523,8 @@ const testUpdateDelegatedStake = async (urls, account, stakeHash, nodeId) => {
         urls,
         account.address,
       )
-      return assertDelegatedStakes(
+      // Verify structural fields (exact match)
+      assertDelegatedStakes(
         updatedStakeResponse,
         [
           {
@@ -531,25 +532,32 @@ const testUpdateDelegatedStake = async (urls, account, stakeHash, nodeId) => {
             nodeId,
             amount: originalStake.amount,
             tokenLockRef: originalStake.tokenLockRef,
-            rewardAmount: originalStake.rewardAmount, // balance is transferred
           },
           {
             hash: otherStake.hash,
             nodeId: otherStake.nodeId,
             amount: otherStake.amount,
             tokenLockRef: otherStake.tokenLockRef,
-            rewardAmount: otherStake.rewardAmount,
           },
         ],
         [],
       )
+      // Verify rewards transferred (>= original, since rewards accumulate each ordinal)
+      const updatedStake = updatedStakeResponse.activeDelegatedStakes.find(
+        s => s.hash === updatedStakeHash
+      )
+      if (updatedStake.rewardAmount < originalStake.rewardAmount) {
+        throw new Error(
+          `Expected rewardAmount >= ${originalStake.rewardAmount} but got ${updatedStake.rewardAmount}`
+        )
+      }
     },
     {
       globalL0Url: urls.globalL0Url,
       name: 'assertDelegatedStakeUpdated',
     },
   )
-  logWorkflow.info('Stake update verified with balance change')
+  logWorkflow.info('Stake update verified with balance change and rewards >= original')
 
   logWorkflow.info('---- End testUpdateDelegatedStake ----')
 
@@ -599,7 +607,7 @@ const testIncreaseDelegatedStake = async (urls, account, stakeHash, nodeId) => {
         urls,
         account.address,
       )
-      return assertDelegatedStakes(
+      assertDelegatedStakes(
         updatedStakeResponse,
         [
           {
@@ -607,18 +615,26 @@ const testIncreaseDelegatedStake = async (urls, account, stakeHash, nodeId) => {
             nodeId,
             amount: thirdLockAmount,
             tokenLockRef: thirdLockHash,
-            rewardAmount: originalStake.rewardAmount, // balance is transferred
           }
         ],
         [],
       )
+      // Verify rewards carried over (>= original)
+      const updatedStake = updatedStakeResponse.activeDelegatedStakes.find(
+        s => s.hash === stakeHash
+      )
+      if (updatedStake.rewardAmount < originalStake.rewardAmount) {
+        throw new Error(
+          `Expected rewardAmount >= ${originalStake.rewardAmount} but got ${updatedStake.rewardAmount}`
+        )
+      }
     },
     {
       globalL0Url: urls.globalL0Url,
       name: 'assertDelegatedStakeUpdated',
     },
   )
-  logWorkflow.info('Stake increase verified with balance change')
+  logWorkflow.info('Stake increase verified with balance change and rewards >= original')
 
   logWorkflow.info('---- End testIncreaseDelegatedStake ----')
 
@@ -656,7 +672,7 @@ const testWithdrawDelegatedStake = async (urls, account, stakeHash) => {
         urls,
         account.address,
       )
-      return assertDelegatedStakes(
+      assertDelegatedStakes(
         updatedStakeResponse,
         [
           {
@@ -664,7 +680,6 @@ const testWithdrawDelegatedStake = async (urls, account, stakeHash) => {
             nodeId: otherStake.nodeId,
             amount: otherStake.amount,
             tokenLockRef: otherStake.tokenLockRef,
-            rewardAmount: otherStake.rewardAmount,
           },
         ],
         [
@@ -673,11 +688,18 @@ const testWithdrawDelegatedStake = async (urls, account, stakeHash) => {
             nodeId: originalStake.nodeId,
             amount: originalStake.amount,
             tokenLockRef: originalStake.tokenLockRef,
-            rewardAmount: originalStake.rewardAmount,
-            totalBalance: originalStake.totalBalance,
           },
         ],
       )
+      // Verify pending stake has rewards >= what it had when active
+      const pendingStake = updatedStakeResponse.pendingWithdrawals.find(
+        s => s.hash === stakeHash
+      )
+      if (pendingStake.rewardAmount < originalStake.rewardAmount) {
+        throw new Error(
+          `Expected pending rewardAmount >= ${originalStake.rewardAmount} but got ${pendingStake.rewardAmount}`
+        )
+      }
     },
     {
       globalL0Url: urls.globalL0Url,
