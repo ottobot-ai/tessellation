@@ -58,7 +58,8 @@ object GlobalSnapshotEventsPublisherDaemon {
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     eventGossipDaemon: EventGossipDaemon[F, GlobalSnapshotEvent, GlobalStateKey],
     clusterStorage: ClusterStorage[F],
-    triggerEventConsensus: Option[F[Unit]]
+    triggerEventConsensus: Option[F[Unit]],
+    getLastFacilitatorCount: F[Int]
   ): Daemon[F] = {
     val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromClass[F](GlobalSnapshotEventsPublisherDaemon.getClass)
 
@@ -111,6 +112,7 @@ object GlobalSnapshotEventsPublisherDaemon {
                 eventMempool,
                 clusterStorage,
                 triggerEventConsensus,
+                getLastFacilitatorCount,
                 lastTriggerRef,
                 logger
               )
@@ -147,6 +149,7 @@ object GlobalSnapshotEventsPublisherDaemon {
     eventMempool: EventMempool[F, E, K],
     clusterStorage: ClusterStorage[F],
     triggerEventConsensus: Option[F[Unit]],
+    getLastFacilitatorCount: F[Int],
     lastTriggerRef: Ref[F, Long],
     logger: SelfAwareStructuredLogger[F]
   ): F[Unit] =
@@ -156,9 +159,14 @@ object GlobalSnapshotEventsPublisherDaemon {
         for {
           peers <- clusterStorage.getResponsivePeers.map(_.filter(_.state === NodeState.Ready))
           peerCount = peers.size
+          lastFacCount <- getLastFacilitatorCount
           _ <-
             if (peerCount < MinClusterPeersForEventTrigger)
               Async[F].unit
+            else if (lastFacCount > 0 && lastFacCount < MinClusterPeersForEventTrigger + 1)
+              logger.debug(
+                s"EventTrigger skipped: last round had $lastFacCount facilitator(s), waiting for multi-node consensus"
+              )
             else
               eventMempool.size.flatMap { mempoolSize =>
                 if (mempoolSize < EventTriggerThreshold)
@@ -175,7 +183,7 @@ object GlobalSnapshotEventsPublisherDaemon {
                     }.flatMap {
                       case true =>
                         logger.info(
-                          s"EventTrigger fired: peers=$peerCount, pending=$mempoolSize, " +
+                          s"EventTrigger fired: peers=$peerCount, lastFacilitators=$lastFacCount, pending=$mempoolSize, " +
                             s"threshold=$EventTriggerThreshold, cooldown=${EventTriggerCooldown.toSeconds}s"
                         ) >> trigger
                       case false =>
