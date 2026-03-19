@@ -105,6 +105,20 @@ const checkInitialNodeParamsNode = async (urls, nodeId) => {
   }
 }
 
+const waitForNodeParamsUpdate = async (urls, verifyFn, maxAttempts = 30, intervalMs = 5000) => {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const nodeParams = await getNodeParams(urls)
+      verifyFn(nodeParams)
+      return nodeParams
+    } catch (e) {
+      if (attempt === maxAttempts) throw e
+      logWorkflow.info(`Waiting for node params to propagate (attempt ${attempt}/${maxAttempts}): ${e.message}`)
+      await sleep(intervalMs)
+    }
+  }
+}
+
 const verifyNodeParamsResponse = (
   nodeParams,
   nodeId,
@@ -112,7 +126,7 @@ const verifyNodeParamsResponse = (
   expectedRewardFraction,
 ) => {
   const data = nodeParams.find((item) => item.peerId === nodeId)
-  if (!data) throw new Error(`PeerId is not correct`)
+  if (!data) throw new Error(`PeerId ${nodeId.slice(0, 8)} not found in node-params (have: ${nodeParams.map(p => p.peerId.slice(0, 8)).join(', ') || 'none'})`)
   if (data.nodeMetadataParameters.name !== expectedName)
     throw new Error(
       `Node parameters name expected ${expectedName} but received ${data.nodeMetadataParameters.name}`,
@@ -232,12 +246,8 @@ const testCreateNodeParameters = async (urls) => {
   checkOk(ur1)
   logWorkflow.info('create node params 1 is OK')
 
-  const nodeParamsAfterUpdate = await getNodeParams(urls)
-  verifyNodeParamsResponse(
-    nodeParamsAfterUpdate,
-    nodeId1,
-    firstNodeParameterName1,
-    firstNodeFraction1,
+  await waitForNodeParamsUpdate(urls, (params) =>
+    verifyNodeParamsResponse(params, nodeId1, firstNodeParameterName1, firstNodeFraction1)
   )
   logWorkflow.info('Check updates node params is OK')
 
@@ -261,12 +271,8 @@ const testCreateNodeParameters = async (urls) => {
   checkOk(ur2)
   logWorkflow.info('Update node params second time is OK')
 
-  const nodeParamsAfterSecondUpdate = await getNodeParams(urls)
-  verifyNodeParamsResponse(
-    nodeParamsAfterSecondUpdate,
-    nodeId1,
-    firstNodeParameterName2,
-    firstNodeFraction2,
+  await waitForNodeParamsUpdate(urls, (params) =>
+    verifyNodeParamsResponse(params, nodeId1, firstNodeParameterName2, firstNodeFraction2)
   )
   logWorkflow.info('Check second updates node params is OK')
 
@@ -333,32 +339,12 @@ const testCreateNodeParameters = async (urls) => {
   )
   checkOk(third)
 
-  // tends to fail here in CI, wait a little longer
-  await sleep(5000)
-
-  const allNodeParams = await getNodeParams(urls)
-  if (allNodeParams.length !== 3) {
-    throw new Error(`Expected 3 node params, got ${allNodeParams.length}`)
-  }
-
-  verifyNodeParamsResponse(
-    allNodeParams,
-    nodeId1,
-    firstNodeParameterName2,
-    firstNodeFraction2,
-  )
-  verifyNodeParamsResponse(
-    allNodeParams,
-    nodeId2,
-    secondNodeParameterName1,
-    secondNodeFraction1,
-  )
-  verifyNodeParamsResponse(
-    allNodeParams,
-    nodeId3,
-    thirdNodeParameterName1,
-    thirdNodeFraction1,
-  )
+  await waitForNodeParamsUpdate(urls, (params) => {
+    if (params.length < 3) throw new Error(`Expected 3 node params, got ${params.length}`)
+    verifyNodeParamsResponse(params, nodeId1, firstNodeParameterName2, firstNodeFraction2)
+    verifyNodeParamsResponse(params, nodeId2, secondNodeParameterName1, secondNodeFraction1)
+    verifyNodeParamsResponse(params, nodeId3, thirdNodeParameterName1, thirdNodeFraction1)
+  })
   logWorkflow.info('All nodes check is OK')
 
   logWorkflow.info('---- End testCreateNodeParameters ----')
