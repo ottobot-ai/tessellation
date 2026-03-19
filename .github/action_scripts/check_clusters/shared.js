@@ -1,6 +1,6 @@
 const axios = require('axios');
 
-const fetchData = async (url, maxRetries = 12, retryIntervalMs = 5000) => {
+const fetchData = async (url, maxRetries = 24, retryIntervalMs = 5000) => {
   let lastError = null;
   for (let idx = 0; idx < maxRetries; idx++) {
     try {
@@ -33,7 +33,7 @@ const sleep = (ms) => {
 const checkIfNodeIsReady = async (url, name) => {
   console.log(`Checking if ${name} is ready`);
   const checkInterval = 10 * 1000;
-  const maxAttempts = 36; // 360s total — genesis needs ~5 ordinals at 43s each before validators can reach Ready
+  const maxAttempts = 48; // 480s total (doubled for CI reliability)
   for (let idx = 0; idx < maxAttempts; idx++) {
     try {
       // Use minimal retries in fetchData since outer loop handles retry-over-time

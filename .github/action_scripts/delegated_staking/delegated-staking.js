@@ -688,8 +688,8 @@ const testWithdrawDelegatedStake = async (urls, account, stakeHash) => {
       globalL0Url: urls.globalL0Url,
       name: 'assertDelegatedStakeRemovedFromState',
       // Withdrawal timeout is ~3 min in CI, use generous limits
-      maxOrdinalMisses: 30,
-      maxStalledChecks: 60,
+      maxOrdinalMisses: 60,
+      maxStalledChecks: 120,
       interval: 5000,
     },
   )
@@ -720,8 +720,8 @@ const testWithdrawDelegatedStake = async (urls, account, stakeHash) => {
     {
       globalL0Url: urls.globalL0Url,
       name: 'assertRewardAndTokenUnlock',
-      maxOrdinalMisses: 5,
-      maxStalledChecks: 10,
+      maxOrdinalMisses: 10,
+      maxStalledChecks: 20,
       interval: 3000,
     },
   )

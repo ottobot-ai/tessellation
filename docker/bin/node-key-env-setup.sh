@@ -59,6 +59,45 @@ generate_keys() {
 
 }
 
+generate_missing_keys() {
+  # Generate keys for any node index that doesn't already have pre-generated keys
+  for i in $(seq 0 $((MAX_NODES - 1))); do
+    if [ ! -f "./docker/config/local-test-keys/$i/key.p12" ]; then
+      echo "Generating keys for node $i (not found in local-test-keys)"
+      mkdir -p ./nodes/$i
+      cd ./nodes/$i/
+      cp ../0/.envrc .envrc 2>/dev/null || cp ../../nodes/.envrc .envrc
+
+      out=$(
+        source .envrc
+        java -jar ../keytool.jar generate
+      )
+
+      ret_addr=$(
+        source .envrc
+        java -jar ../wallet.jar show-address
+      )
+      echo "$ret_addr" > address
+      id=$(
+        source .envrc
+        java -jar ../wallet.jar show-id
+      )
+      export=$(
+        source .envrc
+        java -jar ../keytool.jar export
+      )
+
+      echo "$id" > peer_id
+      mkdir -p ../../docker/config/local-test-keys/$i
+      cp key.p12 ../../docker/config/local-test-keys/$i
+      cp address ../../docker/config/local-test-keys/$i
+      cp peer_id ../../docker/config/local-test-keys/$i
+      cp id_ecdsa.hex ../../docker/config/local-test-keys/$i
+      cd ../../
+    fi
+  done
+}
+
 populate_test_keys() {
   for i in $(seq 0 $((MAX_NODES - 1))); do
     cp ./docker/config/local-test-keys/$i/key.p12 ./nodes/$i/key.p12
@@ -68,21 +107,14 @@ populate_test_keys() {
   done
   GENESIS_DIR=$PROJECT_ROOT/.github/code/hypergraph/dag-l0/genesis-node
   mkdir -p $GENESIS_DIR
-  VALIDATOR_1_DIR=$PROJECT_ROOT/.github/code/hypergraph/dag-l0/validator-1
-  VALIDATOR_2_DIR=$PROJECT_ROOT/.github/code/hypergraph/dag-l0/validator-2
-  mkdir -p $VALIDATOR_1_DIR
-  mkdir -p $VALIDATOR_2_DIR
   cp ./nodes/0/id_ecdsa.hex $GENESIS_DIR/id_ecdsa.hex
-  cp ./nodes/1/id_ecdsa.hex $VALIDATOR_1_DIR/id_ecdsa.hex
-  cp ./nodes/2/id_ecdsa.hex $VALIDATOR_2_DIR/id_ecdsa.hex
 
-  # Copy generated keys to delegated staking test directory for local test runs
-  DELEGATED_STAKING_KEYS_DIR=$PROJECT_ROOT/.github/action_scripts/delegated_staking/keys
-  mkdir -p $DELEGATED_STAKING_KEYS_DIR
-  cp ./nodes/0/id_ecdsa.hex $DELEGATED_STAKING_KEYS_DIR/genesis-node.hex
-  cp ./nodes/1/id_ecdsa.hex $DELEGATED_STAKING_KEYS_DIR/validator-1-node.hex
-  cp ./nodes/2/id_ecdsa.hex $DELEGATED_STAKING_KEYS_DIR/validator-2-node.hex
-
+  # Copy validator keys for all non-genesis nodes
+  for i in $(seq 1 $((MAX_NODES - 1))); do
+    VALIDATOR_DIR=$PROJECT_ROOT/.github/code/hypergraph/dag-l0/validator-$i
+    mkdir -p $VALIDATOR_DIR
+    cp ./nodes/$i/id_ecdsa.hex $VALIDATOR_DIR/id_ecdsa.hex
+  done
 }
 
 
@@ -91,27 +123,6 @@ if [ "$REGENERATE_TEST_KEYS" = true ]; then
 fi
 
 # Generate keys for any nodes beyond the pre-generated set (0-2)
-for i in $(seq 0 $((MAX_NODES - 1))); do
-  if [ ! -f "./docker/config/local-test-keys/$i/key.p12" ]; then
-    echo "Generating keys for node $i (not found in local-test-keys)"
-    mkdir -p ./nodes/$i
-    cd ./nodes/$i/
-    cp ../0/.envrc .envrc 2>/dev/null || cp ../../nodes/.envrc .envrc
-
-    out=$(source .envrc && java -jar ../keytool.jar generate)
-    ret_addr=$(source .envrc && java -jar ../wallet.jar show-address)
-    echo "$ret_addr" > address
-    id=$(source .envrc && java -jar ../wallet.jar show-id)
-    export=$(source .envrc && java -jar ../keytool.jar export)
-    echo "$id" > peer_id
-
-    mkdir -p ../../docker/config/local-test-keys/$i
-    cp key.p12 ../../docker/config/local-test-keys/$i
-    cp address ../../docker/config/local-test-keys/$i
-    cp peer_id ../../docker/config/local-test-keys/$i
-    cp id_ecdsa.hex ../../docker/config/local-test-keys/$i
-    cd ../../
-  fi
-done
+generate_missing_keys
 
 populate_test_keys

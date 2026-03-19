@@ -14,6 +14,9 @@ export RELEASE_TAG=${RELEASE_TAG:-""}
 
 export EXTRA_ENV_PATH=${EXTRA_ENV_PATH:-""}
 export EXIT_CODE=${EXIT_CODE:-0}
+export SNAPSHOT_STREAMING_JAR=${SNAPSHOT_STREAMING_JAR:-""}
+export SNAPSHOT_STREAMING_BRANCH=${SNAPSHOT_STREAMING_BRANCH:-"develop"}
+export BLOCK_EXPLORER_BRANCH=${BLOCK_EXPLORER_BRANCH:-"develop"}
 export CL_DOCKER_BIND_INTERFACE=${CL_DOCKER_BIND_INTERFACE:-""}
 export CLEAN_ASSEMBLY=${CLEAN_ASSEMBLY:-false}
 export DO_EXIT=${DO_EXIT:-false}
@@ -139,6 +142,15 @@ for arg in "$@"; do
       ;;
     --hypergraph-release=*)
       export HYPERGRAPH_RELEASE="${arg#*=}"
+      ;;
+    --snapshot-streaming-jar=*)
+      export SNAPSHOT_STREAMING_JAR="${arg#*=}"
+      ;;
+    --snapshot-streaming-branch=*)
+      export SNAPSHOT_STREAMING_BRANCH="${arg#*=}"
+      ;;
+    --block-explorer-branch=*)
+      export BLOCK_EXPLORER_BRANCH="${arg#*=}"
       ;;
     --ml0-path=*)
       export METAGRAPH_ML0_RELATIVE_PATH="${arg#*=}"
@@ -376,7 +388,7 @@ if [ -n "$METAGRAPH" ]; then
     fi
 fi
 
-# Compute MAX_NODES as the maximum of all NUM_*_NODES values (capped at 9)
+# Compute MAX_NODES as the maximum of all NUM_*_NODES values (capped at 10)
 # This drives how many node directories, keys, and configs are created
 _max_of() { [ "$1" -gt "$2" ] && echo "$1" || echo "$2"; }
 MAX_NODES=$(_max_of ${NUM_GL0_NODES:-0} ${NUM_GL1_NODES:-0})
