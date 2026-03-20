@@ -1,7 +1,7 @@
 package io.constellationnetwork.node.shared.infrastructure.snapshot.daemon
 
 import cats.effect.Async
-import cats.effect.std.Supervisor
+import cats.effect.std.{Semaphore, Supervisor}
 import cats.syntax.applicativeError._
 import cats.syntax.eq._
 import cats.syntax.flatMap._
@@ -34,17 +34,27 @@ object DownloadDaemon {
 
     private val logger = Slf4jLogger.getLoggerFromClass[F](DownloadDaemon.getClass)
 
-    def start: F[Unit] = S.supervise(watchForDownload()).void
+    def start: F[Unit] =
+      Semaphore[F](1).flatMap { downloadLock =>
+        S.supervise(watchForDownload(downloadLock)).void
+      }
 
-    private def watchForDownload(): F[Unit] =
+    private def watchForDownload(downloadLock: Semaphore[F]): F[Unit] =
       nodeStorage.nodeStates
         .filter(_ === NodeState.WaitingForDownload)
         .evalTap { _ =>
-          (peerDiscoveryDelay.waitForPeers >> download.download(hasherSelector)).handleErrorWith { err =>
-            logger.error(err)(
-              "Download failed, stream kept alive. " +
-                "Node remains in WaitingForDownload — will retry after 10s backoff."
-            ) >> Async[F].sleep(10.seconds)
+          downloadLock.tryAcquire.flatMap {
+            case true =>
+              Async[F].guaranteeCase(
+                (peerDiscoveryDelay.waitForPeers >> download.download(hasherSelector)).handleErrorWith { err =>
+                  logger.error(err)(
+                    "Download failed, stream kept alive. " +
+                      "Node remains in WaitingForDownload — will retry after 10s backoff."
+                  ) >> Async[F].sleep(10.seconds)
+                }
+              )(_ => downloadLock.release)
+            case false =>
+              logger.debug("Download already in progress, skipping duplicate trigger")
           }
         }
         .compile
