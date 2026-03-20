@@ -49,6 +49,7 @@ if [ "$LIST_TESTS" = "true" ]; then
   echo "DAG tests (no metagraph required):"
   echo "  dag-cluster              DAG cluster check"
   echo "  delegated-staking        Delegated staking tests"
+  echo "  fork-recovery            Fork recovery test (needs --num-gl0=4)"
   echo "  token-lock-replacement   Token lock replacement edge case tests"
   echo "  snapshot-streaming       Snapshot streaming indexer E2E test"
   echo ""
@@ -521,6 +522,15 @@ if should_run_test "token-lock-replacement"; then
   cd $PROJECT_ROOT/.github/action_scripts/delegated_staking
   node token-lock-replacement-edge-cases.js $DAG_L0_PORT_PREFIX $DAG_L1_PORT_PREFIX testTokenLockReplacementEdgeCases
   show_time "Token lock replacement edge case tests completed"
+fi
+
+if should_run_test "fork-recovery"; then
+  echo "================================================"
+  echo "Running fork-recovery test"
+  echo "================================================"
+  cd $PROJECT_ROOT
+  bash docker/bin/test-fork-recovery.sh $DAG_L0_PORT_PREFIX
+  show_time "Fork recovery test completed"
 fi
 
 if should_run_test "snapshot-streaming"; then
