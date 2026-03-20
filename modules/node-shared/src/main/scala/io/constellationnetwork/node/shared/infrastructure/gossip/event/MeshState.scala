@@ -92,6 +92,10 @@ trait MeshState[F[_]] {
     */
   def removePeer(peerId: PeerId): F[Unit]
 
+  /** Clear all mesh state. Used during fork recovery to reset stale peer info.
+    */
+  def clear: F[Unit]
+
   /** Graft a peer into the mesh.
     */
   def graft(peerId: PeerId): F[Boolean]
@@ -201,6 +205,9 @@ object MeshState {
 
     override def removePeer(peerId: PeerId): F[Unit] =
       stateRef.update(_ - peerId)
+
+    override def clear: F[Unit] =
+      stateRef.set(Map.empty)
 
     override def graft(peerId: PeerId): F[Boolean] =
       nowMs.flatMap { now =>

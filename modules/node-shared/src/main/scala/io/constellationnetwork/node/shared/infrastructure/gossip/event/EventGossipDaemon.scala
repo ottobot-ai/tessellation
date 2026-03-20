@@ -60,6 +60,11 @@ trait EventGossipDaemon[F[_], Event, Key] {
 
   /** Get current mesh state for monitoring */
   def getMeshInfo: F[MeshInfo]
+
+  /** Clear mesh state for fork recovery. Resets all peer tracking and chain tips so the next heartbeat re-grafts fresh peers from cluster
+    * storage.
+    */
+  def clearMesh: F[Unit]
 }
 
 /** Information about the current mesh state for monitoring.
@@ -542,13 +547,20 @@ private class EventGossipDaemonImpl[F[_]: Async: Parallel, Event, Key](
         seenHashCount = seenCount
       )
 
+  override def clearMesh: F[Unit] =
+    meshState.clear >> logger.info("Mesh state cleared for fork recovery")
+
   private def startHeartbeatLoop: F[Unit] =
     S.supervise {
       Stream
         .awakeEvery[F](config.heartbeatInterval)
         .evalMap(_ => running.get)
         .filter(identity)
-        .evalMap(_ => runHeartbeat >> Async[F].cede)
+        .evalMap(_ =>
+          (runHeartbeat >> Async[F].cede).handleErrorWith { e =>
+            logger.warn(e)("Heartbeat iteration failed, will retry next interval")
+          }
+        )
         .compile
         .drain
     }.void
@@ -574,9 +586,11 @@ private class EventGossipDaemonImpl[F[_]: Async: Parallel, Event, Key](
           ifTrue = logger.debug(s"Heartbeat: pruned ${result.pruned.size} peers from mesh"),
           ifFalse = Async[F].unit
         )
-      // Proactive fork detection
+      // Proactive fork detection — clear stale mesh before triggering recovery
       _ <- (maybeForkRecoveryDetector, onForkDetected).mapN { (detector, handler) =>
-        detector.detectForkDivergence.flatMap(_.traverse_(handler))
+        detector.detectForkDivergence.flatMap(_.traverse_ { info =>
+          clearMesh >> handler(info)
+        })
       }.sequence_
     } yield ()
 
@@ -586,7 +600,11 @@ private class EventGossipDaemonImpl[F[_]: Async: Parallel, Event, Key](
         .awakeEvery[F](config.pullInterval)
         .evalMap(_ => running.get)
         .filter(identity)
-        .evalMap(_ => puller.pullFromPeers >> Async[F].cede)
+        .evalMap(_ =>
+          (puller.pullFromPeers >> Async[F].cede).handleErrorWith { e =>
+            logger.warn(e)("Pull iteration failed, will retry next interval")
+          }
+        )
         .compile
         .drain
     }.void
