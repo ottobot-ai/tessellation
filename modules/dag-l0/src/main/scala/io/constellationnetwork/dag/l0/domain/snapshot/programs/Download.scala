@@ -162,7 +162,8 @@ object Download {
             combinedSnapshotCheckpointFileSystemStorage.deleteAbove(metadata.ordinal) >>
             mptStore.deleteAbove(metadata.ordinal) >>
             lastNGlobalSnapshotStorage.clear >>
-            lastGlobalSnapshotStorage.clear
+            lastGlobalSnapshotStorage.clear >>
+            consensus.manager.resetForRecovery
         )
 
       def logDownloadInfo(startingPoint: SnapshotOrdinal, metadata: SnapshotMetadata): F[Unit] =
