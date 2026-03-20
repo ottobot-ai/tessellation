@@ -29,7 +29,7 @@ if [ "$NUM_GL0" -lt 4 ]; then
 fi
 
 ISOLATION_DURATION=90   # seconds to keep node isolated
-RECOVERY_TIMEOUT=300    # max seconds to wait for recovery
+RECOVERY_TIMEOUT=600    # max seconds to wait for recovery (observe() needs ~4 ordinals × 43s + download time)
 STABILIZE_WAIT=300      # seconds to wait for initial cluster stability (nodes need time to join + sync)
 
 echo "================================================"
