@@ -128,6 +128,18 @@ object Download {
           } yield ()
         }
         .onError(logger.error(_)("Unexpected failure during download!"))
+        .handleErrorWith { err =>
+          // If download fails after start() succeeded (e.g. during observe() or startFacilitatingAfterDownload),
+          // the node may be stuck in WaitingForObserving/Observing with nobody to retry.
+          // Revert to WaitingForDownload so the DownloadDaemon can retry from scratch.
+          nodeStorage.getNodeState.flatMap {
+            case state if state =!= NodeState.WaitingForDownload && state =!= NodeState.Ready =>
+              logger.warn(s"Download failed in state=$state, reverting to WaitingForDownload for retry") >>
+                nodeStorage.setNodeState(NodeState.WaitingForDownload)
+            case _ =>
+              Async[F].unit // Already in WaitingForDownload (start failed) or Ready (someone else recovered)
+          } >> err.raiseError[F, Unit]
+        }
 
     def start(implicit hasherSelector: HasherSelector[F]): F[DownloadResult] = {
 
