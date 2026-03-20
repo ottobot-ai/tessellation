@@ -160,7 +160,9 @@ object Download {
           logger.info(s"[Download] Cleanup for snapshots greater than ${metadata.ordinal}") >>
             snapshotStorage.cleanupAbove(metadata.ordinal) >>
             combinedSnapshotCheckpointFileSystemStorage.deleteAbove(metadata.ordinal) >>
-            mptStore.deleteAbove(metadata.ordinal)
+            mptStore.deleteAbove(metadata.ordinal) >>
+            lastNGlobalSnapshotStorage.clear >>
+            lastGlobalSnapshotStorage.clear
         )
 
       def logDownloadInfo(startingPoint: SnapshotOrdinal, metadata: SnapshotMetadata): F[Unit] =

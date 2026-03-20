@@ -7,6 +7,8 @@ import cats.syntax.eq._
 import cats.syntax.flatMap._
 import cats.syntax.functor._
 
+import scala.concurrent.duration._
+
 import io.constellationnetwork.node.shared.domain.Daemon
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.PeerDiscoveryDelay
@@ -41,8 +43,8 @@ object DownloadDaemon {
           (peerDiscoveryDelay.waitForPeers >> download.download(hasherSelector)).handleErrorWith { err =>
             logger.error(err)(
               "Download failed, stream kept alive. " +
-                "Node remains in WaitingForDownload — will retry on next state transition."
-            )
+                "Node remains in WaitingForDownload — will retry after 10s backoff."
+            ) >> Async[F].sleep(10.seconds)
           }
         }
         .compile
