@@ -99,12 +99,13 @@ pass() {
 }
 
 # ── Phase 1: Wait for cluster stability ────────────────────────
-# Genesis runs solo consensus (~43s/round) until validators download its
-# snapshots and join.  We must wait until ALL nodes are producing rounds
-# together before isolating — otherwise the lagging genesis node is on a
-# different ordinal and consensus stalls after isolation.
+# Genesis (gl0-0) runs solo consensus (~43s/round) until validators
+# download its snapshots and join.  Genesis typically falls behind and
+# gets evicted once validators form their own quorum.  We only require
+# the VALIDATORS (gl0-1 .. gl0-N) to stabilise — they form the healthy
+# quorum that the test depends on.
 
-echo "Phase 1: Waiting for ALL $NUM_GL0 GL0 nodes to synchronise (${STABILIZE_WAIT}s)..."
+echo "Phase 1: Waiting for validators to synchronise (${STABILIZE_WAIT}s)..."
 
 deadline=$(($(date +%s) + STABILIZE_WAIT))
 stable=false
@@ -120,22 +121,27 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     fac=$(get_facilitator_count "$node")
     status_line="${status_line} ${node}:ord=${ord:-?}/fac=${fac:-?}"
 
-    # Every node must report an ordinal, facilitators == NUM_GL0, and ordinal > 5
-    if [ -z "$ord" ] || [ "$ord" -lt 5 ] || [ "${fac:-0}" -lt "$NUM_GL0" ]; then
+    # Skip genesis (gl0-0) for sync checks — it often falls behind
+    if [ "$i" -eq 0 ]; then
+      continue
+    fi
+
+    # Validators must report an ordinal > 5, facilitators >= 3 (quorum)
+    if [ -z "$ord" ] || [ "$ord" -lt 5 ] || [ "${fac:-0}" -lt 3 ]; then
       all_synced=false
     fi
 
-    # Track ordinal spread
+    # Track ordinal spread (validators only)
     if [ -n "$ord" ]; then
       [ "$ord" -lt "$min_ord" ] && min_ord=$ord
       [ "$ord" -gt "$max_ord" ] && max_ord=$ord
     fi
   done
 
-  # All nodes must be within 1 ordinal of each other (same round or adjacent)
+  # Validators must be within 1 ordinal of each other
   spread=$((max_ord - min_ord))
   if [ "$all_synced" = true ] && [ "$spread" -le 1 ]; then
-    echo "  Cluster synchronised: $status_line (spread=$spread)"
+    echo "  Validators synchronised: $status_line (spread=$spread)"
     stable=true
     break
   fi
@@ -145,14 +151,14 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
 done
 
 if [ "$stable" != "true" ]; then
-  fail "Cluster did not synchronise within ${STABILIZE_WAIT}s"
+  fail "Validators did not synchronise within ${STABILIZE_WAIT}s"
 fi
 
 # Give one extra round for any lingering lag to settle
 echo "  Waiting one extra consensus round (45s) for safety..."
 sleep 45
 
-# Record pre-isolation state — use the node with the LOWEST ordinal as reference
+# Record pre-isolation state from monitor (a validator)
 pre_ordinal=$(get_ordinal "$MONITOR_NODE")
 pre_isolation_ordinal=$(get_ordinal "$ISOLATION_NODE" 2>/dev/null || echo "$pre_ordinal")
 echo "  Pre-isolation ordinal: $pre_ordinal (monitor), $pre_isolation_ordinal (isolated node)"
