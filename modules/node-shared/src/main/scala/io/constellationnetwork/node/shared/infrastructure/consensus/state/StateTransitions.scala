@@ -207,18 +207,11 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
           ifFalse = new Throwable(s"[DownloadInit] Failed to initialize consensus storage").raiseError[F, Unit],
           ifTrue = ctx.nodeStorage.tryModifyState(NodeState.Observing, NodeState.WaitingForReady) >>
             ctx.nodeStorage.setJoiningGracePeriod >>
-            // Schedule a TimeTick after one timer interval instead of starting a round immediately.
-            // Starting immediately (StartRound(none)) creates a 38-second race: the downloading node
-            // begins ordinal N+1 instantly while genesis is still waiting for its 43s TimeTrigger cycle.
-            // The downloader evicts genesis after 10.5s (facilitiesTimeout), completes with facilitators=2,
-            // then genesis completes the same ordinal with facilitators=3 → FORK_DETECTED.
-            // By deferring to TimeTick, the validator naturally syncs to the cluster's timer cadence.
-            Async[F]
-              .start(
-                Async[F].sleep(ctx.config.timeTriggerInterval) >>
-                  queue.offer(TimeTick)
-              )
-              .void
+            // Start round immediately after download.  The wasLastRoundSolo check in the
+            // StateAdvancer skips the facilitatorsHash fork check on the first multi-node
+            // round, preventing the FORK_DETECTED that previously occurred when validators
+            // and genesis computed different facilitator sets during the join window.
+            queue.offer(StartRound(none))
         )
     } yield ()
 
