@@ -290,6 +290,44 @@ object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
       signedBinary <- signedOf(StateChannelSnapshotBinary(hash, content.getBytes, SnapshotFee.MinValue))
     } yield signedBinary
 
+  // Regression test for issue #137:
+  // After a binary is successfully sent, markAsSent must be called so that
+  // processNormalMode (which filters sendsSoFar === 0) does not re-enqueue it
+  // on the next background tick, causing unbounded retry growth.
+  test("normal mode - after markAsSent, binary is excluded from unsent filter (regression #137)") { res =>
+    implicit val (_, hs, sp, metrics, j) = res
+
+    forall(Gen.nonEmptyListOf(binaryGen)) { binaries =>
+      (for {
+        kp <- Resource.eval(KeyPairGenerator.makeKeyPair)
+        (_, tracker, _) <- mkService(
+          kp.getPublic.toAddress,
+          currentOrdinal = SnapshotOrdinal.MinValue,
+          state = TrackerState.empty.copy(retryMode = false)
+        )
+        result <- Resource.eval(
+          for {
+            hashed <- binaries.traverse(_.toHashed)
+            _ <- hashed.traverse(b => tracker.enqueue(b, SnapshotOrdinal.MinValue, SnapshotOrdinal.MinValue))
+
+            // Before markAsSent: all binaries should appear as unsent
+            pendingBefore <- tracker.getPendingToRetry(100)
+            unsentBefore = pendingBefore.filter(_.sendsSoFar.value === 0L)
+
+            // Simulate what the fixed sendBinaryInBackground does after a successful post
+            _ <- hashed.traverse(b => tracker.markAsSent(b.hash))
+
+            // After markAsSent: no binary should appear as unsent (sendsSoFar > 0)
+            pendingAfter <- tracker.getPendingToRetry(100)
+            unsentAfter = pendingAfter.filter(_.sendsSoFar.value === 0L)
+          } yield
+            expect(unsentBefore.length === hashed.length)
+              .and(expect(unsentAfter.isEmpty))
+        )
+      } yield result).use(IO.pure)
+    }
+  }
+
   test("should add confirmation proof for confirmed binaries in the queue") { res =>
     implicit val (_, hs, sp, metrics, j) = res
 

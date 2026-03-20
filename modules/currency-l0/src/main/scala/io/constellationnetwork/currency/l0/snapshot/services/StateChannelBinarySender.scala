@@ -190,7 +190,10 @@ object StateChannelBinarySender {
       S.supervise(
         poster
           .post(pending.binary, signers)
-          .flatMap(peerId => logger.info(s"[Queue] Sent ${pending.binary.hash} via $peerId"))
+          .flatMap(peerId =>
+            tracker.markAsSent(pending.binary.hash) >>
+              logger.info(s"[Queue] Sent ${pending.binary.hash} via $peerId")
+          )
           .handleErrorWith(err => logger.warn(s"[Queue] Failed to send ${pending.binary.hash}: ${err.getMessage}"))
       ).void
 
