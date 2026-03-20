@@ -52,7 +52,9 @@ get_ordinal() {
 # Helper: get facilitator count from latest consensus log
 get_facilitator_count() {
   local node=$1
-  docker logs "$node" 2>&1 | grep "facilitators=" | tail -1 | grep -oP 'facilitators=\d+' | grep -oP '\d+' | head -1
+  local result
+  result=$(docker logs "$node" 2>&1 | grep "facilitators=" | tail -1 | grep -oP 'facilitators=\d+' | grep -oP '\d+' | head -1 || true)
+  echo "${result:-0}"
 }
 
 # Helper: get node state
@@ -66,14 +68,18 @@ get_node_state() {
 # Helper: check for fork recovery events
 get_fork_events() {
   local node=$1
-  docker logs "$node" 2>&1 | grep -c "Fork divergence\|FORK_CHECKS_PASSED\|fork.*detect" 2>/dev/null || echo "0"
+  local result
+  result=$(docker logs "$node" 2>&1 | grep -c "Fork divergence\|FORK_CHECKS_PASSED\|fork.*detect" 2>/dev/null || true)
+  echo "${result:-0}"
 }
 
 # Helper: check for round completions after a given ordinal
 get_completed_rounds_after() {
   local node=$1
   local after_ordinal=$2
-  docker logs "$node" 2>&1 | grep "ROUND_COMPLETED" | grep -oP 'round=SnapshotOrdinal\{value=(\d+)\}' | grep -oP '\d+' | awk -v min="$after_ordinal" '$1 > min' | wc -l
+  local result
+  result=$(docker logs "$node" 2>&1 | grep "ROUND_COMPLETED" | grep -oP 'round=SnapshotOrdinal\{value=(\d+)\}' | grep -oP '\d+' | awk -v min="$after_ordinal" '$1 > min' | wc -l || true)
+  echo "${result:-0}"
 }
 
 fail() {
@@ -115,7 +121,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     status_line="${status_line} ${node}:ord=${ord:-?}/fac=${fac:-?}"
 
     # Every node must report an ordinal, facilitators == NUM_GL0, and ordinal > 5
-    if [ -z "$ord" ] || [ "$ord" -le 5 ] || [ -z "$fac" ] || [ "$fac" -lt "$NUM_GL0" ]; then
+    if [ -z "$ord" ] || [ "$ord" -lt 5 ] || [ "${fac:-0}" -lt "$NUM_GL0" ]; then
       all_synced=false
     fi
 
