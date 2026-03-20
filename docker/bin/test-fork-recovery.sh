@@ -41,10 +41,12 @@ echo "  Isolation time: ${ISOLATION_DURATION}s"
 echo "  Recovery timeout: ${RECOVERY_TIMEOUT}s"
 echo ""
 
-# Helper: get ordinal from a node (via docker exec to internal port)
+# Helper: get ordinal from a node (via host-mapped port)
 get_ordinal() {
   local node=$1
-  docker exec "$node" curl -s http://localhost:9000/global-snapshots/latest 2>/dev/null | jq -r '.value.ordinal // empty' 2>/dev/null || echo ""
+  local idx=${node##gl0-}
+  local port=$((GL0_PORT_PREFIX * 100 + idx * 10))
+  curl -s "http://localhost:${port}/global-snapshots/latest" 2>/dev/null | jq -r '.value.ordinal // empty' 2>/dev/null || echo ""
 }
 
 # Helper: get facilitator count from latest consensus log
@@ -56,7 +58,9 @@ get_facilitator_count() {
 # Helper: get node state
 get_node_state() {
   local node=$1
-  docker exec "$node" curl -s http://localhost:9000/node/info 2>/dev/null | jq -r '.state // empty' 2>/dev/null || echo ""
+  local idx=${node##gl0-}
+  local port=$((GL0_PORT_PREFIX * 100 + idx * 10))
+  curl -s "http://localhost:${port}/node/info" 2>/dev/null | jq -r '.state // empty' 2>/dev/null || echo ""
 }
 
 # Helper: check for fork recovery events
