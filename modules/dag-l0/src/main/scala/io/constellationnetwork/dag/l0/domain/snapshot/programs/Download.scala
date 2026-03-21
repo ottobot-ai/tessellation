@@ -16,6 +16,7 @@ import io.constellationnetwork.ext.cats.kernel.PartialPrevious
 import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
+import io.constellationnetwork.node.shared.domain.cluster.programs.Joining
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.programs.Download
@@ -63,7 +64,8 @@ object Download {
     ],
     mptStore: MptStore[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    globalSnapshotConsensusStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo]
+    globalSnapshotConsensusStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    joining: Joining[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): Download[F, GlobalIncrementalSnapshot] = new Download[F, GlobalIncrementalSnapshot] {
@@ -219,16 +221,25 @@ object Download {
           val ((snapshot, context), observationLimit) = result
           consensus.manager.startFacilitatingAfterDownload(observationLimit, snapshot, context, isRecovery = true)
         }
-        .onError(logger.error(_)("[RecoveryDownload] Unexpected failure, falling back to full download"))
+        .flatTap { _ =>
+          // Re-announce to cluster peers so they re-add us to their peer lists.
+          // During isolation, LocalHealthcheck removes unresponsive peers from cluster storage.
+          // Without this, the recovered node can fetch snapshots but can't participate in
+          // consensus because other nodes don't route gossip declarations to it.
+          joining.rejoinAfterRecovery.handleErrorWith { err =>
+            logger.warn(err)("[RecoveryDownload] Cluster rejoin failed, continuing anyway")
+          }
+        }
+        .onError(logger.error(_)("[RecoveryDownload] Unexpected failure, will retry"))
         .handleErrorWith { _ =>
-          // Recovery failed — fall back to full download path
-          logger.warn("[RecoveryDownload] Falling back to full download") >>
+          // Recovery failed — transition back to WaitingForDownload so DownloadDaemon retries.
+          // Keep the recovery flag set so the retry uses the incremental path again.
+          logger.warn("[RecoveryDownload] Failed, transitioning to WaitingForDownload for retry") >>
             nodeStorage.getNodeState.flatMap {
               case state if state =!= NodeState.WaitingForDownload && state =!= NodeState.Ready =>
                 nodeStorage.setNodeState(NodeState.WaitingForDownload)
               case _ => Async[F].unit
             }
-          // Don't chain download() here — let the DownloadDaemon retry with a fresh cycle
         }
     }
 

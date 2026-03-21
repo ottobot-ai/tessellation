@@ -66,7 +66,8 @@ object Programs {
           storages.combinedGlobalSnapshotCheckpointStorage,
           mptStore,
           services.eventMempool,
-          globalSnapshotStorage
+          globalSnapshotStorage,
+          sharedPrograms.joining
         )
       val rollbackLoader = RollbackLoader.make(
         keyPair,

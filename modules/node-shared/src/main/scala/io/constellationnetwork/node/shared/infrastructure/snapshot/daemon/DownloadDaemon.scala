@@ -68,7 +68,9 @@ object DownloadDaemon {
                       logger.error(err)(
                         "Download failed, stream kept alive. " +
                           "Node remains in WaitingForDownload — will retry after 10s backoff."
-                      ) >> nodeStorage.clearRecoveryDownload >> Async[F].sleep(10.seconds)
+                      ) >> Async[F].sleep(10.seconds)
+                    // Do NOT clear recoveryDownload flag here — preserve it so retries
+                    // still use the incremental recovery path instead of full download.
                     }
                 )(_ => downloadLock.release)
               case false =>
