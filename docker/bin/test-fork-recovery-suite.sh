@@ -82,9 +82,11 @@ for scenario in "${SCENARIOS[@]}"; do
   start_time=$(date +%s)
 
   # Use compose-runner in --up mode (no tests), then run our test separately
+  # Pass --test=fork-recovery to avoid building snapshot-streaming (needs GITHUB_TOKEN)
   if bash docker/bin/compose-runner.sh \
     --num-gl0="$cluster_size" \
     --skip-assembly \
+    --test=fork-recovery \
     --up \
     2>&1 | tee "$RESULTS_DIR/${test_name}_startup.log" | tail -5; then
     echo "  Cluster started."
