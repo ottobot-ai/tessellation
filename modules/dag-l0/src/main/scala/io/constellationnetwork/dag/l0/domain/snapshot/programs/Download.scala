@@ -43,7 +43,6 @@ import io.circe.Json
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 import retry.RetryPolicies._
 import retry._
-import retry.implicits.retrySyntaxError
 
 object Download {
   def make[F[_]: Async: Parallel: Random: KryoSerializer: JsonSerializer](
@@ -153,14 +152,15 @@ object Download {
       *   - Does NOT clear in-memory caches (lastNGlobalSnapshotStorage, lastGlobalSnapshotStorage)
       *   - Does NOT clear the event mempool
       *   - Does NOT clear the MPT store
-      *   - Skips the observe phase (polls for 1 additional snapshot)
+      *   - Observes exactly one round (waits for the next snapshot) before facilitating
       *   - Uses setForRecovery on lastNGlobalSnapshotStorage (sets single snapshot, no backfill)
       *
       * Falls back to full download if no local persisted state exists (fresh join scenario).
       *
       * Recovery download still goes through the same state machine transitions: WaitingForDownload → DownloadInProgress →
-      * WaitingForObserving → Observing → WaitingForReady → Ready but skips the observation polling loop since the chain is known to be live
-      * (we were just in consensus).
+      * WaitingForObserving → Observing → WaitingForReady → Ready. It observes exactly one round (waits for the next snapshot to appear) to
+      * ensure the node starts facilitating at the beginning of a round rather than mid-flight, avoiding a race condition where the node
+      * joins a round already in progress and misses declarations/proposals.
       */
     def recoveryDownload(implicit hasherSelector: HasherSelector[F]): F[Unit] = {
       def getLatestMetadata: F[SnapshotMetadata] = {
@@ -196,22 +196,34 @@ object Download {
 
       def recoveryObserve(result: DownloadResult): F[(DownloadResult, ObservationLimit)] = {
         val (lastSnapshot, lastContext) = result
-        // Use the downloaded snapshot's ordinal as the observation limit.
-        // Skip the polling loop — the chain is live (we were just in consensus).
-        val observationLimit = lastSnapshot.ordinal
         for {
           hashedSnapshot <- hasherSelector.withCurrent(implicit hs => lastSnapshot.toHashed)
           _ <- lastNGlobalSnapshotStorage.setForRecovery(hashedSnapshot, lastContext)
           _ <- lastGlobalSnapshotStorage.setForRecovery(hashedSnapshot, lastContext)
-          // Reset consensus SnapshotStorage head to the recovered ordinal.
-          // Without this, the head stays at the pre-stall ordinal and the first
-          // post-recovery consensus round fails with "prepend gap" when it tries
-          // to persist at ordinal N+1 but head is still at the old ordinal.
           _ <- hasherSelector.withCurrent { implicit hs =>
             globalSnapshotConsensusStorage.setHeadForRecovery(lastSnapshot, lastContext)
           }
+          // Wait for one more snapshot to appear on the network before facilitating.
+          // This ensures we start facilitating at the beginning of a round, not mid-flight.
+          // Without this, we race: we start round N+1 but the cluster is already mid-way
+          // through it, so we miss their declarations/proposals and the round fails.
+          _ <- logger.info(
+            s"[RecoveryDownload] Observing one round: waiting for ordinal ${lastSnapshot.ordinal.next.show} before facilitating"
+          )
+          observedResult <- fetchNextSnapshot(result)
+          (observedSnapshot, observedContext) = observedResult
+          _ <- logger.info(
+            s"[RecoveryDownload] Observed ordinal ${observedSnapshot.ordinal.show}, ready to facilitate"
+          )
+          observedHashed <- hasherSelector.withCurrent(implicit hs => observedSnapshot.toHashed)
+          _ <- lastNGlobalSnapshotStorage.setForRecovery(observedHashed, observedContext)
+          _ <- lastGlobalSnapshotStorage.setForRecovery(observedHashed, observedContext)
+          _ <- hasherSelector.withCurrent { implicit hs =>
+            globalSnapshotConsensusStorage.setHeadForRecovery(observedSnapshot, observedContext)
+          }
+          observationLimit = observedSnapshot.ordinal
           _ <- consensus.manager.registerForConsensus(observationLimit)
-        } yield (result, observationLimit)
+        } yield (observedResult, observationLimit)
       }
 
       nodeStorage
