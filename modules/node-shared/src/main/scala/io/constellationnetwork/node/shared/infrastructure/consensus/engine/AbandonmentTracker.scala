@@ -312,7 +312,8 @@ class AbandonmentTracker[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, St
   private def attemptRecoveryDownload(key: Key): F[Unit] = {
     val recoveryStates = List(
       NodeState.Ready,
-      NodeState.Observing
+      NodeState.Observing,
+      NodeState.WaitingForReady
     )
 
     def tryStates(remaining: List[NodeState]): F[Option[NodeState]] =
