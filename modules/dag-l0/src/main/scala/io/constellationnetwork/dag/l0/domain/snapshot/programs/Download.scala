@@ -69,7 +69,7 @@ object Download {
     private val validator = StateProofValidator.forGlobal(Some(mptStore.underlying))
 
     val minBatchSizeToStartObserving: Long = 1L
-    val observationOffset = NonNegLong(0L)
+    val observationOffset = NonNegLong(1L)
     val fetchSnapshotDelayBetweenTrials = 10.seconds
 
     type DownloadResult = (Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)

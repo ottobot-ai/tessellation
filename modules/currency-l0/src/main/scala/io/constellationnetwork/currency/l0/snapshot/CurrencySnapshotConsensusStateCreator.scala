@@ -189,11 +189,40 @@ object CurrencySnapshotConsensusStateCreator {
         // They remain in allEligible so they can be re-selected in future rounds.
         // NOTE: abandonedMissing is intentionally NOT included — it's a local-only tracker that
         // can diverge between nodes, causing different facilitator sets → fork detection → Leaving state.
+        //
+        // MINIMUM VIABLE QUORUM: If excluding penalized peers would drop below 3 facilitators,
+        // bypass penalties and use all eligible peers. This prevents PeerQualityTracker from
+        // reducing the facilitator set below viable consensus (2 facilitators can't reach 67% quorum).
+        minViableQuorum = 3
         eligibleThisRound = {
           val excluded = previouslyRemoved ++ penalizedPeers
           val filtered = allEligible.filterNot(excluded.contains)
-          if (filtered.isEmpty) List(selfId) else filtered
+          if (filtered.size >= minViableQuorum) filtered
+          else if (allEligible.size >= minViableQuorum) allEligible
+          else if (allEligible.nonEmpty) allEligible
+          else List(selfId)
         }
+
+        penaltyBypassed = {
+          val excluded = previouslyRemoved ++ penalizedPeers
+          val filtered = allEligible.filterNot(excluded.contains)
+          filtered.size < minViableQuorum && allEligible.size > filtered.size
+        }
+
+        _ <- ConsensusLog
+          .info(
+            logger,
+            ConsensusLog.Facilitator,
+            key.show,
+            "n/a",
+            "event" -> "MIN_QUORUM_FLOOR_APPLIED",
+            "filteredCount" -> allEligible.filterNot((previouslyRemoved ++ penalizedPeers).contains).size.toString,
+            "minViableQuorum" -> minViableQuorum.toString,
+            "usingAll" -> allEligible.size.toString,
+            "penalizedBypassed" -> penalizedPeers.size.toString,
+            "removedBypassed" -> previouslyRemoved.size.toString
+          )
+          .whenA(penaltyBypassed)
 
         // Apply deterministic subset selection using hash-distance ordering
         // Uses the previous round's snapshot hash as entropy for randomization
