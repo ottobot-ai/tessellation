@@ -213,12 +213,11 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Order, Artifact, Ctx, Stat
       // NOTE: state.facilitators.value already excludes withdrawn peers (updateFacilitators removes them),
       // so we use it directly as the active count. Quorum is computed on the active set, not the original.
       activeFacilitators = state.facilitators.value.size
-      // Static quorum floor: require at least 2 facilitators to prevent a single
-      // node from producing snapshots unilaterally. On a public blockchain, remote
-      // peers may be unreliable; a proportional 2/3 threshold would stall the entire
-      // chain if too many nodes go offline. With a floor of 2, the cluster keeps
-      // producing as long as any 2 nodes are alive, and stragglers recover on return.
-      quorumSize = 2
+      // Simple majority quorum: floor(N/2) + 1. Balances liveness against safety —
+      // the cluster tolerates up to floor((N-1)/2) simultaneous failures while still
+      // requiring a majority to agree on each snapshot. Prevents a minority partition
+      // from producing snapshots unilaterally.
+      quorumSize = (activeFacilitators / 2) + 1
       quorumInfeasible = activeFacilitators > 0 && activeFacilitators < quorumSize
 
       // --- View change loop escalation check ---
@@ -401,10 +400,9 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Order, Artifact, Ctx, Stat
       if (missingPeers.nonEmpty) {
         val totalFacilitators = state.facilitators.value.size
         val remaining = totalFacilitators - missingPeers.size
-        // Static quorum floor of 2: allow eviction as long as at least 2 facilitators remain.
-        // This prevents a single node from running consensus alone while still allowing the
-        // cluster to tolerate multiple simultaneous node failures on a public network.
-        val minQuorum = 2
+        // Simple majority: only allow eviction if remaining facilitators still form a majority
+        // of the original set. Prevents a minority partition from continuing alone.
+        val minQuorum = (totalFacilitators / 2) + 1
         val quorumInfeasible = remaining < minQuorum
 
         // Record local eviction votes for missing peers (scaffolding for future gossip-based deterministic eviction)
