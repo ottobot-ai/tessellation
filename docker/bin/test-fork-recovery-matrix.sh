@@ -2,27 +2,34 @@
 #
 # Fork Recovery Matrix Test
 # Tests fork recovery with varying cluster sizes and number of isolated nodes.
-# Verifies that the StallDetector's static quorum floor (minQuorum=2) allows
-# the cluster to continue operating and that isolated nodes recover on return.
 #
-# Usage: ./docker/bin/test-fork-recovery-matrix.sh <num_gl0_nodes> <num_to_isolate>
+# Two modes:
+#   SURVIVAL MODE (default): Verifies cluster continues producing snapshots
+#     during isolation and that isolated nodes recover on return.
+#   STALL MODE (--expect-stall): Verifies cluster STOPS producing snapshots
+#     when too many nodes are isolated (quorum lost), then recovers when
+#     nodes return.
 #
-# Example: ./docker/bin/test-fork-recovery-matrix.sh 7 2
-#   → Runs 7 GL0 nodes, isolates the last 2, verifies cluster continues and nodes recover
+# Usage:
+#   ./docker/bin/test-fork-recovery-matrix.sh <num_gl0_nodes> <num_to_isolate> [--expect-stall]
 #
-# Prerequisites:
-#   - Docker image constellationnetwork/tessellation:test already built
-#   - Cluster already running with the specified number of GL0 nodes
-#   - Containers have NET_ADMIN capability (--privileged)
+# Examples:
+#   ./test-fork-recovery-matrix.sh 7 2           # Expect cluster to survive
+#   ./test-fork-recovery-matrix.sh 7 4 --expect-stall  # Expect cluster to stall
 #
 
 set -eo pipefail
 
-NUM_GL0=${1:?Usage: $0 <num_gl0_nodes> <num_to_isolate>}
-NUM_ISOLATE=${2:?Usage: $0 <num_gl0_nodes> <num_to_isolate>}
+NUM_GL0=${1:?Usage: $0 <num_gl0_nodes> <num_to_isolate> [--expect-stall]}
+NUM_ISOLATE=${2:?Usage: $0 <num_gl0_nodes> <num_to_isolate> [--expect-stall]}
+EXPECT_STALL=false
+if [ "${3}" = "--expect-stall" ]; then
+  EXPECT_STALL=true
+fi
 
-GL0_PORT_PREFIX=${3:-90}
+GL0_PORT_PREFIX=90
 ISOLATION_DURATION=90       # seconds to keep nodes isolated
+STALL_CHECK_DURATION=120    # seconds to verify cluster is stalled (--expect-stall)
 RECOVERY_TIMEOUT=900        # max seconds to wait for ALL isolated nodes to recover
 STABILIZE_WAIT=600          # max seconds to wait for initial cluster stability
 
@@ -33,10 +40,7 @@ if [ "$NUM_ISOLATE" -ge "$NUM_GL0" ]; then
 fi
 
 REMAINING=$((NUM_GL0 - NUM_ISOLATE))
-if [ "$REMAINING" -lt 2 ]; then
-  echo "ERROR: Would leave $REMAINING nodes, below static quorum floor of 2"
-  exit 1
-fi
+QUORUM=$((NUM_GL0 / 2 + 1))
 
 # Build list of nodes to isolate (last N nodes)
 ISOLATE_NODES=()
@@ -44,19 +48,34 @@ for i in $(seq $((NUM_GL0 - NUM_ISOLATE)) $((NUM_GL0 - 1))); do
   ISOLATE_NODES+=("gl0-${i}")
 done
 
-# Monitor node: first non-isolated validator
+# Monitor node: gl0-1 (first non-genesis validator that's never isolated unless almost all are)
 MONITOR_NODE="gl0-1"
+# For stall tests, also check gl0-0 (genesis) as a remaining node
+GENESIS_NODE="gl0-0"
+
+MODE_LABEL="SURVIVAL"
+if [ "$EXPECT_STALL" = "true" ]; then
+  MODE_LABEL="EXPECTED-STALL"
+fi
 
 echo "============================================================"
-echo "Fork Recovery Matrix Test: ${NUM_GL0} nodes, isolate ${NUM_ISOLATE}"
+echo "Fork Recovery Matrix Test: ${NUM_GL0}N isolate ${NUM_ISOLATE} [${MODE_LABEL}]"
 echo "============================================================"
 echo "  Total nodes:     $NUM_GL0"
 echo "  Isolating:       ${ISOLATE_NODES[*]}"
-echo "  Remaining:       $REMAINING (quorum floor: 2)"
+echo "  Remaining:       $REMAINING (quorum: $QUORUM = N/2+1)"
+echo "  Expect stall:    $EXPECT_STALL"
 echo "  Monitor node:    $MONITOR_NODE"
 echo "  Isolation time:  ${ISOLATION_DURATION}s"
 echo "  Recovery timeout: ${RECOVERY_TIMEOUT}s"
 echo ""
+
+if [ "$EXPECT_STALL" = "true" ] && [ "$REMAINING" -ge "$QUORUM" ]; then
+  echo "WARNING: --expect-stall set but remaining=$REMAINING >= quorum=$QUORUM; cluster should NOT stall"
+fi
+if [ "$EXPECT_STALL" = "false" ] && [ "$REMAINING" -lt "$QUORUM" ]; then
+  echo "WARNING: remaining=$REMAINING < quorum=$QUORUM; cluster will likely stall (consider --expect-stall)"
+fi
 
 # ── Helpers ────────────────────────────────────────────────────
 
@@ -97,7 +116,6 @@ fail() {
   echo "============================================================"
   echo "FAIL: $1"
   echo "============================================================"
-  # Cleanup: remove network impairment from all isolated nodes
   for node in "${ISOLATE_NODES[@]}"; do
     docker exec --privileged "$node" tc qdisc del dev eth0 root 2>/dev/null || true
   done
@@ -107,7 +125,7 @@ fail() {
 pass() {
   echo ""
   echo "============================================================"
-  echo "PASS: Fork Recovery Matrix Test (${NUM_GL0}N, isolate ${NUM_ISOLATE})"
+  echo "PASS: Fork Recovery [${MODE_LABEL}] (${NUM_GL0}N, isolate ${NUM_ISOLATE})"
   echo "============================================================"
   echo "$1"
   exit 0
@@ -131,7 +149,6 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     fac=$(get_facilitator_count "$node")
     status_line="${status_line} ${node}:ord=${ord:-?}/fac=${fac:-?}"
 
-    # Skip genesis for sync checks
     if [ "$i" -eq 0 ]; then continue; fi
 
     if [ -z "$ord" ] || [ "$ord" -lt 5 ] || [ "${fac:-0}" -lt "$NUM_GL0" ]; then
@@ -202,27 +219,65 @@ for node in "${ISOLATE_NODES[@]}"; do
   echo "  Isolated $node"
 done
 
-echo "  Waiting ${ISOLATION_DURATION}s for cluster to advance with $REMAINING nodes..."
-sleep "$ISOLATION_DURATION"
+if [ "$EXPECT_STALL" = "true" ]; then
+  # ── STALL MODE: Verify cluster STOPS ──────────────────────────
+  echo ""
+  echo "  [STALL MODE] Waiting ${ISOLATION_DURATION}s then checking cluster stalled..."
+  sleep "$ISOLATION_DURATION"
 
-# Check cluster advanced
-post_isolation_ordinal=$(get_ordinal "$MONITOR_NODE")
-post_fac=$(get_facilitator_count "$MONITOR_NODE")
-post_sigs=$(get_signature_count "$MONITOR_NODE")
-echo "  Cluster state after isolation:"
-echo "    Ordinal: $pre_ordinal → ${post_isolation_ordinal:-?}"
-echo "    Facilitators: ${post_fac:-?}"
-echo "    Signatures: ${post_sigs:-?}"
+  # Check ordinal didn't advance (or advanced very little — allow +1 for in-flight round)
+  post_isolation_ordinal=$(get_ordinal "$GENESIS_NODE")
+  if [ -z "$post_isolation_ordinal" ]; then
+    # Node might be returning 503 if it's in recovery — that's also stalled
+    echo "  gl0-0 returning empty/503 — cluster appears stalled (good)"
+    post_isolation_ordinal="$pre_ordinal"
+  fi
+  advancement=$((post_isolation_ordinal - pre_ordinal))
 
-if [ -z "$post_isolation_ordinal" ] || [ "$post_isolation_ordinal" -le "$pre_ordinal" ]; then
-  for node in "${ISOLATE_NODES[@]}"; do
-    docker exec --privileged "$node" tc qdisc del dev eth0 root 2>/dev/null || true
-  done
-  fail "Cluster did not advance during isolation (stuck at ordinal $pre_ordinal)"
+  echo "  Cluster state after isolation:"
+  echo "    Ordinal: $pre_ordinal → ${post_isolation_ordinal} (advancement: $advancement)"
+
+  if [ "$advancement" -gt 2 ]; then
+    fail "Cluster should have stalled (remaining=$REMAINING < quorum=$QUORUM) but advanced $advancement ordinals!"
+  fi
+  echo "  ✓ Cluster correctly stalled (advancement=$advancement ≤ 2)"
+
+  # Now verify it stays stalled for another check period
+  echo "  Verifying stall persists for ${STALL_CHECK_DURATION}s..."
+  stall_start_ordinal="$post_isolation_ordinal"
+  sleep "$STALL_CHECK_DURATION"
+  stall_check_ordinal=$(get_ordinal "$GENESIS_NODE")
+  stall_check_ordinal=${stall_check_ordinal:-$stall_start_ordinal}
+  stall_advancement=$((stall_check_ordinal - stall_start_ordinal))
+
+  if [ "$stall_advancement" -gt 0 ]; then
+    fail "Cluster advanced $stall_advancement ordinals during stall check — quorum should have prevented this"
+  fi
+  echo "  ✓ Stall confirmed (ordinal unchanged at $stall_check_ordinal for ${STALL_CHECK_DURATION}s)"
+
+  # Record for recovery phase
+  post_isolation_ordinal="$stall_check_ordinal"
+
+else
+  # ── SURVIVAL MODE: Verify cluster continues ───────────────────
+  echo "  [SURVIVAL MODE] Waiting ${ISOLATION_DURATION}s for cluster to advance with $REMAINING nodes..."
+  sleep "$ISOLATION_DURATION"
+
+  post_isolation_ordinal=$(get_ordinal "$MONITOR_NODE")
+  post_fac=$(get_facilitator_count "$MONITOR_NODE")
+  post_sigs=$(get_signature_count "$MONITOR_NODE")
+  echo "  Cluster state after isolation:"
+  echo "    Ordinal: $pre_ordinal → ${post_isolation_ordinal:-?}"
+  echo "    Facilitators: ${post_fac:-?}"
+  echo "    Signatures: ${post_sigs:-?}"
+
+  if [ -z "$post_isolation_ordinal" ] || [ "$post_isolation_ordinal" -le "$pre_ordinal" ]; then
+    fail "Cluster did not advance during isolation (stuck at ordinal $pre_ordinal)"
+  fi
+
+  advancement=$((post_isolation_ordinal - pre_ordinal))
+  echo "  ✓ Cluster produced $advancement snapshots with $REMAINING/$NUM_GL0 nodes"
 fi
-
-advancement=$((post_isolation_ordinal - pre_ordinal))
-echo "  Cluster produced $advancement snapshots with $REMAINING/$NUM_GL0 nodes"
 
 # ── Phase 3: Restore network and monitor recovery ──────────────
 
@@ -241,16 +296,36 @@ recovery_start=$(date +%s)
 recovery_deadline=$((recovery_start + RECOVERY_TIMEOUT))
 all_recovered=false
 
+# For stall mode, we also need the REMAINING nodes to resume
 # Track which nodes have recovered
 declare -A node_recovered
 for node in "${ISOLATE_NODES[@]}"; do
   node_recovered[$node]=false
 done
 
+# For stall mode, additionally track if the cluster resumed producing
+cluster_resumed=false
+if [ "$EXPECT_STALL" = "false" ]; then
+  cluster_resumed=true  # Already producing in survival mode
+fi
+
 while [ "$(date +%s)" -lt "$recovery_deadline" ]; do
   elapsed=$(( $(date +%s) - recovery_start ))
   all_done=true
   status_line=""
+
+  # Check if cluster resumed (stall mode)
+  if [ "$cluster_resumed" = "false" ]; then
+    current_ord=$(get_ordinal "$GENESIS_NODE")
+    current_ord=${current_ord:-$post_isolation_ordinal}
+    if [ "$current_ord" -gt "$((post_isolation_ordinal + 2))" ]; then
+      cluster_resumed=true
+      echo "  [${elapsed}s] CLUSTER RESUMED at ordinal $current_ord (was stalled at $post_isolation_ordinal)"
+    else
+      status_line=" cluster:stalled@${current_ord}"
+      all_done=false
+    fi
+  fi
 
   for node in "${ISOLATE_NODES[@]}"; do
     if [ "${node_recovered[$node]}" = "true" ]; then
@@ -265,7 +340,7 @@ while [ "$(date +%s)" -lt "$recovery_deadline" ]; do
 
     if [ -n "$completed" ] && [ "$completed" -ge 2 ]; then
       node_recovered[$node]=true
-      echo "  [${elapsed}s] $node RECOVERED (completed $completed rounds after isolation)"
+      echo "  [${elapsed}s] $node RECOVERED (completed $completed rounds after ordinal $post_isolation_ordinal)"
     else
       all_done=false
     fi
@@ -304,8 +379,9 @@ done
 
 echo ""
 echo "  Summary:"
+echo "    Mode:              $MODE_LABEL"
 echo "    Initial ordinal:   $pre_ordinal"
-echo "    Post-isolation:    $post_isolation_ordinal (advanced $advancement with $REMAINING nodes)"
+echo "    Post-isolation:    $post_isolation_ordinal"
 echo "    Final ordinal:     ${final_ordinal:-?}"
 echo "    Final facilitators: ${final_fac:-?} (expected: $NUM_GL0)"
 echo "    Final signatures:  ${final_sigs:-?} (expected: $NUM_GL0)"
@@ -317,16 +393,19 @@ if [ "$all_recovered" != "true" ]; then
   for node in "${ISOLATE_NODES[@]}"; do
     if [ "${node_recovered[$node]}" != "true" ]; then
       echo "    $node"
-      echo "    Last 5 abandonment logs:"
-      docker logs "$node" 2>&1 | grep "consecutiveAbandonments\|ROUND_ABANDONED" | tail -5 | sed 's/^/      /'
+      echo "    Last 5 log lines:"
+      docker logs "$node" 2>&1 | grep -E "consecutiveAbandonments|ROUND_ABANDONED|QUORUM_INFEASIBLE|DOWNLOAD_INIT" | tail -5 | sed 's/^/      /'
     fi
   done
-  fail "${NUM_ISOLATE} of ${NUM_ISOLATE} isolated nodes did not recover within ${RECOVERY_TIMEOUT}s"
+  fail "Not all isolated nodes recovered within ${RECOVERY_TIMEOUT}s"
 fi
 
-# Verify final facilitator count matches total nodes
+if [ "$EXPECT_STALL" = "true" ] && [ "$cluster_resumed" != "true" ]; then
+  fail "Cluster did not resume after restoring isolated nodes"
+fi
+
 if [ "${final_fac:-0}" -lt "$NUM_GL0" ]; then
   echo "  WARNING: Final facilitator count ${final_fac} < expected ${NUM_GL0}"
 fi
 
-pass "${NUM_ISOLATE} nodes recovered and rejoined ${NUM_GL0}-node cluster in ${recovery_elapsed}s (ordinal $pre_ordinal → ${final_ordinal:-?})"
+pass "${NUM_ISOLATE} nodes isolated, ${MODE_LABEL} verified, all recovered in ${recovery_elapsed}s (ordinal $pre_ordinal → ${final_ordinal:-?})"
