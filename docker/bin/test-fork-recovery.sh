@@ -126,8 +126,8 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
       continue
     fi
 
-    # Validators must report an ordinal > 5, facilitators >= 3 (quorum)
-    if [ -z "$ord" ] || [ "$ord" -lt 5 ] || [ "${fac:-0}" -lt 3 ]; then
+    # Validators must report an ordinal > 5, ALL nodes participating (fac == NUM_GL0)
+    if [ -z "$ord" ] || [ "$ord" -lt 5 ] || [ "${fac:-0}" -lt "$NUM_GL0" ]; then
       all_synced=false
     fi
 
@@ -154,9 +154,28 @@ if [ "$stable" != "true" ]; then
   fail "Validators did not synchronise within ${STABILIZE_WAIT}s"
 fi
 
-# Give one extra round for any lingering lag to settle
-echo "  Waiting one extra consensus round (45s) for safety..."
-sleep 45
+# Let the full cluster run several rounds so PeerQualityTracker builds
+# scores for all peers.  Peers that haven't participated in enough rounds
+# get penalized and evicted after reconnection.  Wait for 3 ordinals with
+# all NUM_GL0 facilitators to confirm quality scores are established.
+echo "  Waiting for ${NUM_GL0}-node consensus to stabilize (3+ rounds)..."
+stable_rounds=0
+stab_deadline=$(($(date +%s) + 300))
+while [ "$(date +%s)" -lt "$stab_deadline" ] && [ "$stable_rounds" -lt 3 ]; do
+  fac=$(get_facilitator_count "$MONITOR_NODE")
+  ord=$(get_ordinal "$MONITOR_NODE")
+  if [ "${fac:-0}" -eq "$NUM_GL0" ]; then
+    stable_rounds=$((stable_rounds + 1))
+    echo "    Round $stable_rounds/3 with fac=$fac at ordinal $ord"
+  else
+    stable_rounds=0
+    echo "    Waiting... fac=${fac:-?} at ordinal ${ord:-?} (need $NUM_GL0)"
+  fi
+  sleep 45
+done
+if [ "$stable_rounds" -lt 3 ]; then
+  echo "  WARNING: Only $stable_rounds/3 stable rounds achieved, proceeding anyway"
+fi
 
 # Record pre-isolation state from monitor (a validator)
 pre_ordinal=$(get_ordinal "$MONITOR_NODE")
