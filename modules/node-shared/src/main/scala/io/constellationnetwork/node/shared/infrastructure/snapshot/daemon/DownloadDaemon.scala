@@ -2,6 +2,7 @@ package io.constellationnetwork.node.shared.infrastructure.snapshot.daemon
 
 import cats.effect.Async
 import cats.effect.std.{Semaphore, Supervisor}
+import cats.syntax.applicative._
 import cats.syntax.applicativeError._
 import cats.syntax.eq._
 import cats.syntax.flatMap._
@@ -35,29 +36,46 @@ object DownloadDaemon {
     private val logger = Slf4jLogger.getLoggerFromClass[F](DownloadDaemon.getClass)
 
     def start: F[Unit] =
-      Semaphore[F](1).flatMap { downloadLock =>
-        S.supervise(watchForDownload(downloadLock)).void
-      }
+      logger.info("[DownloadDaemon] Starting download daemon") >>
+        Semaphore[F](1).flatMap { downloadLock =>
+          logger.info("[DownloadDaemon] Created semaphore, supervising watchForDownload stream") >>
+            S.supervise(watchForDownload(downloadLock)).void
+        }
 
     private def watchForDownload(downloadLock: Semaphore[F]): F[Unit] =
-      nodeStorage.nodeStates
-        .filter(_ === NodeState.WaitingForDownload)
-        .evalTap { _ =>
-          downloadLock.tryAcquire.flatMap {
-            case true =>
-              Async[F].guaranteeCase(
-                (peerDiscoveryDelay.waitForPeers >> download.download(hasherSelector)).handleErrorWith { err =>
-                  logger.error(err)(
-                    "Download failed, stream kept alive. " +
-                      "Node remains in WaitingForDownload — will retry after 10s backoff."
-                  ) >> Async[F].sleep(10.seconds)
-                }
-              )(_ => downloadLock.release)
-            case false =>
-              logger.debug("Download already in progress, skipping duplicate trigger")
+      logger.info("[DownloadDaemon] Stream subscription started, waiting for WaitingForDownload state...") >>
+        nodeStorage.nodeStates
+          .evalTap(state => logger.debug(s"[DownloadDaemon] State event received: $state"))
+          .filter(_ === NodeState.WaitingForDownload)
+          .evalTap { _ =>
+            downloadLock.tryAcquire.flatMap {
+              case true =>
+                Async[F].guaranteeCase(
+                  nodeStorage.isRecoveryDownload
+                    .flatTap(flag => logger.info(s"[DownloadDaemon] WaitingForDownload triggered, isRecovery=$flag"))
+                    .flatMap { isRecovery =>
+                      val downloadAction = if (isRecovery) {
+                        logger.info("[DownloadDaemon] Using incremental recovery download path") >>
+                          download.recoveryDownload(hasherSelector)
+                      } else {
+                        logger.info("[DownloadDaemon] Using full download path") >>
+                          download.download(hasherSelector)
+                      }
+                      (peerDiscoveryDelay.waitForPeers >> downloadAction)
+                        .flatTap(_ => nodeStorage.clearRecoveryDownload)
+                    }
+                    .handleErrorWith { err =>
+                      logger.error(err)(
+                        "Download failed, stream kept alive. " +
+                          "Node remains in WaitingForDownload — will retry after 10s backoff."
+                      ) >> nodeStorage.clearRecoveryDownload >> Async[F].sleep(10.seconds)
+                    }
+                )(_ => downloadLock.release)
+              case false =>
+                logger.debug("Download already in progress, skipping duplicate trigger")
+            }
           }
-        }
-        .compile
-        .drain
+          .compile
+          .drain
   }
 }

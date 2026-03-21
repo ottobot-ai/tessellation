@@ -182,7 +182,7 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
       _ <- ctx.nodeStorage.tryModifyState(NodeState.Observing, NodeState.Ready)
     } yield ()
 
-  def initFromDownload(key: Key, artifact: Signed[Artifact], context: Ctx): F[Unit] =
+  def initFromDownload(key: Key, artifact: Signed[Artifact], context: Ctx, isRecovery: Boolean = false): F[Unit] =
     for {
       _ <- ConsensusLog.info(log, ConsensusLog.Lifecycle, key.toString, "n/a", "event" -> "DOWNLOAD_INIT_START")
       outcome <- fetchOutcomeFromCluster(key, artifact, context)
@@ -206,24 +206,40 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
         .ifM(
           ifFalse = new Throwable(s"[DownloadInit] Failed to initialize consensus storage").raiseError[F, Unit],
           ifTrue = ctx.nodeStorage.tryModifyState(NodeState.Observing, NodeState.WaitingForReady) >>
-            ctx.nodeStorage.setJoiningGracePeriod >>
-            // Defer first round after download to align with the cluster's TimeTrigger cadence.
-            // Without this delay, validators fire StartRound immediately after download while
-            // genesis is still mid-cycle on its 43s TimeTrigger. With N=4, the 3 validators
-            // form a 75% majority and chain ahead without genesis, causing an irrecoverable
-            // ordinal split (validators on N+2, genesis stuck on N+1 with facilitators=4).
-            // Sleeping for timeTriggerInterval synchronizes the validator's first round with
-            // the cluster's existing cadence, ensuring all nodes participate together.
-            ConsensusLog.info(
-              log,
-              ConsensusLog.Lifecycle,
-              key.toString,
-              "n/a",
-              "event" -> "DOWNLOAD_INIT_DEFERRED",
-              "deferral" -> s"${ctx.config.timeTriggerInterval.toSeconds}s"
-            ) >>
-            Temporal[F].sleep(ctx.config.timeTriggerInterval) >>
-            queue.offer(StartRound(TimeTrigger.some))
+            ctx.nodeStorage.setJoiningGracePeriod >> {
+              if (isRecovery) {
+                // Recovery: skip TimeTrigger deferral. The cluster is already running and the
+                // recovered node needs to join the next round immediately. Deferring 43s would
+                // cause the cluster to advance further, making the node's first round stale.
+                ConsensusLog.info(
+                  log,
+                  ConsensusLog.Lifecycle,
+                  key.toString,
+                  "n/a",
+                  "event" -> "DOWNLOAD_INIT_RECOVERY_IMMEDIATE",
+                  "note" -> "Skipping deferral for recovery download"
+                ) >>
+                  queue.offer(StartRound(TimeTrigger.some))
+              } else {
+                // Initial join: Defer first round to align with the cluster's TimeTrigger cadence.
+                // Without this delay, validators fire StartRound immediately after download while
+                // genesis is still mid-cycle on its 43s TimeTrigger. With N=4, the 3 validators
+                // form a 75% majority and chain ahead without genesis, causing an irrecoverable
+                // ordinal split (validators on N+2, genesis stuck on N+1 with facilitators=4).
+                // Sleeping for timeTriggerInterval synchronizes the validator's first round with
+                // the cluster's existing cadence, ensuring all nodes participate together.
+                ConsensusLog.info(
+                  log,
+                  ConsensusLog.Lifecycle,
+                  key.toString,
+                  "n/a",
+                  "event" -> "DOWNLOAD_INIT_DEFERRED",
+                  "deferral" -> s"${ctx.config.timeTriggerInterval.toSeconds}s"
+                ) >>
+                  Temporal[F].sleep(ctx.config.timeTriggerInterval) >>
+                  queue.offer(StartRound(TimeTrigger.some))
+              }
+            }
         )
     } yield ()
 

@@ -19,7 +19,7 @@ import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.programs.Download
-import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage}
+import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.domain.snapshot.{PeerSelect, Validator}
 import io.constellationnetwork.node.shared.infrastructure.fork.ExitOnFork
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
@@ -62,7 +62,8 @@ object Download {
       GlobalSnapshotInfo
     ],
     mptStore: MptStore[F, GlobalStateKey],
-    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey]
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
+    globalSnapshotConsensusStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): Download[F, GlobalIncrementalSnapshot] = new Download[F, GlobalIncrementalSnapshot] {
@@ -143,6 +144,93 @@ object Download {
               Async[F].unit // Already in WaitingForDownload (start failed) or Ready (someone else recovered)
           } >> err.raiseError[F, Unit]
         }
+
+    /** Incremental recovery download: fetches only the gap between local tip and network tip.
+      *
+      * Unlike full download, this path:
+      *   - Does NOT clear in-memory caches (lastNGlobalSnapshotStorage, lastGlobalSnapshotStorage)
+      *   - Does NOT clear the event mempool
+      *   - Does NOT clear the MPT store
+      *   - Skips the observe phase (polls for 1 additional snapshot)
+      *   - Uses setForRecovery on lastNGlobalSnapshotStorage (sets single snapshot, no backfill)
+      *
+      * Falls back to full download if no local persisted state exists (fresh join scenario).
+      *
+      * Recovery download still goes through the same state machine transitions: WaitingForDownload → DownloadInProgress →
+      * WaitingForObserving → Observing → WaitingForReady → Ready but skips the observation polling loop since the chain is known to be live
+      * (we were just in consensus).
+      */
+    def recoveryDownload(implicit hasherSelector: HasherSelector[F]): F[Unit] = {
+      def getLatestMetadata: F[SnapshotMetadata] = {
+        val retryPolicy = RetryPolicies.exponentialBackoff[F](1.second).join(RetryPolicies.limitRetries(5))
+        retryingOnAllErrors[SnapshotMetadata](
+          policy = retryPolicy,
+          onError = (err: Throwable, details: RetryDetails) =>
+            logger.error(err)(s"[RecoveryDownload] Error fetching metadata (attempt=${details.retriesSoFar})")
+        ) {
+          peerSelect.select.flatMap(p2pClient.globalSnapshot.getLatestMetadata.run(_))
+        }
+      }
+
+      def recoveryStart: F[DownloadResult] =
+        for {
+          metadata <- getLatestMetadata
+          _ <- logger.info(
+            s"[RecoveryDownload] Starting incremental recovery. Network tip: ordinal=${metadata.ordinal.show}, hash=${metadata.hash.show}"
+          )
+          // Only clean up snapshots above the network tip (e.g. from a minority fork).
+          // Do NOT clear in-memory caches — they contain valid state from before the stall.
+          _ <- snapshotStorage.cleanupAbove(metadata.ordinal)
+          _ <- combinedSnapshotCheckpointFileSystemStorage.deleteAbove(metadata.ordinal)
+          // Reset consensus manager state (observation key, last outcome) so the fresh
+          // initFromDownload can set them cleanly, but preserve snapshot caches.
+          _ <- consensus.manager.resetForRecovery
+          // Fetch only the gap: the download() hash-chain walker already stops at persisted snapshots
+          result <- download(metadata.hash, metadata.ordinal, none)
+          _ <- logger.info(
+            s"[RecoveryDownload] Gap fetched. Latest downloaded: ordinal=${result._1.ordinal.show}"
+          )
+        } yield result
+
+      def recoveryObserve(result: DownloadResult): F[(DownloadResult, ObservationLimit)] = {
+        val (lastSnapshot, lastContext) = result
+        // Use the downloaded snapshot's ordinal as the observation limit.
+        // Skip the polling loop — the chain is live (we were just in consensus).
+        val observationLimit = lastSnapshot.ordinal
+        for {
+          hashedSnapshot <- hasherSelector.withCurrent(implicit hs => lastSnapshot.toHashed)
+          _ <- lastNGlobalSnapshotStorage.setForRecovery(hashedSnapshot, lastContext)
+          _ <- lastGlobalSnapshotStorage.setForRecovery(hashedSnapshot, lastContext)
+          // Reset consensus SnapshotStorage head to the recovered ordinal.
+          // Without this, the head stays at the pre-stall ordinal and the first
+          // post-recovery consensus round fails with "prepend gap" when it tries
+          // to persist at ordinal N+1 but head is still at the old ordinal.
+          _ <- hasherSelector.withCurrent { implicit hs =>
+            globalSnapshotConsensusStorage.setHeadForRecovery(lastSnapshot, lastContext)
+          }
+          _ <- consensus.manager.registerForConsensus(observationLimit)
+        } yield (result, observationLimit)
+      }
+
+      nodeStorage
+        .tryModifyState(NodeState.WaitingForDownload, NodeState.DownloadInProgress, NodeState.WaitingForObserving)(recoveryStart)
+        .flatMap(recoveryObserve)
+        .flatMap { result =>
+          val ((snapshot, context), observationLimit) = result
+          consensus.manager.startFacilitatingAfterDownload(observationLimit, snapshot, context, isRecovery = true)
+        }
+        .onError(logger.error(_)("[RecoveryDownload] Unexpected failure, falling back to full download"))
+        .handleErrorWith { _ =>
+          // Recovery failed — fall back to full download path
+          logger.warn("[RecoveryDownload] Falling back to full download") >>
+            nodeStorage.getNodeState.flatMap {
+              case state if state =!= NodeState.WaitingForDownload && state =!= NodeState.Ready =>
+                nodeStorage.setNodeState(NodeState.WaitingForDownload)
+              case _ => Async[F].unit
+            }
+          // Don't chain download() here — let the DownloadDaemon retry with a fresh cycle
+        }
+    }
 
     def start(implicit hasherSelector: HasherSelector[F]): F[DownloadResult] = {
 

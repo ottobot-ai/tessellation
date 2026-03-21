@@ -88,8 +88,8 @@ class ConsensusFSM[F[_]: Async: Metrics: HasherSelector: Random, Event, Key: Eq:
       case RoundCompleted      => log.warn(ConsensusLog.format(ConsensusLog.Lifecycle, "n/a", "n/a", "event" -> "IDLE_ROUND_COMPLETED"))
       case ConsensusFinished(_, _, _) =>
         log.warn(ConsensusLog.format(ConsensusLog.Lifecycle, "n/a", "n/a", "event" -> "IDLE_CONSENSUS_FINISHED"))
-      case InitializeFromDownload(key, art, c) =>
-        transitions.initFromDownload(key.asInstanceOf[Key], art.asInstanceOf[Signed[Artifact]], c.asInstanceOf[Ctx])
+      case InitializeFromDownload(key, art, c, isRecovery) =>
+        transitions.initFromDownload(key.asInstanceOf[Key], art.asInstanceOf[Signed[Artifact]], c.asInstanceOf[Ctx], isRecovery)
       case InitializeFromRollback(key, outcome) => transitions.initFromRollback(key.asInstanceOf[Key], outcome.asInstanceOf[Outcome])
       case WithdrawFromConsensus                => transitions.withdraw
       case _                                    => Async[F].unit

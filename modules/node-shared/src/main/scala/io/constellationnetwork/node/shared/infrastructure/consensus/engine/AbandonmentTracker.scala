@@ -325,52 +325,55 @@ class AbandonmentTracker[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, St
           }
       }
 
-    tryStates(recoveryStates).flatMap {
-      case Some(fromState) =>
-        ConsensusLog.info(
-          logger,
-          ConsensusLog.Lifecycle,
-          key.toString,
-          "n/a",
-          "event" -> "RECOVERY_STATE_TRANSITION",
-          "from" -> fromState.toString,
-          "to" -> "WaitingForDownload"
-        ) >>
-          consecutiveAbandonCountRef.set((none[Key], 0)) >>
-          healthRef.update(_.copy(consecutiveAbandonments = 0)) >>
-          // Clear ALL consensus state (states, resources, peer registrations, scheduling state)
-          // to ensure no stale data from previous abandoned rounds persists into post-recovery.
-          // Without clearAllConsensusState, ghost entries from other ordinals can interfere
-          // with the first post-recovery round. clearAllPeerRegistrations prevents false
-          // lagging detection from stale departed-peer entries.
-          // clearTimeTrigger and clearObservationKey prevent stale scheduling and observation
-          // state from carrying over into the fresh context after download.
-          storage.clearAllConsensusState >>
-          storage.clearAllPeerRegistrations >>
-          storage.clearTimeTrigger >>
-          storage.clearObservationKey >>
-          ctx.pending.clear() >>
-          queue.offer(ConsensusCommand.RoundCompleted)
-      case None =>
-        // Check if node is already in Leaving state — if so, just complete the round and stop.
-        // CRITICAL: Do NOT queue TimeTick here. The old code queued RoundCompleted + TimeTick,
-        // which created an infinite tight loop when node is in Leaving state:
-        //   TimeTick → startRound → abandon → forceLeave(fails) → recoveryDownload(fails) → TimeTick → ...
-        // By only queuing RoundCompleted (no TimeTick), the loop terminates after this iteration.
-        // The next round will only start when an external trigger arrives (peer event, timer, etc.)
-        ctx.nodeStorage.getNodeState.flatMap { currentState =>
-          ConsensusLog.warn(
+    // Signal that this download is a recovery (not a fresh join).
+    // DownloadDaemon will use the incremental recoveryDownload path.
+    ctx.nodeStorage.setRecoveryDownload >>
+      tryStates(recoveryStates).flatMap {
+        case Some(fromState) =>
+          ConsensusLog.info(
             logger,
             ConsensusLog.Lifecycle,
             key.toString,
             "n/a",
-            "event" -> "RECOVERY_TRANSITION_FAILED",
-            "reason" -> s"node in $currentState state, not Ready or Observing",
-            "nodeState" -> currentState.show
+            "event" -> "RECOVERY_STATE_TRANSITION",
+            "from" -> fromState.toString,
+            "to" -> "WaitingForDownload"
           ) >>
+            consecutiveAbandonCountRef.set((none[Key], 0)) >>
+            healthRef.update(_.copy(consecutiveAbandonments = 0)) >>
+            // Clear ALL consensus state (states, resources, peer registrations, scheduling state)
+            // to ensure no stale data from previous abandoned rounds persists into post-recovery.
+            // Without clearAllConsensusState, ghost entries from other ordinals can interfere
+            // with the first post-recovery round. clearAllPeerRegistrations prevents false
+            // lagging detection from stale departed-peer entries.
+            // clearTimeTrigger and clearObservationKey prevent stale scheduling and observation
+            // state from carrying over into the fresh context after download.
+            storage.clearAllConsensusState >>
+            storage.clearAllPeerRegistrations >>
+            storage.clearTimeTrigger >>
+            storage.clearObservationKey >>
             ctx.pending.clear() >>
             queue.offer(ConsensusCommand.RoundCompleted)
-        }
-    }
+        case None =>
+          // Check if node is already in Leaving state — if so, just complete the round and stop.
+          // CRITICAL: Do NOT queue TimeTick here. The old code queued RoundCompleted + TimeTick,
+          // which created an infinite tight loop when node is in Leaving state:
+          //   TimeTick → startRound → abandon → forceLeave(fails) → recoveryDownload(fails) → TimeTick → ...
+          // By only queuing RoundCompleted (no TimeTick), the loop terminates after this iteration.
+          // The next round will only start when an external trigger arrives (peer event, timer, etc.)
+          ctx.nodeStorage.getNodeState.flatMap { currentState =>
+            ConsensusLog.warn(
+              logger,
+              ConsensusLog.Lifecycle,
+              key.toString,
+              "n/a",
+              "event" -> "RECOVERY_TRANSITION_FAILED",
+              "reason" -> s"node in $currentState state, not Ready or Observing",
+              "nodeState" -> currentState.show
+            ) >>
+              ctx.pending.clear() >>
+              queue.offer(ConsensusCommand.RoundCompleted)
+          }
+      }
   }
 }

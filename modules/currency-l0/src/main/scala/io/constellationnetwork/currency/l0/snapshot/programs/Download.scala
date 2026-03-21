@@ -77,6 +77,10 @@ object Download {
     type DownloadResult = (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)
     type ObservationLimit = SnapshotOrdinal
 
+    // Currency L0 recovery currently delegates to full download.
+    // Currency snapshots are small enough that the overhead is minimal.
+    def recoveryDownload(implicit hasherSelector: HasherSelector[F]): F[Unit] = download
+
     def download(implicit hasherSelector: HasherSelector[F]): F[Unit] = {
       implicit val hasher = hasherSelector.getCurrent
 

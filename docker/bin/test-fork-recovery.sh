@@ -78,7 +78,7 @@ get_completed_rounds_after() {
   local node=$1
   local after_ordinal=$2
   local result
-  result=$(docker logs "$node" 2>&1 | grep "ROUND_COMPLETED" | grep -oP 'round=SnapshotOrdinal\{value=(\d+)\}' | grep -oP '\d+' | awk -v min="$after_ordinal" '$1 > min' | wc -l || true)
+  result=$(docker logs "$node" 2>&1 | grep "Round finished ordinal=" | grep -oP 'ordinal=\d+' | grep -oP '\d+' | awk -v min="$after_ordinal" '$1 > min' | wc -l || true)
   echo "${result:-0}"
 }
 

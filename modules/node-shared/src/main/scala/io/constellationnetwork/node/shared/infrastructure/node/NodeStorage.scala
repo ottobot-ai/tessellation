@@ -27,13 +27,15 @@ object NodeStorage {
       stateRef <- Ref.of[F, NodeState](NodeState.Initial)
       stateTopic <- Topic[F, NodeState]
       graceRef <- Ref.of[F, Int](joiningGraceRounds)
+      recoveryRef <- Ref.of[F, Boolean](false)
       _ <- stateTopic.publish1(NodeState.Initial)
-    } yield make(stateRef, stateTopic, graceRef)
+    } yield make(stateRef, stateTopic, graceRef, recoveryRef)
 
   def make[F[_]: Concurrent](
     nodeState: Ref[F, NodeState],
     nodeStateTopic: Topic[F, NodeState],
-    joiningGracePeriod: Ref[F, Int]
+    joiningGracePeriod: Ref[F, Int],
+    recoveryDownloadRef: Ref[F, Boolean]
   ): NodeStorage[F] =
     new NodeStorage[F] {
       def getNodeState: F[NodeState] = nodeState.get
@@ -96,5 +98,14 @@ object NodeStorage {
 
       def isInJoiningGracePeriod: F[Boolean] =
         joiningGracePeriod.get.map(_ > 0)
+
+      def setRecoveryDownload: F[Unit] =
+        recoveryDownloadRef.set(true)
+
+      def clearRecoveryDownload: F[Unit] =
+        recoveryDownloadRef.set(false)
+
+      def isRecoveryDownload: F[Boolean] =
+        recoveryDownloadRef.get
     }
 }
