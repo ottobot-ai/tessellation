@@ -32,6 +32,8 @@ trait NodeStorage[F[_]] {
 
   def clearJoiningGracePeriod: F[Unit]
 
+  def decrementJoiningGracePeriod: F[Unit]
+
   def isInJoiningGracePeriod: F[Boolean]
 
 }

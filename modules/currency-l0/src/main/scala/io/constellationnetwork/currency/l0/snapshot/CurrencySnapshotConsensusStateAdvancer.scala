@@ -213,7 +213,7 @@ object CurrencySnapshotConsensusStateAdvancer {
         resources: ConsensusResources[CurrencySnapshotArtifact, CurrencyConsensusKind]
       ): F[Option[Transition]] =
         for {
-          maybeFacilities <- maybeGetQuorumDeclarations(state, resources)(_.facility)(_.lastSnapshotHash)
+          maybeFacilities <- maybeGetAllDeclarations(state, resources)(_.facility)
           // NOTE: facilitatorsHash fork check is handled by identifyForkedPeers below (evicts minority
           // instead of killing this node). Do NOT call checkForkByFacilitatorsHash here — after stall-based
           // eviction, different nodes may legitimately have different facilitator sets, which would cause
@@ -418,12 +418,14 @@ object CurrencySnapshotConsensusStateAdvancer {
           maybeLeaderProposal match {
             case Some(leaderProposal) =>
               for {
-                // Skip facilitatorsHash fork check when view > 0 (eviction) or solo→multi transition
+                // Skip facilitatorsHash fork check when view > 0 (eviction), solo→multi transition,
+                // or during joining grace period (peer quality scores haven't converged yet).
                 lastSolo <- wasLastRoundSolo
+                inGrace <- nodeStorage.isInJoiningGracePeriod
                 _ <- checkForkByFacilitatorsHash(
                   SortedMap(leader -> leaderProposal),
                   status.facilitatorsHash
-                )(_.facilitatorsHash).whenA(state.viewNumber === 0 && !lastSolo)
+                )(_.facilitatorsHash).whenA(state.viewNumber === 0 && !lastSolo && !inGrace)
                 _ <- checkForkByLastSnapshotHash(
                   SortedMap(leader -> leaderProposal),
                   status.lastSnapshotHash
@@ -585,13 +587,15 @@ object CurrencySnapshotConsensusStateAdvancer {
         resources: ConsensusResources[CurrencySnapshotArtifact, CurrencyConsensusKind]
       ): F[Option[Transition]] =
         for {
-          maybeSignatures <- maybeGetQuorumDeclarations(state, resources)(_.signature)(_.facilitatorsHash)
-          maybeFacilities <- maybeGetQuorumDeclarations(state, resources)(_.facility)(_.trigger)
-          // Skip facilitatorsHash fork check when view > 0 (eviction) or solo→multi transition
+          maybeSignatures <- maybeGetAllDeclarations(state, resources)(_.signature)
+          maybeFacilities <- maybeGetAllDeclarations(state, resources)(_.facility)
+          // Skip facilitatorsHash fork check when view > 0 (eviction), solo→multi transition,
+          // or during joining grace period (peer quality scores haven't converged yet).
           lastSolo2 <- wasLastRoundSolo
+          inGrace2 <- nodeStorage.isInJoiningGracePeriod
           _ <- maybeSignatures
             .traverse_(checkForkByFacilitatorsHash(_, status.facilitatorsHash)(_.facilitatorsHash))
-            .whenA(state.viewNumber === 0 && !lastSolo2)
+            .whenA(state.viewNumber === 0 && !lastSolo2 && !inGrace2)
           _ <- maybeSignatures.traverse_(checkForkByLastSnapshotHash(_, status.lastSnapshotHash))
           maybeGlobalOrd = extractGlobalSnapshotOrdinal(maybeFacilities)
           result <- (maybeGlobalOrd, maybeSignatures) match {
@@ -678,12 +682,14 @@ object CurrencySnapshotConsensusStateAdvancer {
         resources: ConsensusResources[CurrencySnapshotArtifact, CurrencyConsensusKind]
       ): F[Option[Transition]] =
         for {
-          maybeBinarySignatures <- maybeGetQuorumDeclarations(state, resources)(_.binarySignature)(_.facilitatorsHash)
-          // Skip facilitatorsHash fork check when view > 0 (eviction) or solo→multi transition
+          maybeBinarySignatures <- maybeGetAllDeclarations(state, resources)(_.binarySignature)
+          // Skip facilitatorsHash fork check when view > 0 (eviction), solo→multi transition,
+          // or during joining grace period (peer quality scores haven't converged yet).
           lastSolo3 <- wasLastRoundSolo
+          inGrace3 <- nodeStorage.isInJoiningGracePeriod
           _ <- maybeBinarySignatures
             .traverse_(checkForkByFacilitatorsHash(_, status.facilitatorsHash)(_.facilitatorsHash))
-            .whenA(state.viewNumber === 0 && !lastSolo3)
+            .whenA(state.viewNumber === 0 && !lastSolo3 && !inGrace3)
           _ <- maybeBinarySignatures.traverse_(checkForkByLastSnapshotHash(_, status.lastSnapshotHash))
           result <- maybeBinarySignatures.flatTraverse(toFinishedPhase(state, status, _))
         } yield result

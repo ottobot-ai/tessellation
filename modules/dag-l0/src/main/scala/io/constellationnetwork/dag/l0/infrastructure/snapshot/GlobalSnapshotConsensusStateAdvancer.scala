@@ -249,7 +249,7 @@ object GlobalSnapshotConsensusStateAdvancer {
       loggerBundle.app.withOrdinal(SnapshotOrdinal.unsafeApply(state.lastOutcome.key.value.value + 1)) {
         HasherSelector[F].withCurrent { implicit hasher =>
           for {
-            maybeFacilities <- maybeGetQuorumDeclarations(state, resources)(_.facility)(_.lastSnapshotHash)
+            maybeFacilities <- maybeGetAllDeclarations(state, resources)(_.facility)
             facilitators = maybeFacilities.map(_.keys.toList).getOrElse(List.empty[PeerId])
             _ <- loggerBundle.consensus.collectingFacilities(facilitators)
             // NOTE: facilitatorsHash fork check is handled by identifyForkedPeers below (evicts minority
@@ -539,13 +539,15 @@ object GlobalSnapshotConsensusStateAdvancer {
               case Some(leaderProposal) =>
                 for {
                   _ <- loggerBundle.consensus.collectingProposals(List(leader))
-                  // Skip facilitatorsHash fork check when view > 0 (eviction happened) or when
-                  // transitioning from solo genesis to multi-node consensus (penalty state diverges).
+                  // Skip facilitatorsHash fork check when view > 0 (eviction happened), when
+                  // transitioning from solo genesis to multi-node consensus (penalty state diverges),
+                  // or during joining grace period (peer quality scores haven't converged yet).
                   lastSolo <- wasLastRoundSolo
+                  inGrace <- nodeStorage.isInJoiningGracePeriod
                   _ <- checkForkByFacilitatorsHash(
                     SortedMap(leader -> leaderProposal),
                     status.facilitatorsHash
-                  )(_.facilitatorsHash).whenA(state.viewNumber === 0 && !lastSolo)
+                  )(_.facilitatorsHash).whenA(state.viewNumber === 0 && !lastSolo && !inGrace)
                   _ <- checkForkByLastSnapshotHash(
                     SortedMap(leader -> leaderProposal),
                     status.lastSnapshotHash
@@ -955,14 +957,16 @@ object GlobalSnapshotConsensusStateAdvancer {
       loggerBundle.app.withOrdinal(status.majorityArtifactInfo.artifact.ordinal) {
         HasherSelector[F].withCurrent { implicit hasher =>
           for {
-            maybeSignatures <- maybeGetQuorumDeclarations(state, resources)(_.signature)(_.facilitatorsHash)
+            maybeSignatures <- maybeGetAllDeclarations(state, resources)(_.signature)
             facilitators = maybeSignatures.map(_.keys.toList).getOrElse(List.empty[PeerId])
             _ <- loggerBundle.consensus.collectingSignatures(facilitators)
-            // Skip facilitatorsHash fork check when view > 0 (eviction happened) or solo→multi transition
+            // Skip facilitatorsHash fork check when view > 0 (eviction happened), solo→multi transition,
+            // or during joining grace period (peer quality scores haven't converged yet).
             lastSolo2 <- wasLastRoundSolo
+            inGrace2 <- nodeStorage.isInJoiningGracePeriod
             _ <- maybeSignatures
               .traverse_(checkForkByFacilitatorsHash(_, status.facilitatorsHash)(_.facilitatorsHash))
-              .whenA(state.viewNumber === 0 && !lastSolo2)
+              .whenA(state.viewNumber === 0 && !lastSolo2 && !inGrace2)
             _ <- maybeSignatures.traverse_(checkForkByLastSnapshotHash(_, status.lastSnapshotHash))
             result <- maybeSignatures.flatTraverse(toFinishedPhase(state, status, _))
           } yield result

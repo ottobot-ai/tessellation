@@ -150,7 +150,6 @@ object types {
     noProgressTimeout: Option[FiniteDuration] = None,
     maxStallCycles: Int = 3,
     maxRoundDuration: Option[FiniteDuration] = None,
-    quorumThreshold: Option[Double] = Some(0.75),
     removalPenaltyRounds: Int = 3,
     leaderQualityThreshold: Double = 0.5,
     leaderQualityTimeoutMultiplier: Double = 0.5,
@@ -164,9 +163,6 @@ object types {
     tcaMinParticipation: Int = 2,
     qualityDecayThreshold: Int = 100
   ) {
-    quorumThreshold.foreach { t =>
-      require(t > 2.0 / 3.0 && t <= 1.0, s"quorumThreshold must be in (2/3, 1.0], got $t")
-    }
 
     /** Deterministic hash of consensus-critical config values.
       *
@@ -177,7 +173,6 @@ object types {
       * '''Consensus-critical fields''' (included in hash):
       *   - `maxFacilitatorCount`: determines eligible facilitator list size
       *   - `maxStallCycles`: affects when rounds are abandoned
-      *   - `quorumThreshold`: determines quorum size for declaration collection
       *   - `removalPenaltyRounds`: affects facilitator eligibility after removal
       *   - `tcaLookbackWindow`, `tcaMinParticipation`: TCA facilitator selection parameters
       *
@@ -197,7 +192,6 @@ object types {
       val configString =
         s"maxFacilitatorCount=${maxFacilitatorCount.map(_.value)}," +
           s"maxStallCycles=$maxStallCycles," +
-          s"quorumThreshold=$quorumThreshold," +
           s"removalPenaltyRounds=$removalPenaltyRounds," +
           s"tcaLookbackWindow=$tcaLookbackWindow," +
           s"tcaMinParticipation=$tcaMinParticipation," +

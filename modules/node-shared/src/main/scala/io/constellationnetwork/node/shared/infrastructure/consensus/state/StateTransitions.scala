@@ -1,6 +1,6 @@
 package io.constellationnetwork.node.shared.infrastructure.consensus.state
 
-import cats.effect.kernel.Async
+import cats.effect.kernel.{Async, Temporal}
 import cats.effect.std.Random
 import cats.syntax.all._
 import cats.{Eq, Show}
@@ -102,7 +102,7 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
       _ <- ctx.peerQualityTracker.recordRoundSuccess(newState.facilitators.value.toSet)
       leaderScore <- ctx.peerQualityTracker.getQualityScore(newState.leader)
       updated <- storage.tryUpdateLastConsensusOutcomeWithCleanup(prevKey, outcome)
-      _ <- ctx.nodeStorage.clearJoiningGracePeriod
+      _ <- ctx.nodeStorage.decrementJoiningGracePeriod
       // Prune stale resources for keys other than the newly completed key.
       // This prevents memory growth from abandoned rounds leaving behind resource entries.
       activeKey = outcomeKey.get(outcome)
@@ -207,11 +207,23 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
           ifFalse = new Throwable(s"[DownloadInit] Failed to initialize consensus storage").raiseError[F, Unit],
           ifTrue = ctx.nodeStorage.tryModifyState(NodeState.Observing, NodeState.WaitingForReady) >>
             ctx.nodeStorage.setJoiningGracePeriod >>
-            // Start round immediately after download.  The wasLastRoundSolo check in the
-            // StateAdvancer skips the facilitatorsHash fork check on the first multi-node
-            // round, preventing the FORK_DETECTED that previously occurred when validators
-            // and genesis computed different facilitator sets during the join window.
-            queue.offer(StartRound(none))
+            // Defer first round after download to align with the cluster's TimeTrigger cadence.
+            // Without this delay, validators fire StartRound immediately after download while
+            // genesis is still mid-cycle on its 43s TimeTrigger. With N=4, the 3 validators
+            // form a 75% majority and chain ahead without genesis, causing an irrecoverable
+            // ordinal split (validators on N+2, genesis stuck on N+1 with facilitators=4).
+            // Sleeping for timeTriggerInterval synchronizes the validator's first round with
+            // the cluster's existing cadence, ensuring all nodes participate together.
+            ConsensusLog.info(
+              log,
+              ConsensusLog.Lifecycle,
+              key.toString,
+              "n/a",
+              "event" -> "DOWNLOAD_INIT_DEFERRED",
+              "deferral" -> s"${ctx.config.timeTriggerInterval.toSeconds}s"
+            ) >>
+            Temporal[F].sleep(ctx.config.timeTriggerInterval) >>
+            queue.offer(StartRound(TimeTrigger.some))
         )
     } yield ()
 

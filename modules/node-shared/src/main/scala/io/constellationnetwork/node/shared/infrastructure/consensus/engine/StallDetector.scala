@@ -213,10 +213,7 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Order, Artifact, Ctx, Stat
       // NOTE: state.facilitators.value already excludes withdrawn peers (updateFacilitators removes them),
       // so we use it directly as the active count. Quorum is computed on the active set, not the original.
       activeFacilitators = state.facilitators.value.size
-      quorumSize = config.quorumThreshold match {
-        case Some(threshold) => math.ceil(activeFacilitators * threshold).toInt.max(1)
-        case None            => activeFacilitators
-      }
+      quorumSize = math.ceil(activeFacilitators * 2.0 / 3.0).toInt.max(1)
       quorumInfeasible = activeFacilitators > 0 && activeFacilitators < quorumSize
 
       // --- View change loop escalation check ---
@@ -397,12 +394,10 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Order, Artifact, Ctx, Stat
       val phaseLabel = Seq((Metrics.unsafeLabelName("phase"), statusName))
 
       if (missingPeers.nonEmpty) {
-        val remaining = state.facilitators.value.size - missingPeers.size
-        val effectiveQuorum = config.quorumThreshold match {
-          case Some(threshold) => math.ceil(remaining * threshold).toInt.max(1)
-          case None            => remaining
-        }
-        val quorumInfeasible = remaining > 0 && remaining < effectiveQuorum
+        val totalFacilitators = state.facilitators.value.size
+        val remaining = totalFacilitators - missingPeers.size
+        val minQuorum = math.ceil(totalFacilitators * 2.0 / 3.0).toInt.max(1)
+        val quorumInfeasible = remaining < minQuorum
 
         // Record local eviction votes for missing peers (scaffolding for future gossip-based deterministic eviction)
         missingPeers.toList.traverse_(target => evictionVoteTracker.voteToEvict(selfId, target)) >>
@@ -419,7 +414,7 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Order, Artifact, Ctx, Stat
             "progress" -> s"$declaredCount/$activeCount",
             "evicted" -> missingPeers.size.toString,
             "remaining" -> remaining.toString,
-            "effectiveQuorum" -> effectiveQuorum.toString,
+            "minQuorum" -> minQuorum.toString,
             "quorumFeasible" -> (!quorumInfeasible).toString,
             "evictedPeers" -> ConsensusLog.pids(missingPeers),
             "view" -> state.viewNumber.toString
