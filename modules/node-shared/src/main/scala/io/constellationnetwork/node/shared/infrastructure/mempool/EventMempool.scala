@@ -125,6 +125,12 @@ trait EventMempool[F[_], Event, Key] {
     *   Set of all event hashes in the mempool
     */
   def getEventHashes: F[Set[Hash]]
+
+  /** Clear all events from the mempool.
+    *
+    * Used during recovery downloads to discard stale events that would cause artifact mismatches with the healthy cluster.
+    */
+  def clear: F[Unit]
 }
 
 /** Configuration for the event mempool.
@@ -255,5 +261,8 @@ object EventMempool {
 
       def getEventHashes: F[Set[Hash]] =
         storage.get.map(_.entries.keySet)
+
+      def clear: F[Unit] =
+        storage.set(MempoolState.empty[Event, Key])
     }
 }

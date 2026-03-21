@@ -10,6 +10,7 @@ import scala.util.control.NoStackTrace
 
 import io.constellationnetwork.dag.l0.domain.snapshot.storages.SnapshotDownloadStorage
 import io.constellationnetwork.dag.l0.http.p2p.P2PClient
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.{GlobalSnapshotConsensus, GlobalSnapshotContext}
 import io.constellationnetwork.ext.cats.kernel.PartialPrevious
 import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
@@ -21,6 +22,7 @@ import io.constellationnetwork.node.shared.domain.snapshot.programs.Download
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage}
 import io.constellationnetwork.node.shared.domain.snapshot.{PeerSelect, Validator}
 import io.constellationnetwork.node.shared.infrastructure.fork.ExitOnFork
+import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalSnapshotContextFunctions
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.CombinedSnapshotCheckpointFileSystemStorage
 import io.constellationnetwork.schema._
@@ -59,7 +61,8 @@ object Download {
       GlobalIncrementalSnapshot,
       GlobalSnapshotInfo
     ],
-    mptStore: MptStore[F, GlobalStateKey]
+    mptStore: MptStore[F, GlobalStateKey],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): Download[F, GlobalIncrementalSnapshot] = new Download[F, GlobalIncrementalSnapshot] {
@@ -163,7 +166,9 @@ object Download {
             mptStore.deleteAbove(metadata.ordinal) >>
             lastNGlobalSnapshotStorage.clear >>
             lastGlobalSnapshotStorage.clear >>
-            consensus.manager.resetForRecovery
+            consensus.manager.resetForRecovery >>
+            eventMempool.clear >>
+            logger.info("[Download] Cleared event mempool for recovery")
         )
 
       def logDownloadInfo(startingPoint: SnapshotOrdinal, metadata: SnapshotMetadata): F[Unit] =
