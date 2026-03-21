@@ -475,19 +475,19 @@ object ConsensusAuditFixesSuite extends SimpleIOSuite {
   }
 
   // ══════════════════════════════════════════════════════════════════
-  // M4: facilitiesTimeoutMultiplier reduced to 0.3
+  // M4: facilitiesTimeoutMultiplier increased to 0.75
   // ══════════════════════════════════════════════════════════════════
 
-  test("M4: facilities phase timeout is 30% of base (down from 50%)") {
+  test("M4: facilities phase timeout is 75% of base") {
     IO {
       val baseTimeout = 35.seconds
-      val facilitiesMultiplier = 0.3
+      val facilitiesMultiplier = 0.75
 
       val effectiveMs = (baseTimeout.toMillis * facilitiesMultiplier).toLong
       val effectiveTimeout = FiniteDuration(effectiveMs, MILLISECONDS)
 
-      // 35s * 0.3 = 10.5s (faster detection of stuck facilities phase)
-      expect.same(10500.millis, effectiveTimeout)
+      // 35s * 0.75 = 26.25s (sufficient for post-partition recovery)
+      expect.same(26250.millis, effectiveTimeout)
     }
   }
 
@@ -495,15 +495,15 @@ object ConsensusAuditFixesSuite extends SimpleIOSuite {
     IO {
       val baseTimeout = 35.seconds
       val oldMultiplier = 0.5
-      val newMultiplier = 0.3
+      val newMultiplier = 0.75
 
       val oldMs = (baseTimeout.toMillis * oldMultiplier).toLong
       val newMs = (baseTimeout.toMillis * newMultiplier).toLong
 
-      // New timeout is faster: 10.5s vs 17.5s
-      expect(newMs < oldMs) &&
+      // New timeout is longer: 26.25s vs 17.5s (prevents premature eviction during recovery)
+      expect(newMs > oldMs) &&
       expect.same(17500L, oldMs) &&
-      expect.same(10500L, newMs)
+      expect.same(26250L, newMs)
     }
   }
 
