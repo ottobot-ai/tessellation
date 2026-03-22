@@ -594,11 +594,23 @@ private class EventGossipDaemonImpl[F[_]: Async: Parallel, Event, Key](
           meshPeerIds <- meshState.getMeshPeers
           meshPeers = peers.filter(p => meshPeerIds.contains(p.id)).toList
           sampled = scala.util.Random.shuffle(meshPeers).take(3)
+          _ <- logger.debug(
+            s"Chain tip sampling: forkDetector=Some meshSize=${meshPeers.size} sampled=${sampled.size} availablePeers=${peers.size}"
+          )
           _ <- sampled.traverse_ { peer =>
             gossipClient.getIHave
               .run(Peer.toP2PContext(peer))
-              .flatMap(ihave => ihave.chainTip.traverse_(tip => meshState.updateChainTip(peer.id, tip)))
-              .handleErrorWith(_ => Async[F].unit)
+              .flatMap { ihave =>
+                ihave.chainTip match {
+                  case Some(tip) =>
+                    logger.debug(
+                      s"Chain tip from peer ${peer.id.show}: ordinal=${tip.ordinal.value.value} hash=${tip.snapshotHash.show}"
+                    ) >> meshState.updateChainTip(peer.id, tip)
+                  case None =>
+                    logger.debug(s"Peer ${peer.id.show} returned no chain tip in IHave response")
+                }
+              }
+              .handleErrorWith(e => logger.debug(s"Chain tip sampling failed for peer ${peer.id.show}: ${e.getMessage}"))
           }
         } yield ()
       }

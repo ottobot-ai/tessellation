@@ -128,10 +128,13 @@ object Main
         .handlers <+>
         trustHandler(storages.trust) <+> ordinalTrustHandler(storages.trust) <+> services.consensus.handler
 
+      // Shared chain tip getter used by both the gossip daemon (fork detection) and
+      // the HTTP IHave route (so peers can report their chain tip back to callers).
+      getLocalChainTip = sharedStorages.lastGlobalSnapshot.getCombined.map(
+        _.map { case (hashed, _) => ChainTip(hashed.ordinal, hashed.hash) }
+      )
+
       daemonWithRecovery <- {
-        val getLocalChainTip = sharedStorages.lastGlobalSnapshot.getCombined.map(
-          _.map { case (hashed, _) => ChainTip(hashed.ordinal, hashed.hash) }
-        )
         val onForkDetected = { (info: ForkRecoveryInfo) =>
           logger.warn(
             s"Fork divergence detected: local=${info.localOrdinal.value.value} " +
@@ -186,7 +189,8 @@ object Main
           cfg.shared.delegatedStaking.withdrawalTimeLimit
             .getOrElse(sharedConfig.environment, EpochProgress.MinValue),
           cfg.shared,
-          storages.combinedGlobalSnapshotCheckpointStorage
+          storages.combinedGlobalSnapshotCheckpointStorage,
+          getLocalChainTip = Some(getLocalChainTip)
         )
       )
 

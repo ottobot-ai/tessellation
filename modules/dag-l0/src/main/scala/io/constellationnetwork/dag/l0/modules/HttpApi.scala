@@ -18,6 +18,7 @@ import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.config.types.{HttpConfig, RouteRateLimiterConfig, SharedConfig}
 import io.constellationnetwork.node.shared.http.p2p.middlewares.{MetricsMiddleware, PeerAuthMiddleware, `X-Id-Middleware`}
 import io.constellationnetwork.node.shared.http.routes._
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.ChainTip
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.CombinedSnapshotCheckpointFileSystemStorage
 import io.constellationnetwork.node.shared.modules.SharedValidators
@@ -54,7 +55,8 @@ object HttpApi {
       F,
       GlobalIncrementalSnapshot,
       GlobalSnapshotInfo
-    ]
+    ],
+    getLocalChainTip: Option[F[Option[ChainTip]]] = None
   ): F[HttpApi[F, R]] =
     SnapshotRoutes
       .make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
@@ -80,7 +82,8 @@ object HttpApi {
           sharedValidators,
           delegatedStakingWithdrawalTimeLimit,
           sharedConfig,
-          snapshotRoutes
+          snapshotRoutes,
+          getLocalChainTip
         ) {}
       }
 }
@@ -98,7 +101,8 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
   sharedValidators: SharedValidators[F],
   delegatedStakingWithdrawalTimeLimit: EpochProgress,
   sharedConfig: SharedConfig,
-  snapshotRoutes: SnapshotRoutes[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo]
+  snapshotRoutes: SnapshotRoutes[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+  getLocalChainTip: Option[F[Option[ChainTip]]] = None
 ) {
 
   private val mkDagCell = (block: Signed[Block]) =>
@@ -154,7 +158,8 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
   private val registrationRoutes = RegistrationRoutes[F](services.cluster)
   private val gossipRoutes = GossipRoutes[F](storages.rumor, services.gossip, sharedConfig.gossip.timeouts)
   private val eventGossipRoutes = EventGossipRoutes.make[F, GlobalSnapshotEvent, GlobalStateKey](
-    services.eventMempool
+    services.eventMempool,
+    getLocalChainTip
   )
   private val trustRoutes = TrustRoutes[F](storages.trust, programs.trustPush)
   private val stateChannelRoutes =

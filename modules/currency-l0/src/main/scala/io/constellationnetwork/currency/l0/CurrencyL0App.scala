@@ -25,8 +25,9 @@ import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.ext.pureconfig._
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.EventTrigger
-import io.constellationnetwork.node.shared.infrastructure.gossip.event.EventGossipDaemon
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.{ChainTip, EventGossipDaemon}
 import io.constellationnetwork.node.shared.infrastructure.gossip.{GossipDaemon, RumorHandlers}
+import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.LastCheckpointInfo
 import io.constellationnetwork.node.shared.infrastructure.statechannel.StateChannelAllowanceLists
 import io.constellationnetwork.node.shared.resources.MkHttpServer
 import io.constellationnetwork.node.shared.resources.MkHttpServer.ServerName
@@ -173,6 +174,13 @@ abstract class CurrencyL0App(
         .handlers <+>
         services.consensus.handler
 
+      // Chain tip getter for fork detection and IHave chain tip piggyback.
+      // Returns None when no checkpoint has been written yet (empty sentinel hash).
+      getLocalChainTip = storages.combinedCurrencySnapshotCheckpointStorage.getLatestCheckpointInfo.map { info =>
+        if (info.hash == Hash.empty) none[ChainTip]
+        else ChainTip(info.ordinal, info.hash).some
+      }
+
       daemonWithRecovery <- {
         import io.constellationnetwork.currency.dataApplication._
         import io.circe.{Encoder => CEncoder, Decoder => CDecoder, Json => CJson}
@@ -192,7 +200,8 @@ abstract class CurrencyL0App(
             storages.cluster,
             storages.node,
             sharedResources.gossipClient,
-            sharedServices.session
+            sharedServices.session,
+            getLocalChainTip = Some(getLocalChainTip)
           )
           .asResource
       }
@@ -220,7 +229,8 @@ abstract class CurrencyL0App(
             metagraphVersion.some,
             queues,
             sharedConfig,
-            storages.combinedCurrencySnapshotCheckpointStorage
+            storages.combinedCurrencySnapshotCheckpointStorage,
+            getLocalChainTip = Some(getLocalChainTip)
           )
       )
       _ <- MkHttpServer[IO].newEmber(ServerName("public"), cfg.http.publicHttp, api.publicApp)

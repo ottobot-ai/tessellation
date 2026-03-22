@@ -19,6 +19,7 @@ import io.constellationnetwork.kernel._
 import io.constellationnetwork.node.shared.config.types.{HttpConfig, RouteRateLimiterConfig, SharedConfig}
 import io.constellationnetwork.node.shared.http.p2p.middlewares.{PeerAuthMiddleware, `X-Id-Middleware`}
 import io.constellationnetwork.node.shared.http.routes.{EventGossipRoutes, _}
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.ChainTip
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.CombinedSnapshotCheckpointFileSystemStorage
 import io.constellationnetwork.node.shared.snapshot.currency.CurrencySnapshotEvent
@@ -53,7 +54,8 @@ object HttpApi {
       F,
       CurrencyIncrementalSnapshot,
       CurrencySnapshotInfo
-    ]
+    ],
+    getLocalChainTip: Option[F[Option[ChainTip]]] = None
   ): F[HttpApi[F]] =
     for {
       snapshotRoutes <-
@@ -82,7 +84,8 @@ object HttpApi {
         maybeMetagraphVersion,
         queues,
         sharedConfig,
-        snapshotRoutes
+        snapshotRoutes,
+        getLocalChainTip
       ) {}
 }
 
@@ -101,7 +104,8 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
   maybeMetagraphVersion: Option[MetagraphVersion],
   queues: Queues[F],
   sharedConfig: SharedConfig,
-  snapshotRoutes: SnapshotRoutes[F, CurrencyIncrementalSnapshot, CurrencySnapshotInfo]
+  snapshotRoutes: SnapshotRoutes[F, CurrencyIncrementalSnapshot, CurrencySnapshotInfo],
+  getLocalChainTip: Option[F[Option[ChainTip]]] = None
 ) {
 
   private val clusterRoutes =
@@ -130,7 +134,8 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
       DataTransaction.decoder
     }.getOrElse(noopDtDecoder)
     EventGossipRoutes.make[F, CurrencySnapshotEvent, CurrencyStateKey](
-      storages.eventMempool
+      storages.eventMempool,
+      getLocalChainTip
     )
   }
 
