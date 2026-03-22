@@ -135,11 +135,15 @@ object CurrencySnapshotConsensusStateAdvancer {
             val signers = f.signedMajorityArtifact.proofs.map(p => PeerId.fromId(p.id)).toSortedSet
             val nonSigners = state.facilitators.value.filterNot(signers.contains).toSet
 
-            // Compute removal penalties: decrement previous, add penalties for non-signers.
+            // Compute removal penalties: decrement previous, add penalties for non-signers AND evicted peers.
+            // Both nonSigners (facilitators - signers) and removedFacilitators (evicted mid-round)
+            // should receive penalties. Without penalizing evicted peers, they get re-selected every
+            // round and waste stall detection time before being re-evicted.
             // Uses SortedMap for deterministic iteration when filtering penalized peers.
+            val evictedPeers = state.removedFacilitators.value
             val previousPenalties = state.lastOutcome.removalPenalties
             val decrementedPenalties = previousPenalties.view.mapValues(_ - 1).filter(_._2 > 0).to(SortedMap)
-            val newPenalties = nonSigners.foldLeft(decrementedPenalties) { (acc, pid) =>
+            val newPenalties = (nonSigners ++ evictedPeers).foldLeft(decrementedPenalties) { (acc, pid) =>
               acc.updated(pid, config.removalPenaltyRounds)
             }
             val thisRoundQuality: SortedMap[PeerId, (Int, Int)] = SortedMap.from(

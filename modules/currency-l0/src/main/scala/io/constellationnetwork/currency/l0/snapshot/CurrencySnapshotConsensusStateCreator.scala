@@ -83,14 +83,16 @@ object CurrencySnapshotConsensusStateCreator {
         filteredCandidates = approvedCandidates
           .filter(peerId => seedlist.isEmpty || seedlistPeerIds.contains(peerId))
 
-        // Peers that failed to sign in the previous round — derived from PROOFS for determinism.
-        // removedFacilitators and withdrawnFacilitators are non-deterministic (they include
-        // view-change evictions based on local stall detection timing and gossip propagation).
-        // Instead, we use: nonSigners = lastFacilitators - lastSigners (from proofs on the
-        // consensus-agreed signed artifact). This is 100% deterministic across all nodes.
+        // Peers that failed to participate in the previous round.
+        // Two sources (both from consensus-agreed lastOutcome, so deterministic):
+        // 1. nonSigners = facilitators - signers: peers who remained as facilitators but didn't sign
+        // 2. removedFacilitators: peers evicted by StallDetector view change during the round
+        // Without including removedFacilitators, evicted peers get re-selected every round
+        // and waste ~33s of stall detection before being re-evicted.
         lastRoundFacilitators = lastOutcome.facilitators.value.toSet
         lastRoundSigners = lastOutcome.finished.signedMajorityArtifact.proofs.map(_.id.toPeerId).toSortedSet.toSet
-        previouslyRemoved = lastRoundFacilitators -- lastRoundSigners
+        lastRoundEvicted = lastOutcome.removedFacilitators.value
+        previouslyRemoved = (lastRoundFacilitators -- lastRoundSigners) ++ lastRoundEvicted
 
         // Full base WITHOUT removal filter — so removed peers can re-enter in future rounds.
         // The removal filter is only applied for active selection THIS round (see eligibleThisRound below).
