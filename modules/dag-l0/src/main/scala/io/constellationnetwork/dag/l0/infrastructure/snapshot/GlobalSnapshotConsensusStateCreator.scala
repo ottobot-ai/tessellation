@@ -185,12 +185,13 @@ object GlobalSnapshotConsensusStateCreator {
         // NOTE: abandonedMissing is intentionally NOT included — it's a local-only tracker that
         // can diverge between nodes, causing different facilitator sets → fork detection → Leaving state.
         //
-        // MINIMUM VIABLE QUORUM: If excluding penalized peers would drop below 3 facilitators,
+        // MINIMUM VIABLE QUORUM: If excluding penalized peers would drop below majority,
         // bypass penalties and use all eligible peers. This prevents PeerQualityTracker from
-        // reducing the facilitator set below viable consensus (2 facilitators can't reach 67% quorum).
-        // The constant 3 is the minimum for BFT consensus: with 3 nodes, 2/3 = 67% quorum works;
-        // with 2 nodes, neither can reach 67% of 2 = 1.34 → rounds stall indefinitely.
-        minViableQuorum = 3
+        // reducing the facilitator set below viable consensus.
+        // Dynamic majority: floor(N/2) + 1, matching StallDetector's quorum floor.
+        // Penalties can never reduce the facilitator set below the majority threshold —
+        // if they would, bypass them and let StallDetector handle truly unresponsive peers at runtime.
+        minViableQuorum = math.max(3, (allEligible.size / 2) + 1)
         eligibleThisRound = {
           val excluded = previouslyRemoved ++ penalizedPeers
           val filtered = allEligible.filterNot(excluded.contains)
