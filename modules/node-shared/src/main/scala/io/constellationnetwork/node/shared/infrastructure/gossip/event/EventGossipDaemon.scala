@@ -11,7 +11,6 @@ import io.constellationnetwork.node.shared.domain.cluster.services.Session
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.infrastructure.mempool.{EventMempool, MempoolRejectionReason}
-import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.peer.{Peer, PeerId}
 import io.constellationnetwork.security.hash.Hash
@@ -398,7 +397,6 @@ object EventGossipDaemon {
     session: Session[F],
     config: EventGossipConfig = EventGossipConfig(),
     getLocalChainTip: Option[F[Option[ChainTip]]] = None,
-    getLocalOrdinal: Option[F[Option[SnapshotOrdinal]]] = None,
     onForkDetected: Option[ForkRecoveryInfo => F[Unit]] = None,
     forkLagThreshold: Long = 5
   )(implicit S: Supervisor[F]): F[DaemonWithForkRecovery[F, Event, Key]] =
@@ -417,7 +415,7 @@ object EventGossipDaemon {
       meshState <- MeshState.make[F](meshConfig)
       gossipClient = EventGossipClient.make[F, Event](client, session)
 
-      maybeForkDetector = getLocalOrdinal.map(ord => ForkRecoveryDetector.make(meshState, ord, forkLagThreshold))
+      maybeForkDetector = getLocalChainTip.map(tip => ForkRecoveryDetector.make(meshState, tip, forkLagThreshold))
 
       getGossipEligiblePeers: F[Set[Peer]] = clusterStorage.getResponsivePeers.map { peers =>
         peers.filter(p => p.state == NodeState.Ready || p.state == NodeState.Observing)
@@ -437,6 +435,7 @@ object EventGossipDaemon {
           publisher,
           puller,
           graftSyncer,
+          gossipClient,
           getGossipEligiblePeers,
           maybeForkDetector,
           onForkDetected,
@@ -457,6 +456,7 @@ private class EventGossipDaemonImpl[F[_]: Async: Parallel, Event, Key](
   publisher: GossipPublisher[F, Event],
   puller: GossipPuller[F, Event, Key],
   graftSyncer: GraftSyncer[F, Event, Key],
+  gossipClient: EventGossipClient[F, Event],
   getGossipEligiblePeers: F[Set[Peer]],
   maybeForkRecoveryDetector: Option[ForkRecoveryDetector[F]],
   onForkDetected: Option[ForkRecoveryInfo => F[Unit]],
@@ -586,6 +586,22 @@ private class EventGossipDaemonImpl[F[_]: Async: Parallel, Event, Key](
           ifTrue = logger.debug(s"Heartbeat: pruned ${result.pruned.size} peers from mesh"),
           ifFalse = Async[F].unit
         )
+      // Sample chain tips from a few mesh peers so fork detector has fresh data.
+      // The pull loop only contacts non-mesh peers; when the mesh covers all peers
+      // (small clusters or adaptive mesh), chain tips would never be collected.
+      _ <- maybeForkRecoveryDetector.fold(Async[F].unit) { _ =>
+        for {
+          meshPeerIds <- meshState.getMeshPeers
+          meshPeers = peers.filter(p => meshPeerIds.contains(p.id)).toList
+          sampled = scala.util.Random.shuffle(meshPeers).take(3)
+          _ <- sampled.traverse_ { peer =>
+            gossipClient.getIHave
+              .run(Peer.toP2PContext(peer))
+              .flatMap(ihave => ihave.chainTip.traverse_(tip => meshState.updateChainTip(peer.id, tip)))
+              .handleErrorWith(_ => Async[F].unit)
+          }
+        } yield ()
+      }
       // Proactive fork detection — clear stale mesh before triggering recovery
       _ <- (maybeForkRecoveryDetector, onForkDetected).mapN { (detector, handler) =>
         detector.detectForkDivergence.flatMap(_.traverse_ { info =>

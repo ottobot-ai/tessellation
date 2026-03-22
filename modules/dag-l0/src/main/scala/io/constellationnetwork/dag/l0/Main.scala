@@ -132,8 +132,6 @@ object Main
         val getLocalChainTip = sharedStorages.lastGlobalSnapshot.getCombined.map(
           _.map { case (hashed, _) => ChainTip(hashed.ordinal, hashed.hash) }
         )
-        val getLocalOrdinal = sharedStorages.lastGlobalSnapshot.getOrdinal
-
         val onForkDetected = { (info: ForkRecoveryInfo) =>
           logger.warn(
             s"Fork divergence detected: local=${info.localOrdinal.value.value} " +
@@ -152,7 +150,6 @@ object Main
             sharedResources.gossipClient,
             sharedServices.session,
             getLocalChainTip = Some(getLocalChainTip),
-            getLocalOrdinal = Some(getLocalOrdinal),
             onForkDetected = Some(onForkDetected)
           )
           .asResource

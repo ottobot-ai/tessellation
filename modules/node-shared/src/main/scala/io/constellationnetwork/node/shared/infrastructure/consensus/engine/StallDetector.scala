@@ -211,14 +211,21 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Order, Artifact, Ctx, Stat
 
       // --- Quorum feasibility check ---
       // If remaining active facilitators can't form quorum, abandon immediately.
-      // NOTE: state.facilitators.value already excludes withdrawn peers (updateFacilitators removes them),
-      // so we use it directly as the active count. Quorum is computed on the active set, not the original.
+      // Two modes:
+      // 1. During initial startup (activeFacilitators == 1, genesis solo): use facilitator-count
+      //    quorum so genesis can produce the first few snapshots while others observe.
+      // 2. After initial startup (activeFacilitators > 1): use FULL CLUSTER SIZE (responsive peers)
+      //    to prevent eviction cascades where a minority partition shrinks quorum each round
+      //    until a 2-node fork becomes self-sustaining.
       activeFacilitators = state.facilitators.value.size
-      // Simple majority quorum: floor(N/2) + 1. Balances liveness against safety —
-      // the cluster tolerates up to floor((N-1)/2) simultaneous failures while still
-      // requiring a majority to agree on each snapshot. Prevents a minority partition
-      // from producing snapshots unilaterally.
-      quorumSize = (activeFacilitators / 2) + 1
+      readyPeerCount <- clusterStorage.getResponsivePeers.map(_.count(_.state === NodeState.Ready))
+      // Cluster size = Ready peers + self. Only Ready peers can be facilitators, so
+      // non-Ready (Observing, WaitingForReady, etc.) don't inflate the quorum denominator.
+      // During genesis startup (0 Ready peers), clusterSize = activeFacilitators (1),
+      // so genesis can produce solo. After peers join consensus, clusterSize reflects
+      // the actual consensus-capable cluster, preventing minority fork cascades.
+      clusterSize = math.max(readyPeerCount + 1, activeFacilitators)
+      quorumSize = (clusterSize / 2) + 1
       quorumInfeasible = activeFacilitators > 0 && activeFacilitators < quorumSize
 
       // --- View change loop escalation check ---
@@ -236,7 +243,7 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Order, Artifact, Ctx, Stat
         if (isLagging)
           s"lagging behind network: $peersAtHigherKey/$totalRegisteredPeers ready peers at higher key (totalRegs=$totalAllRegs)"
         else if (quorumInfeasible)
-          s"quorum infeasible: $activeFacilitators active < $quorumSize required"
+          s"quorum infeasible: $activeFacilitators active < $quorumSize required (clusterSize=$clusterSize)"
         else if (evictionLoopStuck)
           s"eviction loop: repeated eviction skips (below minimum facilitators), escalating to abandon"
         else if (roundTimedOut)
@@ -402,62 +409,67 @@ class StallDetector[F[_]: Async: Metrics, Event, Key: Order, Artifact, Ctx, Stat
       if (missingPeers.nonEmpty) {
         val totalFacilitators = state.facilitators.value.size
         val remaining = totalFacilitators - missingPeers.size
-        // Simple majority: only allow eviction if remaining facilitators still form a majority
-        // of the original set. Prevents a minority partition from continuing alone.
-        val minQuorum = (totalFacilitators / 2) + 1
-        val quorumInfeasible = remaining < minQuorum
+        // Quorum based on Ready peers in cluster, not current round's facilitator count.
+        // Only Ready peers can participate in consensus, so Observing/WaitingForReady peers
+        // don't inflate the denominator. This prevents eviction cascades from shrinking
+        // quorum each round until a 2-node fork becomes self-sustaining.
+        clusterStorage.getResponsivePeers.map(_.count(_.state === NodeState.Ready)).flatMap { readyPeerCount =>
+          val clusterSize = math.max(readyPeerCount + 1, totalFacilitators)
+          val minQuorum = (clusterSize / 2) + 1
+          val quorumInfeasible = remaining < minQuorum
 
-        // Graduated response: first stall warns and waits, second stall evicts.
-        // This gives slow peers (gossip delay, network jitter) an extra timeout window
-        // before being removed, preventing premature eviction cascades.
-        if (stallCount == 0) {
-          // First timeout — warn only, give peers one more cycle to respond
-          ConsensusLog.warn(
-            logger,
-            ConsensusLog.Stall,
-            key.toString,
-            selfRole(state),
-            "event" -> "PEER_STALL_WARNING",
-            "phase" -> statusName,
-            "elapsed" -> s"${statusDuration.toSeconds}s",
-            "timeout" -> s"${declarationTimeout.toSeconds}s",
-            "progress" -> s"$declaredCount/$activeCount",
-            "missing" -> missingPeers.size.toString,
-            "missingPeers" -> ConsensusLog.pids(missingPeers),
-            "view" -> state.viewNumber.toString,
-            "action" -> "waiting one more cycle before eviction"
-          ) >>
-            Metrics[F].incrementCounter("dag_consensus_stall_warning") >>
-            Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
-            true.pure[F] // Count as stall (increments stallCount) but don't evict
-        } else {
-          // Second+ timeout — evict missing peers
-          // Record local eviction votes for missing peers (scaffolding for future gossip-based deterministic eviction)
-          missingPeers.toList.traverse_(target => evictionVoteTracker.voteToEvict(selfId, target)) >>
+          // Graduated response: first stall warns and waits, second stall evicts.
+          // This gives slow peers (gossip delay, network jitter) an extra timeout window
+          // before being removed, preventing premature eviction cascades.
+          if (stallCount == 0) {
+            // First timeout — warn only, give peers one more cycle to respond
             ConsensusLog.warn(
               logger,
               ConsensusLog.Stall,
               key.toString,
               selfRole(state),
-              "event" -> (if (quorumInfeasible) "QUORUM_INFEASIBLE_AFTER_EVICTION" else "PEER_EVICTION"),
+              "event" -> "PEER_STALL_WARNING",
               "phase" -> statusName,
               "elapsed" -> s"${statusDuration.toSeconds}s",
               "timeout" -> s"${declarationTimeout.toSeconds}s",
               "progress" -> s"$declaredCount/$activeCount",
-              "evicted" -> missingPeers.size.toString,
-              "remaining" -> remaining.toString,
-              "minQuorum" -> minQuorum.toString,
-              "quorumFeasible" -> (!quorumInfeasible).toString,
-              "evictedPeers" -> ConsensusLog.pids(missingPeers),
+              "missing" -> missingPeers.size.toString,
+              "missingPeers" -> ConsensusLog.pids(missingPeers),
               "view" -> state.viewNumber.toString,
-              "stallCount" -> stallCount.toString
+              "action" -> "waiting one more cycle before eviction"
             ) >>
-            Metrics[F].incrementCounter("dag_consensus_peer_eviction") >>
-            Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
-            // If quorum is infeasible after eviction, skip the view change (it can't help)
-            // and let the abandon check in the main loop handle it on the next cycle.
-            // The stall count increment ensures maxStallCycles is reached faster.
-            viewChangeManager.performViewChangeWithEviction(key, state, missingPeers).unlessA(quorumInfeasible).as(true)
+              Metrics[F].incrementCounter("dag_consensus_stall_warning") >>
+              Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
+              true.pure[F] // Count as stall (increments stallCount) but don't evict
+          } else {
+            // Second+ timeout — evict missing peers
+            // Record local eviction votes for missing peers (scaffolding for future gossip-based deterministic eviction)
+            missingPeers.toList.traverse_(target => evictionVoteTracker.voteToEvict(selfId, target)) >>
+              ConsensusLog.warn(
+                logger,
+                ConsensusLog.Stall,
+                key.toString,
+                selfRole(state),
+                "event" -> (if (quorumInfeasible) "QUORUM_INFEASIBLE_AFTER_EVICTION" else "PEER_EVICTION"),
+                "phase" -> statusName,
+                "elapsed" -> s"${statusDuration.toSeconds}s",
+                "timeout" -> s"${declarationTimeout.toSeconds}s",
+                "progress" -> s"$declaredCount/$activeCount",
+                "evicted" -> missingPeers.size.toString,
+                "remaining" -> remaining.toString,
+                "minQuorum" -> minQuorum.toString,
+                "quorumFeasible" -> (!quorumInfeasible).toString,
+                "evictedPeers" -> ConsensusLog.pids(missingPeers),
+                "view" -> state.viewNumber.toString,
+                "stallCount" -> stallCount.toString
+              ) >>
+              Metrics[F].incrementCounter("dag_consensus_peer_eviction") >>
+              Metrics[F].incrementCounter("dag_consensus_stall_phase", phaseLabel) >>
+              // If quorum is infeasible after eviction, skip the view change (it can't help)
+              // and let the abandon check in the main loop handle it on the next cycle.
+              // The stall count increment ensures maxStallCycles is reached faster.
+              viewChangeManager.performViewChangeWithEviction(key, state, missingPeers).unlessA(quorumInfeasible).as(true)
+          }
         }
       } else if (ops.isProposalPhase(state.status)) {
         // All declared but leader hasn't proposed → normal view change (leader rotation only)

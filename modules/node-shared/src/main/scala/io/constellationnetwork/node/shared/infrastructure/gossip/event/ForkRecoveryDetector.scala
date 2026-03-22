@@ -20,7 +20,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * @param localOrdinal
   *   This node's current ordinal
   * @param lag
-  *   How far behind the majority this node is
+  *   How far behind the majority this node is (negative if local is ahead on a fork)
   */
 case class ForkRecoveryInfo(
   majorityOrdinal: SnapshotOrdinal,
@@ -32,12 +32,17 @@ case class ForkRecoveryInfo(
 
 /** Detects fork divergence by comparing local chain tip against peer chain tips collected via gossip.
   *
-  * When a node is on a fork, its ordinal will fall behind the majority of peers. This detector identifies that situation by comparing the
-  * local ordinal against the majority ordinal reported by peers through IHave chain tip metadata.
+  * Fork detection uses (ordinal, hash) pairs — not ordinal alone. Two scenarios:
   *
-  * The majority threshold uses strict majority (> 50% of reporting peers). This is intentional: with 4+ nodes required for quorum (clusters
-  * of 3 can't tolerate any loss with 67% quorum), > 50% of chain tip reporters is a reliable signal that the node has diverged. A higher
-  * threshold (e.g., 2/3) would reduce false positives but delay recovery in split-brain scenarios.
+  *   1. **Lagging fork**: Local ordinal is behind the majority. The node fell off the main chain and stopped advancing. Detected when: lag
+  *      > forkLagThreshold AND majority > 50% of reporters.
+  *
+  * 2. **Running fork**: Local ordinal matches or exceeds the majority, but with a DIFFERENT hash. The node is on a parallel chain producing
+  * its own snapshots (e.g., a 2-node mini-fork after partition). Detected when: peers at the same ordinal have a different hash AND those
+  * peers form a majority.
+  *
+  * The majority threshold uses strict majority (> 50% of reporting peers). This is intentional: with 4+ nodes required for quorum, > 50% of
+  * chain tip reporters is a reliable signal that the node has diverged.
   */
 trait ForkRecoveryDetector[F[_]] {
   def detectForkDivergence: F[Option[ForkRecoveryInfo]]
@@ -47,7 +52,7 @@ object ForkRecoveryDetector {
 
   def make[F[_]: Async](
     meshState: MeshState[F],
-    getLocalOrdinal: F[Option[SnapshotOrdinal]],
+    getLocalChainTip: F[Option[ChainTip]],
     forkLagThreshold: Long = 5
   ): ForkRecoveryDetector[F] = new ForkRecoveryDetector[F] {
 
@@ -56,30 +61,58 @@ object ForkRecoveryDetector {
     def detectForkDivergence: F[Option[ForkRecoveryInfo]] =
       for {
         chainTips <- meshState.getChainTips
-        localOrdinalOpt <- getLocalOrdinal
-        result <- (localOrdinalOpt, chainTips.nonEmpty).pure[F].flatMap {
-          case (Some(localOrdinal), true) =>
-            val ordinalGroups = chainTips.groupBy(_._2.ordinal)
-            val (majorityOrdinal, majorityGroup) = ordinalGroups.maxBy(_._2.size)
-            val lag = majorityOrdinal.value.value - localOrdinal.value.value
+        localTipOpt <- getLocalChainTip
+        result <- (localTipOpt, chainTips.nonEmpty).pure[F].flatMap {
+          case (Some(localTip), true) =>
+            val localOrdinal = localTip.ordinal
+            val localHash = localTip.snapshotHash
 
-            if (lag > forkLagThreshold && majorityGroup.size > chainTips.size / 2) {
-              val majorityHash = majorityGroup.values.head.snapshotHash
-              val info = ForkRecoveryInfo(
-                majorityOrdinal = majorityOrdinal,
-                majorityHash = majorityHash,
-                majorityPeers = majorityGroup.keySet,
-                localOrdinal = localOrdinal,
-                lag = lag
-              )
-              logger
-                .warn(
-                  s"Fork divergence detected: local=${localOrdinal.value.value} " +
-                    s"majority=${majorityOrdinal.value.value} lag=$lag " +
-                    s"majorityPeers=${majorityGroup.size}/${chainTips.size}"
+            // Group peers by (ordinal, hash) — the full chain tip identity
+            val tipGroups: Map[(SnapshotOrdinal, Hash), Map[PeerId, ChainTip]] =
+              chainTips.groupBy { case (_, tip) => (tip.ordinal, tip.snapshotHash) }
+
+            // Find the largest group — the majority chain
+            val ((majorityOrdinal, majorityHash), majorityGroup) = tipGroups.maxBy(_._2.size)
+            val isMajority = majorityGroup.size > chainTips.size / 2
+
+            if (!isMajority) {
+              // No clear majority — can't determine which chain is canonical
+              none[ForkRecoveryInfo].pure[F]
+            } else {
+              val lag = majorityOrdinal.value.value - localOrdinal.value.value
+
+              // Check 1: Lagging fork — local is far behind the majority
+              val isLagging = lag > forkLagThreshold
+
+              // Check 2: Running fork — same or higher ordinal but different hash.
+              // Find peers at our ordinal: if a majority of them have a different hash, we're forked.
+              val peersAtLocalOrdinal = chainTips.filter { case (_, tip) => tip.ordinal == localOrdinal }
+              val peersWithDifferentHash = peersAtLocalOrdinal.filter { case (_, tip) => tip.snapshotHash != localHash }
+              val isRunningFork = peersAtLocalOrdinal.size >= 2 && peersWithDifferentHash.size > peersAtLocalOrdinal.size / 2
+
+              if (isLagging || isRunningFork) {
+                val reason =
+                  if (isRunningFork && !isLagging)
+                    s"hash_divergence local=($localOrdinal,$localHash) vs majority=($majorityOrdinal,$majorityHash) " +
+                      s"peersAtOrdinal=${peersAtLocalOrdinal.size} disagree=${peersWithDifferentHash.size}"
+                  else
+                    s"ordinal_lag local=${localOrdinal.value.value} majority=${majorityOrdinal.value.value} lag=$lag"
+
+                val info = ForkRecoveryInfo(
+                  majorityOrdinal = majorityOrdinal,
+                  majorityHash = majorityHash,
+                  majorityPeers = majorityGroup.keySet,
+                  localOrdinal = localOrdinal,
+                  lag = lag
                 )
-                .as(info.some)
-            } else none[ForkRecoveryInfo].pure[F]
+                logger
+                  .warn(
+                    s"Fork divergence detected: $reason " +
+                      s"majorityPeers=${majorityGroup.size}/${chainTips.size}"
+                  )
+                  .as(info.some)
+              } else none[ForkRecoveryInfo].pure[F]
+            }
           case _ => none[ForkRecoveryInfo].pure[F]
         }
       } yield result
