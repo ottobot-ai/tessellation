@@ -180,12 +180,17 @@ object Download {
           _ <- logger.info(
             s"[RecoveryDownload] Starting incremental recovery. Network tip: ordinal=${metadata.ordinal.show}, hash=${metadata.hash.show}"
           )
-          // Only clean up snapshots above the network tip (e.g. from a minority fork).
-          // Do NOT clear in-memory caches — they contain valid state from before the stall.
+          // Clean up snapshots above the network tip (e.g. from a minority fork).
           _ <- snapshotStorage.cleanupAbove(metadata.ordinal)
           _ <- combinedSnapshotCheckpointFileSystemStorage.deleteAbove(metadata.ordinal)
+          // Clear in-memory snapshot caches. During a network partition the node may have
+          // produced minority-fork snapshots whose hashes differ from the canonical chain.
+          // If we keep stale cache entries, the download replay will fail when it tries to
+          // chain canonical ordinal N+1 onto a forked ordinal N (hash mismatch in set()).
+          _ <- lastNGlobalSnapshotStorage.clear
+          _ <- lastGlobalSnapshotStorage.clear
           // Reset consensus manager state (observation key, last outcome) so the fresh
-          // initFromDownload can set them cleanly, but preserve snapshot caches.
+          // initFromDownload can set them cleanly.
           _ <- consensus.manager.resetForRecovery
           // Fetch only the gap: the download() hash-chain walker already stops at persisted snapshots
           result <- download(metadata.hash, metadata.ordinal, none)
