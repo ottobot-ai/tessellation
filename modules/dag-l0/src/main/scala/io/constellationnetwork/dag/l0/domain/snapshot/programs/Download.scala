@@ -74,7 +74,7 @@ object Download {
     private val validator = StateProofValidator.forGlobal(Some(mptStore.underlying))
 
     val minBatchSizeToStartObserving: Long = 1L
-    val observationOffset = NonNegLong(1L)
+    val observationOffset = NonNegLong(3L)
     val fetchSnapshotDelayBetweenTrials = 10.seconds
 
     type DownloadResult = (Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)
@@ -202,33 +202,30 @@ object Download {
       def recoveryObserve(result: DownloadResult): F[(DownloadResult, ObservationLimit)] = {
         val (lastSnapshot, lastContext) = result
         for {
+          // Reset storage heads to the downloaded snapshot so the normal observe
+          // path can do sequential updates from here.
           hashedSnapshot <- hasherSelector.withCurrent(implicit hs => lastSnapshot.toHashed)
           _ <- lastNGlobalSnapshotStorage.setForRecovery(hashedSnapshot, lastContext)
           _ <- lastGlobalSnapshotStorage.setForRecovery(hashedSnapshot, lastContext)
           _ <- hasherSelector.withCurrent { implicit hs =>
             globalSnapshotConsensusStorage.setHeadForRecovery(lastSnapshot, lastContext)
           }
-          // Wait for one more snapshot to appear on the network before facilitating.
-          // This ensures we start facilitating at the beginning of a round, not mid-flight.
-          // Without this, we race: we start round N+1 but the cluster is already mid-way
-          // through it, so we miss their declarations/proposals and the round fails.
           _ <- logger.info(
-            s"[RecoveryDownload] Observing one round: waiting for ordinal ${lastSnapshot.ordinal.next.show} before facilitating"
+            s"[RecoveryDownload] Storage reset to ordinal ${lastSnapshot.ordinal.show}, entering observe for $observationOffset rounds"
           )
-          observedResult <- fetchNextSnapshot(result)
+          // Reuse the normal observe path — after setForRecovery, snapshots are sequential.
+          // observe updates lastN and lastGlobal storages but NOT the consensus SnapshotStorage head.
+          observeResult <- observe(result)
+          (observedResult, observationLimit) = observeResult
           (observedSnapshot, observedContext) = observedResult
-          _ <- logger.info(
-            s"[RecoveryDownload] Observed ordinal ${observedSnapshot.ordinal.show}, ready to facilitate"
-          )
-          observedHashed <- hasherSelector.withCurrent(implicit hs => observedSnapshot.toHashed)
-          _ <- lastNGlobalSnapshotStorage.setForRecovery(observedHashed, observedContext)
-          _ <- lastGlobalSnapshotStorage.setForRecovery(observedHashed, observedContext)
+          // Sync consensus SnapshotStorage head to observed tip so prepend works on the next round
           _ <- hasherSelector.withCurrent { implicit hs =>
             globalSnapshotConsensusStorage.setHeadForRecovery(observedSnapshot, observedContext)
           }
-          observationLimit = observedSnapshot.ordinal
-          _ <- consensus.manager.registerForConsensus(observationLimit)
-        } yield (observedResult, observationLimit)
+          _ <- logger.info(
+            s"[RecoveryDownload] Consensus head synced to ordinal ${observedSnapshot.ordinal.show}"
+          )
+        } yield observeResult
       }
 
       nodeStorage

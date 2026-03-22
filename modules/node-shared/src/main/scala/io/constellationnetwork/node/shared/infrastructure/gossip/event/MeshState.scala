@@ -288,7 +288,10 @@ object MeshState {
           val currentMeshSize = afterPrune.count(_._2.inMesh)
 
           // 5. Graft new peers if below target
-          val needToGraft = (config.targetMeshSize - currentMeshSize).max(0)
+          // Adaptive: when cluster is small enough, connect to everyone (full mesh).
+          // Mesh optimization only matters for large networks.
+          val effectiveTarget = math.min(availablePeers.size, config.maxMeshSize)
+          val needToGraft = (effectiveTarget - currentMeshSize).max(0)
           val candidatesForGraft = availablePeers
             .diff(afterPrune.filter(_._2.inMesh).keySet) // Not already in mesh
             .toList
@@ -329,7 +332,7 @@ object MeshState {
           //    A cooldown prevents oscillation in high-churn environments.
           val (finalState, rotatedOut, rotatedIn, didRotate) = {
             val currentMeshSize = afterMaxPrune.count(_._2.inMesh)
-            if (rotationAllowed && currentMeshSize >= config.targetMeshSize) {
+            if (rotationAllowed && currentMeshSize >= effectiveTarget) {
               val meshPeers = afterMaxPrune.filter(_._2.inMesh).toList.sortBy(_._2.score)
               val nonMeshCandidates = availablePeers
                 .diff(afterMaxPrune.filter(_._2.inMesh).keySet)
