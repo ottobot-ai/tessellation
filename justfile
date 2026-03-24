@@ -36,12 +36,19 @@ purge-docker:
 clean-docker:
 	@bash docker/bin/tessellation-docker-cleanup.sh
 
-# Remove root-owned node data (gl0/gl1/ml0 persisted state) using a Docker container to bypass sudo
+# Remove root-owned node data and logs for all layer types using a Docker container to bypass sudo
+# Covers: gl0, gl1, ml0, cl1, dl1 — both data and logs directories
 # Data lives in nodes/ (repo root, used by compose-runner) AND docker/nodes/ (legacy)
 clean-data:
-	@docker run --rm -v $(pwd)/nodes:/nodes alpine sh -c "rm -rf /nodes/*/gl0-data /nodes/*/gl1-data /nodes/*/ml0-data /nodes/*/gl0-logs /nodes/*/gl1-logs /nodes/*/ml0-logs" 2>/dev/null || true
-	@docker run --rm -v $(pwd)/docker/nodes:/nodes alpine sh -c "rm -rf /nodes/*/gl0-data /nodes/*/gl1-data /nodes/*/ml0-data" 2>/dev/null || true
-	@echo "Node data cleaned (nodes/ and docker/nodes/)"
+	@docker run --rm -v $(pwd)/nodes:/nodes alpine sh -c "\
+	  for layer in gl0 gl1 ml0 cl1 dl1; do \
+	    rm -rf /nodes/*/\$layer-data /nodes/*/\$layer-logs; \
+	  done" 2>/dev/null || true
+	@docker run --rm -v $(pwd)/docker/nodes:/nodes alpine sh -c "\
+	  for layer in gl0 gl1 ml0 cl1 dl1; do \
+	    rm -rf /nodes/*/\$layer-data /nodes/*/\$layer-logs; \
+	  done" 2>/dev/null || true
+	@echo "Node data and logs cleaned for gl0/gl1/ml0/cl1/dl1 (nodes/ and docker/nodes/)"
 
 clean-configs:
 	@bash docker/bin/clean-configs.sh
