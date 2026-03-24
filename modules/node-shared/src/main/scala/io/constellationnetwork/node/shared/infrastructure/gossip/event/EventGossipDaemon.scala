@@ -190,7 +190,7 @@ private[event] object GossipPublisher {
             .ifM(
               ifTrue = {
                 val push = EventPush(event.hash, event.signed)
-                meshPeers.traverse_ { peer =>
+                meshPeers.parTraverse { peer =>
                   client
                     .pushEvent(push)
                     .run(Peer.toP2PContext(peer))
@@ -208,7 +208,7 @@ private[event] object GossipPublisher {
                       meshState.recordFailure(peer.id) >>
                         logger.warn(s"Failed to push event to peer ${peer.id.show}: ${err.getMessage}")
                     }
-                }
+                }.void
               },
               ifFalse = logger.debug("No mesh peers available for push")
             )
