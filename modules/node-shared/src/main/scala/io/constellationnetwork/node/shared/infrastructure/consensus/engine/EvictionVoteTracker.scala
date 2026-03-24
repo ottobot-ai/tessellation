@@ -5,34 +5,26 @@ import cats.syntax.all._
 
 import io.constellationnetwork.schema.peer.PeerId
 
-/** Tracks local eviction votes from peers to enable deterministic, consensus-agreed peer removal.
+/** Tracks eviction votes to coordinate peer removal during stall detection.
   *
-  * ==Problem==
+  * Used by [[StallDetector]] to record which peers the local node considers unresponsive. Each vote maps a voter (the
+  * detecting node) to a target (the unresponsive peer). The supermajority check gates eviction decisions — a peer is
+  * only evicted when enough facilitators independently agree it is missing.
   *
-  * Currently, peer eviction is based on local gossip state (which peers haven't declared). Different nodes may see different sets of
-  * "missing" peers at the same point in time, leading to non-deterministic eviction decisions. This can cause facilitator set divergence
-  * across nodes.
+  * Votes are cleared at the start of each consensus round via [[clearVotes]].
   *
-  * ==Solution (Scaffolding)==
+  * ==Current Scope==
   *
-  * This tracker collects local eviction votes — each node votes to evict peers it considers unresponsive. When a supermajority of nodes
-  * agree on the same eviction target, the eviction is considered deterministic (all honest nodes will agree).
+  * Votes are currently local-only (each node tracks its own observations). This is sufficient because stall detection
+  * runs independently on each node against the same gossip state, producing convergent eviction decisions in practice.
   *
-  * ==Current Behavior==
+  * ==Future: Gossip-Based Votes==
   *
-  * This is scaffolding for future deterministic eviction. The tracker:
-  *   - Accepts eviction votes from the local node
-  *   - Tracks which peers have been voted for eviction and by how many distinct voters
-  *   - Provides a query method to check if a peer has supermajority eviction votes
-  *   - Integrates with the existing quality tracking for observability
-  *
-  * ==Future Work==
-  *
-  * To make eviction fully deterministic:
-  *   1. Spread eviction votes via gossip (new rumor type) 2. Collect votes from all facilitators (not just local) 3. Include vote tallies
-  *      in the Facility declaration for consensus agreement 4. Only evict when the facilitatorsHash-agreed vote tally reaches supermajority
-  *
-  * This scaffolding prepares the local tracking infrastructure so the gossip protocol can be added incrementally.
+  * For fully deterministic eviction across all nodes:
+  *   1. Spread eviction votes via gossip (new rumor type)
+  *   2. Collect votes from all facilitators, not just local observations
+  *   3. Include vote tallies in Facility declarations for consensus agreement
+  *   4. Only evict when the consensus-agreed tally reaches supermajority
   */
 trait EvictionVoteTracker[F[_]] {
 
