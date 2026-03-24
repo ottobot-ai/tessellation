@@ -152,16 +152,12 @@ object types {
     maxStallCycles: Int = 3,
     maxRoundDuration: Option[FiniteDuration] = None,
     removalPenaltyRounds: Int = 3,
-    leaderQualityThreshold: Double = 0.5,
-    leaderQualityTimeoutMultiplier: Double = 0.5,
     facilitiesTimeoutMultiplier: Double = 0.75,
     proposalsTimeoutMultiplier: Double = 1.5,
     signaturesTimeoutMultiplier: Double = 0.75,
     maxConsecutiveAbandonments: Int = 5,
     monitorSummaryInterval: FiniteDuration = FiniteDuration(10, "s"),
     peerScoreLogInterval: FiniteDuration = FiniteDuration(60, "s"),
-    tcaLookbackWindow: Int = 5,
-    tcaMinParticipation: Int = 2,
     qualityDecayThreshold: Int = 100,
     eventTriggerMinPeers: Int = 2,
     eventTriggerThreshold: Int = 1,
@@ -177,31 +173,26 @@ object types {
       * downstream.
       *
       * '''Consensus-critical fields''' (included in hash):
-      *   - `maxFacilitatorCount`: determines eligible facilitator list size
-      *   - `maxStallCycles`: affects when rounds are abandoned
-      *   - `removalPenaltyRounds`: affects facilitator eligibility after removal
-      *   - `tcaLookbackWindow`, `tcaMinParticipation`: TCA facilitator selection parameters
+      *   - `maxFacilitatorCount`: determines eligible facilitator list size and rendezvous hashing
+      *   - `maxStallCycles`: affects when rounds are abandoned (triggers recovery)
+      *   - `removalPenaltyRounds`: affects facilitator eligibility after eviction
       *
       * '''Non-critical fields''' (excluded — affect timing/performance, not deterministic outcomes):
       *   - `timeTriggerInterval`, `declarationTimeout`, `lockDuration`, `reStallTimeout`, `noProgressTimeout`: timing only
       *   - `facilitiesTimeoutMultiplier`, `proposalsTimeoutMultiplier`, `signaturesTimeoutMultiplier`: timing multipliers only
       *   - `maxRoundDuration`: safety net, not consensus logic
       *   - `declarationRangeLimit`, `eventCutter`: event filtering, not consensus decisions
+      *   - `qualityDecayThreshold`: local peer quality tracking, no consensus effect
       *
       * IMPORTANT: When adding new fields to ConsensusConfig, evaluate whether they affect consensus determinism. If the field changes what
       * peers decide (facilitator selection, quorum logic, voting thresholds), add it to the hash string below. If it only affects timing or
       * performance, exclude it.
-      *
-      * Hash.fromBytes applies SHA-256 (via sha256DigestFromBytes), producing a compact 64-char hex digest.
       */
     lazy val deterministicConfigHash: Hash = {
       val configString =
         s"maxFacilitatorCount=${maxFacilitatorCount.map(_.value)}," +
           s"maxStallCycles=$maxStallCycles," +
-          s"removalPenaltyRounds=$removalPenaltyRounds," +
-          s"tcaLookbackWindow=$tcaLookbackWindow," +
-          s"tcaMinParticipation=$tcaMinParticipation," +
-          s"qualityDecayThreshold=$qualityDecayThreshold"
+          s"removalPenaltyRounds=$removalPenaltyRounds"
       Hash.fromBytes(configString.getBytes("UTF-8"))
     }
   }
