@@ -51,27 +51,7 @@ object DownloadDaemon {
             downloadLock.tryAcquire.flatMap {
               case true =>
                 Async[F].guaranteeCase(
-                  nodeStorage.isRecoveryDownload
-                    .flatTap(flag => logger.info(s"[DownloadDaemon] WaitingForDownload triggered, isRecovery=$flag"))
-                    .flatMap { isRecovery =>
-                      val downloadAction = if (isRecovery) {
-                        logger.info("[DownloadDaemon] Using incremental recovery download path") >>
-                          download.recoveryDownload(hasherSelector)
-                      } else {
-                        logger.info("[DownloadDaemon] Using full download path") >>
-                          download.download(hasherSelector)
-                      }
-                      (peerDiscoveryDelay.waitForPeers >> downloadAction)
-                        .flatTap(_ => nodeStorage.clearRecoveryDownload)
-                    }
-                    .handleErrorWith { err =>
-                      logger.error(err)(
-                        "Download failed, stream kept alive. " +
-                          "Node remains in WaitingForDownload — will retry after 10s backoff."
-                      ) >> Async[F].sleep(10.seconds)
-                    // Do NOT clear recoveryDownload flag here — preserve it so retries
-                    // still use the incremental recovery path instead of full download.
-                    }
+                  attemptDownloadWithRetry
                 )(_ => downloadLock.release)
               case false =>
                 logger.debug("Download already in progress, skipping duplicate trigger")
@@ -79,5 +59,46 @@ object DownloadDaemon {
           }
           .compile
           .drain
+
+    /** Attempts download, retrying with exponential backoff on failure.
+      *
+      * The nodeStates stream only emits on state *transitions*, so if download fails while the node is already in WaitingForDownload, no
+      * new event is published and the stream never re-fires. This method loops internally until download succeeds or the node leaves
+      * WaitingForDownload.
+      */
+    private def attemptDownloadWithRetry: F[Unit] = {
+      val maxBackoff = 60.seconds
+
+      def go(attempt: Int, backoff: FiniteDuration): F[Unit] =
+        nodeStorage.getNodeState.flatMap {
+          case NodeState.WaitingForDownload =>
+            nodeStorage.isRecoveryDownload
+              .flatTap(flag => logger.info(s"[DownloadDaemon] Download attempt $attempt, isRecovery=$flag"))
+              .flatMap { isRecovery =>
+                val downloadAction = if (isRecovery) {
+                  logger.info("[DownloadDaemon] Using incremental recovery download path") >>
+                    download.recoveryDownload(hasherSelector)
+                } else {
+                  logger.info("[DownloadDaemon] Using full download path") >>
+                    download.download(hasherSelector)
+                }
+                (peerDiscoveryDelay.waitForPeers >> downloadAction)
+                  .flatTap(_ => nodeStorage.clearRecoveryDownload)
+              }
+              .handleErrorWith { err =>
+                val nextBackoff = (backoff * 2).min(maxBackoff)
+                logger.error(err)(
+                  s"[DownloadDaemon] Download attempt $attempt failed, retrying in ${backoff.toSeconds}s"
+                ) >> Async[F].sleep(backoff) >> go(attempt + 1, nextBackoff)
+              // Do NOT clear recoveryDownload flag here — preserve it so retries
+              // still use the incremental recovery path instead of full download.
+              }
+          case other =>
+            logger.info(s"[DownloadDaemon] Node no longer in WaitingForDownload (state=$other), aborting retry loop") >>
+              nodeStorage.clearRecoveryDownload
+        }
+
+      go(attempt = 1, backoff = 10.seconds)
+    }
   }
 }

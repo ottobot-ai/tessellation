@@ -183,15 +183,7 @@ object EventMempool {
     new EventMempool[F, Event, Key] {
 
       def add(event: Signed[Event]): F[Either[MempoolRejectionReason, MempoolEntry[Event, Key]]] =
-        for {
-          currentSize <- size
-          result <- (currentSize < config.maxSize)
-            .pure[F]
-            .ifM(
-              ifTrue = doAdd(event),
-              ifFalse = (MempoolRejectionReason.MempoolFull: MempoolRejectionReason).asLeft[MempoolEntry[Event, Key]].pure[F]
-            )
-        } yield result
+        doAdd(event)
 
       private def doAdd(event: Signed[Event]): F[Either[MempoolRejectionReason, MempoolEntry[Event, Key]]] =
         for {
@@ -213,13 +205,18 @@ object EventMempool {
         for {
           stateKeys <- keyExtractor.extractKeys(hashedEvent.signed.value)
           entry <- MempoolEntry(hashedEvent, stateKeys)
-          _ <- storage.update { state =>
-            state.copy(
-              entries = state.entries + (hashedEvent.hash -> entry),
-              insertionOrder = state.insertionOrder :+ hashedEvent.hash
-            )
+          result <- storage.modify { state =>
+            if (state.entries.size >= config.maxSize)
+              (state, (MempoolRejectionReason.MempoolFull: MempoolRejectionReason).asLeft[MempoolEntry[Event, Key]])
+            else {
+              val newState = state.copy(
+                entries = state.entries + (hashedEvent.hash -> entry),
+                insertionOrder = state.insertionOrder :+ hashedEvent.hash
+              )
+              (newState, entry.asRight[MempoolRejectionReason])
+            }
           }
-        } yield entry.asRight[MempoolRejectionReason]
+        } yield result
 
       def get(hash: Hash): F[Option[Hashed[Event]]] =
         storage.get.map(_.entries.get(hash).map(_.hashed))
