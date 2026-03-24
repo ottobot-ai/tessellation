@@ -170,7 +170,7 @@ object UpdateDelegatedStakeAcceptanceManager {
             .traverse { case (signed, epoch) => signed.proofs.head.id.toAddress.map((_, (signed, epoch))) }
             .map(_.groupBy(_._1).view.mapValues(_.map(_._2)).toSortedMap)
 
-          _ <- logger.info(
+          _ <- logger.debug(
             s"[DELEG_STAKE] ordinal=${currentSnapshotOrdinal.show} " +
               s"input: creates=${creates.size} withdrawals=${withdrawals.size} " +
               s"existing=${hashedExistingDelegatedStakes.size} acceptedTokenLocks=${acceptedTokenLocks.size} | " +
