@@ -100,6 +100,16 @@ class AbandonmentTracker[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, St
   /** Tracks consecutive abandonments at the same key to detect infinite stuck loops. */
   private val consecutiveAbandonCountRef: Ref[F, (Option[Key], Int)] = Ref.unsafe((none[Key], 0))
 
+  /** Tracks consecutive retriable abandonments at the same key. If the node is stuck at the same ordinal with quorum-infeasible for too
+    * long (e.g., post-chaos where one node forked ahead), this escalates to non-retriable after `maxRetriableAtSameKey` attempts.
+    */
+  private val retriableAtSameKeyRef: Ref[F, (Option[Key], Int)] = Ref.unsafe((none[Key], 0))
+
+  /** After this many retriable abandonments at the same ordinal, escalate to recovery. Default: 2x maxConsecutiveAbandonments (10 with
+    * default config). This is higher than the non-retriable threshold because quorum-infeasible is expected during transient partitions.
+    */
+  private val maxRetriableAtSameKey: Int = config.maxConsecutiveAbandonments * 2
+
   /** Tracks total recovery download attempts across all keys to detect extended recovery loops. */
   private val totalRecoveryAttemptsRef: Ref[F, Int] = Ref.unsafe(0)
 
@@ -108,6 +118,7 @@ class AbandonmentTracker[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, St
     */
   def resetOnSuccessfulRound: F[Unit] =
     totalRecoveryAttemptsRef.set(0) >>
+      retriableAtSameKeyRef.set((none[Key], 0)) >>
       healthRef.update(_.copy(totalRecoveryAttempts = 0))
 
   /** Track a failed initFromDownload attempt. Called by the event loop error handler when InitializeFromDownload exhausts retries. Without
@@ -232,17 +243,31 @@ class AbandonmentTracker[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, St
         .handleErrorWith(e => logger.warn(e)("condModifyState failed during abandon, proceeding with resource cleanup")) >>
       storage.clearResources(key) >>
       (if (reason.retriable)
-         ConsensusLog.info(
-           logger,
-           Category.Lifecycle,
-           key.toString,
-           "n/a",
-           LogEvent.RoundAbandonedRetriable,
-           "reason" -> reason.label,
-           "detail" -> reason.message
-         ) >>
-           queue.offer(ConsensusCommand.RoundCompleted) >>
-           queue.offer(ConsensusCommand.TimeTick)
+         trackRetriableAtSameKey(key).flatMap { retriableCount =>
+           val shouldEscalate = retriableCount >= maxRetriableAtSameKey
+           ConsensusLog.info(
+             logger,
+             Category.Lifecycle,
+             key.toString,
+             "n/a",
+             if (shouldEscalate) LogEvent.RetriableEscalated else LogEvent.RoundAbandonedRetriable,
+             "reason" -> reason.label,
+             "detail" -> reason.message,
+             "retriableAtSameKey" -> retriableCount.toString,
+             "maxRetriableAtSameKey" -> maxRetriableAtSameKey.toString
+           ) >>
+             (if (shouldEscalate)
+                // Stuck at the same ordinal with quorum-infeasible for too long.
+                // Escalate: treat as non-retriable to trigger recovery download.
+                retriableAtSameKeyRef.set((none[Key], 0)) >>
+                  trackConsecutiveAbandonments(key).flatMap { consecutiveCount =>
+                    healthRef.update(_.copy(consecutiveAbandonments = consecutiveCount)) >>
+                      triggerRecoveryDownload(key, consecutiveCount)
+                  }
+              else
+                queue.offer(ConsensusCommand.RoundCompleted) >>
+                  queue.offer(ConsensusCommand.TimeTick))
+         }
        else
          trackConsecutiveAbandonments(key).flatMap { consecutiveCount =>
            val shouldRecover = consecutiveCount >= config.maxConsecutiveAbandonments
@@ -269,6 +294,18 @@ class AbandonmentTracker[F[_]: Async: Metrics, Event, Key: Eq, Artifact, Ctx, St
     */
   private def trackConsecutiveAbandonments(key: Key): F[Int] =
     consecutiveAbandonCountRef.modify {
+      case (Some(lastKey), count) if lastKey === key =>
+        val newCount = count + 1
+        ((key.some, newCount), newCount)
+      case _ =>
+        ((key.some, 1), 1)
+    }
+
+  /** Track retriable abandonments at the same key. If the node keeps getting quorum-infeasible at the same ordinal, something is
+    * permanently wrong (e.g., post-partition with a 1-ordinal minority fork). Resets to 1 when the key changes.
+    */
+  private def trackRetriableAtSameKey(key: Key): F[Int] =
+    retriableAtSameKeyRef.modify {
       case (Some(lastKey), count) if lastKey === key =>
         val newCount = count + 1
         ((key.some, newCount), newCount)

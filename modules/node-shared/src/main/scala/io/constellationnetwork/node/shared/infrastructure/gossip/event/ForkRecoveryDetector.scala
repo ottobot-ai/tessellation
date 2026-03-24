@@ -37,9 +37,13 @@ case class ForkRecoveryInfo(
   *   1. **Lagging fork**: Local ordinal is behind the majority. The node fell off the main chain and stopped advancing. Detected when: lag
   *      > forkLagThreshold AND majority > 50% of reporters.
   *
-  * 2. **Running fork**: Local ordinal matches or exceeds the majority, but with a DIFFERENT hash. The node is on a parallel chain producing
-  * its own snapshots (e.g., a 2-node mini-fork after partition). Detected when: peers at the same ordinal have a different hash AND those
-  * peers form a majority.
+  * 2. **Running fork**: Local ordinal matches the majority, but with a DIFFERENT hash. The node is on a parallel chain producing its own
+  * snapshots (e.g., a 2-node mini-fork after partition). Detected when: peers at the same ordinal have a different hash AND those peers
+  * form a majority.
+  *
+  * We intentionally do NOT detect "minority fork" (local ahead of majority) via hash comparison, because different ordinals always have
+  * different hashes regardless of fork status. A node 1 ordinal ahead is normal during round completion. If a minority-fork node is truly
+  * stuck, the stale-ordinal escalation in AbandonmentTracker handles it as a safety net.
   *
   * The majority threshold uses strict majority (> 50% of reporting peers). This is intentional: with 4+ nodes required for quorum, > 50% of
   * chain tip reporters is a reliable signal that the node has diverged.
@@ -84,7 +88,7 @@ object ForkRecoveryDetector {
               // Check 1: Lagging fork — local is far behind the majority
               val isLagging = lag > forkLagThreshold
 
-              // Check 2: Running fork — same or higher ordinal but different hash.
+              // Check 2: Running fork — same ordinal but different hash.
               // Find peers at our ordinal: if a majority of them have a different hash, we're forked.
               val peersAtLocalOrdinal = chainTips.filter { case (_, tip) => tip.ordinal == localOrdinal }
               val peersWithDifferentHash = peersAtLocalOrdinal.filter { case (_, tip) => tip.snapshotHash != localHash }
@@ -94,6 +98,13 @@ object ForkRecoveryDetector {
               // for 2-node mini-forks. The lagging fork check (forkLagThreshold) catches those
               // cases once the mini-fork falls behind the canonical chain.
               val isRunningFork = peersAtLocalOrdinal.size >= 2 && peersWithDifferentHash.size > peersAtLocalOrdinal.size / 2
+
+              // NOTE: We intentionally do NOT check "local ahead of majority" (minority fork).
+              // Hash comparison across different ordinals is meaningless — ordinal 11's hash will
+              // never equal ordinal 10's hash regardless of fork status. A node 1 ordinal ahead
+              // is normal (it finished the round first). If a minority-fork node is truly stuck,
+              // the stale-ordinal escalation in AbandonmentTracker handles it (retriable
+              // abandonments at the same key → escalate after maxRetriableAtSameKey attempts).
 
               if (isLagging || isRunningFork) {
                 val reason =

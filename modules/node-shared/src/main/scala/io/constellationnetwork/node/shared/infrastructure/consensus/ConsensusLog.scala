@@ -71,6 +71,7 @@ object ConsensusLog {
     case object RoundCompletedNoOutcome extends Event { val show = "ROUND_COMPLETED_NO_OUTCOME" }
     case object RoundAbandoned extends Event { val show = "ROUND_ABANDONED" }
     case object RoundAbandonedRetriable extends Event { val show = "ROUND_ABANDONED_RETRIABLE" }
+    case object RetriableEscalated extends Event { val show = "RETRIABLE_ESCALATED" }
     case object RoundAbandonedTracked extends Event { val show = "ROUND_ABANDONED_TRACKED" }
     case object RoundBlockedByState extends Event { val show = "ROUND_BLOCKED_BY_STATE" }
     case object RoundMonitor extends Event { val show = "ROUND_MONITOR" }
