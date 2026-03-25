@@ -183,37 +183,27 @@ object EventMempool {
     new EventMempool[F, Event, Key] {
 
       def add(event: Signed[Event]): F[Either[MempoolRejectionReason, MempoolEntry[Event, Key]]] =
-        doAdd(event)
-
-      private def doAdd(event: Signed[Event]): F[Either[MempoolRejectionReason, MempoolEntry[Event, Key]]] =
         for {
           hashed <- event.toHashed
-          existing <- storage.get.map(_.entries.get(hashed.hash))
-
-          result <- existing match {
-            case Some(entry) =>
-              entry.asRight[MempoolRejectionReason].pure[F]
-
-            case None =>
-              processEvent(hashed)
-          }
-        } yield result
-
-      private def processEvent(
-        hashedEvent: Hashed[Event]
-      ): F[Either[MempoolRejectionReason, MempoolEntry[Event, Key]]] =
-        for {
-          stateKeys <- keyExtractor.extractKeys(hashedEvent.signed.value)
-          entry <- MempoolEntry(hashedEvent, stateKeys)
+          stateKeys <- keyExtractor.extractKeys(hashed.signed.value)
+          entry <- MempoolEntry(hashed, stateKeys)
           result <- storage.modify { state =>
-            if (state.entries.size >= config.maxSize)
-              (state, (MempoolRejectionReason.MempoolFull: MempoolRejectionReason).asLeft[MempoolEntry[Event, Key]])
-            else {
-              val newState = state.copy(
-                entries = state.entries + (hashedEvent.hash -> entry),
-                insertionOrder = state.insertionOrder :+ hashedEvent.hash
-              )
-              (newState, entry.asRight[MempoolRejectionReason])
+            state.entries.get(hashed.hash) match {
+              case Some(existing) =>
+                // Duplicate: return existing entry without modifying state
+                (state, existing.asRight[MempoolRejectionReason])
+
+              case None if state.entries.size >= config.maxSize =>
+                // Mempool full: reject without modifying state
+                (state, (MempoolRejectionReason.MempoolFull: MempoolRejectionReason).asLeft[MempoolEntry[Event, Key]])
+
+              case None =>
+                // New event: atomically insert
+                val newState = state.copy(
+                  entries = state.entries + (hashed.hash -> entry),
+                  insertionOrder = state.insertionOrder :+ hashed.hash
+                )
+                (newState, entry.asRight[MempoolRejectionReason])
             }
           }
         } yield result
