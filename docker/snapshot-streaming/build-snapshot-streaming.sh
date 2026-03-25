@@ -39,6 +39,15 @@ else
       "$BUILD_DIR/project/Dependencies.scala"
   fi
 
+  # Apply compatibility patch if present (breaks circular dependency with tessellation)
+  PATCH_FILE="$SS_DIR/snapshot-streaming.patch"
+  if [ -f "$PATCH_FILE" ] && [ -s "$PATCH_FILE" ]; then
+    echo "Applying snapshot-streaming compatibility patch..."
+    cd "$BUILD_DIR"
+    git apply "$PATCH_FILE"
+    cd "$SCRIPT_DIR"
+  fi
+
   cd "$BUILD_DIR"
   sbt --error assembly
   # Try multiple JAR naming patterns (sbt-assembly varies by project config)
