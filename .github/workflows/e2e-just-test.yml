@@ -69,6 +69,7 @@ jobs:
         run: just build --use-test-metagraph --num-gl0=3 --snapshot-streaming-branch=${{ inputs.snapshot_streaming_branch || 'testing' }} --block-explorer-branch=${{ inputs.block_explorer_branch || 'increase_delegated_stakes' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SNAPSHOT_STREAMING_REPO: https://github.com/ottobot-ai/snapshot-streaming.git
 
       - name: Upload JARs
         uses: actions/upload-artifact@v4

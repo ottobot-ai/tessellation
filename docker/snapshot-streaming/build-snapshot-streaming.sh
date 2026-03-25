@@ -11,7 +11,7 @@ fi
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 SS_DIR="$SCRIPT_DIR"
 SS_BRANCH="${SNAPSHOT_STREAMING_BRANCH:-develop}"
-SS_REPO="https://github.com/Constellation-Labs/snapshot-streaming.git"
+SS_REPO="${SNAPSHOT_STREAMING_REPO:-https://github.com/Constellation-Labs/snapshot-streaming.git}"
 
 BE_BRANCH="${BLOCK_EXPLORER_BRANCH:-develop}"
 BE_REPO="https://github.com/Constellation-Labs/block_explorer.git"
