@@ -4,36 +4,37 @@ import java.security.MessageDigest
 
 import cafe.cryptography.curve25519._
 
-/**
- * ECVRF-ED25519-SHA512-TAI implementation per draft-irtf-cfrg-vrf-10.
- *
- * This implements the version that includes zero_string (0x00) suffix in:
- * - hash_to_curve input
- * - hash_points input
- * - proof_to_hash input
- *
- * Parameters:
- *   - suite_string = 0x03
- *   - EC group G = Ed25519 (RFC 8032 Table 1)
- *   - 2n = qLen = 32, cofactor = 8, ptLen = 32, n = 16 (c is 16 bytes), hLen = 64
- *   - Hash = SHA-512
- *   - Key derivation per RFC 8032 §5.1.5
- *   - Nonce generation: ECVRF_nonce_generation_RFC8032 (§5.4.2.2)
- *   - Hash to curve: try_and_increment (§5.4.1.1)
- *
- * Proof format: 80 bytes = Gamma (32) || c (16) || s (32)
- */
+/** ECVRF-ED25519-SHA512-TAI implementation per draft-irtf-cfrg-vrf-10.
+  *
+  * This implements the version that includes zero_string (0x00) suffix in:
+  *   - hash_to_curve input
+  *   - hash_points input
+  *   - proof_to_hash input
+  *
+  * Parameters:
+  *   - suite_string = 0x03
+  *   - EC group G = Ed25519 (RFC 8032 Table 1)
+  *   - 2n = qLen = 32, cofactor = 8, ptLen = 32, n = 16 (c is 16 bytes), hLen = 64
+  *   - Hash = SHA-512
+  *   - Key derivation per RFC 8032 §5.1.5
+  *   - Nonce generation: ECVRF_nonce_generation_RFC8032 (§5.4.2.2)
+  *   - Hash to curve: try_and_increment (§5.4.1.1)
+  *
+  * Proof format: 80 bytes = Gamma (32) || c (16) || s (32)
+  */
 class EcVrf25519 {
 
   import EcVrf25519._
 
-  /**
-   * Generate VRF proof.
-   *
-   * @param secretKey 32-byte Ed25519 seed
-   * @param message   message to prove
-   * @return 80-byte proof (Gamma || c || s)
-   */
+  /** Generate VRF proof.
+    *
+    * @param secretKey
+    *   32-byte Ed25519 seed
+    * @param message
+    *   message to prove
+    * @return
+    *   80-byte proof (Gamma || c || s)
+    */
   def vrfProof(secretKey: Array[Byte], message: Array[Byte]): Array[Byte] = {
     require(secretKey.length == 32, "Secret key must be 32 bytes")
 
@@ -74,14 +75,17 @@ class EcVrf25519 {
     proof
   }
 
-  /**
-   * Verify VRF proof.
-   *
-   * @param publicKey 32-byte Ed25519 public key
-   * @param message   the message
-   * @param proof     80-byte proof
-   * @return true if valid
-   */
+  /** Verify VRF proof.
+    *
+    * @param publicKey
+    *   32-byte Ed25519 public key
+    * @param message
+    *   the message
+    * @param proof
+    *   80-byte proof
+    * @return
+    *   true if valid
+    */
   def vrfVerify(publicKey: Array[Byte], message: Array[Byte], proof: Array[Byte]): Boolean = {
     if (publicKey.length != PointBytes || proof.length != ProofBytes)
       return false
@@ -117,12 +121,13 @@ class EcVrf25519 {
     }
   }
 
-  /**
-   * Extract VRF output hash from proof.
-   *
-   * @param proof 80-byte proof
-   * @return 64-byte hash (beta) or None if invalid proof format
-   */
+  /** Extract VRF output hash from proof.
+    *
+    * @param proof
+    *   80-byte proof
+    * @return
+    *   64-byte hash (beta) or None if invalid proof format
+    */
   def vrfProofToHash(proof: Array[Byte]): Option[Array[Byte]] = {
     if (proof.length != ProofBytes) return None
 
@@ -146,9 +151,8 @@ class EcVrf25519 {
     }
   }
 
-  /**
-   * Derive Ed25519 public key from secret key (32-byte seed).
-   */
+  /** Derive Ed25519 public key from secret key (32-byte seed).
+    */
   def getVerificationKey(secretKey: Array[Byte]): Array[Byte] = {
     require(secretKey.length == 32, "Secret key must be 32 bytes")
     val hashedSk = sha512(secretKey)
@@ -173,12 +177,11 @@ object EcVrf25519 {
     Scalar.fromBits(bytes)
   }
 
-  /**
-   * ECVRF_hash_to_curve_try_and_increment (§5.4.1.1)
-   *
-   * Tries to decode each hash as a curve point until successful.
-   * Input format: suite_string || one_string || PK_string || alpha_string || ctr_string || zero_string
-   */
+  /** ECVRF_hash_to_curve_try_and_increment (§5.4.1.1)
+    *
+    * Tries to decode each hash as a curve point until successful. Input format: suite_string || one_string || PK_string || alpha_string ||
+    * ctr_string || zero_string
+    */
   private def hashToCurve(publicKey: Array[Byte], alpha: Array[Byte]): EdwardsPoint = {
     var ctr = 0
     while (ctr < 256) {
@@ -208,11 +211,10 @@ object EcVrf25519 {
     throw new RuntimeException("Failed to hash to curve after 256 attempts")
   }
 
-  /**
-   * ECVRF_nonce_generation_RFC8032 (§5.4.2.2)
-   *
-   * k = SHA-512(hashed_sk[32..63] || h_string) mod q
-   */
+  /** ECVRF_nonce_generation_RFC8032 (§5.4.2.2)
+    *
+    * k = SHA-512(hashed_sk[32..63] || h_string) mod q
+    */
   private def nonceGeneration(secretKey: Array[Byte], hBytes: Array[Byte]): Scalar = {
     val hashedSk = sha512(secretKey)
     val truncated = hashedSk.slice(32, 64) // upper 32 bytes
@@ -226,11 +228,10 @@ object EcVrf25519 {
     Scalar.fromBytesModOrderWide(kString)
   }
 
-  /**
-   * ECVRF_hash_points (§5.4.4)
-   *
-   * c = SHA-512(suite_string || 0x02 || P1 || P2 || P3 || P4 || 0x00)[0..15] as LE integer
-   */
+  /** ECVRF_hash_points (§5.4.4)
+    *
+    * c = SHA-512(suite_string || 0x02 || P1 || P2 || P3 || P4 || 0x00)[0..15] as LE integer
+    */
   private def hashPoints(
     p1: EdwardsPoint,
     p2: EdwardsPoint,
@@ -255,10 +256,8 @@ object EcVrf25519 {
     Scalar.fromBits(padded)
   }
 
-  /**
-   * Compare two c values (16-byte integers stored in Scalars).
-   * Only the first 16 bytes matter.
-   */
+  /** Compare two c values (16-byte integers stored in Scalars). Only the first 16 bytes matter.
+    */
   private def cPrimeEqualsC(c: Scalar, cPrime: Scalar): Boolean = {
     val cBytes = c.toByteArray
     val cPrimeBytes = cPrime.toByteArray
@@ -271,9 +270,8 @@ object EcVrf25519 {
     true
   }
 
-  /**
-   * Decode an 80-byte proof into (Gamma, c, s).
-   */
+  /** Decode an 80-byte proof into (Gamma, c, s).
+    */
   private def decodeProof(proof: Array[Byte]): Option[(EdwardsPoint, Scalar, Scalar)] = {
     if (proof.length != ProofBytes) return None
 
@@ -294,9 +292,8 @@ object EcVrf25519 {
     Some((gammaPoint, c, s))
   }
 
-  /**
-   * Apply RFC 8032 scalar pruning (clamping).
-   */
+  /** Apply RFC 8032 scalar pruning (clamping).
+    */
   private def pruneScalar(scalar: Array[Byte]): Array[Byte] = {
     val pruned = scalar.clone()
     pruned(0) = (pruned(0) & 0xf8).toByte // Clear bottom 3 bits
@@ -305,21 +302,18 @@ object EcVrf25519 {
     pruned
   }
 
-  /**
-   * Load a 32-byte scalar without reducing (already clamped).
-   */
+  /** Load a 32-byte scalar without reducing (already clamped).
+    */
   private def scalarFromBytes32(bytes: Array[Byte]): Scalar =
     Scalar.fromBits(bytes)
 
-  /**
-   * Convert EdwardsPoint to 32-byte compressed form.
-   */
+  /** Convert EdwardsPoint to 32-byte compressed form.
+    */
   private def pointToBytes(point: EdwardsPoint): Array[Byte] =
     point.compress().toByteArray
 
-  /**
-   * Try to decompress a 32-byte representation to EdwardsPoint.
-   */
+  /** Try to decompress a 32-byte representation to EdwardsPoint.
+    */
   private def bytesToPoint(bytes: Array[Byte]): Option[EdwardsPoint] = {
     if (bytes.length != PointBytes) return None
     try
@@ -329,9 +323,8 @@ object EcVrf25519 {
     }
   }
 
-  /**
-   * SHA-512 helper.
-   */
+  /** SHA-512 helper.
+    */
   private def sha512(input: Array[Byte]): Array[Byte] =
     MessageDigest.getInstance("SHA-512").digest(input)
 }

@@ -6,6 +6,7 @@ import cats.syntax.all._
 
 import io.constellationnetwork.ext.derevo.ordering
 import io.constellationnetwork.schema._
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 
 import derevo.cats.{eqv, order, show}
@@ -19,14 +20,12 @@ import eu.timepit.refined.types.numeric.NonNegLong
 import io.circe.{Decoder, Encoder}
 import io.estatico.newtype.macros.newtype
 
-/**
- * Nakamoto consensus types for Taktikos-style slot-based leader election.
- */
+/** Nakamoto consensus types for Taktikos-style slot-based leader election.
+  */
 object slot {
 
-  /**
-   * Slot number in Nakamoto consensus. 1 slot = 1 second.
-   */
+  /** Slot number in Nakamoto consensus. 1 slot = 1 second.
+    */
   @derive(order, ordering, show)
   case class Slot(value: NonNegLong) {
     def plus(addend: NonNegLong): Slot = Slot(value |+| addend)
@@ -57,12 +56,11 @@ object slot {
     implicit val decoder: Decoder[Slot] = Decoder[NonNegLong].map(Slot(_))
   }
 
-  /**
-   * VRF proof bytes (80 bytes: Gamma || c || s) encoded as hex string.
-   * 
-   * The proof demonstrates that the holder of a secret key computed a 
-   * deterministic output for a given input, without revealing the secret.
-   */
+  /** VRF proof bytes (80 bytes: Gamma || c || s) encoded as hex string.
+    *
+    * The proof demonstrates that the holder of a secret key computed a deterministic output for a given input, without revealing the
+    * secret.
+    */
   @derive(decoder, encoder, eqv, show)
   @newtype
   case class VrfProof(value: Hex) {
@@ -79,12 +77,11 @@ object slot {
       VrfProof(Hex(hex))
   }
 
-  /**
-   * VRF output hash (64 bytes, the beta value) encoded as hex string.
-   * 
-   * This is the verifiable random output derived from the VRF proof.
-   * Used for slot leader election: hash < threshold → eligible to produce block.
-   */
+  /** VRF output hash (64 bytes, the beta value) encoded as hex string.
+    *
+    * This is the verifiable random output derived from the VRF proof. Used for slot leader election: hash < threshold → eligible to produce
+    * block.
+    */
   @derive(decoder, encoder, eqv, show)
   @newtype
   case class VrfOutput(value: Hex) {
@@ -100,4 +97,36 @@ object slot {
     def fromHex(hex: String): VrfOutput =
       VrfOutput(Hex(hex))
   }
+
+  /** VRF public key (Ed25519, 32 bytes) encoded as hex string.
+    */
+  @derive(decoder, encoder, eqv, show)
+  @newtype
+  case class VrfPublicKey(value: Hex) {
+    def toBytes: Array[Byte] = value.toBytes
+  }
+
+  object VrfPublicKey {
+    val ExpectedLength: Int = 32
+
+    def fromBytes(bytes: Array[Byte]): VrfPublicKey =
+      VrfPublicKey(Hex.fromBytes(bytes))
+  }
+
+  /** Certificate proving a validator was eligible to produce a snapshot in a given slot.
+    *
+    * All-or-nothing: either you have the full certificate or none. Present on GlobalIncrementalSnapshot post-activation (None
+    * pre-activation).
+    *
+    * Verifiers check:
+    *   1. slot is within clock tolerance (|mySlot - slot| ≤ skew) 2. VRF proof verifies against (eta || slot) with the given public key 3.
+    *      VRF output normalized to [0,1) is below LDD threshold for the slot gap 4. Public key matches the producer's derived VRF key
+    */
+  @derive(decoder, encoder, eqv, show)
+  case class SlotCertificate(
+    slot: Slot,
+    vrfProof: VrfProof,
+    vrfPublicKey: VrfPublicKey,
+    eta: Hash
+  )
 }
