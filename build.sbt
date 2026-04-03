@@ -330,7 +330,9 @@ lazy val shared = (project in file("modules/shared"))
       Libraries.http4sCirce,
       Libraries.circeFs2,
       Libraries.clickHouse,
-      Libraries.hikari
+      Libraries.hikari,
+      // VRF crypto primitives for Nakamoto consensus
+      "cafe.cryptography" % "curve25519-elisabeth" % "0.1.0"
     )
   )
 
