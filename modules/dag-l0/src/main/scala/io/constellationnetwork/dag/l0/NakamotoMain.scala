@@ -3,36 +3,29 @@ package io.constellationnetwork.dag.l0
 import cats.effect._
 import cats.syntax.all._
 
+import scala.concurrent.duration._
+
 import io.constellationnetwork.BuildInfo
 import io.constellationnetwork.dag.l0.cli.method._
-import io.constellationnetwork.dag.l0.config.types._
 import io.constellationnetwork.dag.l0.modules._
 import io.constellationnetwork.ext.kryo._
 import io.constellationnetwork.node.shared.app.{DagL0, NodeShared, TessellationIOApp}
-import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.NakamotoConsensusLoop
-import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.NakamotoConsensusLoop.LoopCommand
+import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.NakamotoConsensusDriver
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.cluster.ClusterId
+import io.constellationnetwork.schema.nakamoto.LddConfig
+import io.constellationnetwork.schema.nakamoto.slot.SlotCertificate
 import io.constellationnetwork.schema.semver.TessellationVersion
+import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.vrf.{EcVrf25519, VrfKeyDeriver}
 
 import com.monovore.decline.Opts
 import eu.timepit.refined.auto._
+import fs2.Stream
 import org.typelevel.log4cats.SelfAwareStructuredLogger
 import org.typelevel.log4cats.slf4j.Slf4jLogger
-import pureconfig.generic.auto._
-import pureconfig.module.enumeratum._
 
-/** Nakamoto consensus variant of dag-l0.
-  *
-  * This is the integration entry point for running dag-l0 with VRF/LDD
-  * slot-based consensus instead of BFT facilitator rounds.
-  *
-  * For the PoC, this starts the slot loop alongside the existing consensus
-  * infrastructure. The slot loop evaluates VRF eligibility each tick and
-  * produces snapshots when the node wins.
-  *
-  * Usage: run with `--nakamoto` flag or set env NAKAMOTO_CONSENSUS=true
-  */
+/** dag-l0 with Nakamoto/VRF slot-based consensus. */
 object NakamotoMain
     extends TessellationIOApp[Run](
       name = "dag-l0-nakamoto",
@@ -55,48 +48,89 @@ object NakamotoMain
     import nodeShared._
 
     for {
-      implicit0(logger: SelfAwareStructuredLogger[IO]) <- Resource.eval(
-        Slf4jLogger.create[IO]
+      implicit0(logger: SelfAwareStructuredLogger[IO]) <- Resource.eval(Slf4jLogger.create[IO])
+
+      _ <- Resource.eval(logger.info("═══════════════════════════════════════════════"))
+      _ <- Resource.eval(logger.info("  NAKAMOTO CONSENSUS PoC"))
+      _ <- Resource.eval(logger.info(s"  Node: $nodeId"))
+      _ <- Resource.eval(logger.info("═══════════════════════════════════════════════"))
+
+      // Extract raw secp256k1 private key bytes, derive VRF Ed25519 seed
+      rawPrivKey = keyPair.getPrivate match {
+        case ecKey: java.security.interfaces.ECPrivateKey =>
+          val bytes = ecKey.getS.toByteArray
+          // BigInteger may prepend a zero byte for sign; strip if >32 bytes
+          if (bytes.length > 32) bytes.drop(bytes.length - 32) else bytes
+        case other =>
+          // Fallback: use encoded form
+          other.getEncoded.takeRight(32)
+      }
+      vrfSeed = VrfKeyDeriver.deriveVrfSeed(rawPrivKey)
+      vrf = new EcVrf25519()
+      vrfPK = vrf.getVerificationKey(vrfSeed)
+
+      _ <- Resource.eval(
+        logger.info(s"VRF pubkey: ${vrfPK.take(8).map("%02x".format(_)).mkString}...")
       )
 
-      // For the PoC, we start the Nakamoto slot loop as an independent fiber.
-      // It doesn't replace the BFT consensus yet — it runs alongside it,
-      // logging slot evaluations. This lets us verify:
-      //   1. Slot clock ticks correctly
-      //   2. VRF eligibility evaluates per slot
-      //   3. Sidecar connectivity works
-      //   4. Attestation flow works
-      //
-      // Once validated, we swap the BFT consensus out entirely.
+      // All nodes must share genesis time — env var or current time for PoC
+      genesisTimeMs = sys.env.getOrElse("NAKAMOTO_GENESIS_MS", System.currentTimeMillis().toString).toLong
 
-      genesisTimeMs = System.currentTimeMillis() // PoC: genesis = now
+      genesisEta = java.security.MessageDigest
+        .getInstance("SHA-256")
+        .digest("nakamoto-poc-genesis".getBytes("UTF-8"))
 
-      nakamotoLoop <- Resource.eval(
-        NakamotoConsensusLoop.build[IO](
-          selfId = nodeId,
-          keyPair = keyPair,
-          startOrdinal = SnapshotOrdinal.MinValue,
-          startHash = io.constellationnetwork.security.hash.Hash.empty,
-          slotDurationMs = 1000L,
-          genesisTimeMs = genesisTimeMs
+      stateRef <- Resource.eval(
+        Ref.of[IO, NakamotoConsensusDriver.DriverState](
+          NakamotoConsensusDriver.DriverState.initial(0L, Hash.empty, genesisEta)
         )
       )
 
-      // Start the slot loop fiber
-      _ <- Resource.eval(
-        logger.info(s"Starting Nakamoto slot loop (genesis=$genesisTimeMs, peer=$nodeId)")
-      )
-      _ <- nakamotoLoop.run.compile.drain.background
-
-      // Activate after a short delay to let the node initialize
-      _ <- Resource.eval(
-        Async[IO].sleep(scala.concurrent.duration.FiniteDuration(3, "seconds")) >>
-          nakamotoLoop.commandQueue.offer(LoopCommand.Activate) >>
-          logger.info("Nakamoto consensus loop activated")
+      driverConfig = NakamotoConsensusDriver.DriverConfig(
+        slotDurationMs = 1000L,
+        genesisTimeMs = genesisTimeMs,
+        ldd = LddConfig.Default,
+        slotsPerEpoch = 60L
       )
 
-      // Keep alive until shutdown
-      _ <- Resource.eval(Async[IO].never[Unit])
+      onSlotWon = (slot: Long, cert: SlotCertificate) =>
+        logger.info(
+          s"📦 SNAPSHOT slot=$slot proof=${cert.vrfProof.value.value.take(16)}..."
+        )
+
+      slotStream = NakamotoConsensusDriver.slotLoop[IO](
+        selfId = nodeId,
+        vrfSecretKey = vrfSeed,
+        vrfPublicKey = vrfPK,
+        stateRef = stateRef,
+        config = driverConfig,
+        stakeWeight = IO.pure(BigDecimal(1.0)),
+        onSlotWon = onSlotWon
+      )
+
+      _ <- slotStream.compile.drain.background
+
+      _ <- Resource.eval(
+        IO.sleep(3.seconds) >>
+          stateRef.update(_.copy(isActive = true)) >>
+          logger.info("🚀 Slot loop ACTIVE")
+      )
+
+      // Periodic status every 30s
+      _ <- Stream
+        .awakeEvery[IO](30.seconds)
+        .evalMap(_ =>
+          stateRef.get.flatMap(s =>
+            logger.info(
+              s"📊 slot=${s.currentSlot} produced=${s.totalProduced} finalized=${s.totalFinalized}"
+            )
+          )
+        )
+        .compile
+        .drain
+        .background
+
+      _ <- Resource.eval(IO.never[Unit])
     } yield ()
   }
 }
