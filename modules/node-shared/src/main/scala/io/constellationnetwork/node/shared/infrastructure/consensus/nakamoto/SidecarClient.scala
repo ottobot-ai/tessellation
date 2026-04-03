@@ -1,115 +1,106 @@
 package io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto
 
-import cats.effect.kernel.Async
+import cats.effect.kernel.{Async, Resource}
+import cats.syntax.all._
 
-import io.circe._
-import io.circe.generic.semiauto._
-import org.http4s._
-import org.http4s.circe._
-import org.http4s.client.Client
+import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar._
 
-/** HTTP bridge to the Go libp2p sidecar.
+import com.google.protobuf.ByteString
+import io.grpc.{ManagedChannel, ManagedChannelBuilder}
+
+/** gRPC client for the Go libp2p sidecar.
   *
-  * For PoC we use a simple REST API instead of gRPC to avoid adding protobuf/ScalaPB dependencies to the tessellation build. Production
-  * will switch to proper gRPC via ScalaPB.
-  *
-  * The sidecar exposes a small HTTP API alongside its gRPC service: POST /publish/snapshot — broadcast a snapshot POST /publish/attestation
-  * — broadcast an attestation GET /health — sidecar health GET /peers — peer count SSE /subscribe — server-sent events stream
+  * The sidecar manages GossipSub mesh networking. This client talks to it over localhost gRPC to publish snapshots/attestations and
+  * subscribe to incoming gossip messages.
   */
 object SidecarClient {
 
   final case class SidecarConfig(
     host: String = "127.0.0.1",
-    httpPort: Int = 50052
-  ) {
-    def baseUri: Uri = Uri.unsafeFromString(s"http://$host:$httpPort")
+    grpcPort: Int = 50051
+  )
+
+  trait SidecarClientAlgebra[F[_]] {
+    def publishSnapshot(msg: Snapshot): F[PublishResponse]
+    def publishAttestation(msg: TipAttestation): F[PublishResponse]
+    def health: F[HealthResponse]
+    def peers: F[PeerCountResponse]
   }
 
-  // Wire types for the HTTP bridge
-  final case class SnapshotMsg(
-    hash: String,
+  /** Create a gRPC client Resource that opens a channel and cleans up on release. */
+  def makeResource[F[_]: Async](config: SidecarConfig): Resource[F, SidecarClientAlgebra[F]] =
+    Resource
+      .make(
+        Async[F].delay(
+          ManagedChannelBuilder
+            .forAddress(config.host, config.grpcPort)
+            .usePlaintext()
+            .build()
+        )
+      )(ch => Async[F].delay(ch.shutdown()).void)
+      .map(ch => fromChannel[F](ch))
+
+  /** Build algebra from an existing channel. */
+  def fromChannel[F[_]: Async](channel: ManagedChannel): SidecarClientAlgebra[F] = {
+    val stub = SidecarServiceGrpc.stub(channel)
+
+    new SidecarClientAlgebra[F] {
+      private def liftFuture[A](fa: => scala.concurrent.Future[A]): F[A] =
+        Async[F].fromFuture(Async[F].delay(fa))
+
+      def publishSnapshot(msg: Snapshot): F[PublishResponse] =
+        liftFuture(stub.publishSnapshot(msg))
+
+      def publishAttestation(msg: TipAttestation): F[PublishResponse] =
+        liftFuture(stub.publishAttestation(msg))
+
+      def health: F[HealthResponse] =
+        liftFuture(stub.health(HealthRequest()))
+
+      def peers: F[PeerCountResponse] =
+        liftFuture(stub.peerCount(PeerCountRequest()))
+    }
+  }
+
+  // ─── Helpers for constructing proto messages ───
+
+  def mkSnapshot(
+    hash: Array[Byte],
     slot: Long,
     ordinal: Long,
-    parentHash: String,
-    vrfProof: String,
-    vrfPublicKey: String,
-    eta: String,
-    payload: String,
-    producerId: String
-  )
-  object SnapshotMsg {
-    implicit val encoder: Encoder[SnapshotMsg] = deriveEncoder
-    implicit val decoder: Decoder[SnapshotMsg] = deriveDecoder
-  }
+    parentHash: Array[Byte],
+    vrfProof: Array[Byte],
+    vrfPublicKey: Array[Byte],
+    eta: Array[Byte],
+    payload: Array[Byte],
+    producerId: Array[Byte]
+  ): Snapshot =
+    Snapshot(
+      hash = ByteString.copyFrom(hash),
+      slot = slot,
+      ordinal = ordinal,
+      parentHash = ByteString.copyFrom(parentHash),
+      vrfProof = ByteString.copyFrom(vrfProof),
+      vrfPublicKey = ByteString.copyFrom(vrfPublicKey),
+      eta = ByteString.copyFrom(eta),
+      payload = ByteString.copyFrom(payload),
+      producerId = ByteString.copyFrom(producerId)
+    )
 
-  final case class AttestationMsg(
-    tipHash: String,
+  def mkAttestation(
+    tipHash: Array[Byte],
     tipSlot: Long,
     tipOrdinal: Long,
     attestedAt: Long,
-    attesterId: String,
-    signature: String
-  )
-  object AttestationMsg {
-    implicit val encoder: Encoder[AttestationMsg] = deriveEncoder
-    implicit val decoder: Decoder[AttestationMsg] = deriveDecoder
-  }
-
-  final case class PublishResult(ok: Boolean, error: Option[String] = None)
-  object PublishResult {
-    implicit val decoder: Decoder[PublishResult] = deriveDecoder
-  }
-
-  final case class PeerCount(total: Int, meshSnapshots: Int, meshAttestations: Int)
-  object PeerCount {
-    implicit val decoder: Decoder[PeerCount] = deriveDecoder
-  }
-
-  final case class HealthStatus(healthy: Boolean, uptimeSeconds: Long, peerCount: Int)
-  object HealthStatus {
-    implicit val decoder: Decoder[HealthStatus] = deriveDecoder
-  }
-
-  /** Incoming gossip message from the sidecar. */
-  sealed trait GossipEvent
-  object GossipEvent {
-    final case class IncomingSnapshot(msg: SnapshotMsg) extends GossipEvent
-    final case class IncomingAttestation(msg: AttestationMsg) extends GossipEvent
-  }
-
-  trait SidecarClientAlgebra[F[_]] {
-    def publishSnapshot(msg: SnapshotMsg): F[PublishResult]
-    def publishAttestation(msg: AttestationMsg): F[PublishResult]
-    def health: F[HealthStatus]
-    def peers: F[PeerCount]
-  }
-
-  def make[F[_]: Async](
-    client: Client[F],
-    config: SidecarConfig
-  ): SidecarClientAlgebra[F] = new SidecarClientAlgebra[F] {
-    private val base = config.baseUri
-
-    implicit val snapshotEntityEncoder: EntityEncoder[F, SnapshotMsg] = jsonEncoderOf[F, SnapshotMsg]
-    implicit val attestationEntityEncoder: EntityEncoder[F, AttestationMsg] = jsonEncoderOf[F, AttestationMsg]
-    implicit val publishResultEntityDecoder: EntityDecoder[F, PublishResult] = jsonOf[F, PublishResult]
-    implicit val healthEntityDecoder: EntityDecoder[F, HealthStatus] = jsonOf[F, HealthStatus]
-    implicit val peerCountEntityDecoder: EntityDecoder[F, PeerCount] = jsonOf[F, PeerCount]
-
-    def publishSnapshot(msg: SnapshotMsg): F[PublishResult] = {
-      val req = Request[F](Method.POST, base / "publish" / "snapshot").withEntity(msg)
-      client.expect[PublishResult](req)
-    }
-
-    def publishAttestation(msg: AttestationMsg): F[PublishResult] = {
-      val req = Request[F](Method.POST, base / "publish" / "attestation").withEntity(msg)
-      client.expect[PublishResult](req)
-    }
-
-    def health: F[HealthStatus] =
-      client.expect[HealthStatus](base / "health")
-
-    def peers: F[PeerCount] =
-      client.expect[PeerCount](base / "peers")
-  }
+    attesterId: Array[Byte],
+    signature: Array[Byte]
+  ): TipAttestation =
+    TipAttestation(
+      tipHash = ByteString.copyFrom(tipHash),
+      tipSlot = tipSlot,
+      tipOrdinal = tipOrdinal,
+      attestedAt = attestedAt,
+      attesterId = ByteString.copyFrom(attesterId),
+      signature = ByteString.copyFrom(signature)
+    )
 }

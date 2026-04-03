@@ -423,7 +423,16 @@ lazy val nodeShared = (project in file("modules/node-shared"))
       Libraries.pureconfigIp4s,
       Libraries.refinedPureconfig,
       Libraries.shapeless,
-      Libraries.jol
+      Libraries.jol,
+      "com.thesamet.scalapb" %% "scalapb-runtime" % scalapb.compiler.Version.scalapbVersion % "protobuf",
+      "com.thesamet.scalapb" %% "scalapb-runtime-grpc" % scalapb.compiler.Version.scalapbVersion,
+      "io.grpc" % "grpc-netty-shaded" % scalapb.compiler.Version.grpcJavaVersion
+    ),
+    Compile / PB.targets := Seq(
+      scalapb.gen() -> (Compile / sourceManaged).value / "scalapb"
+    ),
+    Compile / PB.protoSources := Seq(
+      baseDirectory.value / "src" / "main" / "protobuf"
     )
   )
 

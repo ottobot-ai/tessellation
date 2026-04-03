@@ -10,7 +10,8 @@ import io.constellationnetwork.dag.l0.cli.method._
 import io.constellationnetwork.dag.l0.modules._
 import io.constellationnetwork.ext.kryo._
 import io.constellationnetwork.node.shared.app.{DagL0, NodeShared, TessellationIOApp}
-import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.NakamotoConsensusDriver
+import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarConfig
+import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.{NakamotoConsensusDriver, SidecarClient}
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.cluster.ClusterId
 import io.constellationnetwork.schema.nakamoto.LddConfig
@@ -93,10 +94,34 @@ object NakamotoMain
         slotsPerEpoch = 60L
       )
 
+      // Sidecar gRPC client — connect to the Go libp2p sidecar
+      sidecarConfig = SidecarConfig(
+        host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
+        grpcPort = sys.env.getOrElse("SIDECAR_GRPC_PORT", "50051").toInt
+      )
+      sidecarClient <- SidecarClient.makeResource[IO](sidecarConfig)
+
       onSlotWon = (slot: Long, cert: SlotCertificate) =>
-        logger.info(
-          s"📦 SNAPSHOT slot=$slot proof=${cert.vrfProof.value.value.take(16)}..."
-        )
+        for {
+          _ <- logger.info(s"📦 SNAPSHOT slot=$slot proof=${cert.vrfProof.value.value.take(16)}...")
+          // Publish via gRPC to sidecar for GossipSub broadcast
+          _ <- sidecarClient
+            .publishSnapshot(
+              SidecarClient.mkSnapshot(
+                hash = Array.emptyByteArray, // TODO: real snapshot hash
+                slot = slot,
+                ordinal = 0L, // TODO: real ordinal from snapshot storage
+                parentHash = Array.emptyByteArray,
+                vrfProof = cert.vrfProof.toBytes,
+                vrfPublicKey = cert.vrfPublicKey.toBytes,
+                eta = genesisEta,
+                payload = Array.emptyByteArray, // TODO: serialized snapshot
+                producerId = nodeId.value.value.getBytes("UTF-8")
+              )
+            )
+            .void
+            .handleErrorWith(e => logger.warn(s"Sidecar publish failed (sidecar down?): ${e.getMessage}"))
+        } yield ()
 
       slotStream = NakamotoConsensusDriver.slotLoop[IO](
         selfId = nodeId,

@@ -21,11 +21,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 /** Drives the Nakamoto slot-based consensus.
   *
   * Each slot tick (1s):
-  *   1. Compute current slot from wall clock
-  *   2. Compute slot gap since last produced snapshot
-  *   3. Evaluate VRF eligibility via LDD threshold
-  *   4. If winner: invoke onSlotWon callback (which drains mempool and builds snapshot)
-  *   5. Update epoch state with VRF output
+  *   1. Compute current slot from wall clock 2. Compute slot gap since last produced snapshot 3. Evaluate VRF eligibility via LDD threshold
+  *      4. If winner: invoke onSlotWon callback (which drains mempool and builds snapshot) 5. Update epoch state with VRF output
   */
 object NakamotoConsensusDriver {
 
