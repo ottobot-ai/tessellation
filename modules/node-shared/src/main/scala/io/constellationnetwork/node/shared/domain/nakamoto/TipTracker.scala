@@ -53,58 +53,62 @@ object TipTracker {
   def make[F[_]: Sync](stakeRegistry: StakeRegistry[F]): F[TipTracker[F]] =
     for {
       attestationsRef <- Ref.of[F, Map[PeerId, TipAttestation]](Map.empty)
-      finalizedRef    <- Ref.of[F, Option[(Hash, Slot)]](None)
-    } yield new TipTracker[F] {
+      finalizedRef <- Ref.of[F, Option[(Hash, Slot)]](None)
+    } yield
+      new TipTracker[F] {
 
-      def recordAttestation(peerId: PeerId, attestation: TipAttestation): F[Unit] =
-        attestationsRef.update { current =>
-          current.get(peerId) match {
-            case Some(existing) if existing.attestedAt.value.value >= attestation.attestedAt.value.value =>
-              // Existing attestation is same or newer, keep it
-              current
-            case _ =>
-              // New or newer attestation, record it
-              current.updated(peerId, attestation)
+        def recordAttestation(peerId: PeerId, attestation: TipAttestation): F[Unit] =
+          attestationsRef.update { current =>
+            current.get(peerId) match {
+              case Some(existing) if existing.attestedAt.value.value >= attestation.attestedAt.value.value =>
+                // Existing attestation is same or newer, keep it
+                current
+              case _ =>
+                // New or newer attestation, record it
+                current.updated(peerId, attestation)
+            }
           }
-        }
 
-      def attestationWeight(tipHash: Hash): F[Double] =
-        for {
-          attestations <- attestationsRef.get
-          weights <- attestations.toList.traverse { case (peerId, att) =>
-            if (att.tipHash === tipHash)
-              stakeRegistry.relativeStake(peerId)
-            else
-              0.0.pure[F]
+        def attestationWeight(tipHash: Hash): F[Double] =
+          for {
+            attestations <- attestationsRef.get
+            weights <- attestations.toList.traverse {
+              case (peerId, att) =>
+                if (att.tipHash === tipHash)
+                  stakeRegistry.relativeStake(peerId)
+                else
+                  0.0.pure[F]
+            }
+          } yield weights.sum
+
+        def isFinalized(tipHash: Hash): F[Boolean] =
+          attestationWeight(tipHash).map(_ > FinalityThreshold)
+
+        def heaviestTip: F[Option[(Hash, Slot, Double)]] =
+          for {
+            attestations <- attestationsRef.get
+            tipHashes = attestations.values.map(a => (a.tipHash, a.tipSlot)).toSet
+            weighted <- tipHashes.toList.traverse {
+              case (hash, slot) =>
+                attestationWeight(hash).map(w => (hash, slot, w))
+            }
+          } yield weighted.maxByOption(_._3).filter(_._3 > 0.0)
+
+        def allAttestations: F[Map[PeerId, TipAttestation]] =
+          attestationsRef.get
+
+        def lastFinalized: F[Option[(Hash, Slot)]] =
+          finalizedRef.get
+
+        def markFinalized(tipHash: Hash, tipSlot: Slot): F[Unit] =
+          finalizedRef.set(Some((tipHash, tipSlot)))
+
+        def pruneBelow(finalizedSlot: Slot): F[Unit] =
+          attestationsRef.update { attestations =>
+            attestations.filter {
+              case (_, att) =>
+                att.tipSlot.value.value >= finalizedSlot.value.value
+            }
           }
-        } yield weights.sum
-
-      def isFinalized(tipHash: Hash): F[Boolean] =
-        attestationWeight(tipHash).map(_ > FinalityThreshold)
-
-      def heaviestTip: F[Option[(Hash, Slot, Double)]] =
-        for {
-          attestations <- attestationsRef.get
-          tipHashes = attestations.values.map(a => (a.tipHash, a.tipSlot)).toSet
-          weighted <- tipHashes.toList.traverse { case (hash, slot) =>
-            attestationWeight(hash).map(w => (hash, slot, w))
-          }
-        } yield weighted.maxByOption(_._3).filter(_._3 > 0.0)
-
-      def allAttestations: F[Map[PeerId, TipAttestation]] =
-        attestationsRef.get
-
-      def lastFinalized: F[Option[(Hash, Slot)]] =
-        finalizedRef.get
-
-      def markFinalized(tipHash: Hash, tipSlot: Slot): F[Unit] =
-        finalizedRef.set(Some((tipHash, tipSlot)))
-
-      def pruneBelow(finalizedSlot: Slot): F[Unit] =
-        attestationsRef.update { attestations =>
-          attestations.filter { case (_, att) =>
-            att.tipSlot.value.value >= finalizedSlot.value.value
-          }
-        }
-    }
+      }
 }

@@ -27,8 +27,7 @@ object SlotClockSuite extends SimpleIOSuite {
     IO {
       val slot10 = Slot.unsafeApply(10L)
       val slot100 = Slot.unsafeApply(100L)
-      expect.eql(genesisMs + 10000L, clock.slotStartTime(slot10)) and
-        expect.eql(genesisMs + 100000L, clock.slotStartTime(slot100))
+      expect.eql(genesisMs + 10000L, clock.slotStartTime(slot10)).and(expect.eql(genesisMs + 100000L, clock.slotStartTime(slot100)))
     }
   }
 
@@ -48,8 +47,7 @@ object SlotClockSuite extends SimpleIOSuite {
     val clock = SlotClock.make[IO](customConfig)
     IO {
       val slot3 = Slot.unsafeApply(3L)
-      expect.eql(genesisMs + 6000L, clock.slotStartTime(slot3)) and
-        expect.eql(genesisMs + 8000L, clock.slotEndTime(slot3))
+      expect.eql(genesisMs + 6000L, clock.slotStartTime(slot3)).and(expect.eql(genesisMs + 8000L, clock.slotEndTime(slot3)))
     }
   }
 
@@ -86,7 +84,7 @@ object SlotClockSuite extends SimpleIOSuite {
       // A time within tolerance (at end + skew) should be current
       val nowWithinTolerance = end + skew
       val withinCheck = nowWithinTolerance >= (start - skew) && nowWithinTolerance <= (end + skew)
-      expect(withinCheck) and {
+      expect(withinCheck).and {
         // A time outside tolerance (at end + skew + 1) should not be current
         val nowOutsideTolerance = end + skew + 1
         val outsideCheck = nowOutsideTolerance >= (start - skew) && nowOutsideTolerance <= (end + skew)
@@ -105,7 +103,7 @@ object SlotClockSuite extends SimpleIOSuite {
 
       // At start - skew
       val atEarlyBoundary = (start - skew) >= (start - skew) && (start - skew) <= (end + skew)
-      expect(atEarlyBoundary) and {
+      expect(atEarlyBoundary).and {
         // At end + skew
         val atLateBoundary = (end + skew) >= (start - skew) && (end + skew) <= (end + skew)
         expect(atLateBoundary)
@@ -141,11 +139,9 @@ object SlotClockSuite extends SimpleIOSuite {
     val clock = SlotClock.make[IO](SlotClock.Config(genesisTimeMs = 0L))
     for {
       slot <- clock.currentSlot
-    } yield {
+    } yield
       // Slot value should be approximately now/1000
       // Since genesis is epoch 0, slot should be close to System.currentTimeMillis/1000
-      expect(slot.value.value > 0L) and
-        expect(slot.value.value < Long.MaxValue / 1000L)
-    }
+      expect(slot.value.value > 0L).and(expect(slot.value.value < Long.MaxValue / 1000L))
   }
 }

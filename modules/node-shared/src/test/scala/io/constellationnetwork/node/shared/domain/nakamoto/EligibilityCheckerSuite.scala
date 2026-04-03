@@ -370,9 +370,7 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
       // δ=2 should be the start of the ramp: fA × (2-1)/(γ-1) = 0.5 × 1/14
       val threshDelta2 = EligibilityChecker.threshold(1.0, 2, defaultConfig)
       val expectedRampStart = 0.5 * 1.0 / 14.0
-      expect.eql(0.0, threshDelta0) and
-        expect.eql(0.0, threshDelta1) and
-        expect(math.abs(threshDelta2 - expectedRampStart) < 1e-10)
+      expect.eql(0.0, threshDelta0).and(expect.eql(0.0, threshDelta1)).and(expect(math.abs(threshDelta2 - expectedRampStart) < 1e-10))
     }
   }
 }

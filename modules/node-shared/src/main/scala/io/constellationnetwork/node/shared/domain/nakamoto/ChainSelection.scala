@@ -74,9 +74,11 @@ object ChainSelection {
           case Nil         => none[ChainTip].pure[F]
           case head :: Nil => head.some.pure[F]
           case head :: tail =>
-            tail.foldLeftM(head) { (best, candidate) =>
-              compare(best, candidate)
-            }.map(_.some)
+            tail
+              .foldLeftM(head) { (best, candidate) =>
+                compare(best, candidate)
+              }
+              .map(_.some)
         }
 
       def shouldSwitch(current: ChainTip, candidate: ChainTip): F[Boolean] =
@@ -104,7 +106,7 @@ object ChainSelection {
         *   1. Lower slot wins (earlier production = harder lottery)
         *   1. Lower VRF output wins (deterministic, comparing as unsigned BigInt)
         */
-      private def compareByTiebreakers(tipA: ChainTip, tipB: ChainTip): ChainTip = {
+      private def compareByTiebreakers(tipA: ChainTip, tipB: ChainTip): ChainTip =
         // Tiebreaker 1: Higher ordinal (longer chain)
         if (tipA.ordinal != tipB.ordinal) {
           if (tipA.ordinal > tipB.ordinal) tipA else tipB
@@ -118,7 +120,6 @@ object ChainSelection {
           val cmp = compareVrfOutputs(tipA.vrfOutput, tipB.vrfOutput)
           if (cmp <= 0) tipA else tipB
         }
-      }
 
       /** Compare VRF outputs as unsigned BigInts.
         *

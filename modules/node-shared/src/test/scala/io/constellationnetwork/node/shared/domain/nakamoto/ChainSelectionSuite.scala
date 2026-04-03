@@ -127,7 +127,7 @@ object ChainSelectionSuite extends SimpleIOSuite {
       result <- chainSelection.selectBest(List(tipA))
     } yield
       expect(result.isDefined) &&
-      expect.same(tipA.hash, result.get.hash)
+        expect.same(tipA.hash, result.get.hash)
   }
 
   test("selectBest picks best from 3 candidates") {
@@ -147,7 +147,7 @@ object ChainSelectionSuite extends SimpleIOSuite {
       result <- chainSelection.selectBest(List(tipA, tipB, tipC))
     } yield
       expect(result.isDefined) &&
-      expect.same(tipB.hash, result.get.hash)
+        expect.same(tipB.hash, result.get.hash)
   }
 
   test("shouldSwitch returns true when candidate is better") {
@@ -243,7 +243,7 @@ object ChainSelectionSuite extends SimpleIOSuite {
     // But as signed byte, 0xFF is -1 which is < 0x01
     // We want unsigned comparison, so tipA (0x01) should win
     val tipA = ChainTip(hash("tipA"), slot(10), 100L, hash("parent"), vrfOutput(0x01))
-    val tipB = ChainTip(hash("tipB"), slot(10), 100L, hash("parent"), vrfOutput(0xFF.toByte))
+    val tipB = ChainTip(hash("tipB"), slot(10), 100L, hash("parent"), vrfOutput(0xff.toByte))
 
     for {
       (chainSelection, tracker, _) <- setupChainSelection(Set(peer1, peer2))
@@ -265,7 +265,7 @@ object ChainSelectionSuite extends SimpleIOSuite {
       result <- chainSelection.selectBest(List(tipA, tipB, tipC))
     } yield
       expect(result.isDefined) &&
-      expect.same(tipB.hash, result.get.hash)
+        expect.same(tipB.hash, result.get.hash)
   }
 
   test("compare is consistent: compare(A, B) and compare(B, A) should select same winner") {

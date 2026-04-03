@@ -15,21 +15,21 @@ object StakeRegistrySuite extends SimpleIOSuite {
   test("empty registry returns 0 stake for any peer") {
     for {
       registry <- StakeRegistry.equalWeight[IO]
-      stake    <- registry.relativeStake(pid("unknown"))
+      stake <- registry.relativeStake(pid("unknown"))
     } yield expect.same(0.0, stake)
   }
 
   test("empty registry has validator count of 0") {
     for {
       registry <- StakeRegistry.equalWeight[IO]
-      count    <- registry.validatorCount
+      count <- registry.validatorCount
     } yield expect.same(0, count)
   }
 
   test("empty registry returns empty allStakes") {
     for {
       registry <- StakeRegistry.equalWeight[IO]
-      stakes   <- registry.allStakes
+      stakes <- registry.allStakes
     } yield expect.same(Map.empty[PeerId, Double], stakes)
   }
 
@@ -37,7 +37,7 @@ object StakeRegistrySuite extends SimpleIOSuite {
     for {
       registry <- StakeRegistry.equalWeight[IO]
       peer1 = pid("peer1")
-      _     <- registry.updateValidators(Set(peer1))
+      _ <- registry.updateValidators(Set(peer1))
       stake <- registry.relativeStake(peer1)
     } yield expect.same(1.0, stake)
   }
@@ -59,12 +59,12 @@ object StakeRegistrySuite extends SimpleIOSuite {
 
     for {
       registry <- StakeRegistry.equalWeight[IO]
-      _        <- registry.updateValidators(peers)
-      stakes   <- registry.allStakes
+      _ <- registry.updateValidators(peers)
+      stakes <- registry.allStakes
     } yield {
       val expectedStake = 1.0 / n.toDouble
       expect(stakes.size == n) &&
-        expect(stakes.values.forall(s => math.abs(s - expectedStake) < 1e-10))
+      expect(stakes.values.forall(s => math.abs(s - expectedStake) < 1e-10))
     }
   }
 
@@ -90,11 +90,10 @@ object StakeRegistrySuite extends SimpleIOSuite {
       _ <- registry.updateValidators(Set(peer3))
       stakePeer1After <- registry.relativeStake(peer1)
       stakePeer3After <- registry.relativeStake(peer3)
-    } yield {
+    } yield
       expect.same(0.5, stakePeer1Before) &&
-        expect.same(0.0, stakePeer1After) &&
-        expect.same(1.0, stakePeer3After)
-    }
+      expect.same(0.0, stakePeer1After) &&
+      expect.same(1.0, stakePeer3After)
   }
 
   test("allStakes sums to ~1.0 within floating point tolerance") {
@@ -103,8 +102,8 @@ object StakeRegistrySuite extends SimpleIOSuite {
 
     for {
       registry <- StakeRegistry.equalWeight[IO]
-      _        <- registry.updateValidators(peers)
-      stakes   <- registry.allStakes
+      _ <- registry.updateValidators(peers)
+      stakes <- registry.allStakes
     } yield {
       val total = stakes.values.sum
       expect(math.abs(total - 1.0) < 1e-10)
@@ -128,10 +127,9 @@ object StakeRegistrySuite extends SimpleIOSuite {
       _ <- registry.updateValidators(Set.empty)
       stakeAfter <- registry.relativeStake(peer1)
       count <- registry.validatorCount
-    } yield {
+    } yield
       expect.same(1.0, stakeBefore) &&
-        expect.same(0.0, stakeAfter) &&
-        expect.same(0, count)
-    }
+      expect.same(0.0, stakeAfter) &&
+      expect.same(0, count)
   }
 }

@@ -10,16 +10,11 @@ import org.http4s.client.Client
 
 /** HTTP bridge to the Go libp2p sidecar.
   *
-  * For PoC we use a simple REST API instead of gRPC to avoid adding
-  * protobuf/ScalaPB dependencies to the tessellation build.
-  * Production will switch to proper gRPC via ScalaPB.
+  * For PoC we use a simple REST API instead of gRPC to avoid adding protobuf/ScalaPB dependencies to the tessellation build. Production
+  * will switch to proper gRPC via ScalaPB.
   *
-  * The sidecar exposes a small HTTP API alongside its gRPC service:
-  *   POST /publish/snapshot   — broadcast a snapshot
-  *   POST /publish/attestation — broadcast an attestation
-  *   GET  /health             — sidecar health
-  *   GET  /peers              — peer count
-  *   SSE  /subscribe          — server-sent events stream
+  * The sidecar exposes a small HTTP API alongside its gRPC service: POST /publish/snapshot — broadcast a snapshot POST /publish/attestation
+  * — broadcast an attestation GET /health — sidecar health GET /peers — peer count SSE /subscribe — server-sent events stream
   */
 object SidecarClient {
 

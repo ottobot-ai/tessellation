@@ -19,8 +19,8 @@ import derevo.derive
   */
 @derive(decoder, encoder, eqv, show)
 case class TipAttestation(
-  tipHash: Hash,    // hash of the endorsed snapshot
-  tipSlot: Slot,    // slot of that snapshot
+  tipHash: Hash, // hash of the endorsed snapshot
+  tipSlot: Slot, // slot of that snapshot
   tipOrdinal: Long, // ordinal of that snapshot (Long to avoid circular deps with SnapshotOrdinal)
-  attestedAt: Slot  // slot when this attestation was created
+  attestedAt: Slot // slot when this attestation was created
 )

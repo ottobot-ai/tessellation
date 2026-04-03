@@ -5,12 +5,11 @@ import cats.syntax.all._
 
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 
-/**
- * Slot clock for Nakamoto consensus.
- *
- * Each slot is 1 second. The genesis slot starts at a configured epoch time.
- * Nodes use local system clock (NTP-synced assumed) with configurable skew tolerance.
- */
+/** Slot clock for Nakamoto consensus.
+  *
+  * Each slot is 1 second. The genesis slot starts at a configured epoch time. Nodes use local system clock (NTP-synced assumed) with
+  * configurable skew tolerance.
+  */
 trait SlotClock[F[_]] {
 
   /** Current slot based on wall clock */
@@ -29,9 +28,9 @@ trait SlotClock[F[_]] {
 object SlotClock {
 
   case class Config(
-    genesisTimeMs: Long,            // Unix epoch millis when slot 0 starts
-    slotDurationMs: Long = 1000L,   // 1 second per slot
-    skewToleranceMs: Long = 1000L   // ±1 second tolerance
+    genesisTimeMs: Long, // Unix epoch millis when slot 0 starts
+    slotDurationMs: Long = 1000L, // 1 second per slot
+    skewToleranceMs: Long = 1000L // ±1 second tolerance
   )
 
   def make[F[_]: Sync: Clock](config: Config): SlotClock[F] = new SlotClock[F] {

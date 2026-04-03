@@ -16,14 +16,14 @@ object EpochStateSuite extends SimpleIOSuite {
   test("genesis eta is returned initially") {
     for {
       state <- EpochState.make[IO](genesisEta)
-      eta   <- state.currentEta
+      eta <- state.currentEta
     } yield expect(eta.sameElements(genesisEta))
   }
 
   test("lastProducedSlot returns MinValue initially") {
     for {
       state <- EpochState.make[IO](genesisEta)
-      slot  <- state.lastProducedSlot
+      slot <- state.lastProducedSlot
     } yield expect.same(Slot.MinValue, slot)
   }
 
@@ -31,7 +31,7 @@ object EpochStateSuite extends SimpleIOSuite {
     for {
       state <- EpochState.make[IO](genesisEta)
       slot5 = Slot.unsafeApply(5)
-      _        <- state.recordProduction(slot5, vrfOutput1)
+      _ <- state.recordProduction(slot5, vrfOutput1)
       lastSlot <- state.lastProducedSlot
     } yield expect.same(slot5, lastSlot)
   }
@@ -41,8 +41,8 @@ object EpochStateSuite extends SimpleIOSuite {
       state <- EpochState.make[IO](genesisEta)
       slot5 = Slot.unsafeApply(5)
       slot10 = Slot.unsafeApply(10)
-      _    <- state.recordProduction(slot5, vrfOutput1)
-      _    <- state.recordProduction(slot10, vrfOutput2)
+      _ <- state.recordProduction(slot5, vrfOutput1)
+      _ <- state.recordProduction(slot10, vrfOutput2)
       slot <- state.lastProducedSlot
     } yield expect.same(slot10, slot)
   }
@@ -50,9 +50,9 @@ object EpochStateSuite extends SimpleIOSuite {
   test("multiple productions accumulate VRF outputs") {
     for {
       state <- EpochState.make[IO](genesisEta)
-      _     <- state.recordProduction(Slot.unsafeApply(1), vrfOutput1)
-      _     <- state.recordProduction(Slot.unsafeApply(2), vrfOutput2)
-      _     <- state.recordProduction(Slot.unsafeApply(3), vrfOutput3)
+      _ <- state.recordProduction(Slot.unsafeApply(1), vrfOutput1)
+      _ <- state.recordProduction(Slot.unsafeApply(2), vrfOutput2)
+      _ <- state.recordProduction(Slot.unsafeApply(3), vrfOutput3)
       count <- state.accumulatedCount
     } yield expect.same(3, count)
   }
@@ -60,30 +60,30 @@ object EpochStateSuite extends SimpleIOSuite {
   test("epoch rotation produces new eta different from previous") {
     for {
       state <- EpochState.make[IO](genesisEta)
-      _     <- state.recordProduction(Slot.unsafeApply(1), vrfOutput1)
-      _     <- state.recordProduction(Slot.unsafeApply(2), vrfOutput2)
+      _ <- state.recordProduction(Slot.unsafeApply(1), vrfOutput1)
+      _ <- state.recordProduction(Slot.unsafeApply(2), vrfOutput2)
       etaBefore <- state.currentEta
-      _         <- state.rotateEpoch(1L)
-      etaAfter  <- state.currentEta
+      _ <- state.rotateEpoch(1L)
+      etaAfter <- state.currentEta
     } yield expect(!etaBefore.sameElements(etaAfter))
   }
 
   test("epoch rotation clears VRF accumulator") {
     for {
       state <- EpochState.make[IO](genesisEta)
-      _     <- state.recordProduction(Slot.unsafeApply(1), vrfOutput1)
-      _     <- state.recordProduction(Slot.unsafeApply(2), vrfOutput2)
+      _ <- state.recordProduction(Slot.unsafeApply(1), vrfOutput1)
+      _ <- state.recordProduction(Slot.unsafeApply(2), vrfOutput2)
       countBefore <- state.accumulatedCount
-      _           <- state.rotateEpoch(1L)
-      countAfter  <- state.accumulatedCount
+      _ <- state.rotateEpoch(1L)
+      countAfter <- state.accumulatedCount
     } yield expect.same(2, countBefore) && expect.same(0, countAfter)
   }
 
   test("epoch rotation returns the new eta") {
     for {
-      state   <- EpochState.make[IO](genesisEta)
-      _       <- state.recordProduction(Slot.unsafeApply(1), vrfOutput1)
-      newEta  <- state.rotateEpoch(1L)
+      state <- EpochState.make[IO](genesisEta)
+      _ <- state.recordProduction(Slot.unsafeApply(1), vrfOutput1)
+      newEta <- state.rotateEpoch(1L)
       current <- state.currentEta
     } yield expect(newEta.sameElements(current))
   }
@@ -109,7 +109,7 @@ object EpochStateSuite extends SimpleIOSuite {
   test("slot gap is computable from lastProducedSlot") {
     for {
       state <- EpochState.make[IO](genesisEta)
-      _     <- state.recordProduction(Slot.unsafeApply(5), vrfOutput1)
+      _ <- state.recordProduction(Slot.unsafeApply(5), vrfOutput1)
       lastSlot <- state.lastProducedSlot
       currentSlot = Slot.unsafeApply(15)
       gap = currentSlot.value.value - lastSlot.value.value
@@ -121,13 +121,12 @@ object EpochStateSuite extends SimpleIOSuite {
       state <- EpochState.make[IO](genesisEta)
       // No productions recorded
       etaBefore <- state.currentEta
-      newEta    <- state.rotateEpoch(1L)
-      etaAfter  <- state.currentEta
-    } yield {
+      newEta <- state.rotateEpoch(1L)
+      etaAfter <- state.currentEta
+    } yield
       // Even with no outputs, eta changes due to epoch number contribution
       expect(!etaBefore.sameElements(etaAfter)) &&
-        expect(newEta.sameElements(etaAfter))
-    }
+      expect(newEta.sameElements(etaAfter))
   }
 
   test("computeNextEta is deterministic") {

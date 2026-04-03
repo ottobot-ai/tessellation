@@ -18,9 +18,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** The Nakamoto slot-based consensus loop.
   *
-  * Replaces ConsensusEventLoop's round-based FSM with a simple slot clock:
-  * every slot tick, check VRF eligibility, produce snapshot if winner,
-  * collect attestations, apply fork choice.
+  * Replaces ConsensusEventLoop's round-based FSM with a simple slot clock: every slot tick, check VRF eligibility, produce snapshot if
+  * winner, collect attestations, apply fork choice.
   *
   * This is the core integration piece that wires together:
   *   - SlotClock (1s ticks)
@@ -79,8 +78,8 @@ object NakamotoConsensusLoop {
 
   /** Build the slot-based consensus stream.
     *
-    * The stream ticks every slotDurationMs (default 1000ms) and evaluates VRF eligibility.
-    * External events (received snapshots, attestations) arrive via the command queue.
+    * The stream ticks every slotDurationMs (default 1000ms) and evaluates VRF eligibility. External events (received snapshots,
+    * attestations) arrive via the command queue.
     */
   def build[F[_]: Async: Random](
     selfId: PeerId,
