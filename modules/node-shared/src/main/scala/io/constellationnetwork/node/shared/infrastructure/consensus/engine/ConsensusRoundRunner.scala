@@ -21,18 +21,26 @@ import monocle.Lens
   *
   * Stall detection is delegated to StallDetector for separation of concerns and testability.
   *
+  * When nakamotoMode is enabled:
+  *   - afterConsensusFinish becomes a no-op (slot clock handles all triggering)
+  *   - scheduleTimeTrigger is not called at startup
+  *   - The NakamotoTriggerDaemon feeds StartRound commands based on VRF slot wins
+  *
   * @see
   *   StallDetector for stall monitoring logic
   * @see
   *   StateTransitions for state advancement logic
   * @see
   *   ConsensusFSM for command routing
+  * @see
+  *   NakamotoTriggerDaemon for VRF slot-based triggering
   */
 class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx, Status, Outcome, Kind](
   ctx: ConsensusEngineContext[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind],
   stallDetector: StallDetector[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind],
   roundFibersRef: Ref[F, List[Fiber[F, Throwable, Unit]]],
-  cancelSignalRef: Ref[F, Option[Deferred[F, Unit]]]
+  cancelSignalRef: Ref[F, Option[Deferred[F, Unit]]],
+  nakamotoMode: Boolean = false
 )(implicit outcomeKey: Lens[Outcome, Key], supervisor: Supervisor[F]) {
 
   import ctx.{advancer, config, creator, logger, queue, storage, updater}
@@ -164,9 +172,15 @@ class ConsensusRoundRunner[F[_]: Async: Metrics, Event, Key: Next, Artifact, Ctx
     } yield ()
 
   def afterConsensusFinish(majorityTrigger: ConsensusTrigger): F[Unit] =
-    majorityTrigger match {
-      case EventTrigger => afterEventTrigger
-      case TimeTrigger  => afterTimeTrigger
+    // In Nakamoto mode, the slot clock daemon handles all round triggering.
+    // We don't reschedule TimeTrigger or process EventTrigger here.
+    if (nakamotoMode) {
+      Async[F].unit
+    } else {
+      majorityTrigger match {
+        case EventTrigger => afterEventTrigger
+        case TimeTrigger  => afterTimeTrigger
+      }
     }
 
   private def afterEventTrigger: F[Unit] =

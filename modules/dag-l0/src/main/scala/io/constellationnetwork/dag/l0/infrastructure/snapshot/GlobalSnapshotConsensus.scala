@@ -4,7 +4,7 @@ import java.security.KeyPair
 
 import cats.Parallel
 import cats.data.NonEmptySet
-import cats.effect.kernel.{Async, Fiber}
+import cats.effect.kernel.{Async, Fiber, Ref}
 import cats.effect.std.{Queue, Random, Supervisor}
 import cats.syntax.all._
 
@@ -38,6 +38,8 @@ import io.constellationnetwork.node.shared.domain.tokenlock.block.TokenLockBlock
 import io.constellationnetwork.node.shared.infrastructure.block.processing.BlockAcceptanceManager
 import io.constellationnetwork.node.shared.infrastructure.consensus._
 import io.constellationnetwork.node.shared.infrastructure.consensus.engine.{ConsensusCommand, ConsensusEventLoop, _}
+import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.NakamotoTriggerDaemon
+import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.NakamotoTriggerDaemon.NakamotoTriggerState
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.gossip.RumorHandler
 import io.constellationnetwork.node.shared.infrastructure.gossip.event.EventGossipClient
@@ -70,10 +72,18 @@ import org.http4s.client.Client
   * Wires together all components and starts the consensus background stream. Returns a Consensus instance with handler (for gossip),
   * manager (external API), storage (state queries), and routes (HTTP endpoints).
   *
+  * When NAKAMOTO_ENABLED env var is set, uses VRF slot-based leader election via NakamotoTriggerDaemon instead of the traditional
+  * EventTrigger + TimeTrigger system. The BFT round machinery (Facility → Proposal → Signature → Finished) remains unchanged.
+  *
   * @see
   *   ConsensusEventLoop for FSM and command processing
+  * @see
+  *   NakamotoTriggerDaemon for VRF slot clock implementation
   */
 object GlobalSnapshotConsensus {
+
+  /** Check if Nakamoto mode is enabled via environment variable */
+  val nakamotoEnabled: Boolean = sys.env.contains("NAKAMOTO_ENABLED")
 
   def make[F[_]: Async: Parallel: Random: JsonSerializer: HasherSelector: SecurityProvider: Metrics, R <: CliMethod](
     sharedCfg: SharedConfig,
@@ -201,6 +211,18 @@ object GlobalSnapshotConsensus {
 
       tcaFilter = TrailingCommonAncestorFilter.make[F]
 
+      // In Nakamoto mode, create state ref for VRF trigger daemon
+      nakamotoStateRef <-
+        if (nakamotoEnabled) {
+          // Genesis time defaults to now if not provided via env
+          val genesisTimeMs = sys.env.get("NAKAMOTO_GENESIS_TIME_MS").flatMap(_.toLongOption).getOrElse(System.currentTimeMillis())
+          // Genesis eta (randomness seed) - use a default or env-provided value
+          val genesisEta = sys.env.get("NAKAMOTO_GENESIS_ETA").map(_.getBytes).getOrElse("tessellation-nakamoto-genesis".getBytes)
+          Ref.of[F, NakamotoTriggerState](NakamotoTriggerState.initial(genesisTimeMs, genesisEta)).map(Some(_))
+        } else {
+          Async[F].pure(None)
+        }
+
       stateCreator =
         GlobalSnapshotConsensusStateCreator.make(
           consensusFunctions,
@@ -212,7 +234,8 @@ object GlobalSnapshotConsensus {
           appConfig.snapshot.consensus.deterministicConfigHash,
           peerQualityTracker,
           tcaFilter,
-          eventMempool
+          eventMempool,
+          nakamotoStateRef
         )
 
       stateRemover =
@@ -259,7 +282,8 @@ object GlobalSnapshotConsensus {
           consensusClient,
           appConfig.snapshot.consensus,
           facilitatorSelector,
-          peerQualityTracker
+          peerQualityTracker,
+          nakamotoMode = nakamotoEnabled
         )
 
       handler = GlobalConsensusHandler.make(loop.queue)
@@ -274,9 +298,35 @@ object GlobalSnapshotConsensus {
         GlobalConsensusKind
       ](consensusStorage, rumorQueue)
 
-      triggerEvent = loop.queue.offer(ConsensusCommand.FacilitateByEvent)
+      // In Nakamoto mode, triggerEvent is a no-op (slot clock handles all triggering)
+      triggerEvent = if (nakamotoEnabled) Async[F].unit else loop.queue.offer(ConsensusCommand.FacilitateByEvent)
 
+      // Start the main consensus loop
       _ <- supervisor.supervise(loop.run.compile.drain)
+
+      // In Nakamoto mode, also start the VRF slot clock daemon
+      _ <- (nakamotoStateRef, nakamotoEnabled) match {
+        case (Some(stateRef), true) =>
+          // Get LDD config from environment or use defaults
+          val lddConfig = io.constellationnetwork.schema.nakamoto.LddConfig.Default
+          val slotsPerEpoch = sys.env.get("NAKAMOTO_SLOTS_PER_EPOCH").flatMap(_.toLongOption).getOrElse(60L)
+          supervisor
+            .supervise(
+              NakamotoTriggerDaemon
+                .run[F](
+                  consensusQueue = loop.queue,
+                  stateRef = stateRef,
+                  keyPair = keyPair,
+                  selfId = selfId,
+                  lddConfig = lddConfig,
+                  slotsPerEpoch = slotsPerEpoch
+                )
+                .compile
+                .drain
+            )
+            .void
+        case _ => Async[F].unit
+      }
       consensus = new Consensus(
         handler,
         consensusStorage,

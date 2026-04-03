@@ -1,7 +1,7 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot
 
 import cats.effect.Async
-import cats.effect.kernel.{Clock, Sync}
+import cats.effect.kernel.{Clock, Ref, Sync}
 import cats.syntax.all._
 
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
@@ -14,6 +14,7 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog
 import io.constellationnetwork.node.shared.infrastructure.consensus._
 import io.constellationnetwork.node.shared.infrastructure.consensus.declaration.Facility
 import io.constellationnetwork.node.shared.infrastructure.consensus.message.ConsensusPeerDeclaration
+import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.NakamotoTriggerDaemon.NakamotoTriggerState
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.ConsensusTrigger
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
@@ -46,8 +47,11 @@ object GlobalSnapshotConsensusStateCreator {
     consensusConfigHash: Hash,
     peerQualityTracker: PeerQualityTracker[F],
     tcaFilter: TrailingCommonAncestorFilter[F],
-    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey]
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
+    nakamotoStateRef: Option[Ref[F, NakamotoTriggerState]] = None
   ): GlobalSnapshotConsensusStateCreator[F] = new GlobalSnapshotConsensusStateCreator[F] {
+
+    val nakamotoEnabled: Boolean = nakamotoStateRef.isDefined
 
     val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
 
@@ -273,12 +277,30 @@ object GlobalSnapshotConsensusStateCreator {
           )
         } yield ()
 
-        // Quality-weighted leader selection: use consensus-agreed quality scores
-        // so all nodes compute the same leader deterministically.
-        // Pass raw (completed, participated) integers — the selector uses integer-only
-        // tier computation (tier = participated - completed = failure count) to avoid
-        // platform-dependent float-to-long conversion differences.
-        leader = facilitatorSelector.selectLeaderWeighted(active, entropy, qualityScores = lastOutcome.peerQuality, qualityWeight = 0.3)
+        // In Nakamoto mode, the slot winner (selfId) is ALWAYS the leader.
+        // We skip facilitatorSelector.selectLeaderWeighted() because the VRF slot winner
+        // is the only node that triggers StartRound, making them the leader by definition.
+        // Quality-weighted selection only applies in traditional mode.
+        //
+        // In traditional mode: use consensus-agreed quality scores so all nodes compute
+        // the same leader deterministically. Pass raw (completed, participated) integers —
+        // the selector uses integer-only tier computation to avoid platform-dependent
+        // float-to-long conversion differences.
+        leader <-
+          if (nakamotoEnabled) {
+            // Log the current slot certificate if available (for debugging/future use)
+            nakamotoStateRef.traverse_ { stateRef =>
+              stateRef.get.flatMap { state =>
+                state.currentSlotCertificate.traverse_ { cert =>
+                  logger.debug(s"Nakamoto mode: slot=${cert.slot.value}, leader=self, slotCert available")
+                }
+              }
+            }.as(selfId)
+          } else {
+            Async[F].pure(
+              facilitatorSelector.selectLeaderWeighted(active, entropy, qualityScores = lastOutcome.peerQuality, qualityWeight = 0.3)
+            )
+          }
 
         _ <- ConsensusLog.info(
           logger,
