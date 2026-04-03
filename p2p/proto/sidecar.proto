@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package nakamoto.p2p;
+
+option go_package = "github.com/scasplte2/tessellation/p2p/proto";
+
+// ─── Messages ────────────────────────────────────────────────────────
+
+// A snapshot produced by a slot winner, broadcast via GossipSub.
+message Snapshot {
+  bytes hash = 1;           // 32 bytes, snapshot hash
+  int64 slot = 2;           // slot number
+  int64 ordinal = 3;        // snapshot ordinal
+  bytes parent_hash = 4;    // 32 bytes, parent snapshot hash
+  bytes vrf_proof = 5;      // 80 bytes, VRF proof (Gamma || c || s)
+  bytes vrf_public_key = 6; // 32 bytes, Ed25519 VRF public key
+  bytes eta = 7;            // 32 bytes, epoch randomness
+  bytes payload = 8;        // serialized snapshot body (opaque to sidecar)
+  bytes producer_id = 9;    // peer identity of the producer
+}
+
+// A validator's endorsement of a chain tip.
+message TipAttestation {
+  bytes tip_hash = 1;       // 32 bytes, hash of endorsed snapshot
+  int64 tip_slot = 2;       // slot of that snapshot
+  int64 tip_ordinal = 3;    // ordinal of that snapshot
+  int64 attested_at = 4;    // slot when attestation was created
+  bytes attester_id = 5;    // peer identity of the attester
+  bytes signature = 6;      // signature over (tip_hash || tip_slot)
+}
+
+// Envelope for GossipSub messages.
+message GossipMessage {
+  oneof body {
+    Snapshot snapshot = 1;
+    TipAttestation attestation = 2;
+  }
+}
+
+// ─── gRPC Service: JVM ↔ Sidecar ────────────────────────────────────
+
+// The sidecar exposes this service on localhost for the JVM to call.
+service SidecarService {
+  // Publish a snapshot to the network (JVM won a slot).
+  rpc PublishSnapshot(Snapshot) returns (PublishResponse);
+
+  // Publish an attestation to the network.
+  rpc PublishAttestation(TipAttestation) returns (PublishResponse);
+
+  // Subscribe to incoming messages from the network.
+  // Server-streaming: sidecar pushes received gossip to JVM.
+  rpc Subscribe(SubscribeRequest) returns (stream GossipMessage);
+
+  // Get connected peer count.
+  rpc PeerCount(PeerCountRequest) returns (PeerCountResponse);
+
+  // Health check.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message PublishResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message SubscribeRequest {
+  // Which message types to receive. Empty = all.
+  repeated string topics = 1;
+}
+
+message PeerCountRequest {}
+
+message PeerCountResponse {
+  int32 total = 1;
+  int32 mesh_snapshots = 2;   // peers in snapshot topic mesh
+  int32 mesh_attestations = 3; // peers in attestation topic mesh
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  int64 uptime_seconds = 2;
+  int32 peer_count = 3;
+}
