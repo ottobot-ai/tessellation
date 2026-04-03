@@ -40,7 +40,7 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
       )
       val thresh0 = EligibilityChecker.threshold(1.0, 0, configWithOffset)
       val thresh4 = EligibilityChecker.threshold(1.0, 4, configWithOffset)
-      expect.eql(0.0, thresh0) and expect.eql(0.0, thresh4)
+      expect.eql(0.0, thresh0).and(expect.eql(0.0, thresh4))
     }
   }
 
@@ -55,7 +55,7 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
       // At slotGap = 5 (halfway), difficulty should be 0.5 * 5/10 = 0.25
       // For relativeStake = 1.0, threshold = 1 - (1 - 0.25)^1 = 0.25
       val threshMid = EligibilityChecker.threshold(1.0, 5, config)
-      expect(math.abs(threshMid - 0.25) < 0.0001) and {
+      expect(math.abs(threshMid - 0.25) < 0.0001).and {
         // At slotGap == lddCutoff, we're in recovery region (baseline)
         // The ramp is for slotGap < lddCutoff
         // At slotGap = 9, should be 0.5 * 9/10 = 0.45
@@ -70,8 +70,8 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
       val thresh15 = EligibilityChecker.threshold(1.0, 15, defaultConfig)
       val thresh100 = EligibilityChecker.threshold(1.0, 100, defaultConfig)
       // For relativeStake = 1.0, threshold ≈ difficulty (floating point)
-      expect(math.abs(thresh15 - defaultConfig.baselineDifficulty) < 1e-10) and
-        expect(math.abs(thresh100 - defaultConfig.baselineDifficulty) < 1e-10)
+      expect(math.abs(thresh15 - defaultConfig.baselineDifficulty) < 1e-10)
+        .and(expect(math.abs(thresh100 - defaultConfig.baselineDifficulty) < 1e-10))
     }
   }
 
@@ -80,7 +80,7 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
       val config = LddConfig(lddCutoff = 15, offset = 0, baselineDifficulty = 0.05, amplitude = 0.5)
       // In recovery: f(δ) = 0.05
       val threshRecovery = EligibilityChecker.threshold(1.0, 20, config)
-      expect(math.abs(threshRecovery - 0.05) < 1e-10) and {
+      expect(math.abs(threshRecovery - 0.05) < 1e-10).and {
         // In ramp at δ=7: f(δ) = 0.5 * 7/15 = 0.2333...
         val fAtDelta7 = 0.5 * 7.0 / 15.0
         val threshRamp = EligibilityChecker.threshold(1.0, 7, config)
@@ -94,9 +94,7 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
       val thresh0Gap = EligibilityChecker.threshold(0.0, 0, defaultConfig)
       val thresh10Gap = EligibilityChecker.threshold(0.0, 10, defaultConfig)
       val thresh100Gap = EligibilityChecker.threshold(0.0, 100, defaultConfig)
-      expect.eql(0.0, thresh0Gap) and
-        expect.eql(0.0, thresh10Gap) and
-        expect.eql(0.0, thresh100Gap)
+      expect.eql(0.0, thresh0Gap).and(expect.eql(0.0, thresh10Gap)).and(expect.eql(0.0, thresh100Gap))
     }
   }
 
@@ -136,9 +134,9 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
       val probAtLeastOne100 = 1.0 - probNoWinner(100)
 
       // All should be approximately f(δ) = 0.3
-      expect(math.abs(probAtLeastOne3 - f) < 0.001) and
-        expect(math.abs(probAtLeastOne10 - f) < 0.001) and
-        expect(math.abs(probAtLeastOne100 - f) < 0.001)
+      expect(math.abs(probAtLeastOne3 - f) < 0.001)
+        .and(expect(math.abs(probAtLeastOne10 - f) < 0.001))
+        .and(expect(math.abs(probAtLeastOne100 - f) < 0.001))
     }
   }
 
@@ -153,11 +151,11 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
       val proof = EligibilityChecker.vrfProofForSlot(sk, slot, eta)
       val outputOpt = vrf.vrfProofToHash(proof)
 
-      expect(outputOpt.isDefined) and {
+      expect(outputOpt.isDefined).and {
         val output = outputOpt.get
-        expect.eql(64, output.length) and {
+        expect.eql(64, output.length).and {
           val normalized = EligibilityChecker.normalizeVrfOutput(output)
-          expect(normalized >= 0.0) and expect(normalized < 1.0)
+          expect(normalized >= 0.0).and(expect(normalized < 1.0))
         }
       }
     }
@@ -175,8 +173,7 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
         EligibilityChecker.normalizeVrfOutput(output)
       }
 
-      expect(results.forall(_ >= 0.0)) and
-        expect(results.forall(_ < 1.0))
+      expect(results.forall(_ >= 0.0)).and(expect(results.forall(_ < 1.0)))
     }
   }
 
@@ -314,9 +311,9 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
       val eta3 = EligibilityChecker.computeNextEta(randomEta(), epoch, rhoHashes)
       val eta4 = EligibilityChecker.computeNextEta(prevEta, epoch, List(randomEta()))
 
-      expect(!java.util.Arrays.equals(eta1, eta2)) and
-        expect(!java.util.Arrays.equals(eta1, eta3)) and
-        expect(!java.util.Arrays.equals(eta1, eta4))
+      expect(!java.util.Arrays.equals(eta1, eta2))
+        .and(expect(!java.util.Arrays.equals(eta1, eta3)))
+        .and(expect(!java.util.Arrays.equals(eta1, eta4)))
     }
   }
 
@@ -362,6 +359,20 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
       val thresh = EligibilityChecker.threshold(1.0, 0, config)
       // difficulty = 0.5 * (0 - 0) / (15 - 0) = 0
       expect.eql(0.0, thresh)
+    }
+  }
+
+  test("default config has ψ=1 buffer: zero probability in slot immediately after snapshot") {
+    IO {
+      // With Default config (offset=1), δ=1 should yield zero threshold
+      val threshDelta0 = EligibilityChecker.threshold(1.0, 0, defaultConfig)
+      val threshDelta1 = EligibilityChecker.threshold(1.0, 1, defaultConfig)
+      // δ=2 should be the start of the ramp: fA × (2-1)/(γ-1) = 0.5 × 1/14
+      val threshDelta2 = EligibilityChecker.threshold(1.0, 2, defaultConfig)
+      val expectedRampStart = 0.5 * 1.0 / 14.0
+      expect.eql(0.0, threshDelta0) and
+        expect.eql(0.0, threshDelta1) and
+        expect(math.abs(threshDelta2 - expectedRampStart) < 1e-10)
     }
   }
 }
