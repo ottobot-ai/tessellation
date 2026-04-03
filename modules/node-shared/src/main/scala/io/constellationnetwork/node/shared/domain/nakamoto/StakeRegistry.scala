@@ -5,12 +5,10 @@ import cats.syntax.all._
 
 import io.constellationnetwork.schema.peer.PeerId
 
-/**
- * Read-only view of validator stake for Nakamoto consensus.
- *
- * Used by EligibilityChecker to determine threshold scaling.
- * Phase 3: equal weight (1/N). Future: stake-proportional.
- */
+/** Read-only view of validator stake for Nakamoto consensus.
+  *
+  * Used by EligibilityChecker to determine threshold scaling. Phase 3: equal weight (1/N). Future: stake-proportional.
+  */
 trait StakeRegistry[F[_]] {
 
   /** Get the relative stake [0,1] for a peer. Returns 0 if peer is not a validator. */
@@ -28,9 +26,8 @@ trait StakeRegistry[F[_]] {
 
 object StakeRegistry {
 
-  /**
-   * Equal-weight stake registry. Every active validator gets 1/N.
-   */
+  /** Equal-weight stake registry. Every active validator gets 1/N.
+    */
   def equalWeight[F[_]: Sync]: F[StakeRegistry[F]] =
     Ref.of[F, Set[PeerId]](Set.empty).map { validatorsRef =>
       new StakeRegistry[F] {
@@ -58,9 +55,8 @@ object StakeRegistry {
       }
     }
 
-  /**
-   * Future: Stake-weighted registry that reads from GlobalSnapshotInfo.
-   * Stub for now — will use activeDelegatedStakes + activeNodeCollaterals.
-   */
+  /** Future: Stake-weighted registry that reads from GlobalSnapshotInfo. Stub for now — will use activeDelegatedStakes +
+    * activeNodeCollaterals.
+    */
   // def stakeWeighted[F[_]: Sync](snapshotInfo: GlobalSnapshotInfo): F[StakeRegistry[F]] = ???
 }
