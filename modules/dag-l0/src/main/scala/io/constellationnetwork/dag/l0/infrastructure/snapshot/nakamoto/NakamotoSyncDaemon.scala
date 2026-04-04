@@ -64,8 +64,10 @@ object NakamotoSyncDaemon {
               chainStore,
               nodeStorage,
               tipTracker,
+              stakeRegistry,
               sidecarClient,
               selfId,
+              lddConfig,
               lastKnownSlotRef,
               epochStateRef,
               etaRotationSlots,
@@ -88,8 +90,10 @@ object NakamotoSyncDaemon {
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     nodeStorage: NodeStorage[F],
     tipTracker: TipTracker[F],
+    stakeRegistry: StakeRegistry[F],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     selfId: peer.PeerId,
+    lddConfig: LddConfig,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSlots: Long,
@@ -100,6 +104,76 @@ object NakamotoSyncDaemon {
         s"📥 Received snapshot ordinal=${snap.ordinal} slot=${snap.slot} from=${snap.producerId.toByteArray.take(4).map("%02x".format(_)).mkString}"
       )
 
+      // ── VRF Proof Validation ──
+      // Verify the producer was legitimately elected for this slot
+      producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
+      producerId = peer.PeerId(producerHex)
+      producerStake <- stakeRegistry.relativeStake(producerId)
+      epochState <- epochStateRef.get
+      lastSlot <- lastKnownSlotRef.get
+      slotGap = lastSlot.fold(snap.slot)(snap.slot - _)
+
+      vrfValid = {
+        val vrfVK = snap.vrfPublicKey.toByteArray
+        val proof = snap.vrfProof.toByteArray
+        if (vrfVK.isEmpty || proof.isEmpty) {
+          false // Missing VRF data
+        } else {
+          io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker.verifyEligibility(
+            vrfVK = vrfVK,
+            slot = Slot(NonNegLong.unsafeFrom(snap.slot)),
+            slotGap = slotGap,
+            eta = epochState.currentEta,
+            relativeStake = producerStake,
+            config = lddConfig,
+            proof = proof
+          )
+        }
+      }
+
+      _ <-
+        if (!vrfValid) {
+          logger.warn(
+            s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal} from=${producerHex.value
+                .take(8)} — VRF verification failed (stake=$producerStake, gap=$slotGap)"
+          )
+        } else {
+          logger.debug(s"✅ VRF valid for slot=${snap.slot} from=${producerHex.value.take(8)}")
+        }
+
+      // Skip storage + attestation if VRF is invalid
+      _ <- Async[F].whenA(vrfValid) {
+        processValidSnapshot(
+          snap,
+          stateRef,
+          chainStore,
+          nodeStorage,
+          tipTracker,
+          sidecarClient,
+          selfId,
+          lastKnownSlotRef,
+          epochStateRef,
+          etaRotationSlots,
+          logger
+        )
+      }
+    } yield ()
+
+  /** Process a VRF-validated snapshot: update tip tracking, store, accumulate VRF output, record attestation. */
+  private def processValidSnapshot[F[_]: Async: HasherSelector](
+    snap: pb.Snapshot,
+    stateRef: Ref[F, SyncState],
+    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
+    nodeStorage: NodeStorage[F],
+    tipTracker: TipTracker[F],
+    sidecarClient: SidecarClient.SidecarClientAlgebra[F],
+    selfId: peer.PeerId,
+    lastKnownSlotRef: Ref[F, Option[Long]],
+    epochStateRef: Ref[F, SharedEpochState],
+    etaRotationSlots: Long,
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] =
+    for {
       // Update network tip tracking
       _ <- stateRef.update { s =>
         if (snap.ordinal > s.networkTipOrdinal)
