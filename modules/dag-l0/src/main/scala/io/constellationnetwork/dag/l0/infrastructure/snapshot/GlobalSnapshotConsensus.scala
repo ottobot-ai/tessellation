@@ -334,6 +334,7 @@ object GlobalSnapshotConsensus {
                     sidecarClient = sidecarClient,
                     tipTracker = tipTracker,
                     stakeRegistry = stakeRegistry,
+                    nodeStorage = nodeStorage,
                     keyPair = keyPair,
                     selfId = selfId,
                     lddConfig = lddConfig,

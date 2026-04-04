@@ -11,6 +11,7 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, StakeRegistry, TipTracker}
+import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.TimeTrigger
@@ -19,6 +20,7 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot._
+import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -115,6 +117,7 @@ object SnapshotLeaderLoop {
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
     stakeRegistry: StakeRegistry[F],
+    nodeStorage: NodeStorage[F],
     keyPair: KeyPair,
     selfId: PeerId,
     lddConfig: LddConfig,
@@ -128,53 +131,62 @@ object SnapshotLeaderLoop {
         .awakeEvery[F](1.second)
         .evalMap { _ =>
           for {
-            state <- stateRef.get
-            wallClockMs = System.currentTimeMillis()
-            currentSlot = (wallClockMs - state.genesisTimeMs) / 1000L
-            slotGap = state.lastProducedSlot.fold(currentSlot)(currentSlot - _)
+            // Only produce when node is Ready (has genesis/joined cluster)
+            nodeState <- nodeStorage.getNodeState
+            _ <-
+              if (nodeState =!= NodeState.Ready) Async[F].unit
+              else
+                for {
+                  state <- stateRef.get
+                  wallClockMs = System.currentTimeMillis()
+                  currentSlot = (wallClockMs - state.genesisTimeMs) / 1000L
+                  slotGap = state.lastProducedSlot.fold(currentSlot)(currentSlot - _)
 
-            slotRefined = Slot(NonNegLong.unsafeFrom(currentSlot))
+                  slotRefined = Slot(NonNegLong.unsafeFrom(currentSlot))
 
-            // VRF eligibility check (equal weight 1.0 for now)
-            result = EligibilityChecker.checkEligibility(
-              vrfSK = vrfSeed,
-              slot = slotRefined,
-              slotGap = slotGap,
-              eta = state.currentEta,
-              relativeStake = 1.0,
-              config = lddConfig
-            )
+                  // Query actual relative stake from registry
+                  myStake <- stakeRegistry.relativeStake(selfId)
 
-            _ <- result match {
-              case Some((proof, vrfOutput)) =>
-                onSlotWon(
-                  stateRef,
-                  consensusFns,
-                  snapshotStorage,
-                  eventMempool,
-                  sidecarClient,
-                  tipTracker,
-                  stakeRegistry,
-                  keyPair,
-                  selfId,
-                  vrfSeed,
-                  vrfPK,
-                  proof,
-                  vrfOutput,
-                  currentSlot,
-                  slotGap,
-                  slotRefined,
-                  lddConfig,
-                  slotsPerEpoch,
-                  logger
-                )
+                  result = EligibilityChecker.checkEligibility(
+                    vrfSK = vrfSeed,
+                    slot = slotRefined,
+                    slotGap = slotGap,
+                    eta = state.currentEta,
+                    relativeStake = myStake,
+                    config = lddConfig
+                  )
 
-              case None =>
-                // Periodic debug log
-                Async[F].whenA(currentSlot % 30 == 0) {
-                  logger.debug(s"Slot $currentSlot: not eligible (gap=$slotGap)")
-                }
-            }
+                  _ <- result match {
+                    case Some((proof, vrfOutput)) =>
+                      onSlotWon(
+                        stateRef,
+                        consensusFns,
+                        snapshotStorage,
+                        eventMempool,
+                        sidecarClient,
+                        tipTracker,
+                        stakeRegistry,
+                        keyPair,
+                        selfId,
+                        vrfSeed,
+                        vrfPK,
+                        proof,
+                        vrfOutput,
+                        currentSlot,
+                        slotGap,
+                        slotRefined,
+                        lddConfig,
+                        slotsPerEpoch,
+                        logger
+                      )
+
+                    case None =>
+                      // Periodic debug log
+                      Async[F].whenA(currentSlot % 30 == 0) {
+                        logger.debug(s"Slot $currentSlot: not eligible (gap=$slotGap, stake=$myStake)")
+                      }
+                  }
+                } yield ()
           } yield ()
         }
 
