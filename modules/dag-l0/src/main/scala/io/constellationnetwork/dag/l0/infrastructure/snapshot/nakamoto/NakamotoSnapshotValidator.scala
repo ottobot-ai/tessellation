@@ -25,10 +25,9 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 /** Validates Nakamoto snapshots received via gossip.
   *
   * Verification pipeline:
-  *   1. VRF proof verification — producer was legitimately elected for this slot
-  *   2. Signature verification — snapshot was signed by the claimed producer
-  *   3. SlotCertificate verification — cert fields match gossip message fields
-  *   4. Content validation — state transitions are correct (via ConsensusFunctions.validateArtifact)
+  *   1. VRF proof verification — producer was legitimately elected for this slot 2. Signature verification — snapshot was signed by the
+  *      claimed producer 3. SlotCertificate verification — cert fields match gossip message fields 4. Content validation — state
+  *      transitions are correct (via ConsensusFunctions.validateArtifact)
   */
 object NakamotoSnapshotValidator {
 
@@ -60,17 +59,18 @@ object NakamotoSnapshotValidator {
       // ── Step 1: VRF proof verification ──
       producerStake <- stakeRegistry.relativeStake(producerId)
 
-      vrfValid = if (vrfPublicKey.isEmpty || vrfProof.isEmpty) false
-      else
-        EligibilityChecker.verifyEligibility(
-          vrfVK = vrfPublicKey,
-          slot = Slot(NonNegLong.unsafeFrom(slot)),
-          slotGap = slotGap,
-          eta = eta,
-          relativeStake = producerStake,
-          config = lddConfig,
-          proof = vrfProof
-        )
+      vrfValid =
+        if (vrfPublicKey.isEmpty || vrfProof.isEmpty) false
+        else
+          EligibilityChecker.verifyEligibility(
+            vrfVK = vrfPublicKey,
+            slot = Slot(NonNegLong.unsafeFrom(slot)),
+            slotGap = slotGap,
+            eta = eta,
+            relativeStake = producerStake,
+            config = lddConfig,
+            proof = vrfProof
+          )
 
       result <-
         if (!vrfValid) {

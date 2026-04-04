@@ -110,7 +110,16 @@ object NakamotoTriggerDaemon {
               val etaHash = Hash(state.currentEta.map("%02x".format(_)).mkString)
               val vrfOutputHex = Hex(vrfOutput.map("%02x".format(_)).mkString)
               val cert =
-                SlotCertificate(slotRefined, VrfProof(proofHex), VrfOutput(vrfOutputHex), VrfPublicKey(pkHex), etaHash, 1, Hash("0" * 64))
+                SlotCertificate(
+                  slotRefined,
+                  Slot.MinValue,
+                  VrfProof(proofHex),
+                  VrfOutput(vrfOutputHex),
+                  VrfPublicKey(pkHex),
+                  etaHash,
+                  1,
+                  Hash("0" * 64)
+                )
 
               for {
                 // Update state with slot win

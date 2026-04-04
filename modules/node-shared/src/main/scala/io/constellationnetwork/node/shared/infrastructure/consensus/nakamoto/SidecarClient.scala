@@ -76,7 +76,8 @@ object SidecarClient {
     vrfPublicKey: Array[Byte],
     eta: Array[Byte],
     payload: Array[Byte],
-    producerId: Array[Byte]
+    producerId: Array[Byte],
+    parentSlot: Long = 0L
   ): Snapshot =
     Snapshot(
       hash = ByteString.copyFrom(hash),
@@ -87,7 +88,8 @@ object SidecarClient {
       vrfPublicKey = ByteString.copyFrom(vrfPublicKey),
       eta = ByteString.copyFrom(eta),
       payload = ByteString.copyFrom(payload),
-      producerId = ByteString.copyFrom(producerId)
+      producerId = ByteString.copyFrom(producerId),
+      parentSlot = parentSlot
     )
 
   def mkAttestation(

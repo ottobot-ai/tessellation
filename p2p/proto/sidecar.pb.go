@@ -33,6 +33,7 @@ type Snapshot struct {
 	Eta           []byte                 `protobuf:"bytes,7,opt,name=eta,proto3" json:"eta,omitempty"`                                         // 32 bytes, epoch randomness
 	Payload       []byte                 `protobuf:"bytes,8,opt,name=payload,proto3" json:"payload,omitempty"`                                 // serialized snapshot body (opaque to sidecar)
 	ProducerId    []byte                 `protobuf:"bytes,9,opt,name=producer_id,json=producerId,proto3" json:"producer_id,omitempty"`         // peer identity of the producer
+	ParentSlot    int64                  `protobuf:"varint,10,opt,name=parent_slot,json=parentSlot,proto3" json:"parent_slot,omitempty"`       // slot of parent snapshot (for slot gap verification)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -128,6 +129,13 @@ func (x *Snapshot) GetProducerId() []byte {
 		return x.ProducerId
 	}
 	return nil
+}
+
+func (x *Snapshot) GetParentSlot() int64 {
+	if x != nil {
+		return x.ParentSlot
+	}
+	return 0
 }
 
 // A validator's endorsement of a chain tip.
@@ -591,7 +599,7 @@ var File_proto_sidecar_proto protoreflect.FileDescriptor
 
 const file_proto_sidecar_proto_rawDesc = "" +
 	"\n" +
-	"\x13proto/sidecar.proto\x12\fnakamoto.p2p\"\xfd\x01\n" +
+	"\x13proto/sidecar.proto\x12\fnakamoto.p2p\"\x9e\x02\n" +
 	"\bSnapshot\x12\x12\n" +
 	"\x04hash\x18\x01 \x01(\fR\x04hash\x12\x12\n" +
 	"\x04slot\x18\x02 \x01(\x03R\x04slot\x12\x18\n" +
@@ -603,7 +611,10 @@ const file_proto_sidecar_proto_rawDesc = "" +
 	"\x03eta\x18\a \x01(\fR\x03eta\x12\x18\n" +
 	"\apayload\x18\b \x01(\fR\apayload\x12\x1f\n" +
 	"\vproducer_id\x18\t \x01(\fR\n" +
-	"producerId\"\xc7\x01\n" +
+	"producerId\x12\x1f\n" +
+	"\vparent_slot\x18\n" +
+	" \x01(\x03R\n" +
+	"parentSlot\"\xc7\x01\n" +
 	"\x0eTipAttestation\x12\x19\n" +
 	"\btip_hash\x18\x01 \x01(\fR\atipHash\x12\x19\n" +
 	"\btip_slot\x18\x02 \x01(\x03R\atipSlot\x12\x1f\n" +

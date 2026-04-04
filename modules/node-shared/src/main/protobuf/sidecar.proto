@@ -18,6 +18,7 @@ message Snapshot {
   bytes eta = 7;            // 32 bytes, epoch randomness
   bytes payload = 8;        // serialized snapshot body (opaque to sidecar)
   bytes producer_id = 9;    // peer identity of the producer
+  int64 parent_slot = 10;   // slot of parent snapshot (for slot gap verification)
 }
 
 // A validator's endorsement of a chain tip.

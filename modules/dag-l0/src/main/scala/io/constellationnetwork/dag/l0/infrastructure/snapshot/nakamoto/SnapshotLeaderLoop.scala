@@ -383,8 +383,10 @@ object SnapshotLeaderLoop {
           .digest(activePool.toList.map(_.value.value).sorted.mkString(",").getBytes("UTF-8"))
         activePoolHash = Hash(activePoolHashBytes.map("%02x".format(_)).mkString)
 
+        parentSlotValue = currentSlot - slotGap // = lastKnownSlot at time of VRF evaluation
         cert = SlotCertificate(
           slot = slotRefined,
+          parentSlot = Slot(NonNegLong.unsafeFrom(math.max(0L, parentSlotValue))),
           vrfProof = VrfProof(proofHex),
           vrfOutput = VrfOutput(vrfOutputHex),
           vrfPublicKey = VrfPublicKey(pkHex),
@@ -480,7 +482,8 @@ object SnapshotLeaderLoop {
                       val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
                       combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
                     },
-                    producerId = selfId.value.toBytes
+                    producerId = selfId.value.toBytes,
+                    parentSlot = parentSlotValue
                   )
                 )
                 .void

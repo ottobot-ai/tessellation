@@ -114,6 +114,7 @@ object NakamotoProposer {
                 case (proof, vrfOut) =>
                   SlotCertificate(
                     slot = currentSlot,
+                    parentSlot = Slot.MinValue, // TODO: wire actual parent slot
                     vrfProof = VrfProof.fromBytes(proof),
                     vrfOutput = VrfOutput.fromBytes(vrfOut),
                     vrfPublicKey = VrfPublicKey.fromBytes(vrfVK),

@@ -130,8 +130,8 @@ object NakamotoSyncDaemon {
         } else None
 
       epochState <- epochStateRef.get
-      lastSlot <- lastKnownSlotRef.get
-      slotGap = lastSlot.fold(snap.slot)(snap.slot - _)
+      // Use parentSlot from gossip message for gap (same inputs as producer used)
+      slotGap = snap.slot - snap.parentSlot
 
       // Full validation pipeline: VRF + signature + cert + content
       validationResult <- parsed match {
