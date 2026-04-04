@@ -233,15 +233,19 @@ object SnapshotLeaderLoop {
               case Some(tip) if tip.ordinal - lastFinalizedOrdinal > ConfirmationDepthK =>
                 // Finalize up to (tip.ordinal - k)
                 val finalizeAtOrdinal = tip.ordinal - ConfirmationDepthK
-                val finalizeAtSlot = Slot(eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(
-                  math.max(0L, tip.slot - ConfirmationDepthK)
-                ))
+                val finalizeAtSlot = Slot(
+                  eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(
+                    math.max(0L, tip.slot - ConfirmationDepthK)
+                  )
+                )
                 val depthHash = Hash(s"depth-finalized-$finalizeAtOrdinal")
                 tipTracker.markFinalized(depthHash, finalizeAtSlot) >>
                   tipTracker.pruneBelow(finalizeAtSlot) >>
-                  logger.info(
-                    s"✅ DEPTH-FINALIZED at ordinal=$finalizeAtOrdinal (tip=${tip.ordinal}, k=$ConfirmationDepthK)"
-                  ).as(true)
+                  logger
+                    .info(
+                      s"✅ DEPTH-FINALIZED at ordinal=$finalizeAtOrdinal (tip=${tip.ordinal}, k=$ConfirmationDepthK)"
+                    )
+                    .as(true)
               case _ => Async[F].pure(false)
             }
 
@@ -370,11 +374,12 @@ object SnapshotLeaderLoop {
                 vrfOutput
               )
 
-              // Update lastGlobalSnapshotStorage + lastNGlobalSnapshotStorage so fork
-              // detection sees the correct chain tip
+              // Update lastGlobalSnapshotStorage + lastNGlobalSnapshotStorage
+              // Use setForRecovery (force-set) instead of set (strict ordinal validation)
+              // because in Nakamoto mode, gossip may have advanced storage past our parent
               _ <- Async[F].whenA(stored) {
-                lastGlobalSnapshotStorage.set(snapshotHashedForStorage, context) >>
-                  lastNGlobalSnapshotStorage.set(snapshotHashedForStorage, context) >>
+                lastGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
+                  lastNGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
                   lastKnownSlotRef.set(Some(currentSlot))
               }
 
