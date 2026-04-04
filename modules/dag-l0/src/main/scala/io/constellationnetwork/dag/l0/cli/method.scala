@@ -175,6 +175,46 @@ object method {
     }
   }
 
+  /** Nakamoto consensus mode: all nodes load genesis identically and start VRF production. No leader/follower distinction. Uses a shared
+    * genesis key so all nodes produce the same signed genesis artifact.
+    */
+  case class RunNakamoto(
+    keyStore: StorePath,
+    alias: KeyAlias,
+    password: Password,
+    dbConfig: DBConfig,
+    httpConfig: HttpConfig,
+    environment: AppEnvironment,
+    genesisPath: Path,
+    seedlistPath: Option[SeedListPath],
+    collateralAmount: Option[Amount],
+    startingEpochProgress: EpochProgress,
+    trustRatingsPath: Option[Path],
+    prioritySeedlistPath: Option[SeedListPath],
+    allowanceListPath: Option[AllowanceListPath]
+  ) extends Run {}
+
+  object RunNakamoto extends WithOpts[RunNakamoto] {
+
+    val opts: Opts[RunNakamoto] = Opts.subcommand("run-nakamoto", "Run Nakamoto consensus mode (shared genesis, VRF production)") {
+      (
+        StorePath.opts,
+        KeyAlias.opts,
+        Password.opts,
+        db.opts,
+        http.opts,
+        AppEnvironment.opts,
+        genesisPathOpts,
+        SeedListPath.opts,
+        CollateralAmountOpts.opts,
+        RunGenesis.startingEpochProgressOpts,
+        trustRatingsPathOpts,
+        SeedListPath.priorityOpts,
+        AllowanceListPath.opts
+      ).mapN(RunNakamoto.apply)
+    }
+  }
+
   val opts: Opts[Run] =
-    RunGenesis.opts.orElse(RunValidator.opts).orElse(RunRollback.opts)
+    RunGenesis.opts.orElse(RunValidator.opts).orElse(RunRollback.opts).orElse(RunNakamoto.opts)
 }

@@ -1,12 +1,9 @@
-version: "3.8"
-
 # Nakamoto PoC local cluster — 3 JVM nodes + 3 Go sidecars
+# All nodes run `run-nakamoto` with shared genesis key → identical genesis → simultaneous Ready.
+#
 # Usage:
 #   1. Build JARs:  sbt dagL0/stage
-#   2. Build sidecar: cd p2p && go build -o sidecar ./cmd/sidecar
-#   3. Start:  docker compose up --build
-#
-# Env vars NAKAMOTO_ENABLED + NAKAMOTO_PURE activate pure attestation mode.
+#   2. Start:  docker compose up --build
 
 x-jvm-common: &jvm-common
   build:
@@ -18,6 +15,9 @@ x-jvm-common: &jvm-common
     NAKAMOTO_PURE: "true"
     NAKAMOTO_GENESIS_ETA: "tessellation-nakamoto-genesis"
     NAKAMOTO_SLOTS_PER_EPOCH: "60"
+    # Genesis time: set dynamically by start.sh, or use 0 for "now"
+    # All nodes MUST share the same genesis time for slot agreement
+    NAKAMOTO_GENESIS_TIME_MS: "${NAKAMOTO_GENESIS_TIME_MS:-0}"
     CL_KEYALIAS: alias
     CL_PASSWORD: password
     JAVA_OPTS: "-Xmx1g -Xss256k --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.security=ALL-UNNAMED"
@@ -25,17 +25,22 @@ x-jvm-common: &jvm-common
     - ./genesis.csv:/opt/genesis.csv:ro
     - ./seedlist.csv:/opt/seedlist.csv:ro
 
+
 x-sidecar-common: &sidecar-common
   build:
-    context: .
-    dockerfile: Dockerfile.sidecar
-  command: [
-    "-grpc", "0.0.0.0:50051",
-    "-listen", "/ip4/0.0.0.0/tcp/9500"
-  ]
+    context: ../p2p
+    dockerfile: Dockerfile
+
+x-nakamoto-cmd: &nakamoto-cmd
+  # All nodes run the same command — no genesis/validator distinction.
+  # Each signs genesis with own key; hash is over unsigned content so they agree.
+  command: >
+    run-nakamoto
+    /opt/genesis.csv
+    --collateral 0
 
 services:
-  # ── Node 0 (genesis) ──────────────────────────────────
+  # ── Node 0 ────────────────────────────────────────────
   sidecar-0:
     <<: *sidecar-common
     container_name: nakamoto-sidecar-0
@@ -64,7 +69,7 @@ services:
       - ./seedlist.csv:/opt/seedlist.csv:ro
       - ../docker/config/local-test-keys/3:/opt/keys:ro
     command: >
-      run-genesis
+      run-nakamoto
       /opt/genesis.csv
       --ip node-0
       --public-port 9000
@@ -81,7 +86,7 @@ services:
       nakamoto:
         aliases: [node-0]
 
-  # ── Node 1 (validator) ─────────────────────────────────
+  # ── Node 1 ────────────────────────────────────────────
   sidecar-1:
     <<: *sidecar-common
     container_name: nakamoto-sidecar-1
@@ -105,13 +110,13 @@ services:
       CL_PUBLIC_HTTP_PORT: "9010"
       CL_P2P_HTTP_PORT: "9011"
       CL_CLI_HTTP_PORT: "9012"
-      CL_GENESIS_PEER_HTTP: "http://node-0:9000"
     volumes:
       - ./genesis.csv:/opt/genesis.csv:ro
       - ./seedlist.csv:/opt/seedlist.csv:ro
       - ../docker/config/local-test-keys/4:/opt/keys:ro
     command: >
-      run-validator
+      run-nakamoto
+      /opt/genesis.csv
       --ip node-1
       --public-port 9010
       --p2p-port 9011
@@ -120,12 +125,11 @@ services:
       --collateral 0
     depends_on:
       - sidecar-1
-      - node-0
     networks:
       nakamoto:
         aliases: [node-1]
 
-  # ── Node 2 (validator) ─────────────────────────────────
+  # ── Node 2 ────────────────────────────────────────────
   sidecar-2:
     <<: *sidecar-common
     container_name: nakamoto-sidecar-2
@@ -149,13 +153,13 @@ services:
       CL_PUBLIC_HTTP_PORT: "9020"
       CL_P2P_HTTP_PORT: "9021"
       CL_CLI_HTTP_PORT: "9022"
-      CL_GENESIS_PEER_HTTP: "http://node-0:9000"
     volumes:
       - ./genesis.csv:/opt/genesis.csv:ro
       - ./seedlist.csv:/opt/seedlist.csv:ro
       - ../docker/config/local-test-keys/5:/opt/keys:ro
     command: >
-      run-validator
+      run-nakamoto
+      /opt/genesis.csv
       --ip node-2
       --public-port 9020
       --p2p-port 9021
@@ -164,7 +168,6 @@ services:
       --collateral 0
     depends_on:
       - sidecar-2
-      - node-0
     networks:
       nakamoto:
         aliases: [node-2]

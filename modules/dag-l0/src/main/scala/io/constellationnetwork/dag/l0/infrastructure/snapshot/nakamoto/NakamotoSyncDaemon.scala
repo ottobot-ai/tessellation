@@ -1,12 +1,10 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import cats.effect.kernel.{Async, Ref}
-import cats.effect.std.Supervisor
 import cats.syntax.all._
 
 import io.constellationnetwork.node.shared.domain.nakamoto.{StakeRegistry, TipTracker}
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
-import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.{GossipStream, SidecarClient}
 import io.constellationnetwork.schema.nakamoto.slot.Slot
@@ -17,15 +15,14 @@ import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.{HasherSelector, SecurityProvider}
 
+import eu.timepit.refined.types.numeric.NonNegLong
 import io.grpc.ManagedChannel
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-/** Replaces DownloadDaemon in Nakamoto mode.
+/** Subscribes to sidecar GossipSub for live snapshots and attestations.
   *
-  * Subscribes to the sidecar's GossipSub stream for live snapshots and attestations. Validates received snapshots (VRF proof + content
-  * integrity), stores them, tracks the chain tip, and emits attestations.
-  *
-  * Transitions the node from Syncing → Ready when the local chain tip is within `catchUpThreshold` ordinals of the network tip.
+  * Uses NakamotoChainStore for fork-aware storage instead of raw SnapshotStorage.prepend. Records attestations in TipTracker for finality
+  * tracking.
   */
 object NakamotoSyncDaemon {
 
@@ -44,13 +41,14 @@ object NakamotoSyncDaemon {
 
   def run[F[_]: Async: SecurityProvider: HasherSelector](
     channel: ManagedChannel,
-    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     nodeStorage: NodeStorage[F],
     tipTracker: TipTracker[F],
     stakeRegistry: StakeRegistry[F],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     selfId: peer.PeerId,
-    lddConfig: LddConfig
+    lddConfig: LddConfig,
+    lastKnownSlotRef: Ref[F, Option[Long]]
   ): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
@@ -61,13 +59,12 @@ object NakamotoSyncDaemon {
             handleSnapshot(
               snap,
               stateRef,
-              snapshotStorage,
+              chainStore,
               nodeStorage,
               tipTracker,
-              stakeRegistry,
               sidecarClient,
               selfId,
-              lddConfig,
+              lastKnownSlotRef,
               logger
             )
 
@@ -81,16 +78,15 @@ object NakamotoSyncDaemon {
     }
   }
 
-  private def handleSnapshot[F[_]: Async: SecurityProvider: HasherSelector](
+  private def handleSnapshot[F[_]: Async: HasherSelector](
     snap: pb.Snapshot,
     stateRef: Ref[F, SyncState],
-    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     nodeStorage: NodeStorage[F],
     tipTracker: TipTracker[F],
-    stakeRegistry: StakeRegistry[F],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     selfId: peer.PeerId,
-    lddConfig: LddConfig,
+    lastKnownSlotRef: Ref[F, Option[Long]],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     for {
@@ -108,18 +104,47 @@ object NakamotoSyncDaemon {
         else s
       }
 
-      // TODO: Full validation pipeline:
-      // 1. Verify VRF proof: EcVrf25519.vrfVerify(vrfPK, eta || slotBytes, proof)
-      // 2. Check LDD threshold: was producer eligible at that slot gap?
-      // 3. Verify snapshot contents: reconstruct and compare hash
-      // 4. Check signature on the Signed[GlobalIncrementalSnapshot]
-      //
-      // For now, accept all snapshots from gossip (trust-on-first-use).
-      // This is safe for the PoC since all nodes run the same code.
+      // Deserialize and store via NakamotoChainStore (handles forks + reorgs)
+      _ <-
+        if (snap.payload.size() > 0) {
+          val payloadStr = snap.payload.toByteArray.map(_.toChar).mkString
+          val result = for {
+            json <- io.circe.parser.parse(payloadStr)
+            snapshotJson <- json.hcursor.get[io.circe.Json]("snapshot")
+            contextJson <- json.hcursor.get[io.circe.Json]("context")
+            snapshot <- snapshotJson.as[io.constellationnetwork.security.signature.Signed[GlobalIncrementalSnapshot]]
+            context <- contextJson.as[GlobalSnapshotInfo]
+          } yield (snapshot, context)
 
-      // Record in TipTracker (snapshot producer effectively attests to their own tip)
+          result match {
+            case Right((signedSnapshot, context)) =>
+              val parentHash = Hash(snap.parentHash.toByteArray.map("%02x".format(_)).mkString)
+              chainStore
+                .store(
+                  signedSnapshot,
+                  context,
+                  snap.ordinal,
+                  snap.slot,
+                  parentHash,
+                  snap.vrfProof.toByteArray
+                )
+                .flatMap { isNew =>
+                  if (isNew) {
+                    // Update slot ref from chain store's best tip (may differ from this snapshot if fork was weaker)
+                    chainStore.bestTipSlot.flatMap {
+                      case Some(bestSlot) => lastKnownSlotRef.set(Some(bestSlot))
+                      case None           => Async[F].unit
+                    }
+                  } else Async[F].unit
+                }
+            case Left(err) =>
+              logger.warn(s"⚠️ Failed to deserialize snapshot payload: ${err.getMessage}")
+          }
+        } else Async[F].unit
+
+      // Record in TipTracker (snapshot producer attests to their own tip)
       tipHash = Hash(snap.hash.toByteArray.map("%02x".format(_)).mkString)
-      tipSlot = Slot(eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(snap.slot))
+      tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
       producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
       producerId = peer.PeerId(producerHex)
       att = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, tipSlot)
@@ -129,24 +154,16 @@ object NakamotoSyncDaemon {
       state <- stateRef.get
       nodeState <- nodeStorage.getNodeState
       _ <- Async[F].whenA(!state.isReady && nodeState =!= NodeState.Ready) {
-        val localOrdinal = snap.ordinal // We just received this, so we're at least here
-        val caughtUp = state.networkTipOrdinal - localOrdinal <= CatchUpThreshold
+        val caughtUp = state.networkTipOrdinal - snap.ordinal <= CatchUpThreshold
         Async[F].whenA(caughtUp) {
-          for {
-            _ <- logger.info(
-              s"✅ Caught up to network tip (local=$localOrdinal, network=${state.networkTipOrdinal}). Transitioning to Ready."
-            )
-            _ <- stateRef.update(_.copy(isReady = true, localTipOrdinal = localOrdinal))
-            // Force transition to Ready — in Nakamoto mode, subscribing to gossip
-            // and catching up IS the join process. No BFT enrollment needed.
-            _ <- nodeStorage.setNodeState(NodeState.Ready)
-            _ <- logger.info(s"🟢 Node state set to Ready — VRF slot production will begin")
-          } yield ()
+          logger.info(s"✅ Caught up (local=${snap.ordinal}, network=${state.networkTipOrdinal}). → Ready.") >>
+            stateRef.update(_.copy(isReady = true, localTipOrdinal = snap.ordinal)) >>
+            nodeStorage.setNodeState(NodeState.Ready) >>
+            logger.info(s"🟢 Node Ready — VRF production begins")
         }
       }
 
-      // Emit our own attestation for this snapshot
-      // (validates that we've seen and accepted it)
+      // Emit our attestation for this snapshot
       _ <- emitAttestation(snap, sidecarClient, selfId, logger)
 
     } yield ()
@@ -157,15 +174,13 @@ object NakamotoSyncDaemon {
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     val tipHash = Hash(att.tipHash.toByteArray.map("%02x".format(_)).mkString)
-    val tipSlot = Slot(eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(att.tipSlot))
+    val tipSlot = Slot(NonNegLong.unsafeFrom(att.tipSlot))
     val attesterHex = Hex(att.attesterId.toByteArray.map("%02x".format(_)).mkString)
     val attesterId = peer.PeerId(attesterHex)
-    val attestedAtSlot = Slot(eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(att.attestedAt))
+    val attestedAtSlot = Slot(NonNegLong.unsafeFrom(att.attestedAt))
     val domainAtt = DomainTipAttestation(tipHash, tipSlot, att.tipOrdinal, attestedAtSlot)
     tipTracker.recordAttestation(attesterId, domainAtt) >>
-      logger.debug(
-        s"📨 Attestation for ordinal=${att.tipOrdinal} slot=${att.tipSlot} from=${attesterHex.value.take(8)}"
-      )
+      logger.debug(s"📨 Attestation for ordinal=${att.tipOrdinal} from=${attesterHex.value.take(8)}")
   }
 
   private def emitAttestation[F[_]: Async](
@@ -174,14 +189,13 @@ object NakamotoSyncDaemon {
     selfId: peer.PeerId,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
-    // Build attestation from our identity
     val att = SidecarClient.mkAttestation(
       tipHash = snap.hash.toByteArray,
       tipSlot = snap.slot,
       tipOrdinal = snap.ordinal,
-      attestedAt = System.currentTimeMillis() / 1000L, // current slot approximation
+      attestedAt = System.currentTimeMillis() / 1000L,
       attesterId = selfId.value.value.getBytes("UTF-8").take(32),
-      signature = Array.emptyByteArray // TODO: sign (tipHash || tipSlot) with node key
+      signature = Array.emptyByteArray // TODO: sign (tipHash || tipSlot)
     )
     sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
       logger.warn(s"Failed to emit attestation: ${e.getMessage}")

@@ -11,6 +11,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	libp2pnoise "github.com/libp2p/go-libp2p/p2p/security/noise"
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/scasplte2/tessellation/p2p/internal/config"
@@ -46,6 +47,7 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 	h, err := libp2p.New(
 		libp2p.ListenAddrs(listenAddrs...),
 		libp2p.ForceReachabilityPrivate(),
+		libp2p.Security(libp2pnoise.ID, libp2pnoise.New),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create libp2p host: %w", err)

@@ -51,6 +51,7 @@ object SnapshotLeaderLoop {
   final case class LoopState(
     genesisTimeMs: Long,
     lastProducedSlot: Option[Long],
+    lastKnownSlot: Option[Long], // updated on both produce AND gossip receive
     currentEta: Array[Byte],
     vrfAccumulator: List[Array[Byte]],
     totalProduced: Long
@@ -61,6 +62,7 @@ object SnapshotLeaderLoop {
       LoopState(
         genesisTimeMs = genesisTimeMs,
         lastProducedSlot = None,
+        lastKnownSlot = None,
         currentEta = genesisEta,
         vrfAccumulator = Nil,
         totalProduced = 0L
@@ -113,6 +115,7 @@ object SnapshotLeaderLoop {
   def run[F[_]: Async: SecurityProvider: HasherSelector](
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
@@ -123,28 +126,38 @@ object SnapshotLeaderLoop {
     keyPair: KeyPair,
     selfId: PeerId,
     lddConfig: LddConfig,
-    slotsPerEpoch: Long = 60L
+    slotsPerEpoch: Long = 60L,
+    lastKnownSlotRef: Ref[F, Option[Long]],
+    genesisTimeMs: Long = 0L
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
+    // Use shared genesis time if provided, else fall back to wall clock
+    val effectiveGenesisTime = if (genesisTimeMs > 0) genesisTimeMs else System.currentTimeMillis()
 
-    Stream.eval(Ref.of[F, LoopState](LoopState.initial(System.currentTimeMillis(), vrfSeed.take(32)))).flatMap { stateRef =>
+    Stream.eval(Ref.of[F, LoopState](LoopState.initial(effectiveGenesisTime, vrfSeed.take(32)))).flatMap { stateRef =>
       val slotTick: Stream[F, Unit] = Stream
         .awakeEvery[F](1.second)
         .evalMap { _ =>
           for {
-            // Only produce when node is Ready (has genesis/joined cluster)
+            // Only produce when node is Ready and past genesis time
             nodeState <- nodeStorage.getNodeState
+            state <- stateRef.get
+            wallClockMs = System.currentTimeMillis()
+            currentSlot = (wallClockMs - state.genesisTimeMs) / 1000L
             _ <-
               if (nodeState =!= NodeState.Ready) Async[F].unit
-              else
+              else if (currentSlot < 0) {
+                // Still waiting for coordinated genesis time
+                Async[F].whenA(currentSlot % 10 == 0)(logger.info(s"⏳ Waiting for genesis (${-currentSlot}s remaining)"))
+              } else
                 for {
-                  state <- stateRef.get
-                  wallClockMs = System.currentTimeMillis()
-                  currentSlot = (wallClockMs - state.genesisTimeMs) / 1000L
-                  slotGap = state.lastProducedSlot.fold(currentSlot)(currentSlot - _)
+                  // Slot gap from last stored chain tip (global, agreed upon)
+                  // Updated after successful chainStore.store, so all validators converge
+                  lastFinalizedSlot <- lastKnownSlotRef.get
+                  slotGap = lastFinalizedSlot.fold(currentSlot)(currentSlot - _)
 
-                  slotRefined = Slot(NonNegLong.unsafeFrom(currentSlot))
+                  slotRefined = Slot(NonNegLong.unsafeFrom(Math.max(0L, currentSlot)))
 
                   // Query actual relative stake from registry
                   myStake <- stakeRegistry.relativeStake(selfId)
@@ -164,6 +177,7 @@ object SnapshotLeaderLoop {
                         stateRef,
                         consensusFns,
                         snapshotStorage,
+                        chainStore,
                         eventMempool,
                         sidecarClient,
                         tipTracker,
@@ -181,6 +195,7 @@ object SnapshotLeaderLoop {
                         slotRefined,
                         lddConfig,
                         slotsPerEpoch,
+                        lastKnownSlotRef,
                         logger
                       )
 
@@ -227,6 +242,7 @@ object SnapshotLeaderLoop {
     stateRef: Ref[F, LoopState],
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
@@ -244,6 +260,7 @@ object SnapshotLeaderLoop {
     slotRefined: Slot,
     lddConfig: LddConfig,
     slotsPerEpoch: Long,
+    lastKnownSlotRef: Ref[F, Option[Long]],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -301,20 +318,24 @@ object SnapshotLeaderLoop {
               // Sign it (single producer signature — attestations come separately)
               signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)
 
-              // Store in local snapshot chain
-              stored <- snapshotStorage.prepend(signed, context)
-              _ <- Async[F].whenA(!stored) {
-                logger.warn(s"Snapshot at slot $currentSlot failed to store (rejected by sequential check)")
-              }
+              // Store via NakamotoChainStore (handles forks + reorgs)
+              snapshotHashedForStorage <- signed.toHashed[F]
+              parentHashValue = lastHashed.hash
+              stored <- chainStore.store(
+                signed,
+                context,
+                lastKey.value.value + 1,
+                currentSlot,
+                parentHashValue,
+                vrfOutput
+              )
 
               // Update lastGlobalSnapshotStorage + lastNGlobalSnapshotStorage so fork
-              // detection sees the correct chain tip (without this, the gossip-based
-              // fork detector thinks the node is stuck at the genesis ordinal and
-              // triggers spurious fork recovery — crashing the node to WaitingForDownload).
-              snapshotHashedForStorage <- signed.toHashed[F]
+              // detection sees the correct chain tip
               _ <- Async[F].whenA(stored) {
                 lastGlobalSnapshotStorage.set(snapshotHashedForStorage, context) >>
-                  lastNGlobalSnapshotStorage.set(snapshotHashedForStorage, context)
+                  lastNGlobalSnapshotStorage.set(snapshotHashedForStorage, context) >>
+                  lastKnownSlotRef.set(Some(currentSlot))
               }
 
               // Clear included events from mempool (returned events were NOT included)
@@ -335,7 +356,13 @@ object SnapshotLeaderLoop {
                     vrfProof = proof,
                     vrfPublicKey = vrfPK,
                     eta = state.currentEta,
-                    payload = Array.empty, // full snapshot travels via separate mechanism
+                    payload = {
+                      import io.circe.syntax._
+                      val snapshotJson = signed.asJson
+                      val contextJson = context.asJson
+                      val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
+                      combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                    },
                     producerId = selfId.value.value.getBytes
                   )
                 )
@@ -373,11 +400,13 @@ object SnapshotLeaderLoop {
 
           s.copy(
             lastProducedSlot = Some(currentSlot),
+            lastKnownSlot = Some(currentSlot),
             currentEta = nextEta,
             vrfAccumulator = nextAcc,
             totalProduced = s.totalProduced + 1
           )
         }
+
       } yield ()
     } // withCurrent
   }

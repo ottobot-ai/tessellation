@@ -313,10 +313,17 @@ object GlobalSnapshotConsensus {
 
           if (usePureAttestation) {
             // Pure attestation mode: SnapshotLeaderLoop bypasses BFT rounds entirely
+            val pureGenesisTimeMs = sys.env.get("NAKAMOTO_GENESIS_TIME_MS").flatMap(_.toLongOption).getOrElse(0L)
             for {
               stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F]
               _ <- stakeRegistry.updateValidators(seedlist.map(_.map(_.peerId)).getOrElse(Set(selfId)))
               tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry)
+              chainStore <- {
+                val chainSelection = io.constellationnetwork.node.shared.domain.nakamoto.ChainSelection.make[F](tipTracker)
+                io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore
+                  .make[F](globalSnapshotStorage, chainSelection, tipTracker)
+              }
+              lastKnownSlotRef <- cats.effect.kernel.Ref.of[F, Option[Long]](None)
               sidecarConfig = io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarConfig(
                 host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
                 grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
@@ -330,6 +337,7 @@ object GlobalSnapshotConsensus {
                   .run[F](
                     consensusFns = consensusFunctions,
                     snapshotStorage = globalSnapshotStorage,
+                    chainStore = chainStore,
                     lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
                     lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
                     eventMempool = eventMempool,
@@ -340,7 +348,9 @@ object GlobalSnapshotConsensus {
                     keyPair = keyPair,
                     selfId = selfId,
                     lddConfig = lddConfig,
-                    slotsPerEpoch = slotsPerEpoch
+                    slotsPerEpoch = slotsPerEpoch,
+                    lastKnownSlotRef = lastKnownSlotRef,
+                    genesisTimeMs = pureGenesisTimeMs
                   )
                   .compile
                   .drain
@@ -350,13 +360,14 @@ object GlobalSnapshotConsensus {
                 io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon
                   .run[F](
                     channel = sidecarClient.channel,
-                    snapshotStorage = globalSnapshotStorage,
+                    chainStore = chainStore,
                     nodeStorage = nodeStorage,
                     tipTracker = tipTracker,
                     stakeRegistry = stakeRegistry,
                     sidecarClient = sidecarClient,
                     selfId = selfId,
-                    lddConfig = lddConfig
+                    lddConfig = lddConfig,
+                    lastKnownSlotRef = lastKnownSlotRef
                   )
                   .compile
                   .drain
