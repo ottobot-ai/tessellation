@@ -16,6 +16,7 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.Sid
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.TimeTrigger
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.schema._
+import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot._
 import io.constellationnetwork.schema.peer.PeerId
@@ -110,7 +111,7 @@ object SnapshotLeaderLoop {
   def run[F[_]: Async: SecurityProvider: HasherSelector](
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
-    eventMempool: EventMempool[F, GlobalSnapshotEvent, Hash],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
     stakeRegistry: StakeRegistry[F],
@@ -210,7 +211,7 @@ object SnapshotLeaderLoop {
     stateRef: Ref[F, LoopState],
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
-    eventMempool: EventMempool[F, GlobalSnapshotEvent, Hash],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
     stakeRegistry: StakeRegistry[F],

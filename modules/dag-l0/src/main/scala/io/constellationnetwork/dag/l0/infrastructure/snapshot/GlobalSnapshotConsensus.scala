@@ -304,29 +304,68 @@ object GlobalSnapshotConsensus {
       // Start the main consensus loop
       _ <- supervisor.supervise(loop.run.compile.drain)
 
-      // In Nakamoto mode, also start the VRF slot clock daemon
-      _ <- (nakamotoStateRef, nakamotoEnabled) match {
-        case (Some(stateRef), true) =>
-          // Get LDD config from environment or use defaults
+      // In Nakamoto mode, start either the pure attestation loop or BFT trigger daemon
+      _ <-
+        if (nakamotoEnabled) {
           val lddConfig = io.constellationnetwork.schema.nakamoto.LddConfig.Default
           val slotsPerEpoch = sys.env.get("NAKAMOTO_SLOTS_PER_EPOCH").flatMap(_.toLongOption).getOrElse(60L)
-          supervisor
-            .supervise(
-              NakamotoTriggerDaemon
-                .run[F](
-                  consensusQueue = loop.queue,
-                  stateRef = stateRef,
-                  keyPair = keyPair,
-                  selfId = selfId,
-                  lddConfig = lddConfig,
-                  slotsPerEpoch = slotsPerEpoch
-                )
-                .compile
-                .drain
-            )
-            .void
-        case _ => Async[F].unit
-      }
+          val usePureAttestation = sys.env.contains("NAKAMOTO_PURE")
+
+          if (usePureAttestation) {
+            // Pure attestation mode: SnapshotLeaderLoop bypasses BFT rounds entirely
+            for {
+              stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F]
+              _ <- stakeRegistry.updateValidators(seedlist.map(_.map(_.peerId)).getOrElse(Set(selfId)))
+              tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry)
+              sidecarConfig = io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarConfig(
+                host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
+                grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
+              )
+              sidecarClient <- io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
+                .makeResource[F](sidecarConfig)
+                .allocated
+                .map(_._1)
+              _ <- supervisor.supervise(
+                io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
+                  .run[F](
+                    consensusFns = consensusFunctions,
+                    snapshotStorage = globalSnapshotStorage,
+                    eventMempool = eventMempool,
+                    sidecarClient = sidecarClient,
+                    tipTracker = tipTracker,
+                    stakeRegistry = stakeRegistry,
+                    keyPair = keyPair,
+                    selfId = selfId,
+                    lddConfig = lddConfig,
+                    slotsPerEpoch = slotsPerEpoch
+                  )
+                  .compile
+                  .drain
+              )
+            } yield ()
+          } else {
+            // BFT trigger mode: VRF triggers fed into existing round system
+            nakamotoStateRef match {
+              case Some(stateRef) =>
+                supervisor
+                  .supervise(
+                    NakamotoTriggerDaemon
+                      .run[F](
+                        consensusQueue = loop.queue,
+                        stateRef = stateRef,
+                        keyPair = keyPair,
+                        selfId = selfId,
+                        lddConfig = lddConfig,
+                        slotsPerEpoch = slotsPerEpoch
+                      )
+                      .compile
+                      .drain
+                  )
+                  .void
+              case _ => Async[F].unit
+            }
+          }
+        } else Async[F].unit
       consensus = new Consensus(
         handler,
         consensusStorage,
