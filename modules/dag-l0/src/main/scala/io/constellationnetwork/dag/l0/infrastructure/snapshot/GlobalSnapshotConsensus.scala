@@ -324,6 +324,22 @@ object GlobalSnapshotConsensus {
                   .make[F](globalSnapshotStorage, chainSelection, tipTracker)
               }
               lastKnownSlotRef <- cats.effect.kernel.Ref.of[F, Option[Long]](None)
+              // Shared epoch state: VRF outputs from ALL sources accumulate here for eta rotation
+              genesisEta = {
+                val rawPrivKey: Array[Byte] = keyPair.getPrivate match {
+                  case ecKey: java.security.interfaces.ECPrivateKey =>
+                    val bytes = ecKey.getS.toByteArray
+                    if (bytes.length > 32) bytes.drop(bytes.length - 32)
+                    else if (bytes.length < 32) Array.fill(32 - bytes.length)(0.toByte) ++ bytes
+                    else bytes
+                  case other => other.getEncoded.takeRight(32)
+                }
+                io.constellationnetwork.security.vrf.VrfKeyDeriver.deriveVrfSeed(rawPrivKey).take(32)
+              }
+              epochStateRef <- cats.effect.kernel.Ref
+                .of[F, io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState](
+                  io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState.initial(genesisEta)
+                )
               sidecarConfig = io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarConfig(
                 host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
                 grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
@@ -350,6 +366,7 @@ object GlobalSnapshotConsensus {
                     lddConfig = lddConfig,
                     slotsPerEpoch = slotsPerEpoch,
                     lastKnownSlotRef = lastKnownSlotRef,
+                    epochStateRef = epochStateRef,
                     genesisTimeMs = pureGenesisTimeMs
                   )
                   .compile
@@ -367,7 +384,9 @@ object GlobalSnapshotConsensus {
                     sidecarClient = sidecarClient,
                     selfId = selfId,
                     lddConfig = lddConfig,
-                    lastKnownSlotRef = lastKnownSlotRef
+                    lastKnownSlotRef = lastKnownSlotRef,
+                    epochStateRef = epochStateRef,
+                    slotsPerEpoch = slotsPerEpoch
                   )
                   .compile
                   .drain

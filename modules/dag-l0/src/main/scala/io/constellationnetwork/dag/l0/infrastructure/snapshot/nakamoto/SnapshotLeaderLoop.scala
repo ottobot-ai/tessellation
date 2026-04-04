@@ -32,6 +32,37 @@ import eu.timepit.refined.types.numeric.NonNegLong
 import fs2.Stream
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
+/** Shared epoch state — used by BOTH SnapshotLeaderLoop (production) and NakamotoSyncDaemon (gossip).
+  *
+  * VRF outputs from ALL sources (own production + received gossip) are accumulated here. When 2/3 of slotsPerEpoch outputs are collected,
+  * eta rotates — this happens uniformly across all validators, not just producers.
+  */
+final case class SharedEpochState(
+  currentEta: Array[Byte],
+  vrfAccumulator: List[Array[Byte]]
+)
+
+object SharedEpochState {
+  def initial(genesisEta: Array[Byte]): SharedEpochState =
+    SharedEpochState(currentEta = genesisEta, vrfAccumulator = Nil)
+
+  /** Accumulate a VRF output and rotate eta if threshold reached. */
+  def accumulate(
+    state: SharedEpochState,
+    vrfOutput: Array[Byte],
+    currentSlot: Long,
+    slotsPerEpoch: Long
+  ): SharedEpochState = {
+    val newAcc = state.vrfAccumulator :+ vrfOutput
+    if (newAcc.size >= (slotsPerEpoch * 2 / 3).toInt) {
+      val epoch = currentSlot / slotsPerEpoch
+      val nextEta = EligibilityChecker.computeNextEta(state.currentEta, epoch, newAcc)
+      SharedEpochState(currentEta = nextEta, vrfAccumulator = Nil)
+    } else
+      state.copy(vrfAccumulator = newAcc)
+  }
+}
+
 /** Pure attestation-based Nakamoto consensus loop.
   *
   * Replaces the entire BFT round system (Facility → Proposal → Signature → Finished). No multi-party coordination. No rounds. No
@@ -52,19 +83,15 @@ object SnapshotLeaderLoop {
     genesisTimeMs: Long,
     lastProducedSlot: Option[Long],
     lastKnownSlot: Option[Long], // updated on both produce AND gossip receive
-    currentEta: Array[Byte],
-    vrfAccumulator: List[Array[Byte]],
     totalProduced: Long
   )
 
   object LoopState {
-    def initial(genesisTimeMs: Long, genesisEta: Array[Byte]): LoopState =
+    def initial(genesisTimeMs: Long): LoopState =
       LoopState(
         genesisTimeMs = genesisTimeMs,
         lastProducedSlot = None,
         lastKnownSlot = None,
-        currentEta = genesisEta,
-        vrfAccumulator = Nil,
         totalProduced = 0L
       )
   }
@@ -128,6 +155,7 @@ object SnapshotLeaderLoop {
     lddConfig: LddConfig,
     slotsPerEpoch: Long = 60L,
     lastKnownSlotRef: Ref[F, Option[Long]],
+    epochStateRef: Ref[F, SharedEpochState],
     genesisTimeMs: Long = 0L
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
@@ -135,7 +163,7 @@ object SnapshotLeaderLoop {
     // Use shared genesis time if provided, else fall back to wall clock
     val effectiveGenesisTime = if (genesisTimeMs > 0) genesisTimeMs else System.currentTimeMillis()
 
-    Stream.eval(Ref.of[F, LoopState](LoopState.initial(effectiveGenesisTime, vrfSeed.take(32)))).flatMap { stateRef =>
+    Stream.eval(Ref.of[F, LoopState](LoopState.initial(effectiveGenesisTime))).flatMap { stateRef =>
       val slotTick: Stream[F, Unit] = Stream
         .awakeEvery[F](1.second)
         .evalMap { _ =>
@@ -161,12 +189,13 @@ object SnapshotLeaderLoop {
 
                   // Query actual relative stake from registry
                   myStake <- stakeRegistry.relativeStake(selfId)
+                  epochState <- epochStateRef.get
 
                   result = EligibilityChecker.checkEligibility(
                     vrfSK = vrfSeed,
                     slot = slotRefined,
                     slotGap = slotGap,
-                    eta = state.currentEta,
+                    eta = epochState.currentEta,
                     relativeStake = myStake,
                     config = lddConfig
                   )
@@ -196,6 +225,7 @@ object SnapshotLeaderLoop {
                         lddConfig,
                         slotsPerEpoch,
                         lastKnownSlotRef,
+                        epochStateRef,
                         logger
                       )
 
@@ -305,17 +335,19 @@ object SnapshotLeaderLoop {
     lddConfig: LddConfig,
     slotsPerEpoch: Long,
     lastKnownSlotRef: Ref[F, Option[Long]],
+    epochStateRef: Ref[F, SharedEpochState],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     HasherSelector[F].withCurrent { implicit hasher =>
       for {
         state <- stateRef.get
+        epochState <- epochStateRef.get
 
         // Build SlotCertificate with active pool info
         // SlotCertificate fields — will be embedded in snapshot once GlobalIncrementalSnapshot is extended
         _proofHex = Hex(proof.map("%02x".format(_)).mkString)
         _pkHex = Hex(vrfPK.map("%02x".format(_)).mkString)
-        _etaHash = Hash(state.currentEta.map("%02x".format(_)).mkString)
+        _etaHash = Hash(epochState.currentEta.map("%02x".format(_)).mkString)
 
         activePool <- stakeRegistry.activeValidators
         activePoolSize = activePool.size
@@ -400,7 +432,7 @@ object SnapshotLeaderLoop {
                     parentHash = lastHashed.hash.value.getBytes,
                     vrfProof = proof,
                     vrfPublicKey = vrfPK,
-                    eta = state.currentEta,
+                    eta = epochState.currentEta,
                     payload = {
                       import io.circe.syntax._
                       val snapshotJson = signed.asJson
@@ -433,21 +465,13 @@ object SnapshotLeaderLoop {
             logger.warn(s"No head snapshot in storage — skipping slot $currentSlot (genesis not yet loaded?)")
         }
 
-        // Update VRF state (epoch rotation)
-        _ <- stateRef.update { s =>
-          val newAcc = s.vrfAccumulator :+ vrfOutput
-          val (nextEta, nextAcc) =
-            if (newAcc.size >= (slotsPerEpoch * 2 / 3).toInt) {
-              val epoch = currentSlot / slotsPerEpoch
-              (EligibilityChecker.computeNextEta(s.currentEta, epoch, newAcc), Nil)
-            } else
-              (s.currentEta, newAcc)
+        // Update epoch state (shared with NakamotoSyncDaemon)
+        _ <- epochStateRef.update(SharedEpochState.accumulate(_, vrfOutput, currentSlot, slotsPerEpoch))
 
+        _ <- stateRef.update { s =>
           s.copy(
             lastProducedSlot = Some(currentSlot),
             lastKnownSlot = Some(currentSlot),
-            currentEta = nextEta,
-            vrfAccumulator = nextAcc,
             totalProduced = s.totalProduced + 1
           )
         }

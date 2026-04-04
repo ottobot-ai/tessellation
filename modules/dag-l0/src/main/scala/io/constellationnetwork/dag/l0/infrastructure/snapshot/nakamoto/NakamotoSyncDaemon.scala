@@ -48,7 +48,9 @@ object NakamotoSyncDaemon {
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     selfId: peer.PeerId,
     lddConfig: LddConfig,
-    lastKnownSlotRef: Ref[F, Option[Long]]
+    lastKnownSlotRef: Ref[F, Option[Long]],
+    epochStateRef: Ref[F, SharedEpochState],
+    slotsPerEpoch: Long
   ): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
@@ -65,6 +67,8 @@ object NakamotoSyncDaemon {
               sidecarClient,
               selfId,
               lastKnownSlotRef,
+              epochStateRef,
+              slotsPerEpoch,
               logger
             )
 
@@ -87,6 +91,8 @@ object NakamotoSyncDaemon {
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     selfId: peer.PeerId,
     lastKnownSlotRef: Ref[F, Option[Long]],
+    epochStateRef: Ref[F, SharedEpochState],
+    slotsPerEpoch: Long,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     for {
@@ -141,6 +147,19 @@ object NakamotoSyncDaemon {
               logger.warn(s"⚠️ Failed to deserialize snapshot payload: ${err.getMessage}")
           }
         } else Async[F].unit
+
+      // Accumulate VRF output from received snapshot for epoch rotation
+      // This ensures ALL nodes rotate eta uniformly, not just producers
+      _ <- {
+        val vrfProofBytes = snap.vrfProof.toByteArray
+        val vrf = new io.constellationnetwork.security.vrf.EcVrf25519()
+        vrf.vrfProofToHash(vrfProofBytes) match {
+          case Some(vrfOutput) =>
+            epochStateRef.update(SharedEpochState.accumulate(_, vrfOutput, snap.slot, slotsPerEpoch))
+          case None =>
+            logger.warn(s"⚠️ Failed to extract VRF output from proof for slot=${snap.slot}")
+        }
+      }
 
       // Record in TipTracker (snapshot producer attests to their own tip)
       tipHash = Hash(snap.hash.toByteArray.map("%02x".format(_)).mkString)
