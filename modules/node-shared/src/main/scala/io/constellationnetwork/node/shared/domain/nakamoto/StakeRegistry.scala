@@ -20,6 +20,9 @@ trait StakeRegistry[F[_]] {
   /** Total number of active validators */
   def validatorCount: F[Int]
 
+  /** Get the set of active validator PeerIds */
+  def activeValidators: F[Set[PeerId]]
+
   /** Update the validator set (called when new finalized snapshot arrives) */
   def updateValidators(validators: Set[PeerId]): F[Unit]
 }
@@ -49,6 +52,9 @@ object StakeRegistry {
 
         def validatorCount: F[Int] =
           validatorsRef.get.map(_.size)
+
+        def activeValidators: F[Set[PeerId]] =
+          validatorsRef.get
 
         def updateValidators(validators: Set[PeerId]): F[Unit] =
           validatorsRef.set(validators)

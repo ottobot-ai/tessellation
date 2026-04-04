@@ -116,7 +116,9 @@ object NakamotoProposer {
                     slot = currentSlot,
                     vrfProof = VrfProof.fromBytes(proof),
                     vrfPublicKey = VrfPublicKey.fromBytes(vrfVK),
-                    eta = Hash(Hex.fromBytes(eta).value)
+                    eta = Hash(Hex.fromBytes(eta).value),
+                    activePoolSize = 1,
+                    activePoolHash = Hash("0" * 64)
                   )
               }
             }

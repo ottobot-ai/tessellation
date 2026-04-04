@@ -127,6 +127,8 @@ object slot {
     slot: Slot,
     vrfProof: VrfProof,
     vrfPublicKey: VrfPublicKey,
-    eta: Hash
+    eta: Hash,
+    activePoolSize: Int,
+    activePoolHash: Hash
   )
 }

@@ -24,9 +24,9 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** VRF slot-clock daemon that replaces EventTrigger + TimeTrigger.
   *
-  * Every 1 second (1 slot), evaluates VRF eligibility. On a win, feeds `StartRound(TimeTrigger)` into the BFT consensus command queue.
-  * The BFT round machinery (Facility → Proposal → Signature → Finished) then runs as normal, but triggered by VRF lottery instead of
-  * mempool threshold or wall-clock timer.
+  * Every 1 second (1 slot), evaluates VRF eligibility. On a win, feeds `StartRound(TimeTrigger)` into the BFT consensus command queue. The
+  * BFT round machinery (Facility → Proposal → Signature → Finished) then runs as normal, but triggered by VRF lottery instead of mempool
+  * threshold or wall-clock timer.
   *
   * This keeps the BFT finalization intact while replacing the leader election mechanism with Taktikos-style LDD snowplow.
   */
@@ -108,7 +108,7 @@ object NakamotoTriggerDaemon {
               val proofHex = Hex(proof.map("%02x".format(_)).mkString)
               val pkHex = Hex(vrfPK.map("%02x".format(_)).mkString)
               val etaHash = Hash(state.currentEta.map("%02x".format(_)).mkString)
-              val cert = SlotCertificate(slotRefined, VrfProof(proofHex), VrfPublicKey(pkHex), etaHash)
+              val cert = SlotCertificate(slotRefined, VrfProof(proofHex), VrfPublicKey(pkHex), etaHash, 1, Hash("0" * 64))
 
               for {
                 // Update state with slot win
