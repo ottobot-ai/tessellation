@@ -227,11 +227,10 @@ object TipTrackerSuite extends SimpleIOSuite {
       isFinalized <- tracker.isFinalized(tipA)
     } yield
       // 2/3 ≈ 0.6667 which should just barely cross the > 0.6667 threshold
-      // Actually 2/3 = 0.6666... which is NOT > 0.6667
-      // This is the edge case - with 3 validators, 2/3 is exactly 66.67% which is
-      // at the threshold but not above it
+      // 2/3 = 0.6666... which is >= 2.0/3.0 (exact IEEE754 match)
+      // With the >= threshold change, exactly 2-of-3 DOES finalize
       expect(Math.abs(weight - 2.0 / 3.0) < 0.0001) &&
-        expect(!isFinalized) // 0.6666... is NOT > 0.6667
+        expect(isFinalized) // 2/3 >= 2/3 is true
   }
 
   test("chain finalization: when tip at ordinal 100 finalizes, all ancestors are implicitly finalized") {
