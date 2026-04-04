@@ -19,7 +19,7 @@ x-jvm-common: &jvm-common
     NAKAMOTO_SLOTS_PER_EPOCH: "60"
     CL_KEYALIAS: alias
     CL_PASSWORD: password
-    JAVA_OPTS: "-Xmx1g -Xss256k"
+    JAVA_OPTS: "-Xmx1g -Xss256k --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.security=ALL-UNNAMED"
   volumes:
     - ./genesis.csv:/opt/genesis.csv:ro
     - ./seedlist.csv:/opt/seedlist.csv:ro
@@ -64,12 +64,13 @@ services:
       - ../docker/config/local-test-keys/3:/opt/keys:ro
     command: >
       run-genesis
+      /opt/genesis.csv
       --ip node-0
       --public-port 9000
       --p2p-port 9001
       --cli-port 9002
       --seedlist /opt/seedlist.csv
-      --collateral-amount 0
+      --collateral 0
     ports:
       - "9000:9000"
       - "9002:9002"
@@ -115,7 +116,7 @@ services:
       --p2p-port 9011
       --cli-port 9012
       --seedlist /opt/seedlist.csv
-      --collateral-amount 0
+      --collateral 0
     depends_on:
       - sidecar-1
       - node-0
@@ -159,7 +160,7 @@ services:
       --p2p-port 9021
       --cli-port 9022
       --seedlist /opt/seedlist.csv
-      --collateral-amount 0
+      --collateral 0
     depends_on:
       - sidecar-2
       - node-0

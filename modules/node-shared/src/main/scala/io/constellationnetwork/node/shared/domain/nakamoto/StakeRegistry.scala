@@ -61,8 +61,7 @@ object StakeRegistry {
       }
     }
 
-  /** Future: Stake-weighted registry that reads from GlobalSnapshotInfo. Stub for now — will use activeDelegatedStakes +
-    * activeNodeCollaterals.
-    */
+  // Future: Stake-weighted registry that reads from GlobalSnapshotInfo. Stub for now — will use activeDelegatedStakes +
+  // activeNodeCollaterals.
   // def stakeWeighted[F[_]: Sync](snapshotInfo: GlobalSnapshotInfo): F[StakeRegistry[F]] = ???
 }
