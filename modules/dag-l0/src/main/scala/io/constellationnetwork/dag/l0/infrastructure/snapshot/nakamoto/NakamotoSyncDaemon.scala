@@ -3,17 +3,23 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
+import io.constellationnetwork.dag.l0.infrastructure.snapshot._
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
+import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto.{StakeRegistry, TipTracker}
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
+import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.{GossipStream, SidecarClient}
+import io.constellationnetwork.schema._
+import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.nakamoto.{LddConfig, TipAttestation => DomainTipAttestation}
 import io.constellationnetwork.schema.node.NodeState
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, peer}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.{HasherSelector, SecurityProvider}
+import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.security.{Hashed, HasherSelector, SecurityProvider}
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import io.grpc.ManagedChannel
@@ -50,7 +56,9 @@ object NakamotoSyncDaemon {
     lddConfig: LddConfig,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
-    etaRotationSlots: Long
+    etaRotationSlots: Long,
+    consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
+    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo]
   ): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
@@ -71,6 +79,8 @@ object NakamotoSyncDaemon {
               lastKnownSlotRef,
               epochStateRef,
               etaRotationSlots,
+              consensusFns,
+              snapshotStorage,
               logger
             )
 
@@ -84,7 +94,7 @@ object NakamotoSyncDaemon {
     }
   }
 
-  private def handleSnapshot[F[_]: Async: HasherSelector](
+  private def handleSnapshot[F[_]: Async: SecurityProvider: HasherSelector](
     snap: pb.Snapshot,
     stateRef: Ref[F, SyncState],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
@@ -97,6 +107,8 @@ object NakamotoSyncDaemon {
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSlots: Long,
+    consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
+    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     for {
@@ -104,58 +116,105 @@ object NakamotoSyncDaemon {
         s"📥 Received snapshot ordinal=${snap.ordinal} slot=${snap.slot} from=${snap.producerId.toByteArray.take(4).map("%02x".format(_)).mkString}"
       )
 
-      // ── VRF Proof Validation ──
-      // Verify the producer was legitimately elected for this slot
-      producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
-      producerId = peer.PeerId(producerHex)
-      producerStake <- stakeRegistry.relativeStake(producerId)
+      // Deserialize payload
+      parsed =
+        if (snap.payload.size() > 0) {
+          val payloadStr = snap.payload.toByteArray.map(_.toChar).mkString
+          (for {
+            json <- io.circe.parser.parse(payloadStr)
+            snapshotJson <- json.hcursor.get[io.circe.Json]("snapshot")
+            contextJson <- json.hcursor.get[io.circe.Json]("context")
+            snapshot <- snapshotJson.as[Signed[GlobalIncrementalSnapshot]]
+            context <- contextJson.as[GlobalSnapshotInfo]
+          } yield (snapshot, context)).toOption
+        } else None
+
       epochState <- epochStateRef.get
       lastSlot <- lastKnownSlotRef.get
       slotGap = lastSlot.fold(snap.slot)(snap.slot - _)
 
-      vrfValid = {
-        val vrfVK = snap.vrfPublicKey.toByteArray
-        val proof = snap.vrfProof.toByteArray
-        if (vrfVK.isEmpty || proof.isEmpty) {
-          false // Missing VRF data
-        } else {
-          io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker.verifyEligibility(
-            vrfVK = vrfVK,
-            slot = Slot(NonNegLong.unsafeFrom(snap.slot)),
-            slotGap = slotGap,
-            eta = epochState.currentEta,
-            relativeStake = producerStake,
-            config = lddConfig,
-            proof = proof
-          )
-        }
+      // Full validation pipeline: VRF + signature + cert + content
+      validationResult <- parsed match {
+        case Some((signedSnapshot, context)) =>
+          // Get last artifact for content validation
+          snapshotStorage.head.flatMap {
+            case Some((lastSigned, lastCtx)) =>
+              NakamotoSnapshotValidator.validate[F](
+                signedSnapshot = signedSnapshot,
+                context = context,
+                slot = snap.slot,
+                vrfProof = snap.vrfProof.toByteArray,
+                vrfPublicKey = snap.vrfPublicKey.toByteArray,
+                producerIdBytes = snap.producerId.toByteArray,
+                eta = epochState.currentEta,
+                slotGap = slotGap,
+                stakeRegistry = stakeRegistry,
+                lddConfig = lddConfig,
+                consensusFns = consensusFns,
+                lastSignedArtifact = lastSigned,
+                lastContext = lastCtx,
+                getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
+              )
+            case None =>
+              // No previous snapshot — skip content validation, just do VRF + sig
+              NakamotoSnapshotValidator.validate[F](
+                signedSnapshot = signedSnapshot,
+                context = context,
+                slot = snap.slot,
+                vrfProof = snap.vrfProof.toByteArray,
+                vrfPublicKey = snap.vrfPublicKey.toByteArray,
+                producerIdBytes = snap.producerId.toByteArray,
+                eta = epochState.currentEta,
+                slotGap = slotGap,
+                stakeRegistry = stakeRegistry,
+                lddConfig = lddConfig,
+                consensusFns = consensusFns,
+                lastSignedArtifact = signedSnapshot, // self-referential for first snapshot
+                lastContext = context,
+                getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
+              )
+          }
+        case None =>
+          // No payload — fall back to VRF-only validation (legacy/PoC)
+          val vrfVK = snap.vrfPublicKey.toByteArray
+          val proof = snap.vrfProof.toByteArray
+          val producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
+          val producerId = peer.PeerId(producerHex)
+          stakeRegistry.relativeStake(producerId).map { producerStake =>
+            val vrfValid =
+              if (vrfVK.isEmpty || proof.isEmpty) false
+              else
+                io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker.verifyEligibility(
+                  vrfVK = vrfVK,
+                  slot = Slot(NonNegLong.unsafeFrom(snap.slot)),
+                  slotGap = slotGap,
+                  eta = epochState.currentEta,
+                  relativeStake = producerStake,
+                  config = lddConfig,
+                  proof = proof
+                )
+            if (vrfValid) NakamotoSnapshotValidator.Valid(null, null) // VRF-only, no snapshot data
+            else NakamotoSnapshotValidator.Invalid("VRF failed (no payload)")
+          }
       }
 
-      _ <-
-        if (!vrfValid) {
-          logger.warn(
-            s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal} from=${producerHex.value
-                .take(8)} — VRF verification failed (stake=$producerStake, gap=$slotGap)"
+      _ <- (validationResult: NakamotoSnapshotValidator.ValidationResult) match {
+        case NakamotoSnapshotValidator.Valid(_, _) =>
+          processValidSnapshot(
+            snap,
+            stateRef,
+            chainStore,
+            nodeStorage,
+            tipTracker,
+            sidecarClient,
+            selfId,
+            lastKnownSlotRef,
+            epochStateRef,
+            etaRotationSlots,
+            logger
           )
-        } else {
-          logger.debug(s"✅ VRF valid for slot=${snap.slot} from=${producerHex.value.take(8)}")
-        }
-
-      // Skip storage + attestation if VRF is invalid
-      _ <- Async[F].whenA(vrfValid) {
-        processValidSnapshot(
-          snap,
-          stateRef,
-          chainStore,
-          nodeStorage,
-          tipTracker,
-          sidecarClient,
-          selfId,
-          lastKnownSlotRef,
-          epochStateRef,
-          etaRotationSlots,
-          logger
-        )
+        case NakamotoSnapshotValidator.Invalid(reason) =>
+          logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $reason")
       }
     } yield ()
 

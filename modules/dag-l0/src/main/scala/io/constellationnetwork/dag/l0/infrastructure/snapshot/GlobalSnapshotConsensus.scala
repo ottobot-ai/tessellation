@@ -400,7 +400,9 @@ object GlobalSnapshotConsensus {
                     lddConfig = lddConfig,
                     lastKnownSlotRef = lastKnownSlotRef,
                     epochStateRef = epochStateRef,
-                    etaRotationSlots = etaRotationSlots
+                    etaRotationSlots = etaRotationSlots,
+                    consensusFns = consensusFunctions,
+                    snapshotStorage = globalSnapshotStorage
                   )
                   .compile
                   .drain
