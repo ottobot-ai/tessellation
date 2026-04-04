@@ -42,7 +42,7 @@ services:
     command: [
       "-grpc", "0.0.0.0:50051",
       "-listen", "/ip4/0.0.0.0/tcp/9500",
-      "-seedlist", "nakamoto-sidecar-1:9500,nakamoto-sidecar-2:9500"
+      "-seedlist", "/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500"
     ]
     networks:
       nakamoto:
@@ -88,7 +88,7 @@ services:
     command: [
       "-grpc", "0.0.0.0:50051",
       "-listen", "/ip4/0.0.0.0/tcp/9500",
-      "-seedlist", "nakamoto-sidecar-0:9500,nakamoto-sidecar-2:9500"
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500"
     ]
     networks:
       nakamoto:
@@ -132,7 +132,7 @@ services:
     command: [
       "-grpc", "0.0.0.0:50051",
       "-listen", "/ip4/0.0.0.0/tcp/9500",
-      "-seedlist", "nakamoto-sidecar-0:9500,nakamoto-sidecar-1:9500"
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500"
     ]
     networks:
       nakamoto:

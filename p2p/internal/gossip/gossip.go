@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/scasplte2/tessellation/p2p/internal/config"
@@ -110,7 +112,7 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		return nil, fmt.Errorf("subscribe attestation: %w", err)
 	}
 
-	return &Node{
+	node := &Node{
 		Host:             h,
 		PubSub:           ps,
 		snapshotTopic:    snTopic,
@@ -118,7 +120,37 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		snapshotSub:      snSub,
 		attestationSub:   atSub,
 		cfg:              cfg,
-	}, nil
+	}
+
+	// Start mDNS discovery for automatic peer finding on local network / Docker bridge
+	mdnsService := mdns.NewMdnsService(h, "nakamoto-mesh", &mdnsNotifee{host: h, ctx: ctx})
+	if err := mdnsService.Start(); err != nil {
+		fmt.Printf("WARN: mDNS start failed: %v\n", err)
+	} else {
+		fmt.Println("mDNS: peer discovery active (service: nakamoto-mesh)")
+	}
+
+	return node, nil
+}
+
+// mdnsNotifee handles mDNS peer discovery events.
+type mdnsNotifee struct {
+	host host.Host
+	ctx  context.Context
+}
+
+func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if pi.ID == n.host.ID() {
+		return // skip self
+	}
+	fmt.Printf("mDNS: discovered peer %s, connecting...\n", pi.ID.ShortString())
+	ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
+	defer cancel()
+	if err := n.host.Connect(ctx, pi); err != nil {
+		fmt.Printf("mDNS: failed to connect to %s: %v\n", pi.ID.ShortString(), err)
+	} else {
+		fmt.Printf("mDNS: connected to %s\n", pi.ID.ShortString())
+	}
 }
 
 // ConnectSeedlist dials all seedlist peers.
@@ -128,12 +160,16 @@ func (n *Node) ConnectSeedlist(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("invalid seedlist addr %q: %w", addr, err)
 		}
+		// Try full p2p addr first (includes peer ID), fall back to addr-only discovery
 		pi, err := peer.AddrInfoFromP2pAddr(ma)
 		if err != nil {
-			return fmt.Errorf("parse peer info from %q: %w", addr, err)
+			// No peer ID in multiaddr — try connecting by address only.
+			// This requires the remote peer to accept connections without prior ID knowledge.
+			// We'll discover the peer ID during the handshake.
+			fmt.Printf("INFO: seed %s has no peer ID, attempting direct dial\n", addr)
+			pi = &peer.AddrInfo{Addrs: []multiaddr.Multiaddr{ma}}
 		}
 		if err := n.Host.Connect(ctx, *pi); err != nil {
-			// Log but don't fail — some seeds may be down
 			fmt.Printf("WARN: failed to connect to seed %s: %v\n", addr, err)
 		}
 	}

@@ -58,7 +58,18 @@ object NakamotoSyncDaemon {
       GossipStream.subscribe[F](channel).evalMap { msg =>
         msg.body match {
           case pb.GossipMessage.Body.Snapshot(snap) =>
-            handleSnapshot(snap, stateRef, snapshotStorage, nodeStorage, tipTracker, stakeRegistry, sidecarClient, selfId, lddConfig, logger)
+            handleSnapshot(
+              snap,
+              stateRef,
+              snapshotStorage,
+              nodeStorage,
+              tipTracker,
+              stakeRegistry,
+              sidecarClient,
+              selfId,
+              lddConfig,
+              logger
+            )
 
           case pb.GossipMessage.Body.Attestation(att) =>
             handleAttestation(att, tipTracker, logger)
@@ -155,9 +166,9 @@ object NakamotoSyncDaemon {
     val attestedAtSlot = Slot(eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(att.attestedAt))
     val domainAtt = DomainTipAttestation(tipHash, tipSlot, att.tipOrdinal, attestedAtSlot)
     tipTracker.recordAttestation(attesterId, domainAtt) >>
-    logger.debug(
-      s"📨 Attestation for ordinal=${att.tipOrdinal} slot=${att.tipSlot} from=${attesterHex.value.take(8)}"
-    )
+      logger.debug(
+        s"📨 Attestation for ordinal=${att.tipOrdinal} slot=${att.tipSlot} from=${attesterHex.value.take(8)}"
+      )
   }
 
   private def emitAttestation[F[_]: Async](
