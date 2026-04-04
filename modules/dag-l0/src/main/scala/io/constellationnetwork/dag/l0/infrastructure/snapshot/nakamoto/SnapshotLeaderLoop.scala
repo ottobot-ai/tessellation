@@ -211,24 +211,37 @@ object SnapshotLeaderLoop {
 
       // Finality monitor: check attestation threshold periodically
       val finalityMonitor: Stream[F, Unit] = Stream
-        .awakeEvery[F](2.seconds)
+        .awakeEvery[F](5.seconds)
         .evalMap { _ =>
           for {
+            allAtts <- tipTracker.allAttestations
             heaviest <- tipTracker.heaviestTip
+            validatorCount <- stakeRegistry.validatorCount
             _ <- heaviest match {
-              case Some((hash, slot, weight)) if weight > TipTracker.FinalityThreshold =>
-                for {
-                  alreadyFinalized <- tipTracker.lastFinalized
-                  isNew = alreadyFinalized.forall { case (fh, _) => fh =!= hash }
-                  _ <- Async[F].whenA(isNew) {
-                    tipTracker.markFinalized(hash, slot) >>
-                      tipTracker.pruneBelow(slot) >>
-                      logger.info(
-                        s"✅ FINALIZED snapshot at slot ${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f".format(weight)})"
-                      )
-                  }
-                } yield ()
-              case _ => Async[F].unit
+              case Some((hash, slot, weight)) =>
+                val attestersForTip = allAtts.count { case (_, att) => att.tipHash === hash }
+                logger.info(
+                  s"📊 Attestations: tip=${hash.value.take(12)}.. slot=${slot.value.value} weight=${"%0.2f"
+                      .format(weight)} (${attestersForTip}/${validatorCount} validators)"
+                ) >>
+                  (if (weight > TipTracker.FinalityThreshold) {
+                     for {
+                       alreadyFinalized <- tipTracker.lastFinalized
+                       isNew = alreadyFinalized.forall { case (fh, _) => fh =!= hash }
+                       _ <- Async[F].whenA(isNew) {
+                         tipTracker.markFinalized(hash, slot) >>
+                           tipTracker.pruneBelow(slot) >>
+                           logger.info(
+                             s"✅ FINALIZED snapshot at slot ${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%0.2f"
+                                 .format(weight)}, ${attestersForTip}/${validatorCount} attesters)"
+                           )
+                       }
+                     } yield ()
+                   } else Async[F].unit)
+              case None =>
+                Async[F].whenA(allAtts.nonEmpty) {
+                  logger.info(s"📊 Attestations: ${allAtts.size} attesters, no heaviest tip")
+                }
             }
           } yield ()
         }

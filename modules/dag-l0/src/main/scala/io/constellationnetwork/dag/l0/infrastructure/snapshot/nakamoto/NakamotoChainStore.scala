@@ -18,14 +18,13 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Nakamoto-aware chain storage that handles forks and reorgs.
   *
-  * Unlike tessellation's linear SnapshotStorage.prepend (which rejects non-sequential parents),
-  * this store maintains:
+  * Unlike tessellation's linear SnapshotStorage.prepend (which rejects non-sequential parents), this store maintains:
   *   - A map of all known snapshots by hash
   *   - The current "best tip" as determined by ChainSelection
   *   - Proper reorg support: when a better chain is received, update the canonical head
   *
-  * It wraps the underlying SnapshotStorage for actual persistence, using setHeadForRecovery
-  * only during reorgs (which is appropriate — it IS a recovery from a shorter/weaker chain).
+  * It wraps the underlying SnapshotStorage for actual persistence, using setHeadForRecovery only during reorgs (which is appropriate — it
+  * IS a recovery from a shorter/weaker chain).
   */
 object NakamotoChainStore {
 
@@ -40,9 +39,9 @@ object NakamotoChainStore {
   )
 
   case class ChainState(
-    byHash: Map[Hash, StoredSnapshot],          // All known snapshots indexed by hash
-    bestTipHash: Option[Hash],                   // Current best chain tip hash
-    lastFinalizedOrdinal: Long                   // Last finalized ordinal — snapshots below this can be pruned
+    byHash: Map[Hash, StoredSnapshot], // All known snapshots indexed by hash
+    bestTipHash: Option[Hash], // Current best chain tip hash
+    lastFinalizedOrdinal: Long // Last finalized ordinal — snapshots below this can be pruned
   )
 
   object ChainState {
@@ -51,8 +50,8 @@ object NakamotoChainStore {
 
   trait NakamotoChainStoreAlgebra[F[_]] {
 
-    /** Store a new snapshot. If it extends the best chain or creates a better fork, update the tip.
-      * Returns true if the snapshot was new (not a duplicate).
+    /** Store a new snapshot. If it extends the best chain or creates a better fork, update the tip. Returns true if the snapshot was new
+      * (not a duplicate).
       */
     def store(
       signedSnapshot: Signed[GlobalIncrementalSnapshot],
@@ -93,7 +92,7 @@ object NakamotoChainStore {
           slot: Long,
           parentHash: Hash,
           vrfOutput: Array[Byte]
-        ): F[Boolean] = {
+        ): F[Boolean] =
           HasherSelector[F].withCurrent { implicit hasher =>
             signedSnapshot.toHashed[F].flatMap { hashed =>
               val snapshotHash = hashed.hash
@@ -118,9 +117,14 @@ object NakamotoChainStore {
                     case None =>
                       // First snapshot — it's automatically the best
                       val newState = state.copy(byHash = newByHash, bestTipHash = Some(snapshotHash))
-                      (newState, persistHead(stored, snapshotHash) >> logger.info(
-                        s"🏗️ Chain initialized at ordinal=$ordinal slot=$slot"
-                      ).as(true))
+                      (
+                        newState,
+                        persistHead(stored, snapshotHash) >> logger
+                          .info(
+                            s"🏗️ Chain initialized at ordinal=$ordinal slot=$slot"
+                          )
+                          .as(true)
+                      )
 
                     case Some(currentBestHash) =>
                       val currentBest = state.byHash(currentBestHash)
@@ -139,9 +143,11 @@ object NakamotoChainStore {
                           // Better chain — reorg
                           stateRef.update(_.copy(bestTipHash = Some(snapshotHash))) >>
                             persistHead(stored, snapshotHash) >>
-                            logger.info(
-                              s"🔄 Chain reorg: ordinal=$ordinal slot=$slot beats previous tip ordinal=${currentBest.ordinal} slot=${currentBest.slot}"
-                            ).as(true)
+                            logger
+                              .info(
+                                s"🔄 Chain reorg: ordinal=$ordinal slot=$slot beats previous tip ordinal=${currentBest.ordinal} slot=${currentBest.slot}"
+                              )
+                              .as(true)
 
                         case false if parentHash === currentBestHash =>
                           // Extends current chain — normal case
@@ -151,9 +157,11 @@ object NakamotoChainStore {
 
                         case false =>
                           // Weaker fork — store but don't switch
-                          logger.debug(
-                            s"🔀 Stored fork snapshot ordinal=$ordinal slot=$slot (not switching)"
-                          ).as(true)
+                          logger
+                            .debug(
+                              s"🔀 Stored fork snapshot ordinal=$ordinal slot=$slot (not switching)"
+                            )
+                            .as(true)
                       }
 
                       (newState, effect)
@@ -162,7 +170,6 @@ object NakamotoChainStore {
               }.flatten
             }
           }
-        }
 
         def bestTip: F[Option[StoredSnapshot]] =
           stateRef.get.map(s => s.bestTipHash.flatMap(s.byHash.get))
@@ -176,7 +183,7 @@ object NakamotoChainStore {
         def chainFromTip: F[List[StoredSnapshot]] =
           stateRef.get.map { state =>
             state.bestTipHash match {
-              case None => Nil
+              case None          => Nil
               case Some(tipHash) =>
                 // Walk back from tip through parents
                 val chain = scala.collection.mutable.ListBuffer.empty[StoredSnapshot]

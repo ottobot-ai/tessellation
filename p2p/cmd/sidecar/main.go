@@ -20,14 +20,16 @@ func main() {
 
 	// CLI flags
 	var (
-		listenAddrs string
-		seedlist    string
-		httpAddr    string
+		listenAddrs    string
+		seedlist       string
+		httpAddr       string
+		enableHTTP     bool
 	)
 	flag.StringVar(&listenAddrs, "listen", "/ip4/0.0.0.0/tcp/9500", "comma-separated libp2p listen multiaddrs")
 	flag.StringVar(&seedlist, "seedlist", "", "comma-separated bootstrap peer multiaddrs")
 	flag.StringVar(&cfg.GRPCAddr, "grpc", cfg.GRPCAddr, "gRPC listen address for JVM")
-	flag.StringVar(&httpAddr, "http", "127.0.0.1:50052", "HTTP bridge listen address for JVM")
+	flag.StringVar(&httpAddr, "http", "127.0.0.1:50052", "HTTP bridge listen address (debug/fallback)")
+	flag.BoolVar(&enableHTTP, "enable-http", false, "enable HTTP bridge (debug/fallback, gRPC is the primary interface)")
 	flag.StringVar(&cfg.PrivateKeyPath, "key", "", "path to Ed25519 private key file")
 	flag.StringVar(&cfg.MetricsAddr, "metrics", "", "Prometheus metrics address (empty = disabled)")
 	flag.Parse()
@@ -66,7 +68,6 @@ func main() {
 	}
 	fmt.Printf("  Topics: %s, %s\n", cfg.SnapshotTopic, cfg.AttestationTopic)
 	fmt.Printf("  gRPC:   %s\n", cfg.GRPCAddr)
-	fmt.Printf("  HTTP:   %s\n", httpAddr)
 
 	// Connect to seedlist
 	if len(cfg.Seedlist) > 0 {
@@ -75,17 +76,20 @@ func main() {
 		}
 	}
 
-	// Start HTTP bridge
-	bridge := httpbridge.New(node)
-	go func() {
-		<-ctx.Done()
-		bridge.Stop()
-	}()
-	go func() {
-		if err := bridge.Start(httpAddr); err != nil && ctx.Err() == nil {
-			fmt.Fprintf(os.Stderr, "WARN: HTTP bridge: %v\n", err)
-		}
-	}()
+	// HTTP bridge — opt-in debug/fallback (gRPC is the primary JVM interface)
+	if enableHTTP {
+		fmt.Printf("  HTTP:   %s (debug/fallback)\n", httpAddr)
+		bridge := httpbridge.New(node)
+		go func() {
+			<-ctx.Done()
+			bridge.Stop()
+		}()
+		go func() {
+			if err := bridge.Start(httpAddr); err != nil && ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "WARN: HTTP bridge: %v\n", err)
+			}
+		}()
+	}
 
 	// Start gRPC server (blocks until shutdown)
 	srv := grpcserver.New(node)

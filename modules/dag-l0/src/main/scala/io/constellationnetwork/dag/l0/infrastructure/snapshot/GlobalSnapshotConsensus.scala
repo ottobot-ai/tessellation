@@ -301,8 +301,8 @@ object GlobalSnapshotConsensus {
       // In Nakamoto mode, triggerEvent is a no-op (slot clock handles all triggering)
       triggerEvent = if (nakamotoEnabled) Async[F].unit else loop.queue.offer(ConsensusCommand.FacilitateByEvent)
 
-      // Start the main consensus loop
-      _ <- supervisor.supervise(loop.run.compile.drain)
+      // Only start BFT consensus loop in non-Nakamoto mode
+      _ <- if (nakamotoEnabled) Async[F].unit else supervisor.supervise(loop.run.compile.drain)
 
       // In Nakamoto mode, start either the pure attestation loop or BFT trigger daemon
       _ <-

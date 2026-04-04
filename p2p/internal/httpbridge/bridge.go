@@ -1,3 +1,6 @@
+// Package httpbridge provides an HTTP/JSON fallback interface for the sidecar.
+// This is NOT the primary JVM↔sidecar interface — gRPC is.
+// Enable with -enable-http flag for debugging or when gRPC is unavailable.
 package httpbridge
 
 import (
