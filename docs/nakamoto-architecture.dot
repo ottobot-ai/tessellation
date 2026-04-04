@@ -1,0 +1,178 @@
+digraph NakamotoArchitecture {
+  rankdir=TB;
+  compound=true;
+  fontname="Helvetica";
+  node [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled", fillcolor="#f0f0f0"];
+  edge [fontname="Helvetica", fontsize=9];
+
+  // ═══════════════════════════════════════════
+  // LAYER 1: NETWORK (Go sidecar)
+  // ═══════════════════════════════════════════
+  subgraph cluster_network {
+    label="Network Layer (Go libp2p sidecar)";
+    style="filled"; fillcolor="#e8f4e8";
+
+    gossipsub [label="GossipSub\n(snapshots + attestations)", fillcolor="#c8e8c8"];
+    mdns [label="mDNS Discovery", fillcolor="#c8e8c8"];
+    bootstrap [label="Bootstrap Peers\n(seedlist multiaddrs)", fillcolor="#c8e8c8"];
+    peerex [label="Peer Exchange\n(GossipSub PX)", fillcolor="#ffe8c8", style="rounded,filled,dashed"];
+    grpc_server [label="gRPC Server\n(:50051)", fillcolor="#c8e8c8"];
+
+    mdns -> gossipsub [label="peer found"];
+    bootstrap -> gossipsub [label="dial"];
+    peerex -> gossipsub [label="share peers", style=dashed];
+  }
+
+  // ═══════════════════════════════════════════
+  // LAYER 2: CONSENSUS (Scala)
+  // ═══════════════════════════════════════════
+  subgraph cluster_consensus {
+    label="Consensus Layer";
+    style="filled"; fillcolor="#e8e8f4";
+
+    subgraph cluster_production {
+      label="Slot Leader Election";
+      style="filled"; fillcolor="#d8d8f0";
+
+      slot_clock [label="Slot Clock\n(1s ticks, shared genesis time)", fillcolor="#c8c8e8"];
+      vrf [label="VRF Evaluation\n(EcVrf25519 + LDD threshold)", fillcolor="#c8c8e8"];
+      eligibility [label="EligibilityChecker\n(threshold = 1-(1-f(δ))^stake)", fillcolor="#c8c8e8"];
+      stake_reg [label="StakeRegistry\n(equal weight → stake-proportional)", fillcolor="#c8c8e8"];
+
+      slot_clock -> vrf [label="current slot"];
+      vrf -> eligibility [label="proof + output"];
+      stake_reg -> eligibility [label="relative stake"];
+    }
+
+    subgraph cluster_attestation {
+      label="Attestation & Finality";
+      style="filled"; fillcolor="#d8d8f0";
+
+      tip_tracker [label="TipTracker\n(attestation weight per tip)", fillcolor="#c8c8e8"];
+      chain_sel [label="ChainSelection\n(length→weight→slot→hash)", fillcolor="#c8c8e8"];
+      finality [label="FinalityMonitor\n(weight>2/3 OR depth>k)", fillcolor="#c8c8e8"];
+
+      tip_tracker -> chain_sel [label="weighted tips"];
+      tip_tracker -> finality [label="attestation counts"];
+    }
+
+    subgraph cluster_eta {
+      label="Epoch Randomness";
+      style="filled"; fillcolor="#d8d8f0";
+
+      eta_calc [label="EtaCalculation\n(chain-derived, Bifrost-style)", fillcolor="#ffe8c8", style="rounded,filled,dashed"];
+      eta_field [label="eta field in\nGlobalIncrementalSnapshot", fillcolor="#ffe8c8", style="rounded,filled,dashed"];
+
+      eta_calc -> eta_field [label="stored on-chain", style=dashed];
+      eta_field -> vrf [label="epoch randomness", style=dashed];
+    }
+
+    // Cross-subgraph edges
+    eligibility -> snapshot_leader [label="eligible → produce"];
+
+    snapshot_leader [label="SnapshotLeaderLoop\n(production + receive + finality)", fillcolor="#a8c8e8", style="rounded,filled,bold"];
+    sync_daemon [label="NakamotoSyncDaemon\n(gossip handler)", fillcolor="#a8c8e8", style="rounded,filled,bold"];
+
+    snapshot_leader -> tip_tracker [label="self-attest"];
+    sync_daemon -> tip_tracker [label="record attestation"];
+    sync_daemon -> chain_sel [label="store snapshot"];
+  }
+
+  // ═══════════════════════════════════════════
+  // LAYER 3: STATE TRANSITION (existing tessellation)
+  // ═══════════════════════════════════════════
+  subgraph cluster_state {
+    label="State Transition Pipeline\n(reused from BFT mode)";
+    style="filled"; fillcolor="#f4e8e8";
+
+    create_proposal [label="createProposalArtifact\n(deterministic snapshot builder)", fillcolor="#e8c8c8", style="rounded,filled,bold"];
+
+    subgraph cluster_state_inner {
+      label="State Processing";
+      style="filled"; fillcolor="#f0d8d8";
+
+      event_mempool [label="EventMempool\n(DAG blocks, SC events)", fillcolor="#e8c8c8"];
+      rewards [label="Rewards Calculator\n(delegation, distribution)", fillcolor="#e8c8c8"];
+      sc_processor [label="StateChannel\nProcessor", fillcolor="#e8c8c8"];
+      mpt_update [label="MPT State Update\n(balances, txRefs, stakes)", fillcolor="#e8c8c8"];
+      state_proof [label="StateProof\n(mptRoot verification)", fillcolor="#e8c8c8"];
+      dag_acceptance [label="DAG Block\nAcceptance", fillcolor="#e8c8c8"];
+    }
+
+    event_mempool -> create_proposal [label="drain events"];
+    create_proposal -> dag_acceptance [label="accept blocks"];
+    create_proposal -> sc_processor [label="process state channels"];
+    create_proposal -> rewards [label="compute rewards"];
+    create_proposal -> mpt_update [label="update state"];
+    mpt_update -> state_proof [label="compute proof"];
+  }
+
+  // ═══════════════════════════════════════════
+  // LAYER 4: STORAGE
+  // ═══════════════════════════════════════════
+  subgraph cluster_storage {
+    label="Storage Layer";
+    style="filled"; fillcolor="#f4f4e8";
+
+    nakamoto_chain [label="NakamotoChainStorage\n(fork-aware, indexed by hash)", fillcolor="#ffe8c8", style="rounded,filled,dashed"];
+    snapshot_store [label="SnapshotStorage\n(existing, linear)", fillcolor="#e8e8c8"];
+    mpt_store [label="MptStore\n(Merkle Patricia Trie)", fillcolor="#e8e8c8"];
+    last_n [label="LastNGlobalSnapshot\n(recent window)", fillcolor="#e8e8c8"];
+
+    nakamoto_chain -> snapshot_store [label="finalized snapshots\npromoted to linear", style=dashed];
+  }
+
+  // ═══════════════════════════════════════════
+  // LAYER 5: NODE LIFECYCLE
+  // ═══════════════════════════════════════════
+  subgraph cluster_lifecycle {
+    label="Node Lifecycle";
+    style="filled"; fillcolor="#f0e8f4";
+
+    run_nakamoto [label="RunNakamoto\n(shared genesis start)", fillcolor="#d8c8e8"];
+    run_validator_nak [label="RunNakamotoValidator\n(join existing chain)", fillcolor="#ffe8c8", style="rounded,filled,dashed"];
+    download_nak [label="NakamotoDownload\n(bulk sync from peers)", fillcolor="#ffe8c8", style="rounded,filled,dashed"];
+
+    run_nakamoto -> snapshot_leader [label="genesis → Ready"];
+    run_validator_nak -> download_nak [label="sync chain", style=dashed];
+    download_nak -> nakamoto_chain [label="store + verify", style=dashed];
+    download_nak -> snapshot_leader [label="caught up → produce", style=dashed];
+  }
+
+  // ═══════════════════════════════════════════
+  // CROSS-LAYER CONNECTIONS
+  // ═══════════════════════════════════════════
+
+  // Network ↔ Consensus
+  grpc_server -> snapshot_leader [label="publish snapshot", dir=back];
+  grpc_server -> sync_daemon [label="subscribe (incoming gossip)"];
+  grpc_server -> sync_daemon [label="publish attestation", dir=back];
+
+  // Consensus → State Transition
+  snapshot_leader -> create_proposal [label="on slot win:\ndrain mempool + build snapshot", style=bold, color="#0066cc"];
+
+  // Consensus → Storage
+  snapshot_leader -> nakamoto_chain [label="store own production", style=dashed];
+  sync_daemon -> nakamoto_chain [label="store gossip snapshots", style=dashed];
+  chain_sel -> nakamoto_chain [label="query tips", style=dashed];
+  create_proposal -> snapshot_store [label="read last artifact + context"];
+
+  // State → Storage
+  mpt_update -> mpt_store [label="sync state"];
+
+  // ═══════════════════════════════════════════
+  // LEGEND
+  // ═══════════════════════════════════════════
+  subgraph cluster_legend {
+    label="Legend";
+    style="filled"; fillcolor="white";
+    rank=sink;
+
+    existing [label="Existing / Working", fillcolor="#c8e8c8"];
+    needed [label="Needs Implementation", fillcolor="#ffe8c8", style="rounded,filled,dashed"];
+    core [label="Core Component", fillcolor="#a8c8e8", style="rounded,filled,bold"];
+
+    existing -> needed [style=invis];
+    needed -> core [style=invis];
+  }
+}

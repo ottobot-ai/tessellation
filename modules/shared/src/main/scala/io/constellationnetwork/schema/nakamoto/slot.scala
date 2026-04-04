@@ -126,6 +126,7 @@ object slot {
   case class SlotCertificate(
     slot: Slot,
     vrfProof: VrfProof,
+    vrfOutput: VrfOutput,
     vrfPublicKey: VrfPublicKey,
     eta: Hash,
     activePoolSize: Int,

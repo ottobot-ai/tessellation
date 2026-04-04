@@ -348,18 +348,28 @@ object SnapshotLeaderLoop {
         state <- stateRef.get
         epochState <- epochStateRef.get
 
-        // Build SlotCertificate with active pool info
-        // SlotCertificate fields — will be embedded in snapshot once GlobalIncrementalSnapshot is extended
-        _proofHex = Hex(proof.map("%02x".format(_)).mkString)
-        _pkHex = Hex(vrfPK.map("%02x".format(_)).mkString)
-        _etaHash = Hash(epochState.currentEta.map("%02x".format(_)).mkString)
+        // Build SlotCertificate
+        proofHex = Hex(proof.map("%02x".format(_)).mkString)
+        vrfOutputHex = Hex(vrfOutput.map("%02x".format(_)).mkString)
+        pkHex = Hex(vrfPK.map("%02x".format(_)).mkString)
+        etaHash = Hash(epochState.currentEta.map("%02x".format(_)).mkString)
 
         activePool <- stakeRegistry.activeValidators
         activePoolSize = activePool.size
         activePoolHashBytes = java.security.MessageDigest
           .getInstance("SHA-256")
           .digest(activePool.toList.map(_.value.value).sorted.mkString(",").getBytes("UTF-8"))
-        _activePoolHash = Hash(activePoolHashBytes.map("%02x".format(_)).mkString)
+        activePoolHash = Hash(activePoolHashBytes.map("%02x".format(_)).mkString)
+
+        cert = SlotCertificate(
+          slot = slotRefined,
+          vrfProof = VrfProof(proofHex),
+          vrfOutput = VrfOutput(vrfOutputHex),
+          vrfPublicKey = VrfPublicKey(pkHex),
+          eta = etaHash,
+          activePoolSize = activePoolSize,
+          activePoolHash = activePoolHash
+        )
 
         _ <- logger.info(s"🎰 WON slot $currentSlot (gap=$slotGap, pool=$activePoolSize) — producing snapshot")
 
@@ -394,7 +404,10 @@ object SnapshotLeaderLoop {
                   }
               )
 
-              (artifact, context, returnedEvents) = result
+              (rawArtifact, context, returnedEvents) = result
+
+              // Attach SlotCertificate and eta to artifact before signing
+              artifact = rawArtifact.copy(slotCertificate = Some(cert), eta = Some(etaHash))
 
               // Sign it (single producer signature — attestations come separately)
               signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)

@@ -122,7 +122,8 @@ case class GlobalIncrementalSnapshot(
   activeNodeCollaterals: Option[SortedMap[Address, List[Signed[UpdateNodeCollateral.Create]]]],
   nodeCollateralWithdrawals: Option[SortedMap[Address, List[Signed[UpdateNodeCollateral.Withdraw]]]],
   version: SnapshotVersion = SnapshotVersion("0.0.1"),
-  slotCertificate: Option[io.constellationnetwork.schema.nakamoto.slot.SlotCertificate] = None
+  slotCertificate: Option[io.constellationnetwork.schema.nakamoto.slot.SlotCertificate] = None,
+  eta: Option[io.constellationnetwork.security.hash.Hash] = None
 ) extends IncrementalSnapshot[GlobalSnapshotStateProof]
 
 object GlobalIncrementalSnapshot {
