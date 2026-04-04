@@ -9,9 +9,9 @@ import (
 	"github.com/libp2p/go-libp2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/host"
+	libp2pnet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
-	libp2pnoise "github.com/libp2p/go-libp2p/p2p/security/noise"
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/scasplte2/tessellation/p2p/internal/config"
@@ -47,7 +47,9 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 	h, err := libp2p.New(
 		libp2p.ListenAddrs(listenAddrs...),
 		libp2p.ForceReachabilityPrivate(),
-		libp2p.Security(libp2pnoise.ID, libp2pnoise.New),
+		// Use default security (TLS + Noise) — Noise-only has simultaneous-connect
+		// issues in Docker where both sides try to initiate at the same time
+		libp2p.DefaultSecurity,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create libp2p host: %w", err)
@@ -146,14 +148,32 @@ func (n *mdnsNotifee) HandlePeerFound(pi peer.AddrInfo) {
 	if pi.ID == n.host.ID() {
 		return // skip self
 	}
-	fmt.Printf("mDNS: discovered peer %s, connecting...\n", pi.ID.ShortString())
-	ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
-	defer cancel()
-	if err := n.host.Connect(ctx, pi); err != nil {
-		fmt.Printf("mDNS: failed to connect to %s: %v\n", pi.ID.ShortString(), err)
-	} else {
-		fmt.Printf("mDNS: connected to %s\n", pi.ID.ShortString())
+	// Already connected? Skip.
+	if n.host.Network().Connectedness(pi.ID) == libp2pnet.Connected {
+		return
 	}
+	// Retry with backoff to handle simultaneous-connect race conditions
+	go func() {
+		for attempt := 0; attempt < 5; attempt++ {
+			if attempt > 0 {
+				// Stagger retries: 1s + random jitter up to 2s
+				jitter := time.Duration(n.host.ID()[0]%20) * 100 * time.Millisecond
+				time.Sleep(time.Duration(attempt)*time.Second + jitter)
+			}
+			if n.host.Network().Connectedness(pi.ID) == libp2pnet.Connected {
+				return
+			}
+			ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
+			err := n.host.Connect(ctx, pi)
+			cancel()
+			if err == nil {
+				fmt.Printf("mDNS: connected to %s (attempt %d)\n", pi.ID.ShortString(), attempt+1)
+				return
+			}
+			fmt.Printf("mDNS: connect attempt %d to %s failed: %v\n", attempt+1, pi.ID.ShortString(), err)
+		}
+		fmt.Printf("mDNS: giving up on %s after 5 attempts\n", pi.ID.ShortString())
+	}()
 }
 
 // ConnectSeedlist dials all seedlist peers.
