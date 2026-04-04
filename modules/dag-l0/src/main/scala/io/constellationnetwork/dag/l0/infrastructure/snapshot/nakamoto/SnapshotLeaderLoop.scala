@@ -209,7 +209,14 @@ object SnapshotLeaderLoop {
           } yield ()
         }
 
-      // Finality monitor: check attestation threshold periodically
+      // Dual finality: attestation weight (fast) OR confirmation depth k (slow fallback)
+      // finalized = attestation_weight > 2/3  OR  depth > k
+      // This ensures finality works with any cluster size:
+      //   - 1 node: depth-only (no attestations possible)
+      //   - 2 nodes: depth-only (can't reach 2/3+1)
+      //   - 3+ nodes: attestation finality kicks in (fast)
+      val ConfirmationDepthK: Long = 6L // Nakamoto-style confirmation depth
+
       val finalityMonitor: Stream[F, Unit] = Stream
         .awakeEvery[F](5.seconds)
         .evalMap { _ =>
@@ -217,6 +224,28 @@ object SnapshotLeaderLoop {
             allAtts <- tipTracker.allAttestations
             heaviest <- tipTracker.heaviestTip
             validatorCount <- stakeRegistry.validatorCount
+            bestTip <- chainStore.bestTip
+            alreadyFinalized <- tipTracker.lastFinalized
+            lastFinalizedOrdinal = alreadyFinalized.map { case (_, s) => s.value.value }.getOrElse(0L)
+
+            // Check depth-based finality: any snapshot with k+ blocks on top is final
+            depthFinalized <- bestTip match {
+              case Some(tip) if tip.ordinal - lastFinalizedOrdinal > ConfirmationDepthK =>
+                // Finalize up to (tip.ordinal - k)
+                val finalizeAtOrdinal = tip.ordinal - ConfirmationDepthK
+                val finalizeAtSlot = Slot(eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(
+                  math.max(0L, tip.slot - ConfirmationDepthK)
+                ))
+                val depthHash = Hash(s"depth-finalized-$finalizeAtOrdinal")
+                tipTracker.markFinalized(depthHash, finalizeAtSlot) >>
+                  tipTracker.pruneBelow(finalizeAtSlot) >>
+                  logger.info(
+                    s"✅ DEPTH-FINALIZED at ordinal=$finalizeAtOrdinal (tip=${tip.ordinal}, k=$ConfirmationDepthK)"
+                  ).as(true)
+              case _ => Async[F].pure(false)
+            }
+
+            // Check attestation-based finality (fast path)
             _ <- heaviest match {
               case Some((hash, slot, weight)) =>
                 val attestersForTip = allAtts.count { case (_, att) => att.tipHash === hash }
@@ -226,18 +255,15 @@ object SnapshotLeaderLoop {
                       .format(weight)} (${attestersForTip}/${validatorCount} validators) peers=[${peerIds}]"
                 ) >>
                   (if (weight > TipTracker.FinalityThreshold) {
-                     for {
-                       alreadyFinalized <- tipTracker.lastFinalized
-                       isNew = alreadyFinalized.forall { case (fh, _) => fh =!= hash }
-                       _ <- Async[F].whenA(isNew) {
-                         tipTracker.markFinalized(hash, slot) >>
-                           tipTracker.pruneBelow(slot) >>
-                           logger.info(
-                             s"✅ FINALIZED snapshot at slot ${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
-                                 .format(weight)}, ${attestersForTip}/${validatorCount} attesters)"
-                           )
-                       }
-                     } yield ()
+                     val isNew = alreadyFinalized.forall { case (fh, _) => fh =!= hash }
+                     Async[F].whenA(isNew && !depthFinalized) {
+                       tipTracker.markFinalized(hash, slot) >>
+                         tipTracker.pruneBelow(slot) >>
+                         logger.info(
+                           s"✅ ATTEST-FINALIZED snapshot at slot ${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
+                               .format(weight)}, ${attestersForTip}/${validatorCount} attesters)"
+                         )
+                     }
                    } else Async[F].unit)
               case None =>
                 Async[F].whenA(allAtts.nonEmpty) {
