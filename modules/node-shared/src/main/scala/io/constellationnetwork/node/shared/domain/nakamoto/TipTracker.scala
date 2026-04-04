@@ -48,7 +48,7 @@ object TipTracker {
     * must attest to a tip for it to finalize. With N=3, need 2/3 = 0.667 → finalized. With N=4, need 3/4 = 0.75 > 0.6667 → finalized (2/4 =
     * 0.5 not finalized).
     */
-  val FinalityThreshold: Double = 0.6667
+  val FinalityThreshold: Double = 2.0 / 3.0  // exactly 2/3 so >= works with equal-weight registries
 
   def make[F[_]: Sync](stakeRegistry: StakeRegistry[F]): F[TipTracker[F]] =
     for {
@@ -82,7 +82,7 @@ object TipTracker {
           } yield weights.sum
 
         def isFinalized(tipHash: Hash): F[Boolean] =
-          attestationWeight(tipHash).map(_ > FinalityThreshold)
+          attestationWeight(tipHash).map(_ >= FinalityThreshold)
 
         def heaviestTip: F[Option[(Hash, Slot, Double)]] =
           for {

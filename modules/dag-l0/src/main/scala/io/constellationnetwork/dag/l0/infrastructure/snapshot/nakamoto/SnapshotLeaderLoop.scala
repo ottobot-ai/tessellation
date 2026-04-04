@@ -258,7 +258,7 @@ object SnapshotLeaderLoop {
                   s"📊 Attestations: tip=${hash.value.take(12)}.. slot=${slot.value.value} weight=${"%.2f"
                       .format(weight)} (${attestersForTip}/${validatorCount} validators) peers=[${peerIds}]"
                 ) >>
-                  (if (weight > TipTracker.FinalityThreshold) {
+                  (if (weight >= TipTracker.FinalityThreshold) {
                      val isNew = alreadyFinalized.forall { case (fh, _) => fh =!= hash }
                      Async[F].whenA(isNew && !depthFinalized) {
                        tipTracker.markFinalized(hash, slot) >>
