@@ -46,17 +46,19 @@ object SharedEpochState {
   def initial(genesisEta: Array[Byte]): SharedEpochState =
     SharedEpochState(currentEta = genesisEta, vrfAccumulator = Nil)
 
-  /** Accumulate a VRF output and rotate eta if threshold reached. */
+  /** Accumulate a VRF output and rotate eta if threshold reached. Eta rotates every `etaRotationSlots` (default 600 = 10 minutes), not
+    * every epoch. This follows Cardano/Bifrost pattern where eta is long-lived (Cardano uses ~5 days).
+    */
   def accumulate(
     state: SharedEpochState,
     vrfOutput: Array[Byte],
     currentSlot: Long,
-    slotsPerEpoch: Long
+    etaRotationSlots: Long
   ): SharedEpochState = {
     val newAcc = state.vrfAccumulator :+ vrfOutput
-    if (newAcc.size >= (slotsPerEpoch * 2 / 3).toInt) {
-      val epoch = currentSlot / slotsPerEpoch
-      val nextEta = EligibilityChecker.computeNextEta(state.currentEta, epoch, newAcc)
+    if (newAcc.size >= (etaRotationSlots * 2 / 3).toInt) {
+      val rotationEpoch = currentSlot / etaRotationSlots
+      val nextEta = EligibilityChecker.computeNextEta(state.currentEta, rotationEpoch, newAcc)
       SharedEpochState(currentEta = nextEta, vrfAccumulator = Nil)
     } else
       state.copy(vrfAccumulator = newAcc)
@@ -137,7 +139,9 @@ object SnapshotLeaderLoop {
     * @param lddConfig
     *   LDD snowplow parameters
     * @param slotsPerEpoch
-    *   slots per epoch for eta rotation (default 60)
+    *   slots per epoch (default 60, for time labels only)
+    * @param etaRotationSlots
+    *   slots per eta rotation period (default 600 = 10 minutes). Eta is long-lived — Cardano uses ~5 days.
     */
   def run[F[_]: Async: SecurityProvider: HasherSelector](
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
@@ -154,6 +158,7 @@ object SnapshotLeaderLoop {
     selfId: PeerId,
     lddConfig: LddConfig,
     slotsPerEpoch: Long = 60L,
+    etaRotationSlots: Long = 600L,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     genesisTimeMs: Long = 0L
@@ -223,7 +228,7 @@ object SnapshotLeaderLoop {
                         slotGap,
                         slotRefined,
                         lddConfig,
-                        slotsPerEpoch,
+                        etaRotationSlots,
                         lastKnownSlotRef,
                         epochStateRef,
                         logger
@@ -333,7 +338,7 @@ object SnapshotLeaderLoop {
     slotGap: Long,
     slotRefined: Slot,
     lddConfig: LddConfig,
-    slotsPerEpoch: Long,
+    etaRotationSlots: Long,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     logger: org.typelevel.log4cats.Logger[F]
@@ -466,7 +471,7 @@ object SnapshotLeaderLoop {
         }
 
         // Update epoch state (shared with NakamotoSyncDaemon)
-        _ <- epochStateRef.update(SharedEpochState.accumulate(_, vrfOutput, currentSlot, slotsPerEpoch))
+        _ <- epochStateRef.update(SharedEpochState.accumulate(_, vrfOutput, currentSlot, etaRotationSlots))
 
         _ <- stateRef.update { s =>
           s.copy(

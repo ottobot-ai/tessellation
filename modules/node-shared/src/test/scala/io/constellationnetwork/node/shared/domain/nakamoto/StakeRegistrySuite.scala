@@ -92,8 +92,8 @@ object StakeRegistrySuite extends SimpleIOSuite {
       stakePeer3After <- registry.relativeStake(peer3)
     } yield
       expect.same(0.5, stakePeer1Before) &&
-      expect.same(0.0, stakePeer1After) &&
-      expect.same(1.0, stakePeer3After)
+        expect.same(0.0, stakePeer1After) &&
+        expect.same(1.0, stakePeer3After)
   }
 
   test("allStakes sums to ~1.0 within floating point tolerance") {
@@ -129,7 +129,7 @@ object StakeRegistrySuite extends SimpleIOSuite {
       count <- registry.validatorCount
     } yield
       expect.same(1.0, stakeBefore) &&
-      expect.same(0.0, stakeAfter) &&
-      expect.same(0, count)
+        expect.same(0.0, stakeAfter) &&
+        expect.same(0, count)
   }
 }

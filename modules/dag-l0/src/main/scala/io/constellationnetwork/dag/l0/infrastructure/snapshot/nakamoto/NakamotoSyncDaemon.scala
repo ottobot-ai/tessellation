@@ -50,7 +50,7 @@ object NakamotoSyncDaemon {
     lddConfig: LddConfig,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
-    slotsPerEpoch: Long
+    etaRotationSlots: Long
   ): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
@@ -68,7 +68,7 @@ object NakamotoSyncDaemon {
               selfId,
               lastKnownSlotRef,
               epochStateRef,
-              slotsPerEpoch,
+              etaRotationSlots,
               logger
             )
 
@@ -92,7 +92,7 @@ object NakamotoSyncDaemon {
     selfId: peer.PeerId,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
-    slotsPerEpoch: Long,
+    etaRotationSlots: Long,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     for {
@@ -155,7 +155,7 @@ object NakamotoSyncDaemon {
         val vrf = new io.constellationnetwork.security.vrf.EcVrf25519()
         vrf.vrfProofToHash(vrfProofBytes) match {
           case Some(vrfOutput) =>
-            epochStateRef.update(SharedEpochState.accumulate(_, vrfOutput, snap.slot, slotsPerEpoch))
+            epochStateRef.update(SharedEpochState.accumulate(_, vrfOutput, snap.slot, etaRotationSlots))
           case None =>
             logger.warn(s"⚠️ Failed to extract VRF output from proof for slot=${snap.slot}")
         }

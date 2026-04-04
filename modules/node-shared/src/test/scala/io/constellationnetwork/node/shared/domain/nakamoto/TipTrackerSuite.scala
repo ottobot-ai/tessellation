@@ -59,9 +59,9 @@ object TipTrackerSuite extends SimpleIOSuite {
       heaviest <- tracker.heaviestTip
     } yield
       expect(heaviest.isDefined) &&
-      expect.same(tipA, heaviest.get._1) &&
-      expect.same(slotA, heaviest.get._2) &&
-      expect(Math.abs(heaviest.get._3 - 1.0) < 0.0001)
+        expect.same(tipA, heaviest.get._1) &&
+        expect.same(slotA, heaviest.get._2) &&
+        expect(Math.abs(heaviest.get._3 - 1.0) < 0.0001)
   }
 
   test("majority attestation reaches finality (3 of 4 peers attest same tip → >2/3 weight)") {
@@ -81,7 +81,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       weight <- tracker.attestationWeight(tipA)
     } yield
       expect(isFinalized) &&
-      expect(Math.abs(weight - 0.75) < 0.0001)
+        expect(Math.abs(weight - 0.75) < 0.0001)
   }
 
   test("newer attestation supersedes older from same peer") {
@@ -99,8 +99,8 @@ object TipTrackerSuite extends SimpleIOSuite {
       weightB <- tracker.attestationWeight(tipB)
     } yield
       expect(Math.abs(weightABefore - 1.0) < 0.0001) &&
-      expect(Math.abs(weightAAfter - 0.0) < 0.0001) &&
-      expect(Math.abs(weightB - 1.0) < 0.0001)
+        expect(Math.abs(weightAAfter - 0.0) < 0.0001) &&
+        expect(Math.abs(weightB - 1.0) < 0.0001)
   }
 
   test("split attestations (2 peers on tip A, 2 on tip B → neither finalized with equal weight)") {
@@ -123,9 +123,9 @@ object TipTrackerSuite extends SimpleIOSuite {
       weightB <- tracker.attestationWeight(tipB)
     } yield
       expect(!isFinalizedA) &&
-      expect(!isFinalizedB) &&
-      expect(Math.abs(weightA - 0.5) < 0.0001) &&
-      expect(Math.abs(weightB - 0.5) < 0.0001)
+        expect(!isFinalizedB) &&
+        expect(Math.abs(weightA - 0.5) < 0.0001) &&
+        expect(Math.abs(weightB - 0.5) < 0.0001)
   }
 
   test("attestationWeight returns 0 for unknown tip") {
@@ -151,7 +151,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       after <- tracker.lastFinalized
     } yield
       expect.same(None, before) &&
-      expect.same(Some((tipA, slot(10))), after)
+        expect.same(Some((tipA, slot(10))), after)
   }
 
   test("pruneBelow removes old attestations") {
@@ -169,9 +169,9 @@ object TipTrackerSuite extends SimpleIOSuite {
       afterPrune <- tracker.allAttestations
     } yield
       expect.same(2, beforePrune.size) &&
-      expect.same(1, afterPrune.size) &&
-      expect(afterPrune.contains(peer2)) &&
-      expect(!afterPrune.contains(peer1))
+        expect.same(1, afterPrune.size) &&
+        expect(afterPrune.contains(peer2)) &&
+        expect(!afterPrune.contains(peer1))
   }
 
   test("fork choice: heaviestTip returns tip with most weight") {
@@ -190,8 +190,8 @@ object TipTrackerSuite extends SimpleIOSuite {
       heaviest <- tracker.heaviestTip
     } yield
       expect(heaviest.isDefined) &&
-      expect.same(tipA, heaviest.get._1) &&
-      expect(Math.abs(heaviest.get._3 - 2.0 / 3.0) < 0.0001)
+        expect.same(tipA, heaviest.get._1) &&
+        expect(Math.abs(heaviest.get._3 - 2.0 / 3.0) < 0.0001)
   }
 
   test("attestation from non-validator (zero stake) doesn't count toward finality") {
@@ -209,7 +209,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       isFinalized <- tracker.isFinalized(tipA)
     } yield
       expect.same(0.0, weight) &&
-      expect(!isFinalized)
+        expect(!isFinalized)
   }
 
   test("2/3+1 threshold: exactly 2 of 3 validators is 0.667 (borderline, should finalize)") {
@@ -231,7 +231,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       // This is the edge case - with 3 validators, 2/3 is exactly 66.67% which is
       // at the threshold but not above it
       expect(Math.abs(weight - 2.0 / 3.0) < 0.0001) &&
-      expect(!isFinalized) // 0.6666... is NOT > 0.6667
+        expect(!isFinalized) // 0.6666... is NOT > 0.6667
   }
 
   test("chain finalization: when tip at ordinal 100 finalizes, all ancestors are implicitly finalized") {
@@ -267,7 +267,7 @@ object TipTrackerSuite extends SimpleIOSuite {
     } yield
       // tipB should still have weight since its attestation was newer
       expect.same(0.0, weightA) &&
-      expect(Math.abs(weightB - 1.0) < 0.0001)
+        expect(Math.abs(weightB - 1.0) < 0.0001)
   }
 
   test("allAttestations returns all current attestations") {
@@ -283,7 +283,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       all <- tracker.allAttestations
     } yield
       expect.same(2, all.size) &&
-      expect(all.get(peer1).exists(_.tipHash == tipA)) &&
-      expect(all.get(peer2).exists(_.tipHash == tipB))
+        expect(all.get(peer1).exists(_.tipHash == tipA)) &&
+        expect(all.get(peer2).exists(_.tipHash == tipB))
   }
 }

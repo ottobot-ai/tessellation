@@ -307,14 +307,27 @@ object GlobalSnapshotConsensus {
       // In Nakamoto mode, start either the pure attestation loop or BFT trigger daemon
       _ <-
         if (nakamotoEnabled) {
-          val lddConfig = io.constellationnetwork.schema.nakamoto.LddConfig.Default
+          val lddConfig = {
+            val default = io.constellationnetwork.schema.nakamoto.LddConfig.Default
+            io.constellationnetwork.schema.nakamoto.LddConfig(
+              lddCutoff = sys.env.get("NAKAMOTO_LDD_CUTOFF").flatMap(_.toIntOption).getOrElse(default.lddCutoff),
+              offset = sys.env.get("NAKAMOTO_LDD_OFFSET").flatMap(_.toIntOption).getOrElse(default.offset),
+              baselineDifficulty = sys.env.get("NAKAMOTO_LDD_BASELINE").flatMap(_.toDoubleOption).getOrElse(default.baselineDifficulty),
+              amplitude = sys.env.get("NAKAMOTO_LDD_AMPLITUDE").flatMap(_.toDoubleOption).getOrElse(default.amplitude)
+            )
+          }
           val slotsPerEpoch = sys.env.get("NAKAMOTO_SLOTS_PER_EPOCH").flatMap(_.toLongOption).getOrElse(60L)
+          val etaRotationSlots = sys.env.get("NAKAMOTO_ETA_ROTATION_SLOTS").flatMap(_.toLongOption).getOrElse(600L)
           val usePureAttestation = sys.env.contains("NAKAMOTO_PURE")
 
           if (usePureAttestation) {
             // Pure attestation mode: SnapshotLeaderLoop bypasses BFT rounds entirely
             val pureGenesisTimeMs = sys.env.get("NAKAMOTO_GENESIS_TIME_MS").flatMap(_.toLongOption).getOrElse(0L)
             for {
+              nakLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("NakamotoConsensus").pure[F]
+              _ <- nakLogger.info(
+                s"🔧 Nakamoto config: LDD(cutoff=${lddConfig.lddCutoff}, offset=${lddConfig.offset}, baseline=${lddConfig.baselineDifficulty}, amplitude=${lddConfig.amplitude}), etaRotation=${etaRotationSlots}s, slotsPerEpoch=${slotsPerEpoch}, genesisTime=${pureGenesisTimeMs}"
+              )
               stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F]
               _ <- stakeRegistry.updateValidators(seedlist.map(_.map(_.peerId)).getOrElse(Set(selfId)))
               tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry)
@@ -365,6 +378,7 @@ object GlobalSnapshotConsensus {
                     selfId = selfId,
                     lddConfig = lddConfig,
                     slotsPerEpoch = slotsPerEpoch,
+                    etaRotationSlots = etaRotationSlots,
                     lastKnownSlotRef = lastKnownSlotRef,
                     epochStateRef = epochStateRef,
                     genesisTimeMs = pureGenesisTimeMs
@@ -386,7 +400,7 @@ object GlobalSnapshotConsensus {
                     lddConfig = lddConfig,
                     lastKnownSlotRef = lastKnownSlotRef,
                     epochStateRef = epochStateRef,
-                    slotsPerEpoch = slotsPerEpoch
+                    etaRotationSlots = etaRotationSlots
                   )
                   .compile
                   .drain

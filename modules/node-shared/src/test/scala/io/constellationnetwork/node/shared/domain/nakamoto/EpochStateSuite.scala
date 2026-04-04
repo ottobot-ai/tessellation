@@ -126,7 +126,7 @@ object EpochStateSuite extends SimpleIOSuite {
     } yield
       // Even with no outputs, eta changes due to epoch number contribution
       expect(!etaBefore.sameElements(etaAfter)) &&
-      expect(newEta.sameElements(etaAfter))
+        expect(newEta.sameElements(etaAfter))
   }
 
   test("computeNextEta is deterministic") {
