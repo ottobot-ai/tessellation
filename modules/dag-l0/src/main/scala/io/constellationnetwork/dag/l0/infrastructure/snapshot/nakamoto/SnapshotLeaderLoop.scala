@@ -221,7 +221,7 @@ object SnapshotLeaderLoop {
               case Some((hash, slot, weight)) =>
                 val attestersForTip = allAtts.count { case (_, att) => att.tipHash === hash }
                 logger.info(
-                  s"📊 Attestations: tip=${hash.value.take(12)}.. slot=${slot.value.value} weight=${"%0.2f"
+                  s"📊 Attestations: tip=${hash.value.take(12)}.. slot=${slot.value.value} weight=${"%.2f"
                       .format(weight)} (${attestersForTip}/${validatorCount} validators)"
                 ) >>
                   (if (weight > TipTracker.FinalityThreshold) {
@@ -232,7 +232,7 @@ object SnapshotLeaderLoop {
                          tipTracker.markFinalized(hash, slot) >>
                            tipTracker.pruneBelow(slot) >>
                            logger.info(
-                             s"✅ FINALIZED snapshot at slot ${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%0.2f"
+                             s"✅ FINALIZED snapshot at slot ${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
                                  .format(weight)}, ${attestersForTip}/${validatorCount} attesters)"
                            )
                        }
