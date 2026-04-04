@@ -137,13 +137,10 @@ object NakamotoSyncDaemon {
               s"✅ Caught up to network tip (local=$localOrdinal, network=${state.networkTipOrdinal}). Transitioning to Ready."
             )
             _ <- stateRef.update(_.copy(isReady = true, localTipOrdinal = localOrdinal))
-            // Note: We can't directly set NodeState.Ready here because the existing
-            // state machine has specific valid transitions. For PoC, the SnapshotLeaderLoop
-            // already checks nodeState. We need the node to reach Ready through the
-            // existing join flow OR we need to add a Nakamoto-specific transition.
-            //
-            // For now, log the readiness. The actual Ready transition happens when
-            // the existing download path completes OR we add a bypass.
+            // Force transition to Ready — in Nakamoto mode, subscribing to gossip
+            // and catching up IS the join process. No BFT enrollment needed.
+            _ <- nodeStorage.setNodeState(NodeState.Ready)
+            _ <- logger.info(s"🟢 Node state set to Ready — VRF slot production will begin")
           } yield ()
         }
       }

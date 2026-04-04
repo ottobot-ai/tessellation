@@ -45,6 +45,7 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 	// Create libp2p host
 	h, err := libp2p.New(
 		libp2p.ListenAddrs(listenAddrs...),
+		libp2p.ForceReachabilityPrivate(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create libp2p host: %w", err)
