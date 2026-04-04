@@ -220,9 +220,10 @@ object SnapshotLeaderLoop {
             _ <- heaviest match {
               case Some((hash, slot, weight)) =>
                 val attestersForTip = allAtts.count { case (_, att) => att.tipHash === hash }
+                val peerIds = allAtts.keys.map(_.value.value.take(8)).mkString(",")
                 logger.info(
                   s"📊 Attestations: tip=${hash.value.take(12)}.. slot=${slot.value.value} weight=${"%.2f"
-                      .format(weight)} (${attestersForTip}/${validatorCount} validators)"
+                      .format(weight)} (${attestersForTip}/${validatorCount} validators) peers=[${peerIds}]"
                 ) >>
                   (if (weight > TipTracker.FinalityThreshold) {
                      for {
@@ -376,7 +377,7 @@ object SnapshotLeaderLoop {
                       val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
                       combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
                     },
-                    producerId = selfId.value.value.getBytes
+                    producerId = selfId.value.toBytes
                   )
                 )
                 .void

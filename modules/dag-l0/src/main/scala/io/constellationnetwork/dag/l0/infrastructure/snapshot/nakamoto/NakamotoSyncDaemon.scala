@@ -180,7 +180,9 @@ object NakamotoSyncDaemon {
     val attestedAtSlot = Slot(NonNegLong.unsafeFrom(att.attestedAt))
     val domainAtt = DomainTipAttestation(tipHash, tipSlot, att.tipOrdinal, attestedAtSlot)
     tipTracker.recordAttestation(attesterId, domainAtt) >>
-      logger.debug(s"📨 Attestation for ordinal=${att.tipOrdinal} from=${attesterHex.value.take(8)}")
+      logger.info(
+        s"📨 Attestation for ordinal=${att.tipOrdinal} from=${attesterHex.value.take(16)}... rawLen=${att.attesterId.toByteArray.length}"
+      )
   }
 
   private def emitAttestation[F[_]: Async](
