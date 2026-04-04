@@ -10,7 +10,7 @@ import scala.concurrent.duration._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
-import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, StakeRegistry, TipTracker}
+import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
@@ -39,12 +39,13 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   */
 final case class SharedEpochState(
   currentEta: Array[Byte],
+  genesisEta: Array[Byte],
   vrfAccumulator: List[Array[Byte]]
 )
 
 object SharedEpochState {
   def initial(genesisEta: Array[Byte]): SharedEpochState =
-    SharedEpochState(currentEta = genesisEta, vrfAccumulator = Nil)
+    SharedEpochState(currentEta = genesisEta, genesisEta = genesisEta, vrfAccumulator = Nil)
 
   /** Accumulate a VRF output and rotate eta if threshold reached. Eta rotates every `etaRotationSlots` (default 600 = 10 minutes), not
     * every epoch. This follows Cardano/Bifrost pattern where eta is long-lived (Cardano uses ~5 days).
@@ -59,7 +60,7 @@ object SharedEpochState {
     if (newAcc.size >= (etaRotationSlots * 2 / 3).toInt) {
       val rotationEpoch = currentSlot / etaRotationSlots
       val nextEta = EligibilityChecker.computeNextEta(state.currentEta, rotationEpoch, newAcc)
-      SharedEpochState(currentEta = nextEta, vrfAccumulator = Nil)
+      SharedEpochState(currentEta = nextEta, genesisEta = state.genesisEta, vrfAccumulator = Nil)
     } else
       state.copy(vrfAccumulator = newAcc)
   }
@@ -194,13 +195,29 @@ object SnapshotLeaderLoop {
 
                   // Query actual relative stake from registry
                   myStake <- stakeRegistry.relativeStake(selfId)
+
+                  // Chain-derived eta: use EtaCalculation for periods >= 2, fall back to SharedEpochState
+                  currentPeriod = EtaCalculation.rotationPeriod(currentSlot, etaRotationSlots)
                   epochState <- epochStateRef.get
+                  eta <-
+                    if (currentPeriod <= 1) {
+                      Async[F].pure(epochState.currentEta)
+                    } else {
+                      chainStore.vrfOutputsForPeriod(currentPeriod - 1, etaRotationSlots).map { chainOutputs =>
+                        if (chainOutputs.nonEmpty) {
+                          EtaCalculation.computeEta(epochState.genesisEta, currentPeriod, chainOutputs.map(_._2))
+                        } else {
+                          // No chain data yet for this period — fall back to accumulator
+                          epochState.currentEta
+                        }
+                      }
+                    }
 
                   result = EligibilityChecker.checkEligibility(
                     vrfSK = vrfSeed,
                     slot = slotRefined,
                     slotGap = slotGap,
-                    eta = epochState.currentEta,
+                    eta = eta,
                     relativeStake = myStake,
                     config = lddConfig
                   )
@@ -224,6 +241,7 @@ object SnapshotLeaderLoop {
                         vrfPK,
                         proof,
                         vrfOutput,
+                        eta,
                         currentSlot,
                         slotGap,
                         slotRefined,
@@ -276,6 +294,7 @@ object SnapshotLeaderLoop {
                 val depthHash = Hash(s"depth-finalized-$finalizeAtOrdinal")
                 tipTracker.markFinalized(depthHash, finalizeAtSlot) >>
                   tipTracker.pruneBelow(finalizeAtSlot) >>
+                  chainStore.finalize(depthHash, finalizeAtOrdinal) >>
                   logger
                     .info(
                       s"✅ DEPTH-FINALIZED at ordinal=$finalizeAtOrdinal (tip=${tip.ordinal}, k=$ConfirmationDepthK)"
@@ -298,6 +317,10 @@ object SnapshotLeaderLoop {
                      Async[F].whenA(isNew && !depthFinalized) {
                        tipTracker.markFinalized(hash, slot) >>
                          tipTracker.pruneBelow(slot) >>
+                         chainStore.get(hash).flatMap {
+                           case Some(stored) => chainStore.finalize(hash, stored.ordinal)
+                           case None         => Async[F].unit
+                         } >>
                          logger.info(
                            s"✅ ATTEST-FINALIZED snapshot at slot ${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
                                .format(weight)}, ${attestersForTip}/${validatorCount} attesters)"
@@ -334,6 +357,7 @@ object SnapshotLeaderLoop {
     vrfPK: Array[Byte],
     proof: Array[Byte],
     vrfOutput: Array[Byte],
+    currentEta: Array[Byte],
     currentSlot: Long,
     slotGap: Long,
     slotRefined: Slot,
@@ -346,13 +370,11 @@ object SnapshotLeaderLoop {
     HasherSelector[F].withCurrent { implicit hasher =>
       for {
         state <- stateRef.get
-        epochState <- epochStateRef.get
-
-        // Build SlotCertificate
+        // Build SlotCertificate — use the chain-derived eta that was used for VRF evaluation
         proofHex = Hex(proof.map("%02x".format(_)).mkString)
         vrfOutputHex = Hex(vrfOutput.map("%02x".format(_)).mkString)
         pkHex = Hex(vrfPK.map("%02x".format(_)).mkString)
-        etaHash = Hash(epochState.currentEta.map("%02x".format(_)).mkString)
+        etaHash = Hash(currentEta.map("%02x".format(_)).mkString)
 
         activePool <- stakeRegistry.activeValidators
         activePoolSize = activePool.size
@@ -450,7 +472,7 @@ object SnapshotLeaderLoop {
                     parentHash = lastHashed.hash.value.getBytes,
                     vrfProof = proof,
                     vrfPublicKey = vrfPK,
-                    eta = epochState.currentEta,
+                    eta = currentEta,
                     payload = {
                       import io.circe.syntax._
                       val snapshotJson = signed.asJson

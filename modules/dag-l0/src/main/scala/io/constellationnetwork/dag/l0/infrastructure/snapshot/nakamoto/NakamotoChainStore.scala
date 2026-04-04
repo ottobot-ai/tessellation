@@ -7,7 +7,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.{ChainSelection, TipT
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.schema.nakamoto.ChainTip
 import io.constellationnetwork.schema.nakamoto.slot.{Slot, VrfOutput}
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, SnapshotOrdinal}
+import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
@@ -35,7 +35,8 @@ object NakamotoChainStore {
     ordinal: Long,
     slot: Long,
     parentHash: Hash,
-    hash: Hash
+    hash: Hash,
+    vrfOutput: Array[Byte] = Array.empty
   )
 
   case class ChainState(
@@ -73,6 +74,17 @@ object NakamotoChainStore {
 
     /** Get the chain of snapshots from tip back to genesis (or pruning point) */
     def chainFromTip: F[List[StoredSnapshot]]
+
+    /** Get VRF outputs for snapshots in the first 2/3 of a rotation period (for eta calculation) */
+    def vrfOutputsForPeriod(period: Long, etaRotationSlots: Long): F[List[(Long, Array[Byte])]]
+
+    /** Mark a snapshot as finalized and prune older fork branches. Keeps the finalized chain but removes orphaned snapshots with ordinal <=
+      * finalizedOrdinal that aren't ancestors of the finalized tip.
+      */
+    def finalize(hash: Hash, ordinal: Long): F[Unit]
+
+    /** Get current chain state size (number of stored snapshots) */
+    def size: F[Int]
   }
 
   def make[F[_]: Async: HasherSelector](
@@ -96,7 +108,7 @@ object NakamotoChainStore {
           HasherSelector[F].withCurrent { implicit hasher =>
             signedSnapshot.toHashed[F].flatMap { hashed =>
               val snapshotHash = hashed.hash
-              val stored = StoredSnapshot(signedSnapshot, context, ordinal, slot, parentHash, snapshotHash)
+              val stored = StoredSnapshot(signedSnapshot, context, ordinal, slot, parentHash, snapshotHash, vrfOutput)
               val vrfHex = VrfOutput(Hex(vrfOutput.map("%02x".format(_)).mkString))
               val newTip = ChainTip(
                 snapshotHash,
@@ -195,6 +207,42 @@ object NakamotoChainStore {
                 chain.toList
             }
           }
+
+        def vrfOutputsForPeriod(period: Long, etaRotationSlots: Long): F[List[(Long, Array[Byte])]] =
+          stateRef.get.map { state =>
+            val periodStart = period * etaRotationSlots
+            val cutoff = periodStart + (etaRotationSlots * 2 / 3)
+            state.byHash.values.toList
+              .filter(s => s.slot >= periodStart && s.slot < cutoff && s.vrfOutput.nonEmpty)
+              .sortBy(_.slot)
+              .map(s => (s.slot, s.vrfOutput))
+          }
+
+        def finalize(hash: Hash, ordinal: Long): F[Unit] =
+          stateRef.modify { state =>
+            // Collect hashes on the canonical chain from finalized tip backward
+            val canonicalHashes = scala.collection.mutable.Set.empty[Hash]
+            var current = state.byHash.get(hash)
+            while (current.isDefined) {
+              canonicalHashes += current.get.hash
+              current = state.byHash.get(current.get.parentHash)
+            }
+
+            // Prune: remove snapshots with ordinal <= finalized that aren't on canonical chain
+            val pruned = state.byHash.filter {
+              case (h, s) =>
+                s.ordinal > ordinal || canonicalHashes.contains(h)
+            }
+            val prunedCount = state.byHash.size - pruned.size
+
+            (
+              state.copy(byHash = pruned, lastFinalizedOrdinal = ordinal),
+              logger.info(s"🔒 Finalized ordinal=$ordinal, pruned $prunedCount orphan snapshots (${pruned.size} remaining)")
+            )
+          }.flatten
+
+        def size: F[Int] =
+          stateRef.get.map(_.byHash.size)
 
         /** Persist to underlying storage by extending the linear chain */
         private def persistLinear(stored: StoredSnapshot)(implicit hasher: Hasher[F]): F[Unit] =

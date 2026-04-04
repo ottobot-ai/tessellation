@@ -513,6 +513,94 @@ object Main
             services.cluster.createSession >>
             services.session.createSession >>
             storages.node.setNodeState(NodeState.Ready)
+
+        case m: RunNakamotoValidator =>
+          // Nakamoto validator: download latest snapshot from a peer, initialize, then produce.
+          // NakamotoSyncDaemon will handle catching up; once caught up, SnapshotLeaderLoop produces.
+          storages.node.tryModifyState(
+            NodeState.Initial,
+            NodeState.WaitingForDownload,
+            NodeState.Ready
+          ) {
+            import org.http4s.client.Client
+            import org.http4s.ember.client.EmberClientBuilder
+            import org.http4s.circe.CirceEntityDecoder._
+            import org.http4s.Uri
+
+            val peerUri = Uri.unsafeFromString(m.peerToJoin)
+
+            EmberClientBuilder.default[IO].build.use { client =>
+              for {
+                _ <- IO(println(s"\uD83D\uDD17 Downloading latest snapshot from ${m.peerToJoin}..."))
+
+                // Download latest snapshot from peer's public HTTP API
+                latestSnapshot <- client.expect[Signed[GlobalIncrementalSnapshot]](
+                  peerUri / "global-snapshots" / "latest"
+                )
+
+                // Download the snapshot info/context
+                latestInfo <- client.expect[GlobalSnapshotInfo](
+                  peerUri / "global-snapshots" / "latest" / "info"
+                )
+
+                _ <- IO(println(s"\uD83D\uDCE6 Got snapshot ordinal=${latestSnapshot.ordinal}"))
+
+                hashedSnapshot <- hasherSelector.withCurrent { implicit hasher =>
+                  latestSnapshot.toHashed[IO]
+                }
+
+                // Initialize storages with the downloaded snapshot
+                _ <- hasherSelector.withCurrent { implicit hasher =>
+                  initializeStorages[IO](
+                    storages.globalSnapshot,
+                    sharedStorages.lastNGlobalSnapshot,
+                    sharedStorages.lastGlobalSnapshot,
+                    programs.download,
+                    hashedSnapshot,
+                    latestInfo
+                  )
+                }
+
+                kvPairs <- hasherSelector.withCurrent { implicit hasher =>
+                  latestInfo.allStateEntries[IO](
+                    Async[IO],
+                    Parallel[IO],
+                    hasher,
+                    jsonSerializer,
+                    globalStateProofSelector
+                  )
+                }
+
+                _ <- sharedStorages.mptStore.syncFull(kvPairs, hashedSnapshot.ordinal)
+
+                // Bootstrap consensus manager with downloaded snapshot
+                _ <- services.consensus.manager
+                  .startFacilitatingAfterRollback(
+                    latestSnapshot.ordinal,
+                    GlobalConsensusOutcome(
+                      latestSnapshot.ordinal,
+                      Facilitators(List(nodeId)),
+                      RemovedFacilitators.empty,
+                      WithdrawnFacilitators.empty,
+                      EligibleFacilitators.empty,
+                      Finished(
+                        latestSnapshot,
+                        latestInfo,
+                        EventTrigger,
+                        Candidates.empty,
+                        Hash.empty,
+                        hashedSnapshot.hash
+                      )
+                    )
+                  )
+
+                _ <- IO(println(s"\u2705 Initialized from peer at ordinal=${latestSnapshot.ordinal}. Starting VRF production."))
+              } yield ()
+            }
+          } >>
+            services.cluster.createSession >>
+            services.session.createSession >>
+            storages.node.setNodeState(NodeState.Ready)
       }).asResource
     } yield ()
   }
