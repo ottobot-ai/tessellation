@@ -25,6 +25,7 @@ object SidecarClient {
     def publishAttestation(msg: TipAttestation): F[PublishResponse]
     def health: F[HealthResponse]
     def peers: F[PeerCountResponse]
+    def channel: ManagedChannel
   }
 
   /** Create a gRPC client Resource that opens a channel and cleans up on release. */
@@ -41,8 +42,8 @@ object SidecarClient {
       .map(ch => fromChannel[F](ch))
 
   /** Build algebra from an existing channel. */
-  def fromChannel[F[_]: Async](channel: ManagedChannel): SidecarClientAlgebra[F] = {
-    val stub = SidecarServiceGrpc.stub(channel)
+  def fromChannel[F[_]: Async](ch: ManagedChannel): SidecarClientAlgebra[F] = {
+    val stub = SidecarServiceGrpc.stub(ch)
 
     new SidecarClientAlgebra[F] {
       private def liftFuture[A](fa: => scala.concurrent.Future[A]): F[A] =
@@ -59,6 +60,8 @@ object SidecarClient {
 
       def peers: F[PeerCountResponse] =
         liftFuture(stub.peerCount(PeerCountRequest()))
+
+      def channel: ManagedChannel = ch
     }
   }
 

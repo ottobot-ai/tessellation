@@ -13,6 +13,7 @@ x-jvm-common: &jvm-common
     context: ..
     dockerfile: nakamoto-test/Dockerfile.jvm
   environment: &jvm-env
+    CL_APP_ENV: dev
     NAKAMOTO_ENABLED: "true"
     NAKAMOTO_PURE: "true"
     NAKAMOTO_GENESIS_ETA: "tessellation-nakamoto-genesis"

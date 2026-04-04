@@ -12,7 +12,7 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, StakeRegistry, TipTracker}
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
-import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
+import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.TimeTrigger
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
@@ -113,6 +113,8 @@ object SnapshotLeaderLoop {
   def run[F[_]: Async: SecurityProvider: HasherSelector](
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
@@ -166,6 +168,8 @@ object SnapshotLeaderLoop {
                         sidecarClient,
                         tipTracker,
                         stakeRegistry,
+                        lastGlobalSnapshotStorage,
+                        lastNGlobalSnapshotStorage,
                         keyPair,
                         selfId,
                         vrfSeed,
@@ -227,6 +231,8 @@ object SnapshotLeaderLoop {
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
     stakeRegistry: StakeRegistry[F],
+    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     keyPair: KeyPair,
     selfId: PeerId,
     vrfSeed: Array[Byte],
@@ -301,6 +307,16 @@ object SnapshotLeaderLoop {
                 logger.warn(s"Snapshot at slot $currentSlot failed to store (rejected by sequential check)")
               }
 
+              // Update lastGlobalSnapshotStorage + lastNGlobalSnapshotStorage so fork
+              // detection sees the correct chain tip (without this, the gossip-based
+              // fork detector thinks the node is stuck at the genesis ordinal and
+              // triggers spurious fork recovery — crashing the node to WaitingForDownload).
+              snapshotHashedForStorage <- signed.toHashed[F]
+              _ <- Async[F].whenA(stored) {
+                lastGlobalSnapshotStorage.set(snapshotHashedForStorage, context) >>
+                  lastNGlobalSnapshotStorage.set(snapshotHashedForStorage, context)
+              }
+
               // Clear included events from mempool (returned events were NOT included)
               includedHashes = hashedEvents.collect {
                 case (h, hashed) if !returnedEvents.contains(hashed.signed.value) => h
@@ -308,8 +324,7 @@ object SnapshotLeaderLoop {
               _ <- eventMempool.clearIncluded(includedHashes)
 
               // Publish via GossipSub sidecar
-              snapshotHashed <- signed.toHashed[F]
-              snapshotHash = snapshotHashed.hash
+              snapshotHash = snapshotHashedForStorage.hash
               _ <- sidecarClient
                 .publishSnapshot(
                   SidecarClient.mkSnapshot(

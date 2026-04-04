@@ -321,15 +321,17 @@ object GlobalSnapshotConsensus {
                 host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
                 grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
               )
-              sidecarClient <- io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
+              allocatedPair <- io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
                 .makeResource[F](sidecarConfig)
                 .allocated
-                .map(_._1)
+              sidecarClient = allocatedPair._1
               _ <- supervisor.supervise(
                 io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
                   .run[F](
                     consensusFns = consensusFunctions,
                     snapshotStorage = globalSnapshotStorage,
+                    lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
+                    lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
                     eventMempool = eventMempool,
                     sidecarClient = sidecarClient,
                     tipTracker = tipTracker,
@@ -339,6 +341,22 @@ object GlobalSnapshotConsensus {
                     selfId = selfId,
                     lddConfig = lddConfig,
                     slotsPerEpoch = slotsPerEpoch
+                  )
+                  .compile
+                  .drain
+              )
+              // Start NakamotoSyncDaemon: receives snapshots + attestations from gossip
+              _ <- supervisor.supervise(
+                io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon
+                  .run[F](
+                    channel = sidecarClient.channel,
+                    snapshotStorage = globalSnapshotStorage,
+                    nodeStorage = nodeStorage,
+                    tipTracker = tipTracker,
+                    stakeRegistry = stakeRegistry,
+                    sidecarClient = sidecarClient,
+                    selfId = selfId,
+                    lddConfig = lddConfig
                   )
                   .compile
                   .drain
