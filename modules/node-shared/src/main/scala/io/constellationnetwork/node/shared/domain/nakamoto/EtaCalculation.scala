@@ -6,8 +6,8 @@ import org.bouncycastle.crypto.digests.Blake2bDigest
 
 /** Chain-derived eta calculation following Bifrost/Cardano pattern.
   *
-  * Eta for rotation period N is derived from VRF outputs in the first 2/3 of rotation period N-1.
-  * Genesis eta is used for rotation period 0 (and period 1, since period 0 has no predecessor).
+  * Eta for rotation period N is derived from VRF outputs in the first 2/3 of rotation period N-1. Genesis eta is used for rotation period 0
+  * (and period 1, since period 0 has no predecessor).
   *
   * This ensures:
   *   - All nodes seeing the same chain compute the same eta (deterministic from chain)
@@ -16,20 +16,18 @@ import org.bouncycastle.crypto.digests.Blake2bDigest
   */
 object EtaCalculation {
 
-  /** Compute which rotation period a slot belongs to.
-    * Period 0 = slots [0, etaRotationSlots), Period 1 = [etaRotationSlots, 2*etaRotationSlots), etc.
+  /** Compute which rotation period a slot belongs to. Period 0 = slots [0, etaRotationSlots), Period 1 = [etaRotationSlots,
+    * 2*etaRotationSlots), etc.
     */
   def rotationPeriod(slot: Long, etaRotationSlots: Long): Long =
     slot / etaRotationSlots
 
-  /** Compute the slot range for a rotation period.
-    * Returns (startSlot, endSlot) inclusive of start, exclusive of end.
+  /** Compute the slot range for a rotation period. Returns (startSlot, endSlot) inclusive of start, exclusive of end.
     */
   def rotationPeriodRange(period: Long, etaRotationSlots: Long): (Long, Long) =
     (period * etaRotationSlots, (period + 1) * etaRotationSlots)
 
-  /** Compute the 2/3 cutoff slot within a rotation period.
-    * VRF outputs from slots < cutoff in the period contribute to next period's eta.
+  /** Compute the 2/3 cutoff slot within a rotation period. VRF outputs from slots < cutoff in the period contribute to next period's eta.
     */
   def twoThirdsCutoff(period: Long, etaRotationSlots: Long): Long = {
     val (start, _) = rotationPeriodRange(period, etaRotationSlots)
@@ -38,12 +36,12 @@ object EtaCalculation {
 
   /** Determine which eta to use for a given slot.
     *
-    * - Period 0: genesis eta
-    * - Period 1: genesis eta (no predecessor period to derive from)
-    * - Period N (N >= 2): eta derived from VRF outputs in first 2/3 of period N-1
+    *   - Period 0: genesis eta
+    *   - Period 1: genesis eta (no predecessor period to derive from)
+    *   - Period N (N >= 2): eta derived from VRF outputs in first 2/3 of period N-1
     *
-    * The caller must supply the VRF outputs from the chain for the relevant period.
-    * This method only handles the "which period and what inputs" logic.
+    * The caller must supply the VRF outputs from the chain for the relevant period. This method only handles the "which period and what
+    * inputs" logic.
     */
   def etaForSlot(
     slot: Long,
@@ -97,8 +95,7 @@ object EtaCalculation {
 
   /** Extract VRF outputs from a chain segment for a specific rotation period's first 2/3.
     *
-    * Given a list of (slot, vrfOutput) pairs from the chain, filter to those in the first 2/3
-    * of the specified rotation period.
+    * Given a list of (slot, vrfOutput) pairs from the chain, filter to those in the first 2/3 of the specified rotation period.
     */
   def extractVrfOutputsForPeriod(
     chainVrfOutputs: List[(Long, Array[Byte])],
@@ -108,8 +105,7 @@ object EtaCalculation {
     val (periodStart, _) = rotationPeriodRange(period, etaRotationSlots)
     val cutoff = twoThirdsCutoff(period, etaRotationSlots)
 
-    chainVrfOutputs
-      .filter { case (slot, _) => slot >= periodStart && slot < cutoff }
+    chainVrfOutputs.filter { case (slot, _) => slot >= periodStart && slot < cutoff }
       .sortBy(_._1) // ensure deterministic ordering by slot
       .map(_._2)
   }

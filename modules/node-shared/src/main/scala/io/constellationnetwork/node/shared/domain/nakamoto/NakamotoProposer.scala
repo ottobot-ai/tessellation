@@ -111,10 +111,11 @@ object NakamotoProposer {
           else
             Sync[F].delay {
               EligibilityChecker.checkEligibility(vrfSK, currentSlot, slotGap, eta, stake, lddConfig).map {
-                case (proof, _) =>
+                case (proof, vrfOut) =>
                   SlotCertificate(
                     slot = currentSlot,
                     vrfProof = VrfProof.fromBytes(proof),
+                    vrfOutput = VrfOutput.fromBytes(vrfOut),
                     vrfPublicKey = VrfPublicKey.fromBytes(vrfVK),
                     eta = Hash(Hex.fromBytes(eta).value),
                     activePoolSize = 1,
