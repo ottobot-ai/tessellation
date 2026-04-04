@@ -27,8 +27,8 @@ x-jvm-common: &jvm-common
 
 x-sidecar-common: &sidecar-common
   build:
-    context: ../p2p
-    dockerfile: Dockerfile
+    context: .
+    dockerfile: Dockerfile.sidecar
   command: [
     "-grpc", "0.0.0.0:50051",
     "-listen", "/ip4/0.0.0.0/tcp/9500"

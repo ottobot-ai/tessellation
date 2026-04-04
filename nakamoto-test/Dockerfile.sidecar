@@ -1,0 +1,5 @@
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates
+COPY sidecar-linux /usr/local/bin/sidecar
+EXPOSE 9500 50051
+ENTRYPOINT ["sidecar"]
