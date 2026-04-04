@@ -164,7 +164,7 @@ object NakamotoSyncDaemon {
       }
 
       // Emit our attestation for this snapshot
-      _ <- emitAttestation(snap, sidecarClient, selfId, logger)
+      _ <- emitAttestation(snap, sidecarClient, tipTracker, selfId, logger)
 
     } yield ()
 
@@ -186,19 +186,31 @@ object NakamotoSyncDaemon {
   private def emitAttestation[F[_]: Async](
     snap: pb.Snapshot,
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
+    tipTracker: TipTracker[F],
     selfId: peer.PeerId,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
-    val att = SidecarClient.mkAttestation(
-      tipHash = snap.hash.toByteArray,
-      tipSlot = snap.slot,
-      tipOrdinal = snap.ordinal,
-      attestedAt = System.currentTimeMillis() / 1000L,
-      attesterId = selfId.value.value.getBytes("UTF-8").take(32),
-      signature = Array.emptyByteArray // TODO: sign (tipHash || tipSlot)
-    )
-    sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
-      logger.warn(s"Failed to emit attestation: ${e.getMessage}")
-    }
+    val tipHash = Hash(snap.hash.toByteArray.map("%02x".format(_)).mkString)
+    val tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
+    val currentSlotMs = System.currentTimeMillis() / 1000L
+    val attestedAtSlot = Slot(NonNegLong.unsafeFrom(currentSlotMs))
+
+    // Record locally first (so our own TipTracker sees it)
+    val localAtt = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, attestedAtSlot)
+    tipTracker.recordAttestation(selfId, localAtt) >>
+      // Broadcast to network — use hex bytes of PeerId so receivers can reconstruct
+      {
+        val att = SidecarClient.mkAttestation(
+          tipHash = snap.hash.toByteArray,
+          tipSlot = snap.slot,
+          tipOrdinal = snap.ordinal,
+          attestedAt = currentSlotMs,
+          attesterId = selfId.value.toBytes,
+          signature = Array.emptyByteArray // TODO: sign (tipHash || tipSlot)
+        )
+        sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
+          logger.warn(s"Failed to emit attestation: ${e.getMessage}")
+        }
+      }
   }
 }
