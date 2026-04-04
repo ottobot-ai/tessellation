@@ -1,0 +1,172 @@
+version: "3.8"
+
+# Nakamoto PoC local cluster — 3 JVM nodes + 3 Go sidecars
+# Usage:
+#   1. Build JARs:  sbt dagL0/stage
+#   2. Build sidecar: cd p2p && go build -o sidecar ./cmd/sidecar
+#   3. Start:  docker compose up --build
+#
+# Env vars NAKAMOTO_ENABLED + NAKAMOTO_PURE activate pure attestation mode.
+
+x-jvm-common: &jvm-common
+  build:
+    context: ..
+    dockerfile: nakamoto-test/Dockerfile.jvm
+  environment: &jvm-env
+    NAKAMOTO_ENABLED: "true"
+    NAKAMOTO_PURE: "true"
+    NAKAMOTO_GENESIS_ETA: "tessellation-nakamoto-genesis"
+    NAKAMOTO_SLOTS_PER_EPOCH: "60"
+    CL_KEYALIAS: alias
+    CL_PASSWORD: password
+    JAVA_OPTS: "-Xmx1g -Xss256k"
+  volumes:
+    - ./genesis.csv:/opt/genesis.csv:ro
+    - ./seedlist.csv:/opt/seedlist.csv:ro
+
+x-sidecar-common: &sidecar-common
+  build:
+    context: ../p2p
+    dockerfile: Dockerfile
+  command: [
+    "-grpc", "0.0.0.0:50051",
+    "-listen", "/ip4/0.0.0.0/tcp/9500"
+  ]
+
+services:
+  # ── Node 0 (genesis) ──────────────────────────────────
+  sidecar-0:
+    <<: *sidecar-common
+    container_name: nakamoto-sidecar-0
+    command: [
+      "-grpc", "0.0.0.0:50051",
+      "-listen", "/ip4/0.0.0.0/tcp/9500",
+      "-seedlist", "nakamoto-sidecar-1:9500,nakamoto-sidecar-2:9500"
+    ]
+    networks:
+      nakamoto:
+        aliases: [sidecar-0]
+
+  node-0:
+    <<: *jvm-common
+    container_name: nakamoto-node-0
+    environment:
+      <<: *jvm-env
+      CL_KEYSTORE: /opt/keys/key.p12
+      SIDECAR_HOST: sidecar-0
+      SIDECAR_GRPC_PORT: "50051"
+      CL_PUBLIC_HTTP_PORT: "9000"
+      CL_P2P_HTTP_PORT: "9001"
+      CL_CLI_HTTP_PORT: "9002"
+    volumes:
+      - ./genesis.csv:/opt/genesis.csv:ro
+      - ./seedlist.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/3:/opt/keys:ro
+    command: >
+      run-genesis
+      --ip node-0
+      --public-port 9000
+      --p2p-port 9001
+      --cli-port 9002
+      --seedlist /opt/seedlist.csv
+      --collateral-amount 0
+    ports:
+      - "9000:9000"
+      - "9002:9002"
+    depends_on:
+      - sidecar-0
+    networks:
+      nakamoto:
+        aliases: [node-0]
+
+  # ── Node 1 (validator) ─────────────────────────────────
+  sidecar-1:
+    <<: *sidecar-common
+    container_name: nakamoto-sidecar-1
+    command: [
+      "-grpc", "0.0.0.0:50051",
+      "-listen", "/ip4/0.0.0.0/tcp/9500",
+      "-seedlist", "nakamoto-sidecar-0:9500,nakamoto-sidecar-2:9500"
+    ]
+    networks:
+      nakamoto:
+        aliases: [sidecar-1]
+
+  node-1:
+    <<: *jvm-common
+    container_name: nakamoto-node-1
+    environment:
+      <<: *jvm-env
+      CL_KEYSTORE: /opt/keys/key.p12
+      SIDECAR_HOST: sidecar-1
+      SIDECAR_GRPC_PORT: "50051"
+      CL_PUBLIC_HTTP_PORT: "9010"
+      CL_P2P_HTTP_PORT: "9011"
+      CL_CLI_HTTP_PORT: "9012"
+      CL_GENESIS_PEER_HTTP: "http://node-0:9000"
+    volumes:
+      - ./genesis.csv:/opt/genesis.csv:ro
+      - ./seedlist.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/4:/opt/keys:ro
+    command: >
+      run-validator
+      --ip node-1
+      --public-port 9010
+      --p2p-port 9011
+      --cli-port 9012
+      --seedlist /opt/seedlist.csv
+      --collateral-amount 0
+    depends_on:
+      - sidecar-1
+      - node-0
+    networks:
+      nakamoto:
+        aliases: [node-1]
+
+  # ── Node 2 (validator) ─────────────────────────────────
+  sidecar-2:
+    <<: *sidecar-common
+    container_name: nakamoto-sidecar-2
+    command: [
+      "-grpc", "0.0.0.0:50051",
+      "-listen", "/ip4/0.0.0.0/tcp/9500",
+      "-seedlist", "nakamoto-sidecar-0:9500,nakamoto-sidecar-1:9500"
+    ]
+    networks:
+      nakamoto:
+        aliases: [sidecar-2]
+
+  node-2:
+    <<: *jvm-common
+    container_name: nakamoto-node-2
+    environment:
+      <<: *jvm-env
+      CL_KEYSTORE: /opt/keys/key.p12
+      SIDECAR_HOST: sidecar-2
+      SIDECAR_GRPC_PORT: "50051"
+      CL_PUBLIC_HTTP_PORT: "9020"
+      CL_P2P_HTTP_PORT: "9021"
+      CL_CLI_HTTP_PORT: "9022"
+      CL_GENESIS_PEER_HTTP: "http://node-0:9000"
+    volumes:
+      - ./genesis.csv:/opt/genesis.csv:ro
+      - ./seedlist.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/5:/opt/keys:ro
+    command: >
+      run-validator
+      --ip node-2
+      --public-port 9020
+      --p2p-port 9021
+      --cli-port 9022
+      --seedlist /opt/seedlist.csv
+      --collateral-amount 0
+    depends_on:
+      - sidecar-2
+      - node-0
+    networks:
+      nakamoto:
+        aliases: [node-2]
+
+networks:
+  nakamoto:
+    driver: bridge
