@@ -72,6 +72,15 @@ object NakamotoChainStore {
     /** Get the current best tip's ordinal */
     def bestTipOrdinal: F[Option[Long]]
 
+    /** Number of snapshots in the chain store */
+    def chainLength: F[Int]
+
+    /** Number of distinct fork tips (snapshots that aren't parents of other snapshots) */
+    def forkCount: F[Int]
+
+    /** Last finalized ordinal */
+    def lastFinalizedOrdinal: F[Long]
+
     /** Get a snapshot by hash */
     def get(hash: Hash): F[Option[StoredSnapshot]]
 
@@ -204,6 +213,18 @@ object NakamotoChainStore {
 
         def bestTipOrdinal: F[Option[Long]] =
           bestTip.map(_.map(_.ordinal))
+
+        def chainLength: F[Int] =
+          stateRef.get.map(_.byHash.size)
+
+        def forkCount: F[Int] =
+          stateRef.get.map { state =>
+            val parentHashes = state.byHash.values.map(_.parentHash).toSet
+            state.byHash.keys.count(h => !parentHashes.contains(h))
+          }
+
+        def lastFinalizedOrdinal: F[Long] =
+          stateRef.get.map(_.lastFinalizedOrdinal)
 
         def get(hash: Hash): F[Option[StoredSnapshot]] =
           stateRef.get.map(_.byHash.get(hash))

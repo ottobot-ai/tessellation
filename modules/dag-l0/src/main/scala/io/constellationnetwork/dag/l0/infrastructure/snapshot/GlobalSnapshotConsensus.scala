@@ -428,6 +428,17 @@ object GlobalSnapshotConsensus {
                   .compile
                   .drain
               )
+              // Start Nakamoto metrics publisher (periodic chain-state gauges)
+              _ <- supervisor.supervise(
+                io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoMetrics
+                  .run[F](
+                    chainStore = chainStore,
+                    tipTracker = tipTracker,
+                    genesisTimeMs = pureGenesisTimeMs
+                  )
+                  .compile
+                  .drain
+              )
               // Start NakamotoSyncDaemon: receives snapshots + attestations from gossip
               _ <- supervisor.supervise(
                 io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon

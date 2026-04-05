@@ -16,6 +16,7 @@ import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalS
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.TimeTrigger
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.nakamoto.LddConfig
@@ -28,6 +29,7 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.vrf.VrfKeyDeriver
 
+import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
 import fs2.Stream
 import org.typelevel.log4cats.slf4j.Slf4jLogger
@@ -144,7 +146,7 @@ object SnapshotLeaderLoop {
     * @param etaRotationSlots
     *   slots per eta rotation period (default 600 = 10 minutes). Eta is long-lived — Cardano uses ~5 days.
     */
-  def run[F[_]: Async: SecurityProvider: HasherSelector](
+  def run[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
@@ -266,10 +268,11 @@ object SnapshotLeaderLoop {
                       } // snapshotSemaphore.permit
 
                     case None =>
-                      // Periodic debug log
-                      Async[F].whenA(currentSlot % 30 == 0) {
-                        logger.debug(s"Slot $currentSlot: not eligible (gap=$slotGap, stake=$myStake)")
-                      }
+                      // Periodic debug log + gauge
+                      Metrics[F].updateGauge("dag_nakamoto_slot", currentSlot) >>
+                        Async[F].whenA(currentSlot % 30 == 0) {
+                          logger.debug(s"Slot $currentSlot: not eligible (gap=$slotGap, stake=$myStake)")
+                        }
                   }
                 } yield ()
           } yield ()
@@ -312,8 +315,10 @@ object SnapshotLeaderLoop {
                   logger
                     .info(
                       s"✅ DEPTH-FINALIZED at ordinal=$finalizeAtOrdinal (tip=${tip.ordinal}, k=$ConfirmationDepthK)"
-                    )
-                    .as(true)
+                    ) >>
+                  Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
+                  Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalizeAtOrdinal) >>
+                  Async[F].pure(true)
               case _ => Async[F].pure(false)
             }
 
@@ -338,7 +343,9 @@ object SnapshotLeaderLoop {
                          logger.info(
                            s"✅ ATTEST-FINALIZED snapshot at slot ${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
                                .format(weight)}, ${attestersForTip}/${activeCount} active of ${validatorCount} seedlist)"
-                         )
+                         ) >>
+                         Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
+                         Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", slot.value.value)
                      }
                    } else Async[F].unit)
               case None =>
@@ -354,7 +361,7 @@ object SnapshotLeaderLoop {
   }
 
   /** Called when VRF lottery is won for a slot. Produces, signs, stores, and publishes a snapshot. */
-  private def onSlotWon[F[_]: Async: SecurityProvider: HasherSelector](
+  private def onSlotWon[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     stateRef: Ref[F, LoopState],
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -411,6 +418,8 @@ object SnapshotLeaderLoop {
         )
 
         _ <- logger.info(s"🎰 WON slot $currentSlot (gap=$slotGap, parentSlot=$parentSlotValue, pool=$activePoolSize) — producing snapshot")
+        _ <- Metrics[F].incrementCounter("dag_nakamoto_slots_won")
+        _ <- Metrics[F].updateGauge("dag_nakamoto_slot", currentSlot)
 
         // Get last snapshot from storage
         headOpt <- snapshotStorage.head
@@ -526,7 +535,9 @@ object SnapshotLeaderLoop {
                   logger.info(
                     s"📦 Produced snapshot ordinal=${lastKey.value.value + 1} slot=$currentSlot " +
                       s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"
-                  )
+                  ) >>
+                  Metrics[F].incrementCounter("dag_nakamoto_snapshots_produced") >>
+                  Metrics[F].updateGauge("dag_nakamoto_ordinal", lastKey.value.value + 1)
               }
             } yield ()
 

@@ -13,6 +13,8 @@ import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.{GossipStream, SidecarClient}
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics._
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
@@ -24,6 +26,7 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, HasherSelector, SecurityProvider}
 
+import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
 import io.grpc.ManagedChannel
 import org.typelevel.log4cats.slf4j.Slf4jLogger
@@ -50,7 +53,7 @@ object NakamotoSyncDaemon {
     def initial: SyncState = SyncState(0L, None, 0L, isReady = false)
   }
 
-  def run[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector](
+  def run[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
     channel: ManagedChannel,
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     nodeStorage: NodeStorage[F],
@@ -121,7 +124,7 @@ object NakamotoSyncDaemon {
     }
   }
 
-  private def handleSnapshot[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector](
+  private def handleSnapshot[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
     snap: pb.Snapshot,
     stateRef: Ref[F, SyncState],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
@@ -311,7 +314,8 @@ object NakamotoSyncDaemon {
                   )
               } else {
                 // Small gap — normal fork, not a restart. Let reorg handle it.
-                logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $reason (gap=$gap, within threshold)")
+                Metrics[F].incrementCounter("dag_nakamoto_snapshots_rejected") >>
+                  logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $reason (gap=$gap, within threshold)")
               }
             case None =>
               catchUpFromGossip(
@@ -329,12 +333,13 @@ object NakamotoSyncDaemon {
               )
           }
         case NakamotoSnapshotValidator.Invalid(reason) =>
-          logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $reason")
+          Metrics[F].incrementCounter("dag_nakamoto_snapshots_rejected") >>
+            logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $reason")
       }
     } yield ()
 
   /** Process a VRF-validated snapshot: update tip tracking, store, accumulate VRF output, record attestation. */
-  private def processValidSnapshot[F[_]: Async: HasherSelector](
+  private def processValidSnapshot[F[_]: Async: HasherSelector: Metrics](
     snap: pb.Snapshot,
     stateRef: Ref[F, SyncState],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
@@ -394,7 +399,9 @@ object NakamotoSyncDaemon {
                         signedSnapshot.toHashed[F].flatMap { hashed =>
                           lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
                             lastNGlobalSnapshotStorage.setForRecovery(hashed, context) >>
-                            logger.info(s"✅ Updated canonical storage to ordinal=${snap.ordinal} slot=${snap.slot}")
+                            logger.info(s"✅ Updated canonical storage to ordinal=${snap.ordinal} slot=${snap.slot}") >>
+                            Metrics[F].incrementCounter("dag_nakamoto_snapshots_received") >>
+                            Metrics[F].updateGauge("dag_nakamoto_ordinal", snap.ordinal)
                         }
                       } >>
                       chainStore.bestTipSlot.flatMap {
@@ -492,7 +499,7 @@ object NakamotoSyncDaemon {
     * Signed[GlobalIncrementalSnapshot] + GlobalSnapshotInfo. We skip validation (can't validate without parent) but reset our canonical
     * storage so subsequent gossip messages WILL have parents we recognize.
     */
-  private def catchUpFromGossip[F[_]: Async: cats.Parallel: JsonSerializer: HasherSelector](
+  private def catchUpFromGossip[F[_]: Async: cats.Parallel: JsonSerializer: HasherSelector: Metrics](
     snap: pb.Snapshot,
     parsed: Option[(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)],
     stateRef: Ref[F, SyncState],
@@ -561,6 +568,7 @@ object NakamotoSyncDaemon {
               )
 
               _ <- productionGate.resume("catch-up-sync")
+              _ <- Metrics[F].incrementCounter("dag_nakamoto_catchups")
               _ <- logger.info(
                 s"\u2705 CATCH-UP complete: now at ordinal=${snap.ordinal} slot=${snap.slot}. " +
                   s"Subsequent gossip should find parents."
