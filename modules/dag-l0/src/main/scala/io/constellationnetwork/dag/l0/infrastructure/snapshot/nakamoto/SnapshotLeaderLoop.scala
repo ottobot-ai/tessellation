@@ -162,7 +162,8 @@ object SnapshotLeaderLoop {
     etaRotationSlots: Long = 600L,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
-    genesisTimeMs: Long = 0L
+    genesisTimeMs: Long = 0L,
+    snapshotSemaphore: cats.effect.std.Semaphore[F]
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -226,33 +227,35 @@ object SnapshotLeaderLoop {
 
                   _ <- result match {
                     case Some((proof, vrfOutput)) =>
-                      onSlotWon(
-                        stateRef,
-                        consensusFns,
-                        snapshotStorage,
-                        chainStore,
-                        eventMempool,
-                        sidecarClient,
-                        tipTracker,
-                        stakeRegistry,
-                        lastGlobalSnapshotStorage,
-                        lastNGlobalSnapshotStorage,
-                        keyPair,
-                        selfId,
-                        vrfSeed,
-                        vrfPK,
-                        proof,
-                        vrfOutput,
-                        eta,
-                        currentSlot,
-                        slotGap,
-                        slotRefined,
-                        lddConfig,
-                        etaRotationSlots,
-                        lastKnownSlotRef,
-                        epochStateRef,
-                        logger
-                      )
+                      snapshotSemaphore.permit.use { _ =>
+                        onSlotWon(
+                          stateRef,
+                          consensusFns,
+                          snapshotStorage,
+                          chainStore,
+                          eventMempool,
+                          sidecarClient,
+                          tipTracker,
+                          stakeRegistry,
+                          lastGlobalSnapshotStorage,
+                          lastNGlobalSnapshotStorage,
+                          keyPair,
+                          selfId,
+                          vrfSeed,
+                          vrfPK,
+                          proof,
+                          vrfOutput,
+                          eta,
+                          currentSlot,
+                          slotGap,
+                          slotRefined,
+                          lddConfig,
+                          etaRotationSlots,
+                          lastKnownSlotRef,
+                          epochStateRef,
+                          logger
+                        )
+                      } // snapshotSemaphore.permit
 
                     case None =>
                       // Periodic debug log

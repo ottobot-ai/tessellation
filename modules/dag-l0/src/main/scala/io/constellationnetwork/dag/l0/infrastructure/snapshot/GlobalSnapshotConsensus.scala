@@ -336,6 +336,26 @@ object GlobalSnapshotConsensus {
                 io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore
                   .make[F](globalSnapshotStorage, chainSelection, tipTracker)
               }
+              // Seed chain store with the current head snapshot so gossip children can find their parent
+              _ <- globalSnapshotStorage.head.flatMap {
+                case Some((headSigned, headCtx)) =>
+                  HasherSelector[F].withCurrent { implicit hasher =>
+                    headSigned.toHashed[F].flatMap { hashed =>
+                      chainStore
+                        .store(
+                          headSigned,
+                          headCtx,
+                          hashed.ordinal.value.value,
+                          0L, // slot unknown for genesis
+                          hashed.lastSnapshotHash,
+                          Array.empty // no VRF output for genesis
+                        )
+                        .void
+                    }
+                  }
+                case None =>
+                  Async[F].unit
+              }
               lastKnownSlotRef <- cats.effect.kernel.Ref.of[F, Option[Long]](None)
               // Shared epoch state: VRF outputs from ALL sources accumulate here for eta rotation
               genesisEta = {
@@ -352,6 +372,9 @@ object GlobalSnapshotConsensus {
                 .of[F, io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState](
                   io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState.initial(genesisEta)
                 )
+              // Shared semaphore: serialize snapshot production and gossip processing
+              // so each operation sees correct parent state (Bifrost uses same pattern)
+              snapshotSemaphore <- cats.effect.std.Semaphore[F](1)
               sidecarConfig = io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarConfig(
                 host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
                 grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
@@ -380,7 +403,8 @@ object GlobalSnapshotConsensus {
                     etaRotationSlots = etaRotationSlots,
                     lastKnownSlotRef = lastKnownSlotRef,
                     epochStateRef = epochStateRef,
-                    genesisTimeMs = pureGenesisTimeMs
+                    genesisTimeMs = pureGenesisTimeMs,
+                    snapshotSemaphore = snapshotSemaphore
                   )
                   .compile
                   .drain
@@ -403,7 +427,8 @@ object GlobalSnapshotConsensus {
                     consensusFns = consensusFunctions,
                     snapshotStorage = globalSnapshotStorage,
                     lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
-                    lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage
+                    lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
+                    snapshotSemaphore = snapshotSemaphore
                   )
                   .compile
                   .drain

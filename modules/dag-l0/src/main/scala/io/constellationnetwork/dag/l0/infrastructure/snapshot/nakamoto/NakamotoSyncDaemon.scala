@@ -61,47 +61,45 @@ object NakamotoSyncDaemon {
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
-    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F]
+    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
+    snapshotSemaphore: Semaphore[F]
   ): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
     fs2.Stream.eval(Ref.of[F, SyncState](SyncState.initial)).flatMap { stateRef =>
-      // Serialize snapshot processing so each one sees correct parent state.
-      // Attestations are lightweight and don't need serialization.
-      fs2.Stream.eval(Semaphore[F](1)).flatMap { snapshotSemaphore =>
-        GossipStream.subscribe[F](channel).evalMap { msg =>
-          msg.body match {
-            case pb.GossipMessage.Body.Snapshot(snap) =>
-              snapshotSemaphore.permit.use { _ =>
-                handleSnapshot(
-                  snap,
-                  stateRef,
-                  chainStore,
-                  nodeStorage,
-                  tipTracker,
-                  stakeRegistry,
-                  sidecarClient,
-                  selfId,
-                  lddConfig,
-                  lastKnownSlotRef,
-                  epochStateRef,
-                  etaRotationSlots,
-                  consensusFns,
-                  snapshotStorage,
-                  lastGlobalSnapshotStorage,
-                  lastNGlobalSnapshotStorage,
-                  logger
-                )
-              } // snapshotSemaphore.permit.use
+      // Shared semaphore serializes snapshot processing with production (SnapshotLeaderLoop)
+      GossipStream.subscribe[F](channel).evalMap { msg =>
+        msg.body match {
+          case pb.GossipMessage.Body.Snapshot(snap) =>
+            snapshotSemaphore.permit.use { _ =>
+              handleSnapshot(
+                snap,
+                stateRef,
+                chainStore,
+                nodeStorage,
+                tipTracker,
+                stakeRegistry,
+                sidecarClient,
+                selfId,
+                lddConfig,
+                lastKnownSlotRef,
+                epochStateRef,
+                etaRotationSlots,
+                consensusFns,
+                snapshotStorage,
+                lastGlobalSnapshotStorage,
+                lastNGlobalSnapshotStorage,
+                logger
+              )
+            } // snapshotSemaphore.permit.use
 
-            case pb.GossipMessage.Body.Attestation(att) =>
-              handleAttestation(att, tipTracker, logger)
+          case pb.GossipMessage.Body.Attestation(att) =>
+            handleAttestation(att, tipTracker, logger)
 
-            case pb.GossipMessage.Body.Empty =>
-              Async[F].unit
-          }
+          case pb.GossipMessage.Body.Empty =>
+            Async[F].unit
         }
-      } // snapshotSemaphore
+      }
     }
   }
 
