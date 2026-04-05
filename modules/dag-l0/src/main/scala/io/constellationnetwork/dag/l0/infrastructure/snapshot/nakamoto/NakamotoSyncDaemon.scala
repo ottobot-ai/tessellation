@@ -6,6 +6,7 @@ import cats.syntax.all._
 
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
+import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
@@ -13,7 +14,8 @@ import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalS
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.{GossipStream, SidecarClient}
 import io.constellationnetwork.schema._
-import io.constellationnetwork.schema.mpt.GlobalStateKey
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.nakamoto.{LddConfig, TipAttestation => DomainTipAttestation}
 import io.constellationnetwork.schema.node.NodeState
@@ -34,19 +36,21 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 object NakamotoSyncDaemon {
 
   private val CatchUpThreshold = 2L
+  private val CatchUpCooldownMs = 10000L // Don't retry catch-up more often than every 10s
 
   final case class SyncState(
     networkTipOrdinal: Long,
     networkTipHash: Option[Hash],
     localTipOrdinal: Long,
-    isReady: Boolean
+    isReady: Boolean,
+    lastCatchUpAttemptMs: Long = 0L
   )
 
   object SyncState {
     def initial: SyncState = SyncState(0L, None, 0L, isReady = false)
   }
 
-  def run[F[_]: Async: SecurityProvider: HasherSelector](
+  def run[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector](
     channel: ManagedChannel,
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     nodeStorage: NodeStorage[F],
@@ -63,8 +67,9 @@ object NakamotoSyncDaemon {
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     snapshotSemaphore: Semaphore[F],
-    productionGate: ProductionGate[F]
-  ): fs2.Stream[F, Unit] = {
+    productionGate: ProductionGate[F],
+    mptStore: MptStore[F, GlobalStateKey]
+  )(implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
     fs2.Stream.eval(Ref.of[F, SyncState](SyncState.initial)).flatMap { stateRef =>
@@ -99,6 +104,7 @@ object NakamotoSyncDaemon {
                     lastGlobalSnapshotStorage,
                     lastNGlobalSnapshotStorage,
                     productionGate,
+                    mptStore,
                     logger
                   )
                 } >> // snapshotSemaphore.permit.use
@@ -115,7 +121,7 @@ object NakamotoSyncDaemon {
     }
   }
 
-  private def handleSnapshot[F[_]: Async: SecurityProvider: HasherSelector](
+  private def handleSnapshot[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector](
     snap: pb.Snapshot,
     stateRef: Ref[F, SyncState],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
@@ -133,8 +139,9 @@ object NakamotoSyncDaemon {
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     productionGate: ProductionGate[F],
+    mptStore: MptStore[F, GlobalStateKey],
     logger: org.typelevel.log4cats.Logger[F]
-  ): F[Unit] =
+  )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] =
     for {
       _ <- logger.info(
         s"📥 Received snapshot ordinal=${snap.ordinal} slot=${snap.slot} parentSlot=${snap.parentSlot} from=${snap.producerId.toByteArray.take(4).map("%02x".format(_)).mkString}"
@@ -263,6 +270,64 @@ object NakamotoSyncDaemon {
             productionGate,
             logger
           )
+        case NakamotoSnapshotValidator.Invalid(reason) if reason == "No parent found" =>
+          // Parent not found — network is ahead of us (restart scenario).
+          catchUpFromGossip(
+            snap,
+            parsed,
+            stateRef,
+            chainStore,
+            snapshotStorage,
+            lastGlobalSnapshotStorage,
+            lastNGlobalSnapshotStorage,
+            lastKnownSlotRef,
+            mptStore,
+            productionGate,
+            logger
+          )
+        case NakamotoSnapshotValidator.Invalid(reason) if reason.startsWith("Content mismatch") =>
+          // Content mismatch — could be normal fork or restart scenario.
+          // Only catch up if incoming ordinal is significantly ahead of our canonical tip.
+          snapshotStorage.head.flatMap {
+            case Some((localTip, _)) =>
+              val localOrd = localTip.ordinal.value.value
+              val gap = snap.ordinal - localOrd
+              if (gap >= CatchUpThreshold) {
+                logger.warn(
+                  s"\uD83D\uDD04 Content mismatch with ordinal gap=$gap (local=$localOrd, incoming=${snap.ordinal}). Triggering catch-up."
+                ) >>
+                  catchUpFromGossip(
+                    snap,
+                    parsed,
+                    stateRef,
+                    chainStore,
+                    snapshotStorage,
+                    lastGlobalSnapshotStorage,
+                    lastNGlobalSnapshotStorage,
+                    lastKnownSlotRef,
+                    mptStore,
+                    productionGate,
+                    logger
+                  )
+              } else {
+                // Small gap — normal fork, not a restart. Let reorg handle it.
+                logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $reason (gap=$gap, within threshold)")
+              }
+            case None =>
+              catchUpFromGossip(
+                snap,
+                parsed,
+                stateRef,
+                chainStore,
+                snapshotStorage,
+                lastGlobalSnapshotStorage,
+                lastNGlobalSnapshotStorage,
+                lastKnownSlotRef,
+                mptStore,
+                productionGate,
+                logger
+              )
+          }
         case NakamotoSnapshotValidator.Invalid(reason) =>
           logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $reason")
       }
@@ -419,5 +484,94 @@ object NakamotoSyncDaemon {
           logger.warn(s"Failed to emit attestation: ${e.getMessage}")
         }
       }
+  }
+
+  /** Catch up from a gossip payload when parent is missing (restart scenario).
+    *
+    * Instead of rejecting the snapshot, use it to reset local state to the network tip. The gossip message already contains the full
+    * Signed[GlobalIncrementalSnapshot] + GlobalSnapshotInfo. We skip validation (can't validate without parent) but reset our canonical
+    * storage so subsequent gossip messages WILL have parents we recognize.
+    */
+  private def catchUpFromGossip[F[_]: Async: cats.Parallel: JsonSerializer: HasherSelector](
+    snap: pb.Snapshot,
+    parsed: Option[(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)],
+    stateRef: Ref[F, SyncState],
+    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
+    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
+    lastKnownSlotRef: Ref[F, Option[Long]],
+    mptStore: MptStore[F, GlobalStateKey],
+    productionGate: ProductionGate[F],
+    logger: org.typelevel.log4cats.Logger[F]
+  )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] = {
+    val now = System.currentTimeMillis()
+    stateRef.get.flatMap { state =>
+      if (now - state.lastCatchUpAttemptMs < CatchUpCooldownMs) {
+        // Cooldown — don't spam catch-up attempts
+        logger.debug(
+          s"⏳ Catch-up cooldown (${(CatchUpCooldownMs - (now - state.lastCatchUpAttemptMs)) / 1000}s remaining), " +
+            s"skipping ordinal=${snap.ordinal}"
+        )
+      } else {
+        parsed match {
+          case Some((signedSnapshot, context)) =>
+            val parentHash = Hash(snap.parentHash.toByteArray.map("%02x".format(_)).mkString)
+            for {
+              _ <- stateRef.update(_.copy(lastCatchUpAttemptMs = now))
+              _ <- logger.warn(
+                s"\uD83D\uDD04 CATCH-UP: No parent found for ordinal=${snap.ordinal} slot=${snap.slot}. " +
+                  s"Resetting local state to network tip."
+              )
+              _ <- productionGate.pause("catch-up-sync")
+
+              // Store in chain store (seed this snapshot as our new starting point)
+              _ <- chainStore.store(
+                signedSnapshot,
+                context,
+                snap.ordinal,
+                snap.slot,
+                parentHash,
+                snap.vrfProof.toByteArray
+              )
+
+              // Update canonical storages
+              _ <- HasherSelector[F].withCurrent { implicit hasher =>
+                signedSnapshot.toHashed[F].flatMap { hashed =>
+                  lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
+                    lastNGlobalSnapshotStorage.setForRecovery(hashed, context)
+                }
+              }
+
+              // MPT full sync from the context we received — critical for
+              // the acceptance manager to validate subsequent snapshots
+              _ <- logger.info(s"\uD83D\uDD04 CATCH-UP: Syncing MPT from received context...")
+              kvPairs <- HasherSelector[F].withCurrent { implicit hasher =>
+                context.allStateEntries[F]
+              }
+              _ <- mptStore.syncFull(kvPairs, SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)))
+              _ <- lastKnownSlotRef.set(Some(snap.slot))
+
+              _ <- stateRef.update(
+                _.copy(
+                  networkTipOrdinal = snap.ordinal,
+                  networkTipHash = Some(Hash(snap.hash.toByteArray.map("%02x".format(_)).mkString)),
+                  localTipOrdinal = snap.ordinal
+                )
+              )
+
+              _ <- productionGate.resume("catch-up-sync")
+              _ <- logger.info(
+                s"\u2705 CATCH-UP complete: now at ordinal=${snap.ordinal} slot=${snap.slot}. " +
+                  s"Subsequent gossip should find parents."
+              )
+            } yield ()
+          case None =>
+            logger.warn(
+              s"\u274c No parent found for ordinal=${snap.ordinal} and no payload to catch up from"
+            )
+        }
+      }
+    }
   }
 }

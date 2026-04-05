@@ -433,77 +433,140 @@ object Main
             )
         case m: RunNakamoto =>
           // Nakamoto mode: all nodes load genesis identically, no leader/follower.
-          // Each node signs genesis with their own key — hash is computed over
-          // UNSIGNED content so all nodes derive the same genesis hash regardless
-          // of which key signs it.
+          // Supports cold restart: if snapshot data already exists on disk,
+          // recover from it instead of re-running genesis.
+          import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.GlobalSnapshotInfoLocalFileSystemStorage
           storages.node.tryModifyState(
             NodeState.Initial,
             NodeState.LoadingGenesis,
             NodeState.GenesisReady
           ) {
-            GenesisLoader.make[IO, GlobalSnapshot].loadBalances(m.genesisPath).flatMap { accounts =>
-              val genesis = GlobalSnapshot.mkGenesis(
-                accounts.map(a => (a.address, a.balance)).toMap,
-                m.startingEpochProgress
-              )
-
-              // Sign genesis with node's own key (hash is content-derived, not signature-derived)
-              hasherSelector.withCurrent { implicit hasher =>
-                Signed
-                  .forAsyncHasher[IO, GlobalSnapshot](genesis, keyPair)
-                  .flatMap(_.toHashed[IO])
-              }.flatMap { hashedGenesis =>
-                GlobalSnapshotLocalFileSystemStorage.make[IO](cfg.snapshot.snapshotPath).flatMap {
-                  fullGlobalSnapshotLocalFileSystemStorage =>
-                    hasherSelector.withCurrent { implicit hasher =>
-                      fullGlobalSnapshotLocalFileSystemStorage.write(hashedGenesis.signed) >>
-                        GlobalSnapshot.mkFirstIncrementalSnapshot[IO](hashedGenesis).flatMap { firstIncrementalSnapshot =>
-                          Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](firstIncrementalSnapshot, keyPair).flatMap {
-                            signedFirstIncrementalSnapshot =>
-                              for {
-                                hashedSnapshot <- signedFirstIncrementalSnapshot.toHashed[IO]
-                                globalSnapshotInfo = hashedGenesis.info.toGlobalSnapshotInfo
-                                _ <- initializeStorages[IO](
-                                  storages.globalSnapshot,
-                                  sharedStorages.lastNGlobalSnapshot,
-                                  sharedStorages.lastGlobalSnapshot,
-                                  programs.download,
-                                  hashedSnapshot,
-                                  globalSnapshotInfo
-                                )
-                                kvPairs <- globalSnapshotInfo.allStateEntries[IO](
-                                  Async[IO],
-                                  Parallel[IO],
-                                  hasher,
-                                  jsonSerializer,
-                                  globalStateProofSelector
-                                )
-                                _ <- sharedStorages.mptStore.syncFull(kvPairs, hashedSnapshot.ordinal)
-
-                                // Bootstrap consensus manager (needed for SnapshotLeaderLoop wiring)
-                                _ <- services.consensus.manager
-                                  .startFacilitatingAfterRollback(
-                                    signedFirstIncrementalSnapshot.ordinal,
-                                    GlobalConsensusOutcome(
-                                      signedFirstIncrementalSnapshot.ordinal,
-                                      Facilitators(List(nodeId)),
-                                      RemovedFacilitators.empty,
-                                      WithdrawnFacilitators.empty,
-                                      EligibleFacilitators.empty,
-                                      Finished(
-                                        signedFirstIncrementalSnapshot,
-                                        hashedGenesis.info.toGlobalSnapshotInfo,
-                                        EventTrigger,
-                                        Candidates.empty,
-                                        Hash.empty,
-                                        hashedSnapshot.hash
-                                      )
+            // Check if we already have snapshot data on disk (cold restart detection)
+            GlobalSnapshotInfoLocalFileSystemStorage.make[IO](cfg.snapshot.snapshotInfoPath).flatMap { infoStorage =>
+              infoStorage.listStoredOrdinals.flatMap { ordinalStream =>
+                ordinalStream.compile.toList.flatMap { storedOrdinals =>
+                  if (storedOrdinals.nonEmpty) {
+                    // === COLD RESTART: recover from disk ===
+                    val latestOrdinal = storedOrdinals.max
+                    IO(
+                      println(
+                        s"\uD83D\uDD04 Cold restart detected: found ${storedOrdinals.size} snapshots on disk, latest ordinal=$latestOrdinal"
+                      )
+                    ) >>
+                      (storages.globalSnapshot.get(latestOrdinal), infoStorage.read(latestOrdinal)).flatMapN {
+                        case (Some(latestSnapshot), Some(latestInfo)) =>
+                          hasherSelector.withCurrent { implicit hasher =>
+                            for {
+                              hashedSnapshot <- latestSnapshot.toHashed[IO]
+                              _ <- storages.globalSnapshot.setHeadForRecovery(latestSnapshot, latestInfo)
+                              _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(hashedSnapshot, latestInfo)
+                              _ <- sharedStorages.lastNGlobalSnapshot.setForRecovery(
+                                hashedSnapshot,
+                                latestInfo
+                              )
+                              kvPairs <- latestInfo.allStateEntries[IO](
+                                Async[IO],
+                                Parallel[IO],
+                                hasher,
+                                jsonSerializer,
+                                globalStateProofSelector
+                              )
+                              _ <- sharedStorages.mptStore.syncFull(kvPairs, latestOrdinal)
+                              _ <- services.consensus.manager
+                                .startFacilitatingAfterRollback(
+                                  latestSnapshot.ordinal,
+                                  GlobalConsensusOutcome(
+                                    latestSnapshot.ordinal,
+                                    Facilitators(List(nodeId)),
+                                    RemovedFacilitators.empty,
+                                    WithdrawnFacilitators.empty,
+                                    EligibleFacilitators.empty,
+                                    Finished(
+                                      latestSnapshot,
+                                      latestInfo,
+                                      EventTrigger,
+                                      Candidates.empty,
+                                      Hash.empty,
+                                      hashedSnapshot.hash
                                     )
                                   )
-                              } yield ()
+                                )
+                              _ <- IO(println(s"\u2705 Recovered from disk at ordinal=$latestOrdinal"))
+                            } yield ()
                           }
+                        case _ =>
+                          IO.raiseError(
+                            new RuntimeException(
+                              s"Cold restart: snapshot info for ordinal=$latestOrdinal exists but snapshot or info data missing"
+                            )
+                          )
+                      }
+                  } else {
+                    // === FRESH START: run genesis ===
+                    GenesisLoader.make[IO, GlobalSnapshot].loadBalances(m.genesisPath).flatMap { accounts =>
+                      val genesis = GlobalSnapshot.mkGenesis(
+                        accounts.map(a => (a.address, a.balance)).toMap,
+                        m.startingEpochProgress
+                      )
+
+                      hasherSelector.withCurrent { implicit hasher =>
+                        Signed
+                          .forAsyncHasher[IO, GlobalSnapshot](genesis, keyPair)
+                          .flatMap(_.toHashed[IO])
+                      }.flatMap { hashedGenesis =>
+                        GlobalSnapshotLocalFileSystemStorage.make[IO](cfg.snapshot.snapshotPath).flatMap {
+                          fullGlobalSnapshotLocalFileSystemStorage =>
+                            hasherSelector.withCurrent { implicit hasher =>
+                              fullGlobalSnapshotLocalFileSystemStorage.write(hashedGenesis.signed) >>
+                                GlobalSnapshot.mkFirstIncrementalSnapshot[IO](hashedGenesis).flatMap { firstIncrementalSnapshot =>
+                                  Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](firstIncrementalSnapshot, keyPair).flatMap {
+                                    signedFirstIncrementalSnapshot =>
+                                      for {
+                                        hashedSnapshot <- signedFirstIncrementalSnapshot.toHashed[IO]
+                                        globalSnapshotInfo = hashedGenesis.info.toGlobalSnapshotInfo
+                                        _ <- initializeStorages[IO](
+                                          storages.globalSnapshot,
+                                          sharedStorages.lastNGlobalSnapshot,
+                                          sharedStorages.lastGlobalSnapshot,
+                                          programs.download,
+                                          hashedSnapshot,
+                                          globalSnapshotInfo
+                                        )
+                                        kvPairs <- globalSnapshotInfo.allStateEntries[IO](
+                                          Async[IO],
+                                          Parallel[IO],
+                                          hasher,
+                                          jsonSerializer,
+                                          globalStateProofSelector
+                                        )
+                                        _ <- sharedStorages.mptStore.syncFull(kvPairs, hashedSnapshot.ordinal)
+                                        _ <- services.consensus.manager
+                                          .startFacilitatingAfterRollback(
+                                            signedFirstIncrementalSnapshot.ordinal,
+                                            GlobalConsensusOutcome(
+                                              signedFirstIncrementalSnapshot.ordinal,
+                                              Facilitators(List(nodeId)),
+                                              RemovedFacilitators.empty,
+                                              WithdrawnFacilitators.empty,
+                                              EligibleFacilitators.empty,
+                                              Finished(
+                                                signedFirstIncrementalSnapshot,
+                                                hashedGenesis.info.toGlobalSnapshotInfo,
+                                                EventTrigger,
+                                                Candidates.empty,
+                                                Hash.empty,
+                                                hashedSnapshot.hash
+                                              )
+                                            )
+                                          )
+                                      } yield ()
+                                  }
+                                }
+                            }
                         }
+                      }
                     }
+                  }
                 }
               }
             }

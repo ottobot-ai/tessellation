@@ -15,27 +15,23 @@ case class UndoEntry(
   ordinal: Long,
   snapshotHash: Hash,
   parentHash: Hash,
-  inserted: Set[Hex],                    // keys new at this ordinal
-  removed: Map[Hex, Array[Byte]],        // keys deleted + their old bytes
-  overwritten: Map[Hex, Array[Byte]]     // keys modified + their old bytes
+  inserted: Set[Hex], // keys new at this ordinal
+  removed: Map[Hex, Array[Byte]], // keys deleted + their old bytes
+  overwritten: Map[Hex, Array[Byte]] // keys modified + their old bytes
 )
 
 /** Fork-aware undo journal for MPT state.
   *
-  * Records what changed at each ordinal on the flat Map[Hex, Array[Byte]]
-  * inside InMemoryMerklePatriciaProducer. On fork switch, walks journal
-  * backwards to common ancestor, undoing mutations, then lets the new
-  * fork's pipeline apply forward normally.
+  * Records what changed at each ordinal on the flat Map[Hex, Array[Byte]] inside InMemoryMerklePatriciaProducer. On fork switch, walks
+  * journal backwards to common ancestor, undoing mutations, then lets the new fork's pipeline apply forward normally.
   *
-  * Cost: O(delta_size) per ordinal for recording.
-  *       O(delta_size × fork_depth) for a fork switch.
-  *       Memory: one UndoEntry per unfinalized ordinal.
+  * Cost: O(delta_size) per ordinal for recording. O(delta_size × fork_depth) for a fork switch. Memory: one UndoEntry per unfinalized
+  * ordinal.
   */
 trait MptUndoJournal[F[_]] {
 
-  /** Wrap a state-mutating action (typically syncFromStateChanges) with
-    * journal recording. Snapshots producer.entries before, runs the action,
-    * then diffs to build the undo entry.
+  /** Wrap a state-mutating action (typically syncFromStateChanges) with journal recording. Snapshots producer.entries before, runs the
+    * action, then diffs to build the undo entry.
     */
   def wrapApply(
     ordinal: Long,
@@ -43,8 +39,7 @@ trait MptUndoJournal[F[_]] {
     parentHash: Hash
   )(apply: F[Unit]): F[Unit]
 
-  /** Unapply journal entries from current tip back to (not including)
-    * the target ancestor ordinal. Returns count of entries unapplied.
+  /** Unapply journal entries from current tip back to (not including) the target ancestor ordinal. Returns count of entries unapplied.
     */
   def unapplyTo(ancestorOrdinal: Long): F[Int]
 
@@ -103,12 +98,15 @@ object MptUndoJournal {
             inserted = after.keySet -- before.keySet
             removedKeys = before.keySet -- after.keySet
             removed = removedKeys.map(k => k -> before(k)).toMap
-            overwritten = (before.keySet intersect after.keySet).flatMap { k =>
-              val oldBytes = before(k)
-              val newBytes = after(k)
-              if (!java.util.Arrays.equals(oldBytes, newBytes)) Some(k -> oldBytes)
-              else None
-            }.toMap
+            overwritten = before.keySet
+              .intersect(after.keySet)
+              .flatMap { k =>
+                val oldBytes = before(k)
+                val newBytes = after(k)
+                if (!java.util.Arrays.equals(oldBytes, newBytes)) Some(k -> oldBytes)
+                else None
+              }
+              .toMap
 
             entry = UndoEntry(ordinal, snapshotHash, parentHash, inserted, removed, overwritten)
 
