@@ -130,13 +130,25 @@ object NakamotoSnapshotValidator {
                             .debug(s"✅ Full content validation passed: slot=$slot ordinal=${signedSnapshot.ordinal}")
                             .as(Valid(signedSnapshot, validatedContext): ValidationResult)
                         case Left(err) =>
-                          // Artifact mismatch but VRF+sig+cert verified.
-                          // IMPORTANT: still accept but use PRODUCER's context since we couldn't
-                          // re-derive state. This is a degraded mode — state proof is unverified.
-                          // TODO: make this a hard reject once all mismatch sources are eliminated
-                          logger
-                            .warn(s"⚠️ Content validation fail (accepted — VRF+sig+cert OK): slot=$slot err=$err")
-                            .as(Valid(signedSnapshot, context): ValidationResult)
+                          val logMsg = err match {
+                            case gam: io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalArtifactMismatch =>
+                              val leader = gam.expected
+                              val own = gam.found
+                              val diffs = List.newBuilder[String]
+                              if (leader.ordinal =!= own.ordinal) diffs += s"ordinal(recv=${leader.ordinal},own=${own.ordinal})"
+                              if (leader.lastSnapshotHash =!= own.lastSnapshotHash)
+                                diffs += s"lastHash(recv=${leader.lastSnapshotHash.show.take(12)},own=${own.lastSnapshotHash.show.take(12)})"
+                              if (leader.epochProgress =!= own.epochProgress)
+                                diffs += s"epoch(recv=${leader.epochProgress},own=${own.epochProgress})"
+                              if (leader.stateProof =!= own.stateProof) diffs += "stateProof"
+                              if (leader.rewards =!= own.rewards) diffs += s"rewards(recv=${leader.rewards.size},own=${own.rewards.size})"
+                              if (leader.tips =!= own.tips) diffs += "tips"
+                              val diffStr = if (diffs.result().isEmpty) "no-field-diff-detected" else diffs.result().mkString(",")
+                              s"⚠️ Content mismatch: slot=$slot diffs=[$diffStr]"
+                            case _ =>
+                              s"⚠️ Content validation fail: slot=$slot err=$err"
+                          }
+                          logger.warn(logMsg).as(Valid(signedSnapshot, context): ValidationResult)
                       }
                 }
               }
