@@ -172,7 +172,8 @@ object GlobalSnapshotAcceptanceManager {
     collateral: Amount,
     withdrawalTimeLimit: EpochProgress,
     mptStore: MptStore[F, GlobalStateKey],
-    loggerBundle: LoggerBundle[F]
+    loggerBundle: LoggerBundle[F],
+    undoJournal: Option[io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal[F]] = None
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): GlobalSnapshotAcceptanceManager[F] = {
@@ -1137,14 +1138,25 @@ object GlobalSnapshotAcceptanceManager {
                 s"nc=${removedNodeCollateralKeys.size},ncw=${removedNodeCollateralWithdrawalKeys.size})"
             )
 
-            _ <- mptStore.syncFromStateChanges(stateChangesAccumulator, ordinal)
+            // === MPT Sync with undo journal ===
+            // When undo journal is present: wrap the sync to record before/after state,
+            // enabling O(delta × fork_depth) rollback instead of O(state_size) full rebuild.
+            syncAction = mptStore.syncFromStateChanges(stateChangesAccumulator, ordinal)
+            _ <- undoJournal match {
+              case Some(journal) =>
+                journal.wrapApply(
+                  ordinal.value.value,
+                  io.constellationnetwork.security.hash.Hash(ordinal.value.value.toString),
+                  io.constellationnetwork.security.hash.Hash.empty
+                )(syncAction)
+              case None =>
+                syncAction
+            }
             incrementalProof <- builder.buildProof(gsi, ordinal)
 
-            // Self-healing incremental MPT: use incremental as primary path.
-            // After fork switches, stateRef carries entries from abandoned branches
-            // that cause the incremental trie to diverge from a clean rebuild.
-            // On divergence: full-resync stateRef from GSI, rebuild trie, log the heal.
-            // Cost: O(state_size) once per fork switch, then O(delta) resumes.
+            // Verify incremental vs full-rebuild for correctness.
+            // With undo journal: divergence should be impossible (journal tracks mutations).
+            // Without journal: self-healing full resync on divergence.
             incrementalRoot = incrementalProof.mptRoot.map(_.show).getOrElse("none")
             verifyProof <- GlobalSnapshotInfo.mptStateProof[F](gsi)
             verifyRoot = verifyProof.mptRoot.map(_.show).getOrElse("none")
@@ -1160,7 +1172,6 @@ object GlobalSnapshotAcceptanceManager {
                   .as(incrementalProof)
               } else {
                 // Fork switch detected — stateRef is polluted from abandoned branch.
-                // Resync entire MPT store from GSI's full state, then rebuild.
                 for {
                   allEntries <- gsi.allStateEntries[F]
                   _ <- loggerBundle.app.warn(
@@ -1182,6 +1193,8 @@ object GlobalSnapshotAcceptanceManager {
                         s"[ACCEPTANCE] ordinal=$ordinal MPT STILL DIVERGED after resync: " +
                           s"healed=${healedRoot.take(12)} expected=${verifyRoot.take(12)}"
                       )
+                  // Also reset journal state after full resync
+                  _ <- undoJournal.traverse_(_.pruneBelow(ordinal.value.value))
                 } yield verifyProof
               }
 

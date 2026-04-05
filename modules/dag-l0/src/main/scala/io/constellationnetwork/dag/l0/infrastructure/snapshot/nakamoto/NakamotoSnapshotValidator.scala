@@ -167,15 +167,22 @@ object NakamotoSnapshotValidator {
                               if (leader.tips =!= own.tips) diffs += "tips"
                               val diffList = diffs.result()
                               val diffStr = if (diffList.isEmpty) "no-field-diff-detected" else diffList.mkString(",")
-                              // stateProof-only diffs are expected (MPT non-determinism across nodes)
-                              if (diffList.size == 1 && diffList.head.startsWith("stateProof["))
-                                s"ℹ️ Content OK (stateProof-only diff): slot=$slot ${diffList.head}"
-                              else
-                                s"⚠️ Content mismatch: slot=$slot diffs=[$diffStr]"
+                              // stateProof-only diffs (mptRoot) are tolerated — MPT non-determinism
+                              // being fixed by undo journal. All other diffs are REJECTED.
+                              val stateProofOnly = diffList.size == 1 && diffList.head.startsWith("stateProof[")
+                              val msg =
+                                if (stateProofOnly)
+                                  s"ℹ️ Content OK (stateProof-only diff): slot=$slot ${diffList.head}"
+                                else
+                                  s"❌ Content REJECTED: slot=$slot diffs=[$diffStr]"
+                              (msg, stateProofOnly)
                             case _ =>
-                              s"⚠️ Content validation fail: slot=$slot err=$err"
+                              (s"❌ Content validation fail: slot=$slot err=$err", false)
                           }
-                          logger.warn(logMsg).as(Valid(signedSnapshot, context): ValidationResult)
+                          if (logMsg._2)
+                            logger.info(logMsg._1).as(Valid(signedSnapshot, context): ValidationResult)
+                          else
+                            logger.warn(logMsg._1).as(Invalid(s"Content mismatch: ${logMsg._1}"): ValidationResult)
                       }
                 }
               }

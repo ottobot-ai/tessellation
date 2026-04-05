@@ -122,6 +122,12 @@ object GlobalSnapshotConsensus {
 
       feeCalculator = FeeCalculator.make(feeConfigs)
 
+      undoJournal <-
+        if (nakamotoEnabled)
+          io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal.make[F](mptStore).map(Some(_))
+        else
+          Async[F].pure(None: Option[io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal[F]])
+
       snapshotAcceptanceManager =
         GlobalSnapshotAcceptanceManager.make(
           sharedCfg.fieldsAddedOrdinals,
@@ -147,7 +153,8 @@ object GlobalSnapshotConsensus {
           sharedCfg.delegatedStaking.withdrawalTimeLimit
             .getOrElse(sharedCfg.environment, EpochProgress.MinValue),
           mptStore,
-          loggerBundle
+          loggerBundle,
+          undoJournal
         )
 
       consensusStorage <- ConsensusStorage.make[
