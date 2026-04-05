@@ -401,7 +401,9 @@ object GlobalSnapshotConsensus {
                     epochStateRef = epochStateRef,
                     etaRotationSlots = etaRotationSlots,
                     consensusFns = consensusFunctions,
-                    snapshotStorage = globalSnapshotStorage
+                    snapshotStorage = globalSnapshotStorage,
+                    lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
+                    lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage
                   )
                   .compile
                   .drain

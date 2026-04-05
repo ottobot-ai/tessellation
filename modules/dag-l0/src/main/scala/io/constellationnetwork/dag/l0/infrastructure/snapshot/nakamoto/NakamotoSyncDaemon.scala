@@ -8,7 +8,7 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapsh
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto.{StakeRegistry, TipTracker}
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
-import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
+import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.{GossipStream, SidecarClient}
 import io.constellationnetwork.schema._
@@ -58,7 +58,9 @@ object NakamotoSyncDaemon {
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSlots: Long,
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
-    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo]
+    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F]
   ): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
@@ -81,6 +83,8 @@ object NakamotoSyncDaemon {
               etaRotationSlots,
               consensusFns,
               snapshotStorage,
+              lastGlobalSnapshotStorage,
+              lastNGlobalSnapshotStorage,
               logger
             )
 
@@ -109,6 +113,8 @@ object NakamotoSyncDaemon {
     etaRotationSlots: Long,
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     for {
@@ -134,13 +140,11 @@ object NakamotoSyncDaemon {
       slotGap = snap.slot - snap.parentSlot
 
       // Full validation pipeline: VRF + signature + cert + content
-      // Look up the PARENT snapshot from chain store (not receiver's head, which may be on a different fork)
-      parentHash = Hash(snap.parentHash.toByteArray.map("%02x".format(_)).mkString)
+      // All nodes converge on same chain — snapshotStorage.head IS the correct parent
       validationResult <- parsed match {
         case Some((signedSnapshot, context)) =>
-          chainStore.get(parentHash).flatMap {
-            case Some(parentStored) =>
-              // Parent found in chain store — use it for content validation
+          snapshotStorage.head.flatMap {
+            case Some((lastSigned, lastCtx)) =>
               NakamotoSnapshotValidator.validate[F](
                 signedSnapshot = signedSnapshot,
                 context = context,
@@ -153,50 +157,28 @@ object NakamotoSyncDaemon {
                 stakeRegistry = stakeRegistry,
                 lddConfig = lddConfig,
                 consensusFns = consensusFns,
-                lastSignedArtifact = parentStored.signedSnapshot,
-                lastContext = parentStored.context,
+                lastSignedArtifact = lastSigned,
+                lastContext = lastCtx,
                 getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
               )
             case None =>
-              // Parent not in chain store — check if this is ordinal 2 (first post-genesis)
-              // For ordinal 2, parent is the genesis-derived first incremental snapshot
-              snapshotStorage.head.flatMap {
-                case Some((lastSigned, lastCtx)) =>
-                  NakamotoSnapshotValidator.validate[F](
-                    signedSnapshot = signedSnapshot,
-                    context = context,
-                    slot = snap.slot,
-                    vrfProof = snap.vrfProof.toByteArray,
-                    vrfPublicKey = snap.vrfPublicKey.toByteArray,
-                    producerIdBytes = snap.producerId.toByteArray,
-                    eta = epochState.currentEta,
-                    slotGap = slotGap,
-                    stakeRegistry = stakeRegistry,
-                    lddConfig = lddConfig,
-                    consensusFns = consensusFns,
-                    lastSignedArtifact = lastSigned,
-                    lastContext = lastCtx,
-                    getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
-                  )
-                case None =>
-                  // No parent at all — use self-referential for first snapshot
-                  NakamotoSnapshotValidator.validate[F](
-                    signedSnapshot = signedSnapshot,
-                    context = context,
-                    slot = snap.slot,
-                    vrfProof = snap.vrfProof.toByteArray,
-                    vrfPublicKey = snap.vrfPublicKey.toByteArray,
-                    producerIdBytes = snap.producerId.toByteArray,
-                    eta = epochState.currentEta,
-                    slotGap = slotGap,
-                    stakeRegistry = stakeRegistry,
-                    lddConfig = lddConfig,
-                    consensusFns = consensusFns,
-                    lastSignedArtifact = signedSnapshot,
-                    lastContext = context,
-                    getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
-                  )
-              }
+              // No parent yet (shouldn't happen after genesis) — use self-referential
+              NakamotoSnapshotValidator.validate[F](
+                signedSnapshot = signedSnapshot,
+                context = context,
+                slot = snap.slot,
+                vrfProof = snap.vrfProof.toByteArray,
+                vrfPublicKey = snap.vrfPublicKey.toByteArray,
+                producerIdBytes = snap.producerId.toByteArray,
+                eta = epochState.currentEta,
+                slotGap = slotGap,
+                stakeRegistry = stakeRegistry,
+                lddConfig = lddConfig,
+                consensusFns = consensusFns,
+                lastSignedArtifact = signedSnapshot,
+                lastContext = context,
+                getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
+              )
           }
         case None =>
           // No payload — fall back to VRF-only validation (legacy/PoC)
@@ -235,6 +217,8 @@ object NakamotoSyncDaemon {
             lastKnownSlotRef,
             epochStateRef,
             etaRotationSlots,
+            lastGlobalSnapshotStorage,
+            lastNGlobalSnapshotStorage,
             logger
           )
         case NakamotoSnapshotValidator.Invalid(reason) =>
@@ -254,6 +238,8 @@ object NakamotoSyncDaemon {
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSlots: Long,
+    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     for {
@@ -293,7 +279,15 @@ object NakamotoSyncDaemon {
                 )
                 .flatMap { isNew =>
                   if (isNew) {
-                    // Update slot ref from chain store's best tip (may differ from this snapshot if fork was weaker)
+                    // Update canonical storage so ALL nodes build on the same chain tip
+                    // This is the key fix: without this, each node builds on its own last production
+                    HasherSelector[F].withCurrent { implicit hasher =>
+                      signedSnapshot.toHashed[F].flatMap { hashed =>
+                        lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
+                          lastNGlobalSnapshotStorage.setForRecovery(hashed, context) >>
+                          logger.info(s"✅ Updated canonical storage to ordinal=${snap.ordinal} slot=${snap.slot}")
+                      }
+                    } >>
                     chainStore.bestTipSlot.flatMap {
                       case Some(bestSlot) => lastKnownSlotRef.set(Some(bestSlot))
                       case None           => Async[F].unit
