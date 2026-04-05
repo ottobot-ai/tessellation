@@ -288,10 +288,10 @@ object NakamotoSyncDaemon {
                           logger.info(s"✅ Updated canonical storage to ordinal=${snap.ordinal} slot=${snap.slot}")
                       }
                     } >>
-                    chainStore.bestTipSlot.flatMap {
-                      case Some(bestSlot) => lastKnownSlotRef.set(Some(bestSlot))
-                      case None           => Async[F].unit
-                    }
+                      chainStore.bestTipSlot.flatMap {
+                        case Some(bestSlot) => lastKnownSlotRef.set(Some(bestSlot))
+                        case None           => Async[F].unit
+                      }
                   } else Async[F].unit
                 }
             case Left(err) =>
