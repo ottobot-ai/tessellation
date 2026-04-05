@@ -6,7 +6,7 @@ import cats.syntax.all._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
-import io.constellationnetwork.node.shared.domain.nakamoto.{StakeRegistry, TipTracker}
+import io.constellationnetwork.node.shared.domain.nakamoto.{EtaCalculation, StakeRegistry, TipTracker}
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
@@ -135,9 +135,24 @@ object NakamotoSyncDaemon {
           } yield (snapshot, context)).toOption
         } else None
 
-      epochState <- epochStateRef.get
+      genesisEta <- epochStateRef.get.map(_.genesisEta)
       // Use parentSlot from gossip message for gap (same inputs as producer used)
       slotGap = snap.slot - snap.parentSlot
+
+      // Chain-derived eta: deterministic from stored chain, same as producer used.
+      // Period 0: genesis eta. Period N>=1: derived from VRF outputs in period N-1.
+      currentPeriod = EtaCalculation.rotationPeriod(snap.slot, etaRotationSlots)
+      eta <-
+        if (currentPeriod <= 0) {
+          Async[F].pure(genesisEta)
+        } else {
+          chainStore.vrfOutputsForPeriod(currentPeriod - 1, etaRotationSlots).map { chainOutputs =>
+            if (chainOutputs.nonEmpty)
+              EtaCalculation.computeEta(genesisEta, currentPeriod, chainOutputs.map(_._2))
+            else
+              genesisEta // No chain data yet — stay on genesis
+          }
+        }
 
       // Full validation pipeline: VRF + signature + cert + content
       // All nodes converge on same chain — snapshotStorage.head IS the correct parent
@@ -152,7 +167,7 @@ object NakamotoSyncDaemon {
                 vrfProof = snap.vrfProof.toByteArray,
                 vrfPublicKey = snap.vrfPublicKey.toByteArray,
                 producerIdBytes = snap.producerId.toByteArray,
-                eta = epochState.currentEta,
+                eta = eta,
                 slotGap = slotGap,
                 stakeRegistry = stakeRegistry,
                 lddConfig = lddConfig,
@@ -170,7 +185,7 @@ object NakamotoSyncDaemon {
                 vrfProof = snap.vrfProof.toByteArray,
                 vrfPublicKey = snap.vrfPublicKey.toByteArray,
                 producerIdBytes = snap.producerId.toByteArray,
-                eta = epochState.currentEta,
+                eta = eta,
                 slotGap = slotGap,
                 stakeRegistry = stakeRegistry,
                 lddConfig = lddConfig,
@@ -194,7 +209,7 @@ object NakamotoSyncDaemon {
                   vrfVK = vrfVK,
                   slot = Slot(NonNegLong.unsafeFrom(snap.slot)),
                   slotGap = slotGap,
-                  eta = epochState.currentEta,
+                  eta = eta,
                   relativeStake = producerStake,
                   config = lddConfig,
                   proof = proof
@@ -299,18 +314,8 @@ object NakamotoSyncDaemon {
           }
         } else Async[F].unit
 
-      // Accumulate VRF output from received snapshot for epoch rotation
-      // This ensures ALL nodes rotate eta uniformly, not just producers
-      _ <- {
-        val vrfProofBytes = snap.vrfProof.toByteArray
-        val vrf = new io.constellationnetwork.security.vrf.EcVrf25519()
-        vrf.vrfProofToHash(vrfProofBytes) match {
-          case Some(vrfOutput) =>
-            epochStateRef.update(SharedEpochState.accumulate(_, vrfOutput, snap.slot, etaRotationSlots))
-          case None =>
-            logger.warn(s"⚠️ Failed to extract VRF output from proof for slot=${snap.slot}")
-        }
-      }
+      // No in-memory epoch state accumulation needed — eta is chain-derived.
+      // VRF outputs are stored in NakamotoChainStore as part of each snapshot.
 
       // Record in TipTracker (snapshot producer attests to their own tip)
       tipHash = Hash(snap.hash.toByteArray.map("%02x".format(_)).mkString)

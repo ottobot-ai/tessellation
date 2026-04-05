@@ -196,19 +196,21 @@ object SnapshotLeaderLoop {
                   // Query actual relative stake from registry
                   myStake <- stakeRegistry.relativeStake(selfId)
 
-                  // Chain-derived eta: use EtaCalculation for periods >= 2, fall back to SharedEpochState
+                  // Chain-derived eta: deterministic from stored chain, no in-memory accumulator.
+                  // Period 0: genesis eta (constant). Period N>=1: derived from VRF outputs in period N-1.
+                  // All nodes seeing the same chain derive the same eta — no divergence.
                   currentPeriod = EtaCalculation.rotationPeriod(currentSlot, etaRotationSlots)
-                  epochState <- epochStateRef.get
+                  genesisEta <- epochStateRef.get.map(_.genesisEta)
                   eta <-
-                    if (currentPeriod <= 1) {
-                      Async[F].pure(epochState.currentEta)
+                    if (currentPeriod <= 0) {
+                      Async[F].pure(genesisEta)
                     } else {
                       chainStore.vrfOutputsForPeriod(currentPeriod - 1, etaRotationSlots).map { chainOutputs =>
                         if (chainOutputs.nonEmpty) {
-                          EtaCalculation.computeEta(epochState.genesisEta, currentPeriod, chainOutputs.map(_._2))
+                          EtaCalculation.computeEta(genesisEta, currentPeriod, chainOutputs.map(_._2))
                         } else {
-                          // No chain data yet for this period — fall back to accumulator
-                          epochState.currentEta
+                          // No chain data yet for previous period — stay on genesis eta
+                          genesisEta
                         }
                       }
                     }
@@ -508,8 +510,8 @@ object SnapshotLeaderLoop {
             logger.warn(s"No head snapshot in storage — skipping slot $currentSlot (genesis not yet loaded?)")
         }
 
-        // Update epoch state (shared with NakamotoSyncDaemon)
-        _ <- epochStateRef.update(SharedEpochState.accumulate(_, vrfOutput, currentSlot, etaRotationSlots))
+        // No in-memory epoch state update needed — eta is chain-derived.
+        // VRF output is stored in NakamotoChainStore as part of the snapshot.
 
         _ <- stateRef.update { s =>
           s.copy(
