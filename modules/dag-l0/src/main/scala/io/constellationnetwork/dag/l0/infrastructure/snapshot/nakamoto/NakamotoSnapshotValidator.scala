@@ -109,15 +109,28 @@ object NakamotoSnapshotValidator {
                   case Left(reason) =>
                     logger.warn(s"❌ Cert mismatch: $reason").as(Invalid(reason): ValidationResult)
                   case Right(_) =>
-                    // Step 4 (Content validation) SKIPPED for Nakamoto:
-                    // validateArtifact re-derives the snapshot from the receiver's local state,
-                    // which diverges across Nakamoto forks. VRF + signature + cert (steps 1-3)
-                    // prove the snapshot was legitimately produced by an eligible leader.
-                    // Content integrity is ensured by the signed hash.
-                    // TODO: Re-enable once chain replay/state sync is implemented.
-                    logger
-                      .debug(s"✅ VRF+sig+cert validation passed: slot=$slot ordinal=${signedSnapshot.ordinal}")
-                      .as(Valid(signedSnapshot, lastContext): ValidationResult)
+                    // ── Step 4: Content validation ──
+                    // Re-run validateArtifact using the PARENT snapshot from chain store
+                    // (not the receiver's local head, which may be on a different fork)
+                    consensusFns
+                      .validateArtifact(
+                        lastSignedArtifact,
+                        lastContext,
+                        EventTrigger,
+                        signedSnapshot.value,
+                        Set(producerId),
+                        getByOrdinal
+                      )
+                      .flatMap {
+                        case Right((_, validatedContext)) =>
+                          logger
+                            .debug(s"✅ Full validation passed: slot=$slot ordinal=${signedSnapshot.ordinal}")
+                            .as(Valid(signedSnapshot, validatedContext): ValidationResult)
+                        case Left(err) =>
+                          logger
+                            .warn(s"❌ Content validation failed: slot=$slot err=$err")
+                            .as(Invalid(s"Content validation: $err"): ValidationResult)
+                      }
                 }
               }
             }
