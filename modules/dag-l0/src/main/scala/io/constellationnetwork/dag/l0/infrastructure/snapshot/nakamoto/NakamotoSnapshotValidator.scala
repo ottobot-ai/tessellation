@@ -140,14 +140,36 @@ object NakamotoSnapshotValidator {
                                 diffs += s"lastHash(recv=${leader.lastSnapshotHash.show.take(12)},own=${own.lastSnapshotHash.show.take(12)})"
                               if (leader.epochProgress =!= own.epochProgress)
                                 diffs += s"epoch(recv=${leader.epochProgress},own=${own.epochProgress})"
-                              if (leader.stateProof =!= own.stateProof) diffs += "stateProof"
+                              if (leader.stateProof =!= own.stateProof) {
+                                val lp = leader.stateProof
+                                val op = own.stateProof
+                                val spDiffs = List.newBuilder[String]
+                                if (lp.lastStateChannelSnapshotHashesProof =!= op.lastStateChannelSnapshotHashesProof) spDiffs += "scHashes"
+                                if (lp.lastTxRefsProof =!= op.lastTxRefsProof) spDiffs += "txRefs"
+                                if (lp.balancesProof =!= op.balancesProof) spDiffs += "balances"
+                                if (lp.lastCurrencySnapshotsProof =!= op.lastCurrencySnapshotsProof) spDiffs += "currSnapshots"
+                                if (lp.activeAllowSpends =!= op.activeAllowSpends) spDiffs += "allowSpends"
+                                if (lp.activeTokenLocks =!= op.activeTokenLocks) spDiffs += "tokenLocks"
+                                if (lp.tokenLockBalances =!= op.tokenLockBalances) spDiffs += "tokenLockBal"
+                                if (lp.lastAllowSpendRefs =!= op.lastAllowSpendRefs) spDiffs += "allowSpendRefs"
+                                if (lp.lastTokenLockRefs =!= op.lastTokenLockRefs) spDiffs += "tokenLockRefs"
+                                if (lp.updateNodeParameters =!= op.updateNodeParameters) spDiffs += "nodeParams"
+                                if (lp.activeDelegatedStakes =!= op.activeDelegatedStakes) spDiffs += "delegStakes"
+                                if (lp.delegatedStakesWithdrawals =!= op.delegatedStakesWithdrawals) spDiffs += "delegWithdraw"
+                                if (lp.activeNodeCollaterals =!= op.activeNodeCollaterals) spDiffs += "nodeCollat"
+                                if (lp.nodeCollateralWithdrawals =!= op.nodeCollateralWithdrawals) spDiffs += "collatWithdraw"
+                                if (lp.priceState =!= op.priceState) spDiffs += "priceState"
+                                if (lp.lastGlobalSnapshotsWithCurrency =!= op.lastGlobalSnapshotsWithCurrency) spDiffs += "globalWithCurr"
+                                if (lp.mptRoot =!= op.mptRoot) spDiffs += "mptRoot"
+                                diffs += s"stateProof[${spDiffs.result().mkString(",")}]"
+                              }
                               if (leader.rewards =!= own.rewards) diffs += s"rewards(recv=${leader.rewards.size},own=${own.rewards.size})"
                               if (leader.tips =!= own.tips) diffs += "tips"
                               val diffList = diffs.result()
                               val diffStr = if (diffList.isEmpty) "no-field-diff-detected" else diffList.mkString(",")
                               // stateProof-only diffs are expected (MPT non-determinism across nodes)
-                              if (diffList == List("stateProof"))
-                                s"ℹ️ Content OK (stateProof-only diff, expected): slot=$slot"
+                              if (diffList.size == 1 && diffList.head.startsWith("stateProof["))
+                                s"ℹ️ Content OK (stateProof-only diff): slot=$slot ${diffList.head}"
                               else
                                 s"⚠️ Content mismatch: slot=$slot diffs=[$diffStr]"
                             case _ =>

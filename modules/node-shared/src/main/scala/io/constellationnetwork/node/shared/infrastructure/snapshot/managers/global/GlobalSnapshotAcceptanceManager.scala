@@ -1138,11 +1138,22 @@ object GlobalSnapshotAcceptanceManager {
             )
 
             _ <- mptStore.syncFromStateChanges(stateChangesAccumulator, ordinal)
-            stateProof <- builder.buildProof(gsi, ordinal)
+            incrementalProof <- builder.buildProof(gsi, ordinal)
+
+            // Use full-rebuild MPT for deterministic stateProof.
+            // The incremental MPT can diverge after forks because it carries polluted state
+            // from abandoned branches. Full rebuild from GlobalSnapshotInfo is always deterministic
+            // given identical inputs.
+            stateProof <- GlobalSnapshotInfo.mptStateProof[F](gsi)
+            incrementalRoot = incrementalProof.mptRoot.map(_.show.take(12)).getOrElse("none")
+            fullRebuildRoot = stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")
+            mptMatch = if (incrementalRoot == fullRebuildRoot) "MATCH" else "DIVERGED"
 
             _ <- loggerBundle.app.info(
               s"[ACCEPTANCE] ordinal=$ordinal EXIT stateProof: " +
-                s"mptRoot=${stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")} " +
+                s"mptRoot=$fullRebuildRoot " +
+                s"incrementalRoot=$incrementalRoot " +
+                s"mptConsistency=$mptMatch " +
                 s"balances=${stateProof.balancesProof.show.take(12)} " +
                 s"txRefs=${stateProof.lastTxRefsProof.show.take(12)} " +
                 s"scHashes=${stateProof.lastStateChannelSnapshotHashesProof.show.take(12)} " +
