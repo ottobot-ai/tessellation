@@ -53,7 +53,7 @@ services:
     command: [
       "-grpc", "0.0.0.0:50051",
       "-listen", "/ip4/0.0.0.0/tcp/9500",
-      "-seedlist", "/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500"
+      "-seedlist", "/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500"
     ]
     networks:
       nakamoto:
@@ -99,7 +99,7 @@ services:
     command: [
       "-grpc", "0.0.0.0:50051",
       "-listen", "/ip4/0.0.0.0/tcp/9500",
-      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500"
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500"
     ]
     networks:
       nakamoto:
@@ -142,7 +142,7 @@ services:
     command: [
       "-grpc", "0.0.0.0:50051",
       "-listen", "/ip4/0.0.0.0/tcp/9500",
-      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500"
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500"
     ]
     networks:
       nakamoto:
@@ -177,6 +177,53 @@ services:
     networks:
       nakamoto:
         aliases: [node-2]
+
+  # ── Node 3 (validator — joins mid-chain) ───────────
+  sidecar-3:
+    <<: *sidecar-common
+    container_name: nakamoto-sidecar-3
+    command: [
+      "-grpc", "0.0.0.0:50051",
+      "-listen", "/ip4/0.0.0.0/tcp/9500",
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500"
+    ]
+    networks:
+      nakamoto:
+        aliases: [sidecar-3]
+    profiles:
+      - validator
+
+  node-3:
+    <<: *jvm-common
+    container_name: nakamoto-node-3
+    environment:
+      <<: *jvm-env
+      CL_KEYSTORE: /opt/keys/key.p12
+      SIDECAR_HOST: sidecar-3
+      SIDECAR_GRPC_PORT: "50051"
+      CL_PUBLIC_HTTP_PORT: "9030"
+      CL_P2P_HTTP_PORT: "9031"
+      CL_CLI_HTTP_PORT: "9032"
+    volumes:
+      - ./genesis.csv:/opt/genesis.csv:ro
+      - ./seedlist.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/6:/opt/keys:ro
+    command: >
+      run-nakamoto-validator
+      --ip node-3
+      --public-port 9030
+      --p2p-port 9031
+      --cli-port 9032
+      --seedlist /opt/seedlist.csv
+      --collateral 0
+      --nakamoto-peer http://node-0:9000
+    depends_on:
+      - sidecar-3
+    networks:
+      nakamoto:
+        aliases: [node-3]
+    profiles:
+      - validator
 
 networks:
   nakamoto:

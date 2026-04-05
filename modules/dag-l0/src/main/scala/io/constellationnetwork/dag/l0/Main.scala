@@ -597,10 +597,10 @@ object Main
                 _ <- IO(println(s"\u2705 Initialized from peer at ordinal=${latestSnapshot.ordinal}. Starting VRF production."))
               } yield ()
             }
-          } >>
-            services.cluster.createSession >>
-            services.session.createSession >>
-            storages.node.setNodeState(NodeState.Ready)
+            // Skip session/cluster token creation — Nakamoto consensus doesn't use
+            // tessellation BFT sessions, and the state machine doesn't accept
+            // WaitingForDownload→StartingSession transitions.
+          }
       }).asResource
     } yield ()
   }

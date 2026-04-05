@@ -94,6 +94,14 @@ final case class SnapshotRoutes[F[_]: Async, S <: Snapshot: Encoder, SI <: Snaps
             }
           }
 
+        case GET -> Root / "latest" / "info" =>
+          whenNodeReady {
+            snapshotStorage.head.flatMap {
+              case Some((_, info)) => Ok(info)
+              case _               => NotFound()
+            }
+          }
+
         case GET -> Root / "latest" / "combined" =>
           whenNodeReady {
             snapshotStorage.head.flatMap {
