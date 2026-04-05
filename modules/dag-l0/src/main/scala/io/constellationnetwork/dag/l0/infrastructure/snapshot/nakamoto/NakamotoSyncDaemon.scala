@@ -155,11 +155,14 @@ object NakamotoSyncDaemon {
         }
 
       // Full validation pipeline: VRF + signature + cert + content
-      // All nodes converge on same chain — snapshotStorage.head IS the correct parent
+      // Look up the ACTUAL parent from chain store using parentHash from gossip message.
+      // Can't use snapshotStorage.head — local node may have produced ahead of this snapshot.
+      parentHash = Hash(snap.parentHash.toByteArray.map("%02x".format(_)).mkString)
       validationResult <- parsed match {
         case Some((signedSnapshot, context)) =>
-          snapshotStorage.head.flatMap {
-            case Some((lastSigned, lastCtx)) =>
+          chainStore.get(parentHash).flatMap {
+            case Some(parentStored) =>
+              // Found actual parent in chain store — validate against it
               NakamotoSnapshotValidator.validate[F](
                 signedSnapshot = signedSnapshot,
                 context = context,
@@ -172,28 +175,33 @@ object NakamotoSyncDaemon {
                 stakeRegistry = stakeRegistry,
                 lddConfig = lddConfig,
                 consensusFns = consensusFns,
-                lastSignedArtifact = lastSigned,
-                lastContext = lastCtx,
+                lastSignedArtifact = parentStored.signedSnapshot,
+                lastContext = parentStored.context,
                 getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
               )
             case None =>
-              // No parent yet (shouldn't happen after genesis) — use self-referential
-              NakamotoSnapshotValidator.validate[F](
-                signedSnapshot = signedSnapshot,
-                context = context,
-                slot = snap.slot,
-                vrfProof = snap.vrfProof.toByteArray,
-                vrfPublicKey = snap.vrfPublicKey.toByteArray,
-                producerIdBytes = snap.producerId.toByteArray,
-                eta = eta,
-                slotGap = slotGap,
-                stakeRegistry = stakeRegistry,
-                lddConfig = lddConfig,
-                consensusFns = consensusFns,
-                lastSignedArtifact = signedSnapshot,
-                lastContext = context,
-                getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
-              )
+              // Parent not in chain store — try snapshotStorage.head as fallback
+              snapshotStorage.head.flatMap {
+                case Some((lastSigned, lastCtx)) =>
+                  NakamotoSnapshotValidator.validate[F](
+                    signedSnapshot = signedSnapshot,
+                    context = context,
+                    slot = snap.slot,
+                    vrfProof = snap.vrfProof.toByteArray,
+                    vrfPublicKey = snap.vrfPublicKey.toByteArray,
+                    producerIdBytes = snap.producerId.toByteArray,
+                    eta = eta,
+                    slotGap = slotGap,
+                    stakeRegistry = stakeRegistry,
+                    lddConfig = lddConfig,
+                    consensusFns = consensusFns,
+                    lastSignedArtifact = lastSigned,
+                    lastContext = lastCtx,
+                    getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
+                  )
+                case None =>
+                  Async[F].pure(NakamotoSnapshotValidator.Invalid("No parent found"): NakamotoSnapshotValidator.ValidationResult)
+              }
           }
         case None =>
           // No payload — fall back to VRF-only validation (legacy/PoC)
