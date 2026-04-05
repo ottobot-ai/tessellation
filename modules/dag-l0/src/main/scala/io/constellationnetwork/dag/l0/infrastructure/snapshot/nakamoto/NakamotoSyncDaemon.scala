@@ -1,6 +1,7 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import cats.effect.kernel.{Async, Ref}
+import cats.effect.std.Semaphore
 import cats.syntax.all._
 
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
@@ -65,36 +66,42 @@ object NakamotoSyncDaemon {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
     fs2.Stream.eval(Ref.of[F, SyncState](SyncState.initial)).flatMap { stateRef =>
-      GossipStream.subscribe[F](channel).evalMap { msg =>
-        msg.body match {
-          case pb.GossipMessage.Body.Snapshot(snap) =>
-            handleSnapshot(
-              snap,
-              stateRef,
-              chainStore,
-              nodeStorage,
-              tipTracker,
-              stakeRegistry,
-              sidecarClient,
-              selfId,
-              lddConfig,
-              lastKnownSlotRef,
-              epochStateRef,
-              etaRotationSlots,
-              consensusFns,
-              snapshotStorage,
-              lastGlobalSnapshotStorage,
-              lastNGlobalSnapshotStorage,
-              logger
-            )
+      // Serialize snapshot processing so each one sees correct parent state.
+      // Attestations are lightweight and don't need serialization.
+      fs2.Stream.eval(Semaphore[F](1)).flatMap { snapshotSemaphore =>
+        GossipStream.subscribe[F](channel).evalMap { msg =>
+          msg.body match {
+            case pb.GossipMessage.Body.Snapshot(snap) =>
+              snapshotSemaphore.permit.use { _ =>
+                handleSnapshot(
+                  snap,
+                  stateRef,
+                  chainStore,
+                  nodeStorage,
+                  tipTracker,
+                  stakeRegistry,
+                  sidecarClient,
+                  selfId,
+                  lddConfig,
+                  lastKnownSlotRef,
+                  epochStateRef,
+                  etaRotationSlots,
+                  consensusFns,
+                  snapshotStorage,
+                  lastGlobalSnapshotStorage,
+                  lastNGlobalSnapshotStorage,
+                  logger
+                )
+              } // snapshotSemaphore.permit.use
 
-          case pb.GossipMessage.Body.Attestation(att) =>
-            handleAttestation(att, tipTracker, logger)
+            case pb.GossipMessage.Body.Attestation(att) =>
+              handleAttestation(att, tipTracker, logger)
 
-          case pb.GossipMessage.Body.Empty =>
-            Async[F].unit
+            case pb.GossipMessage.Body.Empty =>
+              Async[F].unit
+          }
         }
-      }
+      } // snapshotSemaphore
     }
   }
 
