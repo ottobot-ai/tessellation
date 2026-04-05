@@ -72,28 +72,38 @@ object NakamotoSyncDaemon {
       GossipStream.subscribe[F](channel).evalMap { msg =>
         msg.body match {
           case pb.GossipMessage.Body.Snapshot(snap) =>
-            snapshotSemaphore.permit.use { _ =>
-              handleSnapshot(
-                snap,
-                stateRef,
-                chainStore,
-                nodeStorage,
-                tipTracker,
-                stakeRegistry,
-                sidecarClient,
-                selfId,
-                lddConfig,
-                lastKnownSlotRef,
-                epochStateRef,
-                etaRotationSlots,
-                consensusFns,
-                snapshotStorage,
-                lastGlobalSnapshotStorage,
-                lastNGlobalSnapshotStorage,
-                productionGate,
-                logger
-              )
-            } // snapshotSemaphore.permit.use
+            // Pre-semaphore: if incoming snapshot would beat our current tip,
+            // pause production immediately so SnapshotLeaderLoop doesn't build
+            // on a tip we're about to abandon.
+            val incomingOrdinal = snap.ordinal
+            chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
+              val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
+              (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
+               else Async[F].unit) >>
+                snapshotSemaphore.permit.use { _ =>
+                  handleSnapshot(
+                    snap,
+                    stateRef,
+                    chainStore,
+                    nodeStorage,
+                    tipTracker,
+                    stakeRegistry,
+                    sidecarClient,
+                    selfId,
+                    lddConfig,
+                    lastKnownSlotRef,
+                    epochStateRef,
+                    etaRotationSlots,
+                    consensusFns,
+                    snapshotStorage,
+                    lastGlobalSnapshotStorage,
+                    lastNGlobalSnapshotStorage,
+                    productionGate,
+                    logger
+                  )
+                } >> // snapshotSemaphore.permit.use
+                productionGate.resume(ProductionGate.BetterGossipReceived)
+            } // chainStore.bestTipOrdinal.flatMap
 
           case pb.GossipMessage.Body.Attestation(att) =>
             handleAttestation(att, tipTracker, logger)

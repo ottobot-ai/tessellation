@@ -69,6 +69,9 @@ object NakamotoChainStore {
     /** Get the current best tip's slot (for LDD gap calculation) */
     def bestTipSlot: F[Option[Long]]
 
+    /** Get the current best tip's ordinal */
+    def bestTipOrdinal: F[Option[Long]]
+
     /** Get a snapshot by hash */
     def get(hash: Hash): F[Option[StoredSnapshot]]
 
@@ -198,6 +201,9 @@ object NakamotoChainStore {
 
         def bestTipSlot: F[Option[Long]] =
           bestTip.map(_.map(_.slot))
+
+        def bestTipOrdinal: F[Option[Long]] =
+          bestTip.map(_.map(_.ordinal))
 
         def get(hash: Hash): F[Option[StoredSnapshot]] =
           stateRef.get.map(_.byHash.get(hash))
