@@ -109,30 +109,33 @@ object NakamotoSnapshotValidator {
                   case Left(reason) =>
                     logger.warn(s"❌ Cert mismatch: $reason").as(Invalid(reason): ValidationResult)
                   case Right(_) =>
-                    // ── Step 4: Content validation (advisory, non-blocking) ──
-                    // VRF+sig+cert already verified — accept the snapshot.
-                    // Content validation logged as warning if it fails, but doesn't block storage.
-                    // This allows chain convergence: canonical storage updates happen on accepted
-                    // snapshots, which in turn makes future content validations pass.
+                    // ── Step 4: Content validation ──
+                    // Compare received artifact against locally-recreated one.
+                    // Strip Nakamoto-specific fields (slotCertificate, eta) before comparison
+                    // since createProposalArtifact doesn't populate them — producer adds them post-creation.
+                    val strippedReceived = signedSnapshot.value.copy(slotCertificate = None, eta = None)
                     consensusFns
                       .validateArtifact(
                         lastSignedArtifact,
                         lastContext,
                         EventTrigger,
-                        signedSnapshot.value,
+                        strippedReceived,
                         Set(producerId),
                         getByOrdinal
                       )
                       .flatMap {
                         case Right((_, validatedContext)) =>
+                          // Content matches AND we have properly derived state (stateProof correct)
                           logger
-                            .debug(s"✅ Full validation passed: slot=$slot ordinal=${signedSnapshot.ordinal}")
+                            .debug(s"✅ Full content validation passed: slot=$slot ordinal=${signedSnapshot.ordinal}")
                             .as(Valid(signedSnapshot, validatedContext): ValidationResult)
                         case Left(err) =>
-                          // Accept anyway — VRF+sig+cert are sufficient for chain convergence
-                          // Content mismatch typically means our local parent state differs from producer's
+                          // Artifact mismatch but VRF+sig+cert verified.
+                          // IMPORTANT: still accept but use PRODUCER's context since we couldn't
+                          // re-derive state. This is a degraded mode — state proof is unverified.
+                          // TODO: make this a hard reject once all mismatch sources are eliminated
                           logger
-                            .warn(s"⚠️ Content validation advisory fail (accepted anyway): slot=$slot err=$err")
+                            .warn(s"⚠️ Content validation fail (accepted — VRF+sig+cert OK): slot=$slot err=$err")
                             .as(Valid(signedSnapshot, context): ValidationResult)
                       }
                 }
