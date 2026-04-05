@@ -163,7 +163,8 @@ object SnapshotLeaderLoop {
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     genesisTimeMs: Long = 0L,
-    snapshotSemaphore: cats.effect.std.Semaphore[F]
+    snapshotSemaphore: cats.effect.std.Semaphore[F],
+    productionGate: ProductionGate[F]
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -180,9 +181,15 @@ object SnapshotLeaderLoop {
             state <- stateRef.get
             wallClockMs = System.currentTimeMillis()
             currentSlot = (wallClockMs - state.genesisTimeMs) / 1000L
+            gateOpen <- productionGate.isOpen
             _ <-
               if (nodeState =!= NodeState.Ready) Async[F].unit
-              else if (currentSlot < 0) {
+              else if (!gateOpen) {
+                Async[F].whenA(currentSlot % 30 == 0) {
+                  productionGate.pauseReasons
+                    .flatMap(reasons => logger.debug(s"Slot $currentSlot: production paused (${reasons.mkString(", ")})"))
+                }
+              } else if (currentSlot < 0) {
                 // Still waiting for coordinated genesis time
                 Async[F].whenA(currentSlot % 10 == 0)(logger.info(s"⏳ Waiting for genesis (${-currentSlot}s remaining)"))
               } else
@@ -253,6 +260,7 @@ object SnapshotLeaderLoop {
                           etaRotationSlots,
                           lastKnownSlotRef,
                           epochStateRef,
+                          productionGate,
                           logger
                         )
                       } // snapshotSemaphore.permit
@@ -370,6 +378,7 @@ object SnapshotLeaderLoop {
     etaRotationSlots: Long,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
+    productionGate: ProductionGate[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -468,45 +477,56 @@ object SnapshotLeaderLoop {
               }.toSet
               _ <- eventMempool.clearIncluded(includedHashes)
 
-              // Publish via GossipSub sidecar
-              snapshotHash = snapshotHashedForStorage.hash
-              _ <- sidecarClient
-                .publishSnapshot(
-                  SidecarClient.mkSnapshot(
-                    hash = snapshotHash.value.getBytes,
-                    slot = currentSlot,
-                    ordinal = lastKey.value.value + 1,
-                    parentHash = lastHashed.hash.value.getBytes,
-                    vrfProof = proof,
-                    vrfPublicKey = vrfPK,
-                    eta = currentEta,
-                    payload = {
-                      import io.circe.syntax._
-                      val snapshotJson = signed.asJson
-                      val contextJson = context.asJson
-                      val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
-                      combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                    },
-                    producerId = selfId.value.toBytes,
-                    parentSlot = parentSlotValue
+              // Check gate before publishing — a better gossip snapshot may have arrived
+              // during proposal creation. If gate is closed, abandon this production.
+              stillOpen <- productionGate.isOpen
+              _ <-
+                if (!stillOpen)
+                  productionGate.pauseReasons.flatMap(reasons =>
+                    logger.info(s"🛑 Abandoning production at slot $currentSlot before publish (gate closed: ${reasons.mkString(", ")})")
                   )
-                )
-                .void
-                .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}"))
+                else Async[F].unit
 
-              // Self-attest (producer always attests to own snapshot)
-              selfAttestation = io.constellationnetwork.schema.nakamoto.TipAttestation(
-                tipHash = snapshotHash,
-                tipSlot = slotRefined,
-                tipOrdinal = lastKey.value.value + 1,
-                attestedAt = slotRefined
-              )
-              _ <- tipTracker.recordAttestation(selfId, selfAttestation)
-
-              _ <- logger.info(
-                s"📦 Produced snapshot ordinal=${lastKey.value.value + 1} slot=$currentSlot " +
-                  s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"
-              )
+              // Publish + self-attest only if gate is still open
+              snapshotHash = snapshotHashedForStorage.hash
+              _ <- Async[F].whenA(stillOpen) {
+                sidecarClient
+                  .publishSnapshot(
+                    SidecarClient.mkSnapshot(
+                      hash = snapshotHash.value.getBytes,
+                      slot = currentSlot,
+                      ordinal = lastKey.value.value + 1,
+                      parentHash = lastHashed.hash.value.getBytes,
+                      vrfProof = proof,
+                      vrfPublicKey = vrfPK,
+                      eta = currentEta,
+                      payload = {
+                        import io.circe.syntax._
+                        val snapshotJson = signed.asJson
+                        val contextJson = context.asJson
+                        val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
+                        combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                      },
+                      producerId = selfId.value.toBytes,
+                      parentSlot = parentSlotValue
+                    )
+                  )
+                  .void
+                  .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}")) >> {
+                  // Self-attest (producer always attests to own snapshot)
+                  val selfAttestation = io.constellationnetwork.schema.nakamoto.TipAttestation(
+                    tipHash = snapshotHash,
+                    tipSlot = slotRefined,
+                    tipOrdinal = lastKey.value.value + 1,
+                    attestedAt = slotRefined
+                  )
+                  tipTracker.recordAttestation(selfId, selfAttestation)
+                } >>
+                  logger.info(
+                    s"📦 Produced snapshot ordinal=${lastKey.value.value + 1} slot=$currentSlot " +
+                      s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"
+                  )
+              }
             } yield ()
 
           case None =>

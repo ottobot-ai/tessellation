@@ -7,7 +7,7 @@ import cats.syntax.all._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
-import io.constellationnetwork.node.shared.domain.nakamoto.{EtaCalculation, StakeRegistry, TipTracker}
+import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
@@ -62,7 +62,8 @@ object NakamotoSyncDaemon {
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
-    snapshotSemaphore: Semaphore[F]
+    snapshotSemaphore: Semaphore[F],
+    productionGate: ProductionGate[F]
   ): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
@@ -89,6 +90,7 @@ object NakamotoSyncDaemon {
                 snapshotStorage,
                 lastGlobalSnapshotStorage,
                 lastNGlobalSnapshotStorage,
+                productionGate,
                 logger
               )
             } // snapshotSemaphore.permit.use
@@ -120,6 +122,7 @@ object NakamotoSyncDaemon {
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
+    productionGate: ProductionGate[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     for {
@@ -247,6 +250,7 @@ object NakamotoSyncDaemon {
             etaRotationSlots,
             lastGlobalSnapshotStorage,
             lastNGlobalSnapshotStorage,
+            productionGate,
             logger
           )
         case NakamotoSnapshotValidator.Invalid(reason) =>
@@ -268,6 +272,7 @@ object NakamotoSyncDaemon {
     etaRotationSlots: Long,
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
+    productionGate: ProductionGate[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     for {
@@ -307,19 +312,21 @@ object NakamotoSyncDaemon {
                 )
                 .flatMap { isNew =>
                   if (isNew) {
-                    // Update canonical storage so ALL nodes build on the same chain tip
-                    // This is the key fix: without this, each node builds on its own last production
-                    HasherSelector[F].withCurrent { implicit hasher =>
-                      signedSnapshot.toHashed[F].flatMap { hashed =>
-                        lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
-                          lastNGlobalSnapshotStorage.setForRecovery(hashed, context) >>
-                          logger.info(s"✅ Updated canonical storage to ordinal=${snap.ordinal} slot=${snap.slot}")
-                      }
-                    } >>
+                    // Pause production during canonical storage update — prevents
+                    // SnapshotLeaderLoop from building on the stale tip
+                    productionGate.pause(ProductionGate.ReorgInProgress) >>
+                      HasherSelector[F].withCurrent { implicit hasher =>
+                        signedSnapshot.toHashed[F].flatMap { hashed =>
+                          lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
+                            lastNGlobalSnapshotStorage.setForRecovery(hashed, context) >>
+                            logger.info(s"✅ Updated canonical storage to ordinal=${snap.ordinal} slot=${snap.slot}")
+                        }
+                      } >>
                       chainStore.bestTipSlot.flatMap {
                         case Some(bestSlot) => lastKnownSlotRef.set(Some(bestSlot))
                         case None           => Async[F].unit
-                      }
+                      } >>
+                      productionGate.resume(ProductionGate.ReorgInProgress)
                   } else Async[F].unit
                 }
             case Left(err) =>

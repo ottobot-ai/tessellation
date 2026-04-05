@@ -385,6 +385,7 @@ object GlobalSnapshotConsensus {
               // Shared semaphore: serialize snapshot production and gossip processing
               // so each operation sees correct parent state (Bifrost uses same pattern)
               snapshotSemaphore <- cats.effect.std.Semaphore[F](1)
+              productionGate <- io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate.make[F]
               sidecarConfig = io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarConfig(
                 host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
                 grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
@@ -414,7 +415,8 @@ object GlobalSnapshotConsensus {
                     lastKnownSlotRef = lastKnownSlotRef,
                     epochStateRef = epochStateRef,
                     genesisTimeMs = pureGenesisTimeMs,
-                    snapshotSemaphore = snapshotSemaphore
+                    snapshotSemaphore = snapshotSemaphore,
+                    productionGate = productionGate
                   )
                   .compile
                   .drain
@@ -438,7 +440,8 @@ object GlobalSnapshotConsensus {
                     snapshotStorage = globalSnapshotStorage,
                     lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
                     lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
-                    snapshotSemaphore = snapshotSemaphore
+                    snapshotSemaphore = snapshotSemaphore,
+                    productionGate = productionGate
                   )
                   .compile
                   .drain
