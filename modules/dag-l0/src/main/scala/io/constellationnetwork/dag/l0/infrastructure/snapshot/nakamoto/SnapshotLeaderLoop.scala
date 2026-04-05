@@ -395,7 +395,7 @@ object SnapshotLeaderLoop {
           activePoolHash = activePoolHash
         )
 
-        _ <- logger.info(s"🎰 WON slot $currentSlot (gap=$slotGap, pool=$activePoolSize) — producing snapshot")
+        _ <- logger.info(s"🎰 WON slot $currentSlot (gap=$slotGap, parentSlot=$parentSlotValue, pool=$activePoolSize) — producing snapshot")
 
         // Get last snapshot from storage
         headOpt <- snapshotStorage.head

@@ -339,15 +339,14 @@ object GlobalSnapshotConsensus {
               lastKnownSlotRef <- cats.effect.kernel.Ref.of[F, Option[Long]](None)
               // Shared epoch state: VRF outputs from ALL sources accumulate here for eta rotation
               genesisEta = {
-                val rawPrivKey: Array[Byte] = keyPair.getPrivate match {
-                  case ecKey: java.security.interfaces.ECPrivateKey =>
-                    val bytes = ecKey.getS.toByteArray
-                    if (bytes.length > 32) bytes.drop(bytes.length - 32)
-                    else if (bytes.length < 32) Array.fill(32 - bytes.length)(0.toByte) ++ bytes
-                    else bytes
-                  case other => other.getEncoded.takeRight(32)
-                }
-                io.constellationnetwork.security.vrf.VrfKeyDeriver.deriveVrfSeed(rawPrivKey).take(32)
+                // Genesis eta must be identical across all nodes — derive from a fixed domain string
+                // (In production, derive from genesis snapshot hash. For now, use a deterministic constant.)
+                val genesisEtaSeed = "tessellation-nakamoto-genesis-eta-v1".getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                val genesisEtaDigest = new org.bouncycastle.crypto.digests.Blake2bDigest(256)
+                genesisEtaDigest.update(genesisEtaSeed, 0, genesisEtaSeed.length)
+                val genesisEtaBytes = new Array[Byte](32)
+                genesisEtaDigest.doFinal(genesisEtaBytes, 0)
+                genesisEtaBytes
               }
               epochStateRef <- cats.effect.kernel.Ref
                 .of[F, io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState](

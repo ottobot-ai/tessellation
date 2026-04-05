@@ -113,7 +113,7 @@ object NakamotoSyncDaemon {
   ): F[Unit] =
     for {
       _ <- logger.info(
-        s"📥 Received snapshot ordinal=${snap.ordinal} slot=${snap.slot} from=${snap.producerId.toByteArray.take(4).map("%02x".format(_)).mkString}"
+        s"📥 Received snapshot ordinal=${snap.ordinal} slot=${snap.slot} parentSlot=${snap.parentSlot} from=${snap.producerId.toByteArray.take(4).map("%02x".format(_)).mkString}"
       )
 
       // Deserialize payload
