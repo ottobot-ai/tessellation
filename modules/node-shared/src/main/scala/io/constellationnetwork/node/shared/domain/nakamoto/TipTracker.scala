@@ -67,7 +67,7 @@ object TipTracker {
                 // New or newer attestation, record it
                 current.updated(peerId, attestation)
             }
-          }
+          } >> stakeRegistry.markActive(peerId) // Track this peer as actively participating
 
         def attestationWeight(tipHash: Hash): F[Double] =
           for {
@@ -75,7 +75,7 @@ object TipTracker {
             weights <- attestations.toList.traverse {
               case (peerId, att) =>
                 if (att.tipHash === tipHash)
-                  stakeRegistry.relativeStake(peerId)
+                  stakeRegistry.optimisticRelativeStake(peerId) // Use optimistic weight (active peers only)
                 else
                   0.0.pure[F]
             }

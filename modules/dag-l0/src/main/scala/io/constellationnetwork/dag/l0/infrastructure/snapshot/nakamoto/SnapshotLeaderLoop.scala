@@ -290,6 +290,7 @@ object SnapshotLeaderLoop {
             allAtts <- tipTracker.allAttestations
             heaviest <- tipTracker.heaviestTip
             validatorCount <- stakeRegistry.validatorCount
+            activeCount <- stakeRegistry.observedActiveCount
             bestTip <- chainStore.bestTip
             alreadyFinalized <- tipTracker.lastFinalized
             lastFinalizedOrdinal = alreadyFinalized.map { case (_, s) => s.value.value }.getOrElse(0L)
@@ -323,7 +324,7 @@ object SnapshotLeaderLoop {
                 val peerIds = allAtts.keys.map(_.value.value.take(8)).mkString(",")
                 logger.info(
                   s"📊 Attestations: tip=${hash.value.take(12)}.. slot=${slot.value.value} weight=${"%.2f"
-                      .format(weight)} (${attestersForTip}/${validatorCount} validators) peers=[${peerIds}]"
+                      .format(weight)} (${attestersForTip}/${activeCount} active, ${validatorCount} seedlist) peers=[${peerIds}]"
                 ) >>
                   (if (weight >= TipTracker.FinalityThreshold) {
                      val isNew = alreadyFinalized.forall { case (fh, _) => fh =!= hash }
@@ -336,7 +337,7 @@ object SnapshotLeaderLoop {
                          } >>
                          logger.info(
                            s"✅ ATTEST-FINALIZED snapshot at slot ${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
-                               .format(weight)}, ${attestersForTip}/${validatorCount} attesters)"
+                               .format(weight)}, ${attestersForTip}/${activeCount} active of ${validatorCount} seedlist)"
                          )
                      }
                    } else Async[F].unit)

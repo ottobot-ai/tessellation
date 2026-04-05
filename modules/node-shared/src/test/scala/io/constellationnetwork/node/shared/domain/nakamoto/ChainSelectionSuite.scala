@@ -47,7 +47,8 @@ object ChainSelectionSuite extends SimpleIOSuite {
     for {
       registry <- setupRegistry(validators)
       tracker <- TipTracker.make[IO](registry)
-      chainSelection = ChainSelection.make[IO](tracker)
+      // fetchParent always returns None — tests focus on tip comparison, not ancestry traversal
+      chainSelection = ChainSelection.make[IO](tracker, _ => IO.pure(None))
     } yield (chainSelection, tracker, registry)
 
   test("prefers tip with higher attestation weight") {
