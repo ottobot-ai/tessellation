@@ -87,8 +87,15 @@ object NakamotoChainStore {
     /** Get the chain of snapshots from tip back to genesis (or pruning point) */
     def chainFromTip: F[List[StoredSnapshot]]
 
-    /** Get VRF outputs for snapshots in the first 2/3 of a rotation period (for eta calculation) */
+    /** Get VRF outputs for snapshots in the first 2/3 of a rotation period (for eta calculation). Walks from bestTip — use
+      * vrfOutputsForPeriodFrom for fork-aware queries.
+      */
     def vrfOutputsForPeriod(period: Long, etaRotationSlots: Long): F[List[(Long, Array[Byte])]]
+
+    /** Get VRF outputs for a rotation period by walking backward from a specific hash. Used to compute eta for an incoming snapshot on a
+      * potentially different fork.
+      */
+    def vrfOutputsForPeriodFrom(period: Long, etaRotationSlots: Long, fromHash: Hash): F[List[(Long, Array[Byte])]]
 
     /** Mark a snapshot as finalized and prune older fork branches. Keeps the finalized chain but removes orphaned snapshots with ordinal <=
       * finalizedOrdinal that aren't ancestors of the finalized tip.
@@ -250,22 +257,36 @@ object NakamotoChainStore {
 
         def vrfOutputsForPeriod(period: Long, etaRotationSlots: Long): F[List[(Long, Array[Byte])]] =
           stateRef.get.map { state =>
-            val periodStart = period * etaRotationSlots
-            val cutoff = periodStart + (etaRotationSlots * 2 / 3)
-            // Walk canonical chain from bestTip backward — NOT all entries in byHash.
-            // Using byHash.values would include fork branches, causing different nodes
-            // to compute different eta values → VRF verification failures at rotation boundaries.
-            val canonicalSnapshots = scala.collection.mutable.ListBuffer.empty[StoredSnapshot]
-            var current = state.bestTipHash.flatMap(state.byHash.get)
-            while (current.isDefined && current.get.slot >= periodStart) {
-              if (current.get.slot < cutoff && current.get.vrfOutput.nonEmpty)
-                canonicalSnapshots += current.get
-              current = state.byHash.get(current.get.parentHash)
-            }
-            canonicalSnapshots.toList
-              .sortBy(_.slot)
-              .map(s => (s.slot, s.vrfOutput))
+            collectVrfOutputsForPeriod(state, period, etaRotationSlots, state.bestTipHash)
           }
+
+        def vrfOutputsForPeriodFrom(period: Long, etaRotationSlots: Long, fromHash: Hash): F[List[(Long, Array[Byte])]] =
+          stateRef.get.map { state =>
+            collectVrfOutputsForPeriod(state, period, etaRotationSlots, Some(fromHash))
+          }
+
+        private def collectVrfOutputsForPeriod(
+          state: ChainState,
+          period: Long,
+          etaRotationSlots: Long,
+          startHash: Option[Hash]
+        ): List[(Long, Array[Byte])] = {
+          val periodStart = period * etaRotationSlots
+          val cutoff = periodStart + (etaRotationSlots * 2 / 3)
+          // Walk chain from the given starting hash backward.
+          // Using byHash.values would include fork branches, causing different nodes
+          // to compute different eta values → VRF verification failures at rotation boundaries.
+          val canonicalSnapshots = scala.collection.mutable.ListBuffer.empty[StoredSnapshot]
+          var current = startHash.flatMap(state.byHash.get)
+          while (current.isDefined && current.get.slot >= periodStart) {
+            if (current.get.slot < cutoff && current.get.vrfOutput.nonEmpty)
+              canonicalSnapshots += current.get
+            current = state.byHash.get(current.get.parentHash)
+          }
+          canonicalSnapshots.toList
+            .sortBy(_.slot)
+            .map(s => (s.slot, s.vrfOutput))
+        }
 
         def finalize(hash: Hash, ordinal: Long): F[Unit] =
           stateRef.modify { state =>

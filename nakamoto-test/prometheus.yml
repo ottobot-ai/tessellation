@@ -3,17 +3,27 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
-  - job_name: 'nakamoto-nodes'
+  - job_name: 'nakamoto-gl0'
     metrics_path: '/metrics'
     static_configs:
       - targets:
-          - 'node-0:9000'
-          - 'node-1:9010'
-          - 'node-2:9020'
-          - 'node-3:9030'
-          - 'node-4:9040'
-          - 'node-5:9050'
-          - 'node-6:9060'
-          - 'node-7:9070'
+          - 'nakamoto-node-0:9000'
+          - 'nakamoto-node-1:9010'
+          - 'nakamoto-node-2:9020'
+          - 'nakamoto-node-3:9030'
+          - 'nakamoto-node-4:9040'
+          - 'nakamoto-node-5:9050'
+          - 'nakamoto-node-6:9060'
+          - 'nakamoto-node-7:9070'
         labels:
-          cluster: 'nakamoto-local'
+          layer: 'gl0'
+
+  - job_name: 'nakamoto-l1'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets:
+          - 'nakamoto-l1-0:9100'
+          - 'nakamoto-l1-1:9110'
+          - 'nakamoto-l1-2:9120'
+        labels:
+          layer: 'dag-l1'

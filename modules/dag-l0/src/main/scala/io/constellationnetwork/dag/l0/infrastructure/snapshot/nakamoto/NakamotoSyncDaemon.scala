@@ -166,26 +166,51 @@ object NakamotoSyncDaemon {
       genesisEta <- epochStateRef.get.map(_.genesisEta)
       // Use parentSlot from gossip message for gap (same inputs as producer used)
       slotGap = snap.slot - snap.parentSlot
+      parentHash = Hash(new String(snap.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
 
-      // Chain-derived eta: deterministic from stored chain, same as producer used.
-      // Period 0: genesis eta. Period N>=1: derived from VRF outputs in period N-1.
+      // Chain-derived eta: must be computed from the INCOMING snapshot's chain,
+      // not our local best tip. The producer used eta derived from its own chain
+      // (walking back from its parent). If we use our local tip's chain, we'll
+      // compute a different eta when forks diverge → VRF verification fails.
+      //
+      // Strategy: walk from the incoming snapshot's parentHash.
+      // Fallback: if the incoming snapshot carries an eta field, use it directly
+      // (trust-but-verify: we verify the snapshot's chain ancestry separately).
       currentPeriod = EtaCalculation.rotationPeriod(snap.slot, etaRotationSlots)
       eta <-
         if (currentPeriod <= 0) {
           Async[F].pure(genesisEta)
         } else {
-          chainStore.vrfOutputsForPeriod(currentPeriod - 1, etaRotationSlots).map { chainOutputs =>
-            if (chainOutputs.nonEmpty)
-              EtaCalculation.computeEta(genesisEta, currentPeriod, chainOutputs.map(_._2))
-            else
-              genesisEta // No chain data yet — stay on genesis
+          chainStore.vrfOutputsForPeriodFrom(currentPeriod - 1, etaRotationSlots, parentHash).flatMap { chainOutputs =>
+            if (chainOutputs.nonEmpty) {
+              Async[F].pure(EtaCalculation.computeEta(genesisEta, currentPeriod, chainOutputs.map(_._2)))
+            } else {
+              // Parent chain not in our store (different fork or pruned).
+              // Fall back to the eta embedded in the snapshot itself.
+              // This is safe: VRF proof verification ensures the producer
+              // was eligible under THIS eta, and content validation later
+              // ensures the snapshot's state transitions are correct.
+              parsed.flatMap(_._1.value.eta) match {
+                case Some(etaHash) =>
+                  // Hash wraps a hex string — decode to 32 bytes
+                  val hexStr = etaHash.value
+                  val decoded = hexStr.grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
+                  logger
+                    .info(
+                      s"🔗 Using embedded eta from snapshot (parent chain not in store, period=$currentPeriod, eta=${hexStr.take(16)}..)"
+                    )
+                    .as(decoded)
+                case None =>
+                  // No embedded eta and no chain data — use genesis
+                  Async[F].pure(genesisEta)
+              }
+            }
           }
         }
 
       // Full validation pipeline: VRF + signature + cert + content
       // Look up the ACTUAL parent from chain store using parentHash from gossip message.
       // Can't use snapshotStorage.head — local node may have produced ahead of this snapshot.
-      parentHash = Hash(new String(snap.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
       validationResult <- parsed match {
         case Some((signedSnapshot, context)) =>
           chainStore.get(parentHash).flatMap {
