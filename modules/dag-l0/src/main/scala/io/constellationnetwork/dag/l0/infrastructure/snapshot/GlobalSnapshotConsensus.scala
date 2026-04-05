@@ -331,11 +331,21 @@ object GlobalSnapshotConsensus {
               stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F]
               _ <- stakeRegistry.updateValidators(seedlist.map(_.map(_.peerId)).getOrElse(Set(selfId)))
               tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry)
-              chainStore <- {
-                val chainSelection = io.constellationnetwork.node.shared.domain.nakamoto.ChainSelection.make[F](tipTracker)
-                io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore
-                  .make[F](globalSnapshotStorage, chainSelection, tipTracker)
-              }
+              // ChainSelection needs fetchParent — but chainStore needs ChainSelection.
+              // Break the cycle: create chainStore first with a lazy fetchParent that
+              // uses chainStore.tipFor once it's available.
+              chainStoreRef <- cats.effect.kernel.Ref.of[F, Option[
+                io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.NakamotoChainStoreAlgebra[F]
+              ]](None)
+              fetchParent = (tip: io.constellationnetwork.schema.nakamoto.ChainTip) =>
+                chainStoreRef.get.flatMap {
+                  case Some(cs) => cs.tipFor(tip.parentHash)
+                  case None     => cats.Applicative[F].pure(None: Option[io.constellationnetwork.schema.nakamoto.ChainTip])
+                }
+              chainSelection = io.constellationnetwork.node.shared.domain.nakamoto.ChainSelection.make[F](tipTracker, fetchParent)
+              chainStore <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore
+                .make[F](globalSnapshotStorage, chainSelection, tipTracker)
+              _ <- chainStoreRef.set(Some(chainStore))
               // Seed chain store with the current head snapshot so gossip children can find their parent
               _ <- globalSnapshotStorage.head.flatMap {
                 case Some((headSigned, headCtx)) =>

@@ -3,7 +3,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
-import io.constellationnetwork.node.shared.domain.nakamoto.{ChainSelection, TipTracker}
+import io.constellationnetwork.node.shared.domain.nakamoto.{ChainSelection, ParentChildTree, TipTracker}
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.schema.nakamoto.ChainTip
 import io.constellationnetwork.schema.nakamoto.slot.{Slot, VrfOutput}
@@ -85,6 +85,12 @@ object NakamotoChainStore {
 
     /** Get current chain state size (number of stored snapshots) */
     def size: F[Int]
+
+    /** Get the ParentChildTree for chain traversal (used by ChainSelection, reorgs). */
+    def tree: ParentChildTree[F]
+
+    /** Get a ChainTip for a given hash (for ChainSelection traversal). */
+    def tipFor(hash: Hash): F[Option[ChainTip]]
   }
 
   def make[F[_]: Async: HasherSelector](
@@ -94,7 +100,10 @@ object NakamotoChainStore {
   ): F[NakamotoChainStoreAlgebra[F]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoChainStore")
 
-    Ref.of[F, ChainState](ChainState.empty).map { stateRef =>
+    for {
+      stateRef <- Ref.of[F, ChainState](ChainState.empty)
+      pcTree <- ParentChildTree.make[F]
+    } yield {
       new NakamotoChainStoreAlgebra[F] {
 
         def store(
@@ -131,11 +140,12 @@ object NakamotoChainStore {
                       val newState = state.copy(byHash = newByHash, bestTipHash = Some(snapshotHash))
                       (
                         newState,
-                        persistHead(stored, snapshotHash) >> logger
-                          .info(
-                            s"🏗️ Chain initialized at ordinal=$ordinal slot=$slot"
-                          )
-                          .as(true)
+                        pcTree.associate(snapshotHash, parentHash) >>
+                          persistHead(stored, snapshotHash) >> logger
+                            .info(
+                              s"🏗️ Chain initialized at ordinal=$ordinal slot=$slot"
+                            )
+                            .as(true)
                       )
 
                     case Some(currentBestHash) =>
@@ -150,7 +160,7 @@ object NakamotoChainStore {
 
                       val newState = state.copy(byHash = newByHash)
 
-                      val effect = chainSelection.shouldSwitch(currentTip, newTip).flatMap {
+                      val effect = pcTree.associate(snapshotHash, parentHash) >> chainSelection.shouldSwitch(currentTip, newTip).flatMap {
                         case true =>
                           // Better chain — reorg
                           stateRef.update(_.copy(bestTipHash = Some(snapshotHash))) >>
@@ -243,6 +253,19 @@ object NakamotoChainStore {
 
         def size: F[Int] =
           stateRef.get.map(_.byHash.size)
+
+        val tree: ParentChildTree[F] = pcTree
+
+        def tipFor(hash: Hash): F[Option[ChainTip]] =
+          stateRef.get.map(_.byHash.get(hash).map { stored =>
+            ChainTip(
+              hash = stored.hash,
+              slot = Slot(NonNegLong.unsafeFrom(stored.slot)),
+              ordinal = stored.ordinal,
+              parentHash = stored.parentHash,
+              vrfOutput = VrfOutput(Hex(stored.vrfOutput.map("%02x".format(_)).mkString))
+            )
+          })
 
         /** Persist to underlying storage by extending the linear chain */
         private def persistLinear(stored: StoredSnapshot)(implicit hasher: Hasher[F]): F[Unit] =
