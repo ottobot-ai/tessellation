@@ -1140,29 +1140,50 @@ object GlobalSnapshotAcceptanceManager {
             _ <- mptStore.syncFromStateChanges(stateChangesAccumulator, ordinal)
             incrementalProof <- builder.buildProof(gsi, ordinal)
 
-            // Use full-rebuild MPT for deterministic stateProof.
-            // The incremental MPT can diverge after forks because it carries polluted state
-            // from abandoned branches. Full rebuild from GlobalSnapshotInfo is always deterministic
-            // given identical inputs.
-            stateProof <- GlobalSnapshotInfo.mptStateProof[F](gsi)
-            incrementalRoot = incrementalProof.mptRoot.map(_.show.take(12)).getOrElse("none")
-            fullRebuildRoot = stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")
-            mptMatch = if (incrementalRoot == fullRebuildRoot) "MATCH" else "DIVERGED"
+            // Self-healing incremental MPT: use incremental as primary path.
+            // After fork switches, stateRef carries entries from abandoned branches
+            // that cause the incremental trie to diverge from a clean rebuild.
+            // On divergence: full-resync stateRef from GSI, rebuild trie, log the heal.
+            // Cost: O(state_size) once per fork switch, then O(delta) resumes.
+            incrementalRoot = incrementalProof.mptRoot.map(_.show).getOrElse("none")
+            verifyProof <- GlobalSnapshotInfo.mptStateProof[F](gsi)
+            verifyRoot = verifyProof.mptRoot.map(_.show).getOrElse("none")
 
-            _ <- loggerBundle.app.info(
-              s"[ACCEPTANCE] ordinal=$ordinal EXIT stateProof: " +
-                s"mptRoot=$fullRebuildRoot " +
-                s"incrementalRoot=$incrementalRoot " +
-                s"mptConsistency=$mptMatch " +
-                s"balances=${stateProof.balancesProof.show.take(12)} " +
-                s"txRefs=${stateProof.lastTxRefsProof.show.take(12)} " +
-                s"scHashes=${stateProof.lastStateChannelSnapshotHashesProof.show.take(12)} " +
-                s"delegStakes=${stateProof.activeDelegatedStakes.map(_.show.take(12)).getOrElse("none")} " +
-                s"delegWithdrawals=${stateProof.delegatedStakesWithdrawals.map(_.show.take(12)).getOrElse("none")} " +
-                s"nodeCollaterals=${stateProof.activeNodeCollaterals.map(_.show.take(12)).getOrElse("none")} " +
-                s"collateralWithdrawals=${stateProof.nodeCollateralWithdrawals.map(_.show.take(12)).getOrElse("none")} " +
-                s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
-            )
+            stateProof <-
+              if (incrementalRoot == verifyRoot) {
+                loggerBundle.app
+                  .info(
+                    s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptRoot=${incrementalRoot.take(12)} " +
+                      s"mptConsistency=MATCH " +
+                      s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
+                  )
+                  .as(incrementalProof)
+              } else {
+                // Fork switch detected — stateRef is polluted from abandoned branch.
+                // Resync entire MPT store from GSI's full state, then rebuild.
+                for {
+                  allEntries <- gsi.allStateEntries[F]
+                  _ <- loggerBundle.app.warn(
+                    s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptConsistency=DIVERGED " +
+                      s"incremental=${incrementalRoot.take(12)} rebuild=${verifyRoot.take(12)} " +
+                      s"ACTION=full_resync entries=${allEntries.size} " +
+                      s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
+                  )
+                  _ <- mptStore.syncFull(allEntries, ordinal)
+                  healedProof <- builder.buildProof(gsi, ordinal)
+                  healedRoot = healedProof.mptRoot.map(_.show).getOrElse("none")
+                  _ <-
+                    if (healedRoot == verifyRoot)
+                      loggerBundle.app.info(
+                        s"[ACCEPTANCE] ordinal=$ordinal MPT healed: mptRoot=${healedRoot.take(12)} MATCH after resync"
+                      )
+                    else
+                      loggerBundle.app.error(
+                        s"[ACCEPTANCE] ordinal=$ordinal MPT STILL DIVERGED after resync: " +
+                          s"healed=${healedRoot.take(12)} expected=${verifyRoot.take(12)}"
+                      )
+                } yield verifyProof
+              }
 
             (expiredAllowSpends, expiredTokenLocks) = (
               allowSpendStateManager.filterExpiredAllowSpends(
