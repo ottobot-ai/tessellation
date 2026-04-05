@@ -95,6 +95,9 @@ object NakamotoChainStore {
       */
     def finalize(hash: Hash, ordinal: Long): F[Unit]
 
+    /** Walk the canonical chain from `startHash` backward to find the hash at the given ordinal. */
+    def walkBackTo(startHash: Hash, targetOrdinal: Long): F[Option[Hash]]
+
     /** Get current chain state size (number of stored snapshots) */
     def size: F[Int]
 
@@ -286,6 +289,14 @@ object NakamotoChainStore {
               logger.info(s"🔒 Finalized ordinal=$ordinal, pruned $prunedCount orphan snapshots (${pruned.size} remaining)")
             )
           }.flatten
+
+        def walkBackTo(startHash: Hash, targetOrdinal: Long): F[Option[Hash]] =
+          stateRef.get.map { state =>
+            var current = state.byHash.get(startHash)
+            while (current.isDefined && current.get.ordinal > targetOrdinal)
+              current = state.byHash.get(current.get.parentHash)
+            current.filter(_.ordinal == targetOrdinal).map(_.hash)
+          }
 
         def size: F[Int] =
           stateRef.get.map(_.byHash.size)

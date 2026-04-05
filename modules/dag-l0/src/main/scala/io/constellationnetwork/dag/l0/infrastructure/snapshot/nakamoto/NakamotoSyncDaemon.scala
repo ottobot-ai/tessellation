@@ -185,7 +185,7 @@ object NakamotoSyncDaemon {
       // Full validation pipeline: VRF + signature + cert + content
       // Look up the ACTUAL parent from chain store using parentHash from gossip message.
       // Can't use snapshotStorage.head — local node may have produced ahead of this snapshot.
-      parentHash = Hash(snap.parentHash.toByteArray.map("%02x".format(_)).mkString)
+      parentHash = Hash(new String(snap.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
       validationResult <- parsed match {
         case Some((signedSnapshot, context)) =>
           chainStore.get(parentHash).flatMap {
@@ -361,7 +361,7 @@ object NakamotoSyncDaemon {
         if (snap.ordinal > s.networkTipOrdinal)
           s.copy(
             networkTipOrdinal = snap.ordinal,
-            networkTipHash = Some(Hash(snap.hash.toByteArray.map("%02x".format(_)).mkString))
+            networkTipHash = Some(Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8)))
           )
         else s
       }
@@ -380,7 +380,7 @@ object NakamotoSyncDaemon {
 
           result match {
             case Right((signedSnapshot, context)) =>
-              val parentHash = Hash(snap.parentHash.toByteArray.map("%02x".format(_)).mkString)
+              val parentHash = Hash(new String(snap.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
               chainStore
                 .store(
                   signedSnapshot,
@@ -401,7 +401,8 @@ object NakamotoSyncDaemon {
                             lastNGlobalSnapshotStorage.setForRecovery(hashed, context) >>
                             logger.info(s"✅ Updated canonical storage to ordinal=${snap.ordinal} slot=${snap.slot}") >>
                             Metrics[F].incrementCounter("dag_nakamoto_snapshots_received") >>
-                            Metrics[F].updateGauge("dag_nakamoto_ordinal", snap.ordinal)
+                            Metrics[F].updateGauge("dag_nakamoto_ordinal", snap.ordinal) >>
+                            Metrics[F].recordDistribution("dag_nakamoto_slot_gap", (snap.slot - snap.parentSlot).toInt)
                         }
                       } >>
                       chainStore.bestTipSlot.flatMap {
@@ -420,7 +421,7 @@ object NakamotoSyncDaemon {
       // VRF outputs are stored in NakamotoChainStore as part of each snapshot.
 
       // Record in TipTracker (snapshot producer attests to their own tip)
-      tipHash = Hash(snap.hash.toByteArray.map("%02x".format(_)).mkString)
+      tipHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
       tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
       producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
       producerId = peer.PeerId(producerHex)
@@ -450,7 +451,8 @@ object NakamotoSyncDaemon {
     tipTracker: TipTracker[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
-    val tipHash = Hash(att.tipHash.toByteArray.map("%02x".format(_)).mkString)
+    // tipHash bytes are the UTF-8 encoding of the hex hash string — decode back to string
+    val tipHash = Hash(new String(att.tipHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
     val tipSlot = Slot(NonNegLong.unsafeFrom(att.tipSlot))
     val attesterHex = Hex(att.attesterId.toByteArray.map("%02x".format(_)).mkString)
     val attesterId = peer.PeerId(attesterHex)
@@ -469,7 +471,8 @@ object NakamotoSyncDaemon {
     selfId: peer.PeerId,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
-    val tipHash = Hash(snap.hash.toByteArray.map("%02x".format(_)).mkString)
+    // snap.hash bytes are the UTF-8 encoding of the hex hash string — decode back to string
+    val tipHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
     val tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
     val currentSlotMs = System.currentTimeMillis() / 1000L
     val attestedAtSlot = Slot(NonNegLong.unsafeFrom(currentSlotMs))
@@ -523,7 +526,7 @@ object NakamotoSyncDaemon {
       } else {
         parsed match {
           case Some((signedSnapshot, context)) =>
-            val parentHash = Hash(snap.parentHash.toByteArray.map("%02x".format(_)).mkString)
+            val parentHash = Hash(new String(snap.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
             for {
               _ <- stateRef.update(_.copy(lastCatchUpAttemptMs = now))
               _ <- logger.warn(
@@ -562,7 +565,7 @@ object NakamotoSyncDaemon {
               _ <- stateRef.update(
                 _.copy(
                   networkTipOrdinal = snap.ordinal,
-                  networkTipHash = Some(Hash(snap.hash.toByteArray.map("%02x".format(_)).mkString)),
+                  networkTipHash = Some(Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))),
                   localTipOrdinal = snap.ordinal
                 )
               )

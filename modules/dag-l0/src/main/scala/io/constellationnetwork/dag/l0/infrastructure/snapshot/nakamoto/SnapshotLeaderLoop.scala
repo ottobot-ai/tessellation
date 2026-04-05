@@ -303,22 +303,29 @@ object SnapshotLeaderLoop {
               case Some(tip) if tip.ordinal - lastFinalizedOrdinal > ConfirmationDepthK =>
                 // Finalize up to (tip.ordinal - k)
                 val finalizeAtOrdinal = tip.ordinal - ConfirmationDepthK
-                val finalizeAtSlot = Slot(
-                  eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(
-                    math.max(0L, tip.slot - ConfirmationDepthK)
-                  )
-                )
-                val depthHash = Hash(s"depth-finalized-$finalizeAtOrdinal")
-                tipTracker.markFinalized(depthHash, finalizeAtSlot) >>
-                  tipTracker.pruneBelow(finalizeAtSlot) >>
-                  chainStore.finalize(depthHash, finalizeAtOrdinal) >>
-                  logger
-                    .info(
-                      s"✅ DEPTH-FINALIZED at ordinal=$finalizeAtOrdinal (tip=${tip.ordinal}, k=$ConfirmationDepthK)"
-                    ) >>
-                  Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
-                  Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalizeAtOrdinal) >>
-                  Async[F].pure(true)
+                // Walk canonical chain from best tip to find the real hash at finalizeAtOrdinal
+                chainStore.walkBackTo(tip.hash, finalizeAtOrdinal).flatMap {
+                  case Some(canonicalHash) =>
+                    val finalizeAtSlot = Slot(
+                      eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(
+                        math.max(0L, tip.slot - ConfirmationDepthK)
+                      )
+                    )
+                    tipTracker.markFinalized(canonicalHash, finalizeAtSlot) >>
+                      tipTracker.pruneBelow(finalizeAtSlot) >>
+                      chainStore.finalize(canonicalHash, finalizeAtOrdinal) >>
+                      logger
+                        .info(
+                          s"✅ DEPTH-FINALIZED at ordinal=$finalizeAtOrdinal (tip=${tip.ordinal}, k=$ConfirmationDepthK)"
+                        ) >>
+                      Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
+                      Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalizeAtOrdinal) >>
+                      Async[F].pure(true)
+                  case None =>
+                    logger.warn(
+                      s"⚠️ DEPTH-FINALIZE: could not find canonical hash at ordinal=$finalizeAtOrdinal from tip=${tip.hash.value.take(12)}"
+                    ) >> Async[F].pure(false)
+                }
               case _ => Async[F].pure(false)
             }
 
@@ -340,12 +347,20 @@ object SnapshotLeaderLoop {
                            case Some(stored) => chainStore.finalize(hash, stored.ordinal)
                            case None         => Async[F].unit
                          } >>
-                         logger.info(
-                           s"✅ ATTEST-FINALIZED snapshot at slot ${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
-                               .format(weight)}, ${attestersForTip}/${activeCount} active of ${validatorCount} seedlist)"
-                         ) >>
-                         Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
-                         Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", slot.value.value)
+                         chainStore.get(hash).flatMap {
+                           case Some(stored) =>
+                             logger.info(
+                               s"✅ ATTEST-FINALIZED ordinal=${stored.ordinal} slot=${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
+                                   .format(weight)}, ${attestersForTip}/${activeCount} active of ${validatorCount} seedlist)"
+                             ) >>
+                               Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", stored.ordinal)
+                           case None =>
+                             logger.info(
+                               s"✅ ATTEST-FINALIZED slot=${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
+                                   .format(weight)}, ${attestersForTip}/${activeCount} active of ${validatorCount} seedlist)"
+                             )
+                         } >>
+                         Metrics[F].incrementCounter("dag_nakamoto_finalized")
                      }
                    } else Async[F].unit)
               case None =>
@@ -420,6 +435,7 @@ object SnapshotLeaderLoop {
         _ <- logger.info(s"🎰 WON slot $currentSlot (gap=$slotGap, parentSlot=$parentSlotValue, pool=$activePoolSize) — producing snapshot")
         _ <- Metrics[F].incrementCounter("dag_nakamoto_slots_won")
         _ <- Metrics[F].updateGauge("dag_nakamoto_slot", currentSlot)
+        _ <- Metrics[F].recordDistribution("dag_nakamoto_slot_gap", slotGap.toInt)
 
         // Get last snapshot from storage
         headOpt <- snapshotStorage.head

@@ -14,8 +14,8 @@ import fs2.Stream
 
 /** Periodically publishes Nakamoto chain-state gauges to Prometheus.
   *
-  * Point-of-action counters (slots_won, snapshots_produced/received/rejected, finalized, catchups)
-  * are emitted directly in SnapshotLeaderLoop and NakamotoSyncDaemon via Metrics[F].
+  * Point-of-action counters (slots_won, snapshots_produced/received/rejected, finalized, catchups) are emitted directly in
+  * SnapshotLeaderLoop and NakamotoSyncDaemon via Metrics[F].
   *
   * This stream handles gauges that require periodic sampling from chain store state:
   *   - dag_nakamoto_chain_length: snapshots in chain store
@@ -34,9 +34,9 @@ object NakamotoMetrics {
 
     Stream.awakeEvery[F](5.seconds).evalMap { _ =>
       for {
-        bestTip  <- chainStore.bestTip
+        bestTip <- chainStore.bestTip
         chainLen <- chainStore.chainLength
-        forkCnt  <- chainStore.forkCount
+        forkCnt <- chainStore.forkCount
         finalOrd <- chainStore.lastFinalizedOrdinal
 
         now = System.currentTimeMillis()
