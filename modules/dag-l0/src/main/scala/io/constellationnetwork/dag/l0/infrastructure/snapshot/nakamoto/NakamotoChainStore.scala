@@ -228,8 +228,17 @@ object NakamotoChainStore {
           stateRef.get.map { state =>
             val periodStart = period * etaRotationSlots
             val cutoff = periodStart + (etaRotationSlots * 2 / 3)
-            state.byHash.values.toList
-              .filter(s => s.slot >= periodStart && s.slot < cutoff && s.vrfOutput.nonEmpty)
+            // Walk canonical chain from bestTip backward — NOT all entries in byHash.
+            // Using byHash.values would include fork branches, causing different nodes
+            // to compute different eta values → VRF verification failures at rotation boundaries.
+            val canonicalSnapshots = scala.collection.mutable.ListBuffer.empty[StoredSnapshot]
+            var current = state.bestTipHash.flatMap(state.byHash.get)
+            while (current.isDefined && current.get.slot >= periodStart) {
+              if (current.get.slot < cutoff && current.get.vrfOutput.nonEmpty)
+                canonicalSnapshots += current.get
+              current = state.byHash.get(current.get.parentHash)
+            }
+            canonicalSnapshots.toList
               .sortBy(_.slot)
               .map(s => (s.slot, s.vrfOutput))
           }

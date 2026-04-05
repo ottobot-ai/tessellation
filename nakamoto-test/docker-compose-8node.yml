@@ -1,0 +1,379 @@
+# Auto-generated Nakamoto cluster — do not edit manually
+# Regenerate: ./gen-cluster.sh NUM_NODES
+
+x-jvm-common: &jvm-common
+  build:
+    context: ..
+    dockerfile: nakamoto-test/Dockerfile.jvm
+  environment: &jvm-env
+    CL_APP_ENV: dev
+    NAKAMOTO_ENABLED: "true"
+    NAKAMOTO_PURE: "true"
+    NAKAMOTO_GENESIS_ETA: "tessellation-nakamoto-genesis"
+    NAKAMOTO_SLOTS_PER_EPOCH: "60"
+    NAKAMOTO_ETA_ROTATION_SLOTS: "${NAKAMOTO_ETA_ROTATION_SLOTS:-600}"
+    NAKAMOTO_LDD_CUTOFF: "${NAKAMOTO_LDD_CUTOFF:-15}"
+    NAKAMOTO_LDD_OFFSET: "${NAKAMOTO_LDD_OFFSET:-1}"
+    NAKAMOTO_LDD_BASELINE: "${NAKAMOTO_LDD_BASELINE:-0.05}"
+    NAKAMOTO_LDD_AMPLITUDE: "${NAKAMOTO_LDD_AMPLITUDE:-0.5}"
+    NAKAMOTO_GENESIS_TIME_MS: "${NAKAMOTO_GENESIS_TIME_MS:-0}"
+    CL_KEYALIAS: alias
+    CL_PASSWORD: password
+    JAVA_OPTS: "-Xmx1g -Xss256k --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.security=ALL-UNNAMED"
+
+x-sidecar-common: &sidecar-common
+  build:
+    context: ../p2p
+    dockerfile: Dockerfile
+
+services:
+  # ── Node 0 ────────────────────────────────────────────
+  sidecar-0:
+    <<: *sidecar-common
+    container_name: nakamoto-sidecar-0
+    command: [
+      "-grpc", "0.0.0.0:50051",
+      "-listen", "/ip4/0.0.0.0/tcp/9500",
+      "-seedlist", "/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500,/dns4/nakamoto-sidecar-4/tcp/9500,/dns4/nakamoto-sidecar-5/tcp/9500,/dns4/nakamoto-sidecar-6/tcp/9500,/dns4/nakamoto-sidecar-7/tcp/9500"
+    ]
+    networks:
+      nakamoto:
+        aliases: [sidecar-0]
+
+  node-0:
+    <<: *jvm-common
+    container_name: nakamoto-node-0
+    environment:
+      <<: *jvm-env
+      CL_KEYSTORE: /opt/keys/key.p12
+      SIDECAR_HOST: sidecar-0
+      SIDECAR_GRPC_PORT: "50051"
+      CL_PUBLIC_HTTP_PORT: "9000"
+      CL_P2P_HTTP_PORT: "9001"
+      CL_CLI_HTTP_PORT: "9002"
+    volumes:
+      - ./genesis-8.csv:/opt/genesis.csv:ro
+      - ./seedlist-8.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/0:/opt/keys:ro
+    command: >
+      run-nakamoto
+      /opt/genesis.csv
+      --ip node-0
+      --public-port 9000
+      --p2p-port 9001
+      --cli-port 9002
+      --seedlist /opt/seedlist.csv
+      --collateral 0
+    ports:
+      - "9000:9000"
+      - "9002:9002"
+    depends_on:
+      - sidecar-0
+    networks:
+      nakamoto:
+        aliases: [node-0]
+
+  # ── Node 1 ────────────────────────────────────────────
+  sidecar-1:
+    <<: *sidecar-common
+    container_name: nakamoto-sidecar-1
+    command: [
+      "-grpc", "0.0.0.0:50051",
+      "-listen", "/ip4/0.0.0.0/tcp/9500",
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500,/dns4/nakamoto-sidecar-4/tcp/9500,/dns4/nakamoto-sidecar-5/tcp/9500,/dns4/nakamoto-sidecar-6/tcp/9500,/dns4/nakamoto-sidecar-7/tcp/9500"
+    ]
+    networks:
+      nakamoto:
+        aliases: [sidecar-1]
+
+  node-1:
+    <<: *jvm-common
+    container_name: nakamoto-node-1
+    environment:
+      <<: *jvm-env
+      CL_KEYSTORE: /opt/keys/key.p12
+      SIDECAR_HOST: sidecar-1
+      SIDECAR_GRPC_PORT: "50051"
+      CL_PUBLIC_HTTP_PORT: "9010"
+      CL_P2P_HTTP_PORT: "9011"
+      CL_CLI_HTTP_PORT: "9012"
+    volumes:
+      - ./genesis-8.csv:/opt/genesis.csv:ro
+      - ./seedlist-8.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/1:/opt/keys:ro
+    command: >
+      run-nakamoto
+      /opt/genesis.csv
+      --ip node-1
+      --public-port 9010
+      --p2p-port 9011
+      --cli-port 9012
+      --seedlist /opt/seedlist.csv
+      --collateral 0
+    depends_on:
+      - sidecar-1
+    networks:
+      nakamoto:
+        aliases: [node-1]
+
+  # ── Node 2 ────────────────────────────────────────────
+  sidecar-2:
+    <<: *sidecar-common
+    container_name: nakamoto-sidecar-2
+    command: [
+      "-grpc", "0.0.0.0:50051",
+      "-listen", "/ip4/0.0.0.0/tcp/9500",
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500,/dns4/nakamoto-sidecar-4/tcp/9500,/dns4/nakamoto-sidecar-5/tcp/9500,/dns4/nakamoto-sidecar-6/tcp/9500,/dns4/nakamoto-sidecar-7/tcp/9500"
+    ]
+    networks:
+      nakamoto:
+        aliases: [sidecar-2]
+
+  node-2:
+    <<: *jvm-common
+    container_name: nakamoto-node-2
+    environment:
+      <<: *jvm-env
+      CL_KEYSTORE: /opt/keys/key.p12
+      SIDECAR_HOST: sidecar-2
+      SIDECAR_GRPC_PORT: "50051"
+      CL_PUBLIC_HTTP_PORT: "9020"
+      CL_P2P_HTTP_PORT: "9021"
+      CL_CLI_HTTP_PORT: "9022"
+    volumes:
+      - ./genesis-8.csv:/opt/genesis.csv:ro
+      - ./seedlist-8.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/2:/opt/keys:ro
+    command: >
+      run-nakamoto
+      /opt/genesis.csv
+      --ip node-2
+      --public-port 9020
+      --p2p-port 9021
+      --cli-port 9022
+      --seedlist /opt/seedlist.csv
+      --collateral 0
+    depends_on:
+      - sidecar-2
+    networks:
+      nakamoto:
+        aliases: [node-2]
+
+  # ── Node 3 ────────────────────────────────────────────
+  sidecar-3:
+    <<: *sidecar-common
+    container_name: nakamoto-sidecar-3
+    command: [
+      "-grpc", "0.0.0.0:50051",
+      "-listen", "/ip4/0.0.0.0/tcp/9500",
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500,/dns4/nakamoto-sidecar-4/tcp/9500,/dns4/nakamoto-sidecar-5/tcp/9500,/dns4/nakamoto-sidecar-6/tcp/9500,/dns4/nakamoto-sidecar-7/tcp/9500"
+    ]
+    networks:
+      nakamoto:
+        aliases: [sidecar-3]
+
+  node-3:
+    <<: *jvm-common
+    container_name: nakamoto-node-3
+    environment:
+      <<: *jvm-env
+      CL_KEYSTORE: /opt/keys/key.p12
+      SIDECAR_HOST: sidecar-3
+      SIDECAR_GRPC_PORT: "50051"
+      CL_PUBLIC_HTTP_PORT: "9030"
+      CL_P2P_HTTP_PORT: "9031"
+      CL_CLI_HTTP_PORT: "9032"
+    volumes:
+      - ./genesis-8.csv:/opt/genesis.csv:ro
+      - ./seedlist-8.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/3:/opt/keys:ro
+    command: >
+      run-nakamoto
+      /opt/genesis.csv
+      --ip node-3
+      --public-port 9030
+      --p2p-port 9031
+      --cli-port 9032
+      --seedlist /opt/seedlist.csv
+      --collateral 0
+    depends_on:
+      - sidecar-3
+    networks:
+      nakamoto:
+        aliases: [node-3]
+
+  # ── Node 4 ────────────────────────────────────────────
+  sidecar-4:
+    <<: *sidecar-common
+    container_name: nakamoto-sidecar-4
+    command: [
+      "-grpc", "0.0.0.0:50051",
+      "-listen", "/ip4/0.0.0.0/tcp/9500",
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500,/dns4/nakamoto-sidecar-5/tcp/9500,/dns4/nakamoto-sidecar-6/tcp/9500,/dns4/nakamoto-sidecar-7/tcp/9500"
+    ]
+    networks:
+      nakamoto:
+        aliases: [sidecar-4]
+
+  node-4:
+    <<: *jvm-common
+    container_name: nakamoto-node-4
+    environment:
+      <<: *jvm-env
+      CL_KEYSTORE: /opt/keys/key.p12
+      SIDECAR_HOST: sidecar-4
+      SIDECAR_GRPC_PORT: "50051"
+      CL_PUBLIC_HTTP_PORT: "9040"
+      CL_P2P_HTTP_PORT: "9041"
+      CL_CLI_HTTP_PORT: "9042"
+    volumes:
+      - ./genesis-8.csv:/opt/genesis.csv:ro
+      - ./seedlist-8.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/4:/opt/keys:ro
+    command: >
+      run-nakamoto
+      /opt/genesis.csv
+      --ip node-4
+      --public-port 9040
+      --p2p-port 9041
+      --cli-port 9042
+      --seedlist /opt/seedlist.csv
+      --collateral 0
+    depends_on:
+      - sidecar-4
+    networks:
+      nakamoto:
+        aliases: [node-4]
+
+  # ── Node 5 ────────────────────────────────────────────
+  sidecar-5:
+    <<: *sidecar-common
+    container_name: nakamoto-sidecar-5
+    command: [
+      "-grpc", "0.0.0.0:50051",
+      "-listen", "/ip4/0.0.0.0/tcp/9500",
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500,/dns4/nakamoto-sidecar-4/tcp/9500,/dns4/nakamoto-sidecar-6/tcp/9500,/dns4/nakamoto-sidecar-7/tcp/9500"
+    ]
+    networks:
+      nakamoto:
+        aliases: [sidecar-5]
+
+  node-5:
+    <<: *jvm-common
+    container_name: nakamoto-node-5
+    environment:
+      <<: *jvm-env
+      CL_KEYSTORE: /opt/keys/key.p12
+      SIDECAR_HOST: sidecar-5
+      SIDECAR_GRPC_PORT: "50051"
+      CL_PUBLIC_HTTP_PORT: "9050"
+      CL_P2P_HTTP_PORT: "9051"
+      CL_CLI_HTTP_PORT: "9052"
+    volumes:
+      - ./genesis-8.csv:/opt/genesis.csv:ro
+      - ./seedlist-8.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/5:/opt/keys:ro
+    command: >
+      run-nakamoto
+      /opt/genesis.csv
+      --ip node-5
+      --public-port 9050
+      --p2p-port 9051
+      --cli-port 9052
+      --seedlist /opt/seedlist.csv
+      --collateral 0
+    depends_on:
+      - sidecar-5
+    networks:
+      nakamoto:
+        aliases: [node-5]
+
+  # ── Node 6 ────────────────────────────────────────────
+  sidecar-6:
+    <<: *sidecar-common
+    container_name: nakamoto-sidecar-6
+    command: [
+      "-grpc", "0.0.0.0:50051",
+      "-listen", "/ip4/0.0.0.0/tcp/9500",
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500,/dns4/nakamoto-sidecar-4/tcp/9500,/dns4/nakamoto-sidecar-5/tcp/9500,/dns4/nakamoto-sidecar-7/tcp/9500"
+    ]
+    networks:
+      nakamoto:
+        aliases: [sidecar-6]
+
+  node-6:
+    <<: *jvm-common
+    container_name: nakamoto-node-6
+    environment:
+      <<: *jvm-env
+      CL_KEYSTORE: /opt/keys/key.p12
+      SIDECAR_HOST: sidecar-6
+      SIDECAR_GRPC_PORT: "50051"
+      CL_PUBLIC_HTTP_PORT: "9060"
+      CL_P2P_HTTP_PORT: "9061"
+      CL_CLI_HTTP_PORT: "9062"
+    volumes:
+      - ./genesis-8.csv:/opt/genesis.csv:ro
+      - ./seedlist-8.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/6:/opt/keys:ro
+    command: >
+      run-nakamoto
+      /opt/genesis.csv
+      --ip node-6
+      --public-port 9060
+      --p2p-port 9061
+      --cli-port 9062
+      --seedlist /opt/seedlist.csv
+      --collateral 0
+    depends_on:
+      - sidecar-6
+    networks:
+      nakamoto:
+        aliases: [node-6]
+
+  # ── Node 7 ────────────────────────────────────────────
+  sidecar-7:
+    <<: *sidecar-common
+    container_name: nakamoto-sidecar-7
+    command: [
+      "-grpc", "0.0.0.0:50051",
+      "-listen", "/ip4/0.0.0.0/tcp/9500",
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500,/dns4/nakamoto-sidecar-4/tcp/9500,/dns4/nakamoto-sidecar-5/tcp/9500,/dns4/nakamoto-sidecar-6/tcp/9500"
+    ]
+    networks:
+      nakamoto:
+        aliases: [sidecar-7]
+
+  node-7:
+    <<: *jvm-common
+    container_name: nakamoto-node-7
+    environment:
+      <<: *jvm-env
+      CL_KEYSTORE: /opt/keys/key.p12
+      SIDECAR_HOST: sidecar-7
+      SIDECAR_GRPC_PORT: "50051"
+      CL_PUBLIC_HTTP_PORT: "9070"
+      CL_P2P_HTTP_PORT: "9071"
+      CL_CLI_HTTP_PORT: "9072"
+    volumes:
+      - ./genesis-8.csv:/opt/genesis.csv:ro
+      - ./seedlist-8.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/7:/opt/keys:ro
+    command: >
+      run-nakamoto
+      /opt/genesis.csv
+      --ip node-7
+      --public-port 9070
+      --p2p-port 9071
+      --cli-port 9072
+      --seedlist /opt/seedlist.csv
+      --collateral 0
+    depends_on:
+      - sidecar-7
+    networks:
+      nakamoto:
+        aliases: [node-7]
+
+networks:
+  nakamoto:
+    driver: bridge
