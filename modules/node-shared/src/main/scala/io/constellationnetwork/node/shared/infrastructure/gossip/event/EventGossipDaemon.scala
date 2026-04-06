@@ -370,6 +370,22 @@ private[event] object GraftSyncer {
 
 object EventGossipDaemon {
 
+  /** No-op gossip daemon for Nakamoto mode.
+    *
+    * Events are still collected in the mempool via GlobalSnapshotEventsPublisherDaemon, but gossip publish is a no-op since Nakamoto uses
+    * the libp2p GossipSub sidecar for snapshot dissemination, not tessellation's P2P event gossip.
+    */
+  def noop[F[_]: Async, Event, Key]: EventGossipDaemon[F, Event, Key] =
+    new EventGossipDaemon[F, Event, Key] {
+      def start: F[Unit] = Async[F].unit
+      def stop: F[Unit] = Async[F].unit
+      def publish(event: Hashed[Event]): F[Unit] = Async[F].unit
+      def hasSeen(hash: Hash): F[Boolean] = Async[F].pure(false)
+      def markSeen(hash: Hash): F[Unit] = Async[F].unit
+      def getMeshInfo: F[MeshInfo] = Async[F].pure(MeshInfo(0, Set.empty, 0))
+      def clearMesh: F[Unit] = Async[F].unit
+    }
+
   /** Create a new EventGossipDaemon with full P2P gossip capability.
     *
     * This is the primary factory method for production use. Events will be gossiped to mesh peers via the HTTP client.

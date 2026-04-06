@@ -135,36 +135,52 @@ object Main
         services.recoveryPeerHint
       )
 
-      eventGossipDaemon <- EventGossipDaemon
-        .make[IO, GlobalSnapshotEvent, GlobalStateKey](
-          services.eventMempool,
-          storages.cluster,
-          storages.node,
-          sharedResources.gossipClient,
-          sharedServices.session,
-          config = EventGossipConfig(
-            heartbeatInterval = cfg.snapshot.consensus.eventGossipHeartbeatInterval,
-            pullInterval = cfg.snapshot.consensus.eventGossipPullInterval
-          ),
-          getLocalChainTip = Some(forkRecoveryService.getLocalChainTip),
-          onForkDetected = Some(forkRecoveryService.onForkDetected),
-          forkLagThreshold = cfg.snapshot.consensus.forkLagThreshold
-        )
-        .asResource
+      isNakamotoMode = method.isInstanceOf[RunNakamoto] || method.isInstanceOf[RunNakamotoValidator]
 
-      _ <- Daemons
-        .start(
-          storages,
-          services,
-          programs,
-          queues,
-          nodeId,
-          keyPair,
-          cfg,
-          hasherSelector,
-          eventGossipDaemon
-        )
-        .asResource
+      eventGossipDaemon <-
+        if (isNakamotoMode)
+          Resource.pure[IO, EventGossipDaemon[IO, GlobalSnapshotEvent, GlobalStateKey]](
+            EventGossipDaemon.noop[IO, GlobalSnapshotEvent, GlobalStateKey]
+          )
+        else
+          EventGossipDaemon
+            .make[IO, GlobalSnapshotEvent, GlobalStateKey](
+              services.eventMempool,
+              storages.cluster,
+              storages.node,
+              sharedResources.gossipClient,
+              sharedServices.session,
+              config = EventGossipConfig(
+                heartbeatInterval = cfg.snapshot.consensus.eventGossipHeartbeatInterval,
+                pullInterval = cfg.snapshot.consensus.eventGossipPullInterval
+              ),
+              getLocalChainTip = Some(forkRecoveryService.getLocalChainTip),
+              onForkDetected = Some(forkRecoveryService.onForkDetected),
+              forkLagThreshold = cfg.snapshot.consensus.forkLagThreshold
+            )
+            .asResource
+
+      _ <- (if (isNakamotoMode)
+              Daemons.startNakamoto(
+                storages,
+                services,
+                queues,
+                nodeId,
+                keyPair,
+                cfg
+              )
+            else
+              Daemons.start(
+                storages,
+                services,
+                programs,
+                queues,
+                nodeId,
+                keyPair,
+                cfg,
+                hasherSelector,
+                eventGossipDaemon
+              )).asResource
 
       api <- Resource.eval(
         HttpApi.make[IO, Run](
