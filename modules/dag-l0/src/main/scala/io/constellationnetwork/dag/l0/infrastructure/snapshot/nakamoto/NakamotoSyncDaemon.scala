@@ -205,7 +205,7 @@ object NakamotoSyncDaemon {
                   val decoded = hexStr.grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
                   logger
                     .info(
-                      s"🔗 Using embedded eta from snapshot (parent chain not in store, period=$currentPeriod, eta=${hexStr.take(16)}..)"
+                      s"Using embedded eta from snapshot (parent chain not in store, period=$currentPeriod, eta=${hexStr.take(16)}..)"
                     )
                     .as(decoded)
                 case None =>
@@ -432,7 +432,7 @@ object NakamotoSyncDaemon {
                         signedSnapshot.toHashed[F].flatMap { hashed =>
                           lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
                             lastNGlobalSnapshotStorage.setForRecovery(hashed, context) >>
-                            logger.info(s"✅ Updated canonical storage to ordinal=${snap.ordinal} slot=${snap.slot}") >>
+                            logger.debug(s"Updated canonical storage to ordinal=${snap.ordinal} slot=${snap.slot}") >>
                             Metrics[F].incrementCounter("dag_nakamoto_snapshots_received") >>
                             Metrics[F].updateGauge("dag_nakamoto_ordinal", snap.ordinal) >>
                             Metrics[F].recordDistribution("dag_nakamoto_slot_gap", (snap.slot - snap.parentSlot).toInt)
@@ -467,7 +467,7 @@ object NakamotoSyncDaemon {
       _ <- Async[F].whenA(!state.isReady && nodeState =!= NodeState.Ready) {
         val caughtUp = state.networkTipOrdinal - snap.ordinal <= CatchUpThreshold
         Async[F].whenA(caughtUp) {
-          logger.info(s"✅ Caught up (local=${snap.ordinal}, network=${state.networkTipOrdinal}). → Ready.") >>
+          logger.info(s"Caught up (local=${snap.ordinal}, network=${state.networkTipOrdinal}). → Ready.") >>
             stateRef.update(_.copy(isReady = true, localTipOrdinal = snap.ordinal)) >>
             nodeStorage.setNodeState(NodeState.Ready) >>
             logger.info(s"🟢 Node Ready — VRF production begins")

@@ -189,7 +189,7 @@ object NakamotoChainStore {
                             persistHead(stored, snapshotHash) >>
                             logger
                               .info(
-                                s"🔄 Chain reorg: ordinal=$ordinal slot=$slot beats previous tip ordinal=${currentBest.ordinal} slot=${currentBest.slot}"
+                                s"Chain reorg: ordinal=$ordinal slot=$slot beats previous tip ordinal=${currentBest.ordinal} slot=${currentBest.slot}"
                               )
                               .as(true)
 
@@ -197,7 +197,7 @@ object NakamotoChainStore {
                           // Extends current chain — normal case
                           stateRef.update(_.copy(bestTipHash = Some(snapshotHash))) >>
                             persistLinear(stored) >>
-                            logger.info(s"📦 Chain extended to ordinal=$ordinal slot=$slot").as(true)
+                            logger.debug(s"Chain extended to ordinal=$ordinal slot=$slot").as(true)
 
                         case false =>
                           // Weaker fork — store but don't switch

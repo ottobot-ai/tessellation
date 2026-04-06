@@ -465,10 +465,8 @@ object Main
                   if (storedOrdinals.nonEmpty) {
                     // === COLD RESTART: recover from disk ===
                     val latestOrdinal = storedOrdinals.max
-                    IO(
-                      println(
-                        s"\uD83D\uDD04 Cold restart detected: found ${storedOrdinals.size} snapshots on disk, latest ordinal=$latestOrdinal"
-                      )
+                    logger.info(
+                      s"Cold restart detected: found ${storedOrdinals.size} snapshots on disk, latest ordinal=$latestOrdinal"
                     ) >>
                       (storages.globalSnapshot.get(latestOrdinal), infoStorage.read(latestOrdinal)).flatMapN {
                         case (Some(latestSnapshot), Some(latestInfo)) =>
@@ -508,7 +506,7 @@ object Main
                                     )
                                   )
                                 )
-                              _ <- IO(println(s"\u2705 Recovered from disk at ordinal=$latestOrdinal"))
+                              _ <- logger.info(s"Recovered from disk at ordinal=$latestOrdinal")
                             } yield ()
                           }
                         case _ =>
@@ -611,7 +609,7 @@ object Main
 
             EmberClientBuilder.default[IO].build.use { client =>
               for {
-                _ <- IO(println(s"\uD83D\uDD17 Downloading latest snapshot from ${m.peerToJoin}..."))
+                _ <- logger.info(s"Downloading latest snapshot from ${m.peerToJoin}...")
 
                 // Download latest snapshot from peer's public HTTP API
                 latestSnapshot <- client.expect[Signed[GlobalIncrementalSnapshot]](
@@ -623,7 +621,7 @@ object Main
                   peerUri / "global-snapshots" / "latest" / "info"
                 )
 
-                _ <- IO(println(s"\uD83D\uDCE6 Got snapshot ordinal=${latestSnapshot.ordinal}"))
+                _ <- logger.info(s"Got snapshot ordinal=${latestSnapshot.ordinal}")
 
                 hashedSnapshot <- hasherSelector.withCurrent { implicit hasher =>
                   latestSnapshot.toHashed[IO]
@@ -674,7 +672,7 @@ object Main
                     )
                   )
 
-                _ <- IO(println(s"\u2705 Initialized from peer at ordinal=${latestSnapshot.ordinal}. Starting VRF production."))
+                _ <- logger.info(s"Initialized from peer at ordinal=${latestSnapshot.ordinal}. Starting VRF production.")
               } yield ()
             }
             // Skip session/cluster token creation — Nakamoto consensus doesn't use

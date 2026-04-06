@@ -316,7 +316,7 @@ object SnapshotLeaderLoop {
                       chainStore.finalize(canonicalHash, finalizeAtOrdinal) >>
                       logger
                         .info(
-                          s"✅ DEPTH-FINALIZED at ordinal=$finalizeAtOrdinal (tip=${tip.ordinal}, k=$ConfirmationDepthK)"
+                          s"DEPTH-FINALIZED at ordinal=$finalizeAtOrdinal (tip=${tip.ordinal}, k=$ConfirmationDepthK)"
                         ) >>
                       Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
                       Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalizeAtOrdinal) >>
@@ -334,8 +334,8 @@ object SnapshotLeaderLoop {
               case Some((hash, slot, weight)) =>
                 val attestersForTip = allAtts.count { case (_, att) => att.tipHash === hash }
                 val peerIds = allAtts.keys.map(_.value.value.take(8)).mkString(",")
-                logger.info(
-                  s"📊 Attestations: tip=${hash.value.take(12)}.. slot=${slot.value.value} weight=${"%.2f"
+                logger.debug(
+                  s"Attestations: tip=${hash.value.take(12)}.. slot=${slot.value.value} weight=${"%.2f"
                       .format(weight)} (${attestersForTip}/${activeCount} active, ${validatorCount} seedlist) peers=[${peerIds}]"
                 ) >>
                   (if (weight >= TipTracker.FinalityThreshold) {
@@ -350,13 +350,13 @@ object SnapshotLeaderLoop {
                          chainStore.get(hash).flatMap {
                            case Some(stored) =>
                              logger.info(
-                               s"✅ ATTEST-FINALIZED ordinal=${stored.ordinal} slot=${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
+                               s"ATTEST-FINALIZED ordinal=${stored.ordinal} slot=${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
                                    .format(weight)}, ${attestersForTip}/${activeCount} active of ${validatorCount} seedlist)"
                              ) >>
                                Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", stored.ordinal)
                            case None =>
                              logger.info(
-                               s"✅ ATTEST-FINALIZED slot=${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
+                               s"ATTEST-FINALIZED slot=${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
                                    .format(weight)}, ${attestersForTip}/${activeCount} active of ${validatorCount} seedlist)"
                              )
                          } >>
@@ -365,7 +365,7 @@ object SnapshotLeaderLoop {
                    } else Async[F].unit)
               case None =>
                 Async[F].whenA(allAtts.nonEmpty) {
-                  logger.info(s"📊 Attestations: ${allAtts.size} attesters, no heaviest tip")
+                  logger.debug(s"Attestations: ${allAtts.size} attesters, no heaviest tip")
                 }
             }
           } yield ()
@@ -432,7 +432,7 @@ object SnapshotLeaderLoop {
           activePoolHash = activePoolHash
         )
 
-        _ <- logger.info(s"🎰 WON slot $currentSlot (gap=$slotGap, parentSlot=$parentSlotValue, pool=$activePoolSize) — producing snapshot")
+        _ <- logger.info(s"WON slot $currentSlot (gap=$slotGap, parentSlot=$parentSlotValue, pool=$activePoolSize) — producing snapshot")
         _ <- Metrics[F].incrementCounter("dag_nakamoto_slots_won")
         _ <- Metrics[F].updateGauge("dag_nakamoto_slot", currentSlot)
         _ <- Metrics[F].recordDistribution("dag_nakamoto_slot_gap", slotGap.toInt)
@@ -549,7 +549,7 @@ object SnapshotLeaderLoop {
                   tipTracker.recordAttestation(selfId, selfAttestation)
                 } >>
                   logger.info(
-                    s"📦 Produced snapshot ordinal=${lastKey.value.value + 1} slot=$currentSlot " +
+                    s"Produced snapshot ordinal=${lastKey.value.value + 1} slot=$currentSlot " +
                       s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"
                   ) >>
                   Metrics[F].incrementCounter("dag_nakamoto_snapshots_produced") >>
