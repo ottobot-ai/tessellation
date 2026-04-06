@@ -24,6 +24,7 @@ import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.security.vrf.EcVrf25519
 import io.constellationnetwork.security.{Hashed, HasherSelector, SecurityProvider}
 
 import eu.timepit.refined.auto._
@@ -40,6 +41,13 @@ object NakamotoSyncDaemon {
 
   private val CatchUpThreshold = 2L
   private val CatchUpCooldownMs = 10000L // Don't retry catch-up more often than every 10s
+  private val vrf = new EcVrf25519()
+
+  /** Derive VRF output from proof bytes. The chain store needs the output (not the proof) for eta computation. The producer stores
+    * vrfOutput directly, but gossip only carries the proof — we must derive the output here to match what the producer stored.
+    */
+  private def vrfOutputFromProof(proofBytes: Array[Byte]): Array[Byte] =
+    vrf.vrfProofToHash(proofBytes).getOrElse(proofBytes) // fallback to raw proof if derivation fails
 
   final case class SyncState(
     networkTipOrdinal: Long,
@@ -413,7 +421,7 @@ object NakamotoSyncDaemon {
                   snap.ordinal,
                   snap.slot,
                   parentHash,
-                  snap.vrfProof.toByteArray
+                  vrfOutputFromProof(snap.vrfProof.toByteArray)
                 )
                 .flatMap { isNew =>
                   if (isNew) {
@@ -567,7 +575,7 @@ object NakamotoSyncDaemon {
                 snap.ordinal,
                 snap.slot,
                 parentHash,
-                snap.vrfProof.toByteArray
+                vrfOutputFromProof(snap.vrfProof.toByteArray)
               )
 
               // Update canonical storages
