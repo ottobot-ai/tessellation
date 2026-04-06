@@ -46,11 +46,11 @@
    - `epochProgress` continuation: `forkEpochProgress + floor((currentSlot - forkSlot) / 60)`
    - This is the biggest remaining piece — all current testing uses fresh genesis
 
-2. **Disable BFT Daemons in Nakamoto Mode**
-   - ConsensusStateAdvancer, FacilitatorSelector, StallDetector, AbandonmentTracker
-   - ViewChangeManager, 5-phase round machinery
-   - Must not run concurrently with Nakamoto production
-   - Should be clean — check nodeState or config flag
+2. ~~**Disable BFT Daemons in Nakamoto Mode**~~ ✅ (af15c077, bde17768, 5ec6ac46)
+   - Nakamoto-specific Daemons: no-op EventGossipDaemon, drops DownloadDaemon + BFT gossip
+   - BFT P2P routes (gossip, event-gossip, consensus) disabled via HttpApi isNakamotoMode flag
+   - Debug logging cleaned: println→logger, emoji removed, high-freq demoted to debug
+   - Services.make still creates full consensus object (unused — not worth refactoring yet)
 
 3. **Metagraph (CL0/DL1) Nakamoto Support**
    - Current implementation is GL0-only
@@ -149,7 +149,11 @@
 
 ## 🧪 Test Infrastructure
 
+- `nakamoto-test/demo.sh` — one-command full demo (GL0 + L1 + Grafana)
 - `nakamoto-test/docker-compose.yml` — 3 genesis + 1 validator, Go sidecars, seedlist
+- `nakamoto-test/docker-compose-l1.yml` — 3 DAG-L1 nodes (BFT consensus over Nakamoto GL0)
+- `nakamoto-test/docker-compose-monitoring.yml` — Prometheus (5s scrape) + Grafana (pre-provisioned dashboard)
 - `nakamoto-test/test-validator.sh` — automated 4-node join test
 - Manual test scripts for cold restart, single-node restart, reorg scenarios
 - 647+ unit tests passing (VRF, LDD, ChainSelection, Proposer, etc.)
+- See `nakamoto-test/README.md` for full demo instructions
