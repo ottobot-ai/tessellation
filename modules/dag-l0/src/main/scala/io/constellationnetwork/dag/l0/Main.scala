@@ -199,7 +199,8 @@ object Main
           cfg.shared,
           storages.combinedGlobalSnapshotCheckpointStorage,
           getLocalChainTip = Some(forkRecoveryService.getLocalChainTip),
-          maybeMarkSeen = Some(eventGossipDaemon.markSeen)
+          maybeMarkSeen = Some(eventGossipDaemon.markSeen),
+          isNakamotoMode = isNakamotoMode
         )
       )
 

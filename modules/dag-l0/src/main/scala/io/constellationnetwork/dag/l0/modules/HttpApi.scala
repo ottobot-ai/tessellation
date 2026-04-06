@@ -58,7 +58,8 @@ object HttpApi {
       GlobalSnapshotInfo
     ],
     getLocalChainTip: Option[F[Option[ChainTip]]] = None,
-    maybeMarkSeen: Option[Hash => F[Unit]] = None
+    maybeMarkSeen: Option[Hash => F[Unit]] = None,
+    isNakamotoMode: Boolean = false
   ): F[HttpApi[F, R]] =
     SnapshotRoutes
       .make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
@@ -86,7 +87,8 @@ object HttpApi {
           sharedConfig,
           snapshotRoutes,
           getLocalChainTip,
-          maybeMarkSeen
+          maybeMarkSeen,
+          isNakamotoMode
         ) {}
       }
 }
@@ -106,7 +108,8 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
   sharedConfig: SharedConfig,
   snapshotRoutes: SnapshotRoutes[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
   getLocalChainTip: Option[F[Option[ChainTip]]] = None,
-  maybeMarkSeen: Option[Hash => F[Unit]] = None
+  maybeMarkSeen: Option[Hash => F[Unit]] = None,
+  isNakamotoMode: Boolean = false
 ) {
 
   private val mkDagCell = (block: Signed[Block]) =>
@@ -261,6 +264,11 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
       }
     }
 
+  /** BFT P2P routes: gossip, event gossip, consensus. Excluded in Nakamoto mode. */
+  private val bftP2pRoutes: HttpRoutes[F] =
+    if (isNakamotoMode) HttpRoutes.empty
+    else gossipRoutes.p2pRoutes <+> eventGossipRoutes.p2pRoutes <+> consensusRoutes
+
   private val p2pRoutes: HttpRoutes[F] =
     MetricsMiddleware[F]()(implicitly[Async[F]], implicitly[Metrics[F]]) {
       PeerAuthMiddleware.responseSignerMiddleware(privateKey, storages.session, selfId)(
@@ -271,11 +279,9 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
               PeerAuthMiddleware.requestCollateralVerifierMiddleware(services.collateral)(
                 clusterRoutes.p2pRoutes <+>
                   nodeRoutes.p2pRoutes <+>
-                  gossipRoutes.p2pRoutes <+>
-                  eventGossipRoutes.p2pRoutes <+>
                   trustRoutes.p2pRoutes <+>
                   snapshotRoutes.p2pRoutes <+>
-                  consensusRoutes
+                  bftP2pRoutes
               )
             )
           )
