@@ -110,6 +110,14 @@ else
   echo "Finished assembly, building docker image"
   docker build -t constellationnetwork/tessellation:$TESSELLATION_DOCKER_VERSION -f docker/Dockerfile .
 
+  # Nakamoto-mode GL0: also build the Go libp2p sidecar image. The same JVM
+  # JAR runs both BFT and Nakamoto modes — the sidecar provides the GossipSub
+  # transport that Nakamoto-mode GL0 publishes snapshots/attestations/rumors on.
+  if [ "$NAKAMOTO_GL0" = "true" ]; then
+    echo "Building Nakamoto sidecar image (nakamoto-sidecar:test)"
+    docker build -t nakamoto-sidecar:test -f p2p/Dockerfile p2p/
+  fi
+
 
   # Wait for cleanup PID to finish
   wait $CLEANUP_PID
@@ -175,15 +183,48 @@ else
     cp ../../docker/docker-compose.metagraph-test.yaml . ;
     cp ../../docker/docker-compose.metagraph-genesis.yaml . ;
 
+    if [ "$NAKAMOTO_GL0" = "true" ]; then
+      cp ../../docker/docker-compose.nakamoto-sidecar.yaml . ;
+      cp ../../docker/docker-compose.nakamoto-overlay.yaml . ;
+    fi
+
     cd ../../
   done
+
+  # Nakamoto mode: write a shared genesis time + per-node sidecar peer list
+  # into each .env file. All gl0 nodes MUST agree on the same genesis time.
+  if [ "$NAKAMOTO_GL0" = "true" ]; then
+    # 90s in the future — gives all containers time to start before slot 0
+    NAKAMOTO_GENESIS_MS=$(( ($(date +%s) + 90) * 1000 ))
+    echo "Nakamoto genesis time: $(date -d @$((NAKAMOTO_GENESIS_MS / 1000)) '+%H:%M:%S') (90s from now)"
+    # Build the seedlist of all peer sidecars (libp2p multiaddrs)
+    NAKAMOTO_SEEDLIST=""
+    for j in $(seq 0 $((NUM_GL0_NODES - 1))); do
+      [ -n "$NAKAMOTO_SEEDLIST" ] && NAKAMOTO_SEEDLIST="${NAKAMOTO_SEEDLIST},"
+      NAKAMOTO_SEEDLIST="${NAKAMOTO_SEEDLIST}/dns4/sidecar-${j}/tcp/9500"
+    done
+    echo "Nakamoto sidecar seedlist: $NAKAMOTO_SEEDLIST"
+    for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
+      {
+        echo ""
+        echo "# Nakamoto GL0 mode (set by compose-runner.sh --nakamoto-gl0)"
+        echo "NAKAMOTO_GENESIS_TIME_MS=$NAKAMOTO_GENESIS_MS"
+        echo "NAKAMOTO_SIDECAR_SEEDLIST=$NAKAMOTO_SEEDLIST"
+      } >> ./nodes/$i/.env
+    done
+  fi
 
   # Start all GL0 nodes together
   for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
     cd ./nodes/$i/
+    nakamoto_compose_args=""
+    if [ "$NAKAMOTO_GL0" = "true" ]; then
+      nakamoto_compose_args="-f docker-compose.nakamoto-sidecar.yaml -f docker-compose.nakamoto-overlay.yaml"
+    fi
     docker compose -f docker-compose.test.yaml \
       -f docker-compose.yaml \
       -f docker-compose.volumes.yaml \
+      $nakamoto_compose_args \
       --profile l0 \
       up -d
     cd ../../

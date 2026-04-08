@@ -1,0 +1,33 @@
+# Nakamoto mode overlay for the standard gl0 service.
+#
+# Activated via --nakamoto-gl0 in compose-runner.sh. Adds the Nakamoto env
+# vars to the existing gl0 service definition (from docker-compose.yaml) and
+# wires it to depend on the local sidecar (from docker-compose.nakamoto-sidecar.yaml).
+#
+# The gl0 binary supports both BFT and Nakamoto modes from the same JAR; the
+# behavior is selected entirely by these env vars at startup.
+services:
+  gl0:
+    environment:
+      # Top-level Nakamoto switches
+      - NAKAMOTO_ENABLED=true
+      - NAKAMOTO_PURE=true
+      # Coordinated genesis time — set per cluster by compose-runner.sh and
+      # written into each per-node .env file. Every node MUST agree on this.
+      - NAKAMOTO_GENESIS_TIME_MS=${NAKAMOTO_GENESIS_TIME_MS}
+      - NAKAMOTO_GENESIS_ETA=tessellation-nakamoto-genesis
+      # LDD snowplow tunables (defaults shown — override via --nakamoto-* in
+      # set-env.sh later if needed)
+      - NAKAMOTO_SLOTS_PER_EPOCH=${NAKAMOTO_SLOTS_PER_EPOCH:-60}
+      - NAKAMOTO_ETA_ROTATION_SLOTS=${NAKAMOTO_ETA_ROTATION_SLOTS:-600}
+      - NAKAMOTO_LDD_CUTOFF=${NAKAMOTO_LDD_CUTOFF:-15}
+      - NAKAMOTO_LDD_OFFSET=${NAKAMOTO_LDD_OFFSET:-1}
+      - NAKAMOTO_LDD_BASELINE=${NAKAMOTO_LDD_BASELINE:-0.05}
+      - NAKAMOTO_LDD_AMPLITUDE=${NAKAMOTO_LDD_AMPLITUDE:-0.5}
+      # Local sidecar gRPC endpoint — sidecar service runs on the same docker
+      # network with the matching CONTAINER_NAME_SUFFIX.
+      - SIDECAR_HOST=sidecar${CONTAINER_NAME_SUFFIX:-}
+      - SIDECAR_GRPC_PORT=50051
+    depends_on:
+      sidecar:
+        condition: service_healthy

@@ -195,7 +195,14 @@ for arg in "$@"; do
       ;;
     --use-test-metagraph)
       export USE_TEST_METAGRAPH=true
-      ;;    
+      ;;
+    --nakamoto-gl0)
+      # Run GL0 in Nakamoto mode (VRF + libp2p sidecar gossip) instead of BFT.
+      # compose-runner.sh adds a sidecar service per gl0 node and writes
+      # NAKAMOTO_* env vars into each per-node .env. CL0/GL1/CL1/DL1 layers
+      # remain BFT and talk to GL0 over HTTP unchanged.
+      export NAKAMOTO_GL0=true
+      ;;
     --fail)
       export SET_FAILURE_BREAKPOINT_TIME=true
       ;;

@@ -22,6 +22,8 @@ cleanup() {
         cleanup_container dl1-$i dl1-data-$i &
         cleanup_container ml0-$i ml0-data-$i &
         cleanup_container cl1-$i cl1-data-$i &
+        # Nakamoto sidecar containers (only present when --nakamoto-gl0 was used)
+        cleanup_container sidecar-$i "" &
     done
     cleanup_container snapshot-streaming-postgres ss-pgdata &
     cleanup_container snapshot-streaming "" &
