@@ -21,18 +21,29 @@ object GossipStream {
 
     Stream.resource(Dispatcher.sequential[F]).flatMap { dispatcher =>
       Stream.eval(Queue.unbounded[F, Option[GossipMessage]]).flatMap { queue =>
+        // Guard `unsafeRunAndForget` against the case where the cats-effect Dispatcher
+        // resource has already been released by the time gRPC fires its callbacks. The gRPC
+        // StreamObserver lifecycle is independent of the fs2 Stream's resource scope: when the
+        // outer stream finishes (or the channel is shut down), the Dispatcher closes first and
+        // gRPC may then deliver `onError`/`onCompleted` afterwards, throwing
+        // IllegalStateException: Dispatcher already closed. The state is correct — the
+        // consumer has already moved on — so we swallow it as expected shutdown noise.
+        def safeRun(action: F[Unit]): Unit =
+          try dispatcher.unsafeRunAndForget(action)
+          catch { case _: IllegalStateException => () }
+
         val startSubscription: F[Unit] = Async[F].delay {
           stub.subscribe(
             SubscribeRequest(),
             new StreamObserver[GossipMessage] {
               override def onNext(value: GossipMessage): Unit =
-                dispatcher.unsafeRunAndForget(queue.offer(Some(value)))
+                safeRun(queue.offer(Some(value)))
 
               override def onError(t: Throwable): Unit =
-                dispatcher.unsafeRunAndForget(queue.offer(None))
+                safeRun(queue.offer(None))
 
               override def onCompleted(): Unit =
-                dispatcher.unsafeRunAndForget(queue.offer(None))
+                safeRun(queue.offer(None))
             }
           )
         }
