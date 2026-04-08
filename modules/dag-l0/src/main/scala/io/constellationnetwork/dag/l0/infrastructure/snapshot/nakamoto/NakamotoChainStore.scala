@@ -156,22 +156,34 @@ object NakamotoChainStore {
                 } else {
                   val newByHash = state.byHash + (snapshotHash -> stored)
 
-                  state.bestTipHash match {
+                  // Resolve the current best tip defensively. The bestTipHash field can briefly
+                  // point at a hash no longer in byHash if the finalize-pruning path removed it
+                  // (or under a future race we haven't yet root-caused). When that happens we
+                  // treat it as "no best tip" rather than throwing — the incoming snapshot then
+                  // bootstraps a fresh tip, which is the correct recovery for catch-up: a node
+                  // that fell behind and is being reseeded from the network tip should accept
+                  // the new tip unconditionally. See task #9 in NAKAMOTO-PLAN.md.
+                  val resolvedBest = state.bestTipHash.flatMap(h => state.byHash.get(h).map(s => (h, s)))
+
+                  resolvedBest match {
                     case None =>
-                      // First snapshot — it's automatically the best
+                      // First snapshot OR stale best tip — incoming becomes the best
                       val newState = state.copy(byHash = newByHash, bestTipHash = Some(snapshotHash))
                       (
                         newState,
                         pcTree.associate(snapshotHash, parentHash) >>
                           persistHead(stored, snapshotHash) >> logger
                             .info(
-                              s"🏗️ Chain initialized at ordinal=$ordinal slot=$slot"
+                              if (state.bestTipHash.isDefined)
+                                s"🏗️ Chain reseeded at ordinal=$ordinal slot=$slot (previous best tip ${state.bestTipHash.map(_.value.take(12)).getOrElse("?")} no longer in store)"
+                              else
+                                s"🏗️ Chain initialized at ordinal=$ordinal slot=$slot"
                             )
                             .as(true)
                       )
 
-                    case Some(currentBestHash) =>
-                      val currentBest = state.byHash(currentBestHash)
+                    case Some((currentBestHash, currentBest)) =>
+                      // currentBestHash and currentBest both bound from the destructured pair
                       val currentTip = ChainTip(
                         currentBestHash,
                         Slot(NonNegLong.unsafeFrom(currentBest.slot)),
@@ -290,25 +302,49 @@ object NakamotoChainStore {
 
         def finalize(hash: Hash, ordinal: Long): F[Unit] =
           stateRef.modify { state =>
-            // Collect hashes on the canonical chain from finalized tip backward
-            val canonicalHashes = scala.collection.mutable.Set.empty[Hash]
-            var current = state.byHash.get(hash)
-            while (current.isDefined) {
-              canonicalHashes += current.get.hash
-              current = state.byHash.get(current.get.parentHash)
-            }
+            if (!state.byHash.contains(hash)) {
+              // Finality was reached for a hash this node hasn't processed yet (attestations
+              // arrived before the snapshot itself). We can't compute the canonical chain — and
+              // a naive prune would wipe everything at or below this ordinal because
+              // canonicalHashes would be empty. Skip pruning, just record the new finalized
+              // ordinal so subsequent catch-up paths know how far ahead the network is.
+              (
+                state.copy(lastFinalizedOrdinal = math.max(state.lastFinalizedOrdinal, ordinal)),
+                logger.warn(
+                  s"🔒 Finalize called for unknown hash=${hash.value.take(12)}.. ordinal=$ordinal — recording finalized ordinal but skipping prune (snapshot not yet received)"
+                )
+              )
+            } else {
+              // Collect hashes on the canonical chain from finalized tip backward
+              val canonicalHashes = scala.collection.mutable.Set.empty[Hash]
+              var current = state.byHash.get(hash)
+              while (current.isDefined) {
+                canonicalHashes += current.get.hash
+                current = state.byHash.get(current.get.parentHash)
+              }
 
-            // Prune: remove snapshots with ordinal <= finalized that aren't on canonical chain
-            val pruned = state.byHash.filter {
-              case (h, s) =>
-                s.ordinal > ordinal || canonicalHashes.contains(h)
-            }
-            val prunedCount = state.byHash.size - pruned.size
+              // Prune: remove snapshots with ordinal <= finalized that aren't on canonical chain
+              val pruned = state.byHash.filter {
+                case (h, s) =>
+                  s.ordinal > ordinal || canonicalHashes.contains(h)
+              }
+              val prunedCount = state.byHash.size - pruned.size
 
-            (
-              state.copy(byHash = pruned, lastFinalizedOrdinal = ordinal),
-              logger.info(s"🔒 Finalized ordinal=$ordinal, pruned $prunedCount orphan snapshots (${pruned.size} remaining)")
-            )
+              // CRITICAL: if the previous best tip got pruned (it was on a fork branch that
+              // lost finality), clear bestTipHash so subsequent stores reseed correctly. The
+              // alternative — leaving bestTipHash dangling — caused NakamotoChainStore.store
+              // to throw NoSuchElementException on the next call. See task #9.
+              val newBestTip = state.bestTipHash.filter(pruned.contains)
+              val bestTipCleared = state.bestTipHash.isDefined && newBestTip.isEmpty
+
+              (
+                state.copy(byHash = pruned, bestTipHash = newBestTip, lastFinalizedOrdinal = ordinal),
+                logger.info(
+                  s"🔒 Finalized ordinal=$ordinal, pruned $prunedCount orphan snapshots (${pruned.size} remaining)" +
+                    (if (bestTipCleared) s" [best tip cleared — was on pruned fork branch]" else "")
+                )
+              )
+            }
           }.flatten
 
         def walkBackTo(startHash: Hash, targetOrdinal: Long): F[Option[Hash]] =
