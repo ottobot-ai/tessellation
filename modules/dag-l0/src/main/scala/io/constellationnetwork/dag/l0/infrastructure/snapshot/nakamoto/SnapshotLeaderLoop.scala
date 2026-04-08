@@ -284,7 +284,12 @@ object SnapshotLeaderLoop {
       //   - 1 node: depth-only (no attestations possible)
       //   - 2 nodes: depth-only (can't reach 2/3+1)
       //   - 3+ nodes: attestation finality kicks in (fast)
-      val ConfirmationDepthK: Long = 6L // Nakamoto-style confirmation depth
+      // Nakamoto-style confirmation depth: snapshots with k+ children on the canonical chain
+      // are depth-finalized. Override via `NAKAMOTO_CONFIRMATION_DEPTH`. Lower for fast-finality
+      // small clusters; raise for stricter safety on larger clusters. Both depth and attestation
+      // gates always run; whichever fires first finalizes.
+      val ConfirmationDepthK: Long =
+        sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH").flatMap(_.toLongOption).getOrElse(6L)
 
       val finalityMonitor: Stream[F, Unit] = Stream
         .awakeEvery[F](5.seconds)
@@ -470,23 +475,42 @@ object SnapshotLeaderLoop {
 
               (rawArtifact, context, returnedEvents) = result
 
+              // Pre-sign gate check — proposal creation can be slow (mempool drain + acceptance
+              // pipeline). If a better gossip snapshot arrived during that work, abandon now
+              // before sealing (signing) anything. Saves a useless signature + chain store write
+              // and prevents this node from briefly emitting a fork that immediately gets reorged.
+              gateOpenPreSign <- productionGate.isOpen
+              _ <-
+                if (!gateOpenPreSign)
+                  productionGate.pauseReasons.flatMap(reasons =>
+                    logger.info(s"🛑 Abandoning production at slot $currentSlot before sign (gate closed: ${reasons.mkString(", ")})")
+                  )
+                else Async[F].unit
+
               // Attach SlotCertificate and eta to artifact before signing
               artifact = rawArtifact.copy(slotCertificate = Some(cert), eta = Some(etaHash))
 
               // Sign it (single producer signature — attestations come separately)
               signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)
 
-              // Store via NakamotoChainStore (handles forks + reorgs)
+              // Store via NakamotoChainStore (handles forks + reorgs).
+              // Skipped if the production gate closed during proposal creation — a better
+              // gossip snapshot arrived and we are abandoning this round before committing it
+              // to our local chain store. Prevents this node from briefly emitting a fork
+              // that would immediately get reorged.
               snapshotHashedForStorage <- signed.toHashed[F]
               parentHashValue = lastHashed.hash
-              stored <- chainStore.store(
-                signed,
-                context,
-                lastKey.value.value + 1,
-                currentSlot,
-                parentHashValue,
-                vrfOutput
-              )
+              stored <-
+                if (gateOpenPreSign)
+                  chainStore.store(
+                    signed,
+                    context,
+                    lastKey.value.value + 1,
+                    currentSlot,
+                    parentHashValue,
+                    vrfOutput
+                  )
+                else Async[F].pure(false)
 
               // Update lastGlobalSnapshotStorage + lastNGlobalSnapshotStorage
               // Use setForRecovery (force-set) instead of set (strict ordinal validation)
@@ -497,11 +521,13 @@ object SnapshotLeaderLoop {
                   lastKnownSlotRef.set(Some(currentSlot))
               }
 
-              // Clear included events from mempool (returned events were NOT included)
+              // Clear included events from mempool (returned events were NOT included).
+              // Only when stored — if we abandoned pre-sign, the events must stay in the
+              // mempool so the next slot winner (or our next slot) can include them.
               includedHashes = hashedEvents.collect {
                 case (h, hashed) if !returnedEvents.contains(hashed.signed.value) => h
               }.toSet
-              _ <- eventMempool.clearIncluded(includedHashes)
+              _ <- Async[F].whenA(stored)(eventMempool.clearIncluded(includedHashes))
 
               // Check gate before publishing — a better gossip snapshot may have arrived
               // during proposal creation. If gate is closed, abandon this production.

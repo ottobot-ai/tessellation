@@ -44,11 +44,16 @@ trait TipTracker[F[_]] {
 
 object TipTracker {
 
-  /** Finality threshold: > 2/3 of total stake. Using 0.6667 to avoid floating point edge cases. In practice this means ≥ 67% of validators
-    * must attest to a tip for it to finalize. With N=3, need 2/3 = 0.667 → finalized. With N=4, need 3/4 = 0.75 > 0.6667 → finalized (2/4 =
-    * 0.5 not finalized).
+  /** Attestation finality threshold — fraction of total stake that must attest to a tip for it to finalize.
+    *
+    * Default: 2/3 (BFT-classic). Override via `NAKAMOTO_ATTESTATION_THRESHOLD` (e.g. `0.5` for half-honest small clusters, `0.8` for more
+    * conservative finality).
+    *
+    * Both the attestation gate (this threshold) and the depth gate (`NAKAMOTO_CONFIRMATION_DEPTH`) always run; whichever fires first
+    * finalizes. There is no "mode" — just knobs.
     */
-  val FinalityThreshold: Double = 2.0 / 3.0 // exactly 2/3 so >= works with equal-weight registries
+  val FinalityThreshold: Double =
+    sys.env.get("NAKAMOTO_ATTESTATION_THRESHOLD").flatMap(_.toDoubleOption).getOrElse(2.0 / 3.0)
 
   def make[F[_]: Sync](stakeRegistry: StakeRegistry[F]): F[TipTracker[F]] =
     for {

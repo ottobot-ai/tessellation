@@ -49,10 +49,14 @@ trait StakeRegistry[F[_]] {
 
 object StakeRegistry {
 
-  /** Minimum fraction of seedlist that must be observed active before optimistic finality kicks in. Below this, fall back to depth-based
-    * finality only. Prevents 2/2 online nodes finalizing in a 100-node network.
+  /** Minimum fraction of seedlist that must be observed-active before optimistic finality kicks in. Below this, fall back to full-seedlist
+    * weight (depth-based finality only). Prevents 2/2 online nodes finalizing in a 100-node network.
+    *
+    * Default: 0.5. Override via `NAKAMOTO_OPTIMISTIC_MIN_FRACTION`. Lower for small clusters; raise for stricter participation
+    * requirements.
     */
-  val MinActiveQuorumFraction: Double = 0.5 // at least half the seedlist must be active
+  val MinActiveQuorumFraction: Double =
+    sys.env.get("NAKAMOTO_OPTIMISTIC_MIN_FRACTION").flatMap(_.toDoubleOption).getOrElse(0.5)
 
   /** Equal-weight stake registry with optimistic active tracking. Every validator in seedlist gets 1/N for VRF eligibility. Finality weight
     * computed against observed active peers.
