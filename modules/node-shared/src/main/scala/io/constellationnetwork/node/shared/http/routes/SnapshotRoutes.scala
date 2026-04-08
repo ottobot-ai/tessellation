@@ -41,7 +41,13 @@ final case class SnapshotRoutes[F[_]: Async, S <: Snapshot: Encoder, SI <: Snaps
   hasherSelector: HasherSelector[F],
   snapshotTimeoutsConfig: SnapshotTimeoutsConfig,
   cachedCombinedResponse: CachedCombinedResponse[F, S, SI],
-  combinedSnapshotCheckpointFileSystemStorage: CombinedSnapshotCheckpointFileSystemStorage[F, S, SI]
+  combinedSnapshotCheckpointFileSystemStorage: CombinedSnapshotCheckpointFileSystemStorage[F, S, SI],
+  // Optional override for the finalized-ordinal route. In BFT GL0 mode every snapshot is
+  // immediately final, so the default below returns the head ordinal — semantically equivalent
+  // to the legacy behavior for any client. In Nakamoto GL0 mode, dag-l0 wires this to the
+  // chain store's lastFinalizedOrdinal so CL0 can gate state-channel-binary pruning on
+  // actual finality (not just first sight). See task #6 in NAKAMOTO-PLAN.md.
+  getFinalizedOrdinal: Option[F[Option[SnapshotOrdinal]]] = None
 ) extends Http4sDsl[F]
     with PublicRoutes[F]
     with P2PRoutes[F] {
@@ -68,6 +74,24 @@ final case class SnapshotRoutes[F[_]: Async, S <: Snapshot: Encoder, SI <: Snaps
         case GET -> Root / "latest" / "ordinal" =>
           whenNodeReady {
             snapshotStorage.headSnapshot.map(_.map(_.ordinal)).flatMap {
+              case Some(ordinal) => Ok(("value" ->> ordinal.value.value) :: HNil)
+              case None          => NotFound()
+            }
+          }
+
+        case GET -> Root / "latest" / "finalized-ordinal" =>
+          // Returns the highest snapshot ordinal that has reached finality. In BFT mode this
+          // is just the head (every snapshot is immediately final). In Nakamoto mode the chain
+          // store tracks finality explicitly via attestation-2/3 OR depth-k, and the wired
+          // callback returns the actual lagging finalized ordinal — strictly <= head ordinal.
+          //
+          // CL0 polls this endpoint to gate state-channel-binary pruning: a binary stays
+          // re-sendable until its containing GL0 snapshot is finalized, so reorgs cannot
+          // silently drop it.
+          whenNodeReady {
+            val finalizedOrdinalF: F[Option[SnapshotOrdinal]] =
+              getFinalizedOrdinal.getOrElse(snapshotStorage.headSnapshot.map(_.map(_.ordinal)))
+            finalizedOrdinalF.flatMap {
               case Some(ordinal) => Ok(("value" ->> ordinal.value.value) :: HNil)
               case None          => NotFound()
             }
@@ -194,7 +218,8 @@ object SnapshotRoutes {
     nodeStorage: NodeStorage[F],
     hasherSelector: HasherSelector[F],
     snapshotTimeoutsConfig: SnapshotTimeoutsConfig,
-    combinedSnapshotCheckpointFileSystemStorage: CombinedSnapshotCheckpointFileSystemStorage[F, S, SI]
+    combinedSnapshotCheckpointFileSystemStorage: CombinedSnapshotCheckpointFileSystemStorage[F, S, SI],
+    getFinalizedOrdinal: Option[F[Option[SnapshotOrdinal]]] = None
   ): F[SnapshotRoutes[F, S, SI]] =
     for {
       cachedCombined <- CachedCombinedResponse.make[F, S, SI]
@@ -207,7 +232,8 @@ object SnapshotRoutes {
         hasherSelector,
         snapshotTimeoutsConfig,
         cachedCombined,
-        combinedSnapshotCheckpointFileSystemStorage
+        combinedSnapshotCheckpointFileSystemStorage,
+        getFinalizedOrdinal
       )
 }
 

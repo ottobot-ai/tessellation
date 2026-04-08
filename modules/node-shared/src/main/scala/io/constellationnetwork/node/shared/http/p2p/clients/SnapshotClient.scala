@@ -36,6 +36,23 @@ abstract class SnapshotClient[
     PeerResponse[F, SnapshotOrdinal](s"$urlPrefix/latest/ordinal")(client, optionalSession)
   }
 
+  /** Highest snapshot ordinal that has reached finality on the remote node.
+    *
+    * In BFT mode every snapshot is immediately final, so this returns the same value as [[getLatestOrdinal]]. In Nakamoto mode the chain
+    * store tracks finality explicitly via attestation-2/3 OR depth-k confirmation, and this returns the actual finalized ordinal, which
+    * lags the head ordinal.
+    *
+    * Used by CL0's StateChannelBinarySender to gate state-channel-binary pruning on actual finality so reorgs cannot silently drop
+    * binaries.
+    */
+  def getLatestFinalizedOrdinal: PeerResponse[F, SnapshotOrdinal] = {
+    import org.http4s.circe.CirceEntityCodec.circeEntityDecoder
+
+    implicit val decoder: Decoder[SnapshotOrdinal] = deriveMagnoliaDecoder[SnapshotOrdinal]
+
+    PeerResponse[F, SnapshotOrdinal](s"$urlPrefix/latest/finalized-ordinal")(client, optionalSession)
+  }
+
   def getLatestMetadata: PeerResponse[F, SnapshotMetadata] = {
     import org.http4s.circe.CirceEntityCodec.circeEntityDecoder
 

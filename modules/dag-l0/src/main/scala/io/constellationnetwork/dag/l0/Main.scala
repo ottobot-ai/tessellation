@@ -89,6 +89,13 @@ object Main
           hashSelect
         )
         .asResource
+      // Nakamoto finalized-ordinal tracker. Updated by SnapshotLeaderLoop after every
+      // chainStore.finalize call (depth-k or attestation-2/3). Read by the HTTP routes
+      // exposing /global-snapshots/latest/finalized-ordinal so CL0 can gate state-channel
+      // -binary pruning on actual finality. Stays at 0 in BFT mode (HttpApi only consults
+      // it when nakamoto mode is on).
+      nakamotoFinalizedOrdinalRef <- Ref.of[IO, Long](0L).asResource
+
       services <- Services
         .make[IO, Run](
           sharedConfig,
@@ -105,7 +112,8 @@ object Main
           keyPair,
           cfg,
           Hasher.forKryo[IO],
-          nodeShared.loggerBundle
+          nodeShared.loggerBundle,
+          nakamotoFinalizedOrdinalRef
         )
         .asResource
 
@@ -200,7 +208,16 @@ object Main
           storages.combinedGlobalSnapshotCheckpointStorage,
           getLocalChainTip = Some(forkRecoveryService.getLocalChainTip),
           maybeMarkSeen = Some(eventGossipDaemon.markSeen),
-          isNakamotoMode = isNakamotoMode
+          isNakamotoMode = isNakamotoMode,
+          // In Nakamoto mode, expose the chain store's tracked finalized ordinal so CL0 can
+          // gate state-channel-binary pruning on real finality. In BFT mode pass None and
+          // the route defaults to head ordinal (every BFT snapshot is immediately final).
+          getNakamotoFinalizedOrdinal =
+            if (isNakamotoMode)
+              Some(nakamotoFinalizedOrdinalRef.get.map { ord =>
+                if (ord > 0L) SnapshotOrdinal(ord) else None
+              })
+            else None
         )
       )
 

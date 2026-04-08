@@ -1,7 +1,7 @@
 # Nakamoto — Active Work Plan
 
 **Branch:** `feature/nakamoto-stake-registry`
-**Last updated:** 2026-04-08
+**Last updated:** 2026-04-08 (milestone closed: metagraph e2e on Nakamoto GL0 passing)
 
 Companion to `NAKAMOTO-TODO.md` (full backlog). This file tracks the in-flight workstream toward metagraph end-to-end on Nakamoto GL0.
 
@@ -55,15 +55,22 @@ Three checkpoints in `SnapshotLeaderLoop`: (1) slot-tick gate (already existed),
 ### 5. Parametrize finality (no mode switch)  *(✅ done)*
 Three env-var knobs with sensible defaults — `NAKAMOTO_ATTESTATION_THRESHOLD` (default 2/3, in `TipTracker.FinalityThreshold`), `NAKAMOTO_CONFIRMATION_DEPTH` (default 6, in `SnapshotLeaderLoop.ConfirmationDepthK`), `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` (default 0.5, in `StakeRegistry.MinActiveQuorumFraction`). Both gates always run; whichever fires first finalizes. No mode switch.
 
-### 6. Close SC binary finality loop (CL0-side)  *(✅ data model done, wire-up deferred to #7)*
+### 6. Close SC binary finality loop (CL0-side)  *(✅ done)*
 **Bug:** original `pruneConfirmed` dropped a binary on first sight in any GL0 snapshot — if that snapshot was later orphaned in a Nakamoto reorg, the binary was permanently lost.
 
-**Fix landed (data model):** `BinaryTracker.pruneFinalizedBelow(SnapshotOrdinal)` only prunes ConfirmedBinary entries whose `proof.globalOrdinal <= lastFinalizedGlobalOrdinal`. `StateChannelBinarySender.confirm` gained an optional `lastFinalizedGlobalOrdinal: Option[SnapshotOrdinal]` parameter defaulting to the snapshot's own ordinal (BFT-preserving). Tests + main compile.
+**Fix landed:**
+- **Data model:** `BinaryTracker.pruneFinalizedBelow(SnapshotOrdinal)` only prunes ConfirmedBinary entries whose `proof.globalOrdinal <= lastFinalizedGlobalOrdinal`. `StateChannelBinarySender.confirm` gained an optional `lastFinalizedGlobalOrdinal: Option[SnapshotOrdinal]` parameter defaulting to the snapshot's own ordinal (BFT-preserving).
+- **GL0 endpoint:** new `GET /global-snapshots/latest/finalized-ordinal` route on `SnapshotRoutes`. In Nakamoto mode, dag-l0 wires it to a `Ref[F, Long]` that `SnapshotLeaderLoop` updates after every successful `chainStore.finalize` call (depth-k or attestation-2/3, whichever fires first). In BFT mode the route defaults to head ordinal — semantically correct since BFT snapshots are immediately final.
+- **CL0 caller:** `StateChannel.scala:172` now calls `services.globalL0.pullLatestFinalizedOrdinal` (best-effort, falls back to legacy snapshot-own-ordinal on error) and passes the result into `stateChannelBinarySender.confirm`.
 
-**Wire-up remaining (part of #7):** GL0-side endpoint exposing the actual finalized ordinal needs to land, and the CL0 caller in `StateChannel.scala:172` must pass it through. Without this, metagraphs running against Nakamoto GL0 will still drop binaries on reorg — that's why this lives inside the metagraph end-to-end milestone now.
+**Validated live:** in the metagraph e2e (#7 below), `GET /global-snapshots/latest/finalized-ordinal` returns a real value (`{"value":159}`) at end-of-test, proving the route is reachable, the Ref is being updated, and CL0 is consuming it.
 
-### 7. Metagraph end-to-end via `just`  *(milestone — next focus)*
-Update `just` and docker infra to launch CL0 + DL1 against the Nakamoto GL0. Run an existing metagraph end-to-end test. Fix what breaks. Includes the SC binary finality wire-up from #6 above.
+### 7. Metagraph end-to-end via `just`  *(✅ done)*
+Updated `just test` to launch CL0 + DL1 against a Nakamoto GL0 cluster (`--use-test-metagraph --num-gl0=3 --nakamoto-gl0`). Currency e2e test suite (DAG transfers + L0 token transfers + double-spend prevention for both) runs to completion in **622s** test time / **720s** total against 3-node Nakamoto GL0 + sidecars + 3 GL1 + 2 ML0 + 3 CL1 + 3 DL1.
+
+**Also validated:**
+- Sidecar gossip migration end-to-end: BFT consensus rumors and Tessellation events both flow through Go libp2p GossipSub (no legacy HTTP gossip) and CL0 BFT consensus still reaches finality.
+- DHT-only peer discovery: Go sidecar `-disable-mdns` flag forces all peer discovery through Kademlia, validating multi-host readiness (mDNS cannot cross subnets).
 
 ---
 

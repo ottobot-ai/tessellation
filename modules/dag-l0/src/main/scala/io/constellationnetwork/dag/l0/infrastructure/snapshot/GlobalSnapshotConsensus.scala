@@ -130,7 +130,11 @@ object GlobalSnapshotConsensus {
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     eventGossipClient: EventGossipClient[F, GlobalSnapshotEvent],
     loggerBundle: LoggerBundle[F],
-    rumorQueue: Queue[F, Hashed[RumorRaw]]
+    rumorQueue: Queue[F, Hashed[RumorRaw]],
+    // Updated by SnapshotLeaderLoop after every chainStore.finalize call. Read by HttpApi
+    // to expose /global-snapshots/latest/finalized-ordinal so CL0 can gate state-channel
+    // -binary pruning on actual finality. 0L means "no snapshots finalized yet".
+    nakamotoFinalizedOrdinalRef: Ref[F, Long]
   )(implicit supervisor: Supervisor[F], globalStateProofSelector: GlobalStateProofSelector): F[GlobalSnapshotConsensus[F]] =
     for {
       globalStateChannelManager <- GlobalSnapshotStateChannelAcceptanceManager
@@ -449,7 +453,8 @@ object GlobalSnapshotConsensus {
                     epochStateRef = epochStateRef,
                     genesisTimeMs = pureGenesisTimeMs,
                     snapshotSemaphore = snapshotSemaphore,
-                    productionGate = productionGate
+                    productionGate = productionGate,
+                    nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef
                   )
                   .compile
                   .drain

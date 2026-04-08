@@ -32,6 +32,7 @@ func main() {
 	flag.BoolVar(&enableHTTP, "enable-http", false, "enable HTTP bridge (debug/fallback, gRPC is the primary interface)")
 	flag.StringVar(&cfg.PrivateKeyPath, "key", "", "path to Ed25519 private key file")
 	flag.StringVar(&cfg.MetricsAddr, "metrics", "", "Prometheus metrics address (empty = disabled)")
+	flag.BoolVar(&cfg.DisableMdns, "disable-mdns", false, "disable mDNS peer discovery (force DHT-only — for multi-host validation)")
 	flag.Parse()
 
 	if listenAddrs != "" {

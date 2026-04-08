@@ -166,7 +166,11 @@ object SnapshotLeaderLoop {
     epochStateRef: Ref[F, SharedEpochState],
     genesisTimeMs: Long = 0L,
     snapshotSemaphore: cats.effect.std.Semaphore[F],
-    productionGate: ProductionGate[F]
+    productionGate: ProductionGate[F],
+    // Tracks the highest finalized ordinal so HttpApi can expose it via
+    // /global-snapshots/latest/finalized-ordinal. Updated after every successful
+    // chainStore.finalize call (depth-k or attestation-2/3, whichever fires first).
+    nakamotoFinalizedOrdinalRef: Ref[F, Long]
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -319,6 +323,10 @@ object SnapshotLeaderLoop {
                     tipTracker.markFinalized(canonicalHash, finalizeAtSlot) >>
                       tipTracker.pruneBelow(finalizeAtSlot) >>
                       chainStore.finalize(canonicalHash, finalizeAtOrdinal) >>
+                      // Advance the finalized-ordinal tracker so HttpApi /latest/finalized-ordinal
+                      // reflects the new high-water mark. CL0 polls this to gate state-channel
+                      // -binary pruning on actual finality (not just first sight).
+                      nakamotoFinalizedOrdinalRef.update(prev => math.max(prev, finalizeAtOrdinal)) >>
                       logger
                         .info(
                           s"DEPTH-FINALIZED at ordinal=$finalizeAtOrdinal (tip=${tip.ordinal}, k=$ConfirmationDepthK)"
@@ -349,8 +357,11 @@ object SnapshotLeaderLoop {
                        tipTracker.markFinalized(hash, slot) >>
                          tipTracker.pruneBelow(slot) >>
                          chainStore.get(hash).flatMap {
-                           case Some(stored) => chainStore.finalize(hash, stored.ordinal)
-                           case None         => Async[F].unit
+                           case Some(stored) =>
+                             chainStore.finalize(hash, stored.ordinal) >>
+                               // Advance finalized-ordinal tracker (see DEPTH-FINALIZED branch above)
+                               nakamotoFinalizedOrdinalRef.update(prev => math.max(prev, stored.ordinal))
+                           case None => Async[F].unit
                          } >>
                          chainStore.get(hash).flatMap {
                            case Some(stored) =>

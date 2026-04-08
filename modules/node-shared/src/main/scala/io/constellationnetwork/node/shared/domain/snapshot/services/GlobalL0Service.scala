@@ -43,6 +43,16 @@ trait GlobalL0Service[F[_]] {
   def pullGlobalSnapshots(ordinal: SnapshotOrdinal): F[Either[LatestSnapshotTuple, List[Hashed[GlobalIncrementalSnapshot]]]]
   def pullGlobalSnapshot(ordinal: SnapshotOrdinal): F[Option[Hashed[GlobalIncrementalSnapshot]]]
   def pullGlobalSnapshot(hash: Hash): F[Option[Hashed[GlobalIncrementalSnapshot]]]
+
+  /** Highest GL0 snapshot ordinal that has reached finality.
+    *
+    * In BFT GL0 mode this equals the head ordinal (every snapshot is immediately final). In Nakamoto GL0 mode this lags the head: it's the
+    * ordinal up to which attestation-2/3 OR depth-k confirmation has completed. Used by CL0 to gate state-channel-binary pruning on actual
+    * finality so Nakamoto reorgs cannot silently drop binaries.
+    *
+    * Returns None if the remote GL0 has no snapshots yet (pre-genesis) or the request fails.
+    */
+  def pullLatestFinalizedOrdinal: F[Option[SnapshotOrdinal]]
 }
 
 object GlobalL0Service {
@@ -94,6 +104,13 @@ object GlobalL0Service {
           logger
             .warn(e)(s"Failure pulling single snapshot with ordinal=${ordinal.show}")
             .as(none)
+        }
+
+      def pullLatestFinalizedOrdinal: F[Option[SnapshotOrdinal]] =
+        globalL0ClusterStorage.getRandomPeer.flatMap { peer =>
+          l0GlobalSnapshotClient.getLatestFinalizedOrdinal.run(peer).map(_.some)
+        }.handleErrorWith { e =>
+          logger.warn(e)(s"Failure pulling latest finalized ordinal").as(none)
         }
 
       def pullGlobalSnapshots: F[Either[LatestSnapshotTuple, List[Hashed[GlobalIncrementalSnapshot]]]] =

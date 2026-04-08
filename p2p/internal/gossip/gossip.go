@@ -159,12 +159,18 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		cfg:              cfg,
 	}
 
-	// Start mDNS discovery for automatic peer finding on local network / Docker bridge
-	mdnsService := mdns.NewMdnsService(h, "nakamoto-mesh", &mdnsNotifee{host: h, ctx: ctx})
-	if err := mdnsService.Start(); err != nil {
-		fmt.Printf("WARN: mDNS start failed: %v\n", err)
+	// Start mDNS discovery for automatic peer finding on local network / Docker bridge.
+	// Skipped when -disable-mdns is set, which forces all peer discovery through the
+	// Kademlia DHT — useful for multi-host validation where mDNS cannot cross subnets.
+	if cfg.DisableMdns {
+		fmt.Println("mDNS: disabled (DHT-only peer discovery)")
 	} else {
-		fmt.Println("mDNS: peer discovery active (service: nakamoto-mesh)")
+		mdnsService := mdns.NewMdnsService(h, "nakamoto-mesh", &mdnsNotifee{host: h, ctx: ctx})
+		if err := mdnsService.Start(); err != nil {
+			fmt.Printf("WARN: mDNS start failed: %v\n", err)
+		} else {
+			fmt.Println("mDNS: peer discovery active (service: nakamoto-mesh)")
+		}
 	}
 
 	return node, nil

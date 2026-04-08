@@ -4,7 +4,7 @@ import java.security.KeyPair
 
 import cats.Parallel
 import cats.data.NonEmptySet
-import cats.effect.kernel.Async
+import cats.effect.kernel.{Async, Ref}
 import cats.effect.std.{Random, Supervisor}
 import cats.syntax.applicative._
 import cats.syntax.flatMap._
@@ -67,7 +67,8 @@ object Services {
     keyPair: KeyPair,
     cfg: AppConfig,
     txHasher: Hasher[F],
-    loggerBundle: LoggerBundle[F]
+    loggerBundle: LoggerBundle[F],
+    nakamotoFinalizedOrdinalRef: Ref[F, Long]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): F[Services[F, R]] =
@@ -139,7 +140,8 @@ object Services {
             eventMempoolService,
             eventGossipClient,
             loggerBundle,
-            queues.rumor
+            queues.rumor,
+            nakamotoFinalizedOrdinalRef
           )
       }
       addressService = AddressService.make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](

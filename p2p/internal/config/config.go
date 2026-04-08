@@ -34,6 +34,12 @@ type Config struct {
 
 	// MetricsAddr enables Prometheus metrics if non-empty.
 	MetricsAddr string
+
+	// DisableMdns disables the mDNS local-network discovery service. Set this
+	// when validating that the Kademlia DHT is the sole source of peer
+	// discovery — useful for multi-host deployment validation where mDNS
+	// cannot reach across subnets and the cluster MUST work via DHT alone.
+	DisableMdns bool
 }
 
 // DefaultConfig returns sensible defaults for a Nakamoto sidecar.

@@ -24,15 +24,15 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * The sidecar treats the rumor envelope as opaque bytes (JSON-serialized `Signed[RumorRaw]`); the JVM is responsible for signing,
   * validation, and dispatch. This bridge has two halves:
   *
-  *   - **Outbound** ([[publishFn]]): wired into `Gossip.setSidecarPublishFn`. Every rumor passing through `Gossip.spread` is also
-  *     forwarded to the sidecar via `PublishRumor`.
+  *   - **Outbound** ([[publishFn]]): wired into `Gossip.setSidecarPublishFn`. Every rumor passing through `Gossip.spread` is also forwarded
+  *     to the sidecar via `PublishRumor`.
   *   - **Inbound** ([[receive]]): subscribes to the sidecar's `GossipMessage` stream, filters `Rumor` bodies, deserializes back to
   *     `Signed[RumorRaw]`, recomputes the hash, and offers to `rumorQueue`. The existing `GossipDaemon.consumeRumors` pipeline then
   *     validates signature + collateral and dispatches via the registered `RumorHandler`s — meaning **CL0 BFT consensus messages,
   *     Tessellation events, and any other rumor type ride for free** without changes to their handlers.
   *
-  * Wire format: `signed.asJson.noSpaces.getBytes(UTF_8)`. JSON is sized for the existing `application.conf` rumor capacities and
-  * matches the format already used by the legacy HTTP gossip routes.
+  * Wire format: `signed.asJson.noSpaces.getBytes(UTF_8)`. JSON is sized for the existing `application.conf` rumor capacities and matches
+  * the format already used by the legacy HTTP gossip routes.
   */
 object SidecarRumorBridge {
 
@@ -55,8 +55,8 @@ object SidecarRumorBridge {
     }
   }
 
-  /** Inbound receive loop. Subscribes to the sidecar gossip stream, parses Rumor messages, and offers `Hashed[RumorRaw]` to the
-    * shared `rumorQueue` so the existing `GossipDaemon.consumeRumors` pipeline picks them up.
+  /** Inbound receive loop. Subscribes to the sidecar gossip stream, parses Rumor messages, and offers `Hashed[RumorRaw]` to the shared
+    * `rumorQueue` so the existing `GossipDaemon.consumeRumors` pipeline picks them up.
     *
     * Run as a supervised background fiber.
     */

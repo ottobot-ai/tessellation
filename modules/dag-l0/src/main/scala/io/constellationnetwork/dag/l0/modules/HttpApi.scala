@@ -59,7 +59,13 @@ object HttpApi {
     ],
     getLocalChainTip: Option[F[Option[ChainTip]]] = None,
     maybeMarkSeen: Option[Hash => F[Unit]] = None,
-    isNakamotoMode: Boolean = false
+    isNakamotoMode: Boolean = false,
+    // Optional Nakamoto finality callback. When in Nakamoto mode, dag-l0 wires this to
+    // chainStore.lastFinalizedOrdinal so the /global-snapshots/latest/finalized-ordinal
+    // endpoint reports the actual finalized ordinal (lagging the head). In BFT mode this
+    // is None and the endpoint defaults to head ordinal — semantically correct since BFT
+    // snapshots are immediately final.
+    getNakamotoFinalizedOrdinal: Option[F[Option[SnapshotOrdinal]]] = None
   ): F[HttpApi[F, R]] =
     SnapshotRoutes
       .make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
@@ -69,7 +75,8 @@ object HttpApi {
         storages.node,
         HasherSelector[F],
         sharedConfig.snapshotTimeoutsConfig,
-        combinedSnapshotCheckpointFileSystemStorage
+        combinedSnapshotCheckpointFileSystemStorage,
+        getNakamotoFinalizedOrdinal
       )
       .map { snapshotRoutes =>
         new HttpApi[F, R](

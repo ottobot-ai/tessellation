@@ -169,7 +169,16 @@ object StateChannel {
         _ <- persistGlobalSnapshot(snapshot, context)
         _ <- sendGlobalSnapshotSyncConsensusEvent(snapshot)
         _ <- triggerOnGlobalSnapshotPullHook(snapshot, context)
-        _ <- services.stateChannelBinarySender.confirm(snapshot).handleErrorWith { error =>
+        // Fetch GL0's authoritative finalized ordinal so we only prune SC binaries whose
+        // containing GL0 snapshot is actually durable. In BFT GL0 mode every snapshot is
+        // immediately final and the endpoint returns the snapshot's own ordinal — same as
+        // the legacy behavior. In Nakamoto GL0 mode the endpoint returns the lagging
+        // depth-k / attestation-2/3 marker, so binaries stay re-sendable until their
+        // containing snapshot is finalized — closes the reorg-loses-binaries gap.
+        // Best-effort: if the fetch fails (network blip, BFT GL0 with old binary), fall
+        // back to the snapshot's own ordinal which is the legacy default.
+        finalizedOrdinal <- services.globalL0.pullLatestFinalizedOrdinal.handleError(_ => none)
+        _ <- services.stateChannelBinarySender.confirm(snapshot, finalizedOrdinal).handleErrorWith { error =>
           logger.error(error)("Error when confirming state channel binary") >>
             updateFailedConfirmingStateChannelBinaryMetrics() >>
             Async[F].unit
