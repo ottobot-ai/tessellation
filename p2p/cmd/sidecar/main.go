@@ -66,14 +66,21 @@ func main() {
 	for _, addr := range node.Host.Addrs() {
 		fmt.Printf("  Listen: %s/p2p/%s\n", addr, node.Host.ID())
 	}
-	fmt.Printf("  Topics: %s, %s\n", cfg.SnapshotTopic, cfg.AttestationTopic)
+	fmt.Printf("  Topics: %s, %s, %s\n", cfg.SnapshotTopic, cfg.AttestationTopic, cfg.RumorTopic)
 	fmt.Printf("  gRPC:   %s\n", cfg.GRPCAddr)
 
-	// Connect to seedlist
+	// Connect to seedlist (bootstrap peers for the DHT)
 	if len(cfg.Seedlist) > 0 {
 		if err := node.ConnectSeedlist(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "WARN: seedlist connect: %v\n", err)
 		}
+	}
+
+	// Bootstrap the Kademlia DHT routing table and start the rendezvous
+	// discovery loop. Once running, peer discovery is fully decentralized;
+	// the seedlist is only used as the initial entry point.
+	if err := node.BootstrapDHT(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: DHT bootstrap: %v\n", err)
 	}
 
 	// HTTP bridge — opt-in debug/fallback (gRPC is the primary JVM interface)

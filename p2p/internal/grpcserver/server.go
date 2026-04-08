@@ -75,12 +75,25 @@ func (s *Server) PublishAttestation(ctx context.Context, att *pb.TipAttestation)
 	return &pb.PublishResponse{Ok: true}, nil
 }
 
+// PublishRumor broadcasts a generic rumor (event / BFT consensus message / etc).
+func (s *Server) PublishRumor(ctx context.Context, ru *pb.Rumor) (*pb.PublishResponse, error) {
+	data, err := proto.Marshal(ru)
+	if err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	if err := s.node.PublishRumor(ctx, data); err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	return &pb.PublishResponse{Ok: true}, nil
+}
+
 // Subscribe streams incoming gossip messages to the JVM.
 func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_SubscribeServer) error {
 	ctx := stream.Context()
 
 	snCh := s.node.SnapshotMessages(ctx)
 	atCh := s.node.AttestationMessages(ctx)
+	ruCh := s.node.RumorMessages(ctx)
 
 	for {
 		select {
@@ -114,6 +127,21 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 				return err
 			}
 
+		case data, ok := <-ruCh:
+			if !ok {
+				return nil
+			}
+			var ru pb.Rumor
+			if err := proto.Unmarshal(data, &ru); err != nil {
+				continue
+			}
+			msg := &pb.GossipMessage{
+				Body: &pb.GossipMessage_Rumor{Rumor: &ru},
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -122,12 +150,13 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 
 // PeerCount returns mesh membership stats.
 func (s *Server) PeerCount(ctx context.Context, req *pb.PeerCountRequest) (*pb.PeerCountResponse, error) {
-	snPeers, atPeers := s.node.MeshPeerCount()
+	snPeers, atPeers, ruPeers := s.node.MeshPeerCount()
 	total := len(s.node.Host.Network().Peers())
 	return &pb.PeerCountResponse{
 		Total:            int32(total),
 		MeshSnapshots:    int32(snPeers),
 		MeshAttestations: int32(atPeers),
+		MeshRumors:       int32(ruPeers),
 	}, nil
 }
 

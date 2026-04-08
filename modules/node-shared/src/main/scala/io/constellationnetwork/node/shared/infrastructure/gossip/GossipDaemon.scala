@@ -46,30 +46,40 @@ object GossipDaemon {
     selfId: PeerId,
     generation: Generation,
     cfg: GossipDaemonConfig,
-    collateral: Collateral[F]
+    collateral: Collateral[F],
+    nakamotoMode: Boolean = false
   )(implicit S: Supervisor[F], hasherSelector: HasherSelector[F]): GossipDaemon[F] = {
     new GossipDaemon[F] {
       private val logger = Slf4jLogger.getLogger[F]
       private val rumorLogger = Slf4jLogger.getLoggerFromName[F](rumorLoggerName)
 
+      // In Nakamoto mode all peer-to-peer transport is handled by the libp2p sidecar
+      // (via SidecarRumorBridge): outbound rumors are forwarded by Gossip.spread, inbound
+      // rumors are offered to rumorQueue by SidecarRumorBridge.receive. Only the local
+      // consumeRumors loop is needed to validate/dispatch through RumorHandler. The legacy
+      // peer/common round runners (HTTP-based pull gossip) are skipped.
       def startAsInitialValidator: F[Unit] =
-        runPeerRoundRunner >>
-          runCommonRoundRunner >>
-          consumeRumors
+        if (nakamotoMode) consumeRumors
+        else
+          runPeerRoundRunner >>
+            runCommonRoundRunner >>
+            consumeRumors
 
       def startAsRegularValidator: F[Unit] =
-        S.supervise {
-          clusterStorage.peerChanges.collectFirst {
-            case Ior.Right(peer) if peer.state === NodeState.Ready   => peer
-            case Ior.Both(_, peer) if peer.state === NodeState.Ready => peer
-          }.compile.lastOrError.flatMap { peer =>
-            initPeerRumorStorage(peer) >>
-              runPeerRoundRunner >>
-              initCommonRumorStorage(peer) >>
-              runCommonRoundRunner >>
-              consumeRumors
-          }
-        }.void
+        if (nakamotoMode) consumeRumors
+        else
+          S.supervise {
+            clusterStorage.peerChanges.collectFirst {
+              case Ior.Right(peer) if peer.state === NodeState.Ready   => peer
+              case Ior.Both(_, peer) if peer.state === NodeState.Ready => peer
+            }.compile.lastOrError.flatMap { peer =>
+              initPeerRumorStorage(peer) >>
+                runPeerRoundRunner >>
+                initCommonRumorStorage(peer) >>
+                runCommonRoundRunner >>
+                consumeRumors
+            }
+          }.void
 
       private def runPeerRoundRunner =
         GossipRoundRunner.make(clusterStorage, localHealthcheck, peerRound, "peer", cfg.peerRound).flatMap(_.runForever)

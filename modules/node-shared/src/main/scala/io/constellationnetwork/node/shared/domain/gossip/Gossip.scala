@@ -23,10 +23,18 @@ trait Gossip[F[_]] {
   /** Register the direct push callback. Called after consensus client is created to break the circular dependency. */
   def setDirectPushFn(fn: Gossip.DirectPushFn[F]): F[Unit]
 
+  /** Register the sidecar publish callback. When set (Nakamoto / sidecar mode), every spread rumor is also forwarded to the libp2p sidecar
+    * for GossipSub propagation. Wired after the SidecarClient is created to break the circular dependency.
+    */
+  def setSidecarPublishFn(fn: Gossip.SidecarPublishFn[F]): F[Unit]
+
 }
 
 object Gossip {
 
   /** Callback for direct push delivery of consensus rumors. */
   type DirectPushFn[F[_]] = (Hashed[RumorRaw], Set[PeerId]) => F[Unit]
+
+  /** Callback for forwarding spread rumors to the libp2p sidecar (GossipSub transport). */
+  type SidecarPublishFn[F[_]] = Hashed[RumorRaw] => F[Unit]
 }

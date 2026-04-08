@@ -125,6 +125,10 @@ object NakamotoSyncDaemon {
           case pb.GossipMessage.Body.Attestation(att) =>
             handleAttestation(att, tipTracker, logger)
 
+          case _: pb.GossipMessage.Body.Rumor =>
+            // Rumors are handled by SidecarRumorBridge.receive — ignore here.
+            Async[F].unit
+
           case pb.GossipMessage.Body.Empty =>
             Async[F].unit
         }

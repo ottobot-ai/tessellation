@@ -85,6 +85,22 @@ object GlobalSnapshotConsensus {
   /** Check if Nakamoto mode is enabled via environment variable */
   val nakamotoEnabled: Boolean = sys.env.contains("NAKAMOTO_ENABLED")
 
+  /** Genesis time of the Nakamoto chain — Unix epoch milliseconds at which slot 0 starts.
+    *
+    * This is a per-cluster constant: every node in the same Nakamoto cluster MUST agree on the same value, otherwise their slot clocks
+    * drift and they will never produce overlapping VRF eligibility windows.
+    *
+    * Resolved once at process start, in this single place, and threaded as an already-resolved `Long` to every downstream component.
+    * Override via `NAKAMOTO_GENESIS_TIME_MS` at launch time (the standard cluster-launch knob, set by the deploy tooling alongside the
+    * genesis snapshot). If unset, falls back to `System.currentTimeMillis()` — only suitable for single-node dev launches; multi-node
+    * clusters MUST set the env var.
+    *
+    * Future work: derive from the genesis snapshot itself so validators discover it from the chain instead of needing the env var. See task
+    * #2 / NAKAMOTO-PLAN.md.
+    */
+  val nakamotoGenesisTimeMs: Long =
+    sys.env.get("NAKAMOTO_GENESIS_TIME_MS").flatMap(_.toLongOption).getOrElse(System.currentTimeMillis())
+
   def make[F[_]: Async: Parallel: Random: JsonSerializer: HasherSelector: SecurityProvider: Metrics, R <: CliMethod](
     sharedCfg: SharedConfig,
     gossip: Gossip[F],
@@ -221,11 +237,9 @@ object GlobalSnapshotConsensus {
       // In Nakamoto mode, create state ref for VRF trigger daemon
       nakamotoStateRef <-
         if (nakamotoEnabled) {
-          // Genesis time defaults to now if not provided via env
-          val genesisTimeMs = sys.env.get("NAKAMOTO_GENESIS_TIME_MS").flatMap(_.toLongOption).getOrElse(System.currentTimeMillis())
           // Genesis eta (randomness seed) - use a default or env-provided value
           val genesisEta = sys.env.get("NAKAMOTO_GENESIS_ETA").map(_.getBytes).getOrElse("tessellation-nakamoto-genesis".getBytes)
-          Ref.of[F, NakamotoTriggerState](NakamotoTriggerState.initial(genesisTimeMs, genesisEta)).map(Some(_))
+          Ref.of[F, NakamotoTriggerState](NakamotoTriggerState.initial(nakamotoGenesisTimeMs, genesisEta)).map(Some(_))
         } else {
           Async[F].pure(None)
         }
@@ -329,7 +343,7 @@ object GlobalSnapshotConsensus {
 
           if (usePureAttestation) {
             // Pure attestation mode: SnapshotLeaderLoop bypasses BFT rounds entirely
-            val pureGenesisTimeMs = sys.env.get("NAKAMOTO_GENESIS_TIME_MS").flatMap(_.toLongOption).getOrElse(0L)
+            val pureGenesisTimeMs = nakamotoGenesisTimeMs
             for {
               nakLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("NakamotoConsensus").pure[F]
               _ <- nakLogger.info(
@@ -401,6 +415,18 @@ object GlobalSnapshotConsensus {
                 .makeResource[F](sidecarConfig)
                 .allocated
               sidecarClient = allocatedPair._1
+              // Wire rumor gossip onto the sidecar transport. Outbound: every rumor passing through
+              // Gossip.spread is forwarded to the libp2p sidecar via PublishRumor. Inbound: rumors
+              // received from the GossipSub mesh are deserialized back to Hashed[RumorRaw] and offered
+              // to rumorQueue, where the existing GossipDaemon.consumeRumors pipeline validates and
+              // dispatches them via the registered RumorHandlers — meaning BFT consensus messages,
+              // Tessellation events, and any other rumor type ride sidecar transport for free.
+              _ <- gossip.setSidecarPublishFn(
+                io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
+                  .publishFn[F](sidecarClient)
+              )
+              _ <- io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
+                .receive[F](sidecarClient.channel, rumorQueue)
               _ <- supervisor.supervise(
                 io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
                   .run[F](

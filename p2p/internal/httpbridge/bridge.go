@@ -63,6 +63,7 @@ type PeerCountResult struct {
 	Total            int `json:"total"`
 	MeshSnapshots    int `json:"meshSnapshots"`
 	MeshAttestations int `json:"meshAttestations"`
+	MeshRumors       int `json:"meshRumors"`
 }
 
 type HealthResult struct {
@@ -173,12 +174,13 @@ func (b *Bridge) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Bridge) handlePeers(w http.ResponseWriter, r *http.Request) {
-	snPeers, atPeers := b.node.MeshPeerCount()
+	snPeers, atPeers, ruPeers := b.node.MeshPeerCount()
 	total := len(b.node.Host.Network().Peers())
 	writeJSON(w, PeerCountResult{
 		Total:            total,
 		MeshSnapshots:    snPeers,
 		MeshAttestations: atPeers,
+		MeshRumors:       ruPeers,
 	})
 }
 

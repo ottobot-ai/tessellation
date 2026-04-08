@@ -18,6 +18,7 @@ type Config struct {
 	// Topics
 	SnapshotTopic     string
 	AttestationTopic  string
+	RumorTopic        string
 
 	// GossipSub parameters
 	MeshD    int // target mesh degree (default 6)
@@ -42,6 +43,7 @@ func DefaultConfig() Config {
 		GRPCAddr:          "127.0.0.1:50051",
 		SnapshotTopic:     "/nakamoto/snapshots/1.0.0",
 		AttestationTopic:  "/nakamoto/attestations/1.0.0",
+		RumorTopic:        "/tessellation/rumors/1.0.0",
 		MeshD:             6,
 		MeshDLo:           4,
 		MeshDHi:           12,

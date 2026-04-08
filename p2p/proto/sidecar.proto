@@ -30,11 +30,28 @@ message TipAttestation {
   bytes signature = 6;      // signature over (tip_hash || tip_slot)
 }
 
+// A generic signed rumor — used to carry events, BFT consensus messages,
+// and other Tessellation gossip payloads on top of GossipSub. The sidecar
+// treats the body as opaque bytes; the JVM is responsible for serialization,
+// signing, and validation.
+message Rumor {
+  // Signed rumor envelope, JSON-serialized by the JVM and wrapped in the
+  // standard Tessellation `Signed[RumorRaw]` shape. Opaque to the sidecar.
+  bytes signed_rumor_bytes = 1;
+  // Content type discriminator (e.g. "io.constellationnetwork...Event").
+  // Carried alongside the bytes for cheap routing/metrics on the sidecar.
+  string content_type = 2;
+  // Origin peer id (for logging/dedup hints — authoritative origin is in the
+  // signed envelope).
+  bytes origin_id = 3;
+}
+
 // Envelope for GossipSub messages.
 message GossipMessage {
   oneof body {
     Snapshot snapshot = 1;
     TipAttestation attestation = 2;
+    Rumor rumor = 3;
   }
 }
 
@@ -47,6 +64,9 @@ service SidecarService {
 
   // Publish an attestation to the network.
   rpc PublishAttestation(TipAttestation) returns (PublishResponse);
+
+  // Publish a generic rumor (event / BFT consensus message / etc).
+  rpc PublishRumor(Rumor) returns (PublishResponse);
 
   // Subscribe to incoming messages from the network.
   // Server-streaming: sidecar pushes received gossip to JVM.
@@ -75,6 +95,7 @@ message PeerCountResponse {
   int32 total = 1;
   int32 mesh_snapshots = 2;   // peers in snapshot topic mesh
   int32 mesh_attestations = 3; // peers in attestation topic mesh
+  int32 mesh_rumors = 4;      // peers in rumor topic mesh
 }
 
 message HealthRequest {}

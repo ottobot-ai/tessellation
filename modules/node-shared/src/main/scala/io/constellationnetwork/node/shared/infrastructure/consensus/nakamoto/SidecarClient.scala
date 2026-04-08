@@ -23,6 +23,7 @@ object SidecarClient {
   trait SidecarClientAlgebra[F[_]] {
     def publishSnapshot(msg: Snapshot): F[PublishResponse]
     def publishAttestation(msg: TipAttestation): F[PublishResponse]
+    def publishRumor(msg: Rumor): F[PublishResponse]
     def health: F[HealthResponse]
     def peers: F[PeerCountResponse]
     def channel: ManagedChannel
@@ -54,6 +55,9 @@ object SidecarClient {
 
       def publishAttestation(msg: TipAttestation): F[PublishResponse] =
         liftFuture(stub.publishAttestation(msg))
+
+      def publishRumor(msg: Rumor): F[PublishResponse] =
+        liftFuture(stub.publishRumor(msg))
 
       def health: F[HealthResponse] =
         liftFuture(stub.health(HealthRequest()))
@@ -90,6 +94,17 @@ object SidecarClient {
       payload = ByteString.copyFrom(payload),
       producerId = ByteString.copyFrom(producerId),
       parentSlot = parentSlot
+    )
+
+  def mkRumor(
+    signedRumorBytes: Array[Byte],
+    contentType: String,
+    originId: Array[Byte]
+  ): Rumor =
+    Rumor(
+      signedRumorBytes = ByteString.copyFrom(signedRumorBytes),
+      contentType = contentType,
+      originId = ByteString.copyFrom(originId)
     )
 
   def mkAttestation(

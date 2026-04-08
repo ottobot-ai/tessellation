@@ -219,7 +219,8 @@ object Main
         nodeId,
         generation,
         sharedConfig.gossip.daemon,
-        services.collateral
+        services.collateral,
+        nakamotoMode = isNakamotoMode
       )
 
       _ <- (method match {

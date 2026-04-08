@@ -32,6 +32,7 @@ object Gossip {
     for {
       counter <- Ref.of[F, Counter](Counter.MinValue)
       directPushRef <- Ref.of[F, Option[GossipAlg.DirectPushFn[F]]](None)
+      sidecarPublishRef <- Ref.of[F, Option[GossipAlg.SidecarPublishFn[F]]](None)
     } yield
       new GossipAlg[F] {
 
@@ -67,6 +68,9 @@ object Gossip {
         def setDirectPushFn(fn: GossipAlg.DirectPushFn[F]): F[Unit] =
           directPushRef.set(fn.some)
 
+        def setSidecarPublishFn(fn: GossipAlg.SidecarPublishFn[F]): F[Unit] =
+          sidecarPublishRef.set(fn.some)
+
         private def signAndOffer(rumor: RumorRaw): F[Unit] =
           signAndOfferReturn(rumor).void
 
@@ -77,6 +81,10 @@ object Gossip {
             _ <- rumorQueue.offer(hashedRumor)
             _ <- metrics.updateRumorsSpread(signedRumor)
             _ <- logSpread(hashedRumor)
+            maybeSidecarFn <- sidecarPublishRef.get
+            _ <- maybeSidecarFn.traverse_ { fn =>
+              fn(hashedRumor).handleErrorWith(err => rumorLogger.warn(err)(s"Sidecar publish failed, gossip will propagate"))
+            }
           } yield hashedRumor
 
         private def logSpread(hashedRumor: Hashed[RumorRaw]): F[Unit] =
