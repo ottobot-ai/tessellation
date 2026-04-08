@@ -40,6 +40,15 @@ trait MptUndoJournal[F[_]] {
   )(apply: F[Unit]): F[Unit]
 
   /** Unapply journal entries from current tip back to (not including) the target ancestor ordinal. Returns count of entries unapplied.
+    *
+    * NOT YET CONSUMED. Recording (via `wrapApply`) is wired, but no caller invokes `unapplyTo` today. Reorgs are handled by the
+    * self-healing MPT path (full rebuild from canonical chain) — slower but correct. The journal is a performance optimization deferred
+    * until: (a) self-healing rebuilds become a bottleneck during testing, or (b) inclusion-proof features land that require reconstructing
+    * the trie root at a historical ordinal — which is a functional requirement, not just performance.
+    *
+    * To wire this, the snapshot acceptance pipeline needs to detect reorgs BEFORE applying the incoming fork's MPT mutations, compute the
+    * common ancestor ordinal between the canonical chain and the incoming fork, call `unapplyTo` to roll the MPT back to that ancestor,
+    * then let the new fork apply forward via `wrapApply`. See task #4 in NAKAMOTO-PLAN.md.
     */
   def unapplyTo(ancestorOrdinal: Long): F[Int]
 
