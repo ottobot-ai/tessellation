@@ -75,6 +75,22 @@ trait BinaryTracker[F[_]] {
   def updateState(f: TrackerState => TrackerState): F[Unit]
   def clear: F[Unit]
   def pruneConfirmed: F[Unit]
+
+  /** Prune confirmed binaries whose containing GL0 snapshot has reached finality.
+    *
+    * Fixes the reorg-loses-binaries bug: with the original [[pruneConfirmed]], a binary is dropped from the tracker as soon as it is seen
+    * in any GL0 snapshot. If that GL0 snapshot is later orphaned in a Nakamoto reorg, the binary is gone and the metagraph builds the next
+    * snapshot referencing a `lastSnapshotHash` that no longer exists in GL0's canonical chain — a permanent gap.
+    *
+    * This variant only prunes confirmed binaries whose `proof.globalOrdinal <= lastFinalizedGlobalOrdinal`, where the finalized ordinal
+    * must come from GL0's authoritative finality marker (depth-k or attestation-2/3, whichever fires first). Binaries confirmed in
+    * still-unfinalized GL0 snapshots stay in the tracker; if their containing snapshot is orphaned they will be re-promoted to pending and
+    * re-sent on the next worker tick.
+    *
+    * In BFT GL0 mode every snapshot is immediately final, so passing the snapshot's own ordinal here is equivalent to the legacy behavior —
+    * the new method is strictly safer and a drop-in replacement.
+    */
+  def pruneFinalizedBelow(lastFinalizedGlobalOrdinal: SnapshotOrdinal): F[Unit]
 }
 
 object BinaryTracker {
@@ -128,6 +144,16 @@ object BinaryTracker {
         def pruneConfirmed: F[Unit] =
           stateRef.update { state =>
             val updatedTracked = state.tracked.filterNot(_.isInstanceOf[ConfirmedBinary])
+            state.copy(tracked = updatedTracked)
+          }
+
+        def pruneFinalizedBelow(lastFinalizedGlobalOrdinal: SnapshotOrdinal): F[Unit] =
+          stateRef.update { state =>
+            val updatedTracked = state.tracked.filterNot {
+              case ConfirmedBinary(_, proof) =>
+                proof.globalOrdinal.value.value <= lastFinalizedGlobalOrdinal.value.value
+              case _ => false
+            }
             state.copy(tracked = updatedTracked)
           }
       }

@@ -31,7 +31,10 @@ trait StateChannelBinarySender[F[_]] {
     lastGlobalSnapshotSigners: Option[NonEmptySet[PeerId]]
   ): F[Unit]
 
-  def confirm(globalSnapshot: Hashed[GlobalIncrementalSnapshot]): F[Unit]
+  def confirm(
+    globalSnapshot: Hashed[GlobalIncrementalSnapshot],
+    lastFinalizedGlobalOrdinal: Option[SnapshotOrdinal] = None
+  ): F[Unit]
 
   def clearPending: F[Unit]
 }
@@ -120,7 +123,10 @@ object StateChannelBinarySender {
         _ <- logger.info(s"[Queue] Enqueued binary ${binary.hash} at ordinal $currencySnapshotOrdinal")
       } yield ()
 
-    def confirm(globalSnapshot: Hashed[GlobalIncrementalSnapshot]): F[Unit] =
+    def confirm(
+      globalSnapshot: Hashed[GlobalIncrementalSnapshot],
+      lastFinalizedGlobalOrdinal: Option[SnapshotOrdinal] = None
+    ): F[Unit] =
       for {
         identifier <- identifierStorage.get
         confirmedHashes <- getConfirmedHashes(identifier, globalSnapshot)
@@ -132,7 +138,13 @@ object StateChannelBinarySender {
         retryMode = RetryStrategy.shouldEnterRetryMode(updatedState, globalSnapshot.ordinal)
         _ <- tracker.updateState(_.copy(retryMode = retryMode))
         _ <- tracker.updateState(RetryStrategy.updateRetryParameters(_, oldRetryMode))
-        _ <- tracker.pruneConfirmed
+        // Finality-gated pruning: defaults to the snapshot's own ordinal (BFT — every snapshot
+        // is immediately final). For Nakamoto GL0, the caller MUST supply the actual finalized
+        // ordinal from GL0's finality endpoint or confirmed binaries get dropped before the
+        // containing GL0 snapshot is durable, losing them on reorg. See task #6/#7 in
+        // NAKAMOTO-PLAN.md for the wire-up.
+        finalizedOrdinal = lastFinalizedGlobalOrdinal.getOrElse(globalSnapshot.ordinal)
+        _ <- tracker.pruneFinalizedBelow(finalizedOrdinal)
         metricsState <- tracker.getState
         _ <- updateStateChannelRetryParametersMetrics(metricsState)
       } yield ()

@@ -213,7 +213,10 @@ object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
           }
       } yield ()
 
-    def confirm(globalSnapshot: Hashed[GlobalIncrementalSnapshot]): G[Unit] =
+    def confirm(
+      globalSnapshot: Hashed[GlobalIncrementalSnapshot],
+      lastFinalizedGlobalOrdinal: Option[SnapshotOrdinal] = None
+    ): G[Unit] =
       for {
         identifier <- identifierStorage.get
         confirmedHashes <- getConfirmedHashes(identifier, globalSnapshot)
