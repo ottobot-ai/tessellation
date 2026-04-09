@@ -391,7 +391,9 @@ object SnapshotLeaderLoop {
                            case Some(stored) =>
                              chainStore.finalize(hash, stored.ordinal) >>
                                // Advance finalized-ordinal tracker (see DEPTH-FINALIZED branch above)
-                               nakamotoFinalizedOrdinalRef.update(prev => math.max(prev, stored.ordinal))
+                               nakamotoFinalizedOrdinalRef.update(prev => math.max(prev, stored.ordinal)) >>
+                               // Prune tentative snapshots below finalized ordinal — they're stale
+                               snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(stored.ordinal)))
                            case None => Async[F].unit
                          } >>
                          chainStore.get(hash).flatMap {
@@ -560,7 +562,10 @@ object SnapshotLeaderLoop {
               _ <- Async[F].whenA(stored) {
                 lastGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
                   lastNGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
-                  lastKnownSlotRef.set(Some(currentSlot))
+                  lastKnownSlotRef.set(Some(currentSlot)) >>
+                  // Successful production proves the parent's context was valid.
+                  // Confirm the parent (which may be tentative from a reorg) to disk.
+                  snapshotStorage.confirmHead(parentHashValue)
               }
 
               // Clear included events from mempool (returned events were NOT included).

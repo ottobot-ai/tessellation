@@ -29,6 +29,9 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object SnapshotStorage {
 
+  /** Tentative snapshot entry — held in memory until confirmed or pruned. */
+  private case class TentativeEntry[S, C](snapshot: Signed[S], state: C)
+
   private def makeResources[F[_]: Async, S <: Snapshot, C <: SnapshotInfo[_]]() = {
     def mkHeadRef = SignallingRef.of[F, Option[(Signed[S], Hasher[F], C)]](none)
     def mkOrdinalCache = MapRef.ofSingleImmutableMap[F, SnapshotOrdinal, Hash](Map.empty)
@@ -36,11 +39,12 @@ object SnapshotStorage {
     def mkNotPersistedCache = Ref.of(Set.empty[SnapshotOrdinal])
     def mkOffloadQueue = Queue.unbounded[F, SnapshotOrdinal]
     def mkCutoffQueue = Queue.unbounded[F, SnapshotOrdinal]
+    def mkTentativeRef = Ref.of[F, Map[SnapshotOrdinal, Map[Hash, TentativeEntry[S, C]]]](Map.empty)
 
     def mkLogger = Slf4jLogger.create[F]
 
-    (mkHeadRef, mkOrdinalCache, mkHashCache, mkNotPersistedCache, mkOffloadQueue, mkCutoffQueue, mkLogger).mapN {
-      (_, _, _, _, _, _, _)
+    (mkHeadRef, mkOrdinalCache, mkHashCache, mkNotPersistedCache, mkOffloadQueue, mkCutoffQueue, mkTentativeRef, mkLogger).mapN {
+      (_, _, _, _, _, _, _, _)
     }
   }
 
@@ -53,7 +57,7 @@ object SnapshotStorage {
     combinedSnapshotCheckpointFileSystemStorage: CombinedSnapshotCheckpointFileSystemStorage[F, S, C]
   )(implicit supervisor: Supervisor[F]): F[SnapshotStorage[F, S, C] with LatestBalances[F]] =
     makeResources[F, S, C]().flatMap {
-      case (headRef, ordinalCache, hashCache, notPersistedCache, offloadQueue, cutoffQueue, _) =>
+      case (headRef, ordinalCache, hashCache, notPersistedCache, offloadQueue, cutoffQueue, tentativeRef, _) =>
         make(
           headRef,
           ordinalCache,
@@ -61,6 +65,7 @@ object SnapshotStorage {
           notPersistedCache,
           offloadQueue,
           cutoffQueue,
+          tentativeRef,
           snapshotLocalFileSystemStorage,
           snapshotInfoLocalFileSystemStorage,
           inMemoryCapacity,
@@ -77,6 +82,7 @@ object SnapshotStorage {
     notPersistedCache: Ref[F, Set[SnapshotOrdinal]],
     offloadQueue: Queue[F, SnapshotOrdinal],
     snapshotInfoCutoffQueue: Queue[F, SnapshotOrdinal],
+    tentativeRef: Ref[F, Map[SnapshotOrdinal, Map[Hash, TentativeEntry[S, C]]]],
     snapshotLocalFileSystemStorage: SnapshotLocalFileSystemStorage[F, S],
     snapshotInfoLocalFileSystemStorage: SnapshotInfoLocalFileSystemStorage[F, _, C],
     inMemoryCapacity: NonNegLong,
@@ -241,8 +247,55 @@ object SnapshotStorage {
 
         def setHeadForRecovery(snapshot: Signed[S], state: C)(implicit hasher: Hasher[F]): F[Unit] =
           logger.info(s"[SnapshotStorage] Recovery: setting head to ordinal=${snapshot.ordinal.show}") >>
+            // Delete existing file at this ordinal to avoid collision (Nakamoto reorgs
+            // can produce different snapshots at the same ordinal)
+            snapshotLocalFileSystemStorage.delete(snapshot.ordinal).attempt.void >>
             enqueue(snapshot, state) >>
             headRef.set((snapshot, hasher, state).some).void
+
+        def setTentativeHead(snapshot: Signed[S], state: C)(implicit hasher: Hasher[F]): F[Unit] =
+          for {
+            hash <- snapshot.toHashed.map(_.hash)
+            _ <- logger.info(
+              s"[SnapshotStorage] Tentative head: ordinal=${snapshot.ordinal.show} hash=${hash.show.take(16)}"
+            )
+            _ <- tentativeRef.update { m =>
+              val atOrdinal = m.getOrElse(snapshot.ordinal, Map.empty)
+              m.updated(snapshot.ordinal, atOrdinal.updated(hash, TentativeEntry(snapshot, state)))
+            }
+            _ <- headRef.set((snapshot, hasher, state).some)
+            // Update caches so get(ordinal) and get(hash) work for tentative snapshots
+            _ <- ordinalCache(snapshot.ordinal).set(hash.some)
+            _ <- hashCache(hash).set(snapshot.some)
+          } yield ()
+
+        def confirmHead(hash: Hash): F[Unit] =
+          tentativeRef.get.flatMap { tentatives =>
+            tentatives.collectFirst {
+              case (ordinal, entries) if entries.contains(hash) => (ordinal, entries(hash))
+            } match {
+              case Some((ordinal, entry)) =>
+                hasherSelector.withCurrent { implicit hasher =>
+                  logger.info(s"[SnapshotStorage] Confirming tentative: ordinal=${ordinal.show} hash=${hash.show.take(16)}") >>
+                    snapshotLocalFileSystemStorage.delete(ordinal).attempt.void >>
+                    enqueue(entry.snapshot, entry.state)
+                } >> tentativeRef.update(_.updated(ordinal, Map.empty).filter(_._2.nonEmpty))
+              case None =>
+                logger
+                  .debug(s"[SnapshotStorage] confirmHead: hash=${hash.show.take(16)} not in tentative store (already confirmed or pruned)")
+            }
+          }
+
+        def pruneTentative(finalizedOrdinal: SnapshotOrdinal): F[Unit] =
+          tentativeRef.modify { m =>
+            val (stale, remaining) = m.partition(_._1 <= finalizedOrdinal)
+            val staleCount = stale.values.map(_.size).sum
+            (remaining, staleCount)
+          }.flatMap { staleCount =>
+            logger
+              .info(s"[SnapshotStorage] Pruned $staleCount tentative entries at ordinals <= ${finalizedOrdinal.show}")
+              .whenA(staleCount > 0)
+          }
 
         def getLatestBalances: F[Option[Map[Address, Balance]]] =
           headRef.get.map(_.map(_._3.balances))

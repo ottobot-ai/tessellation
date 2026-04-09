@@ -635,7 +635,7 @@ object NakamotoSyncDaemon {
                   productionGate.pause(ProductionGate.ReorgInProgress) >>
                   HasherSelector[F].withCurrent { implicit hasher =>
                     signedSnapshot.toHashed[F].flatMap { hashed =>
-                      snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
+                      snapshotStorage.setTentativeHead(signedSnapshot, context) >>
                         lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
                         lastNGlobalSnapshotStorage.setForRecovery(hashed, context)
                     }
