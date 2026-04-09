@@ -93,6 +93,67 @@ object NakamotoSyncDaemon {
           logger.info(s"🧹 Mempool reconciliation: all $poolSize events valid for new context, keeping all")
     } yield ()
 
+  /** After storing a snapshot, check if any buffered gossip snapshots were waiting for it as their parent. If so, process them via
+    * handleSnapshot (which will now find the parent in the chain store and validate successfully). This creates a validation cascade from
+    * the shared genesis ancestor through the gossip chain.
+    */
+  private def drainPendingChildren[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
+    storedHash: Hash,
+    stateRef: Ref[F, SyncState],
+    pendingParentRef: Ref[F, Map[Hash, List[pb.Snapshot]]],
+    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
+    nodeStorage: NodeStorage[F],
+    tipTracker: TipTracker[F],
+    stakeRegistry: StakeRegistry[F],
+    sidecarClient: SidecarClient.SidecarClientAlgebra[F],
+    selfId: peer.PeerId,
+    lddConfig: LddConfig,
+    lastKnownSlotRef: Ref[F, Option[Long]],
+    epochStateRef: Ref[F, SharedEpochState],
+    etaRotationSlots: Long,
+    consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
+    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
+    productionGate: ProductionGate[F],
+    mptStore: MptStore[F, GlobalStateKey],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
+    logger: org.typelevel.log4cats.Logger[F]
+  )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] =
+    pendingParentRef.modify { m =>
+      val children = m.getOrElse(storedHash, List.empty)
+      (m - storedHash, children)
+    }.flatMap { children =>
+      if (children.isEmpty) Async[F].unit
+      else
+        logger.info(s"🔗 Draining ${children.size} buffered snapshot(s) whose parent ${storedHash.value.take(12)} is now available") >>
+          children.traverse_ { childSnap =>
+            handleSnapshot(
+              childSnap,
+              stateRef,
+              pendingParentRef,
+              chainStore,
+              nodeStorage,
+              tipTracker,
+              stakeRegistry,
+              sidecarClient,
+              selfId,
+              lddConfig,
+              lastKnownSlotRef,
+              epochStateRef,
+              etaRotationSlots,
+              consensusFns,
+              snapshotStorage,
+              lastGlobalSnapshotStorage,
+              lastNGlobalSnapshotStorage,
+              productionGate,
+              mptStore,
+              eventMempool,
+              logger
+            )
+          }
+    }
+
   final case class SyncState(
     networkTipOrdinal: Long,
     networkTipHash: Option[Hash],
@@ -128,55 +189,62 @@ object NakamotoSyncDaemon {
   )(implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
-    fs2.Stream.eval(Ref.of[F, SyncState](SyncState.initial)).flatMap { stateRef =>
-      // Shared semaphore serializes snapshot processing with production (SnapshotLeaderLoop)
-      GossipStream.subscribe[F](channel).evalMap { msg =>
-        msg.body match {
-          case pb.GossipMessage.Body.Snapshot(snap) =>
-            // Pre-semaphore: if incoming snapshot would beat our current tip,
-            // pause production immediately so SnapshotLeaderLoop doesn't build
-            // on a tip we're about to abandon.
-            val incomingOrdinal = snap.ordinal
-            chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
-              val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
-              (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
-               else Async[F].unit) >>
-                snapshotSemaphore.permit.use { _ =>
-                  handleSnapshot(
-                    snap,
-                    stateRef,
-                    chainStore,
-                    nodeStorage,
-                    tipTracker,
-                    stakeRegistry,
-                    sidecarClient,
-                    selfId,
-                    lddConfig,
-                    lastKnownSlotRef,
-                    epochStateRef,
-                    etaRotationSlots,
-                    consensusFns,
-                    snapshotStorage,
-                    lastGlobalSnapshotStorage,
-                    lastNGlobalSnapshotStorage,
-                    productionGate,
-                    mptStore,
-                    eventMempool,
-                    logger
-                  )
-                } >> // snapshotSemaphore.permit.use
-                productionGate.resume(ProductionGate.BetterGossipReceived)
-            } // chainStore.bestTipOrdinal.flatMap
+    // Buffer for gossip snapshots whose parent isn't in the chain store yet.
+    // Keyed by missing parent hash → list of raw gossip snapshots waiting for that parent.
+    // When a snapshot is stored in the chain store, we check this buffer and validate any
+    // snapshots that were waiting for it. This creates a validation cascade from genesis.
+    fs2.Stream.eval(Ref.of[F, Map[Hash, List[pb.Snapshot]]](Map.empty)).flatMap { pendingParentRef =>
+      fs2.Stream.eval(Ref.of[F, SyncState](SyncState.initial)).flatMap { stateRef =>
+        // Shared semaphore serializes snapshot processing with production (SnapshotLeaderLoop)
+        GossipStream.subscribe[F](channel).evalMap { msg =>
+          msg.body match {
+            case pb.GossipMessage.Body.Snapshot(snap) =>
+              // Pre-semaphore: if incoming snapshot would beat our current tip,
+              // pause production immediately so SnapshotLeaderLoop doesn't build
+              // on a tip we're about to abandon.
+              val incomingOrdinal = snap.ordinal
+              chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
+                val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
+                (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
+                 else Async[F].unit) >>
+                  snapshotSemaphore.permit.use { _ =>
+                    handleSnapshot(
+                      snap,
+                      stateRef,
+                      pendingParentRef,
+                      chainStore,
+                      nodeStorage,
+                      tipTracker,
+                      stakeRegistry,
+                      sidecarClient,
+                      selfId,
+                      lddConfig,
+                      lastKnownSlotRef,
+                      epochStateRef,
+                      etaRotationSlots,
+                      consensusFns,
+                      snapshotStorage,
+                      lastGlobalSnapshotStorage,
+                      lastNGlobalSnapshotStorage,
+                      productionGate,
+                      mptStore,
+                      eventMempool,
+                      logger
+                    )
+                  } >> // snapshotSemaphore.permit.use
+                  productionGate.resume(ProductionGate.BetterGossipReceived)
+              } // chainStore.bestTipOrdinal.flatMap
 
-          case pb.GossipMessage.Body.Attestation(att) =>
-            handleAttestation(att, tipTracker, logger)
+            case pb.GossipMessage.Body.Attestation(att) =>
+              handleAttestation(att, tipTracker, logger)
 
-          case _: pb.GossipMessage.Body.Rumor =>
-            // Rumors are handled by SidecarRumorBridge.receive — ignore here.
-            Async[F].unit
+            case _: pb.GossipMessage.Body.Rumor =>
+              // Rumors are handled by SidecarRumorBridge.receive — ignore here.
+              Async[F].unit
 
-          case pb.GossipMessage.Body.Empty =>
-            Async[F].unit
+            case pb.GossipMessage.Body.Empty =>
+              Async[F].unit
+          }
         }
       }
     }
@@ -185,6 +253,7 @@ object NakamotoSyncDaemon {
   private def handleSnapshot[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
     snap: pb.Snapshot,
     stateRef: Ref[F, SyncState],
+    pendingParentRef: Ref[F, Map[Hash, List[pb.Snapshot]]],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     nodeStorage: NodeStorage[F],
     tipTracker: TipTracker[F],
@@ -292,28 +361,20 @@ object NakamotoSyncDaemon {
                 getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
               )
             case None =>
-              // Parent not in chain store — try snapshotStorage.head as fallback
-              snapshotStorage.head.flatMap {
-                case Some((lastSigned, lastCtx)) =>
-                  NakamotoSnapshotValidator.validate[F](
-                    signedSnapshot = signedSnapshot,
-                    context = context,
-                    slot = snap.slot,
-                    vrfProof = snap.vrfProof.toByteArray,
-                    vrfPublicKey = snap.vrfPublicKey.toByteArray,
-                    producerIdBytes = snap.producerId.toByteArray,
-                    eta = eta,
-                    slotGap = slotGap,
-                    stakeRegistry = stakeRegistry,
-                    lddConfig = lddConfig,
-                    consensusFns = consensusFns,
-                    lastSignedArtifact = lastSigned,
-                    lastContext = lastCtx,
-                    getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
-                  )
-                case None =>
-                  Async[F].pure(NakamotoSnapshotValidator.Invalid("No parent found"): NakamotoSnapshotValidator.ValidationResult)
-              }
+              // Parent not in chain store — buffer this snapshot for later validation.
+              // When the parent arrives (via gossip), we'll validate this snapshot against it.
+              // DON'T fall back to the local head — that produces a guaranteed content mismatch.
+              logger.info(
+                s"⏳ Parent ${parentHash.value.take(12)} not in chain store for ordinal=${snap.ordinal} slot=${snap.slot}. " +
+                  s"Buffering for validation when parent arrives."
+              ) >>
+                pendingParentRef.update { m =>
+                  val existing = m.getOrElse(parentHash, List.empty)
+                  m.updated(parentHash, existing :+ snap)
+                } >>
+                Async[F].pure(
+                  NakamotoSnapshotValidator.Invalid("Parent not in chain store (buffered)"): NakamotoSnapshotValidator.ValidationResult
+                )
           }
         case None =>
           // No payload — fall back to VRF-only validation (legacy/PoC)
@@ -357,7 +418,33 @@ object NakamotoSyncDaemon {
             lastNGlobalSnapshotStorage,
             productionGate,
             logger
-          )
+          ) >> {
+            // This snapshot is now stored — drain any children that were waiting for it.
+            val storedHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
+            drainPendingChildren(
+              storedHash,
+              stateRef,
+              pendingParentRef,
+              chainStore,
+              nodeStorage,
+              tipTracker,
+              stakeRegistry,
+              sidecarClient,
+              selfId,
+              lddConfig,
+              lastKnownSlotRef,
+              epochStateRef,
+              etaRotationSlots,
+              consensusFns,
+              snapshotStorage,
+              lastGlobalSnapshotStorage,
+              lastNGlobalSnapshotStorage,
+              productionGate,
+              mptStore,
+              eventMempool,
+              logger
+            )
+          }
         case NakamotoSnapshotValidator.Invalid(reason) if reason == "No parent found" =>
           // Parent not found — network is ahead of us (restart scenario).
           catchUpFromGossip(
@@ -445,6 +532,9 @@ object NakamotoSyncDaemon {
                 logger
               )
           }
+        case NakamotoSnapshotValidator.Invalid(reason) if reason.contains("buffered") =>
+          // Already buffered for validation when parent arrives — nothing more to do
+          Async[F].unit
         case NakamotoSnapshotValidator.Invalid(reason) =>
           Metrics[F].incrementCounter("dag_nakamoto_snapshots_rejected") >>
             logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $reason")
