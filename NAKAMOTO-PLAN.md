@@ -52,8 +52,12 @@ Three checkpoints in `SnapshotLeaderLoop`: (1) slot-tick gate (already existed),
 2. Inclusion-proof feature work begins → wire `unapplyTo` for correctness on the read side, plus add an `applyTo(ordinal)` API to walk forward from a checkpoint
 3. Content-addressed MPT migration → the whole problem dissolves; journal becomes unnecessary
 
-### 5. Parametrize finality (no mode switch)  *(✅ done)*
-Three env-var knobs with sensible defaults — `NAKAMOTO_ATTESTATION_THRESHOLD` (default 2/3, in `TipTracker.FinalityThreshold`), `NAKAMOTO_CONFIRMATION_DEPTH` (default 6, in `SnapshotLeaderLoop.ConfirmationDepthK`), `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` (default 0.5, in `StakeRegistry.MinActiveQuorumFraction`). Both gates always run; whichever fires first finalizes. No mode switch.
+### 5. Parametrize finality (no mode switch)  *(✅ done — updated 2026-04-08 with k=31 + bug fixes)*
+Three env-var knobs with sensible defaults — `NAKAMOTO_ATTESTATION_THRESHOLD` (default 2/3, in `TipTracker.FinalityThreshold`), `NAKAMOTO_CONFIRMATION_DEPTH` (default **31**, in `SnapshotLeaderLoop.ConfirmationDepthK`), `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` (default 0.5, in `StakeRegistry.MinActiveQuorumFraction`). Both gates always run; whichever fires first finalizes. No mode switch.
+
+**k measures snapshots, not slots.** With LDD targeting ~15% slot fill, slots run ~6× sparser than snapshots, but the depth gate is purely an ordinal-distance check: `tip.ordinal - snapshotOrdinal > k`. k=31 was chosen via simulation: k=6 has too high a fork rate against a 1/3 adversary in small clusters; k=31 gives a comfortable Bitcoin-equivalent safety margin.
+
+**Two slot/ordinal-units bugs were fixed in this round** (2026-04-08), discovered while validating the wire-up: `lastFinalizedOrdinal` was being read off `tipTracker.lastFinalized`'s **slot** value, and `finalizeAtSlot` was being computed as `tip.slot - k` (mixing slot- and ordinal-units). The first bug had silently disabled the depth gate end-to-end since it landed — in our 720s e2e test we observed 224 ATTEST-FINALIZED entries and **zero** DEPTH-FINALIZED entries. Both gates now read their inputs from the chain store, which is the authoritative ordinal source.
 
 ### 6. Close SC binary finality loop (CL0-side)  *(✅ done)*
 **Bug:** original `pruneConfirmed` dropped a binary on first sight in any GL0 snapshot — if that snapshot was later orphaned in a Nakamoto reorg, the binary was permanently lost.

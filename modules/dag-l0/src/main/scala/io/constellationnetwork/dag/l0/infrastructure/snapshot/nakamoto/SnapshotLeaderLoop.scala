@@ -282,18 +282,30 @@ object SnapshotLeaderLoop {
           } yield ()
         }
 
-      // Dual finality: attestation weight (fast) OR confirmation depth k (slow fallback)
-      // finalized = attestation_weight > 2/3  OR  depth > k
-      // This ensures finality works with any cluster size:
+      // Dual finality: attestation weight (fast) OR confirmation depth k (safety fallback)
+      //
+      //   - Fast path: tip attestation weight ≥ TipTracker.FinalityThreshold (default 2/3,
+      //     with optimistic dynamic-quorum sizing for partial cluster availability).
+      //   - Fallback: a snapshot is depth-finalized once at least k snapshots sit above it
+      //     on the canonical chain — i.e. `tip.ordinal - snapshotOrdinal > k`. This is the
+      //     Bitcoin-style confirmation rule, and k is measured in **snapshots (ordinals)**,
+      //     not slots. With LDD targeting ~15% slot fill, slots run ~6× sparser than
+      //     snapshots, but the depth gate is purely an ordinal-distance check.
+      //
+      // Both gates always run; whichever fires first finalizes. The depth gate is the
+      // safety net against a 1/3 adversary in small clusters where the attestation gate
+      // may stall or be gameable: simulation shows k=6 has too high a fork rate at
+      // adversarial 1/3, while k=31 gives a comfortable Bitcoin-equivalent safety margin.
+      //
+      // Cluster sizing notes:
       //   - 1 node: depth-only (no attestations possible)
       //   - 2 nodes: depth-only (can't reach 2/3+1)
-      //   - 3+ nodes: attestation finality kicks in (fast)
-      // Nakamoto-style confirmation depth: snapshots with k+ children on the canonical chain
-      // are depth-finalized. Override via `NAKAMOTO_CONFIRMATION_DEPTH`. Lower for fast-finality
-      // small clusters; raise for stricter safety on larger clusters. Both depth and attestation
-      // gates always run; whichever fires first finalizes.
+      //   - 3+ nodes: attestation finality kicks in fast, depth is the safety net
+      //
+      // Override via NAKAMOTO_CONFIRMATION_DEPTH. Default 31 chosen for adversarial-safety
+      // margin in small (3-7 node) test clusters per simulation results.
       val ConfirmationDepthK: Long =
-        sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH").flatMap(_.toLongOption).getOrElse(6L)
+        sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH").flatMap(_.toLongOption).getOrElse(31L)
 
       val finalityMonitor: Stream[F, Unit] = Stream
         .awakeEvery[F](5.seconds)
@@ -305,35 +317,52 @@ object SnapshotLeaderLoop {
             activeCount <- stakeRegistry.observedActiveCount
             bestTip <- chainStore.bestTip
             alreadyFinalized <- tipTracker.lastFinalized
-            lastFinalizedOrdinal = alreadyFinalized.map { case (_, s) => s.value.value }.getOrElse(0L)
+            // The last-finalized **ordinal** must come from chainStore — tipTracker.lastFinalized
+            // only carries (Hash, Slot), and slots are LDD-paced not 1:1 with ordinals. The
+            // previous code derived this from the slot value which silently disabled the depth
+            // gate (as soon as any attestation finality fired, the slot value far outran any
+            // tip.ordinal under LDD slot fill, making `tip.ordinal - lastFinalizedSlot > k`
+            // perpetually false).
+            lastFinalizedOrdinal <- chainStore.lastFinalizedOrdinal
 
-            // Check depth-based finality: any snapshot with k+ blocks on top is final
+            // Depth-based finality: a snapshot is final once k+ snapshots sit above it on
+            // the canonical chain — `tip.ordinal - snapshotOrdinal > k`.
             depthFinalized <- bestTip match {
               case Some(tip) if tip.ordinal - lastFinalizedOrdinal > ConfirmationDepthK =>
-                // Finalize up to (tip.ordinal - k)
+                // Finalize the snapshot at (tip.ordinal - k)
                 val finalizeAtOrdinal = tip.ordinal - ConfirmationDepthK
-                // Walk canonical chain from best tip to find the real hash at finalizeAtOrdinal
+                // Walk the canonical chain from best tip to the hash at finalizeAtOrdinal,
+                // then look up its actual slot from the chain store. The slot is needed by
+                // tipTracker.markFinalized / pruneBelow which key attestations by slot. Do
+                // NOT compute it as `tip.slot - k` — that mixes slot-units with ordinal-units
+                // (the old bug) and produces a slot far above the canonical snapshot's real
+                // slot, over-pruning attestations.
                 chainStore.walkBackTo(tip.hash, finalizeAtOrdinal).flatMap {
                   case Some(canonicalHash) =>
-                    val finalizeAtSlot = Slot(
-                      eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(
-                        math.max(0L, tip.slot - ConfirmationDepthK)
-                      )
-                    )
-                    tipTracker.markFinalized(canonicalHash, finalizeAtSlot) >>
-                      tipTracker.pruneBelow(finalizeAtSlot) >>
-                      chainStore.finalize(canonicalHash, finalizeAtOrdinal) >>
-                      // Advance the finalized-ordinal tracker so HttpApi /latest/finalized-ordinal
-                      // reflects the new high-water mark. CL0 polls this to gate state-channel
-                      // -binary pruning on actual finality (not just first sight).
-                      nakamotoFinalizedOrdinalRef.update(prev => math.max(prev, finalizeAtOrdinal)) >>
-                      logger
-                        .info(
-                          s"DEPTH-FINALIZED at ordinal=$finalizeAtOrdinal (tip=${tip.ordinal}, k=$ConfirmationDepthK)"
-                        ) >>
-                      Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
-                      Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalizeAtOrdinal) >>
-                      Async[F].pure(true)
+                    chainStore.get(canonicalHash).flatMap {
+                      case Some(canonicalSnapshot) =>
+                        val finalizeAtSlot = Slot(NonNegLong.unsafeFrom(canonicalSnapshot.slot))
+                        tipTracker.markFinalized(canonicalHash, finalizeAtSlot) >>
+                          tipTracker.pruneBelow(finalizeAtSlot) >>
+                          chainStore.finalize(canonicalHash, finalizeAtOrdinal) >>
+                          // Advance the finalized-ordinal tracker so HttpApi
+                          // /latest/finalized-ordinal reflects the new high-water mark. CL0
+                          // polls this to gate state-channel-binary pruning on actual finality
+                          // (not just first sight).
+                          nakamotoFinalizedOrdinalRef.update(prev => math.max(prev, finalizeAtOrdinal)) >>
+                          logger
+                            .info(
+                              s"DEPTH-FINALIZED ordinal=$finalizeAtOrdinal slot=${canonicalSnapshot.slot} (tip ord=${tip.ordinal} slot=${tip.slot}, k=$ConfirmationDepthK)"
+                            ) >>
+                          Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
+                          Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalizeAtOrdinal) >>
+                          Async[F].pure(true)
+                      case None =>
+                        logger.warn(
+                          s"⚠️ DEPTH-FINALIZE: walked back to ordinal=$finalizeAtOrdinal but chainStore.get returned None for hash=${canonicalHash.value
+                              .take(12)}"
+                        ) >> Async[F].pure(false)
+                    }
                   case None =>
                     logger.warn(
                       s"⚠️ DEPTH-FINALIZE: could not find canonical hash at ordinal=$finalizeAtOrdinal from tip=${tip.hash.value.take(12)}"
