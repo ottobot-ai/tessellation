@@ -200,10 +200,12 @@ object SnapshotLeaderLoop {
                 Async[F].whenA(currentSlot % 10 == 0)(logger.info(s"⏳ Waiting for genesis (${-currentSlot}s remaining)"))
               } else
                 for {
-                  // Slot gap from last stored chain tip (global, agreed upon)
-                  // Updated after successful chainStore.store, so all validators converge
+                  // Slot gap from last stored chain tip. Used for LDD eligibility:
+                  // higher gap = more likely to be eligible (compensates for missed slots).
+                  // Clamped to minimum 1 to prevent negative eligibility thresholds that
+                  // can occur when catch-up sets lastKnownSlotRef to a future network slot.
                   lastFinalizedSlot <- lastKnownSlotRef.get
-                  slotGap = lastFinalizedSlot.fold(currentSlot)(currentSlot - _)
+                  slotGap = Math.max(1L, lastFinalizedSlot.fold(currentSlot)(currentSlot - _))
 
                   slotRefined = Slot(NonNegLong.unsafeFrom(Math.max(0L, currentSlot)))
 

@@ -5,7 +5,7 @@ import cats.effect.std.Semaphore
 import cats.syntax.all._
 
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
-import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.{DAGEvent, GlobalSnapshotEvent}
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto._
@@ -22,6 +22,7 @@ import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.nakamoto.{LddConfig, TipAttestation => DomainTipAttestation}
 import io.constellationnetwork.schema.node.NodeState
+import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
@@ -40,7 +41,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   */
 object NakamotoSyncDaemon {
 
-  private val CatchUpThreshold = 2L
+  private val CatchUpThreshold = 6L
   private val CatchUpCooldownMs = 10000L // Don't retry catch-up more often than every 10s
   private val vrf = new EcVrf25519()
 
@@ -49,6 +50,48 @@ object NakamotoSyncDaemon {
     */
   private def vrfOutputFromProof(proofBytes: Array[Byte]): Array[Byte] =
     vrf.vrfProofToHash(proofBytes).getOrElse(proofBytes) // fallback to raw proof if derivation fails
+
+  /** Ethereum-style mempool reconciliation after catch-up/reorg.
+    *
+    * Evicts DAG blocks whose transactions reference a lastTxRef that no longer matches the new context. Keeps events whose transactions are
+    * still unconfirmed in the new state — they should be included in the next snapshot.
+    *
+    * Non-DAG events (state channel, allow spend, etc.) are preserved since they have separate validation semantics handled by the
+    * acceptance manager.
+    */
+  private def reconcileMempool[F[_]: Async](
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
+    context: GlobalSnapshotInfo,
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] =
+    for {
+      hashes <- eventMempool.getEventHashes
+      events <- eventMempool.getMultiple(hashes)
+      staleHashes = events.collect {
+        case (hash, hashed) =>
+          hashed.signed.value match {
+            case DAGEvent(signedBlock) =>
+              val isStale = signedBlock.value.transactions.exists { signedTx =>
+                val tx = signedTx.value
+                val contextRef = context.lastTxRefs.getOrElse(tx.source, TransactionReference.empty)
+                // Block is stale if the context's lastTxRef for this source
+                // differs from the transaction's parent ref — meaning the context
+                // has already processed a different transaction chain for this address.
+                contextRef =!= TransactionReference.empty && contextRef =!= tx.parent
+              }
+              if (isStale) Some(hash) else None
+            case _ => None // keep non-DAG events
+          }
+      }.flatten.toSet
+      poolSize <- eventMempool.size
+      _ <-
+        if (staleHashes.nonEmpty)
+          logger.info(
+            s"🧹 Mempool reconciliation: evicting ${staleHashes.size} stale DAG blocks, keeping ${poolSize - staleHashes.size} events"
+          ) >> eventMempool.remove(staleHashes)
+        else
+          logger.info(s"🧹 Mempool reconciliation: all $poolSize events valid for new context, keeping all")
+    } yield ()
 
   final case class SyncState(
     networkTipOrdinal: Long,
@@ -609,13 +652,8 @@ object NakamotoSyncDaemon {
                       )
                       .flatMap(kvPairs => mptStore.syncFull(kvPairs, SnapshotOrdinal.unsafeApply(snap.ordinal)))
                   } >>
-                  // Clear event mempool after reorg — stale events from the abandoned
-                  // fork would be re-accepted against the new context's lastTxRefs,
-                  // causing double-application. Events will re-arrive via L1 gossip.
-                  eventMempool.size.flatMap { poolSize =>
-                    logger.info(s"🧹 Reorg: clearing $poolSize events from mempool") >>
-                      eventMempool.clear
-                  } >>
+                  // Reconcile event mempool — evict stale DAG blocks, keep unconfirmed.
+                  reconcileMempool(eventMempool, context, logger) >>
                   chainStore.bestTipSlot.flatMap {
                     case Some(bestSlot) => lastKnownSlotRef.set(Some(bestSlot))
                     case None           => Async[F].unit
@@ -756,14 +794,14 @@ object NakamotoSyncDaemon {
                 context.allStateEntries[F]
               }
               _ <- mptStore.syncFull(kvPairs, SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)))
-              _ <- lastKnownSlotRef.set(Some(snap.slot))
+              // Don't overwrite lastKnownSlotRef with the gossip slot — it may be
+              // ahead of our wall clock, making slotGap negative and blocking VRF
+              // eligibility. Production will update it after its next successful store.
 
-              // Clear event mempool — stale events from the old chain state would
-              // be re-accepted against the new context's lastTxRefs, causing
-              // double-application. Events will re-arrive via L1 gossip.
-              poolSize <- eventMempool.size
-              _ <- logger.info(s"🧹 Catch-up: clearing $poolSize events from mempool")
-              _ <- eventMempool.clear
+              // Reconcile event mempool — evict DAG blocks whose transactions are
+              // already consumed in the new context's lastTxRefs (prevents double-spend).
+              // Keep events whose transactions are still unconfirmed (prevents starvation).
+              _ <- reconcileMempool(eventMempool, context, logger)
 
               _ <- stateRef.update(
                 _.copy(
