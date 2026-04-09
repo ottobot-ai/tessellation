@@ -305,6 +305,7 @@ object NakamotoSyncDaemon {
             lastKnownSlotRef,
             epochStateRef,
             etaRotationSlots,
+            snapshotStorage,
             lastGlobalSnapshotStorage,
             lastNGlobalSnapshotStorage,
             productionGate,
@@ -350,9 +351,33 @@ object NakamotoSyncDaemon {
                     logger
                   )
               } else {
-                // Small gap — normal fork, not a restart. Let reorg handle it.
-                Metrics[F].incrementCounter("dag_nakamoto_snapshots_rejected") >>
-                  logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $reason (gap=$gap, within threshold)")
+                // Normal Nakamoto fork — store the snapshot as an alternative branch in
+                // chainStore WITHOUT updating canonical state (snapshotStorage,
+                // lastGlobalSnapshotStorage, MPT). Content hasn't been validated against
+                // this fork's parent state yet — validation is deferred to reorg time.
+                //
+                // VRF + signature + slot-cert are already validated (proof of eligibility).
+                // Content validation (state proof match) requires the fork's parent context
+                // which we don't have locally. If ChainSelection later picks this fork as
+                // denser (reorg), we validate by triggering catch-up which resets state to
+                // the fork's context + MPT self-healing.
+                logger.info(
+                  s"🔀 Fork at ordinal=${snap.ordinal} slot=${snap.slot} (gap=$gap). Storing as tentative branch (deferred validation)."
+                ) >>
+                  Metrics[F].incrementCounter("dag_nakamoto_forks_stored") >>
+                  storeForkBranch(
+                    snap,
+                    stateRef,
+                    chainStore,
+                    tipTracker,
+                    snapshotStorage,
+                    lastGlobalSnapshotStorage,
+                    lastNGlobalSnapshotStorage,
+                    lastKnownSlotRef,
+                    mptStore,
+                    productionGate,
+                    logger
+                  )
               }
             case None =>
               catchUpFromGossip(
@@ -387,11 +412,14 @@ object NakamotoSyncDaemon {
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSlots: Long,
+    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     productionGate: ProductionGate[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
+    // processValidSnapshot is called for CANONICAL chain extensions (Valid case).
+    // Content was already validated against local state — safe to update all storages.
     for {
       // Update network tip tracking
       _ <- stateRef.update { s =>
@@ -434,7 +462,12 @@ object NakamotoSyncDaemon {
                     productionGate.pause(ProductionGate.ReorgInProgress) >>
                       HasherSelector[F].withCurrent { implicit hasher =>
                         signedSnapshot.toHashed[F].flatMap { hashed =>
-                          lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
+                          // Update ALL snapshot storages so HTTP routes can serve this
+                          // snapshot. snapshotStorage is what SnapshotRoutes reads from;
+                          // without this, finality-gated routes return NotFound for
+                          // snapshots produced by other nodes.
+                          snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
+                            lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
                             lastNGlobalSnapshotStorage.setForRecovery(hashed, context) >>
                             logger.debug(s"Updated canonical storage to ordinal=${snap.ordinal} slot=${snap.slot}") >>
                             Metrics[F].incrementCounter("dag_nakamoto_snapshots_received") >>
@@ -482,6 +515,115 @@ object NakamotoSyncDaemon {
       _ <- emitAttestation(snap, sidecarClient, tipTracker, selfId, logger)
 
     } yield ()
+
+  /** Store a fork-branch snapshot WITHOUT updating canonical state.
+    *
+    * The snapshot has valid VRF + signature + slot-cert but its content doesn't match our local state (it was built on a different fork).
+    * We store it tentatively in the chain store. If ChainSelection picks this fork as denser (reorg), we trigger catch-up to adopt the new
+    * state — this resets our canonical view to the fork's context and performs MPT self-healing, which is the deferred validation step.
+    *
+    * Stale fork branches are pruned when finality advances past them (chainStore.finalize).
+    */
+  private def storeForkBranch[F[
+    _
+  ]: Async: cats.Parallel: HasherSelector: io.constellationnetwork.json.JsonSerializer: Metrics: SecurityProvider](
+    snap: pb.Snapshot,
+    stateRef: Ref[F, SyncState],
+    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
+    tipTracker: TipTracker[F],
+    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
+    lastKnownSlotRef: Ref[F, Option[Long]],
+    mptStore: MptStore[F, GlobalStateKey],
+    productionGate: ProductionGate[F],
+    logger: org.typelevel.log4cats.Logger[F]
+  )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] =
+    if (snap.payload.size() == 0) Async[F].unit
+    else {
+      val payloadStr = snap.payload.toByteArray.map(_.toChar).mkString
+      val result = for {
+        json <- io.circe.parser.parse(payloadStr)
+        snapshotJson <- json.hcursor.get[io.circe.Json]("snapshot")
+        contextJson <- json.hcursor.get[io.circe.Json]("context")
+        snapshot <- snapshotJson.as[Signed[GlobalIncrementalSnapshot]]
+        context <- contextJson.as[GlobalSnapshotInfo]
+      } yield (snapshot, context)
+
+      result match {
+        case Right((signedSnapshot, context)) =>
+          val parentHash = Hash(new String(snap.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
+          for {
+            // Record the previous best tip so we can detect reorgs
+            prevBestTip <- chainStore.bestTip.map(_.map(_.hash))
+
+            // Store in chainStore — ChainSelection may switch bestTip if this fork is denser
+            isNew <- chainStore.store(
+              signedSnapshot,
+              context,
+              snap.ordinal,
+              snap.slot,
+              parentHash,
+              vrfOutputFromProof(snap.vrfProof.toByteArray)
+            )
+
+            // Check if a reorg happened (bestTip changed to a different chain)
+            newBestTip <- chainStore.bestTip.map(_.map(_.hash))
+            reorgHappened = isNew && prevBestTip =!= newBestTip
+
+            _ <-
+              if (reorgHappened) {
+                // ChainSelection picked this fork as denser — adopt its state via catch-up.
+                // This is the deferred validation: catch-up resets canonical state to the fork's
+                // context and performs MPT self-healing. Subsequent snapshots that build on the
+                // new canonical tip will go through the normal Valid path (full content validation).
+                logger.info(
+                  s"🔄 Reorg to fork at ordinal=${snap.ordinal} slot=${snap.slot} (denser chain). Validating via catch-up."
+                ) >>
+                  productionGate.pause(ProductionGate.ReorgInProgress) >>
+                  HasherSelector[F].withCurrent { implicit hasher =>
+                    signedSnapshot.toHashed[F].flatMap { hashed =>
+                      snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
+                        lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
+                        lastNGlobalSnapshotStorage.setForRecovery(hashed, context)
+                    }
+                  } >>
+                  // MPT self-healing: rebuild from the fork's state
+                  HasherSelector[F].withCurrent { implicit hasher =>
+                    context
+                      .allStateEntries[F](
+                        Async[F],
+                        cats.Parallel[F],
+                        hasher,
+                        implicitly[io.constellationnetwork.json.JsonSerializer[F]],
+                        implicitly[GlobalStateProofSelector]
+                      )
+                      .flatMap(kvPairs => mptStore.syncFull(kvPairs, SnapshotOrdinal.unsafeApply(snap.ordinal)))
+                  } >>
+                  chainStore.bestTipSlot.flatMap {
+                    case Some(bestSlot) => lastKnownSlotRef.set(Some(bestSlot))
+                    case None           => Async[F].unit
+                  } >>
+                  productionGate.resume(ProductionGate.ReorgInProgress) >>
+                  Metrics[F].incrementCounter("dag_nakamoto_reorgs")
+              } else if (isNew) {
+                // Fork stored but not canonical — just log
+                Metrics[F].incrementCounter("dag_nakamoto_forks_stored")
+              } else Async[F].unit
+
+            // Record attestation regardless (producer attests their own tip)
+            tipHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
+            tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
+            producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
+            producerId = peer.PeerId(producerHex)
+            att = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, tipSlot)
+            _ <- tipTracker.recordAttestation(producerId, att)
+          } yield ()
+
+        case Left(err) =>
+          logger.warn(s"⚠️ Failed to deserialize fork-branch payload: ${err.getMessage}")
+      }
+    }
 
   private def handleAttestation[F[_]: Async](
     att: pb.TipAttestation,
