@@ -13,6 +13,7 @@ import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.{GossipStream, SidecarClient}
+import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics._
 import io.constellationnetwork.schema._
@@ -79,7 +80,8 @@ object NakamotoSyncDaemon {
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     snapshotSemaphore: Semaphore[F],
     productionGate: ProductionGate[F],
-    mptStore: MptStore[F, GlobalStateKey]
+    mptStore: MptStore[F, GlobalStateKey],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey]
   )(implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
@@ -116,6 +118,7 @@ object NakamotoSyncDaemon {
                     lastNGlobalSnapshotStorage,
                     productionGate,
                     mptStore,
+                    eventMempool,
                     logger
                   )
                 } >> // snapshotSemaphore.permit.use
@@ -155,6 +158,7 @@ object NakamotoSyncDaemon {
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     productionGate: ProductionGate[F],
     mptStore: MptStore[F, GlobalStateKey],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     logger: org.typelevel.log4cats.Logger[F]
   )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] =
     for {
@@ -323,6 +327,7 @@ object NakamotoSyncDaemon {
             lastNGlobalSnapshotStorage,
             lastKnownSlotRef,
             mptStore,
+            eventMempool,
             productionGate,
             logger
           )
@@ -347,6 +352,7 @@ object NakamotoSyncDaemon {
                     lastNGlobalSnapshotStorage,
                     lastKnownSlotRef,
                     mptStore,
+                    eventMempool,
                     productionGate,
                     logger
                   )
@@ -375,6 +381,7 @@ object NakamotoSyncDaemon {
                     lastNGlobalSnapshotStorage,
                     lastKnownSlotRef,
                     mptStore,
+                    eventMempool,
                     productionGate,
                     logger
                   )
@@ -390,6 +397,7 @@ object NakamotoSyncDaemon {
                 lastNGlobalSnapshotStorage,
                 lastKnownSlotRef,
                 mptStore,
+                eventMempool,
                 productionGate,
                 logger
               )
@@ -536,6 +544,7 @@ object NakamotoSyncDaemon {
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     lastKnownSlotRef: Ref[F, Option[Long]],
     mptStore: MptStore[F, GlobalStateKey],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     productionGate: ProductionGate[F],
     logger: org.typelevel.log4cats.Logger[F]
   )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] =
@@ -599,6 +608,13 @@ object NakamotoSyncDaemon {
                         implicitly[GlobalStateProofSelector]
                       )
                       .flatMap(kvPairs => mptStore.syncFull(kvPairs, SnapshotOrdinal.unsafeApply(snap.ordinal)))
+                  } >>
+                  // Clear event mempool after reorg — stale events from the abandoned
+                  // fork would be re-accepted against the new context's lastTxRefs,
+                  // causing double-application. Events will re-arrive via L1 gossip.
+                  eventMempool.size.flatMap { poolSize =>
+                    logger.info(s"🧹 Reorg: clearing $poolSize events from mempool") >>
+                      eventMempool.clear
                   } >>
                   chainStore.bestTipSlot.flatMap {
                     case Some(bestSlot) => lastKnownSlotRef.set(Some(bestSlot))
@@ -691,6 +707,7 @@ object NakamotoSyncDaemon {
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     lastKnownSlotRef: Ref[F, Option[Long]],
     mptStore: MptStore[F, GlobalStateKey],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     productionGate: ProductionGate[F],
     logger: org.typelevel.log4cats.Logger[F]
   )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] = {
@@ -740,6 +757,13 @@ object NakamotoSyncDaemon {
               }
               _ <- mptStore.syncFull(kvPairs, SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)))
               _ <- lastKnownSlotRef.set(Some(snap.slot))
+
+              // Clear event mempool — stale events from the old chain state would
+              // be re-accepted against the new context's lastTxRefs, causing
+              // double-application. Events will re-arrive via L1 gossip.
+              poolSize <- eventMempool.size
+              _ <- logger.info(s"🧹 Catch-up: clearing $poolSize events from mempool")
+              _ <- eventMempool.clear
 
               _ <- stateRef.update(
                 _.copy(

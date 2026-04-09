@@ -478,7 +478,8 @@ object GlobalSnapshotConsensus {
                 lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
                 snapshotSemaphore = snapshotSemaphore,
                 productionGate = productionGate,
-                mptStore = mptStore
+                mptStore = mptStore,
+                eventMempool = eventMempool
               )
               .compile
               .drain
