@@ -1,6 +1,5 @@
 package io.constellationnetwork.dag.l0.cli
 
-import cats.data.NonEmptySet
 import cats.syntax.all._
 
 import io.constellationnetwork.dag.l0.config.types._
@@ -14,7 +13,6 @@ import io.constellationnetwork.node.shared.config.MainnetRewardsConfig
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.node.shared.infrastructure.statechannel.StateChannelAllowanceLists
 import io.constellationnetwork.schema.balance.Amount
-import io.constellationnetwork.schema.cluster.PeerToJoin
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.security.hash.Hash
 
@@ -26,199 +24,20 @@ import fs2.io.file.Path
 
 object method {
 
-  sealed trait Run extends CliMethod {
-
-    def appConfig(c: AppConfigReader, shared: SharedConfig): AppConfig = AppConfig(
-      trust = c.trust,
-      rewards = MainnetRewardsConfig.classicMainnetRewardsConfig,
-      snapshot = c.snapshot,
-      stateChannel = c.stateChannel,
-      peerDiscovery = c.peerDiscovery,
-      incremental = c.incremental,
-      shared = shared
-    )
-
-    val environment: AppEnvironment
-
-    val stateChannelAllowanceLists = StateChannelAllowanceLists.get(environment)
-
-    val l0SeedlistPath = seedlistPath
-
-    val prioritySeedlistPath: Option[SeedListPath]
-
-  }
-
-  case class RunGenesis(
-    keyStore: StorePath,
-    alias: KeyAlias,
-    password: Password,
-    dbConfig: DBConfig,
-    httpConfig: HttpConfig,
-    environment: AppEnvironment,
-    genesisPath: Path,
-    seedlistPath: Option[SeedListPath],
-    collateralAmount: Option[Amount],
-    startingEpochProgress: EpochProgress,
-    trustRatingsPath: Option[Path],
-    prioritySeedlistPath: Option[SeedListPath],
-    allowanceListPath: Option[AllowanceListPath]
-  ) extends Run {}
-
-  object RunGenesis extends WithOpts[RunGenesis] {
-
-    val startingEpochProgressOpts: Opts[EpochProgress] = Opts
-      .option[NonNegLong]("startingEpochProgress", "Set starting progress for rewarding at the specific epoch")
-      .map(EpochProgress(_))
-      .withDefault(EpochProgress.MinValue)
-
-    val opts: Opts[RunGenesis] = Opts.subcommand("run-genesis", "Run genesis mode") {
-      (
-        StorePath.opts,
-        KeyAlias.opts,
-        Password.opts,
-        db.opts,
-        http.opts,
-        AppEnvironment.opts,
-        genesisPathOpts,
-        SeedListPath.opts,
-        CollateralAmountOpts.opts,
-        startingEpochProgressOpts,
-        trustRatingsPathOpts,
-        SeedListPath.priorityOpts,
-        AllowanceListPath.opts
-      ).mapN(RunGenesis.apply)
-    }
-  }
-
-  case class RunRollback(
-    keyStore: StorePath,
-    alias: KeyAlias,
-    password: Password,
-    dbConfig: DBConfig,
-    httpConfig: HttpConfig,
-    environment: AppEnvironment,
-    seedlistPath: Option[SeedListPath],
-    collateralAmount: Option[Amount],
-    rollbackHash: Hash,
-    trustRatingsPath: Option[Path],
-    prioritySeedlistPath: Option[SeedListPath],
-    allowanceListPath: Option[AllowanceListPath]
-  ) extends Run
-
-  object RunRollback extends WithOpts[RunRollback] {
-
-    val rollbackHashOpts: Opts[Hash] = Opts.argument[Hash]("rollbackHash")
-
-    val opts: Opts[RunRollback] = Opts.subcommand("run-rollback", "Run rollback mode") {
-      (
-        StorePath.opts,
-        KeyAlias.opts,
-        Password.opts,
-        db.opts,
-        http.opts,
-        AppEnvironment.opts,
-        SeedListPath.opts,
-        CollateralAmountOpts.opts,
-        rollbackHashOpts,
-        trustRatingsPathOpts,
-        SeedListPath.priorityOpts,
-        AllowanceListPath.opts
-      ).mapN(RunRollback.apply)
-    }
-  }
-
-  case class RunValidatorWithJoinAttempt(
-    keyStore: StorePath,
-    alias: KeyAlias,
-    password: Password,
-    dbConfig: DBConfig,
-    httpConfig: HttpConfig,
-    environment: AppEnvironment,
-    seedlistPath: Option[SeedListPath],
-    collateralAmount: Option[Amount],
-    trustRatingsPath: Option[Path],
-    prioritySeedlistPath: Option[SeedListPath],
-    peerToJoinPool: NonEmptySet[PeerToJoin],
-    allowanceListPath: Option[AllowanceListPath]
-  ) extends Run
-
-  case class RunValidator(
-    keyStore: StorePath,
-    alias: KeyAlias,
-    password: Password,
-    dbConfig: DBConfig,
-    httpConfig: HttpConfig,
-    environment: AppEnvironment,
-    seedlistPath: Option[SeedListPath],
-    collateralAmount: Option[Amount],
-    trustRatingsPath: Option[Path],
-    prioritySeedlistPath: Option[SeedListPath],
-    allowanceListPath: Option[AllowanceListPath]
-  ) extends Run
-
-  object RunValidator extends WithOpts[RunValidator] {
-
-    val opts: Opts[RunValidator] = Opts.subcommand("run-validator", "Run validator mode") {
-      (
-        StorePath.opts,
-        KeyAlias.opts,
-        Password.opts,
-        db.opts,
-        http.opts,
-        AppEnvironment.opts,
-        SeedListPath.opts,
-        CollateralAmountOpts.opts,
-        trustRatingsPathOpts,
-        SeedListPath.priorityOpts,
-        AllowanceListPath.opts
-      ).mapN(RunValidator.apply)
-    }
-  }
-
-  /** Nakamoto consensus mode: all nodes load genesis identically and start VRF production. No leader/follower distinction. Uses a shared
-    * genesis key so all nodes produce the same signed genesis artifact.
+  /** Unified Nakamoto GL0 command.
+    *
+    * Bootstrap mode is auto-detected at startup from the flags provided:
+    *
+    *   1. `--rollback-hash HASH` → load a specific snapshot (from disk or peer), use as head. Operator escape hatch for anchored recovery.
+    *      2. Local snapshot data on disk → cold restart from the latest ordinal. Automatic — no flag needed. 3. `--nakamoto-peer URL` →
+    *      HTTP-download latest snapshot from a running peer. Used by validators joining mid-chain. 4. `--genesis-csv PATH` → fresh start
+    *      from a genesis CSV. All genesis-time nodes use this with the same file + shared genesis time so they derive the same initial
+    *      state. 5. None of the above → startup error.
+    *
+    * Nakamoto tunables (LDD params, finality knobs, sidecar config, genesis time) are configured via `NAKAMOTO_*` env vars. See
+    * `GlobalSnapshotConsensus.scala` for defaults.
     */
   case class RunNakamoto(
-    keyStore: StorePath,
-    alias: KeyAlias,
-    password: Password,
-    dbConfig: DBConfig,
-    httpConfig: HttpConfig,
-    environment: AppEnvironment,
-    genesisPath: Path,
-    seedlistPath: Option[SeedListPath],
-    collateralAmount: Option[Amount],
-    startingEpochProgress: EpochProgress,
-    trustRatingsPath: Option[Path],
-    prioritySeedlistPath: Option[SeedListPath],
-    allowanceListPath: Option[AllowanceListPath]
-  ) extends Run {}
-
-  object RunNakamoto extends WithOpts[RunNakamoto] {
-
-    val opts: Opts[RunNakamoto] = Opts.subcommand("run-nakamoto", "Run Nakamoto consensus mode (shared genesis, VRF production)") {
-      (
-        StorePath.opts,
-        KeyAlias.opts,
-        Password.opts,
-        db.opts,
-        http.opts,
-        AppEnvironment.opts,
-        genesisPathOpts,
-        SeedListPath.opts,
-        CollateralAmountOpts.opts,
-        RunGenesis.startingEpochProgressOpts,
-        trustRatingsPathOpts,
-        SeedListPath.priorityOpts,
-        AllowanceListPath.opts
-      ).mapN(RunNakamoto.apply)
-    }
-  }
-
-  /** Nakamoto validator mode: join an existing Nakamoto chain by downloading the latest snapshot from a peer. After catching up, starts VRF
-    * production.
-    */
-  case class RunNakamotoValidator(
     keyStore: StorePath,
     alias: KeyAlias,
     password: Password,
@@ -230,36 +49,65 @@ object method {
     trustRatingsPath: Option[Path],
     prioritySeedlistPath: Option[SeedListPath],
     allowanceListPath: Option[AllowanceListPath],
-    peerToJoin: String // HTTP URL of peer to download from, e.g. "http://node-0:9000"
-  ) extends Run {}
+    // Bootstrap source flags (all optional — auto-detect picks the right path)
+    genesisPath: Option[Path],
+    rollbackHash: Option[Hash],
+    peerToJoin: Option[String],
+    startingEpochProgress: EpochProgress
+  ) extends CliMethod {
 
-  object RunNakamotoValidator extends WithOpts[RunNakamotoValidator] {
-    private val peerOpts: Opts[String] =
-      Opts.option[String]("nakamoto-peer", "HTTP URL of a Nakamoto peer to download chain from")
+    def appConfig(c: AppConfigReader, shared: SharedConfig): AppConfig = AppConfig(
+      trust = c.trust,
+      rewards = MainnetRewardsConfig.classicMainnetRewardsConfig,
+      snapshot = c.snapshot,
+      stateChannel = c.stateChannel,
+      peerDiscovery = c.peerDiscovery,
+      incremental = c.incremental,
+      shared = shared
+    )
 
-    val opts: Opts[RunNakamotoValidator] =
-      Opts.subcommand("run-nakamoto-validator", "Join an existing Nakamoto chain by downloading from a peer") {
-        (
-          StorePath.opts,
-          KeyAlias.opts,
-          Password.opts,
-          db.opts,
-          http.opts,
-          AppEnvironment.opts,
-          SeedListPath.opts,
-          CollateralAmountOpts.opts,
-          trustRatingsPathOpts,
-          SeedListPath.priorityOpts,
-          AllowanceListPath.opts,
-          peerOpts
-        ).mapN(RunNakamotoValidator.apply)
-      }
+    val stateChannelAllowanceLists = StateChannelAllowanceLists.get(environment)
+
+    val l0SeedlistPath = seedlistPath
+
   }
 
-  val opts: Opts[Run] =
-    RunGenesis.opts
-      .orElse(RunValidator.opts)
-      .orElse(RunRollback.opts)
-      .orElse(RunNakamoto.opts)
-      .orElse(RunNakamotoValidator.opts)
+  object RunNakamoto extends WithOpts[RunNakamoto] {
+
+    private val startingEpochProgressOpts: Opts[EpochProgress] = Opts
+      .option[NonNegLong]("startingEpochProgress", "Set starting progress for rewarding at the specific epoch")
+      .map(EpochProgress(_))
+      .withDefault(EpochProgress.MinValue)
+
+    private val genesisPathOpt: Opts[Option[Path]] =
+      genesisPathOpts.map(_.some).withDefault(none)
+
+    private val rollbackHashOpt: Opts[Option[Hash]] =
+      Opts.option[Hash]("rollback-hash", "Anchor recovery: load this specific snapshot hash from disk or peer").orNone
+
+    private val peerToJoinOpt: Opts[Option[String]] =
+      Opts.option[String]("nakamoto-peer", "HTTP URL of a Nakamoto peer to download chain from (e.g. http://node-0:9000)").orNone
+
+    val opts: Opts[RunNakamoto] = Opts.subcommand("run-nakamoto", "Run Nakamoto GL0 consensus (VRF production, attestation finality)") {
+      (
+        StorePath.opts,
+        KeyAlias.opts,
+        Password.opts,
+        db.opts,
+        http.opts,
+        AppEnvironment.opts,
+        SeedListPath.opts,
+        CollateralAmountOpts.opts,
+        trustRatingsPathOpts,
+        SeedListPath.priorityOpts,
+        AllowanceListPath.opts,
+        genesisPathOpt,
+        rollbackHashOpt,
+        peerToJoinOpt,
+        startingEpochProgressOpts
+      ).mapN(RunNakamoto.apply)
+    }
+  }
+
+  val opts: Opts[RunNakamoto] = RunNakamoto.opts
 }

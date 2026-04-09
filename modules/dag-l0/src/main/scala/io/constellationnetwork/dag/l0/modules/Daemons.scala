@@ -16,64 +16,14 @@ import io.constellationnetwork.node.shared.domain.Daemon
 import io.constellationnetwork.node.shared.infrastructure.cluster.daemon.NodeStateDaemon
 import io.constellationnetwork.node.shared.infrastructure.collateral.daemon.CollateralDaemon
 import io.constellationnetwork.node.shared.infrastructure.gossip.event.EventGossipDaemon
-import io.constellationnetwork.node.shared.infrastructure.snapshot.daemon.{DownloadDaemon, SelectablePeerDiscoveryDelay}
 import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.{HasherSelector, SecurityProvider}
 
 object Daemons {
 
-  /** Start BFT-mode daemons: full gossip, download daemon, consensus trigger. */
-  def start[F[_]: Async: Supervisor: HasherSelector: SecurityProvider, R <: CliMethod](
-    storages: Storages[F],
-    services: Services[F, R],
-    programs: Programs[F],
-    queues: Queues[F],
-    nodeId: PeerId,
-    keyPair: KeyPair,
-    cfg: AppConfig,
-    hasherSelector: HasherSelector[F],
-    eventGossipDaemon: EventGossipDaemon[F, GlobalSnapshotEvent, GlobalStateKey]
-  ): F[Unit] = {
-    val pddCfg = cfg.peerDiscovery.delay
-    val peerDiscoveryDelay = SelectablePeerDiscoveryDelay.make(
-      clusterStorage = storages.cluster,
-      appEnvironment = cfg.environment,
-      checkPeersAttemptDelay = pddCfg.checkPeersAttemptDelay,
-      checkPeersMaxDelay = pddCfg.checkPeersMaxDelay,
-      additionalDiscoveryDelay = pddCfg.additionalDiscoveryDelay,
-      minPeers = pddCfg.minPeers
-    )
-
-    List[Daemon[F]](
-      NodeStateDaemon.make(storages.node, services.gossip),
-      DownloadDaemon.make(storages.node, programs.download, peerDiscoveryDelay, hasherSelector),
-      Daemon.periodic(storages.trust.updateTrustWithBiases(nodeId), cfg.trust.daemon.interval),
-      GlobalSnapshotEventsPublisherDaemon
-        .make(
-          queues.stateChannelOutput,
-          queues.l1Output,
-          queues.l1AllowSpendOutput,
-          queues.l1TokenLockOutput,
-          queues.updateNodeParametersOutput,
-          queues.delegatedStakeOutput,
-          queues.nodeCollateralOutput,
-          keyPair,
-          services.eventMempool,
-          eventGossipDaemon,
-          services.consensus.triggerEventConsensus,
-          services.consensus.storage.getLastConsensusOutcome.map(_.fold(0)(_.facilitators.value.size)),
-          cfg.snapshot.consensus
-        ),
-      CollateralDaemon.make(services.collateral, storages.globalSnapshot, storages.cluster),
-      TrustStorageUpdater.daemon(services.trustStorageUpdater),
-      Daemon.spawn(eventGossipDaemon.start)
-    ).traverse(_.start).void
-  }
-
-  /** Start Nakamoto-mode daemons.
+  /** Start GL0 Nakamoto daemons.
     *
-    * Differences from BFT mode:
     *   - No DownloadDaemon (Nakamoto nodes sync via GossipSub sidecar, not tessellation peer download)
     *   - No EventGossipDaemon.start (P2P event gossip replaced by libp2p GossipSub)
     *   - EventsPublisher still runs (events accumulate in mempool for snapshot inclusion) but uses a no-op gossip daemon so publish calls

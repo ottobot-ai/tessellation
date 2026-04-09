@@ -2,12 +2,20 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+
+	"crypto/ed25519"
+
+	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/scasplte2/tessellation/p2p/internal/config"
 	"github.com/scasplte2/tessellation/p2p/internal/gossip"
@@ -33,7 +41,93 @@ func main() {
 	flag.StringVar(&cfg.PrivateKeyPath, "key", "", "path to Ed25519 private key file")
 	flag.StringVar(&cfg.MetricsAddr, "metrics", "", "Prometheus metrics address (empty = disabled)")
 	flag.BoolVar(&cfg.DisableMdns, "disable-mdns", false, "disable mDNS peer discovery (force DHT-only — for multi-host validation)")
+
+	var generateKey bool
+	var showPeerID bool
+	var deriveFromECDSA string
+	flag.BoolVar(&generateKey, "generate-key", false, "generate a new Ed25519 key, save to -key path, print peer ID, and exit")
+	flag.BoolVar(&showPeerID, "show-peer-id", false, "load Ed25519 key from -key path, print its libp2p peer ID, and exit")
+	flag.StringVar(&deriveFromECDSA, "derive-from-ecdsa", "", "derive Ed25519 key from ECDSA hex file, save to -key path, print peer ID, and exit")
 	flag.Parse()
+
+	// Key management modes: generate, derive, or inspect identity keys for compose-runner
+	if deriveFromECDSA != "" {
+		if cfg.PrivateKeyPath == "" {
+			fmt.Fprintln(os.Stderr, "ERROR: -derive-from-ecdsa requires -key <path>")
+			os.Exit(1)
+		}
+		ecdsaHex, err := os.ReadFile(deriveFromECDSA)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: read ECDSA hex file %s: %v\n", deriveFromECDSA, err)
+			os.Exit(1)
+		}
+		ecdsaBytes, err := hex.DecodeString(strings.TrimSpace(string(ecdsaHex)))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: decode ECDSA hex: %v\n", err)
+			os.Exit(1)
+		}
+		// Derive Ed25519 seed: SHA-256(domain || ecdsaPrivKey)
+		h := sha256.New()
+		h.Write([]byte("tessellation-nakamoto-sidecar-identity:"))
+		h.Write(ecdsaBytes)
+		seed := h.Sum(nil) // 32 bytes
+		ed25519Key := ed25519.NewKeyFromSeed(seed)
+		// libp2p expects the full 64-byte Ed25519 private key (seed + public key)
+		if err := os.WriteFile(cfg.PrivateKeyPath, ed25519Key, 0600); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: write key to %s: %v\n", cfg.PrivateKeyPath, err)
+			os.Exit(1)
+		}
+		priv, err := libp2pcrypto.UnmarshalEd25519PrivateKey(ed25519Key)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: marshal libp2p key: %v\n", err)
+			os.Exit(1)
+		}
+		id, _ := peer.IDFromPrivateKey(priv)
+		fmt.Print(id.String())
+		os.Exit(0)
+	}
+	if generateKey {
+		if cfg.PrivateKeyPath == "" {
+			fmt.Fprintln(os.Stderr, "ERROR: -generate-key requires -key <path>")
+			os.Exit(1)
+		}
+		priv, _, err := libp2pcrypto.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: generate key: %v\n", err)
+			os.Exit(1)
+		}
+		raw, err := priv.Raw()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: marshal key: %v\n", err)
+			os.Exit(1)
+		}
+		if err := os.WriteFile(cfg.PrivateKeyPath, raw, 0600); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: write key to %s: %v\n", cfg.PrivateKeyPath, err)
+			os.Exit(1)
+		}
+		id, _ := peer.IDFromPrivateKey(priv)
+		fmt.Print(id.String())
+		os.Exit(0)
+	}
+	if showPeerID {
+		if cfg.PrivateKeyPath == "" {
+			fmt.Fprintln(os.Stderr, "ERROR: -show-peer-id requires -key <path>")
+			os.Exit(1)
+		}
+		keyBytes, err := os.ReadFile(cfg.PrivateKeyPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: read key: %v\n", err)
+			os.Exit(1)
+		}
+		priv, err := libp2pcrypto.UnmarshalEd25519PrivateKey(keyBytes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: parse key: %v\n", err)
+			os.Exit(1)
+		}
+		id, _ := peer.IDFromPrivateKey(priv)
+		fmt.Print(id.String())
+		os.Exit(0)
+	}
 
 	if listenAddrs != "" {
 		cfg.ListenAddrs = strings.Split(listenAddrs, ",")

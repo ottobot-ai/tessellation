@@ -3,12 +3,14 @@ package gossip
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	libp2pnet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -50,24 +52,41 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		listenAddrs = append(listenAddrs, ma)
 	}
 
-	// Create libp2p host with a Kademlia DHT routing layer. The DHT runs in
-	// server mode so other peers can use this node as a bootstrap target. The
-	// seedlist is used as the initial bootstrap peer set; once connected, peers
-	// are discovered through the DHT routing table.
-	var kadDHT *dht.IpfsDHT
-	h, err := libp2p.New(
+	// Build libp2p host options. When a pre-generated Ed25519 key is provided
+	// via -key, the host identity is deterministic — compose-runner uses this to
+	// pre-compute the peer ID and include it in the seedlist multiaddrs so that
+	// DHT-only discovery (no mDNS) works: /dns4/sidecar-N/tcp/9500/p2p/<id>.
+	hostOpts := []libp2p.Option{
 		libp2p.ListenAddrs(listenAddrs...),
 		libp2p.ForceReachabilityPrivate(),
 		libp2p.DefaultSecurity,
-		libp2p.Routing(func(host host.Host) (libp2prouting.PeerRouting, error) {
-			d, derr := dht.New(ctx, host, dht.Mode(dht.ModeServer))
-			if derr != nil {
-				return nil, derr
-			}
-			kadDHT = d
-			return d, nil
-		}),
-	)
+	}
+	if cfg.PrivateKeyPath != "" {
+		keyBytes, err := os.ReadFile(cfg.PrivateKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("read identity key %q: %w", cfg.PrivateKeyPath, err)
+		}
+		privKey, err := crypto.UnmarshalEd25519PrivateKey(keyBytes)
+		if err != nil {
+			return nil, fmt.Errorf("parse Ed25519 key from %q: %w", cfg.PrivateKeyPath, err)
+		}
+		hostOpts = append(hostOpts, libp2p.Identity(privKey))
+	}
+
+	// Kademlia DHT in server mode so other peers can use this node as a
+	// bootstrap target. The seedlist is the initial entry point; once connected,
+	// peer discovery is fully decentralized via the DHT routing table.
+	var kadDHT *dht.IpfsDHT
+	hostOpts = append(hostOpts, libp2p.Routing(func(host host.Host) (libp2prouting.PeerRouting, error) {
+		d, derr := dht.New(ctx, host, dht.Mode(dht.ModeServer))
+		if derr != nil {
+			return nil, derr
+		}
+		kadDHT = d
+		return d, nil
+	}))
+
+	h, err := libp2p.New(hostOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create libp2p host: %w", err)
 	}

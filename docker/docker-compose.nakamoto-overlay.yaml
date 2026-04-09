@@ -1,17 +1,13 @@
 # Nakamoto mode overlay for the standard gl0 service.
 #
-# Activated via --nakamoto-gl0 in compose-runner.sh. Adds the Nakamoto env
-# vars to the existing gl0 service definition (from docker-compose.yaml) and
-# wires it to depend on the local sidecar (from docker-compose.nakamoto-sidecar.yaml).
-#
-# The gl0 binary supports both BFT and Nakamoto modes from the same JAR; the
-# behavior is selected entirely by these env vars at startup.
+# Activated via --nakamoto-gl0 in compose-runner.sh. The gl0 binary is now
+# Nakamoto-only — the run-nakamoto CLI command is selected by entrypoint.sh
+# when NAKAMOTO_MODE=true. Tunables below configure LDD, sidecar, and genesis.
 services:
   gl0:
     environment:
-      # Top-level Nakamoto switches
-      - NAKAMOTO_ENABLED=true
-      - NAKAMOTO_PURE=true
+      # Signals entrypoint.sh to use `run-nakamoto` instead of BFT commands
+      - NAKAMOTO_MODE=true
       # Coordinated genesis time — set per cluster by compose-runner.sh and
       # written into each per-node .env file. Every node MUST agree on this.
       - NAKAMOTO_GENESIS_TIME_MS=${NAKAMOTO_GENESIS_TIME_MS}

@@ -19,11 +19,11 @@ services:
       - "/ip4/0.0.0.0/tcp/9500"
       - "-seedlist"
       - "${NAKAMOTO_SIDECAR_SEEDLIST}"
-      # mDNS would otherwise let containers find each other on the docker bridge
-      # for free, masking any DHT routing issues. Forcing DHT-only validates that
-      # the seedlist bootstrap + Kademlia routing actually works for multi-host
-      # deployment where mDNS cannot cross subnets.
+      - "-key"
+      - "/keys/sidecar.key"
       - "-disable-mdns"
+    volumes:
+      - ./sidecar.key:/keys/sidecar.key:ro
     networks:
       - tessellation_common
     healthcheck:

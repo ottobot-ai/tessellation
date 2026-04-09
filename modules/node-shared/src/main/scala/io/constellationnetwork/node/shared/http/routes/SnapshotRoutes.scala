@@ -68,26 +68,38 @@ final case class SnapshotRoutes[F[_]: Async, S <: Snapshot: Encoder, SI <: Snaps
       .map(validStateForSnapshotReturn)
       .ifM(action, serviceUnavailableNodeNotReady)
 
+  /** The effective latest ordinal for external consumers. When finality gating is active (Nakamoto GL0), this returns the finalized ordinal
+    * — strictly <= chain head. All non-GL0 consumers (metagraphs, DAG-L1, dashboards) see only finalized snapshots, preventing
+    * fork-confused reads during temporary Nakamoto chain splits. When not active (BFT mode, or non-GL0 layers), returns the head ordinal.
+    */
+  private def effectiveLatestOrdinal: F[Option[SnapshotOrdinal]] =
+    getFinalizedOrdinal match {
+      case Some(getFinalized) => getFinalized
+      case None               => snapshotStorage.headSnapshot.map(_.map(_.ordinal))
+    }
+
+  /** Check if an ordinal is within the finalized range. When finality gating is active, returns true only if ordinal <= finalized. When not
+    * active, always returns true.
+    */
+  private def isOrdinalServable(ordinal: SnapshotOrdinal): F[Boolean] =
+    getFinalizedOrdinal match {
+      case Some(getFinalized) =>
+        getFinalized.map(_.exists(fin => ordinal.value.value <= fin.value.value))
+      case None => Async[F].pure(true)
+    }
+
   protected val httpRoutes: HttpRoutes[F] =
     Timeout(snapshotTimeoutsConfig.routes)(
       HttpRoutes.of[F] {
         case GET -> Root / "latest" / "ordinal" =>
           whenNodeReady {
-            snapshotStorage.headSnapshot.map(_.map(_.ordinal)).flatMap {
+            effectiveLatestOrdinal.flatMap {
               case Some(ordinal) => Ok(("value" ->> ordinal.value.value) :: HNil)
               case None          => NotFound()
             }
           }
 
         case GET -> Root / "latest" / "finalized-ordinal" =>
-          // Returns the highest snapshot ordinal that has reached finality. In BFT mode this
-          // is just the head (every snapshot is immediately final). In Nakamoto mode the chain
-          // store tracks finality explicitly via attestation-2/3 OR depth-k, and the wired
-          // callback returns the actual lagging finalized ordinal — strictly <= head ordinal.
-          //
-          // CL0 polls this endpoint to gate state-channel-binary pruning: a binary stays
-          // re-sendable until its containing GL0 snapshot is finalized, so reorgs cannot
-          // silently drop it.
           whenNodeReady {
             val finalizedOrdinalF: F[Option[SnapshotOrdinal]] =
               getFinalizedOrdinal.getOrElse(snapshotStorage.headSnapshot.map(_.map(_.ordinal)))
@@ -99,26 +111,39 @@ final case class SnapshotRoutes[F[_]: Async, S <: Snapshot: Encoder, SI <: Snaps
 
         case GET -> Root / "latest" / "metadata" =>
           whenNodeReady {
-            snapshotStorage.headSnapshot
-              .flatMap(_.traverse(snapshot => hasherSelector.withCurrent(implicit hasher => snapshot.toHashed[F])))
-              .map(_.map(snapshot => SnapshotMetadata(snapshot.ordinal, snapshot.hash, snapshot.lastSnapshotHash)))
-              .flatMap {
-                case Some(metadata) => Ok(metadata)
-                case None           => NotFound()
-              }
+            effectiveLatestOrdinal.flatMap {
+              case Some(effOrdinal) =>
+                hasherSelector.withCurrent { implicit hasher =>
+                  snapshotStorage.getHashed(effOrdinal)
+                }.flatMap {
+                  case Some(snapshot) =>
+                    Ok(SnapshotMetadata(snapshot.ordinal, snapshot.hash, snapshot.lastSnapshotHash))
+                  case None => NotFound()
+                }
+              case None => NotFound()
+            }
           }
 
         case req @ GET -> Root / "latest" =>
           whenNodeReady {
-            resolveEncoder[F, Signed[S]](req) { implicit enc =>
-              snapshotStorage.headSnapshot.flatMap {
-                case Some(snapshot) => Ok(snapshot)
-                case _              => NotFound()
-              }
+            effectiveLatestOrdinal.flatMap {
+              case Some(effOrdinal) =>
+                resolveEncoder[F, Signed[S]](req) { implicit enc =>
+                  snapshotStorage.get(effOrdinal).flatMap {
+                    case Some(snapshot) => Ok(snapshot)
+                    case _              => NotFound()
+                  }
+                }
+              case None => NotFound()
             }
           }
 
         case GET -> Root / "latest" / "info" =>
+          // TODO: gate on finality once SnapshotStorage supports getInfo(ordinal).
+          // Currently only head has the info pair. For the metagraph pull use case
+          // (GlobalL0Service.pullGlobalSnapshots), /latest/info is not called — the
+          // context is derived locally from the snapshot content. This route is
+          // primarily for dashboards and external consumers.
           whenNodeReady {
             snapshotStorage.head.flatMap {
               case Some((_, info)) => Ok(info)
@@ -127,6 +152,7 @@ final case class SnapshotRoutes[F[_]: Async, S <: Snapshot: Encoder, SI <: Snaps
           }
 
         case GET -> Root / "latest" / "combined" =>
+          // TODO: gate on finality once SnapshotStorage supports getWithInfo(ordinal).
           whenNodeReady {
             snapshotStorage.head.flatMap {
               case Some((snapshot, state)) =>
@@ -141,6 +167,7 @@ final case class SnapshotRoutes[F[_]: Async, S <: Snapshot: Encoder, SI <: Snaps
           }
 
         case GET -> Root / "latest" / "combined" / "stream" =>
+          // TODO: gate on finality
           whenNodeReady {
             combinedSnapshotCheckpointFileSystemStorage.getLatestAsHttpResponse.flatMap {
               case Some(resp) => resp.pure[F]
@@ -155,46 +182,61 @@ final case class SnapshotRoutes[F[_]: Async, S <: Snapshot: Encoder, SI <: Snaps
 
         case GET -> Root / "latest" / "combined" / "checkpoint" / SnapshotOrdinalVar(ordinal) =>
           whenNodeReady {
-            combinedSnapshotCheckpointFileSystemStorage
-              .getAsStream(ordinal)
-              .flatMap {
-                case Some(byteStream) =>
-                  Ok(byteStream, org.http4s.headers.`Content-Type`(org.http4s.MediaType.application.json))
-                case None => NotFound()
-              }
+            isOrdinalServable(ordinal).flatMap {
+              case false => NotFound()
+              case true =>
+                combinedSnapshotCheckpointFileSystemStorage
+                  .getAsStream(ordinal)
+                  .flatMap {
+                    case Some(byteStream) =>
+                      Ok(byteStream, org.http4s.headers.`Content-Type`(org.http4s.MediaType.application.json))
+                    case None => NotFound()
+                  }
+            }
           }
 
         case req @ GET -> Root / SnapshotOrdinalVar(ordinal) :? FullSnapshotQueryParam(fullSnapshot) =>
           whenNodeReady {
-            if (!fullSnapshot)
-              resolveEncoder[F, Signed[S]](req) { implicit enc =>
-                snapshotStorage.get(ordinal).flatMap {
-                  case Some(snapshot) => Ok(snapshot)
-                  case _              => NotFound()
-                }
-              }
-            else
-              fullGlobalSnapshotStorage.map { storage =>
-                resolveEncoder[F, Signed[GlobalSnapshot]](req) { implicit enc =>
-                  storage.read(ordinal).flatMap {
-                    case Some(snapshot) => Ok(snapshot)
-                    case _              => NotFound()
+            isOrdinalServable(ordinal).flatMap {
+              case false => NotFound()
+              case true =>
+                if (!fullSnapshot)
+                  resolveEncoder[F, Signed[S]](req) { implicit enc =>
+                    snapshotStorage.get(ordinal).flatMap {
+                      case Some(snapshot) => Ok(snapshot)
+                      case _              => NotFound()
+                    }
                   }
-                }
-              }.getOrElse(NotFound())
+                else
+                  fullGlobalSnapshotStorage.map { storage =>
+                    resolveEncoder[F, Signed[GlobalSnapshot]](req) { implicit enc =>
+                      storage.read(ordinal).flatMap {
+                        case Some(snapshot) => Ok(snapshot)
+                        case _              => NotFound()
+                      }
+                    }
+                  }.getOrElse(NotFound())
+            }
           }
 
         case GET -> Root / SnapshotOrdinalVar(ordinal) / "hash" =>
           whenNodeReady {
-            hasherSelector.withCurrent { implicit hasher =>
-              snapshotStorage.getHash(ordinal)
-            }.flatMap {
-              case None           => NotFound()
-              case Some(snapshot) => Ok(snapshot)
+            isOrdinalServable(ordinal).flatMap {
+              case false => NotFound()
+              case true =>
+                hasherSelector.withCurrent { implicit hasher =>
+                  snapshotStorage.getHash(ordinal)
+                }.flatMap {
+                  case None           => NotFound()
+                  case Some(snapshot) => Ok(snapshot)
+                }
             }
           }
 
         case req @ GET -> Root / HashVar(hash) =>
+          // Hash-based lookup: can't easily gate on finality without resolving
+          // the hash to an ordinal first. For now, serve if found — the caller
+          // is typically requesting a specific known hash (e.g., rollback anchor).
           whenNodeReady {
             resolveEncoder[F, Signed[S]](req) { implicit enc =>
               snapshotStorage.get(hash).flatMap {

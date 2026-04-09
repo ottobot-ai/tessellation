@@ -191,27 +191,76 @@ else
     cd ../../
   done
 
-  # Nakamoto mode: write a shared genesis time + per-node sidecar peer list
-  # into each .env file. All gl0 nodes MUST agree on the same genesis time.
+  # Nakamoto mode: write shared genesis time, sidecar peer list, JVM seedlist,
+  # and genesis CSV into each gl0 node's .env + node dir. All gl0 nodes MUST
+  # agree on the same genesis time and seedlist for VRF consensus to work.
   if [ "$NAKAMOTO_GL0" = "true" ]; then
     # 90s in the future — gives all containers time to start before slot 0
     NAKAMOTO_GENESIS_MS=$(( ($(date +%s) + 90) * 1000 ))
     echo "Nakamoto genesis time: $(date -d @$((NAKAMOTO_GENESIS_MS / 1000)) '+%H:%M:%S') (90s from now)"
-    # Build the seedlist of all peer sidecars (libp2p multiaddrs)
+
+    # Derive Ed25519 sidecar identity keys from each node's ECDSA key so the
+    # sidecar's libp2p peer ID is deterministic from the node identity. This
+    # lets us include /p2p/<id> in the seedlist multiaddrs — required for
+    # DHT-only discovery (no mDNS) where peers must be dialed by identity.
+    echo "Deriving sidecar identity keys from node ECDSA keys..."
+    for j in $(seq 0 $((NUM_GL0_NODES - 1))); do
+      SIDECAR_PEER_ID=$(docker run --rm \
+        -v "$(pwd)/nodes/$j:/keys" \
+        -v "$(pwd)/docker/config/local-test-keys/$j:/ecdsa:ro" \
+        nakamoto-sidecar:test \
+        -derive-from-ecdsa /ecdsa/id_ecdsa.hex -key /keys/sidecar.key)
+      echo "$SIDECAR_PEER_ID" > "./nodes/$j/sidecar_peer_id"
+      echo "  sidecar-$j: $SIDECAR_PEER_ID"
+    done
+
+    # Build the sidecar seedlist with full /p2p/<peer-id> multiaddrs
     NAKAMOTO_SEEDLIST=""
     for j in $(seq 0 $((NUM_GL0_NODES - 1))); do
+      SIDECAR_PID=$(cat "./nodes/$j/sidecar_peer_id")
       [ -n "$NAKAMOTO_SEEDLIST" ] && NAKAMOTO_SEEDLIST="${NAKAMOTO_SEEDLIST},"
-      NAKAMOTO_SEEDLIST="${NAKAMOTO_SEEDLIST}/dns4/sidecar-${j}/tcp/9500"
+      NAKAMOTO_SEEDLIST="${NAKAMOTO_SEEDLIST}/dns4/sidecar-${j}/tcp/9500/p2p/${SIDECAR_PID}"
     done
     echo "Nakamoto sidecar seedlist: $NAKAMOTO_SEEDLIST"
+
+    # Build the JVM seedlist (5-field CSV: peerId,ip,p2pPort,alias,bias).
+    # Used by StakeRegistry for validator set, by Joining.scala for peer
+    # allowance, and by ClusterStorage population so /cluster/info returns
+    # the full validator set. Same file works for ALL layers since each node
+    # shares one key across gl0/gl1/ml0/cl1/dl1 in the test environment.
+    echo "Generating Nakamoto seedlist from gl0 peer IDs..."
+    NAKAMOTO_JVM_SEEDLIST=""
+    for j in $(seq 0 $((NUM_GL0_NODES - 1))); do
+      PEER_ID=$(cat ./nodes/$j/peer_id 2>/dev/null || echo "")
+      if [ -z "$PEER_ID" ]; then
+        echo "ERROR: missing peer_id for node $j (expected at ./nodes/$j/peer_id)"
+        exit 1
+      fi
+      # Compute per-node IP and P2P port from the test cluster layout
+      NODE_IP="${NET_PREFIX}.1${j}"
+      NODE_P2P_PORT="${DAG_L0_PORT_PREFIX}${j}1"
+      NAKAMOTO_JVM_SEEDLIST="${NAKAMOTO_JVM_SEEDLIST}${PEER_ID},${NODE_IP},${NODE_P2P_PORT},,\n"
+    done
+
     for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
+      # Write the JVM seedlist file into each node directory
+      printf "$NAKAMOTO_JVM_SEEDLIST" > ./nodes/$i/seedlist.csv
+      # Copy genesis.csv to each gl0 node (run-nakamoto needs it on every node,
+      # not just node 0 — all nodes derive the same genesis state independently)
+      cp ./nodes/0/genesis.csv ./nodes/$i/genesis.csv 2>/dev/null || true
+
       {
         echo ""
         echo "# Nakamoto GL0 mode (set by compose-runner.sh --nakamoto-gl0)"
         echo "NAKAMOTO_GENESIS_TIME_MS=$NAKAMOTO_GENESIS_MS"
         echo "NAKAMOTO_SIDECAR_SEEDLIST=$NAKAMOTO_SEEDLIST"
+        echo "CL_DOCKER_SEEDLIST=./seedlist.csv"
+        # Override join to false for ALL gl0 nodes — Nakamoto has no BFT cluster
+        # join protocol. Validators discover each other via seedlist + sidecar.
+        echo "CL_DOCKER_GL0_JOIN=false"
       } >> ./nodes/$i/.env
     done
+    echo "Nakamoto seedlist written to nodes/*/seedlist.csv ($(wc -l < ./nodes/0/seedlist.csv) peers)"
   fi
 
   # Start all GL0 nodes together

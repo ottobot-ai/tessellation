@@ -82,8 +82,8 @@ import org.http4s.client.Client
   */
 object GlobalSnapshotConsensus {
 
-  /** Check if Nakamoto mode is enabled via environment variable */
-  val nakamotoEnabled: Boolean = sys.env.contains("NAKAMOTO_ENABLED")
+  // GL0 is Nakamoto-only. No env var check needed — the run-nakamoto CLI command
+  // is the single source of truth. Tunables come from NAKAMOTO_* env vars below.
 
   /** Genesis time of the Nakamoto chain — Unix epoch milliseconds at which slot 0 starts.
     *
@@ -142,11 +142,7 @@ object GlobalSnapshotConsensus {
 
       feeCalculator = FeeCalculator.make(feeConfigs)
 
-      undoJournal <-
-        if (nakamotoEnabled)
-          io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal.make[F](mptStore).map(Some(_))
-        else
-          Async[F].pure(None: Option[io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal[F]])
+      undoJournal <- io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal.make[F](mptStore).map(Some(_))
 
       snapshotAcceptanceManager =
         GlobalSnapshotAcceptanceManager.make(
@@ -239,14 +235,10 @@ object GlobalSnapshotConsensus {
       tcaFilter = TrailingCommonAncestorFilter.make[F]
 
       // In Nakamoto mode, create state ref for VRF trigger daemon
-      nakamotoStateRef <-
-        if (nakamotoEnabled) {
-          // Genesis eta (randomness seed) - use a default or env-provided value
-          val genesisEta = sys.env.get("NAKAMOTO_GENESIS_ETA").map(_.getBytes).getOrElse("tessellation-nakamoto-genesis".getBytes)
-          Ref.of[F, NakamotoTriggerState](NakamotoTriggerState.initial(nakamotoGenesisTimeMs, genesisEta)).map(Some(_))
-        } else {
-          Async[F].pure(None)
-        }
+      nakamotoStateRef <- {
+        val genesisEta = sys.env.get("NAKAMOTO_GENESIS_ETA").map(_.getBytes).getOrElse("tessellation-nakamoto-genesis".getBytes)
+        Ref.of[F, NakamotoTriggerState](NakamotoTriggerState.initial(nakamotoGenesisTimeMs, genesisEta)).map(Some(_))
+      }
 
       stateCreator =
         GlobalSnapshotConsensusStateCreator.make(
@@ -308,7 +300,7 @@ object GlobalSnapshotConsensus {
           appConfig.snapshot.consensus,
           facilitatorSelector,
           peerQualityTracker,
-          nakamotoMode = nakamotoEnabled
+          nakamotoMode = true
         )
 
       handler = GlobalConsensusHandler.make(loop.queue)
@@ -323,203 +315,176 @@ object GlobalSnapshotConsensus {
         GlobalConsensusKind
       ](consensusStorage, rumorQueue)
 
-      // In Nakamoto mode, triggerEvent is a no-op (slot clock handles all triggering)
-      triggerEvent = if (nakamotoEnabled) Async[F].unit else loop.queue.offer(ConsensusCommand.FacilitateByEvent)
+      // Nakamoto GL0: no BFT consensus trigger or loop — slot clock handles production
+      triggerEvent = Async[F].unit
 
-      // Only start BFT consensus loop in non-Nakamoto mode
-      _ <- if (nakamotoEnabled) Async[F].unit else supervisor.supervise(loop.run.compile.drain)
+      // Nakamoto LDD + VRF config
+      lddConfig = {
+        val default = io.constellationnetwork.schema.nakamoto.LddConfig.Default
+        io.constellationnetwork.schema.nakamoto.LddConfig(
+          lddCutoff = sys.env.get("NAKAMOTO_LDD_CUTOFF").flatMap(_.toIntOption).getOrElse(default.lddCutoff),
+          offset = sys.env.get("NAKAMOTO_LDD_OFFSET").flatMap(_.toIntOption).getOrElse(default.offset),
+          baselineDifficulty = sys.env.get("NAKAMOTO_LDD_BASELINE").flatMap(_.toDoubleOption).getOrElse(default.baselineDifficulty),
+          amplitude = sys.env.get("NAKAMOTO_LDD_AMPLITUDE").flatMap(_.toDoubleOption).getOrElse(default.amplitude)
+        )
+      }
+      slotsPerEpoch = sys.env.get("NAKAMOTO_SLOTS_PER_EPOCH").flatMap(_.toLongOption).getOrElse(60L)
+      etaRotationSlots = sys.env.get("NAKAMOTO_ETA_ROTATION_SLOTS").flatMap(_.toLongOption).getOrElse(600L)
 
-      // In Nakamoto mode, start either the pure attestation loop or BFT trigger daemon
-      _ <-
-        if (nakamotoEnabled) {
-          val lddConfig = {
-            val default = io.constellationnetwork.schema.nakamoto.LddConfig.Default
-            io.constellationnetwork.schema.nakamoto.LddConfig(
-              lddCutoff = sys.env.get("NAKAMOTO_LDD_CUTOFF").flatMap(_.toIntOption).getOrElse(default.lddCutoff),
-              offset = sys.env.get("NAKAMOTO_LDD_OFFSET").flatMap(_.toIntOption).getOrElse(default.offset),
-              baselineDifficulty = sys.env.get("NAKAMOTO_LDD_BASELINE").flatMap(_.toDoubleOption).getOrElse(default.baselineDifficulty),
-              amplitude = sys.env.get("NAKAMOTO_LDD_AMPLITUDE").flatMap(_.toDoubleOption).getOrElse(default.amplitude)
-            )
-          }
-          val slotsPerEpoch = sys.env.get("NAKAMOTO_SLOTS_PER_EPOCH").flatMap(_.toLongOption).getOrElse(60L)
-          val etaRotationSlots = sys.env.get("NAKAMOTO_ETA_ROTATION_SLOTS").flatMap(_.toLongOption).getOrElse(600L)
-          val usePureAttestation = sys.env.contains("NAKAMOTO_PURE")
+      // Start the Nakamoto SnapshotLeaderLoop + sidecar bridge
+      _ <- {
 
-          if (usePureAttestation) {
-            // Pure attestation mode: SnapshotLeaderLoop bypasses BFT rounds entirely
-            val pureGenesisTimeMs = nakamotoGenesisTimeMs
-            for {
-              nakLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("NakamotoConsensus").pure[F]
-              _ <- nakLogger.info(
-                s"🔧 Nakamoto config: LDD(cutoff=${lddConfig.lddCutoff}, offset=${lddConfig.offset}, baseline=${lddConfig.baselineDifficulty}, amplitude=${lddConfig.amplitude}), etaRotation=${etaRotationSlots}s, slotsPerEpoch=${slotsPerEpoch}, genesisTime=${pureGenesisTimeMs}"
-              )
-              stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F]
-              _ <- stakeRegistry.updateValidators(seedlist.map(_.map(_.peerId)).getOrElse(Set(selfId)))
-              tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry)
-              // ChainSelection needs fetchParent — but chainStore needs ChainSelection.
-              // Break the cycle: create chainStore first with a lazy fetchParent that
-              // uses chainStore.tipFor once it's available.
-              chainStoreRef <- cats.effect.kernel.Ref.of[F, Option[
-                io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.NakamotoChainStoreAlgebra[F]
-              ]](None)
-              fetchParent = (tip: io.constellationnetwork.schema.nakamoto.ChainTip) =>
-                chainStoreRef.get.flatMap {
-                  case Some(cs) => cs.tipFor(tip.parentHash)
-                  case None     => cats.Applicative[F].pure(None: Option[io.constellationnetwork.schema.nakamoto.ChainTip])
-                }
-              chainSelection = io.constellationnetwork.node.shared.domain.nakamoto.ChainSelection.make[F](tipTracker, fetchParent)
-              chainStore <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore
-                .make[F](globalSnapshotStorage, chainSelection, tipTracker)
-              _ <- chainStoreRef.set(Some(chainStore))
-              // Seed chain store with the current head snapshot so gossip children can find their parent
-              _ <- globalSnapshotStorage.head.flatMap {
-                case Some((headSigned, headCtx)) =>
-                  HasherSelector[F].withCurrent { implicit hasher =>
-                    headSigned.toHashed[F].flatMap { hashed =>
-                      chainStore
-                        .store(
-                          headSigned,
-                          headCtx,
-                          hashed.ordinal.value.value,
-                          0L, // slot unknown for genesis
-                          hashed.lastSnapshotHash,
-                          Array.empty // no VRF output for genesis
-                        )
-                        .void
-                    }
-                  }
-                case None =>
-                  Async[F].unit
-              }
-              lastKnownSlotRef <- cats.effect.kernel.Ref.of[F, Option[Long]](None)
-              // Shared epoch state: VRF outputs from ALL sources accumulate here for eta rotation
-              genesisEta = {
-                // Genesis eta must be identical across all nodes — derive from a fixed domain string
-                // (In production, derive from genesis snapshot hash. For now, use a deterministic constant.)
-                val genesisEtaSeed = "tessellation-nakamoto-genesis-eta-v1".getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                val genesisEtaDigest = new org.bouncycastle.crypto.digests.Blake2bDigest(256)
-                genesisEtaDigest.update(genesisEtaSeed, 0, genesisEtaSeed.length)
-                val genesisEtaBytes = new Array[Byte](32)
-                genesisEtaDigest.doFinal(genesisEtaBytes, 0)
-                genesisEtaBytes
-              }
-              epochStateRef <- cats.effect.kernel.Ref
-                .of[F, io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState](
-                  io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState.initial(genesisEta)
-                )
-              // Shared semaphore: serialize snapshot production and gossip processing
-              // so each operation sees correct parent state (Bifrost uses same pattern)
-              snapshotSemaphore <- cats.effect.std.Semaphore[F](1)
-              productionGate <- io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate.make[F]
-              sidecarConfig = io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarConfig(
-                host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
-                grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
-              )
-              allocatedPair <- io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
-                .makeResource[F](sidecarConfig)
-                .allocated
-              sidecarClient = allocatedPair._1
-              // Wire rumor gossip onto the sidecar transport. Outbound: every rumor passing through
-              // Gossip.spread is forwarded to the libp2p sidecar via PublishRumor. Inbound: rumors
-              // received from the GossipSub mesh are deserialized back to Hashed[RumorRaw] and offered
-              // to rumorQueue, where the existing GossipDaemon.consumeRumors pipeline validates and
-              // dispatches them via the registered RumorHandlers — meaning BFT consensus messages,
-              // Tessellation events, and any other rumor type ride sidecar transport for free.
-              _ <- gossip.setSidecarPublishFn(
-                io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
-                  .publishFn[F](sidecarClient)
-              )
-              _ <- io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
-                .receive[F](sidecarClient.channel, rumorQueue)
-              _ <- supervisor.supervise(
-                io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
-                  .run[F](
-                    consensusFns = consensusFunctions,
-                    snapshotStorage = globalSnapshotStorage,
-                    chainStore = chainStore,
-                    lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
-                    lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
-                    eventMempool = eventMempool,
-                    sidecarClient = sidecarClient,
-                    tipTracker = tipTracker,
-                    stakeRegistry = stakeRegistry,
-                    nodeStorage = nodeStorage,
-                    keyPair = keyPair,
-                    selfId = selfId,
-                    lddConfig = lddConfig,
-                    slotsPerEpoch = slotsPerEpoch,
-                    etaRotationSlots = etaRotationSlots,
-                    lastKnownSlotRef = lastKnownSlotRef,
-                    epochStateRef = epochStateRef,
-                    genesisTimeMs = pureGenesisTimeMs,
-                    snapshotSemaphore = snapshotSemaphore,
-                    productionGate = productionGate,
-                    nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef
-                  )
-                  .compile
-                  .drain
-              )
-              // Start Nakamoto metrics publisher (periodic chain-state gauges)
-              _ <- supervisor.supervise(
-                io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoMetrics
-                  .run[F](
-                    chainStore = chainStore,
-                    tipTracker = tipTracker,
-                    genesisTimeMs = pureGenesisTimeMs
-                  )
-                  .compile
-                  .drain
-              )
-              // Start NakamotoSyncDaemon: receives snapshots + attestations from gossip
-              _ <- supervisor.supervise(
-                io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon
-                  .run[F](
-                    channel = sidecarClient.channel,
-                    chainStore = chainStore,
-                    nodeStorage = nodeStorage,
-                    tipTracker = tipTracker,
-                    stakeRegistry = stakeRegistry,
-                    sidecarClient = sidecarClient,
-                    selfId = selfId,
-                    lddConfig = lddConfig,
-                    lastKnownSlotRef = lastKnownSlotRef,
-                    epochStateRef = epochStateRef,
-                    etaRotationSlots = etaRotationSlots,
-                    consensusFns = consensusFunctions,
-                    snapshotStorage = globalSnapshotStorage,
-                    lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
-                    lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
-                    snapshotSemaphore = snapshotSemaphore,
-                    productionGate = productionGate,
-                    mptStore = mptStore
-                  )
-                  .compile
-                  .drain
-              )
-            } yield ()
-          } else {
-            // BFT trigger mode: VRF triggers fed into existing round system
-            nakamotoStateRef match {
-              case Some(stateRef) =>
-                supervisor
-                  .supervise(
-                    NakamotoTriggerDaemon
-                      .run[F](
-                        consensusQueue = loop.queue,
-                        stateRef = stateRef,
-                        keyPair = keyPair,
-                        selfId = selfId,
-                        lddConfig = lddConfig,
-                        slotsPerEpoch = slotsPerEpoch
-                      )
-                      .compile
-                      .drain
-                  )
-                  .void
-              case _ => Async[F].unit
+        val pureGenesisTimeMs = nakamotoGenesisTimeMs
+        for {
+          nakLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("NakamotoConsensus").pure[F]
+          _ <- nakLogger.info(
+            s"🔧 Nakamoto config: LDD(cutoff=${lddConfig.lddCutoff}, offset=${lddConfig.offset}, baseline=${lddConfig.baselineDifficulty}, amplitude=${lddConfig.amplitude}), etaRotation=${etaRotationSlots}s, slotsPerEpoch=${slotsPerEpoch}, genesisTime=${pureGenesisTimeMs}"
+          )
+          stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F]
+          _ <- stakeRegistry.updateValidators(seedlist.map(_.map(_.peerId)).getOrElse(Set(selfId)))
+          tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry)
+          // ChainSelection needs fetchParent — but chainStore needs ChainSelection.
+          // Break the cycle: create chainStore first with a lazy fetchParent that
+          // uses chainStore.tipFor once it's available.
+          chainStoreRef <- cats.effect.kernel.Ref.of[F, Option[
+            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.NakamotoChainStoreAlgebra[F]
+          ]](None)
+          fetchParent = (tip: io.constellationnetwork.schema.nakamoto.ChainTip) =>
+            chainStoreRef.get.flatMap {
+              case Some(cs) => cs.tipFor(tip.parentHash)
+              case None     => cats.Applicative[F].pure(None: Option[io.constellationnetwork.schema.nakamoto.ChainTip])
             }
+          chainSelection = io.constellationnetwork.node.shared.domain.nakamoto.ChainSelection.make[F](tipTracker, fetchParent)
+          chainStore <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore
+            .make[F](globalSnapshotStorage, chainSelection, tipTracker)
+          _ <- chainStoreRef.set(Some(chainStore))
+          // Seed chain store with the current head snapshot so gossip children can find their parent
+          _ <- globalSnapshotStorage.head.flatMap {
+            case Some((headSigned, headCtx)) =>
+              HasherSelector[F].withCurrent { implicit hasher =>
+                headSigned.toHashed[F].flatMap { hashed =>
+                  chainStore
+                    .store(
+                      headSigned,
+                      headCtx,
+                      hashed.ordinal.value.value,
+                      0L, // slot unknown for genesis
+                      hashed.lastSnapshotHash,
+                      Array.empty // no VRF output for genesis
+                    )
+                    .void
+                }
+              }
+            case None =>
+              Async[F].unit
           }
-        } else Async[F].unit
+          lastKnownSlotRef <- cats.effect.kernel.Ref.of[F, Option[Long]](None)
+          // Shared epoch state: VRF outputs from ALL sources accumulate here for eta rotation
+          genesisEta = {
+            // Genesis eta must be identical across all nodes — derive from a fixed domain string
+            // (In production, derive from genesis snapshot hash. For now, use a deterministic constant.)
+            val genesisEtaSeed = "tessellation-nakamoto-genesis-eta-v1".getBytes(java.nio.charset.StandardCharsets.UTF_8)
+            val genesisEtaDigest = new org.bouncycastle.crypto.digests.Blake2bDigest(256)
+            genesisEtaDigest.update(genesisEtaSeed, 0, genesisEtaSeed.length)
+            val genesisEtaBytes = new Array[Byte](32)
+            genesisEtaDigest.doFinal(genesisEtaBytes, 0)
+            genesisEtaBytes
+          }
+          epochStateRef <- cats.effect.kernel.Ref
+            .of[F, io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState](
+              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState.initial(genesisEta)
+            )
+          // Shared semaphore: serialize snapshot production and gossip processing
+          // so each operation sees correct parent state (Bifrost uses same pattern)
+          snapshotSemaphore <- cats.effect.std.Semaphore[F](1)
+          productionGate <- io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate.make[F]
+          sidecarConfig = io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarConfig(
+            host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
+            grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
+          )
+          allocatedPair <- io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
+            .makeResource[F](sidecarConfig)
+            .allocated
+          sidecarClient = allocatedPair._1
+          // Wire rumor gossip onto the sidecar transport. Outbound: every rumor passing through
+          // Gossip.spread is forwarded to the libp2p sidecar via PublishRumor. Inbound: rumors
+          // received from the GossipSub mesh are deserialized back to Hashed[RumorRaw] and offered
+          // to rumorQueue, where the existing GossipDaemon.consumeRumors pipeline validates and
+          // dispatches them via the registered RumorHandlers — meaning BFT consensus messages,
+          // Tessellation events, and any other rumor type ride sidecar transport for free.
+          _ <- gossip.setSidecarPublishFn(
+            io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
+              .publishFn[F](sidecarClient)
+          )
+          _ <- io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
+            .receive[F](sidecarClient.channel, rumorQueue)
+          _ <- supervisor.supervise(
+            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
+              .run[F](
+                consensusFns = consensusFunctions,
+                snapshotStorage = globalSnapshotStorage,
+                chainStore = chainStore,
+                lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
+                lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
+                eventMempool = eventMempool,
+                sidecarClient = sidecarClient,
+                tipTracker = tipTracker,
+                stakeRegistry = stakeRegistry,
+                nodeStorage = nodeStorage,
+                keyPair = keyPair,
+                selfId = selfId,
+                lddConfig = lddConfig,
+                slotsPerEpoch = slotsPerEpoch,
+                etaRotationSlots = etaRotationSlots,
+                lastKnownSlotRef = lastKnownSlotRef,
+                epochStateRef = epochStateRef,
+                genesisTimeMs = pureGenesisTimeMs,
+                snapshotSemaphore = snapshotSemaphore,
+                productionGate = productionGate,
+                nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef
+              )
+              .compile
+              .drain
+          )
+          // Start Nakamoto metrics publisher (periodic chain-state gauges)
+          _ <- supervisor.supervise(
+            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoMetrics
+              .run[F](
+                chainStore = chainStore,
+                tipTracker = tipTracker,
+                genesisTimeMs = pureGenesisTimeMs
+              )
+              .compile
+              .drain
+          )
+          // Start NakamotoSyncDaemon: receives snapshots + attestations from gossip
+          _ <- supervisor.supervise(
+            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon
+              .run[F](
+                channel = sidecarClient.channel,
+                chainStore = chainStore,
+                nodeStorage = nodeStorage,
+                tipTracker = tipTracker,
+                stakeRegistry = stakeRegistry,
+                sidecarClient = sidecarClient,
+                selfId = selfId,
+                lddConfig = lddConfig,
+                lastKnownSlotRef = lastKnownSlotRef,
+                epochStateRef = epochStateRef,
+                etaRotationSlots = etaRotationSlots,
+                consensusFns = consensusFunctions,
+                snapshotStorage = globalSnapshotStorage,
+                lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
+                lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
+                snapshotSemaphore = snapshotSemaphore,
+                productionGate = productionGate,
+                mptStore = mptStore
+              )
+              .compile
+              .drain
+          )
+        } yield ()
+      }
       consensus = new Consensus(
         handler,
         consensusStorage,

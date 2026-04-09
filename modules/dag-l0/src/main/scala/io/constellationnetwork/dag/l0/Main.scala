@@ -18,7 +18,6 @@ import io.constellationnetwork.ext.cats.effect._
 import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
 import io.constellationnetwork.ext.kryo._
 import io.constellationnetwork.node.shared.app.{DagL0, NodeShared, TessellationIOApp}
-import io.constellationnetwork.node.shared.domain.collateral.OwnCollateralNotSatisfied
 import io.constellationnetwork.node.shared.ext.pureconfig._
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.EventTrigger
@@ -30,11 +29,13 @@ import io.constellationnetwork.node.shared.resources.MkHttpServer
 import io.constellationnetwork.node.shared.resources.MkHttpServer.ServerName
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.balance.Amount
-import io.constellationnetwork.schema.cluster.ClusterId
+import io.constellationnetwork.schema.cluster.{ClusterId, ClusterSessionToken, SessionToken}
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.generation.Generation
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.node.NodeState
+import io.constellationnetwork.schema.peer.{Peer, Responsive}
 import io.constellationnetwork.schema.semver.TessellationVersion
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
@@ -50,7 +51,7 @@ import pureconfig.generic.auto._
 import pureconfig.module.enumeratum._
 
 object Main
-    extends TessellationIOApp[Run](
+    extends TessellationIOApp[RunNakamoto](
       name = "dag-l0",
       header = "Tessellation Node",
       version = TessellationVersion.unsafeFrom(BuildInfo.version),
@@ -58,7 +59,7 @@ object Main
       layer = DagL0
     ) {
 
-  val opts: Opts[Run] = cli.method.opts
+  val opts: Opts[RunNakamoto] = cli.method.opts
 
   protected val configFiles: List[String] = List("dag-l0.conf")
 
@@ -67,7 +68,7 @@ object Main
   val kryoRegistrar: Map[Class[_], KryoRegistrationId[KryoRegistrationIdRange]] =
     dagL0KryoRegistrar
 
-  def run(method: Run, nodeShared: NodeShared[IO, Run]): Resource[IO, Unit] = {
+  def run(method: RunNakamoto, nodeShared: NodeShared[IO, RunNakamoto]): Resource[IO, Unit] = {
     import nodeShared._
 
     for {
@@ -97,7 +98,7 @@ object Main
       nakamotoFinalizedOrdinalRef <- Ref.of[IO, Long](0L).asResource
 
       services <- Services
-        .make[IO, Run](
+        .make[IO, RunNakamoto](
           sharedConfig,
           sharedServices,
           sharedStorages,
@@ -117,7 +118,7 @@ object Main
         )
         .asResource
 
-      programs = Programs.make[IO, Run](
+      programs = Programs.make[IO, RunNakamoto](
         sharedPrograms,
         storages,
         services,
@@ -143,55 +144,22 @@ object Main
         services.recoveryPeerHint
       )
 
-      isNakamotoMode = method.isInstanceOf[RunNakamoto] || method.isInstanceOf[RunNakamotoValidator]
+      // Nakamoto GL0: no legacy EventGossipDaemon (P2P gossip is via libp2p sidecar)
+      eventGossipDaemon = EventGossipDaemon.noop[IO, GlobalSnapshotEvent, GlobalStateKey]
 
-      eventGossipDaemon <-
-        if (isNakamotoMode)
-          Resource.pure[IO, EventGossipDaemon[IO, GlobalSnapshotEvent, GlobalStateKey]](
-            EventGossipDaemon.noop[IO, GlobalSnapshotEvent, GlobalStateKey]
-          )
-        else
-          EventGossipDaemon
-            .make[IO, GlobalSnapshotEvent, GlobalStateKey](
-              services.eventMempool,
-              storages.cluster,
-              storages.node,
-              sharedResources.gossipClient,
-              sharedServices.session,
-              config = EventGossipConfig(
-                heartbeatInterval = cfg.snapshot.consensus.eventGossipHeartbeatInterval,
-                pullInterval = cfg.snapshot.consensus.eventGossipPullInterval
-              ),
-              getLocalChainTip = Some(forkRecoveryService.getLocalChainTip),
-              onForkDetected = Some(forkRecoveryService.onForkDetected),
-              forkLagThreshold = cfg.snapshot.consensus.forkLagThreshold
-            )
-            .asResource
-
-      _ <- (if (isNakamotoMode)
-              Daemons.startNakamoto(
-                storages,
-                services,
-                queues,
-                nodeId,
-                keyPair,
-                cfg
-              )
-            else
-              Daemons.start(
-                storages,
-                services,
-                programs,
-                queues,
-                nodeId,
-                keyPair,
-                cfg,
-                hasherSelector,
-                eventGossipDaemon
-              )).asResource
+      _ <- Daemons
+        .startNakamoto(
+          storages,
+          services,
+          queues,
+          nodeId,
+          keyPair,
+          cfg
+        )
+        .asResource
 
       api <- Resource.eval(
-        HttpApi.make[IO, Run](
+        HttpApi.make[IO, RunNakamoto](
           storages,
           queues,
           services,
@@ -208,16 +176,9 @@ object Main
           storages.combinedGlobalSnapshotCheckpointStorage,
           getLocalChainTip = Some(forkRecoveryService.getLocalChainTip),
           maybeMarkSeen = Some(eventGossipDaemon.markSeen),
-          isNakamotoMode = isNakamotoMode,
-          // In Nakamoto mode, expose the chain store's tracked finalized ordinal so CL0 can
-          // gate state-channel-binary pruning on real finality. In BFT mode pass None and
-          // the route defaults to head ordinal (every BFT snapshot is immediately final).
-          getNakamotoFinalizedOrdinal =
-            if (isNakamotoMode)
-              Some(nakamotoFinalizedOrdinalRef.get.map { ord =>
-                if (ord > 0L) SnapshotOrdinal(ord) else None
-              })
-            else None
+          getNakamotoFinalizedOrdinal = Some(nakamotoFinalizedOrdinalRef.get.map { ord =>
+            if (ord > 0L) SnapshotOrdinal(ord) else None
+          })
         )
       )
 
@@ -237,251 +198,64 @@ object Main
         generation,
         sharedConfig.gossip.daemon,
         services.collateral,
-        nakamotoMode = isNakamotoMode
+        nakamotoMode = true
       )
 
-      _ <- (method match {
-        case m: RunValidator =>
-          gossipDaemon.startAsRegularValidator >>
-            storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin) >>
-            services.restart.setNodeForkedRestartMethod(
-              RunValidatorWithJoinAttempt(
-                m.keyStore,
-                m.alias,
-                m.password,
-                m.dbConfig,
-                m.httpConfig,
-                m.environment,
-                m.seedlistPath,
-                m.collateralAmount,
-                m.trustRatingsPath,
-                m.prioritySeedlistPath,
-                _,
-                m.allowanceListPath
-              )
-            )
-        case m: RunValidatorWithJoinAttempt =>
-          gossipDaemon.startAsRegularValidator >>
-            storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin) >>
-            programs.joining.joinOneOf(m.peerToJoinPool) >>
-            services.restart.setClusterLeaveRestartMethod(
-              RunValidator(
-                m.keyStore,
-                m.alias,
-                m.password,
-                m.dbConfig,
-                m.httpConfig,
-                m.environment,
-                m.seedlistPath,
-                m.collateralAmount,
-                m.trustRatingsPath,
-                m.prioritySeedlistPath,
-                m.allowanceListPath
-              )
-            ) >>
-            services.restart.setNodeForkedRestartMethod(
-              RunValidatorWithJoinAttempt(
-                m.keyStore,
-                m.alias,
-                m.password,
-                m.dbConfig,
-                m.httpConfig,
-                m.environment,
-                m.seedlistPath,
-                m.collateralAmount,
-                m.trustRatingsPath,
-                m.prioritySeedlistPath,
-                _,
-                m.allowanceListPath
-              )
-            )
-        case m: RunRollback =>
-          storages.node.tryModifyState(
-            NodeState.Initial,
-            NodeState.RollbackInProgress,
-            NodeState.RollbackDone
-          ) {
-            programs.rollbackLoader.load(m.rollbackHash, programs.download).flatMap {
-              case (snapshotInfo, snapshot) =>
-                for {
-                  hashedSnapshot <- hasherSelector.withCurrent(implicit hasher => snapshot.toHashed[IO])
-                  result <- services.consensus.manager.startFacilitatingAfterRollback(
-                    snapshot.ordinal,
-                    GlobalConsensusOutcome(
+      // Unified Nakamoto bootstrap: auto-detect the right startup path from the flags
+      // provided on the CLI. See cli/method.scala for precedence docs.
+      //
+      // Precedence:
+      //   1. --rollback-hash  → load a specific snapshot (from disk or peer) as trust anchor
+      //   2. Local data on disk → cold restart from the latest ordinal
+      //   3. --nakamoto-peer  → HTTP-download latest snapshot from a running peer
+      //   4. --genesis-csv    → fresh start from a genesis CSV
+      //   5. None             → startup error
+      _ <- ({
+        import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.GlobalSnapshotInfoLocalFileSystemStorage
+
+        if (method.rollbackHash.isDefined) {
+          // === PATH 1: ROLLBACK — load a specific snapshot by hash ===
+          val hash = method.rollbackHash.get
+          logger.info(s"Rollback mode: loading snapshot hash=${hash.value.take(16)}...") >>
+            storages.node.tryModifyState(
+              NodeState.Initial,
+              NodeState.RollbackInProgress,
+              NodeState.RollbackDone
+            ) {
+              programs.rollbackLoader.load(hash, programs.download).flatMap {
+                case (snapshotInfo, snapshot) =>
+                  for {
+                    hashedSnapshot <- hasherSelector.withCurrent(implicit hasher => snapshot.toHashed[IO])
+                    _ <- services.consensus.manager.startFacilitatingAfterRollback(
                       snapshot.ordinal,
-                      Facilitators(List(nodeId)),
-                      RemovedFacilitators.empty,
-                      WithdrawnFacilitators.empty,
-                      EligibleFacilitators.empty,
-                      Finished(snapshot, snapshotInfo, EventTrigger, Candidates.empty, Hash.empty, hashedSnapshot.hash)
+                      GlobalConsensusOutcome(
+                        snapshot.ordinal,
+                        Facilitators(List(nodeId)),
+                        RemovedFacilitators.empty,
+                        WithdrawnFacilitators.empty,
+                        EligibleFacilitators.empty,
+                        Finished(snapshot, snapshotInfo, EventTrigger, Candidates.empty, Hash.empty, hashedSnapshot.hash)
+                      )
                     )
-                  )
-                } yield result
-            }
-          } >>
-            services.collateral
-              .hasCollateral(nodeShared.nodeId)
-              .flatMap(OwnCollateralNotSatisfied.raiseError[IO, Unit].unlessA) >>
-            gossipDaemon.startAsInitialValidator >>
-            services.cluster.createSession >>
-            services.session.createSession >>
-            storages.node.setNodeState(NodeState.Ready) >>
-            services.restart.setClusterLeaveRestartMethod(
-              RunValidator(
-                m.keyStore,
-                m.alias,
-                m.password,
-                m.dbConfig,
-                m.httpConfig,
-                m.environment,
-                m.seedlistPath,
-                m.collateralAmount,
-                m.trustRatingsPath,
-                m.prioritySeedlistPath,
-                m.allowanceListPath
-              )
-            ) >>
-            services.restart.setNodeForkedRestartMethod(
-              RunValidatorWithJoinAttempt(
-                m.keyStore,
-                m.alias,
-                m.password,
-                m.dbConfig,
-                m.httpConfig,
-                m.environment,
-                m.seedlistPath,
-                m.collateralAmount,
-                m.trustRatingsPath,
-                m.prioritySeedlistPath,
-                _,
-                m.allowanceListPath
-              )
-            )
-        case m: RunGenesis =>
-          storages.node.tryModifyState(
-            NodeState.Initial,
-            NodeState.LoadingGenesis,
-            NodeState.GenesisReady
-          ) {
-            GenesisLoader.make[IO, GlobalSnapshot].loadBalances(m.genesisPath).flatMap { accounts =>
-              val genesis = GlobalSnapshot.mkGenesis(
-                accounts.map(a => (a.address, a.balance)).toMap,
-                m.startingEpochProgress
-              )
-
-              hasherSelector.withCurrent { implicit hasher =>
-                Signed
-                  .forAsyncHasher[IO, GlobalSnapshot](genesis, keyPair)
-                  .flatMap(_.toHashed[IO])
-              }.flatMap { hashedGenesis =>
-                GlobalSnapshotLocalFileSystemStorage.make[IO](cfg.snapshot.snapshotPath).flatMap {
-                  fullGlobalSnapshotLocalFileSystemStorage =>
-                    hasherSelector.withCurrent { implicit hasher =>
-                      fullGlobalSnapshotLocalFileSystemStorage.write(hashedGenesis.signed) >>
-                        GlobalSnapshot.mkFirstIncrementalSnapshot[IO](hashedGenesis).flatMap { firstIncrementalSnapshot =>
-                          Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](firstIncrementalSnapshot, keyPair).flatMap {
-                            signedFirstIncrementalSnapshot =>
-                              for {
-                                _ <- services.collateral
-                                  .hasCollateral(nodeShared.nodeId)
-                                  .flatMap(OwnCollateralNotSatisfied.raiseError[IO, Unit].unlessA)
-                                hashedSnapshot <- signedFirstIncrementalSnapshot.toHashed[IO]
-                                globalSnapshotInfo = hashedGenesis.info.toGlobalSnapshotInfo
-                                _ <- initializeStorages[IO](
-                                  storages.globalSnapshot,
-                                  sharedStorages.lastNGlobalSnapshot,
-                                  sharedStorages.lastGlobalSnapshot,
-                                  programs.download,
-                                  hashedSnapshot,
-                                  globalSnapshotInfo
-                                )
-                                kvPairs <- globalSnapshotInfo.allStateEntries[IO](
-                                  Async[IO],
-                                  Parallel[IO],
-                                  hasher,
-                                  jsonSerializer,
-                                  globalStateProofSelector
-                                )
-                                _ <- sharedStorages.mptStore.syncFull(kvPairs, hashedSnapshot.ordinal)
-
-                                _ <- services.consensus.manager
-                                  .startFacilitatingAfterRollback(
-                                    signedFirstIncrementalSnapshot.ordinal,
-                                    GlobalConsensusOutcome(
-                                      signedFirstIncrementalSnapshot.ordinal,
-                                      Facilitators(List(nodeId)),
-                                      RemovedFacilitators.empty,
-                                      WithdrawnFacilitators.empty,
-                                      EligibleFacilitators.empty,
-                                      Finished(
-                                        signedFirstIncrementalSnapshot,
-                                        hashedGenesis.info.toGlobalSnapshotInfo,
-                                        EventTrigger,
-                                        Candidates.empty,
-                                        Hash.empty,
-                                        hashedSnapshot.hash
-                                      )
-                                    )
-                                  )
-                              } yield ()
-                          }
-                        }
-                    }
-                }
+                  } yield ()
               }
-            }
-          } >>
-            gossipDaemon.startAsInitialValidator >>
+            } >>
             services.cluster.createSession >>
             services.session.createSession >>
-            storages.node.setNodeState(NodeState.Ready) >>
-            services.restart.setClusterLeaveRestartMethod(
-              RunValidator(
-                m.keyStore,
-                m.alias,
-                m.password,
-                m.dbConfig,
-                m.httpConfig,
-                m.environment,
-                m.seedlistPath,
-                m.collateralAmount,
-                m.trustRatingsPath,
-                m.prioritySeedlistPath,
-                m.allowanceListPath
-              )
-            ) >>
-            services.restart.setNodeForkedRestartMethod(
-              RunValidatorWithJoinAttempt(
-                m.keyStore,
-                m.alias,
-                m.password,
-                m.dbConfig,
-                m.httpConfig,
-                m.environment,
-                m.seedlistPath,
-                m.collateralAmount,
-                m.trustRatingsPath,
-                m.prioritySeedlistPath,
-                _,
-                m.allowanceListPath
-              )
-            )
-        case m: RunNakamoto =>
-          // Nakamoto mode: all nodes load genesis identically, no leader/follower.
-          // Supports cold restart: if snapshot data already exists on disk,
-          // recover from it instead of re-running genesis.
-          import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.GlobalSnapshotInfoLocalFileSystemStorage
+            storages.node.setNodeState(NodeState.Ready)
+
+        } else {
           storages.node.tryModifyState(
             NodeState.Initial,
             NodeState.LoadingGenesis,
             NodeState.GenesisReady
           ) {
-            // Check if we already have snapshot data on disk (cold restart detection)
+            // Check for local snapshot data on disk (cold restart detection)
             GlobalSnapshotInfoLocalFileSystemStorage.make[IO](cfg.snapshot.snapshotInfoPath).flatMap { infoStorage =>
               infoStorage.listStoredOrdinals.flatMap { ordinalStream =>
                 ordinalStream.compile.toList.flatMap { storedOrdinals =>
                   if (storedOrdinals.nonEmpty) {
-                    // === COLD RESTART: recover from disk ===
+                    // === PATH 2: COLD RESTART — resume from latest ordinal on disk ===
                     val latestOrdinal = storedOrdinals.max
                     logger.info(
                       s"Cold restart detected: found ${storedOrdinals.size} snapshots on disk, latest ordinal=$latestOrdinal"
@@ -493,10 +267,7 @@ object Main
                               hashedSnapshot <- latestSnapshot.toHashed[IO]
                               _ <- storages.globalSnapshot.setHeadForRecovery(latestSnapshot, latestInfo)
                               _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(hashedSnapshot, latestInfo)
-                              _ <- sharedStorages.lastNGlobalSnapshot.setForRecovery(
-                                hashedSnapshot,
-                                latestInfo
-                              )
+                              _ <- sharedStorages.lastNGlobalSnapshot.setForRecovery(hashedSnapshot, latestInfo)
                               kvPairs <- latestInfo.allStateEntries[IO](
                                 Async[IO],
                                 Parallel[IO],
@@ -514,14 +285,7 @@ object Main
                                     RemovedFacilitators.empty,
                                     WithdrawnFacilitators.empty,
                                     EligibleFacilitators.empty,
-                                    Finished(
-                                      latestSnapshot,
-                                      latestInfo,
-                                      EventTrigger,
-                                      Candidates.empty,
-                                      Hash.empty,
-                                      hashedSnapshot.hash
-                                    )
+                                    Finished(latestSnapshot, latestInfo, EventTrigger, Candidates.empty, Hash.empty, hashedSnapshot.hash)
                                   )
                                 )
                               _ <- logger.info(s"Recovered from disk at ordinal=$latestOrdinal")
@@ -534,18 +298,73 @@ object Main
                             )
                           )
                       }
-                  } else {
-                    // === FRESH START: run genesis ===
-                    GenesisLoader.make[IO, GlobalSnapshot].loadBalances(m.genesisPath).flatMap { accounts =>
+
+                  } else if (method.peerToJoin.isDefined) {
+                    // === PATH 3: PEER DOWNLOAD — join an existing chain ===
+                    import org.http4s.ember.client.EmberClientBuilder
+                    import org.http4s.circe.CirceEntityDecoder._
+                    import org.http4s.Uri
+
+                    val peerUrl = method.peerToJoin.get
+                    val peerUri = Uri.unsafeFromString(peerUrl)
+
+                    EmberClientBuilder.default[IO].build.use { client =>
+                      for {
+                        _ <- logger.info(s"Downloading latest snapshot from $peerUrl...")
+                        latestSnapshot <- client.expect[Signed[GlobalIncrementalSnapshot]](
+                          peerUri / "global-snapshots" / "latest"
+                        )
+                        latestInfo <- client.expect[GlobalSnapshotInfo](
+                          peerUri / "global-snapshots" / "latest" / "info"
+                        )
+                        _ <- logger.info(s"Got snapshot ordinal=${latestSnapshot.ordinal}")
+                        hashedSnapshot <- hasherSelector.withCurrent(implicit hasher => latestSnapshot.toHashed[IO])
+                        _ <- hasherSelector.withCurrent { implicit hasher =>
+                          initializeStorages[IO](
+                            storages.globalSnapshot,
+                            sharedStorages.lastNGlobalSnapshot,
+                            sharedStorages.lastGlobalSnapshot,
+                            programs.download,
+                            hashedSnapshot,
+                            latestInfo
+                          )
+                        }
+                        kvPairs <- hasherSelector.withCurrent { implicit hasher =>
+                          latestInfo.allStateEntries[IO](
+                            Async[IO],
+                            Parallel[IO],
+                            hasher,
+                            jsonSerializer,
+                            globalStateProofSelector
+                          )
+                        }
+                        _ <- sharedStorages.mptStore.syncFull(kvPairs, hashedSnapshot.ordinal)
+                        _ <- services.consensus.manager
+                          .startFacilitatingAfterRollback(
+                            latestSnapshot.ordinal,
+                            GlobalConsensusOutcome(
+                              latestSnapshot.ordinal,
+                              Facilitators(List(nodeId)),
+                              RemovedFacilitators.empty,
+                              WithdrawnFacilitators.empty,
+                              EligibleFacilitators.empty,
+                              Finished(latestSnapshot, latestInfo, EventTrigger, Candidates.empty, Hash.empty, hashedSnapshot.hash)
+                            )
+                          )
+                        _ <- logger.info(s"Initialized from peer at ordinal=${latestSnapshot.ordinal}. Starting VRF production.")
+                      } yield ()
+                    }
+
+                  } else if (method.genesisPath.isDefined) {
+                    // === PATH 4: FRESH GENESIS — start from genesis CSV ===
+                    val gPath = method.genesisPath.get
+                    GenesisLoader.make[IO, GlobalSnapshot].loadBalances(gPath).flatMap { accounts =>
                       val genesis = GlobalSnapshot.mkGenesis(
                         accounts.map(a => (a.address, a.balance)).toMap,
-                        m.startingEpochProgress
+                        method.startingEpochProgress
                       )
-
                       hasherSelector.withCurrent { implicit hasher =>
-                        Signed
-                          .forAsyncHasher[IO, GlobalSnapshot](genesis, keyPair)
-                          .flatMap(_.toHashed[IO])
+                        Signed.forAsyncHasher[IO, GlobalSnapshot](genesis, keyPair).flatMap(_.toHashed[IO])
                       }.flatMap { hashedGenesis =>
                         GlobalSnapshotLocalFileSystemStorage.make[IO](cfg.snapshot.snapshotPath).flatMap {
                           fullGlobalSnapshotLocalFileSystemStorage =>
@@ -599,104 +418,60 @@ object Main
                         }
                       }
                     }
+
+                  } else {
+                    // === PATH 5: ERROR — no bootstrap source ===
+                    IO.raiseError(
+                      new RuntimeException(
+                        "Cannot start: no local snapshot data, no --nakamoto-peer, and no --genesis-csv provided. " +
+                          "Provide one of: --genesis-csv <path> (fresh start), --nakamoto-peer <url> (join chain), " +
+                          "or --rollback-hash <hash> (anchored recovery)."
+                      )
+                    )
                   }
                 }
               }
             }
           } >>
-            // Skip gossipDaemon — Nakamoto uses GossipSub sidecar, not tessellation gossip
-            // Skip cluster join — all nodes are peers via seedlist, no join protocol
             services.cluster.createSession >>
             services.session.createSession >>
+            // Populate ClusterStorage from the seedlist so /cluster/info returns the
+            // full validator set. In Nakamoto there's no BFT join handshake, so peers
+            // never register via addPeer — we seed them from the seedlist at startup.
+            (nodeShared.seedlist match {
+              case Some(entries) =>
+                storages.cluster.getToken.flatMap { maybeToken =>
+                  val token = maybeToken.getOrElse(ClusterSessionToken(Generation(1L)))
+                  entries.toList.filter(_.peerId =!= nodeId).traverse_ { entry =>
+                    entry.connectionInfo match {
+                      case Some(connInfo) =>
+                        val publicPort = com.comcast.ip4s.Port
+                          .fromInt(connInfo.p2pPort.value - 1)
+                          .getOrElse(connInfo.p2pPort)
+                        val sessionGen = eu.timepit.refined.types.numeric.PosLong.unsafeFrom(System.currentTimeMillis())
+                        val peer = Peer(
+                          id = entry.peerId,
+                          ip = com.comcast.ip4s.Host.fromString(connInfo.ipAddress.toString).get,
+                          publicPort = publicPort,
+                          p2pPort = connInfo.p2pPort,
+                          clusterSession = token,
+                          session = SessionToken(Generation(sessionGen)),
+                          state = NodeState.Ready,
+                          responsiveness = Responsive,
+                          jar = Hash.empty
+                        )
+                        storages.cluster.addPeer(peer).void
+                      case None =>
+                        // 1-field seedlist entry (peerId only) — can't add to ClusterStorage
+                        // without connection info. The peer will be absent from /cluster/info.
+                        IO.unit
+                    }
+                  }
+                }
+              case None => IO.unit
+            }) >>
             storages.node.setNodeState(NodeState.Ready)
-
-        case m: RunNakamotoValidator =>
-          // Nakamoto validator: download latest snapshot from a peer, initialize, then produce.
-          // NakamotoSyncDaemon will handle catching up; once caught up, SnapshotLeaderLoop produces.
-          storages.node.tryModifyState(
-            NodeState.Initial,
-            NodeState.WaitingForDownload,
-            NodeState.Ready
-          ) {
-            import org.http4s.client.Client
-            import org.http4s.ember.client.EmberClientBuilder
-            import org.http4s.circe.CirceEntityDecoder._
-            import org.http4s.Uri
-
-            val peerUri = Uri.unsafeFromString(m.peerToJoin)
-
-            EmberClientBuilder.default[IO].build.use { client =>
-              for {
-                _ <- logger.info(s"Downloading latest snapshot from ${m.peerToJoin}...")
-
-                // Download latest snapshot from peer's public HTTP API
-                latestSnapshot <- client.expect[Signed[GlobalIncrementalSnapshot]](
-                  peerUri / "global-snapshots" / "latest"
-                )
-
-                // Download the snapshot info/context
-                latestInfo <- client.expect[GlobalSnapshotInfo](
-                  peerUri / "global-snapshots" / "latest" / "info"
-                )
-
-                _ <- logger.info(s"Got snapshot ordinal=${latestSnapshot.ordinal}")
-
-                hashedSnapshot <- hasherSelector.withCurrent { implicit hasher =>
-                  latestSnapshot.toHashed[IO]
-                }
-
-                // Initialize storages with the downloaded snapshot
-                _ <- hasherSelector.withCurrent { implicit hasher =>
-                  initializeStorages[IO](
-                    storages.globalSnapshot,
-                    sharedStorages.lastNGlobalSnapshot,
-                    sharedStorages.lastGlobalSnapshot,
-                    programs.download,
-                    hashedSnapshot,
-                    latestInfo
-                  )
-                }
-
-                kvPairs <- hasherSelector.withCurrent { implicit hasher =>
-                  latestInfo.allStateEntries[IO](
-                    Async[IO],
-                    Parallel[IO],
-                    hasher,
-                    jsonSerializer,
-                    globalStateProofSelector
-                  )
-                }
-
-                _ <- sharedStorages.mptStore.syncFull(kvPairs, hashedSnapshot.ordinal)
-
-                // Bootstrap consensus manager with downloaded snapshot
-                _ <- services.consensus.manager
-                  .startFacilitatingAfterRollback(
-                    latestSnapshot.ordinal,
-                    GlobalConsensusOutcome(
-                      latestSnapshot.ordinal,
-                      Facilitators(List(nodeId)),
-                      RemovedFacilitators.empty,
-                      WithdrawnFacilitators.empty,
-                      EligibleFacilitators.empty,
-                      Finished(
-                        latestSnapshot,
-                        latestInfo,
-                        EventTrigger,
-                        Candidates.empty,
-                        Hash.empty,
-                        hashedSnapshot.hash
-                      )
-                    )
-                  )
-
-                _ <- logger.info(s"Initialized from peer at ordinal=${latestSnapshot.ordinal}. Starting VRF production.")
-              } yield ()
-            }
-            // Skip session/cluster token creation — Nakamoto consensus doesn't use
-            // tessellation BFT sessions, and the state machine doesn't accept
-            // WaitingForDownload→StartingSession transitions.
-          }
+        }
       }).asResource
     } yield ()
   }
