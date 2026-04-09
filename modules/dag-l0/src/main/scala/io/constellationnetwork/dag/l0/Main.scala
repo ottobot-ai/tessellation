@@ -133,10 +133,24 @@ object Main
         sharedStorages.mptStore
       )
 
+      // Inbound event rumor handler: receives Signed[GlobalSnapshotEvent] rumors
+      // from other GL0 nodes via the sidecar GossipSub transport and adds them
+      // to the local event mempool. This is how events submitted to gl0-1 reach
+      // gl0-0's mempool for inclusion in the next snapshot.
+      eventRumorHandler = {
+        import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
+        import io.constellationnetwork.node.shared.infrastructure.gossip.RumorHandler
+        import io.constellationnetwork.node.shared.infrastructure.gossip.ExcludeSelfOrigin
+        RumorHandler.fromPeerRumorConsumer[IO, Signed[GlobalSnapshotEvent]](ExcludeSelfOrigin) { rumor =>
+          services.eventMempool.add(rumor.content).void
+        }
+      }
+
       rumorHandler = RumorHandlers
         .make[IO](storages.cluster, services.localHealthcheck, sharedStorages.forkInfo)
         .handlers <+>
-        trustHandler(storages.trust) <+> ordinalTrustHandler(storages.trust) <+> services.consensus.handler
+        trustHandler(storages.trust) <+> ordinalTrustHandler(storages.trust) <+> services.consensus.handler <+>
+        eventRumorHandler
 
       forkRecoveryService = ForkRecoveryService.make[IO](
         storages.node,
@@ -152,6 +166,7 @@ object Main
           storages,
           services,
           queues,
+          sharedServices.gossip,
           nodeId,
           keyPair,
           cfg

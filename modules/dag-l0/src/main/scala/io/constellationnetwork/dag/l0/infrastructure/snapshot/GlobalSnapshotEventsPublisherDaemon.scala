@@ -12,7 +12,7 @@ import io.constellationnetwork.dag.l0.domain.nodeCollateral.{CreateNodeCollatera
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
 import io.constellationnetwork.node.shared.config.types.ConsensusConfig
 import io.constellationnetwork.node.shared.domain.Daemon
-import io.constellationnetwork.node.shared.infrastructure.gossip.event.EventGossipDaemon
+import io.constellationnetwork.node.shared.domain.gossip.Gossip
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.snapshot.EventTriggerGuard
 import io.constellationnetwork.schema.Block
@@ -41,7 +41,7 @@ object GlobalSnapshotEventsPublisherDaemon {
     nodeCollateralOutputQueue: Queue[F, NodeCollateralOutput],
     keyPair: KeyPair,
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    eventGossipDaemon: EventGossipDaemon[F, GlobalSnapshotEvent, GlobalStateKey],
+    gossip: Gossip[F],
     triggerEventConsensus: Option[F[Unit]],
     getLastFacilitatorCount: F[Int],
     consensusConfig: ConsensusConfig
@@ -94,7 +94,7 @@ object GlobalSnapshotEventsPublisherDaemon {
       Ref.of[F, Long](0L).flatMap { lastTriggerRef =>
         HasherSelector[F].withCurrent { implicit hasher =>
           events.evalMap { event =>
-            signAndPublish(event, keyPair, eventMempool, eventGossipDaemon, logger) >>
+            signAndPublish(event, keyPair, eventMempool, gossip, logger) >>
               EventTriggerGuard(
                 eventMempool,
                 triggerEventConsensus,
@@ -110,21 +110,21 @@ object GlobalSnapshotEventsPublisherDaemon {
     }
   }
 
-  private def signAndPublish[F[_]: Async: SecurityProvider, E, K](
+  private def signAndPublish[F[_]: Async: SecurityProvider, E: scala.reflect.runtime.universe.TypeTag, K](
     event: E,
     keyPair: KeyPair,
     eventMempool: EventMempool[F, E, K],
-    eventGossipDaemon: EventGossipDaemon[F, E, K],
+    gossip: Gossip[F],
     logger: SelfAwareStructuredLogger[F]
-  )(implicit hasher: Hasher[F], signed: CirceEncoder[E]): F[Unit] =
+  )(implicit hasher: Hasher[F], encoder: CirceEncoder[E]): F[Unit] =
     Signed.forAsyncHasher[F, E](event, keyPair).flatMap { signedEvent =>
-      signedEvent.toHashed.flatMap { hashedEvent =>
-        eventMempool.add(signedEvent).flatMap {
-          case Right(_) =>
-            eventGossipDaemon.publish(hashedEvent)
-          case Left(reason) =>
-            logger.warn(s"Failed to add event to mempool: ${event.getClass.getSimpleName}, reason=$reason")
-        }
+      eventMempool.add(signedEvent).flatMap {
+        case Right(_) =>
+          // Spread the signed event as a rumor via the sidecar GossipSub transport.
+          // Other GL0 nodes receive it via the rumorQueue → RumorHandler → mempool path.
+          gossip.spread(signedEvent)
+        case Left(reason) =>
+          logger.warn(s"Failed to add event to mempool: ${event.getClass.getSimpleName}, reason=$reason")
       }
     }
 
