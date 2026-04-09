@@ -1,6 +1,7 @@
 package io.constellationnetwork.schema.mpt
 
 import cats.Parallel
+import cats.effect.std.Semaphore
 import cats.effect.{Async, Ref}
 import cats.syntax.all._
 
@@ -43,6 +44,11 @@ trait MptStore[F[_], K] {
     * exact state, undoing any mutations that occurred after the savepoint was created.
     */
   def savepoint: F[MptStoreSavepoint[F]]
+
+  /** Run an effect while holding the MPT mutation lock. Use this to serialize compound operations (e.g. remove + insert + sync) that must
+    * not interleave with syncFull.
+    */
+  def withExclusiveLock[A](fa: F[A]): F[A]
 }
 
 object MptStore {
@@ -51,14 +57,15 @@ object MptStore {
     producer: StatefulMerklePatriciaProducer[F],
     toHex: K => F[Hex]
   ): F[MptStore[F, K]] =
-    Ref.of[F, Option[SnapshotOrdinal]](None).map { lastSyncedOrdinalRef =>
-      new Impl[F, K](producer, toHex, lastSyncedOrdinalRef): MptStore[F, K]
+    (Ref.of[F, Option[SnapshotOrdinal]](None), Semaphore[F](1)).mapN { (lastSyncedOrdinalRef, mutex) =>
+      new Impl[F, K](producer, toHex, lastSyncedOrdinalRef, mutex): MptStore[F, K]
     }
 
   private final class Impl[F[_]: Async: Parallel: Hasher: JsonSerializer, K](
     producer: StatefulMerklePatriciaProducer[F],
     toHex: K => F[Hex],
-    lastSyncedOrdinalRef: Ref[F, Option[SnapshotOrdinal]]
+    lastSyncedOrdinalRef: Ref[F, Option[SnapshotOrdinal]],
+    mutex: Semaphore[F]
   ) extends MptStore[F, K] {
 
     private val logger = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
@@ -207,19 +214,30 @@ object MptStore {
       producer.buildForOrdinal(snapshotOrdinal)
 
     override def syncFull[V: Encoder](newState: Map[K, V], ordinal: SnapshotOrdinal): F[Unit] =
-      if (newState.isEmpty) {
-        logger.info("[MptStore] Empty sync, skipping") >>
-          clear >> lastSyncedOrdinalRef.set(Some(ordinal))
-      } else
-        for {
-          _ <- logger.info(s"[MptStore] Full sync with ${newState.size} entries")
-          _ <- clear
-          newEntries <- toHexEntries(newState)
-          _ <- producer.insertBytes(newEntries).void
-          _ <- persistAsync(ordinal)
-          _ <- build(ordinal)
-          _ <- lastSyncedOrdinalRef.set(Some(ordinal))
-        } yield ()
+      mutex.permit.use { _ =>
+        if (newState.isEmpty) {
+          logger.info("[MptStore] Empty sync, skipping") >>
+            clear >> lastSyncedOrdinalRef.set(Some(ordinal))
+        } else
+          for {
+            currentEntries <- producer.entries
+            currentSize = currentEntries.size
+            _ <-
+              logger
+                .warn(
+                  s"[MptStore] syncFull REDUCING entry count: $currentSize → ${newState.size} at ordinal=$ordinal. " +
+                    s"State loss possible — check upstream context."
+                )
+                .whenA(currentSize > 0 && newState.size < currentSize)
+            _ <- logger.info(s"[MptStore] Full sync with ${newState.size} entries (was $currentSize)")
+            _ <- clear
+            newEntries <- toHexEntries(newState)
+            _ <- producer.insertBytes(newEntries).void
+            _ <- persistAsync(ordinal)
+            _ <- build(ordinal)
+            _ <- lastSyncedOrdinalRef.set(Some(ordinal))
+          } yield ()
+      }
 
     override def syncFullIfNeeded[V: Encoder](newState: => F[Map[K, V]], ordinal: SnapshotOrdinal): F[Unit] =
       // Use atomic modify to prevent race condition where two threads both see needsSync=true
@@ -276,5 +294,8 @@ object MptStore {
           def restore: F[Unit] =
             producerSP.restore >> lastSyncedOrdinalRef.set(savedOrdinal)
         }
+
+    override def withExclusiveLock[A](fa: F[A]): F[A] =
+      mutex.permit.use(_ => fa)
   }
 }

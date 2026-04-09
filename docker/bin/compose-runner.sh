@@ -255,6 +255,9 @@ else
         echo "NAKAMOTO_GENESIS_TIME_MS=$NAKAMOTO_GENESIS_MS"
         echo "NAKAMOTO_SIDECAR_SEEDLIST=$NAKAMOTO_SEEDLIST"
         echo "CL_DOCKER_SEEDLIST=./seedlist.csv"
+        # Ensure genesis.csv is mounted into the container (docker-env-setup.sh
+        # only sets this for node 0; Nakamoto needs it on every node)
+        echo "CL_GENESIS_FILE=./genesis.csv"
         # Override join to false for ALL gl0 nodes — Nakamoto has no BFT cluster
         # join protocol. Validators discover each other via seedlist + sidecar.
         echo "CL_DOCKER_GL0_JOIN=false"
@@ -363,6 +366,16 @@ else
         cp ml0-data/genesis.snapshot .
         cp ml0-data/genesis.address .
         mv .env.bak .env
+      fi
+      # Ensure genesis.snapshot is in ml0-data (clean-data wipes ml0-data/ but
+      # leaves ./genesis.snapshot in the node root, so regeneration is skipped)
+      if [ -f "./genesis.snapshot" ] && [ ! -f "./ml0-data/genesis.snapshot" ]; then
+        mkdir -p ./ml0-data
+        cp ./genesis.snapshot ./ml0-data/genesis.snapshot
+      fi
+      # Set METAGRAPH_ID from genesis.address (may already be exported from
+      # genesis generation above, or read from a previous run's file)
+      if [ -z "$METAGRAPH_ID" ] && [ -f "./genesis.address" ]; then
         export METAGRAPH_ID=$(head -n 1 genesis.address)
       fi
       echo "METAGRAPH_ID=$METAGRAPH_ID" >> .env

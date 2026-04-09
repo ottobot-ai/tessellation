@@ -382,7 +382,7 @@ object GlobalStateConverter {
 
       def syncFromStateChanges(acc: StateChangesAccumulator, snapshotOrdinal: SnapshotOrdinal)(
         implicit stateProofSelector: StateProofSelector
-      ): F[Unit] = {
+      ): F[Unit] = store.withExclusiveLock {
         val syncLogger = Slf4jLogger.getLoggerFromName[F]("MPT.Sync")
         val BatchSize = 5000
 
