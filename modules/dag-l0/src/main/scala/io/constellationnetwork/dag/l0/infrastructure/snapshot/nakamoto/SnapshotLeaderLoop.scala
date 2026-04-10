@@ -178,6 +178,30 @@ object SnapshotLeaderLoop {
     val effectiveGenesisTime = if (genesisTimeMs > 0) genesisTimeMs else System.currentTimeMillis()
 
     Stream.eval(Ref.of[F, LoopState](LoopState.initial(effectiveGenesisTime))).flatMap { stateRef =>
+      // Seed the chain store with the genesis/initial snapshot so gossip children
+      // can find their parent. Retries until the head is available — the SnapshotLeaderLoop
+      // fiber starts before genesis initialization in Main.scala completes.
+      val seedChainStore: Stream[F, Unit] = Stream.eval {
+        def attempt: F[Unit] = snapshotStorage.head.flatMap {
+          case Some((headSigned, headCtx)) =>
+            HasherSelector[F].withCurrent { implicit hasher =>
+              headSigned.toHashed[F].flatMap { hashed =>
+                chainStore.store(headSigned, headCtx, hashed.ordinal.value.value, 0L, hashed.lastSnapshotHash, Array.empty).flatMap {
+                  case true =>
+                    logger.info(
+                      s"🌱 Seeded chain store with genesis: ordinal=${hashed.ordinal} hash=${hashed.hash.value.take(16)}"
+                    )
+                  case false =>
+                    logger.debug(s"Chain store already has genesis at ordinal=${hashed.ordinal}")
+                }
+              }
+            }
+          case None =>
+            Async[F].sleep(1.second) >> attempt
+        }
+        attempt
+      }
+
       val slotTick: Stream[F, Unit] = Stream
         .awakeEvery[F](1.second)
         .evalMap { _ =>
@@ -420,7 +444,7 @@ object SnapshotLeaderLoop {
           } yield ()
         }
 
-      slotTick.merge(finalityMonitor)
+      seedChainStore ++ slotTick.merge(finalityMonitor)
     }
   }
 

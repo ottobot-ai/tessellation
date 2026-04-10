@@ -363,16 +363,20 @@ object GlobalSnapshotConsensus {
             case Some((headSigned, headCtx)) =>
               HasherSelector[F].withCurrent { implicit hasher =>
                 headSigned.toHashed[F].flatMap { hashed =>
-                  chainStore
-                    .store(
-                      headSigned,
-                      headCtx,
-                      hashed.ordinal.value.value,
-                      0L, // slot unknown for genesis
-                      hashed.lastSnapshotHash,
-                      Array.empty // no VRF output for genesis
-                    )
-                    .void
+                  nakLogger.info(
+                    s"🌱 Seeding chain store with genesis: ordinal=${hashed.ordinal} hash=${hashed.hash.value.take(16)} " +
+                      s"lastSnapshotHash=${hashed.lastSnapshotHash.value.take(16)}"
+                  ) >>
+                    chainStore
+                      .store(
+                        headSigned,
+                        headCtx,
+                        hashed.ordinal.value.value,
+                        0L, // slot unknown for genesis
+                        hashed.lastSnapshotHash,
+                        Array.empty // no VRF output for genesis
+                      )
+                      .void
                 }
               }
             case None =>
