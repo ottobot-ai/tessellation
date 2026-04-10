@@ -1076,6 +1076,7 @@ object NakamotoSyncDaemon {
                   targetOrdinal = 1L,
                   currentOrdinal = snap.ordinal,
                   startedAtOrdinal = snap.ordinal,
+                  completedChunks = Set.empty,
                   createdAtMs = System.currentTimeMillis()
                 )
                 Async[F]
