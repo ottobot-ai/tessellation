@@ -1139,8 +1139,29 @@ object GlobalSnapshotAcceptanceManager {
             )
 
             // === MPT Sync with undo journal ===
-            // When undo journal is present: wrap the sync to record before/after state,
-            // enabling O(delta × fork_depth) rollback instead of O(state_size) full rebuild.
+            // Before applying deltas, detect fork switches: if the journal tip doesn't
+            // match ordinal-1 (the parent), the MPT has state from a different fork.
+            // Reset MPT to the parent state first, then apply deltas incrementally.
+            _ <- undoJournal match {
+              case Some(journal) =>
+                journal.currentTipOrdinal.flatMap {
+                  case Some(tipOrd) if tipOrd != ordinal.value.value - 1 =>
+                    // Fork switch: journal tip at ordinal $tipOrd but parent should be ordinal-1.
+                    // Roll back journal to clear stale fork entries, then reset MPT to parent state.
+                    loggerBundle.app.info(
+                      s"[ACCEPTANCE] ordinal=$ordinal fork switch detected: journalTip=$tipOrd, expected=${ordinal.value.value - 1}. " +
+                        s"Resetting MPT to parent state before applying deltas."
+                    ) >>
+                      journal.unapplyTo(0) >>
+                      lastSnapshotContext
+                        .allStateEntries[F]
+                        .flatMap(entries => mptStore.syncFull(entries, SnapshotOrdinal.unsafeApply(ordinal.value.value - 1)))
+                  case _ =>
+                    Async[F].unit // aligned, no rollback needed
+                }
+              case None =>
+                Async[F].unit
+            }
             syncAction = mptStore.syncFromStateChanges(stateChangesAccumulator, ordinal)
             _ <- undoJournal match {
               case Some(journal) =>
