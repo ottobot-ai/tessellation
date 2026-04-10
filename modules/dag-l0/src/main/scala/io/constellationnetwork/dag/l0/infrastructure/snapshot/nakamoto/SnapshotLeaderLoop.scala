@@ -578,15 +578,14 @@ object SnapshotLeaderLoop {
                   )
                 else Async[F].pure(false)
 
-              // Update lastGlobalSnapshotStorage + lastNGlobalSnapshotStorage
-              // Use setForRecovery (force-set) instead of set (strict ordinal validation)
-              // because in Nakamoto mode, gossip may have advanced storage past our parent
+              // Update ALL snapshot storages — snapshotStorage.head is what the leader loop
+              // reads on the next slot to determine the parent ordinal. Without this, the
+              // leader loop re-reads the last GOSSIP ordinal and re-produces the same ordinal.
               _ <- Async[F].whenA(stored) {
-                lastGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
+                snapshotStorage.setHeadForRecovery(signed, context) >>
+                  lastGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
                   lastNGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
                   lastKnownSlotRef.set(Some(currentSlot)) >>
-                  // Successful production proves the parent's context was valid.
-                  // Confirm the parent (which may be tentative from a reorg) to disk.
                   snapshotStorage.confirmHead(parentHashValue)
               }
 
