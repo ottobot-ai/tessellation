@@ -247,9 +247,18 @@ object SnapshotStorage {
 
         def setHeadForRecovery(snapshot: Signed[S], state: C)(implicit hasher: Hasher[F]): F[Unit] =
           logger.info(s"[SnapshotStorage] Recovery: setting head to ordinal=${snapshot.ordinal.show}") >>
-            // Delete existing file at this ordinal to avoid collision (Nakamoto reorgs
-            // can produce different snapshots at the same ordinal)
-            snapshotLocalFileSystemStorage.delete(snapshot.ordinal).attempt.void >>
+            // Only delete existing file if a DIFFERENT snapshot exists at this ordinal
+            // (Nakamoto reorgs). Don't delete when the same snapshot is re-stored (genesis seeding).
+            snapshot.toHashed.flatMap { hashed =>
+              getHash(snapshot.ordinal).flatMap {
+                case Some(existingHash) if existingHash =!= hashed.hash =>
+                  logger.info(s"[SnapshotStorage] Replacing snapshot at ordinal=${snapshot.ordinal.show} (old=${existingHash.show
+                      .take(12)}, new=${hashed.hash.show.take(12)})") >>
+                    snapshotLocalFileSystemStorage.delete(snapshot.ordinal).attempt.void
+                case _ =>
+                  Async[F].unit
+              }
+            } >>
             enqueue(snapshot, state) >>
             headRef.set((snapshot, hasher, state).some).void
 
