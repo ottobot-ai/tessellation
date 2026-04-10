@@ -9,23 +9,27 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/scasplte2/tessellation/p2p/internal/chainsync"
 	"github.com/scasplte2/tessellation/p2p/internal/gossip"
 	pb "github.com/scasplte2/tessellation/p2p/proto"
 )
 
-// Server implements the SidecarService gRPC interface.
+// Server implements the SidecarService and ChainSyncOutbound gRPC interfaces.
 type Server struct {
 	pb.UnimplementedSidecarServiceServer
+	pb.UnimplementedChainSyncOutboundServer
 
 	node      *gossip.Node
+	chainSync *chainsync.Handler
 	startedAt time.Time
 	grpcSrv   *grpc.Server
 }
 
 // New creates a gRPC server backed by the gossip node.
-func New(node *gossip.Node) *Server {
+func New(node *gossip.Node, cs *chainsync.Handler) *Server {
 	return &Server{
 		node:      node,
+		chainSync: cs,
 		startedAt: time.Now(),
 	}
 }
@@ -39,6 +43,7 @@ func (s *Server) Start(addr string) error {
 
 	s.grpcSrv = grpc.NewServer()
 	pb.RegisterSidecarServiceServer(s.grpcSrv, s)
+	pb.RegisterChainSyncOutboundServer(s.grpcSrv, s)
 
 	fmt.Printf("gRPC server listening on %s\n", addr)
 	return s.grpcSrv.Serve(lis)
@@ -169,4 +174,39 @@ func (s *Server) Health(ctx context.Context, req *pb.HealthRequest) (*pb.HealthR
 		UptimeSeconds: uptime,
 		PeerCount:     int32(peerCount),
 	}, nil
+}
+
+// ─── ChainSyncOutbound: JVM requests chain data from the network ────
+
+// FetchSnapshots fetches specific snapshots by hash from a peer.
+func (s *Server) FetchSnapshots(req *pb.FetchSnapshotsRequest, stream pb.ChainSyncOutbound_FetchSnapshotsServer) error {
+	if s.chainSync == nil {
+		return fmt.Errorf("ChainSync not initialized")
+	}
+	snapshots, err := s.chainSync.FetchSnapshots(stream.Context(), req.Hashes)
+	if err != nil {
+		return err
+	}
+	for _, snap := range snapshots {
+		if err := stream.Send(snap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// FindIntersection finds the common ancestor between local and remote chains.
+func (s *Server) FindIntersection(ctx context.Context, req *pb.FindIntersectionRequest) (*pb.FindIntersectionResponse, error) {
+	if s.chainSync == nil {
+		return nil, fmt.Errorf("ChainSync not initialized")
+	}
+	return s.chainSync.FindIntersection(ctx, req.Points)
+}
+
+// GetPeerTip returns a random peer's current best tip.
+func (s *Server) GetPeerTip(ctx context.Context, req *pb.GetPeerTipRequest) (*pb.PeerTipResponse, error) {
+	if s.chainSync == nil {
+		return nil, fmt.Errorf("ChainSync not initialized")
+	}
+	return s.chainSync.GetPeerTip(ctx)
 }

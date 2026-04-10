@@ -105,3 +105,70 @@ message HealthResponse {
   int64 uptime_seconds = 2;
   int32 peer_count = 3;
 }
+
+// ─── ChainSync: Active Parent Fetching ──────────────────────────────
+// Request-response protocol for fetching missing chain segments from peers.
+// Inspired by Bitcoin (hash-based walk-back), Cardano (intersection finding),
+// Polkadot (libp2p stream protocol), Ethereum (batch fetching).
+
+// A point on a chain, used for intersection finding.
+message ChainPoint {
+  bytes hash = 1;
+  int64 ordinal = 2;
+}
+
+// Request specific snapshots by hash (up to 64 per request).
+message FetchSnapshotsRequest {
+  repeated bytes hashes = 1;
+}
+
+// Find the most recent common ancestor between two chains.
+// Client sends sparse chain points (e.g. tip, tip-1, tip-2, tip-4, tip-8, ...genesis).
+message FindIntersectionRequest {
+  repeated ChainPoint points = 1;
+}
+
+message FindIntersectionResponse {
+  bool found = 1;
+  bytes intersection_hash = 2;
+  int64 intersection_ordinal = 3;
+  bytes tip_hash = 4;       // responder's current best tip
+  int64 tip_ordinal = 5;
+}
+
+message GetPeerTipRequest {}
+
+message PeerTipResponse {
+  bytes hash = 1;
+  int64 ordinal = 2;
+  int64 slot = 3;
+}
+
+message ServeSnapshotsRequest {
+  repeated bytes hashes = 1;
+}
+
+message ServeChainPointsRequest {}
+
+message ServeChainPointsResponse {
+  repeated ChainPoint points = 1;
+  bytes tip_hash = 2;
+  int64 tip_ordinal = 3;
+}
+
+// JVM → Sidecar: request chain data from the network.
+// The sidecar picks a peer, opens a libp2p stream, relays the request,
+// and streams the response back to the JVM.
+service ChainSyncOutbound {
+  rpc FetchSnapshots(FetchSnapshotsRequest) returns (stream Snapshot);
+  rpc FindIntersection(FindIntersectionRequest) returns (FindIntersectionResponse);
+  rpc GetPeerTip(GetPeerTipRequest) returns (PeerTipResponse);
+}
+
+// Sidecar → JVM: serve local chain data to incoming network requests.
+// When a peer asks our sidecar for snapshots, the sidecar calls these
+// methods on the JVM to fulfill the request.
+service ChainSyncInbound {
+  rpc ServeSnapshots(ServeSnapshotsRequest) returns (stream Snapshot);
+  rpc ServeChainPoints(ServeChainPointsRequest) returns (ServeChainPointsResponse);
+}

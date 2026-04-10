@@ -17,6 +17,7 @@ import (
 	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"github.com/scasplte2/tessellation/p2p/internal/chainsync"
 	"github.com/scasplte2/tessellation/p2p/internal/config"
 	"github.com/scasplte2/tessellation/p2p/internal/gossip"
 	"github.com/scasplte2/tessellation/p2p/internal/grpcserver"
@@ -32,12 +33,14 @@ func main() {
 		seedlist       string
 		httpAddr       string
 		enableHTTP     bool
+		jvmGRPCAddr    string
 	)
 	flag.StringVar(&listenAddrs, "listen", "/ip4/0.0.0.0/tcp/9500", "comma-separated libp2p listen multiaddrs")
 	flag.StringVar(&seedlist, "seedlist", "", "comma-separated bootstrap peer multiaddrs")
 	flag.StringVar(&cfg.GRPCAddr, "grpc", cfg.GRPCAddr, "gRPC listen address for JVM")
 	flag.StringVar(&httpAddr, "http", "127.0.0.1:50052", "HTTP bridge listen address (debug/fallback)")
 	flag.BoolVar(&enableHTTP, "enable-http", false, "enable HTTP bridge (debug/fallback, gRPC is the primary interface)")
+	flag.StringVar(&jvmGRPCAddr, "jvm-grpc", "127.0.0.1:50053", "JVM ChainSyncInbound gRPC address (sidecar calls JVM to serve peer requests)")
 	flag.StringVar(&cfg.PrivateKeyPath, "key", "", "path to Ed25519 private key file")
 	flag.StringVar(&cfg.MetricsAddr, "metrics", "", "Prometheus metrics address (empty = disabled)")
 	flag.BoolVar(&cfg.DisableMdns, "disable-mdns", false, "disable mDNS peer discovery (force DHT-only — for multi-host validation)")
@@ -193,8 +196,16 @@ func main() {
 		}()
 	}
 
+	// Start ChainSync protocol handler (libp2p stream-based request-response)
+	csHandler, err := chainsync.New(node.Host, jvmGRPCAddr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "WARN: ChainSync init: %v (will operate without active parent fetching)\n", err)
+	} else {
+		fmt.Printf("  ChainSync: /nakamoto/chainsync/1.0.0 (JVM inbound: %s)\n", jvmGRPCAddr)
+	}
+
 	// Start gRPC server (blocks until shutdown)
-	srv := grpcserver.New(node)
+	srv := grpcserver.New(node, csHandler)
 	go func() {
 		<-ctx.Done()
 		srv.Stop()

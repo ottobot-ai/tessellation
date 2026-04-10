@@ -1,0 +1,384 @@
+// Package chainsync implements a libp2p request-response protocol for fetching
+// missing chain segments from peers. This enables active parent resolution when
+// GossipSub delivers snapshots out of order, and bootstrapping for new peers.
+//
+// Protocol: /nakamoto/chainsync/1.0.0
+// Wire format: length-prefixed protobuf over libp2p streams
+//
+// The sidecar acts as a relay — it does not store snapshots itself. Incoming
+// requests from peers are forwarded to the local JVM via ChainSyncInbound gRPC.
+// Outgoing requests from the JVM are forwarded to a peer via libp2p streams.
+package chainsync
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"math/rand"
+	"sync"
+	"time"
+
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/protocol"
+	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
+
+	pb "github.com/scasplte2/tessellation/p2p/proto"
+)
+
+const (
+	ProtocolID     = protocol.ID("/nakamoto/chainsync/1.0.0")
+	MaxMessageSize = 16 * 1024 * 1024 // 16 MB max per message
+	RequestTimeout = 30 * time.Second
+	MaxHashesPerRequest = 64
+	RateLimitPerPeer    = 10 // requests per minute
+)
+
+// Handler manages the ChainSync libp2p protocol. It registers a stream handler
+// on the host for incoming requests and provides methods for outgoing requests.
+type Handler struct {
+	host      host.Host
+	jvmConn   *grpc.ClientConn // gRPC connection to JVM's ChainSyncInbound server
+	mu        sync.RWMutex
+	peerFails map[peer.ID]time.Time // blacklist: peer -> unblock time
+}
+
+// New creates a ChainSync handler and registers the libp2p stream handler.
+func New(h host.Host, jvmAddr string) (*Handler, error) {
+	// Connect to JVM's ChainSyncInbound gRPC server.
+	// If the JVM server isn't up yet, we'll retry on each incoming request.
+	conn, err := grpc.Dial(jvmAddr, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithTimeout(10*time.Second))
+	if err != nil {
+		// Non-fatal: JVM may not have ChainSync server yet. Log and continue.
+		fmt.Printf("[chainsync] Warning: could not connect to JVM at %s: %v (will retry)\n", jvmAddr, err)
+		conn = nil
+	}
+
+	handler := &Handler{
+		host:      h,
+		jvmConn:   conn,
+		peerFails: make(map[peer.ID]time.Time),
+	}
+
+	// Register stream handler for incoming requests from peers
+	h.SetStreamHandler(ProtocolID, handler.handleIncoming)
+
+	return handler, nil
+}
+
+// handleIncoming processes an incoming ChainSync request from a remote peer.
+// It reads the request, calls the local JVM to get the data, and writes back.
+func (h *Handler) handleIncoming(s network.Stream) {
+	defer s.Close()
+
+	remotePeer := s.Conn().RemotePeer()
+
+	// Read request type (1 byte) + length-prefixed protobuf
+	reqType := make([]byte, 1)
+	if _, err := io.ReadFull(s, reqType); err != nil {
+		fmt.Printf("[chainsync] Failed to read request type from %s: %v\n", remotePeer, err)
+		return
+	}
+
+	data, err := readLengthPrefixed(s)
+	if err != nil {
+		fmt.Printf("[chainsync] Failed to read request from %s: %v\n", remotePeer, err)
+		return
+	}
+
+	switch reqType[0] {
+	case 0x01: // FetchSnapshots
+		h.serveFetchSnapshots(s, data, remotePeer)
+	case 0x02: // FindIntersection
+		h.serveFindIntersection(s, data, remotePeer)
+	case 0x03: // GetPeerTip
+		h.serveGetPeerTip(s, remotePeer)
+	default:
+		fmt.Printf("[chainsync] Unknown request type 0x%02x from %s\n", reqType[0], remotePeer)
+	}
+}
+
+func (h *Handler) serveFetchSnapshots(s network.Stream, data []byte, from peer.ID) {
+	if h.jvmConn == nil {
+		fmt.Printf("[chainsync] No JVM connection, cannot serve snapshots to %s\n", from)
+		return
+	}
+
+	var req pb.ServeSnapshotsRequest
+	if err := proto.Unmarshal(data, &req); err != nil {
+		fmt.Printf("[chainsync] Failed to unmarshal FetchSnapshots from %s: %v\n", from, err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
+	defer cancel()
+
+	client := pb.NewChainSyncInboundClient(h.jvmConn)
+	stream, err := client.ServeSnapshots(ctx, &req)
+	if err != nil {
+		fmt.Printf("[chainsync] JVM ServeSnapshots failed: %v\n", err)
+		return
+	}
+
+	// Relay snapshots back to the requesting peer
+	for {
+		snap, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Printf("[chainsync] JVM ServeSnapshots stream error: %v\n", err)
+			break
+		}
+		respBytes, _ := proto.Marshal(snap)
+		if err := writeLengthPrefixed(s, respBytes); err != nil {
+			break
+		}
+	}
+}
+
+func (h *Handler) serveFindIntersection(s network.Stream, data []byte, from peer.ID) {
+	if h.jvmConn == nil {
+		return
+	}
+
+	// For FindIntersection, we forward the request as ServeChainPoints and compare
+	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
+	defer cancel()
+
+	client := pb.NewChainSyncInboundClient(h.jvmConn)
+	localPoints, err := client.ServeChainPoints(ctx, &pb.ServeChainPointsRequest{})
+	if err != nil {
+		fmt.Printf("[chainsync] JVM ServeChainPoints failed: %v\n", err)
+		return
+	}
+
+	// Parse the incoming intersection request
+	var req pb.FindIntersectionRequest
+	if err := proto.Unmarshal(data, &req); err != nil {
+		return
+	}
+
+	// Find intersection: check if any of the requester's points match our chain
+	localPointSet := make(map[string]int64)
+	for _, p := range localPoints.Points {
+		localPointSet[string(p.Hash)] = p.Ordinal
+	}
+
+	resp := &pb.FindIntersectionResponse{Found: false}
+	if localPoints.TipHash != nil {
+		resp.TipHash = localPoints.TipHash
+		resp.TipOrdinal = localPoints.TipOrdinal
+	}
+
+	for _, p := range req.Points {
+		if _, ok := localPointSet[string(p.Hash)]; ok {
+			resp.Found = true
+			resp.IntersectionHash = p.Hash
+			resp.IntersectionOrdinal = p.Ordinal
+			break
+		}
+	}
+
+	respBytes, _ := proto.Marshal(resp)
+	writeLengthPrefixed(s, respBytes)
+}
+
+func (h *Handler) serveGetPeerTip(s network.Stream, from peer.ID) {
+	if h.jvmConn == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
+	defer cancel()
+
+	client := pb.NewChainSyncInboundClient(h.jvmConn)
+	localPoints, err := client.ServeChainPoints(ctx, &pb.ServeChainPointsRequest{})
+	if err != nil {
+		return
+	}
+
+	resp := &pb.PeerTipResponse{
+		Hash:    localPoints.TipHash,
+		Ordinal: localPoints.TipOrdinal,
+	}
+	respBytes, _ := proto.Marshal(resp)
+	writeLengthPrefixed(s, respBytes)
+}
+
+// FetchSnapshots sends a FetchSnapshots request to a random peer and returns
+// the response snapshots. Called by the JVM via ChainSyncOutbound gRPC.
+func (h *Handler) FetchSnapshots(ctx context.Context, hashes [][]byte) ([]*pb.Snapshot, error) {
+	if len(hashes) > MaxHashesPerRequest {
+		return nil, fmt.Errorf("too many hashes: %d > %d", len(hashes), MaxHashesPerRequest)
+	}
+
+	target, err := h.pickPeer()
+	if err != nil {
+		return nil, err
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	defer cancel()
+
+	s, err := h.host.NewStream(reqCtx, target, ProtocolID)
+	if err != nil {
+		h.markFailed(target)
+		return nil, fmt.Errorf("stream to %s failed: %w", target, err)
+	}
+	defer s.Close()
+
+	// Write request: type byte + length-prefixed protobuf
+	req := &pb.FetchSnapshotsRequest{Hashes: hashes}
+	reqBytes, _ := proto.Marshal(req)
+	if _, err := s.Write([]byte{0x01}); err != nil {
+		h.markFailed(target)
+		return nil, err
+	}
+	if err := writeLengthPrefixed(s, reqBytes); err != nil {
+		h.markFailed(target)
+		return nil, err
+	}
+	// Signal we're done writing
+	s.CloseWrite()
+
+	// Read response snapshots
+	var snapshots []*pb.Snapshot
+	for {
+		data, err := readLengthPrefixed(s)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			h.markFailed(target)
+			return snapshots, err
+		}
+		var snap pb.Snapshot
+		if err := proto.Unmarshal(data, &snap); err != nil {
+			continue
+		}
+		snapshots = append(snapshots, &snap)
+	}
+
+	return snapshots, nil
+}
+
+// FindIntersection sends a FindIntersection request to a random peer.
+func (h *Handler) FindIntersection(ctx context.Context, points []*pb.ChainPoint) (*pb.FindIntersectionResponse, error) {
+	target, err := h.pickPeer()
+	if err != nil {
+		return nil, err
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	defer cancel()
+
+	s, err := h.host.NewStream(reqCtx, target, ProtocolID)
+	if err != nil {
+		h.markFailed(target)
+		return nil, fmt.Errorf("stream to %s failed: %w", target, err)
+	}
+	defer s.Close()
+
+	req := &pb.FindIntersectionRequest{Points: points}
+	reqBytes, _ := proto.Marshal(req)
+	s.Write([]byte{0x02})
+	writeLengthPrefixed(s, reqBytes)
+	s.CloseWrite()
+
+	data, err := readLengthPrefixed(s)
+	if err != nil {
+		h.markFailed(target)
+		return nil, err
+	}
+
+	var resp pb.FindIntersectionResponse
+	if err := proto.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// GetPeerTip asks a random peer for its current best tip.
+func (h *Handler) GetPeerTip(ctx context.Context) (*pb.PeerTipResponse, error) {
+	target, err := h.pickPeer()
+	if err != nil {
+		return nil, err
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	defer cancel()
+
+	s, err := h.host.NewStream(reqCtx, target, ProtocolID)
+	if err != nil {
+		h.markFailed(target)
+		return nil, fmt.Errorf("stream to %s failed: %w", target, err)
+	}
+	defer s.Close()
+
+	s.Write([]byte{0x03})
+	s.CloseWrite()
+
+	data, err := readLengthPrefixed(s)
+	if err != nil {
+		h.markFailed(target)
+		return nil, err
+	}
+
+	var resp pb.PeerTipResponse
+	if err := proto.Unmarshal(data, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+func (h *Handler) pickPeer() (peer.ID, error) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	now := time.Now()
+	peers := h.host.Network().Peers()
+	var candidates []peer.ID
+	for _, p := range peers {
+		if unblock, ok := h.peerFails[p]; ok && now.Before(unblock) {
+			continue
+		}
+		candidates = append(candidates, p)
+	}
+	if len(candidates) == 0 {
+		return "", fmt.Errorf("no available peers for ChainSync")
+	}
+	return candidates[rand.Intn(len(candidates))], nil
+}
+
+func (h *Handler) markFailed(p peer.ID) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.peerFails[p] = time.Now().Add(60 * time.Second)
+}
+
+// Wire helpers: length-prefixed protobuf framing
+
+func readLengthPrefixed(r io.Reader) ([]byte, error) {
+	var length uint32
+	if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+		return nil, err
+	}
+	if length > MaxMessageSize {
+		return nil, fmt.Errorf("message too large: %d bytes", length)
+	}
+	data := make([]byte, length)
+	_, err := io.ReadFull(r, data)
+	return data, err
+}
+
+func writeLengthPrefixed(w io.Writer, data []byte) error {
+	if err := binary.Write(w, binary.BigEndian, uint32(len(data))); err != nil {
+		return err
+	}
+	_, err := w.Write(data)
+	return err
+}
