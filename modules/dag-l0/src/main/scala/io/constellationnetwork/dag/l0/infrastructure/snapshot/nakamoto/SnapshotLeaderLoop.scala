@@ -644,6 +644,10 @@ object SnapshotLeaderLoop {
                     attestedAt = slotRefined
                   )
                   tipTracker.recordAttestation(selfId, selfAttestation)
+                  // TODO: broadcast signed attestation via sidecarClient.publishAttestation
+                  // Requires: sign(tipHash || tipSlot) with keyPair
+                  // Also: validators should attest+broadcast AFTER adopting a validated gossip snapshot
+                  // (in processValidSnapshot path of NakamotoSyncDaemon)
                 } >>
                   logger.info(
                     s"Produced snapshot ordinal=${lastKey.value.value + 1} slot=$currentSlot " +
