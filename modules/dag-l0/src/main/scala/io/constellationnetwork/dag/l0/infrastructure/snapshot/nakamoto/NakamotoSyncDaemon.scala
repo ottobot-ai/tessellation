@@ -423,22 +423,35 @@ object NakamotoSyncDaemon {
                 getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
               )
             case None =>
-              // Parent not in chain store — buffer this snapshot for later validation.
-              // When the parent arrives (via gossip), we'll validate this snapshot against it.
-              // DON'T fall back to the local head — that produces a guaranteed content mismatch.
-              logger.info(
-                s"⏳ Parent ${parentHash.value.take(12)} not in chain store for ordinal=${snap.ordinal} slot=${snap.slot}. " +
-                  s"Buffering for validation when parent arrives."
-              ) >>
-                pendingParentRef.update { m =>
-                  val existing = m.getOrElse(parentHash, List.empty)
-                  m.updated(parentHash, existing :+ snap)
-                } >>
-                // Actively fetch the missing parent from a peer (background fiber)
-                chainSyncManager.requestMissing(parentHash) >>
-                Async[F].pure(
-                  NakamotoSnapshotValidator.Invalid("Parent not in chain store (buffered)"): NakamotoSnapshotValidator.ValidationResult
-                )
+              // Parent not in chain store. Two cases:
+              // 1. Small gap: buffer and fetch parent via ChainSync (normal operation)
+              // 2. Large gap: we're far behind the network — catch up immediately
+              chainStore.bestTipOrdinal.flatMap { localBestOrdinal =>
+                val localOrd = localBestOrdinal.getOrElse(0L)
+                val gap = snap.ordinal - localOrd
+                if (gap >= CatchUpThreshold) {
+                  // Large gap — we're behind. Catch up from this gossip snapshot.
+                  // Buffering won't help because the parent chain diverged from ours.
+                  Async[F].pure(
+                    NakamotoSnapshotValidator.Invalid("No parent found"): NakamotoSnapshotValidator.ValidationResult
+                  )
+                } else {
+                  // Small gap — parent should arrive soon via gossip or ChainSync
+                  logger.info(
+                    s"⏳ Parent ${parentHash.value.take(12)} not in chain store for ordinal=${snap.ordinal} slot=${snap.slot} (gap=$gap). " +
+                      s"Buffering for validation when parent arrives."
+                  ) >>
+                    pendingParentRef.update { m =>
+                      val existing = m.getOrElse(parentHash, List.empty)
+                      m.updated(parentHash, existing :+ snap)
+                    } >>
+                    // Actively fetch the missing parent from a peer (background fiber)
+                    chainSyncManager.requestMissing(parentHash) >>
+                    Async[F].pure(
+                      NakamotoSnapshotValidator.Invalid("Parent not in chain store (buffered)"): NakamotoSnapshotValidator.ValidationResult
+                    )
+                }
+              }
           }
         case None =>
           // No payload — fall back to VRF-only validation (legacy/PoC)
@@ -964,12 +977,15 @@ object NakamotoSyncDaemon {
                 vrfOutputFromProof(snap.vrfProof.toByteArray)
               )
 
-              // Update canonical storages
+              // Update ALL canonical storages — snapshotStorage is what SnapshotLeaderLoop
+              // reads for its parent. Without this, the leader loop produces at the OLD ordinal
+              // after catch-up, causing the node to fall behind again immediately.
               _ <- HasherSelector[F].withCurrent { implicit hasher =>
-                signedSnapshot.toHashed[F].flatMap { hashed =>
-                  lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
-                    lastNGlobalSnapshotStorage.setForRecovery(hashed, context)
-                }
+                snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
+                  signedSnapshot.toHashed[F].flatMap { hashed =>
+                    lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
+                      lastNGlobalSnapshotStorage.setForRecovery(hashed, context)
+                  }
               }
 
               // MPT full sync from the context we received — critical for
