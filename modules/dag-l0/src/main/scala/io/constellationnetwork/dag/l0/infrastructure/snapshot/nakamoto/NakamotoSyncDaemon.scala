@@ -48,6 +48,13 @@ object NakamotoSyncDaemon {
 
   private val CatchUpThreshold = 6L
   private val CatchUpCooldownMs = 10000L // Don't retry catch-up more often than every 10s
+
+  /** Confirmation depth k — same as SnapshotLeaderLoop.ConfirmationDepthK. Used as the boundary between Tier 2 (sequential walk-back) and
+    * Tier 3 (full catch-up + backfill). Gaps > k mean the network has finalized past our tip; sequential fetch won't work.
+    */
+  private val ConfirmationDepthK: Long =
+    sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH").flatMap(_.toLongOption).getOrElse(31L)
+
   private val vrf = new EcVrf25519()
 
   /** Derive VRF output from proof bytes. The chain store needs the output (not the proof) for eta computation. The producer stores
@@ -423,29 +430,50 @@ object NakamotoSyncDaemon {
                 getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
               )
             case None =>
-              // Parent not in chain store. Two cases:
-              // 1. Small gap: buffer and fetch parent via ChainSync (normal operation)
-              // 2. Large gap: we're far behind the network — catch up immediately
+              // Parent not in chain store. Three-tier gap handling:
+              // Tier 1 (<=6): buffer + ChainSync parent fetch (normal gossip latency)
+              // Tier 2 (>6, <=k): sequential walk-back via ChainSync (moderate drift)
+              // Tier 3 (>k): full catch-up — network finalized past us
               chainStore.bestTipOrdinal.flatMap { localBestOrdinal =>
                 val localOrd = localBestOrdinal.getOrElse(0L)
                 val gap = snap.ordinal - localOrd
-                if (gap >= CatchUpThreshold) {
-                  // Large gap — we're behind. Catch up from this gossip snapshot.
-                  // Buffering won't help because the parent chain diverged from ours.
-                  Async[F].pure(
-                    NakamotoSnapshotValidator.Invalid("No parent found"): NakamotoSnapshotValidator.ValidationResult
-                  )
-                } else {
-                  // Small gap — parent should arrive soon via gossip or ChainSync
+                if (gap > ConfirmationDepthK) {
+                  // Tier 3: network finalized past our tip — full catch-up + backfill
+                  logger.warn(
+                    s"🔄 Tier 3: gap=$gap > k=$ConfirmationDepthK for ordinal=${snap.ordinal}. Triggering full catch-up."
+                  ) >>
+                    Async[F].pure(
+                      NakamotoSnapshotValidator.Invalid("No parent found"): NakamotoSnapshotValidator.ValidationResult
+                    )
+                } else if (gap > CatchUpThreshold) {
+                  // Tier 2: moderate gap — sequential walk-back. Buffer this snapshot
+                  // and aggressively fetch parents via ChainSync. The parent chain
+                  // hasn't been finalized yet, so peers still have the snapshots.
                   logger.info(
-                    s"⏳ Parent ${parentHash.value.take(12)} not in chain store for ordinal=${snap.ordinal} slot=${snap.slot} (gap=$gap). " +
-                      s"Buffering for validation when parent arrives."
+                    s"⏳ Tier 2: gap=$gap (>$CatchUpThreshold, <=$ConfirmationDepthK) for ordinal=${snap.ordinal}. " +
+                      s"Sequential walk-back from parent ${parentHash.value.take(12)}."
                   ) >>
                     pendingParentRef.update { m =>
                       val existing = m.getOrElse(parentHash, List.empty)
                       m.updated(parentHash, existing :+ snap)
                     } >>
-                    // Actively fetch the missing parent from a peer (background fiber)
+                    // Fetch the missing parent — when it arrives and is stored,
+                    // drainPendingChildren will validate this buffered snapshot.
+                    // If THAT parent is also missing, ChainSync will recursively
+                    // fetch it too (handleSnapshot → buffer → requestMissing).
+                    chainSyncManager.requestMissing(parentHash) >>
+                    Async[F].pure(
+                      NakamotoSnapshotValidator.Invalid("Parent not in chain store (buffered)"): NakamotoSnapshotValidator.ValidationResult
+                    )
+                } else {
+                  // Tier 1: small gap — parent should arrive soon via gossip or ChainSync
+                  logger.info(
+                    s"⏳ Tier 1: Parent ${parentHash.value.take(12)} not in chain store for ordinal=${snap.ordinal} (gap=$gap). Buffering."
+                  ) >>
+                    pendingParentRef.update { m =>
+                      val existing = m.getOrElse(parentHash, List.empty)
+                      m.updated(parentHash, existing :+ snap)
+                    } >>
                     chainSyncManager.requestMissing(parentHash) >>
                     Async[F].pure(
                       NakamotoSnapshotValidator.Invalid("Parent not in chain store (buffered)"): NakamotoSnapshotValidator.ValidationResult

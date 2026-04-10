@@ -6,7 +6,10 @@ import cats.syntax.all._
 
 import scala.concurrent.{ExecutionContext, Future}
 
+import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
+import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo}
+import io.constellationnetwork.security.HasherSelector
 import io.constellationnetwork.security.hash.Hash
 
 import io.grpc.stub.StreamObserver
@@ -15,7 +18,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 /** Implements the ChainSyncInbound gRPC service — serves local chain data to peer requests relayed through the sidecar.
   *
   * When a remote peer asks for snapshots by hash or chain points, the sidecar calls these methods on the JVM, which looks up data in the
-  * NakamotoChainStore.
+  * NakamotoChainStore with disk fallback via SnapshotStorage.
   */
 object ChainSyncServer {
 
@@ -31,40 +34,49 @@ object ChainSyncServer {
         responseObserver: StreamObserver[pb.Snapshot]
       ): Unit =
         dispatcher.unsafeRunAndForget {
-          Async[F].delay {
-            val hashes = request.hashes.map(h => Hash(new String(h.toByteArray, java.nio.charset.StandardCharsets.UTF_8)))
+          val hashes = request.hashes.map(h => Hash(new String(h.toByteArray, java.nio.charset.StandardCharsets.UTF_8)))
 
-            // Look up each hash in the chain store and stream back
-            hashes.foreach { hash =>
-              val result = dispatcher.unsafeRunSync(chainStore.get(hash))
-              result match {
-                case Some(stored) =>
-                  // Reconstruct the pb.Snapshot from the stored data
-                  val payload = {
-                    import io.circe.syntax._
-                    val snapshotJson = stored.signedSnapshot.asJson
-                    val contextJson = stored.context.asJson
-                    val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
-                    combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                  }
+          dispatcher.unsafeRunSync(
+            logger.info(s"ChainSync SERVE: ${hashes.size} hash(es) requested: ${hashes.map(_.value.take(12)).mkString(",")}")
+          )
 
-                  val snap = pb.Snapshot(
-                    hash = com.google.protobuf.ByteString.copyFrom(stored.hash.value.getBytes),
-                    slot = stored.slot,
-                    ordinal = stored.ordinal,
-                    parentHash = com.google.protobuf.ByteString.copyFrom(stored.parentHash.value.getBytes),
-                    payload = com.google.protobuf.ByteString.copyFrom(payload),
-                    vrfProof = com.google.protobuf.ByteString.copyFrom(stored.vrfOutput)
-                  )
-                  responseObserver.onNext(snap)
+          hashes.toList.traverse_ { hash =>
+            // Try chain store first (in-memory, has full StoredSnapshot with context)
+            chainStore.get(hash).flatMap {
+              case Some(stored) =>
+                val payload = {
+                  import io.circe.syntax._
+                  val snapshotJson = stored.signedSnapshot.asJson
+                  val contextJson = stored.context.asJson
+                  val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
+                  combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                }
+                // Extract VRF proof, public key, and producer ID from the SlotCertificate.
+                // stored.vrfOutput is the VRF OUTPUT (hash of gamma), NOT the proof.
+                // The validator needs the actual proof bytes for verification.
+                val cert = stored.signedSnapshot.value.slotCertificate
+                val vrfProofBytes = cert.map(_.vrfProof.value.toBytes).getOrElse(Array.empty[Byte])
+                val vrfPkBytes = cert.map(_.vrfPublicKey.value.toBytes).getOrElse(Array.empty[Byte])
+                val producerIdBytes = stored.signedSnapshot.proofs.head.id.hex.toBytes
+                val parentSlot = cert.map(_.parentSlot.value.value).getOrElse(0L)
+                val snap = pb.Snapshot(
+                  hash = com.google.protobuf.ByteString.copyFrom(stored.hash.value.getBytes),
+                  slot = stored.slot,
+                  ordinal = stored.ordinal,
+                  parentHash = com.google.protobuf.ByteString.copyFrom(stored.parentHash.value.getBytes),
+                  payload = com.google.protobuf.ByteString.copyFrom(payload),
+                  vrfProof = com.google.protobuf.ByteString.copyFrom(vrfProofBytes),
+                  vrfPublicKey = com.google.protobuf.ByteString.copyFrom(vrfPkBytes),
+                  producerId = com.google.protobuf.ByteString.copyFrom(producerIdBytes),
+                  parentSlot = parentSlot
+                )
+                Async[F].delay(responseObserver.onNext(snap))
 
-                case None =>
-                  // Hash not found — skip it (peer will notice the gap)
-                  ()
-              }
+              case None =>
+                logger.info(s"ChainSync SERVE: hash ${hash.value.take(12)} NOT in chain store") >>
+                  Async[F].unit
             }
-            responseObserver.onCompleted()
-          }
+          } >> Async[F].delay(responseObserver.onCompleted())
         }
 
       override def serveChainPoints(
