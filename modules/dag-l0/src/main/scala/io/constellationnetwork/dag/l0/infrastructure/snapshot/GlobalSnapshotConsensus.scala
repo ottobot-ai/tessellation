@@ -494,6 +494,7 @@ object GlobalSnapshotConsensus {
                 stakeRegistry = stakeRegistry,
                 sidecarClient = sidecarClient,
                 selfId = selfId,
+                keyPair = keyPair,
                 lddConfig = lddConfig,
                 lastKnownSlotRef = lastKnownSlotRef,
                 epochStateRef = epochStateRef,

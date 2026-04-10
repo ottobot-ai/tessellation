@@ -9,6 +9,7 @@ import scala.concurrent.duration._
 
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
+import io.constellationnetwork.ext.crypto._
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
@@ -27,11 +28,13 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.security.signature.signature.{Signature => SigValue}
 import io.constellationnetwork.security.vrf.VrfKeyDeriver
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
 import fs2.Stream
+import io.estatico.newtype.ops._
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Shared epoch state — used by BOTH SnapshotLeaderLoop (production) and NakamotoSyncDaemon (gossip).
@@ -338,7 +341,6 @@ object SnapshotLeaderLoop {
         .evalMap { _ =>
           for {
             allAtts <- tipTracker.allAttestations
-            heaviest <- tipTracker.heaviestTip
             validatorCount <- stakeRegistry.validatorCount
             activeCount <- stakeRegistry.observedActiveCount
             bestTip <- chainStore.bestTip
@@ -397,48 +399,44 @@ object SnapshotLeaderLoop {
               case _ => Async[F].pure(false)
             }
 
-            // Check attestation-based finality (fast path)
-            _ <- heaviest match {
-              case Some((hash, slot, weight)) =>
-                val attestersForTip = allAtts.count { case (_, att) => att.tipHash === hash }
-                val peerIds = allAtts.keys.map(_.value.value.take(8)).mkString(",")
-                logger.debug(
-                  s"Attestations: tip=${hash.value.take(12)}.. slot=${slot.value.value} weight=${"%.2f"
-                      .format(weight)} (${attestersForTip}/${activeCount} active, ${validatorCount} seedlist) peers=[${peerIds}]"
-                ) >>
-                  (if (weight >= TipTracker.FinalityThreshold) {
-                     val isNew = alreadyFinalized.forall { case (fh, _) => fh =!= hash }
-                     Async[F].whenA(isNew && !depthFinalized) {
-                       tipTracker.markFinalized(hash, slot) >>
-                         tipTracker.pruneBelow(slot) >>
-                         chainStore.get(hash).flatMap {
-                           case Some(stored) =>
-                             chainStore.finalize(hash, stored.ordinal) >>
-                               // Advance finalized-ordinal tracker (see DEPTH-FINALIZED branch above)
-                               nakamotoFinalizedOrdinalRef.update(prev => math.max(prev, stored.ordinal)) >>
-                               // Prune tentative snapshots below finalized ordinal — they're stale
-                               snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(stored.ordinal)))
-                           case None => Async[F].unit
-                         } >>
-                         chainStore.get(hash).flatMap {
-                           case Some(stored) =>
-                             logger.info(
-                               s"ATTEST-FINALIZED ordinal=${stored.ordinal} slot=${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
-                                   .format(weight)}, ${attestersForTip}/${activeCount} active of ${validatorCount} seedlist)"
-                             ) >>
-                               Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", stored.ordinal)
-                           case None =>
-                             logger.info(
-                               s"ATTEST-FINALIZED slot=${slot.value.value} (hash=${hash.value.take(16)}..., weight=${"%.2f"
-                                   .format(weight)}, ${attestersForTip}/${activeCount} active of ${validatorCount} seedlist)"
-                             )
-                         } >>
-                         Metrics[F].incrementCounter("dag_nakamoto_finalized")
-                     }
-                   } else Async[F].unit)
-              case None =>
+            // GRANDPA-style chain finality: attesting to ordinal N implicitly attests to all
+            // ancestors. Walk attestation ordinals from highest down, accumulating weight.
+            // The highest ordinal where cumulative weight >= 2/3 is finalized.
+            chainFinalizedOrdinal <- tipTracker.highestFinalizedOrdinal(TipTracker.FinalityThreshold)
+            _ <- (chainFinalizedOrdinal, bestTip) match {
+              case (Some((finalOrdinal, weight)), Some(tip)) if finalOrdinal > lastFinalizedOrdinal && !depthFinalized =>
+                // Walk the canonical chain to find the hash at finalOrdinal
+                chainStore.walkBackTo(tip.hash, finalOrdinal).flatMap {
+                  case Some(canonicalHash) =>
+                    chainStore.get(canonicalHash).flatMap {
+                      case Some(stored) =>
+                        val finalSlot = Slot(NonNegLong.unsafeFrom(stored.slot))
+                        tipTracker.markFinalized(canonicalHash, finalSlot) >>
+                          tipTracker.pruneBelow(finalSlot) >>
+                          chainStore.finalize(canonicalHash, finalOrdinal) >>
+                          nakamotoFinalizedOrdinalRef.update(prev => math.max(prev, finalOrdinal)) >>
+                          snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(finalOrdinal))) >>
+                          logger.info(
+                            s"ATTEST-FINALIZED ordinal=$finalOrdinal slot=${stored.slot} (weight=${"%.2f".format(weight)}, " +
+                              s"${allAtts.size}/${activeCount} active of ${validatorCount} seedlist)"
+                          ) >>
+                          Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
+                          Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalOrdinal)
+                      case None =>
+                        logger.warn(
+                          s"⚠️ ATTEST-FINALIZE: chainStore.get returned None for hash=${canonicalHash.value.take(12)} at ordinal=$finalOrdinal"
+                        )
+                    }
+                  case None =>
+                    logger
+                      .warn(s"⚠️ ATTEST-FINALIZE: walkBackTo found no hash at ordinal=$finalOrdinal from tip=${tip.hash.value.take(12)}")
+                }
+              case _ =>
                 Async[F].whenA(allAtts.nonEmpty) {
-                  logger.debug(s"Attestations: ${allAtts.size} attesters, no heaviest tip")
+                  val ordinals = allAtts.values.map(_.tipOrdinal).toList.sorted
+                  logger.debug(
+                    s"Attestations: ${allAtts.size} attesters, ordinals=[${ordinals.mkString(",")}], lastFinalized=$lastFinalizedOrdinal"
+                  )
                 }
             }
           } yield ()
@@ -636,18 +634,32 @@ object SnapshotLeaderLoop {
                   )
                   .void
                   .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}")) >> {
-                  // Self-attest (producer always attests to own snapshot)
+                  // Self-attest (producer always attests to own snapshot) and broadcast
                   val selfAttestation = io.constellationnetwork.schema.nakamoto.TipAttestation(
                     tipHash = snapshotHash,
                     tipSlot = slotRefined,
                     tipOrdinal = lastKey.value.value + 1,
                     attestedAt = slotRefined
                   )
-                  tipTracker.recordAttestation(selfId, selfAttestation)
-                  // TODO: broadcast signed attestation via sidecarClient.publishAttestation
-                  // Requires: sign(tipHash || tipSlot) with keyPair
-                  // Also: validators should attest+broadcast AFTER adopting a validated gossip snapshot
-                  // (in processValidSnapshot path of NakamotoSyncDaemon)
+                  tipTracker.recordAttestation(selfId, selfAttestation) >>
+                    // Sign via the standard Hasher pipeline (JSON-encode → hash → sign)
+                    // and broadcast to the network via sidecar GossipSub
+                    (for {
+                      attHash <- selfAttestation.hash
+                      sig <- SigValue.fromHash[F](keyPair.getPrivate, attHash)
+                      sigBytes = sig.coerce.toBytes
+                      att = SidecarClient.mkAttestation(
+                        tipHash = snapshotHash.value.getBytes,
+                        tipSlot = currentSlot,
+                        tipOrdinal = lastKey.value.value + 1,
+                        attestedAt = currentSlot,
+                        attesterId = selfId.value.toBytes,
+                        signature = sigBytes
+                      )
+                      _ <- sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
+                        logger.warn(s"Failed to broadcast attestation: ${e.getMessage}")
+                      }
+                    } yield ())
                 } >>
                   logger.info(
                     s"Produced snapshot ordinal=${lastKey.value.value + 1} slot=$currentSlot " +

@@ -189,7 +189,7 @@ object NakamotoChainStore {
                         Slot(NonNegLong.unsafeFrom(currentBest.slot)),
                         currentBest.ordinal,
                         currentBest.parentHash,
-                        VrfOutput(Hex("00" * 64)) // placeholder for current tip's VRF
+                        VrfOutput(Hex(currentBest.vrfOutput.map("%02x".format(_)).mkString))
                       )
 
                       val newState = state.copy(byHash = newByHash)

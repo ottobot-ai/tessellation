@@ -29,6 +29,15 @@ trait TipTracker[F[_]] {
   /** Get the tip with the most attestation weight (fork choice). */
   def heaviestTip: F[Option[(Hash, Slot, Double)]]
 
+  /** GRANDPA-style chain finality: find the highest ordinal where cumulative attestation weight >= threshold.
+    *
+    * Attesting to ordinal N implicitly attests to all ancestors. Walk attestation ordinals from highest to lowest, accumulating weight. The
+    * highest ordinal where cumulative weight >= threshold is the finalized ordinal.
+    *
+    * Returns (highestFinalizedOrdinal, cumulativeWeight) or None if no ordinal reaches the threshold.
+    */
+  def highestFinalizedOrdinal(threshold: Double): F[Option[(Long, Double)]]
+
   /** Get all current attestations (latest per peer). */
   def allAttestations: F[Map[PeerId, TipAttestation]]
 
@@ -98,6 +107,25 @@ object TipTracker {
                 attestationWeight(hash).map(w => (hash, slot, w))
             }
           } yield weighted.maxByOption(_._3).filter(_._3 > 0.0)
+
+        def highestFinalizedOrdinal(threshold: Double): F[Option[(Long, Double)]] =
+          for {
+            attestations <- attestationsRef.get
+            weighted <- attestations.toList.traverse {
+              case (peerId, att) =>
+                stakeRegistry.optimisticRelativeStake(peerId).map(w => (att.tipOrdinal, w))
+            }
+          } yield {
+            // Sort by ordinal descending — highest attestation first
+            val sorted = weighted.filter(_._2 > 0.0).sortBy(-_._1)
+            // Walk down, accumulating weight. Attesting to ordinal N
+            // implicitly attests to all ancestors (GRANDPA property).
+            var cumWeight = 0.0
+            sorted.collectFirst {
+              case (ordinal, weight) if { cumWeight += weight; cumWeight >= threshold } =>
+                (ordinal, cumWeight)
+            }
+          }
 
         def allAttestations: F[Map[PeerId, TipAttestation]] =
           attestationsRef.get

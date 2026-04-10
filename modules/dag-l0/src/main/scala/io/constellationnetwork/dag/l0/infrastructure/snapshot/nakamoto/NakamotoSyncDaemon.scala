@@ -1,11 +1,14 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
+import java.security.KeyPair
+
 import cats.effect.kernel.{Async, Ref}
 import cats.effect.std.Semaphore
 import cats.syntax.all._
 
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.{DAGEvent, GlobalSnapshotEvent}
+import io.constellationnetwork.ext.crypto._
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto._
@@ -23,14 +26,16 @@ import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.nakamoto.{LddConfig, TipAttestation => DomainTipAttestation}
 import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.transaction.TransactionReference
+import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.security.signature.signature.Signature
+import io.constellationnetwork.security.signature.{Signed, Signing}
 import io.constellationnetwork.security.vrf.EcVrf25519
-import io.constellationnetwork.security.{Hashed, HasherSelector, SecurityProvider}
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
+import io.estatico.newtype.ops._
 import io.grpc.ManagedChannel
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
@@ -107,6 +112,7 @@ object NakamotoSyncDaemon {
     stakeRegistry: StakeRegistry[F],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     selfId: peer.PeerId,
+    keyPair: KeyPair,
     lddConfig: LddConfig,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
@@ -139,6 +145,7 @@ object NakamotoSyncDaemon {
               stakeRegistry,
               sidecarClient,
               selfId,
+              keyPair,
               lddConfig,
               lastKnownSlotRef,
               epochStateRef,
@@ -176,6 +183,7 @@ object NakamotoSyncDaemon {
     stakeRegistry: StakeRegistry[F],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     selfId: peer.PeerId,
+    keyPair: KeyPair,
     lddConfig: LddConfig,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
@@ -220,6 +228,7 @@ object NakamotoSyncDaemon {
                             stakeRegistry,
                             sidecarClient,
                             selfId,
+                            keyPair,
                             lddConfig,
                             lastKnownSlotRef,
                             epochStateRef,
@@ -266,6 +275,7 @@ object NakamotoSyncDaemon {
                           stakeRegistry,
                           sidecarClient,
                           selfId,
+                          keyPair,
                           lddConfig,
                           lastKnownSlotRef,
                           epochStateRef,
@@ -310,6 +320,7 @@ object NakamotoSyncDaemon {
     stakeRegistry: StakeRegistry[F],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     selfId: peer.PeerId,
+    keyPair: KeyPair,
     lddConfig: LddConfig,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
@@ -463,6 +474,7 @@ object NakamotoSyncDaemon {
             tipTracker,
             sidecarClient,
             selfId,
+            keyPair,
             lastKnownSlotRef,
             epochStateRef,
             etaRotationSlots,
@@ -484,6 +496,7 @@ object NakamotoSyncDaemon {
               stakeRegistry,
               sidecarClient,
               selfId,
+              keyPair,
               lddConfig,
               lastKnownSlotRef,
               epochStateRef,
@@ -596,7 +609,7 @@ object NakamotoSyncDaemon {
     } yield ()
 
   /** Process a VRF-validated snapshot: update tip tracking, store, accumulate VRF output, record attestation. */
-  private def processValidSnapshot[F[_]: Async: HasherSelector: Metrics](
+  private def processValidSnapshot[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     snap: pb.Snapshot,
     stateRef: Ref[F, SyncState],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
@@ -604,6 +617,7 @@ object NakamotoSyncDaemon {
     tipTracker: TipTracker[F],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     selfId: peer.PeerId,
+    keyPair: KeyPair,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSlots: Long,
@@ -707,7 +721,7 @@ object NakamotoSyncDaemon {
       }
 
       // Emit our attestation for this snapshot
-      _ <- emitAttestation(snap, sidecarClient, tipTracker, selfId, logger)
+      _ <- emitAttestation(snap, sidecarClient, tipTracker, selfId, keyPair, logger)
 
     } yield ()
 
@@ -823,7 +837,7 @@ object NakamotoSyncDaemon {
       }
     }
 
-  private def handleAttestation[F[_]: Async](
+  private def handleAttestation[F[_]: Async: SecurityProvider: HasherSelector](
     att: pb.TipAttestation,
     tipTracker: TipTracker[F],
     logger: org.typelevel.log4cats.Logger[F]
@@ -834,18 +848,39 @@ object NakamotoSyncDaemon {
     val attesterHex = Hex(att.attesterId.toByteArray.map("%02x".format(_)).mkString)
     val attesterId = peer.PeerId(attesterHex)
     val attestedAtSlot = Slot(NonNegLong.unsafeFrom(att.attestedAt))
+    val sigBytes = att.signature.toByteArray
     val domainAtt = DomainTipAttestation(tipHash, tipSlot, att.tipOrdinal, attestedAtSlot)
-    tipTracker.recordAttestation(attesterId, domainAtt) >>
-      logger.info(
-        s"📨 Attestation for ordinal=${att.tipOrdinal} from=${attesterHex.value.take(16)}... rawLen=${att.attesterId.toByteArray.length}"
-      )
+
+    if (sigBytes.isEmpty) {
+      logger.warn(s"⚠️ Rejecting unsigned attestation for ordinal=${att.tipOrdinal} from=${attesterHex.value.take(16)}...")
+    } else {
+      // Verify signature using the same Hasher pipeline: JSON-encode the domain TipAttestation → hash → verify
+      HasherSelector[F].withCurrent { implicit hasher =>
+        for {
+          attHash <- domainAtt.hash
+          publicKey <- attesterHex.toPublicKey[F]
+          valid <- Signing.verifySignature(attHash.getBytes, sigBytes)(publicKey)
+          _ <-
+            if (valid)
+              tipTracker.recordAttestation(attesterId, domainAtt) >>
+                logger.info(
+                  s"📨 Attestation for ordinal=${att.tipOrdinal} from=${attesterHex.value.take(16)}..."
+                )
+            else
+              logger.warn(
+                s"⚠️ Rejecting attestation with invalid signature for ordinal=${att.tipOrdinal} from=${attesterHex.value.take(16)}..."
+              )
+        } yield ()
+      }
+    }
   }
 
-  private def emitAttestation[F[_]: Async](
+  private def emitAttestation[F[_]: Async: SecurityProvider: HasherSelector](
     snap: pb.Snapshot,
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
     selfId: peer.PeerId,
+    keyPair: KeyPair,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     // snap.hash bytes are the UTF-8 encoding of the hex hash string — decode back to string
@@ -857,19 +892,25 @@ object NakamotoSyncDaemon {
     // Record locally first (so our own TipTracker sees it)
     val localAtt = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, attestedAtSlot)
     tipTracker.recordAttestation(selfId, localAtt) >>
-      // Broadcast to network — use hex bytes of PeerId so receivers can reconstruct
-      {
-        val att = SidecarClient.mkAttestation(
-          tipHash = snap.hash.toByteArray,
-          tipSlot = snap.slot,
-          tipOrdinal = snap.ordinal,
-          attestedAt = currentSlotMs,
-          attesterId = selfId.value.toBytes,
-          signature = Array.emptyByteArray // TODO: sign (tipHash || tipSlot)
-        )
-        sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
-          logger.warn(s"Failed to emit attestation: ${e.getMessage}")
-        }
+      // Sign via the standard Hasher pipeline: JSON-encode the domain TipAttestation → hash → sign the hash.
+      // Same path as SignatureProof.fromData / Signed.forAsyncHasher — no custom serialization.
+      HasherSelector[F].withCurrent { implicit hasher =>
+        for {
+          attHash <- localAtt.hash
+          sig <- Signature.fromHash[F](keyPair.getPrivate, attHash)
+          sigBytes = sig.coerce.toBytes
+          att = SidecarClient.mkAttestation(
+            tipHash = snap.hash.toByteArray,
+            tipSlot = snap.slot,
+            tipOrdinal = snap.ordinal,
+            attestedAt = currentSlotMs,
+            attesterId = selfId.value.toBytes,
+            signature = sigBytes
+          )
+          _ <- sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
+            logger.warn(s"Failed to emit attestation: ${e.getMessage}")
+          }
+        } yield ()
       }
   }
 
