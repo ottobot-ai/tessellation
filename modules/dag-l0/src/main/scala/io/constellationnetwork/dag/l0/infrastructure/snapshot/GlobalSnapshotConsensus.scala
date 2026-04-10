@@ -506,7 +506,8 @@ object GlobalSnapshotConsensus {
                 snapshotSemaphore = snapshotSemaphore,
                 productionGate = productionGate,
                 mptStore = mptStore,
-                eventMempool = eventMempool
+                eventMempool = eventMempool,
+                dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data"))
               )
               .compile
               .drain

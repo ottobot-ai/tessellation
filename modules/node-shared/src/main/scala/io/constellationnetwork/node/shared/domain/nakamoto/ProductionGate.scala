@@ -36,6 +36,7 @@ object ProductionGate {
   val InitialSync: String = "initial-sync"
   val MptResync: String = "mpt-resync"
   val BetterGossipReceived: String = "better-gossip-received"
+  val ChainBackfill: String = "chain-backfill"
 
   def make[F[_]: Async]: F[ProductionGate[F]] =
     Ref.of[F, Set[String]](Set.empty).map { reasonsRef =>

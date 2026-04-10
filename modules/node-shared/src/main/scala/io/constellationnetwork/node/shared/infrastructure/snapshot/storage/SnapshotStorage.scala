@@ -306,6 +306,14 @@ object SnapshotStorage {
               .whenA(staleCount > 0)
           }
 
+        def writeForBackfill(snapshot: Signed[S])(implicit hasher: Hasher[F]): F[Unit] =
+          snapshotLocalFileSystemStorage.write(snapshot).handleErrorWith { e =>
+            snapshotExists(snapshot).ifM(
+              Applicative[F].unit, // already on disk — fine
+              logger.error(e)(s"Backfill: failed writing snapshot at ordinal=${snapshot.ordinal.show}")
+            )
+          }
+
         def getLatestBalances: F[Option[Map[Address, Balance]]] =
           headRef.get.map(_.map(_._3.balances))
 

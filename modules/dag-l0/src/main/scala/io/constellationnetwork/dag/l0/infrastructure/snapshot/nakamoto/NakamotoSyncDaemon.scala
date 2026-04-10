@@ -132,6 +132,8 @@ object NakamotoSyncDaemon {
     mptStore: MptStore[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
+    channel: ManagedChannel,
+    dataDir: java.nio.file.Path,
     logger: org.typelevel.log4cats.Logger[F]
   )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] =
     pendingParentRef.modify { m =>
@@ -165,6 +167,8 @@ object NakamotoSyncDaemon {
               mptStore,
               eventMempool,
               chainSyncManager,
+              channel,
+              dataDir,
               logger
             )
           }
@@ -202,7 +206,8 @@ object NakamotoSyncDaemon {
     snapshotSemaphore: Semaphore[F],
     productionGate: ProductionGate[F],
     mptStore: MptStore[F, GlobalStateKey],
-    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey]
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
+    dataDir: java.nio.file.Path
   )(implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
@@ -248,6 +253,8 @@ object NakamotoSyncDaemon {
                             mptStore,
                             eventMempool,
                             csm,
+                            channel,
+                            dataDir,
                             logger
                           )
                         }
@@ -295,6 +302,8 @@ object NakamotoSyncDaemon {
                           mptStore,
                           eventMempool,
                           chainSyncManager,
+                          channel,
+                          dataDir,
                           logger
                         )
                       } >> // snapshotSemaphore.permit.use
@@ -340,6 +349,8 @@ object NakamotoSyncDaemon {
     mptStore: MptStore[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
+    channel: ManagedChannel,
+    dataDir: java.nio.file.Path,
     logger: org.typelevel.log4cats.Logger[F]
   )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] =
     for {
@@ -550,6 +561,8 @@ object NakamotoSyncDaemon {
               mptStore,
               eventMempool,
               chainSyncManager,
+              channel,
+              dataDir,
               logger
             )
           }
@@ -567,6 +580,8 @@ object NakamotoSyncDaemon {
             mptStore,
             eventMempool,
             productionGate,
+            channel,
+            dataDir,
             logger
           )
         case NakamotoSnapshotValidator.Invalid(reason) if reason.startsWith("Content mismatch") =>
@@ -592,6 +607,8 @@ object NakamotoSyncDaemon {
                     mptStore,
                     eventMempool,
                     productionGate,
+                    channel,
+                    dataDir,
                     logger
                   )
               } else {
@@ -637,6 +654,8 @@ object NakamotoSyncDaemon {
                 mptStore,
                 eventMempool,
                 productionGate,
+                channel,
+                dataDir,
                 logger
               )
           }
@@ -961,7 +980,7 @@ object NakamotoSyncDaemon {
     * Signed[GlobalIncrementalSnapshot] + GlobalSnapshotInfo. We skip validation (can't validate without parent) but reset our canonical
     * storage so subsequent gossip messages WILL have parents we recognize.
     */
-  private def catchUpFromGossip[F[_]: Async: cats.Parallel: JsonSerializer: HasherSelector: Metrics](
+  private def catchUpFromGossip[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
     snap: pb.Snapshot,
     parsed: Option[(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)],
     stateRef: Ref[F, SyncState],
@@ -973,6 +992,8 @@ object NakamotoSyncDaemon {
     mptStore: MptStore[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     productionGate: ProductionGate[F],
+    channel: ManagedChannel,
+    dataDir: java.nio.file.Path,
     logger: org.typelevel.log4cats.Logger[F]
   )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] = {
     val now = System.currentTimeMillis()
@@ -1046,6 +1067,25 @@ object NakamotoSyncDaemon {
                 s"\u2705 CATCH-UP complete: now at ordinal=${snap.ordinal} slot=${snap.slot}. " +
                   s"Subsequent gossip should find parents."
               )
+
+              // Start backfill daemon in background to fill the gap from caught-up tip down to genesis.
+              // The parent hash of the caught-up snapshot is the starting point for the walk-back.
+              _ <- {
+                val cursor = BackfillDaemon.BackfillCursor(
+                  nextHashToFetch = parentHash.value,
+                  targetOrdinal = 1L,
+                  currentOrdinal = snap.ordinal,
+                  startedAtOrdinal = snap.ordinal,
+                  createdAtMs = System.currentTimeMillis()
+                )
+                Async[F]
+                  .start(
+                    BackfillDaemon
+                      .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
+                      .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
+                  )
+                  .void
+              }
             } yield ()
           case None =>
             logger.warn(
