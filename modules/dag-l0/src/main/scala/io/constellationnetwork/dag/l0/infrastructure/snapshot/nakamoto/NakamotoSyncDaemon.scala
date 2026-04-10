@@ -118,6 +118,7 @@ object NakamotoSyncDaemon {
     productionGate: ProductionGate[F],
     mptStore: MptStore[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
+    chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     logger: org.typelevel.log4cats.Logger[F]
   )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] =
     pendingParentRef.modify { m =>
@@ -149,6 +150,7 @@ object NakamotoSyncDaemon {
               productionGate,
               mptStore,
               eventMempool,
+              chainSyncManager,
               logger
             )
           }
@@ -195,57 +197,105 @@ object NakamotoSyncDaemon {
     // snapshots that were waiting for it. This creates a validation cascade from genesis.
     fs2.Stream.eval(Ref.of[F, Map[Hash, List[pb.Snapshot]]](Map.empty)).flatMap { pendingParentRef =>
       fs2.Stream.eval(Ref.of[F, SyncState](SyncState.initial)).flatMap { stateRef =>
-        // Shared semaphore serializes snapshot processing with production (SnapshotLeaderLoop)
-        GossipStream.subscribe[F](channel).evalMap { msg =>
-          msg.body match {
-            case pb.GossipMessage.Body.Snapshot(snap) =>
-              // Pre-semaphore: if incoming snapshot would beat our current tip,
-              // pause production immediately so SnapshotLeaderLoop doesn't build
-              // on a tip we're about to abandon.
-              val incomingOrdinal = snap.ordinal
-              chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
-                val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
-                (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
-                 else Async[F].unit) >>
-                  snapshotSemaphore.permit.use { _ =>
-                    handleSnapshot(
-                      snap,
-                      stateRef,
-                      pendingParentRef,
-                      chainStore,
-                      nodeStorage,
-                      tipTracker,
-                      stakeRegistry,
-                      sidecarClient,
-                      selfId,
-                      lddConfig,
-                      lastKnownSlotRef,
-                      epochStateRef,
-                      etaRotationSlots,
-                      consensusFns,
-                      snapshotStorage,
-                      lastGlobalSnapshotStorage,
-                      lastNGlobalSnapshotStorage,
-                      productionGate,
-                      mptStore,
-                      eventMempool,
-                      logger
-                    )
-                  } >> // snapshotSemaphore.permit.use
-                  productionGate.resume(ProductionGate.BetterGossipReceived)
-              } // chainStore.bestTipOrdinal.flatMap
+        // ChainSyncManager for active parent fetching. Uses a Ref to break the
+        // circular dependency: handleSnapshot needs chainSyncManager, but
+        // chainSyncManager's callback needs handleSnapshot.
+        fs2.Stream
+          .eval(
+            Ref.of[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]](None).flatMap { csRef =>
+              ChainSyncManager
+                .make[F](
+                  channel,
+                  { fetchedSnap: pb.Snapshot =>
+                    csRef.get.flatMap {
+                      case Some(csm) =>
+                        snapshotSemaphore.permit.use { _ =>
+                          handleSnapshot(
+                            fetchedSnap,
+                            stateRef,
+                            pendingParentRef,
+                            chainStore,
+                            nodeStorage,
+                            tipTracker,
+                            stakeRegistry,
+                            sidecarClient,
+                            selfId,
+                            lddConfig,
+                            lastKnownSlotRef,
+                            epochStateRef,
+                            etaRotationSlots,
+                            consensusFns,
+                            snapshotStorage,
+                            lastGlobalSnapshotStorage,
+                            lastNGlobalSnapshotStorage,
+                            productionGate,
+                            mptStore,
+                            eventMempool,
+                            csm,
+                            logger
+                          )
+                        }
+                      case None => Async[F].unit
+                    }
+                  }
+                )
+                .flatMap(csm => csRef.set(Some(csm)).as(csm))
+            }
+          )
+          .flatMap { chainSyncManager =>
+            // Shared semaphore serializes snapshot processing with production (SnapshotLeaderLoop)
+            GossipStream.subscribe[F](channel).evalMap { msg =>
+              msg.body match {
+                case pb.GossipMessage.Body.Snapshot(snap) =>
+                  // Pre-semaphore: if incoming snapshot would beat our current tip,
+                  // pause production immediately so SnapshotLeaderLoop doesn't build
+                  // on a tip we're about to abandon.
+                  val incomingOrdinal = snap.ordinal
+                  chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
+                    val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
+                    (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
+                     else Async[F].unit) >>
+                      snapshotSemaphore.permit.use { _ =>
+                        handleSnapshot(
+                          snap,
+                          stateRef,
+                          pendingParentRef,
+                          chainStore,
+                          nodeStorage,
+                          tipTracker,
+                          stakeRegistry,
+                          sidecarClient,
+                          selfId,
+                          lddConfig,
+                          lastKnownSlotRef,
+                          epochStateRef,
+                          etaRotationSlots,
+                          consensusFns,
+                          snapshotStorage,
+                          lastGlobalSnapshotStorage,
+                          lastNGlobalSnapshotStorage,
+                          productionGate,
+                          mptStore,
+                          eventMempool,
+                          chainSyncManager,
+                          logger
+                        )
+                      } >> // snapshotSemaphore.permit.use
+                      productionGate.resume(ProductionGate.BetterGossipReceived)
+                  } // chainStore.bestTipOrdinal.flatMap
 
-            case pb.GossipMessage.Body.Attestation(att) =>
-              handleAttestation(att, tipTracker, logger)
+                case pb.GossipMessage.Body.Attestation(att) =>
+                  handleAttestation(att, tipTracker, logger)
 
-            case _: pb.GossipMessage.Body.Rumor =>
-              // Rumors are handled by SidecarRumorBridge.receive — ignore here.
-              Async[F].unit
+                case _: pb.GossipMessage.Body.Rumor =>
+                  // Rumors are handled by SidecarRumorBridge.receive — ignore here.
+                  Async[F].unit
 
-            case pb.GossipMessage.Body.Empty =>
-              Async[F].unit
+                case pb.GossipMessage.Body.Empty =>
+                  Async[F].unit
+              }
+            }
           }
-        }
       }
     }
   }
@@ -271,6 +321,7 @@ object NakamotoSyncDaemon {
     productionGate: ProductionGate[F],
     mptStore: MptStore[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
+    chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     logger: org.typelevel.log4cats.Logger[F]
   )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] =
     for {
@@ -372,6 +423,8 @@ object NakamotoSyncDaemon {
                   val existing = m.getOrElse(parentHash, List.empty)
                   m.updated(parentHash, existing :+ snap)
                 } >>
+                // Actively fetch the missing parent from a peer (background fiber)
+                chainSyncManager.requestMissing(parentHash) >>
                 Async[F].pure(
                   NakamotoSnapshotValidator.Invalid("Parent not in chain store (buffered)"): NakamotoSnapshotValidator.ValidationResult
                 )
@@ -442,6 +495,7 @@ object NakamotoSyncDaemon {
               productionGate,
               mptStore,
               eventMempool,
+              chainSyncManager,
               logger
             )
           }

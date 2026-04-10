@@ -105,3 +105,59 @@ message HealthResponse {
   int64 uptime_seconds = 2;
   int32 peer_count = 3;
 }
+
+// ─── ChainSync: Active Parent Fetching ──────────────────────────────
+
+message ChainPoint {
+  bytes hash = 1;
+  int64 ordinal = 2;
+}
+
+message FetchSnapshotsRequest {
+  repeated bytes hashes = 1;
+}
+
+message FindIntersectionRequest {
+  repeated ChainPoint points = 1;
+}
+
+message FindIntersectionResponse {
+  bool found = 1;
+  bytes intersection_hash = 2;
+  int64 intersection_ordinal = 3;
+  bytes tip_hash = 4;
+  int64 tip_ordinal = 5;
+}
+
+message GetPeerTipRequest {}
+
+message PeerTipResponse {
+  bytes hash = 1;
+  int64 ordinal = 2;
+  int64 slot = 3;
+}
+
+message ServeSnapshotsRequest {
+  repeated bytes hashes = 1;
+}
+
+message ServeChainPointsRequest {}
+
+message ServeChainPointsResponse {
+  repeated ChainPoint points = 1;
+  bytes tip_hash = 2;
+  int64 tip_ordinal = 3;
+}
+
+// JVM -> Sidecar: request chain data from the network.
+service ChainSyncOutbound {
+  rpc FetchSnapshots(FetchSnapshotsRequest) returns (stream Snapshot);
+  rpc FindIntersection(FindIntersectionRequest) returns (FindIntersectionResponse);
+  rpc GetPeerTip(GetPeerTipRequest) returns (PeerTipResponse);
+}
+
+// Sidecar -> JVM: serve local chain data to incoming network requests.
+service ChainSyncInbound {
+  rpc ServeSnapshots(ServeSnapshotsRequest) returns (stream Snapshot);
+  rpc ServeChainPoints(ServeChainPointsRequest) returns (ServeChainPointsResponse);
+}
