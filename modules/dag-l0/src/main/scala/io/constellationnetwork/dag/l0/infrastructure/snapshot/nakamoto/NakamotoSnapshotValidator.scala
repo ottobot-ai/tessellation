@@ -33,7 +33,14 @@ object NakamotoSnapshotValidator {
 
   sealed abstract class ValidationResult
   final case class Valid(snapshot: Signed[GlobalIncrementalSnapshot], context: GlobalSnapshotInfo) extends ValidationResult
-  final case class Invalid(reason: String) extends ValidationResult
+
+  sealed abstract class Invalid extends ValidationResult
+  case object ParentNotFound extends Invalid
+  case object ParentBuffered extends Invalid
+  final case class VrfFailed(slot: Long, detail: String) extends Invalid
+  final case class SignatureInvalid(ordinal: Long) extends Invalid
+  final case class ContentMismatch(detail: String) extends Invalid
+  final case class VrfOnlyFailed(slot: Long) extends Invalid
 
   def validate[F[_]: Async: SecurityProvider: HasherSelector](
     signedSnapshot: Signed[GlobalIncrementalSnapshot],
@@ -76,7 +83,7 @@ object NakamotoSnapshotValidator {
         if (!vrfValid) {
           logger
             .warn(s"❌ VRF failed: slot=$slot producer=${producerHex.value.take(8)} stake=$producerStake gap=$slotGap")
-            .as(Invalid(s"VRF verification failed for slot $slot"): ValidationResult)
+            .as(VrfFailed(slot, s"producer=${producerHex.value.take(8)} stake=$producerStake gap=$slotGap"): ValidationResult)
         } else {
           // ── Step 2: Signature verification ──
           HasherSelector[F].withCurrent { implicit hasher =>
@@ -84,7 +91,7 @@ object NakamotoSnapshotValidator {
               if (!sigValid) {
                 logger
                   .warn(s"❌ Signature invalid: slot=$slot ordinal=${signedSnapshot.ordinal}")
-                  .as(Invalid(s"Invalid signature on snapshot ordinal=${signedSnapshot.ordinal}"): ValidationResult)
+                  .as(SignatureInvalid(signedSnapshot.ordinal.value.value): ValidationResult)
               } else {
                 // ── Step 3: SlotCertificate verification ──
                 val certResult = signedSnapshot.value.slotCertificate match {
@@ -107,7 +114,7 @@ object NakamotoSnapshotValidator {
 
                 certResult match {
                   case Left(reason) =>
-                    logger.warn(s"❌ Cert mismatch: $reason").as(Invalid(reason): ValidationResult)
+                    logger.warn(s"❌ Cert mismatch: $reason").as(ContentMismatch(s"cert: $reason"): ValidationResult)
                   case Right(_) =>
                     // ── Step 4: Content validation ──
                     // Compare received artifact against locally-recreated one.
@@ -182,7 +189,7 @@ object NakamotoSnapshotValidator {
                           if (logMsg._2)
                             logger.info(logMsg._1).as(Valid(signedSnapshot, context): ValidationResult)
                           else
-                            logger.warn(logMsg._1).as(Invalid(s"Content mismatch: ${logMsg._1}"): ValidationResult)
+                            logger.warn(logMsg._1).as(ContentMismatch(logMsg._1): ValidationResult)
                       }
                 }
               }

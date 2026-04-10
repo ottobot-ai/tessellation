@@ -454,7 +454,7 @@ object NakamotoSyncDaemon {
                     s"🔄 Tier 3: gap=$gap > k=$ConfirmationDepthK for ordinal=${snap.ordinal}. Triggering full catch-up."
                   ) >>
                     Async[F].pure(
-                      NakamotoSnapshotValidator.Invalid("No parent found"): NakamotoSnapshotValidator.ValidationResult
+                      NakamotoSnapshotValidator.ParentNotFound: NakamotoSnapshotValidator.ValidationResult
                     )
                 } else if (gap > CatchUpThreshold) {
                   // Tier 2: moderate gap — sequential walk-back. Buffer this snapshot
@@ -474,7 +474,7 @@ object NakamotoSyncDaemon {
                     // fetch it too (handleSnapshot → buffer → requestMissing).
                     chainSyncManager.requestMissing(parentHash) >>
                     Async[F].pure(
-                      NakamotoSnapshotValidator.Invalid("Parent not in chain store (buffered)"): NakamotoSnapshotValidator.ValidationResult
+                      NakamotoSnapshotValidator.ParentBuffered: NakamotoSnapshotValidator.ValidationResult
                     )
                 } else {
                   // Tier 1: small gap — parent should arrive soon via gossip or ChainSync
@@ -487,7 +487,7 @@ object NakamotoSyncDaemon {
                     } >>
                     chainSyncManager.requestMissing(parentHash) >>
                     Async[F].pure(
-                      NakamotoSnapshotValidator.Invalid("Parent not in chain store (buffered)"): NakamotoSnapshotValidator.ValidationResult
+                      NakamotoSnapshotValidator.ParentBuffered: NakamotoSnapshotValidator.ValidationResult
                     )
                 }
               }
@@ -512,7 +512,7 @@ object NakamotoSyncDaemon {
                   proof = proof
                 )
             if (vrfValid) NakamotoSnapshotValidator.Valid(null, null) // VRF-only, no snapshot data
-            else NakamotoSnapshotValidator.Invalid("VRF failed (no payload)")
+            else NakamotoSnapshotValidator.VrfOnlyFailed(snap.slot)
           }
       }
 
@@ -566,7 +566,7 @@ object NakamotoSyncDaemon {
               logger
             )
           }
-        case NakamotoSnapshotValidator.Invalid(reason) if reason == "No parent found" =>
+        case NakamotoSnapshotValidator.ParentNotFound =>
           // Parent not found — network is ahead of us (restart scenario).
           catchUpFromGossip(
             snap,
@@ -584,7 +584,7 @@ object NakamotoSyncDaemon {
             dataDir,
             logger
           )
-        case NakamotoSnapshotValidator.Invalid(reason) if reason.startsWith("Content mismatch") =>
+        case _: NakamotoSnapshotValidator.ContentMismatch =>
           // Content mismatch — could be normal fork or restart scenario.
           // Only catch up if incoming ordinal is significantly ahead of our canonical tip.
           snapshotStorage.head.flatMap {
@@ -659,12 +659,12 @@ object NakamotoSyncDaemon {
                 logger
               )
           }
-        case NakamotoSnapshotValidator.Invalid(reason) if reason.contains("buffered") =>
+        case NakamotoSnapshotValidator.ParentBuffered =>
           // Already buffered for validation when parent arrives — nothing more to do
           Async[F].unit
-        case NakamotoSnapshotValidator.Invalid(reason) =>
+        case invalid: NakamotoSnapshotValidator.Invalid =>
           Metrics[F].incrementCounter("dag_nakamoto_snapshots_rejected") >>
-            logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $reason")
+            logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $invalid")
       }
     } yield ()
 
