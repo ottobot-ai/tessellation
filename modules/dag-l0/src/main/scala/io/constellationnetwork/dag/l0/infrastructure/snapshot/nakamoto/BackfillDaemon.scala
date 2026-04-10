@@ -20,6 +20,7 @@ import io.constellationnetwork.security.{HasherSelector, SecurityProvider}
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
+import fs2.Stream
 import io.circe.parser
 import io.grpc.ManagedChannel
 import org.typelevel.log4cats.slf4j.Slf4jLogger
@@ -40,6 +41,7 @@ object BackfillDaemon {
 
   private val ChunkSize = 256
   private val MaxConcurrent = 4
+  private val ParallelThreshold = 500L // Use parallel chunking only for gaps > this
   private val RetryDelay = 5.seconds
   private val MaxRetries = 3
 
@@ -147,8 +149,122 @@ object BackfillDaemon {
         snapshotStorage.writeForBackfill(signed)
       }
 
+    /** Fetch a range of snapshots via FetchByRange RPC (ordinal-based, streaming). */
+    def fetchRange(startOrdinal: Long, endOrdinal: Long, targetPeer: Array[Byte] = Array.empty): F[List[pb.BackfillSnapshot]] =
+      Async[F].blocking {
+        val request = pb.FetchByRangeRequest(
+          startOrdinal = startOrdinal,
+          endOrdinal = endOrdinal,
+          targetPeerId = com.google.protobuf.ByteString.copyFrom(targetPeer)
+        )
+        stub.fetchByRange(request).toList
+      }.handleErrorWith { e =>
+        logger.warn(s"Backfill: FetchByRange($startOrdinal-$endOrdinal) failed: ${e.getMessage}").as(List.empty)
+      }
+
+    /** Get connected peer IDs for parallel chunk assignment. */
+    def listPeers: F[List[Array[Byte]]] =
+      Async[F].blocking {
+        stub.listPeers(pb.ListPeersRequest()).peerIds.map(_.toByteArray).toList
+      }.handleErrorWith(_ => Async[F].pure(List.empty))
+
+    /** Parse a BackfillSnapshot proto into domain types. */
+    def parseBackfillSnapshot(snap: pb.BackfillSnapshot): Option[Signed[GlobalIncrementalSnapshot]] =
+      if (snap.payload.size() > 0) {
+        val payloadStr = snap.payload.toByteArray.map(_.toChar).mkString
+        io.circe.parser.decode[Signed[GlobalIncrementalSnapshot]](payloadStr).toOption
+      } else None
+
+    /** Process a chunk: fetch by range, validate signatures, persist to disk. */
+    def processChunk(startOrdinal: Long, endOrdinal: Long, targetPeer: Array[Byte]): F[Boolean] =
+      fetchRange(startOrdinal, endOrdinal, targetPeer).flatMap { backfillSnaps =>
+        if (backfillSnaps.isEmpty) Async[F].pure(false)
+        else {
+          val parsed = backfillSnaps.flatMap { snap =>
+            parseBackfillSnapshot(snap).map(signed => (signed, None: Option[GlobalSnapshotInfo]))
+          }
+          if (parsed.size < backfillSnaps.size) {
+            logger.warn(s"Backfill chunk $startOrdinal-$endOrdinal: ${backfillSnaps.size - parsed.size} unparseable snapshots") >>
+              Async[F].pure(false)
+          } else {
+            validateChunk(parsed).flatMap { valid =>
+              if (!valid) {
+                logger.warn(s"Backfill chunk $startOrdinal-$endOrdinal: signature validation failed") >>
+                  Async[F].pure(false)
+              } else {
+                parsed.traverse_ { case (signed, ctx) => persist(signed, ctx) } >>
+                  Metrics[F].incrementCounter("dag_nakamoto_backfill_fetched") >>
+                  logger.debug(s"Backfill chunk $startOrdinal-$endOrdinal: ${parsed.size} snapshots stored") >>
+                  Async[F].pure(true)
+              }
+            }
+          }
+        }
+      }
+
+    /** Parallel backfill via FetchByRange. Divides gap into chunks, fetches from multiple peers. */
+    def parallelBackfill(cursorRef: Ref[F, BackfillCursor]): F[Boolean] =
+      cursorRef.get.flatMap { cur =>
+        val totalRange = cur.currentOrdinal - cur.targetOrdinal
+        if (totalRange <= 0) Async[F].pure(true)
+        else
+          listPeers.flatMap { peers =>
+            if (peers.isEmpty) {
+              logger.info("Backfill: no peers for range fetch, falling back to sequential") >>
+                Async[F].pure(false)
+            } else {
+              // Divide into chunks, skip already-completed ones
+              val allChunks = (cur.targetOrdinal to cur.currentOrdinal - 1)
+                .grouped(ChunkSize)
+                .map(chunk => (chunk.head, chunk.last))
+                .toList
+                .filterNot { case (s, e) => cur.completedChunks.contains(s"$s-$e") }
+
+              logger.info(
+                s"Backfill: ${allChunks.size} chunks (${allChunks.size * ChunkSize} ordinals) from ${peers.size} peers"
+              ) >>
+                // Process chunks with limited parallelism
+                fs2.Stream
+                  .emits(allChunks.zipWithIndex)
+                  .covary[F]
+                  .parEvalMapUnordered(math.min(MaxConcurrent, peers.size)) {
+                    case ((start, end), idx) =>
+                      val targetPeer = peers(idx % peers.size)
+                      processChunk(start, end, targetPeer).flatMap { success =>
+                        if (success) {
+                          val chunkKey = s"$start-$end"
+                          cursorRef.update(c => c.copy(completedChunks = c.completedChunks + chunkKey)) >>
+                            Async[F].whenA((idx + 1) % 4 == 0)(
+                              cursorRef.get.flatMap(saveCursor(dataDir, _))
+                            ) >>
+                            Metrics[F].updateGauge("dag_nakamoto_backfill_remaining", end - cur.targetOrdinal) >>
+                            Async[F].pure(true)
+                        } else Async[F].pure(false)
+                      }
+                  }
+                  .compile
+                  .toList
+                  .flatMap { results =>
+                    val allSuccess = results.forall(identity)
+                    if (allSuccess) {
+                      clearCursor(dataDir) >>
+                        productionGate.resume(ProductionGate.ChainBackfill) >>
+                        Metrics[F].incrementCounter("dag_nakamoto_backfill_complete") >>
+                        Metrics[F].updateGauge("dag_nakamoto_backfill_remaining", 0L) >>
+                        logger.info(
+                          s"Backfill complete (parallel): ${cur.startedAtOrdinal - cur.targetOrdinal} ordinals filled"
+                        ) >> Async[F].pure(true)
+                    } else {
+                      logger.warn("Backfill: some chunks failed in parallel mode, falling back to sequential") >>
+                        Async[F].pure(false)
+                    }
+                  }
+            }
+          }
+      }
+
     // Sequential walk-back: fetch parent by hash, validate, store, repeat.
-    // Used when parallel range-based fetch isn't available or as fallback.
+    // Fallback when parallel range fetch fails or peers don't support it.
     def walkBack(cursorRef: Ref[F, BackfillCursor]): F[Unit] =
       cursorRef.get.flatMap { cur =>
         if (cur.currentOrdinal <= cur.targetOrdinal) {
@@ -222,7 +338,20 @@ object BackfillDaemon {
       )
       _ <- saveCursor(dataDir, cursor)
       cursorRef <- Ref.of[F, BackfillCursor](cursor)
-      _ <- walkBack(cursorRef)
+      totalGap = cursor.startedAtOrdinal - cursor.targetOrdinal
+      // Use parallel chunked fetch for large gaps, sequential for small ones
+      _ <-
+        if (totalGap > ParallelThreshold) {
+          logger.info(s"Gap=$totalGap > $ParallelThreshold: using parallel chunk fetch") >>
+            parallelBackfill(cursorRef).flatMap { success =>
+              Async[F].unlessA(success) {
+                logger.info("Parallel failed, falling back to sequential") >> walkBack(cursorRef)
+              }
+            }
+        } else {
+          logger.info(s"Gap=$totalGap <= $ParallelThreshold: using sequential fetch") >>
+            walkBack(cursorRef)
+        }
     } yield ()
   }
 }
