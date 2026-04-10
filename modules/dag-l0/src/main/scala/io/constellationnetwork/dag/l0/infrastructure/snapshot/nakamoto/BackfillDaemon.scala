@@ -22,8 +22,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 /** Background daemon that fills historical chain gaps after catch-up.
   *
   * When a node teleports to the network tip via catchUpFromGossip, ordinals between its old tip and the new tip are missing from disk. This
-  * daemon walks backward from the caught-up tip through parent hashes, fetching each snapshot via the existing ChainSync protocol, validating
-  * structurally (hash + signature), and persisting to disk.
+  * daemon walks backward from the caught-up tip through parent hashes, fetching each snapshot via the existing ChainSync protocol,
+  * validating structurally (hash + signature), and persisting to disk.
   *
   * Production (VRF election) is paused during backfill. Attestation continues.
   *
@@ -63,7 +63,12 @@ object BackfillDaemon {
       import io.circe.syntax._
       val cursorFile = dataDir.resolve("backfill-cursor.json")
       val tmpFile = dataDir.resolve("backfill-cursor.json.tmp")
-      Files.write(tmpFile, cursor.asJson.noSpaces.getBytes(StandardCharsets.UTF_8), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)
+      Files.write(
+        tmpFile,
+        cursor.asJson.noSpaces.getBytes(StandardCharsets.UTF_8),
+        StandardOpenOption.CREATE,
+        StandardOpenOption.TRUNCATE_EXISTING
+      )
       val _ = Files.move(tmpFile, cursorFile, java.nio.file.StandardCopyOption.ATOMIC_MOVE)
     }
 
@@ -139,18 +144,20 @@ object BackfillDaemon {
                       val parentHash = hashed.lastSnapshotHash.value
                       val ordinal = signedSnapshot.ordinal.value.value
                       snapshotStorage.writeForBackfill(signedSnapshot) >> {
-                          val newCursor = cur.copy(
-                            nextHashToFetch = parentHash,
-                            currentOrdinal = ordinal
-                          )
-                          cursorRef.set(newCursor) >>
-                            // Persist cursor every 10 snapshots for crash recovery
-                            Async[F].whenA(ordinal % 10 == 0)(saveCursor(dataDir, newCursor)) >>
-                            Async[F].whenA(ordinal % 50 == 0)(
-                              logger.info(s"Backfill progress: ordinal=$ordinal (${cur.startedAtOrdinal - ordinal}/${cur.startedAtOrdinal - cur.targetOrdinal} filled)")
-                            ) >>
-                            walkBack(cursorRef)
-                        }
+                        val newCursor = cur.copy(
+                          nextHashToFetch = parentHash,
+                          currentOrdinal = ordinal
+                        )
+                        cursorRef.set(newCursor) >>
+                          // Persist cursor every 10 snapshots for crash recovery
+                          Async[F].whenA(ordinal % 10 == 0)(saveCursor(dataDir, newCursor)) >>
+                          Async[F].whenA(ordinal % 50 == 0)(
+                            logger.info(
+                              s"Backfill progress: ordinal=$ordinal (${cur.startedAtOrdinal - ordinal}/${cur.startedAtOrdinal - cur.targetOrdinal} filled)"
+                            )
+                          ) >>
+                          walkBack(cursorRef)
+                      }
                     }
                   }
                 case None =>
@@ -162,7 +169,9 @@ object BackfillDaemon {
               }
             case None =>
               // Peer doesn't have this snapshot — wait and retry
-              logger.warn(s"Backfill: ChainSync returned nothing for hash=${hash.value.take(12)} at ordinal~${cur.currentOrdinal}. Retrying in 5s.") >>
+              logger.warn(
+                s"Backfill: ChainSync returned nothing for hash=${hash.value.take(12)} at ordinal~${cur.currentOrdinal}. Retrying in 5s."
+              ) >>
                 cursorRef.get.flatMap(saveCursor(dataDir, _)) >>
                 Async[F].sleep(scala.concurrent.duration.FiniteDuration(5, "seconds")) >>
                 walkBack(cursorRef)

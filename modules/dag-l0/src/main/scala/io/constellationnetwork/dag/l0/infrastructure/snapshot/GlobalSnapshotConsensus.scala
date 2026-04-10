@@ -466,7 +466,11 @@ object GlobalSnapshotConsensus {
           // snapshots or chain points for the ChainSync protocol.
           chainSyncDispatcher <- cats.effect.std.Dispatcher.sequential[F].allocated.map(_._1)
           chainSyncServer = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncServer
-            .make[F](chainStore, chainSyncDispatcher)(implicitly, scala.concurrent.ExecutionContext.global)
+            .make[F](chainStore, globalSnapshotStorage, chainSyncDispatcher)(
+              implicitly,
+              implicitly,
+              scala.concurrent.ExecutionContext.global
+            )
           _ <- {
             val grpcServer = io.grpc.ServerBuilder
               .forPort(50053)

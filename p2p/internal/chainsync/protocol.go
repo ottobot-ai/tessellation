@@ -116,6 +116,8 @@ func (h *Handler) handleIncoming(s network.Stream) {
 		h.serveFindIntersection(s, data, remotePeer)
 	case 0x03: // GetPeerTip
 		h.serveGetPeerTip(s, remotePeer)
+	case 0x04: // FetchByRange
+		h.serveFetchByRange(s, data, remotePeer)
 	default:
 		fmt.Printf("[chainsync] Unknown request type 0x%02x from %s\n", reqType[0], remotePeer)
 	}
@@ -355,6 +357,110 @@ func (h *Handler) GetPeerTip(ctx context.Context) (*pb.PeerTipResponse, error) {
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// serveFetchByRange handles incoming range requests from peers by relaying to JVM.
+func (h *Handler) serveFetchByRange(s network.Stream, data []byte, from peer.ID) {
+	conn := h.ensureJVMConn()
+	if conn == nil {
+		fmt.Printf("[chainsync] No JVM connection, cannot serve range to %s\n", from)
+		return
+	}
+
+	var req pb.FetchByRangeRequest
+	if err := proto.Unmarshal(data, &req); err != nil {
+		fmt.Printf("[chainsync] Failed to unmarshal FetchByRange from %s: %v\n", from, err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	client := pb.NewChainSyncInboundClient(conn)
+	stream, err := client.ServeByRange(ctx, &req)
+	if err != nil {
+		fmt.Printf("[chainsync] JVM ServeByRange failed: %v\n", err)
+		return
+	}
+
+	for {
+		snap, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Printf("[chainsync] JVM ServeByRange stream error: %v\n", err)
+			break
+		}
+		respBytes, _ := proto.Marshal(snap)
+		if err := writeLengthPrefixed(s, respBytes); err != nil {
+			break
+		}
+	}
+}
+
+// FetchByRange sends a range request to a specific peer (or random if no target).
+// Returns BackfillSnapshot messages for the requested ordinal range.
+func (h *Handler) FetchByRange(ctx context.Context, startOrdinal, endOrdinal int64, targetPeerID []byte) ([]*pb.BackfillSnapshot, error) {
+	var target peer.ID
+	if len(targetPeerID) > 0 {
+		target = peer.ID(targetPeerID)
+	} else {
+		var err error
+		target, err = h.pickPeer()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+
+	s, err := h.host.NewStream(reqCtx, target, ProtocolID)
+	if err != nil {
+		h.markFailed(target)
+		return nil, fmt.Errorf("stream to %s failed: %w", target, err)
+	}
+	defer s.Close()
+
+	req := &pb.FetchByRangeRequest{
+		StartOrdinal: startOrdinal,
+		EndOrdinal:   endOrdinal,
+	}
+	reqBytes, _ := proto.Marshal(req)
+	if _, err := s.Write([]byte{0x04}); err != nil {
+		h.markFailed(target)
+		return nil, err
+	}
+	if err := writeLengthPrefixed(s, reqBytes); err != nil {
+		h.markFailed(target)
+		return nil, err
+	}
+	s.CloseWrite()
+
+	var snapshots []*pb.BackfillSnapshot
+	for {
+		data, err := readLengthPrefixed(s)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			h.markFailed(target)
+			return snapshots, err
+		}
+		var snap pb.BackfillSnapshot
+		if err := proto.Unmarshal(data, &snap); err != nil {
+			continue
+		}
+		snapshots = append(snapshots, &snap)
+	}
+
+	return snapshots, nil
+}
+
+// ListPeers returns the IDs of all connected peers.
+func (h *Handler) ListPeers() []peer.ID {
+	return h.host.Network().Peers()
 }
 
 func (h *Handler) pickPeer() (peer.ID, error) {

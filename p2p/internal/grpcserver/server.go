@@ -210,3 +210,30 @@ func (s *Server) GetPeerTip(ctx context.Context, req *pb.GetPeerTipRequest) (*pb
 	}
 	return s.chainSync.GetPeerTip(ctx)
 }
+
+// FetchByRange fetches a contiguous range of snapshots from a peer.
+func (s *Server) FetchByRange(req *pb.FetchByRangeRequest, stream pb.ChainSyncOutbound_FetchByRangeServer) error {
+	if s.chainSync == nil {
+		return fmt.Errorf("ChainSync not initialized")
+	}
+	snapshots, err := s.chainSync.FetchByRange(stream.Context(), req.StartOrdinal, req.EndOrdinal, req.TargetPeerId)
+	if err != nil {
+		return err
+	}
+	for _, snap := range snapshots {
+		if err := stream.Send(snap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ListPeers returns IDs of all connected peers.
+func (s *Server) ListPeers(ctx context.Context, req *pb.ListPeersRequest) (*pb.ListPeersResponse, error) {
+	peers := s.chainSync.ListPeers()
+	peerIDs := make([][]byte, len(peers))
+	for i, p := range peers {
+		peerIDs[i] = []byte(p)
+	}
+	return &pb.ListPeersResponse{PeerIds: peerIDs}, nil
+}
