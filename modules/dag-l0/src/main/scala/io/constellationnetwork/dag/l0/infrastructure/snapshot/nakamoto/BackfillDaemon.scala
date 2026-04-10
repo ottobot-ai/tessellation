@@ -18,6 +18,7 @@ import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{HasherSelector, SecurityProvider}
 
+import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
 import io.circe.parser
 import io.grpc.ManagedChannel
@@ -92,7 +93,7 @@ object BackfillDaemon {
     }
 
   /** Run the backfill daemon. Blocks until backfill is complete or fails permanently. */
-  def run[F[_]: Async: HasherSelector: SecurityProvider](
+  def run[F[_]: Async: HasherSelector: SecurityProvider: Metrics](
     cursor: BackfillCursor,
     channel: ManagedChannel,
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -158,6 +159,8 @@ object BackfillDaemon {
           ) >>
             clearCursor(dataDir) >>
             productionGate.resume(ProductionGate.ChainBackfill) >>
+            Metrics[F].incrementCounter("dag_nakamoto_backfill_complete") >>
+            Metrics[F].updateGauge("dag_nakamoto_backfill_remaining", 0L) >>
             logger.info("Production resumed after backfill completion")
         } else {
           val hash = Hash(cur.nextHashToFetch)
@@ -182,6 +185,8 @@ object BackfillDaemon {
                             )
                             cursorRef.set(newCursor) >>
                               Async[F].whenA(ordinal % 10 == 0)(saveCursor(dataDir, newCursor)) >>
+                              Metrics[F].updateGauge("dag_nakamoto_backfill_remaining", ordinal - cur.targetOrdinal) >>
+                              Metrics[F].incrementCounter("dag_nakamoto_backfill_fetched") >>
                               Async[F].whenA(ordinal % 50 == 0 || ordinal == cur.targetOrdinal)(
                                 logger.info(
                                   s"Backfill progress: ordinal=$ordinal " +
