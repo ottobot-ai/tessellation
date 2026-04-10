@@ -12,11 +12,10 @@ import io.constellationnetwork.security.hash.Hash
 import io.grpc.stub.StreamObserver
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-/** Implements the ChainSyncInbound gRPC service — serves local chain data
-  * to peer requests relayed through the sidecar.
+/** Implements the ChainSyncInbound gRPC service — serves local chain data to peer requests relayed through the sidecar.
   *
-  * When a remote peer asks for snapshots by hash or chain points, the sidecar
-  * calls these methods on the JVM, which looks up data in the NakamotoChainStore.
+  * When a remote peer asks for snapshots by hash or chain points, the sidecar calls these methods on the JVM, which looks up data in the
+  * NakamotoChainStore.
   */
 object ChainSyncServer {
 
@@ -30,7 +29,7 @@ object ChainSyncServer {
       override def serveSnapshots(
         request: pb.ServeSnapshotsRequest,
         responseObserver: StreamObserver[pb.Snapshot]
-      ): Unit = {
+      ): Unit =
         dispatcher.unsafeRunAndForget {
           Async[F].delay {
             val hashes = request.hashes.map(h => Hash(new String(h.toByteArray, java.nio.charset.StandardCharsets.UTF_8)))
@@ -67,7 +66,6 @@ object ChainSyncServer {
             responseObserver.onCompleted()
           }
         }
-      }
 
       override def serveChainPoints(
         request: pb.ServeChainPointsRequest
@@ -87,7 +85,9 @@ object ChainSyncServer {
 
           pb.ServeChainPointsResponse(
             points = points,
-            tipHash = bestTip.map(t => com.google.protobuf.ByteString.copyFrom(t.hash.value.getBytes)).getOrElse(com.google.protobuf.ByteString.EMPTY),
+            tipHash = bestTip
+              .map(t => com.google.protobuf.ByteString.copyFrom(t.hash.value.getBytes))
+              .getOrElse(com.google.protobuf.ByteString.EMPTY),
             tipOrdinal = bestTip.map(_.ordinal).getOrElse(0L)
           )
         }

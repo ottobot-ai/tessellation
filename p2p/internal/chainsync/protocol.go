@@ -41,6 +41,7 @@ const (
 // on the host for incoming requests and provides methods for outgoing requests.
 type Handler struct {
 	host      host.Host
+	jvmAddr   string
 	jvmConn   *grpc.ClientConn // gRPC connection to JVM's ChainSyncInbound server
 	mu        sync.RWMutex
 	peerFails map[peer.ID]time.Time // blacklist: peer -> unblock time
@@ -48,18 +49,9 @@ type Handler struct {
 
 // New creates a ChainSync handler and registers the libp2p stream handler.
 func New(h host.Host, jvmAddr string) (*Handler, error) {
-	// Connect to JVM's ChainSyncInbound gRPC server.
-	// If the JVM server isn't up yet, we'll retry on each incoming request.
-	conn, err := grpc.Dial(jvmAddr, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithTimeout(10*time.Second))
-	if err != nil {
-		// Non-fatal: JVM may not have ChainSync server yet. Log and continue.
-		fmt.Printf("[chainsync] Warning: could not connect to JVM at %s: %v (will retry)\n", jvmAddr, err)
-		conn = nil
-	}
-
 	handler := &Handler{
 		host:      h,
-		jvmConn:   conn,
+		jvmAddr:   jvmAddr,
 		peerFails: make(map[peer.ID]time.Time),
 	}
 
@@ -67,6 +59,34 @@ func New(h host.Host, jvmAddr string) (*Handler, error) {
 	h.SetStreamHandler(ProtocolID, handler.handleIncoming)
 
 	return handler, nil
+}
+
+// ensureJVMConn lazily connects to the JVM's ChainSyncInbound gRPC server.
+// The JVM server starts after the sidecar, so initial connections fail.
+func (h *Handler) ensureJVMConn() *grpc.ClientConn {
+	h.mu.RLock()
+	if h.jvmConn != nil {
+		defer h.mu.RUnlock()
+		return h.jvmConn
+	}
+	h.mu.RUnlock()
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.jvmConn != nil {
+		return h.jvmConn
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := grpc.DialContext(ctx, h.jvmAddr, grpc.WithInsecure(), grpc.WithBlock())
+	if err != nil {
+		fmt.Printf("[chainsync] JVM connection attempt to %s failed: %v\n", h.jvmAddr, err)
+		return nil
+	}
+	fmt.Printf("[chainsync] Connected to JVM at %s\n", h.jvmAddr)
+	h.jvmConn = conn
+	return conn
 }
 
 // handleIncoming processes an incoming ChainSync request from a remote peer.
@@ -102,7 +122,8 @@ func (h *Handler) handleIncoming(s network.Stream) {
 }
 
 func (h *Handler) serveFetchSnapshots(s network.Stream, data []byte, from peer.ID) {
-	if h.jvmConn == nil {
+	conn := h.ensureJVMConn()
+	if conn == nil {
 		fmt.Printf("[chainsync] No JVM connection, cannot serve snapshots to %s\n", from)
 		return
 	}
@@ -116,7 +137,7 @@ func (h *Handler) serveFetchSnapshots(s network.Stream, data []byte, from peer.I
 	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
 	defer cancel()
 
-	client := pb.NewChainSyncInboundClient(h.jvmConn)
+	client := pb.NewChainSyncInboundClient(conn)
 	stream, err := client.ServeSnapshots(ctx, &req)
 	if err != nil {
 		fmt.Printf("[chainsync] JVM ServeSnapshots failed: %v\n", err)
@@ -141,15 +162,15 @@ func (h *Handler) serveFetchSnapshots(s network.Stream, data []byte, from peer.I
 }
 
 func (h *Handler) serveFindIntersection(s network.Stream, data []byte, from peer.ID) {
-	if h.jvmConn == nil {
+	conn := h.ensureJVMConn()
+	if conn == nil {
 		return
 	}
 
-	// For FindIntersection, we forward the request as ServeChainPoints and compare
 	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
 	defer cancel()
 
-	client := pb.NewChainSyncInboundClient(h.jvmConn)
+	client := pb.NewChainSyncInboundClient(conn)
 	localPoints, err := client.ServeChainPoints(ctx, &pb.ServeChainPointsRequest{})
 	if err != nil {
 		fmt.Printf("[chainsync] JVM ServeChainPoints failed: %v\n", err)
@@ -188,14 +209,15 @@ func (h *Handler) serveFindIntersection(s network.Stream, data []byte, from peer
 }
 
 func (h *Handler) serveGetPeerTip(s network.Stream, from peer.ID) {
-	if h.jvmConn == nil {
+	conn := h.ensureJVMConn()
+	if conn == nil {
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
 	defer cancel()
 
-	client := pb.NewChainSyncInboundClient(h.jvmConn)
+	client := pb.NewChainSyncInboundClient(conn)
 	localPoints, err := client.ServeChainPoints(ctx, &pb.ServeChainPointsRequest{})
 	if err != nil {
 		return

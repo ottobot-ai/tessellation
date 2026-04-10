@@ -461,6 +461,28 @@ object GlobalSnapshotConsensus {
               .compile
               .drain
           )
+          // Start ChainSyncInbound gRPC server — serves local chain data to peers
+          // via the sidecar. The sidecar calls this server when peers request
+          // snapshots or chain points for the ChainSync protocol.
+          chainSyncDispatcher <- cats.effect.std.Dispatcher.sequential[F].allocated.map(_._1)
+          chainSyncServer = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncServer
+            .make[F](chainStore, chainSyncDispatcher)(implicitly, scala.concurrent.ExecutionContext.global)
+          _ <- {
+            val grpcServer = io.grpc.ServerBuilder
+              .forPort(50053)
+              .addService(
+                io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar.ChainSyncInboundGrpc
+                  .bindService(chainSyncServer, scala.concurrent.ExecutionContext.global)
+              )
+              .build()
+            Async[F].delay(grpcServer.start()) >>
+              Async[F]
+                .delay(
+                  nakLogger.info("🔗 ChainSyncInbound gRPC server started on port 50053")
+                )
+                .flatten
+          }
+
           // Start NakamotoSyncDaemon: receives snapshots + attestations from gossip
           _ <- supervisor.supervise(
             io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon
