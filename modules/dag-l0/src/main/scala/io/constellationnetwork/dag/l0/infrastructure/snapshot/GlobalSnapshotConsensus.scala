@@ -516,6 +516,28 @@ object GlobalSnapshotConsensus {
               .compile
               .drain
           )
+
+          // Check for persisted backfill cursor from a previous session (crash recovery).
+          // If found, resume backfill with production paused until it completes.
+          backfillDataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data"))
+          existingCursor <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.BackfillDaemon
+            .loadCursor[F](backfillDataDir)
+          _ <- existingCursor match {
+            case Some(cursor) =>
+              nakLogger.info(
+                s"🔄 Resuming backfill from crash: ordinal ${cursor.currentOrdinal} → ${cursor.targetOrdinal} " +
+                  s"(started at ${cursor.startedAtOrdinal})"
+              ) >>
+                supervisor
+                  .supervise(
+                    io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.BackfillDaemon
+                      .run[F](cursor, sidecarClient.channel, globalSnapshotStorage, productionGate, backfillDataDir)
+                      .handleErrorWith(e => nakLogger.warn(s"Backfill daemon failed on resume: ${e.getMessage}"))
+                  )
+                  .void
+            case None =>
+              Async[F].unit
+          }
         } yield ()
       }
       consensus = new Consensus(

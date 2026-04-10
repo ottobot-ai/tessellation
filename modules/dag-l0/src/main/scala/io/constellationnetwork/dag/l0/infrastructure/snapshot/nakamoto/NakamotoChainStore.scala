@@ -7,7 +7,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.{ChainSelection, Pare
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.schema.nakamoto.ChainTip
 import io.constellationnetwork.schema.nakamoto.slot.{Slot, VrfOutput}
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo}
+import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
@@ -348,11 +348,22 @@ object NakamotoChainStore {
           }.flatten
 
         def walkBackTo(startHash: Hash, targetOrdinal: Long): F[Option[Hash]] =
-          stateRef.get.map { state =>
+          stateRef.get.flatMap { state =>
+            // Walk in-memory chain first
             var current = state.byHash.get(startHash)
             while (current.isDefined && current.get.ordinal > targetOrdinal)
               current = state.byHash.get(current.get.parentHash)
-            current.filter(_.ordinal == targetOrdinal).map(_.hash)
+
+            current.filter(_.ordinal == targetOrdinal).map(_.hash) match {
+              case some @ Some(_) => Async[F].pure(some)
+              case None           =>
+                // In-memory chain broke (gap from catch-up/reorg).
+                // Fall back to disk: read snapshot at targetOrdinal directly.
+                import eu.timepit.refined.types.numeric.NonNegLong
+                HasherSelector[F].withCurrent { implicit hasher =>
+                  underlyingStorage.getHash(SnapshotOrdinal(NonNegLong.unsafeFrom(targetOrdinal)))
+                }
+            }
           }
 
         def size: F[Int] =
