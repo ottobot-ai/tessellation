@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
 	"time"
 
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -21,6 +20,7 @@ import (
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/scasplte2/tessellation/p2p/internal/config"
+	"github.com/scasplte2/tessellation/p2p/internal/metrics"
 )
 
 // Node manages libp2p host and GossipSub topics.
@@ -32,12 +32,8 @@ type Node struct {
 	snapshotTopic    *pubsub.Topic
 	attestationTopic *pubsub.Topic
 	rumorTopic       *pubsub.Topic
-	snapshotSub      *pubsub.Subscription
-	attestationSub   *pubsub.Subscription
-	rumorSub         *pubsub.Subscription
 
 	cfg config.Config
-	mu  sync.RWMutex
 }
 
 // New creates a libp2p host with GossipSub and joins the Nakamoto topics.
@@ -140,29 +136,10 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		return nil, fmt.Errorf("join attestation topic: %w", err)
 	}
 
-	// Subscribe to receive messages
-	snSub, err := snTopic.Subscribe()
-	if err != nil {
-		h.Close()
-		return nil, fmt.Errorf("subscribe snapshot: %w", err)
-	}
-
-	atSub, err := atTopic.Subscribe()
-	if err != nil {
-		h.Close()
-		return nil, fmt.Errorf("subscribe attestation: %w", err)
-	}
-
 	ruTopic, err := ps.Join(cfg.RumorTopic)
 	if err != nil {
 		h.Close()
 		return nil, fmt.Errorf("join rumor topic: %w", err)
-	}
-
-	ruSub, err := ruTopic.Subscribe()
-	if err != nil {
-		h.Close()
-		return nil, fmt.Errorf("subscribe rumor: %w", err)
 	}
 
 	node := &Node{
@@ -172,9 +149,6 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		snapshotTopic:    snTopic,
 		attestationTopic: atTopic,
 		rumorTopic:       ruTopic,
-		snapshotSub:      snSub,
-		attestationSub:   atSub,
-		rumorSub:         ruSub,
 		cfg:              cfg,
 	}
 
@@ -320,33 +294,53 @@ func (n *Node) ConnectSeedlist(ctx context.Context) error {
 
 // PublishSnapshot publishes raw bytes to the snapshot topic.
 func (n *Node) PublishSnapshot(ctx context.Context, data []byte) error {
-	return n.snapshotTopic.Publish(ctx, data)
+	err := n.snapshotTopic.Publish(ctx, data)
+	if err == nil {
+		metrics.MessagesPublished.WithLabelValues("snapshot").Inc()
+	}
+	return err
 }
 
 // PublishAttestation publishes raw bytes to the attestation topic.
 func (n *Node) PublishAttestation(ctx context.Context, data []byte) error {
-	return n.attestationTopic.Publish(ctx, data)
+	err := n.attestationTopic.Publish(ctx, data)
+	if err == nil {
+		metrics.MessagesPublished.WithLabelValues("attestation").Inc()
+	}
+	return err
 }
 
 // PublishRumor publishes raw bytes to the rumor topic.
 func (n *Node) PublishRumor(ctx context.Context, data []byte) error {
-	return n.rumorTopic.Publish(ctx, data)
+	err := n.rumorTopic.Publish(ctx, data)
+	if err == nil {
+		metrics.MessagesPublished.WithLabelValues("rumor").Inc()
+	}
+	return err
 }
 
-// SnapshotMessages returns a channel of incoming snapshot messages.
-func (n *Node) SnapshotMessages(ctx context.Context) <-chan []byte {
-	ch := make(chan []byte, 64)
+// subscribeAndRelay creates a per-caller subscription on the given topic and
+// relays incoming messages (excluding self-published) into the returned channel.
+// The subscription is cancelled when ctx is done. The topicLabel is used for
+// Prometheus metrics (e.g. "snapshot", "attestation", "rumor").
+func (n *Node) subscribeAndRelay(ctx context.Context, topic *pubsub.Topic, bufSize int, topicLabel string) (<-chan []byte, error) {
+	sub, err := topic.Subscribe()
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan []byte, bufSize)
 	go func() {
 		defer close(ch)
+		defer sub.Cancel()
 		for {
-			msg, err := n.snapshotSub.Next(ctx)
+			msg, err := sub.Next(ctx)
 			if err != nil {
 				return
 			}
-			// Skip our own messages
 			if msg.ReceivedFrom == n.Host.ID() {
 				continue
 			}
+			metrics.MessagesReceived.WithLabelValues(topicLabel).Inc()
 			select {
 			case ch <- msg.Data:
 			case <-ctx.Done():
@@ -354,52 +348,44 @@ func (n *Node) SnapshotMessages(ctx context.Context) <-chan []byte {
 			}
 		}
 	}()
+	return ch, nil
+}
+
+// SnapshotMessages returns a channel of incoming snapshot messages.
+// Each call creates its own GossipSub subscription so multiple consumers
+// each receive every message independently.
+func (n *Node) SnapshotMessages(ctx context.Context) <-chan []byte {
+	ch, err := n.subscribeAndRelay(ctx, n.snapshotTopic, 64, "snapshot")
+	if err != nil {
+		fmt.Printf("ERROR: subscribe snapshot: %v\n", err)
+		empty := make(chan []byte)
+		close(empty)
+		return empty
+	}
 	return ch
 }
 
 // AttestationMessages returns a channel of incoming attestation messages.
 func (n *Node) AttestationMessages(ctx context.Context) <-chan []byte {
-	ch := make(chan []byte, 256)
-	go func() {
-		defer close(ch)
-		for {
-			msg, err := n.attestationSub.Next(ctx)
-			if err != nil {
-				return
-			}
-			if msg.ReceivedFrom == n.Host.ID() {
-				continue
-			}
-			select {
-			case ch <- msg.Data:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	ch, err := n.subscribeAndRelay(ctx, n.attestationTopic, 256, "attestation")
+	if err != nil {
+		fmt.Printf("ERROR: subscribe attestation: %v\n", err)
+		empty := make(chan []byte)
+		close(empty)
+		return empty
+	}
 	return ch
 }
 
 // RumorMessages returns a channel of incoming rumor messages.
 func (n *Node) RumorMessages(ctx context.Context) <-chan []byte {
-	ch := make(chan []byte, 1024)
-	go func() {
-		defer close(ch)
-		for {
-			msg, err := n.rumorSub.Next(ctx)
-			if err != nil {
-				return
-			}
-			if msg.ReceivedFrom == n.Host.ID() {
-				continue
-			}
-			select {
-			case ch <- msg.Data:
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	ch, err := n.subscribeAndRelay(ctx, n.rumorTopic, 1024, "rumor")
+	if err != nil {
+		fmt.Printf("ERROR: subscribe rumor: %v\n", err)
+		empty := make(chan []byte)
+		close(empty)
+		return empty
+	}
 	return ch
 }
 
@@ -410,10 +396,17 @@ func (n *Node) MeshPeerCount() (snapshots, attestations, rumors int) {
 		len(n.rumorTopic.ListPeers())
 }
 
-// Close shuts down the libp2p host.
+// Topics returns the GossipSub topic handles for metrics collection.
+func (n *Node) Topics() metrics.TopicSet {
+	return metrics.TopicSet{
+		Snapshot:    n.snapshotTopic,
+		Attestation: n.attestationTopic,
+		Rumor:       n.rumorTopic,
+	}
+}
+
+// Close shuts down the libp2p host. Per-caller subscriptions are cancelled
+// by their own goroutines when the context is done.
 func (n *Node) Close() error {
-	n.snapshotSub.Cancel()
-	n.attestationSub.Cancel()
-	n.rumorSub.Cancel()
 	return n.Host.Close()
 }

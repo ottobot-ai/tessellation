@@ -105,6 +105,9 @@ object NakamotoChainStore {
     /** Walk the canonical chain from `startHash` backward to find the hash at the given ordinal. */
     def walkBackTo(startHash: Hash, targetOrdinal: Long): F[Option[Hash]]
 
+    /** Find a snapshot by ordinal in the in-memory store (scans all entries, not just canonical chain). */
+    def getByOrdinal(ordinal: Long): F[Option[StoredSnapshot]]
+
     /** Get current chain state size (number of stored snapshots) */
     def size: F[Int]
 
@@ -318,15 +321,20 @@ object NakamotoChainStore {
               // Collect hashes on the canonical chain from finalized tip backward
               val canonicalHashes = scala.collection.mutable.Set.empty[Hash]
               var current = state.byHash.get(hash)
+              var walkReachedGenesis = false
               while (current.isDefined) {
                 canonicalHashes += current.get.hash
+                if (current.get.ordinal <= 1) walkReachedGenesis = true
                 current = state.byHash.get(current.get.parentHash)
               }
 
-              // Prune: remove snapshots with ordinal <= finalized that aren't on canonical chain
+              // Prune: remove snapshots with ordinal <= finalized that aren't on canonical chain.
+              // If the canonical walk didn't reach genesis (parent pruned in a prior round),
+              // conservatively keep ALL snapshots below the finalized ordinal — we can't
+              // verify what's canonical below the break point.
               val pruned = state.byHash.filter {
                 case (h, s) =>
-                  s.ordinal > ordinal || canonicalHashes.contains(h)
+                  s.ordinal > ordinal || canonicalHashes.contains(h) || !walkReachedGenesis
               }
               val prunedCount = state.byHash.size - pruned.size
 
@@ -365,6 +373,9 @@ object NakamotoChainStore {
                 }
             }
           }
+
+        def getByOrdinal(ordinal: Long): F[Option[StoredSnapshot]] =
+          stateRef.get.map(_.byHash.values.find(_.ordinal == ordinal))
 
         def size: F[Int] =
           stateRef.get.map(_.byHash.size)

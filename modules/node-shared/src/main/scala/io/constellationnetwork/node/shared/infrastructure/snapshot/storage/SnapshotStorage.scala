@@ -224,15 +224,18 @@ object SnapshotStorage {
 
         def get(ordinal: SnapshotOrdinal): F[Option[Signed[S]]] =
           ordinalCache(ordinal).get.flatMap {
-            case Some(hash) => get(hash)
-            case None       => snapshotLocalFileSystemStorage.read(ordinal)
+            case Some(hash) =>
+              get(hash).flatMap {
+                case some @ Some(_) => (some: Option[Signed[S]]).pure[F]
+                // Stale cache entry (hash from a reorged snapshot whose file was deleted).
+                // Evict and fall through to disk which has the current ordinal file.
+                case None => ordinalCache(ordinal).set(None) >> snapshotLocalFileSystemStorage.read(ordinal)
+              }
+            case None => snapshotLocalFileSystemStorage.read(ordinal)
           }
 
         def getHashed(ordinal: SnapshotOrdinal)(implicit hasher: Hasher[F]): F[Option[Hashed[S]]] =
-          ordinalCache(ordinal).get.flatMap {
-            case Some(hash) => get(hash).flatMap(_.traverse(_.toHashed))
-            case None       => snapshotLocalFileSystemStorage.read(ordinal).flatMap(_.traverse(_.toHashed))
-          }
+          get(ordinal).flatMap(_.traverse(_.toHashed))
 
         def get(hash: Hash): F[Option[Signed[S]]] =
           hashCache(hash).get.flatMap {
@@ -260,6 +263,14 @@ object SnapshotStorage {
               }
             } >>
             enqueue(snapshot, state) >>
+            // Ensure the ordinal file exists on disk after enqueue. enqueue → write can fail
+            // due to race conditions during concurrent reorgs (UnableToPersistSnapshot when
+            // another thread recreated the ordinal file first, or hash file missing). Write
+            // directly to the ordinal path as a guaranteed fallback — no hash file or link needed.
+            snapshotLocalFileSystemStorage.exists(snapshot.ordinal).flatMap { exists =>
+              if (!exists) snapshotLocalFileSystemStorage.writeUnderOrdinal(snapshot).attempt.void
+              else Async[F].unit
+            } >>
             headRef.set((snapshot, hasher, state).some).void
 
         def setTentativeHead(snapshot: Signed[S], state: C)(implicit hasher: Hasher[F]): F[Unit] =

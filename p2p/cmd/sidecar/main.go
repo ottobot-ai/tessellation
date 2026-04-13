@@ -22,6 +22,7 @@ import (
 	"github.com/scasplte2/tessellation/p2p/internal/gossip"
 	"github.com/scasplte2/tessellation/p2p/internal/grpcserver"
 	"github.com/scasplte2/tessellation/p2p/internal/httpbridge"
+	"github.com/scasplte2/tessellation/p2p/internal/metrics"
 )
 
 func main() {
@@ -42,7 +43,7 @@ func main() {
 	flag.BoolVar(&enableHTTP, "enable-http", false, "enable HTTP bridge (debug/fallback, gRPC is the primary interface)")
 	flag.StringVar(&jvmGRPCAddr, "jvm-grpc", "127.0.0.1:50053", "JVM ChainSyncInbound gRPC address (sidecar calls JVM to serve peer requests)")
 	flag.StringVar(&cfg.PrivateKeyPath, "key", "", "path to Ed25519 private key file")
-	flag.StringVar(&cfg.MetricsAddr, "metrics", "", "Prometheus metrics address (empty = disabled)")
+	flag.StringVar(&cfg.MetricsAddr, "metrics", ":9501", "Prometheus metrics listen address (empty = disabled)")
 	flag.BoolVar(&cfg.DisableMdns, "disable-mdns", false, "disable mDNS peer discovery (force DHT-only — for multi-host validation)")
 
 	var generateKey bool
@@ -167,18 +168,33 @@ func main() {
 	fmt.Printf("  Topics: %s, %s, %s\n", cfg.SnapshotTopic, cfg.AttestationTopic, cfg.RumorTopic)
 	fmt.Printf("  gRPC:   %s\n", cfg.GRPCAddr)
 
-	// Connect to seedlist (bootstrap peers for the DHT)
-	if len(cfg.Seedlist) > 0 {
-		if err := node.ConnectSeedlist(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "WARN: seedlist connect: %v\n", err)
-		}
-	}
-
 	// Bootstrap the Kademlia DHT routing table and start the rendezvous
 	// discovery loop. Once running, peer discovery is fully decentralized;
 	// the seedlist is only used as the initial entry point.
 	if err := node.BootstrapDHT(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "WARN: DHT bootstrap: %v\n", err)
+	}
+
+	// Connect to seedlist in background — each dial can block up to 10s on
+	// unreachable peers, and with N nodes starting sequentially most peers
+	// aren't up yet. Running this after gRPC server setup ensures the
+	// healthcheck (nc -z localhost 50051) passes immediately.
+	if len(cfg.Seedlist) > 0 {
+		go func() {
+			if err := node.ConnectSeedlist(ctx); err != nil {
+				fmt.Fprintf(os.Stderr, "WARN: seedlist connect: %v\n", err)
+			}
+		}()
+	}
+
+	// Prometheus metrics server
+	if cfg.MetricsAddr != "" {
+		metricsSrv := metrics.ListenAndServe(cfg.MetricsAddr)
+		metrics.StartGaugeUpdater(ctx, node.Host, node.DHT, node.Topics())
+		go func() {
+			<-ctx.Done()
+			metricsSrv.Close()
+		}()
 	}
 
 	// HTTP bridge — opt-in debug/fallback (gRPC is the primary JVM interface)

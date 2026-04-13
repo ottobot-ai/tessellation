@@ -144,6 +144,31 @@ object GlobalSnapshotConsensus {
 
       undoJournal <- io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal.make[F](mptStore).map(Some(_))
 
+      // Wrap getGlobalSnapshotByOrdinal with a chainStore fallback for Nakamoto mode.
+      // snapshotStorage loses ordinal index files during fork switches; chainStore has the
+      // full canonical chain. The Ref breaks the ordering dependency (chainStore is created later).
+      chainStoreForLookupRef <- cats.effect.kernel.Ref.of[F, Option[
+        io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.NakamotoChainStoreAlgebra[F]
+      ]](None)
+      getGlobalSnapshotByOrdinalWithFallback: (SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]) = {
+        (ordinal: SnapshotOrdinal) =>
+          getGlobalSnapshotByOrdinal(ordinal).flatMap {
+            case some @ Some(_) => Async[F].pure(some: Option[Hashed[GlobalIncrementalSnapshot]])
+            case None           =>
+              // snapshotStorage failed (stale cache or missing ordinal file from reorg race).
+              // Fall back to chainStore's in-memory store — direct ordinal scan, no disk.
+              chainStoreForLookupRef.get.flatMap {
+                case Some(cs) =>
+                  cs.getByOrdinal(ordinal.value.value).flatMap {
+                    case Some(stored) =>
+                      HasherSelector[F].withCurrent(implicit h => stored.signedSnapshot.toHashed[F].map(_.some))
+                    case None => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
+                  }
+                case None => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
+              }
+          }
+      }
+
       snapshotAcceptanceManager =
         GlobalSnapshotAcceptanceManager.make(
           sharedCfg.fieldsAddedOrdinals,
@@ -218,7 +243,7 @@ object GlobalSnapshotConsensus {
           appConfig.shared.leavingDelay,
           lastNGlobalSnapshotStorage,
           lastGlobalSnapshotStorage,
-          getGlobalSnapshotByOrdinal,
+          getGlobalSnapshotByOrdinalWithFallback,
           clusterStorage,
           eventMempool,
           eventGossipClient,
@@ -358,6 +383,7 @@ object GlobalSnapshotConsensus {
           chainStore <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore
             .make[F](globalSnapshotStorage, chainSelection, tipTracker)
           _ <- chainStoreRef.set(Some(chainStore))
+          _ <- chainStoreForLookupRef.set(Some(chainStore))
           // Seed chain store with the current head snapshot so gossip children can find their parent
           _ <- globalSnapshotStorage.head.flatMap {
             case Some((headSigned, headCtx)) =>

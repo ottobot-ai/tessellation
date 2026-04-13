@@ -8,10 +8,17 @@
   "time": { "from": "now-30m", "to": "now" },
   "panels": [
     {
+      "id": 100,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 0 },
+      "options": { "mode": "markdown", "content": "# Chain Status" }
+    },
+    {
       "id": 1,
-      "title": "Chain Overview",
+      "title": "Best Ordinal",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 2 },
       "targets": [{ "expr": "max(dag_nakamoto_ordinal)", "legendFormat": "Best Ordinal" }],
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] } } }
     },
@@ -19,7 +26,7 @@
       "id": 2,
       "title": "Finalized Ordinal",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 2 },
       "targets": [{ "expr": "max(dag_nakamoto_finalized_ordinal)", "legendFormat": "Finalized" }],
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "blue", "value": null}] } } }
     },
@@ -27,7 +34,7 @@
       "id": 3,
       "title": "Current Slot",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 2 },
       "targets": [{ "expr": "max(dag_nakamoto_slot)", "legendFormat": "Slot" }],
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "purple", "value": null}] } } }
     },
@@ -35,114 +42,15 @@
       "id": 4,
       "title": "Fill Rate",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 2 },
       "targets": [{ "expr": "max(dag_nakamoto_fill_rate) * 100", "legendFormat": "Fill %" }],
       "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 5}, {"color": "green", "value": 10}] } } }
-    },
-    {
-      "id": 5,
-      "title": "Snapshots per Minute (all nodes)",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
-      "targets": [
-        { "expr": "sum(rate(dag_nakamoto_snapshots_produced_total[1m])) * 60", "legendFormat": "Produced/min" },
-        { "expr": "sum(rate(dag_nakamoto_snapshots_received_total[1m])) * 60", "legendFormat": "Received/min (gossip)" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
-    },
-    {
-      "id": 6,
-      "title": "Ordinal Progression",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
-      "targets": [
-        { "expr": "dag_nakamoto_ordinal", "legendFormat": "{{instance}} tip" },
-        { "expr": "dag_nakamoto_finalized_ordinal", "legendFormat": "{{instance}} finalized" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 0 } } }
-    },
-    {
-      "id": 7,
-      "title": "Fork Count",
-      "type": "timeseries",
-      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 12 },
-      "targets": [
-        { "expr": "dag_nakamoto_fork_count", "legendFormat": "{{instance}}" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 5 }, "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 3}, {"color": "red", "value": 5}] } } }
-    },
-    {
-      "id": 8,
-      "title": "Slots Won / Rejected",
-      "type": "timeseries",
-      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 12 },
-      "targets": [
-        { "expr": "rate(dag_nakamoto_slots_won_total[1m]) * 60", "legendFormat": "{{instance}} won/min" },
-        { "expr": "rate(dag_nakamoto_snapshots_rejected_total[1m]) * 60", "legendFormat": "{{instance}} rejected/min" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
-    },
-    {
-      "id": 9,
-      "title": "Attestation Weight",
-      "type": "timeseries",
-      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 12 },
-      "targets": [
-        { "expr": "dag_nakamoto_attestation_weight", "legendFormat": "{{instance}}" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 }, "thresholds": { "mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 0.67}] } } }
-    },
-    {
-      "id": 10,
-      "title": "Slot Gap Distribution (avg)",
-      "description": "Average number of empty slots between consecutive snapshots",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 18 },
-      "targets": [{ "expr": "avg(dag_nakamoto_slot_gap_sum / dag_nakamoto_slot_gap_count)", "legendFormat": "Avg slot gap" }],
-      "fieldConfig": { "defaults": { "unit": "none", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 10}, {"color": "red", "value": 20}] } } }
-    },
-    {
-      "id": 11,
-      "title": "Max Slot Gap",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 18 },
-      "targets": [{ "expr": "max(dag_nakamoto_slot_gap_max)", "legendFormat": "Max gap" }],
-      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 30}, {"color": "red", "value": 100}] } } }
-    },
-    {
-      "id": 20,
-      "title": "─── DAG-L1 Transaction Layer ───",
-      "type": "text",
-      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 22 },
-      "options": { "mode": "markdown", "content": "## DAG-L1 Transactions" }
-    },
-    {
-      "id": 12,
-      "title": "L1 Transactions per Second (TPS)",
-      "description": "Rate of DAG transactions received by L1 nodes",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
-      "targets": [
-        { "expr": "sum(rate(dag_http_client_request_count_total{route=\"dag_l1_output\",status=\"200\"}[1m]))", "legendFormat": "L1→GL0 blocks/s" },
-        { "expr": "sum(rate(dag_rumors_consumed_total{content_type_short=\"Signed[Block]\",outcome=\"success\"}[1m]))", "legendFormat": "L1 blocks consumed/s" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "ops", "decimals": 2, "custom": { "drawStyle": "line", "fillOpacity": 15 } } }
-    },
-    {
-      "id": 13,
-      "title": "L1 Blocks Total",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
-      "targets": [
-        { "expr": "dag_rumors_consumed_total{content_type_short=\"Signed[Block]\",outcome=\"success\"}", "legendFormat": "{{instance}} blocks" }
-      ],
-      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 5 } } }
     },
     {
       "id": 14,
       "title": "Chain Length",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 18 },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 2 },
       "targets": [{ "expr": "max(dag_nakamoto_chain_length)", "legendFormat": "Length" }],
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] } } }
     },
@@ -150,11 +58,313 @@
       "id": 15,
       "title": "Finalized Total",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 18 },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 2 },
       "targets": [{ "expr": "max(dag_nakamoto_finalized_total)", "legendFormat": "Finalized" }],
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "blue", "value": null}] } } }
+    },
+
+    {
+      "id": 101,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 6 },
+      "options": { "mode": "markdown", "content": "# Ordinal & Finality Progression" }
+    },
+    {
+      "id": 6,
+      "title": "Ordinal vs Finalized (per node)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "dag_nakamoto_ordinal", "legendFormat": "{{node}} tip" },
+        { "expr": "dag_nakamoto_finalized_ordinal", "legendFormat": "{{node}} finalized" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 2 } } }
+    },
+    {
+      "id": 16,
+      "title": "Finality Lag (tip - finalized)",
+      "description": "Number of unfinalized ordinals between tip and last finalized",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "dag_nakamoto_ordinal - dag_nakamoto_finalized_ordinal", "legendFormat": "{{node}} lag" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 15 }, "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 10}, {"color": "red", "value": 31}] } } }
+    },
+
+    {
+      "id": 102,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 16 },
+      "options": { "mode": "markdown", "content": "# Production & Gossip" }
+    },
+    {
+      "id": 5,
+      "title": "Snapshots / min (all nodes)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 18 },
+      "targets": [
+        { "expr": "sum(rate(dag_nakamoto_snapshots_produced_total[1m])) * 60", "legendFormat": "Produced/min" },
+        { "expr": "sum(rate(dag_nakamoto_snapshots_received_total[1m])) * 60", "legendFormat": "Received/min (gossip)" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } } }
+    },
+    {
+      "id": 8,
+      "title": "Slots Won / Rejected per min",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 18 },
+      "targets": [
+        { "expr": "rate(dag_nakamoto_slots_won_total[1m]) * 60", "legendFormat": "{{node}} won/min" },
+        { "expr": "rate(dag_nakamoto_snapshots_rejected_total[1m]) * 60", "legendFormat": "{{node}} rejected/min" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
+    },
+    {
+      "id": 9,
+      "title": "Attestation Weight",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 18 },
+      "targets": [
+        { "expr": "dag_nakamoto_attestation_weight", "legendFormat": "{{node}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 }, "thresholds": { "mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 0.67}] } } }
+    },
+
+    {
+      "id": 103,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 26 },
+      "options": { "mode": "markdown", "content": "# Fork & Slot Health" }
+    },
+    {
+      "id": 7,
+      "title": "Fork Count",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 28 },
+      "targets": [
+        { "expr": "dag_nakamoto_fork_count", "legendFormat": "{{node}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 }, "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 3}, {"color": "red", "value": 5}] } } }
+    },
+    {
+      "id": 10,
+      "title": "Avg Slot Gap",
+      "description": "Average empty slots between consecutive snapshots (lower = denser chain)",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 4, "x": 8, "y": 28 },
+      "targets": [{ "expr": "avg(dag_nakamoto_slot_gap_sum / dag_nakamoto_slot_gap_count)", "legendFormat": "Avg" }],
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 10}, {"color": "red", "value": 20}] } } }
+    },
+    {
+      "id": 11,
+      "title": "Max Slot Gap",
+      "type": "stat",
+      "gridPos": { "h": 3, "w": 4, "x": 12, "y": 28 },
+      "targets": [{ "expr": "max(dag_nakamoto_slot_gap_max)", "legendFormat": "Max" }],
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 30}, {"color": "red", "value": 100}] } } }
+    },
+    {
+      "id": 17,
+      "title": "Slot Gap Over Time",
+      "description": "Slot gap between consecutive snapshots (per node)",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 28 },
+      "targets": [
+        { "expr": "rate(dag_nakamoto_slot_gap_sum[1m]) / rate(dag_nakamoto_slot_gap_count[1m])", "legendFormat": "{{node}} avg gap/min" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
+    },
+    {
+      "id": 18,
+      "title": "Snapshot Production Rate (per node)",
+      "description": "Snapshots produced per minute by each node",
+      "type": "timeseries",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 31 },
+      "targets": [
+        { "expr": "rate(dag_nakamoto_snapshots_produced_total[1m]) * 60", "legendFormat": "{{node}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 50 } } }
+    },
+
+    {
+      "id": 104,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 35 },
+      "options": { "mode": "markdown", "content": "# DAG-L1 Transaction Layer" }
+    },
+    {
+      "id": 12,
+      "title": "L1 Blocks Received at GL0 / min",
+      "description": "Rate of L1 blocks arriving at GL0 via HTTP POST /dag/l1-output",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 37 },
+      "targets": [
+        { "expr": "sum(rate(dag_http_request_count_total{route=\"dag_l1_output\",status=\"200\"}[1m])) * 60", "legendFormat": "L1 blocks/min (all GL0)" },
+        { "expr": "rate(dag_http_request_count_total{route=\"dag_l1_output\",status=\"200\"}[1m]) * 60", "legendFormat": "{{node}} blocks/min" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 } } }
+    },
+    {
+      "id": 13,
+      "title": "L1 Blocks Received (cumulative per GL0)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 37 },
+      "targets": [
+        { "expr": "dag_http_request_count_total{route=\"dag_l1_output\",status=\"200\"}", "legendFormat": "{{node}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 5 } } }
+    },
+    {
+      "id": 22,
+      "title": "Events Drained vs Accepted per Snapshot",
+      "description": "Mempool events drained and actually accepted per snapshot production",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 45 },
+      "targets": [
+        { "expr": "rate(dag_nakamoto_events_drained_sum[1m]) / rate(dag_nakamoto_events_drained_count[1m])", "legendFormat": "avg drained" },
+        { "expr": "rate(dag_nakamoto_events_accepted_sum[1m]) / rate(dag_nakamoto_events_accepted_count[1m])", "legendFormat": "avg accepted" },
+        { "expr": "rate(dag_nakamoto_events_returned_sum[1m]) / rate(dag_nakamoto_events_returned_count[1m])", "legendFormat": "avg returned" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 15 } } }
+    },
+    {
+      "id": 23,
+      "title": "Finality Latency (ms)",
+      "description": "Wall-clock ms from snapshot production to attestation-finalization",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 45 },
+      "targets": [
+        { "expr": "rate(dag_nakamoto_finality_latency_ms_sum[1m]) / rate(dag_nakamoto_finality_latency_ms_count[1m])", "legendFormat": "avg finality ms" },
+        { "expr": "dag_nakamoto_finality_latency_ms_max", "legendFormat": "max finality ms" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
+    },
+    {
+      "id": 24,
+      "title": "Production Duration (ms)",
+      "description": "Wall-clock ms for snapshot creation (mempool drain → publish)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 53 },
+      "targets": [
+        { "expr": "rate(dag_nakamoto_production_duration_ms_sum[1m]) / rate(dag_nakamoto_production_duration_ms_count[1m])", "legendFormat": "{{node}} avg ms" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
+    },
+    {
+      "id": 25,
+      "title": "Production Abandoned",
+      "description": "Snapshots abandoned due to better gossip received",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 53 },
+      "targets": [{ "expr": "sum(dag_nakamoto_production_abandoned_total)", "legendFormat": "Abandoned" }],
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 10}, {"color": "red", "value": 50}] } } }
+    },
+    {
+      "id": 26,
+      "title": "Reorgs",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 53 },
+      "targets": [{ "expr": "sum(dag_nakamoto_reorgs_total)", "legendFormat": "Reorgs" }],
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 20}] } } }
+    },
+    {
+      "id": 27,
+      "title": "Catch-ups",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 53 },
+      "targets": [{ "expr": "sum(dag_nakamoto_catchups_total)", "legendFormat": "Catch-ups" }],
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 3}] } } }
+    },
+
+    {
+      "id": 106,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 57 },
+      "options": { "mode": "markdown", "content": "# Sidecar GossipSub" }
+    },
+    {
+      "id": 28,
+      "title": "GossipSub Mesh Peers",
+      "description": "Number of peers in each GossipSub topic mesh",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 59 },
+      "targets": [
+        { "expr": "sidecar_gossip_mesh_peers", "legendFormat": "{{instance}} {{topic}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
+    },
+    {
+      "id": 29,
+      "title": "Sidecar Messages Published / min",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 59 },
+      "targets": [
+        { "expr": "rate(sidecar_gossip_messages_published_total[1m]) * 60", "legendFormat": "{{instance}} {{topic}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 15 } } }
+    },
+    {
+      "id": 30,
+      "title": "Sidecar Messages Received / min",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 59 },
+      "targets": [
+        { "expr": "rate(sidecar_gossip_messages_received_total[1m]) * 60", "legendFormat": "{{instance}} {{topic}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 15 } } }
+    },
+    {
+      "id": 31,
+      "title": "Connected Peers",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 66 },
+      "targets": [{ "expr": "sidecar_connected_peers_total", "legendFormat": "{{instance}}" }],
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 2}] } } }
+    },
+    {
+      "id": 32,
+      "title": "DHT Routing Table",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 66 },
+      "targets": [{ "expr": "sidecar_dht_routing_table_size", "legendFormat": "{{instance}}" }],
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 2}] } } }
+    },
+
+    {
+      "id": 105,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 70 },
+      "options": { "mode": "markdown", "content": "# Backfill" }
+    },
+    {
+      "id": 19,
+      "title": "Backfill Progress",
+      "description": "Ordinal progress of the backfill daemon",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 72 },
+      "targets": [
+        { "expr": "dag_nakamoto_backfill_progress", "legendFormat": "{{node}} progress" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
+    },
+    {
+      "id": 21,
+      "title": "Backfill Completions",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 72 },
+      "targets": [
+        { "expr": "sum(dag_nakamoto_backfill_completed_total)", "legendFormat": "Completions" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] } } }
     }
   ],
   "schemaVersion": 39,
-  "version": 1
+  "version": 2
 }
