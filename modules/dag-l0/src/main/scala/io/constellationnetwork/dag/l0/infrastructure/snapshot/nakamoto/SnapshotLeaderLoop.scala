@@ -557,9 +557,7 @@ object SnapshotLeaderLoop {
                 getGlobalSnapshotByOrdinal = ordinal =>
                   snapshotStorage.get(ordinal).flatMap {
                     case Some(s) => s.toHashed[F].map(_.some)
-                    case None    =>
-                      // snapshotStorage ordinal index can be lost during Nakamoto fork switches.
-                      // Fall back to chainStore's in-memory store — direct ordinal scan, no disk.
+                    case None =>
                       chainStore.getByOrdinal(ordinal.value.value).flatMap {
                         case Some(stored) => stored.signedSnapshot.toHashed[F].map(_.some)
                         case None         => none[Hashed[GlobalIncrementalSnapshot]].pure[F]

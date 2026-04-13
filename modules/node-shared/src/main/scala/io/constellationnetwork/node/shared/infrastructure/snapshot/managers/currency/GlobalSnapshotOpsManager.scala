@@ -42,9 +42,16 @@ class GlobalSnapshotOpsManager[F[_]: Async: Parallel](
       )
       .flatMap {
         case Some(snapshot) => snapshot.pure[F]
-        case None =>
-          new RuntimeException(s"Global snapshot not found for ordinal $ordinal after retries")
-            .raiseError[F, Hashed[GlobalIncrementalSnapshot]]
+        case None           =>
+          // Last resort: check the in-memory snapshot cache (populated by prior successful lookups)
+          lastGlobalSnapshotsCached.get.map(_.get(ordinal)).flatMap {
+            case Some(snapshot) =>
+              logger.info(s"Recovered ordinal $ordinal from lastGlobalSnapshotsCached after retry exhaustion") >>
+                snapshot.pure[F]
+            case None =>
+              new RuntimeException(s"Global snapshot not found for ordinal $ordinal after retries")
+                .raiseError[F, Hashed[GlobalIncrementalSnapshot]]
+          }
       }
   }
 

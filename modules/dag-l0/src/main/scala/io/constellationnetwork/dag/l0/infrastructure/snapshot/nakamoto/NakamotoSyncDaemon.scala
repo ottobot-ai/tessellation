@@ -438,7 +438,16 @@ object NakamotoSyncDaemon {
                 consensusFns = consensusFns,
                 lastSignedArtifact = parentStored.signedSnapshot,
                 lastContext = parentStored.context,
-                getByOrdinal = (_: SnapshotOrdinal) => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
+                getByOrdinal = { (ordinal: SnapshotOrdinal) =>
+                  snapshotStorage.get(ordinal).flatMap {
+                    case Some(s) => HasherSelector[F].withCurrent(implicit h => s.toHashed[F].map(_.some))
+                    case None =>
+                      chainStore.getByOrdinal(ordinal.value.value).flatMap {
+                        case Some(stored) => HasherSelector[F].withCurrent(implicit h => stored.signedSnapshot.toHashed[F].map(_.some))
+                        case None         => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
+                      }
+                  }
+                }
               )
             case None =>
               // Parent not in chain store. Three-tier gap handling:

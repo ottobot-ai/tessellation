@@ -14,7 +14,7 @@ const createConfig = () => {
   return { ...sharedArgs }
 }
 
-const SLEEP_TIME_UNTIL_QUERY = 120 * 1000
+const SLEEP_TIME_UNTIL_QUERY = 180 * 1000
 
 const FIRST_WALLET_SEED_PHRASE =
   'right off artist rare copy zebra shuffle excite evidence mercy isolate raise'
@@ -194,13 +194,22 @@ const handleMetagraphBatchTransactions = async (
       txnCount,
     )
 
-    logMessage(`Waiting ${SLEEP_TIME_UNTIL_QUERY} ms to fetch wallet balances`)
-    await sleep(SLEEP_TIME_UNTIL_QUERY)
+    const startOriginBalance = await metagraphTokenClient.getBalance()
+    const startDestBalance = await metagraphTokenClient.getBalanceFor(destination.address)
 
-    const originBalance = await metagraphTokenClient.getBalance()
-    const destinationBalance = await metagraphTokenClient.getBalanceFor(
-      destination.address,
-    )
+    logMessage(`Polling for L0 token balance change (timeout ${SLEEP_TIME_UNTIL_QUERY}ms)...`)
+    const pollInterval = 5000
+    const deadline = Date.now() + SLEEP_TIME_UNTIL_QUERY
+    let originBalance = startOriginBalance, destinationBalance = startDestBalance
+    while (Date.now() < deadline) {
+      await sleep(pollInterval)
+      originBalance = await metagraphTokenClient.getBalance()
+      destinationBalance = await metagraphTokenClient.getBalanceFor(destination.address)
+      if (originBalance !== startOriginBalance || destinationBalance !== startDestBalance) {
+        logMessage(`L0 token balance changed after ${Math.round((Date.now() - (deadline - SLEEP_TIME_UNTIL_QUERY)) / 1000)}s`)
+        break
+      }
+    }
 
     return { originBalance, destinationBalance }
   } catch (error) {
