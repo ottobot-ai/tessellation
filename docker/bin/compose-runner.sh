@@ -21,7 +21,7 @@ show_time() {
 }
 
 cleanup_end() {
-  docker rm -f tx-sender 2>/dev/null || true
+  docker rm -f tx-sender prometheus nakamoto-grafana 2>/dev/null || true
   if [ "$CLEANUP_DOCKER_AT_END" == "true" ] && { [ -z "$TEST_HOST" ] || [ "$TEST_HOST" = "http://localhost" ]; }; then
     ./docker/bin/tessellation-docker-cleanup.sh
   fi
@@ -552,7 +552,57 @@ else
 
   show_time "Started docker compose"
 
+  # Optional Prometheus + Grafana monitoring (--grafana flag)
+  if [ "$ENABLE_GRAFANA" = "true" ]; then
+    echo "Starting Prometheus + Grafana monitoring..."
 
+    # Generate Prometheus config with per-node targets
+    PROM_CFG="$PROJECT_ROOT/nodes/prometheus.yml"
+    cat > "$PROM_CFG" <<PROMEOF
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+scrape_configs:
+PROMEOF
+
+    # GL0 targets
+    echo "  - job_name: 'nakamoto-gl0'" >> "$PROM_CFG"
+    echo "    metrics_path: '/metrics'" >> "$PROM_CFG"
+    echo "    static_configs:" >> "$PROM_CFG"
+    for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
+      port=$((${DAG_L0_PORT_PREFIX}${i}0))
+      echo "      - targets: ['gl0-$i:$port']" >> "$PROM_CFG"
+      echo "        labels: { layer: 'gl0', node: 'gl0-$i' }" >> "$PROM_CFG"
+    done
+
+    # Sidecar targets (if Nakamoto)
+    if [ "$NAKAMOTO_GL0" = "true" ]; then
+      echo "  - job_name: 'sidecar'" >> "$PROM_CFG"
+      echo "    metrics_path: '/metrics'" >> "$PROM_CFG"
+      echo "    static_configs:" >> "$PROM_CFG"
+      for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
+        echo "      - targets: ['sidecar-$i:9501']" >> "$PROM_CFG"
+        echo "        labels: { layer: 'sidecar', node: 'sidecar-$i' }" >> "$PROM_CFG"
+      done
+    fi
+
+    docker rm -f prometheus nakamoto-grafana 2>/dev/null || true
+    docker run -d --name prometheus --network tessellation_common \
+      -v "$PROM_CFG:/etc/prometheus/prometheus.yml:ro" \
+      -p 9090:9090 --restart unless-stopped prom/prometheus:latest >/dev/null 2>&1
+
+    docker run -d --name nakamoto-grafana --network tessellation_common \
+      -e GF_SECURITY_ADMIN_USER=admin -e GF_SECURITY_ADMIN_PASSWORD=admin \
+      -e GF_AUTH_ANONYMOUS_ENABLED=true -e GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer \
+      -p 3000:3000 \
+      -v "$PROJECT_ROOT/nakamoto-test/grafana/provisioning:/etc/grafana/provisioning:ro" \
+      -v "$PROJECT_ROOT/nakamoto-test/grafana/dashboards:/var/lib/grafana/dashboards:ro" \
+      --restart unless-stopped grafana/grafana:latest >/dev/null 2>&1
+
+    echo "  Grafana: http://localhost:3000 (admin/admin)"
+    echo "  Prometheus: http://localhost:9090"
+    show_time "Monitoring started"
+  fi
 
   if [ "$DOCKER_UP" = "true" ]; then
     echo "Docker up mode, skipping end-to-end tests"
@@ -602,7 +652,7 @@ show_time "Cluster became healthy"
 # ------------------------------------------------
 TX_SENDER_JAR="$PROJECT_ROOT/docker/jars/tools.jar"
 TX_SENDER_CONF="$PROJECT_ROOT/docker/config/tx-sender.conf"
-if [ -f "$TX_SENDER_JAR" ] && [ -f "$TX_SENDER_CONF" ]; then
+if [ -f "$TX_SENDER_JAR" ] && [ -f "$TX_SENDER_CONF" ] && [ "$NAKAMOTO_GL0" != "true" ]; then
   echo "Starting background transaction sender..."
   docker rm -f tx-sender 2>/dev/null || true
   docker run -d --name tx-sender \

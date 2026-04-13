@@ -11,11 +11,14 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"crypto/ed25519"
 
 	libp2pcrypto "github.com/libp2p/go-libp2p/core/crypto"
+	libp2pnet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 
 	"github.com/scasplte2/tessellation/p2p/internal/chainsync"
 	"github.com/scasplte2/tessellation/p2p/internal/config"
@@ -175,14 +178,46 @@ func main() {
 		fmt.Fprintf(os.Stderr, "WARN: DHT bootstrap: %v\n", err)
 	}
 
-	// Connect to seedlist in background — each dial can block up to 10s on
-	// unreachable peers, and with N nodes starting sequentially most peers
-	// aren't up yet. Running this after gRPC server setup ensures the
-	// healthcheck (nc -z localhost 50051) passes immediately.
+	// Connect to seedlist in background with retry — each dial can block up to
+	// 10s on unreachable peers, and with N nodes starting sequentially most peers
+	// aren't up yet. Retry every 10s until all seeds are connected or context is done.
 	if len(cfg.Seedlist) > 0 {
 		go func() {
-			if err := node.ConnectSeedlist(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "WARN: seedlist connect: %v\n", err)
+			for attempt := 0; attempt < 12; attempt++ {
+				if attempt > 0 {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(10 * time.Second):
+					}
+				}
+				allConnected := true
+				for _, addr := range cfg.Seedlist {
+					ma, err := multiaddr.NewMultiaddr(addr)
+					if err != nil {
+						continue
+					}
+					pi, err := peer.AddrInfoFromP2pAddr(ma)
+					if err != nil {
+						continue
+					}
+					if pi.ID == node.Host.ID() {
+						continue // skip self
+					}
+					if node.Host.Network().Connectedness(pi.ID) == libp2pnet.Connected {
+						continue // already connected
+					}
+					allConnected = false
+					dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+					if err := node.Host.Connect(dialCtx, *pi); err != nil {
+						fmt.Printf("WARN: failed to connect to seed %s: %v\n", addr, err)
+					}
+					cancel()
+				}
+				if allConnected {
+					fmt.Printf("Seedlist: all peers connected (attempt %d)\n", attempt)
+					return
+				}
 			}
 		}()
 	}

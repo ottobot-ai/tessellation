@@ -209,6 +209,9 @@ for arg in "$@"; do
     --up)
       export DOCKER_UP=true
       ;;
+    --grafana)
+      export ENABLE_GRAFANA=true
+      ;;
     --gl0-url=*)
       export GL0_URL="${arg#*=}"
       ;;

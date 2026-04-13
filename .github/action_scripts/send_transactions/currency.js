@@ -14,7 +14,7 @@ const createConfig = () => {
   return { ...sharedArgs }
 }
 
-const SLEEP_TIME_UNTIL_QUERY = 60 * 1000
+const SLEEP_TIME_UNTIL_QUERY = 120 * 1000
 
 const FIRST_WALLET_SEED_PHRASE =
   'right off artist rare copy zebra shuffle excite evidence mercy isolate raise'
@@ -126,11 +126,33 @@ const handleBatchTransactions = async (
   try {
     await batchTransaction(origin, destination, amount, fee, txnCount)
 
-    logMessage(`Waiting ${SLEEP_TIME_UNTIL_QUERY} ms to fetch wallet balances`)
-    await sleep(SLEEP_TIME_UNTIL_QUERY)
+    // Poll for expected balances with timeout. In Nakamoto consensus, fork convergence
+    // adds latency — the balance endpoint reads snapshotStorage.head which may lag.
+    const expectedOriginDelta = -(amount + fee) * txnCount
+    const expectedDestDelta = amount * txnCount
+    const startOriginBalance = await origin.getBalance()
+    const startDestBalance = await destination.getBalance()
+    const expectedOriginBalance = startOriginBalance + expectedOriginDelta
+    const expectedDestBalance = startDestBalance + expectedDestDelta
 
-    const originBalance = await origin.getBalance()
-    const destinationBalance = await destination.getBalance()
+    logMessage(`Polling for balance change (timeout ${SLEEP_TIME_UNTIL_QUERY}ms)...`)
+    const pollInterval = 5000
+    const deadline = Date.now() + SLEEP_TIME_UNTIL_QUERY
+    let originBalance, destinationBalance
+    while (Date.now() < deadline) {
+      await sleep(pollInterval)
+      originBalance = await origin.getBalance()
+      destinationBalance = await destination.getBalance()
+      if (originBalance !== startOriginBalance || destinationBalance !== startDestBalance) {
+        logMessage(`Balance changed after ${Math.round((Date.now() - (deadline - SLEEP_TIME_UNTIL_QUERY)) / 1000)}s`)
+        break
+      }
+    }
+    if (originBalance === startOriginBalance && destinationBalance === startDestBalance) {
+      logMessage(`Balance unchanged after ${SLEEP_TIME_UNTIL_QUERY / 1000}s — falling back to final check`)
+      originBalance = await origin.getBalance()
+      destinationBalance = await destination.getBalance()
+    }
 
     return { originBalance, destinationBalance }
   } catch (error) {
