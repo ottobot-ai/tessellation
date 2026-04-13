@@ -174,9 +174,9 @@ final case class SnapshotRoutes[F[_]: Async, S <: Snapshot: Encoder, SI <: Snaps
           }
 
         case GET -> Root / "latest" / "combined" / "stream" =>
-          // Gated on finality: serves the combined snapshot at the finalized ordinal.
-          // GL1 and CL0 use this endpoint to pull GL0 state — they must only see
-          // finalized snapshots to avoid fork-confused reads.
+          // Finality-gated: GL0 only tells consumers about finalized snapshots.
+          // The alignment loop must handle the case where finalized ordinal
+          // hasn't advanced (same ordinal returned on consecutive pulls).
           whenNodeReady {
             effectiveLatestOrdinal.flatMap {
               case Some(ordinal) =>
