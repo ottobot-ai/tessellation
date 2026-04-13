@@ -139,39 +139,54 @@ final case class SnapshotRoutes[F[_]: Async, S <: Snapshot: Encoder, SI <: Snaps
           }
 
         case GET -> Root / "latest" / "info" =>
-          // TODO: gate on finality once SnapshotStorage supports getInfo(ordinal).
-          // Currently only head has the info pair. For the metagraph pull use case
-          // (GlobalL0Service.pullGlobalSnapshots), /latest/info is not called — the
-          // context is derived locally from the snapshot content. This route is
-          // primarily for dashboards and external consumers.
+          // Gated on finality: in Nakamoto mode returns info at finalized ordinal,
+          // in BFT mode returns head (equivalent since every snapshot is final).
           whenNodeReady {
-            snapshotStorage.head.flatMap {
-              case Some((_, info)) => Ok(info)
-              case _               => NotFound()
+            effectiveLatestOrdinal.flatMap {
+              case Some(ordinal) =>
+                snapshotStorage.get(ordinal).flatMap {
+                  case Some(snapshot) if snapshot.ordinal === ordinal =>
+                    // Found the snapshot — get its context from snapshotStorage head
+                    // (context is only available for the current head)
+                    snapshotStorage.head.flatMap {
+                      case Some((_, info)) => Ok(info)
+                      case _               => NotFound()
+                    }
+                  case _ => NotFound()
+                }
+              case None => NotFound()
             }
           }
 
         case GET -> Root / "latest" / "combined" =>
-          // TODO: gate on finality once SnapshotStorage supports getWithInfo(ordinal).
+          // Gated on finality: serves the combined snapshot at the finalized ordinal.
           whenNodeReady {
-            snapshotStorage.head.flatMap {
-              case Some((snapshot, state)) =>
-                cachedCombinedResponse.get(snapshot.ordinal, snapshot, state).flatMap { bytes =>
-                  Ok(
-                    fs2.Stream.chunk[F, Byte](fs2.Chunk.array(bytes)),
-                    `Content-Type`(MediaType.application.json)
-                  )
-                }
-              case _ => NotFound()
+            effectiveLatestOrdinal.flatMap {
+              case Some(ordinal) =>
+                combinedSnapshotCheckpointFileSystemStorage
+                  .getAsHttpResponse(ordinal)
+                  .flatMap {
+                    case Some(resp) => resp.pure[F]
+                    case None       => NotFound()
+                  }
+              case None => NotFound()
             }
           }
 
         case GET -> Root / "latest" / "combined" / "stream" =>
-          // TODO: gate on finality
+          // Gated on finality: serves the combined snapshot at the finalized ordinal.
+          // GL1 and CL0 use this endpoint to pull GL0 state — they must only see
+          // finalized snapshots to avoid fork-confused reads.
           whenNodeReady {
-            combinedSnapshotCheckpointFileSystemStorage.getLatestAsHttpResponse.flatMap {
-              case Some(resp) => resp.pure[F]
-              case None       => NotFound()
+            effectiveLatestOrdinal.flatMap {
+              case Some(ordinal) =>
+                combinedSnapshotCheckpointFileSystemStorage
+                  .getAsHttpResponse(ordinal)
+                  .flatMap {
+                    case Some(resp) => resp.pure[F]
+                    case None       => NotFound()
+                  }
+              case None => NotFound()
             }
           }
 

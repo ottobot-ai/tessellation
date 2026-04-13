@@ -211,7 +211,8 @@ const checkGlobalL0Node = async (config) => {
       const name = i === 0 ? 'Global L0 Genesis' : `Global L0 Validator ${i}`;
       infos.push({ name, baseUrl: `${host}:${port}` });
     }
-    await clusterCheck(infos, true, 'Global L0', numGL0, true, numGL0);
+    const isNakamoto = process.env.NAKAMOTO_GL0 === 'true';
+    await clusterCheck(infos, true, 'Global L0', numGL0, true, isNakamoto ? 1 : numGL0);
   }
 };
 

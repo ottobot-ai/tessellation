@@ -95,7 +95,9 @@ object Main
       // exposing /global-snapshots/latest/finalized-ordinal so CL0 can gate state-channel
       // -binary pruning on actual finality. Stays at 0 in BFT mode (HttpApi only consults
       // it when nakamoto mode is on).
-      nakamotoFinalizedOrdinalRef <- Ref.of[IO, Long](0L).asResource
+      // Seed with 1 (genesis ordinal) so the genesis snapshot is always servable
+      // on finality-gated endpoints. Updated by SnapshotLeaderLoop as finality advances.
+      nakamotoFinalizedOrdinalRef <- Ref.of[IO, Long](1L).asResource
 
       services <- Services
         .make[IO, RunNakamoto](
@@ -192,7 +194,7 @@ object Main
           getLocalChainTip = Some(forkRecoveryService.getLocalChainTip),
           maybeMarkSeen = Some(eventGossipDaemon.markSeen),
           getNakamotoFinalizedOrdinal = Some(nakamotoFinalizedOrdinalRef.get.map { ord =>
-            if (ord > 0L) SnapshotOrdinal(ord) else None
+            Some(SnapshotOrdinal.unsafeApply(ord))
           })
         )
       )
