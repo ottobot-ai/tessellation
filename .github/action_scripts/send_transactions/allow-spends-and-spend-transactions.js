@@ -15,7 +15,8 @@ const {
     getEpochProgress,
     createSerializer,
     sortedJsonStringify,
-    logWorkflow
+    logWorkflow,
+    getCombinedSnapshot
 } = require('../shared');
 
 const CONSTANTS = {
@@ -237,7 +238,7 @@ const createVerifier = (urls) => {
     const verifyInL0 = async (address, hash, l0Url, tokenId, layerName, isCurrency = false) => {
         await withRetry(
             async () => {
-                const { data: snapshot } = await axios.get(
+                const snapshot = await getCombinedSnapshot(
                     `${l0Url}/global-snapshots/latest/combined`
                 );
                 await verifyAllowSpendInSnapshot(address, hash, snapshot, tokenId, `${layerName} L0`, isCurrency);
@@ -249,7 +250,7 @@ const createVerifier = (urls) => {
     const verifyInCurrencyL0 = async (address, hash) => {
         await withRetry(
             async () => {
-                const { data: snapshot } = await axios.get(
+                const snapshot = await getCombinedSnapshot(
                     `${urls.currencyL0Url}/snapshots/latest/combined`
                 );
                 await verifyAllowSpendInSnapshot(
@@ -285,7 +286,7 @@ const createBalanceManager = (urls) => {
                 ? `${l0Url}/snapshots/latest/combined`
                 : `${l0Url}/global-snapshots/latest/combined`;
 
-            const { data: snapshot } = await axios.get(snapshotUrl);
+            const snapshot = await getCombinedSnapshot(snapshotUrl);
 
             const balance = snapshot[1]?.balances?.[address] || 0;
 
@@ -572,7 +573,7 @@ const verifyDoubleSpendInL0 = async (address, hash, l0Url) => {
     return await withRetry(
         async () => {
             logWorkflow.info(`Checking L0 for hash: ${hash} at address: ${address}`);
-            const { data: snapshot } = await axios.get(`${l0Url}/global-snapshots/latest/combined`);
+            const snapshot = await getCombinedSnapshot(`${l0Url}/global-snapshots/latest/combined`);
 
             const activeAllowSpends = snapshot[1]?.activeAllowSpends?.['']?.[address] || [];
 
@@ -610,7 +611,7 @@ const executeDoubleSpendWorkflow = async () => {
         const sourceAccount = createAndConnectAccount(PRIVATE_KEYS.key1, { l0Url: urls.globalL0Url, l1Url: urls.dagL1Url }, false);
         const address = sourceAccount.address;
 
-        const { data: initialSnapshot } = await axios.get(`${urls.globalL0Url}/global-snapshots/latest/combined`);
+        const initialSnapshot = await getCombinedSnapshot(`${urls.globalL0Url}/global-snapshots/latest/combined`);
         const initialActiveAllowSpends = initialSnapshot[1]?.activeAllowSpends?.['']?.[address] || [];
         const initialCount = initialActiveAllowSpends.length;
         logWorkflow.info(`Initial active allow spends count for address ${address}: ${initialCount}`);
@@ -642,7 +643,7 @@ const executeDoubleSpendWorkflow = async () => {
 
         logWorkflow.info(`Both transactions have the same hash: ${result.dagL1Hash}`);
 
-        const { data: finalSnapshot } = await axios.get(`${urls.globalL0Url}/global-snapshots/latest/combined`);
+        const finalSnapshot = await getCombinedSnapshot(`${urls.globalL0Url}/global-snapshots/latest/combined`);
         const finalActiveAllowSpends = finalSnapshot[1]?.activeAllowSpends?.['']?.[address] || [];
         const finalCount = finalActiveAllowSpends.length;
         logWorkflow.info(`Final active allow spends count for address ${address}: ${finalCount}`);
@@ -713,7 +714,7 @@ const executeExpiredAllowSpendWorkflow = async () => {
 
             await withRetry(
                 async () => {
-                    const { data: snapshot } = await axios.get(`${urls.globalL0Url}/global-snapshots/latest/combined`);
+                    const snapshot = await getCombinedSnapshot(`${urls.globalL0Url}/global-snapshots/latest/combined`);
 
                     const spendActions = snapshot[1]?.spendActions || [];
 
@@ -943,7 +944,7 @@ const verifyAllowSpendExpiration = async (address, hash, initialBalance, urls, l
         ? `${l0Url}/snapshots/latest/combined`
         : `${l0Url}/global-snapshots/latest/combined`;
 
-    const { data: snapshot } = await axios.get(snapshotUrl);
+    const snapshot = await getCombinedSnapshot(snapshotUrl);
 
     const activeAllowSpends = isCurrency
         ? snapshot[1]?.activeAllowSpends?.[address] || []
@@ -1370,7 +1371,7 @@ const verifyAllowSpendIsInactive = async (address, hash, l0Url) => {
     try {
         logWorkflow.info(`Verifying allow spend ${hash} is inactive for address ${address}`);
 
-        const { data: snapshot } = await axios.get(`${l0Url}/global-snapshots/latest/combined`);
+        const snapshot = await getCombinedSnapshot(`${l0Url}/global-snapshots/latest/combined`);
 
         if (!snapshot.activeAllowSpends) {
             logWorkflow.info('No active allow spends found in snapshot');
@@ -1490,7 +1491,7 @@ const verifySpendActionInGlobalL0 = async (urls, metagraphId, update) => {
     await withRetry(
         async () => {
             let spendActions = [];
-            const {data: snapshot} = await axios.get(`${urls.globalL0Url}/global-snapshots/latest/combined`);
+            const snapshot = await getCombinedSnapshot(`${urls.globalL0Url}/global-snapshots/latest/combined`);
             const currentOrdinal = snapshot[0]?.value?.ordinal;
             spendActions.push(...snapshot[0]?.value?.spendActions?.[metagraphId] || []);
 
@@ -1544,7 +1545,7 @@ const verifyUnauthorizedSpendActionInGlobalL0 = async (urls, tokenId, update) =>
 
         return await withRetry(
             async () => {
-                const { data: snapshot } = await axios.get(`${urls.globalL0Url}/global-snapshots/latest/combined`);
+                const snapshot = await getCombinedSnapshot(`${urls.globalL0Url}/global-snapshots/latest/combined`);
 
                 if (!snapshot.spendActions) {
                     logWorkflow.info('No spend actions found in snapshot, which is expected for unauthorized spend');
@@ -1605,7 +1606,7 @@ const waitForAllAllowSpendsToExpire = async (l0Url) => {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             logWorkflow.info(`Checking for active allow spends (attempt ${attempt}/${maxAttempts})...`);
 
-            const { data: snapshot } = await axios.get(`${l0Url}/global-snapshots/latest/combined`);
+            const snapshot = await getCombinedSnapshot(`${l0Url}/global-snapshots/latest/combined`);
 
             if (!snapshot[1]?.activeAllowSpends) {
                 logWorkflow.success('No active allow spends found, proceeding with workflow');
@@ -1994,9 +1995,9 @@ const verifyAllowSpendNotInGlobalL0 = async (address, allowSpend, l0Url, isCurre
             try {
                 logWorkflow.info(`Checking for allow spend in global L0 (attempt ${attemptsMade}/${maxAttempts})...`);
                 
-                const { data: snapshot } = await axios.get(`${l0Url}/global-snapshots/latest/combined`);
-                
-                const tokenActiveAllowSpends = isCurrency 
+                const snapshot = await getCombinedSnapshot(`${l0Url}/global-snapshots/latest/combined`);
+
+                const tokenActiveAllowSpends = isCurrency
                     ? snapshot[1]?.activeAllowSpends?.[CONSTANTS.CURRENCY_TOKEN_ID] 
                     : snapshot[1]?.activeAllowSpends?.[''];
                     

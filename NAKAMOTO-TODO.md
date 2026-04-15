@@ -94,7 +94,23 @@
    - `claimedBy` tracking for pending vs orphaned events
    - NakamotoChainStore.finalize currently prunes chains but doesn't recycle events
 
-10. **Configurable Finality Mode**
+10. **Partition Recovery (Fork Recovery Test Failures)**
+    - Exposed by fork-recovery e2e test: isolate node via `tc netem loss 100%`, restore, verify catch-up
+    - **10a. Sidecar GossipSub mesh re-establishment:** After network partition, libp2p connections drop.
+      Sidecar only connects to seedlist at startup — no periodic reconnection loop.
+      After sidecar restart, GossipSub mesh (GRAFT/PRUNE) doesn't rebuild; gossip doesn't flow.
+      Fix: periodic seedlist reconnection + GossipSub mesh re-grafting in Go sidecar.
+    - **10b. Backfill trigger on reconnection:** When a node receives a gossip block with unknown parent
+      (gap in chain), ChainSync backfill should trigger automatically to fill the gap.
+      Currently no backfill is initiated — the node just stores the new block without ancestors.
+      Fix: NakamotoSyncDaemon should detect parent-not-found and trigger ChainSync REQUEST.
+    - **10c. ProductionGate stale-fork detection:** After partition, the isolated node keeps producing
+      blocks on its stale fork (building on old finalized tip). It should detect it's behind the
+      cluster and pause production until caught up.
+      Fix: compare incoming gossip ordinals with local tip; pause ProductionGate if behind by > threshold.
+    - Test script: `docker/bin/test-fork-recovery.sh` (updated for Nakamoto mode detection)
+
+11. **Configurable Finality Mode**
     - Small clusters (≤3): depth-only (attestation can't reach 2/3 with 2 nodes)
     - Medium clusters: optimistic attestation (current implementation)
     - Large clusters: VRF-sortitioned attestation committees (future)
@@ -102,24 +118,24 @@
 
 ### Low Priority — Post-Testnet
 
-11. **Content-Addressed MPT (Ethereum-style)**
+12. **Content-Addressed MPT (Ethereum-style)**
     - Current: mutable in-memory `InMemoryMerklePatriciaProducer` with stateRef
     - Target: content-addressed trie nodes in KV store keyed by hash
     - Fork switching = change root pointer, structural sharing, GC unreachable
     - Eliminates all MPT non-determinism issues permanently
     - Biggest refactor but best long-term solution
 
-12. **Superblock Proofs (NIPoPoW-style)**
+13. **Superblock Proofs (NIPoPoW-style)**
     - LDD's slot-gap threshold serves as difficulty certificate
     - Enables logarithmic light client proofs (~5,100 headers vs 1.43M full chain)
     - Research track from dilf4s paper — deferred
 
-13. **VRF-Sortitioned Attestation Committees**
+14. **VRF-Sortitioned Attestation Committees**
     - Full-set attestation doesn't scale past ~100 nodes
     - VRF-based committee selection for attestation duty
     - Smaller, rotating committees with same security guarantees
 
-14. **Two-Level Finality (GL0 + Metagraph)**
+15. **Two-Level Finality (GL0 + Metagraph)**
     - Metagraph-local fast finality + GL0 hard finality
     - Cross-metagraph operations wait for GL0
     - Metagraph snapshot resubmission on GL0 orphaning

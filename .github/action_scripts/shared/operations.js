@@ -248,10 +248,44 @@ const waitForTxInclusion = async (fetchFn, {
     );
 };
 
+/**
+ * Fetch a combined snapshot (snapshot + state info) with retry on 404.
+ * The combined checkpoint is only written every `checkpointIntervalEpochs` (default 5)
+ * snapshots, so the endpoint may return 404 at intermediate ordinals.
+ * This helper polls until the next checkpoint is written.
+ *
+ * @param {string} url - Full URL to the combined endpoint (e.g., `${l0Url}/global-snapshots/latest/combined`)
+ * @param {Object} [options]
+ * @param {number} [options.maxAttempts=60] - Max polling attempts
+ * @param {number} [options.interval=5000] - Polling interval in ms
+ * @returns {Promise<Array>} - The combined snapshot as [signedSnapshot, stateInfo]
+ */
+const getCombinedSnapshot = async (url, { maxAttempts = 60, interval = 5000 } = {}) => {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            const { data } = await axios.get(url);
+            return data;
+        } catch (error) {
+            if (error.response?.status === 404) {
+                if (attempt % 10 === 1) {
+                    logWorkflow.info(`Combined snapshot not available at ${url} (attempt ${attempt}/${maxAttempts}), waiting for next checkpoint...`);
+                }
+                if (attempt === maxAttempts) {
+                    throw new Error(`Combined snapshot not available after ${maxAttempts} attempts at ${url}`);
+                }
+                await sleep(interval);
+                continue;
+            }
+            throw error;
+        }
+    }
+};
+
 module.exports = {
     sleep,
     withRetry,
     withRetryOrdinal,
     waitForTxInclusion,
-    getLatestSnapshotInfo
+    getLatestSnapshotInfo,
+    getCombinedSnapshot
 }

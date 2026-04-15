@@ -11,6 +11,7 @@ const {
     createAndConnectAccount,
     createNetworkConfig,
     getEpochProgress,
+    getCombinedSnapshot,
     SerializerType,
     createSerializer
 } = require('../shared');
@@ -111,7 +112,7 @@ const createVerifier = (urls) => {
     const verifyInL0 = async (address, hash, l0Url, tokenId, layerName, isCurrency = false) => {
         await withRetry(
             async () => {
-                const { data: snapshot } = await axios.get(
+                const snapshot = await getCombinedSnapshot(
                     `${l0Url}/global-snapshots/latest/combined`
                 );
                 await verifyTokenLockInSnapshot(address, hash, snapshot, tokenId, `${layerName} L0`, isCurrency);
@@ -123,7 +124,7 @@ const createVerifier = (urls) => {
     const verifyInCurrencyL0 = async (address, hash) => {
         await withRetry(
             async () => {
-                const { data: snapshot } = await axios.get(
+                const snapshot = await getCombinedSnapshot(
                     `${urls.currencyL0Url}/snapshots/latest/combined`
                 );
                 await verifyTokenLockInSnapshot(
@@ -155,7 +156,7 @@ const createBalanceManager = (urls) => {
         try {
             const snapshotUrl = `${l0Url}/snapshots/latest/combined`
 
-            const { data: snapshot } = await axios.get(snapshotUrl);
+            const snapshot = await getCombinedSnapshot(snapshotUrl);
 
             const balance = snapshot[1]?.balances?.[address] || 0;
 
@@ -279,7 +280,7 @@ const verifyTokenLockExpiration = async (address, hash, initialBalance, urls, un
 
     const snapshotUrl = `${l0Url}/snapshots/latest/combined`
 
-    const { data: snapshot } = await axios.get(snapshotUrl);
+    const snapshot = await getCombinedSnapshot(snapshotUrl);
 
     const activeTokenLocks = snapshot[1]?.activeTokenLocks?.[address]
     if (activeTokenLocks && activeTokenLocks.length > 0) {
@@ -308,7 +309,7 @@ const verifyTriggerTokenUnlock = async (address, initialBalance, urls) => {
         async () => {
             const snapshotUrl = `${l0Url}/snapshots/latest/combined`
 
-            const { data: snapshot } = await axios.get(snapshotUrl);
+            const snapshot = await getCombinedSnapshot(snapshotUrl);
             const activeTokenLocks = snapshot[1]?.activeTokenLocks?.[address]
 
             if (activeTokenLocks && Object.keys(activeTokenLocks).length > 0) {
@@ -326,7 +327,7 @@ const verifyTriggerTokenUnlock = async (address, initialBalance, urls) => {
 
     const snapshotUrl = `${l0Url}/snapshots/latest/combined`
 
-    const { data: snapshot } = await axios.get(snapshotUrl);
+    const snapshot = await getCombinedSnapshot(snapshotUrl);
     const currentBalance = snapshot[1]?.balances?.[address] || 0;
     const expectedBalance = initialBalance;
 
