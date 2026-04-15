@@ -33,11 +33,11 @@ func main() {
 
 	// CLI flags
 	var (
-		listenAddrs    string
-		seedlist       string
-		httpAddr       string
-		enableHTTP     bool
-		jvmGRPCAddr    string
+		listenAddrs string
+		seedlist    string
+		httpAddr    string
+		enableHTTP  bool
+		jvmGRPCAddr string
 	)
 	flag.StringVar(&listenAddrs, "listen", "/ip4/0.0.0.0/tcp/9500", "comma-separated libp2p listen multiaddrs")
 	flag.StringVar(&seedlist, "seedlist", "", "comma-separated bootstrap peer multiaddrs")
@@ -221,6 +221,10 @@ func main() {
 			}
 		}()
 	}
+
+	// Mesh health monitor — detects GossipSub mesh degradation after network
+	// partitions and forces seedlist reconnection to restore gossip flow.
+	node.StartMeshHealthMonitor(ctx)
 
 	// Prometheus metrics server
 	if cfg.MetricsAddr != "" {

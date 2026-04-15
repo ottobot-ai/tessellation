@@ -1,5 +1,7 @@
 package io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto
 
+import java.util.concurrent.TimeUnit
+
 import cats.effect.kernel.{Async, Resource}
 import cats.syntax.all._
 
@@ -37,6 +39,9 @@ object SidecarClient {
           ManagedChannelBuilder
             .forAddress(config.host, config.grpcPort)
             .usePlaintext()
+            .keepAliveTime(30, TimeUnit.SECONDS)
+            .keepAliveTimeout(10, TimeUnit.SECONDS)
+            .keepAliveWithoutCalls(true)
             .build()
         )
       )(ch => Async[F].delay(ch.shutdown()).void)

@@ -4,19 +4,20 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
-	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/libp2p/go-libp2p"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	libp2pnet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	libp2prouting "github.com/libp2p/go-libp2p/core/routing"
+	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	routeddiscovery "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	discutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
-	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/scasplte2/tessellation/p2p/internal/config"
@@ -34,6 +35,12 @@ type Node struct {
 	rumorTopic       *pubsub.Topic
 
 	cfg config.Config
+
+	// reconnectMu guards reconnectCh. When the mesh health monitor recovers
+	// from degradation, it closes reconnectCh (broadcasting to all Subscribe
+	// handlers) and creates a fresh channel.
+	reconnectMu sync.Mutex
+	reconnectCh chan struct{}
 }
 
 // New creates a libp2p host with GossipSub and joins the Nakamoto topics.
@@ -95,27 +102,27 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 			Dhi:               cfg.MeshDHi,
 			HeartbeatInterval: cfg.HeartbeatInterval,
 			// Use defaults for everything else
-			Dout:                    pubsub.GossipSubDout,
-			HistoryLength:           pubsub.GossipSubHistoryLength,
-			HistoryGossip:           pubsub.GossipSubHistoryGossip,
-			Dlazy:                   pubsub.GossipSubDlazy,
-			GossipFactor:            pubsub.GossipSubGossipFactor,
-			GossipRetransmission:    pubsub.GossipSubGossipRetransmission,
-			HeartbeatInitialDelay:   pubsub.GossipSubHeartbeatInitialDelay,
-			FanoutTTL:               pubsub.GossipSubFanoutTTL,
-			PrunePeers:              pubsub.GossipSubPrunePeers,
-			PruneBackoff:            pubsub.GossipSubPruneBackoff,
-			UnsubscribeBackoff:      pubsub.GossipSubUnsubscribeBackoff,
-			Connectors:              pubsub.GossipSubConnectors,
-			MaxPendingConnections:   pubsub.GossipSubMaxPendingConnections,
-			ConnectionTimeout:       pubsub.GossipSubConnectionTimeout,
-			DirectConnectTicks:      pubsub.GossipSubDirectConnectTicks,
+			Dout:                      pubsub.GossipSubDout,
+			HistoryLength:             pubsub.GossipSubHistoryLength,
+			HistoryGossip:             pubsub.GossipSubHistoryGossip,
+			Dlazy:                     pubsub.GossipSubDlazy,
+			GossipFactor:              pubsub.GossipSubGossipFactor,
+			GossipRetransmission:      pubsub.GossipSubGossipRetransmission,
+			HeartbeatInitialDelay:     pubsub.GossipSubHeartbeatInitialDelay,
+			FanoutTTL:                 pubsub.GossipSubFanoutTTL,
+			PrunePeers:                pubsub.GossipSubPrunePeers,
+			PruneBackoff:              pubsub.GossipSubPruneBackoff,
+			UnsubscribeBackoff:        pubsub.GossipSubUnsubscribeBackoff,
+			Connectors:                pubsub.GossipSubConnectors,
+			MaxPendingConnections:     pubsub.GossipSubMaxPendingConnections,
+			ConnectionTimeout:         pubsub.GossipSubConnectionTimeout,
+			DirectConnectTicks:        pubsub.GossipSubDirectConnectTicks,
 			DirectConnectInitialDelay: pubsub.GossipSubDirectConnectInitialDelay,
-			OpportunisticGraftTicks: pubsub.GossipSubOpportunisticGraftTicks,
-			OpportunisticGraftPeers: pubsub.GossipSubOpportunisticGraftPeers,
-			MaxIHaveLength:          pubsub.GossipSubMaxIHaveLength,
-			MaxIHaveMessages:        pubsub.GossipSubMaxIHaveMessages,
-			IWantFollowupTime:       pubsub.GossipSubIWantFollowupTime,
+			OpportunisticGraftTicks:   pubsub.GossipSubOpportunisticGraftTicks,
+			OpportunisticGraftPeers:   pubsub.GossipSubOpportunisticGraftPeers,
+			MaxIHaveLength:            pubsub.GossipSubMaxIHaveLength,
+			MaxIHaveMessages:          pubsub.GossipSubMaxIHaveMessages,
+			IWantFollowupTime:         pubsub.GossipSubIWantFollowupTime,
 		}),
 	)
 	if err != nil {
@@ -150,6 +157,7 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		attestationTopic: atTopic,
 		rumorTopic:       ruTopic,
 		cfg:              cfg,
+		reconnectCh:      make(chan struct{}),
 	}
 
 	// Start mDNS discovery for automatic peer finding on local network / Docker bridge.
@@ -394,6 +402,105 @@ func (n *Node) MeshPeerCount() (snapshots, attestations, rumors int) {
 	return len(n.snapshotTopic.ListPeers()),
 		len(n.attestationTopic.ListPeers()),
 		len(n.rumorTopic.ListPeers())
+}
+
+// TriggerSubscriberReconnect broadcasts to all active Subscribe handlers that
+// they should terminate, forcing JVM clients to re-establish their gRPC streams.
+// Called by the mesh health monitor after recovering from degradation.
+func (n *Node) TriggerSubscriberReconnect() {
+	n.reconnectMu.Lock()
+	close(n.reconnectCh)
+	n.reconnectCh = make(chan struct{})
+	n.reconnectMu.Unlock()
+}
+
+// ReconnectCh returns a channel that is closed when subscribers should reconnect.
+func (n *Node) ReconnectCh() <-chan struct{} {
+	n.reconnectMu.Lock()
+	defer n.reconnectMu.Unlock()
+	return n.reconnectCh
+}
+
+// StartMeshHealthMonitor runs a background loop that periodically checks
+// GossipSub mesh health and reconnects to seedlist peers when degraded.
+//
+// After a network partition, libp2p connections drop and GossipSub PRUNEs
+// peers from the mesh. The DHT discovery loop may not recover quickly enough
+// because the routing table can drain during extended partitions. This monitor
+// provides a reliable recovery path by:
+//  1. Checking mesh peer counts every 30s
+//  2. If any topic has 0 mesh peers for 2+ consecutive checks, reconnecting
+//     to all seedlist peers (forcing libp2p connection re-establishment)
+//  3. Logging mesh health for observability
+func (n *Node) StartMeshHealthMonitor(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		emptyMeshStreak := 0
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+
+			sn, at, ru := n.MeshPeerCount()
+			connectedPeers := len(n.Host.Network().Peers())
+
+			// Degraded = no topic subscribers OR no connected peers at all.
+			// topic.ListPeers() returns subscribed peers (not mesh-specific),
+			// so connectedPeers==0 is the more reliable partition signal.
+			if sn == 0 || at == 0 || connectedPeers == 0 {
+				emptyMeshStreak++
+				fmt.Printf("mesh-health: DEGRADED streak=%d snapshots=%d attestations=%d rumors=%d connected=%d\n",
+					emptyMeshStreak, sn, at, ru, connectedPeers)
+
+				// After 2 consecutive degraded checks (~60s), force seedlist reconnection.
+				if emptyMeshStreak >= 2 && len(n.cfg.Seedlist) > 0 {
+					fmt.Println("mesh-health: reconnecting to seedlist peers...")
+					for _, addr := range n.cfg.Seedlist {
+						ma, err := multiaddr.NewMultiaddr(addr)
+						if err != nil {
+							continue
+						}
+						pi, err := peer.AddrInfoFromP2pAddr(ma)
+						if err != nil {
+							continue
+						}
+						if pi.ID == n.Host.ID() {
+							continue
+						}
+						// Disconnect first to clear stale connection state, then reconnect.
+						// This forces a fresh protocol negotiation including GossipSub
+						// subscription exchange.
+						if n.Host.Network().Connectedness(pi.ID) == libp2pnet.Connected {
+							_ = n.Host.Network().ClosePeer(pi.ID)
+							time.Sleep(500 * time.Millisecond)
+						}
+						dialCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+						if err := n.Host.Connect(dialCtx, *pi); err != nil {
+							fmt.Printf("mesh-health: reconnect to %s failed: %v\n", pi.ID.ShortString(), err)
+						} else {
+							fmt.Printf("mesh-health: reconnected to %s\n", pi.ID.ShortString())
+						}
+						cancel()
+					}
+				}
+			} else {
+				if emptyMeshStreak > 0 {
+					fmt.Printf("mesh-health: RECOVERED snapshots=%d attestations=%d rumors=%d connected=%d (was degraded for %d checks)\n",
+						sn, at, ru, connectedPeers, emptyMeshStreak)
+					// Force all active Subscribe handlers to terminate so JVM clients
+					// reconnect and receive gossip from the now-healthy mesh.
+					n.TriggerSubscriberReconnect()
+					fmt.Println("mesh-health: triggered subscriber reconnect")
+				}
+				emptyMeshStreak = 0
+			}
+		}
+	}()
 }
 
 // Topics returns the GossipSub topic handles for metrics collection.

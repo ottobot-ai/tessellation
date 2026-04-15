@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/scasplte2/tessellation/p2p/internal/chainsync"
@@ -41,7 +42,20 @@ func (s *Server) Start(addr string) error {
 		return fmt.Errorf("listen %s: %w", addr, err)
 	}
 
-	s.grpcSrv = grpc.NewServer()
+	s.grpcSrv = grpc.NewServer(
+		// Allow client keepalive pings every 20s (JVM client sends every 30s).
+		// Without this, Go's default EnforcementPolicy rejects pings more frequent
+		// than 5 minutes, preventing the JVM from detecting dead connections after
+		// network partitions.
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             20 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    30 * time.Second,
+			Timeout: 10 * time.Second,
+		}),
+	)
 	pb.RegisterSidecarServiceServer(s.grpcSrv, s)
 	pb.RegisterChainSyncOutboundServer(s.grpcSrv, s)
 
@@ -99,9 +113,14 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 	snCh := s.node.SnapshotMessages(ctx)
 	atCh := s.node.AttestationMessages(ctx)
 	ruCh := s.node.RumorMessages(ctx)
+	reconnectCh := s.node.ReconnectCh()
 
 	for {
 		select {
+		case <-reconnectCh:
+			fmt.Println("gRPC Subscribe: mesh recovered, closing stream to force client reconnect")
+			return fmt.Errorf("mesh recovered — reconnect required")
+
 		case data, ok := <-snCh:
 			if !ok {
 				return nil

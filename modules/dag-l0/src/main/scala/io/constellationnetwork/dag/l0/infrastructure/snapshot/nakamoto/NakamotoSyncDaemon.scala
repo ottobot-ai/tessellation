@@ -6,6 +6,8 @@ import cats.effect.kernel.{Async, Ref}
 import cats.effect.std.Semaphore
 import cats.syntax.all._
 
+import scala.concurrent.duration._
+
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.{DAGEvent, GlobalSnapshotEvent}
 import io.constellationnetwork.ext.crypto._
@@ -266,61 +268,106 @@ object NakamotoSyncDaemon {
             }
           )
           .flatMap { chainSyncManager =>
-            // Shared semaphore serializes snapshot processing with production (SnapshotLeaderLoop)
-            GossipStream.subscribe[F](channel).evalMap { msg =>
-              msg.body match {
-                case pb.GossipMessage.Body.Snapshot(snap) =>
-                  // Pre-semaphore: if incoming snapshot would beat our current tip,
-                  // pause production immediately so SnapshotLeaderLoop doesn't build
-                  // on a tip we're about to abandon.
-                  val incomingOrdinal = snap.ordinal
-                  chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
-                    val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
-                    (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
-                     else Async[F].unit) >>
-                      snapshotSemaphore.permit.use { _ =>
-                        handleSnapshot(
-                          snap,
-                          stateRef,
-                          pendingParentRef,
-                          chainStore,
-                          nodeStorage,
-                          tipTracker,
-                          stakeRegistry,
-                          sidecarClient,
-                          selfId,
-                          keyPair,
-                          lddConfig,
-                          lastKnownSlotRef,
-                          epochStateRef,
-                          etaRotationSlots,
-                          consensusFns,
-                          snapshotStorage,
-                          lastGlobalSnapshotStorage,
-                          lastNGlobalSnapshotStorage,
-                          productionGate,
-                          mptStore,
-                          eventMempool,
-                          chainSyncManager,
-                          channel,
-                          dataDir,
-                          logger
-                        )
-                      } >> // snapshotSemaphore.permit.use
-                      productionGate.resume(ProductionGate.BetterGossipReceived)
-                  } // chainStore.bestTipOrdinal.flatMap
+            // Gossip stream with two-layer reconnection:
+            //
+            // Layer 1 (sidecar-triggered): When the sidecar's mesh health monitor
+            //   recovers from degradation, it closes the gRPC Subscribe stream.
+            //   handleErrorWith catches the error and re-subscribes.
+            //
+            // Layer 2 (idle watchdog): If the gRPC connection dies silently (e.g.,
+            //   Docker network disconnect — gRPC Java doesn't propagate channel
+            //   failures to blocking server-stream reads), the stream hangs forever.
+            //   A concurrent watchdog checks the last-received timestamp every 30s
+            //   and raises an error after 120s of idle. In normal operation (messages
+            //   every ~10s), the watchdog never fires.
+            //
+            // Shared state (pendingParentRef, stateRef, chainSyncManager) survives.
+            def gossipStream: fs2.Stream[F, Unit] =
+              fs2.Stream
+                .eval(Ref.of[F, Long](System.currentTimeMillis()))
+                .flatMap { lastMsgRef =>
+                  val watchdog = fs2.Stream.fixedRate[F](30.seconds).evalMap { _ =>
+                    Async[F].delay(System.currentTimeMillis()).flatMap { now =>
+                      lastMsgRef.get.flatMap { lastMsg =>
+                        val idleMs = now - lastMsg
+                        if (idleMs > 120000L)
+                          logger.warn(s"Gossip stream idle for ${idleMs / 1000}s, forcing reconnect") >>
+                            Async[F].raiseError[Unit](new RuntimeException(s"Gossip idle timeout (${idleMs / 1000}s)"))
+                        else
+                          Async[F].unit
+                      }
+                    }
+                  }
 
-                case pb.GossipMessage.Body.Attestation(att) =>
-                  handleAttestation(att, tipTracker, logger)
+                  val gossip = GossipStream
+                    .subscribe[F](channel)
+                    .evalMap { msg =>
+                      lastMsgRef.set(System.currentTimeMillis()) >>
+                        (msg.body match {
+                          case pb.GossipMessage.Body.Snapshot(snap) =>
+                            val incomingOrdinal = snap.ordinal
+                            chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
+                              val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
+                              (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
+                               else Async[F].unit) >>
+                                snapshotSemaphore.permit.use { _ =>
+                                  handleSnapshot(
+                                    snap,
+                                    stateRef,
+                                    pendingParentRef,
+                                    chainStore,
+                                    nodeStorage,
+                                    tipTracker,
+                                    stakeRegistry,
+                                    sidecarClient,
+                                    selfId,
+                                    keyPair,
+                                    lddConfig,
+                                    lastKnownSlotRef,
+                                    epochStateRef,
+                                    etaRotationSlots,
+                                    consensusFns,
+                                    snapshotStorage,
+                                    lastGlobalSnapshotStorage,
+                                    lastNGlobalSnapshotStorage,
+                                    productionGate,
+                                    mptStore,
+                                    eventMempool,
+                                    chainSyncManager,
+                                    channel,
+                                    dataDir,
+                                    logger
+                                  )
+                                } >>
+                                productionGate.resume(ProductionGate.BetterGossipReceived)
+                            }
 
-                case _: pb.GossipMessage.Body.Rumor =>
-                  // Rumors are handled by SidecarRumorBridge.receive — ignore here.
-                  Async[F].unit
+                          case pb.GossipMessage.Body.Attestation(att) =>
+                            handleAttestation(att, tipTracker, logger)
 
-                case pb.GossipMessage.Body.Empty =>
-                  Async[F].unit
-              }
-            }
+                          case _: pb.GossipMessage.Body.Rumor =>
+                            Async[F].unit
+
+                          case pb.GossipMessage.Body.Empty =>
+                            Async[F].unit
+                        })
+                    }
+
+                  gossip.concurrently(watchdog)
+                }
+                .handleErrorWith { e =>
+                  fs2.Stream.eval(
+                    logger.warn(s"Gossip stream error: ${e.getMessage}. Reconnecting in 5s...")
+                  ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
+                } ++ fs2.Stream.eval(
+                // Normal termination: gRPC StreamObserver.onError puts None in the
+                // queue, causing fromQueueNoneTerminated to end the stream normally
+                // (not as an error). This happens when the sidecar connection dies
+                // during a partition. Restart after a short delay.
+                logger.warn("Gossip stream terminated (sidecar connection lost). Reconnecting in 5s...")
+              ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
+
+            gossipStream
           }
       }
     }
