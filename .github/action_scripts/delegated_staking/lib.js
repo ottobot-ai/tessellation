@@ -264,10 +264,16 @@ const createTokenLock = async (account, urls, lockAmount, replaceRef = null, rep
   return hash
 }
 
-const assertBalanceChange = async (account, expectedBalanceDatum) => {
+const assertBalanceChange = async (account, expectedBalanceDatum, { atLeast = false } = {}) => {
   const balance = dagToDatum(await account.getBalance())
 
-  if (balance !== expectedBalanceDatum) {
+  if (atLeast) {
+    if (balance < expectedBalanceDatum) {
+      throw new Error(
+        `Invalid balance: Expected balance to be at least ${expectedBalanceDatum} but got ${balance}`,
+      )
+    }
+  } else if (balance !== expectedBalanceDatum) {
     throw new Error(
       `Invalid balance: Expected balance to be ${expectedBalanceDatum} but got ${balance}`,
     )

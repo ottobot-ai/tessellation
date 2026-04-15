@@ -754,9 +754,12 @@ const testWithdrawDelegatedStake = async (urls, account, stakeHash) => {
   )
   logWorkflow.info('Stake removed from pendingWithdrawal')
 
+  // Use atLeast because node operator rewards accrue during the test,
+  // making the actual balance higher than the pre-rewards expectation.
   await assertBalanceChange(
     account,
     initialBalance + originalStake.totalBalance,
+    { atLeast: true },
   )
   logWorkflow.info('Wallet balance updated')
 
