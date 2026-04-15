@@ -1,3 +1,4 @@
+const http = require('http')
 const { dag4 } = require('@stardust-collective/dag4')
 const { parseSharedArgs, logWorkflow } = require('../shared')
 
@@ -31,6 +32,51 @@ const logMessage = (message) => {
 
 const sleep = (ms) => {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+const fetchJson = (urlString) => {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlString)
+    http.get(url, (res) => {
+      let data = ''
+      res.on('data', (chunk) => { data += chunk })
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(data))
+        } catch (e) {
+          reject(new Error(`Failed to parse response from ${urlString}: ${data}`))
+        }
+      })
+    }).on('error', reject)
+  })
+}
+
+// After a metagraph transfer lands on CL0 (balance confirmed), CL1 may not have
+// processed the snapshot yet. The sender's last-reference on CL1 still reflects
+// pre-transfer state, so a subsequent transfer built from that ref will have a
+// parent hash that disagrees with CL0's lastTxRefs → ParentHashNotEqLastTxHash.
+//
+// Poll CL1 until the sender's last-reference hash changes from its pre-transfer
+// value, which means CL1 has processed the snapshot containing the transfer.
+const waitForCL1Alignment = async (l1MetagraphUrl, address, beforeHash) => {
+  const timeoutMs = SLEEP_TIME_UNTIL_QUERY
+  logMessage(`Waiting for CL1 alignment (${address.slice(0, 12)}..., timeout ${timeoutMs / 1000}s)...`)
+  const pollStart = Date.now()
+  const deadline = pollStart + timeoutMs
+  const pollInterval = 5000
+  while (Date.now() < deadline) {
+    await sleep(pollInterval)
+    try {
+      const ref = await fetchJson(`${l1MetagraphUrl}/transactions/last-reference/${address}`)
+      if (ref.hash !== beforeHash) {
+        logMessage(`CL1 aligned after ${Math.round((Date.now() - pollStart) / 1000)}s`)
+        return
+      }
+    } catch (e) {
+      logMessage(`CL1 alignment poll error: ${e.message}`)
+    }
+  }
+  logMessage(`CL1 alignment timeout — proceeding anyway`)
 }
 
 const batchTransaction = async (
@@ -185,6 +231,13 @@ const handleMetagraphBatchTransactions = async (
       testnet: true,
     })
 
+    // Capture destination's CL1 last-reference before sending. The destination's
+    // ref only changes when CL1 processes the snapshot (not on local block
+    // acceptance), so it's the correct signal for snapshot round-trip completion.
+    const destRefBefore = await fetchJson(
+      `${networkOptions.l1MetagraphUrl}/transactions/last-reference/${destination.address}`
+    )
+
     await batchMetagraphTransaction(
       metagraphTokenClient,
       origin,
@@ -210,6 +263,16 @@ const handleMetagraphBatchTransactions = async (
         break
       }
     }
+
+    // Wait for CL1 to process the snapshot containing this transfer before
+    // returning. Without this, a subsequent reverse transfer may read stale
+    // last-reference state from CL1 and build a transaction whose parent hash
+    // disagrees with CL0's lastTxRefs.
+    await waitForCL1Alignment(
+      networkOptions.l1MetagraphUrl,
+      destination.address,
+      destRefBefore.hash
+    )
 
     return { originBalance, destinationBalance }
   } catch (error) {

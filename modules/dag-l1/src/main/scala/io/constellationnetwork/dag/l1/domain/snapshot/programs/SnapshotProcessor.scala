@@ -202,7 +202,7 @@ abstract class SnapshotProcessor[
             addressStorage.updateBalances(state.balances)
 
         val setTransactionRefs: F[Unit] =
-          transactionStorage.initByRefs(state.lastTxRefs, snapshot.ordinal)
+          transactionStorage.replaceByRefs(state.lastTxRefs, snapshot.ordinal)
 
         val setInitialSnapshot: F[Unit] =
           Slf4jLogger
