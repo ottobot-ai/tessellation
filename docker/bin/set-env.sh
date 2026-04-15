@@ -203,6 +203,9 @@ for arg in "$@"; do
       # remain BFT and talk to GL0 over HTTP unchanged.
       export NAKAMOTO_GL0=true
       ;;
+    --skip-streaming)
+      export SKIP_STREAMING=true
+      ;;
     --fail)
       export SET_FAILURE_BREAKPOINT_TIME=true
       ;;

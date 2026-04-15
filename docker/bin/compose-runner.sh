@@ -87,8 +87,8 @@ if [ -n "$SELECTED_TESTS" ] && [ -n "$METAGRAPH" ]; then
   fi
 fi
 
-# snapshot-streaming build-from-source needs sdk/publishLocal
-if [ -z "$SELECTED_TESTS" ] || echo "$SELECTED_TESTS" | tr ',' '\n' | grep -qx "snapshot-streaming"; then
+# Metagraph builds and snapshot-streaming need sdk/publishLocal
+if [ -n "$METAGRAPH" ] || { [ "$SKIP_STREAMING" != "true" ] && { [ -z "$SELECTED_TESTS" ] || echo "$SELECTED_TESTS" | tr ',' '\n' | grep -qx "snapshot-streaming"; }; }; then
   export PUBLISH=${PUBLISH:-true}
 fi
 
@@ -150,10 +150,12 @@ else
 
 
   # Build snapshot-streaming JAR (needed before BUILD_ONLY exit so `just build` produces it)
-  if [ -z "$SELECTED_TESTS" ] || echo "$SELECTED_TESTS" | tr ',' '\n' | grep -qx "snapshot-streaming"; then
-    SS_DIR="$PROJECT_ROOT/docker/snapshot-streaming"
-    source "$SS_DIR/build-snapshot-streaming.sh"
-    cd "$PROJECT_ROOT"
+  if [ "$SKIP_STREAMING" != "true" ]; then
+    if [ -z "$SELECTED_TESTS" ] || echo "$SELECTED_TESTS" | tr ',' '\n' | grep -qx "snapshot-streaming"; then
+      SS_DIR="$PROJECT_ROOT/docker/snapshot-streaming"
+      source "$SS_DIR/build-snapshot-streaming.sh"
+      cd "$PROJECT_ROOT"
+    fi
   fi
 
   if [ "$BUILD_ONLY" = "true" ]; then
@@ -438,7 +440,7 @@ else
 
 
   # --- Snapshot-streaming infrastructure ---
-  if [ -z "$SELECTED_TESTS" ] || echo "$SELECTED_TESTS" | tr ',' '\n' | grep -qx "snapshot-streaming"; then
+  if [ "$SKIP_STREAMING" != "true" ] && { [ -z "$SELECTED_TESTS" ] || echo "$SELECTED_TESTS" | tr ',' '\n' | grep -qx "snapshot-streaming"; }; then
     echo "================================================"
     echo "Setting up snapshot-streaming infrastructure"
     echo "================================================"
@@ -616,6 +618,10 @@ fi
 # ------------------------------------------------
 should_run_test() {
   local test_name=$1
+  # --skip-streaming excludes snapshot-streaming from default "run all" mode
+  if [ "$SKIP_STREAMING" = "true" ] && [ "$test_name" = "snapshot-streaming" ]; then
+    return 1
+  fi
   if [ -z "$SELECTED_TESTS" ]; then
     return 0
   fi
