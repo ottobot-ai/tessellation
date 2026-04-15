@@ -143,7 +143,10 @@ object Download {
       }.getOrElse(Applicative[F].unit)
 
     def start: F[DownloadResult] = {
-      val retryPolicy = RetryPolicies.exponentialBackoff[F](1.second).join(RetryPolicies.limitRetries(5))
+      // Retry with 10s constant delay, up to 18 attempts (3 min). The genesis node's
+      // combined checkpoint file may not be available for ~60-90s after cluster start
+      // (genesis initialization + first consensus round + disk write).
+      val retryPolicy = constantDelay[F](fetchSnapshotDelayBetweenTrials).join(RetryPolicies.limitRetries(18))
       retryingOnAllErrors[(Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)](
         policy = retryPolicy,
         onError = (err: Throwable, retryDetails: RetryDetails) =>
@@ -165,7 +168,25 @@ object Download {
 
         if (lastSnapshot.ordinal === observationLimit) {
           result.pure[F]
-        } else fetchNextSnapshot(result) >>= go
+        } else
+          fetchNextSnapshot(result)
+            .flatMap(go)
+            .handleErrorWith {
+              case CannotFetchSnapshot | InvalidChain =>
+                // Chain has stalled — the next ordinal never appeared after exhausting
+                // retries (300s). This happens in small clusters (2-3 nodes) where this
+                // downloading node is needed for BFT quorum: the genesis node produced
+                // snapshots solo until this node joined the cluster, but now consensus
+                // requires both nodes and can't advance until this download completes.
+                // Accept the current state and proceed — the node will catch up via
+                // normal consensus once it reaches Ready.
+                logger.warn(
+                  s"[Download] Observation stalled at ordinal ${lastSnapshot.ordinal.show} " +
+                    s"(target was ${observationLimit.show}). Chain likely needs this node for quorum. " +
+                    s"Proceeding with partial observation."
+                ) >> result.pure[F]
+              case other => other.raiseError[F, DownloadResult]
+            }
       }
 
       consensus.manager.registerForConsensus(observationLimit) >>
