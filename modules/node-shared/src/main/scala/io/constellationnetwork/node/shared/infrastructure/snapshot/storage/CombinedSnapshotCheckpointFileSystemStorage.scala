@@ -113,7 +113,6 @@ final class CombinedSnapshotCheckpointFileSystemStorage[
             status = Status.Ok,
             headers = Headers(
               `Content-Type`(MediaType.application.json),
-              `Transfer-Encoding`(TransferCoding.chunked),
               `Content-Length`(size)
             ),
             body = bodyWithPermit

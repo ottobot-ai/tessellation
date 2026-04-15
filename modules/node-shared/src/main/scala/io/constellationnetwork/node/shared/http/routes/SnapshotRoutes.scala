@@ -167,7 +167,11 @@ final case class SnapshotRoutes[F[_]: Async, S <: Snapshot: Encoder, SI <: Snaps
                   .getAsHttpResponse(ordinal)
                   .flatMap {
                     case Some(resp) => resp.pure[F]
-                    case None       => NotFound()
+                    case None =>
+                      combinedSnapshotCheckpointFileSystemStorage.getLatestAsHttpResponse.flatMap {
+                        case Some(resp) => resp.pure[F]
+                        case None       => NotFound()
+                      }
                   }
               case None => NotFound()
             }
@@ -184,7 +188,15 @@ final case class SnapshotRoutes[F[_]: Async, S <: Snapshot: Encoder, SI <: Snaps
                   .getAsHttpResponse(ordinal)
                   .flatMap {
                     case Some(resp) => resp.pure[F]
-                    case None       => NotFound()
+                    // Checkpoint file doesn't exist at the exact head ordinal —
+                    // checkpoints are written at epoch intervals (every 5 epochs),
+                    // so the head typically runs ahead of the latest checkpoint.
+                    // Fall back to the most recent checkpoint on disk.
+                    case None =>
+                      combinedSnapshotCheckpointFileSystemStorage.getLatestAsHttpResponse.flatMap {
+                        case Some(resp) => resp.pure[F]
+                        case None       => NotFound()
+                      }
                   }
               case None => NotFound()
             }
