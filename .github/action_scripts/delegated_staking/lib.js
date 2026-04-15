@@ -314,8 +314,11 @@ const fetchSnapshot = async (urls, ordinal) => {
 }
 
 const assertRewardTxnInSnapshot = async (snapshot, account, amount) => {
+  // Use >= because additional rewards may accrue between the stake snapshot
+  // and the withdrawal processing, especially in Nakamoto mode where
+  // snapshots are produced at ~10s intervals.
   const rewardTxn = snapshot.value.rewards.find((txn) => {
-    return txn.amount === amount && txn.destination === account.address
+    return txn.amount >= amount && txn.destination === account.address
   })
 
   if (!rewardTxn) {
