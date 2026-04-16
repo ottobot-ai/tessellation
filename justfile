@@ -59,6 +59,26 @@ clean:
 	@just clean-configs
 	@just clean-docker
 
+# NUKE EVERYTHING: docker state, all node data/logs/configs, all JAR caches,
+# metagraph template build artifacts, and SBT target dirs. Use when you suspect
+# stale state is masking code changes. After this, the next `just test` does
+# a full cold rebuild (~5-10 min).
+nuke:
+	@echo "🔥 Nuking all state..."
+	@just clean-docker
+	@just clean-data
+	@just clean-configs
+	@echo "🔥 Removing deploy JAR cache (docker/jars/)..."
+	@rm -f docker/jars/*.jar
+	@echo "🔥 Removing metagraph template build artifacts..."
+	@rm -rf .github/templates/metagraphs/project_template/modules/*/target
+	@rm -rf .github/templates/metagraphs/project_template/project/target
+	@rm -rf .github/templates/metagraphs/project_template/project/project
+	@rm -rf .github/templates/metagraphs/project_template/target
+	@echo "🔥 Running sbt clean (tessellation target dirs)..."
+	@bash sbt clean
+	@echo "🔥 All nuked. Next 'just test' will do a full cold rebuild."
+
 debug-main:
 	@just _check_deps
 	@bash docker/bin/debug/mn-replicate.sh
