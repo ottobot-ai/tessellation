@@ -347,16 +347,21 @@ const testMultipleSequentialReplacements = async (urls, account, currentLockHash
     amount = newAmount
     logWorkflow.info(`  Sequential replacement ${i} verified ✓`)
     
-    // Wait for ordinal progression + L1 sync before next replacement
+    // Wait for ordinal progression + L1 sync before next replacement.
+    // In Nakamoto mode, GL1 processes finalized snapshots with ~60s delay
+    // (depth-k=6 finalization). Wait for 3 ordinal progressions + buffer
+    // to ensure GL1 has processed the snapshot containing the lock.
     if (i < 3) {
       logWorkflow.info('  Waiting for ordinal progression before next replacement...')
+      let progressionsSeen = 0
       await withRetryOrdinal(
         async ({ ordinal, prevOrdinal }) => {
           if (!prevOrdinal) throw new Error('Waiting for first ordinal')
-          if (ordinal - prevOrdinal < 1) throw new Error(`Waiting for ordinal progression: ${ordinal}`)
+          if (ordinal > prevOrdinal) progressionsSeen++
+          if (progressionsSeen < 3) throw new Error(`Waiting for 3 ordinal progressions (seen ${progressionsSeen}): ${ordinal}`)
           return true
         },
-        { globalL0Url: urls.globalL0Url, name: `waitBeforeReplacement${i + 1}`, maxOrdinalMisses: 10, maxStalledChecks: 30 }
+        { globalL0Url: urls.globalL0Url, name: `waitBeforeReplacement${i + 1}`, maxOrdinalMisses: 10, maxStalledChecks: 60 }
       )
       await sleep(5000) // Extra buffer for L1 to process the snapshot
     }
