@@ -18,7 +18,12 @@ const {
 
 const CONSTANTS = {
     ...sharedConstants,
-    EPOCH_PROGRESS_BUFFER_EXPIRATION_TEST: 5,
+    // Increased from 5 to 30 for Nakamoto mode. The propagation pipeline
+    // (CL1 HTTP POST → CL1 block → ML0 snapshot → GL0 state channel →
+    // finalization → ML0 activeTokenLocks) takes ~45-65s, and each epoch
+    // advances ~10s. 5 epochs (~50s) is too short — the lock expires before
+    // the test can observe it in ML0's activeTokenLocks.
+    EPOCH_PROGRESS_BUFFER_EXPIRATION_TEST: 30,
     EPOCH_PROGRESS_BUFFER_TOKEN_UNLOCK_TEST: 50
 };
 

@@ -21,7 +21,10 @@ const {
 
 const CONSTANTS = {
     ...sharedConstants,
-    EPOCH_PROGRESS_BUFFER: 5,
+    // Increased from 5 to 30 for Nakamoto mode. The pipeline from submission
+    // to being visible in ML0's activeAllowSpends takes ~45-65s, and epochs
+    // advance ~10s each — 5 was too short, causing tests to miss the window.
+    EPOCH_PROGRESS_BUFFER: 30,
 };
 
 const getRandomInt = (min, max) => {
