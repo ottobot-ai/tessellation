@@ -944,27 +944,37 @@ const verifyAllowSpendExpiration = async (address, hash, initialBalance, urls, l
         ? `${l0Url}/snapshots/latest/combined`
         : `${l0Url}/global-snapshots/latest/combined`;
 
-    const snapshot = await getCombinedSnapshot(snapshotUrl);
-
-    const activeAllowSpends = isCurrency
-        ? snapshot[1]?.activeAllowSpends?.[address] || []
-        : snapshot[1]?.activeAllowSpends?.[CONSTANTS.CURRENCY_TOKEN_ID]?.[address] || [];
-
-    if (activeAllowSpends.length > 0) {
-        const hasMatchingHash = await findMatchingHash(activeAllowSpends, hash);
-        if (hasMatchingHash) {
-            throw new Error('Allow spend still active after expiration');
-        }
-    }
-
-    const currentBalance = snapshot[1]?.balances?.[address] || 0;
+    // Retry the balance/active-allow-spend check: in Nakamoto mode, finalization
+    // (~5s) and the combined endpoint's finality gating mean the refund may not
+    // be visible immediately after the epoch advances past lastValidEpochProgress.
     const expectedBalance = initialBalance - fee;
+    await withRetry(
+        async () => {
+            const snapshot = await getCombinedSnapshot(snapshotUrl);
 
-    if (currentBalance !== expectedBalance) {
-        throw new Error(
-            `Balance not reverted correctly after expiration. Expected: ${expectedBalance} (initial - fee), got: ${currentBalance}`
-        );
-    }
+            const activeAllowSpends = isCurrency
+                ? snapshot[1]?.activeAllowSpends?.[address] || []
+                : snapshot[1]?.activeAllowSpends?.[CONSTANTS.CURRENCY_TOKEN_ID]?.[address] || [];
+
+            if (activeAllowSpends.length > 0) {
+                const hasMatchingHash = await findMatchingHash(activeAllowSpends, hash);
+                if (hasMatchingHash) {
+                    throw new Error('Allow spend still active after expiration');
+                }
+            }
+
+            const currentBalance = snapshot[1]?.balances?.[address] || 0;
+            if (currentBalance !== expectedBalance) {
+                throw new Error(
+                    `Balance not reverted correctly after expiration. Expected: ${expectedBalance} (initial - fee), got: ${currentBalance}`
+                );
+            }
+        },
+        {
+            name: `${isCurrency ? 'Currency' : 'DAG'} balance refund verification`,
+            interval: CONSTANTS.EXPIRATION_VERIFICATION_INTERVAL_MS
+        }
+    );
 
     logWorkflow.success(`Allow spend expired and balance reverted successfully (minus fee) in ${isCurrency ? 'Currency' : 'DAG'}`);
 };
