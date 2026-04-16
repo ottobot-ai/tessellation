@@ -342,7 +342,10 @@ if [ "$USE_TEST_METAGRAPH" = "true" ] && [ -z "$METAGRAPH" ]; then
     export METAGRAPH=".github/templates/metagraphs/project_template"
 fi
 
-if [ "$METAGRAPH" = ".github/templates/metagraphs/project_template" ] && [ -z "$SKIP_METAGRAPH_ASSEMBLY" ]; then
+# Auto-skip metagraph assembly only when the main --skip-assembly is set.
+# Without this guard, the test metagraph JAR goes stale and doesn't pick up
+# changes to tessellation SDK code (e.g., Download.scala fixes) on re-runs.
+if [ "$METAGRAPH" = ".github/templates/metagraphs/project_template" ] && [ -z "$SKIP_METAGRAPH_ASSEMBLY" ] && [ "$SKIP_ASSEMBLY" = "true" ]; then
     export SKIP_METAGRAPH_ASSEMBLY=true
 fi
 
