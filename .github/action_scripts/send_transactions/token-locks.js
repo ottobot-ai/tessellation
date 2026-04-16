@@ -71,18 +71,21 @@ const createUpdateWithTokenUnlockTransaction = async (sourceAccount, tokenLockHa
     }
 };
 
-const createVerifier = (urls) => {
-    const findMatchingHash = async (tokenLocks, targetHash) => {
-        return tokenLocks.reduce(async (acc, tokenLock) => {
-            const prevResult = await acc;
-            if (prevResult) return true;
+// Module-scope helper so it can be called from outside createVerifier
+// (e.g., verifyTokenLockExpiration at the end of the file).
+const findMatchingHash = async (tokenLocks, targetHash) => {
+    return tokenLocks.reduce(async (acc, tokenLock) => {
+        const prevResult = await acc;
+        if (prevResult) return true;
 
-            const serializer = createSerializer(SerializerType.BROTLI);
-            const message = await serializer.serialize(tokenLock.value);
-            const tokenLockHash = jsSha256.sha256(Buffer.from(message, 'hex'));
-            return tokenLockHash === targetHash;
-        }, Promise.resolve(false));
-    };
+        const serializer = createSerializer(SerializerType.BROTLI);
+        const message = await serializer.serialize(tokenLock.value);
+        const tokenLockHash = jsSha256.sha256(Buffer.from(message, 'hex'));
+        return tokenLockHash === targetHash;
+    }, Promise.resolve(false));
+};
+
+const createVerifier = (urls) => {
 
     const verifyInL1 = async (hash, l1Url, layerName) => {
         await withRetry(
