@@ -46,12 +46,25 @@ message Rumor {
   bytes origin_id = 3;
 }
 
+// A state channel snapshot binary produced by a metagraph CL0, broadcast
+// to all GL0 nodes via GossipSub. Replaces the HTTP POST path that suffered
+// from retry-cap starvation under transient rejections. The sidecar treats
+// the binary bytes as opaque; the JVM serializes Signed[StateChannelSnapshotBinary]
+// the same way the HTTP path does (JsonBrotliBinarySerializer).
+message MetagraphBinary {
+  // Metagraph address (DAG base58 string).
+  string address = 1;
+  // Signed[StateChannelSnapshotBinary] bytes, opaque to the sidecar.
+  bytes binary = 2;
+}
+
 // Envelope for GossipSub messages.
 message GossipMessage {
   oneof body {
     Snapshot snapshot = 1;
     TipAttestation attestation = 2;
     Rumor rumor = 3;
+    MetagraphBinary metagraph_binary = 4;
   }
 }
 
@@ -67,6 +80,9 @@ service SidecarService {
 
   // Publish a generic rumor (event / BFT consensus message / etc).
   rpc PublishRumor(Rumor) returns (PublishResponse);
+
+  // Publish a metagraph state channel snapshot binary to all GL0 nodes.
+  rpc PublishMetagraphBinary(MetagraphBinary) returns (PublishResponse);
 
   // Subscribe to incoming messages from the network.
   // Server-streaming: sidecar pushes received gossip to JVM.
@@ -93,9 +109,10 @@ message PeerCountRequest {}
 
 message PeerCountResponse {
   int32 total = 1;
-  int32 mesh_snapshots = 2;   // peers in snapshot topic mesh
-  int32 mesh_attestations = 3; // peers in attestation topic mesh
-  int32 mesh_rumors = 4;      // peers in rumor topic mesh
+  int32 mesh_snapshots = 2;          // peers in snapshot topic mesh
+  int32 mesh_attestations = 3;       // peers in attestation topic mesh
+  int32 mesh_rumors = 4;             // peers in rumor topic mesh
+  int32 mesh_metagraph_binaries = 5; // peers in metagraph binary topic mesh
 }
 
 message HealthRequest {}

@@ -26,6 +26,7 @@ object SidecarClient {
     def publishSnapshot(msg: Snapshot): F[PublishResponse]
     def publishAttestation(msg: TipAttestation): F[PublishResponse]
     def publishRumor(msg: Rumor): F[PublishResponse]
+    def publishMetagraphBinary(msg: MetagraphBinary): F[PublishResponse]
     def health: F[HealthResponse]
     def peers: F[PeerCountResponse]
     def channel: ManagedChannel
@@ -63,6 +64,9 @@ object SidecarClient {
 
       def publishRumor(msg: Rumor): F[PublishResponse] =
         liftFuture(stub.publishRumor(msg))
+
+      def publishMetagraphBinary(msg: MetagraphBinary): F[PublishResponse] =
+        liftFuture(stub.publishMetagraphBinary(msg))
 
       def health: F[HealthResponse] =
         liftFuture(stub.health(HealthRequest()))
@@ -127,5 +131,14 @@ object SidecarClient {
       attestedAt = attestedAt,
       attesterId = ByteString.copyFrom(attesterId),
       signature = ByteString.copyFrom(signature)
+    )
+
+  def mkMetagraphBinary(
+    address: String,
+    binary: Array[Byte]
+  ): MetagraphBinary =
+    MetagraphBinary(
+      address = address,
+      binary = ByteString.copyFrom(binary)
     )
 }

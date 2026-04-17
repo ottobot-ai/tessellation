@@ -30,9 +30,10 @@ type Node struct {
 	PubSub *pubsub.PubSub
 	DHT    *dht.IpfsDHT
 
-	snapshotTopic    *pubsub.Topic
-	attestationTopic *pubsub.Topic
-	rumorTopic       *pubsub.Topic
+	snapshotTopic        *pubsub.Topic
+	attestationTopic     *pubsub.Topic
+	rumorTopic           *pubsub.Topic
+	metagraphBinaryTopic *pubsub.Topic
 
 	cfg config.Config
 
@@ -149,15 +150,22 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		return nil, fmt.Errorf("join rumor topic: %w", err)
 	}
 
+	mbTopic, err := ps.Join(cfg.MetagraphBinaryTopic)
+	if err != nil {
+		h.Close()
+		return nil, fmt.Errorf("join metagraph-binary topic: %w", err)
+	}
+
 	node := &Node{
-		Host:             h,
-		PubSub:           ps,
-		DHT:              kadDHT,
-		snapshotTopic:    snTopic,
-		attestationTopic: atTopic,
-		rumorTopic:       ruTopic,
-		cfg:              cfg,
-		reconnectCh:      make(chan struct{}),
+		Host:                 h,
+		PubSub:               ps,
+		DHT:                  kadDHT,
+		snapshotTopic:        snTopic,
+		attestationTopic:     atTopic,
+		rumorTopic:           ruTopic,
+		metagraphBinaryTopic: mbTopic,
+		cfg:                  cfg,
+		reconnectCh:          make(chan struct{}),
 	}
 
 	// Start mDNS discovery for automatic peer finding on local network / Docker bridge.
@@ -327,6 +335,17 @@ func (n *Node) PublishRumor(ctx context.Context, data []byte) error {
 	return err
 }
 
+// PublishMetagraphBinary publishes raw bytes to the metagraph-binary topic.
+// Carries Signed[StateChannelSnapshotBinary] serialized by the JVM; the
+// sidecar treats the payload as opaque.
+func (n *Node) PublishMetagraphBinary(ctx context.Context, data []byte) error {
+	err := n.metagraphBinaryTopic.Publish(ctx, data)
+	if err == nil {
+		metrics.MessagesPublished.WithLabelValues("metagraph_binary").Inc()
+	}
+	return err
+}
+
 // subscribeAndRelay creates a per-caller subscription on the given topic and
 // relays incoming messages (excluding self-published) into the returned channel.
 // The subscription is cancelled when ctx is done. The topicLabel is used for
@@ -397,11 +416,26 @@ func (n *Node) RumorMessages(ctx context.Context) <-chan []byte {
 	return ch
 }
 
+// MetagraphBinaryMessages returns a channel of incoming metagraph-binary messages.
+// Buffer sized to tolerate bursts of multiple metagraphs sending binaries
+// concurrently (500 KB per message, ~4 MB/slot absolute worst case).
+func (n *Node) MetagraphBinaryMessages(ctx context.Context) <-chan []byte {
+	ch, err := n.subscribeAndRelay(ctx, n.metagraphBinaryTopic, 256, "metagraph_binary")
+	if err != nil {
+		fmt.Printf("ERROR: subscribe metagraph_binary: %v\n", err)
+		empty := make(chan []byte)
+		close(empty)
+		return empty
+	}
+	return ch
+}
+
 // MeshPeerCount returns the number of peers in each topic mesh.
-func (n *Node) MeshPeerCount() (snapshots, attestations, rumors int) {
+func (n *Node) MeshPeerCount() (snapshots, attestations, rumors, metagraphBinaries int) {
 	return len(n.snapshotTopic.ListPeers()),
 		len(n.attestationTopic.ListPeers()),
-		len(n.rumorTopic.ListPeers())
+		len(n.rumorTopic.ListPeers()),
+		len(n.metagraphBinaryTopic.ListPeers())
 }
 
 // TriggerSubscriberReconnect broadcasts to all active Subscribe handlers that
@@ -446,7 +480,7 @@ func (n *Node) StartMeshHealthMonitor(ctx context.Context) {
 			case <-ticker.C:
 			}
 
-			sn, at, ru := n.MeshPeerCount()
+			sn, at, ru, mb := n.MeshPeerCount()
 			connectedPeers := len(n.Host.Network().Peers())
 
 			// Degraded = no topic subscribers OR no connected peers at all.
@@ -454,8 +488,8 @@ func (n *Node) StartMeshHealthMonitor(ctx context.Context) {
 			// so connectedPeers==0 is the more reliable partition signal.
 			if sn == 0 || at == 0 || connectedPeers == 0 {
 				emptyMeshStreak++
-				fmt.Printf("mesh-health: DEGRADED streak=%d snapshots=%d attestations=%d rumors=%d connected=%d\n",
-					emptyMeshStreak, sn, at, ru, connectedPeers)
+				fmt.Printf("mesh-health: DEGRADED streak=%d snapshots=%d attestations=%d rumors=%d metagraph_binaries=%d connected=%d\n",
+					emptyMeshStreak, sn, at, ru, mb, connectedPeers)
 
 				// After 2 consecutive degraded checks (~60s), force seedlist reconnection.
 				if emptyMeshStreak >= 2 && len(n.cfg.Seedlist) > 0 {
@@ -490,8 +524,8 @@ func (n *Node) StartMeshHealthMonitor(ctx context.Context) {
 				}
 			} else {
 				if emptyMeshStreak > 0 {
-					fmt.Printf("mesh-health: RECOVERED snapshots=%d attestations=%d rumors=%d connected=%d (was degraded for %d checks)\n",
-						sn, at, ru, connectedPeers, emptyMeshStreak)
+					fmt.Printf("mesh-health: RECOVERED snapshots=%d attestations=%d rumors=%d metagraph_binaries=%d connected=%d (was degraded for %d checks)\n",
+						sn, at, ru, mb, connectedPeers, emptyMeshStreak)
 					// Force all active Subscribe handlers to terminate so JVM clients
 					// reconnect and receive gossip from the now-healthy mesh.
 					n.TriggerSubscriberReconnect()
@@ -506,9 +540,10 @@ func (n *Node) StartMeshHealthMonitor(ctx context.Context) {
 // Topics returns the GossipSub topic handles for metrics collection.
 func (n *Node) Topics() metrics.TopicSet {
 	return metrics.TopicSet{
-		Snapshot:    n.snapshotTopic,
-		Attestation: n.attestationTopic,
-		Rumor:       n.rumorTopic,
+		Snapshot:         n.snapshotTopic,
+		Attestation:      n.attestationTopic,
+		Rumor:            n.rumorTopic,
+		MetagraphBinary:  n.metagraphBinaryTopic,
 	}
 }
 

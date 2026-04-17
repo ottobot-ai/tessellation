@@ -106,6 +106,20 @@ func (s *Server) PublishRumor(ctx context.Context, ru *pb.Rumor) (*pb.PublishRes
 	return &pb.PublishResponse{Ok: true}, nil
 }
 
+// PublishMetagraphBinary broadcasts a state channel snapshot binary to all
+// GL0 nodes over the metagraph-binary topic. Opaque payload — sidecar only
+// wraps and routes.
+func (s *Server) PublishMetagraphBinary(ctx context.Context, mb *pb.MetagraphBinary) (*pb.PublishResponse, error) {
+	data, err := proto.Marshal(mb)
+	if err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	if err := s.node.PublishMetagraphBinary(ctx, data); err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	return &pb.PublishResponse{Ok: true}, nil
+}
+
 // Subscribe streams incoming gossip messages to the JVM.
 func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_SubscribeServer) error {
 	ctx := stream.Context()
@@ -113,6 +127,7 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 	snCh := s.node.SnapshotMessages(ctx)
 	atCh := s.node.AttestationMessages(ctx)
 	ruCh := s.node.RumorMessages(ctx)
+	mbCh := s.node.MetagraphBinaryMessages(ctx)
 	reconnectCh := s.node.ReconnectCh()
 
 	for {
@@ -166,6 +181,21 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 				return err
 			}
 
+		case data, ok := <-mbCh:
+			if !ok {
+				return nil
+			}
+			var mb pb.MetagraphBinary
+			if err := proto.Unmarshal(data, &mb); err != nil {
+				continue
+			}
+			msg := &pb.GossipMessage{
+				Body: &pb.GossipMessage_MetagraphBinary{MetagraphBinary: &mb},
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -174,13 +204,14 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 
 // PeerCount returns mesh membership stats.
 func (s *Server) PeerCount(ctx context.Context, req *pb.PeerCountRequest) (*pb.PeerCountResponse, error) {
-	snPeers, atPeers, ruPeers := s.node.MeshPeerCount()
+	snPeers, atPeers, ruPeers, mbPeers := s.node.MeshPeerCount()
 	total := len(s.node.Host.Network().Peers())
 	return &pb.PeerCountResponse{
-		Total:            int32(total),
-		MeshSnapshots:    int32(snPeers),
-		MeshAttestations: int32(atPeers),
-		MeshRumors:       int32(ruPeers),
+		Total:                  int32(total),
+		MeshSnapshots:          int32(snPeers),
+		MeshAttestations:       int32(atPeers),
+		MeshRumors:             int32(ruPeers),
+		MeshMetagraphBinaries:  int32(mbPeers),
 	}, nil
 }
 

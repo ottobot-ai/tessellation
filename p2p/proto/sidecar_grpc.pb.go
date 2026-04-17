@@ -2,7 +2,7 @@
 // versions:
 // - protoc-gen-go-grpc v1.6.1
 // - protoc             v7.34.1
-// source: sidecar.proto
+// source: proto/sidecar.proto
 
 package proto
 
@@ -19,12 +19,13 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	SidecarService_PublishSnapshot_FullMethodName    = "/nakamoto.p2p.SidecarService/PublishSnapshot"
-	SidecarService_PublishAttestation_FullMethodName = "/nakamoto.p2p.SidecarService/PublishAttestation"
-	SidecarService_PublishRumor_FullMethodName       = "/nakamoto.p2p.SidecarService/PublishRumor"
-	SidecarService_Subscribe_FullMethodName          = "/nakamoto.p2p.SidecarService/Subscribe"
-	SidecarService_PeerCount_FullMethodName          = "/nakamoto.p2p.SidecarService/PeerCount"
-	SidecarService_Health_FullMethodName             = "/nakamoto.p2p.SidecarService/Health"
+	SidecarService_PublishSnapshot_FullMethodName        = "/nakamoto.p2p.SidecarService/PublishSnapshot"
+	SidecarService_PublishAttestation_FullMethodName     = "/nakamoto.p2p.SidecarService/PublishAttestation"
+	SidecarService_PublishRumor_FullMethodName           = "/nakamoto.p2p.SidecarService/PublishRumor"
+	SidecarService_PublishMetagraphBinary_FullMethodName = "/nakamoto.p2p.SidecarService/PublishMetagraphBinary"
+	SidecarService_Subscribe_FullMethodName              = "/nakamoto.p2p.SidecarService/Subscribe"
+	SidecarService_PeerCount_FullMethodName              = "/nakamoto.p2p.SidecarService/PeerCount"
+	SidecarService_Health_FullMethodName                 = "/nakamoto.p2p.SidecarService/Health"
 )
 
 // SidecarServiceClient is the client API for SidecarService service.
@@ -39,6 +40,8 @@ type SidecarServiceClient interface {
 	PublishAttestation(ctx context.Context, in *TipAttestation, opts ...grpc.CallOption) (*PublishResponse, error)
 	// Publish a generic rumor (event / BFT consensus message / etc).
 	PublishRumor(ctx context.Context, in *Rumor, opts ...grpc.CallOption) (*PublishResponse, error)
+	// Publish a metagraph state channel snapshot binary to all GL0 nodes.
+	PublishMetagraphBinary(ctx context.Context, in *MetagraphBinary, opts ...grpc.CallOption) (*PublishResponse, error)
 	// Subscribe to incoming messages from the network.
 	// Server-streaming: sidecar pushes received gossip to JVM.
 	Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GossipMessage], error)
@@ -80,6 +83,16 @@ func (c *sidecarServiceClient) PublishRumor(ctx context.Context, in *Rumor, opts
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PublishResponse)
 	err := c.cc.Invoke(ctx, SidecarService_PublishRumor_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sidecarServiceClient) PublishMetagraphBinary(ctx context.Context, in *MetagraphBinary, opts ...grpc.CallOption) (*PublishResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PublishResponse)
+	err := c.cc.Invoke(ctx, SidecarService_PublishMetagraphBinary_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -137,6 +150,8 @@ type SidecarServiceServer interface {
 	PublishAttestation(context.Context, *TipAttestation) (*PublishResponse, error)
 	// Publish a generic rumor (event / BFT consensus message / etc).
 	PublishRumor(context.Context, *Rumor) (*PublishResponse, error)
+	// Publish a metagraph state channel snapshot binary to all GL0 nodes.
+	PublishMetagraphBinary(context.Context, *MetagraphBinary) (*PublishResponse, error)
 	// Subscribe to incoming messages from the network.
 	// Server-streaming: sidecar pushes received gossip to JVM.
 	Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[GossipMessage]) error
@@ -162,6 +177,9 @@ func (UnimplementedSidecarServiceServer) PublishAttestation(context.Context, *Ti
 }
 func (UnimplementedSidecarServiceServer) PublishRumor(context.Context, *Rumor) (*PublishResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PublishRumor not implemented")
+}
+func (UnimplementedSidecarServiceServer) PublishMetagraphBinary(context.Context, *MetagraphBinary) (*PublishResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PublishMetagraphBinary not implemented")
 }
 func (UnimplementedSidecarServiceServer) Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[GossipMessage]) error {
 	return status.Error(codes.Unimplemented, "method Subscribe not implemented")
@@ -247,6 +265,24 @@ func _SidecarService_PublishRumor_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SidecarService_PublishMetagraphBinary_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MetagraphBinary)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SidecarServiceServer).PublishMetagraphBinary(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SidecarService_PublishMetagraphBinary_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SidecarServiceServer).PublishMetagraphBinary(ctx, req.(*MetagraphBinary))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SidecarService_Subscribe_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(SubscribeRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -314,6 +350,10 @@ var SidecarService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _SidecarService_PublishRumor_Handler,
 		},
 		{
+			MethodName: "PublishMetagraphBinary",
+			Handler:    _SidecarService_PublishMetagraphBinary_Handler,
+		},
+		{
 			MethodName: "PeerCount",
 			Handler:    _SidecarService_PeerCount_Handler,
 		},
@@ -329,7 +369,7 @@ var SidecarService_ServiceDesc = grpc.ServiceDesc{
 			ServerStreams: true,
 		},
 	},
-	Metadata: "sidecar.proto",
+	Metadata: "proto/sidecar.proto",
 }
 
 const (
@@ -598,7 +638,7 @@ var ChainSyncOutbound_ServiceDesc = grpc.ServiceDesc{
 			ServerStreams: true,
 		},
 	},
-	Metadata: "sidecar.proto",
+	Metadata: "proto/sidecar.proto",
 }
 
 const (
@@ -791,5 +831,5 @@ var ChainSyncInbound_ServiceDesc = grpc.ServiceDesc{
 			ServerStreams: true,
 		},
 	},
-	Metadata: "sidecar.proto",
+	Metadata: "proto/sidecar.proto",
 }
