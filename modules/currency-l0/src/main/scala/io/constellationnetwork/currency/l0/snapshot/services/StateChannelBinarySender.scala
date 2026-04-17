@@ -184,16 +184,27 @@ object StateChannelBinarySender {
         }
       }
 
-    private def processRetryMode(cap: Int, signers: Option[NonEmptySet[PeerId]]): F[Unit] =
-      tracker.getPendingToRetry(cap).flatMap { toRetry =>
+    private def processRetryMode(cap: Int, signers: Option[NonEmptySet[PeerId]]): F[Unit] = {
+      // Always send at least 3 binaries in retry mode (oldest + 2 newer).
+      // The cap-shrinking RetryStrategy can drop cap to 1 when no confirmations
+      // arrive, but sending ONLY the oldest strands the queue if that binary
+      // is permanently stuck (e.g. its lastSnapshotHash no longer chains from
+      // GL0's committed head). Sending siblings alongside lets GL0's
+      // onlyPossibleReferences resolve chain gaps — if the oldest can't be
+      // placed, newer binaries that chain from something GL0 has can still
+      // land, unstranding the queue.
+      val siblingBatchSize = 3
+      val effectiveCap = Math.max(cap, siblingBatchSize)
+      tracker.getPendingToRetry(effectiveCap).flatMap { toRetry =>
         val sorted = toRetry.sortBy(_.currencySnapshotOrdinal.value.value)
         if (sorted.nonEmpty) {
-          logger.info(s"[RetryMode] Processing ${sorted.size} binaries") >>
+          logger.info(s"[RetryMode] Processing ${sorted.size} binaries (cap=$cap, effectiveCap=$effectiveCap)") >>
             sorted.traverse_(p => sendBinaryInBackground(p, signers))
         } else {
           Applicative[F].unit
         }
       }
+    }
 
     private def sendBinaryInBackground(
       pending: PendingBinary,
