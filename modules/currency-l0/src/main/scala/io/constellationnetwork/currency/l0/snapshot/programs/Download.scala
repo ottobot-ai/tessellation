@@ -1,8 +1,8 @@
 package io.constellationnetwork.currency.l0.snapshot.programs
 
 import cats.Applicative
-import cats.effect.Async
 import cats.effect.std.Random
+import cats.effect.{Async, Ref}
 import cats.syntax.all.none
 import cats.syntax.applicative._
 import cats.syntax.applicativeError._
@@ -163,34 +163,50 @@ object Download {
 
       val observationLimit = SnapshotOrdinal(lastSnapshot.ordinal.value |+| observationOffset)
 
-      def go(result: DownloadResult): F[DownloadResult] = {
-        val (lastSnapshot, _) = result
+      // Ref holds the effective observation limit — starts at the target
+      // observationLimit, but gets rewritten to the actual last-observed
+      // ordinal if observation stalls.
+      Ref.of[F, ObservationLimit](observationLimit).flatMap { effectiveLimitRef =>
+        def go(result: DownloadResult): F[DownloadResult] = {
+          val (lastSnapshot, _) = result
 
-        if (lastSnapshot.ordinal === observationLimit) {
-          result.pure[F]
-        } else
-          fetchNextSnapshot(result)
-            .flatMap(go)
-            .handleErrorWith {
-              case CannotFetchSnapshot | InvalidChain =>
-                // Chain has stalled — the next ordinal never appeared after exhausting
-                // retries (300s). This happens in small clusters (2-3 nodes) where this
-                // downloading node is needed for BFT quorum: the genesis node produced
-                // snapshots solo until this node joined the cluster, but now consensus
-                // requires both nodes and can't advance until this download completes.
-                // Accept the current state and proceed — the node will catch up via
-                // normal consensus once it reaches Ready.
-                logger.warn(
-                  s"[Download] Observation stalled at ordinal ${lastSnapshot.ordinal.show} " +
-                    s"(target was ${observationLimit.show}). Chain likely needs this node for quorum. " +
-                    s"Proceeding with partial observation."
-                ) >> result.pure[F]
-              case other => other.raiseError[F, DownloadResult]
-            }
+          if (lastSnapshot.ordinal === observationLimit) {
+            result.pure[F]
+          } else
+            fetchNextSnapshot(result)
+              .flatMap(go)
+              .handleErrorWith {
+                case CannotFetchSnapshot | InvalidChain =>
+                  // Chain has stalled — the next ordinal never appeared after exhausting
+                  // retries (300s). This happens in small clusters (2-3 nodes) where this
+                  // downloading node is needed for BFT quorum: the genesis node produced
+                  // snapshots solo until this node joined the cluster, but now consensus
+                  // requires both nodes and can't advance until this download completes.
+                  // Accept the current state and proceed — the node will catch up via
+                  // normal consensus once it reaches Ready. Register the actual
+                  // last-observed ordinal so consensus starts from where we are, not
+                  // from the original target (which would cause InitializeFromDownload
+                  // to mismatch artifact/context).
+                  logger.warn(
+                    s"[Download] Observation stalled at ordinal ${lastSnapshot.ordinal.show} " +
+                      s"(target was ${observationLimit.show}). Chain likely needs this node for quorum. " +
+                      s"Proceeding with partial observation."
+                  ) >> effectiveLimitRef.set(lastSnapshot.ordinal) >> result.pure[F]
+                case other => other.raiseError[F, DownloadResult]
+              }
+        }
+
+        // Observe first, then register consensus at the EFFECTIVE limit.
+        // If observation stalls, registerForConsensus is called with the
+        // actual last-observed ordinal — avoiding InitializeFromDownload
+        // artifact/context mismatch when consensus tries to init at a
+        // target the downloading node never reached.
+        go(result).flatMap { r =>
+          effectiveLimitRef.get.flatMap { effectiveLimit =>
+            consensus.manager.registerForConsensus(effectiveLimit).as((r, effectiveLimit))
+          }
+        }
       }
-
-      consensus.manager.registerForConsensus(observationLimit) >>
-        go(result).map((_, observationLimit))
     }
 
     def fetchNextSnapshot(result: DownloadResult)(implicit hasher: Hasher[F]): F[DownloadResult] = {
