@@ -44,6 +44,7 @@ import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, GlobalStateProofSelector}
 import io.constellationnetwork.security.{Hasher, HasherSelector, SecurityProvider}
+import io.constellationnetwork.statechannel.StateChannelOutput
 
 import org.http4s.client.Client
 import org.typelevel.log4cats.slf4j.Slf4jLogger
@@ -109,6 +110,37 @@ object Services {
 
       eventGossipClient = EventGossipClient.make[F, GlobalSnapshotEvent](client, session)
 
+      // stateChannelService must exist before consensus so that the Nakamoto
+      // gossip daemon can route metagraph-binary gossip messages through the
+      // same acceptance pipeline that the HTTP POST endpoint uses.
+      stateChannelService = StateChannelService
+        .make[F](
+          L0Cell.mkL0Cell(
+            queues.l1Output,
+            queues.stateChannelOutput,
+            queues.updateNodeParametersOutput,
+            queues.delegatedStakeOutput,
+            queues.nodeCollateralOutput
+          ),
+          validators.stateChannelValidator,
+          sharedStorages.mptStore
+        )
+
+      // Callback for the Nakamoto gossip daemon to process incoming metagraph
+      // binaries. Mirrors the HTTP route in StateChannelRoutes: wrap as
+      // StateChannelOutput, fetch snapshotStorage.head for context, delegate
+      // to stateChannelService.process. Errors are logged and swallowed —
+      // gossip is fire-and-forget, no sender to reply to.
+      processMetagraphBinary = (output: StateChannelOutput) =>
+        storages.globalSnapshot.head.flatMap {
+          case Some((snapshot, info)) =>
+            HasherSelector[F].withCurrent { implicit hasher =>
+              stateChannelService.process(output, (snapshot, info))
+            }.void
+          case None =>
+            Async[F].unit // Node not ready to accept metagraph snapshots yet.
+        }
+
       consensus <- HasherSelector[F].withCurrent { implicit hs =>
         GlobalSnapshotConsensus
           .make[F, R](
@@ -141,7 +173,8 @@ object Services {
             eventGossipClient,
             loggerBundle,
             queues.rumor,
-            nakamotoFinalizedOrdinalRef
+            nakamotoFinalizedOrdinalRef,
+            processMetagraphBinary
           )
       }
       addressService = AddressService.make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
@@ -150,18 +183,6 @@ object Services {
         Some(sharedStorages.mptStore)
       )
       collateralService = MptStoreCollateral.make[F](cfg.collateral, sharedStorages.mptStore)
-      stateChannelService = StateChannelService
-        .make[F](
-          L0Cell.mkL0Cell(
-            queues.l1Output,
-            queues.stateChannelOutput,
-            queues.updateNodeParametersOutput,
-            queues.delegatedStakeOutput,
-            queues.nodeCollateralOutput
-          ),
-          validators.stateChannelValidator,
-          sharedStorages.mptStore
-        )
       getOrdinal = storages.globalSnapshot.headSnapshot.map(_.map(_.ordinal))
       trustUpdaterService = TrustStorageUpdater.make(getOrdinal, sharedServices.gossip, storages.trust)
       recoveryPeerHintService <- RecoveryPeerHint.make[F]

@@ -209,7 +209,8 @@ object NakamotoSyncDaemon {
     productionGate: ProductionGate[F],
     mptStore: MptStore[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    dataDir: java.nio.file.Path
+    dataDir: java.nio.file.Path,
+    processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit]
   )(implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
@@ -344,6 +345,9 @@ object NakamotoSyncDaemon {
 
                           case pb.GossipMessage.Body.Attestation(att) =>
                             handleAttestation(att, tipTracker, logger)
+
+                          case pb.GossipMessage.Body.MetagraphBinary(mb) =>
+                            handleMetagraphBinary(mb, processMetagraphBinary, logger)
 
                           case _: pb.GossipMessage.Body.Rumor =>
                             Async[F].unit
@@ -988,6 +992,40 @@ object NakamotoSyncDaemon {
               )
         } yield ()
       }
+    }
+  }
+
+  /** Route an incoming state channel binary from gossip into the same acceptance pipeline as the HTTP POST endpoint. The sender serialized
+    * Signed[StateChannelSnapshotBinary] as JSON via circe; we decode back and wrap as StateChannelOutput. Errors (decode failure, address
+    * parse failure) are logged and swallowed — gossip is fire-and-forget with no sender to reply to.
+    */
+  private def handleMetagraphBinary[F[_]: Async](
+    mb: pb.MetagraphBinary,
+    processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] = {
+    import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
+    import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelSnapshotBinary}
+    import io.constellationnetwork.security.signature.Signed
+    import io.circe.parser.decode
+    import eu.timepit.refined.refineV
+
+    refineV[DAGAddressRefined](mb.address) match {
+      case Left(err) =>
+        logger.warn(s"⚠️ Rejecting metagraph-binary gossip: invalid address '${mb.address}' ($err)")
+      case Right(refined) =>
+        val address = Address(refined)
+        val bytes = mb.binary.toByteArray
+        Async[F]
+          .delay(decode[Signed[StateChannelSnapshotBinary]](new String(bytes, java.nio.charset.StandardCharsets.UTF_8)))
+          .flatMap {
+            case Left(err) =>
+              logger.warn(s"⚠️ Rejecting metagraph-binary gossip: decode failed for $address (${err.getMessage})")
+            case Right(signed) =>
+              val output = StateChannelOutput(address, signed)
+              processMetagraphBinary(output)
+                .handleErrorWith(e => logger.warn(s"⚠️ processMetagraphBinary failed for $address: ${e.getMessage}"))
+          }
     }
   }
 
