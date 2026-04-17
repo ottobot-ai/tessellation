@@ -251,8 +251,11 @@ const createTokenLock = async (account, urls, lockAmount, replaceRef = null, rep
     throw new Error('Failed to create TokenLock')
   }
 
+  // Use atLeast because delegator rewards accrue between the balance
+  // snapshot and the retry check. Without this, the exact-match assertion
+  // fails as rewards push the actual balance above the expected value.
   await withRetry(
-    async () => assertBalanceChange(account, initialBalance - lockAmount + replaceBalance),
+    async () => assertBalanceChange(account, initialBalance - lockAmount + replaceBalance, { atLeast: true }),
     {
       name: 'assertBalanceChangeAfterTokenLock',
       maxAttempts: 60,
