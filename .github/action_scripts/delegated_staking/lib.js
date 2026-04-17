@@ -117,15 +117,31 @@ const postNodeParamsNodeId = async (
 }
 
 const createDelegatedStake = async (account, lockHash, lockAmount, nodeId) => {
-  const { hash } = await account.postDelegatedStake({
-    source: account.address,
-    nodeId: nodeId,
-    amount: lockAmount,
-    fee: 0,
-    tokenLockRef: lockHash,
-  })
-
-  return hash
+  // Retry on InvalidTokenLock: the token lock's balance-change confirmation
+  // (via createTokenLock) means it was accepted by GL1, but GL0's stake
+  // validator requires the lock to be in GL0's finalized state. In Nakamoto
+  // mode there's a ~15-30s gap between GL1 acceptance and GL0 finalization.
+  const maxAttempts = 30
+  const intervalMs = 3000
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const { hash } = await account.postDelegatedStake({
+        source: account.address,
+        nodeId: nodeId,
+        amount: lockAmount,
+        fee: 0,
+        tokenLockRef: lockHash,
+      })
+      return hash
+    } catch (error) {
+      const msg = error?.message || String(error)
+      if (msg.includes('InvalidTokenLock') && attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, intervalMs))
+        continue
+      }
+      throw error
+    }
+  }
 }
 
 const withdrawDelegatedStake = async (account, stakeHash) => {
