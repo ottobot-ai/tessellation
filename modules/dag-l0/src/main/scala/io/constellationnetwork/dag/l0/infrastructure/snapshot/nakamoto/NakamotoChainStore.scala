@@ -121,7 +121,18 @@ object NakamotoChainStore {
   def make[F[_]: Async: HasherSelector](
     underlyingStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     chainSelection: ChainSelection[F],
-    tipTracker: TipTracker[F]
+    tipTracker: TipTracker[F],
+    // Finalized-ordinal guard. `store` refuses to write a snapshot whose ordinal is
+    // at-or-below finalized when its hash differs from the already-stored one — that
+    // would silently rewrite finalized content (the gl0-2-divergent-517 class of bug
+    // we saw: local slot-win produced own snapshot at ord N that was already finalized
+    // via gossip with a different hash, and blindly overwrote it, causing permanent
+    // cross-node hash disagreement at ord N).
+    //
+    // Writes above finalized are always allowed (that's the normal reorg path). Writes
+    // at-or-below finalized with MATCHING hash are no-ops (legitimate re-delivery or
+    // download-replay). Only differing-hash writes at-or-below finalized are refused.
+    nakamotoFinalizedOrdinalRef: Ref[F, Long]
   ): F[NakamotoChainStoreAlgebra[F]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoChainStore")
 
@@ -152,7 +163,17 @@ object NakamotoChainStore {
                 vrfHex
               )
 
-              stateRef.modify { state =>
+              // Finality-safety gate. If `ordinal` is at-or-below finalized AND a DIFFERENT hash is
+              // already stored at that ordinal, refuse the write — accepting would silently rewrite
+              // finalized content and cause cross-node hash divergence (the gl0-2-divergent-517
+              // class of bug: local slot-win produced own snapshot at ord N that was already
+              // finalized via gossip with a different hash, and blindly overwrote it, leading to
+              // permanent cross-node hash disagreement at ord N).
+              //
+              // Matching-hash writes at-or-below finalized fall through (legitimate re-delivery
+              // / download replay). Writes above finalized always pass (normal reorg path, still
+              // finality-safe because unfinalized).
+              val tryStore: F[Boolean] = stateRef.modify { state =>
                 if (state.byHash.contains(snapshotHash)) {
                   // Duplicate — already stored
                   (state, false.pure[F])
@@ -227,6 +248,24 @@ object NakamotoChainStore {
                   }
                 }
               }.flatten
+
+              nakamotoFinalizedOrdinalRef.get.flatMap { finalizedOrd =>
+                if (ordinal <= finalizedOrd) {
+                  stateRef.get.flatMap { state =>
+                    state.byHash.values.find(_.ordinal == ordinal).map(_.hash) match {
+                      case Some(existingHash) if existingHash =!= snapshotHash =>
+                        logger
+                          .warn(
+                            s"REFUSED store: finality-safety violation — ordinal=$ordinal is at-or-below finalized=$finalizedOrd, " +
+                              s"existing=${existingHash.value.take(12)}, new=${snapshotHash.value.take(12)}. " +
+                              s"Dropping write; this node previously finalized the existing snapshot and must not rewrite it."
+                          )
+                          .as(false)
+                      case _ => tryStore
+                    }
+                  }
+                } else tryStore
+              }
             }
           }
 

@@ -137,7 +137,9 @@ object GlobalSnapshotConsensus {
     nakamotoFinalizedOrdinalRef: Ref[F, Long],
     // Invoked by NakamotoSyncDaemon when a metagraph-binary arrives via gossip.
     // Routes the binary through the same pipeline as the HTTP endpoint (stateChannelService.process).
-    processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit]
+    processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
+    // Created in Services.make (hoisted so HTTP routes and stateChannelService can also publish).
+    sidecarClient: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarClientAlgebra[F]
   )(implicit supervisor: Supervisor[F], globalStateProofSelector: GlobalStateProofSelector): F[GlobalSnapshotConsensus[F]] =
     for {
       globalStateChannelManager <- GlobalSnapshotStateChannelAcceptanceManager
@@ -384,7 +386,7 @@ object GlobalSnapshotConsensus {
             }
           chainSelection = io.constellationnetwork.node.shared.domain.nakamoto.ChainSelection.make[F](tipTracker, fetchParent)
           chainStore <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore
-            .make[F](globalSnapshotStorage, chainSelection, tipTracker)
+            .make[F](globalSnapshotStorage, chainSelection, tipTracker, nakamotoFinalizedOrdinalRef)
           _ <- chainStoreRef.set(Some(chainStore))
           _ <- chainStoreForLookupRef.set(Some(chainStore))
           // Seed chain store with the current head snapshot so gossip children can find their parent
@@ -431,14 +433,34 @@ object GlobalSnapshotConsensus {
           // so each operation sees correct parent state (Bifrost uses same pattern)
           snapshotSemaphore <- cats.effect.std.Semaphore[F](1)
           productionGate <- io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate.make[F]
-          sidecarConfig = io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarConfig(
-            host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
-            grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
-          )
-          allocatedPair <- io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
-            .makeResource[F](sidecarConfig)
-            .allocated
-          sidecarClient = allocatedPair._1
+          // Shared ChainSyncManager reference. Populated by NakamotoSyncDaemon after it constructs
+          // its internal manager; read-through by the ChainSyncRequestQueue worker below so the
+          // reactive walkback path piggybacks on existing hash-keyed dedup + fetch. No-op until bound.
+          sharedChainSyncManagerRef <- cats.effect.kernel.Ref.of[F, Option[
+            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncManager.ChainSyncManagerAlgebra[F]
+          ]](None)
+          // Reactive ChainSync trigger for the finality walkback path (see
+          // ChainSyncRequestQueue docs for the full rationale). We use `.allocated` to escape
+          // the Resource into the for-comprehension; the fiber ends up sharing the app lifetime,
+          // which matches the surrounding `supervisor.supervise(...)` daemons.
+          chainSyncRequestQueue <- {
+            val workerFn = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncRequestQueue
+              .walkbackWorker[F] _
+            val reactiveWorker: Long => F[Unit] = ord =>
+              sharedChainSyncManagerRef.get.flatMap {
+                case Some(csm) => workerFn(sidecarClient.channel, csm).apply(ord)
+                case None      =>
+                  // Pre-binding window before NakamotoSyncDaemon publishes its ChainSyncManager.
+                  // Brief in practice; the next 5s finality-monitor tick re-offers if the fork persists.
+                  cats.Applicative[F].unit
+              }
+            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncRequestQueue
+              .make[F](reactiveWorker)
+              .allocated
+              .map(_._1) // discard the release; fiber lives with the app
+          }
+          // sidecarClient is now created in Services.make and passed in as a parameter so that
+          // the HTTP state-channel route can publish metagraph binaries via the same gRPC channel.
           // Wire rumor gossip onto the sidecar transport. Outbound: every rumor passing through
           // Gossip.spread is forwarded to the libp2p sidecar via PublishRumor. Inbound: rumors
           // received from the GossipSub mesh are deserialized back to Hashed[RumorRaw] and offered
@@ -474,7 +496,8 @@ object GlobalSnapshotConsensus {
                 genesisTimeMs = pureGenesisTimeMs,
                 snapshotSemaphore = snapshotSemaphore,
                 productionGate = productionGate,
-                nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef
+                nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef,
+                chainSyncRequestQueue = chainSyncRequestQueue
               )
               .compile
               .drain
@@ -541,7 +564,8 @@ object GlobalSnapshotConsensus {
                 mptStore = mptStore,
                 eventMempool = eventMempool,
                 dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data")),
-                processMetagraphBinary = processMetagraphBinary
+                processMetagraphBinary = processMetagraphBinary,
+                sharedChainSyncManagerRef = sharedChainSyncManagerRef
               )
               .compile
               .drain

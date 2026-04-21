@@ -18,6 +18,7 @@ import io.constellationnetwork.ext.cats.effect._
 import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
 import io.constellationnetwork.ext.kryo._
 import io.constellationnetwork.node.shared.app.{DagL0, NodeShared, TessellationIOApp}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityGate
 import io.constellationnetwork.node.shared.ext.pureconfig._
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.EventTrigger
@@ -78,6 +79,16 @@ object Main
       queues <- Queues.make[IO](sharedQueues).asResource
 
       p2pClient = P2PClient.make[IO](sharedP2PClient, sharedResources.client, sharedServices.session, sharedConfig.snapshotTimeoutsConfig)
+      // Nakamoto finalized-ordinal tracker. Updated by SnapshotLeaderLoop after every
+      // chainStore.finalize call (depth-k or attestation-2/3). Read by the HTTP routes
+      // exposing /global-snapshots/latest/finalized-ordinal so CL0 can gate state-channel
+      // -binary pruning on actual finality. Stays at 0 in BFT mode (HttpApi only consults
+      // it when nakamoto mode is on).
+      // Seed with 1 (genesis ordinal) so the genesis snapshot is always servable
+      // on finality-gated endpoints. Updated by SnapshotLeaderLoop as finality advances.
+      // Constructed BEFORE Storages so SnapshotStorage.setHeadForRecovery can enforce
+      // the finality-safety guard (refuses different-hash overwrites at-or-below finalized).
+      nakamotoFinalizedOrdinalRef <- Ref.of[IO, Long](1L).asResource
       storages <- Storages
         .make[IO](
           sharedStorages,
@@ -87,17 +98,17 @@ object Main
           cfg.incremental,
           trustRatings,
           sharedConfig.environment,
-          hashSelect
+          hashSelect,
+          nakamotoFinalizedOrdinalRef.some
         )
         .asResource
-      // Nakamoto finalized-ordinal tracker. Updated by SnapshotLeaderLoop after every
-      // chainStore.finalize call (depth-k or attestation-2/3). Read by the HTTP routes
-      // exposing /global-snapshots/latest/finalized-ordinal so CL0 can gate state-channel
-      // -binary pruning on actual finality. Stays at 0 in BFT mode (HttpApi only consults
-      // it when nakamoto mode is on).
-      // Seed with 1 (genesis ordinal) so the genesis snapshot is always servable
-      // on finality-gated endpoints. Updated by SnapshotLeaderLoop as finality advances.
-      nakamotoFinalizedOrdinalRef <- Ref.of[IO, Long](1L).asResource
+
+      // Finality gate: Nakamoto GL0 serves only attestation-finalized snapshot data
+      // over HTTP. Sidecar GossipSub is the only path for pending (pre-finality)
+      // snapshots between GL0 peers. Constructed here once per node and flowed as
+      // an implicit through Services/HttpApi/route constructors so gating is uniform
+      // — no more ad-hoc Option[F[Option[SnapshotOrdinal]]] threading.
+      implicit0(finalityGate: FinalityGate[IO]) = FinalityGate.fromRef[IO](nakamotoFinalizedOrdinalRef)
 
       services <- Services
         .make[IO, RunNakamoto](
@@ -151,7 +162,8 @@ object Main
       rumorHandler = RumorHandlers
         .make[IO](storages.cluster, services.localHealthcheck, sharedStorages.forkInfo)
         .handlers <+>
-        trustHandler(storages.trust) <+> ordinalTrustHandler(storages.trust) <+> services.consensus.handler <+>
+        // trustHandler(storages.trust) <+> ordinalTrustHandler(storages.trust) <+> // trust disabled on GL0
+        services.consensus.handler <+>
         eventRumorHandler
 
       forkRecoveryService = ForkRecoveryService.make[IO](
@@ -192,10 +204,7 @@ object Main
           cfg.shared,
           storages.combinedGlobalSnapshotCheckpointStorage,
           getLocalChainTip = Some(forkRecoveryService.getLocalChainTip),
-          maybeMarkSeen = Some(eventGossipDaemon.markSeen),
-          getNakamotoFinalizedOrdinal = Some(nakamotoFinalizedOrdinalRef.get.map { ord =>
-            Some(SnapshotOrdinal.unsafeApply(ord))
-          })
+          maybeMarkSeen = Some(eventGossipDaemon.markSeen)
         )
       )
 

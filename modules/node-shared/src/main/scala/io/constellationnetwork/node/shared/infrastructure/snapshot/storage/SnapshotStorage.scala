@@ -54,7 +54,14 @@ object SnapshotStorage {
     inMemoryCapacity: NonNegLong,
     snapshotInfoCutoffOrdinal: SnapshotOrdinal,
     hasherSelector: HasherSelector[F],
-    combinedSnapshotCheckpointFileSystemStorage: CombinedSnapshotCheckpointFileSystemStorage[F, S, C]
+    combinedSnapshotCheckpointFileSystemStorage: CombinedSnapshotCheckpointFileSystemStorage[F, S, C],
+    // Optional finalized-ordinal source. When provided, `setHeadForRecovery` refuses
+    // different-hash overwrites at-or-below finalized — a raw-layer safety net so that
+    // any direct caller (bypassing NakamotoChainStore.store's guard) still cannot
+    // silently rewrite finalized content. BFT consumers leave this None (their BFT
+    // recovery path legitimately rewrites content as part of download catch-up).
+    // Nakamoto GL0 constructs with Some(nakamotoFinalizedOrdinalRef).
+    nakamotoFinalizedOrdinalRef: Option[Ref[F, Long]] = None
   )(implicit supervisor: Supervisor[F]): F[SnapshotStorage[F, S, C] with LatestBalances[F]] =
     makeResources[F, S, C]().flatMap {
       case (headRef, ordinalCache, hashCache, notPersistedCache, offloadQueue, cutoffQueue, tentativeRef, _) =>
@@ -71,7 +78,8 @@ object SnapshotStorage {
           inMemoryCapacity,
           snapshotInfoCutoffOrdinal,
           hasherSelector,
-          combinedSnapshotCheckpointFileSystemStorage
+          combinedSnapshotCheckpointFileSystemStorage,
+          nakamotoFinalizedOrdinalRef
         )
     }
 
@@ -88,7 +96,8 @@ object SnapshotStorage {
     inMemoryCapacity: NonNegLong,
     snapshotInfoCutoffOrdinal: SnapshotOrdinal,
     hasherSelector: HasherSelector[F],
-    combinedSnapshotCheckpointFileSystemStorage: CombinedSnapshotCheckpointFileSystemStorage[F, S, C]
+    combinedSnapshotCheckpointFileSystemStorage: CombinedSnapshotCheckpointFileSystemStorage[F, S, C],
+    nakamotoFinalizedOrdinalRef: Option[Ref[F, Long]]
   )(implicit supervisor: Supervisor[F]): F[SnapshotStorage[F, S, C] with LatestBalances[F]] = {
 
     def logger = Slf4jLogger.getLogger[F]
@@ -248,30 +257,62 @@ object SnapshotStorage {
             _.traverse(_.toHashed.map(_.hash))
           }
 
-        def setHeadForRecovery(snapshot: Signed[S], state: C)(implicit hasher: Hasher[F]): F[Unit] =
+        def setHeadForRecovery(snapshot: Signed[S], state: C)(implicit hasher: Hasher[F]): F[Unit] = {
+          // Raw-layer finality-safety net. NakamotoChainStore.store is the primary enforcement
+          // point, but any direct caller of setHeadForRecovery (e.g. NakamotoSyncDaemon's gossip
+          // accept path, SnapshotLeaderLoop's post-store write) would bypass it. This mirror
+          // guard at the storage boundary ensures that a different-hash rewrite at-or-below
+          // finalized is refused regardless of caller. BFT constructs without the ref; Nakamoto
+          // constructs with Some(nakamotoFinalizedOrdinalRef) and is subject to the check.
+          def finalitySafe(hashedNew: Hashed[S]): F[Boolean] =
+            nakamotoFinalizedOrdinalRef match {
+              case None => true.pure[F]
+              case Some(ref) =>
+                ref.get.flatMap { finalizedOrd =>
+                  if (snapshot.ordinal.value.value > finalizedOrd) true.pure[F]
+                  else
+                    getHash(snapshot.ordinal).map {
+                      case Some(existingHash) => existingHash === hashedNew.hash
+                      case None               => true
+                    }.flatTap { safe =>
+                      Applicative[F].whenA(!safe) {
+                        logger.warn(
+                          s"[SnapshotStorage] REFUSED setHeadForRecovery: finality-safety violation at ordinal=${snapshot.ordinal.show} " +
+                            s"(finalized=$finalizedOrd, new=${hashedNew.hash.show.take(12)}). Refusing to rewrite finalized content."
+                        )
+                      }
+                    }
+                }
+            }
+
           logger.info(s"[SnapshotStorage] Recovery: setting head to ordinal=${snapshot.ordinal.show}") >>
-            // Only delete existing file if a DIFFERENT snapshot exists at this ordinal
-            // (Nakamoto reorgs). Don't delete when the same snapshot is re-stored (genesis seeding).
             snapshot.toHashed.flatMap { hashed =>
-              getHash(snapshot.ordinal).flatMap {
-                case Some(existingHash) if existingHash =!= hashed.hash =>
-                  logger.info(s"[SnapshotStorage] Replacing snapshot at ordinal=${snapshot.ordinal.show} (old=${existingHash.show
-                      .take(12)}, new=${hashed.hash.show.take(12)})") >>
-                    snapshotLocalFileSystemStorage.delete(snapshot.ordinal).attempt.void
-                case _ =>
-                  Async[F].unit
-              }
-            } >>
-            enqueue(snapshot, state) >>
-            // Ensure the ordinal file exists on disk after enqueue. enqueue → write can fail
-            // due to race conditions during concurrent reorgs (UnableToPersistSnapshot when
-            // another thread recreated the ordinal file first, or hash file missing). Write
-            // directly to the ordinal path as a guaranteed fallback — no hash file or link needed.
-            snapshotLocalFileSystemStorage.exists(snapshot.ordinal).flatMap { exists =>
-              if (!exists) snapshotLocalFileSystemStorage.writeUnderOrdinal(snapshot).attempt.void
-              else Async[F].unit
-            } >>
-            headRef.set((snapshot, hasher, state).some).void
+              finalitySafe(hashed).ifM(
+                // Only delete existing file if a DIFFERENT snapshot exists at this ordinal
+                // (Nakamoto reorgs). Don't delete when the same snapshot is re-stored (genesis seeding).
+                getHash(snapshot.ordinal).flatMap {
+                  case Some(existingHash) if existingHash =!= hashed.hash =>
+                    logger.info(s"[SnapshotStorage] Replacing snapshot at ordinal=${snapshot.ordinal.show} (old=${existingHash.show
+                        .take(12)}, new=${hashed.hash.show.take(12)})") >>
+                      snapshotLocalFileSystemStorage.delete(snapshot.ordinal).attempt.void
+                  case _ =>
+                    Async[F].unit
+                } >>
+                  enqueue(snapshot, state) >>
+                  // Ensure the ordinal file exists on disk after enqueue. enqueue → write can fail
+                  // due to race conditions during concurrent reorgs (UnableToPersistSnapshot when
+                  // another thread recreated the ordinal file first, or hash file missing). Write
+                  // directly to the ordinal path as a guaranteed fallback — no hash file or link needed.
+                  snapshotLocalFileSystemStorage.exists(snapshot.ordinal).flatMap { exists =>
+                    if (!exists) snapshotLocalFileSystemStorage.writeUnderOrdinal(snapshot).attempt.void
+                    else Async[F].unit
+                  } >>
+                  headRef.set((snapshot, hasher, state).some).void,
+                // Refused — leave storage untouched so the canonical finalized content remains.
+                Async[F].unit
+              )
+            }
+        }
 
         def setTentativeHead(snapshot: Signed[S], state: C)(implicit hasher: Hasher[F]): F[Unit] =
           for {

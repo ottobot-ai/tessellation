@@ -210,7 +210,13 @@ object NakamotoSyncDaemon {
     mptStore: MptStore[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     dataDir: java.nio.file.Path,
-    processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit]
+    processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
+    // Shared `Option` ref so other components (e.g. the reactive finality-walkback
+    // ChainSyncRequestQueue) can route through the same hash-keyed dedup + fetch
+    // machinery without needing their own `ChainSyncManager`. We publish our
+    // internally-constructed manager into this Ref once it's built; consumers
+    // read-through it and no-op if the producer hasn't bound yet.
+    sharedChainSyncManagerRef: Ref[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]]
   )(implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
@@ -265,7 +271,7 @@ object NakamotoSyncDaemon {
                     }
                   }
                 )
-                .flatMap(csm => csRef.set(Some(csm)).as(csm))
+                .flatMap(csm => csRef.set(Some(csm)) >> sharedChainSyncManagerRef.set(Some(csm)).as(csm))
             }
           )
           .flatMap { chainSyncManager =>
@@ -996,10 +1002,10 @@ object NakamotoSyncDaemon {
   }
 
   /** Route an incoming state channel binary from gossip into the same acceptance pipeline as the HTTP POST endpoint. The sender serialized
-    * Signed[StateChannelSnapshotBinary] as JSON via circe; we decode back and wrap as StateChannelOutput. Errors (decode failure, address
-    * parse failure) are logged and swallowed — gossip is fire-and-forget with no sender to reply to.
+    * Signed[StateChannelSnapshotBinary] via the project's JsonSerializer (JSON + Brotli); we use the same typeclass to deserialize. Errors
+    * (decode failure, address parse failure) are logged and swallowed — gossip is fire-and-forget with no sender to reply to.
     */
-  private def handleMetagraphBinary[F[_]: Async](
+  private def handleMetagraphBinary[F[_]: Async: io.constellationnetwork.json.JsonSerializer](
     mb: pb.MetagraphBinary,
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
     logger: org.typelevel.log4cats.Logger[F]
@@ -1007,7 +1013,6 @@ object NakamotoSyncDaemon {
     import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
     import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelSnapshotBinary}
     import io.constellationnetwork.security.signature.Signed
-    import io.circe.parser.decode
     import eu.timepit.refined.refineV
 
     refineV[DAGAddressRefined](mb.address) match {
@@ -1016,8 +1021,9 @@ object NakamotoSyncDaemon {
       case Right(refined) =>
         val address = Address(refined)
         val bytes = mb.binary.toByteArray
-        Async[F]
-          .delay(decode[Signed[StateChannelSnapshotBinary]](new String(bytes, java.nio.charset.StandardCharsets.UTF_8)))
+        io.constellationnetwork.json
+          .JsonSerializer[F]
+          .deserialize[Signed[StateChannelSnapshotBinary]](bytes)
           .flatMap {
             case Left(err) =>
               logger.warn(s"⚠️ Rejecting metagraph-binary gossip: decode failed for $address (${err.getMessage})")

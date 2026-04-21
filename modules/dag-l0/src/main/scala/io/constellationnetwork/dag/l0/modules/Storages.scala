@@ -39,7 +39,12 @@ object Storages {
     incrementalConfig: IncrementalConfig,
     trustUpdates: Option[PeerObservationAdjustmentUpdateBatch],
     environment: AppEnvironment,
-    hashSelect: HashSelect
+    hashSelect: HashSelect,
+    // Optional finalized-ordinal ref. When Some, SnapshotStorage.setHeadForRecovery
+    // refuses different-hash overwrites at-or-below finalized (raw-layer safety net
+    // complementing NakamotoChainStore.store's guard). Nakamoto GL0 passes Some(ref);
+    // other consumers leave None so BFT semantics are unchanged.
+    nakamotoFinalizedOrdinalRef: Option[cats.effect.kernel.Ref[F, Long]] = None
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): F[Storages[F]] =
@@ -71,7 +76,8 @@ object Storages {
         snapshotConfig.inMemoryCapacity,
         incrementalConfig.lastFullGlobalSnapshotOrdinal.getOrElse(environment, SnapshotOrdinal.MinValue),
         HasherSelector[F],
-        combinedGlobalSnapshotCheckpointStorage
+        combinedGlobalSnapshotCheckpointStorage,
+        nakamotoFinalizedOrdinalRef
       )
       snapshotDownloadStorage = SnapshotDownloadStorage
         .make[F](

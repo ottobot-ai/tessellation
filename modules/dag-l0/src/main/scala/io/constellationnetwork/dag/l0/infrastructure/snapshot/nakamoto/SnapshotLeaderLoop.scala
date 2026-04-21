@@ -173,7 +173,13 @@ object SnapshotLeaderLoop {
     // Tracks the highest finalized ordinal so HttpApi can expose it via
     // /global-snapshots/latest/finalized-ordinal. Updated after every successful
     // chainStore.finalize call (depth-k or attestation-2/3, whichever fires first).
-    nakamotoFinalizedOrdinalRef: Ref[F, Long]
+    nakamotoFinalizedOrdinalRef: Ref[F, Long],
+    // Fire-and-forget ChainSync trigger for the finality walkback path. When the
+    // finality monitor tries to confirm ancestry at an attested ordinal that we
+    // don't have on our local canonical chain (we're on a fork), we enqueue a
+    // request here instead of silently waiting for the next periodic sync. See
+    // ChainSyncRequestQueue for why this is a queue rather than a direct call.
+    chainSyncRequestQueue: ChainSyncRequestQueue[F]
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -301,6 +307,7 @@ object SnapshotLeaderLoop {
                             epochStateRef,
                             productionGate,
                             productionTimestamps,
+                            nakamotoFinalizedOrdinalRef,
                             logger
                           )
                         } // snapshotSemaphore.permit
@@ -445,8 +452,15 @@ object SnapshotLeaderLoop {
                           )
                       }
                     case None =>
+                      // We're on a fork that doesn't contain the attested ordinal. The periodic sync will notice eventually,
+                      // but in practice that takes ~tens of seconds (observed 48s stall in one incident). Enqueue a targeted
+                      // ChainSync request so we start pulling the better chain now. Idempotent: repeated 5s ticks over the same
+                      // gap collapse into one in-flight request.
                       logger
-                        .warn(s"⚠️ ATTEST-FINALIZE: walkBackTo found no hash at ordinal=$finalOrdinal from tip=${tip.hash.value.take(12)}")
+                        .warn(
+                          s"⚠️ ATTEST-FINALIZE: walkBackTo found no hash at ordinal=$finalOrdinal from tip=${tip.hash.value.take(12)}"
+                        ) >>
+                        chainSyncRequestQueue.request(finalOrdinal)
                   }
                 case _ =>
                   Async[F].whenA(allAtts.nonEmpty) {
@@ -492,6 +506,7 @@ object SnapshotLeaderLoop {
     epochStateRef: Ref[F, SharedEpochState],
     productionGate: ProductionGate[F],
     productionTimestamps: Ref[F, Map[Long, Long]],
+    nakamotoFinalizedOrdinalRef: Ref[F, Long],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -529,184 +544,201 @@ object SnapshotLeaderLoop {
 
         // Get last snapshot from storage
         headOpt <- snapshotStorage.head
+        finalizedOrdinal <- nakamotoFinalizedOrdinalRef.get
 
         _ <- headOpt match {
           case Some((lastSigned, lastContext)) =>
-            for {
-              lastHashed <- lastSigned.toHashed[F]
-              lastKey = lastHashed.ordinal
+            lastSigned.toHashed[F].flatMap { lastHashed =>
+              val lastKey = lastHashed.ordinal
+              val wouldProduceOrdinal = lastKey.value.value + 1
+              // Finality-safety: never produce a snapshot at-or-below the network-finalized
+              // ordinal. If we won a slot but our local head is stale (below finalized),
+              // producing would emit a doomed snapshot — refused downstream by
+              // NakamotoChainStore's finality guard, and in a past storage-layer regression
+              // could have silently overwritten finalized content (the gl0-2-divergent-517
+              // class of bug). Skip and let the sync daemon catch us up via gossip/chainsync;
+              // the next slot win after catch-up produces the correct (above-finalized) ordinal.
+              if (wouldProduceOrdinal <= finalizedOrdinal) {
+                logger.warn(
+                  s"⛔ Skipping slot-win production: would-be ordinal=$wouldProduceOrdinal ≤ finalized=$finalizedOrdinal. " +
+                    s"Local head=${lastKey.value.value} is stale; waiting for gossip/chainsync to catch up."
+                )
+              } else
+                for {
+                  productionStartMs <- Async[F].delay(System.currentTimeMillis())
 
-              productionStartMs <- Async[F].delay(System.currentTimeMillis())
+                  // Drain mempool — getMultiple returns Hashed[Event]
+                  // Hashed[A].signed.value gives the raw A
+                  eventHashes <- eventMempool.getEventHashes
+                  hashedEvents <- eventMempool.getMultiple(eventHashes)
+                  eventSet: Set[GlobalSnapshotEvent] = hashedEvents.values.map(_.signed.value).toSet
+                  _ <- Metrics[F].recordDistribution("dag_nakamoto_events_drained", eventSet.size)
 
-              // Drain mempool — getMultiple returns Hashed[Event]
-              // Hashed[A].signed.value gives the raw A
-              eventHashes <- eventMempool.getEventHashes
-              hashedEvents <- eventMempool.getMultiple(eventHashes)
-              eventSet: Set[GlobalSnapshotEvent] = hashedEvents.values.map(_.signed.value).toSet
-              _ <- Metrics[F].recordDistribution("dag_nakamoto_events_drained", eventSet.size)
-
-              // Create snapshot using existing infrastructure — no reimplementation
-              result <- consensusFns.createProposalArtifact(
-                lastKey = lastKey,
-                lastArtifact = lastSigned,
-                lastContext = lastContext,
-                lastArtifactHasher = hasher,
-                trigger = TimeTrigger, // epoch progress increments on TimeTrigger
-                events = eventSet,
-                facilitators = Set(selfId), // single producer, no facilitator set
-                getGlobalSnapshotByOrdinal = ordinal =>
-                  snapshotStorage.get(ordinal).flatMap {
-                    case Some(s) => s.toHashed[F].map(_.some)
-                    case None =>
-                      chainStore.getByOrdinal(ordinal.value.value).flatMap {
-                        case Some(stored) => stored.signedSnapshot.toHashed[F].map(_.some)
-                        case None         => none[Hashed[GlobalIncrementalSnapshot]].pure[F]
+                  // Create snapshot using existing infrastructure — no reimplementation
+                  result <- consensusFns.createProposalArtifact(
+                    lastKey = lastKey,
+                    lastArtifact = lastSigned,
+                    lastContext = lastContext,
+                    lastArtifactHasher = hasher,
+                    trigger = TimeTrigger, // epoch progress increments on TimeTrigger
+                    events = eventSet,
+                    facilitators = Set(selfId), // single producer, no facilitator set
+                    getGlobalSnapshotByOrdinal = ordinal =>
+                      snapshotStorage.get(ordinal).flatMap {
+                        case Some(s) => s.toHashed[F].map(_.some)
+                        case None =>
+                          chainStore.getByOrdinal(ordinal.value.value).flatMap {
+                            case Some(stored) => stored.signedSnapshot.toHashed[F].map(_.some)
+                            case None         => none[Hashed[GlobalIncrementalSnapshot]].pure[F]
+                          }
                       }
-                  }
-              )
-
-              (rawArtifact, context, returnedEvents) = result
-              _ <- Metrics[F].recordDistribution("dag_nakamoto_events_returned", returnedEvents.size)
-              _ <- Metrics[F].recordDistribution("dag_nakamoto_events_accepted", eventSet.size - returnedEvents.size)
-
-              // Pre-sign gate check — proposal creation can be slow (mempool drain + acceptance
-              // pipeline). If a better gossip snapshot arrived during that work, abandon now
-              // before sealing (signing) anything. Saves a useless signature + chain store write
-              // and prevents this node from briefly emitting a fork that immediately gets reorged.
-              gateOpenPreSign <- productionGate.isOpen
-              _ <-
-                if (!gateOpenPreSign)
-                  productionGate.pauseReasons.flatMap(reasons =>
-                    logger.info(s"🛑 Abandoning production at slot $currentSlot before sign (gate closed: ${reasons.mkString(", ")})") >>
-                      Metrics[F].incrementCounter("dag_nakamoto_production_abandoned_total")
                   )
-                else Async[F].unit
 
-              // Attach SlotCertificate and eta to artifact before signing
-              artifact = rawArtifact.copy(slotCertificate = Some(cert), eta = Some(etaHash))
+                  (rawArtifact, context, returnedEvents) = result
+                  _ <- Metrics[F].recordDistribution("dag_nakamoto_events_returned", returnedEvents.size)
+                  _ <- Metrics[F].recordDistribution("dag_nakamoto_events_accepted", eventSet.size - returnedEvents.size)
 
-              // Sign it (single producer signature — attestations come separately)
-              signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)
-
-              // Store via NakamotoChainStore (handles forks + reorgs).
-              // Skipped if the production gate closed during proposal creation — a better
-              // gossip snapshot arrived and we are abandoning this round before committing it
-              // to our local chain store. Prevents this node from briefly emitting a fork
-              // that would immediately get reorged.
-              snapshotHashedForStorage <- signed.toHashed[F]
-              parentHashValue = lastHashed.hash
-              stored <-
-                if (gateOpenPreSign)
-                  chainStore.store(
-                    signed,
-                    context,
-                    lastKey.value.value + 1,
-                    currentSlot,
-                    parentHashValue,
-                    vrfOutput
-                  )
-                else Async[F].pure(false)
-
-              // Update ALL snapshot storages — snapshotStorage.head is what the leader loop
-              // reads on the next slot to determine the parent ordinal. Without this, the
-              // leader loop re-reads the last GOSSIP ordinal and re-produces the same ordinal.
-              _ <- Async[F].whenA(stored) {
-                snapshotStorage.setHeadForRecovery(signed, context) >>
-                  lastGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
-                  lastNGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
-                  lastKnownSlotRef.set(Some(currentSlot)) >>
-                  snapshotStorage.confirmHead(parentHashValue)
-              }
-
-              // Clear included events from mempool (returned events were NOT included).
-              // Only when stored — if we abandoned pre-sign, the events must stay in the
-              // mempool so the next slot winner (or our next slot) can include them.
-              includedHashes = hashedEvents.collect {
-                case (h, hashed) if !returnedEvents.contains(hashed.signed.value) => h
-              }.toSet
-              _ <- Async[F].whenA(stored)(eventMempool.clearIncluded(includedHashes))
-
-              // Check gate before publishing — a better gossip snapshot may have arrived
-              // during proposal creation. If gate is closed, abandon this production.
-              stillOpen <- productionGate.isOpen
-              _ <-
-                if (!stillOpen)
-                  productionGate.pauseReasons.flatMap(reasons =>
-                    logger.info(s"🛑 Abandoning production at slot $currentSlot before publish (gate closed: ${reasons.mkString(", ")})")
-                  )
-                else Async[F].unit
-
-              // Publish + self-attest only if gate is still open
-              snapshotHash = snapshotHashedForStorage.hash
-              _ <- Async[F].whenA(stillOpen) {
-                sidecarClient
-                  .publishSnapshot(
-                    SidecarClient.mkSnapshot(
-                      hash = snapshotHash.value.getBytes,
-                      slot = currentSlot,
-                      ordinal = lastKey.value.value + 1,
-                      parentHash = lastHashed.hash.value.getBytes,
-                      vrfProof = proof,
-                      vrfPublicKey = vrfPK,
-                      eta = currentEta,
-                      payload = {
-                        import io.circe.syntax._
-                        val snapshotJson = signed.asJson
-                        val contextJson = context.asJson
-                        val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
-                        combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                      },
-                      producerId = selfId.value.toBytes,
-                      parentSlot = parentSlotValue
-                    )
-                  )
-                  .void
-                  .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}")) >> {
-                  // Self-attest (producer always attests to own snapshot) and broadcast
-                  val selfAttestation = io.constellationnetwork.schema.nakamoto.TipAttestation(
-                    tipHash = snapshotHash,
-                    tipSlot = slotRefined,
-                    tipOrdinal = lastKey.value.value + 1,
-                    attestedAt = slotRefined
-                  )
-                  tipTracker.recordAttestation(selfId, selfAttestation) >>
-                    // Sign via the standard Hasher pipeline (JSON-encode → hash → sign)
-                    // and broadcast to the network via sidecar GossipSub
-                    (for {
-                      attHash <- selfAttestation.hash
-                      sig <- SigValue.fromHash[F](keyPair.getPrivate, attHash)
-                      sigBytes = sig.coerce.toBytes
-                      att = SidecarClient.mkAttestation(
-                        tipHash = snapshotHash.value.getBytes,
-                        tipSlot = currentSlot,
-                        tipOrdinal = lastKey.value.value + 1,
-                        attestedAt = currentSlot,
-                        attesterId = selfId.value.toBytes,
-                        signature = sigBytes
+                  // Pre-sign gate check — proposal creation can be slow (mempool drain + acceptance
+                  // pipeline). If a better gossip snapshot arrived during that work, abandon now
+                  // before sealing (signing) anything. Saves a useless signature + chain store write
+                  // and prevents this node from briefly emitting a fork that immediately gets reorged.
+                  gateOpenPreSign <- productionGate.isOpen
+                  _ <-
+                    if (!gateOpenPreSign)
+                      productionGate.pauseReasons.flatMap(reasons =>
+                        logger
+                          .info(s"🛑 Abandoning production at slot $currentSlot before sign (gate closed: ${reasons.mkString(", ")})") >>
+                          Metrics[F].incrementCounter("dag_nakamoto_production_abandoned_total")
                       )
-                      _ <- sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
-                        logger.warn(s"Failed to broadcast attestation: ${e.getMessage}")
-                      }
-                    } yield ())
-                } >>
-                  logger.info(
-                    s"Produced snapshot ordinal=${lastKey.value.value + 1} slot=$currentSlot " +
-                      s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"
-                  ) >>
-                  Metrics[F].incrementCounter("dag_nakamoto_snapshots_produced") >>
-                  Metrics[F].updateGauge("dag_nakamoto_ordinal", lastKey.value.value + 1) >>
-                  Async[F].delay(System.currentTimeMillis()).flatMap { nowMs =>
-                    val producedOrdinal = lastKey.value.value + 1
-                    Metrics[F].recordDistribution("dag_nakamoto_production_duration_ms", (nowMs - productionStartMs).toInt) >>
-                      productionTimestamps.update { ts =>
-                        val updated = ts + (producedOrdinal -> nowMs)
-                        // Evict entries older than 1000 ordinals to bound memory
-                        if (updated.size > 1000) updated.toList.sortBy(-_._1).take(1000).toMap
-                        else updated
+                    else Async[F].unit
+
+                  // Attach SlotCertificate and eta to artifact before signing
+                  artifact = rawArtifact.copy(slotCertificate = Some(cert), eta = Some(etaHash))
+
+                  // Sign it (single producer signature — attestations come separately)
+                  signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)
+
+                  // Store via NakamotoChainStore (handles forks + reorgs).
+                  // Skipped if the production gate closed during proposal creation — a better
+                  // gossip snapshot arrived and we are abandoning this round before committing it
+                  // to our local chain store. Prevents this node from briefly emitting a fork
+                  // that would immediately get reorged.
+                  snapshotHashedForStorage <- signed.toHashed[F]
+                  parentHashValue = lastHashed.hash
+                  stored <-
+                    if (gateOpenPreSign)
+                      chainStore.store(
+                        signed,
+                        context,
+                        lastKey.value.value + 1,
+                        currentSlot,
+                        parentHashValue,
+                        vrfOutput
+                      )
+                    else Async[F].pure(false)
+
+                  // Update ALL snapshot storages — snapshotStorage.head is what the leader loop
+                  // reads on the next slot to determine the parent ordinal. Without this, the
+                  // leader loop re-reads the last GOSSIP ordinal and re-produces the same ordinal.
+                  _ <- Async[F].whenA(stored) {
+                    snapshotStorage.setHeadForRecovery(signed, context) >>
+                      lastGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
+                      lastNGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
+                      lastKnownSlotRef.set(Some(currentSlot)) >>
+                      snapshotStorage.confirmHead(parentHashValue)
+                  }
+
+                  // Clear included events from mempool (returned events were NOT included).
+                  // Only when stored — if we abandoned pre-sign, the events must stay in the
+                  // mempool so the next slot winner (or our next slot) can include them.
+                  includedHashes = hashedEvents.collect {
+                    case (h, hashed) if !returnedEvents.contains(hashed.signed.value) => h
+                  }.toSet
+                  _ <- Async[F].whenA(stored)(eventMempool.clearIncluded(includedHashes))
+
+                  // Check gate before publishing — a better gossip snapshot may have arrived
+                  // during proposal creation. If gate is closed, abandon this production.
+                  stillOpen <- productionGate.isOpen
+                  _ <-
+                    if (!stillOpen)
+                      productionGate.pauseReasons.flatMap(reasons =>
+                        logger
+                          .info(s"🛑 Abandoning production at slot $currentSlot before publish (gate closed: ${reasons.mkString(", ")})")
+                      )
+                    else Async[F].unit
+
+                  // Publish + self-attest only if gate is still open
+                  snapshotHash = snapshotHashedForStorage.hash
+                  _ <- Async[F].whenA(stillOpen) {
+                    sidecarClient
+                      .publishSnapshot(
+                        SidecarClient.mkSnapshot(
+                          hash = snapshotHash.value.getBytes,
+                          slot = currentSlot,
+                          ordinal = lastKey.value.value + 1,
+                          parentHash = lastHashed.hash.value.getBytes,
+                          vrfProof = proof,
+                          vrfPublicKey = vrfPK,
+                          eta = currentEta,
+                          payload = {
+                            import io.circe.syntax._
+                            val snapshotJson = signed.asJson
+                            val contextJson = context.asJson
+                            val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
+                            combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                          },
+                          producerId = selfId.value.toBytes,
+                          parentSlot = parentSlotValue
+                        )
+                      )
+                      .void
+                      .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}")) >> {
+                      // Self-attest (producer always attests to own snapshot) and broadcast
+                      val selfAttestation = io.constellationnetwork.schema.nakamoto.TipAttestation(
+                        tipHash = snapshotHash,
+                        tipSlot = slotRefined,
+                        tipOrdinal = lastKey.value.value + 1,
+                        attestedAt = slotRefined
+                      )
+                      tipTracker.recordAttestation(selfId, selfAttestation) >>
+                        // Sign via the standard Hasher pipeline (JSON-encode → hash → sign)
+                        // and broadcast to the network via sidecar GossipSub
+                        (for {
+                          attHash <- selfAttestation.hash
+                          sig <- SigValue.fromHash[F](keyPair.getPrivate, attHash)
+                          sigBytes = sig.coerce.toBytes
+                          att = SidecarClient.mkAttestation(
+                            tipHash = snapshotHash.value.getBytes,
+                            tipSlot = currentSlot,
+                            tipOrdinal = lastKey.value.value + 1,
+                            attestedAt = currentSlot,
+                            attesterId = selfId.value.toBytes,
+                            signature = sigBytes
+                          )
+                          _ <- sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
+                            logger.warn(s"Failed to broadcast attestation: ${e.getMessage}")
+                          }
+                        } yield ())
+                    } >>
+                      logger.info(
+                        s"Produced snapshot ordinal=${lastKey.value.value + 1} slot=$currentSlot " +
+                          s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"
+                      ) >>
+                      Metrics[F].incrementCounter("dag_nakamoto_snapshots_produced") >>
+                      Metrics[F].updateGauge("dag_nakamoto_ordinal", lastKey.value.value + 1) >>
+                      Async[F].delay(System.currentTimeMillis()).flatMap { nowMs =>
+                        val producedOrdinal = lastKey.value.value + 1
+                        Metrics[F].recordDistribution("dag_nakamoto_production_duration_ms", (nowMs - productionStartMs).toInt) >>
+                          productionTimestamps.update { ts =>
+                            val updated = ts + (producedOrdinal -> nowMs)
+                            // Evict entries older than 1000 ordinals to bound memory
+                            if (updated.size > 1000) updated.toList.sortBy(-_._1).take(1000).toMap
+                            else updated
+                          }
                       }
                   }
-              }
-            } yield ()
+                } yield ()
+            }
 
           case None =>
             logger.warn(s"No head snapshot in storage — skipping slot $currentSlot (genesis not yet loaded?)")
