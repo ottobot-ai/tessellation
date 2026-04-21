@@ -112,8 +112,16 @@ class TokenLockBlockStorage[F[_]: Sync: Random](blocks: MapRef[F, ProofsHash, Op
 
   def store(hashedBlock: Hashed[TokenLockBlock]): F[Unit] =
     blocks(hashedBlock.proofsHash).modify {
-      case None  => (WaitingBlock(hashedBlock.signed).some, ().asRight)
-      case other => (other, BlockAlreadyStoredError(hashedBlock.proofsHash, other).asLeft)
+      case None => (WaitingBlock(hashedBlock.signed).some, ().asRight)
+      // Idempotent on Waiting: the consensus pipeline calls `store` twice for
+      // self-produced blocks — once via the consensus path, once via the
+      // gossip-self-loop path (CommonRumor handler offers self-published blocks
+      // back into the peerBlocks queue). Both paths converge on `storeBlock`.
+      // If the second arrival sees Waiting, that's our own duplicate; silently
+      // accept rather than raise BlockAlreadyStoredError. Any other state
+      // (Postponed/Accepted/Majority) is still a real conflict.
+      case w @ Some(WaitingBlock(_)) => (w, ().asRight)
+      case other                     => (other, BlockAlreadyStoredError(hashedBlock.proofsHash, other).asLeft)
     }.flatMap(_.liftTo[F])
 
   def getWaiting: F[Map[ProofsHash, Signed[TokenLockBlock]]] =

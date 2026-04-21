@@ -166,8 +166,14 @@ class BlockStorage[F[_]: Sync: Random](blocks: MapRef[F, ProofsHash, Option[Stor
 
   def store(hashedBlock: Hashed[Block]): F[Unit] =
     blocks(hashedBlock.proofsHash).modify {
-      case None  => (WaitingBlock(hashedBlock.signed).some, ().asRight)
-      case other => (other, BlockAlreadyStoredError(hashedBlock.proofsHash, other).asLeft)
+      case None => (WaitingBlock(hashedBlock.signed).some, ().asRight)
+      // Idempotent on Waiting: see TokenLockBlockStorage.store for the rationale.
+      // The L1 consensus pipeline routes self-produced blocks through `storeBlock`
+      // twice — once via the consensus output, once via the gossip-self-loop
+      // (CommonRumor handler offers self-published blocks back into the peerBlocks
+      // queue). Treat the duplicate Waiting state as a no-op.
+      case w @ Some(WaitingBlock(_)) => (w, ().asRight)
+      case other                     => (other, BlockAlreadyStoredError(hashedBlock.proofsHash, other).asLeft)
     }.flatMap(_.liftTo[F])
 
   def restoreDependent(isDependent: Signed[Block] => F[Boolean]): F[Unit] =
