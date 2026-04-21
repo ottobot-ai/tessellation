@@ -557,15 +557,27 @@ const testTokenLockReplacementEdgeCases = async (urls) => {
     urls, account, lockHash, lockAmount, stakeHash
   )
 
-  // Wait for 2 ordinal progressions to ensure lock is fully propagated to L1.
-  // One progression isn't enough with slow rounds (43s): the lock lands in ordinal N,
-  // the global snapshot for N needs to reach L1, and L1 needs to process it.
-  // Two progressions guarantees the lock's snapshot has been accepted and L1 is current.
+  // Wait for 2 ordinal progressions since we started waiting, to ensure the lock
+  // is fully propagated to L1. One progression isn't enough with slow rounds: the
+  // lock lands in ordinal N, the global snapshot for N needs to reach L1, and L1
+  // needs to process it. Two progressions guarantees the lock's snapshot has been
+  // accepted and L1 is current.
+  //
+  // The previous implementation compared `ordinal - prevOrdinal` (per-poll delta)
+  // against 2, but `prevOrdinal` is the *previous poll's* ordinal, not the starting
+  // ordinal. With poll interval ≪ ordinal cadence, each poll saw advance ≤ 1 and
+  // the predicate never succeeded. Fixed by capturing the starting ordinal.
   logWorkflow.info('Waiting for 2 ordinal progressions before sequential replacements...')
+  let startOrdinalForLockPropagation = null
   await withRetryOrdinal(
-    async ({ ordinal, prevOrdinal }) => {
-      if (!prevOrdinal) throw new Error('Waiting for first ordinal')
-      if (ordinal - prevOrdinal < 2) throw new Error(`Waiting for 2 ordinal progressions: ${ordinal}`)
+    async ({ ordinal }) => {
+      if (startOrdinalForLockPropagation === null) {
+        startOrdinalForLockPropagation = ordinal
+      }
+      const progressed = ordinal - startOrdinalForLockPropagation
+      if (progressed < 2) {
+        throw new Error(`Waiting for 2 ordinal progressions: ${progressed}/2 (ordinal=${ordinal})`)
+      }
       return true
     },
     { globalL0Url: urls.globalL0Url, name: 'waitForLockPropagation', maxOrdinalMisses: 10, maxStalledChecks: 60 }

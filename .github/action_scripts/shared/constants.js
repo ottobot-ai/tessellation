@@ -1,5 +1,11 @@
 const CONSTANTS = {
-    MAX_VERIFICATION_ATTEMPTS: 120,
+    // 300 × 1s = 5 min. The previous 120 (2 min) was ~1 attempt above the
+    // observed time-to-include for late-test token locks; under cluster load,
+    // ML0 falls behind enough that propagation can take 2-3 min after a
+    // successful POST. 5 min gives consistent headroom without ballooning
+    // run-time when things are healthy (each verification short-circuits as
+    // soon as the lock appears).
+    MAX_VERIFICATION_ATTEMPTS: 300,
     VERIFICATION_INTERVAL_MS: 1000,
     EXPIRATION_VERIFICATION_INTERVAL_MS: 10 * 1000,
     SNAPSHOT_WAIT_TIME_MS: 15 * 1000,

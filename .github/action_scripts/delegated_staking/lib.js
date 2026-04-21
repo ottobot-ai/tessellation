@@ -117,11 +117,15 @@ const postNodeParamsNodeId = async (
 }
 
 const createDelegatedStake = async (account, lockHash, lockAmount, nodeId) => {
-  // Retry on InvalidTokenLock: the token lock's balance-change confirmation
-  // (via createTokenLock) means it was accepted by GL1, but GL0's stake
-  // validator requires the lock to be in GL0's finalized state. In Nakamoto
-  // mode there's a ~15-30s gap between GL1 acceptance and GL0 finalization.
-  const maxAttempts = 30
+  // Retry on InvalidTokenLock: GL0's delegated-stake validator reads from the
+  // local MPT (`mptStore.getActiveTokenLocks`). Under Nakamoto, an accepted
+  // token lock can transiently disappear from the serving node's MPT during
+  // a chain reorg — the MPT rewinds and reapplies, so there's a short window
+  // where the lock isn't in `activeTokenLocks`. At 3 nodes reorgs are rare,
+  // so 90s (30 × 3s) was plenty. At 8 nodes reorg churn is higher, so we
+  // extend the window to 6 min to weather multiple reorg cycles. This is
+  // still cheap when the cluster is healthy (first retry usually succeeds).
+  const maxAttempts = 120
   const intervalMs = 3000
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {

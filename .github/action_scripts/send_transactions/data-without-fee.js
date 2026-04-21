@@ -2,7 +2,7 @@ const { dag4 } = require('@stardust-collective/dag4');
 const jsSha256 = require('js-sha256');
 const axios = require('axios');
 const { z } = require('zod');
-const { parseSharedArgs } = require('../shared');
+const { parseSharedArgs, withRetry } = require('../shared');
 
 const CliArgsSchema = z.object({
     privateKey: z.string()
@@ -84,13 +84,18 @@ const sendDataTransactionsUsingUrls = async (
             proof
         ]
     };
-    try {
-        console.log(`Transaction body: ${JSON.stringify(body)}`);
-        const response = await axios.post(`${metagraphL1DataUrl}/data`, body);
+    console.log(`Transaction body: ${JSON.stringify(body)}`);
+    // DL1 returns 500 with "Cannot start data own consensus: No currency snapshot"
+    // during cluster warmup — DL1 needs ML0's first currency snapshot before it can
+    // accept data transactions. Retry until DL1 is ready. The old try/catch here just
+    // swallowed the error and returned; the caller then polled for 120s seeing 404s
+    // because the tx was never actually sent.
+    await withRetry(
+        () => axios.post(`${metagraphL1DataUrl}/data`, body),
+        { name: 'POST /data', maxAttempts: 60, interval: 2000 }
+    ).then(response => {
         console.log(`Response: ${JSON.stringify(response.data)}`);
-    } catch (e) {
-        console.log('Error sending transaction', e);
-    }
+    });
     return account.address;
 };
 

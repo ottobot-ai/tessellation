@@ -79,6 +79,45 @@ const waitForCL1Alignment = async (l1MetagraphUrl, address, beforeHash) => {
   logMessage(`CL1 alignment timeout — proceeding anyway`)
 }
 
+// Poll GL0 for the latest CL0 snapshot ordinal it has committed for this metagraph.
+// Returns -1 if the metagraph has no committed snapshot yet.
+const getMetagraphOrdinalOnGL0 = async (gl0Url, metagraphAddress) => {
+  const info = await fetchJson(`${gl0Url}/global-snapshots/latest/info`)
+  const entry = info.lastCurrencySnapshots && info.lastCurrencySnapshots[metagraphAddress]
+  if (!entry) return -1
+  // lastCurrencySnapshots values may be either an incremental snapshot (with .ordinal)
+  // or a full snapshot wrapper — handle both shapes.
+  const ord = entry.ordinal ?? entry.value?.ordinal ?? entry?.value?.value?.ordinal
+  if (typeof ord === 'number') return ord
+  if (typeof ord === 'object' && typeof ord?.value === 'number') return ord.value
+  return -1
+}
+
+// After a metagraph transfer, wait until GL0 has committed a strictly newer CL0
+// snapshot than it had before. This confirms that GL0's view of the metagraph has
+// absorbed at least one post-transfer CL0 snapshot — preventing the next transfer
+// from racing ahead of CL0's globalSyncView catch-up.
+const waitForGL0MetagraphAlignment = async (gl0Url, metagraphAddress, ordinalBefore) => {
+  const timeoutMs = SLEEP_TIME_UNTIL_QUERY
+  logMessage(`Waiting for GL0 to advance ${metagraphAddress.slice(0, 12)}... past ord ${ordinalBefore} (timeout ${timeoutMs / 1000}s)...`)
+  const pollStart = Date.now()
+  const deadline = pollStart + timeoutMs
+  const pollInterval = 5000
+  while (Date.now() < deadline) {
+    await sleep(pollInterval)
+    try {
+      const current = await getMetagraphOrdinalOnGL0(gl0Url, metagraphAddress)
+      if (current > ordinalBefore) {
+        logMessage(`GL0 advanced ${metagraphAddress.slice(0, 12)}... from ord ${ordinalBefore} to ${current} after ${Math.round((Date.now() - pollStart) / 1000)}s`)
+        return
+      }
+    } catch (e) {
+      logMessage(`GL0 alignment poll error: ${e.message}`)
+    }
+  }
+  logMessage(`GL0 metagraph alignment timeout — proceeding anyway`)
+}
+
 const batchTransaction = async (
   origin,
   destination,
@@ -238,6 +277,15 @@ const handleMetagraphBatchTransactions = async (
       `${networkOptions.l1MetagraphUrl}/transactions/last-reference/${destination.address}`
     )
 
+    // Capture GL0's current CL0 ordinal for this metagraph before sending.
+    // We'll wait for this to advance after the transfer completes — that signals
+    // GL0 has absorbed a post-transfer CL0 snapshot, so the next transfer won't
+    // race ahead of GL0's metagraph view and trigger a globalSyncView mismatch.
+    const gl0OrdBefore = await getMetagraphOrdinalOnGL0(
+      networkOptions.l0GlobalUrl,
+      networkOptions.metagraphId
+    )
+
     await batchMetagraphTransaction(
       metagraphTokenClient,
       origin,
@@ -272,6 +320,16 @@ const handleMetagraphBatchTransactions = async (
       networkOptions.l1MetagraphUrl,
       destination.address,
       destRefBefore.hash
+    )
+
+    // Wait for GL0 to advance its view of this metagraph past its pre-transfer
+    // CL0 ordinal. This prevents the next transfer from landing in a CL0 round
+    // whose globalSyncView is too stale relative to GL0's current head, which
+    // causes SnapshotDifferentThanExpected rejection at the validator.
+    await waitForGL0MetagraphAlignment(
+      networkOptions.l0GlobalUrl,
+      networkOptions.metagraphId,
+      gl0OrdBefore
     )
 
     return { originBalance, destinationBalance }
@@ -524,7 +582,11 @@ const sendTransactions = async () => {
   } = createConfig()
 
   const networkOptions = {
-    metagraphId: 'custom_id',
+    // Fallback "custom_id" is the dag4.js SDK placeholder for "look up the
+    // metagraph from the network config"; it's NOT a real DAG address. Real
+    // GL0 lookups (e.g. waitForGL0MetagraphAlignment) need the actual DAG
+    // address, which compose-runner exports as METAGRAPH_ID.
+    metagraphId: process.env.METAGRAPH_ID || 'custom_id',
     l0GlobalUrl: process.env.GL0_URL || `${process.env.TEST_HOST || 'http://localhost'}:${dagL0PortPrefix}00`,
     dagL1UrlFirstNode: process.env.GL1_URL || `${process.env.TEST_HOST || 'http://localhost'}:${dagL1PortPrefix}00`,
     l0MetagraphUrl: process.env.ML0_URL || `${process.env.TEST_HOST || 'http://localhost'}:${metagraphL0PortPrefix}00`,

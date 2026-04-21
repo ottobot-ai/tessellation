@@ -21,10 +21,26 @@ const {
 
 const CONSTANTS = {
     ...sharedConstants,
-    // Increased from 5 to 30 for Nakamoto mode. The pipeline from submission
-    // to being visible in ML0's activeAllowSpends takes ~45-65s, and epochs
-    // advance ~10s each — 5 was too short, causing tests to miss the window.
-    EPOCH_PROGRESS_BUFFER: 30,
+    // The lastValidEpochProgress offset must clear (observation time + safety margin);
+    // everything beyond that is pure expiration-wait overhead.
+    //
+    // History:
+    //   - 30 was too short in early Nakamoto runs: ML0's /snapshots/latest/combined
+    //     plateaued for ~3 min before showing new state, so GL0 passed expiration
+    //     before the test could observe the allow spend at all.
+    //   - 120 absorbed that plateau but meant every expiration test waits ~10-12 min
+    //     after observation completes before expiration fires. Ran fine, just slow.
+    //   - 40 (current): the plateau was fixed by routing BFT SnapshotStorage reads
+    //     through FinalizedSnapshotReader.bft (serves from in-memory head, not the
+    //     5-epoch-cadence checkpoint file). Observed observation time at 8 nodes
+    //     peaks ~10 epochs (~60s at ~6s/epoch). 40 leaves ~30 epochs safety margin
+    //     above max observation, saves ~80 epochs (~8 min) of wait per expiration
+    //     scenario compared to 120.
+    //
+    // If expiration tests start racing the observation window again, bump first to
+    // 60, then to 80, rather than straight back to 120 — the old plateau root cause
+    // is closed, any new racing would be a different issue worth diagnosing.
+    EPOCH_PROGRESS_BUFFER: 40,
 };
 
 const getRandomInt = (min, max) => {

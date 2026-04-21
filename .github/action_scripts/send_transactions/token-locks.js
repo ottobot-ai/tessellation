@@ -288,15 +288,27 @@ const verifyTokenLockExpiration = async (address, hash, initialBalance, urls, un
 
     const snapshotUrl = `${l0Url}/snapshots/latest/combined`
 
-    const snapshot = await getCombinedSnapshot(snapshotUrl);
-
-    const activeTokenLocks = snapshot[1]?.activeTokenLocks?.[address]
-    if (activeTokenLocks && activeTokenLocks.length > 0) {
-        const hasMatchingHash = await findMatchingHash(activeTokenLocks, hash);
-        if (hasMatchingHash) {
-            throw new Error('Token lock still active after expiration');
+    // The epoch just crossed unlockEpoch. CL0 still needs to produce at least
+    // one snapshot whose acceptance phase evicts the now-expired token lock
+    // from activeTokenLocks. Retry until we see the eviction (or timeout).
+    // Without this retry the check races CL0 snapshot production and flakes.
+    const snapshot = await withRetry(
+        async () => {
+            const snap = await getCombinedSnapshot(snapshotUrl);
+            const activeTokenLocks = snap[1]?.activeTokenLocks?.[address];
+            if (activeTokenLocks && activeTokenLocks.length > 0) {
+                const hasMatchingHash = await findMatchingHash(activeTokenLocks, hash);
+                if (hasMatchingHash) {
+                    throw new Error('Token lock still active after expiration');
+                }
+            }
+            return snap;
+        },
+        {
+            name: 'Token lock expiration eviction',
+            interval: CONSTANTS.EXPIRATION_VERIFICATION_INTERVAL_MS
         }
-    }
+    );
 
     const currentBalance = snapshot[1]?.balances?.[address] || 0;
     const expectedBalance = initialBalance;

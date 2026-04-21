@@ -3,7 +3,7 @@ const jsSha256 = require('js-sha256');
 const axios = require('axios');
 const { z } = require('zod');
 const { compress } = require("brotli");
-const {parseSharedArgs} = require('../shared');
+const {parseSharedArgs, withRetry} = require('../shared');
 
 const CliArgsSchema = z.object({
     privateKey: z.string()
@@ -80,17 +80,17 @@ const generateProofFee = async (message, privateKey, account) => {
 };
 
 const getEstimateFeeResponse = async (metagraphL1DataUrl, update) => {
-    try {
-        const estimateFeeResponse = await axios.post(`${metagraphL1DataUrl}/data/estimate-fee`, update)
-        const {fee, address, updateHash} = estimateFeeResponse.data
-        return {
-            fee,
-            address,
-            updateHash
-        }
-    } catch (e) {
-        console.error(`Could not get estimate fee response`, e)
-        throw e
+    // Retry for cluster warmup — DL1 returns 500 until it receives its first
+    // currency snapshot from ML0 ("Cannot start data own consensus: No currency snapshot").
+    const estimateFeeResponse = await withRetry(
+        () => axios.post(`${metagraphL1DataUrl}/data/estimate-fee`, update),
+        { name: 'POST /data/estimate-fee', maxAttempts: 60, interval: 2000 }
+    );
+    const {fee, address, updateHash} = estimateFeeResponse.data
+    return {
+        fee,
+        address,
+        updateHash
     }
 }
 
@@ -138,13 +138,15 @@ const sendDataTransactionsUsingUrls = async (
             ]
         }
     };
-    try {
-        console.log(`Transaction body: ${JSON.stringify(body)}`);
-        const response = await axios.post(`${metagraphL1DataUrl}/data`, body);
-        console.log(`Response: ${JSON.stringify(response.data)}`);
-    } catch (e) {
-        console.log('Error sending transaction', e);
-    }
+    console.log(`Transaction body: ${JSON.stringify(body)}`);
+    // Retry on DL1 warmup (see getEstimateFeeResponse above). The old try/catch
+    // swallowed the error, causing the downstream poll to 404 forever because the
+    // tx was never actually sent.
+    const response = await withRetry(
+        () => axios.post(`${metagraphL1DataUrl}/data`, body),
+        { name: 'POST /data', maxAttempts: 60, interval: 2000 }
+    );
+    console.log(`Response: ${JSON.stringify(response.data)}`);
 
     return [account.address, estimateFeeResponse];
 };
