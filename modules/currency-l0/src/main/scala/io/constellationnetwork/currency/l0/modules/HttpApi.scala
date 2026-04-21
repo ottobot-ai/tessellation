@@ -17,6 +17,7 @@ import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.env.AppEnvironment.{Dev, Integrationnet, Testnet}
 import io.constellationnetwork.kernel._
 import io.constellationnetwork.node.shared.config.types.{HttpConfig, RouteRateLimiterConfig, SharedConfig}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.{FinalityGate, FinalizedSnapshotReader}
 import io.constellationnetwork.node.shared.http.p2p.middlewares.{PeerAuthMiddleware, `X-Id-Middleware`}
 import io.constellationnetwork.node.shared.http.routes.{EventGossipRoutes, _}
 import io.constellationnetwork.node.shared.infrastructure.gossip.event.ChainTip
@@ -59,8 +60,19 @@ object HttpApi {
     ],
     getLocalChainTip: Option[F[Option[ChainTip]]] = None,
     maybeMarkSeen: Option[Hash => F[Unit]] = None
-  ): F[HttpApi[F]] =
+  ): F[HttpApi[F]] = {
+    // Currency-L0 runs BFT consensus — every snapshot is immediately final. `FinalityGate.passThrough` treats head as finalized for
+    // ordinal gating, and `FinalizedSnapshotReader.bft` serves `/latest/combined` directly from the in-memory head (no checkpoint-file
+    // indirection, so callers see fresh state the moment a snapshot is produced instead of waiting for the next checkpoint write).
+    implicit val finalityGate: FinalityGate[F] =
+      FinalityGate.passThrough[F](storages.snapshot.headSnapshot.map(_.map(_.ordinal)))
     for {
+      cached <- CachedCombinedResponse.make[F, CurrencyIncrementalSnapshot, CurrencySnapshotInfo]
+      finalizedReader = FinalizedSnapshotReader.bft[F, CurrencyIncrementalSnapshot, CurrencySnapshotInfo](
+        storages.snapshot,
+        cached,
+        combinedSnapshotCheckpointFileSystemStorage
+      )
       snapshotRoutes <-
         SnapshotRoutes.make[F, CurrencyIncrementalSnapshot, CurrencySnapshotInfo](
           storages.snapshot,
@@ -69,7 +81,7 @@ object HttpApi {
           storages.node,
           HasherSelector.alwaysCurrent[F],
           sharedConfig.snapshotTimeoutsConfig,
-          combinedSnapshotCheckpointFileSystemStorage
+          finalizedReader
         )
     } yield
       new HttpApi[F](
@@ -91,6 +103,7 @@ object HttpApi {
         getLocalChainTip,
         maybeMarkSeen
       ) {}
+  }
 }
 
 sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Metrics: L0NodeContext] private (

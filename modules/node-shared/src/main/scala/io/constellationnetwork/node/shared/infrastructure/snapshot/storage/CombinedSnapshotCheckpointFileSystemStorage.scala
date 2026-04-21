@@ -187,8 +187,26 @@ final class CombinedSnapshotCheckpointFileSystemStorage[
       }
     }
 
+  /** Highest stored checkpoint ordinal at or below the given ceiling, or None. Used by finality-gated HTTP routes so the fallback returned
+    * from `/latest/combined` never includes a checkpoint beyond the finalized ordinal — even though newer checkpoints may exist on disk.
+    */
+  def getLatestOrdinalAtOrBelow(ceiling: SnapshotOrdinal): F[Option[SnapshotOrdinal]] =
+    listStoredOrdinals.flatMap { ordinalsStream =>
+      ordinalsStream.compile.toList.map { ordinals =>
+        val eligible = ordinals.filter(_.value.value <= ceiling.value.value)
+        if (eligible.isEmpty) None
+        else Some(eligible.max)
+      }
+    }
+
   def getLatestAsHttpResponse: F[Option[Response[F]]] =
     getLatestOrdinal.flatMap {
+      case Some(ordinal) => getAsHttpResponse(ordinal)
+      case None          => Concurrent[F].pure(None)
+    }
+
+  def getLatestAsHttpResponseAtOrBelow(ceiling: SnapshotOrdinal): F[Option[Response[F]]] =
+    getLatestOrdinalAtOrBelow(ceiling).flatMap {
       case Some(ordinal) => getAsHttpResponse(ordinal)
       case None          => Concurrent[F].pure(None)
     }

@@ -14,8 +14,10 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapsh
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.schema.GlobalConsensusOutcome
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.env.AppEnvironment._
+import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.config.types.{HttpConfig, RouteRateLimiterConfig, SharedConfig}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.{FinalityGate, FinalizedSnapshotReader}
 import io.constellationnetwork.node.shared.http.p2p.middlewares.{MetricsMiddleware, PeerAuthMiddleware, `X-Id-Middleware`}
 import io.constellationnetwork.node.shared.http.routes._
 import io.constellationnetwork.node.shared.infrastructure.gossip.event.ChainTip
@@ -39,7 +41,7 @@ import org.http4s.{HttpApp, HttpRoutes}
 
 object HttpApi {
 
-  def make[F[_]: Async: SecurityProvider: HasherSelector: Metrics, R <: CliMethod](
+  def make[F[_]: Async: FinalityGate: SecurityProvider: HasherSelector: JsonSerializer: Metrics, R <: CliMethod](
     storages: Storages[F],
     queues: Queues[F],
     services: Services[F, R],
@@ -58,9 +60,15 @@ object HttpApi {
       GlobalSnapshotInfo
     ],
     getLocalChainTip: Option[F[Option[ChainTip]]] = None,
-    maybeMarkSeen: Option[Hash => F[Unit]] = None,
-    getNakamotoFinalizedOrdinal: Option[F[Option[SnapshotOrdinal]]] = None
-  ): F[HttpApi[F, R]] =
+    maybeMarkSeen: Option[Hash => F[Unit]] = None
+  ): F[HttpApi[F, R]] = {
+    // GL0 runs Nakamoto consensus — head may run ahead of the attestation-finalized ordinal held in `FinalityGate`. The
+    // `FinalizedSnapshotReader.nakamoto` variant serves `/latest/combined` and its kin from the on-disk checkpoint at-or-below
+    // finalized, so tentative (pre-finality) state never leaves the node via HTTP — that channel is reserved for sidecar gossip.
+    val finalizedReader = FinalizedSnapshotReader.nakamoto[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
+      FinalityGate[F],
+      combinedSnapshotCheckpointFileSystemStorage
+    )
     SnapshotRoutes
       .make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
         storages.globalSnapshot,
@@ -69,8 +77,7 @@ object HttpApi {
         storages.node,
         HasherSelector[F],
         sharedConfig.snapshotTimeoutsConfig,
-        combinedSnapshotCheckpointFileSystemStorage,
-        getNakamotoFinalizedOrdinal
+        finalizedReader
       )
       .map { snapshotRoutes =>
         new HttpApi[F, R](
@@ -91,9 +98,13 @@ object HttpApi {
           maybeMarkSeen
         ) {}
       }
+  }
 }
 
-sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Metrics, R <: CliMethod] private (
+sealed abstract class HttpApi[
+  F[_]: Async: FinalityGate: SecurityProvider: HasherSelector: JsonSerializer: Metrics,
+  R <: CliMethod
+] private (
   storages: Storages[F],
   queues: Queues[F],
   services: Services[F, R],
@@ -168,10 +179,18 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
     getLocalChainTip,
     maybeMarkSeen
   )
-  private val trustRoutes = TrustRoutes[F](storages.trust, programs.trustPush)
+  // Trust scores are not used by GL0 today — routes/wiring commented out pending
+  // full removal. Storage and TrustPush are still constructed upstream so case-class
+  // fields remain populated; nothing queries them.
+  // private val trustRoutes = TrustRoutes[F](storages.trust, programs.trustPush)
   private val stateChannelRoutes =
     HasherSelector[F].withCurrent { implicit hasher =>
-      StateChannelRoutes[F](services.stateChannel, storages.globalSnapshot, sharedConfig.snapshotBinarySenderTimeouts)
+      StateChannelRoutes[F](
+        services.stateChannel,
+        storages.globalSnapshot,
+        sharedConfig.snapshotBinarySenderTimeouts,
+        services.sidecarClient
+      )
     }
   private val dagRoutes = DAGBlockRoutes[F](mkDagCell)
   private val allowSpendRoutes = AllowSpendBlockRoutes[F](queues.l1AllowSpendOutput)
@@ -251,7 +270,7 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
                 walletRoutes.publicRoutes <+>
                 nodeRoutes.publicRoutes <+>
                 consensusInfoRoutes.publicRoutes <+>
-                trustRoutes.publicRoutes <+>
+                // trustRoutes.publicRoutes <+>   // disabled — not used on GL0
                 allowSpendRoutes.publicRoutes <+>
                 tokenLockRoutes.publicRoutes <+>
                 tokenLockBlockRoutes.publicRoutes <+>
@@ -276,7 +295,7 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
               PeerAuthMiddleware.requestCollateralVerifierMiddleware(services.collateral)(
                 clusterRoutes.p2pRoutes <+>
                   nodeRoutes.p2pRoutes <+>
-                  trustRoutes.p2pRoutes <+>
+                  // trustRoutes.p2pRoutes <+>   // disabled — not used on GL0
                   snapshotRoutes.p2pRoutes <+>
                   bftP2pRoutes
               )
@@ -286,8 +305,8 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
     }
 
   private val cliRoutes: HttpRoutes[F] =
-    clusterRoutes.cliRoutes <+>
-      trustRoutes.cliRoutes
+    clusterRoutes.cliRoutes
+  // trustRoutes.cliRoutes — disabled — not used on GL0
 
   private val loggers: HttpApp[F] => HttpApp[F] = { http: HttpApp[F] =>
     RequestLogger.httpApp(logHeaders = true, logBody = false)(http)
