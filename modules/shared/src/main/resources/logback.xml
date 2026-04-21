@@ -11,10 +11,10 @@
 
     <logger name="io.constellationnetwork" level="DEBUG" />
     <logger name="io.constellationnetwork.httpsigner" level="INFO" additivity="false" />
-    <logger name="org.http4s.server.middleware.RequestLogger" level="OFF" />
-    <logger name="org.http4s.server.middleware.ResponseLogger" level="OFF" />
-    <logger name="org.http4s.client.middleware.RequestLogger" level="OFF" />
-    <logger name="org.http4s.client.middleware.ResponseLogger" level="OFF" />
+    <logger name="org.http4s.server.middleware.RequestLogger" level="DEBUG" />
+    <logger name="org.http4s.server.middleware.ResponseLogger" level="DEBUG" />
+    <logger name="org.http4s.client.middleware.RequestLogger" level="DEBUG" />
+    <logger name="org.http4s.client.middleware.ResponseLogger" level="DEBUG" />
     <logger name="RumorLogger" level="OFF" />
     <logger name="org.http4s.ember.client.EmberClientBuilderCompanionPlatform" level="ERROR" />
     <logger name="com.clickhouse.client.api.ClientConfigProperties" level="ERROR" />

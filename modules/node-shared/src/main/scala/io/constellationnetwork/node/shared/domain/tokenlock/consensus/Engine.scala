@@ -268,9 +268,12 @@ object Engine {
     }
 
     def broadcast[A <: PeerConsensusInput](data: Signed[A], peers: Set[Peer])(implicit e: Encoder[A]): F[Unit] =
-      peers.toList
-        .traverse(consensusClient.sendConsensusData(data)(e)(_))
-        .void
+      peers.toList.traverse { peer =>
+        logger.debug(s"[TL-FSM] broadcast send to peer=${peer.id}") >>
+          consensusClient
+            .sendConsensusData(data)(e)(peer)
+            .handleErrorWith(err => logger.debug(err)(s"[TL-FSM] broadcast FAILED peer=${peer.id}") >> err.raiseError[F, Unit])
+      }.void
 
     def sendBlockProposal(signedBlock: Signed[TokenLockBlock], roundData: RoundData): F[Unit] = {
       val proposal = SignatureProposal(
@@ -281,9 +284,13 @@ object Engine {
       )
       val signedProposal = Signed.forAsyncHasher(proposal, selfKeyPair)
 
-      signedProposal.flatMap {
-        broadcast(_, roundData.peers)
-      }
+      logger.debug(
+        s"[TL-FSM] sendBlockProposal roundId=${roundData.roundId} owner=${roundData.owner} peers=${roundData.peers
+            .map(_.id)} txs=${signedBlock.tokenLocks.size}"
+      ) >>
+        signedProposal.flatMap {
+          broadcast(_, roundData.peers)
+        }
     }
 
     def processBlock(state: State, proposal: Proposal, signedBlock: Signed[TokenLockBlock]): F[(State, Unit)] = {
@@ -328,7 +335,12 @@ object Engine {
           def combine(roundId: RoundId)(transactions: List[Signed[TokenLock]]): F[Option[TokenLockBlock]] =
             NonEmptyList.fromList(transactions).map(_.toNes).map(TokenLockBlock(roundId, _)).pure[F]
 
-          for {
+          logger.debug(
+            s"[TL-FSM] persistProposal GOT_ALL roundId=${roundData.roundId} owner=${roundData.owner} peers=${roundData.peers
+                .map(_.id)} peerProposals=${roundData.peerProposals.keySet} ownTxs=${roundData.ownProposal.transactions.size} peerTxsTotal=${roundData.peerProposals.values
+                .map(_.transactions.size)
+                .sum}"
+          ) >> (for {
             lastGlobalEpochProgress <- lastGlobalSnapshot.get.map {
               case Some(snapshot) =>
                 snapshot.epochProgress
@@ -371,9 +383,13 @@ object Engine {
                   )
                 processCancellation(newState, cancellation)
             }
-          } yield result
+          } yield result)
         case (newState, _) => ().pure[F].tupleLeft(newState)
-      }.getOrElse(logger.warn(s"Couldn't persist proposal").tupleLeft(state))
+      }.getOrElse(
+        logger
+          .warn(s"Couldn't persist proposal roundId=${proposal.roundId} owner=${proposal.owner} senderId=${proposal.senderId}")
+          .tupleLeft(state)
+      )
 
     def informAboutInabilityToParticipate(proposal: Proposal, reason: TokenLockCancellationReason): F[Unit] = {
       def cancellation = CancelledCreationRound(
@@ -399,54 +415,84 @@ object Engine {
         .handleErrorWith(e => logger.error(e)(s"Error sending own proposal") >> e.raiseError[F, Unit])
 
     def processProposal(state: State, proposal: Proposal): F[(State, Unit)] =
-      fetchConsensusPeers(proposal).flatMap { maybePeers =>
-        val maybeRoundData = state.ownConsensus.filter(_.roundId === proposal.roundId).orElse(state.peerConsensuses.get(proposal.roundId))
+      logger.debug(
+        s"[TL-FSM] processProposal ENTER roundId=${proposal.roundId} owner=${proposal.owner} senderId=${proposal.senderId} facilitators=${proposal.facilitators} txs=${proposal.transactions.size}"
+      ) >>
+        fetchConsensusPeers(proposal).flatMap { maybePeers =>
+          val maybeRoundData = state.ownConsensus.filter(_.roundId === proposal.roundId).orElse(state.peerConsensuses.get(proposal.roundId))
 
-        (maybeRoundData, maybePeers) match {
-          case (Some(_), _) => persistProposal(state, proposal)
-          case (None, _) if proposal.owner === selfId =>
-            informAboutInabilityToParticipate(proposal, TokenLockCancellationReason.ReceivedProposalForNonExistentOwnRound).tupleLeft(state)
-          case (None, Some(peers)) =>
-            getTime.flatMap { startedAt =>
-              pullTokenLocks.flatMap { transactions =>
-                val ownProposal = Proposal(proposal.roundId, senderId = selfId, owner = proposal.owner, peers.map(_.id), transactions)
-                val roundData =
-                  RoundData(proposal.roundId, startedAt, peers, owner = proposal.owner, ownProposal)
+          (maybeRoundData, maybePeers) match {
+            case (Some(_), _) =>
+              logger.debug(s"[TL-FSM] processProposal MATCH=existing-round roundId=${proposal.roundId}") >>
+                persistProposal(state, proposal)
+            case (None, _) if proposal.owner === selfId =>
+              logger.debug(s"[TL-FSM] processProposal MATCH=nonexistent-own-round roundId=${proposal.roundId}") >>
+                informAboutInabilityToParticipate(proposal, TokenLockCancellationReason.ReceivedProposalForNonExistentOwnRound).tupleLeft(
+                  state
+                )
+            case (None, Some(peers)) =>
+              logger.debug(s"[TL-FSM] processProposal MATCH=new-peer-round roundId=${proposal.roundId} peers=${peers.map(_.id)}") >>
+                getTime.flatMap { startedAt =>
+                  pullTokenLocks.flatMap { transactions =>
+                    val ownProposal = Proposal(proposal.roundId, senderId = selfId, owner = proposal.owner, peers.map(_.id), transactions)
+                    val roundData =
+                      RoundData(proposal.roundId, startedAt, peers, owner = proposal.owner, ownProposal)
 
-                sendOwnProposal(ownProposal, peers)
-                  .tupleLeft(
-                    state.focus(_.peerConsensuses).modify(_.updated(roundData.roundId, roundData))
-                  )
-                  .map(_._1)
-                  .flatMap(persistProposal(_, proposal))
-              }
+                    sendOwnProposal(ownProposal, peers)
+                      .tupleLeft(
+                        state.focus(_.peerConsensuses).modify(_.updated(roundData.roundId, roundData))
+                      )
+                      .map(_._1)
+                      .flatMap(persistProposal(_, proposal))
+                  }
 
-            }
-          case (None, None) => informAboutInabilityToParticipate(proposal, TokenLockCancellationReason.MissingRoundPeers).tupleLeft(state)
+                }
+            case (None, None) =>
+              logger.debug(
+                s"[TL-FSM] processProposal MATCH=missing-peers roundId=${proposal.roundId} derivedPeerIds=${deriveConsensusPeerIds(proposal)}"
+              ) >>
+                informAboutInabilityToParticipate(proposal, TokenLockCancellationReason.MissingRoundPeers).tupleLeft(state)
+          }
         }
-      }
 
     def processSignatureProposal(state: State, proposal: SignatureProposal): F[(State, Out)] =
-      tryPersistSignatureProposal(state, proposal).traverse {
-        case (newState, roundData) =>
-          roundData match {
-            case roundData @ RoundData(_, _, _, _, _, Some(ownBlock), _, _, _, _) if gotAllSignatures(roundData) =>
-              val block = roundData.peerBlockSignatures.values.foldLeft(ownBlock) {
-                case (agg, proof) => agg.addProof(proof)
-              }
+      logger.debug(
+        s"[TL-FSM] processSignatureProposal ENTER roundId=${proposal.roundId} owner=${proposal.owner} senderId=${proposal.senderId}"
+      ) >>
+        tryPersistSignatureProposal(state, proposal).traverse {
+          case (newState, roundData) =>
+            roundData match {
+              case roundData @ RoundData(_, _, _, _, _, Some(ownBlock), _, _, _, _) if gotAllSignatures(roundData) =>
+                val block = roundData.peerBlockSignatures.values.foldLeft(ownBlock) {
+                  case (agg, proof) => agg.addProof(proof)
+                }
 
-              block.toHashedWithSignatureCheck.flatMap {
-                case Left(_) =>
-                  cancelRound(newState, roundData).map { case (s, _) => (s, Noop.asInstanceOf[Out]) }
-                case Right(hashedBlock) =>
-                  Applicative[F]
-                    .pure[ConsensusOutput](ConsensusOutput.FinalBlock(hashedBlock))
-                    .tupleLeft(removeRound(newState, roundData))
-              }
-            case _ =>
-              Applicative[F].pure[ConsensusOutput](Noop).tupleLeft(newState)
-          }
-      }.map(_.getOrElse((state, Noop)))
+                block.toHashedWithSignatureCheck.flatMap {
+                  case Left(_) =>
+                    logger.debug(s"[TL-FSM] processSignatureProposal FINAL_BLOCK_SIG_CHECK_FAIL roundId=${roundData.roundId}") >>
+                      cancelRound(newState, roundData).map { case (s, _) => (s, Noop.asInstanceOf[Out]) }
+                  case Right(hashedBlock) =>
+                    logger.debug(s"[TL-FSM] processSignatureProposal GOT_ALL_SIGS roundId=${roundData.roundId} hash=${hashedBlock.hash}") >>
+                      Applicative[F]
+                        .pure[ConsensusOutput](ConsensusOutput.FinalBlock(hashedBlock))
+                        .tupleLeft(removeRound(newState, roundData))
+                }
+              case rd =>
+                logger.debug(
+                  s"[TL-FSM] processSignatureProposal WAITING roundId=${rd.roundId} ownBlockSet=${rd.ownBlock.isDefined} peerBlockSignatures=${rd.peerBlockSignatures.keySet} peers=${rd.peers
+                      .map(_.id)}"
+                ) >>
+                  Applicative[F].pure[ConsensusOutput](Noop).tupleLeft(newState)
+            }
+        }.flatMap {
+          case Some(out) => out.pure[F]
+          case None =>
+            logger
+              .debug(
+                s"[TL-FSM] processSignatureProposal DROPPED roundId=${proposal.roundId} senderId=${proposal.senderId} (tryPersistSignatureProposal returned None)"
+              )
+              .as((state, Noop: Out))
+        }
 
     def startOwnRound(state: State): F[(State, Unit)] =
       state.ownConsensus.fold {
