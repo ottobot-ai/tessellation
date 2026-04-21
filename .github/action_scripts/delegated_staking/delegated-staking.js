@@ -564,6 +564,12 @@ const testUpdateDelegatedStake = async (urls, account, stakeHash, nodeId) => {
     {
       globalL0Url: urls.globalL0Url,
       name: 'assertDelegatedStakeUpdated',
+      // At 8 peers we observe reorg storms that pause production repeatedly — the update tx
+      // can sit in the event mempool for 15–25 ordinals before a non-paused producer drains
+      // it (one observed run: accepted at 23:20:50, included at ord 51 at 23:22:08 ≈ 78s).
+      // Default maxOrdinalMisses=10 gives up one ordinal short. 40 leaves comfortable margin
+      // over the observed peak without hiding an actually-dropped tx.
+      maxOrdinalMisses: 40,
     },
   )
   logWorkflow.info('Stake update verified with balance change and rewards >= original')
