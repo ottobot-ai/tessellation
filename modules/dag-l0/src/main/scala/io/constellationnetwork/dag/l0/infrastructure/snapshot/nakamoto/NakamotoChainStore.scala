@@ -132,7 +132,7 @@ object NakamotoChainStore {
     // Writes above finalized are always allowed (that's the normal reorg path). Writes
     // at-or-below finalized with MATCHING hash are no-ops (legitimate re-delivery or
     // download-replay). Only differing-hash writes at-or-below finalized are refused.
-    nakamotoFinalizedOrdinalRef: Ref[F, Long]
+    nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal]
   ): F[NakamotoChainStoreAlgebra[F]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoChainStore")
 
@@ -249,14 +249,16 @@ object NakamotoChainStore {
                 }
               }.flatten
 
-              nakamotoFinalizedOrdinalRef.get.flatMap { finalizedOrd =>
-                if (ordinal <= finalizedOrd) {
+              nakamotoFinalizedOrdinalRef.get.flatMap { finalized =>
+                // Chain-store API is Long-indexed; compare against the finalized ordinal's Long value.
+                val finalizedLong = finalized.value.value
+                if (ordinal <= finalizedLong) {
                   stateRef.get.flatMap { state =>
                     state.byHash.values.find(_.ordinal == ordinal).map(_.hash) match {
                       case Some(existingHash) if existingHash =!= snapshotHash =>
                         logger
                           .warn(
-                            s"REFUSED store: finality-safety violation — ordinal=$ordinal is at-or-below finalized=$finalizedOrd, " +
+                            s"REFUSED store: finality-safety violation — ordinal=$ordinal is at-or-below finalized=${finalized.show}, " +
                               s"existing=${existingHash.value.take(12)}, new=${snapshotHash.value.take(12)}. " +
                               s"Dropping write; this node previously finalized the existing snapshot and must not rewrite it."
                           )

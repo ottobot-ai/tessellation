@@ -42,13 +42,14 @@ object FinalityGate {
       def isServable(ordinal: SnapshotOrdinal): F[Boolean] = true.pure[F]
     }
 
-  /** Nakamoto instance: finalized ordinal is a mutable Long tracked by the attestation daemon. Initialized to 1L; grows monotonically. */
-  def fromRef[F[_]: Monad](ref: Ref[F, Long]): FinalityGate[F] =
+  /** Nakamoto instance: finalized ordinal is a mutable `SnapshotOrdinal` tracked by the attestation daemon. Seeded with
+    * `SnapshotOrdinal.MinIncrementalValue` (ordinal 1 = genesis); grows monotonically.
+    */
+  def fromRef[F[_]: Monad](ref: Ref[F, SnapshotOrdinal]): FinalityGate[F] =
     new FinalityGate[F] {
-      def finalizedOrdinal: F[Option[SnapshotOrdinal]] =
-        ref.get.map(v => Some(SnapshotOrdinal.unsafeApply(v)))
+      def finalizedOrdinal: F[Option[SnapshotOrdinal]] = ref.get.map(Some(_))
       def isServable(ordinal: SnapshotOrdinal): F[Boolean] =
-        ref.get.map(v => ordinal.value.value <= v)
+        ref.get.map(finalized => ordinal <= finalized)
     }
 
   /** Trivial unconditional instance — everything is servable, finalized is None. Use only in test fixtures where finality doesn't apply. */

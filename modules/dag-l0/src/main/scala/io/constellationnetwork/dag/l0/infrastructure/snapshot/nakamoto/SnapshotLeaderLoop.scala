@@ -173,7 +173,7 @@ object SnapshotLeaderLoop {
     // Tracks the highest finalized ordinal so HttpApi can expose it via
     // /global-snapshots/latest/finalized-ordinal. Updated after every successful
     // chainStore.finalize call (depth-k or attestation-2/3, whichever fires first).
-    nakamotoFinalizedOrdinalRef: Ref[F, Long],
+    nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
     // Fire-and-forget ChainSync trigger for the finality walkback path. When the
     // finality monitor tries to confirm ancestry at an attested ordinal that we
     // don't have on our local canonical chain (we're on a fork), we enqueue a
@@ -389,7 +389,8 @@ object SnapshotLeaderLoop {
                             // /latest/finalized-ordinal reflects the new high-water mark. CL0
                             // polls this to gate state-channel-binary pruning on actual finality
                             // (not just first sight).
-                            nakamotoFinalizedOrdinalRef.update(prev => math.max(prev, finalizeAtOrdinal)) >>
+                            nakamotoFinalizedOrdinalRef
+                              .update(prev => cats.Order[SnapshotOrdinal].max(prev, SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))) >>
                             logger
                               .info(
                                 s"DEPTH-FINALIZED ordinal=$finalizeAtOrdinal slot=${canonicalSnapshot.slot} (tip ord=${tip.ordinal} slot=${tip.slot}, k=$ConfirmationDepthK)"
@@ -432,7 +433,8 @@ object SnapshotLeaderLoop {
                           tipTracker.markFinalized(canonicalHash, finalSlot) >>
                             tipTracker.pruneBelow(finalSlot) >>
                             chainStore.finalize(canonicalHash, finalOrdinal) >>
-                            nakamotoFinalizedOrdinalRef.update(prev => math.max(prev, finalOrdinal)) >>
+                            nakamotoFinalizedOrdinalRef
+                              .update(prev => cats.Order[SnapshotOrdinal].max(prev, SnapshotOrdinal.unsafeApply(finalOrdinal))) >>
                             snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(finalOrdinal))) >>
                             logger.info(
                               s"ATTEST-FINALIZED ordinal=$finalOrdinal slot=${stored.slot} (weight=${"%.2f".format(weight)}, " +
@@ -506,7 +508,7 @@ object SnapshotLeaderLoop {
     epochStateRef: Ref[F, SharedEpochState],
     productionGate: ProductionGate[F],
     productionTimestamps: Ref[F, Map[Long, Long]],
-    nakamotoFinalizedOrdinalRef: Ref[F, Long],
+    nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -550,7 +552,7 @@ object SnapshotLeaderLoop {
           case Some((lastSigned, lastContext)) =>
             lastSigned.toHashed[F].flatMap { lastHashed =>
               val lastKey = lastHashed.ordinal
-              val wouldProduceOrdinal = lastKey.value.value + 1
+              val wouldProduceOrdinal = SnapshotOrdinal.next.next(lastKey)
               // Finality-safety: never produce a snapshot at-or-below the network-finalized
               // ordinal. If we won a slot but our local head is stale (below finalized),
               // producing would emit a doomed snapshot — refused downstream by
@@ -560,8 +562,8 @@ object SnapshotLeaderLoop {
               // the next slot win after catch-up produces the correct (above-finalized) ordinal.
               if (wouldProduceOrdinal <= finalizedOrdinal) {
                 logger.warn(
-                  s"⛔ Skipping slot-win production: would-be ordinal=$wouldProduceOrdinal ≤ finalized=$finalizedOrdinal. " +
-                    s"Local head=${lastKey.value.value} is stale; waiting for gossip/chainsync to catch up."
+                  s"⛔ Skipping slot-win production: would-be ordinal=${wouldProduceOrdinal.show} ≤ finalized=${finalizedOrdinal.show}. " +
+                    s"Local head=${lastKey.show} is stale; waiting for gossip/chainsync to catch up."
                 )
               } else
                 for {

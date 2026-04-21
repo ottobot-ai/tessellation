@@ -134,8 +134,9 @@ object GlobalSnapshotConsensus {
     rumorQueue: Queue[F, Hashed[RumorRaw]],
     // Updated by SnapshotLeaderLoop after every chainStore.finalize call. Read by HttpApi
     // to expose /global-snapshots/latest/finalized-ordinal so CL0 can gate state-channel
-    // -binary pruning on actual finality. 0L means "no snapshots finalized yet".
-    nakamotoFinalizedOrdinalRef: Ref[F, Long],
+    // -binary pruning on actual finality. Seeded with SnapshotOrdinal.MinIncrementalValue
+    // (ordinal 1 = genesis); grows monotonically as finality advances.
+    nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
     // Invoked by NakamotoSyncDaemon when a metagraph-binary arrives via gossip.
     // Routes the binary through the same pipeline as the HTTP endpoint (stateChannelService.process).
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],

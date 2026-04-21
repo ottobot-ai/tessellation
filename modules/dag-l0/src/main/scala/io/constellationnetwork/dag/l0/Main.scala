@@ -88,7 +88,7 @@ object Main
       // on finality-gated endpoints. Updated by SnapshotLeaderLoop as finality advances.
       // Constructed BEFORE Storages so SnapshotStorage.setHeadForRecovery can enforce
       // the finality-safety guard (refuses different-hash overwrites at-or-below finalized).
-      nakamotoFinalizedOrdinalRef <- Ref.of[IO, Long](1L).asResource
+      nakamotoFinalizedOrdinalRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinIncrementalValue).asResource
       storages <- Storages
         .make[IO](
           sharedStorages,

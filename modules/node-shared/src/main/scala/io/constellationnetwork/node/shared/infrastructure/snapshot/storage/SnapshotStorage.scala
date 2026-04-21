@@ -61,8 +61,10 @@ object SnapshotStorage {
     // silently rewrite finalized content. BFT consumers leave this None (their BFT
     // recovery path legitimately rewrites content as part of download catch-up).
     // Nakamoto GL0 constructs with Some(nakamotoFinalizedOrdinalRef).
-    nakamotoFinalizedOrdinalRef: Option[Ref[F, Long]] = None
-  )(implicit supervisor: Supervisor[F]): F[SnapshotStorage[F, S, C] with LatestBalances[F]] =
+    nakamotoFinalizedOrdinalRef: Option[Ref[F, SnapshotOrdinal]] = None
+  )(
+    implicit supervisor: Supervisor[F]
+  ): F[SnapshotStorage[F, S, C] with LatestBalances[F]] =
     makeResources[F, S, C]().flatMap {
       case (headRef, ordinalCache, hashCache, notPersistedCache, offloadQueue, cutoffQueue, tentativeRef, _) =>
         make(
@@ -97,7 +99,7 @@ object SnapshotStorage {
     snapshotInfoCutoffOrdinal: SnapshotOrdinal,
     hasherSelector: HasherSelector[F],
     combinedSnapshotCheckpointFileSystemStorage: CombinedSnapshotCheckpointFileSystemStorage[F, S, C],
-    nakamotoFinalizedOrdinalRef: Option[Ref[F, Long]]
+    nakamotoFinalizedOrdinalRef: Option[Ref[F, SnapshotOrdinal]]
   )(implicit supervisor: Supervisor[F]): F[SnapshotStorage[F, S, C] with LatestBalances[F]] = {
 
     def logger = Slf4jLogger.getLogger[F]
@@ -268,8 +270,8 @@ object SnapshotStorage {
             nakamotoFinalizedOrdinalRef match {
               case None => true.pure[F]
               case Some(ref) =>
-                ref.get.flatMap { finalizedOrd =>
-                  if (snapshot.ordinal.value.value > finalizedOrd) true.pure[F]
+                ref.get.flatMap { finalized =>
+                  if (snapshot.ordinal > finalized) true.pure[F]
                   else
                     getHash(snapshot.ordinal).map {
                       case Some(existingHash) => existingHash === hashedNew.hash
@@ -278,7 +280,7 @@ object SnapshotStorage {
                       Applicative[F].whenA(!safe) {
                         logger.warn(
                           s"[SnapshotStorage] REFUSED setHeadForRecovery: finality-safety violation at ordinal=${snapshot.ordinal.show} " +
-                            s"(finalized=$finalizedOrd, new=${hashedNew.hash.show.take(12)}). Refusing to rewrite finalized content."
+                            s"(finalized=${finalized.show}, new=${hashedNew.hash.show.take(12)}). Refusing to rewrite finalized content."
                         )
                       }
                     }

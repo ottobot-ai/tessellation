@@ -44,7 +44,7 @@ object Storages {
     // refuses different-hash overwrites at-or-below finalized (raw-layer safety net
     // complementing NakamotoChainStore.store's guard). Nakamoto GL0 passes Some(ref);
     // other consumers leave None so BFT semantics are unchanged.
-    nakamotoFinalizedOrdinalRef: Option[cats.effect.kernel.Ref[F, Long]] = None
+    nakamotoFinalizedOrdinalRef: Option[cats.effect.kernel.Ref[F, SnapshotOrdinal]] = None
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): F[Storages[F]] =

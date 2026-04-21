@@ -42,10 +42,10 @@ import io.constellationnetwork.node.shared.infrastructure.node.RestartService
 import io.constellationnetwork.node.shared.infrastructure.snapshot.services.AddressService
 import io.constellationnetwork.node.shared.logger.LoggerBundle
 import io.constellationnetwork.node.shared.modules.{SharedServices, SharedStorages, SharedValidators}
+import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, GlobalStateProofSelector}
 import io.constellationnetwork.security.{Hasher, HasherSelector, SecurityProvider}
 import io.constellationnetwork.statechannel.StateChannelOutput
 
@@ -72,7 +72,7 @@ object Services {
     cfg: AppConfig,
     txHasher: Hasher[F],
     loggerBundle: LoggerBundle[F],
-    nakamotoFinalizedOrdinalRef: Ref[F, Long]
+    nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): Resource[F, Services[F, R]] =
