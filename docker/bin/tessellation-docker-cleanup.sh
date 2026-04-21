@@ -27,6 +27,14 @@ cleanup() {
     done
     cleanup_container snapshot-streaming-postgres ss-pgdata &
     cleanup_container snapshot-streaming "" &
+    # Monitoring stack — attached to tessellation_common. If left running, the
+    # network-removal loop below spins forever on "has active endpoints". The
+    # compose-runner cleanup trap deliberately leaves these up across test runs
+    # (see compose-runner.sh:cleanup_end) so `just clean-data` doesn't disturb
+    # them; full docker teardown (this script, invoked by `just clean-docker` /
+    # `just clean` / `just nuke`) DOES take them down.
+    cleanup_container prometheus "" &
+    cleanup_container nakamoto-grafana "" &
     rm -rf "$(dirname "$0")/../snapshot-streaming/data" 2>/dev/null || true &
     LAST_PID=$!
     wait $LAST_PID

@@ -21,8 +21,15 @@ show_time() {
 }
 
 cleanup_end() {
-  docker rm -f tx-sender prometheus nakamoto-grafana 2>/dev/null || true
+  # tx-sender is a test fixture — always remove when the test run ends.
+  docker rm -f tx-sender 2>/dev/null || true
+  # Prometheus + Grafana are monitoring dashboards we want to survive the test run
+  # (so you can inspect metrics after tests finish, same as the node containers
+  # which stay up with --restart unless-stopped). Only tear them down when the
+  # caller asked for a full docker cleanup — this mirrors how node containers
+  # are handled below.
   if [ "$CLEANUP_DOCKER_AT_END" == "true" ] && { [ -z "$TEST_HOST" ] || [ "$TEST_HOST" = "http://localhost" ]; }; then
+    docker rm -f prometheus nakamoto-grafana 2>/dev/null || true
     ./docker/bin/tessellation-docker-cleanup.sh
   fi
 }
@@ -60,8 +67,8 @@ if [ "$LIST_TESTS" = "true" ]; then
   echo "  token-locks              Token lock tests"
   echo "  allow-spends             Allow-spend tests"
   echo "  spend                    Spend transaction tests"
-  echo "  data-without-fee         Data transaction tests (without fee, requires CI_PRIVATE_KEY)"
-  echo "  data-with-fee            Data transaction tests (with fee, requires CI_PRIVATE_KEY)"
+  echo "  data-without-fee         Data transaction tests (without fee; override signer with CI_PRIVATE_KEY)"
+  echo "  data-with-fee            Data transaction tests (with fee; override signer with CI_PRIVATE_KEY)"
   echo ""
   echo "Usage: just test --test=dag-cluster --test=delegated-staking"
   echo "       just test --test=dag-cluster,rewards    (comma-separated)"
@@ -820,28 +827,28 @@ if [ -n "$METAGRAPH" ]; then
     show_time "Spend transaction tests completed"
   fi
 
-  if [ -n "$CI_PRIVATE_KEY" ]; then
-    if should_run_test "data-without-fee"; then
-      echo "================================================"
-      echo "Running data transaction tests (without fee)"
-      echo "================================================"
-      cd $PROJECT_ROOT/.github/action_scripts
-      node send_transactions/data-without-fee.js $DAG_L0_PORT_PREFIX $DAG_L1_PORT_PREFIX $ML0_PORT_PREFIX $CL1_PORT_PREFIX $DL1_PORT_PREFIX $CI_PRIVATE_KEY
-      show_time "Data transaction tests (without fee) completed"
-    fi
+  # Data-transaction tests sign a UsageUpdateWithFee with an account that has DAG balance.
+  # Default to PRIVATE_KEYS.key1 from shared/constants.js (funded via genesis.csv) so local
+  # and CI runs exercise these by default. Override with CI_PRIVATE_KEY=... if a test needs
+  # a specific signer (e.g. a metagraph whose data app enforces owner-only updates).
+  TEST_DATA_PRIVATE_KEY="${CI_PRIVATE_KEY:-595a30ab6c62ae48a23414951e2703f49f8c0040b9801738ad3550475389d811}"
 
-    if should_run_test "data-with-fee"; then
-      echo "================================================"
-      echo "Running data transaction tests (with fee)"
-      echo "================================================"
-      cd $PROJECT_ROOT/.github/action_scripts
-      node send_transactions/data-with-fee.js $DAG_L0_PORT_PREFIX $DAG_L1_PORT_PREFIX $ML0_PORT_PREFIX $CL1_PORT_PREFIX $DL1_PORT_PREFIX $CI_PRIVATE_KEY
-      show_time "Data transaction tests (with fee) completed"
-    fi
-  else
+  if should_run_test "data-without-fee"; then
     echo "================================================"
-    echo "Skipping data transaction tests (CI_PRIVATE_KEY not set)"
+    echo "Running data transaction tests (without fee)"
     echo "================================================"
+    cd $PROJECT_ROOT/.github/action_scripts
+    node send_transactions/data-without-fee.js $DAG_L0_PORT_PREFIX $DAG_L1_PORT_PREFIX $ML0_PORT_PREFIX $CL1_PORT_PREFIX $DL1_PORT_PREFIX $TEST_DATA_PRIVATE_KEY
+    show_time "Data transaction tests (without fee) completed"
+  fi
+
+  if should_run_test "data-with-fee"; then
+    echo "================================================"
+    echo "Running data transaction tests (with fee)"
+    echo "================================================"
+    cd $PROJECT_ROOT/.github/action_scripts
+    node send_transactions/data-with-fee.js $DAG_L0_PORT_PREFIX $DAG_L1_PORT_PREFIX $ML0_PORT_PREFIX $CL1_PORT_PREFIX $DL1_PORT_PREFIX $TEST_DATA_PRIVATE_KEY
+    show_time "Data transaction tests (with fee) completed"
   fi
 
 else
