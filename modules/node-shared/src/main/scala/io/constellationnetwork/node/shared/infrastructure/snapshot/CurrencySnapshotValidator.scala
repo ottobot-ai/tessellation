@@ -172,7 +172,13 @@ object CurrencySnapshotValidator {
                 expected.artifacts.map(() => _),
                 getGlobalSnapshotByOrdinal,
                 shouldPerformMetagraphSpecificValidations = false,
-                Some((_: Signed[CurrencyIncrementalSnapshot]) => expected.artifacts)
+                Some((_: Signed[CurrencyIncrementalSnapshot]) => expected.artifacts),
+                // Force acceptance to use the exact GL0 sync point the producer used.
+                // Without this, the recompute would fetch GL0's current head, which has
+                // advanced past what CL0 saw when producing → SnapshotDifferentThanExpected
+                // race on the globalSyncView field. Under GL0 finality, expected.globalSyncView
+                // references a finalized ordinal that's locally available on every GL0 node.
+                expected.globalSyncView
               )
 
           def check(result: F[CurrencySnapshotCreationResult[CurrencySnapshotEvent]]) =

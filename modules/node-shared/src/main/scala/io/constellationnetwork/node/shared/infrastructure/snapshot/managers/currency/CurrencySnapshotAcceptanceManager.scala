@@ -57,7 +57,13 @@ trait CurrencySnapshotAcceptanceManager[F[_]] {
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     lastGlobalSyncView: Option[GlobalSyncView],
     shouldPerformMetagraphSpecificValidations: Boolean,
-    lastArtifactProofs: NonEmptySet[SignatureProof]
+    lastArtifactProofs: NonEmptySet[SignatureProof],
+    // Validator-only override. When Some, bypass the priority chain that picks
+    // which GL0 ordinal to sync to and use this exact value. This lets GL0 re-run
+    // acceptance with the same GL0 sync point the producer used, avoiding the race
+    // where GL0's local head has advanced past what CL0 saw when producing.
+    // Producers should always pass None; only the validator supplies a value.
+    forcedGlobalSyncView: Option[GlobalSyncView] = None
   )(implicit hasher: Hasher[F]): F[CurrencySnapshotAcceptanceResult]
 
   def acceptRewardTxs(
@@ -172,7 +178,8 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     maybeLastGlobalSyncView: Option[GlobalSyncView],
     shouldPerformMetagraphSpecificValidations: Boolean,
-    lastArtifactProofs: NonEmptySet[SignatureProof]
+    lastArtifactProofs: NonEmptySet[SignatureProof],
+    forcedGlobalSyncView: Option[GlobalSyncView] = None
   )(implicit hasher: Hasher[F]): F[CurrencySnapshotAcceptanceResult] = for {
     initialTxRef <- TransactionReference.emptyCurrency(lastSnapshotContext.address)
     tokenLockInitialTxRef <- TokenLockReference.emptyCurrency(lastSnapshotContext.address)
@@ -291,14 +298,36 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
 
     lastGlobalSnapshots <- lastNGlobalSnapshotStorage.getLastN
 
-    ordinalToFetchGlobalSnapshot <- maybeSnapshotOrdinalSync
-      .orElse(maybeLastGlobalSyncView.map(_.ordinal))
-      .filter(_ =!= SnapshotOrdinal.MinValue)
-      .fold(fallbackOrdinal.pure[F])(_.pure[F])
+    // Validator path: when forcedGlobalSyncView is Some, the validator is re-running
+    // acceptance to check a CL0 snapshot that was produced against a specific GL0
+    // sync point. Bypass the priority chain (maybeSnapshotOrdinalSync → last view →
+    // local head) and use the exact ordinal the producer used. Under GL0 finality,
+    // this ordinal is guaranteed reachable on our chain; hash is verified as a
+    // sanity check.
+    ordinalToFetchGlobalSnapshot <- forcedGlobalSyncView
+      .map(_.ordinal)
+      .fold(
+        maybeSnapshotOrdinalSync
+          .orElse(maybeLastGlobalSyncView.map(_.ordinal))
+          .filter(_ =!= SnapshotOrdinal.MinValue)
+          .fold(fallbackOrdinal.pure[F])(_.pure[F])
+      )(_.pure[F])
 
     lastSyncGlobalSnapshot <- lastGlobalSnapshots.find(_.ordinal === ordinalToFetchGlobalSnapshot) match {
       case Some(value) => value.pure[F]
       case None        => globalSnapshotOps.getGlobalSnapshotWithRetry(ordinalToFetchGlobalSnapshot, getGlobalSnapshotByOrdinal)
+    }
+
+    _ <- forcedGlobalSyncView.traverse_ { forced =>
+      if (lastSyncGlobalSnapshot.hash === forced.hash) Async[F].unit
+      else
+        Async[F].raiseError[Unit](
+          new IllegalStateException(
+            s"Forced globalSyncView hash mismatch: CL0 snapshot references GL0 ordinal ${forced.ordinal.show} " +
+              s"with hash ${forced.hash.show}, but local GL0 at that ordinal has hash ${lastSyncGlobalSnapshot.hash.show}. " +
+              s"Under finality, this indicates either a bug, data corruption, or a CL0 snapshot from a different chain."
+          )
+        )
     }
 
     _ <- globalSnapshotOps.updateGlobalSnapshotCache(lastSyncGlobalSnapshot)
@@ -306,15 +335,17 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     lastGlobalSnapshotEpochProgress = lastSyncGlobalSnapshot.epochProgress
     lastGlobalSnapshotOrdinal = lastSyncGlobalSnapshot.ordinal
 
-    globalSyncView = maybeLastGlobalSyncView
-      .filter(_.ordinal >= lastSyncGlobalSnapshot.ordinal)
-      .getOrElse(
-        GlobalSyncView(
-          lastSyncGlobalSnapshot.ordinal,
-          lastSyncGlobalSnapshot.hash,
-          lastSyncGlobalSnapshot.epochProgress
+    globalSyncView = forcedGlobalSyncView.getOrElse(
+      maybeLastGlobalSyncView
+        .filter(_.ordinal >= lastSyncGlobalSnapshot.ordinal)
+        .getOrElse(
+          GlobalSyncView(
+            lastSyncGlobalSnapshot.ordinal,
+            lastSyncGlobalSnapshot.hash,
+            lastSyncGlobalSnapshot.epochProgress
+          )
         )
-      )
+    )
 
     blockAcceptanceResults <- (
       blockOps.acceptTokenLockBlocks(
