@@ -11,10 +11,13 @@
 
     <logger name="io.constellationnetwork" level="DEBUG" />
     <logger name="io.constellationnetwork.httpsigner" level="INFO" additivity="false" />
-    <logger name="org.http4s.server.middleware.RequestLogger" level="DEBUG" />
-    <logger name="org.http4s.server.middleware.ResponseLogger" level="DEBUG" />
-    <logger name="org.http4s.client.middleware.RequestLogger" level="DEBUG" />
-    <logger name="org.http4s.client.middleware.ResponseLogger" level="DEBUG" />
+    <!-- http4s per-request/per-response loggers are extremely noisy under normal
+         operation (every HTTP call on both server and client is logged at DEBUG).
+         Kept OFF by default; flip to DEBUG locally for ad-hoc wire debugging. -->
+    <logger name="org.http4s.server.middleware.RequestLogger" level="OFF" />
+    <logger name="org.http4s.server.middleware.ResponseLogger" level="OFF" />
+    <logger name="org.http4s.client.middleware.RequestLogger" level="OFF" />
+    <logger name="org.http4s.client.middleware.ResponseLogger" level="OFF" />
     <logger name="RumorLogger" level="OFF" />
     <logger name="org.http4s.ember.client.EmberClientBuilderCompanionPlatform" level="ERROR" />
     <logger name="com.clickhouse.client.api.ClientConfigProperties" level="ERROR" />
