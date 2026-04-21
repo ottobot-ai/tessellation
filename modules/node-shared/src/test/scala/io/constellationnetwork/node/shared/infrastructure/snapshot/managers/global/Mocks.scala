@@ -224,9 +224,11 @@ object Mocks {
         spendActions: Map[Address, List[SpendAction]],
         activeAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
         allBalances: Map[Option[Address], SortedMap[Address, Balance]]
-      ): IO[(Map[Address, List[SpendAction]], Map[Address, (SpendAction, List[SpendActionValidator.SpendActionValidationError])])] =
-        (Map.empty[Address, List[SpendAction]], Map.empty[Address, (SpendAction, List[SpendActionValidator.SpendActionValidationError])])
-          .pure[IO]
+      ): IO[(Map[Address, List[SpendAction]], Map[Address, List[(SpendAction, List[SpendActionValidator.SpendActionValidationError])]])] =
+        (
+          Map.empty[Address, List[SpendAction]],
+          Map.empty[Address, List[(SpendAction, List[SpendActionValidator.SpendActionValidationError])]]
+        ).pure[IO]
     }
 
     val mockPricingUpdateValidator = new PricingUpdateValidator[IO] {

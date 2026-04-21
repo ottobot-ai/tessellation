@@ -79,7 +79,11 @@ case class MerkleTreeResult(
 
 case class ArtifactValidationResult(
   acceptedSpendActions: Map[Address, List[SpendAction]],
-  rejectedSpendActions: Map[Address, (SpendAction, List[SpendActionValidationError])],
+  // Each metagraph can emit multiple SpendActions in one snapshot; if more than one is
+  // rejected, we need to see ALL of them, not just the last-processed. Previously the
+  // type was `(SpendAction, List[Error])` and a `.toMap` in the validator silently
+  // dropped shadowed entries (bug surfaced in DoubleUseAllowSpend e2e).
+  rejectedSpendActions: Map[Address, List[(SpendAction, List[SpendActionValidationError])]],
   acceptedPricingUpdates: List[PricingUpdate],
   rejectedPricingUpdates: List[(PricingUpdate, List[PricingUpdateValidationError])]
 )

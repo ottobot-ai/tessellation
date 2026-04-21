@@ -390,8 +390,8 @@ object SpendActionValidatorSuite extends MutableIOSuite {
         acceptedSpendActions.contains(ammAddress),
         rejectedSpendActions.contains(ammAddress),
         acceptedSpendActions(ammAddress) === List(spendAction),
-        rejectedSpendActions(ammAddress)._1 === duplicatedAction,
-        rejectedSpendActions(ammAddress)._2 === List(NoActiveAllowSpends("Currency None not found in active allow spends"))
+        rejectedSpendActions(ammAddress).head._1 === duplicatedAction,
+        rejectedSpendActions(ammAddress).head._2 === List(NoActiveAllowSpends("Currency None not found in active allow spends"))
       )
   }
 
@@ -439,8 +439,8 @@ object SpendActionValidatorSuite extends MutableIOSuite {
         rejectedSpendActions.nonEmpty,
         rejectedSpendActions.size === 1,
         rejectedSpendActions.contains(ammAddress),
-        rejectedSpendActions(ammAddress)._1 === spendAction,
-        rejectedSpendActions(ammAddress)._2 === List(
+        rejectedSpendActions(ammAddress).head._1 === spendAction,
+        rejectedSpendActions(ammAddress).head._2 === List(
           DuplicatedAllowSpendReference("Duplicated allow spend reference in the same SpendAction")
         )
       )
@@ -520,7 +520,7 @@ object SpendActionValidatorSuite extends MutableIOSuite {
         rejectedSpendActions.nonEmpty,
         acceptedSpendActions.isEmpty,
         rejectedSpendActions.contains(ammAddress),
-        rejectedSpendActions(ammAddress)._2 === List(
+        rejectedSpendActions(ammAddress).head._2 === List(
           AllowSpendNotFound(s"Allow spend ${Hash.empty} not found in currency active allow spends")
         )
       )

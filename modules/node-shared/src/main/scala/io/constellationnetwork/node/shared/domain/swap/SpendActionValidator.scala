@@ -32,7 +32,7 @@ trait SpendActionValidator[F[_]] {
     spendActions: Map[Address, List[SpendAction]],
     activeAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
     allBalances: Map[Option[Address], SortedMap[Address, Balance]]
-  ): F[(Map[Address, List[SpendAction]], Map[Address, (SpendAction, List[SpendActionValidationError])])]
+  ): F[(Map[Address, List[SpendAction]], Map[Address, List[(SpendAction, List[SpendActionValidationError])]])]
 }
 
 object SpendActionValidator {
@@ -45,7 +45,7 @@ object SpendActionValidator {
     ): F[
       (
         Map[Address, List[SpendAction]],
-        Map[Address, (SpendAction, List[SpendActionValidationError])]
+        Map[Address, List[(SpendAction, List[SpendActionValidationError])]]
       )
     ] = {
       def processActionsForCurrency(
@@ -95,13 +95,18 @@ object SpendActionValidator {
               case (_, spendAction) => spendAction.nonEmpty
             }.toMap
 
-            val rejectedSpendActions = spendTransactionsValidations.flatMap {
-              case (address, (rejected, _)) =>
-                rejected.map {
-                  case (action: SpendAction, errors: List[SpendActionValidationError]) =>
-                    address -> (action, errors)
-                }
-            }.toMap
+            // Preserve ALL rejections per address. The previous `.flatMap ... .toMap` form
+            // silently dropped all but the last rejection per address — which meant, when
+            // a single metagraph emitted multiple SpendActions and more than one was
+            // rejected, only one surfaced in the log / state. The DoubleUseAllowSpend
+            // scenario fed two SpendActions (reusing the same allow-spend) through the
+            // same address and expected both rejections visible.
+            val rejectedSpendActions: Map[Address, List[(SpendAction, List[SpendActionValidationError])]] =
+              spendTransactionsValidations.map {
+                case (address, (rejected, _)) => address -> rejected
+              }.filter {
+                case (_, rejected) => rejected.nonEmpty
+              }.toMap
 
             (acceptedSpendActions, rejectedSpendActions)
         }
