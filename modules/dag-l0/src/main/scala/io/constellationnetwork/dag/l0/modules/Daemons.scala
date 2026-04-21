@@ -39,7 +39,8 @@ object Daemons {
   ): F[Unit] =
     List[Daemon[F]](
       NodeStateDaemon.make(storages.node, services.gossip),
-      Daemon.periodic(storages.trust.updateTrustWithBiases(nodeId), cfg.trust.daemon.interval),
+      // Trust score daemons disabled on GL0 — not used. Storage/service still constructed.
+      // Daemon.periodic(storages.trust.updateTrustWithBiases(nodeId), cfg.trust.daemon.interval),
       GlobalSnapshotEventsPublisherDaemon
         .make(
           queues.stateChannelOutput,
@@ -56,8 +57,8 @@ object Daemons {
           services.consensus.storage.getLastConsensusOutcome.map(_.fold(0)(_.facilitators.value.size)),
           cfg.snapshot.consensus
         ),
-      CollateralDaemon.make(services.collateral, storages.globalSnapshot, storages.cluster),
-      TrustStorageUpdater.daemon(services.trustStorageUpdater)
+      CollateralDaemon.make(services.collateral, storages.globalSnapshot, storages.cluster)
+      // TrustStorageUpdater.daemon(services.trustStorageUpdater) — disabled on GL0
     ).traverse(_.start).void
 
 }

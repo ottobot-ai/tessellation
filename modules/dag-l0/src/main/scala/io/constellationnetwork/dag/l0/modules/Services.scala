@@ -29,8 +29,10 @@ import io.constellationnetwork.node.shared.domain.collateral.Collateral
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
 import io.constellationnetwork.node.shared.domain.healthcheck.LocalHealthcheck
 import io.constellationnetwork.node.shared.domain.rewards.Rewards
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityGate
 import io.constellationnetwork.node.shared.domain.snapshot.services.AddressService
 import io.constellationnetwork.node.shared.infrastructure.collateral.MptStoreCollateral
+import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.node.shared.infrastructure.delegatedStake.{RewardsInfoCalculator, RewardsInfoStorage}
 import io.constellationnetwork.node.shared.infrastructure.gossip.event.{EventGossipClient, RecoveryPeerHint}
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
@@ -53,7 +55,7 @@ object Services {
 
   def make[F[
     _
-  ]: Async: Parallel: Random: KryoSerializer: JsonSerializer: HasherSelector: SecurityProvider: Metrics: Supervisor, R <: CliMethod](
+  ]: Async: FinalityGate: Parallel: Random: KryoSerializer: JsonSerializer: HasherSelector: SecurityProvider: Metrics: Supervisor, R <: CliMethod](
     sharedCfg: SharedConfig,
     sharedServices: SharedServices[F, R],
     sharedStorages: SharedStorages[F],
@@ -110,6 +112,17 @@ object Services {
 
       eventGossipClient = EventGossipClient.make[F, GlobalSnapshotEvent](client, session)
 
+      // Sidecar client for libp2p GossipSub. Created here (rather than inside consensus)
+      // so stateChannelService and HTTP routes can also publish — specifically, the
+      // HTTP state-channel endpoint broadcasts received metagraph binaries to peer GL0s
+      // to work around CL0's single-push-per-binary retry cap starvation.
+      sidecarConfig = SidecarClient.SidecarConfig(
+        host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
+        grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
+      )
+      sidecarClientPair <- SidecarClient.makeResource[F](sidecarConfig).allocated
+      sidecarClient = sidecarClientPair._1
+
       // stateChannelService must exist before consensus so that the Nakamoto
       // gossip daemon can route metagraph-binary gossip messages through the
       // same acceptance pipeline that the HTTP POST endpoint uses.
@@ -128,17 +141,20 @@ object Services {
 
       // Callback for the Nakamoto gossip daemon to process incoming metagraph
       // binaries. Mirrors the HTTP route in StateChannelRoutes: wrap as
-      // StateChannelOutput, fetch snapshotStorage.head for context, delegate
-      // to stateChannelService.process. Errors are logged and swallowed —
-      // gossip is fire-and-forget, no sender to reply to.
+      // StateChannelOutput, fetch head context, delegate to
+      // stateChannelService.process. Errors are logged and swallowed — gossip
+      // is fire-and-forget, no sender to reply to. DO NOT finality-gate this
+      // path: in Nakamoto mode head is ~always ahead of finalized during
+      // active production, so gating here would reject every incoming binary.
+      // The validator handles the race via forcedGlobalSyncView at snapshot
+      // production time.
       processMetagraphBinary = (output: StateChannelOutput) =>
         storages.globalSnapshot.head.flatMap {
           case Some((snapshot, info)) =>
             HasherSelector[F].withCurrent { implicit hasher =>
               stateChannelService.process(output, (snapshot, info))
             }.void
-          case None =>
-            Async[F].unit // Node not ready to accept metagraph snapshots yet.
+          case None => Async[F].unit
         }
 
       consensus <- HasherSelector[F].withCurrent { implicit hs =>
@@ -174,7 +190,8 @@ object Services {
             loggerBundle,
             queues.rumor,
             nakamotoFinalizedOrdinalRef,
-            processMetagraphBinary
+            processMetagraphBinary,
+            sidecarClient
           )
       }
       addressService = AddressService.make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
@@ -200,7 +217,8 @@ object Services {
         restart = sharedServices.restart,
         rewards = rewardsService,
         recoveryPeerHint = recoveryPeerHintService,
-        eventMempool = eventMempoolService
+        eventMempool = eventMempoolService,
+        sidecarClient = sidecarClient
       ) {}
 }
 
@@ -217,5 +235,6 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   val restart: RestartService[F, R],
   val rewards: RewardsService[F],
   val recoveryPeerHint: RecoveryPeerHint[F],
-  val eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey]
+  val eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
+  val sidecarClient: SidecarClient.SidecarClientAlgebra[F]
 )
