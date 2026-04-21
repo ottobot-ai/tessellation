@@ -44,7 +44,9 @@ final case class StateChannelRoutes[F[_]: Async: Hasher: JsonSerializer](
 
   // After a CL0-originated binary is accepted locally, re-broadcast it over the libp2p
   // metagraph-binaries topic so peer GL0s receive it without needing CL0 to HTTP-push to
-  // every GL0 separately. Fire-and-forget: gossip delivery is best-effort, and duplicate
+  // every GL0 separately. Synchronous best-effort: we await the publish before responding
+  // 200 so CL0 sees a bounded Ok latency, but any publish error is swallowed (logged at
+  // WARN). Gossip delivery is still best-effort at the transport layer — duplicate
   // receives on peer nodes are idempotent (process short-circuits on "already accepted").
   private def broadcastMetagraphBinary(address: Address, signed: Signed[StateChannelSnapshotBinary]): F[Unit] =
     JsonSerializer[F]

@@ -108,11 +108,8 @@ class AllowSpendBlockStorage[F[_]: Sync: Random](blocks: MapRef[F, ProofsHash, O
   def store(hashedBlock: Hashed[AllowSpendBlock]): F[Unit] =
     blocks(hashedBlock.proofsHash).modify {
       case None => (WaitingBlock(hashedBlock.signed).some, ().asRight)
-      // Idempotent on Waiting: see TokenLockBlockStorage.store for the rationale.
-      // Self-produced blocks pass through `storeBlock` twice (consensus path +
-      // gossip-self-loop via peerBlocks). Treating the duplicate as a no-op
-      // avoids spurious BlockAlreadyStoredError logs while preserving the
-      // conflict signal for any other state transition.
+      // Idempotent on Waiting — see TokenLockBlockStorage.store for the rationale
+      // (consensus + gossip-self-loop both route self-produced blocks here).
       case w @ Some(WaitingBlock(_)) => (w, ().asRight)
       case other                     => (other, BlockAlreadyStoredError(hashedBlock.proofsHash, other).asLeft)
     }.flatMap(_.liftTo[F])
