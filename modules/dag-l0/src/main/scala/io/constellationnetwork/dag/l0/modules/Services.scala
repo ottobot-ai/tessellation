@@ -4,8 +4,9 @@ import java.security.KeyPair
 
 import cats.Parallel
 import cats.data.NonEmptySet
-import cats.effect.kernel.{Async, Ref}
+import cats.effect.kernel.{Async, Ref, Resource}
 import cats.effect.std.{Random, Supervisor}
+import cats.effect.syntax.all._
 import cats.syntax.applicative._
 import cats.syntax.flatMap._
 import cats.syntax.functor._
@@ -74,7 +75,7 @@ object Services {
     nakamotoFinalizedOrdinalRef: Ref[F, Long]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
-  ): F[Services[F, R]] =
+  ): Resource[F, Services[F, R]] =
     for {
       classicRewards <- Rewards
         .make[F](
@@ -83,6 +84,7 @@ object Services {
           FacilitatorDistributor.make
         )
         .pure[F]
+        .toResource
 
       delegatorRewards <- HasherSelector[F].withCurrent { implicit hasher =>
         GlobalDelegatedRewardsDistributor
@@ -91,11 +93,11 @@ object Services {
             DefaultDelegatedRewardsConfigProvider.getConfig()
           )
           .pure[F]
-      }
+      }.toResource
 
       rewardsInfoCalculator = RewardsInfoCalculator.make(delegatorRewards)
 
-      rewardsInfoStorage <- RewardsInfoStorage.make
+      rewardsInfoStorage <- RewardsInfoStorage.make.toResource
 
       rewardsService = RewardsService(
         classicRewards,
@@ -108,7 +110,7 @@ object Services {
         GlobalEventMempool.make[F](
           GlobalEventMempool.defaultConfig
         )
-      }
+      }.toResource
 
       eventGossipClient = EventGossipClient.make[F, GlobalSnapshotEvent](client, session)
 
@@ -116,12 +118,14 @@ object Services {
       // so stateChannelService and HTTP routes can also publish — specifically, the
       // HTTP state-channel endpoint broadcasts received metagraph binaries to peer GL0s
       // to work around CL0's single-push-per-binary retry cap starvation.
+      //
+      // Held as a Resource so the gRPC channel is shut down cleanly on app teardown
+      // instead of being escaped via `.allocated` (prior behaviour leaked the channel).
       sidecarConfig = SidecarClient.SidecarConfig(
         host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
         grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
       )
-      sidecarClientPair <- SidecarClient.makeResource[F](sidecarConfig).allocated
-      sidecarClient = sidecarClientPair._1
+      sidecarClient <- SidecarClient.makeResource[F](sidecarConfig)
 
       // stateChannelService must exist before consensus so that the Nakamoto
       // gossip daemon can route metagraph-binary gossip messages through the
@@ -202,7 +206,7 @@ object Services {
       collateralService = MptStoreCollateral.make[F](cfg.collateral, sharedStorages.mptStore)
       getOrdinal = storages.globalSnapshot.headSnapshot.map(_.map(_.ordinal))
       trustUpdaterService = TrustStorageUpdater.make(getOrdinal, sharedServices.gossip, storages.trust)
-      recoveryPeerHintService <- RecoveryPeerHint.make[F]
+      recoveryPeerHintService <- RecoveryPeerHint.make[F].toResource
     } yield
       new Services[F, R](
         localHealthcheck = sharedServices.localHealthcheck,

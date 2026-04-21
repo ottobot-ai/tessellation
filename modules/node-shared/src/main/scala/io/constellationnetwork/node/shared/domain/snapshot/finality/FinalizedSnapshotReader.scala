@@ -5,10 +5,7 @@ import cats.syntax.all._
 
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.node.shared.http.routes.CachedCombinedResponse
-import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.{
-  CombinedSnapshotCheckpointFileSystemStorage,
-  LastCheckpointInfo
-}
+import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.{CombinedSnapshotCheckpointFileSystemStorage, LastCheckpointInfo}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo}
 
@@ -19,8 +16,8 @@ import org.http4s.headers.`Content-Type`
   *
   * Two operating modes with very different semantics, split into named factories rather than a runtime flag:
   *
-  *   - `bft` — every snapshot is final on arrival (head == finalized). Reads straight from in-memory `SnapshotStorage.head` and
-  *     serializes via the shared `CachedCombinedResponse`. No disk indirection, no staleness window.
+  *   - `bft` — every snapshot is final on arrival (head == finalized). Reads straight from in-memory `SnapshotStorage.head` and serializes
+  *     via the shared `CachedCombinedResponse`. No disk indirection, no staleness window.
   *   - `nakamoto` — head may run ahead of finality. Reads from the on-disk checkpoint file at or below the finalized ordinal so that
   *     tentative, pre-finality state never leaves the node. Inherits the `checkpointIntervalEpochs` staleness of
   *     `CombinedSnapshotCheckpointFileSystemStorage`, which is acceptable for finality-gated output.
@@ -40,8 +37,8 @@ trait FinalizedSnapshotReader[F[_], S <: Snapshot, SI <: SnapshotInfo[_]] {
     */
   def latestCheckpointInfo: F[Option[LastCheckpointInfo]]
 
-  /** Combined snapshot response at a specific ordinal, iff that ordinal is at-or-below finalized. Used by the `/latest/combined/checkpoint/:ordinal`
-    * route for consumers that want to pin against a specific checkpoint.
+  /** Combined snapshot response at a specific ordinal, iff that ordinal is at-or-below finalized. Used by the
+    * `/latest/combined/checkpoint/:ordinal` route for consumers that want to pin against a specific checkpoint.
     */
   def combinedCheckpointAt(ordinal: SnapshotOrdinal): F[Option[Response[F]]]
 }
@@ -79,8 +76,8 @@ object FinalizedSnapshotReader {
       fileStorage.getAsHttpResponse(ordinal)
   }
 
-  /** Nakamoto implementation: serve only at-or-below the finalized ordinal, read bytes from the on-disk checkpoint. Tentative (pre-finality)
-    * state never leaves via these endpoints; that channel is reserved for the sidecar GossipSub transport.
+  /** Nakamoto implementation: serve only at-or-below the finalized ordinal, read bytes from the on-disk checkpoint. Tentative
+    * (pre-finality) state never leaves via these endpoints; that channel is reserved for the sidecar GossipSub transport.
     */
   def nakamoto[F[_]: Async, S <: Snapshot, SI <: SnapshotInfo[_]](
     finalityGate: FinalityGate[F],

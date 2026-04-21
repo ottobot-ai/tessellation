@@ -4,8 +4,9 @@ import java.security.KeyPair
 
 import cats.Parallel
 import cats.data.NonEmptySet
-import cats.effect.kernel.{Async, Fiber, Ref}
-import cats.effect.std.{Queue, Random, Supervisor}
+import cats.effect.kernel._
+import cats.effect.std._
+import cats.effect.syntax.all._
 import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
@@ -140,21 +141,24 @@ object GlobalSnapshotConsensus {
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
     // Created in Services.make (hoisted so HTTP routes and stateChannelService can also publish).
     sidecarClient: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarClientAlgebra[F]
-  )(implicit supervisor: Supervisor[F], globalStateProofSelector: GlobalStateProofSelector): F[GlobalSnapshotConsensus[F]] =
+  )(implicit supervisor: Supervisor[F], globalStateProofSelector: GlobalStateProofSelector): Resource[F, GlobalSnapshotConsensus[F]] =
     for {
       globalStateChannelManager <- GlobalSnapshotStateChannelAcceptanceManager
         .make[F](stateChannelAllowanceLists, pullDelay = stateChannelPullDelay, purgeDelay = stateChannelPurgeDelay)
+        .toResource
 
       feeCalculator = FeeCalculator.make(feeConfigs)
 
-      undoJournal <- io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal.make[F](mptStore).map(Some(_))
+      undoJournal <- io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal.make[F](mptStore).map(Some(_)).toResource
 
       // Wrap getGlobalSnapshotByOrdinal with a chainStore fallback for Nakamoto mode.
       // snapshotStorage loses ordinal index files during fork switches; chainStore has the
       // full canonical chain. The Ref breaks the ordering dependency (chainStore is created later).
-      chainStoreForLookupRef <- cats.effect.kernel.Ref.of[F, Option[
-        io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.NakamotoChainStoreAlgebra[F]
-      ]](None)
+      chainStoreForLookupRef <- cats.effect.kernel.Ref
+        .of[F, Option[
+          io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.NakamotoChainStoreAlgebra[F]
+        ]](None)
+        .toResource
       getGlobalSnapshotByOrdinalWithFallback: (SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]) = {
         (ordinal: SnapshotOrdinal) =>
           getGlobalSnapshotByOrdinal(ordinal).flatMap {
@@ -203,16 +207,18 @@ object GlobalSnapshotConsensus {
           undoJournal
         )
 
-      consensusStorage <- ConsensusStorage.make[
-        F,
-        GlobalSnapshotEvent,
-        GlobalSnapshotKey,
-        GlobalSnapshotArtifact,
-        GlobalSnapshotContext,
-        GlobalSnapshotStatus,
-        GlobalConsensusOutcome,
-        GlobalConsensusKind
-      ](appConfig.snapshot.consensus)
+      consensusStorage <- ConsensusStorage
+        .make[
+          F,
+          GlobalSnapshotEvent,
+          GlobalSnapshotKey,
+          GlobalSnapshotArtifact,
+          GlobalSnapshotContext,
+          GlobalSnapshotStatus,
+          GlobalConsensusOutcome,
+          GlobalConsensusKind
+        ](appConfig.snapshot.consensus)
+        .toResource
 
       consensusFunctions =
         GlobalSnapshotConsensusFunctions.make[F](
@@ -260,7 +266,7 @@ object GlobalSnapshotConsensus {
         appConfig.snapshot.consensus.maxFacilitatorCount.map(_.value)
       )
 
-      peerQualityTracker <- PeerQualityTracker.make[F]
+      peerQualityTracker <- PeerQualityTracker.make[F].toResource
 
       tcaFilter = TrailingCommonAncestorFilter.make[F]
 
@@ -268,7 +274,7 @@ object GlobalSnapshotConsensus {
       nakamotoStateRef <- {
         val genesisEta = sys.env.get("NAKAMOTO_GENESIS_ETA").map(_.getBytes).getOrElse("tessellation-nakamoto-genesis".getBytes)
         Ref.of[F, NakamotoTriggerState](NakamotoTriggerState.initial(nakamotoGenesisTimeMs, genesisEta)).map(Some(_))
-      }
+      }.toResource
 
       stateCreator =
         GlobalSnapshotConsensusStateCreator.make(
@@ -303,35 +309,37 @@ object GlobalSnapshotConsensus {
       consensusClient = ConsensusClient.make[F, GlobalSnapshotKey, GlobalConsensusOutcome](client, session)
 
       directPushFn = ConsensusDirectSender.makeDirectPushFn(clusterStorage, consensusClient)
-      _ <- gossip.setDirectPushFn(directPushFn)
+      _ <- gossip.setDirectPushFn(directPushFn).toResource
 
       loop <-
-        ConsensusEventLoop.build[
-          F,
-          GlobalSnapshotEvent,
-          GlobalSnapshotKey,
-          GlobalSnapshotArtifact,
-          GlobalSnapshotContext,
-          GlobalSnapshotStatus,
-          GlobalConsensusOutcome,
-          GlobalConsensusKind
-        ](
-          selfId,
-          consensusStorage,
-          stateCreator,
-          stateUpdater,
-          stateAdvancer,
-          stateRemover,
-          consensusOps,
-          nodeStorage,
-          clusterStorage,
-          consensusFunctions,
-          consensusClient,
-          appConfig.snapshot.consensus,
-          facilitatorSelector,
-          peerQualityTracker,
-          nakamotoMode = true
-        )
+        ConsensusEventLoop
+          .build[
+            F,
+            GlobalSnapshotEvent,
+            GlobalSnapshotKey,
+            GlobalSnapshotArtifact,
+            GlobalSnapshotContext,
+            GlobalSnapshotStatus,
+            GlobalConsensusOutcome,
+            GlobalConsensusKind
+          ](
+            selfId,
+            consensusStorage,
+            stateCreator,
+            stateUpdater,
+            stateAdvancer,
+            stateRemover,
+            consensusOps,
+            nodeStorage,
+            clusterStorage,
+            consensusFunctions,
+            consensusClient,
+            appConfig.snapshot.consensus,
+            facilitatorSelector,
+            peerQualityTracker,
+            nakamotoMode = true
+          )
+          .toResource
 
       handler = GlobalConsensusHandler.make(loop.queue)
 
@@ -361,24 +369,33 @@ object GlobalSnapshotConsensus {
       slotsPerEpoch = sys.env.get("NAKAMOTO_SLOTS_PER_EPOCH").flatMap(_.toLongOption).getOrElse(60L)
       etaRotationSlots = sys.env.get("NAKAMOTO_ETA_ROTATION_SLOTS").flatMap(_.toLongOption).getOrElse(600L)
 
-      // Start the Nakamoto SnapshotLeaderLoop + sidecar bridge
+      // Start the Nakamoto SnapshotLeaderLoop + sidecar bridge.
+      //
+      // This block runs in the outer Resource context so the long-lived resources it creates
+      // (ChainSyncRequestQueue drainer, Dispatcher for the ChainSync gRPC server, the gRPC
+      // server itself) are released when the app Resource tree tears down, instead of being
+      // escaped via `.allocated` and leaked across test restarts / shutdown.
       _ <- {
 
         val pureGenesisTimeMs = nakamotoGenesisTimeMs
         for {
-          nakLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("NakamotoConsensus").pure[F]
-          _ <- nakLogger.info(
-            s"🔧 Nakamoto config: LDD(cutoff=${lddConfig.lddCutoff}, offset=${lddConfig.offset}, baseline=${lddConfig.baselineDifficulty}, amplitude=${lddConfig.amplitude}), etaRotation=${etaRotationSlots}s, slotsPerEpoch=${slotsPerEpoch}, genesisTime=${pureGenesisTimeMs}"
-          )
-          stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F]
-          _ <- stakeRegistry.updateValidators(seedlist.map(_.map(_.peerId)).getOrElse(Set(selfId)))
-          tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry)
+          nakLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("NakamotoConsensus").pure[F].toResource
+          _ <- nakLogger
+            .info(
+              s"🔧 Nakamoto config: LDD(cutoff=${lddConfig.lddCutoff}, offset=${lddConfig.offset}, baseline=${lddConfig.baselineDifficulty}, amplitude=${lddConfig.amplitude}), etaRotation=${etaRotationSlots}s, slotsPerEpoch=${slotsPerEpoch}, genesisTime=${pureGenesisTimeMs}"
+            )
+            .toResource
+          stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F].toResource
+          _ <- stakeRegistry.updateValidators(seedlist.map(_.map(_.peerId)).getOrElse(Set(selfId))).toResource
+          tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry).toResource
           // ChainSelection needs fetchParent — but chainStore needs ChainSelection.
           // Break the cycle: create chainStore first with a lazy fetchParent that
           // uses chainStore.tipFor once it's available.
-          chainStoreRef <- cats.effect.kernel.Ref.of[F, Option[
-            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.NakamotoChainStoreAlgebra[F]
-          ]](None)
+          chainStoreRef <- cats.effect.kernel.Ref
+            .of[F, Option[
+              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.NakamotoChainStoreAlgebra[F]
+            ]](None)
+            .toResource
           fetchParent = (tip: io.constellationnetwork.schema.nakamoto.ChainTip) =>
             chainStoreRef.get.flatMap {
               case Some(cs) => cs.tipFor(tip.parentHash)
@@ -387,8 +404,9 @@ object GlobalSnapshotConsensus {
           chainSelection = io.constellationnetwork.node.shared.domain.nakamoto.ChainSelection.make[F](tipTracker, fetchParent)
           chainStore <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore
             .make[F](globalSnapshotStorage, chainSelection, tipTracker, nakamotoFinalizedOrdinalRef)
-          _ <- chainStoreRef.set(Some(chainStore))
-          _ <- chainStoreForLookupRef.set(Some(chainStore))
+            .toResource
+          _ <- chainStoreRef.set(Some(chainStore)).toResource
+          _ <- chainStoreForLookupRef.set(Some(chainStore)).toResource
           // Seed chain store with the current head snapshot so gossip children can find their parent
           _ <- globalSnapshotStorage.head.flatMap {
             case Some((headSigned, headCtx)) =>
@@ -412,8 +430,8 @@ object GlobalSnapshotConsensus {
               }
             case None =>
               Async[F].unit
-          }
-          lastKnownSlotRef <- cats.effect.kernel.Ref.of[F, Option[Long]](None)
+          }.toResource
+          lastKnownSlotRef <- cats.effect.kernel.Ref.of[F, Option[Long]](None).toResource
           // Shared epoch state: VRF outputs from ALL sources accumulate here for eta rotation
           genesisEta = {
             // Genesis eta must be identical across all nodes — derive from a fixed domain string
@@ -429,20 +447,22 @@ object GlobalSnapshotConsensus {
             .of[F, io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState](
               io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState.initial(genesisEta)
             )
+            .toResource
           // Shared semaphore: serialize snapshot production and gossip processing
           // so each operation sees correct parent state (Bifrost uses same pattern)
-          snapshotSemaphore <- cats.effect.std.Semaphore[F](1)
-          productionGate <- io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate.make[F]
+          snapshotSemaphore <- cats.effect.std.Semaphore[F](1).toResource
+          productionGate <- io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate.make[F].toResource
           // Shared ChainSyncManager reference. Populated by NakamotoSyncDaemon after it constructs
           // its internal manager; read-through by the ChainSyncRequestQueue worker below so the
           // reactive walkback path piggybacks on existing hash-keyed dedup + fetch. No-op until bound.
-          sharedChainSyncManagerRef <- cats.effect.kernel.Ref.of[F, Option[
-            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncManager.ChainSyncManagerAlgebra[F]
-          ]](None)
+          sharedChainSyncManagerRef <- cats.effect.kernel.Ref
+            .of[F, Option[
+              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncManager.ChainSyncManagerAlgebra[F]
+            ]](None)
+            .toResource
           // Reactive ChainSync trigger for the finality walkback path (see
-          // ChainSyncRequestQueue docs for the full rationale). We use `.allocated` to escape
-          // the Resource into the for-comprehension; the fiber ends up sharing the app lifetime,
-          // which matches the surrounding `supervisor.supervise(...)` daemons.
+          // ChainSyncRequestQueue docs for the full rationale). Bound directly into the outer
+          // Resource — the drainer fiber is torn down cleanly on app shutdown.
           chainSyncRequestQueue <- {
             val workerFn = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncRequestQueue
               .walkbackWorker[F] _
@@ -456,8 +476,6 @@ object GlobalSnapshotConsensus {
               }
             io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncRequestQueue
               .make[F](reactiveWorker)
-              .allocated
-              .map(_._1) // discard the release; fiber lives with the app
           }
           // sidecarClient is now created in Services.make and passed in as a parameter so that
           // the HTTP state-channel route can publish metagraph binaries via the same gRPC channel.
@@ -467,116 +485,136 @@ object GlobalSnapshotConsensus {
           // to rumorQueue, where the existing GossipDaemon.consumeRumors pipeline validates and
           // dispatches them via the registered RumorHandlers — meaning BFT consensus messages,
           // Tessellation events, and any other rumor type ride sidecar transport for free.
-          _ <- gossip.setSidecarPublishFn(
-            io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
-              .publishFn[F](sidecarClient)
-          )
+          _ <- gossip
+            .setSidecarPublishFn(
+              io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
+                .publishFn[F](sidecarClient)
+            )
+            .toResource
           _ <- io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
             .receive[F](sidecarClient.channel, rumorQueue)
-          _ <- supervisor.supervise(
-            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
-              .run[F](
-                consensusFns = consensusFunctions,
-                snapshotStorage = globalSnapshotStorage,
-                chainStore = chainStore,
-                lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
-                lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
-                eventMempool = eventMempool,
-                sidecarClient = sidecarClient,
-                tipTracker = tipTracker,
-                stakeRegistry = stakeRegistry,
-                nodeStorage = nodeStorage,
-                keyPair = keyPair,
-                selfId = selfId,
-                lddConfig = lddConfig,
-                slotsPerEpoch = slotsPerEpoch,
-                etaRotationSlots = etaRotationSlots,
-                lastKnownSlotRef = lastKnownSlotRef,
-                epochStateRef = epochStateRef,
-                genesisTimeMs = pureGenesisTimeMs,
-                snapshotSemaphore = snapshotSemaphore,
-                productionGate = productionGate,
-                nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef,
-                chainSyncRequestQueue = chainSyncRequestQueue
-              )
-              .compile
-              .drain
-          )
+            .toResource
+          _ <- supervisor
+            .supervise(
+              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
+                .run[F](
+                  consensusFns = consensusFunctions,
+                  snapshotStorage = globalSnapshotStorage,
+                  chainStore = chainStore,
+                  lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
+                  lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
+                  eventMempool = eventMempool,
+                  sidecarClient = sidecarClient,
+                  tipTracker = tipTracker,
+                  stakeRegistry = stakeRegistry,
+                  nodeStorage = nodeStorage,
+                  keyPair = keyPair,
+                  selfId = selfId,
+                  lddConfig = lddConfig,
+                  slotsPerEpoch = slotsPerEpoch,
+                  etaRotationSlots = etaRotationSlots,
+                  lastKnownSlotRef = lastKnownSlotRef,
+                  epochStateRef = epochStateRef,
+                  genesisTimeMs = pureGenesisTimeMs,
+                  snapshotSemaphore = snapshotSemaphore,
+                  productionGate = productionGate,
+                  nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef,
+                  chainSyncRequestQueue = chainSyncRequestQueue
+                )
+                .compile
+                .drain
+            )
+            .toResource
           // Start Nakamoto metrics publisher (periodic chain-state gauges)
-          _ <- supervisor.supervise(
-            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoMetrics
-              .run[F](
-                chainStore = chainStore,
-                tipTracker = tipTracker,
-                genesisTimeMs = pureGenesisTimeMs
-              )
-              .compile
-              .drain
-          )
+          _ <- supervisor
+            .supervise(
+              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoMetrics
+                .run[F](
+                  chainStore = chainStore,
+                  tipTracker = tipTracker,
+                  genesisTimeMs = pureGenesisTimeMs
+                )
+                .compile
+                .drain
+            )
+            .toResource
           // Start ChainSyncInbound gRPC server — serves local chain data to peers
           // via the sidecar. The sidecar calls this server when peers request
           // snapshots or chain points for the ChainSync protocol.
-          chainSyncDispatcher <- cats.effect.std.Dispatcher.sequential[F].allocated.map(_._1)
+          chainSyncDispatcher <- Dispatcher.sequential[F]
           chainSyncServer = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncServer
             .make[F](chainStore, globalSnapshotStorage, chainSyncDispatcher)(
               implicitly,
               implicitly,
               scala.concurrent.ExecutionContext.global
             )
-          _ <- {
-            val grpcServer = io.grpc.ServerBuilder
-              .forPort(50053)
-              .addService(
-                io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar.ChainSyncInboundGrpc
-                  .bindService(chainSyncServer, scala.concurrent.ExecutionContext.global)
-              )
-              .build()
-            Async[F].delay(grpcServer.start()) >>
-              Async[F]
-                .delay(
-                  nakLogger.info("🔗 ChainSyncInbound gRPC server started on port 50053")
+          // Server lifecycle: start it on Resource acquire, shut it down cleanly on release so
+          // the listen socket is returned to the OS instead of being held by a leaked Java server.
+          // `shutdown()` requests graceful close; we give it a short grace period and then drop on
+          // timeout — we don't want a hung RPC from a misbehaving peer to block app teardown.
+          _ <- Resource.make(
+            Async[F].blocking {
+              val grpcServer = io.grpc.ServerBuilder
+                .forPort(50053)
+                .addService(
+                  io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar.ChainSyncInboundGrpc
+                    .bindService(chainSyncServer, scala.concurrent.ExecutionContext.global)
                 )
-                .flatten
-          }
+                .build()
+              grpcServer.start()
+              grpcServer
+            }
+          )(srv =>
+            Async[F].blocking {
+              srv.shutdown()
+              srv.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)
+              ()
+            }
+              .handleError(_ => ())
+          )
+          _ <- nakLogger.info("🔗 ChainSyncInbound gRPC server started on port 50053").toResource
 
           // Start NakamotoSyncDaemon: receives snapshots + attestations from gossip
-          _ <- supervisor.supervise(
-            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon
-              .run[F](
-                channel = sidecarClient.channel,
-                chainStore = chainStore,
-                nodeStorage = nodeStorage,
-                tipTracker = tipTracker,
-                stakeRegistry = stakeRegistry,
-                sidecarClient = sidecarClient,
-                selfId = selfId,
-                keyPair = keyPair,
-                lddConfig = lddConfig,
-                lastKnownSlotRef = lastKnownSlotRef,
-                epochStateRef = epochStateRef,
-                etaRotationSlots = etaRotationSlots,
-                consensusFns = consensusFunctions,
-                snapshotStorage = globalSnapshotStorage,
-                lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
-                lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
-                snapshotSemaphore = snapshotSemaphore,
-                productionGate = productionGate,
-                mptStore = mptStore,
-                eventMempool = eventMempool,
-                dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data")),
-                processMetagraphBinary = processMetagraphBinary,
-                sharedChainSyncManagerRef = sharedChainSyncManagerRef
-              )
-              .compile
-              .drain
-          )
+          _ <- supervisor
+            .supervise(
+              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon
+                .run[F](
+                  channel = sidecarClient.channel,
+                  chainStore = chainStore,
+                  nodeStorage = nodeStorage,
+                  tipTracker = tipTracker,
+                  stakeRegistry = stakeRegistry,
+                  sidecarClient = sidecarClient,
+                  selfId = selfId,
+                  keyPair = keyPair,
+                  lddConfig = lddConfig,
+                  lastKnownSlotRef = lastKnownSlotRef,
+                  epochStateRef = epochStateRef,
+                  etaRotationSlots = etaRotationSlots,
+                  consensusFns = consensusFunctions,
+                  snapshotStorage = globalSnapshotStorage,
+                  lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
+                  lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
+                  snapshotSemaphore = snapshotSemaphore,
+                  productionGate = productionGate,
+                  mptStore = mptStore,
+                  eventMempool = eventMempool,
+                  dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data")),
+                  processMetagraphBinary = processMetagraphBinary,
+                  sharedChainSyncManagerRef = sharedChainSyncManagerRef
+                )
+                .compile
+                .drain
+            )
+            .toResource
 
           // Check for persisted backfill cursor from a previous session (crash recovery).
           // If found, resume backfill with production paused until it completes.
           backfillDataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data"))
           existingCursor <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.BackfillDaemon
             .loadCursor[F](backfillDataDir)
-          _ <- existingCursor match {
+            .toResource
+          _ <- (existingCursor match {
             case Some(cursor) =>
               nakLogger.info(
                 s"🔄 Resuming backfill from crash: ordinal ${cursor.currentOrdinal} → ${cursor.targetOrdinal} " +
@@ -591,7 +629,7 @@ object GlobalSnapshotConsensus {
                   .void
             case None =>
               Async[F].unit
-          }
+          }).toResource
         } yield ()
       }
       consensus = new Consensus(

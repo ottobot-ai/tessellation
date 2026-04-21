@@ -129,7 +129,6 @@ object Main
           nodeShared.loggerBundle,
           nakamotoFinalizedOrdinalRef
         )
-        .asResource
 
       programs = Programs.make[IO, RunNakamoto](
         sharedPrograms,

@@ -3,7 +3,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 import java.security.KeyPair
 
 import cats.effect.kernel.{Async, Ref}
-import cats.effect.std.Semaphore
+import cats.effect.std.{Semaphore, Supervisor}
 import cats.syntax.all._
 
 import scala.concurrent.duration._
@@ -137,7 +137,7 @@ object NakamotoSyncDaemon {
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
     logger: org.typelevel.log4cats.Logger[F]
-  )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] =
+  )(implicit globalStateProofSelector: GlobalStateProofSelector, supervisor: Supervisor[F]): F[Unit] =
     pendingParentRef.modify { m =>
       val children = m.getOrElse(storedHash, List.empty)
       (m - storedHash, children)
@@ -217,7 +217,10 @@ object NakamotoSyncDaemon {
     // internally-constructed manager into this Ref once it's built; consumers
     // read-through it and no-op if the producer hasn't bound yet.
     sharedChainSyncManagerRef: Ref[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]]
-  )(implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector): fs2.Stream[F, Unit] = {
+  )(
+    implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
+    supervisor: Supervisor[F]
+  ): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
 
     // Buffer for gossip snapshots whose parent isn't in the chain store yet.
@@ -409,7 +412,7 @@ object NakamotoSyncDaemon {
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
     logger: org.typelevel.log4cats.Logger[F]
-  )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] =
+  )(implicit globalStateProofSelector: GlobalStateProofSelector, supervisor: Supervisor[F]): F[Unit] =
     for {
       _ <- logger.info(
         s"📥 Received snapshot ordinal=${snap.ordinal} slot=${snap.slot} parentSlot=${snap.parentSlot} from=${snap.producerId.toByteArray.take(4).map("%02x".format(_)).mkString}"
@@ -1095,7 +1098,7 @@ object NakamotoSyncDaemon {
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
     logger: org.typelevel.log4cats.Logger[F]
-  )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] = {
+  )(implicit globalStateProofSelector: GlobalStateProofSelector, supervisor: Supervisor[F]): F[Unit] = {
     val now = System.currentTimeMillis()
     stateRef.get.flatMap { state =>
       if (now - state.lastCatchUpAttemptMs < CatchUpCooldownMs) {
@@ -1179,8 +1182,10 @@ object NakamotoSyncDaemon {
                   completedChunks = Set.empty,
                   createdAtMs = System.currentTimeMillis()
                 )
-                Async[F]
-                  .start(
+                // Scope the backfill fiber to the app Supervisor so shutdown cancels cleanly.
+                // Previously a raw Async.start leaked a fiber that outlived the owning daemon.
+                supervisor
+                  .supervise(
                     BackfillDaemon
                       .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
                       .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
