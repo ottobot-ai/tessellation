@@ -5,6 +5,7 @@ import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake.DelegatedStakeAmount
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.node.UpdateNodeParametersOrdinal
 import io.constellationnetwork.schema.swap.{AllowSpendFee, AllowSpendOrdinal, SwapAmount}
 import io.constellationnetwork.schema.tokenLock.{TokenLockAmount, TokenLockFee, TokenLockOrdinal}
 import io.constellationnetwork.schema.transaction._
@@ -88,6 +89,9 @@ object NewtypeLongShapes {
 
   implicit val delegatedStakeAmountShape: NonNegLongNewtype[DelegatedStakeAmount] =
     NonNegLongNewtype.instance(DelegatedStakeAmount(_), _.value)
+
+  implicit val updateNodeParametersOrdinalShape: NonNegLongNewtype[UpdateNodeParametersOrdinal] =
+    NonNegLongNewtype.instance(UpdateNodeParametersOrdinal(_), _.value)
 
   // --- PosLong shapes -----------------------------------------------------
 
