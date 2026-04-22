@@ -12,30 +12,25 @@ import shapeless.{::, HNil}
 
 /** Canonical scodec codec for the MPT-as-primary key types:
   *   - `PartitionNamespace` — sealed ADT (5 variants) via 1-byte discriminator.
-  *   - `GlobalStateFieldId`  — sealed ADT (19 case objects) via 1-byte id.
-  *   - `GlobalStateKey`      — 4-field compound.
+  *   - `GlobalStateFieldId` — sealed ADT (19 case objects) via 1-byte id.
+  *   - `GlobalStateKey` — 4-field compound.
   *
   * PartitionNamespace discriminator layout:
-  *   - 0x00: HypergraphNamespace   (no body)
-  *   - 0x01: EmptyNamespace        (no body)
-  *   - 0x02: MetagraphNamespace    (+ Address)
-  *   - 0x03: AddressNamespace      (+ Address)
-  *   - 0x04: HashNamespace         (+ 32-byte Hash)
+  *   - 0x00: HypergraphNamespace (no body)
+  *   - 0x01: EmptyNamespace (no body)
+  *   - 0x02: MetagraphNamespace (+ Address)
+  *   - 0x03: AddressNamespace (+ Address)
+  *   - 0x04: HashNamespace (+ 32-byte Hash)
   *
-  * These are NEW discriminator bytes, unrelated to the existing
-  * `PartitionKeyType.toByte` (which is used by the hex-derivation path in
-  * `GlobalStateKey.toHex`). Keeping them separate means the two semantic
-  * concerns — "what shape of key does this namespace produce in the MPT"
-  * (PartitionKeyType) vs. "which ADT variant is this on the wire"
-  * (discriminator) — don't coincidentally collide. The two tag families
+  * These are NEW discriminator bytes, unrelated to the existing `PartitionKeyType.toByte` (which is used by the hex-derivation path in
+  * `GlobalStateKey.toHex`). Keeping them separate means the two semantic concerns — "what shape of key does this namespace produce in the
+  * MPT" (PartitionKeyType) vs. "which ADT variant is this on the wire" (discriminator) — don't coincidentally collide. The two tag families
   * must be allowed to evolve independently.
   *
-  * GlobalStateFieldId: 1-byte id via `fromInt`. 19 variants today (0..18);
-  * 1-byte headroom to 255 is ample. When the registry ever grows past 255,
-  * introduce `GlobalStateKeyCodecV2` with uint16.
+  * GlobalStateFieldId: 1-byte id via `fromInt`. 19 variants today (0..18); 1-byte headroom to 255 is ample. When the registry ever grows
+  * past 255, introduce `GlobalStateKeyCodecV2` with uint16.
   *
-  * Consensus contract: FROZEN. Discriminator bytes, field-id width, and
-  * field-order in `GlobalStateKey` are all persistent — every MPT key
+  * Consensus contract: FROZEN. Discriminator bytes, field-id width, and field-order in `GlobalStateKey` are all persistent — every MPT key
   * written by the scodec era depends on them being stable.
   *
   * First sum-type codec: unlocks MPT-as-primary write path.
@@ -92,8 +87,9 @@ object GlobalStateKeyCodec {
       partitionNamespaceCodec ::
       partitionNamespaceCodec)
       .xmap[GlobalStateKey](
-        { case net :: fid :: contract :: user :: HNil =>
-          GlobalStateKey(net, fid, contract, user)
+        {
+          case net :: fid :: contract :: user :: HNil =>
+            GlobalStateKey(net, fid, contract, user)
         },
         k => k.networkNamespace :: k.fieldId :: k.contractNamespace :: k.userNamespace :: HNil
       )
