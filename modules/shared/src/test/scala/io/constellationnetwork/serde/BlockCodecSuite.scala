@@ -23,19 +23,16 @@ import weaver.FunSuite
 
 /** Round-trip + compositional byte-layout suite for `Block`.
   *
-  * Block composes two collection codecs (`NonEmptyList[BlockReference]` +
-  * `NonEmptySet[Signed[Transaction]]`) and the parameterized `Signed[_]` wrapper.
+  * Block composes two collection codecs (`NonEmptyList[BlockReference]` + `NonEmptySet[Signed[Transaction]]`) and the parameterized
+  * `Signed[_]` wrapper.
   *
-  * Rather than a hand-authored hex golden (which would require manual
-  * arithmetic over a `Signed[Transaction]`'s proof bytes), we assert that
-  * the encoded block equals the concatenation of the already-goldened
-  * primitive encodings:
+  * Rather than a hand-authored hex golden (which would require manual arithmetic over a `Signed[Transaction]`'s proof bytes), we assert
+  * that the encoded block equals the concatenation of the already-goldened primitive encodings:
   *
-  *   `encode(Block) == [uint16 parentCount] ++ encode(parents...) ++ [uint16 txCount] ++ encode(sortedTxs...)`
+  * `encode(Block) == [uint16 parentCount] ++ encode(parents...) ++ [uint16 txCount] ++ encode(sortedTxs...)`
   *
-  * That decomposes the structural contract onto codecs that already have
-  * strict byte goldens (`BlockReference-scodec-v1`, `Transaction-scodec-v1`,
-  * and the `Signed[_]` wire layout exercised transitively).
+  * That decomposes the structural contract onto codecs that already have strict byte goldens (`BlockReference-scodec-v1`,
+  * `Transaction-scodec-v1`, and the `Signed[_]` wire layout exercised transitively).
   */
 object BlockCodecSuite extends FunSuite {
 
@@ -88,9 +85,9 @@ object BlockCodecSuite extends FunSuite {
     val parentBytesA = encodePrimitive(parentA, blockReferenceCodec)
     val parentBytesB = encodePrimitive(parentB, blockReferenceCodec)
 
-    expect(count == ByteVector.fromValidHex("0002")) and
-      expect(bytes.slice(2L, 2L + 40L) == parentBytesA) and
-      expect(bytes.slice(2L + 40L, 2L + 80L) == parentBytesB)
+    expect(count == ByteVector.fromValidHex("0002"))
+      .and(expect(bytes.slice(2L, 2L + 40L) == parentBytesA))
+      .and(expect(bytes.slice(2L + 40L, 2L + 80L) == parentBytesB))
   }
 
   test("Block transactions section begins right after parents with uint16 tx-count") {

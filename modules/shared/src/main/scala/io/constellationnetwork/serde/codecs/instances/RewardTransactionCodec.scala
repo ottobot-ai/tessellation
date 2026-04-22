@@ -11,11 +11,10 @@ import shapeless.{::, HNil}
 /** Canonical scodec codec for `RewardTransaction` — `(destination: Address, amount: TransactionAmount)`.
   *
   * Wire layout:
-  *   - destination : Address           (uint8 length + ASCII, 41 or 52 bytes)
-  *   - amount      : TransactionAmount (8 bytes big-endian PosLong)
+  *   - destination : Address (uint8 length + ASCII, 41 or 52 bytes)
+  *   - amount : TransactionAmount (8 bytes big-endian PosLong)
   *
-  * Field order matches the case class declaration. Total size varies only
-  * with address length (41 or 52 bytes), so: 49 or 60 bytes total.
+  * Field order matches the case class declaration. Total size varies only with address length (41 or 52 bytes), so: 49 or 60 bytes total.
   *
   * Consensus contract: FROZEN. Any schema evolution requires a v2 era.
   */

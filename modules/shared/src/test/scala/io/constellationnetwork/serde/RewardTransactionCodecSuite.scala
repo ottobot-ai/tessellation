@@ -11,8 +11,8 @@ import weaver.FunSuite
 
 /** Golden + round-trip suite for `RewardTransaction` — `(Address, TransactionAmount)`.
   *
-  * A minimal 2-field compound: length-prefixed address (41 or 52 bytes) followed by
-  * an 8-byte PosLong amount. The golden uses a 40-char address so the total is 49 bytes.
+  * A minimal 2-field compound: length-prefixed address (41 or 52 bytes) followed by an 8-byte PosLong amount. The golden uses a 40-char
+  * address so the total is 49 bytes.
   */
 object RewardTransactionCodecSuite extends FunSuite {
 

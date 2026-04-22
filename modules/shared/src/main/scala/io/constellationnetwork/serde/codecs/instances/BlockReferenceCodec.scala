@@ -13,12 +13,11 @@ import shapeless.{::, HNil}
 /** Canonical scodec codec for `BlockReference` — `(height: Height, hash: ProofsHash)`.
   *
   * Wire layout (40 bytes, fully fixed-width):
-  *   - bytes 0..7  : height (Height as 8-byte big-endian NonNegLong)
-  *   - bytes 8..39 : hash   (ProofsHash as 32 raw bytes)
+  *   - bytes 0..7 : height (Height as 8-byte big-endian NonNegLong)
+  *   - bytes 8..39 : hash (ProofsHash as 32 raw bytes)
   *
-  * Matches `TransactionReference`'s layout pattern (ordinal + hash). Fully
-  * fixed-width so byte-offset random access works for any consumer that
-  * wants to peek at the hash without decoding height.
+  * Matches `TransactionReference`'s layout pattern (ordinal + hash). Fully fixed-width so byte-offset random access works for any consumer
+  * that wants to peek at the hash without decoding height.
   *
   * Golden: `BlockReference-scodec-v1.hex`.
   */

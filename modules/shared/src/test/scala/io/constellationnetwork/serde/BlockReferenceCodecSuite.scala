@@ -12,9 +12,8 @@ import weaver.FunSuite
 
 /** Golden + round-trip suite for `BlockReference` — `(Height, ProofsHash)`.
   *
-  * Fixed 40-byte layout: `[height:8][hash:32]`.
-  * Byte-offset random access is the key invariant for any storage record
-  * that wants to peek at the hash without decoding height.
+  * Fixed 40-byte layout: `[height:8][hash:32]`. Byte-offset random access is the key invariant for any storage record that wants to peek at
+  * the hash without decoding height.
   */
 object BlockReferenceCodecSuite extends FunSuite {
 
@@ -51,8 +50,7 @@ object BlockReferenceCodecSuite extends FunSuite {
   test("hash bytes occupy bytes 8..39 (byte-offset random access)") {
     val encoded = sample.immutableBytes
     val hashSlice = encoded.drop(8)
-    expect(hashSlice == ByteVector.fromValidHex(sampleHashHex)) and
-      expect(hashSlice.length == 32L)
+    expect(hashSlice == ByteVector.fromValidHex(sampleHashHex)).and(expect(hashSlice.length == 32L))
   }
 
   test("round-trip preserves edge values") {

@@ -17,24 +17,19 @@ import shapeless.{::, HNil}
 /** Canonical scodec codec for `Block` — the L1 consensus unit.
   *
   * Wire layout:
-  *   - parents      : NonEmptyList[BlockReference]      (uint16 count + 40 bytes each, insertion order)
-  *   - transactions : NonEmptySet[Signed[Transaction]]  (uint16 count + sorted elements)
+  *   - parents : NonEmptyList[BlockReference] (uint16 count + 40 bytes each, insertion order)
+  *   - transactions : NonEmptySet[Signed[Transaction]] (uint16 count + sorted elements)
   *
-  * Determinism: parent order is a first-class part of the block's identity
-  * (preserved as written), but transactions are a set — the encode path sorts
-  * them via `Order[Signed[Transaction]]` (derevo-derived from the case-class
-  * field order). Two nodes serializing the same `Block` must produce
-  * bit-identical bytes; the `NonEmptySetCodec` sorted encode path guarantees
-  * that for the transactions, and `NonEmptyList` preserves insertion order
-  * which the consensus protocol already treats as canonical.
+  * Determinism: parent order is a first-class part of the block's identity (preserved as written), but transactions are a set — the encode
+  * path sorts them via `Order[Signed[Transaction]]` (derevo-derived from the case-class field order). Two nodes serializing the same
+  * `Block` must produce bit-identical bytes; the `NonEmptySetCodec` sorted encode path guarantees that for the transactions, and
+  * `NonEmptyList` preserves insertion order which the consensus protocol already treats as canonical.
   *
-  * Composition: this is the first codec that exercises both collection
-  * helpers (`NonEmptyListCodec` + `NonEmptySetCodec`) AND the parameterized
-  * `Signed[_]` wrapper, so it's the end-to-end test of the implicit chain.
+  * Composition: this is the first codec that exercises both collection helpers (`NonEmptyListCodec` + `NonEmptySetCodec`) AND the
+  * parameterized `Signed[_]` wrapper, so it's the end-to-end test of the implicit chain.
   *
-  * Consensus contract: FROZEN. Parents first, transactions second. Changing
-  * order, prefix width, or the transaction sort order breaks every historical
-  * block's hash and therefore every signature covering it.
+  * Consensus contract: FROZEN. Parents first, transactions second. Changing order, prefix width, or the transaction sort order breaks every
+  * historical block's hash and therefore every signature covering it.
   */
 object BlockCodec {
 
