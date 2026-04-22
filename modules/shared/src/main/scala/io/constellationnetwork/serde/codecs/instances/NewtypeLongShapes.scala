@@ -1,9 +1,12 @@
 package io.constellationnetwork.serde.codecs.instances
 
+import io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSnapshotSyncOrdinal
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.balance.{Amount, Balance}
+import io.constellationnetwork.schema.currencyMessage.MessageOrdinal
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeAmount, DelegatedStakeFee, DelegatedStakeOrdinal}
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.generation.Generation
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.node.UpdateNodeParametersOrdinal
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralAmount, NodeCollateralFee, NodeCollateralOrdinal}
@@ -109,6 +112,12 @@ object NewtypeLongShapes {
   implicit val nodeCollateralAmountShape: NonNegLongNewtype[NodeCollateralAmount] =
     NonNegLongNewtype.instance(NodeCollateralAmount(_), _.value)
 
+  implicit val messageOrdinalShape: NonNegLongNewtype[MessageOrdinal] =
+    NonNegLongNewtype.instance(MessageOrdinal(_), _.value)
+
+  implicit val globalSnapshotSyncOrdinalShape: NonNegLongNewtype[GlobalSnapshotSyncOrdinal] =
+    NonNegLongNewtype.instance(GlobalSnapshotSyncOrdinal(_), _.value)
+
   // --- PosLong shapes -----------------------------------------------------
 
   implicit val transactionAmountShape: PosLongNewtype[TransactionAmount] =
@@ -119,6 +128,9 @@ object NewtypeLongShapes {
 
   implicit val swapAmountShape: PosLongNewtype[SwapAmount] =
     PosLongNewtype.instance(SwapAmount(_), _.value)
+
+  implicit val generationShape: PosLongNewtype[Generation] =
+    PosLongNewtype.instance(Generation(_), _.value)
 
   // --- Plain Long shapes --------------------------------------------------
 
