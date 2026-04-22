@@ -7,10 +7,8 @@ import scodec.codecs.int64
 
 /** Evidence that `T` is a wrapper around a single signed `Long`.
   *
-  * Unlike the refined-Long shapes, there's no validation on decode — a
-  * signed `Long` accepts any 8 bytes. The only type currently fitting is
-  * `TransactionSalt`, which is a random nonce and carries no numeric
-  * invariant.
+  * Unlike the refined-Long shapes, there's no validation on decode — a signed `Long` accepts any 8 bytes. The only type currently fitting
+  * is `TransactionSalt`, which is a random nonce and carries no numeric invariant.
   *
   * Wire format: 8 bytes big-endian int64. Fixed-width, random-access friendly.
   */

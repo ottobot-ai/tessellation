@@ -3,6 +3,7 @@ package io.constellationnetwork.serde.codecs.instances
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.transaction._
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.{LongNewtype, NonNegLongNewtype, PosLongNewtype}
@@ -63,6 +64,12 @@ object NewtypeLongShapes {
 
   implicit val transactionFeeShape: NonNegLongNewtype[TransactionFee] =
     NonNegLongNewtype.instance(TransactionFee(_), _.value)
+
+  implicit val heightShape: NonNegLongNewtype[Height] =
+    NonNegLongNewtype.instance(Height(_), _.value)
+
+  implicit val subHeightShape: NonNegLongNewtype[SubHeight] =
+    NonNegLongNewtype.instance(SubHeight(_), _.value)
 
   // --- PosLong shapes -----------------------------------------------------
 

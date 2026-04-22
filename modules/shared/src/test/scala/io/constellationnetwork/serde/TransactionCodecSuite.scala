@@ -9,13 +9,10 @@ import io.constellationnetwork.serde.implicits._
 import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
 import weaver.FunSuite
 
-/** Golden + round-trip suite for `Transaction` — the first "real" multi-field
-  * consensus type in the scodec library.
+/** Golden + round-trip suite for `Transaction` — the first "real" multi-field consensus type in the scodec library.
   *
-  * Covers the full wire layout (six distinct fields including both
-  * fixed-width and variable-width components) and exercises the field-order
-  * invariant: swapping two fields of the same type (source ↔ destination)
-  * must produce different bytes.
+  * Covers the full wire layout (six distinct fields including both fixed-width and variable-width components) and exercises the field-order
+  * invariant: swapping two fields of the same type (source ↔ destination) must produce different bytes.
   */
 object TransactionCodecSuite extends FunSuite {
 
@@ -66,7 +63,7 @@ object TransactionCodecSuite extends FunSuite {
     val otherSalt = sample.copy(salt = TransactionSalt(0L))
     val a = sample.immutableBytes
     val b = otherSalt.immutableBytes
-    expect(a != b) and expect(a.length == b.length)
+    expect(a != b).and(expect(a.length == b.length))
   }
 
   test("Changing a parent hash byte produces different bytes in the hash region") {
@@ -74,9 +71,7 @@ object TransactionCodecSuite extends FunSuite {
     val a = sample.immutableBytes
     val b = altered.immutableBytes
     // They differ in the parent.hash region: bytes 106..137 (32 bytes).
-    expect(a != b) and
-      expect(a.length == b.length) and
-      expect(a.take(106) == b.take(106)) // everything before the hash matches
+    expect(a != b).and(expect(a.length == b.length)).and(expect(a.take(106) == b.take(106))) // everything before the hash matches
   }
 
   test("Transaction bytes end with the salt (last 8 bytes)") {

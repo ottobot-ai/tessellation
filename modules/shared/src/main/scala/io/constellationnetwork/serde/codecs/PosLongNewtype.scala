@@ -5,16 +5,13 @@ import io.constellationnetwork.serde.ImmutableCodec
 import eu.timepit.refined.types.numeric.PosLong
 import scodec.Codec
 
-/** Evidence that `T` is a wrapper around a single `PosLong`. Parallel to
-  * `NonNegLongNewtype` — same shape, different refinement predicate (> 0
-  * rather than ≥ 0).
+/** Evidence that `T` is a wrapper around a single `PosLong`. Parallel to `NonNegLongNewtype` — same shape, different refinement predicate
+  * (> 0 rather than ≥ 0).
   *
-  * Types that fit: `TransactionAmount`, `SwapAmount`, `TokenLockAmount`,
-  * `Counter`, and any future monetary-amount-like newtype that must be
-  * strictly positive.
+  * Types that fit: `TransactionAmount`, `SwapAmount`, `TokenLockAmount`, `Counter`, and any future monetary-amount-like newtype that must
+  * be strictly positive.
   *
-  * Refactor safety identical to `NonNegLongNewtype`: the one-line
-  * registration with `T(_)` stops compiling if `T` gains a second field.
+  * Refactor safety identical to `NonNegLongNewtype`: the one-line registration with `T(_)` stops compiling if `T` gains a second field.
   */
 trait PosLongNewtype[T] {
   def wrap(n: PosLong): T

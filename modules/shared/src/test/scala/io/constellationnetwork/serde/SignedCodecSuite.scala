@@ -8,7 +8,6 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
-import io.constellationnetwork.serde.codecs.instances.SignatureCodecs._
 import io.constellationnetwork.serde.codecs.instances.SignedCodec._
 import io.constellationnetwork.serde.implicits._
 
