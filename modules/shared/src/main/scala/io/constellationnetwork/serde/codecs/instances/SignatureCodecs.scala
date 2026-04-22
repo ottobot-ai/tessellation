@@ -13,20 +13,15 @@ import shapeless.{::, HNil}
   *   - `Signature` — newtype wrapping `Hex` (signature bytes as hex string).
   *   - `SignatureProof` — `(Id, Signature)` compound.
   *
-  * Wire format for `Id` / `Signature`: delegates to the `Hex` codec's
-  * length-prefixed raw-bytes encoding. Different pubkey/signature schemes
-  * produce different byte lengths (secp256k1 uncompressed pubkey: 64 bytes;
-  * ECDSA DER signature: up to ~72 bytes), which is why length-prefix rather
-  * than fixed-width.
+  * Wire format for `Id` / `Signature`: delegates to the `Hex` codec's length-prefixed raw-bytes encoding. Different pubkey/signature
+  * schemes produce different byte lengths (secp256k1 uncompressed pubkey: 64 bytes; ECDSA DER signature: up to ~72 bytes), which is why
+  * length-prefix rather than fixed-width.
   *
-  * No generic `HexNewtype[T]` shape typeclass here — unlike
-  * `NonNegLongNewtype`, there are only two hex-based newtypes (Id, Signature)
-  * and their codecs are one-line `xmap` calls anyway. Extract a shape helper
-  * only when a third hex newtype appears.
+  * No generic `HexNewtype[T]` shape typeclass here — unlike `NonNegLongNewtype`, there are only two hex-based newtypes (Id, Signature) and
+  * their codecs are one-line `xmap` calls anyway. Extract a shape helper only when a third hex newtype appears.
   *
-  * Consensus contract: FROZEN. `Id` and `Signature` both serialize via
-  * `HexContentCodec`; any change to that helper's wire format is a consensus
-  * break for these types.
+  * Consensus contract: FROZEN. `Id` and `Signature` both serialize via `HexContentCodec`; any change to that helper's wire format is a
+  * consensus break for these types.
   */
 object SignatureCodecs {
 
@@ -55,8 +50,8 @@ object SignatureCodecs {
     ImmutableCodec.fromScodecCodec(signatureProofCodec)
 }
 
-/** Hex newtype unwrapper — needed because `Id` is `@newtype`, so extracting
-  * `.hex` requires import of `newtype.ops`. Kept in the codec file for locality.
+/** Hex newtype unwrapper — needed because `Id` is `@newtype`, so extracting `.hex` requires import of `newtype.ops`. Kept in the codec file
+  * for locality.
   */
 private[instances] object SignatureCodecsNewtypeOps {
   import io.estatico.newtype.ops._

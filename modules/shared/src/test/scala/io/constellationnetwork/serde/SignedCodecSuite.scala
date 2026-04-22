@@ -16,15 +16,12 @@ import eu.timepit.refined.types.numeric.NonNegLong
 import scodec.bits.ByteVector
 import weaver.FunSuite
 
-/** Round-trip + wire-format tests for `Signed[T]` — the parameterized universal
-  * signed-envelope.
+/** Round-trip + wire-format tests for `Signed[T]` — the parameterized universal signed-envelope.
   *
   * Two dimensions of coverage:
-  *   - Implicit resolution actually produces `Codec[Signed[T]]` for a `T` that
-  *     has a `Codec[T]` in scope (via the newtype shape derivation for Balance).
-  *     This is the first typeclass-dispatch test for the library.
-  *   - Wire layout: value bytes then proofs with uint16 count prefix, proofs
-  *     themselves being `(Id, Signature)` pairs with each hex field
+  *   - Implicit resolution actually produces `Codec[Signed[T]]` for a `T` that has a `Codec[T]` in scope (via the newtype shape derivation
+  *     for Balance). This is the first typeclass-dispatch test for the library.
+  *   - Wire layout: value bytes then proofs with uint16 count prefix, proofs themselves being `(Id, Signature)` pairs with each hex field
   *     length-prefixed.
   */
 object SignedCodecSuite extends FunSuite {

@@ -40,6 +40,14 @@ object NonNegLongNewtype {
       def unwrap(t: T): NonNegLong = unwrapFn(t)
     }
 
+  // Note on shapeless `Generic` derivation: a `deriveFromGeneric` helper
+  // using `Generic.Aux[T, NonNegLong :: HNil]` was tried and works for plain
+  // case classes (e.g. `SnapshotOrdinal`), but `@newtype`-annotated classes
+  // (Balance, Amount, EpochProgress, and the rest) hide their structure from
+  // `Generic`. With 7/8 of our newtype-over-Long targets being `@newtype`, the
+  // boilerplate savings weren't worth the inconsistency of two registration
+  // patterns. Reverted to explicit `.instance(wrap, unwrap)` for all.
+
   /** Derived `Codec[T]`: scodec codec for any type with a `NonNegLongNewtype` witness. Wire format: 8 bytes big-endian non-negative int64 —
     * identical to the underlying `NonNegLong`'s canonical bytes, no discriminator, no tag.
     */

@@ -3,9 +3,9 @@ package io.constellationnetwork.serde.codecs.instances
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.transaction.TransactionOrdinal
+import io.constellationnetwork.schema.transaction._
 import io.constellationnetwork.serde.ImmutableCodec
-import io.constellationnetwork.serde.codecs.NonNegLongNewtype
+import io.constellationnetwork.serde.codecs.{LongNewtype, NonNegLongNewtype, PosLongNewtype}
 
 import scodec.Codec
 
@@ -34,6 +34,18 @@ object NewtypeLongShapes {
   implicit def nonNegLongShapeImmutableCodec[T](implicit ev: NonNegLongNewtype[T]): ImmutableCodec[T] =
     NonNegLongNewtype.derivedImmutableCodec[T]
 
+  implicit def posLongShapeCodec[T](implicit ev: PosLongNewtype[T]): Codec[T] =
+    PosLongNewtype.derivedCodec[T]
+  implicit def posLongShapeImmutableCodec[T](implicit ev: PosLongNewtype[T]): ImmutableCodec[T] =
+    PosLongNewtype.derivedImmutableCodec[T]
+
+  implicit def longShapeCodec[T](implicit ev: LongNewtype[T]): Codec[T] =
+    LongNewtype.derivedCodec[T]
+  implicit def longShapeImmutableCodec[T](implicit ev: LongNewtype[T]): ImmutableCodec[T] =
+    LongNewtype.derivedImmutableCodec[T]
+
+  // --- NonNegLong shapes --------------------------------------------------
+
   implicit val balanceShape: NonNegLongNewtype[Balance] =
     NonNegLongNewtype.instance(Balance(_), _.value)
 
@@ -48,4 +60,17 @@ object NewtypeLongShapes {
 
   implicit val transactionOrdinalShape: NonNegLongNewtype[TransactionOrdinal] =
     NonNegLongNewtype.instance(TransactionOrdinal(_), _.value)
+
+  implicit val transactionFeeShape: NonNegLongNewtype[TransactionFee] =
+    NonNegLongNewtype.instance(TransactionFee(_), _.value)
+
+  // --- PosLong shapes -----------------------------------------------------
+
+  implicit val transactionAmountShape: PosLongNewtype[TransactionAmount] =
+    PosLongNewtype.instance(TransactionAmount(_), _.value)
+
+  // --- Plain Long shapes --------------------------------------------------
+
+  implicit val transactionSaltShape: LongNewtype[TransactionSalt] =
+    LongNewtype.instance(TransactionSalt(_), _.value)
 }
