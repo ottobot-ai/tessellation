@@ -33,8 +33,8 @@ import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for the currency-snapshot family:
   *   - `CurrencyIncrementalSnapshotV1` (11 fields, legacy).
-  *   - `CurrencyIncrementalSnapshot`  (17 fields, current).
-  *   - `CurrencySnapshot`             (12 fields, full-snapshot variant).
+  *   - `CurrencyIncrementalSnapshot` (17 fields, current).
+  *   - `CurrencySnapshot` (12 fields, full-snapshot variant).
   *
   * Closing the last big dependency before `GlobalSnapshotInfo`.
   */
@@ -69,21 +69,23 @@ object CurrencySnapshotCodecs {
       optDataApplicationV1Codec ::
       versionCodec)
       .xmap[CurrencyIncrementalSnapshotV1](
-        { case o :: h :: sh :: lsh :: blks :: rws :: tp :: sp :: ep :: da :: v :: HNil =>
-          CurrencyIncrementalSnapshotV1(o, h, sh, lsh, blks, rws, tp, sp, ep, da, v)
+        {
+          case o :: h :: sh :: lsh :: blks :: rws :: tp :: sp :: ep :: da :: v :: HNil =>
+            CurrencyIncrementalSnapshotV1(o, h, sh, lsh, blks, rws, tp, sp, ep, da, v)
         },
-        s => s.ordinal ::
-          s.height ::
-          s.subHeight ::
-          s.lastSnapshotHash ::
-          s.blocks ::
-          s.rewards ::
-          s.tips ::
-          s.stateProof ::
-          s.epochProgress ::
-          s.dataApplication ::
-          s.version ::
-          HNil
+        s =>
+          s.ordinal ::
+            s.height ::
+            s.subHeight ::
+            s.lastSnapshotHash ::
+            s.blocks ::
+            s.rewards ::
+            s.tips ::
+            s.stateProof ::
+            s.epochProgress ::
+            s.dataApplication ::
+            s.version ::
+            HNil
       )
 
   implicit val currencyIncrementalSnapshotV1ImmutableCodec: ImmutableCodec[CurrencyIncrementalSnapshotV1] =
@@ -125,33 +127,51 @@ object CurrencySnapshotCodecs {
       optGlobalSyncViewCodec ::
       versionCodec)
       .xmap[CurrencyIncrementalSnapshot](
-        { case o :: h :: sh :: lsh :: blks :: rws :: tp :: sp :: ep ::
+        {
+          case o :: h :: sh :: lsh :: blks :: rws :: tp :: sp :: ep ::
               da :: msgs :: syncs :: fees :: artifacts :: asb :: tlb ::
               gsv :: v :: HNil =>
-          CurrencyIncrementalSnapshot(
-            o, h, sh, lsh, blks, rws, tp, sp, ep,
-            da, msgs, syncs, fees, artifacts, asb, tlb, gsv, v
-          )
+            CurrencyIncrementalSnapshot(
+              o,
+              h,
+              sh,
+              lsh,
+              blks,
+              rws,
+              tp,
+              sp,
+              ep,
+              da,
+              msgs,
+              syncs,
+              fees,
+              artifacts,
+              asb,
+              tlb,
+              gsv,
+              v
+            )
         },
-        s => s.ordinal ::
-          s.height ::
-          s.subHeight ::
-          s.lastSnapshotHash ::
-          s.blocks ::
-          s.rewards ::
-          s.tips ::
-          s.stateProof ::
-          s.epochProgress ::
-          s.dataApplication ::
-          s.messages ::
-          s.globalSnapshotSyncs ::
-          s.feeTransactions ::
-          s.artifacts ::
-          s.allowSpendBlocks ::
-          s.tokenLockBlocks ::
-          s.globalSyncView ::
-          s.version ::
-          HNil
+        s =>
+          s.ordinal ::
+            s.height ::
+            s.subHeight ::
+            s.lastSnapshotHash ::
+            s.blocks ::
+            s.rewards ::
+            s.tips ::
+            s.stateProof ::
+            s.epochProgress ::
+            s.dataApplication ::
+            s.messages ::
+            s.globalSnapshotSyncs ::
+            s.feeTransactions ::
+            s.artifacts ::
+            s.allowSpendBlocks ::
+            s.tokenLockBlocks ::
+            s.globalSyncView ::
+            s.version ::
+            HNil
       )
 
   implicit val currencyIncrementalSnapshotImmutableCodec: ImmutableCodec[CurrencyIncrementalSnapshot] =
@@ -173,22 +193,24 @@ object CurrencySnapshotCodecs {
       optGlobalSyncViewCodec ::
       versionCodec)
       .xmap[CurrencySnapshot](
-        { case o :: h :: sh :: lsh :: blks :: rws :: tp :: info :: ep :: da :: gsv :: v :: HNil =>
-          CurrencySnapshot(o, h, sh, lsh, blks, rws, tp, info, ep, da, gsv, v)
+        {
+          case o :: h :: sh :: lsh :: blks :: rws :: tp :: info :: ep :: da :: gsv :: v :: HNil =>
+            CurrencySnapshot(o, h, sh, lsh, blks, rws, tp, info, ep, da, gsv, v)
         },
-        s => s.ordinal ::
-          s.height ::
-          s.subHeight ::
-          s.lastSnapshotHash ::
-          s.blocks ::
-          s.rewards ::
-          s.tips ::
-          s.info ::
-          s.epochProgress ::
-          s.dataApplication ::
-          s.globalSyncView ::
-          s.version ::
-          HNil
+        s =>
+          s.ordinal ::
+            s.height ::
+            s.subHeight ::
+            s.lastSnapshotHash ::
+            s.blocks ::
+            s.rewards ::
+            s.tips ::
+            s.info ::
+            s.epochProgress ::
+            s.dataApplication ::
+            s.globalSyncView ::
+            s.version ::
+            HNil
       )
 
   implicit val currencySnapshotImmutableCodec: ImmutableCodec[CurrencySnapshot] =

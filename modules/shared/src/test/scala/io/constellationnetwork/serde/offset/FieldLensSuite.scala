@@ -24,10 +24,10 @@ object ReferenceLensSuite extends FunSuite {
     val sample = BlockReference(Height(NonNegLong.unsafeFrom(42L)), ProofsHash(hashA))
     val bytes = BlockReferenceCodec.codec.encode(sample).require.toByteVector
 
-    expect(BlockReferenceLenses.height.read(bytes).require == sample.height) and
-      expect(BlockReferenceLenses.hash.read(bytes).require == sample.hash) and
-      expect(BlockReferenceLenses.height.offset == 0L) and
-      expect(BlockReferenceLenses.hash.offset == 8L)
+    expect(BlockReferenceLenses.height.read(bytes).require == sample.height)
+      .and(expect(BlockReferenceLenses.hash.read(bytes).require == sample.hash))
+      .and(expect(BlockReferenceLenses.height.offset == 0L))
+      .and(expect(BlockReferenceLenses.hash.offset == 8L))
   }
 
   test("BlockReferenceLenses rejects truncated bytes") {
@@ -43,8 +43,8 @@ object ReferenceLensSuite extends FunSuite {
     val sample = TransactionReference(TransactionOrdinal(NonNegLong.unsafeFrom(99L)), Hash(hashB))
     val bytes = TransactionReferenceCodec.codec.encode(sample).require.toByteVector
 
-    expect(TransactionReferenceLenses.ordinal.read(bytes).require == sample.ordinal) and
-      expect(TransactionReferenceLenses.hash.read(bytes).require == sample.hash)
+    expect(TransactionReferenceLenses.ordinal.read(bytes).require == sample.ordinal)
+      .and(expect(TransactionReferenceLenses.hash.read(bytes).require == sample.hash))
   }
 
   // ---- AllowSpendReference -----------------------------------------------
@@ -53,8 +53,8 @@ object ReferenceLensSuite extends FunSuite {
     val sample = AllowSpendReference(AllowSpendOrdinal(NonNegLong.unsafeFrom(5L)), Hash(hashA))
     val bytes = AllowSpendReferenceCodec.codec.encode(sample).require.toByteVector
 
-    expect(AllowSpendReferenceLenses.ordinal.read(bytes).require == sample.ordinal) and
-      expect(AllowSpendReferenceLenses.hash.read(bytes).require == sample.hash)
+    expect(AllowSpendReferenceLenses.ordinal.read(bytes).require == sample.ordinal)
+      .and(expect(AllowSpendReferenceLenses.hash.read(bytes).require == sample.hash))
   }
 
   // ---- TokenLockReference ------------------------------------------------
@@ -63,26 +63,34 @@ object ReferenceLensSuite extends FunSuite {
     val sample = TokenLockReference(TokenLockOrdinal(NonNegLong.unsafeFrom(123L)), Hash(hashB))
     val bytes = TokenLockReferenceCodec.codec.encode(sample).require.toByteVector
 
-    expect(TokenLockReferenceLenses.ordinal.read(bytes).require == sample.ordinal) and
-      expect(TokenLockReferenceLenses.hash.read(bytes).require == sample.hash)
+    expect(TokenLockReferenceLenses.ordinal.read(bytes).require == sample.ordinal)
+      .and(expect(TokenLockReferenceLenses.hash.read(bytes).require == sample.hash))
   }
 
   // ---- Structural ---------------------------------------------------------
 
   test("Reference lenses all produce byte layouts compatible with the 40-byte shape") {
-    val a = BlockReferenceCodec.codec.encode(BlockReference(Height(NonNegLong.unsafeFrom(1L)), ProofsHash(hashA)))
-      .require.toByteVector
-    val b = TransactionReferenceCodec.codec.encode(
-      TransactionReference(TransactionOrdinal(NonNegLong.unsafeFrom(1L)), Hash(hashA))
-    ).require.toByteVector
-    val c = AllowSpendReferenceCodec.codec.encode(
-      AllowSpendReference(AllowSpendOrdinal(NonNegLong.unsafeFrom(1L)), Hash(hashA))
-    ).require.toByteVector
-    val d = TokenLockReferenceCodec.codec.encode(
-      TokenLockReference(TokenLockOrdinal(NonNegLong.unsafeFrom(1L)), Hash(hashA))
-    ).require.toByteVector
+    val a = BlockReferenceCodec.codec.encode(BlockReference(Height(NonNegLong.unsafeFrom(1L)), ProofsHash(hashA))).require.toByteVector
+    val b = TransactionReferenceCodec.codec
+      .encode(
+        TransactionReference(TransactionOrdinal(NonNegLong.unsafeFrom(1L)), Hash(hashA))
+      )
+      .require
+      .toByteVector
+    val c = AllowSpendReferenceCodec.codec
+      .encode(
+        AllowSpendReference(AllowSpendOrdinal(NonNegLong.unsafeFrom(1L)), Hash(hashA))
+      )
+      .require
+      .toByteVector
+    val d = TokenLockReferenceCodec.codec
+      .encode(
+        TokenLockReference(TokenLockOrdinal(NonNegLong.unsafeFrom(1L)), Hash(hashA))
+      )
+      .require
+      .toByteVector
 
     // Same numeric inputs → same bytes, across all four reference types.
-    expect(a == b) and expect(b == c) and expect(c == d) and expect(a.length == 40L)
+    expect(a == b).and(expect(b == c)).and(expect(c == d)).and(expect(a.length == 40L))
   }
 }

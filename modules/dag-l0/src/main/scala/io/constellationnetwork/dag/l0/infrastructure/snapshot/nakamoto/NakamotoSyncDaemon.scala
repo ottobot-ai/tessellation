@@ -34,6 +34,7 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.signature.Signature
 import io.constellationnetwork.security.signature.{Signed, Signing}
 import io.constellationnetwork.security.vrf.EcVrf25519
+import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong

@@ -12,6 +12,7 @@ import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, M
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
+import io.constellationnetwork.serde.codecs.StringCodec._
 import io.constellationnetwork.shared.sharedKryoRegistrar
 
 import eu.timepit.refined.auto._

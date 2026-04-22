@@ -12,13 +12,13 @@ import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import scodec.Codec
 import shapeless.{::, HNil}
 
-/** Canonical scodec codec for `MetagraphSyncDataInfo` — `(globalOrdinalLastAcceptedOn,
-  * globalEpochProgressLastAcceptedOn, unappliedGlobalChangeOrdinals)`.
+/** Canonical scodec codec for `MetagraphSyncDataInfo` — `(globalOrdinalLastAcceptedOn, globalEpochProgressLastAcceptedOn,
+  * unappliedGlobalChangeOrdinals)`.
   *
   * Wire layout:
   *   - ordinal-last-accepted : SnapshotOrdinal (8 bytes)
-  *   - epoch-last-accepted   : EpochProgress (8 bytes)
-  *   - unapplied-ordinals    : SortedSet[SnapshotOrdinal] (uint16 count + 8 bytes each)
+  *   - epoch-last-accepted : EpochProgress (8 bytes)
+  *   - unapplied-ordinals : SortedSet[SnapshotOrdinal] (uint16 count + 8 bytes each)
   */
 object MetagraphSyncDataInfoCodec {
 

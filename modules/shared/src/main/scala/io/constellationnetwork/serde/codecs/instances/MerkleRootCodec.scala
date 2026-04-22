@@ -12,11 +12,11 @@ import shapeless.{::, HNil}
 /** Canonical scodec codec for `MerkleRoot` — `(leafCount: NonNegInt, hash: Hash)`.
   *
   * Wire layout (36 bytes, fully fixed-width):
-  *   - bytes 0..3   : leafCount (4-byte big-endian NonNegInt)
-  *   - bytes 4..35  : hash      (32 raw bytes)
+  *   - bytes 0..3 : leafCount (4-byte big-endian NonNegInt)
+  *   - bytes 4..35 : hash (32 raw bytes)
   *
-  * Consensus contract: FROZEN. Used inside `GlobalSnapshotStateProofV1` /
-  * `GlobalSnapshotStateProof` as the optional currency-snapshot-proof witness.
+  * Consensus contract: FROZEN. Used inside `GlobalSnapshotStateProofV1` / `GlobalSnapshotStateProof` as the optional
+  * currency-snapshot-proof witness.
   */
 object MerkleRootCodec {
 

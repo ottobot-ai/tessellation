@@ -7,9 +7,8 @@ import scodec.codecs.{bytes, uint32, variableSizeBytes}
   *
   * Wire format: 4-byte unsigned length prefix (uint32) + raw bytes.
   *
-  * 4-byte prefix because data-application blobs can legitimately be megabytes. If consensus ever
-  * needs byte arrays larger than 4GB we'll file a follow-up — current DataApplicationPart payloads
-  * are well under that.
+  * 4-byte prefix because data-application blobs can legitimately be megabytes. If consensus ever needs byte arrays larger than 4GB we'll
+  * file a follow-up — current DataApplicationPart payloads are well under that.
   *
   * Consensus contract: FROZEN. 4-byte length + raw bytes.
   */

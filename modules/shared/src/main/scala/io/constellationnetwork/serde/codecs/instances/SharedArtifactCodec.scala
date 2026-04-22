@@ -23,8 +23,8 @@ import shapeless.{::, HNil}
 
 /** Canonical scodec codec for the `SharedArtifact` sealed ADT.
   *
-  * 1-byte discriminator; all 6 variants live in a single file so the mapping is auditable at a glance.
-  * FROZEN discriminator bytes — do NOT renumber:
+  * 1-byte discriminator; all 6 variants live in a single file so the mapping is auditable at a glance. FROZEN discriminator bytes — do NOT
+  * renumber:
   *   - 0x00: SpendAction
   *   - 0x01: TokenUnlock
   *   - 0x02: AllowSpendExpiration
@@ -32,8 +32,8 @@ import shapeless.{::, HNil}
   *   - 0x04: BalanceAdjustment
   *   - 0x05: GlobalSnapshotsProcessed
   *
-  * PricingUpdate / TokenUnlock / AllowSpendExpiration already have their own codecs (from
-  * PriceOracleCodecs and CurrencyAtomCodecs); this file just wires them into the ADT.
+  * PricingUpdate / TokenUnlock / AllowSpendExpiration already have their own codecs (from PriceOracleCodecs and CurrencyAtomCodecs); this
+  * file just wires them into the ADT.
   */
 object SharedArtifactCodec {
 
@@ -61,8 +61,9 @@ object SharedArtifactCodec {
       optionalAmountCodec ::
       optionalAmountCodec)
       .xmap[BalanceAdjustment](
-        { case addr :: reason :: refs :: inc :: ded :: HNil =>
-          BalanceAdjustment(addr, reason, refs, inc, ded)
+        {
+          case addr :: reason :: refs :: inc :: ded :: HNil =>
+            BalanceAdjustment(addr, reason, refs, inc, ded)
         },
         b => b.address :: b.reason :: b.reference :: b.increase :: b.deduct :: HNil
       )

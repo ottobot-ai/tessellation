@@ -9,9 +9,8 @@ import scodec.codecs.{listOfN, uint16}
   *
   * Wire format: 2-byte count + entries in sorted-by-key order.
   *
-  * Determinism: plain `Map` iteration is not ordered, so the encode path sorts explicitly using
-  * `Order[K]` to produce canonical bytes. On decode we rebuild a plain `Map` (callers that need
-  * sortedness should use `SortedMap` from the start).
+  * Determinism: plain `Map` iteration is not ordered, so the encode path sorts explicitly using `Order[K]` to produce canonical bytes. On
+  * decode we rebuild a plain `Map` (callers that need sortedness should use `SortedMap` from the start).
   */
 object MapCodec {
 

@@ -27,8 +27,8 @@ import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for a batch of simple currency-path atoms.
   *
-  * Covers: `MessageType`, `SessionToken`, `RoundId`, `SnapshotVersion`, `CurrencyMessage`,
-  * `FeeTransaction`, `SpendTransaction`, `BalanceAdjustmentReason`.
+  * Covers: `MessageType`, `SessionToken`, `RoundId`, `SnapshotVersion`, `CurrencyMessage`, `FeeTransaction`, `SpendTransaction`,
+  * `BalanceAdjustmentReason`.
   *
   * All are leaf atoms with no further-unbuilt dependencies.
   */
@@ -127,8 +127,9 @@ object CurrencyAtomCodecs {
   implicit val spendTransactionCodec: Codec[SpendTransaction] =
     (optionalHashCodec :: optionalCurrencyIdCodec :: swapAmountCodec :: addressCodec :: addressCodec)
       .xmap[SpendTransaction](
-        { case ref :: cid :: amt :: src :: dst :: HNil =>
-          SpendTransaction(ref, cid, amt, src, dst)
+        {
+          case ref :: cid :: amt :: src :: dst :: HNil =>
+            SpendTransaction(ref, cid, amt, src, dst)
         },
         s => s.allowSpendRef :: s.currencyId :: s.amount :: s.source :: s.destination :: HNil
       )

@@ -28,6 +28,7 @@ import io.constellationnetwork.schema.peer.{L0Peer, PeerId}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 import io.constellationnetwork.validator.StateProofValidator
 
 import eu.timepit.refined.auto.autoUnwrap

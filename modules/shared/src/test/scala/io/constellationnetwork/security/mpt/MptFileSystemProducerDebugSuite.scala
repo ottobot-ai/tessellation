@@ -25,6 +25,7 @@ import io.constellationnetwork.security.mpt.producer.{FileSystemMerklePatriciaPr
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
+import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong

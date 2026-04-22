@@ -27,6 +27,7 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 
 import fs2.Stream
 import io.circe.Json

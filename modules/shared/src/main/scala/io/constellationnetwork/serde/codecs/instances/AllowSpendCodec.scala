@@ -17,14 +17,14 @@ import shapeless.{::, HNil}
 /** Canonical scodec codec for `AllowSpend` — 8-field record.
   *
   * Wire layout (declared field order):
-  *   - source                 : Address                      (variable, length-prefixed)
-  *   - destination            : Address                      (variable, length-prefixed)
-  *   - currencyId             : Option[CurrencyId]           (1 byte + 41-or-52 if Some)
-  *   - amount                 : SwapAmount                   (8 bytes)
-  *   - fee                    : AllowSpendFee                (8 bytes)
-  *   - parent                 : AllowSpendReference          (40 bytes)
-  *   - lastValidEpochProgress : EpochProgress                (8 bytes)
-  *   - approvers              : List[Address]                (uint16 count + entries)
+  *   - source : Address (variable, length-prefixed)
+  *   - destination : Address (variable, length-prefixed)
+  *   - currencyId : Option[CurrencyId] (1 byte + 41-or-52 if Some)
+  *   - amount : SwapAmount (8 bytes)
+  *   - fee : AllowSpendFee (8 bytes)
+  *   - parent : AllowSpendReference (40 bytes)
+  *   - lastValidEpochProgress : EpochProgress (8 bytes)
+  *   - approvers : List[Address] (uint16 count + entries)
   *
   * Consensus contract: FROZEN.
   */
@@ -41,18 +41,20 @@ object AllowSpendCodec {
       amountCodec :: feeCodec :: allowSpendRefCodec ::
       epochCodec :: approversCodec)
       .xmap[AllowSpend](
-        { case src :: dst :: cid :: amt :: fee :: parent :: lve :: approvers :: HNil =>
-          AllowSpend(src, dst, cid, amt, fee, parent, lve, approvers)
+        {
+          case src :: dst :: cid :: amt :: fee :: parent :: lve :: approvers :: HNil =>
+            AllowSpend(src, dst, cid, amt, fee, parent, lve, approvers)
         },
-        a => a.source ::
-          a.destination ::
-          a.currencyId ::
-          a.amount ::
-          a.fee ::
-          a.parent ::
-          a.lastValidEpochProgress ::
-          a.approvers ::
-          HNil
+        a =>
+          a.source ::
+            a.destination ::
+            a.currencyId ::
+            a.amount ::
+            a.fee ::
+            a.parent ::
+            a.lastValidEpochProgress ::
+            a.approvers ::
+            HNil
       )
 
   implicit val immutableCodec: ImmutableCodec[AllowSpend] = ImmutableCodec.fromScodecCodec(codec)

@@ -22,20 +22,15 @@ import io.circe.Decoder
 import io.circe.parser.decode
 import weaver.MutableIOSuite
 
-/** Parity suite validating our scodec codecs against real Brotli-JSON snapshots from an 8-node
-  * sim (copied into test resources).
+/** Parity suite validating our scodec codecs against real Brotli-JSON snapshots from an 8-node sim (copied into test resources).
   *
   * The pipeline for each fixture:
-  *   1. Read Brotli-compressed JSON bytes from `test/resources/serde/real/`.
-  *   2. Decompress → UTF-8 JSON string.
-  *   3. Decode via the existing circe `Decoder[T]` (the live read path).
-  *   4. Encode that Scala value via our scodec codec.
-  *   5. Decode the scodec bytes back.
-  *   6. Assert equal to the circe-decoded value.
+  *   1. Read Brotli-compressed JSON bytes from `test/resources/serde/real/`. 2. Decompress → UTF-8 JSON string. 3. Decode via the existing
+  *      circe `Decoder[T]` (the live read path). 4. Encode that Scala value via our scodec codec. 5. Decode the scodec bytes back. 6.
+  *      Assert equal to the circe-decoded value.
   *
-  * A mismatch means our scodec codec for `T` doesn't faithfully round-trip the Scala representation
-  * of live on-disk data. This is the validation layer that catches field-order / Option / sum-type
-  * mistakes the unit-level round-trip tests would miss.
+  * A mismatch means our scodec codec for `T` doesn't faithfully round-trip the Scala representation of live on-disk data. This is the
+  * validation layer that catches field-order / Option / sum-type mistakes the unit-level round-trip tests would miss.
   */
 object JsonScodecParitySuite extends MutableIOSuite {
 
@@ -63,7 +58,8 @@ object JsonScodecParitySuite extends MutableIOSuite {
     val json = brotliToJson(readFixture(fixtureName))
     val circeDecoded = decode[T](json).fold(err => throw new AssertionError(s"circe decode failed: $err"), identity)
     val scodecBytes = scodecImmutable.immutableBytes(circeDecoded)
-    val scodecDecoded = scodecBytes.fromImmutableBytes[T](scodecImmutable)
+    val scodecDecoded = scodecBytes
+      .fromImmutableBytes[T](scodecImmutable)
       .fold(err => throw new AssertionError(s"scodec decode failed: $err"), identity)
     scodecDecoded == circeDecoded
   }

@@ -9,8 +9,7 @@ import eu.timepit.refined.types.numeric.NonNegInt
 
 /** Byte-offset lenses for `MerkleRoot` — 36 bytes fixed:
   *
-  *   [0..3]   leafCount (4-byte big-endian NonNegInt)
-  *   [4..35]  hash (32 raw bytes)
+  * [0..3] leafCount (4-byte big-endian NonNegInt) [4..35] hash (32 raw bytes)
   */
 object MerkleRootLenses {
   val leafCount: FieldLens[MerkleRoot, NonNegInt] =

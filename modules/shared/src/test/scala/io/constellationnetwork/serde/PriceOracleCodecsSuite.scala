@@ -49,8 +49,7 @@ object PriceOracleCodecsSuite extends FunSuite {
 
   test("TokenPair encodes as 2 bytes (base + quote discriminators)") {
     val bytes = TokenPair.DAG_USD.immutableBytes
-    expect(bytes.length == 2L) and
-      expect(bytes == ByteVector.fromValidHex("0001"))
+    expect(bytes.length == 2L).and(expect(bytes == ByteVector.fromValidHex("0001")))
   }
 
   test("TokenPair round-trips") {
@@ -66,8 +65,7 @@ object PriceOracleCodecsSuite extends FunSuite {
       Refined.unsafeApply[Long, Positive](2L)
     )
     val bytes = frac.immutableBytes
-    expect(bytes.length == 16L) and
-      expect(bytes == ByteVector.fromValidHex("00000000000000070000000000000002"))
+    expect(bytes.length == 16L).and(expect(bytes == ByteVector.fromValidHex("00000000000000070000000000000002")))
   }
 
   test("NonNegFraction round-trips") {

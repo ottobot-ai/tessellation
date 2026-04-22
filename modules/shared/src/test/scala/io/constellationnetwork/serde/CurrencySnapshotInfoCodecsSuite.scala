@@ -42,7 +42,15 @@ object CurrencySnapshotInfoCodecsSuite extends FunSuite {
 
   test("Current CurrencySnapshotStateProof round-trips with all options absent") {
     val p = CurrencySnapshotStateProof(
-      Hash("a" * 64), Hash("b" * 64), None, None, None, None, None, None, None
+      Hash("a" * 64),
+      Hash("b" * 64),
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None
     )
     expect(p.immutableBytes.fromImmutableBytes[CurrencySnapshotStateProof] == Right(p))
   }

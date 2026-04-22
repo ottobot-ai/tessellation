@@ -11,14 +11,14 @@ import scodec.{Attempt, Codec}
   *
   * Wire format: 2-byte length prefix (uint16) + entries in sorted-by-key order.
   *
-  * Determinism: the encode path iterates via `SortedMap`'s natural iteration, which is already
-  * `Order[K]`-sorted. Two nodes serializing the same logical map produce bit-identical bytes.
+  * Determinism: the encode path iterates via `SortedMap`'s natural iteration, which is already `Order[K]`-sorted. Two nodes serializing the
+  * same logical map produce bit-identical bytes.
   *
-  * Not marked implicit — `K` needs an explicit `Order[K]` and both `K`/`V` need explicit codecs.
-  * Call sites invoke `sortedMap(keyCodec, valueCodec)` explicitly.
+  * Not marked implicit — `K` needs an explicit `Order[K]` and both `K`/`V` need explicit codecs. Call sites invoke `sortedMap(keyCodec,
+  * valueCodec)` explicitly.
   *
-  * Consensus contract: FROZEN. 2-byte count + sorted (key, value) pairs. Changing the prefix
-  * width or the sort order breaks every historical hash that covers a map field.
+  * Consensus contract: FROZEN. 2-byte count + sorted (key, value) pairs. Changing the prefix width or the sort order breaks every
+  * historical hash that covers a map field.
   */
 object SortedMapCodec {
 
@@ -33,9 +33,9 @@ object SortedMapCodec {
     )
   }
 
-  /** Encode side asserts the input is genuinely sorted. Useful when the call site builds the map
-    * and wants the codec to surface any sort-order bug at encode time. Kept as a separate entry
-    * point because the default `sortedMap` is already deterministic without this extra check.
+  /** Encode side asserts the input is genuinely sorted. Useful when the call site builds the map and wants the codec to surface any
+    * sort-order bug at encode time. Kept as a separate entry point because the default `sortedMap` is already deterministic without this
+    * extra check.
     */
   def sortedMapStrict[K: Order, V](keyCodec: Codec[K], valueCodec: Codec[V]): Codec[SortedMap[K, V]] = {
     implicit val ordering: Ordering[K] = Order[K].toOrdering

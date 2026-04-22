@@ -28,7 +28,9 @@ A background research agent surveyed how Ethereum (Geth PBSS, Erigon), Cosmos (I
 
 **Recommended architecture (from research)**: Path-indexed MPT with bounded-depth overlay (PBSS-style) + flat snap-sync side-table.
 
-**Tessellation's actual starting position**: hash-indexed via `Hex(GlobalStateKey)` with incremental flat-state tracking. For current scale (hundreds of ordinals, state well under 10GB), this is fine. At 50GB+ a path-indexed migration becomes priority.
+**Tessellation's actual starting position**: Erigon-style flat-state persistence with in-memory trie cache. `MptStateStorage.scala:18` is explicit: "Storage for MPT state only. Trie is rebuilt on load to save memory and disk space." The `mpt_snapshot_info/<ordinal>` files on disk are per-ordinal flat-KV dumps; MPT nodes are never persisted, they're rebuilt from flat state and cached (`MaxCacheSize = 50`). This means the research's "hash-indexed node storage bloats at 1TB" warning does NOT apply — there's no node storage to bloat. The hash-indexing in Tessellation is only at the top-level key (`Hex(GlobalStateKey)`), which is just key encoding, not node layout.
+
+**Scaling concerns at 100GB are therefore different**: (1) flat-state file serialization at GB-scale (current `MptStateStorage.writeState` rewrites the whole map — move to delta-only persistence), (2) trie rebuild on cache miss (consider disk-backed node cache for longer proof windows), (3) proof cache for repeated queries. None block the MPT-as-primary milestone; all are straightforward tuning when state approaches 100GB.
 
 ## Tessellation's pre-existing infrastructure
 
@@ -110,11 +112,13 @@ Light-client bootstrap.
 
 Matches original estimate, but with concrete integration points rather than from-scratch construction.
 
-## Deferred (revisit at >50GB state)
+## Deferred (revisit at large-state-scale)
 
-- **Path-indexed migration (PBSS-style)**. The research is clear this will eventually be needed; not now.
-- **RocksDB / MDBX backing** for disk persistence (Erigon-style). `MptStateStorage` abstraction already makes this swappable.
-- **Verkle migration**. Track Ethereum's work; not production-ready.
+- **Delta-only flat-state persistence**: current `MptStateStorage` rewrites the whole `Map[Hex, Array[Byte]]` per ordinal. Above ~1GB state this becomes I/O-bound. Replace with overlay-file-per-ordinal + periodic compaction. Straightforward refactor to the storage layer, not load-bearing for Phase 3.
+- **Disk-backed trie node cache**: keep rebuilt MPT nodes on disk (RocksDB/MDBX) for longer proof-serving windows. In-memory `MaxCacheSize = 50` is the current ceiling; disk-backing extends it without memory pressure.
+- **Verkle migration**. Track Ethereum's work; not production-ready as of early 2026.
+
+Note: the "path-indexed migration" concern from Geth's PBSS transition does NOT apply to Tessellation because Tessellation does not persist MPT nodes. That problem class is sidestepped by the Erigon-style flat-only persistence.
 
 ## Non-goals (intentionally deferred beyond Phase 3)
 

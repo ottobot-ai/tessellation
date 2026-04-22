@@ -12,15 +12,15 @@ import scodec.{Attempt, Codec, Err}
 import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for the `UpdateNodeParameters` family:
-  *   - `RewardFraction`                 — Int Refined Closed[0, 100_000_000], 4 bytes with range validation.
-  *   - `UpdateNodeParametersReference`  — 40 bytes (ordinal + hash), same layout as other *Reference types.
+  *   - `RewardFraction` — Int Refined Closed[0, 100_000_000], 4 bytes with range validation.
+  *   - `UpdateNodeParametersReference` — 40 bytes (ordinal + hash), same layout as other *Reference types.
   *   - `DelegatedStakeRewardParameters` — single-field wrapper.
-  *   - `NodeMetadataParameters`         — `(name: String, description: String)`.
-  *   - `UpdateNodeParameters`           — 4-field record.
+  *   - `NodeMetadataParameters` — `(name: String, description: String)`.
+  *   - `UpdateNodeParameters` — 4-field record.
   *
-  * `RewardFraction` is the first consensus-field refined type with a bounded-range predicate (not
-  * just non-negative / positive). Decode validates the `[0, 100_000_000]` range — a byte stream
-  * with a value outside that range fails at the codec layer, not at a later consistency check.
+  * `RewardFraction` is the first consensus-field refined type with a bounded-range predicate (not just non-negative / positive). Decode
+  * validates the `[0, 100_000_000]` range — a byte stream with a value outside that range fails at the codec layer, not at a later
+  * consistency check.
   */
 object UpdateNodeParametersCodec {
 
@@ -83,14 +83,16 @@ object UpdateNodeParametersCodec {
       nodeMetadataParametersCodec ::
       updateNodeParametersReferenceCodec)
       .xmap[UpdateNodeParameters](
-        { case src :: rewardParams :: metaParams :: parent :: HNil =>
-          UpdateNodeParameters(src, rewardParams, metaParams, parent)
+        {
+          case src :: rewardParams :: metaParams :: parent :: HNil =>
+            UpdateNodeParameters(src, rewardParams, metaParams, parent)
         },
-        u => u.source ::
-          u.delegatedStakeRewardParameters ::
-          u.nodeMetadataParameters ::
-          u.parent ::
-          HNil
+        u =>
+          u.source ::
+            u.delegatedStakeRewardParameters ::
+            u.nodeMetadataParameters ::
+            u.parent ::
+            HNil
       )
 
   implicit val updateNodeParametersImmutableCodec: ImmutableCodec[UpdateNodeParameters] =

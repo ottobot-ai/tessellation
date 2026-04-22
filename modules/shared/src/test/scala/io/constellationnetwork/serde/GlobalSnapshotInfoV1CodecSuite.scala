@@ -17,8 +17,8 @@ import weaver.FunSuite
 
 /** Round-trip + structural suite for `GlobalSnapshotInfoV1` — 3 sorted maps.
   *
-  * Exercises the `SortedMapCodec` helper end-to-end with three different value types (Hash,
-  * TransactionReference, Balance) and two independent keys.
+  * Exercises the `SortedMapCodec` helper end-to-end with three different value types (Hash, TransactionReference, Balance) and two
+  * independent keys.
   */
 object GlobalSnapshotInfoV1CodecSuite extends FunSuite {
 
@@ -46,8 +46,7 @@ object GlobalSnapshotInfoV1CodecSuite extends FunSuite {
   )
 
   test("V1 info with all maps empty is exactly 6 bytes (three uint16 zero prefixes)") {
-    expect(empty.immutableBytes == ByteVector.fromValidHex("000000000000")) and
-      expect(empty.immutableBytes.length == 6L)
+    expect(empty.immutableBytes == ByteVector.fromValidHex("000000000000")).and(expect(empty.immutableBytes.length == 6L))
   }
 
   test("V1 info round-trips end-to-end") {
@@ -68,8 +67,7 @@ object GlobalSnapshotInfoV1CodecSuite extends FunSuite {
         addrB -> sample.balances(addrA)
       )
     )
-    expect(sample.immutableBytes != swapped.immutableBytes) and
-      expect(sample.immutableBytes.length == swapped.immutableBytes.length)
+    expect(sample.immutableBytes != swapped.immutableBytes).and(expect(sample.immutableBytes.length == swapped.immutableBytes.length))
   }
 
   test("Map order is deterministic — building the same map by different insertion order is the same bytes") {

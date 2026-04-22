@@ -9,8 +9,8 @@ import scodec.codecs.{discriminated, uint8}
   *
   * Not marked implicit — call sites invoke `either(leftCodec, rightCodec)` explicitly.
   *
-  * Consensus contract: FROZEN. Left before Right in the discriminator order (0x00 / 0x01). Any
-  * change breaks every hash that covers an `Either` field.
+  * Consensus contract: FROZEN. Left before Right in the discriminator order (0x00 / 0x01). Any change breaks every hash that covers an
+  * `Either` field.
   */
 object EitherCodec {
 

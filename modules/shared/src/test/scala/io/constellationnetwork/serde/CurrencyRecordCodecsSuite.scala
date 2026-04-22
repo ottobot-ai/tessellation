@@ -55,8 +55,7 @@ object CurrencyRecordCodecsSuite extends FunSuite {
       epochProgress = EpochProgress(NonNegLong.unsafeFrom(10L))
     )
     val bytes = v.immutableBytes
-    expect(bytes.length == 48L) and
-      expect(bytes.fromImmutableBytes[GlobalSyncView] == Right(v))
+    expect(bytes.length == 48L).and(expect(bytes.fromImmutableBytes[GlobalSyncView] == Right(v)))
   }
 
   // ---- DataApplicationPart ------------------------------------------------
@@ -65,9 +64,9 @@ object CurrencyRecordCodecsSuite extends FunSuite {
     val p = DataApplicationPartV1(Array.emptyByteArray, List.empty, Hash.empty)
     val bytes = p.immutableBytes
     val decoded = bytes.fromImmutableBytes[DataApplicationPartV1].toOption.get
-    expect(decoded.onChainState.sameElements(p.onChainState)) and
-      expect(decoded.blocks.zip(p.blocks).forall { case (a, b) => a.sameElements(b) }) and
-      expect(decoded.calculatedStateProof == p.calculatedStateProof)
+    expect(decoded.onChainState.sameElements(p.onChainState))
+      .and(expect(decoded.blocks.zip(p.blocks).forall { case (a, b) => a.sameElements(b) }))
+      .and(expect(decoded.calculatedStateProof == p.calculatedStateProof))
   }
 
   test("DataApplicationPart round-trips with non-trivial state + optional updateHashes") {
@@ -78,10 +77,10 @@ object CurrencyRecordCodecsSuite extends FunSuite {
       updateHashes = Some(SortedSet(Hash("e" * 64)))
     )
     val decoded = p.immutableBytes.fromImmutableBytes[DataApplicationPart].toOption.get
-    expect(decoded.onChainState.sameElements(p.onChainState)) and
-      expect(decoded.blocks.size == p.blocks.size) and
-      expect(decoded.calculatedStateProof == p.calculatedStateProof) and
-      expect(decoded.updateHashes == p.updateHashes)
+    expect(decoded.onChainState.sameElements(p.onChainState))
+      .and(expect(decoded.blocks.size == p.blocks.size))
+      .and(expect(decoded.calculatedStateProof == p.calculatedStateProof))
+      .and(expect(decoded.updateHashes == p.updateHashes))
   }
 
   // ---- Tips ---------------------------------------------------------------
@@ -130,20 +129,33 @@ object CurrencyRecordCodecsSuite extends FunSuite {
   // ---- AllowSpendBlock / TokenLockBlock -----------------------------------
 
   test("AllowSpendBlock round-trips") {
-    val asp = AllowSpend(addr, addr, None, SwapAmount(PosLong.unsafeFrom(1L)), AllowSpendFee(NonNegLong.unsafeFrom(0L)),
+    val asp = AllowSpend(
+      addr,
+      addr,
+      None,
+      SwapAmount(PosLong.unsafeFrom(1L)),
+      AllowSpendFee(NonNegLong.unsafeFrom(0L)),
       AllowSpendReference(AllowSpendOrdinal(NonNegLong.unsafeFrom(0L)), Hash("0" * 64)),
-      EpochProgress(NonNegLong.unsafeFrom(0L)), Nil)
-    val b = AllowSpendBlock(RoundId(UUID.fromString("00000000-0000-0000-0000-000000000001")),
-      NonEmptySet.of(Signed(asp, NonEmptySet.of(proof))))
+      EpochProgress(NonNegLong.unsafeFrom(0L)),
+      Nil
+    )
+    val b =
+      AllowSpendBlock(RoundId(UUID.fromString("00000000-0000-0000-0000-000000000001")), NonEmptySet.of(Signed(asp, NonEmptySet.of(proof))))
     expect(b.immutableBytes.fromImmutableBytes[AllowSpendBlock] == Right(b))
   }
 
   test("TokenLockBlock round-trips") {
-    val tl = TokenLock(addr, TokenLockAmount(PosLong.unsafeFrom(1L)), TokenLockFee(NonNegLong.unsafeFrom(0L)),
+    val tl = TokenLock(
+      addr,
+      TokenLockAmount(PosLong.unsafeFrom(1L)),
+      TokenLockFee(NonNegLong.unsafeFrom(0L)),
       TokenLockReference(TokenLockOrdinal(NonNegLong.unsafeFrom(0L)), Hash("0" * 64)),
-      None, None, None)
-    val b = TokenLockBlock(RoundId(UUID.fromString("00000000-0000-0000-0000-000000000002")),
-      NonEmptySet.of(Signed(tl, NonEmptySet.of(proof))))
+      None,
+      None,
+      None
+    )
+    val b =
+      TokenLockBlock(RoundId(UUID.fromString("00000000-0000-0000-0000-000000000002")), NonEmptySet.of(Signed(tl, NonEmptySet.of(proof))))
     expect(b.immutableBytes.fromImmutableBytes[TokenLockBlock] == Right(b))
   }
 

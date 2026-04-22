@@ -51,9 +51,9 @@ import scodec.Codec
 import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for the top-level snapshot capstones:
-  *   - `GlobalSnapshot`                (full, 11 fields, legacy pre-incremental).
-  *   - `GlobalIncrementalSnapshotV1`   (12 fields, legacy incremental shape).
-  *   - `GlobalIncrementalSnapshot`     (24 fields, current shape with Nakamoto fields).
+  *   - `GlobalSnapshot` (full, 11 fields, legacy pre-incremental).
+  *   - `GlobalIncrementalSnapshotV1` (12 fields, legacy incremental shape).
+  *   - `GlobalIncrementalSnapshot` (24 fields, current shape with Nakamoto fields).
   *
   * Final commit of the scodec codec library for the snapshot data path.
   */
@@ -91,21 +91,23 @@ object GlobalSnapshotCodecs {
       globalSnapshotInfoV1Codec ::
       tipsCodec)
       .xmap[GlobalSnapshot](
-        { case ord :: h :: sh :: lsh :: blks :: scs :: rws :: ep :: nf :: info :: tips :: HNil =>
-          GlobalSnapshot(ord, h, sh, lsh, blks, scs, rws, ep, nf, info, tips)
+        {
+          case ord :: h :: sh :: lsh :: blks :: scs :: rws :: ep :: nf :: info :: tips :: HNil =>
+            GlobalSnapshot(ord, h, sh, lsh, blks, scs, rws, ep, nf, info, tips)
         },
-        s => s.ordinal ::
-          s.height ::
-          s.subHeight ::
-          s.lastSnapshotHash ::
-          s.blocks ::
-          s.stateChannelSnapshots ::
-          s.rewards ::
-          s.epochProgress ::
-          s.nextFacilitators ::
-          s.info ::
-          s.tips ::
-          HNil
+        s =>
+          s.ordinal ::
+            s.height ::
+            s.subHeight ::
+            s.lastSnapshotHash ::
+            s.blocks ::
+            s.stateChannelSnapshots ::
+            s.rewards ::
+            s.epochProgress ::
+            s.nextFacilitators ::
+            s.info ::
+            s.tips ::
+            HNil
       )
 
   implicit val globalSnapshotImmutableCodec: ImmutableCodec[GlobalSnapshot] =
@@ -127,22 +129,24 @@ object GlobalSnapshotCodecs {
       v1Codec ::
       versionCodec)
       .xmap[GlobalIncrementalSnapshotV1](
-        { case ord :: h :: sh :: lsh :: blks :: scs :: rws :: ep :: nf :: tips :: sp :: v :: HNil =>
-          GlobalIncrementalSnapshotV1(ord, h, sh, lsh, blks, scs, rws, ep, nf, tips, sp, v)
+        {
+          case ord :: h :: sh :: lsh :: blks :: scs :: rws :: ep :: nf :: tips :: sp :: v :: HNil =>
+            GlobalIncrementalSnapshotV1(ord, h, sh, lsh, blks, scs, rws, ep, nf, tips, sp, v)
         },
-        s => s.ordinal ::
-          s.height ::
-          s.subHeight ::
-          s.lastSnapshotHash ::
-          s.blocks ::
-          s.stateChannelSnapshots ::
-          s.rewards ::
-          s.epochProgress ::
-          s.nextFacilitators ::
-          s.tips ::
-          s.stateProof ::
-          s.version ::
-          HNil
+        s =>
+          s.ordinal ::
+            s.height ::
+            s.subHeight ::
+            s.lastSnapshotHash ::
+            s.blocks ::
+            s.stateChannelSnapshots ::
+            s.rewards ::
+            s.epochProgress ::
+            s.nextFacilitators ::
+            s.tips ::
+            s.stateProof ::
+            s.version ::
+            HNil
       )
 
   implicit val globalIncrementalSnapshotV1ImmutableCodec: ImmutableCodec[GlobalIncrementalSnapshotV1] =
@@ -239,40 +243,63 @@ object GlobalSnapshotCodecs {
       slotCertificateOptCodec ::
       etaOptCodec)
       .xmap[GlobalIncrementalSnapshot](
-        { case ord :: h :: sh :: lsh :: blks :: scs :: rws :: dr ::
+        {
+          case ord :: h :: sh :: lsh :: blks :: scs :: rws :: dr ::
               ep :: nf :: tips :: sp :: asb :: tlb :: sa :: unp ::
               art :: ads :: dsw :: anc :: ncw :: v :: slot :: eta :: HNil =>
-          GlobalIncrementalSnapshot(
-            ord, h, sh, lsh, blks, scs, rws, dr,
-            ep, nf, tips, sp, asb, tlb, sa, unp,
-            art, ads, dsw, anc, ncw, v, slot, eta
-          )
+            GlobalIncrementalSnapshot(
+              ord,
+              h,
+              sh,
+              lsh,
+              blks,
+              scs,
+              rws,
+              dr,
+              ep,
+              nf,
+              tips,
+              sp,
+              asb,
+              tlb,
+              sa,
+              unp,
+              art,
+              ads,
+              dsw,
+              anc,
+              ncw,
+              v,
+              slot,
+              eta
+            )
         },
-        s => s.ordinal ::
-          s.height ::
-          s.subHeight ::
-          s.lastSnapshotHash ::
-          s.blocks ::
-          s.stateChannelSnapshots ::
-          s.rewards ::
-          s.delegateRewards ::
-          s.epochProgress ::
-          s.nextFacilitators ::
-          s.tips ::
-          s.stateProof ::
-          s.allowSpendBlocks ::
-          s.tokenLockBlocks ::
-          s.spendActions ::
-          s.updateNodeParameters ::
-          s.artifacts ::
-          s.activeDelegatedStakes ::
-          s.delegatedStakesWithdrawals ::
-          s.activeNodeCollaterals ::
-          s.nodeCollateralWithdrawals ::
-          s.version ::
-          s.slotCertificate ::
-          s.eta ::
-          HNil
+        s =>
+          s.ordinal ::
+            s.height ::
+            s.subHeight ::
+            s.lastSnapshotHash ::
+            s.blocks ::
+            s.stateChannelSnapshots ::
+            s.rewards ::
+            s.delegateRewards ::
+            s.epochProgress ::
+            s.nextFacilitators ::
+            s.tips ::
+            s.stateProof ::
+            s.allowSpendBlocks ::
+            s.tokenLockBlocks ::
+            s.spendActions ::
+            s.updateNodeParameters ::
+            s.artifacts ::
+            s.activeDelegatedStakes ::
+            s.delegatedStakesWithdrawals ::
+            s.activeNodeCollaterals ::
+            s.nodeCollateralWithdrawals ::
+            s.version ::
+            s.slotCertificate ::
+            s.eta ::
+            HNil
       )
 
   implicit val globalIncrementalSnapshotImmutableCodec: ImmutableCodec[GlobalIncrementalSnapshot] =

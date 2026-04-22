@@ -12,12 +12,11 @@ import weaver.FunSuite
 
 /** Round-trip + structural suite for the state-proof family:
   *   - `GlobalSnapshotStateProofV1` (4 fields, legacy pre-MPT shape).
-  *   - `GlobalSnapshotStateProof`   (17 fields, current transitional shape with optional MPT root).
+  *   - `GlobalSnapshotStateProof` (17 fields, current transitional shape with optional MPT root).
   *
-  * These compose `HashCodec`, `MerkleRootCodec`, and `OptionCodec.option`. Rather than a single
-  * hand-computed hex golden for each, we assert:
-  *   - total encoded length is predictable (fixed contributions from required fields +
-  *     1-or-(1+body) per Option field),
+  * These compose `HashCodec`, `MerkleRootCodec`, and `OptionCodec.option`. Rather than a single hand-computed hex golden for each, we
+  * assert:
+  *   - total encoded length is predictable (fixed contributions from required fields + 1-or-(1+body) per Option field),
   *   - the byte offset of each field is stable (so MPT-as-primary storage can peek),
   *   - round-trip returns the same Scala value.
   */
@@ -46,22 +45,21 @@ object GlobalSnapshotStateProofCodecSuite extends FunSuite {
 
   test("V1 first 3 × 32 bytes are the three required hashes in order") {
     val bytes = v1AllPresent.immutableBytes
-    expect(bytes.slice(0L, 32L) == ByteVector.fromValidHex("aa" * 32)) and
-      expect(bytes.slice(32L, 64L) == ByteVector.fromValidHex("bb" * 32)) and
-      expect(bytes.slice(64L, 96L) == ByteVector.fromValidHex("cc" * 32))
+    expect(bytes.slice(0L, 32L) == ByteVector.fromValidHex("aa" * 32))
+      .and(expect(bytes.slice(32L, 64L) == ByteVector.fromValidHex("bb" * 32)))
+      .and(expect(bytes.slice(64L, 96L) == ByteVector.fromValidHex("cc" * 32)))
   }
 
   test("V1 byte at offset 96 is the currency-proof present/absent flag") {
     val presentFlag = v1AllPresent.immutableBytes.drop(96L).head
     val absentFlag = v1CurrencyAbsent.immutableBytes.drop(96L).head
     // `Some` and `None` must produce distinct discriminator bytes, and `None` is zero-byte by convention.
-    expect(absentFlag == 0x00.toByte) and
-      expect(presentFlag != 0x00.toByte)
+    expect(absentFlag == 0x00.toByte).and(expect(presentFlag != 0x00.toByte))
   }
 
   test("V1 round-trips, both present and absent currency-proof cases") {
-    expect(v1AllPresent.immutableBytes.fromImmutableBytes[GlobalSnapshotStateProofV1] == Right(v1AllPresent)) and
-      expect(v1CurrencyAbsent.immutableBytes.fromImmutableBytes[GlobalSnapshotStateProofV1] == Right(v1CurrencyAbsent))
+    expect(v1AllPresent.immutableBytes.fromImmutableBytes[GlobalSnapshotStateProofV1] == Right(v1AllPresent))
+      .and(expect(v1CurrencyAbsent.immutableBytes.fromImmutableBytes[GlobalSnapshotStateProofV1] == Right(v1CurrencyAbsent)))
   }
 
   // ---- Current (17-field) --------------------------------------------------
@@ -119,13 +117,12 @@ object GlobalSnapshotStateProofCodecSuite extends FunSuite {
 
   test("Current, all options absent — every tail byte is 0x00") {
     val tail = allAbsentCurrent.immutableBytes.drop(96L)
-    expect(tail.length == 14L) and
-      expect(tail.toArray.forall(_ == 0x00.toByte))
+    expect(tail.length == 14L).and(expect(tail.toArray.forall(_ == 0x00.toByte)))
   }
 
   test("Current round-trips — all absent and all present") {
-    expect(allAbsentCurrent.immutableBytes.fromImmutableBytes[GlobalSnapshotStateProof] == Right(allAbsentCurrent)) and
-      expect(allPresentCurrent.immutableBytes.fromImmutableBytes[GlobalSnapshotStateProof] == Right(allPresentCurrent))
+    expect(allAbsentCurrent.immutableBytes.fromImmutableBytes[GlobalSnapshotStateProof] == Right(allAbsentCurrent))
+      .and(expect(allPresentCurrent.immutableBytes.fromImmutableBytes[GlobalSnapshotStateProof] == Right(allPresentCurrent)))
   }
 
   test("Current field-order invariant: swapping two same-type options produces different bytes") {
@@ -145,7 +142,6 @@ object GlobalSnapshotStateProofCodecSuite extends FunSuite {
     val bytes = sole.immutableBytes
     val mptSlice = bytes.drop(bytes.length - 33L)
     // Last 32 bytes must be the hash; the preceding byte is the Some discriminator (non-zero).
-    expect(mptSlice.head != 0x00.toByte) and
-      expect(mptSlice.drop(1) == ByteVector.fromValidHex("0d" * 32))
+    expect(mptSlice.head != 0x00.toByte).and(expect(mptSlice.drop(1) == ByteVector.fromValidHex("0d" * 32)))
   }
 }

@@ -15,20 +15,19 @@ import scodec.codecs.{discriminated, provide, uint8}
 import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for the price-oracle family:
-  *   - `TokenId`          — sealed ADT, currently 2 known variants (DAG, USD).
-  *   - `TokenPair`        — `(base: TokenId, quote: TokenId)`.
-  *   - `NonNegFraction`   — `(numerator: NonNegLong, denominator: PosLong)`, 16 bytes fixed.
-  *   - `PriceFraction`    — `(TokenPair, NonNegFraction)`.
-  *   - `PricingUpdate`    — single-field wrapper around `PriceFraction`.
-  *   - `PriceRecord`      — 6-field record.
+  *   - `TokenId` — sealed ADT, currently 2 known variants (DAG, USD).
+  *   - `TokenPair` — `(base: TokenId, quote: TokenId)`.
+  *   - `NonNegFraction` — `(numerator: NonNegLong, denominator: PosLong)`, 16 bytes fixed.
+  *   - `PriceFraction` — `(TokenPair, NonNegFraction)`.
+  *   - `PricingUpdate` — single-field wrapper around `PriceFraction`.
+  *   - `PriceRecord` — 6-field record.
   *
   * Discriminator bytes for `TokenId` (consensus-frozen — do NOT renumber):
   *   - 0x00: DAG (CryptoToken)
   *   - 0x01: USD (FiatToken)
   *
-  * Flat discrimination across the whole `TokenId` tree (not nested CryptoToken/FiatToken tags)
-  * keeps the wire a single byte per TokenId today. When new tokens appear, add new discriminator
-  * codes — up to 254 more before we'd need to widen to uint16.
+  * Flat discrimination across the whole `TokenId` tree (not nested CryptoToken/FiatToken tags) keeps the wire a single byte per TokenId
+  * today. When new tokens appear, add new discriminator codes — up to 254 more before we'd need to widen to uint16.
   */
 object PriceOracleCodecs {
 
@@ -98,8 +97,9 @@ object PriceOracleCodecs {
   implicit val priceRecordCodec: Codec[PriceRecord] =
     (pricingUpdateCodec :: pricingUpdateCodec :: pricingUpdateCodec :: posIntCodec :: epochCodec :: epochCodec)
       .xmap[PriceRecord](
-        { case cur :: up :: sum :: n :: nw :: ua :: HNil =>
-          PriceRecord(cur, up, sum, n, nw, ua)
+        {
+          case cur :: up :: sum :: n :: nw :: ua :: HNil =>
+            PriceRecord(cur, up, sum, n, nw, ua)
         },
         r => r.currentPrice :: r.upcomingPrice :: r.currentSum :: r.currentNumEvents :: r.nextWindowChange :: r.updatedAt :: HNil
       )

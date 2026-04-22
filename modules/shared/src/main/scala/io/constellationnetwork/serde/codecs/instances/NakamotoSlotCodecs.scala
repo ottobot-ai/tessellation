@@ -49,8 +49,9 @@ object NakamotoSlotCodecs {
       int32 ::
       hashAliasCodec)
       .xmap[SlotCertificate](
-        { case s :: ps :: vp :: vo :: vpk :: eta :: aps :: aph :: HNil =>
-          SlotCertificate(s, ps, vp, vo, vpk, eta, aps, aph)
+        {
+          case s :: ps :: vp :: vo :: vpk :: eta :: aps :: aph :: HNil =>
+            SlotCertificate(s, ps, vp, vo, vpk, eta, aps, aph)
         },
         c => c.slot :: c.parentSlot :: c.vrfProof :: c.vrfOutput :: c.vrfPublicKey :: c.eta :: c.activePoolSize :: c.activePoolHash :: HNil
       )

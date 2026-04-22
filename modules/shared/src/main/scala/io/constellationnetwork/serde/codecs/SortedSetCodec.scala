@@ -11,15 +11,13 @@ import scodec.codecs.{listOfN, uint16}
   *
   * Wire format: 2-byte length prefix (uint16) + elements in sorted order.
   *
-  * Parallel to `NonEmptySetCodec.nonEmptySet` but accepts the empty case — `SortedSet` has no
-  * non-empty contract, unlike `NonEmptySet`. Zero-length prefix on decode returns `SortedSet.empty`
-  * rather than a failure.
+  * Parallel to `NonEmptySetCodec.nonEmptySet` but accepts the empty case — `SortedSet` has no non-empty contract, unlike `NonEmptySet`.
+  * Zero-length prefix on decode returns `SortedSet.empty` rather than a failure.
   *
-  * Determinism: `SortedSet`'s natural iteration is already `Order[A]`-sorted; both encode and
-  * decode go through the same sort order.
+  * Determinism: `SortedSet`'s natural iteration is already `Order[A]`-sorted; both encode and decode go through the same sort order.
   *
-  * Not marked implicit — call sites invoke `sortedSet(...)` explicitly with the element codec and
-  * its `Order[A]`, matching the `NonEmptySetCodec` / `SortedMapCodec` pattern.
+  * Not marked implicit — call sites invoke `sortedSet(...)` explicitly with the element codec and its `Order[A]`, matching the
+  * `NonEmptySetCodec` / `SortedMapCodec` pattern.
   *
   * Consensus contract: FROZEN. 2-byte count + sorted elements.
   */

@@ -9,8 +9,8 @@ import io.constellationnetwork.serde.codecs.offset._
 import eu.timepit.refined.types.numeric.NonNegInt
 import weaver.FunSuite
 
-/** Lens suite for `GlobalSnapshotStateProof` — exercises both the fixed-offset hashes at the
-  * head of the record and the dynamic-offset `mptRoot` field at the tail.
+/** Lens suite for `GlobalSnapshotStateProof` — exercises both the fixed-offset hashes at the head of the record and the dynamic-offset
+  * `mptRoot` field at the tail.
   */
 object GlobalSnapshotStateProofLensesSuite extends FunSuite {
 
@@ -19,16 +19,42 @@ object GlobalSnapshotStateProofLensesSuite extends FunSuite {
   private def merkleRoot = MerkleRoot(NonNegInt.unsafeFrom(7), h("dd"))
 
   private def allAbsent = GlobalSnapshotStateProof(
-    h("aa"), h("bb"), h("cc"),
-    None, None, None, None, None, None, None, None, None, None, None, None, None, None
+    h("aa"),
+    h("bb"),
+    h("cc"),
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None,
+    None
   )
 
   private def allPresent = GlobalSnapshotStateProof(
-    h("aa"), h("bb"), h("cc"),
+    h("aa"),
+    h("bb"),
+    h("cc"),
     Some(merkleRoot),
-    Some(h("01")), Some(h("02")), Some(h("03")), Some(h("04")),
-    Some(h("05")), Some(h("06")), Some(h("07")), Some(h("08")),
-    Some(h("09")), Some(h("0a")), Some(h("0b")), Some(h("0c")),
+    Some(h("01")),
+    Some(h("02")),
+    Some(h("03")),
+    Some(h("04")),
+    Some(h("05")),
+    Some(h("06")),
+    Some(h("07")),
+    Some(h("08")),
+    Some(h("09")),
+    Some(h("0a")),
+    Some(h("0b")),
+    Some(h("0c")),
     Some(h("0d"))
   )
 
@@ -36,12 +62,21 @@ object GlobalSnapshotStateProofLensesSuite extends FunSuite {
     val bytesA = GlobalSnapshotStateProofCodec.codec.encode(allAbsent).require.toByteVector
     val bytesP = GlobalSnapshotStateProofCodec.codec.encode(allPresent).require.toByteVector
 
-    expect(GlobalSnapshotStateProofLenses.lastStateChannelSnapshotHashesProof.read(bytesA).require == allAbsent.lastStateChannelSnapshotHashesProof) and
-      expect(GlobalSnapshotStateProofLenses.lastTxRefsProof.read(bytesA).require == allAbsent.lastTxRefsProof) and
-      expect(GlobalSnapshotStateProofLenses.balancesProof.read(bytesA).require == allAbsent.balancesProof) and
-      expect(GlobalSnapshotStateProofLenses.lastStateChannelSnapshotHashesProof.read(bytesP).require == allPresent.lastStateChannelSnapshotHashesProof) and
-      expect(GlobalSnapshotStateProofLenses.lastTxRefsProof.read(bytesP).require == allPresent.lastTxRefsProof) and
-      expect(GlobalSnapshotStateProofLenses.balancesProof.read(bytesP).require == allPresent.balancesProof)
+    expect(
+      GlobalSnapshotStateProofLenses.lastStateChannelSnapshotHashesProof
+        .read(bytesA)
+        .require == allAbsent.lastStateChannelSnapshotHashesProof
+    ).and(expect(GlobalSnapshotStateProofLenses.lastTxRefsProof.read(bytesA).require == allAbsent.lastTxRefsProof))
+      .and(expect(GlobalSnapshotStateProofLenses.balancesProof.read(bytesA).require == allAbsent.balancesProof))
+      .and(
+        expect(
+          GlobalSnapshotStateProofLenses.lastStateChannelSnapshotHashesProof
+            .read(bytesP)
+            .require == allPresent.lastStateChannelSnapshotHashesProof
+        )
+      )
+      .and(expect(GlobalSnapshotStateProofLenses.lastTxRefsProof.read(bytesP).require == allPresent.lastTxRefsProof))
+      .and(expect(GlobalSnapshotStateProofLenses.balancesProof.read(bytesP).require == allPresent.balancesProof))
   }
 
   test("mptRoot dynamic lens returns None when mptRoot is absent (all-absent layout)") {

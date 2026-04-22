@@ -35,6 +35,7 @@ import io.constellationnetwork.schema.snapshot.SnapshotMetadata
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 import io.constellationnetwork.validator.StateProofValidator
 
 import eu.timepit.refined.cats._

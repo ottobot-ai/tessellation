@@ -13,12 +13,10 @@ import scodec.Codec
 
 /** Byte-offset lenses for the `*Reference` family. All 40 bytes fixed-width:
   *
-  *   [0..7]   ordinal-like (8 bytes big-endian NonNegLong)
-  *   [8..39]  hash (32 raw bytes)
+  * [0..7] ordinal-like (8 bytes big-endian NonNegLong) [8..39] hash (32 raw bytes)
   *
-  * These lenses let a consumer read, for example, just the `hash` field of a
-  * `TransactionReference` from a byte slice on disk without decoding the ordinal or any surrounding
-  * record. The typical use is "given the first 2 parent-block-reference's hash in a `Block`
+  * These lenses let a consumer read, for example, just the `hash` field of a `TransactionReference` from a byte slice on disk without
+  * decoding the ordinal or any surrounding record. The typical use is "given the first 2 parent-block-reference's hash in a `Block`
   * serialization, walk the chain without loading the full blocks".
   */
 object BlockReferenceLenses {

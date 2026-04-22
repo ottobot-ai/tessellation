@@ -4,11 +4,7 @@ import cats.data.NonEmptySet
 
 import scala.collection.immutable.SortedSet
 
-import io.constellationnetwork.currency.schema.globalSnapshotSync.{
-  GlobalSnapshotSync,
-  GlobalSnapshotSyncOrdinal,
-  GlobalSyncView
-}
+import io.constellationnetwork.currency.schema.globalSnapshotSync.{GlobalSnapshotSync, GlobalSnapshotSyncOrdinal, GlobalSyncView}
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.swap.AllowSpend
@@ -34,8 +30,7 @@ import io.constellationnetwork.serde.codecs.instances.TokenLockCodec.{codec => t
 import scodec.Codec
 import shapeless.{::, HNil}
 
-/** Round of simple currency-path record codecs — the structural middle layer between atoms and
-  * the big snapshot compounds.
+/** Round of simple currency-path record codecs — the structural middle layer between atoms and the big snapshot compounds.
   */
 object CurrencyRecordCodecs {
 

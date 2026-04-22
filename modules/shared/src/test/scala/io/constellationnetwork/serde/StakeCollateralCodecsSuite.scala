@@ -31,8 +31,8 @@ import weaver.FunSuite
 
 /** Round-trip suite for the delegated-stake + node-collateral families.
   *
-  * Exercises: 1-variant ADT discriminators, `Signed[_]` around an ADT, Option[Hash],
-  * Option[DelegatedStakeAmount], and the composed record types.
+  * Exercises: 1-variant ADT discriminators, `Signed[_]` around an ADT, Option[Hash], Option[DelegatedStakeAmount], and the composed record
+  * types.
   */
 object StakeCollateralCodecsSuite extends FunSuite {
 

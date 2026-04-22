@@ -68,7 +68,20 @@ object GlobalSnapshotCodecsSuite extends FunSuite {
       Hash("a" * 64),
       Hash("b" * 64),
       Hash("c" * 64),
-      None, None, None, None, None, None, None, None, None, None, None, None, None, None
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None
     )
     val sample = GlobalIncrementalSnapshot(
       ordinal = SnapshotOrdinal(NonNegLong.unsafeFrom(10L)),

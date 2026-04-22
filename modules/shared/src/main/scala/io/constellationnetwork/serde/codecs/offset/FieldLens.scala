@@ -5,34 +5,32 @@ import scodec.{Attempt, Codec, Err}
 
 /** A read-only lens into a scodec-encoded byte slice for a specific field of `T`.
   *
-  * Purpose: O(1) byte-offset access to a single field without decoding the whole record. Enables
-  * "peek" operations like "read the `stateRoot` from a snapshot blob on disk" without materializing
-  * the rest of the struct.
+  * Purpose: O(1) byte-offset access to a single field without decoding the whole record. Enables "peek" operations like "read the
+  * `stateRoot` from a snapshot blob on disk" without materializing the rest of the struct.
   *
   * Two regimes:
   *   - **Fixed**: both `offset` and `length` are compile-time known. `read` is a direct slice.
-  *   - **Partial**: `offset` is known, but `length` depends on preceding Option discriminators or
-  *     variable-length prefixes that must be scanned. Constructed via `FieldLens.atDynamic`.
+  *   - **Partial**: `offset` is known, but `length` depends on preceding Option discriminators or variable-length prefixes that must be
+  *     scanned. Constructed via `FieldLens.atDynamic`.
   *
-  * All FieldLenses are strictly-typed against the record `T` they project from — a lens for
-  * `BlockReference.hash` cannot accidentally be used on a `TransactionReference` byte vector.
+  * All FieldLenses are strictly-typed against the record `T` they project from — a lens for `BlockReference.hash` cannot accidentally be
+  * used on a `TransactionReference` byte vector.
   */
 sealed trait FieldLens[T, F] {
 
   /** Byte offset in the encoded-`T` representation where this field begins. */
   def offset: Long
 
-  /** Decode just this field from a full-record byte vector. Fails with a `ScodecFailure` if the
-    * input is too short or the field codec rejects the bytes.
+  /** Decode just this field from a full-record byte vector. Fails with a `ScodecFailure` if the input is too short or the field codec
+    * rejects the bytes.
     */
   def read(bytes: ByteVector): Attempt[F]
 }
 
 object FieldLens {
 
-  /** A fixed-offset, fixed-length field. The byte slice `[offset, offset + length)` is handed to
-    * `codec` for decoding. This is the common case for consensus types that are byte-aligned by
-    * design.
+  /** A fixed-offset, fixed-length field. The byte slice `[offset, offset + length)` is handed to `codec` for decoding. This is the common
+    * case for consensus types that are byte-aligned by design.
     */
   final case class Fixed[T, F](
     offset: Long,
@@ -51,9 +49,9 @@ object FieldLens {
         codec.decode(bytes.slice(offset, offset + length).bits).map(_.value)
   }
 
-  /** A dynamic-offset field: a reader function must locate the field by scanning prefixes /
-    * discriminators. The `locate` function returns `(offset, length)` — if the field is present.
-    * `None` means the field isn't present in the encoded bytes (e.g. an Option field that's `None`).
+  /** A dynamic-offset field: a reader function must locate the field by scanning prefixes / discriminators. The `locate` function returns
+    * `(offset, length)` — if the field is present. `None` means the field isn't present in the encoded bytes (e.g. an Option field that's
+    * `None`).
     */
   final case class Dynamic[T, F](
     codec: Codec[F],
@@ -75,9 +73,8 @@ object FieldLens {
             codec.decode(bytes.slice(o, o + l).bits).map(_.value)
       }
 
-    /** Variant that surfaces absence without throwing a scodec error — useful for lifting the
-      * "field is optional and the byte stream says it's absent" case into ordinary Option-typed
-      * control flow.
+    /** Variant that surfaces absence without throwing a scodec error — useful for lifting the "field is optional and the byte stream says
+      * it's absent" case into ordinary Option-typed control flow.
       */
     def readOption(bytes: ByteVector): Attempt[Option[F]] =
       locate(bytes) match {
@@ -92,7 +89,7 @@ object FieldLens {
       }
   }
 
-  /** Build a fixed-offset lens.  */
+  /** Build a fixed-offset lens. */
   def fixed[T, F](offset: Long, length: Long, codec: Codec[F]): FieldLens[T, F] =
     Fixed(offset, length, codec)
 

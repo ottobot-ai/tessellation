@@ -5,14 +5,14 @@ import cats.effect.std.Semaphore
 import cats.effect.{Async, Ref}
 import cats.syntax.all._
 
-import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt._
 import io.constellationnetwork.security.mpt.producer._
+import io.constellationnetwork.serde.ImmutableCodec
+import io.constellationnetwork.serde.implicits._
 
-import io.circe.{Decoder, Encoder, Json}
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Captured snapshot of an MptStore's internal state. Call `restore` to roll back the store to the state at the time this savepoint was
@@ -22,21 +22,30 @@ trait MptStoreSavepoint[F[_]] {
   def restore: F[Unit]
 }
 
+/** Content-addressable key-value store with MPT commitment.
+  *
+  * Values are encoded via the canonical `ImmutableCodec[V]` typeclass (scodec-backed, byte-exact). A value type must have an
+  * `ImmutableCodec` instance to be stored — this replaces the earlier circe-based encoding and locks in consensus-stable byte layouts at
+  * the storage layer.
+  *
+  * Keys `K` are projected to `Hex` via the constructor-supplied `toHex` function (typically a hash of the canonical key encoding — for
+  * `GlobalStateKey` this is `GlobalStateKey.toHex`).
+  */
 trait MptStore[F[_], K] {
-  def get[V: Decoder](key: K): F[Option[V]]
-  def getMany[V: Decoder](keys: List[K]): F[Map[K, V]]
-  def insert[V: Encoder](key: K, value: V): F[Unit]
-  def insert[V: Encoder](entries: Map[K, V]): F[Unit]
+  def get[V: ImmutableCodec](key: K): F[Option[V]]
+  def getMany[V: ImmutableCodec](keys: List[K]): F[Map[K, V]]
+  def insert[V: ImmutableCodec](key: K, value: V): F[Unit]
+  def insert[V: ImmutableCodec](entries: Map[K, V]): F[Unit]
   def remove(key: K): F[Unit]
   def remove(keys: List[K]): F[Unit]
   def contains(key: K): F[Boolean]
   def isEmpty: F[Boolean]
   def clear: F[Unit]
   def build(ordinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]]
-  def sync[V: Encoder](newState: Map[K, V], ordinal: SnapshotOrdinal): F[Unit]
-  def syncFull[V: Encoder](newState: Map[K, V], ordinal: SnapshotOrdinal): F[Unit]
-  def syncFullIfNeeded[V: Encoder](newState: => F[Map[K, V]], ordinal: SnapshotOrdinal): F[Unit]
-  def update[V: Encoder](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit]
+  def sync[V: ImmutableCodec](newState: Map[K, V], ordinal: SnapshotOrdinal): F[Unit]
+  def syncFull[V: ImmutableCodec](newState: Map[K, V], ordinal: SnapshotOrdinal): F[Unit]
+  def syncFullIfNeeded[V: ImmutableCodec](newState: => F[Map[K, V]], ordinal: SnapshotOrdinal): F[Unit]
+  def update[V: ImmutableCodec](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit]
   def underlying: StatefulMerklePatriciaProducer[F]
   def deleteAbove(ordinal: SnapshotOrdinal): F[Unit]
 
@@ -53,7 +62,7 @@ trait MptStore[F[_], K] {
 
 object MptStore {
 
-  def make[F[_]: Async: Parallel: Hasher: JsonSerializer, K](
+  def make[F[_]: Async: Parallel: Hasher, K](
     producer: StatefulMerklePatriciaProducer[F],
     toHex: K => F[Hex]
   ): F[MptStore[F, K]] =
@@ -61,7 +70,7 @@ object MptStore {
       new Impl[F, K](producer, toHex, lastSyncedOrdinalRef, mutex): MptStore[F, K]
     }
 
-  private final class Impl[F[_]: Async: Parallel: Hasher: JsonSerializer, K](
+  private final class Impl[F[_]: Async: Parallel: Hasher, K](
     producer: StatefulMerklePatriciaProducer[F],
     toHex: K => F[Hex],
     lastSyncedOrdinalRef: Ref[F, Option[SnapshotOrdinal]],
@@ -88,52 +97,35 @@ object MptStore {
           Async[F].unit
       }
 
-    private def toHexEntries[V: Encoder](data: Map[K, V]): F[Map[Hex, Array[Byte]]] =
+    private def encode[V: ImmutableCodec](v: V): Array[Byte] =
+      ImmutableCodec[V].immutableBytes(v).toArray
+
+    private def toHexEntries[V: ImmutableCodec](data: Map[K, V]): F[Map[Hex, Array[Byte]]] =
       if (data.isEmpty) Map.empty[Hex, Array[Byte]].pure[F]
       else if (data.size <= BatchSize) {
         data.toList.parTraverse {
-          case (k, v) =>
-            for {
-              hex <- toHex(k)
-              bytes <- JsonSerializer[F].serialize(v)
-            } yield hex -> bytes
+          case (k, v) => toHex(k).map(_ -> encode(v))
         }.map(_.toMap)
       } else {
-        // Process all batches in parallel and combine results at the end
-        // This avoids O(n) map concatenation per batch
         val batches = data.toList.grouped(BatchSize).toList
         batches.parTraverse { batch =>
           batch.parTraverse {
-            case (k, v) =>
-              for {
-                hex <- toHex(k)
-                bytes <- JsonSerializer[F].serialize(v)
-              } yield hex -> bytes
+            case (k, v) => toHex(k).map(_ -> encode(v))
           }
-        }
-          .map(_.flatten.toMap)
+        }.map(_.flatten.toMap)
       }
 
-    private def deserializeBytes[V: Decoder](bytes: Array[Byte]): F[Option[V]] =
-      if (bytes == null || bytes.isEmpty) {
-        logger.warn("Attempted to deserialize null or empty bytes") >>
-          none[V].pure[F]
-      } else {
-        JsonSerializer[F].deserialize[Json](bytes).flatMap {
-          case Right(json) =>
-            json.as[V] match {
-              case Right(v) => v.some.pure[F]
-              case Left(err) =>
-                logger.warn(s"Failed to decode JSON: ${err.getMessage}") >>
-                  none[V].pure[F]
-            }
+    private def deserializeBytes[V: ImmutableCodec](bytes: Array[Byte]): F[Option[V]] =
+      if (bytes == null || bytes.isEmpty)
+        logger.warn("MptStore.deserializeBytes: null or empty input") >> none[V].pure[F]
+      else
+        scodec.bits.ByteVector.view(bytes).fromImmutableBytes[V] match {
+          case Right(v) => v.some.pure[F]
           case Left(err) =>
-            logger.warn(s"Failed to deserialize bytes: ${err.getMessage}") >>
-              none[V].pure[F]
+            logger.warn(s"MptStore.deserializeBytes: scodec decode failed: $err") >> none[V].pure[F]
         }
-      }
 
-    override def get[V: Decoder](key: K): F[Option[V]] =
+    override def get[V: ImmutableCodec](key: K): F[Option[V]] =
       for {
         hex <- toHex(key)
         entries <- producer.entries
@@ -142,14 +134,13 @@ object MptStore {
           case Some(bytes) if bytes != null && bytes.nonEmpty =>
             deserializeBytes[V](bytes)
           case Some(_) =>
-            logger.warn(s"MptStore.get: Found null/empty bytes for hex=$hex") >>
-              none[V].pure[F]
+            logger.warn(s"MptStore.get: Found null/empty bytes for hex=$hex") >> none[V].pure[F]
           case None =>
             none[V].pure[F]
         }
       } yield result
 
-    override def getMany[V: Decoder](keys: List[K]): F[Map[K, V]] =
+    override def getMany[V: ImmutableCodec](keys: List[K]): F[Map[K, V]] =
       if (keys.isEmpty) Map.empty[K, V].pure[F]
       else
         for {
@@ -161,22 +152,20 @@ object MptStore {
                 case Some(bytes) if bytes != null && bytes.nonEmpty =>
                   deserializeBytes[V](bytes).map(_.map(k -> _))
                 case Some(_) =>
-                  logger.warn(s"MptStore.getMany: Found null/empty bytes for hex=$hex") >>
-                    none[(K, V)].pure[F]
+                  logger.warn(s"MptStore.getMany: Found null/empty bytes for hex=$hex") >> none[(K, V)].pure[F]
                 case None =>
                   none[(K, V)].pure[F]
               }
           }
         } yield results.toMap
 
-    override def insert[V: Encoder](key: K, value: V): F[Unit] =
+    override def insert[V: ImmutableCodec](key: K, value: V): F[Unit] =
       for {
         hex <- toHex(key)
-        bytes <- JsonSerializer[F].serialize(value)
-        _ <- producer.insertBytes(Map(hex -> bytes)).void
+        _ <- producer.insertBytes(Map(hex -> encode(value))).void
       } yield ()
 
-    override def insert[V: Encoder](data: Map[K, V]): F[Unit] =
+    override def insert[V: ImmutableCodec](data: Map[K, V]): F[Unit] =
       if (data.isEmpty) Async[F].unit
       else
         for {
@@ -213,7 +202,7 @@ object MptStore {
     override def build(snapshotOrdinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
       producer.buildForOrdinal(snapshotOrdinal)
 
-    override def syncFull[V: Encoder](newState: Map[K, V], ordinal: SnapshotOrdinal): F[Unit] =
+    override def syncFull[V: ImmutableCodec](newState: Map[K, V], ordinal: SnapshotOrdinal): F[Unit] =
       mutex.permit.use { _ =>
         if (newState.isEmpty) {
           logger.info("[MptStore] Empty sync, skipping") >>
@@ -239,37 +228,28 @@ object MptStore {
           } yield ()
       }
 
-    override def syncFullIfNeeded[V: Encoder](newState: => F[Map[K, V]], ordinal: SnapshotOrdinal): F[Unit] =
-      // Use atomic modify to prevent race condition where two threads both see needsSync=true
+    override def syncFullIfNeeded[V: ImmutableCodec](newState: => F[Map[K, V]], ordinal: SnapshotOrdinal): F[Unit] =
       lastSyncedOrdinalRef.modify { lastOrdinal =>
         val needsSync = lastOrdinal.forall(_ =!= ordinal)
-        if (needsSync) {
-          // Mark as syncing with this ordinal immediately to prevent concurrent syncs
-          (Some(ordinal), true)
-        } else {
-          (lastOrdinal, false)
-        }
+        if (needsSync) (Some(ordinal), true)
+        else (lastOrdinal, false)
       }.flatMap { needsSync =>
-        if (needsSync)
-          newState.flatMap(syncFull(_, ordinal))
-        else
-          logger.debug(s"[MptStore] Skipping sync, already synced at ordinal $ordinal")
+        if (needsSync) newState.flatMap(syncFull(_, ordinal))
+        else logger.debug(s"[MptStore] Skipping sync, already synced at ordinal $ordinal")
       }
 
-    override def sync[V: Encoder](updates: Map[K, V], ordinal: SnapshotOrdinal): F[Unit] =
+    override def sync[V: ImmutableCodec](updates: Map[K, V], ordinal: SnapshotOrdinal): F[Unit] =
       if (updates.isEmpty) Async[F].unit
       else
         for {
           _ <- logger.debug(s"[MptStore] Incremental sync with ${updates.size} entries at ordinal=$ordinal")
           _ <- insert(updates)
           _ <- persistAsync(ordinal)
-          // Build the trie and cache root hash for this ordinal
-          // This is critical for validation - without this, getRootHashForOrdinal returns None
           _ <- build(ordinal).void
           _ <- lastSyncedOrdinalRef.set(Some(ordinal))
         } yield ()
 
-    override def update[V: Encoder](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit] =
+    override def update[V: ImmutableCodec](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit] =
       for {
         _ <- remove(toRemove.toList)
         _ <- insert(toUpsert)

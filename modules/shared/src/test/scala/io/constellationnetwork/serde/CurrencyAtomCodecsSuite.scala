@@ -30,9 +30,9 @@ object CurrencyAtomCodecsSuite extends FunSuite {
   test("MessageType Owner/Staking round-trip") {
     val o: MessageType = MessageType.Owner
     val s: MessageType = MessageType.Staking
-    expect(o.immutableBytes.fromImmutableBytes[MessageType] == Right(o)) and
-      expect(s.immutableBytes.fromImmutableBytes[MessageType] == Right(s)) and
-      expect(o.immutableBytes != s.immutableBytes)
+    expect(o.immutableBytes.fromImmutableBytes[MessageType] == Right(o))
+      .and(expect(s.immutableBytes.fromImmutableBytes[MessageType] == Right(s)))
+      .and(expect(o.immutableBytes != s.immutableBytes))
   }
 
   test("BalanceAdjustmentReason all variants round-trip") {
@@ -53,8 +53,7 @@ object CurrencyAtomCodecsSuite extends FunSuite {
   test("RoundId round-trips (UUID = 16 bytes)") {
     val r = RoundId(UUID.fromString("12345678-1234-1234-1234-123456789abc"))
     val bytes = r.immutableBytes
-    expect(bytes.length == 16L) and
-      expect(bytes.fromImmutableBytes[RoundId] == Right(r))
+    expect(bytes.length == 16L).and(expect(bytes.fromImmutableBytes[RoundId] == Right(r)))
   }
 
   test("SnapshotVersion accepts '0.0.1' and rejects arbitrary strings") {
@@ -84,8 +83,8 @@ object CurrencyAtomCodecsSuite extends FunSuite {
   test("SpendTransaction round-trips with all optional fields present and absent") {
     val withRefs = SpendTransaction(Some(Hash("a" * 64)), None, SwapAmount(PosLong.unsafeFrom(10L)), addr, addr)
     val noRefs = SpendTransaction(None, None, SwapAmount(PosLong.unsafeFrom(10L)), addr, addr)
-    expect(withRefs.immutableBytes.fromImmutableBytes[SpendTransaction] == Right(withRefs)) and
-      expect(noRefs.immutableBytes.fromImmutableBytes[SpendTransaction] == Right(noRefs))
+    expect(withRefs.immutableBytes.fromImmutableBytes[SpendTransaction] == Right(withRefs))
+      .and(expect(noRefs.immutableBytes.fromImmutableBytes[SpendTransaction] == Right(noRefs)))
   }
 
   test("TokenUnlock round-trips") {

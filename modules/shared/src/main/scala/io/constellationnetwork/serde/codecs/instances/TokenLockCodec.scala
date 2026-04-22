@@ -18,13 +18,13 @@ import shapeless.{::, HNil}
 /** Canonical scodec codec for `TokenLock` — 7-field record.
   *
   * Wire layout (declared field order):
-  *   - source               : Address
-  *   - amount               : TokenLockAmount        (8 bytes PosLong)
-  *   - fee                  : TokenLockFee           (8 bytes NonNegLong)
-  *   - parent               : TokenLockReference     (40 bytes)
-  *   - currencyId           : Option[CurrencyId]
-  *   - unlockEpoch          : Option[EpochProgress]  (1 + 8 bytes if Some)
-  *   - replaceTokenLockRef  : Option[Hash]           (1 + 32 bytes if Some)
+  *   - source : Address
+  *   - amount : TokenLockAmount (8 bytes PosLong)
+  *   - fee : TokenLockFee (8 bytes NonNegLong)
+  *   - parent : TokenLockReference (40 bytes)
+  *   - currencyId : Option[CurrencyId]
+  *   - unlockEpoch : Option[EpochProgress] (1 + 8 bytes if Some)
+  *   - replaceTokenLockRef : Option[Hash] (1 + 32 bytes if Some)
   *
   * Consensus contract: FROZEN.
   */
@@ -41,17 +41,19 @@ object TokenLockCodec {
     (addressCodec :: amountCodec :: feeCodec :: tokenLockRefCodec ::
       currencyIdOptCodec :: unlockEpochOptCodec :: replaceRefOptCodec)
       .xmap[TokenLock](
-        { case src :: amt :: fee :: parent :: cid :: unlock :: replace :: HNil =>
-          TokenLock(src, amt, fee, parent, cid, unlock, replace)
+        {
+          case src :: amt :: fee :: parent :: cid :: unlock :: replace :: HNil =>
+            TokenLock(src, amt, fee, parent, cid, unlock, replace)
         },
-        t => t.source ::
-          t.amount ::
-          t.fee ::
-          t.parent ::
-          t.currencyId ::
-          t.unlockEpoch ::
-          t.replaceTokenLockRef ::
-          HNil
+        t =>
+          t.source ::
+            t.amount ::
+            t.fee ::
+            t.parent ::
+            t.currencyId ::
+            t.unlockEpoch ::
+            t.replaceTokenLockRef ::
+            HNil
       )
 
   implicit val immutableCodec: ImmutableCodec[TokenLock] = ImmutableCodec.fromScodecCodec(codec)

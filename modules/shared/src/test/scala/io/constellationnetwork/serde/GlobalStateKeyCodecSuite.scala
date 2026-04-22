@@ -13,16 +13,13 @@ import io.constellationnetwork.serde.implicits._
 import scodec.bits.ByteVector
 import weaver.FunSuite
 
-/** Suite for the first sum-type codec: `PartitionNamespace` (5-variant ADT),
-  * `GlobalStateFieldId` (19 case objects), and the `GlobalStateKey`
-  * compound that binds them together.
+/** Suite for the first sum-type codec: `PartitionNamespace` (5-variant ADT), `GlobalStateFieldId` (19 case objects), and the
+  * `GlobalStateKey` compound that binds them together.
   *
   * Byte-layout contract:
-  *   - uint8 discriminator for `PartitionNamespace`: {Hypergraph=0, Empty=1,
-  *     Metagraph=2, Address=3, Hash=4}
+  *   - uint8 discriminator for `PartitionNamespace`: {Hypergraph=0, Empty=1, Metagraph=2, Address=3, Hash=4}
   *   - uint8 id for `GlobalStateFieldId` (0..18)
-  *   - `GlobalStateKey` is four fields concatenated: network | fieldId |
-  *     contract | user.
+  *   - `GlobalStateKey` is four fields concatenated: network | fieldId | contract | user.
   */
 object GlobalStateKeyCodecSuite extends FunSuite {
 
@@ -45,24 +42,20 @@ object GlobalStateKeyCodecSuite extends FunSuite {
   test("MetagraphNamespace(addr) encodes as 0x02 + address bytes") {
     val ns: PartitionNamespace = MetagraphNamespace(addr)
     val bytes = ns.immutableBytes
-    expect(bytes.head == 0x02.toByte) and
-      expect(bytes.tail == addressBytes(addr))
+    expect(bytes.head == 0x02.toByte).and(expect(bytes.tail == addressBytes(addr)))
   }
 
   test("AddressNamespace(addr) encodes as 0x03 + address bytes") {
     val ns: PartitionNamespace = AddressNamespace(addr)
     val bytes = ns.immutableBytes
-    expect(bytes.head == 0x03.toByte) and
-      expect(bytes.tail == addressBytes(addr))
+    expect(bytes.head == 0x03.toByte).and(expect(bytes.tail == addressBytes(addr)))
   }
 
   test("HashNamespace(h) encodes as 0x04 + 32-byte hash") {
     val h = Hash("ab" * 32)
     val ns: PartitionNamespace = HashNamespace(h)
     val bytes = ns.immutableBytes
-    expect(bytes.head == 0x04.toByte) and
-      expect(bytes.tail == ByteVector.fromValidHex("ab" * 32)) and
-      expect(bytes.length == 33L)
+    expect(bytes.head == 0x04.toByte).and(expect(bytes.tail == ByteVector.fromValidHex("ab" * 32))).and(expect(bytes.length == 33L))
   }
 
   test("Unknown discriminator byte fails decode") {
@@ -90,9 +83,9 @@ object GlobalStateKeyCodecSuite extends FunSuite {
   test("GlobalStateFieldId encodes as single byte matching `toInt`") {
     val samples: Seq[GlobalStateFieldId] = Seq(
       LastStateChannelSnapshotHashes, // 0
-      Balances,                       // 2
-      ActiveDelegatedStakes,          // 13
-      MetagraphSyncData               // 18
+      Balances, // 2
+      ActiveDelegatedStakes, // 13
+      MetagraphSyncData // 18
     )
     val actual = samples.map(_.immutableBytes)
     val expected = samples.map(f => ByteVector.fromByte(f.toInt.toByte))

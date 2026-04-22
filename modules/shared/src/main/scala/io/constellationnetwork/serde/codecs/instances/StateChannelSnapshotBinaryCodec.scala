@@ -13,9 +13,9 @@ import shapeless.{::, HNil}
 /** Canonical scodec codec for `StateChannelSnapshotBinary` — `(lastSnapshotHash, content, fee)`.
   *
   * Wire layout:
-  *   - lastSnapshotHash : Hash         (32 bytes)
-  *   - content          : Array[Byte]  (uint32 length + raw bytes)
-  *   - fee              : SnapshotFee  (8 bytes NonNegLong)
+  *   - lastSnapshotHash : Hash (32 bytes)
+  *   - content : Array[Byte] (uint32 length + raw bytes)
+  *   - fee : SnapshotFee (8 bytes NonNegLong)
   */
 object StateChannelSnapshotBinaryCodec {
 

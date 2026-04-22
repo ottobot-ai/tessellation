@@ -15,7 +15,7 @@ import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for the merkle-tree auxiliary types:
   *   - `ProofEntry` — `(target: Hash, sibling: Either[Hash, Hash])` (33 + 33 = 66 bytes).
-  *   - `Proof`      — `NonEmptyList[ProofEntry]`.
+  *   - `Proof` — `NonEmptyList[ProofEntry]`.
   *   - `MerkleTree` — `(leafCount: NonNegInt, nodes: NonEmptyList[Hash])`.
   *
   * `Proof` is the first codec to exercise the `EitherCodec` helper (in ProofEntry.sibling).

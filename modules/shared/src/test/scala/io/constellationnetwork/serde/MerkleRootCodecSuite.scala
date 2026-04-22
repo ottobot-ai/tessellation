@@ -28,8 +28,7 @@ object MerkleRootCodecSuite extends FunSuite {
 
   test("leafCount occupies first 4 bytes, hash occupies bytes 4..35") {
     val bytes = sample.immutableBytes
-    expect(bytes.take(4) == ByteVector.fromValidHex("0000002a")) and
-      expect(bytes.drop(4) == ByteVector.fromValidHex(sampleHashHex))
+    expect(bytes.take(4) == ByteVector.fromValidHex("0000002a")).and(expect(bytes.drop(4) == ByteVector.fromValidHex(sampleHashHex)))
   }
 
   test("MerkleRoot round-trips through the typeclass layer") {

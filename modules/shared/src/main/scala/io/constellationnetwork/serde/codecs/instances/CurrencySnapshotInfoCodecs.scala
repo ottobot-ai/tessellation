@@ -64,19 +64,21 @@ object CurrencySnapshotInfoCodecs {
       optionalHashCodec :: optionalHashCodec :: optionalHashCodec ::
       optionalHashCodec :: optionalHashCodec :: optionalHashCodec :: optionalHashCodec)
       .xmap[CurrencySnapshotStateProof](
-        { case tx :: bal :: msgs :: fee :: allowSp :: activeAllow :: globSync :: tokLock :: activeLocks :: HNil =>
-          CurrencySnapshotStateProof(tx, bal, msgs, fee, allowSp, activeAllow, globSync, tokLock, activeLocks)
+        {
+          case tx :: bal :: msgs :: fee :: allowSp :: activeAllow :: globSync :: tokLock :: activeLocks :: HNil =>
+            CurrencySnapshotStateProof(tx, bal, msgs, fee, allowSp, activeAllow, globSync, tokLock, activeLocks)
         },
-        p => p.lastTxRefsProof ::
-          p.balancesProof ::
-          p.lastMessagesProof ::
-          p.lastFeeTxRefsProof ::
-          p.lastAllowSpendRefsProof ::
-          p.activeAllowSpends ::
-          p.globalSnapshotSync ::
-          p.lastTokenLockRefsProof ::
-          p.activeTokenLocks ::
-          HNil
+        p =>
+          p.lastTxRefsProof ::
+            p.balancesProof ::
+            p.lastMessagesProof ::
+            p.lastFeeTxRefsProof ::
+            p.lastAllowSpendRefsProof ::
+            p.activeAllowSpends ::
+            p.globalSnapshotSync ::
+            p.lastTokenLockRefsProof ::
+            p.activeTokenLocks ::
+            HNil
       )
 
   implicit val currencySnapshotStateProofImmutableCodec: ImmutableCodec[CurrencySnapshotStateProof] =
@@ -145,19 +147,21 @@ object CurrencySnapshotInfoCodecs {
       optLastTokenLockRefsCodec ::
       optActiveTokenLocksCodec)
       .xmap[CurrencySnapshotInfo](
-        { case tx :: bal :: msgs :: fee :: allowSpR :: activeAllow :: gsync :: lockR :: activeLock :: HNil =>
-          CurrencySnapshotInfo(tx, bal, msgs, fee, allowSpR, activeAllow, gsync, lockR, activeLock)
+        {
+          case tx :: bal :: msgs :: fee :: allowSpR :: activeAllow :: gsync :: lockR :: activeLock :: HNil =>
+            CurrencySnapshotInfo(tx, bal, msgs, fee, allowSpR, activeAllow, gsync, lockR, activeLock)
         },
-        i => i.lastTxRefs ::
-          i.balances ::
-          i.lastMessages ::
-          i.lastFeeTxRefs ::
-          i.lastAllowSpendRefs ::
-          i.activeAllowSpends ::
-          i.globalSnapshotSyncView ::
-          i.lastTokenLockRefs ::
-          i.activeTokenLocks ::
-          HNil
+        i =>
+          i.lastTxRefs ::
+            i.balances ::
+            i.lastMessages ::
+            i.lastFeeTxRefs ::
+            i.lastAllowSpendRefs ::
+            i.activeAllowSpends ::
+            i.globalSnapshotSyncView ::
+            i.lastTokenLockRefs ::
+            i.activeTokenLocks ::
+            HNil
       )
 
   implicit val currencySnapshotInfoImmutableCodec: ImmutableCodec[CurrencySnapshotInfo] =

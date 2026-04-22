@@ -9,8 +9,7 @@ import scodec.Codec
 
 /** Canonical scodec codec for `PeerId` — single-field wrapper around `Hex`.
   *
-  * Same wire layout as `Id` (both wrap `Hex`) — length-prefixed raw bytes, not ASCII hex on the
-  * wire. Differs only in Scala-type identity.
+  * Same wire layout as `Id` (both wrap `Hex`) — length-prefixed raw bytes, not ASCII hex on the wire. Differs only in Scala-type identity.
   */
 object PeerIdCodec {
 

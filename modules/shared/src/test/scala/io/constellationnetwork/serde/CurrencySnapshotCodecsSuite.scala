@@ -47,7 +47,15 @@ object CurrencySnapshotCodecsSuite extends FunSuite {
     rewards = SortedSet.empty,
     tips = SnapshotTips(SortedSet.empty, SortedSet.empty),
     stateProof = CurrencySnapshotStateProof(
-      Hash("a" * 64), Hash("b" * 64), None, None, None, None, None, None, None
+      Hash("a" * 64),
+      Hash("b" * 64),
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None
     ),
     epochProgress = epoch.EpochProgress(NonNegLong.unsafeFrom(0L)),
     dataApplication = None,

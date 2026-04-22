@@ -51,10 +51,9 @@ import shapeless.{::, HNil}
   * Capstone codec for the info layer. Composes every inner-type codec built to this point.
   *
   * Wire layout matches the declared field order exactly:
-  *   1..3  — required maps (last-state-channel-hashes, last-tx-refs, balances)
-  *   4     — lastCurrencySnapshots: SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
-  *   5     — lastCurrencySnapshotsProofs: SortedMap[Address, Proof]
-  *   6..17 — 12 Option[SortedMap[_, _]] fields for post-V1 feature activations
+  * 1..3 — required maps (last-state-channel-hashes, last-tx-refs, balances) 4 — lastCurrencySnapshots: SortedMap[Address,
+  * Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]] 5 — lastCurrencySnapshotsProofs:
+  * SortedMap[Address, Proof] 6..17 — 12 Option[SortedMap[_, _]] fields for post-V1 feature activations
   */
 object GlobalSnapshotInfoCodec {
 
@@ -192,35 +191,50 @@ object GlobalSnapshotInfoCodec {
       priceStateOptCodec ::
       metagraphSyncDataOptCodec)
       .xmap[GlobalSnapshotInfo](
-        { case sch :: tx :: bal :: lcs :: lcsp ::
+        {
+          case sch :: tx :: bal :: lcs :: lcsp ::
               aas :: atl :: tlb :: lasr :: ltlr ::
               unp :: ads :: dsw :: anc :: ncw ::
               ps :: msd :: HNil =>
-          GlobalSnapshotInfo(
-            sch, tx, bal, lcs, lcsp,
-            aas, atl, tlb, lasr, ltlr,
-            unp, ads, dsw, anc, ncw,
-            ps, msd
-          )
+            GlobalSnapshotInfo(
+              sch,
+              tx,
+              bal,
+              lcs,
+              lcsp,
+              aas,
+              atl,
+              tlb,
+              lasr,
+              ltlr,
+              unp,
+              ads,
+              dsw,
+              anc,
+              ncw,
+              ps,
+              msd
+            )
         },
-        i => i.lastStateChannelSnapshotHashes ::
-          i.lastTxRefs ::
-          i.balances ::
-          i.lastCurrencySnapshots ::
-          i.lastCurrencySnapshotsProofs ::
-          i.activeAllowSpends ::
-          i.activeTokenLocks ::
-          i.tokenLockBalances ::
-          i.lastAllowSpendRefs ::
-          i.lastTokenLockRefs ::
-          i.updateNodeParameters ::
-          i.activeDelegatedStakes ::
-          i.delegatedStakesWithdrawals ::
-          i.activeNodeCollaterals ::
-          i.nodeCollateralWithdrawals ::
-          i.priceState ::
-          i.metagraphSyncData ::
-          HNil
+        i =>
+          i.lastStateChannelSnapshotHashes ::
+            i.lastTxRefs ::
+            i.balances ::
+            i.lastCurrencySnapshots ::
+            i.lastCurrencySnapshotsProofs ::
+            i.activeAllowSpends ::
+            i.activeTokenLocks ::
+            i.tokenLockBalances ::
+            i.lastAllowSpendRefs ::
+            i.lastTokenLockRefs ::
+            i.updateNodeParameters ::
+            i.activeDelegatedStakes ::
+            i.delegatedStakesWithdrawals ::
+            i.activeNodeCollaterals ::
+            i.nodeCollateralWithdrawals ::
+            i.priceState ::
+            i.metagraphSyncData ::
+            HNil
       )
 
   implicit val immutableCodec: ImmutableCodec[GlobalSnapshotInfo] = ImmutableCodec.fromScodecCodec(codec)

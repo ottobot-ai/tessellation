@@ -26,6 +26,16 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.{MerklePatriciaError, StatefulMerklePatriciaProducer}
 import io.constellationnetwork.security.mpt.{MerklePatriciaTrie, MptRoot}
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
+import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
+import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
+import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutable}
+import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{immutableCodec => metagraphSyncImmutable}
+import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
+import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{immutableCodec => tokenLockRefImmutable}
+import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.{immutableCodec => txRefImmutable}
 
 import io.circe.syntax.EncoderOps
 import io.circe.{Encoder, Json}

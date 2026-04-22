@@ -31,6 +31,7 @@ import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.security.hash.{Hash, ProofsHash}
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher, SecurityProvider}
+import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 
 import derevo.cats.show
 import derevo.derive

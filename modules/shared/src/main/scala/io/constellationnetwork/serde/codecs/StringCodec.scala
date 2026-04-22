@@ -2,6 +2,8 @@ package io.constellationnetwork.serde.codecs
 
 import java.nio.charset.StandardCharsets
 
+import io.constellationnetwork.serde.ImmutableCodec
+
 import scodec.bits.ByteVector
 import scodec.codecs.{uint16, variableSizeBytes}
 import scodec.{Attempt, Codec, Err}
@@ -10,12 +12,10 @@ import scodec.{Attempt, Codec, Err}
   *
   * Wire format: 2-byte UTF-8 byte-length prefix (uint16) + UTF-8 bytes.
   *
-  * Byte-length (not code-point-length) prefix so the decoder can size the payload exactly.
-  * Caps a string at 65,535 UTF-8 bytes — ample for node-metadata names, descriptions, labels.
-  * If a consensus string ever needs >64KB we'll add a dedicated `longString` alongside.
+  * Byte-length (not code-point-length) prefix so the decoder can size the payload exactly. Caps a string at 65,535 UTF-8 bytes — ample for
+  * node-metadata names, descriptions, labels. If a consensus string ever needs >64KB we'll add a dedicated `longString` alongside.
   *
-  * Consensus contract: FROZEN. Any change to the prefix width or charset breaks every historical
-  * hash that covers a string field.
+  * Consensus contract: FROZEN. Any change to the prefix width or charset breaks every historical hash that covers a string field.
   */
 object StringCodec {
 
@@ -30,4 +30,6 @@ object StringCodec {
           Attempt.successful(ByteVector.view(bytes))
       }
     )
+
+  implicit val immutableCodec: ImmutableCodec[String] = ImmutableCodec.fromScodecCodec(codec)
 }

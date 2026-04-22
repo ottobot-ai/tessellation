@@ -8,8 +8,8 @@ import shapeless.{::, HNil}
 
 /** Canonical scodec codec for `java.util.UUID`.
   *
-  * Wire format: 16 bytes = 8-byte big-endian mostSignificantBits + 8-byte big-endian leastSignificantBits.
-  * Fixed-width, random-access friendly.
+  * Wire format: 16 bytes = 8-byte big-endian mostSignificantBits + 8-byte big-endian leastSignificantBits. Fixed-width, random-access
+  * friendly.
   *
   * Consensus contract: FROZEN.
   */

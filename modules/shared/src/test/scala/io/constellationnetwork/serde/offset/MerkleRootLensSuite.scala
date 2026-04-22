@@ -15,9 +15,9 @@ object MerkleRootLensSuite extends FunSuite {
     val sample = MerkleRoot(NonNegInt.unsafeFrom(42), Hash("ab" * 32))
     val bytes = MerkleRootCodec.codec.encode(sample).require.toByteVector
 
-    expect(MerkleRootLenses.leafCount.read(bytes).require == sample.leafCount) and
-      expect(MerkleRootLenses.hash.read(bytes).require == sample.hash) and
-      expect(bytes.length == 36L)
+    expect(MerkleRootLenses.leafCount.read(bytes).require == sample.leafCount)
+      .and(expect(MerkleRootLenses.hash.read(bytes).require == sample.hash))
+      .and(expect(bytes.length == 36L))
   }
 
   test("MerkleRootLenses rejects truncated bytes") {

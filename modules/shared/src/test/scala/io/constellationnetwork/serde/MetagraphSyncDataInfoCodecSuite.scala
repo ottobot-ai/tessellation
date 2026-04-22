@@ -14,8 +14,8 @@ import weaver.FunSuite
 
 /** Round-trip + structural suite for `MetagraphSyncDataInfo`.
   *
-  * Exercises the `SortedSetCodec` helper end-to-end (with `SortedSet[SnapshotOrdinal]`), and
-  * demonstrates that the empty-set case has no non-emptiness invariant to worry about.
+  * Exercises the `SortedSetCodec` helper end-to-end (with `SortedSet[SnapshotOrdinal]`), and demonstrates that the empty-set case has no
+  * non-emptiness invariant to worry about.
   */
 object MetagraphSyncDataInfoCodecSuite extends FunSuite {
 
@@ -25,8 +25,7 @@ object MetagraphSyncDataInfoCodecSuite extends FunSuite {
   test("Empty unappliedOrdinals encodes to 8 + 8 + 2 = 18 bytes") {
     val sample = MetagraphSyncDataInfo(ord(10L), ep(3L), SortedSet.empty)
     val bytes = sample.immutableBytes
-    expect(bytes.length == 18L) and
-      expect(bytes.drop(16L) == ByteVector.fromValidHex("0000")) // empty set uint16
+    expect(bytes.length == 18L).and(expect(bytes.drop(16L) == ByteVector.fromValidHex("0000"))) // empty set uint16
   }
 
   test("Non-empty unappliedOrdinals round-trips") {

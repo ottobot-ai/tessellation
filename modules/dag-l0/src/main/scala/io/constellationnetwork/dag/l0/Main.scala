@@ -42,6 +42,7 @@ import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 
 import com.monovore.decline.Opts
 import eu.timepit.refined.auto._

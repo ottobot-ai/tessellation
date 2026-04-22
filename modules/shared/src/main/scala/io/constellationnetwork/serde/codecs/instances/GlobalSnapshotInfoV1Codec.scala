@@ -21,11 +21,11 @@ import shapeless.{::, HNil}
   *
   * Wire layout (three sorted maps in declaration order, each prefixed with a uint16 entry count):
   *   - lastStateChannelSnapshotHashes : SortedMap[Address, Hash]
-  *   - lastTxRefs                      : SortedMap[Address, TransactionReference]
-  *   - balances                        : SortedMap[Address, Balance]
+  *   - lastTxRefs : SortedMap[Address, TransactionReference]
+  *   - balances : SortedMap[Address, Balance]
   *
-  * V1 is frozen — never mutated. Historical V1 bytes on disk decode through this codec. The
-  * current `GlobalSnapshotInfo` (17 fields) is a separate codec in a follow-up commit.
+  * V1 is frozen — never mutated. Historical V1 bytes on disk decode through this codec. The current `GlobalSnapshotInfo` (17 fields) is a
+  * separate codec in a follow-up commit.
   */
 object GlobalSnapshotInfoV1Codec {
 
