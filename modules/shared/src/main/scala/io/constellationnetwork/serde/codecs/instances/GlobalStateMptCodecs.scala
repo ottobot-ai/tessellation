@@ -17,17 +17,14 @@ import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs._
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
 import io.constellationnetwork.serde.codecs.instances.TokenLockCodec.{codec => tokenLockCodec}
 
-/** Aggregator for the composite value-type `ImmutableCodec` instances stored in the global-state
-  * MPT via `MptStore[F, GlobalStateKey]`.
+/** Aggregator for the composite value-type `ImmutableCodec` instances stored in the global-state MPT via `MptStore[F, GlobalStateKey]`.
   *
-  * Leaf value types (Balance, TransactionReference, Hash, AllowSpendReference,
-  * TokenLockReference, MetagraphSyncDataInfo, Proof, CurrencySnapshotInfo) already have
-  * `ImmutableCodec` instances directly importable from their own codec modules — those are not
+  * Leaf value types (Balance, TransactionReference, Hash, AllowSpendReference, TokenLockReference, MetagraphSyncDataInfo, Proof,
+  * CurrencySnapshotInfo) already have `ImmutableCodec` instances directly importable from their own codec modules — those are not
   * re-exported here.
   *
-  * Composite types (`SortedSet[Signed[X]]`, `SortedSet[Y]`, `Signed[Z]`) are built from the
-  * leaf codecs + collection / wrapper helpers. This file exposes them as implicits for the
-  * call-site ergonomics of `store.get[SortedSet[Signed[AllowSpend]]](...)`.
+  * Composite types (`SortedSet[Signed[X]]`, `SortedSet[Y]`, `Signed[Z]`) are built from the leaf codecs + collection / wrapper helpers.
+  * This file exposes them as implicits for the call-site ergonomics of `store.get[SortedSet[Signed[AllowSpend]]](...)`.
   */
 object GlobalStateMptCodecs {
 
