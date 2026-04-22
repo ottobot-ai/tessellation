@@ -7,16 +7,21 @@ import scodec.bits.ByteVector
 
 /** Canonical, round-trippable byte representation of `T` — the "immutable" encoding.
   *
+  * These bytes serve two purposes interchangeably:
+  *   1. They are the bytes fed into a signing primitive. `sign(ImmutableCodec[T].immutableBytes(t), key)` is the single path for producing
+  *      a consensus signature. 2. They are the bytes hashed for content addressing.
+  *      `Hash.fromBytes(ImmutableCodec[T].immutableBytes(t).toArray)` is the single path for producing a consensus hash.
+  *
+  * No separate `Signable` typeclass exists — there is no case in the codebase where we want different bytes for signing vs. hashing, and
+  * merging the concepts keeps the mental model small. If a future type legitimately needs divergent signing bytes, introduce `Signable[T]`
+  * at that point, not prophylactically.
+  *
   * Laws:
   *   - Encoding is bit-exact and platform-independent.
   *   - `decode(encode(a)) == Right(a)` for all `a: T`.
   *   - `encode(decode(encode(a)).right.get) == encode(a)` (canonicality).
-  *   - Once defined for a consensus type and era, the encoding MUST NOT change.
-  *     New versions get a new type (e.g. `BlockV2`), or a new discriminator on a
-  *     `discriminated` codec — never an in-place mutation.
-  *
-  * This is typically identical to `Signable[T]`, plus a round-trip. Content-addressing
-  * uses these bytes: `Hash.fromBytes(ImmutableCodec[T].immutableBytes(t).toArray)`.
+  *   - Once defined for a consensus type and era, the encoding MUST NOT change. New versions get a new type (e.g. `BlockV2`), or a new
+  *     discriminator on a `discriminated` codec — never an in-place mutation.
   */
 trait ImmutableCodec[T] {
   def immutableBytes(value: T): ByteVector
@@ -26,8 +31,8 @@ trait ImmutableCodec[T] {
 object ImmutableCodec {
   def apply[T](implicit ev: ImmutableCodec[T]): ImmutableCodec[T] = ev
 
-  /** Build from a scodec `Codec`. The scodec codec is the single source of truth for
-    * both encode and decode — same bits in both directions. */
+  /** Build from a scodec `Codec`. The scodec codec is the single source of truth for both encode and decode — same bits in both directions.
+    */
   def fromScodecCodec[T](codec: Codec[T]): ImmutableCodec[T] = new ImmutableCodec[T] {
     def immutableBytes(value: T): ByteVector =
       codec.encode(value) match {
@@ -46,8 +51,9 @@ object ImmutableCodec {
   /** Summoner — picks up an implicit scodec `Codec` and builds the typeclass instance. */
   def derivedFromScodec[T](implicit codec: Codec[T]): ImmutableCodec[T] = fromScodecCodec[T](codec)
 
-  /** Build asymmetric instance from separate encoder/decoder when you're bridging two
-    * existing scodec pieces (uncommon — prefer `fromScodecCodec`). */
+  /** Build asymmetric instance from separate encoder/decoder when you're bridging two existing scodec pieces (uncommon — prefer
+    * `fromScodecCodec`).
+    */
   def fromScodec[T](enc: Encoder[T], dec: Decoder[T]): ImmutableCodec[T] = new ImmutableCodec[T] {
     def immutableBytes(value: T): ByteVector =
       enc.encode(value) match {

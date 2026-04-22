@@ -2,9 +2,8 @@ package io.constellationnetwork.serde.era
 
 /** A half-open ordinal range `[from, until)` with optional open upper bound.
   *
-  * Eras are configured as a *list* of these; every observable ordinal must fall inside
-  * exactly one era for a given (type, purpose). The registry validates non-overlap and
-  * contiguous coverage at startup.
+  * Eras are configured as a *list* of these; every observable ordinal must fall inside exactly one era for a given (type, purpose). The
+  * registry validates non-overlap and contiguous coverage at startup.
   */
 final case class OrdinalRange(from: Long, until: Option[Long]) {
   require(from >= 0L, s"OrdinalRange.from must be non-negative, got $from")

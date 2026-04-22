@@ -4,25 +4,25 @@ import cats.syntax.all._
 
 /** Dispatches (ordinal → SerdeEra) based on a configured list of half-open ranges.
   *
-  * Replaces the pattern-match in `Hasher.scala:50-58` with a data-driven registry so
-  * adding a third (or fourth) era is a config change, not a code change.
+  * Replaces the pattern-match in `Hasher.scala:50-58` with a data-driven registry so adding a third (or fourth) era is a config change, not
+  * a code change.
   *
   * Construction validates:
   *   - ranges are non-overlapping
   *   - ranges cover `[0, +∞)` with no gaps (the last range must be open-ended)
   *
-  * Use `EraCodecRegistry.fromRanges(...)` from config at startup; pass the registry
-  * wherever era-based dispatch is needed (snapshot decode, legacy bridge, etc.).
+  * Use `EraCodecRegistry.fromRanges(...)` from config at startup; pass the registry wherever era-based dispatch is needed (snapshot decode,
+  * legacy bridge, etc.).
   */
 final class EraCodecRegistry private (ranges: List[(OrdinalRange, SerdeEra)]) {
 
-  /** The era active for a given ordinal, or `None` if the config has a gap
-    * (shouldn't happen — the builder validates coverage). */
+  /** The era active for a given ordinal, or `None` if the config has a gap (shouldn't happen — the builder validates coverage).
+    */
   def eraFor(ordinal: Long): Option[SerdeEra] =
     ranges.collectFirst { case (r, era) if r.contains(ordinal) => era }
 
-  /** Era active at a given ordinal. Throws if the config is broken — validated at
-    * startup, so a runtime miss is a bug. */
+  /** Era active at a given ordinal. Throws if the config is broken — validated at startup, so a runtime miss is a bug.
+    */
   def eraForOrDie(ordinal: Long): SerdeEra =
     eraFor(ordinal).getOrElse(
       throw new IllegalStateException(
@@ -42,10 +42,11 @@ object EraCodecRegistry {
     *   - contiguous coverage from 0 upward
     *   - last range is open-ended (covers future ordinals)
     */
-  def fromRanges(raw: List[(OrdinalRange, SerdeEra)]): Either[String, EraCodecRegistry] = {
+  def fromRanges(raw: List[(OrdinalRange, SerdeEra)]): Either[String, EraCodecRegistry] =
     if (raw.isEmpty) Left("EraCodecRegistry requires at least one (range, era) entry").asRight.swap.leftMap(_ => "").swap.flatMap { _ =>
       Left("EraCodecRegistry requires at least one (range, era) entry")
-    } else {
+    }
+    else {
       val sorted = raw.sortBy(_._1.from)
 
       // 1. No overlaps.
@@ -80,11 +81,10 @@ object EraCodecRegistry {
       if (errors.nonEmpty) Left(errors.mkString("; "))
       else Right(new EraCodecRegistry(sorted))
     }
-  }
 
-  /** Default all-Scodec registry — one era covering [0, ∞). Useful for tests or for
-    * a fresh chain with no historical data. Production clusters configure the full
-    * kryo → json → scodec progression via HOCON. */
+  /** Default all-Scodec registry — one era covering [0, ∞). Useful for tests or for a fresh chain with no historical data. Production
+    * clusters configure the full kryo → json → scodec progression via HOCON.
+    */
   val defaultScodec: EraCodecRegistry =
     fromRanges(List(OrdinalRange.from(0L) -> SerdeEra.Scodec))
       .getOrElse(throw new IllegalStateException("defaultScodec registry failed to construct"))

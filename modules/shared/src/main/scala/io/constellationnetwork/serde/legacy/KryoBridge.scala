@@ -12,10 +12,9 @@ import scodec.bits.ByteVector
 
 /** Kryo-era bridge. Decodes historical kryo bytes into a modern type `T`.
   *
-  * Requires a `KryoSerializer[F]` instance because the existing deserializer is
-  * registration-aware (custom classes must be in the kryo registrar). The factory
-  * takes `F[_]` only to satisfy the typeclass dependency — the actual decode is
-  * synchronous (returns `Either`), matching `LegacyBridgeSerde`'s pure signature.
+  * Requires a `KryoSerializer[F]` instance because the existing deserializer is registration-aware (custom classes must be in the kryo
+  * registrar). The factory takes `F[_]` only to satisfy the typeclass dependency — the actual decode is synchronous (returns `Either`),
+  * matching `LegacyBridgeSerde`'s pure signature.
   *
   * Usage:
   * {{{

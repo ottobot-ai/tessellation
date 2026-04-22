@@ -11,14 +11,11 @@ import io.circe.Decoder
 import io.circe.parser.parse
 import scodec.bits.ByteVector
 
-/** JSON-era bridge. Decodes circe JSON bytes into a modern type `T` that has a
-  * `circe.Decoder` in scope.
+/** JSON-era bridge. Decodes circe JSON bytes into a modern type `T` that has a `circe.Decoder` in scope.
   *
-  * This is intentionally thin: bytes → UTF-8 string → circe parse → `Decoder[T]`.
-  * The original read path's behaviour is preserved (including lenient handling of
-  * unknown fields, which circe does by default). If a migration needs strict
-  * decoding — reject unknown fields — build a per-type bridge that uses a
-  * stricter Decoder.
+  * This is intentionally thin: bytes → UTF-8 string → circe parse → `Decoder[T]`. The original read path's behaviour is preserved
+  * (including lenient handling of unknown fields, which circe does by default). If a migration needs strict decoding — reject unknown
+  * fields — build a per-type bridge that uses a stricter Decoder.
   */
 object JsonBridge {
 

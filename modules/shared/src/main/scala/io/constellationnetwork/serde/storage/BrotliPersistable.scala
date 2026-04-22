@@ -11,28 +11,24 @@ import scodec.bits.ByteVector
 
 /** `Persistable[T]` that wraps an `ImmutableCodec[T]` with brotli compression.
   *
-  * The compressed bytes go to disk (MPT leaves, snapshot files, anything that
-  * wants storage economy). The UNCOMPRESSED `ImmutableCodec` bytes are what
-  * gets hashed — content-addressing never sees compressed bytes. That
-  * separation is load-bearing: a brotli version bump or compression-level
-  * change MUST NOT change any consensus-visible hash.
+  * The compressed bytes go to disk (MPT leaves, snapshot files, anything that wants storage economy). The UNCOMPRESSED `ImmutableCodec`
+  * bytes are what gets hashed — content-addressing never sees compressed bytes. That separation is load-bearing: a brotli version bump or
+  * compression-level change MUST NOT change any consensus-visible hash.
   *
-  * Compression level is a tuning knob, not a contract. Default 2 (fast, good
-  * ratio) matches the existing `JsonBrotliBinarySerializer`. Raising it trades
-  * CPU for smaller on-disk footprint.
+  * Compression level is a tuning knob, not a contract. Default 2 (fast, good ratio) matches the existing `JsonBrotliBinarySerializer`.
+  * Raising it trades CPU for smaller on-disk footprint.
   *
-  * Thread safety: brotli4j encoders/decoders are stateless after construction;
-  * the streaming encoder is per-call (new `BrotliOutputStream`). The native
-  * library is lazily loaded once via `Brotli4jLoader.ensureAvailability()`.
+  * Thread safety: brotli4j encoders/decoders are stateless after construction; the streaming encoder is per-call (new
+  * `BrotliOutputStream`). The native library is lazily loaded once via `Brotli4jLoader.ensureAvailability()`.
   */
 object BrotliPersistable {
 
-  /** Default compression level. Matches the historical choice for state-channel
-    * JSON+brotli in `JsonBrotliBinarySerializer.scala:22`. */
+  /** Default compression level. Matches the historical choice for state-channel JSON+brotli in `JsonBrotliBinarySerializer.scala:22`.
+    */
   val DefaultCompressionLevel: Int = 2
 
   // Ensure the native library loads once per JVM. Safe to call repeatedly.
-  locally { Brotli4jLoader.ensureAvailability() }
+  locally(Brotli4jLoader.ensureAvailability())
 
   /** Wrap an `ImmutableCodec[T]` into a brotli-compressed `Persistable[T]`. */
   def fromImmutableCodec[T](codec: ImmutableCodec[T], level: Int = DefaultCompressionLevel): Persistable[T] =

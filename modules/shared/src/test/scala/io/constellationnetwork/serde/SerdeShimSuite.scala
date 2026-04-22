@@ -10,9 +10,8 @@ import scodec.codecs.{int64, utf8_32}
 import shapeless.{::, HNil}
 import weaver.FunSuite
 
-/** Pilot type: an opaque struct that exercises the full shim. Not a consensus type —
-  * the shim tests only the plumbing. Real consensus codecs ship one per PR under
-  * `serde/scodec/instances/...`.
+/** Pilot type: an opaque struct that exercises the full shim. Not a consensus type — the shim tests only the plumbing. Real consensus
+  * codecs ship one per PR under `serde/scodec/instances/...`.
   */
 final case class PilotValue(counter: Long, label: String)
 
@@ -36,19 +35,11 @@ object SerdeShimSuite extends FunSuite {
 
   private val sample = PilotValue(counter = 42L, label = "hello")
 
-  test("Signable + ImmutableCodec agree on canonical bytes") {
-    val sig = Signable[PilotValue].signableBytes(sample)
-    val imm = ImmutableCodec[PilotValue].immutableBytes(sample)
-    // Reference both so `imm` is used — not just asserted via equality.
-    expect(sig.nonEmpty) and expect(imm.nonEmpty) and expect(sig == imm)
-  }
-
   test("ImmutableCodec round-trips and is canonical") {
     val bytes = sample.immutableBytes
     val decoded = bytes.fromImmutableBytes[PilotValue]
     val reEncoded = decoded.map(_.immutableBytes)
-    expect(decoded == Right(sample)) and
-      expect(reEncoded == Right(bytes))
+    expect(decoded == Right(sample)).and(expect(reEncoded == Right(bytes)))
   }
 
   test("Default Persistable matches ImmutableCodec (no compression)") {
@@ -61,9 +52,10 @@ object SerdeShimSuite extends FunSuite {
     val persisted = PilotValue.brotliPersistable.persistedBytes(sample)
     val decoded = PilotValue.brotliPersistable.fromPersistedBytes(persisted)
     val immutable = sample.immutableBytes
-    expect(decoded == Right(sample)) and
+    expect(decoded == Right(sample)).and(
       // Critical invariant: compressed disk bytes are NOT the hashable bytes.
       expect(persisted != immutable)
+    )
   }
 
   test("BrotliPersistable rejects non-brotli input as SerdeError.BrotliFailure") {
@@ -86,12 +78,12 @@ object SerdeShimSuite extends FunSuite {
       )
       .fold(e => throw new IllegalStateException(s"registry build failed: $e"), identity)
 
-    expect(registry.eraForOrDie(0L) == SerdeEra.Kryo) and
-      expect(registry.eraForOrDie(99L) == SerdeEra.Kryo) and
-      expect(registry.eraForOrDie(100L) == SerdeEra.Json) and
-      expect(registry.eraForOrDie(199L) == SerdeEra.Json) and
-      expect(registry.eraForOrDie(200L) == SerdeEra.Scodec) and
-      expect(registry.eraForOrDie(Long.MaxValue - 1) == SerdeEra.Scodec)
+    expect(registry.eraForOrDie(0L) == SerdeEra.Kryo)
+      .and(expect(registry.eraForOrDie(99L) == SerdeEra.Kryo))
+      .and(expect(registry.eraForOrDie(100L) == SerdeEra.Json))
+      .and(expect(registry.eraForOrDie(199L) == SerdeEra.Json))
+      .and(expect(registry.eraForOrDie(200L) == SerdeEra.Scodec))
+      .and(expect(registry.eraForOrDie(Long.MaxValue - 1) == SerdeEra.Scodec))
   }
 
   test("EraCodecRegistry rejects overlapping ranges") {
@@ -132,7 +124,6 @@ object SerdeShimSuite extends FunSuite {
 
   test("defaultScodec registry covers everything as Scodec") {
     val r = EraCodecRegistry.defaultScodec
-    expect(r.eraForOrDie(0L) == SerdeEra.Scodec) and
-      expect(r.eraForOrDie(Long.MaxValue - 1) == SerdeEra.Scodec)
+    expect(r.eraForOrDie(0L) == SerdeEra.Scodec).and(expect(r.eraForOrDie(Long.MaxValue - 1) == SerdeEra.Scodec))
   }
 }
