@@ -25,9 +25,13 @@ object NewtypeLongShapes {
 
   // Re-export the derivation implicits so a single import of this object brings
   // the full chain (shape witness + Codec[T] + ImmutableCodec[T]) into scope.
-  implicit def derivedCodec[T](implicit ev: NonNegLongNewtype[T]): Codec[T] =
+  // Uniquely named (not plain `derivedCodec`) so multiple shape re-exports can
+  // coexist in the same import scope without implicit resolution ambiguity —
+  // e.g. a file that imports NewtypeLongShapes._ AND SignedCodec._ can't have
+  // both re-exports named `derivedCodec`.
+  implicit def nonNegLongShapeCodec[T](implicit ev: NonNegLongNewtype[T]): Codec[T] =
     NonNegLongNewtype.derivedCodec[T]
-  implicit def derivedImmutableCodec[T](implicit ev: NonNegLongNewtype[T]): ImmutableCodec[T] =
+  implicit def nonNegLongShapeImmutableCodec[T](implicit ev: NonNegLongNewtype[T]): ImmutableCodec[T] =
     NonNegLongNewtype.derivedImmutableCodec[T]
 
   implicit val balanceShape: NonNegLongNewtype[Balance] =

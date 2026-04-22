@@ -9,10 +9,8 @@ import weaver.FunSuite
 
 /** Golden + round-trip suite for Hash. Wire layout: 32 raw bytes, fixed-width.
   *
-  * The legacy JSON / Kryo eras travelled Hash over the wire as 64 ASCII hex
-  * chars (64 bytes). The scodec era uses the raw 32-byte digest. Legacy bytes
-  * are still decodable via `legacy.JsonBridge` / `legacy.KryoBridge`; scodec-era
-  * writes produce only the 32-byte form.
+  * The legacy JSON / Kryo eras travelled Hash over the wire as 64 ASCII hex chars (64 bytes). The scodec era uses the raw 32-byte digest.
+  * Legacy bytes are still decodable via `legacy.JsonBridge` / `legacy.KryoBridge`; scodec-era writes produce only the 32-byte form.
   */
 object HashCodecSuite extends FunSuite {
 
@@ -35,8 +33,7 @@ object HashCodecSuite extends FunSuite {
   test("non-zero Hash round-trips through 32-byte encoding") {
     val bytes = sample.immutableBytes
     val decoded = bytes.fromImmutableBytes[Hash]
-    expect(decoded == Right(sample)) and
-      expect(bytes.length == 32L)
+    expect(decoded == Right(sample)).and(expect(bytes.length == 32L))
   }
 
   test("every Hash encodes to exactly 32 bytes") {

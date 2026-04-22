@@ -8,23 +8,18 @@ import io.constellationnetwork.serde.codecs.NonNegLongNewtype
 import scodec.Codec
 import shapeless.{::, HNil}
 
-/** Canonical scodec codec for `TransactionReference` — first compound type in
-  * the scodec era.
+/** Canonical scodec codec for `TransactionReference` — first compound type in the scodec era.
   *
   * Wire layout (fixed-width, total 40 bytes):
-  *   - bytes  0..7  : ordinal   (TransactionOrdinal → 8 bytes big-endian int64)
-  *   - bytes  8..39 : hash      (Hash              → 32 raw bytes)
+  *   - bytes 0..7 : ordinal (TransactionOrdinal → 8 bytes big-endian int64)
+  *   - bytes 8..39 : hash (Hash → 32 raw bytes)
   *
-  * Because both fields are fixed-width, byte-offset random access works on the
-  * encoded record: jump to offset 8 to read the hash without touching the
-  * ordinal. This is the property the MPT-as-primary workstream wants for leaf
-  * records. Adding a variable-length field to `TransactionReference` would
-  * break that and require this codec file to be rewritten.
+  * Because both fields are fixed-width, byte-offset random access works on the encoded record: jump to offset 8 to read the hash without
+  * touching the ordinal. This is the property the MPT-as-primary workstream wants for leaf records. Adding a variable-length field to
+  * `TransactionReference` would break that and require this codec file to be rewritten.
   *
-  * Compound codec pattern — no reflection / no derivation. The `::` HList
-  * syntax from shapeless wires field codecs in an explicit order. A refactor
-  * that reorders fields requires editing this file to match, making silent
-  * byte drift impossible.
+  * Compound codec pattern — no reflection / no derivation. The `::` HList syntax from shapeless wires field codecs in an explicit order. A
+  * refactor that reorders fields requires editing this file to match, making silent byte drift impossible.
   *
   * Consensus contract: FROZEN. 40 bytes, ordinal-then-hash, fixed widths.
   *

@@ -11,12 +11,10 @@ import weaver.FunSuite
 
 /** Golden + round-trip suite for the newtype-over-NonNegLong family.
   *
-  * These types all share the same shape: `case class X(value: NonNegLong)`.
-  * Their codec is a one-liner (`nonNegLongCodec.xmap(X(_), _.value)`) and their
-  * on-wire bytes are identical to `Balance`: 8 bytes big-endian non-negative
-  * int64. The canary here proves the pattern replicates cleanly — if a future
-  * codec refactor somehow produces different bytes for the same logical value,
-  * one of these tests fails and the drift is caught immediately.
+  * These types all share the same shape: `case class X(value: NonNegLong)`. Their codec is a one-liner (`nonNegLongCodec.xmap(X(_),
+  * _.value)`) and their on-wire bytes are identical to `Balance`: 8 bytes big-endian non-negative int64. The canary here proves the pattern
+  * replicates cleanly — if a future codec refactor somehow produces different bytes for the same logical value, one of these tests fails
+  * and the drift is caught immediately.
   */
 object NewtypeLongCodecsSuite extends FunSuite {
 
@@ -58,9 +56,9 @@ object NewtypeLongCodecsSuite extends FunSuite {
   }
 
   test("all three newtype codecs produce exactly 8 bytes (fixed-width int64)") {
-    expect(amountSample.immutableBytes.length == 8L) and
-      expect(ordinalSample.immutableBytes.length == 8L) and
-      expect(epochSample.immutableBytes.length == 8L)
+    expect(amountSample.immutableBytes.length == 8L)
+      .and(expect(ordinalSample.immutableBytes.length == 8L))
+      .and(expect(epochSample.immutableBytes.length == 8L))
   }
 
   test("different newtype values with the same underlying Long produce identical bytes") {
@@ -72,6 +70,6 @@ object NewtypeLongCodecsSuite extends FunSuite {
     // their bytes for the same numeric value are identical. Call sites that
     // need type-distinct encoding (e.g. an MPT key namespace) must add an
     // explicit type tag upstream of the codec.
-    expect(asAmount == asOrdinal) and expect(asOrdinal == asEpoch)
+    expect(asAmount == asOrdinal).and(expect(asOrdinal == asEpoch))
   }
 }

@@ -10,11 +10,9 @@ import weaver.FunSuite
 
 /** Golden + round-trip + validator-rejection tests for `Address`.
   *
-  * `DAGAddressRefined` is a non-trivial refiner: length=40, `DAG` prefix,
-  * digit-sum parity, base58 suffix, plus the Stardust Collective whitelist
-  * exception. On decode the raw bytes are re-routed through `refineV` —
-  * malformed bytes must produce `SerdeError.ScodecFailure`, not silent
-  * acceptance.
+  * `DAGAddressRefined` is a non-trivial refiner: length=40, `DAG` prefix, digit-sum parity, base58 suffix, plus the Stardust Collective
+  * whitelist exception. On decode the raw bytes are re-routed through `refineV` — malformed bytes must produce `SerdeError.ScodecFailure`,
+  * not silent acceptance.
   */
 object AddressCodecSuite extends FunSuite {
 
@@ -36,16 +34,15 @@ object AddressCodecSuite extends FunSuite {
 
   test("normal-address wire format is 1-byte length prefix + 40 ASCII bytes") {
     val bytes = normalSample.immutableBytes
-    expect(bytes.length == 41L) and
-      expect(bytes.head == 0x28.toByte) and
-      expect(new String(bytes.tail.toArray, "US-ASCII") == normalAddrLiteral)
+    expect(bytes.length == 41L)
+      .and(expect(bytes.head == 0x28.toByte))
+      .and(expect(new String(bytes.tail.toArray, "US-ASCII") == normalAddrLiteral))
   }
 
   test("Stardust Collective 51-char address round-trips") {
     val bytes = stardustSample.immutableBytes
     val decoded = bytes.fromImmutableBytes[io.constellationnetwork.schema.address.Address]
-    expect(decoded == Right(stardustSample)) and
-      expect(bytes.length == 52L) // 1 length byte + 51 ASCII bytes
+    expect(decoded == Right(stardustSample)).and(expect(bytes.length == 52L)) // 1 length byte + 51 ASCII bytes
   }
 
   test("decoding bytes that ASCII-parse but fail the refiner yields SerdeError.ScodecFailure") {

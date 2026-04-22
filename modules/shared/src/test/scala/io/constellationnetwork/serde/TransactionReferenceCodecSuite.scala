@@ -9,12 +9,10 @@ import eu.timepit.refined.types.numeric.NonNegLong
 import scodec.bits.ByteVector
 import weaver.FunSuite
 
-/** Golden + round-trip suite for `TransactionReference` — the first compound
-  * scodec-era codec.
+/** Golden + round-trip suite for `TransactionReference` — the first compound scodec-era codec.
   *
-  * Fixed 40-byte layout: `[ordinal:8][hash:32]`. Tests both the full encoding
-  * and the byte-offset random-access property (hash at offset 8) that the
-  * MPT-as-primary workstream depends on.
+  * Fixed 40-byte layout: `[ordinal:8][hash:32]`. Tests both the full encoding and the byte-offset random-access property (hash at offset 8)
+  * that the MPT-as-primary workstream depends on.
   */
 object TransactionReferenceCodecSuite extends FunSuite {
 
@@ -51,8 +49,7 @@ object TransactionReferenceCodecSuite extends FunSuite {
   test("hash bytes occupy bytes 8..39 (byte-offset random access)") {
     val encoded = sample.immutableBytes
     val hashSlice = encoded.drop(8)
-    expect(hashSlice == ByteVector.fromValidHex(sampleHashHex)) and
-      expect(hashSlice.length == 32L)
+    expect(hashSlice == ByteVector.fromValidHex(sampleHashHex)).and(expect(hashSlice.length == 32L))
   }
 
   test("round-trip preserves both fields independently") {

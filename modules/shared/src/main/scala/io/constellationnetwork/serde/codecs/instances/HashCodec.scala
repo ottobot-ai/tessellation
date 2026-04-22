@@ -9,28 +9,21 @@ import scodec.{Attempt, Codec, Err}
 
 /** Canonical scodec codecs for content-address hash types (`Hash`, `ProofsHash`).
   *
-  * Wire format: **32 raw bytes** — the underlying sha-256 digest. The existing
-  * Scala type `Hash(value: String)` stores the digest as a 64-character
-  * lowercase hex string; the codec converts hex↔bytes at the boundary. That
-  * means:
+  * Wire format: **32 raw bytes** — the underlying sha-256 digest. The existing Scala type `Hash(value: String)` stores the digest as a
+  * 64-character lowercase hex string; the codec converts hex↔bytes at the boundary. That means:
   *   - Encode: take the 64-char hex string, parse to 32 bytes.
   *   - Decode: take 32 bytes, render as 64-char lowercase hex.
   *
-  * This is a deliberate departure from the JSON / Kryo era, where hash bytes
-  * travelled over the wire as UTF-8-encoded ASCII hex (64 bytes per hash).
-  * The scodec era halves hash storage cost and uses the same 32-byte
-  * representation as every other content-address system in the industry.
-  * Historical JSON / Kryo bytes are decoded through `legacy.JsonBridge` /
-  * `legacy.KryoBridge`, which parse the hex-string form; scodec-era writes
-  * only produce 32-byte form.
+  * This is a deliberate departure from the JSON / Kryo era, where hash bytes travelled over the wire as UTF-8-encoded ASCII hex (64 bytes
+  * per hash). The scodec era halves hash storage cost and uses the same 32-byte representation as every other content-address system in the
+  * industry. Historical JSON / Kryo bytes are decoded through `legacy.JsonBridge` / `legacy.KryoBridge`, which parse the hex-string form;
+  * scodec-era writes only produce 32-byte form.
   *
-  * Consensus contract: FROZEN. 32 bytes, length-prefixed? NO — we use a
-  * fixed-width 32 bytes; every `Hash` is exactly 32 bytes on the wire. Any
-  * byte sequence of length != 32 is a decode failure.
+  * Consensus contract: FROZEN. 32 bytes, length-prefixed? NO — we use a fixed-width 32 bytes; every `Hash` is exactly 32 bytes on the wire.
+  * Any byte sequence of length != 32 is a decode failure.
   *
   * Goldens:
-  *   - `Hash-scodec-v1.hex` — 32 zero bytes for `Hash.empty` (the empty-hash
-  *     canary used throughout the codebase).
+  *   - `Hash-scodec-v1.hex` — 32 zero bytes for `Hash.empty` (the empty-hash canary used throughout the codebase).
   */
 object HashCodec {
 
@@ -42,8 +35,8 @@ object HashCodec {
   /** Convert a 32-byte ByteVector → lowercase hex string of length 64. */
   private def toHex(bv: ByteVector): String = bv.toHex
 
-  /** Parse a 64-char lowercase hex string → 32-byte ByteVector. Rejects malformed
-    * input (odd length, non-hex chars, or wrong length). */
+  /** Parse a 64-char lowercase hex string → 32-byte ByteVector. Rejects malformed input (odd length, non-hex chars, or wrong length).
+    */
   private def fromHex(s: String): Attempt[ByteVector] =
     if (s.length != HexCharLength)
       Attempt.failure(Err(s"Hash hex string must be exactly $HexCharLength chars, got ${s.length}"))
@@ -61,8 +54,8 @@ object HashCodec {
 
   implicit val immutableCodec: ImmutableCodec[Hash] = ImmutableCodec.fromScodecCodec(codec)
 
-  /** Same byte layout as `Hash` — `ProofsHash` is a parallel newtype around the
-    * same 64-hex-char representation. */
+  /** Same byte layout as `Hash` — `ProofsHash` is a parallel newtype around the same 64-hex-char representation.
+    */
   implicit val proofsCodec: Codec[ProofsHash] =
     bytes32.exmap(
       (bv: ByteVector) => Attempt.successful(ProofsHash(toHex(bv))),
