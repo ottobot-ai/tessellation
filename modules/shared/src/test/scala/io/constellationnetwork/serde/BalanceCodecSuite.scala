@@ -3,7 +3,7 @@ package io.constellationnetwork.serde
 import scala.util.Random
 
 import io.constellationnetwork.schema.balance.Balance
-import io.constellationnetwork.serde.codecs.instances.BalanceCodec._
+import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.implicits._
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -16,10 +16,9 @@ import weaver.FunSuite
   *   - canonicality: encode(decode(encode(x))) == encode(x)
   *   - golden byte compatibility: encode(knownValue) == known bytes
   *
-  * The golden test is the canary. If a PR changes `Balance` or its codec such that
-  * the known-value bytes drift, this test fails and the change must be made
-  * explicit (via a new type `BalanceV2` or equivalent) rather than silently
-  * breaking every historical signature and hash.
+  * The golden test is the canary. If a PR changes `Balance` or its codec such that the known-value bytes drift, this test fails and the
+  * change must be made explicit (via a new type `BalanceV2` or equivalent) rather than silently breaking every historical signature and
+  * hash.
   */
 object BalanceCodecSuite extends FunSuite {
 
