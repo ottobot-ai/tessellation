@@ -264,7 +264,7 @@ object GlobalSnapshotInfo {
   def mptStateProof[F[_]: Parallel: Async: Hasher: JsonSerializer](info: GlobalSnapshotInfo)(
     implicit stateProofSelector: StateProofSelector
   ): F[GlobalSnapshotStateProof] =
-    info.allStateEntries.buildMpt.map { mptRoot =>
+    info.allStateEntriesAsBytes.buildMptFromBytes.map { mptRoot =>
       GlobalSnapshotStateProof.apply(
         Hash.empty,
         Hash.empty,

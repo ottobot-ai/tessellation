@@ -43,6 +43,12 @@ trait MptStore[F[_], K] {
   def clear: F[Unit]
   def build(ordinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]]
   def sync[V: ImmutableCodec](newState: Map[K, V], ordinal: SnapshotOrdinal): F[Unit]
+
+  /** Finalize an incremental sync at `ordinal` without inserting new entries. Use after a sequence of typed `insert[V]` calls to trigger
+    * build + persist + last-synced-ordinal bookkeeping (same tail work as `sync`, but for callers that did the insert phase themselves with
+    * per-field codecs).
+    */
+  def commit(ordinal: SnapshotOrdinal): F[Unit]
   def syncFull[V: ImmutableCodec](newState: Map[K, V], ordinal: SnapshotOrdinal): F[Unit]
   def syncFullIfNeeded[V: ImmutableCodec](newState: => F[Map[K, V]], ordinal: SnapshotOrdinal): F[Unit]
   def update[V: ImmutableCodec](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit]
@@ -248,6 +254,14 @@ object MptStore {
           _ <- build(ordinal).void
           _ <- lastSyncedOrdinalRef.set(Some(ordinal))
         } yield ()
+
+    override def commit(ordinal: SnapshotOrdinal): F[Unit] =
+      for {
+        _ <- logger.debug(s"[MptStore] Commit at ordinal=$ordinal")
+        _ <- persistAsync(ordinal)
+        _ <- build(ordinal).void
+        _ <- lastSyncedOrdinalRef.set(Some(ordinal))
+      } yield ()
 
     override def update[V: ImmutableCodec](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit] =
       for {

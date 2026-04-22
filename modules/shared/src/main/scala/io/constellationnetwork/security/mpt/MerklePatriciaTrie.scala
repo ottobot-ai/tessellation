@@ -8,7 +8,7 @@ import scala.annotation.tailrec
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.mpt.producer.MerklePatriciaProducer
+import io.constellationnetwork.security.mpt.producer.{MerklePatriciaProducer, ParallelMerklePatriciaProducer}
 
 import io.circe._
 import io.circe.syntax._
@@ -34,6 +34,9 @@ object MerklePatriciaTrie {
     MerklePatriciaProducer
       .stateless[F]
       .create(data)
+
+  def makeParallelFromBytes[F[_]: Hasher: Async: Parallel: JsonSerializer](data: Map[Hex, Array[Byte]]): F[MerklePatriciaTrie] =
+    ParallelMerklePatriciaProducer[F].createFromBytes(data)
 
   def makeParallel[F[_]: Hasher: Async: Parallel: JsonSerializer, A: Encoder](data: Map[Hex, A]): F[MerklePatriciaTrie] =
     MerklePatriciaProducer

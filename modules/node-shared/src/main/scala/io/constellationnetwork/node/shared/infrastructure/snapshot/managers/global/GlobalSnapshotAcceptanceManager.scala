@@ -1180,48 +1180,65 @@ object GlobalSnapshotAcceptanceManager {
             }
             incrementalProof <- builder.buildProof(gsi, ordinal)
 
-            // Verify incremental vs full-rebuild for correctness.
-            // With undo journal: divergence should be impossible (journal tracks mutations).
-            // Without journal: self-healing full resync on divergence.
+            // Verify incremental vs full-rebuild for correctness — only applies when MPT is the
+            // active proof format. For LegacyFormat ordinals the "mptRoot" field is absent on the
+            // builder proof; any mismatch vs `mptStateProof` is expected and must not trigger a
+            // resync (which would needlessly thrash the MPT state).
+            isMptFormat = globalStateProofSelector.select(ordinal) == MerklePatriciaFormat
             incrementalRoot = incrementalProof.mptRoot.map(_.show).getOrElse("none")
-            verifyProof <- GlobalSnapshotInfo.mptStateProof[F](gsi)
-            verifyRoot = verifyProof.mptRoot.map(_.show).getOrElse("none")
 
             stateProof <-
-              if (incrementalRoot == verifyRoot) {
+              if (!isMptFormat) {
                 loggerBundle.app
                   .info(
-                    s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptRoot=${incrementalRoot.take(12)} " +
-                      s"mptConsistency=MATCH " +
+                    s"[ACCEPTANCE] ordinal=$ordinal stateProof: format=LEGACY (MPT check skipped) " +
                       s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
                   )
                   .as(incrementalProof)
               } else {
-                // Fork switch detected — stateRef is polluted from abandoned branch.
                 for {
-                  allEntries <- gsi.allStateEntries[F]
-                  _ <- loggerBundle.app.warn(
-                    s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptConsistency=DIVERGED " +
-                      s"incremental=${incrementalRoot.take(12)} rebuild=${verifyRoot.take(12)} " +
-                      s"ACTION=full_resync entries=${allEntries.size} " +
-                      s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
-                  )
-                  _ <- mptStore.syncFull(allEntries, ordinal)
-                  healedProof <- builder.buildProof(gsi, ordinal)
-                  healedRoot = healedProof.mptRoot.map(_.show).getOrElse("none")
-                  _ <-
-                    if (healedRoot == verifyRoot)
-                      loggerBundle.app.info(
-                        s"[ACCEPTANCE] ordinal=$ordinal MPT healed: mptRoot=${healedRoot.take(12)} MATCH after resync"
-                      )
-                    else
-                      loggerBundle.app.error(
-                        s"[ACCEPTANCE] ordinal=$ordinal MPT STILL DIVERGED after resync: " +
-                          s"healed=${healedRoot.take(12)} expected=${verifyRoot.take(12)}"
-                      )
-                  // Also reset journal state after full resync
-                  _ <- undoJournal.traverse_(_.pruneBelow(ordinal.value.value))
-                } yield verifyProof
+                  verifyProof <- GlobalSnapshotInfo.mptStateProof[F](gsi)
+                  verifyRoot = verifyProof.mptRoot.map(_.show).getOrElse("none")
+                  result <-
+                    if (incrementalRoot == verifyRoot) {
+                      loggerBundle.app
+                        .info(
+                          s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptRoot=${incrementalRoot.take(12)} " +
+                            s"mptConsistency=MATCH " +
+                            s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
+                        )
+                        .as(incrementalProof)
+                    } else {
+                      // Fork switch detected — stateRef is polluted from abandoned branch.
+                      // Resync from GSI via the typed-scodec path so the MPT bytes stay readable
+                      // by typed decoders (`getActiveTokenLocks`, etc.). The old path used
+                      // `allStateEntries` (JSON) + `syncFull[Json]`, which produced UTF-8 JSON
+                      // bytes the scodec typed reads can't decode.
+                      for {
+                        _ <- loggerBundle.app.warn(
+                          s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptConsistency=DIVERGED " +
+                            s"incremental=${incrementalRoot.take(12)} rebuild=${verifyRoot.take(12)} " +
+                            s"ACTION=typed_resync " +
+                            s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
+                        )
+                        _ <- mptStore.syncFromGlobalSnapshotInfo(gsi, ordinal)
+                        healedProof <- builder.buildProof(gsi, ordinal)
+                        healedRoot = healedProof.mptRoot.map(_.show).getOrElse("none")
+                        _ <-
+                          if (healedRoot == verifyRoot)
+                            loggerBundle.app.info(
+                              s"[ACCEPTANCE] ordinal=$ordinal MPT healed: mptRoot=${healedRoot.take(12)} MATCH after resync"
+                            )
+                          else
+                            loggerBundle.app.error(
+                              s"[ACCEPTANCE] ordinal=$ordinal MPT STILL DIVERGED after resync: " +
+                                s"healed=${healedRoot.take(12)} expected=${verifyRoot.take(12)}"
+                            )
+                        // Also reset journal state after full resync
+                        _ <- undoJournal.traverse_(_.pruneBelow(ordinal.value.value))
+                      } yield verifyProof
+                    }
+                } yield result
               }
 
             (expiredAllowSpends, expiredTokenLocks) = (
