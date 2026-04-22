@@ -16,9 +16,9 @@ import scodec.codecs.{discriminated, uint8}
 import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for the node-collateral family:
-  *   - `NodeCollateralReference`       — 40-byte ordinal+hash.
-  *   - `UpdateNodeCollateral`          — sealed ADT, currently one variant (`Create`).
-  *   - `NodeCollateralRecord`          — 2-field record.
+  *   - `NodeCollateralReference` — 40-byte ordinal+hash.
+  *   - `UpdateNodeCollateral` — sealed ADT, currently one variant (`Create`).
+  *   - `NodeCollateralRecord` — 2-field record.
   *   - `PendingNodeCollateralWithdrawal` — 3-field record.
   *
   * Parallels `DelegatedStakeCodecs` — same discriminator pattern, same `Signed[...]` composition.
@@ -41,19 +41,28 @@ object NodeCollateralCodecs {
 
   // ---- UpdateNodeCollateral ADT -------------------------------------------
 
-  private val createCodec: Codec[UpdateNodeCollateral.Create] =
+  val createCodec: Codec[UpdateNodeCollateral.Create] =
     (addressCodec :: peerIdCodec :: amountCodec :: feeCodec :: hashCodec :: nodeCollateralReferenceCodec)
       .xmap[UpdateNodeCollateral.Create](
-        { case src :: nid :: amt :: fee :: tlRef :: parent :: HNil =>
-          UpdateNodeCollateral.Create(src, nid, amt, fee, tlRef, parent)
+        {
+          case src :: nid :: amt :: fee :: tlRef :: parent :: HNil =>
+            UpdateNodeCollateral.Create(src, nid, amt, fee, tlRef, parent)
         },
         c => c.source :: c.nodeId :: c.amount :: c.fee :: c.tokenLockRef :: c.parent :: HNil
+      )
+
+  val withdrawCodec: Codec[UpdateNodeCollateral.Withdraw] =
+    (addressCodec :: hashCodec)
+      .xmap[UpdateNodeCollateral.Withdraw](
+        { case src :: ref :: HNil => UpdateNodeCollateral.Withdraw(src, ref) },
+        w => w.source :: w.collateralRef :: HNil
       )
 
   implicit val updateNodeCollateralCodec: Codec[UpdateNodeCollateral] =
     discriminated[UpdateNodeCollateral]
       .by(uint8)
       .typecase(0, createCodec)
+      .typecase(1, withdrawCodec)
 
   implicit val updateNodeCollateralImmutableCodec: ImmutableCodec[UpdateNodeCollateral] =
     ImmutableCodec.fromScodecCodec(updateNodeCollateralCodec)
@@ -78,8 +87,9 @@ object NodeCollateralCodecs {
   implicit val pendingNodeCollateralWithdrawalCodec: Codec[PendingNodeCollateralWithdrawal] =
     (signedCreateCodec :: ordinalCodec :: epochCodec)
       .xmap[PendingNodeCollateralWithdrawal](
-        { case evt :: accepted :: created :: HNil =>
-          PendingNodeCollateralWithdrawal(evt, accepted, created)
+        {
+          case evt :: accepted :: created :: HNil =>
+            PendingNodeCollateralWithdrawal(evt, accepted, created)
         },
         p => p.event :: p.acceptedOrdinal :: p.createdAt :: HNil
       )

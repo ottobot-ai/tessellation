@@ -19,12 +19,12 @@ import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for the delegated-stake family:
   *   - `DelegatedStakeReference` — 40-byte ordinal+hash.
-  *   - `UpdateDelegatedStake`    — sealed ADT, currently one variant (`Create`).
-  *   - `DelegatedStakeRecord`    — 5-field record keyed on `Signed[UpdateDelegatedStake.Create]`.
+  *   - `UpdateDelegatedStake` — sealed ADT, currently one variant (`Create`).
+  *   - `DelegatedStakeRecord` — 5-field record keyed on `Signed[UpdateDelegatedStake.Create]`.
   *   - `PendingDelegatedStakeWithdrawal` — 6-field record.
   *
-  * UpdateDelegatedStake is encoded with a 1-byte discriminator today (0x00 = Create). The ADT is
-  * sealed but has only one variant; the discriminator leaves 255 codepoints for future variants.
+  * UpdateDelegatedStake is encoded with a 1-byte discriminator today (0x00 = Create). The ADT is sealed but has only one variant; the
+  * discriminator leaves 255 codepoints for future variants.
   */
 object DelegatedStakeCodecs {
 
@@ -44,19 +44,28 @@ object DelegatedStakeCodecs {
 
   // ---- UpdateDelegatedStake ADT -------------------------------------------
 
-  private val createCodec: Codec[UpdateDelegatedStake.Create] =
+  val createCodec: Codec[UpdateDelegatedStake.Create] =
     (addressCodec :: peerIdCodec :: amountCodec :: feeCodec :: hashCodec :: delegatedStakeReferenceCodec)
       .xmap[UpdateDelegatedStake.Create](
-        { case src :: nid :: amt :: fee :: tlRef :: parent :: HNil =>
-          UpdateDelegatedStake.Create(src, nid, amt, fee, tlRef, parent)
+        {
+          case src :: nid :: amt :: fee :: tlRef :: parent :: HNil =>
+            UpdateDelegatedStake.Create(src, nid, amt, fee, tlRef, parent)
         },
         c => c.source :: c.nodeId :: c.amount :: c.fee :: c.tokenLockRef :: c.parent :: HNil
+      )
+
+  val withdrawCodec: Codec[UpdateDelegatedStake.Withdraw] =
+    (addressCodec :: hashCodec)
+      .xmap[UpdateDelegatedStake.Withdraw](
+        { case src :: ref :: HNil => UpdateDelegatedStake.Withdraw(src, ref) },
+        w => w.source :: w.stakeRef :: HNil
       )
 
   implicit val updateDelegatedStakeCodec: Codec[UpdateDelegatedStake] =
     discriminated[UpdateDelegatedStake]
       .by(uint8)
       .typecase(0, createCodec)
+      .typecase(1, withdrawCodec)
 
   implicit val updateDelegatedStakeImmutableCodec: ImmutableCodec[UpdateDelegatedStake] =
     ImmutableCodec.fromScodecCodec(updateDelegatedStakeCodec)
@@ -74,8 +83,9 @@ object DelegatedStakeCodecs {
   implicit val delegatedStakeRecordCodec: Codec[DelegatedStakeRecord] =
     (signedCreateCodec :: ordinalCodec :: amountBalanceCodec :: tokenLockRefOptCodec :: currentAmountOptCodec)
       .xmap[DelegatedStakeRecord](
-        { case evt :: createdAt :: rewards :: tlRef :: curAmt :: HNil =>
-          DelegatedStakeRecord(evt, createdAt, rewards, tlRef, curAmt)
+        {
+          case evt :: createdAt :: rewards :: tlRef :: curAmt :: HNil =>
+            DelegatedStakeRecord(evt, createdAt, rewards, tlRef, curAmt)
         },
         r => r.event :: r.createdAt :: r.rewards :: r.currentTokenLockRef :: r.currentAmount :: HNil
       )
@@ -86,16 +96,18 @@ object DelegatedStakeCodecs {
   implicit val pendingDelegatedStakeWithdrawalCodec: Codec[PendingDelegatedStakeWithdrawal] =
     (signedCreateCodec :: amountBalanceCodec :: ordinalCodec :: epochCodec :: tokenLockRefOptCodec :: currentAmountOptCodec)
       .xmap[PendingDelegatedStakeWithdrawal](
-        { case evt :: rewards :: accepted :: created :: tlRef :: curAmt :: HNil =>
-          PendingDelegatedStakeWithdrawal(evt, rewards, accepted, created, tlRef, curAmt)
+        {
+          case evt :: rewards :: accepted :: created :: tlRef :: curAmt :: HNil =>
+            PendingDelegatedStakeWithdrawal(evt, rewards, accepted, created, tlRef, curAmt)
         },
-        p => p.event ::
-          p.rewards ::
-          p.acceptedOrdinal ::
-          p.createdAt ::
-          p.currentTokenLockRef ::
-          p.currentAmount ::
-          HNil
+        p =>
+          p.event ::
+            p.rewards ::
+            p.acceptedOrdinal ::
+            p.createdAt ::
+            p.currentTokenLockRef ::
+            p.currentAmount ::
+            HNil
       )
 
   implicit val pendingDelegatedStakeWithdrawalImmutableCodec: ImmutableCodec[PendingDelegatedStakeWithdrawal] =

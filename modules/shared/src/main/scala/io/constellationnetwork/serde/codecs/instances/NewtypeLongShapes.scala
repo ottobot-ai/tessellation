@@ -1,5 +1,6 @@
 package io.constellationnetwork.serde.codecs.instances
 
+import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSnapshotSyncOrdinal
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.balance.{Amount, Balance}
@@ -8,6 +9,7 @@ import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeAmount, Dele
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.generation.Generation
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.node.UpdateNodeParametersOrdinal
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralAmount, NodeCollateralFee, NodeCollateralOrdinal}
 import io.constellationnetwork.schema.swap.{AllowSpendFee, AllowSpendOrdinal, SwapAmount}
@@ -117,6 +119,12 @@ object NewtypeLongShapes {
 
   implicit val globalSnapshotSyncOrdinalShape: NonNegLongNewtype[GlobalSnapshotSyncOrdinal] =
     NonNegLongNewtype.instance(GlobalSnapshotSyncOrdinal(_), _.value)
+
+  implicit val slotShape: NonNegLongNewtype[Slot] =
+    NonNegLongNewtype.instance(Slot(_), _.value)
+
+  implicit val snapshotFeeShape: NonNegLongNewtype[SnapshotFee] =
+    NonNegLongNewtype.instance(SnapshotFee(_), _.value)
 
   // --- PosLong shapes -----------------------------------------------------
 
