@@ -2,8 +2,11 @@ package io.constellationnetwork.serde.codecs.instances
 
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.balance.{Amount, Balance}
+import io.constellationnetwork.schema.delegatedStake.DelegatedStakeAmount
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.swap.{AllowSpendFee, AllowSpendOrdinal, SwapAmount}
+import io.constellationnetwork.schema.tokenLock.{TokenLockAmount, TokenLockFee, TokenLockOrdinal}
 import io.constellationnetwork.schema.transaction._
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.{LongNewtype, NonNegLongNewtype, PosLongNewtype}
@@ -71,10 +74,31 @@ object NewtypeLongShapes {
   implicit val subHeightShape: NonNegLongNewtype[SubHeight] =
     NonNegLongNewtype.instance(SubHeight(_), _.value)
 
+  implicit val allowSpendOrdinalShape: NonNegLongNewtype[AllowSpendOrdinal] =
+    NonNegLongNewtype.instance(AllowSpendOrdinal(_), _.value)
+
+  implicit val allowSpendFeeShape: NonNegLongNewtype[AllowSpendFee] =
+    NonNegLongNewtype.instance(AllowSpendFee(_), _.value)
+
+  implicit val tokenLockOrdinalShape: NonNegLongNewtype[TokenLockOrdinal] =
+    NonNegLongNewtype.instance(TokenLockOrdinal(_), _.value)
+
+  implicit val tokenLockFeeShape: NonNegLongNewtype[TokenLockFee] =
+    NonNegLongNewtype.instance(TokenLockFee(_), _.value)
+
+  implicit val delegatedStakeAmountShape: NonNegLongNewtype[DelegatedStakeAmount] =
+    NonNegLongNewtype.instance(DelegatedStakeAmount(_), _.value)
+
   // --- PosLong shapes -----------------------------------------------------
 
   implicit val transactionAmountShape: PosLongNewtype[TransactionAmount] =
     PosLongNewtype.instance(TransactionAmount(_), _.value)
+
+  implicit val tokenLockAmountShape: PosLongNewtype[TokenLockAmount] =
+    PosLongNewtype.instance(TokenLockAmount(_), _.value)
+
+  implicit val swapAmountShape: PosLongNewtype[SwapAmount] =
+    PosLongNewtype.instance(SwapAmount(_), _.value)
 
   // --- Plain Long shapes --------------------------------------------------
 
