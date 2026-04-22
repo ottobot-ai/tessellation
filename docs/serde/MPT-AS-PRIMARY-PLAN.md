@@ -1,206 +1,136 @@
 # MPT-as-Primary: Scodec Integration Plan
 
 **Status:** Planning → Active
-**Branch:** `feature/serde-typeclass-shim` (current), then a new `feature/mpt-as-primary`
-**Target:** 65% accept() CPU reduction (Phase 0 profiling result) by making the Merkle Patricia Trie the primary state store instead of a derived/recomputed proof.
+**Branch:** `feature/serde-typeclass-shim` (current), then `feature/mpt-as-primary`
+**Target:** 65% accept() CPU reduction (Phase 0 profiling result) + enable light-client proofs at historical ordinals.
 
-## What we have
+## Executive summary
 
-After 30+ commits on `feature/serde-typeclass-shim`, every consensus type on the write path has a canonical, hand-written, byte-exact scodec codec with round-trip tests:
+The scodec codec library (`feature/serde-typeclass-shim`) provides canonical byte-exact encoding for every consensus type (506 tests, 6/6 parity against real Brotli-JSON snapshots, byte-offset lenses for O(1) field access).
 
-- **Primitives:** Hash/ProofsHash, Address, Id, Hex, NonNegLong/PosLong/NonNegInt/PosInt shapes, Option/Either/List/Map/SortedMap/SortedSet/NonEmpty{List,Set}, String (UTF-8), UUID, ByteArray.
-- **References (40-byte fixed):** TransactionReference, BlockReference, AllowSpendReference, TokenLockReference, DelegatedStakeReference, NodeCollateralReference, UpdateNodeParametersReference.
-- **Sum-type ADTs:** PartitionNamespace (5), TokenId (2), SharedArtifact (6), UpdateDelegatedStake (2), UpdateNodeCollateral (2), MessageType (2), BalanceAdjustmentReason (3).
-- **Records:** Transaction, Block, RewardTransaction, AllowSpend, TokenLock, UpdateNodeParameters family, Proof/MerkleTree, GlobalStateKey, DelegatedStake/NodeCollateral records, TokenPair/PricingUpdate/PriceRecord, CurrencyMessage, FeeTransaction, SpendTransaction, MetagraphSyncDataInfo, GlobalSnapshotSync/View, ActiveTip/DeprecatedTip/SnapshotTips, BlockAsActiveTip, AllowSpendBlock/TokenLockBlock, DataApplicationPart(V1), StateChannelSnapshotBinary, SlotCertificate + VRF trio.
-- **Capstones:** GlobalSnapshotStateProof(V1), GlobalSnapshotInfo(V1), CurrencySnapshot/CurrencyIncrementalSnapshot(V1) + Info(V1) + StateProof(V1), GlobalSnapshot, GlobalIncrementalSnapshot(V1).
+Crucially, **most of the MPT-as-primary infrastructure already exists in tessellation** and was built with this milestone in mind (see `MptUndoJournal.scala:46-51` comment — "deferred until inclusion-proof features land that require reconstructing the trie root at a historical ordinal"). The integration is about wiring existing pieces, not greenfield construction.
 
-**503 shared tests** validate round-trip correctness. What they do NOT yet validate: that the scodec-encoded bytes, when decoded, match what real historical JSON-encoded data represents. That's parity.
+This plan consolidates (a) the design direction validated by industry research, (b) the concrete integration points against existing tessellation code, and (c) the phased implementation.
 
-## What we don't have (this plan's deliverables)
+## Design decision — validated by industry research
 
-1. **Parity confidence.** We don't know if `scodec.decode(legacy JSON → circe decode → scodec encode)` equals the original Scala value across all the edge cases real data exercises. Only a round-trip through our own codecs — not through the historical encoding.
+A background research agent surveyed how Ethereum (Geth PBSS, Erigon), Cosmos (IAVL), Polkadot (Substrate), and Verkle tries handle MPT state storage. Key findings:
 
-2. **Byte-offset field access.** Our codecs support it *structurally* (fixed-width layout where possible) but no API exposes field-at-offset reads today. All field access requires full decode.
+**Geth PBSS migration (v1.13.0, Sept 2023)** solved the hash-indexed state-bloat problem at ~1TB scale. Path-indexed storage enabled natural in-place pruning, 30-50% disk reduction, at the cost of deep historical proofs. PBSS is now default for new Geth nodes.
 
-3. **MPT-as-primary storage.** State today is recomputed from JSON on every accept(). Target: state lives in a content-addressed MPT keyed by `GlobalStateKey`, writes are incremental.
+**Erigon's flat-KV approach** — no MPT persisted at all, root computed on-demand — achieves 2TB archive vs Geth's 15TB, but **proof latency is spiky**, which conflicts with "proofs every couple of minutes to light clients".
 
-## Non-goals (intentionally deferred)
+**Cosmos IAVL post-mortems** (Band Protocol July 2020 OOM, `cosmos/iavl#256`) document versioned-tree pruning as a known footgun — `SaveVersion` perf degrades under pruning options.
 
-- **Era registry wiring into the live read path.** Phase 3 follow-up. The registry type exists; the codecs exist; flipping the read path is a separate branch when the shape of the new path stabilizes.
-- **Scodec snapshot envelope.** Phase 4, post-MPT. Snapshots stay JSON-Brotli on disk; the *state* moves to MPT.
-- **Hardfork ordinals.** User directive: greenfield, no governance. No ordinal gating for this work — the new code is the behavior.
+**Substrate child tries**: Parity considered removing the feature as over-engineered. Single global trie with namespaced keys achieves the same proof granularity.
 
-## Test-data inventory (what we have to validate against)
+**Verkle tries**: not production-ready as of early 2026. Track but don't build on.
 
-```
-nodes/{0..7}/gl0-data/
-  snapshot/hash/**/*              — genesis full snapshots (Brotli JSON)
-  incremental_snapshot/
-    hash/{xxx}/{yyy}/{fullhash}    — ~760 snapshots per node (Brotli JSON)
-    ordinal/0/{ordinal}            — ordinal → hash symlinks
-  mpt_snapshot_info/{ordinal}      — MPT state-info persists every 100 ordinals
-```
+**Recommended architecture (from research)**: Path-indexed MPT with bounded-depth overlay (PBSS-style) + flat snap-sync side-table.
 
-Real live data from an 8-node simulation. `GlobalSnapshot` (genesis), `GlobalIncrementalSnapshot` (hot path), and the MPT snapshot_info files all present.
+**Tessellation's actual starting position**: hash-indexed via `Hex(GlobalStateKey)` with incremental flat-state tracking. For current scale (hundreds of ordinals, state well under 10GB), this is fine. At 50GB+ a path-indexed migration becomes priority.
 
-## Phase 1 — Parity against real data (1 week, zero prod risk)
+## Tessellation's pre-existing infrastructure
 
-### Goal
+Already built:
 
-Prove the scodec library is a faithful encoding of the same Scala types that circe-JSON produces from historical on-disk bytes.
+| Component | File | Capability |
+|---|---|---|
+| `MptStore[F, K]` | `schema/mpt/MptStore.scala` | Typed store on `GlobalStateKey`, get/insert/remove/update, batched `sync(updates, ordinal)`, `build(ordinal)`, savepoint/restore, `deleteAbove(ordinal)`, `withExclusiveLock`. |
+| `FileSystemMerklePatriciaProducer` | `security/mpt/producer/` | Flat KV in `stateRef: Map[Hex, Array[Byte]]`, cached trie, pending inserts/removes tracked, disk persistence via `MptStateStorage`, per-ordinal root hash cache (`MaxCacheSize = 50`). |
+| `MptUndoJournal[F]` | `node-shared/.../nakamoto/` | Per-ordinal undo records (inserted/removed/overwritten keys + old bytes), `unapplyTo(ancestorOrdinal)` implemented but not yet consumed, `pruneBelow(ordinal)` for finality pruning. |
+| Proof provers | `security/mpt/prover/` | `MerklePatriciaSingleInclusionProver`, `MerklePatriciaBatchInclusionProver`, `MerklePatriciaRangeProver`, `MerklePatriciaPrefixProver` — all tested. |
+| Scodec codec library | `serde/codecs/instances/` | Canonical byte-exact codecs for every consensus type. |
+| Byte-offset field lenses | `serde/codecs/offset/` | O(1) field access for MPT-blob-store reads (Phase 2 of this plan). |
 
-### Work
+**Missing for MPT-as-primary**:
 
-1. **`JsonParityFixture`** test helper that:
-   - Reads a file from `nodes/{n}/gl0-data/{path}`, decompresses Brotli, parses UTF-8 JSON.
-   - Decodes via the existing circe `Decoder[GlobalIncrementalSnapshot]` (or whatever type the file represents).
-   - Encodes that Scala value via our scodec codec.
-   - Decodes the scodec bytes back.
-   - Asserts the round-trip value equals the circe-decoded one.
-2. **Batch fixture suite** that runs the above across a sampling of the 8-node simulation data — one genesis, a handful of incremental snapshots at different ordinals, the MPT info files.
-3. **Fixtures committed** as test resources so CI can run without depending on the `nodes/` working tree. Pick ~5-10 representative files, not all 760; keep git size sane.
-4. **Failures block merge.** Any type where scodec round-trip disagrees with circe round-trip is a codec bug we need to fix before Phase 2.
+1. Flat-KV value format uses JSON via circe `Encoder`/`Decoder`. Needs to route through scodec.
+2. `MptUndoJournal.unapplyTo` is never invoked — needs wiring into proof-at-historical-ordinal.
+3. `GlobalSnapshotInfo` is still materialized in the accept path; needs to become a derived view.
+4. No snap-sync export/import protocol for light-client bootstrap.
+5. No systematic benchmark against Phase 0 baseline.
 
-### Deliverable
+## Phase 3 integration (revised scope)
 
-`shared/test/JsonScodecParitySuite` — passes against real JSON bytes, catches any codec field-order or encoding mistake before the MPT work starts depending on correctness.
+### 3a. Scodec values in the MptStore (1 week)
 
-## Phase 2 — Byte-offset helpers (1-2 weeks, new API design)
+Swap JSON encoding for scodec at the value layer.
 
-### Goal
+- Current: `MptStore.insert[V: Encoder]` / `get[V: Decoder]` uses circe via `JsonSerializer[F]`.
+- Target: parameterize on `ImmutableCodec[V]` (our scodec typeclass). Or add a parallel `ScodecMptStore[F, K]` that coexists.
+- Caveat: `MptUndoJournal` currently stores `old bytes` opaquely — those bytes become scodec-formatted; rollback continues to work because it just reinstates the old byte blob, format-agnostic.
+- Parity against real data covered by `JsonScodecParitySuite` at the value-type level.
 
-Expose field-at-offset reads for fixed-layout consensus types so persisted records can be peeked without full decode. The MPT write path and snapshot verification both benefit: e.g. "tell me the `stateRoot` of a snapshot on disk" should be a 33-byte fseek, not a 300KB brotli+JSON+circe+codec chain.
+### 3b. Historical proof wiring (1 week)
 
-### Design sketch
+New API:
 
 ```scala
-/** A read-only lens into a byte-slice representation of T. */
-trait FieldLens[T, F] {
-  def offset: Long
-  def length: Option[Long]    // None for variable-width; requires partial-decode to locate
-  def read(bytes: ByteVector): Attempt[F]
-}
-
-object FieldLens {
-  // Automatic for types composed entirely of fixed-width fields:
-  def at[T, F](offset: Long, length: Long)(codec: Codec[F]): FieldLens[T, F] =
-    new FieldLens[T, F] {
-      val offset = offset
-      val length = Some(length)
-      def read(bytes: ByteVector) =
-        codec.decode(bytes.drop(offset).take(length).bits).map(_.value)
-    }
+trait MptStore[F[_], K] {
+  ...
+  def proofAt(ordinal: SnapshotOrdinal, key: K): F[Either[ProofError, Proof]]
 }
 ```
 
-Per-type, hand-authored lenses for the high-value fixed-layout types:
+Implementation options:
 
-```scala
-object BlockReferenceLens {
-  val height: FieldLens[BlockReference, Height]        = FieldLens.at(0, 8)(Codec[Height])
-  val hash: FieldLens[BlockReference, ProofsHash]       = FieldLens.at(8, 32)(HashCodec.proofsCodec)
-}
+1. **Direct-read** (preferred if nodes for that root are still on disk): walk from the cached root hash at `ordinal`, no state mutation. Caches already exist; `build(ordinal)` reconstructs from persisted state.
+2. **Savepoint + unapply + prove + restore**: use the existing `MptUndoJournal.unapplyTo` to temporarily roll the trie back, generate proof, restore. Slower but always works within the journal window.
 
-object GlobalSnapshotStateProofLens {
-  // When mptRoot is present, the final 32 bytes of the last 33 are the root hash.
-  def readMptRootIfPresent(bytes: ByteVector): Option[Hash] = ...
-}
-```
+Pick option 1 as primary, fall back to option 2 if the root isn't cached.
 
-### Work
+### 3c. Remove `GlobalSnapshotInfo` materialization on accept path (2-3 weeks)
 
-1. `FieldLens[T, F]` trait + helpers in `modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/offset/`.
-2. Lens modules for: `BlockReference`, `TransactionReference`, `AllowSpendReference`, `TokenLockReference`, `MerkleRoot` — all 40-or-36 byte fully fixed.
-3. `GlobalSnapshotStateProofLens` — partial-fixed: the three required hashes are at fixed offsets 0/32/64, the optional tail requires scanning 1-byte Option discriminators.
-4. Tests that compare lens reads against full-decode reads for a set of samples — lens and full decode must agree.
+The "MPT is the state" change.
 
-### Deliverable
+- `accept()` currently constructs a `GlobalSnapshotInfo` case class and computes a state proof over it. Target: `accept()` emits a delta `(Map[GlobalStateKey, Option[Value]])`, `MptStore.update(toUpsert, toRemove)`, `commit(ordinal)` → root hash.
+- API/read callers that today read `.info.balances`, `.info.lastTxRefs`, etc. need to route through `MptStore.get`. This is the scatter-gather refactor.
+- Preserve a `GlobalSnapshotInfo.from(mptStore, ordinal)` derivation helper for backward-compat read APIs that expect the old shape — but hot paths don't go through it.
+- `GlobalSnapshotStateProof.mptRoot` becomes authoritative; legacy proof hashes populated transitively only where still needed.
 
-A family of `FieldLens[T, F]` types that give O(1) byte-slice access to the high-value fields. Used by the MPT layer in Phase 3 for "read just the state root from a snapshot on disk".
+This is the largest and riskiest piece. Propose splitting into sub-tasks per consumer subsystem (balance queries, last-tx-refs, delegated-stake views, etc.).
 
-## Phase 3 — MPT-as-primary write path (4-6 weeks, the milestone)
+### 3d. Snap-sync export/import (1 week)
 
-### Goal
+Light-client bootstrap.
 
-Make the Merkle Patricia Trie the *authoritative* state store instead of a recomputed proof derived from JSON. The 65% CPU that Phase 0 measured is in `stateProof()` computation — MPT-as-primary eliminates it by maintaining the MPT incrementally across accepts.
+- `MptStore.exportFlat(ordinal): F[SnapSyncDump]` — `stateRef` contents + root hash + signed commitment.
+- `MptStore.importFlat(dump): F[Unit]` — bulk-load, rebuild trie, verify root.
+- Wire a simple HTTP endpoint for peer fetch. Uses existing HTTP4s infrastructure.
+- Wire format: scodec (natural — every value already has a codec). Or piggyback on the existing `mpt_snapshot_info/<ordinal>` files which are already the right shape (the parity discovery).
 
-### Architecture
+### 3e. Benchmark + pruning tuning (1 week)
 
-```
-                           ┌─────────────────────────┐
-                           │   GlobalStateKey        │
-                           │  (typed ADT, scodec'd)  │
-                           └───────────┬─────────────┘
-                                       │ hash to 32 bytes
-                                       ▼
-                           ┌─────────────────────────┐
-  accept(block) ──────────▶│   MptStore[F]            │◀──── snapshot-info
-                           │  key: Hash               │       rollback reads
-                           │  value: ByteVector       │
-                           │  (scodec-encoded)        │
-                           └───────────┬─────────────┘
-                                       │
-                                       ▼
-                           ┌─────────────────────────┐
-                           │  disk backend           │
-                           │  (start: flat-files      │
-                           │   indexed by key-hash)   │
-                           └─────────────────────────┘
-```
+- Reproduce Phase 0 accept() CPU measurement under the new path.
+- Target: 65% CPU reduction.
+- Tune `MaxCacheSize`, prune cadence, persist cadence. Finality window drives pruning depth.
 
-### Write path (what accept() does today → after)
+## Total estimate: 5-6 weeks
 
-**Today:**
-1. Compute new state by folding the block over old state.
-2. Serialize whole state to JSON, hash it into 16 partial proofs.
-3. Brotli-compress and write the snapshot.
-4. On next accept, re-read the whole state from JSON to fold the next block.
+Matches original estimate, but with concrete integration points rather than from-scratch construction.
 
-**Target:**
-1. Compute new state as a *delta* — a list of `(GlobalStateKey, Option[Value])` operations.
-2. Apply the delta to the MPT (insert/update/delete) — each op is O(log N) via MPT path update.
-3. Get the MPT root hash. `GlobalSnapshotStateProof.mptRoot` = that hash.
-4. Snapshot envelope still written as JSON-Brotli (no change to disk wire format yet), but its `stateProof` field now references the MPT root only.
-5. On next accept, the MPT is already loaded — we never leave it.
+## Deferred (revisit at >50GB state)
 
-### Work breakdown
+- **Path-indexed migration (PBSS-style)**. The research is clear this will eventually be needed; not now.
+- **RocksDB / MDBX backing** for disk persistence (Erigon-style). `MptStateStorage` abstraction already makes this swappable.
+- **Verkle migration**. Track Ethereum's work; not production-ready.
 
-1. **`MptStore[F]` trait** — `get(key: Hash): F[Option[ByteVector]]`, `put(key: Hash, value: ByteVector): F[Unit]`, `delete(key: Hash): F[Unit]`, `commit(): F[Hash]` (root), `rollback(): F[Unit]`.
-2. **File-backed backend** — start with a flat-files-indexed-by-hash layout (mirrors the existing `incremental_snapshot/hash/{xxx}/{yyy}/{hash}` convention). LMDB/RocksDB upgrade later if needed.
-3. **`GlobalStateMptOps`** — high-level wrapper that takes a `GlobalStateKey` (typed ADT), hashes it to an MPT key, and handles the codec for the value at that key. Uses `GlobalStateKey.toHex` for the current hex-derived key, but could flip to scodec-bytes-then-hash if preferred for canonicity.
-4. **Accept-path integration** — refactor `GlobalSnapshotAcceptanceManager` / `accept()` to emit the `(key, value)` delta instead of computing proofs from scratch, then apply it to the `MptStore`.
-5. **Rollback-aware** — the existing rollback machinery re-reads historical snapshot_info. After MPT-as-primary, rollback must reconstruct the MPT up to the target ordinal. Two options: (a) snapshot_info files *are* the MPT root + dirty pages at that ordinal, (b) replay deltas from a checkpoint. Pick (a) — it's simpler and matches the existing snapshot_info cadence (every 100 ordinals).
-6. **Snapshot-info files become MPT-rooted** — the existing `mpt_snapshot_info/{ordinal}` files already exist in the sim data. This plan makes them authoritative rather than derived.
-7. **Byte-offset field access** — MPT verification at scan time uses `FieldLens[GlobalSnapshotStateProof, Hash]` to read just the MPT root from a snapshot file on disk, without full decode.
+## Non-goals (intentionally deferred beyond Phase 3)
 
-### Deliverable
-
-`feature/mpt-as-primary` branch that passes:
-- Full existing test suite
-- Parity suite (Phase 1)
-- New MPT-store round-trip tests (put/get/commit/rollback)
-- Accept-path performance test showing the expected CPU drop against a recorded benchmark
-
-### Risks & mitigations
-
-- **MPT state corruption during crash.** Mitigate: atomic commit via write-ahead log at the backend layer; MPT root only advances after the WAL is fsync'd.
-- **Rollback correctness.** Mitigate: snapshot_info files at every-100-ordinal cadence are checkpoints; between checkpoints, we replay the scodec-encoded deltas captured in each snapshot.
-- **Migration from existing JSON state.** Mitigate: on startup, if MPT is empty but snapshot_info exists, populate MPT from the JSON-derived state (one-time bootstrap; production never re-does this).
-
-## Phase 4 — Scodec snapshot envelope (post-MPT, hardfork-optional for greenfield)
-
-Not gated by this plan. When greenfield becomes non-greenfield, revisit.
+- **Era registry wiring into the live read path** — Phase 4 follow-up.
+- **Scodec snapshot envelope** — greenfield, no hardfork gating needed, but still a separate milestone after MPT-as-primary lands.
 
 ## Sequencing
 
 ```
-Phase 1 (parity)  ──▶  Phase 2 (byte-offset lenses)  ──▶  Phase 3 (MPT-as-primary)
-  ~1 week                  ~1-2 weeks                        ~4-6 weeks
-  (low risk)               (new API, reviewed)              (the milestone)
+3a (scodec values)  ──▶  3b (historical proofs)  ──▶  3c (remove GSI materialization)
+                            │                            │
+                            └──▶  3d (snap-sync)         └──▶  3e (benchmark + tune)
 ```
 
-Phase 1 must land before Phase 3 depends on codec correctness. Phase 2 can land in parallel with Phase 3 planning since MPT uses lenses but doesn't block on them for the initial write path (full-decode works; lenses are the optimization).
+3a and 3b are prerequisites; 3c is the long pole; 3d and 3e can parallelize with 3c sub-tasks.
 
 ## Next concrete step
 
-Start Phase 1: `JsonScodecParitySuite` reading real data from `nodes/0/gl0-data/`, committed fixtures in `modules/shared/src/test/resources/serde/real/`.
+Start 3a: parameterize `MptStore` on a scodec value typeclass, migrate one value type (e.g. `Balance`) as a proof of concept, rerun the accept-path tests to confirm equivalence against the JSON-backed path.
