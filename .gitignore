@@ -42,6 +42,8 @@ docker/jars/
 .github/code/
 .workspace/
 .claude/*.local.*
+.claude/scheduled_tasks.lock
+github.com/
 tx-sender.conf
 docker/snapshot-streaming/*.jar
 docker/snapshot-streaming/*.conf
