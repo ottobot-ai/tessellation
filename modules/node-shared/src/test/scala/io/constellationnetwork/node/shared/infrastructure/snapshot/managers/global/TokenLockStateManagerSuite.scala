@@ -42,6 +42,13 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
   val testSignatureProof = signature.SignatureProof(Id(Hex("")), testSignature)
   val testProofs = NonEmptySet.one(testSignatureProof)
 
+  /** Build a deterministic valid 32-byte Hash from a label. Short identifiers like "ref123" aren't valid 64-hex-char Hash strings; the
+    * scodec codec enforces 64-char hex on encode. This helper UTF-8-encodes the label to hex and zero-pads to 64 chars so each label
+    * produces a distinct, encode-safe Hash.
+    */
+  private def testHash(label: String): Hash =
+    Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
+
   override def sharedResource: Resource[IO, Res] =
     for {
       sp <- SecurityProvider.forAsync[IO]
@@ -72,7 +79,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(1000L).some,
         none // No replacement reference
@@ -97,10 +104,10 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(1000L).some,
-        Hash("invalidRef").some // Invalid replacement reference
+        testHash("invalidRef").some // Invalid replacement reference
       )
 
       signedTokenLock <- Signed.forAsyncHasher(tokenLock, kp)
@@ -121,7 +128,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L), // Higher amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(1000L).some,
         none
@@ -134,7 +141,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref456")),
         none,
         EpochProgress(1000L).some,
         hashedExistingTokenLock.hash.some
@@ -166,7 +173,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L), // Higher amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(1000L).some,
         none
@@ -176,7 +183,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L), // Lower amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none,
         EpochProgress(1000L).some,
         none // Will be set after computing hash
@@ -211,7 +218,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref1")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref1")),
         none,
         EpochProgress(1000L).some,
         none // No replacement reference
@@ -222,7 +229,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(50L), // Lower amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref2")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref2")),
         none,
         EpochProgress(1000L).some,
         none
@@ -234,7 +241,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L), // Higher amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(3L), Hash("ref3")),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("ref3")),
         none,
         EpochProgress(1000L).some,
         hashedExistingTokenLock.hash.some // References the existing token lock
@@ -271,7 +278,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none, // Empty currency ID
         EpochProgress(1000L).some,
         none
@@ -285,7 +292,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L), // Higher amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         CurrencyId(currencyAddress).some, // Non-empty currency ID
         EpochProgress(1000L).some,
         hashedExistingTokenLock.hash.some
@@ -318,7 +325,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         sourceAddress1,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none, // Empty currency ID
         EpochProgress(1000L).some,
         none
@@ -332,7 +339,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         sourceAddress2, // Different source address
         TokenLockAmount(200L), // Higher amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none, // Empty currency ID
         EpochProgress(1000L).some,
         hashedExistingTokenLock.hash.some
@@ -362,7 +369,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none, // Empty currency ID
         EpochProgress(1000L).some,
         none
@@ -376,7 +383,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress, // Same source address
         TokenLockAmount(200L), // Higher amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none, // Empty currency ID
         EpochProgress(1000L).some,
         hashedExistingTokenLock.hash.some
@@ -411,7 +418,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         CurrencyId(currencyAddress).some, // Non-empty currency ID
         EpochProgress(1000L).some,
         none
@@ -425,7 +432,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L), // Higher amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none, // Empty currency ID
         EpochProgress(1000L).some,
         hashedExistingTokenLock.hash.some
@@ -456,7 +463,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none, // Empty currency ID
         EpochProgress(1000L).some,
         none
@@ -467,7 +474,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(50L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         CurrencyId(currencyAddress).some, // Non-empty currency ID
         EpochProgress(1000L).some,
         none
@@ -483,7 +490,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L), // Higher amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(3L), Hash("ref789")),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("ref789")),
         none, // Empty currency ID
         EpochProgress(1000L).some,
         hashedExistingTokenLockEmptyCurrency.hash.some
@@ -494,7 +501,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(300L), // Higher amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(4L), Hash("ref101")),
+        TokenLockReference(TokenLockOrdinal(4L), testHash("ref101")),
         none, // Empty currency ID
         EpochProgress(1000L).some,
         hashedExistingTokenLockWithCurrency.hash.some
@@ -536,7 +543,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none, // Empty currency ID
         EpochProgress(1000L).some,
         none
@@ -550,7 +557,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L), // Equal amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none, // Empty currency ID
         EpochProgress(1000L).some,
         hashedExistingTokenLock.hash.some
@@ -561,7 +568,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(50L), // Lower amount
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(3L), Hash("ref789")),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("ref789")),
         none, // Empty currency ID
         EpochProgress(1000L).some,
         hashedExistingTokenLock.hash.some
@@ -607,15 +614,15 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
             PeerId(Hex("")),
             DelegatedStakeAmount(100L),
             DelegatedStakeFee(10L),
-            Hash("tokenLockRef"),
-            DelegatedStakeReference(DelegatedStakeOrdinal(1L), Hash("parent"))
+            testHash("tokenLockRef"),
+            DelegatedStakeReference(DelegatedStakeOrdinal(1L), testHash("parent"))
           ),
           testProofs
         ),
         Amount(50L),
         SnapshotOrdinal(1L),
         EpochProgress(100L),
-        Hash("tokenLockRef").some,
+        testHash("tokenLockRef").some,
         DelegatedStakeAmount(100L).some
       )
 
@@ -623,7 +630,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("tokenLockRef")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("tokenLockRef")),
         none,
         EpochProgress(1000L).some,
         none
@@ -635,10 +642,11 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress -> SortedSet(pendingWithdrawal)
       )
 
-      globalActiveTokenLocksByRef = Map(Hash("tokenLockRef") -> signedActiveTokenLock)
+      globalActiveTokenLocksByRef = Map(testHash("tokenLockRef") -> signedActiveTokenLock)
 
       result <- acceptanceManager.generateTokenUnlocks(expiredWithdrawals, List.empty, globalActiveTokenLocksByRef).pure[IO]
-    } yield expect.eql(Right(Map(testAddress -> List(TokenUnlock(Hash("tokenLockRef"), TokenLockAmount(100L), none, testAddress)))), result)
+    } yield
+      expect.eql(Right(Map(testAddress -> List(TokenUnlock(testHash("tokenLockRef"), TokenLockAmount(100L), none, testAddress)))), result)
   }
 
   test("generateTokenUnlocks - should generate unlocks for token locks with replacement references") { res =>
@@ -653,7 +661,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(1000L).some,
         none
@@ -663,7 +671,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none,
         EpochProgress(1000L).some,
         none // Will be set after computing hash
@@ -704,15 +712,15 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
             PeerId(Hex("")),
             DelegatedStakeAmount(100L),
             DelegatedStakeFee(10L),
-            Hash("missingTokenLockRef"),
-            DelegatedStakeReference(DelegatedStakeOrdinal(1L), Hash("parent"))
+            testHash("missingTokenLockRef"),
+            DelegatedStakeReference(DelegatedStakeOrdinal(1L), testHash("parent"))
           ),
           testProofs
         ),
         Amount(50L),
         SnapshotOrdinal(1L),
         EpochProgress(100L),
-        Hash("missingTokenLockRef").some,
+        testHash("missingTokenLockRef").some,
         DelegatedStakeAmount(100L).some
       )
 
@@ -741,15 +749,15 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
             PeerId(Hex("")),
             DelegatedStakeAmount(100L),
             DelegatedStakeFee(10L),
-            Hash("tokenLockRef1"),
-            DelegatedStakeReference(DelegatedStakeOrdinal(1L), Hash("parent"))
+            testHash("tokenLockRef1"),
+            DelegatedStakeReference(DelegatedStakeOrdinal(1L), testHash("parent"))
           ),
           testProofs
         ),
         Amount(50L),
         SnapshotOrdinal(1L),
         EpochProgress(100L),
-        Hash("tokenLockRef1").some,
+        testHash("tokenLockRef1").some,
         DelegatedStakeAmount(100L).some
       )
 
@@ -757,7 +765,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("tokenLockRef1")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("tokenLockRef1")),
         none,
         EpochProgress(1000L).some,
         none
@@ -767,7 +775,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("tokenLockRef2")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("tokenLockRef2")),
         none,
         EpochProgress(1000L).some,
         none
@@ -777,7 +785,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(300L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(3L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("ref456")),
         none,
         EpochProgress(1000L).some,
         none // Will be set after computing hash
@@ -858,7 +866,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         none, // No unlockEpoch
         none
@@ -888,7 +896,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(2000L).some, // Future unlockEpoch
         none
@@ -918,7 +926,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(500L).some, // Past unlockEpoch
         none
@@ -948,7 +956,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(1000L).some, // Current unlockEpoch
         none
@@ -978,7 +986,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         none, // No unlockEpoch
         none
@@ -989,7 +997,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none,
         EpochProgress(500L).some, // Past unlockEpoch
         none
@@ -1000,7 +1008,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(300L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(3L), Hash("ref789")),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("ref789")),
         none,
         EpochProgress(2000L).some, // Future unlockEpoch
         none
@@ -1035,7 +1043,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         address1,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(500L).some, // Past unlockEpoch
         none
@@ -1046,7 +1054,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         address1,
         TokenLockAmount(200L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none,
         EpochProgress(2000L).some, // Future unlockEpoch
         none
@@ -1057,7 +1065,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         address2,
         TokenLockAmount(300L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(3L), Hash("ref789")),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("ref789")),
         none,
         EpochProgress(300L).some, // Past unlockEpoch
         none
@@ -1068,7 +1076,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         address2,
         TokenLockAmount(400L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(4L), Hash("ref101")),
+        TokenLockReference(TokenLockOrdinal(4L), testHash("ref101")),
         none,
         none, // No unlockEpoch
         none
@@ -1121,7 +1129,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(2000L).some, // Future unlockEpoch
         none
@@ -1132,7 +1140,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none,
         EpochProgress(500L).some, // Past unlockEpoch
         none
@@ -1143,7 +1151,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(300L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(3L), Hash("ref789")),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("ref789")),
         none,
         EpochProgress(1500L).some, // Future unlockEpoch
         none
@@ -1192,7 +1200,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1203,7 +1211,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1261,7 +1269,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         address1,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1272,7 +1280,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         address2,
         TokenLockAmount(200L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1323,7 +1331,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         address1,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1334,7 +1342,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         address2,
         TokenLockAmount(200L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none,
         EpochProgress(500L).some, // Past unlockEpoch
         none
@@ -1381,7 +1389,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         none, // No unlockEpoch
         none
@@ -1426,7 +1434,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1437,7 +1445,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none,
         EpochProgress(500L).some, // Past unlockEpoch
         none
@@ -1485,7 +1493,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1496,7 +1504,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1507,7 +1515,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(300L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(3L), Hash("ref789")),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("ref789")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1518,7 +1526,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(400L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(4L), Hash("ref101")),
+        TokenLockReference(TokenLockOrdinal(4L), testHash("ref101")),
         none,
         EpochProgress(500L).some, // Past unlockEpoch
         none
@@ -1603,7 +1611,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1644,7 +1652,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(999L).some, // Past epoch
         none
@@ -1684,7 +1692,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       acceptedGlobalTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
       lastActiveGlobalTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
 
-      tokenUnlock = TokenUnlock(Hash("ref123"), TokenLockAmount(100L), none, testAddress)
+      tokenUnlock = TokenUnlock(testHash("ref123"), TokenLockAmount(100L), none, testAddress)
       generatedTokenUnlocksByAddress = Map(testAddress -> List(tokenUnlock))
 
       result = acceptanceManager.updateGlobalBalancesByTokenLocks(
@@ -1717,7 +1725,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L), // Larger than balance
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1755,7 +1763,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1766,7 +1774,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(200L),
         TokenLockFee(20L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none,
         EpochProgress(999L).some, // Past epoch
         none
@@ -1779,7 +1787,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       lastActiveGlobalTokenLocks = SortedMap(testAddress -> SortedSet(signedExpiredTokenLock))
 
       // Generated token unlock (should add amount)
-      tokenUnlock = TokenUnlock(Hash("ref789"), TokenLockAmount(50L), none, testAddress)
+      tokenUnlock = TokenUnlock(testHash("ref789"), TokenLockAmount(50L), none, testAddress)
       generatedTokenUnlocksByAddress = Map(testAddress -> List(tokenUnlock))
 
       result = acceptanceManager.updateGlobalBalancesByTokenLocks(
@@ -1820,7 +1828,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         address1,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         EpochProgress(2000L).some,
         none
@@ -1831,7 +1839,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         address2,
         TokenLockAmount(200L),
         TokenLockFee(20L),
-        TokenLockReference(TokenLockOrdinal(2L), Hash("ref456")),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("ref456")),
         none,
         EpochProgress(999L).some, // Past epoch
         none
@@ -1877,7 +1885,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         testAddress,
         TokenLockAmount(100L),
         TokenLockFee(10L),
-        TokenLockReference(TokenLockOrdinal(1L), Hash("ref123")),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("ref123")),
         none,
         none, // No unlock epoch
         none
@@ -1918,9 +1926,9 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       lastActiveGlobalTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
 
       // Multiple token unlocks for the same address
-      tokenUnlock1 = TokenUnlock(Hash("ref123"), TokenLockAmount(100L), none, testAddress)
-      tokenUnlock2 = TokenUnlock(Hash("ref456"), TokenLockAmount(200L), none, testAddress)
-      tokenUnlock3 = TokenUnlock(Hash("ref789"), TokenLockAmount(50L), none, testAddress)
+      tokenUnlock1 = TokenUnlock(testHash("ref123"), TokenLockAmount(100L), none, testAddress)
+      tokenUnlock2 = TokenUnlock(testHash("ref456"), TokenLockAmount(200L), none, testAddress)
+      tokenUnlock3 = TokenUnlock(testHash("ref789"), TokenLockAmount(50L), none, testAddress)
 
       generatedTokenUnlocksByAddress = Map(testAddress -> List(tokenUnlock1, tokenUnlock2, tokenUnlock3))
 

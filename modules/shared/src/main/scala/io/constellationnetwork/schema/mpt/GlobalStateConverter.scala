@@ -385,10 +385,187 @@ object GlobalStateConverter {
     implicit class MptStoreGlobalSnapshotOps[F[_]: Async: Parallel: Hasher: JsonSerializer](
       val store: MptStore[F, GlobalStateKey]
     ) {
+
+      /** Seed / reset the MptStore from a `GlobalSnapshotInfo`.
+        *
+        * Writes each typed field via its canonical scodec `ImmutableCodec`, matching the encoding used by the typed read methods
+        * (`getBalance`, `getActiveTokenLocks`, etc). Previously this went through `allStateEntries → syncFull[Json]` which produced UTF-8
+        * JSON bytes — inconsistent with the scodec-typed reads after the Phase 3a MptStore migration. Tests that round-tripped via this
+        * helper + typed reads would see empty reads because the scodec decoder rejected JSON bytes.
+        *
+        * Consensus note: the production state-proof verification path (`GlobalSnapshotInfo.mptStateProof` → `allStateEntries.buildMpt`)
+        * still uses the JSON-bytes-in-MPT construction and will produce a different root than this scodec-byte MptStore. Aligning the two
+        * is the remaining piece of the Phase 3c work; callers that depend on hash-level agreement between `sync` and `buildMpt` need the
+        * follow-up migration of `makeParallel` / `buildMpt` to scodec.
+        */
       def syncFromGlobalSnapshotInfo(info: GlobalSnapshotInfo, snapshotOrdinal: SnapshotOrdinal)(
         implicit stateProofSelector: StateProofSelector
-      ): F[Unit] =
-        info.allStateEntries[F].flatMap(store.syncFull[Json](_, snapshotOrdinal))
+      ): F[Unit] = {
+        import io.constellationnetwork.schema.ID.Id
+        import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
+        import io.constellationnetwork.schema.mpt.PartitionNamespace.AddressNamespace
+        import io.constellationnetwork.security.hash.Hash
+        import io.constellationnetwork.security.signature.Signed
+        import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
+        import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
+        import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
+        import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutable}
+        import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmutableCodec
+        import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{immutableCodec => metagraphSyncImmutable}
+        import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
+        import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{immutableCodec => tokenLockRefImmutable}
+        import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.{immutableCodec => txRefImmutable}
+
+        // Build the key-to-value maps for each typed field. Each field's codec produces
+        // scodec-encoded bytes consistent with what the read methods decode.
+        val stateChanHashes: Map[GlobalStateKey, Hash] = info.lastStateChannelSnapshotHashes.iterator.map {
+          case (addr, h) => GlobalStateKey.metagraph(addr, LastStateChannelSnapshotHashes) -> h
+        }.toMap
+        val txRefs: Map[GlobalStateKey, io.constellationnetwork.schema.transaction.TransactionReference] =
+          info.lastTxRefs.iterator.map {
+            case (addr, r) => GlobalStateKey.hypergraph(LastTxRefs, addr) -> r
+          }.toMap
+        val balances: Map[GlobalStateKey, Balance] = info.balances.iterator.map {
+          case (addr, b) => GlobalStateKey.hypergraph(Balances, addr) -> b
+        }.toMap
+        val currencyProofs: Map[GlobalStateKey, io.constellationnetwork.merkletree.Proof] =
+          info.lastCurrencySnapshotsProofs.iterator.map {
+            case (addr, p) => GlobalStateKey.metagraph(addr, LastCurrencySnapshotsProofs) -> p
+          }.toMap
+
+        // Currency snapshots — Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
+        // is stored as two separate keys (LastIncrementalCurrencySnapshots + LastCurrencySnapshotInfo).
+        def buildCurrencySnapshotEntries: F[
+          (
+            Map[GlobalStateKey, Signed[io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot]],
+            Map[GlobalStateKey, io.constellationnetwork.currency.schema.currency.CurrencySnapshotInfo]
+          )
+        ] =
+          info.lastCurrencySnapshots.toList.parTraverse {
+            case (metagraphAddr, Left(fullSnapshot)) =>
+              io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot
+                .fromCurrencySnapshot(fullSnapshot.value)
+                .map { inc =>
+                  (
+                    GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> Signed(inc, fullSnapshot.proofs),
+                    GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> fullSnapshot.info.toCurrencySnapshotInfo
+                  )
+                }
+            case (metagraphAddr, Right((inc, snInfo))) =>
+              (
+                (GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> inc) ->
+                  (GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> snInfo)
+              ).pure[F]
+          }.map { paired =>
+            val snapshotEntries = paired.map(_._1).toMap
+            val infoEntries = paired.map(_._2).toMap
+            (snapshotEntries, infoEntries)
+          }
+
+        // Optional-field maps.
+        val activeAllowSpends: Map[GlobalStateKey, SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]] =
+          info.activeAllowSpends.toList
+            .flatMap(_.toList)
+            .flatMap {
+              case (optAddr, innerMap) =>
+                innerMap.toList.map { case (addr, s) => GlobalStateKey.hypergraph(ActiveAllowSpends, optAddr, addr) -> s }
+            }
+            .toMap
+        val activeTokenLocks: Map[GlobalStateKey, SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]] =
+          info.activeTokenLocks.toList
+            .flatMap(_.toList)
+            .map {
+              case (addr, s) => GlobalStateKey.hypergraph(ActiveTokenLocks, addr) -> s
+            }
+            .toMap
+        val tokenLockBalances: Map[GlobalStateKey, Balance] =
+          info.tokenLockBalances.toList
+            .flatMap(_.toList)
+            .flatMap {
+              case (tokenAddr, inner) =>
+                inner.toList.map { case (holder, bal) => GlobalStateKey.hypergraph(TokenLockBalances, tokenAddr, holder) -> bal }
+            }
+            .toMap
+        val lastAllowSpendRefs: Map[GlobalStateKey, io.constellationnetwork.schema.swap.AllowSpendReference] =
+          info.lastAllowSpendRefs.toList
+            .flatMap(_.toList)
+            .map {
+              case (addr, r) => GlobalStateKey.hypergraph(LastAllowSpendRefs, addr) -> r
+            }
+            .toMap
+        val lastTokenLockRefs: Map[GlobalStateKey, io.constellationnetwork.schema.tokenLock.TokenLockReference] =
+          info.lastTokenLockRefs.toList
+            .flatMap(_.toList)
+            .map {
+              case (addr, r) => GlobalStateKey.hypergraph(LastTokenLockRefs, addr) -> r
+            }
+            .toMap
+        val activeDelegatedStakes: Map[GlobalStateKey, SortedSet[io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord]] =
+          info.activeDelegatedStakes.toList
+            .flatMap(_.toList)
+            .map {
+              case (addr, s) => GlobalStateKey.hypergraph(ActiveDelegatedStakes, addr) -> s
+            }
+            .toMap
+        val delegatedStakesWithdrawals
+          : Map[GlobalStateKey, SortedSet[io.constellationnetwork.schema.delegatedStake.PendingDelegatedStakeWithdrawal]] =
+          info.delegatedStakesWithdrawals.toList
+            .flatMap(_.toList)
+            .map {
+              case (addr, s) => GlobalStateKey.hypergraph(DelegatedStakesWithdrawals, addr) -> s
+            }
+            .toMap
+        val activeNodeCollaterals: Map[GlobalStateKey, SortedSet[io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord]] =
+          info.activeNodeCollaterals.toList
+            .flatMap(_.toList)
+            .map {
+              case (addr, s) => GlobalStateKey.hypergraph(ActiveNodeCollaterals, addr) -> s
+            }
+            .toMap
+        val nodeCollateralWithdrawals
+          : Map[GlobalStateKey, SortedSet[io.constellationnetwork.schema.nodeCollateral.PendingNodeCollateralWithdrawal]] =
+          info.nodeCollateralWithdrawals.toList
+            .flatMap(_.toList)
+            .map {
+              case (addr, s) => GlobalStateKey.hypergraph(NodeCollateralWithdrawals, addr) -> s
+            }
+            .toMap
+        val metagraphSyncData: Map[GlobalStateKey, MetagraphSyncDataInfo] =
+          info.metagraphSyncData.toList
+            .flatMap(_.toList)
+            .map {
+              case (addr, d) => GlobalStateKey.hypergraph(MetagraphSyncData, addr) -> d
+            }
+            .toMap
+
+        // We avoid per-field `sync` (each would trigger its own trie build). Instead: clear,
+        // insert each typed batch, then build once under the exclusive lock at the end.
+        store.withExclusiveLock {
+          for {
+            _ <- store.clear
+            currency <- buildCurrencySnapshotEntries
+            _ <- store.insert[Hash](stateChanHashes)
+            _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
+            _ <- store.insert[Balance](balances)
+            _ <- store.insert[Signed[io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot]](currency._1)
+            _ <- store.insert[io.constellationnetwork.currency.schema.currency.CurrencySnapshotInfo](currency._2)
+            _ <- store.insert[io.constellationnetwork.merkletree.Proof](currencyProofs)
+            _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](activeAllowSpends)
+            _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](activeTokenLocks)
+            _ <- store.insert[Balance](tokenLockBalances)
+            _ <- store.insert[io.constellationnetwork.schema.swap.AllowSpendReference](lastAllowSpendRefs)
+            _ <- store.insert[io.constellationnetwork.schema.tokenLock.TokenLockReference](lastTokenLockRefs)
+            _ <- store.insert[SortedSet[io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord]](activeDelegatedStakes)
+            _ <- store
+              .insert[SortedSet[io.constellationnetwork.schema.delegatedStake.PendingDelegatedStakeWithdrawal]](delegatedStakesWithdrawals)
+            _ <- store.insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord]](activeNodeCollaterals)
+            _ <- store
+              .insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.PendingNodeCollateralWithdrawal]](nodeCollateralWithdrawals)
+            _ <- store.insert[MetagraphSyncDataInfo](metagraphSyncData)
+            _ <- store.build(snapshotOrdinal).void
+          } yield ()
+        }
+      }
 
       def syncFromStateChanges(acc: StateChangesAccumulator, snapshotOrdinal: SnapshotOrdinal)(
         implicit stateProofSelector: StateProofSelector

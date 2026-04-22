@@ -73,7 +73,9 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(peer1, peer2, peer3, peer4))
-      // 3 of 4 peers = 75% > 66.67% threshold
+      // 3 of 4 peers attest. Active fraction = 3/4 = 75% ≥ MinActiveQuorumFraction (50%),
+      // so optimistic weighting kicks in: weight is computed against the active set (3 peers),
+      // and all 3 attested the same tip → weight = 1.0. Finality threshold (2/3) is met.
       _ <- tracker.recordAttestation(peer1, att(tipA, slot(10), 100L, slot(11)))
       _ <- tracker.recordAttestation(peer2, att(tipA, slot(10), 100L, slot(11)))
       _ <- tracker.recordAttestation(peer3, att(tipA, slot(10), 100L, slot(11)))
@@ -81,7 +83,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       weight <- tracker.attestationWeight(tipA)
     } yield
       expect(isFinalized) &&
-        expect(Math.abs(weight - 0.75) < 0.0001)
+        expect(Math.abs(weight - 1.0) < 0.0001)
   }
 
   test("newer attestation supersedes older from same peer") {
@@ -220,17 +222,16 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(peer1, peer2, peer3))
-      // 2 of 3 = 0.6666... which is right at the threshold
+      // 2 of 3 peers attest. Active fraction = 2/3 ≈ 66.7% ≥ MinActiveQuorumFraction (50%),
+      // so optimistic weighting is active: both attesters voted the same tip, weight = 1.0
+      // against the 2-peer active set, which trivially exceeds the 2/3 finality threshold.
       _ <- tracker.recordAttestation(peer1, att(tipA, slot(10), 100L, slot(11)))
       _ <- tracker.recordAttestation(peer2, att(tipA, slot(10), 100L, slot(11)))
       weight <- tracker.attestationWeight(tipA)
       isFinalized <- tracker.isFinalized(tipA)
     } yield
-      // 2/3 ≈ 0.6667 which should just barely cross the > 0.6667 threshold
-      // 2/3 = 0.6666... which is >= 2.0/3.0 (exact IEEE754 match)
-      // With the >= threshold change, exactly 2-of-3 DOES finalize
-      expect(Math.abs(weight - 2.0 / 3.0) < 0.0001) &&
-        expect(isFinalized) // 2/3 >= 2/3 is true
+      expect(Math.abs(weight - 1.0) < 0.0001) &&
+        expect(isFinalized)
   }
 
   test("chain finalization: when tip at ordinal 100 finalizes, all ancestors are implicitly finalized") {

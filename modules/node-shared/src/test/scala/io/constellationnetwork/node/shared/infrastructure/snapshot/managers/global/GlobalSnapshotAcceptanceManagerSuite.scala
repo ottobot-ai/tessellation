@@ -38,6 +38,12 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
 
   val address1 = Address("DAG0y4eLqhhXUafeE3mgBstezPTnr8L3tZjAtMWB")
   val address2 = Address("DAG0y4eLqhhXUafeE3mgBstezPTnr8L3tZjAtMWC")
+
+  /** Build a deterministic valid 32-byte Hash from a label. Matches the helper in TokenLockStateManagerSuite; short labels map to a unique
+    * 64-char hex string.
+    */
+  private def testHash(label: String): Hash =
+    Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
   val nodeId = PeerId(
     Hex("5dc4f7eba443f9a0dff11469b4fede358034abf20f9bbd8ea2b607179b72cfc159f33a64e24626891fc38b2c5a3dd7920c6b44a85cb745137b2e2e3e130adb5e")
   )
@@ -305,7 +311,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         event = delegatedStakeEvent,
         createdAt = SnapshotOrdinal(1L),
         rewards = Amount(10L),
-        currentTokenLockRef = Hash("existing").some,
+        currentTokenLockRef = testHash("existing").some,
         currentAmount = DelegatedStakeAmount(150L).some
       )
 
@@ -346,7 +352,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       expect.all(
         newSnapshotInfo.activeDelegatedStakes.isDefined,
         newSnapshotInfo.activeDelegatedStakes.get.contains(address1),
-        updatedRecord.currentTokenLockRef.contains(Hash("existing")),
+        updatedRecord.currentTokenLockRef.contains(testHash("existing")),
         updatedRecord.currentAmount.contains(DelegatedStakeAmount(150L))
       )
   }
