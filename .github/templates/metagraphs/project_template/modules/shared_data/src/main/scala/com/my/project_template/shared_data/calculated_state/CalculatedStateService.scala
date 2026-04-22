@@ -1,5 +1,8 @@
 package com.my.project_template.shared_data.calculated_state
 
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+
 import cats.effect.Ref
 import cats.effect.kernel.Async
 import cats.syntax.all._
@@ -41,7 +44,13 @@ object CalculatedStateService {
         override def hashCalculatedState(
           state: UsageUpdateCalculatedState
         ): F[Hash] = Async[F].delay {
-          Hash(state.asJson.noSpaces)
+          // SHA-256 of the canonical JSON encoding, rendered as 64-char lowercase hex.
+          // This field feeds `DataApplicationPart.calculatedStateProof: Hash`, which is
+          // written into the MPT via a strict 64-hex-char scodec codec; returning the raw
+          // JSON string here (as the template previously did) passes circe-JSON MPT
+          // storage but blows up on the typed-scodec storage path.
+          val digest = MessageDigest.getInstance("SHA-256").digest(state.asJson.noSpaces.getBytes(StandardCharsets.UTF_8))
+          Hash(digest.map("%02x".format(_)).mkString)
         }
       }
     }
