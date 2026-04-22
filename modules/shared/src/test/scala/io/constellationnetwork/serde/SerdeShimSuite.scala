@@ -1,0 +1,138 @@
+package io.constellationnetwork.serde
+
+import io.constellationnetwork.serde.era.{EraCodecRegistry, OrdinalRange, SerdeEra}
+import io.constellationnetwork.serde.implicits._
+import io.constellationnetwork.serde.storage.BrotliPersistable
+
+import scodec.Codec
+import scodec.bits.ByteVector
+import scodec.codecs.{int64, utf8_32}
+import shapeless.{::, HNil}
+import weaver.FunSuite
+
+/** Pilot type: an opaque struct that exercises the full shim. Not a consensus type —
+  * the shim tests only the plumbing. Real consensus codecs ship one per PR under
+  * `serde/scodec/instances/...`.
+  */
+final case class PilotValue(counter: Long, label: String)
+
+object PilotValue {
+  // Hand-written scodec codec. No derivation; adding a field here would require
+  // also updating this codec (and the golden file, once one exists).
+  implicit val codec: Codec[PilotValue] =
+    (int64 :: utf8_32)
+      .xmap[PilotValue](
+        { case c :: l :: HNil => PilotValue(c, l) },
+        p => p.counter :: p.label :: HNil
+      )
+
+  implicit val immutableCodec: ImmutableCodec[PilotValue] = ImmutableCodec.derivedFromScodec[PilotValue]
+
+  // Brotli Persistable — opt-in. Shadows the default implicit Persistable.
+  val brotliPersistable: Persistable[PilotValue] = BrotliPersistable.fromImmutableCodec(immutableCodec)
+}
+
+object SerdeShimSuite extends FunSuite {
+
+  private val sample = PilotValue(counter = 42L, label = "hello")
+
+  test("Signable + ImmutableCodec agree on canonical bytes") {
+    val sig = Signable[PilotValue].signableBytes(sample)
+    val imm = ImmutableCodec[PilotValue].immutableBytes(sample)
+    // Reference both so `imm` is used — not just asserted via equality.
+    expect(sig.nonEmpty) and expect(imm.nonEmpty) and expect(sig == imm)
+  }
+
+  test("ImmutableCodec round-trips and is canonical") {
+    val bytes = sample.immutableBytes
+    val decoded = bytes.fromImmutableBytes[PilotValue]
+    val reEncoded = decoded.map(_.immutableBytes)
+    expect(decoded == Right(sample)) and
+      expect(reEncoded == Right(bytes))
+  }
+
+  test("Default Persistable matches ImmutableCodec (no compression)") {
+    val persist = sample.persistedBytes
+    val imm = sample.immutableBytes
+    expect(persist == imm)
+  }
+
+  test("BrotliPersistable round-trips; hashed bytes differ from disk bytes") {
+    val persisted = PilotValue.brotliPersistable.persistedBytes(sample)
+    val decoded = PilotValue.brotliPersistable.fromPersistedBytes(persisted)
+    val immutable = sample.immutableBytes
+    expect(decoded == Right(sample)) and
+      // Critical invariant: compressed disk bytes are NOT the hashable bytes.
+      expect(persisted != immutable)
+  }
+
+  test("BrotliPersistable rejects non-brotli input as SerdeError.BrotliFailure") {
+    val garbage = ByteVector(Array[Byte](0x00, 0x01, 0x02, 0x03))
+    val result = PilotValue.brotliPersistable.fromPersistedBytes(garbage)
+    result match {
+      case Left(_: SerdeError.BrotliFailure) => success
+      case other                             => failure(s"expected BrotliFailure, got $other")
+    }
+  }
+
+  test("EraCodecRegistry dispatches by ordinal range") {
+    val registry = EraCodecRegistry
+      .fromRanges(
+        List(
+          OrdinalRange(0L, 100L) -> SerdeEra.Kryo,
+          OrdinalRange(100L, 200L) -> SerdeEra.Json,
+          OrdinalRange.from(200L) -> SerdeEra.Scodec
+        )
+      )
+      .fold(e => throw new IllegalStateException(s"registry build failed: $e"), identity)
+
+    expect(registry.eraForOrDie(0L) == SerdeEra.Kryo) and
+      expect(registry.eraForOrDie(99L) == SerdeEra.Kryo) and
+      expect(registry.eraForOrDie(100L) == SerdeEra.Json) and
+      expect(registry.eraForOrDie(199L) == SerdeEra.Json) and
+      expect(registry.eraForOrDie(200L) == SerdeEra.Scodec) and
+      expect(registry.eraForOrDie(Long.MaxValue - 1) == SerdeEra.Scodec)
+  }
+
+  test("EraCodecRegistry rejects overlapping ranges") {
+    val result = EraCodecRegistry.fromRanges(
+      List(
+        OrdinalRange(0L, 100L) -> SerdeEra.Kryo,
+        OrdinalRange(50L, 200L) -> SerdeEra.Json,
+        OrdinalRange.from(200L) -> SerdeEra.Scodec
+      )
+    )
+    expect(result.isLeft)
+  }
+
+  test("EraCodecRegistry rejects gaps") {
+    val result = EraCodecRegistry.fromRanges(
+      List(
+        OrdinalRange(0L, 100L) -> SerdeEra.Kryo,
+        OrdinalRange(150L, 200L) -> SerdeEra.Json,
+        OrdinalRange.from(200L) -> SerdeEra.Scodec
+      )
+    )
+    expect(result.isLeft)
+  }
+
+  test("EraCodecRegistry rejects non-zero start") {
+    val result = EraCodecRegistry.fromRanges(
+      List(OrdinalRange.from(10L) -> SerdeEra.Scodec)
+    )
+    expect(result.isLeft)
+  }
+
+  test("EraCodecRegistry rejects closed last range") {
+    val result = EraCodecRegistry.fromRanges(
+      List(OrdinalRange(0L, 100L) -> SerdeEra.Scodec)
+    )
+    expect(result.isLeft)
+  }
+
+  test("defaultScodec registry covers everything as Scodec") {
+    val r = EraCodecRegistry.defaultScodec
+    expect(r.eraForOrDie(0L) == SerdeEra.Scodec) and
+      expect(r.eraForOrDie(Long.MaxValue - 1) == SerdeEra.Scodec)
+  }
+}

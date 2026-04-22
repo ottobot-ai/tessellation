@@ -317,6 +317,8 @@ lazy val shared = (project in file("modules/shared"))
       Libraries.refinedCore,
       Libraries.refinedCats,
       Libraries.refinedScalacheck,
+      Libraries.scodecCore,
+      Libraries.scodecBits,
       Libraries.pureconfigCore,
       Libraries.pureconfigCats,
       Libraries.pureconfigEnumeratum,
