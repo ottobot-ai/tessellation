@@ -12,21 +12,18 @@ import io.constellationnetwork.security.mpt.prover.attestation.MerklePatriciaInc
 
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-/** Proof generation at a specific ordinal, including historical ordinals within the undo-journal
-  * window.
+/** Proof generation at a specific ordinal, including historical ordinals within the undo-journal window.
   *
   * Strategy:
   *   - **Current ordinal**: direct traversal of the in-memory trie (fast path).
-  *   - **Historical within the journal window**: take a savepoint, `unapplyTo(ordinal)` to roll
-  *     the flat state back, rebuild the trie at that ordinal, generate the proof, restore the
-  *     savepoint. This uses the `MptUndoJournal` infrastructure that was designed for exactly
-  *     this case (`MptUndoJournal.scala:46-51` comment — "deferred until inclusion-proof features
-  *     land that require reconstructing the trie root at a historical ordinal").
-  *   - **Beyond the journal window**: returns `OutOfWindow` — the caller can fall back to
-  *     snapshot-file replay if they need deep history (deferred future work).
+  *   - **Historical within the journal window**: take a savepoint, `unapplyTo(ordinal)` to roll the flat state back, rebuild the trie at
+  *     that ordinal, generate the proof, restore the savepoint. This uses the `MptUndoJournal` infrastructure that was designed for exactly
+  *     this case (`MptUndoJournal.scala:46-51` comment — "deferred until inclusion-proof features land that require reconstructing the trie
+  *     root at a historical ordinal").
+  *   - **Beyond the journal window**: returns `OutOfWindow` — the caller can fall back to snapshot-file replay if they need deep history
+  *     (deferred future work).
   *
-  * The savepoint/unapply path serializes through `MptStore.withExclusiveLock` so concurrent
-  * mutations can't interleave.
+  * The savepoint/unapply path serializes through `MptStore.withExclusiveLock` so concurrent mutations can't interleave.
   */
 trait HistoricalMptProofService[F[_]] {
 

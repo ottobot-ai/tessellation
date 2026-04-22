@@ -56,7 +56,7 @@ object NakamotoSyncDaemon {
     * Tier 3 (full catch-up + backfill). Gaps > k mean the network has finalized past our tip; sequential fetch won't work.
     */
   private val ConfirmationDepthK: Long =
-    sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH").flatMap(_.toLongOption).getOrElse(31L)
+    sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH").flatMap(_.toLongOption).getOrElse(255L)
 
   private val vrf = new EcVrf25519()
 

@@ -343,10 +343,20 @@ object SnapshotLeaderLoop {
         //   - 2 nodes: depth-only (can't reach 2/3+1)
         //   - 3+ nodes: attestation finality kicks in fast, depth is the safety net
         //
-        // Override via NAKAMOTO_CONFIRMATION_DEPTH. Default 31 chosen for adversarial-safety
-        // margin in small (3-7 node) test clusters per simulation results.
+        // Override via NAKAMOTO_CONFIRMATION_DEPTH. Default 255 chosen to approximate Cardano-
+        // equivalent 10⁻¹² common-prefix violation against a 1/3 adversary under the LDD
+        // snowplow (ψ=0, γ=15, fA=0.5, fB=0.05). The k=31 sim result is 0.91% per-attempt;
+        // extrapolating the ~1-log-per-24-blocks slope puts 10⁻¹² at k≈271, so 255 is a
+        // deliberately-conservative operating point pending expanded-range sim verification
+        // (research-nipopos-2026, sim/adv-7block-private, adv_depth_optimization.py).
+        //
+        // Attestation-based BFT finality (≥ 2/3 stake weight, FinalityThreshold in TipTracker)
+        // is the hot path in healthy networks and fires in seconds. Depth-k is the fallback
+        // for adversarial / partition conditions and only binds when attestation finality
+        // stalls. Raising k therefore increases worst-case finality time during degraded
+        // operation without affecting normal-case latency.
         val ConfirmationDepthK: Long =
-          sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH").flatMap(_.toLongOption).getOrElse(31L)
+          sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH").flatMap(_.toLongOption).getOrElse(255L)
 
         val finalityMonitor: Stream[F, Unit] = Stream
           .awakeEvery[F](5.seconds)
