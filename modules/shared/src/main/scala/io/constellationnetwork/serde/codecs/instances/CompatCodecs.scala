@@ -9,17 +9,19 @@ import io.constellationnetwork.serde.{ImmutableCodec, SerdeError}
 import io.circe.{Json, Printer}
 import scodec.bits.ByteVector
 
-/** Compatibility codecs for interop between the scodec-typed `MptStore` and legacy storage paths that carry `Json` / `Array[Byte]` values
-  * opaquely.
+/** Compatibility codecs for interop between the scodec-typed `MptStore` and legacy storage paths
+  * that carry `Json` / `Array[Byte]` values opaquely.
   *
-  * These are INTENTIONALLY not canonical byte-exact encodings of domain types — they are the minimum bridge to keep the type-erased storage
-  * callers compiling while typed migration proceeds. Do NOT use these for new consensus-critical code — write a real `ImmutableCodec[T]`
+  * These are INTENTIONALLY not canonical byte-exact encodings of domain types — they are the
+  * minimum bridge to keep the type-erased storage callers compiling while typed migration
+  * proceeds. Do NOT use these for new consensus-critical code — write a real `ImmutableCodec[T]`
   * for your type instead.
   *
   *   - `ImmutableCodec[Array[Byte]]` — raw byte passthrough. Storing an already-encoded blob.
-  *   - `ImmutableCodec[Json]` — UTF-8 of circe's `noSpaces` printer. Matches the bytes JsonSerializer produces for JSON values, so existing
-  *     on-disk JSON blobs inside the MPT stay readable through this typeclass. Not consensus-canonical: two JSON formatters emit different
-  *     bytes.
+  *   - `ImmutableCodec[Json]`         — UTF-8 of circe's `noSpaces` printer. Matches the bytes
+  *     JsonSerializer produces for JSON values, so existing on-disk JSON blobs inside the MPT stay
+  *     readable through this typeclass. Not consensus-canonical: two JSON formatters emit
+  *     different bytes.
   */
 object CompatCodecs {
 
