@@ -5,17 +5,14 @@ import scala.util.Using
 
 import scodec.bits.ByteVector
 
-/** Test helper: loads a golden hex file from `test/resources/golden/serde/` and
-  * returns the decoded bytes.
+/** Test helper: loads a golden hex file from `test/resources/golden/serde/` and returns the decoded bytes.
   *
-  * Golden files are hand-authored, never auto-regenerated. See
-  * `test/resources/golden/serde/README.md` for the policy.
+  * Golden files are hand-authored, never auto-regenerated. See `test/resources/golden/serde/README.md` for the policy.
   */
 object GoldenVectors {
 
-  /** Load `golden/serde/<name>.hex` from classpath resources. Returns the decoded
-    * bytes. Throws on missing file or malformed hex — tests that depend on a
-    * golden should fail loudly if the canary is missing.
+  /** Load `golden/serde/<name>.hex` from classpath resources. Returns the decoded bytes. Throws on missing file or malformed hex — tests
+    * that depend on a golden should fail loudly if the canary is missing.
     */
   def load(name: String): ByteVector = {
     val path = s"/golden/serde/$name.hex"
