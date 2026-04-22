@@ -118,9 +118,10 @@ object GlobalSnapshotTraverse {
               case KryoHash =>
                 GlobalSnapshotInfoV2.fromGlobalSnapshotInfo(firstInfo).stateProof(firstInc.ordinal)
               case JsonHash =>
-                // Use syncFullIfNeeded for atomic sync - avoids race condition where
-                // two concurrent calls both see entries.isEmpty=true and both try to sync
-                mptStore.syncFullIfNeeded[Json](firstInfo.allStateEntries[F], firstInc.ordinal) >>
+                // Typed-scodec sync — writes per-field `ImmutableCodec[V]` bytes that match
+                // `mptStateProof` (`buildMptFromBytes`) and the typed MPT reads. No JSON blob
+                // intermediate. Idempotent per-ordinal.
+                mptStore.syncFromGlobalSnapshotInfo(firstInfo, firstInc.ordinal) >>
                   builder.buildProof(firstInfo, firstInc.ordinal)
             }
           }

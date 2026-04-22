@@ -50,6 +50,13 @@ object MptIncrementalVsFullSyncSuite extends MutableIOSuite with Checkers {
   private val addr2 = addressGen.sample.get
   private val addr3 = addressGen.sample.get
 
+  /** Build a deterministic valid 32-byte Hash from a label. Short identifiers like "abc" aren't valid 64-hex-char Hash strings; the scodec
+    * codec enforces 64-char hex on encode. This helper UTF-8-encodes the label to hex and zero-pads to 64 chars so each label produces a
+    * distinct, encode-safe Hash.
+    */
+  private def testHash(label: String): Hash =
+    Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
+
   // Use MptRoot format for tests
   implicit val stateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
 
@@ -130,7 +137,7 @@ object MptIncrementalVsFullSyncSuite extends MutableIOSuite with Checkers {
       addr3 -> transactionReferenceGen.sample.get
     )
     val stateChannelHashes = SortedMap(
-      addr2 -> Hash("abc123")
+      addr2 -> testHash("abc123")
     )
 
     val accumulator = StateChangesAccumulator(
@@ -471,7 +478,7 @@ object MptIncrementalVsFullSyncSuite extends MutableIOSuite with Checkers {
 
     val nodeId = Id(Hex("1234567890abcdef" * 8)).toPeerId
     val stake1 = createSignedStake(addr1, nodeId, 1000L)
-    val stake2 = createSignedStake(addr1, nodeId, 2000L, Hash("abc"))
+    val stake2 = createSignedStake(addr1, nodeId, 2000L, testHash("abc"))
 
     // Multiple records for same address - ordering matters!
     val records = SortedSet(
@@ -702,7 +709,7 @@ object MptIncrementalVsFullSyncSuite extends MutableIOSuite with Checkers {
     val nodeId2 = Id(Hex("2222222222222222" * 8)).toPeerId
 
     val stake1 = createSignedStake(addr1, nodeId1, 1000L)
-    val stake2 = createSignedStake(addr1, nodeId2, 2000L, Hash("different"))
+    val stake2 = createSignedStake(addr1, nodeId2, 2000L, testHash("different"))
 
     val ordinal = SnapshotOrdinal(NonNegLong(1L))
     val record1 = DelegatedStakeRecord(stake1, ordinal, balance.Balance(0L), None, None)

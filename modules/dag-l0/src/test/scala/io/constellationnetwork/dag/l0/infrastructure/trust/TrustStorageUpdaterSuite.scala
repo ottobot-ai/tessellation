@@ -53,6 +53,8 @@ object TrustStorageUpdaterSuite extends SimpleIOSuite with Checkers {
     override def spreadDirect[A: TypeTag: Encoder](rumorContent: A, targets: Set[PeerId]): IO[Unit] = IO.unit
 
     override def setDirectPushFn(fn: Gossip.DirectPushFn[IO]): IO[Unit] = IO.unit
+
+    override def setSidecarPublishFn(fn: Gossip.SidecarPublishFn[IO]): IO[Unit] = IO.unit
   }
 
   def init(trust: TrustMap, ordinal: SnapshotOrdinal) =

@@ -125,10 +125,10 @@ object StateChannel {
       }
     }
 
-    // Use syncFullIfNeeded for atomic initialization - avoids race condition where
-    // two concurrent calls both see isEmpty=true and both try to sync
+    // Typed-scodec initialization — writes per-field `ImmutableCodec[V]` bytes consistent
+    // with `mptStateProof` and typed reads. No JSON blob intermediate.
     def ensureMptInitialized(ordinal: SnapshotOrdinal, state: GlobalSnapshotInfo): F[Unit] =
-      sharedStorages.mptStore.syncFullIfNeeded[Json](state.allStateEntries[F], ordinal)
+      sharedStorages.mptStore.syncFromGlobalSnapshotInfo(state, ordinal)
 
     def persistGlobalSnapshot(snapshot: Hashed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo): F[Unit] =
       for {

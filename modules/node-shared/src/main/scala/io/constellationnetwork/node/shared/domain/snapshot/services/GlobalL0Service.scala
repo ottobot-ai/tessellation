@@ -200,10 +200,10 @@ object GlobalL0Service {
       private def stateProofValidation(snapshot: Hashed[GlobalIncrementalSnapshot], info: GlobalSnapshotInfo)(
         implicit hasher: Hasher[F]
       ): F[Boolean] =
-        // Sync the MPT store to match the snapshot's state, then validate.
-        // This is needed because the validator uses the stateful producer which requires
-        // the trie to be synced at the correct ordinal.
-        mptStore.syncFullIfNeeded[Json](info.allStateEntries[F], snapshot.ordinal) >>
+        // Sync the MPT store to match the snapshot's state (typed scodec — no JSON blob
+        // intermediate), then validate. Validator uses the stateful producer which requires
+        // the trie to be built at the correct ordinal.
+        mptStore.syncFromGlobalSnapshotInfo(info, snapshot.ordinal) >>
           validator
             .validate(snapshot, info)
             .flatTap(v => logger.debug(s"Failed StateProofValidation: $v").whenA(v.isInvalid))

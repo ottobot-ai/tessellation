@@ -333,6 +333,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                   override def pullGlobalSnapshot(ordinal: SnapshotOrdinal): IO[Option[Hashed[GlobalIncrementalSnapshot]]] = none.pure[IO]
 
                   override def pullGlobalSnapshot(hash: Hash): IO[Option[Hashed[GlobalIncrementalSnapshot]]] = ???
+
+                  override def pullLatestFinalizedOrdinal: IO[Option[SnapshotOrdinal]] = none.pure[IO]
                 }
                 val lastNSnapshotStorage =
                   LastNGlobalSnapshotStorage.make[IO](lastGlobalSnapshotsSyncConfig, lastNSnapR, incLastNSnapR)
@@ -1045,7 +1047,9 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
 
         val address = Address("DAG0y4eLqhhXUafeE3mgBstezPTnr8L3tZjAtMWB")
-        val snapshotInfo = mkGlobalSnapshotInfo(SortedMap(address -> Hash("someHash")))
+        val snapshotInfo = mkGlobalSnapshotInfo(
+          SortedMap(address -> Hash("someHash".getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64)))
+        )
         for {
           hashedLastSnapshot <- forAsyncHasher(
             generateSnapshot(peerId),
@@ -1786,7 +1790,9 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
         val parent1 = BlockReference(Height(8L), ProofsHash("parent1"))
         val parent2 = BlockReference(Height(9L), ProofsHash("parent2"))
         val address = Address("DAG0y4eLqhhXUafeE3mgBstezPTnr8L3tZjAtMWB")
-        val snapshotInfo = mkGlobalSnapshotInfo(SortedMap(address -> Hash("someHash")))
+        val snapshotInfo = mkGlobalSnapshotInfo(
+          SortedMap(address -> Hash("someHash".getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64)))
+        )
 
         for {
           hashedLastSnapshot <- forAsyncHasher(

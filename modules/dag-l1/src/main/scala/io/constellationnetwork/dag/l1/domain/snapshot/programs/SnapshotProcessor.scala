@@ -126,7 +126,7 @@ abstract class SnapshotProcessor[
         // This avoids redundant full syncs since createContext already synced the trie.
         val updateMptStorage: F[Unit] = state match {
           case info: GlobalSnapshotInfo =>
-            mptStore.syncFullIfNeeded[Json](info.allStateEntries, snapshot.ordinal)
+            mptStore.syncFromGlobalSnapshotInfo(info, snapshot.ordinal)
           case _ => Async[F].unit
         }
 
@@ -173,7 +173,7 @@ abstract class SnapshotProcessor[
 
         val updateMptStorage: F[Unit] = state match {
           case info: GlobalSnapshotInfo =>
-            mptStore.syncFullIfNeeded[Json](info.allStateEntries, snapshot.ordinal)
+            mptStore.syncFromGlobalSnapshotInfo(info, snapshot.ordinal)
           case _ => Async[F].unit
         }
 
@@ -213,7 +213,7 @@ abstract class SnapshotProcessor[
 
         val updateMptStorage: F[Unit] = state match {
           case info: GlobalSnapshotInfo =>
-            mptStore.syncFullIfNeeded[Json](info.allStateEntries, snapshot.ordinal)
+            mptStore.syncFromGlobalSnapshotInfo(info, snapshot.ordinal)
           case _ => Async[F].unit
         }
 
@@ -266,7 +266,7 @@ abstract class SnapshotProcessor[
 
         val updateMptStorage: F[Unit] = state match {
           case info: GlobalSnapshotInfo =>
-            mptStore.syncFullIfNeeded[Json](info.allStateEntries, snapshot.ordinal)
+            mptStore.syncFromGlobalSnapshotInfo(info, snapshot.ordinal)
           case _ => Async[F].unit
         }
 

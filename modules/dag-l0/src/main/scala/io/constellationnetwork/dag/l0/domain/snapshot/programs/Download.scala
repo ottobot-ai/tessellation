@@ -515,14 +515,11 @@ object Download {
               case None => InvalidChain.raiseError[F, Agg]
             }
 
-        // Use syncFullIfNeeded for atomic initialization - avoids race condition where
-        // two concurrent calls both see mptEntries.isEmpty=true and both try to sync
+        // Typed-scodec initial sync — writes per-field `ImmutableCodec[V]` bytes consistent
+        // with `mptStateProof` and typed reads. No JSON blob intermediate.
         def performInitialSync: F[Unit] =
-          logger.info("Performing initial sync of MPT (if needed)") >>
-            mptStore.syncFullIfNeeded[Json](
-              hasherSelector.withCurrent(implicit h => context.allStateEntries[F]),
-              lastSnapshot.ordinal
-            )
+          logger.info("Performing initial sync of MPT") >>
+            hasherSelector.withCurrent(implicit h => mptStore.syncFromGlobalSnapshotInfo(context, lastSnapshot.ordinal))
 
         for {
           _ <- performInitialSync

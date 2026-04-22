@@ -69,6 +69,10 @@ object MptInsertionOrderDeterminismSuite extends MutableIOSuite {
   private val nodeId2 = Id(Hex("2222222222222222" * 8)).toPeerId
   private val nodeId3 = Id(Hex("3333333333333333" * 8)).toPeerId
 
+  /** Build a deterministic valid 32-byte Hash from a label (see MptIncrementalVsFullSyncSuite.testHash). */
+  private def testHash(label: String): Hash =
+    Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
+
   private def createSignedStake(
     source: Address,
     nodeId: PeerId,
@@ -96,11 +100,11 @@ object MptInsertionOrderDeterminismSuite extends MutableIOSuite {
 
     // Create multiple entries with known hex keys
     val entries = List(
-      (Hex("aabbccdd" + "0" * 56), Hash("data1")),
-      (Hex("11223344" + "0" * 56), Hash("data2")),
-      (Hex("ff00ff00" + "0" * 56), Hash("data3")),
-      (Hex("55667788" + "0" * 56), Hash("data4")),
-      (Hex("ddccbbaa" + "0" * 56), Hash("data5"))
+      (Hex("aabbccdd" + "0" * 56), testHash("data1")),
+      (Hex("11223344" + "0" * 56), testHash("data2")),
+      (Hex("ff00ff00" + "0" * 56), testHash("data3")),
+      (Hex("55667788" + "0" * 56), testHash("data4")),
+      (Hex("ddccbbaa" + "0" * 56), testHash("data5"))
     )
 
     // Sort by CompactNibblePath ordering (this is what the fix does)
@@ -140,10 +144,10 @@ object MptInsertionOrderDeterminismSuite extends MutableIOSuite {
     // Create entries whose different orderings produce structurally different tries.
     // Use keys that diverge at the first nibble to maximize structural sensitivity.
     val entries = List(
-      (Hex("a" * 64), Hash("data_a")),
-      (Hex("b" * 64), Hash("data_b")),
-      (Hex("c" * 64), Hash("data_c")),
-      (Hex("d" * 64), Hash("data_d"))
+      (Hex("a" * 64), testHash("data_a")),
+      (Hex("b" * 64), testHash("data_b")),
+      (Hex("c" * 64), testHash("data_c")),
+      (Hex("d" * 64), testHash("data_d"))
     )
 
     val sorted = entries.sortBy { case (hex, _) => CompactNibblePath.fromHexString(hex.value) }
@@ -499,10 +503,12 @@ object MptInsertionOrderDeterminismSuite extends MutableIOSuite {
         consensusTrie <- consensusStore.build(ordinal2)
         consensusRoot = consensusTrie.map(_.rootHash)
 
-        // ROLLBACK PATH using syncFullIfNeeded (the exact API called by GlobalSnapshotTraverse)
+        // ROLLBACK PATH using syncFromGlobalSnapshotInfo (typed scodec — the API called by
+        // GlobalSnapshotTraverse after the Option-C migration; matches the consensus path's
+        // per-field `ImmutableCodec[V]` writes).
         rollbackProducer <- FileSystemMerklePatriciaProducer.make[IO](dir / "rollback")
         rollbackStore <- MptStore.make[IO, GlobalStateKey](rollbackProducer, GlobalStateKey.toHex[IO])
-        _ <- rollbackStore.syncFullIfNeeded[io.circe.Json](finalInfo.allStateEntries[IO], ordinal2)
+        _ <- rollbackStore.syncFromGlobalSnapshotInfo(finalInfo, ordinal2)
         rollbackTrie <- rollbackStore.build(ordinal2)
         rollbackRoot = rollbackTrie.map(_.rootHash)
 
@@ -571,8 +577,8 @@ object MptInsertionOrderDeterminismSuite extends MutableIOSuite {
       createSignedStake(addr1, nodeId1, 1000L),
       createSignedStake(addr2, nodeId2, 2000L),
       createSignedStake(addr3, nodeId3, 3000L),
-      createSignedStake(addr4, nodeId1, 4000L, Hash("lock4")),
-      createSignedStake(addr5, nodeId2, 5000L, Hash("lock5"))
+      createSignedStake(addr4, nodeId1, 4000L, testHash("lock4")),
+      createSignedStake(addr5, nodeId2, 5000L, testHash("lock5"))
     )
     val addrs = List(addr1, addr2, addr3, addr4, addr5)
 

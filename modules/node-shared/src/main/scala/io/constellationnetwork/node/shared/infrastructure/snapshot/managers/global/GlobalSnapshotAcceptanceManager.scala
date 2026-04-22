@@ -1210,10 +1210,8 @@ object GlobalSnapshotAcceptanceManager {
                         .as(incrementalProof)
                     } else {
                       // Fork switch detected — stateRef is polluted from abandoned branch.
-                      // Resync from GSI via the typed-scodec path so the MPT bytes stay readable
-                      // by typed decoders (`getActiveTokenLocks`, etc.). The old path used
-                      // `allStateEntries` (JSON) + `syncFull[Json]`, which produced UTF-8 JSON
-                      // bytes the scodec typed reads can't decode.
+                      // Typed-scodec resync from GSI — matches the encoding of `syncFromStateChanges`
+                      // and the `mptStateProof` bytes path.
                       for {
                         _ <- loggerBundle.app.warn(
                           s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptConsistency=DIVERGED " +

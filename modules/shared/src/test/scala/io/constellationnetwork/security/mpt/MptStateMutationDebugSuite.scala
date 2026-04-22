@@ -48,6 +48,10 @@ object MptStateMutationDebugSuite extends MutableIOSuite {
   private val addr2 = addressGen.sample.get
   private val addr3 = addressGen.sample.get
 
+  /** Build a deterministic valid 32-byte Hash from a label (see MptIncrementalVsFullSyncSuite.testHash). */
+  private def testHash(label: String): Hash =
+    Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
+
   implicit val stateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
 
   private def createSignedStake(
@@ -157,7 +161,7 @@ object MptStateMutationDebugSuite extends MutableIOSuite {
     implicit val (j, h, sp) = res
 
     val stake1 = createSignedStake(addr1, nodeId1, 1000L)
-    val stake2 = createSignedStake(addr1, nodeId2, 2000L, Hash("different"))
+    val stake2 = createSignedStake(addr1, nodeId2, 2000L, testHash("different"))
     val ordinal1 = SnapshotOrdinal(NonNegLong(1L))
     val ordinal2 = SnapshotOrdinal(NonNegLong(2L))
 
@@ -220,7 +224,7 @@ object MptStateMutationDebugSuite extends MutableIOSuite {
     implicit val (j, h, sp) = res
 
     val stake1 = createSignedStake(addr1, nodeId1, 1000L)
-    val stake2 = createSignedStake(addr1, nodeId2, 2000L, Hash("second"))
+    val stake2 = createSignedStake(addr1, nodeId2, 2000L, testHash("second"))
 
     val ordinal1 = SnapshotOrdinal(NonNegLong(1L))
     val ordinal2 = SnapshotOrdinal(NonNegLong(2L))
@@ -278,7 +282,7 @@ object MptStateMutationDebugSuite extends MutableIOSuite {
     implicit val (j, h, sp) = res
 
     val stakes = (1 to 5).map { i =>
-      createSignedStake(addr1, if (i % 2 == 0) nodeId1 else nodeId2, i * 1000L, Hash(s"stake$i"))
+      createSignedStake(addr1, if (i % 2 == 0) nodeId1 else nodeId2, i * 1000L, testHash(s"stake$i"))
     }
 
     val ordinals = List(

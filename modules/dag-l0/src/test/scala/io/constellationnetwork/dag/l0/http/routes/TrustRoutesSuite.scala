@@ -64,6 +64,8 @@ object TrustRoutesSuite extends HttpSuite {
       override def spreadDirect[A: TypeTag: Encoder](rumorContent: A, targets: Set[PeerId]): IO[Unit] = IO.unit
 
       override def setDirectPushFn(fn: Gossip.DirectPushFn[IO]): IO[Unit] = IO.unit
+
+      override def setSidecarPublishFn(fn: Gossip.SidecarPublishFn[IO]): IO[Unit] = IO.unit
     }
     val trustPush = TrustPush.make[IO](trustStorage, gossip)
 
@@ -84,6 +86,8 @@ object TrustRoutesSuite extends HttpSuite {
       override def spreadDirect[A: TypeTag: Encoder](rumorContent: A, targets: Set[PeerId]): IO[Unit] = IO.unit
 
       override def setDirectPushFn(fn: Gossip.DirectPushFn[IO]): IO[Unit] = IO.unit
+
+      override def setSidecarPublishFn(fn: Gossip.SidecarPublishFn[IO]): IO[Unit] = IO.unit
     }
     val trustPush = TrustPush.make[IO](trustStorage, gossip)
 

@@ -52,6 +52,10 @@ object MptFileSystemProducerDebugSuite extends MutableIOSuite {
 
   implicit val stateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
 
+  /** Build a deterministic valid 32-byte Hash from a label (see MptIncrementalVsFullSyncSuite.testHash). */
+  private def testHash(label: String): Hash =
+    Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
+
   private def createSignedStake(
     source: Address,
     nodeId: PeerId,
@@ -149,7 +153,7 @@ object MptFileSystemProducerDebugSuite extends MutableIOSuite {
     implicit val (j, h, sp) = res
 
     val stake1 = createSignedStake(addr1, nodeId1, 1000L)
-    val stake2 = createSignedStake(addr1, nodeId2, 2000L, Hash("different"))
+    val stake2 = createSignedStake(addr1, nodeId2, 2000L, testHash("different"))
     val ordinal1 = SnapshotOrdinal(NonNegLong(1L))
     val ordinal2 = SnapshotOrdinal(NonNegLong(2L))
 
@@ -339,14 +343,13 @@ object MptFileSystemProducerDebugSuite extends MutableIOSuite {
         consensusTrie <- consensusStore.build(ordinal2)
         consensusRoot = consensusTrie.map(_.rootHash)
 
-        // ROLLBACK: New producer, syncFullIfNeeded (like GlobalSnapshotTraverse does)
+        // ROLLBACK: New producer, typed-scodec full sync (like GlobalSnapshotTraverse after
+        // the Option-C migration — per-field `ImmutableCodec[V]` writes, no JSON blob).
         rollbackProducer <- FileSystemMerklePatriciaProducer.make[IO](dir / "rollback")
         rollbackStore <- MptStore.make[IO, GlobalStateKey](rollbackProducer, GlobalStateKey.toHex[IO])
 
-        // This simulates what happens in GlobalSnapshotTraverse:
-        // mptStore.syncFullIfNeeded[Json](firstInfo.allStateEntries[F], firstInc.ordinal)
         info = GlobalSnapshotInfo.empty.copy(activeDelegatedStakes = Some(SortedMap(addr1 -> SortedSet(record2))))
-        _ <- rollbackStore.syncFullIfNeeded[io.circe.Json](info.allStateEntries[IO], ordinal2)
+        _ <- rollbackStore.syncFromGlobalSnapshotInfo(info, ordinal2)
         rollbackTrie <- rollbackStore.build(ordinal2)
         rollbackRoot = rollbackTrie.map(_.rootHash)
 

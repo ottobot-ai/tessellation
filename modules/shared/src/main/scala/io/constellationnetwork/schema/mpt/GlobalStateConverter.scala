@@ -734,9 +734,8 @@ object GlobalStateConverter {
             nodeCollateralKeys ++ nodeCollateralWithdrawalKeys
         }
 
-        // Build per-field typed entry maps so the writes match the scodec-typed reads
-        // (`getBalance`, `getActiveTokenLocks`, …). Previously this went via `store.sync[Json]`
-        // which wrote UTF-8 JSON bytes — unreadable by the typed decoders after Phase 3a.
+        // Per-field typed entry maps — writes go through `ImmutableCodec[V]` so bytes match
+        // the typed reads (`getActiveTokenLocks`, `getBalance`, …). No JSON intermediate.
         val stateChanHashes: Map[GlobalStateKey, Hash] = acc.lastStateChannelSnapshotHashes.iterator.map {
           case (addr, h) => GlobalStateKey.metagraph(addr, LastStateChannelSnapshotHashes) -> h
         }.toMap

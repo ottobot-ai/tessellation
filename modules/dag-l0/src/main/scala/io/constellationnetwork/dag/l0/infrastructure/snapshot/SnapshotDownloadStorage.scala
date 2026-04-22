@@ -101,11 +101,12 @@ object SnapshotDownloadStorage {
         (readPersisted(ordinal).flatMap(_.traverse(_.toHashed)), maybeInfo).tupled.map(_.tupled).flatMap {
           case Some((snapshot, info)) =>
             for {
-              // Use syncFullIfNeeded for atomic sync - avoids redundant syncs if already at this ordinal
+              // Typed-scodec sync — writes per-field `ImmutableCodec[V]` bytes that match
+              // `mptStateProof` and typed MPT reads. No JSON blob intermediate.
               _ <- info match {
                 case Left(value) => ().pure[F]
                 case Right(value) =>
-                  mptStore.syncFullIfNeeded[Json](value.allStateEntries[F], ordinal)
+                  mptStore.syncFromGlobalSnapshotInfo(value, ordinal)
               }
               result <- (info match {
                 case Left(infoV2) =>
