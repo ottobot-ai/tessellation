@@ -1100,6 +1100,20 @@ object GlobalSnapshotAcceptanceManager {
               case (address, snapshots) if snapshots.nonEmpty => address -> snapshots.last
             }
 
+            priceStateDelta = {
+              val prior =
+                lastSnapshotContext.priceState
+                  .getOrElse(
+                    SortedMap
+                      .empty[io.constellationnetwork.schema.priceOracle.TokenPair, io.constellationnetwork.schema.priceOracle.PriceRecord]
+                  )
+              updatedPriceState.filter { case (tp, rec) => !prior.get(tp).contains(rec) }
+            }
+
+            updateNodeParametersDelta = initialData.nodeParamsResult.view
+              .mapValues(unp => (unp, ordinal))
+              .to(SortedMap)
+
             stateChangesAccumulator = StateChangesAccumulator(
               lastStateChannelSnapshotHashes = sCSnapshotHashes.toSortedMap,
               lastTxRefs = transactionsRefsDeltas,
@@ -1120,6 +1134,8 @@ object GlobalSnapshotAcceptanceManager {
               activeNodeCollaterals = updatedCreateNodeCollateralsCleaned,
               nodeCollateralWithdrawals = updatedWithdrawNodeCollateralsCleaned,
               metagraphSyncData = metagraphSyncDataDeltas,
+              updateNodeParameters = updateNodeParametersDelta,
+              priceState = priceStateDelta,
               removedAllowSpendKeys = removedAllowSpendKeys,
               removedTokenLockKeys = removedTokenLockKeys,
               removedTokenLockBalanceKeys = removedTokenLockBalanceKeys,

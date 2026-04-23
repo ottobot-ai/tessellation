@@ -4,8 +4,10 @@ import cats.Show
 import cats.effect.Sync
 import cats.syntax.all._
 
+import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.mpt.PartitionNamespace._
+import io.constellationnetwork.schema.priceOracle.TokenPair
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -189,6 +191,22 @@ object GlobalStateKey {
       contract.map(MetagraphNamespace(_)).getOrElse(EmptyNamespace),
       AddressNamespace(user)
     )
+
+  /** Hypergraph key whose user-namespace component carries a pre-computed hash of an `Id` (hex of a public key). Used for the
+    * `UpdateNodeParameters` partition which is keyed by `Id`, not `Address`.
+    */
+  def updateNodeParametersKey[F[_]: Sync: Hasher](id: Id): F[GlobalStateKey] =
+    Hasher[F].hash(id.hex.value).map { h =>
+      GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.UpdateNodeParameters, EmptyNamespace, HashNamespace(h))
+    }
+
+  /** Hypergraph key whose user-namespace component carries a pre-computed hash of a `TokenPair`. Used for the `PriceState` partition which
+    * is keyed by `TokenPair`, not `Address`.
+    */
+  def priceStateKey[F[_]: Sync: Hasher](tokenPair: TokenPair): F[GlobalStateKey] =
+    Hasher[F].hash(s"${tokenPair.base}/${tokenPair.quote}").map { h =>
+      GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.PriceState, EmptyNamespace, HashNamespace(h))
+    }
 
   def toHex[F[_]: Sync: Hasher](key: GlobalStateKey): F[Hex] =
     for {

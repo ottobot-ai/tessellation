@@ -128,11 +128,12 @@ object TransactionReferenceManagerSuite extends MutableIOSuite {
 
       legacyDeltas <- legacyManager.acceptTransactionRefs(lastTxRefs, contextUpdate, acceptedTxs)
       mptDeltas <- mptManager.acceptTransactionRefs(lastTxRefs, contextUpdate, acceptedTxs)
-    } yield expect.all(
-      legacyDeltas == mptDeltas,
-      legacyDeltas.keySet == Set(destNew1, destNew2),
-      legacyDeltas.values.forall(_ == TransactionReference.empty)
-    )
+    } yield
+      expect.all(
+        legacyDeltas == mptDeltas,
+        legacyDeltas.keySet == Set(destNew1, destNew2),
+        legacyDeltas.values.forall(_ == TransactionReference.empty)
+      )
   }
 
   test("mpt path: contextUpdate shadows prior MPT state (no empty-ref added for in-block delta)") { res =>
@@ -183,10 +184,11 @@ object TransactionReferenceManagerSuite extends MutableIOSuite {
 
       legacyDeltas <- legacyManager.acceptTransactionRefs(SortedMap.empty, Map.empty, SortedSet.empty)
       mptDeltas <- mptManager.acceptTransactionRefs(SortedMap.empty, Map.empty, SortedSet.empty)
-    } yield expect.all(
-      legacyDeltas.isEmpty,
-      mptDeltas.isEmpty,
-      legacyDeltas == mptDeltas
-    )
+    } yield
+      expect.all(
+        legacyDeltas.isEmpty,
+        mptDeltas.isEmpty,
+        legacyDeltas == mptDeltas
+      )
   }
 }

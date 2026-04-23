@@ -3,7 +3,9 @@ package io.constellationnetwork.serde.codecs.instances
 import scala.collection.immutable.SortedSet
 
 import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot}
+import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
+import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.swap.AllowSpend
 import io.constellationnetwork.schema.tokenLock.TokenLock
@@ -13,9 +15,14 @@ import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSet
 import io.constellationnetwork.serde.codecs.instances.AllowSpendCodec.{codec => allowSpendCodec}
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotCodecs._
 import io.constellationnetwork.serde.codecs.instances.DelegatedStakeCodecs._
+import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs._
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
 import io.constellationnetwork.serde.codecs.instances.TokenLockCodec.{codec => tokenLockCodec}
+import io.constellationnetwork.serde.codecs.instances.UpdateNodeParametersCodec.updateNodeParametersCodec
+
+import scodec.Codec
+import shapeless.{::, HNil}
 
 /** Aggregator for the composite value-type `ImmutableCodec` instances stored in the global-state MPT via `MptStore[F, GlobalStateKey]`.
   *
@@ -56,4 +63,16 @@ object GlobalStateMptCodecs {
 
   implicit val signedCurrencyIncrementalSnapshotImmutableCodec: ImmutableCodec[Signed[CurrencyIncrementalSnapshot]] =
     ImmutableCodec.fromScodecCodec(signedCurrencyIncrementalSnapshotCodec)
+
+  private val signedUpdateNodeParametersCodec = signedCodecFor(updateNodeParametersCodec)
+  private val snapshotOrdinalCodec: Codec[SnapshotOrdinal] = Codec[SnapshotOrdinal]
+
+  private val unpRecordCodec: Codec[(Signed[UpdateNodeParameters], SnapshotOrdinal)] =
+    (signedUpdateNodeParametersCodec :: snapshotOrdinalCodec).xmap[(Signed[UpdateNodeParameters], SnapshotOrdinal)](
+      { case s :: o :: HNil => (s, o) },
+      { case (s, o) => s :: o :: HNil }
+    )
+
+  implicit val unpRecordImmutableCodec: ImmutableCodec[(Signed[UpdateNodeParameters], SnapshotOrdinal)] =
+    ImmutableCodec.fromScodecCodec(unpRecordCodec)
 }

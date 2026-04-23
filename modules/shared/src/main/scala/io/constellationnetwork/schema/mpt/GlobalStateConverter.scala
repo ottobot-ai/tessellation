@@ -9,12 +9,15 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot, CurrencySnapshotInfo}
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.merkletree.Proof
+import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
 import io.constellationnetwork.schema.mpt.MptStore
 import io.constellationnetwork.schema.mpt.PartitionNamespace.AddressNamespace
+import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
+import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
 import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
 import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendReference}
 import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
@@ -34,6 +37,7 @@ import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec 
 import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{immutableCodec => metagraphSyncImmutable}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
+import io.constellationnetwork.serde.codecs.instances.PriceOracleCodecs.priceRecordImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{immutableCodec => tokenLockRefImmutable}
 import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.{immutableCodec => txRefImmutable}
 
@@ -61,6 +65,8 @@ object GlobalStateConverter {
     activeNodeCollaterals: SortedMap[Address, SortedSet[NodeCollateralRecord]] = SortedMap.empty,
     nodeCollateralWithdrawals: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]] = SortedMap.empty,
     metagraphSyncData: SortedMap[Address, MetagraphSyncDataInfo] = SortedMap.empty,
+    updateNodeParameters: SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)] = SortedMap.empty,
+    priceState: SortedMap[TokenPair, PriceRecord] = SortedMap.empty,
     removedAllowSpendKeys: Set[(Option[Address], Address)] = Set.empty,
     removedTokenLockKeys: Set[Address] = Set.empty,
     removedTokenLockBalanceKeys: Set[Address] = Set.empty,
@@ -316,8 +322,19 @@ object GlobalStateConverter {
       case (addr, d) => GlobalStateKey.hypergraph(MetagraphSyncData, addr) -> enc(d)
     }
 
+    val updateNodeParametersF: F[List[(GlobalStateKey, Array[Byte])]] =
+      info.updateNodeParameters.toList.flatMap(_.toList).parTraverse {
+        case (id, rec) =>
+          GlobalStateKey.updateNodeParametersKey[F](id).map(k => k -> enc[(Signed[UpdateNodeParameters], SnapshotOrdinal)](rec))
+      }
+
+    val priceStateF: F[List[(GlobalStateKey, Array[Byte])]] =
+      info.priceState.toList.flatMap(_.toList).parTraverse {
+        case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(k => k -> enc[PriceRecord](rec))
+      }
+
     // Currency snapshots encode as two separate keys (Signed[CurrencyIncrementalSnapshot] + CurrencySnapshotInfo)
-    info.lastCurrencySnapshots.toList.parTraverse {
+    val currencyEntriesF = info.lastCurrencySnapshots.toList.parTraverse {
       case (metagraphAddr, Left(fullSnapshot)) =>
         CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value).map { inc =>
           List(
@@ -332,14 +349,16 @@ object GlobalStateConverter {
           GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> enc[Signed[CurrencyIncrementalSnapshot]](inc),
           GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> enc[CurrencySnapshotInfo](snInfo)
         ).pure[F]
-    }.map { currencyEntries =>
+    }
+
+    (currencyEntriesF, updateNodeParametersF, priceStateF).mapN { (currencyEntries, unpEntries, priceEntries) =>
       val all: Iterable[(GlobalStateKey, Array[Byte])] =
         stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
           activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
           lastAllowSpendRefs ++ lastTokenLockRefs ++
           activeDelegatedStakes ++ delegatedStakesWithdrawals ++
           activeNodeCollaterals ++ nodeCollateralWithdrawals ++
-          metagraphSyncData ++ currencyEntries.flatten
+          metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries
       all.toMap
     }
   }
@@ -644,6 +663,14 @@ object GlobalStateConverter {
       def getMetagraphSyncData(metagraphAddress: Address): F[Option[MetagraphSyncDataInfo]] =
         store
           .get[MetagraphSyncDataInfo](GlobalStateKey.hypergraph(GlobalStateFieldId.MetagraphSyncData, metagraphAddress))
+
+      def getUpdateNodeParameters(
+        id: Id
+      )(implicit H: Hasher[F]): F[Option[(Signed[UpdateNodeParameters], SnapshotOrdinal)]] =
+        GlobalStateKey.updateNodeParametersKey[F](id).flatMap(store.get[(Signed[UpdateNodeParameters], SnapshotOrdinal)])
+
+      def getPriceRecord(tokenPair: TokenPair)(implicit H: Hasher[F]): F[Option[PriceRecord]] =
+        GlobalStateKey.priceStateKey[F](tokenPair).flatMap(store.get[PriceRecord])
     }
 
     implicit class MptStoreGlobalSnapshotOps[F[_]: Async: Parallel: Hasher: JsonSerializer](
@@ -802,12 +829,32 @@ object GlobalStateConverter {
             }
             .toMap
 
+        // Keys for UpdateNodeParameters (Id-keyed) and PriceState (TokenPair-keyed) are hashed
+        // async via Hasher, so their entry maps are built in F.
+        val updateNodeParametersEntriesF: F[Map[GlobalStateKey, (Signed[UpdateNodeParameters], SnapshotOrdinal)]] =
+          info.updateNodeParameters.toList
+            .flatMap(_.toList)
+            .parTraverse {
+              case (id, rec) => GlobalStateKey.updateNodeParametersKey[F](id).map(_ -> rec)
+            }
+            .map(_.toMap)
+
+        val priceStateEntriesF: F[Map[GlobalStateKey, PriceRecord]] =
+          info.priceState.toList
+            .flatMap(_.toList)
+            .parTraverse {
+              case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(_ -> rec)
+            }
+            .map(_.toMap)
+
         // We avoid per-field `sync` (each would trigger its own trie build). Instead: clear,
         // insert each typed batch, then build once under the exclusive lock at the end.
         store.withExclusiveLock {
           for {
             _ <- store.clear
             currency <- buildCurrencySnapshotEntries
+            updateNodeParametersEntries <- updateNodeParametersEntriesF
+            priceStateEntries <- priceStateEntriesF
             _ <- store.insert[Hash](stateChanHashes)
             _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
             _ <- store.insert[Balance](balances)
@@ -826,6 +873,8 @@ object GlobalStateConverter {
             _ <- store
               .insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.PendingNodeCollateralWithdrawal]](nodeCollateralWithdrawals)
             _ <- store.insert[MetagraphSyncDataInfo](metagraphSyncData)
+            _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
+            _ <- store.insert[PriceRecord](priceStateEntries)
             _ <- store.build(snapshotOrdinal).void
           } yield ()
         }
@@ -945,6 +994,14 @@ object GlobalStateConverter {
         val metagraphSyncDataEntries: Map[GlobalStateKey, MetagraphSyncDataInfo] =
           acc.metagraphSyncData.iterator.map { case (addr, d) => GlobalStateKey.hypergraph(MetagraphSyncData, addr) -> d }.toMap
 
+        val updateNodeParametersEntriesF: F[Map[GlobalStateKey, (Signed[UpdateNodeParameters], SnapshotOrdinal)]] =
+          acc.updateNodeParameters.toList.parTraverse { case (id, rec) => GlobalStateKey.updateNodeParametersKey[F](id).map(_ -> rec) }
+            .map(_.toMap)
+
+        val priceStateEntriesF: F[Map[GlobalStateKey, PriceRecord]] =
+          acc.priceState.toList.parTraverse { case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(_ -> rec) }
+            .map(_.toMap)
+
         val keysToRemove = toRemovalGlobalStateKeys
         val totalEntries =
           stateChanHashes.size + txRefs.size + balances.size + currencyProofs.size +
@@ -953,7 +1010,8 @@ object GlobalStateConverter {
             lastAllowSpendRefsEntries.size + lastTokenLockRefsEntries.size +
             activeDelegatedStakesEntries.size + delegatedStakesWithdrawalsEntries.size +
             activeNodeCollateralsEntries.size + nodeCollateralWithdrawalsEntries.size +
-            metagraphSyncDataEntries.size
+            metagraphSyncDataEntries.size +
+            acc.updateNodeParameters.size + acc.priceState.size
 
         for {
           t0 <- Async[F].monotonic.map(_.toMillis)
@@ -1001,6 +1059,10 @@ object GlobalStateConverter {
             nodeCollateralWithdrawalsEntries
           )
           _ <- store.insert[MetagraphSyncDataInfo](metagraphSyncDataEntries)
+          updateNodeParametersEntries <- updateNodeParametersEntriesF
+          priceStateEntries <- priceStateEntriesF
+          _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
+          _ <- store.insert[PriceRecord](priceStateEntries)
 
           _ <- store.commit(snapshotOrdinal)
           t2 <- Async[F].monotonic.map(_.toMillis)
