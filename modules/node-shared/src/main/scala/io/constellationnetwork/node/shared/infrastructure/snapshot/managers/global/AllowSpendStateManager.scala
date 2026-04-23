@@ -10,6 +10,8 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.SpendTransaction
 import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
@@ -46,12 +48,15 @@ trait AllowSpendStateManager[F[_]] {
     currentBalances: SortedMap[Address, Balance],
     globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
     lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
-  ): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]
+  )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
 }
 
 object AllowSpendStateManager {
 
-  def make[F[_]: Async](): AllowSpendStateManager[F] = new AllowSpendStateManager[F] {
+  def make[F[_]: Async](
+    mptStore: Option[MptStore[F, GlobalStateKey]] = None,
+    shouldUseMptStore: Boolean = false
+  ): AllowSpendStateManager[F] = new AllowSpendStateManager[F] {
 
     def acceptAllowSpends(
       epochProgress: EpochProgress,
@@ -203,22 +208,20 @@ object AllowSpendStateManager {
       currentBalances: SortedMap[Address, Balance],
       globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
       lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
-    ): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])] = {
+    )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] = {
       val lastActiveGlobalAllowSpends = lastActiveAllowSpends.getOrElse(None, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
       val expiredGlobalAllowSpends = filterExpiredAllowSpends(lastActiveGlobalAllowSpends, epochProgress)
 
-      val result = (globalAllowSpends |+| expiredGlobalAllowSpends)
-        .foldLeft[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
+      (globalAllowSpends |+| expiredGlobalAllowSpends).toList
+        .foldM[F, Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
           Right((currentBalances, SortedMap.empty[Address, Balance]))
         ) {
-          case (accEither, (address, allowSpends)) =>
-            for {
-              (balances, balancesDelta) <- accEither
-              initialBalance = balances.getOrElse(address, Balance.empty)
-
-              unexpiredBalance <- {
+          case (Left(err), _) =>
+            (Left(err): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]).pure[F]
+          case (Right((balances, balancesDelta)), (address, allowSpends)) =>
+            readBalance(address, balances).map { initialBalance =>
+              val unexpiredBalance: Either[BalanceArithmeticError, Balance] = {
                 val unexpired = allowSpends.filter(_.lastValidEpochProgress >= epochProgress)
-
                 unexpired.foldLeft[Either[BalanceArithmeticError, Balance]](Right(initialBalance)) { (currentBalanceEither, allowSpend) =>
                   for {
                     currentBalance <- currentBalanceEither
@@ -228,22 +231,35 @@ object AllowSpendStateManager {
                 }
               }
 
-              expiredBalance <- {
-                val expired = allowSpends.filter(_.lastValidEpochProgress < epochProgress)
-
-                expired.foldLeft[Either[BalanceArithmeticError, Balance]](Right(unexpiredBalance)) { (currentBalanceEither, allowSpend) =>
-                  for {
-                    currentBalance <- currentBalanceEither
-                    balanceAfterExpiredAmount <- currentBalance.plus(SwapAmount.toAmount(allowSpend.amount))
-                  } yield balanceAfterExpiredAmount
+              for {
+                unexpired <- unexpiredBalance
+                expired <- {
+                  val expiredSet = allowSpends.filter(_.lastValidEpochProgress < epochProgress)
+                  expiredSet.foldLeft[Either[BalanceArithmeticError, Balance]](Right(unexpired)) { (currentBalanceEither, allowSpend) =>
+                    for {
+                      currentBalance <- currentBalanceEither
+                      balanceAfterExpiredAmount <- currentBalance.plus(SwapAmount.toAmount(allowSpend.amount))
+                    } yield balanceAfterExpiredAmount
+                  }
                 }
-              }
-
-              updatedAcc = balances.updated(address, expiredBalance)
-              updatedBalancesDelta = balancesDelta.updated(address, expiredBalance)
-            } yield (updatedAcc, updatedBalancesDelta)
+              } yield
+                (
+                  balances.updated(address, expired),
+                  balancesDelta.updated(address, expired)
+                )
+            }
         }
-      result
     }
+
+    private def readBalance(
+      address: Address,
+      deltas: SortedMap[Address, Balance]
+    )(implicit hasher: Hasher[F]): F[Balance] =
+      deltas.get(address) match {
+        case Some(b) => b.pure[F]
+        case None =>
+          if (shouldUseMptStore) mptStore.fold(Balance.empty.pure[F])(_.getBalance(address).map(_.getOrElse(Balance.empty)))
+          else Balance.empty.pure[F]
+      }
   }
 }

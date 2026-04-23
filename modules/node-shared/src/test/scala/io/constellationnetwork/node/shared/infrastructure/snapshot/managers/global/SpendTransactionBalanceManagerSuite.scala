@@ -78,13 +78,14 @@ object SpendTransactionBalanceManagerSuite extends MutableIOSuite {
 
       legacyDelta = legacyEither.map(_._2).getOrElse(SortedMap.empty[Address, Balance])
       mptDelta = mptEither.map(_._2).getOrElse(SortedMap.empty[Address, Balance])
-    } yield expect.all(
-      legacyEither.isRight,
-      mptEither.isRight,
-      legacyDelta == mptDelta,
-      legacyDelta(source) == Balance(NonNegLong(900)),
-      legacyDelta(dest) == Balance(NonNegLong(150))
-    )
+    } yield
+      expect.all(
+        legacyEither.isRight,
+        mptEither.isRight,
+        legacyDelta == mptDelta,
+        legacyDelta(source) == Balance(NonNegLong(900)),
+        legacyDelta(dest) == Balance(NonNegLong(150))
+      )
   }
 
   test("mpt path: delta shadows MPT (in-ordinal updates take precedence)") { res =>
@@ -110,9 +111,10 @@ object SpendTransactionBalanceManagerSuite extends MutableIOSuite {
       mgr = SpendTransactionBalanceManager.make[IO](Some(mptStore), shouldUseMptStore = true)
 
       result <- mgr.updateGlobalBalancesBySpendTransactions(currentDelta, SortedMap.empty, List(spendTx))
-    } yield expect.all(
-      result.isRight,
-      result.map(_._2).getOrElse(SortedMap.empty[Address, Balance])(source) == Balance(NonNegLong(400))
-    )
+    } yield
+      expect.all(
+        result.isRight,
+        result.map(_._2).getOrElse(SortedMap.empty[Address, Balance])(source) == Balance(NonNegLong(400))
+      )
   }
 }

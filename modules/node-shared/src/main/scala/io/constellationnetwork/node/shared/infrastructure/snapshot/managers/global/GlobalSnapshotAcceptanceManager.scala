@@ -186,7 +186,7 @@ object GlobalSnapshotAcceptanceManager {
     val tipUsageManager = TipUsageManager.make[F]()
     val metagraphSyncManager = MetagraphSyncManager.make[F](metagraphsSyncConfig)
     val rewardAcceptanceManager = RewardAcceptanceManager.make[F](Some(mptStore), shouldUseMptStore = false)
-    val allowSpendStateManager = AllowSpendStateManager.make[F]()
+    val allowSpendStateManager = AllowSpendStateManager.make[F](Some(mptStore), shouldUseMptStore = false)
     val tokenLockStateManager = TokenLockStateManager.make[F](mptStore)
     val spendTransactionBalanceManager = SpendTransactionBalanceManager.make[F](Some(mptStore), shouldUseMptStore = false)
     val delegatedStakeStateManager = DelegatedStakeStateManager.make[F]()
@@ -886,15 +886,16 @@ object GlobalSnapshotAcceptanceManager {
               allowSpendBlockAcceptanceResult.contextUpdate.lastTxRefs
             )
 
+            allowSpendBalancesResult <- allowSpendStateManager.updateGlobalBalancesByAllowSpends(
+              epochProgress,
+              updatedBalancesByRewards,
+              globalAllowSpends,
+              globalActiveAllowSpends
+            )
             (updatedBalancesByAllowSpends, updatedBalancesByAllowSpendsDeltas) <- Async[F].fromEither(
-              allowSpendStateManager
-                .updateGlobalBalancesByAllowSpends(
-                  epochProgress,
-                  updatedBalancesByRewards,
-                  globalAllowSpends,
-                  globalActiveAllowSpends
-                )
-                .leftMap(ex => new RuntimeException(s"Balance arithmetic error updating balances by allow spends: $ex"))
+              allowSpendBalancesResult.leftMap(ex =>
+                new RuntimeException(s"Balance arithmetic error updating balances by allow spends: $ex")
+              )
             )
 
             unexpiredNodeCollateralsRaw = nodeCollateralStateManager.acceptNodeCollaterals(
