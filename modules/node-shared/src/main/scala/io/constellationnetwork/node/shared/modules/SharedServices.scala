@@ -171,13 +171,7 @@ object SharedServices {
         collateral.amount,
         cfg.delegatedStaking.withdrawalTimeLimit.getOrElse(cfg.environment, EpochProgress.MinValue),
         storages.mptStore,
-        loggerBundle,
-        undoJournal = None,
-        // Production: skip MPT rebuild-and-compare verify on every ordinal (dominant 43 % of
-        // accept() CPU per Phase 0 baseline). Typed-scodec writes match typed reads; undo
-        // journal catches reorgs; `mptConsistency=MATCH` verified in Phase 3e over 100+
-        // consecutive ordinals. Tests keep the default (verify=on) as a safety net.
-        stateProofVerifyEnabled = false
+        loggerBundle
       )
       globalSnapshotContextFns = GlobalSnapshotContextFunctions.make(
         globalSnapshotAcceptanceManager,

@@ -205,12 +205,7 @@ object GlobalSnapshotConsensus {
             .getOrElse(sharedCfg.environment, EpochProgress.MinValue),
           mptStore,
           loggerBundle,
-          undoJournal,
-          // Production: skip MPT rebuild-and-compare verify on every ordinal (dominant 43 % of
-          // accept() CPU per Phase 0 baseline). Typed-scodec writes match typed reads; undo
-          // journal catches reorgs; `mptConsistency=MATCH` verified in Phase 3e over 100+
-          // consecutive ordinals. Tests keep the default (verify=on) as a safety net.
-          stateProofVerifyEnabled = false
+          undoJournal
         )
 
       consensusStorage <- ConsensusStorage

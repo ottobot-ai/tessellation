@@ -178,13 +178,7 @@ object GlobalSnapshotAcceptanceManager {
     withdrawalTimeLimit: EpochProgress,
     mptStore: MptStore[F, GlobalStateKey],
     loggerBundle: LoggerBundle[F],
-    undoJournal: Option[io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal[F]] = None,
-    // When true, `accept()` computes a reference MPT root from `GlobalSnapshotInfo.mptStateProof`
-    // and compares it against the incremental root written by `syncFromStateChanges`. Dominant
-    // 43 % of accept() CPU (Phase 0 baseline). Keep on in dev/test as a safety net against
-    // writer bugs; flip off in production once the writer is trusted (journal-tracked mutations,
-    // typed-scodec consistency verified by `mptConsistency=MATCH` across many ordinals).
-    stateProofVerifyEnabled: Boolean = true
+    undoJournal: Option[io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal[F]] = None
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): GlobalSnapshotAcceptanceManager[F] = {
@@ -1198,17 +1192,6 @@ object GlobalSnapshotAcceptanceManager {
                 loggerBundle.app
                   .info(
                     s"[ACCEPTANCE] ordinal=$ordinal stateProof: format=LEGACY (MPT check skipped) " +
-                      s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
-                  )
-                  .as(incrementalProof)
-              } else if (!stateProofVerifyEnabled) {
-                // Verify disabled — trust the incremental writer. Saves the O(state_size)
-                // rebuild-and-compare that dominates accept() CPU (Phase 0: 43 %). Enable
-                // in dev/test or during writer-code changes as a safety net.
-                loggerBundle.app
-                  .info(
-                    s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptRoot=${incrementalRoot.take(12)} " +
-                      s"mptConsistency=SKIPPED " +
                       s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
                   )
                   .as(incrementalProof)
