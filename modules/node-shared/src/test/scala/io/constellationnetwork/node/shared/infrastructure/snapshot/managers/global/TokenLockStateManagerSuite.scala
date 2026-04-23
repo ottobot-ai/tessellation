@@ -1583,16 +1583,17 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
     val lastActiveGlobalTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
     val generatedTokenUnlocksByAddress = Map.empty[Address, List[TokenUnlock]]
 
-    val result = acceptanceManager.updateGlobalBalancesByTokenLocks(
-      epochProgress,
-      currentBalances,
-      acceptedGlobalTokenLocks,
-      lastActiveGlobalTokenLocks,
-      generatedTokenUnlocksByAddress
-    )
-
-    (expect(result.isRight) &&
-      expect(result.toOption.get._1.isEmpty)).pure[IO]
+    acceptanceManager
+      .updateGlobalBalancesByTokenLocks(
+        epochProgress,
+        currentBalances,
+        acceptedGlobalTokenLocks,
+        lastActiveGlobalTokenLocks,
+        generatedTokenUnlocksByAddress
+      )
+      .map { result =>
+        expect(result.isRight) && expect(result.toOption.get._1.isEmpty)
+      }
   }
 
   test("updateGlobalBalancesByTokenLocks - should deduct amounts for new token locks") { res =>
@@ -1622,7 +1623,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       lastActiveGlobalTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
       generatedTokenUnlocksByAddress = Map.empty[Address, List[TokenUnlock]]
 
-      result = acceptanceManager.updateGlobalBalancesByTokenLocks(
+      result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
         currentBalances,
         acceptedGlobalTokenLocks,
@@ -1663,7 +1664,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       lastActiveGlobalTokenLocks = SortedMap(testAddress -> SortedSet(signedExpiredTokenLock))
       generatedTokenUnlocksByAddress = Map.empty[Address, List[TokenUnlock]]
 
-      result = acceptanceManager.updateGlobalBalancesByTokenLocks(
+      result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
         currentBalances,
         acceptedGlobalTokenLocks,
@@ -1695,7 +1696,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       tokenUnlock = TokenUnlock(testHash("ref123"), TokenLockAmount(100L), none, testAddress)
       generatedTokenUnlocksByAddress = Map(testAddress -> List(tokenUnlock))
 
-      result = acceptanceManager.updateGlobalBalancesByTokenLocks(
+      result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
         currentBalances,
         acceptedGlobalTokenLocks,
@@ -1736,7 +1737,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       lastActiveGlobalTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
       generatedTokenUnlocksByAddress = Map.empty[Address, List[TokenUnlock]]
 
-      result = acceptanceManager.updateGlobalBalancesByTokenLocks(
+      result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
         currentBalances,
         acceptedGlobalTokenLocks,
@@ -1790,7 +1791,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       tokenUnlock = TokenUnlock(testHash("ref789"), TokenLockAmount(50L), none, testAddress)
       generatedTokenUnlocksByAddress = Map(testAddress -> List(tokenUnlock))
 
-      result = acceptanceManager.updateGlobalBalancesByTokenLocks(
+      result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
         currentBalances,
         acceptedGlobalTokenLocks,
@@ -1852,7 +1853,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       lastActiveGlobalTokenLocks = SortedMap(address2 -> SortedSet(signedTokenLock2))
       generatedTokenUnlocksByAddress = Map.empty[Address, List[TokenUnlock]]
 
-      result = acceptanceManager.updateGlobalBalancesByTokenLocks(
+      result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
         currentBalances,
         acceptedGlobalTokenLocks,
@@ -1896,7 +1897,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       lastActiveGlobalTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
       generatedTokenUnlocksByAddress = Map.empty[Address, List[TokenUnlock]]
 
-      result = acceptanceManager.updateGlobalBalancesByTokenLocks(
+      result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
         currentBalances,
         acceptedGlobalTokenLocks,
@@ -1932,7 +1933,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       generatedTokenUnlocksByAddress = Map(testAddress -> List(tokenUnlock1, tokenUnlock2, tokenUnlock3))
 
-      result = acceptanceManager.updateGlobalBalancesByTokenLocks(
+      result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
         currentBalances,
         acceptedGlobalTokenLocks,

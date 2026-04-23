@@ -944,16 +944,18 @@ object GlobalSnapshotAcceptanceManager {
                 lastSnapshotContext.tokenLockBalances
               )
 
-            (updatedBalancesByTokenLocks, updatedBalancesByTokenLocksDeltas) = tokenLockStateManager.updateGlobalBalancesByTokenLocks(
+            tokenLockBalancesResult <- tokenLockStateManager.updateGlobalBalancesByTokenLocks(
               epochProgress,
               updatedBalancesByAllowSpends,
               globalTokenLocks,
               globalActiveTokenLocks,
               generatedTokenUnlocks
-            ) match {
-              case Right(balances) => balances
-              case Left(error)     => throw new RuntimeException(s"Balance arithmetic error updating balances by token locks: $error")
-            }
+            )
+            (updatedBalancesByTokenLocks, updatedBalancesByTokenLocksDeltas) <- Async[F].fromEither(
+              tokenLockBalancesResult.leftMap(err =>
+                new RuntimeException(s"Balance arithmetic error updating balances by token locks: $err")
+              )
+            )
 
             lastActiveGlobalAllowSpends = globalActiveAllowSpends.getOrElse(None, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
 
