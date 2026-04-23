@@ -129,10 +129,8 @@ object BackfillDaemon {
         } else None
       }
 
-    /** Validate a chunk of snapshots structurally. Checks:
-      *   1. Hash integrity (recompute hash from content) 2. Signature verification (Signed envelope) 3. Parent hash chain continuity within
-      *      chunk 4. Ordinal monotonicity
-      */
+    // Validate a chunk of snapshots structurally. Checks: hash integrity (recompute hash from content),
+    // signature verification (Signed envelope), parent hash chain continuity within chunk, ordinal monotonicity.
     def validateChunk(snapshots: List[(Signed[GlobalIncrementalSnapshot], Option[GlobalSnapshotInfo])]): F[Boolean] =
       if (snapshots.isEmpty) Async[F].pure(true)
       else
@@ -143,13 +141,13 @@ object BackfillDaemon {
           }.map(_.forall(identity))
         }
 
-    /** Store a validated snapshot + optional context to disk. */
+    // Store a validated snapshot + optional context to disk.
     def persist(signed: Signed[GlobalIncrementalSnapshot], contextOpt: Option[GlobalSnapshotInfo]): F[Unit] =
       HasherSelector[F].withCurrent { implicit hasher =>
         snapshotStorage.writeForBackfill(signed)
       }
 
-    /** Fetch a range of snapshots via FetchByRange RPC (ordinal-based, streaming). */
+    // Fetch a range of snapshots via FetchByRange RPC (ordinal-based, streaming).
     def fetchRange(startOrdinal: Long, endOrdinal: Long, targetPeer: Array[Byte] = Array.empty): F[List[pb.BackfillSnapshot]] =
       Async[F].blocking {
         val request = pb.FetchByRangeRequest(
@@ -162,20 +160,20 @@ object BackfillDaemon {
         logger.warn(s"Backfill: FetchByRange($startOrdinal-$endOrdinal) failed: ${e.getMessage}").as(List.empty)
       }
 
-    /** Get connected peer IDs for parallel chunk assignment. */
+    // Get connected peer IDs for parallel chunk assignment.
     def listPeers: F[List[Array[Byte]]] =
       Async[F].blocking {
         stub.listPeers(pb.ListPeersRequest()).peerIds.map(_.toByteArray).toList
       }.handleErrorWith(_ => Async[F].pure(List.empty))
 
-    /** Parse a BackfillSnapshot proto into domain types. */
+    // Parse a BackfillSnapshot proto into domain types.
     def parseBackfillSnapshot(snap: pb.BackfillSnapshot): Option[Signed[GlobalIncrementalSnapshot]] =
       if (snap.payload.size() > 0) {
         val payloadStr = snap.payload.toByteArray.map(_.toChar).mkString
         io.circe.parser.decode[Signed[GlobalIncrementalSnapshot]](payloadStr).toOption
       } else None
 
-    /** Process a chunk: fetch by range, validate signatures, persist to disk. */
+    // Process a chunk: fetch by range, validate signatures, persist to disk.
     def processChunk(startOrdinal: Long, endOrdinal: Long, targetPeer: Array[Byte]): F[Boolean] =
       fetchRange(startOrdinal, endOrdinal, targetPeer).flatMap { backfillSnaps =>
         if (backfillSnaps.isEmpty) Async[F].pure(false)
@@ -202,7 +200,7 @@ object BackfillDaemon {
         }
       }
 
-    /** Parallel backfill via FetchByRange. Divides gap into chunks, fetches from multiple peers. */
+    // Parallel backfill via FetchByRange. Divides gap into chunks, fetches from multiple peers.
     def parallelBackfill(cursorRef: Ref[F, BackfillCursor]): F[Boolean] =
       cursorRef.get.flatMap { cur =>
         val totalRange = cur.currentOrdinal - cur.targetOrdinal
