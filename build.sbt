@@ -434,7 +434,7 @@ lazy val nodeShared = (project in file("modules/node-shared"))
       scalapb.gen() -> (Compile / sourceManaged).value / "scalapb"
     ),
     Compile / PB.protoSources := Seq(
-      baseDirectory.value / "src" / "main" / "protobuf"
+      (LocalRootProject / baseDirectory).value / "p2p" / "proto"
     )
   )
 
