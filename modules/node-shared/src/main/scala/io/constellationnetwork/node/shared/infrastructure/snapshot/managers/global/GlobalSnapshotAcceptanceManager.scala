@@ -185,7 +185,7 @@ object GlobalSnapshotAcceptanceManager {
     val artifactEmissionManager = ArtifactEmissionManager.make[F]()
     val tipUsageManager = TipUsageManager.make[F]()
     val metagraphSyncManager = MetagraphSyncManager.make[F](metagraphsSyncConfig)
-    val rewardAcceptanceManager = RewardAcceptanceManager.make[F]()
+    val rewardAcceptanceManager = RewardAcceptanceManager.make[F](Some(mptStore), shouldUseMptStore = false)
     val allowSpendStateManager = AllowSpendStateManager.make[F]()
     val tokenLockStateManager = TokenLockStateManager.make[F](mptStore)
     val spendTransactionBalanceManager = SpendTransactionBalanceManager.make[F]()
@@ -764,7 +764,7 @@ object GlobalSnapshotAcceptanceManager {
                 s"updatedDelegStakes=${updatedCreateDelegatedStakes.size} updatedDelegWithdrawals=${updatedWithdrawDelegatedStakes.size}"
             )
 
-            (updatedBalancesByRewards, acceptedRewardTxs, rewardBalancesDelta) = rewardAcceptanceManager.acceptRewardTxs(
+            (updatedBalancesByRewards, acceptedRewardTxs, rewardBalancesDelta) <- rewardAcceptanceManager.acceptRewardTxs(
               updatedGlobalBalances ++ currencyAcceptanceBalanceUpdate,
               withdrawalRewardTxs ++ nodeOperatorRewards ++ reservedAddressRewards
             )
