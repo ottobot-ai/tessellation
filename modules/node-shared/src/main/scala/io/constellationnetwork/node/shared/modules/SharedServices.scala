@@ -146,7 +146,12 @@ object SharedServices {
       updateNodeCollateralAcceptanceManager = UpdateNodeCollateralAcceptanceManager.make(
         validators.updateNodeCollateralValidator
       )
-      priceStateUpdater = PriceStateUpdater.make(cfg.environment, DefaultDelegatedRewardsConfigProvider)
+      priceStateUpdater = PriceStateUpdater.make[F](
+        cfg.environment,
+        DefaultDelegatedRewardsConfigProvider,
+        Some(storages.mptStore),
+        shouldUseMptStore = false
+      )
       globalSnapshotAcceptanceManager = GlobalSnapshotAcceptanceManager.make(
         cfg.fieldsAddedOrdinals,
         cfg.metagraphsSync,

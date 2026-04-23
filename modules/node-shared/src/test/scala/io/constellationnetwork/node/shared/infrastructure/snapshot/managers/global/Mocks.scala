@@ -252,7 +252,7 @@ object Mocks {
         lastPriceState: SortedMap[priceOracle.TokenPair, priceOracle.PriceRecord],
         acceptedPricingUpdates: List[PricingUpdate],
         epochProgress: EpochProgress
-      ): IO[SortedMap[priceOracle.TokenPair, priceOracle.PriceRecord]] =
+      )(implicit hasher: Hasher[IO]): IO[SortedMap[priceOracle.TokenPair, priceOracle.PriceRecord]] =
         SortedMap.empty[priceOracle.TokenPair, priceOracle.PriceRecord].pure[IO]
     }
 

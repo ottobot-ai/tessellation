@@ -12,8 +12,11 @@ import io.constellationnetwork.node.shared.config.types.EmissionConfigEntry
 import io.constellationnetwork.schema.NonNegFraction
 import io.constellationnetwork.schema.artifact.PricingUpdate
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.priceOracle.TokenPair.DAG_USD
 import io.constellationnetwork.schema.priceOracle.{PriceFraction, PriceRecord, TokenPair}
+import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
 
 import eu.timepit.refined.cats.posIntCommutativeSemigroup
@@ -22,86 +25,108 @@ import monocle.Monocle.toAppliedFocusOps
 
 trait PriceStateUpdater[F[_]] {
 
+  /** Given the prior full price state and this ordinal's pricing updates, return the **delta** map — only the `TokenPair`s whose record
+    * changed. The caller merges with prior state where a full map is still needed (e.g. `buildGlobalSnapshotInfo`).
+    */
   def updatePriceState(
     lastPriceState: SortedMap[TokenPair, PriceRecord],
     acceptedPricingUpdates: List[PricingUpdate],
     epochProgress: EpochProgress
-  ): F[SortedMap[TokenPair, PriceRecord]]
+  )(implicit hasher: Hasher[F]): F[SortedMap[TokenPair, PriceRecord]]
 
 }
 
 object PriceStateUpdater {
   def make[F[_]: Async](
     environment: AppEnvironment,
-    delegatedRewardsConfigProvider: DelegatedRewardsConfigProvider
+    delegatedRewardsConfigProvider: DelegatedRewardsConfigProvider,
+    mptStore: Option[MptStore[F, GlobalStateKey]] = None,
+    shouldUseMptStore: Boolean = false
   ): PriceStateUpdater[F] = new PriceStateUpdater[F] {
 
     override def updatePriceState(
       lastPriceState: SortedMap[TokenPair, PriceRecord],
       acceptedPricingUpdates: List[PricingUpdate],
       epochProgress: EpochProgress
-    ): F[SortedMap[TokenPair, PriceRecord]] =
+    )(implicit hasher: Hasher[F]): F[SortedMap[TokenPair, PriceRecord]] =
       if (acceptedPricingUpdates.isEmpty) {
-        lastPriceState.pure[F]
+        SortedMap.empty[TokenPair, PriceRecord].pure[F]
       } else {
         for {
           emissionConfig <- getEmissionConfig(epochProgress)
-          updatedState <- acceptedPricingUpdates
+          deltas <- acceptedPricingUpdates
             .groupBy(_.tokenPair)
             .toList
             .traverse {
               case (tokenPair, updates) =>
-                aggregateUpdates(NonEmptyList.fromListUnsafe(updates)).flatMap { aggregatedPricingUpdate =>
-                  (lastPriceState.get(tokenPair) match {
-                    case None =>
-                      for {
-                        initialCurrentPrice <- initialPrice(tokenPair, emissionConfig)
-                        initialUpcomingPrice <- initialPrice(tokenPair, emissionConfig)
-                      } yield
-                        PriceRecord(
-                          currentPrice = initialCurrentPrice,
-                          upcomingPrice = initialUpcomingPrice,
-                          currentSum = aggregatedPricingUpdate,
-                          currentNumEvents = PosInt(1),
-                          nextWindowChange = epochProgress |+| EpochProgress(emissionConfig.epochsPerMonth),
-                          updatedAt = epochProgress
-                        )
-                    case Some(lastPriceRecord) =>
-                      if (lastPriceRecord.nextWindowChange <= epochProgress) {
-                        for {
-                          newUpcomingPrice <- aggregateUpdates(
-                            NonEmptyList.of(lastPriceRecord.currentSum),
-                            lastPriceRecord.currentNumEvents.some
-                          )
-                        } yield
-                          PriceRecord(
-                            currentPrice = lastPriceRecord.upcomingPrice,
-                            upcomingPrice = newUpcomingPrice,
-                            currentSum = aggregatedPricingUpdate,
-                            currentNumEvents = PosInt(1),
-                            nextWindowChange = lastPriceRecord.nextWindowChange |+| EpochProgress(emissionConfig.epochsPerMonth),
-                            updatedAt = epochProgress
-                          )
-                      } else {
-                        val newCurrentNumEvents = lastPriceRecord.currentNumEvents |+| PosInt(1)
-                        for {
-                          newCurrentSum <- addUpdates(lastPriceRecord.currentSum, aggregatedPricingUpdate)
-                        } yield
-                          lastPriceRecord
-                            .focus(_.currentSum)
-                            .replace(newCurrentSum)
-                            .focus(_.currentNumEvents)
-                            .replace(newCurrentNumEvents)
-                            .focus(_.updatedAt)
-                            .replace(epochProgress)
-                      }
-                  }).map(priceRecord => (tokenPair, priceRecord))
+                readPrior(tokenPair, lastPriceState).flatMap { prior =>
+                  aggregateUpdates(NonEmptyList.fromListUnsafe(updates)).flatMap { aggregated =>
+                    buildRecord(tokenPair, prior, aggregated, epochProgress, emissionConfig)
+                      .map(rec => (tokenPair, rec))
+                  }
                 }
             }
             .map(_.toSortedMap)
-            .map(lastPriceState ++ _)
+        } yield deltas
+      }
 
-        } yield updatedState
+    private def readPrior(
+      tokenPair: TokenPair,
+      lastPriceState: SortedMap[TokenPair, PriceRecord]
+    )(implicit hasher: Hasher[F]): F[Option[PriceRecord]] =
+      if (shouldUseMptStore) mptStore.fold(Option.empty[PriceRecord].pure[F])(_.getPriceRecord(tokenPair))
+      else lastPriceState.get(tokenPair).pure[F]
+
+    private def buildRecord(
+      tokenPair: TokenPair,
+      priorOpt: Option[PriceRecord],
+      aggregated: PricingUpdate,
+      epochProgress: EpochProgress,
+      emissionConfig: EmissionConfigEntry
+    ): F[PriceRecord] =
+      priorOpt match {
+        case None =>
+          for {
+            initialCurrentPrice <- initialPrice(tokenPair, emissionConfig)
+            initialUpcomingPrice <- initialPrice(tokenPair, emissionConfig)
+          } yield
+            PriceRecord(
+              currentPrice = initialCurrentPrice,
+              upcomingPrice = initialUpcomingPrice,
+              currentSum = aggregated,
+              currentNumEvents = PosInt(1),
+              nextWindowChange = epochProgress |+| EpochProgress(emissionConfig.epochsPerMonth),
+              updatedAt = epochProgress
+            )
+        case Some(prior) =>
+          if (prior.nextWindowChange <= epochProgress) {
+            for {
+              newUpcomingPrice <- aggregateUpdates(
+                NonEmptyList.of(prior.currentSum),
+                prior.currentNumEvents.some
+              )
+            } yield
+              PriceRecord(
+                currentPrice = prior.upcomingPrice,
+                upcomingPrice = newUpcomingPrice,
+                currentSum = aggregated,
+                currentNumEvents = PosInt(1),
+                nextWindowChange = prior.nextWindowChange |+| EpochProgress(emissionConfig.epochsPerMonth),
+                updatedAt = epochProgress
+              )
+          } else {
+            val newCurrentNumEvents = prior.currentNumEvents |+| PosInt(1)
+            for {
+              newCurrentSum <- addUpdates(prior.currentSum, aggregated)
+            } yield
+              prior
+                .focus(_.currentSum)
+                .replace(newCurrentSum)
+                .focus(_.currentNumEvents)
+                .replace(newCurrentNumEvents)
+                .focus(_.updatedAt)
+                .replace(epochProgress)
+          }
       }
 
     def getEmissionConfig(epochProgress: EpochProgress): F[EmissionConfigEntry] =

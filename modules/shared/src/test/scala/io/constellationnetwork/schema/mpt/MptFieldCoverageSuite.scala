@@ -100,10 +100,11 @@ object MptFieldCoverageSuite extends MutableIOSuite {
       _ <- store.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(100L)))
       got1 <- store.getUpdateNodeParameters(id1)
       got2 <- store.getUpdateNodeParameters(id2)
-    } yield expect.all(
-      got1.contains((unp1, SnapshotOrdinal(NonNegLong(42L)))),
-      got2.contains((unp2, SnapshotOrdinal(NonNegLong(43L))))
-    )
+    } yield
+      expect.all(
+        got1.contains((unp1, SnapshotOrdinal(NonNegLong(42L)))),
+        got2.contains((unp2, SnapshotOrdinal(NonNegLong(43L))))
+      )
   }
 
   test("syncFromGlobalSnapshotInfo + getPriceRecord round-trips via MPT") { res =>
@@ -137,10 +138,11 @@ object MptFieldCoverageSuite extends MutableIOSuite {
       _ <- store.syncFromStateChanges(acc, SnapshotOrdinal(NonNegLong(1L)))
       gotUnp <- store.getUpdateNodeParameters(id)
       gotPr <- store.getPriceRecord(TokenPair.DAG_USD)
-    } yield expect.all(
-      gotUnp.contains((unp, SnapshotOrdinal(NonNegLong(5L)))),
-      gotPr.contains(record)
-    )
+    } yield
+      expect.all(
+        gotUnp.contains((unp, SnapshotOrdinal(NonNegLong(5L)))),
+        gotPr.contains(record)
+      )
   }
 
   test("mptRoot from stateChanges matches mptRoot rebuilt from the resulting GSI (no field drift)") { res =>
@@ -171,10 +173,11 @@ object MptFieldCoverageSuite extends MutableIOSuite {
       storeB <- mkEmptyMptStore
       _ <- storeB.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(1L)))
       rootB <- storeB.underlying.getRootHashForOrdinal(SnapshotOrdinal(NonNegLong(1L)))
-    } yield expect.all(
-      rootA.isDefined,
-      rootB.isDefined,
-      rootA == rootB
-    )
+    } yield
+      expect.all(
+        rootA.isDefined,
+        rootB.isDefined,
+        rootA == rootB
+      )
   }
 }
