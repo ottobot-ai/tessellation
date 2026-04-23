@@ -96,28 +96,35 @@ func (h *Handler) handleIncoming(s network.Stream) {
 
 	remotePeer := s.Conn().RemotePeer()
 
-	// Read request type (1 byte) + length-prefixed protobuf
+	// Read request type (1 byte). Body is length-prefixed protobuf for most
+	// types; GetPeerTip (0x03) is a bare ping with no body — reading a length
+	// prefix for it would EOF (sender CloseWrite's after the type byte),
+	// triggering spurious markFailed on the sender side and cascading to
+	// "no available peers for ChainSync" after all peers get blocked.
 	reqType := make([]byte, 1)
 	if _, err := io.ReadFull(s, reqType); err != nil {
 		fmt.Printf("[chainsync] Failed to read request type from %s: %v\n", remotePeer, err)
 		return
 	}
 
-	data, err := readLengthPrefixed(s)
-	if err != nil {
-		fmt.Printf("[chainsync] Failed to read request from %s: %v\n", remotePeer, err)
-		return
-	}
-
 	switch reqType[0] {
-	case 0x01: // FetchSnapshots
-		h.serveFetchSnapshots(s, data, remotePeer)
-	case 0x02: // FindIntersection
-		h.serveFindIntersection(s, data, remotePeer)
-	case 0x03: // GetPeerTip
+	case 0x03: // GetPeerTip — no body
 		h.serveGetPeerTip(s, remotePeer)
-	case 0x04: // FetchByRange
-		h.serveFetchByRange(s, data, remotePeer)
+		return
+	case 0x01, 0x02, 0x04: // FetchSnapshots / FindIntersection / FetchByRange — length-prefixed body
+		data, err := readLengthPrefixed(s)
+		if err != nil {
+			fmt.Printf("[chainsync] Failed to read request from %s: %v\n", remotePeer, err)
+			return
+		}
+		switch reqType[0] {
+		case 0x01:
+			h.serveFetchSnapshots(s, data, remotePeer)
+		case 0x02:
+			h.serveFindIntersection(s, data, remotePeer)
+		case 0x04:
+			h.serveFetchByRange(s, data, remotePeer)
+		}
 	default:
 		fmt.Printf("[chainsync] Unknown request type 0x%02x from %s\n", reqType[0], remotePeer)
 	}
