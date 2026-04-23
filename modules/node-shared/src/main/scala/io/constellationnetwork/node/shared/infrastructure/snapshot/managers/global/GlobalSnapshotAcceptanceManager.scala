@@ -1261,9 +1261,7 @@ object GlobalSnapshotAcceptanceManager {
                         s"Resetting MPT to parent state before applying deltas."
                     ) >>
                       journal.unapplyTo(0) >>
-                      lastSnapshotContext
-                        .allStateEntries[F]
-                        .flatMap(entries => mptStore.syncFull(entries, SnapshotOrdinal.unsafeApply(ordinal.value.value - 1)))
+                      mptStore.syncFromGlobalSnapshotInfo(lastSnapshotContext, SnapshotOrdinal.unsafeApply(ordinal.value.value - 1))
                   case _ =>
                     Async[F].unit // aligned, no rollback needed
                 }

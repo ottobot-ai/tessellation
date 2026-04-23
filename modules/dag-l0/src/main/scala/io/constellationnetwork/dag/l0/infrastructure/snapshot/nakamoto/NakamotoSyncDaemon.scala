@@ -138,7 +138,11 @@ object NakamotoSyncDaemon {
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
     logger: org.typelevel.log4cats.Logger[F]
-  )(implicit globalStateProofSelector: GlobalStateProofSelector, supervisor: Supervisor[F]): F[Unit] =
+  )(
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
+    supervisor: Supervisor[F]
+  ): F[Unit] =
     pendingParentRef.modify { m =>
       val children = m.getOrElse(storedHash, List.empty)
       (m - storedHash, children)
@@ -220,6 +224,7 @@ object NakamotoSyncDaemon {
     sharedChainSyncManagerRef: Ref[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]]
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
     supervisor: Supervisor[F]
   ): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
@@ -413,7 +418,11 @@ object NakamotoSyncDaemon {
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
     logger: org.typelevel.log4cats.Logger[F]
-  )(implicit globalStateProofSelector: GlobalStateProofSelector, supervisor: Supervisor[F]): F[Unit] =
+  )(
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
+    supervisor: Supervisor[F]
+  ): F[Unit] =
     for {
       _ <- logger.info(
         s"📥 Received snapshot ordinal=${snap.ordinal} slot=${snap.slot} parentSlot=${snap.parentSlot} from=${snap.producerId.toByteArray.take(4).map("%02x".format(_)).mkString}"
@@ -878,7 +887,10 @@ object NakamotoSyncDaemon {
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     productionGate: ProductionGate[F],
     logger: org.typelevel.log4cats.Logger[F]
-  )(implicit globalStateProofSelector: GlobalStateProofSelector): F[Unit] =
+  )(
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): F[Unit] =
     if (snap.payload.size() == 0) Async[F].unit
     else {
       val payloadStr = snap.payload.toByteArray.map(_.toChar).mkString
@@ -930,15 +942,7 @@ object NakamotoSyncDaemon {
                   } >>
                   // MPT self-healing: rebuild from the fork's state
                   HasherSelector[F].withCurrent { implicit hasher =>
-                    context
-                      .allStateEntries[F](
-                        Async[F],
-                        cats.Parallel[F],
-                        hasher,
-                        implicitly[io.constellationnetwork.json.JsonSerializer[F]],
-                        implicitly[GlobalStateProofSelector]
-                      )
-                      .flatMap(kvPairs => mptStore.syncFull(kvPairs, SnapshotOrdinal.unsafeApply(snap.ordinal)))
+                    mptStore.syncFromGlobalSnapshotInfo(context, SnapshotOrdinal.unsafeApply(snap.ordinal))
                   } >>
                   // Reconcile event mempool — evict stale DAG blocks, keep unconfirmed.
                   reconcileMempool(eventMempool, context, logger) >>
@@ -1099,7 +1103,11 @@ object NakamotoSyncDaemon {
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
     logger: org.typelevel.log4cats.Logger[F]
-  )(implicit globalStateProofSelector: GlobalStateProofSelector, supervisor: Supervisor[F]): F[Unit] = {
+  )(
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
+    supervisor: Supervisor[F]
+  ): F[Unit] = {
     val now = System.currentTimeMillis()
     stateRef.get.flatMap { state =>
       if (now - state.lastCatchUpAttemptMs < CatchUpCooldownMs) {
@@ -1144,10 +1152,9 @@ object NakamotoSyncDaemon {
               // MPT full sync from the context we received — critical for
               // the acceptance manager to validate subsequent snapshots
               _ <- logger.info(s"\uD83D\uDD04 CATCH-UP: Syncing MPT from received context...")
-              kvPairs <- HasherSelector[F].withCurrent { implicit hasher =>
-                context.allStateEntries[F]
+              _ <- HasherSelector[F].withCurrent { implicit hasher =>
+                mptStore.syncFromGlobalSnapshotInfo(context, SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)))
               }
-              _ <- mptStore.syncFull(kvPairs, SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)))
               // Don't overwrite lastKnownSlotRef with the gossip slot — it may be
               // ahead of our wall clock, making slotGap negative and blocking VRF
               // eligibility. Production will update it after its next successful store.

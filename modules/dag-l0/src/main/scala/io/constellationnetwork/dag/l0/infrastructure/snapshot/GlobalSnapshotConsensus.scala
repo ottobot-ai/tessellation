@@ -142,7 +142,11 @@ object GlobalSnapshotConsensus {
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
     // Created in Services.make (hoisted so HTTP routes and stateChannelService can also publish).
     sidecarClient: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarClientAlgebra[F]
-  )(implicit supervisor: Supervisor[F], globalStateProofSelector: GlobalStateProofSelector): Resource[F, GlobalSnapshotConsensus[F]] =
+  )(
+    implicit supervisor: Supervisor[F],
+    globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): Resource[F, GlobalSnapshotConsensus[F]] =
     for {
       globalStateChannelManager <- GlobalSnapshotStateChannelAcceptanceManager
         .make[F](stateChannelAllowanceLists, pullDelay = stateChannelPullDelay, purgeDelay = stateChannelPurgeDelay)

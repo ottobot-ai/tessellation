@@ -74,7 +74,8 @@ object Services {
     loggerBundle: LoggerBundle[F],
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal]
   )(
-    implicit globalStateProofSelector: GlobalStateProofSelector
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): Resource[F, Services[F, R]] =
     for {
       classicRewards <- Rewards

@@ -301,14 +301,8 @@ object Main
                               _ <- storages.globalSnapshot.setHeadForRecovery(latestSnapshot, latestInfo)
                               _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(hashedSnapshot, latestInfo)
                               _ <- sharedStorages.lastNGlobalSnapshot.setForRecovery(hashedSnapshot, latestInfo)
-                              kvPairs <- latestInfo.allStateEntries[IO](
-                                Async[IO],
-                                Parallel[IO],
-                                hasher,
-                                jsonSerializer,
-                                globalStateProofSelector
-                              )
-                              _ <- sharedStorages.mptStore.syncFull(kvPairs, latestOrdinal)
+                              _ <- sharedStorages.mptStore
+                                .syncFromGlobalSnapshotInfo(latestInfo, latestOrdinal)(globalStateProofSelector, withdrawalTimeLimit)
                               _ <- services.consensus.manager
                                 .startFacilitatingAfterRollback(
                                   latestSnapshot.ordinal,
@@ -362,16 +356,10 @@ object Main
                             latestInfo
                           )
                         }
-                        kvPairs <- hasherSelector.withCurrent { implicit hasher =>
-                          latestInfo.allStateEntries[IO](
-                            Async[IO],
-                            Parallel[IO],
-                            hasher,
-                            jsonSerializer,
-                            globalStateProofSelector
-                          )
+                        _ <- hasherSelector.withCurrent { implicit hasher =>
+                          sharedStorages.mptStore
+                            .syncFromGlobalSnapshotInfo(latestInfo, hashedSnapshot.ordinal)(globalStateProofSelector, withdrawalTimeLimit)
                         }
-                        _ <- sharedStorages.mptStore.syncFull(kvPairs, hashedSnapshot.ordinal)
                         _ <- services.consensus.manager
                           .startFacilitatingAfterRollback(
                             latestSnapshot.ordinal,
@@ -424,14 +412,11 @@ object Main
                                               hashedSnapshot,
                                               globalSnapshotInfo
                                             )
-                                            kvPairs <- globalSnapshotInfo.allStateEntries[IO](
-                                              Async[IO],
-                                              Parallel[IO],
-                                              hasher,
-                                              jsonSerializer,
-                                              globalStateProofSelector
-                                            )
-                                            _ <- sharedStorages.mptStore.syncFull(kvPairs, hashedSnapshot.ordinal)
+                                            _ <- sharedStorages.mptStore
+                                              .syncFromGlobalSnapshotInfo(globalSnapshotInfo, hashedSnapshot.ordinal)(
+                                                globalStateProofSelector,
+                                                withdrawalTimeLimit
+                                              )
                                             _ <- services.consensus.manager
                                               .startFacilitatingAfterRollback(
                                                 signedFirstIncrementalSnapshot.ordinal,

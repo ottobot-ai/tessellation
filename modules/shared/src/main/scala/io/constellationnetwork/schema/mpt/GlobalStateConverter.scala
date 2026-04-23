@@ -548,7 +548,7 @@ object GlobalStateConverter {
       case (addr, d) => GlobalStateKey.hypergraph(MetagraphSyncData, addr) -> enc(d)
     }.toList
 
-    acc.lastCurrencySnapshots.toList.parTraverse {
+    val currencyEntriesF = acc.lastCurrencySnapshots.toList.parTraverse {
       case (metagraphAddr, Left(fullSnapshot)) =>
         CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value).map { inc =>
           List(
@@ -563,14 +563,27 @@ object GlobalStateConverter {
           GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> enc[Signed[CurrencyIncrementalSnapshot]](inc),
           GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> enc[CurrencySnapshotInfo](snInfo)
         ).pure[F]
-    }.map { currencyEntries =>
+    }
+
+    val updateNodeParametersF: F[List[(GlobalStateKey, Array[Byte])]] =
+      acc.updateNodeParameters.toList.parTraverse {
+        case (id, rec) =>
+          GlobalStateKey.updateNodeParametersKey[F](id).map(k => k -> enc[(Signed[UpdateNodeParameters], SnapshotOrdinal)](rec))
+      }
+
+    val priceStateF: F[List[(GlobalStateKey, Array[Byte])]] =
+      acc.priceState.toList.parTraverse {
+        case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(k => k -> enc[PriceRecord](rec))
+      }
+
+    (currencyEntriesF, updateNodeParametersF, priceStateF).mapN { (currencyEntries, unpEntries, priceEntries) =>
       val all: Iterable[(GlobalStateKey, Array[Byte])] =
         stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
           activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
           lastAllowSpendRefs ++ lastTokenLockRefs ++
           activeDelegatedStakes ++ delegatedStakesWithdrawals ++
           activeNodeCollaterals ++ nodeCollateralWithdrawals ++
-          metagraphSyncData ++ currencyEntries.flatten
+          metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries
       all.toMap
     }
   }
@@ -799,14 +812,9 @@ object GlobalStateConverter {
       /** Seed / reset the MptStore from a `GlobalSnapshotInfo`.
         *
         * Writes each typed field via its canonical scodec `ImmutableCodec`, matching the encoding used by the typed read methods
-        * (`getBalance`, `getActiveTokenLocks`, etc). Previously this went through `allStateEntries → syncFull[Json]` which produced UTF-8
-        * JSON bytes — inconsistent with the scodec-typed reads after the Phase 3a MptStore migration. Tests that round-tripped via this
-        * helper + typed reads would see empty reads because the scodec decoder rejected JSON bytes.
-        *
-        * Consensus note: the production state-proof verification path (`GlobalSnapshotInfo.mptStateProof` → `allStateEntries.buildMpt`)
-        * still uses the JSON-bytes-in-MPT construction and will produce a different root than this scodec-byte MptStore. Aligning the two
-        * is the remaining piece of the Phase 3c work; callers that depend on hash-level agreement between `sync` and `buildMpt` need the
-        * follow-up migration of `makeParallel` / `buildMpt` to scodec.
+        * (`getBalance`, `getActiveTokenLocks`, etc) and the incremental `syncFromStateChanges` writer. Use this for every bootstrap /
+        * resync / peer-download path — `allStateEntries → syncFull[Json]` (JSON bytes) must NOT be mixed in, since it produces different
+        * bytes for the same logical state and the resulting mptRoot will diverge from peers that bootstrapped via the typed path.
         */
       def syncFromGlobalSnapshotInfo(
         info: GlobalSnapshotInfo,
