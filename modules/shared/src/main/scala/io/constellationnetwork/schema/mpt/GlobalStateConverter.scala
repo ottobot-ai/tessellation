@@ -367,6 +367,25 @@ object GlobalStateConverter {
         case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(k => k -> enc[PriceRecord](rec))
       }
 
+    // Allow-spend expiry index: one bucket per `lastValidEpochProgress` with the set of records expiring at that epoch.
+    val allowSpendExpiryIndexF: F[List[(GlobalStateKey, Array[Byte])]] = {
+      val flat = info.activeAllowSpends.toList.flatMap(_.toList).flatMap {
+        case (mid, innerMap) => innerMap.toList.flatMap { case (addr, set) => set.toList.map(s => (mid, addr, s)) }
+      }
+      flat.parTraverse {
+        case (mid, addr, s) => s.toHashed.map(h => (s.lastValidEpochProgress, AllowSpendExpiryKey(mid, addr, h.hash)))
+      }.flatMap { entries =>
+        val byEpoch: Map[EpochProgress, SortedSet[AllowSpendExpiryKey]] =
+          entries.groupMap(_._1)(_._2).view.mapValues(_.to(SortedSet)).toMap
+        byEpoch.toList.parTraverse {
+          case (epoch, bucket) =>
+            GlobalStateKey
+              .expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexAllowSpends, epoch)
+              .map(k => k -> enc[SortedSet[AllowSpendExpiryKey]](bucket))
+        }
+      }
+    }
+
     // Currency snapshots encode as two separate keys (Signed[CurrencyIncrementalSnapshot] + CurrencySnapshotInfo)
     val currencyEntriesF = info.lastCurrencySnapshots.toList.parTraverse {
       case (metagraphAddr, Left(fullSnapshot)) =>
@@ -385,15 +404,16 @@ object GlobalStateConverter {
         ).pure[F]
     }
 
-    (currencyEntriesF, updateNodeParametersF, priceStateF).mapN { (currencyEntries, unpEntries, priceEntries) =>
-      val all: Iterable[(GlobalStateKey, Array[Byte])] =
-        stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
-          activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
-          lastAllowSpendRefs ++ lastTokenLockRefs ++
-          activeDelegatedStakes ++ delegatedStakesWithdrawals ++
-          activeNodeCollaterals ++ nodeCollateralWithdrawals ++
-          metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries
-      all.toMap
+    (currencyEntriesF, updateNodeParametersF, priceStateF, allowSpendExpiryIndexF).mapN {
+      (currencyEntries, unpEntries, priceEntries, allowSpendExpiryEntries) =>
+        val all: Iterable[(GlobalStateKey, Array[Byte])] =
+          stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
+            activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
+            lastAllowSpendRefs ++ lastTokenLockRefs ++
+            activeDelegatedStakes ++ delegatedStakesWithdrawals ++
+            activeNodeCollaterals ++ nodeCollateralWithdrawals ++
+            metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries ++ allowSpendExpiryEntries
+        all.toMap
     }
   }
 
@@ -888,6 +908,26 @@ object GlobalStateConverter {
             }
             .map(_.toMap)
 
+        // Reconstruct the allow-spend expiry index from `info.activeAllowSpends`: each active record contributes one entry in
+        // `index[lastValidEpochProgress]`. Buckets are `SortedSet[AllowSpendExpiryKey]`; empty buckets are omitted entirely.
+        val allowSpendExpiryBucketsF: F[Map[GlobalStateKey, SortedSet[AllowSpendExpiryKey]]] = {
+          val flat = info.activeAllowSpends.toList.flatMap(_.toList).flatMap {
+            case (mid, innerMap) => innerMap.toList.flatMap { case (addr, set) => set.toList.map(s => (mid, addr, s)) }
+          }
+          flat.parTraverse {
+            case (mid, addr, s) =>
+              s.toHashed.map(h => (s.lastValidEpochProgress, AllowSpendExpiryKey(mid, addr, h.hash)))
+          }.flatMap { entries =>
+            val byEpoch: Map[EpochProgress, SortedSet[AllowSpendExpiryKey]] =
+              entries.groupMap(_._1)(_._2).view.mapValues(_.to(SortedSet)).toMap
+            byEpoch.toList.parTraverse {
+              case (epoch, bucket) =>
+                GlobalStateKey.expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexAllowSpends, epoch).map(_ -> bucket)
+            }
+              .map(_.toMap)
+          }
+        }
+
         // We avoid per-field `sync` (each would trigger its own trie build). Instead: clear,
         // insert each typed batch, then build once under the exclusive lock at the end.
         store.withExclusiveLock {
@@ -896,6 +936,7 @@ object GlobalStateConverter {
             currency <- buildCurrencySnapshotEntries
             updateNodeParametersEntries <- updateNodeParametersEntriesF
             priceStateEntries <- priceStateEntriesF
+            allowSpendExpiryBuckets <- allowSpendExpiryBucketsF
             _ <- store.insert[Hash](stateChanHashes)
             _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
             _ <- store.insert[Balance](balances)
@@ -916,6 +957,7 @@ object GlobalStateConverter {
             _ <- store.insert[MetagraphSyncDataInfo](metagraphSyncData)
             _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
             _ <- store.insert[PriceRecord](priceStateEntries)
+            _ <- store.insert[SortedSet[AllowSpendExpiryKey]](allowSpendExpiryBuckets)
             _ <- store.build(snapshotOrdinal).void
           } yield ()
         }

@@ -95,10 +95,11 @@ object ExpiryIndexSuite extends MutableIOSuite {
         SnapshotOrdinal(NonNegLong(2L))
       )
       after <- store.getExpiryBucket[TokenLockExpiryKey](SystemNamespaceLabel.ExpiryIndexTokenLocks, epoch)
-    } yield expect.all(
-      before.contains(SortedSet(key)),
-      after.isEmpty
-    )
+    } yield
+      expect.all(
+        before.contains(SortedSet(key)),
+        after.isEmpty
+      )
   }
 
   test("three indices under SystemIndex fieldId are isolated (no key collisions)") { res =>
@@ -124,11 +125,12 @@ object ExpiryIndexSuite extends MutableIOSuite {
         SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
         epoch
       )
-    } yield expect.all(
-      gotAllow.contains(SortedSet(allowKey)),
-      gotLock.contains(SortedSet(lockKey)),
-      gotColl.contains(SortedSet(collKey))
-    )
+    } yield
+      expect.all(
+        gotAllow.contains(SortedSet(allowKey)),
+        gotLock.contains(SortedSet(lockKey)),
+        gotColl.contains(SortedSet(collKey))
+      )
   }
 
   test("re-sync with empty delta leaves existing buckets intact") { res =>

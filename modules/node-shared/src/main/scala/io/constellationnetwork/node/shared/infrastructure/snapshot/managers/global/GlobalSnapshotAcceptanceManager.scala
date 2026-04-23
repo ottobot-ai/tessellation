@@ -872,14 +872,17 @@ object GlobalSnapshotAcceptanceManager {
               SortedMap.empty[Address, TokenLockReference]
             )
 
-            AllowSpendAcceptanceResult(updatedAllowSpends, allowSpendsDeltas, removedAllowSpendKeys) <- allowSpendStateManager
-              .acceptAllowSpends(
-                epochProgress,
-                activeAllowSpendsFromCurrencySnapshots,
-                globalAllowSpends,
-                globalActiveAllowSpends,
-                allAcceptedSpendTxns
-              )
+            allowSpendAcceptanceResult <- allowSpendStateManager.acceptAllowSpends(
+              epochProgress,
+              activeAllowSpendsFromCurrencySnapshots,
+              globalAllowSpends,
+              globalActiveAllowSpends,
+              allAcceptedSpendTxns
+            )
+            updatedAllowSpends = allowSpendAcceptanceResult.fullState
+            allowSpendsDeltas = allowSpendAcceptanceResult.deltas
+            removedAllowSpendKeys = allowSpendAcceptanceResult.removedKeys
+            allowSpendExpiryIndexDelta = allowSpendAcceptanceResult.expiryIndexDelta
 
             updatedAllowSpendRefs = allowSpendStateManager.acceptAllowSpendRefs(
               globalLastAllowSpendRefs,
@@ -1138,6 +1141,7 @@ object GlobalSnapshotAcceptanceManager {
               metagraphSyncData = metagraphSyncDataDeltas,
               updateNodeParameters = updateNodeParametersDelta,
               priceState = priceStateDeltas,
+              allowSpendExpiryIndex = allowSpendExpiryIndexDelta,
               removedAllowSpendKeys = removedAllowSpendKeys,
               removedTokenLockKeys = removedTokenLockKeys,
               removedTokenLockBalanceKeys = removedTokenLockBalanceKeys,

@@ -11,7 +11,7 @@ import io.constellationnetwork.schema.artifact.SpendTransaction
 import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
@@ -21,7 +21,11 @@ import io.constellationnetwork.syntax.sortedCollection.sortedSetSyntax
 case class AllowSpendAcceptanceResult(
   fullState: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
   deltas: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
-  removedKeys: Set[(Option[Address], Address)] = Set.empty
+  removedKeys: Set[(Option[Address], Address)] = Set.empty,
+  /** Expiry-index delta: adds for records that just entered the active set, removes for records that left it (consumed by a spend
+    * transaction this ordinal, or whose `lastValidEpochProgress` is now in the past).
+    */
+  expiryIndexDelta: SystemIndexDelta[AllowSpendExpiryKey] = SystemIndexDelta.empty[AllowSpendExpiryKey]
 )
 
 trait AllowSpendStateManager[F[_]] {
@@ -155,29 +159,20 @@ object AllowSpendStateManager {
       for {
         (updatedCurrencyAllowSpends, currencyDeltas) <- processedMetagraphsF
         validGlobalAllowSpends <- unexpiredGlobalWithoutSpendTransactionsF
-      } yield {
-        // Compute global deltas by comparing with previous state
-        // Filter out empty sets - those are removals tracked separately in removedKeys
-        val globalDeltas: SortedMap[Address, SortedSet[Signed[AllowSpend]]] =
+
+        globalDeltas: SortedMap[Address, SortedSet[Signed[AllowSpend]]] =
           validGlobalAllowSpends.filter {
             case (address, allowSpends) =>
               allowSpends.nonEmpty && !lastActiveGlobalAllowSpends.get(address).contains(allowSpends)
           }
 
-        val fullState = if (validGlobalAllowSpends.nonEmpty) {
-          updatedCurrencyAllowSpends + (None -> validGlobalAllowSpends)
-        } else {
-          updatedCurrencyAllowSpends
-        }
+        fullState =
+          if (validGlobalAllowSpends.nonEmpty) updatedCurrencyAllowSpends + (None -> validGlobalAllowSpends)
+          else updatedCurrencyAllowSpends
 
-        val deltas = if (globalDeltas.nonEmpty) {
-          currencyDeltas + (None -> globalDeltas)
-        } else {
-          currencyDeltas
-        }
+        deltas = if (globalDeltas.nonEmpty) currencyDeltas + (None -> globalDeltas) else currencyDeltas
 
-        // Compute removed keys: addresses that had AllowSpends but now have empty or missing sets
-        val removedKeys: Set[(Option[Address], Address)] = lastActiveAllowSpends.flatMap {
+        removedKeys: Set[(Option[Address], Address)] = lastActiveAllowSpends.flatMap {
           case (metagraphIdOpt, innerMap) =>
             innerMap.collect {
               case (address, spends)
@@ -187,8 +182,56 @@ object AllowSpendStateManager {
             }
         }.toSet
 
-        AllowSpendAcceptanceResult(fullState, deltas, removedKeys)
-      }
+        expiryIndexDelta <- computeExpiryIndexDelta(lastActiveAllowSpends, fullState)
+      } yield AllowSpendAcceptanceResult(fullState, deltas, removedKeys, expiryIndexDelta)
+    }
+
+    /** Compute the `SystemIndexDelta[AllowSpendExpiryKey]` by diffing the per-`(mid, addr)` sets of `Signed[AllowSpend]` in `before` vs
+      * `after`. Added records contribute to `adds` at their `lastValidEpochProgress`; removed records contribute to `removes` at the same
+      * epoch. Hashing is needed for the key; runs in parallel across (mid, addr) pairs.
+      */
+    private def computeExpiryIndexDelta(
+      before: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+      after: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+    )(implicit hasher: Hasher[F]): F[SystemIndexDelta[AllowSpendExpiryKey]] = {
+      val pairKeys: Set[(Option[Address], Address)] =
+        before.flatMap { case (m, inner) => inner.keys.map(a => (m, a)) }.toSet ++
+          after.flatMap { case (m, inner) => inner.keys.map(a => (m, a)) }.toSet
+
+      def hashEntries(
+        mid: Option[Address],
+        addr: Address,
+        allowSpends: SortedSet[Signed[AllowSpend]]
+      ): F[List[(EpochProgress, AllowSpendExpiryKey)]] =
+        allowSpends.toList.traverse { s =>
+          s.toHashed.map(h => (s.lastValidEpochProgress, AllowSpendExpiryKey(mid, addr, h.hash)))
+        }
+
+      type Entries = List[(EpochProgress, AllowSpendExpiryKey)]
+      val empty: (Entries, Entries) = (List.empty, List.empty)
+
+      pairKeys.toList
+        .foldLeftM[F, (Entries, Entries)](empty) {
+          case ((accAdds, accRemoves), (mid, addr)) =>
+            val oldInner = before.getOrElse(mid, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
+            val newInner = after.getOrElse(mid, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
+            val oldSet = oldInner.getOrElse(addr, SortedSet.empty[Signed[AllowSpend]])
+            val newSet = newInner.getOrElse(addr, SortedSet.empty[Signed[AllowSpend]])
+            val added = newSet.diff(oldSet)
+            val removed = oldSet.diff(newSet)
+            for {
+              addedEntries <- hashEntries(mid, addr, added)
+              removedEntries <- hashEntries(mid, addr, removed)
+            } yield (accAdds ++ addedEntries, accRemoves ++ removedEntries)
+        }
+        .map {
+          case (adds, removes) =>
+            val addsMap: SortedMap[EpochProgress, Set[AllowSpendExpiryKey]] =
+              adds.groupMap(_._1)(_._2).view.mapValues(_.toSet).to(SortedMap)
+            val removesMap: SortedMap[EpochProgress, Set[AllowSpendExpiryKey]] =
+              removes.groupMap(_._1)(_._2).view.mapValues(_.toSet).to(SortedMap)
+            SystemIndexDelta.EpochBucket[AllowSpendExpiryKey](addsMap, removesMap)
+        }
     }
 
     def acceptAllowSpendRefs(
