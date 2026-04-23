@@ -180,10 +180,10 @@ object GlobalSnapshotAcceptanceManager {
     mptStore: MptStore[F, GlobalStateKey],
     loggerBundle: LoggerBundle[F],
     undoJournal: Option[io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal[F]] = None,
-    /** When true, accept() emits adds/removes for the node-collateral-withdrawal expiry index. Requires the same
-      * `Some(withdrawalTimeLimit)` to also be passed to every `syncFromGlobalSnapshotInfo` / `toAllStateKeyValueBytes` in the node's
-      * production paths — otherwise rebuild-path and delta-path mptRoots diverge. Default false until that threading lands.
-      */
+    // When true, accept() emits adds/removes for the node-collateral-withdrawal expiry index. Requires the same
+    // `Some(withdrawalTimeLimit)` to also be passed to every `syncFromGlobalSnapshotInfo` / `toAllStateKeyValueBytes`
+    // in the node's production paths — otherwise rebuild-path and delta-path mptRoots diverge. Default false until
+    // that threading lands.
     maintainNodeCollateralWithdrawalExpiryIndex: Boolean = false
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector

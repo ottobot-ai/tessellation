@@ -304,4 +304,79 @@ object NodeCollateralExpirySweepEquivalenceSuite extends MutableIOSuite {
       indexPairs <- toAddressHashPairs(index)
     } yield expect.all(legacyPairs == indexPairs, legacyPairs.size == 3)
   }
+
+  // ==========================================================================================
+  // #86 parity tests — `findExpiredWithdrawalsViaIndex` (map-input) vs `findExpiredWithdrawalsViaIndexFromMpt`
+  // (MPT point reads, no map). Both should produce identical output under the phase-2a invariant (MPT seeded
+  // with the same state as `lastActive`).
+  // ==========================================================================================
+
+  test("#86 parity: findExpiredWithdrawals map-input vs MPT-backed (mixed)") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp1 <- KeyPairGenerator.makeKeyPair[IO]
+      kp2 <- KeyPairGenerator.makeKeyPair[IO]
+      addr1 = kp1.getPublic.toAddress
+      addr2 = kp2.getPublic.toAddress
+      peer1 = kp1.getPublic.toId.toPeerId
+      peer2 = kp2.getPublic.toId.toPeerId
+
+      wExpired = mkWithdrawal(addr1, peer1, EpochProgress(NonNegLong(50L)), "expired")
+      wValidA = mkWithdrawal(addr1, peer1, EpochProgress(NonNegLong(250L)), "validA")
+      wValidB = mkWithdrawal(addr2, peer2, EpochProgress(NonNegLong(300L)), "validB")
+
+      lastActive = SortedMap(
+        addr1 -> SortedSet(wExpired, wValidA),
+        addr2 -> SortedSet(wValidB)
+      )
+
+      store <- mkSeededMptStore(lastActive)
+      mgr = NodeCollateralStateManager.make[IO](store)
+
+      currentEpoch = EpochProgress(NonNegLong(300L))
+      prevEpoch = EpochProgress.MinValue
+
+      mapBased <- mgr.findExpiredWithdrawalsViaIndex(prevEpoch, currentEpoch, lastActive)
+      mptBased <- mgr.findExpiredWithdrawalsViaIndexFromMpt(prevEpoch, currentEpoch)
+
+      mapPairs <- toAddressHashPairs(mapBased)
+      mptPairs <- toAddressHashPairs(mptBased)
+    } yield expect.all(mapPairs == mptPairs, mapPairs.nonEmpty)
+  }
+
+  test("#86 parity: acceptNodeCollaterals legacy flag vs #86 flag yield identical tuples") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp1 <- KeyPairGenerator.makeKeyPair[IO]
+      kp2 <- KeyPairGenerator.makeKeyPair[IO]
+      addr1 = kp1.getPublic.toAddress
+      addr2 = kp2.getPublic.toAddress
+      peer1 = kp1.getPublic.toId.toPeerId
+      peer2 = kp2.getPublic.toId.toPeerId
+
+      wExpired = mkWithdrawal(addr1, peer1, EpochProgress(NonNegLong(50L)), "expired")
+      wValidA = mkWithdrawal(addr1, peer1, EpochProgress(NonNegLong(250L)), "validA")
+      wValidB = mkWithdrawal(addr2, peer2, EpochProgress(NonNegLong(300L)), "validB")
+
+      existingWithdrawals = SortedMap(
+        addr1 -> SortedSet(wExpired, wValidA),
+        addr2 -> SortedSet(wValidB)
+      )
+      info = GlobalSnapshotInfo.empty.copy(nodeCollateralWithdrawals = existingWithdrawals.some)
+
+      storeLegacy <- mkSeededMptStore(existingWithdrawals)
+      storeMpt <- mkSeededMptStore(existingWithdrawals)
+      mgrLegacy = NodeCollateralStateManager.make[IO](storeLegacy, shouldUseMptStore = true, useMptBackedAcceptPath = false)
+      mgrMpt = NodeCollateralStateManager.make[IO](storeMpt, shouldUseMptStore = true, useMptBackedAcceptPath = true)
+
+      currentEpoch = EpochProgress(NonNegLong(300L))
+      prevEpoch = EpochProgress.MinValue
+
+      resLegacy <- mgrLegacy.acceptNodeCollaterals(info, currentEpoch, prevEpoch, withdrawalTimeLimit)
+      resMpt <- mgrMpt.acceptNodeCollaterals(info, currentEpoch, prevEpoch, withdrawalTimeLimit)
+
+      (_, unexpLegacy, expLegacy) = resLegacy
+      (_, unexpMpt, expMpt) = resMpt
+    } yield expect.all(unexpLegacy == unexpMpt, expLegacy == expMpt)
+  }
 }

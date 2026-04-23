@@ -23,9 +23,8 @@ case class AllowSpendAcceptanceResult(
   fullState: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
   deltas: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
   removedKeys: Set[(Option[Address], Address)] = Set.empty,
-  /** Expiry-index delta: adds for records that just entered the active set, removes for records that left it (consumed by a spend
-    * transaction this ordinal, or whose `lastValidEpochProgress` is now in the past).
-    */
+  // Expiry-index delta: adds for records that just entered the active set, removes for records that left it
+  // (consumed by a spend transaction this ordinal, or whose `lastValidEpochProgress` is now in the past).
   expiryIndexDelta: SystemIndexDelta[AllowSpendExpiryKey] = SystemIndexDelta.empty[AllowSpendExpiryKey]
 )
 
@@ -67,6 +66,15 @@ trait AllowSpendStateManager[F[_]] {
     lastActiveGlobalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]]
   )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
 
+  /** #88 MPT-backed variant — drops the `lastActiveGlobalAllowSpends` map input. Resolves each expiring key's hash via
+    * `mptStore.getActiveAllowSpends(None, addr)` (global partition) instead of an in-memory lookup. Equivalence is verified by
+    * `AllowSpendExpirySweepEquivalenceSuite`.
+    */
+  def findExpiredGlobalAllowSpendsViaIndexFromMpt(
+    previousEpochProgress: EpochProgress,
+    epochProgress: EpochProgress
+  )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+
   def updateGlobalBalancesByAllowSpends(
     epochProgress: EpochProgress,
     previousEpochProgress: EpochProgress,
@@ -80,7 +88,11 @@ object AllowSpendStateManager {
 
   def make[F[_]: Async](
     mptStore: Option[MptStore[F, GlobalStateKey]] = None,
-    shouldUseMptStore: Boolean = false
+    shouldUseMptStore: Boolean = false,
+    // #88: when true, `acceptAllowSpends` / `updateGlobalBalancesByAllowSpends` route expiry discovery through
+    // `findExpiredGlobalAllowSpendsViaIndexFromMpt` (drops the `lastActive*` map dependency inside the sweep).
+    // Default false until testnet validation. Flip in `GlobalSnapshotAcceptanceManager.make` when ready.
+    useMptBackedAcceptPath: Boolean = false
   ): AllowSpendStateManager[F] = new AllowSpendStateManager[F] {
 
     def acceptAllowSpends(
@@ -100,8 +112,13 @@ object AllowSpendStateManager {
       // Phase 2b: route the expiry discovery through the index when shouldUseMptStore=true.
       // Semantically identical to filterExpiredAllowSpends (proven by AllowSpendExpirySweepEquivalenceSuite)
       // but touches only addresses with expiring records rather than every address in lastActive.
+      // #88: when `useMptBackedAcceptPath` is true, expiry resolution also reads from MPT per-address
+      // (drops the `lastActive*` map dependency inside the sweep). Both branches produce the same result
+      // under the phase-2a invariant.
       val expiredGlobalAllowSpendsF: F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
-        if (shouldUseMptStore && mptStore.isDefined)
+        if (useMptBackedAcceptPath && mptStore.isDefined)
+          findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress)
+        else if (shouldUseMptStore && mptStore.isDefined)
           findExpiredGlobalAllowSpendsViaIndex(previousEpochProgress, epochProgress, lastActiveGlobalAllowSpends)
         else
           filterExpiredAllowSpends(lastActiveGlobalAllowSpends, epochProgress).pure[F]
@@ -278,6 +295,45 @@ object AllowSpendStateManager {
     ): SortedMap[Address, SortedSet[Signed[AllowSpend]]] =
       allowSpends.view.mapValues(_.filter(_.lastValidEpochProgress < epochProgress)).to(SortedMap)
 
+    def findExpiredGlobalAllowSpendsViaIndexFromMpt(
+      previousEpochProgress: EpochProgress,
+      epochProgress: EpochProgress
+    )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] = mptStore match {
+      case None =>
+        SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]].pure[F]
+      case Some(store) =>
+        if (previousEpochProgress.value.value >= epochProgress.value.value)
+          SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]].pure[F]
+        else {
+          val fromL = previousEpochProgress.value.value
+          val toL = epochProgress.value.value - 1L
+          val epochs: List[EpochProgress] =
+            (fromL to toL).toList.map(v => EpochProgress(eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(v)))
+
+          for {
+            buckets <- epochs.traverse { e =>
+              store
+                .getExpiryBucket[AllowSpendExpiryKey](SystemNamespaceLabel.ExpiryIndexAllowSpends, e)
+                .map(_.getOrElse(SortedSet.empty[AllowSpendExpiryKey]))
+            }
+            // Filter to global-only (metagraphId = None) and group by address.
+            allKeys = buckets.flatten.toSet.filter(_.metagraphId.isEmpty)
+            byAddress = allKeys.groupBy(_.address)
+            resolved <- byAddress.toList.traverse {
+              case (addr, expiryKeys) =>
+                store.getActiveAllowSpends(None, addr).flatMap { addrSetOpt =>
+                  val addrSet = addrSetOpt.getOrElse(SortedSet.empty[Signed[AllowSpend]])
+                  val expectedHashes = expiryKeys.map(_.hash)
+                  addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s))).map { hashed =>
+                    val matched = hashed.collect { case (h, s) if expectedHashes.contains(h) => s }.to(SortedSet)
+                    addr -> matched
+                  }
+                }
+            }
+          } yield SortedMap.from(resolved).filter(_._2.nonEmpty)
+        }
+    }
+
     def findExpiredGlobalAllowSpendsViaIndex(
       previousEpochProgress: EpochProgress,
       epochProgress: EpochProgress,
@@ -327,9 +383,11 @@ object AllowSpendStateManager {
     )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] = {
       val lastActiveGlobalAllowSpends = lastActiveAllowSpends.getOrElse(None, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
 
-      // Same dual-path as acceptAllowSpends: index sweep under the flag, legacy filter otherwise.
+      // Same three-way dispatch as acceptAllowSpends: #88 MPT-backed, phase-2b index sweep, or legacy filter.
       val expiredGlobalAllowSpendsF: F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
-        if (shouldUseMptStore && mptStore.isDefined)
+        if (useMptBackedAcceptPath && mptStore.isDefined)
+          findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress)
+        else if (shouldUseMptStore && mptStore.isDefined)
           findExpiredGlobalAllowSpendsViaIndex(previousEpochProgress, epochProgress, lastActiveGlobalAllowSpends)
         else
           filterExpiredAllowSpends(lastActiveGlobalAllowSpends, epochProgress).pure[F]

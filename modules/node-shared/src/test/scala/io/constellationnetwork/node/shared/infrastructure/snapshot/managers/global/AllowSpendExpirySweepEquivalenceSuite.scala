@@ -302,4 +302,98 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
       indexPairs <- toAddressHashPairs(indexExpired)
     } yield expect(legacyPairs == indexPairs)
   }
+
+  // ==========================================================================================
+  // #88 parity tests — `findExpiredGlobalAllowSpendsViaIndex` (map-input) vs
+  // `findExpiredGlobalAllowSpendsViaIndexFromMpt` (MPT point reads, no map). Both should produce
+  // identical output under the phase-2a invariant. Plus full-method parity on `acceptAllowSpends`
+  // comparing flag-off vs #88-flag-on.
+  // ==========================================================================================
+
+  test("#88 parity: findExpiredGlobalAllowSpends map-input vs MPT-backed (mixed)") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp1 <- KeyPairGenerator.makeKeyPair[IO]
+      kp2 <- KeyPairGenerator.makeKeyPair[IO]
+      dest <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      addr1 = kp1.getPublic.toAddress
+      addr2 = kp2.getPublic.toAddress
+
+      asExpiredA = mkAllowSpend(addr1, dest, EpochProgress(NonNegLong(100L)), "expiredA")
+      asValidA = mkAllowSpend(addr1, dest, EpochProgress(NonNegLong(500L)), "validA")
+      asValidB = mkAllowSpend(addr2, dest, EpochProgress(NonNegLong(800L)), "validB")
+
+      lastActive = SortedMap(
+        addr1 -> SortedSet(asExpiredA, asValidA),
+        addr2 -> SortedSet(asValidB)
+      )
+
+      store <- mkSeededMptStore(lastActive)
+      mgr = AllowSpendStateManager.make[IO](Some(store))
+
+      currentEpoch = EpochProgress(NonNegLong(300L))
+      prevEpoch = EpochProgress.MinValue
+
+      mapBased <- mgr.findExpiredGlobalAllowSpendsViaIndex(prevEpoch, currentEpoch, lastActive)
+      mptBased <- mgr.findExpiredGlobalAllowSpendsViaIndexFromMpt(prevEpoch, currentEpoch)
+
+      mapPairs <- toAddressHashPairs(mapBased)
+      mptPairs <- toAddressHashPairs(mptBased)
+    } yield expect.all(mapPairs == mptPairs, mapPairs.nonEmpty)
+  }
+
+  test("#88 parity: acceptAllowSpends legacy flag vs #88 flag yield identical AllowSpendAcceptanceResult") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp1 <- KeyPairGenerator.makeKeyPair[IO]
+      kp2 <- KeyPairGenerator.makeKeyPair[IO]
+      dest <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      addr1 = kp1.getPublic.toAddress
+      addr2 = kp2.getPublic.toAddress
+
+      asExpiredA = mkAllowSpend(addr1, dest, EpochProgress(NonNegLong(100L)), "expiredA")
+      asValidA = mkAllowSpend(addr1, dest, EpochProgress(NonNegLong(500L)), "validA")
+      asValidB = mkAllowSpend(addr2, dest, EpochProgress(NonNegLong(800L)), "validB")
+
+      lastActive = SortedMap(
+        addr1 -> SortedSet(asExpiredA, asValidA),
+        addr2 -> SortedSet(asValidB)
+      )
+      lastActiveOuter = SortedMap(Option.empty[Address] -> lastActive)
+
+      storeLegacy <- mkSeededMptStore(lastActive)
+      storeMpt <- mkSeededMptStore(lastActive)
+      mgrLegacy = AllowSpendStateManager.make[IO](Some(storeLegacy), shouldUseMptStore = true, useMptBackedAcceptPath = false)
+      mgrMpt = AllowSpendStateManager.make[IO](Some(storeMpt), shouldUseMptStore = true, useMptBackedAcceptPath = true)
+
+      currentEpoch = EpochProgress(NonNegLong(300L))
+      prevEpoch = EpochProgress.MinValue
+      emptyCurrencySnapshots = SortedMap.empty[Address, SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+      emptyGlobalAllowSpends = SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]]
+      emptySpendTxns = List.empty[io.constellationnetwork.schema.artifact.SpendTransaction]
+
+      resLegacy <- mgrLegacy.acceptAllowSpends(
+        currentEpoch,
+        prevEpoch,
+        emptyCurrencySnapshots,
+        emptyGlobalAllowSpends,
+        lastActiveOuter,
+        emptySpendTxns
+      )
+      resMpt <- mgrMpt.acceptAllowSpends(
+        currentEpoch,
+        prevEpoch,
+        emptyCurrencySnapshots,
+        emptyGlobalAllowSpends,
+        lastActiveOuter,
+        emptySpendTxns
+      )
+    } yield
+      expect.all(
+        resLegacy.fullState == resMpt.fullState,
+        resLegacy.deltas == resMpt.deltas,
+        resLegacy.removedKeys == resMpt.removedKeys,
+        resLegacy.expiryIndexDelta == resMpt.expiryIndexDelta
+      )
+  }
 }

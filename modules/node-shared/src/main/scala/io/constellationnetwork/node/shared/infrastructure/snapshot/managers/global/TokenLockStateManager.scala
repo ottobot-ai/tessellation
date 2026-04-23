@@ -27,9 +27,8 @@ case class TokenLockAcceptanceResult(
   fullState: SortedMap[Address, SortedSet[Signed[TokenLock]]],
   deltas: SortedMap[Address, SortedSet[Signed[TokenLock]]],
   removedKeys: Set[Address] = Set.empty,
-  /** Expiry-index delta: adds for records newly entering active (with `unlockEpoch.isDefined`), removes for records leaving active. Records
-    * with `unlockEpoch = None` never expire and aren't indexed.
-    */
+  // Expiry-index delta: adds for records newly entering active (with `unlockEpoch.isDefined`), removes for records
+  // leaving active. Records with `unlockEpoch = None` never expire and aren't indexed.
   expiryIndexDelta: SystemIndexDelta[TokenLockExpiryKey] = SystemIndexDelta.empty[TokenLockExpiryKey]
 )
 
