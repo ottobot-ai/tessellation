@@ -235,7 +235,7 @@ object GlobalSnapshotContextFunctions {
           returnedSCEvents,
           acceptedRewardTxs,
           snapshotInfo,
-          _,
+          computedStateProof,
           _,
           _,
           _,
@@ -352,10 +352,29 @@ object GlobalSnapshotContextFunctions {
               s"Continuing since snapshot was already validated by L0 majority consensus."
           )
           .whenA(diffRewards.nonEmpty)
-        // State proof validation is also skipped for followers.
-        // The snapshot was already validated by the majority consensus on dag-l0.
-        // Doing a full MPT sync and validation on every ordinal is too expensive (~2 min for 800K entries).
-        // The MPT store is synced once during initial download for query support.
+        // State-proof cross-check: compare the MPT root we computed locally (by applying
+        // the same delta through accept()) against the MPT root the leader claimed in the
+        // incoming signed artifact. A mismatch means either our state diverged or the claim
+        // is wrong — either way we MUST NOT silently commit divergent state.
+        //
+        // Scope: under MPT-as-primary, the `mptRoot` is THE canonical state proof; the
+        // legacy 16-field proofs are read-only artifacts carried for backward compat and
+        // are not the source of truth post-migration, so we don't compare them. For
+        // LegacyFormat ordinals both mptRoots are `None` and the check is a no-op.
+        //
+        // The previous policy explicitly skipped this check entirely with the rationale
+        // "too expensive" — which surfaced the class of silent-divergence bug a partition
+        // test exposed. Now with typed-scodec MPT, the cost is no different from what we'd
+        // pay on disk-load StateProofValidator, and silent divergence is not acceptable.
+        _ <- Async[F]
+          .raiseError[Unit](
+            StateProofMismatch(
+              ordinal = signedArtifact.ordinal,
+              computed = computedStateProof,
+              claimed = signedArtifact.stateProof
+            )
+          )
+          .whenA(computedStateProof.mptRoot =!= signedArtifact.stateProof.mptRoot)
 
       } yield snapshotInfo
     }
@@ -379,5 +398,20 @@ object GlobalSnapshotContextFunctions {
 
     override def getMessage: String =
       s"Cannot build global snapshot because of not accepted rewards: ${notAcceptedRewards.show}"
+  }
+
+  /** Local `accept()` computed a state proof that does not match the one the incoming snapshot claims. Rejecting this snapshot is the only
+    * safe action: committing would silently carry a divergent MPT root forward, defeating peer attestation.
+    */
+  case class StateProofMismatch(
+    ordinal: SnapshotOrdinal,
+    computed: GlobalSnapshotStateProof,
+    claimed: GlobalSnapshotStateProof
+  ) extends NoStackTrace {
+    override def getMessage: String = {
+      val cRoot = computed.mptRoot.map(_.show.take(12)).getOrElse("none")
+      val lRoot = claimed.mptRoot.map(_.show.take(12)).getOrElse("none")
+      s"StateProofMismatch at ordinal=${ordinal.show}: computed.mptRoot=$cRoot claimed.mptRoot=$lRoot"
+    }
   }
 }

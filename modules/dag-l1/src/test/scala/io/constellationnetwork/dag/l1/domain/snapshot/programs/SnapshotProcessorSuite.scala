@@ -250,7 +250,12 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                 .asResource
 
               globalSnapshotAcceptanceManager = {
-                implicit val testGlobalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal.MinValue)
+                // LegacyFormat for all ordinals in this suite — test snapshots carry
+                // `mptRoot = None`, so accept() must also produce proofs without mptRoot
+                // to match on peer-claimed state-proof verification. Inner test blocks
+                // that override this do so only for unrelated inner assertions.
+                implicit val testGlobalStateProofSelector: GlobalStateProofSelector =
+                  GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
                 GlobalSnapshotAcceptanceManager.make(
                   FieldsAddedOrdinals(
                     Map.empty,
@@ -290,7 +295,12 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                 )
               }
               globalSnapshotContextFns = {
-                implicit val testGlobalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal.MinValue)
+                // LegacyFormat for all ordinals in this suite — test snapshots carry
+                // `mptRoot = None`, so accept() must also produce proofs without mptRoot
+                // to match on peer-claimed state-proof verification. Inner test blocks
+                // that override this do so only for unrelated inner assertions.
+                implicit val testGlobalStateProofSelector: GlobalStateProofSelector =
+                  GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
                 GlobalSnapshotContextFunctions.make(
                   globalSnapshotAcceptanceManager,
                   updateDelegatedStakeAcceptanceManager,
@@ -1263,7 +1273,10 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           }
           newSnapshotInfoStateProof <- {
             implicit val hasher = currentHasher
-            implicit val selector = GlobalStateProofSelector(SnapshotOrdinal.MinValue)
+            // Selector must match the one the acceptance manager uses at accept() time
+            // (LegacyFormat, see Mocks selector above) so the claimed proof and the
+            // locally-computed proof agree on whether `mptRoot` is present.
+            implicit val selector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
 
             newSnapshotInfo.stateProof[IO](snapshotOrdinal11)
           }
@@ -1551,7 +1564,10 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             )
           }
           newSnapshotInfoStateProof <- {
-            implicit val testGlobalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal.MinValue)
+            // Align with the Mocks selector so claimed proof and acceptance-computed proof
+            // agree on whether `mptRoot` is present.
+            implicit val testGlobalStateProofSelector: GlobalStateProofSelector =
+              GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
             newSnapshotInfo.stateProof[IO](snapshotOrdinal11)
           }
           hashedNextSnapshot <- forAsyncHasher(
