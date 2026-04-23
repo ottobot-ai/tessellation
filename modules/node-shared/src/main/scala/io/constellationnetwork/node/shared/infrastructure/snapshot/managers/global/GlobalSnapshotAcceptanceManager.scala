@@ -46,7 +46,7 @@ import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal, UpdateNodeCollateral}
 import io.constellationnetwork.schema.peer.PeerId
@@ -327,6 +327,49 @@ object GlobalSnapshotAcceptanceManager {
             )
           )
         }
+      }
+
+      /** Diff `before` vs `after` per-address; each delta record contributes to the expiry index at epoch `createdAt +
+        * withdrawalTimeLimit`. Hashes the record's `event` for the index key's `hash` component.
+        */
+      private def computeNodeCollateralWithdrawalExpiryIndexDelta(
+        before: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
+        after: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
+        limit: EpochProgress
+      )(implicit hasher: Hasher[F]): F[SystemIndexDelta[NodeCollateralWithdrawalExpiryKey]] = {
+        val pairAddresses: Set[Address] = before.keySet ++ after.keySet
+
+        def hashEntries(
+          addr: Address,
+          withdrawals: SortedSet[PendingNodeCollateralWithdrawal]
+        ): F[List[(EpochProgress, NodeCollateralWithdrawalExpiryKey)]] =
+          withdrawals.toList.traverse { w =>
+            w.event.toHashed.map(h => (w.createdAt |+| limit, NodeCollateralWithdrawalExpiryKey(addr, h.hash)))
+          }
+
+        type Entries = List[(EpochProgress, NodeCollateralWithdrawalExpiryKey)]
+        val empty: (Entries, Entries) = (List.empty, List.empty)
+
+        pairAddresses.toList
+          .foldLeftM[F, (Entries, Entries)](empty) {
+            case ((accAdds, accRemoves), addr) =>
+              val oldSet = before.getOrElse(addr, SortedSet.empty[PendingNodeCollateralWithdrawal])
+              val newSet = after.getOrElse(addr, SortedSet.empty[PendingNodeCollateralWithdrawal])
+              val added = newSet.diff(oldSet)
+              val removed = oldSet.diff(newSet)
+              for {
+                addedEntries <- hashEntries(addr, added)
+                removedEntries <- hashEntries(addr, removed)
+              } yield (accAdds ++ addedEntries, accRemoves ++ removedEntries)
+          }
+          .map {
+            case (adds, removes) =>
+              val addsMap: SortedMap[EpochProgress, Set[NodeCollateralWithdrawalExpiryKey]] =
+                adds.groupMap(_._1)(_._2).view.mapValues(_.toSet).to(SortedMap)
+              val removesMap: SortedMap[EpochProgress, Set[NodeCollateralWithdrawalExpiryKey]] =
+                removes.groupMap(_._1)(_._2).view.mapValues(_.toSet).to(SortedMap)
+              SystemIndexDelta.EpochBucket[NodeCollateralWithdrawalExpiryKey](addsMap, removesMap)
+          }
       }
 
       /** Validates spend actions and pricing updates, returning accepted and rejected results.
@@ -1122,6 +1165,12 @@ object GlobalSnapshotAcceptanceManager {
               .mapValues(unp => (unp, ordinal))
               .to(SortedMap)
 
+            nodeCollateralWithdrawalExpiryIndexDelta <- computeNodeCollateralWithdrawalExpiryIndexDelta(
+              lastSnapshotContext.nodeCollateralWithdrawals.getOrElse(SortedMap.empty),
+              updatedWithdrawNodeCollateralsCleaned,
+              withdrawalTimeLimit
+            )
+
             stateChangesAccumulator = StateChangesAccumulator(
               lastStateChannelSnapshotHashes = sCSnapshotHashes.toSortedMap,
               lastTxRefs = transactionsRefsDeltas,
@@ -1146,6 +1195,7 @@ object GlobalSnapshotAcceptanceManager {
               priceState = priceStateDeltas,
               allowSpendExpiryIndex = allowSpendExpiryIndexDelta,
               tokenLockExpiryIndex = tokenLockExpiryIndexDelta,
+              nodeCollateralWithdrawalExpiryIndex = nodeCollateralWithdrawalExpiryIndexDelta,
               removedAllowSpendKeys = removedAllowSpendKeys,
               removedTokenLockKeys = removedTokenLockKeys,
               removedTokenLockBalanceKeys = removedTokenLockBalanceKeys,
@@ -1260,7 +1310,7 @@ object GlobalSnapshotAcceptanceManager {
                             s"deltaUpserts=${deltaUpserts.size} deltaRemoves=${deltaRemoves.size} " +
                             s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
                         )
-                        _ <- mptStore.syncFromGlobalSnapshotInfo(gsi, ordinal)
+                        _ <- mptStore.syncFromGlobalSnapshotInfo(gsi, ordinal, Some(withdrawalTimeLimit))
                         healedProof <- builder.buildProof(gsi, ordinal)
                         healedRoot = healedProof.mptRoot.map(_.show).getOrElse("none")
                         _ <-

@@ -16,6 +16,7 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.node._
+import io.constellationnetwork.schema.nodeCollateral.{PendingNodeCollateralWithdrawal, UpdateNodeCollateral}
 import io.constellationnetwork.schema.priceOracle._
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.schema.tokenLock._
@@ -27,6 +28,7 @@ import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProdu
 import io.constellationnetwork.security.signature.{Signed, signature}
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{
   allowSpendExpiryKeySetImmutableCodec,
+  nodeCollateralWithdrawalExpiryKeySetImmutableCodec,
   tokenLockExpiryKeySetImmutableCodec
 }
 
@@ -251,6 +253,95 @@ object MptFieldCoverageSuite extends MutableIOSuite {
         bucketA == bucketB,
         bucketA.contains(SortedSet(expectedKey))
       )
+  }
+
+  test("node-collateral-withdrawal expiry index: delta and rebuild paths agree when both get the same withdrawalTimeLimit") { res =>
+    implicit val (h, sp, js) = res
+    val withdrawalTimeLimit = EpochProgress(NonNegLong(200L))
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      source = kp.getPublic.toAddress
+      createdAt = EpochProgress(NonNegLong(50L))
+      createEvent = UpdateNodeCollateral.Create(
+        source = source,
+        nodeId = kp.getPublic.toId.toPeerId,
+        amount = io.constellationnetwork.schema.nodeCollateral.NodeCollateralAmount(NonNegLong(1_000_000L)),
+        tokenLockRef = testHash("tl-ref-a")
+      )
+      signedCreate = Signed(createEvent, testProofs)
+      withdrawal = PendingNodeCollateralWithdrawal(
+        event = signedCreate,
+        acceptedOrdinal = SnapshotOrdinal(NonNegLong(1L)),
+        createdAt = createdAt
+      )
+      hashedEvent <- signedCreate.toHashed
+      expectedKey = NodeCollateralWithdrawalExpiryKey(source, hashedEvent.hash)
+      expectedBucketEpoch = createdAt |+| withdrawalTimeLimit
+
+      // Rebuild path
+      info = GlobalSnapshotInfo.empty.copy(
+        nodeCollateralWithdrawals = SortedMap(source -> SortedSet(withdrawal)).some
+      )
+      storeB <- mkEmptyMptStore
+      _ <- storeB.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(1L)), Some(withdrawalTimeLimit))
+      rootB <- storeB.underlying.getRootHashForOrdinal(SnapshotOrdinal(NonNegLong(1L)))
+      bucketB <- storeB.getExpiryBucket[NodeCollateralWithdrawalExpiryKey](
+        SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
+        expectedBucketEpoch
+      )
+
+      storeA <- mkEmptyMptStore
+      acc = StateChangesAccumulator(
+        nodeCollateralWithdrawals = SortedMap(source -> SortedSet(withdrawal)),
+        nodeCollateralWithdrawalExpiryIndex = SystemIndexDelta.EpochBucket[NodeCollateralWithdrawalExpiryKey](
+          adds = SortedMap(expectedBucketEpoch -> Set(expectedKey))
+        )
+      )
+      _ <- storeA.syncFromStateChanges(acc, SnapshotOrdinal(NonNegLong(1L)))
+      rootA <- storeA.underlying.getRootHashForOrdinal(SnapshotOrdinal(NonNegLong(1L)))
+      bucketA <- storeA.getExpiryBucket[NodeCollateralWithdrawalExpiryKey](
+        SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
+        expectedBucketEpoch
+      )
+    } yield
+      expect.all(
+        rootA.isDefined,
+        rootB.isDefined,
+        rootA == rootB,
+        bucketA == bucketB,
+        bucketA.contains(SortedSet(expectedKey))
+      )
+  }
+
+  test("node-collateral-withdrawal expiry index: rebuild with None withdrawalTimeLimit skips indexing") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      source = kp.getPublic.toAddress
+      createEvent = UpdateNodeCollateral.Create(
+        source = source,
+        nodeId = kp.getPublic.toId.toPeerId,
+        amount = io.constellationnetwork.schema.nodeCollateral.NodeCollateralAmount(NonNegLong(1_000_000L)),
+        tokenLockRef = testHash("tl-ref-none")
+      )
+      signedCreate = Signed(createEvent, testProofs)
+      withdrawal = PendingNodeCollateralWithdrawal(
+        event = signedCreate,
+        acceptedOrdinal = SnapshotOrdinal(NonNegLong(1L)),
+        createdAt = EpochProgress(NonNegLong(50L))
+      )
+
+      info = GlobalSnapshotInfo.empty.copy(
+        nodeCollateralWithdrawals = SortedMap(source -> SortedSet(withdrawal)).some
+      )
+      store <- mkEmptyMptStore
+      _ <- store.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(1L)), None)
+      // Any epoch probe; the index should be empty since no limit was given.
+      b <- store.getExpiryBucket[NodeCollateralWithdrawalExpiryKey](
+        SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
+        EpochProgress(NonNegLong(250L))
+      )
+    } yield expect(b.isEmpty)
   }
 
   test("token-lock without unlockEpoch is NOT indexed (never expires)") { res =>

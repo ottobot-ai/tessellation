@@ -281,7 +281,8 @@ object GlobalStateConverter {
     * (previously computed from JSON-via-JsonSerializer bytes, which produced a different root than the scodec-typed store).
     */
   def toAllStateKeyValueBytes[F[_]: Async: Parallel: Hasher: JsonSerializer](
-    info: GlobalSnapshotInfo
+    info: GlobalSnapshotInfo,
+    withdrawalTimeLimit: Option[EpochProgress] = None
   )(implicit stateProofSelector: StateProofSelector): F[Map[GlobalStateKey, Array[Byte]]] = {
     import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
     import io.constellationnetwork.serde.ImmutableCodec
@@ -386,6 +387,28 @@ object GlobalStateConverter {
       }
     }
 
+    // Node-collateral-withdrawal expiry index: expiry = `createdAt + withdrawalTimeLimit`. Skipped entirely when the limit isn't provided.
+    val nodeCollateralWithdrawalExpiryIndexF: F[List[(GlobalStateKey, Array[Byte])]] = withdrawalTimeLimit match {
+      case None => List.empty[(GlobalStateKey, Array[Byte])].pure[F]
+      case Some(limit) =>
+        val flat = info.nodeCollateralWithdrawals.toList.flatMap(_.toList).flatMap {
+          case (addr, set) => set.toList.map(w => (addr, w))
+        }
+        flat.parTraverse {
+          case (addr, w) =>
+            w.event.toHashed.map(h => (w.createdAt |+| limit, NodeCollateralWithdrawalExpiryKey(addr, h.hash)))
+        }.flatMap { entries =>
+          val byEpoch: Map[EpochProgress, SortedSet[NodeCollateralWithdrawalExpiryKey]] =
+            entries.groupMap(_._1)(_._2).view.mapValues(_.to(SortedSet)).toMap
+          byEpoch.toList.parTraverse {
+            case (epoch, bucket) =>
+              GlobalStateKey
+                .expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, epoch)
+                .map(k => k -> enc[SortedSet[NodeCollateralWithdrawalExpiryKey]](bucket))
+          }
+        }
+    }
+
     // Token-lock expiry index: one bucket per `unlockEpoch` (records with `None` unlock aren't indexed).
     val tokenLockExpiryIndexF: F[List[(GlobalStateKey, Array[Byte])]] = {
       val flat = info.activeTokenLocks.toList.flatMap(_.toList).flatMap {
@@ -428,17 +451,23 @@ object GlobalStateConverter {
         ).pure[F]
     }
 
-    (currencyEntriesF, updateNodeParametersF, priceStateF, allowSpendExpiryIndexF, tokenLockExpiryIndexF).mapN {
-      (currencyEntries, unpEntries, priceEntries, allowSpendExpiryEntries, tokenLockExpiryEntries) =>
-        val all: Iterable[(GlobalStateKey, Array[Byte])] =
-          stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
-            activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
-            lastAllowSpendRefs ++ lastTokenLockRefs ++
-            activeDelegatedStakes ++ delegatedStakesWithdrawals ++
-            activeNodeCollaterals ++ nodeCollateralWithdrawals ++
-            metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries ++
-            allowSpendExpiryEntries ++ tokenLockExpiryEntries
-        all.toMap
+    (
+      currencyEntriesF,
+      updateNodeParametersF,
+      priceStateF,
+      allowSpendExpiryIndexF,
+      tokenLockExpiryIndexF,
+      nodeCollateralWithdrawalExpiryIndexF
+    ).mapN { (currencyEntries, unpEntries, priceEntries, allowSpendExpiryEntries, tokenLockExpiryEntries, ncwExpiryEntries) =>
+      val all: Iterable[(GlobalStateKey, Array[Byte])] =
+        stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
+          activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
+          lastAllowSpendRefs ++ lastTokenLockRefs ++
+          activeDelegatedStakes ++ delegatedStakesWithdrawals ++
+          activeNodeCollaterals ++ nodeCollateralWithdrawals ++
+          metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries ++
+          allowSpendExpiryEntries ++ tokenLockExpiryEntries ++ ncwExpiryEntries
+      all.toMap
     }
   }
 
@@ -775,9 +804,11 @@ object GlobalStateConverter {
         * is the remaining piece of the Phase 3c work; callers that depend on hash-level agreement between `sync` and `buildMpt` need the
         * follow-up migration of `makeParallel` / `buildMpt` to scodec.
         */
-      def syncFromGlobalSnapshotInfo(info: GlobalSnapshotInfo, snapshotOrdinal: SnapshotOrdinal)(
-        implicit stateProofSelector: StateProofSelector
-      ): F[Unit] = {
+      def syncFromGlobalSnapshotInfo(
+        info: GlobalSnapshotInfo,
+        snapshotOrdinal: SnapshotOrdinal,
+        withdrawalTimeLimit: Option[EpochProgress] = None
+      )(implicit stateProofSelector: StateProofSelector): F[Unit] = {
         import io.constellationnetwork.schema.ID.Id
         import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
         import io.constellationnetwork.schema.mpt.PartitionNamespace.AddressNamespace
@@ -953,6 +984,30 @@ object GlobalStateConverter {
           }
         }
 
+        // Reconstruct the node-collateral-withdrawal expiry index. Expiry = `createdAt + withdrawalTimeLimit`; skipped when the caller
+        // didn't provide `withdrawalTimeLimit` (test contexts that don't exercise the index).
+        val nodeCollateralWithdrawalExpiryBucketsF: F[Map[GlobalStateKey, SortedSet[NodeCollateralWithdrawalExpiryKey]]] =
+          withdrawalTimeLimit match {
+            case None => Map.empty[GlobalStateKey, SortedSet[NodeCollateralWithdrawalExpiryKey]].pure[F]
+            case Some(limit) =>
+              val flat = info.nodeCollateralWithdrawals.toList.flatMap(_.toList).flatMap {
+                case (addr, set) => set.toList.map(w => (addr, w))
+              }
+              flat.parTraverse {
+                case (addr, w) =>
+                  w.event.toHashed.map(h => (w.createdAt |+| limit, NodeCollateralWithdrawalExpiryKey(addr, h.hash)))
+              }.flatMap { entries =>
+                val byEpoch: Map[EpochProgress, SortedSet[NodeCollateralWithdrawalExpiryKey]] =
+                  entries.groupMap(_._1)(_._2).view.mapValues(_.to(SortedSet)).toMap
+                byEpoch.toList.parTraverse {
+                  case (epoch, bucket) =>
+                    GlobalStateKey
+                      .expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, epoch)
+                      .map(_ -> bucket)
+                }.map(_.toMap)
+              }
+          }
+
         // Reconstruct the token-lock expiry index. Only records with `unlockEpoch.isDefined` contribute — records with `None` unlock
         // never expire and aren't indexed.
         val tokenLockExpiryBucketsF: F[Map[GlobalStateKey, SortedSet[TokenLockExpiryKey]]] = {
@@ -987,6 +1042,7 @@ object GlobalStateConverter {
             priceStateEntries <- priceStateEntriesF
             allowSpendExpiryBuckets <- allowSpendExpiryBucketsF
             tokenLockExpiryBuckets <- tokenLockExpiryBucketsF
+            nodeCollateralWithdrawalExpiryBuckets <- nodeCollateralWithdrawalExpiryBucketsF
             _ <- store.insert[Hash](stateChanHashes)
             _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
             _ <- store.insert[Balance](balances)
@@ -1009,6 +1065,7 @@ object GlobalStateConverter {
             _ <- store.insert[PriceRecord](priceStateEntries)
             _ <- store.insert[SortedSet[AllowSpendExpiryKey]](allowSpendExpiryBuckets)
             _ <- store.insert[SortedSet[TokenLockExpiryKey]](tokenLockExpiryBuckets)
+            _ <- store.insert[SortedSet[NodeCollateralWithdrawalExpiryKey]](nodeCollateralWithdrawalExpiryBuckets)
             _ <- store.build(snapshotOrdinal).void
           } yield ()
         }
