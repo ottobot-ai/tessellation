@@ -187,6 +187,14 @@ object GlobalSnapshotAcceptanceManager {
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): GlobalSnapshotAcceptanceManager[F] = {
+    // Establish the WithdrawalTimeLimit implicit from the explicit constructor param so that the rebuild paths
+    // (`syncFromGlobalSnapshotInfo`, `stateProofBuilder` → `mptStateProof`) see the same limit the accept path uses
+    // to compute expiry-index buckets. Gated by the feature flag until the threading below lands everywhere.
+    implicit val withdrawalTimeLimitCtx: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+      if (maintainNodeCollateralWithdrawalExpiryIndex)
+        io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.some(withdrawalTimeLimit)
+      else
+        io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
     val artifactEmissionManager = ArtifactEmissionManager.make[F]()
     val tipUsageManager = TipUsageManager.make[F]()
     val metagraphSyncManager = MetagraphSyncManager.make[F](metagraphsSyncConfig)
@@ -1319,11 +1327,7 @@ object GlobalSnapshotAcceptanceManager {
                             s"deltaUpserts=${deltaUpserts.size} deltaRemoves=${deltaRemoves.size} " +
                             s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
                         )
-                        _ <- mptStore.syncFromGlobalSnapshotInfo(
-                          gsi,
-                          ordinal,
-                          if (maintainNodeCollateralWithdrawalExpiryIndex) Some(withdrawalTimeLimit) else None
-                        )
+                        _ <- mptStore.syncFromGlobalSnapshotInfo(gsi, ordinal)
                         healedProof <- builder.buildProof(gsi, ordinal)
                         healedRoot = healedProof.mptRoot.map(_.show).getOrElse("none")
                         _ <-

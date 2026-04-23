@@ -34,6 +34,8 @@ import weaver.scalacheck.Checkers
 
 object NetworkApiServiceSuite extends MutableIOSuite with Checkers {
   implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal.unsafeApply(Long.MaxValue))
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
 
   type Res = (SecurityProvider[IO], Hasher[IO], JsonSerializer[IO])
 

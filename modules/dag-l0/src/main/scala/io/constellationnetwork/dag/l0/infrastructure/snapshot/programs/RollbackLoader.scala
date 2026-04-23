@@ -88,7 +88,8 @@ sealed abstract class RollbackLoader[F[_]: Async: Parallel: KryoSerializer: Json
     rollbackHash: Hash,
     download: Download[F, GlobalIncrementalSnapshot]
   )(
-    implicit globalStateProofSelector: GlobalStateProofSelector
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[(GlobalSnapshotInfo, Signed[GlobalIncrementalSnapshot])] =
     GlobalSnapshotLocalFileSystemStorage.make[F](snapshotConfig.snapshotPath).flatMap { fullGlobalSnapshotLocalFileSystemStorage =>
       fullGlobalSnapshotLocalFileSystemStorage

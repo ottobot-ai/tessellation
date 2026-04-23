@@ -37,6 +37,8 @@ import weaver.scalacheck.Checkers
 
 object SnapshotBinaryFeeCalculatorSuite extends MutableIOSuite with Checkers {
   implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
 
   val eventAddress = Address(refineV[DAGAddressRefined].unsafeFrom("DAGSTARDUSTCOLLECTIVEHZOIPHXZUBFGNXWJETZVSPAPAHMLXS"))
   val stakingAddress = Address(refineV[DAGAddressRefined].unsafeFrom("DAG7coCMRPJah33MMcfAEZVeB1vYn3vDRe6WqeGU"))

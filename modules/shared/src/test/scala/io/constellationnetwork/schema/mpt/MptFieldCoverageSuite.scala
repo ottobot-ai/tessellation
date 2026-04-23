@@ -39,6 +39,11 @@ import weaver.MutableIOSuite
 object MptFieldCoverageSuite extends MutableIOSuite {
   implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
 
+  // Default for tests that don't exercise node-collateral expiry indexing. The NC-expiry test below
+  // shadows this in its local scope with `WithdrawalTimeLimit.some(withdrawalTimeLimit)`.
+  implicit val withdrawalTimeLimitImpl: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
+
   type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO])
 
   override def sharedResource: Resource[IO, Res] =
@@ -283,7 +288,10 @@ object MptFieldCoverageSuite extends MutableIOSuite {
         nodeCollateralWithdrawals = SortedMap(source -> SortedSet(withdrawal)).some
       )
       storeB <- mkEmptyMptStore
-      _ <- storeB.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(1L)), Some(withdrawalTimeLimit))
+      _ <- storeB.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(1L)))(
+        globalStateProofSelector,
+        io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.some(withdrawalTimeLimit)
+      )
       rootB <- storeB.underlying.getRootHashForOrdinal(SnapshotOrdinal(NonNegLong(1L)))
       bucketB <- storeB.getExpiryBucket[NodeCollateralWithdrawalExpiryKey](
         SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
@@ -335,7 +343,7 @@ object MptFieldCoverageSuite extends MutableIOSuite {
         nodeCollateralWithdrawals = SortedMap(source -> SortedSet(withdrawal)).some
       )
       store <- mkEmptyMptStore
-      _ <- store.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(1L)), None)
+      _ <- store.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(1L)))
       // Any epoch probe; the index should be empty since no limit was given.
       b <- store.getExpiryBucket[NodeCollateralWithdrawalExpiryKey](
         SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,

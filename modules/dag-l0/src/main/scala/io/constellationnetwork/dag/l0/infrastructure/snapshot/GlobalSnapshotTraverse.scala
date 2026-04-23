@@ -45,7 +45,8 @@ object GlobalSnapshotTraverse {
     download: Download[F, GlobalIncrementalSnapshot],
     mptStore: MptStore[F, GlobalStateKey]
   )(
-    implicit globalStateProofSelector: GlobalStateProofSelector
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): GlobalSnapshotTraverse[F] =
     new GlobalSnapshotTraverse[F] {
       implicit val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)

@@ -176,7 +176,9 @@ object SharedServices {
         collateral.amount,
         cfg.delegatedStaking.withdrawalTimeLimit.getOrElse(cfg.environment, EpochProgress.MinValue),
         storages.mptStore,
-        loggerBundle
+        loggerBundle,
+        None,
+        maintainNodeCollateralWithdrawalExpiryIndex = true
       )
       globalSnapshotContextFns = GlobalSnapshotContextFunctions.make(
         globalSnapshotAcceptanceManager,

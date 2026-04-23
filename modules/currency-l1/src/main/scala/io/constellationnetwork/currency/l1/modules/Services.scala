@@ -51,7 +51,8 @@ object Services {
     txHasher: Hasher[F],
     sharedStorages: SharedStorages[F]
   )(
-    implicit globalStateProofSelector: GlobalStateProofSelector
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): Services[F, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotInfo, R] =
     new Services[F, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotInfo, R] {
 

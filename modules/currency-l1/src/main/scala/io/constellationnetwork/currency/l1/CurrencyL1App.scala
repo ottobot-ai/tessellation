@@ -90,6 +90,11 @@ abstract class CurrencyL1App(
     for {
       cfgR <- loadConfigAs[AppConfigReader].asResource
       cfg = method.appConfig(cfgR, sharedConfig)
+      implicit0(withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit) =
+        io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.some(
+          sharedConfig.delegatedStaking.withdrawalTimeLimit
+            .getOrElse(sharedConfig.environment, io.constellationnetwork.schema.epoch.EpochProgress.MinValue)
+        )
 
       dagL1Queues <- DAGL1Queues.make[IO](sharedQueues).asResource
       queues <- Queues.make[IO](dagL1Queues).asResource

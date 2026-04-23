@@ -34,6 +34,8 @@ import weaver.scalacheck.Checkers
 
 object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
   implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
 
   type Res = (Hasher[IO], SecurityProvider[IO], MptStore[IO, GlobalStateKey], JsonSerializer[IO])
 

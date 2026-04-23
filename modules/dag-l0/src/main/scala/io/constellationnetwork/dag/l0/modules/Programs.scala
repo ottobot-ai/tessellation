@@ -43,7 +43,10 @@ object Programs {
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     mptStore: MptStore[F, GlobalStateKey]
-  )(implicit globalStateProofSelector: GlobalStateProofSelector): Programs[F] =
+  )(
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): Programs[F] =
     HasherSelector[F].withCurrent { implicit hasher =>
       val trustPush = TrustPush.make(storages.trust, services.gossip)
       val peerSelect: PeerSelect[F] = PeerSelect.make(

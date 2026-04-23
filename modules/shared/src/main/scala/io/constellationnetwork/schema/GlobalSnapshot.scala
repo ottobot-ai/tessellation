@@ -75,7 +75,10 @@ object GlobalSnapshot {
 
   def mkFirstIncrementalSnapshot[F[_]: Parallel: Async: Hasher: JsonSerializer](
     genesis: Hashed[GlobalSnapshot]
-  )(implicit stateProofSelector: GlobalStateProofSelector): F[GlobalIncrementalSnapshot] =
+  )(
+    implicit stateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): F[GlobalIncrementalSnapshot] =
     genesis.info.toGlobalSnapshotInfo.stateProof[F](genesis.ordinal).map { stateProof =>
       GlobalIncrementalSnapshot(
         genesis.ordinal.next,

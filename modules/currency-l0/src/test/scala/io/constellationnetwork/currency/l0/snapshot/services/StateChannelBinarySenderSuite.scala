@@ -48,6 +48,8 @@ import weaver.scalacheck.Checkers
 
 object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
   implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
 
   def mkEmptySnapshots(n: Long, keyPair: KeyPair)(
     implicit hs: Hasher[IO],

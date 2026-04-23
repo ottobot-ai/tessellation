@@ -97,6 +97,11 @@ abstract class CurrencyL0App(
       cfgR <- loadConfigAs[AppConfigReader].asResource
       implicit0(logger: SelfAwareStructuredLogger[IO]) = Slf4jLogger.getLoggerFromName[IO](this.getClass.getName)
       cfg = method.appConfig(cfgR, sharedConfig)
+      implicit0(withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit) =
+        io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.some(
+          sharedConfig.delegatedStaking.withdrawalTimeLimit
+            .getOrElse(sharedConfig.environment, io.constellationnetwork.schema.epoch.EpochProgress.MinValue)
+        )
 
       dataApplicationService <- dataApplication.sequence.adaptError {
         case error =>

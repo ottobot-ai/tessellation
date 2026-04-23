@@ -46,7 +46,11 @@ object StateChannel {
     dataApplicationService: Option[BaseDataApplicationL0Service[F]],
     selfKeyPair: KeyPair,
     enqueueConsensusEventFn: CurrencySnapshotEvent => Cell[F, StackF, _, Either[CellError, Ω], _]
-  )(implicit S: Supervisor[F], stateProofSelector: GlobalStateProofSelector): Stream[F, Unit] = {
+  )(
+    implicit S: Supervisor[F],
+    stateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
 
     val globalL0SnapshotProcessing: Stream[F, Unit] =
@@ -84,7 +88,11 @@ object StateChannel {
     dataApplicationService: Option[BaseDataApplicationL0Service[F]],
     selfKeyPair: KeyPair,
     enqueueConsensusEventFn: CurrencySnapshotEvent => Cell[F, StackF, _, Either[CellError, Ω], _]
-  )(implicit S: Supervisor[F], stateProofSelector: GlobalStateProofSelector): F[Unit] = {
+  )(
+    implicit S: Supervisor[F],
+    stateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): F[Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
 
     def triggerOnGlobalSnapshotPullHook(snapshot: Hashed[GlobalIncrementalSnapshot], context: GlobalSnapshotInfo): F[Unit] =

@@ -70,6 +70,9 @@ import io.circe.Json
 
 object Mocks {
 
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
+
   private[snapshot] def mkManager(
     initialSnapshotInfo: Option[GlobalSnapshotInfo] = None
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[GlobalSnapshotAcceptanceManager[IO]] = {

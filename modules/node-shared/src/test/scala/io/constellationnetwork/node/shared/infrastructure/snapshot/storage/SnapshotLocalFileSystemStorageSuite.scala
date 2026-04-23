@@ -26,6 +26,9 @@ import SnapshotLocalFileSystemStorage.UnableToPersistSnapshot
 
 object SnapshotLocalFileSystemStorageSuite extends MutableIOSuite with Checkers {
 
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
+
   val hashPathGenerator = PathGenerator.forHash(Depth(2), PrefixSize(3))
   val ordinalPathGenerator = PathGenerator.forOrdinal(ChunkSize(20000))
 

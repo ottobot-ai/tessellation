@@ -22,6 +22,9 @@ import weaver.scalacheck.Checkers
 
 object GlobalSnapshotSchemaMigrationSuite extends MutableIOSuite with Checkers {
 
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
+
   type Res = (HasherSelector[IO], JsonSerializer[IO])
 
   override def sharedResource: Resource[IO, Res] =

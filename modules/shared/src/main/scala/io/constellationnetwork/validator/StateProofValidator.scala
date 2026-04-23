@@ -50,7 +50,10 @@ object StateProofValidator {
     */
   def forGlobal[F[_]: Async: Parallel: JsonSerializer](
     producer: Option[StatefulMerklePatriciaProducer[F]] = None
-  )(implicit selector: GlobalStateProofSelector): StateProofValidator[F, GlobalSnapshotInfo, GlobalSnapshotStateProof] =
+  )(
+    implicit selector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): StateProofValidator[F, GlobalSnapshotInfo, GlobalSnapshotStateProof] =
     make(GlobalSnapshotInfo.stateProofBuilder(producer))
 
   /** Create a StateProofValidator for CurrencySnapshotInfo. */

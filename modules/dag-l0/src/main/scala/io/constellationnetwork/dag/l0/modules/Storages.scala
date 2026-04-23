@@ -46,7 +46,8 @@ object Storages {
     // other consumers leave None so BFT semantics are unchanged.
     nakamotoFinalizedOrdinalRef: Option[cats.effect.kernel.Ref[F, SnapshotOrdinal]] = None
   )(
-    implicit globalStateProofSelector: GlobalStateProofSelector
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[Storages[F]] =
     for {
       trustStorage <- TrustStorage.make[F](trustUpdates, sharedConfig.trustStorage, seedlist.map(_.map(_.peerId)))

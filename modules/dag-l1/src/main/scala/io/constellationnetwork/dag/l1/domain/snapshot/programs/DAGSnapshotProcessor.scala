@@ -67,7 +67,8 @@ object DAGSnapshotProcessor {
         snapshot: Either[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo), Hashed[GlobalIncrementalSnapshot]]
       )(
         implicit hasher: Hasher[F],
-        stateProofSelector: StateProofSelector
+        stateProofSelector: StateProofSelector,
+        withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
       ): F[SnapshotProcessingResult] =
         checkAlignment(
           snapshot,

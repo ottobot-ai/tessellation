@@ -38,6 +38,9 @@ import weaver.MutableIOSuite
   */
 object MptFileSystemProducerDebugSuite extends MutableIOSuite {
 
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
+
   type Res = (JsonSerializer[IO], Hasher[IO], SecurityProvider[IO])
 
   override def sharedResource: Resource[IO, Res] = for {

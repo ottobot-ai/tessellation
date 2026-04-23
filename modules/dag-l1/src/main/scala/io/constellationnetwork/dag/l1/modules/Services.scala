@@ -52,7 +52,8 @@ object Services {
     txHasher: Hasher[F],
     sharedStorages: SharedStorages[F]
   )(
-    implicit globalStateProofSelector: GlobalStateProofSelector
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): Services[F, P, S, SI, R] =
     new Services[F, P, S, SI, R] {
       val localHealthcheck = sharedServices.localHealthcheck

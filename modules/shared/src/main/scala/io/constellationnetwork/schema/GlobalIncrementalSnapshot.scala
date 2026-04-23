@@ -128,7 +128,8 @@ case class GlobalIncrementalSnapshot(
 
 object GlobalIncrementalSnapshot {
   def fromGlobalSnapshot[F[_]: Parallel: Async: Hasher: JsonSerializer](snapshot: GlobalSnapshot)(
-    implicit stateProofSelector: StateProofSelector
+    implicit stateProofSelector: StateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[GlobalIncrementalSnapshot] = {
     val gsi = snapshot.info.toGlobalSnapshotInfo
     gsi.stateProof[F](snapshot.ordinal).map { stateProof =>

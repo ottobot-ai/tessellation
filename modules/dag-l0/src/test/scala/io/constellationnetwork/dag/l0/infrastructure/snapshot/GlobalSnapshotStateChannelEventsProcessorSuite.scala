@@ -54,6 +54,8 @@ import fs2.concurrent.SignallingRef
 import weaver.MutableIOSuite
 object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
   implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
 
   val TestValidationErrorStorageMaxSize: PosInt = PosInt(16)
 

@@ -26,7 +26,7 @@ class GlobalSnapshotAlignment[F[_]: Async: HasherSelector: SecurityProvider, P <
   programs: Programs[F, P, S, SI],
   storages: Storages[F, P, S, SI],
   sharedStorages: SharedStorages[F]
-) {
+)(implicit withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit) {
 
   private val maxEpochProgressesBehind = 5L
   private implicit val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
@@ -232,6 +232,6 @@ object GlobalSnapshotAlignment {
     programs: Programs[F, P, S, SI],
     storages: Storages[F, P, S, SI],
     sharedStorages: SharedStorages[F]
-  ): GlobalSnapshotAlignment[F, P, S, SI, R] =
+  )(implicit withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit): GlobalSnapshotAlignment[F, P, S, SI, R] =
     new GlobalSnapshotAlignment[F, P, S, SI, R](services, programs, storages, sharedStorages)
 }

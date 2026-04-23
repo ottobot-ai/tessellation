@@ -179,7 +179,8 @@ case class GlobalSnapshotInfo(
     )
 
   def stateProof[F[_]: Parallel: Async: Hasher: JsonSerializer](ordinal: SnapshotOrdinal)(
-    implicit stateProofSelector: StateProofSelector
+    implicit stateProofSelector: StateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[GlobalSnapshotStateProof] =
     stateProofSelector.select(ordinal) match {
       case LegacyFormat         => lastCurrencySnapshots.merkleTree[F].flatMap(stateProof(_))
@@ -203,7 +204,8 @@ object GlobalSnapshotInfo {
     * a pre-built trie, use `stateProofBuilder(Some(producer))`.
     */
   def stateProofBuilder[F[_]: Async: Parallel: JsonSerializer](
-    implicit selector: GlobalStateProofSelector
+    implicit selector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): StateProofBuilder[F, GlobalSnapshotInfo, GlobalSnapshotStateProof] =
     stateProofBuilder(None)
 
@@ -214,7 +216,10 @@ object GlobalSnapshotInfo {
     */
   def stateProofBuilder[F[_]: Async: Parallel: JsonSerializer](
     producer: Option[StatefulMerklePatriciaProducer[F]]
-  )(implicit selector: GlobalStateProofSelector): StateProofBuilder[F, GlobalSnapshotInfo, GlobalSnapshotStateProof] =
+  )(
+    implicit selector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): StateProofBuilder[F, GlobalSnapshotInfo, GlobalSnapshotStateProof] =
     StateProofBuilder.instance { (info, ordinal, hasher) =>
       implicit val h: Hasher[F] = hasher
       implicit val s: StateProofSelector = selector
@@ -262,7 +267,8 @@ object GlobalSnapshotInfo {
     }
 
   def mptStateProof[F[_]: Parallel: Async: Hasher: JsonSerializer](info: GlobalSnapshotInfo)(
-    implicit stateProofSelector: StateProofSelector
+    implicit stateProofSelector: StateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[GlobalSnapshotStateProof] =
     info.allStateEntriesAsBytes.buildMptFromBytes.map { mptRoot =>
       GlobalSnapshotStateProof.apply(

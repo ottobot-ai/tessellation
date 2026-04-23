@@ -32,6 +32,9 @@ import weaver.MutableIOSuite
 
 object MerkleTreeValidatorSuite extends MutableIOSuite {
 
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
+
   type Res = Hasher[IO]
 
   override def sharedResource: Resource[IO, Res] =

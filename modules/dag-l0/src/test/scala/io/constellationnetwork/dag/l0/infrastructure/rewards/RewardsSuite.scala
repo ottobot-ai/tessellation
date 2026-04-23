@@ -44,6 +44,8 @@ import weaver.scalacheck.Checkers
 
 object RewardsSuite extends MutableIOSuite with Checkers {
   implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
 
   type GenIdFn = () => Id
   type Res = (Hasher[IO], SecurityProvider[IO], GenIdFn, JsonSerializer[IO])

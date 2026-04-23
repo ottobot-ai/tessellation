@@ -281,9 +281,12 @@ object GlobalStateConverter {
     * (previously computed from JSON-via-JsonSerializer bytes, which produced a different root than the scodec-typed store).
     */
   def toAllStateKeyValueBytes[F[_]: Async: Parallel: Hasher: JsonSerializer](
-    info: GlobalSnapshotInfo,
-    withdrawalTimeLimit: Option[EpochProgress] = None
-  )(implicit stateProofSelector: StateProofSelector): F[Map[GlobalStateKey, Array[Byte]]] = {
+    info: GlobalSnapshotInfo
+  )(
+    implicit stateProofSelector: StateProofSelector,
+    withdrawalTimeLimitCtx: WithdrawalTimeLimit
+  ): F[Map[GlobalStateKey, Array[Byte]]] = {
+    val withdrawalTimeLimit: Option[EpochProgress] = withdrawalTimeLimitCtx.value
     import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
     import io.constellationnetwork.serde.ImmutableCodec
     import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
@@ -612,7 +615,8 @@ object GlobalStateConverter {
         toAllStateKeyValuePairs(info)
 
       def allStateEntriesAsBytes[F[_]: Async: Parallel: Hasher: JsonSerializer](
-        implicit stateProofSelector: StateProofSelector
+        implicit stateProofSelector: StateProofSelector,
+        withdrawalTimeLimit: WithdrawalTimeLimit
       ): F[Map[GlobalStateKey, Array[Byte]]] =
         toAllStateKeyValueBytes(info)
     }
@@ -806,9 +810,12 @@ object GlobalStateConverter {
         */
       def syncFromGlobalSnapshotInfo(
         info: GlobalSnapshotInfo,
-        snapshotOrdinal: SnapshotOrdinal,
-        withdrawalTimeLimit: Option[EpochProgress] = None
-      )(implicit stateProofSelector: StateProofSelector): F[Unit] = {
+        snapshotOrdinal: SnapshotOrdinal
+      )(
+        implicit stateProofSelector: StateProofSelector,
+        withdrawalTimeLimitCtx: WithdrawalTimeLimit
+      ): F[Unit] = {
+        val withdrawalTimeLimit: Option[EpochProgress] = withdrawalTimeLimitCtx.value
         import io.constellationnetwork.schema.ID.Id
         import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
         import io.constellationnetwork.schema.mpt.PartitionNamespace.AddressNamespace

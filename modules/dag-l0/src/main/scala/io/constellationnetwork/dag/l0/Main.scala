@@ -77,6 +77,13 @@ object Main
       cfgR <- loadConfigAs[AppConfigReader].asResource
       implicit0(logger: SelfAwareStructuredLogger[IO]) = Slf4jLogger.getLoggerFromName[IO](this.getClass.getName)
       cfg = method.appConfig(cfgR, sharedConfig)
+      // WithdrawalTimeLimit — per-environment constant supplied as implicit context to every MPT write path
+      // (`syncFromGlobalSnapshotInfo`, `toAllStateKeyValueBytes`, `mptStateProof`) so that both accept and
+      // rebuild paths produce the same mptRoot. Matches the `StateProofSelector` implicit pattern.
+      implicit0(withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit) =
+        io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.some(
+          cfg.shared.delegatedStaking.withdrawalTimeLimit.getOrElse(cfg.environment, EpochProgress.MinValue)
+        )
       queues <- Queues.make[IO](sharedQueues).asResource
 
       p2pClient = P2PClient.make[IO](sharedP2PClient, sharedResources.client, sharedServices.session, sharedConfig.snapshotTimeoutsConfig)

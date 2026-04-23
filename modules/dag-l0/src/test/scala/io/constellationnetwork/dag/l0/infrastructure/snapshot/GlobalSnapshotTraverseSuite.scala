@@ -82,6 +82,9 @@ import weaver.scalacheck.Checkers
 object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
   val TestValidationErrorStorageMaxSize: PosInt = PosInt(16)
 
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
+
   type GenKeyPairFn = () => KeyPair
 
   type Res = (KryoSerializer[IO], Hasher[IO], JsonSerializer[IO], SecurityProvider[IO], Metrics[IO], Random[IO])

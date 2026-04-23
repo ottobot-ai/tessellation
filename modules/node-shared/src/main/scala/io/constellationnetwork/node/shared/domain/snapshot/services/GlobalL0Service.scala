@@ -72,7 +72,8 @@ object GlobalL0Service {
     maybeMajorityPeerIdSet: Option[NonEmptySet[PeerId]],
     mptStore: MptStore[F, GlobalStateKey]
   )(
-    implicit globalStateProofSelector: GlobalStateProofSelector
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): GlobalL0Service[F] =
     new GlobalL0Service[F] {
 

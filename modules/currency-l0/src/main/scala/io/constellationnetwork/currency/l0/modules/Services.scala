@@ -81,7 +81,8 @@ object Services {
     queues: Queues[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
-    currencyStateProofSelector: CurrencyStateProofSelector
+    currencyStateProofSelector: CurrencyStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[Services[F, R]] =
     for {
       implicit0(hasher: Hasher[F]) <- hasherSelector.getCurrent.pure[F]

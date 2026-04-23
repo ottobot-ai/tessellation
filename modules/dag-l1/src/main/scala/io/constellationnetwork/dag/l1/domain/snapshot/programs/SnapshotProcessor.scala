@@ -55,7 +55,8 @@ abstract class SnapshotProcessor[
     snapshot: Either[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo), Hashed[GlobalIncrementalSnapshot]]
   )(
     implicit hasher: Hasher[F],
-    stateProofSelector: StateProofSelector
+    stateProofSelector: StateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[SnapshotProcessingResult]
 
   def applyGlobalSnapshotFn(
@@ -91,7 +92,8 @@ abstract class SnapshotProcessor[
     mptStore: MptStore[F, GlobalStateKey]
   )(
     implicit hasher: Hasher[F],
-    stateProofSelector: StateProofSelector
+    stateProofSelector: StateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[SnapshotProcessingResult] =
     alignment match {
       case AlignedAtNewOrdinal(

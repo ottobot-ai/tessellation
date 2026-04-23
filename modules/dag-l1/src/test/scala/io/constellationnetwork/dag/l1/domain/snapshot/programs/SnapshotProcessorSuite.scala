@@ -81,6 +81,9 @@ import weaver.SimpleIOSuite
 object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
   val TestValidationErrorStorageMaxSize: PosInt = PosInt(16)
 
+  implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+    io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
+
   type TestResources = (
     SnapshotProcessor[IO, GlobalSnapshotStateProof, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     SecurityProvider[IO],

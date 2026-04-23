@@ -42,7 +42,8 @@ object SnapshotDownloadStorage {
     hashSelect: HashSelect,
     mptStore: MptStore[F, GlobalStateKey]
   )(
-    implicit globalStateProofSelector: GlobalStateProofSelector
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): SnapshotDownloadStorage[F] =
     new SnapshotDownloadStorage[F] {
 

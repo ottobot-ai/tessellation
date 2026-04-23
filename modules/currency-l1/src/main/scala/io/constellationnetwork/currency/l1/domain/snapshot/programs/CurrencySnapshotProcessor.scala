@@ -69,7 +69,11 @@ object CurrencySnapshotProcessor {
     new CurrencySnapshotProcessor[F] {
       def process(
         snapshot: Either[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo), Hashed[GlobalIncrementalSnapshot]]
-      )(implicit hasher: Hasher[F], stateProofSelector: StateProofSelector): F[SnapshotProcessingResult] =
+      )(
+        implicit hasher: Hasher[F],
+        stateProofSelector: StateProofSelector,
+        withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+      ): F[SnapshotProcessingResult] =
         snapshot match {
           case Left((globalSnapshot, globalState)) =>
             val globalSnapshotReference = SnapshotReference.fromHashedSnapshot(globalSnapshot)
@@ -176,7 +180,8 @@ object CurrencySnapshotProcessor {
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(
         implicit hasher: Hasher[F],
-        stateProofSelector: StateProofSelector
+        stateProofSelector: StateProofSelector,
+        withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
       ): F[SnapshotProcessingResult] =
         fetchCurrencySnapshots(globalSnapshot).flatMap {
           case Some(Validated.Valid(hashedSnapshots)) =>
