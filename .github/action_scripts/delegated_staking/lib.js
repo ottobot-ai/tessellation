@@ -257,15 +257,37 @@ const fetchStakeWithRewardsBalance = async (
 const createTokenLock = async (account, urls, lockAmount, replaceRef = null, replaceBalance = 0) => {
   const initialBalance = dagToDatum(await account.getBalance())
 
-  const { hash } = await account.postTokenLock({
-    source: account.address,
-    amount: lockAmount,
-    tokenL1Url: urls.dagL1Url,
-    unlockEpoch: null,
-    currencyId: null,
-    replaceTokenLockRef: replaceRef,
-    fee: 0,
-  })
+  // Retry on NothingToReplace: L1's `TokenLockService.offer` validator reads from the local MPT
+  // (`mptStore.getActiveTokenLocks`). Under Nakamoto, an accepted token lock can transiently disappear
+  // from the serving node's MPT during a chain reorg — the MPT rewinds to savepoint and reapplies
+  // deltas, so there's a short window where a replacement-reference lock isn't in `activeTokenLocks`.
+  // Same pattern as `createDelegatedStake`'s InvalidTokenLock retry at line 119.
+  const maxAttempts = 120
+  const intervalMs = 3000
+  let hash
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const resp = await account.postTokenLock({
+        source: account.address,
+        amount: lockAmount,
+        tokenL1Url: urls.dagL1Url,
+        unlockEpoch: null,
+        currencyId: null,
+        replaceTokenLockRef: replaceRef,
+        fee: 0,
+      })
+      hash = resp.hash
+      break
+    } catch (error) {
+      const msg = error?.message || String(error)
+      // Only retry when the replacement reference is transiently missing; surface other errors immediately.
+      if (replaceRef && msg.includes('NothingToReplace') && attempt < maxAttempts) {
+        await new Promise(r => setTimeout(r, intervalMs))
+        continue
+      }
+      throw error
+    }
+  }
 
   if (!hash) {
     throw new Error('Failed to create TokenLock')
