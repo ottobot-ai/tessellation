@@ -188,7 +188,7 @@ object GlobalSnapshotAcceptanceManager {
     val rewardAcceptanceManager = RewardAcceptanceManager.make[F](Some(mptStore), shouldUseMptStore = false)
     val allowSpendStateManager = AllowSpendStateManager.make[F]()
     val tokenLockStateManager = TokenLockStateManager.make[F](mptStore)
-    val spendTransactionBalanceManager = SpendTransactionBalanceManager.make[F]()
+    val spendTransactionBalanceManager = SpendTransactionBalanceManager.make[F](Some(mptStore), shouldUseMptStore = false)
     val delegatedStakeStateManager = DelegatedStakeStateManager.make[F]()
     val nodeCollateralStateManager = NodeCollateralStateManager.make[F](mptStore)
     val transactionReferenceManager = TransactionReferenceManager.make[F](mptStore, shouldUseMptStore = false)
@@ -1003,15 +1003,16 @@ object GlobalSnapshotAcceptanceManager {
                   .filter(_.currencyId.isEmpty)
             }.toList
 
-            (updatedBalancesBySpendTransactions, updatedBalancesBySpendTransactionsDeltas) = spendTransactionBalanceManager
-              .updateGlobalBalancesBySpendTransactions(
-                updatedBalancesByTokenLocks,
-                allGlobalAllowSpends,
-                globalSpendTransactions
-              ) match {
-              case Right(balances) => balances
-              case Left(error) => throw new RuntimeException(s"Balance arithmetic error updating balances by spend transactions: $error")
-            }
+            spendTxBalancesResult <- spendTransactionBalanceManager.updateGlobalBalancesBySpendTransactions(
+              updatedBalancesByTokenLocks,
+              allGlobalAllowSpends,
+              globalSpendTransactions
+            )
+            (updatedBalancesBySpendTransactions, updatedBalancesBySpendTransactionsDeltas) <- Async[F].fromEither(
+              spendTxBalancesResult.leftMap(err =>
+                new RuntimeException(s"Balance arithmetic error updating balances by spend transactions: $err")
+              )
+            )
 
             MerkleTreeResult(_, updatedLastCurrencySnapshotProofs) <- buildMerkleTreeAndProofs(
               ordinal,

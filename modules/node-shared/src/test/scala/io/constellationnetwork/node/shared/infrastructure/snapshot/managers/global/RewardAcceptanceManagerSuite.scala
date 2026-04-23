@@ -60,11 +60,12 @@ object RewardAcceptanceManagerSuite extends MutableIOSuite {
       manager = RewardAcceptanceManager.make[IO](Some(mptStore), shouldUseMptStore = false)
 
       (updated, accepted, delta) <- manager.acceptRewardTxs(priorMap, rewards)
-    } yield expect.all(
-      updated(recipient) == Balance(NonNegLong(150)),
-      accepted.size == 1,
-      delta == SortedMap(recipient -> Balance(NonNegLong(150)))
-    )
+    } yield
+      expect.all(
+        updated(recipient) == Balance(NonNegLong(150)),
+        accepted.size == 1,
+        delta == SortedMap(recipient -> Balance(NonNegLong(150)))
+      )
   }
 
   test("mpt path: rewards read prior balance from MPT when not in delta map") { res =>
@@ -80,11 +81,12 @@ object RewardAcceptanceManagerSuite extends MutableIOSuite {
       manager = RewardAcceptanceManager.make[IO](Some(mptStore), shouldUseMptStore = true)
 
       (updated, accepted, delta) <- manager.acceptRewardTxs(SortedMap.empty, rewards)
-    } yield expect.all(
-      updated(recipient) == Balance(NonNegLong(150)),
-      accepted.size == 1,
-      delta == SortedMap(recipient -> Balance(NonNegLong(150)))
-    )
+    } yield
+      expect.all(
+        updated(recipient) == Balance(NonNegLong(150)),
+        accepted.size == 1,
+        delta == SortedMap(recipient -> Balance(NonNegLong(150)))
+      )
   }
 
   test("mpt path: delta map shadows prior MPT balance (in-ordinal state)") { res =>
@@ -120,10 +122,11 @@ object RewardAcceptanceManagerSuite extends MutableIOSuite {
 
       (legacyUpdated, legacyAccepted, legacyDelta) <- legacy.acceptRewardTxs(state, rewards)
       (mptUpdated, mptAccepted, mptDelta) <- mpt.acceptRewardTxs(SortedMap.empty, rewards)
-    } yield expect.all(
-      legacyUpdated(recipient) == mptUpdated(recipient),
-      legacyAccepted == mptAccepted,
-      legacyDelta == mptDelta
-    )
+    } yield
+      expect.all(
+        legacyUpdated(recipient) == mptUpdated(recipient),
+        legacyAccepted == mptAccepted,
+        legacyDelta == mptDelta
+      )
   }
 }
