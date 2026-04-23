@@ -344,6 +344,127 @@ object GlobalStateConverter {
     }
   }
 
+  /** Typed scodec-encoded entries for a `StateChangesAccumulator` — the canonical delta form the acceptance manager produces per ordinal.
+    *
+    * Each field is encoded via its `ImmutableCodec[V]`, the same encoder `syncFromStateChanges` uses when writing to the store. This is the
+    * delta-as-bytes representation: the upsert half of `store.update(upserts, removes)` under the MPT-as-primary model. Removals are
+    * carried by the accumulator's `removed*Keys` fields; callers combine both halves.
+    *
+    * Consumes the same codec set as `toAllStateKeyValueBytes(info)` so the two paths produce identical bytes for the same post-state.
+    */
+  def toAccumulatorBytesDelta[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    acc: StateChangesAccumulator
+  )(implicit stateProofSelector: StateProofSelector): F[Map[GlobalStateKey, Array[Byte]]] = {
+    import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
+    import io.constellationnetwork.serde.ImmutableCodec
+    import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
+    import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
+    import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
+    import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
+    import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutable}
+    import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmutableCodec
+    import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{immutableCodec => metagraphSyncImmutable}
+    import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
+    import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{immutableCodec => tokenLockRefImmutable}
+    import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.{immutableCodec => txRefImmutable}
+
+    def enc[V](v: V)(implicit c: ImmutableCodec[V]): Array[Byte] = c.immutableBytes(v).toArray
+
+    val stateChanHashes = acc.lastStateChannelSnapshotHashes.iterator.map {
+      case (addr, h) => GlobalStateKey.metagraph(addr, LastStateChannelSnapshotHashes) -> enc(h)
+    }.toList
+    val txRefs = acc.lastTxRefs.iterator.map { case (addr, r) => GlobalStateKey.hypergraph(LastTxRefs, addr) -> enc(r) }.toList
+    val balances = acc.balances.iterator.map { case (addr, b) => GlobalStateKey.hypergraph(Balances, addr) -> enc(b) }.toList
+    val currencyProofs = acc.lastCurrencySnapshotsProofs.iterator.map {
+      case (addr, p) => GlobalStateKey.metagraph(addr, LastCurrencySnapshotsProofs) -> enc(p)
+    }.toList
+    val activeAllowSpends = acc.activeAllowSpends.toList.flatMap {
+      case (optAddr, inner) =>
+        inner.toList.map {
+          case (addr, s) =>
+            GlobalStateKey.hypergraph(ActiveAllowSpends, optAddr, addr) ->
+              enc[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](s)
+        }
+    }
+    val activeTokenLocks = acc.activeTokenLocks.iterator.map {
+      case (addr, s) =>
+        GlobalStateKey.hypergraph(ActiveTokenLocks, addr) -> enc[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](s)
+    }.toList
+    val tokenLockBalances = acc.tokenLockBalances.toList.flatMap {
+      case (tokenAddr, inner) =>
+        inner.toList.map { case (holder, bal) => GlobalStateKey.hypergraph(TokenLockBalances, tokenAddr, holder) -> enc(bal) }
+    }
+    val lastAllowSpendRefs = acc.lastAllowSpendRefs.iterator.map {
+      case (addr, r) => GlobalStateKey.hypergraph(LastAllowSpendRefs, addr) -> enc(r)
+    }.toList
+    val lastTokenLockRefs = acc.lastTokenLockRefs.iterator.map {
+      case (addr, r) => GlobalStateKey.hypergraph(LastTokenLockRefs, addr) -> enc(r)
+    }.toList
+    val activeDelegatedStakes = acc.activeDelegatedStakes.iterator.map {
+      case (addr, s) => GlobalStateKey.hypergraph(ActiveDelegatedStakes, addr) -> enc[SortedSet[DelegatedStakeRecord]](s)
+    }.toList
+    val delegatedStakesWithdrawals = acc.delegatedStakesWithdrawals.iterator.map {
+      case (addr, s) =>
+        GlobalStateKey.hypergraph(DelegatedStakesWithdrawals, addr) -> enc[SortedSet[PendingDelegatedStakeWithdrawal]](s)
+    }.toList
+    val activeNodeCollaterals = acc.activeNodeCollaterals.iterator.map {
+      case (addr, s) => GlobalStateKey.hypergraph(ActiveNodeCollaterals, addr) -> enc[SortedSet[NodeCollateralRecord]](s)
+    }.toList
+    val nodeCollateralWithdrawals = acc.nodeCollateralWithdrawals.iterator.map {
+      case (addr, s) =>
+        GlobalStateKey.hypergraph(NodeCollateralWithdrawals, addr) -> enc[SortedSet[PendingNodeCollateralWithdrawal]](s)
+    }.toList
+    val metagraphSyncData = acc.metagraphSyncData.iterator.map {
+      case (addr, d) => GlobalStateKey.hypergraph(MetagraphSyncData, addr) -> enc(d)
+    }.toList
+
+    acc.lastCurrencySnapshots.toList.parTraverse {
+      case (metagraphAddr, Left(fullSnapshot)) =>
+        CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value).map { inc =>
+          List(
+            GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) ->
+              enc[Signed[CurrencyIncrementalSnapshot]](Signed(inc, fullSnapshot.proofs)),
+            GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) ->
+              enc[CurrencySnapshotInfo](fullSnapshot.info.toCurrencySnapshotInfo)
+          )
+        }
+      case (metagraphAddr, Right((inc, snInfo))) =>
+        List(
+          GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> enc[Signed[CurrencyIncrementalSnapshot]](inc),
+          GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> enc[CurrencySnapshotInfo](snInfo)
+        ).pure[F]
+    }.map { currencyEntries =>
+      val all: Iterable[(GlobalStateKey, Array[Byte])] =
+        stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
+          activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
+          lastAllowSpendRefs ++ lastTokenLockRefs ++
+          activeDelegatedStakes ++ delegatedStakesWithdrawals ++
+          activeNodeCollaterals ++ nodeCollateralWithdrawals ++
+          metagraphSyncData ++ currencyEntries.flatten
+      all.toMap
+    }
+  }
+
+  /** Removal keys derived from a `StateChangesAccumulator` — the delete half of `store.update(upserts, removes)` under MPT-as-primary.
+    */
+  def toAccumulatorRemovalKeys(acc: StateChangesAccumulator): Set[GlobalStateKey] = {
+    import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
+    val allowSpendKeys = acc.removedAllowSpendKeys.toList.map {
+      case (metagraphIdOpt, address) => GlobalStateKey.hypergraph(ActiveAllowSpends, metagraphIdOpt, address)
+    }
+    val tokenLockKeys = acc.removedTokenLockKeys.toList.map(addr => GlobalStateKey.hypergraph(ActiveTokenLocks, addr))
+    val tokenLockBalanceKeys = acc.removedTokenLockBalanceKeys.toList.map(addr => GlobalStateKey.hypergraph(TokenLockBalances, addr))
+    val delegatedStakeKeys = acc.removedDelegatedStakeKeys.toList.map(addr => GlobalStateKey.hypergraph(ActiveDelegatedStakes, addr))
+    val delegatedStakeWithdrawalKeys =
+      acc.removedDelegatedStakeWithdrawalKeys.toList.map(addr => GlobalStateKey.hypergraph(DelegatedStakesWithdrawals, addr))
+    val nodeCollateralKeys = acc.removedNodeCollateralKeys.toList.map(addr => GlobalStateKey.hypergraph(ActiveNodeCollaterals, addr))
+    val nodeCollateralWithdrawalKeys =
+      acc.removedNodeCollateralWithdrawalKeys.toList.map(addr => GlobalStateKey.hypergraph(NodeCollateralWithdrawals, addr))
+    (allowSpendKeys ++ tokenLockKeys ++ tokenLockBalanceKeys ++
+      delegatedStakeKeys ++ delegatedStakeWithdrawalKeys ++
+      nodeCollateralKeys ++ nodeCollateralWithdrawalKeys).toSet
+  }
+
   object syntax {
     implicit class GlobalSnapshotInfoMptOps(val info: GlobalSnapshotInfo) extends AnyVal {
       def allStateEntries[F[_]: Async: Parallel: Hasher: JsonSerializer](

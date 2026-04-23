@@ -53,6 +53,12 @@ trait MptStore[F[_], K] {
   def syncFullIfNeeded[V: ImmutableCodec](newState: => F[Map[K, V]], ordinal: SnapshotOrdinal): F[Unit]
   def update[V: ImmutableCodec](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit]
   def underlying: StatefulMerklePatriciaProducer[F]
+
+  /** Snapshot of every `(Hex key → raw bytes)` entry currently in the producer. Use for independent cross-checks — feed into a second
+    * producer implementation (e.g. `MerklePatriciaTrie.makeParallelFromBytes`) to build an MPT independently of the incremental writer and
+    * compare roots. Byte-stream is the MPT canonical form; no decoding required.
+    */
+  def allEntriesAsBytes: F[Map[Hex, Array[Byte]]]
   def deleteAbove(ordinal: SnapshotOrdinal): F[Unit]
 
   /** Capture a snapshot of all internal state (producer state + last synced ordinal). The returned savepoint can restore the store to this
@@ -270,6 +276,8 @@ object MptStore {
       } yield ()
 
     override def underlying: StatefulMerklePatriciaProducer[F] = producer
+
+    override def allEntriesAsBytes: F[Map[Hex, Array[Byte]]] = producer.entries
 
     override def deleteAbove(ordinal: SnapshotOrdinal): F[Unit] =
       producer match {
