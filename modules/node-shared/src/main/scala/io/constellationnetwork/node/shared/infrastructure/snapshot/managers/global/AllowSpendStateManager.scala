@@ -15,6 +15,7 @@ import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.allowSpendExpiryKeySetImmutableCodec
 import io.constellationnetwork.syntax.sortedCollection.sortedSetSyntax
 
 /** Result of allow spend acceptance containing full state, deltas, and removed keys */
@@ -46,6 +47,24 @@ trait AllowSpendStateManager[F[_]] {
     allowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
     epochProgress: EpochProgress
   ): SortedMap[Address, SortedSet[Signed[AllowSpend]]]
+
+  /** Index-driven equivalent of `filterExpiredAllowSpends` for the global partition (metagraphId = None).
+    *
+    * Sweeps the allow-spend expiry index for epoch buckets `[previousEpochProgress .. epochProgress - 1]` — the range covering records that
+    * became expired since the previous accept. Resolves each expiring key's hash against the passed-in in-memory map
+    * (`lastActiveGlobalAllowSpends`) to reconstruct the `Signed[AllowSpend]` value. Under the phase-2a invariant (index maintained on every
+    * accept), the output set of `(address, hash)` pairs is equivalent to `filterExpiredAllowSpends(lastActiveGlobalAllowSpends,
+    * epochProgress)` with empty-set entries elided.
+    *
+    * Primary benefit is architectural: once the in-memory `lastActiveGlobalAllowSpends` is no longer materialized (task #91), the index is
+    * the only way to find expiring records in sub-O(N) work. Keep both paths until the flip proves itself end-to-end; equivalence is
+    * verified by `AllowSpendExpirySweepEquivalenceSuite`.
+    */
+  def findExpiredGlobalAllowSpendsViaIndex(
+    previousEpochProgress: EpochProgress,
+    epochProgress: EpochProgress,
+    lastActiveGlobalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]]
+  )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
 
   def updateGlobalBalancesByAllowSpends(
     epochProgress: EpochProgress,
@@ -245,6 +264,46 @@ object AllowSpendStateManager {
       epochProgress: EpochProgress
     ): SortedMap[Address, SortedSet[Signed[AllowSpend]]] =
       allowSpends.view.mapValues(_.filter(_.lastValidEpochProgress < epochProgress)).to(SortedMap)
+
+    def findExpiredGlobalAllowSpendsViaIndex(
+      previousEpochProgress: EpochProgress,
+      epochProgress: EpochProgress,
+      lastActiveGlobalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]]
+    )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] = mptStore match {
+      case None =>
+        // No MPT available; fall back to the legacy full-scan filter, dropping empty-set entries
+        // to match the index-path output shape.
+        filterExpiredAllowSpends(lastActiveGlobalAllowSpends, epochProgress).filter(_._2.nonEmpty).pure[F]
+      case Some(store) =>
+        if (previousEpochProgress.value.value >= epochProgress.value.value)
+          SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]].pure[F]
+        else {
+          val fromL = previousEpochProgress.value.value
+          val toL = epochProgress.value.value - 1L
+          val epochs: List[EpochProgress] =
+            (fromL to toL).toList.map(v => EpochProgress(eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(v)))
+
+          for {
+            buckets <- epochs.traverse { e =>
+              store
+                .getExpiryBucket[AllowSpendExpiryKey](SystemNamespaceLabel.ExpiryIndexAllowSpends, e)
+                .map(_.getOrElse(SortedSet.empty[AllowSpendExpiryKey]))
+            }
+            // Flatten + filter to global-only (metagraphId = None)
+            allKeys = buckets.flatten.toSet.filter(_.metagraphId.isEmpty)
+            byAddress = allKeys.groupBy(_.address)
+            resolved <- byAddress.toList.traverse {
+              case (addr, expiryKeys) =>
+                val addrSet = lastActiveGlobalAllowSpends.getOrElse(addr, SortedSet.empty[Signed[AllowSpend]])
+                val expectedHashes = expiryKeys.map(_.hash)
+                addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s))).map { hashed =>
+                  val matched = hashed.collect { case (h, s) if expectedHashes.contains(h) => s }.to(SortedSet)
+                  addr -> matched
+                }
+            }
+          } yield SortedMap.from(resolved).filter(_._2.nonEmpty)
+        }
+    }
 
     def updateGlobalBalancesByAllowSpends(
       epochProgress: EpochProgress,
