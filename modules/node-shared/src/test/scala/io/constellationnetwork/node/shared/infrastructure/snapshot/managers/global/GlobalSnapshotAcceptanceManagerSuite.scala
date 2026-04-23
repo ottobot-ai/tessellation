@@ -99,6 +99,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -189,6 +190,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List.empty,
@@ -264,6 +266,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(3L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List.empty,
@@ -328,6 +331,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List.empty,
@@ -410,6 +414,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -494,6 +499,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -574,6 +580,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List.empty,
@@ -656,6 +663,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result1 <- manager1.accept(
         ordinal = SnapshotOrdinal(1L),
         epochProgress = EpochProgress(5L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List.empty,
@@ -682,6 +690,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result2 <- manager2.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List.empty,
@@ -798,6 +807,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -892,6 +902,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -973,6 +984,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result1 <- manager.accept(
         ordinal = SnapshotOrdinal(1L),
         epochProgress = EpochProgress(5L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List.empty,
@@ -998,6 +1010,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result2 <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List.empty,
@@ -1032,6 +1045,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         .accept(
           ordinal = SnapshotOrdinal(3L),
           epochProgress = EpochProgress(15L),
+          previousEpochProgress = EpochProgress.MinValue,
           blocksForAcceptance = List.empty,
           allowSpendBlocksForAcceptance = List.empty,
           tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -1137,6 +1151,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result1 <- manager.accept(
         ordinal = SnapshotOrdinal(1L),
         epochProgress = EpochProgress(5L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List.empty,
@@ -1169,6 +1184,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result2 <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -1194,6 +1210,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result3 <- manager.accept(
         ordinal = SnapshotOrdinal(3L),
         epochProgress = EpochProgress(15L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List.empty,
@@ -1217,6 +1234,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result4 <- manager.accept(
         ordinal = SnapshotOrdinal(4L),
         epochProgress = EpochProgress(25L), // Advance epoch significantly to trigger expiration
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List.empty,
@@ -1327,6 +1345,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -1395,6 +1414,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -1468,6 +1488,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -1533,6 +1554,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -1602,6 +1624,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -1683,6 +1706,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock1, tokenLockBlock2, tokenLockBlock3),
@@ -1778,6 +1802,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -1867,6 +1892,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),
@@ -1938,6 +1964,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         ordinal = SnapshotOrdinal(2L),
         epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
         blocksForAcceptance = List.empty,
         allowSpendBlocksForAcceptance = List.empty,
         tokenLockBlocksForAcceptance = List(tokenLockBlock),

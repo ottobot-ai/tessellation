@@ -395,6 +395,7 @@ object GlobalSnapshotConsensusFunctions {
             .accept(
               currentOrdinal,
               currentEpochProgress,
+              lastArtifact.epochProgress,
               blocksForAcceptance.map(_.value),
               sortedAllowSpendEvents,
               sortedTokenLockEvents,

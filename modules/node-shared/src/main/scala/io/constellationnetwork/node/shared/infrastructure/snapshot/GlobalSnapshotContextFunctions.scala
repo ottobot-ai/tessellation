@@ -250,6 +250,7 @@ object GlobalSnapshotContextFunctions {
           snapshotAcceptanceManager.accept(
             signedArtifact.ordinal,
             signedArtifact.epochProgress,
+            lastArtifact.epochProgress,
             blocksForAcceptance,
             allowSpendBlocksForAcceptance,
             tokenLockBlocksForAcceptance,

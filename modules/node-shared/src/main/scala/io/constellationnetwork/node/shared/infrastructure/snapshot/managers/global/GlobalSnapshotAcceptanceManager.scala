@@ -121,6 +121,7 @@ trait GlobalSnapshotAcceptanceManager[F[_]] {
   def accept(
     ordinal: SnapshotOrdinal,
     epochProgress: EpochProgress,
+    previousEpochProgress: EpochProgress,
     blocksForAcceptance: List[Signed[Block]],
     allowSpendBlocksForAcceptance: List[Signed[AllowSpendBlock]],
     tokenLockBlocksForAcceptance: List[Signed[TokenLockBlock]],
@@ -645,6 +646,7 @@ object GlobalSnapshotAcceptanceManager {
       def accept(
         ordinal: SnapshotOrdinal,
         epochProgress: EpochProgress,
+        previousEpochProgress: EpochProgress,
         blocksForAcceptance: List[Signed[Block]],
         allowSpendBlocksForAcceptance: List[Signed[AllowSpendBlock]],
         tokenLockBlocksForAcceptance: List[Signed[TokenLockBlock]],
