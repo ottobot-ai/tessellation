@@ -32,6 +32,18 @@ var (
 		[]string{"topic"},
 	)
 
+	// MessagesDropped counts messages dropped because the per-subscriber relay
+	// channel was full. A non-zero rate means the JVM consumer is slower than
+	// inbound gossip; raise the corresponding buffer or investigate the slow
+	// consumer.
+	MessagesDropped = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sidecar_gossip_messages_dropped_total",
+			Help: "Total gossip messages dropped due to full relay channel (slow JVM consumer).",
+		},
+		[]string{"topic"},
+	)
+
 	// MeshPeers tracks the number of peers in the GossipSub mesh per topic.
 	MeshPeers = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -62,6 +74,7 @@ func init() {
 	prometheus.MustRegister(
 		MessagesPublished,
 		MessagesReceived,
+		MessagesDropped,
 		MeshPeers,
 		ConnectedPeers,
 		DHTRoutingTableSize,

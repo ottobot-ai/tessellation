@@ -18,6 +18,7 @@ import (
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	routeddiscovery "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	discutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
+	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/multiformats/go-multiaddr"
 
 	"github.com/scasplte2/tessellation/p2p/internal/config"
@@ -56,6 +57,20 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		listenAddrs = append(listenAddrs, ma)
 	}
 
+	// Resource manager: explicit ceilings on connections/streams/memory to
+	// protect against adversarial peers at planetary scale. Start from libp2p's
+	// default scaling limits (sized from host CPU/RAM), layer on service-level
+	// defaults (GossipSub, Kad-DHT, identify, ping), then apply as a FixedLimiter.
+	// Without this, the host uses InfiniteLimits which means no protection
+	// against connection/stream/memory exhaustion.
+	scalingLimits := rcmgr.DefaultLimits
+	libp2p.SetDefaultServiceLimits(&scalingLimits)
+	rcmgrLimits := scalingLimits.AutoScale()
+	resourceManager, err := rcmgr.NewResourceManager(rcmgr.NewFixedLimiter(rcmgrLimits))
+	if err != nil {
+		return nil, fmt.Errorf("create resource manager: %w", err)
+	}
+
 	// Build libp2p host options. When a pre-generated Ed25519 key is provided
 	// via -key, the host identity is deterministic — compose-runner uses this to
 	// pre-compute the peer ID and include it in the seedlist multiaddrs so that
@@ -64,6 +79,7 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		libp2p.ListenAddrs(listenAddrs...),
 		libp2p.ForceReachabilityPrivate(),
 		libp2p.DefaultSecurity,
+		libp2p.ResourceManager(resourceManager),
 	}
 	if cfg.PrivateKeyPath != "" {
 		keyBytes, err := os.ReadFile(cfg.PrivateKeyPath)
@@ -95,7 +111,12 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		return nil, fmt.Errorf("create libp2p host: %w", err)
 	}
 
-	// Create GossipSub with custom parameters
+	// Create GossipSub with custom parameters, peer scoring, and peer exchange.
+	// Peer scoring lets the mesh shed misbehaving peers automatically (invalid
+	// messages, IP colocation, unfulfilled IHave promises). At planetary scale
+	// with unknown peers this is essential — without it, any peer can flood
+	// the mesh freely. Peer exchange (PX) lets pruned peers hand off known-good
+	// alternatives on PRUNE, which stabilises the mesh during churn.
 	ps, err := pubsub.NewGossipSub(ctx, h,
 		pubsub.WithGossipSubParams(pubsub.GossipSubParams{
 			D:                 cfg.MeshD,
@@ -125,6 +146,8 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 			MaxIHaveMessages:          pubsub.GossipSubMaxIHaveMessages,
 			IWantFollowupTime:         pubsub.GossipSubIWantFollowupTime,
 		}),
+		pubsub.WithPeerScore(buildPeerScoreParams(cfg), buildPeerScoreThresholds()),
+		pubsub.WithPeerExchange(true),
 	)
 	if err != nil {
 		h.Close()
@@ -350,6 +373,11 @@ func (n *Node) PublishMetagraphBinary(ctx context.Context, data []byte) error {
 // relays incoming messages (excluding self-published) into the returned channel.
 // The subscription is cancelled when ctx is done. The topicLabel is used for
 // Prometheus metrics (e.g. "snapshot", "attestation", "rumor").
+//
+// When the relay channel is full (slow JVM consumer), messages are dropped
+// and counted in sidecar_gossip_messages_dropped_total rather than blocking
+// the relay goroutine. Blocking would backpressure libp2p's internal gossipsub
+// queue and stall the whole validator, so we prefer a loud, observable drop.
 func (n *Node) subscribeAndRelay(ctx context.Context, topic *pubsub.Topic, bufSize int, topicLabel string) (<-chan []byte, error) {
 	sub, err := topic.Subscribe()
 	if err != nil {
@@ -370,8 +398,8 @@ func (n *Node) subscribeAndRelay(ctx context.Context, topic *pubsub.Topic, bufSi
 			metrics.MessagesReceived.WithLabelValues(topicLabel).Inc()
 			select {
 			case ch <- msg.Data:
-			case <-ctx.Done():
-				return
+			default:
+				metrics.MessagesDropped.WithLabelValues(topicLabel).Inc()
 			}
 		}
 	}()
@@ -382,7 +410,7 @@ func (n *Node) subscribeAndRelay(ctx context.Context, topic *pubsub.Topic, bufSi
 // Each call creates its own GossipSub subscription so multiple consumers
 // each receive every message independently.
 func (n *Node) SnapshotMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.snapshotTopic, 64, "snapshot")
+	ch, err := n.subscribeAndRelay(ctx, n.snapshotTopic, n.cfg.SnapshotBufferSize, "snapshot")
 	if err != nil {
 		fmt.Printf("ERROR: subscribe snapshot: %v\n", err)
 		empty := make(chan []byte)
@@ -394,7 +422,7 @@ func (n *Node) SnapshotMessages(ctx context.Context) <-chan []byte {
 
 // AttestationMessages returns a channel of incoming attestation messages.
 func (n *Node) AttestationMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.attestationTopic, 256, "attestation")
+	ch, err := n.subscribeAndRelay(ctx, n.attestationTopic, n.cfg.AttestationBufferSize, "attestation")
 	if err != nil {
 		fmt.Printf("ERROR: subscribe attestation: %v\n", err)
 		empty := make(chan []byte)
@@ -406,7 +434,7 @@ func (n *Node) AttestationMessages(ctx context.Context) <-chan []byte {
 
 // RumorMessages returns a channel of incoming rumor messages.
 func (n *Node) RumorMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.rumorTopic, 1024, "rumor")
+	ch, err := n.subscribeAndRelay(ctx, n.rumorTopic, n.cfg.RumorBufferSize, "rumor")
 	if err != nil {
 		fmt.Printf("ERROR: subscribe rumor: %v\n", err)
 		empty := make(chan []byte)
@@ -417,10 +445,8 @@ func (n *Node) RumorMessages(ctx context.Context) <-chan []byte {
 }
 
 // MetagraphBinaryMessages returns a channel of incoming metagraph-binary messages.
-// Buffer sized to tolerate bursts of multiple metagraphs sending binaries
-// concurrently (500 KB per message, ~4 MB/slot absolute worst case).
 func (n *Node) MetagraphBinaryMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.metagraphBinaryTopic, 256, "metagraph_binary")
+	ch, err := n.subscribeAndRelay(ctx, n.metagraphBinaryTopic, n.cfg.MetagraphBinaryBufferSize, "metagraph_binary")
 	if err != nil {
 		fmt.Printf("ERROR: subscribe metagraph_binary: %v\n", err)
 		empty := make(chan []byte)
@@ -551,4 +577,69 @@ func (n *Node) Topics() metrics.TopicSet {
 // by their own goroutines when the context is done.
 func (n *Node) Close() error {
 	return n.Host.Close()
+}
+
+// buildPeerScoreParams returns GossipSub peer scoring parameters tuned for
+// planetary-scale deployment with unknown, potentially adversarial peers.
+//
+// The shape is modelled on Ethereum consensus-layer (Lighthouse/Prysm) and
+// Filecoin mainnet practice: slow reputation decay so honest peers build and
+// keep good standing over hours, steep penalty for invalid-message publishing,
+// IP colocation weight to mitigate single-ASN Sybils.
+//
+// Starting-point values are intentionally conservative — MeshMessageDeliveries
+// weights are 0 because they require knowing the expected per-topic traffic
+// rate, which we don't yet have in production. Ramp those up once we have
+// telemetry on typical arrival rates.
+func buildPeerScoreParams(cfg config.Config) *pubsub.PeerScoreParams {
+	topics := map[string]*pubsub.TopicScoreParams{
+		cfg.SnapshotTopic:        buildTopicScoreParams(cfg.HeartbeatInterval),
+		cfg.AttestationTopic:     buildTopicScoreParams(cfg.HeartbeatInterval),
+		cfg.RumorTopic:           buildTopicScoreParams(cfg.HeartbeatInterval),
+		cfg.MetagraphBinaryTopic: buildTopicScoreParams(cfg.HeartbeatInterval),
+	}
+	return &pubsub.PeerScoreParams{
+		Topics:                      topics,
+		TopicScoreCap:               32.0,
+		AppSpecificScore:            func(peer.ID) float64 { return 0 },
+		AppSpecificWeight:           1.0,
+		IPColocationFactorWeight:    -35.11,
+		IPColocationFactorThreshold: 10,
+		BehaviourPenaltyWeight:      -15.92,
+		BehaviourPenaltyThreshold:   6.0,
+		BehaviourPenaltyDecay:       pubsub.ScoreParameterDecay(time.Hour),
+		DecayInterval:               cfg.HeartbeatInterval,
+		DecayToZero:                 0.01,
+		RetainScore:                 100 * time.Minute,
+	}
+}
+
+// buildTopicScoreParams returns per-topic scoring defaults. One set serves all
+// four topics today; split into per-topic tuning only when telemetry shows one
+// topic needs different weighting.
+func buildTopicScoreParams(heartbeat time.Duration) *pubsub.TopicScoreParams {
+	return &pubsub.TopicScoreParams{
+		TopicWeight:                    0.25,
+		TimeInMeshWeight:               0.0027,
+		TimeInMeshQuantum:              heartbeat,
+		TimeInMeshCap:                  3600,
+		FirstMessageDeliveriesWeight:   1.0,
+		FirstMessageDeliveriesDecay:    pubsub.ScoreParameterDecay(10 * time.Minute),
+		FirstMessageDeliveriesCap:      1000,
+		MeshMessageDeliveriesWeight:    0, // disabled until we have rate telemetry
+		InvalidMessageDeliveriesWeight: -99.0,
+		InvalidMessageDeliveriesDecay:  pubsub.ScoreParameterDecay(50 * heartbeat),
+	}
+}
+
+// buildPeerScoreThresholds returns the score bands that gate gossip behaviour.
+// Numbers match Ethereum CL and Filecoin mainnet; see libp2p/specs pubsub/gossipsub/gossipsub-v1.1.md.
+func buildPeerScoreThresholds() *pubsub.PeerScoreThresholds {
+	return &pubsub.PeerScoreThresholds{
+		GossipThreshold:             -500,  // below this, no IHave/IWant is sent/honoured
+		PublishThreshold:            -1000, // below this, we won't publish to this peer
+		GraylistThreshold:           -2500, // below this, all RPCs from peer are ignored
+		AcceptPXThreshold:           100,   // PX from peers below this is ignored
+		OpportunisticGraftThreshold: 5,     // grafted-in opportunistic peers must score above this
+	}
 }

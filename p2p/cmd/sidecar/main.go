@@ -48,6 +48,10 @@ func main() {
 	flag.StringVar(&cfg.PrivateKeyPath, "key", "", "path to Ed25519 private key file")
 	flag.StringVar(&cfg.MetricsAddr, "metrics", ":9501", "Prometheus metrics listen address (empty = disabled)")
 	flag.BoolVar(&cfg.DisableMdns, "disable-mdns", false, "disable mDNS peer discovery (force DHT-only — for multi-host validation)")
+	flag.IntVar(&cfg.SnapshotBufferSize, "snapshot-buffer", cfg.SnapshotBufferSize, "per-subscriber relay buffer size for snapshots (full = drop, counted in sidecar_gossip_messages_dropped_total)")
+	flag.IntVar(&cfg.AttestationBufferSize, "attestation-buffer", cfg.AttestationBufferSize, "per-subscriber relay buffer size for attestations")
+	flag.IntVar(&cfg.RumorBufferSize, "rumor-buffer", cfg.RumorBufferSize, "per-subscriber relay buffer size for rumors")
+	flag.IntVar(&cfg.MetagraphBinaryBufferSize, "metagraph-binary-buffer", cfg.MetagraphBinaryBufferSize, "per-subscriber relay buffer size for metagraph binaries")
 
 	var generateKey bool
 	var showPeerID bool
