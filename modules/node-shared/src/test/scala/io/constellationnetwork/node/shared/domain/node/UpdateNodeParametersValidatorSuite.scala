@@ -15,14 +15,18 @@ import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.node.UpdateNodeParametersValidator.InvalidSigned
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.node._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security.key.ops.PublicKeyOps
+import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed.forAsyncHasher
 import io.constellationnetwork.security.signature.SignedValidator.{InvalidSignatures, NotSignedExclusivelyByAddressOwner}
 import io.constellationnetwork.security.signature.{Signed, SignedValidator}
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.unpRecordImmutableCodec
 import io.constellationnetwork.shared.sharedKryoRegistrar
 
 import eu.timepit.refined.types.numeric.PosInt
@@ -478,4 +482,56 @@ object UpdateNodeParametersValidatorSuite extends MutableIOSuite {
   def mkGlobalContext(updateNodeParameters: SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)] = SortedMap.empty) =
     GlobalSnapshotInfo.empty.copy(updateNodeParameters = Some(updateNodeParameters))
 
+  test("mpt path: validateParent agrees with legacy when MPT state matches lastSnapshotContext") { res =>
+    implicit val (json, h, sp) = res
+    val seedList = Set.empty[SeedlistEntry]
+    val signedValidator = SignedValidator.make[IO]
+
+    for {
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = keyPair.getPublic.toAddress
+      id = keyPair.getPublic.toId
+
+      // Existing params in prior state
+      existingParams = testUpdateNodeParameters(source, name = "prior", description = "prior")
+      signedExisting <- forAsyncHasher(existingParams, keyPair)
+      priorRef <- UpdateNodeParametersReference.of(signedExisting)
+
+      // New params that reference the existing as parent
+      newParams = testUpdateNodeParameters(source).copy(parent = priorRef)
+      signedNew <- forAsyncHasher(newParams, keyPair)
+
+      priorMap = SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)](
+        id -> ((signedExisting, SnapshotOrdinal.MinValue))
+      )
+      context = mkGlobalContext(priorMap)
+
+      mptProducer <- InMemoryMerklePatriciaProducer.make[IO]()
+      mptStore <- MptStore.make[IO, GlobalStateKey](mptProducer, GlobalStateKey.toHex[IO])
+      key <- GlobalStateKey.updateNodeParametersKey[IO](id)
+      _ <- mptStore.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](key, (signedExisting, SnapshotOrdinal.MinValue))
+
+      legacyValidator = UpdateNodeParametersValidator.make[IO](
+        signedValidator,
+        RewardFraction(5_000_000),
+        RewardFraction(10_000_000),
+        PosInt(140),
+        seedList.some,
+        mptStore = Some(mptStore),
+        shouldUseMptStore = false
+      )
+      mptValidator = UpdateNodeParametersValidator.make[IO](
+        signedValidator,
+        RewardFraction(5_000_000),
+        RewardFraction(10_000_000),
+        PosInt(140),
+        seedList.some,
+        mptStore = Some(mptStore),
+        shouldUseMptStore = true
+      )
+
+      legacyResult <- legacyValidator.validate(signedNew, context)
+      mptResult <- mptValidator.validate(signedNew, context)
+    } yield expect(legacyResult.isValid == mptResult.isValid)
+  }
 }

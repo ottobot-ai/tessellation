@@ -75,7 +75,9 @@ object SharedValidators {
       delegatedStaking.minRewardFraction,
       delegatedStaking.maxRewardFraction,
       delegatedStaking.maxMetadataFieldsChars,
-      l0Seedlist
+      l0Seedlist,
+      maybeMptStore,
+      shouldUseMptStore = false
     )
     val updateDelegatedStakeValidator = maybeMptStore match {
       case Some(mptStore) => UpdateDelegatedStakeValidator.make[F](signedValidator, l0Seedlist, mptStore)
