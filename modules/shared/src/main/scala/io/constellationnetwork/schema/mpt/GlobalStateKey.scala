@@ -6,6 +6,7 @@ import cats.syntax.all._
 
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.PartitionNamespace._
 import io.constellationnetwork.schema.priceOracle.TokenPair
 import io.constellationnetwork.security.Hasher
@@ -25,6 +26,7 @@ object PartitionKeyType {
   case object PKTHypergraph extends PartitionKeyType { val toByte: Byte = 0x00 }
   case object PKTAddress extends PartitionKeyType { val toByte: Byte = 0x01 }
   case object PKTHash extends PartitionKeyType { val toByte: Byte = 0x02 }
+  case object PKTSystem extends PartitionKeyType { val toByte: Byte = 0x03 }
 
   implicit val ordering: Ordering[PartitionKeyType] = Ordering.by(_.toByte)
   implicit val show: Show[PartitionKeyType] = Show.show(_.toByte.toString)
@@ -38,8 +40,39 @@ object PartitionKeyType {
     case 0x00 => Some(PKTHypergraph)
     case 0x01 => Some(PKTAddress)
     case 0x02 => Some(PKTHash)
+    case 0x03 => Some(PKTSystem)
     case _    => None
   }
+}
+
+/** Discriminator for MPT partitions reserved for internal/derived state that isn't user-addressable: expiry indices, GC markers,
+  * reverse-lookup tables, etc. Adding a new system-scoped partition = adding a new sealed case object here (plus its value codec and the
+  * sync wiring). Keeps `GlobalStateFieldId` bounded to user-visible state.
+  */
+sealed trait SystemNamespaceLabel {
+  def canonicalName: String
+}
+object SystemNamespaceLabel {
+  case object ExpiryIndexAllowSpends extends SystemNamespaceLabel { val canonicalName = "expiry-index-allowspends" }
+  case object ExpiryIndexTokenLocks extends SystemNamespaceLabel { val canonicalName = "expiry-index-tokenlocks" }
+  case object ExpiryIndexNodeCollateralWithdrawals extends SystemNamespaceLabel {
+    val canonicalName = "expiry-index-nodecollateralwithdrawals"
+  }
+
+  val all: List[SystemNamespaceLabel] = List(
+    ExpiryIndexAllowSpends,
+    ExpiryIndexTokenLocks,
+    ExpiryIndexNodeCollateralWithdrawals
+  )
+
+  def fromCanonicalName(name: String): Option[SystemNamespaceLabel] = all.find(_.canonicalName === name)
+
+  implicit val ordering: Ordering[SystemNamespaceLabel] = Ordering.by(_.canonicalName)
+  implicit val show: Show[SystemNamespaceLabel] = Show.show(_.canonicalName)
+
+  implicit val encoder: Encoder[SystemNamespaceLabel] = Encoder[String].contramap(_.canonicalName)
+  implicit val decoder: Decoder[SystemNamespaceLabel] =
+    Decoder[String].emap(n => fromCanonicalName(n).toRight(s"Unknown SystemNamespaceLabel: $n"))
 }
 
 sealed trait PartitionNamespace {
@@ -65,6 +98,13 @@ object PartitionNamespace {
     val keyType: PartitionKeyType = PKTHash
   }
 
+  /** Reserved namespace for system-derived partitions (expiry indices, GC markers, reverse-lookup tables, ...). Hashed to fixed width
+    * during `toHex` like the address-bearing namespaces. Adding a new subsystem = adding a new `SystemNamespaceLabel` case object.
+    */
+  case class SystemNamespace(label: SystemNamespaceLabel) extends PartitionNamespace {
+    val keyType: PartitionKeyType = PKTSystem
+  }
+
   case object EmptyNamespace extends PartitionNamespace {
     val keyType: PartitionKeyType = PKTHypergraph
   }
@@ -75,6 +115,7 @@ object PartitionNamespace {
     case MetagraphNamespace(addr) => (1, addr.value.value, "")
     case AddressNamespace(addr)   => (1, addr.value.value, "")
     case HashNamespace(hash)      => (2, hash.value, "")
+    case SystemNamespace(label)   => (3, label.canonicalName, "")
   }
 
   implicit val show: Show[PartitionNamespace] = Show.show {
@@ -83,6 +124,7 @@ object PartitionNamespace {
     case MetagraphNamespace(addr) => s"Metagraph(${addr.value.value})"
     case AddressNamespace(addr)   => s"Address(${addr.value.value})"
     case HashNamespace(hash)      => s"Hash(${hash.value})"
+    case SystemNamespace(label)   => s"System(${label.canonicalName})"
   }
 
   implicit val encoder: Encoder[PartitionNamespace] = Encoder.instance {
@@ -94,6 +136,8 @@ object PartitionNamespace {
       Json.obj("type" -> Json.fromString("address"), "address" -> Json.fromString(addr.value.value))
     case HashNamespace(hash) =>
       Json.obj("type" -> Json.fromString("hash"), "hash" -> Json.fromString(hash.value))
+    case SystemNamespace(label) =>
+      Json.obj("type" -> Json.fromString("system"), "label" -> Json.fromString(label.canonicalName))
   }
 
   implicit val decoder: Decoder[PartitionNamespace] = Decoder.instance { cursor =>
@@ -103,7 +147,15 @@ object PartitionNamespace {
       case "metagraph"  => cursor.downField("address").as[String].map(s => MetagraphNamespace(Address.fromBytes(s.getBytes)))
       case "address"    => cursor.downField("address").as[String].map(s => AddressNamespace(Address.fromBytes(s.getBytes)))
       case "hash"       => cursor.downField("hash").as[String].map(s => HashNamespace(Hash(s)))
-      case other        => Left(DecodingFailure(s"Unknown PartitionNamespace type: $other", cursor.history))
+      case "system" =>
+        cursor
+          .downField("label")
+          .as[String]
+          .flatMap { l =>
+            SystemNamespaceLabel.fromCanonicalName(l).toRight(DecodingFailure(s"Unknown SystemNamespaceLabel: $l", cursor.history))
+          }
+          .map(SystemNamespace(_))
+      case other => Left(DecodingFailure(s"Unknown PartitionNamespace type: $other", cursor.history))
     }
   }
 }
@@ -133,6 +185,11 @@ object GlobalStateFieldId {
   case object PriceState extends GlobalStateFieldId { def toInt: Int = 17 }
   case object MetagraphSyncData extends GlobalStateFieldId { def toInt: Int = 18 }
 
+  /** Shared fieldId for all system-namespaced partitions (expiry indices, GC markers, etc). Discriminated by `SystemNamespaceLabel` in the
+    * `networkNamespace` slot, not by a distinct fieldId.
+    */
+  case object SystemIndex extends GlobalStateFieldId { def toInt: Int = 19 }
+
   implicit val ordering: Ordering[GlobalStateFieldId] = Ordering.by(_.toInt)
   implicit val show: Show[GlobalStateFieldId] = Show.show(_.toInt.toString)
 
@@ -161,6 +218,7 @@ object GlobalStateFieldId {
     case 16 => Some(NodeCollateralWithdrawals)
     case 17 => Some(PriceState)
     case 18 => Some(MetagraphSyncData)
+    case 19 => Some(SystemIndex)
     case _  => None
   }
 }
@@ -208,6 +266,12 @@ object GlobalStateKey {
       GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.PriceState, EmptyNamespace, HashNamespace(h))
     }
 
+  /** Key into a system-namespaced epoch-bucketed index. `userNamespace` carries a hash of the epoch's canonical string form. */
+  def expiryIndexKey[F[_]: Sync: Hasher](label: SystemNamespaceLabel, epoch: EpochProgress): F[GlobalStateKey] =
+    Hasher[F].hash(epoch.show).map { h =>
+      GlobalStateKey(SystemNamespace(label), GlobalStateFieldId.SystemIndex, EmptyNamespace, HashNamespace(h))
+    }
+
   def toHex[F[_]: Sync: Hasher](key: GlobalStateKey): F[Hex] =
     for {
       networkPart <- serializeNamespace[F](key.networkNamespace)
@@ -229,5 +293,7 @@ object GlobalStateKey {
         Hasher[F].hash(addr.value.value).map(h => f"${ns.keyType.toByte}%02x" + h.value)
       case HashNamespace(hash) =>
         (f"${ns.keyType.toByte}%02x" + hash.value).pure[F]
+      case SystemNamespace(label) =>
+        Hasher[F].hash(label.canonicalName).map(h => f"${ns.keyType.toByte}%02x" + h.value)
     }
 }

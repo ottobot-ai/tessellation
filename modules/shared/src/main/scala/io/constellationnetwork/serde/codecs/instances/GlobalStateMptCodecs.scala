@@ -5,16 +5,20 @@ import scala.collection.immutable.SortedSet
 import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
+import io.constellationnetwork.schema.mpt.{AllowSpendExpiryKey, NodeCollateralWithdrawalExpiryKey, TokenLockExpiryKey}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.swap.AllowSpend
 import io.constellationnetwork.schema.tokenLock.TokenLock
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
+import io.constellationnetwork.serde.codecs.OptionCodec.option
 import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSet
+import io.constellationnetwork.serde.codecs.instances.AddressCodec.{codec => addressCodec}
 import io.constellationnetwork.serde.codecs.instances.AllowSpendCodec.{codec => allowSpendCodec}
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotCodecs._
 import io.constellationnetwork.serde.codecs.instances.DelegatedStakeCodecs._
+import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => hashCodec}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs._
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
@@ -75,4 +79,33 @@ object GlobalStateMptCodecs {
 
   implicit val unpRecordImmutableCodec: ImmutableCodec[(Signed[UpdateNodeParameters], SnapshotOrdinal)] =
     ImmutableCodec.fromScodecCodec(unpRecordCodec)
+
+  // ---- System-index key codecs ---------------------------------------------
+
+  private val allowSpendExpiryKeyCodec: Codec[AllowSpendExpiryKey] =
+    (option(addressCodec) :: addressCodec :: hashCodec).xmap[AllowSpendExpiryKey](
+      { case mid :: addr :: h :: HNil => AllowSpendExpiryKey(mid, addr, h) },
+      k => k.metagraphId :: k.address :: k.hash :: HNil
+    )
+
+  implicit val allowSpendExpiryKeySetImmutableCodec: ImmutableCodec[SortedSet[AllowSpendExpiryKey]] =
+    ImmutableCodec.fromScodecCodec(sortedSet(allowSpendExpiryKeyCodec))
+
+  private val tokenLockExpiryKeyCodec: Codec[TokenLockExpiryKey] =
+    (addressCodec :: hashCodec).xmap[TokenLockExpiryKey](
+      { case addr :: h :: HNil => TokenLockExpiryKey(addr, h) },
+      k => k.address :: k.hash :: HNil
+    )
+
+  implicit val tokenLockExpiryKeySetImmutableCodec: ImmutableCodec[SortedSet[TokenLockExpiryKey]] =
+    ImmutableCodec.fromScodecCodec(sortedSet(tokenLockExpiryKeyCodec))
+
+  private val nodeCollateralWithdrawalExpiryKeyCodec: Codec[NodeCollateralWithdrawalExpiryKey] =
+    (addressCodec :: hashCodec).xmap[NodeCollateralWithdrawalExpiryKey](
+      { case addr :: h :: HNil => NodeCollateralWithdrawalExpiryKey(addr, h) },
+      k => k.address :: k.hash :: HNil
+    )
+
+  implicit val nodeCollateralWithdrawalExpiryKeySetImmutableCodec: ImmutableCodec[SortedSet[NodeCollateralWithdrawalExpiryKey]] =
+    ImmutableCodec.fromScodecCodec(sortedSet(nodeCollateralWithdrawalExpiryKeyCodec))
 }

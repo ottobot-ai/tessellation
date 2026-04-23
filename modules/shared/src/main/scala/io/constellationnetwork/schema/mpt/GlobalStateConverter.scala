@@ -1,8 +1,8 @@
 package io.constellationnetwork.schema.mpt
 
-import cats.Parallel
 import cats.effect.{Async, Sync}
 import cats.syntax.all._
+import cats.{Order, Parallel}
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
@@ -13,6 +13,7 @@ import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
+import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.MptStore
 import io.constellationnetwork.schema.mpt.PartitionNamespace.AddressNamespace
 import io.constellationnetwork.schema.node.UpdateNodeParameters
@@ -29,6 +30,7 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.{MerklePatriciaError, StatefulMerklePatriciaProducer}
 import io.constellationnetwork.security.mpt.{MerklePatriciaTrie, MptRoot}
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
 import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
@@ -67,6 +69,10 @@ object GlobalStateConverter {
     metagraphSyncData: SortedMap[Address, MetagraphSyncDataInfo] = SortedMap.empty,
     updateNodeParameters: SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)] = SortedMap.empty,
     priceState: SortedMap[TokenPair, PriceRecord] = SortedMap.empty,
+    allowSpendExpiryIndex: SystemIndexDelta[AllowSpendExpiryKey] = SystemIndexDelta.empty[AllowSpendExpiryKey],
+    tokenLockExpiryIndex: SystemIndexDelta[TokenLockExpiryKey] = SystemIndexDelta.empty[TokenLockExpiryKey],
+    nodeCollateralWithdrawalExpiryIndex: SystemIndexDelta[NodeCollateralWithdrawalExpiryKey] =
+      SystemIndexDelta.empty[NodeCollateralWithdrawalExpiryKey],
     removedAllowSpendKeys: Set[(Option[Address], Address)] = Set.empty,
     removedTokenLockKeys: Set[Address] = Set.empty,
     removedTokenLockBalanceKeys: Set[Address] = Set.empty,
@@ -75,6 +81,34 @@ object GlobalStateConverter {
     removedNodeCollateralKeys: Set[Address] = Set.empty,
     removedNodeCollateralWithdrawalKeys: Set[Address] = Set.empty
   )
+
+  /** Apply a `SystemIndexDelta[K]` to the given `label`'s partition. Each `EpochBucket` delta triggers per-epoch read-modify-write on the
+    * bucket: read the current `SortedSet[K]`, merge adds, apply removes, write back — or delete the bucket entirely if it becomes empty.
+    * Future `SystemIndexDelta` ADT variants add their own dispatch cases here.
+    */
+  private[mpt] def applySystemIndexDelta[F[_]: Async: Hasher, K: Order](
+    store: MptStore[F, GlobalStateKey],
+    label: SystemNamespaceLabel,
+    delta: SystemIndexDelta[K]
+  )(implicit codec: ImmutableCodec[SortedSet[K]]): F[Unit] = delta match {
+    case eb: SystemIndexDelta.EpochBucket[K] if eb.isEmpty => Async[F].unit
+    case eb: SystemIndexDelta.EpochBucket[K] =>
+      implicit val ordering: Ordering[K] = Order[K].toOrdering
+      eb.touchedEpochs.toList.traverse_ { epoch =>
+        GlobalStateKey.expiryIndexKey[F](label, epoch).flatMap { key =>
+          for {
+            existing <- store.get[SortedSet[K]](key).map(_.getOrElse(SortedSet.empty[K]))
+            toAdd = eb.adds.getOrElse(epoch, Set.empty[K])
+            toRemove = eb.removes.getOrElse(epoch, Set.empty[K])
+            merged = (existing ++ toAdd) -- toRemove
+            _ <-
+              if (merged.isEmpty && existing.nonEmpty) store.remove(key)
+              else if (merged.nonEmpty && merged != existing) store.insert[SortedSet[K]](key, merged)
+              else Async[F].unit
+          } yield ()
+        }
+      }
+  }
 
   private def convertRequiredHypergraph[F[_]: Sync: Parallel, A: Encoder](
     data: SortedMap[Address, A],
@@ -671,6 +705,13 @@ object GlobalStateConverter {
 
       def getPriceRecord(tokenPair: TokenPair)(implicit H: Hasher[F]): F[Option[PriceRecord]] =
         GlobalStateKey.priceStateKey[F](tokenPair).flatMap(store.get[PriceRecord])
+
+      /** Read the contents of a system-namespaced epoch-bucket. Returns `None` if the bucket is empty (not present in MPT). */
+      def getExpiryBucket[K](
+        label: SystemNamespaceLabel,
+        epoch: EpochProgress
+      )(implicit H: Hasher[F], C: ImmutableCodec[SortedSet[K]]): F[Option[SortedSet[K]]] =
+        GlobalStateKey.expiryIndexKey[F](label, epoch).flatMap(store.get[SortedSet[K]])
     }
 
     implicit class MptStoreGlobalSnapshotOps[F[_]: Async: Parallel: Hasher: JsonSerializer](
@@ -1063,6 +1104,21 @@ object GlobalStateConverter {
           priceStateEntries <- priceStateEntriesF
           _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
           _ <- store.insert[PriceRecord](priceStateEntries)
+          _ <- applySystemIndexDelta[F, AllowSpendExpiryKey](
+            store,
+            SystemNamespaceLabel.ExpiryIndexAllowSpends,
+            acc.allowSpendExpiryIndex
+          )
+          _ <- applySystemIndexDelta[F, TokenLockExpiryKey](
+            store,
+            SystemNamespaceLabel.ExpiryIndexTokenLocks,
+            acc.tokenLockExpiryIndex
+          )
+          _ <- applySystemIndexDelta[F, NodeCollateralWithdrawalExpiryKey](
+            store,
+            SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
+            acc.nodeCollateralWithdrawalExpiryIndex
+          )
 
           _ <- store.commit(snapshotOrdinal)
           t2 <- Async[F].monotonic.map(_.toMillis)
