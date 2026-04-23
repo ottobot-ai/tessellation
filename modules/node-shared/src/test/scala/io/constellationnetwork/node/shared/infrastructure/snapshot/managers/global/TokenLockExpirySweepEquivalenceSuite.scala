@@ -199,6 +199,54 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
     } yield expect(indexPairs.isEmpty)
   }
 
+  test("end-to-end acceptTokenLocks parity: flag on vs flag off yield identical result") { res =>
+    implicit val (h, sp, js) = res
+    // Guards against bugs where the index path skips addresses that the legacy path's empty-set entries would have
+    // caused the downstream fold to visit (e.g. addresses with `generatedTokenUnlocks` but no expiring locks).
+    for {
+      kp1 <- KeyPairGenerator.makeKeyPair[IO]
+      kp2 <- KeyPairGenerator.makeKeyPair[IO]
+      addr1 = kp1.getPublic.toAddress
+      addr2 = kp2.getPublic.toAddress
+
+      // addr1: a non-expiring lock (unlockEpoch = None) that will be removed by an incoming TokenUnlock.
+      tlPermanent = mkTokenLock(addr1, None, "permanent1")
+      // addr2: an expiring lock (unlockEpoch in the past) that the filter should find.
+      tlExpires = mkTokenLock(addr2, Some(EpochProgress(NonNegLong(100L))), "expires2")
+
+      lastActive = SortedMap(addr1 -> SortedSet(tlPermanent), addr2 -> SortedSet(tlExpires))
+
+      hashedPermanent <- tlPermanent.toHashed
+      // TokenUnlock targeting addr1 — only `acceptTokenLocks` with the right iteration set will apply it.
+      tokenUnlock = io.constellationnetwork.schema.artifact.TokenUnlock(
+        tokenLockRef = hashedPermanent.hash,
+        amount = io.constellationnetwork.schema.tokenLock.TokenLockAmount(PosLong(100L)),
+        source = addr1,
+        currencyId = None
+      )
+      generatedUnlocks = Map(addr1 -> List(tokenUnlock))
+
+      storeOn <- mkSeededMptStore(lastActive)
+      storeOff <- mkSeededMptStore(lastActive)
+      mgrOn = TokenLockStateManager.make[IO](storeOn, shouldUseMptStore = true)
+      mgrOff = TokenLockStateManager.make[IO](storeOff, shouldUseMptStore = false)
+
+      currentEpoch = EpochProgress(NonNegLong(300L))
+      prevEpoch = EpochProgress.MinValue
+      acceptedGlobal = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
+
+      resultOn <- mgrOn.acceptTokenLocks(currentEpoch, prevEpoch, acceptedGlobal, lastActive, generatedUnlocks)
+      resultOff <- mgrOff.acceptTokenLocks(currentEpoch, prevEpoch, acceptedGlobal, lastActive, generatedUnlocks)
+    } yield
+      expect.all(
+        resultOn.fullState == resultOff.fullState,
+        resultOn.removedKeys == resultOff.removedKeys,
+        // Both paths must remove addr1's lock via the TokenUnlock AND addr2's lock via expiry.
+        !resultOn.fullState.contains(addr1),
+        !resultOn.fullState.contains(addr2)
+      )
+  }
+
   test("index sweep matches legacy filter when sweep window covers multiple epochs") { res =>
     implicit val (h, sp, js) = res
     for {

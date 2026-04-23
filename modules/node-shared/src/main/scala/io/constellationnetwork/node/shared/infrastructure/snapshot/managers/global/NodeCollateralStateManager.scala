@@ -22,12 +22,15 @@ trait NodeCollateralStateManager[F[_]] {
   def acceptNodeCollaterals(
     lastSnapshotContext: GlobalSnapshotInfo,
     epochProgress: EpochProgress,
+    previousEpochProgress: EpochProgress,
     withdrawalTimeLimit: EpochProgress
-  ): (
-    SortedMap[Address, SortedSet[NodeCollateralRecord]],
-    SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
-    SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]
-  )
+  )(implicit hasher: Hasher[F]): F[
+    (
+      SortedMap[Address, SortedSet[NodeCollateralRecord]],
+      SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
+      SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]
+    )
+  ]
 
   /** Index-driven equivalent of the expired-withdrawals filter in `acceptNodeCollaterals`.
     *
@@ -63,17 +66,23 @@ trait NodeCollateralStateManager[F[_]] {
 
 object NodeCollateralStateManager {
 
-  def make[F[_]: Async](mptStore: MptStore[F, GlobalStateKey]): NodeCollateralStateManager[F] = new NodeCollateralStateManager[F] {
+  def make[F[_]: Async](
+    mptStore: MptStore[F, GlobalStateKey],
+    shouldUseMptStore: Boolean = false
+  ): NodeCollateralStateManager[F] = new NodeCollateralStateManager[F] {
 
     def acceptNodeCollaterals(
       lastSnapshotContext: GlobalSnapshotInfo,
       epochProgress: EpochProgress,
+      previousEpochProgress: EpochProgress,
       withdrawalTimeLimit: EpochProgress
-    ): (
-      SortedMap[Address, SortedSet[NodeCollateralRecord]],
-      SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
-      SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]
-    ) = {
+    )(implicit hasher: Hasher[F]): F[
+      (
+        SortedMap[Address, SortedSet[NodeCollateralRecord]],
+        SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
+        SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]
+      )
+    ] = {
       val existingNodeCollaterals =
         lastSnapshotContext.activeNodeCollaterals.getOrElse(SortedMap.empty[Address, SortedSet[NodeCollateralRecord]])
       val existingWithdrawals =
@@ -82,22 +91,31 @@ object NodeCollateralStateManager {
       def isWithdrawalExpired(withdrawalEpoch: EpochProgress): Boolean =
         (withdrawalEpoch |+| withdrawalTimeLimit) <= epochProgress
 
-      val unexpiredWithdrawals = existingWithdrawals.map {
-        case (address, withdrawals) =>
-          address -> withdrawals.filterNot {
-            case PendingNodeCollateralWithdrawal(_, _, withdrawalEpoch) =>
-              isWithdrawalExpired(withdrawalEpoch)
-          }
-      }.filter { case (_, withdrawalList) => withdrawalList.nonEmpty }
+      // Phase 2b: index sweep when flag on (equivalence proven by NodeCollateralExpirySweepEquivalenceSuite).
+      val expiredWithdrawalsF: F[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]] =
+        if (shouldUseMptStore)
+          findExpiredWithdrawalsViaIndex(previousEpochProgress, epochProgress, existingWithdrawals)
+        else {
+          val legacy = existingWithdrawals.map {
+            case (address, withdrawals) =>
+              address -> withdrawals.filter {
+                case PendingNodeCollateralWithdrawal(_, _, withdrawalEpoch) =>
+                  isWithdrawalExpired(withdrawalEpoch)
+              }
+          }.filter { case (_, withdrawalList) => withdrawalList.nonEmpty }
+          legacy.pure[F]
+        }
 
-      val expiredWithdrawals = existingWithdrawals.map {
-        case (address, withdrawals) =>
-          address -> withdrawals.filter {
-            case PendingNodeCollateralWithdrawal(_, _, withdrawalEpoch) =>
-              isWithdrawalExpired(withdrawalEpoch)
-          }
-      }.filter { case (_, withdrawalList) => withdrawalList.nonEmpty }
-      (existingNodeCollaterals, unexpiredWithdrawals, expiredWithdrawals)
+      expiredWithdrawalsF.map { expiredWithdrawals =>
+        // Compute unexpired as the set-difference: keep originals that aren't in expired.
+        val expiredPairs: Set[(Address, PendingNodeCollateralWithdrawal)] =
+          expiredWithdrawals.flatMap { case (a, ws) => ws.map(w => (a, w)) }.toSet
+        val unexpiredWithdrawals = existingWithdrawals.map {
+          case (address, withdrawals) =>
+            address -> withdrawals.filterNot(w => expiredPairs.contains((address, w)))
+        }.filter { case (_, withdrawalList) => withdrawalList.nonEmpty }
+        (existingNodeCollaterals, unexpiredWithdrawals, expiredWithdrawals)
+      }
     }
 
     def findExpiredWithdrawalsViaIndex(

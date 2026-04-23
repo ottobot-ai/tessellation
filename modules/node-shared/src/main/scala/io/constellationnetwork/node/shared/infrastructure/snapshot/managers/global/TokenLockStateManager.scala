@@ -121,7 +121,19 @@ object TokenLockStateManager {
             filterExpiredTokenLocks(lastActiveGlobalTokenLocks, epochProgress).pure[F]
 
         expiredGlobalTokenLocksF.flatMap { expiredGlobalTokenLocks =>
-          (acceptedGlobalTokenLocks |+| expiredGlobalTokenLocks).toList
+          // Under the legacy full-map filter, every lastActive address appeared in `expiredGlobalTokenLocks` (possibly
+          // with an empty set), so the fold touched every such address — which matters for addresses whose only change
+          // is a generated TokenUnlock (the unlock removes the lock via the unlocksRefs check inside the fold). The
+          // index sweep emits only addresses with *expiring* records; we must explicitly add addresses with
+          // `generatedTokenUnlocksByAddress` entries back in so the unlock application isn't skipped.
+          val addressesToProcess: SortedMap[Address, SortedSet[Signed[TokenLock]]] = {
+            val tokenLockUnion = acceptedGlobalTokenLocks |+| expiredGlobalTokenLocks
+            val unlockOnlyAddresses = generatedTokenUnlocksByAddress.keySet.diff(tokenLockUnion.keySet)
+            val unlockOnlySeeds = SortedMap.from(unlockOnlyAddresses.toList.map(_ -> SortedSet.empty[Signed[TokenLock]]))
+            tokenLockUnion ++ unlockOnlySeeds
+          }
+
+          addressesToProcess.toList
             .foldM((lastActiveGlobalTokenLocks, SortedMap.empty[Address, SortedSet[Signed[TokenLock]]])) {
               case ((acc, deltas), (address, tokenLocks)) =>
                 val lastAddressTokenLocks = acc.getOrElse(address, SortedSet.empty[Signed[TokenLock]])

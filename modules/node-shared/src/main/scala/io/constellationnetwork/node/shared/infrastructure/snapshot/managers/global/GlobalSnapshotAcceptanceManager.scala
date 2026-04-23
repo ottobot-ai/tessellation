@@ -200,11 +200,14 @@ object GlobalSnapshotAcceptanceManager {
     val tipUsageManager = TipUsageManager.make[F]()
     val metagraphSyncManager = MetagraphSyncManager.make[F](metagraphsSyncConfig)
     val rewardAcceptanceManager = RewardAcceptanceManager.make[F](Some(mptStore), shouldUseMptStore = false)
-    val allowSpendStateManager = AllowSpendStateManager.make[F](Some(mptStore), shouldUseMptStore = false)
-    val tokenLockStateManager = TokenLockStateManager.make[F](mptStore)
+    // Phase 2b: route expiry discovery through the index-driven sweep on production traffic. Both paths produce the same
+    // (address, hash) set by construction (AllowSpendExpirySweepEquivalenceSuite / TokenLockExpirySweepEquivalenceSuite);
+    // the legacy filter remains compiled in as a fallback until the map inputs are removed in #88 / #85.
+    val allowSpendStateManager = AllowSpendStateManager.make[F](Some(mptStore), shouldUseMptStore = true)
+    val tokenLockStateManager = TokenLockStateManager.make[F](mptStore, shouldUseMptStore = true)
     val spendTransactionBalanceManager = SpendTransactionBalanceManager.make[F](Some(mptStore), shouldUseMptStore = false)
     val delegatedStakeStateManager = DelegatedStakeStateManager.make[F]()
-    val nodeCollateralStateManager = NodeCollateralStateManager.make[F](mptStore)
+    val nodeCollateralStateManager = NodeCollateralStateManager.make[F](mptStore, shouldUseMptStore = true)
     val transactionReferenceManager = TransactionReferenceManager.make[F](mptStore, shouldUseMptStore = false)
 
     val blockAcceptanceCoordinatorManager = BlockAcceptanceCoordinatorManager.make[F](
@@ -961,9 +964,10 @@ object GlobalSnapshotAcceptanceManager {
               )
             )
 
-            unexpiredNodeCollateralsRaw = nodeCollateralStateManager.acceptNodeCollaterals(
+            unexpiredNodeCollateralsRaw <- nodeCollateralStateManager.acceptNodeCollaterals(
               lastSnapshotContext,
               epochProgress,
+              previousEpochProgress,
               withdrawalTimeLimit
             )
             (unexpiredCreate, unexpiredWithdraw, _) = unexpiredNodeCollateralsRaw

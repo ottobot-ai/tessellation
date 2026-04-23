@@ -221,6 +221,56 @@ object NodeCollateralExpirySweepEquivalenceSuite extends MutableIOSuite {
     } yield expect(indexPairs.isEmpty)
   }
 
+  test("end-to-end acceptNodeCollaterals parity: flag on vs flag off yield identical tuples") { res =>
+    implicit val (h, sp, js) = res
+    // Lesson from TokenLock: index-only iteration can silently skip downstream work that the legacy full-map
+    // filter would have visited. Exercise the full method, not just the helper, so shape-only differences
+    // (e.g. index emits fewer addresses than legacy) can't produce divergent downstream state.
+    for {
+      kp1 <- KeyPairGenerator.makeKeyPair[IO]
+      kp2 <- KeyPairGenerator.makeKeyPair[IO]
+      addr1 = kp1.getPublic.toAddress
+      addr2 = kp2.getPublic.toAddress
+      peer1 = kp1.getPublic.toId.toPeerId
+      peer2 = kp2.getPublic.toId.toPeerId
+
+      // addr1: one expired (createdAt=50 → expiry=150 <= 300), one not yet (createdAt=250 → expiry=350)
+      // addr2: one not yet (createdAt=300 → expiry=400)
+      wExpired = mkWithdrawal(addr1, peer1, EpochProgress(NonNegLong(50L)), "expired")
+      wValidA = mkWithdrawal(addr1, peer1, EpochProgress(NonNegLong(250L)), "validA")
+      wValidB = mkWithdrawal(addr2, peer2, EpochProgress(NonNegLong(300L)), "validB")
+
+      existingWithdrawals = SortedMap(
+        addr1 -> SortedSet(wExpired, wValidA),
+        addr2 -> SortedSet(wValidB)
+      )
+
+      info = GlobalSnapshotInfo.empty.copy(nodeCollateralWithdrawals = existingWithdrawals.some)
+
+      storeOn <- mkSeededMptStore(existingWithdrawals)
+      storeOff <- mkSeededMptStore(existingWithdrawals)
+      mgrOn = NodeCollateralStateManager.make[IO](storeOn, shouldUseMptStore = true)
+      mgrOff = NodeCollateralStateManager.make[IO](storeOff, shouldUseMptStore = false)
+
+      currentEpoch = EpochProgress(NonNegLong(300L))
+      prevEpoch = EpochProgress.MinValue
+
+      resOn <- mgrOn.acceptNodeCollaterals(info, currentEpoch, prevEpoch, withdrawalTimeLimit)
+      resOff <- mgrOff.acceptNodeCollaterals(info, currentEpoch, prevEpoch, withdrawalTimeLimit)
+
+      (_, unexpOn, expOn) = resOn
+      (_, unexpOff, expOff) = resOff
+    } yield
+      expect.all(
+        unexpOn == unexpOff,
+        expOn == expOff,
+        // addr1 should have one expired, one unexpired; addr2 should have one unexpired.
+        expOn.get(addr1).map(_.size) == Some(1),
+        unexpOn.get(addr1).map(_.size) == Some(1),
+        unexpOn.get(addr2).map(_.size) == Some(1)
+      )
+  }
+
   test("index sweep matches legacy filter when sweep window covers multiple epochs") { res =>
     implicit val (h, sp, js) = res
     for {

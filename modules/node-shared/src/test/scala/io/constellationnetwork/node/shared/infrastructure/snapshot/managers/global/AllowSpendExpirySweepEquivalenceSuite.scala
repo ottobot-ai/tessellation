@@ -220,6 +220,64 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
     } yield expect.all(legacyPairs == indexPairs, legacyPairs.size == 3)
   }
 
+  test("end-to-end acceptAllowSpends parity: flag on vs flag off yield identical AllowSpendAcceptanceResult") { res =>
+    implicit val (h, sp, js) = res
+    // Guards against iteration-shape bugs: the legacy full-map filter and the index sweep produce different
+    // SortedMap shapes (every-address-with-empty-set vs only-expiring-addresses) that can diverge in downstream
+    // folds. Exercise the full `acceptAllowSpends` method on both paths.
+    for {
+      kp1 <- KeyPairGenerator.makeKeyPair[IO]
+      kp2 <- KeyPairGenerator.makeKeyPair[IO]
+      dest <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      addr1 = kp1.getPublic.toAddress
+      addr2 = kp2.getPublic.toAddress
+
+      asExpiredA = mkAllowSpend(addr1, dest, EpochProgress(NonNegLong(100L)), "expiredA")
+      asValidA = mkAllowSpend(addr1, dest, EpochProgress(NonNegLong(500L)), "validA")
+      asValidB = mkAllowSpend(addr2, dest, EpochProgress(NonNegLong(800L)), "validB")
+
+      lastActive = SortedMap(
+        addr1 -> SortedSet(asExpiredA, asValidA),
+        addr2 -> SortedSet(asValidB)
+      )
+      lastActiveOuter = SortedMap(Option.empty[Address] -> lastActive)
+
+      storeOn <- mkSeededMptStore(lastActive)
+      storeOff <- mkSeededMptStore(lastActive)
+      mgrOn = AllowSpendStateManager.make[IO](Some(storeOn), shouldUseMptStore = true)
+      mgrOff = AllowSpendStateManager.make[IO](Some(storeOff), shouldUseMptStore = false)
+
+      currentEpoch = EpochProgress(NonNegLong(300L))
+      prevEpoch = EpochProgress.MinValue
+      emptyCurrencySnapshots = SortedMap.empty[Address, SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+      emptyGlobalAllowSpends = SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]]
+      emptySpendTxns = List.empty[io.constellationnetwork.schema.artifact.SpendTransaction]
+
+      resOn <- mgrOn.acceptAllowSpends(
+        currentEpoch,
+        prevEpoch,
+        emptyCurrencySnapshots,
+        emptyGlobalAllowSpends,
+        lastActiveOuter,
+        emptySpendTxns
+      )
+      resOff <- mgrOff.acceptAllowSpends(
+        currentEpoch,
+        prevEpoch,
+        emptyCurrencySnapshots,
+        emptyGlobalAllowSpends,
+        lastActiveOuter,
+        emptySpendTxns
+      )
+    } yield
+      expect.all(
+        resOn.fullState == resOff.fullState,
+        resOn.deltas == resOff.deltas,
+        resOn.removedKeys == resOff.removedKeys,
+        resOn.expiryIndexDelta == resOff.expiryIndexDelta
+      )
+  }
+
   test("no-mptStore fallback: findExpiredGlobalAllowSpendsViaIndex with None mptStore returns legacy filter output") { res =>
     implicit val (h, sp, js) = res
     for {
