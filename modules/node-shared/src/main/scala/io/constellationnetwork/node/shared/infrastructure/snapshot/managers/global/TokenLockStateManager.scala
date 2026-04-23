@@ -18,6 +18,7 @@ import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.tokenLockExpiryKeySetImmutableCodec
 
 import eu.timepit.refined.types.numeric.NonNegLong
 
@@ -61,6 +62,22 @@ trait TokenLockStateManager[F[_]] {
     tokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
     epochProgress: EpochProgress
   ): SortedMap[Address, SortedSet[Signed[TokenLock]]]
+
+  /** Index-driven equivalent of `filterExpiredTokenLocks`.
+    *
+    * Sweeps the token-lock expiry index for epoch buckets `[previousEpochProgress .. epochProgress - 1]` — the range covering records whose
+    * `unlockEpoch` fell into the past since the previous accept. Resolves each expiring key's hash against the passed-in in-memory map
+    * (`lastActiveGlobalTokenLocks`) to reconstruct the `Signed[TokenLock]` value. Records with `unlockEpoch = None` are not indexed (they
+    * never expire) and are correctly excluded from both paths.
+    *
+    * Primary benefit is architectural: once the in-memory `lastActiveGlobalTokenLocks` is no longer materialized (task #85 / #91), the
+    * index is the only way to find expiring records in sub-O(N) work. Equivalence is verified by `TokenLockExpirySweepEquivalenceSuite`.
+    */
+  def findExpiredGlobalTokenLocksViaIndex(
+    previousEpochProgress: EpochProgress,
+    epochProgress: EpochProgress,
+    lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+  )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[TokenLock]]]]
 
   def updateTokenLockBalances(
     currencySnapshots: SortedMap[Address, CurrencySnapshotWithState],
@@ -221,6 +238,39 @@ object TokenLockStateManager {
         epochProgress: EpochProgress
       ): SortedMap[Address, SortedSet[Signed[TokenLock]]] =
         tokenLocks.view.mapValues(_.filter(_.unlockEpoch.exists(_ < epochProgress))).to(SortedMap)
+
+      def findExpiredGlobalTokenLocksViaIndex(
+        previousEpochProgress: EpochProgress,
+        epochProgress: EpochProgress,
+        lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+      )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
+        if (previousEpochProgress.value.value >= epochProgress.value.value)
+          SortedMap.empty[Address, SortedSet[Signed[TokenLock]]].pure[F]
+        else {
+          val fromL = previousEpochProgress.value.value
+          val toL = epochProgress.value.value - 1L
+          val epochs: List[EpochProgress] =
+            (fromL to toL).toList.map(v => EpochProgress(NonNegLong.unsafeFrom(v)))
+
+          for {
+            buckets <- epochs.traverse { e =>
+              mptStore
+                .getExpiryBucket[TokenLockExpiryKey](io.constellationnetwork.schema.mpt.SystemNamespaceLabel.ExpiryIndexTokenLocks, e)
+                .map(_.getOrElse(SortedSet.empty[TokenLockExpiryKey]))
+            }
+            allKeys = buckets.flatten.toSet
+            byAddress = allKeys.groupBy(_.address)
+            resolved <- byAddress.toList.traverse {
+              case (addr, expiryKeys) =>
+                val addrSet = lastActiveGlobalTokenLocks.getOrElse(addr, SortedSet.empty[Signed[TokenLock]])
+                val expectedHashes = expiryKeys.map(_.hash)
+                addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s))).map { hashed =>
+                  val matched = hashed.collect { case (h, s) if expectedHashes.contains(h) => s }.to(SortedSet)
+                  addr -> matched
+                }
+            }
+          } yield SortedMap.from(resolved).filter(_._2.nonEmpty)
+        }
 
       def updateTokenLockBalances(
         currencySnapshots: SortedMap[Address, CurrencySnapshotWithState],

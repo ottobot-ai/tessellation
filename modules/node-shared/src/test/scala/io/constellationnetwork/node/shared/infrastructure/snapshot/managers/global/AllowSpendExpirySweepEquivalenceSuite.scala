@@ -33,9 +33,8 @@ import weaver.MutableIOSuite
   * set of `(address, hash)` pairs for the global (`metagraphId = None`) partition under the phase-2a invariant.
   *
   * These tests seed matched state on both paths — identical `lastActiveGlobalAllowSpends` map plus an index rebuilt from that map — and
-  * assert
-  * `findExpiredGlobalAllowSpendsViaIndex` returns the same set as `filterExpiredAllowSpends` (with empty-set entries elided, since the
-  * index path cannot emit addresses with zero expiring records).
+  * assert `findExpiredGlobalAllowSpendsViaIndex` returns the same set as `filterExpiredAllowSpends` (with empty-set entries elided, since
+  * the index path cannot emit addresses with zero expiring records).
   */
 object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
 
@@ -75,8 +74,8 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
     )
 
   /** Build an MPT store seeded with the same state that the GSI rebuild path would produce from `lastActive`. Uses
-    * `syncFromGlobalSnapshotInfo` so the expiry index is materialized from the same records the in-memory map contains — the exact
-    * phase-2a invariant.
+    * `syncFromGlobalSnapshotInfo` so the expiry index is materialized from the same records the in-memory map contains — the exact phase-2a
+    * invariant.
     */
   private def mkSeededMptStore(
     lastActive: SortedMap[Address, SortedSet[Signed[AllowSpend]]]

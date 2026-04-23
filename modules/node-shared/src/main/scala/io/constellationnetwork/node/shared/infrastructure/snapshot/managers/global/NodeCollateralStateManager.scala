@@ -10,10 +10,13 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.security.Hasher
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.nodeCollateralWithdrawalExpiryKeySetImmutableCodec
 import io.constellationnetwork.syntax.sortedCollection.sortedSetSyntax
+
+import eu.timepit.refined.types.numeric.NonNegLong
 
 trait NodeCollateralStateManager[F[_]] {
   def acceptNodeCollaterals(
@@ -25,6 +28,26 @@ trait NodeCollateralStateManager[F[_]] {
     SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
     SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]
   )
+
+  /** Index-driven equivalent of the expired-withdrawals filter in `acceptNodeCollaterals`.
+    *
+    * Sweeps the NC-withdrawal expiry index for buckets `[previousEpochProgress + 1 .. epochProgress]` — the range covering withdrawals
+    * whose expiry epoch (`createdAt + withdrawalTimeLimit`) fell into the past since the previous accept. The bucket keys already encode
+    * the expiry epoch, so `withdrawalTimeLimit` is not passed here — the index was maintained using the same config at write-time, so its
+    * contents are authoritative. Resolves each expiring key's hash against the passed-in in-memory map (`lastActiveWithdrawals`) to
+    * reconstruct the `PendingNodeCollateralWithdrawal` value.
+    *
+    * Note the sweep bounds differ from AllowSpend/TokenLock: NC's legacy predicate is `<=` (expiry_epoch <= currentEpoch), so the delta
+    * window is `(prevEpoch, curEpoch]` — inclusive upper bound, exclusive lower. The other two are `<` so the window is `[prevEpoch,
+    * curEpoch)`.
+    *
+    * Equivalence is verified by `NodeCollateralExpirySweepEquivalenceSuite`.
+    */
+  def findExpiredWithdrawalsViaIndex(
+    previousEpochProgress: EpochProgress,
+    epochProgress: EpochProgress,
+    lastActiveWithdrawals: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]
+  )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]]
 
   def getUpdatedCreateNodeCollaterals(
     nodeCollateralAcceptanceResult: UpdateNodeCollateralAcceptanceResult,
@@ -75,6 +98,41 @@ object NodeCollateralStateManager {
           }
       }.filter { case (_, withdrawalList) => withdrawalList.nonEmpty }
       (existingNodeCollaterals, unexpiredWithdrawals, expiredWithdrawals)
+    }
+
+    def findExpiredWithdrawalsViaIndex(
+      previousEpochProgress: EpochProgress,
+      epochProgress: EpochProgress,
+      lastActiveWithdrawals: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]
+    )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]] = {
+      // NC predicate is `<=` (inclusive), so the sweep window is (prevEpoch, epochProgress] — fromL = prevEpoch + 1, toL = epochProgress.
+      val fromL = previousEpochProgress.value.value + 1L
+      val toL = epochProgress.value.value
+      if (fromL > toL)
+        SortedMap.empty[Address, SortedSet[PendingNodeCollateralWithdrawal]].pure[F]
+      else {
+        val epochs: List[EpochProgress] =
+          (fromL to toL).toList.map(v => EpochProgress(NonNegLong.unsafeFrom(v)))
+
+        for {
+          buckets <- epochs.traverse { e =>
+            mptStore
+              .getExpiryBucket[NodeCollateralWithdrawalExpiryKey](SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, e)
+              .map(_.getOrElse(SortedSet.empty[NodeCollateralWithdrawalExpiryKey]))
+          }
+          allKeys = buckets.flatten.toSet
+          byAddress = allKeys.groupBy(_.address)
+          resolved <- byAddress.toList.traverse {
+            case (addr, expiryKeys) =>
+              val addrSet = lastActiveWithdrawals.getOrElse(addr, SortedSet.empty[PendingNodeCollateralWithdrawal])
+              val expectedHashes = expiryKeys.map(_.hash)
+              addrSet.toList.traverse(w => w.event.toHashed.map(h => (h.hash, w))).map { hashed =>
+                val matched = hashed.collect { case (h, w) if expectedHashes.contains(h) => w }.to(SortedSet)
+                addr -> matched
+              }
+          }
+        } yield SortedMap.from(resolved).filter(_._2.nonEmpty)
+      }
     }
 
     def getUpdatedCreateNodeCollaterals(
