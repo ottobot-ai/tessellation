@@ -225,6 +225,12 @@ object GlobalSnapshotContextFunctions {
           )
         )
 
+        // Capture the pre-accept MPT state so we can roll back on verify failure.
+        // Without this, `syncFromStateChanges` inside `accept()` commits its delta before
+        // we get a chance to compare against the peer-claimed stateProof; a mismatch would
+        // leave the store with divergent bytes and the journal tip advanced.
+        preAcceptSavepoint <- mptStore.savepoint
+
         (
           acceptanceResult,
           _,
@@ -362,19 +368,31 @@ object GlobalSnapshotContextFunctions {
         // are not the source of truth post-migration, so we don't compare them. For
         // LegacyFormat ordinals both mptRoots are `None` and the check is a no-op.
         //
+        // On mismatch we restore the MPT from the pre-accept savepoint BEFORE raising —
+        // otherwise `syncFromStateChanges` has already committed the delta and the journal
+        // tip has advanced, leaving the store with divergent bytes for upstream retries.
+        //
         // The previous policy explicitly skipped this check entirely with the rationale
         // "too expensive" — which surfaced the class of silent-divergence bug a partition
-        // test exposed. Now with typed-scodec MPT, the cost is no different from what we'd
-        // pay on disk-load StateProofValidator, and silent divergence is not acceptable.
-        _ <- Async[F]
-          .raiseError[Unit](
+        // test exposed. Now with typed-scodec MPT the cost is tolerable, and silent
+        // divergence is not acceptable.
+        _ <- {
+          val mismatch = computedStateProof.mptRoot =!= signedArtifact.stateProof.mptRoot
+          val restore = preAcceptSavepoint.restore
+          val raise = Async[F].raiseError[Unit](
             StateProofMismatch(
               ordinal = signedArtifact.ordinal,
               computed = computedStateProof,
               claimed = signedArtifact.stateProof
             )
           )
-          .whenA(computedStateProof.mptRoot =!= signedArtifact.stateProof.mptRoot)
+          (logger.error(
+            s"StateProofMismatch at ordinal=${signedArtifact.ordinal.show}: " +
+              s"computed.mptRoot=${computedStateProof.mptRoot.map(_.show.take(12)).getOrElse("none")} " +
+              s"claimed.mptRoot=${signedArtifact.stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")} — " +
+              s"rolling back MPT to pre-accept savepoint"
+          ) >> restore >> raise).whenA(mismatch)
+        }
 
       } yield snapshotInfo
     }
