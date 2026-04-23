@@ -178,7 +178,12 @@ object GlobalSnapshotAcceptanceManager {
     withdrawalTimeLimit: EpochProgress,
     mptStore: MptStore[F, GlobalStateKey],
     loggerBundle: LoggerBundle[F],
-    undoJournal: Option[io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal[F]] = None
+    undoJournal: Option[io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal[F]] = None,
+    /** When true, accept() emits adds/removes for the node-collateral-withdrawal expiry index. Requires the same
+      * `Some(withdrawalTimeLimit)` to also be passed to every `syncFromGlobalSnapshotInfo` / `toAllStateKeyValueBytes` in the node's
+      * production paths — otherwise rebuild-path and delta-path mptRoots diverge. Default false until that threading lands.
+      */
+    maintainNodeCollateralWithdrawalExpiryIndex: Boolean = false
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): GlobalSnapshotAcceptanceManager[F] = {
@@ -1165,11 +1170,15 @@ object GlobalSnapshotAcceptanceManager {
               .mapValues(unp => (unp, ordinal))
               .to(SortedMap)
 
-            nodeCollateralWithdrawalExpiryIndexDelta <- computeNodeCollateralWithdrawalExpiryIndexDelta(
-              lastSnapshotContext.nodeCollateralWithdrawals.getOrElse(SortedMap.empty),
-              updatedWithdrawNodeCollateralsCleaned,
-              withdrawalTimeLimit
-            )
+            nodeCollateralWithdrawalExpiryIndexDelta <-
+              if (maintainNodeCollateralWithdrawalExpiryIndex)
+                computeNodeCollateralWithdrawalExpiryIndexDelta(
+                  lastSnapshotContext.nodeCollateralWithdrawals.getOrElse(SortedMap.empty),
+                  updatedWithdrawNodeCollateralsCleaned,
+                  withdrawalTimeLimit
+                )
+              else
+                SystemIndexDelta.empty[NodeCollateralWithdrawalExpiryKey].pure[F]
 
             stateChangesAccumulator = StateChangesAccumulator(
               lastStateChannelSnapshotHashes = sCSnapshotHashes.toSortedMap,
@@ -1310,7 +1319,11 @@ object GlobalSnapshotAcceptanceManager {
                             s"deltaUpserts=${deltaUpserts.size} deltaRemoves=${deltaRemoves.size} " +
                             s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
                         )
-                        _ <- mptStore.syncFromGlobalSnapshotInfo(gsi, ordinal, Some(withdrawalTimeLimit))
+                        _ <- mptStore.syncFromGlobalSnapshotInfo(
+                          gsi,
+                          ordinal,
+                          if (maintainNodeCollateralWithdrawalExpiryIndex) Some(withdrawalTimeLimit) else None
+                        )
                         healedProof <- builder.buildProof(gsi, ordinal)
                         healedRoot = healedProof.mptRoot.map(_.show).getOrElse("none")
                         _ <-
