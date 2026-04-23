@@ -1114,7 +1114,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
     val emptyUnlocks = Map.empty[Address, List[TokenUnlock]]
 
     for {
-      result <- acceptanceManager.acceptTokenLocks(currentEpoch, emptyTokenLocks, emptyTokenLocks, emptyUnlocks)
+      result <- acceptanceManager.acceptTokenLocks(currentEpoch, EpochProgress.MinValue, emptyTokenLocks, emptyTokenLocks, emptyUnlocks)
     } yield expect(result.fullState.isEmpty)
   }
 
@@ -1177,6 +1177,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.acceptTokenLocks(
         currentEpoch,
+        EpochProgress.MinValue,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
@@ -1244,6 +1245,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.acceptTokenLocks(
         currentEpoch,
+        EpochProgress.MinValue,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
@@ -1305,6 +1307,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.acceptTokenLocks(
         currentEpoch,
+        EpochProgress.MinValue,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
@@ -1366,6 +1369,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.acceptTokenLocks(
         currentEpoch,
+        EpochProgress.MinValue,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
@@ -1411,6 +1415,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.acceptTokenLocks(
         currentEpoch,
+        EpochProgress.MinValue,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
@@ -1470,6 +1475,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.acceptTokenLocks(
         currentEpoch,
+        EpochProgress.MinValue,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
@@ -1563,6 +1569,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.acceptTokenLocks(
         currentEpoch,
+        EpochProgress.MinValue,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
@@ -1588,6 +1595,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
     acceptanceManager
       .updateGlobalBalancesByTokenLocks(
         epochProgress,
+        EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
@@ -1627,6 +1635,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
+        EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
@@ -1668,6 +1677,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
+        EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
@@ -1700,6 +1710,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
+        EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
@@ -1741,6 +1752,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
+        EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
@@ -1795,6 +1807,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
+        EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
@@ -1857,6 +1870,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
+        EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
@@ -1901,6 +1915,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
+        EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,
@@ -1937,6 +1952,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
+        EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
         lastActiveGlobalTokenLocks,

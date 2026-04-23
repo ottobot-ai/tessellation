@@ -29,8 +29,8 @@ import weaver.MutableIOSuite
 /** Equivalence harness for phase 2b index-driven NC-withdrawal expiry sweep.
   *
   * NC differs from AllowSpend/TokenLock in two ways:
-  *   1. Expiry predicate is `<=` instead of `<`, so the sweep window is `(prevEpoch, curEpoch]` — fromL = prevEpoch + 1, toL = curEpoch.
-  *   2. The expiry epoch is derived (`createdAt + withdrawalTimeLimit`) rather than stored in the record itself. The index bucket keys
+  *   1. Expiry predicate is `<=` instead of `<`, so the sweep window is `(prevEpoch, curEpoch]` — fromL = prevEpoch + 1, toL = curEpoch. 2.
+  *      The expiry epoch is derived (`createdAt + withdrawalTimeLimit`) rather than stored in the record itself. The index bucket keys
   *      already encode the derived epoch, so `withdrawalTimeLimit` is not a sweep parameter.
   *
   * Test suite uses an explicit `WithdrawalTimeLimit` implicit with a concrete value so the seeding `syncFromGlobalSnapshotInfo` populates
@@ -59,7 +59,12 @@ object NodeCollateralExpirySweepEquivalenceSuite extends MutableIOSuite {
   private def testHash(label: String): Hash =
     Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
 
-  private def mkWithdrawal(source: Address, nodeId: io.constellationnetwork.schema.peer.PeerId, createdAt: EpochProgress, label: String): PendingNodeCollateralWithdrawal = {
+  private def mkWithdrawal(
+    source: Address,
+    nodeId: io.constellationnetwork.schema.peer.PeerId,
+    createdAt: EpochProgress,
+    label: String
+  ): PendingNodeCollateralWithdrawal = {
     val createEvent = UpdateNodeCollateral.Create(
       source = source,
       nodeId = nodeId,

@@ -932,6 +932,7 @@ object GlobalSnapshotAcceptanceManager {
 
             allowSpendAcceptanceResult <- allowSpendStateManager.acceptAllowSpends(
               epochProgress,
+              previousEpochProgress,
               activeAllowSpendsFromCurrencySnapshots,
               globalAllowSpends,
               globalActiveAllowSpends,
@@ -949,6 +950,7 @@ object GlobalSnapshotAcceptanceManager {
 
             allowSpendBalancesResult <- allowSpendStateManager.updateGlobalBalancesByAllowSpends(
               epochProgress,
+              previousEpochProgress,
               updatedBalancesByRewards,
               globalAllowSpends,
               globalActiveAllowSpends
@@ -988,6 +990,7 @@ object GlobalSnapshotAcceptanceManager {
 
             tokenLockAcceptanceResult <- tokenLockStateManager.acceptTokenLocks(
               epochProgress,
+              previousEpochProgress,
               globalTokenLocks,
               globalActiveTokenLocks,
               generatedTokenUnlocks
@@ -1010,6 +1013,7 @@ object GlobalSnapshotAcceptanceManager {
 
             tokenLockBalancesResult <- tokenLockStateManager.updateGlobalBalancesByTokenLocks(
               epochProgress,
+              previousEpochProgress,
               updatedBalancesByAllowSpends,
               globalTokenLocks,
               globalActiveTokenLocks,

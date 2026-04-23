@@ -32,6 +32,7 @@ case class AllowSpendAcceptanceResult(
 trait AllowSpendStateManager[F[_]] {
   def acceptAllowSpends(
     epochProgress: EpochProgress,
+    previousEpochProgress: EpochProgress,
     activeAllowSpendsFromCurrencySnapshots: SortedMap[Address, SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
     globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
     lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
@@ -68,6 +69,7 @@ trait AllowSpendStateManager[F[_]] {
 
   def updateGlobalBalancesByAllowSpends(
     epochProgress: EpochProgress,
+    previousEpochProgress: EpochProgress,
     currentBalances: SortedMap[Address, Balance],
     globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
     lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
@@ -83,6 +85,7 @@ object AllowSpendStateManager {
 
     def acceptAllowSpends(
       epochProgress: EpochProgress,
+      previousEpochProgress: EpochProgress,
       activeAllowSpendsFromCurrencySnapshots: SortedMap[Address, SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
       globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
       lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
@@ -93,116 +96,126 @@ object AllowSpendStateManager {
           .flatMap(_.allowSpendRef)
 
       val lastActiveGlobalAllowSpends = lastActiveAllowSpends.getOrElse(None, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
-      val expiredGlobalAllowSpends = filterExpiredAllowSpends(lastActiveGlobalAllowSpends, epochProgress)
 
-      val unexpiredGlobalAllowSpends = (globalAllowSpends |+| expiredGlobalAllowSpends).foldLeft(lastActiveGlobalAllowSpends) {
-        case (acc, (address, allowSpends)) =>
-          val lastAddressAllowSpends = acc.getOrElse(address, SortedSet.empty[Signed[AllowSpend]])
-          val unexpired = (lastAddressAllowSpends ++ allowSpends).filter(_.lastValidEpochProgress >= epochProgress)
-          acc + (address -> unexpired)
-      }
+      // Phase 2b: route the expiry discovery through the index when shouldUseMptStore=true.
+      // Semantically identical to filterExpiredAllowSpends (proven by AllowSpendExpirySweepEquivalenceSuite)
+      // but touches only addresses with expiring records rather than every address in lastActive.
+      val expiredGlobalAllowSpendsF: F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
+        if (shouldUseMptStore && mptStore.isDefined)
+          findExpiredGlobalAllowSpendsViaIndex(previousEpochProgress, epochProgress, lastActiveGlobalAllowSpends)
+        else
+          filterExpiredAllowSpends(lastActiveGlobalAllowSpends, epochProgress).pure[F]
 
-      val unexpiredGlobalWithoutSpendTransactionsF =
-        unexpiredGlobalAllowSpends.toList.foldLeftM(unexpiredGlobalAllowSpends) {
+      expiredGlobalAllowSpendsF.flatMap { expiredGlobalAllowSpends =>
+        val unexpiredGlobalAllowSpends = (globalAllowSpends |+| expiredGlobalAllowSpends).foldLeft(lastActiveGlobalAllowSpends) {
           case (acc, (address, allowSpends)) =>
-            allowSpends.toList.traverse(_.toHashed).map { hashedAllowSpends =>
-              val validAllowSpends = hashedAllowSpends
-                .filterNot(h => allAcceptedSpendTxnsAllowSpendsRefs.contains(h.hash))
-                .map(_.signed)
-                .to(SortedSet)
-
-              acc + (address -> validAllowSpends)
-            }
+            val lastAddressAllowSpends = acc.getOrElse(address, SortedSet.empty[Signed[AllowSpend]])
+            val unexpired = (lastAddressAllowSpends ++ allowSpends).filter(_.lastValidEpochProgress >= epochProgress)
+            acc + (address -> unexpired)
         }
 
-      def processMetagraphAllowSpends(
-        metagraphId: Address,
-        metagraphAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
-        accAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
-        accDeltas: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
-      ): F[
-        (
-          SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
-          SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
-        )
-      ] = {
-        val lastActiveMetagraphAllowSpends =
-          accAllowSpends.getOrElse(metagraphId.some, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
+        val unexpiredGlobalWithoutSpendTransactionsF =
+          unexpiredGlobalAllowSpends.toList.foldLeftM(unexpiredGlobalAllowSpends) {
+            case (acc, (address, allowSpends)) =>
+              allowSpends.toList.traverse(_.toHashed).map { hashedAllowSpends =>
+                val validAllowSpends = hashedAllowSpends
+                  .filterNot(h => allAcceptedSpendTxnsAllowSpendsRefs.contains(h.hash))
+                  .map(_.signed)
+                  .to(SortedSet)
 
-        metagraphAllowSpends.toList.traverse {
-          case (address, addressAllowSpends) =>
-            val lastAddressAllowSpends = lastActiveMetagraphAllowSpends.getOrElse(address, SortedSet.empty[Signed[AllowSpend]])
-
-            val unexpired = (lastAddressAllowSpends ++ addressAllowSpends)
-              .filter(_.lastValidEpochProgress >= epochProgress)
-
-            val unexpiredWithoutSpendTransactions = unexpired.toList
-              .traverse(_.toHashed)
-              .map { hashedAllowSpends =>
-                hashedAllowSpends.filterNot(h => allAcceptedSpendTxnsAllowSpendsRefs.contains(h.hash))
+                acc + (address -> validAllowSpends)
               }
-              .map(_.map(_.signed).toSortedSet)
-
-            unexpiredWithoutSpendTransactions.map { validAllowSpends =>
-              val hasChanged = lastAddressAllowSpends != validAllowSpends
-              (address, validAllowSpends, hasChanged)
-            }
-        }.map { updatedMetagraphAllowSpends =>
-          val fullStateMap = SortedMap(updatedMetagraphAllowSpends.map { case (addr, spends, _) => addr -> spends }: _*)
-          // Filter out empty sets - those are removals tracked separately in removedKeys
-          val deltasMap = SortedMap(updatedMetagraphAllowSpends.collect {
-            case (addr, spends, true) if spends.nonEmpty => addr -> spends
-          }: _*)
-
-          val updatedFullState = accAllowSpends + (metagraphId.some -> fullStateMap)
-          val updatedDeltas = if (deltasMap.nonEmpty) {
-            accDeltas + (metagraphId.some -> deltasMap)
-          } else {
-            accDeltas
           }
 
-          (updatedFullState, updatedDeltas)
+        def processMetagraphAllowSpends(
+          metagraphId: Address,
+          metagraphAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
+          accAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+          accDeltas: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+        ): F[
+          (
+            SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+            SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+          )
+        ] = {
+          val lastActiveMetagraphAllowSpends =
+            accAllowSpends.getOrElse(metagraphId.some, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
+
+          metagraphAllowSpends.toList.traverse {
+            case (address, addressAllowSpends) =>
+              val lastAddressAllowSpends = lastActiveMetagraphAllowSpends.getOrElse(address, SortedSet.empty[Signed[AllowSpend]])
+
+              val unexpired = (lastAddressAllowSpends ++ addressAllowSpends)
+                .filter(_.lastValidEpochProgress >= epochProgress)
+
+              val unexpiredWithoutSpendTransactions = unexpired.toList
+                .traverse(_.toHashed)
+                .map { hashedAllowSpends =>
+                  hashedAllowSpends.filterNot(h => allAcceptedSpendTxnsAllowSpendsRefs.contains(h.hash))
+                }
+                .map(_.map(_.signed).toSortedSet)
+
+              unexpiredWithoutSpendTransactions.map { validAllowSpends =>
+                val hasChanged = lastAddressAllowSpends != validAllowSpends
+                (address, validAllowSpends, hasChanged)
+              }
+          }.map { updatedMetagraphAllowSpends =>
+            val fullStateMap = SortedMap(updatedMetagraphAllowSpends.map { case (addr, spends, _) => addr -> spends }: _*)
+            // Filter out empty sets - those are removals tracked separately in removedKeys
+            val deltasMap = SortedMap(updatedMetagraphAllowSpends.collect {
+              case (addr, spends, true) if spends.nonEmpty => addr -> spends
+            }: _*)
+
+            val updatedFullState = accAllowSpends + (metagraphId.some -> fullStateMap)
+            val updatedDeltas = if (deltasMap.nonEmpty) {
+              accDeltas + (metagraphId.some -> deltasMap)
+            } else {
+              accDeltas
+            }
+
+            (updatedFullState, updatedDeltas)
+          }
         }
+
+        // Process metagraph allow spends and track deltas
+        val processedMetagraphsF = activeAllowSpendsFromCurrencySnapshots.toList
+          .foldLeft((lastActiveAllowSpends, SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]).pure[F]) {
+            case (accF, (metagraphId, metagraphAllowSpends)) =>
+              for {
+                (accFullState, accDeltas) <- accF
+                (updatedFullState, updatedDeltas) <- processMetagraphAllowSpends(metagraphId, metagraphAllowSpends, accFullState, accDeltas)
+              } yield (updatedFullState, updatedDeltas)
+          }
+
+        for {
+          (updatedCurrencyAllowSpends, currencyDeltas) <- processedMetagraphsF
+          validGlobalAllowSpends <- unexpiredGlobalWithoutSpendTransactionsF
+
+          globalDeltas: SortedMap[Address, SortedSet[Signed[AllowSpend]]] =
+            validGlobalAllowSpends.filter {
+              case (address, allowSpends) =>
+                allowSpends.nonEmpty && !lastActiveGlobalAllowSpends.get(address).contains(allowSpends)
+            }
+
+          fullState =
+            if (validGlobalAllowSpends.nonEmpty) updatedCurrencyAllowSpends + (None -> validGlobalAllowSpends)
+            else updatedCurrencyAllowSpends
+
+          deltas = if (globalDeltas.nonEmpty) currencyDeltas + (None -> globalDeltas) else currencyDeltas
+
+          removedKeys: Set[(Option[Address], Address)] = lastActiveAllowSpends.flatMap {
+            case (metagraphIdOpt, innerMap) =>
+              innerMap.collect {
+                case (address, spends)
+                    if spends.nonEmpty &&
+                      !fullState.get(metagraphIdOpt).flatMap(_.get(address)).exists(_.nonEmpty) =>
+                  (metagraphIdOpt, address)
+              }
+          }.toSet
+
+          expiryIndexDelta <- computeExpiryIndexDelta(lastActiveAllowSpends, fullState)
+        } yield AllowSpendAcceptanceResult(fullState, deltas, removedKeys, expiryIndexDelta)
       }
-
-      // Process metagraph allow spends and track deltas
-      val processedMetagraphsF = activeAllowSpendsFromCurrencySnapshots.toList
-        .foldLeft((lastActiveAllowSpends, SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]).pure[F]) {
-          case (accF, (metagraphId, metagraphAllowSpends)) =>
-            for {
-              (accFullState, accDeltas) <- accF
-              (updatedFullState, updatedDeltas) <- processMetagraphAllowSpends(metagraphId, metagraphAllowSpends, accFullState, accDeltas)
-            } yield (updatedFullState, updatedDeltas)
-        }
-
-      for {
-        (updatedCurrencyAllowSpends, currencyDeltas) <- processedMetagraphsF
-        validGlobalAllowSpends <- unexpiredGlobalWithoutSpendTransactionsF
-
-        globalDeltas: SortedMap[Address, SortedSet[Signed[AllowSpend]]] =
-          validGlobalAllowSpends.filter {
-            case (address, allowSpends) =>
-              allowSpends.nonEmpty && !lastActiveGlobalAllowSpends.get(address).contains(allowSpends)
-          }
-
-        fullState =
-          if (validGlobalAllowSpends.nonEmpty) updatedCurrencyAllowSpends + (None -> validGlobalAllowSpends)
-          else updatedCurrencyAllowSpends
-
-        deltas = if (globalDeltas.nonEmpty) currencyDeltas + (None -> globalDeltas) else currencyDeltas
-
-        removedKeys: Set[(Option[Address], Address)] = lastActiveAllowSpends.flatMap {
-          case (metagraphIdOpt, innerMap) =>
-            innerMap.collect {
-              case (address, spends)
-                  if spends.nonEmpty &&
-                    !fullState.get(metagraphIdOpt).flatMap(_.get(address)).exists(_.nonEmpty) =>
-                (metagraphIdOpt, address)
-            }
-        }.toSet
-
-        expiryIndexDelta <- computeExpiryIndexDelta(lastActiveAllowSpends, fullState)
-      } yield AllowSpendAcceptanceResult(fullState, deltas, removedKeys, expiryIndexDelta)
     }
 
     /** Compute the `SystemIndexDelta[AllowSpendExpiryKey]` by diffing the per-`(mid, addr)` sets of `Signed[AllowSpend]` in `before` vs
@@ -307,50 +320,59 @@ object AllowSpendStateManager {
 
     def updateGlobalBalancesByAllowSpends(
       epochProgress: EpochProgress,
+      previousEpochProgress: EpochProgress,
       currentBalances: SortedMap[Address, Balance],
       globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
       lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
     )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] = {
       val lastActiveGlobalAllowSpends = lastActiveAllowSpends.getOrElse(None, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
-      val expiredGlobalAllowSpends = filterExpiredAllowSpends(lastActiveGlobalAllowSpends, epochProgress)
 
-      (globalAllowSpends |+| expiredGlobalAllowSpends).toList
-        .foldM[F, Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
-          Right((currentBalances, SortedMap.empty[Address, Balance]))
-        ) {
-          case (Left(err), _) =>
-            (Left(err): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]).pure[F]
-          case (Right((balances, balancesDelta)), (address, allowSpends)) =>
-            readBalance(address, balances).map { initialBalance =>
-              val unexpiredBalance: Either[BalanceArithmeticError, Balance] = {
-                val unexpired = allowSpends.filter(_.lastValidEpochProgress >= epochProgress)
-                unexpired.foldLeft[Either[BalanceArithmeticError, Balance]](Right(initialBalance)) { (currentBalanceEither, allowSpend) =>
-                  for {
-                    currentBalance <- currentBalanceEither
-                    balanceAfterAmount <- currentBalance.minus(SwapAmount.toAmount(allowSpend.amount))
-                    balanceAfterFee <- balanceAfterAmount.minus(AllowSpendFee.toAmount(allowSpend.fee))
-                  } yield balanceAfterFee
-                }
-              }
+      // Same dual-path as acceptAllowSpends: index sweep under the flag, legacy filter otherwise.
+      val expiredGlobalAllowSpendsF: F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
+        if (shouldUseMptStore && mptStore.isDefined)
+          findExpiredGlobalAllowSpendsViaIndex(previousEpochProgress, epochProgress, lastActiveGlobalAllowSpends)
+        else
+          filterExpiredAllowSpends(lastActiveGlobalAllowSpends, epochProgress).pure[F]
 
-              for {
-                unexpired <- unexpiredBalance
-                expired <- {
-                  val expiredSet = allowSpends.filter(_.lastValidEpochProgress < epochProgress)
-                  expiredSet.foldLeft[Either[BalanceArithmeticError, Balance]](Right(unexpired)) { (currentBalanceEither, allowSpend) =>
+      expiredGlobalAllowSpendsF.flatMap { expiredGlobalAllowSpends =>
+        (globalAllowSpends |+| expiredGlobalAllowSpends).toList
+          .foldM[F, Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
+            Right((currentBalances, SortedMap.empty[Address, Balance]))
+          ) {
+            case (Left(err), _) =>
+              (Left(err): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]).pure[F]
+            case (Right((balances, balancesDelta)), (address, allowSpends)) =>
+              readBalance(address, balances).map { initialBalance =>
+                val unexpiredBalance: Either[BalanceArithmeticError, Balance] = {
+                  val unexpired = allowSpends.filter(_.lastValidEpochProgress >= epochProgress)
+                  unexpired.foldLeft[Either[BalanceArithmeticError, Balance]](Right(initialBalance)) { (currentBalanceEither, allowSpend) =>
                     for {
                       currentBalance <- currentBalanceEither
-                      balanceAfterExpiredAmount <- currentBalance.plus(SwapAmount.toAmount(allowSpend.amount))
-                    } yield balanceAfterExpiredAmount
+                      balanceAfterAmount <- currentBalance.minus(SwapAmount.toAmount(allowSpend.amount))
+                      balanceAfterFee <- balanceAfterAmount.minus(AllowSpendFee.toAmount(allowSpend.fee))
+                    } yield balanceAfterFee
                   }
                 }
-              } yield
-                (
-                  balances.updated(address, expired),
-                  balancesDelta.updated(address, expired)
-                )
-            }
-        }
+
+                for {
+                  unexpired <- unexpiredBalance
+                  expired <- {
+                    val expiredSet = allowSpends.filter(_.lastValidEpochProgress < epochProgress)
+                    expiredSet.foldLeft[Either[BalanceArithmeticError, Balance]](Right(unexpired)) { (currentBalanceEither, allowSpend) =>
+                      for {
+                        currentBalance <- currentBalanceEither
+                        balanceAfterExpiredAmount <- currentBalance.plus(SwapAmount.toAmount(allowSpend.amount))
+                      } yield balanceAfterExpiredAmount
+                    }
+                  }
+                } yield
+                  (
+                    balances.updated(address, expired),
+                    balancesDelta.updated(address, expired)
+                  )
+              }
+          }
+      }
     }
 
     private def readBalance(
