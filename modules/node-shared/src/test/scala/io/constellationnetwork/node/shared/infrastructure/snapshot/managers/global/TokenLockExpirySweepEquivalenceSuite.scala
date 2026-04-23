@@ -277,4 +277,122 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
       indexPairs <- toAddressHashPairs(indexExpired)
     } yield expect.all(legacyPairs == indexPairs, legacyPairs.size == 3)
   }
+
+  // ==========================================================================================
+  // #85 parity tests — legacy path (takes `lastActive` map) vs MPT-backed path (point reads).
+  // Both should produce identical `TokenLockAcceptanceResult` under the phase-2a invariant
+  // (MPT seeded with the same state the caller has in `lastActive`).
+  // ==========================================================================================
+
+  test("#85 parity: acceptTokenLocks legacy vs MPT-backed yield identical TokenLockAcceptanceResult (mixed)") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp1 <- KeyPairGenerator.makeKeyPair[IO]
+      kp2 <- KeyPairGenerator.makeKeyPair[IO]
+      addr1 = kp1.getPublic.toAddress
+      addr2 = kp2.getPublic.toAddress
+
+      tlExpiredA = mkTokenLock(addr1, Some(EpochProgress(NonNegLong(100L))), "expiredA")
+      tlValidA = mkTokenLock(addr1, Some(EpochProgress(NonNegLong(500L))), "validA")
+      tlValidB = mkTokenLock(addr2, Some(EpochProgress(NonNegLong(800L))), "validB")
+
+      lastActive = SortedMap(
+        addr1 -> SortedSet(tlExpiredA, tlValidA),
+        addr2 -> SortedSet(tlValidB)
+      )
+
+      // Two independent stores, both seeded with the same lastActive
+      storeLegacy <- mkSeededMptStore(lastActive)
+      storeMpt <- mkSeededMptStore(lastActive)
+      mgrLegacy = TokenLockStateManager.make[IO](storeLegacy, shouldUseMptStore = true, useMptBackedAcceptPath = false)
+      mgrMpt = TokenLockStateManager.make[IO](storeMpt, shouldUseMptStore = true, useMptBackedAcceptPath = true)
+
+      currentEpoch = EpochProgress(NonNegLong(300L))
+      prevEpoch = EpochProgress.MinValue
+      accepted = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
+      unlocks = Map.empty[Address, List[io.constellationnetwork.schema.artifact.TokenUnlock]]
+
+      resLegacy <- mgrLegacy.acceptTokenLocks(currentEpoch, prevEpoch, accepted, lastActive, unlocks)
+      resMpt <- mgrMpt.acceptTokenLocks(currentEpoch, prevEpoch, accepted, lastActive, unlocks)
+    } yield
+      expect.all(
+        resLegacy.fullState == resMpt.fullState,
+        resLegacy.deltas == resMpt.deltas,
+        resLegacy.removedKeys == resMpt.removedKeys,
+        resLegacy.expiryIndexDelta == resMpt.expiryIndexDelta
+      )
+  }
+
+  test("#85 parity: acceptTokenLocks legacy vs MPT-backed — TokenUnlock application on unlock-only addresses") { res =>
+    implicit val (h, sp, js) = res
+    // The unlock-only-addresses bug (fixed in f76b0d40) is sensitive to iteration-shape differences. This test
+    // exercises the exact failure case: a non-expiring lock that must be removed via a generated TokenUnlock.
+    for {
+      kp1 <- KeyPairGenerator.makeKeyPair[IO]
+      addr1 = kp1.getPublic.toAddress
+
+      tlPermanent = mkTokenLock(addr1, None, "permanent")
+      lastActive = SortedMap(addr1 -> SortedSet(tlPermanent))
+
+      hashedPermanent <- tlPermanent.toHashed
+      tokenUnlock = io.constellationnetwork.schema.artifact.TokenUnlock(
+        tokenLockRef = hashedPermanent.hash,
+        amount = io.constellationnetwork.schema.tokenLock.TokenLockAmount(PosLong(100L)),
+        source = addr1,
+        currencyId = None
+      )
+      unlocks = Map(addr1 -> List(tokenUnlock))
+
+      storeLegacy <- mkSeededMptStore(lastActive)
+      storeMpt <- mkSeededMptStore(lastActive)
+      mgrLegacy = TokenLockStateManager.make[IO](storeLegacy, shouldUseMptStore = true, useMptBackedAcceptPath = false)
+      mgrMpt = TokenLockStateManager.make[IO](storeMpt, shouldUseMptStore = true, useMptBackedAcceptPath = true)
+
+      currentEpoch = EpochProgress(NonNegLong(300L))
+      prevEpoch = EpochProgress.MinValue
+      accepted = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
+
+      resLegacy <- mgrLegacy.acceptTokenLocks(currentEpoch, prevEpoch, accepted, lastActive, unlocks)
+      resMpt <- mgrMpt.acceptTokenLocks(currentEpoch, prevEpoch, accepted, lastActive, unlocks)
+    } yield
+      expect.all(
+        resLegacy.fullState == resMpt.fullState,
+        resLegacy.removedKeys == resMpt.removedKeys,
+        !resMpt.fullState.contains(addr1),
+        resMpt.removedKeys.contains(addr1)
+      )
+  }
+
+  test("#85 parity: updateGlobalBalancesByTokenLocks legacy vs MPT-backed") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp1 <- KeyPairGenerator.makeKeyPair[IO]
+      kp2 <- KeyPairGenerator.makeKeyPair[IO]
+      addr1 = kp1.getPublic.toAddress
+      addr2 = kp2.getPublic.toAddress
+
+      tlExpired = mkTokenLock(addr1, Some(EpochProgress(NonNegLong(100L))), "expired")
+      tlValid = mkTokenLock(addr2, Some(EpochProgress(NonNegLong(800L))), "valid")
+      lastActive = SortedMap(addr1 -> SortedSet(tlExpired), addr2 -> SortedSet(tlValid))
+
+      storeLegacy <- mkSeededMptStore(lastActive)
+      storeMpt <- mkSeededMptStore(lastActive)
+      mgrLegacy = TokenLockStateManager.make[IO](storeLegacy, shouldUseMptStore = true, useMptBackedAcceptPath = false)
+      mgrMpt = TokenLockStateManager.make[IO](storeMpt, shouldUseMptStore = true, useMptBackedAcceptPath = true)
+
+      currentBalances = SortedMap.empty[Address, io.constellationnetwork.schema.balance.Balance]
+      currentEpoch = EpochProgress(NonNegLong(300L))
+      prevEpoch = EpochProgress.MinValue
+      accepted = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
+      unlocks = Map.empty[Address, List[io.constellationnetwork.schema.artifact.TokenUnlock]]
+
+      resLegacyE <- mgrLegacy.updateGlobalBalancesByTokenLocks(currentEpoch, prevEpoch, currentBalances, accepted, lastActive, unlocks)
+      resMptE <- mgrMpt.updateGlobalBalancesByTokenLocks(currentEpoch, prevEpoch, currentBalances, accepted, lastActive, unlocks)
+    } yield
+      expect.all(
+        resLegacyE.isRight,
+        resMptE.isRight,
+        resLegacyE == resMptE
+      )
+  }
 }
