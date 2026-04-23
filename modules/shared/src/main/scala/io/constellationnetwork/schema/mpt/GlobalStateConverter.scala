@@ -445,6 +445,18 @@ object GlobalStateConverter {
     }
   }
 
+  /** Hex-keyed delta derived from a `StateChangesAccumulator` — pairs well with `MptStore.allEntriesAsBytes` (which is `Map[Hex,
+    * Array[Byte]]`) for independent state-replay verification: `expected = (prevBytes -- removes) ++ upserts`.
+    */
+  def toAccumulatorHexDelta[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    acc: StateChangesAccumulator
+  )(implicit stateProofSelector: StateProofSelector): F[(Map[Hex, Array[Byte]], Set[Hex])] =
+    for {
+      typedUpserts <- toAccumulatorBytesDelta[F](acc)
+      upsertsHex <- typedUpserts.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }.map(_.toMap)
+      removalsHex <- toAccumulatorRemovalKeys(acc).toList.parTraverse(GlobalStateKey.toHex[F]).map(_.toSet)
+    } yield (upsertsHex, removalsHex)
+
   /** Removal keys derived from a `StateChangesAccumulator` — the delete half of `store.update(upserts, removes)` under MPT-as-primary.
     */
   def toAccumulatorRemovalKeys(acc: StateChangesAccumulator): Set[GlobalStateKey] = {

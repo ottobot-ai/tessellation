@@ -1167,6 +1167,12 @@ object GlobalSnapshotAcceptanceManager {
               case None =>
                 Async[F].unit
             }
+            // Snapshot the pre-sync MPT bytes. Used below for independent cross-check: apply the
+            // accumulator's delta to this map via the `toAccumulatorHexDelta` helper (a separate
+            // encoder+merge path from `syncFromStateChanges`) and build an MPT via the Parallel
+            // producer. If both paths agree on the post-state root, the writer is validated
+            // without needing `GlobalSnapshotInfo` as an intermediate.
+            preSyncBytes <- mptStore.allEntriesAsBytes
             syncAction = mptStore.syncFromStateChanges(stateChangesAccumulator, ordinal)
             _ <- undoJournal match {
               case Some(journal) =>
@@ -1180,10 +1186,9 @@ object GlobalSnapshotAcceptanceManager {
             }
             incrementalProof <- builder.buildProof(gsi, ordinal)
 
-            // Verify incremental vs full-rebuild for correctness — only applies when MPT is the
-            // active proof format. For LegacyFormat ordinals the "mptRoot" field is absent on the
-            // builder proof; any mismatch vs `mptStateProof` is expected and must not trigger a
-            // resync (which would needlessly thrash the MPT state).
+            // Verify incremental (FileSystem producer incremental-insert) against independent
+            // replay (Parallel producer batch build over `prev ⊖ removes ⊕ upserts`). Only
+            // applies when MPT is the active proof format; LegacyFormat proofs carry no mptRoot.
             isMptFormat = globalStateProofSelector.select(ordinal) == MerklePatriciaFormat
             incrementalRoot = incrementalProof.mptRoot.map(_.show).getOrElse("none")
 
@@ -1197,8 +1202,16 @@ object GlobalSnapshotAcceptanceManager {
                   .as(incrementalProof)
               } else {
                 for {
-                  verifyProof <- GlobalSnapshotInfo.mptStateProof[F](gsi)
-                  verifyRoot = verifyProof.mptRoot.map(_.show).getOrElse("none")
+                  // Independent byte derivation: take pre-sync bytes, apply the accumulator's
+                  // upserts + removes via `toAccumulatorHexDelta` (scodec per-field encoding,
+                  // no `GlobalSnapshotInfo` involved). This is the MPT-as-primary verify path.
+                  deltaPair <- io.constellationnetwork.schema.mpt.GlobalStateConverter
+                    .toAccumulatorHexDelta[F](stateChangesAccumulator)
+                  (deltaUpserts, deltaRemoves) = deltaPair
+                  expectedBytes = (preSyncBytes -- deltaRemoves) ++ deltaUpserts
+                  verifyTrie <- io.constellationnetwork.security.mpt.MerklePatriciaTrie
+                    .makeParallelFromBytes[F](expectedBytes)
+                  verifyRoot = verifyTrie.rootHash.value.show
                   result <-
                     if (incrementalRoot == verifyRoot) {
                       loggerBundle.app
@@ -1209,14 +1222,16 @@ object GlobalSnapshotAcceptanceManager {
                         )
                         .as(incrementalProof)
                     } else {
-                      // Fork switch detected — stateRef is polluted from abandoned branch.
-                      // Typed-scodec resync from GSI — matches the encoding of `syncFromStateChanges`
-                      // and the `mptStateProof` bytes path.
+                      // Writer divergence — `syncFromStateChanges` produced bytes that don't
+                      // match the expected `prev ⊖ removes ⊕ upserts` replay. Resync from GSI
+                      // as the emergency safety net (gsi materialization is still here until
+                      // consumer-migration deletes it). Flag loudly: this is a writer bug.
                       for {
-                        _ <- loggerBundle.app.warn(
+                        _ <- loggerBundle.app.error(
                           s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptConsistency=DIVERGED " +
-                            s"incremental=${incrementalRoot.take(12)} rebuild=${verifyRoot.take(12)} " +
-                            s"ACTION=typed_resync " +
+                            s"incremental=${incrementalRoot.take(12)} replay=${verifyRoot.take(12)} " +
+                            s"ACTION=gsi_resync entries=${expectedBytes.size} " +
+                            s"deltaUpserts=${deltaUpserts.size} deltaRemoves=${deltaRemoves.size} " +
                             s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
                         )
                         _ <- mptStore.syncFromGlobalSnapshotInfo(gsi, ordinal)
@@ -1234,7 +1249,7 @@ object GlobalSnapshotAcceptanceManager {
                             )
                         // Also reset journal state after full resync
                         _ <- undoJournal.traverse_(_.pruneBelow(ordinal.value.value))
-                      } yield verifyProof
+                      } yield healedProof
                     }
                 } yield result
               }
