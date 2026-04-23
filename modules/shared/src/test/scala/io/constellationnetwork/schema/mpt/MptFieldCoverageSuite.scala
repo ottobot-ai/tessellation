@@ -18,13 +18,17 @@ import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.node._
 import io.constellationnetwork.schema.priceOracle._
 import io.constellationnetwork.schema.swap._
+import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.{Signed, signature}
-import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.allowSpendExpiryKeySetImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{
+  allowSpendExpiryKeySetImmutableCodec,
+  tokenLockExpiryKeySetImmutableCodec
+}
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.{NonNegLong, PosInt, PosLong}
@@ -200,6 +204,78 @@ object MptFieldCoverageSuite extends MutableIOSuite {
         bucketA == bucketB,
         bucketA.contains(SortedSet(expectedKey))
       )
+  }
+
+  test("token-lock expiry index: delta path and rebuild path produce equal mptRoot with records present") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      source = kp.getPublic.toAddress
+      unlockEpoch = EpochProgress(NonNegLong(400L))
+      tl = TokenLock(
+        source = source,
+        amount = TokenLockAmount(PosLong(200L)),
+        fee = TokenLockFee(NonNegLong(0L)),
+        parent = TokenLockReference(TokenLockOrdinal(NonNegLong(0L)), testHash("tl-parent")),
+        currencyId = None,
+        unlockEpoch = Some(unlockEpoch),
+        replaceTokenLockRef = None
+      )
+      signedTl = Signed(tl, testProofs)
+      hashed <- signedTl.toHashed
+      expectedKey = TokenLockExpiryKey(source, hashed.hash)
+
+      info = GlobalSnapshotInfo.empty.copy(
+        activeTokenLocks = SortedMap(source -> SortedSet(signedTl)).some
+      )
+      storeB <- mkEmptyMptStore
+      _ <- storeB.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(1L)))
+      rootB <- storeB.underlying.getRootHashForOrdinal(SnapshotOrdinal(NonNegLong(1L)))
+      bucketB <- storeB.getExpiryBucket[TokenLockExpiryKey](SystemNamespaceLabel.ExpiryIndexTokenLocks, unlockEpoch)
+
+      storeA <- mkEmptyMptStore
+      acc = StateChangesAccumulator(
+        activeTokenLocks = SortedMap(source -> SortedSet(signedTl)),
+        tokenLockExpiryIndex = SystemIndexDelta.EpochBucket[TokenLockExpiryKey](
+          adds = SortedMap(unlockEpoch -> Set(expectedKey))
+        )
+      )
+      _ <- storeA.syncFromStateChanges(acc, SnapshotOrdinal(NonNegLong(1L)))
+      rootA <- storeA.underlying.getRootHashForOrdinal(SnapshotOrdinal(NonNegLong(1L)))
+      bucketA <- storeA.getExpiryBucket[TokenLockExpiryKey](SystemNamespaceLabel.ExpiryIndexTokenLocks, unlockEpoch)
+    } yield
+      expect.all(
+        rootA.isDefined,
+        rootB.isDefined,
+        rootA == rootB,
+        bucketA == bucketB,
+        bucketA.contains(SortedSet(expectedKey))
+      )
+  }
+
+  test("token-lock without unlockEpoch is NOT indexed (never expires)") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      source = kp.getPublic.toAddress
+      tl = TokenLock(
+        source = source,
+        amount = TokenLockAmount(PosLong(100L)),
+        fee = TokenLockFee(NonNegLong(0L)),
+        parent = TokenLockReference(TokenLockOrdinal(NonNegLong(0L)), testHash("tl-noexpire")),
+        currencyId = None,
+        unlockEpoch = None,
+        replaceTokenLockRef = None
+      )
+      signedTl = Signed(tl, testProofs)
+
+      info = GlobalSnapshotInfo.empty.copy(activeTokenLocks = SortedMap(source -> SortedSet(signedTl)).some)
+      store <- mkEmptyMptStore
+      _ <- store.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(1L)))
+      // Probe a few plausible epochs — none should have a bucket.
+      b1 <- store.getExpiryBucket[TokenLockExpiryKey](SystemNamespaceLabel.ExpiryIndexTokenLocks, EpochProgress(NonNegLong(0L)))
+      b2 <- store.getExpiryBucket[TokenLockExpiryKey](SystemNamespaceLabel.ExpiryIndexTokenLocks, EpochProgress(NonNegLong(1000L)))
+    } yield expect.all(b1.isEmpty, b2.isEmpty)
   }
 
   test("mptRoot from stateChanges matches mptRoot rebuilt from the resulting GSI (no field drift)") { res =>

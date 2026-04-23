@@ -13,7 +13,7 @@ import io.constellationnetwork.schema.balance.{Balance, BalanceArithmeticError}
 import io.constellationnetwork.schema.delegatedStake.PendingDelegatedStakeWithdrawal
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
@@ -25,7 +25,11 @@ import eu.timepit.refined.types.numeric.NonNegLong
 case class TokenLockAcceptanceResult(
   fullState: SortedMap[Address, SortedSet[Signed[TokenLock]]],
   deltas: SortedMap[Address, SortedSet[Signed[TokenLock]]],
-  removedKeys: Set[Address] = Set.empty
+  removedKeys: Set[Address] = Set.empty,
+  /** Expiry-index delta: adds for records newly entering active (with `unlockEpoch.isDefined`), removes for records leaving active. Records
+    * with `unlockEpoch = None` never expire and aren't indexed.
+    */
+  expiryIndexDelta: SystemIndexDelta[TokenLockExpiryKey] = SystemIndexDelta.empty[TokenLockExpiryKey]
 )
 
 /** Result of token lock balance update containing full state, deltas, and removed keys */
@@ -113,7 +117,7 @@ object TokenLockStateManager {
                   (newAcc, newDeltas)
                 }
           }
-          .map {
+          .flatMap {
             case (fullState, deltas) =>
               val cleanedFullState = fullState.filterNot(_._2.isEmpty)
               val cleanedDeltas = deltas.filterNot(_._2.isEmpty)
@@ -124,7 +128,48 @@ object TokenLockStateManager {
                   address
               }.toSet
 
-              TokenLockAcceptanceResult(cleanedFullState, cleanedDeltas, removedKeys)
+              computeTokenLockExpiryIndexDelta(lastActiveGlobalTokenLocks, cleanedFullState).map { indexDelta =>
+                TokenLockAcceptanceResult(cleanedFullState, cleanedDeltas, removedKeys, indexDelta)
+              }
+          }
+      }
+
+      /** Diff `before` vs `after` per-address; records with `unlockEpoch.isDefined` contribute to the index. Records with `None` unlock
+        * aren't indexed (they never expire).
+        */
+      private def computeTokenLockExpiryIndexDelta(
+        before: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+        after: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+      )(implicit hasher: Hasher[F]): F[SystemIndexDelta[TokenLockExpiryKey]] = {
+        val pairAddresses: Set[Address] = before.keySet ++ after.keySet
+
+        def hashIndexable(addr: Address, locks: SortedSet[Signed[TokenLock]]): F[List[(EpochProgress, TokenLockExpiryKey)]] =
+          locks.toList.mapFilter(l => l.unlockEpoch.map(e => (e, l))).traverse {
+            case (epoch, l) => l.toHashed.map(h => (epoch, TokenLockExpiryKey(addr, h.hash)))
+          }
+
+        type Entries = List[(EpochProgress, TokenLockExpiryKey)]
+        val empty: (Entries, Entries) = (List.empty, List.empty)
+
+        pairAddresses.toList
+          .foldLeftM[F, (Entries, Entries)](empty) {
+            case ((accAdds, accRemoves), addr) =>
+              val oldSet = before.getOrElse(addr, SortedSet.empty[Signed[TokenLock]])
+              val newSet = after.getOrElse(addr, SortedSet.empty[Signed[TokenLock]])
+              val added = newSet.diff(oldSet)
+              val removed = oldSet.diff(newSet)
+              for {
+                addedEntries <- hashIndexable(addr, added)
+                removedEntries <- hashIndexable(addr, removed)
+              } yield (accAdds ++ addedEntries, accRemoves ++ removedEntries)
+          }
+          .map {
+            case (adds, removes) =>
+              val addsMap: SortedMap[EpochProgress, Set[TokenLockExpiryKey]] =
+                adds.groupMap(_._1)(_._2).view.mapValues(_.toSet).to(SortedMap)
+              val removesMap: SortedMap[EpochProgress, Set[TokenLockExpiryKey]] =
+                removes.groupMap(_._1)(_._2).view.mapValues(_.toSet).to(SortedMap)
+              SystemIndexDelta.EpochBucket[TokenLockExpiryKey](addsMap, removesMap)
           }
       }
 

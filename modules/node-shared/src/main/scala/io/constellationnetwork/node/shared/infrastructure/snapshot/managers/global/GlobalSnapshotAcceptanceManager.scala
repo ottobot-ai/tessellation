@@ -928,13 +928,16 @@ object GlobalSnapshotAcceptanceManager {
               .leftMap(error => new RuntimeException(s"Error generating token unlocks: $error"))
               .liftTo[F]
 
-            TokenLockAcceptanceResult(updatedGlobalTokenLocks, tokenLocksDeltas, removedTokenLockKeys) <- tokenLockStateManager
-              .acceptTokenLocks(
-                epochProgress,
-                globalTokenLocks,
-                globalActiveTokenLocks,
-                generatedTokenUnlocks
-              )
+            tokenLockAcceptanceResult <- tokenLockStateManager.acceptTokenLocks(
+              epochProgress,
+              globalTokenLocks,
+              globalActiveTokenLocks,
+              generatedTokenUnlocks
+            )
+            updatedGlobalTokenLocks = tokenLockAcceptanceResult.fullState
+            tokenLocksDeltas = tokenLockAcceptanceResult.deltas
+            removedTokenLockKeys = tokenLockAcceptanceResult.removedKeys
+            tokenLockExpiryIndexDelta = tokenLockAcceptanceResult.expiryIndexDelta
 
             updatedTokenLockRefs = tokenLockStateManager.acceptTokenLockRefs(
               globalLastTokenLockRefs,
@@ -1142,6 +1145,7 @@ object GlobalSnapshotAcceptanceManager {
               updateNodeParameters = updateNodeParametersDelta,
               priceState = priceStateDeltas,
               allowSpendExpiryIndex = allowSpendExpiryIndexDelta,
+              tokenLockExpiryIndex = tokenLockExpiryIndexDelta,
               removedAllowSpendKeys = removedAllowSpendKeys,
               removedTokenLockKeys = removedTokenLockKeys,
               removedTokenLockBalanceKeys = removedTokenLockBalanceKeys,
