@@ -220,23 +220,26 @@ const handleBatchTransactions = async (
     const expectedOriginBalance = startOriginBalance + expectedOriginDelta
     const expectedDestBalance = startDestBalance + expectedDestDelta
 
-    logMessage(`Polling for balance change (timeout ${SLEEP_TIME_UNTIL_QUERY}ms)...`)
+    // Poll until expected balances are reached OR deadline hits.
+    // The previous version broke on FIRST balance change — for batch-of-100 tests this exited
+    // after 1 tx settled and then asserted the full 100-tx expected balance → spurious failure.
+    logMessage(`Polling for balance settlement (timeout ${SLEEP_TIME_UNTIL_QUERY}ms, expect ${expectedOriginDelta}/${expectedDestDelta} delta)...`)
     const pollInterval = 5000
-    const deadline = Date.now() + SLEEP_TIME_UNTIL_QUERY
-    let originBalance, destinationBalance
+    const startTime = Date.now()
+    const deadline = startTime + SLEEP_TIME_UNTIL_QUERY
+    let originBalance = startOriginBalance
+    let destinationBalance = startDestBalance
     while (Date.now() < deadline) {
       await sleep(pollInterval)
       originBalance = await origin.getBalance()
       destinationBalance = await destination.getBalance()
-      if (originBalance !== startOriginBalance || destinationBalance !== startDestBalance) {
-        logMessage(`Balance changed after ${Math.round((Date.now() - (deadline - SLEEP_TIME_UNTIL_QUERY)) / 1000)}s`)
+      if (originBalance === expectedOriginBalance && destinationBalance === expectedDestBalance) {
+        logMessage(`Balance settled after ${Math.round((Date.now() - startTime) / 1000)}s`)
         break
       }
     }
-    if (originBalance === startOriginBalance && destinationBalance === startDestBalance) {
-      logMessage(`Balance unchanged after ${SLEEP_TIME_UNTIL_QUERY / 1000}s — falling back to final check`)
-      originBalance = await origin.getBalance()
-      destinationBalance = await destination.getBalance()
+    if (originBalance !== expectedOriginBalance || destinationBalance !== expectedDestBalance) {
+      logMessage(`Balance did not fully settle after ${SLEEP_TIME_UNTIL_QUERY / 1000}s — origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance} (falling through to final check)`)
     }
 
     return { originBalance, destinationBalance }
@@ -297,19 +300,29 @@ const handleMetagraphBatchTransactions = async (
 
     const startOriginBalance = await metagraphTokenClient.getBalance()
     const startDestBalance = await metagraphTokenClient.getBalanceFor(destination.address)
+    const expectedOriginDelta = -(amount + fee) * txnCount
+    const expectedDestDelta = amount * txnCount
+    const expectedOriginBalance = startOriginBalance + expectedOriginDelta
+    const expectedDestBalance = startDestBalance + expectedDestDelta
 
-    logMessage(`Polling for L0 token balance change (timeout ${SLEEP_TIME_UNTIL_QUERY}ms)...`)
+    // Poll until expected settlement OR deadline. See handleBatchTransactions for rationale —
+    // previously exited on FIRST change, which under batch workloads caused partial-settle asserts.
+    logMessage(`Polling for L0 token balance settlement (timeout ${SLEEP_TIME_UNTIL_QUERY}ms, expect ${expectedOriginDelta}/${expectedDestDelta} delta)...`)
     const pollInterval = 5000
-    const deadline = Date.now() + SLEEP_TIME_UNTIL_QUERY
+    const startTime = Date.now()
+    const deadline = startTime + SLEEP_TIME_UNTIL_QUERY
     let originBalance = startOriginBalance, destinationBalance = startDestBalance
     while (Date.now() < deadline) {
       await sleep(pollInterval)
       originBalance = await metagraphTokenClient.getBalance()
       destinationBalance = await metagraphTokenClient.getBalanceFor(destination.address)
-      if (originBalance !== startOriginBalance || destinationBalance !== startDestBalance) {
-        logMessage(`L0 token balance changed after ${Math.round((Date.now() - (deadline - SLEEP_TIME_UNTIL_QUERY)) / 1000)}s`)
+      if (originBalance === expectedOriginBalance && destinationBalance === expectedDestBalance) {
+        logMessage(`L0 token balance settled after ${Math.round((Date.now() - startTime) / 1000)}s`)
         break
       }
+    }
+    if (originBalance !== expectedOriginBalance || destinationBalance !== expectedDestBalance) {
+      logMessage(`L0 token balance did not fully settle after ${SLEEP_TIME_UNTIL_QUERY / 1000}s — origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance} (falling through to final check)`)
     }
 
     // Wait for CL1 to process the snapshot containing this transfer before

@@ -138,7 +138,22 @@ object CurrencySnapshotProcessor {
                     }
 
                   case Validator.NotNext =>
-                    Applicative[F].pure(SnapshotIgnored(globalSnapshotReference))
+                    // Parent-hash mismatch between our stored last snapshot and the incoming one.
+                    // Either we downloaded during a transient fork window and our local head is now
+                    // orphaned (chain reorg'd to a different hash at that ordinal), or we've fallen
+                    // far enough behind that intermediates are missing. Clear our last snapshot
+                    // state so the next `pullGlobalSnapshots` call sees no stored ordinal and falls
+                    // into the bootstrap (Left) branch, rebootstrapping from the canonical head.
+                    // Without this, cl1 would SnapshotIgnored every subsequent snapshot forever
+                    // (observed: cl1 stranded at ord 56 while gl0 reached ord 161+). Also sets the
+                    // redownload flag for observability / TooFarEpochProgress path consistency.
+                    val reason =
+                      s"Parent-hash mismatch at incoming ord=${globalSnapshotReference.ordinal.show}: stored last ord=${lastGlobalSnapshot.ordinal.show} hash=${lastGlobalSnapshot.hash.value
+                          .take(12)} but incoming.lastSnapshotHash=${globalSnapshot.signed.value.lastSnapshotHash.value.take(12)}. Clearing state + forcing redownload."
+                    globalL0AlignmentStorage.updateShouldRedownload(value = true, reasons = List(reason)) >>
+                      lastGlobalSnapshotStorage.clear >>
+                      lastNGlobalSnapshotStorage.clear
+                        .as[SnapshotProcessingResult](SnapshotIgnored(globalSnapshotReference))
                 }
               case None => (new Throwable("unexpected state")).raiseError[F, SnapshotProcessingResult]
             }
