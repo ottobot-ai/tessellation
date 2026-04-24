@@ -11,276 +11,178 @@ import io.constellationnetwork.security.hex.Hex
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.SimpleIOSuite
 
+/** Tests for the structural-only fork choice. After the BABE/GRANDPA-style split (attestations only drive finality, never fork choice),
+  * `compare` is a deterministic function of block headers — ordinal/slot/VRF tiebreaks for short forks, density-in-window for long forks.
+  * Attestations are still threaded through `shouldSwitch`'s "don't revert below the finalized head" guard, but never tip selection.
+  */
 object ChainSelectionSuite extends SimpleIOSuite {
 
-  // Helper to create PeerId from a name
   private def pid(name: String): PeerId =
     PeerId(Hex(name.getBytes("UTF-8").map(b => f"$b%02x").mkString))
 
-  // Helper to create a slot
   private def slot(n: Long): Slot = Slot(NonNegLong.unsafeFrom(n))
 
-  // Helper to create a hash
   private def hash(s: String): Hash = Hash(s.padTo(64, '0'))
 
-  // Helper to create VRF output from a byte value (fills 64 bytes)
   private def vrfOutput(byte: Byte): VrfOutput =
     VrfOutput.fromBytes(Array.fill(64)(byte))
 
-  // Helper to create a chain tip
   private def tip(hashStr: String, slotNum: Long, ordinal: Long, parentHashStr: String, vrfByte: Byte): ChainTip =
     ChainTip(hash(hashStr), slot(slotNum), ordinal, hash(parentHashStr), vrfOutput(vrfByte))
 
-  // Helper to create an attestation
-  private def att(tipHash: Hash, tipSlot: Slot, tipOrdinal: Long, attestedAt: Slot): TipAttestation =
-    TipAttestation(tipHash, tipSlot, tipOrdinal, attestedAt)
-
-  // Setup StakeRegistry with N equal-weight validators
   private def setupRegistry(validators: Set[PeerId]): IO[StakeRegistry[IO]] =
     for {
       registry <- StakeRegistry.equalWeight[IO]
       _ <- registry.updateValidators(validators)
     } yield registry
 
-  // Setup ChainSelection with TipTracker and StakeRegistry
-  private def setupChainSelection(validators: Set[PeerId]): IO[(ChainSelection[IO], TipTracker[IO], StakeRegistry[IO])] =
+  /** ChainSelection with no parent fetcher — short-fork tests don't need ancestor traversal because their tips have either matching parents
+    * or one is the immediate parent of the other.
+    */
+  private def setupChainSelection(validators: Set[PeerId] = Set.empty): IO[(ChainSelection[IO], TipTracker[IO])] =
     for {
       registry <- setupRegistry(validators)
       tracker <- TipTracker.make[IO](registry)
-      // fetchParent always returns None — tests focus on tip comparison, not ancestry traversal
       chainSelection = ChainSelection.make[IO](tracker, _ => IO.pure(None))
-    } yield (chainSelection, tracker, registry)
+    } yield (chainSelection, tracker)
 
-  test("prefers tip with higher attestation weight") {
+  test("compare: identical tips return same") {
+    val tipA = tip("tipA", 10, 100, "parent", 0x50)
+    for {
+      (chainSelection, _) <- setupChainSelection()
+      result <- chainSelection.compare(tipA, tipA)
+    } yield expect.same(tipA.hash, result.hash)
+  }
+
+  test("compare: prefers higher ordinal (longer chain) — Praos / maxvalid-tk") {
+    // Same parent, different tips, A has higher ordinal → A wins by length
+    val tipA = tip("tipA", 11, 101, "parent", 0x50)
+    val tipB = tip("tipB", 10, 100, "parent", 0x50)
+    for {
+      (chainSelection, _) <- setupChainSelection()
+      result <- chainSelection.compare(tipA, tipB)
+    } yield expect.same(tipA.hash, result.hash)
+  }
+
+  test("compare: equal ordinal, prefers earlier slot — slot-recency tiebreak") {
+    val tipA = tip("tipA", 9, 100, "parent", 0x50)
+    val tipB = tip("tipB", 10, 100, "parent", 0x50)
+    for {
+      (chainSelection, _) <- setupChainSelection()
+      result <- chainSelection.compare(tipA, tipB)
+    } yield expect.same(tipA.hash, result.hash)
+  }
+
+  test("compare: all equal except VRF, prefers lower VRF — final tiebreak") {
+    val tipA = ChainTip(hash("tipA"), slot(10), 100L, hash("parent"), vrfOutput(0x10))
+    val tipB = ChainTip(hash("tipB"), slot(10), 100L, hash("parent"), vrfOutput(0x50))
+    for {
+      (chainSelection, _) <- setupChainSelection()
+      result <- chainSelection.compare(tipA, tipB)
+    } yield expect.same(tipA.hash, result.hash)
+  }
+
+  test("compare: ignores attestation weight — even a 100% attested losing-by-ordinal tip stays losing") {
+    // Pre-fix this would have been picked by the attestation path. Post-fix, structural rule alone wins:
+    // tipA has higher ordinal so tipA wins regardless of who attested what.
     val peer1 = pid("peer1")
     val peer2 = pid("peer2")
     val peer3 = pid("peer3")
-    val tipA = tip("tipA", 10, 100, "parent", 0x50)
+    val tipA = tip("tipA", 10, 105, "parent", 0x10) // longer chain (105 > 100)
     val tipB = tip("tipB", 10, 100, "parent", 0x50)
-
     for {
-      (chainSelection, tracker, _) <- setupChainSelection(Set(peer1, peer2, peer3))
-      // 2 peers attest to tipA, 1 to tipB
-      _ <- tracker.recordAttestation(peer1, att(tipA.hash, tipA.slot, tipA.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipA.hash, tipA.slot, tipA.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer3, att(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
+      (chainSelection, tracker) <- setupChainSelection(Set(peer1, peer2, peer3))
+      // All three peers attest tipB — under blended fork choice, tipB would have won. Now it doesn't.
+      _ <- tracker.recordAttestation(peer1, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
+      _ <- tracker.recordAttestation(peer2, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
+      _ <- tracker.recordAttestation(peer3, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
       result <- chainSelection.compare(tipA, tipB)
     } yield expect.same(tipA.hash, result.hash)
   }
 
-  test("equal weight, prefers higher ordinal (longer chain)") {
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    // Same weight (1 attestation each), tipA has higher ordinal
+  test("compare: VRF tiebreak treats bytes as unsigned (0x01 < 0xFF)") {
+    val tipA = ChainTip(hash("tipA"), slot(10), 100L, hash("parent"), vrfOutput(0x01))
+    val tipB = ChainTip(hash("tipB"), slot(10), 100L, hash("parent"), vrfOutput(0xff.toByte))
+    for {
+      (chainSelection, _) <- setupChainSelection()
+      result <- chainSelection.compare(tipA, tipB)
+    } yield expect.same(tipA.hash, result.hash)
+  }
+
+  test("compare is consistent: compare(A, B) == compare(B, A)") {
     val tipA = tip("tipA", 10, 101, "parent", 0x50)
     val tipB = tip("tipB", 10, 100, "parent", 0x50)
-
     for {
-      (chainSelection, tracker, _) <- setupChainSelection(Set(peer1, peer2))
-      _ <- tracker.recordAttestation(peer1, att(tipA.hash, tipA.slot, tipA.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
-      result <- chainSelection.compare(tipA, tipB)
-    } yield expect.same(tipA.hash, result.hash)
+      (chainSelection, _) <- setupChainSelection()
+      resultAB <- chainSelection.compare(tipA, tipB)
+      resultBA <- chainSelection.compare(tipB, tipA)
+    } yield expect.same(resultAB.hash, resultBA.hash)
   }
 
-  test("equal weight and ordinal, prefers earlier slot") {
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    // Same weight, same ordinal, tipA has earlier slot
-    val tipA = tip("tipA", 9, 100, "parent", 0x50)
-    val tipB = tip("tipB", 10, 100, "parent", 0x50)
-
+  test("selectBest: empty list returns None") {
     for {
-      (chainSelection, tracker, _) <- setupChainSelection(Set(peer1, peer2))
-      _ <- tracker.recordAttestation(peer1, att(tipA.hash, tipA.slot, tipA.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
-      result <- chainSelection.compare(tipA, tipB)
-    } yield expect.same(tipA.hash, result.hash)
-  }
-
-  test("all equal except VRF output, prefers lower VRF output") {
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    // Same weight, ordinal, slot - tipA has lower VRF output
-    val tipA = ChainTip(hash("tipA"), slot(10), 100L, hash("parent"), vrfOutput(0x10))
-    val tipB = ChainTip(hash("tipB"), slot(10), 100L, hash("parent"), vrfOutput(0x50))
-
-    for {
-      (chainSelection, tracker, _) <- setupChainSelection(Set(peer1, peer2))
-      _ <- tracker.recordAttestation(peer1, att(tipA.hash, tipA.slot, tipA.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
-      result <- chainSelection.compare(tipA, tipB)
-    } yield expect.same(tipA.hash, result.hash)
-  }
-
-  test("selectBest returns None for empty list") {
-    for {
-      (chainSelection, _, _) <- setupChainSelection(Set.empty)
+      (chainSelection, _) <- setupChainSelection()
       result <- chainSelection.selectBest(List.empty)
     } yield expect.same(None, result)
   }
 
-  test("selectBest returns single candidate") {
+  test("selectBest: single candidate returns it") {
     val tipA = tip("tipA", 10, 100, "parent", 0x50)
-
     for {
-      (chainSelection, _, _) <- setupChainSelection(Set.empty)
+      (chainSelection, _) <- setupChainSelection()
       result <- chainSelection.selectBest(List(tipA))
     } yield
       expect(result.isDefined) &&
         expect.same(tipA.hash, result.get.hash)
   }
 
-  test("selectBest picks best from 3 candidates") {
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    val peer3 = pid("peer3")
-    // tipB has most attestations
-    val tipA = tip("tipA", 10, 100, "parent", 0x50)
-    val tipB = tip("tipB", 10, 100, "parent", 0x50)
-    val tipC = tip("tipC", 10, 100, "parent", 0x50)
-
+  test("selectBest: picks highest-ordinal among 3 candidates (no attestations)") {
+    val tipA = ChainTip(hash("tipA"), slot(10), 100L, hash("parent"), vrfOutput(0x50))
+    val tipB = ChainTip(hash("tipB"), slot(10), 101L, hash("parent"), vrfOutput(0x50)) // longest
+    val tipC = ChainTip(hash("tipC"), slot(10), 99L, hash("parent"), vrfOutput(0x50))
     for {
-      (chainSelection, tracker, _) <- setupChainSelection(Set(peer1, peer2, peer3))
-      _ <- tracker.recordAttestation(peer1, att(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer3, att(tipA.hash, tipA.slot, tipA.ordinal, slot(11)))
+      (chainSelection, _) <- setupChainSelection()
       result <- chainSelection.selectBest(List(tipA, tipB, tipC))
     } yield
       expect(result.isDefined) &&
         expect.same(tipB.hash, result.get.hash)
   }
 
-  test("shouldSwitch returns true when candidate is better") {
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    val peer3 = pid("peer3")
+  test("shouldSwitch: returns true when candidate has higher ordinal (structural)") {
     val current = tip("current", 10, 100, "parent", 0x50)
-    val candidate = tip("candidate", 10, 100, "parent", 0x50)
-
+    val candidate = tip("candidate", 11, 101, "current", 0x50)
     for {
-      (chainSelection, tracker, _) <- setupChainSelection(Set(peer1, peer2, peer3))
-      // Candidate has more attestations
-      _ <- tracker.recordAttestation(peer1, att(candidate.hash, candidate.slot, candidate.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(candidate.hash, candidate.slot, candidate.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer3, att(current.hash, current.slot, current.ordinal, slot(11)))
+      (chainSelection, _) <- setupChainSelection()
       result <- chainSelection.shouldSwitch(current, candidate)
     } yield expect(result)
   }
 
-  test("shouldSwitch returns false when current is better") {
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    val peer3 = pid("peer3")
-    val current = tip("current", 10, 100, "parent", 0x50)
+  test("shouldSwitch: returns false when current already wins structurally") {
+    val current = tip("current", 10, 101, "parent", 0x50)
     val candidate = tip("candidate", 10, 100, "parent", 0x50)
-
     for {
-      (chainSelection, tracker, _) <- setupChainSelection(Set(peer1, peer2, peer3))
-      // Current has more attestations
-      _ <- tracker.recordAttestation(peer1, att(current.hash, current.slot, current.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(current.hash, current.slot, current.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer3, att(candidate.hash, candidate.slot, candidate.ordinal, slot(11)))
+      (chainSelection, _) <- setupChainSelection()
       result <- chainSelection.shouldSwitch(current, candidate)
     } yield expect(!result)
   }
 
-  test("shouldSwitch returns false when current tip is finalized (even if candidate has more weight)") {
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    val peer3 = pid("peer3")
-    val peer4 = pid("peer4")
-    val current = tip("current", 10, 100, "parent", 0x50)
-    val candidate = tip("candidate", 11, 101, "current", 0x50)
-
-    for {
-      (chainSelection, tracker, _) <- setupChainSelection(Set(peer1, peer2, peer3, peer4))
-      // Mark current as finalized
-      _ <- tracker.markFinalized(current.hash, current.slot)
-      // Candidate has more attestations (3 vs 1)
-      _ <- tracker.recordAttestation(peer1, att(candidate.hash, candidate.slot, candidate.ordinal, slot(12)))
-      _ <- tracker.recordAttestation(peer2, att(candidate.hash, candidate.slot, candidate.ordinal, slot(12)))
-      _ <- tracker.recordAttestation(peer3, att(candidate.hash, candidate.slot, candidate.ordinal, slot(12)))
-      _ <- tracker.recordAttestation(peer4, att(current.hash, current.slot, current.ordinal, slot(11)))
-      result <- chainSelection.shouldSwitch(current, candidate)
-    } yield expect(!result)
-  }
-
-  test("attestation weight dominates over all tiebreakers (tip with less ordinal but more attestations wins)") {
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    val peer3 = pid("peer3")
-    // tipA: higher ordinal (longer chain), earlier slot, lower VRF - but LESS attestations
-    val tipA = ChainTip(hash("tipA"), slot(9), 105L, hash("parent"), vrfOutput(0x10))
-    // tipB: lower ordinal, later slot, higher VRF - but MORE attestations
-    val tipB = ChainTip(hash("tipB"), slot(10), 100L, hash("parent"), vrfOutput(0x50))
-
-    for {
-      (chainSelection, tracker, _) <- setupChainSelection(Set(peer1, peer2, peer3))
-      // tipB has 2/3 attestations, tipA has 1/3
-      _ <- tracker.recordAttestation(peer1, att(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer3, att(tipA.hash, tipA.slot, tipA.ordinal, slot(11)))
-      result <- chainSelection.compare(tipA, tipB)
-    } yield expect.same(tipB.hash, result.hash)
-  }
-
-  test("identical tips: shouldSwitch returns false") {
-    val peer1 = pid("peer1")
+  test("shouldSwitch: identical tips returns false") {
     val tipA = tip("tipA", 10, 100, "parent", 0x50)
-
     for {
-      (chainSelection, tracker, _) <- setupChainSelection(Set(peer1))
-      _ <- tracker.recordAttestation(peer1, att(tipA.hash, tipA.slot, tipA.ordinal, slot(11)))
-      // Comparing tip with itself
+      (chainSelection, _) <- setupChainSelection()
       result <- chainSelection.shouldSwitch(tipA, tipA)
     } yield expect(!result)
   }
 
-  test("VRF comparison handles different byte values correctly (unsigned comparison)") {
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    // 0xFF as unsigned byte is 255, which is > 0x01 as unsigned
-    // But as signed byte, 0xFF is -1 which is < 0x01
-    // We want unsigned comparison, so tipA (0x01) should win
-    val tipA = ChainTip(hash("tipA"), slot(10), 100L, hash("parent"), vrfOutput(0x01))
-    val tipB = ChainTip(hash("tipB"), slot(10), 100L, hash("parent"), vrfOutput(0xff.toByte))
-
+  test("shouldSwitch: refuses to switch when current tip is finalized — finalized-head lock") {
+    // Even if the candidate is structurally better, finalized state wins.
+    // This is the only place attestations (via lastFinalized) influence chain selection.
+    val current = tip("current", 10, 100, "parent", 0x50)
+    val candidate = tip("candidate", 11, 101, "current", 0x50)
     for {
-      (chainSelection, tracker, _) <- setupChainSelection(Set(peer1, peer2))
-      _ <- tracker.recordAttestation(peer1, att(tipA.hash, tipA.slot, tipA.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
-      result <- chainSelection.compare(tipA, tipB)
-    } yield expect.same(tipA.hash, result.hash)
-  }
-
-  test("selectBest with all tips having zero attestations uses tiebreakers") {
-    // No attestations recorded, so all tips have 0 weight
-    // Should fall through to tiebreakers: ordinal → slot → VRF
-    val tipA = ChainTip(hash("tipA"), slot(10), 100L, hash("parent"), vrfOutput(0x50))
-    val tipB = ChainTip(hash("tipB"), slot(10), 101L, hash("parent"), vrfOutput(0x50)) // Higher ordinal
-    val tipC = ChainTip(hash("tipC"), slot(10), 99L, hash("parent"), vrfOutput(0x50))
-
-    for {
-      (chainSelection, _, _) <- setupChainSelection(Set.empty)
-      result <- chainSelection.selectBest(List(tipA, tipB, tipC))
-    } yield
-      expect(result.isDefined) &&
-        expect.same(tipB.hash, result.get.hash)
-  }
-
-  test("compare is consistent: compare(A, B) and compare(B, A) should select same winner") {
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    val tipA = tip("tipA", 10, 101, "parent", 0x50)
-    val tipB = tip("tipB", 10, 100, "parent", 0x50)
-
-    for {
-      (chainSelection, tracker, _) <- setupChainSelection(Set(peer1, peer2))
-      _ <- tracker.recordAttestation(peer1, att(tipA.hash, tipA.slot, tipA.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
-      resultAB <- chainSelection.compare(tipA, tipB)
-      resultBA <- chainSelection.compare(tipB, tipA)
-    } yield expect.same(resultAB.hash, resultBA.hash)
+      (chainSelection, tracker) <- setupChainSelection()
+      _ <- tracker.markFinalized(current.hash, current.slot)
+      result <- chainSelection.shouldSwitch(current, candidate)
+    } yield expect(!result)
   }
 }

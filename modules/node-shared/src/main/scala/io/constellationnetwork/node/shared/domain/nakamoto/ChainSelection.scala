@@ -6,23 +6,31 @@ import cats.syntax.all._
 import io.constellationnetwork.schema.nakamoto.ChainTip
 import io.constellationnetwork.schema.nakamoto.slot.VrfOutput
 
-/** Fork choice rule for Nakamoto consensus — blended attestation-weighted + Bifrost structural.
+/** Fork choice rule for Nakamoto consensus — purely structural (Bitcoin/Praos/Polkadot-BABE pattern).
   *
-  * **Information hierarchy**: attestation weight is the richest signal available about which tip peers believe is canonical. When
-  * attestation data is decisive, it's the right primary comparator. When attestations are tied, missing, or below a meaningful quorum, fall
-  * back to deterministic structural rules so fork-choice stays live and doesn't stall on incomplete attestation data.
+  * **Strict separation of fork choice and finality.** Fork choice picks the best live branch from block-header structure alone (longest
+  * chain, density on long forks). Finality (attestation ≥ 2/3 OR depth-k) is computed elsewhere by `TipTracker` and feeds into chain
+  * selection only as a *constraint* via `shouldSwitch`'s "don't revert below the finalized head" check. This matches Polkadot's
+  * BABE/GRANDPA split, Cardano Praos/Genesis, and the original Nakamoto rule. It is deliberately NOT Ethereum's LMD-GHOST blend — which
+  * couples latest-attestation weight into the comparator and has produced a long tail of balancing/bouncing/avalanche attacks (Neu/Tas/Tse
+  * IACR 2022/289; D'Amato/Zanolini IACR 2023/279). For a 50-100 validator chain with depth-k fallback, the dynamic- availability
+  * head-convergence properties LMD-GHOST buys aren't worth the attack surface.
   *
-  * Compare algorithm:
-  *   1. **Attestation-weighted path** (preferred). Query `TipTracker.attestationWeight` for each tip. If at least one tip has weight ≥
-  *      `minQuorum` AND the weights differ, return the heavier tip. 2. **Structural fallback** — short forks (both tines within kLookback
-  *      of common ancestor): deterministic tiebreakers on tips: height → slot recency → VRF output. This is Bifrost's maxvalid-tk. 3.
-  *      **Structural fallback** — long forks (fork depth exceeds kLookback): block-density comparison within sWindow from fork point. This
-  *      is Bifrost's maxvalid-bg.
+  * '''The pre-removal bug.''' An earlier version called `tipTracker.attestationWeight(tipHash)` per-hash and let the heavier tip win if
+  * either side cleared `minQuorum`. This is a category error: peers always attest the *current* chain head, never older ancestors, so
+  * `attestationWeight(olderHash)` is structurally zero for any snapshot being relayed via sync. A forked node's self-attestation on its own
+  * tip (1/3 in a 3-node cluster) defeated every incoming snapshot from the majority chain (weight 0), and the structural rule never ran.
+  * The node stayed permanently on its 1/3 fork. Stripping that path makes `compare` deterministic on observable header data and lets
+  * maxvalid-tk / maxvalid-bg do their job.
   *
-  * Finality remains the union of two independent rules:
-  *   - attestation ≥ 2/3 weight (BFT-classic, fast path in healthy network)
-  *   - depth-k confirmation (probabilistic, fallback when attestations stall) Whichever fires first marks the tip finalized. This is
-  *     orthogonal to fork-choice.
+  * Compare algorithm (structural only):
+  *   1. **Short forks** (common ancestor within `kLookback`): tiebreakers on tips: ordinal (longer chain wins) → slot (earlier wins) → VRF
+  *      output (lower wins). This is Bifrost's maxvalid-tk. 2. **Long forks** (fork depth exceeds `kLookback`): block-density comparison
+  *      within `sWindow` slots from the fork point. This is Bifrost's maxvalid-bg.
+  *
+  * Finality (orthogonal to this file) is the union of two independent rules:
+  *   - attestation ≥ 2/3 weight on a chain-canonical hash (BFT-classic, fast path in healthy network)
+  *   - depth-k confirmation (probabilistic, fallback when attestations stall) Whichever fires first marks the tip finalized.
   */
 trait ChainSelection[F[_]] {
 
@@ -56,55 +64,31 @@ object ChainSelection {
   val DefaultKLookback: Long = 50L // blocks before switching to density rule
   val DefaultSWindow: Long = 200L // slot window for density comparison
 
-  /** Minimum attestation-weight fraction for the attestation path to kick in.
+  /** Create a ChainSelection that uses purely structural (Bifrost maxvalid-tk + maxvalid-bg) fork choice.
     *
-    * Below this, attestation data is too sparse to be decisive and we fall through to structural rules. With the default `0.2`, any tip
-    * holding ≥20% stake-weight of attestations can win on attestations alone; two tips both below that threshold fight it out on
-    * maxvalid-tk/bg.
-    */
-  val DefaultMinQuorum: Double = 0.2
-
-  /** Create a ChainSelection that uses blended attestation-weighted + Bifrost structural fork choice.
-    *
-    * Attestations are the primary signal when available and decisive. Structural rules (maxvalid-tk for short forks, maxvalid-bg for long
-    * forks) are tiebreakers when attestation weights are tied or below `minQuorum`.
+    * Attestation weight does not enter `compare`. `tipTracker` is retained only so `shouldSwitch` can consult `lastFinalized` to refuse
+    * reverting below a finalized head — a *constraint* on fork choice, not a tiebreaker.
     *
     * @param tipTracker
-    *   provides attestation weights per tip (primary fork-choice input) and finality state.
+    *   used by `shouldSwitch` to query the finalized head; not used in `compare`.
     * @param fetchParent
     *   given a ChainTip, retrieve its parent (for ancestor traversal).
     * @param kLookback
     *   max blocks to traverse before switching to density rule.
     * @param sWindow
     *   forward-looking slot window for density comparison.
-    * @param minQuorum
-    *   minimum stake-weight fraction for the attestation path to decide. Below this, fall through to structural. Default `DefaultMinQuorum`
-    *   (0.2).
     */
   def make[F[_]: Monad](
     tipTracker: TipTracker[F],
     fetchParent: ChainTip => F[Option[ChainTip]],
     kLookback: Long = DefaultKLookback,
-    sWindow: Long = DefaultSWindow,
-    minQuorum: Double = DefaultMinQuorum
+    sWindow: Long = DefaultSWindow
   ): ChainSelection[F] =
     new ChainSelection[F] {
 
       def compare(tipA: ChainTip, tipB: ChainTip): F[ChainTip] =
         if (tipA.hash === tipB.hash) tipA.pure[F]
-        else
-          for {
-            weightA <- tipTracker.attestationWeight(tipA.hash)
-            weightB <- tipTracker.attestationWeight(tipB.hash)
-            // Attestation-king path: if either tip has ≥ minQuorum weight and they differ,
-            // the heavier wins. Small numerical tolerance on equality to avoid float-equals
-            // pathologies.
-            result <-
-              if ((weightA >= minQuorum || weightB >= minQuorum) && math.abs(weightA - weightB) > 1e-12) {
-                (if (weightA > weightB) tipA else tipB).pure[F]
-              } else
-                findCommonAncestorAndSelect(tipA, tipB)
-          } yield result
+        else findCommonAncestorAndSelect(tipA, tipB)
 
       def selectBest(candidates: List[ChainTip]): F[Option[ChainTip]] =
         candidates match {
