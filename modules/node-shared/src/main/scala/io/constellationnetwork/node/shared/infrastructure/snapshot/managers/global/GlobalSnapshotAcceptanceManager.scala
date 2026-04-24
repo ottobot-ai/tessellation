@@ -207,7 +207,7 @@ object GlobalSnapshotAcceptanceManager {
     val tokenLockStateManager = TokenLockStateManager.make[F](mptStore, shouldUseMptStore = true, useMptBackedAcceptPath = true)
     val spendTransactionBalanceManager = SpendTransactionBalanceManager.make[F](Some(mptStore), shouldUseMptStore = false)
     val delegatedStakeStateManager = DelegatedStakeStateManager.make[F]()
-    val nodeCollateralStateManager = NodeCollateralStateManager.make[F](mptStore, shouldUseMptStore = true)
+    val nodeCollateralStateManager = NodeCollateralStateManager.make[F](mptStore, shouldUseMptStore = true, useMptBackedAcceptPath = true)
     val transactionReferenceManager = TransactionReferenceManager.make[F](mptStore, shouldUseMptStore = false)
 
     val blockAcceptanceCoordinatorManager = BlockAcceptanceCoordinatorManager.make[F](
