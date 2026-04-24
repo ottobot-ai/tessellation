@@ -25,7 +25,6 @@ import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
 import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.schema.tokenLock.TokenLock
 import io.constellationnetwork.schema.transaction.RewardTransaction
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.signature.Signed
@@ -61,85 +60,6 @@ object GlobalSnapshotContextFunctions {
       // 1. The snapshot was already validated by dag-l0 majority consensus
       // 2. Full MPT sync on every ordinal is too expensive (~2 min for 800K entries)
       // The MPT store is synced once during initial download for query support.
-
-      // todo - avoid duplication of this function here and in GlobalSnapshotConsensusFunctions
-      private def acceptDelegatedStakes(
-        lastSnapshotContext: GlobalSnapshotInfo,
-        epochProgress: EpochProgress,
-        ordinal: SnapshotOrdinal,
-        acceptedTokenLocks: List[Signed[TokenLock]]
-      )(implicit h: Hasher[F]): F[
-        (
-          SortedMap[Address, SortedSet[DelegatedStakeRecord]],
-          SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]],
-          SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]]
-        )
-      ] = {
-        val existingDelegatedStakesRaw = lastSnapshotContext.activeDelegatedStakes.getOrElse(
-          SortedMap.empty[Address, SortedSet[DelegatedStakeRecord]]
-        )
-
-        val existingDelegatedStakesParsed = existingDelegatedStakesRaw.view.mapValues { records =>
-          records.map { r =>
-            r.copy(
-              currentTokenLockRef = r.currentTokenLockRef.orElse(r.tokenLockRef.some),
-              currentAmount = r.currentAmount.orElse(r.amount.some)
-            )
-          }
-        }.to(SortedMap)
-
-        val existingDelegatedStakesNormalized =
-          if (ordinal > incrementalDelegatedStakingStartingOrdinal)
-            existingDelegatedStakesParsed
-          else
-            existingDelegatedStakesRaw
-
-        val existingWithdrawals = lastSnapshotContext.delegatedStakesWithdrawals.getOrElse(
-          SortedMap.empty[Address, SortedSet[PendingDelegatedStakeWithdrawal]]
-        )
-
-        def isWithdrawalExpired(withdrawalEpoch: EpochProgress): Boolean =
-          (withdrawalEpoch |+| withdrawalTimeLimit) <= epochProgress
-
-        for {
-          hashedReplacementTokenLocks <- acceptedTokenLocks.filter(_.replaceTokenLockRef.isDefined).traverse(_.toHashed)
-          replacementTokenLocks = hashedReplacementTokenLocks.mapFilter(tl => tl.replaceTokenLockRef.tupleRight(tl)).toMap
-
-          existingDelegatedStakes = existingDelegatedStakesNormalized.view
-            .mapValues(_.map { record =>
-              replacementTokenLocks.get(record.tokenLockRef).fold(record) { hashedTokenLock =>
-                record.copy(
-                  currentTokenLockRef = hashedTokenLock.hash.some,
-                  currentAmount = DelegatedStakeAmount.fromTokenLockAmount(hashedTokenLock.amount).some
-                )
-              }
-            })
-            .to(SortedMap)
-
-          (unexpiredWithdrawals, expiredWithdrawals) = existingWithdrawals.foldLeft(
-            (
-              SortedMap.empty[Address, SortedSet[PendingDelegatedStakeWithdrawal]],
-              SortedMap.empty[Address, SortedSet[PendingDelegatedStakeWithdrawal]]
-            )
-          ) {
-            case ((unexpiredAcc, expiredAcc), (address, withdrawals)) =>
-              val (expired, unexpired) = withdrawals.partition {
-                case PendingDelegatedStakeWithdrawal(_, _, _, withdrawalEpoch, _, _) =>
-                  isWithdrawalExpired(withdrawalEpoch)
-              }
-
-              val newUnexpired = if (unexpired.nonEmpty) unexpiredAcc + (address -> unexpired) else unexpiredAcc
-              val newExpired = if (expired.nonEmpty) expiredAcc + (address -> expired) else expiredAcc
-
-              (newUnexpired, newExpired)
-          }
-        } yield
-          (
-            existingDelegatedStakes,
-            unexpiredWithdrawals,
-            expiredWithdrawals
-          )
-      }
 
       def createContext(
         context: GlobalSnapshotInfo,
@@ -188,49 +108,22 @@ object GlobalSnapshotContextFunctions {
           .toList
           .flatten
 
-        acceptedTokenLocksFromBlocks = tokenLockBlocksForAcceptance.flatMap(_.tokenLocks.toList)
-
-        delegatedStakeAcceptanceResult <- updateDelegatedStakeAcceptanceManager.accept(
-          cdsEventsForAcceptance,
-          wdsEventsForAcceptance,
-          context,
-          signedArtifact.epochProgress,
-          signedArtifact.ordinal,
-          acceptedTokenLocksFromBlocks
-        )
-
-        (
-          unexpiredCreateDelegatedStakes,
-          unexpiredWithdrawalsDelegatedStaking,
-          expiredWithdrawalsDelegatedStaking
-        ) <- acceptDelegatedStakes(context, signedArtifact.epochProgress, signedArtifact.ordinal, acceptedTokenLocksFromBlocks)
-
-        updatedCreateDelegatedStakes <- DelegatedRewardsDistributor.getUpdatedCreateDelegatedStakes(
-          signedArtifact.delegateRewards.getOrElse(SortedMap.empty),
-          delegatedStakeAcceptanceResult,
-          PartitionedStakeUpdates(
-            unexpiredCreateDelegatedStakes,
-            unexpiredWithdrawalsDelegatedStaking,
-            expiredWithdrawalsDelegatedStaking
-          )
-        )
-
-        updatedWithdrawDelegatedStakes <- DelegatedRewardsDistributor.getUpdatedWithdrawalDelegatedStakes(
-          context,
-          delegatedStakeAcceptanceResult,
-          PartitionedStakeUpdates(
-            unexpiredCreateDelegatedStakes,
-            unexpiredWithdrawalsDelegatedStaking,
-            expiredWithdrawalsDelegatedStaking
-          )
-        )
-
         // Capture the pre-accept MPT state so we can roll back on verify failure.
         // Without this, `syncFromStateChanges` inside `accept()` commits its delta before
         // we get a chance to compare against the peer-claimed stateProof; a mismatch would
         // leave the store with divergent bytes and the journal tip advanced.
         preAcceptSavepoint <- mptStore.savepoint
 
+        // Derive updated stake/withdrawal maps inside calculateRewardsFn using the
+        // `DelegateRewardsInput.psu` argument — that PartitionedStakeUpdates is produced by
+        // the canonical `DelegatedStakeStateManager.processExistingDelegatedStakes` inside
+        // `accept()`. The previous code ran a drifted-duplicate `acceptDelegatedStakes` helper
+        // here and pre-computed these maps off its output; that helper only partitioned
+        // withdrawals by epoch expiry, while the canonical fn also filters by whether the
+        // associated token lock is still active. The divergence surfaced as StateProofMismatch
+        // on followers whenever a withdrawal became epoch-expired AND its token lock had been
+        // replaced/removed in the same ordinal (observed at ordinal 64 in cl1, e.g.
+        // gl0.mptRoot=221e53b31179 vs cl1.mptRoot=6fc964752c15).
         (
           acceptanceResult,
           _,
@@ -263,25 +156,36 @@ object GlobalSnapshotContextFunctions {
             context,
             lastActiveTips,
             lastDeprecatedTips,
-            _ =>
-              signedArtifact.rewards
-                .pure[F]
-                .map { txs =>
-                  if (signedArtifact.ordinal.value < tessellation3MigrationStartingOrdinal.value) {
-                    DelegatedRewardsResult(
-                      delegatorRewardsMap = SortedMap.empty,
-                      updatedCreateDelegatedStakes = SortedMap.empty,
-                      updatedWithdrawDelegatedStakes = SortedMap.empty,
-                      nodeOperatorRewards = txs,
-                      reservedAddressRewards = SortedSet.empty,
-                      withdrawalRewardTxs = SortedSet.empty,
-                      totalEmittedRewardsAmount =
-                        Amount(NonNegLong.unsafeFrom(txs.toList.map(_.amount.value.value).distinct.sum)) // mimic incorrect behaviour
+            (input: RewardsInput) => {
+              val rewardTxs = signedArtifact.rewards
+              input match {
+                case ClassicRewardsInput(_) =>
+                  // Pre-tessellation3 rewards distribution — no stake-update plumbing applies.
+                  DelegatedRewardsResult(
+                    delegatorRewardsMap = SortedMap.empty,
+                    updatedCreateDelegatedStakes = SortedMap.empty,
+                    updatedWithdrawDelegatedStakes = SortedMap.empty,
+                    nodeOperatorRewards = rewardTxs,
+                    reservedAddressRewards = SortedSet.empty,
+                    withdrawalRewardTxs = SortedSet.empty,
+                    totalEmittedRewardsAmount =
+                      Amount(NonNegLong.unsafeFrom(rewardTxs.toList.map(_.amount.value.value).distinct.sum)) // mimic incorrect behaviour
+                  ).pure[F]
+
+                case DelegateRewardsInput(udsar, psu, _) =>
+                  for {
+                    updatedCreateDelegatedStakes <- DelegatedRewardsDistributor.getUpdatedCreateDelegatedStakes(
+                      signedArtifact.delegateRewards.getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]]),
+                      udsar,
+                      psu
                     )
-                  } else if (signedArtifact.ordinal.value < setSumFixOrdinal.value) {
-                    // Apply same transformation as consensus path for ordinals > incrementalDelegatedStakingStartingOrdinal
-                    val transformedCreateDelegatedStakes =
-                      if (signedArtifact.ordinal > incrementalDelegatedStakingStartingOrdinal) {
+                    updatedWithdrawDelegatedStakes <- DelegatedRewardsDistributor.getUpdatedWithdrawalDelegatedStakes(
+                      context,
+                      udsar,
+                      psu
+                    )
+                    transformedCreateDelegatedStakes =
+                      if (signedArtifact.ordinal > incrementalDelegatedStakingStartingOrdinal)
                         updatedCreateDelegatedStakes.view.mapValues { records =>
                           records.map { r =>
                             r.copy(
@@ -290,45 +194,34 @@ object GlobalSnapshotContextFunctions {
                             )
                           }
                         }.to(SortedMap)
-                      } else updatedCreateDelegatedStakes
-
-                    DelegatedRewardsResult(
-                      delegatorRewardsMap = signedArtifact.delegateRewards
-                        .getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]]),
-                      updatedCreateDelegatedStakes = transformedCreateDelegatedStakes,
-                      updatedWithdrawDelegatedStakes = updatedWithdrawDelegatedStakes,
-                      nodeOperatorRewards = txs,
-                      reservedAddressRewards = SortedSet.empty,
-                      withdrawalRewardTxs = SortedSet.empty,
-                      totalEmittedRewardsAmount =
-                        Amount(NonNegLong.unsafeFrom(txs.toList.map(_.amount.value.value).distinct.sum)) // mimic incorrect behaviour
-                    )
-                  } else {
-                    // Apply same transformation as consensus path for ordinals > incrementalDelegatedStakingStartingOrdinal
-                    val transformedCreateDelegatedStakes =
-                      if (signedArtifact.ordinal > incrementalDelegatedStakingStartingOrdinal) {
-                        updatedCreateDelegatedStakes.view.mapValues { records =>
-                          records.map { r =>
-                            r.copy(
-                              currentTokenLockRef = r.currentTokenLockRef.orElse(r.tokenLockRef.some),
-                              currentAmount = r.currentAmount.orElse(r.amount.some)
-                            )
-                          }
-                        }.to(SortedMap)
-                      } else updatedCreateDelegatedStakes
-
-                    DelegatedRewardsResult(
-                      delegatorRewardsMap = signedArtifact.delegateRewards
-                        .getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]]),
-                      updatedCreateDelegatedStakes = transformedCreateDelegatedStakes,
-                      updatedWithdrawDelegatedStakes = updatedWithdrawDelegatedStakes,
-                      nodeOperatorRewards = txs,
-                      reservedAddressRewards = SortedSet.empty,
-                      withdrawalRewardTxs = SortedSet.empty,
-                      totalEmittedRewardsAmount = Amount(NonNegLong.unsafeFrom(txs.toList.map(_.amount.value.value).sum))
-                    )
-                  }
-                },
+                      else updatedCreateDelegatedStakes
+                  } yield
+                    if (signedArtifact.ordinal.value < setSumFixOrdinal.value)
+                      DelegatedRewardsResult(
+                        delegatorRewardsMap = signedArtifact.delegateRewards
+                          .getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]]),
+                        updatedCreateDelegatedStakes = transformedCreateDelegatedStakes,
+                        updatedWithdrawDelegatedStakes = updatedWithdrawDelegatedStakes,
+                        nodeOperatorRewards = rewardTxs,
+                        reservedAddressRewards = SortedSet.empty,
+                        withdrawalRewardTxs = SortedSet.empty,
+                        totalEmittedRewardsAmount = Amount(
+                          NonNegLong.unsafeFrom(rewardTxs.toList.map(_.amount.value.value).distinct.sum)
+                        ) // mimic incorrect behaviour
+                      )
+                    else
+                      DelegatedRewardsResult(
+                        delegatorRewardsMap = signedArtifact.delegateRewards
+                          .getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]]),
+                        updatedCreateDelegatedStakes = transformedCreateDelegatedStakes,
+                        updatedWithdrawDelegatedStakes = updatedWithdrawDelegatedStakes,
+                        nodeOperatorRewards = rewardTxs,
+                        reservedAddressRewards = SortedSet.empty,
+                        withdrawalRewardTxs = SortedSet.empty,
+                        totalEmittedRewardsAmount = Amount(NonNegLong.unsafeFrom(rewardTxs.toList.map(_.amount.value.value).sum))
+                      )
+              }
+            },
             StateChannelValidationType.Historical,
             getGlobalSnapshotByOrdinal
           )
