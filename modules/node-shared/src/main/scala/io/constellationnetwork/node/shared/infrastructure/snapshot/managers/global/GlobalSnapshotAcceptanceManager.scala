@@ -203,7 +203,7 @@ object GlobalSnapshotAcceptanceManager {
     // Phase 2b: route expiry discovery through the index-driven sweep on production traffic. Both paths produce the same
     // (address, hash) set by construction (AllowSpendExpirySweepEquivalenceSuite / TokenLockExpirySweepEquivalenceSuite);
     // the legacy filter remains compiled in as a fallback until the map inputs are removed in #88 / #85.
-    val allowSpendStateManager = AllowSpendStateManager.make[F](Some(mptStore), shouldUseMptStore = true)
+    val allowSpendStateManager = AllowSpendStateManager.make[F](Some(mptStore), shouldUseMptStore = true, useMptBackedAcceptPath = true)
     val tokenLockStateManager = TokenLockStateManager.make[F](mptStore, shouldUseMptStore = true, useMptBackedAcceptPath = true)
     val spendTransactionBalanceManager = SpendTransactionBalanceManager.make[F](Some(mptStore), shouldUseMptStore = false)
     val delegatedStakeStateManager = DelegatedStakeStateManager.make[F]()
