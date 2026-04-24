@@ -595,7 +595,17 @@ PROMEOF
       done
     fi
 
-    docker rm -f prometheus nakamoto-grafana 2>/dev/null || true
+    # Monitoring trio: Prometheus (scraper), Grafana (UI), and grafana-image-renderer
+    # (server-side PNG rendering for /render/ endpoints so Grafana can serve dashboard
+    # panels as images — required for headless snapshots, screenshots in reports, etc).
+    # All three live on tessellation_common so Grafana can reach both Prometheus
+    # (http://prometheus:9090) and the renderer (http://grafana-renderer:8081) by DNS.
+    docker rm -f prometheus nakamoto-grafana grafana-renderer 2>/dev/null || true
+
+    docker run -d --name grafana-renderer --network tessellation_common \
+      -e ENABLE_METRICS=true \
+      --restart unless-stopped grafana/grafana-image-renderer:latest >/dev/null 2>&1
+
     docker run -d --name prometheus --network tessellation_common \
       -v "$PROM_CFG:/etc/prometheus/prometheus.yml:ro" \
       -p 9090:9090 --restart unless-stopped prom/prometheus:latest >/dev/null 2>&1
@@ -603,6 +613,8 @@ PROMEOF
     docker run -d --name nakamoto-grafana --network tessellation_common \
       -e GF_SECURITY_ADMIN_USER=admin -e GF_SECURITY_ADMIN_PASSWORD=admin \
       -e GF_AUTH_ANONYMOUS_ENABLED=true -e GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer \
+      -e GF_RENDERING_SERVER_URL=http://grafana-renderer:8081/render \
+      -e GF_RENDERING_CALLBACK_URL=http://nakamoto-grafana:3000/ \
       -p 3000:3000 \
       -v "$PROJECT_ROOT/nakamoto-test/grafana/provisioning:/etc/grafana/provisioning:ro" \
       -v "$PROJECT_ROOT/nakamoto-test/grafana/dashboards:/var/lib/grafana/dashboards:ro" \
@@ -610,6 +622,7 @@ PROMEOF
 
     echo "  Grafana: http://localhost:3000 (admin/admin)"
     echo "  Prometheus: http://localhost:9090"
+    echo "  Renderer: http://grafana-renderer:8081 (internal)"
     show_time "Monitoring started"
   fi
 

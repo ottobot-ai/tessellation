@@ -24,6 +24,7 @@ import io.constellationnetwork.node.shared.domain.tokenlock.{ContextualTokenLock
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.LastSnapshotStorage
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.swap.{AllowSpendReference, CurrencyId}
 import io.constellationnetwork.schema.tokenLock.TokenLockReference
@@ -79,6 +80,13 @@ object CurrencySnapshotProcessor {
             val globalSnapshotReference = SnapshotReference.fromHashedSnapshot(globalSnapshot)
             lastGlobalSnapshotStorage.getCombined.flatMap {
               case None =>
+                // Populate MPT with the bootstrap GSI BEFORE processCurrencySnapshots runs
+                // — processAlignment reads the MPT during checkAlignment, so the seed must
+                // happen first. Without it, accept() on the next incremental snapshot reads
+                // from an empty MPT and produces a state proof that diverges from the
+                // leader's claimed root (StateProofMismatch at ordinal 2). Uses scodec-typed
+                // syncFromGlobalSnapshotInfo to match the bytes syncFromStateChanges writes
+                // during accept(). Same pattern as dag-l0/Main.scala bootstrap paths.
                 val setGlobalSnapshot = lastGlobalSnapshotStorage
                   .setInitial(globalSnapshot, globalState)
                   .as[SnapshotProcessingResult](DownloadPerformed(globalSnapshotReference, Set.empty, Set.empty))
@@ -86,14 +94,15 @@ object CurrencySnapshotProcessor {
                   .setInitialFetchingGL0(globalSnapshot, globalState, l0Service.asLeft.some, none)
                   .as[SnapshotProcessingResult](DownloadPerformed(globalSnapshotReference, Set.empty, Set.empty))
 
-                processCurrencySnapshots(
-                  globalSnapshot,
-                  globalState,
-                  globalSnapshotReference,
-                  setGlobalSnapshot,
-                  setNGlobalSnapshots,
-                  getGlobalSnapshotByOrdinal
-                )
+                mptStore.syncFromGlobalSnapshotInfo(globalState, globalSnapshot.ordinal) >>
+                  processCurrencySnapshots(
+                    globalSnapshot,
+                    globalState,
+                    globalSnapshotReference,
+                    setGlobalSnapshot,
+                    setNGlobalSnapshots,
+                    getGlobalSnapshotByOrdinal
+                  )
 
               case _ => (new Throwable("unexpected state")).raiseError[F, SnapshotProcessingResult]
             }
