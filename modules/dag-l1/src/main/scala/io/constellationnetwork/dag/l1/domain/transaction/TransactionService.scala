@@ -60,9 +60,17 @@ object TransactionService {
     def useGlobalSnapshotInfo(
       transaction: Hashed[Transaction]
     ) =
-      lastSnapshotStorage.getCombinedStream.map {
+      // Wait for the first real snapshot rather than defaulting to
+      // (MinValue, Balance.empty) — before the MPT-primary migration, node
+      // startup was fast enough that the first stream emission was usually
+      // Some(...) by the time transactions arrived; post-migration the bigger
+      // accept() work pushes currency-snapshot bootstrap past fast clients
+      // (e.g. spend/currency tests that submit immediately) so None leaks
+      // through and every address reads balance=0 → InsufficientBalance for
+      // genesis-funded accounts. Drop the None prefix and take the first
+      // Some(...) — same semantics as before once any snapshot is available.
+      lastSnapshotStorage.getCombinedStream.collect {
         case Some((s, si)) => (s.ordinal, si.balances.getOrElse(transaction.source, Balance.empty))
-        case None          => (SnapshotOrdinal.MinValue, Balance.empty)
       }.changes.switchMap {
         case (latestOrdinal, balance) => Stream.eval(transactionStorage.tryPut(transaction, latestOrdinal, balance))
       }.head.compile.last.flatMap {
