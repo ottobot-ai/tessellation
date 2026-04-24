@@ -428,10 +428,21 @@ object SnapshotLeaderLoop {
                 case _ => Async[F].pure(false)
               }
 
-              // GRANDPA-style chain finality: attesting to ordinal N implicitly attests to all
-              // ancestors. Walk attestation ordinals from highest down, accumulating weight.
-              // The highest ordinal where cumulative weight >= 2/3 is finalized.
-              chainFinalizedOrdinal <- tipTracker.highestFinalizedOrdinal(TipTracker.FinalityThreshold)
+              // GRANDPA-style chain finality, chain-aware: attesting to ordinal N with a hash on
+              // OUR chain implicitly attests to all ancestors. Attestations with a different hash
+              // at ordinal N are on a different fork and must NOT contribute weight here — the
+              // canonicalHashAt predicate filters them out. Walk attestation ordinals from highest
+              // down, accumulating only matching-hash weight. The highest ordinal where cumulative
+              // weight >= 2/3 is finalized.
+              chainFinalizedOrdinal <- bestTip match {
+                case Some(tip) =>
+                  tipTracker.highestFinalizedOrdinal(
+                    TipTracker.FinalityThreshold,
+                    ord => chainStore.walkBackTo(tip.hash, ord)
+                  )
+                case None =>
+                  Async[F].pure(Option.empty[(Long, Double)])
+              }
               _ <- (chainFinalizedOrdinal, bestTip) match {
                 case (Some((finalOrdinal, weight)), Some(tip)) if finalOrdinal > lastFinalizedOrdinal && !depthFinalized =>
                   // Walk the canonical chain to find the hash at finalOrdinal

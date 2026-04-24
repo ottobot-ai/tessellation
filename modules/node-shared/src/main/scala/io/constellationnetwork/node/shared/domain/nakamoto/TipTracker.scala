@@ -29,14 +29,26 @@ trait TipTracker[F[_]] {
   /** Get the tip with the most attestation weight (fork choice). */
   def heaviestTip: F[Option[(Hash, Slot, Double)]]
 
-  /** GRANDPA-style chain finality: find the highest ordinal where cumulative attestation weight >= threshold.
+  /** GRANDPA-style chain finality, chain-aware: find the highest ordinal where cumulative attestation weight on OUR canonical chain >=
+    * threshold.
     *
-    * Attesting to ordinal N implicitly attests to all ancestors. Walk attestation ordinals from highest to lowest, accumulating weight. The
-    * highest ordinal where cumulative weight >= threshold is the finalized ordinal.
+    * Attesting to ordinal N with hash H implicitly attests to all ancestors of H. Walk attestation ordinals from highest to lowest,
+    * counting weight ONLY for attestations whose tipHash is reachable from our local tip (i.e., `canonicalHashAt(ord) == att.tipHash`).
     *
-    * Returns (highestFinalizedOrdinal, cumulativeWeight) or None if no ordinal reaches the threshold.
+    * '''Why hash-aware''': attesting to ordinal N on fork A must not add weight for finalizing ordinal N on fork B. The hash-agnostic
+    * predecessor silently let forked chains each "finalize" their local fork (observed in a 3-node cluster where gl0-2 forked: all three
+    * nodes logged ATTEST-FINALIZED at the same ordinals with weight=0.67, yet their mptRoots at each ordinal were permanently different).
+    *
+    * @param threshold
+    *   cumulative stake fraction required (e.g. 2/3)
+    * @param canonicalHashAt
+    *   lookup function that returns the canonical hash at a given ordinal on OUR local best chain (typically
+    *   `chainStore.walkBackTo(localTip.hash, ord)`). Attestations whose tipHash doesn't match are discarded from the weight sum.
     */
-  def highestFinalizedOrdinal(threshold: Double): F[Option[(Long, Double)]]
+  def highestFinalizedOrdinal(
+    threshold: Double,
+    canonicalHashAt: Long => F[Option[Hash]]
+  ): F[Option[(Long, Double)]]
 
   /** Get all current attestations (latest per peer). */
   def allAttestations: F[Map[PeerId, TipAttestation]]
@@ -108,18 +120,30 @@ object TipTracker {
             }
           } yield weighted.maxByOption(_._3).filter(_._3 > 0.0)
 
-        def highestFinalizedOrdinal(threshold: Double): F[Option[(Long, Double)]] =
+        def highestFinalizedOrdinal(
+          threshold: Double,
+          canonicalHashAt: Long => F[Option[Hash]]
+        ): F[Option[(Long, Double)]] =
           for {
             attestations <- attestationsRef.get
-            weighted <- attestations.toList.traverse {
+            // Filter each attestation against our canonical chain: only count weight if the peer
+            // attested to the hash that's actually on OUR chain at that ordinal. Attestations on
+            // other forks (different hash at same ordinal) contribute zero weight to finalizing
+            // our chain.
+            onChain <- attestations.toList.traverse[F, Option[(Long, Double)]] {
               case (peerId, att) =>
-                stakeRegistry.optimisticRelativeStake(peerId).map(w => (att.tipOrdinal, w))
+                canonicalHashAt(att.tipOrdinal).flatMap {
+                  case Some(localHash) if localHash === att.tipHash =>
+                    stakeRegistry.optimisticRelativeStake(peerId).map(w => Option((att.tipOrdinal, w)))
+                  case _ =>
+                    Option.empty[(Long, Double)].pure[F]
+                }
             }
           } yield {
-            // Sort by ordinal descending — highest attestation first
-            val sorted = weighted.filter(_._2 > 0.0).sortBy(-_._1)
-            // Walk down, accumulating weight. Attesting to ordinal N
-            // implicitly attests to all ancestors (GRANDPA property).
+            val sorted = onChain.flatten.filter(_._2 > 0.0).sortBy(-_._1)
+            // Walk down, accumulating weight. Attesting to ordinal N with a hash that's on our
+            // canonical chain implies attestation to all ancestors (GRANDPA property) — and since
+            // they're all our hashes, no cross-fork contamination.
             var cumWeight = 0.0
             sorted.collectFirst {
               case (ordinal, weight) if { cumWeight += weight; cumWeight >= threshold } =>

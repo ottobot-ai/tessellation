@@ -286,4 +286,77 @@ object TipTrackerSuite extends SimpleIOSuite {
         expect(all.get(peer1).exists(_.tipHash == tipA)) &&
         expect(all.get(peer2).exists(_.tipHash == tipB))
   }
+
+  test("highestFinalizedOrdinal skips attestations not on our canonical chain (fork scenario)") {
+    // Simulates 3-node cluster where gl0-2 forked. gl0-0/gl0-1 share chain A;
+    // gl0-2 is on chain B. All three attest their local tip at ordinal 100 with
+    // different hashes. For a gl0-0 caller (canonical chain = A), only gl0-0
+    // and gl0-1's attestations count → 2/3 weight = threshold met, finalize
+    // ordinal 100 with hash A. For a gl0-2 caller (canonical chain = B), only
+    // its own attestation counts → 1/3 < 2/3, no finality on B. This prevents
+    // the hash-agnostic bug that let both forks "finalize" in parallel.
+    val gl0_0 = pid("gl0-0")
+    val gl0_1 = pid("gl0-1")
+    val gl0_2 = pid("gl0-2")
+    val hashA100 = hash("chainA_ord100")
+    val hashB100 = hash("chainB_ord100")
+
+    for {
+      (tracker, _) <- setupTracker(Set(gl0_0, gl0_1, gl0_2))
+      _ <- tracker.recordAttestation(gl0_0, att(hashA100, slot(200), 100L, slot(201)))
+      _ <- tracker.recordAttestation(gl0_1, att(hashA100, slot(200), 100L, slot(201)))
+      _ <- tracker.recordAttestation(gl0_2, att(hashB100, slot(205), 100L, slot(206)))
+
+      // gl0-0's view: canonical chain A → ordinal 100 canonical hash = hashA100
+      fromChainA <- tracker.highestFinalizedOrdinal(
+        2.0 / 3.0,
+        ord => IO.pure(if (ord == 100L) Some(hashA100) else None)
+      )
+
+      // gl0-2's view: canonical chain B → ordinal 100 canonical hash = hashB100
+      fromChainB <- tracker.highestFinalizedOrdinal(
+        2.0 / 3.0,
+        ord => IO.pure(if (ord == 100L) Some(hashB100) else None)
+      )
+    } yield
+      // Chain A finalizes (gl0-0 + gl0-1 = 2/3 stake agree on A's ord 100)
+      expect(fromChainA.isDefined) &&
+        expect.same(100L, fromChainA.get._1) &&
+        expect(Math.abs(fromChainA.get._2 - 2.0 / 3.0) < 0.0001) &&
+        // Chain B does NOT finalize (only gl0-2 attests, 1/3 < 2/3)
+        expect.same(None, fromChainB)
+  }
+
+  test("highestFinalizedOrdinal: GRANDPA ancestor rule still works (all agree chain)") {
+    // No fork: all three peers attest different ordinals on the same chain.
+    // Finality should pick the highest ordinal where cumulative weight ≥ 2/3.
+    val peer1 = pid("peer1")
+    val peer2 = pid("peer2")
+    val peer3 = pid("peer3")
+    val h50 = hash("ord50")
+    val h60 = hash("ord60")
+    val h70 = hash("ord70")
+
+    for {
+      (tracker, _) <- setupTracker(Set(peer1, peer2, peer3))
+      _ <- tracker.recordAttestation(peer1, att(h70, slot(140), 70L, slot(141)))
+      _ <- tracker.recordAttestation(peer2, att(h60, slot(120), 60L, slot(121)))
+      _ <- tracker.recordAttestation(peer3, att(h50, slot(100), 50L, slot(101)))
+
+      result <- tracker.highestFinalizedOrdinal(
+        2.0 / 3.0,
+        ord =>
+          IO.pure(ord match {
+            case 70L => Some(h70)
+            case 60L => Some(h60)
+            case 50L => Some(h50)
+            case _   => None
+          })
+      )
+    } yield
+      // peer1 alone at ord 70 = 1/3 (below threshold),
+      // peer1 + peer2 cumulative at ord 60 = 2/3 (at threshold — finalize ord 60)
+      expect(result.isDefined) &&
+        expect.same(60L, result.get._1)
+  }
 }
