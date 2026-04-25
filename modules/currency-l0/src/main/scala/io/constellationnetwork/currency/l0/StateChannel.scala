@@ -158,12 +158,22 @@ object StateChannel {
         _ <- logger.info(s"Successfully initialized global snapshot storages with ordinal=${snapshot.ordinal}")
       } yield ()
 
+    /** Clear all global-snapshot state so the next pull cycle bootstraps fresh from the canonical head via the Left branch. Used when our
+      * locally-stored last snapshot is on an orphaned fork (state diverges from the producer's claim) — keep retrying the same orphan would
+      * stall ml0 indefinitely. Same recovery shape as cl1's `Validator.NotNext` handler.
+      */
+    def clearGlobalSnapshotStateForRebootstrap(reason: String): F[Unit] =
+      logger.warn(s"ml0 clearing global-snapshot state for re-bootstrap: $reason") >>
+        storages.lastSyncGlobalSnapshot.clear >>
+        sharedStorages.lastNGlobalSnapshot.clear >>
+        sharedStorages.lastGlobalSnapshot.clear
+
     def handleIncrementalSnapshot(
       snapshot: Hashed[GlobalIncrementalSnapshot],
       lastSnapshot: Hashed[GlobalIncrementalSnapshot],
       lastState: GlobalSnapshotInfo
     ): F[Unit] =
-      for {
+      (for {
         _ <- logger.info(s"Processing incremental snapshot ordinal=${snapshot.ordinal}")
         _ <- ensureMptInitialized(lastSnapshot.ordinal, lastState)
         context <- services.globalSnapshotContextFunctions.createContext(
@@ -192,7 +202,21 @@ object StateChannel {
             updateFailedConfirmingStateChannelBinaryMetrics() >>
             Async[F].unit
         }
-      } yield ()
+      } yield ()).handleErrorWith {
+        // createContext raises StateProofMismatch when ml0's local lastState diverges from
+        // the producer's claimed mptRoot at this ordinal. Indicates ml0's stored snapshot is
+        // on an orphaned fork (received via gossip in a transient gl0 reorg window). Without
+        // explicit recovery, ml0 retries the same orphan forever (observed: 554 retries on
+        // ord 322 stalled the spend tests). Same recovery shape as cl1's NotNext handler:
+        // wipe the stored last snapshot so the next pull cycle bootstraps fresh from the
+        // canonical head via the Left branch of pullGlobalSnapshots.
+        case e: io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalSnapshotContextFunctions.StateProofMismatch =>
+          clearGlobalSnapshotStateForRebootstrap(
+            s"StateProofMismatch at ordinal=${snapshot.ordinal.show}: ${e.getMessage}"
+          )
+        case other =>
+          Async[F].raiseError(other)
+      }
 
     def processSnapshotList(snapshots: List[Hashed[GlobalIncrementalSnapshot]]): F[Unit] =
       snapshots.tailRecM {
