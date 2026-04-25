@@ -158,9 +158,10 @@ object StateChannel {
         _ <- logger.info(s"Successfully initialized global snapshot storages with ordinal=${snapshot.ordinal}")
       } yield ()
 
-    // Clear all global-snapshot state so the next pull cycle bootstraps fresh from the canonical head via the Left branch. Used
-    // when our locally-stored last snapshot is on an orphaned fork (state diverges from the producer's claim) — keep retrying the
-    // same orphan would stall ml0 indefinitely. Same recovery shape as cl1's Validator.NotNext handler.
+    /** Clear all global-snapshot state so the next pull cycle bootstraps fresh from the canonical head via the Left branch. Used when our
+      * locally-stored last snapshot is on an orphaned fork (state diverges from the producer's claim) — keep retrying the same orphan would
+      * stall ml0 indefinitely. Same recovery shape as cl1's `Validator.NotNext` handler.
+      */
     def clearGlobalSnapshotStateForRebootstrap(reason: String): F[Unit] =
       logger.warn(s"ml0 clearing global-snapshot state for re-bootstrap: $reason") >>
         storages.lastSyncGlobalSnapshot.clear >>
