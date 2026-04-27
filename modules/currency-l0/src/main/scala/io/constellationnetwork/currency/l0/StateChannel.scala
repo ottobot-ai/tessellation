@@ -158,12 +158,42 @@ object StateChannel {
         _ <- logger.info(s"Successfully initialized global snapshot storages with ordinal=${snapshot.ordinal}")
       } yield ()
 
+    // Catch StateProofMismatch raised by createContext when ml0's stored lastState diverges
+    // from the producer's claimed mptRoot — happens when ml0 saved a snapshot from a gl0
+    // producer whose local-head was on a transient fork that the gl0 layer later reorg'd
+    // away from (maxvalid-tk). Without recovery the loop retries the same orphan forever
+    // (observed: 554 retries on ord 322 stalled spend tests at the bigset run).
+    //
+    // Recovery: fetch the canonical latest from majority and atomically swap all three
+    // storage refs via `setForRecovery`. Unlike `clear`, setForRecovery keeps stores
+    // populated, so downstream consumers (StateChannelBinarySender,
+    // CurrencySnapshotConsensusStateCreator, CurrencyMessagesService,
+    // StateChannelSnapshotService) continue to see a valid lastGlobalSnapshot and consensus
+    // stays Ready. MPT is realigned to the canonical state via syncFromGlobalSnapshotInfo.
+    def recoverFromOrphan(failedOrdinal: SnapshotOrdinal, cause: Throwable): F[Unit] =
+      for {
+        _ <- logger.warn(
+          s"ml0 StateProofMismatch at ord=${failedOrdinal.show} (${cause.getMessage}); fetching canonical latest from majority for setForRecovery"
+        )
+        canonical <- services.globalL0.pullLatestSnapshot
+        (canonicalSnapshot, canonicalState) = canonical
+        _ <- ensureMptInitialized(canonicalSnapshot.ordinal, canonicalState)
+        _ <- storages.lastSyncGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
+        _ <- sharedStorages.lastNGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
+        _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
+        _ <- persistGlobalSnapshot(canonicalSnapshot, canonicalState)
+        _ <- triggerOnGlobalSnapshotPullHook(canonicalSnapshot, canonicalState)
+        _ <- logger.info(
+          s"ml0 recovered to canonical ord=${canonicalSnapshot.ordinal.show}; will resume pulling forward on next tick"
+        )
+      } yield ()
+
     def handleIncrementalSnapshot(
       snapshot: Hashed[GlobalIncrementalSnapshot],
       lastSnapshot: Hashed[GlobalIncrementalSnapshot],
       lastState: GlobalSnapshotInfo
     ): F[Unit] =
-      for {
+      (for {
         _ <- logger.info(s"Processing incremental snapshot ordinal=${snapshot.ordinal}")
         _ <- ensureMptInitialized(lastSnapshot.ordinal, lastState)
         context <- services.globalSnapshotContextFunctions.createContext(
@@ -192,7 +222,11 @@ object StateChannel {
             updateFailedConfirmingStateChannelBinaryMetrics() >>
             Async[F].unit
         }
-      } yield ()
+      } yield ()).handleErrorWith {
+        case e: io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalSnapshotContextFunctions.StateProofMismatch =>
+          recoverFromOrphan(snapshot.ordinal, e)
+        case other => Async[F].raiseError(other)
+      }
 
     def processSnapshotList(snapshots: List[Hashed[GlobalIncrementalSnapshot]]): F[Unit] =
       snapshots.tailRecM {
