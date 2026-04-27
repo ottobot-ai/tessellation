@@ -46,7 +46,6 @@ import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.
 import io.circe.syntax.EncoderOps
 import io.circe.{Encoder, Json}
 import org.typelevel.log4cats.slf4j.Slf4jLogger
-import scodec.bits.ByteVector
 
 object GlobalStateConverter {
 
@@ -591,77 +590,15 @@ object GlobalStateConverter {
 
   /** Hex-keyed delta derived from a `StateChangesAccumulator` — pairs well with `MptStore.allEntriesAsBytes` (which is `Map[Hex,
     * Array[Byte]]`) for independent state-replay verification: `expected = (prevBytes -- removes) ++ upserts`.
-    *
-    * `preSyncBytes` is required because the system expiry-index partitions are written via per-bucket read-modify-write (see
-    * `applySystemIndexDelta`) — the accumulator only carries the per-epoch *delta* (adds/removes), not the resulting bucket bytes. Without
-    * the pre-sync map this helper would miss any bucket changes and produce a state-replay root that disagrees with the actual MPT after
-    * `syncFromStateChanges` runs.
     */
   def toAccumulatorHexDelta[F[_]: Async: Parallel: Hasher: JsonSerializer](
-    acc: StateChangesAccumulator,
-    preSyncBytes: Map[Hex, Array[Byte]]
+    acc: StateChangesAccumulator
   )(implicit stateProofSelector: StateProofSelector): F[(Map[Hex, Array[Byte]], Set[Hex])] =
     for {
       typedUpserts <- toAccumulatorBytesDelta[F](acc)
       upsertsHex <- typedUpserts.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }.map(_.toMap)
       removalsHex <- toAccumulatorRemovalKeys(acc).toList.parTraverse(GlobalStateKey.toHex[F]).map(_.toSet)
-      asExp <- replayExpiryIndexDelta[F, AllowSpendExpiryKey](
-        SystemNamespaceLabel.ExpiryIndexAllowSpends,
-        acc.allowSpendExpiryIndex,
-        preSyncBytes
-      )
-      tlExp <- replayExpiryIndexDelta[F, TokenLockExpiryKey](
-        SystemNamespaceLabel.ExpiryIndexTokenLocks,
-        acc.tokenLockExpiryIndex,
-        preSyncBytes
-      )
-      ncwExp <- replayExpiryIndexDelta[F, NodeCollateralWithdrawalExpiryKey](
-        SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
-        acc.nodeCollateralWithdrawalExpiryIndex,
-        preSyncBytes
-      )
-    } yield (upsertsHex ++ asExp._1 ++ tlExp._1 ++ ncwExp._1, removalsHex ++ asExp._2 ++ tlExp._2 ++ ncwExp._2)
-
-  /** Mirror of `applySystemIndexDelta`'s read-modify-write for the verify replay path. For each touched epoch bucket: decode the pre-sync
-    * bytes (if any), apply adds/removes, and decide upsert / remove / no-op the same way the in-store sync does. Skip-on-noop matches the
-    * writer so the resulting `(prevBytes -- removes) ++ upserts` equals the post-sync entry set bit-for-bit.
-    */
-  private def replayExpiryIndexDelta[F[_]: Async: Parallel: Hasher, K: Order](
-    label: SystemNamespaceLabel,
-    delta: SystemIndexDelta[K],
-    preSyncBytes: Map[Hex, Array[Byte]]
-  )(implicit codec: ImmutableCodec[SortedSet[K]]): F[(Map[Hex, Array[Byte]], Set[Hex])] = delta match {
-    case eb: SystemIndexDelta.EpochBucket[K] if eb.isEmpty =>
-      (Map.empty[Hex, Array[Byte]], Set.empty[Hex]).pure[F]
-    case eb: SystemIndexDelta.EpochBucket[K] =>
-      implicit val ordering: Ordering[K] = Order[K].toOrdering
-      eb.touchedEpochs.toList.parTraverse { epoch =>
-        for {
-          key <- GlobalStateKey.expiryIndexKey[F](label, epoch)
-          hexKey <- GlobalStateKey.toHex[F](key)
-        } yield {
-          val existing: SortedSet[K] = preSyncBytes.get(hexKey) match {
-            case Some(bytes) =>
-              codec.fromImmutableBytes(ByteVector.view(bytes)).getOrElse(SortedSet.empty[K])
-            case None => SortedSet.empty[K]
-          }
-          val toAdd = eb.adds.getOrElse(epoch, Set.empty[K])
-          val toRemove = eb.removes.getOrElse(epoch, Set.empty[K])
-          val merged: SortedSet[K] = (existing ++ toAdd) -- toRemove
-          if (merged.isEmpty && existing.nonEmpty)
-            (Map.empty[Hex, Array[Byte]], Set(hexKey))
-          else if (merged.nonEmpty && merged != existing)
-            (Map(hexKey -> codec.immutableBytes(merged).toArray), Set.empty[Hex])
-          else
-            (Map.empty[Hex, Array[Byte]], Set.empty[Hex])
-        }
-      }.map { results =>
-        val merged = results.foldLeft((Map.empty[Hex, Array[Byte]], Set.empty[Hex])) {
-          case ((accU, accR), (u, r)) => (accU ++ u, accR ++ r)
-        }
-        merged
-      }
-  }
+    } yield (upsertsHex, removalsHex)
 
   /** Removal keys derived from a `StateChangesAccumulator` — the delete half of `store.update(upserts, removes)` under MPT-as-primary.
     */
