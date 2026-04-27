@@ -149,9 +149,13 @@ const createInvalidEpochProgressAllowSpendTransaction = async (sourceAccount, am
 
     const { allowSpend: amount, fee } = getRandomAmounts();
 
-    const invalidLastValidEpochProgress = currentEpochProgress - 1;
+    // Use a margin matching EPOCH_PROGRESS_BUFFER so this test stays robust to
+    // dl1's view of `lastGlobalSnapshot.epochProgress` lagging gl0. With current-1,
+    // a brief lag of ~6 epochs lets the contextual validator's `>= currentEpoch + 5`
+    // bound accept the tx even though it's expired at gl0.
+    const invalidLastValidEpochProgress = Math.max(0, currentEpochProgress - CONSTANTS.EPOCH_PROGRESS_BUFFER);
 
-    logWorkflow.info(`Current epoch progress: ${currentEpochProgress}, setting invalid lastValidEpochProgress to ${invalidLastValidEpochProgress} (current - 1)`);
+    logWorkflow.info(`Current epoch progress: ${currentEpochProgress}, setting invalid lastValidEpochProgress to ${invalidLastValidEpochProgress} (current - ${CONSTANTS.EPOCH_PROGRESS_BUFFER})`);
     logWorkflow.info(`Using random amounts - allowSpend: ${amount}, fee: ${fee}`);
 
     return {
