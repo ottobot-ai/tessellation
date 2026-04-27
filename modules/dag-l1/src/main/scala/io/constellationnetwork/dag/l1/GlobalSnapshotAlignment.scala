@@ -1,5 +1,6 @@
 package io.constellationnetwork.dag.l1
 
+import cats.Parallel
 import cats.effect.Async
 import cats.syntax.all._
 
@@ -7,10 +8,12 @@ import scala.concurrent.duration.DurationInt
 
 import io.constellationnetwork.dag.l1.domain.snapshot.programs.SnapshotProcessor.SnapshotProcessingResult
 import io.constellationnetwork.dag.l1.modules._
+import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.domain.snapshot.services.GlobalL0Service
 import io.constellationnetwork.node.shared.modules.SharedStorages
 import io.constellationnetwork.schema._
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo, StateProof}
 import io.constellationnetwork.security._
@@ -19,7 +22,9 @@ import fs2.Stream
 import org.typelevel.log4cats.SelfAwareStructuredLogger
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-class GlobalSnapshotAlignment[F[_]: Async: HasherSelector: SecurityProvider, P <: StateProof, S <: Snapshot, SI <: SnapshotInfo[
+class GlobalSnapshotAlignment[F[
+  _
+]: Async: Parallel: HasherSelector: SecurityProvider: JsonSerializer, P <: StateProof, S <: Snapshot, SI <: SnapshotInfo[
   P
 ], R <: CliMethod](
   services: Services[F, P, S, SI, R],
@@ -155,6 +160,47 @@ class GlobalSnapshotAlignment[F[_]: Async: HasherSelector: SecurityProvider, P <
     } yield snapshots
   }
 
+  // Mirrors ml0's StateChannel orphan recovery (currency-l0/StateChannel.scala): when
+  // createContext raises StateProofMismatch the local lastState diverged from the producer's
+  // claim, indicating dl1 stored a snapshot from a gl0 producer whose head was on a transient
+  // fork that the gl0 layer later reorg'd away from. Without explicit recovery the batch loop
+  // skips this snapshot but the local stores still hold the orphan, so every subsequent batch
+  // hits parent-hash mismatch and stalls. Fix: fetch canonical latest from majority, realign
+  // MPT, atomically swap lastGlobalSnapshot + lastNGlobalSnapshot via setForRecovery, and set
+  // shouldRedownload so the next aligned snapshot rebuilds dl1-local state via the
+  // RedownloadNeeded path. Recovery best-effort — if pullLatestSnapshot fails we fall through
+  // to the legacy log+shouldRedownload behavior and retry next 10s tick.
+  private def recoverFromOrphan(
+    failedSnapshot: Hashed[GlobalIncrementalSnapshot],
+    cause: Throwable
+  )(
+    implicit stateProofSelector: StateProofSelector
+  ): F[Unit] = {
+    val ref = SnapshotReference.fromHashedSnapshot(failedSnapshot).show
+    val recovery = HasherSelector[F].withCurrent { implicit hasher =>
+      for {
+        canonical <- services.globalL0.pullLatestSnapshot
+        (canonicalSnapshot, canonicalState) = canonical
+        _ <- sharedStorages.mptStore.syncFromGlobalSnapshotInfo(canonicalState, canonicalSnapshot.ordinal)
+        _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
+        _ <- sharedStorages.lastNGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
+        _ <- storages.globalL0Alignment.updateShouldRedownload(
+          value = true,
+          reasons = List(s"DL1 setForRecovery to canonical ord=${canonicalSnapshot.ordinal.show} after StateProofMismatch at $ref")
+        )
+        _ <- logger.info(s"DL1 recovered to canonical ord=${canonicalSnapshot.ordinal.show}; will resume on next tick")
+      } yield ()
+    }
+    logger.warn(s"DL1 StateProofMismatch at $ref (${cause.getMessage}); fetching canonical latest from majority for setForRecovery") >>
+      recovery.handleErrorWith { recoveryErr =>
+        logger.error(recoveryErr)(s"DL1 setForRecovery recovery failed for $ref, falling back to log+shouldRedownload") >>
+          storages.globalL0Alignment.updateShouldRedownload(
+            value = true,
+            reasons = List(s"DL1 StateProofMismatch at $ref (recovery failed: ${recoveryErr.getMessage})")
+          )
+      }
+  }
+
   private def performSnapshotsBatchProcessing(
     snapshots: List[Hashed[GlobalIncrementalSnapshot]]
   )(
@@ -167,15 +213,19 @@ class GlobalSnapshotAlignment[F[_]: Async: HasherSelector: SecurityProvider, P <
             .process(snapshot.asRight[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)])
         }
           .map(result => (nextSnapshots, aggResults :+ result).asLeft[List[SnapshotProcessingResult]])
-          .handleErrorWith { e =>
-            val message = s"Failed to process snapshot ${SnapshotReference.fromHashedSnapshot(snapshot).show}, skipping"
-            for {
-              _ <- storages.globalL0Alignment.updateShouldRedownload(
-                value = true,
-                reasons = List(message)
-              )
-              _ <- logger.error(e)(message)
-            } yield (nextSnapshots, aggResults).asLeft[List[SnapshotProcessingResult]]
+          .handleErrorWith {
+            case e: io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalSnapshotContextFunctions.StateProofMismatch =>
+              recoverFromOrphan(snapshot, e)
+                .as((nextSnapshots, aggResults).asLeft[List[SnapshotProcessingResult]])
+            case e =>
+              val message = s"Failed to process snapshot ${SnapshotReference.fromHashedSnapshot(snapshot).show}, skipping"
+              for {
+                _ <- storages.globalL0Alignment.updateShouldRedownload(
+                  value = true,
+                  reasons = List(message)
+                )
+                _ <- logger.error(e)(message)
+              } yield (nextSnapshots, aggResults).asLeft[List[SnapshotProcessingResult]]
           }
 
       case (Nil, aggResults) =>
@@ -227,7 +277,11 @@ class GlobalSnapshotAlignment[F[_]: Async: HasherSelector: SecurityProvider, P <
 }
 
 object GlobalSnapshotAlignment {
-  def make[F[_]: Async: HasherSelector: SecurityProvider, P <: StateProof, S <: Snapshot, SI <: SnapshotInfo[P], R <: CliMethod](
+  def make[F[
+    _
+  ]: Async: Parallel: HasherSelector: SecurityProvider: JsonSerializer, P <: StateProof, S <: Snapshot, SI <: SnapshotInfo[
+    P
+  ], R <: CliMethod](
     services: Services[F, P, S, SI, R],
     programs: Programs[F, P, S, SI],
     storages: Storages[F, P, S, SI],
