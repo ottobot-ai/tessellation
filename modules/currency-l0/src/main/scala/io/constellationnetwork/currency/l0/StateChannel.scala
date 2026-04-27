@@ -15,6 +15,7 @@ import io.constellationnetwork.currency.l0.cli.method.Run
 import io.constellationnetwork.currency.l0.metrics.updateFailedConfirmingStateChannelBinaryMetrics
 import io.constellationnetwork.currency.l0.modules.{Programs, Services, Storages}
 import io.constellationnetwork.currency.schema.globalSnapshotSync.{GlobalSnapshotSync, GlobalSnapshotSyncReference}
+import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kernel.{:: => _, _}
 import io.constellationnetwork.node.shared.domain.snapshot.Validator
@@ -228,6 +229,15 @@ object StateChannel {
         case other => Async[F].raiseError(other)
       }
 
+    // ml0 is on an orphan fork at `lastSnapshot.ordinal` if the incoming snapshot is for the
+    // very next ordinal but its `lastSnapshotHash` doesn't point at our local hash. Differs
+    // from the StateProofMismatch orphan path (which fires inside `handleIncrementalSnapshot`
+    // after createContext disagrees on mptRoot): here we never even reach acceptance, because
+    // the chain-link check rejects the snapshot upfront, leaving the loop dropping every pull
+    // forever. Treat it the same way — fetch canonical latest from majority and reset.
+    def isOrphanFork(lastSnapshot: Hashed[GlobalIncrementalSnapshot], snapshot: Hashed[GlobalIncrementalSnapshot]): Boolean =
+      snapshot.ordinal === lastSnapshot.ordinal.next && snapshot.signed.value.lastSnapshotHash =!= lastSnapshot.hash
+
     def processSnapshotList(snapshots: List[Hashed[GlobalIncrementalSnapshot]]): F[Unit] =
       snapshots.tailRecM {
         case Nil =>
@@ -236,11 +246,22 @@ object StateChannel {
         case snapshot :: nextSnapshots =>
           storages.lastSyncGlobalSnapshot.get.flatMap {
             case Some(lastSnapshot) if !Validator.isNextSnapshot(lastSnapshot, snapshot.signed.value) =>
-              logger
-                .warn(
-                  s"Skipping non-next global snapshot ordinal=${snapshot.ordinal.show} (last=${lastSnapshot.ordinal.show}), dropping ${nextSnapshots.size + 1} remaining"
-                )
-                .as(().asRight[List[Hashed[GlobalIncrementalSnapshot]]])
+              if (isOrphanFork(lastSnapshot, snapshot))
+                logger
+                  .warn(
+                    s"ml0 orphan fork detected at ord=${lastSnapshot.ordinal.show}: incoming ord=${snapshot.ordinal.show} parent=${snapshot.signed.value.lastSnapshotHash.value
+                        .take(12)} ≠ local=${lastSnapshot.hash.value.take(12)}; triggering recovery"
+                  ) >>
+                  recoverFromOrphan(
+                    lastSnapshot.ordinal,
+                    new RuntimeException(s"orphan fork at ord=${lastSnapshot.ordinal.show} (chain-link mismatch)")
+                  ).as(().asRight[List[Hashed[GlobalIncrementalSnapshot]]])
+              else
+                logger
+                  .warn(
+                    s"Skipping non-next global snapshot ordinal=${snapshot.ordinal.show} (last=${lastSnapshot.ordinal.show}), dropping ${nextSnapshots.size + 1} remaining"
+                  )
+                  .as(().asRight[List[Hashed[GlobalIncrementalSnapshot]]])
 
             case _ =>
               storages.lastSyncGlobalSnapshot.getCombined.flatMap {
