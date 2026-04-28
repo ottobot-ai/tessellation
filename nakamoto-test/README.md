@@ -135,17 +135,18 @@ e2e cycles.
 
 | Variable | Test default | Prod default | Description |
 |----------|--------------|--------------|-------------|
-| `NAKAMOTO_LDD_AMPLITUDE` | 1.0 | 0.5 | fA — max probability at gap=1 |
-| `NAKAMOTO_LDD_BASELINE`  | 0.1 | 0.05 | fB — min probability floor |
-| `NAKAMOTO_LDD_CUTOFF`    | 32  | 15  | γ — gap where curve flattens |
-| `NAKAMOTO_LDD_OFFSET`    | 2   | 1   | ψ — snowplow offset |
+| `NAKAMOTO_LDD_AMPLITUDE` | 0.5 | 0.5 | fA — max probability at gap=1 |
+| `NAKAMOTO_LDD_BASELINE`  | 0.05 | 0.05 | fB — min probability floor |
+| `NAKAMOTO_LDD_CUTOFF`    | 16  | 15  | γ — gap where curve flattens |
+| `NAKAMOTO_LDD_OFFSET`    | 1   | 1   | ψ — snowplow offset |
 | `NAKAMOTO_SLOT_DURATION_MS` | 500 | 1000 | Slot tick interval |
 | `NAKAMOTO_SLOTS_PER_EPOCH`  | 60  | 60  | Slots per epoch |
 | `NAKAMOTO_ETA_ROTATION_SLOTS` | 600 | 600 | Eta randomness rotation |
 
-The test-cluster doubling of LDD plus halved slot duration gives roughly 4×
-chain throughput; the docker network has ~0ms inter-node delay so the higher
-concurrent-winner rate at fA=1.0 is fine for e2e.
+LDD parameters now match production defaults (within rounding — γ=16 vs 15)
+so the test cluster exercises the same eligibility curve as mainnet. Slot
+duration is halved to 500ms purely for finer-grained metrics; chain growth
+is wall-clock bound so it doesn't change throughput.
 
 ## Troubleshooting
 
