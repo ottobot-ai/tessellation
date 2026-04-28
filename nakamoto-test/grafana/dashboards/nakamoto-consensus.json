@@ -17,6 +17,7 @@
     {
       "id": 1,
       "title": "Best Ordinal",
+      "description": "Highest ordinal seen on any node (cluster leader's tip).",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 2 },
       "targets": [{ "expr": "max(dag_nakamoto_ordinal)", "legendFormat": "Best Ordinal" }],
@@ -25,6 +26,7 @@
     {
       "id": 2,
       "title": "Finalized Ordinal",
+      "description": "Highest finalized ordinal seen on any node.",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 4, "y": 2 },
       "targets": [{ "expr": "max(dag_nakamoto_finalized_ordinal)", "legendFormat": "Finalized" }],
@@ -33,6 +35,7 @@
     {
       "id": 3,
       "title": "Current Slot",
+      "description": "Slot number = seconds since genesis (slots tick at 1 Hz).",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 8, "y": 2 },
       "targets": [{ "expr": "max(dag_nakamoto_slot)", "legendFormat": "Slot" }],
@@ -40,15 +43,17 @@
     },
     {
       "id": 4,
-      "title": "Fill Rate",
+      "title": "Recent Fill %",
+      "description": "Windowed fill rate: rate(ordinal advance per slot) over $__rate_interval (auto-scales with the panel time range). Steady-state for default LDD with 1Hz slots and ~7s production cadence is ~14%. The previous cumulative-since-genesis metric monotonically decays after any startup gap and is no longer used here.",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 12, "y": 2 },
-      "targets": [{ "expr": "max(dag_nakamoto_fill_rate) * 100", "legendFormat": "Fill %" }],
+      "targets": [{ "expr": "max(rate(dag_nakamoto_ordinal[$__rate_interval])) * 100", "legendFormat": "Fill %" }],
       "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 5}, {"color": "green", "value": 10}] } } }
     },
     {
       "id": 14,
       "title": "Chain Length",
+      "description": "Number of blocks in the canonical chain at the leader.",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 16, "y": 2 },
       "targets": [{ "expr": "max(dag_nakamoto_chain_length)", "legendFormat": "Length" }],
@@ -56,25 +61,82 @@
     },
     {
       "id": 15,
-      "title": "Finalized Total",
+      "title": "Tip Spread",
+      "description": "max(ordinal) - min(ordinal) across all nodes. 0 = converged. Persistently > 5 = nodes failing to follow leader.",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 20, "y": 2 },
-      "targets": [{ "expr": "max(dag_nakamoto_finalized_total)", "legendFormat": "Finalized" }],
-      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "blue", "value": null}] } } }
+      "targets": [{ "expr": "max(dag_nakamoto_ordinal) - min(dag_nakamoto_ordinal)", "legendFormat": "Spread" }],
+      "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 31}] } } }
+    },
+
+    {
+      "id": 107,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 6 },
+      "options": { "mode": "markdown", "content": "# Network Health (cluster-wide)" }
+    },
+    {
+      "id": 33,
+      "title": "Tip & Finalized Spread",
+      "description": "max - min ordinal across nodes. Both lines should hover near 0. Tip spread > 5 sustained = nodes lagging leader. Finalized spread > 0 sustained = finality is not propagating.",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "max(dag_nakamoto_ordinal) - min(dag_nakamoto_ordinal)", "legendFormat": "tip spread" },
+        { "expr": "max(dag_nakamoto_finalized_ordinal) - min(dag_nakamoto_finalized_ordinal)", "legendFormat": "finalized spread" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 15, "lineWidth": 2 }, "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 31}] } } }
+    },
+    {
+      "id": 34,
+      "title": "Per-Node Lag From Leader",
+      "description": "Each node's distance from max(ordinal). Persistent positive lag identifies the laggard. 0 = caught up.",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        { "expr": "max(dag_nakamoto_ordinal) - dag_nakamoto_ordinal", "legendFormat": "{{node}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "none", "custom": { "drawStyle": "line", "fillOpacity": 5 }, "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 3}, {"color": "red", "value": 10}] } } }
+    },
+    {
+      "id": 35,
+      "title": "Fill % at Multiple Windows",
+      "description": "Windowed fill rate at three timescales. 1h = sustained-throughput trend. 15m = reactive (catches dips early). $__rate_interval = matches the panel time range. Steady state is roughly 14% under default LDD (γ=15, fA=0.5, fB=0.05) with 1Hz slots.",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        { "expr": "max(rate(dag_nakamoto_ordinal[1h])) * 100", "legendFormat": "1h sustained" },
+        { "expr": "max(rate(dag_nakamoto_ordinal[15m])) * 100", "legendFormat": "15m reactive" },
+        { "expr": "max(rate(dag_nakamoto_ordinal[$__rate_interval])) * 100", "legendFormat": "panel-scaled" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 } } }
+    },
+    {
+      "id": 36,
+      "title": "Network Production Rate",
+      "description": "Total snapshots produced per minute summed across cluster (gross — includes reorged/abandoned) vs the chain's tip advancement rate. Gap = work being thrown away to forks.",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        { "expr": "sum(rate(dag_nakamoto_snapshots_produced_total[$__rate_interval])) * 60", "legendFormat": "produced/min (sum)" },
+        { "expr": "max(rate(dag_nakamoto_ordinal[$__rate_interval])) * 60", "legendFormat": "tip advance/min" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } } }
     },
 
     {
       "id": 101,
       "title": "",
       "type": "text",
-      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 6 },
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 20 },
       "options": { "mode": "markdown", "content": "# Ordinal & Finality Progression" }
     },
     {
       "id": 6,
       "title": "Ordinal vs Finalized (per node)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
       "targets": [
         { "expr": "dag_nakamoto_ordinal", "legendFormat": "{{node}} tip" },
         { "expr": "dag_nakamoto_finalized_ordinal", "legendFormat": "{{node}} finalized" }
@@ -86,7 +148,7 @@
       "title": "Finality Lag (tip - finalized)",
       "description": "Number of unfinalized ordinals between tip and last finalized",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
       "targets": [
         { "expr": "dag_nakamoto_ordinal - dag_nakamoto_finalized_ordinal", "legendFormat": "{{node}} lag" }
       ],
@@ -97,14 +159,14 @@
       "id": 102,
       "title": "",
       "type": "text",
-      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 16 },
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 30 },
       "options": { "mode": "markdown", "content": "# Production & Gossip" }
     },
     {
       "id": 5,
       "title": "Snapshots / min (all nodes)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 18 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 32 },
       "targets": [
         { "expr": "sum(rate(dag_nakamoto_snapshots_produced_total[1m])) * 60", "legendFormat": "Produced/min" },
         { "expr": "sum(rate(dag_nakamoto_snapshots_received_total[1m])) * 60", "legendFormat": "Received/min (gossip)" }
@@ -115,7 +177,7 @@
       "id": 8,
       "title": "Slots Won / Rejected per min",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 18 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
       "targets": [
         { "expr": "rate(dag_nakamoto_slots_won_total[1m]) * 60", "legendFormat": "{{node}} won/min" },
         { "expr": "rate(dag_nakamoto_snapshots_rejected_total[1m]) * 60", "legendFormat": "{{node}} rejected/min" }
@@ -126,7 +188,7 @@
       "id": 9,
       "title": "Attestation Weight",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 18 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
       "targets": [
         { "expr": "dag_nakamoto_attestation_weight", "legendFormat": "{{node}}" }
       ],
@@ -137,14 +199,14 @@
       "id": 103,
       "title": "",
       "type": "text",
-      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 26 },
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 40 },
       "options": { "mode": "markdown", "content": "# Fork & Slot Health" }
     },
     {
       "id": 7,
       "title": "Fork Count",
       "type": "timeseries",
-      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 28 },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 42 },
       "targets": [
         { "expr": "dag_nakamoto_fork_count", "legendFormat": "{{node}}" }
       ],
@@ -155,7 +217,7 @@
       "title": "Avg Slot Gap",
       "description": "Average empty slots between consecutive snapshots (lower = denser chain)",
       "type": "stat",
-      "gridPos": { "h": 3, "w": 4, "x": 8, "y": 28 },
+      "gridPos": { "h": 3, "w": 4, "x": 8, "y": 42 },
       "targets": [{ "expr": "avg(dag_nakamoto_slot_gap_sum / dag_nakamoto_slot_gap_count)", "legendFormat": "Avg" }],
       "fieldConfig": { "defaults": { "unit": "none", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 10}, {"color": "red", "value": 20}] } } }
     },
@@ -163,7 +225,7 @@
       "id": 11,
       "title": "Max Slot Gap",
       "type": "stat",
-      "gridPos": { "h": 3, "w": 4, "x": 12, "y": 28 },
+      "gridPos": { "h": 3, "w": 4, "x": 12, "y": 42 },
       "targets": [{ "expr": "max(dag_nakamoto_slot_gap_max)", "legendFormat": "Max" }],
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "orange", "value": 30}, {"color": "red", "value": 100}] } } }
     },
@@ -172,7 +234,7 @@
       "title": "Slot Gap Over Time",
       "description": "Slot gap between consecutive snapshots (per node)",
       "type": "timeseries",
-      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 28 },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 42 },
       "targets": [
         { "expr": "rate(dag_nakamoto_slot_gap_sum[1m]) / rate(dag_nakamoto_slot_gap_count[1m])", "legendFormat": "{{node}} avg gap/min" }
       ],
@@ -183,7 +245,7 @@
       "title": "Snapshot Production Rate (per node)",
       "description": "Snapshots produced per minute by each node",
       "type": "timeseries",
-      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 31 },
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 45 },
       "targets": [
         { "expr": "rate(dag_nakamoto_snapshots_produced_total[1m]) * 60", "legendFormat": "{{node}}" }
       ],
@@ -194,7 +256,7 @@
       "id": 104,
       "title": "",
       "type": "text",
-      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 35 },
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 49 },
       "options": { "mode": "markdown", "content": "# DAG-L1 Transaction Layer" }
     },
     {
@@ -202,7 +264,7 @@
       "title": "L1 Blocks Received at GL0 / min",
       "description": "Rate of L1 blocks arriving at GL0 via HTTP POST /dag/l1-output",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 37 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 51 },
       "targets": [
         { "expr": "sum(rate(dag_http_request_count_total{route=\"dag_l1_output\",status=\"200\"}[1m])) * 60", "legendFormat": "L1 blocks/min (all GL0)" },
         { "expr": "rate(dag_http_request_count_total{route=\"dag_l1_output\",status=\"200\"}[1m]) * 60", "legendFormat": "{{node}} blocks/min" }
@@ -213,7 +275,7 @@
       "id": 13,
       "title": "L1 Blocks Received (cumulative per GL0)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 37 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 51 },
       "targets": [
         { "expr": "dag_http_request_count_total{route=\"dag_l1_output\",status=\"200\"}", "legendFormat": "{{node}}" }
       ],
@@ -224,7 +286,7 @@
       "title": "Events Drained vs Accepted per Snapshot",
       "description": "Mempool events drained and actually accepted per snapshot production",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 45 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 59 },
       "targets": [
         { "expr": "rate(dag_nakamoto_events_drained_sum[1m]) / rate(dag_nakamoto_events_drained_count[1m])", "legendFormat": "avg drained" },
         { "expr": "rate(dag_nakamoto_events_accepted_sum[1m]) / rate(dag_nakamoto_events_accepted_count[1m])", "legendFormat": "avg accepted" },
@@ -237,7 +299,7 @@
       "title": "Finality Latency (ms)",
       "description": "Wall-clock ms from snapshot production to attestation-finalization",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 45 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 59 },
       "targets": [
         { "expr": "rate(dag_nakamoto_finality_latency_ms_sum[1m]) / rate(dag_nakamoto_finality_latency_ms_count[1m])", "legendFormat": "avg finality ms" },
         { "expr": "dag_nakamoto_finality_latency_ms_max", "legendFormat": "max finality ms" }
@@ -249,7 +311,7 @@
       "title": "Production Duration (ms)",
       "description": "Wall-clock ms for snapshot creation (mempool drain → publish)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 53 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
       "targets": [
         { "expr": "rate(dag_nakamoto_production_duration_ms_sum[1m]) / rate(dag_nakamoto_production_duration_ms_count[1m])", "legendFormat": "{{node}} avg ms" }
       ],
@@ -260,7 +322,7 @@
       "title": "Production Abandoned",
       "description": "Snapshots abandoned due to better gossip received",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 53 },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 67 },
       "targets": [{ "expr": "sum(dag_nakamoto_production_abandoned_total)", "legendFormat": "Abandoned" }],
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 10}, {"color": "red", "value": 50}] } } }
     },
@@ -268,7 +330,7 @@
       "id": 26,
       "title": "Reorgs",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 53 },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 67 },
       "targets": [{ "expr": "sum(dag_nakamoto_reorgs_total)", "legendFormat": "Reorgs" }],
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 20}] } } }
     },
@@ -276,7 +338,7 @@
       "id": 27,
       "title": "Catch-ups",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 53 },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 67 },
       "targets": [{ "expr": "sum(dag_nakamoto_catchups_total)", "legendFormat": "Catch-ups" }],
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 3}] } } }
     },
@@ -285,7 +347,7 @@
       "id": 106,
       "title": "",
       "type": "text",
-      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 57 },
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 71 },
       "options": { "mode": "markdown", "content": "# Sidecar GossipSub" }
     },
     {
@@ -293,7 +355,7 @@
       "title": "GossipSub Mesh Peers",
       "description": "Number of peers in each GossipSub topic mesh",
       "type": "timeseries",
-      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 59 },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 73 },
       "targets": [
         { "expr": "sidecar_gossip_mesh_peers", "legendFormat": "{{instance}} {{topic}}" }
       ],
@@ -303,7 +365,7 @@
       "id": 29,
       "title": "Sidecar Messages Published / min",
       "type": "timeseries",
-      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 59 },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 73 },
       "targets": [
         { "expr": "rate(sidecar_gossip_messages_published_total[1m]) * 60", "legendFormat": "{{instance}} {{topic}}" }
       ],
@@ -313,7 +375,7 @@
       "id": 30,
       "title": "Sidecar Messages Received / min",
       "type": "timeseries",
-      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 59 },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 73 },
       "targets": [
         { "expr": "rate(sidecar_gossip_messages_received_total[1m]) * 60", "legendFormat": "{{instance}} {{topic}}" }
       ],
@@ -323,7 +385,7 @@
       "id": 31,
       "title": "Connected Peers",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 66 },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 80 },
       "targets": [{ "expr": "sidecar_connected_peers_total", "legendFormat": "{{instance}}" }],
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 2}] } } }
     },
@@ -331,7 +393,7 @@
       "id": 32,
       "title": "DHT Routing Table",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 66 },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 80 },
       "targets": [{ "expr": "sidecar_dht_routing_table_size", "legendFormat": "{{instance}}" }],
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 2}] } } }
     },
@@ -340,7 +402,7 @@
       "id": 105,
       "title": "",
       "type": "text",
-      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 70 },
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 84 },
       "options": { "mode": "markdown", "content": "# Backfill" }
     },
     {
@@ -348,7 +410,7 @@
       "title": "Backfill Progress",
       "description": "Ordinal progress of the backfill daemon",
       "type": "timeseries",
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 72 },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 86 },
       "targets": [
         { "expr": "dag_nakamoto_backfill_progress", "legendFormat": "{{node}} progress" }
       ],
@@ -358,7 +420,7 @@
       "id": 21,
       "title": "Backfill Completions",
       "type": "stat",
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 72 },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 86 },
       "targets": [
         { "expr": "sum(dag_nakamoto_backfill_completed_total)", "legendFormat": "Completions" }
       ],
@@ -366,5 +428,5 @@
     }
   ],
   "schemaVersion": 39,
-  "version": 2
+  "version": 3
 }
