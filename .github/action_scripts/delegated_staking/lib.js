@@ -414,7 +414,10 @@ const waitForStakeInclusion = async (urls, address, stakeHash, options = {}) => 
     {
       globalL0Url: urls.globalL0Url,
       name: 'waitForStakeInclusion',
-      maxOrdinalMisses: 10,
+      // 8-node reorg-storm budget: txs can sit in event mempool 15-25 ordinals before
+      // a non-paused producer drains them. Default 10 was too tight (~one ordinal short
+      // in observed runs). Same value as testUpdateDelegatedStake's per-call override.
+      maxOrdinalMisses: 40,
       maxStalledChecks: 30,
       interval: 2000,
       ...options
@@ -444,7 +447,10 @@ const waitForStakeWithdrawal = async (urls, address, stakeHash, options = {}) =>
     {
       globalL0Url: urls.globalL0Url,
       name: 'waitForStakeWithdrawal',
-      maxOrdinalMisses: 10,
+      // 8-node reorg-storm budget: txs can sit in event mempool 15-25 ordinals before
+      // a non-paused producer drains them. Default 10 was too tight (~one ordinal short
+      // in observed runs). Same value as testUpdateDelegatedStake's per-call override.
+      maxOrdinalMisses: 40,
       maxStalledChecks: 30,
       interval: 2000,
       ...options
@@ -484,7 +490,10 @@ const waitForTokenLockInclusion = async (urls, address, lockHash, options = {}) 
     {
       globalL0Url: urls.globalL0Url,
       name: 'waitForTokenLockInclusion',
-      maxOrdinalMisses: 10,
+      // 8-node reorg-storm budget: txs can sit in event mempool 15-25 ordinals before
+      // a non-paused producer drains them. Default 10 was too tight (~one ordinal short
+      // in observed runs). Same value as testUpdateDelegatedStake's per-call override.
+      maxOrdinalMisses: 40,
       maxStalledChecks: 30,
       interval: 2000,
       ...options
