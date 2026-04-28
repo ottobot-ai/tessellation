@@ -44,10 +44,10 @@
     {
       "id": 4,
       "title": "Recent Fill %",
-      "description": "Windowed fill rate: rate(ordinal advance per slot) over $__rate_interval (auto-scales with the panel time range). Steady-state for default LDD with 1Hz slots and ~7s production cadence is ~14%. The previous cumulative-since-genesis metric monotonically decays after any startup gap and is no longer used here.",
+      "description": "Windowed fill rate: ordinal advance per slot over $__rate_interval (auto-scales with the panel time range). Computed as rate(ordinal) / rate(slot), so it stays correct under any slot duration. Steady state depends on LDD parameters and node count.",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 12, "y": 2 },
-      "targets": [{ "expr": "max(rate(dag_nakamoto_ordinal[$__rate_interval])) * 100", "legendFormat": "Fill %" }],
+      "targets": [{ "expr": "max(rate(dag_nakamoto_ordinal[$__rate_interval])) / max(rate(dag_nakamoto_slot[$__rate_interval])) * 100", "legendFormat": "Fill %" }],
       "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "thresholds": { "mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 5}, {"color": "green", "value": 10}] } } }
     },
     {
@@ -102,13 +102,13 @@
     {
       "id": 35,
       "title": "Fill % at Multiple Windows",
-      "description": "Windowed fill rate at three timescales. 1h = sustained-throughput trend. 15m = reactive (catches dips early). $__rate_interval = matches the panel time range. Steady state is roughly 14% under default LDD (γ=15, fA=0.5, fB=0.05) with 1Hz slots.",
+      "description": "Windowed fill rate at three timescales. 1h = sustained-throughput trend. 15m = reactive (catches dips early). $__rate_interval = matches the panel time range. Computed as rate(ordinal) / rate(slot), so it stays correct under any slot duration.",
       "type": "timeseries",
       "gridPos": { "h": 6, "w": 12, "x": 0, "y": 14 },
       "targets": [
-        { "expr": "max(rate(dag_nakamoto_ordinal[1h])) * 100", "legendFormat": "1h sustained" },
-        { "expr": "max(rate(dag_nakamoto_ordinal[15m])) * 100", "legendFormat": "15m reactive" },
-        { "expr": "max(rate(dag_nakamoto_ordinal[$__rate_interval])) * 100", "legendFormat": "panel-scaled" }
+        { "expr": "max(rate(dag_nakamoto_ordinal[1h])) / max(rate(dag_nakamoto_slot[1h])) * 100", "legendFormat": "1h sustained" },
+        { "expr": "max(rate(dag_nakamoto_ordinal[15m])) / max(rate(dag_nakamoto_slot[15m])) * 100", "legendFormat": "15m reactive" },
+        { "expr": "max(rate(dag_nakamoto_ordinal[$__rate_interval])) / max(rate(dag_nakamoto_slot[$__rate_interval])) * 100", "legendFormat": "panel-scaled" }
       ],
       "fieldConfig": { "defaults": { "unit": "percent", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 } } }
     },
