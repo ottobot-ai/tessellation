@@ -653,6 +653,11 @@ const testIncreaseDelegatedStake = async (urls, account, stakeHash, nodeId) => {
     {
       globalL0Url: urls.globalL0Url,
       name: 'assertDelegatedStakeUpdated',
+      // Same 8-node reorg-storm budget as testUpdateDelegatedStake above. Token-lock-replacement
+      // path (createTokenLock with replaceTokenLockRef) sits in the event mempool until a non-paused
+      // producer drains it; observed run had the lock land at ord 76 with the test polling from
+      // ord 62 — default 10 gives up one short.
+      maxOrdinalMisses: 40,
     },
   )
   logWorkflow.info('Stake increase verified with balance change and rewards >= original')
