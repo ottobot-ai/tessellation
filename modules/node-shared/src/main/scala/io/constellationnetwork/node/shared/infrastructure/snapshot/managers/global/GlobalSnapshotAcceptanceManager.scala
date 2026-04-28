@@ -1246,6 +1246,63 @@ object GlobalSnapshotAcceptanceManager {
                 s"nc=${removedNodeCollateralKeys.size},ncw=${removedNodeCollateralWithdrawalKeys.size})"
             )
 
+            // Temporary instrumentation for ml0/gl0 mptRoot divergence (task #18). Per-field content
+            // fingerprints of the accumulator deltas; identical fingerprints between two nodes mean
+            // identical input to the MPT writer for that field. Compare gl0-0 vs ml0-0 logs at the
+            // first diverging ordinal to localize which field carries the gl0/ml0 disagreement.
+            _ <- loggerBundle.app.info(
+              s"[ACCEPTANCE] ordinal=$ordinal MPT_SYNC_FP: " +
+                s"balances=[${stateChangesAccumulator.balances.size},${"%08x".format(stateChangesAccumulator.balances.toString.hashCode)}] " +
+                s"scHashes=[${stateChangesAccumulator.lastStateChannelSnapshotHashes.size},${"%08x"
+                    .format(stateChangesAccumulator.lastStateChannelSnapshotHashes.toString.hashCode)}] " +
+                s"txRefs=[${stateChangesAccumulator.lastTxRefs.size},${"%08x".format(stateChangesAccumulator.lastTxRefs.toString.hashCode)}] " +
+                s"currSnapshots=[${stateChangesAccumulator.lastCurrencySnapshots.size},${"%08x"
+                    .format(stateChangesAccumulator.lastCurrencySnapshots.toString.hashCode)}] " +
+                s"currProofs=[${stateChangesAccumulator.lastCurrencySnapshotsProofs.size},${"%08x"
+                    .format(stateChangesAccumulator.lastCurrencySnapshotsProofs.toString.hashCode)}] " +
+                s"allowSpends=[${stateChangesAccumulator.activeAllowSpends.size},${"%08x"
+                    .format(stateChangesAccumulator.activeAllowSpends.toString.hashCode)}] " +
+                s"tokenLocks=[${stateChangesAccumulator.activeTokenLocks.size},${"%08x"
+                    .format(stateChangesAccumulator.activeTokenLocks.toString.hashCode)}] " +
+                s"tokenLockBal=[${stateChangesAccumulator.tokenLockBalances.size},${"%08x"
+                    .format(stateChangesAccumulator.tokenLockBalances.toString.hashCode)}] " +
+                s"asRefs=[${stateChangesAccumulator.lastAllowSpendRefs.size},${"%08x"
+                    .format(stateChangesAccumulator.lastAllowSpendRefs.toString.hashCode)}] " +
+                s"tlRefs=[${stateChangesAccumulator.lastTokenLockRefs.size},${"%08x"
+                    .format(stateChangesAccumulator.lastTokenLockRefs.toString.hashCode)}] " +
+                s"delegStakes=[${stateChangesAccumulator.activeDelegatedStakes.size},${"%08x"
+                    .format(stateChangesAccumulator.activeDelegatedStakes.toString.hashCode)}] " +
+                s"delegWithdrawals=[${stateChangesAccumulator.delegatedStakesWithdrawals.size},${"%08x"
+                    .format(stateChangesAccumulator.delegatedStakesWithdrawals.toString.hashCode)}] " +
+                s"nodeColl=[${stateChangesAccumulator.activeNodeCollaterals.size},${"%08x"
+                    .format(stateChangesAccumulator.activeNodeCollaterals.toString.hashCode)}] " +
+                s"nodeCollWithdrawals=[${stateChangesAccumulator.nodeCollateralWithdrawals.size},${"%08x"
+                    .format(stateChangesAccumulator.nodeCollateralWithdrawals.toString.hashCode)}] " +
+                s"metagraphSync=[${stateChangesAccumulator.metagraphSyncData.size},${"%08x"
+                    .format(stateChangesAccumulator.metagraphSyncData.toString.hashCode)}] " +
+                s"updateNodeParams=[${stateChangesAccumulator.updateNodeParameters.size},${"%08x"
+                    .format(stateChangesAccumulator.updateNodeParameters.toString.hashCode)}] " +
+                s"priceState=[${stateChangesAccumulator.priceState.size},${"%08x"
+                    .format(stateChangesAccumulator.priceState.toString.hashCode)}] " +
+                s"asExpiry=${"%08x".format(stateChangesAccumulator.allowSpendExpiryIndex.toString.hashCode)} " +
+                s"tlExpiry=${"%08x".format(stateChangesAccumulator.tokenLockExpiryIndex.toString.hashCode)} " +
+                s"ncwExpiry=${"%08x".format(stateChangesAccumulator.nodeCollateralWithdrawalExpiryIndex.toString.hashCode)} " +
+                s"removed(as=${stateChangesAccumulator.removedAllowSpendKeys.size}/${"%08x"
+                    .format(stateChangesAccumulator.removedAllowSpendKeys.toString.hashCode)}," +
+                s"tl=${stateChangesAccumulator.removedTokenLockKeys.size}/${"%08x"
+                    .format(stateChangesAccumulator.removedTokenLockKeys.toString.hashCode)}," +
+                s"tlb=${stateChangesAccumulator.removedTokenLockBalanceKeys.size}/${"%08x"
+                    .format(stateChangesAccumulator.removedTokenLockBalanceKeys.toString.hashCode)}," +
+                s"ds=${stateChangesAccumulator.removedDelegatedStakeKeys.size}/${"%08x"
+                    .format(stateChangesAccumulator.removedDelegatedStakeKeys.toString.hashCode)}," +
+                s"dsw=${stateChangesAccumulator.removedDelegatedStakeWithdrawalKeys.size}/${"%08x"
+                    .format(stateChangesAccumulator.removedDelegatedStakeWithdrawalKeys.toString.hashCode)}," +
+                s"nc=${stateChangesAccumulator.removedNodeCollateralKeys.size}/${"%08x"
+                    .format(stateChangesAccumulator.removedNodeCollateralKeys.toString.hashCode)}," +
+                s"ncw=${stateChangesAccumulator.removedNodeCollateralWithdrawalKeys.size}/${"%08x"
+                    .format(stateChangesAccumulator.removedNodeCollateralWithdrawalKeys.toString.hashCode)})"
+            )
+
             // === MPT Sync with undo journal ===
             // Before applying deltas, detect fork switches: if the journal tip doesn't
             // match ordinal-1 (the parent), the MPT has state from a different fork.
@@ -1274,6 +1331,16 @@ object GlobalSnapshotAcceptanceManager {
             // producer. If both paths agree on the post-state root, the writer is validated
             // without needing `GlobalSnapshotInfo` as an intermediate.
             preSyncBytes <- mptStore.allEntriesAsBytes
+            // Temporary instrumentation (task #18): fingerprint of starting MPT bytes. Combined with
+            // MPT_SYNC_FP above, gives us the two writer inputs (prev state + delta) for gl0/ml0 diff.
+            // Map[Hex, Array[Byte]] needs sort + content-aware hash since Map order is non-deterministic
+            // and Array.toString is identity-based.
+            _ <- loggerBundle.app.info {
+              val sorted = preSyncBytes.toSeq.sortBy(_._1.toString)
+              val fp = sorted.map { case (k, v) => (k.toString, java.util.Arrays.hashCode(v)) }.toString.hashCode
+              s"[ACCEPTANCE] ordinal=$ordinal MPT_SYNC_PRE: " +
+                s"entries=${preSyncBytes.size} hash=${"%08x".format(fp)}"
+            }
             syncAction = mptStore.syncFromStateChanges(stateChangesAccumulator, ordinal)
             _ <- undoJournal match {
               case Some(journal) =>
@@ -1285,6 +1352,33 @@ object GlobalSnapshotAcceptanceManager {
               case None =>
                 syncAction
             }
+            // Temporary instrumentation (task #18): fingerprint the END gsi components used by
+            // builder.buildProof. If MPT_SYNC_PRE + MPT_SYNC_FP match across nodes but mptRoot
+            // still diverges, the difference must be here.
+            _ <- loggerBundle.app.info(
+              s"[ACCEPTANCE] ordinal=$ordinal GSI_END_FP: " +
+                s"balances=[${gsi.balances.size},${"%08x".format(gsi.balances.toString.hashCode)}] " +
+                s"scHashes=[${gsi.lastStateChannelSnapshotHashes.size},${"%08x"
+                    .format(gsi.lastStateChannelSnapshotHashes.toString.hashCode)}] " +
+                s"txRefs=[${gsi.lastTxRefs.size},${"%08x".format(gsi.lastTxRefs.toString.hashCode)}] " +
+                s"currSnapshots=[${gsi.lastCurrencySnapshots.size},${"%08x".format(gsi.lastCurrencySnapshots.toString.hashCode)}] " +
+                s"currProofs=[${gsi.lastCurrencySnapshotsProofs.size},${"%08x"
+                    .format(gsi.lastCurrencySnapshotsProofs.toString.hashCode)}] " +
+                s"allowSpends=[${gsi.activeAllowSpends.fold(0)(_.size)},${"%08x".format(gsi.activeAllowSpends.toString.hashCode)}] " +
+                s"tokenLocks=[${gsi.activeTokenLocks.fold(0)(_.size)},${"%08x".format(gsi.activeTokenLocks.toString.hashCode)}] " +
+                s"tokenLockBal=[${gsi.tokenLockBalances.fold(0)(_.size)},${"%08x".format(gsi.tokenLockBalances.toString.hashCode)}] " +
+                s"asRefs=[${gsi.lastAllowSpendRefs.fold(0)(_.size)},${"%08x".format(gsi.lastAllowSpendRefs.toString.hashCode)}] " +
+                s"tlRefs=[${gsi.lastTokenLockRefs.fold(0)(_.size)},${"%08x".format(gsi.lastTokenLockRefs.toString.hashCode)}] " +
+                s"delegStakes=[${gsi.activeDelegatedStakes.fold(0)(_.size)},${"%08x".format(gsi.activeDelegatedStakes.toString.hashCode)}] " +
+                s"delegWithdrawals=[${gsi.delegatedStakesWithdrawals.fold(0)(_.size)},${"%08x"
+                    .format(gsi.delegatedStakesWithdrawals.toString.hashCode)}] " +
+                s"nodeColl=[${gsi.activeNodeCollaterals.fold(0)(_.size)},${"%08x".format(gsi.activeNodeCollaterals.toString.hashCode)}] " +
+                s"nodeCollWithdrawals=[${gsi.nodeCollateralWithdrawals.fold(0)(_.size)},${"%08x"
+                    .format(gsi.nodeCollateralWithdrawals.toString.hashCode)}] " +
+                s"metagraphSync=[${gsi.metagraphSyncData.fold(0)(_.size)},${"%08x".format(gsi.metagraphSyncData.toString.hashCode)}] " +
+                s"updateNodeParams=[${gsi.updateNodeParameters.fold(0)(_.size)},${"%08x".format(gsi.updateNodeParameters.toString.hashCode)}] " +
+                s"priceState=[${gsi.priceState.fold(0)(_.size)},${"%08x".format(gsi.priceState.toString.hashCode)}]"
+            )
             incrementalProof <- builder.buildProof(gsi, ordinal)
 
             // Verify incremental (FileSystem producer incremental-insert) against independent
