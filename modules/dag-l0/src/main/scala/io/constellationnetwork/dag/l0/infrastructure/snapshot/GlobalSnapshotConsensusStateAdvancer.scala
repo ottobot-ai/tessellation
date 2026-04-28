@@ -646,11 +646,37 @@ object GlobalSnapshotConsensusStateAdvancer {
       } else {
         // Leader proposed a different artifact — apply it via the follower path.
         // createContext (follower path) mutates the shared MptStore.
-        // We take a savepoint so we can restore on IO-level failure to prevent
-        // partial state from cascading to future rounds.
+        //
+        // Discard own proposal-build mutations BEFORE validating leader's artifact.
+        // Both `createProposalArtifact` and `validateLeaderArtifact` call
+        // `snapshotAcceptanceManager.accept`, which writes to the shared MPT via
+        // `syncFromStateChanges`. If the proposal-build mutations are kept underneath
+        // the validation mutations, the residual entries from proposal-build (keys the
+        // leader's accept didn't touch) survive — and they vary across nodes (each
+        // node's proposal-build sees a slightly different mempool / facilitator view).
+        // Result: the same finalized snapshot ends up with different MPT roots on
+        // different nodes, even though all nodes agree on the canonical signed
+        // artifact. Throwing away own proposal here ensures validation's writes are
+        // the ONLY mutations committed when the round adopts the leader's artifact.
+        //
+        // We then take a fresh savepoint so validation can be rolled back on IO-level
+        // failure or validation rejection without poisoning future rounds.
         resources.artifacts.get(leaderProposal.hash) match {
           case Some(leaderArtifact) =>
-            mptStore.savepoint.flatMap { sp =>
+            proposalSavepointRef.getAndSet(none).flatMap {
+              case Some((spKey, proposalSp)) if spKey === state.key =>
+                proposalSp.restore >>
+                  ConsensusLog.info(
+                    logger,
+                    Category.Lifecycle,
+                    state.key.show,
+                    "n/a",
+                    Event.MptSavepointRestored,
+                    "reason" -> "leader_validation_starting"
+                  )
+              case _ =>
+                Async[F].unit
+            } >> mptStore.savepoint.flatMap { sp =>
               val validate =
                 ConsensusLog.info(
                   logger,
