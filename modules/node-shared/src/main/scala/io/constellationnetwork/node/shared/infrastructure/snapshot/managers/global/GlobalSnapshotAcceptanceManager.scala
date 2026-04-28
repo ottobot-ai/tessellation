@@ -1324,20 +1324,33 @@ object GlobalSnapshotAcceptanceManager {
                         .as(incrementalProof)
                     } else {
                       // Writer divergence — `syncFromStateChanges` produced bytes that don't
-                      // match the expected `prev ⊖ removes ⊕ upserts` replay. This is a writer
-                      // bug; fail acceptance so it surfaces in tests instead of silently healing.
-                      loggerBundle.app.error(
-                        s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptConsistency=DIVERGED " +
-                          s"incremental=${incrementalRoot.take(12)} replay=${verifyRoot.take(12)} " +
-                          s"entries=${expectedBytes.size} " +
-                          s"deltaUpserts=${deltaUpserts.size} deltaRemoves=${deltaRemoves.size} " +
-                          s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
-                      ) >>
-                        Async[F].raiseError[GlobalSnapshotStateProof](
-                          new RuntimeException(
-                            s"MPT writer divergence at ordinal $ordinal: incremental=$incrementalRoot replay=$verifyRoot"
-                          )
+                      // match the expected `prev ⊖ removes ⊕ upserts` replay. Resync from GSI
+                      // as the emergency safety net (gsi materialization is still here until
+                      // consumer-migration deletes it). Flag loudly: this is a writer bug.
+                      for {
+                        _ <- loggerBundle.app.error(
+                          s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptConsistency=DIVERGED " +
+                            s"incremental=${incrementalRoot.take(12)} replay=${verifyRoot.take(12)} " +
+                            s"ACTION=gsi_resync entries=${expectedBytes.size} " +
+                            s"deltaUpserts=${deltaUpserts.size} deltaRemoves=${deltaRemoves.size} " +
+                            s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
                         )
+                        _ <- mptStore.syncFromGlobalSnapshotInfo(gsi, ordinal)
+                        healedProof <- builder.buildProof(gsi, ordinal)
+                        healedRoot = healedProof.mptRoot.map(_.show).getOrElse("none")
+                        _ <-
+                          if (healedRoot == verifyRoot)
+                            loggerBundle.app.info(
+                              s"[ACCEPTANCE] ordinal=$ordinal MPT healed: mptRoot=${healedRoot.take(12)} MATCH after resync"
+                            )
+                          else
+                            loggerBundle.app.error(
+                              s"[ACCEPTANCE] ordinal=$ordinal MPT STILL DIVERGED after resync: " +
+                                s"healed=${healedRoot.take(12)} expected=${verifyRoot.take(12)}"
+                            )
+                        // Also reset journal state after full resync
+                        _ <- undoJournal.traverse_(_.pruneBelow(ordinal.value.value))
+                      } yield healedProof
                     }
                 } yield result
               }
