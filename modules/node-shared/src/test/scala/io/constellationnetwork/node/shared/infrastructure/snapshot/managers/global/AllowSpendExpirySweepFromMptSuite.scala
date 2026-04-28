@@ -13,7 +13,7 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -26,17 +26,13 @@ import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
 import weaver.MutableIOSuite
 
-/** Equivalence harness for phase 2b index-driven expiry sweep.
+/** Spec assertions for the surviving MPT-backed allow-spend expiry sweep.
   *
-  * Phase 2a maintains the allow-spend expiry index on every accept(). Phase 2b replaces the `O(N)` full-map filter with an index-driven
-  * sweep of buckets `[previousEpochProgress .. epochProgress - 1]`. For the flip to be safe at #88/#91, the two paths must return the same
-  * set of `(address, hash)` pairs for the global (`metagraphId = None`) partition under the phase-2a invariant.
-  *
-  * These tests seed matched state on both paths — identical `lastActiveGlobalAllowSpends` map plus an index rebuilt from that map — and
-  * assert `findExpiredGlobalAllowSpendsViaIndex` returns the same set as `filterExpiredAllowSpends` (with empty-set entries elided, since
-  * the index path cannot emit addresses with zero expiring records).
+  * After the legacy in-memory `findExpiredGlobalAllowSpendsViaIndex(map)` was deleted, this suite asserts
+  * `findExpiredGlobalAllowSpendsViaIndexFromMpt(prev, curr)` directly. Window semantics: AllowSpend uses `lastValidEpochProgress <
+  * epochProgress` so the sweep range is `[prev .. curr - 1]`. Only global-partition (metagraphId = None) records are returned.
   */
-object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
+object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
 
   implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
   implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
@@ -73,9 +69,8 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
       testProofs
     )
 
-  /** Build an MPT store seeded with the same state that the GSI rebuild path would produce from `lastActive`. Uses
-    * `syncFromGlobalSnapshotInfo` so the expiry index is materialized from the same records the in-memory map contains — the exact phase-2a
-    * invariant.
+  /** Seed an MPT store from a `lastActive` map by going through `syncFromGlobalSnapshotInfo` — same writer the sweep reads, so the seed
+    * mirrors the phase-2a invariant.
     */
   private def mkSeededMptStore(
     lastActive: SortedMap[Address, SortedSet[Signed[AllowSpend]]]
@@ -89,9 +84,6 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
       _ <- store.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(1L)))
     } yield store
 
-  /** Helper: extract `(address, hash)` pairs from a nested SortedMap[Address, SortedSet[Signed[AllowSpend]]], filtering out empty entries.
-    * Used to compare index-sweep output against legacy-filter output without caring about empty-set key placeholders.
-    */
   private def toAddressHashPairs(
     m: SortedMap[Address, SortedSet[Signed[AllowSpend]]]
   )(implicit h: Hasher[IO]): IO[Set[(Address, Hash)]] =
@@ -100,7 +92,7 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
         set.toList.traverse(s => s.toHashed.map(hashed => (addr, hashed.hash)))
     }.map(_.toSet)
 
-  test("index sweep and legacy filter return the same (addr, hash) set — mixed expired and not") { res =>
+  test("FromMpt sweep returns exactly the expiring records — mixed expired and not") { res =>
     implicit val (h, sp, js) = res
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -119,31 +111,23 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
         addr1 -> SortedSet(asExpiredA, asValidA),
         addr2 -> SortedSet(asValidB)
       )
-      lastActiveOuter = SortedMap(Option.empty[Address] -> lastActive)
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](Some(store))
+      mgr = AllowSpendStateManager.make[IO](Some(store), shouldUseMptStore = true)
 
       // Current epoch 300: asExpiredA (100) is expired, others not yet.
       // previousEpochProgress = MinValue: sweep all buckets up to 299.
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
 
-      legacyExpired = mgr.filterExpiredAllowSpends(lastActive, currentEpoch)
-      indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndex(prevEpoch, currentEpoch, lastActive)
-
-      legacyPairs <- toAddressHashPairs(legacyExpired)
+      indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndexFromMpt(prevEpoch, currentEpoch)
       indexPairs <- toAddressHashPairs(indexExpired)
 
       expectedHashed <- asExpiredA.toHashed
-    } yield
-      expect.all(
-        legacyPairs == indexPairs,
-        indexPairs == Set((addr1, expectedHashed.hash))
-      )
+    } yield expect(indexPairs == Set((addr1, expectedHashed.hash)))
   }
 
-  test("index sweep and legacy filter agree when nothing is expired") { res =>
+  test("FromMpt sweep returns empty when nothing is expired") { res =>
     implicit val (h, sp, js) = res
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -154,40 +138,37 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(asValid))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](Some(store))
+      mgr = AllowSpendStateManager.make[IO](Some(store), shouldUseMptStore = true)
 
       currentEpoch = EpochProgress(NonNegLong(500L))
       prevEpoch = EpochProgress(NonNegLong(100L))
 
-      legacyExpired = mgr.filterExpiredAllowSpends(lastActive, currentEpoch)
-      indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndex(prevEpoch, currentEpoch, lastActive)
-
-      legacyPairs <- toAddressHashPairs(legacyExpired)
+      indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndexFromMpt(prevEpoch, currentEpoch)
       indexPairs <- toAddressHashPairs(indexExpired)
-    } yield expect.all(legacyPairs.isEmpty, indexPairs.isEmpty, legacyPairs == indexPairs)
+    } yield expect(indexPairs.isEmpty)
   }
 
-  test("index sweep returns empty when previousEpochProgress >= epochProgress (same-epoch ordinals)") { res =>
+  test("FromMpt sweep returns empty when previousEpochProgress >= epochProgress (same-epoch ordinals)") { res =>
     implicit val (h, sp, js) = res
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       dest <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
       addr = kp.getPublic.toAddress
 
-      // Even though this record WOULD be expired by the legacy filter, the sweep window is empty.
+      // Even though this record WOULD be expired by a free filter, the sweep window is empty.
       asExpired = mkAllowSpend(addr, dest, EpochProgress(NonNegLong(50L)), "wouldExpire")
       lastActive = SortedMap(addr -> SortedSet(asExpired))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](Some(store))
+      mgr = AllowSpendStateManager.make[IO](Some(store), shouldUseMptStore = true)
 
       sameEpoch = EpochProgress(NonNegLong(200L))
-      indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndex(sameEpoch, sameEpoch, lastActive)
+      indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndexFromMpt(sameEpoch, sameEpoch)
       indexPairs <- toAddressHashPairs(indexExpired)
     } yield expect(indexPairs.isEmpty)
   }
 
-  test("index sweep matches legacy filter when sweep window covers multiple epochs") { res =>
+  test("FromMpt sweep returns all expiring records when window covers multiple epochs") { res =>
     implicit val (h, sp, js) = res
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -206,25 +187,33 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](Some(store))
+      mgr = AllowSpendStateManager.make[IO](Some(store), shouldUseMptStore = true)
 
-      // Sweep window covers 101..114 — captures all three records.
+      // Sweep window [101 .. 114] captures all three records (predicate is `< curr`).
       prevEpoch = EpochProgress(NonNegLong(101L))
       currentEpoch = EpochProgress(NonNegLong(115L))
 
-      legacyExpired = mgr.filterExpiredAllowSpends(lastActive, currentEpoch)
-      indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndex(prevEpoch, currentEpoch, lastActive)
-
-      legacyPairs <- toAddressHashPairs(legacyExpired)
+      indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndexFromMpt(prevEpoch, currentEpoch)
       indexPairs <- toAddressHashPairs(indexExpired)
-    } yield expect.all(legacyPairs == indexPairs, legacyPairs.size == 3)
+
+      hashedAt101 <- asAt101.toHashed
+      hashedAt105 <- asAt105.toHashed
+      hashedAt110 <- asAt110.toHashed
+    } yield
+      expect.all(
+        indexPairs.size == 3,
+        indexPairs == Set(
+          (addr1, hashedAt101.hash),
+          (addr1, hashedAt105.hash),
+          (addr2, hashedAt110.hash)
+        )
+      )
   }
 
-  test("end-to-end acceptAllowSpends parity: flag on vs flag off yield identical AllowSpendAcceptanceResult") { res =>
+  test("end-to-end acceptAllowSpends evicts the expired record from fullState") { res =>
     implicit val (h, sp, js) = res
-    // Guards against iteration-shape bugs: the legacy full-map filter and the index sweep produce different
-    // SortedMap shapes (every-address-with-empty-set vs only-expiring-addresses) that can diverge in downstream
-    // folds. Exercise the full `acceptAllowSpends` method on both paths.
+    // Exercises the full `acceptAllowSpends` method to guard against shape-only differences (e.g. the sweep
+    // emitting only addresses with expiring records vs. downstream reconciliation needing all addresses).
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
       kp2 <- KeyPairGenerator.makeKeyPair[IO]
@@ -242,10 +231,8 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
       )
       lastActiveOuter = SortedMap(Option.empty[Address] -> lastActive)
 
-      storeOn <- mkSeededMptStore(lastActive)
-      storeOff <- mkSeededMptStore(lastActive)
-      mgrOn = AllowSpendStateManager.make[IO](Some(storeOn), shouldUseMptStore = true)
-      mgrOff = AllowSpendStateManager.make[IO](Some(storeOff), shouldUseMptStore = false)
+      store <- mkSeededMptStore(lastActive)
+      mgr = AllowSpendStateManager.make[IO](Some(store), shouldUseMptStore = true)
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -253,7 +240,7 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
       emptyGlobalAllowSpends = SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]]
       emptySpendTxns = List.empty[io.constellationnetwork.schema.artifact.SpendTransaction]
 
-      resOn <- mgrOn.acceptAllowSpends(
+      result <- mgr.acceptAllowSpends(
         currentEpoch,
         prevEpoch,
         emptyCurrencySnapshots,
@@ -261,89 +248,42 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
         lastActiveOuter,
         emptySpendTxns
       )
-      resOff <- mgrOff.acceptAllowSpends(
-        currentEpoch,
-        prevEpoch,
-        emptyCurrencySnapshots,
-        emptyGlobalAllowSpends,
-        lastActiveOuter,
-        emptySpendTxns
+      // Expected post-state: addr1 keeps only asValidA (asExpiredA is swept), addr2 keeps asValidB.
+      expectedGlobal = SortedMap(
+        addr1 -> SortedSet(asValidA),
+        addr2 -> SortedSet(asValidB)
       )
     } yield
       expect.all(
-        resOn.fullState == resOff.fullState,
-        resOn.deltas == resOff.deltas,
-        resOn.removedKeys == resOff.removedKeys,
-        resOn.expiryIndexDelta == resOff.expiryIndexDelta
+        result.fullState.get(None) == Some(expectedGlobal),
+        // No address became fully empty.
+        result.removedKeys.isEmpty
       )
   }
 
-  test("no-mptStore fallback: findExpiredGlobalAllowSpendsViaIndex with None mptStore returns legacy filter output") { res =>
+  test("no-mptStore manager: FromMpt sweep returns empty (no index to consult)") { res =>
     implicit val (h, sp, js) = res
+    // When the manager is constructed with `mptStore = None` the FromMpt sweep returns empty by design — the
+    // caller path falls back to the legacy in-memory filter inside `acceptAllowSpends`. Pinning the empty-output
+    // contract explicitly so a future change there doesn't go unnoticed.
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
-      dest <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
       addr = kp.getPublic.toAddress
-
-      asExpired = mkAllowSpend(addr, dest, EpochProgress(NonNegLong(100L)), "expired")
-      asValid = mkAllowSpend(addr, dest, EpochProgress(NonNegLong(500L)), "valid")
-
-      lastActive = SortedMap(addr -> SortedSet(asExpired, asValid))
 
       mgr = AllowSpendStateManager.make[IO](None)
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress(NonNegLong(50L))
 
-      legacyExpired = mgr.filterExpiredAllowSpends(lastActive, currentEpoch)
-      indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndex(prevEpoch, currentEpoch, lastActive)
-
-      legacyPairs <- toAddressHashPairs(legacyExpired)
-      indexPairs <- toAddressHashPairs(indexExpired)
-    } yield expect(legacyPairs == indexPairs)
+      indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndexFromMpt(prevEpoch, currentEpoch)
+      _ = addr // silence unused
+    } yield expect(indexExpired.isEmpty)
   }
 
-  // ==========================================================================================
-  // #88 parity tests — `findExpiredGlobalAllowSpendsViaIndex` (map-input) vs
-  // `findExpiredGlobalAllowSpendsViaIndexFromMpt` (MPT point reads, no map). Both should produce
-  // identical output under the phase-2a invariant. Plus full-method parity on `acceptAllowSpends`
-  // comparing flag-off vs #88-flag-on.
-  // ==========================================================================================
-
-  test("#88 parity: findExpiredGlobalAllowSpends map-input vs MPT-backed (mixed)") { res =>
+  test("acceptAllowSpends: yields correct expiryIndexDelta — expired record contributes a remove") { res =>
     implicit val (h, sp, js) = res
-    for {
-      kp1 <- KeyPairGenerator.makeKeyPair[IO]
-      kp2 <- KeyPairGenerator.makeKeyPair[IO]
-      dest <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
-      addr1 = kp1.getPublic.toAddress
-      addr2 = kp2.getPublic.toAddress
-
-      asExpiredA = mkAllowSpend(addr1, dest, EpochProgress(NonNegLong(100L)), "expiredA")
-      asValidA = mkAllowSpend(addr1, dest, EpochProgress(NonNegLong(500L)), "validA")
-      asValidB = mkAllowSpend(addr2, dest, EpochProgress(NonNegLong(800L)), "validB")
-
-      lastActive = SortedMap(
-        addr1 -> SortedSet(asExpiredA, asValidA),
-        addr2 -> SortedSet(asValidB)
-      )
-
-      store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](Some(store))
-
-      currentEpoch = EpochProgress(NonNegLong(300L))
-      prevEpoch = EpochProgress.MinValue
-
-      mapBased <- mgr.findExpiredGlobalAllowSpendsViaIndex(prevEpoch, currentEpoch, lastActive)
-      mptBased <- mgr.findExpiredGlobalAllowSpendsViaIndexFromMpt(prevEpoch, currentEpoch)
-
-      mapPairs <- toAddressHashPairs(mapBased)
-      mptPairs <- toAddressHashPairs(mptBased)
-    } yield expect.all(mapPairs == mptPairs, mapPairs.nonEmpty)
-  }
-
-  test("#88 parity: acceptAllowSpends legacy flag vs #88 flag yield identical AllowSpendAcceptanceResult") { res =>
-    implicit val (h, sp, js) = res
+    // Direct correctness check on the index-delta shape: the expired allow-spend should appear in the
+    // `removes` map keyed by its lastValidEpochProgress; `adds` should be empty (no incoming records).
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
       kp2 <- KeyPairGenerator.makeKeyPair[IO]
@@ -361,10 +301,8 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
       )
       lastActiveOuter = SortedMap(Option.empty[Address] -> lastActive)
 
-      storeLegacy <- mkSeededMptStore(lastActive)
-      storeMpt <- mkSeededMptStore(lastActive)
-      mgrLegacy = AllowSpendStateManager.make[IO](Some(storeLegacy), shouldUseMptStore = true, useMptBackedAcceptPath = false)
-      mgrMpt = AllowSpendStateManager.make[IO](Some(storeMpt), shouldUseMptStore = true, useMptBackedAcceptPath = true)
+      store <- mkSeededMptStore(lastActive)
+      mgr = AllowSpendStateManager.make[IO](Some(store), shouldUseMptStore = true)
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -372,7 +310,7 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
       emptyGlobalAllowSpends = SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]]
       emptySpendTxns = List.empty[io.constellationnetwork.schema.artifact.SpendTransaction]
 
-      resLegacy <- mgrLegacy.acceptAllowSpends(
+      result <- mgr.acceptAllowSpends(
         currentEpoch,
         prevEpoch,
         emptyCurrencySnapshots,
@@ -380,20 +318,19 @@ object AllowSpendExpirySweepEquivalenceSuite extends MutableIOSuite {
         lastActiveOuter,
         emptySpendTxns
       )
-      resMpt <- mgrMpt.acceptAllowSpends(
-        currentEpoch,
-        prevEpoch,
-        emptyCurrencySnapshots,
-        emptyGlobalAllowSpends,
-        lastActiveOuter,
-        emptySpendTxns
-      )
+      expectedHashed <- asExpiredA.toHashed
+      expectedKey = AllowSpendExpiryKey(None, addr1, expectedHashed.hash)
+      bucket = result.expiryIndexDelta match {
+        case eb: SystemIndexDelta.EpochBucket[AllowSpendExpiryKey] => eb
+      }
+      allRemovedKeys = bucket.removes.values.flatten.toSet
+      allAddedKeys = bucket.adds.values.flatten.toSet
     } yield
       expect.all(
-        resLegacy.fullState == resMpt.fullState,
-        resLegacy.deltas == resMpt.deltas,
-        resLegacy.removedKeys == resMpt.removedKeys,
-        resLegacy.expiryIndexDelta == resMpt.expiryIndexDelta
+        // The expired record should appear in the `removes` set.
+        clue(allRemovedKeys).contains(expectedKey),
+        // No incoming allow-spends → the `adds` side is empty.
+        clue(allAddedKeys).isEmpty
       )
   }
 }

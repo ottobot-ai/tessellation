@@ -164,9 +164,10 @@ object GlobalSnapshotSchemaMigrationSuite extends MutableIOSuite with Checkers {
           case (legacy, mpt) =>
             expect.all(
               legacy.mptRoot.isEmpty, // Legacy proof has no MPT root
-              legacy.balancesProof =!= Hash.empty, // Legacy proof has balance proof
+              legacy.balancesProof =!= Hash.empty, // Legacy proof: per-field JsonHash-based balance proof
               mpt.mptRoot.isDefined, // MPT proof has MPT root
-              mpt.balancesProof == Hash.empty // MPT proof has empty legacy fields
+              mpt.balancesProof =!= Hash.empty, // MPT proof: per-field MPT subtree root for Balances (post-684f0f54)
+              legacy.balancesProof =!= mpt.balancesProof // The two formats produce observably different proofs
             )
         }
       }

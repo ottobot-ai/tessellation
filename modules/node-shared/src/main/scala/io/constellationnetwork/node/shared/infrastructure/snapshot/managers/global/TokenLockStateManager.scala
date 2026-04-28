@@ -80,22 +80,6 @@ trait TokenLockStateManager[F[_]] {
     epochProgress: EpochProgress
   ): SortedMap[Address, SortedSet[Signed[TokenLock]]]
 
-  /** Index-driven equivalent of `filterExpiredTokenLocks`.
-    *
-    * Sweeps the token-lock expiry index for epoch buckets `[previousEpochProgress .. epochProgress - 1]` — the range covering records whose
-    * `unlockEpoch` fell into the past since the previous accept. Resolves each expiring key's hash against the passed-in in-memory map
-    * (`lastActiveGlobalTokenLocks`) to reconstruct the `Signed[TokenLock]` value. Records with `unlockEpoch = None` are not indexed (they
-    * never expire) and are correctly excluded from both paths.
-    *
-    * Primary benefit is architectural: once the in-memory `lastActiveGlobalTokenLocks` is no longer materialized (task #85 / #91), the
-    * index is the only way to find expiring records in sub-O(N) work. Equivalence is verified by `TokenLockExpirySweepEquivalenceSuite`.
-    */
-  def findExpiredGlobalTokenLocksViaIndex(
-    previousEpochProgress: EpochProgress,
-    epochProgress: EpochProgress,
-    lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
-  )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[TokenLock]]]]
-
   def updateTokenLockBalances(
     currencySnapshots: SortedMap[Address, CurrencySnapshotWithState],
     maybeLastTokenLockBalances: Option[SortedMap[Address, SortedMap[Address, Balance]]]
@@ -162,12 +146,7 @@ object TokenLockStateManager {
 
   def make[F[_]: Async](
     mptStore: MptStore[F, GlobalStateKey],
-    shouldUseMptStore: Boolean = false,
-    // #85: when true, `acceptTokenLocks` / `updateGlobalBalancesByTokenLocks` / `updateTokenLockBalances` delegate to
-    // their `*FromMpt` counterparts (which drop the `lastActive*` map dependencies and use MPT point reads) and then
-    // reconstruct the legacy `fullState`-bearing result shape for API compatibility. Default false until testnet
-    // validation proves the new path end-to-end. When ready, flip in `GlobalSnapshotAcceptanceManager.make`.
-    useMptBackedAcceptPath: Boolean = false
+    shouldUseMptStore: Boolean = false
   ): TokenLockStateManager[F] =
     new TokenLockStateManager[F] {
 
@@ -178,135 +157,19 @@ object TokenLockStateManager {
         lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
         generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
       )(implicit hasher: Hasher[F]): F[TokenLockAcceptanceResult] =
-        if (useMptBackedAcceptPath) {
-          // #85: new path — no map iteration inside the manager; reconstruct fullState from caller's `lastActive` for
-          // API compat. Future #91/#77 work removes `fullState` from the return contract entirely.
-          acceptTokenLocksFromMpt(epochProgress, previousEpochProgress, acceptedGlobalTokenLocks, generatedTokenUnlocksByAddress).map { d =>
-            val reconstructed: SortedMap[Address, SortedSet[Signed[TokenLock]]] =
-              (lastActiveGlobalTokenLocks -- d.removedKeys) ++ d.deltas
-            val cleaned = reconstructed.filter(_._2.nonEmpty)
-            TokenLockAcceptanceResult(
-              fullState = cleaned,
-              deltas = d.deltas,
-              removedKeys = d.removedKeys,
-              expiryIndexDelta = d.expiryIndexDelta
-            )
-          }
-        } else
-          acceptTokenLocksLegacy(
-            epochProgress,
-            previousEpochProgress,
-            acceptedGlobalTokenLocks,
-            lastActiveGlobalTokenLocks,
-            generatedTokenUnlocksByAddress
+        // No map iteration inside the manager; reconstruct fullState from caller's `lastActive` for API compat.
+        // Future #91/#77 work removes `fullState` from the return contract entirely.
+        acceptTokenLocksFromMpt(epochProgress, previousEpochProgress, acceptedGlobalTokenLocks, generatedTokenUnlocksByAddress).map { d =>
+          val reconstructed: SortedMap[Address, SortedSet[Signed[TokenLock]]] =
+            (lastActiveGlobalTokenLocks -- d.removedKeys) ++ d.deltas
+          val cleaned = reconstructed.filter(_._2.nonEmpty)
+          TokenLockAcceptanceResult(
+            fullState = cleaned,
+            deltas = d.deltas,
+            removedKeys = d.removedKeys,
+            expiryIndexDelta = d.expiryIndexDelta
           )
-
-      // Legacy implementation preserved verbatim. Delete once `useMptBackedAcceptPath = true` ships on testnet.
-      private def acceptTokenLocksLegacy(
-        epochProgress: EpochProgress,
-        previousEpochProgress: EpochProgress,
-        acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
-        lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
-        generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
-      )(implicit hasher: Hasher[F]): F[TokenLockAcceptanceResult] = {
-        // Phase 2b: route through index sweep when flag is on (proven equivalent by TokenLockExpirySweepEquivalenceSuite).
-        val expiredGlobalTokenLocksF: F[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
-          if (shouldUseMptStore)
-            findExpiredGlobalTokenLocksViaIndex(previousEpochProgress, epochProgress, lastActiveGlobalTokenLocks)
-          else
-            filterExpiredTokenLocks(lastActiveGlobalTokenLocks, epochProgress).pure[F]
-
-        expiredGlobalTokenLocksF.flatMap { expiredGlobalTokenLocks =>
-          // Under the legacy full-map filter, every lastActive address appeared in `expiredGlobalTokenLocks` (possibly
-          // with an empty set), so the fold touched every such address — which matters for addresses whose only change
-          // is a generated TokenUnlock (the unlock removes the lock via the unlocksRefs check inside the fold). The
-          // index sweep emits only addresses with *expiring* records; we must explicitly add addresses with
-          // `generatedTokenUnlocksByAddress` entries back in so the unlock application isn't skipped.
-          val addressesToProcess: SortedMap[Address, SortedSet[Signed[TokenLock]]] = {
-            val tokenLockUnion = acceptedGlobalTokenLocks |+| expiredGlobalTokenLocks
-            val unlockOnlyAddresses = generatedTokenUnlocksByAddress.keySet.diff(tokenLockUnion.keySet)
-            val unlockOnlySeeds = SortedMap.from(unlockOnlyAddresses.toList.map(_ -> SortedSet.empty[Signed[TokenLock]]))
-            tokenLockUnion ++ unlockOnlySeeds
-          }
-
-          addressesToProcess.toList
-            .foldM((lastActiveGlobalTokenLocks, SortedMap.empty[Address, SortedSet[Signed[TokenLock]]])) {
-              case ((acc, deltas), (address, tokenLocks)) =>
-                val lastAddressTokenLocks = acc.getOrElse(address, SortedSet.empty[Signed[TokenLock]])
-                val unexpired = (lastAddressTokenLocks ++ tokenLocks).filter(_.unlockEpoch.forall(_ >= epochProgress))
-                val addressTokenUnlocks = generatedTokenUnlocksByAddress.getOrElse(address, List.empty)
-                val unlocksRefs = addressTokenUnlocks.map(_.tokenLockRef)
-
-                unexpired
-                  .foldM(SortedSet.empty[Signed[TokenLock]]) { (innerAcc, tokenLock) =>
-                    tokenLock.toHashed.map { tlh =>
-                      if (unlocksRefs.contains(tlh.hash)) innerAcc
-                      else innerAcc + tokenLock
-                    }
-                  }
-                  .map { updatedLocks =>
-                    val hasChanged = lastAddressTokenLocks != updatedLocks
-                    val newAcc = acc.updated(address, updatedLocks)
-                    val newDeltas = if (hasChanged) deltas.updated(address, updatedLocks) else deltas
-                    (newAcc, newDeltas)
-                  }
-            }
-            .flatMap {
-              case (fullState, deltas) =>
-                val cleanedFullState = fullState.filterNot(_._2.isEmpty)
-                val cleanedDeltas = deltas.filterNot(_._2.isEmpty)
-
-                // Compute removed keys: addresses that had TokenLocks but now have empty or missing sets
-                val removedKeys: Set[Address] = lastActiveGlobalTokenLocks.collect {
-                  case (address, spends) if spends.nonEmpty && !cleanedFullState.get(address).exists(_.nonEmpty) =>
-                    address
-                }.toSet
-
-                computeTokenLockExpiryIndexDelta(lastActiveGlobalTokenLocks, cleanedFullState).map { indexDelta =>
-                  TokenLockAcceptanceResult(cleanedFullState, cleanedDeltas, removedKeys, indexDelta)
-                }
-            }
         }
-      }
-
-      /** Diff `before` vs `after` per-address; records with `unlockEpoch.isDefined` contribute to the index. Records with `None` unlock
-        * aren't indexed (they never expire).
-        */
-      private def computeTokenLockExpiryIndexDelta(
-        before: SortedMap[Address, SortedSet[Signed[TokenLock]]],
-        after: SortedMap[Address, SortedSet[Signed[TokenLock]]]
-      )(implicit hasher: Hasher[F]): F[SystemIndexDelta[TokenLockExpiryKey]] = {
-        val pairAddresses: Set[Address] = before.keySet ++ after.keySet
-
-        def hashIndexable(addr: Address, locks: SortedSet[Signed[TokenLock]]): F[List[(EpochProgress, TokenLockExpiryKey)]] =
-          locks.toList.mapFilter(l => l.unlockEpoch.map(e => (e, l))).traverse {
-            case (epoch, l) => l.toHashed.map(h => (epoch, TokenLockExpiryKey(addr, h.hash)))
-          }
-
-        type Entries = List[(EpochProgress, TokenLockExpiryKey)]
-        val empty: (Entries, Entries) = (List.empty, List.empty)
-
-        pairAddresses.toList
-          .foldLeftM[F, (Entries, Entries)](empty) {
-            case ((accAdds, accRemoves), addr) =>
-              val oldSet = before.getOrElse(addr, SortedSet.empty[Signed[TokenLock]])
-              val newSet = after.getOrElse(addr, SortedSet.empty[Signed[TokenLock]])
-              val added = newSet.diff(oldSet)
-              val removed = oldSet.diff(newSet)
-              for {
-                addedEntries <- hashIndexable(addr, added)
-                removedEntries <- hashIndexable(addr, removed)
-              } yield (accAdds ++ addedEntries, accRemoves ++ removedEntries)
-          }
-          .map {
-            case (adds, removes) =>
-              val addsMap: SortedMap[EpochProgress, Set[TokenLockExpiryKey]] =
-                adds.groupMap(_._1)(_._2).view.mapValues(_.toSet).to(SortedMap)
-              val removesMap: SortedMap[EpochProgress, Set[TokenLockExpiryKey]] =
-                removes.groupMap(_._1)(_._2).view.mapValues(_.toSet).to(SortedMap)
-              SystemIndexDelta.EpochBucket[TokenLockExpiryKey](addsMap, removesMap)
-          }
-      }
 
       def acceptReplacementTokenLocks(
         acceptedTokenLocks: List[Signed[TokenLock]],
@@ -356,46 +219,6 @@ object TokenLockStateManager {
         epochProgress: EpochProgress
       ): SortedMap[Address, SortedSet[Signed[TokenLock]]] =
         tokenLocks.view.mapValues(_.filter(_.unlockEpoch.exists(_ < epochProgress))).to(SortedMap)
-
-      def findExpiredGlobalTokenLocksViaIndex(
-        previousEpochProgress: EpochProgress,
-        epochProgress: EpochProgress,
-        lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
-      )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
-        if (previousEpochProgress.value.value >= epochProgress.value.value)
-          SortedMap.empty[Address, SortedSet[Signed[TokenLock]]].pure[F]
-        else {
-          val fromL = previousEpochProgress.value.value
-          val toL = epochProgress.value.value - 1L
-          val epochs: List[EpochProgress] =
-            (fromL to toL).toList.map(v => EpochProgress(NonNegLong.unsafeFrom(v)))
-
-          for {
-            buckets <- epochs.traverse { e =>
-              mptStore
-                .getExpiryBucket[TokenLockExpiryKey](io.constellationnetwork.schema.mpt.SystemNamespaceLabel.ExpiryIndexTokenLocks, e)
-                .map(_.getOrElse(SortedSet.empty[TokenLockExpiryKey]))
-            }
-            allKeys = buckets.flatten.toSet
-            byAddress = allKeys.groupBy(_.address)
-            resolved <- byAddress.toList.traverse {
-              case (addr, expiryKeys) =>
-                val addrSet = lastActiveGlobalTokenLocks.getOrElse(addr, SortedSet.empty[Signed[TokenLock]])
-                val expectedHashes = expiryKeys.map(_.hash)
-                addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s))).map { hashed =>
-                  val matched = hashed.collect { case (h, s) if expectedHashes.contains(h) => s }.to(SortedSet)
-                  addr -> matched
-                }
-            }
-          } yield SortedMap.from(resolved).filter(_._2.nonEmpty)
-        }
-
-      // ============================================================================
-      // #85 MPT-backed impls — drop map inputs, return deltas only. Kept alongside
-      // the legacy map-based methods above; caller dispatches via `shouldUseMptStore`.
-      // When testnet validates these paths end-to-end, delete the legacy methods
-      // (and `TokenLockAcceptanceResult.fullState` / `TokenLockBalanceResult.fullState`).
-      // ============================================================================
 
       def findExpiredGlobalTokenLocksViaIndexFromMpt(
         previousEpochProgress: EpochProgress,
@@ -671,114 +494,17 @@ object TokenLockStateManager {
         acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
         lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
         generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
-      )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] =
-        if (useMptBackedAcceptPath)
-          updateGlobalBalancesByTokenLocksFromMpt(
-            epochProgress,
-            previousEpochProgress,
-            currentBalances,
-            acceptedGlobalTokenLocks,
-            generatedTokenUnlocksByAddress
-          )
-        else
-          updateGlobalBalancesByTokenLocksLegacy(
-            epochProgress,
-            previousEpochProgress,
-            currentBalances,
-            acceptedGlobalTokenLocks,
-            lastActiveGlobalTokenLocks,
-            generatedTokenUnlocksByAddress
-          )
-
-      private def updateGlobalBalancesByTokenLocksLegacy(
-        epochProgress: EpochProgress,
-        previousEpochProgress: EpochProgress,
-        currentBalances: SortedMap[Address, Balance],
-        acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
-        lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
-        generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
       )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] = {
-        val expiredGlobalTokenLocksF: F[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
-          if (shouldUseMptStore)
-            findExpiredGlobalTokenLocksViaIndex(previousEpochProgress, epochProgress, lastActiveGlobalTokenLocks)
-          else
-            filterExpiredTokenLocks(lastActiveGlobalTokenLocks, epochProgress).pure[F]
-
-        expiredGlobalTokenLocksF.flatMap { expiredGlobalTokenLocks =>
-          val afterTokenLocksF = (acceptedGlobalTokenLocks |+| expiredGlobalTokenLocks).toList
-            .foldM[F, Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
-              Right((currentBalances, SortedMap.empty[Address, Balance]))
-            ) {
-              case (Left(err), _) =>
-                (Left(err): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]).pure[F]
-              case (Right((balances, balancesDelta)), (address, tokenLocks)) =>
-                readBalance(address, balances).map { initialBalance =>
-                  val addressTokenUnlocks = generatedTokenUnlocksByAddress.getOrElse(address, List.empty)
-                  val result: Either[BalanceArithmeticError, Balance] = for {
-                    unlocked <- addressTokenUnlocks.foldLeft[Either[BalanceArithmeticError, Balance]](Right(initialBalance)) {
-                      case (currentBalanceEither, tokenUnlock) =>
-                        for {
-                          currentBalance <- currentBalanceEither
-                          balanceAfterUnlock <- currentBalance.plus(TokenLockAmount.toAmount(tokenUnlock.amount))
-                        } yield balanceAfterUnlock
-                    }
-                    expired <- {
-                      val expiredLocks = tokenLocks.filter(_.unlockEpoch.exists(_ < epochProgress))
-                      expiredLocks.foldLeft[Either[BalanceArithmeticError, Balance]](Right(unlocked)) { (currentBalanceEither, tokenLock) =>
-                        for {
-                          currentBalance <- currentBalanceEither
-                          balanceAfterExpiredAmount <- currentBalance.plus(TokenLockAmount.toAmount(tokenLock.amount))
-                        } yield balanceAfterExpiredAmount
-                      }
-                    }
-                    finalBalance <- {
-                      val unexpired = tokenLocks.filter(_.unlockEpoch.forall(_ >= epochProgress))
-                      unexpired.foldLeft[Either[BalanceArithmeticError, Balance]](Right(expired)) { (currentBalanceEither, tokenLock) =>
-                        for {
-                          currentBalance <- currentBalanceEither
-                          balanceAfterAmount <- currentBalance.minus(TokenLockAmount.toAmount(tokenLock.amount))
-                          balanceAfterFee <- balanceAfterAmount.minus(TokenLockFee.toAmount(tokenLock.fee))
-                        } yield balanceAfterFee
-                      }
-                    }
-                  } yield finalBalance
-
-                  result.map { finalBalance =>
-                    (balances.updated(address, finalBalance), balancesDelta.updated(address, finalBalance))
-                  }
-                }
-            }
-
-          afterTokenLocksF.flatMap {
-            case Left(err) =>
-              (Left(err): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]).pure[F]
-            case Right(balancesAfter) =>
-              val addressesWithTokenLocks = acceptedGlobalTokenLocks.keySet ++ expiredGlobalTokenLocks.keySet
-              val addressesWithTokenUnlocksOnly = generatedTokenUnlocksByAddress.keySet -- addressesWithTokenLocks
-
-              addressesWithTokenUnlocksOnly.toList
-                .foldM[F, Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
-                  Right(balancesAfter)
-                ) {
-                  case (Left(err), _) =>
-                    (Left(err): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]).pure[F]
-                  case (Right((balances, balancesDelta)), address) =>
-                    readBalance(address, balances).map { initialBalance =>
-                      val addressTokenUnlocks = generatedTokenUnlocksByAddress.getOrElse(address, List.empty)
-                      val result = addressTokenUnlocks.foldLeft[Either[BalanceArithmeticError, Balance]](Right(initialBalance)) {
-                        case (currentBalanceEither, tokenUnlock) =>
-                          for {
-                            currentBalance <- currentBalanceEither
-                            balanceAfterUnlock <- currentBalance.plus(TokenLockAmount.toAmount(tokenUnlock.amount))
-                          } yield balanceAfterUnlock
-                      }
-                      result.map { finalBalance =>
-                        (balances.updated(address, finalBalance), balancesDelta.updated(address, finalBalance))
-                      }
-                    }
-                }
-          }
-        }
+        // `lastActiveGlobalTokenLocks` retained on the trait signature (#91) but unused here — the FromMpt impl
+        // resolves expiring records via `mptStore.getActiveTokenLocks` instead of an in-memory full map.
+        val _ = lastActiveGlobalTokenLocks
+        updateGlobalBalancesByTokenLocksFromMpt(
+          epochProgress,
+          previousEpochProgress,
+          currentBalances,
+          acceptedGlobalTokenLocks,
+          generatedTokenUnlocksByAddress
+        )
       }
 
       private def readBalance(

@@ -26,13 +26,13 @@ import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
 import weaver.MutableIOSuite
 
-/** Equivalence harness for phase 2b index-driven token-lock expiry sweep.
+/** Spec assertions for the surviving MPT-backed token-lock expiry sweep.
   *
-  * Same shape as `AllowSpendExpirySweepEquivalenceSuite` but for TokenLocks. TokenLock has no `metagraphId` dimension; records with
-  * `unlockEpoch = None` never expire and are not indexed. Tests assert `findExpiredGlobalTokenLocksViaIndex` and `filterExpiredTokenLocks`
-  * return the same `(address, hash)` set under the phase-2a invariant.
+  * After the legacy in-memory `findExpiredGlobalTokenLocksViaIndex(map)` was deleted, this suite asserts
+  * `findExpiredGlobalTokenLocksViaIndexFromMpt(prev, curr)` directly. Window semantics: TokenLock uses `unlockEpoch < epochProgress` so the
+  * sweep range is `[prev .. curr - 1]`. Records with `unlockEpoch = None` never expire and are not indexed.
   */
-object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
+object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
 
   implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
   implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
@@ -68,6 +68,9 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
       testProofs
     )
 
+  /** Seed an MPT store from a `lastActive` map by going through `syncFromGlobalSnapshotInfo` — the same code path that populates the expiry
+    * index in production, so the seed exercises the same writer the sweep reads.
+    */
   private def mkSeededMptStore(
     lastActive: SortedMap[Address, SortedSet[Signed[TokenLock]]]
   )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[MptStore[IO, GlobalStateKey]] =
@@ -86,7 +89,7 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
         set.toList.traverse(s => s.toHashed.map(hashed => (addr, hashed.hash)))
     }.map(_.toSet)
 
-  test("index sweep and legacy filter return the same (addr, hash) set — mixed expired and not") { res =>
+  test("FromMpt sweep returns exactly the expiring records — mixed expired and not") { res =>
     implicit val (h, sp, js) = res
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -106,26 +109,19 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
 
-      legacyExpired = mgr.filterExpiredTokenLocks(lastActive, currentEpoch)
-      indexExpired <- mgr.findExpiredGlobalTokenLocksViaIndex(prevEpoch, currentEpoch, lastActive)
-
-      legacyPairs <- toAddressHashPairs(legacyExpired)
+      indexExpired <- mgr.findExpiredGlobalTokenLocksViaIndexFromMpt(prevEpoch, currentEpoch)
       indexPairs <- toAddressHashPairs(indexExpired)
 
       expectedHashed <- tlExpiredA.toHashed
-    } yield
-      expect.all(
-        legacyPairs == indexPairs,
-        indexPairs == Set((addr1, expectedHashed.hash))
-      )
+    } yield expect(indexPairs == Set((addr1, expectedHashed.hash)))
   }
 
-  test("index sweep and legacy filter agree when nothing is expired") { res =>
+  test("FromMpt sweep returns empty when nothing is expired") { res =>
     implicit val (h, sp, js) = res
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -135,53 +131,41 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(tlValid))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
 
       currentEpoch = EpochProgress(NonNegLong(500L))
       prevEpoch = EpochProgress(NonNegLong(100L))
 
-      legacyExpired = mgr.filterExpiredTokenLocks(lastActive, currentEpoch)
-      indexExpired <- mgr.findExpiredGlobalTokenLocksViaIndex(prevEpoch, currentEpoch, lastActive)
-
-      legacyPairs <- toAddressHashPairs(legacyExpired)
+      indexExpired <- mgr.findExpiredGlobalTokenLocksViaIndexFromMpt(prevEpoch, currentEpoch)
       indexPairs <- toAddressHashPairs(indexExpired)
-    } yield expect.all(legacyPairs.isEmpty, indexPairs.isEmpty, legacyPairs == indexPairs)
+    } yield expect(indexPairs.isEmpty)
   }
 
-  test("records with unlockEpoch = None are never expired (not indexed, not in legacy either)") { res =>
+  test("records with unlockEpoch = None are never returned (not indexed)") { res =>
     implicit val (h, sp, js) = res
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       addr = kp.getPublic.toAddress
 
-      // No unlockEpoch = permanent lock; never appears in either path's expired output.
       tlPermanent = mkTokenLock(addr, None, "permanent")
       tlExpires = mkTokenLock(addr, Some(EpochProgress(NonNegLong(100L))), "expires")
 
       lastActive = SortedMap(addr -> SortedSet(tlPermanent, tlExpires))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
 
       currentEpoch = EpochProgress(NonNegLong(500L))
       prevEpoch = EpochProgress.MinValue
 
-      legacyExpired = mgr.filterExpiredTokenLocks(lastActive, currentEpoch)
-      indexExpired <- mgr.findExpiredGlobalTokenLocksViaIndex(prevEpoch, currentEpoch, lastActive)
-
-      legacyPairs <- toAddressHashPairs(legacyExpired)
+      indexExpired <- mgr.findExpiredGlobalTokenLocksViaIndexFromMpt(prevEpoch, currentEpoch)
       indexPairs <- toAddressHashPairs(indexExpired)
 
       expectedExpires <- tlExpires.toHashed
-    } yield
-      expect.all(
-        legacyPairs == indexPairs,
-        // The permanent lock is NOT expired; only the one with an unlockEpoch in the past is.
-        indexPairs == Set((addr, expectedExpires.hash))
-      )
+    } yield expect(indexPairs == Set((addr, expectedExpires.hash)))
   }
 
-  test("index sweep returns empty when previousEpochProgress >= epochProgress (same-epoch ordinals)") { res =>
+  test("FromMpt sweep returns empty when previousEpochProgress >= epochProgress (same-epoch ordinals)") { res =>
     implicit val (h, sp, js) = res
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -191,18 +175,19 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(tlExpires))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
 
       sameEpoch = EpochProgress(NonNegLong(200L))
-      indexExpired <- mgr.findExpiredGlobalTokenLocksViaIndex(sameEpoch, sameEpoch, lastActive)
+      indexExpired <- mgr.findExpiredGlobalTokenLocksViaIndexFromMpt(sameEpoch, sameEpoch)
       indexPairs <- toAddressHashPairs(indexExpired)
     } yield expect(indexPairs.isEmpty)
   }
 
-  test("end-to-end acceptTokenLocks parity: flag on vs flag off yield identical result") { res =>
+  test("end-to-end acceptTokenLocks removes both expired locks and TokenUnlock-targeted permanent locks") { res =>
     implicit val (h, sp, js) = res
-    // Guards against bugs where the index path skips addresses that the legacy path's empty-set entries would have
-    // caused the downstream fold to visit (e.g. addresses with `generatedTokenUnlocks` but no expiring locks).
+    // Guards the iteration shape: the sweep emits only addresses with expiring records, but downstream
+    // accept must still process addresses with TokenUnlocks (no expiring locks), e.g. a permanent lock
+    // (unlockEpoch = None) being removed via a generated TokenUnlock.
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
       kp2 <- KeyPairGenerator.makeKeyPair[IO]
@@ -211,13 +196,12 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
 
       // addr1: a non-expiring lock (unlockEpoch = None) that will be removed by an incoming TokenUnlock.
       tlPermanent = mkTokenLock(addr1, None, "permanent1")
-      // addr2: an expiring lock (unlockEpoch in the past) that the filter should find.
+      // addr2: an expiring lock (unlockEpoch in the past) that the sweep should find.
       tlExpires = mkTokenLock(addr2, Some(EpochProgress(NonNegLong(100L))), "expires2")
 
       lastActive = SortedMap(addr1 -> SortedSet(tlPermanent), addr2 -> SortedSet(tlExpires))
 
       hashedPermanent <- tlPermanent.toHashed
-      // TokenUnlock targeting addr1 — only `acceptTokenLocks` with the right iteration set will apply it.
       tokenUnlock = io.constellationnetwork.schema.artifact.TokenUnlock(
         tokenLockRef = hashedPermanent.hash,
         amount = io.constellationnetwork.schema.tokenLock.TokenLockAmount(PosLong(100L)),
@@ -226,28 +210,25 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
       )
       generatedUnlocks = Map(addr1 -> List(tokenUnlock))
 
-      storeOn <- mkSeededMptStore(lastActive)
-      storeOff <- mkSeededMptStore(lastActive)
-      mgrOn = TokenLockStateManager.make[IO](storeOn, shouldUseMptStore = true)
-      mgrOff = TokenLockStateManager.make[IO](storeOff, shouldUseMptStore = false)
+      store <- mkSeededMptStore(lastActive)
+      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
       acceptedGlobal = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
 
-      resultOn <- mgrOn.acceptTokenLocks(currentEpoch, prevEpoch, acceptedGlobal, lastActive, generatedUnlocks)
-      resultOff <- mgrOff.acceptTokenLocks(currentEpoch, prevEpoch, acceptedGlobal, lastActive, generatedUnlocks)
+      result <- mgr.acceptTokenLocks(currentEpoch, prevEpoch, acceptedGlobal, lastActive, generatedUnlocks)
     } yield
       expect.all(
-        resultOn.fullState == resultOff.fullState,
-        resultOn.removedKeys == resultOff.removedKeys,
-        // Both paths must remove addr1's lock via the TokenUnlock AND addr2's lock via expiry.
-        !resultOn.fullState.contains(addr1),
-        !resultOn.fullState.contains(addr2)
+        // Both addresses' locks should be gone: addr1 via TokenUnlock, addr2 via expiry.
+        !result.fullState.contains(addr1),
+        !result.fullState.contains(addr2),
+        result.removedKeys.contains(addr1),
+        result.removedKeys.contains(addr2)
       )
   }
 
-  test("index sweep matches legacy filter when sweep window covers multiple epochs") { res =>
+  test("FromMpt sweep returns all expiring records when window covers multiple epochs") { res =>
     implicit val (h, sp, js) = res
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -265,27 +246,33 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
 
+      // Window [101 .. 114] covers all three records (TokenLock predicate is `unlockEpoch < curr`).
       prevEpoch = EpochProgress(NonNegLong(101L))
       currentEpoch = EpochProgress(NonNegLong(115L))
 
-      legacyExpired = mgr.filterExpiredTokenLocks(lastActive, currentEpoch)
-      indexExpired <- mgr.findExpiredGlobalTokenLocksViaIndex(prevEpoch, currentEpoch, lastActive)
-
-      legacyPairs <- toAddressHashPairs(legacyExpired)
+      indexExpired <- mgr.findExpiredGlobalTokenLocksViaIndexFromMpt(prevEpoch, currentEpoch)
       indexPairs <- toAddressHashPairs(indexExpired)
-    } yield expect.all(legacyPairs == indexPairs, legacyPairs.size == 3)
+
+      hashedAt101 <- tlAt101.toHashed
+      hashedAt105 <- tlAt105.toHashed
+      hashedAt110 <- tlAt110.toHashed
+    } yield
+      expect.all(
+        indexPairs.size == 3,
+        indexPairs == Set(
+          (addr1, hashedAt101.hash),
+          (addr1, hashedAt105.hash),
+          (addr2, hashedAt110.hash)
+        )
+      )
   }
 
-  // ==========================================================================================
-  // #85 parity tests — legacy path (takes `lastActive` map) vs MPT-backed path (point reads).
-  // Both should produce identical `TokenLockAcceptanceResult` under the phase-2a invariant
-  // (MPT seeded with the same state the caller has in `lastActive`).
-  // ==========================================================================================
-
-  test("#85 parity: acceptTokenLocks legacy vs MPT-backed yield identical TokenLockAcceptanceResult (mixed)") { res =>
+  test("acceptTokenLocks: mixed expired/not yields the expected post-state and removedKeys") { res =>
     implicit val (h, sp, js) = res
+    // End-to-end shape on the acceptTokenLocks API: same scenario as the legacy `#85 parity` test, but
+    // asserting absolute correctness against an explicit expected fullState rather than two paths agreeing.
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
       kp2 <- KeyPairGenerator.makeKeyPair[IO]
@@ -301,69 +288,30 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
         addr2 -> SortedSet(tlValidB)
       )
 
-      // Two independent stores, both seeded with the same lastActive
-      storeLegacy <- mkSeededMptStore(lastActive)
-      storeMpt <- mkSeededMptStore(lastActive)
-      mgrLegacy = TokenLockStateManager.make[IO](storeLegacy, shouldUseMptStore = true, useMptBackedAcceptPath = false)
-      mgrMpt = TokenLockStateManager.make[IO](storeMpt, shouldUseMptStore = true, useMptBackedAcceptPath = true)
+      store <- mkSeededMptStore(lastActive)
+      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
       accepted = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
       unlocks = Map.empty[Address, List[io.constellationnetwork.schema.artifact.TokenUnlock]]
 
-      resLegacy <- mgrLegacy.acceptTokenLocks(currentEpoch, prevEpoch, accepted, lastActive, unlocks)
-      resMpt <- mgrMpt.acceptTokenLocks(currentEpoch, prevEpoch, accepted, lastActive, unlocks)
+      result <- mgr.acceptTokenLocks(currentEpoch, prevEpoch, accepted, lastActive, unlocks)
     } yield
       expect.all(
-        resLegacy.fullState == resMpt.fullState,
-        resLegacy.deltas == resMpt.deltas,
-        resLegacy.removedKeys == resMpt.removedKeys,
-        resLegacy.expiryIndexDelta == resMpt.expiryIndexDelta
+        // addr1 only retains tlValidA (tlExpiredA is swept).
+        result.fullState.get(addr1) == Some(SortedSet(tlValidA)),
+        // addr2 unchanged (no expiring records).
+        result.fullState.get(addr2) == Some(SortedSet(tlValidB)),
+        // No address became fully empty.
+        result.removedKeys.isEmpty,
+        // The delta only mentions addr1 (its set shape changed).
+        result.deltas.keySet == Set(addr1),
+        result.deltas.get(addr1) == Some(SortedSet(tlValidA))
       )
   }
 
-  test("#85 parity: acceptTokenLocks legacy vs MPT-backed — TokenUnlock application on unlock-only addresses") { res =>
-    implicit val (h, sp, js) = res
-    // The unlock-only-addresses bug (fixed in f76b0d40) is sensitive to iteration-shape differences. This test
-    // exercises the exact failure case: a non-expiring lock that must be removed via a generated TokenUnlock.
-    for {
-      kp1 <- KeyPairGenerator.makeKeyPair[IO]
-      addr1 = kp1.getPublic.toAddress
-
-      tlPermanent = mkTokenLock(addr1, None, "permanent")
-      lastActive = SortedMap(addr1 -> SortedSet(tlPermanent))
-
-      hashedPermanent <- tlPermanent.toHashed
-      tokenUnlock = io.constellationnetwork.schema.artifact.TokenUnlock(
-        tokenLockRef = hashedPermanent.hash,
-        amount = io.constellationnetwork.schema.tokenLock.TokenLockAmount(PosLong(100L)),
-        source = addr1,
-        currencyId = None
-      )
-      unlocks = Map(addr1 -> List(tokenUnlock))
-
-      storeLegacy <- mkSeededMptStore(lastActive)
-      storeMpt <- mkSeededMptStore(lastActive)
-      mgrLegacy = TokenLockStateManager.make[IO](storeLegacy, shouldUseMptStore = true, useMptBackedAcceptPath = false)
-      mgrMpt = TokenLockStateManager.make[IO](storeMpt, shouldUseMptStore = true, useMptBackedAcceptPath = true)
-
-      currentEpoch = EpochProgress(NonNegLong(300L))
-      prevEpoch = EpochProgress.MinValue
-      accepted = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
-
-      resLegacy <- mgrLegacy.acceptTokenLocks(currentEpoch, prevEpoch, accepted, lastActive, unlocks)
-      resMpt <- mgrMpt.acceptTokenLocks(currentEpoch, prevEpoch, accepted, lastActive, unlocks)
-    } yield
-      expect.all(
-        resLegacy.fullState == resMpt.fullState,
-        resLegacy.removedKeys == resMpt.removedKeys,
-        !resMpt.fullState.contains(addr1),
-        resMpt.removedKeys.contains(addr1)
-      )
-  }
-
-  test("#85 parity: updateGlobalBalancesByTokenLocks legacy vs MPT-backed") { res =>
+  test("updateGlobalBalancesByTokenLocks: expired locks credit the source's balance") { res =>
     implicit val (h, sp, js) = res
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -375,10 +323,8 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
       tlValid = mkTokenLock(addr2, Some(EpochProgress(NonNegLong(800L))), "valid")
       lastActive = SortedMap(addr1 -> SortedSet(tlExpired), addr2 -> SortedSet(tlValid))
 
-      storeLegacy <- mkSeededMptStore(lastActive)
-      storeMpt <- mkSeededMptStore(lastActive)
-      mgrLegacy = TokenLockStateManager.make[IO](storeLegacy, shouldUseMptStore = true, useMptBackedAcceptPath = false)
-      mgrMpt = TokenLockStateManager.make[IO](storeMpt, shouldUseMptStore = true, useMptBackedAcceptPath = true)
+      store <- mkSeededMptStore(lastActive)
+      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
 
       currentBalances = SortedMap.empty[Address, io.constellationnetwork.schema.balance.Balance]
       currentEpoch = EpochProgress(NonNegLong(300L))
@@ -386,13 +332,16 @@ object TokenLockExpirySweepEquivalenceSuite extends MutableIOSuite {
       accepted = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
       unlocks = Map.empty[Address, List[io.constellationnetwork.schema.artifact.TokenUnlock]]
 
-      resLegacyE <- mgrLegacy.updateGlobalBalancesByTokenLocks(currentEpoch, prevEpoch, currentBalances, accepted, lastActive, unlocks)
-      resMptE <- mgrMpt.updateGlobalBalancesByTokenLocks(currentEpoch, prevEpoch, currentBalances, accepted, lastActive, unlocks)
+      resultE <- mgr.updateGlobalBalancesByTokenLocks(currentEpoch, prevEpoch, currentBalances, accepted, lastActive, unlocks)
     } yield
       expect.all(
-        resLegacyE.isRight,
-        resMptE.isRight,
-        resLegacyE == resMptE
+        // The Right side carries (full balances, deltas). For an empty starting balance and an expiring
+        // 200-amount lock, addr1 should end at 200 (refunded) and addr2 unchanged at 0 (not touched
+        // because tlValid is still active, not in the expiredGlobalTokenLocks fold input).
+        resultE.isRight,
+        resultE.exists {
+          case (_, deltas) => deltas.get(addr1).map(_.value.value) == Some(200L)
+        }
       )
   }
 }

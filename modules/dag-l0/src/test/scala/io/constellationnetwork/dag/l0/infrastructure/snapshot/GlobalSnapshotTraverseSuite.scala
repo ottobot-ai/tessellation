@@ -54,6 +54,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.node.RewardFraction
 import io.constellationnetwork.schema.peer.PeerId
@@ -107,34 +108,48 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
     gsps: GlobalStateProofSelector,
     js: JsonSerializer[IO]
   ): IO[(Hashed[GlobalSnapshot], NonEmptyList[Hashed[GlobalIncrementalSnapshot]])] =
-    KeyPairGenerator.makeKeyPair[IO].flatMap { keyPair =>
-      Signed
-        .forAsyncHasher[IO, GlobalSnapshot](GlobalSnapshot.mkGenesis(initBalances, EpochProgress.MinValue), keyPair)
-        .flatMap(_.toHashed)
-        .flatMap { genesis =>
-          GlobalIncrementalSnapshot.fromGlobalSnapshot[IO](genesis).flatMap { incremental =>
-            mkSnapshot(genesis.hash, incremental, genesis.info.toGlobalSnapshotInfo, keyPair, SortedSet.empty, Hasher.forKryo[IO]).flatMap {
-              snapshotWithContext =>
-                dags.zipWithIndex
-                  .foldLeftM(NonEmptyList.of(snapshotWithContext)) {
-                    case (snapshots, (blocksChunk, index)) =>
-                      val height = Height(NonNegLong.unsafeFrom(index.toLong + 1L))
-                      mkSnapshot(
-                        snapshots.head._1.hash,
-                        snapshots.head._1.signed.value,
-                        snapshots.head._2,
-                        keyPair,
-                        blocksChunk.toSortedSet,
-                        Hasher.forKryo[IO],
-                        height
-                      )
-                        .map(snapshots.prepend)
-                  }
-                  .map(incrementals => (genesis, incrementals.reverse.map(_._1)))
-            }
-          }
+    for {
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      // Producer-based stateProofBuilder is the same path production uses for both writer and verifier.
+      // Aligning the test fixture to it keeps the writer-side proof shape (empty per-field slots, populated
+      // mptRoot) consistent with what `GlobalSnapshotTraverse`'s validator computes, so loadChain's
+      // post-rollback proof check passes after commit 684f0f54 changed `mptStateProof` to populate per-field
+      // roots in the producer-less builder path.
+      mptProducer <- InMemoryMerklePatriciaProducer.make[IO]()
+      mptStore <- MptStore.make[IO, GlobalStateKey](mptProducer, GlobalStateKey.toHex[IO])
+      genesisSigned <- Signed.forAsyncHasher[IO, GlobalSnapshot](
+        GlobalSnapshot.mkGenesis(initBalances, EpochProgress.MinValue),
+        keyPair
+      )
+      genesis <- genesisSigned.toHashed
+      incremental <- GlobalIncrementalSnapshot.fromGlobalSnapshot[IO](genesis)
+      first <- mkSnapshot(
+        genesis.hash,
+        incremental,
+        genesis.info.toGlobalSnapshotInfo,
+        keyPair,
+        SortedSet.empty,
+        Hasher.forKryo[IO],
+        mptStore
+      )
+      result <- dags.zipWithIndex
+        .foldLeftM(NonEmptyList.of(first)) {
+          case (snapshots, (blocksChunk, index)) =>
+            val height = Height(NonNegLong.unsafeFrom(index.toLong + 1L))
+            mkSnapshot(
+              snapshots.head._1.hash,
+              snapshots.head._1.signed.value,
+              snapshots.head._2,
+              keyPair,
+              blocksChunk.toSortedSet,
+              Hasher.forKryo[IO],
+              mptStore,
+              height
+            )
+              .map(snapshots.prepend)
         }
-    }
+        .map(incrementals => (genesis, incrementals.reverse.map(_._1)))
+    } yield result
 
   def mkSnapshot(
     lastHash: Hash,
@@ -143,6 +158,7 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
     keyPair: KeyPair,
     blocks: SortedSet[BlockAsActiveTip],
     txHasher: Hasher[IO],
+    mptStore: MptStore[IO, GlobalStateKey],
     height: Height = Height.MinValue
   )(
     implicit S: SecurityProvider[IO],
@@ -184,7 +200,13 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
         lastTxRefs = lastTxRefs,
         balances = balances
       )
-      newSnapshotInfoStateProof <- newSnapshotInfo.stateProof[IO](lastSnapshot.ordinal.next)
+      // Sync the new info into the MPT, then build the proof via the producer-based builder — the
+      // same path production's GlobalSnapshotAcceptanceManager uses (`stateProofBuilder(Some(producer))`).
+      // This produces a proof with empty per-field slots and a populated mptRoot, matching what the
+      // GlobalSnapshotTraverse verifier expects.
+      _ <- mptStore.syncFromGlobalSnapshotInfo(newSnapshotInfo, lastSnapshot.ordinal.next)
+      stateProofBuilder = GlobalSnapshotInfo.stateProofBuilder[IO](Some(mptStore.underlying))
+      newSnapshotInfoStateProof <- stateProofBuilder.buildProof(newSnapshotInfo, lastSnapshot.ordinal.next)(H)
       snapshot = GlobalIncrementalSnapshot(
         lastSnapshot.ordinal.next,
         height,
