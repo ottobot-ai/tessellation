@@ -12,14 +12,18 @@ services:
       # written into each per-node .env file. Every node MUST agree on this.
       - NAKAMOTO_GENESIS_TIME_MS=${NAKAMOTO_GENESIS_TIME_MS}
       - NAKAMOTO_GENESIS_ETA=tessellation-nakamoto-genesis
-      # LDD snowplow tunables (defaults shown — override via --nakamoto-* in
-      # set-env.sh later if needed)
+      # LDD snowplow tunables. Test defaults (32/2/0.1/1.0) roughly 2× the
+      # production LddConfig.Default (15/1/0.05/0.5) for ~4× chain throughput;
+      # the e2e cluster has ~0ms inter-node delay so the higher concurrent-winner
+      # rate is fine. Override per-run via env if needed.
       - NAKAMOTO_SLOTS_PER_EPOCH=${NAKAMOTO_SLOTS_PER_EPOCH:-60}
       - NAKAMOTO_ETA_ROTATION_SLOTS=${NAKAMOTO_ETA_ROTATION_SLOTS:-600}
-      - NAKAMOTO_LDD_CUTOFF=${NAKAMOTO_LDD_CUTOFF:-15}
-      - NAKAMOTO_LDD_OFFSET=${NAKAMOTO_LDD_OFFSET:-1}
-      - NAKAMOTO_LDD_BASELINE=${NAKAMOTO_LDD_BASELINE:-0.05}
-      - NAKAMOTO_LDD_AMPLITUDE=${NAKAMOTO_LDD_AMPLITUDE:-0.5}
+      - NAKAMOTO_LDD_CUTOFF=${NAKAMOTO_LDD_CUTOFF:-32}
+      - NAKAMOTO_LDD_OFFSET=${NAKAMOTO_LDD_OFFSET:-2}
+      - NAKAMOTO_LDD_BASELINE=${NAKAMOTO_LDD_BASELINE:-0.1}
+      - NAKAMOTO_LDD_AMPLITUDE=${NAKAMOTO_LDD_AMPLITUDE:-1.0}
+      # Test-only slot duration. Production default is 1000ms (in SnapshotLeaderLoop).
+      - NAKAMOTO_SLOT_DURATION_MS=${NAKAMOTO_SLOT_DURATION_MS:-500}
       # Local sidecar gRPC endpoint — sidecar service runs on the same docker
       # network with the matching CONTAINER_NAME_SUFFIX.
       - SIDECAR_HOST=sidecar${CONTAINER_NAME_SUFFIX:-}
