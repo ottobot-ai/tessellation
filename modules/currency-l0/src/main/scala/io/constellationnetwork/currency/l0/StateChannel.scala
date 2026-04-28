@@ -194,9 +194,16 @@ object StateChannel {
       lastSnapshot: Hashed[GlobalIncrementalSnapshot],
       lastState: GlobalSnapshotInfo
     ): F[Unit] =
+      // Don't call `ensureMptInitialized(lastSnapshot.ordinal, lastState)` here. It's lossy:
+      // syncFromGlobalSnapshotInfo clears the MPT and rebuilds from GSI fields only, which
+      // can't fully reproduce the MPT — entries that the incremental writer correctly produced
+      // (e.g. expiry-index buckets whose source record is no longer active but whose bucket
+      // wasn't explicitly removed) get silently dropped. After the previous snapshot's
+      // accept() call, the MPT is already at lastSnapshot.ordinal state via syncFromStateChanges
+      // (the lossless incremental path). Initialization happens via handleInitialSnapshot at
+      // startup and via recoverFromOrphan / setForRecovery on rollback paths.
       (for {
         _ <- logger.info(s"Processing incremental snapshot ordinal=${snapshot.ordinal}")
-        _ <- ensureMptInitialized(lastSnapshot.ordinal, lastState)
         context <- services.globalSnapshotContextFunctions.createContext(
           lastState,
           lastSnapshot.signed,
