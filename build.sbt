@@ -310,7 +310,6 @@ lazy val shared = (project in file("modules/shared"))
       Libraries.logback % Runtime,
       Libraries.logstashLogbackEncoder % Runtime,
       Libraries.mapref,
-      Libraries.scaffeine,
       Libraries.monocleCore,
       Libraries.monocleMacro,
       Libraries.newtype,

@@ -39,7 +39,6 @@ object Dependencies {
     val logback = "1.3.5"
     val logstashLogbackEncoder = "7.2"
     val scalafixRules = "0.1.2"
-    val scaffeine = "5.3.0"
     val semanticDB = "4.14.2"
     val weaver = "0.11.3"
     val clickHouse = "0.9.5"
@@ -151,8 +150,6 @@ object Dependencies {
     val shapeless = "com.chuusai" %% "shapeless" % V.shapeless
 
     val mapref = "io.chrisdavenport" %% "mapref" % V.mapref
-
-    val scaffeine = "com.github.blemale" %% "scaffeine" % V.scaffeine
 
     val pureconfigCore = "com.github.pureconfig" %% "pureconfig" % V.pureconfig
     val pureconfigCats = pureconfig("cats")
