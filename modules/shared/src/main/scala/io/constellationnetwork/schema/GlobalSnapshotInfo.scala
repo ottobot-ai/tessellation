@@ -233,30 +233,41 @@ object GlobalSnapshotInfo {
             case Some(p) =>
               p.buildForOrdinal(ordinal).flatMap {
                 case Left(err) => err.raiseError[F, GlobalSnapshotStateProof]
-                case Right(trie) =>
+                case Right(_) =>
                   p.getRootHashForOrdinal(ordinal).flatMap {
                     case Some(value) =>
-                      GlobalSnapshotStateProof
-                        .apply(
-                          Hash.empty,
-                          Hash.empty,
-                          Hash.empty,
-                          None,
-                          None,
-                          None,
-                          None,
-                          None,
-                          None,
-                          None,
-                          None,
-                          None,
-                          None,
-                          None,
-                          None,
-                          None,
-                          Some(value.value)
+                      // The producer's `value` is the canonical global mptRoot (incrementally maintained).
+                      // Per-field subtree roots are computed from the same byte map the producer was fed —
+                      // not from a fresh global rebuild — and slot into the case class's per-field proof slots
+                      // so the state proof carries verifiable per-fieldId roots, not Hash.empty placeholders.
+                      // Keep in lockstep with `mptStateProof[F]` below: same fieldRoot mapping, same Option
+                      // lifting from the GSI's per-field presence.
+                      info.allStateEntriesAsBytes.buildPerFieldMptRoots.map { perField =>
+                        val FId = io.constellationnetwork.schema.mpt.GlobalStateFieldId
+
+                        def fieldRoot(id: io.constellationnetwork.schema.mpt.GlobalStateFieldId): Hash =
+                          perField.getOrElse(id, Hash.empty)
+
+                        GlobalSnapshotStateProof(
+                          lastStateChannelSnapshotHashesProof = fieldRoot(FId.LastStateChannelSnapshotHashes),
+                          lastTxRefsProof = fieldRoot(FId.LastTxRefs),
+                          balancesProof = fieldRoot(FId.Balances),
+                          lastCurrencySnapshotsProof = None,
+                          activeAllowSpends = info.activeAllowSpends.map(_ => fieldRoot(FId.ActiveAllowSpends)),
+                          activeTokenLocks = info.activeTokenLocks.map(_ => fieldRoot(FId.ActiveTokenLocks)),
+                          tokenLockBalances = info.tokenLockBalances.map(_ => fieldRoot(FId.TokenLockBalances)),
+                          lastAllowSpendRefs = info.lastAllowSpendRefs.map(_ => fieldRoot(FId.LastAllowSpendRefs)),
+                          lastTokenLockRefs = info.lastTokenLockRefs.map(_ => fieldRoot(FId.LastTokenLockRefs)),
+                          updateNodeParameters = info.updateNodeParameters.map(_ => fieldRoot(FId.UpdateNodeParameters)),
+                          activeDelegatedStakes = info.activeDelegatedStakes.map(_ => fieldRoot(FId.ActiveDelegatedStakes)),
+                          delegatedStakesWithdrawals = info.delegatedStakesWithdrawals.map(_ => fieldRoot(FId.DelegatedStakesWithdrawals)),
+                          activeNodeCollaterals = info.activeNodeCollaterals.map(_ => fieldRoot(FId.ActiveNodeCollaterals)),
+                          nodeCollateralWithdrawals = info.nodeCollateralWithdrawals.map(_ => fieldRoot(FId.NodeCollateralWithdrawals)),
+                          priceState = info.priceState.map(_ => fieldRoot(FId.PriceState)),
+                          lastGlobalSnapshotsWithCurrency = None,
+                          mptRoot = Some(value.value)
                         )
-                        .pure[F]
+                      }
                     case None => MonadThrow[F].raiseError(new RuntimeException(s"Could not get mptRootHash for ordinal $ordinal"))
                   }
               }
