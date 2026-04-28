@@ -1307,7 +1307,7 @@ object GlobalSnapshotAcceptanceManager {
                   // upserts + removes via `toAccumulatorHexDelta` (scodec per-field encoding,
                   // no `GlobalSnapshotInfo` involved). This is the MPT-as-primary verify path.
                   deltaPair <- io.constellationnetwork.schema.mpt.GlobalStateConverter
-                    .toAccumulatorHexDelta[F](stateChangesAccumulator)
+                    .toAccumulatorHexDelta[F](stateChangesAccumulator, preSyncBytes)
                   (deltaUpserts, deltaRemoves) = deltaPair
                   expectedBytes = (preSyncBytes -- deltaRemoves) ++ deltaUpserts
                   verifyTrie <- io.constellationnetwork.security.mpt.MerklePatriciaTrie
