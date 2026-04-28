@@ -720,6 +720,24 @@ object GlobalStateConverter {
               kvPairs.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }
                 .flatMap(pairs => MerklePatriciaTrie.makeParallelFromBytes[F](pairs.toMap).map(_.rootHash))
         } yield mptRoot
+
+      /** Per-fieldId MPT root over the same key+value bytes as the global root. For each `fieldId` present in the input, builds a separate
+        * MPT containing only that field's hex-encoded keys + value bytes and returns its rootHash. Deterministic across nodes because (a)
+        * `fieldId` is a structural prefix of the encoded `GlobalStateKey` and (b) the underlying value encodings are the same as those that
+        * feed the global root. FieldIds with no entries are omitted from the result; callers default to `Hash.empty`.
+        */
+      def buildPerFieldMptRoots: F[Map[GlobalStateFieldId, Hash]] =
+        for {
+          kvPairs <- kvPairsF
+          grouped = kvPairs.groupBy(_._1.fieldId).toList
+          perField <- grouped.parTraverse {
+            case (fieldId, entries) =>
+              if (entries.isEmpty) (fieldId -> Hash.empty).pure[F]
+              else
+                entries.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }
+                  .flatMap(pairs => MerklePatriciaTrie.makeParallelFromBytes[F](pairs.toMap).map(t => fieldId -> t.rootHash.value))
+          }
+        } yield perField.toMap
     }
 
     implicit class MptBuilderOps[F[_]: Parallel: Async: Hasher](kvPairsF: F[Map[GlobalStateKey, Json]]) {

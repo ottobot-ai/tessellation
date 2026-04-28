@@ -269,28 +269,48 @@ object GlobalSnapshotInfo {
   def mptStateProof[F[_]: Parallel: Async: Hasher: JsonSerializer](info: GlobalSnapshotInfo)(
     implicit stateProofSelector: StateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
-  ): F[GlobalSnapshotStateProof] =
-    info.allStateEntriesAsBytes.buildMptFromBytes.map { mptRoot =>
-      GlobalSnapshotStateProof.apply(
-        Hash.empty,
-        Hash.empty,
-        Hash.empty,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(mptRoot.value)
+  ): F[GlobalSnapshotStateProof] = {
+    val FId = io.constellationnetwork.schema.mpt.GlobalStateFieldId
+
+    for {
+      entries <- info.allStateEntriesAsBytes
+      // Compute the global mptRoot and per-fieldId subtree roots in parallel from the same byte map.
+      // Per-field roots are deterministic across nodes because fieldId is a structural prefix of the
+      // encoded GlobalStateKey and value bytes use the same canonical codecs as the global root.
+      // Each subtree root is the rootHash of an MPT built from only that fieldId's entries — gives
+      // the case class's per-field Option[Hash] slots a well-defined, verifiable value (instead of None).
+      results <- (
+        entries.pure[F].buildMptFromBytes,
+        entries.pure[F].buildPerFieldMptRoots
+      ).parTupled
+      (mptRoot, perField) = results
+    } yield {
+      def fieldRoot(id: io.constellationnetwork.schema.mpt.GlobalStateFieldId): Hash =
+        perField.getOrElse(id, Hash.empty)
+
+      GlobalSnapshotStateProof(
+        lastStateChannelSnapshotHashesProof = fieldRoot(FId.LastStateChannelSnapshotHashes),
+        lastTxRefsProof = fieldRoot(FId.LastTxRefs),
+        balancesProof = fieldRoot(FId.Balances),
+        // Currency-snapshots slot is a Merkle tree (not MPT); the MPT format tracks
+        // LastIncrementalCurrencySnapshots/LastCurrencySnapshotInfo via the global mptRoot.
+        lastCurrencySnapshotsProof = None,
+        activeAllowSpends = info.activeAllowSpends.map(_ => fieldRoot(FId.ActiveAllowSpends)),
+        activeTokenLocks = info.activeTokenLocks.map(_ => fieldRoot(FId.ActiveTokenLocks)),
+        tokenLockBalances = info.tokenLockBalances.map(_ => fieldRoot(FId.TokenLockBalances)),
+        lastAllowSpendRefs = info.lastAllowSpendRefs.map(_ => fieldRoot(FId.LastAllowSpendRefs)),
+        lastTokenLockRefs = info.lastTokenLockRefs.map(_ => fieldRoot(FId.LastTokenLockRefs)),
+        updateNodeParameters = info.updateNodeParameters.map(_ => fieldRoot(FId.UpdateNodeParameters)),
+        activeDelegatedStakes = info.activeDelegatedStakes.map(_ => fieldRoot(FId.ActiveDelegatedStakes)),
+        delegatedStakesWithdrawals = info.delegatedStakesWithdrawals.map(_ => fieldRoot(FId.DelegatedStakesWithdrawals)),
+        activeNodeCollaterals = info.activeNodeCollaterals.map(_ => fieldRoot(FId.ActiveNodeCollaterals)),
+        nodeCollateralWithdrawals = info.nodeCollateralWithdrawals.map(_ => fieldRoot(FId.NodeCollateralWithdrawals)),
+        priceState = info.priceState.map(_ => fieldRoot(FId.PriceState)),
+        lastGlobalSnapshotsWithCurrency = None,
+        mptRoot = Some(mptRoot.value)
       )
     }
+  }
 
   def legacyStateProof[F[_]: Parallel: Sync: Hasher](
     info: GlobalSnapshotInfo,
