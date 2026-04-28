@@ -215,15 +215,20 @@ object SnapshotLeaderLoop {
           attempt
         }
 
+        // Slot duration is fixed at 1s by default. Tests can override via `NAKAMOTO_SLOT_DURATION_MS`
+        // (e.g. 500ms for faster bigset cadence). Tick rate and slot derivation share the same value
+        // so cluster nodes agree on slot index for the same wall-clock instant.
+        val slotDurationMs: Long =
+          sys.env.get("NAKAMOTO_SLOT_DURATION_MS").flatMap(_.toLongOption).getOrElse(1000L)
         val slotTick: Stream[F, Unit] = Stream
-          .awakeEvery[F](1.second)
+          .awakeEvery[F](FiniteDuration(slotDurationMs, MILLISECONDS))
           .evalMap { _ =>
             for {
               // Only produce when node is Ready and past genesis time
               nodeState <- nodeStorage.getNodeState
               state <- stateRef.get
               wallClockMs = System.currentTimeMillis()
-              currentSlot = (wallClockMs - state.genesisTimeMs) / 1000L
+              currentSlot = (wallClockMs - state.genesisTimeMs) / slotDurationMs
               gateOpen <- productionGate.isOpen
               _ <-
                 if (nodeState =!= NodeState.Ready) Async[F].unit

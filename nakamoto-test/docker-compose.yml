@@ -1,9 +1,5 @@
-# Nakamoto PoC local cluster — 3 JVM nodes + 3 Go sidecars
-# All nodes run `run-nakamoto` with shared genesis key → identical genesis → simultaneous Ready.
-#
-# Usage:
-#   1. Build JARs:  sbt dagL0/stage
-#   2. Start:  docker compose up --build
+# Auto-generated Nakamoto cluster — do not edit manually
+# Regenerate: ./gen-cluster.sh NUM_NODES
 
 x-jvm-common: &jvm-common
   build:
@@ -16,34 +12,24 @@ x-jvm-common: &jvm-common
     NAKAMOTO_GENESIS_ETA: "tessellation-nakamoto-genesis"
     NAKAMOTO_SLOTS_PER_EPOCH: "60"
     NAKAMOTO_ETA_ROTATION_SLOTS: "${NAKAMOTO_ETA_ROTATION_SLOTS:-600}"
-    # LDD params (override for testing, defaults: cutoff=15, offset=1, baseline=0.05, amplitude=0.5)
-    NAKAMOTO_LDD_CUTOFF: "${NAKAMOTO_LDD_CUTOFF:-15}"
-    NAKAMOTO_LDD_OFFSET: "${NAKAMOTO_LDD_OFFSET:-1}"
-    NAKAMOTO_LDD_BASELINE: "${NAKAMOTO_LDD_BASELINE:-0.05}"
-    NAKAMOTO_LDD_AMPLITUDE: "${NAKAMOTO_LDD_AMPLITUDE:-0.5}"
-    # Genesis time: set dynamically by start.sh, or use 0 for "now"
-    # All nodes MUST share the same genesis time for slot agreement
+    # Test-only LDD overrides — production defaults are in LddConfig.Default (15/1/0.05/0.5).
+    # Doubled here to roughly 4× chain throughput for faster e2e cycles. Cluster network
+    # delay is ~0ms in docker so fA=1.0 + 8 nodes is fine despite the higher concurrent-winner rate.
+    NAKAMOTO_LDD_CUTOFF: "${NAKAMOTO_LDD_CUTOFF:-32}"
+    NAKAMOTO_LDD_OFFSET: "${NAKAMOTO_LDD_OFFSET:-2}"
+    NAKAMOTO_LDD_BASELINE: "${NAKAMOTO_LDD_BASELINE:-0.1}"
+    NAKAMOTO_LDD_AMPLITUDE: "${NAKAMOTO_LDD_AMPLITUDE:-1.0}"
+    # Test-only slot duration. Production default is 1000ms (set in SnapshotLeaderLoop).
+    NAKAMOTO_SLOT_DURATION_MS: "${NAKAMOTO_SLOT_DURATION_MS:-500}"
     NAKAMOTO_GENESIS_TIME_MS: "${NAKAMOTO_GENESIS_TIME_MS:-0}"
     CL_KEYALIAS: alias
     CL_PASSWORD: password
     JAVA_OPTS: "-Xmx1g -Xss256k --add-opens=java.base/java.lang.invoke=ALL-UNNAMED --add-opens=java.base/java.util=ALL-UNNAMED --add-opens=java.base/java.security=ALL-UNNAMED"
-  volumes:
-    - ./genesis.csv:/opt/genesis.csv:ro
-    - ./seedlist.csv:/opt/seedlist.csv:ro
-
 
 x-sidecar-common: &sidecar-common
   build:
     context: ../p2p
     dockerfile: Dockerfile
-
-x-nakamoto-cmd: &nakamoto-cmd
-  # All nodes run the same command — no genesis/validator distinction.
-  # Each signs genesis with own key; hash is over unsigned content so they agree.
-  command: >
-    run-nakamoto
-    /opt/genesis.csv
-    --collateral 0
 
 services:
   # ── Node 0 ────────────────────────────────────────────
@@ -53,7 +39,7 @@ services:
     command: [
       "-grpc", "0.0.0.0:50051",
       "-listen", "/ip4/0.0.0.0/tcp/9500",
-      "-seedlist", "/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500"
+      "-seedlist", "/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500"
     ]
     networks:
       nakamoto:
@@ -71,9 +57,9 @@ services:
       CL_P2P_HTTP_PORT: "9001"
       CL_CLI_HTTP_PORT: "9002"
     volumes:
-      - ./genesis.csv:/opt/genesis.csv:ro
-      - ./seedlist.csv:/opt/seedlist.csv:ro
-      - ../docker/config/local-test-keys/3:/opt/keys:ro
+      - ./genesis-3.csv:/opt/genesis.csv:ro
+      - ./seedlist-3.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/0:/opt/keys:ro
     command: >
       run-nakamoto
       /opt/genesis.csv
@@ -99,7 +85,7 @@ services:
     command: [
       "-grpc", "0.0.0.0:50051",
       "-listen", "/ip4/0.0.0.0/tcp/9500",
-      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500"
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500"
     ]
     networks:
       nakamoto:
@@ -117,9 +103,9 @@ services:
       CL_P2P_HTTP_PORT: "9011"
       CL_CLI_HTTP_PORT: "9012"
     volumes:
-      - ./genesis.csv:/opt/genesis.csv:ro
-      - ./seedlist.csv:/opt/seedlist.csv:ro
-      - ../docker/config/local-test-keys/4:/opt/keys:ro
+      - ./genesis-3.csv:/opt/genesis.csv:ro
+      - ./seedlist-3.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/1:/opt/keys:ro
     command: >
       run-nakamoto
       /opt/genesis.csv
@@ -142,7 +128,7 @@ services:
     command: [
       "-grpc", "0.0.0.0:50051",
       "-listen", "/ip4/0.0.0.0/tcp/9500",
-      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-3/tcp/9500"
+      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500"
     ]
     networks:
       nakamoto:
@@ -160,9 +146,9 @@ services:
       CL_P2P_HTTP_PORT: "9021"
       CL_CLI_HTTP_PORT: "9022"
     volumes:
-      - ./genesis.csv:/opt/genesis.csv:ro
-      - ./seedlist.csv:/opt/seedlist.csv:ro
-      - ../docker/config/local-test-keys/5:/opt/keys:ro
+      - ./genesis-3.csv:/opt/genesis.csv:ro
+      - ./seedlist-3.csv:/opt/seedlist.csv:ro
+      - ../docker/config/local-test-keys/2:/opt/keys:ro
     command: >
       run-nakamoto
       /opt/genesis.csv
@@ -177,53 +163,6 @@ services:
     networks:
       nakamoto:
         aliases: [node-2]
-
-  # ── Node 3 (validator — joins mid-chain) ───────────
-  sidecar-3:
-    <<: *sidecar-common
-    container_name: nakamoto-sidecar-3
-    command: [
-      "-grpc", "0.0.0.0:50051",
-      "-listen", "/ip4/0.0.0.0/tcp/9500",
-      "-seedlist", "/dns4/nakamoto-sidecar-0/tcp/9500,/dns4/nakamoto-sidecar-1/tcp/9500,/dns4/nakamoto-sidecar-2/tcp/9500"
-    ]
-    networks:
-      nakamoto:
-        aliases: [sidecar-3]
-    profiles:
-      - validator
-
-  node-3:
-    <<: *jvm-common
-    container_name: nakamoto-node-3
-    environment:
-      <<: *jvm-env
-      CL_KEYSTORE: /opt/keys/key.p12
-      SIDECAR_HOST: sidecar-3
-      SIDECAR_GRPC_PORT: "50051"
-      CL_PUBLIC_HTTP_PORT: "9030"
-      CL_P2P_HTTP_PORT: "9031"
-      CL_CLI_HTTP_PORT: "9032"
-    volumes:
-      - ./genesis.csv:/opt/genesis.csv:ro
-      - ./seedlist.csv:/opt/seedlist.csv:ro
-      - ../docker/config/local-test-keys/6:/opt/keys:ro
-    command: >
-      run-nakamoto-validator
-      --ip node-3
-      --public-port 9030
-      --p2p-port 9031
-      --cli-port 9032
-      --seedlist /opt/seedlist.csv
-      --collateral 0
-      --nakamoto-peer http://node-0:9000
-    depends_on:
-      - sidecar-3
-    networks:
-      nakamoto:
-        aliases: [node-3]
-    profiles:
-      - validator
 
 networks:
   nakamoto:
