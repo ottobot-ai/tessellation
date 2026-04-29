@@ -1425,12 +1425,13 @@ object GlobalSnapshotAcceptanceManager {
                 } yield result
               }
 
-            (expiredAllowSpends, expiredTokenLocks) = (
-              allowSpendStateManager.filterExpiredAllowSpends(
-                lastActiveGlobalAllowSpends,
-                epochProgress
-              ),
-              tokenLockStateManager.filterExpiredTokenLocks(globalActiveTokenLocks, epochProgress)
+            expiredAllowSpends = allowSpendStateManager.filterExpiredAllowSpends(
+              lastActiveGlobalAllowSpends,
+              epochProgress
+            )
+            expiredTokenLocks <- tokenLockStateManager.findExpiredGlobalTokenLocksViaIndexFromMpt(
+              previousEpochProgress,
+              epochProgress
             )
 
             artifactsFromExpired <- artifactEmissionManager.emitAllExpiredArtifacts(
