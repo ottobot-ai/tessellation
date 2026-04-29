@@ -25,7 +25,11 @@ services:
       - NAKAMOTO_LDD_BASELINE=${NAKAMOTO_LDD_BASELINE:-0.05}
       - NAKAMOTO_LDD_AMPLITUDE=${NAKAMOTO_LDD_AMPLITUDE:-0.5}
       # Test-only slot duration. Production default is 1000ms (in SnapshotLeaderLoop).
-      - NAKAMOTO_SLOT_DURATION_MS=${NAKAMOTO_SLOT_DURATION_MS:-500}
+      # Kept at 1000ms because halving slot duration also halves wall-clock per epoch
+      # (slots-per-epoch is fixed at 60), which made the token-lock-replacement edge
+      # cases flake — the WithdrawalTimeLimit window closes before the L1 syncs the
+      # new lock. If we want faster slots we'd need to scale slots-per-epoch too.
+      - NAKAMOTO_SLOT_DURATION_MS=${NAKAMOTO_SLOT_DURATION_MS:-1000}
       # Local sidecar gRPC endpoint — sidecar service runs on the same docker
       # network with the matching CONTAINER_NAME_SUFFIX.
       - SIDECAR_HOST=sidecar${CONTAINER_NAME_SUFFIX:-}
