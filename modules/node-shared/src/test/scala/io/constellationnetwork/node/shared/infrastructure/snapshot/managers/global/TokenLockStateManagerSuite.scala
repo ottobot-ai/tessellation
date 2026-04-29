@@ -1618,7 +1618,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
-        lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
       )
       .map { result =>
@@ -1650,7 +1649,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       signedTokenLock <- Signed.forAsyncHasher(tokenLock, kp)
       acceptedGlobalTokenLocks = SortedMap(testAddress -> SortedSet(signedTokenLock))
-      lastActiveGlobalTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
       generatedTokenUnlocksByAddress = Map.empty[Address, List[TokenUnlock]]
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
@@ -1658,7 +1656,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
-        lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
       )
 
@@ -1705,7 +1702,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
-        lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
       )
 
@@ -1738,7 +1734,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
-        lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
       )
 
@@ -1772,7 +1767,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       signedTokenLock <- Signed.forAsyncHasher(tokenLock, kp)
       acceptedGlobalTokenLocks = SortedMap(testAddress -> SortedSet(signedTokenLock))
-      lastActiveGlobalTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
       generatedTokenUnlocksByAddress = Map.empty[Address, List[TokenUnlock]]
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
@@ -1780,7 +1774,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
-        lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
       )
     } yield expect(result.isLeft) // Should fail due to insufficient balance
@@ -1840,7 +1833,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
-        lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
       )
 
@@ -1908,7 +1900,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
-        lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
       )
 
@@ -1945,7 +1936,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       signedTokenLock <- Signed.forAsyncHasher(tokenLock, kp)
       acceptedGlobalTokenLocks = SortedMap(testAddress -> SortedSet(signedTokenLock))
-      lastActiveGlobalTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
       generatedTokenUnlocksByAddress = Map.empty[Address, List[TokenUnlock]]
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
@@ -1953,7 +1943,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
-        lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
       )
 
@@ -1976,7 +1965,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       currentBalances = SortedMap(testAddress -> initialBalance)
 
       acceptedGlobalTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
-      lastActiveGlobalTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
 
       // Multiple token unlocks for the same address
       tokenUnlock1 = TokenUnlock(testHash("ref123"), TokenLockAmount(100L), none, testAddress)
@@ -1990,7 +1978,6 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         EpochProgress.MinValue,
         currentBalances,
         acceptedGlobalTokenLocks,
-        lastActiveGlobalTokenLocks,
         generatedTokenUnlocksByAddress
       )
 

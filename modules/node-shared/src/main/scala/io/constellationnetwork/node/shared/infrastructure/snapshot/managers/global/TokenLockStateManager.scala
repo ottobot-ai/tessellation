@@ -90,7 +90,6 @@ trait TokenLockStateManager[F[_]] {
     previousEpochProgress: EpochProgress,
     currentBalances: SortedMap[Address, Balance],
     acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
-    lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
     generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
   )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
 
@@ -500,12 +499,8 @@ object TokenLockStateManager {
         previousEpochProgress: EpochProgress,
         currentBalances: SortedMap[Address, Balance],
         acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
-        lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
         generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
-      )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] = {
-        // `lastActiveGlobalTokenLocks` retained on the trait signature (#91) but unused here — the FromMpt impl
-        // resolves expiring records via `mptStore.getActiveTokenLocks` instead of an in-memory full map.
-        val _ = lastActiveGlobalTokenLocks
+      )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] =
         updateGlobalBalancesByTokenLocksFromMpt(
           epochProgress,
           previousEpochProgress,
@@ -513,7 +508,6 @@ object TokenLockStateManager {
           acceptedGlobalTokenLocks,
           generatedTokenUnlocksByAddress
         )
-      }
 
       private def readBalance(
         address: Address,

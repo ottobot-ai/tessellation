@@ -332,7 +332,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       accepted = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
       unlocks = Map.empty[Address, List[io.constellationnetwork.schema.artifact.TokenUnlock]]
 
-      resultE <- mgr.updateGlobalBalancesByTokenLocks(currentEpoch, prevEpoch, currentBalances, accepted, lastActive, unlocks)
+      resultE <- mgr.updateGlobalBalancesByTokenLocks(currentEpoch, prevEpoch, currentBalances, accepted, unlocks)
     } yield
       expect.all(
         // The Right side carries (full balances, deltas). For an empty starting balance and an expiring

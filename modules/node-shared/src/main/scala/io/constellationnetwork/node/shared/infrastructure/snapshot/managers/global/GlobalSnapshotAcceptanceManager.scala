@@ -1009,7 +1009,6 @@ object GlobalSnapshotAcceptanceManager {
               previousEpochProgress,
               updatedBalancesByAllowSpends,
               globalTokenLocks,
-              globalActiveTokenLocks,
               generatedTokenUnlocks
             )
             (updatedBalancesByTokenLocks, updatedBalancesByTokenLocksDeltas) <- Async[F].fromEither(
