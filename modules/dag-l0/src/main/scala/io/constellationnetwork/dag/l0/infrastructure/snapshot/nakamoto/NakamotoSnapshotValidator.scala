@@ -147,42 +147,52 @@ object NakamotoSnapshotValidator {
                                 diffs += s"lastHash(recv=${leader.lastSnapshotHash.show.take(12)},own=${own.lastSnapshotHash.show.take(12)})"
                               if (leader.epochProgress =!= own.epochProgress)
                                 diffs += s"epoch(recv=${leader.epochProgress},own=${own.epochProgress})"
-                              if (leader.stateProof =!= own.stateProof) {
-                                val lp = leader.stateProof
-                                val op = own.stateProof
-                                val spDiffs = List.newBuilder[String]
-                                if (lp.lastStateChannelSnapshotHashesProof =!= op.lastStateChannelSnapshotHashesProof) spDiffs += "scHashes"
-                                if (lp.lastTxRefsProof =!= op.lastTxRefsProof) spDiffs += "txRefs"
-                                if (lp.balancesProof =!= op.balancesProof) spDiffs += "balances"
-                                if (lp.lastCurrencySnapshotsProof =!= op.lastCurrencySnapshotsProof) spDiffs += "currSnapshots"
-                                if (lp.activeAllowSpends =!= op.activeAllowSpends) spDiffs += "allowSpends"
-                                if (lp.activeTokenLocks =!= op.activeTokenLocks) spDiffs += "tokenLocks"
-                                if (lp.tokenLockBalances =!= op.tokenLockBalances) spDiffs += "tokenLockBal"
-                                if (lp.lastAllowSpendRefs =!= op.lastAllowSpendRefs) spDiffs += "allowSpendRefs"
-                                if (lp.lastTokenLockRefs =!= op.lastTokenLockRefs) spDiffs += "tokenLockRefs"
-                                if (lp.updateNodeParameters =!= op.updateNodeParameters) spDiffs += "nodeParams"
-                                if (lp.activeDelegatedStakes =!= op.activeDelegatedStakes) spDiffs += "delegStakes"
-                                if (lp.delegatedStakesWithdrawals =!= op.delegatedStakesWithdrawals) spDiffs += "delegWithdraw"
-                                if (lp.activeNodeCollaterals =!= op.activeNodeCollaterals) spDiffs += "nodeCollat"
-                                if (lp.nodeCollateralWithdrawals =!= op.nodeCollateralWithdrawals) spDiffs += "collatWithdraw"
-                                if (lp.priceState =!= op.priceState) spDiffs += "priceState"
-                                if (lp.lastGlobalSnapshotsWithCurrency =!= op.lastGlobalSnapshotsWithCurrency) spDiffs += "globalWithCurr"
-                                if (lp.mptRoot =!= op.mptRoot) spDiffs += "mptRoot"
-                                diffs += s"stateProof[${spDiffs.result().mkString(",")}]"
-                              }
+                              val spDiffList: List[String] =
+                                if (leader.stateProof =!= own.stateProof) {
+                                  val lp = leader.stateProof
+                                  val op = own.stateProof
+                                  val spDiffs = List.newBuilder[String]
+                                  if (lp.lastStateChannelSnapshotHashesProof =!= op.lastStateChannelSnapshotHashesProof)
+                                    spDiffs += "scHashes"
+                                  if (lp.lastTxRefsProof =!= op.lastTxRefsProof) spDiffs += "txRefs"
+                                  if (lp.balancesProof =!= op.balancesProof) spDiffs += "balances"
+                                  if (lp.lastCurrencySnapshotsProof =!= op.lastCurrencySnapshotsProof) spDiffs += "currSnapshots"
+                                  if (lp.activeAllowSpends =!= op.activeAllowSpends) spDiffs += "allowSpends"
+                                  if (lp.activeTokenLocks =!= op.activeTokenLocks) spDiffs += "tokenLocks"
+                                  if (lp.tokenLockBalances =!= op.tokenLockBalances) spDiffs += "tokenLockBal"
+                                  if (lp.lastAllowSpendRefs =!= op.lastAllowSpendRefs) spDiffs += "allowSpendRefs"
+                                  if (lp.lastTokenLockRefs =!= op.lastTokenLockRefs) spDiffs += "tokenLockRefs"
+                                  if (lp.updateNodeParameters =!= op.updateNodeParameters) spDiffs += "nodeParams"
+                                  if (lp.activeDelegatedStakes =!= op.activeDelegatedStakes) spDiffs += "delegStakes"
+                                  if (lp.delegatedStakesWithdrawals =!= op.delegatedStakesWithdrawals) spDiffs += "delegWithdraw"
+                                  if (lp.activeNodeCollaterals =!= op.activeNodeCollaterals) spDiffs += "nodeCollat"
+                                  if (lp.nodeCollateralWithdrawals =!= op.nodeCollateralWithdrawals) spDiffs += "collatWithdraw"
+                                  if (lp.priceState =!= op.priceState) spDiffs += "priceState"
+                                  if (lp.lastGlobalSnapshotsWithCurrency =!= op.lastGlobalSnapshotsWithCurrency) spDiffs += "globalWithCurr"
+                                  if (lp.mptRoot =!= op.mptRoot) spDiffs += "mptRoot"
+                                  val result = spDiffs.result()
+                                  diffs += s"stateProof[${result.mkString(",")}]"
+                                  result
+                                } else List.empty[String]
                               if (leader.rewards =!= own.rewards) diffs += s"rewards(recv=${leader.rewards.size},own=${own.rewards.size})"
                               if (leader.tips =!= own.tips) diffs += "tips"
                               val diffList = diffs.result()
                               val diffStr = if (diffList.isEmpty) "no-field-diff-detected" else diffList.mkString(",")
-                              // stateProof-only diffs (mptRoot) are tolerated — MPT non-determinism
-                              // being fixed by undo journal. All other diffs are REJECTED.
-                              val stateProofOnly = diffList.size == 1 && diffList.head.startsWith("stateProof[")
+                              // 0harden: tolerate ONLY a top-level stateProof diff that consists solely of a
+                              // rolled-up `mptRoot` mismatch. Any per-field MPT-derived hash diff (balances,
+                              // tokenLocks, allowSpends, etc.) is now rejected — those are deterministically
+                              // computed from MPT entries and divergence indicates a real bug, not "MPT
+                              // non-determinism being fixed by undo journal".
+                              val mptRootOnly =
+                                diffList.size == 1 &&
+                                  diffList.head.startsWith("stateProof[") &&
+                                  spDiffList == List("mptRoot")
                               val msg =
-                                if (stateProofOnly)
-                                  s"ℹ️ Content OK (stateProof-only diff): slot=$slot ${diffList.head}"
+                                if (mptRootOnly)
+                                  s"ℹ️ Content OK (mptRoot-only diff): slot=$slot ${diffList.head}"
                                 else
                                   s"❌ Content REJECTED: slot=$slot diffs=[$diffStr]"
-                              (msg, stateProofOnly)
+                              (msg, mptRootOnly)
                             case _ =>
                               (s"❌ Content validation fail: slot=$slot err=$err", false)
                           }
