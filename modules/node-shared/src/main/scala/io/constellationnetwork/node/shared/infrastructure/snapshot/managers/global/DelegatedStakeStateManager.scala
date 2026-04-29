@@ -9,9 +9,11 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.tokenLock.TokenLock
-import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.security.{Hashed, Hasher}
 import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
 
 trait DelegatedStakeStateManager[F[_]] {
@@ -35,7 +37,7 @@ trait DelegatedStakeStateManager[F[_]] {
 
 object DelegatedStakeStateManager {
 
-  def make[F[_]: Async](): DelegatedStakeStateManager[F] = new DelegatedStakeStateManager[F] {
+  def make[F[_]: Async](mptStore: MptStore[F, GlobalStateKey]): DelegatedStakeStateManager[F] = new DelegatedStakeStateManager[F] {
 
     override def processExistingDelegatedStakes(
       lastSnapshotContext: GlobalSnapshotInfo,
@@ -58,14 +60,17 @@ object DelegatedStakeStateManager {
         hashedReplacementTokenLocks <- acceptedTokenLocks.filter(_.replaceTokenLockRef.isDefined).traverse(_.toHashed)
         replacementTokenLocks = hashedReplacementTokenLocks.mapFilter(tl => tl.replaceTokenLockRef.tupleRight(tl)).toMap
 
-        // Build a map of active token locks by reference for checking if token locks are still active
-        activeTokenLocksByRef <- lastSnapshotContext.activeTokenLocks
-          .getOrElse(SortedMap.empty[Address, SortedSet[Signed[TokenLock]]])
-          .values
-          .toList
-          .flatten
-          .traverse(_.toHashed)
-          .map(_.map(hashed => hashed.hash -> hashed).toMap)
+        // Build a map of active token locks by reference for checking if token locks are still active.
+        // Scoped to the addresses that own withdrawals — the only consumers of `activeTokenLocksByRef`
+        // (lines below) iterate `existingWithdrawals` / `expiredWithdrawals` whose keys ARE the
+        // staker addresses, and a token lock's source equals the staker. Reading from MPT here
+        // (instead of `lastSnapshotContext.activeTokenLocks`) is part of #11 — drop GSI materialization.
+        activeTokenLocksByRef <- existingWithdrawals.keySet.toList.flatTraverse { addr =>
+          mptStore.getActiveTokenLocks(addr).flatMap {
+            case Some(locks) => locks.toList.traverse(_.toHashed)
+            case None        => List.empty[Hashed[TokenLock]].pure[F]
+          }
+        }.map(_.map(hashed => hashed.hash -> hashed).toMap)
 
         updatedExistingDelegatedStakes = existingDelegatedStakes.view
           .mapValues(_.map { record =>
