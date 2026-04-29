@@ -140,6 +140,14 @@ trait TokenLockStateManager[F[_]] {
     acceptedTokenLocks: List[Signed[TokenLock]],
     globalActiveTokenLocksByRef: Map[Hash, Signed[TokenLock]]
   ): Either[String, Map[Address, List[TokenUnlock]]]
+
+  /** Build a hash-keyed lookup of active token locks for a given set of addresses, sourced from the MPT. Used by the acceptance pipeline so
+    * `generateTokenUnlocks` reads from the same store as `acceptReplacementTokenLocks`. Reading the same source eliminates the divergence
+    * that previously stalled chain-sync replay when the GSI's `activeTokenLocks` view disagreed with the MPT view.
+    */
+  def buildActiveTokenLocksByRefFromMpt(
+    addresses: Set[Address]
+  )(implicit hasher: Hasher[F]): F[Map[Hash, Signed[TokenLock]]]
 }
 
 object TokenLockStateManager {
@@ -574,5 +582,14 @@ object TokenLockStateManager {
           }.toMap
         }
       }
+
+      def buildActiveTokenLocksByRefFromMpt(
+        addresses: Set[Address]
+      )(implicit hasher: Hasher[F]): F[Map[Hash, Signed[TokenLock]]] =
+        addresses.toList.flatTraverse { addr =>
+          mptStore.getActiveTokenLocks(addr).map(_.fold(List.empty[Signed[TokenLock]])(_.toList))
+        }.flatMap { locks =>
+          locks.traverse(lock => lock.toHashed.map(h => h.hash -> lock)).map(_.toMap)
+        }
     }
 }

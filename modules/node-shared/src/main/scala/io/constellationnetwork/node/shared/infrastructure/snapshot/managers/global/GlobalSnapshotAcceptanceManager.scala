@@ -904,24 +904,16 @@ object GlobalSnapshotAcceptanceManager {
               SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
             )
 
-            allTokenLocks: List[Signed[TokenLock]] = globalActiveTokenLocks.values.toList.flatten
-            globalActiveTokenLocksByRef <-
-              if (allTokenLocks.isEmpty) {
-                Async[F].pure(Map.empty[Hash, Signed[TokenLock]])
-              } else {
-                Stream
-                  .emits(allTokenLocks)
-                  .covary[F]
-                  .chunkN(100)
-                  .parEvalMap(10) { chunk =>
-                    Async[F].cede *> chunk.toList.traverse { tokenLock =>
-                      tokenLock.toHashed.map(hashed => hashed.hash -> tokenLock)
-                    } <* Async[F].cede
-                  }
-                  .compile
-                  .toList
-                  .flatMap(results => Async[F].cede.as(results.flatten.toMap))
-              }
+            // Build the hash-keyed lookup from the MPT — same source as `acceptReplacementTokenLocks` so the
+            // two reads can't disagree. Scoped to the addresses actually involved in this acceptance round
+            // (replacement TX sources + expired-withdrawal stakers); avoids a full address-set scan.
+            // Fixes the chain-sync replay stall observed on gl0-7 where MPT and GSI views of activeTokenLocks
+            // diverged and `generateTokenUnlocks` failed lookups that `acceptReplacementTokenLocks` had passed.
+            tokenLockLookupAddresses = acceptedGlobalTokenLocks.map(_.value.source).toSet ++
+              initialData.existingStakes.expired.keySet
+            globalActiveTokenLocksByRef <- tokenLockStateManager.buildActiveTokenLocksByRefFromMpt(
+              tokenLockLookupAddresses
+            )
 
             globalLastAllowSpendRefs = lastSnapshotContext.lastAllowSpendRefs.getOrElse(
               SortedMap.empty[Address, AllowSpendReference]
