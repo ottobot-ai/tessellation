@@ -14,6 +14,8 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.transaction.TransactionReference
@@ -53,7 +55,8 @@ object BlockAcceptanceCoordinatorManager {
     allowSpendBlockAcceptanceManager: AllowSpendBlockAcceptanceManager[F],
     tokenLockBlockAcceptanceManager: TokenLockBlockAcceptanceManager[F],
     tipUsageManager: TipUsageManager[F],
-    collateral: Amount
+    collateral: Amount,
+    mptStore: MptStore[F, GlobalStateKey]
   ): BlockAcceptanceCoordinatorManager[F] = new BlockAcceptanceCoordinatorManager[F] {
 
     def acceptBlocks(
@@ -120,17 +123,19 @@ object BlockAcceptanceCoordinatorManager {
         .view
         .mapValues(_.flatMap(_.replaceTokenLockRef).toSet)
         .toMap
-      val allActiveTokenLocks = lastSnapshotContext.activeTokenLocks.getOrElse(SortedMap.empty[Address, SortedSet[Signed[TokenLock]]])
 
       for {
+        // Read each replacement source's active locks from the MPT instead of the GSI
+        // `activeTokenLocks` map. The lookup was already scoped per-address; only the
+        // backing store moves. Step toward #11 — drop GSI materialization.
         toBeReplacedHashedTokenLocks <-
           refHashesBySource.toList.flatTraverse {
             case (address, refHashes) =>
-              allActiveTokenLocks
-                .getOrElse(address, SortedSet.empty[Signed[TokenLock]])
-                .toList
-                .traverse(_.toHashed)
-                .map(_.filter(h => refHashes.contains(h.hash)))
+              mptStore.getActiveTokenLocks(address).flatMap {
+                case Some(locks) =>
+                  locks.toList.traverse(_.toHashed).map(_.filter(h => refHashes.contains(h.hash)))
+                case None => List.empty[Hashed[TokenLock]].pure[F]
+              }
           }
 
         context = TokenLockBlockAcceptanceContext.fromStaticData(

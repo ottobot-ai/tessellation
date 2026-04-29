@@ -212,7 +212,8 @@ object GlobalSnapshotAcceptanceManager {
       allowSpendBlockAcceptanceManager,
       tokenLockBlockAcceptanceManager,
       tipUsageManager,
-      collateral
+      collateral,
+      mptStore
     )
 
     new GlobalSnapshotAcceptanceManager[F] {
