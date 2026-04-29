@@ -44,7 +44,7 @@ persist across runs. Edit `grafana/dashboards/nakamoto-consensus.json` directly.
 ### Expected Behavior
 
 After genesis (~25s warmup), with the test-overlay defaults you should see:
-- **~30-40% fill rate** at ψ=2/γ=32/fA=1.0/fB=0.1 with 500ms slots
+- **~12% fill rate** at ψ=1/γ=16/fA=0.5/fB=0.05 with 1000ms slots (prod-aligned)
 - **Attestation weight → 1.0** within a few snapshots (2/3+ threshold)
 - **ATTEST-FINALIZED** log lines as 2/3+ weight is reached
 - **DEPTH-FINALIZED** when chain grows past the confirmation depth (k=31)
@@ -139,14 +139,16 @@ e2e cycles.
 | `NAKAMOTO_LDD_BASELINE`  | 0.05 | 0.05 | fB — min probability floor |
 | `NAKAMOTO_LDD_CUTOFF`    | 16  | 15  | γ — gap where curve flattens |
 | `NAKAMOTO_LDD_OFFSET`    | 1   | 1   | ψ — snowplow offset |
-| `NAKAMOTO_SLOT_DURATION_MS` | 500 | 1000 | Slot tick interval |
+| `NAKAMOTO_SLOT_DURATION_MS` | 1000 | 1000 | Slot tick interval |
 | `NAKAMOTO_SLOTS_PER_EPOCH`  | 60  | 60  | Slots per epoch |
 | `NAKAMOTO_ETA_ROTATION_SLOTS` | 600 | 600 | Eta randomness rotation |
 
 LDD parameters now match production defaults (within rounding — γ=16 vs 15)
 so the test cluster exercises the same eligibility curve as mainnet. Slot
-duration is halved to 500ms purely for finer-grained metrics; chain growth
-is wall-clock bound so it doesn't change throughput.
+duration stays at 1000ms — halving it also halves wall-clock per epoch
+(slots-per-epoch is fixed at 60), which broke `WithdrawalTimeLimit` timing
+in token-lock-replacement edge cases. Chain growth is wall-clock bound, so
+faster slots wouldn't have helped throughput anyway.
 
 ## Troubleshooting
 
