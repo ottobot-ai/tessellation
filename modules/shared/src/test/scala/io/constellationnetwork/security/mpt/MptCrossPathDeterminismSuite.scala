@@ -32,22 +32,22 @@ import weaver.scalacheck.Checkers
 /** Track-0diag cross-path determinism property test.
   *
   * Builds the same logical state via multiple trie-mutation paths and asserts every path produces an identical mptRoot AND identical
-  * per-key bytes. Divergence on any pair of paths is the signal Track 0 was created to surface. The validator currently tolerates
-  * mptRoot mismatches for "non-determinism being fixed by undo journal"
-  * (`NakamotoSnapshotValidator.scala:177`); this suite is the gate that lets us remove that tolerance.
+  * per-key bytes. Divergence on any pair of paths is the signal Track 0 was created to surface. The validator currently tolerates mptRoot
+  * mismatches for "non-determinism being fixed by undo journal" (`NakamotoSnapshotValidator.scala:177`); this suite is the gate that lets
+  * us remove that tolerance.
   *
   * Paths covered (per the proposal at `~/.claude/plans/meticulous-shedding-patricia.md`, "Track 0"):
   *   - **A: delta-apply** — `MptStore.syncFromStateChanges(accumulator)` (the accept() path).
   *   - **B: full-sync from GSI** — `MptStore.syncFromGlobalSnapshotInfo` (catch-up, L1 init, peer download). Uses its own `clear → typed
   *     insert per field → build`, NOT `MptStore.syncFull`.
-  *   - **C: per-field syncFull** — `MptStore.syncFull[V]` for one field type at a time (cross-checks single-field semantics; not a
-  *     direct GSI replacement since it clears on every call).
+  *   - **C: per-field syncFull** — `MptStore.syncFull[V]` for one field type at a time (cross-checks single-field semantics; not a direct
+  *     GSI replacement since it clears on every call).
   *   - **D: build vs commit** — `build(ordinal)` and `commit(ordinal)` after the same delta-apply must produce the same root.
-  *   - **E: verify-replay** — `toAccumulatorHexDelta` produces (upserts, removes); applying that to a fresh store and building must
-  *     produce the same root as path A.
+  *   - **E: verify-replay** — `toAccumulatorHexDelta` produces (upserts, removes); applying that to a fresh store and building must produce
+  *     the same root as path A.
   *
-  * The acceptance criterion is byte-equal entries plus byte-equal root, not just root agreement — root accidents can mask per-key
-  * bytes drift on uncommonly-serialised fields.
+  * The acceptance criterion is byte-equal entries plus byte-equal root, not just root agreement — root accidents can mask per-key bytes
+  * drift on uncommonly-serialised fields.
   */
 object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
 
@@ -143,8 +143,8 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
       bytes <- store.allEntriesAsBytes
     } yield (trie.toOption.map(_.rootHash), bytes)
 
-  /** Run path D: same as A but use `commit(ordinal)` instead of `build(ordinal)` for the final root step. The two
-    * must produce the same trie root since `commit` is `persistAsync + build + bookkeeping`.
+  /** Run path D: same as A but use `commit(ordinal)` instead of `build(ordinal)` for the final root step. The two must produce the same
+    * trie root since `commit` is `persistAsync + build + bookkeeping`.
     */
   private def buildViaDeltaApplyThenCommit(slice: GsiSlice, ordinal: SnapshotOrdinal)(
     implicit hasher: Hasher[IO],
@@ -159,9 +159,9 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
       bytes <- store.allEntriesAsBytes
     } yield (trie.toOption.map(_.rootHash), bytes)
 
-  /** Run path E: produce a hex-keyed delta via `toAccumulatorHexDelta`, apply it to a fresh producer's bytes via direct
-    * insert/remove, build the trie. This is the verify-path's reconstruction; if it disagrees with path A the verifier will reject
-    * snapshots that the writer accepted.
+  /** Run path E: produce a hex-keyed delta via `toAccumulatorHexDelta`, apply it to a fresh producer's bytes via direct insert/remove,
+    * build the trie. This is the verify-path's reconstruction; if it disagrees with path A the verifier will reject snapshots that the
+    * writer accepted.
     */
   private def buildViaVerifyReplay(slice: GsiSlice, ordinal: SnapshotOrdinal)(
     implicit hasher: Hasher[IO],
@@ -179,14 +179,14 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
     } yield (trie.toOption.map(_.rootHash), bytes)
 
   /** Compare two `Map[Hex, Array[Byte]]` for byte-equal entry agreement. Since `Array[Byte]` does not have a structural equality, we
-    * normalise to `Map[Hex, Vector[Byte]]` before comparing. */
+    * normalise to `Map[Hex, Vector[Byte]]` before comparing.
+    */
   private def bytesEntriesEq(a: Map[Hex, Array[Byte]], b: Map[Hex, Array[Byte]]): Boolean =
     a.view.mapValues(_.toVector).toMap == b.view.mapValues(_.toVector).toMap
 
-  /** Lift a property over a `GsiSlice` into a Weaver assertion that the four cross-comparable paths (A/B/D/E) agree on root and
-    * entry bytes. "Agree" includes the empty case — when the slice is empty, all paths return `None` (build errors with
-    * "no entries"), which is consistent and therefore acceptable. Path C is exercised separately because it operates on a
-    * single field type at a time.
+  /** Lift a property over a `GsiSlice` into a Weaver assertion that the four cross-comparable paths (A/B/D/E) agree on root and entry
+    * bytes. "Agree" includes the empty case — when the slice is empty, all paths return `None` (build errors with "no entries"), which is
+    * consistent and therefore acceptable. Path C is exercised separately because it operates on a single field type at a time.
     */
   private def assertCrossPathAgreement(slice: GsiSlice, ordinal: SnapshotOrdinal)(
     implicit hasher: Hasher[IO],
@@ -201,14 +201,15 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
       (rootB, bytesB) = b
       (rootD, bytesD) = d
       (rootE, bytesE) = e
-    } yield expect.all(
-      rootA == rootB,
-      rootA == rootD,
-      rootA == rootE,
-      bytesEntriesEq(bytesA, bytesB),
-      bytesEntriesEq(bytesA, bytesD),
-      bytesEntriesEq(bytesA, bytesE)
-    )
+    } yield
+      expect.all(
+        rootA == rootB,
+        rootA == rootD,
+        rootA == rootE,
+        bytesEntriesEq(bytesA, bytesB),
+        bytesEntriesEq(bytesA, bytesD),
+        bytesEntriesEq(bytesA, bytesE)
+      )
 
   test("path A == path B (delta-apply == syncFromGlobalSnapshotInfo) on random slice") { res =>
     implicit val (j, h, _) = res
@@ -217,10 +218,11 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
       for {
         a <- buildViaDeltaApply(slice, ordinal)
         b <- buildViaSyncFromGsi(slice, ordinal)
-      } yield expect.all(
-        a._1 == b._1,
-        bytesEntriesEq(a._2, b._2)
-      )
+      } yield
+        expect.all(
+          a._1 == b._1,
+          bytesEntriesEq(a._2, b._2)
+        )
     }
   }
 
@@ -231,10 +233,11 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
       for {
         a <- buildViaDeltaApply(slice, ordinal)
         d <- buildViaDeltaApplyThenCommit(slice, ordinal)
-      } yield expect.all(
-        a._1 == d._1,
-        bytesEntriesEq(a._2, d._2)
-      )
+      } yield
+        expect.all(
+          a._1 == d._1,
+          bytesEntriesEq(a._2, d._2)
+        )
     }
   }
 
@@ -245,10 +248,11 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
       for {
         a <- buildViaDeltaApply(slice, ordinal)
         e <- buildViaVerifyReplay(slice, ordinal)
-      } yield expect.all(
-        a._1 == e._1,
-        bytesEntriesEq(a._2, e._2)
-      )
+      } yield
+        expect.all(
+          a._1 == e._1,
+          bytesEntriesEq(a._2, e._2)
+        )
     }
   }
 
@@ -261,8 +265,8 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
   }
 
   /** Path C: per-field `syncFull[Balance]`. The store is cleared on every call, so we exercise `syncFull` only as a single-field-type
-    * primitive — not as a GSI rebuild path. The check is: `syncFull[Balance](balances)` produces the same root as building a slice
-    * via path A that contains *only* those balances. Empty slices fall through to all-`None` agreement, same as the cross-path tests.
+    * primitive — not as a GSI rebuild path. The check is: `syncFull[Balance](balances)` produces the same root as building a slice via path
+    * A that contains *only* those balances. Empty slices fall through to all-`None` agreement, same as the cross-path tests.
     */
   test("path C (syncFull[Balance]) matches delta-apply for the balances-only slice") { res =>
     implicit val (j, h, _) = res
@@ -284,15 +288,16 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
         cTrie <- cStore.build(ordinal)
         cBytes <- cStore.allEntriesAsBytes
         cRoot = cTrie.toOption.map(_.rootHash)
-      } yield expect.all(
-        a._1 == cRoot,
-        bytesEntriesEq(a._2, cBytes)
-      )
+      } yield
+        expect.all(
+          a._1 == cRoot,
+          bytesEntriesEq(a._2, cBytes)
+        )
     }
   }
 
-  /** Sanity: empty slice produces consistent results across all paths (all paths return None — `build` errors on empty
-    * with `OperationError("Cannot build trie with no entries")`, which is consistent across paths).
+  /** Sanity: empty slice produces consistent results across all paths (all paths return None — `build` errors on empty with
+    * `OperationError("Cannot build trie with no entries")`, which is consistent across paths).
     */
   test("all paths agree on the empty slice (all return None)") { res =>
     implicit val (j, h, _) = res
@@ -303,21 +308,22 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
       b <- buildViaSyncFromGsi(empty, ordinal)
       d <- buildViaDeltaApplyThenCommit(empty, ordinal)
       e <- buildViaVerifyReplay(empty, ordinal)
-    } yield expect.all(
-      a._1.isEmpty,
-      b._1.isEmpty,
-      d._1.isEmpty,
-      e._1.isEmpty,
-      a._2.isEmpty,
-      b._2.isEmpty,
-      d._2.isEmpty,
-      e._2.isEmpty
-    )
+    } yield
+      expect.all(
+        a._1.isEmpty,
+        b._1.isEmpty,
+        d._1.isEmpty,
+        e._1.isEmpty,
+        a._2.isEmpty,
+        b._2.isEmpty,
+        d._2.isEmpty,
+        e._2.isEmpty
+      )
   }
 
-  /** Single concrete sanity case: 1 balance, 1 lastTxRef, 1 stateChanHash. Asserts the root is non-empty (excluded from
-    * the property-based tests because empty slices fall through to all-`None` agreement). Pinning a concrete case here
-    * means the property tests can't pass vacuously — at least one execution exercises a non-trivial trie.
+  /** Single concrete sanity case: 1 balance, 1 lastTxRef, 1 stateChanHash. Asserts the root is non-empty (excluded from the property-based
+    * tests because empty slices fall through to all-`None` agreement). Pinning a concrete case here means the property tests can't pass
+    * vacuously — at least one execution exercises a non-trivial trie.
     */
   test("concrete sanity: single non-empty slice produces a non-trivial root") { res =>
     implicit val (j, h, _) = res
@@ -334,15 +340,16 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
       b <- buildViaSyncFromGsi(slice, ordinal)
       d <- buildViaDeltaApplyThenCommit(slice, ordinal)
       e <- buildViaVerifyReplay(slice, ordinal)
-    } yield expect.all(
-      a._1.isDefined,
-      a._2.size == 3,
-      a._1 == b._1,
-      a._1 == d._1,
-      a._1 == e._1,
-      bytesEntriesEq(a._2, b._2),
-      bytesEntriesEq(a._2, d._2),
-      bytesEntriesEq(a._2, e._2)
-    )
+    } yield
+      expect.all(
+        a._1.isDefined,
+        a._2.size == 3,
+        a._1 == b._1,
+        a._1 == d._1,
+        a._1 == e._1,
+        bytesEntriesEq(a._2, b._2),
+        bytesEntriesEq(a._2, d._2),
+        bytesEntriesEq(a._2, e._2)
+      )
   }
 }
