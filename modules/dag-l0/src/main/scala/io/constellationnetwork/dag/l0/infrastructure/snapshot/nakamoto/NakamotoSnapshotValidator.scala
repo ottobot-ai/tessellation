@@ -178,21 +178,15 @@ object NakamotoSnapshotValidator {
                               if (leader.tips =!= own.tips) diffs += "tips"
                               val diffList = diffs.result()
                               val diffStr = if (diffList.isEmpty) "no-field-diff-detected" else diffList.mkString(",")
-                              // 0harden: tolerate ONLY a top-level stateProof diff that consists solely of a
-                              // rolled-up `mptRoot` mismatch. Any per-field MPT-derived hash diff (balances,
-                              // tokenLocks, allowSpends, etc.) is now rejected — those are deterministically
-                              // computed from MPT entries and divergence indicates a real bug, not "MPT
-                              // non-determinism being fixed by undo journal".
-                              val mptRootOnly =
-                                diffList.size == 1 &&
-                                  diffList.head.startsWith("stateProof[") &&
-                                  spDiffList == List("mptRoot")
-                              val msg =
-                                if (mptRootOnly)
-                                  s"ℹ️ Content OK (mptRoot-only diff): slot=$slot ${diffList.head}"
-                                else
-                                  s"❌ Content REJECTED: slot=$slot diffs=[$diffStr]"
-                              (msg, mptRootOnly)
+                              // 0harden phase 2: zero tolerance. Any diff between the leader's artifact and
+                              // our locally-reconstructed one is rejected — including the rolled-up mptRoot.
+                              // Per-field MPT-derived hashes are deterministic from MPT entries; the global
+                              // mptRoot is deterministic from the same MPT producer state. If undo-journal
+                              // fork rollback ever produces a transient mptRoot diff, ContentMismatch will
+                              // surface it as a catch-up signal — which is the correct response.
+                              val _ = spDiffList
+                              val msg = s"❌ Content REJECTED: slot=$slot diffs=[$diffStr]"
+                              (msg, false)
                             case _ =>
                               (s"❌ Content validation fail: slot=$slot err=$err", false)
                           }
