@@ -113,7 +113,7 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](Some(store), shouldUseMptStore = true)
+      mgr = AllowSpendStateManager.make[IO](store)
 
       // Current epoch 300: asExpiredA (100) is expired, others not yet.
       // previousEpochProgress = MinValue: sweep all buckets up to 299.
@@ -138,7 +138,7 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(asValid))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](Some(store), shouldUseMptStore = true)
+      mgr = AllowSpendStateManager.make[IO](store)
 
       currentEpoch = EpochProgress(NonNegLong(500L))
       prevEpoch = EpochProgress(NonNegLong(100L))
@@ -160,7 +160,7 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(asExpired))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](Some(store), shouldUseMptStore = true)
+      mgr = AllowSpendStateManager.make[IO](store)
 
       sameEpoch = EpochProgress(NonNegLong(200L))
       indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndexFromMpt(sameEpoch, sameEpoch)
@@ -187,7 +187,7 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](Some(store), shouldUseMptStore = true)
+      mgr = AllowSpendStateManager.make[IO](store)
 
       // Sweep window [101 .. 114] captures all three records (predicate is `< curr`).
       prevEpoch = EpochProgress(NonNegLong(101L))
@@ -232,7 +232,7 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       lastActiveOuter = SortedMap(Option.empty[Address] -> lastActive)
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](Some(store), shouldUseMptStore = true)
+      mgr = AllowSpendStateManager.make[IO](store)
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -261,25 +261,6 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       )
   }
 
-  test("no-mptStore manager: FromMpt sweep returns empty (no index to consult)") { res =>
-    implicit val (h, sp, js) = res
-    // When the manager is constructed with `mptStore = None` the FromMpt sweep returns empty by design — the
-    // caller path falls back to the legacy in-memory filter inside `acceptAllowSpends`. Pinning the empty-output
-    // contract explicitly so a future change there doesn't go unnoticed.
-    for {
-      kp <- KeyPairGenerator.makeKeyPair[IO]
-      addr = kp.getPublic.toAddress
-
-      mgr = AllowSpendStateManager.make[IO](None)
-
-      currentEpoch = EpochProgress(NonNegLong(300L))
-      prevEpoch = EpochProgress(NonNegLong(50L))
-
-      indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndexFromMpt(prevEpoch, currentEpoch)
-      _ = addr // silence unused
-    } yield expect(indexExpired.isEmpty)
-  }
-
   test("acceptAllowSpends: yields correct expiryIndexDelta — expired record contributes a remove") { res =>
     implicit val (h, sp, js) = res
     // Direct correctness check on the index-delta shape: the expired allow-spend should appear in the
@@ -302,7 +283,7 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       lastActiveOuter = SortedMap(Option.empty[Address] -> lastActive)
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](Some(store), shouldUseMptStore = true)
+      mgr = AllowSpendStateManager.make[IO](store)
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue

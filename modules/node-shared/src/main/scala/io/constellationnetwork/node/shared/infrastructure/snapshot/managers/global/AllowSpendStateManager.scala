@@ -72,8 +72,7 @@ trait AllowSpendStateManager[F[_]] {
 object AllowSpendStateManager {
 
   def make[F[_]: Async](
-    mptStore: Option[MptStore[F, GlobalStateKey]] = None,
-    shouldUseMptStore: Boolean = false
+    mptStore: MptStore[F, GlobalStateKey]
   ): AllowSpendStateManager[F] = new AllowSpendStateManager[F] {
 
     def acceptAllowSpends(
@@ -90,16 +89,7 @@ object AllowSpendStateManager {
 
       val lastActiveGlobalAllowSpends = lastActiveAllowSpends.getOrElse(None, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
 
-      // Index-driven expiry sweep, with an in-memory fallback when no MPT store is wired (test paths only — production
-      // always has Some(mptStore)). Output is equivalent to filterExpiredAllowSpends(...) under the phase-2a invariant
-      // (index maintained on every accept).
-      val expiredGlobalAllowSpendsF: F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
-        if (mptStore.isDefined)
-          findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress)
-        else
-          filterExpiredAllowSpends(lastActiveGlobalAllowSpends, epochProgress).pure[F]
-
-      expiredGlobalAllowSpendsF.flatMap { expiredGlobalAllowSpends =>
+      findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress).flatMap { expiredGlobalAllowSpends =>
         val unexpiredGlobalAllowSpends = (globalAllowSpends |+| expiredGlobalAllowSpends).foldLeft(lastActiveGlobalAllowSpends) {
           case (acc, (address, allowSpends)) =>
             val lastAddressAllowSpends = acc.getOrElse(address, SortedSet.empty[Signed[AllowSpend]])
@@ -277,41 +267,37 @@ object AllowSpendStateManager {
     def findExpiredGlobalAllowSpendsViaIndexFromMpt(
       previousEpochProgress: EpochProgress,
       epochProgress: EpochProgress
-    )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] = mptStore match {
-      case None =>
+    )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
+      if (previousEpochProgress.value.value >= epochProgress.value.value)
         SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]].pure[F]
-      case Some(store) =>
-        if (previousEpochProgress.value.value >= epochProgress.value.value)
-          SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]].pure[F]
-        else {
-          val fromL = previousEpochProgress.value.value
-          val toL = epochProgress.value.value - 1L
-          val epochs: List[EpochProgress] =
-            (fromL to toL).toList.map(v => EpochProgress(eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(v)))
+      else {
+        val fromL = previousEpochProgress.value.value
+        val toL = epochProgress.value.value - 1L
+        val epochs: List[EpochProgress] =
+          (fromL to toL).toList.map(v => EpochProgress(eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(v)))
 
-          for {
-            buckets <- epochs.traverse { e =>
-              store
-                .getExpiryBucket[AllowSpendExpiryKey](SystemNamespaceLabel.ExpiryIndexAllowSpends, e)
-                .map(_.getOrElse(SortedSet.empty[AllowSpendExpiryKey]))
-            }
-            // Filter to global-only (metagraphId = None) and group by address.
-            allKeys = buckets.flatten.toSet.filter(_.metagraphId.isEmpty)
-            byAddress = allKeys.groupBy(_.address)
-            resolved <- byAddress.toList.traverse {
-              case (addr, expiryKeys) =>
-                store.getActiveAllowSpends(None, addr).flatMap { addrSetOpt =>
-                  val addrSet = addrSetOpt.getOrElse(SortedSet.empty[Signed[AllowSpend]])
-                  val expectedHashes = expiryKeys.map(_.hash)
-                  addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s))).map { hashed =>
-                    val matched = hashed.collect { case (h, s) if expectedHashes.contains(h) => s }.to(SortedSet)
-                    addr -> matched
-                  }
+        for {
+          buckets <- epochs.traverse { e =>
+            mptStore
+              .getExpiryBucket[AllowSpendExpiryKey](SystemNamespaceLabel.ExpiryIndexAllowSpends, e)
+              .map(_.getOrElse(SortedSet.empty[AllowSpendExpiryKey]))
+          }
+          // Filter to global-only (metagraphId = None) and group by address.
+          allKeys = buckets.flatten.toSet.filter(_.metagraphId.isEmpty)
+          byAddress = allKeys.groupBy(_.address)
+          resolved <- byAddress.toList.traverse {
+            case (addr, expiryKeys) =>
+              mptStore.getActiveAllowSpends(None, addr).flatMap { addrSetOpt =>
+                val addrSet = addrSetOpt.getOrElse(SortedSet.empty[Signed[AllowSpend]])
+                val expectedHashes = expiryKeys.map(_.hash)
+                addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s))).map { hashed =>
+                  val matched = hashed.collect { case (h, s) if expectedHashes.contains(h) => s }.to(SortedSet)
+                  addr -> matched
                 }
-            }
-          } yield SortedMap.from(resolved).filter(_._2.nonEmpty)
-        }
-    }
+              }
+          }
+        } yield SortedMap.from(resolved).filter(_._2.nonEmpty)
+      }
 
     def updateGlobalBalancesByAllowSpends(
       epochProgress: EpochProgress,
@@ -319,16 +305,8 @@ object AllowSpendStateManager {
       currentBalances: SortedMap[Address, Balance],
       globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
       lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
-    )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] = {
-      val lastActiveGlobalAllowSpends = lastActiveAllowSpends.getOrElse(None, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
-
-      val expiredGlobalAllowSpendsF: F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
-        if (mptStore.isDefined)
-          findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress)
-        else
-          filterExpiredAllowSpends(lastActiveGlobalAllowSpends, epochProgress).pure[F]
-
-      expiredGlobalAllowSpendsF.flatMap { expiredGlobalAllowSpends =>
+    )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] =
+      findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress).flatMap { expiredGlobalAllowSpends =>
         (globalAllowSpends |+| expiredGlobalAllowSpends).toList
           .foldM[F, Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
             Right((currentBalances, SortedMap.empty[Address, Balance]))
@@ -367,7 +345,6 @@ object AllowSpendStateManager {
               }
           }
       }
-    }
 
     private def readBalance(
       address: Address,
@@ -375,9 +352,7 @@ object AllowSpendStateManager {
     )(implicit hasher: Hasher[F]): F[Balance] =
       deltas.get(address) match {
         case Some(b) => b.pure[F]
-        case None =>
-          if (shouldUseMptStore) mptStore.fold(Balance.empty.pure[F])(_.getBalance(address).map(_.getOrElse(Balance.empty)))
-          else Balance.empty.pure[F]
+        case None    => mptStore.getBalance(address).map(_.getOrElse(Balance.empty))
       }
   }
 }

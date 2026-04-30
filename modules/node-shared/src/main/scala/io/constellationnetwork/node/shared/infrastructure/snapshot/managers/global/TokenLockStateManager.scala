@@ -93,13 +93,6 @@ trait TokenLockStateManager[F[_]] {
     generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
   )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
 
-  // ---------------------------------------------------------------------------------------
-  // #85 MPT-backed path — new methods that drop the `lastActive*` map inputs and return
-  // deltas-only results. Kept alongside the legacy map-input methods until testnet proves
-  // end-to-end equivalence on live traffic (per migration-pattern memo "keep both paths until
-  // proven"). Caller dispatches via `shouldUseMptStore`.
-  // ---------------------------------------------------------------------------------------
-
   /** MPT-backed `acceptTokenLocks`. Reads current active sets per-address via `mptStore.getActiveTokenLocks` instead of iterating an
     * in-memory map. Returns deltas + removedKeys + expiry-index delta; caller reconstructs full state if needed.
     */
@@ -152,8 +145,7 @@ trait TokenLockStateManager[F[_]] {
 object TokenLockStateManager {
 
   def make[F[_]: Async](
-    mptStore: MptStore[F, GlobalStateKey],
-    shouldUseMptStore: Boolean = false
+    mptStore: MptStore[F, GlobalStateKey]
   ): TokenLockStateManager[F] =
     new TokenLockStateManager[F] {
 
@@ -515,9 +507,7 @@ object TokenLockStateManager {
       )(implicit hasher: Hasher[F]): F[Balance] =
         deltas.get(address) match {
           case Some(b) => b.pure[F]
-          case None =>
-            if (shouldUseMptStore) mptStore.getBalance(address).map(_.getOrElse(Balance.empty))
-            else Balance.empty.pure[F]
+          case None    => mptStore.getBalance(address).map(_.getOrElse(Balance.empty))
         }
 
       def generateTokenUnlocks(

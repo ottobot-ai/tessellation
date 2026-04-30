@@ -64,8 +64,7 @@ trait NodeCollateralStateManager[F[_]] {
 object NodeCollateralStateManager {
 
   def make[F[_]: Async](
-    mptStore: MptStore[F, GlobalStateKey],
-    shouldUseMptStore: Boolean = false
+    mptStore: MptStore[F, GlobalStateKey]
   ): NodeCollateralStateManager[F] = new NodeCollateralStateManager[F] {
 
     def acceptNodeCollaterals(
@@ -85,27 +84,15 @@ object NodeCollateralStateManager {
       val existingWithdrawals =
         lastSnapshotContext.nodeCollateralWithdrawals.getOrElse(SortedMap.empty[Address, SortedSet[PendingNodeCollateralWithdrawal]])
 
-      def isWithdrawalExpired(withdrawalEpoch: EpochProgress): Boolean =
-        (withdrawalEpoch |+| withdrawalTimeLimit) <= epochProgress
+      // `withdrawalTimeLimit` is unused on the MPT path: the expiry epoch was baked into the index keys at write-time
+      // using the same config, so the bucket window alone is authoritative. Retained on the trait signature for callers.
+      val _ = withdrawalTimeLimit
 
-      val expiredWithdrawalsF: F[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]] =
-        if (shouldUseMptStore)
-          findExpiredWithdrawalsViaIndexFromMpt(previousEpochProgress, epochProgress)
-        else {
-          val legacy = existingWithdrawals.map {
-            case (address, withdrawals) =>
-              address -> withdrawals.filter {
-                case PendingNodeCollateralWithdrawal(_, _, withdrawalEpoch) =>
-                  isWithdrawalExpired(withdrawalEpoch)
-              }
-          }.filter { case (_, withdrawalList) => withdrawalList.nonEmpty }
-          legacy.pure[F]
-        }
-
-      expiredWithdrawalsF.map { expiredWithdrawals =>
-        // Compute unexpired as the set-difference: keep originals that aren't in expired.
+      findExpiredWithdrawalsViaIndexFromMpt(previousEpochProgress, epochProgress).map { expiredWithdrawals =>
+        // NB: `SortedMap.flatMap { case (a, ws) => ws.map(w => (a, w)) }` would build a `Map` keyed by `a`,
+        // dropping all but one `(a, w)` per address. Use `.iterator.flatMap` so the result preserves every pair.
         val expiredPairs: Set[(Address, PendingNodeCollateralWithdrawal)] =
-          expiredWithdrawals.flatMap { case (a, ws) => ws.map(w => (a, w)) }.toSet
+          expiredWithdrawals.iterator.flatMap { case (a, ws) => ws.iterator.map(w => (a, w)) }.toSet
         val unexpiredWithdrawals = existingWithdrawals.map {
           case (address, withdrawals) =>
             address -> withdrawals.filterNot(w => expiredPairs.contains((address, w)))

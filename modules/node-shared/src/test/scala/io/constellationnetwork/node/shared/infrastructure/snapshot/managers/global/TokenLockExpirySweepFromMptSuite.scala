@@ -109,7 +109,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
+      mgr = TokenLockStateManager.make[IO](store)
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -131,7 +131,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(tlValid))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
+      mgr = TokenLockStateManager.make[IO](store)
 
       currentEpoch = EpochProgress(NonNegLong(500L))
       prevEpoch = EpochProgress(NonNegLong(100L))
@@ -153,7 +153,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(tlPermanent, tlExpires))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
+      mgr = TokenLockStateManager.make[IO](store)
 
       currentEpoch = EpochProgress(NonNegLong(500L))
       prevEpoch = EpochProgress.MinValue
@@ -175,7 +175,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(tlExpires))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
+      mgr = TokenLockStateManager.make[IO](store)
 
       sameEpoch = EpochProgress(NonNegLong(200L))
       indexExpired <- mgr.findExpiredGlobalTokenLocksViaIndexFromMpt(sameEpoch, sameEpoch)
@@ -211,7 +211,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       generatedUnlocks = Map(addr1 -> List(tokenUnlock))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
+      mgr = TokenLockStateManager.make[IO](store)
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -246,7 +246,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
+      mgr = TokenLockStateManager.make[IO](store)
 
       // Window [101 .. 114] covers all three records (TokenLock predicate is `unlockEpoch < curr`).
       prevEpoch = EpochProgress(NonNegLong(101L))
@@ -289,7 +289,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
+      mgr = TokenLockStateManager.make[IO](store)
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -324,7 +324,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr1 -> SortedSet(tlExpired), addr2 -> SortedSet(tlValid))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store, shouldUseMptStore = true)
+      mgr = TokenLockStateManager.make[IO](store)
 
       currentBalances = SortedMap.empty[Address, io.constellationnetwork.schema.balance.Balance]
       currentEpoch = EpochProgress(NonNegLong(300L))

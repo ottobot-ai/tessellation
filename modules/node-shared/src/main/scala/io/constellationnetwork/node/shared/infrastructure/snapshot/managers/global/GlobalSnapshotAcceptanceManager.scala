@@ -200,11 +200,11 @@ object GlobalSnapshotAcceptanceManager {
     val tipUsageManager = TipUsageManager.make[F]()
     val metagraphSyncManager = MetagraphSyncManager.make[F](metagraphsSyncConfig)
     val rewardAcceptanceManager = RewardAcceptanceManager.make[F](mptStore)
-    val allowSpendStateManager = AllowSpendStateManager.make[F](Some(mptStore), shouldUseMptStore = true)
-    val tokenLockStateManager = TokenLockStateManager.make[F](mptStore, shouldUseMptStore = true)
+    val allowSpendStateManager = AllowSpendStateManager.make[F](mptStore)
+    val tokenLockStateManager = TokenLockStateManager.make[F](mptStore)
     val spendTransactionBalanceManager = SpendTransactionBalanceManager.make[F](mptStore)
     val delegatedStakeStateManager = DelegatedStakeStateManager.make[F](mptStore)
-    val nodeCollateralStateManager = NodeCollateralStateManager.make[F](mptStore, shouldUseMptStore = true)
+    val nodeCollateralStateManager = NodeCollateralStateManager.make[F](mptStore)
     val transactionReferenceManager = TransactionReferenceManager.make[F](mptStore)
 
     val blockAcceptanceCoordinatorManager = BlockAcceptanceCoordinatorManager.make[F](
