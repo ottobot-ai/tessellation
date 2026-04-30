@@ -1143,7 +1143,7 @@ object GlobalSnapshotAcceptanceManager {
               initialData.blockResult,
               updatedLastStateChannelSnapshotHashes,
               (lastSnapshotContext.lastTxRefs ++ transactionsRefsDeltas).toSortedMap,
-              updatedBalancesBySpendTransactions,
+              lastSnapshotContext.balances ++ updatedBalancesBySpendTransactions,
               updatedLastCurrencySnapshots,
               updatedLastCurrencySnapshotProofs,
               updatedAllowSpendsCleaned,
