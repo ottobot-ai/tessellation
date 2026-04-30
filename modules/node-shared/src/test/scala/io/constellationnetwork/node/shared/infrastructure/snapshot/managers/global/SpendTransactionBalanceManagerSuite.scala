@@ -11,7 +11,6 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.SpendTransaction
 import io.constellationnetwork.schema.balance.Balance
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.swap.SwapAmount
 import io.constellationnetwork.security._
@@ -48,7 +47,7 @@ object SpendTransactionBalanceManagerSuite extends MutableIOSuite {
       }
     } yield mptStore
 
-  test("both paths agree on source/destination credits when MPT state matches passed balances") { res =>
+  test("source pays destination using MPT-resident balances when delta map is empty") { res =>
     implicit val (h, sp, js) = res
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -56,11 +55,10 @@ object SpendTransactionBalanceManagerSuite extends MutableIOSuite {
       source = kp1.getPublic.toAddress
       dest = kp2.getPublic.toAddress
 
-      priorState = SortedMap[Address, Balance](
+      priorInMpt = SortedMap[Address, Balance](
         source -> Balance(NonNegLong(1000)),
         dest -> Balance(NonNegLong(50))
       )
-      // A SpendTransaction without allowSpendRef: source pays dest directly.
       spendTx = SpendTransaction(
         source = source,
         destination = dest,
@@ -69,26 +67,20 @@ object SpendTransactionBalanceManagerSuite extends MutableIOSuite {
         allowSpendRef = None
       )
 
-      mptStore <- mkMptStore(priorState)
-      legacy = SpendTransactionBalanceManager.make[IO](Some(mptStore), shouldUseMptStore = false)
-      mptMgr = SpendTransactionBalanceManager.make[IO](Some(mptStore), shouldUseMptStore = true)
+      mptStore <- mkMptStore(priorInMpt)
+      mgr = SpendTransactionBalanceManager.make[IO](mptStore)
 
-      legacyEither <- legacy.updateGlobalBalancesBySpendTransactions(priorState, SortedMap.empty, List(spendTx))
-      mptEither <- mptMgr.updateGlobalBalancesBySpendTransactions(SortedMap.empty, SortedMap.empty, List(spendTx))
-
-      legacyDelta = legacyEither.map(_._2).getOrElse(SortedMap.empty[Address, Balance])
-      mptDelta = mptEither.map(_._2).getOrElse(SortedMap.empty[Address, Balance])
+      result <- mgr.updateGlobalBalancesBySpendTransactions(SortedMap.empty, SortedMap.empty, List(spendTx))
+      delta = result.map(_._2).getOrElse(SortedMap.empty[Address, Balance])
     } yield
       expect.all(
-        legacyEither.isRight,
-        mptEither.isRight,
-        legacyDelta == mptDelta,
-        legacyDelta(source) == Balance(NonNegLong(900)),
-        legacyDelta(dest) == Balance(NonNegLong(150))
+        result.isRight,
+        delta(source) == Balance(NonNegLong(900)),
+        delta(dest) == Balance(NonNegLong(150))
       )
   }
 
-  test("mpt path: delta shadows MPT (in-ordinal updates take precedence)") { res =>
+  test("delta shadows MPT — in-ordinal balance is what's used") { res =>
     implicit val (h, sp, js) = res
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -108,13 +100,51 @@ object SpendTransactionBalanceManagerSuite extends MutableIOSuite {
       )
 
       mptStore <- mkMptStore(priorInMpt)
-      mgr = SpendTransactionBalanceManager.make[IO](Some(mptStore), shouldUseMptStore = true)
+      mgr = SpendTransactionBalanceManager.make[IO](mptStore)
 
       result <- mgr.updateGlobalBalancesBySpendTransactions(currentDelta, SortedMap.empty, List(spendTx))
     } yield
       expect.all(
         result.isRight,
         result.map(_._2).getOrElse(SortedMap.empty[Address, Balance])(source) == Balance(NonNegLong(400))
+      )
+  }
+
+  test("source missing from delta and MPT: balance arithmetic error (insufficient funds)") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp1 <- KeyPairGenerator.makeKeyPair[IO]
+      kp2 <- KeyPairGenerator.makeKeyPair[IO]
+      source = kp1.getPublic.toAddress
+      dest = kp2.getPublic.toAddress
+
+      spendTx = SpendTransaction(
+        source = source,
+        destination = dest,
+        amount = SwapAmount(PosLong(100)),
+        currencyId = None,
+        allowSpendRef = None
+      )
+
+      mptStore <- mkMptStore(SortedMap.empty)
+      mgr = SpendTransactionBalanceManager.make[IO](mptStore)
+
+      result <- mgr.updateGlobalBalancesBySpendTransactions(SortedMap.empty, SortedMap.empty, List(spendTx))
+    } yield expect(result.isLeft)
+  }
+
+  test("empty spend transactions yields the input deltas unchanged") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      mptStore <- mkMptStore(SortedMap.empty)
+      mgr = SpendTransactionBalanceManager.make[IO](mptStore)
+
+      result <- mgr.updateGlobalBalancesBySpendTransactions(SortedMap.empty, SortedMap.empty, List.empty)
+    } yield
+      expect.all(
+        result.isRight,
+        result.map(_._1).getOrElse(SortedMap.empty[Address, Balance]).isEmpty,
+        result.map(_._2).getOrElse(SortedMap.empty[Address, Balance]).isEmpty
       )
   }
 }
