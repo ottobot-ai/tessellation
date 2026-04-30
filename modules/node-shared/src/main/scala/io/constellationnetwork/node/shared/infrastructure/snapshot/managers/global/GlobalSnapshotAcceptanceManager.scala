@@ -199,7 +199,7 @@ object GlobalSnapshotAcceptanceManager {
     val artifactEmissionManager = ArtifactEmissionManager.make[F]()
     val tipUsageManager = TipUsageManager.make[F]()
     val metagraphSyncManager = MetagraphSyncManager.make[F](metagraphsSyncConfig)
-    val rewardAcceptanceManager = RewardAcceptanceManager.make[F](Some(mptStore), shouldUseMptStore = false)
+    val rewardAcceptanceManager = RewardAcceptanceManager.make[F](mptStore)
     val allowSpendStateManager = AllowSpendStateManager.make[F](Some(mptStore), shouldUseMptStore = true)
     val tokenLockStateManager = TokenLockStateManager.make[F](mptStore, shouldUseMptStore = true)
     val spendTransactionBalanceManager = SpendTransactionBalanceManager.make[F](Some(mptStore), shouldUseMptStore = false)
@@ -823,7 +823,7 @@ object GlobalSnapshotAcceptanceManager {
             )
 
             (updatedBalancesByRewards, acceptedRewardTxs, rewardBalancesDelta) <- rewardAcceptanceManager.acceptRewardTxs(
-              updatedGlobalBalances ++ currencyAcceptanceBalanceUpdate,
+              initialData.blockResult.contextUpdate.balances.toSortedMap ++ currencyAcceptanceBalanceUpdate,
               withdrawalRewardTxs ++ nodeOperatorRewards ++ reservedAddressRewards
             )
 

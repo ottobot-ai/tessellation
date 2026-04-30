@@ -10,7 +10,6 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.transaction.{RewardTransaction, TransactionAmount}
 import io.constellationnetwork.security._
@@ -47,28 +46,7 @@ object RewardAcceptanceManagerSuite extends MutableIOSuite {
       }
     } yield mptStore
 
-  test("legacy path: rewards credit destinations from the full-map input") { res =>
-    implicit val (h, sp, js) = res
-    for {
-      kp <- KeyPairGenerator.makeKeyPair[IO]
-      recipient = kp.getPublic.toAddress
-
-      priorMap = SortedMap[Address, Balance](recipient -> Balance(NonNegLong(100)))
-      rewards = SortedSet(RewardTransaction(recipient, TransactionAmount(PosLong(50))))
-
-      mptStore <- mkMptStore(SortedMap.empty)
-      manager = RewardAcceptanceManager.make[IO](Some(mptStore), shouldUseMptStore = false)
-
-      (updated, accepted, delta) <- manager.acceptRewardTxs(priorMap, rewards)
-    } yield
-      expect.all(
-        updated(recipient) == Balance(NonNegLong(150)),
-        accepted.size == 1,
-        delta == SortedMap(recipient -> Balance(NonNegLong(150)))
-      )
-  }
-
-  test("mpt path: rewards read prior balance from MPT when not in delta map") { res =>
+  test("recipient not in delta map: prior balance read from MPT") { res =>
     implicit val (h, sp, js) = res
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -78,7 +56,7 @@ object RewardAcceptanceManagerSuite extends MutableIOSuite {
       rewards = SortedSet(RewardTransaction(recipient, TransactionAmount(PosLong(50))))
 
       mptStore <- mkMptStore(priorInMpt)
-      manager = RewardAcceptanceManager.make[IO](Some(mptStore), shouldUseMptStore = true)
+      manager = RewardAcceptanceManager.make[IO](mptStore)
 
       (updated, accepted, delta) <- manager.acceptRewardTxs(SortedMap.empty, rewards)
     } yield
@@ -89,7 +67,26 @@ object RewardAcceptanceManagerSuite extends MutableIOSuite {
       )
   }
 
-  test("mpt path: delta map shadows prior MPT balance (in-ordinal state)") { res =>
+  test("recipient not in delta map and not in MPT: starts from Balance.empty") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      recipient = kp.getPublic.toAddress
+
+      rewards = SortedSet(RewardTransaction(recipient, TransactionAmount(PosLong(50))))
+
+      mptStore <- mkMptStore(SortedMap.empty)
+      manager = RewardAcceptanceManager.make[IO](mptStore)
+
+      (updated, accepted, _) <- manager.acceptRewardTxs(SortedMap.empty, rewards)
+    } yield
+      expect.all(
+        updated(recipient) == Balance(NonNegLong(50)),
+        accepted.size == 1
+      )
+  }
+
+  test("delta map shadows prior MPT balance (in-ordinal state)") { res =>
     implicit val (h, sp, js) = res
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -101,32 +98,46 @@ object RewardAcceptanceManagerSuite extends MutableIOSuite {
       rewards = SortedSet(RewardTransaction(recipient, TransactionAmount(PosLong(50))))
 
       mptStore <- mkMptStore(priorInMpt)
-      manager = RewardAcceptanceManager.make[IO](Some(mptStore), shouldUseMptStore = true)
+      manager = RewardAcceptanceManager.make[IO](mptStore)
 
       (updated, _, _) <- manager.acceptRewardTxs(currentDelta, rewards)
     } yield expect(updated(recipient) == Balance(NonNegLong(250)))
   }
 
-  test("both paths agree when MPT prior matches the legacy balance map") { res =>
+  test("multiple rewards to the same recipient accumulate") { res =>
     implicit val (h, sp, js) = res
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       recipient = kp.getPublic.toAddress
 
-      state = SortedMap[Address, Balance](recipient -> Balance(NonNegLong(100)))
-      rewards = SortedSet(RewardTransaction(recipient, TransactionAmount(PosLong(50))))
+      rewards = SortedSet(
+        RewardTransaction(recipient, TransactionAmount(PosLong(30))),
+        RewardTransaction(recipient, TransactionAmount(PosLong(20)))
+      )
 
-      mptStore <- mkMptStore(state)
-      legacy = RewardAcceptanceManager.make[IO](Some(mptStore), shouldUseMptStore = false)
-      mpt = RewardAcceptanceManager.make[IO](Some(mptStore), shouldUseMptStore = true)
+      mptStore <- mkMptStore(SortedMap.empty)
+      manager = RewardAcceptanceManager.make[IO](mptStore)
 
-      (legacyUpdated, legacyAccepted, legacyDelta) <- legacy.acceptRewardTxs(state, rewards)
-      (mptUpdated, mptAccepted, mptDelta) <- mpt.acceptRewardTxs(SortedMap.empty, rewards)
+      (updated, accepted, _) <- manager.acceptRewardTxs(SortedMap.empty, rewards)
     } yield
       expect.all(
-        legacyUpdated(recipient) == mptUpdated(recipient),
-        legacyAccepted == mptAccepted,
-        legacyDelta == mptDelta
+        updated(recipient) == Balance(NonNegLong(50)),
+        accepted.size == 2
+      )
+  }
+
+  test("empty rewards yields the input deltas unchanged and zero accepted") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      mptStore <- mkMptStore(SortedMap.empty)
+      manager = RewardAcceptanceManager.make[IO](mptStore)
+
+      (updated, accepted, delta) <- manager.acceptRewardTxs(SortedMap.empty, SortedSet.empty)
+    } yield
+      expect.all(
+        updated.isEmpty,
+        accepted.isEmpty,
+        delta.isEmpty
       )
   }
 }
