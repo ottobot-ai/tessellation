@@ -219,9 +219,12 @@ object AllowSpendStateManager {
       before: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
       after: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
     )(implicit hasher: Hasher[F]): F[SystemIndexDelta[AllowSpendExpiryKey]] = {
+      // NB: `SortedMap.flatMap { ... map(a => (m, a)) }` would build a `Map` keyed by `m` (the outer key),
+      // dropping all but one `(m, a)` per `m` due to key-collision overwrite. Iterate explicitly via
+      // `.iterator` so the result is `Iterator[(Option[Address], Address)]`, preserving every `(mid, addr)` pair.
       val pairKeys: Set[(Option[Address], Address)] =
-        before.flatMap { case (m, inner) => inner.keys.map(a => (m, a)) }.toSet ++
-          after.flatMap { case (m, inner) => inner.keys.map(a => (m, a)) }.toSet
+        (before.iterator.flatMap { case (m, inner) => inner.keysIterator.map(a => (m, a)) } ++
+          after.iterator.flatMap { case (m, inner) => inner.keysIterator.map(a => (m, a)) }).toSet
 
       def hashEntries(
         mid: Option[Address],
