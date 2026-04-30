@@ -57,11 +57,13 @@ object TransactionReferenceManager {
         .map(newDestRefs => (lastTxRefsContextUpdate ++ newDestRefs).toSortedMap)
     }
 
-    /** Diagnostic: run the MPT path purely for instrumentation and compare against the legacy path. Logs every divergence (addresses where
-      * the two paths disagree on whether to add an empty-ref) but always returns the legacy result so production behavior is unchanged.
-      * Drop this once we understand why MPT.LastTxRefs has gaps relative to GSI.lastTxRefs.
+    /** Diagnostic: run BOTH paths, log any divergence, return the MPT path's result. The first plain flag-flip run (commit 6812f3e5) saw
+      * the cluster stall around ord 53; the diagnostic-return-legacy run (commit 333f752e) showed zero divergence across 332 calls and the
+      * cluster behaved normally. This variant returns MPT (production-flip) but keeps the diagnostic so a stall reproduction can be checked
+      * against logged TX_REF_DIVERGE events. If divergences appear and correlate with the stall, the MPT path is the cause. If no
+      * divergences and the cluster still stalls, the prior failure was a flake.
       */
-    private def runDiagAndUseLegacy(
+    private def runDiagAndUseMpt(
       lastTxRefs: SortedMap[Address, TransactionReference],
       lastTxRefsContextUpdate: Map[Address, TransactionReference],
       acceptedTransactions: SortedSet[Signed[Transaction]]
@@ -89,8 +91,8 @@ object TransactionReferenceManager {
                 s"mpt.keys=${mptResult.keySet.map(_.value.value.take(12))}"
             )
           } else
-            logger.debug(s"[TX_REF_AGREE] dests=${destinations.size} ctxUpd=${lastTxRefsContextUpdate.size} keys=${legacyResult.size}")
-      } yield legacyResult
+            logger.debug(s"[TX_REF_AGREE] dests=${destinations.size} ctxUpd=${lastTxRefsContextUpdate.size} keys=${mptResult.size}")
+      } yield mptResult
     }
 
     def acceptTransactionRefs(
@@ -98,7 +100,7 @@ object TransactionReferenceManager {
       lastTxRefsContextUpdate: Map[Address, TransactionReference],
       acceptedTransactions: SortedSet[Signed[Transaction]]
     ): F[SortedMap[Address, TransactionReference]] =
-      if (shouldUseMptStore) runDiagAndUseLegacy(lastTxRefs, lastTxRefsContextUpdate, acceptedTransactions)
+      if (shouldUseMptStore) runDiagAndUseMpt(lastTxRefs, lastTxRefsContextUpdate, acceptedTransactions)
       else useGlobalSnapshotInfo(lastTxRefs, lastTxRefsContextUpdate, acceptedTransactions)
   }
 }
