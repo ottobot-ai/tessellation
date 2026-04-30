@@ -205,7 +205,7 @@ object GlobalSnapshotAcceptanceManager {
     val spendTransactionBalanceManager = SpendTransactionBalanceManager.make[F](Some(mptStore), shouldUseMptStore = false)
     val delegatedStakeStateManager = DelegatedStakeStateManager.make[F](mptStore)
     val nodeCollateralStateManager = NodeCollateralStateManager.make[F](mptStore, shouldUseMptStore = true)
-    val transactionReferenceManager = TransactionReferenceManager.make[F](mptStore, shouldUseMptStore = true)
+    val transactionReferenceManager = TransactionReferenceManager.make[F](mptStore)
 
     val blockAcceptanceCoordinatorManager = BlockAcceptanceCoordinatorManager.make[F](
       blockAcceptanceManager,
@@ -773,7 +773,6 @@ object GlobalSnapshotAcceptanceManager {
             )
 
             transactionsRefsDeltas <- transactionReferenceManager.acceptTransactionRefs(
-              lastSnapshotContext.lastTxRefs,
               initialData.blockResult.contextUpdate.lastTxRefs,
               acceptedTransactions
             )

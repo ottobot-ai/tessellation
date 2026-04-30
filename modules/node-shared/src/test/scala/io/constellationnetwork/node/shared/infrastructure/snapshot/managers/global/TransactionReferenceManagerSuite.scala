@@ -75,7 +75,23 @@ object TransactionReferenceManagerSuite extends MutableIOSuite {
       testProofs
     )
 
-  test("legacy path: adds empty refs for brand-new destinations only") { res =>
+  test("brand-new destination (not in MPT, not in contextUpdate) gets an empty-ref delta") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp1 <- KeyPairGenerator.makeKeyPair[IO]
+      kp2 <- KeyPairGenerator.makeKeyPair[IO]
+      source = kp1.getPublic.toAddress
+      destNew = kp2.getPublic.toAddress
+
+      acceptedTxs = SortedSet(mkSignedTx(source, destNew))
+
+      mptStore <- mkEmptyMptStore
+      manager = TransactionReferenceManager.make[IO](mptStore)
+      deltas <- manager.acceptTransactionRefs(Map.empty, acceptedTxs)
+    } yield expect(deltas == SortedMap(destNew -> TransactionReference.empty))
+  }
+
+  test("destination already in MPT gets no empty-ref delta") { res =>
     implicit val (h, sp, js) = res
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -85,58 +101,21 @@ object TransactionReferenceManagerSuite extends MutableIOSuite {
       destKnown = kp2.getPublic.toAddress
       destNew = kp3.getPublic.toAddress
 
-      lastTxRefs = SortedMap[Address, TransactionReference](
+      preExisting = SortedMap[Address, TransactionReference](
         destKnown -> TransactionReference(TransactionOrdinal(5L), testHash("known"))
       )
-      contextUpdate = Map.empty[Address, TransactionReference]
       acceptedTxs = SortedSet(
         mkSignedTx(source, destKnown),
         mkSignedTx(source, destNew)
       )
 
-      mptStore <- mkEmptyMptStore
-      manager = TransactionReferenceManager.make[IO](mptStore, shouldUseMptStore = false)
-      deltas <- manager.acceptTransactionRefs(lastTxRefs, contextUpdate, acceptedTxs)
+      mptStore <- mkMptStoreWith(preExisting)
+      manager = TransactionReferenceManager.make[IO](mptStore)
+      deltas <- manager.acceptTransactionRefs(Map.empty, acceptedTxs)
     } yield expect(deltas == SortedMap(destNew -> TransactionReference.empty))
   }
 
-  test("mpt path: returns same deltas as legacy path when MPT state matches lastTxRefs") { res =>
-    implicit val (h, sp, js) = res
-    for {
-      kp1 <- KeyPairGenerator.makeKeyPair[IO]
-      kp2 <- KeyPairGenerator.makeKeyPair[IO]
-      kp3 <- KeyPairGenerator.makeKeyPair[IO]
-      kp4 <- KeyPairGenerator.makeKeyPair[IO]
-      source = kp1.getPublic.toAddress
-      destKnown = kp2.getPublic.toAddress
-      destNew1 = kp3.getPublic.toAddress
-      destNew2 = kp4.getPublic.toAddress
-
-      lastTxRefs = SortedMap[Address, TransactionReference](
-        destKnown -> TransactionReference(TransactionOrdinal(5L), testHash("known"))
-      )
-      contextUpdate = Map.empty[Address, TransactionReference]
-      acceptedTxs = SortedSet(
-        mkSignedTx(source, destKnown),
-        mkSignedTx(source, destNew1),
-        mkSignedTx(source, destNew2)
-      )
-
-      mptStore <- mkMptStoreWith(lastTxRefs)
-      legacyManager = TransactionReferenceManager.make[IO](mptStore, shouldUseMptStore = false)
-      mptManager = TransactionReferenceManager.make[IO](mptStore, shouldUseMptStore = true)
-
-      legacyDeltas <- legacyManager.acceptTransactionRefs(lastTxRefs, contextUpdate, acceptedTxs)
-      mptDeltas <- mptManager.acceptTransactionRefs(lastTxRefs, contextUpdate, acceptedTxs)
-    } yield
-      expect.all(
-        legacyDeltas == mptDeltas,
-        legacyDeltas.keySet == Set(destNew1, destNew2),
-        legacyDeltas.values.forall(_ == TransactionReference.empty)
-      )
-  }
-
-  test("mpt path: contextUpdate shadows prior MPT state (no empty-ref added for in-block delta)") { res =>
+  test("contextUpdate shadows MPT state (no empty-ref added for in-block delta)") { res =>
     implicit val (h, sp, js) = res
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -149,13 +128,12 @@ object TransactionReferenceManagerSuite extends MutableIOSuite {
       acceptedTxs = SortedSet(mkSignedTx(source, destInBlock))
 
       mptStore <- mkEmptyMptStore
-      mptManager = TransactionReferenceManager.make[IO](mptStore, shouldUseMptStore = true)
-
-      deltas <- mptManager.acceptTransactionRefs(SortedMap.empty, contextUpdate, acceptedTxs)
+      manager = TransactionReferenceManager.make[IO](mptStore)
+      deltas <- manager.acceptTransactionRefs(contextUpdate, acceptedTxs)
     } yield expect(deltas == SortedMap(destInBlock -> inBlockRef))
   }
 
-  test("mpt path: multiple txs to the same new destination yield one empty-ref entry") { res =>
+  test("multiple txs to the same new destination yield one empty-ref entry") { res =>
     implicit val (h, sp, js) = res
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -169,26 +147,17 @@ object TransactionReferenceManagerSuite extends MutableIOSuite {
       )
 
       mptStore <- mkEmptyMptStore
-      mptManager = TransactionReferenceManager.make[IO](mptStore, shouldUseMptStore = true)
-
-      deltas <- mptManager.acceptTransactionRefs(SortedMap.empty, Map.empty, acceptedTxs)
+      manager = TransactionReferenceManager.make[IO](mptStore)
+      deltas <- manager.acceptTransactionRefs(Map.empty, acceptedTxs)
     } yield expect(deltas == SortedMap(dest -> TransactionReference.empty))
   }
 
-  test("both paths agree on empty inputs") { res =>
+  test("empty inputs yield empty deltas") { res =>
     implicit val (h, sp, js) = res
     for {
       mptStore <- mkEmptyMptStore
-      legacyManager = TransactionReferenceManager.make[IO](mptStore, shouldUseMptStore = false)
-      mptManager = TransactionReferenceManager.make[IO](mptStore, shouldUseMptStore = true)
-
-      legacyDeltas <- legacyManager.acceptTransactionRefs(SortedMap.empty, Map.empty, SortedSet.empty)
-      mptDeltas <- mptManager.acceptTransactionRefs(SortedMap.empty, Map.empty, SortedSet.empty)
-    } yield
-      expect.all(
-        legacyDeltas.isEmpty,
-        mptDeltas.isEmpty,
-        legacyDeltas == mptDeltas
-      )
+      manager = TransactionReferenceManager.make[IO](mptStore)
+      deltas <- manager.acceptTransactionRefs(Map.empty, SortedSet.empty)
+    } yield expect(deltas.isEmpty)
   }
 }
