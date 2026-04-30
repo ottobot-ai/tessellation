@@ -526,9 +526,11 @@ object GlobalSnapshotAcceptanceManager {
         }
       }
 
-      /** Cleans empty entries from state maps and computes removed keys in a single pass. For each map type, we:
-        *   1. Filter out entries with empty sets (cleaning) 2. Identify keys that were non-empty in previous state but empty/missing in new
-        *      state (removal tracking)
+      /** Cleans empty entries from state maps and computes removed keys in a single pass.
+        *
+        * Prior state is passed as keysets-of-non-empty-addresses (`prior*Keys`), not as full maps. This is all that is needed to compute
+        * removals (`addresses that had non-empty sets in previous state and are now empty/missing`) and tightens the dependency: the caller
+        * need not hand over the entire prior partition — only the addresses that had records.
         */
       private def cleanStateMaps(
         updatedAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
@@ -538,11 +540,11 @@ object GlobalSnapshotAcceptanceManager {
         updatedWithdrawDelegatedStakes: SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]],
         updatedCreateNodeCollaterals: SortedMap[Address, SortedSet[NodeCollateralRecord]],
         updatedWithdrawNodeCollaterals: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
-        // Previous state for computing removed keys
-        lastActiveDelegatedStakes: SortedMap[Address, SortedSet[DelegatedStakeRecord]],
-        lastDelegatedStakeWithdrawals: SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]],
-        lastActiveNodeCollaterals: SortedMap[Address, SortedSet[NodeCollateralRecord]],
-        lastNodeCollateralWithdrawals: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]
+        // Prior non-empty keysets — only data needed to compute removals.
+        priorDelegatedStakeKeys: Set[Address],
+        priorDelegatedStakeWithdrawalKeys: Set[Address],
+        priorNodeCollateralKeys: Set[Address],
+        priorNodeCollateralWithdrawalKeys: Set[Address]
       ): CleanedStateMapsResult = {
         val cleanedAllowSpends = updatedAllowSpends.map {
           case (outerKey, innerMap) =>
@@ -557,28 +559,11 @@ object GlobalSnapshotAcceptanceManager {
         val cleanedCreateNodeCollaterals = updatedCreateNodeCollaterals.filter { case (_, records) => records.nonEmpty }
         val cleanedWithdrawNodeCollaterals = updatedWithdrawNodeCollaterals.filter { case (_, records) => records.nonEmpty }
 
-        // Compute removed keys: addresses that had non-empty sets in previous state but are now empty/missing
-        // This is O(m) where m = keys in previous state, with O(1) Set contains checks on cleaned keysets
-        val cleanedDelegatedStakeKeySet = cleanedCreateDelegatedStakes.keySet
-        val cleanedWithdrawDelegatedStakeKeySet = cleanedWithdrawDelegatedStakes.keySet
-        val cleanedNodeCollateralKeySet = cleanedCreateNodeCollaterals.keySet
-        val cleanedWithdrawNodeCollateralKeySet = cleanedWithdrawNodeCollaterals.keySet
-
-        val removedDelegatedStakeKeys = lastActiveDelegatedStakes.collect {
-          case (address, stakes) if stakes.nonEmpty && !cleanedDelegatedStakeKeySet.contains(address) => address
-        }.toSet
-
-        val removedDelegatedStakeWithdrawalKeys = lastDelegatedStakeWithdrawals.collect {
-          case (address, withdrawals) if withdrawals.nonEmpty && !cleanedWithdrawDelegatedStakeKeySet.contains(address) => address
-        }.toSet
-
-        val removedNodeCollateralKeys = lastActiveNodeCollaterals.collect {
-          case (address, collaterals) if collaterals.nonEmpty && !cleanedNodeCollateralKeySet.contains(address) => address
-        }.toSet
-
-        val removedNodeCollateralWithdrawalKeys = lastNodeCollateralWithdrawals.collect {
-          case (address, withdrawals) if withdrawals.nonEmpty && !cleanedWithdrawNodeCollateralKeySet.contains(address) => address
-        }.toSet
+        // Removed keys: addresses that had non-empty sets in previous state but no longer do.
+        val removedDelegatedStakeKeys = priorDelegatedStakeKeys -- cleanedCreateDelegatedStakes.keySet
+        val removedDelegatedStakeWithdrawalKeys = priorDelegatedStakeWithdrawalKeys -- cleanedWithdrawDelegatedStakes.keySet
+        val removedNodeCollateralKeys = priorNodeCollateralKeys -- cleanedCreateNodeCollaterals.keySet
+        val removedNodeCollateralWithdrawalKeys = priorNodeCollateralWithdrawalKeys -- cleanedWithdrawNodeCollaterals.keySet
 
         CleanedStateMapsResult(
           cleanedAllowSpends,
@@ -1082,7 +1067,25 @@ object GlobalSnapshotAcceptanceManager {
               updatedLastCurrencySnapshots
             )
 
-            // Clean state maps and compute removed keys in a single pass
+            // Clean state maps and compute removed keys in a single pass.
+            // For removed-key computation, only the prior non-empty keysets are needed — full maps would carry
+            // value payloads we don't read, so collect just the keys here.
+            priorDelegatedStakeKeys = lastSnapshotContext.activeDelegatedStakes
+              .getOrElse(SortedMap.empty[Address, SortedSet[DelegatedStakeRecord]])
+              .collect { case (a, v) if v.nonEmpty => a }
+              .toSet
+            priorDelegatedStakeWithdrawalKeys = lastSnapshotContext.delegatedStakesWithdrawals
+              .getOrElse(SortedMap.empty[Address, SortedSet[PendingDelegatedStakeWithdrawal]])
+              .collect { case (a, v) if v.nonEmpty => a }
+              .toSet
+            priorNodeCollateralKeys = lastSnapshotContext.activeNodeCollaterals
+              .getOrElse(SortedMap.empty[Address, SortedSet[NodeCollateralRecord]])
+              .collect { case (a, v) if v.nonEmpty => a }
+              .toSet
+            priorNodeCollateralWithdrawalKeys = lastSnapshotContext.nodeCollateralWithdrawals
+              .getOrElse(SortedMap.empty[Address, SortedSet[PendingNodeCollateralWithdrawal]])
+              .collect { case (a, v) if v.nonEmpty => a }
+              .toSet
             cleanedMapsResult = cleanStateMaps(
               updatedAllowSpends,
               updatedTokenLockBalances,
@@ -1091,11 +1094,10 @@ object GlobalSnapshotAcceptanceManager {
               updatedWithdrawDelegatedStakes,
               updatedCreateNodeCollaterals,
               updatedWithdrawNodeCollaterals,
-              // Previous state for computing removed keys
-              lastSnapshotContext.activeDelegatedStakes.getOrElse(SortedMap.empty),
-              lastSnapshotContext.delegatedStakesWithdrawals.getOrElse(SortedMap.empty),
-              lastSnapshotContext.activeNodeCollaterals.getOrElse(SortedMap.empty),
-              lastSnapshotContext.nodeCollateralWithdrawals.getOrElse(SortedMap.empty)
+              priorDelegatedStakeKeys,
+              priorDelegatedStakeWithdrawalKeys,
+              priorNodeCollateralKeys,
+              priorNodeCollateralWithdrawalKeys
             )
 
             updatedAllowSpendsCleaned = cleanedMapsResult.cleanedAllowSpends
