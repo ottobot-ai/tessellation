@@ -17,16 +17,6 @@ import io.constellationnetwork.security.{Hashed, Hasher}
 import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
 
 trait DelegatedStakeStateManager[F[_]] {
-  def acceptDelegatedStakes1(
-    lastSnapshotContext: GlobalSnapshotInfo,
-    epochProgress: EpochProgress,
-    withdrawalTimeLimit: EpochProgress
-  ): (
-    SortedMap[Address, SortedSet[DelegatedStakeRecord]],
-    SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]],
-    SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]]
-  )
-
   def processExistingDelegatedStakes(
     lastSnapshotContext: GlobalSnapshotInfo,
     epochProgress: EpochProgress,
@@ -136,47 +126,5 @@ object DelegatedStakeStateManager {
         )
     }
 
-    def acceptDelegatedStakes1(
-      lastSnapshotContext: GlobalSnapshotInfo,
-      epochProgress: EpochProgress,
-      withdrawalTimeLimit: EpochProgress
-    ): (
-      SortedMap[Address, SortedSet[DelegatedStakeRecord]],
-      SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]],
-      SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]]
-    ) = {
-      val existingDelegatedStakes = lastSnapshotContext.activeDelegatedStakes.getOrElse(
-        SortedMap.empty[Address, SortedSet[DelegatedStakeRecord]]
-      )
-
-      val existingWithdrawals = lastSnapshotContext.delegatedStakesWithdrawals.getOrElse(
-        SortedMap.empty[Address, SortedSet[PendingDelegatedStakeWithdrawal]]
-      )
-
-      def isWithdrawalExpired(withdrawalEpoch: EpochProgress): Boolean =
-        (withdrawalEpoch |+| withdrawalTimeLimit) <= epochProgress
-
-      val unexpiredWithdrawals = existingWithdrawals.map {
-        case (address, withdrawals) =>
-          address -> withdrawals.filterNot {
-            case PendingDelegatedStakeWithdrawal(_, _, _, withdrawalEpoch, _, _) =>
-              isWithdrawalExpired(withdrawalEpoch)
-          }
-      }.filter { case (_, withdrawalList) => withdrawalList.nonEmpty }
-
-      val expiredWithdrawals = existingWithdrawals.map {
-        case (address, withdrawals) =>
-          address -> withdrawals.filter {
-            case PendingDelegatedStakeWithdrawal(_, _, _, withdrawalEpoch, _, _) =>
-              isWithdrawalExpired(withdrawalEpoch)
-          }
-      }.filter { case (_, withdrawalList) => withdrawalList.nonEmpty }
-
-      (
-        existingDelegatedStakes,
-        unexpiredWithdrawals,
-        expiredWithdrawals
-      )
-    }
   }
 }
