@@ -66,6 +66,10 @@ trait NodeCollateralStateManager[F[_]] {
 
   def materializeActiveNodeCollateralAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]]
   def materializeNodeCollateralWithdrawalAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]]
+
+  def materializeNodeCollateralWithdrawalsFromMpt(
+    implicit hasher: Hasher[F]
+  ): F[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]]
 }
 
 object NodeCollateralStateManager {
@@ -208,5 +212,17 @@ object NodeCollateralStateManager {
         prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.NodeCollateralWithdrawals)
         entries <- mptStore.getAllForPrefix[SortedSet[PendingNodeCollateralWithdrawal]](prefix)
       } yield entries.values.toList.mapFilter(s => s.headOption.map(_.event.value.source)).toSet
+
+    def materializeNodeCollateralWithdrawalsFromMpt(
+      implicit hasher: Hasher[F]
+    ): F[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]] =
+      for {
+        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.NodeCollateralWithdrawals)
+        entries <- mptStore.getAllForPrefix[SortedSet[PendingNodeCollateralWithdrawal]](prefix)
+      } yield
+        SortedMap.from(
+          entries.values.toList
+            .mapFilter(set => set.headOption.map(h => h.event.value.source -> set))
+        )
   }
 }

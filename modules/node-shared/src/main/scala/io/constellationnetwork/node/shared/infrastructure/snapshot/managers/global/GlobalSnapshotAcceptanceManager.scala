@@ -1155,11 +1155,13 @@ object GlobalSnapshotAcceptanceManager {
 
             nodeCollateralWithdrawalExpiryIndexDelta <-
               if (maintainNodeCollateralWithdrawalExpiryIndex)
-                computeNodeCollateralWithdrawalExpiryIndexDelta(
-                  lastSnapshotContext.nodeCollateralWithdrawals.getOrElse(SortedMap.empty),
-                  updatedWithdrawNodeCollateralsCleaned,
-                  withdrawalTimeLimit
-                )
+                nodeCollateralStateManager.materializeNodeCollateralWithdrawalsFromMpt.flatMap { priorWithdrawals =>
+                  computeNodeCollateralWithdrawalExpiryIndexDelta(
+                    priorWithdrawals,
+                    updatedWithdrawNodeCollateralsCleaned,
+                    withdrawalTimeLimit
+                  )
+                }
               else
                 SystemIndexDelta.empty[NodeCollateralWithdrawalExpiryKey].pure[F]
 
