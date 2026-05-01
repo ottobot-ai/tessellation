@@ -17,7 +17,7 @@ import io.constellationnetwork.ext.crypto._
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.merkletree.Proof
 import io.constellationnetwork.merkletree.syntax._
-import io.constellationnetwork.node.shared.config.types.{FieldsAddedOrdinals, MetagraphsSyncConfig}
+import io.constellationnetwork.node.shared.config.types.{Era, FieldsAddedOrdinals, MetagraphsSyncConfig}
 import io.constellationnetwork.node.shared.domain.block.processing._
 import io.constellationnetwork.node.shared.domain.delegatedStake.{
   UpdateDelegatedStakeAcceptanceManager,
@@ -587,9 +587,7 @@ object GlobalSnapshotAcceptanceManager {
 
       private def buildGlobalSnapshotInfo(
         ordinal: SnapshotOrdinal,
-        tessellation3MigrationStartingOrdinal: SnapshotOrdinal,
-        tessellation301MigrationStartingOrdinal: SnapshotOrdinal,
-        metagraphSyncDataStartingOrdinal: SnapshotOrdinal,
+        era: Era,
         lastSnapshotContext: GlobalSnapshotInfo,
         acceptanceResult: BlockAcceptanceResult,
         updatedLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
@@ -614,24 +612,24 @@ object GlobalSnapshotAcceptanceManager {
       ): GlobalSnapshotInfo =
         GlobalSnapshotInfo(
           updatedLastStateChannelSnapshotHashes,
-          if (ordinal < tessellation3MigrationStartingOrdinal)
+          if (era.beforeTess3(ordinal))
             lastSnapshotContext.lastTxRefs ++ acceptanceResult.contextUpdate.lastTxRefs
           else transactionsRefs,
           updatedBalancesBySpendTransactions,
           updatedLastCurrencySnapshots,
           updatedLastCurrencySnapshotProofs,
-          if (ordinal < tessellation3MigrationStartingOrdinal) none else updatedAllowSpendsCleaned.some,
-          if (ordinal < tessellation3MigrationStartingOrdinal) none else updatedGlobalTokenLocksCleaned.some,
-          if (ordinal < tessellation3MigrationStartingOrdinal) none else updatedTokenLockBalancesCleaned.some,
-          if (ordinal < tessellation3MigrationStartingOrdinal) none else updatedAllowSpendRefs.some,
-          if (ordinal < tessellation3MigrationStartingOrdinal) none else updatedTokenLockRefs.some,
-          if (ordinal < tessellation3MigrationStartingOrdinal) none else updatedUpdateNodeParameters.some,
-          if (ordinal < tessellation3MigrationStartingOrdinal) none else updatedCreateDelegatedStakesCleaned.some,
-          if (ordinal < tessellation3MigrationStartingOrdinal) none else updatedWithdrawDelegatedStakesCleaned.some,
-          if (ordinal < tessellation3MigrationStartingOrdinal) none else updatedCreateNodeCollateralsCleaned.some,
-          if (ordinal < tessellation3MigrationStartingOrdinal) none else updatedWithdrawNodeCollateralsCleaned.some,
-          if (ordinal < tessellation301MigrationStartingOrdinal) none else updatedPriceState.some,
-          if (ordinal < metagraphSyncDataStartingOrdinal) none else updatedAcceptedMetagraphSyncData.some
+          era.postTess3(ordinal)(updatedAllowSpendsCleaned),
+          era.postTess3(ordinal)(updatedGlobalTokenLocksCleaned),
+          era.postTess3(ordinal)(updatedTokenLockBalancesCleaned),
+          era.postTess3(ordinal)(updatedAllowSpendRefs),
+          era.postTess3(ordinal)(updatedTokenLockRefs),
+          era.postTess3(ordinal)(updatedUpdateNodeParameters),
+          era.postTess3(ordinal)(updatedCreateDelegatedStakesCleaned),
+          era.postTess3(ordinal)(updatedWithdrawDelegatedStakesCleaned),
+          era.postTess3(ordinal)(updatedCreateNodeCollateralsCleaned),
+          era.postTess3(ordinal)(updatedWithdrawNodeCollateralsCleaned),
+          era.postTess301(ordinal)(updatedPriceState),
+          era.postMetagraphSync(ordinal)(updatedAcceptedMetagraphSyncData)
         )
 
       def accept(
@@ -673,13 +671,9 @@ object GlobalSnapshotAcceptanceManager {
       ] = {
         implicit val hasher: Hasher[F] = HasherSelector[F].getForOrdinal(ordinal)
 
+        val era = Era.fromConfig(environment, fieldsAddedOrdinals)
+
         val tessellation3MigrationStartingOrdinal = fieldsAddedOrdinals.tessellation3Migration
-          .getOrElse(environment, SnapshotOrdinal.MinValue)
-
-        val tessellation301MigrationStartingOrdinal = fieldsAddedOrdinals.tessellation301Migration
-          .getOrElse(environment, SnapshotOrdinal.MinValue)
-
-        val metagraphSyncDataStartingOrdinal = fieldsAddedOrdinals.metagraphSyncData
           .getOrElse(environment, SnapshotOrdinal.MinValue)
 
         val fixingAllowSpendAndTokenLockValidation = fieldsAddedOrdinals.fixingAllowSpendAndTokenLockValidation
@@ -1148,9 +1142,7 @@ object GlobalSnapshotAcceptanceManager {
 
             gsi = buildGlobalSnapshotInfo(
               ordinal,
-              tessellation3MigrationStartingOrdinal,
-              tessellation301MigrationStartingOrdinal,
-              metagraphSyncDataStartingOrdinal,
+              era,
               lastSnapshotContext,
               initialData.blockResult,
               updatedLastStateChannelSnapshotHashes,

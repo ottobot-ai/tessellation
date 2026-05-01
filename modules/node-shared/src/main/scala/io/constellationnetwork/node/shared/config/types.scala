@@ -36,6 +36,37 @@ object types {
     setSumFix: Map[AppEnvironment, SnapshotOrdinal]
   )
 
+  /** Typed predicate over per-environment migration gates. Resolves a `FieldsAddedOrdinals` field for the active `AppEnvironment` once at
+    * construction, then collapses repeated `ordinal < <gate>StartingOrdinal` checks into named methods.
+    */
+  final case class Era(
+    private val tessellation3: SnapshotOrdinal,
+    private val tessellation301: SnapshotOrdinal,
+    private val metagraphSync: SnapshotOrdinal
+  ) {
+    def atOrAfterTess3(ordinal: SnapshotOrdinal): Boolean = ordinal.value.value >= tessellation3.value.value
+    def beforeTess3(ordinal: SnapshotOrdinal): Boolean = ordinal.value.value < tessellation3.value.value
+    def atOrAfterTess301(ordinal: SnapshotOrdinal): Boolean = ordinal.value.value >= tessellation301.value.value
+    def atOrAfterMetagraphSync(ordinal: SnapshotOrdinal): Boolean = ordinal.value.value >= metagraphSync.value.value
+
+    /** Some(value) at-or-after tessellation3, None before — the shape behind the 12 nullable post-tess3 fields in the GSI.
+      */
+    def postTess3[A](ordinal: SnapshotOrdinal)(value: => A): Option[A] =
+      if (atOrAfterTess3(ordinal)) Some(value) else None
+    def postTess301[A](ordinal: SnapshotOrdinal)(value: => A): Option[A] =
+      if (atOrAfterTess301(ordinal)) Some(value) else None
+    def postMetagraphSync[A](ordinal: SnapshotOrdinal)(value: => A): Option[A] =
+      if (atOrAfterMetagraphSync(ordinal)) Some(value) else None
+  }
+
+  object Era {
+    def fromConfig(env: AppEnvironment, fieldsAddedOrdinals: FieldsAddedOrdinals): Era = Era(
+      tessellation3 = fieldsAddedOrdinals.tessellation3Migration.getOrElse(env, SnapshotOrdinal.MinValue),
+      tessellation301 = fieldsAddedOrdinals.tessellation301Migration.getOrElse(env, SnapshotOrdinal.MinValue),
+      metagraphSync = fieldsAddedOrdinals.metagraphSyncData.getOrElse(env, SnapshotOrdinal.MinValue)
+    )
+  }
+
   case class MetagraphsSyncConfig(
     maxUnappliedGlobalChangeOrdinals: PosInt
   )
