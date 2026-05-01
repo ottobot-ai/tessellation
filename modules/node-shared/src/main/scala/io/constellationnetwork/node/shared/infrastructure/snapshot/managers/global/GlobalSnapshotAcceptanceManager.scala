@@ -975,10 +975,11 @@ object GlobalSnapshotAcceptanceManager {
               tokenLockBlockAcceptanceResult.contextUpdate.lastTokenLocksRefs
             )
 
+            priorTokenLockBalances <- tokenLockStateManager.materializeTokenLockBalancesFromMpt
             TokenLockBalanceResult(updatedTokenLockBalances, tokenLockBalancesDeltas, removedTokenLockBalanceKeys) = tokenLockStateManager
               .updateTokenLockBalances(
                 currencySnapshots,
-                lastSnapshotContext.tokenLockBalances
+                priorTokenLockBalances.some
               )
 
             tokenLockBalancesResult <- tokenLockStateManager.updateGlobalBalancesByTokenLocks(

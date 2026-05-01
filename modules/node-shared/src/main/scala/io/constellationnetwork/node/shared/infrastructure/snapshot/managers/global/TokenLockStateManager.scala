@@ -18,11 +18,8 @@ import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{
-  addressSetImmutableCodec,
-  signedTokenLockSetCodec,
-  tokenLockExpiryKeySetImmutableCodec
-}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
+import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{immutableCodec => tokenLockReferenceImmutableCodec}
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -160,6 +157,13 @@ trait TokenLockStateManager[F[_]] {
     * `source: Address`, so prefix-scan can't recover keys; instead we read the address set from the sidecar and batch point-read values.
     */
   def materializeLastTokenLockRefsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, TokenLockReference]]
+
+  /** Materialize the nested `metagraphAddr → holderAddr → Balance` view from the address-pair sidecar partition. `Balance` carries no
+    * source so we read the `(metagraphAddr, holderAddr)` pairs from the sidecar, batch point-read each pair's balance, then group by
+    * metagraphAddr. The sidecar is append-only at the writer; pairs whose underlying entry has been removed return `None` and are filtered
+    * out here.
+    */
+  def materializeTokenLockBalancesFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedMap[Address, Balance]]]
 }
 
 object TokenLockStateManager {
@@ -617,5 +621,30 @@ object TokenLockStateManager {
             val key = GlobalStateKey.hypergraph(GlobalStateFieldId.LastTokenLockRefs, addr)
             values.get(key).map(addr -> _)
           })
+
+      def materializeTokenLockBalancesFromMpt(
+        implicit hasher: Hasher[F]
+      ): F[SortedMap[Address, SortedMap[Address, Balance]]] =
+        for {
+          indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.TokenLockBalances)
+          pairSet <- mptStore
+            .get[SortedSet[(Address, Address)]](indexKey)
+            .map(_.getOrElse(SortedSet.empty[(Address, Address)]))
+          pairList = pairSet.toList
+          keys = pairList.map { case (mid, holder) => GlobalStateKey.hypergraph(GlobalStateFieldId.TokenLockBalances, mid, holder) }
+          values <- mptStore.getMany[Balance](keys)
+        } yield {
+          val flat = pairList.flatMap {
+            case (mid, holder) =>
+              val k = GlobalStateKey.hypergraph(GlobalStateFieldId.TokenLockBalances, mid, holder)
+              values.get(k).map(bal => (mid, holder, bal))
+          }
+          flat
+            .groupBy(_._1)
+            .view
+            .mapValues(entries => SortedMap.from(entries.map { case (_, h, b) => h -> b }))
+            .filter { case (_, inner) => inner.nonEmpty }
+            .to(SortedMap)
+        }
     }
 }

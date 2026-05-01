@@ -9,6 +9,7 @@ import io.constellationnetwork.ext.cats.effect._
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.swap.{AllowSpendOrdinal, AllowSpendReference}
@@ -85,6 +86,37 @@ object ActiveAddressIndexSuite extends MutableIOSuite {
     val _ = (j, h)
     val acc = GlobalStateConverter.StateChangesAccumulator(
       lastAllowSpendRefs = SortedMap(addr1 -> asRef, addr2 -> asRef)
+    )
+    val ord = SnapshotOrdinal(NonNegLong.unsafeFrom(9L))
+
+    for {
+      wProducer <- InMemoryMerklePatriciaProducer.make[IO]()
+      wStore <- MptStore.make[IO, GlobalStateKey](wProducer, GlobalStateKey.toHex[IO])
+      _ <- wStore.syncFromStateChanges(acc, ord)
+      wTrie <- wStore.build(ord)
+      wRoot = wTrie.toOption.map(_.rootHash.value.show).getOrElse("none")
+      wBytes <- wStore.allEntriesAsBytes
+
+      replay <- GlobalStateConverter.toAccumulatorHexDelta[IO](acc, Map.empty[Hex, Array[Byte]])
+      rProducer <- InMemoryMerklePatriciaProducer.make[IO]()
+      _ <- rProducer.insertBytes(replay._1).void
+      _ <- rProducer.remove(replay._2.toList)
+      rTrie <- rProducer.buildForOrdinal(ord)
+      rRoot = rTrie.toOption.map(_.rootHash.value.show).getOrElse("none")
+      rBytes <- rProducer.entries
+    } yield
+      expect.all(
+        wRoot == rRoot,
+        wBytes.size == rBytes.size,
+        wBytes.view.mapValues(_.toVector).toMap == rBytes.view.mapValues(_.toVector).toMap
+      )
+  }
+
+  test("first-time tokenLockBalances pair sidecar: writer == replay (empty preSyncBytes)") { res =>
+    implicit val (j, h, _) = res
+    val _ = (j, h)
+    val acc = GlobalStateConverter.StateChangesAccumulator(
+      tokenLockBalances = SortedMap(addr1 -> SortedMap(addr2 -> Balance(NonNegLong.unsafeFrom(100L))))
     )
     val ord = SnapshotOrdinal(NonNegLong.unsafeFrom(9L))
 

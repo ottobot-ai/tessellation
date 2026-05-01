@@ -118,4 +118,16 @@ object GlobalStateMptCodecs {
     */
   implicit val addressSetImmutableCodec: ImmutableCodec[SortedSet[Address]] =
     ImmutableCodec.fromScodecCodec(sortedSet(addressCodec))
+
+  /** Codec for the address-pair index partition (used by `tokenLockBalances` whose key is `(metagraphAddr, holderAddr)` and whose `Balance`
+    * value carries no source addresses). The set ordering uses `Address`'s lexicographic ordering on the pair.
+    */
+  private val addressPairCodec: Codec[(Address, Address)] =
+    (addressCodec :: addressCodec).xmap[(Address, Address)](
+      { case a :: b :: HNil => (a, b) },
+      { case (a, b) => a :: b :: HNil }
+    )
+
+  implicit val addressPairSetImmutableCodec: ImmutableCodec[SortedSet[(Address, Address)]] =
+    ImmutableCodec.fromScodecCodec(sortedSet(addressPairCodec))
 }

@@ -109,6 +109,31 @@ object GlobalStateConverter {
         } yield ()
       }
 
+  /** Apply a `(added, removed)` delta to the address-pair index partition for `fieldId`. Same read-modify-write pattern as
+    * `applyActiveAddressIndexDelta`, but the entry value is a `SortedSet[(Address, Address)]` — used by `tokenLockBalances`-style fields
+    * whose canonical key is `(metagraphAddr, holderAddr)` and whose `Balance` value type carries neither address.
+    */
+  private[mpt] def applyAddressPairIndexDelta[F[_]: Async: Hasher](
+    store: MptStore[F, GlobalStateKey],
+    fieldId: GlobalStateFieldId,
+    added: Set[(Address, Address)],
+    removed: Set[(Address, Address)]
+  ): F[Unit] =
+    if (added.isEmpty && removed.isEmpty) Async[F].unit
+    else
+      GlobalStateKey.activeAddressIndexKey[F](fieldId).flatMap { key =>
+        for {
+          existing <- store
+            .get[SortedSet[(Address, Address)]](key)
+            .map(_.getOrElse(SortedSet.empty[(Address, Address)]))
+          merged = (existing ++ added) -- removed
+          _ <-
+            if (merged.isEmpty && existing.nonEmpty) store.remove(key)
+            else if (merged.nonEmpty && merged != existing) store.insert[SortedSet[(Address, Address)]](key, merged)
+            else Async[F].unit
+        } yield ()
+      }
+
   /** Apply a `SystemIndexDelta[K]` to the given `label`'s partition. Each `EpochBucket` delta triggers per-epoch read-modify-write on the
     * bucket: read the current `SortedSet[K]`, merge adds, apply removes, write back — or delete the bucket entirely if it becomes empty.
     * Future `SystemIndexDelta` ADT variants add their own dispatch cases here.
@@ -658,10 +683,18 @@ object GlobalStateConverter {
         Set.empty,
         preSyncBytes
       )
+      tlbAddrPairIdx <- replayAddressPairIndexDelta[F](
+        GlobalStateFieldId.TokenLockBalances,
+        acc.tokenLockBalances.iterator.flatMap {
+          case (mid, inner) => inner.keysIterator.map(holder => (mid, holder))
+        }.toSet,
+        Set.empty,
+        preSyncBytes
+      )
     } yield
       (
-        upsertsHex ++ asExp._1 ++ tlExp._1 ++ ncwExp._1 ++ asAddrIdx._1 ++ tlAddrIdx._1,
-        removalsHex ++ asExp._2 ++ tlExp._2 ++ ncwExp._2 ++ asAddrIdx._2 ++ tlAddrIdx._2
+        upsertsHex ++ asExp._1 ++ tlExp._1 ++ ncwExp._1 ++ asAddrIdx._1 ++ tlAddrIdx._1 ++ tlbAddrPairIdx._1,
+        removalsHex ++ asExp._2 ++ tlExp._2 ++ ncwExp._2 ++ asAddrIdx._2 ++ tlAddrIdx._2 ++ tlbAddrPairIdx._2
       )
 
   /** Mirror of `applyActiveAddressIndexDelta`'s read-modify-write for the verify replay path. Decode the pre-sync sidecar entry, apply
@@ -691,6 +724,39 @@ object GlobalStateConverter {
           (Map.empty[Hex, Array[Byte]], Set(hexKey))
         else if (merged.nonEmpty && merged != existing)
           (Map(hexKey -> addressSetImmutableCodec.immutableBytes(merged).toArray), Set.empty[Hex])
+        else
+          (Map.empty[Hex, Array[Byte]], Set.empty[Hex])
+      }
+
+  /** Mirror of `applyAddressPairIndexDelta`'s read-modify-write for the verify replay path. Decode the pre-sync sidecar entry, apply
+    * adds/removes, decide upsert / remove / no-op identically to the in-store writer so `(prevBytes -- removes) ++ upserts` matches the
+    * post-sync entry set bit-for-bit.
+    */
+  private def replayAddressPairIndexDelta[F[_]: Async: Hasher](
+    fieldId: GlobalStateFieldId,
+    added: Set[(Address, Address)],
+    removed: Set[(Address, Address)],
+    preSyncBytes: Map[Hex, Array[Byte]]
+  ): F[(Map[Hex, Array[Byte]], Set[Hex])] =
+    if (added.isEmpty && removed.isEmpty)
+      (Map.empty[Hex, Array[Byte]], Set.empty[Hex]).pure[F]
+    else
+      for {
+        key <- GlobalStateKey.activeAddressIndexKey[F](fieldId)
+        hexKey <- GlobalStateKey.toHex[F](key)
+      } yield {
+        val existing: SortedSet[(Address, Address)] = preSyncBytes.get(hexKey) match {
+          case Some(bytes) =>
+            addressPairSetImmutableCodec
+              .fromImmutableBytes(ByteVector.view(bytes))
+              .getOrElse(SortedSet.empty[(Address, Address)])
+          case None => SortedSet.empty[(Address, Address)]
+        }
+        val merged: SortedSet[(Address, Address)] = (existing ++ added) -- removed
+        if (merged.isEmpty && existing.nonEmpty)
+          (Map.empty[Hex, Array[Byte]], Set(hexKey))
+        else if (merged.nonEmpty && merged != existing)
+          (Map(hexKey -> addressPairSetImmutableCodec.immutableBytes(merged).toArray), Set.empty[Hex])
         else
           (Map.empty[Hex, Array[Byte]], Set.empty[Hex])
       }
@@ -1252,6 +1318,20 @@ object GlobalStateConverter {
                 .map(_.toMap)
             }
             _ <- store.insert[SortedSet[Address]](activeAddressIndexEntries)
+            // Address-pair index bootstrap for `tokenLockBalances`. Mirrors the delta-path writer in
+            // `syncFromStateChanges` so bootstrap and incremental paths converge to the same mptRoot.
+            tokenLockBalancePairs: SortedSet[(Address, Address)] =
+              info.tokenLockBalances.fold(SortedSet.empty[(Address, Address)])(_.iterator.flatMap {
+                case (mid, inner) => inner.keysIterator.map(h => (mid, h))
+              }.to(SortedSet))
+            addressPairIndexEntries <-
+              if (tokenLockBalancePairs.isEmpty)
+                Map.empty[GlobalStateKey, SortedSet[(Address, Address)]].pure[F]
+              else
+                GlobalStateKey
+                  .activeAddressIndexKey[F](TokenLockBalances)
+                  .map(k => Map(k -> tokenLockBalancePairs))
+            _ <- store.insert[SortedSet[(Address, Address)]](addressPairIndexEntries)
             _ <- store.build(snapshotOrdinal).void
           } yield ()
         }
@@ -1461,6 +1541,17 @@ object GlobalStateConverter {
           // verify replay path mirrors this in `replayActiveAddressIndexDelta` so `expectedBytes == storeBytes`.
           _ <- applyActiveAddressIndexDelta[F](store, LastAllowSpendRefs, acc.lastAllowSpendRefs.keySet.toSet, Set.empty)
           _ <- applyActiveAddressIndexDelta[F](store, LastTokenLockRefs, acc.lastTokenLockRefs.keySet.toSet, Set.empty)
+          // Address-pair index for `tokenLockBalances` — `(metagraphAddr, holderAddr)` pairs. Same append-only
+          // discipline; materializeTokenLockBalancesFromMpt point-reads each pair and skips Nones, so stale
+          // pairs in the sidecar self-prune at the read boundary.
+          _ <- applyAddressPairIndexDelta[F](
+            store,
+            TokenLockBalances,
+            acc.tokenLockBalances.iterator.flatMap {
+              case (mid, inner) => inner.keysIterator.map(holder => (mid, holder))
+            }.toSet,
+            Set.empty
+          )
 
           _ <- store.commit(snapshotOrdinal)
           t2 <- Async[F].monotonic.map(_.toMillis)
