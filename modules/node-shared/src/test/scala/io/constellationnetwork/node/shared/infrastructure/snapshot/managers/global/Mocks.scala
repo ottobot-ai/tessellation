@@ -257,6 +257,11 @@ object Mocks {
         epochProgress: EpochProgress
       )(implicit hasher: Hasher[IO]): IO[SortedMap[priceOracle.TokenPair, priceOracle.PriceRecord]] =
         SortedMap.empty[priceOracle.TokenPair, priceOracle.PriceRecord].pure[IO]
+
+      override def materializePriceStateFromMpt(
+        implicit hasher: Hasher[IO]
+      ): IO[SortedMap[priceOracle.TokenPair, priceOracle.PriceRecord]] =
+        SortedMap.empty[priceOracle.TokenPair, priceOracle.PriceRecord].pure[IO]
     }
 
     // Create the manager with mock dependencies

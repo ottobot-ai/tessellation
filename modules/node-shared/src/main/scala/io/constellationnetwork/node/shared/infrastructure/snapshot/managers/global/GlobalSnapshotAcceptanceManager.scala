@@ -758,6 +758,12 @@ object GlobalSnapshotAcceptanceManager {
               acceptedTransactions
             )
 
+            // Source prior-ordinal `lastTxRefs` from the MPT instead of `lastSnapshotContext.lastTxRefs`. The
+            // ActiveAddressIndex sidecar (maintained on both delta and bootstrap paths) carries the keyset; we
+            // `getMany` the values. Read happens before `syncFromStateChanges` so the MPT still reflects the
+            // prior ordinal's state.
+            priorLastTxRefs <- transactionReferenceManager.materializeLastTxRefsFromMpt
+
             // Use SortedMap to guarantee deterministic iteration order for downstream processing.
             // Previously used unordered Map which could cause different validation ordering per node.
             currencyBalances = currencySnapshots.toList.map {
@@ -1115,7 +1121,7 @@ object GlobalSnapshotAcceptanceManager {
               lastSnapshotContext,
               initialData.blockResult,
               updatedLastStateChannelSnapshotHashes,
-              (lastSnapshotContext.lastTxRefs ++ transactionsRefsDeltas).toSortedMap,
+              (priorLastTxRefs ++ transactionsRefsDeltas).toSortedMap,
               lastSnapshotContext.balances ++ updatedBalancesBySpendTransactions,
               updatedLastCurrencySnapshots,
               updatedLastCurrencySnapshotProofs,

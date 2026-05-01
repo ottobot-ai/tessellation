@@ -683,6 +683,12 @@ object GlobalStateConverter {
         Set.empty,
         preSyncBytes
       )
+      txAddrIdx <- replayActiveAddressIndexDelta[F](
+        GlobalStateFieldId.LastTxRefs,
+        acc.lastTxRefs.keySet.toSet,
+        Set.empty,
+        preSyncBytes
+      )
       tlbAddrPairIdx <- replayAddressPairIndexDelta[F](
         GlobalStateFieldId.TokenLockBalances,
         acc.tokenLockBalances.iterator.flatMap {
@@ -693,8 +699,8 @@ object GlobalStateConverter {
       )
     } yield
       (
-        upsertsHex ++ asExp._1 ++ tlExp._1 ++ ncwExp._1 ++ asAddrIdx._1 ++ tlAddrIdx._1 ++ tlbAddrPairIdx._1,
-        removalsHex ++ asExp._2 ++ tlExp._2 ++ ncwExp._2 ++ asAddrIdx._2 ++ tlAddrIdx._2 ++ tlbAddrPairIdx._2
+        upsertsHex ++ asExp._1 ++ tlExp._1 ++ ncwExp._1 ++ asAddrIdx._1 ++ tlAddrIdx._1 ++ txAddrIdx._1 ++ tlbAddrPairIdx._1,
+        removalsHex ++ asExp._2 ++ tlExp._2 ++ ncwExp._2 ++ asAddrIdx._2 ++ tlAddrIdx._2 ++ txAddrIdx._2 ++ tlbAddrPairIdx._2
       )
 
   /** Mirror of `applyActiveAddressIndexDelta`'s read-modify-write for the verify replay path. Decode the pre-sync sidecar entry, apply
@@ -1307,7 +1313,8 @@ object GlobalStateConverter {
             activeAddressIndexEntries <- {
               val sets: List[(GlobalStateFieldId, SortedSet[Address])] = List(
                 (LastAllowSpendRefs, info.lastAllowSpendRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet))),
-                (LastTokenLockRefs, info.lastTokenLockRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet)))
+                (LastTokenLockRefs, info.lastTokenLockRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet))),
+                (LastTxRefs, info.lastTxRefs.keySet.to(SortedSet))
               )
               sets
                 .filter(_._2.nonEmpty)
@@ -1541,6 +1548,7 @@ object GlobalStateConverter {
           // verify replay path mirrors this in `replayActiveAddressIndexDelta` so `expectedBytes == storeBytes`.
           _ <- applyActiveAddressIndexDelta[F](store, LastAllowSpendRefs, acc.lastAllowSpendRefs.keySet.toSet, Set.empty)
           _ <- applyActiveAddressIndexDelta[F](store, LastTokenLockRefs, acc.lastTokenLockRefs.keySet.toSet, Set.empty)
+          _ <- applyActiveAddressIndexDelta[F](store, LastTxRefs, acc.lastTxRefs.keySet.toSet, Set.empty)
           // Address-pair index for `tokenLockBalances` — `(metagraphAddr, holderAddr)` pairs. Same append-only
           // discipline; materializeTokenLockBalancesFromMpt point-reads each pair and skips Nones, so stale
           // pairs in the sidecar self-prune at the read boundary.
