@@ -686,11 +686,7 @@ object GlobalSnapshotAcceptanceManager {
               s"[ACCEPTANCE] ordinal=$ordinal epoch=${epochProgress.show} ENTER " +
                 s"blocks=${blocksForAcceptance.size} allowSpend=${allowSpendBlocksForAcceptance.size} " +
                 s"tokenLock=${tokenLockBlocksForAcceptance.size} sc=${scEvents.size} unp=${unpEvents.size} " +
-                s"cds=${cdsEvents.size} wds=${wdsEvents.size} cnc=${cncEvents.size} wnc=${wncEvents.size} " +
-                s"context.balances=${lastSnapshotContext.balances.size} " +
-                s"context.currSnapshots=${lastSnapshotContext.lastCurrencySnapshots.size} " +
-                s"context.delegStakes=${lastSnapshotContext.activeDelegatedStakes.map(_.values.map(_.size).sum).getOrElse(0)} " +
-                s"context.nodeCollaterals=${lastSnapshotContext.activeNodeCollaterals.map(_.values.map(_.size).sum).getOrElse(0)}"
+                s"cds=${cdsEvents.size} wds=${wdsEvents.size} cnc=${cncEvents.size} wnc=${wncEvents.size}"
             )
 
             (allowSpendBlockAcceptanceResult, tokenLockBlockAcceptanceResult) <-
