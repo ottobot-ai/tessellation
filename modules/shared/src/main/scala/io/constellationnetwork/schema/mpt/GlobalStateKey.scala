@@ -59,10 +59,18 @@ object SystemNamespaceLabel {
     val canonicalName = "expiry-index-nodecollateralwithdrawals"
   }
 
+  /** Reverse-lookup partition: per `GlobalStateFieldId`, holds a `SortedSet[Address]` of every address with an active entry in that field.
+    * Lets consumers materialize a `Map[Address, V]` for fields whose value type doesn't carry the address (refs, balances) — the
+    * prefix-scan primitive only recovers addresses from values that embed a `source: Address`, so address-keyed maps with reference-only
+    * values need this sidecar to be reverse-lookable.
+    */
+  case object ActiveAddressIndex extends SystemNamespaceLabel { val canonicalName = "active-address-index" }
+
   val all: List[SystemNamespaceLabel] = List(
     ExpiryIndexAllowSpends,
     ExpiryIndexTokenLocks,
-    ExpiryIndexNodeCollateralWithdrawals
+    ExpiryIndexNodeCollateralWithdrawals,
+    ActiveAddressIndex
   )
 
   def fromCanonicalName(name: String): Option[SystemNamespaceLabel] = all.find(_.canonicalName === name)
@@ -272,6 +280,19 @@ object GlobalStateKey {
       GlobalStateKey(SystemNamespace(label), GlobalStateFieldId.SystemIndex, EmptyNamespace, HashNamespace(h))
     }
 
+  /** Key into the `ActiveAddressIndex` partition for a given user-visible field. `userNamespace` carries a hash of the fieldId's integer
+    * code, so each field gets its own MPT entry under the same partition.
+    */
+  def activeAddressIndexKey[F[_]: Sync: Hasher](fieldId: GlobalStateFieldId): F[GlobalStateKey] =
+    Hasher[F].hash(fieldId.toInt.toString).map { h =>
+      GlobalStateKey(
+        SystemNamespace(SystemNamespaceLabel.ActiveAddressIndex),
+        GlobalStateFieldId.SystemIndex,
+        EmptyNamespace,
+        HashNamespace(h)
+      )
+    }
+
   def toHex[F[_]: Sync: Hasher](key: GlobalStateKey): F[Hex] =
     for {
       networkPart <- serializeNamespace[F](key.networkNamespace)
@@ -280,6 +301,34 @@ object GlobalStateKey {
       userPart <- serializeNamespace[F](key.userNamespace)
       serialized = networkPart + fieldPart + contractPart + userPart
     } yield Hex(serialized)
+
+  /** Hex prefix matching every key in the hypergraph network for the given `fieldId`, optionally scoped to a specific contract address.
+    * Pair with `MptStore.getAllForPrefix` to materialize a per-field view without an external address set.
+    *
+    * Layout: `<hypergraph keyType byte (00)> + <fieldId 8 hex> [+ <contract namespace>]`. Stops short of the user-namespace component, so
+    * the prefix matches every (user-keyed) entry under that field/contract pair.
+    */
+  def hypergraphFieldPrefix[F[_]: Sync: Hasher](
+    fieldId: GlobalStateFieldId,
+    contract: Option[Address] = None
+  ): F[Hex] =
+    for {
+      networkPart <- serializeNamespace[F](HypergraphNamespace)
+      fieldPart = f"${fieldId.toInt}%08x"
+      contractPart <- serializeNamespace[F](contract.map(MetagraphNamespace(_)).getOrElse(EmptyNamespace))
+    } yield Hex(networkPart + fieldPart + contractPart)
+
+  /** Hex prefix matching every entry under `fieldId` regardless of contract scope (global + per-metagraph). Useful for fields like
+    * `ActiveAllowSpends` whose runtime view is `SortedMap[Option[Address], ...]` collapsing all contract scopes into a single scan. Layout:
+    * `<hypergraph (00)> + <fieldId 8 hex>`.
+    */
+  def hypergraphFieldPrefixAcrossContracts[F[_]: Sync: Hasher](
+    fieldId: GlobalStateFieldId
+  ): F[Hex] =
+    for {
+      networkPart <- serializeNamespace[F](HypergraphNamespace)
+      fieldPart = f"${fieldId.toInt}%08x"
+    } yield Hex(networkPart + fieldPart)
 
   private def serializeNamespace[F[_]: Sync: Hasher](ns: PartitionNamespace): F[String] =
     ns match {

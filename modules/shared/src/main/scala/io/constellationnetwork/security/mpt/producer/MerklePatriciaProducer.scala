@@ -1,8 +1,8 @@
 package io.constellationnetwork.security.mpt.producer
 
-import cats.Parallel
 import cats.effect.Async
 import cats.syntax.functor._
+import cats.{Functor, Parallel}
 
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.schema.SnapshotOrdinal
@@ -40,6 +40,20 @@ trait ProducerSavepoint[F[_]] {
 
 trait StatefulMerklePatriciaProducer[F[_]] {
   def entries: F[Map[Hex, Array[Byte]]]
+
+  /** All entries whose hex key starts with `prefix`. Default impl filters `entries` in memory; the in-memory and filesystem backends both
+    * hold full state in a `Ref`, so this is a linear scan with prefix comparison (~O(N) over total entries, no I/O). Designed for
+    * materializing per-field views like `(networkNamespace=Hypergraph, fieldId=LastAllowSpendRefs, no contract)` without an external
+    * address set.
+    *
+    * Note: under the current `GlobalStateKey.toHex` encoding the user-namespace is a one-way hash of the address, so consumers cannot
+    * recover addresses from the returned hex keys directly. Consumers that need `Map[Address, V]` either (a) decode the value when it
+    * embeds `source: Address` (AllowSpend/TokenLock/etc.), or (b) maintain a sidecar address index — same pattern as the expiry-index
+    * partitions.
+    */
+  def entriesWithPrefix(prefix: Hex)(implicit F: Functor[F]): F[Map[Hex, Array[Byte]]] =
+    entries.map(_.filter { case (k, _) => k.value.startsWith(prefix.value) })
+
   def build: F[Either[MerklePatriciaError, MerklePatriciaTrie]]
 
   /** Build the trie and cache the root hash for the given ordinal. This allows retrieval of historical root hashes via

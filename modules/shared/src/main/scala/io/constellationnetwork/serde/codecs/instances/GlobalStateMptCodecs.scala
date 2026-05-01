@@ -4,6 +4,7 @@ import scala.collection.immutable.SortedSet
 
 import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot}
 import io.constellationnetwork.schema.SnapshotOrdinal
+import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
 import io.constellationnetwork.schema.mpt.{AllowSpendExpiryKey, NodeCollateralWithdrawalExpiryKey, TokenLockExpiryKey}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
@@ -108,4 +109,13 @@ object GlobalStateMptCodecs {
 
   implicit val nodeCollateralWithdrawalExpiryKeySetImmutableCodec: ImmutableCodec[SortedSet[NodeCollateralWithdrawalExpiryKey]] =
     ImmutableCodec.fromScodecCodec(sortedSet(nodeCollateralWithdrawalExpiryKeyCodec))
+
+  // ---- ActiveAddressIndex value codec --------------------------------------
+
+  /** Codec for the `ActiveAddressIndex` partition's value type. One MPT entry per indexed `GlobalStateFieldId` holds the full
+    * `SortedSet[Address]` of every address with an active record in that field — used by manager `materializeXFromMpt` paths to recover
+    * keys when the underlying value type doesn't carry the address (refs, balances).
+    */
+  implicit val addressSetImmutableCodec: ImmutableCodec[SortedSet[Address]] =
+    ImmutableCodec.fromScodecCodec(sortedSet(addressCodec))
 }

@@ -34,6 +34,12 @@ trait MptStoreSavepoint[F[_]] {
 trait MptStore[F[_], K] {
   def get[V: ImmutableCodec](key: K): F[Option[V]]
   def getMany[V: ImmutableCodec](keys: List[K]): F[Map[K, V]]
+
+  /** Decoded view of `producer.entriesWithPrefix(prefix)`. Returns `Map[Hex, V]` rather than `Map[K, V]` because the key encoding (`toHex`)
+    * is one-way for hashed-component namespaces — consumers that need `Map[Address, V]` either decode the value's `source` field
+    * (AllowSpend/TokenLock/etc.) or pair this with a sidecar address index.
+    */
+  def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]]
   def insert[V: ImmutableCodec](key: K, value: V): F[Unit]
   def insert[V: ImmutableCodec](entries: Map[K, V]): F[Unit]
   def remove(key: K): F[Unit]
@@ -170,6 +176,16 @@ object MptStore {
               }
           }
         } yield results.toMap
+
+    override def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] =
+      producer.entriesWithPrefix(prefix).flatMap { matched =>
+        matched.toList.traverseFilter {
+          case (hex, bytes) if bytes != null && bytes.nonEmpty =>
+            deserializeBytes[V](bytes).map(_.map(hex -> _))
+          case (hex, _) =>
+            logger.warn(s"MptStore.getAllForPrefix: Found null/empty bytes for hex=$hex") >> none[(Hex, V)].pure[F]
+        }.map(_.toMap)
+      }
 
     override def insert[V: ImmutableCodec](key: K, value: V): F[Unit] =
       for {
