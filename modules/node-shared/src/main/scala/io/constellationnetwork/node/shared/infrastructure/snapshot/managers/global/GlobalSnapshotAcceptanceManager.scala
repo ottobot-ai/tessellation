@@ -830,9 +830,7 @@ object GlobalSnapshotAcceptanceManager {
               .filter { case (_, updates) => updates.nonEmpty }
               .toSortedMap
 
-            lastActiveAllowSpends = lastSnapshotContext.activeAllowSpends.getOrElse(
-              SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
-            )
+            lastActiveAllowSpends <- allowSpendStateManager.materializeActiveAllowSpendsFromMpt
 
             ArtifactValidationResult(
               acceptedSpendActions,
@@ -882,9 +880,9 @@ object GlobalSnapshotAcceptanceManager {
               .flatMap(spendAction => spendAction.spendTransactions.toList)
               .toList
 
-            globalActiveAllowSpends = lastSnapshotContext.activeAllowSpends.getOrElse(
-              SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
-            )
+            // Same materialized view as `lastActiveAllowSpends` above — `lastSnapshotContext` is immutable,
+            // so a single MPT read covers both consumers (validateArtifacts and acceptAllowSpends).
+            globalActiveAllowSpends = lastActiveAllowSpends
             globalActiveTokenLocks = lastSnapshotContext.activeTokenLocks.getOrElse(
               SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
             )
@@ -900,9 +898,7 @@ object GlobalSnapshotAcceptanceManager {
               tokenLockLookupAddresses
             )
 
-            globalLastAllowSpendRefs = lastSnapshotContext.lastAllowSpendRefs.getOrElse(
-              SortedMap.empty[Address, AllowSpendReference]
-            )
+            globalLastAllowSpendRefs <- allowSpendStateManager.materializeLastAllowSpendRefsFromMpt
             globalLastTokenLockRefs = lastSnapshotContext.lastTokenLockRefs.getOrElse(
               SortedMap.empty[Address, TokenLockReference]
             )
