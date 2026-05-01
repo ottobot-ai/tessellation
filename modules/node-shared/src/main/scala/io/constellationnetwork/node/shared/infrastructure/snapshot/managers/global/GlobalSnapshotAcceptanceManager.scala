@@ -736,7 +736,14 @@ object GlobalSnapshotAcceptanceManager {
               case (block, _) => block.value.transactions.toSortedSet
             }.toSortedSet
 
-            updatedGlobalBalances = lastSnapshotContext.balances ++ initialData.blockResult.contextUpdate.balances
+            // Source prior-ordinal `balances` from the MPT instead of `lastSnapshotContext.balances`. The
+            // ActiveAddressIndex sidecar (maintained on both delta and bootstrap paths) carries the keyset; we
+            // `getMany` the values. Read happens before `syncFromStateChanges` so the MPT still reflects the
+            // prior ordinal's state. Used here for the early `updatedGlobalBalances` and below for the final
+            // GSI's `balances` field.
+            priorBalances <- spendTransactionBalanceManager.materializeAllBalancesFromMpt
+
+            updatedGlobalBalances = priorBalances ++ initialData.blockResult.contextUpdate.balances
 
             StateChannelAcceptanceResult(
               scSnapshots,
@@ -1122,7 +1129,7 @@ object GlobalSnapshotAcceptanceManager {
               initialData.blockResult,
               updatedLastStateChannelSnapshotHashes,
               (priorLastTxRefs ++ transactionsRefsDeltas).toSortedMap,
-              lastSnapshotContext.balances ++ updatedBalancesBySpendTransactions,
+              priorBalances ++ updatedBalancesBySpendTransactions,
               updatedLastCurrencySnapshots,
               updatedLastCurrencySnapshotProofs,
               updatedAllowSpendsCleaned,

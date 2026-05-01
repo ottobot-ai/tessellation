@@ -3,15 +3,17 @@ package io.constellationnetwork.node.shared.infrastructure.snapshot.managers.glo
 import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.immutable.SortedMap
+import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.SpendTransaction
 import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.security.{Hashed, Hasher}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.addressSetImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
 import eu.timepit.refined.types.numeric.NonNegLong
 
@@ -25,6 +27,12 @@ trait SpendTransactionBalanceManager[F[_]] {
     allGlobalAllowSpends: SortedMap[Address, List[Hashed[AllowSpend]]],
     globalSpendTransactions: List[SpendTransaction]
   )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
+
+  /** Materialize the full `address → Balance` view via the `ActiveAddressIndex` sidecar. The Balance value type doesn't carry the address,
+    * so we recover the keyset from the sidecar partition and `getMany` each entry. Used by GSAM to source the prior-ordinal `balances` map
+    * without consulting `lastSnapshotContext`.
+    */
+  def materializeAllBalancesFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, Balance]]
 }
 
 object SpendTransactionBalanceManager {
@@ -95,5 +103,18 @@ object SpendTransactionBalanceManager {
           case Some(b) => b.pure[F]
           case None    => mptStore.getBalance(address).map(_.getOrElse(Balance.empty))
         }
+
+      def materializeAllBalancesFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, Balance]] =
+        for {
+          indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.Balances)
+          addrSet <- mptStore.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
+          addrList = addrSet.toList
+          keys = addrList.map(addr => GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr))
+          values <- mptStore.getMany[Balance](keys)
+        } yield
+          SortedMap.from(addrList.flatMap { addr =>
+            val key = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr)
+            values.get(key).map(addr -> _)
+          })
     }
 }
