@@ -1093,19 +1093,13 @@ object GlobalSnapshotAcceptanceManager {
             removedNodeCollateralKeys = cleanedMapsResult.removedNodeCollateralKeys
             removedNodeCollateralWithdrawalKeys = cleanedMapsResult.removedNodeCollateralWithdrawalKeys
 
+            priorPriceState <- priceStateUpdater.materializePriceStateFromMpt
             priceStateDeltas <- priceStateUpdater.updatePriceState(
-              lastSnapshotContext.priceState.getOrElse(
-                SortedMap
-                  .empty[io.constellationnetwork.schema.priceOracle.TokenPair, io.constellationnetwork.schema.priceOracle.PriceRecord]
-              ),
+              priorPriceState,
               acceptedPricingUpdates,
               epochProgress
             )
-            updatedPriceState = lastSnapshotContext.priceState
-              .getOrElse(
-                SortedMap
-                  .empty[io.constellationnetwork.schema.priceOracle.TokenPair, io.constellationnetwork.schema.priceOracle.PriceRecord]
-              ) ++ priceStateDeltas
+            updatedPriceState = priorPriceState ++ priceStateDeltas
 
             MetagraphSyncAcceptanceResult(updatedAcceptedMetagraphSyncData, metagraphSyncDataDeltas) <- metagraphSyncManager
               .acceptMetagraphSyncData(

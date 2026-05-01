@@ -13,10 +13,11 @@ import io.constellationnetwork.schema.NonNegFraction
 import io.constellationnetwork.schema.artifact.PricingUpdate
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.priceOracle.TokenPair.DAG_USD
 import io.constellationnetwork.schema.priceOracle.{PriceFraction, PriceRecord, TokenPair}
 import io.constellationnetwork.security.Hasher
+import io.constellationnetwork.serde.codecs.instances.PriceOracleCodecs.priceRecordImmutableCodec
 import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
 
 import eu.timepit.refined.cats.posIntCommutativeSemigroup
@@ -33,6 +34,11 @@ trait PriceStateUpdater[F[_]] {
     acceptedPricingUpdates: List[PricingUpdate],
     epochProgress: EpochProgress
   )(implicit hasher: Hasher[F]): F[SortedMap[TokenPair, PriceRecord]]
+
+  /** Recover the full `priceState` map from MPT via prefix-scan over the `PriceState` partition. The TokenPair key isn't recoverable from
+    * the hashed key bytes, so we extract it from each `PriceRecord.currentPrice.price.tokenPair` (the value carries its own pair).
+    */
+  def materializePriceStateFromMpt(implicit hasher: Hasher[F]): F[SortedMap[TokenPair, PriceRecord]]
 
 }
 
@@ -76,6 +82,18 @@ object PriceStateUpdater {
     )(implicit hasher: Hasher[F]): F[Option[PriceRecord]] =
       if (shouldUseMptStore) mptStore.fold(Option.empty[PriceRecord].pure[F])(_.getPriceRecord(tokenPair))
       else lastPriceState.get(tokenPair).pure[F]
+
+    override def materializePriceStateFromMpt(
+      implicit hasher: Hasher[F]
+    ): F[SortedMap[TokenPair, PriceRecord]] =
+      mptStore match {
+        case None => SortedMap.empty[TokenPair, PriceRecord].pure[F]
+        case Some(store) =>
+          for {
+            prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.PriceState)
+            entries <- store.getAllForPrefix[PriceRecord](prefix)
+          } yield SortedMap.from(entries.values.map(rec => rec.currentPrice.price.tokenPair -> rec))
+      }
 
     private def buildRecord(
       tokenPair: TokenPair,
