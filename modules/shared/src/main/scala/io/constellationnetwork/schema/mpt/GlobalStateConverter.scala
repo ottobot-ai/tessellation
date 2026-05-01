@@ -15,7 +15,7 @@ import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.MptStore
-import io.constellationnetwork.schema.mpt.PartitionNamespace.AddressNamespace
+import io.constellationnetwork.schema.mpt.PartitionNamespace.{AddressNamespace, MetagraphNamespace}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
@@ -695,6 +695,12 @@ object GlobalStateConverter {
         Set.empty,
         preSyncBytes
       )
+      scHashesAddrIdx <- replayActiveAddressIndexDelta[F](
+        GlobalStateFieldId.LastStateChannelSnapshotHashes,
+        acc.lastStateChannelSnapshotHashes.keySet.toSet,
+        Set.empty,
+        preSyncBytes
+      )
       tlbAddrPairIdx <- replayAddressPairIndexDelta[F](
         GlobalStateFieldId.TokenLockBalances,
         acc.tokenLockBalances.iterator.flatMap {
@@ -705,8 +711,8 @@ object GlobalStateConverter {
       )
     } yield
       (
-        upsertsHex ++ asExp._1 ++ tlExp._1 ++ ncwExp._1 ++ asAddrIdx._1 ++ tlAddrIdx._1 ++ txAddrIdx._1 ++ balAddrIdx._1 ++ tlbAddrPairIdx._1,
-        removalsHex ++ asExp._2 ++ tlExp._2 ++ ncwExp._2 ++ asAddrIdx._2 ++ tlAddrIdx._2 ++ txAddrIdx._2 ++ balAddrIdx._2 ++ tlbAddrPairIdx._2
+        upsertsHex ++ asExp._1 ++ tlExp._1 ++ ncwExp._1 ++ asAddrIdx._1 ++ tlAddrIdx._1 ++ txAddrIdx._1 ++ balAddrIdx._1 ++ scHashesAddrIdx._1 ++ tlbAddrPairIdx._1,
+        removalsHex ++ asExp._2 ++ tlExp._2 ++ ncwExp._2 ++ asAddrIdx._2 ++ tlAddrIdx._2 ++ txAddrIdx._2 ++ balAddrIdx._2 ++ scHashesAddrIdx._2 ++ tlbAddrPairIdx._2
       )
 
   /** Mirror of `applyActiveAddressIndexDelta`'s read-modify-write for the verify replay path. Decode the pre-sync sidecar entry, apply
@@ -1021,10 +1027,43 @@ object GlobalStateConverter {
         store
           .get[MetagraphSyncDataInfo](GlobalStateKey.hypergraph(GlobalStateFieldId.MetagraphSyncData, metagraphAddress))
 
+      /** Materialize the full `Address → Hash` view of `lastStateChannelSnapshotHashes` via the `ActiveAddressIndex` sidecar.
+        * Metagraph-keyed fields hash the address into the partition key, so we recover the keyset from the sidecar and `getMany` the
+        * values; the returned map's `K` preserves the original `MetagraphNamespace(addr)` so we pattern-match the address back out.
+        */
+      def getAllLastStateChannelSnapshotHashes(
+        implicit H: Hasher[F]
+      ): F[SortedMap[Address, Hash]] =
+        for {
+          indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastStateChannelSnapshotHashes)
+          addrSet <- store.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
+          keys = addrSet.toList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastStateChannelSnapshotHashes))
+          values <- store.getMany[Hash](keys)
+        } yield
+          SortedMap.from(values.toList.flatMap {
+            case (key, h) =>
+              key.networkNamespace match {
+                case MetagraphNamespace(addr) => List(addr -> h)
+                case _                        => Nil
+              }
+          })
+
       def getUpdateNodeParameters(
         id: Id
       )(implicit H: Hasher[F]): F[Option[(Signed[UpdateNodeParameters], SnapshotOrdinal)]] =
         GlobalStateKey.updateNodeParametersKey[F](id).flatMap(store.get[(Signed[UpdateNodeParameters], SnapshotOrdinal)])
+
+      /** Materialize the full `Id → (Signed[UpdateNodeParameters], SnapshotOrdinal)` view via prefix-scan. The MPT key is a hash of the
+        * `Id`, but the signed value carries the signer's `Id` in `proofs.head.id`, which by GSAM convention matches the map's keying `Id`.
+        * No sidecar needed.
+        */
+      def getAllUpdateNodeParameters(
+        implicit H: Hasher[F]
+      ): F[SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)]] =
+        for {
+          prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.UpdateNodeParameters)
+          entries <- store.getAllForPrefix[(Signed[UpdateNodeParameters], SnapshotOrdinal)](prefix)
+        } yield SortedMap.from(entries.values.map { case (signed, ord) => signed.proofs.head.id -> (signed, ord) })
 
       def getPriceRecord(tokenPair: TokenPair)(implicit H: Hasher[F]): F[Option[PriceRecord]] =
         GlobalStateKey.priceStateKey[F](tokenPair).flatMap(store.get[PriceRecord])
@@ -1321,7 +1360,8 @@ object GlobalStateConverter {
                 (LastAllowSpendRefs, info.lastAllowSpendRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet))),
                 (LastTokenLockRefs, info.lastTokenLockRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet))),
                 (LastTxRefs, info.lastTxRefs.keySet.to(SortedSet)),
-                (Balances, info.balances.keySet.to(SortedSet))
+                (Balances, info.balances.keySet.to(SortedSet)),
+                (LastStateChannelSnapshotHashes, info.lastStateChannelSnapshotHashes.keySet.to(SortedSet))
               )
               sets
                 .filter(_._2.nonEmpty)
@@ -1557,6 +1597,12 @@ object GlobalStateConverter {
           _ <- applyActiveAddressIndexDelta[F](store, LastTokenLockRefs, acc.lastTokenLockRefs.keySet.toSet, Set.empty)
           _ <- applyActiveAddressIndexDelta[F](store, LastTxRefs, acc.lastTxRefs.keySet.toSet, Set.empty)
           _ <- applyActiveAddressIndexDelta[F](store, Balances, acc.balances.keySet.toSet, Set.empty)
+          _ <- applyActiveAddressIndexDelta[F](
+            store,
+            LastStateChannelSnapshotHashes,
+            acc.lastStateChannelSnapshotHashes.keySet.toSet,
+            Set.empty
+          )
           // Address-pair index for `tokenLockBalances` — `(metagraphAddr, holderAddr)` pairs. Same append-only
           // discipline; materializeTokenLockBalancesFromMpt point-reads each pair and skips Nones, so stale
           // pairs in the sidecar self-prune at the read boundary.

@@ -728,9 +728,13 @@ object GlobalSnapshotAcceptanceManager {
               initialData.delegatedResult
             )
 
-            updatedUpdateNodeParameters = lastSnapshotContext.updateNodeParameters.getOrElse(
-              SortedMap.empty[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)]
-            ) ++ initialData.nodeParamsResult.view.mapValues(unp => (unp, ordinal))
+            // Source prior-ordinal `updateNodeParameters` from the MPT instead of `lastSnapshotContext.updateNodeParameters`.
+            // The MPT key is a hash of the `Id`, but the signed value carries the signer's `Id` in `proofs.head.id`,
+            // which by GSAM convention matches the map's keying `Id`. No sidecar needed; prefix-scan + value-decode.
+            priorUpdateNodeParameters <- mptStore.getAllUpdateNodeParameters
+
+            updatedUpdateNodeParameters = priorUpdateNodeParameters ++
+              initialData.nodeParamsResult.view.mapValues(unp => (unp, ordinal))
 
             acceptedTransactions = initialData.blockResult.accepted.flatMap {
               case (block, _) => block.value.transactions.toSortedSet
@@ -867,7 +871,13 @@ object GlobalSnapshotAcceptanceManager {
             _ <- loggerBundle.app.info(acceptedPricingUpdatesMessage)
             _ <- loggerBundle.app.info(rejectedPricingUpdatesMessage)
 
-            updatedLastStateChannelSnapshotHashes = lastSnapshotContext.lastStateChannelSnapshotHashes ++ sCSnapshotHashes
+            // Source prior `lastStateChannelSnapshotHashes` from the MPT instead of `lastSnapshotContext`. The
+            // `LastStateChannelSnapshotHashes` partition is metagraph-keyed and the value (`Hash`) doesn't carry the
+            // address; the `ActiveAddressIndex` sidecar tracks the keyset, and `getMany` preserves the original
+            // `MetagraphNamespace(addr)` for pattern-match recovery.
+            priorLastStateChannelSnapshotHashes <- mptStore.getAllLastStateChannelSnapshotHashes
+
+            updatedLastStateChannelSnapshotHashes = priorLastStateChannelSnapshotHashes ++ sCSnapshotHashes
             updatedLastCurrencySnapshots = lastSnapshotContext.lastCurrencySnapshots ++ currencySnapshots
 
             activeAllowSpendsFromCurrencySnapshots = currencySnapshots
