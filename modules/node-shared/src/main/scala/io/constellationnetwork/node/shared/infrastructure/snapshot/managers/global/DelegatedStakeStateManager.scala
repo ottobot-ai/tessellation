@@ -10,10 +10,14 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.tokenLock.TokenLock
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{
+  delegatedStakeRecordSetCodec,
+  pendingDelegatedStakeWithdrawalSetCodec
+}
 import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
 
 trait DelegatedStakeStateManager[F[_]] {
@@ -23,6 +27,9 @@ trait DelegatedStakeStateManager[F[_]] {
     acceptedTokenLocks: List[Signed[TokenLock]],
     withdrawalTimeLimit: EpochProgress
   )(implicit hasher: Hasher[F]): F[PartitionedRecords[SortedSet[DelegatedStakeRecord], SortedSet[PendingDelegatedStakeWithdrawal]]]
+
+  def materializeActiveDelegatedStakeAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]]
+  def materializeDelegatedStakeWithdrawalAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]]
 }
 
 object DelegatedStakeStateManager {
@@ -125,6 +132,18 @@ object DelegatedStakeStateManager {
           finalExpiredWithdrawals
         )
     }
+
+    def materializeActiveDelegatedStakeAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]] =
+      for {
+        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveDelegatedStakes)
+        entries <- mptStore.getAllForPrefix[SortedSet[DelegatedStakeRecord]](prefix)
+      } yield entries.values.toList.mapFilter(s => s.headOption.map(_.event.value.source)).toSet
+
+    def materializeDelegatedStakeWithdrawalAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]] =
+      for {
+        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.DelegatedStakesWithdrawals)
+        entries <- mptStore.getAllForPrefix[SortedSet[PendingDelegatedStakeWithdrawal]](prefix)
+      } yield entries.values.toList.mapFilter(s => s.headOption.map(_.event.value.source)).toSet
 
   }
 }

@@ -13,7 +13,11 @@ import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.security.Hasher
-import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.nodeCollateralWithdrawalExpiryKeySetImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{
+  nodeCollateralRecordSetCodec,
+  nodeCollateralWithdrawalExpiryKeySetImmutableCodec,
+  pendingNodeCollateralWithdrawalSetCodec
+}
 import io.constellationnetwork.syntax.sortedCollection.sortedSetSyntax
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -59,6 +63,9 @@ trait NodeCollateralStateManager[F[_]] {
     unexpiredWithdrawNodeCollaterals: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
     lastSnapshotContext: GlobalSnapshotInfo
   )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]]
+
+  def materializeActiveNodeCollateralAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]]
+  def materializeNodeCollateralWithdrawalAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]]
 }
 
 object NodeCollateralStateManager {
@@ -189,5 +196,17 @@ object NodeCollateralStateManager {
       }.map(SortedMap.from(_))
         .map(unexpiredWithdrawNodeCollaterals |+| _)
         .map(_.filterNot(_._2.isEmpty))
+
+    def materializeActiveNodeCollateralAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]] =
+      for {
+        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveNodeCollaterals)
+        entries <- mptStore.getAllForPrefix[SortedSet[NodeCollateralRecord]](prefix)
+      } yield entries.values.toList.mapFilter(s => s.headOption.map(_.event.value.source)).toSet
+
+    def materializeNodeCollateralWithdrawalAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]] =
+      for {
+        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.NodeCollateralWithdrawals)
+        entries <- mptStore.getAllForPrefix[SortedSet[PendingNodeCollateralWithdrawal]](prefix)
+      } yield entries.values.toList.mapFilter(s => s.headOption.map(_.event.value.source)).toSet
   }
 }

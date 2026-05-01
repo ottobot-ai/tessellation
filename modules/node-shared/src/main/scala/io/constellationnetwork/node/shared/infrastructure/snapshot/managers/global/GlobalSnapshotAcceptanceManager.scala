@@ -1061,24 +1061,12 @@ object GlobalSnapshotAcceptanceManager {
             )
 
             // Clean state maps and compute removed keys in a single pass.
-            // For removed-key computation, only the prior non-empty keysets are needed — full maps would carry
-            // value payloads we don't read, so collect just the keys here.
-            priorDelegatedStakeKeys = lastSnapshotContext.activeDelegatedStakes
-              .getOrElse(SortedMap.empty[Address, SortedSet[DelegatedStakeRecord]])
-              .collect { case (a, v) if v.nonEmpty => a }
-              .toSet
-            priorDelegatedStakeWithdrawalKeys = lastSnapshotContext.delegatedStakesWithdrawals
-              .getOrElse(SortedMap.empty[Address, SortedSet[PendingDelegatedStakeWithdrawal]])
-              .collect { case (a, v) if v.nonEmpty => a }
-              .toSet
-            priorNodeCollateralKeys = lastSnapshotContext.activeNodeCollaterals
-              .getOrElse(SortedMap.empty[Address, SortedSet[NodeCollateralRecord]])
-              .collect { case (a, v) if v.nonEmpty => a }
-              .toSet
-            priorNodeCollateralWithdrawalKeys = lastSnapshotContext.nodeCollateralWithdrawals
-              .getOrElse(SortedMap.empty[Address, SortedSet[PendingNodeCollateralWithdrawal]])
-              .collect { case (a, v) if v.nonEmpty => a }
-              .toSet
+            // For removed-key computation, only the prior non-empty keysets are needed; the manager materialize
+            // helpers prefix-scan MPT and recover Address keys from each record's `event.value.source`.
+            priorDelegatedStakeKeys <- delegatedStakeStateManager.materializeActiveDelegatedStakeAddressesFromMpt
+            priorDelegatedStakeWithdrawalKeys <- delegatedStakeStateManager.materializeDelegatedStakeWithdrawalAddressesFromMpt
+            priorNodeCollateralKeys <- nodeCollateralStateManager.materializeActiveNodeCollateralAddressesFromMpt
+            priorNodeCollateralWithdrawalKeys <- nodeCollateralStateManager.materializeNodeCollateralWithdrawalAddressesFromMpt
             cleanedMapsResult = cleanStateMaps(
               updatedAllowSpends,
               updatedTokenLockBalances,
