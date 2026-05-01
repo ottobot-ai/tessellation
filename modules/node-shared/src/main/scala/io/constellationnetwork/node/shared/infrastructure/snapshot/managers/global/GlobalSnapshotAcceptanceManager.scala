@@ -883,9 +883,7 @@ object GlobalSnapshotAcceptanceManager {
             // Same materialized view as `lastActiveAllowSpends` above — `lastSnapshotContext` is immutable,
             // so a single MPT read covers both consumers (validateArtifacts and acceptAllowSpends).
             globalActiveAllowSpends = lastActiveAllowSpends
-            globalActiveTokenLocks = lastSnapshotContext.activeTokenLocks.getOrElse(
-              SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
-            )
+            globalActiveTokenLocks <- tokenLockStateManager.materializeActiveTokenLocksFromMpt
 
             // Build the hash-keyed lookup from the MPT — same source as `acceptReplacementTokenLocks` so the
             // two reads can't disagree. Scoped to the addresses actually involved in this acceptance round
@@ -899,9 +897,7 @@ object GlobalSnapshotAcceptanceManager {
             )
 
             globalLastAllowSpendRefs <- allowSpendStateManager.materializeLastAllowSpendRefsFromMpt
-            globalLastTokenLockRefs = lastSnapshotContext.lastTokenLockRefs.getOrElse(
-              SortedMap.empty[Address, TokenLockReference]
-            )
+            globalLastTokenLockRefs <- tokenLockStateManager.materializeLastTokenLockRefsFromMpt
 
             allowSpendAcceptanceResult <- allowSpendStateManager.acceptAllowSpends(
               epochProgress,

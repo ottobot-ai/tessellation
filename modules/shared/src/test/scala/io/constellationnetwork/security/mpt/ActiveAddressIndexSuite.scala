@@ -72,11 +72,12 @@ object ActiveAddressIndexSuite extends MutableIOSuite {
       rTrie <- rProducer.buildForOrdinal(ord)
       rRoot = rTrie.toOption.map(_.rootHash.value.show).getOrElse("none")
       rBytes <- rProducer.entries
-    } yield expect.all(
-      wRoot == rRoot,
-      wBytes.size == rBytes.size,
-      wBytes.view.mapValues(_.toVector).toMap == rBytes.view.mapValues(_.toVector).toMap
-    )
+    } yield
+      expect.all(
+        wRoot == rRoot,
+        wBytes.size == rBytes.size,
+        wBytes.view.mapValues(_.toVector).toMap == rBytes.view.mapValues(_.toVector).toMap
+      )
   }
 
   test("first-time lastAllowSpendRefs entries: writer == replay (empty preSyncBytes)") { res =>
@@ -102,11 +103,12 @@ object ActiveAddressIndexSuite extends MutableIOSuite {
       rTrie <- rProducer.buildForOrdinal(ord)
       rRoot = rTrie.toOption.map(_.rootHash.value.show).getOrElse("none")
       rBytes <- rProducer.entries
-    } yield expect.all(
-      wRoot == rRoot,
-      wBytes.size == rBytes.size,
-      wBytes.view.mapValues(_.toVector).toMap == rBytes.view.mapValues(_.toVector).toMap
-    )
+    } yield
+      expect.all(
+        wRoot == rRoot,
+        wBytes.size == rBytes.size,
+        wBytes.view.mapValues(_.toVector).toMap == rBytes.view.mapValues(_.toVector).toMap
+      )
   }
 
   test("two-step: ord8 builds sidecar, ord9 extends it; writer == verify-replay against preSyncBytes") { res =>
@@ -137,10 +139,11 @@ object ActiveAddressIndexSuite extends MutableIOSuite {
       rTrie <- io.constellationnetwork.security.mpt.MerklePatriciaTrie
         .makeParallelFromBytes[IO](expectedBytes)
       rRoot = rTrie.rootHash.value.show
-    } yield expect.all(
-      wRoot == rRoot,
-      wBytes.size == expectedBytes.size,
-      wBytes.view.mapValues(_.toVector).toMap == expectedBytes.view.mapValues(_.toVector).toMap
-    )
+    } yield
+      expect.all(
+        wRoot == rRoot,
+        wBytes.size == expectedBytes.size,
+        wBytes.view.mapValues(_.toVector).toMap == expectedBytes.view.mapValues(_.toVector).toMap
+      )
   }
 }
