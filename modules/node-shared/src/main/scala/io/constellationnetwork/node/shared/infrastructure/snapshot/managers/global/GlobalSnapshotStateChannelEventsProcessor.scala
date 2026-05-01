@@ -20,7 +20,7 @@ import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.currencyMessage._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, SnapshotOrdinal}
+import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
@@ -38,7 +38,11 @@ trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
 
   def process(
     snapshotOrdinal: SnapshotOrdinal,
-    lastGlobalSnapshotInfo: GlobalSnapshotInfo,
+    currentBalances: SortedMap[Address, Balance],
+    priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
+    priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+      CurrencySnapshot
+    ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
     events: List[StateChannelOutput],
     validationType: StateChannelValidationType,
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
@@ -46,7 +50,10 @@ trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
 
   def processCurrencySnapshots(
     snapshotOrdinal: SnapshotOrdinal,
-    lastGlobalSnapshotInfo: GlobalSnapshotInfo,
+    currentBalances: SortedMap[Address, Balance],
+    priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+      CurrencySnapshot
+    ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
     events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
   )(
@@ -100,15 +107,19 @@ object GlobalSnapshotStateChannelEventsProcessor {
 
       def process(
         snapshotOrdinal: SnapshotOrdinal,
-        lastGlobalSnapshotInfo: GlobalSnapshotInfo,
+        currentBalances: SortedMap[Address, Balance],
+        priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
         events: List[StateChannelOutput],
         validationType: StateChannelValidationType,
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(implicit hasher: Hasher[F]): F[StateChannelAcceptanceResult] = {
-        // Note: getFeeAddresses still reads from lastGlobalSnapshotInfo directly because it
-        // iterates all lastCurrencySnapshots to collect fee addresses — a bulk operation not suited
-        // for per-key MptStore lookups. The staking balance lookups in buildSnapshotFeesInfo use MptStore.
-        val allFeesAddresses: Map[Address, Set[Address]] = getFeeAddresses(lastGlobalSnapshotInfo)
+        // getFeeAddresses iterates `priorLastCurrencySnapshots` (materialized once by the caller from MPT)
+        // to collect fee addresses across all metagraphs. The staking-balance lookups inside
+        // buildSnapshotFeesInfo remain MptStore-backed (per-event, per-key) so we do not duplicate that here.
+        val allFeesAddresses: Map[Address, Set[Address]] = getFeeAddresses(priorLastCurrencySnapshots)
         type Acc = (Map[Address, Set[Address]], List[ValidatedNec[(Address, StateChannelValidationError), StateChannelOutput]])
 
         events
@@ -137,16 +148,20 @@ object GlobalSnapshotStateChannelEventsProcessor {
           }
           .map { case (_, processedEvents) => processedEvents.partitionMap(_.toEither) }
           .flatTap { case (invalid, _) => logger.warn(s"Invalid state channels events: $invalid").whenA(invalid.nonEmpty) }
-          .flatMap { case (_, validatedEvents) => processStateChannelEvents(snapshotOrdinal, lastGlobalSnapshotInfo, validatedEvents) }
+          .flatMap {
+            case (_, validatedEvents) =>
+              processStateChannelEvents(snapshotOrdinal, priorLastStateChannelSnapshotHashes, validatedEvents)
+          }
           .flatMap {
             case (scSnapshots, returnedSCEvents) =>
               processCurrencySnapshots(
                 snapshotOrdinal,
-                lastGlobalSnapshotInfo,
+                currentBalances,
+                priorLastCurrencySnapshots,
                 scSnapshots,
                 getGlobalSnapshotByOrdinal
               ).map { accepted =>
-                val (lastCurrencyStates, incomingCurrencyState) = calculateLastCurrencySnapshots(accepted, lastGlobalSnapshotInfo)
+                val (lastCurrencyStates, incomingCurrencyState) = calculateLastCurrencySnapshots(accepted, priorLastCurrencySnapshots)
                 val finalScSnapshots = accepted.map { case (k, (v, _)) => k -> v.map(_._1) }
                 // TODO: ASSUMING that owner addresses are restricted from being shared at this point
                 val balanceUpdates = accepted.values.map(_._2).foldLeft(SortedMap.empty[Address, Balance])(_ ++ _)
@@ -163,7 +178,9 @@ object GlobalSnapshotStateChannelEventsProcessor {
       }
       private def calculateLastCurrencySnapshots(
         processedCurrencySnapshots: SortedMap[Address, MetagraphAcceptanceResult],
-        lastGlobalSnapshotInfo: GlobalSnapshotInfo
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
       ): (SortedMap[Address, CurrencySnapshotWithState], SortedMap[Address, List[CurrencySnapshotWithState]]) = {
         val lastCurrencySnapshotPerAddress =
           processedCurrencySnapshots.map { case (k, (v, _)) => k -> v.toList.flatMap(_._2).lastOption }.collect {
@@ -174,7 +191,7 @@ object GlobalSnapshotStateChannelEventsProcessor {
           processedCurrencySnapshots.map { case (k, (v, _)) => k -> v.toList.flatMap(_._2) }.filterNot { case (_, list) => list.isEmpty }
 
         (
-          lastGlobalSnapshotInfo.lastCurrencySnapshots.concat(lastCurrencySnapshotPerAddress),
+          priorLastCurrencySnapshots.concat(lastCurrencySnapshotPerAddress),
           lastCurrencySnapshots
         )
       }
@@ -206,7 +223,10 @@ object GlobalSnapshotStateChannelEventsProcessor {
         */
       def processCurrencySnapshots(
         snapshotOrdinal: SnapshotOrdinal,
-        lastGlobalSnapshotInfo: GlobalSnapshotInfo,
+        currentBalances: SortedMap[Address, Balance],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
         events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(implicit hasher: Hasher[F]): F[SortedMap[Address, MetagraphAcceptanceResult]] = {
@@ -224,13 +244,14 @@ object GlobalSnapshotStateChannelEventsProcessor {
 
             val emptyBalanceUpdate = SortedMap.empty[Address, Balance]
 
-            // initialState reads from lastGlobalSnapshotInfo.lastCurrencySnapshots (not MptStore)
-            // because the Left(fullSnapshot) vs Right(incremental, info) distinction matters:
-            // the Left branch handles the first-incremental-over-full transition without calling
-            // applyCurrencySnapshot, while MptStore normalizes Left to Right (via fromCurrencySnapshot),
-            // which would route into the applyCurrencySnapshot path and fail due to hash mismatches.
+            // initialState reads from `priorLastCurrencySnapshots` (materialized via the
+            // `getAllLastCurrencySnapshots` MPT prefix-scan) rather than a synthetic
+            // `lastGlobalSnapshotInfo.copy(...)`, because the Left(fullSnapshot) vs Right(incremental, info)
+            // distinction matters: the Left branch handles the first-incremental-over-full transition without
+            // calling applyCurrencySnapshot. The materialize preserves Left bindings via the per-address
+            // `Left(Signed[CurrencySnapshot])` partition lookup.
             val initialState =
-              lastGlobalSnapshotInfo.lastCurrencySnapshots
+              priorLastCurrencySnapshots
                 .get(address)
                 .map(init => (stubBinary, init.some))
                 .map(s => (NonEmptyList.one(s), SortedMap.empty[Address, Balance]))
@@ -296,17 +317,17 @@ object GlobalSnapshotStateChannelEventsProcessor {
                             // Fee deduction: if fee is required, we need a fee address (owner address from
                             // currency messages). Without one we reject. With one, we check the local balance
                             // accumulator first (to account for fees already deducted earlier in this batch),
-                            // falling back to lastGlobalSnapshotInfo.balances for the initial balance lookup.
+                            // falling back to `currentBalances` for the initial balance lookup.
                             //
-                            // We deliberately use lastGlobalSnapshotInfo.balances (the deterministic context
-                            // passed into accept()) rather than mptStore.getBalance, because accept() mutates
-                            // the MptStore as a side-effect (syncFromStateChanges). When validateArtifact
-                            // calls accept() a second time (to validate the leader's artifact), the MptStore
-                            // has already been updated by the validator's own proposal computation, producing
-                            // a different balance than the leader saw — causing currencyAcceptanceBalanceUpdate
-                            // to diverge. Using the immutable context snapshot avoids this entirely, and also
-                            // correctly reflects block-level balance changes (updatedGlobalBalances) that the
-                            // MptStore does not yet contain at the time of fee calculation.
+                            // `currentBalances` is the in-progress balance map (`priorBalances ++` block-level
+                            // delta) materialized once by GSAM before calling `process`. It is deliberately NOT
+                            // a per-event MptStore read because accept() mutates the MptStore as a side-effect
+                            // (syncFromStateChanges). When validateArtifact calls accept() a second time, the
+                            // MptStore would already reflect the validator's own proposal computation,
+                            // producing a different balance than the leader saw — causing
+                            // currencyAcceptanceBalanceUpdate to diverge. Pinning to a snapshot value avoids
+                            // that, and also correctly reflects block-level balance changes that the MptStore
+                            // does not yet contain at the time of fee calculation.
                             maybeFeeAddress
                               .filter(_ => isFeeRequired)
                               .fold(
@@ -316,7 +337,7 @@ object GlobalSnapshotStateChannelEventsProcessor {
                                   current.asRight[Agg].pure[F]
                               ) { feeAddress =>
                                 val localBalance = balanceUpdate.get(feeAddress)
-                                val contextBalance = lastGlobalSnapshotInfo.balances.getOrElse(feeAddress, Balance.empty)
+                                val contextBalance = currentBalances.getOrElse(feeAddress, Balance.empty)
                                 localBalance.getOrElse(contextBalance).pure[F].map { balance =>
                                   // We're inside the Some(feeAddress) handler, so isFeeRequired is always true here.
                                   // If fee deduction succeeds, continue processing; otherwise reject remaining binaries.
@@ -359,10 +380,10 @@ object GlobalSnapshotStateChannelEventsProcessor {
 
       private def processStateChannelEvents(
         ordinal: SnapshotOrdinal,
-        lastGlobalSnapshotInfo: GlobalSnapshotInfo,
+        priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
         events: List[StateChannelOutput]
       )(implicit hasher: Hasher[F]): F[(SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], Set[StateChannelOutput])] =
-        stateChannelManager.accept(ordinal, lastGlobalSnapshotInfo, events)
+        stateChannelManager.accept(ordinal, priorLastStateChannelSnapshotHashes, events)
 
     }
 

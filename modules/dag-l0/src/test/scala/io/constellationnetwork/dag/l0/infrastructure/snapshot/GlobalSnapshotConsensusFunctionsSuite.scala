@@ -11,7 +11,7 @@ import cats.syntax.list._
 import scala.collection.immutable.{SortedMap, SortedSet}
 import scala.reflect.runtime.universe.TypeTag
 
-import io.constellationnetwork.currency.schema.currency.SnapshotFee
+import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.dag.l0.domain.snapshot.programs.{
   GlobalSnapshotEventCutter,
   SnapshotBinaryFeeCalculator,
@@ -195,7 +195,11 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
   val scProcessor: GlobalSnapshotStateChannelEventsProcessor[IO] = new GlobalSnapshotStateChannelEventsProcessor[IO] {
     def process(
       snapshotOrdinal: GlobalSnapshotKey,
-      lastGlobalSnapshotInfo: GlobalSnapshotContext,
+      currentBalances: SortedMap[Address, Balance],
+      priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
+      priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+        CurrencySnapshot
+      ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
       events: List[StateChannelOutput],
       validationType: StateChannelValidationType,
       getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
@@ -211,7 +215,10 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
 
     def processCurrencySnapshots(
       snapshotOrdinal: SnapshotOrdinal,
-      lastGlobalSnapshotInfo: GlobalSnapshotContext,
+      currentBalances: SortedMap[Address, Balance],
+      priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+        CurrencySnapshot
+      ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
       events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
       getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
     )(implicit hasher: Hasher[F]): IO[

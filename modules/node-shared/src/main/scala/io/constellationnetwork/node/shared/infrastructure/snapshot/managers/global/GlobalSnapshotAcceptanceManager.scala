@@ -300,15 +300,20 @@ object GlobalSnapshotAcceptanceManager {
 
       private def processStateChannelEvents(
         ordinal: SnapshotOrdinal,
-        lastSnapshotContext: GlobalSnapshotInfo,
-        updatedGlobalBalances: SortedMap[Address, Balance],
+        currentBalances: SortedMap[Address, Balance],
+        priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
         scEvents: List[StateChannelOutput],
         validationType: StateChannelValidationType,
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(implicit hasher: Hasher[F]): F[StateChannelAcceptanceResult] =
         stateChannelEventsProcessor.process(
           ordinal,
-          lastSnapshotContext.copy(balances = updatedGlobalBalances),
+          currentBalances,
+          priorLastStateChannelSnapshotHashes,
+          priorLastCurrencySnapshots,
           scEvents,
           validationType,
           getGlobalSnapshotByOrdinal
@@ -749,6 +754,22 @@ object GlobalSnapshotAcceptanceManager {
 
             updatedGlobalBalances = priorBalances ++ initialData.blockResult.contextUpdate.balances
 
+            // Source prior `lastStateChannelSnapshotHashes` from the MPT instead of `lastSnapshotContext`. The
+            // `LastStateChannelSnapshotHashes` partition is metagraph-keyed and the value (`Hash`) doesn't carry the
+            // address; the `ActiveAddressIndex` sidecar tracks the keyset, and `getMany` preserves the original
+            // `MetagraphNamespace(addr)` for pattern-match recovery. Read here (before
+            // `processStateChannelEvents`) so the StateChannelAcceptanceManager can be GSI-free.
+            priorLastStateChannelSnapshotHashes <- mptStore.getAllLastStateChannelSnapshotHashes
+
+            // Source prior `lastCurrencySnapshots` from the MPT instead of `lastSnapshotContext`. The
+            // `Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]` value
+            // spans 3 metagraph-keyed partitions; we read the keyset from `LastCurrencySnapshots`'s
+            // `ActiveAddressIndex` sidecar (which marks any address with either mode), then per-address try Left
+            // before falling back to the Right pair. Read here (before `processStateChannelEvents`) so the
+            // StateChannelEventsProcessor can be GSI-free — `getFeeAddresses` and the `initialState` lookup
+            // both consume this materialized map.
+            priorLastCurrencySnapshots <- mptStore.getAllLastCurrencySnapshots
+
             StateChannelAcceptanceResult(
               scSnapshots,
               currencySnapshots,
@@ -757,8 +778,9 @@ object GlobalSnapshotAcceptanceManager {
               incomingCurrencySnapshots
             ) <- processStateChannelEvents(
               ordinal,
-              lastSnapshotContext,
               updatedGlobalBalances,
+              priorLastStateChannelSnapshotHashes,
+              priorLastCurrencySnapshots,
               scEvents,
               validationType,
               getGlobalSnapshotByOrdinal
@@ -871,20 +893,7 @@ object GlobalSnapshotAcceptanceManager {
             _ <- loggerBundle.app.info(acceptedPricingUpdatesMessage)
             _ <- loggerBundle.app.info(rejectedPricingUpdatesMessage)
 
-            // Source prior `lastStateChannelSnapshotHashes` from the MPT instead of `lastSnapshotContext`. The
-            // `LastStateChannelSnapshotHashes` partition is metagraph-keyed and the value (`Hash`) doesn't carry the
-            // address; the `ActiveAddressIndex` sidecar tracks the keyset, and `getMany` preserves the original
-            // `MetagraphNamespace(addr)` for pattern-match recovery.
-            priorLastStateChannelSnapshotHashes <- mptStore.getAllLastStateChannelSnapshotHashes
-
             updatedLastStateChannelSnapshotHashes = priorLastStateChannelSnapshotHashes ++ sCSnapshotHashes
-            // Source prior `lastCurrencySnapshots` from the MPT instead of `lastSnapshotContext`. The
-            // `Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]` value
-            // spans 3 metagraph-keyed partitions; we read the keyset from `LastCurrencySnapshots`'s
-            // `ActiveAddressIndex` sidecar (which marks any address with either mode), then per-address try Left
-            // before falling back to the Right pair.
-            priorLastCurrencySnapshots <- mptStore.getAllLastCurrencySnapshots
-
             updatedLastCurrencySnapshots = priorLastCurrencySnapshots ++ currencySnapshots
 
             activeAllowSpendsFromCurrencySnapshots = currencySnapshots

@@ -54,8 +54,12 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
       stateChannelOutput2 <- mkStateChannelOutput(2, address, Hash("someHash").some)
       snapshotInfo = mkGlobalSnapshotInfo(SortedMap(address -> Hash("someHash")))
       manager <- mkManager(snapshotInfo)
-      result1 <- manager.accept(SnapshotOrdinal(1L), snapshotInfo, List(stateChannelOutput1))
-      result2 <- manager.accept(SnapshotOrdinal(10L), snapshotInfo, List(stateChannelOutput1, stateChannelOutput2))
+      result1 <- manager.accept(SnapshotOrdinal(1L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput1))
+      result2 <- manager.accept(
+        SnapshotOrdinal(10L),
+        snapshotInfo.lastStateChannelSnapshotHashes,
+        List(stateChannelOutput1, stateChannelOutput2)
+      )
       expected1 = (SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], Set(stateChannelOutput1))
       expected2 = (
         SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
@@ -72,8 +76,8 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
       stateChannelOutput <- mkStateChannelOutput(1, address, Hash("someHash").some)
       snapshotInfo = mkGlobalSnapshotInfo(SortedMap(address -> Hash("someHash")))
       manager <- mkManager(snapshotInfo)
-      _ <- manager.accept(SnapshotOrdinal(1L), snapshotInfo, List(stateChannelOutput))
-      result <- manager.accept(SnapshotOrdinal(11L), snapshotInfo, List(stateChannelOutput))
+      _ <- manager.accept(SnapshotOrdinal(1L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput))
+      result <- manager.accept(SnapshotOrdinal(11L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput))
     } yield expect.same((SortedMap(address -> NonEmptyList.one(stateChannelOutput.snapshotBinary)), Set.empty), result)
 
   }
@@ -85,8 +89,8 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
       stateChannelOutput <- mkStateChannelOutput(1, address, Some(Hash("unknown")))
       snapshotInfo = mkGlobalSnapshotInfo(SortedMap.empty)
       manager <- mkManager(snapshotInfo)
-      _ <- manager.accept(SnapshotOrdinal(1L), snapshotInfo, List(stateChannelOutput))
-      result <- manager.accept(SnapshotOrdinal(11L), snapshotInfo, List(stateChannelOutput))
+      _ <- manager.accept(SnapshotOrdinal(1L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput))
+      result <- manager.accept(SnapshotOrdinal(11L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput))
       expected = (SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], Set(stateChannelOutput))
     } yield expect.same(expected, result)
 
@@ -99,10 +103,10 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
       stateChannelOutput <- mkStateChannelOutput(1, address, Some(Hash("unknown")))
       snapshotInfo = mkGlobalSnapshotInfo(SortedMap.empty)
       manager <- mkManager(snapshotInfo, NonNegLong.MinValue, NonNegLong(4L))
-      _ <- manager.accept(SnapshotOrdinal(1L), snapshotInfo, List(stateChannelOutput))
-      resultAt4 <- manager.accept(SnapshotOrdinal(4L), snapshotInfo, List(stateChannelOutput))
+      _ <- manager.accept(SnapshotOrdinal(1L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput))
+      resultAt4 <- manager.accept(SnapshotOrdinal(4L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput))
       expectedAt4 = (SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], Set(stateChannelOutput))
-      resultAt5 <- manager.accept(SnapshotOrdinal(5L), snapshotInfo, List(stateChannelOutput))
+      resultAt5 <- manager.accept(SnapshotOrdinal(5L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput))
       expectedAt5 = (SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], Set.empty[StateChannelOutput])
 
       getsReturnedAt4 = expect.same(expectedAt4, resultAt4)
@@ -118,9 +122,13 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
       stateChannelOutput2 <- mkStateChannelOutput(2, address, None)
       snapshotInfo = mkGlobalSnapshotInfo(SortedMap.empty)
       manager <- mkManager(snapshotInfo)
-      _ <- manager.accept(SnapshotOrdinal(1L), snapshotInfo, List(stateChannelOutput1))
-      _ <- manager.accept(SnapshotOrdinal(10L), snapshotInfo, List(stateChannelOutput1, stateChannelOutput2))
-      result <- manager.accept(SnapshotOrdinal(11L), snapshotInfo, List(stateChannelOutput1, stateChannelOutput2))
+      _ <- manager.accept(SnapshotOrdinal(1L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput1))
+      _ <- manager.accept(SnapshotOrdinal(10L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput1, stateChannelOutput2))
+      result <- manager.accept(
+        SnapshotOrdinal(11L),
+        snapshotInfo.lastStateChannelSnapshotHashes,
+        List(stateChannelOutput1, stateChannelOutput2)
+      )
       expected = (SortedMap(address -> NonEmptyList.one(stateChannelOutput2.snapshotBinary)), Set.empty)
     } yield expect.same(expected, result)
 
@@ -135,8 +143,16 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
       stateChannelOutput3 <- mkStateChannelOutput(1, address, None)
       snapshotInfo = mkGlobalSnapshotInfo(SortedMap.empty)
       manager <- mkManager(snapshotInfo)
-      _ <- manager.accept(SnapshotOrdinal(1L), snapshotInfo, List(stateChannelOutput1, stateChannelOutput2, stateChannelOutput3))
-      result <- manager.accept(SnapshotOrdinal(11L), snapshotInfo, List(stateChannelOutput1, stateChannelOutput2, stateChannelOutput3))
+      _ <- manager.accept(
+        SnapshotOrdinal(1L),
+        snapshotInfo.lastStateChannelSnapshotHashes,
+        List(stateChannelOutput1, stateChannelOutput2, stateChannelOutput3)
+      )
+      result <- manager.accept(
+        SnapshotOrdinal(11L),
+        snapshotInfo.lastStateChannelSnapshotHashes,
+        List(stateChannelOutput1, stateChannelOutput2, stateChannelOutput3)
+      )
       expected1 = (SortedMap(address -> NonEmptyList.one(stateChannelOutput2.snapshotBinary)), Set.empty)
       expected2 = (SortedMap(address -> NonEmptyList.one(stateChannelOutput1.snapshotBinary)), Set.empty)
     } yield expect.same(expected1, result).xor(expect.same(expected2, result))
@@ -163,9 +179,9 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
           results <- (1 to numberOfCalls).toList.traverse { _ =>
             for {
               manager <- mkManager(snapshotInfo)
-              _ <- manager.accept(SnapshotOrdinal(1L), snapshotInfo, stateChannelOutputs)
+              _ <- manager.accept(SnapshotOrdinal(1L), snapshotInfo.lastStateChannelSnapshotHashes, stateChannelOutputs)
               shuffledOutputs <- Random.scalaUtilRandom[IO].flatMap(_.shuffleList(stateChannelOutputs))
-              result <- manager.accept(SnapshotOrdinal(11L), snapshotInfo, shuffledOutputs)
+              result <- manager.accept(SnapshotOrdinal(11L), snapshotInfo.lastStateChannelSnapshotHashes, shuffledOutputs)
             } yield result
           }
           expectedUniqueResults = 1
@@ -185,8 +201,16 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
       stateChannelOutput3 <- mkStateChannelOutput(2, address, None)
       snapshotInfo = mkGlobalSnapshotInfo(SortedMap.empty)
       manager <- mkManager(snapshotInfo)
-      _ <- manager.accept(SnapshotOrdinal(1L), snapshotInfo, List(stateChannelOutput1, stateChannelOutput2, stateChannelOutput3))
-      result <- manager.accept(SnapshotOrdinal(11L), snapshotInfo, List(stateChannelOutput1, stateChannelOutput2, stateChannelOutput3))
+      _ <- manager.accept(
+        SnapshotOrdinal(1L),
+        snapshotInfo.lastStateChannelSnapshotHashes,
+        List(stateChannelOutput1, stateChannelOutput2, stateChannelOutput3)
+      )
+      result <- manager.accept(
+        SnapshotOrdinal(11L),
+        snapshotInfo.lastStateChannelSnapshotHashes,
+        List(stateChannelOutput1, stateChannelOutput2, stateChannelOutput3)
+      )
       expected = (SortedMap(address -> NonEmptyList.one(stateChannelOutput3.snapshotBinary)), Set.empty)
     } yield expect.same(expected, result)
 
@@ -207,12 +231,12 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
       manager <- mkManager(snapshotInfo)
       _ <- manager.accept(
         SnapshotOrdinal(1L),
-        snapshotInfo,
+        snapshotInfo.lastStateChannelSnapshotHashes,
         List(output1, output1Following1, output2, output2Following1, output2Following2)
       )
       result <- manager.accept(
         SnapshotOrdinal(11L),
-        snapshotInfo,
+        snapshotInfo.lastStateChannelSnapshotHashes,
         List(output1, output1Following1, output2, output2Following1, output2Following2)
       )
       expected = (SortedMap(address -> NonEmptyList.of(output2Following1.snapshotBinary, output2.snapshotBinary)), Set.empty)
@@ -234,7 +258,7 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
       manager <- mkManager(snapshotInfo, pullDelay = NonNegLong.MinValue)
       result <- manager.accept(
         SnapshotOrdinal(1L),
-        snapshotInfo,
+        snapshotInfo.lastStateChannelSnapshotHashes,
         List(output1, output1Following1, output2, output2Following1, output2Following2)
       )
       expected = (SortedMap(address -> NonEmptyList.of(output2Following1.snapshotBinary, output2.snapshotBinary)), Set.empty)
@@ -248,7 +272,7 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
       stateChannelOutput <- mkStateChannelOutput(1, address, Hash("someHash").some)
       snapshotInfo = mkGlobalSnapshotInfo(SortedMap(address -> Hash("someHash")))
       manager <- mkManager(snapshotInfo, NonNegLong.MinValue, NonNegLong.MinValue)
-      result <- manager.accept(SnapshotOrdinal(1L), snapshotInfo, List(stateChannelOutput))
+      result <- manager.accept(SnapshotOrdinal(1L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput))
     } yield expect.same((SortedMap(address -> NonEmptyList.one(stateChannelOutput.snapshotBinary)), Set.empty), result)
 
   }
@@ -263,7 +287,7 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
       manager <- mkManager(snapshotInfo, pullDelay = NonNegLong.MinValue)
       result <- manager.accept(
         SnapshotOrdinal(1L),
-        snapshotInfo,
+        snapshotInfo.lastStateChannelSnapshotHashes,
         List(first, third)
       )
       expected = (SortedMap(address -> NonEmptyList.one(first.snapshotBinary)), Set(third))

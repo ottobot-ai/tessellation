@@ -15,6 +15,7 @@ import cats.syntax.validated._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot, CurrencySnapshotInfo}
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types._
@@ -159,7 +160,11 @@ object Mocks {
     val mockStateChannelEventsProcessor = new GlobalSnapshotStateChannelEventsProcessor[IO] {
       override def process(
         snapshotOrdinal: SnapshotOrdinal,
-        lastGlobalSnapshotInfo: GlobalSnapshotInfo,
+        currentBalances: SortedMap[Address, Balance],
+        priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
         events: List[StateChannelOutput],
         validationType: StateChannelValidationType,
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
@@ -173,7 +178,10 @@ object Mocks {
 
       override def processCurrencySnapshots(
         snapshotOrdinal: SnapshotOrdinal,
-        lastGlobalSnapshotInfo: GlobalSnapshotInfo,
+        currentBalances: SortedMap[Address, Balance],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
         events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(

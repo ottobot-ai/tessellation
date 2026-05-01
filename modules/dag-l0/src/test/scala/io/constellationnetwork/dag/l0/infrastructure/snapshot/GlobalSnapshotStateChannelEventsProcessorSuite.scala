@@ -156,7 +156,11 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
 
       currencySnapshotContextFns = CurrencySnapshotContextFunctions.make(currencySnapshotValidator)
       manager = new GlobalSnapshotStateChannelAcceptanceManager[IO] {
-        def accept(ordinal: SnapshotOrdinal, lastGlobalSnapshotInfo: GlobalSnapshotInfo, events: List[StateChannelOutput])(
+        def accept(
+          ordinal: SnapshotOrdinal,
+          priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
+          events: List[StateChannelOutput]
+        )(
           implicit hasher: Hasher[IO]
         ): IO[
           (
@@ -190,7 +194,9 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
       )
       result <- service.process(
         SnapshotOrdinal(1L),
-        snapshotInfo,
+        snapshotInfo.balances,
+        snapshotInfo.lastStateChannelSnapshotHashes,
+        snapshotInfo.lastCurrencySnapshots,
         output :: Nil,
         StateChannelValidationType.Full,
         _ => None.pure[IO]
@@ -223,7 +229,9 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
       )
       result <- service.process(
         SnapshotOrdinal(1L),
-        snapshotInfo,
+        snapshotInfo.balances,
+        snapshotInfo.lastStateChannelSnapshotHashes,
+        snapshotInfo.lastCurrencySnapshots,
         output1 :: output2 :: Nil,
         StateChannelValidationType.Full,
         _ => None.pure[IO]
@@ -257,7 +265,9 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
       )
       result <- service.process(
         SnapshotOrdinal(1L),
-        snapshotInfo,
+        snapshotInfo.balances,
+        snapshotInfo.lastStateChannelSnapshotHashes,
+        snapshotInfo.lastCurrencySnapshots,
         output1 :: output2 :: Nil,
         StateChannelValidationType.Full,
         _ => None.pure[IO]

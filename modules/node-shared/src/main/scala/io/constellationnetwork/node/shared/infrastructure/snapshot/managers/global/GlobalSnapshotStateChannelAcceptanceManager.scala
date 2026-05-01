@@ -10,9 +10,9 @@ import cats.syntax.traverse._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.{Hash, ProofsHash}
 import io.constellationnetwork.security.signature.Signed
@@ -25,7 +25,11 @@ import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
 
 trait GlobalSnapshotStateChannelAcceptanceManager[F[_]] {
-  def accept(ordinal: SnapshotOrdinal, lastGlobalSnapshotInfo: GlobalSnapshotInfo, events: List[StateChannelOutput])(
+  def accept(
+    ordinal: SnapshotOrdinal,
+    priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
+    events: List[StateChannelOutput]
+  )(
     implicit hasher: Hasher[F]
   ): F[
     (
@@ -44,7 +48,11 @@ object GlobalSnapshotStateChannelAcceptanceManager {
     Ref.of[F, Map[(Address, Hash), Long]](Map.empty).map { firstSeenKeysForOrdinalR =>
       new GlobalSnapshotStateChannelAcceptanceManager[F] {
 
-        def accept(ordinal: SnapshotOrdinal, lastGlobalSnapshotInfo: GlobalSnapshotInfo, events: List[StateChannelOutput])(
+        def accept(
+          ordinal: SnapshotOrdinal,
+          priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
+          events: List[StateChannelOutput]
+        )(
           implicit hasher: Hasher[F]
         ): F[
           (
@@ -61,7 +69,7 @@ object GlobalSnapshotStateChannelAcceptanceManager {
                   ordinal,
                   stateChannelAllowanceLists.flatMap(_.get(address))
                 )(
-                  lastGlobalSnapshotInfo.lastStateChannelSnapshotHashes.getOrElse(address, Hash.empty),
+                  priorLastStateChannelSnapshotHashes.getOrElse(address, Hash.empty),
                   outputs
                 ).map {
                   case (accepted, returned) => (accepted.map(address -> _), returned.toSet)
