@@ -701,6 +701,12 @@ object GlobalStateConverter {
         Set.empty,
         preSyncBytes
       )
+      currSnapsAddrIdx <- replayActiveAddressIndexDelta[F](
+        GlobalStateFieldId.LastCurrencySnapshots,
+        acc.lastCurrencySnapshots.keySet.toSet,
+        Set.empty,
+        preSyncBytes
+      )
       tlbAddrPairIdx <- replayAddressPairIndexDelta[F](
         GlobalStateFieldId.TokenLockBalances,
         acc.tokenLockBalances.iterator.flatMap {
@@ -711,8 +717,10 @@ object GlobalStateConverter {
       )
     } yield
       (
-        upsertsHex ++ asExp._1 ++ tlExp._1 ++ ncwExp._1 ++ asAddrIdx._1 ++ tlAddrIdx._1 ++ txAddrIdx._1 ++ balAddrIdx._1 ++ scHashesAddrIdx._1 ++ tlbAddrPairIdx._1,
-        removalsHex ++ asExp._2 ++ tlExp._2 ++ ncwExp._2 ++ asAddrIdx._2 ++ tlAddrIdx._2 ++ txAddrIdx._2 ++ balAddrIdx._2 ++ scHashesAddrIdx._2 ++ tlbAddrPairIdx._2
+        upsertsHex ++ asExp._1 ++ tlExp._1 ++ ncwExp._1 ++ asAddrIdx._1 ++ tlAddrIdx._1 ++ txAddrIdx._1 ++ balAddrIdx._1 ++
+          scHashesAddrIdx._1 ++ currSnapsAddrIdx._1 ++ tlbAddrPairIdx._1,
+        removalsHex ++ asExp._2 ++ tlExp._2 ++ ncwExp._2 ++ asAddrIdx._2 ++ tlAddrIdx._2 ++ txAddrIdx._2 ++ balAddrIdx._2 ++
+          scHashesAddrIdx._2 ++ currSnapsAddrIdx._2 ++ tlbAddrPairIdx._2
       )
 
   /** Mirror of `applyActiveAddressIndexDelta`'s read-modify-write for the verify replay path. Decode the pre-sync sidecar entry, apply
@@ -1048,6 +1056,39 @@ object GlobalStateConverter {
               }
           })
 
+      /** Materialize the full `lastCurrencySnapshots` view. The value is `Either[Signed[CurrencySnapshot],
+        * (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]` — Left and Right are stored in disjoint partitions per address, so
+        * for each metagraph address we try the Left partition first and fall back to the Right pair. The address keyset is sourced from the
+        * `ActiveAddressIndex` sidecar tracking `LastCurrencySnapshots` (covers both modes since both populations mark the same address).
+        */
+      def getAllLastCurrencySnapshots(
+        implicit H: Hasher[F]
+      ): F[SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]] =
+        for {
+          indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastCurrencySnapshots)
+          addrSet <- store.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
+          addrList = addrSet.toList
+          leftKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots))
+          incKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots))
+          infoKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshotInfo))
+          lefts <- store.getMany[Signed[CurrencySnapshot]](leftKeys)
+          incs <- store.getMany[Signed[CurrencyIncrementalSnapshot]](incKeys)
+          infos <- store.getMany[CurrencySnapshotInfo](infoKeys)
+        } yield
+          SortedMap.from(addrList.flatMap { addr =>
+            val leftKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots)
+            val incKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
+            val infoKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshotInfo)
+            lefts.get(leftKey) match {
+              case Some(snap) => List(addr -> Left(snap))
+              case None =>
+                (incs.get(incKey), infos.get(infoKey)) match {
+                  case (Some(inc), Some(info)) => List(addr -> Right((inc, info)))
+                  case _                       => Nil
+                }
+            }
+          })
+
       def getUpdateNodeParameters(
         id: Id
       )(implicit H: Hasher[F]): F[Option[(Signed[UpdateNodeParameters], SnapshotOrdinal)]] =
@@ -1361,7 +1402,8 @@ object GlobalStateConverter {
                 (LastTokenLockRefs, info.lastTokenLockRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet))),
                 (LastTxRefs, info.lastTxRefs.keySet.to(SortedSet)),
                 (Balances, info.balances.keySet.to(SortedSet)),
-                (LastStateChannelSnapshotHashes, info.lastStateChannelSnapshotHashes.keySet.to(SortedSet))
+                (LastStateChannelSnapshotHashes, info.lastStateChannelSnapshotHashes.keySet.to(SortedSet)),
+                (LastCurrencySnapshots, info.lastCurrencySnapshots.keySet.to(SortedSet))
               )
               sets
                 .filter(_._2.nonEmpty)
@@ -1601,6 +1643,12 @@ object GlobalStateConverter {
             store,
             LastStateChannelSnapshotHashes,
             acc.lastStateChannelSnapshotHashes.keySet.toSet,
+            Set.empty
+          )
+          _ <- applyActiveAddressIndexDelta[F](
+            store,
+            LastCurrencySnapshots,
+            acc.lastCurrencySnapshots.keySet.toSet,
             Set.empty
           )
           // Address-pair index for `tokenLockBalances` — `(metagraphAddr, holderAddr)` pairs. Same append-only

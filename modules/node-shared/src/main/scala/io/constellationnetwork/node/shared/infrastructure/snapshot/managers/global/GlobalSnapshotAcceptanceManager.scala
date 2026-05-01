@@ -878,7 +878,14 @@ object GlobalSnapshotAcceptanceManager {
             priorLastStateChannelSnapshotHashes <- mptStore.getAllLastStateChannelSnapshotHashes
 
             updatedLastStateChannelSnapshotHashes = priorLastStateChannelSnapshotHashes ++ sCSnapshotHashes
-            updatedLastCurrencySnapshots = lastSnapshotContext.lastCurrencySnapshots ++ currencySnapshots
+            // Source prior `lastCurrencySnapshots` from the MPT instead of `lastSnapshotContext`. The
+            // `Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]` value
+            // spans 3 metagraph-keyed partitions; we read the keyset from `LastCurrencySnapshots`'s
+            // `ActiveAddressIndex` sidecar (which marks any address with either mode), then per-address try Left
+            // before falling back to the Right pair.
+            priorLastCurrencySnapshots <- mptStore.getAllLastCurrencySnapshots
+
+            updatedLastCurrencySnapshots = priorLastCurrencySnapshots ++ currencySnapshots
 
             activeAllowSpendsFromCurrencySnapshots = currencySnapshots
               .mapFilter(_.toOption.flatMap { case (_, info) => info.activeAllowSpends })
