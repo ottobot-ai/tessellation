@@ -15,7 +15,12 @@ import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.allowSpendExpiryKeySetImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendReferenceImmutableCodec}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{
+  addressSetImmutableCodec,
+  allowSpendExpiryKeySetImmutableCodec,
+  signedAllowSpendSetCodec
+}
 import io.constellationnetwork.syntax.sortedCollection.sortedSetSyntax
 
 /** Result of allow spend acceptance containing full state, deltas, and removed keys */
@@ -67,6 +72,25 @@ trait AllowSpendStateManager[F[_]] {
     globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
     lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
   )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
+
+  /** Materialize the full `Option[contract] → user → active-allow-spend-set` view by prefix-scanning the MPT under `(HypergraphNamespace,
+    * fieldId=ActiveAllowSpends)` across all contract scopes. Replaces `lastSnapshotContext.activeAllowSpends` reads in the GSAM hot path so
+    * the accept pipeline no longer depends on the inbound GSI carrying that field.
+    *
+    * Both dimensions of the outer map are recovered from the value: `head.value.currencyId.map(_.value)` for the contract scope (None =
+    * DAG-global, Some(addr) = metagraph-scoped) and `head.value.source` for the user. Every member of a per-key SortedSet shares one
+    * `(currencyId, source)` pair by construction, so taking the head is safe.
+    */
+  def materializeActiveAllowSpendsFromMpt(
+    implicit hasher: Hasher[F]
+  ): F[SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]]
+
+  /** Materialize the full `address → AllowSpendReference` view via the `ActiveAddressIndex` sidecar. The reference value type doesn't carry
+    * `source: Address`, so prefix-scan can't recover keys; instead we read the address set from the sidecar and batch point-read values.
+    */
+  def materializeLastAllowSpendRefsFromMpt(
+    implicit hasher: Hasher[F]
+  ): F[SortedMap[Address, AllowSpendReference]]
 }
 
 object AllowSpendStateManager {
@@ -354,5 +378,36 @@ object AllowSpendStateManager {
         case Some(b) => b.pure[F]
         case None    => mptStore.getBalance(address).map(_.getOrElse(Balance.empty))
       }
+
+    def materializeActiveAllowSpendsFromMpt(
+      implicit hasher: Hasher[F]
+    ): F[SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]] =
+      for {
+        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveAllowSpends)
+        entries <- mptStore.getAllForPrefix[SortedSet[Signed[AllowSpend]]](prefix)
+      } yield
+        entries.values.toList
+          .mapFilter(set => set.headOption.map(h => (h.value.currencyId.map(_.value), h.value.source, set)))
+          .filter(_._3.nonEmpty)
+          .foldLeft(SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]) {
+            case (acc, (contract, source, set)) =>
+              val inner = acc.getOrElse(contract, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
+              acc.updated(contract, inner.updated(source, set))
+          }
+
+    def materializeLastAllowSpendRefsFromMpt(
+      implicit hasher: Hasher[F]
+    ): F[SortedMap[Address, AllowSpendReference]] =
+      for {
+        indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastAllowSpendRefs)
+        addrSet <- mptStore.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
+        addrList = addrSet.toList
+        keys = addrList.map(addr => GlobalStateKey.hypergraph(GlobalStateFieldId.LastAllowSpendRefs, addr))
+        values <- mptStore.getMany[AllowSpendReference](keys)
+      } yield
+        SortedMap.from(addrList.flatMap { addr =>
+          val key = GlobalStateKey.hypergraph(GlobalStateFieldId.LastAllowSpendRefs, addr)
+          values.get(key).map(addr -> _)
+        })
   }
 }

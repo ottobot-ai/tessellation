@@ -18,7 +18,12 @@ import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.tokenLockExpiryKeySetImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{
+  addressSetImmutableCodec,
+  signedTokenLockSetCodec,
+  tokenLockExpiryKeySetImmutableCodec
+}
+import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{immutableCodec => tokenLockReferenceImmutableCodec}
 
 import eu.timepit.refined.types.numeric.NonNegLong
 
@@ -140,6 +145,21 @@ trait TokenLockStateManager[F[_]] {
   def buildActiveTokenLocksByRefFromMpt(
     addresses: Set[Address]
   )(implicit hasher: Hasher[F]): F[Map[Hash, Signed[TokenLock]]]
+
+  /** Materialize the full `address → active-token-lock-set` view by prefix-scanning the MPT under `(HypergraphNamespace,
+    * fieldId=ActiveTokenLocks)`. Replaces `lastSnapshotContext.activeTokenLocks` reads in the GSAM hot path so the accept pipeline no
+    * longer depends on the inbound GSI carrying that field.
+    *
+    * The MPT hex key hashes the address one-way, so addresses are recovered from each value's `Signed[TokenLock].value.source` (every
+    * member of a per-address set shares one source by construction). Empty sets are filtered out — they shouldn't be persisted but the
+    * filter is a cheap safety net for partially-cleaned state.
+    */
+  def materializeActiveTokenLocksFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[TokenLock]]]]
+
+  /** Materialize the full `address → TokenLockReference` view via the `ActiveAddressIndex` sidecar. The reference value type doesn't carry
+    * `source: Address`, so prefix-scan can't recover keys; instead we read the address set from the sidecar and batch point-read values.
+    */
+  def materializeLastTokenLockRefsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, TokenLockReference]]
 }
 
 object TokenLockStateManager {
@@ -575,5 +595,27 @@ object TokenLockStateManager {
         }.flatMap { locks =>
           locks.traverse(lock => lock.toHashed.map(h => h.hash -> lock)).map(_.toMap)
         }
+
+      def materializeActiveTokenLocksFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
+        for {
+          prefix <- GlobalStateKey.hypergraphFieldPrefix[F](GlobalStateFieldId.ActiveTokenLocks)
+          entries <- mptStore.getAllForPrefix[SortedSet[Signed[TokenLock]]](prefix)
+        } yield
+          SortedMap.from(
+            entries.values.toList.mapFilter(set => set.headOption.map(_.value.source -> set)).filter(_._2.nonEmpty)
+          )
+
+      def materializeLastTokenLockRefsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, TokenLockReference]] =
+        for {
+          indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastTokenLockRefs)
+          addrSet <- mptStore.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
+          addrList = addrSet.toList
+          keys = addrList.map(addr => GlobalStateKey.hypergraph(GlobalStateFieldId.LastTokenLockRefs, addr))
+          values <- mptStore.getMany[TokenLockReference](keys)
+        } yield
+          SortedMap.from(addrList.flatMap { addr =>
+            val key = GlobalStateKey.hypergraph(GlobalStateFieldId.LastTokenLockRefs, addr)
+            values.get(key).map(addr -> _)
+          })
     }
 }
