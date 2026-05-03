@@ -17,7 +17,8 @@ const {
     sortedJsonStringify,
     logWorkflow,
     getCombinedSnapshot,
-    isStaleParentError
+    isStaleParentError,
+    isServerRetriable
 } = require('../shared');
 
 const CONSTANTS = {
@@ -1231,18 +1232,37 @@ const sendDataWithSpendTransaction = async (urls, allowSpendHash, sourceAddress,
         proofs: [proof]
     };
 
-    try {
-        logWorkflow.info(`Sending data transaction with spend: ${JSON.stringify(body)}`);
-        const response = await axios.post(`${urls.dataL1Url}/data`, body);
-        logWorkflow.success(`Response: ${JSON.stringify(response.data)}`);
+    // dl1's `/data` POST returns 500 {retriable:true} during the ~10s window after a
+    // StateProofMismatch → recovery → re-bootstrap cycle, when lastGlobalSnapshotStorage
+    // is cleared but the next pullGlobalSnapshots tick hasn't re-bootstrapped yet
+    // (GL0SnapshotOrdinalUnavailable / CurrencySnapshotUnavailable). Honor the server's
+    // retriable contract: retry up to 30s before giving up.
+    const maxAttempts = 30
+    const retryDelayMs = 1000
+    let lastError = null
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            if (attempt === 1) logWorkflow.info(`Sending data transaction with spend: ${JSON.stringify(body)}`);
+            const response = await axios.post(`${urls.dataL1Url}/data`, body);
+            if (attempt > 1) logWorkflow.info(`sendDataWithSpendTransaction: succeeded on attempt ${attempt}/${maxAttempts}`);
+            logWorkflow.success(`Response: ${JSON.stringify(response.data)}`);
 
-        const spendAmount = dataUpdate.UsageUpdateWithSpendTransaction.spendTransactionA.amount;
+            const spendAmount = dataUpdate.UsageUpdateWithSpendTransaction.spendTransactionA.amount;
 
-        return { response: response.data, update: dataUpdate, spendAmount };
-    } catch (e) {
-        logWorkflow.error('Error sending data transaction with spend', e);
-        throw e;
+            return { response: response.data, update: dataUpdate, spendAmount };
+        } catch (e) {
+            lastError = e
+            if (isServerRetriable(e) && attempt < maxAttempts) {
+                const desc = e.response?.data?.description || e.message
+                logWorkflow.warning(`sendDataWithSpendTransaction: server-retriable (${desc}) attempt ${attempt}/${maxAttempts}, retrying in ${retryDelayMs}ms...`);
+                await sleep(retryDelayMs)
+                continue
+            }
+            logWorkflow.error('Error sending data transaction with spend', e);
+            throw e;
+        }
     }
+    throw lastError;
 };
 
 const spendTransactionWorkflow = {
@@ -1843,19 +1863,34 @@ const sendExceedingAmountSpendTransaction = async (urls, allowSpendHash, sourceA
         proofs: [proof]
     };
 
-    try {
-        logWorkflow.info(`Sending data transaction with exceeding spend amount: ${JSON.stringify(body)}`);
-        const response = await axios.post(`${urls.dataL1Url}/data`, body);
-        logWorkflow.success(`Transaction accepted at endpoint level: ${JSON.stringify(response.data)}`);
-        return { 
-            response: response.data, 
-            update: dataUpdate, 
-            spendAmount: dataUpdate.UsageUpdateWithSpendTransaction.spendTransactionA.amount
-        };
-    } catch (error) {
-        logWorkflow.error('Error sending data transaction with exceeding spend amount', error);
-        throw error;
+    // Same dl1 recovery-window race as sendDataWithSpendTransaction — see comment there.
+    const maxAttempts = 30
+    const retryDelayMs = 1000
+    let lastError = null
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            if (attempt === 1) logWorkflow.info(`Sending data transaction with exceeding spend amount: ${JSON.stringify(body)}`);
+            const response = await axios.post(`${urls.dataL1Url}/data`, body);
+            if (attempt > 1) logWorkflow.info(`sendExceedingAmountSpendTransaction: succeeded on attempt ${attempt}/${maxAttempts}`);
+            logWorkflow.success(`Transaction accepted at endpoint level: ${JSON.stringify(response.data)}`);
+            return {
+                response: response.data,
+                update: dataUpdate,
+                spendAmount: dataUpdate.UsageUpdateWithSpendTransaction.spendTransactionA.amount
+            };
+        } catch (error) {
+            lastError = error
+            if (isServerRetriable(error) && attempt < maxAttempts) {
+                const desc = error.response?.data?.description || error.message
+                logWorkflow.warning(`sendExceedingAmountSpendTransaction: server-retriable (${desc}) attempt ${attempt}/${maxAttempts}, retrying in ${retryDelayMs}ms...`);
+                await sleep(retryDelayMs)
+                continue
+            }
+            logWorkflow.error('Error sending data transaction with exceeding spend amount', error);
+            throw error;
+        }
     }
+    throw lastError;
 };
 
 const executeExceedingAmountSpendWorkflow = async () => {

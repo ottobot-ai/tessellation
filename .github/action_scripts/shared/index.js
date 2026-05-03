@@ -1,7 +1,7 @@
 const { parseSharedArgs } = require('./validations')
 const { CONSTANTS, PRIVATE_KEYS } = require('./constants')
 const { generateProof, SerializerType, createSerializer, sortedJsonStringify } = require('./signatures')
-const { sleep, withRetry, withRetryOrdinal, waitForTxInclusion, getLatestSnapshotInfo, getCombinedSnapshot, isStaleParentError, waitForLastRefHash } = require('./operations')
+const { sleep, withRetry, withRetryOrdinal, waitForTxInclusion, getLatestSnapshotInfo, getCombinedSnapshot, isStaleParentError, isServerRetriable, waitForLastRefHash } = require('./operations')
 const { getEpochProgress, createAndConnectAccount, createNetworkConfig } = require('./network')
 const { COLORS, logWorkflow } = require('./logging')
 
@@ -25,6 +25,7 @@ module.exports = {
   getLatestSnapshotInfo,
   getCombinedSnapshot,
   isStaleParentError,
+  isServerRetriable,
   waitForLastRefHash,
 
   getEpochProgress,

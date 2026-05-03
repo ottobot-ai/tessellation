@@ -306,6 +306,23 @@ const isStaleParentError = (error) => {
 }
 
 /**
+ * Detect a server-marked retriable 5xx. The dl1 `/data` endpoint returns 500
+ * with `{retriable: true, description: ...}` for transient conditions like
+ * `GL0SnapshotOrdinalUnavailable` or `CurrencySnapshotUnavailable`, which
+ * happen in a ~10s window during dl1's StateProofMismatch → recovery →
+ * re-bootstrap cycle (lastGlobalSnapshotStorage cleared, next pullGlobalSnapshots
+ * tick re-bootstraps from canonical head). The server is explicitly contracting
+ * "retry me"; honor it.
+ */
+const isServerRetriable = (error) => {
+    const status = error?.response?.status
+    if (status !== 500 && status !== 503) return false
+    const body = error.response?.data
+    if (!body || typeof body !== 'object') return false
+    return body.retriable === true
+}
+
+/**
  * Poll `GET /allow-spends/last-reference/{addr}` until it returns the just-submitted
  * tx's hash, with a hard timeout. Used after a successful submit to gate the next
  * scenario — guarantees the L1 view has caught up before this process exits.
@@ -344,5 +361,6 @@ module.exports = {
     getLatestSnapshotInfo,
     getCombinedSnapshot,
     isStaleParentError,
+    isServerRetriable,
     waitForLastRefHash
 }
