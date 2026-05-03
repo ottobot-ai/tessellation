@@ -71,8 +71,12 @@ if [ "$SKIP_HYPERGRAPH_BUILD" != "true" ]; then
           override_set=true
         fi
         if [ "$override_set" == "false" ]; then
-          echo "Assembling L0 according to default behavior"
-          sbt dagL0/assembly
+          # Default: rebuild BOTH L0 and L1. Either layer can change when node-shared
+          # is touched (e.g. GSAM acceptance logic, validators). Rebuilding only L0
+          # left gl1.jar stale and produced StateProofMismatch on layers running an
+          # older binary than gl0. Mirrors bcbd4877 for the metagraph side.
+          echo "Assembling L0 + L1 according to default behavior"
+          sbt dagL0/assembly dagL1/assembly
         fi
       else
         echo "Found existing assemblies, and skip assembly was set to true"
