@@ -12,7 +12,6 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.collateral.LatestBalances
 import io.constellationnetwork.node.shared.domain.snapshot.storage.LastSnapshotStorage
 import io.constellationnetwork.node.shared.domain.transaction.TransactionValidator
-import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
@@ -50,12 +49,26 @@ object TransactionService {
     def useMptStore(
       transaction: Hashed[Transaction]
     )(implicit hasher: Hasher[F]) =
-      for {
-        maybeSnapshot <- lastSnapshotStorage.get
-        ordinal = maybeSnapshot.map(_.ordinal).getOrElse(SnapshotOrdinal.MinValue)
-        balance <- mptStore.getBalance(transaction.source).map(_.getOrElse(Balance.empty))
-        result <- transactionStorage.tryPut(transaction, ordinal, balance)
-      } yield result
+      // Mirror of the wait pattern in useGlobalSnapshotInfo (see comment there).
+      // The MPT is populated by SnapshotProcessor's updateMptStorage step on
+      // every download/align, but until the first snapshot lands, getBalance
+      // returns None → Balance.empty → InsufficientBalance for genesis-funded
+      // accounts that submit immediately after cluster-ready (currency.js,
+      // token-locks). Wait for the first Some(snapshot) before reading.
+      lastSnapshotStorage.getCombinedStream.collect {
+        case Some((s, _)) => s.ordinal
+      }.changes.switchMap { latestOrdinal =>
+        Stream.eval(
+          mptStore.getBalance(transaction.source).map(_.getOrElse(Balance.empty)).flatMap { balance =>
+            transactionStorage.tryPut(transaction, latestOrdinal, balance)
+          }
+        )
+      }.head.compile.last.flatMap {
+        case Some(value) => value.pure[F]
+        case None =>
+          new Exception(s"Unexpected state, stream should always emit the first snapshot")
+            .raiseError[F, Either[NonEmptyList[ContextualTransactionValidationError], Hash]]
+      }
 
     def useGlobalSnapshotInfo(
       transaction: Hashed[Transaction]
