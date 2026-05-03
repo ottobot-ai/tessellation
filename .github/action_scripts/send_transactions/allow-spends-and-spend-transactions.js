@@ -84,8 +84,26 @@ const transferTokensToCurrencyId = async (urls) => {
         l1Url: urls.currencyL1Url
     })
 
-    await account.transferDag(CONSTANTS.CURRENCY_TOKEN_ID, 1000, 0.1)
-    await metagraphClient.transfer(CONSTANTS.CURRENCY_TOKEN_ID, 1000, 0.1)
+    // Both transfers are idempotent funding for the metagraph. Across test scenarios
+    // the dag4 SDK queries lastReference fresh each call; if a prior scenario already
+    // submitted a tx, the SDK's parent reference may lag and produce a Conflict on the
+    // server. The first scenario funds the metagraph; later scenarios catch and ignore
+    // — the metagraph balance from the earlier funding still applies.
+    const ignoreConflict = async (label, fn) => {
+        try {
+            await fn()
+        } catch (err) {
+            const msg = (err && (err.message || JSON.stringify(err))) || ''
+            if (msg.includes('Conflict')) {
+                logWorkflow.info(`${label}: ignoring expected Conflict — metagraph already funded by earlier scenario`)
+            } else {
+                throw err
+            }
+        }
+    }
+
+    await ignoreConflict('transferDag', () => account.transferDag(CONSTANTS.CURRENCY_TOKEN_ID, 1000, 0.1))
+    await ignoreConflict('metagraphClient.transfer', () => metagraphClient.transfer(CONSTANTS.CURRENCY_TOKEN_ID, 1000, 0.1))
 }
 
 const createAllowSpendTransaction = async (sourceAccount, ammAddress, l1Url, l0Url, isCurrency = false) => {
