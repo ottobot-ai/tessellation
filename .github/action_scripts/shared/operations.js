@@ -281,11 +281,68 @@ const getCombinedSnapshot = async (url, { maxAttempts = 60, interval = 5000 } = 
     }
 };
 
+/**
+ * Detect a "stale parent" race in an axios error response from POST /allow-spends.
+ *
+ * The test code builds AllowSpend bodies with `parent: lastRef` pulled from a
+ * fresh `GET /allow-spends/last-reference/{addr}`. Across scenarios (each
+ * scenario is a separate node process) the L1 may not have materialized the
+ * prior scenario's accepted tx into its allowSpendStorage view by the time the
+ * next process queries — so lastRef.ordinal lags. The submit then fails with
+ * one of three ContextualAllowSpendValidator errors, all unambiguously race-class:
+ *   - ParentOrdinalLowerThenLastProcessedTxOrdinal (note the misspelling in the Scala enum)
+ *   - HasNoMatchingParent
+ *   - Conflict (same ordinal, different hash — happens when two parallel submits land at ord=N+1)
+ * Retrying with a freshly-rebuilt tx is safe; real validation bugs surface as
+ * `InsufficientBalance`, `InvalidSigned`, `TooFarLastValidEpochProgress`, etc.
+ */
+const isStaleParentError = (error) => {
+    if (error?.response?.status !== 400) return false
+    const body = error.response.data
+    const text = typeof body === 'string' ? body : JSON.stringify(body)
+    return text.includes('ParentOrdinalLowerThenLastProcessedTxOrdinal') ||
+           text.includes('HasNoMatchingParent') ||
+           text.includes('Conflict')
+}
+
+/**
+ * Poll `GET /allow-spends/last-reference/{addr}` until it returns the just-submitted
+ * tx's hash, with a hard timeout. Used after a successful submit to gate the next
+ * scenario — guarantees the L1 view has caught up before this process exits.
+ *
+ * Failing loud (throwing on timeout) is intentional: a stuck lastRef is a real
+ * cluster issue worth surfacing, not silently glossing over.
+ */
+const waitForLastRefHash = async (axiosInst, l1Url, address, expectedHash, {
+    timeoutMs = 30000,
+    intervalMs = 200,
+    label = 'waitForLastRefHash'
+} = {}) => {
+    const start = Date.now()
+    let lastSeen = null
+    while (Date.now() - start < timeoutMs) {
+        try {
+            const { data: ref } = await axiosInst.get(`${l1Url}/allow-spends/last-reference/${address}`)
+            lastSeen = ref
+            if (ref?.hash === expectedHash) return ref
+        } catch (_) {
+            // transient — keep polling until timeout
+        }
+        await sleep(intervalMs)
+    }
+    throw new Error(
+        `${label}: lastRef did not advance to ${expectedHash} within ${timeoutMs}ms ` +
+        `(last seen: ${JSON.stringify(lastSeen)})`
+    )
+}
+
 module.exports = {
     sleep,
     withRetry,
     withRetryOrdinal,
     waitForTxInclusion,
     getLatestSnapshotInfo,
-    getCombinedSnapshot
+    getCombinedSnapshot,
+    isStaleParentError,
+    waitForLastRefHash
 }

@@ -16,7 +16,9 @@ const {
     createSerializer,
     sortedJsonStringify,
     logWorkflow,
-    getCombinedSnapshot
+    getCombinedSnapshot,
+    isStaleParentError,
+    waitForLastRefHash
 } = require('../shared');
 
 const CONSTANTS = {
@@ -819,24 +821,63 @@ const executeInvalidSignatureWorkflow = async () => {
 };
 
 const createTransactionHandler = (urls) => {
-    const submitTransaction = async (allowSpend, proof, l1Url) => {
-        try {
-            const body = { value: allowSpend, proofs: [proof] };
-            return await axios.post(`${l1Url}/allow-spends`, body);
-        } catch (error) {
-            console.error('Error sending AllowSpend transaction', error);
-            throw error;
+    // Submit a valid AllowSpend with race-class retry. Each retry rebuilds + re-signs
+    // with a freshly-pulled lastRef, since the L1's allowSpendStorage view can lag a
+    // prior scenario's accepted tx by a snapshot or two. Two retry triggers:
+    //   1. Synchronous: HTTP 400 with `ParentOrdinalLowerThen…` / `HasNoMatchingParent`
+    //      / `Conflict` — the contextual validator caught the stale parent at submit time.
+    //   2. Asynchronous: HTTP 200 returned but lastRef never advances to our hash within
+    //      the timeout — gl1 accepted into the pool then dropped at block formation
+    //      (block-acceptance-level ParentOrdinalBelowLastTxOrdinal). The poll-after-submit
+    //      gate also closes the race for the *next* scenario querying this address.
+    const submitValidTransaction = async (sourceAccount, sourcePrivateKey, l0Url, l1Url, isCurrency, options = {}) => {
+        const { maxAttempts = 3, retryDelayMs = 500, lastRefTimeoutMs = 30000, label = 'submitValidAllowSpend' } = options
+        let lastError = null
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            const allowSpend = await createAllowSpendTransaction(sourceAccount, CONSTANTS.CURRENCY_TOKEN_ID, l1Url, l0Url, isCurrency)
+            const proof = await generateProof(allowSpend, sourcePrivateKey, sourceAccount, SerializerType.BROTLI)
+            const body = { value: allowSpend, proofs: [proof] }
+            try {
+                const response = await axios.post(`${l1Url}/allow-spends`, body)
+                const submittedHash = response.data.hash
+                try {
+                    await waitForLastRefHash(axios, l1Url, sourceAccount.address, submittedHash, {
+                        timeoutMs: lastRefTimeoutMs,
+                        label: `${label}/lastRef`
+                    })
+                    return { allowSpend, response }
+                } catch (waitErr) {
+                    if (attempt < maxAttempts) {
+                        logWorkflow.warning(
+                            `${label}: lastRef did not advance to ${submittedHash} on attempt ${attempt}/${maxAttempts}. ` +
+                            `Tx likely dropped at block formation (stale parent at consensus time). Rebuilding with fresh lastRef.`
+                        )
+                        await sleep(retryDelayMs)
+                        continue
+                    }
+                    throw waitErr
+                }
+            } catch (error) {
+                lastError = error
+                if (isStaleParentError(error) && attempt < maxAttempts) {
+                    logWorkflow.warning(
+                        `${label}: stale-parent race on attempt ${attempt}/${maxAttempts} ` +
+                        `(${JSON.stringify(error.response?.data)}). Retrying with fresh lastRef.`
+                    )
+                    await sleep(retryDelayMs)
+                    continue
+                }
+                console.error('Error sending AllowSpend transaction', error)
+                throw error
+            }
         }
-    };
+        throw lastError
+    }
 
     const sendTransaction = async (sourcePrivateKey, l0Url, l1Url, isCurrency = false) => {
         const sourceAccount = createAndConnectAccount(sourcePrivateKey, { l0Url, l1Url }, isCurrency);
-        const ammAddress = CONSTANTS.CURRENCY_TOKEN_ID;
 
-        const allowSpend = await createAllowSpendTransaction(sourceAccount, ammAddress, l1Url, l0Url, isCurrency);
-        const proof = await generateProof(allowSpend, sourcePrivateKey, sourceAccount, SerializerType.BROTLI);
-
-        const response = await submitTransaction(allowSpend, proof, l1Url);
+        const { allowSpend, response } = await submitValidTransaction(sourceAccount, sourcePrivateKey, l0Url, l1Url, isCurrency)
 
         return {
             address: sourceAccount.address,
