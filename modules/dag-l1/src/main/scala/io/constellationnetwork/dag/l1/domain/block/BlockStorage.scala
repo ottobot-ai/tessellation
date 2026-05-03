@@ -48,6 +48,15 @@ class BlockStorage[F[_]: Sync: Random](blocks: MapRef[F, ProofsHash, Option[Stor
       case other                 => (other, BlockPostponementError(hashedBlock.proofsHash, other).asLeft)
     }.flatMap(_.liftTo[F]).void
 
+  /** Drop a Waiting block — used when acceptance fails with a permanent rejection (chain advanced past this block's position) so it can't
+    * cycle Postponed → relatedPostponed → Waiting → fail → Postponed forever.
+    */
+  private[block] def dropWaiting(proofsHash: ProofsHash): F[Unit] =
+    blocks(proofsHash).update {
+      case Some(WaitingBlock(_)) => None
+      case other                 => other
+    }
+
   def adjustToMajority(
     toAdd: Set[(Hashed[Block], NonNegLong)] = Set.empty,
     toMarkMajority: Set[(ProofsHash, NonNegLong)] = Set.empty,

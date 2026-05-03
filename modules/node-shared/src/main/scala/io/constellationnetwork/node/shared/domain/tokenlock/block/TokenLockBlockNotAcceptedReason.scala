@@ -13,6 +13,18 @@ import derevo.derive
 @derive(eqv, show)
 sealed trait TokenLockBlockNotAcceptedReason
 
+object TokenLockBlockNotAcceptedReason {
+
+  /** Permanent rejections — chain has advanced past this token-lock's chain position; postponing causes the block-acceptance loop to
+    * re-promote it from Postponed → Waiting and retry forever. Mirror of `BlockNotAcceptedReason.isPermanent`.
+    */
+  def isPermanent(reason: TokenLockBlockNotAcceptedReason): Boolean = reason match {
+    case RejectedTokenLock(_, _: ParentOrdinalBelowLastTxOrdinal) => true
+    case RejectedTokenLock(_, _: ParentHashNotEqLastTxHash)       => true
+    case _                                                        => false
+  }
+}
+
 @derive(eqv, show)
 sealed trait TokenLockBlockRejectionReason extends TokenLockBlockNotAcceptedReason
 

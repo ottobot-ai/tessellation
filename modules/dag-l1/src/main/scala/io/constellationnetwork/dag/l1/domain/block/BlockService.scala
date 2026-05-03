@@ -87,10 +87,12 @@ object BlockService {
         } yield ()
       }
 
-      private def processAcceptanceError(hashedBlock: Hashed[Block])(reason: BlockNotAcceptedReason): F[BlockAcceptanceError] =
-        blockStorage
-          .postpone(hashedBlock)
-          .as(BlockAcceptanceError(hashedBlock.ownReference, reason))
+      private def processAcceptanceError(hashedBlock: Hashed[Block])(reason: BlockNotAcceptedReason): F[BlockAcceptanceError] = {
+        val handle =
+          if (BlockNotAcceptedReason.isPermanent(reason)) blockStorage.dropWaiting(hashedBlock.proofsHash)
+          else blockStorage.postpone(hashedBlock)
+        handle.as(BlockAcceptanceError(hashedBlock.ownReference, reason))
+      }
 
     }
 

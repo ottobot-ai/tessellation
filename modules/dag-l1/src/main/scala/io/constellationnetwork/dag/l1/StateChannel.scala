@@ -19,6 +19,7 @@ import cats.syntax.traverseFilter._
 import scala.concurrent.duration.DurationInt
 
 import io.constellationnetwork.dag.l1.config.types.AppConfig
+import io.constellationnetwork.dag.l1.domain.block.BlockService
 import io.constellationnetwork.dag.l1.domain.consensus.block.BlockConsensusInput._
 import io.constellationnetwork.dag.l1.domain.consensus.block.BlockConsensusOutput.{CleanedConsensuses, FinalBlock, NoData}
 import io.constellationnetwork.dag.l1.domain.consensus.block.Validator.{canStartInspectionTrigger, canStartOwnConsensus, isPeerInputValid}
@@ -28,6 +29,7 @@ import io.constellationnetwork.dag.l1.modules._
 import io.constellationnetwork.ext.fs2.StreamOps
 import io.constellationnetwork.kernel.CellError
 import io.constellationnetwork.node.shared.cli.CliMethod
+import io.constellationnetwork.node.shared.domain.block.processing.BlockNotAcceptedReason
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.schema.height.Height
 import io.constellationnetwork.schema.peer.PeerId
@@ -211,14 +213,20 @@ class StateChannel[
                 HasherSelector[F].withCurrent { implicit hasher =>
                   services.block
                     .accept(signedBlock)
-                }.handleErrorWith { error =>
-                  for {
-                    _ <- logger.warn(error)(s"Failed acceptance of a block with ${hash.show}")
-                    _ <- storages.globalL0Alignment.updateShouldRedownload(
-                      value = true,
-                      reasons = List(s"Block acceptance failed for ${hash.show}: ${error.getMessage}")
-                    )
-                  } yield ()
+                }.handleErrorWith {
+                  // Permanent rejection (e.g. lost-consensus orphan whose parent ordinal sits below the chain's
+                  // current lastTxOrdinal): the block was already dropped from Waiting in `processAcceptanceError`,
+                  // and forcing a global redownload won't help — the chain state is fine, our local block was bad.
+                  case e: BlockService.BlockAcceptanceError if BlockNotAcceptedReason.isPermanent(e.reason) =>
+                    logger.warn(s"Permanently rejected block ${hash.show}: ${e.reason} — dropped, no redownload")
+                  case error =>
+                    for {
+                      _ <- logger.warn(error)(s"Failed acceptance of a block with ${hash.show}")
+                      _ <- storages.globalL0Alignment.updateShouldRedownload(
+                        value = true,
+                        reasons = List(s"Block acceptance failed for ${hash.show}: ${error.getMessage}")
+                      )
+                    } yield ()
                 }
           }
           .void

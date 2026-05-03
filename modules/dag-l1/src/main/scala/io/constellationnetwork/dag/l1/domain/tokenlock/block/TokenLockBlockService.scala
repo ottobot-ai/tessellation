@@ -108,10 +108,12 @@ object TokenLockBlockService {
 
       private def processAcceptanceError(
         hashedBlock: Hashed[TokenLockBlock]
-      )(reason: TokenLockBlockNotAcceptedReason): F[TokenLockBlockAcceptanceError] =
-        tokenLockBlockStorage
-          .postpone(hashedBlock)
-          .as(TokenLockBlockAcceptanceError(hashedBlock.proofsHash, reason))
+      )(reason: TokenLockBlockNotAcceptedReason): F[TokenLockBlockAcceptanceError] = {
+        val handle =
+          if (TokenLockBlockNotAcceptedReason.isPermanent(reason)) tokenLockBlockStorage.dropWaiting(hashedBlock.proofsHash)
+          else tokenLockBlockStorage.postpone(hashedBlock)
+        handle.as(TokenLockBlockAcceptanceError(hashedBlock.proofsHash, reason))
+      }
 
     }
 

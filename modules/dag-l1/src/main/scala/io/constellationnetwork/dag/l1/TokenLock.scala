@@ -11,6 +11,7 @@ import scala.concurrent.duration._
 
 import io.constellationnetwork.currency.tokenlock.ConsensusInput.OwnerConsensusInput
 import io.constellationnetwork.currency.tokenlock.{ConsensusInput, ConsensusOutput}
+import io.constellationnetwork.dag.l1.domain.tokenlock.block.TokenLockBlockService
 import io.constellationnetwork.dag.l1.http.p2p.L0BlockOutputClient
 import io.constellationnetwork.dag.l1.modules.{Queues, Services}
 import io.constellationnetwork.node.shared.cli.CliMethod
@@ -19,7 +20,7 @@ import io.constellationnetwork.node.shared.domain.cluster.storage.{ClusterStorag
 import io.constellationnetwork.node.shared.domain.globalAlignment.GlobalL0AlignmentStorage
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage}
-import io.constellationnetwork.node.shared.domain.tokenlock.block.TokenLockBlockStorage
+import io.constellationnetwork.node.shared.domain.tokenlock.block.{TokenLockBlockNotAcceptedReason, TokenLockBlockStorage}
 import io.constellationnetwork.node.shared.domain.tokenlock.consensus.Validator._
 import io.constellationnetwork.node.shared.domain.tokenlock.consensus.config.TokenLockConsensusConfig
 import io.constellationnetwork.node.shared.domain.tokenlock.consensus.{ConsensusClient, ConsensusState, Engine}
@@ -172,14 +173,18 @@ object TokenLock {
             case (hash, signedBlock) =>
               services.tokenLockBlock
                 .accept(signedBlock, SnapshotOrdinal.MinValue)
-                .handleErrorWith { error =>
-                  for {
-                    _ <- logger.warn(error)(s"Failed acceptance of a token lock block with ${hash.show}")
-                    _ <- globalL0AlignmentStorage.updateShouldRedownload(
-                      value = true,
-                      reasons = List(s"Token Lock block acceptance failed for ${hash.show}: ${error.getMessage}")
-                    )
-                  } yield ()
+                .handleErrorWith {
+                  // Permanent rejection — block was already dropped from Waiting in `processAcceptanceError`.
+                  case e: TokenLockBlockService.TokenLockBlockAcceptanceError if TokenLockBlockNotAcceptedReason.isPermanent(e.reason) =>
+                    logger.warn(s"Permanently rejected token lock block ${hash.show}: ${e.reason} — dropped, no redownload")
+                  case error =>
+                    for {
+                      _ <- logger.warn(error)(s"Failed acceptance of a token lock block with ${hash.show}")
+                      _ <- globalL0AlignmentStorage.updateShouldRedownload(
+                        value = true,
+                        reasons = List(s"Token Lock block acceptance failed for ${hash.show}: ${error.getMessage}")
+                      )
+                    } yield ()
                 }
           }
         }.void

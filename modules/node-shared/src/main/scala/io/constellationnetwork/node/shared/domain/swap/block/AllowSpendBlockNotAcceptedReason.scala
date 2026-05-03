@@ -13,6 +13,18 @@ import derevo.derive
 @derive(eqv, show)
 sealed trait AllowSpendBlockNotAcceptedReason
 
+object AllowSpendBlockNotAcceptedReason {
+
+  /** Permanent rejections — chain has advanced past this allow-spend's chain position; postponing causes the block-acceptance loop to
+    * re-promote it from Postponed → Waiting and retry forever. Mirror of `BlockNotAcceptedReason.isPermanent`.
+    */
+  def isPermanent(reason: AllowSpendBlockNotAcceptedReason): Boolean = reason match {
+    case RejectedAllowSpend(_, _: ParentOrdinalBelowLastTxOrdinal) => true
+    case RejectedAllowSpend(_, _: ParentHashNotEqLastTxHash)       => true
+    case _                                                         => false
+  }
+}
+
 @derive(eqv, show)
 sealed trait AllowSpendBlockRejectionReason extends AllowSpendBlockNotAcceptedReason
 

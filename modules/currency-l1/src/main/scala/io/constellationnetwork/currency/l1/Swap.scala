@@ -14,13 +14,14 @@ import io.constellationnetwork.currency.l1.modules.{Queues, Services}
 import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshotInfo, CurrencySnapshotStateProof}
 import io.constellationnetwork.currency.swap.ConsensusInput.OwnerConsensusInput
 import io.constellationnetwork.currency.swap.{ConsensusInput, ConsensusOutput}
+import io.constellationnetwork.dag.l1.domain.swap.block.AllowSpendBlockService
 import io.constellationnetwork.dag.l1.http.p2p.L0BlockOutputClient
 import io.constellationnetwork.node.shared.domain.cluster.storage.{ClusterStorage, L0ClusterStorage}
 import io.constellationnetwork.node.shared.domain.consensus.config.SwapConsensusConfig
 import io.constellationnetwork.node.shared.domain.globalAlignment.GlobalL0AlignmentStorage
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.LastSnapshotStorage
-import io.constellationnetwork.node.shared.domain.swap.block.AllowSpendBlockStorage
+import io.constellationnetwork.node.shared.domain.swap.block.{AllowSpendBlockNotAcceptedReason, AllowSpendBlockStorage}
 import io.constellationnetwork.node.shared.domain.swap.consensus.Validator._
 import io.constellationnetwork.node.shared.domain.swap.consensus.{ConsensusClient, ConsensusState, Engine}
 import io.constellationnetwork.node.shared.domain.swap.{AllowSpendStorage, AllowSpendValidator}
@@ -167,14 +168,19 @@ object Swap {
                 case (hash, signedBlock) =>
                   services.allowSpendBlock
                     .accept(signedBlock, snapshotOrdinal)
-                    .handleErrorWith { error =>
-                      for {
-                        _ <- logger.warn(error)(s"Failed acceptance of an allow spend block with ${hash.show}")
-                        _ <- globalL0AlignmentStorage.updateShouldRedownload(
-                          value = true,
-                          reasons = List(s"Allow spend block acceptance failed for ${hash.show}: ${error.getMessage}")
-                        )
-                      } yield ()
+                    .handleErrorWith {
+                      // Permanent rejection — block was already dropped from Waiting in `processAcceptanceError`.
+                      case e: AllowSpendBlockService.AllowSpendBlockAcceptanceError
+                          if AllowSpendBlockNotAcceptedReason.isPermanent(e.reason) =>
+                        logger.warn(s"Permanently rejected allow spend block ${hash.show}: ${e.reason} — dropped, no redownload")
+                      case error =>
+                        for {
+                          _ <- logger.warn(error)(s"Failed acceptance of an allow spend block with ${hash.show}")
+                          _ <- globalL0AlignmentStorage.updateShouldRedownload(
+                            value = true,
+                            reasons = List(s"Allow spend block acceptance failed for ${hash.show}: ${error.getMessage}")
+                          )
+                        } yield ()
                     }
               }
             }.void

@@ -38,6 +38,15 @@ class TokenLockBlockStorage[F[_]: Sync: Random](blocks: MapRef[F, ProofsHash, Op
       case other                 => (other, BlockPostponementError(hashedBlock.proofsHash, other).asLeft)
     }.flatMap(_.liftTo[F]).void
 
+  /** Drop a Waiting block — used when acceptance fails with a permanent rejection (chain advanced past this block's position). Mirror of
+    * `BlockStorage.dropWaiting`.
+    */
+  def dropWaiting(proofsHash: ProofsHash): F[Unit] =
+    blocks(proofsHash).update {
+      case Some(WaitingBlock(_)) => None
+      case other                 => other
+    }
+
   def adjustToMajority(
     toAdd: Set[Hashed[TokenLockBlock]] = Set.empty,
     toMarkMajority: Set[ProofsHash] = Set.empty,

@@ -17,6 +17,19 @@ import derevo.derive
 @derive(eqv, show)
 sealed trait BlockNotAcceptedReason
 
+object BlockNotAcceptedReason {
+
+  /** Permanent rejections: the block can never become acceptable on the current canonical chain because the chain has already advanced past
+    * the transaction's chain position. Postponing such a block causes it to oscillate between Postponed and Waiting forever, blocking
+    * forward progress (observed: gl1 stuck in 120-cycle redownload loop on a lost-consensus orphan, starving block production).
+    */
+  def isPermanent(reason: BlockNotAcceptedReason): Boolean = reason match {
+    case RejectedTransaction(_, _: ParentOrdinalBelowLastTxOrdinal) => true
+    case RejectedTransaction(_, _: ParentHashNotEqLastTxHash)       => true
+    case _                                                          => false
+  }
+}
+
 @derive(eqv, show, encoder)
 sealed trait BlockRejectionReason extends BlockNotAcceptedReason
 

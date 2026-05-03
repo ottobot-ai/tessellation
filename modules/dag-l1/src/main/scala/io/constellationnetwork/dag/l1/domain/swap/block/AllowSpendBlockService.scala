@@ -108,10 +108,12 @@ object AllowSpendBlockService {
 
       private def processAcceptanceError(
         hashedBlock: Hashed[AllowSpendBlock]
-      )(reason: AllowSpendBlockNotAcceptedReason): F[AllowSpendBlockAcceptanceError] =
-        allowSpendBlockStorage
-          .postpone(hashedBlock)
-          .as(AllowSpendBlockAcceptanceError(hashedBlock.proofsHash, reason))
+      )(reason: AllowSpendBlockNotAcceptedReason): F[AllowSpendBlockAcceptanceError] = {
+        val handle =
+          if (AllowSpendBlockNotAcceptedReason.isPermanent(reason)) allowSpendBlockStorage.dropWaiting(hashedBlock.proofsHash)
+          else allowSpendBlockStorage.postpone(hashedBlock)
+        handle.as(AllowSpendBlockAcceptanceError(hashedBlock.proofsHash, reason))
+      }
 
     }
 
