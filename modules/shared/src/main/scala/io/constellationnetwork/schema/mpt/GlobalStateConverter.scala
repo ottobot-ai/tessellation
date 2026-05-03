@@ -76,7 +76,7 @@ object GlobalStateConverter {
       SystemIndexDelta.empty[NodeCollateralWithdrawalExpiryKey],
     removedAllowSpendKeys: Set[(Option[Address], Address)] = Set.empty,
     removedTokenLockKeys: Set[Address] = Set.empty,
-    removedTokenLockBalanceKeys: Set[Address] = Set.empty,
+    removedTokenLockBalanceKeys: Set[(Address, Address)] = Set.empty,
     removedDelegatedStakeKeys: Set[Address] = Set.empty,
     removedDelegatedStakeWithdrawalKeys: Set[Address] = Set.empty,
     removedNodeCollateralKeys: Set[Address] = Set.empty,
@@ -712,7 +712,7 @@ object GlobalStateConverter {
         acc.tokenLockBalances.iterator.flatMap {
           case (mid, inner) => inner.keysIterator.map(holder => (mid, holder))
         }.toSet,
-        Set.empty,
+        acc.removedTokenLockBalanceKeys,
         preSyncBytes
       )
     } yield
@@ -836,7 +836,9 @@ object GlobalStateConverter {
       case (metagraphIdOpt, address) => GlobalStateKey.hypergraph(ActiveAllowSpends, metagraphIdOpt, address)
     }
     val tokenLockKeys = acc.removedTokenLockKeys.toList.map(addr => GlobalStateKey.hypergraph(ActiveTokenLocks, addr))
-    val tokenLockBalanceKeys = acc.removedTokenLockBalanceKeys.toList.map(addr => GlobalStateKey.hypergraph(TokenLockBalances, addr))
+    val tokenLockBalanceKeys = acc.removedTokenLockBalanceKeys.toList.map {
+      case (mid, holder) => GlobalStateKey.hypergraph(TokenLockBalances, mid, holder)
+    }
     val delegatedStakeKeys = acc.removedDelegatedStakeKeys.toList.map(addr => GlobalStateKey.hypergraph(ActiveDelegatedStakes, addr))
     val delegatedStakeWithdrawalKeys =
       acc.removedDelegatedStakeWithdrawalKeys.toList.map(addr => GlobalStateKey.hypergraph(DelegatedStakesWithdrawals, addr))
@@ -1449,8 +1451,8 @@ object GlobalStateConverter {
           val tokenLockKeys = acc.removedTokenLockKeys.map { address =>
             GlobalStateKey.hypergraph(ActiveTokenLocks, address)
           }
-          val tokenLockBalanceKeys = acc.removedTokenLockBalanceKeys.map { metagraphAddress =>
-            GlobalStateKey.hypergraph(TokenLockBalances, metagraphAddress)
+          val tokenLockBalanceKeys = acc.removedTokenLockBalanceKeys.map {
+            case (mid, holder) => GlobalStateKey.hypergraph(TokenLockBalances, mid, holder)
           }
           val delegatedStakeKeys = acc.removedDelegatedStakeKeys.map { address =>
             GlobalStateKey.hypergraph(ActiveDelegatedStakes, address)
@@ -1651,16 +1653,17 @@ object GlobalStateConverter {
             acc.lastCurrencySnapshots.keySet.toSet,
             Set.empty
           )
-          // Address-pair index for `tokenLockBalances` — `(metagraphAddr, holderAddr)` pairs. Same append-only
-          // discipline; materializeTokenLockBalancesFromMpt point-reads each pair and skips Nones, so stale
-          // pairs in the sidecar self-prune at the read boundary.
+          // Address-pair index for `tokenLockBalances` — `(metagraphAddr, holderAddr)` pairs. Adds come from this
+          // ordinal's deltas; removes come from the manager's pair-shaped `removedTokenLockBalanceKeys` so the
+          // sidecar prunes in lock-step with the actual MPT entry deletes (otherwise materialize keeps re-reading
+          // the stale pair and the diff loop re-emits the same removal every ordinal).
           _ <- applyAddressPairIndexDelta[F](
             store,
             TokenLockBalances,
             acc.tokenLockBalances.iterator.flatMap {
               case (mid, inner) => inner.keysIterator.map(holder => (mid, holder))
             }.toSet,
-            Set.empty
+            acc.removedTokenLockBalanceKeys
           )
 
           _ <- store.commit(snapshotOrdinal)

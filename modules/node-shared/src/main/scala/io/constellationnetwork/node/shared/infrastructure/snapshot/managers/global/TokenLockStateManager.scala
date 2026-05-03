@@ -45,17 +45,23 @@ case class TokenLockAcceptanceDeltas(
   expiryIndexDelta: SystemIndexDelta[TokenLockExpiryKey] = SystemIndexDelta.empty[TokenLockExpiryKey]
 )
 
-/** Result of token lock balance update containing full state, deltas, and removed keys */
+/** Result of token lock balance update containing full state, deltas, and removed keys.
+  *
+  * `removedKeys` is a `Set[(metagraphAddr, holderAddr)]` — pairs whose balance entry was present in the prior MPT state but is absent from
+  * the post-accept full state. Pair shape mirrors the actual MPT key (`GlobalStateKey.hypergraph(TokenLockBalances, mid, holder)`), so the
+  * syncFromStateChanges removal targets a real key and the address-pair sidecar can prune the same pair. Using a mid-only `Set[Address]`
+  * would target nothing and the entry would persist forever, surfacing as gl1 verify-replay mptRoot drift on every sc-event ordinal.
+  */
 case class TokenLockBalanceResult(
   fullState: SortedMap[Address, SortedMap[Address, Balance]],
   deltas: SortedMap[Address, SortedMap[Address, Balance]],
-  removedKeys: Set[Address] = Set.empty
+  removedKeys: Set[(Address, Address)] = Set.empty
 )
 
 /** Deltas-only result for the MPT-backed token-lock-balances path (#85). */
 case class TokenLockBalanceDeltas(
   deltas: SortedMap[Address, SortedMap[Address, Balance]],
-  removedKeys: Set[Address] = Set.empty
+  removedKeys: Set[(Address, Address)] = Set.empty
 )
 
 trait TokenLockStateManager[F[_]] {
@@ -463,8 +469,9 @@ object TokenLockStateManager {
             (metagraphId, metagraphTokenLocksAmounts).pure[F]
         }.map { entries =>
           val deltasMap = SortedMap.from(entries.filter(_._2.nonEmpty))
-          val removedMids: Set[Address] = entries.collect { case (mid, balances) if balances.isEmpty => mid }.toSet
-          TokenLockBalanceDeltas(deltas = deltasMap, removedKeys = removedMids)
+          // Pair-shaped removals require knowing prior holders for each mid; this F-returning helper doesn't carry
+          // that input today. Left empty until a caller actually consumes this and threads in prior MPT state.
+          TokenLockBalanceDeltas(deltas = deltasMap, removedKeys = Set.empty)
         }
 
       def updateTokenLockBalances(
@@ -501,10 +508,16 @@ object TokenLockStateManager {
         val cleanedFullState = fullState.filter { case (_, balances) => balances.nonEmpty }
         val cleanedDeltas = deltas.filter { case (_, balances) => balances.nonEmpty }
 
-        // Compute removed keys: metagraph addresses that had balances but now have empty or missing maps
-        val removedKeys: Set[Address] = lastTokenLockBalances.collect {
-          case (metagraphId, balances) if balances.nonEmpty && !cleanedFullState.get(metagraphId).exists(_.nonEmpty) =>
-            metagraphId
+        // Pair-shaped removals: enumerate every (mid, holder) that was present in the prior state but is
+        // absent from the post-accept state. Mirrors AllowSpend's `(metagraphIdOpt, address)` enumeration —
+        // mid-only removals would target the wrong MPT key shape (writes use `hypergraph(TokenLockBalances,
+        // mid, holder)`) and the entries would persist, replaying as a stale "removed" delta every ordinal.
+        val removedKeys: Set[(Address, Address)] = lastTokenLockBalances.iterator.flatMap {
+          case (metagraphId, priorBalances) =>
+            val updatedBalances = cleanedFullState.getOrElse(metagraphId, SortedMap.empty[Address, Balance])
+            priorBalances.iterator.collect {
+              case (holder, _) if !updatedBalances.contains(holder) => (metagraphId, holder)
+            }
         }.toSet
 
         TokenLockBalanceResult(cleanedFullState, cleanedDeltas, removedKeys)
