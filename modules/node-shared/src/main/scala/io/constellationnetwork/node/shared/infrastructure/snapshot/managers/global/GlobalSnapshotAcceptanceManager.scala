@@ -1300,19 +1300,25 @@ object GlobalSnapshotAcceptanceManager {
             // === MPT Sync with undo journal ===
             // Before applying deltas, detect fork switches: if the journal tip doesn't
             // match ordinal-1 (the parent), the MPT has state from a different fork.
-            // Reset MPT to the parent state first, then apply deltas incrementally.
+            // Roll the journal back to the immediate parent (ordinal-1), which reverse-applies
+            // the local-fork ordinals via the recorded undo entries. This restores MPT to
+            // the parent's state WITHOUT consulting `lastSnapshotContext` — the journal is
+            // the source of truth for undo. Trusting `lastSnapshotContext` here was the bug:
+            // each gl0 carries its own local-fork GSI, so reseeding from it propagates the
+            // divergence cluster-wide (observed at 9 ords/run in DoubleUseAllowSpend e2e
+            // 2026-05-02, ords 100/203/284/323/325/401/438/508/516).
+            //
+            // Single-ordinal forks resolve completely. Multi-ordinal forks would require
+            // unwinding past the immediate parent — a follow-up if observed.
             _ <- undoJournal match {
               case Some(journal) =>
                 journal.currentTipOrdinal.flatMap {
                   case Some(tipOrd) if tipOrd != ordinal.value.value - 1 =>
-                    // Fork switch: journal tip at ordinal $tipOrd but parent should be ordinal-1.
-                    // Roll back journal to clear stale fork entries, then reset MPT to parent state.
                     loggerBundle.app.info(
                       s"[ACCEPTANCE] ordinal=$ordinal fork switch detected: journalTip=$tipOrd, expected=${ordinal.value.value - 1}. " +
-                        s"Resetting MPT to parent state before applying deltas."
+                        s"Rolling journal back to ordinal=${ordinal.value.value - 1} (reverse-apply local-fork entries)."
                     ) >>
-                      journal.unapplyTo(0) >>
-                      mptStore.syncFromGlobalSnapshotInfo(lastSnapshotContext, SnapshotOrdinal.unsafeApply(ordinal.value.value - 1))
+                      journal.unapplyTo(ordinal.value.value - 1).void
                   case _ =>
                     Async[F].unit // aligned, no rollback needed
                 }
