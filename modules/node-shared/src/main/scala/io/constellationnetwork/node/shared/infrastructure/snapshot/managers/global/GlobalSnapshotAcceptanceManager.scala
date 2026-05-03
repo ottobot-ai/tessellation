@@ -841,7 +841,13 @@ object GlobalSnapshotAcceptanceManager {
               withdrawalRewardTxs ++ nodeOperatorRewards ++ reservedAddressRewards
             )
 
-            globalBalances = SortedMap(none[Address] -> updatedBalancesByRewards)
+            // `updatedBalancesByRewards` carries only addresses touched by this ordinal's blocks/rewards. The
+            // SpendActionValidator consumes this via `getOrElse(addr, Balance.empty)` and treats absence as zero,
+            // so a metagraph self-spend (`spendTransactionB` with no allowSpendRef) whose DAG balance was funded
+            // in a PRIOR ordinal would always reject as `NotEnoughCurrencyIdBalance{balance: 0}`. Merge with
+            // `priorBalances` (full prior-ordinal map from MPT, materialized at line 747) so the validator
+            // sees the cumulative state. Mirrors the GSI-store merge at line 1150.
+            globalBalances = SortedMap(none[Address] -> (priorBalances ++ updatedBalancesByRewards))
 
             // Use SortedMap for deterministic validation ordering across all peers.
             spendActions = sharedArtifacts
