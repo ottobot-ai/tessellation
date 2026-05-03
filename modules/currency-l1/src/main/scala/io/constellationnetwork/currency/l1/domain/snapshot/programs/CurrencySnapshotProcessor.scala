@@ -155,7 +155,16 @@ object CurrencySnapshotProcessor {
                       lastNGlobalSnapshotStorage.clear
                         .as[SnapshotProcessingResult](SnapshotIgnored(globalSnapshotReference))
                 }
-              case None => (new Throwable("unexpected state")).raiseError[F, SnapshotProcessingResult]
+              case None =>
+                // Storage was cleared by the NotNext branch above (or by recoverFromOrphan + a
+                // subsequent NotNext). The remaining snapshots in this batch can't process —
+                // there's no `lastGlobalSnapshot` to validate against. Drain them as
+                // SnapshotIgnored so the next `pullGlobalSnapshots` tick bootstraps fresh via
+                // the Left branch (line 79). Throwing here stalls dl1 entirely: the
+                // performSnapshotsBatchProcessing catch-all logs "Failed to process snapshot,
+                // skipping" but lastGlobalSnapshot stays None forever, so /data POSTs return
+                // 500 "Last Global Snapshot ordinal not available" and downstream tests fail.
+                Async[F].pure[SnapshotProcessingResult](SnapshotIgnored(globalSnapshotReference))
             }
         }
 
