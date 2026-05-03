@@ -17,8 +17,7 @@ const {
     sortedJsonStringify,
     logWorkflow,
     getCombinedSnapshot,
-    isStaleParentError,
-    waitForLastRefHash
+    isStaleParentError
 } = require('../shared');
 
 const CONSTANTS = {
@@ -821,17 +820,27 @@ const executeInvalidSignatureWorkflow = async () => {
 };
 
 const createTransactionHandler = (urls) => {
-    // Submit a valid AllowSpend with race-class retry. Each retry rebuilds + re-signs
-    // with a freshly-pulled lastRef, since the L1's allowSpendStorage view can lag a
-    // prior scenario's accepted tx by a snapshot or two. Two retry triggers:
-    //   1. Synchronous: HTTP 400 with `ParentOrdinalLowerThen…` / `HasNoMatchingParent`
-    //      / `Conflict` — the contextual validator caught the stale parent at submit time.
-    //   2. Asynchronous: HTTP 200 returned but lastRef never advances to our hash within
-    //      the timeout — gl1 accepted into the pool then dropped at block formation
-    //      (block-acceptance-level ParentOrdinalBelowLastTxOrdinal). The poll-after-submit
-    //      gate also closes the race for the *next* scenario querying this address.
+    // Submit a valid AllowSpend with race-class retry on the contextual validator.
+    // Each retry rebuilds + re-signs with a freshly-pulled lastRef. The L1's
+    // `allowSpendStorage.getLastProcessedAllowSpend` view can lag a prior scenario's
+    // accepted tx by a snapshot or two — across separate scenario processes the
+    // SDK / direct test code may build a tx with parent.ordinal=N when the L1 has
+    // already advanced lastTxOrdinal=N+1. The submit then fails with one of:
+    //   - ParentOrdinalLowerThenLastProcessedTxOrdinal
+    //   - HasNoMatchingParent
+    //   - Conflict
+    // All three unambiguously indicate stale lastRef; retrying can't mask a real
+    // validation bug (those surface as InsufficientBalance / InvalidSigned /
+    // TooFarLastValidEpochProgress and propagate immediately).
+    //
+    // Note: we deliberately do NOT poll lastRef after a successful submit. The
+    // existing scenario assertions (`verifyInL1` against the waiting pool,
+    // `verifyInL0` against the global snapshot) take 30+ seconds of natural
+    // wall-clock time, which is more than enough for L1's allowSpendStorage view
+    // to catch up before the next scenario starts. Polling would actively break
+    // verifyInL1, which expects the AllowSpend to still be in `findWaiting`.
     const submitValidTransaction = async (sourceAccount, sourcePrivateKey, l0Url, l1Url, isCurrency, options = {}) => {
-        const { maxAttempts = 3, retryDelayMs = 500, lastRefTimeoutMs = 30000, label = 'submitValidAllowSpend' } = options
+        const { maxAttempts = 3, retryDelayMs = 500, label = 'submitValidAllowSpend' } = options
         let lastError = null
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             const allowSpend = await createAllowSpendTransaction(sourceAccount, CONSTANTS.CURRENCY_TOKEN_ID, l1Url, l0Url, isCurrency)
@@ -839,24 +848,7 @@ const createTransactionHandler = (urls) => {
             const body = { value: allowSpend, proofs: [proof] }
             try {
                 const response = await axios.post(`${l1Url}/allow-spends`, body)
-                const submittedHash = response.data.hash
-                try {
-                    await waitForLastRefHash(axios, l1Url, sourceAccount.address, submittedHash, {
-                        timeoutMs: lastRefTimeoutMs,
-                        label: `${label}/lastRef`
-                    })
-                    return { allowSpend, response }
-                } catch (waitErr) {
-                    if (attempt < maxAttempts) {
-                        logWorkflow.warning(
-                            `${label}: lastRef did not advance to ${submittedHash} on attempt ${attempt}/${maxAttempts}. ` +
-                            `Tx likely dropped at block formation (stale parent at consensus time). Rebuilding with fresh lastRef.`
-                        )
-                        await sleep(retryDelayMs)
-                        continue
-                    }
-                    throw waitErr
-                }
+                return { allowSpend, response }
             } catch (error) {
                 lastError = error
                 if (isStaleParentError(error) && attempt < maxAttempts) {
