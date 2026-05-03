@@ -172,9 +172,9 @@ if [ -n "$METAGRAPH" ]; then
         override_set=true
       fi
       if [ "$override_set" == "false" ]; then
-        echo "Assembling ML0 according to default behavior"
-        echo "Assembling currencyL0 with explicit version: $TESSELLATION_VERSION"
-        sbt --error currencyL0/assembly
+        echo "Assembling all metagraph modules (default behavior)"
+        echo "Assembling with explicit version: $TESSELLATION_VERSION"
+        assemble_all_metagraph
       fi
     else
       echo "Found existing assemblies, and skip assembly was set to true"
