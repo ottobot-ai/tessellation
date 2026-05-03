@@ -1,6 +1,6 @@
 const http = require('http')
 const { dag4 } = require('@stardust-collective/dag4')
-const { parseSharedArgs, logWorkflow } = require('../shared')
+const { parseSharedArgs, logWorkflow, isStaleParentError } = require('../shared')
 
 const createConfig = () => {
   const args = process.argv.slice(2)
@@ -118,6 +118,24 @@ const waitForGL0MetagraphAlignment = async (gl0Url, metagraphAddress, ordinalBef
   logMessage(`GL0 metagraph alignment timeout — proceeding anyway`)
 }
 
+// Detect race-class errors that surface from the dag4 SDK or gl1 contextual
+// validator. The SDK's `generateBatchTransactions` queries `lastReference`
+// fresh — if gl1's view lags a prior scenario's accepted tx by a snapshot or
+// two, the chain it builds has a stale parent. Three error shapes can come
+// back from `sendBatchTransactions`: ContextualValidator 400 with one of
+// `ParentOrdinalLowerThenLastProcessedTxOrdinal`, `HasNoMatchingParent`,
+// `Conflict`, OR a chain-acceptance-time `ParentOrdinalBelowLastTxOrdinal`
+// surfaced as a thrown SDK error string. All three are unambiguously
+// stale-lastRef; rebuilding with a fresh query is safe.
+const isSdkStaleParentError = (error) => {
+  if (isStaleParentError(error)) return true
+  const msg = (error && (error.message || String(error))) || ''
+  return msg.includes('ParentOrdinalBelowLastTxOrdinal') ||
+         msg.includes('ParentOrdinalLowerThenLastProcessedTxOrdinal') ||
+         msg.includes('HasNoMatchingParent') ||
+         msg.includes('Conflict')
+}
+
 const batchTransaction = async (
   origin,
   destination,
@@ -125,32 +143,47 @@ const batchTransaction = async (
   fee = 1,
   num = 100,
 ) => {
-  try {
-    const txnsData = []
-    for (let idx = 0; idx < num; idx++) {
-      const txnBody = {
-        address: destination.address,
-        amount,
-        fee,
+  const maxAttempts = 3
+  const retryDelayMs = 1000
+  let lastError = null
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const txnsData = []
+      for (let idx = 0; idx < num; idx++) {
+        const txnBody = {
+          address: destination.address,
+          amount,
+          fee,
+        }
+
+        txnsData.push(txnBody)
       }
 
-      txnsData.push(txnBody)
+      const generatedTransactions = await origin.generateBatchTransactions(
+        txnsData,
+      )
+
+      const hashes = await origin.sendBatchTransactions(generatedTransactions)
+
+      logMessage(
+        `DAG transaction from: ${origin.address} sent - batch of ${num}.`,
+      )
+
+      return hashes
+    } catch (e) {
+      lastError = e
+      if (isSdkStaleParentError(e) && attempt < maxAttempts) {
+        logMessage(
+          `batchTransaction: stale-parent race on attempt ${attempt}/${maxAttempts} ` +
+          `(${e.message || e}). Retrying with fresh lastRef.`
+        )
+        await sleep(retryDelayMs)
+        continue
+      }
+      throw Error(`Error when sending batch transaction: ${e}`)
     }
-
-    const generatedTransactions = await origin.generateBatchTransactions(
-      txnsData,
-    )
-
-    const hashes = await origin.sendBatchTransactions(generatedTransactions)
-
-    logMessage(
-      `DAG transaction from: ${origin.address} sent - batch of ${num}.`,
-    )
-
-    return hashes
-  } catch (e) {
-    throw Error(`Error when sending batch transaction: ${e}`)
   }
+  throw Error(`Error when sending batch transaction after ${maxAttempts} attempts: ${lastError}`)
 }
 
 const batchMetagraphTransaction = async (
@@ -161,34 +194,49 @@ const batchMetagraphTransaction = async (
   fee = 1,
   num = 100,
 ) => {
-  try {
-    const txnsData = []
-    for (let idx = 0; idx < num; idx++) {
-      const txnBody = {
-        address: destination.address,
-        amount,
-        fee,
+  const maxAttempts = 3
+  const retryDelayMs = 1000
+  let lastError = null
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const txnsData = []
+      for (let idx = 0; idx < num; idx++) {
+        const txnBody = {
+          address: destination.address,
+          amount,
+          fee,
+        }
+
+        txnsData.push(txnBody)
       }
 
-      txnsData.push(txnBody)
+      const generatedTransactions = await metagraphTokenClient.generateBatchTransactions(
+        txnsData,
+      )
+
+      const hashes = await metagraphTokenClient.sendBatchTransactions(
+        generatedTransactions,
+      )
+
+      logMessage(
+        `L0 token transaction from: ${origin.address} sent - batch of ${num}.`,
+      )
+
+      return hashes
+    } catch (e) {
+      lastError = e
+      if (isSdkStaleParentError(e) && attempt < maxAttempts) {
+        logMessage(
+          `batchMetagraphTransaction: stale-parent race on attempt ${attempt}/${maxAttempts} ` +
+          `(${e.message || e}). Retrying with fresh lastRef.`
+        )
+        await sleep(retryDelayMs)
+        continue
+      }
+      throw Error(`Error when sending batch transaction: ${e}`)
     }
-
-    const generatedTransactions = await metagraphTokenClient.generateBatchTransactions(
-      txnsData,
-    )
-
-    const hashes = await metagraphTokenClient.sendBatchTransactions(
-      generatedTransactions,
-    )
-
-    logMessage(
-      `L0 token transaction from: ${origin.address} sent - batch of ${num}.`,
-    )
-
-    return hashes
-  } catch (e) {
-    throw Error(`Error when sending batch transaction: ${e}`)
   }
+  throw Error(`Error when sending batch transaction after ${maxAttempts} attempts: ${lastError}`)
 }
 
 const handleBatchTransactions = async (
