@@ -280,11 +280,14 @@ object GlobalSnapshotContextFunctions {
               claimed = signedArtifact.stateProof
             )
           )
+          val perFieldDiffs = perFieldRootDiffs(computedStateProof, signedArtifact.stateProof)
+          val diffSuffix = if (perFieldDiffs.isEmpty) "" else s" — diffs: ${perFieldDiffs.mkString(", ")}"
           (logger.error(
             s"StateProofMismatch at ordinal=${signedArtifact.ordinal.show}: " +
               s"computed.mptRoot=${computedStateProof.mptRoot.map(_.show.take(12)).getOrElse("none")} " +
-              s"claimed.mptRoot=${signedArtifact.stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")} — " +
-              s"rolling back MPT to pre-accept savepoint"
+              s"claimed.mptRoot=${signedArtifact.stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")}" +
+              diffSuffix +
+              s" — rolling back MPT to pre-accept savepoint"
           ) >> restore >> raise).whenA(mismatch)
         }
 
@@ -325,5 +328,53 @@ object GlobalSnapshotContextFunctions {
       val lRoot = claimed.mptRoot.map(_.show.take(12)).getOrElse("none")
       s"StateProofMismatch at ordinal=${ordinal.show}: computed.mptRoot=$cRoot claimed.mptRoot=$lRoot"
     }
+  }
+
+  // Field-level diff between two GlobalSnapshotStateProofs. Returns one entry per differing field so that the
+  // mismatch log identifies WHICH subtree diverged, not just that the top-level mptRoot differs. This is a
+  // pure helper — extracted so the unit tests (and operators reading logs) can correlate divergence to a
+  // specific manager. Adding a new GlobalSnapshotStateProof field requires adding a row here.
+  private[snapshot] def perFieldRootDiffs(
+    computed: GlobalSnapshotStateProof,
+    claimed: GlobalSnapshotStateProof
+  ): List[String] = {
+    def shortHash(h: io.constellationnetwork.security.hash.Hash): String = h.show.take(12)
+    def shortMerkle(m: io.constellationnetwork.merkletree.MerkleRoot): String = m.show.take(12)
+    def diffHash(
+      label: String,
+      a: io.constellationnetwork.security.hash.Hash,
+      b: io.constellationnetwork.security.hash.Hash
+    ): Option[String] =
+      if (a === b) None else Some(s"$label(c=${shortHash(a)},l=${shortHash(b)})")
+    def diffOptHash(
+      label: String,
+      a: Option[io.constellationnetwork.security.hash.Hash],
+      b: Option[io.constellationnetwork.security.hash.Hash]
+    ): Option[String] =
+      if (a === b) None else Some(s"$label(c=${a.map(shortHash).getOrElse("none")},l=${b.map(shortHash).getOrElse("none")})")
+    def diffOptMerkle(
+      label: String,
+      a: Option[io.constellationnetwork.merkletree.MerkleRoot],
+      b: Option[io.constellationnetwork.merkletree.MerkleRoot]
+    ): Option[String] =
+      if (a === b) None else Some(s"$label(c=${a.map(shortMerkle).getOrElse("none")},l=${b.map(shortMerkle).getOrElse("none")})")
+    List(
+      diffHash("lastStateChannelSnapshotHashes", computed.lastStateChannelSnapshotHashesProof, claimed.lastStateChannelSnapshotHashesProof),
+      diffHash("lastTxRefs", computed.lastTxRefsProof, claimed.lastTxRefsProof),
+      diffHash("balances", computed.balancesProof, claimed.balancesProof),
+      diffOptMerkle("lastCurrencySnapshots", computed.lastCurrencySnapshotsProof, claimed.lastCurrencySnapshotsProof),
+      diffOptHash("activeAllowSpends", computed.activeAllowSpends, claimed.activeAllowSpends),
+      diffOptHash("activeTokenLocks", computed.activeTokenLocks, claimed.activeTokenLocks),
+      diffOptHash("tokenLockBalances", computed.tokenLockBalances, claimed.tokenLockBalances),
+      diffOptHash("lastAllowSpendRefs", computed.lastAllowSpendRefs, claimed.lastAllowSpendRefs),
+      diffOptHash("lastTokenLockRefs", computed.lastTokenLockRefs, claimed.lastTokenLockRefs),
+      diffOptHash("updateNodeParameters", computed.updateNodeParameters, claimed.updateNodeParameters),
+      diffOptHash("activeDelegatedStakes", computed.activeDelegatedStakes, claimed.activeDelegatedStakes),
+      diffOptHash("delegatedStakesWithdrawals", computed.delegatedStakesWithdrawals, claimed.delegatedStakesWithdrawals),
+      diffOptHash("activeNodeCollaterals", computed.activeNodeCollaterals, claimed.activeNodeCollaterals),
+      diffOptHash("nodeCollateralWithdrawals", computed.nodeCollateralWithdrawals, claimed.nodeCollateralWithdrawals),
+      diffOptHash("priceState", computed.priceState, claimed.priceState),
+      diffOptHash("lastGlobalSnapshotsWithCurrency", computed.lastGlobalSnapshotsWithCurrency, claimed.lastGlobalSnapshotsWithCurrency)
+    ).flatten
   }
 }
