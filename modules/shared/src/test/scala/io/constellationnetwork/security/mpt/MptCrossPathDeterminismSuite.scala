@@ -184,6 +184,14 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
   private def bytesEntriesEq(a: Map[Hex, Array[Byte]], b: Map[Hex, Array[Byte]]): Boolean =
     a.view.mapValues(_.toVector).toMap == b.view.mapValues(_.toVector).toMap
 
+  /** Filter to only "user" entries, dropping the `SystemNamespace` sidecar (ActiveAddressIndex, expiry indices, …). `GlobalStateKey.toHex`
+    * encodes the namespace's `keyType` byte as the first 2 hex chars (see `PartitionKeyType`): `00` Hypergraph, `01` Metagraph/Address,
+    * `02` Hash, `03` System. Path C (`syncFull[V]`) does not maintain sidecars, so direct byte comparison against path A
+    * (`syncFromStateChanges`, which does) requires filtering the sidecar (`03…`) entries out of A first.
+    */
+  private def userEntriesOnly(bytes: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
+    bytes.filter { case (k, _) => !k.value.startsWith("03") }
+
   /** Lift a property over a `GsiSlice` into a Weaver assertion that the four cross-comparable paths (A/B/D/E) agree on root and entry
     * bytes. "Agree" includes the empty case — when the slice is empty, all paths return `None` (build errors with "no entries"), which is
     * consistent and therefore acceptable. Path C is exercised separately because it operates on a single field type at a time.
@@ -265,10 +273,13 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
   }
 
   /** Path C: per-field `syncFull[Balance]`. The store is cleared on every call, so we exercise `syncFull` only as a single-field-type
-    * primitive — not as a GSI rebuild path. The check is: `syncFull[Balance](balances)` produces the same root as building a slice via path
-    * A that contains *only* those balances. Empty slices fall through to all-`None` agreement, same as the cross-path tests.
+    * primitive — not as a GSI rebuild path. The check is: `syncFull[Balance](balances)` produces the same set of *user* entries as
+    * `syncFromStateChanges` for a balances-only slice. `syncFromStateChanges` additionally maintains the `ActiveAddressIndex` sidecar
+    * (added in `40d6f957`), which `syncFull` does not write — those sidecar entries are filtered before comparing. Roots therefore can
+    * differ: path A's root covers user-entries-plus-sidecar; path C's covers user-entries-only. The test asserts user-byte equality, which
+    * is the semantic invariant `syncFull` is meant to honour.
     */
-  test("path C (syncFull[Balance]) matches delta-apply for the balances-only slice") { res =>
+  test("path C (syncFull[Balance]) matches delta-apply user entries for the balances-only slice") { res =>
     implicit val (j, h, _) = res
     val ordinal = SnapshotOrdinal(NonNegLong(1000L))
     forall(gsiSliceGen) { slice =>
@@ -285,14 +296,9 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
         }.toMap
         cStore <- freshStore
         _ <- cStore.syncFull[Balance](keyedBalances, ordinal)
-        cTrie <- cStore.build(ordinal)
+        _ <- cStore.build(ordinal)
         cBytes <- cStore.allEntriesAsBytes
-        cRoot = cTrie.toOption.map(_.rootHash)
-      } yield
-        expect.all(
-          a._1 == cRoot,
-          bytesEntriesEq(a._2, cBytes)
-        )
+      } yield expect(bytesEntriesEq(userEntriesOnly(a._2), cBytes))
     }
   }
 
@@ -324,6 +330,9 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
   /** Single concrete sanity case: 1 balance, 1 lastTxRef, 1 stateChanHash. Asserts the root is non-empty (excluded from the property-based
     * tests because empty slices fall through to all-`None` agreement). Pinning a concrete case here means the property tests can't pass
     * vacuously — at least one execution exercises a non-trivial trie.
+    *
+    * Entry count: 3 user entries (one per field) plus 3 ActiveAddressIndex sidecar entries (one per non-empty field), for 6 total.
+    * `applyActiveAddressIndexDelta` short-circuits when both `added` and `removed` are empty, so empty fields don't contribute a sidecar.
     */
   test("concrete sanity: single non-empty slice produces a non-trivial root") { res =>
     implicit val (j, h, _) = res
@@ -343,7 +352,8 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
     } yield
       expect.all(
         a._1.isDefined,
-        a._2.size == 3,
+        userEntriesOnly(a._2).size == 3,
+        a._2.size == 6,
         a._1 == b._1,
         a._1 == d._1,
         a._1 == e._1,
