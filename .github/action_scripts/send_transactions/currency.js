@@ -142,6 +142,7 @@ const batchTransaction = async (
   amount = 10,
   fee = 1,
   num = 100,
+  lastRefUrl = null,
 ) => {
   const maxAttempts = 3
   const retryDelayMs = 1000
@@ -159,14 +160,28 @@ const batchTransaction = async (
         txnsData.push(txnBody)
       }
 
+      // Diagnostic: capture origin's lastReference as seen by gl1 before submit.
+      // Lets us correlate "what parent the SDK built on" against post-submit state
+      // when a duplicate-tx race surfaces in balance assertions downstream.
+      let lastRefBefore = null
+      if (lastRefUrl) {
+        try {
+          lastRefBefore = await fetchJson(`${lastRefUrl}/transactions/last-reference/${origin.address}`)
+        } catch (_) { /* best-effort */ }
+      }
+
       const generatedTransactions = await origin.generateBatchTransactions(
         txnsData,
       )
 
       const hashes = await origin.sendBatchTransactions(generatedTransactions)
 
+      const summary = Array.isArray(hashes)
+        ? `${hashes.length} hashes [first=${hashes[0]?.slice(0, 12)}.. last=${hashes[hashes.length - 1]?.slice(0, 12)}..]`
+        : `result=${JSON.stringify(hashes)?.slice(0, 200)}`
       logMessage(
-        `DAG transaction from: ${origin.address} sent - batch of ${num}.`,
+        `DAG transaction from: ${origin.address} sent - batch of ${num}. attempt=${attempt} ` +
+        `gl1LastRefBefore={ord=${lastRefBefore?.ordinal},hash=${lastRefBefore?.hash?.slice(0, 12)}..} returned=${summary}`,
       )
 
       return hashes
@@ -193,6 +208,7 @@ const batchMetagraphTransaction = async (
   amount = 10,
   fee = 1,
   num = 100,
+  cl1Url = null,
 ) => {
   const maxAttempts = 3
   const retryDelayMs = 1000
@@ -210,6 +226,13 @@ const batchMetagraphTransaction = async (
         txnsData.push(txnBody)
       }
 
+      let lastRefBefore = null
+      if (cl1Url) {
+        try {
+          lastRefBefore = await fetchJson(`${cl1Url}/transactions/last-reference/${origin.address}`)
+        } catch (_) { /* best-effort */ }
+      }
+
       const generatedTransactions = await metagraphTokenClient.generateBatchTransactions(
         txnsData,
       )
@@ -218,8 +241,12 @@ const batchMetagraphTransaction = async (
         generatedTransactions,
       )
 
+      const summary = Array.isArray(hashes)
+        ? `${hashes.length} hashes [first=${hashes[0]?.slice(0, 12)}.. last=${hashes[hashes.length - 1]?.slice(0, 12)}..]`
+        : `result=${JSON.stringify(hashes)?.slice(0, 200)}`
       logMessage(
-        `L0 token transaction from: ${origin.address} sent - batch of ${num}.`,
+        `L0 token transaction from: ${origin.address} sent - batch of ${num}. attempt=${attempt} ` +
+        `cl1LastRefBefore={ord=${lastRefBefore?.ordinal},hash=${lastRefBefore?.hash?.slice(0, 12)}..} returned=${summary}`,
       )
 
       return hashes
@@ -257,7 +284,8 @@ const handleBatchTransactions = async (
   }
 
   try {
-    await batchTransaction(origin, destination, amount, fee, txnCount)
+    const dagL1Url = networkOptions?.dagL1UrlFirstNode || null
+    await batchTransaction(origin, destination, amount, fee, txnCount, dagL1Url)
 
     // Poll for expected balances with timeout. In Nakamoto consensus, fork convergence
     // adds latency — the balance endpoint reads snapshotStorage.head which may lag.
@@ -288,6 +316,25 @@ const handleBatchTransactions = async (
     }
     if (originBalance !== expectedOriginBalance || destinationBalance !== expectedDestBalance) {
       logMessage(`Balance did not fully settle after ${SLEEP_TIME_UNTIL_QUERY / 1000}s — origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance} (falling through to final check)`)
+      // Diagnostic dump: post-failure lastReference for both wallets on gl1 lets
+      // us tell whether more txs landed than we sent (chain ordinal advanced
+      // beyond expected) vs balance-endpoint staleness (ordinal as expected,
+      // balance just hasn't propagated yet).
+      if (dagL1Url) {
+        try {
+          const [originRefAfter, destRefAfter] = await Promise.all([
+            fetchJson(`${dagL1Url}/transactions/last-reference/${origin.address}`).catch(() => null),
+            fetchJson(`${dagL1Url}/transactions/last-reference/${destination.address}`).catch(() => null),
+          ])
+          logMessage(
+            `[DIAG] post-failure DAG state: origin(${origin.address.slice(0, 12)}..) ` +
+            `lastRef={ord=${originRefAfter?.ordinal},hash=${originRefAfter?.hash?.slice(0, 12)}..} ` +
+            `dest(${destination.address.slice(0, 12)}..) ` +
+            `lastRef={ord=${destRefAfter?.ordinal},hash=${destRefAfter?.hash?.slice(0, 12)}..} ` +
+            `expectedSentCount=${txnCount}`
+          )
+        } catch (_) { /* best-effort */ }
+      }
     }
 
     return { originBalance, destinationBalance }
@@ -344,6 +391,7 @@ const handleMetagraphBatchTransactions = async (
       amount,
       fee,
       txnCount,
+      networkOptions.l1MetagraphUrl,
     )
 
     const startOriginBalance = await metagraphTokenClient.getBalance()
@@ -371,6 +419,25 @@ const handleMetagraphBatchTransactions = async (
     }
     if (originBalance !== expectedOriginBalance || destinationBalance !== expectedDestBalance) {
       logMessage(`L0 token balance did not fully settle after ${SLEEP_TIME_UNTIL_QUERY / 1000}s — origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance} (falling through to final check)`)
+      // Diagnostic dump: post-failure cl1 lastReference for both wallets +
+      // gl0 metagraph ord. If origin's cl1 ord advanced > expected, more txs
+      // landed than we sent (dag4-SDK / cl1 race). If ord matches expected,
+      // the balance endpoint is just stale (snapshot lag).
+      try {
+        const [originRefAfter, destRefAfter, gl0OrdAfter] = await Promise.all([
+          fetchJson(`${networkOptions.l1MetagraphUrl}/transactions/last-reference/${origin.address}`).catch(() => null),
+          fetchJson(`${networkOptions.l1MetagraphUrl}/transactions/last-reference/${destination.address}`).catch(() => null),
+          getMetagraphOrdinalOnGL0(networkOptions.l0GlobalUrl, networkOptions.metagraphId).catch(() => -1),
+        ])
+        logMessage(
+          `[DIAG] post-failure L0-token state: origin(${origin.address.slice(0, 12)}..) ` +
+          `cl1LastRef={ord=${originRefAfter?.ordinal},hash=${originRefAfter?.hash?.slice(0, 12)}..} ` +
+          `dest(${destination.address.slice(0, 12)}..) ` +
+          `cl1LastRef={ord=${destRefAfter?.ordinal},hash=${destRefAfter?.hash?.slice(0, 12)}..} ` +
+          `gl0MetagraphOrd=${gl0OrdAfter} (was ${gl0OrdBefore} before submit) ` +
+          `expectedSentCount=${txnCount}`
+        )
+      } catch (_) { /* best-effort */ }
     }
 
     // Wait for CL1 to process the snapshot containing this transfer before
