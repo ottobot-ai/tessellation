@@ -81,13 +81,24 @@ const waitForCL1Alignment = async (l1MetagraphUrl, address, beforeHash) => {
 
 // Poll GL0 for the latest CL0 snapshot ordinal it has committed for this metagraph.
 // Returns -1 if the metagraph has no committed snapshot yet.
+//
+// gl0 serves lastCurrencySnapshots as an Either-encoded value:
+//   {"<addr>": {"Right": [signedSnapshot, snapshotInfo]}}  (incremental)
+//   {"<addr>": {"Left":  [hashedSnapshot, snapshotInfo]}}  (genesis/full)
+// where the first element of either array carries the snapshot, with `.value.ordinal`
+// for incremental or `.signed.value.ordinal` for full. Try both shapes; the prior
+// implementation missed the Either wrapper entirely and reported -1 forever.
 const getMetagraphOrdinalOnGL0 = async (gl0Url, metagraphAddress) => {
   const info = await fetchJson(`${gl0Url}/global-snapshots/latest/info`)
   const entry = info.lastCurrencySnapshots && info.lastCurrencySnapshots[metagraphAddress]
   if (!entry) return -1
-  // lastCurrencySnapshots values may be either an incremental snapshot (with .ordinal)
-  // or a full snapshot wrapper — handle both shapes.
-  const ord = entry.ordinal ?? entry.value?.ordinal ?? entry?.value?.value?.ordinal
+  const inner = entry.Right ?? entry.Left ?? entry
+  // inner may be an array [snapshot, info] or a bare snapshot object.
+  const snap = Array.isArray(inner) ? inner[0] : inner
+  if (!snap) return -1
+  const ord = snap.value?.ordinal
+            ?? snap.signed?.value?.ordinal
+            ?? snap.ordinal
   if (typeof ord === 'number') return ord
   if (typeof ord === 'object' && typeof ord?.value === 'number') return ord.value
   return -1
