@@ -577,14 +577,23 @@ object SnapshotLeaderLoop {
 
         _ <- logger.info(s"WON slot $currentSlot (gap=$slotGap, parentSlot=$parentSlotValue, pool=$activePoolSize) — producing snapshot")
         _ <- Metrics[F].incrementCounter("dag_nakamoto_slots_won")
-        // Per-(self, eta_period) win counter: decomposes win-count skew across nodes into within-period
-        // (eta-sk pairing luck) vs across-period (persistent sk bias). Each node only emits its own
-        // label values; the stake-equality assumption means cluster-wide totals per period should be
-        // ≈ uniform across nodes if VRF is unbiased.
+        // Per-(self, eta_period, phase) win counter: decomposes win-count skew across nodes into
+        // within-period (eta-sk pairing luck) vs across-period (persistent sk bias), AND across the
+        // two LDD threshold regimes. Ramp and baseline phases have very different per-slot success
+        // probabilities (ramp: 0…fA across gap range; baseline: fB ≈ 5%), so a mixed counter compares
+        // apples to oranges. Tagging by phase lets us run a uniformity test independently in each
+        // regime — both should be ≈ uniform across nodes under unbiased VRF + equal stake.
         etaPeriod = currentSlot / etaRotationSlots
+        phase =
+          if (slotGap < lddConfig.offset.toLong) "dormant"
+          else if (slotGap < lddConfig.lddCutoff.toLong) "ramp"
+          else "baseline"
         _ <- Metrics[F].incrementCounter(
           "dag_nakamoto_slots_won_by_period",
-          Seq(Metrics.unsafeLabelName("eta_period") -> etaPeriod.toString)
+          Seq(
+            Metrics.unsafeLabelName("eta_period") -> etaPeriod.toString,
+            Metrics.unsafeLabelName("phase") -> phase
+          )
         )
         _ <- Metrics[F].updateGauge("dag_nakamoto_slot", currentSlot)
         _ <- Metrics[F].recordDistribution("dag_nakamoto_slot_gap", slotGap.toInt)
