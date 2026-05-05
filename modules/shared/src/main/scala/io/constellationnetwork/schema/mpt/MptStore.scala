@@ -22,6 +22,15 @@ trait MptStoreSavepoint[F[_]] {
   def restore: F[Unit]
 }
 
+/** Outcome of a transaction body — must be returned explicitly so the caller cannot accidentally leave a partial mutation in the store. The
+  * bracket pattern (`MptStore.withTransaction`) restores the savepoint on `Rollback` and on body failure; `Commit` keeps mutations.
+  */
+sealed trait MptTxAction
+object MptTxAction {
+  case object Commit extends MptTxAction
+  case object Rollback extends MptTxAction
+}
+
 /** Content-addressable key-value store with MPT commitment.
   *
   * Values are encoded via the canonical `ImmutableCodec[V]` typeclass (scodec-backed, byte-exact). A value type must have an
@@ -71,6 +80,18 @@ trait MptStore[F[_], K] {
     * exact state, undoing any mutations that occurred after the savepoint was created.
     */
   def savepoint: F[MptStoreSavepoint[F]]
+
+  /** Run `body` as a transaction. Mutations made via this MptStore between entry and the body's completion are tracked by an automatic
+    * savepoint. The body MUST yield `(A, MptTxAction)`:
+    *   - `MptTxAction.Commit` keeps the mutations
+    *   - `MptTxAction.Rollback` restores the savepoint If the body raises an error, mutations are rolled back and the error is re-raised.
+    *
+    * The whole bracket runs under `withExclusiveLock` so concurrent transactions serialize.
+    *
+    * Use this instead of bare `savepoint`/`restore` for any compound operation that may keep OR discard its mutations depending on a
+    * post-mutation outcome (e.g. validating an incoming artifact whose acceptance depends on whether it wins ChainSelection).
+    */
+  def withTransaction[A](body: F[(A, MptTxAction)]): F[A]
 
   /** Run an effect while holding the MPT mutation lock. Use this to serialize compound operations (e.g. remove + insert + sync) that must
     * not interleave with syncFull.
@@ -231,30 +252,30 @@ object MptStore {
       producer.buildForOrdinal(snapshotOrdinal)
 
     override def syncFull[V: ImmutableCodec](newState: Map[K, V], ordinal: SnapshotOrdinal): F[Unit] =
-      mutex.permit.use { _ =>
-        if (newState.isEmpty) {
-          logger.info("[MptStore] Empty sync, skipping") >>
-            clear >> lastSyncedOrdinalRef.set(Some(ordinal))
-        } else
-          for {
-            currentEntries <- producer.entries
-            currentSize = currentEntries.size
-            _ <-
-              logger
-                .warn(
-                  s"[MptStore] syncFull REDUCING entry count: $currentSize → ${newState.size} at ordinal=$ordinal. " +
-                    s"State loss possible — check upstream context."
-                )
-                .whenA(currentSize > 0 && newState.size < currentSize)
-            _ <- logger.info(s"[MptStore] Full sync with ${newState.size} entries (was $currentSize)")
-            _ <- clear
-            newEntries <- toHexEntries(newState)
-            _ <- producer.insertBytes(newEntries).void
-            _ <- persistAsync(ordinal)
-            _ <- build(ordinal)
-            _ <- lastSyncedOrdinalRef.set(Some(ordinal))
-          } yield ()
-      }
+      // Caller-serialized — see `withTransaction` comment. Bootstrap / download paths are
+      // single-fiber; in-flight production paths serialize via `snapshotSemaphore`.
+      if (newState.isEmpty) {
+        logger.info("[MptStore] Empty sync, skipping") >>
+          clear >> lastSyncedOrdinalRef.set(Some(ordinal))
+      } else
+        for {
+          currentEntries <- producer.entries
+          currentSize = currentEntries.size
+          _ <-
+            logger
+              .warn(
+                s"[MptStore] syncFull REDUCING entry count: $currentSize → ${newState.size} at ordinal=$ordinal. " +
+                  s"State loss possible — check upstream context."
+              )
+              .whenA(currentSize > 0 && newState.size < currentSize)
+          _ <- logger.info(s"[MptStore] Full sync with ${newState.size} entries (was $currentSize)")
+          _ <- clear
+          newEntries <- toHexEntries(newState)
+          _ <- producer.insertBytes(newEntries).void
+          _ <- persistAsync(ordinal)
+          _ <- build(ordinal)
+          _ <- lastSyncedOrdinalRef.set(Some(ordinal))
+        } yield ()
 
     override def syncFullIfNeeded[V: ImmutableCodec](newState: => F[Map[K, V]], ordinal: SnapshotOrdinal): F[Unit] =
       lastSyncedOrdinalRef.modify { lastOrdinal =>
@@ -312,6 +333,20 @@ object MptStore {
           def restore: F[Unit] =
             producerSP.restore >> lastSyncedOrdinalRef.set(savedOrdinal)
         }
+
+    override def withTransaction[A](body: F[(A, MptTxAction)]): F[A] =
+      // Caller-serialized: the body may call other MPT methods that internally take their own
+      // serialization (syncFrom*, syncFull). If we wrapped the bracket in `withExclusiveLock` the
+      // nested re-acquisition would deadlock the same non-reentrant semaphore. Production callers
+      // (onSlotWon, handleSnapshot) already serialize through `snapshotSemaphore`; HTTP-side
+      // callers (HistoricalMptProofService) wrap the call site with `withExclusiveLock` themselves.
+      savepoint.flatMap { sp =>
+        body.attempt.flatMap {
+          case Right((a, MptTxAction.Commit))   => a.pure[F]
+          case Right((a, MptTxAction.Rollback)) => sp.restore.as(a)
+          case Left(err)                        => sp.restore >> err.raiseError[F, A]
+        }
+      }
 
     override def withExclusiveLock[A](fa: F[A]): F[A] =
       mutex.permit.use(_ => fa)

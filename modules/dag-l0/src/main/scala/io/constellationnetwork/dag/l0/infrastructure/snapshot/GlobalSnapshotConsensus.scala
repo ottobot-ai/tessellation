@@ -523,6 +523,7 @@ object GlobalSnapshotConsensus {
                   genesisTimeMs = pureGenesisTimeMs,
                   snapshotSemaphore = snapshotSemaphore,
                   productionGate = productionGate,
+                  mptStore = mptStore,
                   nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef,
                   chainSyncRequestQueue = chainSyncRequestQueue
                 )

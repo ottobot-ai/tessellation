@@ -1362,82 +1362,85 @@ object GlobalStateConverter {
         }
 
         // We avoid per-field `sync` (each would trigger its own trie build). Instead: clear,
-        // insert each typed batch, then build once under the exclusive lock at the end.
-        store.withExclusiveLock {
-          for {
-            _ <- store.clear
-            currency <- buildCurrencySnapshotEntries
-            updateNodeParametersEntries <- updateNodeParametersEntriesF
-            priceStateEntries <- priceStateEntriesF
-            allowSpendExpiryBuckets <- allowSpendExpiryBucketsF
-            tokenLockExpiryBuckets <- tokenLockExpiryBucketsF
-            nodeCollateralWithdrawalExpiryBuckets <- nodeCollateralWithdrawalExpiryBucketsF
-            _ <- store.insert[Hash](stateChanHashes)
-            _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
-            _ <- store.insert[Balance](balances)
-            _ <- store.insert[Signed[io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot]](currency._1)
-            _ <- store.insert[io.constellationnetwork.currency.schema.currency.CurrencySnapshotInfo](currency._2)
-            _ <- store.insert[io.constellationnetwork.merkletree.Proof](currencyProofs)
-            _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](activeAllowSpends)
-            _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](activeTokenLocks)
-            _ <- store.insert[Balance](tokenLockBalances)
-            _ <- store.insert[io.constellationnetwork.schema.swap.AllowSpendReference](lastAllowSpendRefs)
-            _ <- store.insert[io.constellationnetwork.schema.tokenLock.TokenLockReference](lastTokenLockRefs)
-            _ <- store.insert[SortedSet[io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord]](activeDelegatedStakes)
-            _ <- store
-              .insert[SortedSet[io.constellationnetwork.schema.delegatedStake.PendingDelegatedStakeWithdrawal]](delegatedStakesWithdrawals)
-            _ <- store.insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord]](activeNodeCollaterals)
-            _ <- store
-              .insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.PendingNodeCollateralWithdrawal]](nodeCollateralWithdrawals)
-            _ <- store.insert[MetagraphSyncDataInfo](metagraphSyncData)
-            _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
-            _ <- store.insert[PriceRecord](priceStateEntries)
-            _ <- store.insert[SortedSet[AllowSpendExpiryKey]](allowSpendExpiryBuckets)
-            _ <- store.insert[SortedSet[TokenLockExpiryKey]](tokenLockExpiryBuckets)
-            _ <- store.insert[SortedSet[NodeCollateralWithdrawalExpiryKey]](nodeCollateralWithdrawalExpiryBuckets)
-            // ActiveAddressIndex bootstrap: rebuild from `info.<field>.keySet` for the indexed fields. Must mirror the
-            // delta-path maintenance in `syncFromStateChanges` so a node that bootstraps via `syncFromGlobalSnapshotInfo`
-            // converges to the same mptRoot as one that processed every ordinal incrementally.
-            activeAddressIndexEntries <- {
-              val sets: List[(GlobalStateFieldId, SortedSet[Address])] = List(
-                (LastAllowSpendRefs, info.lastAllowSpendRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet))),
-                (LastTokenLockRefs, info.lastTokenLockRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet))),
-                (LastTxRefs, info.lastTxRefs.keySet.to(SortedSet)),
-                (Balances, info.balances.keySet.to(SortedSet)),
-                (LastStateChannelSnapshotHashes, info.lastStateChannelSnapshotHashes.keySet.to(SortedSet)),
-                (LastCurrencySnapshots, info.lastCurrencySnapshots.keySet.to(SortedSet))
-              )
-              sets
-                .filter(_._2.nonEmpty)
-                .parTraverse {
-                  case (fieldId, addrSet) =>
-                    GlobalStateKey.activeAddressIndexKey[F](fieldId).map(_ -> addrSet)
-                }
-                .map(_.toMap)
-            }
-            _ <- store.insert[SortedSet[Address]](activeAddressIndexEntries)
-            // Address-pair index bootstrap for `tokenLockBalances`. Mirrors the delta-path writer in
-            // `syncFromStateChanges` so bootstrap and incremental paths converge to the same mptRoot.
-            tokenLockBalancePairs: SortedSet[(Address, Address)] =
-              info.tokenLockBalances.fold(SortedSet.empty[(Address, Address)])(_.iterator.flatMap {
-                case (mid, inner) => inner.keysIterator.map(h => (mid, h))
-              }.to(SortedSet))
-            addressPairIndexEntries <-
-              if (tokenLockBalancePairs.isEmpty)
-                Map.empty[GlobalStateKey, SortedSet[(Address, Address)]].pure[F]
-              else
-                GlobalStateKey
-                  .activeAddressIndexKey[F](TokenLockBalances)
-                  .map(k => Map(k -> tokenLockBalancePairs))
-            _ <- store.insert[SortedSet[(Address, Address)]](addressPairIndexEntries)
-            _ <- store.build(snapshotOrdinal).void
-          } yield ()
-        }
+        // insert each typed batch, then build once at the end.
+        // Caller-serialized — see MptStore.withTransaction. Bootstrap/download paths are
+        // single-fiber; production-time reorg-adoption callers (NakamotoSyncDaemon catch-up
+        // and storeForkBranch) run under `snapshotSemaphore`. accept() callers run under
+        // `mptStore.withTransaction`'s savepoint scope, also `snapshotSemaphore`-serialized.
+        for {
+          _ <- store.clear
+          currency <- buildCurrencySnapshotEntries
+          updateNodeParametersEntries <- updateNodeParametersEntriesF
+          priceStateEntries <- priceStateEntriesF
+          allowSpendExpiryBuckets <- allowSpendExpiryBucketsF
+          tokenLockExpiryBuckets <- tokenLockExpiryBucketsF
+          nodeCollateralWithdrawalExpiryBuckets <- nodeCollateralWithdrawalExpiryBucketsF
+          _ <- store.insert[Hash](stateChanHashes)
+          _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
+          _ <- store.insert[Balance](balances)
+          _ <- store.insert[Signed[io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot]](currency._1)
+          _ <- store.insert[io.constellationnetwork.currency.schema.currency.CurrencySnapshotInfo](currency._2)
+          _ <- store.insert[io.constellationnetwork.merkletree.Proof](currencyProofs)
+          _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](activeAllowSpends)
+          _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](activeTokenLocks)
+          _ <- store.insert[Balance](tokenLockBalances)
+          _ <- store.insert[io.constellationnetwork.schema.swap.AllowSpendReference](lastAllowSpendRefs)
+          _ <- store.insert[io.constellationnetwork.schema.tokenLock.TokenLockReference](lastTokenLockRefs)
+          _ <- store.insert[SortedSet[io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord]](activeDelegatedStakes)
+          _ <- store
+            .insert[SortedSet[io.constellationnetwork.schema.delegatedStake.PendingDelegatedStakeWithdrawal]](delegatedStakesWithdrawals)
+          _ <- store.insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord]](activeNodeCollaterals)
+          _ <- store
+            .insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.PendingNodeCollateralWithdrawal]](nodeCollateralWithdrawals)
+          _ <- store.insert[MetagraphSyncDataInfo](metagraphSyncData)
+          _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
+          _ <- store.insert[PriceRecord](priceStateEntries)
+          _ <- store.insert[SortedSet[AllowSpendExpiryKey]](allowSpendExpiryBuckets)
+          _ <- store.insert[SortedSet[TokenLockExpiryKey]](tokenLockExpiryBuckets)
+          _ <- store.insert[SortedSet[NodeCollateralWithdrawalExpiryKey]](nodeCollateralWithdrawalExpiryBuckets)
+          // ActiveAddressIndex bootstrap: rebuild from `info.<field>.keySet` for the indexed fields. Must mirror the
+          // delta-path maintenance in `syncFromStateChanges` so a node that bootstraps via `syncFromGlobalSnapshotInfo`
+          // converges to the same mptRoot as one that processed every ordinal incrementally.
+          activeAddressIndexEntries <- {
+            val sets: List[(GlobalStateFieldId, SortedSet[Address])] = List(
+              (LastAllowSpendRefs, info.lastAllowSpendRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet))),
+              (LastTokenLockRefs, info.lastTokenLockRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet))),
+              (LastTxRefs, info.lastTxRefs.keySet.to(SortedSet)),
+              (Balances, info.balances.keySet.to(SortedSet)),
+              (LastStateChannelSnapshotHashes, info.lastStateChannelSnapshotHashes.keySet.to(SortedSet)),
+              (LastCurrencySnapshots, info.lastCurrencySnapshots.keySet.to(SortedSet))
+            )
+            sets
+              .filter(_._2.nonEmpty)
+              .parTraverse {
+                case (fieldId, addrSet) =>
+                  GlobalStateKey.activeAddressIndexKey[F](fieldId).map(_ -> addrSet)
+              }
+              .map(_.toMap)
+          }
+          _ <- store.insert[SortedSet[Address]](activeAddressIndexEntries)
+          // Address-pair index bootstrap for `tokenLockBalances`. Mirrors the delta-path writer in
+          // `syncFromStateChanges` so bootstrap and incremental paths converge to the same mptRoot.
+          tokenLockBalancePairs: SortedSet[(Address, Address)] =
+            info.tokenLockBalances.fold(SortedSet.empty[(Address, Address)])(_.iterator.flatMap {
+              case (mid, inner) => inner.keysIterator.map(h => (mid, h))
+            }.to(SortedSet))
+          addressPairIndexEntries <-
+            if (tokenLockBalancePairs.isEmpty)
+              Map.empty[GlobalStateKey, SortedSet[(Address, Address)]].pure[F]
+            else
+              GlobalStateKey
+                .activeAddressIndexKey[F](TokenLockBalances)
+                .map(k => Map(k -> tokenLockBalancePairs))
+          _ <- store.insert[SortedSet[(Address, Address)]](addressPairIndexEntries)
+          _ <- store.build(snapshotOrdinal).void
+        } yield ()
       }
 
       def syncFromStateChanges(acc: StateChangesAccumulator, snapshotOrdinal: SnapshotOrdinal)(
         implicit stateProofSelector: StateProofSelector
-      ): F[Unit] = store.withExclusiveLock {
+      ): F[Unit] = {
+        // Caller-serialized — see MptStore.withTransaction.
         import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
 
         val syncLogger = Slf4jLogger.getLoggerFromName[F]("MPT.Sync")

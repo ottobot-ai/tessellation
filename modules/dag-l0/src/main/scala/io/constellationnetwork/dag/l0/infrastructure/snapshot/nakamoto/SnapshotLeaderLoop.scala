@@ -19,7 +19,7 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.Time
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.schema._
-import io.constellationnetwork.schema.mpt.GlobalStateKey
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, MptTxAction}
 import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot._
 import io.constellationnetwork.schema.node.NodeState
@@ -170,6 +170,11 @@ object SnapshotLeaderLoop {
     genesisTimeMs: Long = 0L,
     snapshotSemaphore: cats.effect.std.Semaphore[F],
     productionGate: ProductionGate[F],
+    // MPT store — wraps leader-build (createProposalArtifact + gate decision) in
+    // withTransaction so an abandoned proposal (gate closed pre-sign or chainStore
+    // refused the write) restores the canonical MPT state instead of leaving the
+    // proposal's mid-flight mutations behind.
+    mptStore: MptStore[F, GlobalStateKey],
     // Tracks the highest finalized ordinal so HttpApi can expose it via
     // /global-snapshots/latest/finalized-ordinal. Updated after every successful
     // chainStore.finalize call (depth-k or attestation-2/3, whichever fires first).
@@ -313,6 +318,7 @@ object SnapshotLeaderLoop {
                             productionGate,
                             productionTimestamps,
                             nakamotoFinalizedOrdinalRef,
+                            mptStore,
                             logger
                           )
                         } // snapshotSemaphore.permit
@@ -535,6 +541,7 @@ object SnapshotLeaderLoop {
     productionGate: ProductionGate[F],
     productionTimestamps: Ref[F, Map[Long, Long]],
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
+    mptStore: MptStore[F, GlobalStateKey],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -567,6 +574,15 @@ object SnapshotLeaderLoop {
 
         _ <- logger.info(s"WON slot $currentSlot (gap=$slotGap, parentSlot=$parentSlotValue, pool=$activePoolSize) — producing snapshot")
         _ <- Metrics[F].incrementCounter("dag_nakamoto_slots_won")
+        // Per-(self, eta_period) win counter: decomposes win-count skew across nodes into within-period
+        // (eta-sk pairing luck) vs across-period (persistent sk bias). Each node only emits its own
+        // label values; the stake-equality assumption means cluster-wide totals per period should be
+        // ≈ uniform across nodes if VRF is unbiased.
+        etaPeriod = currentSlot / etaRotationSlots
+        _ <- Metrics[F].incrementCounter(
+          "dag_nakamoto_slots_won_by_period",
+          Seq(Metrics.unsafeLabelName("eta_period") -> etaPeriod.toString)
+        )
         _ <- Metrics[F].updateGauge("dag_nakamoto_slot", currentSlot)
         _ <- Metrics[F].recordDistribution("dag_nakamoto_slot_gap", slotGap.toInt)
 
@@ -602,68 +618,68 @@ object SnapshotLeaderLoop {
                   eventSet: Set[GlobalSnapshotEvent] = hashedEvents.values.map(_.signed.value).toSet
                   _ <- Metrics[F].recordDistribution("dag_nakamoto_events_drained", eventSet.size)
 
-                  // Create snapshot using existing infrastructure — no reimplementation
-                  result <- consensusFns.createProposalArtifact(
-                    lastKey = lastKey,
-                    lastArtifact = lastSigned,
-                    lastContext = lastContext,
-                    lastArtifactHasher = hasher,
-                    trigger = TimeTrigger, // epoch progress increments on TimeTrigger
-                    events = eventSet,
-                    facilitators = Set(selfId), // single producer, no facilitator set
-                    getGlobalSnapshotByOrdinal = ordinal =>
-                      snapshotStorage.get(ordinal).flatMap {
-                        case Some(s) => s.toHashed[F].map(_.some)
-                        case None =>
-                          chainStore.getByOrdinal(ordinal.value.value).flatMap {
-                            case Some(stored) => stored.signedSnapshot.toHashed[F].map(_.some)
-                            case None         => none[Hashed[GlobalIncrementalSnapshot]].pure[F]
+                  // Wrap createProposalArtifact + gate check + chainStore.store in a single
+                  // MPT transaction. createProposalArtifact calls accept() which mutates the
+                  // MPT (apply deltas to compute stateProof). We Commit only when we both
+                  // pass the pre-sign gate AND chainStore accepts the write — i.e. this
+                  // proposal is going on the chain. On gate-closed abandonment OR a refused
+                  // chainStore write, Rollback so the canonical MPT is unchanged.
+                  txOutcome <- mptStore.withTransaction {
+                    for {
+                      result <- consensusFns.createProposalArtifact(
+                        lastKey = lastKey,
+                        lastArtifact = lastSigned,
+                        lastContext = lastContext,
+                        lastArtifactHasher = hasher,
+                        trigger = TimeTrigger, // epoch progress increments on TimeTrigger
+                        events = eventSet,
+                        facilitators = Set(selfId), // single producer, no facilitator set
+                        getGlobalSnapshotByOrdinal = ordinal =>
+                          snapshotStorage.get(ordinal).flatMap {
+                            case Some(s) => s.toHashed[F].map(_.some)
+                            case None =>
+                              chainStore.getByOrdinal(ordinal.value.value).flatMap {
+                                case Some(stored) => stored.signedSnapshot.toHashed[F].map(_.some)
+                                case None         => none[Hashed[GlobalIncrementalSnapshot]].pure[F]
+                              }
                           }
-                      }
-                  )
-
-                  (rawArtifact, context, returnedEvents) = result
-                  _ <- Metrics[F].recordDistribution("dag_nakamoto_events_returned", returnedEvents.size)
-                  _ <- Metrics[F].recordDistribution("dag_nakamoto_events_accepted", eventSet.size - returnedEvents.size)
-
-                  // Pre-sign gate check — proposal creation can be slow (mempool drain + acceptance
-                  // pipeline). If a better gossip snapshot arrived during that work, abandon now
-                  // before sealing (signing) anything. Saves a useless signature + chain store write
-                  // and prevents this node from briefly emitting a fork that immediately gets reorged.
-                  gateOpenPreSign <- productionGate.isOpen
-                  _ <-
-                    if (!gateOpenPreSign)
-                      productionGate.pauseReasons.flatMap(reasons =>
-                        logger
-                          .info(s"🛑 Abandoning production at slot $currentSlot before sign (gate closed: ${reasons.mkString(", ")})") >>
-                          Metrics[F].incrementCounter("dag_nakamoto_production_abandoned_total")
                       )
-                    else Async[F].unit
+                      (rawArtifact, context, returnedEvents) = result
+                      _ <- Metrics[F].recordDistribution("dag_nakamoto_events_returned", returnedEvents.size)
+                      _ <- Metrics[F].recordDistribution("dag_nakamoto_events_accepted", eventSet.size - returnedEvents.size)
 
-                  // Attach SlotCertificate and eta to artifact before signing
-                  artifact = rawArtifact.copy(slotCertificate = Some(cert), eta = Some(etaHash))
+                      // Pre-sign gate check — abandon if a better gossip snapshot arrived
+                      // during the (slow) acceptance pipeline. Skips signature + chain store write.
+                      gateOpenPreSign <- productionGate.isOpen
+                      _ <-
+                        if (!gateOpenPreSign)
+                          productionGate.pauseReasons.flatMap(reasons =>
+                            logger.info(
+                              s"🛑 Abandoning production at slot $currentSlot before sign (gate closed: ${reasons.mkString(", ")}). MPT rolled back."
+                            ) >>
+                              Metrics[F].incrementCounter("dag_nakamoto_production_abandoned_total")
+                          )
+                        else Async[F].unit
 
-                  // Sign it (single producer signature — attestations come separately)
-                  signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)
-
-                  // Store via NakamotoChainStore (handles forks + reorgs).
-                  // Skipped if the production gate closed during proposal creation — a better
-                  // gossip snapshot arrived and we are abandoning this round before committing it
-                  // to our local chain store. Prevents this node from briefly emitting a fork
-                  // that would immediately get reorged.
-                  snapshotHashedForStorage <- signed.toHashed[F]
-                  parentHashValue = lastHashed.hash
-                  stored <-
-                    if (gateOpenPreSign)
-                      chainStore.store(
-                        signed,
-                        context,
-                        lastKey.value.value + 1,
-                        currentSlot,
-                        parentHashValue,
-                        vrfOutput
-                      )
-                    else Async[F].pure(false)
+                      artifact = rawArtifact.copy(slotCertificate = Some(cert), eta = Some(etaHash))
+                      signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)
+                      snapshotHashedForStorage <- signed.toHashed[F]
+                      parentHashValue = lastHashed.hash
+                      stored <-
+                        if (gateOpenPreSign)
+                          chainStore.store(
+                            signed,
+                            context,
+                            lastKey.value.value + 1,
+                            currentSlot,
+                            parentHashValue,
+                            vrfOutput
+                          )
+                        else Async[F].pure(false)
+                      action: MptTxAction = if (stored) MptTxAction.Commit else MptTxAction.Rollback
+                    } yield ((signed, context, returnedEvents, stored, snapshotHashedForStorage, parentHashValue), action)
+                  }
+                  (signed, context, returnedEvents, stored, snapshotHashedForStorage, parentHashValue) = txOutcome
 
                   // Update ALL snapshot storages — snapshotStorage.head is what the leader loop
                   // reads on the next slot to determine the parent ordinal. Without this, the

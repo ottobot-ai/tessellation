@@ -4,7 +4,7 @@ import cats.effect.Async
 import cats.syntax.all._
 
 import io.constellationnetwork.schema.SnapshotOrdinal
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, MptTxAction}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.prover.MerklePatriciaProofError
@@ -106,15 +106,19 @@ object HistoricalMptProofService {
       hex: Hex,
       tipOrdinal: Long
     ): F[Either[ProofError, MerklePatriciaInclusionProof]] =
+      // The journal-rewind path is read-only by intent: we mutate the MPT to inspect a past
+      // ordinal, then always roll back. `withTransaction` with Rollback expresses that
+      // intent at the bracket boundary; restore is automatic on body completion or error.
+      // `withTransaction` itself is caller-serialized (it doesn't take the exclusive lock to
+      // avoid nested-acquisition deadlocks with `accept()`'s internal MPT writes). HTTP-served
+      // proof requests are NOT protected by `snapshotSemaphore`, so we wrap explicitly here.
       store.withExclusiveLock {
-        for {
-          savepoint <- store.savepoint
-          result <- attemptHistorical(ordinal, hex, tipOrdinal).handleErrorWith { err =>
+        store.withTransaction {
+          attemptHistorical(ordinal, hex, tipOrdinal).handleErrorWith { err =>
             logger.error(err)(s"[HistoricalMptProofService] Historical proof at $ordinal failed") >>
               (TrieBuildFailed(err.getMessage): ProofError).asLeft[MerklePatriciaInclusionProof].pure[F]
-          }
-          _ <- savepoint.restore
-        } yield result
+          }.map(_ -> (MptTxAction.Rollback: MptTxAction))
+        }
       }
 
     private def attemptHistorical(

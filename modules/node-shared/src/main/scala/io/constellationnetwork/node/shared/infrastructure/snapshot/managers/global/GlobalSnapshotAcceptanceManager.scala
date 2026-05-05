@@ -688,6 +688,32 @@ object GlobalSnapshotAcceptanceManager {
                 s"cds=${cdsEvents.size} wds=${wdsEvents.size} cnc=${cncEvents.size} wnc=${wncEvents.size}"
             )
 
+            // Fork-switch detection MUST run before any MPT reads. accept() reads `priorBalances`,
+            // `priorLastTxRefs`, `priorLastCurrencySnapshots`, etc. from the live MPT, expecting it to
+            // reflect ordinal-1 state. If the journal tip is at ordinal (e.g. a prior accept at the same
+            // ordinal already wrote — common on gl0 nodes where SnapshotLeaderLoop produces and then
+            // validateArtifact validates a competing proposal at the same slot), the priors read
+            // post-write state, corrupt every downstream balance/refs computation, and the resulting
+            // mptRoot drifts from the canonical leader's state. Followers (cl0/dl1) that only run
+            // createContext don't accumulate this corruption — they then disagree with the corrupted
+            // gl0 leader's stateProof on the next ordinal (#70: dl1 StateProofMismatch on every sc=1
+            // ord under spend load, balances field diverging despite identical event input).
+            _ <- undoJournal match {
+              case Some(journal) =>
+                journal.currentTipOrdinal.flatMap {
+                  case Some(tipOrd) if tipOrd != ordinal.value.value - 1 =>
+                    loggerBundle.app.info(
+                      s"[ACCEPTANCE] ordinal=$ordinal fork switch detected: journalTip=$tipOrd, expected=${ordinal.value.value - 1}. " +
+                        s"Rolling journal back to ordinal=${ordinal.value.value - 1} (reverse-apply local-fork entries)."
+                    ) >>
+                      journal.unapplyTo(ordinal.value.value - 1).void
+                  case _ =>
+                    Async[F].unit // aligned, no rollback needed
+                }
+              case None =>
+                Async[F].unit
+            }
+
             (allowSpendBlockAcceptanceResult, tokenLockBlockAcceptanceResult) <-
               acceptAllowSpendAndTokenLockBlocks(
                 ordinal,
@@ -1303,34 +1329,40 @@ object GlobalSnapshotAcceptanceManager {
                     .format(stateChangesAccumulator.removedNodeCollateralWithdrawalKeys.toString.hashCode)})"
             )
 
-            // === MPT Sync with undo journal ===
-            // Before applying deltas, detect fork switches: if the journal tip doesn't
-            // match ordinal-1 (the parent), the MPT has state from a different fork.
-            // Roll the journal back to the immediate parent (ordinal-1), which reverse-applies
-            // the local-fork ordinals via the recorded undo entries. This restores MPT to
-            // the parent's state WITHOUT consulting `lastSnapshotContext` — the journal is
-            // the source of truth for undo. Trusting `lastSnapshotContext` here was the bug:
-            // each gl0 carries its own local-fork GSI, so reseeding from it propagates the
-            // divergence cluster-wide (observed at 9 ords/run in DoubleUseAllowSpend e2e
-            // 2026-05-02, ords 100/203/284/323/325/401/438/508/516).
-            //
-            // Single-ordinal forks resolve completely. Multi-ordinal forks would require
-            // unwinding past the immediate parent — a follow-up if observed.
-            _ <- undoJournal match {
-              case Some(journal) =>
-                journal.currentTipOrdinal.flatMap {
-                  case Some(tipOrd) if tipOrd != ordinal.value.value - 1 =>
-                    loggerBundle.app.info(
-                      s"[ACCEPTANCE] ordinal=$ordinal fork switch detected: journalTip=$tipOrd, expected=${ordinal.value.value - 1}. " +
-                        s"Rolling journal back to ordinal=${ordinal.value.value - 1} (reverse-apply local-fork entries)."
-                    ) >>
-                      journal.unapplyTo(ordinal.value.value - 1).void
-                  case _ =>
-                    Async[F].unit // aligned, no rollback needed
-                }
-              case None =>
-                Async[F].unit
+            // Per-entry balance delta dump for #70 dl1/gl0 mptRoot.balances divergence diagnosis.
+            // SortedMap iteration is deterministic; Balance.toString is a Long — both content-stable
+            // across nodes. Each entry: <addr-last8>=<balance>. Capped to 32 entries to keep logs sane.
+            _ <- loggerBundle.app.info {
+              val entries = stateChangesAccumulator.balances.toSeq.map {
+                case (addr, bal) => s"${addr.value.value.takeRight(8)}=${bal.value.value}"
+              }
+              val rendered =
+                if (entries.size > 32) entries.take(32).mkString(",") + s",...(${entries.size - 32} more)"
+                else entries.mkString(",")
+              s"[ACCEPTANCE] ordinal=$ordinal MPT_SYNC_FP_BAL_DELTA: [$rendered]"
             }
+            _ <- loggerBundle.app.info {
+              val pipelineEntries = List(
+                "blocks" -> initialData.blockResult.contextUpdate.balances.toSortedMap,
+                "currAccept" -> currencyAcceptanceBalanceUpdate.toSortedMap,
+                "rewards" -> rewardBalancesDelta,
+                "allowSpends" -> updatedBalancesByAllowSpendsDeltas,
+                "tokenLocks" -> updatedBalancesByTokenLocksDeltas,
+                "spendTxs" -> updatedBalancesBySpendTransactionsDeltas
+              )
+              val parts = pipelineEntries.map {
+                case (label, m) =>
+                  val rendered = m.toSeq.map { case (addr, bal) => s"${addr.value.value.takeRight(8)}=${bal.value.value}" }
+                    .mkString(",")
+                  s"$label=[${m.size},${"%08x".format(m.toString.hashCode)}]<$rendered>"
+              }
+              s"[ACCEPTANCE] ordinal=$ordinal MPT_SYNC_FP_BAL_PIPELINE: ${parts.mkString(" ")}"
+            }
+
+            // === MPT Sync with undo journal ===
+            // Fork-switch detection ran at the top of accept() before any MPT reads, so the MPT
+            // here is at ordinal-1 state. Apply the delta via syncFromStateChanges and wrap with
+            // wrapApply so the journal records this ordinal's undo entry.
             // Snapshot the pre-sync MPT bytes. Used below for independent cross-check: apply the
             // accumulator's delta to this map via the `toAccumulatorHexDelta` helper (a separate
             // encoder+merge path from `syncFromStateChanges`) and build an MPT via the Parallel

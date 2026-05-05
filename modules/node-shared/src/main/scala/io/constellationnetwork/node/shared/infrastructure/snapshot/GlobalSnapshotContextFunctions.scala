@@ -21,7 +21,7 @@ import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, MptTxAction}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
 import io.constellationnetwork.schema.peer.PeerId
@@ -108,12 +108,14 @@ object GlobalSnapshotContextFunctions {
           .toList
           .flatten
 
-        // Capture the pre-accept MPT state so we can roll back on verify failure.
-        // Without this, `syncFromStateChanges` inside `accept()` commits its delta before
-        // we get a chance to compare against the peer-claimed stateProof; a mismatch would
-        // leave the store with divergent bytes and the journal tip advanced.
-        preAcceptSavepoint <- mptStore.savepoint
-
+        // Wrap accept() + state-proof verification in a transaction. On mismatch we raise
+        // StateProofMismatch; the bracket auto-rolls back the MPT mutations before re-raising.
+        // On success the bracket commits.
+        //
+        // Why: `syncFromStateChanges` inside `accept()` commits its delta to MPT before we get
+        // a chance to compare against the peer-claimed stateProof; a mismatch would leave the
+        // store with divergent bytes and the journal tip advanced, contaminating future rounds.
+        //
         // Derive updated stake/withdrawal maps inside calculateRewardsFn using the
         // `DelegateRewardsInput.psu` argument — that PartitionedStakeUpdates is produced by
         // the canonical `DelegatedStakeStateManager.processExistingDelegatedStakes` inside
@@ -124,173 +126,169 @@ object GlobalSnapshotContextFunctions {
         // on followers whenever a withdrawal became epoch-expired AND its token lock had been
         // replaced/removed in the same ordinal (observed at ordinal 64 in cl1, e.g.
         // gl0.mptRoot=221e53b31179 vs cl1.mptRoot=6fc964752c15).
-        (
-          acceptanceResult,
-          _,
-          _,
-          _,
-          _,
-          _,
-          returnedSCEvents,
-          acceptedRewardTxs,
-          snapshotInfo,
-          computedStateProof,
-          _,
-          _,
-          _,
-          _
-        ) <-
-          snapshotAcceptanceManager.accept(
-            signedArtifact.ordinal,
-            signedArtifact.epochProgress,
-            lastArtifact.epochProgress,
-            blocksForAcceptance,
-            allowSpendBlocksForAcceptance,
-            tokenLockBlocksForAcceptance,
-            scEvents,
-            unpEventsForAcceptance,
-            cdsEventsForAcceptance,
-            wdsEventsForAcceptance,
-            cncEventsForAcceptance,
-            wncEventsForAcceptance,
-            context,
-            lastActiveTips,
-            lastDeprecatedTips,
-            (input: RewardsInput) => {
-              val rewardTxs = signedArtifact.rewards
-              input match {
-                case ClassicRewardsInput(_) =>
-                  // Pre-tessellation3 rewards distribution — no stake-update plumbing applies.
-                  DelegatedRewardsResult(
-                    delegatorRewardsMap = SortedMap.empty,
-                    updatedCreateDelegatedStakes = SortedMap.empty,
-                    updatedWithdrawDelegatedStakes = SortedMap.empty,
-                    nodeOperatorRewards = rewardTxs,
-                    reservedAddressRewards = SortedSet.empty,
-                    withdrawalRewardTxs = SortedSet.empty,
-                    totalEmittedRewardsAmount =
-                      Amount(NonNegLong.unsafeFrom(rewardTxs.toList.map(_.amount.value.value).distinct.sum)) // mimic incorrect behaviour
-                  ).pure[F]
+        snapshotInfo <- mptStore.withTransaction {
+          snapshotAcceptanceManager
+            .accept(
+              signedArtifact.ordinal,
+              signedArtifact.epochProgress,
+              lastArtifact.epochProgress,
+              blocksForAcceptance,
+              allowSpendBlocksForAcceptance,
+              tokenLockBlocksForAcceptance,
+              scEvents,
+              unpEventsForAcceptance,
+              cdsEventsForAcceptance,
+              wdsEventsForAcceptance,
+              cncEventsForAcceptance,
+              wncEventsForAcceptance,
+              context,
+              lastActiveTips,
+              lastDeprecatedTips,
+              (input: RewardsInput) => {
+                val rewardTxs = signedArtifact.rewards
+                input match {
+                  case ClassicRewardsInput(_) =>
+                    // Pre-tessellation3 rewards distribution — no stake-update plumbing applies.
+                    DelegatedRewardsResult(
+                      delegatorRewardsMap = SortedMap.empty,
+                      updatedCreateDelegatedStakes = SortedMap.empty,
+                      updatedWithdrawDelegatedStakes = SortedMap.empty,
+                      nodeOperatorRewards = rewardTxs,
+                      reservedAddressRewards = SortedSet.empty,
+                      withdrawalRewardTxs = SortedSet.empty,
+                      totalEmittedRewardsAmount =
+                        Amount(NonNegLong.unsafeFrom(rewardTxs.toList.map(_.amount.value.value).distinct.sum)) // mimic incorrect behaviour
+                    ).pure[F]
 
-                case DelegateRewardsInput(udsar, psu, _) =>
-                  for {
-                    updatedCreateDelegatedStakes <- DelegatedRewardsDistributor.getUpdatedCreateDelegatedStakes(
-                      signedArtifact.delegateRewards.getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]]),
-                      udsar,
-                      psu
-                    )
-                    updatedWithdrawDelegatedStakes <- DelegatedRewardsDistributor.getUpdatedWithdrawalDelegatedStakes(
-                      context,
-                      udsar,
-                      psu
-                    )
-                    transformedCreateDelegatedStakes =
-                      if (signedArtifact.ordinal > incrementalDelegatedStakingStartingOrdinal)
-                        updatedCreateDelegatedStakes.view.mapValues { records =>
-                          records.map { r =>
-                            r.copy(
-                              currentTokenLockRef = r.currentTokenLockRef.orElse(r.tokenLockRef.some),
-                              currentAmount = r.currentAmount.orElse(r.amount.some)
-                            )
-                          }
-                        }.to(SortedMap)
-                      else updatedCreateDelegatedStakes
-                  } yield
-                    if (signedArtifact.ordinal.value < setSumFixOrdinal.value)
-                      DelegatedRewardsResult(
-                        delegatorRewardsMap = signedArtifact.delegateRewards
-                          .getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]]),
-                        updatedCreateDelegatedStakes = transformedCreateDelegatedStakes,
-                        updatedWithdrawDelegatedStakes = updatedWithdrawDelegatedStakes,
-                        nodeOperatorRewards = rewardTxs,
-                        reservedAddressRewards = SortedSet.empty,
-                        withdrawalRewardTxs = SortedSet.empty,
-                        totalEmittedRewardsAmount = Amount(
-                          NonNegLong.unsafeFrom(rewardTxs.toList.map(_.amount.value.value).distinct.sum)
-                        ) // mimic incorrect behaviour
+                  case DelegateRewardsInput(udsar, psu, _) =>
+                    for {
+                      updatedCreateDelegatedStakes <- DelegatedRewardsDistributor.getUpdatedCreateDelegatedStakes(
+                        signedArtifact.delegateRewards.getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]]),
+                        udsar,
+                        psu
                       )
-                    else
-                      DelegatedRewardsResult(
-                        delegatorRewardsMap = signedArtifact.delegateRewards
-                          .getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]]),
-                        updatedCreateDelegatedStakes = transformedCreateDelegatedStakes,
-                        updatedWithdrawDelegatedStakes = updatedWithdrawDelegatedStakes,
-                        nodeOperatorRewards = rewardTxs,
-                        reservedAddressRewards = SortedSet.empty,
-                        withdrawalRewardTxs = SortedSet.empty,
-                        totalEmittedRewardsAmount = Amount(NonNegLong.unsafeFrom(rewardTxs.toList.map(_.amount.value.value).sum))
+                      updatedWithdrawDelegatedStakes <- DelegatedRewardsDistributor.getUpdatedWithdrawalDelegatedStakes(
+                        context,
+                        udsar,
+                        psu
                       )
-              }
-            },
-            StateChannelValidationType.Historical,
-            getGlobalSnapshotByOrdinal
-          )
-
-        // For followers (currency-l0, dag-l1, currency-l1), we log warnings instead of raising errors
-        // for blocks, state channels, and rewards validation divergences.
-        // The snapshot was already validated by dag-l0 majority consensus, so local acceptance
-        // divergences on followers should not cause permanent stalls. The same rationale applies
-        // as for skipping state proof validation below.
-        _ <- logger
-          .warn(
-            s"Follower: ${acceptanceResult.notAccepted.size} blocks not accepted at ordinal=${signedArtifact.ordinal.show}. " +
-              s"Reasons: ${acceptanceResult.notAccepted.map { case (_, reason) => reason }.mkString(", ")}. " +
-              s"Continuing since snapshot was already validated by L0 majority consensus."
-          )
-          .whenA(acceptanceResult.notAccepted.nonEmpty)
-        _ <- logger
-          .warn(
-            s"Follower: ${returnedSCEvents.size} state channels returned at ordinal=${signedArtifact.ordinal.show} " +
-              s"for addresses: ${returnedSCEvents.toList.map(_.address).mkString(", ")}. " +
-              s"Continuing since snapshot was already validated by L0 majority consensus."
-          )
-          .whenA(returnedSCEvents.nonEmpty)
-        diffRewards = acceptedRewardTxs -- signedArtifact.rewards
-        _ <- logger
-          .warn(
-            s"Follower: ${diffRewards.size} rewards not accepted at ordinal=${signedArtifact.ordinal.show}. " +
-              s"Continuing since snapshot was already validated by L0 majority consensus."
-          )
-          .whenA(diffRewards.nonEmpty)
-        // State-proof cross-check: compare the MPT root we computed locally (by applying
-        // the same delta through accept()) against the MPT root the leader claimed in the
-        // incoming signed artifact. A mismatch means either our state diverged or the claim
-        // is wrong — either way we MUST NOT silently commit divergent state.
-        //
-        // Scope: under MPT-as-primary, the `mptRoot` is THE canonical state proof; the
-        // legacy 16-field proofs are read-only artifacts carried for backward compat and
-        // are not the source of truth post-migration, so we don't compare them. For
-        // LegacyFormat ordinals both mptRoots are `None` and the check is a no-op.
-        //
-        // On mismatch we restore the MPT from the pre-accept savepoint BEFORE raising —
-        // otherwise `syncFromStateChanges` has already committed the delta and the journal
-        // tip has advanced, leaving the store with divergent bytes for upstream retries.
-        //
-        // The previous policy explicitly skipped this check entirely with the rationale
-        // "too expensive" — which surfaced the class of silent-divergence bug a partition
-        // test exposed. Now with typed-scodec MPT the cost is tolerable, and silent
-        // divergence is not acceptable.
-        _ <- {
-          val mismatch = computedStateProof.mptRoot =!= signedArtifact.stateProof.mptRoot
-          val restore = preAcceptSavepoint.restore
-          val raise = Async[F].raiseError[Unit](
-            StateProofMismatch(
-              ordinal = signedArtifact.ordinal,
-              computed = computedStateProof,
-              claimed = signedArtifact.stateProof
+                      transformedCreateDelegatedStakes =
+                        if (signedArtifact.ordinal > incrementalDelegatedStakingStartingOrdinal)
+                          updatedCreateDelegatedStakes.view.mapValues { records =>
+                            records.map { r =>
+                              r.copy(
+                                currentTokenLockRef = r.currentTokenLockRef.orElse(r.tokenLockRef.some),
+                                currentAmount = r.currentAmount.orElse(r.amount.some)
+                              )
+                            }
+                          }.to(SortedMap)
+                        else updatedCreateDelegatedStakes
+                    } yield
+                      if (signedArtifact.ordinal.value < setSumFixOrdinal.value)
+                        DelegatedRewardsResult(
+                          delegatorRewardsMap = signedArtifact.delegateRewards
+                            .getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]]),
+                          updatedCreateDelegatedStakes = transformedCreateDelegatedStakes,
+                          updatedWithdrawDelegatedStakes = updatedWithdrawDelegatedStakes,
+                          nodeOperatorRewards = rewardTxs,
+                          reservedAddressRewards = SortedSet.empty,
+                          withdrawalRewardTxs = SortedSet.empty,
+                          totalEmittedRewardsAmount = Amount(
+                            NonNegLong.unsafeFrom(rewardTxs.toList.map(_.amount.value.value).distinct.sum)
+                          ) // mimic incorrect behaviour
+                        )
+                      else
+                        DelegatedRewardsResult(
+                          delegatorRewardsMap = signedArtifact.delegateRewards
+                            .getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]]),
+                          updatedCreateDelegatedStakes = transformedCreateDelegatedStakes,
+                          updatedWithdrawDelegatedStakes = updatedWithdrawDelegatedStakes,
+                          nodeOperatorRewards = rewardTxs,
+                          reservedAddressRewards = SortedSet.empty,
+                          withdrawalRewardTxs = SortedSet.empty,
+                          totalEmittedRewardsAmount = Amount(NonNegLong.unsafeFrom(rewardTxs.toList.map(_.amount.value.value).sum))
+                        )
+                }
+              },
+              StateChannelValidationType.Historical,
+              getGlobalSnapshotByOrdinal
             )
-          )
-          val perFieldDiffs = perFieldRootDiffs(computedStateProof, signedArtifact.stateProof)
-          val diffSuffix = if (perFieldDiffs.isEmpty) "" else s" — diffs: ${perFieldDiffs.mkString(", ")}"
-          (logger.error(
-            s"StateProofMismatch at ordinal=${signedArtifact.ordinal.show}: " +
-              s"computed.mptRoot=${computedStateProof.mptRoot.map(_.show.take(12)).getOrElse("none")} " +
-              s"claimed.mptRoot=${signedArtifact.stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")}" +
-              diffSuffix +
-              s" — rolling back MPT to pre-accept savepoint"
-          ) >> restore >> raise).whenA(mismatch)
+            .flatMap {
+              case (
+                    acceptanceResult,
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    returnedSCEvents,
+                    acceptedRewardTxs,
+                    snapshotInfo,
+                    computedStateProof,
+                    _,
+                    _,
+                    _,
+                    _
+                  ) =>
+                // For followers (currency-l0, dag-l1, currency-l1), we log warnings instead of raising errors
+                // for blocks, state channels, and rewards validation divergences.
+                // The snapshot was already validated by dag-l0 majority consensus, so local acceptance
+                // divergences on followers should not cause permanent stalls. The same rationale applies
+                // as for skipping state proof validation below.
+                for {
+                  _ <- logger
+                    .warn(
+                      s"Follower: ${acceptanceResult.notAccepted.size} blocks not accepted at ordinal=${signedArtifact.ordinal.show}. " +
+                        s"Reasons: ${acceptanceResult.notAccepted.map { case (_, reason) => reason }.mkString(", ")}. " +
+                        s"Continuing since snapshot was already validated by L0 majority consensus."
+                    )
+                    .whenA(acceptanceResult.notAccepted.nonEmpty)
+                  _ <- logger
+                    .warn(
+                      s"Follower: ${returnedSCEvents.size} state channels returned at ordinal=${signedArtifact.ordinal.show} " +
+                        s"for addresses: ${returnedSCEvents.toList.map(_.address).mkString(", ")}. " +
+                        s"Continuing since snapshot was already validated by L0 majority consensus."
+                    )
+                    .whenA(returnedSCEvents.nonEmpty)
+                  diffRewards = acceptedRewardTxs -- signedArtifact.rewards
+                  _ <- logger
+                    .warn(
+                      s"Follower: ${diffRewards.size} rewards not accepted at ordinal=${signedArtifact.ordinal.show}. " +
+                        s"Continuing since snapshot was already validated by L0 majority consensus."
+                    )
+                    .whenA(diffRewards.nonEmpty)
+                  // State-proof cross-check: compare the MPT root we computed locally (by applying
+                  // the same delta through accept()) against the MPT root the leader claimed in the
+                  // incoming signed artifact. A mismatch raises StateProofMismatch — the surrounding
+                  // `mptStore.withTransaction` bracket auto-rolls back the MPT mutations on raise,
+                  // so divergent bytes don't leak into future rounds.
+                  //
+                  // Scope: under MPT-as-primary, the `mptRoot` is THE canonical state proof; the
+                  // legacy 16-field proofs are read-only artifacts carried for backward compat and
+                  // are not the source of truth post-migration, so we don't compare them. For
+                  // LegacyFormat ordinals both mptRoots are `None` and the check is a no-op.
+                  mismatch = computedStateProof.mptRoot =!= signedArtifact.stateProof.mptRoot
+                  _ <-
+                    if (mismatch) {
+                      val perFieldDiffs = perFieldRootDiffs(computedStateProof, signedArtifact.stateProof)
+                      val diffSuffix = if (perFieldDiffs.isEmpty) "" else s" — diffs: ${perFieldDiffs.mkString(", ")}"
+                      logger.error(
+                        s"StateProofMismatch at ordinal=${signedArtifact.ordinal.show}: " +
+                          s"computed.mptRoot=${computedStateProof.mptRoot.map(_.show.take(12)).getOrElse("none")} " +
+                          s"claimed.mptRoot=${signedArtifact.stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")}" +
+                          diffSuffix +
+                          s" — rolling back MPT (transaction will rollback)"
+                      ) >> Async[F].raiseError[(GlobalSnapshotInfo, MptTxAction)](
+                        StateProofMismatch(
+                          ordinal = signedArtifact.ordinal,
+                          computed = computedStateProof,
+                          claimed = signedArtifact.stateProof
+                        )
+                      )
+                    } else Async[F].unit
+                } yield (snapshotInfo, MptTxAction.Commit: MptTxAction)
+            }
         }
-
       } yield snapshotInfo
     }
 

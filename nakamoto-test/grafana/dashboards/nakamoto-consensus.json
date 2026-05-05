@@ -242,14 +242,36 @@
     },
     {
       "id": 18,
-      "title": "Snapshot Production Rate (per node)",
-      "description": "Snapshots produced per minute by each node",
+      "title": "Snapshot Production Share (% per node)",
+      "description": "Each node's share of cluster-wide snapshot production. Stacked to 100% — asymmetry shows as one band dominating the bar.",
       "type": "timeseries",
-      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 45 },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 45 },
       "targets": [
-        { "expr": "rate(dag_nakamoto_snapshots_produced_total[1m]) * 60", "legendFormat": "{{node}}" }
+        { "expr": "100 * rate(dag_nakamoto_snapshots_produced_total[1m]) / scalar(sum(rate(dag_nakamoto_snapshots_produced_total[1m])))", "legendFormat": "{{node}}" }
       ],
-      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 50 } } }
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "decimals": 1, "custom": { "drawStyle": "bars", "fillOpacity": 80, "stacking": { "mode": "normal", "group": "A" } } } }
+    },
+    {
+      "id": 110,
+      "title": "Snapshots Received by Producer (% of cluster)",
+      "description": "Per-producer share of snapshots adopted by the cluster (counts each delivery across all receivers, sliced by producer_id label). Stacked to 100% — uneven bars indicate one peer is dominating chain extensions.",
+      "type": "timeseries",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 45 },
+      "targets": [
+        { "expr": "100 * sum(rate(dag_nakamoto_snapshots_received_by_producer[1m])) by (producer_id) / scalar(sum(rate(dag_nakamoto_snapshots_received_by_producer[1m])))", "legendFormat": "{{producer_id}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100, "decimals": 1, "custom": { "drawStyle": "bars", "fillOpacity": 80, "stacking": { "mode": "normal", "group": "A" } } } }
+    },
+    {
+      "id": 111,
+      "title": "Wins by Eta Period (per node)",
+      "description": "Decomposes per-node win counts into eta-rotation periods. Each period shares the same eta across all nodes — within a period, per-node wins are deterministic from (sk, eta). Persistent skew across many periods → systematic per-key bias. Periodic skew that averages out → finite-sample (sk, eta) variance.",
+      "type": "timeseries",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 45 },
+      "targets": [
+        { "expr": "sum by (node, eta_period) (increase(dag_nakamoto_slots_won_by_period_total[$__range]))", "legendFormat": "{{node}}-p{{eta_period}}", "instant": false }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "custom": { "drawStyle": "bars", "fillOpacity": 70 } } }
     },
 
     {
