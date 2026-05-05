@@ -70,13 +70,17 @@ if [ "$LIST_TESTS" = "true" ]; then
   echo "  data-without-fee         Data transaction tests (without fee; override signer with CI_PRIVATE_KEY)"
   echo "  data-with-fee            Data transaction tests (with fee; override signer with CI_PRIVATE_KEY)"
   echo ""
+  echo "Multi-metagraph tests (require --metagraphs=K with K>=2, opt-in only):"
+  echo "  multi-metagraph          Sanity check K parallel metagraphs share gl0 with distinct IDs"
+  echo ""
   echo "Usage: just test --test=dag-cluster --test=delegated-staking"
   echo "       just test --test=dag-cluster,rewards    (comma-separated)"
+  echo "       just test --metagraphs=2 --test=multi-metagraph   (multi-metagraph)"
   exit 0
 fi
 
 # If tests are selected, check if any require metagraph. If not, skip metagraph setup.
-METAGRAPH_TESTS="currency,rewards,token-locks,allow-spends,spend,data-without-fee,data-with-fee"
+METAGRAPH_TESTS="currency,rewards,token-locks,allow-spends,spend,data-without-fee,data-with-fee,multi-metagraph"
 if [ -n "$SELECTED_TESTS" ] && [ -n "$METAGRAPH" ]; then
   needs_metagraph=false
   for t in $(echo "$SELECTED_TESTS" | tr ',' ' '); do
@@ -140,9 +144,18 @@ else
     echo "removed config, $PROJECT_ROOT/nodes"
   fi
 
-  for i in $(seq 0 $((MAX_NODES - 1))); do
+  # Hypergraph operator dirs (gl0+gl1)
+  for i in $(seq 0 $((MAX_HG_NODES - 1))); do
     mkdir -p ./nodes/$i
   done
+  # Per-metagraph operator dirs (ml0+cl1+dl1, distinct keystore per metagraph)
+  if [ -n "$METAGRAPH" ]; then
+    for k in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
+      for i in $(seq 0 $((${MAX_METAGRAPH_NODES:-$MAX_NODES} - 1))); do
+        mkdir -p ./nodes/m${k}-${i}
+      done
+    done
+  fi
 
   # Copy keytool and wallet jars to nodes directory for key generation (needed for nodes 3+)
   cp ./docker/jars/keytool.jar ./docker/jars/wallet.jar ./nodes/ 2>/dev/null || true
@@ -171,13 +184,16 @@ else
   fi
 
 
+  # /16 subnet — hypergraph at NET_BASE.0.0/24, metagraph k at NET_BASE.${k+1}.0/24.
+  # Allows K parallel metagraph clusters with disjoint /24s, no IP collisions.
+  NET_BASE_SUBNET=${NET_PREFIX%.*}
   docker network create \
     --driver=bridge \
-    --subnet=${NET_PREFIX}.0/24 \
+    --subnet=${NET_BASE_SUBNET}.0.0/16 \
     tessellation_common
 
-  # Phase 1: Setup compose files and start GL0 nodes
-  for i in $(seq 0 $((MAX_NODES - 1))); do
+  # Phase 1a: Seed compose files into hypergraph operator dirs (gl0+gl1)
+  for i in $(seq 0 $((MAX_HG_NODES - 1))); do
     cd ./nodes/$i/
 
     docker compose -f docker-compose.test.yaml \
@@ -188,9 +204,6 @@ else
     cp ../../docker/docker-compose.yaml . ; \
     cp ../../docker/docker-compose.test.yaml . ; \
     cp ../../docker/docker-compose.volumes.yaml . ; \
-    cp ../../docker/docker-compose.metagraph.yaml . ;
-    cp ../../docker/docker-compose.metagraph-test.yaml . ;
-    cp ../../docker/docker-compose.metagraph-genesis.yaml . ;
 
     if [ "$NAKAMOTO_GL0" = "true" ]; then
       cp ../../docker/docker-compose.nakamoto-sidecar.yaml . ;
@@ -199,6 +212,28 @@ else
 
     cd ../../
   done
+
+  # Phase 1b: Seed compose files into per-metagraph operator dirs (ml0+cl1+dl1)
+  if [ -n "$METAGRAPH" ]; then
+    for k in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
+      for i in $(seq 0 $((${MAX_METAGRAPH_NODES:-$MAX_NODES} - 1))); do
+        if [ ! -d "./nodes/m${k}-${i}" ]; then
+          continue
+        fi
+        cd ./nodes/m${k}-${i}/
+
+        docker compose -f docker-compose.metagraph.yaml \
+        -f docker-compose.metagraph-test.yaml \
+        down --remove-orphans --volumes > /dev/null 2>&1 || true;
+
+        cp ../../docker/docker-compose.metagraph.yaml . ;
+        cp ../../docker/docker-compose.metagraph-test.yaml . ;
+        cp ../../docker/docker-compose.metagraph-genesis.yaml . ;
+
+        cd ../../
+      done
+    done
+  fi
 
   # Nakamoto mode: write shared genesis time, sidecar peer list, JVM seedlist,
   # and genesis CSV into each gl0 node's .env + node dir. All gl0 nodes MUST
@@ -250,6 +285,28 @@ else
       NODE_P2P_PORT="${DAG_L0_PORT_PREFIX}${j}1"
       NAKAMOTO_JVM_SEEDLIST="${NAKAMOTO_JVM_SEEDLIST}${PEER_ID},${NODE_IP},${NODE_P2P_PORT},,\n"
     done
+
+    # Append per-metagraph operator peer IDs with alias=metagraph-op so gl0 will
+    # accept their state-channel binary signatures (validateSignaturesWithSeedlist
+    # requires at least one signer to be in the seedlist). The "metagraph-op"
+    # marker is filtered out of StakeRegistry validators in
+    # GlobalSnapshotConsensus.scala so VRF stake stays at 1/N over hg validators
+    # only — adding metagraph signers would otherwise dilute it.
+    if [ -n "$METAGRAPH" ]; then
+      for k in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
+        M_PREFIX="${NET_BASE}.$((k + 1))"
+        M_ML0_PORT_PREFIX=$((ML0_PORT_PREFIX - k*10))
+        for i in $(seq 0 $((${MAX_METAGRAPH_NODES:-$MAX_NODES} - 1))); do
+          M_PEER_FILE="./nodes/m${k}-${i}/peer_id"
+          if [ -f "$M_PEER_FILE" ]; then
+            M_PEER_ID=$(cat "$M_PEER_FILE")
+            M_NODE_IP="${M_PREFIX}.3${i}"
+            M_NODE_P2P_PORT="${M_ML0_PORT_PREFIX}${i}1"
+            NAKAMOTO_JVM_SEEDLIST="${NAKAMOTO_JVM_SEEDLIST}${M_PEER_ID},${M_NODE_IP},${M_NODE_P2P_PORT},metagraph-op,\n"
+          fi
+        done
+      done
+    fi
 
     for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
       # Write the JVM seedlist file into each node directory
@@ -318,8 +375,9 @@ else
     fi
   fi
 
-  # Phase 2: Start GL1 nodes (GL0 is now ready for peer discovery)
-  for i in $(seq 0 $((MAX_NODES - 1))); do
+  # Phase 2: Start GL1 nodes (GL0 is now ready for peer discovery).
+  # GL1 lives in the hypergraph operator dirs alongside GL0.
+  for i in $(seq 0 $((MAX_HG_NODES - 1))); do
     cd ./nodes/$i/
 
     if [ "$i" -lt "$NUM_GL1_NODES" ]; then
@@ -361,88 +419,126 @@ else
   if [ -n "$METAGRAPH" ]; then
     metagraph_args="-f docker-compose.metagraph.yaml -f docker-compose.metagraph-test.yaml"
 
-    # Phase 1: Genesis creation, set METAGRAPH_ID, and start ML0
-    for i in $(seq 0 $((MAX_NODES - 1))); do
-      cd ./nodes/$i/
+    # Per-metagraph startup. Each metagraph k has its own operator dirs at
+    # nodes/m${k}-${i} with distinct keystore. Genesis is m${k}-0; its
+    # genesis.address gives the metagraph's address (METAGRAPH_ID).
+    declare -a METAGRAPH_IDS=()
+    for k in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
+      M_PREFIX="m${k}"
+      echo "================================================"
+      echo "Bringing up metagraph $k (operators: nodes/${M_PREFIX}-*/)"
+      echo "================================================"
 
-      if [ ! -f "./genesis.snapshot" ] && [ "$i" -eq 0 ]; then
-        echo "Generating metagraph genesis snapshot"
-        cp .env .env.bak
-        echo "CL_ML0_GENERATE_GENESIS=true" >> .env
-        docker compose $metagraph_args -f docker-compose.metagraph-genesis.yaml --profile ml0 up
-        docker stop ml0-0
-        docker rm ml0-0
-        cp ml0-data/genesis.snapshot .
-        cp ml0-data/genesis.address .
-        mv .env.bak .env
-      fi
-      # Ensure genesis.snapshot is in ml0-data (clean-data wipes ml0-data/ but
-      # leaves ./genesis.snapshot in the node root, so regeneration is skipped)
-      if [ -f "./genesis.snapshot" ] && [ ! -f "./ml0-data/genesis.snapshot" ]; then
-        mkdir -p ./ml0-data
-        cp ./genesis.snapshot ./ml0-data/genesis.snapshot
-      fi
-      # Set METAGRAPH_ID from genesis.address (may already be exported from
-      # genesis generation above, or read from a previous run's file)
-      if [ -z "$METAGRAPH_ID" ] && [ -f "./genesis.address" ]; then
-        export METAGRAPH_ID=$(head -n 1 genesis.address)
-      fi
-      echo "METAGRAPH_ID=$METAGRAPH_ID" >> .env
-      echo "CL_L0_TOKEN_IDENTIFIER=$METAGRAPH_ID" >> .env
+      # Phase 1: Genesis creation + ML0 start
+      for i in $(seq 0 $((${MAX_METAGRAPH_NODES:-$MAX_NODES} - 1))); do
+        if [ ! -d "./nodes/${M_PREFIX}-${i}" ]; then
+          continue
+        fi
+        cd ./nodes/${M_PREFIX}-${i}/
 
-      if [ "$i" -lt "$NUM_ML0_NODES" ]; then
-        echo "Starting ML0 for node $i"
-        docker compose $metagraph_args --profile ml0 up -d
-      fi
-
-      cd ../../
-    done
-
-    # Wait for ML0 to be ready before starting metagraph L1 layers (CL1/DL1)
-    if [ "$NUM_ML0_NODES" -gt 0 ]; then
-      echo "Waiting for ML0 to be ready before starting metagraph L1 layers..."
-      ml0_url="${TEST_HOST:-http://localhost}:${ML0_PORT_PREFIX}00"
-      ml0_ready=false
-      for attempt in $(seq 1 120); do
-        cluster_info=$(curl -s "${ml0_url}/cluster/info" 2>/dev/null || echo "")
-        if [ -n "$cluster_info" ] && echo "$cluster_info" | jq 'length' >/dev/null 2>&1; then
-          node_count=$(echo "$cluster_info" | jq 'length')
-          if [ "$node_count" -ge 1 ]; then
-            echo "ML0 is ready with $node_count node(s)"
-            ml0_ready=true
-            break
+        if [ ! -f "./genesis.snapshot" ] && [ "$i" -eq 0 ]; then
+          echo "Generating metagraph $k genesis snapshot"
+          cp .env .env.bak
+          echo "CL_ML0_GENERATE_GENESIS=true" >> .env
+          docker compose $metagraph_args -f docker-compose.metagraph-genesis.yaml --profile ml0 up
+          docker stop ml0-${M_PREFIX}-0
+          docker rm ml0-${M_PREFIX}-0
+          cp ml0-data/genesis.snapshot .
+          cp ml0-data/genesis.address .
+          mv .env.bak .env
+        fi
+        # Ensure genesis.snapshot is in ml0-data (clean-data wipes ml0-data/ but
+        # leaves ./genesis.snapshot in the node root, so regeneration is skipped)
+        if [ -f "./genesis.snapshot" ] && [ ! -f "./ml0-data/genesis.snapshot" ]; then
+          mkdir -p ./ml0-data
+          cp ./genesis.snapshot ./ml0-data/genesis.snapshot
+        fi
+        # Capture this metagraph's ID from m${k}-0/genesis.address; reuse for
+        # validators. METAGRAPH_IDS[k] holds the address; written into every
+        # operator dir's .env so cl1/dl1/ml0 share the L0_TOKEN_IDENTIFIER.
+        if [ "$i" -eq 0 ] && [ -f "./genesis.address" ]; then
+          MK_ID=$(head -n 1 genesis.address)
+          METAGRAPH_IDS[$k]="$MK_ID"
+          export "M${k}_METAGRAPH_ID=$MK_ID"
+          # Back-compat: METAGRAPH_ID without prefix == metagraph 0's ID.
+          # JS tests today read process.env.METAGRAPH_ID expecting m0.
+          if [ "$k" -eq 0 ]; then
+            export METAGRAPH_ID="$MK_ID"
           fi
         fi
-        echo "ML0 not ready yet (attempt $attempt/120), waiting..."
-        sleep 5
+        MK_ID="${METAGRAPH_IDS[$k]:-${MK_ID:-}}"
+        echo "METAGRAPH_ID=$MK_ID" >> .env
+        echo "CL_L0_TOKEN_IDENTIFIER=$MK_ID" >> .env
+
+        if [ "$i" -lt "$NUM_ML0_NODES" ]; then
+          echo "Starting ML0 for metagraph $k node $i (container ml0-${M_PREFIX}-${i})"
+          docker compose $metagraph_args --profile ml0 up -d
+        fi
+
+        cd ../../
       done
-      if [ "$ml0_ready" = "false" ]; then
-        echo "ERROR: ML0 did not become ready in time"
-        docker logs ml0-0 || true
-        exit 1
-      fi
-    fi
 
-    # Phase 2: Start CL1/DL1 services (ML0 is now ready)
-    for i in $(seq 0 $((MAX_NODES - 1))); do
-      cd ./nodes/$i/
-
-      l1_profile_args=""
-      if [ "$i" -lt "$NUM_CL1_NODES" ]; then
-        l1_profile_args="$l1_profile_args --profile cl1"
+      # Wait for THIS metagraph's ML0 to be ready before starting its CL1/DL1
+      if [ "$NUM_ML0_NODES" -gt 0 ]; then
+        echo "Waiting for metagraph $k ML0 to be ready before starting CL1/DL1..."
+        # Per-metagraph external ml0 port: M_ML0_PORT_PREFIX shifts -10 per k
+        # to avoid host-port collisions across metagraphs (m0=92xx, m1=82xx, ...).
+        M_ML0_PORT_PREFIX=$((ML0_PORT_PREFIX - k*10))
+        ml0_url="${TEST_HOST:-http://localhost}:${M_ML0_PORT_PREFIX}00"
+        ml0_ready=false
+        for attempt in $(seq 1 120); do
+          cluster_info=$(curl -s "${ml0_url}/cluster/info" 2>/dev/null || echo "")
+          if [ -n "$cluster_info" ] && echo "$cluster_info" | jq 'length' >/dev/null 2>&1; then
+            node_count=$(echo "$cluster_info" | jq 'length')
+            if [ "$node_count" -ge 1 ]; then
+              echo "Metagraph $k ML0 is ready with $node_count node(s)"
+              ml0_ready=true
+              break
+            fi
+          fi
+          echo "Metagraph $k ML0 not ready yet (attempt $attempt/120), waiting..."
+          sleep 5
+        done
+        if [ "$ml0_ready" = "false" ]; then
+          echo "ERROR: Metagraph $k ML0 did not become ready in time"
+          docker logs ml0-${M_PREFIX}-0 || true
+          exit 1
+        fi
       fi
-      if [ "$i" -lt "$NUM_DL1_NODES" ]; then
-        l1_profile_args="$l1_profile_args --profile dl1"
-      fi
-      l1_profile_args=$(echo $l1_profile_args | xargs)
 
-      if [ -n "$l1_profile_args" ]; then
-        echo "Starting CL1/DL1 for node $i"
-        docker compose $metagraph_args $l1_profile_args up -d
-      fi
+      # Phase 2: Start CL1/DL1 for this metagraph
+      for i in $(seq 0 $((${MAX_METAGRAPH_NODES:-$MAX_NODES} - 1))); do
+        if [ ! -d "./nodes/${M_PREFIX}-${i}" ]; then
+          continue
+        fi
+        cd ./nodes/${M_PREFIX}-${i}/
 
-      cd ../../
+        l1_profile_args=""
+        if [ "$i" -lt "$NUM_CL1_NODES" ]; then
+          l1_profile_args="$l1_profile_args --profile cl1"
+        fi
+        if [ "$i" -lt "$NUM_DL1_NODES" ]; then
+          l1_profile_args="$l1_profile_args --profile dl1"
+        fi
+        l1_profile_args=$(echo $l1_profile_args | xargs)
+
+        if [ -n "$l1_profile_args" ]; then
+          echo "Starting CL1/DL1 for metagraph $k node $i"
+          docker compose $metagraph_args $l1_profile_args up -d
+        fi
+
+        cd ../../
+      done
     done
+
+    # Export aggregate METAGRAPH_IDS_CSV so JS tests can iterate K metagraphs
+    METAGRAPH_IDS_CSV=""
+    for k in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
+      [ -n "$METAGRAPH_IDS_CSV" ] && METAGRAPH_IDS_CSV="${METAGRAPH_IDS_CSV},"
+      METAGRAPH_IDS_CSV="${METAGRAPH_IDS_CSV}${METAGRAPH_IDS[$k]:-}"
+    done
+    export METAGRAPH_IDS_CSV
+    echo "METAGRAPH_IDS_CSV=${METAGRAPH_IDS_CSV}"
   fi
 
 
@@ -787,6 +883,22 @@ fi
 # ------------------------------------------------
 
 if [ -n "$METAGRAPH" ]; then
+
+  # Multi-metagraph sanity test: opt-in via --test=multi-metagraph, only runs
+  # when --metagraphs=K with K>=2 (otherwise the test refuses by design — no
+  # silent pass on a single-metagraph cluster). Not part of the default suite.
+  if [ -n "$SELECTED_TESTS" ] && echo "$SELECTED_TESTS" | tr ',' '\n' | grep -qx "multi-metagraph"; then
+    echo "================================================"
+    echo "Running multi-metagraph sanity test (K=${NUM_METAGRAPHS})"
+    echo "================================================"
+    if [ "${NUM_METAGRAPHS:-1}" -lt 2 ]; then
+      echo "ERROR: multi-metagraph test requires --metagraphs=K with K>=2 (got NUM_METAGRAPHS=${NUM_METAGRAPHS:-1})"
+      exit 1
+    fi
+    cd $PROJECT_ROOT/.github/action_scripts
+    node check_clusters/multi-metagraph.js
+    show_time "Multi-metagraph sanity test completed"
+  fi
 
   if should_run_test "currency"; then
     echo "================================================"

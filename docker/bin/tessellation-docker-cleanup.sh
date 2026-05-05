@@ -19,11 +19,19 @@ cleanup() {
     for i in $(seq 0 9); do
         cleanup_container gl0-$i gl0-data-$i &
         cleanup_container gl1-$i gl1-data-$i &
+        # Nakamoto sidecar containers (only present when --nakamoto-gl0 was used)
+        cleanup_container sidecar-$i "" &
+        # Legacy single-metagraph layout (pre multi-metagraph)
         cleanup_container dl1-$i dl1-data-$i &
         cleanup_container ml0-$i ml0-data-$i &
         cleanup_container cl1-$i cl1-data-$i &
-        # Nakamoto sidecar containers (only present when --nakamoto-gl0 was used)
-        cleanup_container sidecar-$i "" &
+        # Multi-metagraph layout: ml0-m${k}-${i}, cl1-m${k}-${i}, dl1-m${k}-${i}
+        # for k in 0..9 (matches NUM_METAGRAPHS cap from set-env.sh).
+        for k in $(seq 0 9); do
+            cleanup_container ml0-m${k}-$i ml0-data-m${k}-$i &
+            cleanup_container cl1-m${k}-$i cl1-data-m${k}-$i &
+            cleanup_container dl1-m${k}-$i dl1-data-m${k}-$i &
+        done
     done
     cleanup_container snapshot-streaming-postgres ss-pgdata &
     cleanup_container snapshot-streaming "" &

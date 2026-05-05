@@ -72,7 +72,16 @@ if [ "$ID" == "dl1" ]; then
 fi
 
 if [ -z "$CL_EXTERNAL_IP" ]; then
-  export CL_EXTERNAL_IP=${NET_PREFIX}.${CL_DOCKER_TEST_NETWORK_SUFFIX:-1}${CONTAINER_OFFSET:-0}
+  # Metagraph layers (ml0/cl1/dl1) live in their own /24 subnet per metagraph
+  # k at NET_BASE.${k+1}.*; hg layers (gl0/gl1) stay at NET_PREFIX.* (= NET_BASE.0).
+  # METAGRAPH_NET_PREFIX is set per-metagraph by docker-env-setup.sh and is the
+  # right base for ml0/cl1/dl1; NET_PREFIX is the legacy single-subnet fallback.
+  if [ "$ID" == "ml0" ] || [ "$ID" == "cl1" ] || [ "$ID" == "dl1" ]; then
+    BASE_PREFIX=${METAGRAPH_NET_PREFIX:-${NET_PREFIX}}
+  else
+    BASE_PREFIX=${NET_PREFIX}
+  fi
+  export CL_EXTERNAL_IP=${BASE_PREFIX}.${CL_DOCKER_TEST_NETWORK_SUFFIX:-1}${CONTAINER_OFFSET:-0}
 fi
 
 echo "Using external IP $CL_EXTERNAL_IP for service $ID"

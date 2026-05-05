@@ -67,6 +67,18 @@ export LIST_TESTS=${LIST_TESTS:-false}
 # .workspace/sharding-design-notes.md §3 (Deliverable A — multi-metagraph e2e).
 export NUM_METAGRAPHS=${NUM_METAGRAPHS:-1}
 
+# Nakamoto GL0 is the only consensus mode on this branch — the JAR no longer
+# exposes BFT subcommands (run-genesis/run-validator/run-rollback) for gl0.
+# The NAKAMOTO_GL0 var and the `--nakamoto-gl0` flag are kept ONLY as a
+# transitional shim while CI scripts and runbooks still reference them; the
+# scattered `if [ "$NAKAMOTO_GL0" = "true" ]` gates in compose-runner.sh +
+# entrypoint.sh + docker-compose.nakamoto-overlay.yaml selection should be
+# collapsed once everything that calls into here drops the flag.
+# TODO(multi-metagraph cleanup): remove --nakamoto-gl0 + NAKAMOTO_GL0 var
+# entirely; make the sidecar build, overlay, and entrypoint Nakamoto-only by
+# default; drop the NAKAMOTO_MODE env var passed via the overlay.
+export NAKAMOTO_GL0=${NAKAMOTO_GL0:-true}
+
 
 # Store any explicitly-set TESSELLATION_VERSION from environment
 # This will be used for precedence after args are parsed
@@ -211,10 +223,9 @@ for arg in "$@"; do
       fi
       ;;
     --nakamoto-gl0)
-      # Run GL0 in Nakamoto mode (VRF + libp2p sidecar gossip) instead of BFT.
-      # compose-runner.sh adds a sidecar service per gl0 node and writes
-      # NAKAMOTO_* env vars into each per-node .env. CL0/GL1/CL1/DL1 layers
-      # remain BFT and talk to GL0 over HTTP unchanged.
+      # No-op: NAKAMOTO_GL0 defaults to true on this branch (BFT gl0 is gone).
+      # Kept for backward compat with scripts/CI that still pass it explicitly.
+      # TODO: remove flag + var once all callers drop it (see set-env.sh top).
       export NAKAMOTO_GL0=true
       ;;
     --skip-streaming)
@@ -418,17 +429,28 @@ if [ -n "$METAGRAPH" ]; then
     fi
 fi
 
-# Compute MAX_NODES as the maximum of all NUM_*_NODES values (capped at 10)
-# This drives how many node directories, keys, and configs are created
+# Compute MAX_NODES as the maximum of all NUM_*_NODES values (capped at 10).
+# Hypergraph operators live in nodes/$i/ and run gl0+gl1; their count comes
+# from NUM_GL0_NODES / NUM_GL1_NODES.
+#
+# Metagraph operators (per metagraph k in [0, NUM_METAGRAPHS)) live in
+# nodes/m${k}-${i}/ and run ml0+cl1+dl1; their count is MAX_METAGRAPH_NODES,
+# the max of the per-layer NUM_ML0/CL1/DL1_NODES (each metagraph has its own
+# independent operator set with its own keystore).
+#
+# MAX_NODES is the unified ceiling — drives directory creation for both
+# hypergraph and metagraph operators (the latter via K parallel m${k}-* dirs).
 _max_of() { [ "$1" -gt "$2" ] && echo "$1" || echo "$2"; }
-MAX_NODES=$(_max_of ${NUM_GL0_NODES:-0} ${NUM_GL1_NODES:-0})
-MAX_NODES=$(_max_of $MAX_NODES ${NUM_ML0_NODES:-0})
-MAX_NODES=$(_max_of $MAX_NODES ${NUM_CL1_NODES:-0})
-MAX_NODES=$(_max_of $MAX_NODES ${NUM_DL1_NODES:-0})
+MAX_HG_NODES=$(_max_of ${NUM_GL0_NODES:-0} ${NUM_GL1_NODES:-0})
+MAX_METAGRAPH_NODES=$(_max_of ${NUM_ML0_NODES:-0} ${NUM_CL1_NODES:-0})
+MAX_METAGRAPH_NODES=$(_max_of $MAX_METAGRAPH_NODES ${NUM_DL1_NODES:-0})
+MAX_NODES=$(_max_of $MAX_HG_NODES $MAX_METAGRAPH_NODES)
 # Ensure at least 3 (legacy default) and at most 9 (single-digit IP/port offset limit)
 MAX_NODES=$(_max_of $MAX_NODES 3)
 [ "$MAX_NODES" -gt 9 ] && MAX_NODES=9
-export MAX_NODES
+[ "$MAX_HG_NODES" -gt 9 ] && MAX_HG_NODES=9
+[ "$MAX_METAGRAPH_NODES" -gt 9 ] && MAX_METAGRAPH_NODES=9
+export MAX_NODES MAX_HG_NODES MAX_METAGRAPH_NODES
 
 # Layer URLs: explicit overrides take priority, otherwise built from TEST_HOST + port prefix
 # When using a remote host, GL1 defaults to port 9010 instead of 9100

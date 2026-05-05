@@ -17,6 +17,40 @@ const createNetworkConfig = (args) => {
     };
 };
 
+// Per-metagraph URL helper. K metagraphs share the same gl0/gl1 hypergraph
+// but each has its own ml0/cl1/dl1 cluster at port-prefix shifted -10 per k
+// (m0=92/93/94, m1=82/83/84, ...). Mirrors the bash logic in
+// docker-env-setup.sh that allocates host ports per metagraph.
+//
+// Args: metagraphIdx (k in [0, NUM_METAGRAPHS)).
+// Returns: { metagraphId, metagraphL0Url, currencyL1Url, dataL1Url }.
+const getMetagraphUrls = (metagraphIdx) => {
+    const k = parseInt(metagraphIdx, 10);
+    const host = process.env.TEST_HOST || 'http://localhost';
+
+    // METAGRAPH_IDS_CSV is exported by compose-runner.sh after metagraph
+    // genesis; falls back to METAGRAPH_ID for k=0 single-metagraph compat.
+    const idsCsv = process.env.METAGRAPH_IDS_CSV || '';
+    const ids = idsCsv ? idsCsv.split(',') : [];
+    const metagraphId = ids[k] || (k === 0 ? process.env.METAGRAPH_ID : null);
+    if (!metagraphId) {
+        throw new Error(`No metagraph ID found for k=${k} (METAGRAPH_IDS_CSV="${idsCsv}", METAGRAPH_ID="${process.env.METAGRAPH_ID}")`);
+    }
+
+    // Per-k port prefix shift, matching docker-env-setup.sh:
+    // M_ML0_PORT_PREFIX = ML0_PORT_PREFIX - k*10
+    const ml0PortPrefix = parseInt(process.env.ML0_PORT_PREFIX || '92', 10) - k * 10;
+    const cl1PortPrefix = parseInt(process.env.CL1_PORT_PREFIX || '93', 10) - k * 10;
+    const dl1PortPrefix = parseInt(process.env.DL1_PORT_PREFIX || '94', 10) - k * 10;
+
+    return {
+        metagraphId,
+        metagraphL0Url: `${host}:${ml0PortPrefix}00`,
+        currencyL1Url: `${host}:${cl1PortPrefix}00`,
+        dataL1Url: `${host}:${dl1PortPrefix}00`
+    };
+};
+
 const createAndConnectAccount = (privateKey, networkConfig) => {
     const account = dag4.createAccount(privateKey);
     account.connect({
@@ -59,5 +93,6 @@ const getEpochProgress = async (l0Url, isCurrency = false) => {
 module.exports = {
     createNetworkConfig,
     createAndConnectAccount,
-    getEpochProgress
+    getEpochProgress,
+    getMetagraphUrls
 }

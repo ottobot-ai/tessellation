@@ -11,7 +11,13 @@ const CONSTANTS = {
     SNAPSHOT_WAIT_TIME_MS: 15 * 1000,
     DEFAULT_COMPRESSION_LEVEL: 2,
     DEFAULT_LAST_VALID_EPOCH_PROGRESS: 50,
-    CURRENCY_TOKEN_ID: process.env.METAGRAPH_ID
+    CURRENCY_TOKEN_ID: process.env.METAGRAPH_ID,
+    // K metagraph IDs in genesis order; comma-separated by compose-runner.sh.
+    // For K=1, METAGRAPH_IDS[0] === METAGRAPH_ID; the legacy CURRENCY_TOKEN_ID
+    // continues to point at metagraph 0 for backward compat.
+    METAGRAPH_IDS: (process.env.METAGRAPH_IDS_CSV || process.env.METAGRAPH_ID || '')
+        .split(',')
+        .filter(s => s.length > 0)
 };
 
 const PRIVATE_KEYS = {

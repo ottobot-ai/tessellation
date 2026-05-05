@@ -131,43 +131,47 @@ verify_healthy() {
       check_health "${host}:${DAG_L1_PORT_PREFIX}00" "gl1-0" "$NUM_GL1_NODES" || any_failed=true
     fi
 
-    if [ "$NUM_ML0_NODES" -gt 0 ]; then
-      check_health "${host}:${ML0_PORT_PREFIX}00" "ml0-0" "$NUM_ML0_NODES" || any_failed=true
-    fi
+    # Per-metagraph health: each metagraph k has its own ml0/cl1/dl1 cluster
+    # at port-prefix shifted -10 per k (m0=92/93/94, m1=82/83/84, ...) and
+    # container names ml0-m${k}-0, cl1-m${k}-0, dl1-m${k}-0.
+    for k in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
+      local m_ml0_pp=$((ML0_PORT_PREFIX - k*10))
+      local m_cl1_pp=$((CL1_PORT_PREFIX - k*10))
+      local m_dl1_pp=$((DL1_PORT_PREFIX - k*10))
 
-    if [ "$NUM_CL1_NODES" -gt 0 ]; then
-      check_health "${host}:${CL1_PORT_PREFIX}00" "cl1-0" "$NUM_CL1_NODES" || any_failed=true
-    fi
+      if [ "$NUM_ML0_NODES" -gt 0 ]; then
+        check_health "${host}:${m_ml0_pp}00" "ml0-m${k}-0" "$NUM_ML0_NODES" || any_failed=true
+      fi
 
-    if [ "$NUM_DL1_NODES" -gt 0 ]; then
-      check_health "${host}:${DL1_PORT_PREFIX}00" "dl1-0" "$NUM_DL1_NODES" || any_failed=true
-    fi
+      if [ "$NUM_CL1_NODES" -gt 0 ]; then
+        check_health "${host}:${m_cl1_pp}00" "cl1-m${k}-0" "$NUM_CL1_NODES" || any_failed=true
+      fi
 
-    # Operational readiness probe: peer-count alone isn't enough. DL1 joins the
-    # cluster before it has received its first currency snapshot from ML0, and
-    # /data POSTs return 500 ("Cannot start data own consensus: No currency
-    # snapshot") during that window. We saw this break data-transaction tests
-    # when they ran early in the sequence (before currency tests warmed the
-    # cluster). Probe proxy: ML0 ordinal >= 1 (past genesis 0). DL1 polls ML0
-    # for currency snapshots, so once ML0 has produced one, DL1 absorbs it
-    # within a gossip tick. The retries in the data-transaction test scripts
-    # are still there as belt-and-suspenders for the DL1 absorption lag.
-    if [ "$NUM_ML0_NODES" -gt 0 ]; then
-      local ml0_ordinal_url="${host}:${ML0_PORT_PREFIX}00"
-      echo "Waiting for ML0 to produce its first snapshot (so DL1 can accept data txs)..."
-      for op_attempt in $(seq 1 120); do
-        ordinal_resp=$(curl -s --connect-timeout 3 --max-time 5 "${ml0_ordinal_url}/snapshots/latest/ordinal" 2>/dev/null || echo "")
-        if [ -n "$ordinal_resp" ] && echo "$ordinal_resp" | jq -e '.value >= 1' >/dev/null 2>&1; then
-          ord_val=$(echo "$ordinal_resp" | jq '.value')
-          echo "ML0 operational: snapshot ordinal=$ord_val"
-          break
-        fi
-        if [ "$((op_attempt % 10))" -eq 0 ]; then
-          echo "ML0 not yet producing snapshots (attempt $op_attempt/120)..."
-        fi
-        sleep 3
-      done
-    fi
+      if [ "$NUM_DL1_NODES" -gt 0 ]; then
+        check_health "${host}:${m_dl1_pp}00" "dl1-m${k}-0" "$NUM_DL1_NODES" || any_failed=true
+      fi
+
+      # Operational readiness probe: peer-count alone isn't enough. DL1 joins
+      # the cluster before it has received its first currency snapshot from
+      # ML0, and /data POSTs return 500 during that window. Probe proxy: ML0
+      # ordinal >= 1 (past genesis 0).
+      if [ "$NUM_ML0_NODES" -gt 0 ]; then
+        local ml0_ordinal_url="${host}:${m_ml0_pp}00"
+        echo "Waiting for metagraph $k ML0 to produce its first snapshot..."
+        for op_attempt in $(seq 1 120); do
+          ordinal_resp=$(curl -s --connect-timeout 3 --max-time 5 "${ml0_ordinal_url}/snapshots/latest/ordinal" 2>/dev/null || echo "")
+          if [ -n "$ordinal_resp" ] && echo "$ordinal_resp" | jq -e '.value >= 1' >/dev/null 2>&1; then
+            ord_val=$(echo "$ordinal_resp" | jq '.value')
+            echo "Metagraph $k ML0 operational: snapshot ordinal=$ord_val"
+            break
+          fi
+          if [ "$((op_attempt % 10))" -eq 0 ]; then
+            echo "Metagraph $k ML0 not yet producing snapshots (attempt $op_attempt/120)..."
+          fi
+          sleep 3
+        done
+      fi
+    done
 
     if [ "$any_failed" = "true" ]; then
       echo "ERROR: One or more cluster health checks failed"

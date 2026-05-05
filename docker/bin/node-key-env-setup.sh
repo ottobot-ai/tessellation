@@ -19,13 +19,13 @@ export CL_CLI_HTTP_PORT=9000
 EOF
 
 
-for i in $(seq 0 $((MAX_NODES - 1))); do
+for i in $(seq 0 $((${MAX_HG_NODES:-$MAX_NODES} - 1))); do
   cp ./nodes/.envrc ./nodes/$i/.envrc
 done
 
 generate_keys() {
 
-  for i in $(seq 0 $((MAX_NODES - 1))); do
+  for i in $(seq 0 $((${MAX_HG_NODES:-$MAX_NODES} - 1))); do
     mkdir -p ./nodes/$i
     cd ./nodes/$i/
 
@@ -60,8 +60,8 @@ generate_keys() {
 }
 
 generate_missing_keys() {
-  # Generate keys for any node index that doesn't already have pre-generated keys
-  for i in $(seq 0 $((MAX_NODES - 1))); do
+  # Generate keys for any hypergraph node index that doesn't already have pre-generated keys
+  for i in $(seq 0 $((${MAX_HG_NODES:-$MAX_NODES} - 1))); do
     if [ ! -f "./docker/config/local-test-keys/$i/key.p12" ]; then
       echo "Generating keys for node $i (not found in local-test-keys)"
       mkdir -p ./nodes/$i
@@ -99,7 +99,8 @@ generate_missing_keys() {
 }
 
 populate_test_keys() {
-  for i in $(seq 0 $((MAX_NODES - 1))); do
+  local n=${MAX_HG_NODES:-$MAX_NODES}
+  for i in $(seq 0 $((n - 1))); do
     cp ./docker/config/local-test-keys/$i/key.p12 ./nodes/$i/key.p12
     cp ./docker/config/local-test-keys/$i/address ./nodes/$i/address
     cp ./docker/config/local-test-keys/$i/peer_id ./nodes/$i/peer_id
@@ -109,11 +110,67 @@ populate_test_keys() {
   mkdir -p $GENESIS_DIR
   cp ./nodes/0/id_ecdsa.hex $GENESIS_DIR/id_ecdsa.hex
 
-  # Copy validator keys for all non-genesis nodes
-  for i in $(seq 1 $((MAX_NODES - 1))); do
+  # Copy validator keys for all non-genesis hypergraph nodes
+  for i in $(seq 1 $((n - 1))); do
     VALIDATOR_DIR=$PROJECT_ROOT/.github/code/hypergraph/dag-l0/validator-$i
     mkdir -p $VALIDATOR_DIR
     cp ./nodes/$i/id_ecdsa.hex $VALIDATOR_DIR/id_ecdsa.hex
+  done
+}
+
+# Each metagraph k in [0, NUM_METAGRAPHS) gets its own set of operator keys
+# (architecturally distinct from hypergraph operators — separate p12 owners).
+# Generates nodes/m${k}-${i}/{key.p12,address,peer_id,id_ecdsa.hex} backed by
+# a per-metagraph cache at docker/config/local-test-keys/m${k}/${i}/.
+generate_metagraph_keys() {
+  local k=$1
+  local n=${MAX_METAGRAPH_NODES:-$MAX_NODES}
+  for i in $(seq 0 $((n - 1))); do
+    if [ ! -f "./docker/config/local-test-keys/m${k}/$i/key.p12" ]; then
+      echo "Generating metagraph $k operator keys for node $i"
+      mkdir -p ./nodes/m${k}-${i}
+      cd ./nodes/m${k}-${i}/
+      cp ../0/.envrc .envrc 2>/dev/null || cp ../../nodes/.envrc .envrc
+
+      out=$(
+        source .envrc
+        java -jar ../keytool.jar generate
+      )
+
+      ret_addr=$(
+        source .envrc
+        java -jar ../wallet.jar show-address
+      )
+      echo "$ret_addr" > address
+      id=$(
+        source .envrc
+        java -jar ../wallet.jar show-id
+      )
+      export=$(
+        source .envrc
+        java -jar ../keytool.jar export
+      )
+
+      echo "$id" > peer_id
+      mkdir -p ../../docker/config/local-test-keys/m${k}/$i
+      cp key.p12 ../../docker/config/local-test-keys/m${k}/$i
+      cp address ../../docker/config/local-test-keys/m${k}/$i
+      cp peer_id ../../docker/config/local-test-keys/m${k}/$i
+      cp id_ecdsa.hex ../../docker/config/local-test-keys/m${k}/$i
+      cd ../../
+    fi
+  done
+}
+
+populate_metagraph_keys() {
+  local k=$1
+  local n=${MAX_METAGRAPH_NODES:-$MAX_NODES}
+  for i in $(seq 0 $((n - 1))); do
+    mkdir -p ./nodes/m${k}-${i}
+    cp ./docker/config/local-test-keys/m${k}/$i/key.p12 ./nodes/m${k}-${i}/key.p12
+    cp ./docker/config/local-test-keys/m${k}/$i/address ./nodes/m${k}-${i}/address
+    cp ./docker/config/local-test-keys/m${k}/$i/peer_id ./nodes/m${k}-${i}/peer_id
+    cp ./docker/config/local-test-keys/m${k}/$i/id_ecdsa.hex ./nodes/m${k}-${i}/id_ecdsa.hex
   done
 }
 
@@ -126,3 +183,11 @@ fi
 generate_missing_keys
 
 populate_test_keys
+
+# Per-metagraph operator keys (NUM_METAGRAPHS=1 by default — only m0)
+if [ -n "$METAGRAPH" ]; then
+  for k in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
+    generate_metagraph_keys $k
+    populate_metagraph_keys $k
+  done
+fi
