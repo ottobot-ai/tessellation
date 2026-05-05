@@ -470,7 +470,7 @@ object SnapshotLeaderLoop {
                               .update(prev => cats.Order[SnapshotOrdinal].max(prev, SnapshotOrdinal.unsafeApply(finalOrdinal))) >>
                             snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(finalOrdinal))) >>
                             logger.info(
-                              s"ATTEST-FINALIZED ordinal=$finalOrdinal slot=${stored.slot} (weight=${"%.2f".format(weight)}, " +
+                              s"ATTEST-FINALIZED ordinal=$finalOrdinal slot=${stored.slot} (weight=${"%.2f".format(weight.toDouble)}, " +
                                 s"${allAtts.size}/${activeCount} active of ${validatorCount} seedlist)"
                             ) >>
                             Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
