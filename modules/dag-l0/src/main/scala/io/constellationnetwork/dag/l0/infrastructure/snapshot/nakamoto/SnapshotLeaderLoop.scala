@@ -18,6 +18,8 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.Sid
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.TimeTrigger
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
+import io.constellationnetwork.numerics.Ratio
+import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, MptTxAction}
 import io.constellationnetwork.schema.nakamoto.LddConfig
@@ -453,7 +455,7 @@ object SnapshotLeaderLoop {
                     ord => chainStore.walkBackTo(tip.hash, ord)
                   )
                 case None =>
-                  Async[F].pure(Option.empty[(Long, Double)])
+                  Async[F].pure(Option.empty[(Long, Ratio)])
               }
               _ <- (chainFinalizedOrdinal, bestTip) match {
                 case (Some((finalOrdinal, weight)), Some(tip)) if finalOrdinal > lastFinalizedOrdinal && !depthFinalized =>
