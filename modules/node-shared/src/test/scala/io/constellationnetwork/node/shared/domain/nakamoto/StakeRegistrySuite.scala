@@ -2,6 +2,8 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 
 import cats.effect.IO
 
+import io.constellationnetwork.numerics.Ratio
+import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hex.Hex
 
@@ -16,7 +18,7 @@ object StakeRegistrySuite extends SimpleIOSuite {
     for {
       registry <- StakeRegistry.equalWeight[IO]
       stake <- registry.relativeStake(pid("unknown"))
-    } yield expect.same(0.0, stake)
+    } yield expect.same(Ratio.Zero, stake)
   }
 
   test("empty registry has validator count of 0") {
@@ -30,7 +32,7 @@ object StakeRegistrySuite extends SimpleIOSuite {
     for {
       registry <- StakeRegistry.equalWeight[IO]
       stakes <- registry.allStakes
-    } yield expect.same(Map.empty[PeerId, Double], stakes)
+    } yield expect.same(Map.empty[PeerId, Ratio], stakes)
   }
 
   test("single validator gets relativeStake of 1.0") {
@@ -39,7 +41,7 @@ object StakeRegistrySuite extends SimpleIOSuite {
       peer1 = pid("peer1")
       _ <- registry.updateValidators(Set(peer1))
       stake <- registry.relativeStake(peer1)
-    } yield expect.same(1.0, stake)
+    } yield expect.same(Ratio.One, stake)
   }
 
   test("two validators each get relativeStake of 0.5") {
@@ -50,7 +52,7 @@ object StakeRegistrySuite extends SimpleIOSuite {
       _ <- registry.updateValidators(Set(peer1, peer2))
       stake1 <- registry.relativeStake(peer1)
       stake2 <- registry.relativeStake(peer2)
-    } yield expect.same(0.5, stake1) && expect.same(0.5, stake2)
+    } yield expect.same(Ratio(1, 2), stake1) && expect.same(Ratio(1, 2), stake2)
   }
 
   test("N validators each get 1/N stake") {
@@ -62,9 +64,9 @@ object StakeRegistrySuite extends SimpleIOSuite {
       _ <- registry.updateValidators(peers)
       stakes <- registry.allStakes
     } yield {
-      val expectedStake = 1.0 / n.toDouble
+      val expectedStake = Ratio(1, n)
       expect(stakes.size == n) &&
-      expect(stakes.values.forall(s => math.abs(s - expectedStake) < 1e-10))
+      expect(stakes.values.forall(_ == expectedStake))
     }
   }
 
@@ -76,7 +78,7 @@ object StakeRegistrySuite extends SimpleIOSuite {
       unknownPeer = pid("unknown")
       _ <- registry.updateValidators(Set(peer1, peer2))
       stake <- registry.relativeStake(unknownPeer)
-    } yield expect.same(0.0, stake)
+    } yield expect.same(Ratio.Zero, stake)
   }
 
   test("update replaces entire validator set") {
@@ -91,12 +93,12 @@ object StakeRegistrySuite extends SimpleIOSuite {
       stakePeer1After <- registry.relativeStake(peer1)
       stakePeer3After <- registry.relativeStake(peer3)
     } yield
-      expect.same(0.5, stakePeer1Before) &&
-        expect.same(0.0, stakePeer1After) &&
-        expect.same(1.0, stakePeer3After)
+      expect.same(Ratio(1, 2), stakePeer1Before) &&
+        expect.same(Ratio.Zero, stakePeer1After) &&
+        expect.same(Ratio.One, stakePeer3After)
   }
 
-  test("allStakes sums to ~1.0 within floating point tolerance") {
+  test("allStakes sums to exactly 1.0") {
     val n = 7
     val peers = (1 to n).map(i => pid(s"peer$i")).toSet
 
@@ -105,8 +107,8 @@ object StakeRegistrySuite extends SimpleIOSuite {
       _ <- registry.updateValidators(peers)
       stakes <- registry.allStakes
     } yield {
-      val total = stakes.values.sum
-      expect(math.abs(total - 1.0) < 1e-10)
+      val total = stakes.values.foldLeft(Ratio.Zero)(_ + _)
+      expect.same(Ratio.One, total)
     }
   }
 
@@ -128,8 +130,8 @@ object StakeRegistrySuite extends SimpleIOSuite {
       stakeAfter <- registry.relativeStake(peer1)
       count <- registry.validatorCount
     } yield
-      expect.same(1.0, stakeBefore) &&
-        expect.same(0.0, stakeAfter) &&
+      expect.same(Ratio.One, stakeBefore) &&
+        expect.same(Ratio.Zero, stakeAfter) &&
         expect.same(0, count)
   }
 }

@@ -3,6 +3,8 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 import cats.effect.kernel.{Ref, Sync}
 import cats.syntax.all._
 
+import io.constellationnetwork.numerics.Ratio
+import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema.nakamoto.TipAttestation
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.peer.PeerId
@@ -14,6 +16,10 @@ import io.constellationnetwork.security.hash.Hash
   * (PeerRumor ordering). When a tip accumulates ≥ 2/3+1 of total stake weight, it's finalized along with all ancestors.
   *
   * Production continues regardless of finality status. If attestation stalls, builders continue on the longest chain.
+  *
+  * All weights are exact `Ratio`. Attestation sums and the 2/3 threshold comparison are byte-identical across all JVMs/CPUs — closes the
+  * latent finality-split risk that Double summation order would introduce on N-not-power-of-2 clusters (e.g. 7-node cluster where 1/7 isn't
+  * exactly representable in IEEE 754).
   */
 trait TipTracker[F[_]] {
 
@@ -21,13 +27,13 @@ trait TipTracker[F[_]] {
   def recordAttestation(peerId: PeerId, attestation: TipAttestation): F[Unit]
 
   /** Get the current attestation weight for a tip hash. Returns stake fraction [0,1]. */
-  def attestationWeight(tipHash: Hash): F[Double]
+  def attestationWeight(tipHash: Hash): F[Ratio]
 
   /** Check if a tip has reached finality threshold (≥ 2/3+1 weight). */
   def isFinalized(tipHash: Hash): F[Boolean]
 
   /** Get the tip with the most attestation weight (fork choice). */
-  def heaviestTip: F[Option[(Hash, Slot, Double)]]
+  def heaviestTip: F[Option[(Hash, Slot, Ratio)]]
 
   /** GRANDPA-style chain finality, chain-aware: find the highest ordinal where cumulative attestation weight on OUR canonical chain >=
     * threshold.
@@ -46,9 +52,9 @@ trait TipTracker[F[_]] {
     *   `chainStore.walkBackTo(localTip.hash, ord)`). Attestations whose tipHash doesn't match are discarded from the weight sum.
     */
   def highestFinalizedOrdinal(
-    threshold: Double,
+    threshold: Ratio,
     canonicalHashAt: Long => F[Option[Hash]]
-  ): F[Option[(Long, Double)]]
+  ): F[Option[(Long, Ratio)]]
 
   /** Get all current attestations (latest per peer). */
   def allAttestations: F[Map[PeerId, TipAttestation]]
@@ -68,13 +74,17 @@ object TipTracker {
   /** Attestation finality threshold — fraction of total stake that must attest to a tip for it to finalize.
     *
     * Default: 2/3 (BFT-classic). Override via `NAKAMOTO_ATTESTATION_THRESHOLD` (e.g. `0.5` for half-honest small clusters, `0.8` for more
-    * conservative finality).
+    * conservative finality). Env-var Doubles are locked to `Ratio` at boot.
     *
     * Both the attestation gate (this threshold) and the depth gate (`NAKAMOTO_CONFIRMATION_DEPTH`) always run; whichever fires first
     * finalizes. There is no "mode" — just knobs.
     */
-  val FinalityThreshold: Double =
-    sys.env.get("NAKAMOTO_ATTESTATION_THRESHOLD").flatMap(_.toDoubleOption).getOrElse(2.0 / 3.0)
+  val FinalityThreshold: Ratio =
+    sys.env
+      .get("NAKAMOTO_ATTESTATION_THRESHOLD")
+      .flatMap(_.toDoubleOption)
+      .map(Ratio(_, 18))
+      .getOrElse(Ratio(2, 3))
 
   def make[F[_]: Sync](stakeRegistry: StakeRegistry[F]): F[TipTracker[F]] =
     for {
@@ -95,7 +105,7 @@ object TipTracker {
             }
           } >> stakeRegistry.markActive(peerId) // Track this peer as actively participating
 
-        def attestationWeight(tipHash: Hash): F[Double] =
+        def attestationWeight(tipHash: Hash): F[Ratio] =
           for {
             attestations <- attestationsRef.get
             weights <- attestations.toList.traverse {
@@ -103,14 +113,14 @@ object TipTracker {
                 if (att.tipHash === tipHash)
                   stakeRegistry.optimisticRelativeStake(peerId) // Use optimistic weight (active peers only)
                 else
-                  0.0.pure[F]
+                  Ratio.Zero.pure[F]
             }
-          } yield weights.sum
+          } yield weights.foldLeft(Ratio.Zero)(_ + _)
 
         def isFinalized(tipHash: Hash): F[Boolean] =
           attestationWeight(tipHash).map(_ >= FinalityThreshold)
 
-        def heaviestTip: F[Option[(Hash, Slot, Double)]] =
+        def heaviestTip: F[Option[(Hash, Slot, Ratio)]] =
           for {
             attestations <- attestationsRef.get
             tipHashes = attestations.values.map(a => (a.tipHash, a.tipSlot)).toSet
@@ -118,35 +128,35 @@ object TipTracker {
               case (hash, slot) =>
                 attestationWeight(hash).map(w => (hash, slot, w))
             }
-          } yield weighted.maxByOption(_._3).filter(_._3 > 0.0)
+          } yield weighted.filter(_._3 > Ratio.Zero).maxByOption { case (_, _, w) => (w.numerator, w.denominator) }
 
         def highestFinalizedOrdinal(
-          threshold: Double,
+          threshold: Ratio,
           canonicalHashAt: Long => F[Option[Hash]]
-        ): F[Option[(Long, Double)]] =
+        ): F[Option[(Long, Ratio)]] =
           for {
             attestations <- attestationsRef.get
             // Filter each attestation against our canonical chain: only count weight if the peer
             // attested to the hash that's actually on OUR chain at that ordinal. Attestations on
             // other forks (different hash at same ordinal) contribute zero weight to finalizing
             // our chain.
-            onChain <- attestations.toList.traverse[F, Option[(Long, Double)]] {
+            onChain <- attestations.toList.traverse[F, Option[(Long, Ratio)]] {
               case (peerId, att) =>
                 canonicalHashAt(att.tipOrdinal).flatMap {
                   case Some(localHash) if localHash === att.tipHash =>
                     stakeRegistry.optimisticRelativeStake(peerId).map(w => Option((att.tipOrdinal, w)))
                   case _ =>
-                    Option.empty[(Long, Double)].pure[F]
+                    Option.empty[(Long, Ratio)].pure[F]
                 }
             }
           } yield {
-            val sorted = onChain.flatten.filter(_._2 > 0.0).sortBy(-_._1)
+            val sorted = onChain.flatten.filter(_._2 > Ratio.Zero).sortBy(-_._1)
             // Walk down, accumulating weight. Attesting to ordinal N with a hash that's on our
             // canonical chain implies attestation to all ancestors (GRANDPA property) — and since
             // they're all our hashes, no cross-fork contamination.
-            var cumWeight = 0.0
+            var cumWeight: Ratio = Ratio.Zero
             sorted.collectFirst {
-              case (ordinal, weight) if { cumWeight += weight; cumWeight >= threshold } =>
+              case (ordinal, weight) if { cumWeight = cumWeight + weight; cumWeight >= threshold } =>
                 (ordinal, cumWeight)
             }
           }

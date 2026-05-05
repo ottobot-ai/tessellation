@@ -163,6 +163,7 @@ object SnapshotLeaderLoop {
     keyPair: KeyPair,
     selfId: PeerId,
     lddConfig: LddConfig,
+    eligibilityChecker: EligibilityChecker[F],
     slotsPerEpoch: Long = 60L,
     etaRotationSlots: Long = 600L,
     lastKnownSlotRef: Ref[F, Option[Long]],
@@ -278,7 +279,7 @@ object SnapshotLeaderLoop {
                         }
                       }
 
-                    result = EligibilityChecker.checkEligibility(
+                    result <- eligibilityChecker.checkEligibility(
                       vrfSK = vrfSeed,
                       slot = slotRefined,
                       slotGap = slotGap,

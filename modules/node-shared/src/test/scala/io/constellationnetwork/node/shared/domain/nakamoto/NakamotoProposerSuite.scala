@@ -9,6 +9,7 @@ import cats.effect.kernel.{Clock, Ref}
 
 import scala.concurrent.duration._
 
+import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
 import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot._
 import io.constellationnetwork.schema.peer.PeerId
@@ -24,6 +25,12 @@ object NakamotoProposerSuite extends SimpleIOSuite {
   private val random = new SecureRandom()
   private val defaultLddConfig = LddConfig.Default
   private val genesisEta: Array[Byte] = Array.fill(32)(0x42.toByte)
+
+  private val makeEligibilityChecker: IO[EligibilityChecker[IO]] =
+    for {
+      log1p <- Log1pInterpreter.make[IO](10000, 8)
+      exp <- ExpInterpreter.make[IO](10000, 38)
+    } yield EligibilityChecker.make[IO](log1p, exp)
 
   private def randomSk(): Array[Byte] = {
     val sk = new Array[Byte](32)
@@ -65,6 +72,7 @@ object NakamotoProposerSuite extends SimpleIOSuite {
       _ <- stakeRegistry.updateValidators(validatorsWithSelf)
       genesisTimeMs = System.currentTimeMillis() - (initialSlot * 1000L)
       slotClock = SlotClock.make[IO](SlotClock.Config(genesisTimeMs))(IO.asyncForIO, fixedClock(genesisTimeMs + (initialSlot * 1000L)))
+      ec <- makeEligibilityChecker
       proposer = NakamotoProposer.make[IO](
         vrfSK = vrfSK,
         vrfVK = vrfVK,
@@ -72,7 +80,8 @@ object NakamotoProposerSuite extends SimpleIOSuite {
         epochState = epochState,
         stakeRegistry = stakeRegistry,
         slotClock = slotClock,
-        lddConfig = defaultLddConfig
+        lddConfig = defaultLddConfig,
+        eligibilityChecker = ec
       )
     } yield (proposer, epochState, stakeRegistry, peerId)
   }
@@ -127,6 +136,7 @@ object NakamotoProposerSuite extends SimpleIOSuite {
           stakeRegistry <- StakeRegistry.equalWeight[IO]
           _ <- stakeRegistry.updateValidators(Set(peerId))
           slotClock = SlotClock.make[IO](SlotClock.Config(0L))(IO.asyncForIO, fixedClock(100000L))
+          ec <- makeEligibilityChecker
           proposer = NakamotoProposer.make[IO](
             vrfSK = sk,
             vrfVK = vk,
@@ -134,7 +144,8 @@ object NakamotoProposerSuite extends SimpleIOSuite {
             epochState = epochState,
             stakeRegistry = stakeRegistry,
             slotClock = slotClock,
-            lddConfig = defaultLddConfig
+            lddConfig = defaultLddConfig,
+            eligibilityChecker = ec
           )
           maybeCert <- proposer.evaluateSlot(slot)
           result <- maybeCert match {
@@ -166,6 +177,7 @@ object NakamotoProposerSuite extends SimpleIOSuite {
           stakeRegistry <- StakeRegistry.equalWeight[IO]
           _ <- stakeRegistry.updateValidators(Set(peerId))
           slotClock = SlotClock.make[IO](SlotClock.Config(0L))(IO.asyncForIO, fixedClock(100000L))
+          ec <- makeEligibilityChecker
           proposer = NakamotoProposer.make[IO](
             vrfSK = sk,
             vrfVK = vk,
@@ -173,7 +185,8 @@ object NakamotoProposerSuite extends SimpleIOSuite {
             epochState = epochState,
             stakeRegistry = stakeRegistry,
             slotClock = slotClock,
-            lddConfig = defaultLddConfig
+            lddConfig = defaultLddConfig,
+            eligibilityChecker = ec
           )
           maybeCert <- proposer.evaluateSlot(slot)
           result <- maybeCert match {
@@ -210,6 +223,7 @@ object NakamotoProposerSuite extends SimpleIOSuite {
           stakeRegistry <- StakeRegistry.equalWeight[IO]
           _ <- stakeRegistry.updateValidators(Set(peerId))
           slotClock = SlotClock.make[IO](SlotClock.Config(0L))(IO.asyncForIO, fixedClock(100000L))
+          ec <- makeEligibilityChecker
           proposer = NakamotoProposer.make[IO](
             vrfSK = sk,
             vrfVK = vk,
@@ -217,7 +231,8 @@ object NakamotoProposerSuite extends SimpleIOSuite {
             epochState = epochState,
             stakeRegistry = stakeRegistry,
             slotClock = slotClock,
-            lddConfig = defaultLddConfig
+            lddConfig = defaultLddConfig,
+            eligibilityChecker = ec
           )
           maybeCert <- proposer.evaluateSlot(slot)
           result <- maybeCert match {
@@ -262,6 +277,7 @@ object NakamotoProposerSuite extends SimpleIOSuite {
       _ <- stakeRegistry.updateValidators(Set(peerId))
       slotClock = SlotClock.make[IO](SlotClock.Config(0L))(IO.asyncForIO, fixedClock(0L))
       epochConfig = NakamotoProposer.EpochConfig(slotsPerEpoch = 10L)
+      ec <- makeEligibilityChecker
       proposer = NakamotoProposer.make[IO](
         vrfSK = sk,
         vrfVK = vk,
@@ -270,6 +286,7 @@ object NakamotoProposerSuite extends SimpleIOSuite {
         stakeRegistry = stakeRegistry,
         slotClock = slotClock,
         lddConfig = defaultLddConfig,
+        eligibilityChecker = ec,
         epochConfig = epochConfig
       )
       etaBefore <- epochState.currentEta
@@ -303,14 +320,15 @@ object NakamotoProposerSuite extends SimpleIOSuite {
         stakeRegistry <- StakeRegistry.equalWeight[IO]
         _ <- stakeRegistry.updateValidators(Set(peerId))
         slotClock = SlotClock.make[IO](SlotClock.Config(0L))(IO.asyncForIO, fixedClock(100000L))
-        proposerLargeGap = NakamotoProposer.make[IO](sk, vk, peerId, epochStateLargeGap, stakeRegistry, slotClock, defaultLddConfig)
+        ec <- makeEligibilityChecker
+        proposerLargeGap = NakamotoProposer.make[IO](sk, vk, peerId, epochStateLargeGap, stakeRegistry, slotClock, defaultLddConfig, ec)
         lastSlotLarge <- epochStateLargeGap.lastProducedSlot
         gapLarge = 100L - lastSlotLarge.value.value
 
         // Test with small gap (threshold = 0)
         epochStateSmallGap <- EpochState.make[IO](genesisEta)
         _ <- epochStateSmallGap.recordProduction(Slot.unsafeApply(99L), Array.fill(64)(0.toByte))
-        proposerSmallGap = NakamotoProposer.make[IO](sk, vk, peerId, epochStateSmallGap, stakeRegistry, slotClock, defaultLddConfig)
+        proposerSmallGap = NakamotoProposer.make[IO](sk, vk, peerId, epochStateSmallGap, stakeRegistry, slotClock, defaultLddConfig, ec)
         lastSlotSmall <- epochStateSmallGap.lastProducedSlot
         gapSmall = 100L - lastSlotSmall.value.value
       } yield (gapLarge == 100L, gapSmall == 1L)
@@ -339,7 +357,8 @@ object NakamotoProposerSuite extends SimpleIOSuite {
           stakeRegistry <- StakeRegistry.equalWeight[IO]
           _ <- stakeRegistry.updateValidators(Set(peerId))
           slotClock = SlotClock.make[IO](SlotClock.Config(0L))(IO.asyncForIO, fixedClock(100000L))
-          proposer = NakamotoProposer.make[IO](sk, vk, peerId, epochState, stakeRegistry, slotClock, defaultLddConfig)
+          ec <- makeEligibilityChecker
+          proposer = NakamotoProposer.make[IO](sk, vk, peerId, epochState, stakeRegistry, slotClock, defaultLddConfig, ec)
           eta <- epochState.currentEta
           maybeCert <- proposer.evaluateSlot(slot)
           result <- maybeCert match {
@@ -379,9 +398,10 @@ object NakamotoProposerSuite extends SimpleIOSuite {
           // Both validators have equal stake (0.5 each)
           _ <- stakeRegistry.updateValidators(Set(peerId1, peerId2))
           slotClock = SlotClock.make[IO](SlotClock.Config(0L))(IO.asyncForIO, fixedClock(100000L))
+          ec <- makeEligibilityChecker
 
-          proposer1 = NakamotoProposer.make[IO](sk1, vk1, peerId1, epochState, stakeRegistry, slotClock, defaultLddConfig)
-          proposer2 = NakamotoProposer.make[IO](sk2, vk2, peerId2, epochState, stakeRegistry, slotClock, defaultLddConfig)
+          proposer1 = NakamotoProposer.make[IO](sk1, vk1, peerId1, epochState, stakeRegistry, slotClock, defaultLddConfig, ec)
+          proposer2 = NakamotoProposer.make[IO](sk2, vk2, peerId2, epochState, stakeRegistry, slotClock, defaultLddConfig, ec)
 
           cert1 <- proposer1.evaluateSlot(slot)
           cert2 <- proposer2.evaluateSlot(slot)
@@ -410,9 +430,10 @@ object NakamotoProposerSuite extends SimpleIOSuite {
           stakeRegistry <- StakeRegistry.equalWeight[IO]
           _ <- stakeRegistry.updateValidators(Set(peerId1, peerId2))
           slotClock = SlotClock.make[IO](SlotClock.Config(0L))(IO.asyncForIO, fixedClock(100000L))
+          ec <- makeEligibilityChecker
 
-          proposer1 = NakamotoProposer.make[IO](sk1, vk1, peerId1, epochState, stakeRegistry, slotClock, defaultLddConfig)
-          proposer2 = NakamotoProposer.make[IO](sk2, vk2, peerId2, epochState, stakeRegistry, slotClock, defaultLddConfig)
+          proposer1 = NakamotoProposer.make[IO](sk1, vk1, peerId1, epochState, stakeRegistry, slotClock, defaultLddConfig, ec)
+          proposer2 = NakamotoProposer.make[IO](sk2, vk2, peerId2, epochState, stakeRegistry, slotClock, defaultLddConfig, ec)
 
           cert1 <- proposer1.evaluateSlot(slot)
           cert2 <- proposer2.evaluateSlot(slot)
@@ -441,7 +462,8 @@ object NakamotoProposerSuite extends SimpleIOSuite {
       vk = vrf.getVerificationKey(sk)
       peerId = randomPeerId()
       slotClock = SlotClock.make[IO](SlotClock.Config(0L))(IO.asyncForIO, fixedClock(100000L))
-      proposer = NakamotoProposer.make[IO](sk, vk, peerId, epochState, stakeRegistry, slotClock, defaultLddConfig)
+      ec <- makeEligibilityChecker
+      proposer = NakamotoProposer.make[IO](sk, vk, peerId, epochState, stakeRegistry, slotClock, defaultLddConfig, ec)
       result <- proposer.evaluateSlot(Slot.unsafeApply(100L))
     } yield expect(result.isEmpty, "Should not be eligible with zero stake")
   }
@@ -460,7 +482,8 @@ object NakamotoProposerSuite extends SimpleIOSuite {
           stakeRegistry <- StakeRegistry.equalWeight[IO]
           _ <- stakeRegistry.updateValidators(Set(peerId))
           slotClock = SlotClock.make[IO](SlotClock.Config(0L))(IO.asyncForIO, fixedClock(100000L))
-          proposer = NakamotoProposer.make[IO](sk, vk, peerId, epochState, stakeRegistry, slotClock, defaultLddConfig)
+          ec <- makeEligibilityChecker
+          proposer = NakamotoProposer.make[IO](sk, vk, peerId, epochState, stakeRegistry, slotClock, defaultLddConfig, ec)
           maybeCert <- proposer.evaluateSlot(slot)
           result <- maybeCert match {
             case Some(cert) => IO.pure(Some(cert))
@@ -481,7 +504,8 @@ object NakamotoProposerSuite extends SimpleIOSuite {
             vk = vrf.getVerificationKey(sk)
             peerId = randomPeerId()
             slotClock = SlotClock.make[IO](SlotClock.Config(0L))(IO.asyncForIO, fixedClock(100000L))
-            proposer = NakamotoProposer.make[IO](sk, vk, peerId, epochState, stakeRegistry, slotClock, defaultLddConfig)
+            ec <- makeEligibilityChecker
+            proposer = NakamotoProposer.make[IO](sk, vk, peerId, epochState, stakeRegistry, slotClock, defaultLddConfig, ec)
             // Try to verify with a peerId that has no stake
             unknownPeer = randomPeerId()
             verified <- proposer.verifyCertificate(cert, unknownPeer, 100L)
@@ -506,7 +530,8 @@ object NakamotoProposerSuite extends SimpleIOSuite {
           stakeRegistry <- StakeRegistry.equalWeight[IO]
           _ <- stakeRegistry.updateValidators(Set(peerId))
           slotClock = SlotClock.make[IO](SlotClock.Config(0L))(IO.asyncForIO, fixedClock(100000L))
-          proposer = NakamotoProposer.make[IO](sk, vk, peerId, epochState, stakeRegistry, slotClock, defaultLddConfig)
+          ec <- makeEligibilityChecker
+          proposer = NakamotoProposer.make[IO](sk, vk, peerId, epochState, stakeRegistry, slotClock, defaultLddConfig, ec)
           maybeCert <- proposer.evaluateSlot(slot)
           result <- maybeCert match {
             case Some(cert) =>

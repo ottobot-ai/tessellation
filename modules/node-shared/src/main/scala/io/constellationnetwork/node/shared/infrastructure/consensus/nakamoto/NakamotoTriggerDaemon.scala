@@ -11,6 +11,7 @@ import scala.concurrent.duration._
 import io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker
 import io.constellationnetwork.node.shared.infrastructure.consensus.engine.ConsensusCommand
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.TimeTrigger
+import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot._
 import io.constellationnetwork.schema.peer.PeerId
@@ -77,7 +78,8 @@ object NakamotoTriggerDaemon {
     keyPair: KeyPair,
     selfId: PeerId,
     lddConfig: LddConfig,
-    slotsPerEpoch: Long
+    slotsPerEpoch: Long,
+    eligibilityChecker: EligibilityChecker[F]
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoTriggerDaemon")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -93,13 +95,14 @@ object NakamotoTriggerDaemon {
 
           slotRefined = Slot(NonNegLong.unsafeFrom(currentSlot))
 
-          // Equal weight (1.0) for now — StakeRegistry will supply real weights later
-          result = EligibilityChecker.checkEligibility(
+          // Equal weight (1/1) for now — StakeRegistry will supply real weights later. This daemon is
+          // legacy / dead code on the gl0 path; SnapshotLeaderLoop is the live producer driver.
+          result <- eligibilityChecker.checkEligibility(
             vrfSK = vrfSeed,
             slot = slotRefined,
             slotGap = slotGap,
             eta = state.currentEta,
-            relativeStake = 1.0,
+            relativeStake = Ratio.One,
             config = lddConfig
           )
 

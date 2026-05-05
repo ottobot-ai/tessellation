@@ -4,6 +4,7 @@ import java.security.SecureRandom
 
 import cats.effect.IO
 
+import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema.nakamoto.LddConfig
 
 import weaver.SimpleIOSuite
@@ -12,12 +13,17 @@ object EcVrf25519UniformitySuite extends SimpleIOSuite {
 
   private val vrf = new EcVrf25519()
 
-  // Replicates EligibilityChecker.threshold + normalizeVrfOutput inline so the test does not depend on LddConfig wiring.
+  // Inline Double-based threshold (lossy reference) — used for the simulation envelope check and as a smoke
+  // test that BouncyCastle VRF outputs distribute uniformly. The exact-Ratio threshold is exercised in
+  // RatioNumericsSuite + EligibilityCheckerSuite. Cfg.amplitude / baselineDifficulty are Ratio; convert
+  // once at the top via .toDouble (safe — test-only path, never on consensus).
   private def threshold(relativeStake: Double, slotGap: Long, cfg: LddConfig): Double = {
+    val amp = cfg.amplitude.toDouble
+    val base = cfg.baselineDifficulty.toDouble
     val f =
       if (slotGap < cfg.offset) 0.0
-      else if (slotGap < cfg.lddCutoff) cfg.amplitude * (slotGap - cfg.offset).toDouble / (cfg.lddCutoff - cfg.offset).toDouble
-      else cfg.baselineDifficulty
+      else if (slotGap < cfg.lddCutoff) amp * (slotGap - cfg.offset).toDouble / (cfg.lddCutoff - cfg.offset).toDouble
+      else base
     if (f <= 0.0) 0.0
     else if (f >= 1.0) 1.0
     else 1.0 - math.pow(1.0 - f, relativeStake)
@@ -49,10 +55,9 @@ object EcVrf25519UniformitySuite extends SimpleIOSuite {
     *   - shared eta across all nodes (rotates every 600 slots → 10 periods)
     *   - per-slot threshold derived from a slot_gap that resets to 1 when ANY node wins
     *
-    * Asserts that the per-node win-count distribution is consistent with iid Bernoulli with the empirical
-    * threshold integral. Specifically: (1) cluster total within ±20 % of expectation, (2) per-node sample
-    * stdev within 3× the iid theoretical stdev. The 3× tolerance is loose on purpose — this is a smoke
-    * test for "BouncyCastle VRF doesn't introduce per-key bias", not a precise variance bound.
+    * Asserts that the per-node win-count distribution is consistent with iid Bernoulli with the empirical threshold integral. Specifically:
+    * (1) cluster total within ±20 % of expectation, (2) per-node sample stdev within 3× the iid theoretical stdev. The 3× tolerance is
+    * loose on purpose — this is a smoke test for "BouncyCastle VRF doesn't introduce per-key bias", not a precise variance bound.
     */
   test("VRF — 8-key cluster simulation: per-key win counts within iid Bernoulli envelope") {
     IO {
@@ -82,12 +87,14 @@ object EcVrf25519UniformitySuite extends SimpleIOSuite {
         val gap = if (lastWinSlot < 0) slot + 1 else slot - lastWinSlot
         val period = slot / etaRotation
         // chain-derived eta surrogate: deterministic from genesis + period
-        val eta = if (period == 0) genesisEta else {
-          val mix = new Array[Byte](32)
-          var i = 0
-          while (i < 32) { mix(i) = (genesisEta(i) ^ period.toByte).toByte; i += 1 }
-          mix
-        }
+        val eta =
+          if (period == 0) genesisEta
+          else {
+            val mix = new Array[Byte](32)
+            var i = 0
+            while (i < 32) { mix(i) = (genesisEta(i) ^ period.toByte).toByte; i += 1 }
+            mix
+          }
         val thresh = threshold(relativeStake, gap, cfg)
         sumThresholdsAcrossSlots += thresh
         slotsCounted += 1L
@@ -145,8 +152,8 @@ object EcVrf25519UniformitySuite extends SimpleIOSuite {
     }
   }
 
-  /** Direct VRF-output uniformity check on a single fixed key, no thresholding. Verifies that BouncyCastle
-    * EcVrf25519 outputs distribute approximately uniformly in [0,1) over varied (slot, eta) inputs.
+  /** Direct VRF-output uniformity check on a single fixed key, no thresholding. Verifies that BouncyCastle EcVrf25519 outputs distribute
+    * approximately uniformly in [0,1) over varied (slot, eta) inputs.
     */
   test("VRF — single-key output histogram is approximately uniform on [0,1)") {
     IO {

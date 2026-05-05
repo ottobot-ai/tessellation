@@ -97,6 +97,7 @@ object NakamotoProposer {
     stakeRegistry: StakeRegistry[F],
     slotClock: SlotClock[F],
     lddConfig: LddConfig,
+    eligibilityChecker: EligibilityChecker[F],
     epochConfig: EpochConfig = EpochConfig()
   ): NakamotoProposer[F] = new NakamotoProposer[F] {
 
@@ -107,11 +108,12 @@ object NakamotoProposer {
         stake <- stakeRegistry.relativeStake(peerId)
         slotGap = currentSlot.value.value - lastSlot.value.value
         result <-
-          if (stake <= 0.0) Sync[F].pure(None)
+          if (stake == io.constellationnetwork.numerics.Ratio.Zero) Sync[F].pure(Option.empty[SlotCertificate])
           else
-            Sync[F].delay {
-              EligibilityChecker.checkEligibility(vrfSK, currentSlot, slotGap, eta, stake, lddConfig).map {
-                case (proof, vrfOut) =>
+            eligibilityChecker.checkEligibility(vrfSK, currentSlot, slotGap, eta, stake, lddConfig).map {
+              case None => Option.empty[SlotCertificate]
+              case Some((proof, vrfOut)) =>
+                Some(
                   SlotCertificate(
                     slot = currentSlot,
                     parentSlot = Slot.MinValue, // TODO: wire actual parent slot
@@ -122,7 +124,7 @@ object NakamotoProposer {
                     activePoolSize = 1,
                     activePoolHash = Hash("0" * 64)
                   )
-              }
+                )
             }
       } yield result
 
@@ -130,27 +132,26 @@ object NakamotoProposer {
       for {
         stake <- stakeRegistry.relativeStake(producerPeerId)
         result <-
-          if (stake <= 0.0) Sync[F].pure(false)
-          else
-            Sync[F].delay {
-              // Derive expected VRF VK from producer's secp256k1 identity
-              // Note: In production, this would use VrfKeyDeriver with the peer's private key
-              // For verification, we use the VRF VK embedded in the certificate
-              // (The caller must verify that cert.vrfPublicKey matches the producer's registered key)
-              val eta = Hex(cert.eta.value).toBytes
-              val proof = cert.vrfProof.toBytes
-              val vk = cert.vrfPublicKey.toBytes
+          if (stake == io.constellationnetwork.numerics.Ratio.Zero) Sync[F].pure(false)
+          else {
+            // Derive expected VRF VK from producer's secp256k1 identity
+            // Note: In production, this would use VrfKeyDeriver with the peer's private key
+            // For verification, we use the VRF VK embedded in the certificate
+            // (The caller must verify that cert.vrfPublicKey matches the producer's registered key)
+            val eta = Hex(cert.eta.value).toBytes
+            val proof = cert.vrfProof.toBytes
+            val vk = cert.vrfPublicKey.toBytes
 
-              EligibilityChecker.verifyEligibility(
-                vrfVK = vk,
-                slot = cert.slot,
-                slotGap = slotGap,
-                eta = eta,
-                relativeStake = stake,
-                config = lddConfig,
-                proof = proof
-              )
-            }
+            eligibilityChecker.verifyEligibility(
+              vrfVK = vk,
+              slot = cert.slot,
+              slotGap = slotGap,
+              eta = eta,
+              relativeStake = stake,
+              config = lddConfig,
+              proof = proof
+            )
+          }
       } yield result
 
     def recordFinalization(slot: Slot, vrfOutput: Array[Byte]): F[Unit] =

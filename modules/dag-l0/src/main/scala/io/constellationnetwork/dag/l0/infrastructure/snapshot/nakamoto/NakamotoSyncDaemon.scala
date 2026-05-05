@@ -124,6 +124,7 @@ object NakamotoSyncDaemon {
     selfId: peer.PeerId,
     keyPair: KeyPair,
     lddConfig: LddConfig,
+    eligibilityChecker: EligibilityChecker[F],
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSlots: Long,
@@ -163,6 +164,7 @@ object NakamotoSyncDaemon {
               selfId,
               keyPair,
               lddConfig,
+              eligibilityChecker,
               lastKnownSlotRef,
               epochStateRef,
               etaRotationSlots,
@@ -203,6 +205,7 @@ object NakamotoSyncDaemon {
     selfId: peer.PeerId,
     keyPair: KeyPair,
     lddConfig: LddConfig,
+    eligibilityChecker: EligibilityChecker[F],
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSlots: Long,
@@ -260,6 +263,7 @@ object NakamotoSyncDaemon {
                             selfId,
                             keyPair,
                             lddConfig,
+                            eligibilityChecker,
                             lastKnownSlotRef,
                             epochStateRef,
                             etaRotationSlots,
@@ -339,6 +343,7 @@ object NakamotoSyncDaemon {
                                     selfId,
                                     keyPair,
                                     lddConfig,
+                                    eligibilityChecker,
                                     lastKnownSlotRef,
                                     epochStateRef,
                                     etaRotationSlots,
@@ -404,6 +409,7 @@ object NakamotoSyncDaemon {
     selfId: peer.PeerId,
     keyPair: KeyPair,
     lddConfig: LddConfig,
+    eligibilityChecker: EligibilityChecker[F],
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSlots: Long,
@@ -519,6 +525,7 @@ object NakamotoSyncDaemon {
                     slotGap = slotGap,
                     stakeRegistry = stakeRegistry,
                     lddConfig = lddConfig,
+                    eligibilityChecker = eligibilityChecker,
                     consensusFns = consensusFns,
                     lastSignedArtifact = parentStored.signedSnapshot,
                     lastContext = parentStored.context,
@@ -584,11 +591,11 @@ object NakamotoSyncDaemon {
               val proof = snap.vrfProof.toByteArray
               val producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
               val producerId = peer.PeerId(producerHex)
-              stakeRegistry.relativeStake(producerId).map { producerStake =>
-                val vrfValid =
-                  if (vrfVK.isEmpty || proof.isEmpty) false
+              stakeRegistry.relativeStake(producerId).flatMap { producerStake =>
+                val vrfValidF =
+                  if (vrfVK.isEmpty || proof.isEmpty) false.pure[F]
                   else
-                    io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker.verifyEligibility(
+                    eligibilityChecker.verifyEligibility(
                       vrfVK = vrfVK,
                       slot = Slot(NonNegLong.unsafeFrom(snap.slot)),
                       slotGap = slotGap,
@@ -597,8 +604,10 @@ object NakamotoSyncDaemon {
                       config = lddConfig,
                       proof = proof
                     )
-                if (vrfValid) NakamotoSnapshotValidator.Valid(null, null) // VRF-only, no snapshot data
-                else NakamotoSnapshotValidator.VrfOnlyFailed(snap.slot)
+                vrfValidF.map { vrfValid =>
+                  if (vrfValid) NakamotoSnapshotValidator.Valid(null, null) // VRF-only, no snapshot data
+                  else NakamotoSnapshotValidator.VrfOnlyFailed(snap.slot)
+                }
               }
           }
           storeOutcome <- validationResult match {
@@ -667,6 +676,7 @@ object NakamotoSyncDaemon {
               selfId,
               keyPair,
               lddConfig,
+              eligibilityChecker,
               lastKnownSlotRef,
               epochStateRef,
               etaRotationSlots,

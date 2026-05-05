@@ -2,6 +2,8 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 
 import cats.effect.IO
 
+import io.constellationnetwork.numerics.Ratio
+import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema.nakamoto.TipAttestation
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.peer.PeerId
@@ -61,7 +63,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       expect(heaviest.isDefined) &&
         expect.same(tipA, heaviest.get._1) &&
         expect.same(slotA, heaviest.get._2) &&
-        expect(Math.abs(heaviest.get._3 - 1.0) < 0.0001)
+        expect.same(Ratio.One, heaviest.get._3)
   }
 
   test("majority attestation reaches finality (3 of 4 peers attest same tip → >2/3 weight)") {
@@ -83,7 +85,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       weight <- tracker.attestationWeight(tipA)
     } yield
       expect(isFinalized) &&
-        expect(Math.abs(weight - 1.0) < 0.0001)
+        expect.same(Ratio.One, weight)
   }
 
   test("newer attestation supersedes older from same peer") {
@@ -100,9 +102,9 @@ object TipTrackerSuite extends SimpleIOSuite {
       weightAAfter <- tracker.attestationWeight(tipA)
       weightB <- tracker.attestationWeight(tipB)
     } yield
-      expect(Math.abs(weightABefore - 1.0) < 0.0001) &&
-        expect(Math.abs(weightAAfter - 0.0) < 0.0001) &&
-        expect(Math.abs(weightB - 1.0) < 0.0001)
+      expect.same(Ratio.One, weightABefore) &&
+        expect.same(Ratio.Zero, weightAAfter) &&
+        expect.same(Ratio.One, weightB)
   }
 
   test("split attestations (2 peers on tip A, 2 on tip B → neither finalized with equal weight)") {
@@ -126,8 +128,8 @@ object TipTrackerSuite extends SimpleIOSuite {
     } yield
       expect(!isFinalizedA) &&
         expect(!isFinalizedB) &&
-        expect(Math.abs(weightA - 0.5) < 0.0001) &&
-        expect(Math.abs(weightB - 0.5) < 0.0001)
+        expect.same(Ratio(1, 2), weightA) &&
+        expect.same(Ratio(1, 2), weightB)
   }
 
   test("attestationWeight returns 0 for unknown tip") {
@@ -139,7 +141,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       (tracker, _) <- setupTracker(Set(peer1))
       _ <- tracker.recordAttestation(peer1, att(tipA, slot(10), 100L, slot(11)))
       weight <- tracker.attestationWeight(unknownTip)
-    } yield expect.same(0.0, weight)
+    } yield expect.same(Ratio.Zero, weight)
   }
 
   test("markFinalized updates lastFinalized") {
@@ -193,7 +195,7 @@ object TipTrackerSuite extends SimpleIOSuite {
     } yield
       expect(heaviest.isDefined) &&
         expect.same(tipA, heaviest.get._1) &&
-        expect(Math.abs(heaviest.get._3 - 2.0 / 3.0) < 0.0001)
+        expect.same(Ratio(2, 3), heaviest.get._3)
   }
 
   test("attestation from non-validator (zero stake) doesn't count toward finality") {
@@ -210,7 +212,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       weight <- tracker.attestationWeight(tipA)
       isFinalized <- tracker.isFinalized(tipA)
     } yield
-      expect.same(0.0, weight) &&
+      expect.same(Ratio.Zero, weight) &&
         expect(!isFinalized)
   }
 
@@ -230,7 +232,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       weight <- tracker.attestationWeight(tipA)
       isFinalized <- tracker.isFinalized(tipA)
     } yield
-      expect(Math.abs(weight - 1.0) < 0.0001) &&
+      expect.same(Ratio.One, weight) &&
         expect(isFinalized)
   }
 
@@ -266,8 +268,8 @@ object TipTrackerSuite extends SimpleIOSuite {
       weightB <- tracker.attestationWeight(tipB)
     } yield
       // tipB should still have weight since its attestation was newer
-      expect.same(0.0, weightA) &&
-        expect(Math.abs(weightB - 1.0) < 0.0001)
+      expect.same(Ratio.Zero, weightA) &&
+        expect.same(Ratio.One, weightB)
   }
 
   test("allAttestations returns all current attestations") {
@@ -309,20 +311,20 @@ object TipTrackerSuite extends SimpleIOSuite {
 
       // gl0-0's view: canonical chain A → ordinal 100 canonical hash = hashA100
       fromChainA <- tracker.highestFinalizedOrdinal(
-        2.0 / 3.0,
+        Ratio(2, 3),
         ord => IO.pure(if (ord == 100L) Some(hashA100) else None)
       )
 
       // gl0-2's view: canonical chain B → ordinal 100 canonical hash = hashB100
       fromChainB <- tracker.highestFinalizedOrdinal(
-        2.0 / 3.0,
+        Ratio(2, 3),
         ord => IO.pure(if (ord == 100L) Some(hashB100) else None)
       )
     } yield
       // Chain A finalizes (gl0-0 + gl0-1 = 2/3 stake agree on A's ord 100)
       expect(fromChainA.isDefined) &&
         expect.same(100L, fromChainA.get._1) &&
-        expect(Math.abs(fromChainA.get._2 - 2.0 / 3.0) < 0.0001) &&
+        expect.same(Ratio(2, 3), fromChainA.get._2) &&
         // Chain B does NOT finalize (only gl0-2 attests, 1/3 < 2/3)
         expect.same(None, fromChainB)
   }
@@ -344,7 +346,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       _ <- tracker.recordAttestation(peer3, att(h50, slot(100), 50L, slot(101)))
 
       result <- tracker.highestFinalizedOrdinal(
-        2.0 / 3.0,
+        Ratio(2, 3),
         ord =>
           IO.pure(ord match {
             case 70L => Some(h70)

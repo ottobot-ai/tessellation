@@ -53,6 +53,7 @@ object NakamotoSnapshotValidator {
     slotGap: Long,
     stakeRegistry: StakeRegistry[F],
     lddConfig: LddConfig,
+    eligibilityChecker: EligibilityChecker[F],
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     lastSignedArtifact: Signed[GlobalIncrementalSnapshot],
     lastContext: GlobalSnapshotInfo,
@@ -66,10 +67,10 @@ object NakamotoSnapshotValidator {
       // ── Step 1: VRF proof verification ──
       producerStake <- stakeRegistry.relativeStake(producerId)
 
-      vrfValid =
-        if (vrfPublicKey.isEmpty || vrfProof.isEmpty) false
+      vrfValid <-
+        if (vrfPublicKey.isEmpty || vrfProof.isEmpty) false.pure[F]
         else
-          EligibilityChecker.verifyEligibility(
+          eligibilityChecker.verifyEligibility(
             vrfVK = vrfPublicKey,
             slot = Slot(NonNegLong.unsafeFrom(slot)),
             slotGap = slotGap,

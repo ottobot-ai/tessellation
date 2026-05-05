@@ -8,6 +8,8 @@ import scala.concurrent.duration._
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics._
+import io.constellationnetwork.numerics.Ratio
+import io.constellationnetwork.numerics.implicits._
 
 import eu.timepit.refined.auto._
 import fs2.Stream
@@ -46,7 +48,8 @@ object NakamotoMetrics {
         fillRate = if (currentSlot > 0) tipOrd.toDouble / currentSlot.toDouble else 0.0
 
         weight <- bestTip.map(_.hash).traverse(tipTracker.attestationWeight)
-        attWeight = weight.getOrElse(0.0)
+        // Lossy Ratio→Double for metric gauge only — never fed back into consensus arithmetic.
+        attWeight = weight.getOrElse(Ratio.Zero).toDouble
 
         _ <- m.updateGauge("dag_nakamoto_chain_length", chainLen.toLong)
         _ <- m.updateGauge("dag_nakamoto_fork_count", forkCnt.toLong)

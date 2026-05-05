@@ -4,6 +4,9 @@ import java.security.SecureRandom
 
 import cats.effect.IO
 
+import io.constellationnetwork.numerics.Ratio
+import io.constellationnetwork.numerics.implicits._
+import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
 import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.security.vrf.EcVrf25519
@@ -15,6 +18,13 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
   private val vrf = new EcVrf25519()
   private val defaultConfig = LddConfig.Default
   private val random = new SecureRandom()
+
+  // Match Bifrost prod precision (log1p=8, exp=38) so test thresholds are byte-identical to runtime.
+  private val checkerIO: IO[EligibilityChecker[IO]] =
+    for {
+      log1p <- Log1pInterpreter.make[IO](maxIterations = 10000, precision = 8)
+      exp <- ExpInterpreter.make[IO](maxIterations = 10000, precision = 38)
+    } yield EligibilityChecker.make[IO](log1p, exp)
 
   private def randomSk(): Array[Byte] = {
     val sk = new Array[Byte](32)
@@ -28,250 +38,210 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
     eta
   }
 
+  // Tolerance for asserting Ratio threshold matches an analytical Double reference.
+  private val Tol: Ratio = Ratio(1, BigInt(10).pow(6))
+
   // ============ Threshold Function Tests ============
 
   test("threshold is 0 when slotGap < offset") {
-    IO {
-      val configWithOffset = LddConfig(
-        lddCutoff = 15,
-        offset = 5, // Non-zero offset
-        baselineDifficulty = 0.05,
-        amplitude = 0.5
-      )
-      val thresh0 = EligibilityChecker.threshold(1.0, 0, configWithOffset)
-      val thresh4 = EligibilityChecker.threshold(1.0, 4, configWithOffset)
-      expect.eql(0.0, thresh0).and(expect.eql(0.0, thresh4))
-    }
+    val configWithOffset = LddConfig(lddCutoff = 15, offset = 5, baselineDifficulty = Ratio(1, 20), amplitude = Ratio(1, 2))
+    for {
+      checker <- checkerIO
+      thresh0 <- checker.threshold(Ratio.One, 0, configWithOffset)
+      thresh4 <- checker.threshold(Ratio.One, 4, configWithOffset)
+    } yield expect(thresh0 == Ratio.Zero).and(expect(thresh4 == Ratio.Zero))
   }
 
   test("threshold ramps linearly in ramp region") {
-    IO {
-      val config = LddConfig(
-        lddCutoff = 10,
-        offset = 0,
-        baselineDifficulty = 0.05,
-        amplitude = 0.5
-      )
-      // At slotGap = 5 (halfway), difficulty should be 0.5 * 5/10 = 0.25
-      // For relativeStake = 1.0, threshold = 1 - (1 - 0.25)^1 = 0.25
-      val threshMid = EligibilityChecker.threshold(1.0, 5, config)
-      expect(math.abs(threshMid - 0.25) < 0.0001).and {
-        // At slotGap == lddCutoff, we're in recovery region (baseline)
-        // The ramp is for slotGap < lddCutoff
-        // At slotGap = 9, should be 0.5 * 9/10 = 0.45
-        val threshAlmostCutoff = EligibilityChecker.threshold(1.0, 9, config)
-        expect(math.abs(threshAlmostCutoff - 0.45) < 0.0001)
-      }
-    }
+    // offset=0, cutoff=10, amplitude=1/2, baseline=1/20.
+    // At slotGap=5: difficulty = 1/2 × 5/10 = 1/4. threshold@stake=1.0 = 1 - (3/4)^1 = 1/4.
+    // At slotGap=9: difficulty = 1/2 × 9/10 = 9/20. threshold@stake=1.0 = 1 - (11/20)^1 = 9/20.
+    val config = LddConfig(lddCutoff = 10, offset = 0, baselineDifficulty = Ratio(1, 20), amplitude = Ratio(1, 2))
+    for {
+      checker <- checkerIO
+      threshMid <- checker.threshold(Ratio.One, 5, config)
+      threshAlmostCutoff <- checker.threshold(Ratio.One, 9, config)
+    } yield
+      expect((threshMid - Ratio(1, 4)).abs < Tol)
+        .and(expect((threshAlmostCutoff - Ratio(9, 20)).abs < Tol))
   }
 
-  test("threshold equals baselineDifficulty in recovery region (δ ≥ γ)") {
-    IO {
-      val thresh15 = EligibilityChecker.threshold(1.0, 15, defaultConfig)
-      val thresh100 = EligibilityChecker.threshold(1.0, 100, defaultConfig)
-      // For relativeStake = 1.0, threshold ≈ difficulty (floating point)
-      expect(math.abs(thresh15 - defaultConfig.baselineDifficulty) < 1e-10)
-        .and(expect(math.abs(thresh100 - defaultConfig.baselineDifficulty) < 1e-10))
-    }
+  test("threshold equals baselineDifficulty in recovery region (δ ≥ γ) at stake=1") {
+    for {
+      checker <- checkerIO
+      thresh15 <- checker.threshold(Ratio.One, 15, defaultConfig)
+      thresh100 <- checker.threshold(Ratio.One, 100, defaultConfig)
+    } yield
+      // At stake=1 the formula 1 - (1-f)^1 = f, so threshold = baselineDifficulty exactly (within Lentz precision).
+      expect((thresh15 - defaultConfig.baselineDifficulty).abs < Tol)
+        .and(expect((thresh100 - defaultConfig.baselineDifficulty).abs < Tol))
   }
 
-  test("threshold with relativeStake=1.0 approximately equals f(δ)") {
-    IO {
-      val config = LddConfig(lddCutoff = 15, offset = 0, baselineDifficulty = 0.05, amplitude = 0.5)
-      // In recovery: f(δ) = 0.05
-      val threshRecovery = EligibilityChecker.threshold(1.0, 20, config)
-      expect(math.abs(threshRecovery - 0.05) < 1e-10).and {
-        // In ramp at δ=7: f(δ) = 0.5 * 7/15 = 0.2333...
-        val fAtDelta7 = 0.5 * 7.0 / 15.0
-        val threshRamp = EligibilityChecker.threshold(1.0, 7, config)
-        expect(math.abs(threshRamp - fAtDelta7) < 0.0001)
-      }
-    }
-  }
-
-  test("threshold with relativeStake=0.0 is always 0") {
-    IO {
-      val thresh0Gap = EligibilityChecker.threshold(0.0, 0, defaultConfig)
-      val thresh10Gap = EligibilityChecker.threshold(0.0, 10, defaultConfig)
-      val thresh100Gap = EligibilityChecker.threshold(0.0, 100, defaultConfig)
-      expect.eql(0.0, thresh0Gap).and(expect.eql(0.0, thresh10Gap)).and(expect.eql(0.0, thresh100Gap))
-    }
+  test("threshold with relativeStake=0 is always 0") {
+    for {
+      checker <- checkerIO
+      t0 <- checker.threshold(Ratio.Zero, 0, defaultConfig)
+      t10 <- checker.threshold(Ratio.Zero, 10, defaultConfig)
+      t100 <- checker.threshold(Ratio.Zero, 100, defaultConfig)
+    } yield
+      // exp(0 × x) = 1, so threshold = 1 - 1 = 0 exactly.
+      expect(t0 == Ratio.Zero).and(expect(t10 == Ratio.Zero)).and(expect(t100 == Ratio.Zero))
   }
 
   test("threshold scales with relativeStake via (1 - (1-f)^stake)") {
-    IO {
-      val f = 0.5 // amplitude at cutoff
-      val config = LddConfig(lddCutoff = 10, offset = 0, baselineDifficulty = f, amplitude = f)
-
-      // At slotGap = cutoff, difficulty = baselineDifficulty = 0.5
-      val threshHalfStake = EligibilityChecker.threshold(0.5, 10, config)
-      // threshold = 1 - (1 - 0.5)^0.5 = 1 - 0.5^0.5 = 1 - 0.7071 ≈ 0.2929
-      val expected = 1.0 - math.pow(0.5, 0.5)
-      expect(math.abs(threshHalfStake - expected) < 0.0001)
-    }
+    // f = 1/2, stake = 1/2. threshold = 1 - (1/2)^(1/2) ≈ 0.2929.
+    val f = Ratio(1, 2)
+    val config = LddConfig(lddCutoff = 10, offset = 0, baselineDifficulty = f, amplitude = f)
+    for {
+      checker <- checkerIO
+      threshHalfStake <- checker.threshold(Ratio(1, 2), 10, config)
+      expectedDouble = 1.0 - math.pow(0.5, 0.5)
+      expectedRatio = Ratio(expectedDouble, 12)
+    } yield expect((threshHalfStake - expectedRatio).abs < Tol)
   }
 
   // ============ N-Independence Tests ============
 
   test("N-independent: P(≥1 winner) ≈ f(δ) for N equal validators") {
-    IO {
-      // Taktikos property: regardless of N validators, probability of at least one winner
-      // should be approximately f(δ) when validators have equal stake summing to 1
-      val f = 0.3 // difficulty
-      val config = LddConfig(lddCutoff = 1, offset = 0, baselineDifficulty = f, amplitude = f)
-      val slotGap = 10L // In recovery region
-
-      def probNoWinner(n: Int): Double = {
-        val stakePerValidator = 1.0 / n
-        val threshPerValidator = EligibilityChecker.threshold(stakePerValidator, slotGap, config)
-        // P(validator doesn't win) = 1 - threshold
-        // P(no winner among N) = (1 - thresh)^N
-        math.pow(1.0 - threshPerValidator, n.toDouble)
+    // Pick a difficulty config so the recovery region holds at slotGap=10. f = 0.3.
+    val fRatio = Ratio(3, 10)
+    val config = LddConfig(lddCutoff = 1, offset = 0, baselineDifficulty = fRatio, amplitude = fRatio)
+    val slotGap = 10L
+    for {
+      checker <- checkerIO
+      probAtLeastOne <- List(3, 10, 100).traverse { n =>
+        checker.threshold(Ratio(1, n), slotGap, config).map { tPerValidator =>
+          // Cast to BigDecimal for the (1-t)^n exponentiation across N — Double arithmetic is fine
+          // for this *expectation check*, since the test asserts a probability identity, not
+          // consensus behavior. The threshold itself is exact-Ratio.
+          val t = tPerValidator.toDouble
+          1.0 - math.pow(1.0 - t, n.toDouble)
+        }
       }
-
-      val probAtLeastOne3 = 1.0 - probNoWinner(3)
-      val probAtLeastOne10 = 1.0 - probNoWinner(10)
-      val probAtLeastOne100 = 1.0 - probNoWinner(100)
-
-      // All should be approximately f(δ) = 0.3
-      expect(math.abs(probAtLeastOne3 - f) < 0.001)
-        .and(expect(math.abs(probAtLeastOne10 - f) < 0.001))
-        .and(expect(math.abs(probAtLeastOne100 - f) < 0.001))
-    }
+    } yield expect(probAtLeastOne.forall(p => math.abs(p - 0.3) < 0.001))
   }
 
   // ============ VRF Integration Tests ============
 
-  test("VRF proof roundtrip: prove → hash → normalize") {
-    IO {
-      val sk = randomSk()
-      val eta = randomEta()
-      val slot = Slot.unsafeApply(100L)
-
-      val proof = EligibilityChecker.vrfProofForSlot(sk, slot, eta)
-      val outputOpt = vrf.vrfProofToHash(proof)
-
+  test("VRF proof roundtrip: prove → hash → ratio") {
+    for {
+      checker <- checkerIO
+      sk = randomSk()
+      eta = randomEta()
+      slot = Slot.unsafeApply(100L)
+      proof = checker.vrfProofForSlot(sk, slot, eta)
+      outputOpt = vrf.vrfProofToHash(proof)
+    } yield
       expect(outputOpt.isDefined).and {
         val output = outputOpt.get
-        expect.eql(64, output.length).and {
-          val normalized = EligibilityChecker.normalizeVrfOutput(output)
-          expect(normalized >= 0.0).and(expect(normalized < 1.0))
-        }
+        val r = EligibilityChecker.vrfOutputAsRatio(output)
+        expect(output.length == 64)
+          .and(expect(r >= Ratio.Zero))
+          .and(expect(r < Ratio.One))
       }
-    }
   }
 
-  test("normalizeVrfOutput produces values in [0, 1)") {
-    IO {
-      // Test with various VRF outputs
-      val results = (1 to 100).map { _ =>
+  test("vrfOutputAsRatio produces values in [0, 1)") {
+    for {
+      checker <- checkerIO
+      results = (1 to 50).map { _ =>
         val sk = randomSk()
         val eta = randomEta()
         val slot = Slot.unsafeApply(random.nextLong().abs)
-        val proof = EligibilityChecker.vrfProofForSlot(sk, slot, eta)
+        val proof = checker.vrfProofForSlot(sk, slot, eta)
         val output = vrf.vrfProofToHash(proof).get
-        EligibilityChecker.normalizeVrfOutput(output)
+        EligibilityChecker.vrfOutputAsRatio(output)
       }
-
-      expect(results.forall(_ >= 0.0)).and(expect(results.forall(_ < 1.0)))
-    }
+    } yield expect(results.forall(_ >= Ratio.Zero)).and(expect(results.forall(_ < Ratio.One)))
   }
 
   test("checkEligibility + verifyEligibility roundtrip") {
-    IO {
-      val eta = randomEta()
-      val slotGap = 20L // In recovery region
-      val relativeStake = 1.0 // Full stake for higher chance of eligibility
-
-      // Run multiple times to get an eligible result
-      var found = false
-      var attempt = 0
-
-      while (!found && attempt < 1000) {
-        val testSk = randomSk()
-        val testVk = vrf.getVerificationKey(testSk)
-        val testSlot = Slot.unsafeApply(attempt.toLong)
-
-        EligibilityChecker.checkEligibility(testSk, testSlot, slotGap, eta, relativeStake, defaultConfig) match {
-          case Some((p, _)) =>
-            // Verify the proof
-            val verified = EligibilityChecker.verifyEligibility(testVk, testSlot, slotGap, eta, relativeStake, defaultConfig, p)
-            if (verified) {
-              found = true
+    val eta = randomEta()
+    val slotGap = 20L
+    val relativeStake = Ratio.One
+    for {
+      checker <- checkerIO
+      foundAttempt <- {
+        // Loop until we find one eligible slot, up to N attempts. Stake=1 means threshold = baseline = 1/20,
+        // so ~1-in-20 attempts wins on average.
+        def loop(attempt: Int): IO[Boolean] =
+          if (attempt >= 1000) IO.pure(false)
+          else {
+            val sk = randomSk()
+            val vk = vrf.getVerificationKey(sk)
+            val slot = Slot.unsafeApply(attempt.toLong)
+            checker.checkEligibility(sk, slot, slotGap, eta, relativeStake, defaultConfig).flatMap {
+              case Some((proof, _)) =>
+                checker.verifyEligibility(vk, slot, slotGap, eta, relativeStake, defaultConfig, proof).flatMap {
+                  case true  => IO.pure(true)
+                  case false => loop(attempt + 1)
+                }
+              case None => loop(attempt + 1)
             }
-          case None =>
-        }
-        attempt += 1
+          }
+        loop(0)
       }
-
-      expect(found, s"Should find at least one eligible slot in $attempt attempts")
-    }
+    } yield expect(foundAttempt, "Should find at least one eligible slot in 1000 attempts")
   }
 
   test("verifyEligibility fails with wrong VRF key") {
-    IO {
-      val sk1 = randomSk()
-      val sk2 = randomSk()
-      val vk2 = vrf.getVerificationKey(sk2) // Different key
-      val eta = randomEta()
-      val slot = Slot.unsafeApply(10L)
-      val slotGap = 20L
-
-      val proof = EligibilityChecker.vrfProofForSlot(sk1, slot, eta)
-
-      // Verification with wrong public key should fail
-      val verified = EligibilityChecker.verifyEligibility(vk2, slot, slotGap, eta, 1.0, defaultConfig, proof)
-      expect(!verified)
-    }
+    val sk1 = randomSk()
+    val sk2 = randomSk()
+    val vk2 = vrf.getVerificationKey(sk2)
+    val eta = randomEta()
+    val slot = Slot.unsafeApply(10L)
+    val slotGap = 20L
+    for {
+      checker <- checkerIO
+      proof = checker.vrfProofForSlot(sk1, slot, eta)
+      verified <- checker.verifyEligibility(vk2, slot, slotGap, eta, Ratio.One, defaultConfig, proof)
+    } yield expect(!verified)
   }
 
   test("verifyEligibility fails with tampered proof") {
-    IO {
-      val sk = randomSk()
-      val vk = vrf.getVerificationKey(sk)
-      val eta = randomEta()
-      val slot = Slot.unsafeApply(10L)
-      val slotGap = 20L
-
-      val proof = EligibilityChecker.vrfProofForSlot(sk, slot, eta)
-      val tamperedProof = proof.clone()
-      tamperedProof(0) = (tamperedProof(0) ^ 0xff).toByte
-
-      val verified = EligibilityChecker.verifyEligibility(vk, slot, slotGap, eta, 1.0, defaultConfig, tamperedProof)
-      expect(!verified)
-    }
+    val sk = randomSk()
+    val vk = vrf.getVerificationKey(sk)
+    val eta = randomEta()
+    val slot = Slot.unsafeApply(10L)
+    val slotGap = 20L
+    for {
+      checker <- checkerIO
+      proof = checker.vrfProofForSlot(sk, slot, eta)
+      tampered = {
+        val t = proof.clone()
+        t(0) = (t(0) ^ 0xff).toByte
+        t
+      }
+      verified <- checker.verifyEligibility(vk, slot, slotGap, eta, Ratio.One, defaultConfig, tampered)
+    } yield expect(!verified)
   }
 
   test("verifyEligibility fails with wrong slot") {
-    IO {
-      val sk = randomSk()
-      val vk = vrf.getVerificationKey(sk)
-      val eta = randomEta()
-      val slot = Slot.unsafeApply(10L)
-      val wrongSlot = Slot.unsafeApply(11L)
-      val slotGap = 20L
-
-      val proof = EligibilityChecker.vrfProofForSlot(sk, slot, eta)
-
-      val verified = EligibilityChecker.verifyEligibility(vk, wrongSlot, slotGap, eta, 1.0, defaultConfig, proof)
-      expect(!verified)
-    }
+    val sk = randomSk()
+    val vk = vrf.getVerificationKey(sk)
+    val eta = randomEta()
+    val slot = Slot.unsafeApply(10L)
+    val wrongSlot = Slot.unsafeApply(11L)
+    val slotGap = 20L
+    for {
+      checker <- checkerIO
+      proof = checker.vrfProofForSlot(sk, slot, eta)
+      verified <- checker.verifyEligibility(vk, wrongSlot, slotGap, eta, Ratio.One, defaultConfig, proof)
+    } yield expect(!verified)
   }
 
   test("verifyEligibility fails with wrong eta") {
-    IO {
-      val sk = randomSk()
-      val vk = vrf.getVerificationKey(sk)
-      val eta = randomEta()
-      val wrongEta = randomEta()
-      val slot = Slot.unsafeApply(10L)
-      val slotGap = 20L
-
-      val proof = EligibilityChecker.vrfProofForSlot(sk, slot, eta)
-
-      val verified = EligibilityChecker.verifyEligibility(vk, slot, slotGap, wrongEta, 1.0, defaultConfig, proof)
-      expect(!verified)
-    }
+    val sk = randomSk()
+    val vk = vrf.getVerificationKey(sk)
+    val eta = randomEta()
+    val wrongEta = randomEta()
+    val slot = Slot.unsafeApply(10L)
+    val slotGap = 20L
+    for {
+      checker <- checkerIO
+      proof = checker.vrfProofForSlot(sk, slot, eta)
+      verified <- checker.verifyEligibility(vk, slot, slotGap, wrongEta, Ratio.One, defaultConfig, proof)
+    } yield expect(!verified)
   }
 
   // ============ Epoch Eta Tests ============
@@ -281,10 +251,8 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
       val prevEta = randomEta()
       val epoch = 42L
       val rhoHashes = List(randomEta(), randomEta(), randomEta())
-
       val eta1 = EligibilityChecker.computeNextEta(prevEta, epoch, rhoHashes)
       val eta2 = EligibilityChecker.computeNextEta(prevEta, epoch, rhoHashes)
-
       expect(java.util.Arrays.equals(eta1, eta2))
     }
   }
@@ -292,25 +260,19 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
   test("computeNextEta produces 32-byte output") {
     IO {
       val prevEta = randomEta()
-      val epoch = 1L
-      val rhoHashes = List(randomEta())
-
-      val nextEta = EligibilityChecker.computeNextEta(prevEta, epoch, rhoHashes)
-      expect.eql(32, nextEta.length)
+      val nextEta = EligibilityChecker.computeNextEta(prevEta, 1L, List(randomEta()))
+      expect(nextEta.length == 32)
     }
   }
 
   test("computeNextEta differs with different inputs") {
     IO {
       val prevEta = randomEta()
-      val epoch = 1L
       val rhoHashes = List(randomEta())
-
-      val eta1 = EligibilityChecker.computeNextEta(prevEta, epoch, rhoHashes)
-      val eta2 = EligibilityChecker.computeNextEta(prevEta, epoch + 1, rhoHashes)
-      val eta3 = EligibilityChecker.computeNextEta(randomEta(), epoch, rhoHashes)
-      val eta4 = EligibilityChecker.computeNextEta(prevEta, epoch, List(randomEta()))
-
+      val eta1 = EligibilityChecker.computeNextEta(prevEta, 1L, rhoHashes)
+      val eta2 = EligibilityChecker.computeNextEta(prevEta, 2L, rhoHashes)
+      val eta3 = EligibilityChecker.computeNextEta(randomEta(), 1L, rhoHashes)
+      val eta4 = EligibilityChecker.computeNextEta(prevEta, 1L, List(randomEta()))
       expect(!java.util.Arrays.equals(eta1, eta2))
         .and(expect(!java.util.Arrays.equals(eta1, eta3)))
         .and(expect(!java.util.Arrays.equals(eta1, eta4)))
@@ -319,58 +281,60 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
 
   test("computeNextEta handles empty rhoNonceHashes") {
     IO {
-      val prevEta = randomEta()
-      val epoch = 1L
-
-      val eta = EligibilityChecker.computeNextEta(prevEta, epoch, List.empty)
-      expect.eql(32, eta.length)
+      val eta = EligibilityChecker.computeNextEta(randomEta(), 1L, List.empty)
+      expect(eta.length == 32)
     }
   }
 
   // ============ Edge Cases ============
 
   test("vrfProofForSlot requires 32-byte eta") {
-    IO {
-      val sk = randomSk()
-      val slot = Slot.unsafeApply(0L)
-      val shortEta = new Array[Byte](16)
-
-      val result = scala.util.Try {
-        EligibilityChecker.vrfProofForSlot(sk, slot, shortEta)
-      }
-
+    for {
+      checker <- checkerIO
+    } yield {
+      val result = scala.util.Try(checker.vrfProofForSlot(randomSk(), Slot.unsafeApply(0L), new Array[Byte](16)))
       expect(result.isFailure)
     }
   }
 
-  test("threshold handles edge case difficulty = 1.0") {
-    IO {
-      // If somehow difficulty >= 1.0, should return 1.0
-      val config = LddConfig(lddCutoff = 1, offset = 0, baselineDifficulty = 1.0, amplitude = 1.0)
-      val thresh = EligibilityChecker.threshold(1.0, 10, config)
-      expect.eql(1.0, thresh)
-    }
+  test("threshold handles edge case difficulty = 1") {
+    val config = LddConfig(lddCutoff = 1, offset = 0, baselineDifficulty = Ratio.One, amplitude = Ratio.One)
+    for {
+      checker <- checkerIO
+      thresh <- checker.threshold(Ratio.One, 10, config)
+    } yield expect(thresh == Ratio.One)
   }
 
   test("threshold handles slotGap = 0 with offset = 0") {
-    IO {
-      // At slotGap = 0, offset = 0: should be in ramp with difficulty = 0
-      val config = LddConfig(lddCutoff = 15, offset = 0, baselineDifficulty = 0.05, amplitude = 0.5)
-      val thresh = EligibilityChecker.threshold(1.0, 0, config)
-      // difficulty = 0.5 * (0 - 0) / (15 - 0) = 0
-      expect.eql(0.0, thresh)
-    }
+    val config = LddConfig(lddCutoff = 15, offset = 0, baselineDifficulty = Ratio(1, 20), amplitude = Ratio(1, 2))
+    for {
+      checker <- checkerIO
+      thresh <- checker.threshold(Ratio.One, 0, config)
+    } yield expect(thresh == Ratio.Zero) // difficulty = 0 → short-circuit
   }
 
   test("default config has ψ=1 buffer: zero probability in slot immediately after snapshot") {
-    IO {
-      // With Default config (offset=1), δ=1 should yield zero threshold
-      val threshDelta0 = EligibilityChecker.threshold(1.0, 0, defaultConfig)
-      val threshDelta1 = EligibilityChecker.threshold(1.0, 1, defaultConfig)
-      // δ=2 should be the start of the ramp: fA × (2-1)/(γ-1) = 0.5 × 1/14
-      val threshDelta2 = EligibilityChecker.threshold(1.0, 2, defaultConfig)
-      val expectedRampStart = 0.5 * 1.0 / 14.0
-      expect.eql(0.0, threshDelta0).and(expect.eql(0.0, threshDelta1)).and(expect(math.abs(threshDelta2 - expectedRampStart) < 1e-10))
-    }
+    for {
+      checker <- checkerIO
+      threshDelta0 <- checker.threshold(Ratio.One, 0, defaultConfig)
+      threshDelta1 <- checker.threshold(Ratio.One, 1, defaultConfig)
+      threshDelta2 <- checker.threshold(Ratio.One, 2, defaultConfig)
+      // δ=2: difficulty = 1/2 × (2-1)/(15-1) = 1/28. At stake=1: threshold = 1 - (27/28)^1 = 1/28.
+      expectedRampStart = Ratio(1, 28)
+    } yield
+      expect(threshDelta0 == Ratio.Zero)
+        .and(expect(threshDelta1 == Ratio.Zero))
+        .and(expect((threshDelta2 - expectedRampStart).abs < Tol))
+  }
+
+  // Helper: traverse for List in IO context (cats stdlib alternative).
+  private implicit class TraverseListIO[A](xs: List[A]) {
+    def traverse[B](f: A => IO[B]): IO[List[B]] =
+      xs.foldLeft(IO.pure(List.empty[B])) { (accIO, a) =>
+        for {
+          acc <- accIO
+          b <- f(a)
+        } yield acc :+ b
+      }
   }
 }

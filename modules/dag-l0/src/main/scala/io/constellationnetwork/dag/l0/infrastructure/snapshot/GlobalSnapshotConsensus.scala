@@ -361,14 +361,24 @@ object GlobalSnapshotConsensus {
       // Nakamoto GL0: no BFT consensus trigger or loop — slot clock handles production
       triggerEvent = Async[F].unit
 
-      // Nakamoto LDD + VRF config
+      // Nakamoto LDD + VRF config. Env vars are typed Double for backwards-compatible config; we lock
+      // them into Ratio at boot via `Ratio.apply(double, prec)` so the threshold computation is exact
+      // and reproducible across all JVMs/CPUs.
       lddConfig = {
         val default = io.constellationnetwork.schema.nakamoto.LddConfig.Default
         io.constellationnetwork.schema.nakamoto.LddConfig(
           lddCutoff = sys.env.get("NAKAMOTO_LDD_CUTOFF").flatMap(_.toIntOption).getOrElse(default.lddCutoff),
           offset = sys.env.get("NAKAMOTO_LDD_OFFSET").flatMap(_.toIntOption).getOrElse(default.offset),
-          baselineDifficulty = sys.env.get("NAKAMOTO_LDD_BASELINE").flatMap(_.toDoubleOption).getOrElse(default.baselineDifficulty),
-          amplitude = sys.env.get("NAKAMOTO_LDD_AMPLITUDE").flatMap(_.toDoubleOption).getOrElse(default.amplitude)
+          baselineDifficulty = sys.env
+            .get("NAKAMOTO_LDD_BASELINE")
+            .flatMap(_.toDoubleOption)
+            .map(io.constellationnetwork.numerics.Ratio(_, io.constellationnetwork.schema.nakamoto.LddConfig.DoubleParsePrecision))
+            .getOrElse(default.baselineDifficulty),
+          amplitude = sys.env
+            .get("NAKAMOTO_LDD_AMPLITUDE")
+            .flatMap(_.toDoubleOption)
+            .map(io.constellationnetwork.numerics.Ratio(_, io.constellationnetwork.schema.nakamoto.LddConfig.DoubleParsePrecision))
+            .getOrElse(default.amplitude)
         )
       }
       slotsPerEpoch = sys.env.get("NAKAMOTO_SLOTS_PER_EPOCH").flatMap(_.toLongOption).getOrElse(60L)
@@ -393,6 +403,14 @@ object GlobalSnapshotConsensus {
           stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F].toResource
           _ <- stakeRegistry.updateValidators(seedlist.map(_.map(_.peerId)).getOrElse(Set(selfId))).toResource
           tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry).toResource
+
+          // Numerics for VRF eligibility threshold. Bifrost prod precision: log1p=8, exp=38, maxIter=10000.
+          // We use prec=8 / prec=38 to match Bifrost exactly. The Lentz iteration runs in exact `Ratio`
+          // arithmetic so two honest nodes (different JVMs/CPUs/JIT-tiers) compute byte-identical
+          // thresholds — closes the IEEE 754 nondeterminism risk.
+          log1p <- io.constellationnetwork.numerics.interpreters.Log1pInterpreter.make[F](maxIterations = 10000, precision = 8).toResource
+          exp <- io.constellationnetwork.numerics.interpreters.ExpInterpreter.make[F](maxIterations = 10000, precision = 38).toResource
+          eligibilityChecker = io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker.make[F](log1p, exp)
           // ChainSelection needs fetchParent — but chainStore needs ChainSelection.
           // Break the cycle: create chainStore first with a lazy fetchParent that
           // uses chainStore.tipFor once it's available.
@@ -516,6 +534,7 @@ object GlobalSnapshotConsensus {
                   keyPair = keyPair,
                   selfId = selfId,
                   lddConfig = lddConfig,
+                  eligibilityChecker = eligibilityChecker,
                   slotsPerEpoch = slotsPerEpoch,
                   etaRotationSlots = etaRotationSlots,
                   lastKnownSlotRef = lastKnownSlotRef,
@@ -594,6 +613,7 @@ object GlobalSnapshotConsensus {
                   selfId = selfId,
                   keyPair = keyPair,
                   lddConfig = lddConfig,
+                  eligibilityChecker = eligibilityChecker,
                   lastKnownSlotRef = lastKnownSlotRef,
                   epochStateRef = epochStateRef,
                   etaRotationSlots = etaRotationSlots,
