@@ -60,6 +60,13 @@ export USE_TEST_METAGRAPH=${USE_TEST_METAGRAPH:-false}
 export SELECTED_TESTS=${SELECTED_TESTS:-""}
 export LIST_TESTS=${LIST_TESTS:-false}
 
+# Number of independent metagraphs to spin up against a single hypergraph.
+# K=1 (default) preserves the legacy single-metagraph behaviour. K>=2 spawns
+# additional metagraph clusters with their own keystore + genesis, sharing
+# the same GL0/GL1 hypergraph. Required for sharding-related e2e — see
+# .workspace/sharding-design-notes.md §3 (Deliverable A — multi-metagraph e2e).
+export NUM_METAGRAPHS=${NUM_METAGRAPHS:-1}
+
 
 # Store any explicitly-set TESSELLATION_VERSION from environment
 # This will be used for precedence after args are parsed
@@ -195,6 +202,13 @@ for arg in "$@"; do
       ;;
     --use-test-metagraph)
       export USE_TEST_METAGRAPH=true
+      ;;
+    --metagraphs=*)
+      export NUM_METAGRAPHS="${arg#*=}"
+      if ! [[ "$NUM_METAGRAPHS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: --metagraphs must be a positive integer (got: $NUM_METAGRAPHS)"
+        exit 1
+      fi
       ;;
     --nakamoto-gl0)
       # Run GL0 in Nakamoto mode (VRF + libp2p sidecar gossip) instead of BFT.
