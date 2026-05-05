@@ -401,7 +401,13 @@ object GlobalSnapshotConsensus {
             )
             .toResource
           stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F].toResource
-          _ <- stakeRegistry.updateValidators(seedlist.map(_.map(_.peerId)).getOrElse(Set(selfId))).toResource
+          // Filter out entries marked with alias="metagraph-op". They live in the seedlist
+          // so state-channel binary signature validation accepts them as known signers,
+          // but they must not count as Nakamoto validators (would dilute 1/N VRF stake).
+          validatorPeers = seedlist
+            .map(_.collect { case e if !e.alias.exists(_.value.value == "metagraph-op") => e.peerId })
+            .getOrElse(Set(selfId))
+          _ <- stakeRegistry.updateValidators(validatorPeers).toResource
           tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry).toResource
 
           // Numerics for VRF eligibility threshold. Bifrost prod precision: log1p=8, exp=38, maxIter=10000.

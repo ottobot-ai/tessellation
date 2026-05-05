@@ -468,31 +468,38 @@ object Main
               case Some(entries) =>
                 storages.cluster.getToken.flatMap { maybeToken =>
                   val token = maybeToken.getOrElse(ClusterSessionToken(Generation(1L)))
-                  entries.toList.filter(_.peerId =!= nodeId).traverse_ { entry =>
-                    entry.connectionInfo match {
-                      case Some(connInfo) =>
-                        val publicPort = com.comcast.ip4s.Port
-                          .fromInt(connInfo.p2pPort.value - 1)
-                          .getOrElse(connInfo.p2pPort)
-                        val sessionGen = eu.timepit.refined.types.numeric.PosLong.unsafeFrom(System.currentTimeMillis())
-                        val peer = Peer(
-                          id = entry.peerId,
-                          ip = com.comcast.ip4s.Host.fromString(connInfo.ipAddress.toString).get,
-                          publicPort = publicPort,
-                          p2pPort = connInfo.p2pPort,
-                          clusterSession = token,
-                          session = SessionToken(Generation(sessionGen)),
-                          state = NodeState.Ready,
-                          responsiveness = Responsive,
-                          jar = Hash.empty
-                        )
-                        storages.cluster.addPeer(peer).void
-                      case None =>
-                        // 1-field seedlist entry (peerId only) — can't add to ClusterStorage
-                        // without connection info. The peer will be absent from /cluster/info.
-                        IO.unit
+                  // Drop metagraph-op-marked entries: they're in the seedlist only so gl0
+                  // accepts state-channel binary signatures, but they aren't gl0 cluster
+                  // members. Including them in /cluster/info caused metagraph cl1/dl1 to
+                  // pick them as "global L0 peers" and fail to fetch global snapshots.
+                  entries.toList
+                    .filter(_.peerId =!= nodeId)
+                    .filterNot(_.alias.exists(_.value.value == "metagraph-op"))
+                    .traverse_ { entry =>
+                      entry.connectionInfo match {
+                        case Some(connInfo) =>
+                          val publicPort = com.comcast.ip4s.Port
+                            .fromInt(connInfo.p2pPort.value - 1)
+                            .getOrElse(connInfo.p2pPort)
+                          val sessionGen = eu.timepit.refined.types.numeric.PosLong.unsafeFrom(System.currentTimeMillis())
+                          val peer = Peer(
+                            id = entry.peerId,
+                            ip = com.comcast.ip4s.Host.fromString(connInfo.ipAddress.toString).get,
+                            publicPort = publicPort,
+                            p2pPort = connInfo.p2pPort,
+                            clusterSession = token,
+                            session = SessionToken(Generation(sessionGen)),
+                            state = NodeState.Ready,
+                            responsiveness = Responsive,
+                            jar = Hash.empty
+                          )
+                          storages.cluster.addPeer(peer).void
+                        case None =>
+                          // 1-field seedlist entry (peerId only) — can't add to ClusterStorage
+                          // without connection info. The peer will be absent from /cluster/info.
+                          IO.unit
+                      }
                     }
-                  }
                 }
               case None => IO.unit
             }) >>
