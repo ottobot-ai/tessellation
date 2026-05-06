@@ -5,12 +5,12 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.SpendTransaction
 import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.security.Hasher
@@ -21,6 +21,7 @@ import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{
   allowSpendExpiryKeySetImmutableCodec,
   signedAllowSpendSetCodec
 }
+import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.syntax.sortedCollection.sortedSetSyntax
 
 /** Result of allow spend acceptance containing full state, deltas, and removed keys */
@@ -96,7 +97,7 @@ trait AllowSpendStateManager[F[_]] {
 object AllowSpendStateManager {
 
   def make[F[_]: Async](
-    mptStore: MptStore[F, GlobalStateKey]
+    reader: GlobalStateReader[F]
   ): AllowSpendStateManager[F] = new AllowSpendStateManager[F] {
 
     def acceptAllowSpends(
@@ -302,8 +303,9 @@ object AllowSpendStateManager {
 
         for {
           buckets <- epochs.traverse { e =>
-            mptStore
-              .getExpiryBucket[AllowSpendExpiryKey](SystemNamespaceLabel.ExpiryIndexAllowSpends, e)
+            GlobalStateKey
+              .expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexAllowSpends, e)
+              .flatMap(reader.get[SortedSet[AllowSpendExpiryKey]])
               .map(_.getOrElse(SortedSet.empty[AllowSpendExpiryKey]))
           }
           // Filter to global-only (metagraphId = None) and group by address.
@@ -311,14 +313,16 @@ object AllowSpendStateManager {
           byAddress = allKeys.groupBy(_.address)
           resolved <- byAddress.toList.traverse {
             case (addr, expiryKeys) =>
-              mptStore.getActiveAllowSpends(None, addr).flatMap { addrSetOpt =>
-                val addrSet = addrSetOpt.getOrElse(SortedSet.empty[Signed[AllowSpend]])
-                val expectedHashes = expiryKeys.map(_.hash)
-                addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s))).map { hashed =>
-                  val matched = hashed.collect { case (h, s) if expectedHashes.contains(h) => s }.to(SortedSet)
-                  addr -> matched
+              reader
+                .get[SortedSet[Signed[AllowSpend]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, None, addr))
+                .flatMap { addrSetOpt =>
+                  val addrSet = addrSetOpt.getOrElse(SortedSet.empty[Signed[AllowSpend]])
+                  val expectedHashes = expiryKeys.map(_.hash)
+                  addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s))).map { hashed =>
+                    val matched = hashed.collect { case (h, s) if expectedHashes.contains(h) => s }.to(SortedSet)
+                    addr -> matched
+                  }
                 }
-              }
           }
         } yield SortedMap.from(resolved).filter(_._2.nonEmpty)
       }
@@ -376,7 +380,8 @@ object AllowSpendStateManager {
     )(implicit hasher: Hasher[F]): F[Balance] =
       deltas.get(address) match {
         case Some(b) => b.pure[F]
-        case None    => mptStore.getBalance(address).map(_.getOrElse(Balance.empty))
+        case None =>
+          reader.get[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, address)).map(_.getOrElse(Balance.empty))
       }
 
     def materializeActiveAllowSpendsFromMpt(
@@ -384,7 +389,7 @@ object AllowSpendStateManager {
     ): F[SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]] =
       for {
         prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveAllowSpends)
-        entries <- mptStore.getAllForPrefix[SortedSet[Signed[AllowSpend]]](prefix)
+        entries <- reader.getAllForPrefix[SortedSet[Signed[AllowSpend]]](prefix)
       } yield
         entries.values.toList
           .mapFilter(set => set.headOption.map(h => (h.value.currencyId.map(_.value), h.value.source, set)))
@@ -400,10 +405,10 @@ object AllowSpendStateManager {
     ): F[SortedMap[Address, AllowSpendReference]] =
       for {
         indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastAllowSpendRefs)
-        addrSet <- mptStore.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
+        addrSet <- reader.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
         addrList = addrSet.toList
         keys = addrList.map(addr => GlobalStateKey.hypergraph(GlobalStateFieldId.LastAllowSpendRefs, addr))
-        values <- mptStore.getMany[AllowSpendReference](keys)
+        values <- reader.getMany[AllowSpendReference](keys)
       } yield
         SortedMap.from(addrList.flatMap { addr =>
           val key = GlobalStateKey.hypergraph(GlobalStateFieldId.LastAllowSpendRefs, addr)

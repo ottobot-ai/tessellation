@@ -8,6 +8,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -113,7 +114,7 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](store)
+      mgr = AllowSpendStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       // Current epoch 300: asExpiredA (100) is expired, others not yet.
       // previousEpochProgress = MinValue: sweep all buckets up to 299.
@@ -138,7 +139,7 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(asValid))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](store)
+      mgr = AllowSpendStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentEpoch = EpochProgress(NonNegLong(500L))
       prevEpoch = EpochProgress(NonNegLong(100L))
@@ -160,7 +161,7 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(asExpired))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](store)
+      mgr = AllowSpendStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       sameEpoch = EpochProgress(NonNegLong(200L))
       indexExpired <- mgr.findExpiredGlobalAllowSpendsViaIndexFromMpt(sameEpoch, sameEpoch)
@@ -187,7 +188,7 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](store)
+      mgr = AllowSpendStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       // Sweep window [101 .. 114] captures all three records (predicate is `< curr`).
       prevEpoch = EpochProgress(NonNegLong(101L))
@@ -232,7 +233,7 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       lastActiveOuter = SortedMap(Option.empty[Address] -> lastActive)
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](store)
+      mgr = AllowSpendStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -283,7 +284,7 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
       lastActiveOuter = SortedMap(Option.empty[Address] -> lastActive)
 
       store <- mkSeededMptStore(lastActive)
-      mgr = AllowSpendStateManager.make[IO](store)
+      mgr = AllowSpendStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
