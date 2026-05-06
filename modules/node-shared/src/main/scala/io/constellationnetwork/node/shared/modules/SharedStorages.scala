@@ -62,11 +62,13 @@ object SharedStorages {
       // overlay anyway in #56.10's scope.
       bestTipFnRef <- Ref.of[F, F[Option[BranchId]]](none[BranchId].pure[F])
       mptOverlay <- MptOverlay.make[F, GlobalStateKey](
-        // Stays on `Passthrough` until #56.11's e2e-validated multi-branch flip. At that point
-        // flip to `MptOverlay.OverlayMode.productionDefault` (or read mode from config); the
-        // `bestTipFn` indirection below is already in place to give MultiBranch eviction the
-        // ancestor protection (#56.9) it needs once production starts producing real branches.
-        mode = MptOverlay.OverlayMode.Passthrough,
+        // #56.11 production flip. Validated against allow-spends e2e on Passthrough first
+        // (zero StateProofMismatch, full scenario coverage). MultiBranch enables per-branch
+        // ChangeSet isolation: provisional/non-canonical downloads accumulate in pending and
+        // are folded into base only on `chainStore.finalize` → `mptOverlay.finalizeBranch`.
+        // `bestTipFn` (set by dag-l0 boot path) gives Taktikos-scored eviction (#56.9)
+        // ancestor protection so the canonical chain is never dropped under cap pressure.
+        mode = MptOverlay.OverlayMode.productionDefault,
         underlying = mptStore,
         pcTree = mptOverlayParentChildTree,
         toHex = GlobalStateKey.toHex[F],
