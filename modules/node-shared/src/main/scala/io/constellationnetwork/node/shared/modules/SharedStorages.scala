@@ -2,8 +2,7 @@ package io.constellationnetwork.node.shared.modules
 
 import cats.Parallel
 import cats.effect.kernel.Async
-import cats.syntax.flatMap._
-import cats.syntax.functor._
+import cats.syntax.all._
 
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types.SharedConfig
@@ -58,7 +57,13 @@ object SharedStorages {
         enabled = false,
         underlying = mptStore,
         pcTree = mptOverlayParentChildTree,
-        toHex = GlobalStateKey.toHex[F]
+        toHex = GlobalStateKey.toHex[F],
+        // #56.9: ancestor-protection callback. With the overlay disabled (passthrough mode) and no
+        // chainStore wire-up, return `None` — eviction never fires anyway because the passthrough has
+        // no pending state. When `enabled` flips true and a real `chainStore` is in scope, replace this
+        // with `chainStore.bestTip.map(_.map(s => BranchId(s.hash)))` so depth-k / attestation-2/3
+        // finality still finds canonical-chain ancestors after eviction pressure.
+        bestTipFn = none[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId].pure[F]
       )
     } yield
       new SharedStorages[F](

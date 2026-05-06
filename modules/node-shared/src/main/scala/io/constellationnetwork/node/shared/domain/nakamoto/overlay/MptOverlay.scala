@@ -167,19 +167,33 @@ object MptOverlay {
     ordinal: SnapshotOrdinal
   )
 
+  /** Default cap on pending branches. Per the rev3 plan: 4 branches × 32 ordinals × ~50 KB ≈ ~6 MB. Eviction (#56.9) drops the
+    * lowest-scoring non-canonical branch when this is exceeded.
+    */
+  val DefaultMaxPendingBranches: Int = 4
+
   /** Factory dispatch on the `MPT_OVERLAY_ENABLED` feature flag (default off). Off → passthrough (correctness-equivalent to direct
     * `MptStore` use). On → multi-branch overlay with per-branch `ChangeSet` accumulation.
     *
     * `toHex` is plumbed in alongside `underlying` so the multi-branch impl can encode keys before the per-handle accumulator stores them.
     * For passthrough, `toHex` is unused — kept on the signature so flipping the flag doesn't change call sites.
+    *
+    * `maxPendingBranches` (#56.9): cap on the multi-branch overlay's pending-branches map. When exceeded, the lowest-scoring non-ancestor
+    * branch is evicted on commit. Default 4. Ignored by the passthrough impl (no pending state).
+    *
+    * `bestTipFn` (#56.9): callback the overlay queries during eviction to identify ancestors of the canonical chain — these are NEVER
+    * evicted. Pass `Async[F].pure(none[BranchId])` for "no ancestor protection" (purely score-based eviction); production deployments
+    * should plumb this from `chainStore.bestTip` so depth-k / attestation-2/3 finality can still walk back through pending branches.
     */
   def make[F[_]: Async: Hasher, K](
     enabled: Boolean,
     underlying: MptStore[F, K],
     pcTree: ParentChildTree[F],
-    toHex: K => F[Hex]
+    toHex: K => F[Hex],
+    maxPendingBranches: Int = DefaultMaxPendingBranches,
+    bestTipFn: F[Option[BranchId]]
   ): F[MptOverlay[F, K]] =
-    if (enabled) MultiBranch[F, K](underlying, pcTree, toHex)
+    if (enabled) MultiBranch[F, K](underlying, pcTree, toHex, maxPendingBranches, bestTipFn)
     else Async[F].pure(passthrough(underlying, pcTree))
 
   /** Single-branch passthrough — correctness-equivalent to using `MptStore` directly. The `BranchId` argument on every method is ignored.
@@ -311,14 +325,25 @@ object MptOverlay {
     def apply[F[_]: Async: Hasher, K](
       underlying: MptStore[F, K],
       pcTree: ParentChildTree[F],
-      toHex: K => F[Hex]
+      toHex: K => F[Hex],
+      maxPendingBranches: Int,
+      bestTipFn: F[Option[BranchId]]
     ): F[MptOverlay[F, K]] =
       (
         Ref.of[F, Map[BranchId, BranchEntry]](Map.empty),
         Ref.of[F, Map[SnapshotOrdinal, BranchId]](Map.empty),
         Semaphore[F](1)
       ).mapN { (pendingRef, finalizedRef, mutex) =>
-        new Impl[F, K](underlying, pcTree, toHex, pendingRef, finalizedRef, mutex): MptOverlay[F, K]
+        new Impl[F, K](
+          underlying,
+          pcTree,
+          toHex,
+          pendingRef,
+          finalizedRef,
+          mutex,
+          maxPendingBranches,
+          bestTipFn
+        ): MptOverlay[F, K]
       }
 
     private final class Impl[F[_]: Async: Hasher, K](
@@ -327,7 +352,9 @@ object MptOverlay {
       toHex: K => F[Hex],
       pendingRef: Ref[F, Map[BranchId, BranchEntry]],
       finalizedRef: Ref[F, Map[SnapshotOrdinal, BranchId]],
-      mutex: Semaphore[F]
+      mutex: Semaphore[F],
+      maxPendingBranches: Int,
+      bestTipFn: F[Option[BranchId]]
     ) extends MptOverlay[F, K] {
 
       private val logger = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
@@ -354,12 +381,47 @@ object MptOverlay {
           for {
             changes <- handle.accRef.get
             _ <- pendingRef.update(_.updated(childTip, BranchEntry(handle.parent, changes, ordinal)))
+            // Eviction (#56.9): single-shot — each commit adds exactly one branch, so at most one over the
+            // cap. Read pending+evict+write while still holding the mutex so a concurrent commit can't see
+            // a momentarily-over-cap state.
+            _ <- pendingRef.get.flatMap(evictIfOverCap).flatMap(pendingRef.set)
             _ <-
               if (handle.parent.value === childTip.value) Async[F].unit
               else pcTree.associate(childTip.value, handle.parent.value)
           } yield ()
         }
       }
+
+      /** Eviction policy (#56.9). Drops the lowest-scoring non-ancestor branch when `pending.size` exceeds the cap. Score is `(ordinal asc,
+        * BranchId.value lex asc)` — lowest gets evicted. Ancestors of `bestTipFn`'s tip are never evicted (would break finality walk-back).
+        * If `bestTipFn` returns `None`, no ancestor protection is applied. If ALL pending branches are ancestors, eviction is skipped with
+        * a warn log — the overlay rides over-cap until finalization releases ancestors.
+        */
+      private def evictIfOverCap(pending: Map[BranchId, BranchEntry]): F[Map[BranchId, BranchEntry]] =
+        if (pending.size <= maxPendingBranches) pending.pure[F]
+        else
+          bestTipFn.flatMap { bestTipOpt =>
+            val ancestors = bestTipOpt.fold(Set.empty[BranchId])(walkAncestorsInPending(_, pending))
+            val candidates = pending.view.filterKeys(id => !ancestors.contains(id)).toMap
+            if (candidates.isEmpty)
+              logger
+                .warn(
+                  s"[MptOverlay] Eviction skipped: all ${pending.size} pending branches are ancestors of bestTip; " +
+                    s"cap=$maxPendingBranches. Overlay will ride over-cap until finalization releases ancestors."
+                )
+                .as(pending)
+            else {
+              val (evictId, evictEntry) = candidates.toList.minBy {
+                case (id, entry) => (entry.ordinal.value.value, id.value.value)
+              }
+              logger
+                .info(
+                  s"[MptOverlay] Evicting branch=${evictId.value} ordinal=${evictEntry.ordinal} (cap=$maxPendingBranches, " +
+                    s"pending=${pending.size}, ancestors=${ancestors.size})"
+                )
+                .as(pending - evictId)
+            }
+          }
 
       def get[V: ImmutableCodec](branch: BranchId, key: K): F[Option[V]] =
         for {
@@ -519,6 +581,27 @@ object MptOverlay {
       pending.get(branch) match {
         case None        => acc
         case Some(entry) => countAncestors(entry.parent, pending, acc + 1)
+      }
+
+    /** Set of `BranchId`s on the chain from `branch` to base (inclusive of `branch` itself). Used by eviction (#56.9) to identify branches
+      * that must NOT be dropped because they are ancestors of the canonical tip — finality walk-back depends on them being present.
+      *
+      * Walks parent pointers in `pending` only; stops when a parent isn't in `pending` (= reached the finalized base) OR when revisiting an
+      * already-seen branch (defensive cycle guard, though `pendingRef` should never contain cycles).
+      */
+    @tailrec
+    private def walkAncestorsInPending(
+      branch: BranchId,
+      pending: Map[BranchId, BranchEntry],
+      acc: Set[BranchId] = Set.empty
+    ): Set[BranchId] =
+      if (acc.contains(branch)) acc
+      else {
+        val updated = acc + branch
+        pending.get(branch) match {
+          case Some(entry) => walkAncestorsInPending(entry.parent, pending, updated)
+          case None        => updated
+        }
       }
   }
 }
