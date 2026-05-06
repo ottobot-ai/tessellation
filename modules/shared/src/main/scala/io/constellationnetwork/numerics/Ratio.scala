@@ -13,10 +13,9 @@ package io.constellationnetwork.numerics
 
 import scala.annotation.tailrec
 
-/** Exact rational number with `numerator / denominator` reduced by gcd at construction time. Used throughout the
-  * Taktikos consensus path (eligibility threshold, attestation weight, finality threshold) so that two honest nodes
-  * compute byte-identical results regardless of JVM, CPU, or JIT tier — eliminating the IEEE 754 nondeterminism risk
-  * that Double would introduce.
+/** Exact rational number with `numerator / denominator` reduced by gcd at construction time. Used throughout the Taktikos consensus path
+  * (eligibility threshold, attestation weight, finality threshold) so that two honest nodes compute byte-identical results regardless of
+  * JVM, CPU, or JIT tier — eliminating the IEEE 754 nondeterminism risk that Double would introduce.
   */
 case class Ratio(numerator: BigInt, denominator: BigInt, greatestCommonDenominator: BigInt) {
 
@@ -50,9 +49,8 @@ object Ratio {
 
   def apply(n: Int, d: Int): Ratio = apply(BigInt(n), BigInt(d))
 
-  /** Convert a Double to Ratio with `prec` decimal digits of precision. Loses precision; intended for parsing
-    * Double-typed config (env vars) into the consensus-deterministic representation at boot time. After this point
-    * the value never touches Double again.
+  /** Convert a Double to Ratio with `prec` decimal digits of precision. Loses precision; intended for parsing Double-typed config (env
+    * vars) into the consensus-deterministic representation at boot time. After this point the value never touches Double again.
     */
   def apply(double: Double, prec: Int): Ratio = {
     val d = BigInt(10).pow(prec)

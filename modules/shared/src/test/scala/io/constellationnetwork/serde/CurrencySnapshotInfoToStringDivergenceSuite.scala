@@ -14,9 +14,9 @@ import io.constellationnetwork.serde.implicits._
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.FunSuite
 
-/** Diagnostic suite for #70: dl1 follower computes a `lastCurrencySnapshots` accumulator with the same scodec bytes
-  * as gl0's leader but a different `toString.hashCode`. This suite probes which construction path (SortedMap.empty vs
-  * deserialize, ++ ordering, Some(empty) vs None semantics under various builders) produces equal-bytes-but-unequal-toString.
+/** Diagnostic suite for #70: dl1 follower computes a `lastCurrencySnapshots` accumulator with the same scodec bytes as gl0's leader but a
+  * different `toString.hashCode`. This suite probes which construction path (SortedMap.empty vs deserialize, ++ ordering, Some(empty) vs
+  * None semantics under various builders) produces equal-bytes-but-unequal-toString.
   */
 object CurrencySnapshotInfoToStringDivergenceSuite extends FunSuite {
 

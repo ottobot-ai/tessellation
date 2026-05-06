@@ -4,11 +4,10 @@ import cats.{Eq, Show}
 
 import io.circe.{Decoder, Encoder, Json}
 
-/** JSON, Eq, and Show instances for [[Ratio]]. Kept in a separate Apache-2.0 file so the imported `Ratio.scala`
-  * (MPL-2.0) can stay byte-identical to upstream Bifrost.
+/** JSON, Eq, and Show instances for [[Ratio]]. Kept in a separate Apache-2.0 file so the imported `Ratio.scala` (MPL-2.0) can stay
+  * byte-identical to upstream Bifrost.
   *
-  * On-wire encoding: `{ "n": <BigInt>, "d": <BigInt> }`. The gcd field is recomputed at `Ratio.apply` so it does
-  * not need to round-trip.
+  * On-wire encoding: `{ "n": <BigInt>, "d": <BigInt> }`. The gcd field is recomputed at `Ratio.apply` so it does not need to round-trip.
   */
 object RatioInstances {
 

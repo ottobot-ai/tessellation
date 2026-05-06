@@ -14,17 +14,17 @@ package io.constellationnetwork.numerics.interpreters
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.implicits._
 
-/** Modified Lentz's method (Numerical Recipes in Fortran 77, 2nd ed., §5.2) for evaluating continued-fraction
-  * expansions in exact `Ratio` arithmetic. The two interpreters that build on this — [[Log1pInterpreter]] and
-  * [[ExpInterpreter]] — supply different `a(j)` / `b(j)` coefficient sequences but share the same iterative
-  * skeleton.
+/** Modified Lentz's method (Numerical Recipes in Fortran 77, 2nd ed., §5.2) for evaluating continued-fraction expansions in exact `Ratio`
+  * arithmetic. The two interpreters that build on this — [[Log1pInterpreter]] and [[ExpInterpreter]] — supply different `a(j)` / `b(j)`
+  * coefficient sequences but share the same iterative skeleton.
   */
 trait LentzMethod {
 
-  /** Evaluate the continued fraction defined by the coefficient sequences `a(j)` and `b(j)` until the relative
-    * change drops below `10^-(prec+1)` or `maxIter` iterations are reached.
+  /** Evaluate the continued fraction defined by the coefficient sequences `a(j)` and `b(j)` until the relative change drops below
+    * `10^-(prec+1)` or `maxIter` iterations are reached.
     *
-    * @return tuple `(approximation, didNotConverge, iterations)`
+    * @return
+    *   tuple `(approximation, didNotConverge, iterations)`
     */
   private[numerics] def modified_lentz_method(
     maxIter: Int,

@@ -18,9 +18,9 @@ import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.algebras.Log1p
 import io.constellationnetwork.numerics.implicits._
 
-/** Continued-fraction approximation of `ln(1 + x)`. Avoids catastrophic cancellation when `x` is small (the typical
-  * regime for our LDD eligibility math, where `1 - difficulty` is close to 1). Computed entirely in `Ratio`, so
-  * the result is reproducible across all JVMs/CPUs.
+/** Continued-fraction approximation of `ln(1 + x)`. Avoids catastrophic cancellation when `x` is small (the typical regime for our LDD
+  * eligibility math, where `1 - difficulty` is close to 1). Computed entirely in `Ratio`, so the result is reproducible across all
+  * JVMs/CPUs.
   */
 object Log1pInterpreter extends LentzMethod {
 

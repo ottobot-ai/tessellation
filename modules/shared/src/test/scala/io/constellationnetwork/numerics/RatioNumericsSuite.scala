@@ -88,10 +88,11 @@ object RatioNumericsSuite extends SimpleIOSuite {
         result <- expSync(coefficient)
         expected = Ratio.One - x
         diff = (result - expected).abs
-      } yield expect(
-        diff < tolerance,
-        s"exp(log1p(-$x)) = $result, expected ${expected}, diff $diff exceeds $tolerance"
-      )
+      } yield
+        expect(
+          diff < tolerance,
+          s"exp(log1p(-$x)) = $result, expected ${expected}, diff $diff exceeds $tolerance"
+        )
     )
   }
 
@@ -113,16 +114,17 @@ object RatioNumericsSuite extends SimpleIOSuite {
       // Sanity: same value computed via Double to within tolerance.
       doubleThresh = 1.0 - math.pow(1.0 - difficulty.toDouble, stake.toDouble)
       diff = (threshold - Ratio(doubleThresh, 12)).abs
-    } yield expect(
-      threshold > Ratio.Zero,
-      s"threshold should be positive, got $threshold"
-    ).and(expect(threshold < Ratio.One, s"threshold should be < 1, got $threshold"))
-      .and(
-        expect(
-          diff < tolerance,
-          s"Ratio threshold $threshold disagrees with Double approximation $doubleThresh by $diff"
+    } yield
+      expect(
+        threshold > Ratio.Zero,
+        s"threshold should be positive, got $threshold"
+      ).and(expect(threshold < Ratio.One, s"threshold should be < 1, got $threshold"))
+        .and(
+          expect(
+            diff < tolerance,
+            s"Ratio threshold $threshold disagrees with Double approximation $doubleThresh by $diff"
+          )
         )
-      )
   }
 
   test("Lentz — pure-determinism: identical inputs ⇒ byte-identical Ratio output") {
@@ -139,7 +141,10 @@ object RatioNumericsSuite extends SimpleIOSuite {
   private implicit class TraverseExpectations[A](xs: List[A]) {
     def traverse_test(f: A => IO[weaver.Expectations]): IO[weaver.Expectations] =
       xs.foldLeft(IO.pure(weaver.Expectations.Helpers.success)) { (accIO, a) =>
-        for { acc <- accIO; e <- f(a) } yield acc.and(e)
+        for {
+          acc <- accIO
+          e <- f(a)
+        } yield acc.and(e)
       }
   }
 }
