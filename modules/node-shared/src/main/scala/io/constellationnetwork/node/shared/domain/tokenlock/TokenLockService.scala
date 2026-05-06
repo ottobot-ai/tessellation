@@ -5,7 +5,7 @@ import cats.data.Validated.{Invalid, Valid}
 import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.immutable.{SortedMap, SortedSet}
+import scala.collection.immutable.SortedSet
 
 import io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot
 import io.constellationnetwork.ext.cats.syntax.validated.validatedSyntax
@@ -15,12 +15,12 @@ import io.constellationnetwork.node.shared.domain.tokenlock.ContextualTokenLockV
   ContextualTokenLockValidationError,
   NonContextualValidationError
 }
+import io.constellationnetwork.schema.GlobalIncrementalSnapshot
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo, StateProof}
 import io.constellationnetwork.schema.tokenLock.TokenLock
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher}
@@ -80,12 +80,25 @@ object TokenLockService {
           .map(_.errorMap(NonContextualValidationError))
           .flatMap {
             case Valid(_) =>
-              lastSnapshotStorage.getCombinedStream.evalMap {
-                case Some((s, si)) =>
+              // Wait for the first real snapshot rather than defaulting to
+              // (MinValue, Balance.empty). Pre-MPT-primary migration node startup
+              // was fast enough that the stream's first emission was usually
+              // Some(...) by the time submissions arrived; post-migration the
+              // bigger accept() pipeline lands cl1's first currency snapshot
+              // later than fast clients (e.g. token-locks test posting right
+              // after cluster-ready), so a None first emission would be
+              // substituted to Balance.empty and `.head` would consume that as
+              // the answer — producing InsufficientBalance{balance:0} for
+              // genesis-funded addresses. Mirror of the e7a8daa8 fix in
+              // dag-l1 TransactionService: drop None emissions via `collect`,
+              // then run getBalanceAndTokenLocks on the first Some.
+              lastSnapshotStorage.getCombinedStream.collect {
+                case Some(value) => value
+              }.evalMap {
+                case (s, si) =>
                   getBalanceAndTokenLocks(si, tokenLock.source).map {
                     case (balance, activeTokenLocks) => (s.ordinal, balance, activeTokenLocks)
                   }
-                case None => (SnapshotOrdinal.MinValue, Balance.empty, SortedSet.empty[Signed[TokenLock]]).pure[F]
               }.changes.switchMap {
                 case (latestOrdinal, balance, activeTokenLocks) =>
                   Stream.eval(tokenLockStorage.tryPut(tokenLock, latestOrdinal, lastGlobalEpochProgress, balance, activeTokenLocks))
