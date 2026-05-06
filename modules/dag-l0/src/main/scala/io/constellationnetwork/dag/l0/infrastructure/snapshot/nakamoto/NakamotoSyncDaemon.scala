@@ -23,7 +23,7 @@ import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics._
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, MptTxAction}
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.nakamoto.{LddConfig, TipAttestation => DomainTipAttestation}
 import io.constellationnetwork.schema.node.NodeState
@@ -520,143 +520,143 @@ object NakamotoSyncDaemon {
           }
         }
 
-      // Full validation pipeline + chainStore.store under a single MPT transaction.
-      // Validate calls accept() which mutates the MPT (apply deltas to compute stateProof).
-      // We commit those mutations only when this snapshot becomes the new bestTip; on a
-      // fork-branch storage (validate succeeded against a non-canonical parent or chain
-      // selection didn't switch) we Rollback so canonical MPT stays at the bestTip's state.
-      // Validation failures (ContentMismatch, etc.) also Rollback — accept()'s mid-flight
-      // mutations would otherwise corrupt the canonical MPT.
-      txResult <- mptStore.withTransaction {
-        for {
-          validationResult <- parsed match {
-            case Some((signedSnapshot, context)) =>
-              chainStore.get(parentHash).flatMap {
-                case Some(parentStored) =>
-                  NakamotoSnapshotValidator.validate[F](
-                    signedSnapshot = signedSnapshot,
-                    context = context,
-                    slot = snap.slot,
-                    vrfProof = snap.vrfProof.toByteArray,
-                    vrfPublicKey = snap.vrfPublicKey.toByteArray,
-                    producerIdBytes = snap.producerId.toByteArray,
-                    eta = eta,
-                    slotGap = slotGap,
-                    stakeRegistry = stakeRegistry,
-                    lddConfig = lddConfig,
-                    eligibilityChecker = eligibilityChecker,
-                    consensusFns = consensusFns,
-                    lastSignedArtifact = parentStored.signedSnapshot,
-                    lastContext = parentStored.context,
-                    getByOrdinal = { (ordinal: SnapshotOrdinal) =>
-                      snapshotStorage.get(ordinal).flatMap {
-                        case Some(s) => HasherSelector[F].withCurrent(implicit h => s.toHashed[F].map(_.some))
-                        case None =>
-                          chainStore.getByOrdinal(ordinal.value.value).flatMap {
-                            case Some(stored) =>
-                              HasherSelector[F].withCurrent(implicit h => stored.signedSnapshot.toHashed[F].map(_.some))
-                            case None => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
-                          }
+      // Validation pipeline + chainStore.store. Pre-Phase E this body ran inside
+      // `mptStore.withTransaction` so `accept()`'s mid-flight MPT mutations could be
+      // rolled back when the snapshot didn't become the new bestTip. Phase D
+      // (commit caa3559e) routed `accept()` through the overlay algebra
+      // (`overlay.checkout` / `overlay.commit`); under `MptOverlay.OverlayMode.MultiBranch`
+      // each download lands in its own pending `ChangeSet` — non-canonical branches sit
+      // in pending until eviction (#56.9) drops them or `finalizeBranch` promotes the
+      // canonical chain. The savepoint bracket is obsolete and removed here: the
+      // overlay's branching IS the rollback. Under the current `Passthrough` wiring,
+      // writes still land in base immediately and we lose the daemon-side rollback
+      // semantics — that's intentional migration scaffolding, byte-equivalent to the
+      // legacy path under #107's parity gate. The proper isolation arrives when
+      // Phase J flips production wiring to `MultiBranch`.
+      validationResult <- parsed match {
+        case Some((signedSnapshot, context)) =>
+          chainStore.get(parentHash).flatMap {
+            case Some(parentStored) =>
+              NakamotoSnapshotValidator.validate[F](
+                signedSnapshot = signedSnapshot,
+                context = context,
+                slot = snap.slot,
+                vrfProof = snap.vrfProof.toByteArray,
+                vrfPublicKey = snap.vrfPublicKey.toByteArray,
+                producerIdBytes = snap.producerId.toByteArray,
+                eta = eta,
+                slotGap = slotGap,
+                stakeRegistry = stakeRegistry,
+                lddConfig = lddConfig,
+                eligibilityChecker = eligibilityChecker,
+                consensusFns = consensusFns,
+                lastSignedArtifact = parentStored.signedSnapshot,
+                lastContext = parentStored.context,
+                getByOrdinal = { (ordinal: SnapshotOrdinal) =>
+                  snapshotStorage.get(ordinal).flatMap {
+                    case Some(s) => HasherSelector[F].withCurrent(implicit h => s.toHashed[F].map(_.some))
+                    case None =>
+                      chainStore.getByOrdinal(ordinal.value.value).flatMap {
+                        case Some(stored) =>
+                          HasherSelector[F].withCurrent(implicit h => stored.signedSnapshot.toHashed[F].map(_.some))
+                        case None => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
                       }
-                    }
-                  )
-                case None =>
-                  // Parent not in chain store. Three-tier gap handling:
-                  // Tier 1 (<=6): buffer + ChainSync parent fetch (normal gossip latency)
-                  // Tier 2 (>6, <=k): sequential walk-back via ChainSync (moderate drift)
-                  // Tier 3 (>k): full catch-up — network finalized past us
-                  chainStore.bestTipOrdinal.flatMap { localBestOrdinal =>
-                    val localOrd = localBestOrdinal.getOrElse(0L)
-                    val gap = snap.ordinal - localOrd
-                    if (gap > ConfirmationDepthK) {
-                      logger.warn(
-                        s"🔄 Tier 3: gap=$gap > k=$ConfirmationDepthK for ordinal=${snap.ordinal}. Triggering full catch-up."
-                      ) >>
-                        Async[F].pure(
-                          NakamotoSnapshotValidator.ParentNotFound: NakamotoSnapshotValidator.ValidationResult
-                        )
-                    } else if (gap > CatchUpThreshold) {
-                      logger.info(
-                        s"⏳ Tier 2: gap=$gap (>$CatchUpThreshold, <=$ConfirmationDepthK) for ordinal=${snap.ordinal}. " +
-                          s"Sequential walk-back from parent ${parentHash.value.take(12)}."
-                      ) >>
-                        pendingParentRef.update { m =>
-                          val existing = m.getOrElse(parentHash, List.empty)
-                          m.updated(parentHash, existing :+ snap)
-                        } >>
-                        chainSyncManager.requestMissing(parentHash) >>
-                        Async[F].pure(
-                          NakamotoSnapshotValidator.ParentBuffered: NakamotoSnapshotValidator.ValidationResult
-                        )
-                    } else {
-                      logger.info(
-                        s"⏳ Tier 1: Parent ${parentHash.value.take(12)} not in chain store for ordinal=${snap.ordinal} (gap=$gap). Buffering."
-                      ) >>
-                        pendingParentRef.update { m =>
-                          val existing = m.getOrElse(parentHash, List.empty)
-                          m.updated(parentHash, existing :+ snap)
-                        } >>
-                        chainSyncManager.requestMissing(parentHash) >>
-                        Async[F].pure(
-                          NakamotoSnapshotValidator.ParentBuffered: NakamotoSnapshotValidator.ValidationResult
-                        )
-                    }
                   }
-              }
+                }
+              )
             case None =>
-              // No payload — fall back to VRF-only validation (legacy/PoC). No accept() and
-              // therefore no MPT mutation; the bracket still wraps for uniformity.
-              val vrfVK = snap.vrfPublicKey.toByteArray
-              val proof = snap.vrfProof.toByteArray
-              val producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
-              val producerId = peer.PeerId(producerHex)
-              stakeRegistry.relativeStake(producerId).flatMap { producerStake =>
-                val vrfValidF =
-                  if (vrfVK.isEmpty || proof.isEmpty) false.pure[F]
-                  else
-                    eligibilityChecker.verifyEligibility(
-                      vrfVK = vrfVK,
-                      slot = Slot(NonNegLong.unsafeFrom(snap.slot)),
-                      slotGap = slotGap,
-                      eta = eta,
-                      relativeStake = producerStake,
-                      config = lddConfig,
-                      proof = proof
+              // Parent not in chain store. Three-tier gap handling:
+              // Tier 1 (<=6): buffer + ChainSync parent fetch (normal gossip latency)
+              // Tier 2 (>6, <=k): sequential walk-back via ChainSync (moderate drift)
+              // Tier 3 (>k): full catch-up — network finalized past us
+              chainStore.bestTipOrdinal.flatMap { localBestOrdinal =>
+                val localOrd = localBestOrdinal.getOrElse(0L)
+                val gap = snap.ordinal - localOrd
+                if (gap > ConfirmationDepthK) {
+                  logger.warn(
+                    s"🔄 Tier 3: gap=$gap > k=$ConfirmationDepthK for ordinal=${snap.ordinal}. Triggering full catch-up."
+                  ) >>
+                    Async[F].pure(
+                      NakamotoSnapshotValidator.ParentNotFound: NakamotoSnapshotValidator.ValidationResult
                     )
-                vrfValidF.map { vrfValid =>
-                  if (vrfValid) NakamotoSnapshotValidator.Valid(null, null) // VRF-only, no snapshot data
-                  else NakamotoSnapshotValidator.VrfOnlyFailed(snap.slot)
+                } else if (gap > CatchUpThreshold) {
+                  logger.info(
+                    s"⏳ Tier 2: gap=$gap (>$CatchUpThreshold, <=$ConfirmationDepthK) for ordinal=${snap.ordinal}. " +
+                      s"Sequential walk-back from parent ${parentHash.value.take(12)}."
+                  ) >>
+                    pendingParentRef.update { m =>
+                      val existing = m.getOrElse(parentHash, List.empty)
+                      m.updated(parentHash, existing :+ snap)
+                    } >>
+                    chainSyncManager.requestMissing(parentHash) >>
+                    Async[F].pure(
+                      NakamotoSnapshotValidator.ParentBuffered: NakamotoSnapshotValidator.ValidationResult
+                    )
+                } else {
+                  logger.info(
+                    s"⏳ Tier 1: Parent ${parentHash.value.take(12)} not in chain store for ordinal=${snap.ordinal} (gap=$gap). Buffering."
+                  ) >>
+                    pendingParentRef.update { m =>
+                      val existing = m.getOrElse(parentHash, List.empty)
+                      m.updated(parentHash, existing :+ snap)
+                    } >>
+                    chainSyncManager.requestMissing(parentHash) >>
+                    Async[F].pure(
+                      NakamotoSnapshotValidator.ParentBuffered: NakamotoSnapshotValidator.ValidationResult
+                    )
                 }
               }
           }
-          storeOutcome <- validationResult match {
-            case v: NakamotoSnapshotValidator.Valid if v.snapshot != null && v.context != null =>
-              for {
-                isNew <- chainStore.store(
-                  v.snapshot,
-                  v.context,
-                  snap.ordinal,
-                  snap.slot,
-                  parentHash,
-                  vrfOutputFromProof(snap.vrfProof.toByteArray)
+        case None =>
+          // No payload — fall back to VRF-only validation (legacy/PoC). No accept() and
+          // therefore no MPT mutation.
+          val vrfVK = snap.vrfPublicKey.toByteArray
+          val proof = snap.vrfProof.toByteArray
+          val producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
+          val producerId = peer.PeerId(producerHex)
+          stakeRegistry.relativeStake(producerId).flatMap { producerStake =>
+            val vrfValidF =
+              if (vrfVK.isEmpty || proof.isEmpty) false.pure[F]
+              else
+                eligibilityChecker.verifyEligibility(
+                  vrfVK = vrfVK,
+                  slot = Slot(NonNegLong.unsafeFrom(snap.slot)),
+                  slotGap = slotGap,
+                  eta = eta,
+                  relativeStake = producerStake,
+                  config = lddConfig,
+                  proof = proof
                 )
-                bestTipOpt <- chainStore.bestTip
-                thisHash <- HasherSelector[F].withCurrent(implicit h => v.snapshot.toHashed[F].map(_.hash))
-                becameBest = isNew && bestTipOpt.exists(_.hash === thisHash)
-                _ <- Async[F].whenA(isNew && !becameBest) {
-                  logger.info(
-                    s"🔀 Stored Nakamoto snapshot at ordinal=${snap.ordinal} as fork branch (not bestTip) — MPT rolled back to canonical state."
-                  )
-                }
-              } yield (becameBest, v.snapshot.some, v.context.some)
-            case _ =>
-              (false, none[Signed[GlobalIncrementalSnapshot]], none[GlobalSnapshotInfo]).pure[F]
+            vrfValidF.map { vrfValid =>
+              if (vrfValid) NakamotoSnapshotValidator.Valid(null, null) // VRF-only, no snapshot data
+              else NakamotoSnapshotValidator.VrfOnlyFailed(snap.slot)
+            }
           }
-          (becameBest, signedOpt, ctxOpt) = storeOutcome
-          action: MptTxAction = if (becameBest) MptTxAction.Commit else MptTxAction.Rollback
-        } yield ((validationResult, becameBest, signedOpt, ctxOpt), action)
       }
-      (validationResult, becameBest, signedOpt, ctxOpt) = txResult
+      storeOutcome <- validationResult match {
+        case v: NakamotoSnapshotValidator.Valid if v.snapshot != null && v.context != null =>
+          for {
+            isNew <- chainStore.store(
+              v.snapshot,
+              v.context,
+              snap.ordinal,
+              snap.slot,
+              parentHash,
+              vrfOutputFromProof(snap.vrfProof.toByteArray)
+            )
+            bestTipOpt <- chainStore.bestTip
+            thisHash <- HasherSelector[F].withCurrent(implicit h => v.snapshot.toHashed[F].map(_.hash))
+            becameBest = isNew && bestTipOpt.exists(_.hash === thisHash)
+            _ <- Async[F].whenA(isNew && !becameBest) {
+              logger.info(
+                s"🔀 Stored Nakamoto snapshot at ordinal=${snap.ordinal} as fork branch (not bestTip) — overlay isolates pending branches from canonical."
+              )
+            }
+          } yield (becameBest, v.snapshot.some, v.context.some)
+        case _ =>
+          (false, none[Signed[GlobalIncrementalSnapshot]], none[GlobalSnapshotInfo]).pure[F]
+      }
+      (becameBest, signedOpt, ctxOpt) = storeOutcome
 
       _ <- (validationResult: NakamotoSnapshotValidator.ValidationResult) match {
         case NakamotoSnapshotValidator.Valid(_, _) =>
@@ -854,9 +854,12 @@ object NakamotoSyncDaemon {
       }
 
       // Canonical-state updates only when this snapshot became the bestTip in the chainStore.
-      // chainStore.store ran inside the mptStore.withTransaction bracket above, so MPT is already
-      // committed for this snapshot; on the fork-branch path MPT was rolled back and we must NOT
-      // update canonical storage here.
+      // After Phase E, the validate+store path no longer wraps MPT writes in a savepoint
+      // bracket — accept() routes through the overlay algebra (Phase D, commit caa3559e),
+      // so the MPT mutations for this snapshot are already in flight (Passthrough → base
+      // immediately; MultiBranch → pending ChangeSet under the parent's branch). On the
+      // fork-branch path we still must NOT update canonical storage; the overlay's
+      // pending isolation (or the eventual finalizeBranch promotion) handles state.
       _ <- (signedSnapshot, context) match {
         case (Some(signed), Some(ctx)) if becameBestTip =>
           productionGate.pause(ProductionGate.ReorgInProgress) >>
