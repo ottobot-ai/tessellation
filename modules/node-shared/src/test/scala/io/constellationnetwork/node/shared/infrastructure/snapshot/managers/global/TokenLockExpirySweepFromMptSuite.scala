@@ -8,6 +8,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -109,7 +110,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -131,7 +132,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(tlValid))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentEpoch = EpochProgress(NonNegLong(500L))
       prevEpoch = EpochProgress(NonNegLong(100L))
@@ -153,7 +154,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(tlPermanent, tlExpires))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentEpoch = EpochProgress(NonNegLong(500L))
       prevEpoch = EpochProgress.MinValue
@@ -175,7 +176,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(tlExpires))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       sameEpoch = EpochProgress(NonNegLong(200L))
       indexExpired <- mgr.findExpiredGlobalTokenLocksViaIndexFromMpt(sameEpoch, sameEpoch)
@@ -211,7 +212,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       generatedUnlocks = Map(addr1 -> List(tokenUnlock))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -246,7 +247,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       // Window [101 .. 114] covers all three records (TokenLock predicate is `unlockEpoch < curr`).
       prevEpoch = EpochProgress(NonNegLong(101L))
@@ -289,7 +290,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -324,7 +325,7 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr1 -> SortedSet(tlExpired), addr2 -> SortedSet(tlValid))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = TokenLockStateManager.make[IO](store)
+      mgr = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentBalances = SortedMap.empty[Address, io.constellationnetwork.schema.balance.Balance]
       currentEpoch = EpochProgress(NonNegLong(300L))

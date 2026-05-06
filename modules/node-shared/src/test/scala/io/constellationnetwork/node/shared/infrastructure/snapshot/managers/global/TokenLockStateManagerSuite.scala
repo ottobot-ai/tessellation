@@ -8,6 +8,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -71,7 +72,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("acceptReplacementTokenLocks - should accept token locks without replacement reference") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -96,7 +97,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("acceptReplacementTokenLocks - should filter out token locks with invalid replacement references") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -158,14 +159,14 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       )
 
       localMptStore <- mkMptStore(snapshotInfo)
-      acceptanceManager = TokenLockStateManager.make[IO](localMptStore)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
       result <- acceptanceManager.acceptReplacementTokenLocks(List(signedTokenLock), snapshotInfo)
     } yield expect(result == List(signedTokenLock))
   }
 
   test("acceptReplacementTokenLocks - should reject token locks with lower amount than existing") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -261,14 +262,14 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       mixedTokenLocks = List(signedTokenLockWithoutReplacement, signedReplacementTokenLock)
 
       localMptStore <- mkMptStore(snapshotInfo)
-      acceptanceManager = TokenLockStateManager.make[IO](localMptStore)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
       result <- acceptanceManager.acceptReplacementTokenLocks(mixedTokenLocks, snapshotInfo)
     } yield expect(result == List(signedTokenLockWithoutReplacement, signedReplacementTokenLock))
   }
 
   test("acceptReplacementTokenLocks - should reject replacement token locks with non-empty currency ID") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -314,7 +315,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("acceptReplacementTokenLocks - should reject replacement token locks with different source address") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -401,14 +402,14 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       )
 
       localMptStore <- mkMptStore(snapshotInfo)
-      acceptanceManager = TokenLockStateManager.make[IO](localMptStore)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
       result <- acceptanceManager.acceptReplacementTokenLocks(List(signedReplacementTokenLock), snapshotInfo)
     } yield expect(result == List(signedReplacementTokenLock)) // Should accept
   }
 
   test("acceptReplacementTokenLocks - should reject replacement token locks when existing token lock has non-empty currency ID") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -520,7 +521,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       )
 
       localMptStore <- mkMptStore(snapshotInfo)
-      acceptanceManager = TokenLockStateManager.make[IO](localMptStore)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
       result <- acceptanceManager.acceptReplacementTokenLocks(
         List(signedReplacementTokenLockEmptyCurrency, signedReplacementTokenLockWithCurrency),
         snapshotInfo
@@ -534,7 +535,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("acceptReplacementTokenLocks - should reject replacement token locks with lower or equal amount") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -594,7 +595,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("generateTokenUnlocks - should handle empty inputs") { res =>
     val (_, _, mptStore, _) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       result <- acceptanceManager.generateTokenUnlocks(SortedMap.empty, List.empty, Map.empty).pure[IO]
@@ -603,7 +604,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("generateTokenUnlocks - should generate unlocks for expired withdrawals") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -653,7 +654,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("generateTokenUnlocks - should generate unlocks for token locks with replacement references") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -702,7 +703,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("generateTokenUnlocks - should return error for missing token lock") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -738,7 +739,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("generateTokenUnlocks - should combine expired withdrawals and replacement unlocks") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -846,7 +847,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("filterExpiredTokenLocks - should return empty map for empty input") { res =>
     val (_, _, mptStore, _) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
     val currentEpoch = EpochProgress(1000L)
     val emptyTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
 
@@ -857,7 +858,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("filterExpiredTokenLocks - should filter out token locks with no unlockEpoch") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -887,7 +888,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("filterExpiredTokenLocks - should filter out token locks with future unlockEpoch") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -917,7 +918,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("filterExpiredTokenLocks - should include token locks with past unlockEpoch") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -947,7 +948,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("filterExpiredTokenLocks - should include token locks with current unlockEpoch") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -977,7 +978,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("filterExpiredTokenLocks - should handle mixed token locks with different unlockEpochs") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -1032,7 +1033,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("filterExpiredTokenLocks - should handle multiple addresses") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -1108,7 +1109,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("acceptTokenLocks - should handle empty inputs") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
     val currentEpoch = EpochProgress(1000L)
     val emptyTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
     val emptyUnlocks = Map.empty[Address, List[TokenUnlock]]
@@ -1178,7 +1179,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       // pre-acceptance state that callers used to pass via `lastActiveGlobalTokenLocks`.
       snapshotInfo = GlobalSnapshotInfo.empty.copy(activeTokenLocks = lastActiveGlobalTokenLocks.some)
       localMptStore <- mkMptStore(snapshotInfo)
-      acceptanceManager = TokenLockStateManager.make[IO](localMptStore)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
 
       result <- acceptanceManager.acceptTokenLocks(
         currentEpoch,
@@ -1251,7 +1252,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       // pre-acceptance state that callers used to pass via `lastActiveGlobalTokenLocks`.
       snapshotInfo = GlobalSnapshotInfo.empty.copy(activeTokenLocks = lastActiveGlobalTokenLocks.some)
       localMptStore <- mkMptStore(snapshotInfo)
-      acceptanceManager = TokenLockStateManager.make[IO](localMptStore)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
 
       result <- acceptanceManager.acceptTokenLocks(
         currentEpoch,
@@ -1270,7 +1271,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("acceptTokenLocks - should handle multiple addresses") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp1 <- KeyPairGenerator.makeKeyPair[IO]
@@ -1380,7 +1381,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       // pre-acceptance state that callers used to pass via `lastActiveGlobalTokenLocks`.
       snapshotInfo = GlobalSnapshotInfo.empty.copy(activeTokenLocks = lastActiveGlobalTokenLocks.some)
       localMptStore <- mkMptStore(snapshotInfo)
-      acceptanceManager = TokenLockStateManager.make[IO](localMptStore)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
 
       result <- acceptanceManager.acceptTokenLocks(
         currentEpoch,
@@ -1399,7 +1400,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("acceptTokenLocks - should handle token locks with no unlockEpoch") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -1445,7 +1446,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("acceptTokenLocks - should combine accepted and expired token locks correctly") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -1585,7 +1586,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       // pre-acceptance state that callers used to pass via `lastActiveGlobalTokenLocks`.
       snapshotInfo = GlobalSnapshotInfo.empty.copy(activeTokenLocks = lastActiveGlobalTokenLocks.some)
       localMptStore <- mkMptStore(snapshotInfo)
-      acceptanceManager = TokenLockStateManager.make[IO](localMptStore)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
 
       result <- acceptanceManager.acceptTokenLocks(
         currentEpoch,
@@ -1604,7 +1605,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("updateGlobalBalancesByTokenLocks - should handle empty inputs") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     val epochProgress = EpochProgress(1000L)
     val currentBalances = SortedMap.empty[Address, Balance]
@@ -1627,7 +1628,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("updateGlobalBalancesByTokenLocks - should deduct amounts for new token locks") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -1695,7 +1696,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       // expiring records the same way it does in production.
       snapshotInfo = GlobalSnapshotInfo.empty.copy(activeTokenLocks = lastActiveGlobalTokenLocks.some)
       localMptStore <- mkMptStore(snapshotInfo)
-      acceptanceManager = TokenLockStateManager.make[IO](localMptStore)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
@@ -1713,7 +1714,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("updateGlobalBalancesByTokenLocks - should add amounts for generated token unlocks") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -1745,7 +1746,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("updateGlobalBalancesByTokenLocks - should handle balance arithmetic errors") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -1826,7 +1827,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       // expiring records the same way it does in production.
       snapshotInfo = GlobalSnapshotInfo.empty.copy(activeTokenLocks = lastActiveGlobalTokenLocks.some)
       localMptStore <- mkMptStore(snapshotInfo)
-      acceptanceManager = TokenLockStateManager.make[IO](localMptStore)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
@@ -1893,7 +1894,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       // expiring records the same way it does in production.
       snapshotInfo = GlobalSnapshotInfo.empty.copy(activeTokenLocks = lastActiveGlobalTokenLocks.some)
       localMptStore <- mkMptStore(snapshotInfo)
-      acceptanceManager = TokenLockStateManager.make[IO](localMptStore)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
 
       result <- acceptanceManager.updateGlobalBalancesByTokenLocks(
         epochProgress,
@@ -1913,7 +1914,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("updateGlobalBalancesByTokenLocks - should handle token locks without unlock epoch") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -1954,7 +1955,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
   test("updateGlobalBalancesByTokenLocks - should handle multiple token unlocks for same address") { res =>
     implicit val (jsonHasher, sp, mptStore, js) = res
-    val acceptanceManager = TokenLockStateManager.make[IO](mptStore)
+    val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
