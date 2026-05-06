@@ -1,7 +1,7 @@
 package io.constellationnetwork.node.shared.modules
 
 import cats.Parallel
-import cats.effect.kernel.Async
+import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
 import io.constellationnetwork.json.JsonSerializer
@@ -11,7 +11,7 @@ import io.constellationnetwork.node.shared.domain.cluster.storage.{ClusterStorag
 import io.constellationnetwork.node.shared.domain.collateral.LatestBalances
 import io.constellationnetwork.node.shared.domain.fork.ForkInfoStorage
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, MptOverlay}
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.cluster.storage.{ClusterStorage, SessionStorage}
@@ -53,16 +53,24 @@ object SharedStorages {
       // tree used by consensus topology — passing it through means topology associations made during
       // `commit` / `finalizeBranch` stay in sync with the chain-store's view.
       mptOverlayParentChildTree <- ParentChildTree.make[F]
+      // Lazy-bound `bestTipFn` for overlay eviction (#56.10 Phase I). The chain store lives
+      // downstream of `SharedStorages.make` (only dag-l0's `GlobalSnapshotConsensus.make` builds
+      // it today), so the overlay captures `bestTipFnRef.get.flatten` and the dag-l0 wiring layer
+      // calls `setBestTipFn(chainStore.bestTip.map(_.map(s => BranchId(s.hash))))` once chainStore
+      // is available. Layers without a chain store (dag-l1, currency-l0/l1, sdk) leave the ref
+      // at the default and degrade to purely score-based eviction — they don't run multi-branch
+      // overlay anyway in #56.10's scope.
+      bestTipFnRef <- Ref.of[F, F[Option[BranchId]]](none[BranchId].pure[F])
       mptOverlay <- MptOverlay.make[F, GlobalStateKey](
-        // Stays on `Passthrough` until accept() migrates to the overlay (Phase D). At that point flip to
-        // `MptOverlay.OverlayMode.productionDefault` (or read mode from config) and provide a real
-        // `bestTipFn` (Phase I) so depth-k / attestation-2/3 finality still finds canonical-chain
-        // ancestors after eviction pressure.
+        // Stays on `Passthrough` until #56.11's e2e-validated multi-branch flip. At that point
+        // flip to `MptOverlay.OverlayMode.productionDefault` (or read mode from config); the
+        // `bestTipFn` indirection below is already in place to give MultiBranch eviction the
+        // ancestor protection (#56.9) it needs once production starts producing real branches.
         mode = MptOverlay.OverlayMode.Passthrough,
         underlying = mptStore,
         pcTree = mptOverlayParentChildTree,
         toHex = GlobalStateKey.toHex[F],
-        bestTipFn = none[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId].pure[F]
+        bestTipFn = bestTipFnRef.get.flatten
       )
     } yield
       new SharedStorages[F](
@@ -75,7 +83,8 @@ object SharedStorages {
         lastNGlobalSnapshot = lastNGlobalSnapshotStorage,
         lastGlobalSnapshot = lastGlobalSnapshotStorage,
         mptStore = mptStore,
-        mptOverlay = mptOverlay
+        mptOverlay = mptOverlay,
+        setBestTipFn = bestTipFnRef.set
       ) {}
 }
 
@@ -89,5 +98,9 @@ sealed abstract class SharedStorages[F[_]] private (
   val lastNGlobalSnapshot: LastNGlobalSnapshotStorage[F],
   val lastGlobalSnapshot: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo] with LatestBalances[F],
   val mptStore: MptStore[F, GlobalStateKey],
-  val mptOverlay: MptOverlay[F, GlobalStateKey]
+  val mptOverlay: MptOverlay[F, GlobalStateKey],
+  // Setter for the overlay's eviction `bestTipFn` (#56.10 Phase I). Called from the dag-l0
+  // wiring layer once the chain store is constructed; layers without a chain store never
+  // call this and the overlay sees `none[BranchId]` from the default in `make`.
+  val setBestTipFn: F[Option[BranchId]] => F[Unit]
 )

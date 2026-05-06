@@ -191,6 +191,7 @@ object Services {
             storages.globalSnapshot.getHashed,
             sharedStorages.mptStore,
             sharedStorages.mptOverlay,
+            sharedStorages.setBestTipFn,
             eventMempoolService,
             eventGossipClient,
             loggerBundle,

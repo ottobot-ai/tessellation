@@ -133,6 +133,10 @@ object GlobalSnapshotConsensus {
     // becomes canonical at an ordinal. Currently a passthrough impl by default — finalize is a
     // no-op until accept() migrates to the overlay (#56.10).
     mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
+    // #56.10 Phase I: setter on `SharedStorages` for the overlay's eviction `bestTipFn`. Invoked
+    // once the chain store has been constructed below so the overlay can walk back through pending
+    // branches without dropping the canonical chain under eviction pressure (#56.9).
+    setBestTipFn: F[Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId]] => F[Unit],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     eventGossipClient: EventGossipClient[F, GlobalSnapshotEvent],
     loggerBundle: LoggerBundle[F],
@@ -438,6 +442,22 @@ object GlobalSnapshotConsensus {
             .toResource
           _ <- chainStoreRef.set(Some(chainStore)).toResource
           _ <- chainStoreForLookupRef.set(Some(chainStore)).toResource
+          // #56.10 Phase I: wire the overlay's eviction `bestTipFn` to chainStore.bestTip so
+          // ancestor protection can find the canonical chain. The overlay captured a Ref-backed
+          // closure at SharedStorages.make time; setting the ref here completes the binding.
+          _ <- setBestTipFn(
+            chainStore.bestTip.map(
+              _.map(s => io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(s.hash))
+            )
+          ).toResource
+          // #56.10 Phase H: startup base-consistency guard. Runs in the boot Resource chain
+          // (after SharedStorages.make's mptStore and the chainStore just constructed above)
+          // and before any request-serving — this resource block is awaited before the HTTP
+          // servers start in Main.scala. A no-op for fresh nodes; fires only when crash
+          // recovery left MPT base ahead of finalized.
+          _ <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.MptBaseConsistency
+            .assertBaseConsistentOrPrune[F](mptStore, chainStore.lastFinalizedOrdinal)(implicitly[Async[F]], nakLogger)
+            .toResource
           // Seed chain store with the current head snapshot so gossip children can find their parent
           _ <- globalSnapshotStorage.head.flatMap {
             case Some((headSigned, headCtx)) =>

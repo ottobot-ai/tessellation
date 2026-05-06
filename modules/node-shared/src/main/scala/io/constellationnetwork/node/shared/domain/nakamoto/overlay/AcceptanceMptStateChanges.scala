@@ -41,19 +41,18 @@ import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.
   *
   * Mirrors that method's per-field insert order, sidecar maintenance, and removal-key derivation, but routes every mutation through
   * `AcceptanceMpt[F]` (i.e. through the overlay's `BranchHandle`) instead of writing directly to `MptStore`. Under
-  * `MptOverlay.OverlayMode.Passthrough` the bytes land immediately in the underlying `MptStore` and the per-key/per-root parity contract from
-  * `GsamWritePathParitySuite` (#107) preserves byte-equivalence with the legacy writer. Under `MptOverlay.OverlayMode.MultiBranch` the
+  * `MptOverlay.OverlayMode.Passthrough` the bytes land immediately in the underlying `MptStore` and the per-key/per-root parity contract
+  * from `GsamWritePathParitySuite` (#107) preserves byte-equivalence with the legacy writer. Under `MptOverlay.OverlayMode.MultiBranch` the
   * mutations accumulate in a per-branch `ChangeSet` and are folded into the base by `MptOverlay.finalizeBranch`.
   *
-  * '''Sidecar reads''': `applyActiveAddressIndexDelta` / `applyAddressPairIndexDelta` / `applySystemIndexDelta` are read-modify-write on the
-  * sidecar partition. Reads go through `mpt.get` — branch-aware — so a multi-branch view sees the parent branch's sidecar state, not the
-  * finalized base. Writes route through `mpt.insert`/`mpt.remove`, accumulating in the same branch-local handle.
+  * '''Sidecar reads''': `applyActiveAddressIndexDelta` / `applyAddressPairIndexDelta` / `applySystemIndexDelta` are read-modify-write on
+  * the sidecar partition. Reads go through `mpt.get` — branch-aware — so a multi-branch view sees the parent branch's sidecar state, not
+  * the finalized base. Writes route through `mpt.insert`/`mpt.remove`, accumulating in the same branch-local handle.
   */
 object AcceptanceMptStateChanges {
 
-  /** Apply `acc`'s deltas through the writer algebra in the same field/insert order as
-    * `GlobalStateConverter.syncFromStateChanges`. Identical inputs produce identical bytes — that is the parity contract enforced by
-    * `GsamWritePathParitySuite`.
+  /** Apply `acc`'s deltas through the writer algebra in the same field/insert order as `GlobalStateConverter.syncFromStateChanges`.
+    * Identical inputs produce identical bytes — that is the parity contract enforced by `GsamWritePathParitySuite`.
     *
     * Does NOT call `mptStore.commit(snapshotOrdinal)`; the per-ordinal trie checkpoint is the overlay's responsibility (Passthrough's
     * `commit` checkpoints inline; MultiBranch's `finalizeBranch.foldIntoBase` checkpoints at finalize time).
@@ -161,13 +160,11 @@ object AcceptanceMptStateChanges {
       acc.metagraphSyncData.iterator.map { case (addr, d) => GlobalStateKey.hypergraph(MetagraphSyncData, addr) -> d }.toMap
 
     val updateNodeParametersEntriesF: F[Map[GlobalStateKey, (Signed[UpdateNodeParameters], SnapshotOrdinal)]] =
-      acc.updateNodeParameters.toList
-        .parTraverse { case (id, rec) => GlobalStateKey.updateNodeParametersKey[F](id).map(_ -> rec) }
+      acc.updateNodeParameters.toList.parTraverse { case (id, rec) => GlobalStateKey.updateNodeParametersKey[F](id).map(_ -> rec) }
         .map(_.toMap)
 
     val priceStateEntriesF: F[Map[GlobalStateKey, PriceRecord]] =
-      acc.priceState.toList
-        .parTraverse { case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(_ -> rec) }
+      acc.priceState.toList.parTraverse { case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(_ -> rec) }
         .map(_.toMap)
 
     val keysToRemove = toRemovalKeys
@@ -241,9 +238,9 @@ object AcceptanceMptStateChanges {
     } yield ()
   }
 
-  /** `ActiveAddressIndex` partition RMW for `fieldId`, against the writer-algebra. Mirrors `GlobalStateConverter.applyActiveAddressIndexDelta`
-    * exactly — the ONLY difference is the read source (overlay branch view via `mpt.get`) and the write source (handle accumulation via
-    * `mpt.insert` / `mpt.remove`).
+  /** `ActiveAddressIndex` partition RMW for `fieldId`, against the writer-algebra. Mirrors
+    * `GlobalStateConverter.applyActiveAddressIndexDelta` exactly — the ONLY difference is the read source (overlay branch view via
+    * `mpt.get`) and the write source (handle accumulation via `mpt.insert` / `mpt.remove`).
     */
   private def applyActiveAddressIndexDeltaViaMpt[F[_]: Async: Hasher](
     mpt: AcceptanceMpt[F],

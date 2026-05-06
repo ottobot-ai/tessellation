@@ -64,6 +64,12 @@ trait MptStore[F[_], K] {
     * per-field codecs).
     */
   def commit(ordinal: SnapshotOrdinal): F[Unit]
+
+  /** Last ordinal at which the trie was synced / committed / built. `None` for a freshly-constructed store with no writes yet. Read-only
+    * accessor used by the boot-time base-consistency check (#56.10 Phase H) — if the persisted base is ahead of `chainStore`'s finalized
+    * head (e.g. crash mid-fold-forward), the operator can prune via `deleteAbove(finalizedOrdinal)` or rebuild from the finalized snapshot.
+    */
+  def lastPersistedOrdinal: F[Option[SnapshotOrdinal]]
   def syncFull[V: ImmutableCodec](newState: Map[K, V], ordinal: SnapshotOrdinal): F[Unit]
   def syncFullIfNeeded[V: ImmutableCodec](newState: => F[Map[K, V]], ordinal: SnapshotOrdinal): F[Unit]
   def update[V: ImmutableCodec](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit]
@@ -305,6 +311,9 @@ object MptStore {
         _ <- build(ordinal).void
         _ <- lastSyncedOrdinalRef.set(Some(ordinal))
       } yield ()
+
+    override def lastPersistedOrdinal: F[Option[SnapshotOrdinal]] =
+      lastSyncedOrdinalRef.get
 
     override def update[V: ImmutableCodec](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit] =
       for {
