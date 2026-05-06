@@ -1,7 +1,7 @@
 # Nakamoto mode overlay for the standard gl0 service.
 #
-# Activated via --nakamoto-gl0 in compose-runner.sh. The gl0 binary is now
-# Nakamoto-only — the run-nakamoto CLI command is selected by entrypoint.sh
+# Layered in by compose-runner.sh alongside the sidecar overlay. The gl0 binary
+# is Nakamoto-only — the run-nakamoto CLI command is selected by entrypoint.sh
 # when NAKAMOTO_MODE=true. Tunables below configure LDD, sidecar, and genesis.
 services:
   gl0:

@@ -109,22 +109,20 @@ verify_healthy() {
       # Nakamoto GL0: also wait for finality before proceeding. Non-GL0 consumers
       # can ONLY see finalized snapshots, so starting metagraphs/L1s before GL0 has
       # finalized anything would leave them stuck on NotFound.
-      if [ "$NAKAMOTO_GL0" = "true" ]; then
-        echo "Waiting for GL0 to reach finality before starting other layers..."
-        local gl0_finality_url="${host}:${DAG_L0_PORT_PREFIX}00"
-        for finality_attempt in $(seq 1 120); do
-          finalized=$(curl -s --connect-timeout 3 --max-time 5 "${gl0_finality_url}/global-snapshots/latest/finalized-ordinal" 2>/dev/null || echo "")
-          if [ -n "$finalized" ] && echo "$finalized" | jq -e '.value > 0' >/dev/null 2>&1; then
-            fin_val=$(echo "$finalized" | jq '.value')
-            echo "GL0 finality reached: ordinal=$fin_val"
-            break
-          fi
-          if [ "$((finality_attempt % 10))" -eq 0 ]; then
-            echo "GL0 not yet finalized (attempt $finality_attempt/120)..."
-          fi
-          sleep 3
-        done
-      fi
+      echo "Waiting for GL0 to reach finality before starting other layers..."
+      local gl0_finality_url="${host}:${DAG_L0_PORT_PREFIX}00"
+      for finality_attempt in $(seq 1 120); do
+        finalized=$(curl -s --connect-timeout 3 --max-time 5 "${gl0_finality_url}/global-snapshots/latest/finalized-ordinal" 2>/dev/null || echo "")
+        if [ -n "$finalized" ] && echo "$finalized" | jq -e '.value > 0' >/dev/null 2>&1; then
+          fin_val=$(echo "$finalized" | jq '.value')
+          echo "GL0 finality reached: ordinal=$fin_val"
+          break
+        fi
+        if [ "$((finality_attempt % 10))" -eq 0 ]; then
+          echo "GL0 not yet finalized (attempt $finality_attempt/120)..."
+        fi
+        sleep 3
+      done
     fi
 
     if [ "$NUM_GL1_NODES" -gt 0 ]; then

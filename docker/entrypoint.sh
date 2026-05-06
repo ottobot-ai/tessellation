@@ -122,7 +122,7 @@ if [ "$ID" == "gl0" ] && [ "$NAKAMOTO_MODE" == "true" ]; then
   fi
 
 else
-  # ── BFT mode (gl1, ml0, cl1, dl1, or gl0 without --nakamoto-gl0) ──
+  # ── BFT mode (gl1, ml0, cl1, dl1) ──
   export RUN_COMMAND="run-validator"
 
   if [ "$CL_DOCKER_GENESIS" == "true" ]; then

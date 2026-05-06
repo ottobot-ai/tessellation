@@ -9,13 +9,13 @@ etc.) have been removed — `just test` is now the single entry point.
 
 ```bash
 # 8-node Nakamoto GL0 + 3 GL1 + metagraph + Grafana/Prometheus
-just test --nakamoto-gl0 --num-gl0=8 --use-test-metagraph --grafana
+just test --num-gl0=8 --use-test-metagraph --grafana
 
 # Skip the assembly step and reuse cached JARs (much faster on iteration)
-just test --skip-assembly --nakamoto-gl0 --num-gl0=8 --grafana
+just test --skip-assembly --num-gl0=8 --grafana
 
 # 3-node GL0 variant
-just test --nakamoto-gl0 --num-gl0=3 --grafana
+just test --num-gl0=3 --grafana
 
 # Tear down
 just down

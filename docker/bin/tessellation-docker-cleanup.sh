@@ -19,7 +19,7 @@ cleanup() {
     for i in $(seq 0 9); do
         cleanup_container gl0-$i gl0-data-$i &
         cleanup_container gl1-$i gl1-data-$i &
-        # Nakamoto sidecar containers (only present when --nakamoto-gl0 was used)
+        # Nakamoto sidecar containers
         cleanup_container sidecar-$i "" &
         # Legacy single-metagraph layout (pre multi-metagraph)
         cleanup_container dl1-$i dl1-data-$i &

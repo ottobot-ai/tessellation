@@ -121,13 +121,10 @@ else
   echo "Finished assembly, building docker image"
   docker build -t constellationnetwork/tessellation:$TESSELLATION_DOCKER_VERSION -f docker/Dockerfile .
 
-  # Nakamoto-mode GL0: also build the Go libp2p sidecar image. The same JVM
-  # JAR runs both BFT and Nakamoto modes — the sidecar provides the GossipSub
+  # Build the Go libp2p sidecar image. The sidecar provides the GossipSub
   # transport that Nakamoto-mode GL0 publishes snapshots/attestations/rumors on.
-  if [ "$NAKAMOTO_GL0" = "true" ]; then
-    echo "Building Nakamoto sidecar image (nakamoto-sidecar:test)"
-    docker build -t nakamoto-sidecar:test -f p2p/Dockerfile p2p/
-  fi
+  echo "Building Nakamoto sidecar image (nakamoto-sidecar:test)"
+  docker build -t nakamoto-sidecar:test -f p2p/Dockerfile p2p/
 
 
   # Wait for cleanup PID to finish
@@ -205,10 +202,8 @@ else
     cp ../../docker/docker-compose.test.yaml . ; \
     cp ../../docker/docker-compose.volumes.yaml . ; \
 
-    if [ "$NAKAMOTO_GL0" = "true" ]; then
-      cp ../../docker/docker-compose.nakamoto-sidecar.yaml . ;
-      cp ../../docker/docker-compose.nakamoto-overlay.yaml . ;
-    fi
+    cp ../../docker/docker-compose.nakamoto-sidecar.yaml . ;
+    cp ../../docker/docker-compose.nakamoto-overlay.yaml . ;
 
     cd ../../
   done
@@ -238,7 +233,6 @@ else
   # Nakamoto mode: write shared genesis time, sidecar peer list, JVM seedlist,
   # and genesis CSV into each gl0 node's .env + node dir. All gl0 nodes MUST
   # agree on the same genesis time and seedlist for VRF consensus to work.
-  if [ "$NAKAMOTO_GL0" = "true" ]; then
     # 90s in the future — gives all containers time to start before slot 0
     NAKAMOTO_GENESIS_MS=$(( ($(date +%s) + 90) * 1000 ))
     echo "Nakamoto genesis time: $(date -d @$((NAKAMOTO_GENESIS_MS / 1000)) '+%H:%M:%S') (90s from now)"
@@ -317,7 +311,7 @@ else
 
       {
         echo ""
-        echo "# Nakamoto GL0 mode (set by compose-runner.sh --nakamoto-gl0)"
+        echo "# Nakamoto GL0 mode"
         echo "NAKAMOTO_GENESIS_TIME_MS=$NAKAMOTO_GENESIS_MS"
         echo "NAKAMOTO_SIDECAR_SEEDLIST=$NAKAMOTO_SEEDLIST"
         echo "CL_DOCKER_SEEDLIST=./seedlist.csv"
@@ -330,15 +324,11 @@ else
       } >> ./nodes/$i/.env
     done
     echo "Nakamoto seedlist written to nodes/*/seedlist.csv ($(wc -l < ./nodes/0/seedlist.csv) peers)"
-  fi
 
   # Start all GL0 nodes together
   for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
     cd ./nodes/$i/
-    nakamoto_compose_args=""
-    if [ "$NAKAMOTO_GL0" = "true" ]; then
-      nakamoto_compose_args="-f docker-compose.nakamoto-sidecar.yaml -f docker-compose.nakamoto-overlay.yaml"
-    fi
+    nakamoto_compose_args="-f docker-compose.nakamoto-sidecar.yaml -f docker-compose.nakamoto-overlay.yaml"
     docker compose -f docker-compose.test.yaml \
       -f docker-compose.yaml \
       -f docker-compose.volumes.yaml \
@@ -671,7 +661,7 @@ scrape_configs:
 PROMEOF
 
     # GL0 targets
-    echo "  - job_name: 'nakamoto-gl0'" >> "$PROM_CFG"
+    echo "  - job_name: 'gl0'" >> "$PROM_CFG"
     echo "    metrics_path: '/metrics'" >> "$PROM_CFG"
     echo "    static_configs:" >> "$PROM_CFG"
     for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
@@ -680,16 +670,14 @@ PROMEOF
       echo "        labels: { layer: 'gl0', node: 'gl0-$i' }" >> "$PROM_CFG"
     done
 
-    # Sidecar targets (if Nakamoto)
-    if [ "$NAKAMOTO_GL0" = "true" ]; then
-      echo "  - job_name: 'sidecar'" >> "$PROM_CFG"
-      echo "    metrics_path: '/metrics'" >> "$PROM_CFG"
-      echo "    static_configs:" >> "$PROM_CFG"
-      for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
-        echo "      - targets: ['sidecar-$i:9501']" >> "$PROM_CFG"
-        echo "        labels: { layer: 'sidecar', node: 'sidecar-$i' }" >> "$PROM_CFG"
-      done
-    fi
+    # Sidecar targets
+    echo "  - job_name: 'sidecar'" >> "$PROM_CFG"
+    echo "    metrics_path: '/metrics'" >> "$PROM_CFG"
+    echo "    static_configs:" >> "$PROM_CFG"
+    for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
+      echo "      - targets: ['sidecar-$i:9501']" >> "$PROM_CFG"
+      echo "        labels: { layer: 'sidecar', node: 'sidecar-$i' }" >> "$PROM_CFG"
+    done
 
     # Monitoring trio: Prometheus (scraper), Grafana (UI), and grafana-image-renderer
     # (server-side PNG rendering for /render/ endpoints so Grafana can serve dashboard
@@ -768,26 +756,6 @@ fi
 source ../../docker/bin/cluster-health-check.sh
 verify_healthy
 show_time "Cluster became healthy"
-
-# ------------------------------------------------
-# Start background transaction sender (keeps EventTrigger flowing)
-# ------------------------------------------------
-TX_SENDER_JAR="$PROJECT_ROOT/docker/jars/tools.jar"
-TX_SENDER_CONF="$PROJECT_ROOT/docker/config/tx-sender.conf"
-if [ -f "$TX_SENDER_JAR" ] && [ -f "$TX_SENDER_CONF" ] && [ "$NAKAMOTO_GL0" != "true" ]; then
-  echo "Starting background transaction sender..."
-  docker rm -f tx-sender 2>/dev/null || true
-  docker run -d --name tx-sender \
-    --network tessellation_common \
-    --restart unless-stopped \
-    -v "$TX_SENDER_JAR:/app/tools.jar:ro" \
-    -v "$TX_SENDER_CONF:/app/tx-sender.conf:ro" \
-    eclipse-temurin:11-jre \
-    java -jar /app/tools.jar tx-sender --config /app/tx-sender.conf \
-    > /dev/null 2>&1 && echo "  tx-sender started" || echo "  tx-sender failed to start (non-fatal)"
-else
-  echo "Skipping background tx-sender (tools.jar or tx-sender.conf not found)"
-fi
 
 # ------------------------------------------------
 # GL0/GL1 tests (no metagraph required)

@@ -1,8 +1,8 @@
 # Nakamoto sidecar overlay for the standard `just test` infra.
 #
 # Adds a Go libp2p sidecar service alongside the gl0 service in each per-node
-# compose file. Activated via --nakamoto-gl0 in compose-runner.sh, which sets
-# NAKAMOTO_GL0=true and writes the per-node sidecar peer list into .env.
+# compose file. Layered in by compose-runner.sh, which writes the per-node
+# sidecar peer list into .env.
 #
 # The image is built locally from p2p/Dockerfile by compose-runner.sh; we
 # tag it `nakamoto-sidecar:test` so all per-node compose files reuse the

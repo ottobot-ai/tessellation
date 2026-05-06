@@ -67,18 +67,6 @@ export LIST_TESTS=${LIST_TESTS:-false}
 # .workspace/sharding-design-notes.md §3 (Deliverable A — multi-metagraph e2e).
 export NUM_METAGRAPHS=${NUM_METAGRAPHS:-1}
 
-# Nakamoto GL0 is the only consensus mode on this branch — the JAR no longer
-# exposes BFT subcommands (run-genesis/run-validator/run-rollback) for gl0.
-# The NAKAMOTO_GL0 var and the `--nakamoto-gl0` flag are kept ONLY as a
-# transitional shim while CI scripts and runbooks still reference them; the
-# scattered `if [ "$NAKAMOTO_GL0" = "true" ]` gates in compose-runner.sh +
-# entrypoint.sh + docker-compose.nakamoto-overlay.yaml selection should be
-# collapsed once everything that calls into here drops the flag.
-# TODO(multi-metagraph cleanup): remove --nakamoto-gl0 + NAKAMOTO_GL0 var
-# entirely; make the sidecar build, overlay, and entrypoint Nakamoto-only by
-# default; drop the NAKAMOTO_MODE env var passed via the overlay.
-export NAKAMOTO_GL0=${NAKAMOTO_GL0:-true}
-
 
 # Store any explicitly-set TESSELLATION_VERSION from environment
 # This will be used for precedence after args are parsed
@@ -221,12 +209,6 @@ for arg in "$@"; do
         echo "Error: --metagraphs must be a positive integer (got: $NUM_METAGRAPHS)"
         exit 1
       fi
-      ;;
-    --nakamoto-gl0)
-      # No-op: NAKAMOTO_GL0 defaults to true on this branch (BFT gl0 is gone).
-      # Kept for backward compat with scripts/CI that still pass it explicitly.
-      # TODO: remove flag + var once all callers drop it (see set-env.sh top).
-      export NAKAMOTO_GL0=true
       ;;
     --skip-streaming)
       export SKIP_STREAMING=true
