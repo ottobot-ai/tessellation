@@ -5,11 +5,11 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.SpendTransaction
 import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.security.{Hashed, Hasher}
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.addressSetImmutableCodec
@@ -37,7 +37,7 @@ trait SpendTransactionBalanceManager[F[_]] {
 
 object SpendTransactionBalanceManager {
 
-  def make[F[_]: Async](mptStore: MptStore[F, GlobalStateKey]): SpendTransactionBalanceManager[F] =
+  def make[F[_]: Async](reader: GlobalStateReader[F]): SpendTransactionBalanceManager[F] =
     new SpendTransactionBalanceManager[F] {
 
       def updateGlobalBalancesBySpendTransactions(
@@ -101,16 +101,17 @@ object SpendTransactionBalanceManager {
       private def readBalance(address: Address, deltas: SortedMap[Address, Balance]): F[Balance] =
         deltas.get(address) match {
           case Some(b) => b.pure[F]
-          case None    => mptStore.getBalance(address).map(_.getOrElse(Balance.empty))
+          case None =>
+            reader.get[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, address)).map(_.getOrElse(Balance.empty))
         }
 
       def materializeAllBalancesFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, Balance]] =
         for {
           indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.Balances)
-          addrSet <- mptStore.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
+          addrSet <- reader.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
           addrList = addrSet.toList
           keys = addrList.map(addr => GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr))
-          values <- mptStore.getMany[Balance](keys)
+          values <- reader.getMany[Balance](keys)
         } yield
           SortedMap.from(addrList.flatMap { addr =>
             val key = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr)

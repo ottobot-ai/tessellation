@@ -7,6 +7,7 @@ import scala.collection.immutable.SortedMap
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.SpendTransaction
@@ -68,7 +69,7 @@ object SpendTransactionBalanceManagerSuite extends MutableIOSuite {
       )
 
       mptStore <- mkMptStore(priorInMpt)
-      mgr = SpendTransactionBalanceManager.make[IO](mptStore)
+      mgr = SpendTransactionBalanceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
       result <- mgr.updateGlobalBalancesBySpendTransactions(SortedMap.empty, SortedMap.empty, List(spendTx))
       delta = result.map(_._2).getOrElse(SortedMap.empty[Address, Balance])
@@ -100,7 +101,7 @@ object SpendTransactionBalanceManagerSuite extends MutableIOSuite {
       )
 
       mptStore <- mkMptStore(priorInMpt)
-      mgr = SpendTransactionBalanceManager.make[IO](mptStore)
+      mgr = SpendTransactionBalanceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
       result <- mgr.updateGlobalBalancesBySpendTransactions(currentDelta, SortedMap.empty, List(spendTx))
     } yield
@@ -127,7 +128,7 @@ object SpendTransactionBalanceManagerSuite extends MutableIOSuite {
       )
 
       mptStore <- mkMptStore(SortedMap.empty)
-      mgr = SpendTransactionBalanceManager.make[IO](mptStore)
+      mgr = SpendTransactionBalanceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
       result <- mgr.updateGlobalBalancesBySpendTransactions(SortedMap.empty, SortedMap.empty, List(spendTx))
     } yield expect(result.isLeft)
@@ -137,7 +138,7 @@ object SpendTransactionBalanceManagerSuite extends MutableIOSuite {
     implicit val (h, sp, js) = res
     for {
       mptStore <- mkMptStore(SortedMap.empty)
-      mgr = SpendTransactionBalanceManager.make[IO](mptStore)
+      mgr = SpendTransactionBalanceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
       result <- mgr.updateGlobalBalancesBySpendTransactions(SortedMap.empty, SortedMap.empty, List.empty)
     } yield
