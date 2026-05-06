@@ -114,7 +114,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -205,7 +206,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotContext),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -281,7 +283,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotContext),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -346,7 +349,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotContext),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -429,7 +433,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -514,7 +519,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -595,7 +601,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -678,7 +685,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(initialSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, snapshotWithDelegatedStake, _, _, _, _, _) = result1
@@ -705,7 +713,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(snapshotWithDelegatedStake),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, finalSnapshotInfo, _, _, _, _, _) = result2
@@ -822,7 +831,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -917,7 +927,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -999,7 +1010,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(initialSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, snapshotWithDelegatedStake, _, _, _, _, _) = result1
@@ -1025,7 +1037,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(snapshotWithDelegatedStake),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, snapshotWithWithdrawal, _, _, _, _, _) = result2
@@ -1060,7 +1073,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
           lastDeprecatedTips = SortedSet.empty,
           calculateRewardsFn = delegatedRewardsFunction(snapshotWithWithdrawal),
           validationType = StateChannelValidationType.Full,
-          getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+          getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+          parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
         )
       (_, _, _, _, _, _, _, _, finalSnapshotInfo, _, _, _, _, _) = result3
     } yield
@@ -1166,7 +1180,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(initialSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, snapshotWithDelegatedStake, _, _, _, _, _) = result1
@@ -1199,7 +1214,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(snapshotWithDelegatedStake),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, snapshotWithReplacement, _, _, _, _, _) = result2
@@ -1225,7 +1241,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(snapshotWithReplacement),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, snapshotWithWithdrawal, _, _, _, _, _) = result3
@@ -1249,7 +1266,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(snapshotWithWithdrawal),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, _, _, _, _, _, _, finalSnapshotInfo, _, _, _, _, _) = result4
@@ -1360,7 +1378,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -1429,7 +1448,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -1503,7 +1523,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -1569,7 +1590,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -1639,7 +1661,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -1721,7 +1744,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -1817,7 +1841,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -1907,7 +1932,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result
@@ -1979,7 +2005,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         lastDeprecatedTips = SortedSet.empty,
         calculateRewardsFn = delegatedRewardsFunction(lastSnapshotInfo),
         validationType = StateChannelValidationType.Full,
-        getGlobalSnapshotByOrdinal = _ => None.pure[IO]
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
       (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _) = result

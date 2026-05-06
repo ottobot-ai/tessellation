@@ -231,11 +231,22 @@ object MptOverlay {
         Async[F].pure(new PassthroughHandle[F, K](underlying, parentBranch))
 
       def commit(branch: BranchHandle[F, K], childTip: BranchId, ordinal: SnapshotOrdinal): F[Unit] =
-        // Topology bookkeeping only — writes already landed in `underlying` during the handle's lifetime.
+        // Writes already landed in `underlying` during the handle's lifetime; this just performs the
+        // topology bookkeeping and the per-ordinal trie checkpoint that legacy `syncFromStateChanges`
+        // used to do at its tail. Without the checkpoint, `builder.buildProof` (which calls
+        // `producer.buildForOrdinal` + `producer.getRootHashForOrdinal`) cannot resolve the just-written
+        // ordinal — that's the post-write contract the algebra has to honor when the GSAM rewire (#56.10
+        // Phase D) routes through `overlay.commit` instead of `mptStore.syncFromStateChanges`. Multi-branch
+        // mode does the equivalent inside `finalizeBranch.foldIntoBase`.
+        //
         // Skip self-association if checkout was given the same id (e.g. genesis bootstrap), which would
         // otherwise create a self-loop in the parent-child tree.
-        if (branch.parent.value === childTip.value) Async[F].unit
-        else pcTree.associate(childTip.value, branch.parent.value)
+        for {
+          _ <- underlying.commit(ordinal)
+          _ <-
+            if (branch.parent.value === childTip.value) Async[F].unit
+            else pcTree.associate(childTip.value, branch.parent.value)
+        } yield ()
 
       def get[V: ImmutableCodec](branch: BranchId, key: K): F[Option[V]] =
         underlying.get(key)

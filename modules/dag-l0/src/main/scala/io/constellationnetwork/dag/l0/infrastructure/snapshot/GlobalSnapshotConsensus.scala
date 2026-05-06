@@ -212,9 +212,8 @@ object GlobalSnapshotConsensus {
           collateral,
           sharedCfg.delegatedStaking.withdrawalTimeLimit
             .getOrElse(sharedCfg.environment, EpochProgress.MinValue),
-          mptStore,
-          loggerBundle,
-          undoJournal
+          mptOverlay,
+          loggerBundle
         )
 
       consensusStorage <- ConsensusStorage

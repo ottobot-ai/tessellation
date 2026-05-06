@@ -410,7 +410,14 @@ object GlobalSnapshotConsensusFunctions {
               lastDeprecatedTips,
               rewardsWithFacilitators(lastFacilitators),
               StateChannelValidationType.Full,
-              getGlobalSnapshotByOrdinal
+              getGlobalSnapshotByOrdinal,
+              // The parent's snapshot hash identifies the branch we're extending. Inside accept(),
+              // `overlay.checkout(parentTip)` uses it as the branch view for prior reads; the
+              // resulting handle's commit will eventually be associated under this id when the
+              // wiring flips to MultiBranch (Phase J / #56.10). Until then `OverlayMode.Passthrough`
+              // ignores the BranchId on every read/write — the byte-parity contract from #107
+              // covers the rewire under that mode.
+              io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(lastArtifactHash)
             )
         acceptEndMs <- Async[F].monotonic.map(_.toMillis)
         _ <- ConsensusLog.info(

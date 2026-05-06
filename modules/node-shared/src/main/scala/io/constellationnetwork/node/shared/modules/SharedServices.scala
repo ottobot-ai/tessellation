@@ -174,9 +174,8 @@ object SharedServices {
         priceStateUpdater,
         collateral.amount,
         cfg.delegatedStaking.withdrawalTimeLimit.getOrElse(cfg.environment, EpochProgress.MinValue),
-        storages.mptStore,
+        storages.mptOverlay,
         loggerBundle,
-        None,
         maintainNodeCollateralWithdrawalExpiryIndex = true
       )
       globalSnapshotContextFns = GlobalSnapshotContextFunctions.make(

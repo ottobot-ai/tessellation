@@ -71,6 +71,11 @@ object GlobalSnapshotContextFunctions {
 
         lastDeprecatedTips = lastArtifact.tips.deprecated
 
+        // Branch identity for the algebra: the parent snapshot's hash. Under the active
+        // `OverlayMode.Passthrough` wiring (Phase D) this is ignored on every read/write; under
+        // a future `MultiBranch` flip it identifies which pending branch's view to read at.
+        lastArtifactHash <- HasherSelector[F].forOrdinal(lastArtifact.ordinal)(implicit h => h.hash(lastArtifact.value))
+
         blocksForAcceptance = signedArtifact.blocks.toList.map(_.block)
         allowSpendBlocksForAcceptance = signedArtifact.allowSpendBlocks.map(_.toList).getOrElse(List.empty)
         tokenLockBlocksForAcceptance = signedArtifact.tokenLockBlocks.map(_.toList).getOrElse(List.empty)
@@ -211,7 +216,11 @@ object GlobalSnapshotContextFunctions {
                 }
               },
               StateChannelValidationType.Historical,
-              getGlobalSnapshotByOrdinal
+              getGlobalSnapshotByOrdinal,
+              // Follower-side validation: branch identity is the parent's hash so the algebra reads at
+              // the same parent view the proposer constructed against. Phase D (Passthrough) ignores
+              // the BranchId on every read/write — the byte-parity contract from #107 covers the rewire.
+              io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(lastArtifactHash)
             )
             .flatMap {
               case (

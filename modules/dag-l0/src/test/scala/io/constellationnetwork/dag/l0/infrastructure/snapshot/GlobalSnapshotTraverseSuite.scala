@@ -420,6 +420,9 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
         io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.empty[IO]
       )
       dbLogger <- Slf4jLoggerBundle.makeUnsafe[IO]
+      pcTreeForOverlay <- io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree.make[IO]
+      mptOverlay = io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
+        .passthrough[IO, GlobalStateKey](mptStore, pcTreeForOverlay)
 
       snapshotAcceptanceManager = GlobalSnapshotAcceptanceManager
         .make[IO](
@@ -438,7 +441,7 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
           priceStateUpdater,
           Amount.empty,
           EpochProgress(NonNegLong(136080L)),
-          mptStore,
+          mptOverlay,
           dbLogger
         )
       snapshotContextFunctions = GlobalSnapshotContextFunctions.make[IO](

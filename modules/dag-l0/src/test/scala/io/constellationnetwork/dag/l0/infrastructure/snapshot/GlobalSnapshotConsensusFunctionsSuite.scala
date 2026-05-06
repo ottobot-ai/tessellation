@@ -362,6 +362,9 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         mptProducer,
         GlobalStateKey.toHex[IO]
       )
+      pcTree <- io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree.make[IO]
+      mptOverlay = io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
+        .passthrough[IO, GlobalStateKey](mptStore, pcTree)
       dbLogger <- Slf4jLoggerBundle.makeUnsafe[IO]
       snapshotAcceptanceManager = GlobalSnapshotAcceptanceManager
         .make[IO](
@@ -391,7 +394,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           priceStateUpdater,
           collateral,
           EpochProgress(NonNegLong(136080L)),
-          mptStore,
+          mptOverlay,
           dbLogger
         )
       rewardsInfoStorage <- RewardsInfoStorage.make

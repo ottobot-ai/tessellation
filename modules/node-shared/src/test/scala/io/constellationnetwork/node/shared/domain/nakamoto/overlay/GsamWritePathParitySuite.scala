@@ -38,8 +38,8 @@ import weaver.scalacheck.Checkers
   *   - '''Path A (legacy):''' `mptStore.syncFromStateChanges(acc, ordinal)` — the production write path.
   *   - '''Path F (algebra over passthrough):''' writer-algebra (`AcceptanceMpt[F]`) over `MptOverlay.passthrough` — `handle.update[V]` per
   *     field, sidecar read-modify-write through `overlay.get` + `handle.insert`, `overlay.commit`, `overlay.buildRoot`.
-  *   - '''Path G (algebra over multi-branch, optional):''' same writer-algebra over `MptOverlay.MultiBranch`. After `commit` the writes live
-  *     in the per-branch `ChangeSet`; `finalizeBranch` folds them into the base. Post-finalize bytes must match path A. Exercises the
+  *   - '''Path G (algebra over multi-branch, optional):''' same writer-algebra over `MptOverlay.MultiBranch`. After `commit` the writes
+  *     live in the per-branch `ChangeSet`; `finalizeBranch` folds them into the base. Post-finalize bytes must match path A. Exercises the
   *     `ChangeSet`-accumulation path Phase D will adopt in production.
   *
   * Failure on root or per-key bytes blocks Phase D — silent divergence here would be a consensus-correctness regression. We compare both
@@ -115,9 +115,9 @@ object GsamWritePathParitySuite extends MutableIOSuite with Checkers {
   private def bytesEntriesEq(a: Map[Hex, Array[Byte]], b: Map[Hex, Array[Byte]]): Boolean =
     a.view.mapValues(_.toVector).toMap == b.view.mapValues(_.toVector).toMap
 
-  /** Apply a slice through the writer-algebra. Mirrors the per-field insert order and the `applyActiveAddressIndexDelta` sidecar maintenance
-    * of `GlobalStateConverter.syncFromStateChanges` (lines ~1600–1660), but expressed against `AcceptanceMpt[F]` instead of `MptStore[F, K]`
-    * directly. Produces the same final base bytes when the algebra is correct — that is the parity contract.
+  /** Apply a slice through the writer-algebra. Mirrors the per-field insert order and the `applyActiveAddressIndexDelta` sidecar
+    * maintenance of `GlobalStateConverter.syncFromStateChanges` (lines ~1600–1660), but expressed against `AcceptanceMpt[F]` instead of
+    * `MptStore[F, K]` directly. Produces the same final base bytes when the algebra is correct — that is the parity contract.
     *
     * Sidecar: only the `ActiveAddressIndex` partition is exercised here (the three fields are address-keyed). Read-modify-write via
     * `acceptanceMpt.get[SortedSet[Address]]` — when the slice's added-set is empty the sidecar is not touched at all, matching the legacy
@@ -196,8 +196,8 @@ object GsamWritePathParitySuite extends MutableIOSuite with Checkers {
     } yield (rootRes.toOption.map(_.rootHash), bytes)
 
   /** PATH G — writer-algebra over `MptOverlay.MultiBranch`. Writes accumulate in the per-branch `ChangeSet` until `finalizeBranch` folds
-    * them into the underlying store. Compared to path A post-finalize, the base bytes must be identical — divergence here points to a bug in
-    * either `MultiBranchHandle`'s encoding or `foldIntoBase`'s producer-level apply order.
+    * them into the underlying store. Compared to path A post-finalize, the base bytes must be identical — divergence here points to a bug
+    * in either `MultiBranchHandle`'s encoding or `foldIntoBase`'s producer-level apply order.
     *
     * Note: for an empty slice the merged ChangeSet is empty and `foldIntoBase` is a no-op — identical to path A on empty.
     */

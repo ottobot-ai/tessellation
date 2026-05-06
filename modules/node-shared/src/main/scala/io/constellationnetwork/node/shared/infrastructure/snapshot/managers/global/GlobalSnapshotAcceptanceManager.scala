@@ -23,6 +23,7 @@ import io.constellationnetwork.node.shared.domain.delegatedStake.{
   UpdateDelegatedStakeAcceptanceManager,
   UpdateDelegatedStakeAcceptanceResult
 }
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
 import io.constellationnetwork.node.shared.domain.node.UpdateNodeParametersAcceptanceManager
 import io.constellationnetwork.node.shared.domain.nodeCollateral.{
   UpdateNodeCollateralAcceptanceManager,
@@ -136,7 +137,8 @@ trait GlobalSnapshotAcceptanceManager[F[_]] {
     lastDeprecatedTips: SortedSet[DeprecatedTip],
     calculateRewardsFn: RewardsInput => F[DelegatedRewardsResult],
     validationType: StateChannelValidationType,
-    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
+    parentTip: BranchId
   ): F[
     (
       BlockAcceptanceResult,
@@ -177,9 +179,8 @@ object GlobalSnapshotAcceptanceManager {
     priceStateUpdater: PriceStateUpdater[F],
     collateral: Amount,
     withdrawalTimeLimit: EpochProgress,
-    mptStore: MptStore[F, GlobalStateKey],
+    overlay: MptOverlay[F, GlobalStateKey],
     loggerBundle: LoggerBundle[F],
-    undoJournal: Option[io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal[F]] = None,
     // When true, accept() emits adds/removes for the node-collateral-withdrawal expiry index. Requires the same
     // `Some(withdrawalTimeLimit)` to also be passed to every `syncFromGlobalSnapshotInfo` / `toAllStateKeyValueBytes`
     // in the node's production paths — otherwise rebuild-path and delta-path mptRoots diverge. Default false until
@@ -196,6 +197,12 @@ object GlobalSnapshotAcceptanceManager {
         io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.some(withdrawalTimeLimit)
       else
         io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
+    // Per-manager readers and the verify-replay block still need an `MptStore`-shaped read source.
+    // Under `OverlayMode.Passthrough` (current production wiring) `overlay.base` IS the canonical
+    // store and reads are byte-equivalent to the legacy `mptStore` parameter. When the wiring flips
+    // to `MultiBranch` (Phase J), per-manager reads will need to migrate to a branch-aware reader
+    // derived from `overlay.get(parentTip, _)` so a pending branch sees its own deltas.
+    val mptStore: MptStore[F, GlobalStateKey] = overlay.base
     val artifactEmissionManager = ArtifactEmissionManager.make[F]()
     val tipUsageManager = TipUsageManager.make[F]()
     val metagraphSyncManager = MetagraphSyncManager.make[F](metagraphsSyncConfig)
@@ -665,7 +672,8 @@ object GlobalSnapshotAcceptanceManager {
         lastDeprecatedTips: SortedSet[DeprecatedTip],
         calculateRewardsFn: RewardsInput => F[DelegatedRewardsResult],
         validationType: StateChannelValidationType,
-        getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
+        parentTip: BranchId
       ): F[
         (
           BlockAcceptanceResult,
@@ -703,31 +711,16 @@ object GlobalSnapshotAcceptanceManager {
                 s"cds=${cdsEvents.size} wds=${wdsEvents.size} cnc=${cncEvents.size} wnc=${wncEvents.size}"
             )
 
-            // Fork-switch detection MUST run before any MPT reads. accept() reads `priorBalances`,
-            // `priorLastTxRefs`, `priorLastCurrencySnapshots`, etc. from the live MPT, expecting it to
-            // reflect ordinal-1 state. If the journal tip is at ordinal (e.g. a prior accept at the same
-            // ordinal already wrote — common on gl0 nodes where SnapshotLeaderLoop produces and then
-            // validateArtifact validates a competing proposal at the same slot), the priors read
-            // post-write state, corrupt every downstream balance/refs computation, and the resulting
-            // mptRoot drifts from the canonical leader's state. Followers (cl0/dl1) that only run
-            // createContext don't accumulate this corruption — they then disagree with the corrupted
-            // gl0 leader's stateProof on the next ordinal (#70: dl1 StateProofMismatch on every sc=1
-            // ord under spend load, balances field diverging despite identical event input).
-            _ <- undoJournal match {
-              case Some(journal) =>
-                journal.currentTipOrdinal.flatMap {
-                  case Some(tipOrd) if tipOrd != ordinal.value.value - 1 =>
-                    loggerBundle.app.info(
-                      s"[ACCEPTANCE] ordinal=$ordinal fork switch detected: journalTip=$tipOrd, expected=${ordinal.value.value - 1}. " +
-                        s"Rolling journal back to ordinal=${ordinal.value.value - 1} (reverse-apply local-fork entries)."
-                    ) >>
-                      journal.unapplyTo(ordinal.value.value - 1).void
-                  case _ =>
-                    Async[F].unit // aligned, no rollback needed
-                }
-              case None =>
-                Async[F].unit
-            }
+            // Branch-aware checkout against the parent's tip. Reads through `mpt` route through
+            // `overlay.get(parentTip, _)`, so priors observe the parent-branch view (under
+            // `OverlayMode.Passthrough` this collapses to the underlying base). The legacy
+            // `journal.unapplyTo(ord-1)` fork-switch reverse-apply is gone: branch-scoped reads
+            // make rollback unnecessary — a competing proposal at the same slot checks out
+            // against its own parent and accumulates writes in its own handle, never observing
+            // sibling branches' deltas. (#70's gl0 leader-vs-validator at same ordinal disappears
+            // by construction.)
+            handle <- overlay.checkout(parentTip)
+            mpt = AcceptanceMpt.fromOverlay[F](overlay, parentTip, handle)
 
             (allowSpendBlockAcceptanceResult, tokenLockBlockAcceptanceResult) <-
               acceptAllowSpendAndTokenLockBlocks(
@@ -1374,16 +1367,15 @@ object GlobalSnapshotAcceptanceManager {
               s"[ACCEPTANCE] ordinal=$ordinal MPT_SYNC_FP_BAL_PIPELINE: ${parts.mkString(" ")}"
             }
 
-            // === MPT Sync with undo journal ===
-            // Fork-switch detection ran at the top of accept() before any MPT reads, so the MPT
-            // here is at ordinal-1 state. Apply the delta via syncFromStateChanges and wrap with
-            // wrapApply so the journal records this ordinal's undo entry.
-            // Snapshot the pre-sync MPT bytes. Used below for independent cross-check: apply the
+            // === MPT writes via the overlay algebra (#56.10 Phase D) ===
+            // Snapshot the pre-sync MPT bytes for the verify-replay cross-check below: apply the
             // accumulator's delta to this map via the `toAccumulatorHexDelta` helper (a separate
-            // encoder+merge path from `syncFromStateChanges`) and build an MPT via the Parallel
+            // encoder+merge path from the writer-algebra) and build an MPT via the Parallel
             // producer. If both paths agree on the post-state root, the writer is validated
-            // without needing `GlobalSnapshotInfo` as an intermediate.
-            preSyncBytes <- mptStore.allEntriesAsBytes
+            // without needing `GlobalSnapshotInfo` as an intermediate. Read via `overlay.base`
+            // because the verify-replay cross-checks against the post-write base bytes; under
+            // `OverlayMode.Passthrough` this is the canonical store.
+            preSyncBytes <- overlay.base.allEntriesAsBytes
             // Temporary instrumentation (task #18): fingerprint of starting MPT bytes. Combined with
             // MPT_SYNC_FP above, gives us the two writer inputs (prev state + delta) for gl0/ml0 diff.
             // Map[Hex, Array[Byte]] needs sort + content-aware hash since Map order is non-deterministic
@@ -1394,17 +1386,20 @@ object GlobalSnapshotAcceptanceManager {
               s"[ACCEPTANCE] ordinal=$ordinal MPT_SYNC_PRE: " +
                 s"entries=${preSyncBytes.size} hash=${"%08x".format(fp)}"
             }
-            syncAction = mptStore.syncFromStateChanges(stateChangesAccumulator, ordinal)
-            _ <- undoJournal match {
-              case Some(journal) =>
-                journal.wrapApply(
-                  ordinal.value.value,
-                  io.constellationnetwork.security.hash.Hash(ordinal.value.value.toString),
-                  io.constellationnetwork.security.hash.Hash.empty
-                )(syncAction)
-              case None =>
-                syncAction
-            }
+            // Route the accumulator's deltas through the writer algebra: `mpt.insert / mpt.remove`
+            // accumulate in the branch handle (Passthrough → straight to base; MultiBranch →
+            // per-branch ChangeSet). Field/insert order, sidecar maintenance and removal-key
+            // derivation mirror legacy `mptStore.syncFromStateChanges` byte-for-byte —
+            // `GsamWritePathParitySuite` (#107) is the regression contract.
+            _ <- AcceptanceMptStateChanges.applyStateChanges[F](mpt, stateChangesAccumulator)
+            // Register the write-batch on the branch. Under Passthrough this also performs the
+            // per-ordinal trie checkpoint (`underlying.commit(ordinal)`) that `builder.buildProof`
+            // needs to resolve the just-written ordinal; under MultiBranch the equivalent runs
+            // inside `finalizeBranch.foldIntoBase`. `childTip` is the parentTip itself for now —
+            // until Phase J flips the wiring to MultiBranch and the call site computes the next
+            // snapshot's hash, the topology bookkeeping is a self-loop that Passthrough.commit
+            // short-circuits.
+            _ <- overlay.commit(handle, parentTip, ordinal)
             // Temporary instrumentation (task #18): fingerprint the END gsi components used by
             // builder.buildProof. If MPT_SYNC_PRE + MPT_SYNC_FP match across nodes but mptRoot
             // still diverges, the difference must be here.

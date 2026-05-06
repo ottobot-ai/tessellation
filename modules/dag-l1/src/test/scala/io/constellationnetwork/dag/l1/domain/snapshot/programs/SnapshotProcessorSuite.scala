@@ -255,6 +255,9 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                   GlobalStateKey.toHex[IO]
                 )
                 .asResource
+              mptOverlayParentChildTree <- io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree.make[IO].asResource
+              mptOverlay = io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
+                .passthrough[IO, GlobalStateKey](mptStore, mptOverlayParentChildTree)
 
               globalSnapshotAcceptanceManager = {
                 // LegacyFormat for all ordinals in this suite — test snapshots carry
@@ -297,7 +300,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                   priceStateUpdater,
                   Amount(0L),
                   EpochProgress(NonNegLong(136080L)),
-                  mptStore,
+                  mptOverlay,
                   dbLogger
                 )
               }

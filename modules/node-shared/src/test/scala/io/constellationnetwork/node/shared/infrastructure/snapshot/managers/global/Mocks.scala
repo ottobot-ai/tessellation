@@ -284,7 +284,12 @@ object Mocks {
               GlobalStateKey.toHex[IO]
             )
             .flatMap { mptStore =>
-              initialSnapshotInfo.traverse_(info => mptStore.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal.MinValue)) >>
+              for {
+                _ <- initialSnapshotInfo.traverse_(info => mptStore.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal.MinValue))
+                pcTree <- io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree.make[IO]
+                overlay = io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
+                  .passthrough[IO, GlobalStateKey](mptStore, pcTree)
+              } yield
                 GlobalSnapshotAcceptanceManager
                   .make[IO](
                     FieldsAddedOrdinals(
@@ -314,9 +319,8 @@ object Mocks {
                     collateral = Amount.empty,
                     withdrawalTimeLimit = EpochProgress(4L),
                     loggerBundle = loggerBundle,
-                    mptStore = mptStore
+                    overlay = overlay
                   )
-                  .pure[IO]
             }
         }
       }
