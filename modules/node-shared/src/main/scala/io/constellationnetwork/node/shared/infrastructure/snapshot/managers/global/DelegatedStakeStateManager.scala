@@ -5,18 +5,19 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.tokenLock.TokenLock
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher}
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{
   delegatedStakeRecordSetCodec,
-  pendingDelegatedStakeWithdrawalSetCodec
+  pendingDelegatedStakeWithdrawalSetCodec,
+  signedTokenLockSetCodec
 }
 import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
 
@@ -34,7 +35,7 @@ trait DelegatedStakeStateManager[F[_]] {
 
 object DelegatedStakeStateManager {
 
-  def make[F[_]: Async](mptStore: MptStore[F, GlobalStateKey]): DelegatedStakeStateManager[F] = new DelegatedStakeStateManager[F] {
+  def make[F[_]: Async](reader: GlobalStateReader[F]): DelegatedStakeStateManager[F] = new DelegatedStakeStateManager[F] {
 
     override def processExistingDelegatedStakes(
       lastSnapshotContext: GlobalSnapshotInfo,
@@ -63,7 +64,7 @@ object DelegatedStakeStateManager {
         // staker addresses, and a token lock's source equals the staker. Reading from MPT here
         // (instead of `lastSnapshotContext.activeTokenLocks`) is part of #11 — drop GSI materialization.
         activeTokenLocksByRef <- existingWithdrawals.keySet.toList.flatTraverse { addr =>
-          mptStore.getActiveTokenLocks(addr).flatMap {
+          reader.get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, addr)).flatMap {
             case Some(locks) => locks.toList.traverse(_.toHashed)
             case None        => List.empty[Hashed[TokenLock]].pure[F]
           }
@@ -136,13 +137,13 @@ object DelegatedStakeStateManager {
     def materializeActiveDelegatedStakeAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]] =
       for {
         prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveDelegatedStakes)
-        entries <- mptStore.getAllForPrefix[SortedSet[DelegatedStakeRecord]](prefix)
+        entries <- reader.getAllForPrefix[SortedSet[DelegatedStakeRecord]](prefix)
       } yield entries.values.toList.mapFilter(s => s.headOption.map(_.event.value.source)).toSet
 
     def materializeDelegatedStakeWithdrawalAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]] =
       for {
         prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.DelegatedStakesWithdrawals)
-        entries <- mptStore.getAllForPrefix[SortedSet[PendingDelegatedStakeWithdrawal]](prefix)
+        entries <- reader.getAllForPrefix[SortedSet[PendingDelegatedStakeWithdrawal]](prefix)
       } yield entries.values.toList.mapFilter(s => s.headOption.map(_.event.value.source)).toSet
 
   }
