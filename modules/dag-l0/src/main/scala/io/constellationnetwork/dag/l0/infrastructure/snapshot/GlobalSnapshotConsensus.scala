@@ -159,8 +159,6 @@ object GlobalSnapshotConsensus {
 
       feeCalculator = FeeCalculator.make(feeConfigs)
 
-      undoJournal <- io.constellationnetwork.node.shared.domain.nakamoto.MptUndoJournal.make[F](mptStore).map(Some(_)).toResource
-
       // Wrap getGlobalSnapshotByOrdinal with a chainStore fallback for Nakamoto mode.
       // snapshotStorage loses ordinal index files during fork switches; chainStore has the
       // full canonical chain. The Ref breaks the ordering dependency (chainStore is created later).

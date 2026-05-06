@@ -19,9 +19,7 @@ import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
 
-/** Tests for the branch-aware proof path (#56.7). The legacy journal-based paths (`proofAt` / `directProof` / `historicalProof`) are not
-  * exercised here — they're slated for removal at #56.10 and have no active call sites yet.
-  */
+/** Tests for the branch-aware proof path (#56.7). */
 object HistoricalMptProofServiceSuite extends MutableIOSuite {
 
   type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO])
@@ -60,8 +58,7 @@ object HistoricalMptProofServiceSuite extends MutableIOSuite {
         GlobalStateKey.toHex[IO],
         bestTipFn = IO.pure(none[BranchId])
       )
-      undoJournal <- MptUndoJournal.make[IO](store)
-      svc = HistoricalMptProofService.make[IO](store, undoJournal, overlay)
+      svc = HistoricalMptProofService.make[IO](store, overlay)
     } yield (store, overlay, svc)
 
   test("proofAtBranch: produces a valid inclusion proof for a key in the base trie (branch unknown to overlay = base view)") { res =>
