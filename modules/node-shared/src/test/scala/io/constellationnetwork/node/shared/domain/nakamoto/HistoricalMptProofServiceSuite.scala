@@ -45,8 +45,10 @@ object HistoricalMptProofServiceSuite extends MutableIOSuite {
   private val branchB: BranchId = BranchId(Hash("b" * 64))
   private val parentP: BranchId = BranchId(Hash("0" * 64))
 
-  private def mkSetup(implicit h: Hasher[IO], js: JsonSerializer[IO])
-    : IO[(MptStore[IO, GlobalStateKey], MptOverlay[IO, GlobalStateKey], HistoricalMptProofService[IO])] =
+  private def mkSetup(
+    implicit h: Hasher[IO],
+    js: JsonSerializer[IO]
+  ): IO[(MptStore[IO, GlobalStateKey], MptOverlay[IO, GlobalStateKey], HistoricalMptProofService[IO])] =
     for {
       mptProducer <- InMemoryMerklePatriciaProducer.make[IO]()
       store <- MptStore.make[IO, GlobalStateKey](mptProducer, GlobalStateKey.toHex[IO])

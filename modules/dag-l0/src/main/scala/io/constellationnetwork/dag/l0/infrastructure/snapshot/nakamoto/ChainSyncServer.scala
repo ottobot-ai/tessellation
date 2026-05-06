@@ -41,43 +41,65 @@ object ChainSyncServer {
             logger.info(s"ChainSync SERVE: ${hashes.size} hash(es) requested: ${hashes.map(_.value.take(12)).mkString(",")}")
           )
 
-          hashes.toList.traverse_ { hash =>
-            // Try chain store first (in-memory, has full StoredSnapshot with context)
-            chainStore.get(hash).flatMap {
-              case Some(stored) =>
-                val payload = {
-                  import io.circe.syntax._
-                  val snapshotJson = stored.signedSnapshot.asJson
-                  val contextJson = stored.context.asJson
-                  val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
-                  combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                }
-                // Extract VRF proof, public key, and producer ID from the SlotCertificate.
-                // stored.vrfOutput is the VRF OUTPUT (hash of gamma), NOT the proof.
-                // The validator needs the actual proof bytes for verification.
-                val cert = stored.signedSnapshot.value.slotCertificate
-                val vrfProofBytes = cert.map(_.vrfProof.value.toBytes).getOrElse(Array.empty[Byte])
-                val vrfPkBytes = cert.map(_.vrfPublicKey.value.toBytes).getOrElse(Array.empty[Byte])
-                val producerIdBytes = stored.signedSnapshot.proofs.head.id.hex.toBytes
-                val parentSlot = cert.map(_.parentSlot.value.value).getOrElse(0L)
-                val snap = pb.Snapshot(
-                  hash = com.google.protobuf.ByteString.copyFrom(stored.hash.value.getBytes),
-                  slot = stored.slot,
-                  ordinal = stored.ordinal,
-                  parentHash = com.google.protobuf.ByteString.copyFrom(stored.parentHash.value.getBytes),
-                  payload = com.google.protobuf.ByteString.copyFrom(payload),
-                  vrfProof = com.google.protobuf.ByteString.copyFrom(vrfProofBytes),
-                  vrfPublicKey = com.google.protobuf.ByteString.copyFrom(vrfPkBytes),
-                  producerId = com.google.protobuf.ByteString.copyFrom(producerIdBytes),
-                  parentSlot = parentSlot
-                )
-                Async[F].delay(responseObserver.onNext(snap))
+          // Look up the finalized boundary ONCE per request — all hashes in this batch are
+          // classified against the same snapshot of `lastFinalizedOrdinal`. Reading per-hash would
+          // race: a finalize landing mid-iteration could flip a snapshot from Provisional to
+          // Finalized between two hashes, producing inconsistent disposition for callers that
+          // batch hashes spanning the finality boundary.
+          chainStore.lastFinalizedOrdinal.flatMap { finalizedOrdinal =>
+            hashes.toList.traverse_ { hash =>
+              // Try chain store first (in-memory, has full StoredSnapshot with context)
+              chainStore.get(hash).flatMap {
+                case Some(stored) =>
+                  val payload = {
+                    import io.circe.syntax._
+                    val snapshotJson = stored.signedSnapshot.asJson
+                    val contextJson = stored.context.asJson
+                    val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
+                    combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                  }
+                  // Extract VRF proof, public key, and producer ID from the SlotCertificate.
+                  // stored.vrfOutput is the VRF OUTPUT (hash of gamma), NOT the proof.
+                  // The validator needs the actual proof bytes for verification.
+                  val cert = stored.signedSnapshot.value.slotCertificate
+                  val vrfProofBytes = cert.map(_.vrfProof.value.toBytes).getOrElse(Array.empty[Byte])
+                  val vrfPkBytes = cert.map(_.vrfPublicKey.value.toBytes).getOrElse(Array.empty[Byte])
+                  val producerIdBytes = stored.signedSnapshot.proofs.head.id.hex.toBytes
+                  val parentSlot = cert.map(_.parentSlot.value.value).getOrElse(0L)
+                  // #56.8 disposition: snapshots at ordinal ≤ finalizedOrdinal are on the canonical
+                  // chain by construction (chainStore.finalize prunes non-canonical at-or-below
+                  // finalized in the same step that advances `lastFinalizedOrdinal`). Snapshots
+                  // above are pending — `branch_id` is the snapshot's own hash (branch identity =
+                  // tip hash in the multi-branch overlay model).
+                  val isFinalized = stored.ordinal <= finalizedOrdinal
+                  val branchIdBytes =
+                    if (isFinalized) com.google.protobuf.ByteString.EMPTY
+                    else com.google.protobuf.ByteString.copyFrom(stored.hash.value.getBytes)
+                  val snap = pb.Snapshot(
+                    hash = com.google.protobuf.ByteString.copyFrom(stored.hash.value.getBytes),
+                    slot = stored.slot,
+                    ordinal = stored.ordinal,
+                    parentHash = com.google.protobuf.ByteString.copyFrom(stored.parentHash.value.getBytes),
+                    payload = com.google.protobuf.ByteString.copyFrom(payload),
+                    vrfProof = com.google.protobuf.ByteString.copyFrom(vrfProofBytes),
+                    vrfPublicKey = com.google.protobuf.ByteString.copyFrom(vrfPkBytes),
+                    producerId = com.google.protobuf.ByteString.copyFrom(producerIdBytes),
+                    parentSlot = parentSlot,
+                    finalized = isFinalized,
+                    branchId = branchIdBytes
+                  )
+                  Async[F].delay(responseObserver.onNext(snap))
 
-              case None =>
-                logger.info(s"ChainSync SERVE: hash ${hash.value.take(12)} NOT in chain store") >>
-                  Async[F].unit
-            }
-          } >> Async[F].delay(responseObserver.onCompleted())
+                case None =>
+                  // NotFound: emit nothing for this hash. Existing behavior. The Scala-side
+                  // `ChainSyncStateResponse.NotFound` ADT case is constructed by the consumer
+                  // when it observes a requested hash absent from the response stream — the wire
+                  // format hasn't been extended for explicit not-found yet.
+                  logger.info(s"ChainSync SERVE: hash ${hash.value.take(12)} NOT in chain store") >>
+                    Async[F].unit
+              }
+            } >> Async[F].delay(responseObserver.onCompleted())
+          }
         }
 
       override def serveChainPoints(

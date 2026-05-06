@@ -247,40 +247,59 @@ object NakamotoSyncDaemon {
               ChainSyncManager
                 .make[F](
                   channel,
-                  { fetchedSnap: pb.Snapshot =>
-                    csRef.get.flatMap {
-                      case Some(csm) =>
-                        snapshotSemaphore.permit.use { _ =>
-                          handleSnapshot(
-                            fetchedSnap,
-                            stateRef,
-                            pendingParentRef,
-                            chainStore,
-                            nodeStorage,
-                            tipTracker,
-                            stakeRegistry,
-                            sidecarClient,
-                            selfId,
-                            keyPair,
-                            lddConfig,
-                            eligibilityChecker,
-                            lastKnownSlotRef,
-                            epochStateRef,
-                            etaRotationSlots,
-                            consensusFns,
-                            snapshotStorage,
-                            lastGlobalSnapshotStorage,
-                            lastNGlobalSnapshotStorage,
-                            productionGate,
-                            mptStore,
-                            eventMempool,
-                            csm,
-                            channel,
-                            dataDir,
-                            logger
-                          )
+                  { resp: io.constellationnetwork.node.shared.domain.nakamoto.chainsync.ChainSyncStateResponse[pb.Snapshot] =>
+                    // #56.8: ADT pattern-match on the chain-sync disposition. Today's `handleSnapshot`
+                    // pipeline doesn't yet differentiate finalized vs provisional — both are validated
+                    // and stored identically. The structural distinction lands here so #56.10's
+                    // overlay-aware accept() can route Provisional fetches to overlay-local commits
+                    // (matching codex's NakamotoSyncDaemon catch in plan rev4 phase E) and Finalized
+                    // fetches straight to base. NotFound logs and unwinds the inflight tracker.
+                    import io.constellationnetwork.node.shared.domain.nakamoto.chainsync.ChainSyncStateResponse
+                    val fetchedSnap: Option[pb.Snapshot] = resp match {
+                      case ChainSyncStateResponse.Finalized(snap)      => Some(snap)
+                      case ChainSyncStateResponse.Provisional(snap, _) => Some(snap)
+                      case ChainSyncStateResponse.NotFound(_)          => None
+                    }
+                    fetchedSnap match {
+                      case Some(snap) =>
+                        csRef.get.flatMap {
+                          case Some(csm) =>
+                            snapshotSemaphore.permit.use { _ =>
+                              handleSnapshot(
+                                snap,
+                                stateRef,
+                                pendingParentRef,
+                                chainStore,
+                                nodeStorage,
+                                tipTracker,
+                                stakeRegistry,
+                                sidecarClient,
+                                selfId,
+                                keyPair,
+                                lddConfig,
+                                eligibilityChecker,
+                                lastKnownSlotRef,
+                                epochStateRef,
+                                etaRotationSlots,
+                                consensusFns,
+                                snapshotStorage,
+                                lastGlobalSnapshotStorage,
+                                lastNGlobalSnapshotStorage,
+                                productionGate,
+                                mptStore,
+                                eventMempool,
+                                csm,
+                                channel,
+                                dataDir,
+                                logger
+                              )
+                            }
+                          case None => Async[F].unit
                         }
-                      case None => Async[F].unit
+                      case None =>
+                        // NotFound — peer doesn't have the requested hash. Inflight tracking is
+                        // unwound by ChainSyncManager's `guaranteeCase`; nothing further to do here.
+                        Async[F].unit
                     }
                   }
                 )

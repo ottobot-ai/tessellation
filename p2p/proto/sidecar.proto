@@ -8,6 +8,21 @@ option java_package = "io.constellationnetwork.node.shared.infrastructure.consen
 // ─── Messages ────────────────────────────────────────────────────────
 
 // A snapshot produced by a slot winner, broadcast via GossipSub.
+//
+// Fields 11-12 added by #56.8 (ChainSync state-query disposition):
+//   - `finalized=true` ⇒ snapshot is on the canonical chain at an ordinal ≤ chainStore's
+//     last finalized ordinal. Consumers may cache aggressively and treat as authoritative.
+//   - `finalized=false` ⇒ snapshot is on a pending branch and may be reorged out.
+//     `branch_id` carries the branch identifier so consumers can correlate provisional
+//     fetches across requests.
+//   - For gossip-broadcast snapshots (publishing path), `finalized=false` and `branch_id`
+//     is the snapshot's own hash — every newly-produced snapshot is provisional.
+//   - For "not found" responses on the ServeSnapshots/FetchSnapshots RPC, the server
+//     simply omits the snapshot from the stream (existing behavior, unchanged).
+//
+// The Go sidecar treats `payload` as opaque bytes and is unaffected by these additions
+// — proto3 forward-compat skips unknown fields. JVM-side parsers populate the disposition
+// when serving and read it when fetching (see `ChainSyncStateResponse`).
 message Snapshot {
   bytes hash = 1;           // 32 bytes, snapshot hash
   int64 slot = 2;           // slot number
@@ -19,6 +34,8 @@ message Snapshot {
   bytes payload = 8;        // serialized snapshot body (opaque to sidecar)
   bytes producer_id = 9;    // peer identity of the producer
   int64 parent_slot = 10;   // slot of parent snapshot (for slot gap verification)
+  bool finalized = 11;      // ChainSync disposition (#56.8): true ⇒ on canonical chain at finalized ordinal
+  bytes branch_id = 12;     // ChainSync disposition (#56.8): pending branch id when finalized=false
 }
 
 // A validator's endorsement of a chain tip.

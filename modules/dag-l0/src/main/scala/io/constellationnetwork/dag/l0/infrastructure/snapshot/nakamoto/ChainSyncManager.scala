@@ -3,6 +3,8 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 import cats.effect.{Async, Ref}
 import cats.syntax.all._
 
+import io.constellationnetwork.node.shared.domain.nakamoto.chainsync.ChainSyncStateResponse
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.security.hash.Hash
 
@@ -30,7 +32,7 @@ object ChainSyncManager {
 
   def make[F[_]: Async](
     channel: ManagedChannel,
-    onFetched: pb.Snapshot => F[Unit]
+    onFetched: ChainSyncStateResponse[pb.Snapshot] => F[Unit]
   ): F[ChainSyncManagerAlgebra[F]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("ChainSyncManager")
     val stub = pb.ChainSyncOutboundGrpc.blockingStub(channel)
@@ -66,7 +68,13 @@ object ChainSyncManager {
             _ <- logger.info(s"🔗 ChainSync: fetching missing parent ${parentHash.value.take(16)}")
             snapshots <- fetch
             _ <- logger.info(s"🔗 ChainSync: received ${snapshots.size} snapshot(s) for ${parentHash.value.take(16)}")
-            _ <- snapshots.traverse_(onFetched)
+            // #56.8: parse each pb.Snapshot's `finalized` + `branch_id` fields into the ADT.
+            // Empty response → NotFound. Always invoke `onFetched` even for NotFound so the consumer
+            // observes the absence (legacy path silently dropped). Single-hash request, so at most one
+            // pb.Snapshot in the response per invocation.
+            _ <-
+              if (snapshots.isEmpty) onFetched(ChainSyncStateResponse.NotFound(parentHash))
+              else snapshots.traverse_(snap => onFetched(parsePbSnapshot(snap)))
           } yield ()
 
           Async[F].guaranteeCase(
@@ -75,4 +83,26 @@ object ChainSyncManager {
         }
       }
   }
+
+  /** Parse the disposition fields of a `pb.Snapshot` (added in #56.8) into the Scala-side ADT.
+    *
+    * Convention: `finalized=true` → `Finalized`; `finalized=false` → `Provisional` with `branch_id` decoded as a hash. If a snapshot
+    * arrives with `finalized=false` but `branch_id` empty (e.g. an old peer that hasn't been regenerated against the new proto), we treat
+    * it as `Provisional` with the snapshot's own hash as branch id — preserves the "every newly-produced snapshot is its own branch tip"
+    * convention.
+    *
+    * `private[nakamoto]` so the test suite can verify wire parsing without exposing it as public API.
+    */
+  private[nakamoto] def parsePbSnapshot(snap: pb.Snapshot): ChainSyncStateResponse[pb.Snapshot] =
+    if (snap.finalized) ChainSyncStateResponse.Finalized(snap)
+    else {
+      val branchHash =
+        if (snap.branchId.isEmpty)
+          // Pre-#56.8 peer or wire compatibility: fall back to the snapshot's own hash as the branch id.
+          // The `branchId` field is bytes-encoded UTF-8 of the hash hex string (matching `pb.Snapshot.hash`).
+          Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
+        else
+          Hash(new String(snap.branchId.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
+      ChainSyncStateResponse.Provisional(snap, BranchId(branchHash))
+    }
 }
