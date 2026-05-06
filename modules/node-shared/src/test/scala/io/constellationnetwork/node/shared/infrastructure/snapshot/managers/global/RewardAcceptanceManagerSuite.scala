@@ -7,6 +7,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
@@ -56,7 +57,7 @@ object RewardAcceptanceManagerSuite extends MutableIOSuite {
       rewards = SortedSet(RewardTransaction(recipient, TransactionAmount(PosLong(50))))
 
       mptStore <- mkMptStore(priorInMpt)
-      manager = RewardAcceptanceManager.make[IO](mptStore)
+      manager = RewardAcceptanceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
       (updated, accepted, delta) <- manager.acceptRewardTxs(SortedMap.empty, rewards)
     } yield
@@ -76,7 +77,7 @@ object RewardAcceptanceManagerSuite extends MutableIOSuite {
       rewards = SortedSet(RewardTransaction(recipient, TransactionAmount(PosLong(50))))
 
       mptStore <- mkMptStore(SortedMap.empty)
-      manager = RewardAcceptanceManager.make[IO](mptStore)
+      manager = RewardAcceptanceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
       (updated, accepted, _) <- manager.acceptRewardTxs(SortedMap.empty, rewards)
     } yield
@@ -98,7 +99,7 @@ object RewardAcceptanceManagerSuite extends MutableIOSuite {
       rewards = SortedSet(RewardTransaction(recipient, TransactionAmount(PosLong(50))))
 
       mptStore <- mkMptStore(priorInMpt)
-      manager = RewardAcceptanceManager.make[IO](mptStore)
+      manager = RewardAcceptanceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
       (updated, _, _) <- manager.acceptRewardTxs(currentDelta, rewards)
     } yield expect(updated(recipient) == Balance(NonNegLong(250)))
@@ -116,7 +117,7 @@ object RewardAcceptanceManagerSuite extends MutableIOSuite {
       )
 
       mptStore <- mkMptStore(SortedMap.empty)
-      manager = RewardAcceptanceManager.make[IO](mptStore)
+      manager = RewardAcceptanceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
       (updated, accepted, _) <- manager.acceptRewardTxs(SortedMap.empty, rewards)
     } yield
@@ -130,7 +131,7 @@ object RewardAcceptanceManagerSuite extends MutableIOSuite {
     implicit val (h, sp, js) = res
     for {
       mptStore <- mkMptStore(SortedMap.empty)
-      manager = RewardAcceptanceManager.make[IO](mptStore)
+      manager = RewardAcceptanceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
 
       (updated, accepted, delta) <- manager.acceptRewardTxs(SortedMap.empty, SortedSet.empty)
     } yield

@@ -34,8 +34,8 @@ import weaver.MutableIOSuite
   *   - against `MptStore[F, GlobalStateKey]` directly (legacy path), and
   *   - against `AcceptanceMpt.fromOverlay` over `MptOverlay.passthrough`.
   *
-  * Both wirings receive the same input state and the same `acceptTransactionRefs` call; their results must be identical SortedMaps. If
-  * they diverge, the algebra has changed read semantics and Phase C must NOT proceed until the divergence is understood.
+  * Both wirings receive the same input state and the same `acceptTransactionRefs` call; their results must be identical SortedMaps. If they
+  * diverge, the algebra has changed read semantics and Phase C must NOT proceed until the divergence is understood.
   *
   * Stronger property than tests-pass: this is the cross-implementation parity gate. The test fixes a generated state, runs both wirings,
   * and asserts equality.
@@ -59,8 +59,8 @@ object TransactionReferenceManagerParitySuite extends MutableIOSuite {
       implicit0(h: Hasher[IO]) = Hasher.forJson[IO]
     } yield (h, sp, j)
 
-  /** Build an `MptStore` seeded with the supplied refs AND with the `ActiveAddressIndex` sidecar populated for `LastTxRefs`. The sidecar
-    * is what `materializeLastTxRefsFromMpt` reads to recover the keyset, so the test must mirror what `accept()` writes via
+  /** Build an `MptStore` seeded with the supplied refs AND with the `ActiveAddressIndex` sidecar populated for `LastTxRefs`. The sidecar is
+    * what `materializeLastTxRefsFromMpt` reads to recover the keyset, so the test must mirror what `accept()` writes via
     * `syncFromStateChanges` in production.
     */
   private def mkMptStoreWith(

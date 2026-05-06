@@ -199,7 +199,9 @@ object GlobalSnapshotAcceptanceManager {
     val artifactEmissionManager = ArtifactEmissionManager.make[F]()
     val tipUsageManager = TipUsageManager.make[F]()
     val metagraphSyncManager = MetagraphSyncManager.make[F](metagraphsSyncConfig)
-    val rewardAcceptanceManager = RewardAcceptanceManager.make[F](mptStore)
+    val rewardAcceptanceManager = RewardAcceptanceManager.make[F](
+      io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
+    )
     val allowSpendStateManager = AllowSpendStateManager.make[F](mptStore)
     val tokenLockStateManager = TokenLockStateManager.make[F](mptStore)
     val spendTransactionBalanceManager = SpendTransactionBalanceManager.make[F](mptStore)
