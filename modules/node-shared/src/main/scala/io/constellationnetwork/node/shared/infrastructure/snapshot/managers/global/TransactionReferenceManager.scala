@@ -5,9 +5,9 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.transaction.{Transaction, TransactionReference}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
@@ -30,7 +30,7 @@ trait TransactionReferenceManager[F[_]] {
 
 object TransactionReferenceManager {
 
-  def make[F[_]: Async](mptStore: MptStore[F, GlobalStateKey]): TransactionReferenceManager[F] = new TransactionReferenceManager[F] {
+  def make[F[_]: Async](reader: GlobalStateReader[F]): TransactionReferenceManager[F] = new TransactionReferenceManager[F] {
 
     def acceptTransactionRefs(
       lastTxRefsContextUpdate: Map[Address, TransactionReference],
@@ -39,7 +39,7 @@ object TransactionReferenceManager {
       val destinationsNeedingLookup =
         (acceptedTransactions.map(_.destination) -- lastTxRefsContextUpdate.keySet).toList
       destinationsNeedingLookup.traverseFilter { addr =>
-        mptStore.getTxRef(addr).map {
+        reader.get[TransactionReference](GlobalStateKey.hypergraph(GlobalStateFieldId.LastTxRefs, addr)).map {
           case None => (addr -> TransactionReference.empty).some
           case _    => none
         }
@@ -50,10 +50,10 @@ object TransactionReferenceManager {
     def materializeLastTxRefsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, TransactionReference]] =
       for {
         indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastTxRefs)
-        addrSet <- mptStore.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
+        addrSet <- reader.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
         addrList = addrSet.toList
         keys = addrList.map(addr => GlobalStateKey.hypergraph(GlobalStateFieldId.LastTxRefs, addr))
-        values <- mptStore.getMany[TransactionReference](keys)
+        values <- reader.getMany[TransactionReference](keys)
       } yield
         SortedMap.from(addrList.flatMap { addr =>
           val key = GlobalStateKey.hypergraph(GlobalStateFieldId.LastTxRefs, addr)

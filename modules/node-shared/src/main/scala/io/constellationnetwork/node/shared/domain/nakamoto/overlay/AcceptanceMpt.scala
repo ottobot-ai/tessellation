@@ -3,7 +3,7 @@ package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 import cats.effect.kernel.Sync
 import cats.syntax.all._
 
-import io.constellationnetwork.schema.mpt.GlobalStateKey
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.serde.ImmutableCodec
 
@@ -15,6 +15,19 @@ trait GlobalStateReader[F[_]] {
   def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]]
   def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]]
   def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]]
+}
+
+object GlobalStateReader {
+
+  /** Adapt an `MptStore[F, GlobalStateKey]` as a `GlobalStateReader[F]`. Used by call sites still threading `MptStore` through legacy paths
+    * (catch-up / bootstrap, finalized-base reads). Branch-aware reads belong on the overlay path; this adapter is for migration scaffolding
+    * where a manager has been converted to `GlobalStateReader[F]` but its consumer still wires it from an `MptStore`.
+    */
+  def fromMptStore[F[_]](store: MptStore[F, GlobalStateKey]): GlobalStateReader[F] = new GlobalStateReader[F] {
+    def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]] = store.get[V](key)
+    def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]] = store.getMany[V](keys)
+    def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] = store.getAllForPrefix[V](prefix)
+  }
 }
 
 /** Write-side algebra: accumulate deltas in a checked-out branch handle. Mutations are local to this writer's branch until commit; a

@@ -8,6 +8,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -86,7 +87,7 @@ object TransactionReferenceManagerSuite extends MutableIOSuite {
       acceptedTxs = SortedSet(mkSignedTx(source, destNew))
 
       mptStore <- mkEmptyMptStore
-      manager = TransactionReferenceManager.make[IO](mptStore)
+      manager = TransactionReferenceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
       deltas <- manager.acceptTransactionRefs(Map.empty, acceptedTxs)
     } yield expect(deltas == SortedMap(destNew -> TransactionReference.empty))
   }
@@ -110,7 +111,7 @@ object TransactionReferenceManagerSuite extends MutableIOSuite {
       )
 
       mptStore <- mkMptStoreWith(preExisting)
-      manager = TransactionReferenceManager.make[IO](mptStore)
+      manager = TransactionReferenceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
       deltas <- manager.acceptTransactionRefs(Map.empty, acceptedTxs)
     } yield expect(deltas == SortedMap(destNew -> TransactionReference.empty))
   }
@@ -128,7 +129,7 @@ object TransactionReferenceManagerSuite extends MutableIOSuite {
       acceptedTxs = SortedSet(mkSignedTx(source, destInBlock))
 
       mptStore <- mkEmptyMptStore
-      manager = TransactionReferenceManager.make[IO](mptStore)
+      manager = TransactionReferenceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
       deltas <- manager.acceptTransactionRefs(contextUpdate, acceptedTxs)
     } yield expect(deltas == SortedMap(destInBlock -> inBlockRef))
   }
@@ -147,7 +148,7 @@ object TransactionReferenceManagerSuite extends MutableIOSuite {
       )
 
       mptStore <- mkEmptyMptStore
-      manager = TransactionReferenceManager.make[IO](mptStore)
+      manager = TransactionReferenceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
       deltas <- manager.acceptTransactionRefs(Map.empty, acceptedTxs)
     } yield expect(deltas == SortedMap(dest -> TransactionReference.empty))
   }
@@ -156,7 +157,7 @@ object TransactionReferenceManagerSuite extends MutableIOSuite {
     implicit val (h, sp, js) = res
     for {
       mptStore <- mkEmptyMptStore
-      manager = TransactionReferenceManager.make[IO](mptStore)
+      manager = TransactionReferenceManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
       deltas <- manager.acceptTransactionRefs(Map.empty, SortedSet.empty)
     } yield expect(deltas.isEmpty)
   }
