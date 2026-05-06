@@ -10,6 +10,7 @@ import scala.collection.immutable.SortedMap
 import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.ext.cats.syntax.validated.validatedSyntax
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.statechannel.StateChannelAcceptanceResult.CurrencySnapshotWithState
 import io.constellationnetwork.node.shared.domain.statechannel.StateChannelValidator.{StateChannelValidationError, getFeeAddresses}
 import io.constellationnetwork.node.shared.domain.statechannel._
@@ -19,13 +20,15 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.currencyMessage._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.security.{Hashed, Hasher}
+import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelSnapshotBinary, StateChannelValidationType}
 
 import io.circe.Decoder
@@ -67,7 +70,7 @@ object GlobalSnapshotStateChannelEventsProcessor {
     stateChannelManager: GlobalSnapshotStateChannelAcceptanceManager[F],
     currencySnapshotContextFns: CurrencySnapshotContextFunctions[F],
     feeCalculator: FeeCalculator[F],
-    mptStore: MptStore[F, GlobalStateKey]
+    reader: GlobalStateReader[F]
   ) =
     new GlobalSnapshotStateChannelEventsProcessor[F] {
       private val logger = Slf4jLogger.getLoggerFromClass[F](GlobalSnapshotStateChannelEventsProcessor.getClass)
@@ -93,10 +96,12 @@ object GlobalSnapshotStateChannelEventsProcessor {
                   SnapshotFeesInfo.empty.pure
               case Some(snapshot) =>
                 for {
-                  maybeCurrencyInfo <- mptStore.getCurrencySnapshotInfo(event.address)
+                  maybeCurrencyInfo <- reader.get[CurrencySnapshotInfo](
+                    GlobalStateKey.metagraph(event.address, GlobalStateFieldId.LastCurrencySnapshotInfo)
+                  )
                   stakingAddr = maybeCurrencyInfo.flatMap(fetchStakingAddress)
                   stakingBalance <- stakingAddr.fold(Balance.empty.pure[F]) { addr =>
-                    mptStore.getBalance(addr).map(_.getOrElse(Balance.empty))
+                    reader.get[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr)).map(_.getOrElse(Balance.empty))
                   }
                   sortedMessagesDesc = snapshot.value.messages.map(_.toList.sortBy(-_.ordinal.value.value))
                   maybeOwnerAddress = sortedMessagesDesc.flatMap(_.find(_.messageType === MessageType.Owner)).map(_.address)

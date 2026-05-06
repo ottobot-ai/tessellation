@@ -201,7 +201,7 @@ object GlobalSnapshotConsensus {
             globalStateChannelManager,
             sharedServices.currencySnapshotContextFns,
             feeCalculator,
-            mptStore
+            io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
           ),
           sharedServices.updateNodeParametersAcceptanceManager,
           sharedServices.updateDelegatedStakeAcceptanceManager,

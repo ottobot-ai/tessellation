@@ -165,7 +165,7 @@ object SharedServices {
             globalSnapshotStateChannelManager,
             currencySnapshotContextFns,
             feeCalculator,
-            storages.mptStore
+            io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(storages.mptStore)
           ),
         updateNodeParametersAcceptanceManager,
         updateDelegatedStakeAcceptanceManager,
