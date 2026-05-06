@@ -82,10 +82,17 @@ object IncrementalTrieOps {
             MerklePatriciaNode.Branch.fromByteKeys(branch.internalPaths.updated(nibbleValue, updatedChild)).widen
           }
         case None =>
-          // Create new leaf for this path
+          // Create new leaf for this path. If the existing branch is empty (size 0), the result of adding one child must
+          // canonicalize to a Leaf with the prepended nibble — matching the canonical form produced by
+          // `ParallelMerklePatriciaProducer.buildTree` for size==1 at the same depth. Without this canonicalization, an
+          // incremental insert into an empty Branch produces a non-canonical Branch{1 child}, diverging from the parallel
+          // build's root hash. This case is unreachable through the existing producer flows (which seed via fullBuild) but
+          // is exposed by `MerklePatriciaTrie.withChanges` when starting from an empty base.
           val remaining = if (depth + 1 >= path.length) CompactNibblePath.empty else path.drop(depth + 1)
           MerklePatriciaNode.Leaf.fromCompact[F](remaining, dataDigest).flatMap { newLeaf =>
-            MerklePatriciaNode.Branch.fromByteKeys(branch.internalPaths + (nibbleValue -> newLeaf)).widen
+            val newPaths = branch.internalPaths + (nibbleValue -> newLeaf)
+            if (newPaths.size == 1) collapseOrRebuildBranch(newPaths)
+            else MerklePatriciaNode.Branch.fromByteKeys(newPaths).widen
           }
       }
     }

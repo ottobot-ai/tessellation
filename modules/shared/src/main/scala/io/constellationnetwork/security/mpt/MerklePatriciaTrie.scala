@@ -2,6 +2,7 @@ package io.constellationnetwork.security.mpt
 
 import cats.Parallel
 import cats.effect.Async
+import cats.syntax.all._
 
 import scala.annotation.tailrec
 
@@ -20,6 +21,38 @@ final case class MerklePatriciaTrie(rootNode: MerklePatriciaNode) {
   /** Get the root hash - O(1) since digest is pre-computed.
     */
   def rootHash: MptRoot = MptRoot(rootNode.digest)
+
+  /** Apply a delta of upserts and removals, returning a new trie that shares unchanged subtree references with this one.
+    *
+    * Implementation: thin wrapper over `IncrementalTrieOps.removeMultiple` then `insertMultiple`. Removals are applied first so a key
+    * removed and re-upserted in the same delta ends up with the new value. Both operations sort by `CompactNibblePath` ordering to match
+    * the deterministic trie structure produced by the parallel/file-system full-build paths.
+    *
+    * Cost: O(changed_keys × log N) new node allocations. Unchanged subtrees share refs with the receiver — branch-overlay friendly.
+    *
+    * Empty-state note: this operates at the trie level, so an empty result (e.g. all entries removed) is represented as an empty Branch.
+    * That matches `ParallelMerklePatriciaProducer.createFromBytes(Map.empty)` but differs from `InMemoryMerklePatriciaProducer.build` which
+    * errors on "no entries" — the latter is a producer-level invariant, not a trie-level one.
+    */
+  def withChanges[F[_]: Async: Hasher](
+    upserts: Map[Hex, Array[Byte]],
+    removes: Set[Hex]
+  ): F[MerklePatriciaTrie] = {
+    val sortedRemoves = removes.toList.sortBy(hex => CompactNibblePath.fromHexString(hex.value))
+
+    for {
+      afterRemoves <-
+        if (sortedRemoves.isEmpty) rootNode.pure[F]
+        else IncrementalTrieOps.removeMultiple[F](rootNode, sortedRemoves)
+      hashedInserts <- upserts.toList.traverse {
+        case (hex, bytes) => Hasher[F].hashBytes(bytes).map(hash => (hex, hash))
+      }
+      sortedInserts = hashedInserts.sortBy { case (hex, _) => CompactNibblePath.fromHexString(hex.value) }
+      afterUpserts <-
+        if (sortedInserts.isEmpty) afterRemoves.pure[F]
+        else IncrementalTrieOps.insertMultiple[F](afterRemoves, sortedInserts)
+    } yield MerklePatriciaTrie(afterUpserts)
+  }
 }
 
 object MerklePatriciaTrie {
