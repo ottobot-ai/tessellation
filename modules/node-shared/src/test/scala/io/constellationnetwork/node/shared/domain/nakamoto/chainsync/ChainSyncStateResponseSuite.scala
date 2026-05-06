@@ -5,8 +5,8 @@ import io.constellationnetwork.security.hash.Hash
 
 import weaver.SimpleIOSuite
 
-/** Tests for the `ChainSyncStateResponse` ADT (#56.8). Exhaustive-match coverage and `fold` semantics. The ADT itself is purely
-  * structural — wire round-tripping happens at the gRPC parse boundary in `ChainSyncManager`, not here.
+/** Tests for the `ChainSyncStateResponse` ADT (#56.8). Exhaustive-match coverage and `fold` semantics. The ADT itself is purely structural
+  * — wire round-tripping happens at the gRPC parse boundary in `ChainSyncManager`, not here.
   */
 object ChainSyncStateResponseSuite extends SimpleIOSuite {
 

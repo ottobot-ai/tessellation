@@ -12,13 +12,13 @@ import io.constellationnetwork.security.hash.Hash
   *     Durable. Consumers may cache aggressively and treat as authoritative.
   *   - [[ChainSyncStateResponse.Provisional]] — the snapshot is on a pending branch above the finalized point. May be reorged out.
   *     Consumers should NOT treat as authoritative; the carried `branch` lets them correlate provisional fetches across requests.
-  *   - [[ChainSyncStateResponse.NotFound]] — the responding peer does not have the requested hash. Stream-omission was the legacy
-  *     encoding; the explicit ADT case lets JVM-side consumers express the absence without conflating it with empty streams.
+  *   - [[ChainSyncStateResponse.NotFound]] — the responding peer does not have the requested hash. Stream-omission was the legacy encoding;
+  *     the explicit ADT case lets JVM-side consumers express the absence without conflating it with empty streams.
   *
   * '''Wire encoding''' (added in #56.8): `pb.Snapshot` carries `finalized: bool` + `branch_id: bytes` fields. `Finalized` ⇒
-  * `finalized=true`, `branch_id` empty. `Provisional` ⇒ `finalized=false`, `branch_id` populated. `NotFound` is currently encoded as
-  * stream omission — there's no `pb.Snapshot` emitted for missing hashes. Future work could add an explicit "not found" wire variant if
-  * consumers want to distinguish "asked for, peer doesn't have it" from "asked for, peer has it but stream cut off mid-flight".
+  * `finalized=true`, `branch_id` empty. `Provisional` ⇒ `finalized=false`, `branch_id` populated. `NotFound` is currently encoded as stream
+  * omission — there's no `pb.Snapshot` emitted for missing hashes. Future work could add an explicit "not found" wire variant if consumers
+  * want to distinguish "asked for, peer doesn't have it" from "asked for, peer has it but stream cut off mid-flight".
   *
   * '''Green-field deployment note''': no peer-version compat required; the disposition fields are non-default in proto3 so existing Go
   * sidecars that haven't been regenerated still relay bytes correctly (proto3 unknown-field passthrough).
