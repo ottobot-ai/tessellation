@@ -44,9 +44,9 @@ object ChangeSetSuite extends SimpleIOSuite with Checkers {
 
   pureTest("empty ChangeSet has no mutations") {
     expect(ChangeSet.empty.isEmpty) &&
-      expect.same(0, ChangeSet.empty.size) &&
-      expect.same(Map.empty[Hex, Array[Byte]], ChangeSet.empty.upserts) &&
-      expect.same(Set.empty[Hex], ChangeSet.empty.removals)
+    expect.same(0, ChangeSet.empty.size) &&
+    expect.same(Map.empty[Hex, Array[Byte]], ChangeSet.empty.upserts) &&
+    expect.same(Set.empty[Hex], ChangeSet.empty.removals)
   }
 
   test("merge with empty is identity (left)") {
@@ -75,7 +75,7 @@ object ChangeSetSuite extends SimpleIOSuite with Checkers {
     val b = ChangeSet(upserts = Map.empty, removals = Set(k))
     val merged = a.merge(b)
     expect(!merged.upserts.contains(k)) &&
-      expect(merged.removals.contains(k))
+    expect(merged.removals.contains(k))
   }
 
   pureTest("merge: other.upserts cancel matching removals in this") {
@@ -85,7 +85,7 @@ object ChangeSetSuite extends SimpleIOSuite with Checkers {
     val b = ChangeSet(upserts = Map(k -> newVal), removals = Set.empty)
     val merged = a.merge(b)
     expect(!merged.removals.contains(k)) &&
-      expect.same(newVal.toSeq, merged.upserts(k).toSeq)
+    expect.same(newVal.toSeq, merged.upserts(k).toSeq)
   }
 
   pureTest("merge: same upsert key in both — other wins") {
@@ -126,10 +126,11 @@ object ChangeSetSuite extends SimpleIOSuite with Checkers {
     implicit val showCombined: Show[(Map[Hex, Seq[Byte]], ChangeSet, ChangeSet)] =
       Show.show { case (b, a1, a2) => s"(base=${b.size}, a=${a1.size}, b=${a2.size})" }
 
-    forall(combined) { case (base, a, b) =>
-      val sequential = applyDelta(applyDelta(base, a), b)
-      val merged = applyDelta(base, a.merge(b))
-      expect.same(sequential, merged)
+    forall(combined) {
+      case (base, a, b) =>
+        val sequential = applyDelta(applyDelta(base, a), b)
+        val merged = applyDelta(base, a.merge(b))
+        expect.same(sequential, merged)
     }
   }
 }
