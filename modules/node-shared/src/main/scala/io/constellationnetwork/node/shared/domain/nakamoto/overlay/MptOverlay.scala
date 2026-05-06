@@ -1,20 +1,28 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 
-import cats.effect.kernel.Async
+import cats.effect.kernel.{Async, Ref}
+import cats.effect.std.Semaphore
 import cats.syntax.all._
+
+import scala.annotation.tailrec
 
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.mpt.MptStore
+import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.MerklePatriciaTrie
 import io.constellationnetwork.security.mpt.producer.MerklePatriciaError
 import io.constellationnetwork.serde.ImmutableCodec
+import io.constellationnetwork.serde.implicits._
+
+import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Branch identity within the overlay. Reuses chain-store snapshot identity (the `Hash` of a snapshot/block tip) so that callers can pass
-  * `chainStore.bestTip` (or any known parent hash) without any conversion. The opaque-ness target of the rev3 plan is approximated here as a
-  * value-class wrapper — Scala 2.13 has no opaque types, but the wrapper preserves "do not concatenate / mistakenly compare with raw Hash".
+  * `chainStore.bestTip` (or any known parent hash) without any conversion. The opaque-ness target of the rev3 plan is approximated here as
+  * a value-class wrapper — Scala 2.13 has no opaque types, but the wrapper preserves "do not concatenate / mistakenly compare with raw
+  * Hash".
   */
 final case class BranchId(value: Hash) extends AnyVal
 
@@ -24,30 +32,37 @@ object BranchId {
     * depend on its exact value, only on the fact that it is stable for the lifetime of the overlay.
     */
   val passthrough: BranchId = BranchId(Hash.empty)
+
+  /** Conventional id for "no pending branch — I just want to read the finalized base." Any `BranchId` not present in the multi-branch
+    * overlay's pending map resolves to the base, so this is purely a documentation alias.
+    */
+  val base: BranchId = BranchId(Hash.empty)
 }
 
-/** Outcome of `MptOverlay.finalizeBranch`. The plan (#56.6) defines this as the single return value the finality sink reads after each call.
+/** Outcome of `MptOverlay.finalizeBranch`. The plan (#56.6) defines this as the single return value the finality sink reads after each
+  * call.
   */
 sealed trait FinalizationOutcome
 object FinalizationOutcome {
 
   /** A branch's deltas were folded forward into the on-disk base, and zero or more non-canonical branches were dropped.
-    *   - In multi-branch mode (#56.4+), `keysApplied` and `branchesDropped` are populated from the actual fold-forward.
-    *   - In passthrough mode (#56.2), this is never returned — the passthrough always returns `NoOp` because there is no overlay state to
-    *     fold.
+    *   - In multi-branch mode, `keysApplied` counts the distinct trie keys touched (`upserts.size + removals.size` of the merged
+    *     chain-of-deltas). `branchesDropped` counts pending branch entries removed from the overlay other than the canonical chain itself.
+    *   - In passthrough mode, this is never returned — the passthrough always returns `NoOp` because there is no overlay state to fold.
     */
   final case class Folded(keysApplied: Int, branchesDropped: Int) extends FinalizationOutcome
 
-  /** Idempotency / passthrough sentinel: nothing to fold. Returned when `(ordinal, hash)` already finalized, or when the overlay is in
-    * passthrough mode and the underlying `MptStore` already holds the canonical state.
+  /** Idempotency / passthrough sentinel: nothing to fold. Returned when `(ordinal, hash)` already finalized at the same canonical, or when
+    * the overlay is in passthrough mode and the underlying `MptStore` already holds the canonical state, or when the requested branch isn't
+    * tracked in the overlay (so there's nothing to apply).
     */
   case object NoOp extends FinalizationOutcome
 }
 
 /** Mutable handle for accumulating writes against a checked-out branch.
   *
-  * In passthrough mode the writes go straight to the underlying `MptStore`. In multi-branch mode (#56.4) the writes accumulate into a
-  * `ChangeSet` keyed by `BranchId`, and only `commit` materializes the per-branch view.
+  * In passthrough mode the writes go straight to the underlying `MptStore`. In multi-branch mode the writes accumulate into a `ChangeSet`
+  * keyed by `BranchId`, and only `commit` materializes the per-branch view.
   *
   * `BranchHandle` is intentionally narrower than `MptStore` — only mutations needed during snapshot construction. Reads always go through
   * the overlay (`MptOverlay.get` / `getAllForPrefix`) keyed by `BranchId`, since the value visible at a branch is `base ⊕ chain-of-deltas`,
@@ -66,16 +81,17 @@ trait BranchHandle[F[_], K] {
 
 /** Branch-aware view over an `MptStore`.
   *
-  * Goal (rev3 plan, #56): each pending branch gets its own state view (deltas over a finalized base). Only the finalized state is persisted;
-  * pending branches live in memory. When finality advances, the canonical branch's diffs apply forward; non-canonical branches are dropped.
-  *
-  * '''#56.2 milestone (this file)''': defines the trait and ships a single passthrough impl that delegates straight to `MptStore`. The
-  * passthrough is correctness-equivalent to the current direct-`MptStore` model — `checkout` / `commit` are no-ops, reads/writes hit
-  * `MptStore` regardless of the supplied `BranchId`. This lets the overlay be wired into call sites behind a feature flag without changing
-  * behavior. Multi-branch semantics arrive in #56.4.
+  * Goal (rev3 plan, #56): each pending branch gets its own state view (deltas over a finalized base). Only the finalized state is
+  * persisted; pending branches live in memory. When finality advances, the canonical branch's diffs apply forward; non-canonical branches
+  * are dropped.
   *
   * '''Layering''': WRAP, not parameterize. The 14+ existing `MptStore` call sites stay untouched until callers are migrated to the overlay
   * one at a time. `base` is exposed so legacy paths can keep working during migration.
+  *
+  * Two impls live behind `MptOverlay.make(enabled, ...)`:
+  *   - '''passthrough''' (#56.2): correctness-equivalent to direct `MptStore` use; `BranchId` is ignored.
+  *   - '''multi-branch''' (#56.4): per-branch `ChangeSet` accumulation with sibling isolation, lazy fall-through to base on read miss, and
+  *     fold-forward on finalize.
   */
 trait MptOverlay[F[_], K] {
 
@@ -85,61 +101,70 @@ trait MptOverlay[F[_], K] {
   /** Block-tree topology shared with consensus. Reused — no separate tree maintained by the overlay. */
   def parentChildTree: ParentChildTree[F]
 
-  /** Check out a writable handle whose writes will become a child of `parent`. In passthrough mode the returned handle delegates straight to
-    * the underlying `MptStore`; the `parent` argument is retained on the handle for later `commit`.
+  /** Check out a writable handle whose writes will become a child of `parent`. In multi-branch mode the returned handle accumulates writes
+    * into a per-handle `ChangeSet`; reads via the overlay against any other branch do NOT see these writes until `commit` registers them.
     */
   def checkout(parent: BranchId): F[BranchHandle[F, K]]
 
-  /** Commit the writes accumulated on `branch` as the child branch identified by `childTip` at `ordinal`. Multi-branch mode: registers
-    * `(parent → childTip)` in `parentChildTree` and stores the accumulated `ChangeSet` keyed by `childTip`. Passthrough mode: associates the
-    * tip in the parent-child tree (so consensus topology stays accurate) and otherwise no-ops — writes already landed in the underlying
-    * store.
+  /** Commit the writes accumulated on `branch` as the child branch identified by `childTip` at `ordinal`. Multi-branch: registers the
+    * accumulated `ChangeSet` keyed by `childTip` and links `(parent → childTip)` in `parentChildTree`. Passthrough: associates the tip in
+    * the parent-child tree (so consensus topology stays accurate) and otherwise no-ops — writes already landed in the underlying store.
     */
   def commit(branch: BranchHandle[F, K], childTip: BranchId, ordinal: SnapshotOrdinal): F[Unit]
 
-  /** Read at a specific branch view. Passthrough: ignores `branch`, delegates to `MptStore.get`. */
+  /** Read at a specific branch view. Multi-branch: walks `branch → ... → base` through the pending-branches map, returning the first delta
+    * hit (upsert or removal); falls through to `MptStore.get` on miss. Passthrough: ignores `branch`, delegates to `MptStore.get`.
+    */
   def get[V: ImmutableCodec](branch: BranchId, key: K): F[Option[V]]
 
-  /** Prefix scan at a specific branch view. Passthrough: ignores `branch`, delegates to `MptStore.getAllForPrefix`. */
+  /** Prefix scan at a specific branch view. Multi-branch: composes base prefix-scan with the chain's accumulated upserts (decoded to V) and
+    * removals (filtered to `prefix`). Passthrough: ignores `branch`, delegates to `MptStore.getAllForPrefix`.
+    */
   def getAllForPrefix[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[Map[Hex, V]]
 
-  /** Build the per-branch trie at `ordinal`. Passthrough: ignores `branch`, delegates to `MptStore.build`. Multi-branch (#56.5): composes
-    * the on-disk base trie with the branch's accumulated `ChangeSet` via `MerklePatriciaTrie.withChanges`.
+  /** Build the per-branch trie at `ordinal`. Multi-branch: takes the on-disk base trie at `ordinal` and applies the chain's merged
+    * `ChangeSet` via `MerklePatriciaTrie.withChanges`. Passthrough: ignores `branch`, delegates to `MptStore.build`.
     */
   def buildRoot(branch: BranchId, ordinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]]
 
-  /** Finality sink (#56.6). Idempotent on `(ordinal, canonical)`. Passthrough always returns `NoOp` — there is no overlay state to fold.
-    * Multi-branch: applies the canonical branch's accumulated delta to the on-disk base, drops non-canonical branches at `ordinal`, prunes
-    * `parentChildTree` below the new finalized height.
+  /** Finality sink (#56.6 wires the call site). Idempotent on `(ordinal, canonical)`. Errors loudly when called twice at the same `ordinal`
+    * with different `canonical` hashes (depth-k vs attestation-2/3 disagreement during partition).
     *
-    * Errors loudly when called twice at the same `ordinal` with different `canonical` hashes (depth-k vs attestation-2/3 disagreement
-    * during partition).
+    * Multi-branch: walks `canonical → ... → base` through the pending-branches map, merges all chain `ChangeSet`s, applies the merged delta
+    * to the underlying producer, and clears the entire pending-branches map. (More nuanced eviction — keeping non-conflicting siblings —
+    * lands in #56.9.) Passthrough: always returns `NoOp` because there is no overlay state to fold.
     */
   def finalizeBranch(canonical: BranchId, ordinal: SnapshotOrdinal): F[FinalizationOutcome]
 }
 
 object MptOverlay {
 
-  /** Factory that dispatches on the `MPT_OVERLAY_ENABLED` feature flag. While #56.2 is the active milestone there is only one impl —
-    * passthrough — so both branches return passthrough. When the multi-branch impl lands in #56.4 this is the dispatch point that swaps in
-    * the real overlay.
-    *
-    * Default expected wiring (caller sets `enabled = false` or omits): passthrough (correctness-equivalent to direct `MptStore` use).
+  /** Per-branch entry in the overlay's pending-branches map. Lives only in memory — restart wipes pending state and the node resyncs from
+    * the finalized base + `ChainSync`.
     */
-  def make[F[_]: Async, K](
+  private final case class BranchEntry(
+    parent: BranchId,
+    changes: ChangeSet,
+    ordinal: SnapshotOrdinal
+  )
+
+  /** Factory dispatch on the `MPT_OVERLAY_ENABLED` feature flag (default off). Off → passthrough (correctness-equivalent to direct
+    * `MptStore` use). On → multi-branch overlay with per-branch `ChangeSet` accumulation.
+    *
+    * `toHex` is plumbed in alongside `underlying` so the multi-branch impl can encode keys before the per-handle accumulator stores them.
+    * For passthrough, `toHex` is unused — kept on the signature so flipping the flag doesn't change call sites.
+    */
+  def make[F[_]: Async: Hasher, K](
     enabled: Boolean,
     underlying: MptStore[F, K],
-    pcTree: ParentChildTree[F]
-  ): F[MptOverlay[F, K]] = {
-    val _ = enabled // multi-branch impl arrives in #56.4; until then both flag values route to passthrough
-    Async[F].pure(passthrough(underlying, pcTree))
-  }
+    pcTree: ParentChildTree[F],
+    toHex: K => F[Hex]
+  ): F[MptOverlay[F, K]] =
+    if (enabled) MultiBranch[F, K](underlying, pcTree, toHex)
+    else Async[F].pure(passthrough(underlying, pcTree))
 
   /** Single-branch passthrough — correctness-equivalent to using `MptStore` directly. The `BranchId` argument on every method is ignored.
-    * `commit` registers the branch in `parentChildTree` so consensus topology stays consistent with what multi-branch mode will need.
-    *
-    * Use case: feature-flag `MPT_OVERLAY_ENABLED = false` (default) wires this impl, so toggling the flag does not change behavior. When
-    * #56.4 lands the multi-branch impl, switching the flag on swaps the wiring.
+    * `commit` registers the branch in `parentChildTree` so consensus topology stays consistent with what multi-branch mode needs.
     */
   def passthrough[F[_]: Async, K](
     underlying: MptStore[F, K],
@@ -184,5 +209,287 @@ object MptOverlay {
     def remove(key: K): F[Unit] = underlying.remove(key)
     def remove(keys: List[K]): F[Unit] = underlying.remove(keys)
     def update[V: ImmutableCodec](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit] = underlying.update(toUpsert, toRemove)
+  }
+
+  /** Per-handle local accumulator. Mutates a `Ref[ChangeSet]` and is otherwise inert against `MptStore` until `commit` registers the
+    * accumulated state in the overlay's pending-branches map.
+    *
+    * Encoding is identical to `MptStore.Impl.encode` so a key that flows through this handle and is later folded to base is byte-equivalent
+    * to one written via `MptStore.insert` directly.
+    */
+  private final class MultiBranchHandle[F[_]: Async, K](
+    toHex: K => F[Hex],
+    val accRef: Ref[F, ChangeSet],
+    val parent: BranchId
+  ) extends BranchHandle[F, K] {
+
+    private def encode[V: ImmutableCodec](v: V): Array[Byte] =
+      ImmutableCodec[V].immutableBytes(v).toArray
+
+    def insert[V: ImmutableCodec](key: K, value: V): F[Unit] =
+      toHex(key).flatMap { hex =>
+        val bytes = encode(value)
+        accRef.update(cs => ChangeSet(cs.upserts.updated(hex, bytes), cs.removals - hex))
+      }
+
+    def insert[V: ImmutableCodec](entries: Map[K, V]): F[Unit] =
+      if (entries.isEmpty) Async[F].unit
+      else
+        entries.toList.traverse { case (k, v) => toHex(k).map(_ -> encode(v)) }.flatMap { hexed =>
+          val newPairs = hexed.toMap
+          accRef.update(cs => ChangeSet(cs.upserts ++ newPairs, cs.removals -- newPairs.keySet))
+        }
+
+    def remove(key: K): F[Unit] =
+      toHex(key).flatMap { hex =>
+        accRef.update(cs => ChangeSet(cs.upserts - hex, cs.removals + hex))
+      }
+
+    def remove(keys: List[K]): F[Unit] =
+      if (keys.isEmpty) Async[F].unit
+      else
+        keys.traverse(toHex).flatMap { hexes =>
+          val toRemove = hexes.toSet
+          accRef.update(cs => ChangeSet(cs.upserts -- toRemove, cs.removals ++ toRemove))
+        }
+
+    def update[V: ImmutableCodec](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit] =
+      for {
+        upsertHexed <- toUpsert.toList.traverse { case (k, v) => toHex(k).map(_ -> encode(v)) }
+        removeHexed <- toRemove.toList.traverse(toHex)
+        upMap = upsertHexed.toMap
+        rmSet = removeHexed.toSet
+        // Apply removals first then upserts — matches `MerklePatriciaTrie.withChanges` ordering, so a key
+        // present in BOTH `toUpsert` and `toRemove` ends up upserted (consistent with `MptStore.update`).
+        _ <- accRef.update { cs =>
+          val afterRemove = ChangeSet(cs.upserts -- rmSet, cs.removals ++ rmSet)
+          ChangeSet(afterRemove.upserts ++ upMap, afterRemove.removals -- upMap.keySet)
+        }
+      } yield ()
+  }
+
+  /** Multi-branch overlay implementation.
+    *
+    * State:
+    *   - `pendingRef: Map[BranchId, BranchEntry]` — every committed branch above the finalized base. A branch not in this map resolves to
+    *     "the base" for read purposes.
+    *   - `finalizedRef: Map[SnapshotOrdinal, BranchId]` — finalized canonical at each ordinal, for `finalizeBranch` idempotency and
+    *     cross-ordinal conflict detection.
+    *   - `mutex: Semaphore` — serializes `commit` and `finalizeBranch` against each other so the chain walk + base apply in
+    *     `finalizeBranch` is atomic w.r.t. concurrent commits.
+    *
+    * Read path: `walkChainForKey` is a pure tail-recursion over `pendingRef.get`. It starts at the requested branch and walks up parent
+    * pointers, returning:
+    *   - `Some(None)` — the chain explicitly removed `key` at some level, so the answer is `None` (do NOT fall through).
+    *   - `Some(Some(bytes))` — the chain has an upsert for `key`; deserialize and return.
+    *   - `None` — no level in the chain mentions `key`, fall through to the base `MptStore`.
+    *
+    * Merge ordering convention (`mergedChain`): walking leaf→root, each parent's `ChangeSet` is `parent.merge(childAcc)`. `merge` is "later
+    * wins", so if leaf is the most recent commit, `parent.merge(leaf)` correctly applies parent first then leaf — the chronological order.
+    */
+  private object MultiBranch {
+
+    def apply[F[_]: Async: Hasher, K](
+      underlying: MptStore[F, K],
+      pcTree: ParentChildTree[F],
+      toHex: K => F[Hex]
+    ): F[MptOverlay[F, K]] =
+      (
+        Ref.of[F, Map[BranchId, BranchEntry]](Map.empty),
+        Ref.of[F, Map[SnapshotOrdinal, BranchId]](Map.empty),
+        Semaphore[F](1)
+      ).mapN { (pendingRef, finalizedRef, mutex) =>
+        new Impl[F, K](underlying, pcTree, toHex, pendingRef, finalizedRef, mutex): MptOverlay[F, K]
+      }
+
+    private final class Impl[F[_]: Async: Hasher, K](
+      underlying: MptStore[F, K],
+      pcTree: ParentChildTree[F],
+      toHex: K => F[Hex],
+      pendingRef: Ref[F, Map[BranchId, BranchEntry]],
+      finalizedRef: Ref[F, Map[SnapshotOrdinal, BranchId]],
+      mutex: Semaphore[F]
+    ) extends MptOverlay[F, K] {
+
+      private val logger = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
+
+      def base: MptStore[F, K] = underlying
+      def parentChildTree: ParentChildTree[F] = pcTree
+
+      def checkout(parentBranch: BranchId): F[BranchHandle[F, K]] =
+        Ref.of[F, ChangeSet](ChangeSet.empty).map { acc =>
+          new MultiBranchHandle[F, K](toHex, acc, parentBranch)
+        }
+
+      def commit(branch: BranchHandle[F, K], childTip: BranchId, ordinal: SnapshotOrdinal): F[Unit] = {
+        // Casting back to MultiBranchHandle to read its accumulator. Safe because checkout always returns
+        // MultiBranchHandle in this impl. Using a class match avoids exposing `accRef` on the public trait.
+        val handle = branch match {
+          case h: MultiBranchHandle[F, K] @unchecked => h
+          case other =>
+            throw new IllegalArgumentException(
+              s"Multi-branch overlay received a non-MultiBranchHandle on commit: ${other.getClass.getName}"
+            )
+        }
+        mutex.permit.use { _ =>
+          for {
+            changes <- handle.accRef.get
+            _ <- pendingRef.update(_.updated(childTip, BranchEntry(handle.parent, changes, ordinal)))
+            _ <-
+              if (handle.parent.value === childTip.value) Async[F].unit
+              else pcTree.associate(childTip.value, handle.parent.value)
+          } yield ()
+        }
+      }
+
+      def get[V: ImmutableCodec](branch: BranchId, key: K): F[Option[V]] =
+        for {
+          hex <- toHex(key)
+          pending <- pendingRef.get
+          chainResult = walkChainForKey(branch, hex, pending)
+          out <- chainResult match {
+            case Some(None)        => none[V].pure[F]
+            case Some(Some(bytes)) => deserializeBytes[V](bytes)
+            case None              => underlying.get[V](key)
+          }
+        } yield out
+
+      def getAllForPrefix[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[Map[Hex, V]] =
+        for {
+          baseEntries <- underlying.getAllForPrefix[V](prefix)
+          pending <- pendingRef.get
+          merged = mergedChain(branch, pending)
+          filteredUpserts = merged.upserts.filter { case (hex, _) => hex.value.startsWith(prefix.value) }
+          filteredRemovals = merged.removals.filter(_.value.startsWith(prefix.value))
+          decoded <- filteredUpserts.toList.traverseFilter {
+            case (hex, bytes) => deserializeBytes[V](bytes).map(_.map(hex -> _))
+          }
+        } yield (baseEntries -- filteredRemovals) ++ decoded.toMap
+
+      def buildRoot(branch: BranchId, ordinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
+        underlying.build(ordinal).flatMap {
+          case Left(err) => Async[F].pure(Left(err): Either[MerklePatriciaError, MerklePatriciaTrie])
+          case Right(baseTrie) =>
+            pendingRef.get.flatMap { pending =>
+              val merged = mergedChain(branch, pending)
+              if (merged.isEmpty) Async[F].pure(Right(baseTrie): Either[MerklePatriciaError, MerklePatriciaTrie])
+              else
+                baseTrie
+                  .withChanges[F](merged.upserts, merged.removals)
+                  .map(t => Right(t): Either[MerklePatriciaError, MerklePatriciaTrie])
+            }
+        }
+
+      def finalizeBranch(canonical: BranchId, ordinal: SnapshotOrdinal): F[FinalizationOutcome] =
+        mutex.permit.use { _ =>
+          finalizedRef.get.flatMap { finalized =>
+            finalized.get(ordinal) match {
+              case Some(prev) if prev.value === canonical.value =>
+                // Already finalized at exactly this (ordinal, hash); nothing to do.
+                FinalizationOutcome.NoOp.pure[F].widen[FinalizationOutcome]
+              case Some(prev) =>
+                Async[F].raiseError[FinalizationOutcome](
+                  new IllegalStateException(
+                    s"MptOverlay finality conflict at ordinal=$ordinal: previously finalized=${prev.value} " +
+                      s"now requested=${canonical.value}"
+                  )
+                )
+              case None =>
+                pendingRef.get.flatMap { pending =>
+                  pending.get(canonical) match {
+                    case None =>
+                      // Branch never registered with the overlay. Record the finalization (so future calls at
+                      // this ordinal are conflict-checked) but there is nothing to apply.
+                      finalizedRef
+                        .update(_.updated(ordinal, canonical))
+                        .as(FinalizationOutcome.NoOp: FinalizationOutcome)
+                    case Some(_) =>
+                      val merged = mergedChain(canonical, pending)
+                      val droppedCount = pending.size - countAncestors(canonical, pending)
+                      for {
+                        _ <- foldIntoBase(merged, ordinal)
+                        _ <- pendingRef.set(Map.empty)
+                        _ <- finalizedRef.update(_.updated(ordinal, canonical))
+                        _ <- logger.info(
+                          s"[MptOverlay] Finalized branch=${canonical.value} at ordinal=$ordinal: " +
+                            s"keysApplied=${merged.size} branchesDropped=$droppedCount"
+                        )
+                      } yield FinalizationOutcome.Folded(merged.size, droppedCount)
+                  }
+                }
+            }
+          }
+        }
+
+      private def foldIntoBase(merged: ChangeSet, ordinal: SnapshotOrdinal): F[Unit] = {
+        val producer = underlying.underlying
+        for {
+          _ <-
+            if (merged.removals.nonEmpty) producer.remove(merged.removals.toList).void
+            else Async[F].unit
+          _ <-
+            if (merged.upserts.nonEmpty) producer.insertBytes(merged.upserts).void
+            else Async[F].unit
+          _ <- underlying.commit(ordinal)
+        } yield ()
+      }
+
+      private def deserializeBytes[V: ImmutableCodec](bytes: Array[Byte]): F[Option[V]] =
+        if (bytes == null || bytes.isEmpty) none[V].pure[F]
+        else
+          scodec.bits.ByteVector.view(bytes).fromImmutableBytes[V] match {
+            case Right(v)  => v.some.pure[F]
+            case Left(err) => logger.warn(s"MptOverlay.deserializeBytes: scodec decode failed: $err") >> none[V].pure[F]
+          }
+    }
+
+    /** Walk the chain leaf→root looking for `hex`. Returns:
+      *   - `Some(None)` if the chain explicitly removed the key at some level (caller must NOT fall through to base — the explicit removal
+      *     wins).
+      *   - `Some(Some(bytes))` if some level upserted it.
+      *   - `None` if the chain never mentions the key (caller falls through to base).
+      *
+      * Pure tail recursion — no F effects, hashtable lookups only.
+      */
+    @tailrec
+    private def walkChainForKey(
+      branch: BranchId,
+      hex: Hex,
+      pending: Map[BranchId, BranchEntry]
+    ): Option[Option[Array[Byte]]] =
+      pending.get(branch) match {
+        case None => None
+        case Some(entry) =>
+          if (entry.changes.removals.contains(hex)) Some(None)
+          else
+            entry.changes.upserts.get(hex) match {
+              case Some(bytes) => Some(Some(bytes))
+              case None        => walkChainForKey(entry.parent, hex, pending)
+            }
+      }
+
+    /** Walk the chain leaf→root merging `ChangeSet`s in chronological order. At each level, `entry.changes.merge(acc)` ensures the parent's
+      * changes are applied first (older), then the accumulated child-side delta on top (newer). Pure recursion.
+      */
+    @tailrec
+    private def mergedChain(
+      branch: BranchId,
+      pending: Map[BranchId, BranchEntry],
+      acc: ChangeSet = ChangeSet.empty
+    ): ChangeSet =
+      pending.get(branch) match {
+        case None        => acc
+        case Some(entry) => mergedChain(entry.parent, pending, entry.changes.merge(acc))
+      }
+
+    /** Number of branches in `pending` that are on the chain from `branch` to base (inclusive). Used by `finalizeBranch` to compute
+      * `branchesDropped = pending.size - ancestors`.
+      */
+    @tailrec
+    private def countAncestors(branch: BranchId, pending: Map[BranchId, BranchEntry], acc: Int = 0): Int =
+      pending.get(branch) match {
+        case None        => acc
+        case Some(entry) => countAncestors(entry.parent, pending, acc + 1)
+      }
   }
 }
