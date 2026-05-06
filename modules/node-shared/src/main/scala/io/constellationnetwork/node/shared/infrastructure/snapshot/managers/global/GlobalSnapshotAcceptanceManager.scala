@@ -224,7 +224,7 @@ object GlobalSnapshotAcceptanceManager {
       tokenLockBlockAcceptanceManager,
       tipUsageManager,
       collateral,
-      mptStore
+      io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
     )
 
     new GlobalSnapshotAcceptanceManager[F] {

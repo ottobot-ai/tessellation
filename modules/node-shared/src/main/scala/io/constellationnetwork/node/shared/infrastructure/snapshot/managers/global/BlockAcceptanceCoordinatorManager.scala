@@ -8,19 +8,20 @@ import cats.syntax.all._
 import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.node.shared.domain.block.processing._
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.swap.block._
 import io.constellationnetwork.node.shared.domain.tokenlock.block._
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.signedTokenLockSetCodec
 
 trait BlockAcceptanceCoordinatorManager[F[_]] {
   def acceptBlocks(
@@ -56,7 +57,7 @@ object BlockAcceptanceCoordinatorManager {
     tokenLockBlockAcceptanceManager: TokenLockBlockAcceptanceManager[F],
     tipUsageManager: TipUsageManager[F],
     collateral: Amount,
-    mptStore: MptStore[F, GlobalStateKey]
+    reader: GlobalStateReader[F]
   ): BlockAcceptanceCoordinatorManager[F] = new BlockAcceptanceCoordinatorManager[F] {
 
     def acceptBlocks(
@@ -131,7 +132,7 @@ object BlockAcceptanceCoordinatorManager {
         toBeReplacedHashedTokenLocks <-
           refHashesBySource.toList.flatTraverse {
             case (address, refHashes) =>
-              mptStore.getActiveTokenLocks(address).flatMap {
+              reader.get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, address)).flatMap {
                 case Some(locks) =>
                   locks.toList.traverse(_.toHashed).map(_.filter(h => refHashes.contains(h.hash)))
                 case None => List.empty[Hashed[TokenLock]].pure[F]
