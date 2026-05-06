@@ -128,6 +128,11 @@ object GlobalSnapshotConsensus {
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     mptStore: MptStore[F, GlobalStateKey],
+    // #56.6: branch-aware overlay over `mptStore`. Plumbed straight through to SnapshotLeaderLoop
+    // so the finality call sites (depth-k + attestation-2/3) can notify the overlay when a branch
+    // becomes canonical at an ordinal. Currently a passthrough impl by default — finalize is a
+    // no-op until accept() migrates to the overlay (#56.10).
+    mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     eventGossipClient: EventGossipClient[F, GlobalSnapshotEvent],
     loggerBundle: LoggerBundle[F],
@@ -549,6 +554,7 @@ object GlobalSnapshotConsensus {
                   snapshotSemaphore = snapshotSemaphore,
                   productionGate = productionGate,
                   mptStore = mptStore,
+                  mptOverlay = mptOverlay,
                   nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef,
                   chainSyncRequestQueue = chainSyncRequestQueue
                 )

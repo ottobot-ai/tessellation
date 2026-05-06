@@ -12,6 +12,7 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
 import io.constellationnetwork.ext.crypto._
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto._
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, MptOverlay}
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
@@ -178,6 +179,12 @@ object SnapshotLeaderLoop {
     // refused the write) restores the canonical MPT state instead of leaving the
     // proposal's mid-flight mutations behind.
     mptStore: MptStore[F, GlobalStateKey],
+    // MPT overlay (#56.6 wiring). Receives `finalizeBranch(canonicalHash, ordinal)` after
+    // every successful `chainStore.finalize` call. With accept() not yet migrated to use
+    // the overlay (#56.10), pending-branches is always empty here so finalize returns
+    // `NoOp` at runtime — but the wiring is in place so flipping `MPT_OVERLAY_ENABLED`
+    // and migrating accept() activates fold-forward without touching this loop.
+    mptOverlay: MptOverlay[F, GlobalStateKey],
     // Tracks the highest finalized ordinal so HttpApi can expose it via
     // /global-snapshots/latest/finalized-ordinal. Updated after every successful
     // chainStore.finalize call (depth-k or attestation-2/3, whichever fires first).
@@ -409,6 +416,13 @@ object SnapshotLeaderLoop {
                           tipTracker.markFinalized(canonicalHash, finalizeAtSlot) >>
                             tipTracker.pruneBelow(finalizeAtSlot) >>
                             chainStore.finalize(canonicalHash, finalizeAtOrdinal) >>
+                            // #56.6: notify the MPT overlay that this branch is finalized. With
+                            // accept() not yet migrated, this is a runtime no-op (pending=empty
+                            // returns NoOp). When #56.10 migrates accept() to commit branches,
+                            // this becomes the fold-forward sink without touching this site.
+                            mptOverlay
+                              .finalizeBranch(BranchId(canonicalHash), SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
+                              .void >>
                             // Advance the finalized-ordinal tracker so HttpApi
                             // /latest/finalized-ordinal reflects the new high-water mark. CL0
                             // polls this to gate state-channel-binary pruning on actual finality
@@ -468,6 +482,10 @@ object SnapshotLeaderLoop {
                           tipTracker.markFinalized(canonicalHash, finalSlot) >>
                             tipTracker.pruneBelow(finalSlot) >>
                             chainStore.finalize(canonicalHash, finalOrdinal) >>
+                            // #56.6: see depth-k branch above. Same wiring at the attestation-2/3 sink.
+                            mptOverlay
+                              .finalizeBranch(BranchId(canonicalHash), SnapshotOrdinal.unsafeApply(finalOrdinal))
+                              .void >>
                             nakamotoFinalizedOrdinalRef
                               .update(prev => cats.Order[SnapshotOrdinal].max(prev, SnapshotOrdinal.unsafeApply(finalOrdinal))) >>
                             snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(finalOrdinal))) >>

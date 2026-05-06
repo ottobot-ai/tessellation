@@ -190,6 +190,7 @@ object Services {
             sharedStorages.lastGlobalSnapshot,
             storages.globalSnapshot.getHashed,
             sharedStorages.mptStore,
+            sharedStorages.mptOverlay,
             eventMempoolService,
             eventGossipClient,
             loggerBundle,

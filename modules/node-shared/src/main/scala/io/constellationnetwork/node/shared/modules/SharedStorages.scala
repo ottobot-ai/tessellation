@@ -11,6 +11,8 @@ import io.constellationnetwork.node.shared.domain.block.processing.BlockRejectio
 import io.constellationnetwork.node.shared.domain.cluster.storage.{ClusterStorage, SessionStorage}
 import io.constellationnetwork.node.shared.domain.collateral.LatestBalances
 import io.constellationnetwork.node.shared.domain.fork.ForkInfoStorage
+import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.cluster.storage.{ClusterStorage, SessionStorage}
@@ -46,6 +48,18 @@ object SharedStorages {
         mptProducer,
         GlobalStateKey.toHex[F]
       )
+      // MptOverlay (#56.6 wiring): default flag = false → passthrough impl, correctness-equivalent to direct
+      // MptStore use. Lives here so production sites that need branch-aware reads / finality folding can
+      // pull it from `SharedStorages` alongside the underlying store. The `ParentChildTree` is the same
+      // tree used by consensus topology — passing it through means topology associations made during
+      // `commit` / `finalizeBranch` stay in sync with the chain-store's view.
+      mptOverlayParentChildTree <- ParentChildTree.make[F]
+      mptOverlay <- MptOverlay.make[F, GlobalStateKey](
+        enabled = false,
+        underlying = mptStore,
+        pcTree = mptOverlayParentChildTree,
+        toHex = GlobalStateKey.toHex[F]
+      )
     } yield
       new SharedStorages[F](
         cluster = clusterStorage,
@@ -56,7 +70,8 @@ object SharedStorages {
         currencySnapshotEventValidationError = currencySnapshotEventValidationErrorStorage,
         lastNGlobalSnapshot = lastNGlobalSnapshotStorage,
         lastGlobalSnapshot = lastGlobalSnapshotStorage,
-        mptStore = mptStore
+        mptStore = mptStore,
+        mptOverlay = mptOverlay
       ) {}
 }
 
@@ -69,5 +84,6 @@ sealed abstract class SharedStorages[F[_]] private (
   val currencySnapshotEventValidationError: ValidationErrorStorage[F, CurrencySnapshotEvent, BlockRejectionReason],
   val lastNGlobalSnapshot: LastNGlobalSnapshotStorage[F],
   val lastGlobalSnapshot: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo] with LatestBalances[F],
-  val mptStore: MptStore[F, GlobalStateKey]
+  val mptStore: MptStore[F, GlobalStateKey],
+  val mptOverlay: MptOverlay[F, GlobalStateKey]
 )
