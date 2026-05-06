@@ -8,7 +8,8 @@ import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -647,6 +648,133 @@ object MptOverlaySuite extends MutableIOSuite {
       expect.all(
         preCommit.isEmpty,
         postCommit.contains(Balance(NonNegLong(5L)))
+      )
+  }
+
+  // ============================================================
+  // #56.4.5 — partition-atomicity contract for finalize
+  // ============================================================
+  //
+  // Contract: a single `finalizeBranch` writes ALL partition deltas (sidecars + user fields) to the base
+  // in one savepoint-bracketed transaction. There is no partial-partition state. The rollback-on-failure
+  // half of the contract is exercised by `MptStore.withTransaction`'s own savepoint mechanism — these
+  // tests cover the success-side: large multi-key folds and cross-partition mixes land all at once.
+
+  test("atomicity: linear chain finalize folds ALL keys from every level into base together") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+
+      keyP = gskBalance(2000)
+      keyC = gskBalance(2001)
+      keyG = gskBalance(2002)
+
+      // Three-deep chain: parentBranch -> child -> grandchild, each writing one key.
+      hP <- overlay.checkout(parentP)
+      _ <- hP.insert[Balance](keyP, Balance(NonNegLong(10L)))
+      _ <- overlay.commit(hP, branchA, ordinal)
+
+      hC <- overlay.checkout(branchA)
+      _ <- hC.insert[Balance](keyC, Balance(NonNegLong(20L)))
+      _ <- overlay.commit(hC, branchB, ordinal)
+
+      hG <- overlay.checkout(branchB)
+      _ <- hG.insert[Balance](keyG, Balance(NonNegLong(30L)))
+      _ <- overlay.commit(hG, branchC, ordinal)
+
+      _ <- overlay.finalizeBranch(branchC, ordinal)
+
+      // ALL three keys must be in base after a single finalize call.
+      gotP <- store.get[Balance](keyP)
+      gotC <- store.get[Balance](keyC)
+      gotG <- store.get[Balance](keyG)
+    } yield
+      expect.all(
+        gotP.contains(Balance(NonNegLong(10L))),
+        gotC.contains(Balance(NonNegLong(20L))),
+        gotG.contains(Balance(NonNegLong(30L)))
+      )
+  }
+
+  test("atomicity: cross-partition finalize lands user-field AND system-namespace keys together") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+
+      // User-field keys (Balances partition).
+      userKey1 = gskBalance(2100)
+      userKey2 = gskBalance(2101)
+
+      // System-namespace keys (sidecar partitions).
+      activeIdxKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.Balances)
+      expiryAllowSpendsKey <- GlobalStateKey
+        .expiryIndexKey[IO](SystemNamespaceLabel.ExpiryIndexAllowSpends, EpochProgress(NonNegLong(42L)))
+
+      handle <- overlay.checkout(parentP)
+      _ <- handle.insert[Balance](userKey1, Balance(NonNegLong(1L)))
+      _ <- handle.insert[Balance](userKey2, Balance(NonNegLong(2L)))
+      // Sidecar partitions normally hold structured codecs; for atomicity testing we only care that the
+      // fold writes the bytes through. Use Balance bytes as a stand-in payload.
+      _ <- handle.insert[Balance](activeIdxKey, Balance(NonNegLong(7L)))
+      _ <- handle.insert[Balance](expiryAllowSpendsKey, Balance(NonNegLong(13L)))
+      _ <- overlay.commit(handle, branchA, ordinal)
+
+      _ <- overlay.finalizeBranch(branchA, ordinal)
+
+      // All four keys — across user-field and sidecar partitions — must be visible in base.
+      g1 <- store.get[Balance](userKey1)
+      g2 <- store.get[Balance](userKey2)
+      gActive <- store.get[Balance](activeIdxKey)
+      gExpiry <- store.get[Balance](expiryAllowSpendsKey)
+    } yield
+      expect.all(
+        g1.contains(Balance(NonNegLong(1L))),
+        g2.contains(Balance(NonNegLong(2L))),
+        gActive.contains(Balance(NonNegLong(7L))),
+        gExpiry.contains(Balance(NonNegLong(13L)))
+      )
+  }
+
+  test("atomicity: finalize that combines upserts AND removals applies both in one go (no half-applied state)") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+
+      // Pre-populate base with two keys we'll later remove via finalize.
+      removedKey1 = gskBalance(2200)
+      removedKey2 = gskBalance(2201)
+      _ <- store.insert[Balance](
+        Map[GlobalStateKey, Balance](
+          removedKey1 -> Balance(NonNegLong(100L)),
+          removedKey2 -> Balance(NonNegLong(200L))
+        )
+      )
+
+      // Branch removes both AND adds two new keys.
+      addedKey1 = gskBalance(2202)
+      addedKey2 = gskBalance(2203)
+
+      handle <- overlay.checkout(parentP)
+      _ <- handle.remove(List(removedKey1, removedKey2))
+      _ <- handle.insert[Balance](addedKey1, Balance(NonNegLong(11L)))
+      _ <- handle.insert[Balance](addedKey2, Balance(NonNegLong(22L)))
+      _ <- overlay.commit(handle, branchA, ordinal)
+
+      _ <- overlay.finalizeBranch(branchA, ordinal)
+
+      gRemoved1 <- store.get[Balance](removedKey1)
+      gRemoved2 <- store.get[Balance](removedKey2)
+      gAdded1 <- store.get[Balance](addedKey1)
+      gAdded2 <- store.get[Balance](addedKey2)
+    } yield
+      expect.all(
+        gRemoved1.isEmpty,
+        gRemoved2.isEmpty,
+        gAdded1.contains(Balance(NonNegLong(11L))),
+        gAdded2.contains(Balance(NonNegLong(22L)))
       )
   }
 }

@@ -8,7 +8,7 @@ import scala.annotation.tailrec
 
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
 import io.constellationnetwork.schema.SnapshotOrdinal
-import io.constellationnetwork.schema.mpt.MptStore
+import io.constellationnetwork.schema.mpt.{MptStore, MptTxAction}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -92,6 +92,25 @@ trait BranchHandle[F[_], K] {
   *   - '''passthrough''' (#56.2): correctness-equivalent to direct `MptStore` use; `BranchId` is ignored.
   *   - '''multi-branch''' (#56.4): per-branch `ChangeSet` accumulation with sibling isolation, lazy fall-through to base on read miss, and
   *     fold-forward on finalize.
+  *
+  * '''Sidecar / per-field root contract (#56.4.5)''':
+  *   - The overlay accumulates writes as raw `Hex → Array[Byte]` pairs without distinguishing partition kind. Sidecar partitions
+  *     (`ActiveAddressIndex`, expiry indices for AllowSpend / TokenLock / NodeCollateral) and user-field partitions (Balances, LastTxRefs,
+  *     etc.) all flow through the same `ChangeSet`. They share the producer's hex keyspace.
+  *   - '''Global root''' (`buildRoot(branch, ordinal)`): includes EVERY partition — sidecars and user fields — composed via
+  *     `MerklePatriciaTrie.withChanges` from the on-disk base trie at `ordinal`. This is the consensus-relevant root used in stateProof
+  *     verification.
+  *   - '''Per-field root algorithm already exists''' at `GlobalStateConverter.buildPerFieldMptRoots`: it groups `Map[GlobalStateKey,
+  *     Array[Byte]]` by `_._1.fieldId` (structured component of `GlobalStateKey`, not a Hex-prefix slice) and builds a fresh
+  *     `MerklePatriciaTrie.makeParallelFromBytes` per group. Sidecar entries land under `GlobalStateFieldId.SystemIndex`; they are produced
+  *     by `buildPerFieldMptRoots` but the consumer in `GlobalSnapshotInfo.stateProofBuilder` only reads user-visible fieldIds (`Balances`,
+  *     `LastTxRefs`, etc.) via `fieldRoot(id)` lookups, so sidecars are effectively excluded at the StateProof boundary.
+  *   - '''#56.5 work''': re-source the input map (`Map[GlobalStateKey, Array[Byte]]`) from the OVERLAY's branch-scoped view (so a pending
+  *     branch's stateProof reflects its deltas), then feed it into the existing `buildPerFieldMptRoots`. The algorithm doesn't change; the
+  *     producer of the kvPairs does.
+  *   - '''Finalization atomicity''': a single `finalizeBranch` writes ALL partition deltas (sidecars + user fields) to the base in one
+  *     savepoint-bracketed transaction (`MptStore.withTransaction`). If the apply fails mid-stream, the base rolls back to its pre-call
+  *     state. There is no partial-partition state — the contract is all-or-nothing across the entire merged chain.
   */
 trait MptOverlay[F[_], K] {
 
@@ -421,18 +440,28 @@ object MptOverlay {
           }
         }
 
-      private def foldIntoBase(merged: ChangeSet, ordinal: SnapshotOrdinal): F[Unit] = {
-        val producer = underlying.underlying
-        for {
-          _ <-
-            if (merged.removals.nonEmpty) producer.remove(merged.removals.toList).void
-            else Async[F].unit
-          _ <-
-            if (merged.upserts.nonEmpty) producer.insertBytes(merged.upserts).void
-            else Async[F].unit
-          _ <- underlying.commit(ordinal)
-        } yield ()
-      }
+      /** Atomically apply the merged chain delta to the underlying base store.
+        *
+        * The bracket via `MptStore.withTransaction` ensures partial application cannot persist: if any of the producer-level operations
+        * (remove → insertBytes → commit) fails, the savepoint restores the base to its pre-call state. This is the partition-atomicity
+        * contract from #56.4.5: a single `finalizeBranch` writes either ALL partitions' deltas (sidecars + user fields) or NONE.
+        *
+        * `Rethrow.rethrow` on the producer-level `Either` results lifts a `MerklePatriciaError` into `F` so the transaction rolls back
+        * rather than swallowing the failure (the legacy `.void` would have left the base half-applied without surfacing the error).
+        */
+      private def foldIntoBase(merged: ChangeSet, ordinal: SnapshotOrdinal): F[Unit] =
+        underlying.withTransaction {
+          val producer = underlying.underlying
+          for {
+            _ <-
+              if (merged.removals.nonEmpty) producer.remove(merged.removals.toList).rethrow
+              else Async[F].unit
+            _ <-
+              if (merged.upserts.nonEmpty) producer.insertBytes(merged.upserts).rethrow
+              else Async[F].unit
+            _ <- underlying.commit(ordinal)
+          } yield ((), MptTxAction.Commit)
+        }
 
       private def deserializeBytes[V: ImmutableCodec](bytes: Array[Byte]): F[Option[V]] =
         if (bytes == null || bytes.isEmpty) none[V].pure[F]

@@ -23,8 +23,8 @@ import weaver.SimpleIOSuite
   *   - Lentz max iterations = 10000
   *
   * If you intentionally change the captured arithmetic and need to refresh these vectors, run the suite once, copy each actual
-  * `Ratio(numerator, denominator)` from the failure into the corresponding `expected` literal, and document why the change is consensus-safe
-  * in the commit message.
+  * `Ratio(numerator, denominator)` from the failure into the corresponding `expected` literal, and document why the change is
+  * consensus-safe in the commit message.
   */
 object EligibilityDeterminismGoldenSuite extends SimpleIOSuite {
 
