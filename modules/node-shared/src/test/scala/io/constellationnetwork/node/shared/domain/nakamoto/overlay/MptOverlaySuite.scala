@@ -226,13 +226,13 @@ object MptOverlaySuite extends MutableIOSuite {
       )
   }
 
-  test("MptOverlay.make: enabled=false routes to passthrough") { res =>
+  test("MptOverlay.make: OverlayMode.Passthrough routes to passthrough") { res =>
     implicit val (h, _, js) = res
     for {
       store <- mkStore
       pcTree <- ParentChildTree.make[IO]
       overlay <- MptOverlay.make[IO, GlobalStateKey](
-        enabled = false,
+        mode = MptOverlay.OverlayMode.Passthrough,
         store,
         pcTree,
         GlobalStateKey.toHex[IO],
@@ -245,13 +245,13 @@ object MptOverlaySuite extends MutableIOSuite {
     } yield expect(r.contains(Balance(NonNegLong(5L))))
   }
 
-  test("MptOverlay.make: enabled=true routes to multi-branch (writes do NOT go to underlying store before commit)") { res =>
+  test("MptOverlay.make: OverlayMode.MultiBranch routes to multi-branch (writes do NOT go to underlying store before commit)") { res =>
     implicit val (h, _, js) = res
     for {
       store <- mkStore
       pcTree <- ParentChildTree.make[IO]
       overlay <- MptOverlay.make[IO, GlobalStateKey](
-        enabled = true,
+        mode = MptOverlay.OverlayMode.productionDefault,
         store,
         pcTree,
         GlobalStateKey.toHex[IO],
@@ -279,7 +279,7 @@ object MptOverlaySuite extends MutableIOSuite {
       store <- mkStore
       pcTree <- ParentChildTree.make[IO]
       overlay <- MptOverlay.make[IO, GlobalStateKey](
-        enabled = true,
+        mode = MptOverlay.OverlayMode.productionDefault,
         store,
         pcTree,
         GlobalStateKey.toHex[IO],
@@ -812,11 +812,10 @@ object MptOverlaySuite extends MutableIOSuite {
       store <- mkStore
       pcTree <- ParentChildTree.make[IO]
       overlay <- MptOverlay.make[IO, GlobalStateKey](
-        enabled = true,
+        mode = MptOverlay.OverlayMode.MultiBranch(cap),
         store,
         pcTree,
         GlobalStateKey.toHex[IO],
-        maxPendingBranches = cap,
         bestTipFn = bestTipFn
       )
     } yield (store, overlay)

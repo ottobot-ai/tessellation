@@ -54,7 +54,7 @@ object HistoricalMptProofServiceSuite extends MutableIOSuite {
       store <- MptStore.make[IO, GlobalStateKey](mptProducer, GlobalStateKey.toHex[IO])
       pcTree <- ParentChildTree.make[IO]
       overlay <- MptOverlay.make[IO, GlobalStateKey](
-        enabled = true,
+        mode = MptOverlay.OverlayMode.productionDefault,
         store,
         pcTree,
         GlobalStateKey.toHex[IO],

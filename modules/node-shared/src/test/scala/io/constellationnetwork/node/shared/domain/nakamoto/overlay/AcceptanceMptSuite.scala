@@ -125,7 +125,7 @@ object AcceptanceMptSuite extends MutableIOSuite {
       store <- mkStore
       pcTree <- ParentChildTree.make[IO]
       overlay <- MptOverlay.make[IO, GlobalStateKey](
-        enabled = true,
+        mode = MptOverlay.OverlayMode.productionDefault,
         underlying = store,
         pcTree = pcTree,
         toHex = GlobalStateKey.toHex[IO],
@@ -158,7 +158,7 @@ object AcceptanceMptSuite extends MutableIOSuite {
       store <- mkStore
       pcTree <- ParentChildTree.make[IO]
       overlay <- MptOverlay.make[IO, GlobalStateKey](
-        enabled = true,
+        mode = MptOverlay.OverlayMode.productionDefault,
         underlying = store,
         pcTree = pcTree,
         toHex = GlobalStateKey.toHex[IO],

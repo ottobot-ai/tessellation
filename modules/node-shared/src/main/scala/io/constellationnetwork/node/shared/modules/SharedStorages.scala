@@ -54,15 +54,14 @@ object SharedStorages {
       // `commit` / `finalizeBranch` stay in sync with the chain-store's view.
       mptOverlayParentChildTree <- ParentChildTree.make[F]
       mptOverlay <- MptOverlay.make[F, GlobalStateKey](
-        enabled = false,
+        // Stays on `Passthrough` until accept() migrates to the overlay (Phase D). At that point flip to
+        // `MptOverlay.OverlayMode.productionDefault` (or read mode from config) and provide a real
+        // `bestTipFn` (Phase I) so depth-k / attestation-2/3 finality still finds canonical-chain
+        // ancestors after eviction pressure.
+        mode = MptOverlay.OverlayMode.Passthrough,
         underlying = mptStore,
         pcTree = mptOverlayParentChildTree,
         toHex = GlobalStateKey.toHex[F],
-        // #56.9: ancestor-protection callback. With the overlay disabled (passthrough mode) and no
-        // chainStore wire-up, return `None` — eviction never fires anyway because the passthrough has
-        // no pending state. When `enabled` flips true and a real `chainStore` is in scope, replace this
-        // with `chainStore.bestTip.map(_.map(s => BranchId(s.hash)))` so depth-k / attestation-2/3
-        // finality still finds canonical-chain ancestors after eviction pressure.
         bestTipFn = none[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId].pure[F]
       )
     } yield

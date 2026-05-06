@@ -172,29 +172,49 @@ object MptOverlay {
     */
   val DefaultMaxPendingBranches: Int = 4
 
-  /** Factory dispatch on the `MPT_OVERLAY_ENABLED` feature flag (default off). Off → passthrough (correctness-equivalent to direct
-    * `MptStore` use). On → multi-branch overlay with per-branch `ChangeSet` accumulation.
+  /** Operating mode of an `MptOverlay`. Replaces the rev3 `enabled: Boolean` flag (#56.10 Phase J).
+    *
+    *   - `Passthrough`: correctness-equivalent to direct `MptStore` use. The `BranchId` argument is ignored on every call; commits land in
+    *     the underlying store immediately. Used during the migration window so e2e/unit tests can prove parity between old and new paths.
+    *   - `MultiBranch(maxPendingBranches)`: per-branch `ChangeSet` accumulation with sibling isolation. Pending state lives in memory; only
+    *     `finalizeBranch` folds it into the underlying store. Cap on pending branches — eviction (#56.9) drops the lowest-scoring
+    *     non-ancestor branch on commit when exceeded.
+    *
+    * Transient: this ADT is migration scaffolding, not a permanent rollout flag. After #56.11 the only valid mode is `MultiBranch` and the
+    * sealed trait can be retired entirely.
+    */
+  sealed trait OverlayMode extends Product with Serializable
+  object OverlayMode {
+    case object Passthrough extends OverlayMode
+    final case class MultiBranch(maxPendingBranches: Int) extends OverlayMode
+
+    /** Default for production wiring: multi-branch with the canonical cap. Used by `SharedStorages` once accept() has migrated to the
+      * overlay (Phase D). Until then production wiring stays on `Passthrough` to preserve byte-for-byte parity with the legacy path.
+      */
+    val productionDefault: OverlayMode = MultiBranch(DefaultMaxPendingBranches)
+  }
+
+  /** Factory dispatching on `OverlayMode`.
     *
     * `toHex` is plumbed in alongside `underlying` so the multi-branch impl can encode keys before the per-handle accumulator stores them.
-    * For passthrough, `toHex` is unused — kept on the signature so flipping the flag doesn't change call sites.
-    *
-    * `maxPendingBranches` (#56.9): cap on the multi-branch overlay's pending-branches map. When exceeded, the lowest-scoring non-ancestor
-    * branch is evicted on commit. Default 4. Ignored by the passthrough impl (no pending state).
+    * For passthrough, `toHex` is unused — kept on the signature so swapping modes doesn't change call sites.
     *
     * `bestTipFn` (#56.9): callback the overlay queries during eviction to identify ancestors of the canonical chain — these are NEVER
     * evicted. Pass `Async[F].pure(none[BranchId])` for "no ancestor protection" (purely score-based eviction); production deployments
-    * should plumb this from `chainStore.bestTip` so depth-k / attestation-2/3 finality can still walk back through pending branches.
+    * should plumb this from `chainStore.bestTip` (Phase I) so depth-k / attestation-2/3 finality can still walk back through pending
+    * branches.
     */
   def make[F[_]: Async: Hasher, K](
-    enabled: Boolean,
+    mode: OverlayMode,
     underlying: MptStore[F, K],
     pcTree: ParentChildTree[F],
     toHex: K => F[Hex],
-    maxPendingBranches: Int = DefaultMaxPendingBranches,
     bestTipFn: F[Option[BranchId]]
   ): F[MptOverlay[F, K]] =
-    if (enabled) MultiBranch[F, K](underlying, pcTree, toHex, maxPendingBranches, bestTipFn)
-    else Async[F].pure(passthrough(underlying, pcTree))
+    mode match {
+      case OverlayMode.Passthrough             => Async[F].pure(passthrough(underlying, pcTree))
+      case OverlayMode.MultiBranch(maxPending) => MultiBranch[F, K](underlying, pcTree, toHex, maxPending, bestTipFn)
+    }
 
   /** Single-branch passthrough — correctness-equivalent to using `MptStore` directly. The `BranchId` argument on every method is ignored.
     * `commit` registers the branch in `parentChildTree` so consensus topology stays consistent with what multi-branch mode needs.
