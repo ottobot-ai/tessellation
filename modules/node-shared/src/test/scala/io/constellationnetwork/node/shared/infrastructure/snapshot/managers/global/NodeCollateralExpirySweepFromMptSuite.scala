@@ -8,6 +8,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -120,7 +121,7 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = NodeCollateralStateManager.make[IO](store)
+      mgr = NodeCollateralStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -144,7 +145,7 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(wFresh))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = NodeCollateralStateManager.make[IO](store)
+      mgr = NodeCollateralStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentEpoch = EpochProgress(NonNegLong(500L))
       prevEpoch = EpochProgress(NonNegLong(100L))
@@ -166,7 +167,7 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(wBoundary))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = NodeCollateralStateManager.make[IO](store)
+      mgr = NodeCollateralStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -193,7 +194,7 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(wExpired))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = NodeCollateralStateManager.make[IO](store)
+      mgr = NodeCollateralStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       sameEpoch = EpochProgress(NonNegLong(200L))
       index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(sameEpoch, sameEpoch)
@@ -225,7 +226,7 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       info = GlobalSnapshotInfo.empty.copy(nodeCollateralWithdrawals = existingWithdrawals.some)
 
       store <- mkSeededMptStore(existingWithdrawals)
-      mgr = NodeCollateralStateManager.make[IO](store)
+      mgr = NodeCollateralStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
@@ -264,7 +265,7 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       )
 
       store <- mkSeededMptStore(lastActive)
-      mgr = NodeCollateralStateManager.make[IO](store)
+      mgr = NodeCollateralStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       // NC window is `(prev .. curr]`: fromL = 201, toL = 215. All three (201, 205, 210) fall inside.
       prevEpoch = EpochProgress(NonNegLong(200L))
@@ -302,7 +303,7 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       lastActive = SortedMap(addr -> SortedSet(wAtPrev))
 
       store <- mkSeededMptStore(lastActive)
-      mgr = NodeCollateralStateManager.make[IO](store)
+      mgr = NodeCollateralStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       prevEpoch = EpochProgress(NonNegLong(200L))
       currentEpoch = EpochProgress(NonNegLong(300L))

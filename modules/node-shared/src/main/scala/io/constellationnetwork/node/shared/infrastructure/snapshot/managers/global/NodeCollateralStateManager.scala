@@ -5,11 +5,11 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.nodeCollateral.UpdateNodeCollateralAcceptanceResult
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.security.Hasher
@@ -75,7 +75,7 @@ trait NodeCollateralStateManager[F[_]] {
 object NodeCollateralStateManager {
 
   def make[F[_]: Async](
-    mptStore: MptStore[F, GlobalStateKey]
+    reader: GlobalStateReader[F]
   ): NodeCollateralStateManager[F] = new NodeCollateralStateManager[F] {
 
     def acceptNodeCollaterals(
@@ -126,22 +126,27 @@ object NodeCollateralStateManager {
 
         for {
           buckets <- epochs.traverse { e =>
-            mptStore
-              .getExpiryBucket[NodeCollateralWithdrawalExpiryKey](SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, e)
+            GlobalStateKey
+              .expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, e)
+              .flatMap(reader.get[SortedSet[NodeCollateralWithdrawalExpiryKey]])
               .map(_.getOrElse(SortedSet.empty[NodeCollateralWithdrawalExpiryKey]))
           }
           allKeys = buckets.flatten.toSet
           byAddress = allKeys.groupBy(_.address)
           resolved <- byAddress.toList.traverse {
             case (addr, expiryKeys) =>
-              mptStore.getNodeCollateralWithdrawals(addr).flatMap { addrSetOpt =>
-                val addrSet = addrSetOpt.getOrElse(SortedSet.empty[PendingNodeCollateralWithdrawal])
-                val expectedHashes = expiryKeys.map(_.hash)
-                addrSet.toList.traverse(w => w.event.toHashed.map(h => (h.hash, w))).map { hashed =>
-                  val matched = hashed.collect { case (h, w) if expectedHashes.contains(h) => w }.to(SortedSet)
-                  addr -> matched
+              reader
+                .get[SortedSet[PendingNodeCollateralWithdrawal]](
+                  GlobalStateKey.hypergraph(GlobalStateFieldId.NodeCollateralWithdrawals, addr)
+                )
+                .flatMap { addrSetOpt =>
+                  val addrSet = addrSetOpt.getOrElse(SortedSet.empty[PendingNodeCollateralWithdrawal])
+                  val expectedHashes = expiryKeys.map(_.hash)
+                  addrSet.toList.traverse(w => w.event.toHashed.map(h => (h.hash, w))).map { hashed =>
+                    val matched = hashed.collect { case (h, w) if expectedHashes.contains(h) => w }.to(SortedSet)
+                    addr -> matched
+                  }
                 }
-              }
           }
         } yield SortedMap.from(resolved).filter(_._2.nonEmpty)
       }
@@ -186,8 +191,8 @@ object NodeCollateralStateManager {
         case (addr, acceptedWithdrawls) =>
           acceptedWithdrawls.traverse {
             case (ev, ep) =>
-              mptStore
-                .getNodeCollaterals(addr)
+              reader
+                .get[SortedSet[NodeCollateralRecord]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveNodeCollaterals, addr))
                 .flatMap { maybeCollaterals =>
                   maybeCollaterals.flatTraverse {
                     _.findM { s =>
@@ -204,13 +209,13 @@ object NodeCollateralStateManager {
     def materializeActiveNodeCollateralAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]] =
       for {
         prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveNodeCollaterals)
-        entries <- mptStore.getAllForPrefix[SortedSet[NodeCollateralRecord]](prefix)
+        entries <- reader.getAllForPrefix[SortedSet[NodeCollateralRecord]](prefix)
       } yield entries.values.toList.mapFilter(s => s.headOption.map(_.event.value.source)).toSet
 
     def materializeNodeCollateralWithdrawalAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]] =
       for {
         prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.NodeCollateralWithdrawals)
-        entries <- mptStore.getAllForPrefix[SortedSet[PendingNodeCollateralWithdrawal]](prefix)
+        entries <- reader.getAllForPrefix[SortedSet[PendingNodeCollateralWithdrawal]](prefix)
       } yield entries.values.toList.mapFilter(s => s.headOption.map(_.event.value.source)).toSet
 
     def materializeNodeCollateralWithdrawalsFromMpt(
@@ -218,7 +223,7 @@ object NodeCollateralStateManager {
     ): F[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]] =
       for {
         prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.NodeCollateralWithdrawals)
-        entries <- mptStore.getAllForPrefix[SortedSet[PendingNodeCollateralWithdrawal]](prefix)
+        entries <- reader.getAllForPrefix[SortedSet[PendingNodeCollateralWithdrawal]](prefix)
       } yield
         SortedMap.from(
           entries.values.toList

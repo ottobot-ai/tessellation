@@ -210,7 +210,9 @@ object GlobalSnapshotAcceptanceManager {
     val delegatedStakeStateManager = DelegatedStakeStateManager.make[F](
       io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
     )
-    val nodeCollateralStateManager = NodeCollateralStateManager.make[F](mptStore)
+    val nodeCollateralStateManager = NodeCollateralStateManager.make[F](
+      io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
+    )
     val transactionReferenceManager =
       TransactionReferenceManager.make[F](
         io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
