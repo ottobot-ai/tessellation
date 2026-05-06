@@ -405,7 +405,7 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
           stateChannelManager,
           currencySnapshotContextFns,
           feeCalculator,
-          mptStore
+          io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
         )
       updateNodeParametersAcceptanceManager = UpdateNodeParametersAcceptanceManager.make(validators.updateNodeParametersValidator)
       updateDelegatedStakeAcceptanceManager = UpdateDelegatedStakeAcceptanceManager.make(
@@ -414,7 +414,11 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
       updateNodeCollateralAcceptanceManager = UpdateNodeCollateralAcceptanceManager.make(
         validators.updateNodeCollateralValidator
       )
-      priceStateUpdater = PriceStateUpdater.make(Dev, DefaultDelegatedRewardsConfigProvider)
+      priceStateUpdater = PriceStateUpdater.make[IO](
+        Dev,
+        DefaultDelegatedRewardsConfigProvider,
+        io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.empty[IO]
+      )
       dbLogger <- Slf4jLoggerBundle.makeUnsafe[IO]
 
       snapshotAcceptanceManager = GlobalSnapshotAcceptanceManager

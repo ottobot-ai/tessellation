@@ -28,6 +28,15 @@ object GlobalStateReader {
     def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]] = store.getMany[V](keys)
     def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] = store.getAllForPrefix[V](prefix)
   }
+
+  /** Empty reader that always returns no values. Used by tests / wirings where no MPT is available — equivalent to "no prior state". */
+  def empty[F[_]: cats.Applicative]: GlobalStateReader[F] = new GlobalStateReader[F] {
+    def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]] = cats.Applicative[F].pure(None)
+    def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]] =
+      cats.Applicative[F].pure(Map.empty)
+    def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] =
+      cats.Applicative[F].pure(Map.empty)
+  }
 }
 
 /** Write-side algebra: accumulate deltas in a checked-out branch handle. Mutations are local to this writer's branch until commit; a

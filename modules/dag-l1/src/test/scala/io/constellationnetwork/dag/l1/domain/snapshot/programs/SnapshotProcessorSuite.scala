@@ -241,7 +241,11 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                 .make(validators.updateDelegatedStakeValidator)
               updateNodeCollateralAcceptanceManager = UpdateNodeCollateralAcceptanceManager
                 .make(validators.updateNodeCollateralValidator)
-              priceStateUpdater = PriceStateUpdater.make(Dev, DefaultDelegatedRewardsConfigProvider)
+              priceStateUpdater = PriceStateUpdater.make[IO](
+                Dev,
+                DefaultDelegatedRewardsConfigProvider,
+                io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.empty[IO]
+              )
 
               dbLogger <- Slf4jLoggerBundle.make[IO]
               mptProducer <- InMemoryMerklePatriciaProducer.make[IO]().asResource
@@ -283,7 +287,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                       globalSnapshotStateChannelManager,
                       currencySnapshotContextFns,
                       feeCalculator,
-                      mptStore
+                      io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
                     ),
                   updateNodeParametersAcceptanceManager,
                   updateDelegatedStakeAcceptanceManager,

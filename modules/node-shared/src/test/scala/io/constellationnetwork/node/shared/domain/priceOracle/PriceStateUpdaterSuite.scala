@@ -10,6 +10,7 @@ import io.constellationnetwork.env.AppEnvironment.Dev
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.DefaultDelegatedRewardsConfigProvider
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.priceOracle.PriceStateUpdater.aggregateUpdates
 import io.constellationnetwork.schema.NonNegFraction
 import io.constellationnetwork.schema.artifact.PricingUpdate
@@ -76,7 +77,7 @@ object PriceStateUpdaterSuite extends MutableIOSuite {
   }
 
   test("empty updates list returns empty delta") { implicit h =>
-    val updater = PriceStateUpdater.make[IO](Dev, DefaultDelegatedRewardsConfigProvider)
+    val updater = PriceStateUpdater.make[IO](Dev, DefaultDelegatedRewardsConfigProvider, GlobalStateReader.empty[IO])
     val initialState = SortedMap(
       DAG_USD -> PriceRecord(
         currentPrice = PricingUpdate(PriceFraction(DAG_USD, NonNegFraction.unsafeFrom(1, 1))),
@@ -94,7 +95,7 @@ object PriceStateUpdaterSuite extends MutableIOSuite {
   }
 
   test("new token pair creates initial price record") { implicit h =>
-    val updater = PriceStateUpdater.make[IO](Dev, DefaultDelegatedRewardsConfigProvider)
+    val updater = PriceStateUpdater.make[IO](Dev, DefaultDelegatedRewardsConfigProvider, GlobalStateReader.empty[IO])
     val initialState = SortedMap.empty[TokenPair, PriceRecord]
 
     for {
@@ -115,7 +116,7 @@ object PriceStateUpdaterSuite extends MutableIOSuite {
   }
 
   test("existing token pair updates price record") { implicit h =>
-    val updater = PriceStateUpdater.make[IO](Dev, DefaultDelegatedRewardsConfigProvider)
+    val updater = PriceStateUpdater.make[IO](Dev, DefaultDelegatedRewardsConfigProvider, GlobalStateReader.empty[IO])
 
     for {
       currentPrice <- invPricingUpdate(10)
@@ -146,7 +147,7 @@ object PriceStateUpdaterSuite extends MutableIOSuite {
   }
 
   test("window change updates price record correctly") { implicit h =>
-    val updater = PriceStateUpdater.make[IO](Dev, DefaultDelegatedRewardsConfigProvider)
+    val updater = PriceStateUpdater.make[IO](Dev, DefaultDelegatedRewardsConfigProvider, GlobalStateReader.empty[IO])
 
     for {
       currentPrice <- invPricingUpdate(10)
@@ -176,7 +177,7 @@ object PriceStateUpdaterSuite extends MutableIOSuite {
       )
   }
 
-  test("mpt path: returns same deltas as legacy path when MPT state matches lastPriceState") { implicit h =>
+  test("materializePriceStateFromMpt: recovers prior records from the MPT") { implicit h =>
     val prior = PriceRecord(
       currentPrice = PricingUpdate(PriceFraction(DAG_USD, NonNegFraction.unsafeFrom(10, 1))),
       upcomingPrice = PricingUpdate(PriceFraction(DAG_USD, NonNegFraction.unsafeFrom(11, 1))),
@@ -185,7 +186,6 @@ object PriceStateUpdaterSuite extends MutableIOSuite {
       nextWindowChange = EpochProgress(NonNegLong(100)),
       updatedAt = EpochProgress(NonNegLong(10))
     )
-    val lastPriceState = SortedMap(DAG_USD -> prior)
 
     for {
       implicit0(js: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO]
@@ -194,17 +194,9 @@ object PriceStateUpdaterSuite extends MutableIOSuite {
       priorKey <- GlobalStateKey.priceStateKey[IO](DAG_USD)
       _ <- mptStore.insert[PriceRecord](priorKey, prior)
 
-      update <- pricingUpdate(20)
-      legacyUpdater = PriceStateUpdater.make[IO](Dev, DefaultDelegatedRewardsConfigProvider, Some(mptStore), shouldUseMptStore = false)
-      mptUpdater = PriceStateUpdater.make[IO](Dev, DefaultDelegatedRewardsConfigProvider, Some(mptStore), shouldUseMptStore = true)
-
-      legacyDeltas <- legacyUpdater.updatePriceState(lastPriceState, List(update), EpochProgress(NonNegLong(50)))
-      mptDeltas <- mptUpdater.updatePriceState(lastPriceState, List(update), EpochProgress(NonNegLong(50)))
-    } yield
-      expect.all(
-        legacyDeltas == mptDeltas,
-        legacyDeltas.keySet == Set(DAG_USD)
-      )
+      updater = PriceStateUpdater.make[IO](Dev, DefaultDelegatedRewardsConfigProvider, GlobalStateReader.fromMptStore(mptStore))
+      materialized <- updater.materializePriceStateFromMpt
+    } yield expect(materialized == SortedMap(DAG_USD -> prior))
   }
 
   private def pricingUpdate(n: Long): IO[PricingUpdate] =

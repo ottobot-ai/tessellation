@@ -149,8 +149,7 @@ object SharedServices {
       priceStateUpdater = PriceStateUpdater.make[F](
         cfg.environment,
         DefaultDelegatedRewardsConfigProvider,
-        Some(storages.mptStore),
-        shouldUseMptStore = false
+        io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(storages.mptStore)
       )
       globalSnapshotAcceptanceManager = GlobalSnapshotAcceptanceManager.make(
         cfg.fieldsAddedOrdinals,

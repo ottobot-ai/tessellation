@@ -342,7 +342,11 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
     val spendActionValidator = SpendActionValidator.make[IO]
 
     val pricingUpdateValidator = PricingUpdateValidator.make[IO](None, NonNegLong(0))
-    val priceStateUpdater = PriceStateUpdater.make(Dev, delegatedRewardsConfigProvider)
+    val priceStateUpdater = PriceStateUpdater.make[IO](
+      Dev,
+      delegatedRewardsConfigProvider,
+      io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.empty[IO]
+    )
 
     val feeCalculator = new SnapshotBinaryFeeCalculator[IO] {
       override def calculateFee(

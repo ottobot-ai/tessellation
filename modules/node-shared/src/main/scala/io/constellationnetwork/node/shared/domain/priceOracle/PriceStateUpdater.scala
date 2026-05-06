@@ -9,11 +9,11 @@ import scala.collection.immutable.SortedMap
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.node.shared.config.DelegatedRewardsConfigProvider
 import io.constellationnetwork.node.shared.config.types.EmissionConfigEntry
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema.NonNegFraction
 import io.constellationnetwork.schema.artifact.PricingUpdate
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.priceOracle.TokenPair.DAG_USD
 import io.constellationnetwork.schema.priceOracle.{PriceFraction, PriceRecord, TokenPair}
 import io.constellationnetwork.security.Hasher
@@ -46,8 +46,7 @@ object PriceStateUpdater {
   def make[F[_]: Async](
     environment: AppEnvironment,
     delegatedRewardsConfigProvider: DelegatedRewardsConfigProvider,
-    mptStore: Option[MptStore[F, GlobalStateKey]] = None,
-    shouldUseMptStore: Boolean = false
+    reader: GlobalStateReader[F]
   ): PriceStateUpdater[F] = new PriceStateUpdater[F] {
 
     override def updatePriceState(
@@ -65,35 +64,23 @@ object PriceStateUpdater {
             .toList
             .traverse {
               case (tokenPair, updates) =>
-                readPrior(tokenPair, lastPriceState).flatMap { prior =>
-                  aggregateUpdates(NonEmptyList.fromListUnsafe(updates)).flatMap { aggregated =>
-                    buildRecord(tokenPair, prior, aggregated, epochProgress, emissionConfig)
-                      .map(rec => (tokenPair, rec))
-                  }
+                val prior = lastPriceState.get(tokenPair)
+                aggregateUpdates(NonEmptyList.fromListUnsafe(updates)).flatMap { aggregated =>
+                  buildRecord(tokenPair, prior, aggregated, epochProgress, emissionConfig)
+                    .map(rec => (tokenPair, rec))
                 }
             }
             .map(_.toSortedMap)
         } yield deltas
       }
 
-    private def readPrior(
-      tokenPair: TokenPair,
-      lastPriceState: SortedMap[TokenPair, PriceRecord]
-    )(implicit hasher: Hasher[F]): F[Option[PriceRecord]] =
-      if (shouldUseMptStore) mptStore.fold(Option.empty[PriceRecord].pure[F])(_.getPriceRecord(tokenPair))
-      else lastPriceState.get(tokenPair).pure[F]
-
     override def materializePriceStateFromMpt(
       implicit hasher: Hasher[F]
     ): F[SortedMap[TokenPair, PriceRecord]] =
-      mptStore match {
-        case None => SortedMap.empty[TokenPair, PriceRecord].pure[F]
-        case Some(store) =>
-          for {
-            prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.PriceState)
-            entries <- store.getAllForPrefix[PriceRecord](prefix)
-          } yield SortedMap.from(entries.values.map(rec => rec.currentPrice.price.tokenPair -> rec))
-      }
+      for {
+        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.PriceState)
+        entries <- reader.getAllForPrefix[PriceRecord](prefix)
+      } yield SortedMap.from(entries.values.map(rec => rec.currentPrice.price.tokenPair -> rec))
 
     private def buildRecord(
       tokenPair: TokenPair,
