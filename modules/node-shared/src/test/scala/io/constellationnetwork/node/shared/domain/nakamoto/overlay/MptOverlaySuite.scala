@@ -497,6 +497,150 @@ object MptOverlaySuite extends MutableIOSuite {
       )
   }
 
+  // ----- allEntriesAsBytes branch-aware view -----
+
+  test("multi-branch: allEntriesAsBytes(branch) sees pending upserts that base does not") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+
+      keyBase = gskBalance(900)
+      keyPending = gskBalance(901)
+      _ <- store.insert[Balance](keyBase, Balance(NonNegLong(1L)))
+
+      handle <- overlay.checkout(parentP)
+      _ <- handle.insert[Balance](keyPending, Balance(NonNegLong(2L)))
+      _ <- overlay.commit(handle, branchA, ordinal)
+
+      hexBase <- GlobalStateKey.toHex[IO](keyBase)
+      hexPending <- GlobalStateKey.toHex[IO](keyPending)
+
+      // Branch view sees both base and pending.
+      branchBytes <- overlay.allEntriesAsBytes(branchA)
+      // Base bytes do NOT include the pending upsert (commit didn't fold to base under MultiBranch).
+      baseBytes <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        branchBytes.contains(hexBase),
+        branchBytes.contains(hexPending),
+        baseBytes.contains(hexBase),
+        !baseBytes.contains(hexPending)
+      )
+  }
+
+  test("multi-branch: allEntriesAsBytes(branch) hides keys removed by the chain") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+
+      keyKeep = gskBalance(910)
+      keyDrop = gskBalance(911)
+      _ <- store.insert[Balance](
+        Map[GlobalStateKey, Balance](
+          keyKeep -> Balance(NonNegLong(1L)),
+          keyDrop -> Balance(NonNegLong(2L))
+        )
+      )
+
+      handle <- overlay.checkout(parentP)
+      _ <- handle.remove(keyDrop)
+      _ <- overlay.commit(handle, branchA, ordinal)
+
+      hexKeep <- GlobalStateKey.toHex[IO](keyKeep)
+      hexDrop <- GlobalStateKey.toHex[IO](keyDrop)
+      branchBytes <- overlay.allEntriesAsBytes(branchA)
+      baseBytes <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        branchBytes.contains(hexKeep),
+        !branchBytes.contains(hexDrop), // chain removed it
+        baseBytes.contains(hexKeep),
+        baseBytes.contains(hexDrop) // base still has it (no fold yet)
+      )
+  }
+
+  test("multi-branch: allEntriesAsBytes(branch) preserves sibling isolation") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+
+      keyBase = gskBalance(920)
+      keyA = gskBalance(921)
+      keyB = gskBalance(922)
+      _ <- store.insert[Balance](keyBase, Balance(NonNegLong(1L)))
+
+      hA <- overlay.checkout(parentP)
+      _ <- hA.insert[Balance](keyA, Balance(NonNegLong(10L)))
+      _ <- overlay.commit(hA, branchA, ordinal)
+
+      hB <- overlay.checkout(parentP)
+      _ <- hB.insert[Balance](keyB, Balance(NonNegLong(20L)))
+      _ <- overlay.commit(hB, branchB, ordinal)
+
+      hexBase <- GlobalStateKey.toHex[IO](keyBase)
+      hexA <- GlobalStateKey.toHex[IO](keyA)
+      hexB <- GlobalStateKey.toHex[IO](keyB)
+      fromA <- overlay.allEntriesAsBytes(branchA)
+      fromB <- overlay.allEntriesAsBytes(branchB)
+    } yield
+      expect.all(
+        fromA.contains(hexBase),
+        fromA.contains(hexA),
+        !fromA.contains(hexB), // ← B's write not visible from A
+        fromB.contains(hexBase),
+        !fromB.contains(hexA), // ← A's write not visible from B
+        fromB.contains(hexB)
+      )
+  }
+
+  test("multi-branch: allEntriesAsBytes(unknownBranch) returns the base view (no chain)") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+      _ <- store.insert[Balance](gskBalance(930), Balance(NonNegLong(7L)))
+
+      // Commit a branch whose state should NOT be visible via an unrelated BranchId.
+      handle <- overlay.checkout(parentP)
+      _ <- handle.insert[Balance](gskBalance(931), Balance(NonNegLong(99L)))
+      _ <- overlay.commit(handle, branchA, ordinal)
+
+      // BranchId.base (Hash.empty) is not in pending — falls through to base.
+      baseView <- overlay.allEntriesAsBytes(BranchId.base)
+      directBase <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        baseView.keySet == directBase.keySet,
+        baseView.size == directBase.size
+      )
+  }
+
+  test("passthrough: allEntriesAsBytes ignores BranchId — returns underlying entries") { res =>
+    implicit val (h, _, js) = res
+    for {
+      store <- mkStore
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.Passthrough,
+        store,
+        pcTree,
+        GlobalStateKey.toHex[IO],
+        bestTipFn = IO.pure(none[BranchId])
+      )
+      _ <- store.insert[Balance](gskBalance(940), Balance(NonNegLong(3L)))
+      fromA <- overlay.allEntriesAsBytes(branchA)
+      fromB <- overlay.allEntriesAsBytes(branchB)
+      direct <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        fromA.keySet == direct.keySet,
+        fromB.keySet == direct.keySet
+      )
+  }
+
   // ----- buildRoot includes branch deltas -----
 
   test("multi-branch: buildRoot for sibling branches yields different root hashes") { res =>

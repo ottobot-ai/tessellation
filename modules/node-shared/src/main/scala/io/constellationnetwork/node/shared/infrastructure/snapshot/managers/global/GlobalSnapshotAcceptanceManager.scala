@@ -1372,10 +1372,10 @@ object GlobalSnapshotAcceptanceManager {
             // accumulator's delta to this map via the `toAccumulatorHexDelta` helper (a separate
             // encoder+merge path from the writer-algebra) and build an MPT via the Parallel
             // producer. If both paths agree on the post-state root, the writer is validated
-            // without needing `GlobalSnapshotInfo` as an intermediate. Read via `overlay.base`
-            // because the verify-replay cross-checks against the post-write base bytes; under
-            // `OverlayMode.Passthrough` this is the canonical store.
-            preSyncBytes <- overlay.base.allEntriesAsBytes
+            // without needing `GlobalSnapshotInfo` as an intermediate. Read at the parent-branch
+            // view so MultiBranch sees pending state from ancestor branches (under Passthrough this
+            // degenerates to `overlay.base.allEntriesAsBytes` since BranchId is ignored).
+            preSyncBytes <- overlay.allEntriesAsBytes(parentTip)
             // Temporary instrumentation (task #18): fingerprint of starting MPT bytes. Combined with
             // MPT_SYNC_FP above, gives us the two writer inputs (prev state + delta) for gl0/ml0 diff.
             // Map[Hex, Array[Byte]] needs sort + content-aware hash since Map order is non-deterministic

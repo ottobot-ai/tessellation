@@ -146,6 +146,14 @@ trait MptOverlay[F[_], K] {
     */
   def buildRoot(branch: BranchId, ordinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]]
 
+  /** Read all entries as raw `Map[Hex, Array[Byte]]` at a specific branch view. Multi-branch: composes base entries with the chain's
+    * accumulated upserts and removals (`mergedChain` walked leaf→root). Passthrough: ignores `branch`, delegates to
+    * `MptStore.allEntriesAsBytes`. Used by GSAM's verify-replay cross-check to obtain the parent-branch view bytes that the replay (`prev ⊖
+    * removes ⊕ upserts`) applies the delta on top of — under MultiBranch, reading raw `underlying.allEntriesAsBytes` is wrong because
+    * pending writes in the parent's chain aren't folded into base yet.
+    */
+  def allEntriesAsBytes(branch: BranchId): F[Map[Hex, Array[Byte]]]
+
   /** Finality sink (#56.6 wires the call site). Idempotent on `(ordinal, canonical)`. Errors loudly when called twice at the same `ordinal`
     * with different `canonical` hashes (depth-k vs attestation-2/3 disagreement during partition).
     *
@@ -253,6 +261,9 @@ object MptOverlay {
 
       def getAllForPrefix[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[Map[Hex, V]] =
         underlying.getAllForPrefix[V](prefix)
+
+      def allEntriesAsBytes(branch: BranchId): F[Map[Hex, Array[Byte]]] =
+        underlying.allEntriesAsBytes
 
       def buildRoot(branch: BranchId, ordinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
         underlying.build(ordinal)
@@ -491,6 +502,13 @@ object MptOverlay {
                   .map(t => Right(t): Either[MerklePatriciaError, MerklePatriciaTrie])
             }
         }
+
+      def allEntriesAsBytes(branch: BranchId): F[Map[Hex, Array[Byte]]] =
+        for {
+          baseEntries <- underlying.allEntriesAsBytes
+          pending <- pendingRef.get
+          merged = mergedChain(branch, pending)
+        } yield (baseEntries -- merged.removals) ++ merged.upserts
 
       def finalizeBranch(canonical: BranchId, ordinal: SnapshotOrdinal): F[FinalizationOutcome] =
         mutex.permit.use { _ =>
