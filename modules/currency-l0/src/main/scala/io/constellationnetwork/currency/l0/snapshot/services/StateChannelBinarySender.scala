@@ -193,13 +193,41 @@ object StateChannelBinarySender {
       // onlyPossibleReferences resolve chain gaps — if the oldest can't be
       // placed, newer binaries that chain from something GL0 has can still
       // land, unstranding the queue.
+      //
+      // Implementation note (#113): the previous version called
+      // `tracker.getPendingToRetry(effectiveCap)` which uses `take(cap)` —
+      // returning the OLDEST `cap` entries, the opposite of the documented
+      // "oldest + 2 newer" intent. Under MultiBranch, when ml0 misses a gl0
+      // ordinal that confirms a binary (e.g. fork-recovery aftermath where
+      // ml0 jumps ords via setForRecovery), the retry strategy drops cap to
+      // 0 and only resends the oldest 3 binaries forever — none of which
+      // chain-link from gl0's stored `lastStateChannelSnapshotHash`. The
+      // queue strands. Fixed by mixing oldest 1 + newest (effectiveCap-1)
+      // so a recently-built binary that chains from a confirmed predecessor
+      // gets through and unblocks the chain, even if the oldest is
+      // permanently stuck on a stale parent.
       val siblingBatchSize = 3
       val effectiveCap = Math.max(cap, siblingBatchSize)
-      tracker.getPendingToRetry(effectiveCap).flatMap { toRetry =>
-        val sorted = toRetry.sortBy(_.currencySnapshotOrdinal.value.value)
-        if (sorted.nonEmpty) {
-          logger.info(s"[RetryMode] Processing ${sorted.size} binaries (cap=$cap, effectiveCap=$effectiveCap)") >>
-            sorted.traverse_(p => sendBinaryInBackground(p, signers))
+      // Fetch a generous window then mix oldest + newest. We use
+      // `effectiveCap * 16` as a heuristic upper bound — enough to capture
+      // the queue's true newest entries even when ml0 is far ahead of gl0,
+      // while avoiding allocating the entire tracker.
+      tracker.getPendingToRetry(effectiveCap * 16).flatMap { allPending =>
+        val sortedAsc = allPending.sortBy(_.currencySnapshotOrdinal.value.value)
+        val toRetry =
+          if (sortedAsc.size <= effectiveCap) sortedAsc
+          else {
+            // Take 1 oldest + (effectiveCap - 1) newest, dedup by hash.
+            val oldest = sortedAsc.take(1)
+            val newest = sortedAsc.takeRight(effectiveCap - 1)
+            (oldest ++ newest).distinct
+          }
+        if (toRetry.nonEmpty) {
+          logger.info(
+            s"[RetryMode] Processing ${toRetry.size} binaries (cap=$cap, effectiveCap=$effectiveCap, " +
+              s"mix=oldest+newest, totalPending=${allPending.size})"
+          ) >>
+            toRetry.traverse_(p => sendBinaryInBackground(p, signers))
         } else {
           Applicative[F].unit
         }
