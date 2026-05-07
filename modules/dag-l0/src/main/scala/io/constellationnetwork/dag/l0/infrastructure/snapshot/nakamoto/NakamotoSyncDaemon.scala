@@ -134,6 +134,7 @@ object NakamotoSyncDaemon {
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     productionGate: ProductionGate[F],
     mptStore: MptStore[F, GlobalStateKey],
+    mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
@@ -174,6 +175,7 @@ object NakamotoSyncDaemon {
               lastNGlobalSnapshotStorage,
               productionGate,
               mptStore,
+              mptOverlay,
               eventMempool,
               chainSyncManager,
               channel,
@@ -216,6 +218,7 @@ object NakamotoSyncDaemon {
     snapshotSemaphore: Semaphore[F],
     productionGate: ProductionGate[F],
     mptStore: MptStore[F, GlobalStateKey],
+    mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     dataDir: java.nio.file.Path,
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
@@ -287,6 +290,7 @@ object NakamotoSyncDaemon {
                                 lastNGlobalSnapshotStorage,
                                 productionGate,
                                 mptStore,
+                                mptOverlay,
                                 eventMempool,
                                 csm,
                                 channel,
@@ -372,6 +376,7 @@ object NakamotoSyncDaemon {
                                     lastNGlobalSnapshotStorage,
                                     productionGate,
                                     mptStore,
+                                    mptOverlay,
                                     eventMempool,
                                     chainSyncManager,
                                     channel,
@@ -438,6 +443,7 @@ object NakamotoSyncDaemon {
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     productionGate: ProductionGate[F],
     mptStore: MptStore[F, GlobalStateKey],
+    mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
@@ -562,7 +568,8 @@ object NakamotoSyncDaemon {
                         case None => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
                       }
                   }
-                }
+                },
+                mptOverlay = mptOverlay
               )
             case None =>
               // Parent not in chain store. Three-tier gap handling:
@@ -705,6 +712,7 @@ object NakamotoSyncDaemon {
               lastNGlobalSnapshotStorage,
               productionGate,
               mptStore,
+              mptOverlay,
               eventMempool,
               chainSyncManager,
               channel,

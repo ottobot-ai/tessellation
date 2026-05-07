@@ -62,19 +62,31 @@ object SharedStorages {
       // overlay anyway in #56.10's scope.
       bestTipFnRef <- Ref.of[F, F[Option[BranchId]]](none[BranchId].pure[F])
       mptOverlay <- MptOverlay.make[F, GlobalStateKey](
-        // Stays on `Passthrough` until two MultiBranch prerequisites land:
-        //   1. `accept()` threads the child snapshot hash so `overlay.commit(handle, snapshotHash, ordinal)`
-        //      registers under a real childTip (not the self-loop `parentTip == childTip` Phase D used as a
-        //      transient stub — under MultiBranch that creates a self-loop in `pendingRef` because every
-        //      commit overrides the entry at `parentTip` with `BranchEntry(parent = parentTip, ...)`).
-        //   2. `builder.buildProof`'s global `mptRoot` derivation reads through `overlay.buildRoot(branch, ordinal)`
-        //      instead of `producer.getRootHashForOrdinal` — under MultiBranch the producer has no per-ordinal
-        //      commit until `finalizeBranch.foldIntoBase`, so producer-derived roots are stale until then.
-        // Brief flip 2026-05-06 reverted after `delegated_staking` failure surfaced the verify-replay
-        // divergence at ordinal=2 (gl0-run.log: `mptConsistency=DIVERGED incremental=d8d6 replay=db16`).
-        // `allEntriesAsBytes(branch)` (added in the same session) is the foundational read API the Phase J
-        // refactor will use; eviction's `bestTipFn` is already wired and ready.
-        mode = MptOverlay.OverlayMode.Passthrough,
+        // Phase J landed two of three prerequisites for MultiBranch:
+        //   1. ✅ `overlay.commit(handle, BranchId(snapshotHash), ordinal)` is now called by the proposer
+        //      (`GlobalSnapshotConsensusFunctions` after `globalSnapshot` is hashed) and the follower
+        //      (`GlobalSnapshotContextFunctions` after state-proof verification passes), each using the
+        //      resulting artifact's hash as the real `childTip` — no more self-loop in `pendingRef`.
+        //   2. ✅ `accept()` derives the proof's global `mptRoot` from `overlay.allEntriesAsBytesWithHandle`
+        //      (post-write byte view including handle's pending writes) via `mptStateProofFromBytes`,
+        //      not `producer.getRootHashForOrdinal` — correct under MultiBranch where the producer has
+        //      no per-ordinal commit until `finalizeBranch.foldIntoBase`.
+        //   3. ❌ Per-manager prior reads route through a branch-aware reader (`GlobalStateReader.dynamic`
+        //      bound to a `Ref[BranchId]` set at accept() top), AND the 3 direct `mptStore.getAllX` calls
+        //      in GSAM accept() now use the branch-aware `mpt` (AcceptanceMpt). Both compile clean and
+        //      the parity gate (#107) + GSAM unit suite (67 tests) pass under both modes.
+        //
+        // PENDING for MultiBranch flip: e2e #3 (2026-05-06 evening) still surfaces follower mptRoot
+        // mismatches at low ordinals. gl1 (Global L1 follower) computes mptRoot=0b45d762698c at ord=3
+        // (with `gsi.currSnapshots=1`, correctly carrying ord-2's currency snapshots forward), while
+        // gl0's leader-claimed mptRoot=56ad37cf069a corresponds to `gsi.currSnapshots=0`. Both nodes
+        // run identical accept() with the same inputs, so the divergence implies one of the per-call
+        // overlay paths is missing the parent-branch's pending writes despite the reader fix. Likely
+        // suspects: (a) leader runs createProposalArtifact AND createContext per ord — second commit
+        // overwrites first, but if the second runs against a stale `branchTipRef.get` we'd see the
+        // observed pattern; (b) the createContext path on the leader may diverge from the follower's
+        // path despite identical algebra. Needs more investigation before re-flipping.
+        mode = MptOverlay.OverlayMode.productionDefault,
         underlying = mptStore,
         pcTree = mptOverlayParentChildTree,
         toHex = GlobalStateKey.toHex[F],

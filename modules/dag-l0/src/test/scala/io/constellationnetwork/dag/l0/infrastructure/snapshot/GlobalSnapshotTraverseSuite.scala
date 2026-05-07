@@ -424,7 +424,7 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
       mptOverlay = io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
         .passthrough[IO, GlobalStateKey](mptStore, pcTreeForOverlay)
 
-      snapshotAcceptanceManager = GlobalSnapshotAcceptanceManager
+      snapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager
         .make[IO](
           FieldsAddedOrdinals(Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty),
           MetagraphsSyncConfig(PosInt(100)),
@@ -451,7 +451,8 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
         SnapshotOrdinal.MinValue,
         SnapshotOrdinal.MinValue,
         mptStore,
-        SnapshotOrdinal.MinValue
+        SnapshotOrdinal.MinValue,
+        mptOverlay
       )
       lastNSnapshotStorage =
         LastNGlobalSnapshotStorage.make[IO](lastGlobalSnapshotsSyncConfig, lastNSnapR, incLastNSnapR)

@@ -366,7 +366,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       mptOverlay = io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
         .passthrough[IO, GlobalStateKey](mptStore, pcTree)
       dbLogger <- Slf4jLoggerBundle.makeUnsafe[IO]
-      snapshotAcceptanceManager = GlobalSnapshotAcceptanceManager
+      snapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager
         .make[IO](
           FieldsAddedOrdinals(
             Map.empty,
@@ -412,7 +412,8 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           SnapshotOrdinal.MinValue,
           SnapshotOrdinal.MinValue,
           SnapshotOrdinal.MinValue,
-          mptStore
+          mptStore,
+          mptOverlay
         )
     } yield globalSnapshotConsensusFunction
   }

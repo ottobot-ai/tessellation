@@ -259,50 +259,52 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
               mptOverlay = io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
                 .passthrough[IO, GlobalStateKey](mptStore, mptOverlayParentChildTree)
 
-              globalSnapshotAcceptanceManager = {
+              globalSnapshotAcceptanceManager <- {
                 // LegacyFormat for all ordinals in this suite — test snapshots carry
                 // `mptRoot = None`, so accept() must also produce proofs without mptRoot
                 // to match on peer-claimed state-proof verification. Inner test blocks
                 // that override this do so only for unrelated inner assertions.
                 implicit val testGlobalStateProofSelector: GlobalStateProofSelector =
                   GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
-                GlobalSnapshotAcceptanceManager.make(
-                  FieldsAddedOrdinals(
-                    Map.empty,
-                    Map.empty,
-                    Map.empty,
-                    Map.empty,
-                    Map.empty,
-                    Map.empty,
-                    Map.empty,
-                    Map.empty,
-                    Map.empty,
-                    Map.empty
-                  ),
-                  MetagraphsSyncConfig(PosInt(100)),
-                  Dev,
-                  BlockAcceptanceManager.make[IO](validators.blockValidator, Hasher.forKryo[IO]),
-                  AllowSpendBlockAcceptanceManager.make[IO](validators.allowSpendBlockValidator),
-                  TokenLockBlockAcceptanceManager.make[IO](validators.tokenLockBlockValidator),
-                  GlobalSnapshotStateChannelEventsProcessor
-                    .make[IO](
-                      validators.stateChannelValidator,
-                      globalSnapshotStateChannelManager,
-                      currencySnapshotContextFns,
-                      feeCalculator,
-                      io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
+                GlobalSnapshotAcceptanceManager
+                  .make(
+                    FieldsAddedOrdinals(
+                      Map.empty,
+                      Map.empty,
+                      Map.empty,
+                      Map.empty,
+                      Map.empty,
+                      Map.empty,
+                      Map.empty,
+                      Map.empty,
+                      Map.empty,
+                      Map.empty
                     ),
-                  updateNodeParametersAcceptanceManager,
-                  updateDelegatedStakeAcceptanceManager,
-                  updateNodeCollateralAcceptanceManager,
-                  validators.spendActionValidator,
-                  validators.pricingUpdateValidator,
-                  priceStateUpdater,
-                  Amount(0L),
-                  EpochProgress(NonNegLong(136080L)),
-                  mptOverlay,
-                  dbLogger
-                )
+                    MetagraphsSyncConfig(PosInt(100)),
+                    Dev,
+                    BlockAcceptanceManager.make[IO](validators.blockValidator, Hasher.forKryo[IO]),
+                    AllowSpendBlockAcceptanceManager.make[IO](validators.allowSpendBlockValidator),
+                    TokenLockBlockAcceptanceManager.make[IO](validators.tokenLockBlockValidator),
+                    GlobalSnapshotStateChannelEventsProcessor
+                      .make[IO](
+                        validators.stateChannelValidator,
+                        globalSnapshotStateChannelManager,
+                        currencySnapshotContextFns,
+                        feeCalculator,
+                        io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
+                      ),
+                    updateNodeParametersAcceptanceManager,
+                    updateDelegatedStakeAcceptanceManager,
+                    updateNodeCollateralAcceptanceManager,
+                    validators.spendActionValidator,
+                    validators.pricingUpdateValidator,
+                    priceStateUpdater,
+                    Amount(0L),
+                    EpochProgress(NonNegLong(136080L)),
+                    mptOverlay,
+                    dbLogger
+                  )
+                  .asResource
               }
               globalSnapshotContextFns = {
                 // LegacyFormat for all ordinals in this suite — test snapshots carry
@@ -318,7 +320,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                   SnapshotOrdinal.MinValue,
                   SnapshotOrdinal.MinValue,
                   mptStore,
-                  SnapshotOrdinal.MinValue
+                  SnapshotOrdinal.MinValue,
+                  mptOverlay
                 )
               }
               snapshotProcessor = {

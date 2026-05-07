@@ -190,8 +190,8 @@ object GlobalSnapshotConsensus {
           }
       }
 
-      snapshotAcceptanceManager =
-        GlobalSnapshotAcceptanceManager.make(
+      snapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager
+        .make[F](
           sharedCfg.fieldsAddedOrdinals,
           sharedCfg.metagraphsSync,
           sharedCfg.environment,
@@ -217,6 +217,7 @@ object GlobalSnapshotConsensus {
           mptOverlay,
           loggerBundle
         )
+        .toResource
 
       consensusStorage <- ConsensusStorage
         .make[
@@ -249,7 +250,8 @@ object GlobalSnapshotConsensus {
             .getOrElse(sharedCfg.environment, SnapshotOrdinal.MinValue),
           sharedCfg.incrementalDelegatedStakingStartingOrdinal
             .getOrElse(sharedCfg.environment, SnapshotOrdinal.MinValue),
-          mptStore
+          mptStore,
+          mptOverlay
         )
 
       stateAdvancer =
@@ -653,6 +655,7 @@ object GlobalSnapshotConsensus {
                   snapshotSemaphore = snapshotSemaphore,
                   productionGate = productionGate,
                   mptStore = mptStore,
+                  mptOverlay = mptOverlay,
                   eventMempool = eventMempool,
                   dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data")),
                   processMetagraphBinary = processMetagraphBinary,

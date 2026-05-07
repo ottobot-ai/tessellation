@@ -302,6 +302,33 @@ object GlobalStateKey {
       serialized = networkPart + fieldPart + contractPart + userPart
     } yield Hex(serialized)
 
+  /** Inverse of `toHex` over the network-namespace + fieldPart prefix only. Reads the keyType byte at offset 0, skips the namespace's hash
+    * payload (none for `PKTHypergraph`, 64 hex chars for the hashed types) and parses the next 8 hex chars as a fieldId integer. Returns
+    * `None` if the hex is malformed or the integer doesn't resolve to a `GlobalStateFieldId`. Used by overlay-derived per-field root
+    * construction (#56.10 Phase J), which has hex-keyed bytes instead of typed `GlobalStateKey`s and needs to group by `fieldId` without
+    * round-tripping through `GlobalStateKey`.
+    */
+  def fieldIdFromHex(hex: Hex): Option[GlobalStateFieldId] = {
+    val s = hex.value
+    if (s.length < 2) None
+    else {
+      val keyTypeOffset = 2
+      // PKTHypergraph (0x00) carries no hash — fieldPart is at offset 2.
+      // PKTAddress / PKTHash / PKTSystem all carry a 32-byte hash → 64 hex chars → fieldPart at offset 2 + 64.
+      val fieldStart = s.substring(0, keyTypeOffset) match {
+        case "00" => keyTypeOffset
+        case _    => keyTypeOffset + 64
+      }
+      val fieldEnd = fieldStart + 8
+      if (s.length < fieldEnd) None
+      else
+        scala.util
+          .Try(java.lang.Integer.parseInt(s.substring(fieldStart, fieldEnd), 16))
+          .toOption
+          .flatMap(GlobalStateFieldId.fromInt)
+    }
+  }
+
   /** Hex prefix matching every key in the hypergraph network for the given `fieldId`, optionally scoped to a specific contract address.
     * Pair with `MptStore.getAllForPrefix` to materialize a per-field view without an external address set.
     *

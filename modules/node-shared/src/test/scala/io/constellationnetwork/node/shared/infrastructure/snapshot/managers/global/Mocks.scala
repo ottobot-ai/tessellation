@@ -289,8 +289,7 @@ object Mocks {
                 pcTree <- io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree.make[IO]
                 overlay = io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
                   .passthrough[IO, GlobalStateKey](mptStore, pcTree)
-              } yield
-                GlobalSnapshotAcceptanceManager
+                mgr <- GlobalSnapshotAcceptanceManager
                   .make[IO](
                     FieldsAddedOrdinals(
                       Map.empty,
@@ -321,6 +320,7 @@ object Mocks {
                     loggerBundle = loggerBundle,
                     overlay = overlay
                   )
+              } yield mgr
             }
         }
       }

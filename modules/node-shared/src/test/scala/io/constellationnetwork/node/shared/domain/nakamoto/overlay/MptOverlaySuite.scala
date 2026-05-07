@@ -641,6 +641,112 @@ object MptOverlaySuite extends MutableIOSuite {
       )
   }
 
+  test("passthrough: allEntriesAsBytesWithHandle delegates to underlying.allEntriesAsBytes") { res =>
+    implicit val (h, _, js) = res
+    for {
+      store <- mkStore
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.Passthrough,
+        store,
+        pcTree,
+        GlobalStateKey.toHex[IO],
+        bestTipFn = IO.pure(none[BranchId])
+      )
+      keyBase = gskBalance(942)
+      keyHandle = gskBalance(943)
+      _ <- store.insert[Balance](keyBase, Balance(NonNegLong(1L)))
+      hexBase <- GlobalStateKey.toHex[IO](keyBase)
+      hexHandle <- GlobalStateKey.toHex[IO](keyHandle)
+
+      // Under Passthrough handle.insert writes straight to the store, so the post-write view
+      // already includes the new key — both before and after we sample via `allEntriesAsBytesWithHandle`.
+      handle <- overlay.checkout(parentP)
+      _ <- handle.insert[Balance](keyHandle, Balance(NonNegLong(2L)))
+      view <- overlay.allEntriesAsBytesWithHandle(handle, ordinal)
+      direct <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        view.keySet == direct.keySet,
+        view.contains(hexBase),
+        view.contains(hexHandle)
+      )
+  }
+
+  test("multi-branch: allEntriesAsBytesWithHandle composes base + parent chain + handle accumulator") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+
+      keyBase = gskBalance(944)
+      keyParentBranch = gskBalance(945)
+      keyHandle = gskBalance(946)
+
+      _ <- store.insert[Balance](keyBase, Balance(NonNegLong(1L)))
+
+      // Commit a parent branch under `branchA` so a child checkout against `branchA` will
+      // see its writes through `mergedChain`.
+      parentHandle <- overlay.checkout(parentP)
+      _ <- parentHandle.insert[Balance](keyParentBranch, Balance(NonNegLong(2L)))
+      _ <- overlay.commit(parentHandle, branchA, ordinal)
+
+      // Child checkout against `branchA`, accumulate one more pending write.
+      childHandle <- overlay.checkout(branchA)
+      _ <- childHandle.insert[Balance](keyHandle, Balance(NonNegLong(3L)))
+
+      hexBase <- GlobalStateKey.toHex[IO](keyBase)
+      hexParentBranch <- GlobalStateKey.toHex[IO](keyParentBranch)
+      hexHandle <- GlobalStateKey.toHex[IO](keyHandle)
+
+      // The post-write view at the child handle should include all three:
+      // (a) base, (b) parent-branch's committed entry, (c) handle's still-uncommitted entry.
+      view <- overlay.allEntriesAsBytesWithHandle(childHandle, ordinal)
+
+      // Base is unchanged — handle is uncommitted; parent-branch was committed but lives in
+      // pendingRef under MultiBranch, not folded to base.
+      directBase <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        view.contains(hexBase),
+        view.contains(hexParentBranch),
+        view.contains(hexHandle),
+        directBase.contains(hexBase),
+        !directBase.contains(hexParentBranch),
+        !directBase.contains(hexHandle)
+      )
+  }
+
+  test("multi-branch: allEntriesAsBytesWithHandle hides keys the handle removed") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+
+      keyKeep = gskBalance(947)
+      keyDrop = gskBalance(948)
+
+      _ <- store.insert[Balance](
+        Map[GlobalStateKey, Balance](
+          keyKeep -> Balance(NonNegLong(10L)),
+          keyDrop -> Balance(NonNegLong(20L))
+        )
+      )
+
+      handle <- overlay.checkout(parentP)
+      _ <- handle.remove(keyDrop)
+
+      hexKeep <- GlobalStateKey.toHex[IO](keyKeep)
+      hexDrop <- GlobalStateKey.toHex[IO](keyDrop)
+
+      view <- overlay.allEntriesAsBytesWithHandle(handle, ordinal)
+    } yield
+      expect.all(
+        view.contains(hexKeep),
+        !view.contains(hexDrop)
+      )
+  }
+
   // ----- buildRoot includes branch deltas -----
 
   test("multi-branch: buildRoot for sibling branches yields different root hashes") { res =>

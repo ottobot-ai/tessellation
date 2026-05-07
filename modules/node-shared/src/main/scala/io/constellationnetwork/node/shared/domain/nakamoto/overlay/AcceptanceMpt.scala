@@ -29,6 +29,39 @@ object GlobalStateReader {
     def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] = store.getAllForPrefix[V](prefix)
   }
 
+  /** Branch-aware reader bound to a specific `parent`. Routes every read to `overlay.get(parent, ...)`, so under MultiBranch the
+    * prior-state view picks up parent-branch entries that haven't yet been folded into the underlying base. Used by the per-manager
+    * prior-state lookups inside `accept()`, where reading at `parentTip` (not `overlay.base`) is what makes a child snapshot see its
+    * parent's pending writes (#56.10 Phase J).
+    */
+  def fromOverlay[F[_]: cats.Monad](
+    overlay: MptOverlay[F, GlobalStateKey],
+    parent: BranchId
+  ): GlobalStateReader[F] = dynamic[F](overlay, cats.Applicative[F].pure(parent))
+
+  /** Branch-aware reader whose `parent` is read from `currentParent` on every call. Lets a manager constructed once at GSAM `make` stay
+    * valid across many `accept()` calls — each call rebinds the reader's view by writing to a `Ref[F, BranchId]` whose `.get` is wired in
+    * here. Caller MUST serialize accept() (consensus FSM + snapshot semaphore both do this); a parallel writer would race the Ref. Under
+    * Passthrough the BranchId is ignored on every read, so this collapses to base-equivalent reads.
+    */
+  def dynamic[F[_]: cats.Monad](
+    overlay: MptOverlay[F, GlobalStateKey],
+    currentParent: F[BranchId]
+  ): GlobalStateReader[F] = new GlobalStateReader[F] {
+    import cats.syntax.flatMap._
+    import cats.syntax.functor._
+    def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]] =
+      currentParent.flatMap(p => overlay.get[V](p, key))
+    def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]] =
+      if (keys.isEmpty) cats.Applicative[F].pure(Map.empty)
+      else
+        currentParent.flatMap { p =>
+          cats.Traverse[List].traverse(keys)(k => overlay.get[V](p, k).map(_.map(k -> _))).map(_.flatten.toMap)
+        }
+    def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] =
+      currentParent.flatMap(p => overlay.getAllForPrefix[V](p, prefix))
+  }
+
   /** Empty reader that always returns no values. Used by tests / wirings where no MPT is available — equivalent to "no prior state". */
   def empty[F[_]: cats.Applicative]: GlobalStateReader[F] = new GlobalStateReader[F] {
     def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]] = cats.Applicative[F].pure(None)

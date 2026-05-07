@@ -151,7 +151,7 @@ object SharedServices {
         DefaultDelegatedRewardsConfigProvider,
         io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(storages.mptStore)
       )
-      globalSnapshotAcceptanceManager = GlobalSnapshotAcceptanceManager.make(
+      globalSnapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager.make(
         cfg.fieldsAddedOrdinals,
         cfg.metagraphsSync,
         cfg.environment,
@@ -185,7 +185,8 @@ object SharedServices {
         cfg.fieldsAddedOrdinals.tessellation3Migration.getOrElse(cfg.environment, SnapshotOrdinal.MinValue),
         cfg.fieldsAddedOrdinals.setSumFix.getOrElse(cfg.environment, SnapshotOrdinal.MinValue),
         storages.mptStore,
-        cfg.incrementalDelegatedStakingStartingOrdinal.getOrElse(cfg.environment, SnapshotOrdinal.MinValue)
+        cfg.incrementalDelegatedStakingStartingOrdinal.getOrElse(cfg.environment, SnapshotOrdinal.MinValue),
+        storages.mptOverlay
       )
     } yield
       new SharedServices[F, A](

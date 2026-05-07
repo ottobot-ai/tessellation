@@ -80,7 +80,8 @@ object GlobalSnapshotConsensusFunctions {
     v3MigrationOrdinal: SnapshotOrdinal,
     setSumFixOrdinal: SnapshotOrdinal,
     incrementalDelegatedStakingStartingOrdinal: SnapshotOrdinal,
-    mptStore: MptStore[F, GlobalStateKey]
+    mptStore: MptStore[F, GlobalStateKey],
+    overlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey]
   ): GlobalSnapshotConsensusFunctions[F] = new GlobalSnapshotConsensusFunctions[F] {
 
     private val logger = Slf4jLogger.getLoggerFromClass[F](getClass)
@@ -389,7 +390,8 @@ object GlobalSnapshotConsensusFunctions {
           spendActions,
           updateNodeParameters,
           sharedArtifacts,
-          delegatorRewardsMap
+          delegatorRewardsMap,
+          overlayHandle
         ) <-
           globalSnapshotAcceptanceManager
             .accept(
@@ -491,6 +493,17 @@ object GlobalSnapshotConsensusFunctions {
           acceptedDelegatedStakeWithdrawals.some,
           acceptedNnodeCollateralCreates.some,
           acceptedNnodeCollateralWithdrawals.some
+        )
+        // Phase J: commit the overlay handle once the artifact is built and we have the snapshot's
+        // hash to use as the branch's `childTip`. Under MultiBranch this registers `currentSnapshotHash`
+        // as a new branch in `pendingRef` (parent → this hash) so child snapshots can `checkout` against
+        // it; under Passthrough this is a no-op (writes already committed inline). Failing to commit
+        // here would leak the handle's accumulator (MultiBranch eviction would never see it).
+        currentSnapshotHash <- hasher.hash(globalSnapshot)
+        _ <- overlay.commit(
+          overlayHandle,
+          io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(currentSnapshotHash),
+          currentOrdinal
         )
         returnedEvents = returnedSCEvents.map(StateChannelEvent(_)) ++ returnedDAGEvents
         _ <- ConsensusLog.info(

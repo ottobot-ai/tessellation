@@ -11,8 +11,8 @@ import org.typelevel.log4cats.Logger
 
 /** Startup base-consistency guard (#56.10 Phase H).
   *
-  * On node start, before serving any requests, assert that the on-disk MPT base ordinal is `≤` `chainStore`'s finalized head. A base that is
-  * AHEAD of finalized indicates a crash mid-fold-forward (e.g. the trie's deltas were persisted but the chain store hadn't recorded the
+  * On node start, before serving any requests, assert that the on-disk MPT base ordinal is `≤` `chainStore`'s finalized head. A base that
+  * is AHEAD of finalized indicates a crash mid-fold-forward (e.g. the trie's deltas were persisted but the chain store hadn't recorded the
   * matching finality yet). Recover by pruning the trie back to `finalized` via `MptStore.deleteAbove`. If pruning isn't applicable (e.g.
   * `chainStore.lastFinalizedOrdinal == 0` while MPT base is non-empty — fresh node with stale `mpt-data/`), fail loudly with a clear
   * operator-actionable error rather than silently rebuilding.

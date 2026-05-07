@@ -131,6 +131,26 @@ trait MptOverlay[F[_], K] {
     */
   def commit(branch: BranchHandle[F, K], childTip: BranchId, ordinal: SnapshotOrdinal): F[Unit]
 
+  /** Re-key a previously-committed pending branch from `oldChildTip` to `newChildTip`. Used by the Nakamoto leader path: `accept()` /
+    * `createProposalArtifact` commits the handle at `hash(rawArtifact)` (the artifact returned by the acceptance pipeline). The leader then
+    * mutates the artifact (`copy(slotCertificate = Some(cert), eta = Some(eta))`) before signing and persisting; the chain's canonical
+    * reference for ordinal N is the with-cert hash, but the overlay branch is keyed by the pre-cert hash. Without rekeying, ordinal N+1's
+    * `checkout(BranchId(getLastArtifactHash))` fails to find the parent and falls through to base, missing N's pending writes — surfaces as
+    * `priorLastCurrencySnapshots`-empty divergence. Multi-branch: looks up the entry under `oldChildTip`; if found, removes it and inserts
+    * at `newChildTip` (preserving `parent`, `changes`, `ordinal`); also associates `newChildTip → entry.parent` in `parentChildTree`.
+    * Passthrough: no-op (no `pendingRef`).
+    *
+    * Idempotent: if `oldChildTip` is not present (already rekeyed or never registered) and `newChildTip` is not present, this is a no-op.
+    */
+  def rekey(oldChildTip: BranchId, newChildTip: BranchId): F[Unit]
+
+  /** Drop a previously-committed pending branch. Used by the Nakamoto leader path when production is abandoned (gate closed before sign or
+    * `chainStore.store` refused) — the rawArtifact's branch was committed inside `createProposalArtifact` but the snapshot will never reach
+    * the chain, so the `pendingRef` entry is garbage. Multi-branch: removes from `pendingRef` (parent-child tree edges remain — they're
+    * pure topology and don't affect reads). Passthrough: no-op. Idempotent: missing branch is fine.
+    */
+  def discardBranch(branchId: BranchId): F[Unit]
+
   /** Read at a specific branch view. Multi-branch: walks `branch → ... → base` through the pending-branches map, returning the first delta
     * hit (upsert or removal); falls through to `MptStore.get` on miss. Passthrough: ignores `branch`, delegates to `MptStore.get`.
     */
@@ -153,6 +173,18 @@ trait MptOverlay[F[_], K] {
     * pending writes in the parent's chain aren't folded into base yet.
     */
   def allEntriesAsBytes(branch: BranchId): F[Map[Hex, Array[Byte]]]
+
+  /** Read all entries as raw `Map[Hex, Array[Byte]]` including a checked-out handle's pending writes (i.e. the post-write view BEFORE
+    * `commit` registers them in the overlay). Multi-branch: equivalent to `allEntriesAsBytes(handle.parent)` merged with handle's
+    * accumulator. Passthrough: handle writes have already landed in `underlying` (no accumulator), so this delegates to
+    * `MptStore.allEntriesAsBytes`.
+    *
+    * Used by GSAM's proof construction (Phase J): the `mptRoot` baked into the snapshot's `GlobalSnapshotStateProof` must reflect the
+    * post-write state — under MultiBranch, that means base + parent chain + the handle's accumulated `ChangeSet`. The legacy
+    * `producer.getRootHashForOrdinal` path goes stale under MultiBranch because the producer has no per-ordinal commit until
+    * `finalizeBranch.foldIntoBase`.
+    */
+  def allEntriesAsBytesWithHandle(handle: BranchHandle[F, K], ordinal: SnapshotOrdinal): F[Map[Hex, Array[Byte]]]
 
   /** Finality sink (#56.6 wires the call site). Idempotent on `(ordinal, canonical)`. Errors loudly when called twice at the same `ordinal`
     * with different `canonical` hashes (depth-k vs attestation-2/3 disagreement during partition).
@@ -256,6 +288,16 @@ object MptOverlay {
             else pcTree.associate(childTip.value, branch.parent.value)
         } yield ()
 
+      def rekey(oldChildTip: BranchId, newChildTip: BranchId): F[Unit] =
+        // Passthrough has no `pendingRef` — writes already landed in `underlying`. The rekey is a no-op.
+        Async[F].unit
+
+      def discardBranch(branchId: BranchId): F[Unit] =
+        // Passthrough has no `pendingRef` — writes already landed in `underlying`. Discard is a no-op
+        // here; correctness for abandoned proposals depends on the caller's `mptStore.withTransaction`
+        // wrapper rolling back the underlying writes via savepoint, which is independent of this call.
+        Async[F].unit
+
       def get[V: ImmutableCodec](branch: BranchId, key: K): F[Option[V]] =
         underlying.get(key)
 
@@ -263,6 +305,10 @@ object MptOverlay {
         underlying.getAllForPrefix[V](prefix)
 
       def allEntriesAsBytes(branch: BranchId): F[Map[Hex, Array[Byte]]] =
+        underlying.allEntriesAsBytes
+
+      def allEntriesAsBytesWithHandle(handle: BranchHandle[F, K], ordinal: SnapshotOrdinal): F[Map[Hex, Array[Byte]]] =
+        // Passthrough: handle writes already landed in `underlying` (PassthroughHandle delegates directly).
         underlying.allEntriesAsBytes
 
       def buildRoot(branch: BranchId, ordinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
@@ -434,6 +480,31 @@ object MptOverlay {
         }
       }
 
+      def rekey(oldChildTip: BranchId, newChildTip: BranchId): F[Unit] =
+        if (oldChildTip.value === newChildTip.value) Async[F].unit
+        else
+          mutex.permit.use { _ =>
+            pendingRef.get.flatMap { before =>
+              before.get(oldChildTip) match {
+                case None =>
+                  // Idempotent: nothing to rekey. Caller may have already rekeyed (e.g. retry path)
+                  // or the leader's `createProposalArtifact` ran with `OverlayMode.Passthrough` and
+                  // `pendingRef` is empty by construction.
+                  Async[F].unit
+                case Some(entry) =>
+                  for {
+                    _ <- pendingRef.update(p => (p - oldChildTip).updated(newChildTip, entry))
+                    _ <-
+                      if (entry.parent.value === newChildTip.value) Async[F].unit
+                      else pcTree.associate(newChildTip.value, entry.parent.value)
+                  } yield ()
+              }
+            }
+          }
+
+      def discardBranch(branchId: BranchId): F[Unit] =
+        mutex.permit.use(_ => pendingRef.update(_ - branchId))
+
       /** Eviction policy (#56.9). Drops the lowest-scoring non-ancestor branch when `pending.size` exceeds the cap. Score is `(ordinal asc,
         * BranchId.value lex asc)` — lowest gets evicted. Ancestors of `bestTipFn`'s tip are never evicted (would break finality walk-back).
         * If `bestTipFn` returns `None`, no ancestor protection is applied. If ALL pending branches are ancestors, eviction is skipped with
@@ -509,6 +580,27 @@ object MptOverlay {
           pending <- pendingRef.get
           merged = mergedChain(branch, pending)
         } yield (baseEntries -- merged.removals) ++ merged.upserts
+
+      def allEntriesAsBytesWithHandle(handle: BranchHandle[F, K], ordinal: SnapshotOrdinal): F[Map[Hex, Array[Byte]]] = {
+        // Same type-cast pattern as `commit` — checkout always returns a MultiBranchHandle in this impl, so the
+        // cast is safe. Avoids exposing `accRef` on the public trait while keeping the post-write view computable.
+        val mb = handle match {
+          case h: MultiBranchHandle[F, K] @unchecked => h
+          case other =>
+            throw new IllegalArgumentException(
+              s"Multi-branch overlay received a non-MultiBranchHandle in allEntriesAsBytesWithHandle: ${other.getClass.getName}"
+            )
+        }
+        for {
+          baseEntries <- underlying.allEntriesAsBytes
+          pending <- pendingRef.get
+          parentMerged = mergedChain(mb.parent, pending)
+          handleChanges <- mb.accRef.get
+          // Chronological compose: parent's accumulated chain first, then handle's local pending writes on top.
+          // `merge` enforces "later wins" + strips upsert/removal overlap.
+          combined = parentMerged.merge(handleChanges)
+        } yield (baseEntries -- combined.removals) ++ combined.upserts
+      }
 
       def finalizeBranch(canonical: BranchId, ordinal: SnapshotOrdinal): F[FinalizationOutcome] =
         mutex.permit.use { _ =>

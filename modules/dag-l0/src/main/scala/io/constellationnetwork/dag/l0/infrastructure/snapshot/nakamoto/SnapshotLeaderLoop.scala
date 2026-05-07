@@ -329,6 +329,7 @@ object SnapshotLeaderLoop {
                             productionTimestamps,
                             nakamotoFinalizedOrdinalRef,
                             mptStore,
+                            mptOverlay,
                             logger
                           )
                         } // snapshotSemaphore.permit
@@ -563,6 +564,7 @@ object SnapshotLeaderLoop {
     productionTimestamps: Ref[F, Map[Long, Long]],
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
     mptStore: MptStore[F, GlobalStateKey],
+    mptOverlay: MptOverlay[F, GlobalStateKey],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -691,6 +693,13 @@ object SnapshotLeaderLoop {
                           )
                         else Async[F].unit
 
+                      // Hash the rawArtifact: this is the BranchId under which `createProposalArtifact`
+                      // committed the overlay handle (line 502 of GlobalSnapshotConsensusFunctions:
+                      // `currentSnapshotHash <- hasher.hash(globalSnapshot)`). The chain's canonical
+                      // reference for this ordinal is the with-cert hash (`signedHashed.hash`); we
+                      // re-key the overlay branch from raw → with-cert so ord N+1's
+                      // `checkout(BranchId(getLastArtifactHash))` finds the parent.
+                      rawArtifactHash <- hasher.hash(rawArtifact)
                       artifact = rawArtifact.copy(slotCertificate = Some(cert), eta = Some(etaHash))
                       signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)
                       snapshotHashedForStorage <- signed.toHashed[F]
@@ -706,6 +715,16 @@ object SnapshotLeaderLoop {
                             vrfOutput
                           )
                         else Async[F].pure(false)
+                      // Rekey the overlay branch on success; discard it on abandonment.
+                      // Done inside the `mptStore.withTransaction` block so the overlay update is
+                      // bundled with the underlying-MPT mutation: if the tx rolls back (action =
+                      // Rollback), the underlying writes are reverted but the overlay's
+                      // `discardBranch` has already cleaned up the now-orphan `pendingRef` entry.
+                      _ <-
+                        if (stored)
+                          mptOverlay.rekey(BranchId(rawArtifactHash), BranchId(snapshotHashedForStorage.hash))
+                        else
+                          mptOverlay.discardBranch(BranchId(rawArtifactHash))
                       action: MptTxAction = if (stored) MptTxAction.Commit else MptTxAction.Rollback
                     } yield ((signed, context, returnedEvents, stored, snapshotHashedForStorage, parentHashValue), action)
                   }

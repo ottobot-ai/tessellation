@@ -49,7 +49,8 @@ object GlobalSnapshotContextFunctions {
     tessellation3MigrationStartingOrdinal: SnapshotOrdinal,
     setSumFixOrdinal: SnapshotOrdinal,
     mptStore: MptStore[F, GlobalStateKey],
-    incrementalDelegatedStakingStartingOrdinal: SnapshotOrdinal
+    incrementalDelegatedStakingStartingOrdinal: SnapshotOrdinal,
+    overlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ) =
@@ -237,7 +238,8 @@ object GlobalSnapshotContextFunctions {
                     _,
                     _,
                     _,
-                    _
+                    _,
+                    overlayHandle
                   ) =>
                 // For followers (currency-l0, dag-l1, currency-l1), we log warnings instead of raising errors
                 // for blocks, state channels, and rewards validation divergences.
@@ -295,6 +297,20 @@ object GlobalSnapshotContextFunctions {
                         )
                       )
                     } else Async[F].unit
+                  // Phase J: hash the incoming signed artifact and commit the overlay handle under
+                  // the resulting `BranchId(snapshotHash)`. This is the follower-side counterpart of
+                  // the proposer's `overlay.commit(handle, BranchId(currentSnapshotHash), ordinal)`
+                  // call — keeping both sides committed under the same id is what lets ChainSync
+                  // pull a follower's pending branch by snapshot hash when sync clients ask for it.
+                  // Done AFTER the mismatch check raises (so divergent state never gets registered
+                  // under a real childTip), and BEFORE the transaction yields Commit (so failure
+                  // here triggers the rollback path).
+                  signedArtifactHash <- hasher.hash(signedArtifact.value)
+                  _ <- overlay.commit(
+                    overlayHandle,
+                    io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(signedArtifactHash),
+                    signedArtifact.ordinal
+                  )
                 } yield (snapshotInfo, MptTxAction.Commit: MptTxAction)
             }
         }

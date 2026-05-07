@@ -57,7 +57,11 @@ object NakamotoSnapshotValidator {
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     lastSignedArtifact: Signed[GlobalIncrementalSnapshot],
     lastContext: GlobalSnapshotInfo,
-    getByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+    getByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
+    mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[
+      F,
+      io.constellationnetwork.schema.mpt.GlobalStateKey
+    ]
   ): F[ValidationResult] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoValidator")
     val producerHex = Hex(producerIdBytes.map("%02x".format(_)).mkString)
@@ -133,10 +137,28 @@ object NakamotoSnapshotValidator {
                       )
                       .flatMap {
                         case Right((_, validatedContext)) =>
-                          // Content matches AND we have properly derived state (stateProof correct)
-                          logger
-                            .debug(s"✅ Full content validation passed: slot=$slot ordinal=${signedSnapshot.ordinal}")
-                            .as(Valid(signedSnapshot, validatedContext): ValidationResult)
+                          // Content matches AND we have properly derived state (stateProof correct).
+                          //
+                          // Phase J / MultiBranch: `validateArtifact` ran `createProposalArtifact(strippedReceived)`
+                          // which committed the overlay handle at `hash(strippedReceived)` — i.e. the no-cert hash
+                          // (line 502 of GlobalSnapshotConsensusFunctions). The chain's canonical reference for this
+                          // ordinal is the WITH-cert hash (`hash(signedSnapshot.value)`). Without rekeying, ordinal
+                          // N+1's `checkout(BranchId(getLastArtifactHash))` falls through to base on this node and
+                          // misses N's pending writes — surfaces as `priorLastCurrencySnapshots` / balances divergence
+                          // (validating a peer's WITH-cert artifact without aligning the overlay key to the
+                          // canonical chain hash).
+                          //
+                          // Mirror the leader-side rekey in SnapshotLeaderLoop: walk the local pendingRef from
+                          // stripped-hash to canonical-hash so the next ordinal's checkout finds the parent.
+                          for {
+                            strippedHash <- hasher.hash(strippedReceived)
+                            canonicalHash <- hasher.hash(signedSnapshot.value)
+                            _ <- mptOverlay.rekey(
+                              io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(strippedHash),
+                              io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(canonicalHash)
+                            )
+                            _ <- logger.debug(s"✅ Full content validation passed: slot=$slot ordinal=${signedSnapshot.ordinal}")
+                          } yield Valid(signedSnapshot, validatedContext): ValidationResult
                         case Left(err) =>
                           val logMsg = err match {
                             case gam: io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalArtifactMismatch =>

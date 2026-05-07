@@ -280,21 +280,62 @@ object GlobalSnapshotInfo {
   def mptStateProof[F[_]: Parallel: Async: Hasher: JsonSerializer](info: GlobalSnapshotInfo)(
     implicit stateProofSelector: StateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): F[GlobalSnapshotStateProof] =
+    info.allStateEntriesAsBytes.flatMap { entries =>
+      // Re-hex the keys to feed `mptStateProofFromBytes`, which is the canonical helper now.
+      // Hex-keyed bytes is what the overlay produces, so making that the helper's input shape lets
+      // GSAM's Phase J path and this rebuild path share one implementation.
+      entries.toList.parTraverse {
+        case (k, v) => io.constellationnetwork.schema.mpt.GlobalStateKey.toHex[F](k).map(_ -> v)
+      }
+        .flatMap(pairs => mptStateProofFromBytes[F](info, pairs.toMap))
+    }
+
+  /** Build an MPT state proof from a pre-computed byte map, sharing the per-field-root + GlobalSnapshotStateProof shape with
+    * `mptStateProof[F](info)`. Used when the byte source is NOT `info.allStateEntriesAsBytes` — specifically GSAM's accept() pipeline under
+    * `OverlayMode.MultiBranch`, where the proof's `mptRoot` must reflect the post-write overlay+handle view (base + parent chain +
+    * uncommitted handle accumulator), not the producer's stale per-ordinal root nor a fresh GSI re-encode that may diverge from the
+    * actually-committed bytes under sidecar/expiry-index drift.
+    *
+    * Caller is responsible for ensuring `entries` matches the consensus-relevant post-acceptance state. The parity gate (#107) is the
+    * byte-equivalence contract between `info.allStateEntriesAsBytes` and overlay-derived bytes.
+    */
+  def mptStateProofFromBytes[F[_]: Parallel: Async: Hasher: JsonSerializer](
+    info: GlobalSnapshotInfo,
+    entries: Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]
+  )(
+    implicit stateProofSelector: StateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[GlobalSnapshotStateProof] = {
     val FId = io.constellationnetwork.schema.mpt.GlobalStateFieldId
 
+    // Group hex-keyed entries by `fieldId` parsed from the network-namespace prefix
+    // (`GlobalStateKey.fieldIdFromHex`). Entries with malformed prefixes are dropped — they
+    // wouldn't survive the producer's typed encoding either, so they can't influence consensus.
+    val perFieldGrouping
+      : Map[io.constellationnetwork.schema.mpt.GlobalStateFieldId, Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]] =
+      entries.toList.flatMap {
+        case (hex, bytes) =>
+          io.constellationnetwork.schema.mpt.GlobalStateKey.fieldIdFromHex(hex).map(fid => fid -> (hex -> bytes))
+      }.groupMap(_._1)(_._2).view.mapValues(_.toMap).toMap
+
     for {
-      entries <- info.allStateEntriesAsBytes
       // Compute the global mptRoot and per-fieldId subtree roots in parallel from the same byte map.
       // Per-field roots are deterministic across nodes because fieldId is a structural prefix of the
       // encoded GlobalStateKey and value bytes use the same canonical codecs as the global root.
       // Each subtree root is the rootHash of an MPT built from only that fieldId's entries — gives
       // the case class's per-field Option[Hash] slots a well-defined, verifiable value (instead of None).
       results <- (
-        entries.pure[F].buildMptFromBytes,
-        entries.pure[F].buildPerFieldMptRoots
+        io.constellationnetwork.security.mpt.MerklePatriciaTrie.makeParallelFromBytes[F](entries).map(_.rootHash),
+        perFieldGrouping.toList.parTraverse {
+          case (fieldId, fieldEntries) =>
+            io.constellationnetwork.security.mpt.MerklePatriciaTrie
+              .makeParallelFromBytes[F](fieldEntries)
+              .map(t => fieldId -> t.rootHash.value)
+        }
       ).parTupled
-      (mptRoot, perField) = results
+      (mptRoot, perFieldList) = results
+      perField = perFieldList.toMap
     } yield {
       def fieldRoot(id: io.constellationnetwork.schema.mpt.GlobalStateFieldId): Hash =
         perField.getOrElse(id, Hash.empty)
