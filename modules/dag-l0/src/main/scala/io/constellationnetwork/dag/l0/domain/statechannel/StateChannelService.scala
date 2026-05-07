@@ -18,8 +18,6 @@ import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.statechannel.StateChannelOutput
 
-import org.typelevel.log4cats.slf4j.Slf4jLogger
-
 trait StateChannelService[F[_]] {
   def process(
     stateChannel: StateChannelOutput,
@@ -35,7 +33,6 @@ object StateChannelService {
     mptStore: MptStore[F, GlobalStateKey]
   ): StateChannelService[F] =
     new StateChannelService[F] {
-      private val logger = Slf4jLogger.getLoggerFromClass[F](StateChannelService.getClass)
 
       def process(
         stateChannelOutput: StateChannelOutput,
@@ -51,16 +48,6 @@ object StateChannelService {
         // returns CurrencySnapshotInfo with lastMessages = None (via toCurrencySnapshotInfo),
         // so fetchStakingAddress returns None → Balance.empty, matching old behavior.
         for {
-          // [#113-DIAG] gl0-side: ml0 -> gl0 binary INGRESS via HTTP route. If we never see this log
-          // for the metagraphAddr during the L0-token reverse polling window, ml0 isn't sending
-          // (Hypothesis 1). If we see it but no later [#113-DIAG] process ENTRY for that addr, the
-          // binary was rejected before reaching the consensus path.
-          _ <- logger.info(
-            s"[#113-DIAG] gl0 INGRESS metagraph=${stateChannelOutput.address.show.take(8)} " +
-              s"lastHash=${stateChannelOutput.snapshotBinary.value.lastSnapshotHash.value.take(12)} " +
-              s"snapshot.headOrd=${snapshot.ordinal.show}"
-          )
-
           maybeCurrencyInfo <- mptStore.getCurrencySnapshotInfo(stateChannelOutput.address)
 
           stakingAddr = maybeCurrencyInfo.flatMap(fetchStakingAddress)
@@ -75,20 +62,10 @@ object StateChannelService {
           validations <- stateChannelValidator.validate(stateChannelOutput, snapshot.ordinal, snapshotFeesInfo)
           result <- validations match {
             case Valid(_) =>
-              logger.info(
-                s"[#113-DIAG] gl0 INGRESS VALID metagraph=${stateChannelOutput.address.show.take(8)} " +
-                  s"-> enqueue to L0Cell"
-              ) >>
-                mkDagCell(L0CellInput.HandleStateChannelSnapshot(stateChannelOutput))
-                  .run()
-                  .as(().asRight[NonEmptyList[StateChannelValidationError]])
-            case Invalid(errors) =>
-              logger
-                .warn(
-                  s"[#113-DIAG] gl0 INGRESS INVALID metagraph=${stateChannelOutput.address.show.take(8)} " +
-                    s"errors=${errors.toList}"
-                )
-                .as(errors.toNonEmptyList.asLeft[Unit])
+              mkDagCell(L0CellInput.HandleStateChannelSnapshot(stateChannelOutput))
+                .run()
+                .as(().asRight[NonEmptyList[StateChannelValidationError]])
+            case Invalid(errors) => errors.toNonEmptyList.asLeft[Unit].pure[F]
           }
         } yield result
       }

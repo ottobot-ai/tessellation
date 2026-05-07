@@ -127,111 +127,59 @@ object GlobalSnapshotStateChannelEventsProcessor {
         val allFeesAddresses: Map[Address, Set[Address]] = getFeeAddresses(priorLastCurrencySnapshots)
         type Acc = (Map[Address, Set[Address]], List[ValidatedNec[(Address, StateChannelValidationError), StateChannelOutput]])
 
-        // [#113-DIAG] Log entry summary: events arriving from network/gossip into GSAM->process.
-        // groupBy(address) tells us per-metagraph binary count; lastSnapshotHash tells us the
-        // chain-link the binary expects. Important to compare under MultiBranch vs Passthrough.
-        val perAddrSummary = events
-          .groupBy(_.address)
-          .view
-          .mapValues { eventsForAddr =>
-            eventsForAddr.map(e => s"lastHash=${e.snapshotBinary.value.lastSnapshotHash.value.take(12)}")
-          }
-          .toList
-        logger.info(
-          s"[#113-DIAG] process ENTRY ord=${snapshotOrdinal.show} events=${events.size} " +
-            s"priorLastCurrencySnapshots.size=${priorLastCurrencySnapshots.size} " +
-            s"priorLastScHashes.size=${priorLastStateChannelSnapshotHashes.size} " +
-            s"perAddr=$perAddrSummary " +
-            s"validationType=$validationType"
-        ) >>
-          events
-            .sortBy(_.address)
-            .foldLeftM[F, Acc]((allFeesAddresses, List.empty)) {
-              case ((prevAllFeeAddresses, alreadyProcessed), event) =>
-                buildSnapshotFeesInfo(event, prevAllFeeAddresses).flatMap { snapshotFeesInfo =>
-                  val validationV = validationType match {
-                    case StateChannelValidationType.Full =>
-                      stateChannelValidator.validate(event, snapshotOrdinal, snapshotFeesInfo)
-                    case StateChannelValidationType.Historical =>
-                      stateChannelValidator.validateHistorical(event, snapshotOrdinal, snapshotFeesInfo)
-                  }
-
-                  validationV.flatMap { v =>
-                    // [#113-DIAG] Log per-event validation outcome with explicit error if invalid.
-                    val logF = v match {
-                      case Validated.Valid(_) =>
-                        logger.info(
-                          s"[#113-DIAG] validate VALID ord=${snapshotOrdinal.show} addr=${event.address.show} " +
-                            s"lastHash=${event.snapshotBinary.value.lastSnapshotHash.value.take(12)} " +
-                            s"feeAddrs.size=${snapshotFeesInfo.allFeesAddresses.size}"
-                        )
-                      case Validated.Invalid(errs) =>
-                        logger.warn(
-                          s"[#113-DIAG] validate INVALID ord=${snapshotOrdinal.show} addr=${event.address.show} " +
-                            s"lastHash=${event.snapshotBinary.value.lastSnapshotHash.value.take(12)} " +
-                            s"errors=${errs.toList}"
-                        )
-                    }
-                    logF.as(v match {
-                      case valid @ Validated.Valid(event) =>
-                        val updatedAllFeesAddresses = prevAllFeeAddresses.updatedWith(event.address) { existing =>
-                          val added = Set(snapshotFeesInfo.ownerAddress, snapshotFeesInfo.stakingAddress).flatten
-                          existing.map(_ ++ added).orElse(added.some)
-                        }
-                        (updatedAllFeesAddresses, alreadyProcessed :+ valid)
-                      case invalid @ Validated.Invalid(_) =>
-                        (prevAllFeeAddresses, alreadyProcessed :+ invalid.errorMap(error => (event.address, error)))
-                    })
-                  }
+        events
+          .sortBy(_.address)
+          .foldLeftM[F, Acc]((allFeesAddresses, List.empty)) {
+            case ((prevAllFeeAddresses, alreadyProcessed), event) =>
+              buildSnapshotFeesInfo(event, prevAllFeeAddresses).flatMap { snapshotFeesInfo =>
+                val validationV = validationType match {
+                  case StateChannelValidationType.Full =>
+                    stateChannelValidator.validate(event, snapshotOrdinal, snapshotFeesInfo)
+                  case StateChannelValidationType.Historical =>
+                    stateChannelValidator.validateHistorical(event, snapshotOrdinal, snapshotFeesInfo)
                 }
-            }
-            .map { case (_, processedEvents) => processedEvents.partitionMap(_.toEither) }
-            .flatTap { case (invalid, _) => logger.warn(s"Invalid state channels events: $invalid").whenA(invalid.nonEmpty) }
-            .flatMap {
-              case (_, validatedEvents) =>
-                processStateChannelEvents(snapshotOrdinal, priorLastStateChannelSnapshotHashes, validatedEvents)
-            }
-            .flatMap {
-              case (scSnapshots, returnedSCEvents) =>
-                // [#113-DIAG] Log post-stateChannelManager.accept: which addrs survived chain-linking and how many binaries each.
-                logger.info(
-                  s"[#113-DIAG] postScManagerAccept ord=${snapshotOrdinal.show} " +
-                    s"scSnapshots.addrs=${scSnapshots.keySet.toList.map(_.show.take(8))} " +
-                    s"scSnapshots.binCounts=${scSnapshots.view.mapValues(_.size).toMap} " +
-                    s"returned.size=${returnedSCEvents.size}"
-                ) >>
-                  processCurrencySnapshots(
-                    snapshotOrdinal,
-                    currentBalances,
-                    priorLastCurrencySnapshots,
-                    scSnapshots,
-                    getGlobalSnapshotByOrdinal
-                  ).flatMap { accepted =>
-                    val (lastCurrencyStates, incomingCurrencyState) = calculateLastCurrencySnapshots(accepted, priorLastCurrencySnapshots)
-                    val finalScSnapshots = accepted.map { case (k, (v, _)) => k -> v.map(_._1) }
-                    // TODO: ASSUMING that owner addresses are restricted from being shared at this point
-                    val balanceUpdates = accepted.values.map(_._2).foldLeft(SortedMap.empty[Address, Balance])(_ ++ _)
 
-                    // [#113-DIAG] Log final acceptance: which metagraph addrs end up in lastCurrencyStates.
-                    logger
-                      .info(
-                        s"[#113-DIAG] process EXIT ord=${snapshotOrdinal.show} " +
-                          s"accepted.addrs=${accepted.keySet.toList.map(_.show.take(8))} " +
-                          s"lastCurrencyStates.size=${lastCurrencyStates.size} " +
-                          s"incomingCurrencyState.size=${incomingCurrencyState.size} " +
-                          s"finalScSnapshots.size=${finalScSnapshots.size}"
-                      )
-                      .as(
-                        StateChannelAcceptanceResult(
-                          finalScSnapshots,
-                          lastCurrencyStates,
-                          returnedSCEvents,
-                          balanceUpdates,
-                          incomingCurrencyState
-                        )
-                      )
-                  }
-            }
+                validationV.map {
+                  case valid @ Validated.Valid(event) =>
+                    val updatedAllFeesAddresses = prevAllFeeAddresses.updatedWith(event.address) { existing =>
+                      val added = Set(snapshotFeesInfo.ownerAddress, snapshotFeesInfo.stakingAddress).flatten
+                      existing.map(_ ++ added).orElse(added.some)
+                    }
+                    (updatedAllFeesAddresses, alreadyProcessed :+ valid)
+                  case invalid @ Validated.Invalid(_) =>
+                    (prevAllFeeAddresses, alreadyProcessed :+ invalid.errorMap(error => (event.address, error)))
+                }
+              }
+          }
+          .map { case (_, processedEvents) => processedEvents.partitionMap(_.toEither) }
+          .flatTap { case (invalid, _) => logger.warn(s"Invalid state channels events: $invalid").whenA(invalid.nonEmpty) }
+          .flatMap {
+            case (_, validatedEvents) =>
+              processStateChannelEvents(snapshotOrdinal, priorLastStateChannelSnapshotHashes, validatedEvents)
+          }
+          .flatMap {
+            case (scSnapshots, returnedSCEvents) =>
+              processCurrencySnapshots(
+                snapshotOrdinal,
+                currentBalances,
+                priorLastCurrencySnapshots,
+                scSnapshots,
+                getGlobalSnapshotByOrdinal
+              ).map { accepted =>
+                val (lastCurrencyStates, incomingCurrencyState) = calculateLastCurrencySnapshots(accepted, priorLastCurrencySnapshots)
+                val finalScSnapshots = accepted.map { case (k, (v, _)) => k -> v.map(_._1) }
+                // TODO: ASSUMING that owner addresses are restricted from being shared at this point
+                val balanceUpdates = accepted.values.map(_._2).foldLeft(SortedMap.empty[Address, Balance])(_ ++ _)
+
+                StateChannelAcceptanceResult(
+                  finalScSnapshots,
+                  lastCurrencyStates,
+                  returnedSCEvents,
+                  balanceUpdates,
+                  incomingCurrencyState
+                )
+              }
+          }
       }
       private def calculateLastCurrencySnapshots(
         processedCurrencySnapshots: SortedMap[Address, MetagraphAcceptanceResult],
@@ -362,25 +310,13 @@ object GlobalSnapshotStateChannelEventsProcessor {
                     case (_, lastCurrState @ Some(Right((lastIncremental, lastState)))) =>
                       deserialize[Signed[CurrencyIncrementalSnapshot]](head).flatMap {
                         case Some(snapshot) => // second or subsequent incremental snapshot - we do subtract fee
-                          // [#113-DIAG] Log applyCurrencySnapshot entry — the createContext call inside can raise,
-                          // which is caught by handleErrorWith below. We additionally log the SUCCESS path here so
-                          // we can see in logs whether the L0-token reverse cl1 binary actually got applied or not.
-                          logger.info(
-                            s"[#113-DIAG] applyCurrencySnapshot ENTER metagraph=${address.show.take(8)} " +
-                              s"lastIncremental.ord=${lastIncremental.value.ordinal.show} " +
-                              s"snapshot.ord=${snapshot.value.ordinal.show}"
-                          ) >> applyCurrencySnapshot(
+                          applyCurrencySnapshot(
                             address,
                             lastState,
                             lastIncremental,
                             snapshot,
                             getGlobalSnapshotByOrdinal
-                          ).flatTap { _ =>
-                            logger.info(
-                              s"[#113-DIAG] applyCurrencySnapshot OK metagraph=${address.show.take(8)} " +
-                                s"snapshot.ord=${snapshot.value.ordinal.show}"
-                            )
-                          }.flatMap { state =>
+                          ).flatMap { state =>
                             val maybeFeeAddress = state.lastMessages.flatMap(_.get(MessageType.Owner)).map(_.address)
 
                             // Fee deduction: if fee is required, we need a fee address (owner address from
@@ -421,7 +357,7 @@ object GlobalSnapshotStateChannelEventsProcessor {
                               }
                           }.handleErrorWith { e => // we don't accept neither binary nor incremental
                             logger.warn(e)(
-                              s"[#113-DIAG] applyCurrencySnapshot FAILED Currency snapshot of ordinal ${snapshot.value.ordinal.show} for address ${address.show} couldn't be applied"
+                              s"Currency snapshot of ordinal ${snapshot.value.ordinal.show} for address ${address.show} couldn't be applied"
                             ) >> Async[F].pure(current.asRight)
                           }
                         case None => // again we only let it through if fee is not required
