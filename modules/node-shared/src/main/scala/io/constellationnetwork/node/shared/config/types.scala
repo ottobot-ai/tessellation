@@ -337,7 +337,16 @@ object types {
     //     sticky and the ACS path becomes load-bearing instead of decorative. v12 nodes carry
     //     readmissionCountdown values that v11 nodes would auto-drop, producing different
     //     `lastOutcome` evolution → cluster-wide cold restart required.
-    consensusSchemaVersion: Int = 12
+    //   v13 (2026-05-07): Facility schema gains `appliedEvictionCerts: List[EvictionCertificate]`.
+    //     Lets a node that has assembled a quorum-signed cert apply it at round-start instead
+    //     of having to wait for proposal acceptance at the next ordinal. v13 nodes derive
+    //     committee = eligible \\ chronicNonSigners \\ probation \\ deferred \\ cert_targets;
+    //     v12 nodes derive committee = eligible \\ chronicNonSigners \\ probation \\ deferred.
+    //     With even one cert applied, the two committees produce different proof sets, so
+    //     v12 cannot safely participate in v13 rounds — cluster-wide cold restart required.
+    //     Closes the testnet 2026-05-07 ord 3121304 stuck-cluster gap. See
+    //     docs/consensus/eviction-cert-deterministic-shrinkage.md.
+    consensusSchemaVersion: Int = 13
   ) {
 
     /** Deterministic hash of consensus-critical config values.
