@@ -213,10 +213,24 @@ object NakamotoSnapshotValidator {
                             case _ =>
                               (s"❌ Content validation fail: slot=$slot err=$err", false)
                           }
-                          if (logMsg._2)
-                            logger.info(logMsg._1).as(Valid(signedSnapshot, context): ValidationResult)
-                          else
-                            logger.warn(logMsg._1).as(ContentMismatch(logMsg._1): ValidationResult)
+                          // Discard the orphan branch left behind by `validateArtifact`'s internal
+                          // call to `createProposalArtifact(strippedReceived)` (#113). On the Right
+                          // path we rekey stripped → canonical so the branch survives under the
+                          // chain's hash; on the Left path nothing rekeys, so the entry leaks under
+                          // hash(strippedReceived) until eviction. Under fork-recovery this leaks
+                          // accumulate and pressure cap=4 eviction into dropping ancestors of
+                          // bestTip, breaking parent-walk on subsequent ords.
+                          for {
+                            strippedHash <- hasher.hash(strippedReceived)
+                            _ <- mptOverlay.discardBranch(
+                              io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(strippedHash)
+                            )
+                            result <-
+                              if (logMsg._2)
+                                logger.info(logMsg._1).as(Valid(signedSnapshot, context): ValidationResult)
+                              else
+                                logger.warn(logMsg._1).as(ContentMismatch(logMsg._1): ValidationResult)
+                          } yield result
                       }
                 }
               }
