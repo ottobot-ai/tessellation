@@ -62,13 +62,19 @@ object SharedStorages {
       // overlay anyway in #56.10's scope.
       bestTipFnRef <- Ref.of[F, F[Option[BranchId]]](none[BranchId].pure[F])
       mptOverlay <- MptOverlay.make[F, GlobalStateKey](
-        // #56.11 production flip. Validated against allow-spends e2e on Passthrough first
-        // (zero StateProofMismatch, full scenario coverage). MultiBranch enables per-branch
-        // ChangeSet isolation: provisional/non-canonical downloads accumulate in pending and
-        // are folded into base only on `chainStore.finalize` → `mptOverlay.finalizeBranch`.
-        // `bestTipFn` (set by dag-l0 boot path) gives Taktikos-scored eviction (#56.9)
-        // ancestor protection so the canonical chain is never dropped under cap pressure.
-        mode = MptOverlay.OverlayMode.productionDefault,
+        // Stays on `Passthrough` until two MultiBranch prerequisites land:
+        //   1. `accept()` threads the child snapshot hash so `overlay.commit(handle, snapshotHash, ordinal)`
+        //      registers under a real childTip (not the self-loop `parentTip == childTip` Phase D used as a
+        //      transient stub — under MultiBranch that creates a self-loop in `pendingRef` because every
+        //      commit overrides the entry at `parentTip` with `BranchEntry(parent = parentTip, ...)`).
+        //   2. `builder.buildProof`'s global `mptRoot` derivation reads through `overlay.buildRoot(branch, ordinal)`
+        //      instead of `producer.getRootHashForOrdinal` — under MultiBranch the producer has no per-ordinal
+        //      commit until `finalizeBranch.foldIntoBase`, so producer-derived roots are stale until then.
+        // Brief flip 2026-05-06 reverted after `delegated_staking` failure surfaced the verify-replay
+        // divergence at ordinal=2 (gl0-run.log: `mptConsistency=DIVERGED incremental=d8d6 replay=db16`).
+        // `allEntriesAsBytes(branch)` (added in the same session) is the foundational read API the Phase J
+        // refactor will use; eviction's `bestTipFn` is already wired and ready.
+        mode = MptOverlay.OverlayMode.Passthrough,
         underlying = mptStore,
         pcTree = mptOverlayParentChildTree,
         toHex = GlobalStateKey.toHex[F],
