@@ -306,11 +306,17 @@ object GlobalSnapshotContextFunctions {
                   // under a real childTip), and BEFORE the transaction yields Commit (so failure
                   // here triggers the rollback path).
                   signedArtifactHash <- hasher.hash(signedArtifact.value)
-                  _ <- overlay.commit(
-                    overlayHandle,
-                    io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(signedArtifactHash),
-                    signedArtifact.ordinal
-                  )
+                  branchId = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(signedArtifactHash)
+                  _ <- overlay.commit(overlayHandle, branchId, signedArtifact.ordinal)
+                  // Followers (gl1/cl1/dl1) and gl0 history-replay paths receive a linear stream of
+                  // canonical snapshots — there are no concurrent forks at this layer to keep around
+                  // for reorg fallback. Without an immediate fold, pendingRef grows until eviction
+                  // (cap=4) drops a parent ancestor, breaking the chain walk; subsequent reads fall
+                  // through to a stale base, surfacing as systematic StateProofMismatch on followers
+                  // (#113). gl0's live consensus path keeps overlay finalization in NakamotoSyncDaemon
+                  // (k-confirmed via chain store) and does not call createContext, so this immediate
+                  // fold only affects the linear-stream callers.
+                  _ <- overlay.finalizeBranch(branchId, signedArtifact.ordinal)
                 } yield (snapshotInfo, MptTxAction.Commit: MptTxAction)
             }
         }

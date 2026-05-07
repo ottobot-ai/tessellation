@@ -420,14 +420,21 @@ object MptOverlay {
       (
         Ref.of[F, Map[BranchId, BranchEntry]](Map.empty),
         Ref.of[F, Map[SnapshotOrdinal, BranchId]](Map.empty),
+        // `lastCommittedBranchRef` (#113): tracks the most-recently-committed branch's id.
+        // Used as an additional eviction-protection tip alongside `bestTipFn`. Solves the
+        // lag race where `lastGlobalSnapshotStorage`-backed `bestTipFn` updates AFTER persist,
+        // so during the persist window the just-committed branches would be the only eviction
+        // candidates and get dropped — exactly the freshest chain we need to keep.
+        Ref.of[F, Option[BranchId]](none[BranchId]),
         Semaphore[F](1)
-      ).mapN { (pendingRef, finalizedRef, mutex) =>
+      ).mapN { (pendingRef, finalizedRef, lastCommittedBranchRef, mutex) =>
         new Impl[F, K](
           underlying,
           pcTree,
           toHex,
           pendingRef,
           finalizedRef,
+          lastCommittedBranchRef,
           mutex,
           maxPendingBranches,
           bestTipFn
@@ -440,6 +447,7 @@ object MptOverlay {
       toHex: K => F[Hex],
       pendingRef: Ref[F, Map[BranchId, BranchEntry]],
       finalizedRef: Ref[F, Map[SnapshotOrdinal, BranchId]],
+      lastCommittedBranchRef: Ref[F, Option[BranchId]],
       mutex: Semaphore[F],
       maxPendingBranches: Int,
       bestTipFn: F[Option[BranchId]]
@@ -469,6 +477,9 @@ object MptOverlay {
           for {
             changes <- handle.accRef.get
             _ <- pendingRef.update(_.updated(childTip, BranchEntry(handle.parent, changes, ordinal)))
+            // Track this commit as the most-recent. Read by `evictIfOverCap` so the just-committed
+            // branch and its ancestors are protected even when the external `bestTipFn` lags.
+            _ <- lastCommittedBranchRef.set(childTip.some)
             // Eviction (#56.9): single-shot — each commit adds exactly one branch, so at most one over the
             // cap. Read pending+evict+write while still holding the mutex so a concurrent commit can't see
             // a momentarily-over-cap state.
@@ -505,35 +516,47 @@ object MptOverlay {
       def discardBranch(branchId: BranchId): F[Unit] =
         mutex.permit.use(_ => pendingRef.update(_ - branchId))
 
-      /** Eviction policy (#56.9). Drops the lowest-scoring non-ancestor branch when `pending.size` exceeds the cap. Score is `(ordinal asc,
-        * BranchId.value lex asc)` — lowest gets evicted. Ancestors of `bestTipFn`'s tip are never evicted (would break finality walk-back).
-        * If `bestTipFn` returns `None`, no ancestor protection is applied. If ALL pending branches are ancestors, eviction is skipped with
-        * a warn log — the overlay rides over-cap until finalization releases ancestors.
+      /** Eviction policy (#56.9, refined #113). Drops the lowest-scoring non-ancestor branch when `pending.size` exceeds the cap. Score is
+        * `(ordinal asc, BranchId.value lex asc)` — lowest gets evicted. Two protected tips, both with full ancestor walk-back:
+        *
+        *   - `bestTipFn`'s tip — externally-supplied "canonical chain head" (chainStore.bestTip on dag-l0; lastGlobalSnapshotStorage on
+        *     followers).
+        *   - `lastCommittedBranchRef`'s tip — most-recently-committed branch (set inside `commit` before this fn runs). Catches the lag
+        *     window where the upstream source backing `bestTipFn` updates AFTER overlay commit (e.g. `lastGlobalSnapshotStorage.set` runs
+        *     after the round completes; during the persist window the just-committed branches would otherwise be the only eviction
+        *     candidates and get dropped — exactly the freshest chain we need to keep).
+        *
+        * If both refs return `None`, no ancestor protection applies (purely score-based eviction). If ALL pending branches are protected,
+        * eviction is skipped with a warn log — the overlay rides over-cap until finalization releases ancestors.
         */
       private def evictIfOverCap(pending: Map[BranchId, BranchEntry]): F[Map[BranchId, BranchEntry]] =
         if (pending.size <= maxPendingBranches) pending.pure[F]
         else
-          bestTipFn.flatMap { bestTipOpt =>
-            val ancestors = bestTipOpt.fold(Set.empty[BranchId])(walkAncestorsInPending(_, pending))
-            val candidates = pending.view.filterKeys(id => !ancestors.contains(id)).toMap
-            if (candidates.isEmpty)
-              logger
-                .warn(
-                  s"[MptOverlay] Eviction skipped: all ${pending.size} pending branches are ancestors of bestTip; " +
-                    s"cap=$maxPendingBranches. Overlay will ride over-cap until finalization releases ancestors."
-                )
-                .as(pending)
-            else {
-              val (evictId, evictEntry) = candidates.toList.minBy {
-                case (id, entry) => (entry.ordinal.value.value, id.value.value)
+          (bestTipFn, lastCommittedBranchRef.get).tupled.flatMap {
+            case (bestTipOpt, lastCommittedOpt) =>
+              val bestTipAncestors = bestTipOpt.fold(Set.empty[BranchId])(walkAncestorsInPending(_, pending))
+              val lastCommittedAncestors = lastCommittedOpt.fold(Set.empty[BranchId])(walkAncestorsInPending(_, pending))
+              val ancestors = bestTipAncestors ++ lastCommittedAncestors
+              val candidates = pending.view.filterKeys(id => !ancestors.contains(id)).toMap
+              if (candidates.isEmpty)
+                logger
+                  .warn(
+                    s"[MptOverlay] Eviction skipped: all ${pending.size} pending branches are protected " +
+                      s"(bestTip-ancestors=${bestTipAncestors.size}, lastCommitted-ancestors=${lastCommittedAncestors.size}); " +
+                      s"cap=$maxPendingBranches. Overlay will ride over-cap until finalization releases ancestors."
+                  )
+                  .as(pending)
+              else {
+                val (evictId, evictEntry) = candidates.toList.minBy {
+                  case (id, entry) => (entry.ordinal.value.value, id.value.value)
+                }
+                logger
+                  .info(
+                    s"[MptOverlay] Evicting branch=${evictId.value} ordinal=${evictEntry.ordinal} (cap=$maxPendingBranches, " +
+                      s"pending=${pending.size}, ancestors=${ancestors.size})"
+                  )
+                  .as(pending - evictId)
               }
-              logger
-                .info(
-                  s"[MptOverlay] Evicting branch=${evictId.value} ordinal=${evictEntry.ordinal} (cap=$maxPendingBranches, " +
-                    s"pending=${pending.size}, ancestors=${ancestors.size})"
-                )
-                .as(pending - evictId)
-            }
           }
 
       def get[V: ImmutableCodec](branch: BranchId, key: K): F[Option[V]] =

@@ -53,14 +53,21 @@ object SharedStorages {
       // tree used by consensus topology — passing it through means topology associations made during
       // `commit` / `finalizeBranch` stay in sync with the chain-store's view.
       mptOverlayParentChildTree <- ParentChildTree.make[F]
-      // Lazy-bound `bestTipFn` for overlay eviction (#56.10 Phase I). The chain store lives
-      // downstream of `SharedStorages.make` (only dag-l0's `GlobalSnapshotConsensus.make` builds
-      // it today), so the overlay captures `bestTipFnRef.get.flatten` and the dag-l0 wiring layer
-      // calls `setBestTipFn(chainStore.bestTip.map(_.map(s => BranchId(s.hash))))` once chainStore
-      // is available. Layers without a chain store (dag-l1, currency-l0/l1, sdk) leave the ref
-      // at the default and degrade to purely score-based eviction — they don't run multi-branch
-      // overlay anyway in #56.10's scope.
-      bestTipFnRef <- Ref.of[F, F[Option[BranchId]]](none[BranchId].pure[F])
+      // Lazy-bound `bestTipFn` for overlay eviction (#56.10 Phase I, refined #113).
+      //
+      // Default = `lastGlobalSnapshotStorage.get.map(_.map(h => BranchId(h.hash)))` — every layer
+      // (gl0/gl1/cl1/dl1/ml0) maintains `lastGlobalSnapshot`, and the canonical hash of the
+      // most-recently-accepted snapshot is exactly what the overlay's eviction needs as the
+      // ancestor-walk tip. Without this, follower layers had no ancestor protection under
+      // MultiBranch and saw recoverable SPM under stress (gl1 ~50, cl1/dl1 ~28 each per full e2e).
+      //
+      // dag-l0 overrides via `setBestTipFn(chainStore.bestTip...)` once `NakamotoChainStore` is
+      // built, since the chain store has the live tip ahead of `lastGlobalSnapshotStorage` (which
+      // updates after persist). For followers there is no chain store; the lastGlobal default is
+      // both correct and live (it's set in `createContext`'s commit path).
+      bestTipFnRef <- Ref.of[F, F[Option[BranchId]]](
+        lastGlobalSnapshotStorage.get.map(_.map(hashed => BranchId(hashed.hash)))
+      )
       mptOverlay <- MptOverlay.make[F, GlobalStateKey](
         // Phase J landed two of three prerequisites for MultiBranch:
         //   1. ✅ `overlay.commit(handle, BranchId(snapshotHash), ordinal)` is now called by the proposer
