@@ -186,8 +186,12 @@ trait MptOverlay[F[_], K] {
     */
   def allEntriesAsBytesWithHandle(handle: BranchHandle[F, K], ordinal: SnapshotOrdinal): F[Map[Hex, Array[Byte]]]
 
-  /** Finality sink (#56.6 wires the call site). Idempotent on `(ordinal, canonical)`. Errors loudly when called twice at the same `ordinal`
-    * with different `canonical` hashes (depth-k vs attestation-2/3 disagreement during partition).
+  /** Finality sink (#56.6 wires the call site). Idempotent on `(ordinal, canonical)`. When called at the same `ordinal` with a different
+    * `canonical` hash (reorg replay — followers re-pull through `setForRecovery`), accepts the new canonical, folds its pending chain
+    * (idempotent: no-op if nothing pending) and updates the finality marker. The reorg-replace path is essential for follower recovery
+    * (#113); without it, every reorg crashed `GlobalSnapshotAlignment` and the node was stuck. NakamotoSyncDaemon (gl0 leader path) is
+    * still expected never to hit this case in practice — depth-k confirmation precludes a different-hash re-finalization at the same ord —
+    * so the path is benign for gl0.
     *
     * Multi-branch: walks `canonical → ... → base` through the pending-branches map, merges all chain `ChangeSet`s, applies the merged delta
     * to the underlying producer, and clears the entire pending-branches map. (More nuanced eviction — keeping non-conflicting siblings —
@@ -650,12 +654,44 @@ object MptOverlay {
                 // Already finalized at exactly this (ordinal, hash); nothing to do.
                 FinalizationOutcome.NoOp.pure[F].widen[FinalizationOutcome]
               case Some(prev) =>
-                Async[F].raiseError[FinalizationOutcome](
-                  new IllegalStateException(
-                    s"MptOverlay finality conflict at ordinal=$ordinal: previously finalized=${prev.value} " +
-                      s"now requested=${canonical.value}"
-                  )
-                )
+                // Reorg-style re-finalization: the same ordinal is being finalized with a different canonical
+                // hash than before. Followers (gl1/cl1/dl1/ml0) hit this path when `setForRecovery` resets
+                // their LastSnapshotStorage to ord N < currentOrdinal and the GlobalSnapshotPullingProcess
+                // re-pulls + re-validates each snapshot through `createContext`. The previous behavior raised
+                // and aborted the recovery loop entirely (#113); instead, accept the new canonical as the
+                // post-reorg truth, fold its pending chain (idempotent under MultiBranch when the prior
+                // finalization already cleared pending), and update the finalizedRef. The fold may overwrite
+                // base entries the prior canonical wrote — that is correct: the new canonical is the new state
+                // at this ordinal, and base must reflect it. NakamotoSyncDaemon (gl0 leader path) cannot hit
+                // this case because depth-k confirmation precludes a different-hash re-finalization at the
+                // same ord; it remains an internal-consistency bug there if this branch ever fires on gl0.
+                pendingRef.get.flatMap { pending =>
+                  pending.get(canonical) match {
+                    case None =>
+                      // No pending entries to fold for the new canonical (already folded by the proposer or
+                      // by a prior call). Just update the finality marker so subsequent finalizeBranch calls
+                      // at this ord with the new canonical short-circuit on the (Some, equal) branch.
+                      finalizedRef.update(_.updated(ordinal, canonical)) >>
+                        logger
+                          .info(
+                            s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
+                              s"new=${canonical.value} (no pending fold needed)"
+                          )
+                          .as(FinalizationOutcome.NoOp: FinalizationOutcome)
+                    case Some(_) =>
+                      val merged = mergedChain(canonical, pending)
+                      val droppedCount = pending.size - countAncestors(canonical, pending)
+                      for {
+                        _ <- foldIntoBase(merged, ordinal)
+                        _ <- pendingRef.set(Map.empty)
+                        _ <- finalizedRef.update(_.updated(ordinal, canonical))
+                        _ <- logger.info(
+                          s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
+                            s"new=${canonical.value} keysApplied=${merged.size} branchesDropped=$droppedCount"
+                        )
+                      } yield FinalizationOutcome.Folded(merged.size, droppedCount)
+                  }
+                }
               case None =>
                 pendingRef.get.flatMap { pending =>
                   pending.get(canonical) match {

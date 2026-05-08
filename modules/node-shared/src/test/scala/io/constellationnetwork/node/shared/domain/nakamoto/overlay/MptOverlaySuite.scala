@@ -859,7 +859,7 @@ object MptOverlaySuite extends MutableIOSuite {
       )
   }
 
-  test("multi-branch: finalizeBranch raises on conflict — different canonical at same ordinal") { res =>
+  test("multi-branch: finalizeBranch reorg-replaces on different canonical at same ordinal") { res =>
     implicit val (h, _, js) = res
     for {
       pair <- mkMultiBranch
@@ -871,11 +871,12 @@ object MptOverlaySuite extends MutableIOSuite {
 
       _ <- overlay.finalizeBranch(branchA, ordinal)
 
-      // After finalize, branchB is no longer in pending (cleared by previous finalize). But the conflict
-      // contract is at the (ordinal, canonical) level: re-finalizing the SAME ordinal with a DIFFERENT
-      // canonical must error, even if that other canonical isn't in pending.
-      conflict <- overlay.finalizeBranch(branchB, ordinal).attempt
-    } yield expect(conflict.isLeft)
+      // After the first finalize, pending is empty. Re-finalizing the SAME ordinal with a DIFFERENT
+      // canonical must NOT error (#113): followers re-pulling through `setForRecovery` legitimately
+      // re-validate the same ord under a new canonical hash. The reorg-replace path updates the
+      // finality marker; with no pending entries to fold, the outcome is NoOp.
+      reorg <- overlay.finalizeBranch(branchB, ordinal)
+    } yield expect(reorg == FinalizationOutcome.NoOp)
   }
 
   test("multi-branch: finalizeBranch on an unknown branch is a NoOp (idempotency entry recorded)") { res =>
@@ -888,13 +889,13 @@ object MptOverlaySuite extends MutableIOSuite {
       r1 <- overlay.finalizeBranch(branchA, ordinal)
       // Re-finalizing same (ordinal, branchA) — still NoOp.
       r2 <- overlay.finalizeBranch(branchA, ordinal)
-      // Re-finalizing same ordinal with DIFFERENT canonical now conflicts.
-      conflict <- overlay.finalizeBranch(branchB, ordinal).attempt
+      // Re-finalizing same ordinal with DIFFERENT canonical reorg-replaces: NoOp because nothing pending.
+      reorg <- overlay.finalizeBranch(branchB, ordinal)
     } yield
       expect.all(
         r1 == FinalizationOutcome.NoOp,
         r2 == FinalizationOutcome.NoOp,
-        conflict.isLeft
+        reorg == FinalizationOutcome.NoOp
       )
   }
 
