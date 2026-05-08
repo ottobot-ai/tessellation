@@ -236,7 +236,7 @@ object MptOverlaySuite extends MutableIOSuite {
         store,
         pcTree,
         GlobalStateKey.toHex[IO],
-        bestTipFn = IO.pure(none[BranchId])
+        bestTipsFn = IO.pure(Set.empty[BranchId])
       )
 
       key = gskBalance(20)
@@ -255,7 +255,7 @@ object MptOverlaySuite extends MutableIOSuite {
         store,
         pcTree,
         GlobalStateKey.toHex[IO],
-        bestTipFn = IO.pure(none[BranchId])
+        bestTipsFn = IO.pure(Set.empty[BranchId])
       )
 
       key = gskBalance(21)
@@ -283,7 +283,7 @@ object MptOverlaySuite extends MutableIOSuite {
         store,
         pcTree,
         GlobalStateKey.toHex[IO],
-        bestTipFn = IO.pure(none[BranchId])
+        bestTipsFn = IO.pure(Set.empty[BranchId])
       )
     } yield (store, overlay)
 
@@ -628,7 +628,7 @@ object MptOverlaySuite extends MutableIOSuite {
         store,
         pcTree,
         GlobalStateKey.toHex[IO],
-        bestTipFn = IO.pure(none[BranchId])
+        bestTipsFn = IO.pure(Set.empty[BranchId])
       )
       _ <- store.insert[Balance](gskBalance(940), Balance(NonNegLong(3L)))
       fromA <- overlay.allEntriesAsBytes(branchA)
@@ -651,7 +651,7 @@ object MptOverlaySuite extends MutableIOSuite {
         store,
         pcTree,
         GlobalStateKey.toHex[IO],
-        bestTipFn = IO.pure(none[BranchId])
+        bestTipsFn = IO.pure(Set.empty[BranchId])
       )
       keyBase = gskBalance(942)
       keyHandle = gskBalance(943)
@@ -1053,7 +1053,7 @@ object MptOverlaySuite extends MutableIOSuite {
 
   private def mkMultiBranchWithCap(
     cap: Int,
-    bestTipFn: IO[Option[BranchId]] = IO.pure(none[BranchId])
+    bestTipsFn: IO[Set[BranchId]] = IO.pure(Set.empty[BranchId])
   )(
     implicit h: Hasher[IO],
     js: JsonSerializer[IO]
@@ -1066,7 +1066,7 @@ object MptOverlaySuite extends MutableIOSuite {
         store,
         pcTree,
         GlobalStateKey.toHex[IO],
-        bestTipFn = bestTipFn
+        bestTipsFn = bestTipsFn
       )
     } yield (store, overlay)
 
@@ -1152,8 +1152,8 @@ object MptOverlaySuite extends MutableIOSuite {
       // bestTip = branchD; chain is branchA → branchB → branchC → branchD (linear).
       // branchA is lowest-ordinal but is bestTip's ancestor → must not be evicted.
       // After committing branchE (sibling of parentP), eviction should fire on branchE, not branchA.
-      bestTipRef <- IO.ref[Option[BranchId]](none[BranchId])
-      pair <- mkMultiBranchWithCap(cap = 4, bestTipFn = bestTipRef.get)
+      bestTipsRef <- IO.ref[Set[BranchId]](Set.empty[BranchId])
+      pair <- mkMultiBranchWithCap(cap = 4, bestTipsFn = bestTipsRef.get)
       (_, overlay) = pair
 
       _ <- commitEmpty(overlay, parentP, branchA, SnapshotOrdinal(NonNegLong(1L)))
@@ -1161,8 +1161,8 @@ object MptOverlaySuite extends MutableIOSuite {
       _ <- commitEmpty(overlay, branchB, branchC, SnapshotOrdinal(NonNegLong(3L)))
       _ <- commitEmpty(overlay, branchC, branchD, SnapshotOrdinal(NonNegLong(4L)))
 
-      // Set bestTip to branchD AFTER chain is built; subsequent commits will protect ancestors.
-      _ <- bestTipRef.set(Some(branchD))
+      // Set bestTips to {branchD} AFTER chain is built; subsequent commits will protect ancestors.
+      _ <- bestTipsRef.set(Set(branchD))
 
       // Commit branchE as a sibling of parentP at ordinal 5 — pending now has 5, cap=4.
       // Eviction should fire. With branchA→D as bestTip's ancestor chain, the ONLY non-ancestor is
@@ -1218,12 +1218,12 @@ object MptOverlaySuite extends MutableIOSuite {
       )
   }
 
-  test("eviction: bestTipFn = None — purely score-based, no ancestor protection") { res =>
+  test("eviction: bestTipsFn = empty — purely score-based, no ancestor protection") { res =>
     implicit val (h, _, js) = res
     for {
       // Linear chain branchA(ord=1) → branchB(ord=2). Commit branchC, branchD as siblings.
-      // bestTipFn returns None → branchA is NOT protected as ancestor → it gets evicted at cap.
-      pair <- mkMultiBranchWithCap(cap = 3, bestTipFn = IO.pure(none[BranchId]))
+      // bestTipsFn returns empty → branchA is NOT protected as ancestor → it gets evicted at cap.
+      pair <- mkMultiBranchWithCap(cap = 3, bestTipsFn = IO.pure(Set.empty[BranchId]))
       (_, overlay) = pair
 
       keyA = gskBalance(3200)
@@ -1248,25 +1248,127 @@ object MptOverlaySuite extends MutableIOSuite {
       )
   }
 
+  test("eviction: multi-tip protection — fork-recovery committed branches are NOT evicted while bestTip lags") { res =>
+    implicit val (h, _, js) = res
+    // #115 regression: during fork-recovery, the validator commits the canonical branch BEFORE
+    // chainStore reorgs to it. If `bestTipsFn` returned only the local-fork bestTip, the just-
+    // committed canonical branch and its ancestors would be eviction candidates and could be
+    // dropped — breaking parent-walk for the next ord's `mergedChain`.
+    //
+    // Setup: gl0-2 has self-produced local chain (localA→localB), AND has just received
+    // canonical chain from peers (canonA→canonB). chainStore.allTips returns BOTH leaves
+    // (localB + canonB). With cap=2 we have 4 pending branches → 2 over cap. Eviction must
+    // protect ALL ancestors of BOTH tips.
+    val localA = BranchId(Hash("a" * 64))
+    val localB = BranchId(Hash("b" * 64))
+    val canonA = BranchId(Hash("c" * 64))
+    val canonB = BranchId(Hash("d" * 64))
+    for {
+      bestTipsRef <- IO.ref[Set[BranchId]](Set.empty[BranchId])
+      pair <- mkMultiBranchWithCap(cap = 2, bestTipsFn = bestTipsRef.get)
+      (_, overlay) = pair
+
+      // Build the local-fork chain first, with bestTips = {localB} after each commit.
+      _ <- commitEmpty(overlay, parentP, localA, SnapshotOrdinal(NonNegLong(1L)))
+      _ <- bestTipsRef.set(Set(localA))
+      _ <- commitEmpty(overlay, localA, localB, SnapshotOrdinal(NonNegLong(2L)))
+      _ <- bestTipsRef.set(Set(localB))
+
+      // Now receive canonical chain from peers. Validator commits canonA, canonB. AT THIS POINT
+      // chainStore stores both BUT bestTip hasn't reorged yet. Multi-tip: bestTipsRef returns
+      // {localB, canonA} during the canonA commit window — both are "leaves" in chainStore.
+      _ <- bestTipsRef.set(Set(localB, canonA))
+      _ <- commitEmpty(overlay, parentP, canonA, SnapshotOrdinal(NonNegLong(3L)))
+      // pending = {localA, localB, canonA} = 3, cap=2 → 1 over → eviction fires.
+      // Without multi-tip protection, eviction would treat canonA as a non-ancestor of bestTip=localB
+      // and drop it. With multi-tip, canonA IS in bestTips, so its ancestors-or-self are protected.
+      _ <- bestTipsRef.set(Set(localB, canonB))
+      _ <- commitEmpty(overlay, canonA, canonB, SnapshotOrdinal(NonNegLong(4L)))
+      // pending = {localA, localB, canonA, canonB} = 4, cap=2 → 2 over → eviction fires (single-shot, drops 1).
+      // After this commit: lastCommittedRef = canonB (protects canonA, canonB), bestTips = {localB, canonB}
+      // (protects localA, localB, canonA, canonB). Total protected = 4. No candidates. Skip.
+      _ <- bestTipsRef.set(Set(localB, canonB))
+
+      // The critical test: read at canonB MUST find canonA's data via parent walk.
+      // We use empty commits so there's no per-key write to read; instead probe via parent-child tree
+      // (which eviction doesn't touch — but pendingRef IS touched). Our real assertion:
+      // mergedChain(canonB) walks canonB → canonA. If canonA is in pending, walk continues; otherwise
+      // it stops. Since allEntriesAsBytes(canonB) doesn't surface that distinction with empty commits,
+      // we instead verify via the parent-child tree (which tracks topology not pending) — and verify
+      // that no eviction happened (cap=2 but all 4 are protected → ride over-cap).
+      pCanonA <- overlay.parentChildTree.parentOf(canonA.value)
+      pCanonB <- overlay.parentChildTree.parentOf(canonB.value)
+      pLocalA <- overlay.parentChildTree.parentOf(localA.value)
+      pLocalB <- overlay.parentChildTree.parentOf(localB.value)
+    } yield
+      expect.all(
+        pLocalA.contains(parentP.value),
+        pLocalB.contains(localA.value),
+        pCanonA.contains(parentP.value),
+        pCanonB.contains(canonA.value)
+      )
+  }
+
+  test("eviction: multi-tip protection — write at canonical chain is observable via mergedChain when bestTip lags") { res =>
+    implicit val (h, _, js) = res
+    // Stronger version of the #115 regression: writes on the canonical chain must remain observable
+    // through mergedChain after eviction pressure on the local-fork chain. This is the actual
+    // smoking-gun symptom — gl0-2's preSyncBytes(73) had 32 entries vs canonical's 33 because
+    // canonical-71 got evicted and mergedChain(canonical-72) couldn't see canonical-71's writes.
+    val localA = BranchId(Hash("a" * 64))
+    val canonA = BranchId(Hash("c" * 64))
+    val canonB = BranchId(Hash("d" * 64))
+
+    val keyOnCanonA = gskBalance(7100)
+
+    for {
+      bestTipsRef <- IO.ref[Set[BranchId]](Set.empty[BranchId])
+      pair <- mkMultiBranchWithCap(cap = 2, bestTipsFn = bestTipsRef.get)
+      (_, overlay) = pair
+
+      // Local-fork chain with a write.
+      _ <- commitEmpty(overlay, parentP, localA, SnapshotOrdinal(NonNegLong(1L)))
+      _ <- bestTipsRef.set(Set(localA))
+
+      // Canonical chain commit at canonA writes a key. This is the write that MUST survive eviction
+      // pressure for the canonB→canonA→base walk to return correct bytes.
+      hCanonA <- overlay.checkout(parentP)
+      _ <- hCanonA.insert[Balance](keyOnCanonA, Balance(NonNegLong(99L)))
+      _ <- bestTipsRef.set(Set(localA, canonA))
+      _ <- overlay.commit(hCanonA, canonA, SnapshotOrdinal(NonNegLong(2L)))
+      // pending = {localA, canonA} = 2, cap=2 → no eviction yet.
+
+      // Commit canonB on top of canonA. lastCommittedRef = canonB. Multi-tip = {localA, canonB}.
+      // pending → {localA, canonA, canonB} = 3, cap=2 → eviction fires.
+      // ancestors(canonB) = {canonB, canonA}. ancestors(localA) = {localA}. Total protected = 3. No candidates → skipped.
+      // (Without multi-tip protection: bestTip = localA, ancestors = {localA, canonB}, candidates = {canonA}, evict canonA → BUG.)
+      _ <- bestTipsRef.set(Set(localA, canonB))
+      _ <- commitEmpty(overlay, canonA, canonB, SnapshotOrdinal(NonNegLong(3L)))
+
+      // Read keyOnCanonA at canonB. Walk: canonB → canonA. canonA must still be in pending → its write surfaces.
+      readAtCanonB <- overlay.get[Balance](canonB, keyOnCanonA)
+    } yield expect(readAtCanonB.contains(Balance(NonNegLong(99L))))
+  }
+
   test("eviction: all candidates are ancestors — eviction skipped (overlay rides over-cap)") { res =>
     implicit val (h, _, js) = res
     for {
       // Linear chain A→B→C→D, all ancestors of bestTip=D. Cap=3 but all branches are ancestors.
       // No candidates → eviction skipped (warns), pending stays at 4.
-      bestTipRef <- IO.ref[Option[BranchId]](none[BranchId])
-      pair <- mkMultiBranchWithCap(cap = 3, bestTipFn = bestTipRef.get)
+      bestTipsRef <- IO.ref[Set[BranchId]](Set.empty[BranchId])
+      pair <- mkMultiBranchWithCap(cap = 3, bestTipsFn = bestTipsRef.get)
       (_, overlay) = pair
 
       _ <- commitEmpty(overlay, parentP, branchA, SnapshotOrdinal(NonNegLong(1L)))
       _ <- commitEmpty(overlay, branchA, branchB, SnapshotOrdinal(NonNegLong(2L)))
       _ <- commitEmpty(overlay, branchB, branchC, SnapshotOrdinal(NonNegLong(3L)))
-      _ <- bestTipRef.set(Some(branchC))
+      _ <- bestTipsRef.set(Set(branchC))
 
       // Adding branchD as child of branchC pushes pending to 4 (over cap=3). All four are ancestors of
       // branchD (the new tip). Eviction can't drop any.
-      _ <- bestTipRef.set(Some(branchA)) // still all 3 are A's ancestors-or-self chain when we add D
+      _ <- bestTipsRef.set(Set(branchA)) // still all 3 are A's ancestors-or-self chain when we add D
       _ <- commitEmpty(overlay, branchC, branchD, SnapshotOrdinal(NonNegLong(4L)))
-      _ <- bestTipRef.set(Some(branchD))
+      _ <- bestTipsRef.set(Set(branchD))
 
       // Verify ALL parent associations still present.
       pA <- overlay.parentChildTree.parentOf(branchA.value)

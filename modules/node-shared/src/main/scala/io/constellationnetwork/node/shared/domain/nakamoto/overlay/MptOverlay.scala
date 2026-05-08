@@ -239,21 +239,22 @@ object MptOverlay {
     * `toHex` is plumbed in alongside `underlying` so the multi-branch impl can encode keys before the per-handle accumulator stores them.
     * For passthrough, `toHex` is unused — kept on the signature so swapping modes doesn't change call sites.
     *
-    * `bestTipFn` (#56.9): callback the overlay queries during eviction to identify ancestors of the canonical chain — these are NEVER
-    * evicted. Pass `Async[F].pure(none[BranchId])` for "no ancestor protection" (purely score-based eviction); production deployments
-    * should plumb this from `chainStore.bestTip` (Phase I) so depth-k / attestation-2/3 finality can still walk back through pending
-    * branches.
+    * `bestTipsFn` (#56.9, multi-tip in #115): callback the overlay queries during eviction to identify ancestors of every viable chain head
+    * — ancestors of any tip in the returned set are NEVER evicted. Pass `Async[F].pure(Set.empty[BranchId])` for "no ancestor protection"
+    * (purely score-based eviction); production deployments should plumb this from `chainStore.allTips` (Phase I) so depth-k /
+    * attestation-2/3 finality can still walk back through pending branches AND fork-recovery doesn't lose the canonical chain when the
+    * local-fork chain is bestTip.
     */
   def make[F[_]: Async: Hasher, K](
     mode: OverlayMode,
     underlying: MptStore[F, K],
     pcTree: ParentChildTree[F],
     toHex: K => F[Hex],
-    bestTipFn: F[Option[BranchId]]
+    bestTipsFn: F[Set[BranchId]]
   ): F[MptOverlay[F, K]] =
     mode match {
       case OverlayMode.Passthrough             => Async[F].pure(passthrough(underlying, pcTree))
-      case OverlayMode.MultiBranch(maxPending) => MultiBranch[F, K](underlying, pcTree, toHex, maxPending, bestTipFn)
+      case OverlayMode.MultiBranch(maxPending) => MultiBranch[F, K](underlying, pcTree, toHex, maxPending, bestTipsFn)
     }
 
   /** Single-branch passthrough — correctness-equivalent to using `MptStore` directly. The `BranchId` argument on every method is ignored.
@@ -415,14 +416,14 @@ object MptOverlay {
       pcTree: ParentChildTree[F],
       toHex: K => F[Hex],
       maxPendingBranches: Int,
-      bestTipFn: F[Option[BranchId]]
+      bestTipsFn: F[Set[BranchId]]
     ): F[MptOverlay[F, K]] =
       (
         Ref.of[F, Map[BranchId, BranchEntry]](Map.empty),
         Ref.of[F, Map[SnapshotOrdinal, BranchId]](Map.empty),
         // `lastCommittedBranchRef` (#113): tracks the most-recently-committed branch's id.
-        // Used as an additional eviction-protection tip alongside `bestTipFn`. Solves the
-        // lag race where `lastGlobalSnapshotStorage`-backed `bestTipFn` updates AFTER persist,
+        // Used as an additional eviction-protection tip alongside `bestTipsFn`. Solves the
+        // lag race where `lastGlobalSnapshotStorage`-backed tips update AFTER persist,
         // so during the persist window the just-committed branches would be the only eviction
         // candidates and get dropped — exactly the freshest chain we need to keep.
         Ref.of[F, Option[BranchId]](none[BranchId]),
@@ -437,7 +438,7 @@ object MptOverlay {
           lastCommittedBranchRef,
           mutex,
           maxPendingBranches,
-          bestTipFn
+          bestTipsFn
         ): MptOverlay[F, K]
       }
 
@@ -450,7 +451,7 @@ object MptOverlay {
       lastCommittedBranchRef: Ref[F, Option[BranchId]],
       mutex: Semaphore[F],
       maxPendingBranches: Int,
-      bestTipFn: F[Option[BranchId]]
+      bestTipsFn: F[Set[BranchId]]
     ) extends MptOverlay[F, K] {
 
       private val logger = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
@@ -478,7 +479,7 @@ object MptOverlay {
             changes <- handle.accRef.get
             _ <- pendingRef.update(_.updated(childTip, BranchEntry(handle.parent, changes, ordinal)))
             // Track this commit as the most-recent. Read by `evictIfOverCap` so the just-committed
-            // branch and its ancestors are protected even when the external `bestTipFn` lags.
+            // branch and its ancestors are protected even when the external `bestTipsFn` lags.
             _ <- lastCommittedBranchRef.set(childTip.some)
             // Eviction (#56.9): single-shot — each commit adds exactly one branch, so at most one over the
             // cap. Read pending+evict+write while still holding the mutex so a concurrent commit can't see
@@ -516,33 +517,39 @@ object MptOverlay {
       def discardBranch(branchId: BranchId): F[Unit] =
         mutex.permit.use(_ => pendingRef.update(_ - branchId))
 
-      /** Eviction policy (#56.9, refined #113). Drops the lowest-scoring non-ancestor branch when `pending.size` exceeds the cap. Score is
-        * `(ordinal asc, BranchId.value lex asc)` — lowest gets evicted. Two protected tips, both with full ancestor walk-back:
+      /** Eviction policy (#56.9, refined #113, multi-tip in #115). Drops the lowest-scoring non-ancestor branch when `pending.size` exceeds
+        * the cap. Score is `(ordinal asc, BranchId.value lex asc)` — lowest gets evicted. Multiple protected tips, each contributing its
+        * full ancestor walk-back to the protection set:
         *
-        *   - `bestTipFn`'s tip — externally-supplied "canonical chain head" (chainStore.bestTip on dag-l0; lastGlobalSnapshotStorage on
-        *     followers).
+        *   - `bestTipsFn`'s tips — externally-supplied set of viable chain heads. On dag-l0 this comes from `chainStore.allTips` (every
+        *     leaf in `byHash`, i.e. the canonical chain head AND every tentative-branch head being followed during fork-recovery). On
+        *     followers it comes from `lastGlobalSnapshotStorage` (singleton). Returning the full set instead of just `bestTip` solves the
+        *     fork-recovery race (#115): when validator commits canonical-N before the chain reorgs to it, canonical-N isn't yet bestTip but
+        *     its ancestors are needed for `mergedChain` walks at canonical-N+1. Returning all tips protects them.
         *   - `lastCommittedBranchRef`'s tip — most-recently-committed branch (set inside `commit` before this fn runs). Catches the lag
-        *     window where the upstream source backing `bestTipFn` updates AFTER overlay commit (e.g. `lastGlobalSnapshotStorage.set` runs
-        *     after the round completes; during the persist window the just-committed branches would otherwise be the only eviction
+        *     window where the upstream sources backing `bestTipsFn` update AFTER overlay commit (e.g. `chainStore.store` runs after overlay
+        *     commit on the leader path; during the persist window the just-committed branches would otherwise be the only eviction
         *     candidates and get dropped — exactly the freshest chain we need to keep).
         *
-        * If both refs return `None`, no ancestor protection applies (purely score-based eviction). If ALL pending branches are protected,
+        * If both sources return empty, no ancestor protection applies (purely score-based eviction). If ALL pending branches are protected,
         * eviction is skipped with a warn log — the overlay rides over-cap until finalization releases ancestors.
         */
       private def evictIfOverCap(pending: Map[BranchId, BranchEntry]): F[Map[BranchId, BranchEntry]] =
         if (pending.size <= maxPendingBranches) pending.pure[F]
         else
-          (bestTipFn, lastCommittedBranchRef.get).tupled.flatMap {
-            case (bestTipOpt, lastCommittedOpt) =>
-              val bestTipAncestors = bestTipOpt.fold(Set.empty[BranchId])(walkAncestorsInPending(_, pending))
+          (bestTipsFn, lastCommittedBranchRef.get).tupled.flatMap {
+            case (bestTips, lastCommittedOpt) =>
+              val bestTipsAncestors =
+                bestTips.foldLeft(Set.empty[BranchId])((acc, tip) => acc ++ walkAncestorsInPending(tip, pending))
               val lastCommittedAncestors = lastCommittedOpt.fold(Set.empty[BranchId])(walkAncestorsInPending(_, pending))
-              val ancestors = bestTipAncestors ++ lastCommittedAncestors
+              val ancestors = bestTipsAncestors ++ lastCommittedAncestors
               val candidates = pending.view.filterKeys(id => !ancestors.contains(id)).toMap
               if (candidates.isEmpty)
                 logger
                   .warn(
                     s"[MptOverlay] Eviction skipped: all ${pending.size} pending branches are protected " +
-                      s"(bestTip-ancestors=${bestTipAncestors.size}, lastCommitted-ancestors=${lastCommittedAncestors.size}); " +
+                      s"(bestTips=${bestTips.size}, bestTips-ancestors=${bestTipsAncestors.size}, " +
+                      s"lastCommitted-ancestors=${lastCommittedAncestors.size}); " +
                       s"cap=$maxPendingBranches. Overlay will ride over-cap until finalization releases ancestors."
                   )
                   .as(pending)
@@ -553,7 +560,7 @@ object MptOverlay {
                 logger
                   .info(
                     s"[MptOverlay] Evicting branch=${evictId.value} ordinal=${evictEntry.ordinal} (cap=$maxPendingBranches, " +
-                      s"pending=${pending.size}, ancestors=${ancestors.size})"
+                      s"pending=${pending.size}, ancestors=${ancestors.size}, bestTips=${bestTips.size})"
                   )
                   .as(pending - evictId)
               }

@@ -56,7 +56,7 @@ object HistoricalMptProofServiceSuite extends MutableIOSuite {
         store,
         pcTree,
         GlobalStateKey.toHex[IO],
-        bestTipFn = IO.pure(none[BranchId])
+        bestTipsFn = IO.pure(Set.empty[BranchId])
       )
       svc = HistoricalMptProofService.make[IO](store, overlay)
     } yield (store, overlay, svc)

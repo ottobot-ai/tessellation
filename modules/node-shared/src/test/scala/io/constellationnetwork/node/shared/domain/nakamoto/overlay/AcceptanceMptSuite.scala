@@ -129,7 +129,7 @@ object AcceptanceMptSuite extends MutableIOSuite {
         underlying = store,
         pcTree = pcTree,
         toHex = GlobalStateKey.toHex[IO],
-        bestTipFn = none[BranchId].pure[IO]
+        bestTipsFn = Set.empty[BranchId].pure[IO]
       )
 
       handle <- overlay.checkout(parentP)
@@ -162,7 +162,7 @@ object AcceptanceMptSuite extends MutableIOSuite {
         underlying = store,
         pcTree = pcTree,
         toHex = GlobalStateKey.toHex[IO],
-        bestTipFn = none[BranchId].pure[IO]
+        bestTipsFn = Set.empty[BranchId].pure[IO]
       )
 
       key = gskBalance(6)

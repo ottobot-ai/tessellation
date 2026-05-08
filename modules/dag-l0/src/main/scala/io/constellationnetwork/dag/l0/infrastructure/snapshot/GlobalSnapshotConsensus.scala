@@ -133,10 +133,12 @@ object GlobalSnapshotConsensus {
     // becomes canonical at an ordinal. Currently a passthrough impl by default — finalize is a
     // no-op until accept() migrates to the overlay (#56.10).
     mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
-    // #56.10 Phase I: setter on `SharedStorages` for the overlay's eviction `bestTipFn`. Invoked
-    // once the chain store has been constructed below so the overlay can walk back through pending
-    // branches without dropping the canonical chain under eviction pressure (#56.9).
-    setBestTipFn: F[Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId]] => F[Unit],
+    // #56.10 Phase I (multi-tip in #115): setter on `SharedStorages` for the overlay's eviction
+    // `bestTipsFn`. Invoked once the chain store has been constructed below so the overlay can walk
+    // back through pending branches without dropping the canonical chain under eviction pressure
+    // (#56.9). Returns the FULL set of fork tips, not just bestTip — protects canonical chain
+    // ancestors during fork-recovery (#115) when the local-fork chain is bestTip.
+    setBestTipsFn: F[Set[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId]] => F[Unit],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     eventGossipClient: EventGossipClient[F, GlobalSnapshotEvent],
     loggerBundle: LoggerBundle[F],
@@ -444,12 +446,19 @@ object GlobalSnapshotConsensus {
             .toResource
           _ <- chainStoreRef.set(Some(chainStore)).toResource
           _ <- chainStoreForLookupRef.set(Some(chainStore)).toResource
-          // #56.10 Phase I: wire the overlay's eviction `bestTipFn` to chainStore.bestTip so
-          // ancestor protection can find the canonical chain. The overlay captured a Ref-backed
-          // closure at SharedStorages.make time; setting the ref here completes the binding.
-          _ <- setBestTipFn(
-            chainStore.bestTip.map(
-              _.map(s => io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(s.hash))
+          // #56.10 Phase I (multi-tip in #115): wire the overlay's eviction `bestTipsFn` to
+          // `chainStore.allTips` so ancestor protection covers EVERY viable chain head — the
+          // canonical bestTip AND any tentative-branch heads being followed during fork-recovery.
+          // Without this, when validator commits canonical-N before chain reorgs to it, canonical-N
+          // is committed but isn't yet bestTip; subsequent eviction (with lastCommittedRef pointing
+          // elsewhere) drops canonical-N's branch, breaking the parent walk for canonical-N+1.
+          // Using `allTips` (every leaf in `byHash`) instead of just `bestTip` keeps the canonical
+          // chain alive through fork-recovery's commit-before-reorg window. The overlay captured a
+          // Ref-backed closure at SharedStorages.make time; setting the ref here completes the
+          // binding.
+          _ <- setBestTipsFn(
+            chainStore.allTips.map(
+              _.map(io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(_))
             )
           ).toResource
           // #56.10 Phase H: startup base-consistency guard. Runs in the boot Resource chain

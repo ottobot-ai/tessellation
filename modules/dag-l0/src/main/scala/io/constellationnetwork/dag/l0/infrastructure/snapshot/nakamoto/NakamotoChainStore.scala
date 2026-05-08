@@ -78,6 +78,13 @@ object NakamotoChainStore {
     /** Number of distinct fork tips (snapshots that aren't parents of other snapshots) */
     def forkCount: F[Int]
 
+    /** Set of all distinct fork-tip hashes (every snapshot in `byHash` that isn't the parent of another stored snapshot). Includes the
+      * canonical bestTip AND any tentative-branch heads we're following during fork-recovery. The MptOverlay uses this to protect ancestors
+      * of every viable chain head from cap-eviction (#115): when validator commits canonical-N before the chain reorgs to it, canonical-N
+      * isn't yet `bestTip` but IS in `allTips`, so its ancestors are protected.
+      */
+    def allTips: F[Set[Hash]]
+
     /** Last finalized ordinal */
     def lastFinalizedOrdinal: F[Long]
 
@@ -287,6 +294,12 @@ object NakamotoChainStore {
           stateRef.get.map { state =>
             val parentHashes = state.byHash.values.map(_.parentHash).toSet
             state.byHash.keys.count(h => !parentHashes.contains(h))
+          }
+
+        def allTips: F[Set[Hash]] =
+          stateRef.get.map { state =>
+            val parentHashes = state.byHash.values.map(_.parentHash).toSet
+            state.byHash.keySet -- parentHashes
           }
 
         def lastFinalizedOrdinal: F[Long] =

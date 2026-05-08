@@ -53,20 +53,22 @@ object SharedStorages {
       // tree used by consensus topology — passing it through means topology associations made during
       // `commit` / `finalizeBranch` stay in sync with the chain-store's view.
       mptOverlayParentChildTree <- ParentChildTree.make[F]
-      // Lazy-bound `bestTipFn` for overlay eviction (#56.10 Phase I, refined #113).
+      // Lazy-bound `bestTipsFn` for overlay eviction (#56.10 Phase I, refined #113, multi-tip in #115).
       //
-      // Default = `lastGlobalSnapshotStorage.get.map(_.map(h => BranchId(h.hash)))` — every layer
+      // Default = `lastGlobalSnapshotStorage.get.map(_.toSet.map(h => BranchId(h.hash)))` — every layer
       // (gl0/gl1/cl1/dl1/ml0) maintains `lastGlobalSnapshot`, and the canonical hash of the
       // most-recently-accepted snapshot is exactly what the overlay's eviction needs as the
-      // ancestor-walk tip. Without this, follower layers had no ancestor protection under
+      // ancestor-walk tip. Followers don't have multi-tip state (no fork-recovery), so the singleton
+      // set is correct here. Without this, follower layers had no ancestor protection under
       // MultiBranch and saw recoverable SPM under stress (gl1 ~50, cl1/dl1 ~28 each per full e2e).
       //
-      // dag-l0 overrides via `setBestTipFn(chainStore.bestTip...)` once `NakamotoChainStore` is
-      // built, since the chain store has the live tip ahead of `lastGlobalSnapshotStorage` (which
-      // updates after persist). For followers there is no chain store; the lastGlobal default is
-      // both correct and live (it's set in `createContext`'s commit path).
-      bestTipFnRef <- Ref.of[F, F[Option[BranchId]]](
-        lastGlobalSnapshotStorage.get.map(_.map(hashed => BranchId(hashed.hash)))
+      // dag-l0 overrides via `setBestTipsFn(chainStore.allTips...)` once `NakamotoChainStore` is
+      // built, since the chain store has every viable chain head — the canonical bestTip AND every
+      // tentative-branch head being followed during fork-recovery. Returning the full set (not just
+      // bestTip) is the #115 fix: when validator commits canonical-N before chain reorgs to it,
+      // canonical-N isn't bestTip but IS in allTips, so its ancestors are protected from eviction.
+      bestTipsFnRef <- Ref.of[F, F[Set[BranchId]]](
+        lastGlobalSnapshotStorage.get.map(_.map(hashed => BranchId(hashed.hash)).toSet)
       )
       mptOverlay <- MptOverlay.make[F, GlobalStateKey](
         // Phase J landed two of three prerequisites for MultiBranch:
@@ -97,7 +99,7 @@ object SharedStorages {
         underlying = mptStore,
         pcTree = mptOverlayParentChildTree,
         toHex = GlobalStateKey.toHex[F],
-        bestTipFn = bestTipFnRef.get.flatten
+        bestTipsFn = bestTipsFnRef.get.flatten
       )
     } yield
       new SharedStorages[F](
@@ -111,7 +113,7 @@ object SharedStorages {
         lastGlobalSnapshot = lastGlobalSnapshotStorage,
         mptStore = mptStore,
         mptOverlay = mptOverlay,
-        setBestTipFn = bestTipFnRef.set
+        setBestTipsFn = bestTipsFnRef.set
       ) {}
 }
 
@@ -126,8 +128,9 @@ sealed abstract class SharedStorages[F[_]] private (
   val lastGlobalSnapshot: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo] with LatestBalances[F],
   val mptStore: MptStore[F, GlobalStateKey],
   val mptOverlay: MptOverlay[F, GlobalStateKey],
-  // Setter for the overlay's eviction `bestTipFn` (#56.10 Phase I). Called from the dag-l0
-  // wiring layer once the chain store is constructed; layers without a chain store never
-  // call this and the overlay sees `none[BranchId]` from the default in `make`.
-  val setBestTipFn: F[Option[BranchId]] => F[Unit]
+  // Setter for the overlay's eviction `bestTipsFn` (#56.10 Phase I, multi-tip in #115). Called
+  // from the dag-l0 wiring layer once the chain store is constructed; layers without a chain
+  // store never call this and the overlay sees the lastGlobalSnapshot-derived singleton set
+  // from the default in `make`.
+  val setBestTipsFn: F[Set[BranchId]] => F[Unit]
 )

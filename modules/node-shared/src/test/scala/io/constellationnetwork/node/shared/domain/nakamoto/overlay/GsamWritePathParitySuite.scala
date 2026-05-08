@@ -213,7 +213,7 @@ object GsamWritePathParitySuite extends MutableIOSuite with Checkers {
         underlying = store,
         pcTree = pcTree,
         toHex = GlobalStateKey.toHex[IO],
-        bestTipFn = IO.pure(none[BranchId])
+        bestTipsFn = IO.pure(Set.empty[BranchId])
       )
       handle <- overlay.checkout(parentBranch)
       mpt = AcceptanceMpt.fromOverlay[IO](overlay, parentBranch, handle)
