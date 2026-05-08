@@ -45,7 +45,18 @@ object GlobalSnapshotStateChannelAcceptanceManager {
     pullDelay: NonNegLong = NonNegLong.MinValue,
     purgeDelay: NonNegLong = NonNegLong.MinValue
   ): F[GlobalSnapshotStateChannelAcceptanceManager[F]] =
-    Ref.of[F, Map[(Address, Hash), Long]](Map.empty).map { firstSeenKeysForOrdinalR =>
+    // First-sight registry keyed by `(address, parent.lastSnapshotHash)`. Tracks
+    // (firstSeenOrdinal, set of binary hashes seen so far at that key). The set membership
+    // ensures that under fork-recovery, when a freshly-built canonical binary arrives at a
+    // parent slot whose orphan-period predecessor was cached AND aged past purgeDelay, the
+    // new binary gets its own first-sight registration instead of being silently dropped via
+    // the orphan's stale `seenAt`. (#113) Without this, ml0 re-builds at parent=H but gl0
+    // says "already saw key (addr, H) at X (>5 ords ago), purge" and the canonical binary
+    // never advances gl0's metagraph view. The race-aging semantics for honest concurrent
+    // siblings (multiple binaries sharing the same parent in the same window) is preserved
+    // because they all share the SAME first-sight ord — they enter the set together at first
+    // sight, and all become pullable when shouldPull triggers.
+    Ref.of[F, Map[(Address, Hash), (Long, Set[Hash])]](Map.empty).map { firstSeenKeysForOrdinalR =>
       new GlobalSnapshotStateChannelAcceptanceManager[F] {
 
         def accept(
@@ -76,7 +87,7 @@ object GlobalSnapshotStateChannelAcceptanceManager {
                 }
             }
             .flatTap { _ =>
-              firstSeenKeysForOrdinalR.update(_.filterNot { case (_, seenAt) => shouldPurge(seenAt, ordinal) })
+              firstSeenKeysForOrdinalR.update(_.filterNot { case (_, (seenAt, _)) => shouldPurge(seenAt, ordinal) })
             }
             .map(_.unzip)
             .map {
@@ -97,18 +108,34 @@ object GlobalSnapshotStateChannelAcceptanceManager {
         private def allowedForProcessing(ordinal: SnapshotOrdinal, withHashes: List[StateChannelOutputWithHash]) =
           withHashes.groupBy(o => (o.output.address, o.output.snapshotBinary.lastSnapshotHash)).toList.traverse {
             case (key, outputs) =>
+              val incomingHashes = outputs.map(_.hash).toSet
               firstSeenKeysForOrdinalR.modify { current =>
                 current.get(key) match {
-                  case Some(seenAt) if shouldPurge(seenAt, ordinal) =>
-                    (current, Left(List.empty))
-                  case Some(seenAt) if shouldPull(seenAt, ordinal) =>
-                    (current, Right(outputs))
-                  case Some(_) =>
-                    (current, Left(outputs))
+                  case Some((seenAt, knownHashes)) if shouldPurge(seenAt, ordinal) =>
+                    val novelHashes = incomingHashes -- knownHashes
+                    if (novelHashes.nonEmpty) {
+                      // (#113) New binary content arrived at this parent-slot AFTER the cached
+                      // entry aged out. Re-register at this ordinal so the rebuilt canonical
+                      // binary doesn't get silently purged. Old binaries that already aged
+                      // remain blocked because they're still in `knownHashes`.
+                      val refreshed = (ordinal.value.value, knownHashes ++ incomingHashes)
+                      val novelOutputs = outputs.filter(o => novelHashes.contains(o.hash))
+                      val verdict =
+                        if (shouldPull(ordinal.value, ordinal)) Right(novelOutputs)
+                        else Left(novelOutputs)
+                      (current.updated(key, refreshed), verdict)
+                    } else
+                      (current, Left(List.empty))
+                  case Some((seenAt, knownHashes)) if shouldPull(seenAt, ordinal) =>
+                    val merged = (seenAt, knownHashes ++ incomingHashes)
+                    (current.updated(key, merged), Right(outputs))
+                  case Some((seenAt, knownHashes)) =>
+                    val merged = (seenAt, knownHashes ++ incomingHashes)
+                    (current.updated(key, merged), Left(outputs))
                   case None if shouldPull(ordinal.value, ordinal) =>
-                    (current + (key -> ordinal.value.value), Right(outputs))
+                    (current.updated(key, (ordinal.value.value, incomingHashes)), Right(outputs))
                   case None =>
-                    (current + (key -> ordinal.value.value), Left(outputs))
+                    (current.updated(key, (ordinal.value.value, incomingHashes)), Left(outputs))
                 }
               }
           }
