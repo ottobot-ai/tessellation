@@ -506,6 +506,16 @@ object MptOverlay {
                 case Some(entry) =>
                   for {
                     _ <- pendingRef.update(p => (p - oldChildTip).updated(newChildTip, entry))
+                    // #115: keep `lastCommittedBranchRef` consistent with the rekey. Without this,
+                    // the ref keeps pointing at the now-removed `oldChildTip`, and `walkAncestorsInPending`
+                    // returns just `{oldChildTip}` (acc + branch when not in pending) — providing zero
+                    // real ancestor protection during the eviction firing of the NEXT commit. With this
+                    // update, lastCommittedRef-based protection still walks the canonical chain even
+                    // before the next commit registers a new lastCommitted.
+                    _ <- lastCommittedBranchRef.update {
+                      case Some(current) if current.value === oldChildTip.value => newChildTip.some
+                      case other                                                => other
+                    }
                     _ <-
                       if (entry.parent.value === newChildTip.value) Async[F].unit
                       else pcTree.associate(newChildTip.value, entry.parent.value)
