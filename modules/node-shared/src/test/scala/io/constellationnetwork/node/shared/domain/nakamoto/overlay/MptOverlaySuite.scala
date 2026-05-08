@@ -25,7 +25,7 @@ import weaver.MutableIOSuite
   * Passthrough section: prove the impl behaves identically to using `MptStore` directly.
   *
   * Multi-branch section: prove sibling isolation (the #56.4 acceptance gate), chain reads, prefix scans, `buildRoot` with deltas, and
-  * `finalizeBranch` fold-forward + idempotency + conflict detection.
+  * `finalizeBranch` fold-forward + idempotency + reorg-replace (#113).
   */
 object MptOverlaySuite extends MutableIOSuite {
 
