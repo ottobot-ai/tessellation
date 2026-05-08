@@ -131,11 +131,17 @@ class BlockAcceptanceOpsManager[F[_]: Async: Parallel](
   def acceptTransactionRefs(
     lastTxRefs: SortedMap[Address, TransactionReference],
     lastTxRefsContextUpdate: Map[Address, TransactionReference],
-    acceptedTransactions: SortedSet[Signed[Transaction]]
+    acceptedTransactions: SortedSet[Signed[Transaction]],
+    initialTxRef: TransactionReference
   ): SortedMap[Address, TransactionReference] = {
     val updatedRefs = lastTxRefs ++ lastTxRefsContextUpdate
     val newDestinationAddresses = acceptedTransactions.map(_.destination) -- updatedRefs.keySet
-    updatedRefs ++ newDestinationAddresses.toList.map(_ -> TransactionReference.empty)
+    // [#113] For currency snapshots, the empty parent reference is `emptyCurrency(metagraphAddress)` — not
+    // `TransactionReference.empty (0, 0x000)`. cl1's TransactionStorage uses `emptyCurrency` for fresh wallets;
+    // populating destinations with DAG-style empty here causes `ParentHashNotEqLastTxHash` rejection at ml0
+    // when a fresh recipient subsequently sends. `initialTxRef` is `emptyCurrency(metagraphAddress)` per
+    // CurrencySnapshotAcceptanceManager line 184, the same value used by `getInitialTxRef` fallback.
+    updatedRefs ++ newDestinationAddresses.toList.map(_ -> initialTxRef)
   }
 
   def acceptTokenLockRefs(

@@ -221,7 +221,8 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     transactionsRefs = blockOps.acceptTransactionRefs(
       lastSnapshotContext.snapshotInfo.lastTxRefs,
       acceptanceBlocksResult.contextUpdate.lastTxRefs,
-      acceptedTransactions
+      acceptedTransactions,
+      initialTxRef
     )
 
     rewards <- calculateRewardsFn(acceptedTransactions)
