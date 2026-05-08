@@ -184,6 +184,15 @@ object StateChannel {
         _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
         _ <- persistGlobalSnapshot(canonicalSnapshot, canonicalState)
         _ <- triggerOnGlobalSnapshotPullHook(canonicalSnapshot, canonicalState)
+        // Drop pending state-channel binaries built against the orphan gl0 chain. Their
+        // `globalSyncView` references gl0 ordinals whose hashes no longer match canonical;
+        // gl0 will reject them with `Forced globalSyncView hash mismatch`, leaving the queue
+        // poisoned (totalPending grows monotonically as ml0 produces new binaries). Clearing
+        // here lets the next currency-consensus round build binaries against the new canonical
+        // gl0 view, restoring the metagraph propagation chain on gl0. Binaries already
+        // confirmed by gl0 (state-channel-snapshot included in a finalized global snapshot)
+        // are unaffected — `markAsConfirmed` already removed them. (#113)
+        _ <- services.stateChannelBinarySender.clearPending
         _ <- logger.info(
           s"ml0 recovered to canonical ord=${canonicalSnapshot.ordinal.show}; will resume pulling forward on next tick"
         )
