@@ -668,22 +668,56 @@ object MptOverlay {
                 pendingRef.get.flatMap { pending =>
                   pending.get(canonical) match {
                     case None =>
-                      // No pending entries to fold for the new canonical (already folded by the proposer or
-                      // by a prior call). Just update the finality marker so subsequent finalizeBranch calls
-                      // at this ord with the new canonical short-circuit on the (Some, equal) branch.
-                      finalizedRef.update(_.updated(ordinal, canonical)) >>
-                        logger
-                          .info(
-                            s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
-                              s"new=${canonical.value} (no pending fold needed)"
-                          )
-                          .as(FinalizationOutcome.NoOp: FinalizationOutcome)
+                      // Reorg-replace where the NEW canonical was never overlay-registered locally. Two cases:
+                      //   1. Idempotent — pending genuinely empty (a prior canonical's fold already cleared it).
+                      //   2. Bug surface (#116, iter14 evidence): pending still holds fork branches from the
+                      //      locally-rejected chain. Eviction (`evictIfOverCap`) and `walkAncestorsInPending`
+                      //      would treat them as protected via `lastCommittedBranchRef`, blocking real eviction
+                      //      and skewing chain walks. Worse: if the orphan branches' deltas were earlier folded
+                      //      into base on a prior fork-side finalize, base now holds rejected writes. Reads at
+                      //      `parentTip=canonical` walk pending→empty→base, returning the contaminated bytes
+                      //      (manifests as StateProofMismatch on followers, divergent local-built proofs on
+                      //      gl0 — see iter14 forensics: gl0-2 ord 81 PRE 64545a6f vs canonical cad91eed).
+                      // The overlay alone cannot reconstruct missing canonical deltas (caller never pushed
+                      // them via `commit`). What it CAN do: drop orphan pending so eviction/walks no longer
+                      // protect rejected ancestors, and reset `lastCommittedBranchRef` so the next commit
+                      // does not protect a now-stale tip. Caller is responsible for resyncing base via
+                      // `syncFromGlobalSnapshotInfo` when it can detect the case (gl0 NakamotoSyncDaemon
+                      // catch-up does this on reorg adoption; gl1/dl1 do it via `recoverFromOrphan` +
+                      // `setForRecovery` on StateProofMismatch). The WARN log surfaces the case so operators
+                      // can see when canonical was never overlay-registered locally.
+                      val droppedCount = pending.size
+                      val cleanup =
+                        if (droppedCount > 0)
+                          pendingRef.set(Map.empty) >> lastCommittedBranchRef.set(none)
+                        else Async[F].unit
+                      for {
+                        _ <- cleanup
+                        _ <- finalizedRef.update(_.updated(ordinal, canonical))
+                        _ <-
+                          if (droppedCount > 0)
+                            logger.warn(
+                              s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
+                                s"new=${canonical.value} — canonical NOT in pending; dropped $droppedCount " +
+                                s"orphan fork branch(es) from pendingRef + reset lastCommittedBranchRef. " +
+                                s"Base may still hold rejected writes — caller must verify base via " +
+                                s"syncFromGlobalSnapshotInfo if subsequent reads diverge."
+                            )
+                          else
+                            logger.info(
+                              s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
+                                s"new=${canonical.value} (pending already empty, no fold needed)"
+                            )
+                      } yield
+                        if (droppedCount > 0) FinalizationOutcome.Folded(0, droppedCount): FinalizationOutcome
+                        else FinalizationOutcome.NoOp: FinalizationOutcome
                     case Some(_) =>
                       val merged = mergedChain(canonical, pending)
                       val droppedCount = pending.size - countAncestors(canonical, pending)
                       for {
                         _ <- foldIntoBase(merged, ordinal)
                         _ <- pendingRef.set(Map.empty)
+                        _ <- lastCommittedBranchRef.set(none)
                         _ <- finalizedRef.update(_.updated(ordinal, canonical))
                         _ <- logger.info(
                           s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
@@ -707,6 +741,12 @@ object MptOverlay {
                       for {
                         _ <- foldIntoBase(merged, ordinal)
                         _ <- pendingRef.set(Map.empty)
+                        // pendingRef cleared → any prior `lastCommittedBranchRef` now points at a branch
+                        // that's no longer in pending (its ancestor walk yields zero protection per the
+                        // "branch not in pending" leaf in walkAncestorsInPending). Reset to None so a
+                        // future commit can re-establish the protection cleanly. Same rationale as the
+                        // reorg-replace `case Some` arm above (#116).
+                        _ <- lastCommittedBranchRef.set(none)
                         _ <- finalizedRef.update(_.updated(ordinal, canonical))
                         _ <- logger.info(
                           s"[MptOverlay] Finalized branch=${canonical.value} at ordinal=$ordinal: " +

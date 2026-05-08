@@ -879,6 +879,55 @@ object MptOverlaySuite extends MutableIOSuite {
     } yield expect(reorg == FinalizationOutcome.NoOp)
   }
 
+  test("multi-branch: finalizeBranch reorg-replace drops orphan fork pending when canonical is unknown (#116)") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (_, overlay) = pair
+
+      orphanKey = gskBalance(2100)
+      orphanValue = Balance(NonNegLong(7777L))
+
+      // Setup: commit + finalize branchA at the ordinal. After this, finalizedRef[ord]=branchA,
+      // pending is empty (foldIntoBase cleared it), lastCommittedBranchRef reset to None.
+      hA <- overlay.checkout(parentP)
+      _ <- hA.insert[Balance](gskBalance(2099), Balance(NonNegLong(1L)))
+      _ <- overlay.commit(hA, branchA, ordinal)
+      _ <- overlay.finalizeBranch(branchA, ordinal)
+
+      // The bug surface (iter14, gl0-2 solo-fork scenario): a node ingests a fork branch into
+      // the overlay AFTER finalizing the prior canonical at the same ord. This branch is an orphan
+      // — it's not on the canonical chain, but the overlay has no way to know that yet. In the real
+      // failing case this happens via a re-replay through createContext that registers the wrong
+      // chain head, then ChainSync delivers the canonical rebuilt from a peer, but the orphan stays
+      // in pending. Simulate this by committing an orphan branch (parent=parentP) at the same ordinal.
+      hOrphan <- overlay.checkout(parentP)
+      _ <- hOrphan.insert[Balance](orphanKey, orphanValue)
+      _ <- overlay.commit(hOrphan, branchC, ordinal)
+
+      // Reorg-replace fires: a NEW canonical (branchB) at the SAME ord, with branchB never
+      // overlay-registered. Before the #116 fix, this just bumped finalizedRef and left the orphan
+      // (branchC) in pending — eviction protected it via lastCommittedBranchRef and reads at
+      // canonical-tip parentTip leaked through to its writes via mergedChain ancestor walks.
+      // After the fix: pending is cleared, lastCommittedBranchRef reset, outcome reports the drop.
+      reorg <- overlay.finalizeBranch(branchB, ordinal)
+
+      // Orphan's write must no longer be visible from any branch — pending was cleared, base
+      // never received the orphan's delta (no fold happened for branchC), so reads return base only.
+      orphanReadFromOrphan <- overlay.get[Balance](branchC, orphanKey)
+      orphanReadFromCanonical <- overlay.get[Balance](branchB, orphanKey)
+      orphanReadFromBase <- overlay.get[Balance](parentP, orphanKey)
+    } yield
+      expect.all(
+        // Outcome reports the orphan was dropped (pending.size was 1 before clear).
+        reorg == FinalizationOutcome.Folded(0, 1),
+        // Orphan's write fully invisible — confirms pending was cleared.
+        orphanReadFromOrphan.isEmpty,
+        orphanReadFromCanonical.isEmpty,
+        orphanReadFromBase.isEmpty
+      )
+  }
+
   test("multi-branch: finalizeBranch on an unknown branch is a NoOp (idempotency entry recorded)") { res =>
     implicit val (h, _, js) = res
     for {
