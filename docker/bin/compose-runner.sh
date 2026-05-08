@@ -70,12 +70,12 @@ if [ "$LIST_TESTS" = "true" ]; then
   echo "  data-without-fee         Data transaction tests (without fee; override signer with CI_PRIVATE_KEY)"
   echo "  data-with-fee            Data transaction tests (with fee; override signer with CI_PRIVATE_KEY)"
   echo ""
-  echo "Multi-metagraph tests (require --metagraphs=K with K>=2, opt-in only):"
+  echo "Multi-metagraph tests (run by default under \`just test\` since NUM_METAGRAPHS>=2; require K>=2):"
   echo "  multi-metagraph          Sanity check K parallel metagraphs share gl0 with distinct IDs"
   echo ""
   echo "Usage: just test --test=dag-cluster --test=delegated-staking"
   echo "       just test --test=dag-cluster,rewards    (comma-separated)"
-  echo "       just test --metagraphs=2 --test=multi-metagraph   (multi-metagraph)"
+  echo "       just test --metagraphs=1                (single-metagraph, skips multi-metagraph)"
   exit 0
 fi
 
@@ -852,20 +852,22 @@ fi
 
 if [ -n "$METAGRAPH" ]; then
 
-  # Multi-metagraph sanity test: opt-in via --test=multi-metagraph, only runs
-  # when --metagraphs=K with K>=2 (otherwise the test refuses by design — no
-  # silent pass on a single-metagraph cluster). Not part of the default suite.
-  if [ -n "$SELECTED_TESTS" ] && echo "$SELECTED_TESTS" | tr ',' '\n' | grep -qx "multi-metagraph"; then
+  # Multi-metagraph sanity test. Runs by default when NUM_METAGRAPHS>=2 (default
+  # under `just test` since 2026-05-08), or explicitly when --test=multi-metagraph
+  # is selected. With NUM_METAGRAPHS=1 (single-metagraph runs) it's skipped to
+  # avoid silent passes — the test refuses K<2 by design.
+  if should_run_test "multi-metagraph" && [ "${NUM_METAGRAPHS:-1}" -ge 2 ]; then
     echo "================================================"
     echo "Running multi-metagraph sanity test (K=${NUM_METAGRAPHS})"
     echo "================================================"
-    if [ "${NUM_METAGRAPHS:-1}" -lt 2 ]; then
-      echo "ERROR: multi-metagraph test requires --metagraphs=K with K>=2 (got NUM_METAGRAPHS=${NUM_METAGRAPHS:-1})"
-      exit 1
-    fi
     cd $PROJECT_ROOT/.github/action_scripts
     node check_clusters/multi-metagraph.js
     show_time "Multi-metagraph sanity test completed"
+  elif [ -n "$SELECTED_TESTS" ] && echo "$SELECTED_TESTS" | tr ',' '\n' | grep -qx "multi-metagraph"; then
+    # Explicit --test=multi-metagraph with NUM_METAGRAPHS<2: hard error so the
+    # caller notices the misconfiguration instead of silently no-op'ing.
+    echo "ERROR: multi-metagraph test requires --metagraphs=K with K>=2 (got NUM_METAGRAPHS=${NUM_METAGRAPHS:-1})"
+    exit 1
   fi
 
   if should_run_test "currency"; then
