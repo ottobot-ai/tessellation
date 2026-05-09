@@ -283,12 +283,45 @@ object GlobalSnapshotContextFunctions {
                     if (mismatch) {
                       val perFieldDiffs = perFieldRootDiffs(computedStateProof, signedArtifact.stateProof)
                       val diffSuffix = if (perFieldDiffs.isEmpty) "" else s" — diffs: ${perFieldDiffs.mkString(", ")}"
+                      // #117 diag: when balances or lastStateChannelSnapshotHashes diverge, log the
+                      // local-side delta vs prior context so we can correlate the divergence to a
+                      // specific entry. The leader's full GSI isn't available locally — we can only
+                      // log what THIS node computed; cross-correlating with another node's logs
+                      // (via the same per-key fingerprints) localizes the offending key.
+                      val priorBalances = context.balances
+                      val computedBalances = snapshotInfo.balances
+                      val balDeltaKeys = (priorBalances.keySet ++ computedBalances.keySet).filter { addr =>
+                        priorBalances.get(addr) != computedBalances.get(addr)
+                      }
+                      val balDeltaSample = balDeltaKeys.toList.take(10).map { addr =>
+                        val before = priorBalances.get(addr).map(_.value.value.toString).getOrElse("none")
+                        val after = computedBalances.get(addr).map(_.value.value.toString).getOrElse("none")
+                        s"${addr.value.value.take(10)}=$before->$after"
+                      }
+                      val priorScHashes = context.lastStateChannelSnapshotHashes
+                      val computedScHashes = snapshotInfo.lastStateChannelSnapshotHashes
+                      val scDeltaKeys = (priorScHashes.keySet ++ computedScHashes.keySet).filter { addr =>
+                        priorScHashes.get(addr) != computedScHashes.get(addr)
+                      }
+                      val scDeltaSample = scDeltaKeys.toList.take(10).map { addr =>
+                        val before = priorScHashes.get(addr).map(_.show.take(8)).getOrElse("none")
+                        val after = computedScHashes.get(addr).map(_.show.take(8)).getOrElse("none")
+                        s"${addr.value.value.take(10)}=$before->$after"
+                      }
                       logger.error(
                         s"StateProofMismatch at ordinal=${signedArtifact.ordinal.show}: " +
                           s"computed.mptRoot=${computedStateProof.mptRoot.map(_.show.take(12)).getOrElse("none")} " +
                           s"claimed.mptRoot=${signedArtifact.stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")}" +
                           diffSuffix +
                           s" — rolling back MPT (transaction will rollback)"
+                      ) >> logger.error(
+                        s"StateProofMismatch at ordinal=${signedArtifact.ordinal.show} #117 DIAG " +
+                          s"prior.balances.size=${priorBalances.size} computed.balances.size=${computedBalances.size} " +
+                          s"balDeltaCount=${balDeltaKeys.size} balDeltaSample=[${balDeltaSample.mkString(",")}] " +
+                          s"prior.scHashes.size=${priorScHashes.size} computed.scHashes.size=${computedScHashes.size} " +
+                          s"scDeltaCount=${scDeltaKeys.size} scDeltaSample=[${scDeltaSample.mkString(",")}] " +
+                          s"signed.lastSnapshotHash=${signedArtifact.value.lastSnapshotHash.show.take(12)} " +
+                          s"signed.scSnapshots.metagraphs=${signedArtifact.stateChannelSnapshots.size}"
                       ) >> Async[F].raiseError[(GlobalSnapshotInfo, MptTxAction)](
                         StateProofMismatch(
                           ordinal = signedArtifact.ordinal,

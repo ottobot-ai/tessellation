@@ -181,7 +181,16 @@ class GlobalSnapshotAlignment[F[
       for {
         canonical <- services.globalL0.pullLatestSnapshot
         (canonicalSnapshot, canonicalState) = canonical
+        _ <- logger.info(
+          s"DL1 #117 DIAG recoverFromOrphan failed=$ref pulled canonical ord=${canonicalSnapshot.ordinal.show} " +
+            s"hash=${canonicalSnapshot.hash.show.take(12)} balances.size=${canonicalState.balances.size} " +
+            s"scHashes.size=${canonicalState.lastStateChannelSnapshotHashes.size}"
+        )
         _ <- sharedStorages.mptStore.syncFromGlobalSnapshotInfo(canonicalState, canonicalSnapshot.ordinal)
+        postSyncRoot <- sharedStorages.mptStore.underlying.getRootHashForOrdinal(canonicalSnapshot.ordinal)
+        _ <- logger.info(
+          s"DL1 #117 DIAG post-sync mptRoot=${postSyncRoot.map(_.value.show.take(12)).getOrElse("none")} at ord=${canonicalSnapshot.ordinal.show}"
+        )
         _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
         _ <- sharedStorages.lastNGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
         _ <- storages.globalL0Alignment.updateShouldRedownload(
