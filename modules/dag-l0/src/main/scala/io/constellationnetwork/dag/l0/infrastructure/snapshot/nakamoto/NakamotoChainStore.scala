@@ -225,30 +225,58 @@ object NakamotoChainStore {
 
                       val newState = state.copy(byHash = newByHash)
 
-                      val effect = pcTree.associate(snapshotHash, parentHash) >> chainSelection.shouldSwitch(currentTip, newTip).flatMap {
-                        case true =>
-                          // Better chain — reorg
-                          stateRef.update(_.copy(bestTipHash = Some(snapshotHash))) >>
-                            persistHead(stored, snapshotHash) >>
-                            logger
-                              .info(
-                                s"Chain reorg: ordinal=$ordinal slot=$slot beats previous tip ordinal=${currentBest.ordinal} slot=${currentBest.slot}"
-                              )
-                              .as(true)
-
-                        case false if parentHash === currentBestHash =>
-                          // Extends current chain — normal case
+                      // Extension-first dispatch. Three architecturally distinct outcomes from a peer-received
+                      // snapshot:
+                      //
+                      //   1. CANONICAL EXTENSION: incoming snapshot's parentHash IS our current bestTip. The new
+                      //      tip naturally extends the chain we're already on. `prepend` is the optimized linear
+                      //      append, with the `isNextSnapshot` invariant check. No state proofs need re-anchoring,
+                      //      no MPT base reset is implied. (Pre-#117 fix this case was conflated with reorg
+                      //      because `chainSelection.shouldSwitch` returns true for any longer chain — including
+                      //      a child of currentBestTip — so it routed through `setHeadForRecovery` and logged
+                      //      "Chain reorg" misleadingly. The DEBUG-level "Chain extended" leg below was dead code.)
+                      //
+                      //   2. TRUE REORG: incoming snapshot's parentHash is NOT our current bestTip AND
+                      //      ChainSelection picks the incoming chain over ours (longer / denser / lower-VRF
+                      //      tiebreak per maxvalid-tk + maxvalid-bg). We're switching to a different branch.
+                      //      `setHeadForRecovery` is the right API — it allows non-sequential head movement.
+                      //
+                      //   3. ALTERNATE BRANCH: incoming snapshot is on a different branch and ChainSelection
+                      //      keeps our current tip. Store the snapshot in the chain store as an alternate branch
+                      //      head (so eviction / future reorg-detection sees it) but don't change bestTip.
+                      //
+                      // The order matters: case 1 must be checked BEFORE invoking `shouldSwitch`, because
+                      // `shouldSwitch` cannot distinguish "child of current" from "competing chain at higher
+                      // ord" — both make the candidate win in `compare`.
+                      val effect = pcTree.associate(snapshotHash, parentHash) >> {
+                        if (parentHash === currentBestHash) {
+                          // CASE 1: canonical chain extension — append linearly
                           stateRef.update(_.copy(bestTipHash = Some(snapshotHash))) >>
                             persistLinear(stored) >>
                             logger.debug(s"Chain extended to ordinal=$ordinal slot=$slot").as(true)
-
-                        case false =>
-                          // Weaker fork — store but don't switch
-                          logger
-                            .debug(
-                              s"🔀 Stored fork snapshot ordinal=$ordinal slot=$slot (not switching)"
-                            )
-                            .as(true)
+                        } else {
+                          chainSelection.shouldSwitch(currentTip, newTip).flatMap {
+                            case true =>
+                              // CASE 2: real reorg — different branch wins
+                              stateRef.update(_.copy(bestTipHash = Some(snapshotHash))) >>
+                                persistHead(stored, snapshotHash) >>
+                                logger
+                                  .info(
+                                    s"Chain reorg: ordinal=$ordinal slot=$slot (parent=${parentHash.value.take(8)}) beats " +
+                                      s"previous tip ordinal=${currentBest.ordinal} slot=${currentBest.slot} " +
+                                      s"hash=${currentBestHash.value.take(8)}"
+                                  )
+                                  .as(true)
+                            case false =>
+                              // CASE 3: alternate branch loses ChainSelection — store but don't switch
+                              logger
+                                .debug(
+                                  s"🔀 Stored alternate branch snapshot ordinal=$ordinal slot=$slot " +
+                                    s"(parent=${parentHash.value.take(8)}, not switching from currentBest=${currentBestHash.value.take(8)})"
+                                )
+                                .as(true)
+                          }
+                        }
                       }
 
                       (newState, effect)
