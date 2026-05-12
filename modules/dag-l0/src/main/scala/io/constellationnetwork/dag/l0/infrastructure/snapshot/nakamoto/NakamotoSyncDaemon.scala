@@ -790,6 +790,7 @@ object NakamotoSyncDaemon {
                     lastNGlobalSnapshotStorage,
                     lastKnownSlotRef,
                     mptStore,
+                    mptOverlay,
                     eventMempool,
                     productionGate,
                     logger
@@ -936,6 +937,7 @@ object NakamotoSyncDaemon {
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     lastKnownSlotRef: Ref[F, Option[Long]],
     mptStore: MptStore[F, GlobalStateKey],
+    mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     productionGate: ProductionGate[F],
     logger: org.typelevel.log4cats.Logger[F]
@@ -992,9 +994,32 @@ object NakamotoSyncDaemon {
                         lastNGlobalSnapshotStorage.setForRecovery(hashed, context)
                     }
                   } >>
-                  // MPT self-healing: rebuild from the fork's state
+                  // MPT self-healing: rebuild from the fork's state.
+                  //
+                  // Before re-syncing the underlying base store from the fork's GlobalSnapshotInfo,
+                  // we MUST clean up the overlay's pending/finalized refs. `syncFromGlobalSnapshotInfo`
+                  // operates on the base `MptStore` directly (clears + repopulates) and bypasses the
+                  // overlay entirely. Without this `finalizeBranch` call the overlay's `pendingRef`
+                  // would still hold orphan local-fork branches whose deltas were built against the
+                  // pre-reorg base — those branches show up in `bestTipsFn`, get marked protected by
+                  // `walkAncestorsInPending`, and block `evictIfOverCap` from making progress
+                  // (pendingRef grows unboundedly past cap, see #116 iter14 forensics).
+                  //
+                  // The reorg-replace `case None` arm in `MptOverlay.finalizeBranch` handles the
+                  // expected case here ("canonical not in pending, locally-rejected fork branches
+                  // still resident"): it clears `pendingRef`, resets `lastCommittedBranchRef`, and
+                  // emits a WARN that the caller is responsible for base resync (which is exactly
+                  // what we do next via `syncFromGlobalSnapshotInfo`).
                   HasherSelector[F].withCurrent { implicit hasher =>
-                    mptStore.syncFromGlobalSnapshotInfo(context, SnapshotOrdinal.unsafeApply(snap.ordinal))
+                    signedSnapshot.toHashed[F].flatMap { hashed =>
+                      mptOverlay
+                        .finalizeBranch(
+                          io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(hashed.hash),
+                          SnapshotOrdinal.unsafeApply(snap.ordinal)
+                        )
+                        .void >>
+                        mptStore.syncFromGlobalSnapshotInfo(context, SnapshotOrdinal.unsafeApply(snap.ordinal))
+                    }
                   } >>
                   // Reconcile event mempool — evict stale DAG blocks, keep unconfirmed.
                   reconcileMempool(eventMempool, context, logger) >>
