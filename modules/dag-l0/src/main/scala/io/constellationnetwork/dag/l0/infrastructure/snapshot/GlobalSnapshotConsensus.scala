@@ -139,14 +139,6 @@ object GlobalSnapshotConsensus {
     // (#56.9). Returns the FULL set of fork tips, not just bestTip — protects canonical chain
     // ancestors during fork-recovery (#115) when the local-fork chain is bestTip.
     setBestTipsFn: F[Set[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId]] => F[Unit],
-    // Setter for the single canonical bestTip getter used by HTTP read endpoints (#117). Wired
-    // from `chainStore.bestTip` once NakamotoChainStore is built — gives gl0's HTTP balance/
-    // last-ref endpoints a way to query overlay state at the chain's current canonical view
-    // (pending → base fallthrough), so reads don't lag the chain by `finalizeBranch.foldIntoBase`
-    // cycles. Followers (gl1/cl1/dl1/ml0) never call this setter; they use the default which
-    // returns the last finalized global snapshot's hash — overlay.get falls through to base
-    // there since metagraph layers must not see gl0's pending state.
-    setBestTipFn: F[Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId]] => F[Unit],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     eventGossipClient: EventGossipClient[F, GlobalSnapshotEvent],
     loggerBundle: LoggerBundle[F],
@@ -467,15 +459,6 @@ object GlobalSnapshotConsensus {
           _ <- setBestTipsFn(
             chainStore.allTips.map(
               _.map(io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(_))
-            )
-          ).toResource
-          // #117: single canonical bestTip for HTTP read endpoints. Unlike `allTips`, this is
-          // just the chain's chosen current head — what consensus has decided is canonical.
-          // Used by `AddressService.getBalance` (and any other gl0 HTTP read path) to query
-          // overlay state at the chain's current view.
-          _ <- setBestTipFn(
-            chainStore.bestTip.map(
-              _.map(stored => io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(stored.hash))
             )
           ).toResource
           // #56.10 Phase H: startup base-consistency guard. Runs in the boot Resource chain

@@ -192,7 +192,6 @@ object Services {
             sharedStorages.mptStore,
             sharedStorages.mptOverlay,
             sharedStorages.setBestTipsFn,
-            sharedStorages.setBestTipFn,
             eventMempoolService,
             eventGossipClient,
             loggerBundle,
@@ -205,9 +204,7 @@ object Services {
       addressService = AddressService.make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
         cfg.shared.addresses,
         storages.globalSnapshot,
-        Some(sharedStorages.mptStore),
-        Some(sharedStorages.mptOverlay),
-        sharedStorages.bestTipFn
+        Some(sharedStorages.mptStore)
       )
       collateralService = MptStoreCollateral.make[F](cfg.collateral, sharedStorages.mptStore)
       getOrdinal = storages.globalSnapshot.headSnapshot.map(_.map(_.ordinal))

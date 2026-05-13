@@ -5,7 +5,6 @@ import cats.syntax.flatMap._
 import cats.syntax.functor._
 
 import io.constellationnetwork.node.shared.config.types.AddressesConfig
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, MptOverlay}
 import io.constellationnetwork.node.shared.domain.snapshot.services.AddressService
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.schema.SnapshotOrdinal
@@ -13,11 +12,10 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo}
 import io.constellationnetwork.schema.tokenLock.TokenLock
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
 import io.estatico.newtype.ops._
 
@@ -30,35 +28,13 @@ object AddressService {
   def make[F[_]: Async, S <: Snapshot, C <: SnapshotInfo[_]](
     addressCfg: AddressesConfig,
     snapshotStorage: SnapshotStorage[F, S, C],
-    maybeMptStore: Option[MptStore[F, GlobalStateKey]] = None,
-    maybeMptOverlay: Option[MptOverlay[F, GlobalStateKey]] = None,
-    bestTipBranchF: F[Option[BranchId]] = null.asInstanceOf[F[Option[BranchId]]]
-  ): AddressService[F, S] = {
-    val effectiveBestTipBranchF: F[Option[BranchId]] =
-      Option(bestTipBranchF).getOrElse(Async[F].pure(Option.empty[BranchId]))
+    maybeMptStore: Option[MptStore[F, GlobalStateKey]] = None
+  ): AddressService[F, S] =
     new AddressService[F, S] {
 
-      // #117 read path: when an overlay is wired, query at the canonical bestTip so HTTP reads
-      // reflect the chain's current view (pending → base fallthrough). Without overlay-aware
-      // reads, balances lag by `finalizeBranch.foldIntoBase` cycles — bounded by attestation
-      // finality (~5s healthy) but unbounded when finality stalls (#117 saw 2m15s gaps under
-      // multi-metagraph load).
       def getBalance(address: Address): F[Option[(Balance, SnapshotOrdinal)]] =
-        (maybeMptOverlay, maybeMptStore) match {
-          case (Some(overlay), _) =>
-            snapshotStorage.head.flatMap {
-              case Some((snapshot, _)) =>
-                effectiveBestTipBranchF.flatMap { maybeBranch =>
-                  val branch = maybeBranch.getOrElse(BranchId.base)
-                  overlay
-                    .get[Balance](branch, GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, address))
-                    .map { maybeBalance =>
-                      Some((maybeBalance.getOrElse(Balance.empty), snapshot.value.ordinal))
-                    }
-                }
-              case None => Async[F].pure(None)
-            }
-          case (None, Some(mptStore)) =>
+        maybeMptStore match {
+          case Some(mptStore) =>
             snapshotStorage.head.flatMap {
               case Some((snapshot, _)) =>
                 mptStore.getBalance(address).map { maybeBalance =>
@@ -66,7 +42,7 @@ object AddressService {
                 }
               case None => Async[F].pure(None)
             }
-          case (None, None) =>
+          case None =>
             snapshotStorage.head.map(_.map {
               case (snapshot, state) =>
                 val balance = state.balances.getOrElse(address, Balance.empty)
@@ -147,5 +123,4 @@ object AddressService {
         })
 
     }
-  }
 }

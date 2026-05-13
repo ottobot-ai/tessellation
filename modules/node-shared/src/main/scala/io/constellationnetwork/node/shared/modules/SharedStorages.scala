@@ -70,17 +70,6 @@ object SharedStorages {
       bestTipsFnRef <- Ref.of[F, F[Set[BranchId]]](
         lastGlobalSnapshotStorage.get.map(_.map(hashed => BranchId(hashed.hash)).toSet)
       )
-      // Single canonical bestTip getter (#117): used by HTTP read endpoints on gl0 to look up
-      // the latest accepted snapshot's state via overlay.get(branch, key). Unlike `bestTipsFn`
-      // (Set of all viable tips for eviction protection), this returns exactly the chain's
-      // canonical tip — what consensus has decided is current. dag-l0 overrides with
-      // `chainStore.bestTip` once NakamotoChainStore is built. Followers (gl1/cl1/dl1/ml0)
-      // keep the lastGlobalSnapshot default — that hash points to gl0's last finalized
-      // snapshot they downloaded, so overlay.get falls through to base (correct: metagraph
-      // layers must not see gl0's pending state, per the per-layer finality rule).
-      bestTipFnRef <- Ref.of[F, F[Option[BranchId]]](
-        lastGlobalSnapshotStorage.get.map(_.map(hashed => BranchId(hashed.hash)))
-      )
       mptOverlay <- MptOverlay.make[F, GlobalStateKey](
         // Phase J landed two of three prerequisites for MultiBranch:
         //   1. ✅ `overlay.commit(handle, BranchId(snapshotHash), ordinal)` is now called by the proposer
@@ -124,9 +113,7 @@ object SharedStorages {
         lastGlobalSnapshot = lastGlobalSnapshotStorage,
         mptStore = mptStore,
         mptOverlay = mptOverlay,
-        setBestTipsFn = bestTipsFnRef.set,
-        bestTipFn = bestTipFnRef.get.flatten,
-        setBestTipFn = bestTipFnRef.set
+        setBestTipsFn = bestTipsFnRef.set
       ) {}
 }
 
@@ -145,12 +132,5 @@ sealed abstract class SharedStorages[F[_]] private (
   // from the dag-l0 wiring layer once the chain store is constructed; layers without a chain
   // store never call this and the overlay sees the lastGlobalSnapshot-derived singleton set
   // from the default in `make`.
-  val setBestTipsFn: F[Set[BranchId]] => F[Unit],
-  // Single canonical bestTip getter for HTTP read paths (#117). Used by gl0 services that need
-  // to query the overlay at the chain's canonical tip — `overlay.get(bestTipBranch, key)` walks
-  // pending → falls through to base. Without this, balance/lastTxRef HTTP reads on gl0 lag
-  // by however long it takes `finalizeBranch.foldIntoBase` to fire (seconds when finality is
-  // healthy, minutes when attestation gossip degrades).
-  val bestTipFn: F[Option[BranchId]],
-  val setBestTipFn: F[Option[BranchId]] => F[Unit]
+  val setBestTipsFn: F[Set[BranchId]] => F[Unit]
 )
