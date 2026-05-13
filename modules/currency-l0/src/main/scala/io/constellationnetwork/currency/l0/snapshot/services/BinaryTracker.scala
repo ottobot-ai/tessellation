@@ -60,7 +60,16 @@ case class TrackerState(
   //
   // Cleared per-hash when the binary is truly confirmed (markAsConfirmed) or pruned
   // (pruneFinalizedBelow). #123.
-  softObservedHashes: Set[Hash]
+  softObservedHashes: Set[Hash],
+  // High-water mark of currency-snapshot ordinals known to be confirmed at gl0
+  // (across the entire run, monotonic — never decreases). Pending binaries whose
+  // `currencySnapshotOrdinal <= highestConfirmedCurrencyOrd` are *definitionally*
+  // superseded: gl0 has accepted a later currency snapshot, so the older one was
+  // either a sibling that lost the race or a member of a local fork gl0 abandoned.
+  // Used by `markAsConfirmed` to GC stale Pendings on every confirmation tick.
+  // Without this, m0's queue accumulates indefinitely under chain-link drift,
+  // slowing throughput (#125, observed in iter25).
+  highestConfirmedCurrencyOrd: SnapshotOrdinal
 )
 
 object TrackerState {
@@ -70,7 +79,8 @@ object TrackerState {
     retryMode = false,
     noConfirmationsSinceRetryCount = NonNegLong.MinValue,
     backoffExponent = NonNegLong.MinValue,
-    softObservedHashes = Set.empty
+    softObservedHashes = Set.empty,
+    highestConfirmedCurrencyOrd = SnapshotOrdinal.MinValue
   )
 }
 
@@ -143,15 +153,52 @@ object BinaryTracker {
               case (PendingBinary(binaryData, _, _, _), index) if confirmedHashes.contains(binaryData.hash) => index
             }.maxOption
 
-            val updatedTracked = indexedTracked.map {
+            val promoted = indexedTracked.map {
               case (pendingBinary @ PendingBinary(_, _, _, _), index) if index <= maybeHighestConfirmationIndex.getOrElse(-1) =>
                 ConfirmedBinary(pendingBinary, proof)
               case (other, _) => other
             }
 
-            // Clear soft observations for hashes now confirmed — the real-confirmed
-            // status supersedes the operational signal.
-            state.copy(tracked = updatedTracked, softObservedHashes = state.softObservedHashes -- confirmedHashes)
+            // Update high-water mark using the highest currencyOrd among entries we
+            // just confirmed (or had already confirmed earlier). Monotonic — only
+            // grows. We read from `promoted` because the indexed-prefix promotion
+            // above already converted all matched Pendings to ConfirmedBinary.
+            val newWatermark = promoted.collect {
+              case ConfirmedBinary(p, _) => p.currencySnapshotOrdinal
+            }.maxOption
+              .fold(state.highestConfirmedCurrencyOrd) { maxOrd =>
+                if (maxOrd.value.value > state.highestConfirmedCurrencyOrd.value.value) maxOrd
+                else state.highestConfirmedCurrencyOrd
+              }
+
+            // GC superseded Pendings: any PendingBinary whose currencySnapshotOrdinal
+            // is STRICTLY LESS than the watermark is definitionally stale (gl0 has
+            // accepted a later currency snapshot, so this one was either on a local
+            // fork gl0 abandoned or simply too old to matter). Dropping them prevents
+            // queue growth under chain-link drift (#125, iter25 data-with-fee root
+            // cause). Safe because gl0's `lastStateChannelSnapshotHashes[addr]` has
+            // already advanced past these — they would only ever yield `chain-link
+            // rejection → returnedSCEvents` forever, never actually landing.
+            //
+            // We use strict `<` (not `<=`) so unmatched siblings at the *same* ord as
+            // a confirmed binary survive: a sibling could still legitimately chain
+            // forward if it was the canonical-pick at gl0 we just haven't observed yet.
+            // The next confirmation tick advances watermark past their ord and they
+            // get cleaned up naturally.
+            val gcd = promoted.filterNot {
+              case p: PendingBinary => p.currencySnapshotOrdinal.value.value < newWatermark.value.value
+              case _                => false
+            }
+
+            // Clear soft observations for hashes now confirmed or GC'd.
+            val remainingHashes = gcd.collect { case p: PendingBinary => p.binary.hash }.toSet
+            val remainingSoftObs = state.softObservedHashes.intersect(remainingHashes)
+
+            state.copy(
+              tracked = gcd,
+              softObservedHashes = remainingSoftObs,
+              highestConfirmedCurrencyOrd = newWatermark
+            )
           }
 
         def softObserve(hashes: Set[Hash]): F[Unit] =
