@@ -20,7 +20,7 @@
 | Chain-derived eta (replaces accumulator) | 9b1ede57 | — |
 | MPT stateProof determinism (full-rebuild workaround) | b7489986 | — |
 | Self-healing incremental MPT (detect + resync on fork) | 21cec6de | — |
-| MptUndoJournal (per-ordinal delta tracking) | 289bcece | — |
+| ~~MptUndoJournal (per-ordinal delta tracking)~~ — REMOVED in #56.10 (`5ecc0772`, 2026-05-06); replaced by `MptOverlay` branch checkout/discard. | 289bcece (introduction); `5ecc0772` (removal) | — |
 | Content validation enforcement | 289bcece | — |
 | NakamotoSnapshotValidator (4-stage: VRF+sig+cert+content) | — | — |
 | /latest/info endpoint for validators | 5a09af8f | — |
@@ -72,11 +72,7 @@
 
 ### Medium Priority — Testnet Hardening
 
-6. **Proactive MPT Rollback on Fork Switch**
-   - MptUndoJournal exists and records deltas, but `unapplyTo` not yet wired in NakamotoSyncDaemon
-   - Currently relies on self-healing (detect divergence → full resync)
-   - Need: on reorg in chainStore, call `journal.unapplyTo(commonAncestorOrdinal)` before accepting new fork
-   - Required for testnet scale (100MB state, 80k trie entries — full resync too expensive)
+6. ~~**Proactive MPT Rollback on Fork Switch**~~ — superseded by `MptOverlay` design (#56). MultiBranch overlay (production default since #56.11 / `e3538d9b`) holds per-branch pending writes; fork-switch is a `checkout`/`discardBranch` op against the overlay, not a journal replay. Self-healing remains as the fallback for irrecoverable base divergence.
 
 7. **Production Abandonment on Better Gossip**
    - ProductionGate infrastructure exists but threshold-based abandonment not wired
