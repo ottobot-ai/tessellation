@@ -6,6 +6,7 @@ import cats.effect.kernel.{Async, Ref}
 import cats.syntax.flatMap._
 import cats.syntax.functor._
 import cats.syntax.list._
+import cats.syntax.show._
 import cats.syntax.traverse._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
@@ -23,6 +24,7 @@ import io.constellationnetwork.syntax.sortedCollection._
 import _root_.cats.kernel.Order
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
+import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 trait GlobalSnapshotStateChannelAcceptanceManager[F[_]] {
   def accept(
@@ -57,6 +59,8 @@ object GlobalSnapshotStateChannelAcceptanceManager {
     // because they all share the SAME first-sight ord — they enter the set together at first
     // sight, and all become pullable when shouldPull triggers.
     Ref.of[F, Map[(Address, Hash), (Long, Set[Hash])]](Map.empty).map { firstSeenKeysForOrdinalR =>
+      val logger = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
+
       new GlobalSnapshotStateChannelAcceptanceManager[F] {
 
         def accept(
@@ -97,13 +101,41 @@ object GlobalSnapshotStateChannelAcceptanceManager {
         private def acceptForAddress(
           ordinal: SnapshotOrdinal,
           allowedPeers: Option[NonEmptySet[PeerId]]
-        )(lastHash: Hash, outputs: List[StateChannelOutput])(implicit hasher: Hasher[F]) = for {
-          outputsWithHashes <- outputs.traverse(stateChannelOutputWithHashes)
-          (notAllowed, allowed) <- allowedForProcessing(ordinal, outputsWithHashes).map(_.partitionMap(identity))
-          (impossibleCandidates, possibleCandidates) = onlyPossibleReferences(lastHash, allowed.flatten).partitionMap(identity)
-          toReturn = notAllowed.flatten.map(_.output) ++ impossibleCandidates.map(_.output)
-          toAdd = selectStateChannels(allowedPeers)(lastHash, possibleCandidates)
-        } yield (toAdd, toReturn)
+        )(lastHash: Hash, outputs: List[StateChannelOutput])(implicit hasher: Hasher[F]) =
+          for {
+            outputsWithHashes <- outputs.traverse(stateChannelOutputWithHashes)
+            allowedResult <- allowedForProcessing(ordinal, outputsWithHashes).map(_.partitionMap(identity))
+            (notAllowed, allowed) = allowedResult
+            chainLinked = onlyPossibleReferences(lastHash, allowed.flatten).partitionMap(identity)
+            (impossibleCandidates, possibleCandidates) = chainLinked
+            // #123: surface chain-link rejections that were previously silent. Without this
+            // log a metagraph whose binaries don't chain (e.g. genesis-hash divergence
+            // between gl0 and ml0) gets infinite silent rejection — the queue strands, no
+            // diagnostic anywhere. With this log the address + parent-hash mismatch is
+            // visible per round.
+            _ <- logImpossibleCandidates(ordinal, lastHash, impossibleCandidates, possibleCandidates)
+            toReturn = notAllowed.flatten.map(_.output) ++ impossibleCandidates.map(_.output)
+            toAdd = selectStateChannels(allowedPeers)(lastHash, possibleCandidates)
+          } yield (toAdd, toReturn)
+
+        private def logImpossibleCandidates(
+          ordinal: SnapshotOrdinal,
+          lastHash: Hash,
+          impossible: List[StateChannelOutputWithHash],
+          possible: List[StateChannelOutputWithHash]
+        ): F[Unit] =
+          impossible.headOption match {
+            case Some(rejected) =>
+              val address = rejected.output.address
+              val lastSnapshotHashes = impossible.map(_.output.snapshotBinary.value.lastSnapshotHash).distinct
+              logger.warn(
+                s"[SCAcceptance] Chain-link rejection at ord=${ordinal.show} for addr=${address.show}: " +
+                  s"gl0.lastHash=${lastHash.value.take(12)} but binary.lastSnapshotHash in " +
+                  s"{${lastSnapshotHashes.map(_.value.take(12)).mkString(",")}}. " +
+                  s"${impossible.size} returned, ${possible.size} possible."
+              )
+            case None => Async[F].unit
+          }
 
         private def allowedForProcessing(ordinal: SnapshotOrdinal, withHashes: List[StateChannelOutputWithHash]) =
           withHashes.groupBy(o => (o.output.address, o.output.snapshotBinary.lastSnapshotHash)).toList.traverse {
@@ -124,8 +156,24 @@ object GlobalSnapshotStateChannelAcceptanceManager {
                         if (shouldPull(ordinal.value, ordinal)) Right(novelOutputs)
                         else Left(novelOutputs)
                       (current.updated(key, refreshed), verdict)
-                    } else
-                      (current, Left(List.empty))
+                    } else {
+                      // (#123) All incoming hashes are same-hash resends of binaries that
+                      // aged out without being included. The previous behavior was to silently
+                      // drop them via Left(List.empty), which strands queues whose binaries
+                      // *could* now be chain-linked (e.g. gl0's lastHash for this address has
+                      // advanced compatibly since first sight, or first-sight happened during
+                      // a gl0 bootstrap window where chain-link wasn't yet possible).
+                      //
+                      // Re-register at this ordinal and re-emit the outputs so the chain-link
+                      // check at `onlyPossibleReferences` gets a fresh chance. If chain-link
+                      // still rejects them, they flow into `toReturn` (returnedSCEvents) so the
+                      // metagraph is informed and can re-build, instead of being silently lost.
+                      val refreshed = (ordinal.value.value, knownHashes ++ incomingHashes)
+                      val verdict =
+                        if (shouldPull(ordinal.value, ordinal)) Right(outputs)
+                        else Left(outputs)
+                      (current.updated(key, refreshed), verdict)
+                    }
                   case Some((seenAt, knownHashes)) if shouldPull(seenAt, ordinal) =>
                     val merged = (seenAt, knownHashes ++ incomingHashes)
                     (current.updated(key, merged), Right(outputs))

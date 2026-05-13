@@ -301,10 +301,22 @@ object StateChannel {
     // unreachable on the happy path; kept as defense-in-depth and logged as WARN if
     // it ever fires.
     //
+    // State-advancement gating vs SC-binary confirmation (#123): G1 correctly gates
+    // *state advancement* (only finalized snapshots feed accept() / MPT updates), but
+    // SC-binary confirmation is a separate operational signal. A binary that landed in
+    // gl0 best-tip (unfinalized) is already making progress through consensus, and
+    // retry-mode shouldn't shrink cap to 0 while waiting on the slower finality marker.
+    // So we pull the full best-tip range, soft-observe the unfinalized slice via
+    // `stateChannelBinarySender.softConfirm` (operational signal — doesn't prune, doesn't
+    // promote Pending→Confirmed), then return only the finalized slice for state derivation.
+    //
     // ml0 already fetches `pullLatestFinalizedOrdinal` in handleIncrementalSnapshot for
-    // SC-binary pruning (:236). We fetch it here too so we never download unfinalized
-    // snapshots; the two calls are cheap (single peer endpoint) and the values are
-    // monotonic per node so transient inconsistency between calls is harmless.
+    // SC-binary pruning (:236). We fetch it here too so we never advance state past
+    // unfinalized snapshots; the two calls are cheap (single peer endpoint) and the
+    // values are monotonic per node so transient inconsistency between calls is harmless.
+    def softObserveUnfinalized(unfinalized: List[Hashed[GlobalIncrementalSnapshot]]): F[Unit] =
+      unfinalized.traverse_(services.stateChannelBinarySender.softConfirm)
+
     val pullFinalityGated: F[Either[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo), List[Hashed[GlobalIncrementalSnapshot]]]] =
       (storages.lastSyncGlobalSnapshot.get.map(_.map(_.ordinal)), services.globalL0.pullLatestFinalizedOrdinal).flatMapN {
         case (None, _) =>
@@ -318,12 +330,45 @@ object StateChannel {
             .info(s"ml0 pullFinalityGated: waiting on gl0 finality (last=${lastOrd.show}, finalized=unknown); idling")
             .as(List.empty[Hashed[GlobalIncrementalSnapshot]].asRight)
         case (Some(lastOrd), Some(finalizedOrd)) if finalizedOrd <= lastOrd =>
+          // No finalized state to advance to. But best-tip may have unfinalized snapshots
+          // containing our binaries — still pull them for soft-observation so retry-mode
+          // doesn't starve for confirmation signal during the gap. Single HTTP call, no
+          // state mutation.
           logger
-            .debug(s"ml0 pullFinalityGated: caught up to finality (last=${lastOrd.show}, finalized=${finalizedOrd.show})")
-            .as(List.empty[Hashed[GlobalIncrementalSnapshot]].asRight)
+            .debug(
+              s"ml0 pullFinalityGated: caught up to finality (last=${lastOrd.show}, finalized=${finalizedOrd.show}); polling best-tip for SC observation"
+            ) >>
+            services.globalL0
+              .pullGlobalSnapshots(lastOrd)
+              .flatMap {
+                case Left(_)          => Applicative[F].unit
+                case Right(snapshots) => softObserveUnfinalized(snapshots.filter(_.ordinal > finalizedOrd))
+              }
+              .as(List.empty[Hashed[GlobalIncrementalSnapshot]].asRight)
         case (Some(lastOrd), Some(finalizedOrd)) =>
+          // Pull raw (up to best-tip), split into finalized + unfinalized. Finalized feeds
+          // state advancement (return path); unfinalized feeds soft-observation (operational).
           logger.info(s"ml0 pullFinalityGated: pulling (last=${lastOrd.show}, finalized=${finalizedOrd.show}]") >>
-            services.globalL0.pullFinalizedGlobalSnapshots(lastOrd, finalizedOrd).map(_.asRight)
+            services.globalL0.pullGlobalSnapshots(lastOrd).flatMap {
+              case Left(_) =>
+                // Bootstrap tuple — shouldn't happen here (we have lastOrd). Preserve the
+                // original `pullFinalizedGlobalSnapshots` behavior of treating it as a
+                // transient state and returning empty (idle); the bootstrap path runs
+                // separately via handleInitialSnapshot from the None case above.
+                logger
+                  .info(s"pullFinalityGated: bootstrap tuple returned unexpectedly for last=${lastOrd.show}, returning empty")
+                  .as(List.empty[Hashed[GlobalIncrementalSnapshot]].asRight)
+              case Right(allSnapshots) =>
+                val (finalized, unfinalized) = allSnapshots.partition(_.ordinal <= finalizedOrd)
+                softObserveUnfinalized(unfinalized) >>
+                  logger
+                    .info(
+                      s"pullFinalityGated: kept ${finalized.size} finalized, soft-observed ${unfinalized.size} unfinalized" +
+                        s" (last=${lastOrd.show}, finalized=${finalizedOrd.show})"
+                    )
+                    .whenA(unfinalized.nonEmpty)
+                    .as(finalized.asRight)
+            }
       }
 
     pullFinalityGated.flatMap {

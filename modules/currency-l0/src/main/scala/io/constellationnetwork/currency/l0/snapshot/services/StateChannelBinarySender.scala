@@ -36,6 +36,12 @@ trait StateChannelBinarySender[F[_]] {
     lastFinalizedGlobalOrdinal: Option[SnapshotOrdinal] = None
   ): F[Unit]
 
+  /** Soft-confirm via an unfinalized (best-tip) gl0 snapshot. Operational signal only — tracks which pending binaries have landed in gl0
+    * best-tip so retry-mode can keep cap healthy without waiting on G1 finality. Does NOT prune, does NOT promote Pending→Confirmed (a
+    * best-tip reorg cannot strand a binary). #123.
+    */
+  def softConfirm(globalSnapshot: Hashed[GlobalIncrementalSnapshot]): F[Unit]
+
   def clearPending: F[Unit]
 }
 
@@ -147,6 +153,17 @@ object StateChannelBinarySender {
         _ <- tracker.pruneFinalizedBelow(finalizedOrdinal)
         metricsState <- tracker.getState
         _ <- updateStateChannelRetryParametersMetrics(metricsState)
+      } yield ()
+
+    def softConfirm(globalSnapshot: Hashed[GlobalIncrementalSnapshot]): F[Unit] =
+      for {
+        identifier <- identifierStorage.get
+        observedHashes <- getConfirmedHashes(identifier, globalSnapshot)
+        _ <-
+          if (observedHashes.nonEmpty) {
+            tracker.softObserve(observedHashes) >>
+              logger.debug(s"[Queue] Soft-observed ${observedHashes.size} binaries at best-tip ord=${globalSnapshot.ordinal.show}")
+          } else Applicative[F].unit
       } yield ()
 
     def clearPending: F[Unit] =

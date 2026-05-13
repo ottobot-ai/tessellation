@@ -49,7 +49,18 @@ case class TrackerState(
   cap: NonNegLong,
   retryMode: Boolean,
   noConfirmationsSinceRetryCount: NonNegLong,
-  backoffExponent: NonNegLong
+  backoffExponent: NonNegLong,
+  // Hashes of pending binaries observed in a gl0 best-tip snapshot (unfinalized).
+  // Used as an *operational signal* to keep retry-cap healthy under G1 finality-
+  // gating: a binary that landed in gl0 best-tip is progressing through gl0
+  // consensus, so retry-mode should not panic and shrink cap as if no confirmations
+  // are happening. Distinct from `ConfirmedBinary` status — soft observations do
+  // NOT promote Pending→Confirmed, so a best-tip reorg cannot strand the binary in
+  // confirmed-but-never-pruned state.
+  //
+  // Cleared per-hash when the binary is truly confirmed (markAsConfirmed) or pruned
+  // (pruneFinalizedBelow). #123.
+  softObservedHashes: Set[Hash]
 )
 
 object TrackerState {
@@ -58,7 +69,8 @@ object TrackerState {
     cap = NonNegLong.unsafeFrom(4L),
     retryMode = false,
     noConfirmationsSinceRetryCount = NonNegLong.MinValue,
-    backoffExponent = NonNegLong.MinValue
+    backoffExponent = NonNegLong.MinValue,
+    softObservedHashes = Set.empty
   )
 }
 
@@ -70,6 +82,16 @@ trait BinaryTracker[F[_]] {
   ): F[Unit]
   def markAsSent(binaryHash: Hash): F[Unit]
   def markAsConfirmed(confirmedHashes: Set[Hash], proof: GlobalSnapshotConfirmationProof): F[Unit]
+
+  /** Mark binaries as observed in an unfinalized gl0 snapshot (best-tip).
+    *
+    * Operational signal only — does NOT promote tracked entries to ConfirmedBinary. Used by RetryStrategy to keep cap healthy under G1
+    * finality-gating: a binary that landed in gl0 best-tip is progressing through consensus, so retry-mode shouldn't shrink cap as if no
+    * progress is happening. Safe under best-tip reorgs because the binary stays Pending and re-sends continue — if reorged out, the next
+    * true confirmation just doesn't arrive and the soft observation eventually decays via `markAsConfirmed`/`pruneFinalizedBelow` clearing
+    * the entry. #123.
+    */
+  def softObserve(hashes: Set[Hash]): F[Unit]
   def getPendingToRetry(cap: Int): F[List[PendingBinary]]
   def getState: F[TrackerState]
   def updateState(f: TrackerState => TrackerState): F[Unit]
@@ -127,7 +149,20 @@ object BinaryTracker {
               case (other, _) => other
             }
 
-            state.copy(tracked = updatedTracked)
+            // Clear soft observations for hashes now confirmed — the real-confirmed
+            // status supersedes the operational signal.
+            state.copy(tracked = updatedTracked, softObservedHashes = state.softObservedHashes -- confirmedHashes)
+          }
+
+        def softObserve(hashes: Set[Hash]): F[Unit] =
+          stateRef.update { state =>
+            // Only retain observations for hashes that are still Pending in tracked.
+            // Confirmed binaries don't need this signal, and untracked hashes have nothing
+            // to amplify in retry-mode logic.
+            val pendingHashes = state.tracked.collect { case p: PendingBinary => p.binary.hash }.toSet
+            val novel = hashes.intersect(pendingHashes) -- state.softObservedHashes
+            if (novel.isEmpty) state
+            else state.copy(softObservedHashes = state.softObservedHashes ++ novel)
           }
 
         def getPendingToRetry(cap: Int): F[List[PendingBinary]] =
@@ -154,7 +189,10 @@ object BinaryTracker {
                 proof.globalOrdinal.value.value <= lastFinalizedGlobalOrdinal.value.value
               case _ => false
             }
-            state.copy(tracked = updatedTracked)
+            // After pruning, drop soft observations for hashes that are no longer tracked
+            // (they were pruned, so we're done with them).
+            val remainingHashes = updatedTracked.collect { case p: PendingBinary => p.binary.hash }.toSet
+            state.copy(tracked = updatedTracked, softObservedHashes = state.softObservedHashes.intersect(remainingHashes))
           }
       }
     }

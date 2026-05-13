@@ -41,10 +41,20 @@ object RetryStrategy {
     } else if (!state.retryMode) {
       state
     } else {
-      val confirmedCount = state.tracked.count(_.isInstanceOf[ConfirmedBinary])
+      val realConfirmedCount = state.tracked.count(_.isInstanceOf[ConfirmedBinary])
+      // Soft observations from gl0 best-tip count as progress under G1 (#123). A binary
+      // that landed in best-tip is moving through consensus even if not yet finalized;
+      // shrinking cap to 0 would strand the queue waiting on finality-gated confirmations
+      // while pending binaries continue piling up. Soft signals do NOT trigger pruning —
+      // only the finalized path can drop binaries (`pruneFinalizedBelow`).
+      val softObservedPendingCount = state.tracked.count {
+        case p: PendingBinary => state.softObservedHashes.contains(p.binary.hash)
+        case _                => false
+      }
+      val effectiveConfirmedCount = realConfirmedCount + softObservedPendingCount
 
-      if (confirmedCount > 0) {
-        updateCapOnConfirmations(state, confirmedCount)
+      if (effectiveConfirmedCount > 0) {
+        updateCapOnConfirmations(state, effectiveConfirmedCount)
       } else if (state.cap.value > 1) {
         decreaseCap(state)
       } else if (state.cap.value == 1) {

@@ -96,9 +96,18 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
 
   }
 
-  test("invalid or yet un-processable state channel should be purged after purge delay is exceeded") { res =>
+  test("invalid or yet un-processable state channel should keep being returned past purge delay (#123)") { res =>
     implicit val (h, sp, js) = res
 
+    // Pre-#123 behavior: after purgeDelay, same-hash resends were silently dropped (Left(List.empty)).
+    // That stranded metagraph queues whose first-ever binary couldn't chain-link initially (e.g.
+    // m0 in iter20 — first binary's lastSnapshotHash didn't match gl0's prior state). gl0 never
+    // emitted a rejection signal, the metagraph never knew, and the queue piled up forever.
+    //
+    // Post-#123 behavior: same-hash resends past purgeDelay are re-emitted for chain-link
+    // re-evaluation. If they still can't chain (e.g. "unknown" parent vs gl0's Hash.empty), they
+    // flow into `toReturn` so the metagraph sees the rejection. The registry is re-registered at
+    // the current ordinal so the entry stays trackable.
     for {
       stateChannelOutput <- mkStateChannelOutput(1, address, Some(Hash("unknown")))
       snapshotInfo = mkGlobalSnapshotInfo(SortedMap.empty)
@@ -107,11 +116,11 @@ object GlobalSnapshotStateChannelAcceptanceManagerSuite extends MutableIOSuite w
       resultAt4 <- manager.accept(SnapshotOrdinal(4L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput))
       expectedAt4 = (SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], Set(stateChannelOutput))
       resultAt5 <- manager.accept(SnapshotOrdinal(5L), snapshotInfo.lastStateChannelSnapshotHashes, List(stateChannelOutput))
-      expectedAt5 = (SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], Set.empty[StateChannelOutput])
+      expectedAt5 = (SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], Set(stateChannelOutput))
 
-      getsReturnedAt4 = expect.same(expectedAt4, resultAt4)
-      getsDiscardedAt5 = expect.same(expectedAt5, resultAt5)
-    } yield getsReturnedAt4 && getsDiscardedAt5
+      returnedAt4 = expect.same(expectedAt4, resultAt4)
+      returnedAt5 = expect.same(expectedAt5, resultAt5)
+    } yield returnedAt4 && returnedAt5
   }
 
   test("valid state channel with more signatures should be preferred") { res =>

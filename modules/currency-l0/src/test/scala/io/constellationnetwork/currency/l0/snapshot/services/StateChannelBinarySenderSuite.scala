@@ -249,6 +249,9 @@ object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
         }
       }
 
+    def softConfirm(globalSnapshot: Hashed[GlobalIncrementalSnapshot]): G[Unit] =
+      identifierStorage.get.flatMap(getConfirmedHashes(_, globalSnapshot)).flatMap(tracker.softObserve)
+
     def clearPending: G[Unit] = tracker.clear
 
     private def getConfirmedHashes(
