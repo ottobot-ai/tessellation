@@ -5,6 +5,7 @@ import cats.effect.std.Semaphore
 import cats.syntax.all._
 
 import scala.annotation.tailrec
+import scala.collection.immutable.SortedMap
 
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
 import io.constellationnetwork.schema.SnapshotOrdinal
@@ -431,8 +432,17 @@ object MptOverlay {
         // so during the persist window the just-committed branches would be the only eviction
         // candidates and get dropped — exactly the freshest chain we need to keep.
         Ref.of[F, Option[BranchId]](none[BranchId]),
+        // `undoJournalRef` (#121): per-ordinal reverse-delta against base. Every successful
+        // `foldIntoBase(forward, ord)` captures the keys-touched portion of base BEFORE the
+        // fold and stores a `ChangeSet` that, when applied to base, would undo the fold.
+        // On reorg-replace finality (a different canonical re-finalizes ord N), the existing
+        // entry is replayed first to restore base to its pre-N state, then the new canonical's
+        // forward delta (if available in pending) is folded and journaled. This plugs the
+        // "Base may still hold rejected writes" leak documented in #121 / iter19. In-memory
+        // per node — local-only state, not consensus-visible.
+        Ref.of[F, SortedMap[Long, ChangeSet]](SortedMap.empty[Long, ChangeSet]),
         Semaphore[F](1)
-      ).mapN { (pendingRef, finalizedRef, lastCommittedBranchRef, mutex) =>
+      ).mapN { (pendingRef, finalizedRef, lastCommittedBranchRef, undoJournalRef, mutex) =>
         new Impl[F, K](
           underlying,
           pcTree,
@@ -440,6 +450,7 @@ object MptOverlay {
           pendingRef,
           finalizedRef,
           lastCommittedBranchRef,
+          undoJournalRef,
           mutex,
           maxPendingBranches,
           bestTipsFn
@@ -453,6 +464,7 @@ object MptOverlay {
       pendingRef: Ref[F, Map[BranchId, BranchEntry]],
       finalizedRef: Ref[F, Map[SnapshotOrdinal, BranchId]],
       lastCommittedBranchRef: Ref[F, Option[BranchId]],
+      undoJournalRef: Ref[F, SortedMap[Long, ChangeSet]],
       mutex: Semaphore[F],
       maxPendingBranches: Int,
       bestTipsFn: F[Set[BranchId]]
@@ -692,6 +704,11 @@ object MptOverlay {
                           pendingRef.set(Map.empty) >> lastCommittedBranchRef.set(none)
                         else Async[F].unit
                       for {
+                        // #121: Replay the previous canonical's undo entry to revert base to its pre-`ordinal` state.
+                        // This plugs the "Base may still hold rejected writes" leak: prior versions of this code path
+                        // dropped pending but left the prior fold's writes in base, contaminating subsequent reads at
+                        // `parentTip=canonical` (overlay walks pending→empty→base, sees the rejected bytes).
+                        undoApplied <- applyUndoAt(ordinal.value.value, ordinal)
                         _ <- cleanup
                         _ <- finalizedRef.update(_.updated(ordinal, canonical))
                         _ <-
@@ -700,13 +717,15 @@ object MptOverlay {
                               s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
                                 s"new=${canonical.value} — canonical NOT in pending; dropped $droppedCount " +
                                 s"orphan fork branch(es) from pendingRef + reset lastCommittedBranchRef. " +
-                                s"Base may still hold rejected writes — caller must verify base via " +
-                                s"syncFromGlobalSnapshotInfo if subsequent reads diverge."
+                                s"Undo applied=$undoApplied (base reverted to pre-ord state). " +
+                                s"Caller still needs to resync base via syncFromGlobalSnapshotInfo to apply " +
+                                s"the new canonical's deltas."
                             )
                           else
                             logger.info(
                               s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
-                                s"new=${canonical.value} (pending already empty, no fold needed)"
+                                s"new=${canonical.value} (pending already empty, no fold needed). " +
+                                s"Undo applied=$undoApplied."
                             )
                       } yield
                         if (droppedCount > 0) FinalizationOutcome.Folded(0, droppedCount): FinalizationOutcome
@@ -715,13 +734,18 @@ object MptOverlay {
                       val merged = mergedChain(canonical, pending)
                       val droppedCount = pending.size - countAncestors(canonical, pending)
                       for {
+                        // #121: Revert prior canonical's writes from base before folding the new canonical.
+                        // Without this, keys that the OLD canonical wrote but the NEW canonical doesn't touch
+                        // would retain the OLD canonical's bytes after the fold, causing silent state divergence.
+                        undoApplied <- applyUndoAt(ordinal.value.value, ordinal)
                         _ <- foldIntoBase(merged, ordinal)
                         _ <- pendingRef.set(Map.empty)
                         _ <- lastCommittedBranchRef.set(none)
                         _ <- finalizedRef.update(_.updated(ordinal, canonical))
                         _ <- logger.info(
                           s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
-                            s"new=${canonical.value} keysApplied=${merged.size} branchesDropped=$droppedCount"
+                            s"new=${canonical.value} keysApplied=${merged.size} branchesDropped=$droppedCount " +
+                            s"undoApplied=$undoApplied"
                         )
                       } yield FinalizationOutcome.Folded(merged.size, droppedCount)
                   }
@@ -767,19 +791,67 @@ object MptOverlay {
         *
         * `Rethrow.rethrow` on the producer-level `Either` results lifts a `MerklePatriciaError` into `F` so the transaction rolls back
         * rather than swallowing the failure (the legacy `.void` would have left the base half-applied without surfacing the error).
+        *
+        * The `foldRaw` overload writes a delta to base without journaling — used by `applyUndoAt` to replay a captured reverse delta (which
+        * would otherwise recurse forever, journaling reversals of reversals). The public `foldIntoBase` wraps it with `captureReverseDelta`
+        * + `undoJournalRef` writes to enable atomic rollback on reorg-replace finality (#121).
         */
       private def foldIntoBase(merged: ChangeSet, ordinal: SnapshotOrdinal): F[Unit] =
+        for {
+          reverse <- captureReverseDelta(merged)
+          _ <- foldRaw(merged, ordinal)
+          _ <- undoJournalRef.update(_.updated(ordinal.value.value, reverse))
+        } yield ()
+
+      private def foldRaw(delta: ChangeSet, ordinal: SnapshotOrdinal): F[Unit] =
         underlying.withTransaction {
           val producer = underlying.underlying
           for {
             _ <-
-              if (merged.removals.nonEmpty) producer.remove(merged.removals.toList).rethrow
+              if (delta.removals.nonEmpty) producer.remove(delta.removals.toList).rethrow
               else Async[F].unit
             _ <-
-              if (merged.upserts.nonEmpty) producer.insertBytes(merged.upserts).rethrow
+              if (delta.upserts.nonEmpty) producer.insertBytes(delta.upserts).rethrow
               else Async[F].unit
             _ <- underlying.commit(ordinal)
           } yield ((), MptTxAction.Commit)
+        }
+
+      /** Read the current base state for the keys touched by `forward` and build a `ChangeSet` whose application to base would undo
+        * `forward`'s effect:
+        *   - keys present in base before the fold → reverse `upserts` (restore the pre-fold value)
+        *   - keys absent in base before the fold → reverse `removals` (drop the now-inserted entry)
+        *
+        * The base view is materialized as `producer.entries` which is `stateRef.get` — an in-memory snapshot, so this is O(|touched|) after
+        * the O(1) Ref read (no I/O). Called inside `mutex.permit` (finalizeBranch holds it) so the captured view is consistent with the
+        * upcoming `foldRaw` write.
+        */
+      private def captureReverseDelta(forward: ChangeSet): F[ChangeSet] =
+        underlying.underlying.entries.map { current =>
+          val touched = forward.upserts.keySet ++ forward.removals
+          val (presentBefore, absentBefore) = touched.partition(current.contains)
+          val reverseUpserts: Map[Hex, Array[Byte]] = presentBefore.iterator.map(k => k -> current(k)).toMap
+          val reverseRemovals: Set[Hex] = absentBefore.filter(forward.upserts.contains)
+          ChangeSet(reverseUpserts, reverseRemovals)
+        }
+
+      /** Replay `undoJournalRef[ord]` against base and drop the entry. Returns `true` if an entry existed and was applied, `false` if no
+        * entry was present at that ordinal. Idempotent: a second call at the same ord is a NoOp.
+        *
+        * Used by `finalizeBranch` reorg-replace paths to revert the previous canonical's writes from base before the new canonical (which
+        * may or may not be locally registered in `pendingRef`) is folded or simply recorded.
+        */
+      private def applyUndoAt(ord: Long, contextOrdinal: SnapshotOrdinal): F[Boolean] =
+        undoJournalRef.modify { journal =>
+          journal.get(ord) match {
+            case Some(reverse) => (journal - ord, Some(reverse))
+            case None          => (journal, None)
+          }
+        }.flatMap {
+          case Some(reverse) if !reverse.isEmpty =>
+            foldRaw(reverse, contextOrdinal).as(true)
+          case Some(_) => true.pure[F] // empty reverse was journaled (degenerate case); count as applied
+          case None    => false.pure[F]
         }
 
       private def deserializeBytes[V: ImmutableCodec](bytes: Array[Byte]): F[Option[V]] =

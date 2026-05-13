@@ -928,6 +928,87 @@ object MptOverlaySuite extends MutableIOSuite {
       )
   }
 
+  test("multi-branch: reorg-replace canonical-not-in-pending UNDOES prior canonical's base writes (#121)") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (_, overlay) = pair
+
+      losingKey = gskBalance(3001)
+      losingValue = Balance(NonNegLong(99L))
+
+      // Setup: branchA commits & finalizes at ord with a write that gets folded into base.
+      // Before #121, after the reorg-replace below, this write would remain in base — the bug.
+      hA <- overlay.checkout(parentP)
+      _ <- hA.insert[Balance](losingKey, losingValue)
+      _ <- overlay.commit(hA, branchA, ordinal)
+      _ <- overlay.finalizeBranch(branchA, ordinal)
+
+      // Verify the fold happened — branchA's write is now in base.
+      readAfterA <- overlay.get[Balance](parentP, losingKey)
+
+      // Reorg-replace: a different canonical (branchB) is now finalized at the same ord.
+      // branchB is NOT in pending (no overlay.commit happened for it).
+      reorg <- overlay.finalizeBranch(branchB, ordinal)
+
+      // CORE ASSERTION: branchA's write must be undone from base. Reading at any branch
+      // should return empty — branchA was rejected, branchB never wrote, base reverted.
+      readAfterReorgFromBase <- overlay.get[Balance](parentP, losingKey)
+      readAfterReorgFromBranchB <- overlay.get[Balance](branchB, losingKey)
+    } yield
+      expect.all(
+        // Pre-condition: the fold happened.
+        readAfterA.contains(losingValue),
+        // Outcome: branchA's pending was already empty post-fold, so no fork branches dropped.
+        reorg == FinalizationOutcome.NoOp,
+        // Core: the undo journal reverted branchA's base write.
+        readAfterReorgFromBase.isEmpty,
+        readAfterReorgFromBranchB.isEmpty
+      )
+  }
+
+  test("multi-branch: reorg-replace canonical-in-pending UNDOES old canonical's writes for keys new canonical doesn't touch (#121)") {
+    res =>
+      implicit val (h, _, js) = res
+      for {
+        pair <- mkMultiBranch
+        (_, overlay) = pair
+
+        sharedKey = gskBalance(3010) // both canonicals write to this
+        losingOnlyKey = gskBalance(3011) // ONLY branchA writes to this — must be undone on reorg
+
+        vA_shared = Balance(NonNegLong(11L))
+        vA_losingOnly = Balance(NonNegLong(22L))
+        vB_shared = Balance(NonNegLong(33L))
+
+        // branchA: writes to both keys, folds into base.
+        hA <- overlay.checkout(parentP)
+        _ <- hA.insert[Balance](sharedKey, vA_shared)
+        _ <- hA.insert[Balance](losingOnlyKey, vA_losingOnly)
+        _ <- overlay.commit(hA, branchA, ordinal)
+        _ <- overlay.finalizeBranch(branchA, ordinal)
+
+        // branchB: writes ONLY to sharedKey (not losingOnlyKey).
+        hB <- overlay.checkout(parentP)
+        _ <- hB.insert[Balance](sharedKey, vB_shared)
+        _ <- overlay.commit(hB, branchB, ordinal)
+
+        // Reorg-replace at the same ord: branchB IS in pending this time.
+        reorg <- overlay.finalizeBranch(branchB, ordinal)
+
+        // After reorg: sharedKey reflects branchB's value; losingOnlyKey is GONE (branchA's
+        // write was undone). Before #121, sharedKey would be branchB's value but losingOnlyKey
+        // would retain branchA's stale value — the silent-divergence bug.
+        readShared <- overlay.get[Balance](branchB, sharedKey)
+        readLosingOnly <- overlay.get[Balance](branchB, losingOnlyKey)
+      } yield
+        expect.all(
+          reorg == FinalizationOutcome.Folded(1, 0),
+          readShared.contains(vB_shared),
+          readLosingOnly.isEmpty
+        )
+  }
+
   test("multi-branch: finalizeBranch on an unknown branch is a NoOp (idempotency entry recorded)") { res =>
     implicit val (h, _, js) = res
     for {
