@@ -217,6 +217,7 @@ object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
 
     def confirm(
       globalSnapshot: Hashed[GlobalIncrementalSnapshot],
+      gl0KnownCurrencyOrd: Option[SnapshotOrdinal] = None,
       lastFinalizedGlobalOrdinal: Option[SnapshotOrdinal] = None
     ): G[Unit] =
       for {
@@ -225,7 +226,7 @@ object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
         state <- tracker.getState
         oldRetryMode = state.retryMode
         proof = GlobalSnapshotConfirmationProof.fromGlobalSnapshot(globalSnapshot)
-        _ <- tracker.markAsConfirmed(confirmedHashes, proof)
+        _ <- tracker.markAsConfirmed(confirmedHashes, proof, gl0KnownCurrencyOrd)
         updatedState <- tracker.getState
         retryMode = RetryStrategy.shouldEnterRetryMode(updatedState, globalSnapshot.ordinal)
         _ <- tracker.updateState(_.copy(retryMode = retryMode))

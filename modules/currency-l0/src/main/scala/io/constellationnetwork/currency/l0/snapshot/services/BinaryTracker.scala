@@ -61,14 +61,18 @@ case class TrackerState(
   // Cleared per-hash when the binary is truly confirmed (markAsConfirmed) or pruned
   // (pruneFinalizedBelow). #123.
   softObservedHashes: Set[Hash],
-  // High-water mark of currency-snapshot ordinals known to be confirmed at gl0
-  // (across the entire run, monotonic — never decreases). Pending binaries whose
-  // `currencySnapshotOrdinal <= highestConfirmedCurrencyOrd` are *definitionally*
-  // superseded: gl0 has accepted a later currency snapshot, so the older one was
-  // either a sibling that lost the race or a member of a local fork gl0 abandoned.
-  // Used by `markAsConfirmed` to GC stale Pendings on every confirmation tick.
-  // Without this, m0's queue accumulates indefinitely under chain-link drift,
-  // slowing throughput (#125, observed in iter25).
+  // High-water mark sourced from gl0's authoritative `GlobalSnapshotInfo
+  // .lastCurrencySnapshots[ourIdentifier].ordinal` — the ord of the last currency
+  // snapshot gl0 has accepted for our metagraph. Monotonic (never decreases). Used
+  // by `markAsConfirmed` to GC superseded Pendings.
+  //
+  // Why this is safe under BFT metagraph consensus: ml0 nodes don't race siblings,
+  // they vote on a single binary at each currencyOrd. The only way Pendings below
+  // gl0's known ord can exist is a brief metagraph fork (rare; resolved by ml0
+  // re-syncing to gl0's pick). Those forked-off Pendings are definitionally past:
+  // gl0 has accepted a later snapshot, so older versions on the abandoned branch
+  // can never land. Dropping them prevents queue growth under chain drift
+  // (#125, iter25 data-with-fee root cause).
   highestConfirmedCurrencyOrd: SnapshotOrdinal
 )
 
@@ -91,7 +95,20 @@ trait BinaryTracker[F[_]] {
     enqueuedAtGlobal: SnapshotOrdinal
   ): F[Unit]
   def markAsSent(binaryHash: Hash): F[Unit]
-  def markAsConfirmed(confirmedHashes: Set[Hash], proof: GlobalSnapshotConfirmationProof): F[Unit]
+
+  /** Mark binaries as confirmed and (optionally) advance the GC watermark to gl0's authoritative
+    * `lastCurrencySnapshots[ourIdentifier].ordinal`.
+    *
+    * The watermark MUST come from gl0's `GlobalSnapshotInfo.lastCurrencySnapshots` (the authoritative gl0 view), not inferred from local
+    * hash matches. Even under BFT metagraph consensus (where ml0 nodes vote on a single binary per ord and don't race), brief metagraph
+    * forks can cause our local Pendings to be on an abandoned branch gl0 didn't pick. The local-hash signal is silent in those cases (we
+    * never see our hash in gl0's snapshot). gl0's known ord makes those stale Pendings GC-able regardless.
+    */
+  def markAsConfirmed(
+    confirmedHashes: Set[Hash],
+    proof: GlobalSnapshotConfirmationProof,
+    gl0KnownCurrencyOrd: Option[SnapshotOrdinal]
+  ): F[Unit]
 
   /** Mark binaries as observed in an unfinalized gl0 snapshot (best-tip).
     *
@@ -145,7 +162,11 @@ object BinaryTracker {
             state.copy(tracked = updatedTracked)
           }
 
-        def markAsConfirmed(confirmedHashes: Set[Hash], proof: GlobalSnapshotConfirmationProof): F[Unit] =
+        def markAsConfirmed(
+          confirmedHashes: Set[Hash],
+          proof: GlobalSnapshotConfirmationProof,
+          gl0KnownCurrencyOrd: Option[SnapshotOrdinal]
+        ): F[Unit] =
           stateRef.update { state =>
             val indexedTracked = state.tracked.zipWithIndex
 
@@ -159,32 +180,26 @@ object BinaryTracker {
               case (other, _) => other
             }
 
-            // Update high-water mark using the highest currencyOrd among entries we
-            // just confirmed (or had already confirmed earlier). Monotonic — only
-            // grows. We read from `promoted` because the indexed-prefix promotion
-            // above already converted all matched Pendings to ConfirmedBinary.
-            val newWatermark = promoted.collect {
-              case ConfirmedBinary(p, _) => p.currencySnapshotOrdinal
-            }.maxOption
-              .fold(state.highestConfirmedCurrencyOrd) { maxOrd =>
-                if (maxOrd.value.value > state.highestConfirmedCurrencyOrd.value.value) maxOrd
-                else state.highestConfirmedCurrencyOrd
-              }
+            // High-water mark: gl0's authoritative `lastCurrencySnapshots[ourIdentifier]
+            // .ordinal` from GlobalSnapshotInfo. The ord of the last currency snapshot
+            // gl0 has accepted for our metagraph. Monotonic — never decreases. Falls
+            // back to the existing watermark when GSI doesn't yet have an entry for
+            // our identifier (e.g. very-early bootstrap before our first binary lands).
+            val newWatermark = gl0KnownCurrencyOrd.fold(state.highestConfirmedCurrencyOrd) { gl0Ord =>
+              if (gl0Ord.value.value > state.highestConfirmedCurrencyOrd.value.value) gl0Ord
+              else state.highestConfirmedCurrencyOrd
+            }
 
             // GC superseded Pendings: any PendingBinary whose currencySnapshotOrdinal
-            // is STRICTLY LESS than the watermark is definitionally stale (gl0 has
-            // accepted a later currency snapshot, so this one was either on a local
-            // fork gl0 abandoned or simply too old to matter). Dropping them prevents
-            // queue growth under chain-link drift (#125, iter25 data-with-fee root
-            // cause). Safe because gl0's `lastStateChannelSnapshotHashes[addr]` has
-            // already advanced past these — they would only ever yield `chain-link
-            // rejection → returnedSCEvents` forever, never actually landing.
+            // is STRICTLY LESS than gl0's known current ord is past — gl0 has accepted
+            // a later snapshot for us, so no version of our binary at this ord can land.
             //
-            // We use strict `<` (not `<=`) so unmatched siblings at the *same* ord as
-            // a confirmed binary survive: a sibling could still legitimately chain
-            // forward if it was the canonical-pick at gl0 we just haven't observed yet.
-            // The next confirmation tick advances watermark past their ord and they
-            // get cleaned up naturally.
+            // Strict `<` (not `<=`) preserves binaries at the exact same ord as gl0's
+            // current. Under BFT metagraph consensus there's typically only one binary
+            // per ord, and if it's ours we just confirmed it (now ConfirmedBinary, not
+            // PendingBinary). But during a transient metagraph fork our Pending at the
+            // gl0-known ord might be on the abandoned branch — those drop on the next
+            // confirmation tick once gl0 advances to ord+1.
             val gcd = promoted.filterNot {
               case p: PendingBinary => p.currencySnapshotOrdinal.value.value < newWatermark.value.value
               case _                => false

@@ -234,7 +234,19 @@ object StateChannel {
         // Best-effort: if the fetch fails (network blip, BFT GL0 with old binary), fall
         // back to the snapshot's own ordinal which is the legacy default.
         finalizedOrdinal <- services.globalL0.pullLatestFinalizedOrdinal.handleError(_ => none)
-        _ <- services.stateChannelBinarySender.confirm(snapshot, finalizedOrdinal).handleErrorWith { error =>
+        // Extract gl0's authoritative current currency ord for *our* metagraph
+        // identifier from the GSI we just computed (#125). This is the watermark for
+        // GC'ing stale Pending binaries: anything below this ord on our local fork is
+        // definitively past — gl0 has accepted a later currency snapshot for us, so
+        // older Pendings (e.g. from a brief metagraph fork that gl0 didn't pick) can
+        // never land. Without this, ml0's queue accumulates indefinitely under chain
+        // drift and slows tight-budget tests like data-with-fee (iter25 failure mode).
+        ourIdentifier <- storages.identifier.get
+        gl0KnownCurrencyOrd = context.lastCurrencySnapshots.get(ourIdentifier).map {
+          case Left(genesisSnap)   => genesisSnap.value.ordinal
+          case Right((incSnap, _)) => incSnap.value.ordinal
+        }
+        _ <- services.stateChannelBinarySender.confirm(snapshot, gl0KnownCurrencyOrd, finalizedOrdinal).handleErrorWith { error =>
           logger.error(error)("Error when confirming state channel binary") >>
             updateFailedConfirmingStateChannelBinaryMetrics() >>
             Async[F].unit

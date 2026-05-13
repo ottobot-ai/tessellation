@@ -31,8 +31,16 @@ trait StateChannelBinarySender[F[_]] {
     lastGlobalSnapshotSigners: Option[NonEmptySet[PeerId]]
   ): F[Unit]
 
+  /** Confirm binaries that landed in this finality-gated global snapshot, advance the GC watermark to gl0's authoritative currency ord
+    * (from GSI), and prune below finality.
+    *
+    * `gl0KnownCurrencyOrd` is the authoritative source for stale-Pending GC — it MUST come from
+    * `GlobalSnapshotInfo.lastCurrencySnapshots[ourIdentifier].ordinal`, not inferred from local hash matches. Pass `None` to skip GC (e.g.
+    * tests, or when GSI isn't available for the caller). See `BinaryTracker.markAsConfirmed`.
+    */
   def confirm(
     globalSnapshot: Hashed[GlobalIncrementalSnapshot],
+    gl0KnownCurrencyOrd: Option[SnapshotOrdinal] = None,
     lastFinalizedGlobalOrdinal: Option[SnapshotOrdinal] = None
   ): F[Unit]
 
@@ -131,6 +139,7 @@ object StateChannelBinarySender {
 
     def confirm(
       globalSnapshot: Hashed[GlobalIncrementalSnapshot],
+      gl0KnownCurrencyOrd: Option[SnapshotOrdinal] = None,
       lastFinalizedGlobalOrdinal: Option[SnapshotOrdinal] = None
     ): F[Unit] =
       for {
@@ -139,7 +148,7 @@ object StateChannelBinarySender {
         state <- tracker.getState
         oldRetryMode = state.retryMode
         proof = GlobalSnapshotConfirmationProof.fromGlobalSnapshot(globalSnapshot)
-        _ <- tracker.markAsConfirmed(confirmedHashes, proof)
+        _ <- tracker.markAsConfirmed(confirmedHashes, proof, gl0KnownCurrencyOrd)
         updatedState <- tracker.getState
         retryMode = RetryStrategy.shouldEnterRetryMode(updatedState, globalSnapshot.ordinal)
         _ <- tracker.updateState(_.copy(retryMode = retryMode))
