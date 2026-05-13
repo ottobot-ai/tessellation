@@ -42,7 +42,11 @@ const CONSTANTS = {
     // If expiration tests start racing the observation window again, bump first to
     // 60, then to 80, rather than straight back to 120 — the old plateau root cause
     // is closed, any new racing would be a different issue worth diagnosing.
-    EPOCH_PROGRESS_BUFFER: 40,
+    // 2026-05-13: 40 → 25 after #125 overlay + queue GC. Per the comment above,
+    // observation peaks at ~10 epochs; 25 leaves 15-epoch (~90s at 6s/epoch) margin.
+    // If expiration scenarios start racing, bump first to 30 or 40 — but only if
+    // accompanied by a real diagnostic, since the historical root cause is closed.
+    EPOCH_PROGRESS_BUFFER: 25,
 };
 
 const getRandomInt = (min, max) => {

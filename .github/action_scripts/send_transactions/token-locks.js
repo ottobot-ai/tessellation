@@ -23,8 +23,12 @@ const CONSTANTS = {
     // finalization → ML0 activeTokenLocks) takes ~45-65s, and each epoch
     // advances ~10s. 5 epochs (~50s) is too short — the lock expires before
     // the test can observe it in ML0's activeTokenLocks.
-    EPOCH_PROGRESS_BUFFER_EXPIRATION_TEST: 30,
-    EPOCH_PROGRESS_BUFFER_TOKEN_UNLOCK_TEST: 50
+    // 2026-05-13: 30 → 20 + 50 → 30 after #125. With overlay+G0/G1/G2/GC the
+    // pipeline observation peak holds steady; expiration test gets 10-epoch margin
+    // (~100s at ~10s/epoch), unlock test keeps 20-epoch headroom for the extra
+    // DAG-balance-restoration pipeline stage.
+    EPOCH_PROGRESS_BUFFER_EXPIRATION_TEST: 20,
+    EPOCH_PROGRESS_BUFFER_TOKEN_UNLOCK_TEST: 30
 };
 
 const createConfig = () => {
