@@ -54,6 +54,20 @@ trait GlobalL0Service[F[_]] {
     * Returns None if the remote GL0 has no snapshots yet (pre-genesis) or the request fails.
     */
   def pullLatestFinalizedOrdinal: F[Option[SnapshotOrdinal]]
+
+  /** Pull GL0 snapshots in the range (lastOrdinal, finalizedOrdinal], i.e. only depth-k-finalized snapshots above our local head.
+    *
+    * Followers (gl1/cl1/dl1/ml0) MUST consume only finalized snapshots — by construction, GL0 reorgs can only happen within the depth-k
+    * window, so finalized snapshots are immutable from the follower's perspective and `replaceByRefs` / `recoverFromOrphan` paths become
+    * unreachable on the happy path. See #122.
+    *
+    * Returns an empty list if `finalizedOrdinal <= lastOrdinal` (nothing finalized beyond local head yet). Returns at most
+    * `singlePullLimit` snapshots when configured.
+    */
+  def pullFinalizedGlobalSnapshots(
+    lastOrdinal: SnapshotOrdinal,
+    finalizedOrdinal: SnapshotOrdinal
+  ): F[List[Hashed[GlobalIncrementalSnapshot]]]
 }
 
 object GlobalL0Service {
@@ -180,6 +194,42 @@ object GlobalL0Service {
 
       def pullGlobalSnapshots(ordinal: SnapshotOrdinal): F[Either[LatestSnapshotTuple, List[Hashed[GlobalIncrementalSnapshot]]]] =
         maybeMajorityPeerIds.fold(pullGlobalSnapshotsFromRandomPeerAtOrdinal(ordinal))(pullGlobalSnapshotsFromMajorityAtOrdinal(_, ordinal))
+
+      def pullFinalizedGlobalSnapshots(
+        lastOrdinal: SnapshotOrdinal,
+        finalizedOrdinal: SnapshotOrdinal
+      ): F[List[Hashed[GlobalIncrementalSnapshot]]] =
+        if (finalizedOrdinal <= lastOrdinal)
+          // Nothing finalized beyond our head yet — follower must idle until finality
+          // advances. Logged at DEBUG (this is the steady-state when the follower is
+          // caught up to the finality watermark).
+          logger.debug(s"No finalized snapshots beyond local head: finalized=${finalizedOrdinal.show} <= last=${lastOrdinal.show}") >>
+            noSnapshots.pure[F]
+        else
+          // Pull the standard batch starting from lastOrdinal, then clamp to finalizedOrdinal.
+          // The post-filter is safe because pullGlobalSnapshots(ordinal) already verifies hash
+          // chaining via pullVerifiedSnapshots (majority mode) or peer fetch (random mode);
+          // we just drop any snapshots that exceed the finality watermark before returning.
+          pullGlobalSnapshots(lastOrdinal).flatMap {
+            case Left(_) =>
+              // Bootstrap path — caller's lastOrdinal had no stored state. The follower's
+              // initial-snapshot path runs separately (download bootstrap), so we don't
+              // surface a tuple here; return empty so the caller idles. This is a transient
+              // state during startup.
+              logger
+                .info(s"pullFinalizedGlobalSnapshots: bootstrap tuple returned for last=${lastOrdinal.show}, returning empty")
+                .as(noSnapshots)
+            case Right(snapshots) =>
+              val finalized = snapshots.filter(_.ordinal <= finalizedOrdinal)
+              val dropped = snapshots.size - finalized.size
+              logger
+                .info(
+                  s"pullFinalizedGlobalSnapshots: kept ${finalized.size} finalized, dropped $dropped unfinalized" +
+                    s" (last=${lastOrdinal.show}, finalized=${finalizedOrdinal.show})"
+                )
+                .whenA(dropped > 0)
+                .as(finalized)
+          }
 
       private def verifyLatestSnapshot(
         snapshotTuple: LatestSnapshotTuple,

@@ -49,7 +49,18 @@ object DAGSnapshotProcessor {
           tokenLockStorage.initByRefs(state.lastTokenLockRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal)
 
       override def onRedownload(snapshot: Hashed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo): F[Unit] =
-        allowSpendStorage.replaceByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
+        // Defense-in-depth (#122): with finality-gating, followers consume only depth-k-finalized
+        // gl0 snapshots, so RedownloadNeeded should never fire on the happy path. If we hit this,
+        // either gl0 finality went backwards (genuine bug) or the local node's chain mismatch
+        // detection is firing on a finalized snapshot (also a bug). The destructive replaceByRefs
+        // path is preserved so the cluster can self-heal, but the WARN log surfaces the anomaly.
+        org.typelevel.log4cats.slf4j.Slf4jLogger
+          .getLogger[F]
+          .warn(
+            s"dl1 onRedownload firing for finalized snapshot ord=${snapshot.ordinal.show} — destructive replaceByRefs path " +
+              s"should be unreachable under finality-gating (#122); investigate"
+          ) >>
+          allowSpendStorage.replaceByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
           tokenLockStorage.replaceByRefs(state.lastTokenLockRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal)
 
       override def setInitialLastNSnapshots(snapshot: Hashed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo): F[Unit] =

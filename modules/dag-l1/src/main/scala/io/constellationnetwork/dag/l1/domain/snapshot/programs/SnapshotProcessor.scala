@@ -287,10 +287,14 @@ abstract class SnapshotProcessor[
           }
 
       case Ignore(snapshot, lastHeight, lastSubHeight, lastOrdinal, processingHeight, processingSubHeight, processingOrdinal) =>
+        // With finality-gating (#122), Validator.NotNext on a depth-k-finalized snapshot
+        // implies either a genuine chain-fork bug or a local state divergence — neither
+        // should occur on the happy path. Kept as defensive code (the cluster recovers via
+        // the ShouldRedownload path) but logged as WARN so the anomaly surfaces.
         Slf4jLogger
           .getLogger[F]
           .warn(
-            s"Unexpected case during global snapshot processing - ignoring snapshot! Last: (height: $lastHeight, subHeight: $lastSubHeight, ordinal: $lastOrdinal) processing: (height: $processingHeight, subHeight:$processingSubHeight, ordinal: $processingOrdinal)."
+            s"NotNext on finalized snapshot (#122 anomaly) - ignoring! Last: (height: $lastHeight, subHeight: $lastSubHeight, ordinal: $lastOrdinal) processing: (height: $processingHeight, subHeight:$processingSubHeight, ordinal: $processingOrdinal)."
           )
           .as(SnapshotIgnored(SnapshotReference.fromHashedSnapshot(snapshot)))
     }

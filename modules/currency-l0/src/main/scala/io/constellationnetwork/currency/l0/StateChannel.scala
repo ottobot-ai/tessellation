@@ -295,7 +295,38 @@ object StateChannel {
           }
       }
 
-    services.globalL0.pullGlobalSnapshots.flatMap {
+    // Finality-gated pull (#122). ml0 consumes only depth-k-finalized gl0 snapshots —
+    // gl0 reorgs are bounded by the depth-k window, so ml0 never observes a snapshot
+    // that later gets reorg'd away. The recoverFromOrphan path therefore becomes
+    // unreachable on the happy path; kept as defense-in-depth and logged as WARN if
+    // it ever fires.
+    //
+    // ml0 already fetches `pullLatestFinalizedOrdinal` in handleIncrementalSnapshot for
+    // SC-binary pruning (:236). We fetch it here too so we never download unfinalized
+    // snapshots; the two calls are cheap (single peer endpoint) and the values are
+    // monotonic per node so transient inconsistency between calls is harmless.
+    val pullFinalityGated: F[Either[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo), List[Hashed[GlobalIncrementalSnapshot]]]] =
+      (storages.lastSyncGlobalSnapshot.get.map(_.map(_.ordinal)), services.globalL0.pullLatestFinalizedOrdinal).flatMapN {
+        case (None, _) =>
+          // Bootstrap: no stored snapshot yet. Defer to legacy bootstrap pull (canonical
+          // latest with majority verification) which yields a Left → handleInitialSnapshot.
+          // Finality gating kicks in on the next 10s tick once lastSyncGlobalSnapshot is set.
+          logger.info("ml0 pullFinalityGated: no stored last snapshot, falling back to bootstrap pull") >>
+            services.globalL0.pullGlobalSnapshots
+        case (Some(lastOrd), None) =>
+          logger
+            .info(s"ml0 pullFinalityGated: waiting on gl0 finality (last=${lastOrd.show}, finalized=unknown); idling")
+            .as(List.empty[Hashed[GlobalIncrementalSnapshot]].asRight)
+        case (Some(lastOrd), Some(finalizedOrd)) if finalizedOrd <= lastOrd =>
+          logger
+            .debug(s"ml0 pullFinalityGated: caught up to finality (last=${lastOrd.show}, finalized=${finalizedOrd.show})")
+            .as(List.empty[Hashed[GlobalIncrementalSnapshot]].asRight)
+        case (Some(lastOrd), Some(finalizedOrd)) =>
+          logger.info(s"ml0 pullFinalityGated: pulling (last=${lastOrd.show}, finalized=${finalizedOrd.show}]") >>
+            services.globalL0.pullFinalizedGlobalSnapshots(lastOrd, finalizedOrd).map(_.asRight)
+      }
+
+    pullFinalityGated.flatMap {
       case Left((snapshot, state)) =>
         handleInitialSnapshot(snapshot, state)
 

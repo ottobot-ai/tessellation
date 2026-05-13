@@ -149,10 +149,45 @@ class GlobalSnapshotAlignment[F[
         logger.warn(e)("Failed to log snapshot processing results")
       }
 
+    // Finality-gated pull (#122). Followers consume only depth-k-finalized gl0 snapshots;
+    // by construction, gl0 reorgs can only happen within the depth-k window, so the
+    // follower never observes a snapshot that later gets reorg'd away. The destructive
+    // RedownloadNeeded path (replaceByRefs) and the StateProofMismatch recovery path
+    // become unreachable on the happy path — they remain as defense-in-depth.
+    //
+    // Three cases:
+    //   - No stored last snapshot: must bootstrap via the legacy pullGlobalSnapshots Left
+    //     path (which fetches the canonical latest with majority verification).
+    //   - finalizedOrdinal not yet known (None) or <= lastOrdinal: idle until finality
+    //     advances. At node startup, gl0 hasn't built up depth-k confirmations yet, so
+    //     the follower must wait — this is the "bootstrap finality" case.
+    //   - finalizedOrdinal > lastOrdinal: pull (lastOrdinal, finalizedOrdinal].
+    def pullFinalityGated: F[Either[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo), List[Hashed[GlobalIncrementalSnapshot]]]] =
+      (sharedStorages.lastGlobalSnapshot.getOrdinal, services.globalL0.pullLatestFinalizedOrdinal).flatMapN {
+        case (None, _) =>
+          // Bootstrap: no stored snapshot yet. Defer to the legacy path which fetches
+          // canonical-latest with majority verification, then takes the Left branch in
+          // processSnapshots to perform a download. Finality gating kicks in on the next
+          // tick once lastGlobalSnapshot is populated.
+          logger.info("pullFinalityGated: no stored last snapshot, falling back to bootstrap pull") >>
+            services.globalL0.pullGlobalSnapshots
+        case (Some(lastOrd), None) =>
+          logger
+            .info(s"pullFinalityGated: waiting on gl0 finality (last=${lastOrd.show}, finalized=unknown); idling")
+            .as(List.empty[Hashed[GlobalIncrementalSnapshot]].asRight)
+        case (Some(lastOrd), Some(finalizedOrd)) if finalizedOrd <= lastOrd =>
+          logger
+            .debug(s"pullFinalityGated: caught up to finality (last=${lastOrd.show}, finalized=${finalizedOrd.show})")
+            .as(List.empty[Hashed[GlobalIncrementalSnapshot]].asRight)
+        case (Some(lastOrd), Some(finalizedOrd)) =>
+          logger.info(s"pullFinalityGated: pulling (last=${lastOrd.show}, finalized=${finalizedOrd.show}]") >>
+            services.globalL0.pullFinalizedGlobalSnapshots(lastOrd, finalizedOrd).map(_.asRight)
+      }
+
     for {
       snapshots <- withRetry(
-        operation = services.globalL0.pullGlobalSnapshots,
-        operationName = "Pull global snapshots"
+        operation = pullFinalityGated,
+        operationName = "Pull finality-gated global snapshots"
       )
       _ <- logSnapshots(snapshots)
       results <- processSnapshots(snapshots)

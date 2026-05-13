@@ -358,6 +358,11 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                   override def pullGlobalSnapshot(hash: Hash): IO[Option[Hashed[GlobalIncrementalSnapshot]]] = ???
 
                   override def pullLatestFinalizedOrdinal: IO[Option[SnapshotOrdinal]] = none.pure[IO]
+
+                  override def pullFinalizedGlobalSnapshots(
+                    lastOrdinal: SnapshotOrdinal,
+                    finalizedOrdinal: SnapshotOrdinal
+                  ): IO[List[Hashed[GlobalIncrementalSnapshot]]] = List.empty[Hashed[GlobalIncrementalSnapshot]].pure[IO]
                 }
                 val lastNSnapshotStorage =
                   LastNGlobalSnapshotStorage.make[IO](lastGlobalSnapshotsSyncConfig, lastNSnapR, incLastNSnapR)

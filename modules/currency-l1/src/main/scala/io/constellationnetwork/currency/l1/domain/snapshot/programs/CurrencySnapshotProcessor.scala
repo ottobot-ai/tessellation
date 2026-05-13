@@ -139,18 +139,24 @@ object CurrencySnapshotProcessor {
 
                   case Validator.NotNext =>
                     // Parent-hash mismatch between our stored last snapshot and the incoming one.
-                    // Either we downloaded during a transient fork window and our local head is now
-                    // orphaned (chain reorg'd to a different hash at that ordinal), or we've fallen
-                    // far enough behind that intermediates are missing. Clear our last snapshot
-                    // state so the next `pullGlobalSnapshots` call sees no stored ordinal and falls
-                    // into the bootstrap (Left) branch, rebootstrapping from the canonical head.
-                    // Without this, cl1 would SnapshotIgnored every subsequent snapshot forever
-                    // (observed: cl1 stranded at ord 56 while gl0 reached ord 161+). Also sets the
-                    // redownload flag for observability / TooFarEpochProgress path consistency.
+                    // Under finality-gating (#122) followers consume only depth-k-finalized gl0
+                    // snapshots, so this branch should be unreachable on the happy path — a
+                    // mismatch at the finalized horizon implies either a genuine chain-fork bug
+                    // or local state divergence (e.g. stale storage). Defensive recovery kept:
+                    // clear our last snapshot state so the next pull falls into the bootstrap
+                    // (Left) branch, rebootstrapping from the canonical head. Without this, cl1
+                    // would SnapshotIgnored every subsequent snapshot forever (observed: cl1
+                    // stranded at ord 56 while gl0 reached ord 161+). Also sets the redownload
+                    // flag for observability / TooFarEpochProgress path consistency.
                     val reason =
                       s"Parent-hash mismatch at incoming ord=${globalSnapshotReference.ordinal.show}: stored last ord=${lastGlobalSnapshot.ordinal.show} hash=${lastGlobalSnapshot.hash.value
                           .take(12)} but incoming.lastSnapshotHash=${globalSnapshot.signed.value.lastSnapshotHash.value.take(12)}. Clearing state + forcing redownload."
-                    globalL0AlignmentStorage.updateShouldRedownload(value = true, reasons = List(reason)) >>
+                    Slf4jLogger
+                      .getLogger[F]
+                      .warn(
+                        s"cl1 NotNext on finalized snapshot (#122 anomaly) at ord=${globalSnapshotReference.ordinal.show} — destructive clear+redownload preserved as defense; investigate"
+                      ) >>
+                      globalL0AlignmentStorage.updateShouldRedownload(value = true, reasons = List(reason)) >>
                       lastGlobalSnapshotStorage.clear >>
                       lastNGlobalSnapshotStorage.clear
                         .as[SnapshotProcessingResult](SnapshotIgnored(globalSnapshotReference))
@@ -201,7 +207,18 @@ object CurrencySnapshotProcessor {
           tokenLockStorage.initByRefs(state.lastTokenLockRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal)
 
       override def onRedownload(snapshot: Hashed[CurrencyIncrementalSnapshot], state: CurrencySnapshotInfo): F[Unit] =
-        allowSpendStorage.replaceByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
+        // Defense-in-depth (#122): cl1 consumes gl0 snapshots via finality-gating in
+        // GlobalSnapshotAlignment, so RedownloadNeeded on a finalized gl0 snapshot should be
+        // unreachable on the happy path. If we hit this, either the local cl1 fork-detected
+        // against a finalized state (genuine bug) or finality went backwards (also a bug).
+        // Destructive replaceByRefs preserved for cluster self-heal; WARN surfaces the anomaly.
+        Slf4jLogger
+          .getLogger[F]
+          .warn(
+            s"cl1 onRedownload firing for currency snapshot ord=${snapshot.ordinal.show} — destructive replaceByRefs path " +
+              s"should be unreachable under finality-gating (#122); investigate"
+          ) >>
+          allowSpendStorage.replaceByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
           tokenLockStorage.replaceByRefs(state.lastTokenLockRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal)
 
       private def processCurrencySnapshots(
