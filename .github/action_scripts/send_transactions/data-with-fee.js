@@ -183,18 +183,26 @@ const checkFeeTransactionInGlobalL0 = async (globalL0Url, feeWallet) => {
             const response = await axios.get(`${globalL0Url}/global-snapshots/latest/combined`);
             const [_, globalSnapshotInfo] = response.data;
 
-            // Multi-metagraph aware: iterate all metagraphs and return success if
-            // any of them has the feeWallet balance. Previously we picked the
-            // first metagraph (Object.keys()[0]) which is incorrect under
-            // --metagraphs>1 because map iteration order is by metagraph ID
-            // and the target metagraph isn't always first.
+            // Multi-metagraph aware: look up ONLY the target metagraph that we
+            // sent the data update to. Previously we picked the first metagraph
+            // (Object.keys()[0]) which is wrong under --metagraphs>1; then we
+            // iterated all metagraphs which can false-pass on a shared fee
+            // wallet balance (the project template's hardcoded fee address is
+            // identical across all metagraphs, so any other metagraph holding
+            // a non-zero balance for that address would satisfy the check).
+            //
+            // The test always submits to metagraph k=0, whose identifier is
+            // exported as METAGRAPH_ID by compose-runner.sh.
+            const targetMetagraphId = process.env.METAGRAPH_ID;
+            if (!targetMetagraphId) {
+                throw new Error('METAGRAPH_ID env var not set — cannot identify target metagraph');
+            }
             const lcs = globalSnapshotInfo.lastCurrencySnapshots || {};
-            for (const [mid, either] of Object.entries(lcs)) {
-                const right = either && either.Right;
-                if (!right || !Array.isArray(right) || right.length < 2) continue;
-                const balances = right[1].balances || {};
+            const targetEntry = lcs[targetMetagraphId];
+            if (targetEntry && targetEntry.Right && Array.isArray(targetEntry.Right) && targetEntry.Right.length >= 2) {
+                const balances = targetEntry.Right[1].balances || {};
                 if (balances[feeWallet] && balances[feeWallet] > 0) {
-                    console.log(`Fee transaction processed successfully on metagraph ${mid}. Response: ${JSON.stringify(balances)}`);
+                    console.log(`Fee transaction processed successfully on metagraph ${targetMetagraphId}. Response: ${JSON.stringify(balances)}`);
                     return;
                 }
             }
