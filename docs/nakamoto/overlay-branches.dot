@@ -1,0 +1,67 @@
+// MPT overlay branch model + finalizeBranch fold-forward
+//
+// Render: dot -Tpng overlay-branches.dot -o overlay-branches.png
+//
+// Code refs:
+//   - MptOverlay.scala:28           BranchId (newtype over snapshot Hash)
+//   - MptOverlay.scala:46           FinalizationOutcome
+//   - MptOverlay.scala:63           BranchHandle (write capability on a branch)
+//   - MptOverlay.scala:170          MptOverlay trait
+//   - MptOverlay.scala:323          passthrough impl (no branching)
+//   - MptOverlay.scala:661          multi-branch finalizeBranch impl
+//   - MptOverlay.scala:685..749     reorg-replace path (#116, #121 undo journal)
+//   - GSAM.accept                   writes go via BranchHandle into pending ChangeSet
+//   - SnapshotLeaderLoop:447, 510   finalityMonitor's two fold-forward sinks
+//
+// Cross-refs:
+//   docs/CODEBASE_MAP.md            architectural overview
+//   ~/.claude/plans/balmy-branching-bertillon.md   rev3 overlay plan (#56)
+
+digraph overlay {
+  rankdir=BT;
+  splines=ortho;
+  graph [fontname="Helvetica", fontsize=11, label="MptOverlay.MultiBranch — pending ChangeSets above persistent base", labelloc=t];
+  node  [fontname="Helvetica", fontsize=10];
+  edge  [fontname="Helvetica", fontsize=9];
+
+  // Persistent base
+  base [label="base : MptStore (on disk)\nfinalized state only", shape=cylinder, fillcolor="#bbdefb", style=filled];
+
+  // Pending branches (in-memory ChangeSets keyed by BranchId = snapshotHash)
+  subgraph cluster_pending {
+    label="pendingRef : Map[BranchId, ChangeSet]   (in-memory)";
+    style="rounded,dashed";
+    color="#90caf9";
+
+    A   [label="A   (ord N, canonical so far)\nChangeSet ΔA over base",   shape=note, fillcolor="#c8e6c9", style=filled];
+    A1  [label="A+1 (ord N+1)\nChangeSet ΔA+1 over A",                   shape=note, fillcolor="#c8e6c9", style=filled];
+    A2  [label="A+2 (ord N+2, bestTip)\nChangeSet ΔA+2 over A+1",       shape=note, fillcolor="#c8e6c9", style=filled];
+
+    B   [label="B   (ord N, fork branch)\nChangeSet ΔB over base",      shape=note, fillcolor="#ffccbc", style=filled];
+    B1  [label="B+1 (ord N+1)\nChangeSet ΔB+1 over B",                  shape=note, fillcolor="#ffccbc", style=filled];
+
+    A  -> base [label="parent", style=dashed, arrowhead=open, color="#555555"];
+    A1 -> A    [label="parent", style=dashed, arrowhead=open, color="#555555"];
+    A2 -> A1   [label="parent", style=dashed, arrowhead=open, color="#555555"];
+    B  -> base [label="parent", style=dashed, arrowhead=open, color="#555555"];
+    B1 -> B    [label="parent", style=dashed, arrowhead=open, color="#555555"];
+  }
+
+  // Reads
+  reader [label="Read at branch=A2\nwalks A2.Δ → A1.Δ → A.Δ → base\n(lazy fall-through, hex-key resolution)", shape=parallelogram, fillcolor="#fff9c4", style=filled];
+  reader -> A2 [style=dotted, arrowhead=none, label="overlay.get(A2, key)"];
+
+  // Finalization sink
+  finalize [label="mptOverlay.finalizeBranch(BranchId(canonical), ord)\nMptOverlay.scala:661\n\n• merged = mergedChain(canonical, pending)\n• applyUndoAt(ord)   // #121 base-write rollback if reorg-replace\n• foldIntoBase(merged, ord)  // single withTransaction commit\n• pendingRef := empty\n• finalizedRef.update(ord -> canonical)", shape=box, fillcolor="#ffd54f", style="rounded,filled"];
+
+  // Caller of finalize
+  caller [label="finalityMonitor (5s)\nSnapshotLeaderLoop.scala:447, 510\n— depth-k OR attestation-2/3 fires", shape=box, fillcolor="#e1bee7", style="rounded,filled"];
+
+  caller -> finalize;
+  finalize -> A   [label="merged: ΔA+ΔA+1+ΔA+2", color="#2e7d32"];
+  finalize -> A1  [color="#2e7d32"];
+  finalize -> A2  [color="#2e7d32"];
+  finalize -> B   [label="dropped\n(non-canonical)", color="#d32f2f", style=dashed];
+  finalize -> B1  [color="#d32f2f", style=dashed];
+  finalize -> base [label="foldIntoBase\n(atomic withTransaction)", color="#2e7d32"];
+}

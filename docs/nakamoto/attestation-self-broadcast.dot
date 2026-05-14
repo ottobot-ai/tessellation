@@ -1,0 +1,61 @@
+// Self-attestation broadcast: snapshot production → TipTracker write → sidecar GossipSub publish
+//
+// Render: dot -Tpng attestation-self-broadcast.dot -o attestation-self-broadcast.png
+//
+// Code refs:
+//   - SnapshotLeaderLoop.scala:238   slotTick (1s default cadence, NAKAMOTO_SLOT_DURATION_MS)
+//   - SnapshotLeaderLoop.scala:303   onSlotWon (production path)
+//   - SnapshotLeaderLoop.scala:709   chainStore.store (commit inside withTransaction bracket)
+//   - SnapshotLeaderLoop.scala:818   NakamotoSyncDaemon.emitTipAttestation (Phase 2 — unified self-attest)
+//   - NakamotoSyncDaemon.scala:1146  emitTipAttestation impl
+//   - NakamotoSyncDaemon.scala:1126  emitAttestation (peer-receive path delegates here too)
+//   - TipTracker.scala:96            recordAttestation ("newer wins" by attestedAt)
+
+digraph self_broadcast {
+  rankdir=TB;
+  splines=ortho;
+  graph [fontname="Helvetica", fontsize=11];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#f5f5f5"];
+  edge  [fontname="Helvetica", fontsize=9];
+
+  // Trigger
+  slot_tick [label="slotTick (awakeEvery 1s)\nSnapshotLeaderLoop.scala:238", fillcolor="#e3f2fd"];
+
+  // Eligibility
+  eligible [label="EligibilityChecker.checkEligibility\n(LDD: ψ=1, γ=15, fA=1/2, fB=1/20)\nreturns Option[(proof, vrfOutput)]"];
+
+  // Production
+  on_slot_won [label="onSlotWon\nSnapshotLeaderLoop.scala:303", fillcolor="#fff9c4"];
+
+  build_artifact [label="createProposalArtifact\n+ MptOverlay branch checkout\n(writes accumulate in ChangeSet)"];
+  chain_store [label="chainStore.store(signed, …)\nlocal-only commit\n(inside MptStore.withTransaction)"];
+  rekey       [label="mptOverlay.rekey(rawHash, certHash)\nupdate branch id post-cert"];
+
+  // Publish + attest
+  publish_snap [label="sidecarClient.publishSnapshot\n→ Go libp2p sidecar\n→ GossipSub topic"];
+  emit_self    [label="NakamotoSyncDaemon.emitTipAttestation\n(unified self/peer entry — Phase 2)", fillcolor="#c8e6c9"];
+
+  // emitTipAttestation internals
+  subgraph cluster_emit {
+    label="emitTipAttestation (NakamotoSyncDaemon.scala:1146)";
+    style="rounded,dashed";
+    color="#90caf9";
+    clock     [label="Clock[F].realTime\n(currentSeconds — pure F-typed)", fillcolor="#e1bee7"];
+    record    [label="tipTracker.recordAttestation(\n  selfId,\n  TipAttestation(tipHash, tipSlot, ord, attestedAt))"];
+    sign      [label="HasherSelector.withCurrent → hash → sign\nSignature.fromHash[F]"];
+    publish   [label="sidecarClient.publishAttestation\n→ Go libp2p sidecar\n→ GossipSub topic"];
+  }
+
+  slot_tick   -> eligible;
+  eligible    -> on_slot_won            [label="Some((proof,vrf))"];
+  on_slot_won -> build_artifact;
+  build_artifact -> chain_store         [label="(within withTransaction)"];
+  chain_store -> rekey                  [label="if stored"];
+  rekey       -> publish_snap           [label="if production gate still open"];
+  publish_snap -> emit_self;
+
+  emit_self -> clock;
+  clock     -> record                   [label="attestedAt = realTime.toSeconds"];
+  record    -> sign;
+  sign      -> publish;
+}

@@ -1,0 +1,77 @@
+// Peer-attestation receive: inbound sidecar gossip → signature verify → TipTracker write
+// And: peer-snapshot receive → processValidSnapshot → unconditional emitAttestation
+//
+// Render: dot -Tpng attestation-peer-receive.dot -o attestation-peer-receive.png
+//
+// Code refs:
+//   - SidecarRumorBridge.scala:75    inbound stream subscribe
+//   - NakamotoSyncDaemon.scala:670   processValidSnapshot call from receive handler
+//   - NakamotoSyncDaemon.scala:833   processValidSnapshot impl
+//   - NakamotoSyncDaemon.scala:900   recordAttestation(producerId, …) — implicit credit
+//   - NakamotoSyncDaemon.scala:916   emitAttestation(snap, …)  — UNCONDITIONAL self-att
+//   - NakamotoSyncDaemon.scala:1051  handleAttestation (inbound TipAttestation handler)
+//   - NakamotoSyncDaemon.scala:1076  recordAttestation(attesterId, …)
+//
+// Key subtlety highlighted: emitAttestation at line 916 fires regardless of
+// becameBestTip. This is what makes the Phase 3 re-attestation ticker necessary —
+// our selfId TipTracker entry can be moved onto a fork-branch hash by a peer's
+// gossip, then needs to be rescued back onto canonical.
+
+digraph peer_receive {
+  rankdir=TB;
+  splines=ortho;
+  graph [fontname="Helvetica", fontsize=11];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#f5f5f5"];
+  edge  [fontname="Helvetica", fontsize=9];
+
+  // Two inbound streams from the Go sidecar
+  sidecar [label="Go libp2p sidecar\n(GossipSub topics)", shape=cylinder, fillcolor="#bbdefb"];
+
+  // ── Snapshot path ──────────────────────────
+  subgraph cluster_snap {
+    label="pb.Snapshot path  (NakamotoSyncDaemon receive)";
+    style="rounded,dashed";
+    color="#90caf9";
+    snap_in   [label="pb.Snapshot decoded"];
+    validate  [label="Validate VRF + sig + slot-cert\n+ chainStore.store\n→ (becameBest, signedOpt, ctxOpt)"];
+    pvs       [label="processValidSnapshot\nNakamotoSyncDaemon.scala:833", fillcolor="#fff9c4"];
+
+    canonical [label="if becameBest:\n  setHeadForRecovery,\n  last*Storage.setForRecovery\n  productionGate.pause/resume(ReorgInProgress)"];
+
+    record_prod [label="tipTracker.recordAttestation(\n  producerId, att for snap.hash)\nNakamotoSyncDaemon.scala:900", fillcolor="#ffe0b2"];
+
+    emit_unconditional [label="emitAttestation(snap, …)\nUNCONDITIONAL — fires for fork-branches too\nNakamotoSyncDaemon.scala:916", fillcolor="#ffccbc"];
+
+    emit_internals [label="emitAttestation delegates to\nemitTipAttestation\n→ recordAttestation(selfId, att for snap.hash)\n→ sidecar publishAttestation"];
+  }
+
+  // ── Attestation path ───────────────────────
+  subgraph cluster_att {
+    label="pb.TipAttestation path  (NakamotoSyncDaemon receive)";
+    style="rounded,dashed";
+    color="#a5d6a7";
+    att_in     [label="pb.TipAttestation decoded\nNakamotoSyncDaemon.scala:1051"];
+    sig_verify [label="Recompute domain hash\nVerify ECDSA signature\nvia attesterId's pubkey"];
+    record_att [label="tipTracker.recordAttestation(\n  attesterId, domainAtt)\nNakamotoSyncDaemon.scala:1076", fillcolor="#ffe0b2"];
+    reject     [label="logger.warn\n(invalid signature / unsigned)", fillcolor="#ffcdd2"];
+  }
+
+  sidecar -> snap_in;
+  sidecar -> att_in;
+
+  snap_in    -> validate;
+  validate   -> pvs;
+  pvs        -> canonical    [label="if becameBest"];
+  pvs        -> record_prod  [label="always"];
+  pvs        -> emit_unconditional [label="always (even if !becameBest)"];
+  emit_unconditional -> emit_internals;
+
+  att_in    -> sig_verify;
+  sig_verify -> record_att   [label="valid"];
+  sig_verify -> reject       [label="invalid / missing"];
+
+  // Side-note about the gap
+  gap [label="GAP: emit_unconditional moves selfId.tipHash\nonto a fork-branch hash whenever a fork-branch\nsnap arrives. TipTracker.highestFinalizedOrdinal's\ncanonical-hash filter then drops our own vote\nto zero weight on our canonical chain.\nSee finality-monitor.dot for the 5s Phase 3 ticker\nthat rescues it.", shape=note, fillcolor="#fff59d", style="filled"];
+
+  emit_internals -> gap [style=dotted, arrowhead=none];
+}

@@ -1,0 +1,80 @@
+// finalityMonitor: 5s tick combining Phase 3 re-attestation, depth-k finality, and attestation-2/3 finality
+//
+// Render: dot -Tpng finality-monitor.dot -o finality-monitor.png
+//
+// Code refs:
+//   - SnapshotLeaderLoop.scala:381   finalityMonitor stream (awakeEvery 5s)
+//   - SnapshotLeaderLoop.scala:396   Phase 3 re-attestation ticker (NEW in commit 6e49b7d5)
+//   - SnapshotLeaderLoop.scala:425   depth-k gate (ConfirmationDepthK = 255)
+//   - SnapshotLeaderLoop.scala:489   attestation-2/3 gate
+//   - SnapshotLeaderLoop.scala:447, 510   mptOverlay.finalizeBranch (the two sinks)
+//   - TipTracker.scala:133           highestFinalizedOrdinal (canonical-hash filter)
+//   - TipTracker.scala:67            FinalityThreshold = 2/3 (env NAKAMOTO_ATTESTATION_THRESHOLD)
+//   - NakamotoChainStore.scala:290   chainStore.store finality-safety gate
+//
+// Skill ref: ~/.claude/skills/taktikos/SKILL.md (Taktikos LDD + maxvalid-tk)
+
+digraph finality_monitor {
+  rankdir=TB;
+  graph [fontname="Helvetica", fontsize=11];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled", fillcolor="#f5f5f5"];
+  edge  [fontname="Helvetica", fontsize=9];
+
+  tick [label="awakeEvery(5.seconds)\nSnapshotLeaderLoop.scala:382", fillcolor="#e3f2fd"];
+
+  // Reads at start of every tick
+  read_atts [label="allAtts <- tipTracker.allAttestations\nbestTip  <- chainStore.bestTip\nlastFinalizedOrdinal <- chainStore.lastFinalizedOrdinal"];
+
+  // ── Phase 3: re-attestation ticker (NEW, commit 6e49b7d5) ──
+  subgraph cluster_phase3 {
+    label="Phase 3 re-attestation (commit 6e49b7d5)";
+    style="rounded,dashed";
+    color="#ce93d8";
+
+    p3_cond [label="!allAtts(selfId).tipHash == bestTip.hash ?\n(or selfId not in allAtts)"];
+    p3_fire [label="NakamotoSyncDaemon.emitTipAttestation(\n  tipHash=bestTip.hash,\n  tipSlot, tipOrdinal,\n  …)\n→ logger.info(\"RE-ATTEST …\")", fillcolor="#e1bee7"];
+  }
+
+  // ── Depth-k path ─────────────────────────
+  subgraph cluster_depthk {
+    label="Depth-k finality (Bitcoin-style)";
+    style="rounded,dashed";
+    color="#90caf9";
+
+    dk_cond [label="tip.ordinal - lastFinalizedOrdinal > k ?\n(default k = 255, env NAKAMOTO_CONFIRMATION_DEPTH)"];
+    dk_walk [label="walkBackTo(tip.hash, ord-k)\n→ canonicalHash, canonicalSnapshot"];
+    dk_sink [label="markFinalized + pruneBelow\nchainStore.finalize(hash, ord)\nmptOverlay.finalizeBranch(BranchId(hash), ord)\nlog 'DEPTH-FINALIZED …'"];
+  }
+
+  // ── Attestation 2/3 path (GRANDPA-style) ─
+  subgraph cluster_att23 {
+    label="Attestation-2/3 finality (GRANDPA-style)";
+    style="rounded,dashed";
+    color="#a5d6a7";
+
+    att_hf [label="tipTracker.highestFinalizedOrdinal(\n  threshold=2/3,\n  canonicalHashAt = walkBackTo(tip.hash, _))\nTipTracker.scala:133", fillcolor="#fff9c4"];
+    att_filter [label="for each attestation:\n  if att.tipHash == canonicalHashAt(att.tipOrdinal)\n  → add stakeRegistry.optimisticRelativeStake(peerId)\n  else → 0   (canonical-hash filter)"];
+    att_sink [label="markFinalized + pruneBelow\nchainStore.finalize(hash, ord)\nmptOverlay.finalizeBranch(BranchId(hash), ord)\nlog 'ATTEST-FINALIZED …'"];
+    att_walk_miss [label="walkBackTo returns None\n(local fork doesn't contain attested ordinal)\n→ chainSyncRequestQueue.request(ord)", fillcolor="#ffccbc"];
+  }
+
+  // Wiring
+  tick -> read_atts;
+  read_atts -> p3_cond;
+  p3_cond -> p3_fire        [label="mismatch"];
+  p3_fire -> dk_cond;
+  p3_cond -> dk_cond        [label="match"];
+
+  dk_cond -> dk_walk        [label="yes"];
+  dk_cond -> att_hf         [label="no\n(check attestation path)"];
+  dk_walk -> dk_sink;
+
+  att_hf -> att_filter;
+  att_filter -> att_sink    [label="cumWeight ≥ 2/3 AND finalOrd > lastFinalizedOrd AND !depthFinalized"];
+  att_filter -> att_walk_miss [label="walkBackTo miss\n(on a fork)"];
+
+  // Common downstream effect
+  overlay [label="mptOverlay.finalizeBranch\n(see overlay-branches.dot)\n— atomic fold-forward,\n  drop sibling pending branches,\n  apply undo journal on reorg-replace", fillcolor="#ffd54f"];
+  dk_sink -> overlay [style=bold, color="#1b5e20"];
+  att_sink -> overlay [style=bold, color="#1b5e20"];
+}

@@ -404,7 +404,7 @@ object SnapshotLeaderLoop {
                     selfId = selfId,
                     keyPair = keyPair,
                     logger = logger
-                  ) >> logger.debug(
+                  ) >> logger.info(
                     s"RE-ATTEST bestTip change: ord=${tip.ordinal} slot=${tip.slot} hash=${tip.hash.value.take(12)} " +
                       s"(prior self-att=${allAtts.get(selfId).map(_.tipHash.value.take(12)).getOrElse("none")})"
                   )

@@ -2,7 +2,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import java.security.KeyPair
 
-import cats.effect.kernel.{Async, Ref}
+import cats.effect.kernel.{Async, Clock, Ref}
 import cats.effect.std.{Semaphore, Supervisor}
 import cats.syntax.all._
 
@@ -1149,32 +1149,39 @@ object NakamotoSyncDaemon {
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     val tipSlot = Slot(NonNegLong.unsafeFrom(tipSlotLong))
-    val currentSlotMs = System.currentTimeMillis() / 1000L
-    val attestedAtSlot = Slot(NonNegLong.unsafeFrom(currentSlotMs))
+    // `attestedAt` is wall-clock seconds. Read through Clock[F] (auto-available
+    // from Async[F] <: Clock[F]) rather than calling System.currentTimeMillis
+    // directly — keeps the time read referentially transparent and testable
+    // and matches the codebase's existing Clock-based patterns
+    // (ValidationErrorStorage, MempoolEntry, MeshState, etc.).
+    Clock[F].realTime.flatMap { realTime =>
+      val currentSeconds = realTime.toSeconds
+      val attestedAtSlot = Slot(NonNegLong.unsafeFrom(currentSeconds))
 
-    // Record locally first (so our own TipTracker sees it)
-    val localAtt = DomainTipAttestation(tipHash, tipSlot, tipOrdinal, attestedAtSlot)
-    tipTracker.recordAttestation(selfId, localAtt) >>
-      // Sign via the standard Hasher pipeline: JSON-encode the domain TipAttestation → hash → sign the hash.
-      // Same path as SignatureProof.fromData / Signed.forAsyncHasher — no custom serialization.
-      HasherSelector[F].withCurrent { implicit hasher =>
-        for {
-          attHash <- localAtt.hash
-          sig <- Signature.fromHash[F](keyPair.getPrivate, attHash)
-          sigBytes = sig.coerce.toBytes
-          att = SidecarClient.mkAttestation(
-            tipHash = tipHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-            tipSlot = tipSlotLong,
-            tipOrdinal = tipOrdinal,
-            attestedAt = currentSlotMs,
-            attesterId = selfId.value.toBytes,
-            signature = sigBytes
-          )
-          _ <- sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
-            logger.warn(s"Failed to emit attestation: ${e.getMessage}")
-          }
-        } yield ()
-      }
+      // Record locally first (so our own TipTracker sees it)
+      val localAtt = DomainTipAttestation(tipHash, tipSlot, tipOrdinal, attestedAtSlot)
+      tipTracker.recordAttestation(selfId, localAtt) >>
+        // Sign via the standard Hasher pipeline: JSON-encode the domain TipAttestation → hash → sign the hash.
+        // Same path as SignatureProof.fromData / Signed.forAsyncHasher — no custom serialization.
+        HasherSelector[F].withCurrent { implicit hasher =>
+          for {
+            attHash <- localAtt.hash
+            sig <- Signature.fromHash[F](keyPair.getPrivate, attHash)
+            sigBytes = sig.coerce.toBytes
+            att = SidecarClient.mkAttestation(
+              tipHash = tipHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+              tipSlot = tipSlotLong,
+              tipOrdinal = tipOrdinal,
+              attestedAt = currentSeconds,
+              attesterId = selfId.value.toBytes,
+              signature = sigBytes
+            )
+            _ <- sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
+              logger.warn(s"Failed to emit attestation: ${e.getMessage}")
+            }
+          } yield ()
+        }
+    }
   }
 
   /** Catch up from a gossip payload when parent is missing (restart scenario).
