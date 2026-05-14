@@ -150,7 +150,7 @@ object SnapshotLeaderLoop {
     * @param etaRotationSlots
     *   slots per eta rotation period (default 600 = 10 minutes). Eta is long-lived — Cardano uses ~5 days.
     */
-  def run[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
+  def run[F[_]: Async: SecurityProvider: HasherSelector: Metrics: SlotClock](
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
@@ -192,13 +192,13 @@ object SnapshotLeaderLoop {
     // don't have on our local canonical chain (we're on a fork), we enqueue a
     // request here instead of silently waiting for the next periodic sync. See
     // ChainSyncRequestQueue for why this is a queue rather than a direct call.
-    chainSyncRequestQueue: ChainSyncRequestQueue[F],
-    // Global slot provider: derives the current consensus slot from wall-clock + genesis,
-    // honoring the cluster's configured slotDurationMs (1000ms prod, 500ms in e2e). Used
-    // here as the source of `attestedAt` for emit*Attestation — `attestedAt` is a Nakamoto
-    // consensus slot, NOT wall-clock seconds (Slot's NonNegLong is dimensionally a slot
-    // index, even when slotDurationMs == 1000).
-    slotClock: SlotClock[F]
+    chainSyncRequestQueue: ChainSyncRequestQueue[F]
+    // Global slot provider is a `SlotClock[F]` context bound on the `run` signature above;
+    // summoned at call sites via `SlotClock[F].currentSlot`. Constructed once at
+    // `GlobalSnapshotConsensus.make` and made `implicit` there so the typeclass resolves
+    // through the supervised stream call. `attestedAt` is a Nakamoto consensus slot, NOT
+    // wall-clock seconds (Slot's NonNegLong is dimensionally a slot index, even when
+    // slotDurationMs == 1000).
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -334,7 +334,6 @@ object SnapshotLeaderLoop {
                             nakamotoFinalizedOrdinalRef,
                             mptStore,
                             mptOverlay,
-                            slotClock,
                             logger
                           )
                         } // snapshotSemaphore.permit
@@ -402,7 +401,7 @@ object SnapshotLeaderLoop {
               // hash filter) and our own vote never contributes to bestTip finality.
               _ <- bestTip match {
                 case Some(tip) if !allAtts.get(selfId).exists(_.tipHash === tip.hash) =>
-                  slotClock.currentSlot.flatMap { attestedAt =>
+                  SlotClock[F].currentSlot.flatMap { attestedAt =>
                     NakamotoSyncDaemon.emitTipAttestation[F](
                       tipHash = tip.hash,
                       tipSlot = Slot(NonNegLong.unsafeFrom(tip.slot)),
@@ -599,7 +598,6 @@ object SnapshotLeaderLoop {
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
     mptStore: MptStore[F, GlobalStateKey],
     mptOverlay: MptOverlay[F, GlobalStateKey],
-    slotClock: SlotClock[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     HasherSelector[F].withCurrent { implicit hasher =>

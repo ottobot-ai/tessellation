@@ -27,6 +27,12 @@ trait SlotClock[F[_]] {
 
 object SlotClock {
 
+  /** Standard typeclass summoner so call sites can write `SlotClock[F].currentSlot` instead of taking the instance as an explicit value
+    * parameter. The instance is constructed once at `GlobalSnapshotConsensus.make` and made `implicit` in scope there; downstream functions
+    * pick it up via the `[F[_]: ... : SlotClock]` context bound.
+    */
+  def apply[F[_]](implicit ev: SlotClock[F]): SlotClock[F] = ev
+
   case class Config(
     genesisTimeMs: Long, // Unix epoch millis when slot 0 starts
     slotDurationMs: Long = 1000L, // 1 second per slot

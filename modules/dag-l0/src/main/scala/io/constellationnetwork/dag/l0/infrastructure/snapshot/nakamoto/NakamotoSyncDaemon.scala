@@ -112,7 +112,7 @@ object NakamotoSyncDaemon {
     * handleSnapshot (which will now find the parent in the chain store and validate successfully). This creates a validation cascade from
     * the shared genesis ancestor through the gossip chain.
     */
-  private def drainPendingChildren[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
+  private def drainPendingChildren[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics: SlotClock](
     storedHash: Hash,
     stateRef: Ref[F, SyncState],
     pendingParentRef: Ref[F, Map[Hash, List[pb.Snapshot]]],
@@ -139,7 +139,6 @@ object NakamotoSyncDaemon {
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
-    slotClock: SlotClock[F],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -181,7 +180,6 @@ object NakamotoSyncDaemon {
               chainSyncManager,
               channel,
               dataDir,
-              slotClock,
               logger
             )
           }
@@ -199,7 +197,7 @@ object NakamotoSyncDaemon {
     def initial: SyncState = SyncState(0L, None, 0L, isReady = false)
   }
 
-  def run[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
+  def run[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics: SlotClock](
     channel: ManagedChannel,
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     nodeStorage: NodeStorage[F],
@@ -229,8 +227,9 @@ object NakamotoSyncDaemon {
     // machinery without needing their own `ChainSyncManager`. We publish our
     // internally-constructed manager into this Ref once it's built; consumers
     // read-through it and no-op if the producer hasn't bound yet.
-    sharedChainSyncManagerRef: Ref[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]],
-    slotClock: SlotClock[F]
+    sharedChainSyncManagerRef: Ref[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]]
+    // Global slot provider for `attestedAt` consensus-slot reads is a `SlotClock[F]`
+    // context bound on `run` (see `processValidSnapshot` below).
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -298,7 +297,6 @@ object NakamotoSyncDaemon {
                                 csm,
                                 channel,
                                 dataDir,
-                                slotClock,
                                 logger
                               )
                             }
@@ -385,7 +383,6 @@ object NakamotoSyncDaemon {
                                     chainSyncManager,
                                     channel,
                                     dataDir,
-                                    slotClock,
                                     logger
                                   )
                                 } >>
@@ -426,7 +423,7 @@ object NakamotoSyncDaemon {
     }
   }
 
-  private def handleSnapshot[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
+  private def handleSnapshot[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics: SlotClock](
     snap: pb.Snapshot,
     stateRef: Ref[F, SyncState],
     pendingParentRef: Ref[F, Map[Hash, List[pb.Snapshot]]],
@@ -453,7 +450,6 @@ object NakamotoSyncDaemon {
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
-    slotClock: SlotClock[F],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -692,7 +688,6 @@ object NakamotoSyncDaemon {
             lastGlobalSnapshotStorage,
             lastNGlobalSnapshotStorage,
             productionGate,
-            slotClock,
             logger
           ) >> {
             // This snapshot is now stored — drain any children that were waiting for it.
@@ -724,7 +719,6 @@ object NakamotoSyncDaemon {
               chainSyncManager,
               channel,
               dataDir,
-              slotClock,
               logger
             )
           }
@@ -838,7 +832,7 @@ object NakamotoSyncDaemon {
     *     was stored as a fork branch (or duplicate) in chainStore and MPT was rolled back; we still update tip-tracking, attestation, and
     *     ready-transition.
     */
-  private def processValidSnapshot[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
+  private def processValidSnapshot[F[_]: Async: SecurityProvider: HasherSelector: Metrics: SlotClock](
     snap: pb.Snapshot,
     signedSnapshot: Option[Signed[GlobalIncrementalSnapshot]],
     context: Option[GlobalSnapshotInfo],
@@ -857,7 +851,6 @@ object NakamotoSyncDaemon {
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     productionGate: ProductionGate[F],
-    slotClock: SlotClock[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     for {
@@ -939,7 +932,7 @@ object NakamotoSyncDaemon {
       // (honors NAKAMOTO_SLOT_DURATION_MS; 500 ms in e2e, 1000 ms default) —
       // NOT a wall-clock unit.
       _ <- Async[F].whenA(becameBestTip) {
-        slotClock.currentSlot.flatMap { attestedAt =>
+        SlotClock[F].currentSlot.flatMap { attestedAt =>
           emitAttestation(snap, attestedAt, sidecarClient, tipTracker, selfId, keyPair, logger)
         }
       }
