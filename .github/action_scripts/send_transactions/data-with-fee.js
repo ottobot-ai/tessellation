@@ -183,11 +183,20 @@ const checkFeeTransactionInGlobalL0 = async (globalL0Url, feeWallet) => {
             const response = await axios.get(`${globalL0Url}/global-snapshots/latest/combined`);
             const [_, globalSnapshotInfo] = response.data;
 
-            const firstSnapshotKey = Object.keys(globalSnapshotInfo.lastCurrencySnapshots)[0];
-            const metagraphSnapshotBalances = globalSnapshotInfo.lastCurrencySnapshots[firstSnapshotKey].Right[1].balances;
-            if (Object.keys(metagraphSnapshotBalances).length > 0 && metagraphSnapshotBalances[feeWallet] > 0) {
-                console.log(`Fee transaction processed successfully. Response: ${JSON.stringify(metagraphSnapshotBalances)}`);
-                return;
+            // Multi-metagraph aware: iterate all metagraphs and return success if
+            // any of them has the feeWallet balance. Previously we picked the
+            // first metagraph (Object.keys()[0]) which is incorrect under
+            // --metagraphs>1 because map iteration order is by metagraph ID
+            // and the target metagraph isn't always first.
+            const lcs = globalSnapshotInfo.lastCurrencySnapshots || {};
+            for (const [mid, either] of Object.entries(lcs)) {
+                const right = either && either.Right;
+                if (!right || !Array.isArray(right) || right.length < 2) continue;
+                const balances = right[1].balances || {};
+                if (balances[feeWallet] && balances[feeWallet] > 0) {
+                    console.log(`Fee transaction processed successfully on metagraph ${mid}. Response: ${JSON.stringify(balances)}`);
+                    return;
+                }
             }
 
             console.log(`Fee transaction not processed yet. Retrying in 1 seconds (${attempt}/${maxAttempts})`);
