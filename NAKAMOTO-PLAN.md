@@ -1,9 +1,25 @@
 # Nakamoto — Active Work Plan
 
-**Branch:** `feature/nakamoto-stake-registry`
-**Last updated:** 2026-04-08 (milestone closed: metagraph e2e on Nakamoto GL0 passing)
+**Branch:** `feature/serde-typeclass-shim`
+**Last updated:** 2026-05-14 (#56 MultiBranch overlay validated via iter31 e2e — 8 gl0 + K=2 metagraphs, EXIT=0)
 
 Companion to `NAKAMOTO-TODO.md` (full backlog). This file tracks the in-flight workstream toward metagraph end-to-end on Nakamoto GL0.
+
+---
+
+## Current milestone (2026-05-14) — MPT overlay e2e validation
+
+**Status: iter31 full e2e PASSED** (`feature/serde-typeclass-shim` @ `f51252ef`).
+
+- 8 gl0 + 2 metagraphs, 4212s runtime, EXIT=0
+- All 11 test phases green (delegated-staking → token-lock-replacement → multi-metagraph K=2 → currency → rewards → token-locks → allow-spends → spend-transactions → data-tx-no-fee → data-tx-with-fee)
+- Per-gl0 finality (preserved at `/tmp/iter31-cluster-logs/`): 488–500 **ATTEST-FINALIZED**, **0 DEPTH-FINALIZED**, 0–3 fork branches per node, all attestations `weight=0.75, 8/8 active`. Cluster is healthy; depth-k fallback never engaged.
+
+**Open follow-ups** (memory: `project_iter31_overlay_full_e2e_pass.md`):
+- dl1/cl1 `pullFinalityGated` tick=10s vs gl0 finalization ~6s/ord → follower-side download lag is the actual mechanism behind iter26's `TooFarLastValidEpochProgress`. Worked around with `allow-spends.max-epoch-progress` 200→500; structural fix is faster pull / parallel batch / direct gl0 epoch read.
+- Reorg re-attestation gap: chainSelection bestTip changes don't trigger fresh `processValidSnapshot` → no Polkadot-style re-attest to new canonical. Not failing tests but a correctness gap.
+- Reproducibility: iter31 is one pass; iter32 currently running for second confirmation.
+- Pending memory items #118 (OverlayReader rewire of 5 gl0 HTTP read sites), #119 (n1 fork-recovery deadlock re-bootstrap), #120 (2-of-2 fragility under VRF droughts).
 
 ---
 
