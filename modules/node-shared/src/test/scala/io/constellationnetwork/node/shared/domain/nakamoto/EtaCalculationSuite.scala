@@ -26,23 +26,23 @@ object EtaCalculationSuite extends SimpleIOSuite {
   }
 
   pureTest("twoThirdsCutoff is at 2/3 of period") {
-    // Period 1: slots [600, 1200), 2/3 cutoff at 600 + 400 = 1000
+    // Period 1: ordinals [600, 1200), 2/3 cutoff at 600 + 400 = 1000
     expect(EtaCalculation.twoThirdsCutoff(1, etaRotation) == 1000L)
   }
 
   pureTest("period 0 uses genesis eta") {
-    val eta = EtaCalculation.etaForSlot(100, etaRotation, genesisEta, _ => Nil)
+    val eta = EtaCalculation.etaForOrdinal(100, etaRotation, genesisEta, _ => Nil)
     expect(eta.sameElements(genesisEta))
   }
 
   pureTest("period 1 uses genesis eta") {
-    val eta = EtaCalculation.etaForSlot(700, etaRotation, genesisEta, _ => Nil)
+    val eta = EtaCalculation.etaForOrdinal(700, etaRotation, genesisEta, _ => Nil)
     expect(eta.sameElements(genesisEta))
   }
 
   pureTest("period 2 derives from period 1 VRF outputs") {
     val fakeVrfOutputs = List(Array.fill(64)(0x01.toByte), Array.fill(64)(0x02.toByte))
-    val eta = EtaCalculation.etaForSlot(
+    val eta = EtaCalculation.etaForOrdinal(
       1300, // period 2
       etaRotation,
       genesisEta,
@@ -54,7 +54,7 @@ object EtaCalculationSuite extends SimpleIOSuite {
   }
 
   pureTest("period 2 with no blocks in period 1 falls back to genesis eta") {
-    val eta = EtaCalculation.etaForSlot(1300, etaRotation, genesisEta, _ => Nil)
+    val eta = EtaCalculation.etaForOrdinal(1300, etaRotation, genesisEta, _ => Nil)
     expect(eta.sameElements(genesisEta))
   }
 
@@ -88,7 +88,7 @@ object EtaCalculationSuite extends SimpleIOSuite {
   }
 
   pureTest("extractVrfOutputsForPeriod filters to first 2/3") {
-    // Period 1: slots [600, 1200), cutoff at 1000
+    // Period 1: ordinals [600, 1200), cutoff at 1000
     val chainOutputs = List(
       (550L, Array.fill(64)(0x00.toByte)), // period 0 — excluded
       (650L, Array.fill(64)(0x01.toByte)), // period 1, before cutoff — included
@@ -114,7 +114,7 @@ object EtaCalculationSuite extends SimpleIOSuite {
     expect(extracted.isEmpty)
   }
 
-  pureTest("extractVrfOutputsForPeriod orders by slot") {
+  pureTest("extractVrfOutputsForPeriod orders by ordinal") {
     val chainOutputs = List(
       (800L, Array.fill(64)(0x02.toByte)),
       (650L, Array.fill(64)(0x01.toByte)),
@@ -122,9 +122,9 @@ object EtaCalculationSuite extends SimpleIOSuite {
     )
     val extracted = EtaCalculation.extractVrfOutputsForPeriod(chainOutputs, 1, etaRotation)
     expect(extracted.length == 3) &&
-    expect(extracted(0).head == 0x01.toByte) && // slot 650
-    expect(extracted(1).head == 0x02.toByte) && // slot 800
-    expect(extracted(2).head == 0x03.toByte) // slot 900
+    expect(extracted(0).head == 0x01.toByte) && // ordinal 650
+    expect(extracted(1).head == 0x02.toByte) && // ordinal 800
+    expect(extracted(2).head == 0x03.toByte) // ordinal 900
   }
 
   pureTest("eta is 32 bytes (Blake2b-256)") {
@@ -134,18 +134,18 @@ object EtaCalculationSuite extends SimpleIOSuite {
   }
 
   pureTest("full flow: period 0 → 1 → 2 with chain data") {
-    // Simulate chain: some blocks in period 0, some in period 1
+    // Simulate chain: some snapshots in period 0, some in period 1
     val period0Outputs = (0 until 10).map(i => (i * 50L, Array.fill(64)(i.toByte))).toList
     val period1Outputs = (0 until 8).map(i => ((600 + i * 50).toLong, Array.fill(64)((i + 100).toByte))).toList
     val allOutputs = period0Outputs ++ period1Outputs
 
     // Period 0 and 1: genesis eta
-    val eta0 = EtaCalculation.etaForSlot(100, etaRotation, genesisEta, _ => Nil)
-    val eta1 = EtaCalculation.etaForSlot(700, etaRotation, genesisEta, _ => Nil)
+    val eta0 = EtaCalculation.etaForOrdinal(100, etaRotation, genesisEta, _ => Nil)
+    val eta1 = EtaCalculation.etaForOrdinal(700, etaRotation, genesisEta, _ => Nil)
     expect(eta0.sameElements(genesisEta)) &&
     expect(eta1.sameElements(genesisEta)) && {
       // Period 2: derived from period 1's first 2/3 outputs
-      val eta2 = EtaCalculation.etaForSlot(
+      val eta2 = EtaCalculation.etaForOrdinal(
         1300,
         etaRotation,
         genesisEta,

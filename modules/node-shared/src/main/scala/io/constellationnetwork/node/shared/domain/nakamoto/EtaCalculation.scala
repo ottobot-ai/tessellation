@@ -9,6 +9,9 @@ import org.bouncycastle.crypto.digests.Blake2bDigest
   * Eta for rotation period N is derived from VRF outputs in the first 2/3 of rotation period N-1. Genesis eta is used for rotation period 0
   * (and period 1, since period 0 has no predecessor).
   *
+  * Rotation periods are keyed on **snapshot ordinal**, not slot — slots are LDD-paced and lumpy; ordinals are 1:1 with snapshots and give a
+  * stable R that satisfies the Praos R ≥ 3·k₁ stability bound. See `docs/nakamoto/attestation-and-finality.md` §1.
+  *
   * This ensures:
   *   - All nodes seeing the same chain compute the same eta (deterministic from chain)
   *   - Eta for period N is knowable at the 2/3 point of period N-1 (lookahead)
@@ -16,25 +19,29 @@ import org.bouncycastle.crypto.digests.Blake2bDigest
   */
 object EtaCalculation {
 
-  /** Compute which rotation period a slot belongs to. Period 0 = slots [0, etaRotationSlots), Period 1 = [etaRotationSlots,
-    * 2*etaRotationSlots), etc.
+  /** Compute which rotation period an ordinal belongs to. Period 0 = ordinals [0, etaRotationSnapshots), Period 1 = [etaRotationSnapshots,
+    * 2*etaRotationSnapshots), etc.
+    *
+    * Keyed on **ordinal**, not slot — the security argument is about CP-safety of VRF inputs (a snapshot-indexed property), and slot rate
+    * varies under LDD-fill drift. See `docs/nakamoto/attestation-and-finality.md` §1.
     */
-  def rotationPeriod(slot: Long, etaRotationSlots: Long): Long =
-    slot / etaRotationSlots
+  def rotationPeriod(ordinal: Long, etaRotationSnapshots: Long): Long =
+    ordinal / etaRotationSnapshots
 
-  /** Compute the slot range for a rotation period. Returns (startSlot, endSlot) inclusive of start, exclusive of end.
+  /** Compute the ordinal range for a rotation period. Returns (startOrdinal, endOrdinal) inclusive of start, exclusive of end.
     */
-  def rotationPeriodRange(period: Long, etaRotationSlots: Long): (Long, Long) =
-    (period * etaRotationSlots, (period + 1) * etaRotationSlots)
+  def rotationPeriodRange(period: Long, etaRotationSnapshots: Long): (Long, Long) =
+    (period * etaRotationSnapshots, (period + 1) * etaRotationSnapshots)
 
-  /** Compute the 2/3 cutoff slot within a rotation period. VRF outputs from slots < cutoff in the period contribute to next period's eta.
+  /** Compute the 2/3 cutoff ordinal within a rotation period. VRF outputs from ordinals < cutoff in the period contribute to next period's
+    * eta.
     */
-  def twoThirdsCutoff(period: Long, etaRotationSlots: Long): Long = {
-    val (start, _) = rotationPeriodRange(period, etaRotationSlots)
-    start + (etaRotationSlots * 2 / 3)
+  def twoThirdsCutoff(period: Long, etaRotationSnapshots: Long): Long = {
+    val (start, _) = rotationPeriodRange(period, etaRotationSnapshots)
+    start + (etaRotationSnapshots * 2 / 3)
   }
 
-  /** Determine which eta to use for a given slot.
+  /** Determine which eta to use for a given ordinal.
     *
     *   - Period 0: genesis eta
     *   - Period 1: genesis eta (no predecessor period to derive from)
@@ -43,13 +50,13 @@ object EtaCalculation {
     * The caller must supply the VRF outputs from the chain for the relevant period. This method only handles the "which period and what
     * inputs" logic.
     */
-  def etaForSlot(
-    slot: Long,
-    etaRotationSlots: Long,
+  def etaForOrdinal(
+    ordinal: Long,
+    etaRotationSnapshots: Long,
     genesisEta: Array[Byte],
     lookupVrfOutputsForPeriod: Long => List[Array[Byte]]
   ): Array[Byte] = {
-    val period = rotationPeriod(slot, etaRotationSlots)
+    val period = rotationPeriod(ordinal, etaRotationSnapshots)
 
     if (period <= 1) {
       // Periods 0 and 1 use genesis eta
@@ -95,18 +102,19 @@ object EtaCalculation {
 
   /** Extract VRF outputs from a chain segment for a specific rotation period's first 2/3.
     *
-    * Given a list of (slot, vrfOutput) pairs from the chain, filter to those in the first 2/3 of the specified rotation period.
+    * Given a list of (ordinal, vrfOutput) pairs from the chain, filter to those in the first 2/3 of the specified rotation period. The
+    * `Long` in the input pairs is the snapshot's **ordinal** (matches the snapshot-indexed rotation unit).
     */
   def extractVrfOutputsForPeriod(
     chainVrfOutputs: List[(Long, Array[Byte])],
     period: Long,
-    etaRotationSlots: Long
+    etaRotationSnapshots: Long
   ): List[Array[Byte]] = {
-    val (periodStart, _) = rotationPeriodRange(period, etaRotationSlots)
-    val cutoff = twoThirdsCutoff(period, etaRotationSlots)
+    val (periodStart, _) = rotationPeriodRange(period, etaRotationSnapshots)
+    val cutoff = twoThirdsCutoff(period, etaRotationSnapshots)
 
-    chainVrfOutputs.filter { case (slot, _) => slot >= periodStart && slot < cutoff }
-      .sortBy(_._1) // ensure deterministic ordering by slot
+    chainVrfOutputs.filter { case (ordinal, _) => ordinal >= periodStart && ordinal < cutoff }
+      .sortBy(_._1) // ensure deterministic ordering by ordinal
       .map(_._2)
   }
 }

@@ -141,7 +141,7 @@ e2e cycles.
 | `NAKAMOTO_LDD_OFFSET`    | 1   | 1   | ψ — snowplow offset |
 | `NAKAMOTO_SLOT_DURATION_MS` | 1000 | 1000 | Slot tick interval |
 | `NAKAMOTO_SLOTS_PER_EPOCH`  | 60  | 60  | Slots per epoch |
-| `NAKAMOTO_ETA_ROTATION_SLOTS` | 600 | 600 | Eta randomness rotation |
+| `NAKAMOTO_ETA_ROTATION_SNAPSHOTS` | 100 | 2550 | Eta randomness rotation (snapshots; prod = 10·k₁) |
 
 LDD parameters now match production defaults (within rounding — γ=16 vs 15)
 so the test cluster exercises the same eligibility curve as mainnet. Slot

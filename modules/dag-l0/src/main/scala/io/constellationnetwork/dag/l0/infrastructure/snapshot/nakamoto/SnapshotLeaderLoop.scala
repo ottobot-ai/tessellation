@@ -53,18 +53,19 @@ object SharedEpochState {
   def initial(genesisEta: Array[Byte]): SharedEpochState =
     SharedEpochState(currentEta = genesisEta, genesisEta = genesisEta, vrfAccumulator = Nil)
 
-  /** Accumulate a VRF output and rotate eta if threshold reached. Eta rotates every `etaRotationSlots` (default 600 = 10 minutes), not
-    * every epoch. This follows Cardano/Bifrost pattern where eta is long-lived (Cardano uses ~5 days).
+  /** Accumulate a VRF output and rotate eta if threshold reached. Eta rotates every `etaRotationSnapshots` (default 2550 = 10·k₁), not
+    * every epoch. Rotation is keyed on **ordinal** to satisfy the Praos R ≥ 3·k₁ stability bound (slots are LDD-paced and lumpy; ordinals
+    * give a stable R). See `docs/nakamoto/attestation-and-finality.md` §1.
     */
   def accumulate(
     state: SharedEpochState,
     vrfOutput: Array[Byte],
-    currentSlot: Long,
-    etaRotationSlots: Long
+    currentOrdinal: Long,
+    etaRotationSnapshots: Long
   ): SharedEpochState = {
     val newAcc = state.vrfAccumulator :+ vrfOutput
-    if (newAcc.size >= (etaRotationSlots * 2 / 3).toInt) {
-      val rotationEpoch = currentSlot / etaRotationSlots
+    if (newAcc.size >= (etaRotationSnapshots * 2 / 3).toInt) {
+      val rotationEpoch = currentOrdinal / etaRotationSnapshots
       val nextEta = EligibilityChecker.computeNextEta(state.currentEta, rotationEpoch, newAcc)
       SharedEpochState(currentEta = nextEta, genesisEta = state.genesisEta, vrfAccumulator = Nil)
     } else
@@ -147,8 +148,10 @@ object SnapshotLeaderLoop {
     *   LDD snowplow parameters
     * @param slotsPerEpoch
     *   slots per epoch (default 60, for time labels only)
-    * @param etaRotationSlots
-    *   slots per eta rotation period (default 600 = 10 minutes). Eta is long-lived — Cardano uses ~5 days.
+    * @param etaRotationSnapshots
+    *   snapshots per eta rotation period. Production default 2550 = 10·k₁ (matches Cardano R/k ratio). Eta is long-lived — Cardano uses ~5
+    *   days. Rotation is keyed on **ordinal**, not slot — see `docs/nakamoto/attestation-and-finality.md` §1 for the R ≥ 3·k₁ stability
+    *   bound rationale.
     */
   def run[F[_]: Async: SecurityProvider: HasherSelector: Metrics: SlotClock](
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
@@ -166,7 +169,7 @@ object SnapshotLeaderLoop {
     lddConfig: LddConfig,
     eligibilityChecker: EligibilityChecker[F],
     slotsPerEpoch: Long = 60L,
-    etaRotationSlots: Long = 600L,
+    etaRotationSnapshots: Long = 2550L,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     genesisTimeMs: Long = 0L,
@@ -276,13 +279,18 @@ object SnapshotLeaderLoop {
                     // Chain-derived eta: deterministic from stored chain, no in-memory accumulator.
                     // Period 0: genesis eta (constant). Period N>=1: derived from VRF outputs in period N-1.
                     // All nodes seeing the same chain derive the same eta — no divergence.
-                    currentPeriod = EtaCalculation.rotationPeriod(currentSlot, etaRotationSlots)
+                    //
+                    // Rotation period is keyed on **ordinal**, not slot — slots are LDD-paced and lumpy;
+                    // ordinals are 1:1 with snapshots and give a stable R that satisfies the R ≥ 3·k₁
+                    // bound. See `docs/nakamoto/attestation-and-finality.md` §1.
+                    lastChainOrdinal <- chainStore.bestTipOrdinal.map(_.getOrElse(0L))
+                    currentPeriod = EtaCalculation.rotationPeriod(lastChainOrdinal, etaRotationSnapshots)
                     genesisEta <- epochStateRef.get.map(_.genesisEta)
                     eta <-
                       if (currentPeriod <= 0) {
                         Async[F].pure(genesisEta)
                       } else {
-                        chainStore.vrfOutputsForPeriod(currentPeriod - 1, etaRotationSlots).map { chainOutputs =>
+                        chainStore.vrfOutputsForPeriod(currentPeriod - 1, etaRotationSnapshots).map { chainOutputs =>
                           if (chainOutputs.nonEmpty) {
                             EtaCalculation.computeEta(genesisEta, currentPeriod, chainOutputs.map(_._2))
                           } else {
@@ -326,7 +334,7 @@ object SnapshotLeaderLoop {
                             slotGap,
                             slotRefined,
                             lddConfig,
-                            etaRotationSlots,
+                            etaRotationSnapshots,
                             lastKnownSlotRef,
                             epochStateRef,
                             productionGate,
@@ -590,7 +598,7 @@ object SnapshotLeaderLoop {
     slotGap: Long,
     slotRefined: Slot,
     lddConfig: LddConfig,
-    etaRotationSlots: Long,
+    etaRotationSnapshots: Long,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     productionGate: ProductionGate[F],
@@ -636,7 +644,11 @@ object SnapshotLeaderLoop {
         // probabilities (ramp: 0…fA across gap range; baseline: fB ≈ 5%), so a mixed counter compares
         // apples to oranges. Tagging by phase lets us run a uniformity test independently in each
         // regime — both should be ≈ uniform across nodes under unbiased VRF + equal stake.
-        etaPeriod = currentSlot / etaRotationSlots
+        //
+        // etaPeriod is keyed on ordinal (matches the rotation unit migration; see
+        // `docs/nakamoto/attestation-and-finality.md` §1).
+        lastChainOrdinal <- chainStore.bestTipOrdinal.map(_.getOrElse(0L))
+        etaPeriod = lastChainOrdinal / etaRotationSnapshots
         phase =
           if (slotGap < lddConfig.offset.toLong) "dormant"
           else if (slotGap < lddConfig.lddCutoff.toLong) "ramp"

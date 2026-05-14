@@ -95,14 +95,15 @@ object NakamotoChainStore {
     def chainFromTip: F[List[StoredSnapshot]]
 
     /** Get VRF outputs for snapshots in the first 2/3 of a rotation period (for eta calculation). Walks from bestTip — use
-      * vrfOutputsForPeriodFrom for fork-aware queries.
+      * vrfOutputsForPeriodFrom for fork-aware queries. The Long in the returned pairs is the snapshot's **ordinal** (rotation periods are
+      * keyed on ordinal to satisfy the R ≥ 3·k₁ stability bound; see `docs/nakamoto/attestation-and-finality.md` §1).
       */
-    def vrfOutputsForPeriod(period: Long, etaRotationSlots: Long): F[List[(Long, Array[Byte])]]
+    def vrfOutputsForPeriod(period: Long, etaRotationSnapshots: Long): F[List[(Long, Array[Byte])]]
 
     /** Get VRF outputs for a rotation period by walking backward from a specific hash. Used to compute eta for an incoming snapshot on a
-      * potentially different fork.
+      * potentially different fork. The Long in the returned pairs is the snapshot's **ordinal**.
       */
-    def vrfOutputsForPeriodFrom(period: Long, etaRotationSlots: Long, fromHash: Hash): F[List[(Long, Array[Byte])]]
+    def vrfOutputsForPeriodFrom(period: Long, etaRotationSnapshots: Long, fromHash: Hash): F[List[(Long, Array[Byte])]]
 
     /** Mark a snapshot as finalized and prune older fork branches. Keeps the finalized chain but removes orphaned snapshots with ordinal <=
       * finalizedOrdinal that aren't ancestors of the finalized tip.
@@ -352,37 +353,40 @@ object NakamotoChainStore {
             }
           }
 
-        def vrfOutputsForPeriod(period: Long, etaRotationSlots: Long): F[List[(Long, Array[Byte])]] =
+        def vrfOutputsForPeriod(period: Long, etaRotationSnapshots: Long): F[List[(Long, Array[Byte])]] =
           stateRef.get.map { state =>
-            collectVrfOutputsForPeriod(state, period, etaRotationSlots, state.bestTipHash)
+            collectVrfOutputsForPeriod(state, period, etaRotationSnapshots, state.bestTipHash)
           }
 
-        def vrfOutputsForPeriodFrom(period: Long, etaRotationSlots: Long, fromHash: Hash): F[List[(Long, Array[Byte])]] =
+        def vrfOutputsForPeriodFrom(period: Long, etaRotationSnapshots: Long, fromHash: Hash): F[List[(Long, Array[Byte])]] =
           stateRef.get.map { state =>
-            collectVrfOutputsForPeriod(state, period, etaRotationSlots, Some(fromHash))
+            collectVrfOutputsForPeriod(state, period, etaRotationSnapshots, Some(fromHash))
           }
 
+        // Filters by **ordinal**, not slot — rotation periods are snapshot-indexed so R satisfies the
+        // Praos R ≥ 3·k₁ stability bound (see `docs/nakamoto/attestation-and-finality.md` §1). The
+        // returned Long is the snapshot's ordinal.
         private def collectVrfOutputsForPeriod(
           state: ChainState,
           period: Long,
-          etaRotationSlots: Long,
+          etaRotationSnapshots: Long,
           startHash: Option[Hash]
         ): List[(Long, Array[Byte])] = {
-          val periodStart = period * etaRotationSlots
-          val cutoff = periodStart + (etaRotationSlots * 2 / 3)
+          val periodStart = period * etaRotationSnapshots
+          val cutoff = periodStart + (etaRotationSnapshots * 2 / 3)
           // Walk chain from the given starting hash backward.
           // Using byHash.values would include fork branches, causing different nodes
           // to compute different eta values → VRF verification failures at rotation boundaries.
           val canonicalSnapshots = scala.collection.mutable.ListBuffer.empty[StoredSnapshot]
           var current = startHash.flatMap(state.byHash.get)
-          while (current.isDefined && current.get.slot >= periodStart) {
-            if (current.get.slot < cutoff && current.get.vrfOutput.nonEmpty)
+          while (current.isDefined && current.get.ordinal >= periodStart) {
+            if (current.get.ordinal < cutoff && current.get.vrfOutput.nonEmpty)
               canonicalSnapshots += current.get
             current = state.byHash.get(current.get.parentHash)
           }
           canonicalSnapshots.toList
-            .sortBy(_.slot)
-            .map(s => (s.slot, s.vrfOutput))
+            .sortBy(_.ordinal)
+            .map(s => (s.ordinal, s.vrfOutput))
         }
 
         def finalize(hash: Hash, ordinal: Long): F[Unit] =

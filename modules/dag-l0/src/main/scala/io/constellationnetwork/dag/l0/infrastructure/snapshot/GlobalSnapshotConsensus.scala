@@ -392,7 +392,10 @@ object GlobalSnapshotConsensus {
         )
       }
       slotsPerEpoch = sys.env.get("NAKAMOTO_SLOTS_PER_EPOCH").flatMap(_.toLongOption).getOrElse(60L)
-      etaRotationSlots = sys.env.get("NAKAMOTO_ETA_ROTATION_SLOTS").flatMap(_.toLongOption).getOrElse(600L)
+      // R = 2550 = 10·k₁ (matches Cardano R/k ratio). Rotation is keyed on **ordinal**, not slot —
+      // slots are LDD-paced and lumpy; ordinals are 1:1 with snapshots and give a stable R that
+      // satisfies the Praos R ≥ 3·k₁ stability bound. See `docs/nakamoto/attestation-and-finality.md` §1.
+      etaRotationSnapshots = sys.env.get("NAKAMOTO_ETA_ROTATION_SNAPSHOTS").flatMap(_.toLongOption).getOrElse(2550L)
 
       // Start the Nakamoto SnapshotLeaderLoop + sidecar bridge.
       //
@@ -426,7 +429,7 @@ object GlobalSnapshotConsensus {
           nakLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("NakamotoConsensus").pure[F].toResource
           _ <- nakLogger
             .info(
-              s"🔧 Nakamoto config: LDD(cutoff=${lddConfig.lddCutoff}, offset=${lddConfig.offset}, baseline=${lddConfig.baselineDifficulty}, amplitude=${lddConfig.amplitude}), etaRotation=${etaRotationSlots}s, slotsPerEpoch=${slotsPerEpoch}, genesisTime=${pureGenesisTimeMs}"
+              s"🔧 Nakamoto config: LDD(cutoff=${lddConfig.lddCutoff}, offset=${lddConfig.offset}, baseline=${lddConfig.baselineDifficulty}, amplitude=${lddConfig.amplitude}), etaRotation=${etaRotationSnapshots} snapshots, slotsPerEpoch=${slotsPerEpoch}, genesisTime=${pureGenesisTimeMs}"
             )
             .toResource
           stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F].toResource
@@ -594,7 +597,7 @@ object GlobalSnapshotConsensus {
                   lddConfig = lddConfig,
                   eligibilityChecker = eligibilityChecker,
                   slotsPerEpoch = slotsPerEpoch,
-                  etaRotationSlots = etaRotationSlots,
+                  etaRotationSnapshots = etaRotationSnapshots,
                   lastKnownSlotRef = lastKnownSlotRef,
                   epochStateRef = epochStateRef,
                   genesisTimeMs = pureGenesisTimeMs,
@@ -675,7 +678,7 @@ object GlobalSnapshotConsensus {
                   eligibilityChecker = eligibilityChecker,
                   lastKnownSlotRef = lastKnownSlotRef,
                   epochStateRef = epochStateRef,
-                  etaRotationSlots = etaRotationSlots,
+                  etaRotationSnapshots = etaRotationSnapshots,
                   consensusFns = consensusFunctions,
                   snapshotStorage = globalSnapshotStorage,
                   lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,

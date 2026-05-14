@@ -1,8 +1,9 @@
 # Attestation flow and finality in Tessellation-Nakamoto GL0
 
 **Status:** living document. Last updated 2026-05-14 — 4-phase formalization,
-GKL property mapping, eta-rotation R ≥ 3k₁ bound, chain-selection scope per
-phase. Supersedes the prior single-tier finality framing.
+GKL property mapping, eta-rotation R ≥ 3k₁ bound (unit migrated to snapshots),
+chain-selection scope per phase. Supersedes the prior single-tier finality
+framing.
 
 This document formalizes the chain-growth model for Tessellation-Nakamoto and
 describes how the operational components (attestation, chain selection,
@@ -175,12 +176,12 @@ nonce stability"; GKL 2015 §6).
 
 ### 1.3 Per-environment R configuration
 
-R should be measured in **snapshots**, not slots — the security argument
-is about CP-safety of inputs (a snapshot-indexed property), and slot rate
+R is measured in **snapshots**, not slots — the security argument is
+about CP-safety of inputs (a snapshot-indexed property), and slot rate
 varies under LDD-fill drift.
 
-Recommended defaults (Cardano uses `R = 10·k`; we follow the same ratio
-in production):
+Defaults (Cardano uses `R = 10·k`; we follow the same ratio in
+production):
 
 | Environment | k₁ | R (snapshots) | Multiplier | Notes |
 |---|---|---|---|---|
@@ -188,16 +189,13 @@ in production):
 | **e2e tests** | 255 | 100 | 0.39·k₁ | violates R ≥ 3k₁ but tests aren't adversarial; chosen to exercise rotation mechanism many times per run |
 | **expanded sims** | 255 | 765 | 3·k₁ | minimum-compliant; for sim runs that want to model rotation behavior under attack |
 
-The current default of `etaRotationSlots = 600` (in slots, ~90 snapshots
-under 15% fill) violates the bound by ~8.5×. Tests have accepted this
-silently; production-readiness work needs to fix it.
-
-**Implementation note:** the unit migration from slots to snapshots in
-the config knob is non-trivial because `EtaCalculation.rotationPeriod`
-currently keys on slot index. The cleanest path is to keep the env var
-named in slots but document the snapshot-equivalent (snapshots ≈ slots ×
-expected-LDD-fill); a fuller refactor switches `rotationPeriod` to key on
-ordinal.
+**Status:** unit migration from slots to snapshots landed. The env var
+is `NAKAMOTO_ETA_ROTATION_SNAPSHOTS` (production default 2550, e2e
+default 100). `EtaCalculation.rotationPeriod` keys on **ordinal**, and
+`NakamotoChainStore.collectVrfOutputsForPeriod` walks back filtering by
+ordinal range — slots are not consulted for rotation decisions. The old
+`NAKAMOTO_ETA_ROTATION_SLOTS` env var is removed (pre-prod, no
+backwards-compat shim).
 
 ---
 
@@ -439,9 +437,9 @@ weight sum.
   hash at an already-finalized ordinal. Does NOT cover the case where a
   ChangeSet is dropped from `pendingRef` without ever being folded — by
   design, those writes never reach base.
-- **Eta-rotation R is currently in slots, not snapshots** — see §1.3.
-  Production-readiness requires switching the unit and raising the
-  default to `R = 10·k₁` per Cardano practice.
+- ~~**Eta-rotation R is currently in slots, not snapshots**~~ — **resolved**.
+  `NAKAMOTO_ETA_ROTATION_SNAPSHOTS` keys rotation on ordinal; production
+  default 2550 = 10·k₁ per Cardano practice. See §1.3.
 
 ---
 

@@ -19,7 +19,10 @@ services:
       # so doubling fA just changed the fill-rate metric without producing
       # snapshots faster.
       - NAKAMOTO_SLOTS_PER_EPOCH=${NAKAMOTO_SLOTS_PER_EPOCH:-60}
-      - NAKAMOTO_ETA_ROTATION_SLOTS=${NAKAMOTO_ETA_ROTATION_SLOTS:-600}
+      # R = 100 snapshots for e2e (production default 2550 = 10·k₁). Violates the
+      # R ≥ 3·k₁ bound but tests aren't adversarial; chosen to exercise rotation
+      # mechanism many times per run. See `docs/nakamoto/attestation-and-finality.md` §1.3.
+      - NAKAMOTO_ETA_ROTATION_SNAPSHOTS=${NAKAMOTO_ETA_ROTATION_SNAPSHOTS:-100}
       - NAKAMOTO_LDD_CUTOFF=${NAKAMOTO_LDD_CUTOFF:-16}
       - NAKAMOTO_LDD_OFFSET=${NAKAMOTO_LDD_OFFSET:-1}
       - NAKAMOTO_LDD_BASELINE=${NAKAMOTO_LDD_BASELINE:-0.05}

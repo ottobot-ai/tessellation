@@ -127,7 +127,7 @@ object NakamotoSyncDaemon {
     eligibilityChecker: EligibilityChecker[F],
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
-    etaRotationSlots: Long,
+    etaRotationSnapshots: Long,
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -168,7 +168,7 @@ object NakamotoSyncDaemon {
               eligibilityChecker,
               lastKnownSlotRef,
               epochStateRef,
-              etaRotationSlots,
+              etaRotationSnapshots,
               consensusFns,
               snapshotStorage,
               lastGlobalSnapshotStorage,
@@ -210,7 +210,7 @@ object NakamotoSyncDaemon {
     eligibilityChecker: EligibilityChecker[F],
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
-    etaRotationSlots: Long,
+    etaRotationSnapshots: Long,
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -285,7 +285,7 @@ object NakamotoSyncDaemon {
                                 eligibilityChecker,
                                 lastKnownSlotRef,
                                 epochStateRef,
-                                etaRotationSlots,
+                                etaRotationSnapshots,
                                 consensusFns,
                                 snapshotStorage,
                                 lastGlobalSnapshotStorage,
@@ -371,7 +371,7 @@ object NakamotoSyncDaemon {
                                     eligibilityChecker,
                                     lastKnownSlotRef,
                                     epochStateRef,
-                                    etaRotationSlots,
+                                    etaRotationSnapshots,
                                     consensusFns,
                                     snapshotStorage,
                                     lastGlobalSnapshotStorage,
@@ -438,7 +438,7 @@ object NakamotoSyncDaemon {
     eligibilityChecker: EligibilityChecker[F],
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
-    etaRotationSlots: Long,
+    etaRotationSnapshots: Long,
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -496,12 +496,15 @@ object NakamotoSyncDaemon {
       // Strategy: walk from the incoming snapshot's parentHash.
       // Fallback: if the incoming snapshot carries an eta field, use it directly
       // (trust-but-verify: we verify the snapshot's chain ancestry separately).
-      currentPeriod = EtaCalculation.rotationPeriod(snap.slot, etaRotationSlots)
+      //
+      // Rotation period is keyed on **ordinal**, not slot — see
+      // `docs/nakamoto/attestation-and-finality.md` §1.
+      currentPeriod = EtaCalculation.rotationPeriod(snap.ordinal, etaRotationSnapshots)
       eta <-
         if (currentPeriod <= 0) {
           Async[F].pure(genesisEta)
         } else {
-          chainStore.vrfOutputsForPeriodFrom(currentPeriod - 1, etaRotationSlots, parentHash).flatMap { chainOutputs =>
+          chainStore.vrfOutputsForPeriodFrom(currentPeriod - 1, etaRotationSnapshots, parentHash).flatMap { chainOutputs =>
             if (chainOutputs.nonEmpty) {
               Async[F].pure(EtaCalculation.computeEta(genesisEta, currentPeriod, chainOutputs.map(_._2)))
             } else {
@@ -683,7 +686,7 @@ object NakamotoSyncDaemon {
             keyPair,
             lastKnownSlotRef,
             epochStateRef,
-            etaRotationSlots,
+            etaRotationSnapshots,
             snapshotStorage,
             lastGlobalSnapshotStorage,
             lastNGlobalSnapshotStorage,
@@ -707,7 +710,7 @@ object NakamotoSyncDaemon {
               eligibilityChecker,
               lastKnownSlotRef,
               epochStateRef,
-              etaRotationSlots,
+              etaRotationSnapshots,
               consensusFns,
               snapshotStorage,
               lastGlobalSnapshotStorage,
@@ -846,7 +849,7 @@ object NakamotoSyncDaemon {
     keyPair: KeyPair,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
-    etaRotationSlots: Long,
+    etaRotationSnapshots: Long,
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
