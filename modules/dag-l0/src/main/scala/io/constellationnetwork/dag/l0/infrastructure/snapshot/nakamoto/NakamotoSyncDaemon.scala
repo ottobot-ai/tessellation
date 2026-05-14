@@ -1120,7 +1120,10 @@ object NakamotoSyncDaemon {
     }
   }
 
-  private def emitAttestation[F[_]: Async: SecurityProvider: HasherSelector](
+  // Package-visible so SnapshotLeaderLoop can route producer-self-attestation through the
+  // same code path peer-received snapshots use. Unifies the two attestation sites: any future
+  // gating, signing semantics, or broadcast policy applies uniformly.
+  def emitAttestation[F[_]: Async: SecurityProvider: HasherSelector](
     snap: pb.Snapshot,
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
@@ -1130,12 +1133,27 @@ object NakamotoSyncDaemon {
   ): F[Unit] = {
     // snap.hash bytes are the UTF-8 encoding of the hex hash string — decode back to string
     val tipHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
-    val tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
+    emitTipAttestation(tipHash, snap.slot, snap.ordinal, sidecarClient, tipTracker, selfId, keyPair, logger)
+  }
+
+  // Primitive variant for callers that have tip hash/slot/ordinal directly (e.g. the finality
+  // monitor's bestTip-change ticker re-attesting after chainSelection moves).
+  def emitTipAttestation[F[_]: Async: SecurityProvider: HasherSelector](
+    tipHash: Hash,
+    tipSlotLong: Long,
+    tipOrdinal: Long,
+    sidecarClient: SidecarClient.SidecarClientAlgebra[F],
+    tipTracker: TipTracker[F],
+    selfId: peer.PeerId,
+    keyPair: KeyPair,
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] = {
+    val tipSlot = Slot(NonNegLong.unsafeFrom(tipSlotLong))
     val currentSlotMs = System.currentTimeMillis() / 1000L
     val attestedAtSlot = Slot(NonNegLong.unsafeFrom(currentSlotMs))
 
     // Record locally first (so our own TipTracker sees it)
-    val localAtt = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, attestedAtSlot)
+    val localAtt = DomainTipAttestation(tipHash, tipSlot, tipOrdinal, attestedAtSlot)
     tipTracker.recordAttestation(selfId, localAtt) >>
       // Sign via the standard Hasher pipeline: JSON-encode the domain TipAttestation → hash → sign the hash.
       // Same path as SignatureProof.fromData / Signed.forAsyncHasher — no custom serialization.
@@ -1145,9 +1163,9 @@ object NakamotoSyncDaemon {
           sig <- Signature.fromHash[F](keyPair.getPrivate, attHash)
           sigBytes = sig.coerce.toBytes
           att = SidecarClient.mkAttestation(
-            tipHash = snap.hash.toByteArray,
-            tipSlot = snap.slot,
-            tipOrdinal = snap.ordinal,
+            tipHash = tipHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+            tipSlot = tipSlotLong,
+            tipOrdinal = tipOrdinal,
             attestedAt = currentSlotMs,
             attesterId = selfId.value.toBytes,
             signature = sigBytes

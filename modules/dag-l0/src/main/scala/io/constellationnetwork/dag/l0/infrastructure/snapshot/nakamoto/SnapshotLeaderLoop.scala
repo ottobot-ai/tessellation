@@ -31,13 +31,11 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.security.signature.signature.{Signature => SigValue}
 import io.constellationnetwork.security.vrf.VrfKeyDeriver
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
 import fs2.Stream
-import io.estatico.newtype.ops._
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Shared epoch state — used by BOTH SnapshotLeaderLoop (production) and NakamotoSyncDaemon (gossip).
@@ -388,6 +386,31 @@ object SnapshotLeaderLoop {
               validatorCount <- stakeRegistry.validatorCount
               activeCount <- stakeRegistry.observedActiveCount
               bestTip <- chainStore.bestTip
+
+              // Polkadot-style re-attestation. If our last self-attestation doesn't match current
+              // bestTip — because chain-selection switched after a fork-branch arrived, a reorg
+              // promoted a different tip, or we never attested anything yet — emit a fresh
+              // self-attestation pointing at canonical. Without this, a stale self-att gets
+              // filtered to zero weight by TipTracker.highestFinalizedOrdinal:143-151 (canonical-
+              // hash filter) and our own vote never contributes to bestTip finality.
+              _ <- bestTip match {
+                case Some(tip) if !allAtts.get(selfId).exists(_.tipHash === tip.hash) =>
+                  NakamotoSyncDaemon.emitTipAttestation[F](
+                    tipHash = tip.hash,
+                    tipSlotLong = tip.slot,
+                    tipOrdinal = tip.ordinal,
+                    sidecarClient = sidecarClient,
+                    tipTracker = tipTracker,
+                    selfId = selfId,
+                    keyPair = keyPair,
+                    logger = logger
+                  ) >> logger.debug(
+                    s"RE-ATTEST bestTip change: ord=${tip.ordinal} slot=${tip.slot} hash=${tip.hash.value.take(12)} " +
+                      s"(prior self-att=${allAtts.get(selfId).map(_.tipHash.value.take(12)).getOrElse("none")})"
+                  )
+                case _ => Async[F].unit
+              }
+
               alreadyFinalized <- tipTracker.lastFinalized
               // The last-finalized **ordinal** must come from chainStore — tipTracker.lastFinalized
               // only carries (Hash, Slot), and slots are LDD-paced not 1:1 with ordinals. The
@@ -785,34 +808,23 @@ object SnapshotLeaderLoop {
                         )
                       )
                       .void
-                      .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}")) >> {
-                      // Self-attest (producer always attests to own snapshot) and broadcast
-                      val selfAttestation = io.constellationnetwork.schema.nakamoto.TipAttestation(
+                      .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}")) >>
+                      // Unify self-attestation with peer-attestation: route through the same emit
+                      // function the SyncDaemon uses on processValidSnapshot. Eliminates the previous
+                      // double-implementation (the old self-attest block computed attestedAt in slot
+                      // units while emitAttestation uses wall-clock seconds, so peer attestations
+                      // always shadowed self-attestations under recordAttestation's "newer wins"
+                      // rule — see TipTracker:96-105).
+                      NakamotoSyncDaemon.emitTipAttestation[F](
                         tipHash = snapshotHash,
-                        tipSlot = slotRefined,
+                        tipSlotLong = currentSlot,
                         tipOrdinal = lastKey.value.value + 1,
-                        attestedAt = slotRefined
-                      )
-                      tipTracker.recordAttestation(selfId, selfAttestation) >>
-                        // Sign via the standard Hasher pipeline (JSON-encode → hash → sign)
-                        // and broadcast to the network via sidecar GossipSub
-                        (for {
-                          attHash <- selfAttestation.hash
-                          sig <- SigValue.fromHash[F](keyPair.getPrivate, attHash)
-                          sigBytes = sig.coerce.toBytes
-                          att = SidecarClient.mkAttestation(
-                            tipHash = snapshotHash.value.getBytes,
-                            tipSlot = currentSlot,
-                            tipOrdinal = lastKey.value.value + 1,
-                            attestedAt = currentSlot,
-                            attesterId = selfId.value.toBytes,
-                            signature = sigBytes
-                          )
-                          _ <- sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
-                            logger.warn(s"Failed to broadcast attestation: ${e.getMessage}")
-                          }
-                        } yield ())
-                    } >>
+                        sidecarClient = sidecarClient,
+                        tipTracker = tipTracker,
+                        selfId = selfId,
+                        keyPair = keyPair,
+                        logger = logger
+                      ) >>
                       logger.info(
                         s"Produced snapshot ordinal=${lastKey.value.value + 1} slot=$currentSlot " +
                           s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"
