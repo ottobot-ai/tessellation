@@ -147,6 +147,15 @@ const isSdkStaleParentError = (error) => {
          msg.includes('Conflict')
 }
 
+// Post-#122 finality-gating: dl1's lastSnapshotStorage tracks finalized gl0
+// only, so just-credited balances can appear as 0 to the mempool validator
+// for a short window before finality catches up. Same root cause family as
+// the TooFar fix (commit 91d43872). Retry on this transient state.
+const isTransientInsufficientBalance = (error) => {
+  const msg = (error && (error.message || String(error))) || ''
+  return msg.includes('InsufficientBalance') && msg.includes('balance=0')
+}
+
 const batchTransaction = async (
   origin,
   destination,
@@ -204,6 +213,14 @@ const batchTransaction = async (
           `(${e.message || e}). Retrying with fresh lastRef.`
         )
         await sleep(retryDelayMs)
+        continue
+      }
+      if (isTransientInsufficientBalance(e) && attempt < maxAttempts) {
+        logMessage(
+          `batchTransaction: transient zero-balance (finality lag) on attempt ${attempt}/${maxAttempts} ` +
+          `(${e.message || e}). Retrying after delay for finality to catch up.`
+        )
+        await sleep(5000)
         continue
       }
       throw Error(`Error when sending batch transaction: ${e}`)
@@ -269,6 +286,14 @@ const batchMetagraphTransaction = async (
           `(${e.message || e}). Retrying with fresh lastRef.`
         )
         await sleep(retryDelayMs)
+        continue
+      }
+      if (isTransientInsufficientBalance(e) && attempt < maxAttempts) {
+        logMessage(
+          `batchMetagraphTransaction: transient zero-balance (finality lag) on attempt ${attempt}/${maxAttempts} ` +
+          `(${e.message || e}). Retrying after delay for finality to catch up.`
+        )
+        await sleep(5000)
         continue
       }
       throw Error(`Error when sending batch transaction: ${e}`)
