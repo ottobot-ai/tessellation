@@ -192,7 +192,13 @@ object SnapshotLeaderLoop {
     // don't have on our local canonical chain (we're on a fork), we enqueue a
     // request here instead of silently waiting for the next periodic sync. See
     // ChainSyncRequestQueue for why this is a queue rather than a direct call.
-    chainSyncRequestQueue: ChainSyncRequestQueue[F]
+    chainSyncRequestQueue: ChainSyncRequestQueue[F],
+    // Global slot provider: derives the current consensus slot from wall-clock + genesis,
+    // honoring the cluster's configured slotDurationMs (1000ms prod, 500ms in e2e). Used
+    // here as the source of `attestedAt` for emit*Attestation — `attestedAt` is a Nakamoto
+    // consensus slot, NOT wall-clock seconds (Slot's NonNegLong is dimensionally a slot
+    // index, even when slotDurationMs == 1000).
+    slotClock: SlotClock[F]
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -328,6 +334,7 @@ object SnapshotLeaderLoop {
                             nakamotoFinalizedOrdinalRef,
                             mptStore,
                             mptOverlay,
+                            slotClock,
                             logger
                           )
                         } // snapshotSemaphore.permit
@@ -395,19 +402,23 @@ object SnapshotLeaderLoop {
               // hash filter) and our own vote never contributes to bestTip finality.
               _ <- bestTip match {
                 case Some(tip) if !allAtts.get(selfId).exists(_.tipHash === tip.hash) =>
-                  NakamotoSyncDaemon.emitTipAttestation[F](
-                    tipHash = tip.hash,
-                    tipSlotLong = tip.slot,
-                    tipOrdinal = tip.ordinal,
-                    sidecarClient = sidecarClient,
-                    tipTracker = tipTracker,
-                    selfId = selfId,
-                    keyPair = keyPair,
-                    logger = logger
-                  ) >> logger.info(
-                    s"RE-ATTEST bestTip change: ord=${tip.ordinal} slot=${tip.slot} hash=${tip.hash.value.take(12)} " +
-                      s"(prior self-att=${allAtts.get(selfId).map(_.tipHash.value.take(12)).getOrElse("none")})"
-                  )
+                  slotClock.currentSlot.flatMap { attestedAt =>
+                    NakamotoSyncDaemon.emitTipAttestation[F](
+                      tipHash = tip.hash,
+                      tipSlot = Slot(NonNegLong.unsafeFrom(tip.slot)),
+                      tipOrdinal = tip.ordinal,
+                      attestedAt = attestedAt,
+                      sidecarClient = sidecarClient,
+                      tipTracker = tipTracker,
+                      selfId = selfId,
+                      keyPair = keyPair,
+                      logger = logger
+                    ) >> logger.info(
+                      s"RE-ATTEST bestTip change: ord=${tip.ordinal} slot=${tip.slot} hash=${tip.hash.value.take(12)} " +
+                        s"attestedAt=${attestedAt.value.value} " +
+                        s"(prior self-att=${allAtts.get(selfId).map(_.tipHash.value.take(12)).getOrElse("none")})"
+                    )
+                  }
                 case _ => Async[F].unit
               }
 
@@ -588,6 +599,7 @@ object SnapshotLeaderLoop {
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
     mptStore: MptStore[F, GlobalStateKey],
     mptOverlay: MptOverlay[F, GlobalStateKey],
+    slotClock: SlotClock[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -811,14 +823,18 @@ object SnapshotLeaderLoop {
                       .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}")) >>
                       // Unify self-attestation with peer-attestation: route through the same emit
                       // function the SyncDaemon uses on processValidSnapshot. Eliminates the previous
-                      // double-implementation (the old self-attest block computed attestedAt in slot
-                      // units while emitAttestation uses wall-clock seconds, so peer attestations
-                      // always shadowed self-attestations under recordAttestation's "newer wins"
-                      // rule — see TipTracker:96-105).
+                      // double-implementation where the two paths used different `attestedAt` units
+                      // and peer attestations shadowed self-attestations under TipTracker's "newer
+                      // wins" rule (TipTracker:96-105).
+                      //
+                      // `attestedAt` here is the consensus slot at which we produced — i.e. the slot
+                      // we won via VRF. Cluster-wide consistency comes from SlotClock honoring the
+                      // configured slotDurationMs (1000ms prod, 500ms e2e).
                       NakamotoSyncDaemon.emitTipAttestation[F](
                         tipHash = snapshotHash,
-                        tipSlotLong = currentSlot,
+                        tipSlot = slotRefined,
                         tipOrdinal = lastKey.value.value + 1,
+                        attestedAt = slotRefined,
                         sidecarClient = sidecarClient,
                         tipTracker = tipTracker,
                         selfId = selfId,

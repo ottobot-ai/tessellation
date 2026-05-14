@@ -1,0 +1,66 @@
+// 4-phase snapshot progression with triggers and GKL-property mapping
+//
+// Render: dot -Tpng phase-state-machine.dot -o phase-state-machine.png
+//
+// Each snapshot ordinal advances through phases monotonically. Multiple
+// independent triggers can fire each transition; whichever crosses its
+// threshold first ratchets the phase forward. Phases gate distinct
+// system affordances (overlay branching, follower reads, MPT base
+// folding, archival pruning).
+//
+// Reference: GKL "Bitcoin Backbone Protocol" (2015) — Chain Growth,
+// Chain Quality, Common Prefix properties; carried through Praos and
+// Taktikos. The phase progression IS the GKL property progression
+// over a snapshot's lifetime.
+//
+// Code refs:
+//   - SnapshotLeaderLoop.scala:381    finalityMonitor (current 2-trigger impl)
+//   - TipTracker.scala:67             FinalityThreshold = 2/3 (T_weight today)
+//   - SnapshotLeaderLoop.scala:349    ConfirmationDepthK = 255 (T_depth1)
+//   - MptOverlay.scala:46             FinalizationOutcome (the Phase 2 sink)
+//   - NakamotoChainStore.scala:290    finality-safety gate
+
+digraph phase_state_machine {
+  rankdir=LR;
+  graph [fontname="Helvetica", fontsize=11, labelloc=t,
+         label="Snapshot phase progression  —  GKL property dominates each phase\n(triggers on edges; affordances unlocked listed under each state)"];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled"];
+  edge  [fontname="Helvetica", fontsize=9];
+
+  // --- Phase 0: PENDING ----------
+  P0 [label="Phase 0 — PENDING\n\nGKL dominant: CHAIN GROWTH\n(chain must extend, rivals expected)\n\nAffordances:\n• Overlay branch (ChangeSet)\n• Local writes during accept()\n• Gossip publish allowed\n• No follower read\n• No SC binary confirm",
+      fillcolor="#e3f2fd"];
+
+  // --- Phase 1: PROVISIONAL ----------
+  P1 [label="Phase 1 — PROVISIONAL\n\nGKL dominant: CHAIN QUALITY (contested)\n(attestations accumulating;\n adversary composition bounded)\n\nAffordances:\n• On canonical bestTip chain\n• Counted in chain-selection\n• Attestation weight recording\n• Still no follower read",
+      fillcolor="#fff9c4"];
+
+  // --- Phase 2: SETTLED ----------
+  P2 [label="Phase 2 — SETTLED\n\nGKL dominant: CHAIN QUALITY (resolved)\n(content fixed; G1 boundary)\n\nAffordances:\n• MPT overlay folds into base\n• Followers consume (dl1/cl1/ml0)\n• SC binary confirmations issue\n• Mempool watermark advances\n• Eta inputs locked",
+      fillcolor="#c8e6c9"];
+
+  // --- Phase 3: ARCHIVAL ----------
+  P3 [label="Phase 3 — ARCHIVAL\n\nGKL dominant: COMMON PREFIX\n(cryptographic-equivalent\n agreement among honest nodes)\n\nAffordances:\n• Undo journal pruned\n• Overlay history shed\n• Aggregate-signature cert (Mithril-eq)\n• Light-client trust anchor\n• Eta beyond reach of any adversary",
+      fillcolor="#d1c4e9"];
+
+  // --- Transition edges with trigger labels ----------
+  P0 -> P1 [label="  fork-choice (length → head-slot)\n  promotes ordinal to bestTip ancestor\n  [Taktikos maxvalid-tk]  "];
+
+  P1 -> P2 [label="  ANY of:\n  T_count: attesters ≥ majority (1-vote-1)\n  T_weight: stake ≥ 2/3 (collateral+delegated)\n  T_depth1: ord - finalized > k1 = 255\n  [whichever fires first]  "];
+
+  P2 -> P3 [label="  T_depth2: ord - finalized > k2\n  (k2 = Cardano-equivalent CP bound,\n   target ~10⁻¹² → ord-distance ≈ 2^16)  "];
+
+  // --- The "always pending until promoted" self-loop ----------
+  P0 -> P0 [label="  awaiting parent /\n  rival branches active  ",
+            style=dashed, color="#666666"];
+
+  // --- The "rollback path" — formally allowed P1 → P0 ----------
+  P1 -> P0 [label="  reorg: bestTip switches\n  to a different branch  ",
+            style=dashed, color="#d32f2f", constraint=false];
+
+  // Note: P2 → anything else is FORBIDDEN by design.
+  // Once Settled, the only path is forward to Archival.
+
+  // --- Property dominance band (rendered as nodeless edges for layout) ----------
+  { rank=same; P0; P1; P2; P3; }
+}

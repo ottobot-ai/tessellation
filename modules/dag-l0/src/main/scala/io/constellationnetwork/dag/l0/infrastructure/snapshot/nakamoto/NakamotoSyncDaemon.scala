@@ -2,7 +2,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import java.security.KeyPair
 
-import cats.effect.kernel.{Async, Clock, Ref}
+import cats.effect.kernel.{Async, Ref}
 import cats.effect.std.{Semaphore, Supervisor}
 import cats.syntax.all._
 
@@ -139,6 +139,7 @@ object NakamotoSyncDaemon {
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
+    slotClock: SlotClock[F],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -180,6 +181,7 @@ object NakamotoSyncDaemon {
               chainSyncManager,
               channel,
               dataDir,
+              slotClock,
               logger
             )
           }
@@ -227,7 +229,8 @@ object NakamotoSyncDaemon {
     // machinery without needing their own `ChainSyncManager`. We publish our
     // internally-constructed manager into this Ref once it's built; consumers
     // read-through it and no-op if the producer hasn't bound yet.
-    sharedChainSyncManagerRef: Ref[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]]
+    sharedChainSyncManagerRef: Ref[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]],
+    slotClock: SlotClock[F]
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -295,6 +298,7 @@ object NakamotoSyncDaemon {
                                 csm,
                                 channel,
                                 dataDir,
+                                slotClock,
                                 logger
                               )
                             }
@@ -381,6 +385,7 @@ object NakamotoSyncDaemon {
                                     chainSyncManager,
                                     channel,
                                     dataDir,
+                                    slotClock,
                                     logger
                                   )
                                 } >>
@@ -448,6 +453,7 @@ object NakamotoSyncDaemon {
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
+    slotClock: SlotClock[F],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -686,6 +692,7 @@ object NakamotoSyncDaemon {
             lastGlobalSnapshotStorage,
             lastNGlobalSnapshotStorage,
             productionGate,
+            slotClock,
             logger
           ) >> {
             // This snapshot is now stored — drain any children that were waiting for it.
@@ -717,6 +724,7 @@ object NakamotoSyncDaemon {
               chainSyncManager,
               channel,
               dataDir,
+              slotClock,
               logger
             )
           }
@@ -849,6 +857,7 @@ object NakamotoSyncDaemon {
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     productionGate: ProductionGate[F],
+    slotClock: SlotClock[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     for {
@@ -912,8 +921,28 @@ object NakamotoSyncDaemon {
         }
       }
 
-      // Emit our attestation for this snapshot
-      _ <- emitAttestation(snap, sidecarClient, tipTracker, selfId, keyPair, logger)
+      // Emit OUR attestation only when chain-selection promoted this peer snapshot
+      // to our local bestTip (a Phase 0 → 1 transition for us, per
+      // `docs/nakamoto/attestation-and-finality.md` §0/§4). The earlier
+      // unconditional emit (commit `6e49b7d5`) moved selfId.tipHash onto any
+      // arriving fork-branch snap, which the canonical-hash filter in
+      // `TipTracker.highestFinalizedOrdinal` then zeroed out — disenfranchising
+      // us on our own canonical chain. The 5s re-attestation ticker
+      // (`SnapshotLeaderLoop.scala:396-412`) remains as a safety net for the
+      // case where bestTip flips between this branch and the ticker firing.
+      //
+      // The producer-implicit attestation at line 909 above (recordAttestation
+      // for the producer's `peerId`) stays unconditional — it credits the
+      // producer for what they produced, independent of our chain selection.
+      //
+      // attestedAt is the current consensus slot per the cluster SlotClock
+      // (honors NAKAMOTO_SLOT_DURATION_MS; 500 ms in e2e, 1000 ms default) —
+      // NOT a wall-clock unit.
+      _ <- Async[F].whenA(becameBestTip) {
+        slotClock.currentSlot.flatMap { attestedAt =>
+          emitAttestation(snap, attestedAt, sidecarClient, tipTracker, selfId, keyPair, logger)
+        }
+      }
 
     } yield ()
 
@@ -1123,8 +1152,15 @@ object NakamotoSyncDaemon {
   // Package-visible so SnapshotLeaderLoop can route producer-self-attestation through the
   // same code path peer-received snapshots use. Unifies the two attestation sites: any future
   // gating, signing semantics, or broadcast policy applies uniformly.
+  //
+  // `attestedAt` is a *consensus slot* (the Nakamoto LDD-paced slot at the time of attestation),
+  // **not** a wall-clock timestamp. The caller is responsible for sourcing it from the cluster's
+  // global slot provider (`SlotClock[F]`, see node-shared/.../nakamoto/SlotClock.scala), which
+  // honors the configured `slotDurationMs` — 1000 ms by default, 500 ms in e2e. This function
+  // does not read the wall clock.
   def emitAttestation[F[_]: Async: SecurityProvider: HasherSelector](
     snap: pb.Snapshot,
+    attestedAt: Slot,
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
     selfId: peer.PeerId,
@@ -1133,55 +1169,48 @@ object NakamotoSyncDaemon {
   ): F[Unit] = {
     // snap.hash bytes are the UTF-8 encoding of the hex hash string — decode back to string
     val tipHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
-    emitTipAttestation(tipHash, snap.slot, snap.ordinal, sidecarClient, tipTracker, selfId, keyPair, logger)
+    val tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
+    emitTipAttestation(tipHash, tipSlot, snap.ordinal, attestedAt, sidecarClient, tipTracker, selfId, keyPair, logger)
   }
 
   // Primitive variant for callers that have tip hash/slot/ordinal directly (e.g. the finality
   // monitor's bestTip-change ticker re-attesting after chainSelection moves).
+  // See `emitAttestation` comment re: `attestedAt` semantics — both functions take it from the
+  // caller; neither reads the wall clock.
   def emitTipAttestation[F[_]: Async: SecurityProvider: HasherSelector](
     tipHash: Hash,
-    tipSlotLong: Long,
+    tipSlot: Slot,
     tipOrdinal: Long,
+    attestedAt: Slot,
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
     selfId: peer.PeerId,
     keyPair: KeyPair,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
-    val tipSlot = Slot(NonNegLong.unsafeFrom(tipSlotLong))
-    // `attestedAt` is wall-clock seconds. Read through Clock[F] (auto-available
-    // from Async[F] <: Clock[F]) rather than calling System.currentTimeMillis
-    // directly — keeps the time read referentially transparent and testable
-    // and matches the codebase's existing Clock-based patterns
-    // (ValidationErrorStorage, MempoolEntry, MeshState, etc.).
-    Clock[F].realTime.flatMap { realTime =>
-      val currentSeconds = realTime.toSeconds
-      val attestedAtSlot = Slot(NonNegLong.unsafeFrom(currentSeconds))
-
-      // Record locally first (so our own TipTracker sees it)
-      val localAtt = DomainTipAttestation(tipHash, tipSlot, tipOrdinal, attestedAtSlot)
-      tipTracker.recordAttestation(selfId, localAtt) >>
-        // Sign via the standard Hasher pipeline: JSON-encode the domain TipAttestation → hash → sign the hash.
-        // Same path as SignatureProof.fromData / Signed.forAsyncHasher — no custom serialization.
-        HasherSelector[F].withCurrent { implicit hasher =>
-          for {
-            attHash <- localAtt.hash
-            sig <- Signature.fromHash[F](keyPair.getPrivate, attHash)
-            sigBytes = sig.coerce.toBytes
-            att = SidecarClient.mkAttestation(
-              tipHash = tipHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-              tipSlot = tipSlotLong,
-              tipOrdinal = tipOrdinal,
-              attestedAt = currentSeconds,
-              attesterId = selfId.value.toBytes,
-              signature = sigBytes
-            )
-            _ <- sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
-              logger.warn(s"Failed to emit attestation: ${e.getMessage}")
-            }
-          } yield ()
-        }
-    }
+    // Record locally first (so our own TipTracker sees it)
+    val localAtt = DomainTipAttestation(tipHash, tipSlot, tipOrdinal, attestedAt)
+    tipTracker.recordAttestation(selfId, localAtt) >>
+      // Sign via the standard Hasher pipeline: JSON-encode the domain TipAttestation → hash → sign the hash.
+      // Same path as SignatureProof.fromData / Signed.forAsyncHasher — no custom serialization.
+      HasherSelector[F].withCurrent { implicit hasher =>
+        for {
+          attHash <- localAtt.hash
+          sig <- Signature.fromHash[F](keyPair.getPrivate, attHash)
+          sigBytes = sig.coerce.toBytes
+          att = SidecarClient.mkAttestation(
+            tipHash = tipHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+            tipSlot = tipSlot.value.value,
+            tipOrdinal = tipOrdinal,
+            attestedAt = attestedAt.value.value,
+            attesterId = selfId.value.toBytes,
+            signature = sigBytes
+          )
+          _ <- sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
+            logger.warn(s"Failed to emit attestation: ${e.getMessage}")
+          }
+        } yield ()
+      }
   }
 
   /** Catch up from a gossip payload when parent is missing (restart scenario).

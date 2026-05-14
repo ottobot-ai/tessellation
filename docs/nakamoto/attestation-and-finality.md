@@ -1,12 +1,12 @@
 # Attestation flow and finality in Tessellation-Nakamoto GL0
 
-**Status:** living document. Last updated 2026-05-14 with commit `6e49b7d5`
-(attestation unification through chain-selection-gated path).
+**Status:** living document. Last updated 2026-05-14 — 4-phase formalization,
+GKL property mapping, eta-rotation R ≥ 3k₁ bound, chain-selection scope per
+phase. Supersedes the prior single-tier finality framing.
 
-This document describes how Nakamoto GL0 produces and consumes attestations,
-how attestations interact with the MPT overlay's pending branches, and how the
-two-tier finality monitor (depth-k + attestation-2/3) drives the overlay's
-fold-forward sink.
+This document formalizes the chain-growth model for Tessellation-Nakamoto and
+describes how the operational components (attestation, chain selection,
+finality, eta rotation, MPT overlay) compose under it.
 
 Cross-references:
 - [`docs/CODEBASE_MAP.md`](../CODEBASE_MAP.md) — module map.
@@ -16,196 +16,322 @@ Cross-references:
   [`docs/nakamoto-architecture.png`](../nakamoto-architecture.png) — high-level
   consensus architecture diagram.
 - `~/.claude/skills/taktikos/SKILL.md` — Taktikos protocol rules
-  (LDD snowplow, maxvalid-tk, depth-k sim results). The defaults referenced
-  here (`ψ=1`, `γ=15`, `fA=1/2`, `fB=1/20`, `k=255`) come from
-  `LddConfig.Default` and `SnapshotLeaderLoop.ConfirmationDepthK`.
+  (LDD snowplow, maxvalid-tk, depth-k sim results). Defaults referenced here
+  (`ψ=1`, `γ=15`, `fA=1/2`, `fB=1/20`, `k₁=255`) come from `LddConfig.Default`
+  and `SnapshotLeaderLoop.ConfirmationDepthK`.
 - `~/.claude/plans/balmy-branching-bertillon.md` — rev3 MPT overlay plan
   (#56 work track); `FinalizationOutcome` and the multi-branch model are
   defined there.
 
 ---
 
-## 1. Top-level model
+## 0. The four-phase chain-growth model
+
+Tessellation-Nakamoto formalizes chain growth as a four-phase progression
+parameterized by **independent, sufficient triggers**. Each snapshot ordinal
+advances monotonically through the phases; phases gate distinct system
+affordances (overlay branching, follower reads, MPT base writes, archival
+pruning).
+
+The model is the **Garay-Kiayias-Leonardos (GKL)** properties — Chain Growth
+(CG), Chain Quality (CQ), Common Prefix (CP) — projected onto a snapshot's
+lifetime. Carries forward through Ouroboros Praos (David et al. 2018) and
+Taktikos (FC 2023).
+
+### 0.1 Phases
+
+![Phase state machine](phase-state-machine.png)
+([`phase-state-machine.dot`](phase-state-machine.dot))
+
+| Phase | Name | GKL property dominant | Key affordances |
+|---|---|---|---|
+| **0** | **PENDING** | **Chain Growth** | overlay ChangeSet active; rivals at same ordinal expected; gossip publish allowed; **no** follower read |
+| **1** | **PROVISIONAL** | **Chain Quality (contested)** | on canonical bestTip ancestor; attestation weight accumulating; still **no** follower read |
+| **2** | **SETTLED** | **Chain Quality (resolved)** | MPT overlay folds into base; G1 boundary — followers consume; SC binary confirms; eta inputs locked |
+| **3** | **ARCHIVAL** | **Common Prefix** | depth-k₂ deep; undo journal pruned; aggregate-signature cert producible; light-client trust anchor |
+
+The intuition:
+- **Chain Growth is strongest at the tip** — Phase 0 is where blocks are
+  added; the property "the chain keeps extending" applies here.
+- **Common Prefix is strongest at archival depth** — Phase 3 is where the
+  chain is cryptographically locked; the property "honest nodes agree past
+  depth k" is operative.
+- **Chain Quality is the tension** — too-low k₁ or sticky fork-choice lets
+  adversary blocks crowd in; too-high k₁ orphans honest blocks. Phase 1↔2
+  is where the trigger thresholds (T_count, T_weight, T_depth1) calibrate
+  this tradeoff.
+
+### 0.2 Triggers (Phase 1 → 2)
+
+![Trigger composition](trigger-composition.png)
+([`trigger-composition.dot`](trigger-composition.dot))
+
+The Phase 1→2 transition is gated by multiple independent triggers, of
+which any single one is sufficient:
+
+| Trigger | Test | Source |
+|---|---|---|
+| `T_count` | `|attesters with canonical-hash match| ≥ ⌈|active|/2⌉ + 1` | future — 1-validator-1-vote; Sybil-resistant for equal-stake |
+| `T_weight` | `Σ stakeᵢ across canonical-hash attesters ≥ 2/3 active stake` | `TipTracker.FinalityThreshold` (`NAKAMOTO_ATTESTATION_THRESHOLD`) |
+| `T_depth1` | `tip.ordinal - lastFinalizedOrdinal > k₁` (default 255) | `SnapshotLeaderLoop.ConfirmationDepthK` (`NAKAMOTO_CONFIRMATION_DEPTH`) |
+
+Today only `T_weight` and `T_depth1` are wired. The proposed refactor
+(`FinalityTrigger[F]` typeclass) makes `T_count` a drop-in addition and
+opens the path for future triggers (NIPoPoW superblock anchors, etc.).
+
+The semantics are **max-of**: the Phase 2 boundary at any tick is the
+maximum `latestQualifying` ordinal across all registered Phase-2 triggers.
+Each trigger gives a *sufficient* condition, not a *necessary* one.
+
+### 0.3 Trigger (Phase 2 → 3)
+
+| Trigger | Test | Rationale |
+|---|---|---|
+| `T_depth2` | `tip.ordinal - lastFinalizedOrdinal > k₂` | Cardano-equivalent CP-violation < 10⁻¹². Target `k₂ = 2¹⁶ = 65536` snapshots. |
+
+`T_depth2` is the cryptographic-equivalent "never rollback" bound. Once
+reached, downstream subsystems (overlay history pruning, aggregate
+certificate emission, light-client anchor publication) become safe.
+
+### 0.4 Component scope per phase
+
+The cleanest operational consequence of the phase model is that each
+subsystem has a well-defined active phase range:
+
+| Component | Active in phases | Notes |
+|---|---|---|
+| `ChainSelection.standardCompare` (Taktikos maxvalid-tk) | 0, 1 | short-fork rule (< k₁ back) |
+| `ChainSelection` density rule (Ouroboros Genesis maxvalid-bg) | 0, 1 | deep-fork rule (≥ k₁ back); operationally rare in steady state |
+| Attestation triggers `T_count`, `T_weight` | 1 | accumulate weight on canonical-hash matches |
+| Depth trigger `T_depth1` | 1 → advances to 2 | structural fallback when attestation gates stall |
+| MPT overlay `pendingRef` writes | 0, 1 | per-branch ChangeSets above persistent base |
+| MPT overlay `finalizeBranch` (fold into base) | at Phase 2 boundary | fires on Phase 1 → 2 transition |
+| G1 follower consumption (dl1/cl1/ml0 pull) | from Phase 2 | `pullFinalityGated` |
+| Eta-rotation use of period j VRF outputs | from Phase 2 | the first 2/3 of period j must reach Phase 2 before period j+1 begins |
+| Depth trigger `T_depth2` | 2 → advances to 3 | archival depth gate |
+| Undo journal pruning, overlay history shedding | from Phase 3 | reorg-recovery structures no longer required |
+| Aggregate-signature certificate (Mithril-equivalent) | from Phase 3 | light-client trust anchor |
+
+**The density rule (Genesis maxvalid-bg) is operationally bounded to
+Phase 0/1.** Once a snapshot reaches Phase 2, no chain-selection rule can
+touch it; once it reaches Phase 3, even cryptographic adversary advantage
+is negligible.
+
+> **Note on Cardano:** Cardano runs Praos as its steady-state consensus.
+> The Ouroboros Genesis density rule is included in `cardano-node` for
+> bootstrap correctness and deep-fork-recovery (e.g. a node joining from
+> scratch faced with multiple divergent histories), but rarely fires in
+> normal mainnet operation. Our `ChainSelection` mirrors this: maxvalid-tk
+> for short forks (the common case), maxvalid-bg density for deep forks
+> (the recovery case).
+
+### 0.5 Tine selection illustration
+
+![Tine selection](tine-selection.png)
+([`tine-selection.dot`](tine-selection.dot))
+
+Praos-style tine diagram with phase bands overlaid. Honest snapshots ○,
+adversarial ●, orphaned-honest ◇. The brace ⟨k₁⟩ marks the Phase 1→2
+boundary; the trunk to the left of it is the agreed common prefix.
+
+---
+
+## 1. Eta rotation under the R ≥ 3k₁ bound
+
+![Eta rotation timeline](eta-rotation-timeline.png)
+([`eta-rotation-timeline.dot`](eta-rotation-timeline.dot))
+
+Eta is the long-lived VRF nonce that seeds slot-leader eligibility. To
+prevent grinding attacks, eta_{j+1} must be:
+1. Derived from VRF outputs of period **j** (not j+1), and
+2. The VRF inputs used must be **CP-safe at the time of use** — i.e. all
+   honest nodes agree on them.
+
+### 1.1 The 2/3 cut
+
+`EtaCalculation.scala:30-35` (`twoThirdsCutoff`): eta_{j+1} is computed
+from VRF outputs in the **first 2R/3** of period j, where R is the
+rotation-period length. `NakamotoChainStore.collectVrfOutputsForPeriod`
+(`NakamotoChainStore.scala:365-386`) walks the canonical chain only — so
+all honest nodes seeing the same canonical chain compute the same eta.
+
+### 1.2 The R ≥ 3k₁ bound
+
+By the time period j+1 starts (i.e. eta_{j+1} begins seeding the lottery):
+- VRF inputs were emitted in slots `[j·R, j·R + 2R/3)` of period j.
+- They are now at least `R/3` snapshots deep on the canonical chain.
+
+For these inputs to be CP-safe (operationally, at Phase 2 — Settled), we
+require:
+
+```
+R / 3 ≥ k₁     ⇒     R ≥ 3·k₁
+```
+
+with some `epsilon` for safety margin.
+
+This is the standard Praos eta-stability bound (Praos 2018 §5.4 "epoch
+nonce stability"; GKL 2015 §6).
+
+### 1.3 Per-environment R configuration
+
+R should be measured in **snapshots**, not slots — the security argument
+is about CP-safety of inputs (a snapshot-indexed property), and slot rate
+varies under LDD-fill drift.
+
+Recommended defaults (Cardano uses `R = 10·k`; we follow the same ratio
+in production):
+
+| Environment | k₁ | R (snapshots) | Multiplier | Notes |
+|---|---|---|---|---|
+| **production** | 255 | 2550 | 10·k₁ | matches Cardano R/k ratio; ~4.7 hr at 15% LDD-fill at 1s/slot |
+| **e2e tests** | 255 | 100 | 0.39·k₁ | violates R ≥ 3k₁ but tests aren't adversarial; chosen to exercise rotation mechanism many times per run |
+| **expanded sims** | 255 | 765 | 3·k₁ | minimum-compliant; for sim runs that want to model rotation behavior under attack |
+
+The current default of `etaRotationSlots = 600` (in slots, ~90 snapshots
+under 15% fill) violates the bound by ~8.5×. Tests have accepted this
+silently; production-readiness work needs to fix it.
+
+**Implementation note:** the unit migration from slots to snapshots in
+the config knob is non-trivial because `EtaCalculation.rotationPeriod`
+currently keys on slot index. The cleanest path is to keep the env var
+named in slots but document the snapshot-equivalent (snapshots ≈ slots ×
+expected-LDD-fill); a fuller refactor switches `rotationPeriod` to key on
+ordinal.
+
+---
+
+## 2. Top-level state model
 
 Each gl0 node maintains three coupled local data structures:
 
 | Structure | Lives in | Purpose |
 |---|---|---|
-| `NakamotoChainStore` | `dag-l0/.../nakamoto/NakamotoChainStore.scala` | The fork-DAG of known tips; supports `bestTip` (Taktikos maxvalid-tk), `walkBackTo`, `finalize` (advance the local finalized boundary). |
-| `MptOverlay` | `node-shared/.../nakamoto/overlay/MptOverlay.scala` | Per-process key/value MPT with multi-branch ChangeSets above an on-disk base; `finalizeBranch` folds the canonical branch into base. |
-| `TipTracker` | `node-shared/.../nakamoto/TipTracker.scala` | `Map[PeerId, TipAttestation]` of latest attestation per peer, used by both fork-choice tie-breakers and attestation-2/3 finality. |
+| `NakamotoChainStore` | `dag-l0/.../nakamoto/NakamotoChainStore.scala` | Fork-DAG of known tips; `bestTip` (Taktikos maxvalid-tk), `walkBackTo`, `finalize` (advance the local finalized boundary at the Phase 1→2 transition). |
+| `MptOverlay` | `node-shared/.../nakamoto/overlay/MptOverlay.scala` | Per-process key/value MPT with multi-branch ChangeSets above an on-disk base; `finalizeBranch` folds the canonical branch into base at the Phase 1→2 transition. |
+| `TipTracker` | `node-shared/.../nakamoto/TipTracker.scala` | `Map[PeerId, TipAttestation]`; supplies inputs to `T_count` and `T_weight`. |
 
-These three are bridged by **`SnapshotLeaderLoop.finalityMonitor`** (a 5s `fs2.Stream`
-that runs concurrently with the slot tick) and **`NakamotoSyncDaemon`** (which
-consumes inbound sidecar gossip and drives `processValidSnapshot` and
+These are bridged by **`SnapshotLeaderLoop.finalityMonitor`** (5s
+`fs2.Stream` running concurrently with the slot tick) and
+**`NakamotoSyncDaemon`** (inbound sidecar gossip → `processValidSnapshot`,
 `handleAttestation`).
 
 The "sidecar" is the Go libp2p GossipSub process bridged via gRPC at
-`SidecarClient` (`node-shared/.../nakamoto/SidecarClient.scala`). Outbound
-attestations and snapshots go through this. Inbound is consumed by
-`SidecarRumorBridge` (`node-shared/.../nakamoto/SidecarRumorBridge.scala`) for
-rumor-typed gossip and by `NakamotoSyncDaemon`'s own subscription streams for
-typed `pb.Snapshot` / `pb.TipAttestation` messages.
+`SidecarClient` (`node-shared/.../nakamoto/SidecarClient.scala`).
+Outbound attestations and snapshots go through this. Inbound is consumed
+by `SidecarRumorBridge` for rumor-typed gossip and by `NakamotoSyncDaemon`'s
+own subscription streams for typed `pb.Snapshot` / `pb.TipAttestation`.
 
 ---
 
-## 2. Self-attestation broadcast (production path)
+## 3. Self-attestation broadcast (production path)
 
 ![Self-attestation broadcast](attestation-self-broadcast.png)
 ([`attestation-self-broadcast.dot`](attestation-self-broadcast.dot))
 
-When a node's `slotTick` fires (`SnapshotLeaderLoop.scala:238`, 1s default
-cadence; configurable via `NAKAMOTO_SLOT_DURATION_MS`), the node:
+When a node's `slotTick` fires (`SnapshotLeaderLoop.scala:238`,
+configurable via `NAKAMOTO_SLOT_DURATION_MS`):
 
-1. Reads the **slot gap** from `lastKnownSlotRef` (slots elapsed since last
-   stored chain tip) and computes its **own relative stake** via
-   `StakeRegistry`.
-2. Computes **eta** for the current rotation period from the chain history
-   (`EtaCalculation.computeEta`). Period 0 → genesis eta; later periods derive
-   deterministically from VRF outputs of the previous period.
+1. Reads the **slot gap** from `lastKnownSlotRef`; computes own relative
+   stake via `StakeRegistry`.
+2. Computes **eta** for the current rotation period from chain history
+   (`EtaCalculation.computeEta`). Period 0/1 → genesis eta; later periods
+   derive from the first 2/3 of the previous period's canonical VRF
+   outputs (see §1).
 3. Calls `EligibilityChecker.checkEligibility(vrfSK, slot, slotGap, eta,
-   relativeStake, lddConfig)`. Returns `Some((proof, vrfOutput))` if the node
-   beat its LDD threshold for this slot, else `None`.
-4. On `Some(...)`: enters `onSlotWon` (`SnapshotLeaderLoop.scala:303`).
+   relativeStake, lddConfig)`. Returns `Some((proof, vrfOutput))` if the
+   node beat its LDD threshold for this slot.
+4. On `Some(...)`: enters `onSlotWon`.
 
-`onSlotWon` is bracketed by `mptStore.withTransaction`. Inside:
+`onSlotWon` is bracketed by `mptStore.withTransaction`:
+- `createProposalArtifact` accumulates writes through an
+  `MptOverlay.BranchHandle` keyed by the raw artifact hash. Writes are
+  not visible to readers outside the branch (Phase 0 isolation).
+- `chainStore.store(signed, …)` commits to the fork-DAG locally.
+- `mptOverlay.rekey(rawHash, withCertHash)` re-keys the branch by the
+  cert-bearing snapshot hash so ord N+1's parent walk finds it.
+- `MptTxAction.Commit` if `chainStore.store == true`; `Rollback` else.
 
-- `createProposalArtifact` constructs the snapshot and accumulates writes into
-  an `MptOverlay.BranchHandle` for the new branch (keyed by the raw artifact
-  hash). The writes are not visible to readers outside this branch.
-- `chainStore.store(signed, context, ordinal, slot, parentHash, vrfOutput)` is
-  the local-only commit to the fork-DAG (`SnapshotLeaderLoop.scala:709`).
-- `mptOverlay.rekey(BranchId(rawArtifactHash), BranchId(snapshotHashedForStorage.hash))`
-  re-keys the branch so it can be located by the cert-bearing snapshot hash
-  later.
-- The transaction commits on `MptTxAction.Commit` if `chainStore.store` returned
-  true (snapshot accepted as a new tip); rolls back otherwise.
+After the transaction (still in Phase 0 for this snapshot):
+- Canonical-state pointers advance for recovery.
+- Snapshot is published via `sidecarClient.publishSnapshot`.
+- Self-attestation is emitted via `NakamotoSyncDaemon.emitTipAttestation`
+  with `attestedAt = slotRefined` (the consensus slot at which we
+  produced — see §3.1).
 
-After the transaction:
+### 3.1 `attestedAt` semantics — consensus slot, not wall-clock
 
-- `setHeadForRecovery` + `lastGlobalSnapshotStorage.setForRecovery` +
-  `lastNGlobalSnapshotStorage.setForRecovery` + `lastKnownSlotRef.set` advance
-  the local canonical-state pointers.
-- The production gate is rechecked; if still open the node broadcasts via
-  `sidecarClient.publishSnapshot` (`SnapshotLeaderLoop.scala:766`).
-- **The unified self-attestation entry point** (Phase 2, commit `6e49b7d5`):
-  `NakamotoSyncDaemon.emitTipAttestation` (`NakamotoSyncDaemon.scala:1146`) is
-  called with the snapshot hash, slot, and ordinal.
+`attestedAt` is a **consensus slot** (a `Slot` newtype over `NonNegLong`,
+indexed by the cluster's `SlotClock`), **not** wall-clock seconds.
 
-### `emitTipAttestation` internals
+The cluster's `SlotClock` (`node-shared/.../nakamoto/SlotClock.scala`)
+derives slot index as `(wallClock - genesisTimeMs) / slotDurationMs`. In
+production `slotDurationMs = 1000`; in e2e tests `slotDurationMs = 500`.
+The slot index is what cluster nodes agree on for "the same instant in
+consensus time" — it scales with the configured slot rate.
 
-`NakamotoSyncDaemon.scala:1146-1184`:
-
-1. **Read wall-clock time** via `Clock[F].realTime` (referentially transparent,
-   F-typed — *not* `System.currentTimeMillis()`). Convert to seconds; this is
-   the `attestedAt` field of the domain `TipAttestation`. Wall-clock seconds is
-   the canonical "newer wins" key in `TipTracker.recordAttestation`
-   (`TipTracker.scala:96-105`).
-2. **Write locally** via `tipTracker.recordAttestation(selfId, localAtt)` —
-   `localAtt = TipAttestation(tipHash, tipSlot, tipOrdinal, attestedAt)`.
-3. **Sign** the hash of `localAtt` with the node's keypair using the
-   project's `HasherSelector.withCurrent` pipeline (JSON-encode → hash → ECDSA
-   sign). Same pipeline as `SignatureProof.fromData` / `Signed.forAsyncHasher`.
-4. **Broadcast** via `sidecarClient.publishAttestation` — gRPC to the Go sidecar,
-   which publishes on the GossipSub attestation topic.
-
-Prior to commit `6e49b7d5`, `SnapshotLeaderLoop.onSlotWon` had its own inline
-self-attestation block computing the same four steps with `attestedAt =
-slotRefined` (slot number, ~hundreds), while `NakamotoSyncDaemon.emitAttestation`
-(triggered when we receive a snapshot via gossip) used `attestedAt =
-System.currentTimeMillis() / 1000L` (~1.7B). This asymmetry meant peer
-attestations always shadowed self-attestations under `TipTracker`'s "newer
-wins" rule. The Phase 2 change unifies both paths through `emitTipAttestation`
-and both paths now read time via `Clock[F].realTime` for referential
-transparency.
+Earlier implementations of `emitAttestation` used `System.currentTimeMillis()`
+(non-typed, wall-clock dependent) or `Clock[F].realTime.toSeconds` (typed
+but dimensionally wrong — seconds is not a slot). Both gave divergent
+units between the production self-attest path (`onSlotWon`, slot index)
+and the peer-receive path (`processValidSnapshot`, seconds), so peer
+attestations always shadowed self-attestations under `TipTracker`'s
+"newer wins" rule. Both paths now read `attestedAt` from `SlotClock`
+(or, in `onSlotWon`, use the just-won `slotRefined`).
 
 ---
 
-## 3. Peer-attestation and peer-snapshot receive
+## 4. Peer-attestation and peer-snapshot receive
 
 ![Peer receive paths](attestation-peer-receive.png)
 ([`attestation-peer-receive.dot`](attestation-peer-receive.dot))
 
-The Go sidecar exposes two subscription streams which `NakamotoSyncDaemon`
-consumes:
+The Go sidecar exposes two subscription streams consumed by
+`NakamotoSyncDaemon`:
 
-**Inbound `pb.Snapshot`** — full snapshot from another producer's `publishSnapshot`:
-1. Decode + validate VRF + signature + slot-cert + chainStore.store (computes
-   `becameBest` from `chainStore.bestTip.hash === thisHash`,
-   `NakamotoSyncDaemon.scala:643-664`).
-2. Route through `processValidSnapshot` (`NakamotoSyncDaemon.scala:670`,
-   implementation at `:833`). This:
+**Inbound `pb.Snapshot`** — full snapshot from another producer's
+`publishSnapshot`:
+1. Decode + validate VRF + signature + slot-cert + chainStore.store
+   (computes `becameBest` from `chainStore.bestTip.hash === thisHash`).
+2. Route through `processValidSnapshot`. This:
    - Updates `networkTipOrdinal` / `networkTipHash` tracking.
-   - If `becameBest=true`: pauses the production gate (`ReorgInProgress`),
-     calls `setHeadForRecovery` and `last*SnapshotStorage.setForRecovery` on
-     the local canonical pointers, resumes the gate.
-   - **`tipTracker.recordAttestation(producerId, att)`** at line 900 —
-     "the producer is implicitly attesting to their own tip". This credits the
-     producer's `peerId` with an attestation entry for the snapshot they
-     produced.
-   - **`emitAttestation(snap, …)`** at line 916 — fires **unconditionally**,
-     even when `becameBest=false`. This calls our own
-     `tipTracker.recordAttestation(selfId, …)` with the received snapshot's
-     hash, *regardless of whether it's on our canonical chain*.
+   - If `becameBest`: pauses production gate (`ReorgInProgress`), calls
+     `setHeadForRecovery`, resumes the gate.
+   - `tipTracker.recordAttestation(producerId, att)` — credits the
+     producer's `peerId` with an attestation entry (implicit attestation
+     by producing).
+   - `emitAttestation(snap, …)` — **see §4.1 below for the gating
+     correction**.
 
-**Inbound `pb.TipAttestation`** — explicit attestation from another peer's
-`publishAttestation` (`NakamotoSyncDaemon.scala:1051-1087`):
+**Inbound `pb.TipAttestation`** — explicit attestation from another
+peer's `publishAttestation`:
 1. Decode and recover the attester's `peerId`.
-2. Reconstruct domain `TipAttestation`, hash it via the standard pipeline.
-3. Look up the attester's public key, verify ECDSA signature against the hash.
-4. If valid: `tipTracker.recordAttestation(attesterId, domainAtt)`. If invalid
-   or unsigned: drop with a warn log.
+2. Reconstruct domain `TipAttestation`, hash via the standard pipeline.
+3. Look up attester pubkey, verify ECDSA signature against the hash.
+4. If valid: `tipTracker.recordAttestation(attesterId, domainAtt)`.
+   Invalid/unsigned: drop with a warn log.
 
-### The "selfId.tipHash drift" subtlety
+### 4.1 The `emitAttestation`-on-peer-receive gating correction
 
-Step 4 of the snapshot path (`emitAttestation` at line 916) is unconditional.
-If a peer broadcasts a snap on a fork branch and our local chain has
-`bestTip` on a different chain at the same ordinal, our `selfId` TipTracker
-entry is moved onto the fork-branch's hash. The canonical-hash filter in
-`TipTracker.highestFinalizedOrdinal` (`TipTracker.scala:133-160`) then drops
-our own vote to zero weight on our canonical chain. **This is the gap the
-Phase 3 re-attestation ticker exists to rescue** — see §5.
+> **Status:** in-progress design correction. Commit `6e49b7d5` introduced
+> *unconditional* `emitAttestation` on peer-receive. iter33 + iter34
+> e2e failures traced to this regression: any peer's fork-branch snap
+> can move our self-attestation off canonical, after which the
+> canonical-hash filter (see §6) zeros our weight contribution. The
+> Phase 3 re-attestation ticker (§5.1) was added to rescue this but
+> doesn't address the root cause.
 
----
+The correct gating: `emitAttestation` in `processValidSnapshot` should
+only fire when `becameBest = true` — i.e. chain-selection promoted the
+peer's snapshot to **our** canonical bestTip (a Phase 0 → 1 transition).
+Without this gating, our self-attestation can drift onto Phase 0
+fork-branches that lost chain selection, breaking Phase 1 → 2 weight
+accumulation.
 
-## 4. MPT overlay branches at the tip
-
-![MPT overlay branches](overlay-branches.png)
-([`overlay-branches.dot`](overlay-branches.dot))
-
-`MptOverlay.MultiBranch` (`MptOverlay.scala`):
-- `base: MptStore` — on-disk persistent key-value MPT holding **finalized
-  state only**.
-- `pendingRef: Map[BranchId, ChangeSet]` — in-memory pending branches keyed
-  by `BranchId` (a newtype over the snapshot's hash). Each `ChangeSet`
-  contains key-level upserts and removals over its parent branch.
-- A branch's effective state is `base ⊕ chain-of-parent-ChangeSets`. Reads
-  via `overlay.get(branch, key)` walk the chain lazily and fall through to
-  base on miss.
-
-When `GSAM.accept()` builds a snapshot, it `overlay.checkout(parentBranchId)`
-to obtain a `BranchHandle`, mutates state through that handle (writes go to a
-new ChangeSet keyed by the in-progress snapshot's hash), and the bracket
-returns the handle so the caller can call `overlay.commit(handle, childBranchId,
-ordinal)` after sealing the snapshot. Multiple snapshots at the same ordinal
-(fork branches) each become their own branch in `pendingRef`. **Sibling
-isolation**: a write on branch `B` is invisible to a reader at `A` at the same
-parent. There is no cross-branch read leakage.
-
-### `finalizeBranch(canonical, ordinal)`
-
-`MptOverlay.scala:661`. Two outcomes encoded in `FinalizationOutcome`:
-- `Folded(keysApplied, branchesDropped)` — canonical branch found in pending,
-  its full chain of ChangeSets is merged and folded into base atomically
-  (single `MptStore.withTransaction` bracket, see partition-atomicity
-  contract `#56.4.5`). All sibling pending branches are dropped.
-- `NoOp` — already finalized at the same (ordinal, hash); idempotent.
-
-Reorg-replace path (`MptOverlay.scala:685-749`): when a different hash was
-previously finalized at the same ordinal, the **undo journal** (#121) is
-replayed to revert the prior canonical's writes from base before folding the
-new canonical. This plugs the "base may still hold rejected writes" leak
-seen in the iter19 forensics.
+The Phase 3 ticker should be retained as a *safety net* for the case
+where chain-selection flips bestTip during a 5s window (so our self-att
+is on a previous bestTip), but should not be the primary attestation
+correctness mechanism.
 
 ---
 
@@ -216,113 +342,106 @@ seen in the iter19 forensics.
 
 `SnapshotLeaderLoop.scala:381-552`. On every 5s tick:
 
-### 5.1 Phase 3 re-attestation ticker (added by commit `6e49b7d5`)
+### 5.1 Phase-1 visibility check (re-attestation ticker)
 
-`SnapshotLeaderLoop.scala:396-412`. Reads `allAtts <-
-tipTracker.allAttestations` and `bestTip <- chainStore.bestTip`. If
+`SnapshotLeaderLoop.scala:396-412`. If `allAtts(selfId).tipHash !== bestTip.hash`
+(our last self-attestation doesn't match current canonical), emit a
+fresh self-attestation pointing at bestTip. Log at INFO:
+`RE-ATTEST bestTip change …`.
 
-```
-bestTip = Some(tip) AND !allAtts(selfId).tipHash === tip.hash
-```
+**Operationally**: a Phase 0 → Phase 1 visibility patch. Rescues our
+contribution to T_weight / T_count when chain-selection has moved our
+canonical view but we haven't re-attested.
 
-(either we never attested anything, OR our last self-attestation points at a
-hash that isn't current bestTip), call `NakamotoSyncDaemon.emitTipAttestation(
-tipHash=tip.hash, tipSlotLong=tip.slot, tipOrdinal=tip.ordinal, …)` and log
-at INFO level (`RE-ATTEST bestTip change …`).
+This is a *safety net*, not the primary self-attestation mechanism (see
+§4.1).
 
-Why: rescue our own vote from the "selfId.tipHash drift" described in §3.
-Without it, peer-snapshot arrivals leave us silently disenfranchised on our
-own canonical chain.
-
-### 5.2 Depth-k finality (Bitcoin-style)
+### 5.2 T_depth1: depth-k₁ finality (Phase 1 → Phase 2 trigger)
 
 `SnapshotLeaderLoop.scala:425-481`. If
+`tip.ordinal - lastFinalizedOrdinal > k₁` (default 255), the snapshot at
+`tip.ordinal - k₁` is structurally finalized:
 
-```
-tip.ordinal - lastFinalizedOrdinal > ConfirmationDepthK
-```
+1. `walkBackTo(tip.hash, finalizeAtOrdinal)` returns the canonical hash.
+2. `chainStore.get(canonicalHash)` returns the stored snapshot (read its
+   slot — slots are LDD-paced, NOT 1:1 with ordinals).
+3. Apply the four-write sink: `tipTracker.markFinalized` →
+   `pruneBelow` → `chainStore.finalize` → `mptOverlay.finalizeBranch`.
 
-(default `k = 255`, env override `NAKAMOTO_CONFIRMATION_DEPTH`), the snapshot
-at `tip.ordinal - k` is structurally finalized:
+This is the Bitcoin-style probabilistic CP fallback.
 
-1. `walkBackTo(tip.hash, finalizeAtOrdinal)` returns the canonical hash at that
-   ordinal on our local best chain.
-2. `chainStore.get(canonicalHash)` returns the stored snapshot so we can read
-   its slot value (slots are LDD-paced, NOT 1:1 with ordinals — never compute
-   `tip.slot - k` instead of using the canonical snapshot's actual slot).
-3. Apply the four-write sink: `tipTracker.markFinalized` → `pruneBelow` →
-   `chainStore.finalize` → `mptOverlay.finalizeBranch`.
-
-### 5.3 Attestation-2/3 finality (GRANDPA-style)
+### 5.3 T_weight: attestation-2/3 finality (Phase 1 → Phase 2 trigger)
 
 `SnapshotLeaderLoop.scala:489-543`. Calls
-`tipTracker.highestFinalizedOrdinal(threshold=2/3, canonicalHashAt =
-walkBackTo(tip.hash, _))`:
+`tipTracker.highestFinalizedOrdinal(threshold=2/3, canonicalHashAt = walkBackTo(tip.hash, _))`:
 
 `TipTracker.highestFinalizedOrdinal` (`TipTracker.scala:133-160`):
-- Walks all attestations in `attestationsRef` sorted by `tipOrdinal` descending.
-- For each `(peerId, att)`: looks up `canonicalHashAt(att.tipOrdinal)` — the
-  hash on **our** local canonical chain at that ordinal. If it matches
-  `att.tipHash`, accumulate `stakeRegistry.optimisticRelativeStake(peerId)`
-  into the running weight; else contribute zero. (This is the canonical-hash
-  filter; it prevents cross-fork attestation contamination.)
-- Returns the highest ordinal where cumulative weight ≥ `threshold`.
+- Walks all attestations sorted by `tipOrdinal` descending.
+- For each `(peerId, att)`: looks up `canonicalHashAt(att.tipOrdinal)` —
+  the hash on **our** canonical chain at that ordinal. If it matches
+  `att.tipHash`, accumulate `stakeRegistry.optimisticRelativeStake(peerId)`;
+  else contribute zero. (Canonical-hash filter — prevents cross-fork
+  contamination.)
+- Returns highest ordinal where cumulative weight ≥ 2/3.
 
-If the returned ordinal beats `lastFinalizedOrdinal` AND depth-k didn't fire
-in the same tick:
-- Walk back from bestTip to find the canonical hash at the attestation-
-  finalized ordinal.
-- Apply the same four-write sink as depth-k: `markFinalized` → `pruneBelow` →
-  `chainStore.finalize` → `mptOverlay.finalizeBranch`.
+If returned ordinal beats `lastFinalizedOrdinal` AND T_depth1 didn't
+fire in the same tick:
+- Walk back from bestTip to canonical hash at the finalized ordinal.
+- Apply the same four-write sink.
 
-If `walkBackTo` returns `None` — we're on a fork that doesn't contain the
-attested ordinal — enqueue a `chainSyncRequestQueue.request(finalOrdinal)` so
-we proactively pull the better chain.
+If `walkBackTo` returns `None` (we're on a fork not containing the
+attested ordinal) — enqueue `chainSyncRequestQueue.request(finalOrdinal)`
+to proactively pull the better chain.
+
+### 5.4 (Future) T_depth2: archival finality (Phase 2 → Phase 3 trigger)
+
+Not yet wired. Once Phase 3 sinks (overlay history pruning, aggregate
+certificate emission) are spec'd, this becomes a third gate on the same
+tick.
 
 ---
 
-## 6. Why we still rely on the canonical-hash filter
+## 6. Why the canonical-hash filter is load-bearing
 
-In a GRANDPA-style design, each peer's attestation is "I saw this snapshot
-and it's valid." Different peers may attest to different forks at the same
-ordinal. The canonical-hash filter in `highestFinalizedOrdinal` ensures that
-weight from a peer who attested to fork B doesn't count toward finalizing
-fork A on **our** chain — even if both are well-formed.
+In a GRANDPA-style design, peer attestations are "I saw this snapshot
+and it's valid." Different peers may attest to different forks at the
+same ordinal. The canonical-hash filter in `highestFinalizedOrdinal`
+ensures weight from a peer who attested to fork B doesn't count toward
+finalizing fork A on **our** chain.
 
-This is the **hash-aware** generalisation of GRANDPA. The hash-agnostic
+This is the **hash-aware** generalization of GRANDPA. A hash-agnostic
 predecessor silently let forked chains each "finalize" their local fork
-(observed in a 3-node cluster where gl0-2 forked: all three nodes logged
-ATTEST-FINALIZED at the same ordinals with weight=0.67, yet their mptRoots
-were permanently different — see iter14 forensics memory entries and #115).
+(observed in a 3-node cluster where gl0-2 forked; all three logged
+ATTEST-FINALIZED at the same ordinals with weight=0.67, yet mptRoots
+were permanently different — see iter14 forensics, #115).
 
-The filter is load-bearing for safety. The Phase 3 re-attestation ticker
-(§5.1) is needed precisely *because* the filter is strict: when our own
-selfId attestation drifts onto a non-canonical hash via §3's unconditional
-`emitAttestation`, the filter rules us out of our own canonical chain's
+The filter is load-bearing for safety. The §5.1 visibility ticker exists
+*because* the filter is strict: when self-attestation drifts onto a
+non-canonical hash, the filter rules us out of our own canonical chain's
 weight sum.
 
 ---
 
 ## 7. Caveats and known issues
 
-- The Phase 3 ticker was added in commit `6e49b7d5` but its log level was
-  `debug` and `SnapshotLeaderLoop`'s logger config does not surface DEBUG —
-  the first e2e measurements gave zero observability into firing rate.
-  Subsequent change raised it to `info` to give real evidence.
-- `NakamotoChainStore.store` has a **finality-safety gate**
-  (`NakamotoChainStore.scala:290-303`) that refuses to write a different hash
-  at an already-finalized ordinal. Combined with `chainStore.finalize` driven
-  by 2/3 weight that *includes* our self-attestation, a small-cluster node
-  can self-finalize a divergent fork and then refuse the canonical chain's
-  hash — the "fork-recovery deadlock" of #117 Path B / #119. The full fix is
-  a node-level "I'm permanently divergent → re-bootstrap" path; not in scope
-  for the attestation-unification change.
-- The undo journal (#121) plugs base-write contamination on reorg-replace,
-  but only operates when `finalizeBranch` is called with a different hash at
-  an already-finalized ordinal. It does NOT cover the case where a snapshot's
-  ChangeSet is dropped from `pendingRef` without ever being folded (which is
-  the normal "this fork branch lost chainSelection" outcome — those writes
-  never reach base, by design).
+- **`emitAttestation`-on-peer-receive** is currently unconditional
+  (commit `6e49b7d5`). Causing iter33/iter34 regressions. See §4.1 for
+  the planned gating correction.
+- **`NakamotoChainStore.store` finality-safety gate** refuses to write a
+  different hash at an already-finalized ordinal
+  (`NakamotoChainStore.scala:290-303`). Combined with `chainStore.finalize`
+  driven by 2/3 weight including our self-attestation, a small-cluster
+  node can self-finalize a divergent fork and then refuse the canonical
+  chain's hash — the "fork-recovery deadlock" of #119. Full fix is a
+  node-level re-bootstrap path.
+- **Undo journal (#121)** plugs base-write contamination on reorg-replace
+  but only operates when `finalizeBranch` is called with a different
+  hash at an already-finalized ordinal. Does NOT cover the case where a
+  ChangeSet is dropped from `pendingRef` without ever being folded — by
+  design, those writes never reach base.
+- **Eta-rotation R is currently in slots, not snapshots** — see §1.3.
+  Production-readiness requires switching the unit and raising the
+  default to `R = 10·k₁` per Cardano practice.
 
 ---
 
@@ -330,26 +449,56 @@ weight sum.
 
 | File | Role |
 |---|---|
-| `modules/dag-l0/.../nakamoto/SnapshotLeaderLoop.scala` | Slot tick, eligibility, onSlotWon production path, finalityMonitor (5s tick — depth-k + attestation-2/3 + Phase 3 re-attestation ticker). |
-| `modules/dag-l0/.../nakamoto/NakamotoSyncDaemon.scala` | Inbound gossip handlers: `processValidSnapshot`, `handleAttestation`. The unified `emitAttestation` + `emitTipAttestation` outbound entry. |
-| `modules/dag-l0/.../nakamoto/NakamotoChainStore.scala` | Fork-DAG of tips. `bestTip`, `store`, `finalize`, `walkBackTo`. Finality-safety gate at `:290-303`. |
-| `modules/node-shared/.../nakamoto/TipTracker.scala` | `Map[PeerId, TipAttestation]`. Newer-wins via `attestedAt`. `highestFinalizedOrdinal` chain-aware weight walk. |
-| `modules/node-shared/.../nakamoto/overlay/MptOverlay.scala` | Branch-aware MPT: `pendingRef`, `BranchHandle`, `checkout/commit`, `finalizeBranch` (#56). |
-| `modules/node-shared/.../nakamoto/ChainSelection.scala` | Taktikos maxvalid-tk / maxvalid-bg fork choice. Purely structural. |
+| `modules/dag-l0/.../nakamoto/SnapshotLeaderLoop.scala` | Slot tick, eligibility, onSlotWon production path, finalityMonitor (5s tick — T_depth1 + T_weight + §5.1 visibility ticker). |
+| `modules/dag-l0/.../nakamoto/NakamotoSyncDaemon.scala` | Inbound gossip: `processValidSnapshot`, `handleAttestation`. Outbound: unified `emitAttestation` / `emitTipAttestation`. |
+| `modules/dag-l0/.../nakamoto/NakamotoChainStore.scala` | Fork-DAG of tips. `bestTip`, `store`, `finalize`, `walkBackTo`. Finality-safety gate at `:290-303`. `vrfOutputsForPeriod` for §1's eta rotation inputs. |
+| `modules/node-shared/.../nakamoto/TipTracker.scala` | `Map[PeerId, TipAttestation]`. Newer-wins via `attestedAt`. `highestFinalizedOrdinal` chain-aware weight walk. Source for T_weight (today) and T_count (future). |
+| `modules/node-shared/.../nakamoto/overlay/MptOverlay.scala` | Branch-aware MPT: `pendingRef`, `BranchHandle`, `checkout/commit`, `finalizeBranch` (#56). Phase 0/1 writes live here; Phase 2 transition triggers `finalizeBranch`. |
+| `modules/node-shared/.../nakamoto/ChainSelection.scala` | Taktikos maxvalid-tk (short forks, Phase 0/1) + Ouroboros Genesis maxvalid-bg density rule (deep forks, Phase 0/1). Inactive from Phase 2. |
 | `modules/node-shared/.../nakamoto/EligibilityChecker.scala` | LDD threshold function (ψ, γ, fA, fB). |
-| `modules/node-shared/.../nakamoto/StakeRegistry.scala` | Per-peer stake fractions; `optimisticRelativeStake` for active-only weighting. |
+| `modules/node-shared/.../nakamoto/StakeRegistry.scala` | Per-peer stake fractions (delegated + collateral combined planned); `optimisticRelativeStake` for active-only weighting. |
+| `modules/node-shared/.../nakamoto/SlotClock.scala` | Cluster-wide consensus slot provider. Source of `attestedAt`. |
+| `modules/node-shared/.../nakamoto/EtaCalculation.scala` | Eta computation; `twoThirdsCutoff` for the §1 R ≥ 3k₁ rule. |
 | `modules/node-shared/.../nakamoto/SidecarClient.scala` | gRPC client to Go libp2p sidecar (`publishSnapshot`, `publishAttestation`, `publishRumor`). |
 | `modules/node-shared/.../nakamoto/SidecarRumorBridge.scala` | Subscribe→Rumor inbound bridge for non-typed gossip. |
 
+---
+
 ## 9. Rendering the diagrams
 
-The `.dot` sources live next to this file. To render:
+The `.dot` sources live next to this file. To render all eight:
 
 ```bash
-dot -Tpng attestation-self-broadcast.dot -o attestation-self-broadcast.png
-dot -Tpng attestation-peer-receive.dot   -o attestation-peer-receive.png
-dot -Tpng overlay-branches.dot           -o overlay-branches.png
-dot -Tpng finality-monitor.dot           -o finality-monitor.png
+cd docs/nakamoto/
+for d in *.dot; do dot -Tpng "$d" -o "${d%.dot}.png"; done
 ```
 
-(Requires graphviz: `sudo apt-get install graphviz` on Debian/Ubuntu.)
+Requires graphviz (`sudo apt-get install graphviz` on Debian/Ubuntu).
+
+| `.dot` file | What it illustrates |
+|---|---|
+| `phase-state-machine.dot` | The 4-phase progression with trigger labels and affordance lists. |
+| `tine-selection.dot` | Praos-style fork diagram (honest ○, adversarial ●, orphaned ◇, bestTip ▲) with phase bands overlay. |
+| `eta-rotation-timeline.dot` | Period j → eta_{j+1} flow showing the 2/3 cut and R ≥ 3k₁ stability buffer. |
+| `trigger-composition.dot` | T_count + T_weight + T_depth1 → Phase 2; T_depth2 → Phase 3. Max-of semantics. |
+| `attestation-self-broadcast.dot` | Production-path attestation flow (onSlotWon → emitTipAttestation → sidecar). |
+| `attestation-peer-receive.dot` | Peer-receive paths for `pb.Snapshot` and `pb.TipAttestation`. |
+| `finality-monitor.dot` | 5s tick combining §5.1 / §5.2 / §5.3. |
+| `overlay-branches.dot` | MPT overlay pendingRef branches and fold-forward to base. |
+
+---
+
+## 10. References
+
+- Garay, Kiayias, Leonardos. *The Bitcoin Backbone Protocol: Analysis
+  and Applications*. EUROCRYPT 2015. [GKL] — defines CG / CQ / CP.
+- David, Gaži, Kiayias, Russell. *Ouroboros Praos: An Adaptively-Secure,
+  Semi-Synchronous Proof-of-Stake Protocol*. EUROCRYPT 2018. — VRF
+  lottery + epoch nonce stability.
+- Badertscher, Gaži, Kiayias, Russell, Zikas. *Ouroboros Genesis:
+  Composable Proof-of-Stake Blockchains with Dynamic Availability*. CCS
+  2018. — density-based fork choice for bootstrap.
+- Kiayias, Leonardos, Stouka, Zacharias. *Ouroboros Taktikos*. FC 2023.
+  — LDD-snowplow, maxvalid-tk.
+- Chase, Karayannidis. *Mithril: Stake-based Threshold Multisignatures*.
+  IOG technical report 2021. — aggregate signatures over Praos snapshots.

@@ -1,0 +1,116 @@
+// Finality trigger composition — independent triggers fold into phase advancement
+//
+// Render: dot -Tpng trigger-composition.dot -o trigger-composition.png
+//
+// Each tick (5s finalityMonitor), the registered triggers are evaluated.
+// Each trigger reports the highest ordinal it qualifies; the phase
+// advances to whichever ordinal is reached by AT LEAST ONE trigger of
+// the appropriate level. Trigger composition is "max-of" semantics, not
+// "and-of" — sufficient conditions, not necessary.
+//
+// Today's impl has T_weight + T_depth1 hard-coded inside finalityMonitor.
+// The proposed refactor:
+//
+//   trait FinalityTrigger[F[_]] {
+//     def targetPhase: ChainPhase                       // Phase1, Phase2, Phase3
+//     def latestQualifying(tip: ChainTip): F[Option[(SnapshotOrdinal, Hash)]]
+//   }
+//
+// makes adding T_count (Sybil-resistant count-based) and T_depth2 (archival)
+// drop-in.
+//
+// Refs:
+//   - SnapshotLeaderLoop.scala:381    finalityMonitor (current 2-trigger impl)
+//   - TipTracker.scala:67             FinalityThreshold (T_weight = 2/3)
+//   - SnapshotLeaderLoop.scala:349    ConfirmationDepthK = 255 (T_depth1)
+//   - SnapshotLeaderLoop.scala:425    depth-k gate site
+//   - SnapshotLeaderLoop.scala:489    attestation-2/3 gate site
+
+digraph trigger_composition {
+  rankdir=TB;
+  graph [fontname="Helvetica", fontsize=11, labelloc=t,
+         label="Finality triggers — independent, sufficient, max-of\nEach trigger advances the phase boundary on its own;\nthe registered list is the cluster's safety/liveness contract."];
+  node  [fontname="Helvetica", fontsize=10, shape=box, style="rounded,filled"];
+  edge  [fontname="Helvetica", fontsize=9];
+
+  // ---- Inputs ----
+  tip [label="chainStore.bestTip\n(canonical head ordinal)",
+       fillcolor="#e1f5fe"];
+
+  attestations [label="tipTracker.allAttestations\nMap[PeerId, TipAttestation]\nfiltered by canonical-hash\n(see TipTracker:143)",
+                fillcolor="#e1f5fe"];
+
+  stake_reg [label="stakeRegistry\n(delegated stake +\nnode collateral)",
+             fillcolor="#e1f5fe"];
+
+  finalized [label="chainStore.lastFinalizedOrdinal\n(monotonic high-water mark)",
+             fillcolor="#e1f5fe"];
+
+  // ---- Phase 1→2 triggers ----
+  subgraph cluster_phase2 {
+    label="Phase 1 → 2 triggers   (advance to SETTLED)";
+    style="filled,rounded";
+    color="#558b2f";
+    fillcolor="#f1f8e9";
+    fontsize=11;
+
+    t_count [label="T_count\n──────\n|canonical-hash attesters|\n≥ ⌈|active|/2⌉ + 1\n\n1-vote-1-validator\n(future)",
+             fillcolor="#dcedc8"];
+
+    t_weight [label="T_weight\n──────\nΣ stakeᵢ ≥ 2/3\nactive stake\n\nstake-weighted\nNAKAMOTO_ATTESTATION_THRESHOLD",
+              fillcolor="#dcedc8"];
+
+    t_depth1 [label="T_depth1\n──────\ntip.ord - finalized\n> k₁ (= 255)\n\nBitcoin-style CP fallback\nNAKAMOTO_CONFIRMATION_DEPTH",
+              fillcolor="#dcedc8"];
+  }
+
+  // ---- Phase 2→3 trigger ----
+  subgraph cluster_phase3 {
+    label="Phase 2 → 3 trigger   (advance to ARCHIVAL)";
+    style="filled,rounded";
+    color="#4527a0";
+    fillcolor="#ede7f6";
+    fontsize=11;
+
+    t_depth2 [label="T_depth2\n──────\ntip.ord - finalized > k₂\n(target k₂ = 2¹⁶ = 65536)\n\n~10⁻¹² CP-violation\nunder 1/3 adversary\n→ light-client trust anchor",
+              fillcolor="#d1c4e9"];
+  }
+
+  // ---- Folding logic ----
+  fold_p2 [label="max-of triggers\n→ Phase 2 boundary",
+           shape=box, fillcolor="#c8e6c9", style="filled,bold"];
+
+  fold_p3 [label="T_depth2\n→ Phase 3 boundary",
+           shape=box, fillcolor="#b39ddb", style="filled,bold"];
+
+  // ---- Affordances downstream ----
+  phase2_act [label="Phase 2 actions:\n• chainStore.finalize\n• tipTracker.markFinalized\n• mptOverlay.finalizeBranch\n• nakamotoFinalizedOrdinalRef\n• G1: followers consume",
+              shape=box, style="filled,rounded", fillcolor="#a5d6a7"];
+
+  phase3_act [label="Phase 3 actions:\n• prune undo journal\n• drop overlay history\n• aggregate-sig cert (future)\n• light-client anchor (future)",
+              shape=box, style="filled,rounded", fillcolor="#9575cd"];
+
+  // ---- Wiring ----
+  tip -> t_count;
+  tip -> t_weight;
+  tip -> t_depth1;
+  tip -> t_depth2;
+  attestations -> t_count;
+  attestations -> t_weight;
+  stake_reg -> t_weight;
+  finalized -> t_depth1;
+  finalized -> t_depth2;
+
+  t_count -> fold_p2 [label="ord_count"];
+  t_weight -> fold_p2 [label="ord_weight"];
+  t_depth1 -> fold_p2 [label="ord_d1"];
+
+  t_depth2 -> fold_p3 [label="ord_d2"];
+
+  fold_p2 -> phase2_act [penwidth=2, color="#1b5e20"];
+  fold_p3 -> phase3_act [penwidth=2, color="#4527a0"];
+
+  // ---- Note: Phase 2 must precede Phase 3 ----
+  fold_p2 -> fold_p3 [label="must precede\n(ord ≤ Phase 2 boundary)",
+                      style=dashed, color="#666666", constraint=false];
+}

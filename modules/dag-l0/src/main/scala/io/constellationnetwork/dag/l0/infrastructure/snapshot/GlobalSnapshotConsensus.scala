@@ -410,6 +410,19 @@ object GlobalSnapshotConsensus {
               s"🔧 Nakamoto config: LDD(cutoff=${lddConfig.lddCutoff}, offset=${lddConfig.offset}, baseline=${lddConfig.baselineDifficulty}, amplitude=${lddConfig.amplitude}), etaRotation=${etaRotationSlots}s, slotsPerEpoch=${slotsPerEpoch}, genesisTime=${pureGenesisTimeMs}"
             )
             .toResource
+          // Global slot provider. `currentSlot = (wallClock - genesis) / slotDurationMs`.
+          // Source for `attestedAt` consensus-slot reads in NakamotoSyncDaemon (peer receive)
+          // and SnapshotLeaderLoop (Phase 3 re-attestation ticker). `attestedAt` must be a
+          // CONSENSUS slot, not wall-clock seconds — slotDurationMs is 500ms in e2e, 1000ms
+          // in prod, so the Slot index runs at different rates than seconds. Reads the same
+          // `NAKAMOTO_SLOT_DURATION_MS` env var as SnapshotLeaderLoop's slot-tick so both
+          // computations agree on the slot index for any given wall-clock instant.
+          slotClock = io.constellationnetwork.node.shared.domain.nakamoto.SlotClock.make[F](
+            io.constellationnetwork.node.shared.domain.nakamoto.SlotClock.Config(
+              genesisTimeMs = pureGenesisTimeMs,
+              slotDurationMs = sys.env.get("NAKAMOTO_SLOT_DURATION_MS").flatMap(_.toLongOption).getOrElse(1000L)
+            )
+          )
           stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F].toResource
           // Filter out entries marked with alias="metagraph-op". They live in the seedlist
           // so state-channel binary signature validation accepts them as known signers,
@@ -584,7 +597,8 @@ object GlobalSnapshotConsensus {
                   mptStore = mptStore,
                   mptOverlay = mptOverlay,
                   nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef,
-                  chainSyncRequestQueue = chainSyncRequestQueue
+                  chainSyncRequestQueue = chainSyncRequestQueue,
+                  slotClock = slotClock
                 )
                 .compile
                 .drain
@@ -668,7 +682,8 @@ object GlobalSnapshotConsensus {
                   eventMempool = eventMempool,
                   dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data")),
                   processMetagraphBinary = processMetagraphBinary,
-                  sharedChainSyncManagerRef = sharedChainSyncManagerRef
+                  sharedChainSyncManagerRef = sharedChainSyncManagerRef,
+                  slotClock = slotClock
                 )
                 .compile
                 .drain

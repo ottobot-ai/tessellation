@@ -1,0 +1,117 @@
+// Praos-style tine selection diagram (GKL/Praos paper symbology)
+//
+// Render: dot -Tpng tine-selection.dot -o tine-selection.png
+//
+// Standard Ouroboros symbology:
+//   ○  honest snapshot (white circle, filled-white, black border)
+//   ●  adversarial snapshot (black circle, filled-black)
+//   ◇  honest snapshot on a losing tine (white diamond)
+//   ▲  current bestTip
+//   |     phase boundary (vertical dashed line)
+//   ⟨k⟩  brace marking k-deep region (CP-safe boundary)
+//
+// The figure shows a tree of tines at slots s_1 ... s_12:
+//   - Main trunk: honest chain, dominant by maxvalid-tk length
+//   - Adversarial fork at s_6 attempts a private re-org
+//   - Honest minor tine at s_8 (orphaned by chain-selection)
+//
+// Phase bands overlay the time axis:
+//   - PENDING beyond Phase 1 boundary
+//   - PROVISIONAL between Phase 1 and Phase 2 boundaries
+//   - SETTLED between Phase 2 and Phase 3 boundaries
+//   - ARCHIVAL before Phase 3 boundary (oldest)
+//
+// Refs: Garay-Kiayias-Leonardos 2015 "The Bitcoin Backbone Protocol"
+//       David et al. 2018 "Ouroboros Praos" §4 (chain-tree diagrams)
+//       FC2023 Taktikos paper §3 (LDD-snowplow + maxvalid-tk)
+
+digraph tine_selection {
+  rankdir=LR;
+  graph [fontname="Helvetica", fontsize=11, labelloc=t,
+         label="Tine selection under Taktikos maxvalid-tk\n○ honest  ●  adversarial  ◇  orphaned-honest  ▲  bestTip\nphase bands overlay; ⟨k1⟩ marks Phase 1→2 boundary"];
+  node  [fontname="Helvetica", fontsize=9];
+  edge  [fontname="Helvetica", fontsize=8];
+
+  // -------- Phase boundary markers (rendered as tall invisible columns) --------
+  subgraph cluster_arch {
+    label="ARCHIVAL  (CP-safe, depth > k2)";
+    labelloc=b;
+    style="filled,rounded";
+    color="#d1c4e9";
+    fillcolor="#ede7f6";
+    fontsize=10;
+
+    s1 [label="s₁\n○", shape=circle, style=filled, fillcolor="white", color=black];
+    s2 [label="s₂\n○", shape=circle, style=filled, fillcolor="white", color=black];
+    s3 [label="s₃\n○", shape=circle, style=filled, fillcolor="white", color=black];
+  }
+
+  subgraph cluster_settled {
+    label="SETTLED  (depth > k1)";
+    labelloc=b;
+    style="filled,rounded";
+    color="#c8e6c9";
+    fillcolor="#e8f5e9";
+    fontsize=10;
+
+    s4 [label="s₄\n○", shape=circle, style=filled, fillcolor="white", color=black];
+    s5 [label="s₅\n●", shape=circle, style=filled, fillcolor=black, fontcolor=white];
+    s6 [label="s₆\n○", shape=circle, style=filled, fillcolor="white", color=black];
+  }
+
+  subgraph cluster_prov {
+    label="PROVISIONAL  (attestations\naccumulating)";
+    labelloc=b;
+    style="filled,rounded";
+    color="#fff9c4";
+    fillcolor="#fffde7";
+    fontsize=10;
+
+    s7  [label="s₇\n○", shape=circle, style=filled, fillcolor="white", color=black];
+    s8a [label="s₈\n◇", shape=diamond, style=filled, fillcolor="white", color="#888888",
+         tooltip="orphaned honest"];
+    s8  [label="s₈\n○", shape=circle, style=filled, fillcolor="white", color=black];
+    s9  [label="s₉\n●", shape=circle, style=filled, fillcolor=black, fontcolor=white];
+
+    // Adversarial private re-org attempt: a tine off s5
+    s6adv [label="s₆'\n●", shape=circle, style=filled, fillcolor=black, fontcolor=white];
+    s7adv [label="s₇'\n●", shape=circle, style=filled, fillcolor=black, fontcolor=white];
+  }
+
+  subgraph cluster_pending {
+    label="PENDING  (chain growth zone)";
+    labelloc=b;
+    style="filled,rounded";
+    color="#e3f2fd";
+    fillcolor="#f1f8fe";
+    fontsize=10;
+
+    s10 [label="s₁₀\n○", shape=circle, style=filled, fillcolor="white", color=black];
+    s11 [label="s₁₁\n○", shape=circle, style=filled, fillcolor="white", color=black];
+    s12 [label="s₁₂\n▲", shape=circle, style="filled,bold", fillcolor="#ffe082",
+         color=black, penwidth=2, tooltip="bestTip"];
+  }
+
+  // -------- Edges: main honest trunk --------
+  s1 -> s2 -> s3 -> s4 -> s5 -> s6 -> s7 -> s8 -> s9 -> s10 -> s11 -> s12
+       [penwidth=2, color="#1b5e20"];
+
+  // -------- Edge: orphaned honest tine at s8 (lost to maxvalid-tk tiebreak) --------
+  s7 -> s8a [style=dashed, color="#666666", arrowhead=open,
+             label="losing tine\n(higher head-slot)"];
+
+  // -------- Edge: adversarial private fork from s5 --------
+  s5 -> s6adv [style=dashed, color="#d32f2f", arrowhead=open];
+  s6adv -> s7adv [style=dashed, color="#d32f2f", arrowhead=open];
+  // (gives up — couldn't outpace honest length)
+  s7adv -> phantom [style=invis];
+  phantom [shape=none, label="(private fork dies:\nfailed to catch honest length)", fontsize=8, fontcolor="#d32f2f"];
+
+  // -------- k1 brace at Phase 1→2 boundary --------
+  k1_label [shape=none, label="⟨───   k₁ = 255   ───⟩\n(Phase 1 → Phase 2:\nT_count, T_weight, or T_depth1)", fontsize=10, fontcolor="#1b5e20"];
+
+  // Common-prefix property visualized: from any honest node's view,
+  // pruning the last k1 snapshots gives a common prefix with any other
+  // honest node. The trunk s1..s_(bestTip-k1) is the agreed prefix.
+
+}

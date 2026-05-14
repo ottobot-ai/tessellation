@@ -1,0 +1,82 @@
+// Eta rotation timeline — Praos-style R ≥ 3k stability bound
+//
+// Render: dot -Tpng eta-rotation-timeline.dot -o eta-rotation-timeline.png
+//
+// Standard Praos symbology:
+//   |───|  bracketed slot range (e.g. period j)
+//   ⟨2R/3⟩  brace marking the eta-feeding cutoff
+//   ⟨k₁⟩    brace marking the CP-stability bound
+//   ──→     time axis (slots / snapshots, left to right)
+//
+// The diagram illustrates why R ≥ 3·k₁ is required for eta stability:
+//   - Eta_{j+1} is computed from VRF outputs in the first 2R/3 of period j.
+//   - By the time period j+1 starts, those inputs are at least R/3 deep.
+//   - For honest nodes to agree on eta_{j+1}, the inputs must be CP-safe,
+//     i.e. at least k₁ deep at use time.
+//   - Therefore: R/3 ≥ k₁  →  R ≥ 3k₁.
+//
+// Two value sets shown:
+//   - Production target: R = 2550 snapshots = 10 × k₁ (matches Cardano R/k=10)
+//   - E2E target:        R = 100 snapshots  (small but exercises mechanism)
+//
+// Refs:
+//   - GKL 2015 §6 (stability of randomness inputs)
+//   - Praos 2018 §5.4 ("epoch nonce" stability)
+//   - EtaCalculation.scala:30          twoThirdsCutoff
+//   - EtaCalculation.scala:100         extractVrfOutputsForPeriod
+//   - NakamotoChainStore.scala:365     collectVrfOutputsForPeriod (canonical-only walk)
+//   - SnapshotLeaderLoop.scala:285     eta lookup site
+
+digraph eta_rotation {
+  rankdir=LR;
+  graph [fontname="Helvetica", fontsize=11, labelloc=t,
+         label="Eta rotation under Praos R ≥ 3k₁ stability bound\nR = rotation period (snapshots), k₁ = Phase 1→2 depth = 255\nProd: R = 2550 = 10·k₁    E2E: R = 100 (test-only, accepts violation)"];
+  node  [fontname="Helvetica", fontsize=10];
+  edge  [fontname="Helvetica", fontsize=9];
+
+  // ---- Period j: the "current" rotation period ----
+  subgraph cluster_period_j {
+    label="Period j   (snapshots [j·R, (j+1)·R))";
+    style="filled,rounded";
+    color="#1565c0";
+    fillcolor="#e3f2fd";
+    fontsize=11;
+
+    feed [label="First 2R/3 of period j\n──────────────────\nVRF outputs from snapshots\n[j·R, j·R + 2R/3)\n\n■ feeds  eta_{j+1}",
+          shape=box, style="filled,rounded", fillcolor="#bbdefb", color="#0d47a1"];
+
+    buffer [label="Last R/3 of period j\n──────────────\nstability buffer\n(≥ k₁ snapshots\n once period j+1 starts)",
+            shape=box, style="filled,rounded,dashed", fillcolor="#e1f5fe", color="#0277bd"];
+
+    feed -> buffer [style=invis];
+  }
+
+  // ---- Period j+1 begins here ----
+  subgraph cluster_period_jp1 {
+    label="Period j+1   (snapshots [(j+1)·R, (j+2)·R))";
+    style="filled,rounded";
+    color="#388e3c";
+    fillcolor="#e8f5e9";
+    fontsize=11;
+
+    use [label="eta_{j+1} in use\n────────────\nVRF lottery seeded with\neta_{j+1} = Blake2b-256(\n   eta_j ‖ (j+1)\n   ‖ vrf₁ ‖ vrf₂ ‖ ...)",
+         shape=box, style="filled,rounded", fillcolor="#c8e6c9", color="#1b5e20"];
+  }
+
+  // ---- The k₁ requirement (annotation) ----
+  k_req [label="At time of use:\n  freshest eta input is\n  R/3 snapshots deep.\n\nFor honest agreement\n(CP property), need:\n  R/3 ≥ k₁\n  ∴ R ≥ 3·k₁\n\nProd: 2550/3 = 850 ≥ 255 ✓\nE2E:  100/3 ≈ 33 < 255 ✗\n(accepted; tests aren't adversarial)",
+         shape=note, style=filled, fillcolor="#fff9c4", color="#f57f17", fontsize=9];
+
+  // ---- Causal arrows ----
+  feed -> use [label="  Blake2b-256\n  with VRF outputs\n  from first 2R/3  ",
+               penwidth=2, color="#0d47a1"];
+
+  buffer -> use [style=dashed, arrowhead=none, color="#bdbdbd",
+                 label="(period j-end\nbarrier)"];
+
+  use -> k_req [style=dotted, arrowhead=none, color="#666666"];
+
+  // ---- Adversary attack story (footnote) ----
+  attack [label="WHY 3k₁?\nAdversary forking at any point in the\nfirst 2R/3 of period j could shift eta_{j+1}.\nWith R/3 ≥ k₁ stability buffer, no honest\nrollback can rewrite those inputs.",
+          shape=note, style=filled, fillcolor="#ffccbc", color="#d84315", fontsize=9];
+}
