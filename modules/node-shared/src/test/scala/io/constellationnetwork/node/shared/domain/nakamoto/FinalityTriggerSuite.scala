@@ -13,9 +13,9 @@ import io.constellationnetwork.security.hex.Hex
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.SimpleIOSuite
 
-/** Tests for [[FinalityTrigger]] and its concrete implementations (`TWeightTrigger`, `TDepth1Trigger`).
+/** Tests for [[FinalityTrigger]] and its concrete implementations (`TWeightTrigger`, `TCountTrigger`, `TDepth1Trigger`).
   *
-  * `T_count` and `T_depth2` (Kind enum entries reserved for #136 / #137) have no `make` builder yet and are NOT exercised here.
+  * `T_depth2` (Kind enum entry reserved for #137) has no `make` builder yet and is NOT exercised here.
   */
 object FinalityTriggerSuite extends SimpleIOSuite {
 
@@ -49,11 +49,15 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     )
 
   private def setupTipTracker(validators: Set[PeerId]): IO[TipTracker[IO]] =
+    setupTracker(validators).flatMap { case (tracker, _) => IO.pure(tracker) }
+
+  // Variant that also exposes the StakeRegistry — needed by TCountTrigger.make.
+  private def setupTracker(validators: Set[PeerId]): IO[(TipTracker[IO], StakeRegistry[IO])] =
     for {
       registry <- StakeRegistry.equalWeight[IO]
       _ <- registry.updateValidators(validators)
       tracker <- TipTracker.make[IO](registry)
-    } yield tracker
+    } yield (tracker, registry)
 
   // Helper: record an attestation using its own `attestedAt` as `now` so the skew gate is trivially satisfied.
   private def record(tracker: TipTracker[IO], peerId: PeerId, attestation: TipAttestation): IO[Unit] =
@@ -102,6 +106,109 @@ object FinalityTriggerSuite extends SimpleIOSuite {
       _ <- record(tracker, peer2, att(forkedTipHash, slot(50), 50L, 1000L))
       trigger <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
       st = state(self, 50L, canonicalTipHash, Map(50L -> canonicalTipHash))
+      result <- trigger.evaluate(st)
+    } yield expect.same(SnapshotOrdinal.MinValue, result)
+  }
+
+  test("TCount: evaluates to highest ordinal with ≥ 2/3 distinct attester count on canonical hash") {
+    // 4-peer cluster (self + 3 others). 2/3 of 4 = 2.67 → ceil → 3 required non-self attesters.
+    // All three non-self peers attest the canonical tip at ord=50. Count = 3 ≥ 3 → qualifies ord=50.
+    val self = pid("self")
+    val peer1 = pid("peer1")
+    val peer2 = pid("peer2")
+    val peer3 = pid("peer3")
+    val tipHash = hash("tip-at-50")
+    for {
+      (tracker, registry) <- setupTracker(Set(self, peer1, peer2, peer3))
+      _ <- record(tracker, peer1, att(tipHash, slot(50), 50L, 1000L))
+      _ <- record(tracker, peer2, att(tipHash, slot(50), 50L, 1000L))
+      _ <- record(tracker, peer3, att(tipHash, slot(50), 50L, 1000L))
+      trigger <- TCountTrigger.make[IO](tracker, registry, TipTracker.FinalityThreshold)
+      st = state(self, 50L, tipHash, Map(50L -> tipHash))
+      result <- trigger.evaluate(st)
+    } yield expect.same(ord(50L), result)
+  }
+
+  test("TCount: attestations on non-canonical fork return MinValue (cross-fork filter)") {
+    val self = pid("self")
+    val peer1 = pid("peer1")
+    val peer2 = pid("peer2")
+    val peer3 = pid("peer3")
+    val canonicalTipHash = hash("canonical")
+    val forkedTipHash = hash("forked")
+    // Three non-self peers attest a DIFFERENT hash at ord=50 than what's canonical on our chain.
+    // Canonical filter zeroes all three counts → no ordinal reaches the threshold.
+    for {
+      (tracker, registry) <- setupTracker(Set(self, peer1, peer2, peer3))
+      _ <- record(tracker, peer1, att(forkedTipHash, slot(50), 50L, 1000L))
+      _ <- record(tracker, peer2, att(forkedTipHash, slot(50), 50L, 1000L))
+      _ <- record(tracker, peer3, att(forkedTipHash, slot(50), 50L, 1000L))
+      trigger <- TCountTrigger.make[IO](tracker, registry, TipTracker.FinalityThreshold)
+      st = state(self, 50L, canonicalTipHash, Map(50L -> canonicalTipHash))
+      result <- trigger.evaluate(st)
+    } yield expect.same(SnapshotOrdinal.MinValue, result)
+  }
+
+  test("TCount: self-excludes selfId from the attester count") {
+    // 3-peer cluster: self + peer1 + peer2. 2/3 of 3 = 2 required. If self is NOT excluded,
+    // {self, peer1, peer2} = 3 attesters → qualifies. With self-exclusion, {peer1, peer2} = 2
+    // attesters → still qualifies. To exercise the exclusion strictly we want a setup where
+    // including self would fire but excluding it would NOT: a 4-peer cluster (self + 3 others)
+    // where only 2 non-self peers attest, plus self also attests. ceil(2/3 * 4) = 3 required.
+    // Non-self count = 2 (peer1, peer2). With self included naively count would be 3 → qualifies.
+    // With self excluded, count = 2 < 3 → MinValue.
+    val self = pid("self")
+    val peer1 = pid("peer1")
+    val peer2 = pid("peer2")
+    val peer3 = pid("peer3")
+    val tipHash = hash("tip-at-50")
+    for {
+      (tracker, registry) <- setupTracker(Set(self, peer1, peer2, peer3))
+      _ <- record(tracker, self, att(tipHash, slot(50), 50L, 1000L)) // self attests
+      _ <- record(tracker, peer1, att(tipHash, slot(50), 50L, 1000L))
+      _ <- record(tracker, peer2, att(tipHash, slot(50), 50L, 1000L))
+      // peer3 does NOT attest
+      trigger <- TCountTrigger.make[IO](tracker, registry, TipTracker.FinalityThreshold)
+      st = state(self, 50L, tipHash, Map(50L -> tipHash))
+      result <- trigger.evaluate(st)
+    } yield expect.same(SnapshotOrdinal.MinValue, result)
+  }
+
+  test("TCount: ties with TWeight under equal stake (sanity check)") {
+    // Sanity check: under equal-weight stake, T_count and T_weight should qualify the same
+    // ordinal whenever the cluster's attestation set is uniform. 3-peer cluster, both non-self
+    // peers attest the canonical tip — T_weight sees 2/2 active = 1.0 ≥ 2/3 → qualifies ord=50.
+    // T_count sees 2 non-self attesters, ceil(2/3 * 3) = 2 required → qualifies ord=50.
+    val self = pid("self")
+    val peer1 = pid("peer1")
+    val peer2 = pid("peer2")
+    val tipHash = hash("tip-at-50")
+    for {
+      (tracker, registry) <- setupTracker(Set(self, peer1, peer2))
+      _ <- record(tracker, peer1, att(tipHash, slot(50), 50L, 1000L))
+      _ <- record(tracker, peer2, att(tipHash, slot(50), 50L, 1000L))
+      tWeight <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
+      tCount <- TCountTrigger.make[IO](tracker, registry, TipTracker.FinalityThreshold)
+      st = state(self, 50L, tipHash, Map(50L -> tipHash))
+      weightResult <- tWeight.evaluate(st)
+      countResult <- tCount.evaluate(st)
+    } yield expect.same(weightResult, countResult) && expect.same(ord(50L), countResult)
+  }
+
+  test("TCount: returns MinValue when count is below threshold") {
+    // 4-peer cluster, ceil(2/3 * 4) = 3 required. Only 2 non-self peers attest → count = 2 < 3.
+    val self = pid("self")
+    val peer1 = pid("peer1")
+    val peer2 = pid("peer2")
+    val peer3 = pid("peer3")
+    val tipHash = hash("tip-at-50")
+    for {
+      (tracker, registry) <- setupTracker(Set(self, peer1, peer2, peer3))
+      _ <- record(tracker, peer1, att(tipHash, slot(50), 50L, 1000L))
+      _ <- record(tracker, peer2, att(tipHash, slot(50), 50L, 1000L))
+      // peer3 does NOT attest
+      trigger <- TCountTrigger.make[IO](tracker, registry, TipTracker.FinalityThreshold)
+      st = state(self, 50L, tipHash, Map(50L -> tipHash))
       result <- trigger.evaluate(st)
     } yield expect.same(SnapshotOrdinal.MinValue, result)
   }

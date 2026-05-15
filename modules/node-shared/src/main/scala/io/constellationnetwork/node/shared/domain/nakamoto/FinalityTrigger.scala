@@ -12,8 +12,8 @@ import io.constellationnetwork.security.hash.Hash
 /** Phase 1 → Phase 2 finality trigger.
   *
   * The 4-phase finality model (see `docs/nakamoto/attestation-and-finality.md` §0) has three Phase 1→2 triggers: `T_weight` (2/3
-  * attestation), `T_count` (N/2+1 attester count — reserved for #136), and `T_depth1` (depth-k₁ confirmation). All triggers run in parallel
-  * with max-of semantics: a snapshot advances to Phase 2 as soon as ANY trigger qualifies it.
+  * attestation weight), `T_count` (1-validator-1-vote ≥ 2/3 attester count), and `T_depth1` (depth-k₁ confirmation). All triggers run in
+  * parallel with max-of semantics: a snapshot advances to Phase 2 as soon as ANY trigger qualifies it.
   *
   * Each trigger is a small monotone observable: given a `ConsensusState`, compute the highest ordinal the trigger has qualified. The result
   * may NEVER go backwards — once a trigger has qualified ordinal N, every ord ≤ N is also qualified by that trigger.
@@ -46,21 +46,21 @@ trait FinalityTrigger[F[_]] {
 
 object FinalityTrigger {
 
-  /** Tag for each Phase 1→2 trigger. Currently implemented: [[Kind.TWeight]], [[Kind.TDepth1]]. Reserved for future tasks:
-    * [[Kind.TCount]] (#136), [[Kind.TDepth2]] (#137).
+  /** Tag for each Phase 1→2 trigger. Currently implemented: [[Kind.TWeight]], [[Kind.TCount]], [[Kind.TDepth1]]. Reserved for future task:
+    * [[Kind.TDepth2]] (#137).
     */
   sealed trait Kind { def name: String }
   object Kind {
     case object TWeight extends Kind { val name = "t_weight" }
-    case object TCount extends Kind { val name = "t_count" } // reserved for #136
+    case object TCount extends Kind { val name = "t_count" }
     case object TDepth1 extends Kind { val name = "t_depth1" }
     case object TDepth2 extends Kind { val name = "t_depth2" } // reserved for #137
 
     val all: List[Kind] = List(TWeight, TCount, TDepth1, TDepth2)
   }
 
-  /** Snapshot of inputs each trigger may read at evaluation time. Concrete triggers ignore fields they don't care about. Adding a field here
-    * is the only place to update callers — keep it minimal.
+  /** Snapshot of inputs each trigger may read at evaluation time. Concrete triggers ignore fields they don't care about. Adding a field
+    * here is the only place to update callers — keep it minimal.
     *
     * The `F` is carried so `canonicalHashAt` can stay effectful (chain walk).
     *
@@ -83,8 +83,8 @@ object FinalityTrigger {
 
   /** Pure lookup: which triggers have qualified `ord`?
     *
-    * Monotonicity means a trigger qualifies `ord` iff its `latestQualifyingOrdinal >= ord`. Set-valued so all subsets are representable
-    * (a snapshot can be qualified by any combination of T_weight, T_count, T_depth1, T_depth2).
+    * Monotonicity means a trigger qualifies `ord` iff its `latestQualifyingOrdinal >= ord`. Set-valued so all subsets are representable (a
+    * snapshot can be qualified by any combination of T_weight, T_count, T_depth1, T_depth2).
     *
     * Returned as a `Set[Kind]` (not `List`) because order is irrelevant — the lookup is "did each trigger qualify yet?", not "in which
     * order did they fire?".
@@ -97,8 +97,8 @@ object FinalityTrigger {
       .traverse(t => t.latestQualifyingOrdinal.map(latest => Option.when(latest >= ord)(t.kind)))
       .map(_.flatten.toSet)
 
-  /** Helper: choose the highest `latestQualifyingOrdinal` across a list of triggers. Equivalent to today's `max(t_weight, t_depth1)`
-    * before `chainStore.finalize` — preserves the max-of semantics under any composition.
+  /** Helper: choose the highest `latestQualifyingOrdinal` across a list of triggers. Equivalent to today's `max(t_weight, t_depth1)` before
+    * `chainStore.finalize` — preserves the max-of semantics under any composition.
     */
   def maxLatestQualifyingOrdinal[F[_]: Monad](
     triggers: List[FinalityTrigger[F]]
@@ -142,8 +142,8 @@ object FinalityTrigger {
 
 /** Production builder for the `T_weight` trigger (2/3 attestation finality on the canonical chain).
   *
-  * Wraps [[TipTracker.highestFinalizedOrdinal]] — self-excludes `state.selfId` (#133), filters attestations by canonical-hash match
-  * (#119 fork-recovery-deadlock fix), and walks attestation ordinals from highest down accumulating weight.
+  * Wraps [[TipTracker.highestFinalizedOrdinal]] — self-excludes `state.selfId` (#133), filters attestations by canonical-hash match (#119
+  * fork-recovery-deadlock fix), and walks attestation ordinals from highest down accumulating weight.
   */
 object TWeightTrigger {
 
@@ -184,5 +184,85 @@ object TDepth1Trigger {
         if (qualifying > 0L) SnapshotOrdinal.unsafeApply(qualifying)
         else SnapshotOrdinal.MinValue
       Sync[F].pure(ord)
+    }
+}
+
+/** Production builder for the `T_count` trigger (1-validator-1-vote count finality on the canonical chain).
+  *
+  * Counts the number of DISTINCT attesters whose `tipHash` matches our canonical chain at their `tipOrdinal`, walks attestation ordinals
+  * from highest down, and qualifies the highest ordinal where the cumulative count reaches `ceil(threshold * validatorCount)`. Counts
+  * peers, not weights — under equal stake this ties with [[TWeightTrigger]]; under future stake-weighted VRF this is strictly stronger
+  * evidence (a single high-stake validator can hit the 2/3 *weight* threshold alone, but cannot fake a count of distinct attesters).
+  *
+  * '''Why hash-aware''': same as `T_weight`. Attesting to ordinal N on fork A must not count toward finalizing ordinal N on fork B.
+  *
+  * '''Why self-exclusion''' (task #133): a node MUST NOT count its own attestation toward its own finality threshold, otherwise it can
+  * self-finalize a divergent fork and trip the finality-safety gate in `chainStore.finalize`, locking the node out of canonical recovery
+  * (the "fork-recovery deadlock" of #119). Parity with [[TWeightTrigger]].
+  *
+  * '''Denominator''': `validatorCount` (full seedlist), NOT the observed-active set. Counting against the full validator set means a
+  * partition that loses 1/3 of the network correctly DOES NOT count-finalize (count below 2/3 of full). This is intentional — depth-k
+  * fallback (T_depth1) handles the partitioned case.
+  */
+object TCountTrigger {
+
+  /** @param tipTracker
+    *   attestation accumulator. Read for `allAttestations`.
+    * @param stakeRegistry
+    *   validator registry. Read for `validatorCount` (the threshold denominator — full seedlist).
+    * @param threshold
+    *   fraction of validators required (e.g. `TipTracker.FinalityThreshold` = 2/3). Reuses the same env knob as `T_weight` so both 2/3
+    *   triggers share one configuration surface.
+    */
+  def make[F[_]: Sync](
+    tipTracker: TipTracker[F],
+    stakeRegistry: StakeRegistry[F],
+    threshold: Ratio
+  ): F[FinalityTrigger[F]] =
+    FinalityTrigger.fromRef[F](FinalityTrigger.Kind.TCount, SnapshotOrdinal.MinValue) { state =>
+      for {
+        attestations <- tipTracker.allAttestations
+        validatorCount <- stakeRegistry.validatorCount
+        // Self-exclusion (#133): drop our own attestation before the canonical-hash filter.
+        // Parity with TWeight — see the docstring on this object for why.
+        nonSelf = attestations.iterator.filter { case (peerId, _) => peerId =!= state.selfId }.toList
+        // Canonical-hash filter: keep only attestations whose tipHash is on our chain at their
+        // tipOrdinal. Attestations on other forks contribute zero count for finalizing our chain.
+        onChainOrdinals <- nonSelf.traverse[F, Option[Long]] {
+          case (_, att) =>
+            state.canonicalHashAt(att.tipOrdinal).map {
+              case Some(localHash) if localHash === att.tipHash => Some(att.tipOrdinal)
+              case _                                            => None
+            }
+        }
+      } yield {
+        // GRANDPA ancestor rule (parity with TWeight): attesting to ord N with a hash on our
+        // canonical chain implicitly attests to all ancestors of that hash. Walk from highest
+        // ordinal down, accumulating the count of distinct peers reached so far. The highest
+        // ordinal at which the cumulative count meets the threshold is T_count's qualifying ord.
+        //
+        // Each peer's latest attestation supersedes earlier ones (TipTracker.recordAttestation
+        // contract), so the map is already keyed by peer — `nonSelf` has at most one entry per
+        // peer, which becomes one ordinal in `onChainOrdinals`. No de-duplication needed here.
+        val sortedDesc = onChainOrdinals.flatten.sorted(Ordering[Long].reverse)
+        // Exact threshold count: smallest n such that n * thresholdDenom >= thresholdNum * validatorCount.
+        // This matches `n / validatorCount >= threshold` without IEEE 754 division (Ratio is BigInt math).
+        // Note: at validatorCount=0 the required count is 0, but `sortedDesc` is also empty (no peers ⇒
+        // no attestations), so `collectFirst` yields None → MinValue. Safe in cold-start.
+        val thresholdNum = threshold.numerator
+        val thresholdDen = threshold.denominator
+        // ceil(thresholdNum * validatorCount / thresholdDen) — done with BigInt to avoid Long overflow
+        // and stay consensus-deterministic with the rest of the Ratio path.
+        val required: BigInt = {
+          val target = thresholdNum * BigInt(validatorCount)
+          val q = target / thresholdDen
+          if (target % thresholdDen == 0) q else q + 1
+        }
+        var cumCount: BigInt = BigInt(0)
+        sortedDesc.collectFirst {
+          case ordinal if { cumCount = cumCount + 1; cumCount >= required } =>
+            SnapshotOrdinal.unsafeApply(ordinal)
+        }.getOrElse(SnapshotOrdinal.MinValue)
+      }
     }
 }
