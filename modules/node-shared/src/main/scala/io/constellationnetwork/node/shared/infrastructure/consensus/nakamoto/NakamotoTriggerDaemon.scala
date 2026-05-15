@@ -112,10 +112,16 @@ object NakamotoTriggerDaemon {
               val pkHex = Hex(vrfPK.map("%02x".format(_)).mkString)
               val etaHash = Hash(state.currentEta.map("%02x".format(_)).mkString)
               val vrfOutputHex = Hex(vrfOutput.map("%02x".format(_)).mkString)
+              // Parent slot = lastProducedSlot when present, else genesis (Slot.MinValue).
+              // Mirrors the slot used to derive `slotGap` above so the verifier's
+              // slotGap = cert.slot - cert.parentSlot reconstruction agrees.
+              val parentSlotRefined = state.lastProducedSlot
+                .map(s => Slot(NonNegLong.unsafeFrom(math.max(0L, s))))
+                .getOrElse(Slot.MinValue)
               val cert =
                 SlotCertificate(
                   slotRefined,
-                  Slot.MinValue,
+                  parentSlotRefined,
                   VrfProof(proofHex),
                   VrfOutput(vrfOutputHex),
                   VrfPublicKey(pkHex),

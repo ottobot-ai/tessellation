@@ -116,7 +116,11 @@ object NakamotoProposer {
                 Some(
                   SlotCertificate(
                     slot = currentSlot,
-                    parentSlot = Slot.MinValue, // TODO: wire actual parent slot
+                    // `lastSlot` is the slot of the parent snapshot (the last one this proposer
+                    // recorded as finalized via `recordFinalization` / `epochState.recordProduction`).
+                    // The verifier reconstructs slotGap = cert.slot - cert.parentSlot — for that
+                    // identity to hold, parentSlot MUST match the slot used to derive `slotGap` here.
+                    parentSlot = lastSlot,
                     vrfProof = VrfProof.fromBytes(proof),
                     vrfOutput = VrfOutput.fromBytes(vrfOut),
                     vrfPublicKey = VrfPublicKey.fromBytes(vrfVK),

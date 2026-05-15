@@ -376,6 +376,37 @@ object NakamotoProposerSuite extends SimpleIOSuite {
     findEligibleAndCheckFields().map(correct => expect(correct, "Certificate should contain correct eta, vrfPublicKey, and slot"))
   }
 
+  // ============ Test 9b: certificate carries the actual parent slot (regression for #134) ============
+
+  test("certificate.parentSlot matches epochState.lastProducedSlot (was Slot.MinValue placeholder before #134)") {
+    // Pre-fix, `evaluateSlot` hard-coded `parentSlot = Slot.MinValue`. The verifier
+    // (NakamotoSyncDaemon) reconstructs slotGap = cert.slot - cert.parentSlot, so
+    // for any non-genesis snapshot a MinValue placeholder would inflate the slotGap
+    // to `currentSlot`, picking the wrong LDD threshold. The proposer must thread
+    // the parent slot (== epochState.lastProducedSlot at the moment of evaluation)
+    // through every `SlotCertificate` it emits.
+    val parentSlotLong = 80L
+    def findEligibleAndCheckParentSlot(attempts: Int = 0): IO[Boolean] =
+      if (attempts >= 2000) IO.pure(false)
+      else {
+        val sk = randomSk()
+        for {
+          (proposer, _, _, _) <- makeFixtures(vrfSK = sk, lastProducedSlot = Slot.unsafeApply(parentSlotLong))
+          maybeCert <- proposer.evaluateSlot(Slot.unsafeApply(100L)) // slotGap = 20, in ramp/recovery
+          result <- maybeCert match {
+            case Some(cert) =>
+              IO.pure(cert.parentSlot == Slot.unsafeApply(parentSlotLong) && cert.slot == Slot.unsafeApply(100L))
+            case None =>
+              findEligibleAndCheckParentSlot(attempts + 1)
+          }
+        } yield result
+      }
+
+    findEligibleAndCheckParentSlot().map(ok =>
+      expect(ok, s"SlotCertificate.parentSlot should equal lastProducedSlot=$parentSlotLong, not Slot.MinValue")
+    )
+  }
+
   // ============ Test 10: multi-winner scenario ============
 
   test("multi-winner scenario: two proposers both eligible for same slot") {
