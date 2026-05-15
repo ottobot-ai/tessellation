@@ -266,7 +266,6 @@ object Main
                   cfg.l0Peer,
                   cfg.seedlistPath,
                   cfg.collateralAmount,
-                  cfg.trustRatingsPath,
                   cfg.prioritySeedlistPath,
                   cfg.allowanceListPath
                 )
@@ -281,7 +280,6 @@ object Main
                   cfg.l0Peer,
                   cfg.seedlistPath,
                   cfg.collateralAmount,
-                  cfg.trustRatingsPath,
                   cfg.prioritySeedlistPath,
                   _,
                   cfg.allowanceListPath
@@ -302,7 +300,6 @@ object Main
                   cfg.l0Peer,
                   cfg.seedlistPath,
                   cfg.collateralAmount,
-                  cfg.trustRatingsPath,
                   cfg.prioritySeedlistPath,
                   _,
                   cfg.allowanceListPath
@@ -324,7 +321,6 @@ object Main
                   cfg.l0Peer,
                   cfg.seedlistPath,
                   cfg.collateralAmount,
-                  cfg.trustRatingsPath,
                   cfg.prioritySeedlistPath,
                   cfg.allowanceListPath
                 )
@@ -339,7 +335,6 @@ object Main
                   cfg.l0Peer,
                   cfg.seedlistPath,
                   cfg.collateralAmount,
-                  cfg.trustRatingsPath,
                   cfg.prioritySeedlistPath,
                   _,
                   cfg.allowanceListPath

@@ -32,8 +32,7 @@ object P2PClient {
       BlockConsensusClient.make(client),
       L0GlobalSnapshotClient.make(client, none, sharedConfig.snapshotTimeoutsConfig),
       SwapConsensusClient.make(client),
-      TokenLockConsensusClient.make(client),
-      L0TrustClient.make(client)
+      TokenLockConsensusClient.make(client)
     ) {}
 }
 
@@ -47,6 +46,5 @@ sealed abstract class P2PClient[F[_]] private (
   val blockConsensus: BlockConsensusClient[F],
   val l0GlobalSnapshot: L0GlobalSnapshotClient[F],
   val swapConsensusClient: SwapConsensusClient[F],
-  val tokenLockConsensusClient: TokenLockConsensusClient[F],
-  val l0Trust: L0TrustClient[F]
+  val tokenLockConsensusClient: TokenLockConsensusClient[F]
 )

@@ -294,7 +294,6 @@ abstract class CurrencyL0App(
                       rv.collateralAmount,
                       rv.globalL0Peer,
                       rv.identifier,
-                      rv.trustRatingsPath,
                       _,
                       rv.allowanceListPath
                     )
@@ -328,7 +327,6 @@ abstract class CurrencyL0App(
                       m.collateralAmount,
                       m.globalL0Peer,
                       m.identifier,
-                      m.trustRatingsPath,
                       m.allowanceListPath
                     )
                   ) >>
@@ -344,7 +342,6 @@ abstract class CurrencyL0App(
                       m.collateralAmount,
                       m.globalL0Peer,
                       m.identifier,
-                      m.trustRatingsPath,
                       _,
                       m.allowanceListPath
                     )
@@ -415,7 +412,6 @@ abstract class CurrencyL0App(
                       rr.collateralAmount,
                       rr.globalL0Peer,
                       rr.identifier,
-                      rr.trustRatingsPath,
                       rr.allowanceListPath
                     )
                   ) >>
@@ -431,7 +427,6 @@ abstract class CurrencyL0App(
                       rr.collateralAmount,
                       rr.globalL0Peer,
                       rr.identifier,
-                      rr.trustRatingsPath,
                       _,
                       rr.allowanceListPath
                     )
@@ -530,7 +525,6 @@ abstract class CurrencyL0App(
                         m.collateralAmount,
                         m.globalL0Peer,
                         identifier,
-                        m.trustRatingsPath,
                         m.allowanceListPath
                       )
                     ) >>
@@ -546,7 +540,6 @@ abstract class CurrencyL0App(
                           m.collateralAmount,
                           m.globalL0Peer,
                           identifier,
-                          m.trustRatingsPath,
                           _,
                           m.allowanceListPath
                         )

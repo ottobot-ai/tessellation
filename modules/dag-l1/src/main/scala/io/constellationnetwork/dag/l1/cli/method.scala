@@ -6,7 +6,6 @@ import cats.syntax.all._
 import io.constellationnetwork.dag.l1.config.types._
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.env.env._
-import io.constellationnetwork.node.shared.cli.opts.trustRatingsPathOpts
 import io.constellationnetwork.node.shared.cli.{CliMethod, CollateralAmountOpts, L0PeerOpts}
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.node.shared.infrastructure.{DagL1, L1Layer}
@@ -15,7 +14,6 @@ import io.constellationnetwork.schema.cluster.PeerToJoin
 import io.constellationnetwork.schema.peer.L0Peer
 
 import com.monovore.decline.Opts
-import fs2.io.file.Path
 
 object method {
 
@@ -47,7 +45,6 @@ object method {
     l0Peer: L0Peer,
     seedlistPath: Option[SeedListPath],
     collateralAmount: Option[Amount],
-    trustRatingsPath: Option[Path],
     prioritySeedlistPath: Option[SeedListPath],
     allowanceListPath: Option[AllowanceListPath]
   ) extends Run
@@ -64,7 +61,6 @@ object method {
         L0PeerOpts.opts,
         SeedListPath.opts,
         CollateralAmountOpts.opts,
-        trustRatingsPathOpts,
         SeedListPath.priorityOpts,
         AllowanceListPath.opts
       ).mapN(RunInitialValidator.apply)
@@ -80,7 +76,6 @@ object method {
     l0Peer: L0Peer,
     seedlistPath: Option[SeedListPath],
     collateralAmount: Option[Amount],
-    trustRatingsPath: Option[Path],
     prioritySeedlistPath: Option[SeedListPath],
     majorityForkPeerIds: NonEmptySet[PeerToJoin],
     allowanceListPath: Option[AllowanceListPath]
@@ -95,7 +90,6 @@ object method {
     l0Peer: L0Peer,
     seedlistPath: Option[SeedListPath],
     collateralAmount: Option[Amount],
-    trustRatingsPath: Option[Path],
     prioritySeedlistPath: Option[SeedListPath],
     allowanceListPath: Option[AllowanceListPath]
   ) extends Run
@@ -112,7 +106,6 @@ object method {
         L0PeerOpts.opts,
         SeedListPath.opts,
         CollateralAmountOpts.opts,
-        trustRatingsPathOpts,
         SeedListPath.priorityOpts,
         AllowanceListPath.opts
       ).mapN(RunValidator.apply)

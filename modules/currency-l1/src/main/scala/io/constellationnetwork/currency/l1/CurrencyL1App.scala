@@ -282,7 +282,6 @@ abstract class CurrencyL1App(
                   cfg.identifier,
                   cfg.seedlistPath,
                   cfg.collateralAmount,
-                  cfg.trustRatingsPath,
                   cfg.prioritySeedlistPath,
                   cfg.allowanceListPath
                 )

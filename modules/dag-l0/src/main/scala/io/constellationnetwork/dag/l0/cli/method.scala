@@ -7,7 +7,7 @@ import io.constellationnetwork.env._
 import io.constellationnetwork.env.env._
 import io.constellationnetwork.ext.decline.WithOpts
 import io.constellationnetwork.ext.decline.decline._
-import io.constellationnetwork.node.shared.cli.opts.{genesisPathOpts, trustRatingsPathOpts}
+import io.constellationnetwork.node.shared.cli.opts.genesisPathOpts
 import io.constellationnetwork.node.shared.cli.{CliMethod, CollateralAmountOpts}
 import io.constellationnetwork.node.shared.config.MainnetRewardsConfig
 import io.constellationnetwork.node.shared.config.types._
@@ -46,7 +46,6 @@ object method {
     environment: AppEnvironment,
     seedlistPath: Option[SeedListPath],
     collateralAmount: Option[Amount],
-    trustRatingsPath: Option[Path],
     prioritySeedlistPath: Option[SeedListPath],
     allowanceListPath: Option[AllowanceListPath],
     // Bootstrap source flags (all optional — auto-detect picks the right path)
@@ -57,7 +56,6 @@ object method {
   ) extends CliMethod {
 
     def appConfig(c: AppConfigReader, shared: SharedConfig): AppConfig = AppConfig(
-      trust = c.trust,
       rewards = MainnetRewardsConfig.classicMainnetRewardsConfig,
       snapshot = c.snapshot,
       stateChannel = c.stateChannel,
@@ -98,7 +96,6 @@ object method {
         AppEnvironment.opts,
         SeedListPath.opts,
         CollateralAmountOpts.opts,
-        trustRatingsPathOpts,
         SeedListPath.priorityOpts,
         AllowanceListPath.opts,
         genesisPathOpt,

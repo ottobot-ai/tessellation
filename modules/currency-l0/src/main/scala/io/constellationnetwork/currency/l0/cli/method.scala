@@ -13,7 +13,7 @@ import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.env.env._
 import io.constellationnetwork.ext.decline.WithOpts
 import io.constellationnetwork.node.shared.cli._
-import io.constellationnetwork.node.shared.cli.opts.{genesisBalancesOpts, genesisPathOpts, trustRatingsPathOpts}
+import io.constellationnetwork.node.shared.cli.opts.{genesisBalancesOpts, genesisPathOpts}
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
@@ -51,7 +51,6 @@ object method {
       CollateralConfig(
         amount = collateralAmount.getOrElse(Amount(NonNegLong.MinValue))
       ),
-      c.trust.storage,
       c.priorityPeerIds.get(environment),
       c.snapshot.size,
       c.feeConfigs.get(environment).map(SortedMap.from(_)).getOrElse(SortedMap.empty),
@@ -86,7 +85,6 @@ object method {
     prioritySeedlistPath: Option[SeedListPath],
     collateralAmount: Option[Amount],
     globalL0Peer: L0Peer,
-    trustRatingsPath: Option[Path],
     lastKryoHashOrdinal: SnapshotOrdinal,
     allowanceListPath: Option[AllowanceListPath]
   ) extends Run
@@ -105,7 +103,6 @@ object method {
         SeedListPath.priorityOpts,
         CollateralAmountOpts.opts,
         GlobalL0PeerOpts.opts,
-        trustRatingsPathOpts,
         Opts.apply(SnapshotOrdinal.MinValue),
         AllowanceListPath.opts
       ).mapN(CreateGenesis.apply)
@@ -123,7 +120,6 @@ object method {
     prioritySeedlistPath: Option[SeedListPath],
     collateralAmount: Option[Amount],
     globalL0Peer: L0Peer,
-    trustRatingsPath: Option[Path],
     lastKryoHashOrdinal: SnapshotOrdinal,
     allowanceListPath: Option[AllowanceListPath],
     metagraphOwnerMessagePath: Option[MetagraphOwnerMessagePath]
@@ -143,7 +139,6 @@ object method {
         SeedListPath.priorityOpts,
         CollateralAmountOpts.opts,
         GlobalL0PeerOpts.opts,
-        trustRatingsPathOpts,
         Opts(SnapshotOrdinal.MinValue),
         AllowanceListPath.opts,
         MetagraphOwnerMessagePath.opts
@@ -159,7 +154,6 @@ object method {
           seedListPriorityPath,
           collateralAmount,
           globalL0Peer,
-          trustRatingsPath,
           snapshotOrdinal,
           allowanceListPath,
           maybeOwnerMessage
@@ -175,7 +169,6 @@ object method {
             seedListPriorityPath,
             collateralAmount,
             globalL0Peer,
-            trustRatingsPath,
             snapshotOrdinal,
             allowanceListPath,
             maybeOwnerMessage
@@ -200,7 +193,6 @@ object method {
     collateralAmount: Option[Amount],
     globalL0Peer: L0Peer,
     identifier: Address,
-    trustRatingsPath: Option[Path],
     allowanceListPath: Option[AllowanceListPath]
   ) extends Run
 
@@ -215,7 +207,6 @@ object method {
     collateralAmount: Option[Amount],
     globalL0Peer: L0Peer,
     identifier: Address,
-    trustRatingsPath: Option[Path],
     majorityForkPeerIds: NonEmptySet[PeerToJoin],
     allowanceListPath: Option[AllowanceListPath]
   ) extends Run
@@ -234,7 +225,6 @@ object method {
         CollateralAmountOpts.opts,
         GlobalL0PeerOpts.opts,
         L0TokenIdentifierOpts.opts,
-        trustRatingsPathOpts,
         AllowanceListPath.opts
       ).mapN(RunValidator.apply)
     }
@@ -251,7 +241,6 @@ object method {
     collateralAmount: Option[Amount],
     globalL0Peer: L0Peer,
     identifier: Address,
-    trustRatingsPath: Option[Path],
     allowanceListPath: Option[AllowanceListPath]
   ) extends Run
 
@@ -269,7 +258,6 @@ object method {
         CollateralAmountOpts.opts,
         GlobalL0PeerOpts.opts,
         L0TokenIdentifierOpts.opts,
-        trustRatingsPathOpts,
         AllowanceListPath.opts
       ).mapN(RunRollback.apply)
     }

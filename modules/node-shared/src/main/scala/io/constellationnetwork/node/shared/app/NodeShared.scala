@@ -17,8 +17,7 @@ import io.constellationnetwork.node.shared.modules._
 import io.constellationnetwork.node.shared.resources.SharedResources
 import io.constellationnetwork.schema.generation.Generation
 import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.schema.trust.PeerObservationAdjustmentUpdateBatch
-import io.constellationnetwork.schema.{CurrencyStateProofSelector, GlobalStateProofSelector, StateProofSelector}
+import io.constellationnetwork.schema.{CurrencyStateProofSelector, GlobalStateProofSelector}
 import io.constellationnetwork.security.{HashSelect, HasherSelector, SecurityProvider}
 
 import fs2.concurrent.SignallingRef
@@ -39,7 +38,6 @@ trait NodeShared[F[_], A <: CliMethod] {
   lazy val nodeId: PeerId = PeerId.fromPublic(keyPair.getPublic)
   val generation: Generation
   val seedlist: Option[Set[SeedlistEntry]]
-  val trustRatings: Option[PeerObservationAdjustmentUpdateBatch]
 
   val sharedConfig: SharedConfig
 

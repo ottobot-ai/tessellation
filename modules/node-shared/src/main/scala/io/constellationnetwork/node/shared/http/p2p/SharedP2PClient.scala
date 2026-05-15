@@ -21,8 +21,7 @@ object SharedP2PClient {
       SignClient.make[F](client),
       ClusterClient.make[F](client, session),
       GossipClient.make[F](client, session, sharedConfig.gossip.timeouts),
-      NodeClient.make[F](client, session),
-      TrustClient.make[F](client, session)
+      NodeClient.make[F](client, session)
     ) {}
 
 }
@@ -31,6 +30,5 @@ sealed abstract class SharedP2PClient[F[_]] private (
   val sign: SignClient[F],
   val cluster: ClusterClient[F],
   val gossip: GossipClient[F],
-  val node: NodeClient[F],
-  val trust: TrustClient[F]
+  val node: NodeClient[F]
 )

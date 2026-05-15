@@ -9,7 +9,6 @@ import cats.syntax.traverse._
 
 import io.constellationnetwork.dag.l0.config.types.AppConfig
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotEventsPublisherDaemon
-import io.constellationnetwork.dag.l0.infrastructure.trust.TrustStorageUpdater
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.domain.Daemon
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
@@ -39,8 +38,6 @@ object Daemons {
   ): F[Unit] =
     List[Daemon[F]](
       NodeStateDaemon.make(storages.node, services.gossip),
-      // Trust score daemons disabled on GL0 — not used. Storage/service still constructed.
-      // Daemon.periodic(storages.trust.updateTrustWithBiases(nodeId), cfg.trust.daemon.interval),
       GlobalSnapshotEventsPublisherDaemon
         .make(
           queues.stateChannelOutput,
@@ -58,7 +55,6 @@ object Daemons {
           cfg.snapshot.consensus
         ),
       CollateralDaemon.make(services.collateral, storages.globalSnapshot, storages.cluster)
-      // TrustStorageUpdater.daemon(services.trustStorageUpdater) — disabled on GL0
     ).traverse(_.start).void
 
 }

@@ -11,7 +11,6 @@ import io.constellationnetwork.dag.l1.config.types.{AppConfig, AppConfigReader}
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.env.env._
 import io.constellationnetwork.node.shared.cli._
-import io.constellationnetwork.node.shared.cli.opts.trustRatingsPathOpts
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.node.shared.infrastructure.L1Layer
 import io.constellationnetwork.schema.address.Address
@@ -21,7 +20,6 @@ import io.constellationnetwork.schema.peer.L0Peer
 
 import com.monovore.decline.Opts
 import eu.timepit.refined.types.numeric.NonNegLong
-import fs2.io.file.Path
 
 object method {
 
@@ -48,7 +46,6 @@ object method {
       CollateralConfig(
         amount = collateralAmount.getOrElse(Amount(NonNegLong.MinValue))
       ),
-      c.trust.storage,
       c.priorityPeerIds.get(environment),
       c.snapshot.size,
       c.feeConfigs.get(environment).map(SortedMap.from(_)).getOrElse(SortedMap.empty),
@@ -83,7 +80,6 @@ object method {
     identifier: Address,
     seedlistPath: Option[SeedListPath],
     collateralAmount: Option[Amount],
-    trustRatingsPath: Option[Path],
     prioritySeedlistPath: Option[SeedListPath],
     allowanceListPath: Option[AllowanceListPath]
   ) extends Run
@@ -102,7 +98,6 @@ object method {
         L0TokenIdentifierOpts.opts,
         SeedListPath.opts,
         CollateralAmountOpts.opts,
-        trustRatingsPathOpts,
         SeedListPath.priorityOpts,
         AllowanceListPath.opts
       ).mapN(RunInitialValidator.apply)
@@ -120,7 +115,6 @@ object method {
     identifier: Address,
     seedlistPath: Option[SeedListPath],
     collateralAmount: Option[Amount],
-    trustRatingsPath: Option[Path],
     prioritySeedlistPath: Option[SeedListPath],
     majorityForkPeerIds: NonEmptySet[PeerToJoin],
     allowanceListPath: Option[AllowanceListPath]
@@ -137,7 +131,6 @@ object method {
     identifier: Address,
     seedlistPath: Option[SeedListPath],
     collateralAmount: Option[Amount],
-    trustRatingsPath: Option[Path],
     prioritySeedlistPath: Option[SeedListPath],
     allowanceListPath: Option[AllowanceListPath]
   ) extends Run
@@ -156,7 +149,6 @@ object method {
         L0TokenIdentifierOpts.opts,
         SeedListPath.opts,
         CollateralAmountOpts.opts,
-        trustRatingsPathOpts,
         SeedListPath.priorityOpts,
         AllowanceListPath.opts
       ).mapN(RunValidator.apply)

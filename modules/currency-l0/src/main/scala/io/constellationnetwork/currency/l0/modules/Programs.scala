@@ -41,8 +41,7 @@ object Programs {
     val peerSelect: PeerSelect[F] =
       PeerSelect.make(
         storages.cluster,
-        p2pClient.currencySnapshot,
-        p2pClient.l0Trust.getCurrentTrust.run(globalL0Peer)
+        p2pClient.currencySnapshot
       )
     val download = Download
       .make(

@@ -14,7 +14,6 @@ import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.peer.PeerId
 
 import eu.timepit.refined.auto._
-import fs2.io.file.Path
 
 object CliMethod {
   val collateralConfig: (AppEnvironment, Option[Amount]) => CollateralConfig = (environment: AppEnvironment, amount: Option[Amount]) =>
@@ -45,8 +44,6 @@ trait CliMethod {
 
   val stateChannelAllowanceLists: Option[Map[Address, NonEmptySet[PeerId]]]
 
-  val trustRatingsPath: Option[Path]
-
   val httpConfig: HttpConfig
 
   val collateralAmount: Option[Amount]
@@ -60,7 +57,6 @@ trait CliMethod {
     c.leavingDelay,
     c.stateAfterJoining,
     CliMethod.collateralConfig(environment, collateralAmount),
-    c.trust.storage,
     c.priorityPeerIds.get(environment),
     c.snapshot.size,
     c.feeConfigs.get(environment).map(SortedMap.from(_)).getOrElse(SortedMap.empty),

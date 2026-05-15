@@ -28,7 +28,6 @@ import io.constellationnetwork.node.shared.infrastructure.cluster.services.Sessi
 import io.constellationnetwork.node.shared.infrastructure.logs.LoggerConfigurator
 import io.constellationnetwork.node.shared.infrastructure.metrics.MetricsFactory
 import io.constellationnetwork.node.shared.infrastructure.seedlist.{Loader => SeedlistLoader}
-import io.constellationnetwork.node.shared.infrastructure.trust.TrustRatingCsvLoader
 import io.constellationnetwork.node.shared.logger.{ClickHouseLoggerBundle, Slf4jLoggerBundle}
 import io.constellationnetwork.node.shared.modules._
 import io.constellationnetwork.node.shared.resources.SharedResources
@@ -190,7 +189,6 @@ abstract class TessellationIOApp[A <: CliMethod](
                                         _seedlist <- loadSeedlist("Seedlist", method.seedlistPath).asResource
                                         _l0Seedlist <- loadSeedlist("l0Seedlist", method.l0SeedlistPath).asResource
                                         _prioritySeedlist <- loadSeedlist("prioritySeedlist", method.prioritySeedlistPath).asResource
-                                        _trustRatings <- method.trustRatingsPath.traverse(TrustRatingCsvLoader.make[IO].load).asResource
                                         maybeCustomAllowanceList <- loadAllowanceList("allowanceList", method.allowanceListPath).asResource
                                         storages <- _hasherSelector
                                           .withCurrent(implicit hasher => SharedStorages.make[IO](clusterId, cfg))
@@ -298,7 +296,6 @@ abstract class TessellationIOApp[A <: CliMethod](
                                           val keyPair = _keyPair
                                           val seedlist = _seedlist
                                           val generation = _generation
-                                          val trustRatings = _trustRatings
 
                                           val sharedConfig = cfg
 

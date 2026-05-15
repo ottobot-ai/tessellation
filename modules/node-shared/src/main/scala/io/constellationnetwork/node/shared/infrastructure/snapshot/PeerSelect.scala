@@ -5,7 +5,7 @@ import cats.data.NonEmptyList
 import cats.effect.Async
 import cats.effect.std.Random
 import cats.effect.syntax.concurrent._
-import cats.syntax.either._
+import cats.syntax.applicative._
 import cats.syntax.eq._
 import cats.syntax.flatMap._
 import cats.syntax.functor._
@@ -21,19 +21,27 @@ import io.constellationnetwork.schema.node.NodeState.Ready
 import io.constellationnetwork.schema.peer.Peer.toP2PContext
 import io.constellationnetwork.schema.peer.{L0Peer, Peer}
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo}
-import io.constellationnetwork.schema.trust.{TrustScores, TrustValueRefined, TrustValueRefinement}
 import io.constellationnetwork.security.hash.Hash
 
 import derevo.cats.show
 import derevo.circe.magnolia.encoder
 import derevo.derive
-import eu.timepit.refined.auto._
-import eu.timepit.refined.numeric.Positive
-import eu.timepit.refined.refineV
-import eu.timepit.refined.types.numeric.PosInt
 import io.circe.syntax.EncoderOps
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
+/** Peer selection for snapshot download.
+  *
+  * Selects a single L0 peer whose snapshot ordinal is in the majority cohort and whose snapshot hash for that ordinal is in the majority
+  * cohort.
+  *
+  * Selection process:
+  *   1. Filter ready peers and uniformly sample up to `maxSampleSize` candidates. 2. Query each candidate's latest snapshot ordinal; the
+  *      most popular ordinal becomes `majorityOrdinal`. 3. Query each candidate's snapshot hash at `majorityOrdinal`; the largest
+  *      hash-equivalence class wins. 4. Pick one peer uniformly at random from the winning class.
+  *
+  * History: previously this module fed peer weights from a TrustStorage/l0Trust scoring stack; that machinery was never wired into
+  * consensus and was removed. Selection is now purely uniform sampling + majority consensus on ordinals/hashes.
+  */
 object PeerSelect {
   val peerSelectLoggerName = "PeerSelectLogger"
 
@@ -49,17 +57,14 @@ object PeerSelect {
   )
 
   val maxConcurrentPeerInquiries = 10
-  val peerSampleRatio = 0.25
-  val minSampleSize: PosInt = 20
-  val defaultPeerTrustScore: TrustValueRefined = 1e-4
+  val maxSampleSize: Int = 20
 
   case object NoPeersToSelect extends NoStackTrace
   case object NoHashes extends NoStackTrace
 
   def make[F[_]: Async: Random, S <: Snapshot, SI <: SnapshotInfo[_]](
     storage: ClusterStorage[F],
-    snapshotClient: SnapshotClient[F, S, SI],
-    getTrustScores: F[TrustScores]
+    snapshotClient: SnapshotClient[F, S, SI]
   ): PeerSelect[F] = new PeerSelect[F] {
 
     val logger = Slf4jLogger.getLoggerFromName[F](peerSelectLoggerName)
@@ -103,26 +108,11 @@ object PeerSelect {
         selectedPeer
       )
 
+    /** Uniform-random sample (without replacement) of up to `maxSampleSize` peers. */
     def getPeerSublist(peers: Set[Peer]): F[List[Peer]] = {
-      val sampleSize = Math.max((peers.size * peerSampleRatio).toInt, minSampleSize)
-
-      for {
-        scores <- getTrustScores.map(_.scores)
-        refinedScores = scores.view
-          .mapValues(score => refineV[TrustValueRefinement](score))
-          .collect {
-            case (key, Right(s)) =>
-              key -> s
-          }
-          .toMap
-        candidates = peers.map { p =>
-          p -> refinedScores.getOrElse(p.id, defaultPeerTrustScore)
-        }.toMap
-        size <- MonadThrow[F].fromEither(
-          refineV[Positive](sampleSize).leftMap(new IllegalStateException(_))
-        )
-        samples <- WeightedProspect.sample(candidates, size)
-      } yield samples
+      val peerList = peers.toList
+      if (peerList.size <= maxSampleSize) peerList.pure[F]
+      else Random[F].shuffleList(peerList).map(_.take(maxSampleSize))
     }
 
     def getSnapshotHashByPeer(peer: Peer, ordinal: SnapshotOrdinal): F[Option[(Peer, Hash)]] =

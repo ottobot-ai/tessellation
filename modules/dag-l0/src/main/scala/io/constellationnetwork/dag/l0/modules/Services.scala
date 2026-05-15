@@ -18,7 +18,6 @@ import io.constellationnetwork.dag.l0.infrastructure.mempool.GlobalEventMempool
 import io.constellationnetwork.dag.l0.infrastructure.rewards._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
-import io.constellationnetwork.dag.l0.infrastructure.trust.TrustStorageUpdater
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
@@ -209,8 +208,6 @@ object Services {
         Some(sharedStorages.mptStore)
       )
       collateralService = MptStoreCollateral.make[F](cfg.collateral, sharedStorages.mptStore)
-      getOrdinal = storages.globalSnapshot.headSnapshot.map(_.map(_.ordinal))
-      trustUpdaterService = TrustStorageUpdater.make(getOrdinal, sharedServices.gossip, storages.trust)
       recoveryPeerHintService <- RecoveryPeerHint.make[F].toResource
     } yield
       new Services[F, R](
@@ -222,7 +219,6 @@ object Services {
         address = addressService,
         collateral = collateralService,
         stateChannel = stateChannelService,
-        trustStorageUpdater = trustUpdaterService,
         restart = sharedServices.restart,
         rewards = rewardsService,
         recoveryPeerHint = recoveryPeerHintService,
@@ -241,7 +237,6 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   val address: AddressService[F, GlobalIncrementalSnapshot],
   val collateral: Collateral[F],
   val stateChannel: StateChannelService[F],
-  val trustStorageUpdater: TrustStorageUpdater[F],
   val restart: RestartService[F, R],
   val rewards: RewardsService[F],
   val recoveryPeerHint: RecoveryPeerHint[F],

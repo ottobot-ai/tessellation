@@ -17,7 +17,6 @@ import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.peer.SignRequest
 import io.constellationnetwork.schema.snapshot.StateProof
 import io.constellationnetwork.schema.transaction._
-import io.constellationnetwork.schema.trust.PublicTrust
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.Signed.SignedOrdering
 import io.constellationnetwork.security.signature.signature.SignatureProof
@@ -55,7 +54,9 @@ package object shared {
     NodeState.Ready.getClass -> 323,
     NodeState.Leaving.getClass -> 324,
     NodeState.Offline.getClass -> 325,
-    classOf[PublicTrust] -> 326,
+    // 326 retired: was classOf[PublicTrust] from removed TrustStorage stack. Slot intentionally left vacant
+    // so we do not reuse the ID and break replay of any historical kryo-encoded artifacts that still
+    // reference it. New registrations should pick fresh IDs.
     classOf[Ordinal] -> 327,
     classOf[CommonRumorRaw] -> 328,
     classOf[Transaction] -> 329,

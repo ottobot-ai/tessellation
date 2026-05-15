@@ -76,7 +76,6 @@ object types {
     leavingDelay: FiniteDuration,
     stateAfterJoining: NodeState,
     collateral: Option[CollateralConfig],
-    trust: SharedTrustConfig,
     snapshot: SharedSnapshotConfig,
     feeConfigs: Map[AppEnvironment, Map[SnapshotOrdinal, FeeCalculatorConfig]],
     forkInfoStorage: ForkInfoStorageConfig,
@@ -104,7 +103,6 @@ object types {
     leavingDelay: FiniteDuration,
     stateAfterJoining: NodeState,
     collateral: CollateralConfig,
-    trustStorage: TrustStorageConfig,
     priorityPeerIds: Option[NonEmptySet[PeerId]],
     snapshotSize: SnapshotSizeConfig,
     feeConfigs: SortedMap[SnapshotOrdinal, FeeCalculatorConfig],
@@ -125,10 +123,6 @@ object types {
     snapshotTimeoutsConfig: SnapshotTimeoutsConfig,
     clickHouseConfig: ClickHouseAppConfig,
     mptSnapshotInfoPath: Path
-  )
-
-  case class SharedTrustConfig(
-    storage: TrustStorageConfig
   )
 
   case class SharedSnapshotConfig(
@@ -354,13 +348,6 @@ object types {
     oneTimeRewards: Map[AppEnvironment, List[OneTimeReward]],
     priceOracleEpoch: Map[AppEnvironment, EpochProgress]
   ) extends RewardsConfig
-
-  case class TrustStorageConfig(
-    ordinalTrustUpdateInterval: NonNegLong,
-    ordinalTrustUpdateDelay: NonNegLong,
-    seedlistInputBias: Double,
-    seedlistOutputBias: Double
-  )
 
   case class PeerDiscoveryDelay(
     checkPeersAttemptDelay: FiniteDuration,

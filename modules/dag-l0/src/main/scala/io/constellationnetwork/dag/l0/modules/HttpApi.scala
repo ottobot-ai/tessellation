@@ -179,10 +179,6 @@ sealed abstract class HttpApi[
     getLocalChainTip,
     maybeMarkSeen
   )
-  // Trust scores are not used by GL0 today — routes/wiring commented out pending
-  // full removal. Storage and TrustPush are still constructed upstream so case-class
-  // fields remain populated; nothing queries them.
-  // private val trustRoutes = TrustRoutes[F](storages.trust, programs.trustPush)
   private val stateChannelRoutes =
     HasherSelector[F].withCurrent { implicit hasher =>
       StateChannelRoutes[F](
@@ -249,8 +245,7 @@ sealed abstract class HttpApi[
     storages.cluster,
     services.consensus,
     services.gossip,
-    services.session,
-    DebugTrustRoutes[F](storages.trust).public
+    services.session
   ).publicRoutes
 
   private val metricRoutes = MetricRoutes[F]().publicRoutes

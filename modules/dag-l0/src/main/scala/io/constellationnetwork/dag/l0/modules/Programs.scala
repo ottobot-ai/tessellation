@@ -8,7 +8,6 @@ import cats.effect.std.Random
 import cats.syntax.all._
 
 import io.constellationnetwork.dag.l0.config.types.AppConfig
-import io.constellationnetwork.dag.l0.domain.cluster.programs.TrustPush
 import io.constellationnetwork.dag.l0.domain.snapshot.programs.Download
 import io.constellationnetwork.dag.l0.http.p2p.P2PClient
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.programs.RollbackLoader
@@ -48,11 +47,9 @@ object Programs {
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): Programs[F] =
     HasherSelector[F].withCurrent { implicit hasher =>
-      val trustPush = TrustPush.make(storages.trust, services.gossip)
       val peerSelect: PeerSelect[F] = PeerSelect.make(
         storages.cluster,
-        p2pClient.globalSnapshot,
-        storages.trust.getBiasedTrustScores
+        p2pClient.globalSnapshot
       )
       val download: Download[F, GlobalIncrementalSnapshot] = Download
         .make[F](
@@ -87,14 +84,13 @@ object Programs {
         mptStore
       )
 
-      new Programs[F](sharedPrograms.peerDiscovery, sharedPrograms.joining, trustPush, download, rollbackLoader) {}
+      new Programs[F](sharedPrograms.peerDiscovery, sharedPrograms.joining, download, rollbackLoader) {}
     }
 }
 
 sealed abstract class Programs[F[_]] private (
   val peerDiscovery: PeerDiscovery[F],
   val joining: Joining[F],
-  val trustPush: TrustPush[F],
   val download: Download[F, GlobalIncrementalSnapshot],
   val rollbackLoader: RollbackLoader[F]
 )

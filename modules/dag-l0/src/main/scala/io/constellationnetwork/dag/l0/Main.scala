@@ -12,7 +12,6 @@ import io.constellationnetwork.dag.l0.domain.snapshot.ForkRecoveryService
 import io.constellationnetwork.dag.l0.http.p2p.P2PClient
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.schema.{Finished, GlobalConsensusOutcome}
-import io.constellationnetwork.dag.l0.infrastructure.trust.handler.{ordinalTrustHandler, trustHandler}
 import io.constellationnetwork.dag.l0.modules._
 import io.constellationnetwork.ext.cats.effect._
 import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
@@ -111,7 +110,6 @@ object Main
           nodeShared.seedlist,
           cfg.snapshot,
           cfg.incremental,
-          trustRatings,
           sharedConfig.environment,
           hashSelect,
           nakamotoFinalizedOrdinalRef.some
@@ -177,7 +175,6 @@ object Main
       rumorHandler = RumorHandlers
         .make[IO](storages.cluster, services.localHealthcheck, sharedStorages.forkInfo)
         .handlers <+>
-        // trustHandler(storages.trust) <+> ordinalTrustHandler(storages.trust) <+> // trust disabled on GL0
         services.consensus.handler <+>
         eventRumorHandler
 

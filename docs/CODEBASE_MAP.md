@@ -165,7 +165,6 @@ graph LR
 | `infrastructure/snapshot/GlobalSnapshotConsensusFunctions.scala` | Snapshot creation/validation |
 | `domain/cell/L0Cell.scala` | Hylomorphism for event processing |
 | `infrastructure/rewards/Rewards.scala` | Classic + delegated rewards |
-| `infrastructure/trust/` | EigenTrust, DATT, Self-Avoiding Walk |
 | `modules/Services.scala` | Service wiring |
 | `modules/Storages.scala` | Storage wiring |
 
@@ -364,7 +363,7 @@ sequenceDiagram
 3. **Consensus stalls**: 100ms polling with timeout-based lock and ack spreading
 4. **L1 alignment**: Polls L0, doesn't push - eventual consistency model
 5. **State proofs**: MPT roots computed on snapshot, not per-transaction
-6. **Trust algorithms**: Combined score from EigenTrust + DATT + Self-Avoiding Walk
+6. **Trust storage removed**: The historical TrustStorage / l0Trust / EigenTrust+DATT+Self-Avoiding-Walk stack was never wired into consensus and has been deleted. Peer selection is now uniform-random over ready peers, narrowed by majority-ordinal/majority-hash consensus.
 7. **Java 21 required**: Enforced at build time, needed for Kryo reflection
 
 ## Navigation Guide

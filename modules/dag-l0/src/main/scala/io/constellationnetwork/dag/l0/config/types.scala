@@ -1,7 +1,5 @@
 package io.constellationnetwork.dag.l0.config
 
-import scala.concurrent.duration.FiniteDuration
-
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.schema.SnapshotOrdinal
@@ -13,7 +11,6 @@ import eu.timepit.refined.types.string.NonEmptyString
 object types {
 
   case class AppConfigReader(
-    trust: TrustConfig,
     snapshot: SnapshotConfig,
     stateChannel: StateChannelConfig,
     peerDiscovery: PeerDiscoveryConfig,
@@ -21,7 +18,6 @@ object types {
   )
 
   case class AppConfig(
-    trust: TrustConfig,
     snapshot: SnapshotConfig,
     rewards: ClassicRewardsConfig,
     stateChannel: StateChannelConfig,
@@ -54,13 +50,5 @@ object types {
     url: NonEmptyString,
     user: NonEmptyString,
     password: Secret[String]
-  )
-
-  case class TrustDaemonConfig(
-    interval: FiniteDuration
-  )
-
-  case class TrustConfig(
-    daemon: TrustDaemonConfig
   )
 }

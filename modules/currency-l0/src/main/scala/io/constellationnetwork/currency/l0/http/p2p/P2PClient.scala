@@ -31,7 +31,6 @@ object P2PClient {
       StateChannelSnapshotClient.make(client, sharedConfig.snapshotBinarySenderTimeouts),
       L0GlobalSnapshotClient.make(client, none, sharedConfig.snapshotTimeoutsConfig),
       CurrencySnapshotClient.make[F](client, session, sharedConfig.snapshotTimeoutsConfig),
-      L0TrustClient.make(client),
       DataApplicationClient.make(client, session)
     ) {}
 }
@@ -44,6 +43,5 @@ sealed abstract class P2PClient[F[_]] private (
   val stateChannelSnapshot: StateChannelSnapshotClient[F],
   val l0GlobalSnapshot: L0GlobalSnapshotClient[F],
   val currencySnapshot: CurrencySnapshotClient[F],
-  val l0Trust: L0TrustClient[F],
   val dataApplication: DataApplicationClient[F]
 )

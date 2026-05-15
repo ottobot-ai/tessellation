@@ -8,7 +8,6 @@ import cats.syntax.all._
 import io.constellationnetwork.dag.l0.config.types.IncrementalConfig
 import io.constellationnetwork.dag.l0.domain.snapshot.storages.SnapshotDownloadStorage
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.SnapshotDownloadStorage
-import io.constellationnetwork.dag.l0.infrastructure.trust.storage.TrustStorage
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.json.JsonSerializer
@@ -18,13 +17,11 @@ import io.constellationnetwork.node.shared.domain.cluster.storage.{ClusterStorag
 import io.constellationnetwork.node.shared.domain.collateral.LatestBalances
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
-import io.constellationnetwork.node.shared.domain.trust.storage.TrustStorage
 import io.constellationnetwork.node.shared.infrastructure.gossip.RumorStorage
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage._
 import io.constellationnetwork.node.shared.modules.SharedStorages
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
-import io.constellationnetwork.schema.trust.PeerObservationAdjustmentUpdateBatch
 import io.constellationnetwork.security.{HashSelect, HasherSelector}
 
 import fs2.io.file.Files
@@ -37,7 +34,6 @@ object Storages {
     seedlist: Option[Set[SeedlistEntry]],
     snapshotConfig: SnapshotConfig,
     incrementalConfig: IncrementalConfig,
-    trustUpdates: Option[PeerObservationAdjustmentUpdateBatch],
     environment: AppEnvironment,
     hashSelect: HashSelect,
     // Optional finalized-ordinal ref. When Some, SnapshotStorage.setHeadForRecovery
@@ -50,7 +46,6 @@ object Storages {
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[Storages[F]] =
     for {
-      trustStorage <- TrustStorage.make[F](trustUpdates, sharedConfig.trustStorage, seedlist.map(_.map(_.peerId)))
       incrementalGlobalSnapshotTmpLocalFileSystemStorage <- GlobalIncrementalSnapshotLocalFileSystemStorage.make[F](
         snapshotConfig.incrementalTmpSnapshotPath
       )
@@ -97,7 +92,6 @@ object Storages {
         node = sharedStorages.node,
         session = sharedStorages.session,
         rumor = sharedStorages.rumor,
-        trust = trustStorage,
         globalSnapshot = globalSnapshotStorage,
         fullGlobalSnapshot = fullGlobalSnapshotLocalFileSystemStorage,
         incrementalGlobalSnapshotLocalFileSystemStorage = incrementalGlobalSnapshotPersistedLocalFileSystemStorage,
@@ -114,7 +108,6 @@ sealed abstract class Storages[F[_]] private (
   val node: NodeStorage[F],
   val session: SessionStorage[F],
   val rumor: RumorStorage[F],
-  val trust: TrustStorage[F],
   val globalSnapshot: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo] with LatestBalances[F],
   val fullGlobalSnapshot: SnapshotLocalFileSystemStorage[F, GlobalSnapshot],
   val incrementalGlobalSnapshotLocalFileSystemStorage: SnapshotLocalFileSystemStorage[F, GlobalIncrementalSnapshot],
