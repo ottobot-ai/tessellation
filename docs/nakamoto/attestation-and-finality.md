@@ -581,13 +581,19 @@ weight sum.
     self-exclude `selfId` from the canonical-hash-filtered weight/count
     sum, so a node can no longer self-finalize purely on its own
     attestation. Parity surface across both 2/3 triggers.
-  - **Full re-bootstrap path is in progress (#141)**: a node that has
-    already self-finalized a divergent fork — e.g. recovered from a
-    pre-fix snapshot — still needs an explicit `RebootstrapOrchestrator`
-    to clear `TipTracker.attestationsRef` / `lastFinalized` and reset the
-    overlay before re-syncing from a peer. `TipTracker.unsafe_reset` and
-    `MptOverlay.unsafe_reset` exist as the leaf primitives; the
-    orchestrator scaffolding is not yet on this branch.
+  - **Full re-bootstrap path landed** (commit `01ebcca6`, task #141): the
+    `RebootstrapOrchestrator` ticks at 30s, observes
+    `chainStore.divergentRefuseCount`, and when sustained refuses cross
+    `NAKAMOTO_REBOOTSTRAP_REFUSE_THRESHOLD` (default 3) it pauses
+    production, calls `tipTracker.unsafe_reset` + `mptOverlay.unsafe_reset` +
+    `chainStore.unsafe_clearFinality`, bumps
+    `dag_nakamoto_rebootstrap_initiated_total`, and lets the existing
+    `NakamotoSyncDaemon` Tier-3 catch-up path re-seed canonical state.
+    A 5-minute cooldown (`NAKAMOTO_REBOOTSTRAP_COOLDOWN_MS`) prevents flap.
+    **Default-OFF via `NAKAMOTO_REBOOTSTRAP_ENABLED=false`** — the recovery
+    path ships dormant until iter-level e2e proves it doesn't spuriously
+    fire under normal small-cluster operation; operators flip it on per
+    node.
 - **Undo journal (#121)** plugs base-write contamination on reorg-replace
   but only operates when `finalizeBranch` is called with a different
   hash at an already-finalized ordinal. Does NOT cover the case where a
@@ -608,8 +614,9 @@ weight sum.
 | `modules/dag-l0/.../nakamoto/NakamotoChainStore.scala` | Fork-DAG of tips. `bestTip`, `store`, `finalize`, `walkBackTo`. Finality-safety gate at `:290-303`. `vrfOutputsForPeriod` for §1's eta rotation inputs. |
 | `modules/node-shared/.../nakamoto/FinalityTrigger.scala` | `FinalityTrigger[F]` typeclass + `Kind` ADT + `triggersFor` / `maxLatestQualifyingOrdinal` lookup helpers + `fromRef` factory. Concrete builders: `TWeightTrigger`, `TCountTrigger`, `TDepth1Trigger`, `TDepth2Trigger`. Also defines `FinalityTriggerView[F]` (observability seam consumed by the HTTP route). Commits `30a2fa73` (typeclass), `7003be21` (T_count), `06455f98` (T_depth2). |
 | `modules/dag-l0/.../http/routes/FinalityTriggersRoutes.scala` | HTTP route `GET /global-snapshots/{ord}/finality-triggers` — reads a `Ref[F, Option[FinalityTriggerView[F]]]` populated by `SnapshotLeaderLoop` at startup; 503 until populated. Pure observability (commit `866cd598`, task #138). |
-| `modules/node-shared/.../nakamoto/TipTracker.scala` | `Map[PeerId, TipAttestation]`. Newer-wins via `attestedAt`. `recordAttestation` enforces ±`MaxAttestationSkewMs` skew bound (env `NAKAMOTO_MAX_ATTESTATION_SKEW_MS`, default 60s — commit `422e1a6b`). `highestFinalizedOrdinal(selfId, …)` takes `selfId` parameter for #133 self-exclusion (commit `95471c7f`). Source for `T_weight` and `T_count`. Includes `unsafe_reset` leaf primitive for #141 re-bootstrap (orchestrator not yet wired). |
-| `modules/node-shared/.../nakamoto/overlay/MptOverlay.scala` | Branch-aware MPT: `pendingRef`, `BranchHandle`, `checkout/commit`, `finalizeBranch` (#56). Phase 0/1 writes live here; Phase 2 transition triggers `finalizeBranch`. Phase-3 `pruneBelow(ord)` (commit `173e6a7d`, #139) drops `undoJournalRef` and `finalizedRef` entries strictly below the archival watermark; idempotent and irreversible. Also has `unsafe_reset` leaf primitive for #141. |
+| `modules/dag-l0/.../nakamoto/RebootstrapOrchestrator.scala` | fs2.Stream ticker (default 30s) consuming `chainStore.divergentRefuseCount` + cooldown to detect lock-out and call `unsafe_reset` on TipTracker/Overlay + `unsafe_clearFinality` on chainStore. Default-OFF via `NAKAMOTO_REBOOTSTRAP_ENABLED`. Pure `decide` function for unit testing. Commit `01ebcca6` (#141). |
+| `modules/node-shared/.../nakamoto/TipTracker.scala` | `Map[PeerId, TipAttestation]`. Newer-wins via `attestedAt`. `recordAttestation` enforces ±`MaxAttestationSkewMs` skew bound (env `NAKAMOTO_MAX_ATTESTATION_SKEW_MS`, default 60s — commit `422e1a6b`). `highestFinalizedOrdinal(selfId, …)` takes `selfId` parameter for #133 self-exclusion (commit `95471c7f`). Source for `T_weight` and `T_count`. `unsafe_reset` leaf primitive called only by `RebootstrapOrchestrator` (#141, commit `01ebcca6`). |
+| `modules/node-shared/.../nakamoto/overlay/MptOverlay.scala` | Branch-aware MPT: `pendingRef`, `BranchHandle`, `checkout/commit`, `finalizeBranch` (#56). Phase 0/1 writes live here; Phase 2 transition triggers `finalizeBranch`. Phase-3 `pruneBelow(ord)` (commit `173e6a7d`, #139) drops `undoJournalRef` and `finalizedRef` entries strictly below the archival watermark; idempotent and irreversible. `unsafe_reset` leaf primitive called only by `RebootstrapOrchestrator` (#141). |
 | `modules/node-shared/.../nakamoto/ChainSelection.scala` | Taktikos maxvalid-tk (short forks, Phase 0/1) + Ouroboros Genesis maxvalid-bg density rule (deep forks, Phase 0/1). Inactive from Phase 2. |
 | `modules/node-shared/.../nakamoto/EligibilityChecker.scala` | LDD threshold function (ψ, γ, fA, fB). |
 | `modules/node-shared/.../nakamoto/StakeRegistry.scala` | Per-peer stake fractions (delegated + collateral combined planned); `optimisticRelativeStake` for active-only weighting. `validatorCount` provides the `T_count` denominator (full seedlist). |
