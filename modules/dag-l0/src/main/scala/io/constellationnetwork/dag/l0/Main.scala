@@ -97,6 +97,13 @@ object Main
       // Constructed BEFORE Storages so SnapshotStorage.setHeadForRecovery can enforce
       // the finality-safety guard (refuses different-hash overwrites at-or-below finalized).
       nakamotoFinalizedOrdinalRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinIncrementalValue).asResource
+      // Chain-quality observable seam (#138). Set by SnapshotLeaderLoop after trigger
+      // construction; read by the new /global-snapshots/{ord}/finality-triggers HTTP
+      // route. Lives at the same lifetime as nakamotoFinalizedOrdinalRef — created here
+      // so both Services and HttpApi can share it.
+      finalityTriggerViewRef <- Ref
+        .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[IO]]](None)
+        .asResource
       storages <- Storages
         .make[IO](
           sharedStorages,
@@ -135,7 +142,8 @@ object Main
           cfg,
           Hasher.forKryo[IO],
           nodeShared.loggerBundle,
-          nakamotoFinalizedOrdinalRef
+          nakamotoFinalizedOrdinalRef,
+          finalityTriggerViewRef
         )
 
       programs = Programs.make[IO, RunNakamoto](

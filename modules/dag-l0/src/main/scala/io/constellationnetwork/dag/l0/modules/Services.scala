@@ -72,7 +72,8 @@ object Services {
     cfg: AppConfig,
     txHasher: Hasher[F],
     loggerBundle: LoggerBundle[F],
-    nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal]
+    nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
+    finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
@@ -197,6 +198,7 @@ object Services {
             loggerBundle,
             queues.rumor,
             nakamotoFinalizedOrdinalRef,
+            finalityTriggerViewRef,
             processMetagraphBinary,
             sidecarClient
           )
@@ -225,7 +227,8 @@ object Services {
         rewards = rewardsService,
         recoveryPeerHint = recoveryPeerHintService,
         eventMempool = eventMempoolService,
-        sidecarClient = sidecarClient
+        sidecarClient = sidecarClient,
+        finalityTriggerViewRef = finalityTriggerViewRef
       ) {}
 }
 
@@ -243,5 +246,9 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   val rewards: RewardsService[F],
   val recoveryPeerHint: RecoveryPeerHint[F],
   val eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-  val sidecarClient: SidecarClient.SidecarClientAlgebra[F]
+  val sidecarClient: SidecarClient.SidecarClientAlgebra[F],
+  // Observability seam for /global-snapshots/{ord}/finality-triggers (#138). Set once by
+  // SnapshotLeaderLoop after trigger construction; read by FinalityTriggersRoutes. The
+  // route returns 503 while the Ref is empty (pre-startup window).
+  val finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]]
 )

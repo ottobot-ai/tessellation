@@ -1,6 +1,7 @@
 package io.constellationnetwork.node.shared.domain.nakamoto
 
 import cats.effect.IO
+import cats.syntax.all._
 
 import io.constellationnetwork.node.shared.infrastructure.metrics.NoOpMetrics
 import io.constellationnetwork.schema.SnapshotOrdinal
@@ -349,6 +350,88 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     for {
       result <- FinalityTrigger.triggersFor[IO](Nil, ord(100L))
     } yield expect.same(Set.empty[FinalityTrigger.Kind], result)
+  }
+
+  test("triggersFor over all four triggers — only the triggers that qualify N are returned (#138 building block)") {
+    // Scenario for the chain-quality observable (task #138): at finalize time we want to know
+    // exactly which subset of the four triggers (T_weight, T_count, T_depth1, T_depth2) has
+    // qualified the just-finalized ordinal. This test sets up a state where:
+    //   - T_weight qualifies ord=50 (3/4 peers on canonical chain @ ord=50, exceeds 2/3)
+    //   - T_count qualifies ord=50 (3 non-self peers, ceil(2/3 * 4) = 3 → exactly meets)
+    //   - T_depth1 qualifies ord=90 (bestTip=100, k=10)
+    //   - T_depth2 qualifies MinValue (bestTip=100 < k₂=1000)
+    // Then we query triggersFor at three ordinals: 50 (all three Phase-1→2 fire), 90 (only
+    // T_depth1), 99 (none).
+    val self = pid("self")
+    val peer1 = pid("peer1")
+    val peer2 = pid("peer2")
+    val peer3 = pid("peer3")
+    val tipHash50 = hash("tip-at-50")
+    val tipHash100 = hash("tip-at-100")
+    val canonical = Map(50L -> tipHash50, 100L -> tipHash100)
+    for {
+      (tracker, registry) <- setupTracker(Set(self, peer1, peer2, peer3))
+      _ <- record(tracker, peer1, att(tipHash50, slot(50), 50L, 1000L))
+      _ <- record(tracker, peer2, att(tipHash50, slot(50), 50L, 1000L))
+      _ <- record(tracker, peer3, att(tipHash50, slot(50), 50L, 1000L))
+      tWeight <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
+      tCount <- TCountTrigger.make[IO](tracker, registry, TipTracker.FinalityThreshold)
+      tDepth1 <- TDepth1Trigger.make[IO](10L)
+      tDepth2 <- TDepth2Trigger.make[IO](1000L)
+      all = List[FinalityTrigger[IO]](tWeight, tCount, tDepth1, tDepth2)
+      st = state(self, 100L, tipHash100, canonical)
+      // Advance every trigger
+      _ <- all.traverse_(_.evaluateAndAdvance(st))
+      at50 <- FinalityTrigger.triggersFor(all, ord(50L))
+      at90 <- FinalityTrigger.triggersFor(all, ord(90L))
+      at99 <- FinalityTrigger.triggersFor(all, ord(99L))
+      // Sanity-check the individual latest ordinals match the design above.
+      latestWeight <- tWeight.latestQualifyingOrdinal
+      latestCount <- tCount.latestQualifyingOrdinal
+      latestDepth1 <- tDepth1.latestQualifyingOrdinal
+      latestDepth2 <- tDepth2.latestQualifyingOrdinal
+    } yield
+      // Pre-flight: triggers landed where we set them up.
+      expect.same(ord(50L), latestWeight) &&
+        expect.same(ord(50L), latestCount) &&
+        expect.same(ord(90L), latestDepth1) &&
+        expect.same(SnapshotOrdinal.MinValue, latestDepth2) &&
+        // ord=50: all three Phase-1→2 triggers qualify (T_weight=50, T_count=50, T_depth1=90 ≥ 50).
+        // T_depth2 still at MinValue (chain too short), so it does NOT qualify.
+        expect.same(
+          Set[FinalityTrigger.Kind](FinalityTrigger.Kind.TWeight, FinalityTrigger.Kind.TCount, FinalityTrigger.Kind.TDepth1),
+          at50
+        ) &&
+        // ord=90: T_weight (50) and T_count (50) do not qualify. T_depth1 (90) qualifies. T_depth2 at MinValue.
+        expect.same(Set[FinalityTrigger.Kind](FinalityTrigger.Kind.TDepth1), at90) &&
+        // ord=99: T_depth1 only at 90 — too low. None qualify.
+        expect.same(Set.empty[FinalityTrigger.Kind], at99)
+  }
+
+  test("FinalityTriggerView.fromTriggers wraps a trigger list and answers triggersFor correctly") {
+    // Smoke test for the #138 view shim — confirms the wrapper preserves
+    // FinalityTrigger.triggersFor semantics without caching or staleness.
+    val self = pid("self")
+    val tipHash = hash("tip")
+    for {
+      tracker <- setupTipTracker(Set(self, pid("peer1"), pid("peer2")))
+      _ <- record(tracker, pid("peer1"), att(tipHash, slot(50), 50L, 1000L))
+      _ <- record(tracker, pid("peer2"), att(tipHash, slot(50), 50L, 1000L))
+      tWeight <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
+      tDepth1 <- TDepth1Trigger.make[IO](10L)
+      view = FinalityTriggerView.fromTriggers[IO](List(tWeight, tDepth1))
+      st = state(self, 100L, tipHash, Map(50L -> tipHash))
+      // Initially no trigger has advanced — view returns empty.
+      empty <- view.triggersFor(ord(50L))
+      _ <- tWeight.evaluateAndAdvance(st)
+      _ <- tDepth1.evaluateAndAdvance(st)
+      // After advance, view reflects both.
+      both <- view.triggersFor(ord(50L))
+      depthOnly <- view.triggersFor(ord(90L))
+    } yield
+      expect.same(Set.empty[FinalityTrigger.Kind], empty) &&
+        expect.same(Set[FinalityTrigger.Kind](FinalityTrigger.Kind.TWeight, FinalityTrigger.Kind.TDepth1), both) &&
+        expect.same(Set[FinalityTrigger.Kind](FinalityTrigger.Kind.TDepth1), depthOnly)
   }
 
   test("maxLatestQualifyingOrdinal: returns max across all triggers (today's max(t_weight, t_depth1) semantics)") {

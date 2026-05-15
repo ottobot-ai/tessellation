@@ -148,6 +148,11 @@ object GlobalSnapshotConsensus {
     // -binary pruning on actual finality. Seeded with SnapshotOrdinal.MinIncrementalValue
     // (ordinal 1 = genesis); grows monotonically as finality advances.
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
+    // Observability seam for the chain-quality HTTP route (#138). Populated by SnapshotLeaderLoop
+    // once the four FinalityTriggers are constructed; read by `FinalityTriggersRoutes` to answer
+    // "which triggers qualified ord N?" without owning trigger references. Empty until the
+    // leader-loop fiber has started — the route handles `None` as a 503.
+    finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
     // Invoked by NakamotoSyncDaemon when a metagraph-binary arrives via gossip.
     // Routes the binary through the same pipeline as the HTTP endpoint (stateChannelService.process).
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
@@ -587,7 +592,8 @@ object GlobalSnapshotConsensus {
                   mptStore = mptStore,
                   mptOverlay = mptOverlay,
                   nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef,
-                  chainSyncRequestQueue = chainSyncRequestQueue
+                  chainSyncRequestQueue = chainSyncRequestQueue,
+                  finalityTriggerViewRef = finalityTriggerViewRef
                 )
                 .compile
                 .drain

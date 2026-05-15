@@ -228,6 +228,11 @@ sealed abstract class HttpApi[
   }
   private val tokenLockRoutes = GL0TokenLockRoutes(storages.globalSnapshot, storages.mptStore)
 
+  // Chain-quality / finality-triggers observable (#138). Reads the FinalityTriggerView Ref
+  // populated by SnapshotLeaderLoop after trigger construction. Pure observability — no
+  // consensus semantics change.
+  private val finalityTriggersRoutes = FinalityTriggersRoutes[F](services.finalityTriggerViewRef)
+
   private val walletRoutes = WalletRoutes[F, GlobalIncrementalSnapshot]("/dag", services.address)
   private val consensusInfoRoutes =
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -266,6 +271,7 @@ sealed abstract class HttpApi[
                 stateChannelRoutes.publicRoutes <+>
                 clusterRoutes.publicRoutes <+>
                 snapshotRoutes.publicRoutes <+>
+                finalityTriggersRoutes.publicRoutes <+>
                 dagRoutes.publicRoutes <+>
                 walletRoutes.publicRoutes <+>
                 nodeRoutes.publicRoutes <+>

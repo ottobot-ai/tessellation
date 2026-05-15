@@ -142,6 +142,33 @@ object FinalityTrigger {
     }
 }
 
+/** Observability seam for the chain-quality HTTP route (task #138).
+  *
+  * Wraps a list of [[FinalityTrigger]] instances and answers "which triggers qualified ord N?" without exposing the trigger objects
+  * themselves to the HTTP layer. Constructed once per leader-loop instance (closing over the in-scope triggers) and handed to the HTTP
+  * layer via a `Ref[F, Option[FinalityTriggerView[F]]]` populated at startup. Pure observability — never feeds back into consensus.
+  */
+trait FinalityTriggerView[F[_]] {
+
+  /** Which finality triggers have qualified the given ordinal? Set-valued — any combination of `T_weight`, `T_count`, `T_depth1`,
+    * `T_depth2` is representable. Empty set means no trigger has qualified `ord` yet.
+    */
+  def triggersFor(ord: SnapshotOrdinal): F[Set[FinalityTrigger.Kind]]
+}
+
+object FinalityTriggerView {
+  def apply[F[_]](implicit F: FinalityTriggerView[F]): FinalityTriggerView[F] = F
+
+  /** Wrap a concrete trigger list as a view. The list is captured by reference; the view reads each trigger's current
+    * `latestQualifyingOrdinal` on every call (no caching), so it always reflects the most recent `evaluateAndAdvance` result.
+    */
+  def fromTriggers[F[_]: cats.Monad](triggers: List[FinalityTrigger[F]]): FinalityTriggerView[F] =
+    new FinalityTriggerView[F] {
+      def triggersFor(ord: SnapshotOrdinal): F[Set[FinalityTrigger.Kind]] =
+        FinalityTrigger.triggersFor(triggers, ord)
+    }
+}
+
 /** Production builder for the `T_weight` trigger (2/3 attestation finality on the canonical chain).
   *
   * Wraps [[TipTracker.highestFinalizedOrdinal]] — self-excludes `state.selfId` (#133), filters attestations by canonical-hash match (#119
