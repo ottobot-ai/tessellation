@@ -328,6 +328,9 @@ object SnapshotLeaderLoop {
                         }
                       }
 
+                    // Raw VRF-trial counter (incremented BEFORE win/loss check) — pairs with `dag_nakamoto_slots_won` to surface silently-degraded validators (clock skew, missing eta, bad keystore) that would otherwise vanish from finality counters; Prometheus scrapes per node so {node} is added by the collector.
+                    _ <- Metrics[F].incrementCounter("dag_nakamoto_slots_trialed_total")
+
                     result <- eligibilityChecker.checkEligibility(
                       vrfSK = vrfSeed,
                       slot = slotRefined,
