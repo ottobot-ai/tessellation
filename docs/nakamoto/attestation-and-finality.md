@@ -197,6 +197,28 @@ ordinal range — slots are not consulted for rotation decisions. The old
 `NAKAMOTO_ETA_ROTATION_SLOTS` env var is removed (pre-prod, no
 backwards-compat shim).
 
+### 1.4 Period-assignment determinism — predecessor-keyed
+
+Period assignment is keyed on the **predecessor ordinal**: when a snapshot
+is produced at ordinal *N*, both producer and verifier compute
+`currentPeriod = (N - 1) / R`. This makes the period a function of the
+snapshot itself (the predecessor is universally known via `snap.lastSnapshotHash`),
+not of the observer's local `bestTipOrdinal`.
+
+Why this matters: an earlier draft of the migration keyed period on
+`chainStore.bestTipOrdinal` directly. At the producer that was already
+the predecessor (`bestTipOrdinal == N - 1` at production time), but the
+verifier site used `snap.ordinal` raw. The off-by-one at every R-boundary
+caused producer/verifier disagreement on which eta to expect, stalling
+finality at the boundary (iter35 stalled at ord=99 with R=100). Aligning
+both sites on `(N - 1) / R` restores universal agreement.
+
+The 2/3-cut input-stability argument (§1.2) is independent: it ensures
+the VRF *inputs* feeding a derived eta are CP-safe by the time they're
+used. Period *assignment* and input *stability* are two distinct
+properties — predecessor-keying fixes the first; R ≥ 3·k₁ ensures the
+second.
+
 ---
 
 ## 2. Top-level state model
@@ -254,28 +276,34 @@ After the transaction (still in Phase 0 for this snapshot):
 - Canonical-state pointers advance for recovery.
 - Snapshot is published via `sidecarClient.publishSnapshot`.
 - Self-attestation is emitted via `NakamotoSyncDaemon.emitTipAttestation`
-  with `attestedAt = slotRefined` (the consensus slot at which we
-  produced — see §3.1).
+  with `attestedAt = Clock[F].realTime.toMillis` (see §3.1).
 
-### 3.1 `attestedAt` semantics — consensus slot, not wall-clock
+### 3.1 `attestedAt` semantics — wall-clock epoch ms (Chronos-prep)
 
-`attestedAt` is a **consensus slot** (a `Slot` newtype over `NonNegLong`,
-indexed by the cluster's `SlotClock`), **not** wall-clock seconds.
+`attestedAt` is **wall-clock epoch milliseconds**, sourced via the typed
+`Clock[F].realTime` from cats-effect (NEVER `System.currentTimeMillis()`).
+It is a `Long` field on `TipAttestation`, not a `Slot`.
 
-The cluster's `SlotClock` (`node-shared/.../nakamoto/SlotClock.scala`)
-derives slot index as `(wallClock - genesisTimeMs) / slotDurationMs`. In
-production `slotDurationMs = 1000`; in e2e tests `slotDurationMs = 500`.
-The slot index is what cluster nodes agree on for "the same instant in
-consensus time" — it scales with the configured slot rate.
+Wall-clock semantics here are deliberate. The `attestedAt` field is
+positioned to double as a future **Ouroboros Chronos**-style timestamp
+gossip surface: each attestation carries the producer's wall-clock claim
+for when it was made, and the protocol can distill a cluster-consensus
+time from those claims without needing NTP. Today the field is only used
+by `TipTracker.recordAttestation` for the "newer-wins" rule (compares
+Longs), but the wire-format and semantics are stable for that future use.
 
-Earlier implementations of `emitAttestation` used `System.currentTimeMillis()`
-(non-typed, wall-clock dependent) or `Clock[F].realTime.toSeconds` (typed
-but dimensionally wrong — seconds is not a slot). Both gave divergent
-units between the production self-attest path (`onSlotWon`, slot index)
-and the peer-receive path (`processValidSnapshot`, seconds), so peer
-attestations always shadowed self-attestations under `TipTracker`'s
-"newer wins" rule. Both paths now read `attestedAt` from `SlotClock`
-(or, in `onSlotWon`, use the just-won `slotRefined`).
+All three emit-paths source `attestedAt` from `Clock[F].realTime`:
+- Production self-emit in `onSlotWon` after `chainStore.store` succeeds.
+- becameBestTip self-emit in `processValidSnapshot` (peer-snapshot path).
+- §5.1 visibility-ticker re-emit.
+
+The peer-receive handler (`handleAttestation`) takes `att.attestedAt`
+directly off the wire (the peer's wall-clock claim).
+
+Earlier iterations used `System.currentTimeMillis()` (non-typed) and
+later attempted `attestedAt: Slot` keyed to a `SlotClock` (dimensionally
+clean but blocked the Chronos use-case). The current `Long` epoch-ms
+shape is stable.
 
 ---
 
@@ -455,7 +483,7 @@ weight sum.
 | `modules/node-shared/.../nakamoto/ChainSelection.scala` | Taktikos maxvalid-tk (short forks, Phase 0/1) + Ouroboros Genesis maxvalid-bg density rule (deep forks, Phase 0/1). Inactive from Phase 2. |
 | `modules/node-shared/.../nakamoto/EligibilityChecker.scala` | LDD threshold function (ψ, γ, fA, fB). |
 | `modules/node-shared/.../nakamoto/StakeRegistry.scala` | Per-peer stake fractions (delegated + collateral combined planned); `optimisticRelativeStake` for active-only weighting. |
-| `modules/node-shared/.../nakamoto/SlotClock.scala` | Cluster-wide consensus slot provider. Source of `attestedAt`. |
+| `modules/node-shared/.../nakamoto/SlotClock.scala` | Cluster-wide consensus slot provider. Not currently used by the attestation path (Chronos-prep wall-clock semantics; see §3.1); retained as a domain primitive for future consensus-slot consumers. |
 | `modules/node-shared/.../nakamoto/EtaCalculation.scala` | Eta computation; `twoThirdsCutoff` for the §1 R ≥ 3k₁ rule. |
 | `modules/node-shared/.../nakamoto/SidecarClient.scala` | gRPC client to Go libp2p sidecar (`publishSnapshot`, `publishAttestation`, `publishRumor`). |
 | `modules/node-shared/.../nakamoto/SidecarRumorBridge.scala` | Subscribe→Rumor inbound bridge for non-typed gossip. |

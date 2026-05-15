@@ -96,7 +96,7 @@ object TipTracker {
         def recordAttestation(peerId: PeerId, attestation: TipAttestation): F[Unit] =
           attestationsRef.update { current =>
             current.get(peerId) match {
-              case Some(existing) if existing.attestedAt.value.value >= attestation.attestedAt.value.value =>
+              case Some(existing) if existing.attestedAt >= attestation.attestedAt =>
                 // Existing attestation is same or newer, keep it
                 current
               case _ =>

@@ -2,7 +2,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import java.security.KeyPair
 
-import cats.effect.kernel.{Async, Ref}
+import cats.effect.kernel.{Async, Clock, Ref}
 import cats.effect.std.{Semaphore, Supervisor}
 import cats.syntax.all._
 
@@ -112,7 +112,7 @@ object NakamotoSyncDaemon {
     * handleSnapshot (which will now find the parent in the chain store and validate successfully). This creates a validation cascade from
     * the shared genesis ancestor through the gossip chain.
     */
-  private def drainPendingChildren[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics: SlotClock](
+  private def drainPendingChildren[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
     storedHash: Hash,
     stateRef: Ref[F, SyncState],
     pendingParentRef: Ref[F, Map[Hash, List[pb.Snapshot]]],
@@ -197,7 +197,7 @@ object NakamotoSyncDaemon {
     def initial: SyncState = SyncState(0L, None, 0L, isReady = false)
   }
 
-  def run[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics: SlotClock](
+  def run[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
     channel: ManagedChannel,
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     nodeStorage: NodeStorage[F],
@@ -228,8 +228,6 @@ object NakamotoSyncDaemon {
     // internally-constructed manager into this Ref once it's built; consumers
     // read-through it and no-op if the producer hasn't bound yet.
     sharedChainSyncManagerRef: Ref[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]]
-    // Global slot provider for `attestedAt` consensus-slot reads is a `SlotClock[F]`
-    // context bound on `run` (see `processValidSnapshot` below).
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -423,7 +421,7 @@ object NakamotoSyncDaemon {
     }
   }
 
-  private def handleSnapshot[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics: SlotClock](
+  private def handleSnapshot[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
     snap: pb.Snapshot,
     stateRef: Ref[F, SyncState],
     pendingParentRef: Ref[F, Map[Hash, List[pb.Snapshot]]],
@@ -497,9 +495,17 @@ object NakamotoSyncDaemon {
       // Fallback: if the incoming snapshot carries an eta field, use it directly
       // (trust-but-verify: we verify the snapshot's chain ancestry separately).
       //
-      // Rotation period is keyed on **ordinal**, not slot — see
-      // `docs/nakamoto/attestation-and-finality.md` §1.
-      currentPeriod = EtaCalculation.rotationPeriod(snap.ordinal, etaRotationSnapshots)
+      // Rotation period is keyed on the **predecessor ordinal** (`snap.ordinal - 1`),
+      // mirroring the producer side at `SnapshotLeaderLoop:281` where `lastChainOrdinal`
+      // (= bestTipOrdinal at production time, = N-1 for snap N) is the divisor input.
+      // Period assignment must be a function of the snapshot itself so every honest
+      // verifier reaches the same conclusion regardless of where their local bestTip is.
+      // Using `snap.ordinal` directly causes an off-by-one at every R boundary: the
+      // producer of ord=R uses (R-1)/R = period (R-1)/R → 0, but a naive verifier
+      // computes R/R = 1, expecting derived eta where the SlotCertificate carries
+      // genesisEta. This caused iter35's finalization stall at ord=99 (R=100 boundary).
+      // See `docs/nakamoto/attestation-and-finality.md` §1.
+      currentPeriod = EtaCalculation.rotationPeriod(math.max(0L, snap.ordinal - 1), etaRotationSnapshots)
       eta <-
         if (currentPeriod <= 0) {
           Async[F].pure(genesisEta)
@@ -835,7 +841,7 @@ object NakamotoSyncDaemon {
     *     was stored as a fork branch (or duplicate) in chainStore and MPT was rolled back; we still update tip-tracking, attestation, and
     *     ready-transition.
     */
-  private def processValidSnapshot[F[_]: Async: SecurityProvider: HasherSelector: Metrics: SlotClock](
+  private def processValidSnapshot[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     snap: pb.Snapshot,
     signedSnapshot: Option[Signed[GlobalIncrementalSnapshot]],
     context: Option[GlobalSnapshotInfo],
@@ -896,12 +902,18 @@ object NakamotoSyncDaemon {
         case _ => Async[F].unit
       }
 
-      // Record in TipTracker (snapshot producer attests to their own tip)
+      // Record in TipTracker (snapshot producer attests to their own tip).
+      // `attestedAt` is OUR wall-clock receive time (epoch ms via Clock[F].realTime,
+      // NOT System.currentTimeMillis()) — so TipTracker's "newer wins" rule sees
+      // the latest arrival from each peer. The unit is wall-clock millis, not a
+      // consensus slot — kept open as the future Ouroboros-Chronos timestamp
+      // gossip surface, per `docs/nakamoto/attestation-and-finality.md`.
       tipHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
       tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
       producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
       producerId = peer.PeerId(producerHex)
-      att = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, tipSlot)
+      nowMs <- Clock[F].realTime.map(_.toMillis)
+      att = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, nowMs)
       _ <- tipTracker.recordAttestation(producerId, att)
 
       // Check if we should transition to Ready
@@ -927,15 +939,16 @@ object NakamotoSyncDaemon {
       // (`SnapshotLeaderLoop.scala:396-412`) remains as a safety net for the
       // case where bestTip flips between this branch and the ticker firing.
       //
-      // The producer-implicit attestation at line 909 above (recordAttestation
-      // for the producer's `peerId`) stays unconditional — it credits the
-      // producer for what they produced, independent of our chain selection.
+      // The producer-implicit attestation above (recordAttestation for the
+      // producer's `peerId`) stays unconditional — it credits the producer
+      // for what they produced, independent of our chain selection.
       //
-      // attestedAt is the current consensus slot per the cluster SlotClock
-      // (honors NAKAMOTO_SLOT_DURATION_MS; 500 ms in e2e, 1000 ms default) —
-      // NOT a wall-clock unit.
+      // `attestedAt` is wall-clock epoch ms via `Clock[F].realTime` (NOT
+      // `System.currentTimeMillis()`, NOT a consensus slot). Wall-clock
+      // semantics are deliberate, keeping the field reusable as a future
+      // Ouroboros-Chronos-style timestamp-claim surface.
       _ <- Async[F].whenA(becameBestTip) {
-        SlotClock[F].currentSlot.flatMap { attestedAt =>
+        Clock[F].realTime.map(_.toMillis).flatMap { attestedAt =>
           emitAttestation(snap, attestedAt, sidecarClient, tipTracker, selfId, keyPair, logger)
         }
       }
@@ -1059,12 +1072,15 @@ object NakamotoSyncDaemon {
                 Metrics[F].incrementCounter("dag_nakamoto_forks_stored")
               } else Async[F].unit
 
-            // Record attestation regardless (producer attests their own tip)
+            // Record attestation regardless (producer attests their own tip). `attestedAt`
+            // is OUR wall-clock receive time via Clock[F].realTime — same Chronos-prep
+            // semantics as the becameBestTip-branch site above.
             tipHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
             tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
             producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
             producerId = peer.PeerId(producerHex)
-            att = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, tipSlot)
+            nowMs <- Clock[F].realTime.map(_.toMillis)
+            att = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, nowMs)
             _ <- tipTracker.recordAttestation(producerId, att)
           } yield ()
 
@@ -1083,9 +1099,10 @@ object NakamotoSyncDaemon {
     val tipSlot = Slot(NonNegLong.unsafeFrom(att.tipSlot))
     val attesterHex = Hex(att.attesterId.toByteArray.map("%02x".format(_)).mkString)
     val attesterId = peer.PeerId(attesterHex)
-    val attestedAtSlot = Slot(NonNegLong.unsafeFrom(att.attestedAt))
     val sigBytes = att.signature.toByteArray
-    val domainAtt = DomainTipAttestation(tipHash, tipSlot, att.tipOrdinal, attestedAtSlot)
+    // `att.attestedAt` is wall-clock epoch ms set by the peer (Clock[F].realTime).
+    // Used purely for "newer-wins" ordering in TipTracker; no slot interpretation.
+    val domainAtt = DomainTipAttestation(tipHash, tipSlot, att.tipOrdinal, att.attestedAt)
 
     if (sigBytes.isEmpty) {
       logger.warn(s"⚠️ Rejecting unsigned attestation for ordinal=${att.tipOrdinal} from=${attesterHex.value.take(16)}...")
@@ -1149,14 +1166,15 @@ object NakamotoSyncDaemon {
   // same code path peer-received snapshots use. Unifies the two attestation sites: any future
   // gating, signing semantics, or broadcast policy applies uniformly.
   //
-  // `attestedAt` is a *consensus slot* (the Nakamoto LDD-paced slot at the time of attestation),
-  // **not** a wall-clock timestamp. The caller is responsible for sourcing it from the cluster's
-  // global slot provider (`SlotClock[F]`, see node-shared/.../nakamoto/SlotClock.scala), which
-  // honors the configured `slotDurationMs` — 1000 ms by default, 500 ms in e2e. This function
-  // does not read the wall clock.
+  // `attestedAt` is **wall-clock epoch milliseconds** sourced via `Clock[F].realTime` by the
+  // caller (NEVER `System.currentTimeMillis()`). It is NOT a consensus slot. Wall-clock
+  // semantics here are deliberate — keeps the field reusable as a future Ouroboros-Chronos-style
+  // timestamp-claim surface (gossiping `attestedAt` values lets the network distill a consensus
+  // time without needing NTP). Today the value is only used by `TipTracker.recordAttestation`
+  // for the "newer wins" rule, which compares Longs.
   def emitAttestation[F[_]: Async: SecurityProvider: HasherSelector](
     snap: pb.Snapshot,
-    attestedAt: Slot,
+    attestedAt: Long,
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
     selfId: peer.PeerId,
@@ -1171,13 +1189,13 @@ object NakamotoSyncDaemon {
 
   // Primitive variant for callers that have tip hash/slot/ordinal directly (e.g. the finality
   // monitor's bestTip-change ticker re-attesting after chainSelection moves).
-  // See `emitAttestation` comment re: `attestedAt` semantics — both functions take it from the
-  // caller; neither reads the wall clock.
+  // See `emitAttestation` comment re: `attestedAt` semantics — wall-clock epoch ms via
+  // `Clock[F].realTime`, sourced by the caller; this function does not read the clock.
   def emitTipAttestation[F[_]: Async: SecurityProvider: HasherSelector](
     tipHash: Hash,
     tipSlot: Slot,
     tipOrdinal: Long,
-    attestedAt: Slot,
+    attestedAt: Long,
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
     selfId: peer.PeerId,
@@ -1198,7 +1216,7 @@ object NakamotoSyncDaemon {
             tipHash = tipHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
             tipSlot = tipSlot.value.value,
             tipOrdinal = tipOrdinal,
-            attestedAt = attestedAt.value.value,
+            attestedAt = attestedAt,
             attesterId = selfId.value.toBytes,
             signature = sigBytes
           )

@@ -2,7 +2,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import java.security.KeyPair
 
-import cats.effect.kernel.{Async, Ref}
+import cats.effect.kernel.{Async, Clock, Ref}
 import cats.syntax.all._
 
 import scala.concurrent.duration._
@@ -153,7 +153,7 @@ object SnapshotLeaderLoop {
     *   days. Rotation is keyed on **ordinal**, not slot — see `docs/nakamoto/attestation-and-finality.md` §1 for the R ≥ 3·k₁ stability
     *   bound rationale.
     */
-  def run[F[_]: Async: SecurityProvider: HasherSelector: Metrics: SlotClock](
+  def run[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
@@ -196,12 +196,6 @@ object SnapshotLeaderLoop {
     // request here instead of silently waiting for the next periodic sync. See
     // ChainSyncRequestQueue for why this is a queue rather than a direct call.
     chainSyncRequestQueue: ChainSyncRequestQueue[F]
-    // Global slot provider is a `SlotClock[F]` context bound on the `run` signature above;
-    // summoned at call sites via `SlotClock[F].currentSlot`. Constructed once at
-    // `GlobalSnapshotConsensus.make` and made `implicit` there so the typeclass resolves
-    // through the supervised stream call. `attestedAt` is a Nakamoto consensus slot, NOT
-    // wall-clock seconds (Slot's NonNegLong is dimensionally a slot index, even when
-    // slotDurationMs == 1000).
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -392,8 +386,12 @@ object SnapshotLeaderLoop {
         val ConfirmationDepthK: Long =
           sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH").flatMap(_.toLongOption).getOrElse(255L)
 
+        // Tick at 5× slot duration: 5s in prod (1000ms slot), 2.5s in e2e (500ms slot).
+        // Slightly faster than the expected snapshot arrival rate so the finality
+        // monitor catches new tips reactively, but still amortizes the chain-walk +
+        // weight-fold cost over multiple slots.
         val finalityMonitor: Stream[F, Unit] = Stream
-          .awakeEvery[F](5.seconds)
+          .awakeEvery[F](FiniteDuration(5L * slotDurationMs, MILLISECONDS))
           .evalMap { _ =>
             for {
               allAtts <- tipTracker.allAttestations
@@ -401,15 +399,18 @@ object SnapshotLeaderLoop {
               activeCount <- stakeRegistry.observedActiveCount
               bestTip <- chainStore.bestTip
 
-              // Polkadot-style re-attestation. If our last self-attestation doesn't match current
+              // §5.1 visibility ticker. If our last self-attestation doesn't match current
               // bestTip — because chain-selection switched after a fork-branch arrived, a reorg
               // promoted a different tip, or we never attested anything yet — emit a fresh
               // self-attestation pointing at canonical. Without this, a stale self-att gets
               // filtered to zero weight by TipTracker.highestFinalizedOrdinal:143-151 (canonical-
               // hash filter) and our own vote never contributes to bestTip finality.
+              //
+              // `attestedAt` is wall-clock epoch ms via `Clock[F].realTime` — same Chronos-prep
+              // semantics as the peer-receive becameBestTip emit. Not a consensus slot.
               _ <- bestTip match {
                 case Some(tip) if !allAtts.get(selfId).exists(_.tipHash === tip.hash) =>
-                  SlotClock[F].currentSlot.flatMap { attestedAt =>
+                  Clock[F].realTime.map(_.toMillis).flatMap { attestedAt =>
                     NakamotoSyncDaemon.emitTipAttestation[F](
                       tipHash = tip.hash,
                       tipSlot = Slot(NonNegLong.unsafeFrom(tip.slot)),
@@ -422,7 +423,7 @@ object SnapshotLeaderLoop {
                       logger = logger
                     ) >> logger.info(
                       s"RE-ATTEST bestTip change: ord=${tip.ordinal} slot=${tip.slot} hash=${tip.hash.value.take(12)} " +
-                        s"attestedAt=${attestedAt.value.value} " +
+                        s"attestedAt=${attestedAt} " +
                         s"(prior self-att=${allAtts.get(selfId).map(_.tipHash.value.take(12)).getOrElse("none")})"
                     )
                   }
@@ -832,25 +833,28 @@ object SnapshotLeaderLoop {
                       .void
                       .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}")) >>
                       // Unify self-attestation with peer-attestation: route through the same emit
-                      // function the SyncDaemon uses on processValidSnapshot. Eliminates the previous
+                      // function the SyncDaemon uses on processValidSnapshot. Eliminates the
                       // double-implementation where the two paths used different `attestedAt` units
                       // and peer attestations shadowed self-attestations under TipTracker's "newer
                       // wins" rule (TipTracker:96-105).
                       //
-                      // `attestedAt` here is the consensus slot at which we produced — i.e. the slot
-                      // we won via VRF. Cluster-wide consistency comes from SlotClock honoring the
-                      // configured slotDurationMs (1000ms prod, 500ms e2e).
-                      NakamotoSyncDaemon.emitTipAttestation[F](
-                        tipHash = snapshotHash,
-                        tipSlot = slotRefined,
-                        tipOrdinal = lastKey.value.value + 1,
-                        attestedAt = slotRefined,
-                        sidecarClient = sidecarClient,
-                        tipTracker = tipTracker,
-                        selfId = selfId,
-                        keyPair = keyPair,
-                        logger = logger
-                      ) >>
+                      // `attestedAt` is wall-clock epoch ms via `Clock[F].realTime` (NOT
+                      // System.currentTimeMillis()). Wall-clock semantics here are deliberate —
+                      // keeps the `attestedAt` field reusable as a future Ouroboros-Chronos-style
+                      // timestamp gossip surface, per docs §3.1.
+                      Clock[F].realTime.map(_.toMillis).flatMap { attestedAt =>
+                        NakamotoSyncDaemon.emitTipAttestation[F](
+                          tipHash = snapshotHash,
+                          tipSlot = slotRefined,
+                          tipOrdinal = lastKey.value.value + 1,
+                          attestedAt = attestedAt,
+                          sidecarClient = sidecarClient,
+                          tipTracker = tipTracker,
+                          selfId = selfId,
+                          keyPair = keyPair,
+                          logger = logger
+                        )
+                      } >>
                       logger.info(
                         s"Produced snapshot ordinal=${lastKey.value.value + 1} slot=$currentSlot " +
                           s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"

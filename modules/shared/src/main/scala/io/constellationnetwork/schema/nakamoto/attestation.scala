@@ -16,11 +16,16 @@ import derevo.derive
   * and all its ancestors back to the last finalized tip become finalized.
   *
   * TipAttestations are wrapped in Signed[TipAttestation] for transport and verification.
+  *
+  * `attestedAt` is wall-clock epoch milliseconds at the time of attestation, sourced via `Clock[F].realTime` (NEVER
+  * `System.currentTimeMillis()`). It is **NOT** a consensus slot — wall-clock semantics here are deliberate, to keep the door open for a
+  * future Ouroboros Chronos-style time-sync layer that reuses the attestation gossip topic as a timestamp-claim transport. Today it is only
+  * used by `TipTracker.recordAttestation` for the "newer wins" rule, which compares Longs.
   */
 @derive(decoder, encoder, eqv, show)
 case class TipAttestation(
   tipHash: Hash, // hash of the endorsed snapshot
   tipSlot: Slot, // slot of that snapshot
   tipOrdinal: Long, // ordinal of that snapshot (Long to avoid circular deps with SnapshotOrdinal)
-  attestedAt: Slot // slot when this attestation was created
+  attestedAt: Long // wall-clock epoch ms when this attestation was created (Clock[F].realTime, NOT a slot)
 )

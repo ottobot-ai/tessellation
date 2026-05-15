@@ -25,9 +25,12 @@ object TipTrackerSuite extends SimpleIOSuite {
   // Helper to create a hash
   private def hash(s: String): Hash = Hash(s.padTo(64, '0'))
 
-  // Helper to create an attestation
+  // Helper to create an attestation. `attestedAt` is wall-clock epoch ms in production
+  // (sourced from `Clock[F].realTime`); in tests we pass a Slot for terseness and
+  // unpack to its raw Long value, which keeps the monotonic-newer-wins ordering the
+  // test cases assume without coupling the test fixtures to wall-clock minutiae.
   private def att(tipHash: Hash, tipSlot: Slot, tipOrdinal: Long, attestedAt: Slot): TipAttestation =
-    TipAttestation(tipHash, tipSlot, tipOrdinal, attestedAt)
+    TipAttestation(tipHash, tipSlot, tipOrdinal, attestedAt.value.value)
 
   // Setup StakeRegistry with N equal-weight validators
   private def setupRegistry(validators: Set[PeerId]): IO[StakeRegistry[IO]] =

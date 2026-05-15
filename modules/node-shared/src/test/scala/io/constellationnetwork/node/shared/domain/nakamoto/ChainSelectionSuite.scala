@@ -93,9 +93,9 @@ object ChainSelectionSuite extends SimpleIOSuite {
     for {
       (chainSelection, tracker) <- setupChainSelection(Set(peer1, peer2, peer3))
       // All three peers attest tipB — under blended fork choice, tipB would have won. Now it doesn't.
-      _ <- tracker.recordAttestation(peer1, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer2, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
-      _ <- tracker.recordAttestation(peer3, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11)))
+      _ <- tracker.recordAttestation(peer1, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11).value.value))
+      _ <- tracker.recordAttestation(peer2, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11).value.value))
+      _ <- tracker.recordAttestation(peer3, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11).value.value))
       result <- chainSelection.compare(tipA, tipB)
     } yield expect.same(tipA.hash, result.hash)
   }

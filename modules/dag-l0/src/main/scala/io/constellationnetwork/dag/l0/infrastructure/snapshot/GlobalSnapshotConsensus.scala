@@ -406,25 +406,6 @@ object GlobalSnapshotConsensus {
       _ <- {
 
         val pureGenesisTimeMs = nakamotoGenesisTimeMs
-        // Global slot provider. `currentSlot = (wallClock - genesis) / slotDurationMs`.
-        // Source for `attestedAt` consensus-slot reads in NakamotoSyncDaemon (peer receive)
-        // and SnapshotLeaderLoop (Phase 3 re-attestation ticker). `attestedAt` must be a
-        // CONSENSUS slot, not wall-clock seconds — slotDurationMs is 500ms in e2e, 1000ms
-        // in prod, so the Slot index runs at different rates than seconds. Reads the same
-        // `NAKAMOTO_SLOT_DURATION_MS` env var as SnapshotLeaderLoop's slot-tick so both
-        // computations agree on the slot index for any given wall-clock instant.
-        //
-        // Made implicit here — the single construction site — so downstream `[F[_]: ... :
-        // SlotClock]` context bounds (`SnapshotLeaderLoop.run`, `NakamotoSyncDaemon.run`)
-        // resolve through `SlotClock[F].currentSlot` at the call sites instead of threading
-        // the instance through every forwarding call.
-        implicit val slotClock: io.constellationnetwork.node.shared.domain.nakamoto.SlotClock[F] =
-          io.constellationnetwork.node.shared.domain.nakamoto.SlotClock.make[F](
-            io.constellationnetwork.node.shared.domain.nakamoto.SlotClock.Config(
-              genesisTimeMs = pureGenesisTimeMs,
-              slotDurationMs = sys.env.get("NAKAMOTO_SLOT_DURATION_MS").flatMap(_.toLongOption).getOrElse(1000L)
-            )
-          )
         for {
           nakLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("NakamotoConsensus").pure[F].toResource
           _ <- nakLogger
