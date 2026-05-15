@@ -914,7 +914,9 @@ object NakamotoSyncDaemon {
       producerId = peer.PeerId(producerHex)
       nowMs <- Clock[F].realTime.map(_.toMillis)
       att = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, nowMs)
-      _ <- tipTracker.recordAttestation(producerId, att)
+      // The producer-implicit attestation uses OUR local clock for `attestedAt`, so the
+      // skew gate (`TipTracker.MaxAttestationSkewMs`) is trivially satisfied here.
+      _ <- tipTracker.recordAttestation(producerId, att, nowMs)
 
       // Check if we should transition to Ready
       state <- stateRef.get
@@ -1074,14 +1076,15 @@ object NakamotoSyncDaemon {
 
             // Record attestation regardless (producer attests their own tip). `attestedAt`
             // is OUR wall-clock receive time via Clock[F].realTime — same Chronos-prep
-            // semantics as the becameBestTip-branch site above.
+            // semantics as the becameBestTip-branch site above. Skew gate trivially
+            // passes since `attestedAt` and `now` are both this node's local clock.
             tipHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
             tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
             producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
             producerId = peer.PeerId(producerHex)
             nowMs <- Clock[F].realTime.map(_.toMillis)
             att = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, nowMs)
-            _ <- tipTracker.recordAttestation(producerId, att)
+            _ <- tipTracker.recordAttestation(producerId, att, nowMs)
           } yield ()
 
         case Left(err) =>
@@ -1113,9 +1116,14 @@ object NakamotoSyncDaemon {
           attHash <- domainAtt.hash
           publicKey <- attesterHex.toPublicKey[F]
           valid <- Signing.verifySignature(attHash.getBytes, sigBytes)(publicKey)
+          // Chronos-prep: capture OUR local clock when the peer's attestation lands so
+          // `TipTracker.recordAttestation` can compare against the peer's claimed
+          // `attestedAt`. Badly-skewed peers (or attackers forging timestamps) are
+          // dropped inside the tracker before they pollute `T_count` finality (#136).
+          nowMs <- Clock[F].realTime.map(_.toMillis)
           _ <-
             if (valid)
-              tipTracker.recordAttestation(attesterId, domainAtt) >>
+              tipTracker.recordAttestation(attesterId, domainAtt, nowMs) >>
                 logger.info(
                   s"📨 Attestation for ordinal=${att.tipOrdinal} from=${attesterHex.value.take(16)}..."
                 )
@@ -1202,9 +1210,11 @@ object NakamotoSyncDaemon {
     keyPair: KeyPair,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
-    // Record locally first (so our own TipTracker sees it)
+    // Record locally first (so our own TipTracker sees it). The caller already sourced
+    // `attestedAt` from `Clock[F].realTime`, so passing the same value as `now` makes
+    // the skew gate (`TipTracker.MaxAttestationSkewMs`) trivially pass on self-emit.
     val localAtt = DomainTipAttestation(tipHash, tipSlot, tipOrdinal, attestedAt)
-    tipTracker.recordAttestation(selfId, localAtt) >>
+    tipTracker.recordAttestation(selfId, localAtt, attestedAt) >>
       // Sign via the standard Hasher pipeline: JSON-encode the domain TipAttestation → hash → sign the hash.
       // Same path as SignatureProof.fromData / Signed.forAsyncHasher — no custom serialization.
       HasherSelector[F].withCurrent { implicit hasher =>

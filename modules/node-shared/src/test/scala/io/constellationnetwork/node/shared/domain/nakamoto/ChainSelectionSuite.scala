@@ -2,6 +2,7 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 
 import cats.effect.IO
 
+import io.constellationnetwork.node.shared.infrastructure.metrics.NoOpMetrics
 import io.constellationnetwork.schema.nakamoto.slot.{Slot, VrfOutput}
 import io.constellationnetwork.schema.nakamoto.{ChainTip, TipAttestation}
 import io.constellationnetwork.schema.peer.PeerId
@@ -16,6 +17,11 @@ import weaver.SimpleIOSuite
   * Attestations are still threaded through `shouldSwitch`'s "don't revert below the finalized head" guard, but never tip selection.
   */
 object ChainSelectionSuite extends SimpleIOSuite {
+
+  // No-op Metrics typeclass instance — required by `TipTracker.make` since the
+  // skew-rejection counter (`dag_nakamoto_attestations_rejected_skew_total`) is
+  // emitted there. This suite never exercises the skew path so the noop is enough.
+  implicit private val metrics: io.constellationnetwork.node.shared.infrastructure.metrics.Metrics[IO] = NoOpMetrics.make
 
   private def pid(name: String): PeerId =
     PeerId(Hex(name.getBytes("UTF-8").map(b => f"$b%02x").mkString))
@@ -93,9 +99,10 @@ object ChainSelectionSuite extends SimpleIOSuite {
     for {
       (chainSelection, tracker) <- setupChainSelection(Set(peer1, peer2, peer3))
       // All three peers attest tipB — under blended fork choice, tipB would have won. Now it doesn't.
-      _ <- tracker.recordAttestation(peer1, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11).value.value))
-      _ <- tracker.recordAttestation(peer2, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11).value.value))
-      _ <- tracker.recordAttestation(peer3, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11).value.value))
+      // Pass `now == attestedAt` so the skew gate (TipTracker.MaxAttestationSkewMs) trivially passes.
+      _ <- tracker.recordAttestation(peer1, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11).value.value), slot(11).value.value)
+      _ <- tracker.recordAttestation(peer2, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11).value.value), slot(11).value.value)
+      _ <- tracker.recordAttestation(peer3, TipAttestation(tipB.hash, tipB.slot, tipB.ordinal, slot(11).value.value), slot(11).value.value)
       result <- chainSelection.compare(tipA, tipB)
     } yield expect.same(tipA.hash, result.hash)
   }

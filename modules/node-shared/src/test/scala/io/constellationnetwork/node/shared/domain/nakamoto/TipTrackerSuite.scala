@@ -2,6 +2,7 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 
 import cats.effect.IO
 
+import io.constellationnetwork.node.shared.infrastructure.metrics.NoOpMetrics
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema.nakamoto.TipAttestation
@@ -14,6 +15,11 @@ import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.SimpleIOSuite
 
 object TipTrackerSuite extends SimpleIOSuite {
+
+  // No-op Metrics typeclass instance — tests don't assert on counters so a noop suffices.
+  // The skew-rejection counter (`dag_nakamoto_attestations_rejected_skew_total`) still
+  // flows through this instance; the dedicated skew tests below assert behavior, not counts.
+  implicit private val metrics: io.constellationnetwork.node.shared.infrastructure.metrics.Metrics[IO] = NoOpMetrics.make
 
   // Helper to create PeerId from a name
   private def pid(name: String): PeerId =
@@ -46,6 +52,13 @@ object TipTrackerSuite extends SimpleIOSuite {
       tracker <- TipTracker.make[IO](registry)
     } yield (tracker, registry)
 
+  // Helper that passes the attestation's own `attestedAt` as `now` so the skew gate
+  // (TipTracker.MaxAttestationSkewMs) is trivially satisfied (skew=0). Existing tests
+  // assert behavior independent of wall-clock skew; the dedicated skew tests at the
+  // bottom of this file exercise the gate explicitly by passing custom `now` values.
+  private def record(tracker: TipTracker[IO], peerId: PeerId, attestation: TipAttestation): IO[Unit] =
+    tracker.recordAttestation(peerId, attestation, attestation.attestedAt)
+
   test("empty tracker has no heaviest tip") {
     for {
       (tracker, _) <- setupTracker(Set.empty)
@@ -60,7 +73,7 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(peer1))
-      _ <- tracker.recordAttestation(peer1, att(tipA, slotA, 100L, slot(11)))
+      _ <- record(tracker, peer1, att(tipA, slotA, 100L, slot(11)))
       heaviest <- tracker.heaviestTip
     } yield
       expect(heaviest.isDefined) &&
@@ -81,9 +94,9 @@ object TipTrackerSuite extends SimpleIOSuite {
       // 3 of 4 peers attest. Active fraction = 3/4 = 75% ≥ MinActiveQuorumFraction (50%),
       // so optimistic weighting kicks in: weight is computed against the active set (3 peers),
       // and all 3 attested the same tip → weight = 1.0. Finality threshold (2/3) is met.
-      _ <- tracker.recordAttestation(peer1, att(tipA, slot(10), 100L, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipA, slot(10), 100L, slot(11)))
-      _ <- tracker.recordAttestation(peer3, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer1, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer2, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer3, att(tipA, slot(10), 100L, slot(11)))
       isFinalized <- tracker.isFinalized(tipA)
       weight <- tracker.attestationWeight(tipA)
     } yield
@@ -98,10 +111,10 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(peer1))
-      _ <- tracker.recordAttestation(peer1, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer1, att(tipA, slot(10), 100L, slot(11)))
       weightABefore <- tracker.attestationWeight(tipA)
       // Newer attestation (attestedAt=12 > 11)
-      _ <- tracker.recordAttestation(peer1, att(tipB, slot(12), 102L, slot(12)))
+      _ <- record(tracker, peer1, att(tipB, slot(12), 102L, slot(12)))
       weightAAfter <- tracker.attestationWeight(tipA)
       weightB <- tracker.attestationWeight(tipB)
     } yield
@@ -120,10 +133,10 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(peer1, peer2, peer3, peer4))
-      _ <- tracker.recordAttestation(peer1, att(tipA, slot(10), 100L, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipA, slot(10), 100L, slot(11)))
-      _ <- tracker.recordAttestation(peer3, att(tipB, slot(10), 100L, slot(11)))
-      _ <- tracker.recordAttestation(peer4, att(tipB, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer1, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer2, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer3, att(tipB, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer4, att(tipB, slot(10), 100L, slot(11)))
       isFinalizedA <- tracker.isFinalized(tipA)
       isFinalizedB <- tracker.isFinalized(tipB)
       weightA <- tracker.attestationWeight(tipA)
@@ -142,7 +155,7 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(peer1))
-      _ <- tracker.recordAttestation(peer1, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer1, att(tipA, slot(10), 100L, slot(11)))
       weight <- tracker.attestationWeight(unknownTip)
     } yield expect.same(Ratio.Zero, weight)
   }
@@ -169,8 +182,8 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(peer1, peer2))
-      _ <- tracker.recordAttestation(peer1, att(tipOld, slot(5), 50L, slot(6)))
-      _ <- tracker.recordAttestation(peer2, att(tipNew, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer1, att(tipOld, slot(5), 50L, slot(6)))
+      _ <- record(tracker, peer2, att(tipNew, slot(10), 100L, slot(11)))
       beforePrune <- tracker.allAttestations
       _ <- tracker.pruneBelow(slot(10))
       afterPrune <- tracker.allAttestations
@@ -191,9 +204,9 @@ object TipTrackerSuite extends SimpleIOSuite {
     for {
       (tracker, _) <- setupTracker(Set(peer1, peer2, peer3))
       // 2 peers on A, 1 peer on B
-      _ <- tracker.recordAttestation(peer1, att(tipA, slot(10), 100L, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipA, slot(10), 100L, slot(11)))
-      _ <- tracker.recordAttestation(peer3, att(tipB, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer1, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer2, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer3, att(tipB, slot(10), 100L, slot(11)))
       heaviest <- tracker.heaviestTip
     } yield
       expect(heaviest.isDefined) &&
@@ -211,7 +224,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       // Only peer1 and peer2 are validators
       (tracker, _) <- setupTracker(Set(peer1, peer2))
       // nonValidator attests but has 0 stake
-      _ <- tracker.recordAttestation(nonValidator, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, nonValidator, att(tipA, slot(10), 100L, slot(11)))
       weight <- tracker.attestationWeight(tipA)
       isFinalized <- tracker.isFinalized(tipA)
     } yield
@@ -230,8 +243,8 @@ object TipTrackerSuite extends SimpleIOSuite {
       // 2 of 3 peers attest. Active fraction = 2/3 ≈ 66.7% ≥ MinActiveQuorumFraction (50%),
       // so optimistic weighting is active: both attesters voted the same tip, weight = 1.0
       // against the 2-peer active set, which trivially exceeds the 2/3 finality threshold.
-      _ <- tracker.recordAttestation(peer1, att(tipA, slot(10), 100L, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer1, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer2, att(tipA, slot(10), 100L, slot(11)))
       weight <- tracker.attestationWeight(tipA)
       isFinalized <- tracker.isFinalized(tipA)
     } yield
@@ -264,9 +277,9 @@ object TipTrackerSuite extends SimpleIOSuite {
     for {
       (tracker, _) <- setupTracker(Set(peer1))
       // First: newer attestation
-      _ <- tracker.recordAttestation(peer1, att(tipB, slot(12), 102L, slot(15)))
+      _ <- record(tracker, peer1, att(tipB, slot(12), 102L, slot(15)))
       // Then try to record older attestation
-      _ <- tracker.recordAttestation(peer1, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer1, att(tipA, slot(10), 100L, slot(11)))
       weightA <- tracker.attestationWeight(tipA)
       weightB <- tracker.attestationWeight(tipB)
     } yield
@@ -283,8 +296,8 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(peer1, peer2))
-      _ <- tracker.recordAttestation(peer1, att(tipA, slot(10), 100L, slot(11)))
-      _ <- tracker.recordAttestation(peer2, att(tipB, slot(12), 102L, slot(13)))
+      _ <- record(tracker, peer1, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer2, att(tipB, slot(12), 102L, slot(13)))
       all <- tracker.allAttestations
     } yield
       expect.same(2, all.size) &&
@@ -311,9 +324,9 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(gl0_0, gl0_1, gl0_2))
-      _ <- tracker.recordAttestation(gl0_0, att(hashA100, slot(200), 100L, slot(201)))
-      _ <- tracker.recordAttestation(gl0_1, att(hashA100, slot(200), 100L, slot(201)))
-      _ <- tracker.recordAttestation(gl0_2, att(hashB100, slot(205), 100L, slot(206)))
+      _ <- record(tracker, gl0_0, att(hashA100, slot(200), 100L, slot(201)))
+      _ <- record(tracker, gl0_1, att(hashA100, slot(200), 100L, slot(201)))
+      _ <- record(tracker, gl0_2, att(hashB100, slot(205), 100L, slot(206)))
 
       // gl0-0's view: canonical chain A → ord 100 canonical hash = hashA100.
       // gl0-0 is excluded as self; gl0-1's matching attestation alone = 1/3 < 2/3.
@@ -365,9 +378,9 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(peer1, peer2, peer3))
-      _ <- tracker.recordAttestation(peer1, att(h70, slot(140), 70L, slot(141)))
-      _ <- tracker.recordAttestation(peer2, att(h60, slot(120), 60L, slot(121)))
-      _ <- tracker.recordAttestation(peer3, att(h50, slot(100), 50L, slot(101)))
+      _ <- record(tracker, peer1, att(h70, slot(140), 70L, slot(141)))
+      _ <- record(tracker, peer2, att(h60, slot(120), 60L, slot(121)))
+      _ <- record(tracker, peer3, att(h50, slot(100), 50L, slot(101)))
 
       result <- tracker.highestFinalizedOrdinal(
         observer,
@@ -400,8 +413,8 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(self, peer))
-      _ <- tracker.recordAttestation(self, att(h100, slot(200), 100L, slot(201)))
-      _ <- tracker.recordAttestation(peer, att(h100, slot(200), 100L, slot(201)))
+      _ <- record(tracker, self, att(h100, slot(200), 100L, slot(201)))
+      _ <- record(tracker, peer, att(h100, slot(200), 100L, slot(201)))
 
       // Self-view: self-attestation excluded, peer alone = 1/2 < 2/3 → no finality
       selfView <- tracker.highestFinalizedOrdinal(
@@ -446,10 +459,10 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(self, peer1, peer2, peer3))
-      _ <- tracker.recordAttestation(self, att(h100, slot(200), 100L, slot(201)))
-      _ <- tracker.recordAttestation(peer1, att(h100, slot(200), 100L, slot(201)))
-      _ <- tracker.recordAttestation(peer2, att(h100, slot(200), 100L, slot(201)))
-      _ <- tracker.recordAttestation(peer3, att(h100, slot(200), 100L, slot(201)))
+      _ <- record(tracker, self, att(h100, slot(200), 100L, slot(201)))
+      _ <- record(tracker, peer1, att(h100, slot(200), 100L, slot(201)))
+      _ <- record(tracker, peer2, att(h100, slot(200), 100L, slot(201)))
+      _ <- record(tracker, peer3, att(h100, slot(200), 100L, slot(201)))
 
       selfView <- tracker.highestFinalizedOrdinal(
         self,
@@ -461,5 +474,74 @@ object TipTrackerSuite extends SimpleIOSuite {
       // (post-self-exclusion) active set under optimistic weighting → finalize.
       expect(selfView.isDefined) &&
         expect.same(100L, selfView.get._1)
+  }
+
+  // -- Skew gate (#140) --
+  //
+  // `TipTracker.MaxAttestationSkewMs` defends against peers (badly-skewed or malicious)
+  // submitting attestations whose claimed `attestedAt` is more than ±60s away from our
+  // local wall-clock when `recordAttestation` runs. Skewed attestations are dropped
+  // silently (counter `dag_nakamoto_attestations_rejected_skew_total` increments via
+  // the no-op Metrics here; production wires the real registry). The constant is read
+  // from `NAKAMOTO_MAX_ATTESTATION_SKEW_MS` at JVM start — tests use whatever the
+  // process saw at boot. With the default 60_000ms the boundary numbers below sit
+  // safely inside / outside that window.
+
+  test("recordAttestation drops attestation with attestedAt > now + 60s") {
+    val peer1 = pid("peer1")
+    val tipA = hash("tipA")
+    val nowMs = 1_700_000_000_000L
+    // Claim 60_001ms in the future — just past the +60s ceiling.
+    val skewedFuture = TipAttestation(tipA, slot(10), 100L, nowMs + 60_001L)
+
+    for {
+      (tracker, _) <- setupTracker(Set(peer1))
+      _ <- tracker.recordAttestation(peer1, skewedFuture, nowMs)
+      all <- tracker.allAttestations
+      weight <- tracker.attestationWeight(tipA)
+    } yield
+      // Attestation rejected → no entry recorded, zero weight.
+      expect(all.isEmpty) &&
+        expect.same(Ratio.Zero, weight)
+  }
+
+  test("recordAttestation drops attestation with attestedAt < now - 60s") {
+    val peer1 = pid("peer1")
+    val tipA = hash("tipA")
+    val nowMs = 1_700_000_000_000L
+    // Claim 60_001ms in the past — just past the -60s floor.
+    val skewedPast = TipAttestation(tipA, slot(10), 100L, nowMs - 60_001L)
+
+    for {
+      (tracker, _) <- setupTracker(Set(peer1))
+      _ <- tracker.recordAttestation(peer1, skewedPast, nowMs)
+      all <- tracker.allAttestations
+      weight <- tracker.attestationWeight(tipA)
+    } yield
+      expect(all.isEmpty) &&
+        expect.same(Ratio.Zero, weight)
+  }
+
+  test("recordAttestation accepts attestation within ±60s window") {
+    val peer1 = pid("peer1")
+    val peer2 = pid("peer2")
+    val tipA = hash("tipA")
+    val nowMs = 1_700_000_000_000L
+    // Two attestations near the boundary on each side — both must be accepted.
+    val nearFuture = TipAttestation(tipA, slot(10), 100L, nowMs + 59_999L)
+    val nearPast = TipAttestation(tipA, slot(10), 100L, nowMs - 59_999L)
+
+    for {
+      (tracker, _) <- setupTracker(Set(peer1, peer2))
+      _ <- tracker.recordAttestation(peer1, nearFuture, nowMs)
+      _ <- tracker.recordAttestation(peer2, nearPast, nowMs)
+      all <- tracker.allAttestations
+      weight <- tracker.attestationWeight(tipA)
+    } yield
+      // Both inside the window → both recorded → full attestation weight on tipA.
+      expect.same(2, all.size) &&
+        expect(all.contains(peer1)) &&
+        expect(all.contains(peer2)) &&
+        expect.same(Ratio.One, weight)
   }
 }

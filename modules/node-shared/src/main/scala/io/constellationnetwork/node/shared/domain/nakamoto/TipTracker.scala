@@ -3,12 +3,16 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 import cats.effect.kernel.{Ref, Sync}
 import cats.syntax.all._
 
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema.nakamoto.TipAttestation
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
+
+import eu.timepit.refined.auto._
+import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Tracks attestations from validators and determines finality.
   *
@@ -23,8 +27,16 @@ import io.constellationnetwork.security.hash.Hash
   */
 trait TipTracker[F[_]] {
 
-  /** Record an attestation from a peer. Newer attestations supersede older ones. */
-  def recordAttestation(peerId: PeerId, attestation: TipAttestation): F[Unit]
+  /** Record an attestation from a peer. Newer attestations supersede older ones.
+    *
+    * `now` is the receiver's local wall-clock in epoch milliseconds (`Clock[F].realTime.toMillis`) — used to defend against badly-skewed
+    * peers (or attackers) submitting attestations with absurd `attestedAt` values. Attestations whose `|attestation.attestedAt - now|`
+    * exceeds `TipTracker.MaxAttestationSkewMs` are dropped (with a counter increment + WARN log) so they cannot pollute the `T_count`
+    * finality sum (#136) once that trigger lands. Self-attestations on this node always pass the gate because the emit sites
+    * (`SnapshotLeaderLoop.onSlotWon`, `NakamotoSyncDaemon.emitTipAttestation`) source `attestedAt` from the same `Clock[F].realTime` that's
+    * threaded through `now` here.
+    */
+  def recordAttestation(peerId: PeerId, attestation: TipAttestation, now: Long): F[Unit]
 
   /** Get the current attestation weight for a tip hash. Returns stake fraction [0,1]. */
   def attestationWeight(tipHash: Hash): F[Ratio]
@@ -98,24 +110,58 @@ object TipTracker {
       .map(Ratio(_, 18))
       .getOrElse(Ratio(2, 3))
 
-  def make[F[_]: Sync](stakeRegistry: StakeRegistry[F]): F[TipTracker[F]] =
+  /** Maximum allowed clock skew (epoch ms) between a peer's claimed `attestedAt` and our local `Clock[F].realTime` when `recordAttestation`
+    * runs.
+    *
+    * Attestations outside `±MaxAttestationSkewMs` are dropped (counter `dag_nakamoto_attestations_rejected_skew_total` + WARN log) so a
+    * badly-skewed or malicious peer cannot pollute `T_count` finality (#136). The bound is intentionally generous (default 60s) for today's
+    * loosely-coordinated clocks; it can be tightened in production after the Ouroboros-Chronos timestamp-gossip work lands, because
+    * `attestedAt` is wall-clock epoch ms (not a consensus slot) precisely to leave that future surface open.
+    *
+    * Default: 60_000L ms. Override via env `NAKAMOTO_MAX_ATTESTATION_SKEW_MS` (e.g. `30000` for tighter, `120000` for looser). Read once at
+    * JVM start so flipping in-flight requires a restart.
+    */
+  val MaxAttestationSkewMs: Long =
+    sys.env
+      .get("NAKAMOTO_MAX_ATTESTATION_SKEW_MS")
+      .flatMap(_.toLongOption)
+      .getOrElse(60000L)
+
+  def make[F[_]: Sync: Metrics](stakeRegistry: StakeRegistry[F]): F[TipTracker[F]] =
     for {
       attestationsRef <- Ref.of[F, Map[PeerId, TipAttestation]](Map.empty)
       finalizedRef <- Ref.of[F, Option[(Hash, Slot)]](None)
+      logger = Slf4jLogger.getLoggerFromName[F]("TipTracker")
     } yield
       new TipTracker[F] {
 
-        def recordAttestation(peerId: PeerId, attestation: TipAttestation): F[Unit] =
-          attestationsRef.update { current =>
-            current.get(peerId) match {
-              case Some(existing) if existing.attestedAt >= attestation.attestedAt =>
-                // Existing attestation is same or newer, keep it
-                current
-              case _ =>
-                // New or newer attestation, record it
-                current.updated(peerId, attestation)
-            }
-          } >> stakeRegistry.markActive(peerId) // Track this peer as actively participating
+        def recordAttestation(peerId: PeerId, attestation: TipAttestation, now: Long): F[Unit] = {
+          val skew = math.abs(attestation.attestedAt - now)
+          if (skew > MaxAttestationSkewMs)
+            // Chronos-prep defensive layer: reject attestations whose claimed wall-clock is more than
+            // ±MaxAttestationSkewMs away from our local clock. Without this gate a single peer with a
+            // badly-misconfigured system clock (or one actively forging `attestedAt`) would be free to
+            // submit attestations that fall in the future / far past, polluting `T_count` finality
+            // (#136) and bypassing the eventual timestamp-gossip aggregation. `stakeRegistry.markActive`
+            // is intentionally NOT called on rejection — we don't want a skewed peer to count toward
+            // the active-quorum fraction either.
+            logger.warn(
+              s"⚠️ Rejecting attestation from peer=${peerId.value.value.take(16)}... " +
+                s"ordinal=${attestation.tipOrdinal} attestedAt=${attestation.attestedAt} " +
+                s"now=$now skew=${skew}ms (max=${MaxAttestationSkewMs}ms)"
+            ) >> Metrics[F].incrementCounter("dag_nakamoto_attestations_rejected_skew_total")
+          else
+            attestationsRef.update { current =>
+              current.get(peerId) match {
+                case Some(existing) if existing.attestedAt >= attestation.attestedAt =>
+                  // Existing attestation is same or newer, keep it
+                  current
+                case _ =>
+                  // New or newer attestation, record it
+                  current.updated(peerId, attestation)
+              }
+            } >> stakeRegistry.markActive(peerId) // Track this peer as actively participating
+        }
 
         def attestationWeight(tipHash: Hash): F[Ratio] =
           for {
