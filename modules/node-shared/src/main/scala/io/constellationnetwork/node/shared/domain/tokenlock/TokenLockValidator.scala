@@ -74,7 +74,7 @@ object TokenLockValidator {
             tokenLockLimitsConfig,
             currentTokenLocks
           )
-          replacementV = validateReplaceTokenLockRef(signedTokenLock, currentTokenLocks)
+          replacementV = validateReplaceTokenLockRef(signedTokenLock)
         } yield
           signatureValidations
             .productR(tokenLocksLimitV)
@@ -120,12 +120,11 @@ object TokenLockValidator {
           signedTx.validNec
 
       private def validateReplaceTokenLockRef(
-        tokenLock: Signed[TokenLock],
-        currentTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+        tokenLock: Signed[TokenLock]
       ): TokenLockValidationErrorOr[Signed[TokenLock]] =
         tokenLock.replaceTokenLockRef match {
           case None => tokenLock.validNec[TokenLockValidationError]
-          case Some(ref) =>
+          case Some(_) =>
             if (tokenLock.currencyId.nonEmpty)
               (ReplacementIsNotSupported(tokenLock.currencyId): TokenLockValidationError).invalidNec[Signed[TokenLock]]
             else
