@@ -1,9 +1,12 @@
 # Attestation flow and finality in Tessellation-Nakamoto GL0
 
-**Status:** living document. Last updated 2026-05-14 — 4-phase formalization,
-GKL property mapping, eta-rotation R ≥ 3k₁ bound (unit migrated to snapshots),
-chain-selection scope per phase. Supersedes the prior single-tier finality
-framing.
+**Status:** living document. Last updated 2026-05-15 — finality-trigger stack
+landed: `FinalityTrigger[F]` typeclass refactor, `T_count` (1-validator-1-vote)
+and `T_depth2` (archival) triggers wired, attestation skew-rejection,
+chain-quality observable + HTTP route, and `MptOverlay.pruneBelow` Phase-3
+sink. Builds on the 4-phase formalization, GKL property mapping, eta-rotation
+R ≥ 3k₁ bound, chain-selection-scope-per-phase from 2026-05-14. Supersedes
+the prior single-tier finality framing.
 
 This document formalizes the chain-growth model for Tessellation-Nakamoto and
 describes how the operational components (attestation, chain selection,
@@ -49,7 +52,7 @@ Taktikos (FC 2023).
 | **0** | **PENDING** | **Chain Growth** | overlay ChangeSet active; rivals at same ordinal expected; gossip publish allowed; **no** follower read |
 | **1** | **PROVISIONAL** | **Chain Quality (contested)** | on canonical bestTip ancestor; attestation weight accumulating; still **no** follower read |
 | **2** | **SETTLED** | **Chain Quality (resolved)** | MPT overlay folds into base; G1 boundary — followers consume; SC binary confirms; eta inputs locked |
-| **3** | **ARCHIVAL** | **Common Prefix** | depth-k₂ deep; undo journal pruned; aggregate-signature cert producible; light-client trust anchor |
+| **3** | **ARCHIVAL** | **Common Prefix** | depth-k₂ deep; **undo journal pruned** (resolved via `MptOverlay.pruneBelow`, commit `173e6a7d` / #139); aggregate-signature cert producible *(reserved)*; light-client trust anchor *(reserved)* |
 
 The intuition:
 - **Chain Growth is strongest at the tip** — Phase 0 is where blocks are
@@ -72,27 +75,47 @@ which any single one is sufficient:
 
 | Trigger | Test | Source |
 |---|---|---|
-| `T_count` | `|attesters with canonical-hash match| ≥ ⌈|active|/2⌉ + 1` | future — 1-validator-1-vote; Sybil-resistant for equal-stake |
-| `T_weight` | `Σ stakeᵢ across canonical-hash attesters ≥ 2/3 active stake` | `TipTracker.FinalityThreshold` (`NAKAMOTO_ATTESTATION_THRESHOLD`) |
-| `T_depth1` | `tip.ordinal - lastFinalizedOrdinal > k₁` (default 255) | `SnapshotLeaderLoop.ConfirmationDepthK` (`NAKAMOTO_CONFIRMATION_DEPTH`) |
+| `T_count` | `|attesters with canonical-hash match| ≥ ⌈2/3 · validatorCount⌉` (self-excluded; BigInt ceil math) | `TCountTrigger.make` (`TipTracker.FinalityThreshold` shared with `T_weight`) |
+| `T_weight` | `Σ stakeᵢ across canonical-hash attesters ≥ 2/3 active stake` (self-excluded, #133) | `TWeightTrigger.make` (`TipTracker.FinalityThreshold` / `NAKAMOTO_ATTESTATION_THRESHOLD`) |
+| `T_depth1` | `tip.ordinal - lastFinalizedOrdinal > k₁` (default 255) | `TDepth1Trigger.make` (`SnapshotLeaderLoop.ConfirmationDepthK` / `NAKAMOTO_CONFIRMATION_DEPTH`) |
 
-Today only `T_weight` and `T_depth1` are wired. The proposed refactor
-(`FinalityTrigger[F]` typeclass) makes `T_count` a drop-in addition and
-opens the path for future triggers (NIPoPoW superblock anchors, etc.).
+Today `T_weight`, `T_count`, and `T_depth1` are all wired and evaluated on
+every 5s tick of `SnapshotLeaderLoop.finalityMonitor`. Each is a
+[`FinalityTrigger[F]`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/FinalityTrigger.scala)
+backed by a monotone `Ref[F, SnapshotOrdinal]` (`evaluateAndAdvance` only
+ever increases). The typeclass refactor landed in commit `30a2fa73`; the
+`T_count` builder landed in `7003be21`. The composition opens the path for
+future triggers (NIPoPoW superblock anchors, etc.) — adding one is a single
+`FinalityTrigger.make` call without touching `finalityMonitor` internals.
 
 The semantics are **max-of**: the Phase 2 boundary at any tick is the
 maximum `latestQualifying` ordinal across all registered Phase-2 triggers.
 Each trigger gives a *sufficient* condition, not a *necessary* one.
+`FinalityTrigger.triggersFor(ord)` (set-valued lookup) inverts the
+relationship and answers "which triggers qualified this ordinal?" — pure
+observability, no chain walk. This drives the chain-quality observable
+described in §5.5.
 
 ### 0.3 Trigger (Phase 2 → 3)
 
-| Trigger | Test | Rationale |
+| Trigger | Test | Source |
 |---|---|---|
-| `T_depth2` | `tip.ordinal - lastFinalizedOrdinal > k₂` | Cardano-equivalent CP-violation < 10⁻¹². Target `k₂ = 2¹⁶ = 65536` snapshots. |
+| `T_depth2` | `bestTipOrdinal - k₂` qualifies; default `k₂ = 2¹⁶ = 65536` | `TDepth2Trigger.make` (`SnapshotLeaderLoop.ArchivalDepthK` / `NAKAMOTO_ARCHIVAL_DEPTH`) |
 
-`T_depth2` is the cryptographic-equivalent "never rollback" bound. Once
-reached, downstream subsystems (overlay history pruning, aggregate
-certificate emission, light-client anchor publication) become safe.
+`T_depth2` is the cryptographic-equivalent "never rollback" bound (Cardano-
+equivalent CP-violation < 10⁻¹²). Wired via commit `06455f98` (#137): the
+same `FinalityTrigger[F]` typeclass used by the Phase 1→2 triggers. When
+its `latestQualifyingOrdinal` advances, `finalityMonitor` emits an
+`ARCHIVAL-FINALIZED` INFO log and the `dag_nakamoto_archival_finalized`
+counter / `dag_nakamoto_archival_ordinal` gauge.
+
+Downstream sinks:
+
+- **Overlay history pruning** — landed via `MptOverlay.pruneBelow(ord)`
+  (commit `173e6a7d`, #139): drops `undoJournalRef` and `finalizedRef`
+  entries strictly below the new archival watermark. Idempotent.
+- **Aggregate-signature certificate** (Mithril-equivalent) — reserved.
+- **Light-client anchor publication** — reserved.
 
 ### 0.4 Component scope per phase
 
@@ -109,9 +132,9 @@ subsystem has a well-defined active phase range:
 | MPT overlay `finalizeBranch` (fold into base) | at Phase 2 boundary | fires on Phase 1 → 2 transition |
 | G1 follower consumption (dl1/cl1/ml0 pull) | from Phase 2 | `pullFinalityGated` |
 | Eta-rotation use of period j VRF outputs | from Phase 2 | the first 2/3 of period j must reach Phase 2 before period j+1 begins |
-| Depth trigger `T_depth2` | 2 → advances to 3 | archival depth gate |
-| Undo journal pruning, overlay history shedding | from Phase 3 | reorg-recovery structures no longer required |
-| Aggregate-signature certificate (Mithril-equivalent) | from Phase 3 | light-client trust anchor |
+| Depth trigger `T_depth2` | 2 → advances to 3 | archival depth gate (default `k₂` = 65536) |
+| Undo journal pruning, overlay history shedding | from Phase 3 | **resolved** — `MptOverlay.pruneBelow(ord)` driven by `T_depth2.latestQualifyingOrdinal` (commit `173e6a7d`, #139) |
+| Aggregate-signature certificate (Mithril-equivalent) | from Phase 3 | *reserved* — light-client trust anchor |
 
 **The density rule (Genesis maxvalid-bg) is operationally bounded to
 Phase 0/1.** Once a snapshot reaches Phase 2, no chain-selection rule can
@@ -249,7 +272,7 @@ own subscription streams for typed `pb.Snapshot` / `pb.TipAttestation`.
 ![Self-attestation broadcast](attestation-self-broadcast.png)
 ([`attestation-self-broadcast.dot`](attestation-self-broadcast.dot))
 
-When a node's `slotTick` fires (`SnapshotLeaderLoop.scala:238`,
+When a node's `slotTick` fires (`SnapshotLeaderLoop.scala`, `val slotTick`,
 configurable via `NAKAMOTO_SLOT_DURATION_MS`):
 
 1. Reads the **slot gap** from `lastKnownSlotRef`; computes own relative
@@ -304,6 +327,20 @@ Earlier iterations used `System.currentTimeMillis()` (non-typed) and
 later attempted `attestedAt: Slot` keyed to a `SlotClock` (dimensionally
 clean but blocked the Chronos use-case). The current `Long` epoch-ms
 shape is stable.
+
+**Receive-side skew sanity bound (commit `422e1a6b`).** Because
+`attestedAt` is wall-clock and feeds `T_count` (each peer is exactly one
+vote), a badly-skewed or malicious peer could otherwise pollute the
+count-finality sum with attestations whose claimed time is far in the
+past/future. `TipTracker.recordAttestation` now drops attestations whose
+`|attestation.attestedAt - now|` exceeds `TipTracker.MaxAttestationSkewMs`
+(default 60_000 ms, override via env `NAKAMOTO_MAX_ATTESTATION_SKEW_MS`).
+Rejected attestations increment the `dag_nakamoto_attestations_rejected_skew_total`
+counter and log at WARN — `stakeRegistry.markActive` is intentionally not
+called on rejection, so a skewed peer also doesn't count toward the
+active-quorum fraction. The bound is intentionally generous today and
+can be tightened in production once the Ouroboros-Chronos timestamp-gossip
+work lands.
 
 ---
 
@@ -366,14 +403,14 @@ load-bearing for correctness — it is a recovery affordance only.
 ![Finality monitor](finality-monitor.png)
 ([`finality-monitor.dot`](finality-monitor.dot))
 
-`SnapshotLeaderLoop.scala:381-552`. On every 5s tick:
+`SnapshotLeaderLoop.scala:489-802` (`val finalityMonitor`). On every
+5s tick:
 
 ### 5.1 Phase-1 visibility check (re-attestation ticker)
 
-`SnapshotLeaderLoop.scala:396-412`. If `allAtts(selfId).tipHash !== bestTip.hash`
-(our last self-attestation doesn't match current canonical), emit a
-fresh self-attestation pointing at bestTip. Log at INFO:
-`RE-ATTEST bestTip change …`.
+If `allAtts(selfId).tipHash !== bestTip.hash` (our last self-attestation
+doesn't match current canonical), emit a fresh self-attestation pointing
+at bestTip. Log at INFO: `RE-ATTEST bestTip change …`.
 
 **Operationally**: a Phase 0 → Phase 1 visibility patch. Rescues our
 contribution to T_weight / T_count when chain-selection has moved our
@@ -384,9 +421,14 @@ This is a *safety net*, not the primary self-attestation mechanism (see
 
 ### 5.2 T_depth1: depth-k₁ finality (Phase 1 → Phase 2 trigger)
 
-`SnapshotLeaderLoop.scala:425-481`. If
-`tip.ordinal - lastFinalizedOrdinal > k₁` (default 255), the snapshot at
-`tip.ordinal - k₁` is structurally finalized:
+Driven by `TDepth1Trigger.make(ConfirmationDepthK)` (`FinalityTrigger.scala`,
+`FinalityTrigger.fromRef` factory backing a monotone `Ref[F, SnapshotOrdinal]`).
+Its `latestQualifyingOrdinal` is monotone non-decreasing — once it has
+qualified ordinal N, every ord ≤ N is qualified.
+
+On each tick `finalityMonitor` runs `tDepth1.evaluateAndAdvance(state)`
+(`bestTipOrdinal - k₁`, clamped). If the result beats `lastFinalizedOrdinal`,
+the snapshot at `tDepth1.latestQualifyingOrdinal` is structurally finalized:
 
 1. `walkBackTo(tip.hash, finalizeAtOrdinal)` returns the canonical hash.
 2. `chainStore.get(canonicalHash)` returns the stored snapshot (read its
@@ -394,21 +436,34 @@ This is a *safety net*, not the primary self-attestation mechanism (see
 3. Apply the four-write sink: `tipTracker.markFinalized` →
    `pruneBelow` → `chainStore.finalize` → `mptOverlay.finalizeBranch`.
 
-This is the Bitcoin-style probabilistic CP fallback.
+This is the Bitcoin-style probabilistic CP fallback. No semantic change
+from the prior inline implementation — only the gate is lifted into the
+typeclass.
 
 ### 5.3 T_weight: attestation-2/3 finality (Phase 1 → Phase 2 trigger)
 
-`SnapshotLeaderLoop.scala:489-543`. Calls
-`tipTracker.highestFinalizedOrdinal(threshold=2/3, canonicalHashAt = walkBackTo(tip.hash, _))`:
+Driven by `TWeightTrigger.make(tipTracker, TipTracker.FinalityThreshold)`,
+which wraps
+`TipTracker.highestFinalizedOrdinal(selfId, threshold, canonicalHashAt = walkBackTo(tip.hash, _))`:
 
-`TipTracker.highestFinalizedOrdinal` (`TipTracker.scala:133-160`):
 - Walks all attestations sorted by `tipOrdinal` descending.
-- For each `(peerId, att)`: looks up `canonicalHashAt(att.tipOrdinal)` —
+- **Self-exclusion** (commit `95471c7f`, task #133): drops the entry keyed
+  by `state.selfId` BEFORE the canonical-hash filter. Without this, a node
+  can self-finalize a divergent fork and the `chainStore.finalize`
+  finality-safety gate then refuses the canonical hash — the "fork-recovery
+  deadlock" of #119 (P-11b partial mitigation; full re-bootstrap is in
+  progress as task #141). See the doc-comment on
+  `TipTracker.highestFinalizedOrdinal` for the full rationale.
+- For each remaining `(peerId, att)`: looks up `canonicalHashAt(att.tipOrdinal)` —
   the hash on **our** canonical chain at that ordinal. If it matches
   `att.tipHash`, accumulate `stakeRegistry.optimisticRelativeStake(peerId)`;
   else contribute zero. (Canonical-hash filter — prevents cross-fork
   contamination.)
 - Returns highest ordinal where cumulative weight ≥ 2/3.
+
+The trigger's `evaluateAndAdvance` updates a monotone Ref so
+`FinalityTrigger.triggersFor(ord)` correctly reports membership for later
+lookups (§5.5).
 
 If returned ordinal beats `lastFinalizedOrdinal` AND T_depth1 didn't
 fire in the same tick:
@@ -419,11 +474,74 @@ If `walkBackTo` returns `None` (we're on a fork not containing the
 attested ordinal) — enqueue `chainSyncRequestQueue.request(finalOrdinal)`
 to proactively pull the better chain.
 
-### 5.4 (Future) T_depth2: archival finality (Phase 2 → Phase 3 trigger)
+### 5.4 T_depth2: archival finality (Phase 2 → Phase 3 trigger)
 
-Not yet wired. Once Phase 3 sinks (overlay history pruning, aggregate
-certificate emission) are spec'd, this becomes a third gate on the same
-tick.
+~~Not yet wired.~~ **Wired via commit `06455f98`** (task #137). Built by
+`TDepth2Trigger.make(ArchivalDepthK)` — structurally identical to
+`TDepth1Trigger`, only the constant differs (`k₂` default 65536 vs
+`k₁` default 255, env `NAKAMOTO_ARCHIVAL_DEPTH`).
+
+When `tDepth2.latestQualifyingOrdinal` strictly outruns the local archival
+watermark `lastArchivalOrdinalRef`, `finalityMonitor`:
+
+- Advances `lastArchivalOrdinalRef` to the new qualifying ordinal.
+- Logs at INFO: `ARCHIVAL-FINALIZED ordinal=N (tip ord=M, k₂=65536)`.
+- Increments `dag_nakamoto_archival_finalized` counter, updates
+  `dag_nakamoto_archival_ordinal` gauge.
+- Calls `mptOverlay.pruneBelow(archivalQualifying)` — the Phase-3
+  overlay-history prune sink (#139, commit `173e6a7d`). Drops
+  `undoJournalRef` and `finalizedRef` entries strictly below the
+  watermark.
+
+Reserved Phase-3 sinks (aggregate-signature certificate, light-client
+trust anchor) plug in at the same advance point without touching the
+trigger.
+
+### 5.5 Chain-quality observable
+
+`FinalityTrigger.triggersFor(triggers, ord): F[Set[Kind]]` answers
+"which finality triggers qualified ordinal N?" — a pure set-valued
+lookup over each trigger's monotone `latestQualifyingOrdinal` (no chain
+walk). Used at two seams:
+
+**Sample at `chainStore.finalize` time** (commit `866cd598`,
+`emitChainQuality` in `SnapshotLeaderLoop`). Both finalize paths (depth-k₁
+and attestation-2/3) take the Phase 1→2 trigger set and:
+
+- Update gauge `dag_nakamoto_chain_quality` ∈ {1, 2, 3} — count of
+  qualifying Phase 1→2 triggers. 1 = sketchy single-trigger evidence
+  (typically depth-only in a small-cluster partition); 3 = rock-solid
+  unanimous evidence.
+- Increment per-kind counters for whichever triggers fired:
+  `dag_nakamoto_finality_triggers_fired_t_weight_total`,
+  `_t_count_total`, `_t_depth1_total`.
+
+`T_depth2` is intentionally excluded from the gauge — it's the Phase 2→3
+boundary and has its own `dag_nakamoto_archival_finalized` counter
+(see §5.4).
+
+**HTTP route**: `GET /global-snapshots/{ord}/finality-triggers` answers
+the same lookup for any ordinal, not just the just-finalized one
+(`FinalityTriggersRoutes`). JSON payload:
+
+```json
+{
+  "ordinal": 1234,
+  "triggers": ["t_count", "t_depth1", "t_weight"],
+  "satisfied_count": 3,
+  "phases": { "phase_1_to_2_count": 3, "phase_2_to_3": false }
+}
+```
+
+Returns 503 until the leader loop has initialized the
+`FinalityTriggerView` (startup window). Pure observability — never feeds
+back into consensus.
+
+The seam is `FinalityTriggerView[F]`, published from `SnapshotLeaderLoop`
+into a `Ref[F, Option[FinalityTriggerView[F]]]` at trigger-construction
+time and read lock-free by the route. Future use cases: ops chain-quality
+histograms; operator-side "stop-finalize" policy at low quality;
+light-client trust eligibility once Mithril lands.
 
 ---
 
@@ -450,16 +568,26 @@ weight sum.
 
 ## 7. Caveats and known issues
 
-- **`emitAttestation`-on-peer-receive** is currently unconditional
-  (commit `6e49b7d5`). Causing iter33/iter34 regressions. See §4.1 for
-  the planned gating correction.
+- ~~**`emitAttestation`-on-peer-receive** is currently unconditional
+  (commit `6e49b7d5`).~~ — **resolved** (commit `728cffaf`). See §4.1.
 - **`NakamotoChainStore.store` finality-safety gate** refuses to write a
   different hash at an already-finalized ordinal
   (`NakamotoChainStore.scala:290-303`). Combined with `chainStore.finalize`
-  driven by 2/3 weight including our self-attestation, a small-cluster
-  node can self-finalize a divergent fork and then refuse the canonical
-  chain's hash — the "fork-recovery deadlock" of #119. Full fix is a
-  node-level re-bootstrap path.
+  driven by 2/3 weight, a small-cluster node could previously self-finalize
+  a divergent fork and then refuse the canonical chain's hash — the
+  "fork-recovery deadlock" of #119.
+  - **P-11b mitigation landed** (commit `95471c7f`, task #133):
+    `TipTracker.highestFinalizedOrdinal` and `TCountTrigger` both
+    self-exclude `selfId` from the canonical-hash-filtered weight/count
+    sum, so a node can no longer self-finalize purely on its own
+    attestation. Parity surface across both 2/3 triggers.
+  - **Full re-bootstrap path is in progress (#141)**: a node that has
+    already self-finalized a divergent fork — e.g. recovered from a
+    pre-fix snapshot — still needs an explicit `RebootstrapOrchestrator`
+    to clear `TipTracker.attestationsRef` / `lastFinalized` and reset the
+    overlay before re-syncing from a peer. `TipTracker.unsafe_reset` and
+    `MptOverlay.unsafe_reset` exist as the leaf primitives; the
+    orchestrator scaffolding is not yet on this branch.
 - **Undo journal (#121)** plugs base-write contamination on reorg-replace
   but only operates when `finalizeBranch` is called with a different
   hash at an already-finalized ordinal. Does NOT cover the case where a
@@ -475,14 +603,16 @@ weight sum.
 
 | File | Role |
 |---|---|
-| `modules/dag-l0/.../nakamoto/SnapshotLeaderLoop.scala` | Slot tick, eligibility, onSlotWon production path, finalityMonitor (5s tick — T_depth1 + T_weight + §5.1 visibility ticker). |
+| `modules/dag-l0/.../nakamoto/SnapshotLeaderLoop.scala` | Slot tick, eligibility, onSlotWon production path, finalityMonitor (5s tick — constructs the four `FinalityTrigger[F]` instances; drives T_weight + T_count + T_depth1 finalize paths, T_depth2 archival watermark, §5.1 visibility ticker, `emitChainQuality` gauge + counters). |
 | `modules/dag-l0/.../nakamoto/NakamotoSyncDaemon.scala` | Inbound gossip: `processValidSnapshot`, `handleAttestation`. Outbound: unified `emitAttestation` / `emitTipAttestation`. |
 | `modules/dag-l0/.../nakamoto/NakamotoChainStore.scala` | Fork-DAG of tips. `bestTip`, `store`, `finalize`, `walkBackTo`. Finality-safety gate at `:290-303`. `vrfOutputsForPeriod` for §1's eta rotation inputs. |
-| `modules/node-shared/.../nakamoto/TipTracker.scala` | `Map[PeerId, TipAttestation]`. Newer-wins via `attestedAt`. `highestFinalizedOrdinal` chain-aware weight walk. Source for T_weight (today) and T_count (future). |
-| `modules/node-shared/.../nakamoto/overlay/MptOverlay.scala` | Branch-aware MPT: `pendingRef`, `BranchHandle`, `checkout/commit`, `finalizeBranch` (#56). Phase 0/1 writes live here; Phase 2 transition triggers `finalizeBranch`. |
+| `modules/node-shared/.../nakamoto/FinalityTrigger.scala` | `FinalityTrigger[F]` typeclass + `Kind` ADT + `triggersFor` / `maxLatestQualifyingOrdinal` lookup helpers + `fromRef` factory. Concrete builders: `TWeightTrigger`, `TCountTrigger`, `TDepth1Trigger`, `TDepth2Trigger`. Also defines `FinalityTriggerView[F]` (observability seam consumed by the HTTP route). Commits `30a2fa73` (typeclass), `7003be21` (T_count), `06455f98` (T_depth2). |
+| `modules/dag-l0/.../http/routes/FinalityTriggersRoutes.scala` | HTTP route `GET /global-snapshots/{ord}/finality-triggers` — reads a `Ref[F, Option[FinalityTriggerView[F]]]` populated by `SnapshotLeaderLoop` at startup; 503 until populated. Pure observability (commit `866cd598`, task #138). |
+| `modules/node-shared/.../nakamoto/TipTracker.scala` | `Map[PeerId, TipAttestation]`. Newer-wins via `attestedAt`. `recordAttestation` enforces ±`MaxAttestationSkewMs` skew bound (env `NAKAMOTO_MAX_ATTESTATION_SKEW_MS`, default 60s — commit `422e1a6b`). `highestFinalizedOrdinal(selfId, …)` takes `selfId` parameter for #133 self-exclusion (commit `95471c7f`). Source for `T_weight` and `T_count`. Includes `unsafe_reset` leaf primitive for #141 re-bootstrap (orchestrator not yet wired). |
+| `modules/node-shared/.../nakamoto/overlay/MptOverlay.scala` | Branch-aware MPT: `pendingRef`, `BranchHandle`, `checkout/commit`, `finalizeBranch` (#56). Phase 0/1 writes live here; Phase 2 transition triggers `finalizeBranch`. Phase-3 `pruneBelow(ord)` (commit `173e6a7d`, #139) drops `undoJournalRef` and `finalizedRef` entries strictly below the archival watermark; idempotent and irreversible. Also has `unsafe_reset` leaf primitive for #141. |
 | `modules/node-shared/.../nakamoto/ChainSelection.scala` | Taktikos maxvalid-tk (short forks, Phase 0/1) + Ouroboros Genesis maxvalid-bg density rule (deep forks, Phase 0/1). Inactive from Phase 2. |
 | `modules/node-shared/.../nakamoto/EligibilityChecker.scala` | LDD threshold function (ψ, γ, fA, fB). |
-| `modules/node-shared/.../nakamoto/StakeRegistry.scala` | Per-peer stake fractions (delegated + collateral combined planned); `optimisticRelativeStake` for active-only weighting. |
+| `modules/node-shared/.../nakamoto/StakeRegistry.scala` | Per-peer stake fractions (delegated + collateral combined planned); `optimisticRelativeStake` for active-only weighting. `validatorCount` provides the `T_count` denominator (full seedlist). |
 | `modules/node-shared/.../nakamoto/SlotClock.scala` | Cluster-wide consensus slot provider. Not currently used by the attestation path (Chronos-prep wall-clock semantics; see §3.1); retained as a domain primitive for future consensus-slot consumers. |
 | `modules/node-shared/.../nakamoto/EtaCalculation.scala` | Eta computation; `twoThirdsCutoff` for the §1 R ≥ 3k₁ rule. |
 | `modules/node-shared/.../nakamoto/SidecarClient.scala` | gRPC client to Go libp2p sidecar (`publishSnapshot`, `publishAttestation`, `publishRumor`). |

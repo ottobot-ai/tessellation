@@ -1,7 +1,7 @@
 # Nakamoto — Active Work Plan
 
 **Branch:** `feature/serde-typeclass-shim`
-**Last updated:** 2026-05-14 (#56 MultiBranch overlay validated via iter31 e2e — 8 gl0 + K=2 metagraphs, EXIT=0)
+**Last updated:** 2026-05-15 (finality-trigger stack landed — `FinalityTrigger[F]` typeclass, `T_count`, `T_depth2`, attestation skew bound, chain-quality observable + HTTP route, overlay `pruneBelow`)
 
 Companion to `NAKAMOTO-TODO.md` (full backlog). This file tracks the in-flight workstream toward metagraph end-to-end on Nakamoto GL0.
 
@@ -70,12 +70,23 @@ Three checkpoints in `SnapshotLeaderLoop`: (1) slot-tick gate (already existed),
 2. Inclusion-proof feature work begins → wire `unapplyTo` for correctness on the read side, plus add an `applyTo(ordinal)` API to walk forward from a checkpoint
 3. Content-addressed MPT migration → the whole problem dissolves; journal becomes unnecessary
 
-### 5. Parametrize finality (no mode switch)  *(✅ done — updated 2026-05-08 to k=255 after expanded sims)*
-Three env-var knobs with sensible defaults — `NAKAMOTO_ATTESTATION_THRESHOLD` (default 2/3, in `TipTracker.FinalityThreshold`), `NAKAMOTO_CONFIRMATION_DEPTH` (default **255**, in `SnapshotLeaderLoop.ConfirmationDepthK`), `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` (default 0.5, in `StakeRegistry.MinActiveQuorumFraction`). Both gates always run; whichever fires first finalizes. No mode switch.
+### 5. Parametrize finality (no mode switch)  *(✅ done — updated 2026-05-08 to k=255 after expanded sims; 2026-05-15 trigger stack refactored)*
+Env-var knobs with sensible defaults — `NAKAMOTO_ATTESTATION_THRESHOLD` (default 2/3, in `TipTracker.FinalityThreshold`, shared by `T_weight` and `T_count`), `NAKAMOTO_CONFIRMATION_DEPTH` (default **255**, in `SnapshotLeaderLoop.ConfirmationDepthK` / `T_depth1`), `NAKAMOTO_ARCHIVAL_DEPTH` (default **65536** = 2¹⁶, in `SnapshotLeaderLoop.ArchivalDepthK` / `T_depth2`), `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` (default 0.5, in `StakeRegistry.MinActiveQuorumFraction`), `NAKAMOTO_MAX_ATTESTATION_SKEW_MS` (default 60_000, in `TipTracker.MaxAttestationSkewMs`). All gates always run; whichever fires first finalizes. No mode switch.
 
 **k measures snapshots, not slots.** With LDD targeting ~15% slot fill, slots run ~6× sparser than snapshots, but the depth gate is purely an ordinal-distance check: `tip.ordinal - snapshotOrdinal > k`. The original k=31 choice (2026-04-08) was based on a measured-sim table topping out at k≤80 with k=6 too high a fork rate against a 1/3 adversary; k=31 gave ~0.91% per-attempt. Subsequent expanded sims (`adv_depth_expanded_parallel.py`, 10M trials, k≤400) extrapolate the fB=0.05-tail slope to ~10⁻¹² at k≈271–290. Default raised to **k=255** as a conservative operating point approximating Cardano-equivalent CP-violation; attestation finality remains the hot path (seconds), so this only affects worst-case finality time during degraded operation.
 
 **Two slot/ordinal-units bugs were fixed in this round** (2026-04-08), discovered while validating the wire-up: `lastFinalizedOrdinal` was being read off `tipTracker.lastFinalized`'s **slot** value, and `finalizeAtSlot` was being computed as `tip.slot - k` (mixing slot- and ordinal-units). The first bug had silently disabled the depth gate end-to-end since it landed — in our 720s e2e test we observed 224 ATTEST-FINALIZED entries and **zero** DEPTH-FINALIZED entries. Both gates now read their inputs from the chain store, which is the authoritative ordinal source.
+
+**Finality-trigger stack refactor (2026-05-15).** The two inline gates (depth-k₁ + attestation-2/3) were extracted into a `FinalityTrigger[F]` typeclass (`modules/node-shared/.../nakamoto/FinalityTrigger.scala`) so each trigger is a monotone-Ref-backed observable that `SnapshotLeaderLoop.finalityMonitor` evaluates and advances on each tick. With the refactor:
+
+- **`T_count`** added (commit `7003be21`) — 1-validator-1-vote canonical-hash-filtered count finality, self-excluded (#133), denominator = `StakeRegistry.validatorCount` (full seedlist). Reuses `TipTracker.FinalityThreshold` so it ties with `T_weight` under equal stake and is strictly stronger evidence once stake-weighted VRF lands.
+- **`T_depth2`** added (commit `06455f98`) — Phase 2 → Phase 3 archival depth gate. Identical structure to `T_depth1`, only the constant differs (k₂ default 65536). Drives `MptOverlay.pruneBelow` (commit `173e6a7d`) so long-running nodes don't leak undo-journal / finalizedRef entries past the archival boundary.
+- **`T_weight`** got self-exclusion via #133 (commit `95471c7f`) — `TipTracker.highestFinalizedOrdinal` now takes a `selfId: PeerId` parameter and drops the self-entry before the canonical-hash filter. Partial mitigation of #119 fork-recovery deadlock; full re-bootstrap path is in progress (#141 — `RebootstrapOrchestrator` not yet wired, leaf primitives `TipTracker.unsafe_reset` / `MptOverlay.unsafe_reset` already in place).
+- **`attestedAt` skew bound** (commit `422e1a6b`) — receive-side defense-in-depth for `T_count`. Drops attestations outside ±`NAKAMOTO_MAX_ATTESTATION_SKEW_MS` of `Clock[F].realTime`; counter `dag_nakamoto_attestations_rejected_skew_total`. Tightenable post-Chronos.
+- **Chain-quality observable** (commit `866cd598`, task #138) — `FinalityTrigger.triggersFor(ord)` lookup answers "which triggers qualified ord N?" at both finalize sites (gauge `dag_nakamoto_chain_quality` ∈ {1, 2, 3}; per-kind counters) and via HTTP route `GET /global-snapshots/{ord}/finality-triggers`. Pure observability — never feeds back into consensus.
+- **`SlotCertificate.parentSlot` wiring** (commit `bec9de6b`) — `NakamotoProposer` was passing `parentSlot = Slot.MinValue` (TODO placeholder); now threaded through correctly so verifier-side `slotGap = cert.slot - cert.parentSlot` reconstruction matches the producer's LDD lottery threshold.
+
+See `docs/nakamoto/attestation-and-finality.md` §0 / §5 for the formal four-phase model and the trigger contracts.
 
 ### 6. Close SC binary finality loop (CL0-side)  *(✅ done)*
 **Bug:** original `pruneConfirmed` dropped a binary on first sight in any GL0 snapshot — if that snapshot was later orphaned in a Nakamoto reorg, the binary was permanently lost.
