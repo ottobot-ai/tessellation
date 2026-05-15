@@ -339,25 +339,25 @@ peer's `publishAttestation`:
 
 ### 4.1 The `emitAttestation`-on-peer-receive gating correction
 
-> **Status:** in-progress design correction. Commit `6e49b7d5` introduced
-> *unconditional* `emitAttestation` on peer-receive. iter33 + iter34
-> e2e failures traced to this regression: any peer's fork-branch snap
-> can move our self-attestation off canonical, after which the
-> canonical-hash filter (see §6) zeros our weight contribution. The
-> Phase 3 re-attestation ticker (§5.1) was added to rescue this but
-> doesn't address the root cause.
+> **Status:** resolved. Commit `728cffaf` (2026-05-13) gates
+> `emitAttestation` in `processValidSnapshot` on `becameBestTip = true`
+> (see `NakamotoSyncDaemon.scala:950`). iter35+ runs confirm the
+> regression introduced by `6e49b7d5` is fixed and no longer the cause
+> of weight-accumulation stalls.
 
-The correct gating: `emitAttestation` in `processValidSnapshot` should
-only fire when `becameBest = true` — i.e. chain-selection promoted the
-peer's snapshot to **our** canonical bestTip (a Phase 0 → 1 transition).
-Without this gating, our self-attestation can drift onto Phase 0
-fork-branches that lost chain selection, breaking Phase 1 → 2 weight
-accumulation.
+The gating rule: `emitAttestation` in `processValidSnapshot` only fires
+when `becameBest = true` — i.e. chain-selection promoted the peer's
+snapshot to **our** canonical bestTip (a Phase 0 → 1 transition).
+Without this gating, our self-attestation could drift onto Phase 0
+fork-branches that lost chain selection, after which the canonical-hash
+filter (see §6) would zero our weight contribution — breaking
+Phase 1 → 2 weight accumulation. iter33 + iter34 hit this exact mode.
 
-The Phase 3 ticker should be retained as a *safety net* for the case
-where chain-selection flips bestTip during a 5s window (so our self-att
-is on a previous bestTip), but should not be the primary attestation
-correctness mechanism.
+The Phase 3 re-attestation ticker (§5.1) is retained as a *safety net*
+for the case where chain-selection flips bestTip during a 5s window (so
+our self-att lands on a previous bestTip and the canonical-hash filter
+zeros it). With the §3 gating in place, the ticker is no longer
+load-bearing for correctness — it is a recovery affordance only.
 
 ---
 
