@@ -818,7 +818,7 @@ const testWithdrawDelegatedStake = async (urls, account, stakeHash) => {
       globalL0Url: urls.globalL0Url,
       name: 'assertRewardAndTokenUnlock',
       maxOrdinalMisses: 10,
-      maxStalledChecks: 20,
+      maxStalledChecks: 75,
       interval: 3000,
     },
   )

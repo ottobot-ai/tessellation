@@ -71,7 +71,7 @@ const getLatestSnapshotInfo = async (globalL0Url) => {
  * @param {string} options.globalL0Url - GL0 URL for ordinal checks
  * @param {string} [options.name='operation'] - Name for logging
  * @param {number} [options.maxOrdinalMisses=5] - Max ordinal progressions without success before failing
- * @param {number} [options.maxStalledChecks=10] - Max checks with no ordinal progress before failing
+ * @param {number} [options.maxStalledChecks=75] - Max checks with no ordinal progress before failing
  * @param {number} [options.interval=3000] - Polling interval in ms
  * @param {Function} [options.onOrdinalMiss] - Called when ordinal progresses but check fails.
  *                                              Can return a new tx hash if resubmitting.
@@ -105,7 +105,8 @@ const withRetryOrdinal = async (checkFn, {
     globalL0Url,
     name = 'operation',
     maxOrdinalMisses = 10,
-    maxStalledChecks = 20,
+    // Tolerates ~99.9th-percentile LDD gap at r=1 (see docs/nakamoto/attestation-and-finality.md §5; closed form: P(gap ≥ K) = Π(1 − f(δ)))
+    maxStalledChecks = 75,
     interval = 3000,
     onOrdinalMiss = null,
     onStalled = null,

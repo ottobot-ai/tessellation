@@ -294,7 +294,7 @@ const testReplaceMinimumIncrease = async (urls, account, existingLockHash, exist
       }
       return true
     },
-    { globalL0Url: urls.globalL0Url, name: 'verifyMinIncreaseUpdate', maxOrdinalMisses: 10, maxStalledChecks: 30 }
+    { globalL0Url: urls.globalL0Url, name: 'verifyMinIncreaseUpdate', maxOrdinalMisses: 10, maxStalledChecks: 75 }
   )
   
   // Brief wait for L1 sync after ordinal progression confirmed

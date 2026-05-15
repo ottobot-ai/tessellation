@@ -418,7 +418,7 @@ const waitForStakeInclusion = async (urls, address, stakeHash, options = {}) => 
       // a non-paused producer drains them. Default 10 was too tight (~one ordinal short
       // in observed runs). Same value as testUpdateDelegatedStake's per-call override.
       maxOrdinalMisses: 40,
-      maxStalledChecks: 30,
+      maxStalledChecks: 75,
       interval: 2000,
       ...options
     }
@@ -451,7 +451,7 @@ const waitForStakeWithdrawal = async (urls, address, stakeHash, options = {}) =>
       // a non-paused producer drains them. Default 10 was too tight (~one ordinal short
       // in observed runs). Same value as testUpdateDelegatedStake's per-call override.
       maxOrdinalMisses: 40,
-      maxStalledChecks: 30,
+      maxStalledChecks: 75,
       interval: 2000,
       ...options
     }
@@ -494,7 +494,7 @@ const waitForTokenLockInclusion = async (urls, address, lockHash, options = {}) 
       // a non-paused producer drains them. Default 10 was too tight (~one ordinal short
       // in observed runs). Same value as testUpdateDelegatedStake's per-call override.
       maxOrdinalMisses: 40,
-      maxStalledChecks: 30,
+      maxStalledChecks: 75,
       interval: 2000,
       ...options
     }
