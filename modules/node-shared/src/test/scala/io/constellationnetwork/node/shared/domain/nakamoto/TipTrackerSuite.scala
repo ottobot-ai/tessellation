@@ -544,4 +544,69 @@ object TipTrackerSuite extends SimpleIOSuite {
         expect(all.contains(peer2)) &&
         expect.same(Ratio.One, weight)
   }
+
+  // ============================================================
+  // P-11 (task #141): unsafe_reset for re-bootstrap recovery
+  // ============================================================
+
+  test("unsafe_reset: clears attestations map") {
+    val peer1 = pid("peer1")
+    val peer2 = pid("peer2")
+    val tipA = hash("tipA")
+
+    for {
+      (tracker, _) <- setupTracker(Set(peer1, peer2))
+      _ <- record(tracker, peer1, att(tipA, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer2, att(tipA, slot(10), 100L, slot(11)))
+      beforeReset <- tracker.allAttestations
+      _ <- tracker.unsafe_reset
+      afterReset <- tracker.allAttestations
+    } yield
+      expect.same(2, beforeReset.size) &&
+        expect(afterReset.isEmpty)
+  }
+
+  test("unsafe_reset: clears lastFinalized marker") {
+    val peer1 = pid("peer1")
+    val tipFinal = hash("tipFinal")
+
+    for {
+      (tracker, _) <- setupTracker(Set(peer1))
+      _ <- tracker.markFinalized(tipFinal, slot(100))
+      beforeReset <- tracker.lastFinalized
+      _ <- tracker.unsafe_reset
+      afterReset <- tracker.lastFinalized
+    } yield
+      expect.same(Some((tipFinal, slot(100))), beforeReset) &&
+        expect.same(None, afterReset)
+  }
+
+  test("unsafe_reset: post-reset is reusable — new attestations accumulate weight normally") {
+    val peer1 = pid("peer1")
+    val peer2 = pid("peer2")
+    val peer3 = pid("peer3")
+    val tipOld = hash("tipOld")
+    val tipNew = hash("tipNew")
+
+    for {
+      (tracker, _) <- setupTracker(Set(peer1, peer2, peer3))
+      // Build up state that would represent a divergent self-finalize.
+      _ <- record(tracker, peer1, att(tipOld, slot(10), 100L, slot(11)))
+      _ <- record(tracker, peer2, att(tipOld, slot(10), 100L, slot(11)))
+      _ <- tracker.markFinalized(tipOld, slot(10))
+      // Reset (simulating re-bootstrap orchestrator firing).
+      _ <- tracker.unsafe_reset
+      // Post-reset: receive fresh canonical attestations.
+      _ <- record(tracker, peer1, att(tipNew, slot(20), 200L, slot(21)))
+      _ <- record(tracker, peer2, att(tipNew, slot(20), 200L, slot(21)))
+      newWeight <- tracker.attestationWeight(tipNew)
+      oldWeight <- tracker.attestationWeight(tipOld)
+      isNewFinalized <- tracker.isFinalized(tipNew)
+    } yield
+      // Old tip has zero weight (attestations cleared), new tip has 2/3+ weight,
+      // confirming the tracker is fully reusable post-reset.
+      expect.same(Ratio.Zero, oldWeight) &&
+        expect(newWeight >= Ratio(2, 3)) &&
+        expect(isNewFinalized)
+  }
 }

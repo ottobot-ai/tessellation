@@ -213,6 +213,17 @@ trait MptOverlay[F[_], K] {
     * (cross-ordinal conflict-detection entries are likewise unreachable past k₂). Passthrough: no-op (no per-branch history to prune).
     */
   def pruneBelow(ord: SnapshotOrdinal): F[Unit]
+
+  /** Re-bootstrap escape hatch (P-11, task #141). Clear `pendingRef`, `finalizedRef`, `lastCommittedBranchRef`, and `undoJournalRef`
+    * unconditionally. The underlying base `MptStore` is NOT touched — the caller (`RebootstrapOrchestrator`) is responsible for resyncing
+    * base via `mptStore.syncFromGlobalSnapshotInfo` after this returns. Equivalent to "fresh overlay over the existing base".
+    *
+    * Breaks the all-or-nothing finality contract (`finalizeBranch` walks `pendingRef`+`undoJournalRef` consistently) — the prefix `unsafe_`
+    * signals callers must hold the mutex-equivalent (production paused, no in-flight commits) before invoking.
+    *
+    * Multi-branch: clears all four Refs. Passthrough: no-op (no per-branch state to reset).
+    */
+  def unsafe_reset: F[Unit]
 }
 
 object MptOverlay {
@@ -343,6 +354,11 @@ object MptOverlay {
       def pruneBelow(ord: SnapshotOrdinal): F[Unit] =
         // Passthrough has no in-memory history (no `undoJournalRef`, no `pendingRef`, no `finalizedRef`);
         // writes already landed in `underlying` during the handle's lifetime. Trivially a no-op.
+        Async[F].unit
+
+      def unsafe_reset: F[Unit] =
+        // Passthrough has no in-memory state to drop; writes already landed in `underlying`.
+        // The base `MptStore` reset is the caller's responsibility (`syncFromGlobalSnapshotInfo`).
         Async[F].unit
     }
 
@@ -848,6 +864,33 @@ object MptOverlay {
                 logger.debug(
                   s"OVERLAY-PRUNE-BELOW ord=$ordValue no-op (already pruned: $preUndo undoJournal, $preFinalized finalized)"
                 )
+          } yield ()
+        }
+
+      def unsafe_reset: F[Unit] =
+        // P-11 re-bootstrap reset (task #141). Wipes ALL in-memory overlay state so the
+        // post-reset path starts fresh: a future `commit` will register a new pending branch
+        // against an empty pending map; a future `finalizeBranch` will see no prior canonical
+        // at any ord (no idempotency conflict, no reorg-replace path). Base `MptStore` is
+        // NOT touched here — caller resyncs base via `syncFromGlobalSnapshotInfo` once the
+        // canonical chain head is known.
+        //
+        // Single mutex with commit/finalize/pruneBelow so we cannot race a concurrent fold.
+        mutex.permit.use { _ =>
+          for {
+            preCounts <- (pendingRef.get, finalizedRef.get, undoJournalRef.get).tupled.map {
+              case (p, f, u) => (p.size, f.size, u.size)
+            }
+            (pPending, pFinalized, pUndo) = preCounts
+            _ <- pendingRef.set(Map.empty)
+            _ <- finalizedRef.set(Map.empty)
+            _ <- lastCommittedBranchRef.set(none)
+            _ <- undoJournalRef.set(SortedMap.empty[Long, ChangeSet])
+            _ <- logger.warn(
+              s"⚠️ OVERLAY-UNSAFE-RESET: dropped $pPending pending branches, $pFinalized finalized markers, " +
+                s"$pUndo undoJournal entries (re-bootstrap recovery). Base MptStore NOT touched; caller " +
+                s"must resync via syncFromGlobalSnapshotInfo."
+            )
           } yield ()
         }
 

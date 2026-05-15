@@ -1754,4 +1754,120 @@ object MptOverlaySuite extends MutableIOSuite {
       readAfter <- overlay.get[Balance](BranchId.base, key)
     } yield expect(readAfter.contains(Balance(NonNegLong(99L))))
   }
+
+  // ============================================================
+  // P-11 (task #141): unsafe_reset for re-bootstrap recovery
+  // ============================================================
+
+  test("unsafe_reset on multi-branch: drops pending branches, idempotency markers, undo journal") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+
+      keyA = gskBalance(9000)
+      keyB = gskBalance(9001)
+
+      // Pre-seed base with a value so we can confirm base survives the reset.
+      keyBase = gskBalance(8999)
+      _ <- store.insert[Balance](keyBase, Balance(NonNegLong(42L)))
+
+      // Build up pending state across two branches + a finalized marker (via finalize on one).
+      hA <- overlay.checkout(parentP)
+      _ <- hA.insert[Balance](keyA, Balance(NonNegLong(11L)))
+      _ <- overlay.commit(hA, branchA, ordinal)
+
+      hB <- overlay.checkout(parentP)
+      _ <- hB.insert[Balance](keyB, Balance(NonNegLong(22L)))
+      _ <- overlay.commit(hB, branchB, ordinal)
+
+      // Reset — the core P-11 contract.
+      _ <- overlay.unsafe_reset
+
+      // Branches gone — reads at their ids fall through to base.
+      readKeyAFromBranchA <- overlay.get[Balance](branchA, keyA)
+      readKeyBFromBranchB <- overlay.get[Balance](branchB, keyB)
+
+      // Base untouched — `unsafe_reset` is in-memory only.
+      readBaseFromOverlay <- overlay.get[Balance](BranchId.base, keyBase)
+      readBaseDirect <- store.get[Balance](keyBase)
+
+      // After reset, finalizeBranch at the same ord with a never-committed branch returns NoOp
+      // (the conflict-detection finalizedRef was cleared) and does not raise.
+      finalize <- overlay.finalizeBranch(branchC, ordinal)
+    } yield
+      expect.all(
+        // Pending state cleared — chain walks at branchA/branchB no longer see their writes.
+        readKeyAFromBranchA.isEmpty,
+        readKeyBFromBranchB.isEmpty,
+        // Base preserved — the caller is responsible for resyncing base via syncFromGlobalSnapshotInfo.
+        readBaseFromOverlay.contains(Balance(NonNegLong(42L))),
+        readBaseDirect.contains(Balance(NonNegLong(42L))),
+        // finalizedRef cleared — re-finalize at the same ordinal with a NEW canonical works
+        // (would have hit reorg-replace or duplicate-detection without the reset).
+        finalize == FinalizationOutcome.NoOp
+      )
+  }
+
+  test("unsafe_reset on multi-branch: post-reset commit on the same branch id works without conflict") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (_, overlay) = pair
+
+      key = gskBalance(9100)
+
+      // Initial commit.
+      h1 <- overlay.checkout(parentP)
+      _ <- h1.insert[Balance](key, Balance(NonNegLong(1L)))
+      _ <- overlay.commit(h1, branchA, ordinal)
+      _ <- overlay.finalizeBranch(branchA, ordinal)
+
+      // Reset.
+      _ <- overlay.unsafe_reset
+
+      // Re-commit + finalize at the SAME branchA — would normally hit the
+      // "Already finalized at exactly this (ordinal, hash); nothing to do" idempotency arm
+      // (which is harmless), but more importantly the pendingRef no longer carries the
+      // first commit's entry — confirming the reset actually wiped pending.
+      h2 <- overlay.checkout(parentP)
+      _ <- h2.insert[Balance](key, Balance(NonNegLong(2L)))
+      _ <- overlay.commit(h2, branchA, ordinal)
+      readBeforeFinalize <- overlay.get[Balance](branchA, key)
+      finalize2 <- overlay.finalizeBranch(branchA, ordinal)
+      readAfterFinalize <- overlay.get[Balance](BranchId.base, key)
+    } yield
+      expect.all(
+        // Branch read post-second-commit sees the second value (new pending entry).
+        readBeforeFinalize.contains(Balance(NonNegLong(2L))),
+        // Finalize folds the second write into base — no idempotency hit because finalizedRef cleared.
+        finalize2 match {
+          case FinalizationOutcome.Folded(_, _) => true
+          case _                                => false
+        },
+        readAfterFinalize.contains(Balance(NonNegLong(2L)))
+      )
+  }
+
+  test("unsafe_reset on Passthrough: no-op (no in-memory state to drop)") { res =>
+    implicit val (h, _, js) = res
+    for {
+      store <- mkStore
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.Passthrough,
+        store,
+        pcTree,
+        GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+
+      key = gskBalance(9200)
+      _ <- store.insert[Balance](key, Balance(NonNegLong(7L)))
+
+      // Reset should be safe and not touch base.
+      _ <- overlay.unsafe_reset
+      readAfter <- overlay.get[Balance](BranchId.base, key)
+    } yield expect(readAfter.contains(Balance(NonNegLong(7L))))
+  }
 }

@@ -124,6 +124,36 @@ object NakamotoChainStore {
 
     /** Get a ChainTip for a given hash (for ChainSelection traversal). */
     def tipFor(hash: Hash): F[Option[ChainTip]]
+
+    /** Divergent-self-finalize signal (P-11, task #141). Increments each time `store` refuses a different-hash write at-or-below the
+      * finalized ordinal — i.e. each time the finality-safety gate rejects the canonical chain's hash because this node has already
+      * locally-finalized a divergent hash at that ordinal.
+      *
+      * Reset to 0 by `unsafe_clearFinality`. The `RebootstrapOrchestrator` reads this counter to decide when to trigger a full reset. The
+      * counter is `F[Long]` (read-only from orchestrator's perspective) so concurrent refuses from the store path can advance it without
+      * coordination.
+      */
+    def divergentRefuseCount: F[Long]
+
+    /** Latest divergent-self-finalize event: the (ordinal, canonicalHash) we last refused to store because our local-finalized hash at that
+      * ordinal differs. Cleared by `unsafe_clearFinality`. Read by the orchestrator to log which ordinal we were stuck at when divergence
+      * was detected.
+      */
+    def divergentRefuseSample: F[Option[(Long, Hash)]]
+
+    /** Re-bootstrap escape hatch (P-11, task #141). Reset the chain store's internal state so a fresh canonical chain can be ingested
+      * without tripping the finality-safety gate that was permanently refusing the canonical hash:
+      *   - `byHash` cleared
+      *   - `bestTipHash` cleared
+      *   - `lastFinalizedOrdinal` reset to 0
+      *   - `divergentRefuseCounterRef` / `divergentRefuseSampleRef` cleared
+      *
+      * Breaks the monotonicity invariant of `finalize` (which only ever advances finality) — the prefix `unsafe_` signals callers must hold
+      * the right gates (production paused, chain-sync about to fire) before invoking. Do NOT call from the consensus path.
+      *
+      * Returns `true` if any state was actually cleared (used for logging).
+      */
+    def unsafe_clearFinality: F[Boolean]
   }
 
   def make[F[_]: Async: HasherSelector](
@@ -147,6 +177,11 @@ object NakamotoChainStore {
     for {
       stateRef <- Ref.of[F, ChainState](ChainState.empty)
       pcTree <- ParentChildTree.make[F]
+      // Divergent-self-finalize signal (P-11). Incremented on every refused different-hash
+      // write at-or-below finalized. Reset by `unsafe_clearFinality`. Used by the
+      // RebootstrapOrchestrator to detect that this node has self-finalized a divergent fork.
+      divergentRefuseCounterRef <- Ref.of[F, Long](0L)
+      divergentRefuseSampleRef <- Ref.of[F, Option[(Long, Hash)]](None)
     } yield {
       new NakamotoChainStoreAlgebra[F] {
 
@@ -292,13 +327,21 @@ object NakamotoChainStore {
                   stateRef.get.flatMap { state =>
                     state.byHash.values.find(_.ordinal == ordinal).map(_.hash) match {
                       case Some(existingHash) if existingHash =!= snapshotHash =>
-                        logger
-                          .warn(
-                            s"REFUSED store: finality-safety violation — ordinal=$ordinal is at-or-below finalized=${finalized.show}, " +
-                              s"existing=${existingHash.value.take(12)}, new=${snapshotHash.value.take(12)}. " +
-                              s"Dropping write; this node previously finalized the existing snapshot and must not rewrite it."
-                          )
-                          .as(false)
+                        // P-11 (#141): the divergent-self-finalize trip-wire. We've already finalized
+                        // a different hash at this ordinal; the incoming write IS the canonical chain
+                        // trying to overwrite our locally-finalized divergent fork. Increment the
+                        // signal counter + record the sample so the RebootstrapOrchestrator can detect
+                        // the lock-out and trigger reset.
+                        divergentRefuseCounterRef.update(_ + 1L) >>
+                          divergentRefuseSampleRef.set(Some((ordinal, snapshotHash))) >>
+                          logger
+                            .warn(
+                              s"REFUSED store: finality-safety violation — ordinal=$ordinal is at-or-below finalized=${finalized.show}, " +
+                                s"existing=${existingHash.value.take(12)}, new=${snapshotHash.value.take(12)}. " +
+                                s"Dropping write; this node previously finalized the existing snapshot and must not rewrite it. " +
+                                s"[P-11 divergent-refuse counter incremented]"
+                            )
+                            .as(false)
                       case _ => tryStore
                     }
                   }
@@ -493,6 +536,36 @@ object NakamotoChainStore {
         private def persistHead(stored: StoredSnapshot, hash: Hash)(implicit hasher: Hasher[F]): F[Unit] =
           underlyingStorage.setHeadForRecovery(stored.signedSnapshot, stored.context) >>
             logger.debug(s"💾 Set head to ordinal=${stored.ordinal} hash=${hash.value.take(8)}")
+
+        def divergentRefuseCount: F[Long] =
+          divergentRefuseCounterRef.get
+
+        def divergentRefuseSample: F[Option[(Long, Hash)]] =
+          divergentRefuseSampleRef.get
+
+        def unsafe_clearFinality: F[Boolean] =
+          for {
+            before <- stateRef.get
+            // Capture pre-reset state so the WARN log surfaces what was dropped. Useful for
+            // post-mortem analysis ("we self-finalized hash X at ord N, then re-bootstrapped").
+            preChainSize = before.byHash.size
+            preFinalized = before.lastFinalizedOrdinal
+            preBestTip = before.bestTipHash
+            _ <- stateRef.set(ChainState.empty)
+            _ <- divergentRefuseCounterRef.set(0L)
+            _ <- divergentRefuseSampleRef.set(None)
+            _ <- nakamotoFinalizedOrdinalRef.set(SnapshotOrdinal.MinValue)
+            anyCleared = preChainSize > 0 || preFinalized > 0 || preBestTip.isDefined
+            _ <-
+              if (anyCleared)
+                logger.warn(
+                  s"⚠️ CHAIN-STORE-UNSAFE-RESET: dropped $preChainSize stored snapshots, " +
+                    s"lastFinalizedOrdinal=$preFinalized→0, bestTip=${preBestTip.fold("none")(_.value.take(12))}→none " +
+                    s"(re-bootstrap recovery). Caller must re-seed via chainStore.store from canonical chain."
+                )
+              else
+                logger.info("CHAIN-STORE-UNSAFE-RESET: no-op (chain store already empty)")
+          } yield anyCleared
       }
     }
   }

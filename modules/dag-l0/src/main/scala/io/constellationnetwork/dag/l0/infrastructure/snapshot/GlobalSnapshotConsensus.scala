@@ -684,6 +684,25 @@ object GlobalSnapshotConsensus {
             )
             .toResource
 
+          // P-11 (#141): re-bootstrap orchestrator. Periodic ticker that detects when this
+          // node has self-finalized a divergent fork and got locked out of canonical recovery
+          // (the "fork-recovery deadlock"). Gated by `NAKAMOTO_REBOOTSTRAP_ENABLED` (default
+          // FALSE) — production deployments turn it on per-node once iter e2e validates no
+          // spurious fires. Disabled: emits a single INFO at startup and otherwise no-op.
+          _ <- supervisor
+            .supervise(
+              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.RebootstrapOrchestrator
+                .run[F](
+                  chainStore = chainStore,
+                  tipTracker = tipTracker,
+                  mptOverlay = mptOverlay,
+                  productionGate = productionGate
+                )
+                .compile
+                .drain
+            )
+            .toResource
+
           // Check for persisted backfill cursor from a previous session (crash recovery).
           // If found, resume backfill with production paused until it completes.
           backfillDataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data"))

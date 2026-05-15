@@ -91,6 +91,15 @@ trait TipTracker[F[_]] {
 
   /** Clear attestations for tips that are ancestors of a finalized tip. */
   def pruneBelow(finalizedSlot: Slot): F[Unit]
+
+  /** Re-bootstrap escape hatch (P-11, task #141). Clear `attestationsRef` and `finalizedRef` unconditionally — drop ALL peer attestations
+    * and the last-finalized marker. Called from the divergent-self-finalize recovery path (`RebootstrapOrchestrator`) when this node has
+    * permanently locked itself out of canonical finalization and needs a complete reset.
+    *
+    * Breaks the monotonicity invariant of `markFinalized` (which only ever sets a finalized tip) — the prefix `unsafe_` signals that
+    * callers must hold the right gates (production paused, chain-sync about to fire) before invoking. Do NOT call from the consensus path.
+    */
+  def unsafe_reset: F[Unit]
 }
 
 object TipTracker {
@@ -242,5 +251,13 @@ object TipTracker {
                 att.tipSlot.value.value >= finalizedSlot.value.value
             }
           }
+
+        // Re-bootstrap reset (P-11). Wipes attestation map + last-finalized marker so a
+        // post-reset chain-resync starts with no prior state. Caller (RebootstrapOrchestrator)
+        // pauses production + attestation emit before calling.
+        def unsafe_reset: F[Unit] =
+          attestationsRef.set(Map.empty) >>
+            finalizedRef.set(None) >>
+            logger.warn("⚠️ TipTracker.unsafe_reset: cleared attestations + lastFinalized (re-bootstrap)")
       }
 }
