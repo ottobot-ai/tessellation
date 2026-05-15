@@ -13,9 +13,7 @@ import io.constellationnetwork.security.hex.Hex
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.SimpleIOSuite
 
-/** Tests for [[FinalityTrigger]] and its concrete implementations (`TWeightTrigger`, `TCountTrigger`, `TDepth1Trigger`).
-  *
-  * `T_depth2` (Kind enum entry reserved for #137) has no `make` builder yet and is NOT exercised here.
+/** Tests for [[FinalityTrigger]] and its concrete implementations (`TWeightTrigger`, `TCountTrigger`, `TDepth1Trigger`, `TDepth2Trigger`).
   */
 object FinalityTriggerSuite extends SimpleIOSuite {
 
@@ -233,6 +231,59 @@ object FinalityTriggerSuite extends SimpleIOSuite {
       st = state(self, 50L, tipHash) // chain shorter than k
       result <- trigger.evaluate(st)
     } yield expect.same(SnapshotOrdinal.MinValue, result)
+  }
+
+  test("TDepth2: evaluates to bestTipOrdinal - k₂") {
+    // Mirrors TDepth1 structurally: pure subtraction of bestTipOrdinal minus the depth constant.
+    // Use a small k₂ here for test ergonomics; the production default is 65536.
+    val self = pid("self")
+    val tipHash = hash("tip")
+    val k2 = 1000L
+    for {
+      trigger <- TDepth2Trigger.make[IO](k2)
+      st = state(self, 5000L, tipHash)
+      result <- trigger.evaluate(st)
+    } yield expect.same(ord(4000L), result)
+  }
+
+  test("TDepth2: returns MinValue when chain is shorter than k₂") {
+    // At the production k₂ = 65536 the chain will be shorter than k₂ for the first ~tens of thousands
+    // of ordinals; clamp to MinValue so Phase-3 sinks never see a wraparound or negative ordinal.
+    val self = pid("self")
+    val tipHash = hash("tip")
+    val k2 = 65536L
+    for {
+      trigger <- TDepth2Trigger.make[IO](k2)
+      st = state(self, 100L, tipHash) // bestTip far below k₂
+      result <- trigger.evaluate(st)
+    } yield expect.same(SnapshotOrdinal.MinValue, result)
+  }
+
+  test("TDepth2 with k₂=65536 fires later than TDepth1 with k=255 (Phase 2 → Phase 3 strictly after Phase 1 → Phase 2)") {
+    // The 4-phase finality model requires that ARCHIVAL (Phase 3) qualification trails SETTLED
+    // (Phase 2) qualification — once a snapshot is depth-k₂ deep, it has trivially been depth-k₁
+    // deep for tens of thousands of snapshots already. This is the structural invariant that lets
+    // Phase-3 sinks (overlay history pruning, future Mithril cert, light-client anchor) safely
+    // assume Phase 2 finality has already fired. Sanity-check: at any bestTip > k₂, the TDepth1
+    // qualifying ordinal strictly exceeds the TDepth2 qualifying ordinal.
+    val self = pid("self")
+    val tipHash = hash("tip")
+    val k1 = 255L
+    val k2 = 65536L
+    for {
+      tDepth1 <- TDepth1Trigger.make[IO](k1)
+      tDepth2 <- TDepth2Trigger.make[IO](k2)
+      // bestTip well beyond k₂ so both triggers produce a real ordinal.
+      st = state(self, 100000L, tipHash)
+      depth1Result <- tDepth1.evaluate(st)
+      depth2Result <- tDepth2.evaluate(st)
+    } yield
+      expect.same(ord(99745L), depth1Result) &&
+        expect.same(ord(34464L), depth2Result) &&
+        // Strict ordering: TDepth2 qualifies a LOWER ordinal (older snapshots), which is the same as
+        // saying TDepth2 "fires later" in time — for any given snapshot N, we cross k₁ depth before
+        // we cross k₂ depth.
+        expect(depth2Result.value.value < depth1Result.value.value)
   }
 
   test("evaluateAndAdvance is monotone: never decreases the Ref") {

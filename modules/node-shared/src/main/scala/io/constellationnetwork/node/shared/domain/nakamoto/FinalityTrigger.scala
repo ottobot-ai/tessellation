@@ -9,11 +9,13 @@ import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 
-/** Phase 1 → Phase 2 finality trigger.
+/** Finality trigger.
   *
-  * The 4-phase finality model (see `docs/nakamoto/attestation-and-finality.md` §0) has three Phase 1→2 triggers: `T_weight` (2/3
-  * attestation weight), `T_count` (1-validator-1-vote ≥ 2/3 attester count), and `T_depth1` (depth-k₁ confirmation). All triggers run in
-  * parallel with max-of semantics: a snapshot advances to Phase 2 as soon as ANY trigger qualifies it.
+  * The 4-phase finality model (see `docs/nakamoto/attestation-and-finality.md` §0) has three Phase 1→2 triggers — `T_weight` (2/3
+  * attestation weight), `T_count` (1-validator-1-vote ≥ 2/3 attester count), `T_depth1` (depth-k₁ confirmation) — plus one Phase 2→3
+  * trigger: `T_depth2` (depth-k₂ archival gate, see §0.3). The Phase 1→2 triggers run in parallel with max-of semantics — a snapshot
+  * advances to Phase 2 as soon as ANY trigger qualifies it. `T_depth2` advances Phase 2 → Phase 3 independently and gates archival-only
+  * sinks (overlay history pruning, future aggregate-signature certificates, light-client trust anchor publication).
   *
   * Each trigger is a small monotone observable: given a `ConsensusState`, compute the highest ordinal the trigger has qualified. The result
   * may NEVER go backwards — once a trigger has qualified ordinal N, every ord ≤ N is also qualified by that trigger.
@@ -46,15 +48,15 @@ trait FinalityTrigger[F[_]] {
 
 object FinalityTrigger {
 
-  /** Tag for each Phase 1→2 trigger. Currently implemented: [[Kind.TWeight]], [[Kind.TCount]], [[Kind.TDepth1]]. Reserved for future task:
-    * [[Kind.TDepth2]] (#137).
+  /** Tag for each finality trigger. Phase 1→2: [[Kind.TWeight]], [[Kind.TCount]], [[Kind.TDepth1]]. Phase 2→3: [[Kind.TDepth2]] (archival
+    * depth gate). All four are wired today; see `docs/nakamoto/attestation-and-finality.md` §0.3 for the Phase 2→3 semantics.
     */
   sealed trait Kind { def name: String }
   object Kind {
     case object TWeight extends Kind { val name = "t_weight" }
     case object TCount extends Kind { val name = "t_count" }
     case object TDepth1 extends Kind { val name = "t_depth1" }
-    case object TDepth2 extends Kind { val name = "t_depth2" } // reserved for #137
+    case object TDepth2 extends Kind { val name = "t_depth2" }
 
     val all: List[Kind] = List(TWeight, TCount, TDepth1, TDepth2)
   }
@@ -180,6 +182,33 @@ object TDepth1Trigger {
     FinalityTrigger.fromRef[F](FinalityTrigger.Kind.TDepth1, SnapshotOrdinal.MinValue) { state =>
       val bestOrd = state.bestTipOrdinal.value.value
       val qualifying = bestOrd - k
+      val ord =
+        if (qualifying > 0L) SnapshotOrdinal.unsafeApply(qualifying)
+        else SnapshotOrdinal.MinValue
+      Sync[F].pure(ord)
+    }
+}
+
+/** Production builder for the `T_depth2` trigger (Phase 2 → Phase 3, ARCHIVAL depth gate).
+  *
+  * Mirrors [[TDepth1Trigger]] structurally — qualifies ordinal `bestTipOrdinal - k₂`, clamped to `MinValue` while the chain is shorter than
+  * `k₂`. The difference is only the constant: `k₂ ≫ k₁` so a strictly deeper / strictly later qualifying ordinal.
+  *
+  * Provides the boundary where common-prefix is overwhelmingly safe and Phase-3 sinks (overlay history pruning #139, future
+  * aggregate-signature certificates, light-client trust anchor publication) become eligible to run. Today the wiring in
+  * `SnapshotLeaderLoop.finalityMonitor` only emits a log line + Prometheus counter when `T_depth2` advances — no downstream effects yet.
+  *
+  * See `docs/nakamoto/attestation-and-finality.md` §0.3 for the rationale and `k₂ = 2¹⁶ = 65536` target.
+  */
+object TDepth2Trigger {
+
+  /** @param k2
+    *   archival depth (typically `NAKAMOTO_ARCHIVAL_DEPTH`, default 65536). Distinct from `k₁` (default 255).
+    */
+  def make[F[_]: Sync](k2: Long): F[FinalityTrigger[F]] =
+    FinalityTrigger.fromRef[F](FinalityTrigger.Kind.TDepth2, SnapshotOrdinal.MinValue) { state =>
+      val bestOrd = state.bestTipOrdinal.value.value
+      val qualifying = bestOrd - k2
       val ord =
         if (qualifying > 0L) SnapshotOrdinal.unsafeApply(qualifying)
         else SnapshotOrdinal.MinValue
