@@ -1514,4 +1514,244 @@ object MptOverlaySuite extends MutableIOSuite {
         pD.contains(branchC.value)
       )
   }
+
+  // ============================================================
+  // #139 — Phase-3 (T_depth2) archival prune of overlay history
+  // ============================================================
+  //
+  // Contract: `pruneBelow(ord)` drops in-memory accumulators whose entries are strictly below `ord`.
+  // Pruning is purely a memory bound — production code paths produce identical `mptRoot`s before
+  // and after — and irreversible (entries at depth > k₂ ≈ 65536 cannot be reorg'd in practice).
+  //
+  // Observable signals:
+  //   - `finalizedRef`: a finalize that previously hit the reorg-replace path (entry present) hits
+  //     the no-prior-finality path (`case None`) after pruning — observable via `FinalizationOutcome`.
+  //   - `undoJournalRef`: a reorg-replace with canonical-not-in-pending used to UNDO the prior
+  //     canonical's writes via the journal entry; after pruning, no undo replay happens — observable
+  //     via reads of the prior canonical's keys (they remain in base).
+
+  test("pruneBelow on Passthrough is a no-op (and does not throw)") { res =>
+    implicit val (h, _, js) = res
+    for {
+      store <- mkStore
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.Passthrough,
+        store,
+        pcTree,
+        GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+
+      key = gskBalance(8000)
+      _ <- store.insert[Balance](key, Balance(NonNegLong(42L)))
+
+      // Prune at multiple boundaries — all are no-ops. Read survives unchanged.
+      _ <- overlay.pruneBelow(SnapshotOrdinal(NonNegLong(0L)))
+      _ <- overlay.pruneBelow(SnapshotOrdinal(NonNegLong(100L)))
+      _ <- overlay.pruneBelow(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+
+      readAfterPrune <- overlay.get[Balance](BranchId.base, key)
+    } yield expect(readAfterPrune.contains(Balance(NonNegLong(42L))))
+  }
+
+  test("pruneBelow on MultiBranch drops undoJournal entries with finalizedAt < ord") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (_, overlay) = pair
+
+      ord1 = SnapshotOrdinal(NonNegLong(1L))
+      ord2 = SnapshotOrdinal(NonNegLong(2L))
+      pruneAt = SnapshotOrdinal(NonNegLong(2L)) // drops only ord1
+
+      losingKeyOrd1 = gskBalance(8100)
+      losingValOrd1 = Balance(NonNegLong(11L))
+      losingKeyOrd2 = gskBalance(8101)
+      losingValOrd2 = Balance(NonNegLong(22L))
+
+      // Setup: finalize branchA at ord1 (writes losingKeyOrd1 to base + journals reverse delta at key=1).
+      hA1 <- overlay.checkout(parentP)
+      _ <- hA1.insert[Balance](losingKeyOrd1, losingValOrd1)
+      _ <- overlay.commit(hA1, branchA, ord1)
+      _ <- overlay.finalizeBranch(branchA, ord1)
+
+      // Setup: finalize branchC at ord2 (writes losingKeyOrd2 to base + journals reverse delta at key=2).
+      hC2 <- overlay.checkout(parentP)
+      _ <- hC2.insert[Balance](losingKeyOrd2, losingValOrd2)
+      _ <- overlay.commit(hC2, branchC, ord2)
+      _ <- overlay.finalizeBranch(branchC, ord2)
+
+      // Both writes are now in base.
+      readOrd1Pre <- overlay.get[Balance](parentP, losingKeyOrd1)
+      readOrd2Pre <- overlay.get[Balance](parentP, losingKeyOrd2)
+
+      // Prune below ord2 — drops ord1's journal entry, keeps ord2's.
+      _ <- overlay.pruneBelow(pruneAt)
+
+      // Reorg-replace at ord1 (canonical-not-in-pending) — without the journal entry, branchA's
+      // base write is NOT undone (the undo replay finds nothing to apply).
+      _ <- overlay.finalizeBranch(branchB, ord1)
+      readOrd1AfterReorg <- overlay.get[Balance](parentP, losingKeyOrd1)
+
+      // Reorg-replace at ord2 — journal entry preserved, branchC's base write IS undone.
+      _ <- overlay.finalizeBranch(branchD, ord2)
+      readOrd2AfterReorg <- overlay.get[Balance](parentP, losingKeyOrd2)
+    } yield
+      expect.all(
+        readOrd1Pre.contains(losingValOrd1),
+        readOrd2Pre.contains(losingValOrd2),
+        // Below-prune ordinal: undo journal entry was pruned → branchA's write survives in base.
+        readOrd1AfterReorg.contains(losingValOrd1),
+        // At-or-above-prune ordinal: undo journal entry preserved → branchC's write is undone.
+        readOrd2AfterReorg.isEmpty
+      )
+  }
+
+  test("pruneBelow on MultiBranch preserves undoJournal entries at or above ord") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (_, overlay) = pair
+
+      ord5 = SnapshotOrdinal(NonNegLong(5L))
+      ord10 = SnapshotOrdinal(NonNegLong(10L))
+      pruneAt = ord5 // entries >= 5 preserved
+
+      key5 = gskBalance(8200)
+      val5 = Balance(NonNegLong(55L))
+      key10 = gskBalance(8201)
+      val10 = Balance(NonNegLong(100L))
+
+      // Finalize at ord5 and ord10 — both journal entries exist.
+      hA <- overlay.checkout(parentP)
+      _ <- hA.insert[Balance](key5, val5)
+      _ <- overlay.commit(hA, branchA, ord5)
+      _ <- overlay.finalizeBranch(branchA, ord5)
+
+      hC <- overlay.checkout(parentP)
+      _ <- hC.insert[Balance](key10, val10)
+      _ <- overlay.commit(hC, branchC, ord10)
+      _ <- overlay.finalizeBranch(branchC, ord10)
+
+      // Prune at ord5 — entries at key=5 and key=10 both retained (rangeFrom is inclusive on `ord`).
+      _ <- overlay.pruneBelow(pruneAt)
+
+      // Both undo entries should still fire on reorg-replace.
+      _ <- overlay.finalizeBranch(branchB, ord5)
+      readKey5 <- overlay.get[Balance](parentP, key5)
+
+      _ <- overlay.finalizeBranch(branchD, ord10)
+      readKey10 <- overlay.get[Balance](parentP, key10)
+    } yield
+      expect.all(
+        // Both undo entries survived prune → both base writes were undone.
+        readKey5.isEmpty,
+        readKey10.isEmpty
+      )
+  }
+
+  test("pruneBelow on MultiBranch is idempotent — calling twice with the same ord is safe") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (_, overlay) = pair
+
+      ord1 = SnapshotOrdinal(NonNegLong(1L))
+      ord2 = SnapshotOrdinal(NonNegLong(2L))
+
+      // Finalize twice to seed undoJournal entries.
+      hA <- overlay.checkout(parentP)
+      _ <- hA.insert[Balance](gskBalance(8300), Balance(NonNegLong(7L)))
+      _ <- overlay.commit(hA, branchA, ord1)
+      _ <- overlay.finalizeBranch(branchA, ord1)
+
+      hB <- overlay.checkout(parentP)
+      _ <- hB.insert[Balance](gskBalance(8301), Balance(NonNegLong(8L)))
+      _ <- overlay.commit(hB, branchB, ord2)
+      _ <- overlay.finalizeBranch(branchB, ord2)
+
+      // Prune at ord2 three times — must not error.
+      _ <- overlay.pruneBelow(ord2)
+      _ <- overlay.pruneBelow(ord2)
+      _ <- overlay.pruneBelow(ord2)
+
+      // Subsequent finalize at ord2 with a different canonical hits reorg-replace; entry at ord2
+      // was preserved across all three prunes (each pruned only strictly below ord2).
+      reorgOrd2 <- overlay.finalizeBranch(branchC, ord2)
+      readPostReorgOrd2 <- overlay.get[Balance](parentP, gskBalance(8301))
+    } yield
+      expect.all(
+        // ord2's journal entry survived → reorg-replace undoes branchB's write.
+        readPostReorgOrd2.isEmpty,
+        // Outcome is NoOp because pending was already empty after the prior fold.
+        reorgOrd2 == FinalizationOutcome.NoOp
+      )
+  }
+
+  test("pruneBelow with a future ord (beyond current chain) drops everything") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (_, overlay) = pair
+
+      ord1 = SnapshotOrdinal(NonNegLong(1L))
+      ord5 = SnapshotOrdinal(NonNegLong(5L))
+      pruneAt = SnapshotOrdinal(NonNegLong(1000L)) // well past everything
+
+      // Finalize a few snapshots — seeds undoJournal and finalizedRef entries.
+      hA <- overlay.checkout(parentP)
+      _ <- hA.insert[Balance](gskBalance(8400), Balance(NonNegLong(1L)))
+      _ <- overlay.commit(hA, branchA, ord1)
+      _ <- overlay.finalizeBranch(branchA, ord1)
+
+      hC <- overlay.checkout(parentP)
+      _ <- hC.insert[Balance](gskBalance(8401), Balance(NonNegLong(5L)))
+      _ <- overlay.commit(hC, branchC, ord5)
+      _ <- overlay.finalizeBranch(branchC, ord5)
+
+      // Prune everything below the future watermark.
+      _ <- overlay.pruneBelow(pruneAt)
+
+      // Re-finalize a different canonical at ord1 — finalizedRef[ord1] was pruned, so this is
+      // the NO-PRIOR-FINALITY path (case None) — branch never registered → NoOp.
+      reorgOrd1 <- overlay.finalizeBranch(branchB, ord1)
+
+      // No undo entries left → branchA's and branchC's writes remain in base after their respective
+      // reorg-replace attempts.
+      readKey1 <- overlay.get[Balance](parentP, gskBalance(8400))
+      readKey5 <- overlay.get[Balance](parentP, gskBalance(8401))
+    } yield
+      expect.all(
+        reorgOrd1 == FinalizationOutcome.NoOp,
+        // With everything pruned the undo journal cannot fire — base writes survive.
+        readKey1.contains(Balance(NonNegLong(1L))),
+        readKey5.contains(Balance(NonNegLong(5L)))
+      )
+  }
+
+  test("pruneBelow on Passthrough is idempotent") { res =>
+    implicit val (h, _, js) = res
+    for {
+      store <- mkStore
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.Passthrough,
+        store,
+        pcTree,
+        GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+
+      key = gskBalance(8500)
+      _ <- store.insert[Balance](key, Balance(NonNegLong(99L)))
+
+      // Multiple no-ops in a row.
+      _ <- overlay.pruneBelow(SnapshotOrdinal(NonNegLong(5L)))
+      _ <- overlay.pruneBelow(SnapshotOrdinal(NonNegLong(5L)))
+      _ <- overlay.pruneBelow(SnapshotOrdinal(NonNegLong(10L)))
+
+      readAfter <- overlay.get[Balance](BranchId.base, key)
+    } yield expect(readAfter.contains(Balance(NonNegLong(99L))))
+  }
 }

@@ -199,6 +199,20 @@ trait MptOverlay[F[_], K] {
     * lands in #56.9.) Passthrough: always returns `NoOp` because there is no overlay state to fold.
     */
   def finalizeBranch(canonical: BranchId, ordinal: SnapshotOrdinal): F[FinalizationOutcome]
+
+  /** Phase-3 (T_depth2) archival prune of overlay history structures (#139). Drops in-memory accumulators whose entries are strictly below
+    * `ord` — entries at the archival boundary k₂ (≈65536 snapshots, well past any reorg window we permit) cannot be needed by any future
+    * operation, so dropping them is safe and irreversible. Called from `SnapshotLeaderLoop.finalityMonitor` after the local archival
+    * watermark advances past `T_depth2.latestQualifyingOrdinal`.
+    *
+    * Pruning is purely a memory bound — the production code path produces identical `mptRoot`s before and after the call. Idempotent: a
+    * second call with the same `ord` is a no-op; a call with a lower `ord` is a no-op for entries already pruned.
+    *
+    * Multi-branch: prunes `undoJournalRef` entries with `finalizedAt < ord` (the reorg-recovery reverse-delta sink; no entry at depth > k₂
+    * can ever be replayed because reorgs at that depth are excluded by `T_depth2`'s definition) AND `finalizedRef` entries below `ord`
+    * (cross-ordinal conflict-detection entries are likewise unreachable past k₂). Passthrough: no-op (no per-branch history to prune).
+    */
+  def pruneBelow(ord: SnapshotOrdinal): F[Unit]
 }
 
 object MptOverlay {
@@ -325,6 +339,11 @@ object MptOverlay {
         // contract (error on (ordinal, hashA) then (ordinal, hashB)) is meaningful only in multi-branch
         // mode where pending state actually exists; passthrough is invisible to the comparator.
         Async[F].pure(FinalizationOutcome.NoOp)
+
+      def pruneBelow(ord: SnapshotOrdinal): F[Unit] =
+        // Passthrough has no in-memory history (no `undoJournalRef`, no `pendingRef`, no `finalizedRef`);
+        // writes already landed in `underlying` during the handle's lifetime. Trivially a no-op.
+        Async[F].unit
     }
 
   private final class PassthroughHandle[F[_], K](
@@ -781,6 +800,55 @@ object MptOverlay {
                 }
             }
           }
+        }
+
+      def pruneBelow(ord: SnapshotOrdinal): F[Unit] =
+        // Phase-3 archival prune (#139). `ord` is the local archival watermark — `T_depth2.latestQualifyingOrdinal`
+        // advanced past it in `SnapshotLeaderLoop.finalityMonitor`. By definition of k₂ ≈ 65536 snapshots,
+        // reorgs at depth > k₂ are negligibly unlikely, so:
+        //   - `undoJournalRef[finalizedAt]` for `finalizedAt < ord` can never be replayed (reorg-replace
+        //     finality at those ords is excluded by depth-k₂ archival finality).
+        //   - `finalizedRef[ord']` for `ord' < ord` will never be re-finalized with a different canonical
+        //     hash (same reason), so the conflict-detection entry is dead weight.
+        //
+        // `pendingRef` is deliberately NOT touched here — pending branches are managed by the commit/finalize
+        // path (cleared on `finalizeBranch.foldIntoBase`, evicted on cap exceedance) and any live branch with
+        // `entry.ordinal < ord` would already be unreachable in practice; touching pendingRef here would
+        // cross-cut concerns and is unnecessary because eviction + finalize already bound it.
+        //
+        // ParentChildTree is shared with consensus and has its own owner-driven `pruneBelow`; pruning it
+        // from inside the overlay would double-prune via a second owner.
+        //
+        // Single shared mutex with commit/finalize so the prune is consistent with concurrent fold operations.
+        mutex.permit.use { _ =>
+          val ordValue = ord.value.value
+          for {
+            preCounts <- (undoJournalRef.get, finalizedRef.get).tupled.map {
+              case (uj, fz) => (uj.size, fz.size)
+            }
+            (preUndo, preFinalized) = preCounts
+            // `rangeFrom` on `SortedMap[Long, _]` returns the sub-map of entries with key >= `ordValue`,
+            // i.e. drops all entries strictly below the archival watermark. O(log n) under TreeMap.
+            _ <- undoJournalRef.update(journal => journal.rangeFrom(ordValue))
+            _ <- finalizedRef.update(_.filter { case (k, _) => k.value.value >= ordValue })
+            postCounts <- (undoJournalRef.get, finalizedRef.get).tupled.map {
+              case (uj, fz) => (uj.size, fz.size)
+            }
+            (postUndo, postFinalized) = postCounts
+            droppedUndo = preUndo - postUndo
+            droppedFinalized = preFinalized - postFinalized
+            _ <-
+              if (droppedUndo > 0 || droppedFinalized > 0)
+                logger.info(
+                  s"OVERLAY-PRUNE-BELOW ord=$ordValue pre=$preUndo undoJournal entries / $preFinalized finalized entries " +
+                    s"post=$postUndo undoJournal entries / $postFinalized finalized entries " +
+                    s"(dropped undo=$droppedUndo, finalized=$droppedFinalized)"
+                )
+              else
+                logger.debug(
+                  s"OVERLAY-PRUNE-BELOW ord=$ordValue no-op (already pruned: $preUndo undoJournal, $preFinalized finalized)"
+                )
+          } yield ()
         }
 
       /** Atomically apply the merged chain delta to the underlying base store.

@@ -766,12 +766,12 @@ object SnapshotLeaderLoop {
 
                             // T_depth2 (Phase 2 → Phase 3, ARCHIVAL) observability + scaffolding.
                             //
-                            // No downstream effects yet — Phase-3 sinks land separately (overlay
-                            // history pruning #139, future Mithril aggregate cert, light-client
-                            // trust anchor). When `tDepth2.latestQualifyingOrdinal` strictly outruns
-                            // our local archival watermark, advance the watermark and emit the log
-                            // line + counters. The Ref is kept in this scope (TODO referenced where
-                            // it's constructed); #139 will plumb a getter to its prune driver.
+                            // When `tDepth2.latestQualifyingOrdinal` strictly outruns our local archival
+                            // watermark, advance the watermark, emit the log line + counters, AND drive
+                            // the Phase-3 overlay-history prune sink (#139) so long-running nodes don't
+                            // leak the per-ordinal undo journal / finalizedRef accumulators that grow
+                            // monotonically with every finalize. Future Phase-3 sinks (Mithril aggregate
+                            // cert, light-client trust anchor) plug in here too.
                             archivalQualifying <- tDepth2.latestQualifyingOrdinal
                             _ <- lastArchivalOrdinalRef.get.flatMap { prev =>
                               if (archivalQualifying.value.value > prev.value.value)
@@ -783,7 +783,12 @@ object SnapshotLeaderLoop {
                                           s"(tip ord=${tip.ordinal}, k₂=$ArchivalDepthK)"
                                       ) >>
                                       Metrics[F].incrementCounter("dag_nakamoto_archival_finalized") >>
-                                      Metrics[F].updateGauge("dag_nakamoto_archival_ordinal", archivalQualifying.value.value)
+                                      Metrics[F].updateGauge("dag_nakamoto_archival_ordinal", archivalQualifying.value.value) >>
+                                      // Phase-3 archival prune (#139). `pruneBelow` drops overlay history
+                                      // entries strictly below the new archival watermark — irreversible
+                                      // and safe by depth-k₂ definition (reorgs at this depth excluded).
+                                      // Logged at INFO inside the overlay when entries are dropped.
+                                      mptOverlay.pruneBelow(archivalQualifying)
                                   case None =>
                                     // Trigger advanced without a tip — shouldn't happen because the
                                     // trigger's evaluator returns MinValue when bestTip is None.
