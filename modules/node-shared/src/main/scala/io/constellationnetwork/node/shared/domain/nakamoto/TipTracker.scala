@@ -45,6 +45,17 @@ trait TipTracker[F[_]] {
     * predecessor silently let forked chains each "finalize" their local fork (observed in a 3-node cluster where gl0-2 forked: all three
     * nodes logged ATTEST-FINALIZED at the same ordinals with weight=0.67, yet their mptRoots at each ordinal were permanently different).
     *
+    * '''Why self-exclusion''' (task #133): a node MUST NOT count its own attestation toward its own finality threshold. Otherwise it can
+    * self-finalize a divergent fork, and once `chainStore.finalize` records the local hash, the finality-safety gate (`NakamotoChainStore`)
+    * will permanently refuse the canonical chain's hash — the "fork-recovery deadlock" of #119. Under equal-stake `1/N` this is rare (a
+    * single attestation is `1/N` of the threshold), but once stake-weighted VRF lands a single high-stake validator could hit the 2/3
+    * threshold purely from its own attestation. The producer's contribution is still recorded (other peers' views of this node's
+    * attestation count normally — only the self-view filters it out).
+    *
+    * @param selfId
+    *   this node's `PeerId`. Attestations stored under `selfId` are excluded from the weight sum to avoid self-finalization on divergent
+    *   forks. Peer (observer) views — e.g. validating someone else's chain — should pass a different identity here, or use a sentinel that
+    *   never matches a real peer.
     * @param threshold
     *   cumulative stake fraction required (e.g. 2/3)
     * @param canonicalHashAt
@@ -52,6 +63,7 @@ trait TipTracker[F[_]] {
     *   `chainStore.walkBackTo(localTip.hash, ord)`). Attestations whose tipHash doesn't match are discarded from the weight sum.
     */
   def highestFinalizedOrdinal(
+    selfId: PeerId,
     threshold: Ratio,
     canonicalHashAt: Long => F[Option[Hash]]
   ): F[Option[(Long, Ratio)]]
@@ -131,6 +143,7 @@ object TipTracker {
           } yield weighted.filter(_._3 > Ratio.Zero).maxByOption { case (_, _, w) => (w.numerator, w.denominator) }
 
         def highestFinalizedOrdinal(
+          selfId: PeerId,
           threshold: Ratio,
           canonicalHashAt: Long => F[Option[Hash]]
         ): F[Option[(Long, Ratio)]] =
@@ -140,7 +153,13 @@ object TipTracker {
             // attested to the hash that's actually on OUR chain at that ordinal. Attestations on
             // other forks (different hash at same ordinal) contribute zero weight to finalizing
             // our chain.
-            onChain <- attestations.toList.traverse[F, Option[(Long, Ratio)]] {
+            //
+            // Self-exclusion (task #133): drop the entry keyed by `selfId` BEFORE the canonical
+            // filter. A node must not count its own attestation toward its own finality threshold,
+            // otherwise — combined with `chainStore.finalize`'s finality-safety gate — it can
+            // self-finalize a divergent fork and then permanently refuse the canonical chain (the
+            // "fork-recovery deadlock" of #119).
+            onChain <- attestations.iterator.filter { case (peerId, _) => peerId =!= selfId }.toList.traverse[F, Option[(Long, Ratio)]] {
               case (peerId, att) =>
                 canonicalHashAt(att.tipOrdinal).flatMap {
                   case Some(localHash) if localHash === att.tipHash =>

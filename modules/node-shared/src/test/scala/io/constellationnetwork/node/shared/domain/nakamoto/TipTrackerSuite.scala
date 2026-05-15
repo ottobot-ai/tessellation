@@ -295,14 +295,17 @@ object TipTrackerSuite extends SimpleIOSuite {
   test("highestFinalizedOrdinal skips attestations not on our canonical chain (fork scenario)") {
     // Simulates 3-node cluster where gl0-2 forked. gl0-0/gl0-1 share chain A;
     // gl0-2 is on chain B. All three attest their local tip at ordinal 100 with
-    // different hashes. For a gl0-0 caller (canonical chain = A), only gl0-0
-    // and gl0-1's attestations count → 2/3 weight = threshold met, finalize
-    // ordinal 100 with hash A. For a gl0-2 caller (canonical chain = B), only
-    // its own attestation counts → 1/3 < 2/3, no finality on B. This prevents
-    // the hash-agnostic bug that let both forks "finalize" in parallel.
+    // different hashes. For a gl0-0 caller (canonical chain = A, self=gl0-0),
+    // only gl0-1's attestation counts (gl0-0 is excluded as self, gl0-2 is
+    // off-chain) → 1/3 < 2/3, no finality. For a gl0-2 caller (canonical chain
+    // = B, self=gl0-2), no peer attestations match B → no finality. The third
+    // viewpoint — an external observer who is none of the validators — sees
+    // gl0-0 + gl0-1 = 2/3 on A → finality on A. This combines two safety rules:
+    // the hash-agnostic-fork bug AND the self-finalization (#119/#133) bug.
     val gl0_0 = pid("gl0-0")
     val gl0_1 = pid("gl0-1")
     val gl0_2 = pid("gl0-2")
+    val observer = pid("observer")
     val hashA100 = hash("chainA_ord100")
     val hashB100 = hash("chainB_ord100")
 
@@ -312,32 +315,50 @@ object TipTrackerSuite extends SimpleIOSuite {
       _ <- tracker.recordAttestation(gl0_1, att(hashA100, slot(200), 100L, slot(201)))
       _ <- tracker.recordAttestation(gl0_2, att(hashB100, slot(205), 100L, slot(206)))
 
-      // gl0-0's view: canonical chain A → ordinal 100 canonical hash = hashA100
-      fromChainA <- tracker.highestFinalizedOrdinal(
+      // gl0-0's view: canonical chain A → ord 100 canonical hash = hashA100.
+      // gl0-0 is excluded as self; gl0-1's matching attestation alone = 1/3 < 2/3.
+      fromChainA_selfGl00 <- tracker.highestFinalizedOrdinal(
+        gl0_0,
         Ratio(2, 3),
         ord => IO.pure(if (ord == 100L) Some(hashA100) else None)
       )
 
-      // gl0-2's view: canonical chain B → ordinal 100 canonical hash = hashB100
+      // External observer's view of chain A: no self-exclusion (observer is not
+      // a validator), gl0-0 + gl0-1 = 2/3 stake agree on A's ord 100 → finalize.
+      fromChainA_observer <- tracker.highestFinalizedOrdinal(
+        observer,
+        Ratio(2, 3),
+        ord => IO.pure(if (ord == 100L) Some(hashA100) else None)
+      )
+
+      // gl0-2's view: canonical chain B → ordinal 100 canonical hash = hashB100.
+      // gl0-2 is excluded as self; no peer attestations match B → no finality.
       fromChainB <- tracker.highestFinalizedOrdinal(
+        gl0_2,
         Ratio(2, 3),
         ord => IO.pure(if (ord == 100L) Some(hashB100) else None)
       )
     } yield
-      // Chain A finalizes (gl0-0 + gl0-1 = 2/3 stake agree on A's ord 100)
-      expect(fromChainA.isDefined) &&
-        expect.same(100L, fromChainA.get._1) &&
-        expect.same(Ratio(2, 3), fromChainA.get._2) &&
-        // Chain B does NOT finalize (only gl0-2 attests, 1/3 < 2/3)
+      // gl0-0's self-view of chain A: 1/3 only (gl0-1 alone after self-exclusion)
+      expect.same(None, fromChainA_selfGl00) &&
+        // Observer (no self-exclusion): sees gl0-0 + gl0-1 = 2/3 on A, finalizes
+        expect(fromChainA_observer.isDefined) &&
+        expect.same(100L, fromChainA_observer.get._1) &&
+        expect.same(Ratio(2, 3), fromChainA_observer.get._2) &&
+        // gl0-2's view of chain B: self-excluded + no peers attest B = no finality
         expect.same(None, fromChainB)
   }
 
   test("highestFinalizedOrdinal: GRANDPA ancestor rule still works (all agree chain)") {
     // No fork: all three peers attest different ordinals on the same chain.
     // Finality should pick the highest ordinal where cumulative weight ≥ 2/3.
+    // From an external observer's viewpoint (selfId not in validator set), all
+    // three attestations count and finality picks the highest ord where weight
+    // cumulates past 2/3.
     val peer1 = pid("peer1")
     val peer2 = pid("peer2")
     val peer3 = pid("peer3")
+    val observer = pid("observer")
     val h50 = hash("ord50")
     val h60 = hash("ord60")
     val h70 = hash("ord70")
@@ -349,6 +370,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       _ <- tracker.recordAttestation(peer3, att(h50, slot(100), 50L, slot(101)))
 
       result <- tracker.highestFinalizedOrdinal(
+        observer,
         Ratio(2, 3),
         ord =>
           IO.pure(ord match {
@@ -363,5 +385,81 @@ object TipTrackerSuite extends SimpleIOSuite {
       // peer1 + peer2 cumulative at ord 60 = 2/3 (at threshold — finalize ord 60)
       expect(result.isDefined) &&
         expect.same(60L, result.get._1)
+  }
+
+  test("highestFinalizedOrdinal excludes self-attestation — node attesting its own ordinal doesn't count toward its threshold") {
+    // Task #133: a node MUST NOT count its own attestation toward its own
+    // finality threshold. With 2 validators (self + peer) attesting the same
+    // ordinal on the same hash, an external observer would see 2/2 = full
+    // weight, but the self-view must drop its own attestation, leaving only
+    // 1/2 — below the 2/3 threshold. This prevents self-finalization on a
+    // divergent fork that would then trip the finality-safety gate of #119.
+    val self = pid("self")
+    val peer = pid("peer")
+    val h100 = hash("ord100")
+
+    for {
+      (tracker, _) <- setupTracker(Set(self, peer))
+      _ <- tracker.recordAttestation(self, att(h100, slot(200), 100L, slot(201)))
+      _ <- tracker.recordAttestation(peer, att(h100, slot(200), 100L, slot(201)))
+
+      // Self-view: self-attestation excluded, peer alone = 1/2 < 2/3 → no finality
+      selfView <- tracker.highestFinalizedOrdinal(
+        self,
+        Ratio(2, 3),
+        ord => IO.pure(if (ord == 100L) Some(h100) else None)
+      )
+
+      // Peer's view: self-attestation (its own) excluded but the OTHER
+      // validator's attestation still counts → 1/2 also below 2/3.
+      peerView <- tracker.highestFinalizedOrdinal(
+        peer,
+        Ratio(2, 3),
+        ord => IO.pure(if (ord == 100L) Some(h100) else None)
+      )
+
+      // Observer's view: no self-exclusion. Both attestations of the same hash
+      // give 2/2 = full weight — past 2/3, finalize ord 100.
+      observerView <- tracker.highestFinalizedOrdinal(
+        pid("observer"),
+        Ratio(2, 3),
+        ord => IO.pure(if (ord == 100L) Some(h100) else None)
+      )
+    } yield
+      expect.same(None, selfView) &&
+        expect.same(None, peerView) &&
+        expect(observerView.isDefined) &&
+        expect.same(100L, observerView.get._1)
+  }
+
+  test("highestFinalizedOrdinal includes others' attestations of the same ordinal as expected") {
+    // Task #133 sibling: confirm that excluding self does NOT over-exclude.
+    // 4-node cluster: self + 3 peers all attest ord 100 with the same hash.
+    // Self-view: self-attestation dropped, 3 peers = 3/4 ≥ 2/3 → finalize.
+    // This proves the self-filter is precise — it only drops the self entry,
+    // not other attestations on the same ordinal/hash.
+    val self = pid("self")
+    val peer1 = pid("peer1")
+    val peer2 = pid("peer2")
+    val peer3 = pid("peer3")
+    val h100 = hash("ord100")
+
+    for {
+      (tracker, _) <- setupTracker(Set(self, peer1, peer2, peer3))
+      _ <- tracker.recordAttestation(self, att(h100, slot(200), 100L, slot(201)))
+      _ <- tracker.recordAttestation(peer1, att(h100, slot(200), 100L, slot(201)))
+      _ <- tracker.recordAttestation(peer2, att(h100, slot(200), 100L, slot(201)))
+      _ <- tracker.recordAttestation(peer3, att(h100, slot(200), 100L, slot(201)))
+
+      selfView <- tracker.highestFinalizedOrdinal(
+        self,
+        Ratio(2, 3),
+        ord => IO.pure(if (ord == 100L) Some(h100) else None)
+      )
+    } yield
+      // 3 peers attesting the same ord/hash = full weight against the 3-peer
+      // (post-self-exclusion) active set under optimistic weighting → finalize.
+      expect(selfView.isDefined) &&
+        expect.same(100L, selfView.get._1)
   }
 }

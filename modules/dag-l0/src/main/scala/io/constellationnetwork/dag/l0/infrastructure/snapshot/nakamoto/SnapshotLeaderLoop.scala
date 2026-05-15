@@ -507,7 +507,12 @@ object SnapshotLeaderLoop {
               // weight >= 2/3 is finalized.
               chainFinalizedOrdinal <- bestTip match {
                 case Some(tip) =>
+                  // Self-exclusion (task #133): pass `selfId` so our own attestation is dropped
+                  // from the weight sum. Otherwise this node could self-finalize a divergent fork
+                  // and trip the finality-safety gate in `chainStore.finalize`, locking the node
+                  // out of canonical recovery (the "fork-recovery deadlock" of #119).
                   tipTracker.highestFinalizedOrdinal(
+                    selfId,
                     TipTracker.FinalityThreshold,
                     ord => chainStore.walkBackTo(tip.hash, ord)
                   )
