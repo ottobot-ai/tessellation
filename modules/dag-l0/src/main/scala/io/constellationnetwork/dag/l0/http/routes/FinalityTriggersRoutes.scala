@@ -19,8 +19,9 @@ import org.http4s.dsl.Http4sDsl
 /** HTTP route for the chain-quality / finality-triggers observable (task #138).
   *
   * `GET /global-snapshots/{ord}/finality-triggers` answers "which finality triggers qualified the given ordinal?" without taking on
-  * leader-loop internals. The trigger list is owned by [[io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop]],
-  * which publishes a [[FinalityTriggerView]] through a `Ref` at startup. This route reads that Ref each request — lock-free, no caching.
+  * leader-loop internals. The trigger list is owned by
+  * [[io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop]], which publishes a [[FinalityTriggerView]]
+  * through a `Ref` at startup. This route reads that Ref each request — lock-free, no caching.
   *
   * Returns 503 while the Ref is empty (the leader-loop hasn't initialized yet — startup window).
   *
