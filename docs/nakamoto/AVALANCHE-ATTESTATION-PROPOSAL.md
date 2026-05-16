@@ -3,7 +3,10 @@
 **Status:** research proposal. Decision input. Implementation deferred behind
 stake-weighted VRF + KES. Written 2026-05-15. Revised 2026-05-15 to fold in
 locked decisions and the quick-sweep sim recommendation from
-[`~/repos/research-nipopos-2026` commit `15983f1a`](#).
+[`~/repos/research-nipopos-2026` commit `15983f1a`](#). Revised again
+2026-05-15 to flip cascade semantics from **Snowflake → Snowball** (per-color
+persistent confidence accumulator, decide by margin) and fold in two
+Frosty-derived insights — see §0 TL;DR and §2.2 / §10A.
 
 This document proposes replacing the current "attest the current canonical
 bestTip per (ord, hash) pair" emit policy with an **Avalanche-style
@@ -37,6 +40,13 @@ Cross-references:
 - Rocco et al. (Team Rocket pseudonym). *Snowflake to Avalanche: A Novel
   Metastable Consensus Protocol Family for Cryptocurrencies*. 2018.
   ([https://www.avalabs.org/whitepapers](https://www.avalabs.org/whitepapers))
+- Lewis-Pye, Buchwald, Buttolph, O'Grady, Sekniqi. *Frosty: Bringing
+  strong liveness guarantees to the Snow family of consensus protocols*.
+  arXiv:2404.14250, 2024. ([html](https://arxiv.org/html/2404.14250v5))
+  — Snowflake+ dual-threshold variant + epoch-change liveness module.
+- Amores-Sesar, Schneider. *An Analysis of Avalanche Consensus*.
+  arXiv:2401.02811, 2024. — independent Snowflake / Snowball / Avalanche
+  formal-model analysis. Cited in §6.1 for the safety bound delta.
 - [`~/repos/research-nipopos-2026/sims/AVALANCHE_CALIBRATION.md`](../../../research-nipopos-2026/sims/AVALANCHE_CALIBRATION.md)
   — sim harness, branch `sim/avalanche-attestation`, commit `15983f1a`.
 - `~/.claude/skills/taktikos/SKILL.md` — Taktikos protocol rules.
@@ -45,7 +55,7 @@ Cross-references:
 
 ## §0. Locked decisions (TL;DR)
 
-The 10 decisions below are settled. The rest of the doc derives from them.
+The 12 decisions below are settled. The rest of the doc derives from them.
 
 | # | Decision | Where it lands |
 |---|---|---|
@@ -54,11 +64,13 @@ The 10 decisions below are settled. The rest of the doc derives from them.
 | C | **T_count is subsumed by β.** Observing β peers all preferring hash H is *effectively* a per-node T_count-equivalent local quorum. β is set proportionally; T_count's wire-level evaluation collapses into the cascade trigger. | §3.2 |
 | D | **Audit-after-implementation.** The combined Taktikos + Avalanche security argument is novel; cryptographer review happens against the implemented protocol, not as a pre-implementation gate. | §6, §9 |
 | E | **Symmetric rollback.** When a node's cascade flips its locally-preferred hash, the state-application rollback is symmetric to the application path (the same MPT-overlay primitives that move state forward also move it back). | §3.3 |
-| F | **Emit-once.** The decided-attestation is emitted exactly once, when the β-counter first clears the threshold. No re-attestation under fluctuating peer-set views. The §5.1 visibility ticker is removed entirely. | §2.2, §5.4 |
+| F | **Emit-once.** The decided-attestation is emitted exactly once, when the Snowball accumulator margin first clears β (formerly: the Snowflake counter cleared β). No re-attestation under fluctuating peer-set views. The §5.1 visibility ticker is removed entirely. | §2.2, §5.4 |
 | G | **No slashing in this proposal.** Equivocation **detection** produces self-verifying evidence (§4.2); what to do with the evidence (zero stake, freeze, ignore) is a separate workstream. | §4.3, §4.5 |
 | H | **NIPoPoW is the archival path.** Out of scope here (see [`NIPOPOW-PROPOSAL.md`](./NIPOPOW-PROPOSAL.md)). Avalanche-attestation and NIPoPoW are orthogonal: Avalanche answers "which hash" at the tip; NIPoPoW answers "did this chain happen" for any archival range. | §8.4 |
 | I | **Uniform peer sampling** over the active stake-registry set. Stake-weighted sampling is rejected: classic Avalanche's safety bound is for uniform K-sample. Stake-weight already lands at the trigger layer (T_weight). | §2.2, §2.3, §6.3 |
 | J | **Single-chain (gl0) scope.** Cross-metagraph (gl1, currency-l1) attestation is out of scope. | §8.5 |
+| **K** | **Snowball semantics (not Snowflake).** Per-color persistent confidence accumulator; decide hash H when accumulator(H) exceeds the second-highest accumulator by margin β. Robust to adversarial timing of split queries — accumulated history cannot be reset by a single flip. Confirmed-defective in our prior text (§2.2) and in the sim harness, which is also Snowflake; both must be re-implemented. | §2.2, §2.4 |
+| **L** | **Frosty as future work, not blocker.** The Frosty paper (Lewis-Pye et al. 2024) supplies a dual-threshold Snowflake+ variant and an epoch-change liveness module. The dual-threshold idea is a candidate refinement for our Snowball cascade (§10A.1); the liveness module is largely subsumed by our existing T_depth1 / T_depth2 stack (§10A.2) but flagged as cross-link. | §10A |
 
 ### 0.A — Sim recommendation (quick sweep, 21 cells × 500 trials, commit `15983f1a`)
 
@@ -151,6 +163,101 @@ keeps the local validator's attestation aligned with the network
 majority so chain sync doesn't need a special-case "I'm
 permanently-divergent" mode.
 
+### 0.K — Snowflake → Snowball (decision K)
+
+The cascade described in our earlier §2.2 and implemented in
+`avalanche_attestation_calibration.py` is **Snowflake** semantics:
+`if majority == preference: confidence += 1; else: preference = majority;
+confidence = 1`. The confidence counter resets on every flip — there is
+no per-color history. This is the variant the original Rocco et al.
+paper (2018, §3.1) describes as the simplest member of the family;
+Snowball (§3.2 of the same paper, and §2.2 of Amores-Sesar & Schneider's
+formal analysis arXiv:2401.02811) adds **persistent per-color confidence
+counters** that accumulate over the entire protocol execution. A flip
+under Snowball does not erase prior accumulated evidence; the decision
+rule becomes "decide H when `accum(H) − max{accum(H') : H' ≠ H} ≥ β`".
+
+Why this matters for our setting: under a coordinated-lie adversary that
+strategically times split queries against a victim node, Snowflake's
+reset-on-flip is the load-bearing weakness. The sim's 1–2 % safety-
+violation rate at f=0.20 with (K=3, α=2, β=6) is the predicted
+signature of this attack. Snowball at the **same** β is strictly more
+robust because the adversary must overcome accumulated history, not
+just one round.
+
+The relevant sim evidence has been re-read post-flip-decision: the
+focused sweep at `/tmp/avalanche-focused.log` (commit `15983f1a`,
+2000 trials/cell, 4 K-α-β triples × 4 N values × 3 f values = 48 cells
+planned, ~40 cells complete at the time of this revision) confirms the
+Snowflake split-attack signature **and** the diagonal observation that
+larger K (classical Avalanche K=20, α=15, β=20) **fails entirely at
+high f_adv** — see §0.K.1 below.
+
+### 0.K.1 — Focused sweep: headline numbers (Snowflake-tuned)
+
+| N    | f_adv | (K, α, β)     | convergence | safety_violations | med_rounds |
+|------|-------|---------------|-------------|-------------------|------------|
+| 64   | 0.20  | (3, 2, 6)     | 1.000       | **1.85 %**        | 10         |
+| 64   | 0.20  | (3, 2, 10)    | 1.000       | 0.00              | 14         |
+| 64   | 0.33  | **(20, 15, 20)** | **0.000** | 0.00              | DNF (cap)  |
+| 256  | 0.20  | (3, 2, 6)     | 1.000       | 0.10 %            | 10         |
+| 256  | 0.20  | **(20, 15, 20)** | 0.777    | 0.00              | 163        |
+| 256  | 0.33  | **(20, 15, 20)** | **0.000** | 0.00              | DNF (cap)  |
+| 1024 | 0.33  | (3, 2, 6)     | 1.000       | 0.00              | 9          |
+| 1024 | 0.33  | (8, 6, 12)    | 1.000       | 0.00              | 21         |
+| 1024 | 0.20  | (8, 6, 12)    | 1.000       | 0.00              | 61         |
+
+**The headline result for the TL;DR: K=20 / α=15 / β=20 (the literature-
+standard "classical Avalanche" triple) FAILS at f_adv=0.33 — 0 %
+convergence at both N=64 and N=256, hitting the 200-round cap.** Even at
+f_adv=0.20 it converges only 77.7 % of the time at N=256, and at a p50
+of 163 rounds (vs. our (3, 2, 6) at 10 rounds). This is a strong
+argument against the literature parameters for our setting and the
+single strongest justification for keeping (K=3, α=2) as the operating
+point — but with **β subject to re-sim under Snowball semantics**
+(§2.4).
+
+The (3, 2, 6) safety-violation rate at f=0.20 (1.85 % at N=64 dropping
+to 0.10 % at N=256) is the Snowflake split-attack signature. (3, 2, 10)
+already zeroes it; the prediction under Snowball semantics is that
+β=6 will also zero it because the accumulator cannot be reset by a
+single split.
+
+### 0.L — Frosty TL;DR (decision L; Lewis-Pye et al. 2024)
+
+Frosty (arXiv:2404.14250) supplies two enhancements to the Snow family.
+We adopt **neither directly in this proposal**; both are documented in
+§10A and cross-linked to future work.
+
+1. **Snowflake+** (dual-threshold cascade): replace single α with two
+   thresholds α₁ (flip) and α₂ (count). Splits the "decide to switch
+   preference" and "decide to deepen confidence" decisions into two
+   distinct sample-fraction thresholds, with α₁ ≤ α₂. Used to produce a
+   clean consistency proof. Our Snowball semantics (decision K) already
+   resolves the dominant attack (Snowflake split); Snowflake+ is an
+   orthogonal refinement that can stack on top of Snowball at low cost.
+   Candidate for a Phase 2 refinement. See §10A.1.
+
+2. **Liveness module + epoch change**: when the cascade fails to make
+   progress (adversary > O(√n) attacking liveness), trigger an "epoch
+   change" to a temporary quorum-based protocol. **We do not need this**:
+   our T_depth1 (depth-k₁) fallback already provides a structural
+   liveness floor independent of attestation flow. Our depth-k₁
+   fallback is to Frosty's liveness module as Bitcoin's longest-chain
+   rule is to PBFT's view change — different shape, same purpose.
+   See §10A.2.
+
+Frosty's recommended parameters (k=80, α₁=41, α₂=72, β=12, n≥500) are
+tuned for a much larger validator set than ours (cf. (3, 2, 6) at N=16).
+The synchrony assumption (Δ-bounded message delivery) matches our
+setting at the Avalanche-tick layer. The Byzantine bound f < n/5 is
+**tighter than ours** (we tolerate f ≤ 1/3 at the chain layer via
+Taktikos LDD, and the Avalanche layer composes with — not replaces —
+that bound). We do **not** import Frosty's f < n/5 assumption.
+
+`fB = 0.05` in production is unchanged — Frosty has no LDD analog and
+no recommendation that contradicts it.
+
 ---
 
 ## §1. Motivation: the architectural defect P-11b papers over
@@ -240,35 +347,53 @@ Avalanche-style subsampling delivers (1)–(5).
 
 ### 2.1 The original primitive (recap)
 
-Snowball (Rocco et al. §3.2) is a metastable consensus primitive in
-which each node repeatedly queries a random sample of `K` peers, taking
-the majority of their preferences as input to a confidence counter. Once
-confidence reaches a threshold `β`, the node *decides* on its current
-preference and stops querying. Decisions are **irrevocable** at the
-protocol layer (the application layer is free to reorganize state up
-until decision, but never after).
+The Snow family (Rocco et al. 2018; Amores-Sesar & Schneider 2024) is
+a sequence of metastable consensus primitives, each adding state to the
+previous:
+
+- **Slush**: each node repeatedly queries a random K-sample of peers and
+  adopts the α-majority color. Decision is by fixed round count.
+  Stateless across rounds.
+- **Snowflake**: adds a single `confidence` counter that **resets on
+  every color flip**. Decision after β *consecutive* same-color
+  α-majority queries. The reset is the load-bearing weakness:
+  adversarially-timed splits can keep `confidence` low indefinitely.
+- **Snowball**: replaces the single counter with a **per-color
+  persistent accumulator** `accum: Color → Int`. Each α-majority query
+  for color C increments `accum(C)`. A color flip occurs when
+  `accum(C') > accum(C_current)` for some C' (the node prefers the
+  color with the highest accumulator). Decision when
+  `accum(C_decided) − max{accum(C') : C' ≠ C_decided} ≥ β`. **No
+  reset on flip** — accumulated history persists, so the adversary
+  cannot erase prior evidence.
+- **Snowman**: chain-restricted Snowball (per-block, hash-chained).
+  We use this variant — decision **§0.J**, gl0 single-chain.
+- **Avalanche**: DAG-form, multiple Snowballs in parallel. Out of
+  scope.
+
+We adopt **Snowball** semantics (decision **§0.K**). Decisions are
+**irrevocable** at the protocol layer; the application layer rolls back
+state on flip up until decision (decision **§0.E**) but never after.
 
 Properties:
 - **Safety** (probabilistic): for honest fraction `f` above a threshold,
-  the probability two honest nodes decide different values is
-  `≤ ε(K, α, β, f)`, exponentially small in `β`.
+  the probability two honest nodes decide different colors is
+  `≤ ε(K, α, β, f)`, exponentially small in `β`. Snowball's bound is at
+  least as good as Snowflake's at the same β, and strictly better
+  against the coordinated-split adversary (§0.K, §6.1).
 - **Liveness** (probabilistic): with positive progress per round, all
-  honest nodes converge to one preference; once converged, all decide
+  honest nodes converge to one color; once converged, all decide
   within `β` rounds.
 - **Quiescence**: no decided node ever talks again about that ordinal.
 
-Snowman is the chain-restricted variant; Avalanche extends to a DAG.
-We use Snowman (single-chain) semantics — decision **§0.J**, gl0 scope
-only.
-
-### 2.2 Adaptation to per-ordinal attestation
+### 2.2 Adaptation to per-ordinal attestation (Snowball)
 
 For each ordinal N that a validator observes:
 
 ```
 state per (node, ord):
-  preference: Hash         // init: local canonical hash at this ord, if any
-  confidence: Int = 0
+  preference: Hash                          // init: local canonical hash at this ord, if any
+  accum:      Map[Hash, Int] = {}           // per-hash persistent accumulator (Snowball, §0.K)
   decided:    Boolean = false
   initialized: Boolean = false
 
@@ -279,31 +404,42 @@ every Δ ms (the Avalanche tick — see §2.4):
     R = R.filter(_ != Pending)                                                   // drop "I don't know yet"
     if |R| < α:
       continue                                                                   // not enough responses — try next tick
-    majority = the hash that appears most in R
-    if count(majority) >= α and majority == preference:
-      confidence += 1
-    else if count(majority) >= α and majority != preference:
-      preference = majority
-      confidence = 1                                                             // restart confidence on flip
-      rollback_local_state_to(ord - 1)                                           // §0.E symmetric rollback (§3.3)
-    else:
-      confidence = max(confidence - 1, 0)                                        // no clear majority — decay
-    if confidence >= β:
+    topHash = the hash that appears most in R
+    if count(topHash) >= α:
+      accum(topHash) += 1                                                        // Snowball: persistent per-color tally
+      // re-derive preference: the hash with the highest accumulator
+      newPreference = argmax(accum)
+      if newPreference != preference:
+        rollback_local_state_to(ord - 1)                                         // §0.E symmetric rollback (§3.3)
+        preference = newPreference                                               // accum is NOT reset
+    // (else: no α-majority — no accumulator increment, no flip)
+    // Decision: margin of top accumulator over the runner-up clears β
+    sorted = accum.values.sorted(descending)
+    if sorted.length >= 1 and (sorted[0] - sorted.getOrElse(1, 0)) >= β:
       decided = true
       emit signed_attestation(ord, preference, attestedAt = now)                 // §0.F emit-once
 ```
 
+**Key contrast with Snowflake (§2.1):** there is no `confidence: Int`
+that resets on flip. The accumulator carries history across the whole
+cascade. A flip is just "the hash with the highest cumulative
+α-majority count changed" — it does not zero anyone's tally. The
+decision condition is **margin-based** (`top − runnerUp ≥ β`), not
+consecutive-count-based.
+
 The seed value for `preference` when entering an ord:
 - If we have produced or stored a snapshot at ord N already, use the
-  canonical hash from our local chain store.
+  canonical hash from our local chain store. Initialize `accum` with
+  the seed hash set to 0 (no a-priori weight); the first
+  α-majority query increments it.
 - If we have seen peer snapshots at ord N but our chain hasn't reached
   there yet, use the most-recently-arriving valid candidate.
 - If we have seen no snapshots at ord N, do not initialize yet (no
   query) — Avalanche is silent until we have a candidate.
 
 `Pending` is a peer-side response signaling "I have not initialized at
-ord yet"; counted toward `|R|` it would falsely decay confidence
-otherwise — drop it.
+ord yet"; counted toward `|R|` it would skew the α-majority test
+(false-quorum-of-zero) — drop it.
 
 **Sampling is uniform** over the active validator set (decision **§0.I**).
 Stake-weighting the sample was considered and rejected: classic
@@ -318,13 +454,18 @@ we drop it — we don't carry weighted variants for completeness.
 One new gossip topic (or libp2p sidecar RPC method):
 
 - **Query**: `(queryId, ordinal)` → 0 RTT
-- **Response**: `(queryId, ordinal, preference: Option[Hash], confidence: Option[Int], decided: Bool)`
+- **Response**: `(queryId, ordinal, preference: Option[Hash], accum: Map[Hash, Int], decided: Bool)`
   → 1 RTT total
 
 The response's `preference: Option[Hash]` is `None` when the responder
-hasn't initialized — explicit "pending" signal. The `confidence`
-and `decided` fields are observational only; they don't gate anything.
-They feed Prometheus and diagnostics.
+hasn't initialized — explicit "pending" signal. The `accum` map (the
+full per-hash accumulator) and `decided` flag are **observational only**;
+they don't gate anything in the querier's cascade (the querier only
+needs `preference` to drive its own Snowball step). They feed
+Prometheus and diagnostics, and they're useful for after-the-fact
+audit of which hash the network was converging on at any given tick.
+At small cluster sizes the `accum` map is bounded to ~3-5 entries (the
+distinct fork tips at this ord).
 
 Implementation note: this can ride on the existing libp2p GossipSub
 sidecar (`SidecarClient`) as a new typed message, or — preferred — on a
@@ -335,21 +476,25 @@ cluster size 100 with 10 pending ordinals that's `100 × 3 × 10 / 0.5s
 
 ### 2.4 Parameters
 
-Initial recommendation from the quick-sweep sim (commit `15983f1a`,
-§0.A above): **`(K=3, α=2, β=6)`** for small clusters. Subject to
-N ∈ {500, 1000} scale verification at `n_trials ≥ 10000` (in flight in
-the same commit's background job).
+**Initial recommendation (Snowball, subject to re-sim): `(K=3, α=2,
+β=6-10)` for small clusters.** The exact β within that range is
+**pending a re-run of the focused sim under Snowball semantics**: the
+current sim numbers (§0.A, §0.K.1) are Snowflake-tuned, and Snowball is
+expected to require **lower β** for the same agreement rate because
+adversarial timing of splits cannot reset the accumulator. The
+expectation is that Snowball-β=6 will match or exceed Snowflake-β=10's
+0 % violation rate at f=0.20 — but this needs the re-sim before being
+locked.
 
-| Environment      | Cluster size | K  | α  | β  | Tick Δ              | p99 wall-time |
-|------------------|--------------|----|----|----|---------------------|---------------|
-| e2e tests        | 3-8          | 3  | 2  | 6  | `slot/2 = 250 ms`   | ~1.5-2.5 s    |
-| small mainnet    | 16-100       | 3  | 2  | 6  | `slot/2 = 500 ms`   | ~2-3 s        |
-| large mainnet*   | 500-1000     | TBD| TBD| TBD| `slot/2 = 500 ms`   | TBD           |
+| Environment      | Cluster size | K  | α  | β (Snowball)    | Tick Δ              | p99 wall-time |
+|------------------|--------------|----|----|-----------------|---------------------|---------------|
+| e2e tests        | 3-8          | 3  | 2  | 6–10 (re-sim)   | `slot/2 = 250 ms`   | ~1.5-3 s      |
+| small mainnet    | 16-100       | 3  | 2  | 6–10 (re-sim)   | `slot/2 = 500 ms`   | ~2-4 s        |
+| large mainnet*   | 500-1000     | TBD| TBD| TBD             | `slot/2 = 500 ms`   | TBD           |
 
 `*` Large-cluster row pending the full sweep at N ∈ {500, 1000},
-`n_trials = 10000`. If the quick-sweep extrapolation holds, the same
-`(3, 2, 6)` triple covers it; if the safety-violation rate degrades at
-scale we'll bump β.
+`n_trials = 10000`. Under Snowball semantics we expect (K=3, α=2) to
+hold and β to land at 6 if the re-sim matches the prediction.
 
 **Tick cadence decision (§0.A):** `Δ = slotDurationMs / 2`, computed via
 `Ratio[BigInt]` arithmetic so every node derives the identical integer
@@ -368,11 +513,14 @@ Constraints:
 - `K ≤ |stakeRegistry.activeValidators| - 1`. If insufficient peers,
   Avalanche stalls → depth-k₁ fallback (T_depth1) carries us through.
   Liveness floor.
-- `α > K/2` for safety: a tie cannot promote a value. At `(3, 2, 6)`,
+- `α > K/2` for safety: a tie cannot promote a value. At `(3, 2, β)`,
   `α = 2 > 1.5 = K/2`. Holds.
-- `β` controls the safety-vs-latency knob (smaller = faster decision,
-  larger = lower split-decision probability). Sim picked β=6 as the
-  smallest β that hit ≥ 99 % agreement under coordinated-lie at f=0.33.
+- `β` is the **margin** between the top and runner-up accumulator at
+  decision time (Snowball, §2.2). Snowflake β was the consecutive-
+  count threshold; Snowball β is the lifetime-margin threshold. The
+  knob is the same — safety vs. latency — but the underlying state
+  is richer, which is why a smaller β suffices for the same agreement
+  rate.
 
 Knobs land under config (`NAKAMOTO_AVALANCHE_K` / `_ALPHA` / `_BETA` /
 `_TICK_FRACTION_NUM` / `_TICK_FRACTION_DEN`) with `LddConfig`-style
@@ -420,15 +568,15 @@ In particular:
 ### 3.2 T_count under β (decision §0.C)
 
 T_count today fires when 2/3 of distinct attesters (regardless of stake)
-have attested to the receiver's canonical hash. Under Avalanche, each
-honest node's β-counter answers a stronger local question: "have I
-observed β peers all preferring my current hash?" Once β-many peers all
-prefer H, the local node decides — and once that local decision becomes
-gossiped as an emitted attestation, the receiver's T_count input
-trivially includes it.
+have attested to the receiver's canonical hash. Under Avalanche-Snowball,
+each honest node's per-color accumulator answers a stronger local
+question: "is my preferred hash H's lifetime α-majority count ahead of
+the runner-up by margin β?" Once `accum(H) − runnerUp ≥ β`, the local
+node decides — and once that local decision becomes gossiped as an
+emitted attestation, the receiver's T_count input trivially includes it.
 
 The net effect: T_count's network-level evaluation reduces to "every
-node has independently decided via its own β-counter, and the
+node has independently decided via its own Snowball margin, and the
 receiver has now collected those decisions". The trigger stays in
 the codebase for two reasons:
 
@@ -447,8 +595,8 @@ formal; at small clusters (16, β=6) this already exceeds the 2/3 floor.
 
 ### 3.3 Symmetric rollback (decision §0.E)
 
-When the Avalanche cascade flips its locally-preferred hash
-(`majority != preference` branch in §2.2), the validator may have
+When the Snowball cascade flips its locally-preferred hash
+(`newPreference != preference` branch in §2.2), the validator may have
 already applied state from `preference` (the pre-flip hash) into its
 local MPT overlay or chainStore. The rollback path is **symmetric to
 the application path**: the same MPT-overlay primitives that move state
@@ -463,6 +611,10 @@ forward also move it back. Concretely:
 - Drop the corresponding TipTracker entries from `pendingRef`.
 - Drop the corresponding `chainStore.bestTip` lineage; let chain
   selection re-seat on the post-flip hash via the normal LDD path.
+- **Snowball-specific:** the `accum` map is **not** reset on flip
+  (that's the entire point of Snowball over Snowflake). State rollback
+  in the application layer is decoupled from the cascade's per-color
+  history.
 
 What we do **not** want: an asymmetric "fast-path apply, slow-path
 hand-rolled undo" mechanism. That was the shape that gave us the
@@ -471,11 +623,15 @@ mempool tx-drop on reorg (#122). The Avalanche-flip path uses the same
 primitives that already work — no new undo path. This is the load-bearing
 constraint behind decision **§0.E**.
 
-The cost of symmetric rollback is bounded by Avalanche's `β` rounds: a
-flip can happen at most `β-1` times per ordinal before decision. In
-practice — under honest majority — flips during the cascade window are
-rare; the harness measures `median_rounds = 7-12` at β=6, so the
-cascade typically lands first-try on the right preference.
+The cost of symmetric rollback is bounded by the number of flips a
+single ordinal can undergo before decision, which under Snowball is
+itself bounded by **the time it takes for the leading accumulator to
+pull `β` ahead of the runner-up**. Under honest majority, flips during
+the cascade window are rare; the (Snowflake-tuned) harness measures
+`median_rounds = 7-12` at β=6, so the cascade typically lands first-try
+on the right preference. Snowball is expected to lower the flip rate
+further because a single round of split queries cannot reverse
+accumulator order if the leading hash has a comfortable margin.
 
 ---
 
@@ -578,13 +734,20 @@ second. This sequence:
 
 ### 5.1 Decision latency (revised with sim numbers)
 
-The dominant cost of Avalanche is `β` rounds × `Δ` ticks before lock-in:
+The dominant cost of Avalanche is `β`-equivalent rounds × `Δ` ticks
+before lock-in:
 
 ```
 T_decide ≈ β · Δ + RTT_query
 ```
 
-From the quick-sweep (§0.A), measured (not extrapolated):
+(For Snowflake, β is the consecutive-count threshold; for Snowball, β
+is the lifetime-margin threshold. Under non-adversarial conditions the
+two are within a small constant factor — Snowball reaches `accum(H) −
+runnerUp ≥ β` in roughly β rounds once everyone agrees.)
+
+From the quick-sweep (§0.A) — note these numbers are Snowflake-tuned;
+Snowball is expected to match-or-beat them at the same β:
 
 | Env             | N    | (K, α, β)   | Δ      | p50 / p99 rounds | p50 / p99 wall-time |
 |-----------------|------|-------------|--------|------------------|---------------------|
@@ -620,7 +783,8 @@ finality" mode for fork branches, which is the desired safety property
 under partition anyway:
 
 - If the cluster is partitioned below `K`, Avalanche **stalls**:
-- `confidence` never reaches `β` → no decision → no attestation emitted.
+- `accum` never accumulates a `β`-margin → no decision → no
+  attestation emitted.
 - `T_weight` and `T_count` get nothing to count → don't fire.
 - `T_depth1` keeps ticking → carries the chain through finality on
   pure structural depth.
@@ -673,17 +837,41 @@ by Rocco et al.'s Theorem 1:
 Pr[honest split decision] ≤ (1 - p)^β       where p ≈ Φ_α,K(f)
 ```
 
-At our chosen (K=3, α=2, β=6), classical Avalanche's analytic bound is
-weaker than at (K=20, α=15, β=20); but the sim under coordinated-lie
-adversary shows zero safety violations at f ≤ 0.33 for N ≥ 5 (the
-single 1% violation observation at N=100, f=0.20 (§0.A) is in 500
-trials and likely a finite-sample artifact — the full sweep at
-n_trials=10000 will resolve). The compositional safety story is:
+This bound is for **Snowflake**. The Snowball bound (Amores-Sesar &
+Schneider 2024, §5.5) is **at least as good** at the same parameters
+and **strictly better** against a coordinated-split adversary, because
+the accumulator cannot be erased — Snowflake's exponent is tied to
+"consecutive same-color rounds" whereas Snowball's is tied to
+"cumulative margin", and the adversary cannot keep the cumulative
+margin below threshold without also losing the underlying α-majority
+race. **At our chosen (K=3, α=2, β=6) the literature bound is loose;
+the sim is our source of truth.**
 
-- **Best case (sim-measured at f=0.33, N=100):** zero violations in 500
-  trials. Posterior 95% CI for the violation rate is `[0, 0.6%]`.
-- **Worst case observation (sim at f=0.20, N=100):** 5 violations in 500
-  trials = 1.0% rate. Full sweep needed before this number is publishable.
+At our chosen (K=3, α=2, β=6) under Snowflake, the focused sweep
+(§0.K.1) shows 1.85 % violations at N=64, f=0.20, dropping to 0.10 % at
+N=256. Snowflake-β=10 zeroes both. **Under Snowball semantics (decision
+§0.K, §2.2) we predict β=6 to zero them as well**, because the dominant
+attack mode (adversary times split queries to keep `confidence` resetting)
+no longer applies — the accumulator survives flips. **Pending re-sim
+confirmation.**
+
+The compositional safety story (Snowflake-tuned, to be re-derived
+under Snowball):
+
+- **Best case (sim-measured at f=0.33, N=256, Snowflake):** zero
+  violations in 2000 trials. Posterior 95 % CI for the violation rate
+  is `[0, 0.15 %]`.
+- **Worst case observation (sim at f=0.20, N=64, Snowflake):** 37
+  violations in 2000 trials = 1.85 % rate. Under Snowball this is
+  predicted to drop to ≪ 0.1 % at the same β=6.
+
+The classical-Avalanche (K=20, α=15, β=20) row of the focused sweep
+(§0.K.1) is the cautionary tale: 0 % convergence at f=0.33 for any
+cluster size up to N=256, regardless of which semantics. This is not
+a Snowflake-vs-Snowball issue; it is a `K > N - 1`-effectively (slow
+recruitment of α=15 honest peers out of 256 with 33 % adversarial)
+issue, and is the strongest argument against the literature parameters
+for our setting.
 
 ### 6.2 What Taktikos gives us (probabilistic)
 
@@ -771,18 +959,23 @@ The shape, scoped to "research now, build later":
 | Sim harness extension (full sweep verification + figures) | ~100 | `~/repos/research-nipopos-2026/sims/` |
 | **Total** | **~1800 LOC + sim work** | |
 
-The `AvalancheState` Ref shape:
+The `AvalancheState` Ref shape (Snowball, §2.2):
 
 ```scala
 final case class AvalancheState(
   preference:  Hash,
-  confidence:  Int,
+  accum:       Map[Hash, Int],     // per-color persistent accumulator (Snowball)
   decided:     Boolean,
   initialized: Boolean,
   lastTickMs:  Long
 )
 type AvalancheStateRef[F[_]] = Ref[F, Map[SnapshotOrdinal, AvalancheState]]
 ```
+
+`accum` is bounded in practice to a handful of entries per ordinal
+(distinct fork-tip hashes observed at this ord). Memory per ord is
+`O(observed_hashes × (hash_size + int_size))` ≈ a few hundred bytes
+worst-case.
 
 TTL-based eviction: drop entries below `T_depth1.latestQualifyingOrdinal`
 (once a depth-finalized ord exists, Avalanche has no need to converge on
@@ -816,13 +1009,17 @@ enforced.
 The questions resolved by the 10 locked decisions in §0 are removed
 from this list. What remains genuinely open:
 
-1. **Scale verification at N ∈ {500, 1000}.** The (K=3, α=2, β=6)
-   triple is sim-validated up to N=100. The full sweep (`python
-   sims/avalanche_attestation_calibration.py 10000 22 --figures`,
-   commit `15983f1a` background job) extends the verification to
-   N ∈ {500, 1000}. **Pending result.** If the safety-violation rate
-   stays ≤ 1 % at f ≤ 0.33, lock the proposal at (3, 2, 6). If
-   degrades, bump β to (3, 2, 8) or (3, 2, 10).
+1. **Snowball re-sim + scale verification at N ∈ {500, 1000}.** The
+   current sim harness is **Snowflake** (per decision §0.K, this is the
+   defect being fixed). The Snowball re-sim must (a) port the inner
+   loop from Snowflake's `confidence: Int / reset on flip` to
+   Snowball's `accum: Map[Hash, Int] / margin decision`; (b) re-run
+   the focused sweep at the same (K, α, β) grid; (c) extend to
+   N ∈ {500, 1000} at `n_trials = 10000`. **Pending.** Predicted
+   outcome: Snowball-β=6 reaches 0 safety violations everywhere
+   Snowflake-β=10 does. If confirmed, lock the proposal at
+   `(K=3, α=2, β=6)`. If Snowball-β=6 still shows residual violations
+   at the f=0.20 / N=64 worst-case cell, bump to β=8.
 
 2. **Tentative attestation emission.** Should the protocol allow a
    *tentative* attestation emit before Avalanche decides — labeled as
@@ -873,10 +1070,11 @@ from this list. What remains genuinely open:
 
 8. **Adversarial timing.** Can a Byzantine node strategically delay
    `responding` to queries — but still respond — to influence
-   confidence dynamics in a victim node? Probably yes, but only at
-   the cost of being detectable (a per-peer query-response latency
-   histogram is a natural Prometheus addition). Worth flagging to
-   cryptographer review (§6.3).
+   accumulator dynamics in a victim node? Less of a concern under
+   Snowball (the accumulator is monotone, so delaying a response
+   merely defers — not erases — its contribution), but a per-peer
+   query-response latency histogram is still a natural Prometheus
+   addition. Worth flagging to cryptographer review (§6.3).
 
 9. **Tipping over to a hybrid finality definition.** Today,
    `T_weight ∨ T_count ∨ T_depth1` finalizes a snapshot. Post-
@@ -935,20 +1133,186 @@ P-11 default-off-and-soon-admin-only per §0.B).
 
 ---
 
+## §10A. Frosty-derived enhancements (future work)
+
+Frosty (Lewis-Pye, Buchwald, Buttolph, O'Grady, Sekniqi, arXiv:2404.14250,
+2024) supplies two enhancements to the Snow family. Per decision §0.L
+we adopt **neither directly in this proposal**, but each is documented
+here as a candidate refinement.
+
+### 10A.1 Snowflake+ dual-threshold cascade — candidate refinement
+
+**What it is.** Frosty's Snowflake+ replaces Snowflake's single
+threshold α with two: α₁ (the flip threshold — sample count to switch
+preference) and α₂ (the count threshold — sample count to deepen
+confidence), with α₁ ≤ α₂. The decision rule becomes:
+
+```
+if ≥ α₁ sampled values are 1 - val:   val := 1 - val; count := 0
+elif ≥ α₂ sampled values equal val:   count += 1
+if count >= β:                        decide(val)
+```
+
+**Why it matters.** Splitting "flip" and "deepen" into two thresholds
+lets the protocol be **more conservative about flipping** (small α₁
+means flips are easy and frequent) while **also more conservative
+about deciding** (large α₂ means decisions require near-unanimity).
+The resulting cleanly-analyzable safety bound is what Frosty's
+consistency proof depends on (Lewis-Pye et al. §4, Theorem 1).
+Frosty's recommended values are α₁=41, α₂=72 (k=80) — both well above
+the Snowflake α=72 single-threshold equivalent.
+
+**Why it's deferred.** Our Snowball semantics (decision §0.K, §2.2)
+already resolves the dominant attack mode (Snowflake reset-on-flip).
+Adding Snowflake+ dual thresholds on top of Snowball ("Snowball+")
+is straightforward — replace the single `α` check with two — but
+needs its own sim sweep to find the right (α₁, α₂, β) triple at our
+small-cluster (K=3) setting. The implementation cost is small
+(~20 LOC change to the cascade + new config knobs); the cost is
+in the calibration work, not the code.
+
+**Failure mode it would prevent (over Snowball alone):** a borderline
+adversary that consistently produces split queries at the α boundary
+— neither giving the victim a clear α-majority for the leading hash,
+nor a clear α-majority for the trailing one. Snowball still
+progresses, but slowly. Snowflake+ at small α₁ would let the victim
+flip preference more readily; at large α₂, hold off deciding until
+clearly converged. Net effect: smoother latency distribution under
+this specific adversary class.
+
+**Implementation cost.** ~20 LOC change to the cascade plus new
+config knobs `NAKAMOTO_AVALANCHE_ALPHA_1` / `_ALPHA_2`. Sim re-
+calibration: re-run the focused sweep on a 2D (α₁, α₂) grid for each
+(K, β) cell.
+
+**Cross-link.** If we adopt Snowflake+ later, the rolling-upgrade
+shape is identical to the Snowflake → Snowball flip: it's a node-
+local cascade change, not a wire-protocol change. The query / response
+RPC types don't change.
+
+### 10A.2 Frosty liveness module — subsumed by T_depth1
+
+**What it is.** Frosty's central claim is that even Snowman has a
+liveness vulnerability when the adversary exceeds O(√n) processors:
+termination can become polynomial in n rather than logarithmic. The
+fix is an "epoch change" trigger that, when the cascade fails to
+make progress within an expected window, switches to a temporary
+**quorum-based** (e.g. Tendermint or Simplex — see Frosty for partial
+synchrony, arXiv:2506.09823) protocol to force-finalize the next
+block, then returns to Snowman.
+
+**Why it's subsumed for our setting.** We already have an
+operational analog: **T_depth1 (depth-k₁ structural finality,
+default k₁ = 255)** carries the chain through whenever attestation
+flow stalls. The shape differs (Frosty's quorum-based protocol is a
+hot-path safety net; T_depth1 is a slow-path longest-chain-style
+liveness floor), but the **role is the same**: a guarantee that
+finality eventually happens even when the fast cascade fails to
+converge.
+
+Concretely, the §5.3 ("Liveness floor") analysis shows:
+- If the cluster is partitioned below K, Avalanche stalls → `accum`
+  never accumulates a β-margin → T_weight and T_count starve →
+  T_depth1 carries the chain on pure structural depth.
+- T_depth1 is **structural**, independent of attestation flow.
+  It runs on slot-clock + LDD, not on Avalanche queries.
+
+This is, modulo terminology, exactly Frosty's epoch-change pattern:
+"detect the cascade has stalled, switch to a fallback that doesn't
+depend on the cascade's progress, finalize from that fallback".
+
+**Why we don't import Frosty's specific module.** Frosty's epoch-
+change uses a quorum-based protocol — Tendermint in the synchronous
+version, Simplex in the partial-synchrony version. Importing either
+would require us to either (a) run a parallel quorum protocol that
+duplicates depth-k₁'s job, or (b) wire epoch-change into the Avalanche
+cascade as an explicit trigger condition (which adds complexity for
+no gain over the existing T_depth1 fallback). Our setting is "Avalanche
+as evidence-producer, multi-trigger finality stack as
+evidence-consumer" (per §3), not "Avalanche as the only path to
+finality"; Frosty's setting is the latter. The architectural fit
+isn't there.
+
+**Cross-link to future work.** If at some point we want to remove the
+T_depth1 / T_depth2 triggers entirely and rely on Avalanche as the
+sole finality input, Frosty's epoch-change *would* become essential.
+That would be a separate, much more invasive proposal.
+
+### 10A.3 Frosty parameters at our cluster size — not directly useful
+
+Frosty's recommended parameters (k=80, α₁=41, α₂=72, β=12, n ≥ 500)
+are tuned for large permissioned validator sets and a fully-synchronous
+network with bounded message delivery Δ. At our (K=3, N=16) operating
+point Frosty's k=80 is structurally impossible (K ≤ N - 1 binds).
+The proof bounds Frosty derives also assume f < n/5 — strictly
+tighter than our f ≤ 1/3 at the chain layer (Taktikos LDD bound). We
+do not import the f < n/5 assumption; the **Avalanche layer composes
+with** — does not replace — Taktikos's bound.
+
+`fB = 0.05` in production is unchanged. Frosty has no LDD analog and
+no recommendation that contradicts our fB.
+
+---
+
+## §10B. Sharding reference — Avalanche Subnets (out of scope)
+
+Avalanche Subnets ([build.avax.network/academy](https://build.avax.network/academy/avalanche-l1/avalanche-fundamentals/04-creating-an-l1/03-network-architecture))
+is Avalanche's architectural answer to horizontal scaling: each subnet
+is a sovereign network running its own Snowman instance over a
+**dynamic subset** of the platform's validators (validators may
+participate in multiple subnets; the primary network's P-chain is the
+authoritative registry of subnet membership and validator-set
+composition). Cross-subnet asset bridging happens via the P-chain
+plus the Avalanche Warp Messaging protocol; the architectural pattern
+is "hierarchical Snowman, per-subnet validator sets, cross-subnet
+implicit voting via an attestation DAG".
+
+For the long-term **sharding workstream** in this codebase (see
+`project_consensus_sharding_roadmap.md` and `project_sharding_strategic_signals.md`),
+Avalanche Subnets is the architectural reference: per-shard Snowman
+(or Snowball-attestation, in our terminology) instances; cross-shard
+attestations through the global Taktikos chain (the P-chain analog);
+validator-set partitioning by combined delegated stake + node
+collateral. **This proposal does not spec sharding** — sharding is a
+separate, much larger workstream that depends on KES, stake-weighted
+VRF, and a redesign of the L0/L1 layer separation. Avalanche Subnets
+is cross-linked here only to anchor the reference for that future
+work.
+
+---
+
 ## §10. References
 
 - Team Rocket (pseud.). *Snowflake to Avalanche: A Novel Metastable
   Consensus Protocol Family for Cryptocurrencies*. IPFS hash
   `QmUy4jh5mGNZvLkjies1RWM4YuvJh5o2FYopNPVYwrRVGV`, 2018. Mirror at
   [avalabs.org/whitepapers](https://www.avalabs.org/whitepapers).
+  Original Slush / Snowflake / Snowball / Avalanche family. The
+  Snowball semantics in §2.2 are the §3.2 variant.
 - Rocco et al. *Snowman++: Improved Snowman Consensus*. 2020.
   (operational improvements over Snowman.)
+- Lewis-Pye, Buchwald, Buttolph, O'Grady, Sekniqi. *Frosty: Bringing
+  strong liveness guarantees to the Snow family of consensus protocols*.
+  arXiv:2404.14250, 2024. ([html](https://arxiv.org/html/2404.14250v5))
+  Snowflake+ dual-threshold cascade (§10A.1) and epoch-change liveness
+  module (§10A.2). Synchronous model, f < n/5.
+- Lewis-Pye et al. *Frosty for partial synchrony*. arXiv:2506.09823,
+  2025. Frosty's adaptation to partial synchrony using Simplex as the
+  epoch-change fallback. Reference for §10A.2.
+- Amores-Sesar, Schneider. *An Analysis of Avalanche Consensus*.
+  arXiv:2401.02811, 2024. Independent formal analysis of the Snow
+  family with explicit Snowflake vs Snowball comparison. Cited in
+  §0.K, §6.1.
 - Garay, Kiayias, Leonardos. *The Bitcoin Backbone Protocol: Analysis
   and Applications*. EUROCRYPT 2015.
 - Kiayias, Leonardos, Stouka, Zacharias. *Ouroboros Taktikos*. FC 2023.
 - Buterin & Griffith. *Casper the Friendly Finality Gadget*. 2017.
   (Slashing-evidence design precedent: GASPER's equivocation evidence
   has the same "self-verifying tuple" property we adopt in §4.2.)
+- Avalanche Network Architecture documentation
+  ([build.avax.network/academy](https://build.avax.network/academy/avalanche-l1/avalanche-fundamentals/04-creating-an-l1/03-network-architecture)).
+  Subnets architecture, P-chain registry, validator-set partitioning.
+  Reference for §10B (long-term sharding workstream).
 - This repo:
   - `docs/nakamoto/attestation-and-finality.md` — current attestation/
     finality model.
@@ -966,6 +1330,11 @@ P-11 default-off-and-soon-admin-only per §0.B).
     hack this proposal obviates (§0.B).
 - Sim harness:
   - `~/repos/research-nipopos-2026` branch `sim/avalanche-attestation`,
-    commit `15983f1a` — quick-sweep parameter calibration.
+    commit `15983f1a` — quick-sweep parameter calibration (Snowflake,
+    to be re-run under Snowball per §0.K, §8.1).
   - `~/repos/research-nipopos-2026/sims/AVALANCHE_CALIBRATION.md`
     — adversary models, latency models, output schema.
+  - `~/repos/research-nipopos-2026/sims/avalanche_focused.py` — focused
+    sweep used to derive §0.K.1 headline numbers.
+  - `/tmp/avalanche-focused.log` — focused-sweep raw output (2000
+    trials/cell, ~40/42 cells complete at the time of this revision).
