@@ -7,8 +7,7 @@ import java.util.Arrays
   * @param value
   *   Root hash of the Merkle tree of leaf-keypair witnesses (32 bytes when using Blake2b-256).
   * @param step
-  *   The time step the corresponding secret key was at when this VK was derived. A KES sum VK is implicitly bound to a
-  *   specific step.
+  *   The time step the corresponding secret key was at when this VK was derived. A KES sum VK is implicitly bound to a specific step.
   */
 final case class VerificationKeyKesSum(value: Array[Byte], step: Int) {
 
@@ -38,8 +37,8 @@ final case class VerificationKeyKesProduct(value: Array[Byte], step: Int) {
   * @param signature
   *   Raw Ed25519 signature (64 bytes).
   * @param witness
-  *   Merkle authentication path from the leaf VK to the root. The verifier reconstructs the root and compares to the
-  *   one carried in the [[VerificationKeyKesSum]].
+  *   Merkle authentication path from the leaf VK to the root. The verifier reconstructs the root and compares to the one carried in the
+  *   [[VerificationKeyKesSum]].
   */
 final case class SignatureKesSum(
   verificationKey: Array[Byte],
@@ -55,9 +54,9 @@ final case class SignatureKesSum(
   override def equals(other: Any): Boolean = other match {
     case s: SignatureKesSum =>
       verificationKey.sameElements(s.verificationKey) &&
-        signature.sameElements(s.signature) &&
-        witness.length == s.witness.length &&
-        witness.zip(s.witness).forall { case (x, y) => x.sameElements(y) }
+      signature.sameElements(s.signature) &&
+      witness.length == s.witness.length &&
+      witness.zip(s.witness).forall { case (x, y) => x.sameElements(y) }
     case _ => false
   }
 }
@@ -69,8 +68,8 @@ final case class SignatureKesSum(
   * @param subSignature
   *   Sum-scheme signature by the "sub" (fast) tree over the user message.
   * @param subRoot
-  *   The sub-tree verification root that the super signature commits to. Carried explicitly so verifiers do not need
-  *   the sub-tree secret state.
+  *   The sub-tree verification root that the super signature commits to. Carried explicitly so verifiers do not need the sub-tree secret
+  *   state.
   */
 final case class SignatureKesProduct(
   superSignature: SignatureKesSum,
@@ -84,8 +83,8 @@ final case class SignatureKesProduct(
   override def equals(other: Any): Boolean = other match {
     case s: SignatureKesProduct =>
       superSignature == s.superSignature &&
-        subSignature == s.subSignature &&
-        subRoot.sameElements(s.subRoot)
+      subSignature == s.subSignature &&
+      subRoot.sameElements(s.subRoot)
     case _ => false
   }
 }
@@ -93,8 +92,12 @@ final case class SignatureKesProduct(
 /** Secret key for the KES sum composition. Wraps a [[KesBinaryTree]] and an offset (start time step).
   *
   * Note: mutable bytes are embedded in `tree`; instances must not be shared across phases of evolution.
+  *
+  * Package-private: callers must not handle secret-key material directly — the read-once lifecycle is enforced by
+  * [[OperationalKeyMakerAlgebra]], which holds the only live instance inside a [[cats.effect.Ref]] guarded by a
+  * [[cats.effect.std.Semaphore]].
   */
-final case class SecretKeyKesSum(tree: KesBinaryTree, offset: Long)
+private[kes] final case class SecretKeyKesSum(tree: KesBinaryTree, offset: Long)
 
 /** Secret key for the KES product (super × sub) composition.
   *
@@ -105,12 +108,14 @@ final case class SecretKeyKesSum(tree: KesBinaryTree, offset: Long)
   * @param nextSubSeed
   *   Seed material used to derive the next sub-tree once `subTree` is exhausted.
   * @param subSignature
-  *   Super-tree signature over the current sub-tree's root; carried so we can re-issue product signatures without
-  *   re-signing the super tree on every sign.
+  *   Super-tree signature over the current sub-tree's root; carried so we can re-issue product signatures without re-signing the super tree
+  *   on every sign.
   * @param offset
   *   Start time step. The first usable step is `offset`.
+  *
+  * Package-private: see [[SecretKeyKesSum]] for the lifecycle rationale.
   */
-final case class SecretKeyKesProduct(
+private[kes] final case class SecretKeyKesProduct(
   superTree: KesBinaryTree,
   subTree: KesBinaryTree,
   nextSubSeed: Array[Byte],

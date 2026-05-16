@@ -8,12 +8,11 @@ import KesBinaryTree._
 
 /** MMM sum composition of forward-secure signatures, instantiated over Ed25519 + Blake2b-256.
   *
-  *   - Provides forward-secure signatures over `l = 2^h` time periods, where `h` is the tree height chosen at key
-  *     generation.
+  *   - Provides forward-secure signatures over `l = 2^h` time periods, where `h` is the tree height chosen at key generation.
   *   - Ported from Bifrost's `co.topl.crypto.signing.kes.SumComposition` (credit: Aaron Schutza).
   *
-  * The sum scheme alone is a useful building block but is NOT the recommended consensus-facing API: it is bounded in
-  * the number of supported periods. See [[ProductComposition]] / [[KesProduct]] for the production interface.
+  * The sum scheme alone is a useful building block but is NOT the recommended consensus-facing API: it is bounded in the number of
+  * supported periods. See [[ProductComposition]] / [[KesProduct]] for the production interface.
   *
   * This class is package-private; consumers should use [[KesSum]] (which wraps it and exposes a friendlier API surface).
   */
@@ -84,8 +83,8 @@ protected[kes] class SumComposition extends KesEd25519Blake2b256 {
 
   /** Evolve the key to `step`. Idempotent at `step == 0` (returns the input unchanged).
     *
-    * Returns `Left(KesError)` if `step` is past the maximum step expressible by the tree height, or if `step <=
-    * currentStep` and `step != 0`.
+    * Returns `Left(KesError)` if `step` is past the maximum step expressible by the tree height, or if `step <= currentStep` and `step !=
+    * 0`.
     */
   protected[kes] def updateKey(keyTree: SK, step: Int): Either[KesError, SK] = {
     val totalSteps = exp(getTreeHeight(keyTree))
@@ -98,8 +97,8 @@ protected[kes] class SumComposition extends KesEd25519Blake2b256 {
 
   /** Securely overwrite all secret bytes carried by a (potentially nested) tree node.
     *
-    * Uses [[SecureRandom]] so the overwrite is not constant; this defeats heap-grep attacks that recognise the
-    * "all-zero" pattern that a naive `Array.fill` would leave behind.
+    * Uses [[SecureRandom]] so the overwrite is not constant; this defeats heap-grep attacks that recognise the "all-zero" pattern that a
+    * naive `Array.fill` would leave behind.
     */
   protected[kes] def eraseOldNode(node: KesBinaryTree): Unit =
     node match {
@@ -174,9 +173,8 @@ protected[kes] class SumComposition extends KesEd25519Blake2b256 {
     }
   }
 
-  /** Sign `m` with the active leaf of `keyTree`. The witness stack accumulates the sibling witnesses on the way down to
-    * the active leaf; this is the Merkle authentication path the verifier will check against the [[VerificationKeyKesSum]]
-    * root.
+  /** Sign `m` with the active leaf of `keyTree`. The witness stack accumulates the sibling witnesses on the way down to the active leaf;
+    * this is the Merkle authentication path the verifier will check against the [[VerificationKeyKesSum]] root.
     */
   protected[kes] def sign(keyTree: SK, m: Array[Byte]): SIG = {
     @tailrec
@@ -215,11 +213,11 @@ protected[kes] class SumComposition extends KesEd25519Blake2b256 {
       else if (leftGoing(0)) multiWitness(W.tail, hash(vkSign), W.head, 1)
       else multiWitness(W.tail, W.head, hash(vkSign), 1)
 
-    def emptyWitness: Boolean = root sameElements hash(vkSign)
+    def emptyWitness: Boolean = root.sameElements(hash(vkSign))
 
     def singleWitness(w: Array[Byte]): Boolean =
-      if (leftGoing(0)) root sameElements hash(concat(hash(vkSign), w))
-      else root sameElements hash(concat(w, hash(vkSign)))
+      if (leftGoing(0)) root.sameElements(hash(concat(hash(vkSign), w)))
+      else root.sameElements(hash(concat(w, hash(vkSign))))
 
     @tailrec
     def multiWitness(
@@ -228,7 +226,7 @@ protected[kes] class SumComposition extends KesEd25519Blake2b256 {
       witnessRight: Array[Byte],
       index: Int
     ): Boolean =
-      if (witnessList.isEmpty) root sameElements hash(concat(witnessLeft, witnessRight))
+      if (witnessList.isEmpty) root.sameElements(hash(concat(witnessLeft, witnessRight)))
       else if (leftGoing(index))
         multiWitness(witnessList.tail, hash(concat(witnessLeft, witnessRight)), witnessList.head, index + 1)
       else multiWitness(witnessList.tail, witnessList.head, hash(concat(witnessLeft, witnessRight)), index + 1)

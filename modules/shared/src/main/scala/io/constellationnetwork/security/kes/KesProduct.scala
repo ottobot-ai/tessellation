@@ -3,20 +3,23 @@ package io.constellationnetwork.security.kes
 /** Public wrapper for the KES product (super × sub) composition.
   *
   *   - This is the recommended consensus-facing KES API.
-  *   - Forward security: signing at step `t` consumes the secret bytes specific to `t`; after evolution to `t' > t`, no
-  *     signature for `t' < t` can be forged from the evolved state.
+  *   - Forward security: signing at step `t` consumes the secret bytes specific to `t`; after evolution to `t' > t`, no signature for `t' <
+  *     t` can be forged from the evolved state.
   *
   * Ported from Bifrost's `co.topl.crypto.signing.KesProduct` (credit: Aaron Schutza).
+  *
+  * Package-private: the consensus-facing entry point is [[OperationalKeyMakerAlgebra]] (F[_]-typed, lifecycle-managed, read-once
+  * persistence). This raw imperative API is reachable only from within the `kes` package — primarily for tests and as the inner impl of
+  * [[OperationalKeyMaker]]. Callers outside the package MUST use [[OperationalKeyMaker.make]].
   */
-class KesProduct private[kes] () extends ProductComposition {
+private[kes] class KesProduct extends ProductComposition {
 
   /** Generate a KES product keypair at step 0.
     *
     * @param seed
     *   Entropy; overwritten on return.
     * @param height
-    *   `(heightSup, heightSub)` controlling the super × sub tree heights. Total supported steps: `2^(heightSup +
-    *   heightSub)`.
+    *   `(heightSup, heightSub)` controlling the super × sub tree heights. Total supported steps: `2^(heightSup + heightSub)`.
     * @param offset
     *   Time-step offset embedded in the secret key.
     */
@@ -64,8 +67,8 @@ class KesProduct private[kes] () extends ProductComposition {
     verify(prodSig, message, sumVk)
   }
 
-  /** Evolve `privateKey` forward to time `steps`. Returns [[KesError]] if not strictly greater than the current step
-    * (and not 0), or if past the maximum step expressible by the configured tree height.
+  /** Evolve `privateKey` forward to time `steps`. Returns [[KesError]] if not strictly greater than the current step (and not 0), or if
+    * past the maximum step expressible by the configured tree height.
     *
     * '''Read-once enforcement''': the implementation overwrites the bytes corresponding to past periods using a
     * [[java.security.SecureRandom]] before returning. See [[ProductComposition.eraseOldNode]] and
@@ -105,10 +108,10 @@ class KesProduct private[kes] () extends ProductComposition {
     )
 }
 
-object KesProduct {
+private[kes] object KesProduct {
 
-  /** A reusable instance. [[KesProduct]] is stateless apart from a private [[java.security.SecureRandom]] used for
-    * secret-byte overwrite during evolution.
+  /** A reusable instance. [[KesProduct]] is stateless apart from a private [[java.security.SecureRandom]] used for secret-byte overwrite
+    * during evolution.
     */
   val instance: KesProduct = new KesProduct
 }

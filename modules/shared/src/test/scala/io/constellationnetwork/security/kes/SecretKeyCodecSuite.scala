@@ -12,13 +12,16 @@ object SecretKeyCodecSuite extends SimpleIOSuite {
   private def assertTreeEqual(t1: KesBinaryTree, t2: KesBinaryTree): weaver.Expectations = (t1, t2) match {
     case (KesBinaryTree.Empty(), KesBinaryTree.Empty()) => success
     case (l1: KesBinaryTree.SigningLeaf, l2: KesBinaryTree.SigningLeaf) =>
-      expect.all(l1.sk sameElements l2.sk, l1.vk sameElements l2.vk)
+      expect.all(l1.sk.sameElements(l2.sk), l1.vk.sameElements(l2.vk))
     case (n1: KesBinaryTree.MerkleNode, n2: KesBinaryTree.MerkleNode) =>
-      expect.all(
-        n1.seed sameElements n2.seed,
-        n1.witnessLeft sameElements n2.witnessLeft,
-        n1.witnessRight sameElements n2.witnessRight
-      ) and assertTreeEqual(n1.left, n2.left) and assertTreeEqual(n1.right, n2.right)
+      expect
+        .all(
+          n1.seed.sameElements(n2.seed),
+          n1.witnessLeft.sameElements(n2.witnessLeft),
+          n1.witnessRight.sameElements(n2.witnessRight)
+        )
+        .and(assertTreeEqual(n1.left, n2.left))
+        .and(assertTreeEqual(n1.right, n2.right))
     case _ => failure(s"tree shapes differ: $t1 vs $t2")
   }
 
@@ -30,12 +33,14 @@ object SecretKeyCodecSuite extends SimpleIOSuite {
     SecretKeyCodec.decodeProductSk(encoded) match {
       case Left(err) => failure(s"decode failed: $err")
       case Right(decoded) =>
-        assertTreeEqual(sk.superTree, decoded.superTree) and
-          assertTreeEqual(sk.subTree, decoded.subTree) and
-          expect.all(
-            sk.nextSubSeed sameElements decoded.nextSubSeed,
-            sk.subSignature == decoded.subSignature,
-            sk.offset == decoded.offset
+        assertTreeEqual(sk.superTree, decoded.superTree)
+          .and(assertTreeEqual(sk.subTree, decoded.subTree))
+          .and(
+            expect.all(
+              sk.nextSubSeed.sameElements(decoded.nextSubSeed),
+              sk.subSignature == decoded.subSignature,
+              sk.offset == decoded.offset
+            )
           )
     }
   }
@@ -58,7 +63,7 @@ object SecretKeyCodecSuite extends SimpleIOSuite {
       kes.verify(sigOrig, msg, vkAfter),
       kes.verify(sigCopy, msg, vkAfter),
       // Same VK before vs after roundtrip (modulo step).
-      vkAfter.value sameElements kes.getVerificationKey(evolved).value,
+      vkAfter.value.sameElements(kes.getVerificationKey(evolved).value),
       vkAfter.step == 9
     )
   }

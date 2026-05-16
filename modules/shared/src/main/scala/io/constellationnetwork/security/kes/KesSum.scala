@@ -2,15 +2,17 @@ package io.constellationnetwork.security.kes
 
 /** Public wrapper for the KES sum composition.
   *
-  * Exposes the named model types ([[SecretKeyKesSum]] / [[VerificationKeyKesSum]] / [[SignatureKesSum]]) instead of the
-  * internal tuple-encoded representation used by [[SumComposition]].
+  * Exposes the named model types ([[SecretKeyKesSum]] / [[VerificationKeyKesSum]] / [[SignatureKesSum]]) instead of the internal
+  * tuple-encoded representation used by [[SumComposition]].
   *
-  * NOTE: the sum composition is a building block. For consensus-layer use, prefer [[KesProduct]] which provides a
-  * larger number of time periods via the product (super × sub) composition.
+  * NOTE: the sum composition is a building block. For consensus-layer use, prefer [[KesProduct]] which provides a larger number of time
+  * periods via the product (super × sub) composition.
   *
   * Ported from Bifrost's `co.topl.crypto.signing.KesSum` (credit: Aaron Schutza).
+  *
+  * Package-private: see [[KesProduct]] for the same rationale. Production callers use [[OperationalKeyMakerAlgebra]].
   */
-class KesSum private[kes] () extends SumComposition {
+private[kes] class KesSum extends SumComposition {
 
   /** Generate a KES sum keypair at step 0.
     *
@@ -19,8 +21,8 @@ class KesSum private[kes] () extends SumComposition {
     * @param height
     *   Tree height; the resulting key supports `2^height` periods.
     * @param offset
-    *   Time-step offset embedded in the secret key (the secret key remembers when it started; useful for aligning with
-    *   wall-clock period numbers).
+    *   Time-step offset embedded in the secret key (the secret key remembers when it started; useful for aligning with wall-clock period
+    *   numbers).
     */
   def createKeyPair(seed: Array[Byte], height: Int, offset: Long): (SecretKeyKesSum, VerificationKeyKesSum) = {
     val sk = generateSecretKey(seed, height)
@@ -41,8 +43,7 @@ class KesSum private[kes] () extends SumComposition {
     verify(sumSig, message, sumVk)
   }
 
-  /** Evolve `privateKey` forward to time `steps`. Returns [[KesError]] if the step is past the maximum or not
-    * monotonically increasing.
+  /** Evolve `privateKey` forward to time `steps`. Returns [[KesError]] if the step is past the maximum or not monotonically increasing.
     */
   def update(privateKey: SecretKeyKesSum, steps: Int): Either[KesError, SecretKeyKesSum] =
     updateKey(privateKey.tree, steps).map(t => privateKey.copy(tree = t))
@@ -60,10 +61,10 @@ class KesSum private[kes] () extends SumComposition {
   }
 }
 
-object KesSum {
+private[kes] object KesSum {
 
-  /** A reusable instance. [[KesSum]] is stateless apart from a private [[java.security.SecureRandom]] used for
-    * secret-byte overwrite during evolution.
+  /** A reusable instance. [[KesSum]] is stateless apart from a private [[java.security.SecureRandom]] used for secret-byte overwrite during
+    * evolution.
     */
   val instance: KesSum = new KesSum
 }

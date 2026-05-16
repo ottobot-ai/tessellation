@@ -10,16 +10,15 @@ import KesBinaryTree._
   * Ports Bifrost's `co.topl.crypto.signing.kes.KesEd25519Blake2b256` to use:
   *
   *   - BouncyCastle's `org.bouncycastle.math.ec.rfc8032.Ed25519` instead of Bifrost's wrapper, which has the same
-  *     `generatePublicKey`/`sign`/`verify` static signatures (`(sk, 0, pk, 0)`, `(sk, 0, msg, 0, msgLen, sig, 0)`,
-  *     `(sig, 0, pk, 0, msg, 0, msgLen)`).
-  *   - BouncyCastle's `Blake2bDigest(256)` for the hash function. The MMM construction uses a 32-byte digest, which is
-  *     what Blake2b-256 produces.
+  *     `generatePublicKey`/`sign`/`verify` static signatures (`(sk, 0, pk, 0)`, `(sk, 0, msg, 0, msgLen, sig, 0)`, `(sig, 0, pk, 0, msg, 0,
+  *     msgLen)`).
+  *   - BouncyCastle's `Blake2bDigest(256)` for the hash function. The MMM construction uses a 32-byte digest, which is what Blake2b-256
+  *     produces.
   *
-  * Both choices keep the output bit-for-bit compatible with Bifrost so test vectors from `KesProductSpec` can be reused
-  * once we wire them.
+  * Both choices keep the output bit-for-bit compatible with Bifrost so test vectors from `KesProductSpec` can be reused once we wire them.
   *
-  * This class is the building block for [[SumComposition]] (and through it, [[ProductComposition]]); end-users should
-  * use [[KesSum]] / [[KesProduct]] instead.
+  * This class is the building block for [[SumComposition]] (and through it, [[ProductComposition]]); end-users should use [[KesSum]] /
+  * [[KesProduct]] instead.
   */
 protected[kes] trait KesEd25519Blake2b256 {
 
@@ -63,8 +62,8 @@ protected[kes] trait KesEd25519Blake2b256 {
     (hash(left), hash(right))
   }
 
-  /** Generate an Ed25519 keypair from a 32-byte seed. The first 32 bytes of `seed` (or all if shorter) are used; the
-    * returned `sk` is the seed clone, the `pk` is derived.
+  /** Generate an Ed25519 keypair from a 32-byte seed. The first 32 bytes of `seed` (or all if shorter) are used; the returned `sk` is the
+    * seed clone, the `pk` is derived.
     */
   protected def sGenKeypair(seed: Array[Byte]): (Array[Byte], Array[Byte]) = {
     val pk = new Array[Byte](pkBytes)
@@ -84,8 +83,8 @@ protected[kes] trait KesEd25519Blake2b256 {
   protected def sVerify(m: Array[Byte], signature: Array[Byte], pk: Array[Byte]): Boolean =
     Ed25519.verify(signature, 0, pk, 0, m, 0, m.length)
 
-  /** Tree height. A single leaf has height 0; a `MerkleNode(_, _, _, leaf, _)` has height 1; etc. The empty tree has
-    * height -1 (matches Bifrost's behaviour: `loop(empty) = 0` then minus 1).
+  /** Tree height. A single leaf has height 0; a `MerkleNode(_, _, _, leaf, _)` has height 1; etc. The empty tree has height -1 (matches
+    * Bifrost's behaviour: `loop(empty) = 0` then minus 1).
     */
   def getTreeHeight(tree: KesBinaryTree): Int = {
     def loop(t: KesBinaryTree): Int = t match {

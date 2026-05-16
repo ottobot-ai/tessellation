@@ -4,19 +4,19 @@ package io.constellationnetwork.security.kes
   *
   * Ported from Bifrost's `co.topl.crypto.models.KesBinaryTree`. The tree has three node types:
   *
-  *   - [[KesBinaryTree.MerkleNode]] — an interior node with a per-node seed, witnesses of its left/right subtrees, and
-  *     the subtrees themselves. Either subtree may be [[KesBinaryTree.Empty]] once it has been collapsed during key
-  *     evolution; this represents that the corresponding sub-key bytes have been destroyed.
+  *   - [[KesBinaryTree.MerkleNode]] — an interior node with a per-node seed, witnesses of its left/right subtrees, and the subtrees
+  *     themselves. Either subtree may be [[KesBinaryTree.Empty]] once it has been collapsed during key evolution; this represents that the
+  *     corresponding sub-key bytes have been destroyed.
   *   - [[KesBinaryTree.SigningLeaf]] — a leaf carrying the active Ed25519 keypair for the current period.
   *   - [[KesBinaryTree.Empty]] — a placeholder used to mark erased subtrees.
   *
-  * The byte arrays stored here are mutable on purpose: the read-once / forward-security pattern requires that secret
-  * bytes can be overwritten in place after they have been consumed. Callers must therefore treat instances as if they
-  * carried embedded mutable state and avoid sharing references across phases.
+  * The byte arrays stored here are mutable on purpose: the read-once / forward-security pattern requires that secret bytes can be
+  * overwritten in place after they have been consumed. Callers must therefore treat instances as if they carried embedded mutable state and
+  * avoid sharing references across phases.
   */
-sealed trait KesBinaryTree extends Product with Serializable
+private[kes] sealed trait KesBinaryTree extends Product with Serializable
 
-object KesBinaryTree {
+private[kes] object KesBinaryTree {
 
   /** Wire prefix used when serialising a [[MerkleNode]] entry. */
   val nodeTypePrefix: Byte = 0

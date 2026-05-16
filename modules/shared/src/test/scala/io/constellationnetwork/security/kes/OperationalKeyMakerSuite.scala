@@ -19,9 +19,12 @@ object OperationalKeyMakerSuite extends SimpleIOSuite {
     val kes = KesProduct.instance
     val seed = Array.fill[Byte](32)(seedByte)
     val (sk, vk) = kes.createKeyPair(seed, height, 0L)
-    SecureStore.inMemory[IO].flatTap { store =>
-      store.write(keyName, SecretKeyCodec.encodeProductSk(sk))
-    }.map((_, vk))
+    SecureStore
+      .inMemory[IO]
+      .flatTap { store =>
+        store.write(keyName, SecretKeyCodec.encodeProductSk(sk))
+      }
+      .map((_, vk))
   }
 
   test("persistence round-trip: encode + write + load + sign + verify") {
@@ -30,9 +33,11 @@ object OperationalKeyMakerSuite extends SimpleIOSuite {
       result <- OperationalKeyMaker.make[IO](store, keyName, etaPeriodLength = 100L).use { kmaker =>
         kmaker.signAt(0, "hello".getBytes("UTF-8"))
       }
-    } yield matches(result) { case Right(sig) =>
-      expect(KesProduct.instance.verify(sig, "hello".getBytes("UTF-8"), vk))
-    }
+    } yield
+      matches(result) {
+        case Right(sig) =>
+          expect(KesProduct.instance.verify(sig, "hello".getBytes("UTF-8"), vk))
+      }
   }
 
   test("evolving advances the persisted state (next make sees the evolved key)") {
@@ -103,8 +108,10 @@ object OperationalKeyMakerSuite extends SimpleIOSuite {
           sigResult <- kmaker.signAt(2, "stable".getBytes("UTF-8"))
         } yield (vk, sigResult)
       }
-    } yield matches(out) { case (vk, Right(sig)) =>
-      expect(KesProduct.instance.verify(sig, "stable".getBytes("UTF-8"), vk))
-    }
+    } yield
+      matches(out) {
+        case (vk, Right(sig)) =>
+          expect(KesProduct.instance.verify(sig, "stable".getBytes("UTF-8"), vk))
+      }
   }
 }

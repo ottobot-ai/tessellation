@@ -10,14 +10,13 @@ import KesBinaryTree._
   *   - Each super-step authorises a fresh sub-tree;
   *   - Each sub-step within the sub-tree signs a single message.
   *
-  * Total expressible time steps: `2^(heightSup + heightSub)`. Bifrost notes this is theoretically unbounded for
-  * `log(l) / log(2) = 7` in the asymmetric product composition (assuming integer time steps).
+  * Total expressible time steps: `2^(heightSup + heightSub)`. Bifrost notes this is theoretically unbounded for `log(l) / log(2) = 7` in
+  * the asymmetric product composition (assuming integer time steps).
   *
-  * This is the consensus-facing KES scheme. Ported from Bifrost's `co.topl.crypto.signing.kes.ProductComposition`
-  * (credit: Aaron Schutza).
+  * This is the consensus-facing KES scheme. Ported from Bifrost's `co.topl.crypto.signing.kes.ProductComposition` (credit: Aaron Schutza).
   *
-  * Package-private; consumers should use [[KesProduct]] (which wraps it and translates between the tuple-encoded
-  * internal representation and the named-field model types in [[models]]).
+  * Package-private; consumers should use [[KesProduct]] (which wraps it and translates between the tuple-encoded internal representation
+  * and the named-field model types in [[models]]).
   */
 protected[kes] class ProductComposition extends KesEd25519Blake2b256 {
 
@@ -62,8 +61,8 @@ protected[kes] class ProductComposition extends KesEd25519Blake2b256 {
 
   /** Erase the secret bytes carried by the active leaf inside `input` (the leaf hanging off the rightmost spine).
     *
-    * Used after committing to a child VK so the parent secret key is no longer in a state where it can re-commit to a
-    * different child key until the next super-step. Returns a new tree with the erased leaf substituted in.
+    * Used after committing to a child VK so the parent secret key is no longer in a state where it can re-commit to a different child key
+    * until the next super-step. Returns a new tree with the erased leaf substituted in.
     */
   protected[kes] def eraseLeafSecretKey(input: KesBinaryTree): Either[KesError, KesBinaryTree] =
     input match {
@@ -88,8 +87,8 @@ protected[kes] class ProductComposition extends KesEd25519Blake2b256 {
   /** Evolve the product key to `step`.
     *
     *   - `step == 0` is a no-op.
-    *   - When `step` crosses into a new super-period, the sub-tree is regenerated from `key._3` and the new sub-VK is
-    *     signed by the (already-evolved) super-tree.
+    *   - When `step` crosses into a new super-period, the sub-tree is regenerated from `key._3` and the new sub-VK is signed by the
+    *     (already-evolved) super-tree.
     *   - When `step` remains within the current super-period, only the sub-tree is evolved.
     */
   protected[kes] def updateKey(key: SK, step: Int): Either[KesError, SK] = {

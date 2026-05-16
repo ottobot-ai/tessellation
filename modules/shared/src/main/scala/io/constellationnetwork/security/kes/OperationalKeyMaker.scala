@@ -10,35 +10,36 @@ import cats.syntax.functor._
   *
   * Lifecycle:
   *
-  *   1. At construction, the interpreter reads the single key file from `secureStore` (under `keyName`). It is an
-  *      error for the store to be empty or contain more than one entry under `keyName` at startup.
-  *   1. On each [[OperationalKeyMakerAlgebra.signAt]] or [[OperationalKeyMakerAlgebra.evolveTo]] call, the in-memory
-  *      key is evolved to the target period. The pre-evolution bytes are destroyed by
-  *      [[ProductComposition.eraseOldNode]] and [[ProductComposition.eraseLeafSecretKey]] during the evolve.
-  *   1. After every evolution, the new key is encoded and re-written to `secureStore` (the old persisted bytes are
-  *      overwritten by [[SecureStore.write]]'s internal scrub).
-  *   1. All mutations are serialized by a [[Semaphore]] (one permit) so concurrent callers see a consistent step
-  *      progression.
+  *   1. At construction, the interpreter reads the single key file from `secureStore` (under `keyName`). It is an error for the store to be
+  *      empty or contain more than one entry under `keyName` at startup.
+  *   1. On each [[OperationalKeyMakerAlgebra.signAt]] or [[OperationalKeyMakerAlgebra.evolveTo]] call, the in-memory key is evolved to the
+  *      target period. The pre-evolution bytes are destroyed by [[ProductComposition.eraseOldNode]] and
+  *      [[ProductComposition.eraseLeafSecretKey]] during the evolve.
+  *   1. After every evolution, the new key is encoded and re-written to `secureStore` (the old persisted bytes are overwritten by
+  *      [[SecureStore.write]]'s internal scrub).
+  *   1. All mutations are serialized by a [[Semaphore]] (one permit) so concurrent callers see a consistent step progression.
   *
-  * '''Period alignment''': the `etaPeriodLength` parameter is carried in this interpreter as configuration only.
-  * It is intended as documentation that, in the wired system, KES periods will align with eta rotation cadence
-  * (per [[project_consensus_epoch_staggering]]). This algebra does not itself drive period advancement;
-  * the caller decides which period to sign at.
+  * '''Period alignment''': the `etaPeriodLength` parameter is carried in this interpreter as configuration only. It is intended as
+  * documentation that, in the wired system, KES periods will align with eta rotation cadence (per [[project_consensus_epoch_staggering]]).
+  * This algebra does not itself drive period advancement; the caller decides which period to sign at.
   *
   *   - `etaPeriodLength: Long` — number of slots per eta period, as configured by the consensus layer.
   *   - `keyName: String` — the file/entry name in the [[SecureStore]]. A single-key invariant is enforced.
   */
 object OperationalKeyMaker {
 
-  /** Construct an [[OperationalKeyMakerAlgebra]] backed by `secureStore`. The store must contain exactly one entry
-    * under `keyName` at startup.
+  /** Construct an [[OperationalKeyMakerAlgebra]] backed by `secureStore`. The store must contain exactly one entry under `keyName` at
+    * startup.
+    *
+    * The underlying KES product scheme is fixed to [[KesProduct.instance]] (package-private). Callers outside the package cannot inject an
+    * alternate scheme; the interface boundary is the F[_]-typed algebra.
     */
   def make[F[_]: Async](
     secureStore: SecureStore[F],
     keyName: String,
-    etaPeriodLength: Long,
-    kesProduct: KesProduct = KesProduct.instance
+    etaPeriodLength: Long
   ): Resource[F, OperationalKeyMakerAlgebra[F]] = {
+    val kesProduct: KesProduct = KesProduct.instance
     val acquire: F[OperationalKeyMakerAlgebra[F]] =
       for {
         _ <- Async[F].pure(etaPeriodLength) // documented config knob, kept on the interpreter for callers to inspect

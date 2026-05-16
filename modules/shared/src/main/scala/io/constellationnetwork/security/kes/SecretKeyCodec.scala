@@ -8,16 +8,15 @@ import KesBinaryTree._
 
 /** Binary codec for [[SecretKeyKesProduct]] and friends.
   *
-  *   - Tag-byte prefix per [[KesBinaryTree]] variant (matches Bifrost's `nodeTypePrefix` / `leafTypePrefix` /
-  *     `emptyTypePrefix` constants).
+  *   - Tag-byte prefix per [[KesBinaryTree]] variant (matches Bifrost's `nodeTypePrefix` / `leafTypePrefix` / `emptyTypePrefix` constants).
   *   - 4-byte big-endian length prefix for each byte array.
   *   - Streams via [[DataInputStream]] / [[DataOutputStream]] to keep the code simple and obvious.
   *
-  * No dependency on Tessellation's Kryo or Circe machinery — the KES bytes are short, the format is stable, and
-  * doing it ourselves avoids dragging serde concerns into a security-critical primitive.
+  * No dependency on Tessellation's Kryo or Circe machinery — the KES bytes are short, the format is stable, and doing it ourselves avoids
+  * dragging serde concerns into a security-critical primitive.
   *
-  * Intentionally does NOT use `scodec` even though `shared` depends on it: the read-once pattern demands tight control
-  * over which Array[Byte] instances we hold onto, and a streaming codec library is the wrong abstraction.
+  * Intentionally does NOT use `scodec` even though `shared` depends on it: the read-once pattern demands tight control over which
+  * Array[Byte] instances we hold onto, and a streaming codec library is the wrong abstraction.
   */
 private[kes] object SecretKeyCodec {
 
