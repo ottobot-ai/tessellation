@@ -89,3 +89,14 @@ check:
 # Generate test user keys for bulk transaction testing
 generate-test-keys num_keys='10':
 	@bash docker/bin/generate-test-user-keys.sh {{ num_keys }}
+
+# §1.1 stake-weighted VRF e2e: bring up an 8-gl0 cluster with non-uniform stake genesis.
+# Weights must sum to ~1.0 and length must match the gl0 count (default 8). Cluster runs
+# at 500ms slot cadence (test-speedup) until taken down with `just down`. After enough
+# slots accumulate, validate with:
+#   bash test-scripts/analyze-block-production-by-stake.sh '<weights>'
+nakamoto-iter-staked weights='0.40,0.20,0.10,0.10,0.05,0.05,0.05,0.05' *extra_args:
+	@just _check_deps
+	@NAKAMOTO_STAKE_DISTRIBUTION='{{ weights }}' \
+	 NAKAMOTO_SLOT_DURATION_MS=500 \
+	 bash docker/bin/compose-runner.sh --num-gl0=8 --up --grafana {{ extra_args }}
