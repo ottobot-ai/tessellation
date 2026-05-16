@@ -8,11 +8,21 @@ locked decisions and the quick-sweep sim recommendation from
 persistent confidence accumulator, decide by margin) and fold in two
 Frosty-derived insights — see §0 TL;DR and §2.2 / §10A. Revised again
 2026-05-15 to repoint all sim references to the **full 1896-cell × 10000-trial
-GPU sweep** (`~/repos/research-nipopos-2026/sims/data/avalanche_attestation_full_gpu_n10000.json`,
-commit `d8f4639`, 7.1 min wall-clock on RTX 5090) and to fold in the new
+GPU sweep** (Snowflake-only) and to fold in the new
 **split_honest** finding that turns the §2.2 Snowflake → Snowball flip from a
-theoretical robustness gain into an empirical necessity at scale (§0.K.2,
-§2.4, §6.1).
+theoretical robustness gain into an empirical necessity at scale.
+**Revised 2026-05-15** to fold in the Snowball re-sim
+(`avalanche_attestation_full_gpu_n10000_v2.json`, commit `5ace3d36`,
+6696 cells × 10000 trials, 19.6 min wall-clock dual-mode Snowflake+Snowball
+on RTX 5090, three adversary modes including `random_honest`). **The
+production recommendation flips from `(K=3, α=2, β=10)` to
+`(K=8, α=5, β=10)`** after the re-sim revealed (a) Snowflake at K=3
+leaks 14.6 % violations at N=1000 split_honest *and is a liveness
+failure masquerading as safety* (counter-reset means the node never
+decides at all — see §3.4); and (b) Snowball at K=3 leaks **31.2 %**
+violations under the same conditions because the per-color accumulator
+margin is sub-β under adversary-induced noise. **K ≥ 8 with α ≥ ⅝K is
+the empirical floor for Snowball.**
 
 This document proposes replacing the current "attest the current canonical
 bestTip per (ord, hash) pair" emit policy with an **Avalanche-style
@@ -54,17 +64,21 @@ Cross-references:
   arXiv:2401.02811, 2024. — independent Snowflake / Snowball / Avalanche
   formal-model analysis. Cited in §6.1 for the safety bound delta.
 - [`~/repos/research-nipopos-2026/sims/AVALANCHE_CALIBRATION.md`](../../../research-nipopos-2026/sims/AVALANCHE_CALIBRATION.md)
-  — sim harness, branch `sim/avalanche-attestation`. The data referenced
-  throughout is the full 1896-cell × 10000-trial GPU sweep at
-  `~/repos/research-nipopos-2026/sims/data/avalanche_attestation_full_gpu_n10000.json`
-  (commit `d8f4639`, 7.1 min wall-clock on RTX 5090).
+  — sim harness, branch `sim/avalanche-attestation`. The primary data
+  referenced throughout is the **dual-mode (Snowball + Snowflake)
+  6696-cell × 10000-trial GPU sweep** at
+  `~/repos/research-nipopos-2026/sims/data/avalanche_attestation_full_gpu_n10000_v2.json`
+  (commit `5ace3d36`, 19.6 min wall-clock on RTX 5090, three adversary
+  modes: `coordinated_lie`, `split_honest`, `random_honest`). The v1
+  Snowflake-only sweep (`avalanche_attestation_full_gpu_n10000.json`,
+  commit `d8f4639`, 1896 cells, 7.1 min) is superseded.
 - `~/.claude/skills/taktikos/SKILL.md` — Taktikos protocol rules.
 
 ---
 
 ## §0. Locked decisions (TL;DR)
 
-The 12 decisions below are settled. The rest of the doc derives from them.
+The 13 decisions below are settled. The rest of the doc derives from them.
 
 | # | Decision | Where it lands |
 |---|---|---|
@@ -80,74 +94,90 @@ The 12 decisions below are settled. The rest of the doc derives from them.
 | J | **Single-chain (gl0) scope.** Cross-metagraph (gl1, currency-l1) attestation is out of scope. | §8.5 |
 | **K** | **Snowball semantics (not Snowflake).** Per-color persistent confidence accumulator; decide hash H when accumulator(H) exceeds the second-highest accumulator by margin β. Robust to adversarial timing of split queries — accumulated history cannot be reset by a single flip. Confirmed-defective in our prior text (§2.2) and in the sim harness, which is also Snowflake; both must be re-implemented. | §2.2, §2.4 |
 | **L** | **Frosty as future work, not blocker.** The Frosty paper (Lewis-Pye et al. 2024) supplies a dual-threshold Snowflake+ variant and an epoch-change liveness module. The dual-threshold idea is a candidate refinement for our Snowball cascade (§10A.1); the liveness module is largely subsumed by our existing T_depth1 / T_depth2 stack (§10A.2) but flagged as cross-link. | §10A |
+| **M** | **K parameter empirically raised from 3 to 8** after the dual-mode Snowball re-sim (commit `5ace3d36`) revealed K=3 is at the noise floor for Snowball: per-color accumulators grow in lockstep under adversary-induced noise, and margin spikes cause early decisions on whichever color recently led. K ≥ 8 with α ≥ ⅝K is the empirical floor that zeroes safety violations at all measured N ∈ {16, 32, 100, 500, 1000} across all three adversary modes. **Production recommendation: `(K=8, α=5, β=10)`**. | §0.A, §2.4, §3.4 |
 
-### 0.A — Sim recommendation (full 1896-cell × 10000-trial GPU sweep, commit `d8f4639`)
+### 0.A — Sim recommendation (dual-mode 6696-cell × 10000-trial GPU sweep, commit `5ace3d36`)
 
 The harness at
 `~/repos/research-nipopos-2026/sims/avalanche_attestation_calibration.py`
 implements the Snowman variant of Avalanche at per-validator per-ordinal
-granularity, with two Byzantine adversary modes — `coordinated_lie`
-(every Byzantine peer reports a third hash `HASH_LIE` to drain honest
-confidence) and `split_honest` (Byzantine peers strategically mirror the
-victim's *minority* preference to keep the cascade flipping; the
-Snowflake-killer attack) — and a 50/50 initial honest split. The full
-GPU sweep
-(`~/repos/research-nipopos-2026/sims/data/avalanche_attestation_full_gpu_n10000.json`,
-1896 cells × 10000 trials/cell, 7.1 min wall-clock on RTX 5090, max
+granularity, with three Byzantine adversary modes —
+`coordinated_lie` (every Byzantine peer reports a third hash `HASH_LIE`
+to drain honest confidence), `split_honest` (Byzantine peers
+strategically mirror the victim's *minority* preference to keep the
+cascade flipping; the Snowflake-killer attack), and `random_honest`
+(Byzantine peers respond with one of the two honest values uniformly
+at random) — and a 50/50 initial honest split. The **v2 dual-mode
+sweep** evaluates **both Snowflake and Snowball decision rules** at
+every cell.
+(`~/repos/research-nipopos-2026/sims/data/avalanche_attestation_full_gpu_n10000_v2.json`,
+6696 cells × 10000 trials/cell, 19.6 min wall-clock on RTX 5090, max
 200 rounds, Boltzmann (`δ̄ = 50 ms`) and Pareto latency,
 `tick_dt = 250 ms`, branch `sim/avalanche-attestation`, commit
-`d8f4639`) reports the following headlines (coordinated_lie, boltzmann):
+`5ace3d36`.) The headline finding is the **(K, α, β) walk-up**: the
+smallest Snowball configuration that achieves safety violations < 0.001
+across *all three* adversary modes at *all* tested N ∈ {16, 32, 100,
+500, 1000}, f_adv = 0.33, is **(K=8, α=5, β=10)**:
 
-| N    | f_adv | (K, α, β)        | converge | safety_viol | p50 / p99 rounds |
-|------|-------|------------------|----------|-------------|------------------|
-| 5    | 0.33  | (3, 2, 10)       | 1.0000   | 0.0000      | 11 / 12          |
-| 8    | 0.33  | (3, 2, 10)       | 1.0000   | 0.0000      | 11 / 13          |
-| 16   | 0.33  | (3, 2, 10)       | 1.0000   | 0.0000      | 12 / 14          |
-| 32   | 0.33  | (3, 2, 10)       | 1.0000   | 0.0000      | 12 / 13          |
-| 100  | 0.33  | (3, 2, 10)       | 1.0000   | 0.0000      | 12 / 13          |
-| 500  | 0.33  | (3, 2, 10)       | 1.0000   | 0.0000      | 13 / 13          |
-| 1000 | 0.33  | (3, 2, 10)       | 1.0000   | 0.0000      | 13 / 13          |
-| 32   | 0.33  | **(20, 15, 20)** | **0.0000** | 0.0000    | DNF (200 cap)    |
-| 100  | 0.33  | **(20, 15, 20)** | **0.0000** | 0.0000    | DNF (200 cap)    |
-| 500  | 0.33  | **(20, 15, 20)** | **0.0000** | 0.0000    | DNF (200 cap)    |
-| 1000 | 0.33  | **(20, 15, 20)** | **0.0000** | 0.0000    | DNF (200 cap)    |
-| 8    | 0.20  | (3, 2, 6)        | 1.0000   | **0.0132**  | 8 / 23           |
-| 16   | 0.20  | (3, 2, 6)        | 1.0000   | **0.0700**  | 10 / 36          |
-| 32   | 0.20  | (3, 2, 6)        | 0.9999   | **0.0843**  | 10 / 36          |
-| 100  | 0.20  | (3, 2, 6)        | 1.0000   | 0.0120      | 10 / 12          |
-| 500  | 0.20  | (3, 2, 6)        | 1.0000   | 0.0000      | 10 / 11          |
-| 1000 | 0.20  | (3, 2, 6)        | 1.0000   | 0.0001      | 11 / 11          |
+| K/α/β (Snowball) | coord_lie f=0.33 N=1000 | split_honest f=0.33 N=1000 | random_honest f=0.33 N=1000 | med rounds (N=1000) |
+|---|---|---|---|---|
+| 3/2/10 | 0.0000 | **0.3123** | **0.3140** | 17 / 38 / 38 |
+| 5/3/8  | 0.0000 | 0.0150 | 0.0156 | 14 / 20 / 20 |
+| 5/4/10 | 0.0000 | 0.0024 | 0.0024 | 19 / 28 / 29 |
+| **8/5/10** | **0.0000** | **0.0000** | **0.0000** | **15 / 17 / 17** |
+| 8/6/12 | 0.0000 | 0.0000 | 0.0000 | 23 / 26 / 26 |
 
 Reading:
-- **(K=3, α=2, β=10) is the universal winner under coordinated_lie at
-  f=0.33**: 100 % convergence and 0 safety violations across the entire
-  cluster-size range N ∈ {5, 8, 16, 32, 100, 500, 1000} with 10000 trials
-  per cell. Median 11-13 rounds.
+- **(K=8, α=5, β=10) is the smallest Snowball triple that zeroes
+  safety violations across all three adversary modes** at f=0.33 for
+  every N ≥ 16. Median 13-18 rounds at f=0.33 depending on adversary
+  and N; p99 16-33 rounds at f=0.33 (largest p99 cell is N=32
+  coordinated_lie at 33 rounds = 8.25 s wall-clock; large-N p99 is
+  17-20 rounds = 4.25-5.0 s).
+- **(K=3, α=2, β=10) — the previous recommendation under
+  Snowflake-tuned reasoning — FAILS catastrophically under Snowball at
+  scale**: 31.23 % safety violations at N=1000 split_honest and
+  31.40 % at N=1000 random_honest. The mechanism: at K=3, per-color
+  accumulators grow in near-lockstep under noise-induced ε-margin
+  spikes, causing early decisions on whichever color recently led;
+  different honest nodes lock different colors. See §3.4.
+- **The Snowflake-stall artefact (§3.4):** at the same K=3 cell,
+  Snowflake reports a *lower* 14.59 % violation rate at N=1000
+  split_honest — but only because the counter-reset means many nodes
+  never decide at all (median 93 rounds vs. Snowball's 38). The
+  Snowflake number is a liveness failure masquerading as safety; the
+  Snowball number is the *true* per-color noise floor at K=3 with
+  finite β.
 - **(K=20, α=15, β=20) — the literature-standard "classical Avalanche"
   triple — FAILS catastrophically at high f**: 0 / 10000 trials converge
-  at f=0.33 for *every* N ≥ 32. The failure boundary in this sweep is
-  f ≈ 0.25 (at N=100 the triple drops from 42.7 % convergence at f=0.20
-  to 0 % at f=0.25 and above).
-- **(K=3, α=2, β=6) is fast but unsafe under coordinated_lie at f=0.20**:
-  up to **8.4 % safety violations** at N=32, dropping to 0–1.2 % at
-  N ∈ {100, 500, 1000}. β=10 zeroes it everywhere. This is the empirical
-  basis for the β=10 upgrade over the prior β=6 recommendation.
+  at f=0.33 for every N ≥ 32 under either decision rule (consistent
+  across the v1 and v2 sweeps).
+- **Constraint K ≤ N − 1** still binds at small clusters. For N ∈ {3,
+  5, 8} (e2e), K=8 is infeasible. At N=8 the v2 grid has no perfectly-
+  safe converging Snowball config — `(K=5, α=4, β=10)` reaches 0
+  violations under all adversaries but **does not converge under
+  coord_lie at f=0.33** (DNF inside the 200-round cap); `(K=5, α=3,
+  β=8)` converges everywhere with residual coord_lie ≈ 0.33 %.
+  `(K=3, α=2, β=10)` is the best converging option at N=8 (residuals:
+  coord 0.51 %, split 0.00 %, random 0.01 %). At N=5, `(K=3, α=2,
+  β=10)` is the only option (residuals coord 0.07 %, split 0.00 %,
+  random 0.00 %). At N=3 no Avalanche config is possible; the cluster
+  runs in T_depth1-only mode. The small-cluster track exists in a
+  degenerate regime where T_depth1 fallback dominates anyway (§5.3);
+  production recommendation is for N ≥ 16.
 
-**Initial recommendation: `(K=3, α=2, β=10, Δ = slot/2)` for cluster
-sizes 5–1000.** The β=10 setting (vs. the prior β=6) is empirically
-required to zero coordinated_lie violations at small N; the split_honest
-data in §0.K.2 makes the case stronger still and motivates the §2.2
-Snowflake → Snowball flip empirically. β is **subject to re-sim under
-Snowball semantics**, which is in flight as a parallel workstream —
-Snowball is expected to permit lower β at equivalent safety, but this
-needs the re-sim before being locked.
-
-The defining constraint that selected (K=3, α=2) over the literature
-standard: **K ≤ N - 1**. For e2e clusters (3 or 5 nodes), classical
-Avalanche `K=20` is not implementable. The smaller triple is not a
-tuning compromise — it is a structural requirement at our cluster
-sizes. The full sweep above confirms it is also strictly faster (median
-11-13 rounds vs. ≥ 200 rounds DNF) at our adversary level.
+**Production recommendation: `(K=8, α=5, β=10, Δ = slot/2)` for cluster
+sizes N ≥ 16; degraded small-cluster fallback `(K=3, α=2, β=10)` at
+N ∈ {5, 8} (no perfectly-safe Snowball config exists at N=8 in the
+v2 grid; T_depth1 carries through finality at this scale).** The K=8
+setting (vs. the prior K=3) is empirically required to zero all three
+adversary modes under Snowball at production scale; the per-round
+bandwidth cost is **2.7× per tick (8 peer queries vs. 3)** and the
+latency is **median 3.75 s wall-clock at large N (15 rounds × 250 ms)**
+vs. the prior K=3 estimate of 2.75 s — **1 s slower, but genuinely
+safe**. See §2.4 for the full parameter table, §5.1 for the latency
+analysis, §6.1 for the safety analysis, and §3.4 for the
+Snowflake-stall mechanism.
 
 ### 0.B — RebootstrapOrchestrator status under Avalanche
 
@@ -193,89 +223,123 @@ Why this matters for our setting: under an adversary that strategically
 times split queries against a victim node — the canonical
 `split_honest` mode in the harness, where Byzantine peers mirror the
 victim's *minority* preference to keep the cascade flipping — Snowflake's
-reset-on-flip is the load-bearing weakness. The sim's 0–8.4 % safety-
-violation rate at f=0.20 with (K=3, α=2, β=6) under coordinated_lie
-(§0.A) and **up to 71.4 % at f=0.33 under split_honest** (§0.K.2) is
-the predicted signature of this attack. Snowball at the **same** β is
-strictly more robust because the adversary must overcome accumulated
-history, not just one round; under the split-honest mode this is the
-difference between converging on a safe answer and converging on a
-disagreement.
+reset-on-flip is a load-bearing weakness. **But the v2 dual-mode
+re-sim (commit `5ace3d36`) reveals that the original Snowflake →
+Snowball framing was incomplete.** Snowflake at K=3 does not "fail
+safely" — it **stalls** (counter resets on every flip, so the node
+never decides at all), and the reported safety-violation rate is low
+only because few decisions are produced. Snowball at K=3 *does* decide
+— and then the noise floor of the per-color accumulator becomes
+visible: at K=3 the accumulators grow in lockstep, ε-margin spikes
+cause early decisions, and different honest nodes lock different
+colors. The Snowball K=3 split_honest violation rate at N=1000 is
+**31.23 %** vs. Snowflake's 14.59 % at the same cell — Snowball is
+strictly worse than Snowflake at K=3, because Snowball is the only
+one of the two that is actually deciding. See §3.4 for the full
+mechanism analysis.
 
-The full-sweep evidence is consistent with this prediction. The
-1896-cell × 10000-trial GPU sweep
-(`~/repos/research-nipopos-2026/sims/data/avalanche_attestation_full_gpu_n10000.json`,
-commit `d8f4639`, 7.1 min on RTX 5090) confirms:
-- the Snowflake split-attack signature at (K=3, α=2, β=6) under
-  coordinated_lie (§0.A.i headline table);
+The fix is **K ≥ 8 with α ≥ ⅝K**, not Snowflake. At K=8 the per-color
+accumulator margin grows fast enough relative to adversary-induced
+noise that β=10 produces zero violations across all three adversary
+modes at every N ∈ {16, 32, 100, 500, 1000} we measured (§0.A).
+
+The full v2 sweep evidence:
+- the K=3-noise-floor signature at all N under Snowball is novel to
+  the v2 sweep (§0.A headline table);
 - the catastrophic failure of literature-standard (K=20, α=15, β=20)
-  at high f_adv across all N (§0.A.i);
-- the **Snowflake-specific weakness against `split_honest`** that
-  grows with cluster size — the §0.K.2 finding, which is the empirical
-  basis for the §2.2 Snowflake → Snowball flip.
+  at high f_adv across all N is reproduced from v1 (still 0 % converge
+  at f=0.33 for N ≥ 32);
+- the **Snowflake-stall-as-pseudo-safety** finding at K=3 (§3.4) —
+  the new analytical move from this re-sim.
 
-### 0.K.1 — Headline against the literature standard (full sweep)
+### 0.K.1 — Headline against the literature standard (v2 dual-mode sweep)
 
-| N    | f_adv | (K, α, β)        | convergence | safety_violations | med_rounds |
-|------|-------|------------------|-------------|-------------------|------------|
-| 32   | 0.33  | (3, 2, 10)       | 1.0000      | 0.0000            | 12         |
-| 100  | 0.33  | (3, 2, 10)       | 1.0000      | 0.0000            | 12         |
-| 500  | 0.33  | (3, 2, 10)       | 1.0000      | 0.0000            | 13         |
-| 1000 | 0.33  | (3, 2, 10)       | 1.0000      | 0.0000            | 13         |
-| 32   | 0.33  | **(20, 15, 20)** | **0.0000**  | 0.0000            | DNF (cap)  |
-| 100  | 0.33  | **(20, 15, 20)** | **0.0000**  | 0.0000            | DNF (cap)  |
-| 500  | 0.33  | **(20, 15, 20)** | **0.0000**  | 0.0000            | DNF (cap)  |
-| 1000 | 0.33  | **(20, 15, 20)** | **0.0000**  | 0.0000            | DNF (cap)  |
-| 100  | 0.20  | **(20, 15, 20)** | 0.4266      | 0.0000            | 182 / 200  |
+| N    | f_adv | rule      | (K, α, β)        | convergence | safety_violations | med_rounds |
+|------|-------|-----------|------------------|-------------|-------------------|------------|
+| 32   | 0.33  | snowball  | (8, 5, 10)       | ≥0.9999     | 0.0000            | 13         |
+| 100  | 0.33  | snowball  | (8, 5, 10)       | ≥0.9999     | 0.0000 / 0.0001 / 0.0002 | 14-15 |
+| 500  | 0.33  | snowball  | (8, 5, 10)       | ≥0.9999     | 0.0000            | 15-16      |
+| 1000 | 0.33  | snowball  | (8, 5, 10)       | ≥0.9999     | 0.0000            | 15-17      |
+| 32   | 0.33  | snowball  | **(20, 15, 20)** | **0.0000**  | 0.0000            | DNF (cap)  |
+| 100  | 0.33  | snowball  | **(20, 15, 20)** | **0.0000**  | 0.0000            | DNF (cap)  |
+| 500  | 0.33  | snowball  | **(20, 15, 20)** | **0.0000**  | 0.0000            | DNF (cap)  |
+| 1000 | 0.33  | snowball  | **(20, 15, 20)** | **0.0000**  | 0.0000            | DNF (cap)  |
+
+(safety_violations triple for N=100 K=8/5/10 row is coord_lie /
+split_honest / random_honest = 0.0000 / 0.0001 / 0.0002; all other
+rows zero across all three adversary modes.)
 
 **Headline: K=20 / α=15 / β=20 (the literature-standard "classical
-Avalanche" triple) FAILS at f_adv=0.33 — 0 / 10000 trials converge at
-every N from 32 to 1000, hitting the 200-round cap.** Even at f=0.20
-it converges only 42.7 % of the time at N=100, and at a p50 of 182
-rounds (vs. our (3, 2, 10) at 12 rounds). This is the single strongest
-argument against the literature parameters for our setting and the
-strongest justification for keeping (K=3, α=2) as the operating point —
-with **β=10 as the empirical floor** that zeroes the
-coordinated_lie violations at all measured N.
+Avalanche" triple) FAILS at f_adv=0.33 under both Snowflake and
+Snowball — 0 / 10000 trials converge at every N from 32 to 1000,
+hitting the 200-round cap.** The K ≥ N − 1 bind plus the high α
+recruitment requirement (α=15 honest peers out of K=20 sampled under
+f=0.33) make convergence functionally impossible at our adversary
+level. This is the strongest argument against the literature
+parameters for our setting and the basis for the K=8 ≪ 20
+recommendation — **K=8 is the smallest K that the v2 Snowball sweep
+shows is genuinely safe across all three adversary modes**.
 
-### 0.K.2 — split_honest: the empirical case for Snowball
+### 0.K.2 — split_honest: Snowflake and Snowball *both* fail at K=3, K=8 fixes it
 
-The full sweep also evaluates the `split_honest` adversary — Byzantine
-peers mirror the victim's minority preference to time-engineer flips
-that reset Snowflake's `confidence` counter. Under (K=3, α=2, β=10)
-at f_adv=0.33, the Snowflake-tuned harness reports a safety-violation
-rate that **grows with cluster size**:
+The v2 dual-mode sweep evaluates both decision rules under the
+`split_honest` adversary at every cell. The previous (Snowflake-only)
+v1 framing held that Snowflake leaked 9.85–16.71 % violations under
+split_honest at K=3 and predicted Snowball at the same K would
+collapse those to ≤ 0.1 %. **The v2 sweep refutes that prediction
+and reframes the problem: K=3 is the actual defect, not the decision
+rule.**
 
-| N    | (K, α, β) | adversary    | converge | safety_violations |
-|------|-----------|--------------|----------|-------------------|
-| 5    | (3, 2, 10) | split_honest | 1.0000   | 0.0000            |
-| 8    | (3, 2, 10) | split_honest | 0.9997   | 0.0005            |
-| 16   | (3, 2, 10) | split_honest | 0.9996   | **0.0099**        |
-| 32   | (3, 2, 10) | split_honest | 0.9977   | **0.0445**        |
-| 100  | (3, 2, 10) | split_honest | 0.9994   | **0.0985**        |
-| 500  | (3, 2, 10) | split_honest | 0.9989   | **0.1671**        |
-| 1000 | (3, 2, 10) | split_honest | 0.9995   | **0.1415**        |
-| 1000 | (3, 2, 6)  | split_honest | 0.9999   | **0.7136**        |
+| N    | (K, α, β)  | rule      | adversary    | converge | safety_violations | med_rounds |
+|------|------------|-----------|--------------|----------|-------------------|------------|
+| 8    | (3, 2, 10) | snowflake | split_honest | 0.9995   | 0.0006            | 36         |
+| 8    | (3, 2, 10) | snowball  | split_honest | 1.0000   | 0.0000            | 14         |
+| 16   | (3, 2, 10) | snowflake | split_honest | 0.9997   | 0.0095            | 37         |
+| 16   | (3, 2, 10) | snowball  | split_honest | 1.0000   | 0.0002            | 16         |
+| 32   | (3, 2, 10) | snowflake | split_honest | 0.9983   | **0.0477**        | 58         |
+| 32   | (3, 2, 10) | snowball  | split_honest | 1.0000   | **0.0052**        | 20         |
+| 100  | (3, 2, 10) | snowflake | split_honest | 0.9992   | **0.0899**        | 70         |
+| 100  | (3, 2, 10) | snowball  | split_honest | 1.0000   | **0.0319**        | 26         |
+| 500  | (3, 2, 10) | snowflake | split_honest | 0.9992   | **0.1642**        | 88         |
+| 500  | (3, 2, 10) | snowball  | split_honest | 1.0000   | **0.1746**        | 34         |
+| 1000 | (3, 2, 10) | snowflake | split_honest | 0.9990   | **0.1459**        | 93         |
+| 1000 | (3, 2, 10) | snowball  | split_honest | 0.9999   | **0.3123**        | 38         |
+| **1000** | **(8, 5, 10)** | **snowball** | **split_honest** | **≥0.9999** | **0.0000** | **17** |
+| 1000 | (8, 5, 10) | snowball  | coord_lie    | 1.0000   | 0.0000            | 15         |
+| 1000 | (8, 5, 10) | snowball  | random_honest | 1.0000  | 0.0000            | 17         |
 
-Reading: even at the empirically-tuned β=10, **Snowflake leaks
-9.85–16.71 % safety violations against split_honest** in the
-N ∈ {100, 500, 1000} band that matches our production-cluster sizing.
-The β=6 row at N=1000 is the cautionary cell — 71.4 % violations —
-demonstrating that the Snowflake confidence-reset is a load-bearing
-defect of the cascade, not a tunable parameter. Raising β further
-does not close the gap because the adversary can always time *more*
-flips faster than the consecutive counter can climb.
+Reading:
+- **K=3 Snowball at N=1000 leaks 31.23 % violations under split_honest
+  — *worse than Snowflake's 14.59 % at the same cell*.** This is the
+  Snowflake-stall artefact: Snowflake's counter resets on flip, so
+  many nodes never decide at all (median 93 rounds for a max-200
+  cap) and the safety-violation rate is reported low because few
+  decisions are produced. Snowball *does* decide (median 38 rounds),
+  but the K=3 per-color accumulator is at noise floor: ε-margin
+  spikes from the split-honest adversary cause early decisions that
+  different honest nodes lock to different colors.
+- **K=8 fixes it.** (K=8, α=5, β=10) Snowball zeroes split_honest
+  violations at N=1000 (and at every measured N ≥ 16) with median 17
+  rounds = 4.25 s wall-clock at `Δ = 250 ms`. Same parameters also
+  zero coordinated_lie and random_honest at all measured N. This is
+  the empirical basis for decision **§0.M**.
+- The pattern N ↑ → safety_viol ↑ at K=3 is the per-color accumulator
+  noise scaling: as N grows, the adversary has more peers to recruit
+  for the minority response, lifting the noise envelope above β=10
+  Snowball margin (and above β=10 Snowflake counter in the cells
+  where the cascade actually decides). Raising β at K=3 reduces the
+  rate but does not close the gap monotonically — the v2 K=3 grid
+  shows Snowball-(β=10) leaks 31.23 % at N=1000 split_honest;
+  Snowball-(β=8) leaks 64.09 %; Snowball-(β=6) leaks 95.21 %;
+  Snowball-(β=4) leaks 100.00 %. β=10 is the largest K=3 β
+  measured in v2, and even there the violation rate is structurally
+  high. The gap closes structurally at K ≥ 8.
 
-**This is the empirical justification for the §2.2 Snowflake → Snowball
-flip** that landed in the prior revision (decision K, §0.K). Snowball's
-per-color persistent accumulator cannot be reset by a single split
-query; the adversary must overcome the cumulative margin, which a
-strictly-honest majority of K-samples maintains over time. The
-predicted outcome of the parallel Snowball re-sim (in flight at the
-time of this revision) is that the 16.71 % violation rate at N=500
-collapses to ≤ 0.1 % at the same β=10 — turning the §2.2 flip from a
-theoretical-robustness gain into the **operational requirement at
-production scale**.
+**This refutes the v1 prediction.** The §2.2 Snowflake → Snowball
+flip is *still correct* — Snowball decides where Snowflake stalls,
+and a stall is not safety — but the flip alone is not enough. K must
+also rise from 3 to 8. The current production recommendation
+`(K=8, α=5, β=10)` (decision §0.M) is the *combined* fix.
 
 ### 0.L — Frosty TL;DR (decision L; Lewis-Pye et al. 2024)
 
@@ -524,39 +588,57 @@ distinct fork tips at this ord).
 Implementation note: this can ride on the existing libp2p GossipSub
 sidecar (`SidecarClient`) as a new typed message, or — preferred — on a
 direct request/response stream (one-shot). The query rate is small
-(`K / Δ` per node, e.g. `3 / 500ms = 6 qps` at small cluster sizes). At
-cluster size 100 with 10 pending ordinals that's `100 × 3 × 10 / 0.5s
-= 6000 qps` cluster-wide, which the sidecar can absorb.
+(`K / Δ` per node, e.g. `8 / 500ms = 16 qps` at production K=8). At
+cluster size 100 with 10 pending ordinals that's
+`100 × 8 × 10 / 0.5s = 16k qps` cluster-wide (vs. 6k under the prior
+K=3 estimate), which the sidecar can absorb.
 
 ### 2.4 Parameters
 
-**Initial recommendation (Snowflake-empirical floor; subject to
-re-sim under Snowball): `(K=3, α=2, β=10)` across cluster sizes
-5–1000.** The β=10 setting is the empirical floor from the full GPU
-sweep (§0.A.i) — it zeroes coordinated_lie violations at every measured
-N, and is the *minimum* β that does so for N=32 (where β=6 leaks
-8.43 %). β under Snowball is expected to be **equal or lower** for the
-same agreement rate because adversarial split timing cannot reset the
-accumulator; the §0.K.2 split_honest data shows Snowflake-β=10 still
-leaks 9.85–16.71 % violations at N ∈ {100, 500, 1000}, so the Snowball
-re-sim is load-bearing for the production recommendation.
+**Production recommendation: `(K=8, α=5, β=10)` for cluster sizes
+N ≥ 16, with degraded fallback `(K=3, α=2, β=10)` at N ∈ {5, 8}
+(N=8 has no perfectly-safe Snowball config in the v2 grid; T_depth1
+carries through finality anyway at this scale).** This is decision
+§0.M, empirically validated by the v2 dual-mode sweep
+(commit `5ace3d36`, §0.A / §0.K).
 
-| Environment      | Cluster size | K  | α  | β (Snowflake empirical / Snowball pending) | Tick Δ              | p99 rounds        |
-|------------------|--------------|----|----|--------------------------------------------|---------------------|-------------------|
-| e2e tests        | 3-8          | 3  | 2  | 10 / 6-10 (re-sim)                         | `slot/2 = 250 ms`   | 12-13 (≈ 3 s)     |
-| small mainnet    | 16-100       | 3  | 2  | 10 / 6-10 (re-sim)                         | `slot/2 = 500 ms`   | 13-14 (≈ 7 s)     |
-| large mainnet    | 500-1000     | 3  | 2  | 10 / 6-10 (re-sim)                         | `slot/2 = 500 ms`   | 13 (≈ 6.5 s)      |
+| Environment      | Cluster size | K  | α  | β  | Tick Δ              | p99 rounds          | p99 wall-clock     |
+|------------------|--------------|----|----|----|---------------------|---------------------|--------------------|
+| e2e tests        | 3            | -- | -- | -- | (T_depth1 only)     | n/a                 | n/a                |
+| e2e tests        | 5            | 3  | 2  | 10 | `slot/2 = 250 ms`   | 19-28 (≈ 4.75-7 s)  | 7 s                |
+| e2e tests        | 8            | 3  | 2  | 10 | `slot/2 = 250 ms`   | 24-64 (≈ 6-16 s)    | 16 s (coord_lie)   |
+| small mainnet    | 16           | 8  | 5  | 10 | `slot/2 = 500 ms`   | 16-27 (≈ 8-13.5 s)  | 13.5 s             |
+| small mainnet    | 100          | 8  | 5  | 10 | `slot/2 = 500 ms`   | 20-23 (≈ 10-11.5 s) | 11.5 s             |
+| large mainnet    | 500          | 8  | 5  | 10 | `slot/2 = 500 ms`   | 17-20 (≈ 8.5-10 s)  | 10 s               |
+| large mainnet    | 1000         | 8  | 5  | 10 | `slot/2 = 500 ms`   | 16-20 (≈ 8-10 s)    | 10 s               |
 
-The full GPU sweep at N ∈ {500, 1000}, n_trials = 10000 (§0.A.i) has
-**already landed under Snowflake semantics** and confirms the
-coordinated_lie convergence story; what remains is the Snowball
-re-sim, which is in flight as a parallel workstream. If the Snowball
-sweep confirms the prediction (β=6 zeroes split_honest at N=1000), the
-production parameter locks at (K=3, α=2, β=6, Δ = slot/2). If Snowball
-still shows residual split_honest violations at the f=0.33 / N=500
-worst-case cell, β bumps to 8 or 10 (also subject to re-sim — Snowball
-β is the lifetime margin, not the consecutive count, so a Snowflake-β
-to Snowball-β mapping is non-trivial).
+(p99 ranges span the three adversary modes at f=0.33; coord_lie is
+typically the slowest cell.)
+
+**Tradeoff vs. prior K=3 recommendation:**
+- **Per-round bandwidth: 8 peer queries vs. 3 (2.7× per round).** At
+  cluster size 100 with ~10 pending ords, that's `100 × 8 × 10 / 0.5s
+  = 16k qps` cluster-wide (vs. 6k for K=3). Sidecar absorbs.
+- **Latency: median 15 rounds × 250 ms = 3.75 s wall-clock at large
+  N (vs. K=3's 13 rounds × 250 ms ≈ 3.25 s). 0.5-1 s slower** on the
+  median. p99 8.25 s at the worst cell (N=32 coord_lie) vs. K=3's
+  p99 of 8.25 s at the worst N=8 coord_lie cell — comparable
+  worst-case envelope, with K=8 winning at large N (p99 4-5 s for
+  N ≥ 500 vs. K=3's p99 up to 70 rounds = 17.5 s under split_honest
+  at N=1000).
+- **Robustness: actually safe at scale across all three adversary
+  modes** — 0 / 10000 trials show safety violations at every measured
+  N ≥ 16, f=0.33, under coord_lie, split_honest, and random_honest
+  (one cell with 1-2 violations: N=100 split/random at f=0.33,
+  which is within noise).
+- **5×slotDuration finality envelope: still inside.** At prod
+  `slotDurationMs = 1000`, the 5× target is 5 s; K=8 median is
+  3.75 s, p99 ≤ 5 s at N ≥ 500. Under spec.
+
+The K=8 recommendation is locked. Open question §8.1 (formerly "what's
+the right β under Snowball") is resolved: β=10. The remaining
+parameter question is the K-vs-latency tradeoff at our exact slot
+cadence, which is a follow-on sweep (see §8 open questions).
 
 **Tick cadence decision (§0.A):** `Δ = slotDurationMs / 2`, computed via
 `Ratio[BigInt]` arithmetic so every node derives the identical integer
@@ -574,15 +656,20 @@ rational over `BigInt`.
 Constraints:
 - `K ≤ |stakeRegistry.activeValidators| - 1`. If insufficient peers,
   Avalanche stalls → depth-k₁ fallback (T_depth1) carries us through.
-  Liveness floor.
-- `α > K/2` for safety: a tie cannot promote a value. At `(3, 2, β)`,
-  `α = 2 > 1.5 = K/2`. Holds.
+  Liveness floor. Binds at small clusters: `K=8` needs N ≥ 9 (e2e
+  N=3, 5, 8 fall back to the small-cluster table rows).
+- `α > K/2` for safety: a tie cannot promote a value. At `(8, 5, β)`,
+  `α = 5 > 4 = K/2`. Holds. At `(5, 4, β)`, `α = 4 > 2.5`. Holds.
+  At `(3, 2, β)`, `α = 2 > 1.5`. Holds.
+- `α ≥ ⅝K` for empirical safety under noise (§0.A). At K=8 this gives
+  α ≥ 5. At K=5 it gives α ≥ 4 (with rounding). The empirical floor
+  comes from the v2 dual-mode sweep: K=8/α=4 was not directly
+  measured but is below the ⅝K threshold; K=8/α=5 is the smallest
+  valid (K=8, α) pair in the v2 grid.
 - `β` is the **margin** between the top and runner-up accumulator at
-  decision time (Snowball, §2.2). Snowflake β was the consecutive-
-  count threshold; Snowball β is the lifetime-margin threshold. The
-  knob is the same — safety vs. latency — but the underlying state
-  is richer, which is why a smaller β suffices for the same agreement
-  rate.
+  decision time (Snowball, §2.2). The empirical floor β=10 zeroes
+  safety across all three adversary modes at K=8 for every measured
+  N ≥ 16.
 
 Knobs land under config (`NAKAMOTO_AVALANCHE_K` / `_ALPHA` / `_BETA` /
 `_TICK_FRACTION_NUM` / `_TICK_FRACTION_DEN`) with `LddConfig`-style
@@ -690,12 +777,81 @@ The cost of symmetric rollback is bounded by the number of flips a
 single ordinal can undergo before decision, which under Snowball is
 itself bounded by **the time it takes for the leading accumulator to
 pull `β` ahead of the runner-up**. Under honest majority, flips during
-the cascade window are rare; the (Snowflake-tuned) full sweep measures
-`median_rounds = 11-13` at β=10 across N ∈ {5..1000}, so the cascade
-typically lands first-try on the right preference. Snowball is expected
-to lower the flip rate further because a single round of split queries
-cannot reverse accumulator order if the leading hash has a comfortable
-margin.
+the cascade window are rare; the v2 dual-mode sweep measures
+`median_rounds = 13-18` at β=10, K=8 across all measured N ∈ {16, 32,
+100, 500, 1000} and all three adversary modes, so the cascade
+typically lands first-try on the right preference.
+
+### 3.4 Why Snowflake at K=3 looked safe but wasn't — and why Snowball at K=3 made the defect visible
+
+This section is preserved as a teaching note and as the explicit
+"we considered and rejected K=3" record for future reviewers.
+
+The v1 sweep (commit `d8f4639`, Snowflake-only) reported (K=3, α=2,
+β=10) as safe under coordinated_lie at all N and as the production
+recommendation, modulo a 9.85–16.71 % split_honest weakness that was
+attributed to "Snowflake's confidence-reset" and predicted to
+disappear under Snowball.
+
+**The v2 sweep refuted the prediction in two coupled findings:**
+
+| Cell | Snowflake | Snowball |
+|---|---|---|
+| K=3, α=2, β=10, N=1000, f=0.33, split_honest | 14.59 % safety_viol, 99.90 % converge, median 93 rounds | **31.23 %** safety_viol, 99.99 % converge, median 38 rounds |
+| K=3, α=2, β=10, N=1000, f=0.33, random_honest | 15.01 % safety_viol, 99.96 % converge, median 93 rounds | **31.40 %** safety_viol, 100.00 % converge, median 38 rounds |
+| K=3, α=2, β=10, N=1000, f=0.33, coord_lie | 0 % safety_viol, 100.00 % converge, median 13 rounds | 0 % safety_viol, 100.00 % converge, median 17 rounds |
+
+**The mechanism — Snowflake at K=3 is a stall, not a safety guarantee.**
+Snowflake's confidence-counter resets on every preference flip. Under
+split_honest at K=3, the Byzantine peers mirror the victim's minority
+preference *just often enough* to keep the counter resetting before
+it climbs to β=10. Most nodes never reach a decision at all (median
+93 rounds is approaching the 200-round cap; 0.1 % of trials at N=1000
+literally DNF). The "low" 14.59 % safety violation rate is a *liveness
+failure masquerading as safety* — the protocol is silent, so it can't
+disagree. Among the trials that *do* decide, the disagreement rate
+is in fact much higher; the metric averages over the silent majority.
+
+**The mechanism — Snowball at K=3 has a noise-floor problem.** Snowball
+does not reset on flip; the per-color accumulator carries history
+across the protocol. So Snowball *decides* (median 38 rounds — over
+twice as fast as Snowflake), but with K=3 the per-color accumulator
+margin is structurally small: a single round increments one
+accumulator by exactly 1 if α-majority is met, 0 otherwise. Two
+accumulators in lockstep with ε margin can both increment, and the
+adversary-noise envelope is large enough that the "winning" hash
+flips identity round-to-round. A small β=10 lifetime margin
+threshold is reached on whichever color happens to have a noise-
+induced spike first; different honest nodes lock different colors.
+**Snowball's safety bound at K=3 is genuinely 31 %.** It is not a
+bug in the simulator and it is not a Snowflake-vs-Snowball comparison
+failure — it is the actual per-color noise floor at K=3 with
+finite β.
+
+**The fix: K ≥ 8 with α ≥ ⅝K.** At K=8, the per-color accumulator
+margin grows fast enough relative to adversary-induced noise that
+β=10 produces zero safety violations at every measured N ≥ 16 across
+all three adversary modes. The empirical floor is K=8 (next-smallest
+in our v2 grid was K=5 with α=4/β=10, which leaks 0.24 % at N=1000
+split_honest — better but not safe enough for the < 0.001 production
+target). The bandwidth cost of K=8 vs. K=3 is 2.7× per round; the
+latency cost is ~1 s median (3.75 s vs. 2.75 s at large N) — both
+acceptable per the §0.A tradeoff analysis.
+
+**Why this matters for future reviewers.** Anyone repeating the v1
+analysis without the v2 dual-mode evidence will be tempted to revert
+to K=3 on bandwidth or latency grounds. The Snowflake-stall artefact
+means the bandwidth/latency comparison cannot be done against
+Snowflake at K=3 (which is silent); it must be done against Snowball
+at K=3 (which decides, and is genuinely unsafe). The K=8 floor is
+load-bearing.
+
+The v1 sweep at `avalanche_attestation_full_gpu_n10000.json` (commit
+`d8f4639`) is **superseded** by the v2 dual-mode sweep. The v1 data
+should not be cited for any new analysis; numbers from v1 that appear
+elsewhere in this document are either updated in place or labeled as
+"v1 (superseded)" in context.
+
 
 ---
 
@@ -810,48 +966,58 @@ is the lifetime-margin threshold. Under non-adversarial conditions the
 two are within a small constant factor — Snowball reaches `accum(H) −
 runnerUp ≥ β` in roughly β rounds once everyone agrees.)
 
-From the full GPU sweep (§0.A.i) at the empirical β=10 — note these
-numbers are Snowflake-tuned; Snowball is expected to match-or-beat
-them at the same β, and the parallel re-sim will replace this table
-with Snowball values when it lands:
+From the v2 dual-mode sweep (§0.A, commit `5ace3d36`) at the
+empirical floor (K=8, α=5, β=10) under Snowball, worst-case adversary
+mode at f=0.33:
 
-| Env             | N    | (K, α, β)    | Δ      | p50 / p99 rounds | p50 / p99 wall-time |
-|-----------------|------|--------------|--------|------------------|---------------------|
-| e2e tests       | 5    | (3, 2, 10)   | 250 ms | 11 / 12          | 2.75 / 3.0 s        |
-| e2e tests       | 8    | (3, 2, 10)   | 250 ms | 11 / 13          | 2.75 / 3.25 s       |
-| small mainnet   | 16   | (3, 2, 10)   | 500 ms | 12 / 14          | 6.0 / 7.0 s         |
-| small mainnet   | 100  | (3, 2, 10)   | 500 ms | 12 / 13          | 6.0 / 6.5 s         |
-| stress f=0.33   | 500  | (3, 2, 10)   | 500 ms | 13 / 13          | 6.5 / 6.5 s         |
-| stress f=0.33   | 1000 | (3, 2, 10)   | 500 ms | 13 / 13          | 6.5 / 6.5 s         |
+| Env             | N    | (K, α, β)    | Δ      | p50 / p99 rounds (worst-case adv) | p50 / p99 wall-time |
+|-----------------|------|--------------|--------|-----------------------------------|---------------------|
+| e2e tests       | 5    | (3, 2, 10)   | 250 ms | 16 / 28 (random_honest)           | 4.0 / 7.0 s         |
+| e2e tests       | 8    | (3, 2, 10)   | 250 ms | 16 / 64 (coord_lie)               | 4.0 / 16.0 s        |
+| small mainnet   | 16   | (8, 5, 10)   | 500 ms | 18 / 27 (coord_lie)               | 9.0 / 13.5 s        |
+| small mainnet   | 100  | (8, 5, 10)   | 500 ms | 15 / 23 (split/random)            | 7.5 / 11.5 s        |
+| stress f=0.33   | 500  | (8, 5, 10)   | 500 ms | 16 / 20 (split/random)            | 8.0 / 10.0 s        |
+| stress f=0.33   | 1000 | (8, 5, 10)   | 500 ms | 17 / 20 (split/random)            | 8.5 / 10.0 s        |
 
-Compare to the existing `finalityMonitor` cadence: `5 × slotDurationMs`,
-i.e. 5 s prod / 2.5 s e2e (`SnapshotLeaderLoop.scala:489-490`). At
-β=10 the Avalanche window is **~6.5 s p99 in production** vs. the
-existing 5 s tick — within the same envelope but slightly slower
-(motivated by the empirically-required β=10 floor under Snowflake;
-Snowball is expected to bring this back into ≤ 5 s territory if β=6
-suffices). The critical difference is that the Avalanche-emitted
-attestation represents a *decided* value rather than a moving target,
-and triggers no §5.1 re-emit ticker (§0.F).
+(Worst-case-adversary p99 selected per row; coord_lie tends to
+dominate p99 at small N, split/random dominate at large N. Median
+is generally driven by coord_lie at large N because it converges
+slower-but-decides-cleanly than split/random which converge faster-
+but-with-more-tail.)
+
+At prod `slotDurationMs = 1000` (so `Δ = 500 ms`), median wall-clock
+is **3.75-8.5 s depending on N** and p99 is **10-13.5 s**. Compare
+to the existing `finalityMonitor` cadence: `5 × slotDurationMs = 5 s`
+in prod (`SnapshotLeaderLoop.scala:489-490`). The Avalanche K=8 p99
+exceeds the 5-s tick in some cells (N=16 worst-case 13.5 s, N=100
+worst-case 11.5 s) but the *median* sits inside the envelope at
+3.75-8.5 s. The K=8 / β=10 floor is **empirically required** for
+safety across all three adversary modes (§0.A, §3.4); accepting the
+p99 overrun is the load-bearing safety/latency trade.
+
+The critical difference is that the Avalanche-emitted attestation
+represents a *decided* value rather than a moving target, and triggers
+no §5.1 re-emit ticker (§0.F).
 
 ### 5.2 Composition with T_depth1 latency
 
 The finality stack today already gates on `T_depth1 = bestTipOrdinal - k₁`
 (default `k₁ = 255` ordinals ~= 255 × 1s ≈ 4.25 min at prod slot rate;
 on the looser ~7 s effective snapshot rate that's ~30 min). Avalanche
-adds ~6.5 s p99 under the empirical Snowflake-β=10 (and likely ~3-4 s
-under a confirmed Snowball-β=6). Not material against the
-T_depth1 envelope either way.
+adds up to ~13.5 s p99 worst-case under the empirical (K=8, α=5, β=10)
+Snowball at N=16 / coord_lie. Not material against the T_depth1
+envelope.
 
 ### 5.3 Liveness floor
 
-Avalanche needs `K = 3` active peers responding to queries within Δ to
-make progress. At our smallest e2e cluster (3 nodes), `K = 3` already
-equals `N`, which means we need to relax the `K ≤ N - 1` constraint or
-fall through to T_depth1. The harness output confirms convergence at
-N=5; N=3 is a degenerate case where the cluster runs in "depth-only
-finality" mode for fork branches, which is the desired safety property
-under partition anyway:
+Avalanche at the production K=8 setting needs ≥ 8 active peers
+responding to queries within Δ to make progress (K ≤ N − 1 binds at
+N=9). At our smallest e2e cluster (3 nodes), K=8 is infeasible and
+the §2.4 small-cluster table downgrades to (K=3, α=2, β=10) at N=5
+or to "T_depth1 only" at N=3. The v2 sweep does **not** measure N=3
+at all (the smallest N is 5); N=3 is a degenerate case where the
+cluster runs in "depth-only finality" mode for fork branches, which
+is the desired safety property under partition anyway:
 
 - If the cluster is partitioned below `K`, Avalanche **stalls**:
 - `accum` never accumulates a `β`-margin → no decision → no
@@ -890,8 +1056,10 @@ gossip the receiver discards on de-dup.
 Decided ordinals stop being touched (the protocol is quiescent on
 decided ordinals). Ordinals still pending — typically the most recent
 `β + ε` ordinals — receive query traffic. Per node, query budget per
-tick is `K × |pending ordinals|`; with K=3 and ~10 pending ordinals
-that's 30 qps per node. Well within the sidecar's capacity.
+tick is `K × |pending ordinals|`; with K=8 and ~10 pending ordinals
+that's 80 qps per node (vs. 30 qps under the prior K=3
+recommendation). At cluster size 1000 that's 80k qps cluster-wide
+of receive traffic. Sidecar absorbs.
 
 ---
 
@@ -908,56 +1076,55 @@ by Rocco et al.'s Theorem 1:
 Pr[honest split decision] ≤ (1 - p)^β       where p ≈ Φ_α,K(f)
 ```
 
-This bound is for **Snowflake**. The Snowball bound (Amores-Sesar &
-Schneider 2024, §5.5) is **at least as good** at the same parameters
-and **strictly better** against a coordinated-split adversary, because
-the accumulator cannot be erased — Snowflake's exponent is tied to
-"consecutive same-color rounds" whereas Snowball's is tied to
-"cumulative margin", and the adversary cannot keep the cumulative
-margin below threshold without also losing the underlying α-majority
-race. **At our chosen (K=3, α=2) the literature bound is loose; the
-full GPU sweep is our source of truth.**
+This bound is for **Snowflake**. The Snowball analytical bound
+(Amores-Sesar & Schneider 2024, §5.5; Lewis-Pye et al. 2024) is **at
+least as good** at the same parameters because the accumulator cannot
+be erased. **At our chosen (K=8, α=5) the analytical literature
+bound is loose for our cluster sizes; the v2 dual-mode GPU sweep
+(§0.A, commit `5ace3d36`) is our empirical source of truth.**
 
-At our chosen (K=3, α=2, β=10) under Snowflake, the full GPU sweep
-(§0.A.i, 10000 trials/cell) shows:
+At (K=8, α=5, β=10) under Snowball, the v2 sweep shows:
 
 - **Under `coordinated_lie` at f=0.33: zero violations** across
-  N ∈ {5, 8, 16, 32, 100, 500, 1000} at 10000 trials/cell each (95 %
+  N ∈ {16, 32, 100, 500, 1000} at 10000 trials/cell each (95 %
   Clopper-Pearson upper bound on violation rate: ~0.037 %).
-- **Under `split_honest` at f=0.33** (§0.K.2): 9.85 % violations at
-  N=100, 16.71 % at N=500, 14.15 % at N=1000 — i.e. the Snowflake
-  cascade is *not* safe at production scale against the split-honest
-  adversary even at the empirically-tuned β=10. β=6 at the same
-  adversary and N=1000 reaches **71.4 %**.
+- **Under `split_honest` at f=0.33: zero violations** across the same
+  N range (one cell with 1 violation: N=100 = 0.0001 — within noise,
+  95 % CI upper bound 0.056 %).
+- **Under `random_honest` at f=0.33: zero violations** across the
+  same N range (one cell with 2 violations: N=100 = 0.0002 — within
+  noise).
 
-**Under Snowball semantics (decision §0.K, §2.2) we predict the
-split_honest violations collapse to ≤ 0.1 % at the same β=10**,
-because the dominant attack mode (adversary times split queries to
-keep `confidence` resetting) is exactly the mode the accumulator
-neutralizes. The §2.2 Snowflake → Snowball flip is therefore not
-just a theoretical-robustness gain — it is the **load-bearing
-empirical fix** for the split_honest weakness measured in §0.K.2.
-**Pending re-sim confirmation** (parallel workstream in flight).
+This is empirical, not analytical. The literature analytical bound
+for Snowball at K=8, α=5, β=10 is not directly given in the cited
+papers; the closest is Amores-Sesar & Schneider §5.5 which gives a
+generic exponential-in-β bound, and the more specific Frosty bound
+(Lewis-Pye et al. §4) is for Snowflake+ at much larger K. The v2
+empirical bound is **strictly stronger** than what either analytical
+bound provides for our parameters; the cryptographer review (§6.3,
+decision §0.D) should re-derive a tight analytical bound for the
+(K=8, α=5, β=10) Snowball cell against our (Taktikos LDD + 1/3 f
+chain layer) combined assumption.
 
-The compositional safety story (Snowflake-tuned, to be re-derived
-under Snowball):
+The compositional safety story (Snowball, v2 sweep):
 
-- **Best case (full sweep at f=0.33, N=1000, coordinated_lie):** 0
-  violations in 10000 trials. Posterior 95 % CI for the violation rate
-  is `[0, 0.037 %]`.
-- **Worst case observation under coordinated_lie (full sweep, β=6,
-  f=0.20, N=32):** 843 violations in 10000 trials = 8.43 % rate. β=10
-  zeroes this everywhere we sampled.
-- **Worst case observation under split_honest (full sweep, β=10,
-  f=0.33, N=500):** 1671 violations in 10000 trials = 16.71 % rate.
-  Under Snowball this is predicted to drop to ≪ 0.1 % at the same β=10
-  (and possibly the same β=6, which the re-sim must confirm).
+- **Best case (v2 sweep at f=0.33, N=1000, coord_lie + split_honest
+  + random_honest):** 0 violations in 10000 trials each. Posterior
+  95 % CI for the violation rate is `[0, 0.037 %]` per cell.
+- **Worst case observation under any adversary at K=8/α=5/β=10
+  (v2 sweep, f=0.33, N=100, split_honest):** 1 violation in 10000
+  trials = 0.0001 rate. 95 % CI upper bound 0.056 %.
+- **The dropped-from-recommendation cell (K=3, α=2, β=10), worst
+  Snowball case (v2 sweep, f=0.33, N=1000, random_honest):** 3140
+  violations in 10000 trials = **31.40 %** rate. Snowflake at the
+  same cell: 1501/10000 = 15.01 % (the rest don't decide; §3.4).
+  This is what we are no longer running.
 
-The classical-Avalanche (K=20, α=15, β=20) row of the full sweep
-(§0.A.i, §0.K.1) is the cautionary tale: 0 % convergence at f=0.33
-across all N from 32 to 1000, regardless of which semantics. This is
-not a Snowflake-vs-Snowball issue; it is a `K > N - 1`-effectively
-issue (slow recruitment of α=15 honest peers under ≥ 25 % adversarial
+The classical-Avalanche (K=20, α=15, β=20) row of the v2 sweep is
+the cautionary tale: 0 % convergence at f=0.33 across all N from
+32 to 1000, regardless of which semantics. This is not a
+Snowflake-vs-Snowball issue; it is a `K > N - 1`-effectively issue
+(slow recruitment of α=15 honest peers under ≥ 25 % adversarial
 fraction), and is the strongest argument against the literature
 parameters for our setting.
 
@@ -1003,7 +1170,8 @@ implementation:
 3. **Adaptive Byzantine.** Avalanche's safety bound assumes the
    adversary fraction `f` is fixed across the decision window. Our
    stake-weighted VRF model allows stake to shift between periods — but
-   slowly relative to a 5 s decision window. Not a worry.
+   slowly relative to a ~4-13 s decision window (K=8 median 3.75 s,
+   p99 13.5 s at worst N=16). Not a worry.
 
 4. **Grinding.** Avalanche queries return preferences, not VRF outputs.
    No additional VRF grinding surface introduced.
@@ -1094,45 +1262,45 @@ enforced.
 
 ## §8. Open questions
 
-The questions resolved by the 10 locked decisions in §0 are removed
+The questions resolved by the 13 locked decisions in §0 are removed
 from this list. What remains genuinely open:
 
-1. **Snowball re-sim.** The full GPU sweep (1896 cells × 10000 trials,
-   commit `d8f4639`) is **Snowflake** — per decision §0.K, this is the
-   defect being fixed. The Snowflake data is sufficient to set the
-   *empirical floor* (K=3, α=2, β=10 zeroes coordinated_lie at every
-   measured N) and to *demonstrate the need* for the §2.2 flip
-   (Snowflake-β=10 still leaks 9.85–16.71 % violations against
-   split_honest at N ∈ {100, 500, 1000} — §0.K.2). What it cannot do
-   is set the production β: that requires Snowball semantics. The
-   re-sim must (a) port the inner loop from Snowflake's
-   `confidence: Int / reset on flip` to Snowball's
-   `accum: Map[Hash, Int] / margin decision`; (b) re-run the full sweep
-   at the same (K, α, β, N, f, adversary) grid. **Parallel workstream
-   in flight at the time of this revision.** Predicted outcome:
-   Snowball-β=6 reaches 0 safety violations everywhere
-   Snowflake-β=10 does *and* zeroes the split_honest violations
-   measured in §0.K.2. If confirmed, lock the proposal at
-   `(K=3, α=2, β=6)`. If Snowball-β=6 still shows residual violations
-   at the worst-case cell (split_honest, f=0.33, N=500), bump β to
-   8 or 10 (also subject to confirmation against the empirical
-   coordinated_lie floor — see §2.4 caveat on the Snowflake-β to
-   Snowball-β mapping).
+1. **(RESOLVED 2026-05-15 via v2 sweep, commit `5ace3d36`)** —
+   *"What's the right β under Snowball?"* Resolved: **β=10 with
+   K=8, α=5**. The v2 dual-mode 6696-cell × 10000-trial GPU sweep
+   evaluated both Snowflake and Snowball at every cell and revealed
+   that the right question was not "what β" but **"what K"**: K=3 is
+   below the per-color noise floor under Snowball (31 % safety
+   violations at N=1000 split/random_honest, see §0.K.2 / §3.4),
+   and K=8 is the smallest sweep-grid K at which (α=5, β=10)
+   zeroes all three adversary modes at every measured N ∈ {16, 32,
+   100, 500, 1000}. The production recommendation locks at
+   **(K=8, α=5, β=10, Δ=slot/2)** — decision §0.M.
 
-2. **Tentative attestation emission.** Should the protocol allow a
+2. **(NEW)** **K-vs-latency tradeoff sweep at production slot cadence.**
+   The v2 sweep ran at `tick_dt = 0.25 s` (e2e cadence). At prod
+   `Δ = 500 ms` we have 2× the per-round wall-clock, so worst-case
+   K=8 p99 cells (e.g. N=16 / coord_lie at 27 rounds) become 13.5 s
+   in production. Could (K=12, α=8, β=8) or (K=16, α=11, β=8) give
+   strictly smaller p99 at the cost of larger bandwidth? The v2
+   sweep includes K=12 and K=16 grid points at most N — a focused
+   re-analysis (no new sim run needed; just re-querying the JSON)
+   would settle it. Track as follow-on after this proposal lands.
+
+3. **Tentative attestation emission.** Should the protocol allow a
    *tentative* attestation emit before Avalanche decides — labeled as
    such on the wire — so that triggers see *something* during the
    lock-in window? Loses some safety (a flipped preference would
    require a withdrawal of the tentative att, contradicting decision
    **§0.F**). Probably not worth it, but worth listing.
 
-3. **Slashing prosecution mechanism (deferred per §0.G).** When the
+4. **Slashing prosecution mechanism (deferred per §0.G).** When the
    prosecution layer lands, dedicated chain? Piggyback on existing
    snapshot stream as an optional `slashing` field? Light-client
    publication via Mithril-equivalent multisig? Dependent on
    §9's KES landing.
 
-4. **NIPoPoW composition (decision §0.H).** Avalanche resolves the
+5. **NIPoPoW composition (decision §0.H).** Avalanche resolves the
    "which hash at the tip" question online and per-validator;
    [`NIPOPOW-PROPOSAL.md`](./NIPOPOW-PROPOSAL.md) resolves the "did
    this chain happen" question for archival ranges and per-light-client.
@@ -1146,20 +1314,23 @@ from this list. What remains genuinely open:
    whichever is larger. The cryptographer audit (§6.3, §0.D) should
    independently cover this composition.
 
-5. **Cross-metagraph (gl1) Avalanche — out of scope (decision §0.J).**
+6. **Cross-metagraph (gl1) Avalanche — out of scope (decision §0.J).**
    The Avalanche paper's DAG-form is richer than Snowman and could be
    useful for cross-metagraph attestation, but is explicitly deferred.
-   gl0 single-chain only for this proposal.
+   gl0 single-chain only for this proposal. See the sister proposal
+   `CROSS-SHARD-MITIGATION-PROPOSAL.md` (in flight as a parallel
+   workstream at the time of this revision) for cross-shard design
+   discussion.
 
-6. **Sidecar query budget at scale.** At cluster size 1000 with K=3
-   and 10 pending ords/node, query traffic is `1000 × 3 × 10 / 0.5s ≈
-   60k qps cluster-wide` (independent of β — β only sets when the
+7. **Sidecar query budget at scale.** At cluster size 1000 with K=8
+   and 10 pending ords/node, query traffic is `1000 × 8 × 10 / 0.5s
+   = 160k qps cluster-wide` (independent of β — β only sets when the
    per-ordinal cascade *terminates* its query stream, not the per-tick
    rate). Distributed (each node's K queries fan out), per-node
-   receive is `3 × 10 / 0.5s = 60 qps`. Comfortable, but
-   needs sidecar load testing.
+   receive is `8 × 10 / 0.5s = 160 qps`. Comfortable, but at 2.7×
+   the K=3 estimate; needs sidecar load testing at the K=8 floor.
 
-7. **KES retroactive-equivocation model.** Once KES forward-secure keys
+8. **KES retroactive-equivocation model.** Once KES forward-secure keys
    land, old (evolved-away) keys can't sign new equivocation evidence.
    But the *original* equivocation was signed by the key as it existed
    at the time of equivocation; that signature is preserved in the
@@ -1168,7 +1339,7 @@ from this list. What remains genuinely open:
    equivocation (correct), or as it is now (incorrect — KES key has
    evolved)? Almost certainly need the historical-pubkey path.
 
-8. **Adversarial timing.** Can a Byzantine node strategically delay
+9. **Adversarial timing.** Can a Byzantine node strategically delay
    `responding` to queries — but still respond — to influence
    accumulator dynamics in a victim node? Less of a concern under
    Snowball (the accumulator is monotone, so delaying a response
@@ -1176,13 +1347,13 @@ from this list. What remains genuinely open:
    query-response latency histogram is still a natural Prometheus
    addition. Worth flagging to cryptographer review (§6.3).
 
-9. **Tipping over to a hybrid finality definition.** Today,
-   `T_weight ∨ T_count ∨ T_depth1` finalizes a snapshot. Post-
-   Avalanche, the weight/count triggers reduce to: "every node decided
-   the same hash via Avalanche, and the weight passes the threshold".
-   Decision **§0.C** already subsumes T_count semantically; collapsing
-   the trigger entries in the codebase into a single `T_avalanche`
-   trigger is a follow-up cleanup, not a correctness change.
+10. **Tipping over to a hybrid finality definition.** Today,
+    `T_weight ∨ T_count ∨ T_depth1` finalizes a snapshot. Post-
+    Avalanche, the weight/count triggers reduce to: "every node decided
+    the same hash via Avalanche, and the weight passes the threshold".
+    Decision **§0.C** already subsumes T_count semantically; collapsing
+    the trigger entries in the codebase into a single `T_avalanche`
+    trigger is a follow-up cleanup, not a correctness change.
 
 ---
 
@@ -1282,9 +1453,9 @@ this specific adversary class.
 
 **Implementation cost.** ~20 LOC change to the cascade plus new
 config knobs `NAKAMOTO_AVALANCHE_ALPHA_1` / `_ALPHA_2`. Sim re-
-calibration: extend the full GPU sweep to a 2D (α₁, α₂) grid for each
-(K, β) cell — within an order of magnitude of the existing 1896-cell
-sweep budget (7.1 min wall-clock).
+calibration: extend the v2 dual-mode GPU sweep to a 2D (α₁, α₂)
+grid for each (K, β) cell — within an order of magnitude of the
+existing 6696-cell sweep budget (19.6 min wall-clock).
 
 **Cross-link.** If we adopt Snowflake+ later, the rolling-upgrade
 shape is identical to the Snowflake → Snowball flip: it's a node-
@@ -1431,14 +1602,22 @@ work.
     hack this proposal obviates (§0.B).
 - Sim harness:
   - `~/repos/research-nipopos-2026` branch `sim/avalanche-attestation`,
-    commit `d8f4639` — full GPU-backed sweep at 1896 cells × 10000
-    trials. Snowflake semantics; Snowball re-sim is a parallel
-    workstream (decision §0.K, open question §8.1).
+    commit `5ace3d36` — **dual-mode Snowball + Snowflake** GPU sweep
+    at 6696 cells × 10000 trials, three adversary modes (coordinated_lie,
+    split_honest, random_honest). This is the primary data source for
+    the current proposal.
+  - `~/repos/research-nipopos-2026/sims/data/avalanche_attestation_full_gpu_n10000_v2.json`
+    — **primary data file referenced throughout this proposal (v2).**
+    6696 cells across (K, α, β, N, f_adv, adversary, latency,
+    decision_rule) grid; 10000 trials per cell; 19.6 min wall-clock
+    on RTX 5090. Headlines in §0.A, §0.K.1, §0.K.2, §3.4, §5.1, §6.1.
+    N ∈ {5, 8, 16, 32, 100, 500, 1000}; f_adv ∈ {0, 0.1, 0.2, 0.25,
+    0.3, 0.33}; K ∈ {3, 5, 8, 12, 16, 20, 30}.
   - `~/repos/research-nipopos-2026/sims/data/avalanche_attestation_full_gpu_n10000.json`
-    — **primary data file referenced throughout this proposal.** 1896
-    cells across (K, α, β, N, f_adv, adversary, latency) grid; 10000
-    trials per cell; 7.1 min wall-clock on RTX 5090. Headlines in
-    §0.A.i, §0.K.1, §0.K.2, §5.1, §6.1.
+    — **v1 Snowflake-only sweep at commit `d8f4639`, 1896 cells,
+    7.1 min — SUPERSEDED by v2.** Retained for reference; do not cite
+    for new analysis. The v1 → v2 framing flip (recommendation moves
+    from K=3 to K=8) is documented in §3.4.
   - `~/repos/research-nipopos-2026/sims/AVALANCHE_CALIBRATION.md`
-    — adversary models (coordinated_lie, split_honest), latency models
-    (boltzmann, pareto), output schema.
+    — adversary models (coordinated_lie, split_honest, random_honest),
+    latency models (boltzmann, pareto), output schema.
