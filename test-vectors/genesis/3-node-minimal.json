@@ -1,0 +1,111 @@
+{
+  "_meta" : {
+    "expectedProperties" : [
+      "3 operators with stake distribution: 0.5,0.3,0.2",
+      "Total stake budget: 100000000000 datum",
+      "Collateral per operator: 0 datum",
+      "Stake records signed at load time with synthetic delegator keys",
+      "ECDSA signatures non-deterministic by RNG (verifiable but not byte-equal across loads)"
+    ],
+    "generatedAt" : "1970-01-01T00:00:00Z",
+    "generatorVersion" : "tools-0.0.0-worktree-SNAPSHOT",
+    "invocation" : "generate-genesis --num-operators 3 --seed 1004 --stake-distribution 0.5,0.3,0.2 --stake-budget-datum 100000000000 --collateral-per-operator 0 --network-magic test-cluster",
+    "seed" : 1004
+  },
+  "activationOrdinal" : 0,
+  "delegatedStakes" : [
+    {
+      "createdAt" : 0,
+      "delegatorPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a04763074020101042004f690697465e7de907e4b453548964cf567baac82d5cb1bd945f8afa9046dcda00706052b8104000aa14403420004c7745761971d43efeaeccf2e3c64039e4e98d3fb8422a36b3511a04368856ce645e8ccc431fad1de75f105a19fa0dffc087091651edcf87f573a01af557c9602",
+      "event" : {
+        "amount" : 50000000000,
+        "fee" : 0,
+        "nodeId" : "806d2f7a6885beceeda89271b3fc90339b0fc473a5cff7c157b1280469089cc1e0d5e48d0aa093e04c0b7b4717138ac05cb461f9b672b7124bad488fe7d90b8d",
+        "parent" : {
+          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+          "ordinal" : 0
+        },
+        "source" : "DAG0a4KeYBJ4Mst7WF6juvokS6XTzzXRQPppKeNP",
+        "tokenLockRef" : "9fa871d8ca05de561bf168f6245620aab226004455366582bdb67467ad993588"
+      },
+      "rewards" : 0
+    },
+    {
+      "createdAt" : 0,
+      "delegatorPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a0476307402010104200506914b24ac3540f3802b2c821ae5d036c883ff711d0aaf830668078d04b7d7a00706052b8104000aa14403420004a6b4108a1a20725b13f59ec1e7424ee2002840085dd527ca9935ac1b7a90a5d78a8f11213fcc7a4f1cc0701c309f75b66de24c9b2545f6d755a43d8e4734d9f2",
+      "event" : {
+        "amount" : 30000000000,
+        "fee" : 0,
+        "nodeId" : "b1fc3ea204cc384b4e43a9bc6d3b804293df6a0dd142233695293260a50e59051145597f3b66c157f7ece2cc7560945a1b7ac63be5bc28cffc1da294836a78a7",
+        "parent" : {
+          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+          "ordinal" : 0
+        },
+        "source" : "DAG2BH3xKeP47tf4GKDmRGdZ8TtXsXCspaZNcsy3",
+        "tokenLockRef" : "ef152e564e65122873906b140e5dcaf51cc2208721d1f161ec5db64a3f66f50e"
+      },
+      "rewards" : 0
+    },
+    {
+      "createdAt" : 0,
+      "delegatorPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a047630740201010420859697075a77b963d349d969263d09758de8005e83432aacc1b5b8dbc8715dbfa00706052b8104000aa14403420004f9d8a6ceccd5830a4b65df3dfa3d922014e4b471d15ab369c68eb4ffd09c347082c6c935fccc98341dd229c346c3b3fedd2e93b9c80916f0d01e8310f72105b0",
+      "event" : {
+        "amount" : 20000000000,
+        "fee" : 0,
+        "nodeId" : "eae96ee3fd37dfd55545ffdf36974d76eeeb95a0f8ecf036c111de27f0e5cef6f240e70e291d3b1f9c8225025c46f53bba23ec91a8dc6fd832e045f79c5e68a3",
+        "parent" : {
+          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+          "ordinal" : 0
+        },
+        "source" : "DAG7JhgdPUWhVWr5M8uJN4MWkzmM6Y2A1d4Ed4bJ",
+        "tokenLockRef" : "95540240be5026d260e403f817b9486551eee33f9e936baee73c7313ba383b46"
+      },
+      "rewards" : 0
+    }
+  ],
+  "initialBalances" : [
+    {
+      "address" : "DAG8ajavmt3WDrivoQ5m2mssaDKeu6TF4TsRN6JZ",
+      "balance" : 100000000000000
+    },
+    {
+      "address" : "DAG1c5sbqiGLFNPp7RT5Pd2SEtQrJfbGrhCpS9eY",
+      "balance" : 100000000000000
+    },
+    {
+      "address" : "DAG2EKXDT8kp4dFvrwSKEJBjCFPm2vuyK6cBzckv",
+      "balance" : 100000000000000
+    }
+  ],
+  "networkMagic" : "test-cluster",
+  "nodeCollaterals" : [
+  ],
+  "operators" : [
+    {
+      "address" : "DAG8ajavmt3WDrivoQ5m2mssaDKeu6TF4TsRN6JZ",
+      "kesPublicKey" : null,
+      "peerId" : "806d2f7a6885beceeda89271b3fc90339b0fc473a5cff7c157b1280469089cc1e0d5e48d0aa093e04c0b7b4717138ac05cb461f9b672b7124bad488fe7d90b8d",
+      "vrfPublicKey" : null
+    },
+    {
+      "address" : "DAG1c5sbqiGLFNPp7RT5Pd2SEtQrJfbGrhCpS9eY",
+      "kesPublicKey" : null,
+      "peerId" : "b1fc3ea204cc384b4e43a9bc6d3b804293df6a0dd142233695293260a50e59051145597f3b66c157f7ece2cc7560945a1b7ac63be5bc28cffc1da294836a78a7",
+      "vrfPublicKey" : null
+    },
+    {
+      "address" : "DAG2EKXDT8kp4dFvrwSKEJBjCFPm2vuyK6cBzckv",
+      "kesPublicKey" : null,
+      "peerId" : "eae96ee3fd37dfd55545ffdf36974d76eeeb95a0f8ecf036c111de27f0e5cef6f240e70e291d3b1f9c8225025c46f53bba23ec91a8dc6fd832e045f79c5e68a3",
+      "vrfPublicKey" : null
+    }
+  ],
+  "protocolParams" : {
+    "etaRotationSnapshots" : 2550,
+    "genesisEta" : "tessellation-nakamoto-genesis",
+    "lddCutoff" : 15,
+    "slotsPerEpoch" : 60,
+    "startingEpochProgress" : 0
+  },
+  "startingEpochProgress" : 0
+}

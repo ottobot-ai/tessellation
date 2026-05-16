@@ -160,6 +160,68 @@ else
   source ./docker/bin/node-key-env-setup.sh
   source ./docker/bin/docker-env-setup.sh
 
+  # Tier-1 test-vectors hook (§1.1 — `project_test_vector_pattern`). When
+  # NAKAMOTO_STAKE_DISTRIBUTION is set, generate a Tier-1 l0-genesis.json via the tools-jar
+  # and overlay it onto each gl0 node so the cluster boots from a stake-weighted genesis
+  # instead of the equal-weight CSV. Validation, generator invocation, per-node copy +
+  # CL_GENESIS_FILE wire-up are all gated by this env var being non-empty.
+  if [ -n "$NAKAMOTO_STAKE_DISTRIBUTION" ]; then
+    echo "------------------------------------------------"
+    echo "Tier-1 test-vector path: NAKAMOTO_STAKE_DISTRIBUTION='$NAKAMOTO_STAKE_DISTRIBUTION'"
+    echo "------------------------------------------------"
+
+    # Validate: comma-separated, length matches NUM_GL0_NODES, sum ≈ 1.0
+    STAKE_COUNT=$(echo "$NAKAMOTO_STAKE_DISTRIBUTION" | tr ',' '\n' | grep -c .)
+    if [ "$STAKE_COUNT" -ne "$NUM_GL0_NODES" ]; then
+      echo "ERROR: NAKAMOTO_STAKE_DISTRIBUTION has $STAKE_COUNT entries but NUM_GL0_NODES=$NUM_GL0_NODES"
+      exit 1
+    fi
+    STAKE_SUM=$(echo "$NAKAMOTO_STAKE_DISTRIBUTION" | tr ',' '\n' | awk '{s+=$1} END{printf "%.4f", s}')
+    awk -v s="$STAKE_SUM" 'BEGIN{ if (s < 0.99 || s > 1.01) exit 1 }' || {
+      echo "ERROR: NAKAMOTO_STAKE_DISTRIBUTION sum=$STAKE_SUM, must be ≈ 1.0"
+      exit 1
+    }
+
+    # Invoke the generator. --keys-from ./nodes lets the generator REUSE the existing
+    # `nodes/N/key.p12` operator credentials (rather than synthesizing fresh keys) so the
+    # peerIds + addresses in `l0-genesis.json` match the runtime credentials downstream.
+    GENESIS_SEED=${NAKAMOTO_GENESIS_SEED:-42}
+    STAKE_BUDGET=${NAKAMOTO_STAKE_BUDGET_DATUM:-1000000000000}
+    COLLATERAL=${NAKAMOTO_COLLATERAL_PER_OPERATOR:-0}
+    mkdir -p ./nodes/_genesis-out
+    java --add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
+         --add-opens=java.base/java.util=ALL-UNNAMED \
+         --add-opens=java.base/java.security=ALL-UNNAMED \
+         -jar ./docker/jars/tools.jar generate-genesis \
+         --output-dir ./nodes/_genesis-out \
+         --num-operators "$NUM_GL0_NODES" \
+         --keys-from ./nodes \
+         --stake-distribution "$NAKAMOTO_STAKE_DISTRIBUTION" \
+         --stake-budget-datum "$STAKE_BUDGET" \
+         --collateral-per-operator "$COLLATERAL" \
+         --initial-balances-csv ./.github/config/genesis.csv \
+         --seed "$GENESIS_SEED" \
+         --network-magic test-cluster
+
+    if [ ! -f ./nodes/_genesis-out/l0-genesis.json ]; then
+      echo "ERROR: generator did not produce l0-genesis.json"
+      exit 1
+    fi
+
+    # Per-node copy + opt-in env vars. Each gl0 node sees the same l0-genesis.json — the
+    # `loadL0Genesis` reader is deterministic w.r.t. its input file, so all nodes derive the
+    # same seeded `GlobalSnapshotInfo`.
+    # - CL_GENESIS_JSON_HOST: docker-compose mounts ./genesis.json → /tessellation/genesis.json
+    # - CL_GENESIS_CONTAINER_PATH: entrypoint.sh passes this to run-nakamoto (dispatches JSON branch)
+    for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
+      cp ./nodes/_genesis-out/l0-genesis.json ./nodes/$i/genesis.json
+      # Append rather than overwrite — node-key-env-setup already wrote envrc + .env entries.
+      echo "CL_GENESIS_JSON_HOST=./genesis.json" >> ./nodes/$i/.env
+      echo "CL_GENESIS_CONTAINER_PATH=/tessellation/genesis.json" >> ./nodes/$i/.env
+    done
+    echo "Tier-1 l0-genesis.json propagated to $NUM_GL0_NODES gl0 nodes"
+  fi
+
 
   echo "------------------------------------------------"
   echo "All deployment configurations now generated, proceeding to run cluster"

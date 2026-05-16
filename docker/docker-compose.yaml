@@ -34,8 +34,12 @@ services:
       - ${CL_DOCKER_SEEDLIST:-/dev/null}:/tessellation/seedlist:ro
       - ${CL_DOCKER_PRIORITY_SEEDLIST:-/dev/null}:/tessellation/priority-seedlist:ro
       - ${CL_DOCKER_GL0_LOGS:-./gl0-logs}:/tessellation/logs
-      # Only required for testing purposes
+      # Only required for testing purposes.
+      # Legacy CSV-genesis path uses `CL_GENESIS_FILE` as the host-side source. Tier-1 JSON
+      # path layers on `CL_GENESIS_JSON_HOST` for an additional /tessellation/genesis.json mount.
+      # The entrypoint chooses which container-side path to consume via `CL_GENESIS_CONTAINER_PATH`.
       - ${CL_GENESIS_FILE:-/dev/null}:/tessellation/genesis.csv:ro
+      - ${CL_GENESIS_JSON_HOST:-/dev/null}:/tessellation/genesis.json:ro
       # If using docker volumes: gl0-data:/tessellation/data
       # If using host volumes: default to a path like ./l0-data
       - ${CL_DOCKER_GL0_DATA:-./gl0-data}:/tessellation/data

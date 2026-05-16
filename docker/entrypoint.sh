@@ -116,7 +116,10 @@ if [ "$ID" == "gl0" ] && [ "$NAKAMOTO_MODE" == "true" ]; then
   #   2. Local data on disk (cold restart — automatic)
   #   3. --genesis-csv (fresh start from genesis CSV)
   # No BFT cluster join — validators discover each other via seedlist + sidecar.
-  RUN_COMMAND="run-nakamoto /tessellation/genesis.csv"
+  # Tier-1 test-vectors: when CL_GENESIS_CONTAINER_PATH is set (e.g.
+  # /tessellation/genesis.json), the dag-l0 main dispatches to the JSON-genesis branch.
+  # Default stays at the legacy CSV path so unchanged tests keep working.
+  RUN_COMMAND="run-nakamoto ${CL_GENESIS_CONTAINER_PATH:-/tessellation/genesis.csv}"
   if [ -n "$CL_DOCKER_ROLLBACK_HASH" ]; then
     RUN_COMMAND="$RUN_COMMAND --rollback-hash $CL_DOCKER_ROLLBACK_HASH"
   fi
@@ -144,7 +147,9 @@ else
       fi
     else
       if [ ! -f "/tessellation/data/snapshot/ordinal/0/0" ]; then
-        RUN_COMMAND="run-genesis /tessellation/genesis.csv"
+        # BFT path mirrors the Nakamoto path above: honor CL_GENESIS_CONTAINER_PATH for
+        # Tier-1 JSON; default to the legacy CSV path otherwise.
+        RUN_COMMAND="run-genesis ${CL_GENESIS_CONTAINER_PATH:-/tessellation/genesis.csv}"
       elif [ "$CL_DOCKER_ROLLBACK" == "true" ]; then
         if [ -z "$CL_DOCKER_ROLLBACK_HASH" ]; then
           echo "Error: CL_DOCKER_ROLLBACK=true but CL_DOCKER_ROLLBACK_HASH is not set"

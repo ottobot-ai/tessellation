@@ -21,13 +21,14 @@ import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityGate
 import io.constellationnetwork.node.shared.ext.pureconfig._
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.EventTrigger
-import io.constellationnetwork.node.shared.infrastructure.genesis.{GenesisFS => GenesisLoader}
+import io.constellationnetwork.node.shared.infrastructure.genesis.{GenesisFS => GenesisLoader, L0GenesisLoader}
 import io.constellationnetwork.node.shared.infrastructure.gossip.event._
 import io.constellationnetwork.node.shared.infrastructure.gossip.{GossipDaemon, RumorHandlers}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.GlobalSnapshotLocalFileSystemStorage
 import io.constellationnetwork.node.shared.resources.MkHttpServer
 import io.constellationnetwork.node.shared.resources.MkHttpServer.ServerName
 import io.constellationnetwork.schema._
+import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.cluster.{ClusterId, ClusterSessionToken, SessionToken}
 import io.constellationnetwork.schema.epoch.EpochProgress
@@ -382,70 +383,117 @@ object Main
                     }
 
                   } else if (method.genesisPath.isDefined) {
-                    // === PATH 4: FRESH GENESIS — start from genesis CSV ===
+                    // === PATH 4: FRESH GENESIS — start from genesis CSV OR Tier-1 l0-genesis.json ===
                     val gPath = method.genesisPath.get
-                    GenesisLoader.make[IO, GlobalSnapshot].loadBalances(gPath).flatMap { accounts =>
-                      IO.raiseError(
-                        new RuntimeException(
-                          s"Genesis CSV at $gPath loaded 0 balances — file may be empty or unreadable " +
-                            s"(check CL_GENESIS_FILE mount). Refusing to start with empty genesis state."
-                        )
-                      ).whenA(accounts.isEmpty) >>
-                        logger.info(s"Loaded ${accounts.size} genesis balances from $gPath") >> {
-                          val genesis = GlobalSnapshot.mkGenesis(
-                            accounts.map(a => (a.address, a.balance)).toMap,
-                            method.startingEpochProgress
-                          )
-                          hasherSelector.withCurrent { implicit hasher =>
-                            Signed.forAsyncHasher[IO, GlobalSnapshot](genesis, keyPair).flatMap(_.toHashed[IO])
-                          }.flatMap { hashedGenesis =>
-                            GlobalSnapshotLocalFileSystemStorage.make[IO](cfg.snapshot.snapshotPath).flatMap {
-                              fullGlobalSnapshotLocalFileSystemStorage =>
-                                hasherSelector.withCurrent { implicit hasher =>
-                                  fullGlobalSnapshotLocalFileSystemStorage.write(hashedGenesis.signed) >>
-                                    GlobalSnapshot.mkFirstIncrementalSnapshot[IO](hashedGenesis).flatMap { firstIncrementalSnapshot =>
-                                      Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](firstIncrementalSnapshot, keyPair).flatMap {
-                                        signedFirstIncrementalSnapshot =>
-                                          for {
-                                            hashedSnapshot <- signedFirstIncrementalSnapshot.toHashed[IO]
-                                            globalSnapshotInfo = hashedGenesis.info.toGlobalSnapshotInfo
-                                            _ <- initializeStorages[IO](
-                                              storages.globalSnapshot,
-                                              sharedStorages.lastNGlobalSnapshot,
-                                              sharedStorages.lastGlobalSnapshot,
-                                              programs.download,
-                                              hashedSnapshot,
-                                              globalSnapshotInfo
+
+                    // Tier-1 test-vector dispatch: extension-driven, opt-in. The CSV path is the
+                    // canonical default; the JSON branch loads an `L0GenesisData` payload (balances +
+                    // delegated-stake records + node-collateral records + protocol params) and
+                    // augments the in-memory `GlobalSnapshotInfo` AFTER `toGlobalSnapshotInfo` per
+                    // Option (ii) in `IMPLEMENTATION-PLAN-POST-VALIDATION.md` §1.1 — the on-disk
+                    // `Signed[GlobalSnapshot]` stays V1.
+                    val genesisLoader = GenesisLoader.make[IO, GlobalSnapshot]
+
+                    // (balanceMap, gsiAugmenter): one for the GlobalSnapshot.mkGenesis call, one for
+                    // overlaying delegated-stake + collateral entries onto the runtime GSI.
+                    val loadStep: IO[(Map[Address, balance.Balance], GlobalSnapshotInfo => IO[GlobalSnapshotInfo])] =
+                      if (gPath.extName == ".json") {
+                        genesisLoader.loadL0Genesis(gPath).flatMap { data =>
+                          val balanceMap = data.initialBalanceMap
+                          IO.raiseError[(Map[Address, balance.Balance], GlobalSnapshotInfo => IO[GlobalSnapshotInfo])](
+                            new RuntimeException(
+                              s"L0 genesis JSON at $gPath has no operators — refusing to start with empty operator set."
+                            )
+                          ).whenA(data.operators.isEmpty) >>
+                            logger.info(
+                              s"Loaded L0 genesis JSON: ${data.operators.size} operators, " +
+                                s"${data.delegatedStakes.size} delegated-stakes, " +
+                                s"${data.nodeCollaterals.size} node-collaterals, " +
+                                s"${data.initialBalances.size} initial balances"
+                            ) >> IO.pure(
+                              (
+                                balanceMap,
+                                (base: GlobalSnapshotInfo) =>
+                                  hasherSelector.withCurrent { implicit hasher =>
+                                    L0GenesisLoader.augmentSnapshotInfo[IO](base, data)
+                                  }
+                              )
+                            )
+                        }
+                      } else {
+                        genesisLoader.loadBalances(gPath).flatMap { accounts =>
+                          IO.raiseError[(Map[Address, balance.Balance], GlobalSnapshotInfo => IO[GlobalSnapshotInfo])](
+                            new RuntimeException(
+                              s"Genesis CSV at $gPath loaded 0 balances — file may be empty or unreadable " +
+                                s"(check CL_GENESIS_FILE mount). Refusing to start with empty genesis state."
+                            )
+                          ).whenA(accounts.isEmpty) >>
+                            logger.info(s"Loaded ${accounts.size} genesis balances from $gPath") >> IO.pure(
+                              (
+                                accounts.map(a => (a.address, a.balance)).toMap,
+                                (base: GlobalSnapshotInfo) => IO.pure(base)
+                              )
+                            )
+                        }
+                      }
+
+                    loadStep.flatMap {
+                      case (balanceMap, augmenter) =>
+                        val genesis = GlobalSnapshot.mkGenesis(balanceMap, method.startingEpochProgress)
+                        hasherSelector.withCurrent { implicit hasher =>
+                          Signed.forAsyncHasher[IO, GlobalSnapshot](genesis, keyPair).flatMap(_.toHashed[IO])
+                        }.flatMap { hashedGenesis =>
+                          GlobalSnapshotLocalFileSystemStorage.make[IO](cfg.snapshot.snapshotPath).flatMap {
+                            fullGlobalSnapshotLocalFileSystemStorage =>
+                              hasherSelector.withCurrent { implicit hasher =>
+                                fullGlobalSnapshotLocalFileSystemStorage.write(hashedGenesis.signed) >>
+                                  GlobalSnapshot.mkFirstIncrementalSnapshot[IO](hashedGenesis).flatMap { firstIncrementalSnapshot =>
+                                    Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](firstIncrementalSnapshot, keyPair).flatMap {
+                                      signedFirstIncrementalSnapshot =>
+                                        for {
+                                          hashedSnapshot <- signedFirstIncrementalSnapshot.toHashed[IO]
+                                          baseGsi = hashedGenesis.info.toGlobalSnapshotInfo
+                                          // Apply Tier-1 augmenter: CSV path is a no-op (identity);
+                                          // JSON path overlays delegated-stake + collateral entries.
+                                          // The augmented GSI is what downstream storage + consensus
+                                          // sees from slot 0 onward — no warm-up window.
+                                          globalSnapshotInfo <- augmenter(baseGsi)
+                                          _ <- initializeStorages[IO](
+                                            storages.globalSnapshot,
+                                            sharedStorages.lastNGlobalSnapshot,
+                                            sharedStorages.lastGlobalSnapshot,
+                                            programs.download,
+                                            hashedSnapshot,
+                                            globalSnapshotInfo
+                                          )
+                                          _ <- sharedStorages.mptStore
+                                            .syncFromGlobalSnapshotInfo(globalSnapshotInfo, hashedSnapshot.ordinal)(
+                                              globalStateProofSelector,
+                                              withdrawalTimeLimit
                                             )
-                                            _ <- sharedStorages.mptStore
-                                              .syncFromGlobalSnapshotInfo(globalSnapshotInfo, hashedSnapshot.ordinal)(
-                                                globalStateProofSelector,
-                                                withdrawalTimeLimit
-                                              )
-                                            _ <- services.consensus.manager
-                                              .startFacilitatingAfterRollback(
+                                          _ <- services.consensus.manager
+                                            .startFacilitatingAfterRollback(
+                                              signedFirstIncrementalSnapshot.ordinal,
+                                              GlobalConsensusOutcome(
                                                 signedFirstIncrementalSnapshot.ordinal,
-                                                GlobalConsensusOutcome(
-                                                  signedFirstIncrementalSnapshot.ordinal,
-                                                  Facilitators(List(nodeId)),
-                                                  RemovedFacilitators.empty,
-                                                  WithdrawnFacilitators.empty,
-                                                  EligibleFacilitators.empty,
-                                                  Finished(
-                                                    signedFirstIncrementalSnapshot,
-                                                    hashedGenesis.info.toGlobalSnapshotInfo,
-                                                    EventTrigger,
-                                                    Candidates.empty,
-                                                    Hash.empty,
-                                                    hashedSnapshot.hash
-                                                  )
+                                                Facilitators(List(nodeId)),
+                                                RemovedFacilitators.empty,
+                                                WithdrawnFacilitators.empty,
+                                                EligibleFacilitators.empty,
+                                                Finished(
+                                                  signedFirstIncrementalSnapshot,
+                                                  globalSnapshotInfo,
+                                                  EventTrigger,
+                                                  Candidates.empty,
+                                                  Hash.empty,
+                                                  hashedSnapshot.hash
                                                 )
                                               )
-                                          } yield ()
-                                      }
+                                            )
+                                        } yield ()
                                     }
-                                }
-                            }
+                                  }
+                              }
                           }
                         }
                     }
