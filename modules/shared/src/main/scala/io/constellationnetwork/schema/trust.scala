@@ -9,12 +9,7 @@ import eu.timepit.refined.numeric.Interval
 import eu.timepit.refined.refineV
 import fs2.data.csv.{CellDecoder, DecoderError}
 
-/** Remaining refined-Double type aliases used for non-consensus weighting (seedlist `bias`, weighted-sampling primitive).
-  *
-  * Historical context: this object once carried the TrustStorage / l0Trust scoring stack. That mechanism was never wired into consensus and
-  * was removed wholesale. Only the primitive `TrustValueRefined` type alias remains because the seedlist still uses a closed `[-1.0, 1.0]`
-  * bias column. The name is kept to avoid churning the CSV format and refined evidence.
-  */
+/** Refined `[-1.0, 1.0]` Double used by the seedlist `bias` column. */
 object trust {
 
   type TrustValueRefinement = Interval.Closed[-1.0, 1.0]

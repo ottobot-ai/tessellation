@@ -38,9 +38,6 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *   1. Filter ready peers and uniformly sample up to `maxSampleSize` candidates. 2. Query each candidate's latest snapshot ordinal; the
   *      most popular ordinal becomes `majorityOrdinal`. 3. Query each candidate's snapshot hash at `majorityOrdinal`; the largest
   *      hash-equivalence class wins. 4. Pick one peer uniformly at random from the winning class.
-  *
-  * History: previously this module fed peer weights from a TrustStorage/l0Trust scoring stack; that machinery was never wired into
-  * consensus and was removed. Selection is now purely uniform sampling + majority consensus on ordinals/hashes.
   */
 object PeerSelect {
   val peerSelectLoggerName = "PeerSelectLogger"

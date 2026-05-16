@@ -271,7 +271,6 @@ sealed abstract class HttpApi[
                 walletRoutes.publicRoutes <+>
                 nodeRoutes.publicRoutes <+>
                 consensusInfoRoutes.publicRoutes <+>
-                // trustRoutes.publicRoutes <+>   // disabled — not used on GL0
                 allowSpendRoutes.publicRoutes <+>
                 tokenLockRoutes.publicRoutes <+>
                 tokenLockBlockRoutes.publicRoutes <+>
@@ -296,7 +295,6 @@ sealed abstract class HttpApi[
               PeerAuthMiddleware.requestCollateralVerifierMiddleware(services.collateral)(
                 clusterRoutes.p2pRoutes <+>
                   nodeRoutes.p2pRoutes <+>
-                  // trustRoutes.p2pRoutes <+>   // disabled — not used on GL0
                   snapshotRoutes.p2pRoutes <+>
                   bftP2pRoutes
               )
@@ -307,7 +305,6 @@ sealed abstract class HttpApi[
 
   private val cliRoutes: HttpRoutes[F] =
     clusterRoutes.cliRoutes
-  // trustRoutes.cliRoutes — disabled — not used on GL0
 
   private val loggers: HttpApp[F] => HttpApp[F] = { http: HttpApp[F] =>
     RequestLogger.httpApp(logHeaders = true, logBody = false)(http)

@@ -58,7 +58,6 @@ object internal {
       :: Equal["/consensus"]
       :: Equal["/state-channels"]
       :: Equal["/construction"]
-      :: Equal["/trust"]
       :: Equal["/debug"]
       :: Equal["/node"]
       :: Equal["/node-params"]
