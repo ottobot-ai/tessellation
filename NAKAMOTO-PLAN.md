@@ -1,9 +1,23 @@
 # Nakamoto — Active Work Plan
 
 **Branch:** `feature/serde-typeclass-shim`
-**Last updated:** 2026-05-15 (finality-trigger stack landed — `FinalityTrigger[F]` typeclass, `T_count`, `T_depth2`, attestation skew bound, chain-quality observable + HTTP route, overlay `pruneBelow`)
+**Last updated:** 2026-05-16 (post-validation roadmap split out to companion doc — see Forward roadmap below)
 
-Companion to `NAKAMOTO-TODO.md` (full backlog). This file tracks the in-flight workstream toward metagraph end-to-end on Nakamoto GL0.
+Companion to `NAKAMOTO-TODO.md` (full backlog) and `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` (forward roadmap — stake-weighted VRF + KES + Avalanche + NIPoPoW + cross-shard mitigation, sequenced by dependency). This file tracks the in-flight workstream toward metagraph end-to-end on Nakamoto GL0; the companion file sequences the post-empirical-validation implementation phases.
+
+## Forward roadmap (2026-05-16)
+
+The implementation work that remains after the finality-trigger stack + GKL composition doc + empirical sim validation lives in **`docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md`**. Phases:
+
+1. **§1.1 Stake-weighted VRF** (parallel track, 5-8 d) — combined `delegatedStake + nodeCollateral` weighting; foundation for §3, §4.A.
+2. **§1.2 KES port from Bifrost** (parallel track, 15-25 d) — forward-secure signatures; prerequisite for §3, §4.C.
+3. **§2 Avalanche-attestation cascade** (independent, 12-18 d) — Snowball `(K=8, α=5, β=10, Δ=slot/2)`; production parameters empirically validated.
+4. **§3 NIPoPoW level-µ chains** (needs §1.1+§1.2, 20-30 d) — `L = 10` domain-separated VRF trials per slot; tower anchored at `T_depth2`.
+5. **§4.A Cross-shard Option A** (needs §1.1, 12-18 d) — VRF-sortition of operator keys to shards; gates `StateChannelValidator.validateAllowedSignatures`.
+6. **§4.C Cross-shard Option C** (needs §1.2+§4.A, 15-25 d) — slashing of `nodeCollateral` on detected equivocation; KES-anchored evidence non-repudiation.
+7. **§5 Sharding proper** — out of scope; strictly gated on §4.A+§4.C in production (per `GKL-COMPOSITION.md` §5.2, `α_total > 1/(2S)` collapse threshold).
+
+Critical path: §1.2 → §3 → §4.C ≈ 50-80 person-days. Whole-roadmap sequential: 79-124 person-days. Process rule introduced: empirical validation must precede doc commitment (§0.4 / §6.3 of the companion).
 
 ---
 
