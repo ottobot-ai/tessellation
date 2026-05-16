@@ -22,22 +22,19 @@ import io.constellationnetwork.security.key.{ECDSA, secp256k}
 import eu.timepit.refined.refineV
 import eu.timepit.refined.types.numeric.NonNegLong
 
-/** Tier-1 test-vector generator. Emits a byte-deterministic `l0-genesis.json` for a given seed +
-  * flag set. See `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` §1.1 and
-  * `project_test_vector_pattern` memory for the design rationale (genesis-template + generator +
-  * fixture library, mirroring Cardano's `cardano-cli genesis create-cardano`).
+/** Tier-1 test-vector generator. Emits a byte-deterministic `l0-genesis.json` for a given seed + flag set. See
+  * `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` §1.1 and `project_test_vector_pattern` memory for the design rationale
+  * (genesis-template + generator + fixture library, mirroring Cardano's `cardano-cli genesis create-cardano`).
   *
-  * Determinism contract: for a given (seed, flag-set), the emitted JSON file is byte-identical
-  * across runs. ECDSA signatures are NOT deterministic in this codebase — see
-  * `L0GenesisLoader` docstring; the fixture stores RAW events plus delegator private-key hex and
-  * signing happens at load time. This means the fixture-on-disk is reproducible, even if the
-  * runtime in-memory `Signed[...]` values aren't byte-equal across cluster restarts.
+  * Determinism contract: for a given (seed, flag-set), the emitted JSON file is byte-identical across runs. ECDSA signatures are NOT
+  * deterministic in this codebase — see `L0GenesisLoader` docstring; the fixture stores RAW events plus delegator private-key hex and
+  * signing happens at load time. This means the fixture-on-disk is reproducible, even if the runtime in-memory `Signed[...]` values aren't
+  * byte-equal across cluster restarts.
   */
 object GenesisGenerator {
 
-  /** Reuses the existing operator credential at `nodes/N/key.p12` when `keysFromDir.isDefined`.
-    * Otherwise generates a fresh keypair via the deterministic SHA1PRNG path so the operator
-    * address + peerId are seed-derived.
+  /** Reuses the existing operator credential at `nodes/N/key.p12` when `keysFromDir.isDefined`. Otherwise generates a fresh keypair via the
+    * deterministic SHA1PRNG path so the operator address + peerId are seed-derived.
     */
   case class GeneratorOpts(
     outputDir: String,
@@ -67,10 +64,9 @@ object GenesisGenerator {
     rng
   }
 
-  /** Deterministic ECDSA key generation. BouncyCastle's `KeyPairGenerator.initialize(spec, rng)`
-    * accepts an arbitrary `SecureRandom` — feeding it a `SHA1PRNG` seeded from the generator
-    * seed gives reproducible public/private bytes. This is the foundation of the byte-determinism
-    * contract for operator + delegator + owner addresses.
+  /** Deterministic ECDSA key generation. BouncyCastle's `KeyPairGenerator.initialize(spec, rng)` accepts an arbitrary `SecureRandom` —
+    * feeding it a `SHA1PRNG` seeded from the generator seed gives reproducible public/private bytes. This is the foundation of the
+    * byte-determinism contract for operator + delegator + owner addresses.
     */
   def deterministicKeyPair[F[_]: Async: SecurityProvider](seed: Long, salt: String): F[KeyPair] =
     Async[F].delay {
@@ -81,19 +77,17 @@ object GenesisGenerator {
       kpg.generateKeyPair()
     }
 
-  /** Synthetic `tokenLockRef` hash derived deterministically from (seed, kind, index). For Tier-1
-    * these references don't have to resolve against `activeTokenLocks` because the
-    * `UpdateDelegatedStakeValidator` only fires on incoming transactions, NOT on already-seeded
-    * `activeDelegatedStakes` records (verified by inspection — `validateCreateDelegatedStake` is
-    * called only from `DelegatedStakesRoutes` and `UpdateDelegatedStakeAcceptanceManager`, both of
-    * which validate `signed` against `lastContext` where `lastContext` IS the seeded GSI).
+  /** Synthetic `tokenLockRef` hash derived deterministically from (seed, kind, index). For Tier-1 these references don't have to resolve
+    * against `activeTokenLocks` because the `UpdateDelegatedStakeValidator` only fires on incoming transactions, NOT on already-seeded
+    * `activeDelegatedStakes` records (verified by inspection — `validateCreateDelegatedStake` is called only from `DelegatedStakesRoutes`
+    * and `UpdateDelegatedStakeAcceptanceManager`, both of which validate `signed` against `lastContext` where `lastContext` IS the seeded
+    * GSI).
     */
   def syntheticTokenLockRef(seed: Long, kind: String, index: Int): Hash =
     Hash.fromBytes(s"$seed|$kind|$index".getBytes("UTF-8"))
 
-  /** Allocate per-operator stake amounts given a relative-weight list and a budget. Uses BigDecimal
-    * arithmetic so the per-operator amounts are deterministic regardless of source order; the
-    * residual (due to integer truncation) goes to operator 0.
+  /** Allocate per-operator stake amounts given a relative-weight list and a budget. Uses BigDecimal arithmetic so the per-operator amounts
+    * are deterministic regardless of source order; the residual (due to integer truncation) goes to operator 0.
     */
   def allocateStakeAmounts(weights: List[BigDecimal], budget: Long): List[Long] = {
     val total = weights.foldLeft(BigDecimal(0))(_ + _)
@@ -105,9 +99,8 @@ object GenesisGenerator {
     }
   }
 
-  /** Build a single `UpdateDelegatedStake.Create` event for a (delegator-address, operator-peerId)
-    * pair. The event carries the seeded amount + synthetic tokenLockRef + empty parent (this is the
-    * first stake for the delegator).
+  /** Build a single `UpdateDelegatedStake.Create` event for a (delegator-address, operator-peerId) pair. The event carries the seeded
+    * amount + synthetic tokenLockRef + empty parent (this is the first stake for the delegator).
     */
   def buildStakeEvent(
     delegatorAddr: Address,
@@ -117,14 +110,15 @@ object GenesisGenerator {
   ): Either[String, UpdateDelegatedStake.Create] =
     for {
       amt <- refineV[eu.timepit.refined.numeric.NonNegative](amountLong)
-    } yield UpdateDelegatedStake.Create(
-      source = delegatorAddr,
-      nodeId = operatorPeerId,
-      amount = DelegatedStakeAmount(NonNegLong.unsafeFrom(amt.value)),
-      fee = DelegatedStakeFee(NonNegLong(0L)),
-      tokenLockRef = tokenLockRef,
-      parent = DelegatedStakeReference.empty
-    )
+    } yield
+      UpdateDelegatedStake.Create(
+        source = delegatorAddr,
+        nodeId = operatorPeerId,
+        amount = DelegatedStakeAmount(NonNegLong.unsafeFrom(amt.value)),
+        fee = DelegatedStakeFee(NonNegLong(0L)),
+        tokenLockRef = tokenLockRef,
+        parent = DelegatedStakeReference.empty
+      )
 
   def buildCollateralEvent(
     ownerAddr: Address,
@@ -134,24 +128,23 @@ object GenesisGenerator {
   ): Either[String, UpdateNodeCollateral.Create] =
     for {
       amt <- refineV[eu.timepit.refined.numeric.NonNegative](amountLong)
-    } yield UpdateNodeCollateral.Create(
-      source = ownerAddr,
-      nodeId = operatorPeerId,
-      amount = NodeCollateralAmount(NonNegLong.unsafeFrom(amt.value)),
-      fee = NodeCollateralFee(NonNegLong(0L)),
-      tokenLockRef = tokenLockRef,
-      parent = NodeCollateralReference.empty
-    )
+    } yield
+      UpdateNodeCollateral.Create(
+        source = ownerAddr,
+        nodeId = operatorPeerId,
+        amount = NodeCollateralAmount(NonNegLong.unsafeFrom(amt.value)),
+        fee = NodeCollateralFee(NonNegLong(0L)),
+        tokenLockRef = tokenLockRef,
+        parent = NodeCollateralReference.empty
+      )
 
-  /** Encode an operator's private key as PKCS8 hex (the format the loader's `keyPairFromHex`
-    * expects). Public key is recoverable from the private key via EC point multiplication, so we
-    * don't need to embed it separately in the fixture.
+  /** Encode an operator's private key as PKCS8 hex (the format the loader's `keyPairFromHex` expects). Public key is recoverable from the
+    * private key via EC point multiplication, so we don't need to embed it separately in the fixture.
     */
   def encodePrivateKey(kp: KeyPair): String = Hex.fromBytes(kp.getPrivate.getEncoded).value
 
-  /** Top-level entry point. Produces `(l0Genesis, optional cl1Genesis)`. The cl1Genesis is
-    * synthesized when `initialBalancesCsv` is supplied; otherwise None (the caller can still
-    * commit the l0-only fixture for stake-distribution regression tests).
+  /** Top-level entry point. Produces `(l0Genesis, optional cl1Genesis)`. The cl1Genesis is synthesized when `initialBalancesCsv` is
+    * supplied; otherwise None (the caller can still commit the l0-only fixture for stake-distribution regression tests).
     */
   def generate[F[_]: Async: SecurityProvider](opts: GeneratorOpts, invocation: String): F[GeneratedOutputs] =
     for {
@@ -204,20 +197,20 @@ object GenesisGenerator {
       }
       nodeCollaterals =
         if (opts.collateralPerOperator <= 0L) List.empty
-        else collateralOwnerKeys.zipWithIndex.flatMap {
-          case (cKp, i) =>
-            val operatorPeerId = PeerId.fromPublic(operatorKeys(i).getPublic)
-            val ownerAddr = cKp.getPublic.toAddress
-            val tokenLockRef = syntheticTokenLockRef(opts.seed, "collateral", i)
-            buildCollateralEvent(ownerAddr, operatorPeerId, opts.collateralPerOperator, tokenLockRef).toOption.map {
-              evt =>
+        else
+          collateralOwnerKeys.zipWithIndex.flatMap {
+            case (cKp, i) =>
+              val operatorPeerId = PeerId.fromPublic(operatorKeys(i).getPublic)
+              val ownerAddr = cKp.getPublic.toAddress
+              val tokenLockRef = syntheticTokenLockRef(opts.seed, "collateral", i)
+              buildCollateralEvent(ownerAddr, operatorPeerId, opts.collateralPerOperator, tokenLockRef).toOption.map { evt =>
                 L0GenesisNodeCollateral(
                   event = evt,
                   ownerPrivateKeyHex = encodePrivateKey(cKp),
                   createdAt = 0L
                 )
-            }
-        }
+              }
+          }
       // Initial balances: explicit CSV entries (if any) + a per-operator allocation matching the
       // genesis-csv legacy convention (100_000_000_000_000 = 1e6 DAG * 1e8 datum) so wallet tests
       // still find money at the operator addresses.

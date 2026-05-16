@@ -22,17 +22,14 @@ import eu.timepit.refined.numeric.NonNegative
 import eu.timepit.refined.refineV
 import eu.timepit.refined.types.numeric.NonNegLong
 
-/** Helper that turns a Tier-1 `L0GenesisData` into a `GlobalSnapshotInfo` overlay. Called from the
-  * dag-l0 `Main.scala` JSON-genesis bootstrap branch AFTER `hashedGenesis.info.toGlobalSnapshotInfo`
-  * is computed — we widen the in-memory GSI with delegated-stake + collateral entries before any
-  * downstream consumer (storages, services) reads it. The on-disk `Signed[GlobalSnapshot]` stays V1
-  * (Option (ii) in the §1.1 plan — lowest blast radius).
+/** Helper that turns a Tier-1 `L0GenesisData` into a `GlobalSnapshotInfo` overlay. Called from the dag-l0 `Main.scala` JSON-genesis
+  * bootstrap branch AFTER `hashedGenesis.info.toGlobalSnapshotInfo` is computed — we widen the in-memory GSI with delegated-stake +
+  * collateral entries before any downstream consumer (storages, services) reads it. The on-disk `Signed[GlobalSnapshot]` stays V1 (Option
+  * (ii) in the §1.1 plan — lowest blast radius).
   *
-  * Signing: ECDSA signatures in this codebase are NOT deterministic
-  * (`Signing.signData` uses an unseeded `SecureRandom`). The fixture file stores the raw event
-  * plus the synthetic delegator's PKCS8 private-key hex; we sign at LOAD time. The signature bytes
-  * vary across loads, but they are always valid (public key recoverable, hash signs OK) and the
-  * VRF stake-weighting reads `amount`, never the signature.
+  * Signing: ECDSA signatures in this codebase are NOT deterministic (`Signing.signData` uses an unseeded `SecureRandom`). The fixture file
+  * stores the raw event plus the synthetic delegator's PKCS8 private-key hex; we sign at LOAD time. The signature bytes vary across loads,
+  * but they are always valid (public key recoverable, hash signs OK) and the VRF stake-weighting reads `amount`, never the signature.
   */
 object L0GenesisLoader {
 
@@ -46,9 +43,9 @@ object L0GenesisLoader {
       kf.generatePrivate(spec)
     }
 
-  /** Recover the public key from the private key. For EC keys produced by `KeyPairGenerator`,
-    * BouncyCastle stores the public point inside the PKCS8 attributes; we reconstruct it via
-    * `BCECPrivateKey.getParameters`. Falls back to ECPublicKeySpec arithmetic if that's unavailable.
+  /** Recover the public key from the private key. For EC keys produced by `KeyPairGenerator`, BouncyCastle stores the public point inside
+    * the PKCS8 attributes; we reconstruct it via `BCECPrivateKey.getParameters`. Falls back to ECPublicKeySpec arithmetic if that's
+    * unavailable.
     */
   private def derivePublicKey[F[_]: Async: SecurityProvider](priv: PrivateKey): F[PublicKey] =
     Async[F].delay {
@@ -69,10 +66,9 @@ object L0GenesisLoader {
       pub <- derivePublicKey[F](priv)
     } yield new KeyPair(pub, priv)
 
-  /** Sign a synthetic delegated-stake event using its embedded delegator private key, then wrap
-    * the result in a runtime `DelegatedStakeRecord`. Defensive: if signing fails (corrupt hex,
-    * wrong curve, etc), the entry is skipped and logged — Tier-1 fixtures are reviewed before
-    * landing so silent-skip on malformed records is the conservative choice.
+  /** Sign a synthetic delegated-stake event using its embedded delegator private key, then wrap the result in a runtime
+    * `DelegatedStakeRecord`. Defensive: if signing fails (corrupt hex, wrong curve, etc), the entry is skipped and logged — Tier-1 fixtures
+    * are reviewed before landing so silent-skip on malformed records is the conservative choice.
     */
   private def signStake[F[_]: Async: Hasher: SecurityProvider](
     s: L0GenesisDelegatedStake
@@ -97,10 +93,9 @@ object L0GenesisLoader {
       }
     }.handleError(_ => Option.empty[(Address, NodeCollateralRecord)])
 
-  /** Augment a base `GlobalSnapshotInfo` (from `GlobalSnapshotInfoV1.toGlobalSnapshotInfo`) with
-    * the delegated-stake records, node-collateral records, and balances declared in an L0 genesis
-    * fixture. Returns a new GSI with `activeDelegatedStakes`, `activeNodeCollaterals`, and
-    * `balances` populated. Other fields (allow-spends, token-locks, etc.) are left at the empty
+  /** Augment a base `GlobalSnapshotInfo` (from `GlobalSnapshotInfoV1.toGlobalSnapshotInfo`) with the delegated-stake records,
+    * node-collateral records, and balances declared in an L0 genesis fixture. Returns a new GSI with `activeDelegatedStakes`,
+    * `activeNodeCollaterals`, and `balances` populated. Other fields (allow-spends, token-locks, etc.) are left at the empty
     * `Some(SortedMap.empty)` produced by `toGlobalSnapshotInfo`.
     */
   def augmentSnapshotInfo[F[_]: Async: Hasher: SecurityProvider](
