@@ -8,10 +8,20 @@ per-shard sub-snapshots via state-channel binaries) against the
 stake-concentration attack derived in
 [`docs/GKL-COMPOSITION.md`](../GKL-COMPOSITION.md) §5.2.
 
+**Revision history:**
+- 2026-05-15 (initial): Recommended Option B (per-shard attestation-set
+  on SC binaries, τ=⅔) as primary defence.
+- 2026-05-15 (patch): User-directed flip from Option B (rejected —
+  modifies metagraph consensus, out of scope) to **Option A
+  (VRF-sortition of operator keys) + Option C (out-of-band slashing)
+  combined defence**. Option B retained in §3 with REJECTED banner for
+  historical record. §5 / §6 / §7 rewritten accordingly.
+
 This document formalises three candidate defences, compares them on the
-load-bearing criteria, and recommends one to prototype first. Code
-locations the recommended option would touch are sketched in §6; the
-detailed implementation work is downstream.
+load-bearing criteria, and recommends the combined Option A + Option C
+defence (Option B rejected by user directive 2026-05-15 — see §3 and
+§5.2 for the rationale). Code locations the chosen options would touch
+are sketched in §6; the detailed implementation work is downstream.
 
 Cross-references:
 - [`docs/GKL-COMPOSITION.md`](../GKL-COMPOSITION.md) (commit `45c97895`) —
@@ -19,15 +29,18 @@ Cross-references:
   `α_total > 1/(2S)` collapse boundary that motivates this proposal.
 - [`docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md`](./AVALANCHE-ATTESTATION-PROPOSAL.md)
   (commit `be1c8250`) — Snowball cascade `(K=3, α_cascade=2, β=10)` and
-  the 4-trigger composition. Option B in this document explicitly
-  composes with that cascade.
+  the 4-trigger composition. Option B (rejected) had composed with that
+  cascade; under the chosen Options A+C, gl0 still runs Snowball at the
+  global layer but does not require shard-internal Snowball quorum on
+  SC binary admission.
 - [`docs/nakamoto/NIPOPOW-PROPOSAL.md`](./NIPOPOW-PROPOSAL.md)
   (commit `bcb42140`) — per-shard NIPoPoW tower; cross-shard tower is
   out of scope here (no cross-shard tower in v1).
 - [`docs/nakamoto/attestation-and-finality.md`](./attestation-and-finality.md)
   — 4-phase model + `T_count` / `T_weight` / `T_depth1` / `T_depth2`
-  trigger stack. The recommendation reuses `T_count` semantics at the
-  per-shard sub-snapshot boundary.
+  trigger stack. Used at gl0 unchanged under Options A + C. (Rejected
+  Option B had proposed extending `T_count` semantics to the per-shard
+  sub-snapshot boundary.)
 - [`modules/node-shared/.../statechannel/StateChannelValidator.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/statechannel/StateChannelValidator.scala)
   — the SC binary admission code path. §1.2 below dissects what it
   currently checks; §6 sketches the touch-points for the recommended
@@ -37,13 +50,17 @@ Cross-references:
   into the next global snapshot.
 - [`modules/shared/.../statechannel/StateChannelSnapshotBinary.scala`](../../modules/shared/src/main/scala/io/constellationnetwork/statechannel/StateChannelSnapshotBinary.scala)
   — the on-the-wire SC binary shape (`lastSnapshotHash`, `content`,
-  `fee`). Option B grows this with an attestation-set field.
+  `fee`). Unchanged under the chosen Options A + C; rejected Option B
+  would have grown this with an attestation-set field.
 - [`modules/node-shared/.../nakamoto/StakeRegistry.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/StakeRegistry.scala)
-  — global validator registry; used by Option A for per-epoch VRF
-  sortition.
+  — global validator registry; relevant if §7.1 picks a stake-weighted
+  sortition unit.
+- [`modules/node-shared/.../nakamoto/EligibilityChecker.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/EligibilityChecker.scala)
+  — canonical VRF + eta-seed pattern reused by Option A's
+  `OperatorShardAssignment`.
 - `:project_sharding_strategic_signals` (memory file) — directive on
   combined `delegated stake + node collateral` as the stake-weight
-  source. Both options A and B inherit this.
+  source. Load-bearing on §7.1 sortition-unit decision under Option A.
 - `~/repos/research-nipopos-2026/sims/cross_shard.py` (branch
   `sim/integration`, commit `913c4a8`) + figures /
   `sims/data/cross_shard_t_count_fixed_30s_concentrated_in_shard_0_S4_slots1000.json` —
@@ -53,29 +70,39 @@ Cross-references:
 
 ## §0 TL;DR
 
-**Recommendation: Option B (per-shard attestation-set on SC binary
-acceptance), tuned to `τ = ⅔` of the shard's active validator quorum,
-composed with the existing Snowball cascade.** Option A
-(VRF-sortition into shards) is too disruptive given Tessellation's
-per-shard operator topology; Option C (slashing/governance) is
-necessary as a deterrent regardless but cannot defend the cross-shard
-CQ bound by itself. Option B reuses primitives the integrated stack
-already has — `T_count`, `StakeRegistry`, the Snowball convergence —
-and makes the structural defence cheap relative to the GKL bound it
-needs to hold.
+**Combined mitigation: Option A (VRF-sortition of operator keys to
+shards) as structural defence + Option C (out-of-band slashing /
+governance) as economic deterrent. Option B (per-shard attestation-set
+on SC binaries) is REJECTED — modifying how metagraphs construct their
+submitted state-channel binaries is out of scope (user directive
+2026-05-15).**
 
 The one-paragraph rationale: under the GKL §5.2 derivation, an
-adversary with global stake `α_total > 1/(2S)` can concentrate into a
-single shard and exceed `α_local > 1/3` in that shard. Option B caps
-the adversary's *effective influence over SC binary acceptance* at the
-shard's quorum requirement: if `τ = ⅔`, an adversary needs `α_local
-> 1/3` of the *shard's signing quorum* — not its block production
-chance — to forge an SC binary gl0 will accept. The cross-shard CQ
-bound becomes the union of per-shard quorum bounds, not the union of
-per-shard production bounds; the two differ by exactly the per-shard
-Snowball CP guarantee already proven in
-[`AVALANCHE-ATTESTATION-PROPOSAL.md`](./AVALANCHE-ATTESTATION-PROPOSAL.md)
-§§6.1 / 0.A.
+adversary holding `α_total > 1/(2S)` global stake can concentrate
+operator keys into one shard and drive `α_local > 1/3` there. **Option
+A** blocks the structural concentration by deciding shard membership
+of operator keys via VRF: the set of operator keys eligible to submit
+SC binaries for a shard at epoch `e` is the deterministic VRF draw
+`VRF(operator_pk, ηₑ) → shard_id`. An adversary controlling `N`
+operator keys cannot place them all in one shard — the assignment is
+the protocol's, not the operator's. The eligible-submitter set
+rotates per epoch. **Option C** provides the economic deterrent: if a
+byzantine operator slips through VRF-sortition at the margin and
+submits divergent state, on-chain equivocation evidence triggers
+slashing of the offending operator's node collateral. KES forward-
+secure signatures are a hard prerequisite for slashing so evidence
+cannot be repudiated by claiming the signing key was rotated after
+the forge. **Why not B:** Option B would require the metagraph
+operator to gather a quorum of shard validators to multi-sign the SC
+binary *before* submitting to gl0. That changes the metagraph's
+submission pipeline — a single-operator-signed binary becomes a
+multi-sig artifact — which is precisely the metagraph-consensus
+modification the user has declared out of scope: *"for metagraph
+security, we leave it to them, if they submit a valid snapshot with
+signatures we accept it. Modifying metagraph consensus is out of
+scope."* The structural-vs-deterrent split (A + C) substitutes for
+the rejected attestation-set approach (B) by moving the defence
+entirely to gl0's admission and post-hoc enforcement layers.
 
 ---
 
@@ -257,19 +284,39 @@ each shard.
 
 ### 2.5 Verdict
 
-Option A solves the §1.1 problem at the cost of a fundamental change
-to Tessellation's operator topology. The "operators choose which
-metagraphs to run" model is load-bearing for the current
-metagraph-as-business-unit framing (`:reference_pacaswap_multimetagraph`).
-Disrupting it is feasible but a multi-quarter workstream of its own,
-and it interacts with KES rollout, the two-tier stake model, and the
-metagraph-genesis flow in ways not yet enumerated.
+Option A solves the §1.1 problem by structural construction: an
+adversary cannot place operator keys in the shard of its choosing,
+because the assignment is VRF-determined. The cost is operator-
+topology disruption — the "operators choose which metagraphs to run"
+model is load-bearing for the current metagraph-as-business-unit
+framing (`:reference_pacaswap_multimetagraph`) and Option A modifies
+that framing at the *sortition unit* (whose keys are eligible to
+submit binaries for which shard at which epoch). It interacts with
+KES rollout, the two-tier stake model, and the metagraph-genesis flow
+in ways §7 enumerates.
 
-**Status: candidate, but not recommended as first prototype.**
+**Status: chosen (combined with Option C — see §0 and §5).** The
+2026-05-15 user directive selected Option A as the structural defence
+on the explicit grounds that modifying metagraph consensus (Option B)
+is out of scope.
 
 ---
 
-## §3 Option B — Per-shard attestation-set on SC binary admission
+## §3 Option B: Per-shard attestation-set on SC binaries — **REJECTED**
+
+### 3.0 Why rejected (user directive 2026-05-15)
+
+Option B requires the metagraph's L0 operator to coordinate a quorum
+of shard validators to multi-sign the SC binary **before** posting it
+to gl0. That changes the metagraph's submission pipeline, turning a
+single-operator-signed binary into a multi-sig artifact and adding a
+shard-internal consensus round to the metagraph's path. Per user
+directive: *"for metagraph security, we leave it to them, if they
+submit a valid snapshot with signatures we accept it. Modifying
+metagraph consensus is out of scope."* Option B is therefore rejected.
+The remainder of this section is retained for historical record and
+counterfactual reference; the analysis below was the prior
+recommendation before the 2026-05-15 patch.
 
 ### 3.1 Design
 
@@ -484,15 +531,16 @@ the signing key was rotated between forge and detection).
 
 ### 4.4 Status
 
-**Necessary as a deterrent layer, regardless of which structural
-defence (A or B) is chosen.** An adversary willing to lose collateral
-can still exploit a structural-defence gap if there is one;
-conversely, a structural defence with no economic backing risks a
-permissionless adversary using throwaway keys. The two are
-complementary, not alternative.
+**Chosen, in combination with Option A.** Per the 2026-05-15 user
+directive, Option C is the economic-deterrent half of the combined
+defence. Option A blocks the structural concentration by VRF-assigning
+operator keys to shards; Option C deters the residual marginal attacks
+(adversary keys that happen to land in the target shard by VRF luck)
+by slashing operator collateral on detected divergence. KES forward-
+security is the hard prerequisite for evidence non-repudiation.
 
-**Status: recommended as a follow-on workstream, sequenced after
-Option B prototype and after KES port.**
+**Status: chosen. Sequenced after Option A baseline and after KES
+port.**
 
 ---
 
@@ -500,96 +548,130 @@ Option B prototype and after KES port.**
 
 ### 5.1 Choice
 
-**Prototype Option B first.** Sequence:
+**Option A (VRF-sortition of operator keys to shards) as structural
+defence, combined with Option C (out-of-band slashing of node
+collateral) as economic deterrent. Option B is REJECTED.**
 
-1. **B0** — extend `StateChannelSnapshotBinary` envelope to carry a
-   multi-proof set + a shard-id tag. No verification change yet;
-   binary still admits on single-signature semantics. (~2 weeks)
-2. **B1** — extend
-   [`StakeRegistry`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/StakeRegistry.scala)
-   with `shardValidators(shardId): F[Set[PeerId]]`, populated from
-   per-metagraph `activeDelegatedStakes` / `activeNodeCollaterals`.
-   (~2 weeks)
-3. **B2** — extend `StateChannelValidator.validateAllowedSignatures`
-   to gate on `isQuorate(τ = ⅔)` against the shard validator set.
-   Gate behind a config flag for staged rollout. (~3 weeks)
-4. **B3** — wire the shard's L0 operator to collect Snowball-decided
-   attestations and submit once `τ` is cleared. Reuse the existing
-   `TipTracker` aggregation primitive. (~3 weeks)
-5. **B4** — flip the config flag on a metagraph-by-metagraph basis;
-   measure per-binary verification cost, SC binary size, end-to-end
-   latency. (~2 weeks)
+The two chosen options play complementary roles:
 
-After B, sequence the KES port (`:project_kes_port_constraints`) and
-Option C slashing on top.
+- **Option A — structural defence.** The set of operator keys that
+  can submit SC binaries for a given shard at epoch `e` is
+  determined by VRF on `(operator_pk, ηₑ)`, not by operator choice.
+  An adversary controlling `N` operator keys cannot concentrate them
+  all into one shard because the assignment is deterministic and
+  the protocol's — not the operator's. The eligible-submitter set
+  rotates per epoch on the same eta-rotation cadence as gl0's
+  slot-leader eligibility (see
+  [`EligibilityChecker.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/EligibilityChecker.scala)
+  for the VRF pattern to reuse). At gl0, SC binary admission is
+  gated by a VRF-eligibility check at
+  [`StateChannelValidator.validateAllowedSignatures`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/statechannel/StateChannelValidator.scala)
+  (currently lines `164-167`) — the operator key signing the binary
+  must be VRF-eligible for the target shard at the current epoch.
+- **Option C — economic deterrent.** If a byzantine operator slips
+  through the VRF lottery (rare, but possible at the margin) and
+  submits divergent state, the operator's node collateral is slashed
+  via on-chain equivocation proof. KES forward-secure signatures
+  (`:project_kes_port_constraints`) are the hard prerequisite — a
+  slashed operator must not be able to repudiate evidence by claiming
+  the signing key was rotated post-forge.
 
-### 5.2 Rationale
+**Together: A blocks the structural concentration attack at the
+admission boundary; C deters the residual marginal attacks by
+imposing economic loss on detected divergence. The combination
+substitutes for the rejected attestation-set approach (B), moving the
+defence entirely to gl0's VRF-eligibility check and the post-hoc
+slashing pipeline — no change to the metagraph's SC binary
+construction.**
 
-- **Composes with the integrated stack.** Option B reuses Snowball
-  convergence, `T_count` quorum semantics, the `StakeRegistry`
-  abstraction, and the `Signed[_]` multi-proof primitive. Nothing
-  novel at the cryptographic layer.
-- **Defends the GKL §5.2 bound.** The new bound is `α_total ≤ 1/3`
-  under any distribution — restoring the single-chain bound for the
-  cross-shard composition. This is the load-bearing safety property
-  the GKL doc identified as missing.
-- **No operator-topology disruption.** Operators continue to choose
-  which metagraphs to operate; delegated-stake math is unchanged;
-  the metagraph-as-business-unit framing is preserved.
-- **Detection comes for free.** A shard that *cannot* reach quorum
-  is visible at gl0 as a rejection event — slashing evidence for
-  Option C is the natural output, not an additional construction.
-- **Bounded engineering surface.** The total touch-set is ~5 files
-  in `node-shared` + ~2 in `shared` + the per-shard aggregator wire
-  on `dag-l0`. Smaller than Option A (which rewrites the
-  metagraph-registration flow) and smaller than Option C (which
-  requires KES + fraud-proof construction).
+### 5.2 Why Option B is rejected
 
-### 5.3 What we are explicitly **not** committing to
+Option B would require the metagraph's L0 operator to coordinate a
+quorum of shard validators to multi-sign the SC binary **before**
+posting it to gl0. The wire artifact would mutate from a single-
+operator-signed binary to a multi-sig artifact, and the metagraph's
+submission pipeline would gain a shard-internal consensus round (the
+operator must collect Snowball-decided attestations, sum stake against
+τ, then post).
 
-- An implementation. This is a design proposal; B0..B4 are sizing
+Per the user directive (2026-05-15): *"for metagraph security, we
+leave it to them, if they submit a valid snapshot with signatures we
+accept it. Modifying metagraph consensus is out of scope."* Option B
+is therefore out of scope; the structural defence must live entirely
+on the gl0 side. Option A satisfies that constraint (VRF-eligibility
+is a gl0 admission check; the metagraph's submission pipeline is
+unchanged — still a single operator signature).
+
+### 5.3 Sequencing
+
+1. **A0** — VRF-sortition design freeze: pick sortition unit
+   (per-operator vs per-validator vs hybrid — see §7.1), epoch length
+   `E` (see §7.3), and shard count `S` baseline. Closes via decision
+   in §7.
+2. **A1** — `OperatorShardAssignment` service in
+   `node-shared/.../domain/sharding/` (location TBD pending the
+   broader sharding skeleton). Reuses the VRF + eta pattern from
+   [`EligibilityChecker.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/EligibilityChecker.scala).
+3. **A2** — `StateChannelValidator` gains a `validateShardEligibility`
+   step at `validateAllowedSignatures` (lines `164-167`); behind a
+   staged-rollout config flag.
+4. **C0** — KES port (`:project_kes_port_constraints`) — hard
+   prerequisite for C1.
+5. **C1** — Equivocation detector at gl0: monitors for two SC binaries
+   from same operator key at same shard slot with different state
+   hashes; emits a slashing-evidence packet.
+6. **C2** — Slashing pipeline: on-chain consumption of evidence
+   packets; node-collateral burn / governance pause.
+
+### 5.4 What we are explicitly **not** committing to
+
+- An implementation. This is a design proposal; A0..C2 are sizing
   estimates, not a project plan.
-- The exact aggregation primitive. Multi-`SignatureProof` set is the
-  default; if shard validator counts grow beyond ~30 we may want to
-  upgrade to BLS aggregate, but only with a separate proposal.
-- The "per-shard `T_depth1` fallback" detail (§7.2 — open).
+- The exact slashing magnitude. Open — see §7.4.
 - The cross-shard NIPoPoW story. Out of scope; per-shard NIPoPoW
   remains as in [`NIPOPOW-PROPOSAL.md`](./NIPOPOW-PROPOSAL.md).
+- Any change to metagraph consensus or the SC binary construction
+  pipeline. Out of scope by user directive (see §5.2).
 
 ---
 
-## §6 Implementation skeleton (Option B)
+## §6 Implementation skeleton (Options A + C)
 
-This section sketches the code-level surface for Option B as a
-reviewer aid. None of this is committed in this document.
+This section sketches the code-level surface for the chosen combined
+defence as a reviewer aid. None of this is committed in this
+document. Option B's implementation skeleton has been removed —
+see §3 (Option B is rejected).
 
-### 6.1 Wire-level changes
+### 6.1 Option A — VRF-sortition of operator keys to shards
 
-[`modules/shared/src/main/scala/io/constellationnetwork/statechannel/StateChannelSnapshotBinary.scala`](../../modules/shared/src/main/scala/io/constellationnetwork/statechannel/StateChannelSnapshotBinary.scala)
+#### 6.1.1 New service: `OperatorShardAssignment`
+
+Location: `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/sharding/`
+(directory does not yet exist; created with the broader sharding
+skeleton).
 
 ```scala
-// today
-case class StateChannelSnapshotBinary(
-  lastSnapshotHash: Hash,
-  content: Array[Byte],
-  fee: SnapshotFee
-)
+trait OperatorShardAssignment[F[_]] {
+  /** VRF-derived assignment: returns the shard the operator key is
+    * eligible to submit binaries for at epoch `e`. */
+  def assignmentFor(operatorPk: PublicKey, epoch: EpochProgress): F[ShardId]
+
+  /** Inverse view: returns the set of operator keys eligible to
+    * submit binaries for `shard` at epoch `e`. */
+  def eligibleOperators(shard: ShardId, epoch: EpochProgress): F[Set[PublicKey]]
+
+  /** Predicate used by the gl0 validator. */
+  def isEligible(operatorPk: PublicKey, shard: ShardId, epoch: EpochProgress): F[Boolean]
+}
 ```
 
-The wire shape is unchanged at the binary level; the multi-proof
-support lives in the existing `Signed[_]` envelope (`proofs:
-NonEmptySet[SignatureProof]`). The codec at
-[`modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/StateChannelSnapshotBinaryCodec.scala`](../../modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/StateChannelSnapshotBinaryCodec.scala)
-does not need to change.
+VRF input: `(operator_pk, ηₑ ‖ "SHARD-ASSIGN")`. ηₑ is the eta-seed
+for epoch `e`, the same seed the gl0 LDD slot-leader election uses.
+See [`EligibilityChecker.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/EligibilityChecker.scala)
+for the canonical VRF pattern to reuse. Output: a deterministic
+shard index in `[0, S)`.
 
-What needs adding is a **shard-id tag** so gl0 can look up the
-correct shard validator set. Today the shard is implicit in the
-binary's `address` (the metagraph's address), so the lookup key is
-`address → shardId → validatorSet`. The `address → shardId` map
-already exists implicitly via per-metagraph
-`stateChannelAllowanceLists`.
-
-### 6.2 Validator-side change
+#### 6.1.2 Admission gate at `StateChannelValidator`
 
 [`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/statechannel/StateChannelValidator.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/statechannel/StateChannelValidator.scala)
 
@@ -604,85 +686,104 @@ validateSignaturesWithSeedlist(stateChannelOutput.snapshotBinary)
 Add a fourth step:
 
 ```scala
-  .andThen(_ => validateShardQuorum(stateChannelOutput, stakeRegistry, τ))
+  .andThen(_ => validateShardEligibility(stateChannelOutput, operatorShardAssignment, currentEpoch))
 ```
 
-where `validateShardQuorum` computes the attester-stake sum against
-the shard's active validator set, gated by `τ = ⅔` of the shard's
-total stake.
+where `validateShardEligibility` extracts the operator's `PublicKey`
+from the binary's signing proof, resolves the binary's target shard
+from `stateChannelOutput.address`, and asks
+`OperatorShardAssignment.isEligible` for the current epoch. Rejection
+on `false`.
 
-The constructor at `StateChannelValidator.make` (line 84) gains a
-`stakeRegistry: StakeRegistry[F]` parameter; wired through
-[`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/modules/SharedValidators.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/modules/SharedValidators.scala)
-at construction.
+The constructor at `StateChannelValidator.make` (line 84) gains an
+`operatorShardAssignment: OperatorShardAssignment[F]` parameter and
+an `epochProgressR: F[EpochProgress]` reader, both wired through
+[`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/modules/SharedValidators.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/modules/SharedValidators.scala).
 
-### 6.3 Stake-registry extension
+#### 6.1.3 Epoch boundary
 
-[`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/StakeRegistry.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/StakeRegistry.scala)
+Epoch length `E` is open (see §7.3). Default candidate: tie to the
+existing eta-rotation `R = 2550` snapshots (≈ 1 day at 7s cadence) to
+avoid introducing a new rotation period. Short `E` → less time for
+adversary stake re-accumulation; long `E` → less assignment churn.
 
-Add a shard-scoped view:
+#### 6.1.4 Address → shard mapping
+
+The binary's target shard is resolved from
+`stateChannelOutput.address` (the metagraph address). Open whether
+this is a 1:1 (address ↔ shard) mapping or whether large metagraphs
+span multiple shards. For v1 assume 1:1; revisit in the broader
+sharding plan.
+
+#### 6.1.5 Config knobs
+
+```
+NAKAMOTO_SHARD_VRF_EPOCH_LEN_SNAPSHOTS = 2550   // ηₑ rotation cadence
+NAKAMOTO_SHARD_COUNT_S                  = 4     // baseline; see §1
+NAKAMOTO_SHARD_VRF_ELIGIBILITY_GATE     = on|off  // staged rollout
+```
+
+### 6.2 Option C — slashing of node collateral on detected divergence
+
+#### 6.2.1 Detection at gl0
+
+The detector observes the SC binary stream entering
+[`GlobalSnapshotStateChannelAcceptanceManager.accept`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotStateChannelAcceptanceManager.scala)
+and flags any pair `(b₁, b₂)` such that:
+
+- both are signed by the **same operator public key**, and
+- both target the **same shard slot** (`address`, `parent.lastSnapshotHash`,
+  or equivalent canonical shard-ordinal key), and
+- they carry **different state hashes** (`content` digest or
+  `lastSnapshotHash` of a downstream binary that anchors to them).
+
+This is an equivocation event. Both binaries are retained as
+evidence.
+
+#### 6.2.2 Slashing-evidence packet
 
 ```scala
-trait StakeRegistry[F[_]] {
-  // existing global view
-  def relativeStake(peerId: PeerId): F[Ratio]
-  def allStakes: F[Map[PeerId, Ratio]]
-  def validatorCount: F[Int]
-
-  // new shard-scoped view
-  def shardValidators(shard: Address): F[Set[PeerId]]
-  def shardRelativeStake(shard: Address, peerId: PeerId): F[Ratio]
-  def shardTotalStake(shard: Address): F[Ratio]
-}
+case class StateChannelEquivocationEvidence(
+  operator: PublicKey,
+  shard: ShardId,
+  epoch: EpochProgress,
+  binaryA: Signed[StateChannelSnapshotBinary],
+  binaryB: Signed[StateChannelSnapshotBinary],
+  kesProof: KesEvolutionProof  // proves both signatures predate any key rotation
+)
 ```
 
-The `Address` here is the metagraph's address — i.e. the existing
-shard identifier in the SC binary world.
+Both signatures are verifiable against `operator`; the KES evolution
+proof witnesses that the operator could not have rotated keys
+between the two signings. KES is the hard prerequisite — see
+`:project_kes_port_constraints`.
 
-### 6.4 Aggregator-side change (shard's L0 operator)
+#### 6.2.3 Slashing pipeline
 
-The shard's
-[`BinaryPoster`](../../modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/snapshot/services/BinaryPoster.scala)
-moves from "post on operator signature" to "post when attestation set
-clears τ":
+On evidence acceptance: the offending operator's node collateral is
+slashed (magnitude TBD — see §7.4) and the operator is optionally
+paused pending governance review. Slashed collateral may be burned
+or redistributed to honest validators in the same shard. The
+mechanics integrate with the existing `nodeCollateral` accounting in
+per-metagraph state.
 
-1. The shard's `SnapshotLeaderLoop`-equivalent runs the Snowball
-   cascade on each new sub-snapshot ordinal.
-2. On decision, each validator broadcasts a signed attestation
-   (existing `TipAttestation` gossip path).
-3. The L0 operator collects attestations into a quorum set; when
-   `Σ attesterStake ≥ τ × shardTotalStake`, the operator assembles
-   the multi-proof `Signed[StateChannelSnapshotBinary]` and posts to
-   gl0.
-
-The `TipTracker.recordAttestation` primitive already handles
-per-ordinal newer-wins aggregation; the quorum-extraction step is the
-new logic.
-
-### 6.5 Acceptance-manager change (gl0)
-
-[`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotStateChannelAcceptanceManager.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotStateChannelAcceptanceManager.scala)
-
-No structural change — the manager continues to first-sight-register
-binaries keyed on `(address, parent.lastSnapshotHash)`. The
-quorum check happens upstream in `StateChannelService.process` (line
-`62`, `stateChannelValidator.validate`).
-
-### 6.6 Config knobs
-
-Following the
-[`AVALANCHE-ATTESTATION-PROPOSAL.md`](./AVALANCHE-ATTESTATION-PROPOSAL.md) §2.5
-pattern (numerator/denominator integer pairs for grinding-resistance):
+#### 6.2.4 Config knobs
 
 ```
-NAKAMOTO_SHARD_QUORUM_NUM   = 2
-NAKAMOTO_SHARD_QUORUM_DEN   = 3
-NAKAMOTO_SHARD_QUORUM_GATE  = on | off  // staged rollout flag
-NAKAMOTO_SHARD_QUORUM_TIMEOUT_TICKS = 5  // multiples of finality-monitor tick
+NAKAMOTO_SLASHING_MAGNITUDE_PCT       = TBD   // see §7.4
+NAKAMOTO_SLASHING_GATE                = on|off
+NAKAMOTO_SLASHING_GOVERNANCE_PAUSE    = on|off
 ```
 
-Defaults sourced from a `ShardQuorumConfig.Default` matching the
-`LddConfig.Default` pattern.
+### 6.3 What was removed
+
+The earlier draft sketched Option B implementation: shard-quorum
+aggregation, multi-proof SC binary wire shape, per-shard
+`StakeRegistry.shardValidators`, and shard-internal Snowball
+attestation collection. All of that is **removed** — Option B was
+rejected (see §3). The metagraph's SC binary submission pipeline is
+unchanged under the chosen Options A + C; the defence lives entirely
+on the gl0 admission and slashing layers.
 
 ---
 
@@ -691,103 +792,139 @@ Defaults sourced from a `ShardQuorumConfig.Default` matching the
 These are flagged for the implementation workstream and the
 Tier-2 sharding plan. This document does not attempt to close them.
 
-### 7.1 Sortition unit (Option A residual)
+### 7.1 Sortition unit — **load-bearing under Options A + C**
 
-Even if Option B is the recommended structural defence, **shard
-membership** must be defined for `StakeRegistry.shardValidators`. Two
-candidates:
+Under the chosen design the VRF-sortition input determines what kind
+of key is assigned to a shard. Per user directive (2026-05-15), the
+default is **per-operator-key** sortition: each operator public key
+draws its eligible shard from `VRF(operator_pk, ηₑ)`. But the two-
+tier stake model from `:project_sharding_strategic_signals` — combined
+**delegated stake + node collateral** — may push toward a finer-
+grained unit. Three candidates:
 
-- **Static, operator-elected.** Operators declare per-metagraph
-  participation at registration; the shard validator set is the
-  declared participants. Simple; matches today's "operators choose
-  metagraphs" model. Concentration is possible if operators
-  collude.
-- **VRF-sortitioned per epoch.** Option A applied at the shard
-  validator-set boundary only — operators run nodes for all
-  metagraphs but only validate a VRF-assigned subset per epoch.
-  Splits the difference between A and B.
+- **Per-operator-key (default).** Sortition input is the operator's
+  L0 signing public key. Simplest; matches the directive's plain
+  reading. Concentration is structurally blocked at the eligible-
+  submitter set; an operator with N keys cannot place them all into
+  one shard.
+- **Per-validator (delegated-stake-weighted).** Sortition input is a
+  (validator, operator) tuple; eligibility is weighted by delegated
+  stake. Aligns the two-tier model: delegators staking to operator
+  `O` indirectly influence shard assignment.
+- **Hybrid.** Operators declare eligibility at registration time; VRF
+  picks the *active subset* of eligible operators per epoch per
+  shard. Lets operators opt into shards they have infrastructure
+  for, while preserving per-epoch VRF rotation.
 
-A hybrid is plausible: operators declare *eligibility*, the protocol
-samples *active set* via VRF, the active set runs Snowball + posts
-the quorum. **Open.**
+**Needs decision before A0.** The two-tier-stake interaction is the
+load-bearing constraint; see `:project_sharding_strategic_signals`.
 
 ### 7.2 `T_depth1` fallback at the per-shard sub-snapshot boundary
 
-If the shard partitions and cannot reach `τ` for an extended period,
-the shard's state is stuck. The current `T_depth1` at gl0 handles
-this *for gl0 itself*; for the per-shard sub-snapshot, an analogous
-structural-depth fallback is needed. Options:
+If a shard's elected operator key is offline or its VRF-eligible
+set is degenerate (no live key) for an extended period, the shard's
+state cannot advance. The current `T_depth1` at gl0 handles this
+*for gl0 itself*; for the per-shard sub-snapshot, an analogous
+structural fallback is needed. Options:
 
-- **Operator-only fallback after timeout.** After `T` ticks without
-  quorum, allow the operator to post a single-signature SC binary
-  marked `T_depth1-only`; gl0 admits but does **not** count it
-  toward cross-shard CQ. The shard state advances; downstream users
-  treat it as "unconfirmed" until the partition heals.
+- **Wider VRF assignment after timeout.** After `T` epochs without a
+  binary from any VRF-eligible operator, broaden eligibility to the
+  next-epoch set (or to the global operator set). Live but with
+  reduced concentration resistance until the partition heals.
 - **Structural-depth proof.** The operator posts an SC binary plus
   a per-shard NIPoPoW header proving the sub-snapshot is depth-`k₁`
   deep in the shard's chain; gl0 admits on that proof in lieu of
-  quorum. Cleaner but requires per-shard NIPoPoW first.
+  eligibility. Cleaner but requires per-shard NIPoPoW first.
 
-**Open. Recommended path: operator-only fallback for v1; structural-
+**Open. Recommended path: wider VRF assignment for v1; structural-
 depth proof later.**
 
-### 7.3 Quorum threshold sensitivity
+### 7.3 VRF-sortition epoch length `E`
 
-`τ = ⅔` matches `T_count`. But `T_count` thresholds are tuned to gl0
-cluster sizes (currently ~3-8 active validators per
-`:project_iter37_8node_validated`). At larger shard counts (~30+
-validators per shard) the optimal `τ` may differ; we may want
-`τ = 1/2 + ε` for liveness or `τ = 3/4` for stricter safety.
+How long is each epoch over which a fixed VRF-shard-assignment holds?
+Default candidate: tie to the eta-rotation `R = 2550` snapshots
+(≈ 1 day at 7s cadence) so no new rotation cadence is introduced.
+Tradeoff:
 
-**Open. Needs cross-shard sim re-run at variable τ to characterise
-the latency-vs-safety frontier.**
+- **Short `E`.** Less time for an adversary to target a known shard
+  assignment; less time for accumulated stake re-positioning. More
+  assignment churn — operators bootstrap state more often.
+- **Long `E`.** Less churn, simpler operator UX. More time for an
+  adversary to plan around a specific epoch's assignments.
 
-### 7.4 Aggregator-side timing model
+**Open. Needs cross-shard sim re-run at variable `E` to characterise
+the safety-vs-operational-cost frontier. Replaces the earlier "optimal
+τ" question, which is no longer relevant — τ was Option B's quorum
+threshold; rejected.**
 
-Shard's L0 operator becomes the attestation-aggregator. If the
-operator is byzantine (concentration scenario), it can withhold
-honest attestations from the quorum set. The shard is then live but
-producing only adversary-quorum binaries — gl0 rejects them, the
-shard stalls.
+### 7.4 Combined-defence flow: byzantine operator that slips through VRF
 
-This is the correct safety behaviour but raises a liveness question:
-**how do honest validators in a byzantine-operator-controlled shard
-escalate?** Options:
+Under Option A alone, an operator key that is VRF-eligible for a
+shard at epoch `e` can submit any cryptographically valid SC binary
+for that shard — including divergent state. The structural defence
+does **not** prevent this; it only bounds *how many* keys can
+concentrate. A byzantine operator landing in shard `s` is rare per
+key but possible. The combined flow:
 
-- A direct-to-gl0 attestation submission path for shard validators
-  (i.e. validators can submit attestation sets without operator
-  cooperation). Bypasses operator censorship at the cost of more
-  wire traffic.
-- A periodic "operator change" governance trigger if the shard
-  stalls for an extended period.
+1. The byzantine operator submits two divergent SC binaries for the
+   same shard slot (the equivocation that constitutes evidence).
+2. gl0's equivocation detector (§6.2.1) observes both binaries.
+3. The slashing-evidence packet (§6.2.2) is constructed and admitted
+   on-chain.
+4. The operator's node collateral is slashed (§6.2.3); future epochs'
+   VRF-eligibility for that operator's key is unaffected by VRF but
+   the operator no longer has collateral at stake, so the deterrent
+   has bitten.
 
-**Open. Affects the Option C slashing design.**
+This is the residual-attack path Option C is designed to deter.
+
+**Open subquestions:**
+- **Escalation when only one divergent binary is observed (not yet
+  two).** A byzantine operator might submit one divergent binary
+  and never equivocate; gl0 has no on-chain evidence to slash. Cross-
+  shard fraud-proof construction or external monitoring would be
+  needed.
+- **Slashing magnitude.** What fraction of the operator's node
+  collateral is burned per evidenced equivocation? 100% (total burn,
+  maximal deterrent) vs partial-slash with escalation. Open.
+- **Governance escalation.** Should repeated equivocation or a
+  cluster-detected shard stall trigger a governance pause on the
+  operator's metagraph? Open; tied to `:project_sharding_strategic_signals`
+  governance model.
 
 ### 7.5 Interaction with NIPoPoW per-shard tower
 
 Per-shard NIPoPoW tower entries
 ([`NIPOPOW-PROPOSAL.md`](./NIPOPOW-PROPOSAL.md) §2) are produced at
-the shard's sub-snapshot level. Under Option B, a tower entry is
-admitted only if the underlying sub-snapshot's SC binary cleared the
-quorum gate. This naturally lifts the per-shard tower's CP bound to
-the same quorum-gated bound as the cross-shard CQ. The composition
-is clean but worth formalising: a light client verifying a per-shard
-tower entry inherits both `ε_snowball,s` and `ε_quorum,s` at the
-tower-anchored ordinal.
+the shard's sub-snapshot level. Under Options A + C, a tower entry is
+admitted via the standard gl0 path, and the per-shard CP bound the
+tower encodes inherits the VRF-eligibility check (Option A) and the
+slashing-evidence guarantee (Option C). The light-client composition:
+a verifier of a per-shard tower entry can assume the underlying SC
+binary was admitted by a VRF-eligible operator at the entry's epoch,
+and that any divergence would have surfaced slashing evidence at gl0.
 
 **Open in GKL composition doc §6.5.**
 
 ### 7.6 Migration path
 
-Pre-Option-B SC binaries are single-signed. Post-Option-B nodes must
-accept both shapes during rollout (per
-`:project_sharding_strategic_signals` "no backwards-compat constraint
-for sharding" — but the metagraphs themselves are in production and
-re-signing legacy binaries is not free). The staged-rollout flag
-(`NAKAMOTO_SHARD_QUORUM_GATE`) handles the gl0 side; the per-shard
-operator side needs analogous flagging.
+Under the chosen Options A + C, **no migration is needed for the
+metagraph submission pipeline.** SC binaries remain single-operator-
+signed; the wire shape of `StateChannelSnapshotBinary` is unchanged.
+Migration is purely on the gl0 side and consists of two staged
+rollouts:
 
-**Open. Sequence with eventual era-3 hard-fork.**
+- **`NAKAMOTO_SHARD_VRF_ELIGIBILITY_GATE`** — gl0 admission rejects
+  binaries from operator keys not VRF-eligible for the target shard
+  at the current epoch. Staged per-metagraph to allow operators to
+  align infrastructure with assignments.
+- **`NAKAMOTO_SLASHING_GATE`** — gl0 detects equivocations and admits
+  slashing-evidence packets. Requires KES port (see §6.2). Staged
+  after operators have rotated to KES signing keys.
+
+Metagraphs in production continue to operate unchanged on their side;
+the gl0-side gates flip on independently. **Open. Sequence after KES
+port lands.**
 
 ---
 
@@ -795,20 +932,22 @@ operator side needs analogous flagging.
 
 | Doc | Relationship |
 |---|---|
-| [`docs/GKL-COMPOSITION.md`](../GKL-COMPOSITION.md) §5.2 | Derives the `α_total > 1/(2S)` collapse boundary this proposal closes. |
-| [`docs/GKL-COMPOSITION.md`](../GKL-COMPOSITION.md) §5.3 | Cross-shard CP composition — Regime A is the regime Option B preserves at the sub-snapshot boundary. |
+| [`docs/GKL-COMPOSITION.md`](../GKL-COMPOSITION.md) §5.2 | Derives the `α_total > 1/(2S)` collapse boundary this proposal closes via Options A + C. |
+| [`docs/GKL-COMPOSITION.md`](../GKL-COMPOSITION.md) §5.3 | Cross-shard CP composition — the regime preserved by VRF-eligibility (Option A) and slashing-evidence enforcement (Option C) at the gl0 admission boundary. |
 | [`docs/GKL-COMPOSITION.md`](../GKL-COMPOSITION.md) §6.1 | Open question "stake-concentration mitigation" — this proposal is the answer. |
-| [`docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md`](./AVALANCHE-ATTESTATION-PROPOSAL.md) §2 | Snowball cascade Option B reuses at the per-shard layer. |
-| [`docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md`](./AVALANCHE-ATTESTATION-PROPOSAL.md) §0.A | Empirical `(K=3, α_cascade=2, β=10)` operating point Option B inherits. |
-| [`docs/nakamoto/NIPOPOW-PROPOSAL.md`](./NIPOPOW-PROPOSAL.md) §2 | Per-shard tower; §7.5 above sketches the composition. |
-| [`docs/nakamoto/attestation-and-finality.md`](./attestation-and-finality.md) §0.2 | `T_count` quorum semantics Option B applies one level down (sub-snapshot). |
-| [`docs/nakamoto/attestation-and-finality.md`](./attestation-and-finality.md) §0.4 G1 | The `pullFinalityGated` interface Option B extends to gate on shard-quorum. |
-| `:project_sharding_strategic_signals` (memory) | Two-tier stake model (delegated + node collateral) Option B inherits via `StakeRegistry`. |
-| `:project_kes_port_constraints` (memory) | KES port — prerequisite for Option C slashing follow-on. |
-| `~/repos/research-nipopos-2026/sims/cross_shard.py` (branch `sim/integration`, commit `913c4a8`) | Empirical anchor — the simulator that surfaced the §1 gap. The `t_count` gate in the sim is the in-silico version of Option B's `τ`-quorum. |
+| [`docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md`](./AVALANCHE-ATTESTATION-PROPOSAL.md) §2 | Snowball cascade — used by gl0 for global finality. Under the chosen Options A + C it is **not** required at the per-shard layer (would have been under rejected Option B). |
+| [`docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md`](./AVALANCHE-ATTESTATION-PROPOSAL.md) §0.A | Empirical `(K=3, α_cascade=2, β=10)` operating point at the global layer. |
+| [`docs/nakamoto/NIPOPOW-PROPOSAL.md`](./NIPOPOW-PROPOSAL.md) §2 | Per-shard tower; §7.5 above sketches the composition with VRF-eligibility + slashing. |
+| [`docs/nakamoto/attestation-and-finality.md`](./attestation-and-finality.md) §0.2 | `T_count` quorum semantics at gl0 (unchanged). Option B had proposed extending this to the sub-snapshot boundary; rejected. |
+| [`docs/nakamoto/attestation-and-finality.md`](./attestation-and-finality.md) §0.4 G1 | The `pullFinalityGated` interface; remains the gl0-side gate, no extension required under Options A + C. |
+| [`modules/node-shared/.../nakamoto/EligibilityChecker.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/EligibilityChecker.scala) | Canonical VRF + eta-seed pattern Option A's `OperatorShardAssignment` reuses. |
+| `:project_sharding_strategic_signals` (memory) | Two-tier stake model (**delegated stake + node collateral**) — **load-bearing on §7.1 sortition-unit decision** (per-operator-key default vs delegated-stake-weighted). |
+| `:project_kes_port_constraints` (memory) | KES port — **hard prerequisite** for Option C slashing evidence non-repudiation. |
+| `~/repos/research-nipopos-2026/sims/cross_shard.py` (branch `sim/integration`, commit `913c4a8`) | Empirical anchor — the simulator that surfaced the §1 gap. Under Options A + C the sim's `t_count` gate is replaced by VRF-eligibility check (Option A) + post-hoc slashing (Option C); a sim re-run with the new gate is implied by §7.3 (epoch-length sweep). |
 
 ---
 
 *Research proposal. No code commitment. Implementation surface in §6
 is reviewer-aid sizing; the project plan follows from the
-recommendation in §5.*
+recommendation in §5. Revised 2026-05-15 per user directive — see
+revision history at the top of the file.*
