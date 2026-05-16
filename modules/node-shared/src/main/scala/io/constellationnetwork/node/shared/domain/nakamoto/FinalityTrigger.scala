@@ -67,14 +67,16 @@ object FinalityTrigger {
     * The `F` is carried so `canonicalHashAt` can stay effectful (chain walk).
     *
     * @param selfId
-    *   this node's PeerId. Used by [[TWeightTrigger]] to self-exclude (task #133).
+    *   this node's PeerId. Retained for [[TCountTrigger]] self-exclusion (task #133, still needed for the count path because T_count counts
+    *   distinct attesters and self-counting would double-promote a node's own evidence under the count rule). NOT used by
+    *   [[TWeightTrigger]] in the post-Snowball wiring — the Snowball decision is observer-independent by construction (NID-restored).
     * @param bestTipOrdinal
     *   ordinal of the current best chain tip. Used by [[TDepth1Trigger]] to compute `bestTipOrdinal - k₁`.
     * @param bestTipHash
     *   hash of the current best chain tip. Used by [[TWeightTrigger]] to walk back into canonical history.
     * @param canonicalHashAt
     *   chain walk: returns the hash on our canonical chain at the given ordinal (typically `chainStore.walkBackTo(bestTipHash, ord)`). Used
-    *   by [[TWeightTrigger]] to filter cross-fork attestations from the weight sum.
+    *   by [[TWeightTrigger]] to filter cross-fork attestations from the Snowball decision set.
     */
   final case class ConsensusState[F[_]](
     selfId: PeerId,
@@ -169,30 +171,47 @@ object FinalityTriggerView {
     }
 }
 
-/** Production builder for the `T_weight` trigger (2/3 attestation finality on the canonical chain).
+/** Production builder for the `T_weight` trigger.
   *
-  * Wraps [[TipTracker.highestFinalizedOrdinal]] — self-excludes `state.selfId` (#133), filters attestations by canonical-hash match (#119
-  * fork-recovery-deadlock fix), and walks attestation ordinals from highest down accumulating weight.
+  * '''Mechanism (post-Snowball commit).''' The trigger's qualifying ordinal is the highest ordinal where the sibling
+  * [[SnowballAccumulator]] has reached a decision on our canonical-chain hash. This is the Avalanche- Snowball cascade primary output
+  * (`docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §2, §3.1) — replacing the prior Snowflake-style weight-sum gate at this position in
+  * the trigger stack. The trigger's *position* in the stack (`T_weight`) is unchanged; only the *mechanism* flips from "Snowflake counter"
+  * to "Snowball margin-based decision". Position-name kept as `T_weight` so downstream metrics, log lines, and observability surfaces are
+  * unchanged.
+  *
+  * '''NID restoration.''' Snowball is observer-independent — every honest observer plugging in the same attestation transcript reaches the
+  * same decision regardless of their own identity. This is the property the prior P-11b self-exclusion (commit `95471c7f`) broke to prevent
+  * self-finalize-then-deadlock; with Snowball the deadlock attractor is gone structurally and self-attestation is included again.
+  *
+  * '''Cross-fork filter.''' Decisions on a divergent fork (decided hash differs from our canonical hash at that ordinal) are skipped via
+  * the same `canonicalHashAt` predicate the legacy weight-sum path used. Only decisions matching our canonical chain contribute.
+  *
+  * '''Threshold parameter.''' Retained for signature stability; not used by the Snowball path (decision is margin-based, not
+  * threshold-based). The 2/3 stake threshold lives in the legacy weight-sum `TipTracker.highestFinalizedOrdinal` which remains available as
+  * fallback evidence.
   */
 object TWeightTrigger {
 
   /** @param tipTracker
-    *   attestation accumulator (source of weights + canonical-filter walk)
+    *   attestation accumulator (sibling Snowball accumulator is read for the decision)
     * @param threshold
-    *   cumulative stake fraction required to qualify (e.g. `TipTracker.FinalityThreshold` = 2/3)
+    *   retained for signature stability; not used by the Snowball decision (margin-based, not threshold-based)
     */
   def make[F[_]: Sync](
     tipTracker: TipTracker[F],
     threshold: Ratio
-  ): F[FinalityTrigger[F]] =
+  ): F[FinalityTrigger[F]] = {
+    val _ = threshold // explicitly unused; preserved on signature for caller stability
     FinalityTrigger.fromRef[F](FinalityTrigger.Kind.TWeight, SnapshotOrdinal.MinValue) { state =>
       tipTracker
-        .highestFinalizedOrdinal(state.selfId, threshold, state.canonicalHashAt)
+        .highestSnowballDecidedOrdinal(state.canonicalHashAt)
         .map {
-          case Some((ord, _)) => SnapshotOrdinal.unsafeApply(ord)
-          case None           => SnapshotOrdinal.MinValue
+          case Some(ord) => SnapshotOrdinal.unsafeApply(ord)
+          case None      => SnapshotOrdinal.MinValue
         }
     }
+  }
 }
 
 /** Production builder for the `T_depth1` trigger (depth-k₁ confirmation finality).

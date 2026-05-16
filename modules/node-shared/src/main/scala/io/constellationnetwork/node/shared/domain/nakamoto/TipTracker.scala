@@ -24,6 +24,13 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * All weights are exact `Ratio`. Attestation sums and the 2/3 threshold comparison are byte-identical across all JVMs/CPUs — closes the
   * latent finality-split risk that Double summation order would introduce on N-not-power-of-2 clusters (e.g. 7-node cluster where 1/7 isn't
   * exactly representable in IEEE 754).
+  *
+  * '''Snowball / NID note.''' Each attestation recorded here is ALSO forwarded into a sibling [[SnowballAccumulator]] (constructed in
+  * [[TipTracker.make]] alongside the legacy weight tracker). The accumulator implements per-(ordinal, hash) lifetime evidence with
+  * margin-based decisions — Snowball semantics from Rocco et al. 2018 §3.2. The legacy `highestFinalizedOrdinal` weight-sum path remains as
+  * fallback (T_count-equivalent: distinct attesters reaching ≥ 2/3 stake weight on canonical), but the primary `T_weight` driver is now
+  * Snowball via `highestSnowballDecidedOrdinal`. Snowball is observer-independent (no `selfId`), which is what restores Non-Interactive
+  * Determinism after the P-11b rollback in this commit (see `AVALANCHE-ATTESTATION-PROPOSAL.md` §3.1).
   */
 trait TipTracker[F[_]] {
 
@@ -35,6 +42,9 @@ trait TipTracker[F[_]] {
     * finality sum (#136) once that trigger lands. Self-attestations on this node always pass the gate because the emit sites
     * (`SnapshotLeaderLoop.onSlotWon`, `NakamotoSyncDaemon.emitTipAttestation`) source `attestedAt` from the same `Clock[F].realTime` that's
     * threaded through `now` here.
+    *
+    * Accepted attestations are also forwarded into the sibling [[SnowballAccumulator]] so the Snowball decision rule can advance
+    * independently of the legacy weight-sum path.
     */
   def recordAttestation(peerId: PeerId, attestation: TipAttestation, now: Long): F[Unit]
 
@@ -57,17 +67,14 @@ trait TipTracker[F[_]] {
     * predecessor silently let forked chains each "finalize" their local fork (observed in a 3-node cluster where gl0-2 forked: all three
     * nodes logged ATTEST-FINALIZED at the same ordinals with weight=0.67, yet their mptRoots at each ordinal were permanently different).
     *
-    * '''Why self-exclusion''' (task #133): a node MUST NOT count its own attestation toward its own finality threshold. Otherwise it can
-    * self-finalize a divergent fork, and once `chainStore.finalize` records the local hash, the finality-safety gate (`NakamotoChainStore`)
-    * will permanently refuse the canonical chain's hash — the "fork-recovery deadlock" of #119. Under equal-stake `1/N` this is rare (a
-    * single attestation is `1/N` of the threshold), but once stake-weighted VRF lands a single high-stake validator could hit the 2/3
-    * threshold purely from its own attestation. The producer's contribution is still recorded (other peers' views of this node's
-    * attestation count normally — only the self-view filters it out).
+    * '''NID restoration (Snowball commit).''' This method NO LONGER self-excludes the caller. The earlier P-11b stopgap (commit `95471c7f`)
+    * excluded `selfId` from the weight sum to prevent a high-stake validator from self-finalizing a divergent fork. That trade —
+    * small-cluster safety for Non-Interactive Determinism — is no longer required because the primary `T_weight` evaluation now runs
+    * through [[SnowballAccumulator.highestDecidedOnCanonical]] which is observer-independent by construction. This method remains as the
+    * legacy weight-sum path (used as a fallback / parallel evidence stream and for the ATTEST-FINALIZED log line's cumulative weight); it
+    * is now safe to include self because Snowball, not weight-sum, is the primary deadlock-attractor mitigation. See
+    * `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §3.1.
     *
-    * @param selfId
-    *   this node's `PeerId`. Attestations stored under `selfId` are excluded from the weight sum to avoid self-finalization on divergent
-    *   forks. Peer (observer) views — e.g. validating someone else's chain — should pass a different identity here, or use a sentinel that
-    *   never matches a real peer.
     * @param threshold
     *   cumulative stake fraction required (e.g. 2/3)
     * @param canonicalHashAt
@@ -75,10 +82,19 @@ trait TipTracker[F[_]] {
     *   `chainStore.walkBackTo(localTip.hash, ord)`). Attestations whose tipHash doesn't match are discarded from the weight sum.
     */
   def highestFinalizedOrdinal(
-    selfId: PeerId,
     threshold: Ratio,
     canonicalHashAt: Long => F[Option[Hash]]
   ): F[Option[(Long, Ratio)]]
+
+  /** Highest ordinal where the sibling [[SnowballAccumulator]] has decided on our canonical-chain hash.
+    *
+    * This is the post-Snowball `T_weight` primary path (`AVALANCHE-ATTESTATION-PROPOSAL.md` §3.1). It takes NO `selfId` —
+    * observer-independent by construction, which is the load-bearing NID property.
+    */
+  def highestSnowballDecidedOrdinal(canonicalHashAt: Long => F[Option[Hash]]): F[Option[Long]]
+
+  /** Diagnostic / observability — read the sibling Snowball accumulator's per-hash counts at an ordinal. */
+  def snowballAccumAt(ordinal: Long): F[Map[Hash, Int]]
 
   /** Get all current attestations (latest per peer). */
   def allAttestations: F[Map[PeerId, TipAttestation]]
@@ -137,6 +153,15 @@ object TipTracker {
       .getOrElse(60000L)
 
   def make[F[_]: Sync: Metrics](stakeRegistry: StakeRegistry[F]): F[TipTracker[F]] =
+    SnowballAccumulator.make[F]().flatMap { snowball =>
+      makeWithAccumulator(stakeRegistry, snowball)
+    }
+
+  /** Variant for tests / callers that want to inject a pre-built [[SnowballAccumulator]] (e.g. with a custom β). */
+  def makeWithAccumulator[F[_]: Sync: Metrics](
+    stakeRegistry: StakeRegistry[F],
+    snowball: SnowballAccumulator[F]
+  ): F[TipTracker[F]] =
     for {
       attestationsRef <- Ref.of[F, Map[PeerId, TipAttestation]](Map.empty)
       finalizedRef <- Ref.of[F, Option[(Hash, Slot)]](None)
@@ -169,7 +194,14 @@ object TipTracker {
                   // New or newer attestation, record it
                   current.updated(peerId, attestation)
               }
-            } >> stakeRegistry.markActive(peerId) // Track this peer as actively participating
+            } >> stakeRegistry.markActive(peerId) >> // Track this peer as actively participating
+              // Forward the same attestation into the Snowball accumulator. The accumulator's
+              // `recordAttestation` handles the per-peer at-most-one-per-ordinal invariant internally
+              // (if the same peer flips hashes at this ordinal, the prior contribution is moved to the
+              // new hash — Snowball's per-color persistence is at the OTHER peers' lifetime evidence
+              // level, not within a single peer). Calling unconditionally on the path that also writes
+              // `attestationsRef` keeps both views in lockstep.
+              snowball.recordAttestation(peerId, attestation.tipOrdinal, attestation.tipHash)
         }
 
         def attestationWeight(tipHash: Hash): F[Ratio] =
@@ -198,7 +230,6 @@ object TipTracker {
           } yield weighted.filter(_._3 > Ratio.Zero).maxByOption { case (_, _, w) => (w.numerator, w.denominator) }
 
         def highestFinalizedOrdinal(
-          selfId: PeerId,
           threshold: Ratio,
           canonicalHashAt: Long => F[Option[Hash]]
         ): F[Option[(Long, Ratio)]] =
@@ -209,12 +240,13 @@ object TipTracker {
             // other forks (different hash at same ordinal) contribute zero weight to finalizing
             // our chain.
             //
-            // Self-exclusion (task #133): drop the entry keyed by `selfId` BEFORE the canonical
-            // filter. A node must not count its own attestation toward its own finality threshold,
-            // otherwise — combined with `chainStore.finalize`'s finality-safety gate — it can
-            // self-finalize a divergent fork and then permanently refuse the canonical chain (the
-            // "fork-recovery deadlock" of #119).
-            onChain <- attestations.iterator.filter { case (peerId, _) => peerId =!= selfId }.toList.traverse[F, Option[(Long, Ratio)]] {
+            // '''NID restoration:''' no longer self-excludes. Pre-Snowball this method dropped the
+            // entry keyed by `selfId` before the canonical filter (commit `95471c7f`, task #133).
+            // With the Snowball accumulator now the primary `T_weight` driver, the fork-recovery
+            // deadlock attractor is gone structurally; this legacy weight-sum path can safely
+            // include self again, restoring observer-independence. See
+            // `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §3.1 ("P-11b rolled back").
+            onChain <- attestations.toList.traverse[F, Option[(Long, Ratio)]] {
               case (peerId, att) =>
                 canonicalHashAt(att.tipOrdinal).flatMap {
                   case Some(localHash) if localHash === att.tipHash =>
@@ -235,6 +267,12 @@ object TipTracker {
             }
           }
 
+        def highestSnowballDecidedOrdinal(canonicalHashAt: Long => F[Option[Hash]]): F[Option[Long]] =
+          snowball.highestDecidedOnCanonical(canonicalHashAt)
+
+        def snowballAccumAt(ordinal: Long): F[Map[Hash, Int]] =
+          snowball.accumAt(ordinal)
+
         def allAttestations: F[Map[PeerId, TipAttestation]] =
           attestationsRef.get
 
@@ -245,11 +283,20 @@ object TipTracker {
           finalizedRef.set(Some((tipHash, tipSlot)))
 
         def pruneBelow(finalizedSlot: Slot): F[Unit] =
-          attestationsRef.update { attestations =>
-            attestations.filter {
-              case (_, att) =>
-                att.tipSlot.value.value >= finalizedSlot.value.value
+          attestationsRef.modify { attestations =>
+            val (kept, dropped) = attestations.partition {
+              case (_, att) => att.tipSlot.value.value >= finalizedSlot.value.value
             }
+            // The ordinal floor we need to prune the Snowball accumulator at is the *highest* ordinal among
+            // dropped attestations (or, equivalently, the lowest ordinal of kept attestations minus 1).
+            // Use the dropped set's max ordinal as the inclusive upper bound — pruneBelow keeps strictly >=.
+            val pruneOrdFloor: Option[Long] =
+              if (dropped.isEmpty) None
+              else Some(dropped.values.map(_.tipOrdinal).max + 1L)
+            (kept, pruneOrdFloor)
+          }.flatMap {
+            case Some(floor) => snowball.pruneBelow(floor)
+            case None        => Sync[F].unit
           }
 
         // Re-bootstrap reset (P-11). Wipes attestation map + last-finalized marker so a
@@ -258,6 +305,7 @@ object TipTracker {
         def unsafe_reset: F[Unit] =
           attestationsRef.set(Map.empty) >>
             finalizedRef.set(None) >>
-            logger.warn("⚠️ TipTracker.unsafe_reset: cleared attestations + lastFinalized (re-bootstrap)")
+            snowball.unsafe_reset >>
+            logger.warn("⚠️ TipTracker.unsafe_reset: cleared attestations + lastFinalized + Snowball accumulator (re-bootstrap)")
       }
 }

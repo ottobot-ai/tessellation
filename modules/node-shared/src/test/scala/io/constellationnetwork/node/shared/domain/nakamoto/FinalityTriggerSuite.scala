@@ -62,6 +62,30 @@ object FinalityTriggerSuite extends SimpleIOSuite {
   private def record(tracker: TipTracker[IO], peerId: PeerId, attestation: TipAttestation): IO[Unit] =
     tracker.recordAttestation(peerId, attestation, attestation.attestedAt)
 
+  // ============================================================
+  // TWeight: post-Snowball wiring (`AVALANCHE-ATTESTATION-PROPOSAL.md` §2, §3.1).
+  //
+  // TWeight now reads `tipTracker.highestSnowballDecidedOrdinal` — the sibling SnowballAccumulator's
+  // margin-based decision. Beta defaults to 10 distinct peer attestations of margin between leader
+  // and runner-up. The Snowball decision is observer-independent (NID restored). To exercise the
+  // trigger here we feed enough distinct-peer attestations to clear the β=10 margin (or use a
+  // smaller β via env in production; for tests we wire enough peers so β=10 is satisfied).
+  // ============================================================
+
+  // For TWeight tests, use a wider validator set so the Snowball accumulator can clear β=10
+  // (leader needs to be 10 distinct peers ahead of runner-up). With 11 peers all attesting the
+  // same hash, leader_count = 11 and runner_up = 0 → margin 11 ≥ 10 → decided.
+  private def setupTrackerWithEnoughPeersForBeta(
+    extraPeers: Int = 11
+  ): IO[(TipTracker[IO], StakeRegistry[IO], Set[PeerId])] = {
+    val self = pid("self")
+    val peers = (1 to extraPeers).map(i => pid(s"snow-peer-$i")).toSet
+    for {
+      pair <- setupTracker(peers + self)
+      (tracker, registry) = pair
+    } yield (tracker, registry, peers)
+  }
+
   test("TWeight: empty attestations → MinValue qualifying ordinal") {
     val self = pid("self")
     val tipHash = hash("tip")
@@ -73,14 +97,14 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     } yield expect.same(SnapshotOrdinal.MinValue, result)
   }
 
-  test("TWeight: 2/3 weight on canonical hash → returns qualifying ordinal") {
+  test("TWeight (Snowball): below β margin → MinValue qualifying ordinal") {
+    // Three peers attest the same canonical hash; below β=10 margin → not decided yet → MinValue.
+    // Confirms the Snowball decision rule is margin-based, not count-based: a 3-peer
+    // unanimous-on-canonical attestation set is below the β=10 floor.
     val self = pid("self")
     val peer1 = pid("peer1")
     val peer2 = pid("peer2")
     val tipHash = hash("tip-at-50")
-    // Two non-self peers each attest the canonical tip. With self-exclusion the contributing set
-    // is {peer1, peer2}; under optimistic stake-weighting they're 1.0 of the active set, which
-    // trivially exceeds 2/3.
     for {
       tracker <- setupTipTracker(Set(self, peer1, peer2))
       _ <- record(tracker, peer1, att(tipHash, slot(50), 50L, 1000L))
@@ -88,25 +112,65 @@ object FinalityTriggerSuite extends SimpleIOSuite {
       trigger <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
       st = state(self, 50L, tipHash, Map(50L -> tipHash))
       result <- trigger.evaluate(st)
+    } yield expect.same(SnapshotOrdinal.MinValue, result)
+  }
+
+  test("TWeight (Snowball): β-margin cleared on canonical → returns qualifying ordinal") {
+    // 11 peers all attest the same canonical hash → leader_count = 11, runner_up = 0, margin 11
+    // ≥ β=10 → decided → trigger qualifies the ordinal. Validates the end-to-end Snowball path
+    // through TWeightTrigger.
+    val self = pid("self")
+    val tipHash = hash("tip-at-50")
+    for {
+      triple <- setupTrackerWithEnoughPeersForBeta()
+      (tracker, _, peers) = triple
+      _ <- peers.toList.traverse_(p => record(tracker, p, att(tipHash, slot(50), 50L, 1000L)))
+      trigger <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
+      st = state(self, 50L, tipHash, Map(50L -> tipHash))
+      result <- trigger.evaluate(st)
     } yield expect.same(ord(50L), result)
   }
 
-  test("TWeight: attestations on non-canonical fork return MinValue (cross-fork attestation filtered)") {
+  test("TWeight (Snowball): decisions on non-canonical fork are filtered → MinValue") {
+    // 11 peers attest a forked hash; canonical chain has a different hash. Snowball decides on
+    // the forked hash internally (its accumulator has 11 votes for the forked side), but the
+    // canonical-hash filter in `highestDecidedOnCanonical` returns None for ordinals where the
+    // decided hash doesn't match canonical.
     val self = pid("self")
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
     val canonicalTipHash = hash("canonical")
     val forkedTipHash = hash("forked")
-    // Peers attest a DIFFERENT hash at ord=50; canonical chain has canonicalTipHash there.
-    // The canonical-hash filter zeroes both attestations → no qualifying ordinal.
     for {
-      tracker <- setupTipTracker(Set(self, peer1, peer2))
-      _ <- record(tracker, peer1, att(forkedTipHash, slot(50), 50L, 1000L))
-      _ <- record(tracker, peer2, att(forkedTipHash, slot(50), 50L, 1000L))
+      triple <- setupTrackerWithEnoughPeersForBeta()
+      (tracker, _, peers) = triple
+      _ <- peers.toList.traverse_(p => record(tracker, p, att(forkedTipHash, slot(50), 50L, 1000L)))
       trigger <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
       st = state(self, 50L, canonicalTipHash, Map(50L -> canonicalTipHash))
       result <- trigger.evaluate(st)
     } yield expect.same(SnapshotOrdinal.MinValue, result)
+  }
+
+  test("TWeight (Snowball): NID — two observers with different selfId reach the same decision") {
+    // Load-bearing NID assertion: post-Snowball the T_weight decision is observer-independent.
+    // The `selfId` field on `ConsensusState` is still passed (T_count uses it), but T_weight no
+    // longer reads it. Two evaluations against the same TipTracker — one as observerA, one as
+    // observerB — produce identical qualifying ordinals.
+    val observerA = pid("observerA")
+    val observerB = pid("observerB")
+    val tipHash = hash("tip-at-50")
+    for {
+      triple <- setupTrackerWithEnoughPeersForBeta()
+      (tracker, _, peers) = triple
+      _ <- peers.toList.traverse_(p => record(tracker, p, att(tipHash, slot(50), 50L, 1000L)))
+      triggerA <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
+      triggerB <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
+      stA = state(observerA, 50L, tipHash, Map(50L -> tipHash))
+      stB = state(observerB, 50L, tipHash, Map(50L -> tipHash))
+      resultA <- triggerA.evaluate(stA)
+      resultB <- triggerB.evaluate(stB)
+    } yield
+      // NID: identical decisions across different observer identities.
+      expect.same(resultA, resultB) &&
+        expect.same(ord(50L), resultA)
   }
 
   test("TCount: evaluates to highest ordinal with ≥ 2/3 distinct attester count on canonical hash") {
@@ -173,19 +237,19 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     } yield expect.same(SnapshotOrdinal.MinValue, result)
   }
 
-  test("TCount: ties with TWeight under equal stake (sanity check)") {
-    // Sanity check: under equal-weight stake, T_count and T_weight should qualify the same
-    // ordinal whenever the cluster's attestation set is uniform. 3-peer cluster, both non-self
-    // peers attest the canonical tip — T_weight sees 2/2 active = 1.0 ≥ 2/3 → qualifies ord=50.
-    // T_count sees 2 non-self attesters, ceil(2/3 * 3) = 2 required → qualifies ord=50.
+  test("TCount: agrees with TWeight (Snowball) at the same canonical ordinal once both clear their respective thresholds") {
+    // Post-Snowball, T_weight and T_count are independent triggers with different mechanisms:
+    // T_weight = Snowball margin (β=10 distinct peer attestations of leader-vs-runner-up margin)
+    // T_count = ≥ 2/3 distinct non-self attesters on canonical (still self-excludes per #133)
+    // Once enough peers attest the canonical hash to clear both gates, both qualify the same ord.
+    // 12-peer cluster (self + 11 attesters all on canonical): T_weight Snowball margin = 11 ≥ 10
+    // → qualifies. T_count = 11 attesters, ceil(2/3 * 12) = 8 required → qualifies. Both ord=50.
     val self = pid("self")
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
     val tipHash = hash("tip-at-50")
     for {
-      (tracker, registry) <- setupTracker(Set(self, peer1, peer2))
-      _ <- record(tracker, peer1, att(tipHash, slot(50), 50L, 1000L))
-      _ <- record(tracker, peer2, att(tipHash, slot(50), 50L, 1000L))
+      triple <- setupTrackerWithEnoughPeersForBeta()
+      (tracker, registry, peers) = triple
+      _ <- peers.toList.traverse_(p => record(tracker, p, att(tipHash, slot(50), 50L, 1000L)))
       tWeight <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
       tCount <- TCountTrigger.make[IO](tracker, registry, TipTracker.FinalityThreshold)
       st = state(self, 50L, tipHash, Map(50L -> tipHash))
@@ -325,9 +389,10 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     val tipHash = hash("tip")
     for {
       // Pre-advance T_weight to ord=50 and T_depth1 to ord=90 via two evaluateAndAdvance calls.
-      tracker <- setupTipTracker(Set(self, pid("peer1"), pid("peer2")))
-      _ <- record(tracker, pid("peer1"), att(tipHash, slot(50), 50L, 1000L))
-      _ <- record(tracker, pid("peer2"), att(tipHash, slot(50), 50L, 1000L))
+      // Snowball T_weight requires β=10 margin; use 11 peers to clear it.
+      triple <- setupTrackerWithEnoughPeersForBeta()
+      (tracker, _, peers) = triple
+      _ <- peers.toList.traverse_(p => record(tracker, p, att(tipHash, slot(50), 50L, 1000L)))
       tWeight <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
       tDepth1 <- TDepth1Trigger.make[IO](10L)
       st = state(self, 100L, tipHash, Map(50L -> tipHash))
@@ -355,25 +420,21 @@ object FinalityTriggerSuite extends SimpleIOSuite {
   test("triggersFor over all four triggers — only the triggers that qualify N are returned (#138 building block)") {
     // Scenario for the chain-quality observable (task #138): at finalize time we want to know
     // exactly which subset of the four triggers (T_weight, T_count, T_depth1, T_depth2) has
-    // qualified the just-finalized ordinal. This test sets up a state where:
-    //   - T_weight qualifies ord=50 (3/4 peers on canonical chain @ ord=50, exceeds 2/3)
-    //   - T_count qualifies ord=50 (3 non-self peers, ceil(2/3 * 4) = 3 → exactly meets)
+    // qualified the just-finalized ordinal. Uses a 12-peer cluster (self + 11) to clear the
+    // Snowball β=10 margin at T_weight while also satisfying the T_count ≥ 2/3 distinct attesters
+    // gate.
+    //   - T_weight qualifies ord=50 (Snowball margin 11 ≥ β=10)
+    //   - T_count qualifies ord=50 (11 non-self peers, ceil(2/3 * 12) = 8 → met)
     //   - T_depth1 qualifies ord=90 (bestTip=100, k=10)
     //   - T_depth2 qualifies MinValue (bestTip=100 < k₂=1000)
-    // Then we query triggersFor at three ordinals: 50 (all three Phase-1→2 fire), 90 (only
-    // T_depth1), 99 (none).
     val self = pid("self")
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    val peer3 = pid("peer3")
     val tipHash50 = hash("tip-at-50")
     val tipHash100 = hash("tip-at-100")
     val canonical = Map(50L -> tipHash50, 100L -> tipHash100)
     for {
-      (tracker, registry) <- setupTracker(Set(self, peer1, peer2, peer3))
-      _ <- record(tracker, peer1, att(tipHash50, slot(50), 50L, 1000L))
-      _ <- record(tracker, peer2, att(tipHash50, slot(50), 50L, 1000L))
-      _ <- record(tracker, peer3, att(tipHash50, slot(50), 50L, 1000L))
+      triple <- setupTrackerWithEnoughPeersForBeta()
+      (tracker, registry, peers) = triple
+      _ <- peers.toList.traverse_(p => record(tracker, p, att(tipHash50, slot(50), 50L, 1000L)))
       tWeight <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
       tCount <- TCountTrigger.make[IO](tracker, registry, TipTracker.FinalityThreshold)
       tDepth1 <- TDepth1Trigger.make[IO](10L)
@@ -410,13 +471,14 @@ object FinalityTriggerSuite extends SimpleIOSuite {
 
   test("FinalityTriggerView.fromTriggers wraps a trigger list and answers triggersFor correctly") {
     // Smoke test for the #138 view shim — confirms the wrapper preserves
-    // FinalityTrigger.triggersFor semantics without caching or staleness.
+    // FinalityTrigger.triggersFor semantics without caching or staleness. Uses enough peers to
+    // clear the Snowball β=10 margin so T_weight qualifies.
     val self = pid("self")
     val tipHash = hash("tip")
     for {
-      tracker <- setupTipTracker(Set(self, pid("peer1"), pid("peer2")))
-      _ <- record(tracker, pid("peer1"), att(tipHash, slot(50), 50L, 1000L))
-      _ <- record(tracker, pid("peer2"), att(tipHash, slot(50), 50L, 1000L))
+      triple <- setupTrackerWithEnoughPeersForBeta()
+      (tracker, _, peers) = triple
+      _ <- peers.toList.traverse_(p => record(tracker, p, att(tipHash, slot(50), 50L, 1000L)))
       tWeight <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
       tDepth1 <- TDepth1Trigger.make[IO](10L)
       view = FinalityTriggerView.fromTriggers[IO](List(tWeight, tDepth1))
@@ -438,9 +500,9 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     val self = pid("self")
     val tipHash = hash("tip")
     for {
-      tracker <- setupTipTracker(Set(self, pid("peer1"), pid("peer2")))
-      _ <- record(tracker, pid("peer1"), att(tipHash, slot(50), 50L, 1000L))
-      _ <- record(tracker, pid("peer2"), att(tipHash, slot(50), 50L, 1000L))
+      triple <- setupTrackerWithEnoughPeersForBeta()
+      (tracker, _, peers) = triple
+      _ <- peers.toList.traverse_(p => record(tracker, p, att(tipHash, slot(50), 50L, 1000L)))
       tWeight <- TWeightTrigger.make[IO](tracker, TipTracker.FinalityThreshold)
       tDepth1 <- TDepth1Trigger.make[IO](10L)
       st = state(self, 100L, tipHash, Map(50L -> tipHash))

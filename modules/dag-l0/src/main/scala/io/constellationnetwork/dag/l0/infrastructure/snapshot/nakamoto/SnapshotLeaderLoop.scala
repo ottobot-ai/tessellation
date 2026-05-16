@@ -448,11 +448,20 @@ object SnapshotLeaderLoop {
         // qualified ordinal N?" for free — used by the future chain-quality observable
         // (#138) and post-mortem finality analysis without re-walking the chain.
         //
-        // T_weight (2/3 stake weight) and T_count (2/3 distinct attester count) reuse the
-        // SAME `TipTracker.FinalityThreshold` env knob: under equal stake they tie; once
-        // stake-weighted VRF lands, T_count is strictly stronger evidence (each high-stake
-        // validator can hit 2/3 weight alone, but cannot fake count-of-distinct-attesters).
-        // Running both gives defense-in-depth without an additional configuration surface.
+        // T_weight in the post-Snowball wiring reads the sibling [[SnowballAccumulator]]
+        // (constructed inside `TipTracker.make`) — decision is margin-based per Snowball
+        // semantics (proposal §2, §3.1), not the 2/3 weight-sum gate. The
+        // `TipTracker.FinalityThreshold` value (2/3, env `NAKAMOTO_ATTESTATION_THRESHOLD`) is
+        // retained for the T_count rule (1-validator-1-vote ≥ 2/3 distinct attesters), the
+        // legacy fallback evidence at the same position, and the ATTEST-FINALIZED log line.
+        //
+        // Snowball parameters (K, α, β) are documented and defaulted on the
+        // [[SnowballAccumulator]] companion (env: `NAKAMOTO_SNOWBALL_K=8`,
+        // `NAKAMOTO_SNOWBALL_ALPHA=5`, `NAKAMOTO_SNOWBALL_BETA=10`). Empirical floor from the
+        // GPU dual-mode sweep at commit `5ace3d36` of `~/repos/research-nipopos-2026` —
+        // 0 safety violations across all measured cluster sizes N ∈ {16, 32, 100, 500, 1000}
+        // at f_adv=0.33 under all three adversary modes (coordinated_lie, split_honest,
+        // random_honest). See `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §0.A.
         //
         // The triggers are READ-ONLY surfaces here. Side effects (chainStore.finalize,
         // mptOverlay.finalizeBranch, log lines, metrics, mempool prune) still live in the
@@ -644,18 +653,20 @@ object SnapshotLeaderLoop {
                             // weight >= 2/3 is finalized.
                             //
                             // The trigger's `tWeight.latestQualifyingOrdinal` already reflects this evaluation
-                            // (from `evaluateAndAdvance` above). We re-query `highestFinalizedOrdinal` here
-                            // ONLY to retrieve the cumulative `weight` value for the ATTEST-FINALIZED log line
-                            // (downstream log-parsing depends on `weight=X.XX` exactly). The work is idempotent
-                            // — a pure read against the attestations map + canonical chain walk.
+                            // (from `evaluateAndAdvance` above) — but `tWeight` now reads the Snowball
+                            // accumulator, not the legacy weight-sum path. The legacy
+                            // `highestFinalizedOrdinal` call below is retained for the ATTEST-FINALIZED log
+                            // line's cumulative `weight` value (downstream log-parsing depends on
+                            // `weight=X.XX` exactly) and as parallel evidence at the same ordinal. The work is
+                            // idempotent — a pure read against the attestations map + canonical chain walk.
+                            //
+                            // '''P-11b rolled back (Snowball commit).''' This call NO LONGER passes `selfId`.
+                            // Snowball's observer-independent decision rule is the primary T_weight driver;
+                            // the legacy weight-sum here can safely include self again. NID is restored at the
+                            // T_weight position. See `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §3.1.
                             chainFinalizedOrdinal <- bestTip match {
                               case Some(tip) =>
-                                // Self-exclusion (task #133): pass `selfId` so our own attestation is dropped
-                                // from the weight sum. Otherwise this node could self-finalize a divergent fork
-                                // and trip the finality-safety gate in `chainStore.finalize`, locking the node
-                                // out of canonical recovery (the "fork-recovery deadlock" of #119).
                                 tipTracker.highestFinalizedOrdinal(
-                                  selfId,
                                   TipTracker.FinalityThreshold,
                                   ord => chainStore.walkBackTo(tip.hash, ord)
                                 )
