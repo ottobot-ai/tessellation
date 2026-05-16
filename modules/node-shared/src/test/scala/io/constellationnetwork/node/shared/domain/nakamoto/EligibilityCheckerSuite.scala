@@ -327,6 +327,27 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
         .and(expect((threshDelta2 - expectedRampStart).abs < Tol))
   }
 
+  // ============ Stake-weighted Property: threshold is monotone non-decreasing in relativeStake ============
+  //
+  // §1.1 sanity check on top of the existing equal-weight tests: with a fixed slotGap + LddConfig,
+  // threshold(s, δ, cfg) must be monotone non-decreasing in `s` because the closed form is
+  //   threshold(s, δ) = 1 - (1 - f(δ))^s
+  // and 1 - f(δ) ∈ [0, 1] so x ↦ x^s is non-increasing in s for x ∈ [0, 1].
+  test("stakeWeightedProperty: threshold monotone non-decreasing in relativeStake at fixed slotGap+config") {
+    val slotGap = 10L
+    // Use the default config (f recovery region holds at slotGap=10 ≥ lddCutoff=15? — checked below).
+    // Pick a config whose recovery region is at slotGap=10 and whose f is non-degenerate.
+    val cfg = LddConfig(lddCutoff = 5, offset = 0, baselineDifficulty = Ratio(3, 10), amplitude = Ratio(3, 10))
+    val stakes = List(Ratio(1, 8), Ratio(1, 4), Ratio(1, 2), Ratio(3, 4))
+    for {
+      checker <- checkerIO
+      thresholds <- stakes.traverse(checker.threshold(_, slotGap, cfg))
+    } yield {
+      val pairs = thresholds.zip(thresholds.drop(1))
+      expect(pairs.forall { case (lo, hi) => lo <= hi })
+    }
+  }
+
   // Helper: traverse for List in IO context (cats stdlib alternative).
   private implicit class TraverseListIO[A](xs: List[A]) {
     def traverse[B](f: A => IO[B]): IO[List[B]] =

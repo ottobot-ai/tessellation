@@ -1,15 +1,17 @@
 package io.constellationnetwork.node.shared.domain.nakamoto
 
-import cats.effect.kernel.{Ref, Sync}
+import cats.effect.kernel.{Async, Ref, Sync}
 import cats.syntax.all._
 
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.implicits._
+import io.constellationnetwork.schema.GlobalSnapshotInfo
 import io.constellationnetwork.schema.peer.PeerId
 
 /** Read-only view of validator stake for Nakamoto consensus.
   *
-  * Used by EligibilityChecker to determine threshold scaling. Phase 3: equal weight (1/N). Future: stake-proportional.
+  * Used by EligibilityChecker to determine threshold scaling. Phase 3: equal weight (1/N). §1.1: stake-proportional via [[stakeWeighted]] —
+  * combined `delegatedStake + nodeCollateral` per the strategic-signals memo (two-tier stake is the unit).
   *
   * Stakes are returned as exact `Ratio` so eligibility and finality threshold computations are byte-identical across all JVMs/CPUs (no IEEE
   * 754 sum-order or rounding non-determinism).
@@ -54,8 +56,14 @@ trait StakeRegistry[F[_]] {
 
 object StakeRegistry {
 
-  /** Minimum fraction of seedlist that must be observed-active before optimistic finality kicks in. Below this, fall back to full-seedlist
-    * weight (depth-based finality only). Prevents 2/2 online nodes finalizing in a 100-node network.
+  /** Minimum '''stake fraction''' of the seedlist that must be observed-active before optimistic finality kicks in. Below this, fall back
+    * to full-seedlist weight (depth-based finality only). Prevents 2/2 online nodes finalizing a network where the offline majority holds
+    * most of the stake.
+    *
+    * §1.1 semantic change: the comparison is now a stake fraction (Σ stake of observed-active ÷ Σ stake of full seedlist) instead of a
+    * count fraction (# observed-active ÷ # seedlist). The env var name [[NAKAMOTO_OPTIMISTIC_MIN_FRACTION]] is unchanged — interface
+    * stable, semantics moved with the stake-weighted VRF election. For the legacy [[equalWeight]] registry the comparison remains
+    * count-fraction (since every peer carries 1/N) and the two definitions coincide.
     *
     * Default: 1/2. Override via `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` (parsed Double, locked into Ratio at boot). Lower for small clusters;
     * raise for stricter participation requirements.
@@ -69,6 +77,9 @@ object StakeRegistry {
 
   /** Equal-weight stake registry with optimistic active tracking. Every validator in seedlist gets 1/N for VRF eligibility. Finality weight
     * computed against observed active peers.
+    *
+    * For the equal-weight registry the optimistic quorum check is a count-fraction comparison; since every peer carries 1/N this is also
+    * the stake-fraction. Retained as the boot path and test fixture.
     */
   def equalWeight[F[_]: Sync]: F[StakeRegistry[F]] =
     (Ref.of[F, Set[PeerId]](Set.empty), Ref.of[F, Set[PeerId]](Set.empty)).mapN { (validatorsRef, activeRef) =>
@@ -129,7 +140,144 @@ object StakeRegistry {
       }
     }
 
-  // Future: Stake-weighted registry that reads from GlobalSnapshotInfo. Stub for now — will use activeDelegatedStakes +
-  // activeNodeCollaterals.
-  // def stakeWeighted[F[_]: Sync](snapshotInfo: GlobalSnapshotInfo): F[StakeRegistry[F]] = ???
+  /** Stake-weighted registry sourced from `GlobalSnapshotInfo.activeDelegatedStakes + activeNodeCollaterals`.
+    *
+    * Weight per peer = (Σ delegated-stake amount with `nodeId == peer`) + (Σ node-collateral amount with `nodeId == peer`), both rolled
+    * into a single `BigInt` numerator. Relative stake = peer-weight ÷ Σ(weight over seedlist).
+    *
+    * Seedlist membership is the gate: stake records pointing at a `nodeId` outside the seedlist are dropped from both numerator and
+    * denominator. The set of validators and the observed-active set are held in `Ref`s, mirroring [[equalWeight]] — `updateValidators`,
+    * `markActive`, `markInactive` are byte-identical to that path.
+    *
+    * Boot fallback: when `snapshotInfoR` returns `None` (the node has not loaded a GSI yet), relative stake falls back to `Ratio(1,
+    * validators.size)` so leader-loop wiring before genesis still elects.
+    *
+    * §3 NIPoPoW follow-on: this constructor reads the *latest* GSI on every call. Eta-period historical stake look-back (read the stake
+    * snapshot from the eta-boundary, not the chain head) is out of scope for §1.1.
+    */
+  def stakeWeighted[F[_]: Async](
+    snapshotInfoR: F[Option[GlobalSnapshotInfo]]
+  ): F[StakeRegistry[F]] =
+    (Ref.of[F, Set[PeerId]](Set.empty), Ref.of[F, Set[PeerId]](Set.empty)).mapN { (validatorsRef, activeRef) =>
+      new StakeRegistry[F] {
+
+        // Sum delegated + collateral amounts for every record in the GSI whose `nodeId == p`.
+        // Both tiers contribute as a single BigInt — matches the §1.1 plan's "combined stake" definition.
+        private def stakeOf(info: GlobalSnapshotInfo, p: PeerId): BigInt = {
+          val delegated: BigInt = info.activeDelegatedStakes.map { byAddr =>
+            byAddr.valuesIterator.flatMap(_.iterator).foldLeft(BigInt(0)) { (acc, record) =>
+              if (record.event.value.nodeId == p) acc + BigInt(record.amount.value.value)
+              else acc
+            }
+          }
+            .getOrElse(BigInt(0))
+
+          val collateral: BigInt = info.activeNodeCollaterals.map { byAddr =>
+            byAddr.valuesIterator.flatMap(_.iterator).foldLeft(BigInt(0)) { (acc, record) =>
+              if (record.event.value.nodeId == p) acc + BigInt(record.event.value.amount.value.value)
+              else acc
+            }
+          }
+            .getOrElse(BigInt(0))
+
+          delegated + collateral
+        }
+
+        // Σ stake over a peer set, dropping off-set node-ids from numerator AND denominator.
+        private def totalStakeOver(info: GlobalSnapshotInfo, peers: Set[PeerId]): BigInt =
+          peers.foldLeft(BigInt(0))((acc, p) => acc + stakeOf(info, p))
+
+        def relativeStake(peerId: PeerId): F[Ratio] =
+          (snapshotInfoR, validatorsRef.get).flatMapN {
+            case (None, validators) =>
+              // Boot path: no GSI yet — fall back to 1/N so leader-loop wiring before genesis still elects.
+              Async[F].pure {
+                if (validators.contains(peerId) && validators.nonEmpty) Ratio(1, validators.size)
+                else Ratio.Zero
+              }
+            case (Some(info), validators) =>
+              Async[F].pure {
+                if (!validators.contains(peerId) || validators.isEmpty) Ratio.Zero
+                else {
+                  val total = totalStakeOver(info, validators)
+                  if (total == BigInt(0)) Ratio.Zero
+                  else Ratio(stakeOf(info, peerId), total)
+                }
+              }
+          }
+
+        def allStakes: F[Map[PeerId, Ratio]] =
+          (snapshotInfoR, validatorsRef.get).flatMapN {
+            case (None, validators) =>
+              Async[F].pure {
+                if (validators.isEmpty) Map.empty[PeerId, Ratio]
+                else {
+                  val stake = Ratio(1, validators.size)
+                  validators.map(_ -> stake).toMap
+                }
+              }
+            case (Some(info), validators) =>
+              Async[F].pure {
+                if (validators.isEmpty) Map.empty[PeerId, Ratio]
+                else {
+                  val total = totalStakeOver(info, validators)
+                  if (total == BigInt(0)) Map.empty[PeerId, Ratio]
+                  else validators.iterator.map(p => p -> Ratio(stakeOf(info, p), total)).toMap
+                }
+              }
+          }
+
+        def validatorCount: F[Int] =
+          validatorsRef.get.map(_.size)
+
+        def observedActiveCount: F[Int] =
+          activeRef.get.map(_.size)
+
+        def activeValidators: F[Set[PeerId]] =
+          validatorsRef.get
+
+        def observedActive: F[Set[PeerId]] =
+          activeRef.get
+
+        def updateValidators(validators: Set[PeerId]): F[Unit] =
+          validatorsRef.set(validators)
+
+        def markActive(peerId: PeerId): F[Unit] =
+          validatorsRef.get.flatMap { validators =>
+            activeRef.update(_ + peerId).whenA(validators.contains(peerId))
+          }
+
+        def markInactive(peerId: PeerId): F[Unit] =
+          activeRef.update(_ - peerId)
+
+        def optimisticRelativeStake(peerId: PeerId): F[Ratio] =
+          (snapshotInfoR, validatorsRef.get, activeRef.get).flatMapN {
+            case (None, validators, _) =>
+              // Boot path: same fallback as relativeStake — 1/N.
+              Async[F].pure {
+                if (validators.contains(peerId) && validators.nonEmpty) Ratio(1, validators.size)
+                else Ratio.Zero
+              }
+            case (Some(info), validators, active) =>
+              Async[F].pure {
+                val effectiveActive = active.intersect(validators)
+                val totalSeedlist = totalStakeOver(info, validators)
+                val totalActive = totalStakeOver(info, effectiveActive)
+                val activeStakeFraction =
+                  if (totalSeedlist == BigInt(0)) Ratio.Zero
+                  else Ratio(totalActive, totalSeedlist)
+                val meetsQuorum = validators.nonEmpty && activeStakeFraction >= MinActiveQuorumFraction
+
+                if (meetsQuorum && effectiveActive.contains(peerId) && totalActive != BigInt(0))
+                  Ratio(stakeOf(info, peerId), totalActive)
+                else if (validators.contains(peerId) && validators.nonEmpty) {
+                  // Full-seedlist fallback. Mirrors the relativeStake path so behavior is identical when below quorum
+                  // or when the peer is not in the observed-active set.
+                  if (totalSeedlist == BigInt(0)) Ratio.Zero
+                  else Ratio(stakeOf(info, peerId), totalSeedlist)
+                } else Ratio.Zero
+              }
+          }
+      }
+    }
 }

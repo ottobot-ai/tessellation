@@ -418,7 +418,14 @@ object GlobalSnapshotConsensus {
               s"🔧 Nakamoto config: LDD(cutoff=${lddConfig.lddCutoff}, offset=${lddConfig.offset}, baseline=${lddConfig.baselineDifficulty}, amplitude=${lddConfig.amplitude}), etaRotation=${etaRotationSnapshots} snapshots, slotsPerEpoch=${slotsPerEpoch}, genesisTime=${pureGenesisTimeMs}"
             )
             .toResource
-          stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry.equalWeight[F].toResource
+          // §1.1: switch from equal-weight to stake-weighted VRF election. `snapshotInfoR` re-reads
+          // the latest GSI on every call so per-validator stake reflects the most recent
+          // activeDelegatedStakes + activeNodeCollaterals. Boot path (no GSI yet) falls back to 1/N
+          // inside the constructor; updateValidators / markActive / markInactive semantics are
+          // unchanged from equalWeight.
+          stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry
+            .stakeWeighted[F](lastGlobalSnapshotStorage.getCombined.map(_.map(_._2)))
+            .toResource
           // Filter out entries marked with alias="metagraph-op". They live in the seedlist
           // so state-channel binary signature validation accepts them as known signers,
           // but they must not count as Nakamoto validators (would dilute 1/N VRF stake).
