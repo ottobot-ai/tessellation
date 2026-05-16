@@ -251,12 +251,53 @@ for arg in "$@"; do
     --list-tests)
       export LIST_TESTS=true
       ;;
+    --stake-dist=*)
+      # §1.1 stake-weighted VRF e2e: pre-genesis stake distribution.
+      # Accepts "uniform" | "rand" | "<comma-separated weights>". Resolved into
+      # NAKAMOTO_STAKE_DISTRIBUTION after all args parse (needs NUM_GL0_NODES).
+      export STAKE_DIST_SPEC="${arg#*=}"
+      ;;
     *)
       echo "Unknown argument: $arg"
       exit 1
       ;;
   esac
 done
+
+# §1.1 stake-weighted VRF: resolve --stake-dist=<spec> into NAKAMOTO_STAKE_DISTRIBUTION
+# now that NUM_GL0_NODES is known. compose-runner.sh forwards the env var to the Tier-1
+# genesis generator path (test-vectors/genesis fixtures); when unset, default CSV path is used.
+if [ -n "${STAKE_DIST_SPEC:-}" ]; then
+  case "$STAKE_DIST_SPEC" in
+    uniform)
+      if [ -z "${NUM_GL0_NODES:-}" ] || [ "$NUM_GL0_NODES" -lt 2 ]; then
+        echo "ERROR: --stake-dist=uniform requires --num-gl0=N with N >= 2 (got: '${NUM_GL0_NODES:-}')"
+        exit 1
+      fi
+      export NAKAMOTO_STAKE_DISTRIBUTION=$(awk -v n="$NUM_GL0_NODES" 'BEGIN {
+        for (i = 0; i < n; i++) { if (i > 0) printf ","; printf "%.6f", 1.0/n }
+      }')
+      ;;
+    rand)
+      if [ -z "${NUM_GL0_NODES:-}" ] || [ "$NUM_GL0_NODES" -lt 2 ]; then
+        echo "ERROR: --stake-dist=rand requires --num-gl0=N with N >= 2 (got: '${NUM_GL0_NODES:-}')"
+        exit 1
+      fi
+      seed=${NAKAMOTO_GENESIS_SEED:-$(date +%s)}
+      export NAKAMOTO_STAKE_DISTRIBUTION=$(awk -v n="$NUM_GL0_NODES" -v seed="$seed" 'BEGIN {
+        srand(seed)
+        total = 0
+        for (i = 0; i < n; i++) { w[i] = rand() + 0.01; total += w[i] }
+        for (i = 0; i < n; i++) { if (i > 0) printf ","; printf "%.6f", w[i] / total }
+      }')
+      ;;
+    *)
+      # Pass-through CSV; compose-runner.sh validates length + sum.
+      export NAKAMOTO_STAKE_DISTRIBUTION="$STAKE_DIST_SPEC"
+      ;;
+  esac
+  echo "[set-env] --stake-dist=$STAKE_DIST_SPEC → NAKAMOTO_STAKE_DISTRIBUTION=$NAKAMOTO_STAKE_DISTRIBUTION"
+fi
 
 exit_func() {
   if [ "$DO_EXIT" = "true" ]; then
