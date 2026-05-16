@@ -53,6 +53,23 @@ object method {
 
   case class TxSenderCmd(configPath: String) extends CliMethod
 
+  /** Tier-1 test-vector generator. See `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` §1.1 and `project_test_vector_pattern` for
+    * the design rationale. Emits a byte-deterministic `l0-genesis.json` (operator set + delegated-stake records + node-collateral records +
+    * protocol params + initial balances) into `outputDir`. Optionally synthesizes a `cl1-genesis.json` (single-metagraph for Tier-1).
+    */
+  case class GenerateGenesisCmd(
+    outputDir: Path,
+    numOperators: Int,
+    stakeDistribution: List[BigDecimal],
+    stakeBudgetDatum: Long,
+    collateralPerOperator: Long,
+    initialBalancesCsv: Option[Path],
+    seed: Long,
+    keysFromDir: Option[Path],
+    networkMagic: String,
+    startingEpochProgress: Long
+  ) extends CliMethod
+
   sealed trait WalletsOpts
   case class GeneratedWallets(count: IntGreaterEqual2, genesisPath: Path) extends WalletsOpts
   case class LoadedWallets(walletsPath: Path, alias: String, password: String) extends WalletsOpts
@@ -121,11 +138,61 @@ object method {
       }
   }
 
+  object GenerateGenesisCmd {
+    private def parseWeights(s: String): List[BigDecimal] =
+      if (s.trim.isEmpty) List.empty
+      else
+        s.split(",")
+          .toList
+          .map(_.trim)
+          .filter(_.nonEmpty)
+          .flatMap(p => scala.util.Try(BigDecimal(p)).toOption)
+
+    val opts: Opts[GenerateGenesisCmd] = Opts.subcommand(
+      "generate-genesis",
+      "Generate a Tier-1 l0-genesis.json test-vector fixture"
+    ) {
+      (
+        Opts.option[Path]("output-dir", "Directory to write l0-genesis.json (and optional cl1-genesis.json) into."),
+        Opts.option[Int]("num-operators", "Number of validator operators in the genesis."),
+        Opts
+          .option[String](
+            "stake-distribution",
+            "Comma-separated relative weights summing to ≈1.0. Defaults to uniform if omitted."
+          )
+          .withDefault("")
+          .map(parseWeights),
+        Opts
+          .option[Long]("stake-budget-datum", "Total stake budget in datum (1 DAG = 1e8 datum).")
+          .withDefault(1000000000000L),
+        Opts
+          .option[Long](
+            "collateral-per-operator",
+            "Per-operator node-collateral in datum. Omit (or 0) to skip collateral records."
+          )
+          .withDefault(0L),
+        Opts
+          .option[Path](
+            "initial-balances-csv",
+            "Optional CSV (address,balance) to seed cl1 balances; if omitted, synthesizes per-operator stipends."
+          )
+          .orNone,
+        Opts.option[Long]("seed", "Required: PRNG seed for byte-determinism."),
+        Opts
+          .option[Path]("keys-from", "Optional directory containing nodes/N/key.p12 to reuse existing operator keys.")
+          .orNone,
+        Opts.option[String]("network-magic", "Test-cluster network magic string.").withDefault("test-cluster"),
+        Opts.option[Long]("starting-epoch-progress", "Initial epoch progress for the genesis.").withDefault(0L)
+      ).mapN(GenerateGenesisCmd.apply)
+    }
+  }
+
   val opts: Opts[CliMethod] =
     SendTransactionsCmd.opts
       .orElse(SendStateChannelSnapshotCmd.opts)
       .orElse(GetLatestSnapshotInfoCmd.opts)
       .orElse(TxSenderCmd.opts)
+      .orElse(GenerateGenesisCmd.opts)
 
   private val defaultProtocol = "http://"
 

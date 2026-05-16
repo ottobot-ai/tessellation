@@ -88,6 +88,8 @@ object Main
                         sendStateChannelSnapshot(client, baseUrl)
                       case GetLatestSnapshotInfoCmd(networkHost, networkPort) =>
                         getLatestSnapshotInfo(client, networkHost, networkPort)
+                      case g: GenerateGenesisCmd =>
+                        generateGenesis[IO](g)
                       case _ => IO.raiseError(new Throwable("Not implemented"))
                     }).as(ExitCode.Success)
                   }
@@ -243,6 +245,66 @@ object Main
       .through(Files.forAsync[F].writeAll(Path.fromNioPath(genesisPath)))
       .compile
       .drain
+  }
+
+  /** Tier-1 test-vector emit. Parallel to `createGenesis` (which emits the legacy CSV format) but targets the `L0GenesisData` schema. See
+    * `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` §1.1 and `project_test_vector_pattern` memory.
+    *
+    * Determinism: the emitted `l0-genesis.json` is byte-deterministic for a given (seed, flag-set). Verified by running the generator twice
+    * and `diff -r`-ing the outputs (see commit message).
+    */
+  def generateGenesis[F[_]: Async: SecurityProvider: Console](cmd: cli.method.GenerateGenesisCmd): F[Unit] = {
+    import io.constellationnetwork.tools.genesis.GenesisGenerator
+    import io.circe.Printer
+
+    val opts = GenesisGenerator.GeneratorOpts(
+      outputDir = cmd.outputDir.toString,
+      numOperators = cmd.numOperators,
+      stakeDistribution =
+        if (cmd.stakeDistribution.nonEmpty) cmd.stakeDistribution
+        else List.fill(cmd.numOperators)(BigDecimal(1) / BigDecimal(cmd.numOperators)),
+      stakeBudgetDatum = cmd.stakeBudgetDatum,
+      collateralPerOperator = cmd.collateralPerOperator,
+      initialBalancesCsv = cmd.initialBalancesCsv.map(_.toString),
+      seed = cmd.seed,
+      keysFromDir = cmd.keysFromDir.map(_.toString),
+      networkMagic = cmd.networkMagic,
+      startingEpochProgress = cmd.startingEpochProgress
+    )
+
+    val invocation = s"generate-genesis --num-operators ${cmd.numOperators} --seed ${cmd.seed}" +
+      (if (cmd.stakeDistribution.nonEmpty) s" --stake-distribution ${cmd.stakeDistribution.mkString(",")}" else "") +
+      s" --stake-budget-datum ${cmd.stakeBudgetDatum}" +
+      s" --collateral-per-operator ${cmd.collateralPerOperator}" +
+      s" --network-magic ${cmd.networkMagic}"
+
+    // Canonical printer: sort keys, keep nulls (vrfPublicKey/kesPublicKey are intentionally null
+    // in Tier-1), 2-space indent (human-reviewable diffs). `Printer.spaces2` defaults sortKeys=false,
+    // so we override it via .copy(sortKeys = true) — sortKeys is what makes the output
+    // byte-deterministic across JVMs (circe HashMap iteration order is not stable).
+    val printer = Printer.spaces2.copy(sortKeys = true, dropNullValues = false)
+
+    for {
+      outputs <- GenesisGenerator.generate[F](opts, invocation)
+      _ <- Async[F].blocking {
+        java.nio.file.Files.createDirectories(cmd.outputDir)
+      }
+      l0Json = printer.print(io.circe.syntax.EncoderOps(outputs.l0Genesis).asJson)
+      _ <- Async[F].blocking {
+        java.nio.file.Files.writeString(cmd.outputDir.resolve("l0-genesis.json"), l0Json)
+      }
+      _ <- outputs.cl1Genesis.traverse_ { cl1 =>
+        Async[F].blocking {
+          val cl1Json = printer.print(io.circe.syntax.EncoderOps(cl1).asJson)
+          java.nio.file.Files.writeString(cmd.outputDir.resolve("cl1-genesis.json"), cl1Json)
+        }
+      }
+      _ <- console.green[F](s"Wrote l0-genesis.json (${l0Json.length} bytes) to ${cmd.outputDir}")
+      _ <- console.green[F](s"  operators: ${outputs.l0Genesis.operators.size}")
+      _ <- console.green[F](s"  delegatedStakes: ${outputs.l0Genesis.delegatedStakes.size}")
+      _ <- console.green[F](s"  nodeCollaterals: ${outputs.l0Genesis.nodeCollaterals.size}")
+      _ <- console.green[F](s"  initialBalances: ${outputs.l0Genesis.initialBalances.size}")
+    } yield ()
   }
 
   def printProgress[F[_]: Async: Console](startTime: FiniteDuration, counter: Long): F[Unit] =
