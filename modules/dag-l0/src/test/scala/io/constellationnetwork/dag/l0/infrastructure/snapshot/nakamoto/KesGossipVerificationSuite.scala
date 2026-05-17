@@ -92,6 +92,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           tipOrdinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
+          enforce = false,
           logger = logger
         )
       }
@@ -118,6 +119,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           tipOrdinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
+          enforce = false,
           logger = logger
         )
       }
@@ -147,6 +149,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           tipOrdinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
+          enforce = false,
           logger = logger
         )
       }
@@ -175,6 +178,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           tipOrdinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
+          enforce = false,
           logger = logger
         )
       }
@@ -200,6 +204,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           tipOrdinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
+          enforce = false,
           logger = logger
         )
       }
@@ -230,6 +235,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           ordinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
+          enforce = false,
           logger = logger
         )
       }
@@ -253,6 +259,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           ordinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
+          enforce = false,
           logger = logger
         )
       }
@@ -277,6 +284,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           ordinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
+          enforce = false,
           logger = logger
         )
       }
@@ -302,6 +310,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           ordinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
+          enforce = false,
           logger = logger
         )
       }
@@ -309,5 +318,163 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
     } yield
       expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_invalid_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_snapshots_verified_total"))
+  }
+
+  // ============================================================
+  // Slice 9 — enforce=true return-value matrix
+  // ============================================================
+  //
+  // The signature's `enforce` knob doesn't change which counter ticks (that's still the
+  // outcome matrix) — it changes what the return value is so the daemon can drop the
+  // message. These tests pin the return-value mapping so a regression on counter handling
+  // can't silently flip the gate behavior.
+
+  test("enforce=true: valid sig → returns true; invalid → returns false; missing → returns false") {
+    for {
+      (_, metrics) <- setup
+      (signer, vk) <- buildSigner(0xaa.toByte)
+      (_, wrongVk) <- buildSigner(0xbb.toByte)
+      sigResult <- signer.signAt(0, testMessageBytes)
+      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
+      // (a) registry matches → verify=true
+      registryGood = KesRegistry.make[IO](Map(peerId('a') -> vk))
+      // (b) registry holds wrong VK → verify=false
+      registryWrong = KesRegistry.make[IO](Map(peerId('a') -> wrongVk))
+      // (c) registry empty (no entry) → ACCEPT under "Ed25519 already authenticated" carve-out
+      registryEmpty = KesRegistry.empty[IO]
+
+      okGood <- {
+        implicit val m: Metrics[IO] = metrics
+        KesGossipVerification.verifyAttestation[IO](
+          messageBytes = testMessageBytes,
+          kesSigBytes = wireBytes,
+          attesterId = peerId('a'),
+          attesterHex = peerHex('a'),
+          tipOrdinal = testOrdinal,
+          kesRegistry = registryGood,
+          etaRotationSnapshots = etaRotationSnapshots,
+          enforce = true,
+          logger = logger
+        )
+      }
+      okWrong <- {
+        implicit val m: Metrics[IO] = metrics
+        KesGossipVerification.verifyAttestation[IO](
+          messageBytes = testMessageBytes,
+          kesSigBytes = wireBytes,
+          attesterId = peerId('a'),
+          attesterHex = peerHex('a'),
+          tipOrdinal = testOrdinal,
+          kesRegistry = registryWrong,
+          etaRotationSnapshots = etaRotationSnapshots,
+          enforce = true,
+          logger = logger
+        )
+      }
+      okEmpty <- {
+        implicit val m: Metrics[IO] = metrics
+        KesGossipVerification.verifyAttestation[IO](
+          messageBytes = testMessageBytes,
+          kesSigBytes = wireBytes,
+          attesterId = peerId('a'),
+          attesterHex = peerHex('a'),
+          tipOrdinal = testOrdinal,
+          kesRegistry = registryEmpty,
+          etaRotationSnapshots = etaRotationSnapshots,
+          enforce = true,
+          logger = logger
+        )
+      }
+      okNoSig <- {
+        implicit val m: Metrics[IO] = metrics
+        KesGossipVerification.verifyAttestation[IO](
+          messageBytes = testMessageBytes,
+          kesSigBytes = Array.empty[Byte],
+          attesterId = peerId('a'),
+          attesterHex = peerHex('a'),
+          tipOrdinal = testOrdinal,
+          kesRegistry = registryGood,
+          etaRotationSnapshots = etaRotationSnapshots,
+          enforce = true,
+          logger = logger
+        )
+      }
+      okDecodeFail <- {
+        implicit val m: Metrics[IO] = metrics
+        KesGossipVerification.verifyAttestation[IO](
+          messageBytes = testMessageBytes,
+          kesSigBytes = Array.fill[Byte](16)(0xff.toByte),
+          attesterId = peerId('a'),
+          attesterHex = peerHex('a'),
+          tipOrdinal = testOrdinal,
+          kesRegistry = registryGood,
+          etaRotationSnapshots = etaRotationSnapshots,
+          enforce = true,
+          logger = logger
+        )
+      }
+    } yield
+      expect(okGood, "valid sig + valid registry must return true under enforce=true") &&
+        expect(!okWrong, "wrong VK in registry must return false under enforce=true") &&
+        expect(okEmpty, "no registry entry must still return true (Ed25519 already authenticated)") &&
+        expect(!okNoSig, "missing wire field must return false under enforce=true") &&
+        expect(!okDecodeFail, "decode failure must return false under enforce=true")
+  }
+
+  test("enforce=false: same matrix always returns true (warn-only)") {
+    for {
+      (_, metrics) <- setup
+      (signer, _) <- buildSigner(0xcc.toByte)
+      (_, wrongVk) <- buildSigner(0xdd.toByte)
+      sigResult <- signer.signAt(0, testMessageBytes)
+      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
+      registryWrong = KesRegistry.make[IO](Map(peerId('a') -> wrongVk))
+
+      okNoSig <- {
+        implicit val m: Metrics[IO] = metrics
+        KesGossipVerification.verifyAttestation[IO](
+          messageBytes = testMessageBytes,
+          kesSigBytes = Array.empty[Byte],
+          attesterId = peerId('a'),
+          attesterHex = peerHex('a'),
+          tipOrdinal = testOrdinal,
+          kesRegistry = registryWrong,
+          etaRotationSnapshots = etaRotationSnapshots,
+          enforce = false,
+          logger = logger
+        )
+      }
+      okWrong <- {
+        implicit val m: Metrics[IO] = metrics
+        KesGossipVerification.verifyAttestation[IO](
+          messageBytes = testMessageBytes,
+          kesSigBytes = wireBytes,
+          attesterId = peerId('a'),
+          attesterHex = peerHex('a'),
+          tipOrdinal = testOrdinal,
+          kesRegistry = registryWrong,
+          etaRotationSnapshots = etaRotationSnapshots,
+          enforce = false,
+          logger = logger
+        )
+      }
+      okDecodeFail <- {
+        implicit val m: Metrics[IO] = metrics
+        KesGossipVerification.verifyAttestation[IO](
+          messageBytes = testMessageBytes,
+          kesSigBytes = Array.fill[Byte](16)(0xff.toByte),
+          attesterId = peerId('a'),
+          attesterHex = peerHex('a'),
+          tipOrdinal = testOrdinal,
+          kesRegistry = registryWrong,
+          etaRotationSnapshots = etaRotationSnapshots,
+          enforce = false,
+          logger = logger
+        )
+      }
+    } yield
+      expect(okNoSig, "no-sig must still return true under enforce=false") &&
+        expect(okWrong, "invalid sig must still return true under enforce=false") &&
+        expect(okDecodeFail, "decode-fail must still return true under enforce=false")
   }
 }
