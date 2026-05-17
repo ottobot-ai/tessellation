@@ -64,6 +64,7 @@ import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
 
+import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
 import io.circe.Json
 import org.http4s.client.Client
@@ -691,6 +692,53 @@ object GlobalSnapshotConsensus {
                   tipTracker = tipTracker,
                   genesisTimeMs = pureGenesisTimeMs
                 )
+                .compile
+                .drain
+            )
+            .toResource
+          // §1.2 Slice 8: KES period evolution aligned with eta rotation cadence.
+          //
+          // Sender-side sign-time evolution (Slice 5/6) auto-evolves the key on every signAt call,
+          // so forward security is preserved *whenever the validator signs*. But a quiet validator
+          // (no VRF wins) holds stale period-N bytes until its next sign — the exposure window is
+          // 1/relativeStake snapshots in expectation. This fiber tightens that window to a single
+          // poll interval by proactively burning past periods at each eta boundary.
+          //
+          // Period derivation matches `EtaCalculation.rotationPeriod(ordinal, etaRotationSnapshots)`
+          // (snapshot-indexed, not slot-indexed — see attestation-and-finality.md §1). Aligns with
+          // [[project_consensus_epoch_staggering]]'s "KES periods aligned with eta cadence" rule.
+          //
+          // Skipped entirely on the in-memory fallback path (no CL_KES_SECURE_STORE_DIR) — the
+          // evolution would write to nowhere persistent and just waste cycles. Disk path is the
+          // only one where the proactive evolution materially shrinks the exposure window.
+          lastEvolvedKesPeriodRef <- Ref.of[F, Int](0).toResource
+          _ <- supervisor
+            .supervise(
+              fs2.Stream
+                .awakeEvery[F](scala.concurrent.duration.DurationInt(2).seconds)
+                .evalMap { _ =>
+                  for {
+                    finalizedOrd <- nakamotoFinalizedOrdinalRef.get
+                    currentPeriod = io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
+                      .rotationPeriod(finalizedOrd.value.value, etaRotationSnapshots.toLong)
+                      .toInt
+                    lastEvolved <- lastEvolvedKesPeriodRef.get
+                    _ <-
+                      if (currentPeriod > lastEvolved)
+                        operationalKeyMaker.evolveTo(currentPeriod).flatMap {
+                          case Right(_) =>
+                            lastEvolvedKesPeriodRef.set(currentPeriod) >>
+                              nakLogger.info(
+                                s"🔐 KES period rotated: $lastEvolved → $currentPeriod (finalizedOrd=${finalizedOrd.value.value}, etaRotationSnapshots=$etaRotationSnapshots)"
+                              ) >>
+                              Metrics[F].incrementCounter("dag_nakamoto_kes_period_rotations_total") >>
+                              Metrics[F].updateGauge("dag_nakamoto_kes_current_period", currentPeriod.toLong)
+                          case Left(err) =>
+                            nakLogger.warn(s"⚠️ KES evolveTo($currentPeriod) failed: $err")
+                        }
+                      else cats.Applicative[F].unit
+                  } yield ()
+                }
                 .compile
                 .drain
             )
