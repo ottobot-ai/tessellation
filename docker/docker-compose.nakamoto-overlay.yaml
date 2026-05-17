@@ -27,6 +27,10 @@ services:
       - NAKAMOTO_LDD_OFFSET=${NAKAMOTO_LDD_OFFSET:-1}
       - NAKAMOTO_LDD_BASELINE=${NAKAMOTO_LDD_BASELINE:-0.05}
       - NAKAMOTO_LDD_AMPLITUDE=${NAKAMOTO_LDD_AMPLITUDE:-0.5}
+      # §1.2 Slice 9: receiver-side KES verification load-bearing flag. Default off
+      # for safe rollout — when true, KES verify-fail/decode-fail/no-sig drop the
+      # message (rather than warn-only). See `KesGossipVerification.scala`.
+      - NAKAMOTO_KES_ENFORCE=${NAKAMOTO_KES_ENFORCE:-false}
       # Test-only slot duration. Production default is 1000ms (in SnapshotLeaderLoop).
       # Kept at 1000ms because halving slot duration also halves wall-clock per epoch
       # (slots-per-epoch is fixed at 60), which made the token-lock-replacement edge
