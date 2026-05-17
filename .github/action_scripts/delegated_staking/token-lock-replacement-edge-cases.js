@@ -346,15 +346,16 @@ const testMultipleSequentialReplacements = async (urls, account, currentLockHash
     amount = newAmount
     logWorkflow.info(`  Sequential replacement ${i} verified ✓ (acceptanceOrd=${acceptanceOrd})`)
 
-    // Wait for T_depth2 finality of replacement i before submitting replacement i+1.
+    // Wait for t_count finality of replacement i (2/3 stake attested ≡ Taktikos operational
+    // finality) before submitting replacement i+1.
     //
-    // Under MultiBranch overlay, acceptance ≠ canonical until depth-k / T_depth2 fires —
+    // Under MultiBranch overlay, acceptance ≠ canonical until a Phase 1→2 trigger fires —
     // the binary's lastSnapshotHash can reference a branch gl0 has switched away from,
     // causing silent chain-link rejection (#186 / #118). Building the next chain-linked
-    // replacement on a finalized state is what a robust real Nakamoto client should do.
+    // replacement on a t_count-final state is what a robust real Nakamoto client should do.
     // Once #118 OverlayReader lands, we can fall back to "wait for acceptance" again.
     if (i < 3) {
-      logWorkflow.info(`  Waiting for replacement ${i} (ord=${acceptanceOrd}) to be T_depth2 finalized before next replacement...`)
+      logWorkflow.info(`  Waiting for replacement ${i} (ord=${acceptanceOrd}) to reach t_count finality before next replacement...`)
       await waitForFinality(urls.globalL0Url, acceptanceOrd, { name: `waitForFinality${i}` })
     }
   }
@@ -549,13 +550,13 @@ const testTokenLockReplacementEdgeCases = async (urls) => {
     urls, account, lockHash, lockAmount, stakeHash
   )
 
-  // Wait for T_depth2 finality of the minimum-increase replacement before entering the
-  // rapid sequential-replacement loop. Under MultiBranch, acceptance ≠ canonical until
-  // depth-k / T_depth2 fires — without this wait, sequential replacement 1 inherits the
-  // same lastRef race that broke replacement 2 of the loop (#186 / #118). The previous
-  // "wait 2 ord progressions" was insufficient (a sequential replacement happened to be
-  // slow enough on retries to mask it).
-  logWorkflow.info(`Waiting for min-increase replacement (ord=${minIncreaseAcceptanceOrd}) to be T_depth2 finalized before sequential replacements...`)
+  // Wait for t_count finality (2/3 stake attested ≡ Taktikos operational finality) of the
+  // minimum-increase replacement before entering the rapid sequential-replacement loop.
+  // Under MultiBranch overlay, acceptance ≠ canonical until a Phase 1→2 trigger fires —
+  // without this wait, sequential replacement 1 inherits the same lastRef race that broke
+  // replacement 2 of the loop (#186 / #118). t_depth2 is archival (k₂=65536, ~days) and
+  // would be far too slow for test pacing.
+  logWorkflow.info(`Waiting for min-increase replacement (ord=${minIncreaseAcceptanceOrd}) to reach t_count finality before sequential replacements...`)
   await waitForFinality(urls.globalL0Url, minIncreaseAcceptanceOrd, { name: 'waitForLockPropagation' })
 
   // Test 5: Multiple sequential replacements

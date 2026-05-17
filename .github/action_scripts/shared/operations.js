@@ -355,25 +355,32 @@ const waitForLastRefHash = async (axiosInst, l1Url, address, expectedHash, {
 }
 
 /**
- * Wait for a specific gl0 snapshot ordinal to reach T_depth2 finality.
+ * Wait for a specific gl0 snapshot ordinal to reach a finality trigger.
  *
- * Polls `GET /global-snapshots/{ord}/finality-triggers` (added by task #138) and
- * returns when `phases.phase_2_to_3` is true. This is the right "wait until canonical"
- * primitive for chain-linked tx tests: under MultiBranch overlay, acceptance ≠ canonical
- * until depth-k / T_depth2 — building tx N+1 on top of tx N before tx N is finalized
- * can race against a branch switch and drop tx N+1 silently (#186 / #118).
+ * Polls `GET /global-snapshots/{ord}/finality-triggers` (added by task #138) and returns
+ * when the requested trigger has fired. This is the right "wait until canonical" primitive
+ * for chain-linked tx tests: under MultiBranch overlay, acceptance ≠ canonical until a
+ * Phase 1→2 trigger fires — building tx N+1 on top of tx N before that can race against a
+ * branch switch and drop tx N+1 silently (#186 / #118).
+ *
+ * The default trigger is `t_count` (2/3 validators have attested as their best tip) —
+ * Taktikos-equivalent of BFT operational finality, typically fires within seconds in a
+ * healthy network. `t_depth2` is archival (k₂=65536, ~5 days) and only useful for
+ * Mithril-style trust anchors, not test pacing.
  *
  * @param {string} globalL0Url - The GL0 URL
  * @param {number} targetOrdinal - The ordinal to wait for finality on
  * @param {Object} [options]
  * @param {string} [options.name='waitForFinality'] - Name for logging
- * @param {number} [options.timeoutMs=300000] - 5 min cap; depth-k=31 @ 7s/ord = ~3.6 min worst case
+ * @param {string} [options.trigger='t_count'] - Which trigger to wait for ('t_weight', 't_count', 't_depth1', 't_depth2')
+ * @param {number} [options.timeoutMs=120000] - 2 min cap; t_count typically fires within ~seconds
  * @param {number} [options.intervalMs=3000] - Poll interval
- * @returns {Promise<Object>} - The final finality-triggers payload
+ * @returns {Promise<Object>} - The finality-triggers payload at success
  */
 const waitForFinality = async (globalL0Url, targetOrdinal, {
     name = 'waitForFinality',
-    timeoutMs = 5 * 60 * 1000,
+    trigger = 't_count',
+    timeoutMs = 2 * 60 * 1000,
     intervalMs = 3000,
 } = {}) => {
     const start = Date.now()
@@ -386,23 +393,24 @@ const waitForFinality = async (globalL0Url, targetOrdinal, {
             )
             if (response.status === 200) {
                 lastSeen = response.data
-                if (response.data?.phases?.phase_2_to_3 === true) {
+                const triggers = response.data?.triggers || []
+                if (triggers.includes(trigger)) {
                     const elapsedSec = Math.round((Date.now() - start) / 1000)
                     logWorkflow.info(
-                        `${name}: ord=${targetOrdinal} reached T_depth2 finality after ${elapsedSec}s ` +
-                        `(triggers=[${(response.data.triggers || []).join(',')}])`
+                        `${name}: ord=${targetOrdinal} reached ${trigger} finality after ${elapsedSec}s ` +
+                        `(triggers=[${triggers.join(',')}])`
                     )
                     return response.data
                 }
             }
-            // 503 (leader-loop not yet initialized) or 200 with phase_2_to_3=false → keep polling
+            // 503 (leader-loop not yet initialized) or 200 without the requested trigger → keep polling
         } catch (_) {
             // transient — keep polling until timeout
         }
         await sleep(intervalMs)
     }
     throw new Error(
-        `${name}: ord=${targetOrdinal} did not reach T_depth2 finality within ${Math.round(timeoutMs / 1000)}s ` +
+        `${name}: ord=${targetOrdinal} did not reach ${trigger} finality within ${Math.round(timeoutMs / 1000)}s ` +
         `(last seen: ${JSON.stringify(lastSeen)})`
     )
 }
