@@ -452,11 +452,29 @@ object GlobalSnapshotConsensus {
                 etaPeriodLength = etaRotationSnapshots.toLong
               )
           }
-          _ <- operationalKeyMaker.currentPublicKey.flatMap { kesVk =>
+          // §1.2 Slice 2: bind the KES master VK (period-0 root of the super × sub tree) to the
+          // operator's long-term Ed25519 key via a SHA512withECDSA signature over kesVk.value.
+          // The pair (kesVk, kesVkSigByLongTerm) is the registration certificate: it lets any
+          // other validator confirm that the KES VK they see in genesis (or in a future runtime
+          // registration tx) was issued by this operator without anyone needing access to the
+          // KES SK. KES forward security is preserved because the long-term key signs the VK,
+          // not the SK — compromise of the long-term key still cannot forge KES sigs for
+          // past periods (those required the corresponding SK leaf that has been erased).
+          kesRegistration <- operationalKeyMaker.currentPublicKey.flatMap { kesVk =>
+            io.constellationnetwork.security.signature.Signing
+              .signData[F](kesVk.value)(keyPair.getPrivate)
+              .map(regSig => (kesVk, regSig))
+          }.toResource
+          _ <- {
+            val (kesVk, regSig) = kesRegistration
             val vkHex = kesVk.value.take(16).map("%02x".format(_)).mkString
+            val regHex = regSig.take(16).map("%02x".format(_)).mkString
             nakLogger.info(
               s"🔐 KES bootstrap: period=0 height=${io.constellationnetwork.security.kes.OperationalKeyMaker.DefaultHeight} vk=$vkHex... step=${kesVk.step}"
-            )
+            ) >>
+              nakLogger.info(
+                s"🔐 KES-REG: master-vk-sig=$regHex... (SHA512withECDSA over kesVk by operator long-term key, ${regSig.length}B)"
+              )
           }.toResource
 
           // Numerics for VRF eligibility threshold. Bifrost prod precision: log1p=8, exp=38, maxIter=10000.
