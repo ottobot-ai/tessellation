@@ -13,11 +13,11 @@ import cats.syntax.functor._
   *   1. At construction, the interpreter reads the single key file from `secureStore` (under `keyName`). It is an error for the store to be
   *      empty or contain more than one entry under `keyName` at startup.
   *   1. On each [[OperationalKeyMakerAlgebra.signAt]] or [[OperationalKeyMakerAlgebra.evolveTo]] call, the in-memory key is evolved to the
-  *      target period. The pre-evolution bytes are destroyed by [[ProductComposition.eraseOldNode]] and
-  *      [[ProductComposition.eraseLeafSecretKey]] during the evolve.
+  *      target period. The pre-evolution bytes are destroyed by `ProductComposition.eraseOldNode` and
+  *      `ProductComposition.eraseLeafSecretKey` during the evolve.
   *   1. After every evolution, the new key is encoded and re-written to `secureStore` (the old persisted bytes are overwritten by
   *      [[SecureStore.write]]'s internal scrub).
-  *   1. All mutations are serialized by a [[Semaphore]] (one permit) so concurrent callers see a consistent step progression.
+  *   1. All mutations are serialized by a `Semaphore` (one permit) so concurrent callers see a consistent step progression.
   *
   * '''Period alignment''': the `etaPeriodLength` parameter is carried in this interpreter as configuration only. It is intended as
   * documentation that, in the wired system, KES periods will align with eta rotation cadence (per [[project_consensus_epoch_staggering]]).

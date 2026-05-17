@@ -41,7 +41,7 @@ trait SecureStore[F[_]] {
 
 object SecureStore {
 
-  /** In-memory implementation suitable for tests and development. Stores `name -> bytes` in a [[Ref]].
+  /** In-memory implementation suitable for tests and development. Stores `name -> bytes` in a `cats.effect.Ref`.
     *
     * On [[consume]] / [[erase]], the stored bytes are overwritten with [[java.security.SecureRandom]] before the entry is removed from the
     * map.

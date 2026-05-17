@@ -16,7 +16,7 @@ import KesBinaryTree._
   * This is the consensus-facing KES scheme. Ported from Bifrost's `co.topl.crypto.signing.kes.ProductComposition` (credit: Aaron Schutza).
   *
   * Package-private; consumers should use `KesProduct` (which wraps it and translates between the tuple-encoded internal representation and
-  * the named-field model types in [[models]]).
+  * the named-field model types in `models`).
   */
 protected[kes] class ProductComposition extends KesEd25519Blake2b256 {
 

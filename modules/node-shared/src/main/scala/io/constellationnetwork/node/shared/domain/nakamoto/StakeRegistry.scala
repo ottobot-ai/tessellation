@@ -10,7 +10,7 @@ import io.constellationnetwork.schema.peer.PeerId
 
 /** Read-only view of validator stake for Nakamoto consensus.
   *
-  * Used by EligibilityChecker to determine threshold scaling. Phase 3: equal weight (1/N). §1.1: stake-proportional via [[stakeWeighted]] —
+  * Used by EligibilityChecker to determine threshold scaling. Phase 3: equal weight (1/N). §1.1: stake-proportional via `stakeWeighted` —
   * combined `delegatedStake + nodeCollateral` per the strategic-signals memo (two-tier stake is the unit).
   *
   * Stakes are returned as exact `Ratio` so eligibility and finality threshold computations are byte-identical across all JVMs/CPUs (no IEEE
@@ -61,8 +61,8 @@ object StakeRegistry {
     * most of the stake.
     *
     * §1.1 semantic change: the comparison is now a stake fraction (Σ stake of observed-active ÷ Σ stake of full seedlist) instead of a
-    * count fraction (# observed-active ÷ # seedlist). The env var name [[NAKAMOTO_OPTIMISTIC_MIN_FRACTION]] is unchanged — interface
-    * stable, semantics moved with the stake-weighted VRF election. For the legacy [[equalWeight]] registry the comparison remains
+    * count fraction (# observed-active ÷ # seedlist). The env var name `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` is unchanged — interface
+    * stable, semantics moved with the stake-weighted VRF election. For the legacy `equalWeight` registry the comparison remains
     * count-fraction (since every peer carries 1/N) and the two definitions coincide.
     *
     * Default: 1/2. Override via `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` (parsed Double, locked into Ratio at boot). Lower for small clusters;

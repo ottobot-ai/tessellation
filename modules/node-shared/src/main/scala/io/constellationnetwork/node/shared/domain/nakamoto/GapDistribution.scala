@@ -41,7 +41,7 @@ object GapDistribution {
   /** Baseline difficulty for δ ≥ γ. DO NOT raise this in production. */
   val FB: Ratio = Ratio(1, 20)
 
-  /** f(δ) under the three-regime LDD snowplow. Returns an exact [[Ratio]] suitable for consensus-side arithmetic. */
+  /** f(δ) under the three-regime LDD snowplow. Returns an exact [[io.constellationnetwork.numerics.Ratio]] suitable for consensus-side arithmetic. */
   def thresholdAtGap(delta: Int): Ratio =
     if (delta < Psi) Ratio.Zero
     else if (delta < Gamma) Ratio(BigInt(delta - Psi), BigInt(Gamma - Psi)) * FA

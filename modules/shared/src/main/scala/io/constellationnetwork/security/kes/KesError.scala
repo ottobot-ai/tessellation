@@ -20,7 +20,7 @@ object KesError {
     val message: String = s"Step $requestedStep is not greater than current step $currentStep"
   }
 
-  /** Internal invariant violated while evolving a key. Should never happen for a well-formed [[KesBinaryTree]]. */
+  /** Internal invariant violated while evolving a key. Should never happen for a well-formed `KesBinaryTree`. */
   final case class MalformedTree(reason: String) extends KesError {
     val message: String = s"Malformed key tree: $reason"
   }

@@ -14,7 +14,7 @@ package io.constellationnetwork.security.kes
   * takes an `etaPeriodLength` config parameter so callers can express that alignment at construction; the alignment itself (slot -> period
   * mapping) is the caller's responsibility and lives at the SnapshotLeaderLoop / EtaRotation boundary, not here.
   *
-  * '''Forward security''': all evolution operations are sequenced through a [[cats.effect.std.Semaphore]] (one permit). Once `signAt(p, _)`
+  * '''Forward security''': all evolution operations are sequenced through a `cats.effect.std.Semaphore` (one permit). Once `signAt(p, _)`
   * has been observed, the underlying secret-key bytes for any period `<= p` are no longer present in memory or in the secure store: they
   * have been overwritten by the read-once consume + KES evolve sequence.
   */
