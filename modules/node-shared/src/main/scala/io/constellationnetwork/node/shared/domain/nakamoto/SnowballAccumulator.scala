@@ -3,8 +3,12 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 import cats.effect.kernel.{Ref, Sync}
 import cats.syntax.all._
 
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
+
+import eu.timepit.refined.auto._
+import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Per-(ordinal, hash) lifetime accumulator implementing **Snowball** decision semantics from the Snow family (Rocco et al. 2018, §3.2;
   * Amores-Sesar & Schneider 2024).
@@ -136,12 +140,21 @@ object SnowballAccumulator {
     val empty: State = State(Map.empty, Map.empty, Map.empty)
   }
 
-  def make[F[_]: Sync](beta: Int = Beta): F[SnowballAccumulator[F]] =
-    Ref.of[F, State](State.empty).map { stateRef =>
+  def make[F[_]: Sync: Metrics](beta: Int = Beta): F[SnowballAccumulator[F]] =
+    for {
+      stateRef <- Ref.of[F, State](State.empty)
+      highestDecidedRef <- Ref.of[F, Long](-1L)
+      logger = Slf4jLogger.getLoggerFromName[F]("SnowballAccumulator")
+    } yield
       new SnowballAccumulator[F] {
 
-        def recordAttestation(peerId: PeerId, ordinal: Long, hash: Hash): F[Unit] =
-          stateRef.update { st =>
+        def recordAttestation(peerId: PeerId, ordinal: Long, hash: Hash): F[Unit] = {
+          // `Ref.modify` so we can detect a newly-arrived decision and emit a log line / counter
+          // outside the state transition (logging is effectful — keep it out of the pure update).
+          // Returns `Some((leaderHash, leaderCount, runnerUp))` when this attestation crossed the
+          // β margin for the first time at this ordinal; `None` otherwise (already decided OR margin
+          // still short).
+          val updated: F[Option[(Hash, Int, Int)]] = stateRef.modify { st =>
             val peerHistory = st.lastByPeer.getOrElse(peerId, Map.empty)
             val priorAtOrd = peerHistory.get(ordinal)
 
@@ -171,21 +184,41 @@ object SnowballAccumulator {
             val newLastByPeer = st.lastByPeer.updated(peerId, newPeerHistory)
 
             // Decision rule: leader_count − runner_up_count >= β. Sticky once set.
-            val newDecided = st.decided.get(ordinal) match {
-              case Some(_) => st.decided // already decided; Snowball decisions are irrevocable
+            val newDecisionInfo: Option[(Hash, Int, Int)] = st.decided.get(ordinal) match {
+              case Some(_) => None // already decided; Snowball decisions are irrevocable
               case None =>
                 val sortedDesc = ordAccumAfterAdd.toList.sortBy(-_._2)
                 sortedDesc match {
-                  case Nil => st.decided
+                  case Nil => None
                   case (leaderHash, leaderCount) :: rest =>
                     val runnerUp = rest.headOption.map(_._2).getOrElse(0)
-                    if (leaderCount - runnerUp >= beta) st.decided.updated(ordinal, leaderHash)
-                    else st.decided
+                    if (leaderCount - runnerUp >= beta) Some((leaderHash, leaderCount, runnerUp))
+                    else None
                 }
             }
+            val newDecided = newDecisionInfo match {
+              case Some((h, _, _)) => st.decided.updated(ordinal, h)
+              case None            => st.decided
+            }
 
-            State(newAccum, newDecided, newLastByPeer)
+            (State(newAccum, newDecided, newLastByPeer), newDecisionInfo)
           }
+
+          updated.flatMap {
+            case Some((leaderHash, leaderCount, runnerUp)) =>
+              // INFO log + counter + monotone-ratchet gauge. Keep the log compact — emitted once per
+              // first-time decision per ordinal, so volume is bounded by chain length.
+              val msg =
+                s"DECIDED ordinal=$ordinal hash=${leaderHash.value.take(16)} " +
+                  s"leader=$leaderCount runnerUp=$runnerUp β=$beta margin=${leaderCount - runnerUp}"
+              logger.info(msg) >>
+                Metrics[F].incrementCounter("dag_nakamoto_snowball_decisions_total") >>
+                highestDecidedRef
+                  .modify(prev => (math.max(prev, ordinal), math.max(prev, ordinal)))
+                  .flatMap(h => Metrics[F].updateGauge("dag_nakamoto_snowball_highest_decided_ordinal", h))
+            case None => Sync[F].unit
+          }
+        }
 
         def decidedAt(ordinal: Long): F[Option[Hash]] =
           stateRef.get.map(_.decided.get(ordinal))
@@ -226,5 +259,4 @@ object SnowballAccumulator {
         def unsafe_reset: F[Unit] =
           stateRef.set(State.empty)
       }
-    }
 }

@@ -3,6 +3,7 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 import cats.effect.IO
 import cats.syntax.all._
 
+import io.constellationnetwork.node.shared.infrastructure.metrics.NoOpMetrics
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -16,6 +17,8 @@ import weaver.SimpleIOSuite
   * `~/repos/research-nipopos-2026/sims/avalanche_attestation_calibration_gpu.py` commit `5ace3d36` (reference implementation).
   */
 object SnowballAccumulatorSuite extends SimpleIOSuite {
+
+  implicit private val metrics: io.constellationnetwork.node.shared.infrastructure.metrics.Metrics[IO] = NoOpMetrics.make
 
   private def pid(name: String): PeerId =
     PeerId(Hex(name.getBytes("UTF-8").map(b => f"$b%02x").mkString))
