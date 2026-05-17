@@ -1,6 +1,6 @@
 package io.constellationnetwork.security.kes
 
-/** Stateful interpreter wrapper around [[KesProduct]] that manages the read-once key lifecycle.
+/** Stateful interpreter wrapper around `KesProduct` that manages the read-once key lifecycle.
   *
   * Caller-facing surface:
   *

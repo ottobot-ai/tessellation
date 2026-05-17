@@ -11,11 +11,12 @@ package io.constellationnetwork.security
   *
   * ==Public surface==
   *
-  * The CONSENSUS-FACING public API is the '''product+sum''' composition: [[kes.KesProduct]]. It composes two sum-based trees (super and
-  * sub) and yields up to `2^(heightSup + heightSub)` periods.
+  * The CONSENSUS-FACING public API is [[kes.OperationalKeyMaker]] (the F[_]-typed, lifecycle-managed wrapper around the package-private
+  * `KesProduct` product+sum composition). It composes two sum-based trees (super and sub) and yields up to `2^(heightSup + heightSub)`
+  * periods.
   *
-  * The plain sum composition ([[kes.KesSum]]) is exposed as a building block for completeness and tests; consumers that need forward
-  * security at the consensus layer must use [[kes.KesProduct]].
+  * The plain sum composition (`KesSum`) is exposed as a building block for completeness and tests; consumers that need forward security at
+  * the consensus layer must go through [[kes.OperationalKeyMakerAlgebra]] which is backed by the product+sum scheme.
   *
   * ==Period alignment==
   *

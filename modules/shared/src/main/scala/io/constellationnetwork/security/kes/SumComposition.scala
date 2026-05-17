@@ -12,9 +12,9 @@ import KesBinaryTree._
   *   - Ported from Bifrost's `co.topl.crypto.signing.kes.SumComposition` (credit: Aaron Schutza).
   *
   * The sum scheme alone is a useful building block but is NOT the recommended consensus-facing API: it is bounded in the number of
-  * supported periods. See [[ProductComposition]] / [[KesProduct]] for the production interface.
+  * supported periods. See [[ProductComposition]] / `KesProduct` for the production interface.
   *
-  * This class is package-private; consumers should use [[KesSum]] (which wraps it and exposes a friendlier API surface).
+  * This class is package-private; consumers should use `KesSum` (which wraps it and exposes a friendlier API surface).
   */
 protected[kes] class SumComposition extends KesEd25519Blake2b256 {
 

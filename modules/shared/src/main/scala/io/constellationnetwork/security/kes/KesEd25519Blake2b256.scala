@@ -17,8 +17,8 @@ import KesBinaryTree._
   *
   * Both choices keep the output bit-for-bit compatible with Bifrost so test vectors from `KesProductSpec` can be reused once we wire them.
   *
-  * This class is the building block for [[SumComposition]] (and through it, [[ProductComposition]]); end-users should use [[KesSum]] /
-  * [[KesProduct]] instead.
+  * This class is the building block for [[SumComposition]] (and through it, [[ProductComposition]]); end-users should use `KesSum` /
+  * `KesProduct` instead.
   */
 protected[kes] trait KesEd25519Blake2b256 {
 

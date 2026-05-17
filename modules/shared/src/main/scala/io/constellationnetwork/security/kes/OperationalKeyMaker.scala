@@ -6,7 +6,7 @@ import cats.syntax.either._
 import cats.syntax.flatMap._
 import cats.syntax.functor._
 
-/** Stateful interpreter that wraps [[KesProduct]] in a [[OperationalKeyMakerAlgebra]] with read-once persistence.
+/** Stateful interpreter that wraps `KesProduct` in a [[OperationalKeyMakerAlgebra]] with read-once persistence.
   *
   * Lifecycle:
   *
@@ -31,7 +31,7 @@ object OperationalKeyMaker {
   /** Construct an [[OperationalKeyMakerAlgebra]] backed by `secureStore`. The store must contain exactly one entry under `keyName` at
     * startup.
     *
-    * The underlying KES product scheme is fixed to [[KesProduct.instance]] (package-private). Callers outside the package cannot inject an
+    * The underlying KES product scheme is fixed to `KesProduct.instance` (package-private). Callers outside the package cannot inject an
     * alternate scheme; the interface boundary is the F[_]-typed algebra.
     */
   def make[F[_]: Async](
