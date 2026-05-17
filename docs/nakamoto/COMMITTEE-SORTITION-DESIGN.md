@@ -261,26 +261,30 @@ In the current codebase metagraph snapshots flow through gl0 as `StateChannelOut
 ## 8. Open questions / out of scope
 
 1. **N-2 stake snapshot pipeline.** This doc assumes `sigmaOperatorKey` is fetched against an N-2 frozen StakeRegistry. That snapshot pipeline is task #180 (NIPoPoW S0). Until it lands, an interim implementation can use live stake — broken under adaptive corruption but correct in shape, so the design migration is just swapping the StakeRegistry query.
-2. **Slashing (Option C, follow-up).** A committee member that emits two contradictory attestations on competing snapshots is detectable from the two KES signatures. Slashing logic + stake-burn path is a separate design doc.
+2. **Slashing (Option C).** Covered in [`SLASHING-DESIGN.md`](SLASHING-DESIGN.md). Detection + evidence tx + 100% stake reduction + cooldown + 5% bounty. Lands as S4 of the sequencing below.
 3. **Mid-life joiners (KES Slice 10, #179).** Operators registered mid-life sign with a KES offset. Committee sortition uses VRF + stake fraction, both of which are independent of KES offset, so no interaction. Receiver MUST still verify the operator was in the N-2 active set at this epoch — a brand-new joiner is excluded from the committee until N-2 epochs after their registration finalizes.
 4. **K_target governance.** Fixed for v1. v2 would let each metagraph pick K, with L0-enforced `K ≥ K_floor`. Out of scope here.
 5. **Algorand committee-vs-block-proposer split.** Algorand also uses VRF sortition to elect the proposer separately. We already have a leader VRF for that role (`EligibilityChecker`), so no new design needed.
-6. **Per-snapshot vs per-epoch committee.** Per-snapshot in this doc. Per-epoch (one committee per K_committee_epoch eta periods) would reduce churn but increase adaptive-corruption risk. Defer.
+6. **Per-snapshot vs per-epoch committee.** Per-snapshot for v1; per-epoch is the v2 end-state and is safe **only after slashing lands** (`SLASHING-DESIGN.md`). Per-epoch cuts gossip volume ~K_committee_epoch× (≈ 8× at default cadence: ~60s epoch / ~7s snapshot) — substantial at thousands of metagraphs. Without slashing, per-epoch enables an adaptive-corruption attack: adversary identifies the committee at epoch start, corrupts ⅔ of those specific keys, equivocates with no consequence. Slashing closes that attack — equivocation costs 100% of the stake. v5 of the sequencing flips the VRF message from `snapshot_ord` → `eta_period`; the primitive is unchanged. See §9 S5.
 
 ---
 
 ## 9. Sequencing
 
 1. **This doc** — committee sortition primitive.
-2. **Slashing stake-burn design doc** — separate; detection lands in S4 of impl, but the ledger logic for stake reduction + slashable-window definition needs its own writeup.
-3. **N-2 StakeRegistry pipeline** — #180 (NIPoPoW S0). Required for adaptive-corruption defense.
-4. **Impl S1 — `CommitteeSortition[F]` primitive + tests.**
-5. **Impl S2 — `pb.MetagraphAttestation` + gossip + aggregator stub (warn-only).**
-6. **Impl S3 — pre-inclusion gate (load-bearing flip).**
-7. **Impl S4 — slashing detection on conflicting committee attestations.**
-8. **Impl S5 — e2e validation** at degenerate K=N. Larger-N security validation deferred to scale-test infra.
+2. **[`SLASHING-DESIGN.md`](SLASHING-DESIGN.md)** — slashing ledger logic + evidence tx + bounty. Detection (S4) feeds the validator/effects landed in this doc.
+3. **N-2 StakeRegistry pipeline** — #180 (NIPoPoW S0). Required for adaptive-corruption defense AND for slashing's "stake at evidence time = N-2 frozen" anti-frontrun property.
+4. **Impl S1 — `CommitteeSortition[F]` primitive + tests.** ✅ landed (`65967d996`).
+5. **Impl S2 — `pb.MetagraphAttestation` + sidecar gossip + JVM bindings (no aggregator yet).** ✅ landed (`de15d0b3d`).
+6. **Impl S2.5 — `MetagraphAttestationAggregator[F]` (verify + tally; warn-only emit-on-receive).** Pending.
+7. **Impl S3 — pre-inclusion gate (load-bearing flip).** `processMetagraphBinary` waits for ≥2K/3.
+8. **Impl S4a — `SlashableEvidence` schema + validator.**
+9. **Impl S4b — `SlashingDetector[F]` reads aggregator, emits evidence.**
+10. **Impl S4c — GSAM accept-time stake reduction + cooldown + bounty + burn.**
+11. **Impl S5 — per-epoch committee shift.** VRF message `snapshot_ord → eta_period`. Safe only after S4. Cuts gossip ~K_committee_epoch×.
+12. **Impl S6 — e2e validation** at degenerate K=N. Larger-N security validation deferred to scale-test infra.
 
-S2 must land warn-only before S3 flips load-bearing — same staging pattern that worked for KES Slice 5→9. Skipping the warn-only middle would break liveness the moment the pre-inclusion gate goes live because no operator has historic committee attestations to forward yet.
+S2 must land warn-only before S3 flips load-bearing — same staging pattern that worked for KES Slice 5→9. Skipping the warn-only middle would break liveness the moment the pre-inclusion gate goes live because no operator has historic committee attestations to forward yet. S5 (per-epoch) must come AFTER S4 (slashing) — without the deterrent, per-epoch enables the adaptive-corruption attack documented in §8 Q#6.
 
 ---
 
