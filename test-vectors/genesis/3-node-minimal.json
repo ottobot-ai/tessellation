@@ -8,7 +8,7 @@
       "ECDSA signatures non-deterministic by RNG (verifiable but not byte-equal across loads)"
     ],
     "generatedAt" : "1970-01-01T00:00:00Z",
-    "generatorVersion" : "tools-0.0.0-worktree-SNAPSHOT",
+    "generatorVersion" : "tools-3.2.0-rc.2+687.f2983307.local",
     "invocation" : "generate-genesis --num-operators 3 --seed 1004 --stake-distribution 0.5,0.3,0.2 --stake-budget-datum 100000000000 --collateral-per-operator 0 --network-magic test-cluster",
     "seed" : 1004
   },
@@ -75,6 +75,26 @@
     {
       "address" : "DAG2EKXDT8kp4dFvrwSKEJBjCFPm2vuyK6cBzckv",
       "balance" : 100000000000000
+    }
+  ],
+  "kesRegistrations" : [
+    {
+      "kesVk" : "c076dfda21656efb05ff19bb5f3ffb95dbef3debfe0b5752d7623953793e876b",
+      "kesVkStep" : 0,
+      "longTermSig" : "3045022039c7640494a217fa89fe429831ee062d31c00f0747106d237d4b4df146f34d4c022100f8cd2ebe95f57561087b26b98bb572bfd297a3fe23f9efbde64366960ed9a09d",
+      "peerId" : "806d2f7a6885beceeda89271b3fc90339b0fc473a5cff7c157b1280469089cc1e0d5e48d0aa093e04c0b7b4717138ac05cb461f9b672b7124bad488fe7d90b8d"
+    },
+    {
+      "kesVk" : "bc4aedec525b5146138bdc37b39316e60bad4785c1da79255869cc5086876e39",
+      "kesVkStep" : 0,
+      "longTermSig" : "3045022069eeedece2689df28bcfb950dc259deb2d9494efaa7aa966b6e7fbd948e43c38022100eb6ff0e278461d2111400e1debad60485f350b5c84e02fe783f0af8171811347",
+      "peerId" : "b1fc3ea204cc384b4e43a9bc6d3b804293df6a0dd142233695293260a50e59051145597f3b66c157f7ece2cc7560945a1b7ac63be5bc28cffc1da294836a78a7"
+    },
+    {
+      "kesVk" : "f2b0cdf626a6af2d20414c2d5466f4694eead7673719b886bd85c5966580a140",
+      "kesVkStep" : 0,
+      "longTermSig" : "3046022100aa19f1ef803f5b5a653d981056dfd0d9bc882d2b8f30a9838aeeb8c969f13ba6022100f1f7d5d5bcdbaa395b8560cba09cfbddf674c8e30aa63fa0c32a010291faad32",
+      "peerId" : "eae96ee3fd37dfd55545ffdf36974d76eeeb95a0f8ecf036c111de27f0e5cef6f240e70e291d3b1f9c8225025c46f53bba23ec91a8dc6fd832e045f79c5e68a3"
     }
   ],
   "networkMagic" : "test-cluster",

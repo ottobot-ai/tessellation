@@ -1,5 +1,7 @@
 package io.constellationnetwork.tools.genesis
 
+import java.nio.file.attribute.PosixFilePermissions
+import java.nio.file.{Files => JFiles, Paths => JPaths}
 import java.security.spec.ECGenParameterSpec
 import java.security.{KeyPair, KeyPairGenerator => JKeyPairGenerator, SecureRandom => JSecureRandom}
 import java.time.format.DateTimeFormatter
@@ -16,8 +18,10 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.SecurityProvider
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.kes.OperationalKeyMaker
 import io.constellationnetwork.security.key.ops._
 import io.constellationnetwork.security.key.{ECDSA, secp256k}
+import io.constellationnetwork.security.signature.Signing
 
 import eu.timepit.refined.refineV
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -51,8 +55,20 @@ object GenesisGenerator {
 
   case class GeneratedOutputs(
     l0Genesis: L0GenesisData,
-    cl1Genesis: Option[Cl1GenesisData]
+    cl1Genesis: Option[Cl1GenesisData],
+    // §1.2 Slice 3b: per-operator KES SK byte blobs the caller writes to per-operator key
+    // directories. Held in-memory inside the generator; the CLI dispatcher (`Main.generateGenesis`)
+    // persists them via `writeKesSecretKeys`. Empty when KES generation is disabled.
+    kesSecretKeys: List[OperatorKesSecretKey] = List.empty
   )
+
+  /** Per-operator KES SK material. The CLI side writes `bytes` to `<output-dir>/keys/operator-<operatorIndex>/kes-sk.bin` with `chmod
+    * 0600`.
+    *
+    * The byte blob is the same `SecretKeyCodec.encodeProductSk` output that the gl0 startup path will later consume from a disk-backed
+    * `SecureStore` (Slice 4) to reopen the master key.
+    */
+  case class OperatorKesSecretKey(operatorIndex: Int, peerId: PeerId, bytes: Array[Byte])
 
   private def deterministicRng(seed: Long, salt: String): JSecureRandom = {
     val rng = JSecureRandom.getInstance("SHA1PRNG")
@@ -179,6 +195,43 @@ object GenesisGenerator {
             kesPublicKey = None
           )
       }
+      // §1.2 Slice 3b: per-operator KES master key + registration cert. The KES seed is drawn
+      // from a `SecureRandom` (NOT derived from the operator's long-term key) — forward security
+      // requires that compromise of the long-term key does not leak the KES SK or any past KES
+      // signature. The registration signature `Sign_ed25519(kesVk.value)` is what binds the master
+      // VK to the operator identity for downstream verifiers.
+      //
+      // The encoded SK bytes (raw `SecretKeyCodec.encodeProductSk` output) are carried in
+      // `GeneratedOutputs.kesSecretKeys` for the CLI dispatcher to persist via
+      // `writeKesSecretKeys`. They do NOT land in the L0 genesis JSON — only the public VK +
+      // registration signature do.
+      kesMaterial <- (0 until opts.numOperators).toList.traverse { i =>
+        val kp = operatorKeys(i)
+        val peerId = PeerId.fromPublic(kp.getPublic)
+        for {
+          seed <- Async[F].delay {
+            val s = new Array[Byte](32)
+            new JSecureRandom().nextBytes(s)
+            s
+          }
+          skVk <- OperationalKeyMaker.generateFreshKesKeyMaterial[F](seed)
+          (skBytes, vk) = skVk
+          _ <- Async[F].delay(java.util.Arrays.fill(seed, 0.toByte))
+          // Sign the RAW vk bytes (NOT the hex string) with the operator's long-term Ed25519 key.
+          // Receivers verify with `Signing.verifySignature(vk.value, longTermSig)` using the
+          // operator's long-term pubkey (recovered from `L0GenesisOperator.peerId`).
+          regSig <- Signing.signData[F](vk.value)(kp.getPrivate)
+          registration = L0GenesisKesRegistration(
+            peerId = peerId.value.value,
+            kesVk = Hex.fromBytes(vk.value).value,
+            kesVkStep = vk.step,
+            longTermSig = Hex.fromBytes(regSig).value
+          )
+          sk = OperatorKesSecretKey(operatorIndex = i, peerId = peerId, bytes = skBytes)
+        } yield (registration, sk)
+      }
+      kesRegistrations = kesMaterial.map(_._1)
+      kesSecretKeys = kesMaterial.map(_._2)
       stakeAmounts = allocateStakeAmounts(opts.stakeDistribution, opts.stakeBudgetDatum)
       delegatedStakes = delegatorKeys.zipWithIndex.flatMap {
         case (dKp, i) =>
@@ -239,7 +292,8 @@ object GenesisGenerator {
         operators = operators,
         delegatedStakes = delegatedStakes,
         nodeCollaterals = nodeCollaterals,
-        initialBalances = initialBalances
+        initialBalances = initialBalances,
+        kesRegistrations = Some(kesRegistrations)
       )
       cl1 = opts.initialBalancesCsv.map { _ =>
         Cl1GenesisData(
@@ -250,7 +304,7 @@ object GenesisGenerator {
           balances = initialBalances
         )
       }
-    } yield GeneratedOutputs(l0, cl1)
+    } yield GeneratedOutputs(l0, cl1, kesSecretKeys)
 
   private def validateOpts[F[_]: Async](opts: GeneratorOpts): F[Unit] = {
     val errors = scala.collection.mutable.ListBuffer.empty[String]
@@ -268,6 +322,30 @@ object GenesisGenerator {
       Async[F].raiseError(new IllegalArgumentException(s"Invalid generator options: ${errors.mkString("; ")}"))
     )
   }
+
+  /** Persist each per-operator KES SK blob to `<outputDir>/keys/operator-<N>/kes-sk.bin`, with the file mode set to `0600` (owner-only
+    * read/write). The directory layout is the one a future disk-backed [[io.constellationnetwork.security.kes.SecureStore]] (Slice 4) will
+    * mount: one file per key entry, file name = `keyName`, bytes = raw `SecretKeyCodec.encodeProductSk` output.
+    *
+    * POSIX permissions are best-effort; on file systems that do not support POSIX permissions (e.g. tmpfs on some CI sandboxes), the chmod
+    * step is logged but does not fail the write.
+    */
+  def writeKesSecretKeys[F[_]: Async](outputDir: String, keys: List[OperatorKesSecretKey]): F[List[String]] =
+    keys.traverse { sk =>
+      Async[F].delay {
+        val dir = JPaths.get(outputDir, "keys", s"operator-${sk.operatorIndex}")
+        JFiles.createDirectories(dir)
+        val skFile = dir.resolve("kes-sk.bin")
+        JFiles.write(skFile, sk.bytes)
+        // Restrict to owner-only. Skip silently on file systems without POSIX support — the
+        // alternative (failing the write) breaks the cross-platform contract; the docs note this.
+        scala.util.Try {
+          val perms = PosixFilePermissions.fromString("rw-------")
+          JFiles.setPosixFilePermissions(skFile, perms)
+        }
+        skFile.toAbsolutePath.toString
+      }
+    }
 
   private def loadOrSynthesizeBalances[F[_]: Async](
     csvPath: Option[String],

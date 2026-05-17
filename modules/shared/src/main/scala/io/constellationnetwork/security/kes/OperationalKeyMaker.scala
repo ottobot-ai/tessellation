@@ -156,4 +156,29 @@ object OperationalKeyMaker {
 
     Resource.eval(acquire) >> make(secureStore, keyName, etaPeriodLength)
   }
+
+  /** Generate a fresh KES product keypair from `seed` at offset `0`, and return the encoded secret-key bytes together with the master
+    * verification key at step 0. Genesis-generator helper: the Tier-1 generator embeds the master VK in the L0 genesis fixture as part of
+    * the per-operator KES registration record, and writes the encoded SK bytes to a per-operator `kes-sk.bin` file that the gl0 container
+    * will later mount and load via a disk-backed [[SecureStore]] (Slice 3d / Slice 4).
+    *
+    * The returned SK bytes are the same format `OperationalKeyMaker.make` consumes from a [[SecureStore]] — i.e. the output of
+    * [[SecretKeyCodec.encodeProductSk]]. The caller owns the returned bytes; they must be securely written to disk + scrubbed from memory
+    * after use. Same `seed.clone()` defensive copy + scrub as [[bootstrap]] for symmetry.
+    *
+    *   - `seed` — entropy for the KES tree. Must not be reused across operators.
+    *   - `height` — `(superHeight, subHeight)` tree shape. Default [[DefaultHeight]] = `(7, 7)` → 16384 periods.
+    */
+  def generateFreshKesKeyMaterial[F[_]: Async](
+    seed: Array[Byte],
+    height: (Int, Int) = DefaultHeight
+  ): F[(Array[Byte], VerificationKeyKesProduct)] = {
+    val seedCopy = seed.clone()
+    Async[F].delay {
+      val (sk, vk) = KesProduct.instance.createKeyPair(seedCopy, height, offset = 0L)
+      val encoded = SecretKeyCodec.encodeProductSk(sk)
+      java.util.Arrays.fill(seedCopy, 0.toByte)
+      (encoded, vk)
+    }
+  }
 }

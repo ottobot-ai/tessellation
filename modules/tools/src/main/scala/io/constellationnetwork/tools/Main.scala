@@ -299,11 +299,17 @@ object Main
           java.nio.file.Files.writeString(cmd.outputDir.resolve("cl1-genesis.json"), cl1Json)
         }
       }
+      // §1.2 Slice 3b: persist per-operator KES SK blobs to <outputDir>/keys/operator-<N>/kes-sk.bin
+      // for the gl0 container to mount + load at startup (Slice 3d / Slice 4). The public KES
+      // registration certs live in the L0 genesis JSON itself.
+      skPaths <- GenesisGenerator.writeKesSecretKeys[F](cmd.outputDir.toString, outputs.kesSecretKeys)
       _ <- console.green[F](s"Wrote l0-genesis.json (${l0Json.length} bytes) to ${cmd.outputDir}")
       _ <- console.green[F](s"  operators: ${outputs.l0Genesis.operators.size}")
       _ <- console.green[F](s"  delegatedStakes: ${outputs.l0Genesis.delegatedStakes.size}")
       _ <- console.green[F](s"  nodeCollaterals: ${outputs.l0Genesis.nodeCollaterals.size}")
       _ <- console.green[F](s"  initialBalances: ${outputs.l0Genesis.initialBalances.size}")
+      _ <- console.green[F](s"  kesRegistrations: ${outputs.l0Genesis.kesRegistrations.map(_.size).getOrElse(0)}")
+      _ <- console.green[F](s"  kesSecretKeys written: ${skPaths.size} (under ${cmd.outputDir}/keys/operator-*)")
     } yield ()
   }
 
