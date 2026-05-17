@@ -61,9 +61,9 @@ object StakeRegistry {
     * most of the stake.
     *
     * §1.1 semantic change: the comparison is now a stake fraction (Σ stake of observed-active ÷ Σ stake of full seedlist) instead of a
-    * count fraction (# observed-active ÷ # seedlist). The env var name `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` is unchanged — interface
-    * stable, semantics moved with the stake-weighted VRF election. For the legacy `equalWeight` registry the comparison remains
-    * count-fraction (since every peer carries 1/N) and the two definitions coincide.
+    * count fraction (# observed-active ÷ # seedlist). The env var name `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` is unchanged — interface stable,
+    * semantics moved with the stake-weighted VRF election. For the legacy `equalWeight` registry the comparison remains count-fraction
+    * (since every peer carries 1/N) and the two definitions coincide.
     *
     * Default: 1/2. Override via `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` (parsed Double, locked into Ratio at boot). Lower for small clusters;
     * raise for stricter participation requirements.

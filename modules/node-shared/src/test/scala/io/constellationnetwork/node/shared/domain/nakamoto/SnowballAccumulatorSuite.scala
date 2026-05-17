@@ -9,12 +9,11 @@ import io.constellationnetwork.security.hex.Hex
 
 import weaver.SimpleIOSuite
 
-/** Tests for [[SnowballAccumulator]] — the per-(ordinal, hash) lifetime accumulator implementing Snowball
-  * decision semantics from the Snow family.
+/** Tests for [[SnowballAccumulator]] — the per-(ordinal, hash) lifetime accumulator implementing Snowball decision semantics from the Snow
+  * family.
   *
-  * Anchors: `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §2.2 (algebraic decision rule), §3.4 (why
-  * K=8/α=5/β=10), GPU sim kernel at `~/repos/research-nipopos-2026/sims/avalanche_attestation_calibration_gpu.py`
-  * commit `5ace3d36` (reference implementation).
+  * Anchors: `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §2.2 (algebraic decision rule), §3.4 (why K=8/α=5/β=10), GPU sim kernel at
+  * `~/repos/research-nipopos-2026/sims/avalanche_attestation_calibration_gpu.py` commit `5ace3d36` (reference implementation).
   */
 object SnowballAccumulatorSuite extends SimpleIOSuite {
 
@@ -279,9 +278,7 @@ object SnowballAccumulatorSuite extends SimpleIOSuite {
       acc <- SnowballAccumulator.make[IO](beta = 10)
       _ <- (1 to 10).toList.traverse_(i => acc.recordAttestation(pid(s"p-$i"), 50L, h50))
       _ <- (1 to 10).toList.traverse_(i => acc.recordAttestation(pid(s"q-$i"), 60L, h60off))
-      result <- acc.highestDecidedOnCanonical(o =>
-        IO.pure(if (o == 50L) Some(h50) else if (o == 60L) Some(h60canon) else None)
-      )
+      result <- acc.highestDecidedOnCanonical(o => IO.pure(if (o == 50L) Some(h50) else if (o == 60L) Some(h60canon) else None))
     } yield expect.same(Some(50L), result)
   }
 
