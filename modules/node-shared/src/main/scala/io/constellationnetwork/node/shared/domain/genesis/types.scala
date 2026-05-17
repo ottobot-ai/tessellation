@@ -138,6 +138,32 @@ object types {
     * `GlobalSnapshot.mkGenesis`, and applies the `delegatedStakes` and `nodeCollaterals` fields by overlay onto the in-memory
     * `GlobalSnapshotInfo` AFTER `toGlobalSnapshotInfo` is called (Option (ii) in the plan — the on-disk `Signed[GlobalSnapshot]` stays V1).
     */
+  /** Per-operator KES master-VK registration cert embedded in L0 genesis. Slice 3 of §1.2 KES wiring.
+    *
+    *   - `peerId` — hex-encoded operator PeerId (matches `L0GenesisOperator.peerId`).
+    *   - `kesVk` — hex-encoded `VerificationKeyKesProduct.value` (the period-0 root of the super × sub Merkle tree, 32 bytes for the
+    *     Blake2b-256 default).
+    *   - `kesVkStep` — `VerificationKeyKesProduct.step`. Always `0` for a freshly-generated master VK at genesis time; carried explicitly
+    *     so reconstruction of the `VerificationKeyKesProduct` doesn't have to assume a fixed step.
+    *   - `longTermSig` — hex-encoded SHA512withECDSA signature of `kesVk` raw bytes (after hex-decode) under the operator's long-term
+    *     Ed25519 private key. This is the registration binding: any receiver who knows the operator's long-term public key (from the
+    *     seedlist / `L0GenesisOperator`) can verify the binding without ever seeing the KES SK.
+    *
+    * Optional in the L0 genesis JSON for backward compatibility with fixtures generated before §1.2 Slice 3 (they parse with the field
+    * absent and `KesRegistry.empty` is used downstream).
+    */
+  case class L0GenesisKesRegistration(
+    peerId: String,
+    kesVk: String,
+    kesVkStep: Int,
+    longTermSig: String
+  )
+
+  object L0GenesisKesRegistration {
+    implicit val encoder: Encoder[L0GenesisKesRegistration] = deriveEncoder[L0GenesisKesRegistration]
+    implicit val decoder: Decoder[L0GenesisKesRegistration] = deriveDecoder[L0GenesisKesRegistration]
+  }
+
   case class L0GenesisData(
     _meta: L0GenesisMeta,
     networkMagic: String,
@@ -147,7 +173,11 @@ object types {
     operators: List[L0GenesisOperator],
     delegatedStakes: List[L0GenesisDelegatedStake],
     nodeCollaterals: List[L0GenesisNodeCollateral],
-    initialBalances: List[L0GenesisBalance]
+    initialBalances: List[L0GenesisBalance],
+    // §1.2 Slice 3: per-operator KES master VK registration. Optional so existing Tier-1 fixtures
+    // (8-node-uniform-stake.json etc) still parse — they pre-date this field and consume the
+    // `KesRegistry.empty` default downstream.
+    kesRegistrations: Option[List[L0GenesisKesRegistration]] = None
   ) {
 
     /** Build a deterministic balance map for `GlobalSnapshot.mkGenesis`. Combines `initialBalances` with the delegator/owner addresses from

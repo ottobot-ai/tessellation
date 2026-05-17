@@ -9,12 +9,16 @@ import cats.syntax.all._
 import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.node.shared.domain.genesis.types.{L0GenesisData, L0GenesisDelegatedStake, L0GenesisNodeCollateral}
+import io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry
+import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, UpdateDelegatedStake}
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, UpdateNodeCollateral}
+import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.kes.VerificationKeyKesProduct
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
 
@@ -137,5 +141,33 @@ object L0GenesisLoader {
         activeDelegatedStakes = Some(stakeMap),
         activeNodeCollaterals = Some(collMap)
       )
+    }
+
+  /** Build a [[KesRegistry]] from the `kesRegistrations` field of an L0 genesis fixture. Each entry is hex-decoded into a
+    * `VerificationKeyKesProduct` and keyed by the registered `PeerId`. Entries whose `peerId` or `kesVk` fail to hex-decode are dropped
+    * silently — Tier-1 fixtures are reviewed before landing, so a malformed registration is best surfaced as "peer absent from registry"
+    * rather than as a hard failure during boot.
+    *
+    *   - Missing `kesRegistrations` (None) ⇒ empty registry. Slice 3 backward-compat for fixtures predating the field.
+    *   - `longTermSig` is parsed and kept available for callers that want to re-verify the binding at load time (e.g. a startup sanity
+    *     check that the operator's long-term pubkey actually signed this VK). For Slice 3 we just trust the fixture — the generator side
+    *     runs the binding signature, and the loader trusts the file. A future strict-mode could verify here.
+    */
+  def buildKesRegistry[F[_]: Async](data: L0GenesisData): F[KesRegistry[F]] =
+    Async[F].delay {
+      val parsed: Map[PeerId, VerificationKeyKesProduct] =
+        data.kesRegistrations
+          .getOrElse(Nil)
+          .flatMap { r =>
+            val peerOpt = scala.util.Try(Id(Hex(r.peerId)).toPeerId).toOption
+            val vkBytesOpt = scala.util.Try(Hex(r.kesVk).toBytes).toOption
+            (peerOpt, vkBytesOpt) match {
+              case (Some(p), Some(vkBytes)) =>
+                Some(p -> VerificationKeyKesProduct(vkBytes, r.kesVkStep))
+              case _ => None
+            }
+          }
+          .toMap
+      KesRegistry.make[F](parsed)
     }
 }
