@@ -13,24 +13,22 @@ import eu.timepit.refined.auto._
 
 /** §1.2 Slice 5/6 — warn-only KES verification of incoming attestations + snapshots.
   *
-  * Pulled out of [[NakamotoSyncDaemon]] so the verification logic + counter taxonomy live in one
-  * place and are independently unit-testable. The daemon retains responsibility for routing (call
-  * the right helper after the Ed25519 path succeeds); this object owns the matrix:
+  * Pulled out of [[NakamotoSyncDaemon]] so the verification logic + counter taxonomy live in one place and are independently unit-testable.
+  * The daemon retains responsibility for routing (call the right helper after the Ed25519 path succeeds); this object owns the matrix:
   *
-  *   - empty wire field  → `*_no_sig_total`            (no log)
-  *   - decode failure    → `*_decode_failed_total`     (WARN)
+  *   - empty wire field → `*_no_sig_total` (no log)
+  *   - decode failure → `*_decode_failed_total` (WARN)
   *   - sig + no registry → `*_no_registry_entry_total` (DEBUG)
-  *   - sig + verify OK   → `*_verified_total`          (INFO)
-  *   - sig + verify fail → `*_invalid_total`           (WARN — do NOT reject)
+  *   - sig + verify OK → `*_verified_total` (INFO)
+  *   - sig + verify fail → `*_invalid_total` (WARN — do NOT reject)
   *
-  * '''Warn-only'''. This slice does not reject anything on KES failure — Ed25519 remains the
-  * load-bearing path until Slice 9 flips KES to be authoritative.
+  * '''Warn-only'''. This slice does not reject anything on KES failure — Ed25519 remains the load-bearing path until Slice 9 flips KES to
+  * be authoritative.
   */
 private[nakamoto] object KesGossipVerification {
 
-  /** Verify a KES signature attached to an attestation. `messageBytes` is the Ed25519-signed
-    * attestation-hash bytes (the same bytes the Ed25519 path verified). Period is recomputed
-    * from `tipOrdinal` for log context only — the actual KES verify reconstructs the period
+  /** Verify a KES signature attached to an attestation. `messageBytes` is the Ed25519-signed attestation-hash bytes (the same bytes the
+    * Ed25519 path verified). Period is recomputed from `tipOrdinal` for log context only — the actual KES verify reconstructs the period
     * from the secret-key tree's internal step.
     */
   def verifyAttestation[F[_]: Async: Metrics](
@@ -78,8 +76,8 @@ private[nakamoto] object KesGossipVerification {
     }
   }
 
-  /** Verify a KES signature attached to a snapshot. `messageBytes` is the snapshot-hash bytes
-    * (the same bytes the producer signed on the sender side).
+  /** Verify a KES signature attached to a snapshot. `messageBytes` is the snapshot-hash bytes (the same bytes the producer signed on the
+    * sender side).
     */
   def verifySnapshot[F[_]: Async: Metrics](
     messageBytes: Array[Byte],

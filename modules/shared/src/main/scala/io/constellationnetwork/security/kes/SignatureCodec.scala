@@ -12,15 +12,15 @@ import java.io._
   *   - subSignature: same
   *   - subRoot: a single byte array
   *
-  * Package-private — the `SignatureKesSum` shape it encodes is internal. Cross-package callers (Slice 5/6 receivers in `dag-l0`)
-  * reach the encode/decode via the [[OperationalKeyMaker]] forwarder methods, which keep the wire format scoped to this module.
+  * Package-private — the `SignatureKesSum` shape it encodes is internal. Cross-package callers (Slice 5/6 receivers in `dag-l0`) reach the
+  * encode/decode via the [[OperationalKeyMaker]] forwarder methods, which keep the wire format scoped to this module.
   */
 private[kes] object SignatureCodec {
 
-  /** Encode a product signature to its wire representation. The encoded length is small in practice: each `SignatureKesSum` is
-    * `vk (32B) + sig (64B) + witness (~7 × 32B)` ≈ 320B for typical Bifrost-port heights; the product carries two of these plus a
-    * single root, so a full product signature serializes to roughly 700 bytes. The 4-byte length prefixes add 4 × (2 + 1 +
-    * 2 × ⌈log₂(treeHeight)⌉) ≈ 60B of overhead.
+  /** Encode a product signature to its wire representation. The encoded length is small in practice: each `SignatureKesSum` is `vk (32B) +
+    * sig (64B) + witness (~7 × 32B)` ≈ 320B for typical Bifrost-port heights; the product carries two of these plus a single root, so a
+    * full product signature serializes to roughly 700 bytes. The 4-byte length prefixes add 4 × (2 + 1 + 2 × ⌈log₂(treeHeight)⌉) ≈ 60B of
+    * overhead.
     */
   def encodeSignature(sig: SignatureKesProduct): Array[Byte] = {
     val baos = new ByteArrayOutputStream()
@@ -32,9 +32,9 @@ private[kes] object SignatureCodec {
     baos.toByteArray
   }
 
-  /** Decode a product signature from its wire representation. Returns `Left(KesError.MalformedTree)` on truncation, implausible
-    * length fields, or any other parse failure. Implausibility bounds match [[SecretKeyCodec]] (16 MiB max per byte array, 64
-    * max witness entries) to defend against length-prefix attacks; valid signatures sit far below both limits.
+  /** Decode a product signature from its wire representation. Returns `Left(KesError.MalformedTree)` on truncation, implausible length
+    * fields, or any other parse failure. Implausibility bounds match [[SecretKeyCodec]] (16 MiB max per byte array, 64 max witness entries)
+    * to defend against length-prefix attacks; valid signatures sit far below both limits.
     */
   def decodeSignature(bytes: Array[Byte]): Either[KesError, SignatureKesProduct] = {
     val dis = new DataInputStream(new ByteArrayInputStream(bytes))

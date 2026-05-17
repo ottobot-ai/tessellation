@@ -15,18 +15,16 @@ import weaver.SimpleIOSuite
 
 /** §1.2 Slice 5/6 verify-path round-trip tests.
   *
-  * Asserts the warn-only behavior matrix for both [[KesGossipVerification.verifyAttestation]] and
-  * [[KesGossipVerification.verifySnapshot]]:
+  * Asserts the warn-only behavior matrix for both [[KesGossipVerification.verifyAttestation]] and [[KesGossipVerification.verifySnapshot]]:
   *
-  *   - sender's signature + receiver's verification round-trip cleanly when the kesRegistry has the
-  *     sender's master VK (hard correctness claim from the slice spec)
+  *   - sender's signature + receiver's verification round-trip cleanly when the kesRegistry has the sender's master VK (hard correctness
+  *     claim from the slice spec)
   *   - empty wire field → no-sig counter increments
   *   - present sig + missing registry entry → no-registry-entry counter
   *   - present sig + wrong VK in registry → invalid counter (registry pre-seeded with a different VK)
   *
-  * Uses [[CountingMetrics]] to assert per-counter increments and the existing
-  * [[OperationalKeyMaker.bootstrap]] pattern from `OperationalKeyMakerSuite` for deterministic
-  * sender keys (in-memory store + fixed seed).
+  * Uses [[CountingMetrics]] to assert per-counter increments and the existing [[OperationalKeyMaker.bootstrap]] pattern from
+  * `OperationalKeyMakerSuite` for deterministic sender keys (in-memory store + fixed seed).
   */
 object KesGossipVerificationSuite extends SimpleIOSuite {
 
@@ -47,8 +45,8 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
   private def setup: IO[(cats.effect.kernel.Ref[IO, Map[String, Int]], Metrics[IO])] =
     CountingMetrics.make
 
-  /** Build a signing OperationalKeyMaker with a deterministic seed; return both the algebra
-    * (for `signAt`) and the master VK (for the registry).
+  /** Build a signing OperationalKeyMaker with a deterministic seed; return both the algebra (for `signAt`) and the master VK (for the
+    * registry).
     */
   private def buildSigner(seedByte: Byte): IO[(OperationalKeyMakerAlgebra[IO], VerificationKeyKesProduct)] =
     SecureStore.inMemory[IO].flatMap { store =>

@@ -7,17 +7,16 @@ import scala.concurrent.duration.FiniteDuration
 
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics.{MetricKey, TagSeq}
 
-/** Test-only Metrics interpreter that records `incrementCounter` calls into a `Ref[Map[String, Int]]`
-  * so suites can assert against per-counter call counts. All other methods are no-ops.
+/** Test-only Metrics interpreter that records `incrementCounter` calls into a `Ref[Map[String, Int]]` so suites can assert against
+  * per-counter call counts. All other methods are no-ops.
   *
-  * Lives under the `node.shared.infrastructure.metrics` package so it can satisfy the
-  * `private[shared] getAllAsText` member of [[Metrics]] without subclass-visibility tricks at the
-  * call site.
+  * Lives under the `node.shared.infrastructure.metrics` package so it can satisfy the `private[shared] getAllAsText` member of [[Metrics]]
+  * without subclass-visibility tricks at the call site.
   */
 object CountingMetrics {
 
-  /** Build a `(counterRef, metricsInstance)` pair. Call sites usually start with `setup` and pass
-    * the metrics into the system under test, then snapshot the ref at the end of the test.
+  /** Build a `(counterRef, metricsInstance)` pair. Call sites usually start with `setup` and pass the metrics into the system under test,
+    * then snapshot the ref at the end of the test.
     */
   def make: IO[(Ref[IO, Map[String, Int]], Metrics[IO])] =
     Ref.of[IO, Map[String, Int]](Map.empty).map { ref =>
