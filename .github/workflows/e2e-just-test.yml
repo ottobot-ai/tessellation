@@ -94,15 +94,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Default stake distribution is `rand` with NAKAMOTO_GENESIS_SEED=42 (resolved in
-        # set-env.sh when --stake-dist is omitted) — every matrix entry exercises the
-        # Tier-1 / stake-weighted-VRF / KES path with a deterministic non-uniform shape.
+        # Default stake distribution is `harmonic` (Zipf-style w_i=1/(i+1), normalized;
+        # resolved in set-env.sh when --stake-dist is omitted) — every matrix entry
+        # exercises the Tier-1 / stake-weighted-VRF / KES path with a deterministic
+        # non-uniform shape and a top-operator share of ~0.37 at N=8. The skew is
+        # load-bearing for #186 (uniform / near-uniform stake flickers MultiBranch
+        # overlay branches in gl0 acceptance validators).
         # Two explicit overrides:
         # - `nakamoto-heavy-skew`: a sharply-skewed distribution (0.4/0.2/0.1/0.1/0.05x4)
         #   to catch threshold-saturation edge cases at the heavy end.
         # - `nakamoto-uniform`: uniform 1/N stake — stress-tests `lastTokenLocksRefs` /
         #   `lastStateChannelSnapshotHashes` consistency under maximal leader churn
-        #   (#117 / #118 family). Expected to be flaky until the OverlayReader work lands.
+        #   (#117 / #118 / #186 family). Expected to be flaky until the OverlayReader
+        #   work lands.
         # The legacy CSV-genesis path is reachable via `--stake-dist=csv`.
         test-group:
           - { name: dag-cluster,            tests: "dag-cluster" }

@@ -268,22 +268,23 @@ done
 # now that NUM_GL0_NODES is known. compose-runner.sh forwards the env var to the Tier-1
 # genesis generator path (test-vectors/genesis fixtures); when unset, default CSV path is used.
 #
-# Default to --stake-dist=rand (with NAKAMOTO_GENESIS_SEED=42 below for determinism) when
-# the flag is omitted AND we have ≥ 2 gl0 nodes, so that every `just test` run takes the
-# Tier-1 path (stake-weighted VRF + KES registry populated from genesis) AND uses a
-# realistic non-uniform shape. Uniform stake was tried first but it exposes a pre-existing
-# `lastTokenLocksRefs` race (#117 / #118 family — gl0 acceptance validators flicker
-# between overlay branches under maximal leader churn). Non-uniform stake concentrates
-# leadership on the heavy operators, which keeps the lastRef view stable enough for the
-# acceptance validators to converge. The CSV-only legacy path is reachable via
-# --stake-dist=csv. Uniform stake stays reachable via --stake-dist=uniform for anyone who
-# wants to stress-test the lastRef race directly.
+# Default to --stake-dist=harmonic when the flag is omitted AND we have ≥ 2 gl0 nodes.
+# Harmonic gives a deterministic Zipf-style skewed distribution (w_i = 1/(i+1), normalized)
+# so every `just test` exercises the Tier-1 / stake-weighted-VRF / KES path AND keeps the
+# top operator's stake share ≥ ~0.37 for any N. The skew is load-bearing: under more-
+# uniform stake the gl0 acceptance validators (TokenLockBlockAcceptanceLogic +
+# GlobalSnapshotStateChannelAcceptanceManager) race against MultiBranch overlay branch
+# switches and reject chain-linked TXs with ParentHashNotEqLastTxHash / Chain-link
+# rejection — see task #186 (same family as #117 / #118). Concentrating leadership on
+# a single heavy operator keeps the branch view stable enough for the existing
+# validators to converge. Harmonic matches the shape used in iter37/iter36 validation
+# (0.4/0.2/0.1/0.1/0.05x4 for N=8 → harmonic gives 0.37/0.18/0.12/0.09/0.07/0.06/0.05/0.05).
+#
+# Uniform and rand stakes both expose #186 and are kept reachable via --stake-dist=
+# uniform / --stake-dist=rand for explicit stress-testing. CSV-genesis fallback via
+# --stake-dist=csv.
 if [ -z "${STAKE_DIST_SPEC:-}" ] && [ -n "${NUM_GL0_NODES:-}" ] && [ "$NUM_GL0_NODES" -ge 2 ]; then
-  export STAKE_DIST_SPEC="rand"
-  # Deterministic seed so test runs are reproducible. Override via NAKAMOTO_GENESIS_SEED
-  # for adversarial / soak runs that want to randomize the operator order.
-  : "${NAKAMOTO_GENESIS_SEED:=42}"
-  export NAKAMOTO_GENESIS_SEED
+  export STAKE_DIST_SPEC="harmonic"
 fi
 
 if [ "${STAKE_DIST_SPEC:-}" = "csv" ]; then
@@ -314,6 +315,22 @@ if [ -n "${STAKE_DIST_SPEC:-}" ]; then
         srand(seed)
         total = 0
         for (i = 0; i < n; i++) { w[i] = rand() + 0.01; total += w[i] }
+        for (i = 0; i < n; i++) { if (i > 0) printf ","; printf "%.6f", w[i] / total }
+      }')
+      ;;
+    harmonic)
+      # Zipf-style skewed distribution: w_i = 1/(i+1), normalized. Deterministic (no
+      # seed), scales naturally to any N≥2, top-operator share decreases gradually
+      # from 0.67 (N=2) → 0.55 (N=3) → 0.44 (N=5) → 0.37 (N=8) → 0.32 (N=10).
+      # Top share stays well above 1/N for all N, which keeps the gl0 acceptance
+      # validators' branch view stable under leader churn (see #186).
+      if [ -z "${NUM_GL0_NODES:-}" ] || [ "$NUM_GL0_NODES" -lt 2 ]; then
+        echo "ERROR: --stake-dist=harmonic requires --num-gl0=N with N >= 2 (got: '${NUM_GL0_NODES:-}')"
+        exit 1
+      fi
+      export NAKAMOTO_STAKE_DISTRIBUTION=$(awk -v n="$NUM_GL0_NODES" 'BEGIN {
+        total = 0
+        for (i = 0; i < n; i++) { w[i] = 1.0 / (i + 1); total += w[i] }
         for (i = 0; i < n; i++) { if (i > 0) printf ","; printf "%.6f", w[i] / total }
       }')
       ;;
