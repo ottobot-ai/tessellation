@@ -77,7 +77,8 @@ object KesRegistryLoaderSuite extends SimpleIOSuite {
         peerId = peerHex('a'),
         kesVk = vkHex('1'),
         kesVkStep = 0,
-        longTermSig = regSigHex
+        longTermSig = regSigHex,
+        offset = 0L
       )
     )
     for {
@@ -89,15 +90,16 @@ object KesRegistryLoaderSuite extends SimpleIOSuite {
       expect.same(1, all.size) &&
         expect.same(None, missing) &&
         expect(lookup.isDefined) &&
-        expect.same(lookup.map(_.step), Some(0)) &&
-        expect(lookup.map(_.value.toList) == Some(Hex(vkHex('1')).toBytes.toList))
+        expect.same(lookup.map(_.vk.step), Some(0)) &&
+        expect.same(lookup.map(_.offset), Some(0L)) &&
+        expect(lookup.map(_.vk.value.toList) == Some(Hex(vkHex('1')).toBytes.toList))
   }
 
   test("buildKesRegistry: multiple registrations all land in the registry; duplicate peerId keeps last") {
     val regs = List(
-      L0GenesisKesRegistration(peerHex('a'), vkHex('1'), 0, regSigHex),
-      L0GenesisKesRegistration(peerHex('b'), vkHex('2'), 0, regSigHex),
-      L0GenesisKesRegistration(peerHex('c'), vkHex('3'), 0, regSigHex)
+      L0GenesisKesRegistration(peerHex('a'), vkHex('1'), 0, regSigHex, 0L),
+      L0GenesisKesRegistration(peerHex('b'), vkHex('2'), 0, regSigHex, 0L),
+      L0GenesisKesRegistration(peerHex('c'), vkHex('3'), 0, regSigHex, 0L)
     )
     for {
       reg <- L0GenesisLoader.buildKesRegistry[IO](baseData(Some(regs)))
@@ -107,9 +109,26 @@ object KesRegistryLoaderSuite extends SimpleIOSuite {
       c <- reg.getKesVk(peerId('c'))
     } yield
       expect.same(3, all.size) &&
-        expect(a.exists(_.value.toList == Hex(vkHex('1')).toBytes.toList)) &&
-        expect(b.exists(_.value.toList == Hex(vkHex('2')).toBytes.toList)) &&
-        expect(c.exists(_.value.toList == Hex(vkHex('3')).toBytes.toList))
+        expect(a.exists(_.vk.value.toList == Hex(vkHex('1')).toBytes.toList)) &&
+        expect(b.exists(_.vk.value.toList == Hex(vkHex('2')).toBytes.toList)) &&
+        expect(c.exists(_.vk.value.toList == Hex(vkHex('3')).toBytes.toList))
+  }
+
+  test("buildKesRegistry: non-zero offset is carried through to the KesRegistryEntry") {
+    val regs = List(
+      L0GenesisKesRegistration(peerHex('a'), vkHex('1'), 0, regSigHex, offset = 0L),
+      L0GenesisKesRegistration(peerHex('b'), vkHex('2'), 0, regSigHex, offset = 42L),
+      L0GenesisKesRegistration(peerHex('c'), vkHex('3'), 0, regSigHex, offset = 9999L)
+    )
+    for {
+      reg <- L0GenesisLoader.buildKesRegistry[IO](baseData(Some(regs)))
+      a <- reg.getKesVk(peerId('a'))
+      b <- reg.getKesVk(peerId('b'))
+      c <- reg.getKesVk(peerId('c'))
+    } yield
+      expect.same(a.map(_.offset), Some(0L)) &&
+        expect.same(b.map(_.offset), Some(42L)) &&
+        expect.same(c.map(_.offset), Some(9999L))
   }
 
 }

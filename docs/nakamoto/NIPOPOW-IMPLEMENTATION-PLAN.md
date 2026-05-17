@@ -111,7 +111,7 @@ Per proposal §2.1, each slot fires `L = 10` independent trials per validator us
 
 1. **Density-tuning empirical gap** — proposal §6.4 flags this as the hardest non-cryptographic part. We should validate density behavior on the iter-stake-1-1 cluster BEFORE building proof routes (catch parameter mismatch early).
 2. **N-2 staggering correctness** — if Slice S0 is wrong, all downstream NIPoPoW levels are silently broken because the verifier uses the wrong stake-at-period. Property test from S0.6 is load-bearing.
-3. **KES forward-security assumption** — Slice 9 (load-bearing flip) is on by env flag default-off. Before NIPoPoW v1 ships, flip `NAKAMOTO_KES_ENFORCE=true` by default (separate ~1-day follow-up; gated on a clean iter with enforce=true).
+3. **KES forward-security assumption** — Slice 9 made KES load-bearing unconditionally (no enforce flag; receivers drop any message that fails KES verify). NIPoPoW v1 can rely on KES authenticity end-to-end.
 
 ---
 

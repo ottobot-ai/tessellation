@@ -9,7 +9,7 @@ import cats.syntax.all._
 import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.node.shared.domain.genesis.types.{L0GenesisData, L0GenesisDelegatedStake, L0GenesisNodeCollateral}
-import io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry
+import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, KesRegistryEntry}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
@@ -155,7 +155,7 @@ object L0GenesisLoader {
     */
   def buildKesRegistry[F[_]: Async](data: L0GenesisData): F[KesRegistry[F]] =
     Async[F].delay {
-      val parsed: Map[PeerId, VerificationKeyKesProduct] =
+      val parsed: Map[PeerId, KesRegistryEntry] =
         data.kesRegistrations
           .getOrElse(Nil)
           .flatMap { r =>
@@ -163,7 +163,7 @@ object L0GenesisLoader {
             val vkBytesOpt = scala.util.Try(Hex(r.kesVk).toBytes).toOption
             (peerOpt, vkBytesOpt) match {
               case (Some(p), Some(vkBytes)) =>
-                Some(p -> VerificationKeyKesProduct(vkBytes, r.kesVkStep))
+                Some(p -> KesRegistryEntry(VerificationKeyKesProduct(vkBytes, r.kesVkStep), r.offset))
               case _ => None
             }
           }

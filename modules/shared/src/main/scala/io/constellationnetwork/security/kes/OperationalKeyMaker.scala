@@ -137,18 +137,22 @@ object OperationalKeyMaker {
     *   - `height` — `(superHeight, subHeight)` controlling expressible periods. Default [[DefaultHeight]] = `(7, 7)` → 16384 periods.
     *   - `keyName` — entry name in the [[SecureStore]]. Same convention as [[make]] (one entry per operator).
     *   - `etaPeriodLength` — carried-only metadata; see [[make]] for the alignment story.
+    *   - `offset` — eta-period offset for this operator's tree. Genesis operators register with `offset = 0` (tree's step 0 == global eta
+    *     period 0). Mid-life joiners (Slice 10 #179) use a positive offset matching the global eta period at registration activation. The
+    *     receiver computes `treeInternalStep = globalEtaPeriod - offset` when verifying sigs from this operator.
     */
   def bootstrap[F[_]: Async](
     secureStore: SecureStore[F],
     keyName: String,
     seed: Array[Byte],
     etaPeriodLength: Long,
-    height: (Int, Int) = DefaultHeight
+    height: (Int, Int) = DefaultHeight,
+    offset: Long = 0L
   ): Resource[F, OperationalKeyMakerAlgebra[F]] = {
     val seedCopy = seed.clone()
     val acquire: F[Unit] =
       Async[F].delay {
-        val (sk, _) = KesProduct.instance.createKeyPair(seedCopy, height, offset = 0L)
+        val (sk, _) = KesProduct.instance.createKeyPair(seedCopy, height, offset)
         SecretKeyCodec.encodeProductSk(sk)
       }
         .flatMap(bytes => secureStore.write(keyName, bytes))
@@ -157,10 +161,10 @@ object OperationalKeyMaker {
     Resource.eval(acquire) >> make(secureStore, keyName, etaPeriodLength)
   }
 
-  /** Generate a fresh KES product keypair from `seed` at offset `0`, and return the encoded secret-key bytes together with the master
-    * verification key at step 0. Genesis-generator helper: the Tier-1 generator embeds the master VK in the L0 genesis fixture as part of
-    * the per-operator KES registration record, and writes the encoded SK bytes to a per-operator `kes-sk.bin` file that the gl0 container
-    * will later mount and load via a disk-backed [[SecureStore]] (Slice 3d / Slice 4).
+  /** Generate a fresh KES product keypair from `seed`, and return the encoded secret-key bytes together with the master verification key at
+    * step 0. Genesis-generator helper: the Tier-1 generator embeds the master VK in the L0 genesis fixture as part of the per-operator KES
+    * registration record, and writes the encoded SK bytes to a per-operator `kes-sk.bin` file that the gl0 container will later mount and
+    * load via a disk-backed [[SecureStore]] (Slice 3d / Slice 4).
     *
     * The returned SK bytes are the same format `OperationalKeyMaker.make` consumes from a [[SecureStore]] — i.e. the output of
     * [[SecretKeyCodec.encodeProductSk]]. The caller owns the returned bytes; they must be securely written to disk + scrubbed from memory
@@ -168,14 +172,18 @@ object OperationalKeyMaker {
     *
     *   - `seed` — entropy for the KES tree. Must not be reused across operators.
     *   - `height` — `(superHeight, subHeight)` tree shape. Default [[DefaultHeight]] = `(7, 7)` → 16384 periods.
+    *   - `offset` — eta-period offset for this operator's tree. Genesis operators register with `offset = 0` (tree's step 0 == global eta
+    *     period 0). Mid-life joiners (Slice 10 #179) supply a positive offset matching the global eta period at registration activation;
+    *     see [[bootstrap]] for the receiver-side rebind convention.
     */
   def generateFreshKesKeyMaterial[F[_]: Async](
     seed: Array[Byte],
-    height: (Int, Int) = DefaultHeight
+    height: (Int, Int) = DefaultHeight,
+    offset: Long = 0L
   ): F[(Array[Byte], VerificationKeyKesProduct)] = {
     val seedCopy = seed.clone()
     Async[F].delay {
-      val (sk, vk) = KesProduct.instance.createKeyPair(seedCopy, height, offset = 0L)
+      val (sk, vk) = KesProduct.instance.createKeyPair(seedCopy, height, offset)
       val encoded = SecretKeyCodec.encodeProductSk(sk)
       java.util.Arrays.fill(seedCopy, 0.toByte)
       (encoded, vk)

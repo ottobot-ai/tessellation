@@ -11,34 +11,23 @@ import io.constellationnetwork.security.kes.OperationalKeyMaker
 
 import eu.timepit.refined.auto._
 
-/** §1.2 Slice 5/6/9 — KES verification of incoming attestations + snapshots.
+/** §1.2 — KES verification of incoming attestations + snapshots, load-bearing.
   *
   * Pulled out of [[NakamotoSyncDaemon]] so the verification logic + counter taxonomy live in one place and are independently unit-testable.
-  * The daemon retains responsibility for routing (call the right helper after the Ed25519 path succeeds); this object owns the matrix:
+  * Slice 9 made KES authoritative (no warn-only escape hatch); the daemon drops any message that returns `false`. Behavior matrix:
   *
-  *   - empty wire field → `*_no_sig_total` (warn when enforcing)
-  *   - decode failure → `*_decode_failed_total` (WARN)
-  *   - sig + no registry → `*_no_registry_entry_total` (DEBUG; never rejects — see note)
-  *   - sig + verify OK → `*_verified_total` (INFO)
-  *   - sig + verify fail → `*_invalid_total` (WARN)
-  *
-  * '''Slice 9 enforcement''': when `enforce=true`, the helpers return `false` for no-sig / decode-fail / invalid; the daemon drops the
-  * message on `false`. When `enforce=false`, the helpers always return `true` (preserves the warn-only behavior from Slices 5/6 so legacy
-  * CSV-genesis paths and the soak iter prior to flip still work).
-  *
-  * '''Why no-registry-entry never rejects''': the registry today is built from genesis. With Slice 10 (#179, runtime registration cert), an
-  * operator can submit a `RegisterKesVk` tx mid-life — between submission and finality, the GSI's `activeKesRegistrations` lags. If we
-  * rejected on `None` from `getKesVk`, a newly-joined operator's first batch of attestations would be dropped before their reg-cert
-  * settled. Symmetric handling on both sides of the rotation cliff is more important than catching impersonation at this gate (Ed25519
-  * already authenticates the peer; KES only adds forward-secure non-repudiation).
+  *   - empty wire field → `*_no_sig_total` + WARN, return false (reject)
+  *   - decode failure → `*_decode_failed_total` + WARN, return false
+  *   - sig + no registry → `*_no_registry_entry_total` + DEBUG, return true (Ed25519 already authenticated; carve-out for Slice 10 runtime
+  *     registration where a newly-joined operator's reg-cert tx may not yet have finalized when their first sigs arrive)
+  *   - sig + verify OK → `*_verified_total` + INFO, return true
+  *   - sig + verify fail → `*_invalid_total` + WARN, return false
   */
 private[nakamoto] object KesGossipVerification {
 
   /** Verify a KES signature attached to an attestation. `messageBytes` is the Ed25519-signed attestation-hash bytes (the same bytes the
-    * Ed25519 path verified). Period is recomputed from `tipOrdinal` for log context and for the step-rebind below.
-    *
-    * Returns `true` if the attestation should be accepted, `false` if it should be dropped. When `enforce=false` always returns `true`
-    * (warn-only).
+    * Ed25519 path verified). The KES step is rebound to `globalPeriod - operator.offset` so operators registered mid-life (Slice 10) sign
+    * relative to their own tree's offset rather than global eta period zero.
     */
   def verifyAttestation[F[_]: Async: Metrics](
     messageBytes: Array[Byte],
@@ -48,27 +37,19 @@ private[nakamoto] object KesGossipVerification {
     tipOrdinal: Long,
     kesRegistry: KesRegistry[F],
     etaRotationSnapshots: Long,
-    enforce: Boolean,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Boolean] = {
     val tag = "KES-ATT"
     if (kesSigBytes.isEmpty) {
       Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_no_sig_total") >>
-        Async[F]
-          .whenA(enforce) {
-            logger.warn(s"⚠️ $tag missing sig — rejecting ord=$tipOrdinal from=${attesterHex.value.take(16)}...")
-          }
-          .as(!enforce)
+        logger.warn(s"⚠️ $tag missing sig — rejecting ord=$tipOrdinal from=${attesterHex.value.take(16)}...").as(false)
     } else {
       OperationalKeyMaker.decodeSignature(kesSigBytes) match {
         case Left(err) =>
           Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_decode_failed_total") >>
             logger
-              .warn(
-                s"⚠️ $tag decode failed for ord=$tipOrdinal from=${attesterHex.value
-                    .take(16)}...: ${err.message}${if (enforce) " — rejecting" else ""}"
-              )
-              .as(!enforce)
+              .warn(s"⚠️ $tag decode failed for ord=$tipOrdinal from=${attesterHex.value.take(16)}...: ${err.message} — rejecting")
+              .as(false)
         case Right(kSig) =>
           kesRegistry.getKesVk(attesterId).flatMap {
             case None =>
@@ -78,40 +59,46 @@ private[nakamoto] object KesGossipVerification {
                     s"$tag no registry entry for ord=$tipOrdinal from=${attesterHex.value.take(16)}... — accepting (Ed25519 already authenticated)"
                   )
                   .as(true)
-            case Some(vk) =>
-              // Registry holds the master VK captured at bootstrap (step=0). Sender signs
-              // at the *current* product step (= kesPeriod). `SumComposition.verify` uses
-              // `kesVk.step` in its left-vs-right tree-walk heuristic, so verify with the
-              // master VK literally would mis-walk the Merkle path and reject every
-              // post-rotation sig. Rebind step to the period derived from the wire ordinal
-              // so verify reconstructs the same path the sender used. The root bytes are
-              // invariant under evolution; only the `step` index changes.
-              val kesPeriod = EtaCalculation.rotationPeriod(tipOrdinal, etaRotationSnapshots).toInt
-              val vkAtPeriod = vk.copy(step = kesPeriod)
-              val ok = OperationalKeyMaker.verify(kSig, messageBytes, vkAtPeriod)
-              if (ok)
-                Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_verified_total") >>
-                  logger
-                    .info(
-                      s"🔐 $tag verified ord=$tipOrdinal period=$kesPeriod from=${attesterHex.value.take(16)}..."
-                    )
-                    .as(true)
-              else
+            case Some(entry) =>
+              // Registry holds the master VK captured at registration (step=0 in the tree) plus the
+              // operator's eta-period offset. Sender signs at the *current* product step (=
+              // globalPeriod - offset); `SumComposition.verify` uses `kesVk.step` in its left-vs-right
+              // tree-walk so verifying with a step that doesn't match the sender's mis-walks the path
+              // and rejects every sig. Rebind step to `globalPeriod - operator.offset` so verify
+              // reconstructs the same path the sender used. Root bytes are invariant; only step changes.
+              val globalPeriod = EtaCalculation.rotationPeriod(tipOrdinal, etaRotationSnapshots).toInt
+              val treeInternalStep = globalPeriod - entry.offset.toInt
+              if (treeInternalStep < 0)
                 Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_invalid_total") >>
                   logger
                     .warn(
-                      s"⚠️ $tag invalid ord=$tipOrdinal period=$kesPeriod from=${attesterHex.value.take(16)}...${if (enforce) " — rejecting"
-                        else " — warn-only, not rejecting"}"
+                      s"⚠️ $tag from operator with offset=${entry.offset} can't sign at globalPeriod=$globalPeriod (treeInternalStep would be $treeInternalStep — operator not yet active)"
                     )
-                    .as(!enforce)
+                    .as(false)
+              else {
+                val vkAtStep = entry.vk.copy(step = treeInternalStep)
+                val ok = OperationalKeyMaker.verify(kSig, messageBytes, vkAtStep)
+                if (ok)
+                  Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_verified_total") >>
+                    logger
+                      .info(
+                        s"🔐 $tag verified ord=$tipOrdinal period=$globalPeriod step=$treeInternalStep from=${attesterHex.value.take(16)}..."
+                      )
+                      .as(true)
+                else
+                  Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_invalid_total") >>
+                    logger
+                      .warn(
+                        s"⚠️ $tag invalid ord=$tipOrdinal period=$globalPeriod step=$treeInternalStep from=${attesterHex.value.take(16)}... — rejecting"
+                      )
+                      .as(false)
+              }
           }
       }
     }
   }
 
-  /** Verify a KES signature attached to a snapshot. `messageBytes` is the snapshot-hash bytes (the same bytes the producer signed on the
-    * sender side). Same accept/reject semantics as [[verifyAttestation]].
-    */
+  /** Verify a KES signature attached to a snapshot. Same accept/reject semantics as [[verifyAttestation]]. */
   def verifySnapshot[F[_]: Async: Metrics](
     messageBytes: Array[Byte],
     kesSigBytes: Array[Byte],
@@ -120,27 +107,19 @@ private[nakamoto] object KesGossipVerification {
     ordinal: Long,
     kesRegistry: KesRegistry[F],
     etaRotationSnapshots: Long,
-    enforce: Boolean,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Boolean] = {
     val tag = "KES-SNAP"
     if (kesSigBytes.isEmpty) {
       Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_no_sig_total") >>
-        Async[F]
-          .whenA(enforce) {
-            logger.warn(s"⚠️ $tag missing sig — rejecting ord=$ordinal from=${producerHex.value.take(16)}...")
-          }
-          .as(!enforce)
+        logger.warn(s"⚠️ $tag missing sig — rejecting ord=$ordinal from=${producerHex.value.take(16)}...").as(false)
     } else {
       OperationalKeyMaker.decodeSignature(kesSigBytes) match {
         case Left(err) =>
           Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_decode_failed_total") >>
             logger
-              .warn(
-                s"⚠️ $tag decode failed for ord=$ordinal from=${producerHex.value.take(16)}...: ${err.message}${if (enforce) " — rejecting"
-                  else ""}"
-              )
-              .as(!enforce)
+              .warn(s"⚠️ $tag decode failed for ord=$ordinal from=${producerHex.value.take(16)}...: ${err.message} — rejecting")
+              .as(false)
         case Right(kSig) =>
           kesRegistry.getKesVk(producerId).flatMap {
             case None =>
@@ -150,26 +129,34 @@ private[nakamoto] object KesGossipVerification {
                     s"$tag no registry entry for ord=$ordinal from=${producerHex.value.take(16)}... — accepting (Ed25519 already authenticated)"
                   )
                   .as(true)
-            case Some(vk) =>
-              // Same step-rebind as `verifyAttestation` above. See that comment.
-              val kesPeriod = EtaCalculation.rotationPeriod(ordinal, etaRotationSnapshots).toInt
-              val vkAtPeriod = vk.copy(step = kesPeriod)
-              val ok = OperationalKeyMaker.verify(kSig, messageBytes, vkAtPeriod)
-              if (ok)
-                Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_verified_total") >>
-                  logger
-                    .info(
-                      s"🔐 $tag verified ord=$ordinal period=$kesPeriod from=${producerHex.value.take(16)}..."
-                    )
-                    .as(true)
-              else
+            case Some(entry) =>
+              val globalPeriod = EtaCalculation.rotationPeriod(ordinal, etaRotationSnapshots).toInt
+              val treeInternalStep = globalPeriod - entry.offset.toInt
+              if (treeInternalStep < 0)
                 Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_invalid_total") >>
                   logger
                     .warn(
-                      s"⚠️ $tag invalid ord=$ordinal period=$kesPeriod from=${producerHex.value.take(16)}...${if (enforce) " — rejecting"
-                        else " — warn-only, not rejecting"}"
+                      s"⚠️ $tag from operator with offset=${entry.offset} can't sign at globalPeriod=$globalPeriod (treeInternalStep would be $treeInternalStep — operator not yet active)"
                     )
-                    .as(!enforce)
+                    .as(false)
+              else {
+                val vkAtStep = entry.vk.copy(step = treeInternalStep)
+                val ok = OperationalKeyMaker.verify(kSig, messageBytes, vkAtStep)
+                if (ok)
+                  Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_verified_total") >>
+                    logger
+                      .info(
+                        s"🔐 $tag verified ord=$ordinal period=$globalPeriod step=$treeInternalStep from=${producerHex.value.take(16)}..."
+                      )
+                      .as(true)
+                else
+                  Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_invalid_total") >>
+                    logger
+                      .warn(
+                        s"⚠️ $tag invalid ord=$ordinal period=$globalPeriod step=$treeInternalStep from=${producerHex.value.take(16)}... — rejecting"
+                      )
+                      .as(false)
+              }
           }
       }
     }

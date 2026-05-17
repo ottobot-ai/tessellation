@@ -2,7 +2,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import cats.effect.IO
 
-import io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry
+import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, KesRegistryEntry}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{CountingMetrics, Metrics}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.peer.PeerId
@@ -78,7 +78,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
     for {
       (counters, metrics) <- setup
       (signer, vk) <- buildSigner(0x11.toByte)
-      registry = KesRegistry.make[IO](Map(peerId('a') -> vk))
+      registry = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(vk, 0L)))
       sigResult <- signer.signAt(0, testMessageBytes)
       sigBytes = sigResult.toOption.get
       wireBytes = OperationalKeyMaker.encodeSignature(sigBytes)
@@ -92,7 +92,6 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           tipOrdinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
-          enforce = false,
           logger = logger
         )
       }
@@ -119,7 +118,6 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           tipOrdinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
-          enforce = false,
           logger = logger
         )
       }
@@ -136,7 +134,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       (signer, _) <- buildSigner(0x22.toByte)
       // Registry has someone else's entry, not the attester
       (_, otherVk) <- buildSigner(0x33.toByte)
-      registry = KesRegistry.make[IO](Map(peerId('z') -> otherVk))
+      registry = KesRegistry.make[IO](Map(peerId('z') -> KesRegistryEntry(otherVk, 0L)))
       sigResult <- signer.signAt(0, testMessageBytes)
       wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
       _ <- {
@@ -149,7 +147,6 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           tipOrdinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
-          enforce = false,
           logger = logger
         )
       }
@@ -165,7 +162,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       (counters, metrics) <- setup
       (signerA, _) <- buildSigner(0x44.toByte) // signs the actual message
       (_, wrongVk) <- buildSigner(0x55.toByte) // different VK seeded in registry
-      registry = KesRegistry.make[IO](Map(peerId('a') -> wrongVk))
+      registry = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(wrongVk, 0L)))
       sigResult <- signerA.signAt(0, testMessageBytes)
       wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
       _ <- {
@@ -178,7 +175,6 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           tipOrdinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
-          enforce = false,
           logger = logger
         )
       }
@@ -204,7 +200,6 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           tipOrdinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
-          enforce = false,
           logger = logger
         )
       }
@@ -222,7 +217,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
     for {
       (counters, metrics) <- setup
       (signer, vk) <- buildSigner(0x66.toByte)
-      registry = KesRegistry.make[IO](Map(peerId('p') -> vk))
+      registry = KesRegistry.make[IO](Map(peerId('p') -> KesRegistryEntry(vk, 0L)))
       sigResult <- signer.signAt(0, testMessageBytes)
       wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
       _ <- {
@@ -235,7 +230,6 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           ordinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
-          enforce = false,
           logger = logger
         )
       }
@@ -259,7 +253,6 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           ordinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
-          enforce = false,
           logger = logger
         )
       }
@@ -284,7 +277,6 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           ordinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
-          enforce = false,
           logger = logger
         )
       }
@@ -297,7 +289,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       (counters, metrics) <- setup
       (signer, _) <- buildSigner(0x88.toByte)
       (_, wrongVk) <- buildSigner(0x99.toByte)
-      registry = KesRegistry.make[IO](Map(peerId('p') -> wrongVk))
+      registry = KesRegistry.make[IO](Map(peerId('p') -> KesRegistryEntry(wrongVk, 0L)))
       sigResult <- signer.signAt(0, testMessageBytes)
       wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
       _ <- {
@@ -310,7 +302,6 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
           ordinal = testOrdinal,
           kesRegistry = registry,
           etaRotationSnapshots = etaRotationSnapshots,
-          enforce = false,
           logger = logger
         )
       }
@@ -321,160 +312,157 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
   }
 
   // ============================================================
-  // Slice 9 — enforce=true return-value matrix
+  // Slice 9 — load-bearing return-value matrix
   // ============================================================
   //
-  // The signature's `enforce` knob doesn't change which counter ticks (that's still the
-  // outcome matrix) — it changes what the return value is so the daemon can drop the
-  // message. These tests pin the return-value mapping so a regression on counter handling
-  // can't silently flip the gate behavior.
+  // Verification is unconditional now (no warn-only fallback). These tests pin the return-
+  // value mapping so the daemon's drop-on-false behavior can't silently flip.
 
-  test("enforce=true: valid sig → returns true; invalid → returns false; missing → returns false") {
+  test("return-value matrix: valid→true, wrong/missing/decode-fail→false, no-registry→true (carve-out)") {
     for {
       (_, metrics) <- setup
       (signer, vk) <- buildSigner(0xaa.toByte)
       (_, wrongVk) <- buildSigner(0xbb.toByte)
       sigResult <- signer.signAt(0, testMessageBytes)
       wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      // (a) registry matches → verify=true
-      registryGood = KesRegistry.make[IO](Map(peerId('a') -> vk))
-      // (b) registry holds wrong VK → verify=false
-      registryWrong = KesRegistry.make[IO](Map(peerId('a') -> wrongVk))
-      // (c) registry empty (no entry) → ACCEPT under "Ed25519 already authenticated" carve-out
+      registryGood = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(vk, 0L)))
+      registryWrong = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(wrongVk, 0L)))
       registryEmpty = KesRegistry.empty[IO]
 
       okGood <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registryGood,
-          etaRotationSnapshots = etaRotationSnapshots,
-          enforce = true,
-          logger = logger
+          testMessageBytes,
+          wireBytes,
+          peerId('a'),
+          peerHex('a'),
+          testOrdinal,
+          registryGood,
+          etaRotationSnapshots,
+          logger
         )
       }
       okWrong <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registryWrong,
-          etaRotationSnapshots = etaRotationSnapshots,
-          enforce = true,
-          logger = logger
+          testMessageBytes,
+          wireBytes,
+          peerId('a'),
+          peerHex('a'),
+          testOrdinal,
+          registryWrong,
+          etaRotationSnapshots,
+          logger
         )
       }
       okEmpty <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registryEmpty,
-          etaRotationSnapshots = etaRotationSnapshots,
-          enforce = true,
-          logger = logger
+          testMessageBytes,
+          wireBytes,
+          peerId('a'),
+          peerHex('a'),
+          testOrdinal,
+          registryEmpty,
+          etaRotationSnapshots,
+          logger
         )
       }
       okNoSig <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = Array.empty[Byte],
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registryGood,
-          etaRotationSnapshots = etaRotationSnapshots,
-          enforce = true,
-          logger = logger
+          testMessageBytes,
+          Array.empty[Byte],
+          peerId('a'),
+          peerHex('a'),
+          testOrdinal,
+          registryGood,
+          etaRotationSnapshots,
+          logger
         )
       }
       okDecodeFail <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = Array.fill[Byte](16)(0xff.toByte),
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registryGood,
-          etaRotationSnapshots = etaRotationSnapshots,
-          enforce = true,
-          logger = logger
+          testMessageBytes,
+          Array.fill[Byte](16)(0xff.toByte),
+          peerId('a'),
+          peerHex('a'),
+          testOrdinal,
+          registryGood,
+          etaRotationSnapshots,
+          logger
         )
       }
     } yield
-      expect(okGood, "valid sig + valid registry must return true under enforce=true") &&
-        expect(!okWrong, "wrong VK in registry must return false under enforce=true") &&
-        expect(okEmpty, "no registry entry must still return true (Ed25519 already authenticated)") &&
-        expect(!okNoSig, "missing wire field must return false under enforce=true") &&
-        expect(!okDecodeFail, "decode failure must return false under enforce=true")
+      expect(okGood, "valid sig + valid registry must return true") &&
+        expect(!okWrong, "wrong VK in registry must return false") &&
+        expect(okEmpty, "no registry entry must return true (Ed25519 already authenticated; Slice 10 carve-out)") &&
+        expect(!okNoSig, "missing wire field must return false") &&
+        expect(!okDecodeFail, "decode failure must return false")
   }
 
-  test("enforce=false: same matrix always returns true (warn-only)") {
+  // ============================================================
+  // Offset semantics — operators registered mid-life
+  // ============================================================
+  //
+  // An operator with `offset = K` has their tree's step 0 active at global eta period K. Sigs
+  // signed at global period K+N use tree-internal step N. The receiver computes
+  // `step = globalPeriod - offset` and verifies with `vk.copy(step = ...)`. Two cases pinned:
+  //   (a) offset > 0 + matching sender step → verify succeeds
+  //   (b) offset > globalPeriod → step would be negative → verify rejects with no actual crypto check
+
+  test("offset > 0: sig at global period K+N round-trips via tree-internal step N") {
+    // etaRotation=1 makes globalPeriod == tipOrdinal — easier to reason about.
+    val rot: Long = 1L
+    val offset: Long = 5L
+    val globalPeriod: Int = 7 // tree-internal step = 7 - 5 = 2
     for {
       (_, metrics) <- setup
-      (signer, _) <- buildSigner(0xcc.toByte)
-      (_, wrongVk) <- buildSigner(0xdd.toByte)
+      (signer, vk) <- buildSigner(0x11.toByte)
+      // Sender at tree-internal step 2
+      sigResult <- signer.signAt(globalPeriod - offset.toInt, testMessageBytes)
+      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
+      registry = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(vk, offset)))
+      ok <- {
+        implicit val m: Metrics[IO] = metrics
+        KesGossipVerification.verifyAttestation[IO](
+          testMessageBytes,
+          wireBytes,
+          peerId('a'),
+          peerHex('a'),
+          tipOrdinal = globalPeriod.toLong, // with rot=1 this is the global period
+          kesRegistry = registry,
+          etaRotationSnapshots = rot,
+          logger = logger
+        )
+      }
+    } yield expect(ok, s"offset=$offset + sig at tree step=${globalPeriod - offset} must verify at globalPeriod=$globalPeriod")
+  }
+
+  test("offset > globalPeriod: tree-internal step would be negative — rejected without crypto check") {
+    val rot: Long = 1L
+    val offset: Long = 50L
+    val globalPeriod: Int = 10 // step = 10 - 50 = -40 — out of range
+    for {
+      (_, metrics) <- setup
+      (signer, vk) <- buildSigner(0x22.toByte)
       sigResult <- signer.signAt(0, testMessageBytes)
       wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      registryWrong = KesRegistry.make[IO](Map(peerId('a') -> wrongVk))
-
-      okNoSig <- {
+      registry = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(vk, offset)))
+      ok <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = Array.empty[Byte],
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registryWrong,
-          etaRotationSnapshots = etaRotationSnapshots,
-          enforce = false,
+          testMessageBytes,
+          wireBytes,
+          peerId('a'),
+          peerHex('a'),
+          tipOrdinal = globalPeriod.toLong,
+          kesRegistry = registry,
+          etaRotationSnapshots = rot,
           logger = logger
         )
       }
-      okWrong <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registryWrong,
-          etaRotationSnapshots = etaRotationSnapshots,
-          enforce = false,
-          logger = logger
-        )
-      }
-      okDecodeFail <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = Array.fill[Byte](16)(0xff.toByte),
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registryWrong,
-          etaRotationSnapshots = etaRotationSnapshots,
-          enforce = false,
-          logger = logger
-        )
-      }
-    } yield
-      expect(okNoSig, "no-sig must still return true under enforce=false") &&
-        expect(okWrong, "invalid sig must still return true under enforce=false") &&
-        expect(okDecodeFail, "decode-fail must still return true under enforce=false")
+    } yield expect(!ok, s"operator registered at offset=$offset can't sign at globalPeriod=$globalPeriod — reject")
   }
 }

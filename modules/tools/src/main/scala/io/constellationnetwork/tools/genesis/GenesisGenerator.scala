@@ -225,7 +225,11 @@ object GenesisGenerator {
             peerId = peerId.value.value,
             kesVk = Hex.fromBytes(vk.value).value,
             kesVkStep = vk.step,
-            longTermSig = Hex.fromBytes(regSig).value
+            longTermSig = Hex.fromBytes(regSig).value,
+            // Genesis operators register with offset 0 — their KES tree's step 0 == global eta
+            // period 0. Mid-life joiners (Slice 10 #179) supply a non-zero offset via the runtime
+            // registration tx; they do not flow through this generator.
+            offset = 0L
           )
           sk = OperatorKesSecretKey(operatorIndex = i, peerId = peerId, bytes = skBytes)
         } yield (registration, sk)

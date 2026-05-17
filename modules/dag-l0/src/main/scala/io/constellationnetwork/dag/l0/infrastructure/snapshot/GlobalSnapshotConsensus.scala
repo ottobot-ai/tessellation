@@ -809,12 +809,10 @@ object GlobalSnapshotConsensus {
                   dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data")),
                   processMetagraphBinary = processMetagraphBinary,
                   sharedChainSyncManagerRef = sharedChainSyncManagerRef,
-                  // §1.2 Slice 5/6: sign attestations + verify incoming KES sigs.
-                  // Slice 9: enforceKes flips verify from warn-only to load-bearing reject path.
-                  // Env: NAKAMOTO_KES_ENFORCE=true to enable. Default off for safe rollout.
+                  // §1.2 Slice 5/6/9: KES sender-side signing + receiver-side load-bearing verify.
+                  // Always-on; no env flag — verification failures drop the message.
                   operationalKeyMaker = operationalKeyMaker,
-                  kesRegistry = kesRegistry,
-                  enforceKes = sys.env.get("NAKAMOTO_KES_ENFORCE").exists(_.equalsIgnoreCase("true"))
+                  kesRegistry = kesRegistry
                 )
                 .compile
                 .drain

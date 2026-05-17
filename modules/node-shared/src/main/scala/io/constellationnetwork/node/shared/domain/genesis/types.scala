@@ -156,7 +156,12 @@ object types {
     peerId: String,
     kesVk: String,
     kesVkStep: Int,
-    longTermSig: String
+    longTermSig: String,
+    // Eta-period offset for this operator's KES tree. Genesis operators register at offset=0
+    // (their tree's step 0 == global eta period 0). Mid-life joiners (Slice 10 #179) use a
+    // positive offset matching the global eta period at registration activation. See
+    // KesRegistryEntry doc for verifier semantics.
+    offset: Long
   )
 
   object L0GenesisKesRegistration {

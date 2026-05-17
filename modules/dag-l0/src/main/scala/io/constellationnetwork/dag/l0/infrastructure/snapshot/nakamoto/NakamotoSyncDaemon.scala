@@ -141,7 +141,6 @@ object NakamotoSyncDaemon {
     dataDir: java.nio.file.Path,
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
-    enforceKes: Boolean,
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -185,7 +184,6 @@ object NakamotoSyncDaemon {
               dataDir,
               operationalKeyMaker,
               kesRegistry,
-              enforceKes,
               logger
             )
           }
@@ -234,16 +232,13 @@ object NakamotoSyncDaemon {
     // internally-constructed manager into this Ref once it's built; consumers
     // read-through it and no-op if the producer hasn't bound yet.
     sharedChainSyncManagerRef: Ref[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]],
-    // §1.2 Slice 5/6: KES parallel-signing infrastructure. The OperationalKeyMaker
-    // signs attestations + snapshots with the operator's KES product key at the period
-    // derived from `EtaCalculation.rotationPeriod`. The KesRegistry holds the
-    // (peerId → kesMasterVk) map needed by receivers to verify incoming KES sigs.
-    // enforceKes: when true, KES verification is load-bearing — no-sig / decode-fail /
-    // verify-fail outcomes drop the message. When false, warn-only (Slices 5/6 default).
-    // Wired from NAKAMOTO_KES_ENFORCE env at GlobalSnapshotConsensus.make.
+    // §1.2 Slice 5/6/9: KES parallel-signing infrastructure (sender) + load-bearing
+    // receiver-side verify. The OperationalKeyMaker signs attestations + snapshots with
+    // the operator's KES product key at the period derived from `EtaCalculation.rotationPeriod`.
+    // The KesRegistry holds the (peerId → (kesMasterVk, offset)) map needed by receivers to
+    // verify incoming KES sigs and drop them when verification fails.
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
-    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
-    enforceKes: Boolean
+    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F]
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -313,7 +308,6 @@ object NakamotoSyncDaemon {
                                 dataDir,
                                 operationalKeyMaker,
                                 kesRegistry,
-                                enforceKes,
                                 logger
                               )
                             }
@@ -402,7 +396,6 @@ object NakamotoSyncDaemon {
                                     dataDir,
                                     operationalKeyMaker,
                                     kesRegistry,
-                                    enforceKes,
                                     logger
                                   )
                                 } >>
@@ -410,7 +403,7 @@ object NakamotoSyncDaemon {
                             }
 
                           case pb.GossipMessage.Body.Attestation(att) =>
-                            handleAttestation(att, tipTracker, kesRegistry, etaRotationSnapshots, enforceKes, logger)
+                            handleAttestation(att, tipTracker, kesRegistry, etaRotationSnapshots, logger)
 
                           case pb.GossipMessage.Body.MetagraphBinary(mb) =>
                             handleMetagraphBinary(mb, processMetagraphBinary, logger)
@@ -470,11 +463,9 @@ object NakamotoSyncDaemon {
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
-    // §1.2 Slice 5/6/9: KES infrastructure for sender-side signing + receiver-side verify.
-    // enforceKes flips warn-only ↔ load-bearing per Slice 9.
+    // §1.2 Slice 5/6/9: KES infrastructure for sender-side signing + receiver-side load-bearing verify.
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
-    enforceKes: Boolean,
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -726,7 +717,6 @@ object NakamotoSyncDaemon {
             productionGate,
             operationalKeyMaker,
             kesRegistry,
-            enforceKes,
             logger
           ) >> {
             // This snapshot is now stored — drain any children that were waiting for it.
@@ -760,7 +750,6 @@ object NakamotoSyncDaemon {
               dataDir,
               operationalKeyMaker,
               kesRegistry,
-              enforceKes,
               logger
             )
           }
@@ -895,13 +884,13 @@ object NakamotoSyncDaemon {
     productionGate: ProductionGate[F],
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
-    enforceKes: Boolean,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
-    // §1.2 Slice 9: snapshot KES gate runs BEFORE any state mutation. When enforceKes=true
-    // and the sig is missing / undecodable / invalid, drop the snapshot entirely — no
-    // networkTip update, no canonical-storage write, no self-attestation emit. When
-    // enforceKes=false this returns true unconditionally (warn-only fallback).
+    // §1.2 Slice 9: snapshot KES gate runs BEFORE any state mutation. On no-sig /
+    // decode-fail / verify-fail / step-out-of-range, drop the snapshot entirely — no
+    // networkTip update, no canonical-storage write, no self-attestation emit. The
+    // no-registry-entry carve-out accepts so Ed25519-authenticated peers awaiting
+    // their Slice 10 (#179) reg-cert finality aren't silently dropped.
     val kesGate: F[Boolean] = KesGossipVerification.verifySnapshot(
       messageBytes = snap.hash.toByteArray,
       kesSigBytes = snap.kesSignature.toByteArray,
@@ -910,7 +899,6 @@ object NakamotoSyncDaemon {
       ordinal = snap.ordinal,
       kesRegistry = kesRegistry,
       etaRotationSnapshots = etaRotationSnapshots,
-      enforce = enforceKes,
       logger = logger
     )
     kesGate.flatMap { kesOk =>
@@ -1070,9 +1058,9 @@ object NakamotoSyncDaemon {
       }
 
       // §1.2 Slice 9: KES verification of the incoming snapshot's `kes_signature` field is
-      // now run BEFORE this body via `processValidSnapshot`'s outer `kesGate`. By the time
-      // we reach here the gate has already passed (or this code is unreachable because the
-      // gate dropped the snapshot in enforceKes=true mode).
+      // run BEFORE this body via `processValidSnapshot`'s outer `kesGate`. By the time we
+      // reach here the gate has already passed (otherwise the snapshot was rejected and
+      // this code is unreachable).
 
     } yield ()
 
@@ -1216,7 +1204,6 @@ object NakamotoSyncDaemon {
     tipTracker: TipTracker[F],
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
     etaRotationSnapshots: Long,
-    enforceKes: Boolean,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     // tipHash bytes are the UTF-8 encoding of the hex hash string — decode back to string
@@ -1247,9 +1234,10 @@ object NakamotoSyncDaemon {
           _ <-
             if (valid)
               // §1.2 Slice 9: KES verification runs BEFORE TipTracker.recordAttestation so we
-              // can drop the attestation without un-recording it. When enforceKes=false this
-              // is warn-only and always returns true (preserves Slices 5/6 behavior). When
-              // enforceKes=true: no-sig / decode-fail / verify-fail → drop, no record.
+              // can drop the attestation without un-recording it. Returns false on no-sig /
+              // decode-fail / verify-fail / step-out-of-range; the no-registry-entry carve-out
+              // returns true so Ed25519-authenticated peers that haven't registered yet
+              // (Slice 10 mid-life joiners) aren't silently dropped.
               KesGossipVerification
                 .verifyAttestation(
                   messageBytes = attHash.getBytes,
@@ -1259,7 +1247,6 @@ object NakamotoSyncDaemon {
                   tipOrdinal = att.tipOrdinal,
                   kesRegistry = kesRegistry,
                   etaRotationSnapshots = etaRotationSnapshots,
-                  enforce = enforceKes,
                   logger = logger
                 )
                 .flatMap { kesOk =>
