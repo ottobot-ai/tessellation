@@ -267,6 +267,23 @@ done
 # §1.1 stake-weighted VRF: resolve --stake-dist=<spec> into NAKAMOTO_STAKE_DISTRIBUTION
 # now that NUM_GL0_NODES is known. compose-runner.sh forwards the env var to the Tier-1
 # genesis generator path (test-vectors/genesis fixtures); when unset, default CSV path is used.
+#
+# Default to --stake-dist=uniform when the flag is omitted AND we have ≥ 2 gl0 nodes, so
+# that every `just test` run takes the Tier-1 path (stake-weighted VRF + KES registry
+# populated from genesis). The CSV-only path is kept as a fallback for single-node setups
+# and explicit opt-out (--stake-dist=csv). Non-uniform stake distributions are validated
+# separately in the CI matrix entry `nakamoto-non-uniform`.
+if [ -z "${STAKE_DIST_SPEC:-}" ] && [ -n "${NUM_GL0_NODES:-}" ] && [ "$NUM_GL0_NODES" -ge 2 ]; then
+  export STAKE_DIST_SPEC="uniform"
+fi
+
+if [ "${STAKE_DIST_SPEC:-}" = "csv" ]; then
+  # Explicit opt-out: caller wants the legacy CSV-genesis path (no KES registry, no
+  # stake-weighted VRF). Surfaces as `STAKE_DIST_SPEC` set but `NAKAMOTO_STAKE_DISTRIBUTION`
+  # unset, which compose-runner.sh treats as "skip Tier-1 generator".
+  unset STAKE_DIST_SPEC
+fi
+
 if [ -n "${STAKE_DIST_SPEC:-}" ]; then
   case "$STAKE_DIST_SPEC" in
     uniform)

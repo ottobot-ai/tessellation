@@ -37,12 +37,29 @@ else
 fi
 
 if [ "$SKIP_HYPERGRAPH_BUILD" != "true" ]; then
-  # Build hypergraph JARs from source
-  if [[ "$INCLUDE_L0" == "false" && "$INCLUDE_L1" == "false" && "$SKIP_ASSEMBLY" == "false" ]]; then
-    assemble_all
+  # Build hypergraph JARs from source.
+  #
+  # SKIP_ASSEMBLY=false means "rebuild everything". The previous "only dagL0/dagL1"
+  # default left tools.jar (genesis generator) + keytool/wallet stale whenever code
+  # in those modules — or in any module they transitively depend on, like node-shared
+  # — was edited. Symptom: edits to genesis types (e.g. `L0GenesisKesRegistration`
+  # gains a field) compile cleanly via `sbt tools/compile` but the deployed tools.jar
+  # still serializes the old schema, producing genesis JSON that the freshly-built
+  # gl0.jar then fails to decode. See `project_tessellation_build` memory for the
+  # general "stale JAR cache" failure mode.
+  if [ "$SKIP_ASSEMBLY" == "false" ]; then
+    if [[ "$INCLUDE_L0" == "true" && "$INCLUDE_L1" == "false" ]]; then
+      echo "Assembling L0 only (--include-l1=false)"
+      sbt dagL0/assembly
+    elif [[ "$INCLUDE_L0" == "false" && "$INCLUDE_L1" == "true" ]]; then
+      echo "Assembling L1 only (--include-l0=false)"
+      sbt dagL1/assembly
+    else
+      echo "Assembling all modules (dagL0, dagL1, keytool, wallet, tools)"
+      assemble_all
+    fi
   else
     missing=false
-
     for module in dag-l0 dag-l1 keytool wallet tools; do
       set +e
       jar_path=$(ls -1t modules/"$module"/target/scala-2.13/tessellation-"$module"-assembly*.jar 2>/dev/null | head -n1)
@@ -58,29 +75,7 @@ if [ "$SKIP_HYPERGRAPH_BUILD" != "true" ]; then
       echo "▶️  One or more modules is missing. Cannot skip assembly. Running full assembly"
       assemble_all
     else
-      if [ "$SKIP_ASSEMBLY" == "false" ]; then
-        override_set=false
-        if [ "$INCLUDE_L0" == "true" ]; then
-          echo "Assembling L0"
-          sbt dagL0/assembly
-          override_set=true
-        fi
-        if [ "$INCLUDE_L1" == "true" ]; then
-          echo "Assembling L1"
-          sbt dagL1/assembly
-          override_set=true
-        fi
-        if [ "$override_set" == "false" ]; then
-          # Default: rebuild BOTH L0 and L1. Either layer can change when node-shared
-          # is touched (e.g. GSAM acceptance logic, validators). Rebuilding only L0
-          # left gl1.jar stale and produced StateProofMismatch on layers running an
-          # older binary than gl0. Mirrors bcbd4877 for the metagraph side.
-          echo "Assembling L0 + L1 according to default behavior"
-          sbt dagL0/assembly dagL1/assembly
-        fi
-      else
-        echo "Found existing assemblies, and skip assembly was set to true"
-      fi
+      echo "Found existing assemblies, and skip assembly was set to true"
     fi
   fi
 

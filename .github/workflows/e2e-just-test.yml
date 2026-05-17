@@ -94,8 +94,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Default stake distribution is `uniform` (resolved in set-env.sh when --stake-dist
+        # is omitted) — every matrix entry exercises the Tier-1 / stake-weighted-VRF / KES
+        # path. The `nakamoto-non-uniform` entry explicitly tests a skewed distribution
+        # against the dag-cluster suite so we catch any code path that assumes equal
+        # stake shares (e.g. concavity-bias edge cases, threshold saturation at the heavy
+        # end). The legacy CSV-genesis path is reachable via `--stake-dist=csv`.
         test-group:
           - { name: dag-cluster,            tests: "dag-cluster" }
+          - { name: nakamoto-non-uniform,   tests: "dag-cluster", extra-args: "--num-gl0=8 --stake-dist=0.4,0.2,0.1,0.1,0.05,0.05,0.05,0.05" }
           - { name: delegated-staking,      tests: "delegated-staking" }
           - { name: token-lock-replacement, tests: "token-lock-replacement" }
           - { name: fork-recovery,          tests: "fork-recovery", extra-args: "--num-gl0=5", runner: "Ubuntu-22-64-core" }
