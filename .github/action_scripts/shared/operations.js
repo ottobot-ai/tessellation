@@ -354,11 +354,65 @@ const waitForLastRefHash = async (axiosInst, l1Url, address, expectedHash, {
     )
 }
 
+/**
+ * Wait for a specific gl0 snapshot ordinal to reach T_depth2 finality.
+ *
+ * Polls `GET /global-snapshots/{ord}/finality-triggers` (added by task #138) and
+ * returns when `phases.phase_2_to_3` is true. This is the right "wait until canonical"
+ * primitive for chain-linked tx tests: under MultiBranch overlay, acceptance ≠ canonical
+ * until depth-k / T_depth2 — building tx N+1 on top of tx N before tx N is finalized
+ * can race against a branch switch and drop tx N+1 silently (#186 / #118).
+ *
+ * @param {string} globalL0Url - The GL0 URL
+ * @param {number} targetOrdinal - The ordinal to wait for finality on
+ * @param {Object} [options]
+ * @param {string} [options.name='waitForFinality'] - Name for logging
+ * @param {number} [options.timeoutMs=300000] - 5 min cap; depth-k=31 @ 7s/ord = ~3.6 min worst case
+ * @param {number} [options.intervalMs=3000] - Poll interval
+ * @returns {Promise<Object>} - The final finality-triggers payload
+ */
+const waitForFinality = async (globalL0Url, targetOrdinal, {
+    name = 'waitForFinality',
+    timeoutMs = 5 * 60 * 1000,
+    intervalMs = 3000,
+} = {}) => {
+    const start = Date.now()
+    let lastSeen = null
+    while (Date.now() - start < timeoutMs) {
+        try {
+            const response = await axios.get(
+                `${globalL0Url}/global-snapshots/${targetOrdinal}/finality-triggers`,
+                { validateStatus: s => s >= 200 && s < 600 }
+            )
+            if (response.status === 200) {
+                lastSeen = response.data
+                if (response.data?.phases?.phase_2_to_3 === true) {
+                    const elapsedSec = Math.round((Date.now() - start) / 1000)
+                    logWorkflow.info(
+                        `${name}: ord=${targetOrdinal} reached T_depth2 finality after ${elapsedSec}s ` +
+                        `(triggers=[${(response.data.triggers || []).join(',')}])`
+                    )
+                    return response.data
+                }
+            }
+            // 503 (leader-loop not yet initialized) or 200 with phase_2_to_3=false → keep polling
+        } catch (_) {
+            // transient — keep polling until timeout
+        }
+        await sleep(intervalMs)
+    }
+    throw new Error(
+        `${name}: ord=${targetOrdinal} did not reach T_depth2 finality within ${Math.round(timeoutMs / 1000)}s ` +
+        `(last seen: ${JSON.stringify(lastSeen)})`
+    )
+}
+
 module.exports = {
     sleep,
     withRetry,
     withRetryOrdinal,
     waitForTxInclusion,
+    waitForFinality,
     getLatestSnapshotInfo,
     getCombinedSnapshot,
     isStaleParentError,

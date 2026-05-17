@@ -31,6 +31,7 @@ const {
   sleep,
   withRetry,
   withRetryOrdinal,
+  waitForFinality,
   createNetworkConfig,
   logWorkflow,
 } = require('../shared')
@@ -279,10 +280,10 @@ const testReplaceMinimumIncrease = async (urls, account, existingLockHash, exist
   const newLockHash = await createTokenLock(account, urls, minIncrease, existingLockHash, existingAmount)
   logWorkflow.info(`Created replacement with +1 datum: ${newLockHash}`)
 
-  // Verify delegated stake updated using ordinal-aware retry
+  // Verify delegated stake updated using ordinal-aware retry. Returns acceptance ord.
   logWorkflow.info('Waiting for snapshot inclusion and stake update...')
-  await withRetryOrdinal(
-    async () => {
+  const acceptanceOrd = await withRetryOrdinal(
+    async ({ ordinal }) => {
       const stakeResponse = await getAccountDelegatedStakes(urls, account.address)
       const stake = stakeResponse.activeDelegatedStakes.find(s => s.hash === stakeHash)
       if (!stake) throw new Error('Stake not found')
@@ -292,17 +293,13 @@ const testReplaceMinimumIncrease = async (urls, account, existingLockHash, exist
       if (stake.amount !== minIncrease) {
         throw new Error(`Amount not updated: expected ${minIncrease}, got ${stake.amount}`)
       }
-      return true
+      return ordinal
     },
     { globalL0Url: urls.globalL0Url, name: 'verifyMinIncreaseUpdate', maxOrdinalMisses: 10, maxStalledChecks: 75 }
   )
-  
-  // Brief wait for L1 sync after ordinal progression confirmed
-  logWorkflow.info('Lock confirmed in snapshot, waiting for GL0 sync...')
-  await sleep(5000)
 
   logWorkflow.info('---- End testReplaceMinimumIncrease ----')
-  return { newLockHash, newAmount: minIncrease }
+  return { newLockHash, newAmount: minIncrease, acceptanceOrd }
 }
 
 /**
@@ -325,9 +322,11 @@ const testMultipleSequentialReplacements = async (urls, account, currentLockHash
     const newLockHash = await createTokenLock(account, urls, newAmount, lockHash, amount)
     logWorkflow.info(`  Created replacement ${i}: ${newLockHash.substring(0, 16)}...`)
 
-    // Verify delegated stake updated using ordinal-aware retry
-    await withRetryOrdinal(
-      async () => {
+    // Verify delegated stake updated using ordinal-aware retry. Returns the gl0 ordinal
+    // at which the check succeeded — we use that to wait for T_depth2 finality before
+    // building the next chain-linked replacement.
+    const acceptanceOrd = await withRetryOrdinal(
+      async ({ ordinal }) => {
         const stakeResponse = await getAccountDelegatedStakes(urls, account.address)
         const stake = stakeResponse.activeDelegatedStakes.find(s => s.hash === stakeHash)
         if (!stake) throw new Error('Stake not found')
@@ -337,7 +336,7 @@ const testMultipleSequentialReplacements = async (urls, account, currentLockHash
         if (stake.amount !== newAmount) {
           throw new Error(`Replacement ${i}: Amount not updated. Expected ${newAmount}, got ${stake.amount}`)
         }
-        return true
+        return ordinal
       },
       { globalL0Url: urls.globalL0Url, name: `verifySequentialReplacement${i}`, maxOrdinalMisses: 10 }
     )
@@ -345,25 +344,18 @@ const testMultipleSequentialReplacements = async (urls, account, currentLockHash
     // IMPORTANT: Update lockHash to the NEW lock for the next iteration
     lockHash = newLockHash
     amount = newAmount
-    logWorkflow.info(`  Sequential replacement ${i} verified ✓`)
-    
-    // Wait for ordinal progression + L1 sync before next replacement.
-    // In Nakamoto mode, GL1 processes finalized snapshots with ~60s delay
-    // (depth-k=6 finalization). Wait for 3 ordinal progressions + buffer
-    // to ensure GL1 has processed the snapshot containing the lock.
+    logWorkflow.info(`  Sequential replacement ${i} verified ✓ (acceptanceOrd=${acceptanceOrd})`)
+
+    // Wait for T_depth2 finality of replacement i before submitting replacement i+1.
+    //
+    // Under MultiBranch overlay, acceptance ≠ canonical until depth-k / T_depth2 fires —
+    // the binary's lastSnapshotHash can reference a branch gl0 has switched away from,
+    // causing silent chain-link rejection (#186 / #118). Building the next chain-linked
+    // replacement on a finalized state is what a robust real Nakamoto client should do.
+    // Once #118 OverlayReader lands, we can fall back to "wait for acceptance" again.
     if (i < 3) {
-      logWorkflow.info('  Waiting for ordinal progression before next replacement...')
-      let progressionsSeen = 0
-      await withRetryOrdinal(
-        async ({ ordinal, prevOrdinal }) => {
-          if (!prevOrdinal) throw new Error('Waiting for first ordinal')
-          if (ordinal > prevOrdinal) progressionsSeen++
-          if (progressionsSeen < 3) throw new Error(`Waiting for 3 ordinal progressions (seen ${progressionsSeen}): ${ordinal}`)
-          return true
-        },
-        { globalL0Url: urls.globalL0Url, name: `waitBeforeReplacement${i + 1}`, maxOrdinalMisses: 10, maxStalledChecks: 60 }
-      )
-      await sleep(5000) // Extra buffer for L1 to process the snapshot
+      logWorkflow.info(`  Waiting for replacement ${i} (ord=${acceptanceOrd}) to be T_depth2 finalized before next replacement...`)
+      await waitForFinality(urls.globalL0Url, acceptanceOrd, { name: `waitForFinality${i}` })
     }
   }
 
@@ -553,36 +545,18 @@ const testTokenLockReplacementEdgeCases = async (urls) => {
   await testReplaceNonExistentRef(urls, account)
 
   // Test 4: Replace with minimum valid increase (+1 datum)
-  const { newLockHash, newAmount } = await testReplaceMinimumIncrease(
+  const { newLockHash, newAmount, acceptanceOrd: minIncreaseAcceptanceOrd } = await testReplaceMinimumIncrease(
     urls, account, lockHash, lockAmount, stakeHash
   )
 
-  // Wait for 2 ordinal progressions since we started waiting, to ensure the lock
-  // is fully propagated to L1. One progression isn't enough with slow rounds: the
-  // lock lands in ordinal N, the global snapshot for N needs to reach L1, and L1
-  // needs to process it. Two progressions guarantees the lock's snapshot has been
-  // accepted and L1 is current.
-  //
-  // The previous implementation compared `ordinal - prevOrdinal` (per-poll delta)
-  // against 2, but `prevOrdinal` is the *previous poll's* ordinal, not the starting
-  // ordinal. With poll interval ≪ ordinal cadence, each poll saw advance ≤ 1 and
-  // the predicate never succeeded. Fixed by capturing the starting ordinal.
-  logWorkflow.info('Waiting for 2 ordinal progressions before sequential replacements...')
-  let startOrdinalForLockPropagation = null
-  await withRetryOrdinal(
-    async ({ ordinal }) => {
-      if (startOrdinalForLockPropagation === null) {
-        startOrdinalForLockPropagation = ordinal
-      }
-      const progressed = ordinal - startOrdinalForLockPropagation
-      if (progressed < 2) {
-        throw new Error(`Waiting for 2 ordinal progressions: ${progressed}/2 (ordinal=${ordinal})`)
-      }
-      return true
-    },
-    { globalL0Url: urls.globalL0Url, name: 'waitForLockPropagation', maxOrdinalMisses: 10, maxStalledChecks: 60 }
-  )
-  await sleep(5000) // Extra buffer for L1 to process the snapshot
+  // Wait for T_depth2 finality of the minimum-increase replacement before entering the
+  // rapid sequential-replacement loop. Under MultiBranch, acceptance ≠ canonical until
+  // depth-k / T_depth2 fires — without this wait, sequential replacement 1 inherits the
+  // same lastRef race that broke replacement 2 of the loop (#186 / #118). The previous
+  // "wait 2 ord progressions" was insufficient (a sequential replacement happened to be
+  // slow enough on retries to mask it).
+  logWorkflow.info(`Waiting for min-increase replacement (ord=${minIncreaseAcceptanceOrd}) to be T_depth2 finalized before sequential replacements...`)
+  await waitForFinality(urls.globalL0Url, minIncreaseAcceptanceOrd, { name: 'waitForLockPropagation' })
 
   // Test 5: Multiple sequential replacements
   await testMultipleSequentialReplacements(urls, account, newLockHash, newAmount, stakeHash)
