@@ -674,7 +674,9 @@ object GlobalSnapshotConsensus {
                   mptOverlay = mptOverlay,
                   nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef,
                   chainSyncRequestQueue = chainSyncRequestQueue,
-                  finalityTriggerViewRef = finalityTriggerViewRef
+                  finalityTriggerViewRef = finalityTriggerViewRef,
+                  // §1.2 Slice 5/6: parallel-sign attestations + snapshots with KES.
+                  operationalKeyMaker = operationalKeyMaker
                 )
                 .compile
                 .drain
@@ -758,7 +760,10 @@ object GlobalSnapshotConsensus {
                   eventMempool = eventMempool,
                   dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data")),
                   processMetagraphBinary = processMetagraphBinary,
-                  sharedChainSyncManagerRef = sharedChainSyncManagerRef
+                  sharedChainSyncManagerRef = sharedChainSyncManagerRef,
+                  // §1.2 Slice 5/6: sign attestations + warn-only verify incoming KES sigs.
+                  operationalKeyMaker = operationalKeyMaker,
+                  kesRegistry = kesRegistry
                 )
                 .compile
                 .drain

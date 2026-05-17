@@ -229,7 +229,13 @@ object SnapshotLeaderLoop {
     // qualified ord N?" without taking on the leader-loop's internal state. Caller
     // creates the Ref before HttpApi wiring; we set it once at startup. Pure
     // observability — never feeds back into consensus.
-    finalityTriggerViewRef: Ref[F, Option[FinalityTriggerView[F]]]
+    finalityTriggerViewRef: Ref[F, Option[FinalityTriggerView[F]]],
+    // §1.2 Slice 5/6: KES parallel-signing for attestations + snapshots. `operationalKeyMaker`
+    // signs the attestation hash + snapshot hash at the period derived from the rotation
+    // function; `etaRotationSnapshots` is already in this signature above so we don't add it.
+    // Receivers (NakamotoSyncDaemon) re-derive the same period from the wire ordinal and
+    // verify with the master VK looked up in the registry — warn-only this slice.
+    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F]
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -373,6 +379,7 @@ object SnapshotLeaderLoop {
                             nakamotoFinalizedOrdinalRef,
                             mptStore,
                             mptOverlay,
+                            operationalKeyMaker,
                             logger
                           )
                         } // snapshotSemaphore.permit
@@ -528,6 +535,8 @@ object SnapshotLeaderLoop {
                                     tipTracker = tipTracker,
                                     selfId = selfId,
                                     keyPair = keyPair,
+                                    operationalKeyMaker = operationalKeyMaker,
+                                    etaRotationSnapshots = etaRotationSnapshots,
                                     logger = logger
                                   ) >> logger.info(
                                     s"RE-ATTEST bestTip change: ord=${tip.ordinal} slot=${tip.slot} hash=${tip.hash.value.take(12)} " +
@@ -857,6 +866,8 @@ object SnapshotLeaderLoop {
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
     mptStore: MptStore[F, GlobalStateKey],
     mptOverlay: MptOverlay[F, GlobalStateKey],
+    // §1.2 Slice 6: KES parallel-signing for the published snapshot's `kes_signature` field.
+    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -1058,13 +1069,54 @@ object SnapshotLeaderLoop {
 
                   // Publish + self-attest only if gate is still open
                   snapshotHash = snapshotHashedForStorage.hash
+                  producedOrdinal = lastKey.value.value + 1
+                  // §1.2 Slice 6: parallel-sign the snapshot's hash bytes with KES BEFORE we
+                  // publish, then embed the resulting bytes in the pb.Snapshot's `kes_signature`
+                  // field. Period is derived from the produced ordinal (`lastKey + 1`) — receivers
+                  // re-derive the same period from `snap.ordinal` so verification stays self-
+                  // consistent. Sender failure → empty wire field, receiver treats as no-sig.
+                  //
+                  // The message bytes ARE the snapshot hash as a UTF-8 string (matching the
+                  // sidecar's existing `hash` byte representation and the receiver's
+                  // `snap.hash.toByteArray` extraction in NakamotoSyncDaemon.verifyKesSnapshot).
+                  kesPeriodSnap = EtaCalculation.rotationPeriod(producedOrdinal, etaRotationSnapshots).toInt
+                  snapshotHashBytes = snapshotHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                  kesSnapAttempt <-
+                    if (stillOpen) operationalKeyMaker.signAt(kesPeriodSnap, snapshotHashBytes)
+                    else
+                      Async[F]
+                        .pure[
+                          Either[io.constellationnetwork.security.kes.KesError, io.constellationnetwork.security.kes.SignatureKesProduct]
+                        ](
+                          Left(io.constellationnetwork.security.kes.KesError.MalformedTree("skipped — gate closed"))
+                        )
+                  kesSnapSigBytes <- kesSnapAttempt match {
+                    case Right(kSig) =>
+                      val bytes = io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(kSig)
+                      Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_signed_total") >>
+                        logger
+                          .info(
+                            s"🔐 KES-SNAP ord=$producedOrdinal period=$kesPeriodSnap sub-sig=${bytes.take(8).map("%02x".format(_)).mkString} (${bytes.length}B)"
+                          )
+                          .as(bytes)
+                    case Left(err) if stillOpen =>
+                      Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_sign_failed_total") >>
+                        logger
+                          .warn(
+                            s"⚠️ KES-SNAP sign failed for ord=$producedOrdinal period=$kesPeriodSnap: ${err.message} — emitting unsigned wire field"
+                          )
+                          .as(Array.empty[Byte])
+                    case Left(_) =>
+                      // gate closed → no publish, sig not needed; return empty for path uniformity
+                      Async[F].pure(Array.empty[Byte])
+                  }
                   _ <- Async[F].whenA(stillOpen) {
                     sidecarClient
                       .publishSnapshot(
                         SidecarClient.mkSnapshot(
                           hash = snapshotHash.value.getBytes,
                           slot = currentSlot,
-                          ordinal = lastKey.value.value + 1,
+                          ordinal = producedOrdinal,
                           parentHash = lastHashed.hash.value.getBytes,
                           vrfProof = proof,
                           vrfPublicKey = vrfPK,
@@ -1077,7 +1129,8 @@ object SnapshotLeaderLoop {
                             combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
                           },
                           producerId = selfId.value.toBytes,
-                          parentSlot = parentSlotValue
+                          parentSlot = parentSlotValue,
+                          kesSignature = kesSnapSigBytes
                         )
                       )
                       .void
@@ -1096,23 +1149,24 @@ object SnapshotLeaderLoop {
                         NakamotoSyncDaemon.emitTipAttestation[F](
                           tipHash = snapshotHash,
                           tipSlot = slotRefined,
-                          tipOrdinal = lastKey.value.value + 1,
+                          tipOrdinal = producedOrdinal,
                           attestedAt = attestedAt,
                           sidecarClient = sidecarClient,
                           tipTracker = tipTracker,
                           selfId = selfId,
                           keyPair = keyPair,
+                          operationalKeyMaker = operationalKeyMaker,
+                          etaRotationSnapshots = etaRotationSnapshots,
                           logger = logger
                         )
                       } >>
                       logger.info(
-                        s"Produced snapshot ordinal=${lastKey.value.value + 1} slot=$currentSlot " +
+                        s"Produced snapshot ordinal=$producedOrdinal slot=$currentSlot " +
                           s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"
                       ) >>
                       Metrics[F].incrementCounter("dag_nakamoto_snapshots_produced") >>
-                      Metrics[F].updateGauge("dag_nakamoto_ordinal", lastKey.value.value + 1) >>
+                      Metrics[F].updateGauge("dag_nakamoto_ordinal", producedOrdinal) >>
                       Async[F].delay(System.currentTimeMillis()).flatMap { nowMs =>
-                        val producedOrdinal = lastKey.value.value + 1
                         Metrics[F].recordDistribution("dag_nakamoto_production_duration_ms", (nowMs - productionStartMs).toInt) >>
                           productionTimestamps.update { ts =>
                             val updated = ts + (producedOrdinal -> nowMs)

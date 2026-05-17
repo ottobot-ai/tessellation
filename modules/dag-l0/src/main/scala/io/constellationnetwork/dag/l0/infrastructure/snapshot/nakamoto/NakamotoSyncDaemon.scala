@@ -139,6 +139,8 @@ object NakamotoSyncDaemon {
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
+    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
+    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -180,6 +182,8 @@ object NakamotoSyncDaemon {
               chainSyncManager,
               channel,
               dataDir,
+              operationalKeyMaker,
+              kesRegistry,
               logger
             )
           }
@@ -227,7 +231,14 @@ object NakamotoSyncDaemon {
     // machinery without needing their own `ChainSyncManager`. We publish our
     // internally-constructed manager into this Ref once it's built; consumers
     // read-through it and no-op if the producer hasn't bound yet.
-    sharedChainSyncManagerRef: Ref[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]]
+    sharedChainSyncManagerRef: Ref[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]],
+    // §1.2 Slice 5/6: KES parallel-signing infrastructure. The OperationalKeyMaker
+    // signs attestations + snapshots with the operator's KES product key at the period
+    // derived from `EtaCalculation.rotationPeriod`. The KesRegistry holds the
+    // (peerId → kesMasterVk) map needed by receivers to verify incoming KES sigs.
+    // Both are warn-only this slice — Ed25519 stays load-bearing until Slice 9.
+    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
+    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F]
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -295,6 +306,8 @@ object NakamotoSyncDaemon {
                                 csm,
                                 channel,
                                 dataDir,
+                                operationalKeyMaker,
+                                kesRegistry,
                                 logger
                               )
                             }
@@ -381,6 +394,8 @@ object NakamotoSyncDaemon {
                                     chainSyncManager,
                                     channel,
                                     dataDir,
+                                    operationalKeyMaker,
+                                    kesRegistry,
                                     logger
                                   )
                                 } >>
@@ -388,7 +403,7 @@ object NakamotoSyncDaemon {
                             }
 
                           case pb.GossipMessage.Body.Attestation(att) =>
-                            handleAttestation(att, tipTracker, logger)
+                            handleAttestation(att, tipTracker, kesRegistry, etaRotationSnapshots, logger)
 
                           case pb.GossipMessage.Body.MetagraphBinary(mb) =>
                             handleMetagraphBinary(mb, processMetagraphBinary, logger)
@@ -448,6 +463,9 @@ object NakamotoSyncDaemon {
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
+    // §1.2 Slice 5/6: KES infrastructure for sender-side signing + receiver-side warn-only verify.
+    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
+    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -697,6 +715,8 @@ object NakamotoSyncDaemon {
             lastGlobalSnapshotStorage,
             lastNGlobalSnapshotStorage,
             productionGate,
+            operationalKeyMaker,
+            kesRegistry,
             logger
           ) >> {
             // This snapshot is now stored — drain any children that were waiting for it.
@@ -728,6 +748,8 @@ object NakamotoSyncDaemon {
               chainSyncManager,
               channel,
               dataDir,
+              operationalKeyMaker,
+              kesRegistry,
               logger
             )
           }
@@ -860,6 +882,8 @@ object NakamotoSyncDaemon {
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     productionGate: ProductionGate[F],
+    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
+    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     for {
@@ -951,9 +975,34 @@ object NakamotoSyncDaemon {
       // Ouroboros-Chronos-style timestamp-claim surface.
       _ <- Async[F].whenA(becameBestTip) {
         Clock[F].realTime.map(_.toMillis).flatMap { attestedAt =>
-          emitAttestation(snap, attestedAt, sidecarClient, tipTracker, selfId, keyPair, logger)
+          emitAttestation(
+            snap,
+            attestedAt,
+            sidecarClient,
+            tipTracker,
+            selfId,
+            keyPair,
+            operationalKeyMaker,
+            etaRotationSnapshots,
+            logger
+          )
         }
       }
+
+      // §1.2 Slice 6: warn-only KES verification of the incoming snapshot's `kes_signature`
+      // field. Mirrors the attestation behavior matrix exactly — empty / decode-fail /
+      // no-registry / verified / invalid. The Ed25519 path is already validated upstream
+      // (NakamotoSnapshotValidator); KES rides alongside until Slice 9.
+      _ <- KesGossipVerification.verifySnapshot(
+        messageBytes = snap.hash.toByteArray,
+        kesSigBytes = snap.kesSignature.toByteArray,
+        producerId = producerId,
+        producerHex = producerHex,
+        ordinal = snap.ordinal,
+        kesRegistry = kesRegistry,
+        etaRotationSnapshots = etaRotationSnapshots,
+        logger = logger
+      )
 
     } yield ()
 
@@ -1092,9 +1141,11 @@ object NakamotoSyncDaemon {
       }
     }
 
-  private def handleAttestation[F[_]: Async: SecurityProvider: HasherSelector](
+  private def handleAttestation[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     att: pb.TipAttestation,
     tipTracker: TipTracker[F],
+    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
+    etaRotationSnapshots: Long,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     // tipHash bytes are the UTF-8 encoding of the hex hash string — decode back to string
@@ -1103,6 +1154,7 @@ object NakamotoSyncDaemon {
     val attesterHex = Hex(att.attesterId.toByteArray.map("%02x".format(_)).mkString)
     val attesterId = peer.PeerId(attesterHex)
     val sigBytes = att.signature.toByteArray
+    val kesSigBytes = att.kesSignature.toByteArray
     // `att.attestedAt` is wall-clock epoch ms set by the peer (Clock[F].realTime).
     // Used purely for "newer-wins" ordering in TipTracker; no slot interpretation.
     val domainAtt = DomainTipAttestation(tipHash, tipSlot, att.tipOrdinal, att.attestedAt)
@@ -1126,6 +1178,23 @@ object NakamotoSyncDaemon {
               tipTracker.recordAttestation(attesterId, domainAtt, nowMs) >>
                 logger.info(
                   s"📨 Attestation for ordinal=${att.tipOrdinal} from=${attesterHex.value.take(16)}..."
+                ) >>
+                // §1.2 Slice 5: warn-only KES verification. Ed25519 stays load-bearing;
+                // KES rides alongside until Slice 9 flips it to load-bearing. Behavior matrix:
+                //   - empty wire field  → no-sig counter, no log
+                //   - decode failure    → decode-failed counter + WARN
+                //   - sig + no registry → no-registry-entry counter + DEBUG
+                //   - sig + verify OK   → verified counter + INFO
+                //   - sig + verify fail → invalid counter + WARN (do NOT reject attestation)
+                KesGossipVerification.verifyAttestation(
+                  messageBytes = attHash.getBytes,
+                  kesSigBytes = kesSigBytes,
+                  attesterId = attesterId,
+                  attesterHex = attesterHex,
+                  tipOrdinal = att.tipOrdinal,
+                  kesRegistry = kesRegistry,
+                  etaRotationSnapshots = etaRotationSnapshots,
+                  logger = logger
                 )
             else
               logger.warn(
@@ -1180,26 +1249,40 @@ object NakamotoSyncDaemon {
   // timestamp-claim surface (gossiping `attestedAt` values lets the network distill a consensus
   // time without needing NTP). Today the value is only used by `TipTracker.recordAttestation`
   // for the "newer wins" rule, which compares Longs.
-  def emitAttestation[F[_]: Async: SecurityProvider: HasherSelector](
+  def emitAttestation[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     snap: pb.Snapshot,
     attestedAt: Long,
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
     selfId: peer.PeerId,
     keyPair: KeyPair,
+    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
+    etaRotationSnapshots: Long,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     // snap.hash bytes are the UTF-8 encoding of the hex hash string — decode back to string
     val tipHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
     val tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
-    emitTipAttestation(tipHash, tipSlot, snap.ordinal, attestedAt, sidecarClient, tipTracker, selfId, keyPair, logger)
+    emitTipAttestation(
+      tipHash,
+      tipSlot,
+      snap.ordinal,
+      attestedAt,
+      sidecarClient,
+      tipTracker,
+      selfId,
+      keyPair,
+      operationalKeyMaker,
+      etaRotationSnapshots,
+      logger
+    )
   }
 
   // Primitive variant for callers that have tip hash/slot/ordinal directly (e.g. the finality
   // monitor's bestTip-change ticker re-attesting after chainSelection moves).
   // See `emitAttestation` comment re: `attestedAt` semantics — wall-clock epoch ms via
   // `Clock[F].realTime`, sourced by the caller; this function does not read the clock.
-  def emitTipAttestation[F[_]: Async: SecurityProvider: HasherSelector](
+  def emitTipAttestation[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     tipHash: Hash,
     tipSlot: Slot,
     tipOrdinal: Long,
@@ -1208,6 +1291,8 @@ object NakamotoSyncDaemon {
     tipTracker: TipTracker[F],
     selfId: peer.PeerId,
     keyPair: KeyPair,
+    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
+    etaRotationSnapshots: Long,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     // Record locally first (so our own TipTracker sees it). The caller already sourced
@@ -1222,13 +1307,39 @@ object NakamotoSyncDaemon {
           attHash <- localAtt.hash
           sig <- Signature.fromHash[F](keyPair.getPrivate, attHash)
           sigBytes = sig.coerce.toBytes
+          // §1.2 Slice 5: parallel-sign the attestation hash with KES. Period is derived from
+          // the tip's ordinal, NOT slot — slots are LDD-paced and lumpy. The receiver re-derives
+          // the same period from `tipOrdinal` in the wire message so verification stays
+          // self-consistent without any extra wire field.
+          //
+          // Sender failure (signAt returns Left) → empty wire field, receiver treats as no-sig.
+          // Don't drop the attestation. Period eta-aligned evolution lands in Slice 8; this slice
+          // signs at the period without any pre-evolve step.
+          kesPeriod = EtaCalculation.rotationPeriod(tipOrdinal, etaRotationSnapshots).toInt
+          kesAttempt <- operationalKeyMaker.signAt(kesPeriod, attHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+          kesSigBytes <- kesAttempt match {
+            case Right(kSig) =>
+              val bytes = io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(kSig)
+              Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_signed_total") >>
+                logger
+                  .info(
+                    s"🔐 KES-ATT ord=$tipOrdinal period=$kesPeriod sub-sig=${bytes.take(8).map("%02x".format(_)).mkString} (${bytes.length}B)"
+                  )
+                  .as(bytes)
+            case Left(err) =>
+              Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_sign_failed_total") >>
+                logger
+                  .warn(s"⚠️ KES-ATT sign failed for ord=$tipOrdinal period=$kesPeriod: ${err.message} — emitting unsigned wire field")
+                  .as(Array.empty[Byte])
+          }
           att = SidecarClient.mkAttestation(
             tipHash = tipHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
             tipSlot = tipSlot.value.value,
             tipOrdinal = tipOrdinal,
             attestedAt = attestedAt,
             attesterId = selfId.value.toBytes,
-            signature = sigBytes
+            signature = sigBytes,
+            kesSignature = kesSigBytes
           )
           _ <- sidecarClient.publishAttestation(att).void.handleErrorWith { e =>
             logger.warn(s"Failed to emit attestation: ${e.getMessage}")

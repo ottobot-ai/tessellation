@@ -90,7 +90,12 @@ object SidecarClient {
     eta: Array[Byte],
     payload: Array[Byte],
     producerId: Array[Byte],
-    parentSlot: Long = 0L
+    parentSlot: Long = 0L,
+    // §1.2 Slice 6: optional KES parallel signature over the snapshot artifact hash.
+    // Empty by default (pre-Slice-6 callers + sender-side signAt failures both
+    // produce an empty wire field; receivers tolerate empty in Slice 5/6 — load-bearing
+    // verification lands in Slice 9).
+    kesSignature: Array[Byte] = Array.empty[Byte]
   ): Snapshot =
     Snapshot(
       hash = ByteString.copyFrom(hash),
@@ -102,7 +107,8 @@ object SidecarClient {
       eta = ByteString.copyFrom(eta),
       payload = ByteString.copyFrom(payload),
       producerId = ByteString.copyFrom(producerId),
-      parentSlot = parentSlot
+      parentSlot = parentSlot,
+      kesSignature = ByteString.copyFrom(kesSignature)
     )
 
   def mkRumor(
@@ -122,7 +128,12 @@ object SidecarClient {
     tipOrdinal: Long,
     attestedAt: Long,
     attesterId: Array[Byte],
-    signature: Array[Byte]
+    signature: Array[Byte],
+    // §1.2 Slice 5: optional KES parallel signature over the attestation hash.
+    // Empty by default (pre-Slice-5 callers + sender-side signAt failures both
+    // produce an empty wire field; receivers tolerate empty in Slice 5/6 — load-bearing
+    // verification lands in Slice 9).
+    kesSignature: Array[Byte] = Array.empty[Byte]
   ): TipAttestation =
     TipAttestation(
       tipHash = ByteString.copyFrom(tipHash),
@@ -130,7 +141,8 @@ object SidecarClient {
       tipOrdinal = tipOrdinal,
       attestedAt = attestedAt,
       attesterId = ByteString.copyFrom(attesterId),
-      signature = ByteString.copyFrom(signature)
+      signature = ByteString.copyFrom(signature),
+      kesSignature = ByteString.copyFrom(kesSignature)
     )
 
   def mkMetagraphBinary(

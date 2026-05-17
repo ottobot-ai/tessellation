@@ -181,4 +181,31 @@ object OperationalKeyMaker {
       (encoded, vk)
     }
   }
+
+  /** Pure verify helper exposed for callers outside the `kes` package. `KesProduct` itself is package-private so the underlying
+    * `KesProduct.instance.verify` would be unreachable from `dag-l0` (Slice 5 receiver path). This forwards to that method without widening
+    * the package surface. The function is pure (no F[_]) because verify performs no I/O — it's a Merkle-path reconstruction + Ed25519
+    * verify, all CPU-only.
+    */
+  def verify(
+    signature: SignatureKesProduct,
+    message: Array[Byte],
+    verifyKey: VerificationKeyKesProduct
+  ): Boolean =
+    KesProduct.instance.verify(signature, message, verifyKey)
+
+  /** Encode a KES product signature to its on-the-wire byte representation. Forwarder for [[SignatureCodec.encodeSignature]], exposed
+    * because [[SignatureCodec]] is package-private (the secret-key bits should stay scoped). Slice 5/6 senders call this to fill the
+    * `kes_signature` field on `pb.TipAttestation` / `pb.Snapshot`.
+    */
+  def encodeSignature(signature: SignatureKesProduct): Array[Byte] =
+    SignatureCodec.encodeSignature(signature)
+
+  /** Decode a KES product signature from its on-the-wire byte representation. Forwarder for [[SignatureCodec.decodeSignature]]; see
+    * [[encodeSignature]] for the rationale. Slice 5/6 receivers call this on the `kes_signature` field bytes; an empty input yields
+    * `Left(KesError.MalformedTree(...))` rather than a special "no-signature" sentinel — callers handle the empty case upstream by
+    * short-circuiting on `bytes.isEmpty` before invoking decode.
+    */
+  def decodeSignature(bytes: Array[Byte]): Either[KesError, SignatureKesProduct] =
+    SignatureCodec.decodeSignature(bytes)
 }

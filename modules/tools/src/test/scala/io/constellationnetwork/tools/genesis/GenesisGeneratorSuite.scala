@@ -11,9 +11,8 @@ import io.constellationnetwork.security.signature.Signing
 
 import weaver.SimpleIOSuite
 
-/** Round-trip tests for `GenesisGenerator.generate` — verifies that the §1.2 Slice 3b KES registration
-  * fields are populated correctly and that the long-term-signature binding actually verifies against the
-  * operator's long-term ECDSA public key.
+/** Round-trip tests for `GenesisGenerator.generate` — verifies that the §1.2 Slice 3b KES registration fields are populated correctly and
+  * that the long-term-signature binding actually verifies against the operator's long-term ECDSA public key.
   */
 object GenesisGeneratorSuite extends SimpleIOSuite {
 
@@ -103,8 +102,7 @@ object GenesisGeneratorSuite extends SimpleIOSuite {
         out <- GenesisGenerator.generate[IO](opts(), invocation = "test")
         regs = out.l0Genesis.kesRegistrations.getOrElse(Nil)
         ops = out.l0Genesis.operators
-      } yield
-        regs.zip(ops).map { case (reg, op) => expect.same(op.peerId, reg.peerId) }.combineAll
+      } yield regs.zip(ops).map { case (reg, op) => expect.same(op.peerId, reg.peerId) }.combineAll
     }
   }
 
@@ -132,15 +130,16 @@ object GenesisGeneratorSuite extends SimpleIOSuite {
         paths <- GenesisGenerator.writeKesSecretKeys[IO](tmpDir, out.kesSecretKeys)
         // Each file exists, is non-empty, and (on POSIX) has 0600.
         checks <- IO.delay {
-          paths.zip(out.kesSecretKeys).map {
-            case (p, sk) =>
-              val path = JPaths.get(p)
-              val exists = JFiles.exists(path)
-              val size = if (exists) JFiles.size(path) else 0L
-              val expectedRel = s"keys/operator-${sk.operatorIndex}/kes-sk.bin"
-              val pathOk = p.endsWith(expectedRel)
-              val permsOk = scala.util
-                .Try {
+          paths
+            .zip(out.kesSecretKeys)
+            .map {
+              case (p, sk) =>
+                val path = JPaths.get(p)
+                val exists = JFiles.exists(path)
+                val size = if (exists) JFiles.size(path) else 0L
+                val expectedRel = s"keys/operator-${sk.operatorIndex}/kes-sk.bin"
+                val pathOk = p.endsWith(expectedRel)
+                val permsOk = scala.util.Try {
                   val view = JFiles.getFileAttributeView(path, classOf[PosixFileAttributeView])
                   if (view == null) true // non-POSIX FS, no-op
                   else {
@@ -149,9 +148,10 @@ object GenesisGeneratorSuite extends SimpleIOSuite {
                     asString == "rw-------"
                   }
                 }
-                .getOrElse(true)
-              expect(exists) && expect(size > 0L) && expect(pathOk) && expect(permsOk)
-          }.combineAll
+                  .getOrElse(true)
+                expect(exists) && expect(size > 0L) && expect(pathOk) && expect(permsOk)
+            }
+            .combineAll
         }
       } yield checks
     }
