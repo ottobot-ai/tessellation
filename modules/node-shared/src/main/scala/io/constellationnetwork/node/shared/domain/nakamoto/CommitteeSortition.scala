@@ -63,7 +63,7 @@ trait CommitteeSortition[F[_]] {
 
 object CommitteeSortition {
 
-  private val vrf = new EcVrf25519()
+  private val vrf = EcVrf25519.default
 
   /** Domain-separation suffix. Must NOT collide with anything `EligibilityChecker` hashes. */
   private val DomainTag: Array[Byte] = "committee".getBytes(StandardCharsets.UTF_8)

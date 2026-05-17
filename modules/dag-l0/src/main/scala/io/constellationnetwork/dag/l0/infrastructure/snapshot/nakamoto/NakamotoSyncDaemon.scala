@@ -58,7 +58,7 @@ object NakamotoSyncDaemon {
   private val ConfirmationDepthK: Long =
     sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH").flatMap(_.toLongOption).getOrElse(255L)
 
-  private val vrf = new EcVrf25519()
+  private val vrf = EcVrf25519.default
 
   /** Derive VRF output from proof bytes. The chain store needs the output (not the proof) for eta computation. The producer stores
     * vrfOutput directly, but gossip only carries the proof — we must derive the output here to match what the producer stored.

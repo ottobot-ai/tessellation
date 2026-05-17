@@ -68,7 +68,7 @@ object NakamotoProposer {
     slotsPerEpoch: Long = 60L // Epoch rotates every 60 slots (60 seconds)
   )
 
-  private val vrf = new EcVrf25519()
+  private val vrf = EcVrf25519.default
 
   /** Create a NakamotoProposer instance.
     *

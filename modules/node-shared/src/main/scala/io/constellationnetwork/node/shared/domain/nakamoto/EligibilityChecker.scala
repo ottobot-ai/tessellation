@@ -99,7 +99,7 @@ class EligibilityChecker[F[_]: Monad](log1p: Log1p[F], exp: Exp[F]) {
 
 object EligibilityChecker {
 
-  private val vrf = new EcVrf25519()
+  private val vrf = EcVrf25519.default
 
   /** 2^512 — denominator for normalizing a 64-byte VRF output into [0, 1) as a `Ratio`. Computed once. */
   private val NormalizationConstant: BigInt = BigInt(2).pow(512)
