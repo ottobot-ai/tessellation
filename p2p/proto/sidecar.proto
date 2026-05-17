@@ -36,6 +36,11 @@ message Snapshot {
   int64 parent_slot = 10;   // slot of parent snapshot (for slot gap verification)
   bool finalized = 11;      // ChainSync disposition (#56.8): true ⇒ on canonical chain at finalized ordinal
   bytes branch_id = 12;     // ChainSync disposition (#56.8): pending branch id when finalized=false
+  // KES product signature over the same bytes that `signature` covers (the
+  // snapshot artifact hash for Snapshot). Empty when sender pre-dates the §1.2
+  // KES rollout — receiver tolerates empty (Slice 5 makes verification
+  // warn-only). Added in §1.2 Slice 4.
+  bytes kes_signature = 13;
 }
 
 // A validator's endorsement of a chain tip.
@@ -46,6 +51,11 @@ message TipAttestation {
   int64 attested_at = 4;    // slot when attestation was created
   bytes attester_id = 5;    // peer identity of the attester
   bytes signature = 6;      // signature over (tip_hash || tip_slot)
+  // KES product signature over the same bytes that `signature` covers (the
+  // attestation hash for TipAttestation). Empty when sender pre-dates the §1.2
+  // KES rollout — receiver tolerates empty (Slice 5 makes verification
+  // warn-only). Added in §1.2 Slice 4.
+  bytes kes_signature = 7;
 }
 
 // A generic signed rumor — used to carry events, BFT consensus messages,
