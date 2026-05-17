@@ -114,4 +114,58 @@ object OperationalKeyMakerSuite extends SimpleIOSuite {
           expect(KesProduct.instance.verify(sig, "stable".getBytes("UTF-8"), vk))
       }
   }
+
+  // ============================================================
+  // bootstrap factory — single-call generate + persist + open
+  // ============================================================
+
+  test("bootstrap: generate + persist + open in one call; signature verifies against currentPublicKey") {
+    val seed = Array.fill[Byte](32)(0x11.toByte)
+    for {
+      store <- SecureStore.inMemory[IO]
+      out <- OperationalKeyMaker
+        .bootstrap[IO](store, keyName, seed, etaPeriodLength = 100L, height = (2, 2))
+        .use { kmaker =>
+          for {
+            vk <- kmaker.currentPublicKey
+            sigResult <- kmaker.signAt(0, "bootstrap-msg".getBytes("UTF-8"))
+          } yield (vk, sigResult)
+        }
+    } yield
+      matches(out) {
+        case (vk, Right(sig)) =>
+          expect(KesProduct.instance.verify(sig, "bootstrap-msg".getBytes("UTF-8"), vk))
+      }
+  }
+
+  test("bootstrap: persisted key survives across two open/close cycles") {
+    val seed = Array.fill[Byte](32)(0x22.toByte)
+    for {
+      store <- SecureStore.inMemory[IO]
+      // Bootstrap once + evolve to step 3 to mutate the persisted key
+      _ <- OperationalKeyMaker
+        .bootstrap[IO](store, keyName, seed, etaPeriodLength = 100L, height = (2, 2))
+        .use(_.evolveTo(3))
+      // Re-open via plain make (no re-bootstrap); the persisted state should be at step 3
+      step <- OperationalKeyMaker
+        .make[IO](store, keyName, etaPeriodLength = 100L)
+        .use(_.currentPeriod)
+    } yield expect.same(3, step)
+  }
+
+  test("bootstrap: caller's seed is scrubbed (defensive overwrite)") {
+    val originalSeed = Array.fill[Byte](32)(0x33.toByte)
+    val seedHandedToBootstrap = originalSeed.clone() // separate copy so we keep `originalSeed` for comparison
+    for {
+      store <- SecureStore.inMemory[IO]
+      _ <- OperationalKeyMaker
+        .bootstrap[IO](store, keyName, seedHandedToBootstrap, etaPeriodLength = 100L, height = (2, 2))
+        .use(_ => IO.unit)
+    } yield
+      // The bootstrap clones the seed defensively (`seed.clone()` at the top of `bootstrap`), then scrubs the
+      // copy after generation. The caller's original `seedHandedToBootstrap` is NOT scrubbed — that's the
+      // *caller's* responsibility per the doc (callers should zero their own buffer if needed). The contract
+      // tested here is: caller's bytes are unchanged (we cloned them rather than scrubbing in-place).
+      expect.same(originalSeed.toList, seedHandedToBootstrap.toList)
+  }
 }

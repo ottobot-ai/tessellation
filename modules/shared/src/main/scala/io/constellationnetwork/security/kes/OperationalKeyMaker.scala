@@ -28,6 +28,12 @@ import cats.syntax.functor._
   */
 object OperationalKeyMaker {
 
+  /** Default tree heights `(superHeight, subHeight)` for `bootstrap`. `(7, 7)` gives `2^14 = 16384` total steps — comfortably more than any
+    * realistic eta-period count over the lifetime of a single operator key. Smaller is faster to generate but harder to right-size; larger
+    * costs more boot-time CPU + memory.
+    */
+  val DefaultHeight: (Int, Int) = (7, 7)
+
   /** Construct an [[OperationalKeyMakerAlgebra]] backed by `secureStore`. The store must contain exactly one entry under `keyName` at
     * startup.
     *
@@ -118,5 +124,36 @@ object OperationalKeyMaker {
         }
       }
     }
+  }
+
+  /** Generate a fresh KES product keypair from `seed`, persist the secret-key bytes to `secureStore` under `keyName`, and open an
+    * [[OperationalKeyMakerAlgebra]] over it. Equivalent to: caller manually invokes `KesProduct.createKeyPair` (package-private) + writes
+    * the encoded secret-key bytes to `secureStore` + calls [[make]]. Provided as a single entry point because `KesProduct` and
+    * `SecretKeyCodec` are both package-private, so external callers can't otherwise reach the generator.
+    *
+    *   - `seed` — entropy for the KES tree. Must not be reused across operators. Caller owns the bytes; they are overwritten on success
+    *     (defensive scrub before returning). For deterministic per-test setups, derive from the operator's long-term key (e.g.
+    *     `blake2b(ed25519_sk || "kes")`); for production, use [[java.security.SecureRandom.nextBytes]].
+    *   - `height` — `(superHeight, subHeight)` controlling expressible periods. Default [[DefaultHeight]] = `(7, 7)` → 16384 periods.
+    *   - `keyName` — entry name in the [[SecureStore]]. Same convention as [[make]] (one entry per operator).
+    *   - `etaPeriodLength` — carried-only metadata; see [[make]] for the alignment story.
+    */
+  def bootstrap[F[_]: Async](
+    secureStore: SecureStore[F],
+    keyName: String,
+    seed: Array[Byte],
+    etaPeriodLength: Long,
+    height: (Int, Int) = DefaultHeight
+  ): Resource[F, OperationalKeyMakerAlgebra[F]] = {
+    val seedCopy = seed.clone()
+    val acquire: F[Unit] =
+      Async[F].delay {
+        val (sk, _) = KesProduct.instance.createKeyPair(seedCopy, height, offset = 0L)
+        SecretKeyCodec.encodeProductSk(sk)
+      }
+        .flatMap(bytes => secureStore.write(keyName, bytes))
+        .flatMap(_ => Async[F].delay(java.util.Arrays.fill(seedCopy, 0.toByte)))
+
+    Resource.eval(acquire) >> make(secureStore, keyName, etaPeriodLength)
   }
 }

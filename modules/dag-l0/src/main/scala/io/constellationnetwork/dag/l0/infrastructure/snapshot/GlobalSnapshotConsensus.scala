@@ -434,6 +434,30 @@ object GlobalSnapshotConsensus {
             .getOrElse(Set(selfId))
           _ <- stakeRegistry.updateValidators(validatorPeers).toResource
           tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry).toResource
+          // §1.2 Slice 1: bootstrap an in-memory OperationalKeyMaker per gl0 startup. Fresh KES
+          // keypair generated from a SecureRandom seed each JVM run (no persistence yet — disk-
+          // backed SecureStore is Slice 4). Not yet wired to any signing call site (Slice 2/3); the
+          // bootstrap proves lifecycle integration before the parallel-sign work touches the
+          // SnapshotLeaderLoop / NakamotoSyncDaemon hot paths. Period 0 + VK fingerprint are logged
+          // so eta-rotation evolution can be observed at INFO level in subsequent slices.
+          kesSecureStore <- io.constellationnetwork.security.kes.SecureStore.inMemory[F].toResource
+          operationalKeyMaker <- {
+            val seed = new Array[Byte](32)
+            new java.security.SecureRandom().nextBytes(seed)
+            io.constellationnetwork.security.kes.OperationalKeyMaker
+              .bootstrap[F](
+                secureStore = kesSecureStore,
+                keyName = "gl0-operational-kes.key",
+                seed = seed,
+                etaPeriodLength = etaRotationSnapshots.toLong
+              )
+          }
+          _ <- operationalKeyMaker.currentPublicKey.flatMap { kesVk =>
+            val vkHex = kesVk.value.take(16).map("%02x".format(_)).mkString
+            nakLogger.info(
+              s"🔐 KES bootstrap: period=0 height=${io.constellationnetwork.security.kes.OperationalKeyMaker.DefaultHeight} vk=$vkHex... step=${kesVk.step}"
+            )
+          }.toResource
 
           // Numerics for VRF eligibility threshold. Bifrost prod precision: log1p=8, exp=38, maxIter=10000.
           // We use prec=8 / prec=38 to match Bifrost exactly. The Lentz iteration runs in exact `Ratio`
