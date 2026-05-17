@@ -43,6 +43,13 @@ services:
       # If using docker volumes: gl0-data:/tessellation/data
       # If using host volumes: default to a path like ./l0-data
       - ${CL_DOCKER_GL0_DATA:-./gl0-data}:/tessellation/data
+      # §1.2 Slice 3d: per-operator KES SecureStore directory. Mounted AFTER /tessellation/data
+      # so the overlay layers correctly. RW because OperationalKeyMaker.evolveTo writes the
+      # evolved SK back after each period rotation (read-once scrub requires mutating the
+      # backing file). Default `/dev/null` makes the mount no-op when KES isn't staged
+      # — gl0 falls back to the in-memory bootstrap path (master VK per-JVM-run; receivers
+      # will count incoming KES sigs as "no registry entry" until Slice 5 verification).
+      - ${CL_KES_SECURE_STORE_HOST:-/dev/null}:/tessellation/data/kes
     healthcheck:
       test: ["CMD", "/tessellation/internal-health-check.sh"]
       interval: 3s

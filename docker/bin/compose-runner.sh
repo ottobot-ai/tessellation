@@ -213,13 +213,38 @@ else
     # same seeded `GlobalSnapshotInfo`.
     # - CL_GENESIS_JSON_HOST: docker-compose mounts ./genesis.json → /tessellation/genesis.json
     # - CL_GENESIS_CONTAINER_PATH: entrypoint.sh passes this to run-nakamoto (dispatches JSON branch)
+    #
+    # §1.2 Slice 3d: distribute per-operator KES SK files. Slice 3b writes them to
+    # `_genesis-out/keys/operator-<N>/kes-sk.bin`. Each container gets a PER-NODE copy
+    # (operator N → node N) so the disk-backed SecureStore inside the container loads
+    # exactly the SK whose master VK is registered in genesis for that node's PeerId.
+    # Mount is RW (not :ro) because OperationalKeyMaker.evolveTo writes the evolved
+    # key back to disk after each period rotation — the read-once scrub semantics
+    # require the SecureStore to mutate the backing file.
     for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
       cp ./nodes/_genesis-out/l0-genesis.json ./nodes/$i/genesis.json
       # Append rather than overwrite — node-key-env-setup already wrote envrc + .env entries.
       echo "CL_GENESIS_JSON_HOST=./genesis.json" >> ./nodes/$i/.env
       echo "CL_GENESIS_CONTAINER_PATH=/tessellation/genesis.json" >> ./nodes/$i/.env
+
+      # §1.2 Slice 3d: stage the per-operator KES SK file. Operator N maps to gl0 node N
+      # (1:1 by the generator's per-operator-key allocation). If the file is missing the
+      # generator didn't write KES SKs (older tools.jar) — log + skip; the gl0 will fall
+      # back to the in-memory fresh-bootstrap path (no genesis match for KES verify, but
+      # the cluster still boots and runs Ed25519-only).
+      KES_SK_SRC="./nodes/_genesis-out/keys/operator-$i/kes-sk.bin"
+      KES_SK_DST_DIR="./nodes/$i/kes"
+      if [ -f "$KES_SK_SRC" ]; then
+        mkdir -p "$KES_SK_DST_DIR"
+        cp "$KES_SK_SRC" "$KES_SK_DST_DIR/kes-sk.bin"
+        chmod 0600 "$KES_SK_DST_DIR/kes-sk.bin"
+        echo "CL_KES_SECURE_STORE_HOST=./kes" >> ./nodes/$i/.env
+        echo "CL_KES_SECURE_STORE_DIR=/tessellation/data/kes" >> ./nodes/$i/.env
+      else
+        echo "  WARN: $KES_SK_SRC missing; gl0-$i will fall back to in-memory KES bootstrap"
+      fi
     done
-    echo "Tier-1 l0-genesis.json propagated to $NUM_GL0_NODES gl0 nodes"
+    echo "Tier-1 l0-genesis.json + per-operator KES SK files propagated to $NUM_GL0_NODES gl0 nodes"
   fi
 
 
