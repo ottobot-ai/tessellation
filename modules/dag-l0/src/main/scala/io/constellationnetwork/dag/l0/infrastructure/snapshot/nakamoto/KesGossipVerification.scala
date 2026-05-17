@@ -59,8 +59,16 @@ private[nakamoto] object KesGossipVerification {
                   s"$tag no registry entry for ord=$tipOrdinal from=${attesterHex.value.take(16)}... — skipping verify"
                 )
             case Some(vk) =>
-              val ok = OperationalKeyMaker.verify(kSig, messageBytes, vk)
-              val kesPeriod = EtaCalculation.rotationPeriod(tipOrdinal, etaRotationSnapshots)
+              // Registry holds the master VK captured at bootstrap (step=0). Sender signs
+              // at the *current* product step (= kesPeriod). `SumComposition.verify` uses
+              // `kesVk.step` in its left-vs-right tree-walk heuristic, so verify with the
+              // master VK literally would mis-walk the Merkle path and reject every
+              // post-rotation sig. Rebind step to the period derived from the wire ordinal
+              // so verify reconstructs the same path the sender used. The root bytes are
+              // invariant under evolution; only the `step` index changes.
+              val kesPeriod = EtaCalculation.rotationPeriod(tipOrdinal, etaRotationSnapshots).toInt
+              val vkAtPeriod = vk.copy(step = kesPeriod)
+              val ok = OperationalKeyMaker.verify(kSig, messageBytes, vkAtPeriod)
               if (ok)
                 Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_verified_total") >>
                   logger.info(
@@ -107,8 +115,10 @@ private[nakamoto] object KesGossipVerification {
                   s"$tag no registry entry for ord=$ordinal from=${producerHex.value.take(16)}... — skipping verify"
                 )
             case Some(vk) =>
-              val ok = OperationalKeyMaker.verify(kSig, messageBytes, vk)
-              val kesPeriod = EtaCalculation.rotationPeriod(ordinal, etaRotationSnapshots)
+              // Same step-rebind as `verifyAttestation` above. See that comment.
+              val kesPeriod = EtaCalculation.rotationPeriod(ordinal, etaRotationSnapshots).toInt
+              val vkAtPeriod = vk.copy(step = kesPeriod)
+              val ok = OperationalKeyMaker.verify(kSig, messageBytes, vkAtPeriod)
               if (ok)
                 Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_verified_total") >>
                   logger.info(

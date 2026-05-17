@@ -1,6 +1,7 @@
 package io.constellationnetwork.security.kes
 
 import cats.effect.IO
+import cats.syntax.traverse._
 
 import weaver.SimpleIOSuite
 
@@ -112,6 +113,43 @@ object OperationalKeyMakerSuite extends SimpleIOSuite {
       matches(out) {
         case (vk, Right(sig)) =>
           expect(KesProduct.instance.verify(sig, "stable".getBytes("UTF-8"), vk))
+      }
+  }
+
+  // ============================================================
+  // master-VK round-trip: register at step=0, verify post-rotation
+  // ============================================================
+  //
+  // Regression for the bug found during Slice 8 e2e: the genesis-registered master
+  // VK has step=0, but post-rotation sigs are produced at the sender's evolved step.
+  // `SumComposition.verify` uses `kesVk.step` to decide which side of the Merkle tree
+  // the witness lands on, so verify with master-VK(step=0) vs. sig-at-step-N walks
+  // the wrong path and returns false. Receivers must rebind the VK's step to the
+  // expected period before calling verify.
+  test("verify with master-VK + rebound step succeeds across multiple evolutions") {
+    val periodsToCheck = List(1, 2, 5, 10, 15)
+    val msg = "post-rotation-payload".getBytes("UTF-8")
+    for {
+      (store, masterVk) <- freshStore(seedByte = 0x42.toByte, height = (2, 2))
+      results <- OperationalKeyMaker.make[IO](store, keyName, etaPeriodLength = 100L).use { kmaker =>
+        periodsToCheck.traverse { p =>
+          kmaker.signAt(p, msg).map {
+            case Right(sig) =>
+              // Master VK as it would be loaded from the registry (step=0), rebound to p.
+              val vkAtPeriod = masterVk.copy(step = p)
+              (p, KesProduct.instance.verify(sig, msg, vkAtPeriod), KesProduct.instance.verify(sig, msg, masterVk))
+            case Left(err) => (p, false, false)
+          }
+        }
+      }
+    } yield
+      // For each period: rebound-step verify must succeed; raw master-VK verify is
+      // expected to fail (which is exactly the production bug this test guards against).
+      results.foldLeft(success) {
+        case (acc, (p, reboundOk, rawOk)) =>
+          acc
+            .and(expect(reboundOk, s"rebound-step verify must succeed at period=$p"))
+            .and(expect(!rawOk, s"raw master-VK verify must fail at period=$p (regression guard)"))
       }
   }
 
