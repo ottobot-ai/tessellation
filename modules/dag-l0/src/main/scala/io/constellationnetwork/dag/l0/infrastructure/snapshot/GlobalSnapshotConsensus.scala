@@ -157,7 +157,12 @@ object GlobalSnapshotConsensus {
     // Routes the binary through the same pipeline as the HTTP endpoint (stateChannelService.process).
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
     // Created in Services.make (hoisted so HTTP routes and stateChannelService can also publish).
-    sidecarClient: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarClientAlgebra[F]
+    sidecarClient: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarClientAlgebra[F],
+    // §1.2 Slice 3c: (peerId → KES master VK) registry loaded from L0 genesis. Empty for the CSV-
+    // genesis bootstrap path (no per-operator KES VKs registered). Read by Slice 5/6 verification
+    // on every incoming attestation/snapshot to confirm the sender's KES signature against the
+    // genesis-registered VK without trusting the sender to ship its own VK in-band.
+    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F]
   )(
     implicit supervisor: Supervisor[F],
     globalStateProofSelector: GlobalStateProofSelector,
@@ -434,23 +439,43 @@ object GlobalSnapshotConsensus {
             .getOrElse(Set(selfId))
           _ <- stakeRegistry.updateValidators(validatorPeers).toResource
           tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry).toResource
-          // §1.2 Slice 1: bootstrap an in-memory OperationalKeyMaker per gl0 startup. Fresh KES
-          // keypair generated from a SecureRandom seed each JVM run (no persistence yet — disk-
-          // backed SecureStore is Slice 4). Not yet wired to any signing call site (Slice 2/3); the
-          // bootstrap proves lifecycle integration before the parallel-sign work touches the
-          // SnapshotLeaderLoop / NakamotoSyncDaemon hot paths. Period 0 + VK fingerprint are logged
-          // so eta-rotation evolution can be observed at INFO level in subsequent slices.
-          kesSecureStore <- io.constellationnetwork.security.kes.SecureStore.inMemory[F].toResource
-          operationalKeyMaker <- {
-            val seed = new Array[Byte](32)
-            new java.security.SecureRandom().nextBytes(seed)
-            io.constellationnetwork.security.kes.OperationalKeyMaker
-              .bootstrap[F](
-                secureStore = kesSecureStore,
-                keyName = "gl0-operational-kes.key",
-                seed = seed,
-                etaPeriodLength = etaRotationSnapshots.toLong
-              )
+          // §1.2 Slice 3c: bootstrap an OperationalKeyMaker. Two paths:
+          //   - Disk-backed (production / e2e harness): if `CL_KES_SECURE_STORE_DIR` is set, open a
+          //     [[io.constellationnetwork.security.kes.SecureStore.disk]] at that directory and
+          //     `OperationalKeyMaker.make` against the pre-staged `kes-sk.bin` written by the
+          //     genesis generator (Slice 3b). Its master VK matches the genesis-registered VK by
+          //     construction, so Slice 5 verification works end-to-end out of the box.
+          //   - Fallback (dev / unit-test): no env var → in-memory store + fresh bootstrap with a
+          //     SecureRandom seed. The master VK is per-JVM-run and will NOT match anything in
+          //     `kesRegistry`, so Slice 5 receivers will count it as "no registry entry" — fine for
+          //     local dev (warn-only) but not for cross-node verification.
+          kesSecureStore <- sys.env.get("CL_KES_SECURE_STORE_DIR") match {
+            case Some(dir) =>
+              io.constellationnetwork.security.kes.SecureStore.disk[F](java.nio.file.Paths.get(dir)).toResource
+            case None =>
+              io.constellationnetwork.security.kes.SecureStore.inMemory[F].toResource
+          }
+          operationalKeyMaker <- sys.env.get("CL_KES_SECURE_STORE_DIR") match {
+            case Some(_) =>
+              // Disk path: SK was pre-staged at `<dir>/kes-sk.bin` by the genesis generator
+              // (Slice 3b). Just open; do not regenerate.
+              io.constellationnetwork.security.kes.OperationalKeyMaker
+                .make[F](
+                  secureStore = kesSecureStore,
+                  keyName = "kes-sk.bin",
+                  etaPeriodLength = etaRotationSnapshots.toLong
+                )
+            case None =>
+              // Fallback: in-memory + fresh bootstrap with SecureRandom seed.
+              val seed = new Array[Byte](32)
+              new java.security.SecureRandom().nextBytes(seed)
+              io.constellationnetwork.security.kes.OperationalKeyMaker
+                .bootstrap[F](
+                  secureStore = kesSecureStore,
+                  keyName = "gl0-operational-kes.key",
+                  seed = seed,
+                  etaPeriodLength = etaRotationSnapshots.toLong
+                )
           }
           // §1.2 Slice 2: bind the KES master VK (period-0 root of the super × sub tree) to the
           // operator's long-term Ed25519 key via a SHA512withECDSA signature over kesVk.value.
@@ -474,7 +499,14 @@ object GlobalSnapshotConsensus {
             ) >>
               nakLogger.info(
                 s"🔐 KES-REG: master-vk-sig=$regHex... (SHA512withECDSA over kesVk by operator long-term key, ${regSig.length}B)"
-              )
+              ) >>
+              // §1.2 Slice 3c: log the genesis-loaded KesRegistry size. Empty means no peers were
+              // registered at genesis (CSV-genesis bootstrap, or JSON without the kesRegistrations
+              // field) — Slice 5 verification will count incoming KES sigs against the empty
+              // registry as "no entry" and warn-only-skip.
+              kesRegistry.list.flatMap { regs =>
+                nakLogger.info(s"📋 KES registry loaded: ${regs.size} peer(s) registered")
+              }
           }.toResource
 
           // Numerics for VRF eligibility threshold. Bifrost prod precision: log1p=8, exp=38, maxIter=10000.

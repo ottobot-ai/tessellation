@@ -124,6 +124,23 @@ object Main
       // — no more ad-hoc Option[F[Option[SnapshotOrdinal]]] threading.
       implicit0(finalityGate: FinalityGate[IO]) = FinalityGate.fromRef[IO](nakamotoFinalizedOrdinalRef)
 
+      // §1.2 Slice 3c: pre-load the L0 genesis JSON (if any) ONLY to extract the KES registry
+      // — the full load (with delegated-stake + collateral signing) happens later in PATH 4
+      // below. Reading the file twice is fine: it's a few KB and parsed once at startup. For
+      // bootstrap paths that don't take PATH 4 (rollback / join / CSV-genesis), the registry
+      // is empty and Slice 5 verification treats every KES sig as "no registry entry" (warn-
+      // only-skip — the receiver doesn't reject, just doesn't validate).
+      kesRegistry <- (method.genesisPath, method.genesisPath.exists(_.extName == ".json")) match {
+        case (Some(gPath), true) =>
+          GenesisLoader
+            .make[IO, GlobalSnapshot]
+            .loadL0Genesis(gPath)
+            .flatMap(L0GenesisLoader.buildKesRegistry[IO])
+            .asResource
+        case _ =>
+          io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO].pure[IO].asResource
+      }
+
       services <- Services
         .make[IO, RunNakamoto](
           sharedConfig,
@@ -142,7 +159,8 @@ object Main
           Hasher.forKryo[IO],
           nodeShared.loggerBundle,
           nakamotoFinalizedOrdinalRef,
-          finalityTriggerViewRef
+          finalityTriggerViewRef,
+          kesRegistry
         )
 
       programs = Programs.make[IO, RunNakamoto](

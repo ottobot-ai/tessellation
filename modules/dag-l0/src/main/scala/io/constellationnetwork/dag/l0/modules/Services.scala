@@ -72,7 +72,10 @@ object Services {
     txHasher: Hasher[F],
     loggerBundle: LoggerBundle[F],
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
-    finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]]
+    finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
+    // §1.2 Slice 3c: KesRegistry loaded from L0 genesis (or empty for CSV-genesis). Threaded
+    // through to GlobalSnapshotConsensus.make.
+    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
@@ -199,7 +202,8 @@ object Services {
             nakamotoFinalizedOrdinalRef,
             finalityTriggerViewRef,
             processMetagraphBinary,
-            sidecarClient
+            sidecarClient,
+            kesRegistry
           )
       }
       addressService = AddressService.make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
