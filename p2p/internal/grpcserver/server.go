@@ -120,6 +120,20 @@ func (s *Server) PublishMetagraphBinary(ctx context.Context, mb *pb.MetagraphBin
 	return &pb.PublishResponse{Ok: true}, nil
 }
 
+// PublishMetagraphAttestation broadcasts a per-metagraph committee attestation
+// (Slice S2) to all GL0 nodes over the metagraph-attestation topic. Opaque
+// payload — sidecar only wraps and routes.
+func (s *Server) PublishMetagraphAttestation(ctx context.Context, ma *pb.MetagraphAttestation) (*pb.PublishResponse, error) {
+	data, err := proto.Marshal(ma)
+	if err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	if err := s.node.PublishMetagraphAttestation(ctx, data); err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	return &pb.PublishResponse{Ok: true}, nil
+}
+
 // Subscribe streams incoming gossip messages to the JVM.
 func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_SubscribeServer) error {
 	ctx := stream.Context()
@@ -128,6 +142,7 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 	atCh := s.node.AttestationMessages(ctx)
 	ruCh := s.node.RumorMessages(ctx)
 	mbCh := s.node.MetagraphBinaryMessages(ctx)
+	maCh := s.node.MetagraphAttestationMessages(ctx)
 	reconnectCh := s.node.ReconnectCh()
 
 	for {
@@ -196,6 +211,21 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 				return err
 			}
 
+		case data, ok := <-maCh:
+			if !ok {
+				return nil
+			}
+			var ma pb.MetagraphAttestation
+			if err := proto.Unmarshal(data, &ma); err != nil {
+				continue
+			}
+			msg := &pb.GossipMessage{
+				Body: &pb.GossipMessage_MetagraphAttestation{MetagraphAttestation: &ma},
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -204,14 +234,15 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 
 // PeerCount returns mesh membership stats.
 func (s *Server) PeerCount(ctx context.Context, req *pb.PeerCountRequest) (*pb.PeerCountResponse, error) {
-	snPeers, atPeers, ruPeers, mbPeers := s.node.MeshPeerCount()
+	snPeers, atPeers, ruPeers, mbPeers, maPeers := s.node.MeshPeerCount()
 	total := len(s.node.Host.Network().Peers())
 	return &pb.PeerCountResponse{
-		Total:                  int32(total),
-		MeshSnapshots:          int32(snPeers),
-		MeshAttestations:       int32(atPeers),
-		MeshRumors:             int32(ruPeers),
-		MeshMetagraphBinaries:  int32(mbPeers),
+		Total:                     int32(total),
+		MeshSnapshots:             int32(snPeers),
+		MeshAttestations:          int32(atPeers),
+		MeshRumors:                int32(ruPeers),
+		MeshMetagraphBinaries:     int32(mbPeers),
+		MeshMetagraphAttestations: int32(maPeers),
 	}, nil
 }
 

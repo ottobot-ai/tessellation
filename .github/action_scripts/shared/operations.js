@@ -385,7 +385,11 @@ const waitForFinality = async (globalL0Url, targetOrdinal, {
 } = {}) => {
     const start = Date.now()
     let lastSeen = null
+    let pollCount = 0
+    let fetchErrors = 0
+    let lastFetchError = null
     while (Date.now() - start < timeoutMs) {
+        pollCount++
         try {
             const response = await axios.get(
                 `${globalL0Url}/global-snapshots/${targetOrdinal}/finality-triggers`,
@@ -404,14 +408,22 @@ const waitForFinality = async (globalL0Url, targetOrdinal, {
                 }
             }
             // 503 (leader-loop not yet initialized) or 200 without the requested trigger → keep polling
-        } catch (_) {
-            // transient — keep polling until timeout
+        } catch (err) {
+            fetchErrors++
+            lastFetchError = err.message || String(err)
+            // Surface fetch problems at higher poll counts so a stuck cluster shows up in test
+            // output rather than just timing out silently. Mirror withRetryOrdinal's diagnostic.
+            if (fetchErrors % 10 === 0) {
+                logWorkflow.warning(
+                    `${name}: ord=${targetOrdinal} fetch failed ${fetchErrors}× (last: ${lastFetchError})`
+                )
+            }
         }
         await sleep(intervalMs)
     }
     throw new Error(
         `${name}: ord=${targetOrdinal} did not reach ${trigger} finality within ${Math.round(timeoutMs / 1000)}s ` +
-        `(last seen: ${JSON.stringify(lastSeen)})`
+        `(polls=${pollCount}, fetchErrors=${fetchErrors}, lastFetchError=${lastFetchError}, last seen: ${JSON.stringify(lastSeen)})`
     )
 }
 

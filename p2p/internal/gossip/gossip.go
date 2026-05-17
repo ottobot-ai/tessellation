@@ -31,10 +31,11 @@ type Node struct {
 	PubSub *pubsub.PubSub
 	DHT    *dht.IpfsDHT
 
-	snapshotTopic        *pubsub.Topic
-	attestationTopic     *pubsub.Topic
-	rumorTopic           *pubsub.Topic
-	metagraphBinaryTopic *pubsub.Topic
+	snapshotTopic             *pubsub.Topic
+	attestationTopic          *pubsub.Topic
+	rumorTopic                *pubsub.Topic
+	metagraphBinaryTopic      *pubsub.Topic
+	metagraphAttestationTopic *pubsub.Topic
 
 	cfg config.Config
 
@@ -179,16 +180,23 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		return nil, fmt.Errorf("join metagraph-binary topic: %w", err)
 	}
 
+	maTopic, err := ps.Join(cfg.MetagraphAttestationTopic)
+	if err != nil {
+		h.Close()
+		return nil, fmt.Errorf("join metagraph-attestation topic: %w", err)
+	}
+
 	node := &Node{
-		Host:                 h,
-		PubSub:               ps,
-		DHT:                  kadDHT,
-		snapshotTopic:        snTopic,
-		attestationTopic:     atTopic,
-		rumorTopic:           ruTopic,
-		metagraphBinaryTopic: mbTopic,
-		cfg:                  cfg,
-		reconnectCh:          make(chan struct{}),
+		Host:                      h,
+		PubSub:                    ps,
+		DHT:                       kadDHT,
+		snapshotTopic:             snTopic,
+		attestationTopic:          atTopic,
+		rumorTopic:                ruTopic,
+		metagraphBinaryTopic:      mbTopic,
+		metagraphAttestationTopic: maTopic,
+		cfg:                       cfg,
+		reconnectCh:               make(chan struct{}),
 	}
 
 	// Start mDNS discovery for automatic peer finding on local network / Docker bridge.
@@ -369,6 +377,17 @@ func (n *Node) PublishMetagraphBinary(ctx context.Context, data []byte) error {
 	return err
 }
 
+// PublishMetagraphAttestation publishes raw bytes to the metagraph-attestation topic.
+// Carries the per-metagraph committee VRF attestation (Slice S2); the sidecar
+// treats the payload as opaque.
+func (n *Node) PublishMetagraphAttestation(ctx context.Context, data []byte) error {
+	err := n.metagraphAttestationTopic.Publish(ctx, data)
+	if err == nil {
+		metrics.MessagesPublished.WithLabelValues("metagraph_attestation").Inc()
+	}
+	return err
+}
+
 // subscribeAndRelay creates a per-caller subscription on the given topic and
 // relays incoming messages (excluding self-published) into the returned channel.
 // The subscription is cancelled when ctx is done. The topicLabel is used for
@@ -456,12 +475,25 @@ func (n *Node) MetagraphBinaryMessages(ctx context.Context) <-chan []byte {
 	return ch
 }
 
+// MetagraphAttestationMessages returns a channel of incoming metagraph-attestation messages.
+func (n *Node) MetagraphAttestationMessages(ctx context.Context) <-chan []byte {
+	ch, err := n.subscribeAndRelay(ctx, n.metagraphAttestationTopic, n.cfg.MetagraphAttestationBufferSize, "metagraph_attestation")
+	if err != nil {
+		fmt.Printf("ERROR: subscribe metagraph_attestation: %v\n", err)
+		empty := make(chan []byte)
+		close(empty)
+		return empty
+	}
+	return ch
+}
+
 // MeshPeerCount returns the number of peers in each topic mesh.
-func (n *Node) MeshPeerCount() (snapshots, attestations, rumors, metagraphBinaries int) {
+func (n *Node) MeshPeerCount() (snapshots, attestations, rumors, metagraphBinaries, metagraphAttestations int) {
 	return len(n.snapshotTopic.ListPeers()),
 		len(n.attestationTopic.ListPeers()),
 		len(n.rumorTopic.ListPeers()),
-		len(n.metagraphBinaryTopic.ListPeers())
+		len(n.metagraphBinaryTopic.ListPeers()),
+		len(n.metagraphAttestationTopic.ListPeers())
 }
 
 // TriggerSubscriberReconnect broadcasts to all active Subscribe handlers that
@@ -506,7 +538,7 @@ func (n *Node) StartMeshHealthMonitor(ctx context.Context) {
 			case <-ticker.C:
 			}
 
-			sn, at, ru, mb := n.MeshPeerCount()
+			sn, at, ru, mb, ma := n.MeshPeerCount()
 			connectedPeers := len(n.Host.Network().Peers())
 
 			// Degraded = no topic subscribers OR no connected peers at all.
@@ -514,8 +546,8 @@ func (n *Node) StartMeshHealthMonitor(ctx context.Context) {
 			// so connectedPeers==0 is the more reliable partition signal.
 			if sn == 0 || at == 0 || connectedPeers == 0 {
 				emptyMeshStreak++
-				fmt.Printf("mesh-health: DEGRADED streak=%d snapshots=%d attestations=%d rumors=%d metagraph_binaries=%d connected=%d\n",
-					emptyMeshStreak, sn, at, ru, mb, connectedPeers)
+				fmt.Printf("mesh-health: DEGRADED streak=%d snapshots=%d attestations=%d rumors=%d metagraph_binaries=%d metagraph_attestations=%d connected=%d\n",
+					emptyMeshStreak, sn, at, ru, mb, ma, connectedPeers)
 
 				// After 2 consecutive degraded checks (~60s), force seedlist reconnection.
 				if emptyMeshStreak >= 2 && len(n.cfg.Seedlist) > 0 {
@@ -550,8 +582,8 @@ func (n *Node) StartMeshHealthMonitor(ctx context.Context) {
 				}
 			} else {
 				if emptyMeshStreak > 0 {
-					fmt.Printf("mesh-health: RECOVERED snapshots=%d attestations=%d rumors=%d metagraph_binaries=%d connected=%d (was degraded for %d checks)\n",
-						sn, at, ru, mb, connectedPeers, emptyMeshStreak)
+					fmt.Printf("mesh-health: RECOVERED snapshots=%d attestations=%d rumors=%d metagraph_binaries=%d metagraph_attestations=%d connected=%d (was degraded for %d checks)\n",
+						sn, at, ru, mb, ma, connectedPeers, emptyMeshStreak)
 					// Force all active Subscribe handlers to terminate so JVM clients
 					// reconnect and receive gossip from the now-healthy mesh.
 					n.TriggerSubscriberReconnect()
@@ -566,10 +598,11 @@ func (n *Node) StartMeshHealthMonitor(ctx context.Context) {
 // Topics returns the GossipSub topic handles for metrics collection.
 func (n *Node) Topics() metrics.TopicSet {
 	return metrics.TopicSet{
-		Snapshot:         n.snapshotTopic,
-		Attestation:      n.attestationTopic,
-		Rumor:            n.rumorTopic,
-		MetagraphBinary:  n.metagraphBinaryTopic,
+		Snapshot:             n.snapshotTopic,
+		Attestation:          n.attestationTopic,
+		Rumor:                n.rumorTopic,
+		MetagraphBinary:      n.metagraphBinaryTopic,
+		MetagraphAttestation: n.metagraphAttestationTopic,
 	}
 }
 
@@ -593,10 +626,11 @@ func (n *Node) Close() error {
 // telemetry on typical arrival rates.
 func buildPeerScoreParams(cfg config.Config) *pubsub.PeerScoreParams {
 	topics := map[string]*pubsub.TopicScoreParams{
-		cfg.SnapshotTopic:        buildTopicScoreParams(cfg.HeartbeatInterval),
-		cfg.AttestationTopic:     buildTopicScoreParams(cfg.HeartbeatInterval),
-		cfg.RumorTopic:           buildTopicScoreParams(cfg.HeartbeatInterval),
-		cfg.MetagraphBinaryTopic: buildTopicScoreParams(cfg.HeartbeatInterval),
+		cfg.SnapshotTopic:             buildTopicScoreParams(cfg.HeartbeatInterval),
+		cfg.AttestationTopic:          buildTopicScoreParams(cfg.HeartbeatInterval),
+		cfg.RumorTopic:                buildTopicScoreParams(cfg.HeartbeatInterval),
+		cfg.MetagraphBinaryTopic:      buildTopicScoreParams(cfg.HeartbeatInterval),
+		cfg.MetagraphAttestationTopic: buildTopicScoreParams(cfg.HeartbeatInterval),
 	}
 	return &pubsub.PeerScoreParams{
 		Topics:                      topics,

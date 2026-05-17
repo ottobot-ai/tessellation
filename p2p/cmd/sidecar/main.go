@@ -52,6 +52,7 @@ func main() {
 	flag.IntVar(&cfg.AttestationBufferSize, "attestation-buffer", cfg.AttestationBufferSize, "per-subscriber relay buffer size for attestations")
 	flag.IntVar(&cfg.RumorBufferSize, "rumor-buffer", cfg.RumorBufferSize, "per-subscriber relay buffer size for rumors")
 	flag.IntVar(&cfg.MetagraphBinaryBufferSize, "metagraph-binary-buffer", cfg.MetagraphBinaryBufferSize, "per-subscriber relay buffer size for metagraph binaries")
+	flag.IntVar(&cfg.MetagraphAttestationBufferSize, "metagraph-attestation-buffer", cfg.MetagraphAttestationBufferSize, "per-subscriber relay buffer size for metagraph attestations")
 
 	var generateKey bool
 	var showPeerID bool

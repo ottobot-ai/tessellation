@@ -19,13 +19,14 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	SidecarService_PublishSnapshot_FullMethodName        = "/nakamoto.p2p.SidecarService/PublishSnapshot"
-	SidecarService_PublishAttestation_FullMethodName     = "/nakamoto.p2p.SidecarService/PublishAttestation"
-	SidecarService_PublishRumor_FullMethodName           = "/nakamoto.p2p.SidecarService/PublishRumor"
-	SidecarService_PublishMetagraphBinary_FullMethodName = "/nakamoto.p2p.SidecarService/PublishMetagraphBinary"
-	SidecarService_Subscribe_FullMethodName              = "/nakamoto.p2p.SidecarService/Subscribe"
-	SidecarService_PeerCount_FullMethodName              = "/nakamoto.p2p.SidecarService/PeerCount"
-	SidecarService_Health_FullMethodName                 = "/nakamoto.p2p.SidecarService/Health"
+	SidecarService_PublishSnapshot_FullMethodName             = "/nakamoto.p2p.SidecarService/PublishSnapshot"
+	SidecarService_PublishAttestation_FullMethodName          = "/nakamoto.p2p.SidecarService/PublishAttestation"
+	SidecarService_PublishRumor_FullMethodName                = "/nakamoto.p2p.SidecarService/PublishRumor"
+	SidecarService_PublishMetagraphBinary_FullMethodName      = "/nakamoto.p2p.SidecarService/PublishMetagraphBinary"
+	SidecarService_PublishMetagraphAttestation_FullMethodName = "/nakamoto.p2p.SidecarService/PublishMetagraphAttestation"
+	SidecarService_Subscribe_FullMethodName                   = "/nakamoto.p2p.SidecarService/Subscribe"
+	SidecarService_PeerCount_FullMethodName                   = "/nakamoto.p2p.SidecarService/PeerCount"
+	SidecarService_Health_FullMethodName                      = "/nakamoto.p2p.SidecarService/Health"
 )
 
 // SidecarServiceClient is the client API for SidecarService service.
@@ -42,6 +43,8 @@ type SidecarServiceClient interface {
 	PublishRumor(ctx context.Context, in *Rumor, opts ...grpc.CallOption) (*PublishResponse, error)
 	// Publish a metagraph state channel snapshot binary to all GL0 nodes.
 	PublishMetagraphBinary(ctx context.Context, in *MetagraphBinary, opts ...grpc.CallOption) (*PublishResponse, error)
+	// Publish a per-metagraph committee attestation to all GL0 nodes (Slice S2).
+	PublishMetagraphAttestation(ctx context.Context, in *MetagraphAttestation, opts ...grpc.CallOption) (*PublishResponse, error)
 	// Subscribe to incoming messages from the network.
 	// Server-streaming: sidecar pushes received gossip to JVM.
 	Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GossipMessage], error)
@@ -93,6 +96,16 @@ func (c *sidecarServiceClient) PublishMetagraphBinary(ctx context.Context, in *M
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PublishResponse)
 	err := c.cc.Invoke(ctx, SidecarService_PublishMetagraphBinary_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sidecarServiceClient) PublishMetagraphAttestation(ctx context.Context, in *MetagraphAttestation, opts ...grpc.CallOption) (*PublishResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PublishResponse)
+	err := c.cc.Invoke(ctx, SidecarService_PublishMetagraphAttestation_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -152,6 +165,8 @@ type SidecarServiceServer interface {
 	PublishRumor(context.Context, *Rumor) (*PublishResponse, error)
 	// Publish a metagraph state channel snapshot binary to all GL0 nodes.
 	PublishMetagraphBinary(context.Context, *MetagraphBinary) (*PublishResponse, error)
+	// Publish a per-metagraph committee attestation to all GL0 nodes (Slice S2).
+	PublishMetagraphAttestation(context.Context, *MetagraphAttestation) (*PublishResponse, error)
 	// Subscribe to incoming messages from the network.
 	// Server-streaming: sidecar pushes received gossip to JVM.
 	Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[GossipMessage]) error
@@ -180,6 +195,9 @@ func (UnimplementedSidecarServiceServer) PublishRumor(context.Context, *Rumor) (
 }
 func (UnimplementedSidecarServiceServer) PublishMetagraphBinary(context.Context, *MetagraphBinary) (*PublishResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PublishMetagraphBinary not implemented")
+}
+func (UnimplementedSidecarServiceServer) PublishMetagraphAttestation(context.Context, *MetagraphAttestation) (*PublishResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PublishMetagraphAttestation not implemented")
 }
 func (UnimplementedSidecarServiceServer) Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[GossipMessage]) error {
 	return status.Error(codes.Unimplemented, "method Subscribe not implemented")
@@ -283,6 +301,24 @@ func _SidecarService_PublishMetagraphBinary_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SidecarService_PublishMetagraphAttestation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MetagraphAttestation)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SidecarServiceServer).PublishMetagraphAttestation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SidecarService_PublishMetagraphAttestation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SidecarServiceServer).PublishMetagraphAttestation(ctx, req.(*MetagraphAttestation))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SidecarService_Subscribe_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(SubscribeRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -352,6 +388,10 @@ var SidecarService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PublishMetagraphBinary",
 			Handler:    _SidecarService_PublishMetagraphBinary_Handler,
+		},
+		{
+			MethodName: "PublishMetagraphAttestation",
+			Handler:    _SidecarService_PublishMetagraphAttestation_Handler,
 		},
 		{
 			MethodName: "PeerCount",

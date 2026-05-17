@@ -86,6 +86,33 @@ message MetagraphBinary {
   bytes binary = 2;
 }
 
+// Per-metagraph committee attestation (Slice S2, task #188).
+//
+// Emitted by a gl0 operator key that wins the committee VRF for a given
+// (metagraph_address, snapshot_ord) under the per-metagraph sortition
+// (`docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md`). The receiver verifies the
+// VRF proof against the sender's published VK + the threshold `K · σ`, then
+// tallies toward the per-binary `≥ 2K/3` quorum. Slice S3 will flip the
+// aggregate from warn-only observability into the load-bearing pre-inclusion
+// gate that lets non-committee operators skip the binary entirely.
+//
+// `binary_hash` ties the attestation to a specific MetagraphBinary so we don't
+// double-count attestations across competing binaries on the same snapshot ord
+// (slashing-condition substrate, S4).
+//
+// `kes_signature` covers the same bytes as `signature` and follows the same
+// Slice 9 verify path used for TipAttestation. Empty during the warn-only
+// window (S2); receiver-side enforcement turns on in S3.
+message MetagraphAttestation {
+  bytes peer_id = 1;           // operator's long-term peer id
+  string metagraph_address = 2;  // DAG base58 string; subject metagraph
+  int64 snapshot_ord = 3;       // metagraph snapshot ordinal being attested
+  bytes binary_hash = 4;        // 32 bytes; hash of the MetagraphBinary
+  bytes committee_vrf_proof = 5; // committee VRF proof — gates membership
+  bytes signature = 6;          // long-term-key signature over the canonical bytes
+  bytes kes_signature = 7;      // KES product signature (Slice 9 path); empty during S2 warn-only
+}
+
 // Envelope for GossipSub messages.
 message GossipMessage {
   oneof body {
@@ -93,6 +120,7 @@ message GossipMessage {
     TipAttestation attestation = 2;
     Rumor rumor = 3;
     MetagraphBinary metagraph_binary = 4;
+    MetagraphAttestation metagraph_attestation = 5;
   }
 }
 
@@ -111,6 +139,9 @@ service SidecarService {
 
   // Publish a metagraph state channel snapshot binary to all GL0 nodes.
   rpc PublishMetagraphBinary(MetagraphBinary) returns (PublishResponse);
+
+  // Publish a per-metagraph committee attestation to all GL0 nodes (Slice S2).
+  rpc PublishMetagraphAttestation(MetagraphAttestation) returns (PublishResponse);
 
   // Subscribe to incoming messages from the network.
   // Server-streaming: sidecar pushes received gossip to JVM.
@@ -137,10 +168,11 @@ message PeerCountRequest {}
 
 message PeerCountResponse {
   int32 total = 1;
-  int32 mesh_snapshots = 2;          // peers in snapshot topic mesh
-  int32 mesh_attestations = 3;       // peers in attestation topic mesh
-  int32 mesh_rumors = 4;             // peers in rumor topic mesh
-  int32 mesh_metagraph_binaries = 5; // peers in metagraph binary topic mesh
+  int32 mesh_snapshots = 2;              // peers in snapshot topic mesh
+  int32 mesh_attestations = 3;           // peers in attestation topic mesh
+  int32 mesh_rumors = 4;                 // peers in rumor topic mesh
+  int32 mesh_metagraph_binaries = 5;     // peers in metagraph binary topic mesh
+  int32 mesh_metagraph_attestations = 6; // peers in metagraph attestation topic mesh (Slice S2)
 }
 
 message HealthRequest {}

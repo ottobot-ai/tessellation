@@ -14,32 +14,29 @@ import org.bouncycastle.crypto.digests.Blake2bDigest
 
 /** Per-metagraph committee sortition (Algorand-style VRF-threshold).
   *
-  * Each operator key independently checks whether its VRF output for the message
-  * `Blake2b-256(eta ‖ metagraphAddress ‖ snapshotOrd ‖ "committee")` falls below the
-  * stake-weighted threshold `K_target · σ_i`. Operators whose VRF output is below the threshold
-  * are committee members; non-committee operators ignore the metagraph snapshot.
+  * Each operator key independently checks whether its VRF output for the message `Blake2b-256(eta ‖ metagraphAddress ‖ snapshotOrd ‖
+  * "committee")` falls below the stake-weighted threshold `K_target · σ_i`. Operators whose VRF output is below the threshold are committee
+  * members; non-committee operators ignore the metagraph snapshot.
   *
-  * See `docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md` for the design rationale, threat model, and
-  * Chernoff honest-majority bound. This file is Slice S1: pure primitive + property tests. No
-  * consensus wiring yet — that lands in S2/S3 (warn-only gossip → load-bearing pre-inclusion gate).
+  * See `docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md` for the design rationale, threat model, and Chernoff honest-majority bound. This file
+  * is Slice S1: pure primitive + property tests. No consensus wiring yet — that lands in S2/S3 (warn-only gossip → load-bearing
+  * pre-inclusion gate).
   *
-  * '''Domain separation.''' The `"committee"` byte-suffix in the hash input keeps this VRF
-  * independent of the leader VRF in `EligibilityChecker`. A leader winning a slot reveals their
-  * leader-VRF output but not their committee-VRF output for any future metagraph snapshot.
+  * '''Domain separation.''' The `"committee"` byte-suffix in the hash input keeps this VRF independent of the leader VRF in
+  * `EligibilityChecker`. A leader winning a slot reveals their leader-VRF output but not their committee-VRF output for any future
+  * metagraph snapshot.
   *
-  * '''Determinism.''' All arithmetic is exact `Ratio` over `BigInt`; no `Double`. Reuses
-  * `EligibilityChecker.vrfOutputAsRatio` so committee and leader VRF outputs share the same
-  * `[0, 1)` interpretation. The threshold is multiplicative (`K · σ`) not LDD — no `Log1p`/`Exp`
+  * '''Determinism.''' All arithmetic is exact `Ratio` over `BigInt`; no `Double`. Reuses `EligibilityChecker.vrfOutputAsRatio` so committee
+  * and leader VRF outputs share the same `[0, 1)` interpretation. The threshold is multiplicative (`K · σ`) not LDD — no `Log1p`/`Exp`
   * needed.
   */
 trait CommitteeSortition[F[_]] {
 
-  /** Check whether the holder of `vrfSk` is in the committee for `(metagraphAddress, snapshotOrd)`
-    * given their `sigmaOperatorKey` stake share and the target committee size `kTarget`.
+  /** Check whether the holder of `vrfSk` is in the committee for `(metagraphAddress, snapshotOrd)` given their `sigmaOperatorKey` stake
+    * share and the target committee size `kTarget`.
     *
-    * Returns the VRF proof + output on success (caller signs it with their KES key and gossips it
-    * as their committee-attestation contribution). Returns `None` if the operator key is not in the
-    * committee for this `(eta, metagraphAddress, snapshotOrd)`.
+    * Returns the VRF proof + output on success (caller signs it with their KES key and gossips it as their committee-attestation
+    * contribution). Returns `None` if the operator key is not in the committee for this `(eta, metagraphAddress, snapshotOrd)`.
     */
   def isInCommittee(
     vrfSk: Array[Byte],
@@ -50,9 +47,8 @@ trait CommitteeSortition[F[_]] {
     kTarget: Int
   ): F[Option[(Array[Byte], Array[Byte])]]
 
-  /** Verifier counterpart. Given a published VRF proof from a claimed committee member, confirms
-    * (a) the proof verifies under `vrfVk` for the canonical message and (b) the proof's output
-    * falls below `K · σ`. Both must hold; otherwise reject.
+  /** Verifier counterpart. Given a published VRF proof from a claimed committee member, confirms (a) the proof verifies under `vrfVk` for
+    * the canonical message and (b) the proof's output falls below `K · σ`. Both must hold; otherwise reject.
     */
   def verifyMembership(
     vrfVk: Array[Byte],
@@ -74,10 +70,9 @@ object CommitteeSortition {
 
   /** Build the canonical VRF message: `Blake2b-256(eta ‖ metagraphAddress ‖ snapshotOrd ‖ "committee")`.
     *
-    * `eta` MUST be 32 bytes (epoch randomness). `metagraphAddress` is hashed in its canonical UTF-8
-    * text form, which is identical across all serializers (`DAG{par}{36-base58}`). `snapshotOrd` is
-    * 8-byte big-endian. Hashing the whole message into a fixed-size digest (rather than passing it
-    * raw to the VRF) keeps the VRF input length bounded.
+    * `eta` MUST be 32 bytes (epoch randomness). `metagraphAddress` is hashed in its canonical UTF-8 text form, which is identical across
+    * all serializers (`DAG{par}{36-base58}`). `snapshotOrd` is 8-byte big-endian. Hashing the whole message into a fixed-size digest
+    * (rather than passing it raw to the VRF) keeps the VRF input length bounded.
     */
   def message(eta: Array[Byte], metagraphAddress: Address, snapshotOrd: Long): Array[Byte] = {
     require(eta.length == 32, s"Eta must be 32 bytes, got ${eta.length}")
@@ -93,10 +88,9 @@ object CommitteeSortition {
     out
   }
 
-  /** Committee threshold: `min(K · σ, 1)`. Saturates at one — an operator whose `K · σ` ≥ 1 is
-    * always in the committee. Per the design doc §3 this is fine for v1 since the sortition unit is
-    * per-operator-key (an operator with 40% total stake splits it across multiple keys to restore
-    * the sampling property at the cluster's K).
+  /** Committee threshold: `min(K · σ, 1)`. Saturates at one — an operator whose `K · σ` ≥ 1 is always in the committee. Per the design doc
+    * §3 this is fine for v1 since the sortition unit is per-operator-key (an operator with 40% total stake splits it across multiple keys
+    * to restore the sampling property at the cluster's K).
     */
   def threshold(kTarget: Int, sigmaOperatorKey: Ratio): Ratio = {
     require(kTarget > 0, s"K_target must be positive, got $kTarget")

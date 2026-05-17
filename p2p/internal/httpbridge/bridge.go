@@ -60,11 +60,12 @@ type PublishResult struct {
 }
 
 type PeerCountResult struct {
-	Total                 int `json:"total"`
-	MeshSnapshots         int `json:"meshSnapshots"`
-	MeshAttestations      int `json:"meshAttestations"`
-	MeshRumors            int `json:"meshRumors"`
-	MeshMetagraphBinaries int `json:"meshMetagraphBinaries"`
+	Total                     int `json:"total"`
+	MeshSnapshots             int `json:"meshSnapshots"`
+	MeshAttestations          int `json:"meshAttestations"`
+	MeshRumors                int `json:"meshRumors"`
+	MeshMetagraphBinaries     int `json:"meshMetagraphBinaries"`
+	MeshMetagraphAttestations int `json:"meshMetagraphAttestations"`
 }
 
 type HealthResult struct {
@@ -175,14 +176,15 @@ func (b *Bridge) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (b *Bridge) handlePeers(w http.ResponseWriter, r *http.Request) {
-	snPeers, atPeers, ruPeers, mbPeers := b.node.MeshPeerCount()
+	snPeers, atPeers, ruPeers, mbPeers, maPeers := b.node.MeshPeerCount()
 	total := len(b.node.Host.Network().Peers())
 	writeJSON(w, PeerCountResult{
-		Total:                 total,
-		MeshSnapshots:         snPeers,
-		MeshAttestations:      atPeers,
-		MeshRumors:            ruPeers,
-		MeshMetagraphBinaries: mbPeers,
+		Total:                     total,
+		MeshSnapshots:             snPeers,
+		MeshAttestations:          atPeers,
+		MeshRumors:                ruPeers,
+		MeshMetagraphBinaries:     mbPeers,
+		MeshMetagraphAttestations: maPeers,
 	})
 }
 

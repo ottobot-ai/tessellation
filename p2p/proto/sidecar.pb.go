@@ -22,18 +22,40 @@ const (
 )
 
 // A snapshot produced by a slot winner, broadcast via GossipSub.
+//
+// Fields 11-12 added by #56.8 (ChainSync state-query disposition):
+//   - `finalized=true` ⇒ snapshot is on the canonical chain at an ordinal ≤ chainStore's
+//     last finalized ordinal. Consumers may cache aggressively and treat as authoritative.
+//   - `finalized=false` ⇒ snapshot is on a pending branch and may be reorged out.
+//     `branch_id` carries the branch identifier so consumers can correlate provisional
+//     fetches across requests.
+//   - For gossip-broadcast snapshots (publishing path), `finalized=false` and `branch_id`
+//     is the snapshot's own hash — every newly-produced snapshot is provisional.
+//   - For "not found" responses on the ServeSnapshots/FetchSnapshots RPC, the server
+//     simply omits the snapshot from the stream (existing behavior, unchanged).
+//
+// The Go sidecar treats `payload` as opaque bytes and is unaffected by these additions
+// — proto3 forward-compat skips unknown fields. JVM-side parsers populate the disposition
+// when serving and read it when fetching (see `ChainSyncStateResponse`).
 type Snapshot struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Hash          []byte                 `protobuf:"bytes,1,opt,name=hash,proto3" json:"hash,omitempty"`                                       // 32 bytes, snapshot hash
-	Slot          int64                  `protobuf:"varint,2,opt,name=slot,proto3" json:"slot,omitempty"`                                      // slot number
-	Ordinal       int64                  `protobuf:"varint,3,opt,name=ordinal,proto3" json:"ordinal,omitempty"`                                // snapshot ordinal
-	ParentHash    []byte                 `protobuf:"bytes,4,opt,name=parent_hash,json=parentHash,proto3" json:"parent_hash,omitempty"`         // 32 bytes, parent snapshot hash
-	VrfProof      []byte                 `protobuf:"bytes,5,opt,name=vrf_proof,json=vrfProof,proto3" json:"vrf_proof,omitempty"`               // 80 bytes, VRF proof (Gamma || c || s)
-	VrfPublicKey  []byte                 `protobuf:"bytes,6,opt,name=vrf_public_key,json=vrfPublicKey,proto3" json:"vrf_public_key,omitempty"` // 32 bytes, Ed25519 VRF public key
-	Eta           []byte                 `protobuf:"bytes,7,opt,name=eta,proto3" json:"eta,omitempty"`                                         // 32 bytes, epoch randomness
-	Payload       []byte                 `protobuf:"bytes,8,opt,name=payload,proto3" json:"payload,omitempty"`                                 // serialized snapshot body (opaque to sidecar)
-	ProducerId    []byte                 `protobuf:"bytes,9,opt,name=producer_id,json=producerId,proto3" json:"producer_id,omitempty"`         // peer identity of the producer
-	ParentSlot    int64                  `protobuf:"varint,10,opt,name=parent_slot,json=parentSlot,proto3" json:"parent_slot,omitempty"`       // slot of parent snapshot (for slot gap verification)
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	Hash         []byte                 `protobuf:"bytes,1,opt,name=hash,proto3" json:"hash,omitempty"`                                       // 32 bytes, snapshot hash
+	Slot         int64                  `protobuf:"varint,2,opt,name=slot,proto3" json:"slot,omitempty"`                                      // slot number
+	Ordinal      int64                  `protobuf:"varint,3,opt,name=ordinal,proto3" json:"ordinal,omitempty"`                                // snapshot ordinal
+	ParentHash   []byte                 `protobuf:"bytes,4,opt,name=parent_hash,json=parentHash,proto3" json:"parent_hash,omitempty"`         // 32 bytes, parent snapshot hash
+	VrfProof     []byte                 `protobuf:"bytes,5,opt,name=vrf_proof,json=vrfProof,proto3" json:"vrf_proof,omitempty"`               // 80 bytes, VRF proof (Gamma || c || s)
+	VrfPublicKey []byte                 `protobuf:"bytes,6,opt,name=vrf_public_key,json=vrfPublicKey,proto3" json:"vrf_public_key,omitempty"` // 32 bytes, Ed25519 VRF public key
+	Eta          []byte                 `protobuf:"bytes,7,opt,name=eta,proto3" json:"eta,omitempty"`                                         // 32 bytes, epoch randomness
+	Payload      []byte                 `protobuf:"bytes,8,opt,name=payload,proto3" json:"payload,omitempty"`                                 // serialized snapshot body (opaque to sidecar)
+	ProducerId   []byte                 `protobuf:"bytes,9,opt,name=producer_id,json=producerId,proto3" json:"producer_id,omitempty"`         // peer identity of the producer
+	ParentSlot   int64                  `protobuf:"varint,10,opt,name=parent_slot,json=parentSlot,proto3" json:"parent_slot,omitempty"`       // slot of parent snapshot (for slot gap verification)
+	Finalized    bool                   `protobuf:"varint,11,opt,name=finalized,proto3" json:"finalized,omitempty"`                           // ChainSync disposition (#56.8): true ⇒ on canonical chain at finalized ordinal
+	BranchId     []byte                 `protobuf:"bytes,12,opt,name=branch_id,json=branchId,proto3" json:"branch_id,omitempty"`              // ChainSync disposition (#56.8): pending branch id when finalized=false
+	// KES product signature over the same bytes that `signature` covers (the
+	// snapshot artifact hash for Snapshot). Empty when sender pre-dates the §1.2
+	// KES rollout — receiver tolerates empty (Slice 5 makes verification
+	// warn-only). Added in §1.2 Slice 4.
+	KesSignature  []byte `protobuf:"bytes,13,opt,name=kes_signature,json=kesSignature,proto3" json:"kes_signature,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -138,15 +160,41 @@ func (x *Snapshot) GetParentSlot() int64 {
 	return 0
 }
 
+func (x *Snapshot) GetFinalized() bool {
+	if x != nil {
+		return x.Finalized
+	}
+	return false
+}
+
+func (x *Snapshot) GetBranchId() []byte {
+	if x != nil {
+		return x.BranchId
+	}
+	return nil
+}
+
+func (x *Snapshot) GetKesSignature() []byte {
+	if x != nil {
+		return x.KesSignature
+	}
+	return nil
+}
+
 // A validator's endorsement of a chain tip.
 type TipAttestation struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	TipHash       []byte                 `protobuf:"bytes,1,opt,name=tip_hash,json=tipHash,proto3" json:"tip_hash,omitempty"`           // 32 bytes, hash of endorsed snapshot
-	TipSlot       int64                  `protobuf:"varint,2,opt,name=tip_slot,json=tipSlot,proto3" json:"tip_slot,omitempty"`          // slot of that snapshot
-	TipOrdinal    int64                  `protobuf:"varint,3,opt,name=tip_ordinal,json=tipOrdinal,proto3" json:"tip_ordinal,omitempty"` // ordinal of that snapshot
-	AttestedAt    int64                  `protobuf:"varint,4,opt,name=attested_at,json=attestedAt,proto3" json:"attested_at,omitempty"` // slot when attestation was created
-	AttesterId    []byte                 `protobuf:"bytes,5,opt,name=attester_id,json=attesterId,proto3" json:"attester_id,omitempty"`  // peer identity of the attester
-	Signature     []byte                 `protobuf:"bytes,6,opt,name=signature,proto3" json:"signature,omitempty"`                      // signature over (tip_hash || tip_slot)
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	TipHash    []byte                 `protobuf:"bytes,1,opt,name=tip_hash,json=tipHash,proto3" json:"tip_hash,omitempty"`           // 32 bytes, hash of endorsed snapshot
+	TipSlot    int64                  `protobuf:"varint,2,opt,name=tip_slot,json=tipSlot,proto3" json:"tip_slot,omitempty"`          // slot of that snapshot
+	TipOrdinal int64                  `protobuf:"varint,3,opt,name=tip_ordinal,json=tipOrdinal,proto3" json:"tip_ordinal,omitempty"` // ordinal of that snapshot
+	AttestedAt int64                  `protobuf:"varint,4,opt,name=attested_at,json=attestedAt,proto3" json:"attested_at,omitempty"` // slot when attestation was created
+	AttesterId []byte                 `protobuf:"bytes,5,opt,name=attester_id,json=attesterId,proto3" json:"attester_id,omitempty"`  // peer identity of the attester
+	Signature  []byte                 `protobuf:"bytes,6,opt,name=signature,proto3" json:"signature,omitempty"`                      // signature over (tip_hash || tip_slot)
+	// KES product signature over the same bytes that `signature` covers (the
+	// attestation hash for TipAttestation). Empty when sender pre-dates the §1.2
+	// KES rollout — receiver tolerates empty (Slice 5 makes verification
+	// warn-only). Added in §1.2 Slice 4.
+	KesSignature  []byte `protobuf:"bytes,7,opt,name=kes_signature,json=kesSignature,proto3" json:"kes_signature,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -219,6 +267,13 @@ func (x *TipAttestation) GetAttesterId() []byte {
 func (x *TipAttestation) GetSignature() []byte {
 	if x != nil {
 		return x.Signature
+	}
+	return nil
+}
+
+func (x *TipAttestation) GetKesSignature() []byte {
+	if x != nil {
+		return x.KesSignature
 	}
 	return nil
 }
@@ -352,6 +407,115 @@ func (x *MetagraphBinary) GetBinary() []byte {
 	return nil
 }
 
+// Per-metagraph committee attestation (Slice S2, task #188).
+//
+// Emitted by a gl0 operator key that wins the committee VRF for a given
+// (metagraph_address, snapshot_ord) under the per-metagraph sortition
+// (`docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md`). The receiver verifies the
+// VRF proof against the sender's published VK + the threshold `K · σ`, then
+// tallies toward the per-binary `≥ 2K/3` quorum. Slice S3 will flip the
+// aggregate from warn-only observability into the load-bearing pre-inclusion
+// gate that lets non-committee operators skip the binary entirely.
+//
+// `binary_hash` ties the attestation to a specific MetagraphBinary so we don't
+// double-count attestations across competing binaries on the same snapshot ord
+// (slashing-condition substrate, S4).
+//
+// `kes_signature` covers the same bytes as `signature` and follows the same
+// Slice 9 verify path used for TipAttestation. Empty during the warn-only
+// window (S2); receiver-side enforcement turns on in S3.
+type MetagraphAttestation struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	PeerId            []byte                 `protobuf:"bytes,1,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`                                    // operator's long-term peer id
+	MetagraphAddress  string                 `protobuf:"bytes,2,opt,name=metagraph_address,json=metagraphAddress,proto3" json:"metagraph_address,omitempty"`      // DAG base58 string; subject metagraph
+	SnapshotOrd       int64                  `protobuf:"varint,3,opt,name=snapshot_ord,json=snapshotOrd,proto3" json:"snapshot_ord,omitempty"`                    // metagraph snapshot ordinal being attested
+	BinaryHash        []byte                 `protobuf:"bytes,4,opt,name=binary_hash,json=binaryHash,proto3" json:"binary_hash,omitempty"`                        // 32 bytes; hash of the MetagraphBinary
+	CommitteeVrfProof []byte                 `protobuf:"bytes,5,opt,name=committee_vrf_proof,json=committeeVrfProof,proto3" json:"committee_vrf_proof,omitempty"` // committee VRF proof — gates membership
+	Signature         []byte                 `protobuf:"bytes,6,opt,name=signature,proto3" json:"signature,omitempty"`                                            // long-term-key signature over the canonical bytes
+	KesSignature      []byte                 `protobuf:"bytes,7,opt,name=kes_signature,json=kesSignature,proto3" json:"kes_signature,omitempty"`                  // KES product signature (Slice 9 path); empty during S2 warn-only
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *MetagraphAttestation) Reset() {
+	*x = MetagraphAttestation{}
+	mi := &file_proto_sidecar_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MetagraphAttestation) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MetagraphAttestation) ProtoMessage() {}
+
+func (x *MetagraphAttestation) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_sidecar_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MetagraphAttestation.ProtoReflect.Descriptor instead.
+func (*MetagraphAttestation) Descriptor() ([]byte, []int) {
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *MetagraphAttestation) GetPeerId() []byte {
+	if x != nil {
+		return x.PeerId
+	}
+	return nil
+}
+
+func (x *MetagraphAttestation) GetMetagraphAddress() string {
+	if x != nil {
+		return x.MetagraphAddress
+	}
+	return ""
+}
+
+func (x *MetagraphAttestation) GetSnapshotOrd() int64 {
+	if x != nil {
+		return x.SnapshotOrd
+	}
+	return 0
+}
+
+func (x *MetagraphAttestation) GetBinaryHash() []byte {
+	if x != nil {
+		return x.BinaryHash
+	}
+	return nil
+}
+
+func (x *MetagraphAttestation) GetCommitteeVrfProof() []byte {
+	if x != nil {
+		return x.CommitteeVrfProof
+	}
+	return nil
+}
+
+func (x *MetagraphAttestation) GetSignature() []byte {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
+}
+
+func (x *MetagraphAttestation) GetKesSignature() []byte {
+	if x != nil {
+		return x.KesSignature
+	}
+	return nil
+}
+
 // Envelope for GossipSub messages.
 type GossipMessage struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -361,6 +525,7 @@ type GossipMessage struct {
 	//	*GossipMessage_Attestation
 	//	*GossipMessage_Rumor
 	//	*GossipMessage_MetagraphBinary
+	//	*GossipMessage_MetagraphAttestation
 	Body          isGossipMessage_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -368,7 +533,7 @@ type GossipMessage struct {
 
 func (x *GossipMessage) Reset() {
 	*x = GossipMessage{}
-	mi := &file_proto_sidecar_proto_msgTypes[4]
+	mi := &file_proto_sidecar_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -380,7 +545,7 @@ func (x *GossipMessage) String() string {
 func (*GossipMessage) ProtoMessage() {}
 
 func (x *GossipMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[4]
+	mi := &file_proto_sidecar_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -393,7 +558,7 @@ func (x *GossipMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GossipMessage.ProtoReflect.Descriptor instead.
 func (*GossipMessage) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{4}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *GossipMessage) GetBody() isGossipMessage_Body {
@@ -439,6 +604,15 @@ func (x *GossipMessage) GetMetagraphBinary() *MetagraphBinary {
 	return nil
 }
 
+func (x *GossipMessage) GetMetagraphAttestation() *MetagraphAttestation {
+	if x != nil {
+		if x, ok := x.Body.(*GossipMessage_MetagraphAttestation); ok {
+			return x.MetagraphAttestation
+		}
+	}
+	return nil
+}
+
 type isGossipMessage_Body interface {
 	isGossipMessage_Body()
 }
@@ -459,6 +633,10 @@ type GossipMessage_MetagraphBinary struct {
 	MetagraphBinary *MetagraphBinary `protobuf:"bytes,4,opt,name=metagraph_binary,json=metagraphBinary,proto3,oneof"`
 }
 
+type GossipMessage_MetagraphAttestation struct {
+	MetagraphAttestation *MetagraphAttestation `protobuf:"bytes,5,opt,name=metagraph_attestation,json=metagraphAttestation,proto3,oneof"`
+}
+
 func (*GossipMessage_Snapshot) isGossipMessage_Body() {}
 
 func (*GossipMessage_Attestation) isGossipMessage_Body() {}
@@ -466,6 +644,8 @@ func (*GossipMessage_Attestation) isGossipMessage_Body() {}
 func (*GossipMessage_Rumor) isGossipMessage_Body() {}
 
 func (*GossipMessage_MetagraphBinary) isGossipMessage_Body() {}
+
+func (*GossipMessage_MetagraphAttestation) isGossipMessage_Body() {}
 
 type PublishResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -477,7 +657,7 @@ type PublishResponse struct {
 
 func (x *PublishResponse) Reset() {
 	*x = PublishResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[5]
+	mi := &file_proto_sidecar_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -489,7 +669,7 @@ func (x *PublishResponse) String() string {
 func (*PublishResponse) ProtoMessage() {}
 
 func (x *PublishResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[5]
+	mi := &file_proto_sidecar_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -502,7 +682,7 @@ func (x *PublishResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishResponse.ProtoReflect.Descriptor instead.
 func (*PublishResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{5}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *PublishResponse) GetOk() bool {
@@ -529,7 +709,7 @@ type SubscribeRequest struct {
 
 func (x *SubscribeRequest) Reset() {
 	*x = SubscribeRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[6]
+	mi := &file_proto_sidecar_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -541,7 +721,7 @@ func (x *SubscribeRequest) String() string {
 func (*SubscribeRequest) ProtoMessage() {}
 
 func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[6]
+	mi := &file_proto_sidecar_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -554,7 +734,7 @@ func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribeRequest.ProtoReflect.Descriptor instead.
 func (*SubscribeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{6}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *SubscribeRequest) GetTopics() []string {
@@ -572,7 +752,7 @@ type PeerCountRequest struct {
 
 func (x *PeerCountRequest) Reset() {
 	*x = PeerCountRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[7]
+	mi := &file_proto_sidecar_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -584,7 +764,7 @@ func (x *PeerCountRequest) String() string {
 func (*PeerCountRequest) ProtoMessage() {}
 
 func (x *PeerCountRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[7]
+	mi := &file_proto_sidecar_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -597,23 +777,24 @@ func (x *PeerCountRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerCountRequest.ProtoReflect.Descriptor instead.
 func (*PeerCountRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{7}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{8}
 }
 
 type PeerCountResponse struct {
-	state                 protoimpl.MessageState `protogen:"open.v1"`
-	Total                 int32                  `protobuf:"varint,1,opt,name=total,proto3" json:"total,omitempty"`
-	MeshSnapshots         int32                  `protobuf:"varint,2,opt,name=mesh_snapshots,json=meshSnapshots,proto3" json:"mesh_snapshots,omitempty"`                           // peers in snapshot topic mesh
-	MeshAttestations      int32                  `protobuf:"varint,3,opt,name=mesh_attestations,json=meshAttestations,proto3" json:"mesh_attestations,omitempty"`                  // peers in attestation topic mesh
-	MeshRumors            int32                  `protobuf:"varint,4,opt,name=mesh_rumors,json=meshRumors,proto3" json:"mesh_rumors,omitempty"`                                    // peers in rumor topic mesh
-	MeshMetagraphBinaries int32                  `protobuf:"varint,5,opt,name=mesh_metagraph_binaries,json=meshMetagraphBinaries,proto3" json:"mesh_metagraph_binaries,omitempty"` // peers in metagraph binary topic mesh
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	state                     protoimpl.MessageState `protogen:"open.v1"`
+	Total                     int32                  `protobuf:"varint,1,opt,name=total,proto3" json:"total,omitempty"`
+	MeshSnapshots             int32                  `protobuf:"varint,2,opt,name=mesh_snapshots,json=meshSnapshots,proto3" json:"mesh_snapshots,omitempty"`                                       // peers in snapshot topic mesh
+	MeshAttestations          int32                  `protobuf:"varint,3,opt,name=mesh_attestations,json=meshAttestations,proto3" json:"mesh_attestations,omitempty"`                              // peers in attestation topic mesh
+	MeshRumors                int32                  `protobuf:"varint,4,opt,name=mesh_rumors,json=meshRumors,proto3" json:"mesh_rumors,omitempty"`                                                // peers in rumor topic mesh
+	MeshMetagraphBinaries     int32                  `protobuf:"varint,5,opt,name=mesh_metagraph_binaries,json=meshMetagraphBinaries,proto3" json:"mesh_metagraph_binaries,omitempty"`             // peers in metagraph binary topic mesh
+	MeshMetagraphAttestations int32                  `protobuf:"varint,6,opt,name=mesh_metagraph_attestations,json=meshMetagraphAttestations,proto3" json:"mesh_metagraph_attestations,omitempty"` // peers in metagraph attestation topic mesh (Slice S2)
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *PeerCountResponse) Reset() {
 	*x = PeerCountResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[8]
+	mi := &file_proto_sidecar_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -625,7 +806,7 @@ func (x *PeerCountResponse) String() string {
 func (*PeerCountResponse) ProtoMessage() {}
 
 func (x *PeerCountResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[8]
+	mi := &file_proto_sidecar_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -638,7 +819,7 @@ func (x *PeerCountResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerCountResponse.ProtoReflect.Descriptor instead.
 func (*PeerCountResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{8}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *PeerCountResponse) GetTotal() int32 {
@@ -676,6 +857,13 @@ func (x *PeerCountResponse) GetMeshMetagraphBinaries() int32 {
 	return 0
 }
 
+func (x *PeerCountResponse) GetMeshMetagraphAttestations() int32 {
+	if x != nil {
+		return x.MeshMetagraphAttestations
+	}
+	return 0
+}
+
 type HealthRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -684,7 +872,7 @@ type HealthRequest struct {
 
 func (x *HealthRequest) Reset() {
 	*x = HealthRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[9]
+	mi := &file_proto_sidecar_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -696,7 +884,7 @@ func (x *HealthRequest) String() string {
 func (*HealthRequest) ProtoMessage() {}
 
 func (x *HealthRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[9]
+	mi := &file_proto_sidecar_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -709,7 +897,7 @@ func (x *HealthRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthRequest.ProtoReflect.Descriptor instead.
 func (*HealthRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{9}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{10}
 }
 
 type HealthResponse struct {
@@ -723,7 +911,7 @@ type HealthResponse struct {
 
 func (x *HealthResponse) Reset() {
 	*x = HealthResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[10]
+	mi := &file_proto_sidecar_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -735,7 +923,7 @@ func (x *HealthResponse) String() string {
 func (*HealthResponse) ProtoMessage() {}
 
 func (x *HealthResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[10]
+	mi := &file_proto_sidecar_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -748,7 +936,7 @@ func (x *HealthResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthResponse.ProtoReflect.Descriptor instead.
 func (*HealthResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{10}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *HealthResponse) GetHealthy() bool {
@@ -783,7 +971,7 @@ type ChainPoint struct {
 
 func (x *ChainPoint) Reset() {
 	*x = ChainPoint{}
-	mi := &file_proto_sidecar_proto_msgTypes[11]
+	mi := &file_proto_sidecar_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -795,7 +983,7 @@ func (x *ChainPoint) String() string {
 func (*ChainPoint) ProtoMessage() {}
 
 func (x *ChainPoint) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[11]
+	mi := &file_proto_sidecar_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -808,7 +996,7 @@ func (x *ChainPoint) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChainPoint.ProtoReflect.Descriptor instead.
 func (*ChainPoint) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{11}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *ChainPoint) GetHash() []byte {
@@ -835,7 +1023,7 @@ type FetchSnapshotsRequest struct {
 
 func (x *FetchSnapshotsRequest) Reset() {
 	*x = FetchSnapshotsRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[12]
+	mi := &file_proto_sidecar_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -847,7 +1035,7 @@ func (x *FetchSnapshotsRequest) String() string {
 func (*FetchSnapshotsRequest) ProtoMessage() {}
 
 func (x *FetchSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[12]
+	mi := &file_proto_sidecar_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -860,7 +1048,7 @@ func (x *FetchSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*FetchSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{12}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *FetchSnapshotsRequest) GetHashes() [][]byte {
@@ -881,7 +1069,7 @@ type FindIntersectionRequest struct {
 
 func (x *FindIntersectionRequest) Reset() {
 	*x = FindIntersectionRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[13]
+	mi := &file_proto_sidecar_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -893,7 +1081,7 @@ func (x *FindIntersectionRequest) String() string {
 func (*FindIntersectionRequest) ProtoMessage() {}
 
 func (x *FindIntersectionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[13]
+	mi := &file_proto_sidecar_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -906,7 +1094,7 @@ func (x *FindIntersectionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FindIntersectionRequest.ProtoReflect.Descriptor instead.
 func (*FindIntersectionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{13}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *FindIntersectionRequest) GetPoints() []*ChainPoint {
@@ -929,7 +1117,7 @@ type FindIntersectionResponse struct {
 
 func (x *FindIntersectionResponse) Reset() {
 	*x = FindIntersectionResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[14]
+	mi := &file_proto_sidecar_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -941,7 +1129,7 @@ func (x *FindIntersectionResponse) String() string {
 func (*FindIntersectionResponse) ProtoMessage() {}
 
 func (x *FindIntersectionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[14]
+	mi := &file_proto_sidecar_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -954,7 +1142,7 @@ func (x *FindIntersectionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FindIntersectionResponse.ProtoReflect.Descriptor instead.
 func (*FindIntersectionResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{14}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *FindIntersectionResponse) GetFound() bool {
@@ -1000,7 +1188,7 @@ type GetPeerTipRequest struct {
 
 func (x *GetPeerTipRequest) Reset() {
 	*x = GetPeerTipRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[15]
+	mi := &file_proto_sidecar_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1012,7 +1200,7 @@ func (x *GetPeerTipRequest) String() string {
 func (*GetPeerTipRequest) ProtoMessage() {}
 
 func (x *GetPeerTipRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[15]
+	mi := &file_proto_sidecar_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1025,7 +1213,7 @@ func (x *GetPeerTipRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPeerTipRequest.ProtoReflect.Descriptor instead.
 func (*GetPeerTipRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{15}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{16}
 }
 
 type PeerTipResponse struct {
@@ -1039,7 +1227,7 @@ type PeerTipResponse struct {
 
 func (x *PeerTipResponse) Reset() {
 	*x = PeerTipResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[16]
+	mi := &file_proto_sidecar_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1051,7 +1239,7 @@ func (x *PeerTipResponse) String() string {
 func (*PeerTipResponse) ProtoMessage() {}
 
 func (x *PeerTipResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[16]
+	mi := &file_proto_sidecar_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1064,7 +1252,7 @@ func (x *PeerTipResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerTipResponse.ProtoReflect.Descriptor instead.
 func (*PeerTipResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{16}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *PeerTipResponse) GetHash() []byte {
@@ -1097,7 +1285,7 @@ type ServeSnapshotsRequest struct {
 
 func (x *ServeSnapshotsRequest) Reset() {
 	*x = ServeSnapshotsRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[17]
+	mi := &file_proto_sidecar_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1109,7 +1297,7 @@ func (x *ServeSnapshotsRequest) String() string {
 func (*ServeSnapshotsRequest) ProtoMessage() {}
 
 func (x *ServeSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[17]
+	mi := &file_proto_sidecar_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1122,7 +1310,7 @@ func (x *ServeSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServeSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*ServeSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{17}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *ServeSnapshotsRequest) GetHashes() [][]byte {
@@ -1140,7 +1328,7 @@ type ServeChainPointsRequest struct {
 
 func (x *ServeChainPointsRequest) Reset() {
 	*x = ServeChainPointsRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[18]
+	mi := &file_proto_sidecar_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1152,7 +1340,7 @@ func (x *ServeChainPointsRequest) String() string {
 func (*ServeChainPointsRequest) ProtoMessage() {}
 
 func (x *ServeChainPointsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[18]
+	mi := &file_proto_sidecar_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1165,7 +1353,7 @@ func (x *ServeChainPointsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServeChainPointsRequest.ProtoReflect.Descriptor instead.
 func (*ServeChainPointsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{18}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{19}
 }
 
 type ServeChainPointsResponse struct {
@@ -1179,7 +1367,7 @@ type ServeChainPointsResponse struct {
 
 func (x *ServeChainPointsResponse) Reset() {
 	*x = ServeChainPointsResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[19]
+	mi := &file_proto_sidecar_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1191,7 +1379,7 @@ func (x *ServeChainPointsResponse) String() string {
 func (*ServeChainPointsResponse) ProtoMessage() {}
 
 func (x *ServeChainPointsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[19]
+	mi := &file_proto_sidecar_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1204,7 +1392,7 @@ func (x *ServeChainPointsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServeChainPointsResponse.ProtoReflect.Descriptor instead.
 func (*ServeChainPointsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{19}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *ServeChainPointsResponse) GetPoints() []*ChainPoint {
@@ -1248,7 +1436,7 @@ type BackfillSnapshot struct {
 
 func (x *BackfillSnapshot) Reset() {
 	*x = BackfillSnapshot{}
-	mi := &file_proto_sidecar_proto_msgTypes[20]
+	mi := &file_proto_sidecar_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1260,7 +1448,7 @@ func (x *BackfillSnapshot) String() string {
 func (*BackfillSnapshot) ProtoMessage() {}
 
 func (x *BackfillSnapshot) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[20]
+	mi := &file_proto_sidecar_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1273,7 +1461,7 @@ func (x *BackfillSnapshot) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackfillSnapshot.ProtoReflect.Descriptor instead.
 func (*BackfillSnapshot) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{20}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *BackfillSnapshot) GetHash() []byte {
@@ -1351,7 +1539,7 @@ type FetchByRangeRequest struct {
 
 func (x *FetchByRangeRequest) Reset() {
 	*x = FetchByRangeRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[21]
+	mi := &file_proto_sidecar_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1363,7 +1551,7 @@ func (x *FetchByRangeRequest) String() string {
 func (*FetchByRangeRequest) ProtoMessage() {}
 
 func (x *FetchByRangeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[21]
+	mi := &file_proto_sidecar_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1376,7 +1564,7 @@ func (x *FetchByRangeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchByRangeRequest.ProtoReflect.Descriptor instead.
 func (*FetchByRangeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{21}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *FetchByRangeRequest) GetStartOrdinal() int64 {
@@ -1409,7 +1597,7 @@ type ListPeersRequest struct {
 
 func (x *ListPeersRequest) Reset() {
 	*x = ListPeersRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[22]
+	mi := &file_proto_sidecar_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1421,7 +1609,7 @@ func (x *ListPeersRequest) String() string {
 func (*ListPeersRequest) ProtoMessage() {}
 
 func (x *ListPeersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[22]
+	mi := &file_proto_sidecar_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1434,7 +1622,7 @@ func (x *ListPeersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListPeersRequest.ProtoReflect.Descriptor instead.
 func (*ListPeersRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{22}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{23}
 }
 
 type ListPeersResponse struct {
@@ -1446,7 +1634,7 @@ type ListPeersResponse struct {
 
 func (x *ListPeersResponse) Reset() {
 	*x = ListPeersResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[23]
+	mi := &file_proto_sidecar_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1458,7 +1646,7 @@ func (x *ListPeersResponse) String() string {
 func (*ListPeersResponse) ProtoMessage() {}
 
 func (x *ListPeersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[23]
+	mi := &file_proto_sidecar_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1471,7 +1659,7 @@ func (x *ListPeersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListPeersResponse.ProtoReflect.Descriptor instead.
 func (*ListPeersResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{23}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ListPeersResponse) GetPeerIds() [][]byte {
@@ -1485,7 +1673,7 @@ var File_proto_sidecar_proto protoreflect.FileDescriptor
 
 const file_proto_sidecar_proto_rawDesc = "" +
 	"\n" +
-	"\x13proto/sidecar.proto\x12\fnakamoto.p2p\"\x9e\x02\n" +
+	"\x13proto/sidecar.proto\x12\fnakamoto.p2p\"\xfe\x02\n" +
 	"\bSnapshot\x12\x12\n" +
 	"\x04hash\x18\x01 \x01(\fR\x04hash\x12\x12\n" +
 	"\x04slot\x18\x02 \x01(\x03R\x04slot\x12\x18\n" +
@@ -1500,7 +1688,10 @@ const file_proto_sidecar_proto_rawDesc = "" +
 	"producerId\x12\x1f\n" +
 	"\vparent_slot\x18\n" +
 	" \x01(\x03R\n" +
-	"parentSlot\"\xc7\x01\n" +
+	"parentSlot\x12\x1c\n" +
+	"\tfinalized\x18\v \x01(\bR\tfinalized\x12\x1b\n" +
+	"\tbranch_id\x18\f \x01(\fR\bbranchId\x12#\n" +
+	"\rkes_signature\x18\r \x01(\fR\fkesSignature\"\xec\x01\n" +
 	"\x0eTipAttestation\x12\x19\n" +
 	"\btip_hash\x18\x01 \x01(\fR\atipHash\x12\x19\n" +
 	"\btip_slot\x18\x02 \x01(\x03R\atipSlot\x12\x1f\n" +
@@ -1510,33 +1701,45 @@ const file_proto_sidecar_proto_rawDesc = "" +
 	"attestedAt\x12\x1f\n" +
 	"\vattester_id\x18\x05 \x01(\fR\n" +
 	"attesterId\x12\x1c\n" +
-	"\tsignature\x18\x06 \x01(\fR\tsignature\"u\n" +
+	"\tsignature\x18\x06 \x01(\fR\tsignature\x12#\n" +
+	"\rkes_signature\x18\a \x01(\fR\fkesSignature\"u\n" +
 	"\x05Rumor\x12,\n" +
 	"\x12signed_rumor_bytes\x18\x01 \x01(\fR\x10signedRumorBytes\x12!\n" +
 	"\fcontent_type\x18\x02 \x01(\tR\vcontentType\x12\x1b\n" +
 	"\torigin_id\x18\x03 \x01(\fR\boriginId\"C\n" +
 	"\x0fMetagraphBinary\x12\x18\n" +
 	"\aaddress\x18\x01 \x01(\tR\aaddress\x12\x16\n" +
-	"\x06binary\x18\x02 \x01(\fR\x06binary\"\x88\x02\n" +
+	"\x06binary\x18\x02 \x01(\fR\x06binary\"\x93\x02\n" +
+	"\x14MetagraphAttestation\x12\x17\n" +
+	"\apeer_id\x18\x01 \x01(\fR\x06peerId\x12+\n" +
+	"\x11metagraph_address\x18\x02 \x01(\tR\x10metagraphAddress\x12!\n" +
+	"\fsnapshot_ord\x18\x03 \x01(\x03R\vsnapshotOrd\x12\x1f\n" +
+	"\vbinary_hash\x18\x04 \x01(\fR\n" +
+	"binaryHash\x12.\n" +
+	"\x13committee_vrf_proof\x18\x05 \x01(\fR\x11committeeVrfProof\x12\x1c\n" +
+	"\tsignature\x18\x06 \x01(\fR\tsignature\x12#\n" +
+	"\rkes_signature\x18\a \x01(\fR\fkesSignature\"\xe3\x02\n" +
 	"\rGossipMessage\x124\n" +
 	"\bsnapshot\x18\x01 \x01(\v2\x16.nakamoto.p2p.SnapshotH\x00R\bsnapshot\x12@\n" +
 	"\vattestation\x18\x02 \x01(\v2\x1c.nakamoto.p2p.TipAttestationH\x00R\vattestation\x12+\n" +
 	"\x05rumor\x18\x03 \x01(\v2\x13.nakamoto.p2p.RumorH\x00R\x05rumor\x12J\n" +
-	"\x10metagraph_binary\x18\x04 \x01(\v2\x1d.nakamoto.p2p.MetagraphBinaryH\x00R\x0fmetagraphBinaryB\x06\n" +
+	"\x10metagraph_binary\x18\x04 \x01(\v2\x1d.nakamoto.p2p.MetagraphBinaryH\x00R\x0fmetagraphBinary\x12Y\n" +
+	"\x15metagraph_attestation\x18\x05 \x01(\v2\".nakamoto.p2p.MetagraphAttestationH\x00R\x14metagraphAttestationB\x06\n" +
 	"\x04body\"7\n" +
 	"\x0fPublishResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
 	"\x05error\x18\x02 \x01(\tR\x05error\"*\n" +
 	"\x10SubscribeRequest\x12\x16\n" +
 	"\x06topics\x18\x01 \x03(\tR\x06topics\"\x12\n" +
-	"\x10PeerCountRequest\"\xd6\x01\n" +
+	"\x10PeerCountRequest\"\x96\x02\n" +
 	"\x11PeerCountResponse\x12\x14\n" +
 	"\x05total\x18\x01 \x01(\x05R\x05total\x12%\n" +
 	"\x0emesh_snapshots\x18\x02 \x01(\x05R\rmeshSnapshots\x12+\n" +
 	"\x11mesh_attestations\x18\x03 \x01(\x05R\x10meshAttestations\x12\x1f\n" +
 	"\vmesh_rumors\x18\x04 \x01(\x05R\n" +
 	"meshRumors\x126\n" +
-	"\x17mesh_metagraph_binaries\x18\x05 \x01(\x05R\x15meshMetagraphBinaries\"\x0f\n" +
+	"\x17mesh_metagraph_binaries\x18\x05 \x01(\x05R\x15meshMetagraphBinaries\x12>\n" +
+	"\x1bmesh_metagraph_attestations\x18\x06 \x01(\x05R\x19meshMetagraphAttestations\"\x0f\n" +
 	"\rHealthRequest\"p\n" +
 	"\x0eHealthResponse\x12\x18\n" +
 	"\ahealthy\x18\x01 \x01(\bR\ahealthy\x12%\n" +
@@ -1591,12 +1794,13 @@ const file_proto_sidecar_proto_rawDesc = "" +
 	"\x0etarget_peer_id\x18\x03 \x01(\fR\ftargetPeerId\"\x12\n" +
 	"\x10ListPeersRequest\".\n" +
 	"\x11ListPeersResponse\x12\x19\n" +
-	"\bpeer_ids\x18\x01 \x03(\fR\apeerIds2\xa8\x04\n" +
+	"\bpeer_ids\x18\x01 \x03(\fR\apeerIds2\x8a\x05\n" +
 	"\x0eSidecarService\x12H\n" +
 	"\x0fPublishSnapshot\x12\x16.nakamoto.p2p.Snapshot\x1a\x1d.nakamoto.p2p.PublishResponse\x12Q\n" +
 	"\x12PublishAttestation\x12\x1c.nakamoto.p2p.TipAttestation\x1a\x1d.nakamoto.p2p.PublishResponse\x12B\n" +
 	"\fPublishRumor\x12\x13.nakamoto.p2p.Rumor\x1a\x1d.nakamoto.p2p.PublishResponse\x12V\n" +
-	"\x16PublishMetagraphBinary\x12\x1d.nakamoto.p2p.MetagraphBinary\x1a\x1d.nakamoto.p2p.PublishResponse\x12J\n" +
+	"\x16PublishMetagraphBinary\x12\x1d.nakamoto.p2p.MetagraphBinary\x1a\x1d.nakamoto.p2p.PublishResponse\x12`\n" +
+	"\x1bPublishMetagraphAttestation\x12\".nakamoto.p2p.MetagraphAttestation\x1a\x1d.nakamoto.p2p.PublishResponse\x12J\n" +
 	"\tSubscribe\x12\x1e.nakamoto.p2p.SubscribeRequest\x1a\x1b.nakamoto.p2p.GossipMessage0\x01\x12L\n" +
 	"\tPeerCount\x12\x1e.nakamoto.p2p.PeerCountRequest\x1a\x1f.nakamoto.p2p.PeerCountResponse\x12C\n" +
 	"\x06Health\x12\x1b.nakamoto.p2p.HealthRequest\x1a\x1c.nakamoto.p2p.HealthResponse2\xb8\x03\n" +
@@ -1610,7 +1814,8 @@ const file_proto_sidecar_proto_rawDesc = "" +
 	"\x10ChainSyncInbound\x12O\n" +
 	"\x0eServeSnapshots\x12#.nakamoto.p2p.ServeSnapshotsRequest\x1a\x16.nakamoto.p2p.Snapshot0\x01\x12S\n" +
 	"\fServeByRange\x12!.nakamoto.p2p.FetchByRangeRequest\x1a\x1e.nakamoto.p2p.BackfillSnapshot0\x01\x12a\n" +
-	"\x10ServeChainPoints\x12%.nakamoto.p2p.ServeChainPointsRequest\x1a&.nakamoto.p2p.ServeChainPointsResponseB-Z+github.com/scasplte2/tessellation/p2p/protob\x06proto3"
+	"\x10ServeChainPoints\x12%.nakamoto.p2p.ServeChainPointsRequest\x1a&.nakamoto.p2p.ServeChainPointsResponseBz\n" +
+	"Kio.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.protoZ+github.com/scasplte2/tessellation/p2p/protob\x06proto3"
 
 var (
 	file_proto_sidecar_proto_rawDescOnce sync.Once
@@ -1624,75 +1829,79 @@ func file_proto_sidecar_proto_rawDescGZIP() []byte {
 	return file_proto_sidecar_proto_rawDescData
 }
 
-var file_proto_sidecar_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
+var file_proto_sidecar_proto_msgTypes = make([]protoimpl.MessageInfo, 25)
 var file_proto_sidecar_proto_goTypes = []any{
 	(*Snapshot)(nil),                 // 0: nakamoto.p2p.Snapshot
 	(*TipAttestation)(nil),           // 1: nakamoto.p2p.TipAttestation
 	(*Rumor)(nil),                    // 2: nakamoto.p2p.Rumor
 	(*MetagraphBinary)(nil),          // 3: nakamoto.p2p.MetagraphBinary
-	(*GossipMessage)(nil),            // 4: nakamoto.p2p.GossipMessage
-	(*PublishResponse)(nil),          // 5: nakamoto.p2p.PublishResponse
-	(*SubscribeRequest)(nil),         // 6: nakamoto.p2p.SubscribeRequest
-	(*PeerCountRequest)(nil),         // 7: nakamoto.p2p.PeerCountRequest
-	(*PeerCountResponse)(nil),        // 8: nakamoto.p2p.PeerCountResponse
-	(*HealthRequest)(nil),            // 9: nakamoto.p2p.HealthRequest
-	(*HealthResponse)(nil),           // 10: nakamoto.p2p.HealthResponse
-	(*ChainPoint)(nil),               // 11: nakamoto.p2p.ChainPoint
-	(*FetchSnapshotsRequest)(nil),    // 12: nakamoto.p2p.FetchSnapshotsRequest
-	(*FindIntersectionRequest)(nil),  // 13: nakamoto.p2p.FindIntersectionRequest
-	(*FindIntersectionResponse)(nil), // 14: nakamoto.p2p.FindIntersectionResponse
-	(*GetPeerTipRequest)(nil),        // 15: nakamoto.p2p.GetPeerTipRequest
-	(*PeerTipResponse)(nil),          // 16: nakamoto.p2p.PeerTipResponse
-	(*ServeSnapshotsRequest)(nil),    // 17: nakamoto.p2p.ServeSnapshotsRequest
-	(*ServeChainPointsRequest)(nil),  // 18: nakamoto.p2p.ServeChainPointsRequest
-	(*ServeChainPointsResponse)(nil), // 19: nakamoto.p2p.ServeChainPointsResponse
-	(*BackfillSnapshot)(nil),         // 20: nakamoto.p2p.BackfillSnapshot
-	(*FetchByRangeRequest)(nil),      // 21: nakamoto.p2p.FetchByRangeRequest
-	(*ListPeersRequest)(nil),         // 22: nakamoto.p2p.ListPeersRequest
-	(*ListPeersResponse)(nil),        // 23: nakamoto.p2p.ListPeersResponse
+	(*MetagraphAttestation)(nil),     // 4: nakamoto.p2p.MetagraphAttestation
+	(*GossipMessage)(nil),            // 5: nakamoto.p2p.GossipMessage
+	(*PublishResponse)(nil),          // 6: nakamoto.p2p.PublishResponse
+	(*SubscribeRequest)(nil),         // 7: nakamoto.p2p.SubscribeRequest
+	(*PeerCountRequest)(nil),         // 8: nakamoto.p2p.PeerCountRequest
+	(*PeerCountResponse)(nil),        // 9: nakamoto.p2p.PeerCountResponse
+	(*HealthRequest)(nil),            // 10: nakamoto.p2p.HealthRequest
+	(*HealthResponse)(nil),           // 11: nakamoto.p2p.HealthResponse
+	(*ChainPoint)(nil),               // 12: nakamoto.p2p.ChainPoint
+	(*FetchSnapshotsRequest)(nil),    // 13: nakamoto.p2p.FetchSnapshotsRequest
+	(*FindIntersectionRequest)(nil),  // 14: nakamoto.p2p.FindIntersectionRequest
+	(*FindIntersectionResponse)(nil), // 15: nakamoto.p2p.FindIntersectionResponse
+	(*GetPeerTipRequest)(nil),        // 16: nakamoto.p2p.GetPeerTipRequest
+	(*PeerTipResponse)(nil),          // 17: nakamoto.p2p.PeerTipResponse
+	(*ServeSnapshotsRequest)(nil),    // 18: nakamoto.p2p.ServeSnapshotsRequest
+	(*ServeChainPointsRequest)(nil),  // 19: nakamoto.p2p.ServeChainPointsRequest
+	(*ServeChainPointsResponse)(nil), // 20: nakamoto.p2p.ServeChainPointsResponse
+	(*BackfillSnapshot)(nil),         // 21: nakamoto.p2p.BackfillSnapshot
+	(*FetchByRangeRequest)(nil),      // 22: nakamoto.p2p.FetchByRangeRequest
+	(*ListPeersRequest)(nil),         // 23: nakamoto.p2p.ListPeersRequest
+	(*ListPeersResponse)(nil),        // 24: nakamoto.p2p.ListPeersResponse
 }
 var file_proto_sidecar_proto_depIdxs = []int32{
 	0,  // 0: nakamoto.p2p.GossipMessage.snapshot:type_name -> nakamoto.p2p.Snapshot
 	1,  // 1: nakamoto.p2p.GossipMessage.attestation:type_name -> nakamoto.p2p.TipAttestation
 	2,  // 2: nakamoto.p2p.GossipMessage.rumor:type_name -> nakamoto.p2p.Rumor
 	3,  // 3: nakamoto.p2p.GossipMessage.metagraph_binary:type_name -> nakamoto.p2p.MetagraphBinary
-	11, // 4: nakamoto.p2p.FindIntersectionRequest.points:type_name -> nakamoto.p2p.ChainPoint
-	11, // 5: nakamoto.p2p.ServeChainPointsResponse.points:type_name -> nakamoto.p2p.ChainPoint
-	0,  // 6: nakamoto.p2p.SidecarService.PublishSnapshot:input_type -> nakamoto.p2p.Snapshot
-	1,  // 7: nakamoto.p2p.SidecarService.PublishAttestation:input_type -> nakamoto.p2p.TipAttestation
-	2,  // 8: nakamoto.p2p.SidecarService.PublishRumor:input_type -> nakamoto.p2p.Rumor
-	3,  // 9: nakamoto.p2p.SidecarService.PublishMetagraphBinary:input_type -> nakamoto.p2p.MetagraphBinary
-	6,  // 10: nakamoto.p2p.SidecarService.Subscribe:input_type -> nakamoto.p2p.SubscribeRequest
-	7,  // 11: nakamoto.p2p.SidecarService.PeerCount:input_type -> nakamoto.p2p.PeerCountRequest
-	9,  // 12: nakamoto.p2p.SidecarService.Health:input_type -> nakamoto.p2p.HealthRequest
-	12, // 13: nakamoto.p2p.ChainSyncOutbound.FetchSnapshots:input_type -> nakamoto.p2p.FetchSnapshotsRequest
-	21, // 14: nakamoto.p2p.ChainSyncOutbound.FetchByRange:input_type -> nakamoto.p2p.FetchByRangeRequest
-	13, // 15: nakamoto.p2p.ChainSyncOutbound.FindIntersection:input_type -> nakamoto.p2p.FindIntersectionRequest
-	15, // 16: nakamoto.p2p.ChainSyncOutbound.GetPeerTip:input_type -> nakamoto.p2p.GetPeerTipRequest
-	22, // 17: nakamoto.p2p.ChainSyncOutbound.ListPeers:input_type -> nakamoto.p2p.ListPeersRequest
-	17, // 18: nakamoto.p2p.ChainSyncInbound.ServeSnapshots:input_type -> nakamoto.p2p.ServeSnapshotsRequest
-	21, // 19: nakamoto.p2p.ChainSyncInbound.ServeByRange:input_type -> nakamoto.p2p.FetchByRangeRequest
-	18, // 20: nakamoto.p2p.ChainSyncInbound.ServeChainPoints:input_type -> nakamoto.p2p.ServeChainPointsRequest
-	5,  // 21: nakamoto.p2p.SidecarService.PublishSnapshot:output_type -> nakamoto.p2p.PublishResponse
-	5,  // 22: nakamoto.p2p.SidecarService.PublishAttestation:output_type -> nakamoto.p2p.PublishResponse
-	5,  // 23: nakamoto.p2p.SidecarService.PublishRumor:output_type -> nakamoto.p2p.PublishResponse
-	5,  // 24: nakamoto.p2p.SidecarService.PublishMetagraphBinary:output_type -> nakamoto.p2p.PublishResponse
-	4,  // 25: nakamoto.p2p.SidecarService.Subscribe:output_type -> nakamoto.p2p.GossipMessage
-	8,  // 26: nakamoto.p2p.SidecarService.PeerCount:output_type -> nakamoto.p2p.PeerCountResponse
-	10, // 27: nakamoto.p2p.SidecarService.Health:output_type -> nakamoto.p2p.HealthResponse
-	0,  // 28: nakamoto.p2p.ChainSyncOutbound.FetchSnapshots:output_type -> nakamoto.p2p.Snapshot
-	20, // 29: nakamoto.p2p.ChainSyncOutbound.FetchByRange:output_type -> nakamoto.p2p.BackfillSnapshot
-	14, // 30: nakamoto.p2p.ChainSyncOutbound.FindIntersection:output_type -> nakamoto.p2p.FindIntersectionResponse
-	16, // 31: nakamoto.p2p.ChainSyncOutbound.GetPeerTip:output_type -> nakamoto.p2p.PeerTipResponse
-	23, // 32: nakamoto.p2p.ChainSyncOutbound.ListPeers:output_type -> nakamoto.p2p.ListPeersResponse
-	0,  // 33: nakamoto.p2p.ChainSyncInbound.ServeSnapshots:output_type -> nakamoto.p2p.Snapshot
-	20, // 34: nakamoto.p2p.ChainSyncInbound.ServeByRange:output_type -> nakamoto.p2p.BackfillSnapshot
-	19, // 35: nakamoto.p2p.ChainSyncInbound.ServeChainPoints:output_type -> nakamoto.p2p.ServeChainPointsResponse
-	21, // [21:36] is the sub-list for method output_type
-	6,  // [6:21] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	4,  // 4: nakamoto.p2p.GossipMessage.metagraph_attestation:type_name -> nakamoto.p2p.MetagraphAttestation
+	12, // 5: nakamoto.p2p.FindIntersectionRequest.points:type_name -> nakamoto.p2p.ChainPoint
+	12, // 6: nakamoto.p2p.ServeChainPointsResponse.points:type_name -> nakamoto.p2p.ChainPoint
+	0,  // 7: nakamoto.p2p.SidecarService.PublishSnapshot:input_type -> nakamoto.p2p.Snapshot
+	1,  // 8: nakamoto.p2p.SidecarService.PublishAttestation:input_type -> nakamoto.p2p.TipAttestation
+	2,  // 9: nakamoto.p2p.SidecarService.PublishRumor:input_type -> nakamoto.p2p.Rumor
+	3,  // 10: nakamoto.p2p.SidecarService.PublishMetagraphBinary:input_type -> nakamoto.p2p.MetagraphBinary
+	4,  // 11: nakamoto.p2p.SidecarService.PublishMetagraphAttestation:input_type -> nakamoto.p2p.MetagraphAttestation
+	7,  // 12: nakamoto.p2p.SidecarService.Subscribe:input_type -> nakamoto.p2p.SubscribeRequest
+	8,  // 13: nakamoto.p2p.SidecarService.PeerCount:input_type -> nakamoto.p2p.PeerCountRequest
+	10, // 14: nakamoto.p2p.SidecarService.Health:input_type -> nakamoto.p2p.HealthRequest
+	13, // 15: nakamoto.p2p.ChainSyncOutbound.FetchSnapshots:input_type -> nakamoto.p2p.FetchSnapshotsRequest
+	22, // 16: nakamoto.p2p.ChainSyncOutbound.FetchByRange:input_type -> nakamoto.p2p.FetchByRangeRequest
+	14, // 17: nakamoto.p2p.ChainSyncOutbound.FindIntersection:input_type -> nakamoto.p2p.FindIntersectionRequest
+	16, // 18: nakamoto.p2p.ChainSyncOutbound.GetPeerTip:input_type -> nakamoto.p2p.GetPeerTipRequest
+	23, // 19: nakamoto.p2p.ChainSyncOutbound.ListPeers:input_type -> nakamoto.p2p.ListPeersRequest
+	18, // 20: nakamoto.p2p.ChainSyncInbound.ServeSnapshots:input_type -> nakamoto.p2p.ServeSnapshotsRequest
+	22, // 21: nakamoto.p2p.ChainSyncInbound.ServeByRange:input_type -> nakamoto.p2p.FetchByRangeRequest
+	19, // 22: nakamoto.p2p.ChainSyncInbound.ServeChainPoints:input_type -> nakamoto.p2p.ServeChainPointsRequest
+	6,  // 23: nakamoto.p2p.SidecarService.PublishSnapshot:output_type -> nakamoto.p2p.PublishResponse
+	6,  // 24: nakamoto.p2p.SidecarService.PublishAttestation:output_type -> nakamoto.p2p.PublishResponse
+	6,  // 25: nakamoto.p2p.SidecarService.PublishRumor:output_type -> nakamoto.p2p.PublishResponse
+	6,  // 26: nakamoto.p2p.SidecarService.PublishMetagraphBinary:output_type -> nakamoto.p2p.PublishResponse
+	6,  // 27: nakamoto.p2p.SidecarService.PublishMetagraphAttestation:output_type -> nakamoto.p2p.PublishResponse
+	5,  // 28: nakamoto.p2p.SidecarService.Subscribe:output_type -> nakamoto.p2p.GossipMessage
+	9,  // 29: nakamoto.p2p.SidecarService.PeerCount:output_type -> nakamoto.p2p.PeerCountResponse
+	11, // 30: nakamoto.p2p.SidecarService.Health:output_type -> nakamoto.p2p.HealthResponse
+	0,  // 31: nakamoto.p2p.ChainSyncOutbound.FetchSnapshots:output_type -> nakamoto.p2p.Snapshot
+	21, // 32: nakamoto.p2p.ChainSyncOutbound.FetchByRange:output_type -> nakamoto.p2p.BackfillSnapshot
+	15, // 33: nakamoto.p2p.ChainSyncOutbound.FindIntersection:output_type -> nakamoto.p2p.FindIntersectionResponse
+	17, // 34: nakamoto.p2p.ChainSyncOutbound.GetPeerTip:output_type -> nakamoto.p2p.PeerTipResponse
+	24, // 35: nakamoto.p2p.ChainSyncOutbound.ListPeers:output_type -> nakamoto.p2p.ListPeersResponse
+	0,  // 36: nakamoto.p2p.ChainSyncInbound.ServeSnapshots:output_type -> nakamoto.p2p.Snapshot
+	21, // 37: nakamoto.p2p.ChainSyncInbound.ServeByRange:output_type -> nakamoto.p2p.BackfillSnapshot
+	20, // 38: nakamoto.p2p.ChainSyncInbound.ServeChainPoints:output_type -> nakamoto.p2p.ServeChainPointsResponse
+	23, // [23:39] is the sub-list for method output_type
+	7,  // [7:23] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_proto_sidecar_proto_init() }
@@ -1700,11 +1909,12 @@ func file_proto_sidecar_proto_init() {
 	if File_proto_sidecar_proto != nil {
 		return
 	}
-	file_proto_sidecar_proto_msgTypes[4].OneofWrappers = []any{
+	file_proto_sidecar_proto_msgTypes[5].OneofWrappers = []any{
 		(*GossipMessage_Snapshot)(nil),
 		(*GossipMessage_Attestation)(nil),
 		(*GossipMessage_Rumor)(nil),
 		(*GossipMessage_MetagraphBinary)(nil),
+		(*GossipMessage_MetagraphAttestation)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -1712,7 +1922,7 @@ func file_proto_sidecar_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_sidecar_proto_rawDesc), len(file_proto_sidecar_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   24,
+			NumMessages:   25,
 			NumExtensions: 0,
 			NumServices:   3,
 		},

@@ -83,10 +83,11 @@ func init() {
 
 // TopicSet holds the GossipSub topics for gauge collection.
 type TopicSet struct {
-	Snapshot        *pubsub.Topic
-	Attestation     *pubsub.Topic
-	Rumor           *pubsub.Topic
-	MetagraphBinary *pubsub.Topic
+	Snapshot             *pubsub.Topic
+	Attestation          *pubsub.Topic
+	Rumor                *pubsub.Topic
+	MetagraphBinary      *pubsub.Topic
+	MetagraphAttestation *pubsub.Topic
 }
 
 // StartGaugeUpdater launches a background goroutine that periodically updates
@@ -104,6 +105,9 @@ func StartGaugeUpdater(ctx context.Context, h host.Host, kadDHT *dht.IpfsDHT, to
 			MeshPeers.WithLabelValues("rumor").Set(float64(len(topics.Rumor.ListPeers())))
 			if topics.MetagraphBinary != nil {
 				MeshPeers.WithLabelValues("metagraph_binary").Set(float64(len(topics.MetagraphBinary.ListPeers())))
+			}
+			if topics.MetagraphAttestation != nil {
+				MeshPeers.WithLabelValues("metagraph_attestation").Set(float64(len(topics.MetagraphAttestation.ListPeers())))
 			}
 
 			// Total connected peers

@@ -15,22 +15,27 @@ import weaver.SimpleIOSuite
 /** Tests for [[CommitteeSortition]] — the per-metagraph committee VRF-threshold primitive.
   *
   * Coverage matches §10 of the design doc (`docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md`):
-  *   1. Determinism — same inputs → same proof bytes & in/out result.
-  *   2. Domain separation — committee VRF doesn't collide with leader VRF (same `(eta, sk)` but different
-  *      consensus role).
-  *   3. Per-metagraph isolation — same `(eta, sk, snapshotOrd)` across different metagraphs gives
-  *      independent draws.
-  *   4. Per-snapshot rotation — committee changes per snapshot ordinal.
-  *   5. Verify roundtrip — proof produced by `isInCommittee` passes `verifyMembership`.
-  *   6. Negative tests — wrong VK / tampered proof / wrong metagraph / wrong eta → reject.
-  *   7. Threshold edge cases — σ=0 always out, K·σ ≥ 1 always in, K=0 forbidden.
-  *   8. Statistical inclusion rate — over many draws, mean committee size ≈ K · Σσ.
+  *   1. Determinism — same inputs → same proof bytes & in/out result. 2. Domain separation — committee VRF doesn't collide with leader VRF
+  *      (same `(eta, sk)` but different consensus role). 3. Per-metagraph isolation — same `(eta, sk, snapshotOrd)` across different
+  *      metagraphs gives independent draws. 4. Per-snapshot rotation — committee changes per snapshot ordinal. 5. Verify roundtrip — proof
+  *      produced by `isInCommittee` passes `verifyMembership`. 6. Negative tests — wrong VK / tampered proof / wrong metagraph / wrong eta
+  *      → reject. 7. Threshold edge cases — σ=0 always out, K·σ ≥ 1 always in, K=0 forbidden. 8. Statistical inclusion rate — over many
+  *      draws, mean committee size ≈ K · Σσ.
   */
 object CommitteeSortitionSuite extends SimpleIOSuite {
 
   private val vrf = new EcVrf25519()
   private val sortition: CommitteeSortition[IO] = CommitteeSortition.make[IO]
-  private val random = new SecureRandom()
+  // Deterministic SHA1PRNG so the statistical inclusion-rate test is reproducible across CI runs.
+  // `SecureRandom.getInstance("SHA1PRNG")` then setSeed BEFORE any draw makes the byte stream a pure
+  // function of the seed (default constructor mixes in /dev/(u)random first, which would only
+  // append). The VRF determinism tests don't depend on this, but the Chernoff-sanity test at K=50
+  // has a ~10⁻⁵ tail-deviation probability per run; pinning the seed keeps the tolerance tight.
+  private val random = {
+    val r = SecureRandom.getInstance("SHA1PRNG")
+    r.setSeed(0x53_4f_52_54_49_54_49L) // ASCII "SORTITI"
+    r
+  }
 
   private def randomSk(): Array[Byte] = {
     val sk = new Array[Byte](32)
@@ -101,7 +106,6 @@ object CommitteeSortitionSuite extends SimpleIOSuite {
   // ============ Per-metagraph isolation ============
 
   test("different metagraph addresses produce independent committee draws") {
-    val sk = randomSk()
     val eta = randomEta()
     val addrA = metagraphAddr("metagraph-A")
     val addrB = metagraphAddr("metagraph-B")
@@ -124,10 +128,11 @@ object CommitteeSortitionSuite extends SimpleIOSuite {
     for {
       r1 <- sortition.isInCommittee(sk, eta, addr, 1L, sigma, k)
       r2 <- sortition.isInCommittee(sk, eta, addr, 2L, sigma, k)
-    } yield (r1, r2) match {
-      case (Some((_, o1)), Some((_, o2))) => expect(!o1.sameElements(o2))
-      case _ => success // not both selected — that's fine, this test only asserts output divergence when both fire
-    }
+    } yield
+      (r1, r2) match {
+        case (Some((_, o1)), Some((_, o2))) => expect(!o1.sameElements(o2))
+        case _ => success // not both selected — that's fine, this test only asserts output divergence when both fire
+      }
   }
 
   // ============ Verify roundtrip ============
