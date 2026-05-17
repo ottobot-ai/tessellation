@@ -5,11 +5,9 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.pro
 import com.google.protobuf.ByteString
 import weaver.SimpleIOSuite
 
-/** §1.2 Slice 4 — schema-only roundtrip checks for the new `kes_signature` field on
-  * `pb.TipAttestation` and `pb.Snapshot`. The sender side does not populate this field yet
-  * (Slice 6 will); the receiver side does not verify it yet (Slice 5 will). All we assert
-  * here is that the scalapb-generated codec preserves the field across `toByteArray` /
-  * `parseFrom` so that future sender + receiver paths can rely on it.
+/** §1.2 Slice 4 — schema-only roundtrip checks for the new `kes_signature` field on `pb.TipAttestation` and `pb.Snapshot`. The sender side
+  * does not populate this field yet (Slice 6 will); the receiver side does not verify it yet (Slice 5 will). All we assert here is that the
+  * scalapb-generated codec preserves the field across `toByteArray` / `parseFrom` so that future sender + receiver paths can rely on it.
   */
 object SidecarProtoKesSignatureSuite extends SimpleIOSuite {
 

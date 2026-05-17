@@ -9,8 +9,8 @@ import io.constellationnetwork.security.hex.Hex
 
 import weaver.SimpleIOSuite
 
-/** Round-trip tests for `L0GenesisLoader.buildKesRegistry` — the Slice 3 entry point that turns the optional `kesRegistrations` field of
-  * an L0 genesis fixture into a runtime `KesRegistry[F]`.
+/** Round-trip tests for `L0GenesisLoader.buildKesRegistry` — the Slice 3 entry point that turns the optional `kesRegistrations` field of an
+  * L0 genesis fixture into a runtime `KesRegistry[F]`.
   */
 object KesRegistryLoaderSuite extends SimpleIOSuite {
 
