@@ -8,12 +8,12 @@ import cats.syntax.functor._
 import scala.collection.immutable.SortedMap
 
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.StateChannelEvent
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
 import io.constellationnetwork.node.shared.domain.statechannel.{FeeCalculator, FeeCalculatorConfig}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.currencyMessage.fetchStakingAddress
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 
 import eu.timepit.refined.types.numeric.{NonNegInt, NonNegLong}
 
@@ -24,9 +24,9 @@ trait SnapshotBinaryFeeCalculator[F[_]] {
 object SnapshotBinaryFeeCalculator {
   def make[F[_]: Async](
     configs: SortedMap[SnapshotOrdinal, FeeCalculatorConfig],
-    mptStore: MptStore[F, GlobalStateKey]
+    reader: GlobalStateReader[F]
   ): SnapshotBinaryFeeCalculator[F] =
-    make(FeeCalculator.make[F](configs), mptStore)
+    make(FeeCalculator.make[F](configs), reader)
 
   // Staking balance note: for metagraphs with only a full snapshot (Left case in the old
   // lastCurrencySnapshots), getCurrencySnapshotInfo returns CurrencySnapshotInfo with
@@ -35,14 +35,14 @@ object SnapshotBinaryFeeCalculator {
   // for Left(fullSnapshot).
   def make[F[_]: Async](
     feeCalculator: FeeCalculator[F],
-    mptStore: MptStore[F, GlobalStateKey]
+    reader: GlobalStateReader[F]
   ): SnapshotBinaryFeeCalculator[F] =
     (event: StateChannelEvent, ordinal: SnapshotOrdinal) =>
       for {
-        maybeCurrencyInfo <- mptStore.getCurrencySnapshotInfo(event.value.address)
+        maybeCurrencyInfo <- reader.getCurrencySnapshotInfo(event.value.address)
         stakingAddr = maybeCurrencyInfo.flatMap(fetchStakingAddress)
         balance <- stakingAddr.fold(Balance.empty.pure[F]) { addr =>
-          mptStore.getBalance(addr).map(_.getOrElse(Balance.empty))
+          reader.getBalance(addr).map(_.getOrElse(Balance.empty))
         }
         result <- {
           val binary = event.value.snapshotBinary.value

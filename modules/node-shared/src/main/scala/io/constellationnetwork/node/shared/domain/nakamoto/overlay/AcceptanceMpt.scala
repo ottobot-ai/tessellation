@@ -62,6 +62,30 @@ object GlobalStateReader {
       currentParent.flatMap(p => overlay.getAllForPrefix[V](p, prefix))
   }
 
+  /** GL0 HTTP / read-path constructor (#117/#118 Phase 2). Reads at the chain's current best tip so callers see the canonical
+    * pending-or-base view — under `OverlayMode.MultiBranch` the chain's pending writes haven't landed in the underlying base yet, and
+    * legacy `MptStore` reads would lag by `finalizeBranch.foldIntoBase` cycles (~5s healthy, minutes under finality stalls). When
+    * `bestTipBranchF` resolves to `None` (pre-bootstrap window or follower with no chain store), reads fall back to `BranchId.base`, which
+    * the multi-branch overlay resolves directly to the underlying `MptStore` (no pending walk). Under `OverlayMode.Passthrough` the
+    * `BranchId` is ignored on every read, so `pending` collapses to base-equivalent reads.
+    *
+    * Followers (gl1/cl1/dl1/ml0) MUST NOT call this — they should construct `finalized` instead, since per-layer rule says followers see
+    * only finalized gl0 state. Compile-time guard: a follower module has no `MptOverlay` in scope at its `Services.make`, so it cannot
+    * construct `pending`.
+    */
+  def pending[F[_]: cats.Monad](
+    overlay: MptOverlay[F, GlobalStateKey],
+    bestTipBranchF: F[Option[BranchId]]
+  ): GlobalStateReader[F] =
+    dynamic[F](overlay, cats.Functor[F].map(bestTipBranchF)(_.getOrElse(BranchId.base)))
+
+  /** Follower read-path constructor (#117/#118 Phase 2). Reads from the finalized base `MptStore` directly — equivalent to `fromMptStore`.
+    * Provided as a named factory so call sites in follower modules (gl1/cl1/dl1/ml0) make the "finalized-only" choice explicit at
+    * construction time and don't accidentally pick up overlay-pending state. Has the same type as `pending` but no `MptOverlay` dependency.
+    */
+  def finalized[F[_]](store: MptStore[F, GlobalStateKey]): GlobalStateReader[F] =
+    fromMptStore[F](store)
+
   /** Empty reader that always returns no values. Used by tests / wirings where no MPT is available — equivalent to "no prior state". */
   def empty[F[_]: cats.Applicative]: GlobalStateReader[F] = new GlobalStateReader[F] {
     def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]] = cats.Applicative[F].pure(None)

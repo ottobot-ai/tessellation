@@ -11,6 +11,7 @@ import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.StateChannelEvent
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.statechannel.FeeCalculatorConfig
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
@@ -217,7 +218,7 @@ object SnapshotBinaryFeeCalculatorSuite extends MutableIOSuite with Checkers {
       case (input, stateChannelEvent, _) =>
         val info = GlobalSnapshotInfo.empty.copy(balances = SortedMap(stakingAddress -> input.balance))
         mkMptStore(info).flatMap { mptStore =>
-          val calculator = SnapshotBinaryFeeCalculator.make[IO](configs, mptStore)
+          val calculator = SnapshotBinaryFeeCalculator.make[IO](configs, GlobalStateReader.finalized[IO](mptStore))
           calculator
             .calculateFee(stateChannelEvent, SnapshotOrdinal.MinValue)
             .map(actual => expect.same(input.expectedFeeWithoutBalance, actual))
@@ -234,7 +235,7 @@ object SnapshotBinaryFeeCalculatorSuite extends MutableIOSuite with Checkers {
           lastCurrencySnapshots = lastCurrencySnapshots
         )
         mkMptStore(info).flatMap { mptStore =>
-          val calculator = SnapshotBinaryFeeCalculator.make[IO](configs, mptStore)
+          val calculator = SnapshotBinaryFeeCalculator.make[IO](configs, GlobalStateReader.finalized[IO](mptStore))
           calculator
             .calculateFee(stateChannelEvent, SnapshotOrdinal.MinValue)
             .map(actual => expect.same(input.expectedFeeWithoutBalance, actual))
@@ -251,7 +252,7 @@ object SnapshotBinaryFeeCalculatorSuite extends MutableIOSuite with Checkers {
           lastCurrencySnapshots = lastCurrencySnapshots
         )
         mkMptStore(info).flatMap { mptStore =>
-          val calculator = SnapshotBinaryFeeCalculator.make[IO](configs, mptStore)
+          val calculator = SnapshotBinaryFeeCalculator.make[IO](configs, GlobalStateReader.finalized[IO](mptStore))
           calculator
             .calculateFee(stateChannelEvent, SnapshotOrdinal.MinValue)
             .map(actual => expect.same(input.expectedFeeWithoutBalance, actual))
@@ -268,7 +269,7 @@ object SnapshotBinaryFeeCalculatorSuite extends MutableIOSuite with Checkers {
           lastCurrencySnapshots = lastCurrencySnapshots
         )
         mkMptStore(info).flatMap { mptStore =>
-          val calculator = SnapshotBinaryFeeCalculator.make[IO](configs, mptStore)
+          val calculator = SnapshotBinaryFeeCalculator.make[IO](configs, GlobalStateReader.finalized[IO](mptStore))
           calculator
             .calculateFee(stateChannelEvent, SnapshotOrdinal.MinValue)
             .map(actual => expect.same(input.expectedFeeWithBalance, actual))

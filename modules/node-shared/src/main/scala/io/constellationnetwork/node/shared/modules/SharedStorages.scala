@@ -70,6 +70,19 @@ object SharedStorages {
       bestTipsFnRef <- Ref.of[F, F[Set[BranchId]]](
         lastGlobalSnapshotStorage.get.map(_.map(hashed => BranchId(hashed.hash)).toSet)
       )
+      // `bestTipFn` for `GlobalStateReader.pending` (#117/#118 Phase 2). The single canonical
+      // bestTip — under MultiBranch the chain's pending writes live under this branch, so HTTP /
+      // service reads via the `pending` reader walk this branch first and fall through to base on
+      // miss. Default reads the last accepted global snapshot's hash, which is correct for layers
+      // that don't have a `NakamotoChainStore` (followers never construct the `pending` reader, so
+      // they never hit this default through that path either — it's only here so the default is
+      // sensible if some code path constructs `pending` on a follower in error). dag-l0 overrides
+      // via `setBestTipFn(chainStore.bestTip...)` once `NakamotoChainStore` is built, so the
+      // reader sees the chain's true canonical tip across reorgs (not just the most-recently
+      // accepted snapshot, which may not be on the canonical chain during fork recovery).
+      bestTipFnRef <- Ref.of[F, F[Option[BranchId]]](
+        lastGlobalSnapshotStorage.get.map(_.map(hashed => BranchId(hashed.hash)))
+      )
       mptOverlay <- MptOverlay.make[F, GlobalStateKey](
         // Phase J landed two of three prerequisites for MultiBranch:
         //   1. ✅ `overlay.commit(handle, BranchId(snapshotHash), ordinal)` is now called by the proposer
@@ -113,7 +126,9 @@ object SharedStorages {
         lastGlobalSnapshot = lastGlobalSnapshotStorage,
         mptStore = mptStore,
         mptOverlay = mptOverlay,
-        setBestTipsFn = bestTipsFnRef.set
+        setBestTipsFn = bestTipsFnRef.set,
+        bestTipFn = bestTipFnRef.get.flatten,
+        setBestTipFn = bestTipFnRef.set
       ) {}
 }
 
@@ -132,5 +147,12 @@ sealed abstract class SharedStorages[F[_]] private (
   // from the dag-l0 wiring layer once the chain store is constructed; layers without a chain
   // store never call this and the overlay sees the lastGlobalSnapshot-derived singleton set
   // from the default in `make`.
-  val setBestTipsFn: F[Set[BranchId]] => F[Unit]
+  val setBestTipsFn: F[Set[BranchId]] => F[Unit],
+  // Reader-tip for `GlobalStateReader.pending` (#117/#118 Phase 2). Reads the chain's canonical
+  // best tip — used by gl0 HTTP / read paths to pick up the chain's pending writes that haven't
+  // been folded into base yet (the overlay walks pending → base on miss). Mirrors the
+  // `setBestTipsFn` pattern: dag-l0 overrides via `setBestTipFn(chainStore.bestTip...)` once
+  // `NakamotoChainStore` is built. The default reads `lastGlobalSnapshot.get.hash`.
+  val bestTipFn: F[Option[BranchId]],
+  val setBestTipFn: F[Option[BranchId]] => F[Unit]
 )

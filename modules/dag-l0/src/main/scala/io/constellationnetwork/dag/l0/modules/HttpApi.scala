@@ -209,7 +209,7 @@ sealed abstract class HttpApi[
         storages.node,
         delegatedStakingWithdrawalTimeLimit,
         services.rewards.rewardsInfoStorage,
-        storages.mptStore
+        services.pendingReader
       )
     }
   private val nodeCollateralsRoutes = HasherSelector[F].withCurrent { implicit hasher =>
@@ -219,7 +219,7 @@ sealed abstract class HttpApi[
       storages.globalSnapshot,
       storages.node,
       delegatedStakingWithdrawalTimeLimit,
-      storages.mptStore
+      services.pendingReader
     )
   }
   private val tokenLockRoutes = GL0TokenLockRoutes(storages.globalSnapshot, storages.mptStore)

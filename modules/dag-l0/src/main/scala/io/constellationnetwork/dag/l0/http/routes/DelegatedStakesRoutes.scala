@@ -4,12 +4,14 @@ import cats.data.Validated.{Invalid, Valid}
 import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.immutable.{SortedMap, SortedSet}
+import scala.collection.immutable.SortedSet
 
 import io.constellationnetwork.dag.l0.domain.delegatedStake.{CreateDelegatedStakeOutput, DelegatedStakeOutput, WithdrawDelegatedStakeOutput}
 import io.constellationnetwork.ext.http4s.AddressVar
 import io.constellationnetwork.kernel._
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeValidator
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.node.shared.infrastructure.delegatedStake.RewardsInfoStorage
@@ -20,8 +22,6 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
@@ -43,7 +43,7 @@ final case class DelegatedStakesRoutes[F[_]: Async: Hasher](
   nodeStorage: NodeStorage[F],
   withdrawalTimeLimit: EpochProgress,
   rewardsInfoStorage: RewardsInfoStorage[F],
-  mptStore: MptStore[F, GlobalStateKey]
+  reader: GlobalStateReader[F]
 ) extends Http4sDsl[F]
     with PublicRoutes[F] {
 
@@ -55,8 +55,8 @@ final case class DelegatedStakesRoutes[F[_]: Async: Hasher](
 
   private def getDelegatedStakesInfo(address: Address): F[DelegatedStakesInfo] =
     for {
-      lastStakes <- mptStore.getDelegatedStakes(address).map(_.getOrElse(SortedSet.empty[DelegatedStakeRecord]))
-      lastWithdrawals <- mptStore.getDelegatedStakeWithdrawals(address).map(_.getOrElse(SortedSet.empty[PendingDelegatedStakeWithdrawal]))
+      lastStakes <- reader.getDelegatedStakes(address).map(_.getOrElse(SortedSet.empty[DelegatedStakeRecord]))
+      lastWithdrawals <- reader.getDelegatedStakeWithdrawals(address).map(_.getOrElse(SortedSet.empty[PendingDelegatedStakeWithdrawal]))
       stakes <- lastStakes.toList.traverse {
         case record: DelegatedStakeRecord =>
           DelegatedStakeReference
@@ -128,7 +128,7 @@ final case class DelegatedStakesRoutes[F[_]: Async: Hasher](
   private def getLastReference(
     address: Address
   ): F[DelegatedStakeReference] =
-    mptStore.getDelegatedStakes(address).flatMap { maybeDelegatedStakes =>
+    reader.getDelegatedStakes(address).flatMap { maybeDelegatedStakes =>
       maybeDelegatedStakes
         .getOrElse(SortedSet.empty[DelegatedStakeRecord])
         .toList

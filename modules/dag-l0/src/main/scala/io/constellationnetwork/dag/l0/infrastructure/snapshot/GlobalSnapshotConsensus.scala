@@ -140,6 +140,17 @@ object GlobalSnapshotConsensus {
     // (#56.9). Returns the FULL set of fork tips, not just bestTip — protects canonical chain
     // ancestors during fork-recovery (#115) when the local-fork chain is bestTip.
     setBestTipsFn: F[Set[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId]] => F[Unit],
+    // #117/#118 Phase 2: setter on `SharedStorages` for `GlobalStateReader.pending`'s bestTipFn.
+    // Distinct from `setBestTipsFn` (used by overlay eviction): this returns the single canonical
+    // bestTip so HTTP reads via the `pending` reader resolve to the canonical chain head (not a
+    // tentative fork head). Wired below once `chainStore` exists; the default in SharedStorages
+    // reads `lastGlobalSnapshot.head.hash` which lags during fork recovery, hence the override.
+    setBestTipFn: F[Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId]] => F[Unit],
+    // #117/#118 Phase 2: branch-aware reader used by the snapshot binary fee calculator (and
+    // any consensus-internal call site that needs read access at the chain's bestTip). Under
+    // MultiBranch this picks up the chain's pending writes; the legacy `mptStore` path saw
+    // base-only and could miscalculate fees during finality stalls (#117 root cause).
+    pendingReader: io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[F],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     eventGossipClient: EventGossipClient[F, GlobalSnapshotEvent],
     loggerBundle: LoggerBundle[F],
@@ -252,7 +263,7 @@ object GlobalSnapshotConsensus {
           rewardsService,
           GlobalSnapshotEventCutter.make(
             appConfig.snapshot.consensus.eventCutter.maxBinarySizeBytes,
-            SnapshotBinaryFeeCalculator.make(appConfig.shared.feeConfigs, mptStore)
+            SnapshotBinaryFeeCalculator.make(appConfig.shared.feeConfigs, pendingReader)
           ),
           UpdateNodeParametersCutter.make(appConfig.snapshot.consensus.eventCutter.maxUpdateNodeParametersSize),
           appConfig.environment,
@@ -549,6 +560,17 @@ object GlobalSnapshotConsensus {
           _ <- setBestTipsFn(
             chainStore.allTips.map(
               _.map(io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(_))
+            )
+          ).toResource
+          // #117/#118 Phase 2: install the chain's canonical bestTip as the source for
+          // `GlobalStateReader.pending`'s `bestTipBranchF`. Under MultiBranch the chain's
+          // pending writes live under this branch; the reader walks pending → falls through
+          // to base, so HTTP reads see the canonical view (not the lagging base). When
+          // `chainStore.bestTip` is empty (pre-genesis-seed window), the reader falls back
+          // to `BranchId.base` which resolves to the underlying `MptStore`.
+          _ <- setBestTipFn(
+            chainStore.bestTip.map(
+              _.map(stored => io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(stored.hash))
             )
           ).toResource
           // #56.10 Phase H: startup base-consistency guard. Runs in the boot Resource chain

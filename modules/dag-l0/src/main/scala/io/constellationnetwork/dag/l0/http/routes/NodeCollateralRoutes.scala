@@ -4,11 +4,13 @@ import cats.data.Validated.{Invalid, Valid}
 import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.immutable.{SortedMap, SortedSet}
+import scala.collection.immutable.SortedSet
 
 import io.constellationnetwork.dag.l0.domain.nodeCollateral.{CreateNodeCollateralOutput, NodeCollateralOutput, WithdrawNodeCollateralOutput}
 import io.constellationnetwork.ext.http4s.AddressVar
 import io.constellationnetwork.kernel._
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.nodeCollateral.UpdateNodeCollateralValidator
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
@@ -16,8 +18,6 @@ import io.constellationnetwork.routes.internal._
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.Hasher
@@ -39,7 +39,7 @@ final case class NodeCollateralRoutes[F[_]: Async: Hasher](
   snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
   nodeStorage: NodeStorage[F],
   withdrawalTimeLimit: EpochProgress,
-  mptStore: MptStore[F, GlobalStateKey]
+  reader: GlobalStateReader[F]
 ) extends Http4sDsl[F]
     with PublicRoutes[F] {
 
@@ -51,8 +51,8 @@ final case class NodeCollateralRoutes[F[_]: Async: Hasher](
 
   private def getNodeCollateralInfo(address: Address): F[NodeCollateralsInfo] =
     for {
-      lastCollaterals <- mptStore.getNodeCollaterals(address).map(_.getOrElse(SortedSet.empty[NodeCollateralRecord]))
-      lastWithdrawals <- mptStore.getNodeCollateralWithdrawals(address).map(_.getOrElse(SortedSet.empty[PendingNodeCollateralWithdrawal]))
+      lastCollaterals <- reader.getNodeCollaterals(address).map(_.getOrElse(SortedSet.empty[NodeCollateralRecord]))
+      lastWithdrawals <- reader.getNodeCollateralWithdrawals(address).map(_.getOrElse(SortedSet.empty[PendingNodeCollateralWithdrawal]))
     } yield {
       val active = lastCollaterals.toList.map {
         case NodeCollateralRecord(collateral, acceptedOrdinal) =>
@@ -88,7 +88,7 @@ final case class NodeCollateralRoutes[F[_]: Async: Hasher](
   private def getLastReference(
     address: Address
   ): F[NodeCollateralReference] =
-    mptStore.getNodeCollaterals(address).flatMap { maybeCollaterals =>
+    reader.getNodeCollaterals(address).flatMap { maybeCollaterals =>
       maybeCollaterals
         .getOrElse(SortedSet.empty[NodeCollateralRecord])
         .toList

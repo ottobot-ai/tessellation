@@ -15,6 +15,7 @@ import io.constellationnetwork.dag.l0.domain.nodeCollateral.NodeCollateralOutput
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.statechannel.{SnapshotFeesInfo, StateChannelValidator}
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
@@ -96,7 +97,12 @@ object StateChannelServiceSuite extends MutableIOSuite {
       unpQueue <- Queue.unbounded[IO, Signed[UpdateNodeParameters]]
       dsQueue <- Queue.unbounded[IO, DelegatedStakeOutput]
       ncQueue <- Queue.unbounded[IO, NodeCollateralOutput]
-    } yield StateChannelService.make[IO](L0Cell.mkL0Cell[IO](dagQueue, scQueue, unpQueue, dsQueue, ncQueue), validator, mptStore)
+    } yield
+      StateChannelService.make[IO](
+        L0Cell.mkL0Cell[IO](dagQueue, scQueue, unpQueue, dsQueue, ncQueue),
+        validator,
+        GlobalStateReader.finalized[IO](mptStore)
+      )
   }
 
   def mkStateChannelOutput()(implicit S: SecurityProvider[IO], H: Hasher[IO]) = for {

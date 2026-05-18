@@ -28,6 +28,7 @@ import io.constellationnetwork.node.shared.domain.cluster.services.{Cluster, Ses
 import io.constellationnetwork.node.shared.domain.collateral.Collateral
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
 import io.constellationnetwork.node.shared.domain.healthcheck.LocalHealthcheck
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityGate
 import io.constellationnetwork.node.shared.domain.snapshot.services.AddressService
@@ -131,6 +132,18 @@ object Services {
       )
       sidecarClient <- SidecarClient.makeResource[F](sidecarConfig)
 
+      // #117/#118 Phase 2: branch-aware reader over the gl0 overlay at the chain's bestTip.
+      // Used by HTTP routes and read-path services on gl0 — under MultiBranch the chain's
+      // pending writes are invisible to the underlying `MptStore` base until
+      // `finalizeBranch.foldIntoBase` lands, so a direct base read lags by attestation
+      // finality (~5s healthy) and unboundedly under finality stalls. Routing reads through
+      // the overlay at the chain's bestTip walks pending → falls through to base. Followers
+      // construct `GlobalStateReader.finalized` instead — see follower modules' Services.
+      pendingReader: GlobalStateReader[F] = GlobalStateReader.pending[F](
+        sharedStorages.mptOverlay,
+        sharedStorages.bestTipFn
+      )
+
       // stateChannelService must exist before consensus so that the Nakamoto
       // gossip daemon can route metagraph-binary gossip messages through the
       // same acceptance pipeline that the HTTP POST endpoint uses.
@@ -144,7 +157,7 @@ object Services {
             queues.nodeCollateralOutput
           ),
           validators.stateChannelValidator,
-          sharedStorages.mptStore
+          pendingReader
         )
 
       // Callback for the Nakamoto gossip daemon to process incoming metagraph
@@ -195,6 +208,8 @@ object Services {
             sharedStorages.mptStore,
             sharedStorages.mptOverlay,
             sharedStorages.setBestTipsFn,
+            sharedStorages.setBestTipFn,
+            pendingReader,
             eventMempoolService,
             eventGossipClient,
             loggerBundle,
@@ -209,9 +224,9 @@ object Services {
       addressService = AddressService.make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
         cfg.shared.addresses,
         storages.globalSnapshot,
-        Some(sharedStorages.mptStore)
+        Some(pendingReader)
       )
-      collateralService = MptStoreCollateral.make[F](cfg.collateral, sharedStorages.mptStore)
+      collateralService = MptStoreCollateral.make[F](cfg.collateral, pendingReader)
       recoveryPeerHintService <- RecoveryPeerHint.make[F].toResource
     } yield
       new Services[F, R](
@@ -228,7 +243,8 @@ object Services {
         recoveryPeerHint = recoveryPeerHintService,
         eventMempool = eventMempoolService,
         sidecarClient = sidecarClient,
-        finalityTriggerViewRef = finalityTriggerViewRef
+        finalityTriggerViewRef = finalityTriggerViewRef,
+        pendingReader = pendingReader
       ) {}
 }
 
@@ -249,5 +265,9 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   // Observability seam for /global-snapshots/{ord}/finality-triggers (#138). Set once by
   // SnapshotLeaderLoop after trigger construction; read by FinalityTriggersRoutes. The
   // route returns 503 while the Ref is empty (pre-startup window).
-  val finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]]
+  val finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
+  // #117/#118 Phase 2: branch-aware reader for gl0 HTTP routes / read paths. Resolves to the
+  // chain's bestTip under MultiBranch so reads pick up the chain's pending writes, falling
+  // through to base on miss. See `GlobalStateReader.pending` for the contract.
+  val pendingReader: GlobalStateReader[F]
 )

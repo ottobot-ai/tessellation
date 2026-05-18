@@ -5,14 +5,14 @@ import cats.syntax.flatMap._
 import cats.syntax.functor._
 
 import io.constellationnetwork.node.shared.config.types.AddressesConfig
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
 import io.constellationnetwork.node.shared.domain.snapshot.services.AddressService
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo}
 import io.constellationnetwork.schema.tokenLock.TokenLock
 import io.constellationnetwork.security.signature.Signed
@@ -21,23 +21,28 @@ import io.estatico.newtype.ops._
 
 object AddressService {
 
-  /** Only `getBalance` is migrated to MptStore for per-address O(log n) lookup. Aggregate methods (`getTotalSupply`, `getWalletCount`,
-    * `getFilteredOutTotalSupply`, `getCirculatedSupply`, `getFilteredOutCirculatedSupply`) intentionally remain on `SnapshotInfo` because
-    * they iterate all balances/token-locks/delegated-stakes and cannot benefit from key-based MptStore access.
+  /** `getBalance` is overlay-aware on gl0 (`OverlayReader.pending`) — under `OverlayMode.MultiBranch` the chain's pending writes are
+    * invisible to the underlying `MptStore` base until `finalizeBranch.foldIntoBase` lands, so HTTP reads via base lag by attestation
+    * finality (~5s healthy) and unboundedly under finality stalls (#117 saw 2m15s gaps under multi-metagraph load). Routing through the
+    * overlay at the chain's bestTip walks pending → falls through to base.
+    *
+    * Aggregate methods (`getTotalSupply`, `getWalletCount`, `getFilteredOutTotalSupply`, `getCirculatedSupply`,
+    * `getFilteredOutCirculatedSupply`) intentionally remain on `SnapshotInfo` because they iterate all
+    * balances/token-locks/delegated-stakes and cannot benefit from per-key MptStore access.
     */
   def make[F[_]: Async, S <: Snapshot, C <: SnapshotInfo[_]](
     addressCfg: AddressesConfig,
     snapshotStorage: SnapshotStorage[F, S, C],
-    maybeMptStore: Option[MptStore[F, GlobalStateKey]] = None
+    maybeReader: Option[GlobalStateReader[F]] = None
   ): AddressService[F, S] =
     new AddressService[F, S] {
 
       def getBalance(address: Address): F[Option[(Balance, SnapshotOrdinal)]] =
-        maybeMptStore match {
-          case Some(mptStore) =>
+        maybeReader match {
+          case Some(reader) =>
             snapshotStorage.head.flatMap {
               case Some((snapshot, _)) =>
-                mptStore.getBalance(address).map { maybeBalance =>
+                reader.getBalance(address).map { maybeBalance =>
                   Some((maybeBalance.getOrElse(Balance.empty), snapshot.value.ordinal))
                 }
               case None => Async[F].pure(None)
