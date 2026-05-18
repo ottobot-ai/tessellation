@@ -15,10 +15,10 @@ import org.typelevel.log4cats.Logger
   *
   * '''Why this exists (#201 / #202).''' The committee gate's KES period and the receiver-side eta both derive from "the ordinal of the
   * metagraph parent snapshot." The previous shortcut used `nakamotoFinalizedOrdinalRef` (the gl0 finalized ordinal) as a proxy, which is
-  * the wrong quantity — the gl0 finalized ordinal and the metagraph parent's ordinal are independent (the metagraph may have produced 0,
-  * 1, or many snapshots in the window since the gl0 chain last finalized). Worse, the gl0 finalized ordinal is per-peer asymmetric:
-  * different peers see different `finalizedOrdinalRef` values for the same parentHash, so the KES period they derive disagrees → KES
-  * verify fails → the gate times out.
+  * the wrong quantity — the gl0 finalized ordinal and the metagraph parent's ordinal are independent (the metagraph may have produced 0, 1,
+  * or many snapshots in the window since the gl0 chain last finalized). Worse, the gl0 finalized ordinal is per-peer asymmetric: different
+  * peers see different `finalizedOrdinalRef` values for the same parentHash, so the KES period they derive disagrees → KES verify fails →
+  * the gate times out.
   *
   * '''How it resolves.''' Reads `lastStateChannelSnapshotHashes[mg]` from the gl0 global-state MPT via the overlay-aware reader (post-#118
   * pending reader, so it picks up the chain's pending writes under MultiBranch instead of lagging behind base by `foldIntoBase`). If that
