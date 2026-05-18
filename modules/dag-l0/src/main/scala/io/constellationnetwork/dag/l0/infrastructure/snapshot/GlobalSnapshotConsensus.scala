@@ -440,6 +440,21 @@ object GlobalSnapshotConsensus {
             .getOrElse(Set(selfId))
           _ <- stakeRegistry.updateValidators(validatorPeers).toResource
           tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry).toResource
+          // Slice S3: committee sortition + per-binary attestation aggregator. The sortition is a
+          // stateless function; the aggregator holds the per-`(metagraph, parent, binary)` tally
+          // until `pruneParents` is called from the finality hook. K_target defaults to the active
+          // gl0 operator count (degenerate K=N — everyone in every committee, gate is effectively a
+          // no-op). For genuine sortition set `NAKAMOTO_COMMITTEE_K_TARGET`. The gate itself is
+          // constructed below once the operationalKeyMaker + kesRegistry are in scope.
+          // CommitteeSortition uses `Hasher[F]` to encode the canonical VRF input. The Selector's
+          // current hasher matches the message-side encoding the rest of the consensus surface
+          // uses; sortition messages aren't ordinal-bound (they key on parent hash) so picking
+          // the current hasher rather than `getForOrdinal` is correct.
+          committeeSortition = io.constellationnetwork.node.shared.domain.nakamoto.CommitteeSortition
+            .make[F](implicitly[Async[F]], HasherSelector[F].getCurrent)
+          committeeAggregator <- io.constellationnetwork.node.shared.domain.nakamoto.MetagraphAttestationAggregator
+            .make[F]
+            .toResource
           // §1.2 Slice 3c: bootstrap an OperationalKeyMaker. Two paths:
           //   - Disk-backed (production / e2e harness): if `CL_KES_SECURE_STORE_DIR` is set, open a
           //     [[io.constellationnetwork.security.kes.SecureStore.disk]] at that directory and
@@ -646,6 +661,154 @@ object GlobalSnapshotConsensus {
           _ <- io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
             .receive[F](sidecarClient.channel, rumorQueue)
             .toResource
+
+          // Slice S3: construct the committee gate. Sender path signs the per-metagraph attestation with
+          // the operator's long-term Ed25519 key + KES product key (Slice 9 path) and gossips via the
+          // sidecar; receiver path verifies all three sigs then records into the aggregator. K_target
+          // defaults to the active gl0 operator count (degenerate K=N — gate effectively a no-op except
+          // to prove the wiring works). Env override `NAKAMOTO_COMMITTEE_K_TARGET` for genuine sortition
+          // (e.g., K=4 on N=8).
+          committeeKTarget = {
+            val active = validatorPeers.size
+            sys.env.get("NAKAMOTO_COMMITTEE_K_TARGET").flatMap(_.toIntOption).getOrElse(math.max(1, active))
+          }
+          // VRF SK/VK derived from the long-term keypair via the same `VrfKeyDeriver` path the leader
+          // VRF uses. For v1 sortition uses the same VRF identity as leader election; per-operator-key
+          // VRF keys land later (#180).
+          committeeVrfKeys = {
+            val rawPrivKey: Array[Byte] = keyPair.getPrivate match {
+              case ecKey: java.security.interfaces.ECPrivateKey =>
+                val bytes = ecKey.getS.toByteArray
+                if (bytes.length > 32) bytes.drop(bytes.length - 32)
+                else if (bytes.length < 32) Array.fill(32 - bytes.length)(0.toByte) ++ bytes
+                else bytes
+              case other =>
+                other.getEncoded.takeRight(32)
+            }
+            val seed = io.constellationnetwork.security.vrf.VrfKeyDeriver.deriveVrfSeed(rawPrivKey)
+            val vk = new io.constellationnetwork.security.vrf.EcVrf25519().getVerificationKey(seed)
+            (seed, vk)
+          }
+          committeeGateLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger
+            .getLoggerFromName[F]("MetagraphCommitteeGate")
+            .pure[F]
+            .toResource
+          // KES adapter — the gate calls `signAt` with the period derived from the metagraph-parent
+          // ordinal (via `kesPeriodFor` below). The signer returns the encoded bytes; on `signAt`
+          // failure, returns empty bytes which the receiver-side gate treats as "no KES sig" and
+          // rejects. This matches the existing Slice 9 sender-failure-emits-empty pattern.
+          committeeKesSigner = new io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.KesSigner[F] {
+            def signAt(kesPeriod: Int, message: Array[Byte]): F[Array[Byte]] =
+              operationalKeyMaker.signAt(kesPeriod, message).map {
+                case Right(sig) => io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(sig)
+                case Left(_)    => Array.empty[Byte]
+              }
+          }
+          // KES verifier — reuses the Slice 9 verify path (`KesGossipVerification.verifyAttestation`)
+          // so empty/decode-fail/verify-fail/step-out-of-range → false (reject), no-registry-entry →
+          // true (Ed25519 already authenticated). Same accept matrix as TipAttestation's KES gate.
+          committeeKesVerifier = new io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.KesVerifier[F] {
+            def verify(
+              messageBytes: Array[Byte],
+              kesSigBytes: Array[Byte],
+              attesterId: io.constellationnetwork.schema.peer.PeerId,
+              attesterHex: io.constellationnetwork.security.hex.Hex,
+              kesOrdinal: Long
+            ): F[Boolean] =
+              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.KesGossipVerification
+                .verifyAttestation[F](
+                  messageBytes = messageBytes,
+                  kesSigBytes = kesSigBytes,
+                  attesterId = attesterId,
+                  attesterHex = attesterHex,
+                  tipOrdinal = kesOrdinal,
+                  kesRegistry = kesRegistry,
+                  etaRotationSnapshots = etaRotationSnapshots.toLong,
+                  logger = committeeGateLogger
+                )
+          }
+          // Publisher — wraps `sidecarClient.publishMetagraphAttestation`; failures are logged and
+          // swallowed (gossip best-effort). Receivers re-emit if the publish lost in the libp2p mesh,
+          // matching the existing fire-and-forget pattern for `publishAttestation`.
+          committeePublisher = new io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.Publisher[F] {
+            def publish(
+              senderPeerIdBytes: Array[Byte],
+              metagraphAddress: String,
+              parentHashBytes: Array[Byte],
+              binaryHashBytes: Array[Byte],
+              committeeVrfProof: Array[Byte],
+              longTermSignature: Array[Byte],
+              kesSignature: Array[Byte]
+            ): F[Unit] = {
+              val msg = io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
+                .mkMetagraphAttestation(
+                  peerIdBytes = senderPeerIdBytes,
+                  metagraphAddress = metagraphAddress,
+                  parentHash = parentHashBytes,
+                  binaryHash = binaryHashBytes,
+                  committeeVrfProof = committeeVrfProof,
+                  signature = longTermSignature,
+                  kesSignature = kesSignature
+                )
+              sidecarClient.publishMetagraphAttestation(msg).void.handleErrorWith { e =>
+                committeeGateLogger.warn(s"Failed to publish metagraph attestation for $metagraphAddress: ${e.getMessage}")
+              }
+            }
+          }
+          // KES period and parent-ordinal lookups. For v1 with a single metagraph + non-rotating eta,
+          // the metagraph parent ordinal is approximated by the current gl0 finalized ordinal — the
+          // KES period derived from it matches what the sender's leader VRF used for the gl0 snapshot
+          // that included this binary. Follow-up: resolve via `lastCurrencySnapshots[mg]` from the GSI.
+          committeeKesPeriodFor = (parentOrdinal: Long) =>
+            io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
+              .rotationPeriod(parentOrdinal, etaRotationSnapshots.toLong)
+              .toInt
+          committeeParentOrdinalFor = (_: io.constellationnetwork.security.hash.Hash) =>
+            nakamotoFinalizedOrdinalRef.get.map(o => Option(o.value.value))
+          committeeGate = {
+            implicit val gateLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
+            implicit val gateHasher: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+            io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.make[F](
+              selfPeerId = selfId,
+              selfVrfSk = committeeVrfKeys._1,
+              keyPair = keyPair,
+              sortition = committeeSortition,
+              aggregator = committeeAggregator,
+              kesSigner = committeeKesSigner,
+              kesVerifier = committeeKesVerifier,
+              publisher = committeePublisher,
+              kTarget = committeeKTarget,
+              gateTimeoutMs = io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.DefaultGateTimeoutMs,
+              pollIntervalMs = io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.DefaultPollIntervalMs,
+              kesPeriodFor = committeeKesPeriodFor,
+              parentOrdinalFor = committeeParentOrdinalFor
+            )
+          }
+          // Resolve eta for a metagraph-parent ordinal. For v1 we reuse the same logic the snapshot
+          // production path uses — derive period from the parent ordinal, fold over per-period VRF
+          // outputs from the chain store, fall back to `genesisEta` when no chain data yet. The
+          // receiver-side gate VRF input MUST agree with the sender's input; this resolver is the
+          // single source of truth on both sides.
+          committeeEtaForOrdinal: (Long => F[Array[Byte]]) = (parentOrdinal: Long) => {
+            val currentPeriod = io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
+              .rotationPeriod(parentOrdinal, etaRotationSnapshots.toLong)
+            if (currentPeriod <= 0) epochStateRef.get.map(_.genesisEta)
+            else
+              for {
+                genesis <- epochStateRef.get.map(_.genesisEta)
+                chainOutputs <- chainStore.vrfOutputsForPeriod(currentPeriod - 1, etaRotationSnapshots.toLong)
+              } yield
+                if (chainOutputs.nonEmpty)
+                  io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
+                    .computeEta(genesis, currentPeriod, chainOutputs.map(_._2))
+                else genesis
+          }
+
+          _ <- nakLogger
+            .info(
+              s"🏛️ Committee gate constructed: kTarget=$committeeKTarget, validatorPeers=${validatorPeers.size}, K=N (sortition no-op until K_TARGET < N)"
+            )
+            .toResource
           _ <- supervisor
             .supervise(
               io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
@@ -677,7 +840,15 @@ object GlobalSnapshotConsensus {
                   chainSyncRequestQueue = chainSyncRequestQueue,
                   finalityTriggerViewRef = finalityTriggerViewRef,
                   // §1.2 Slice 5/6: parallel-sign attestations + snapshots with KES.
-                  operationalKeyMaker = operationalKeyMaker
+                  operationalKeyMaker = operationalKeyMaker,
+                  // Slice S3: drop aggregator entries for `(mg, parent)` pairs in the finalized
+                  // snapshot's `stateChannelSnapshots`. Otherwise the tally grows monotonically.
+                  onFinalize = (snap: io.constellationnetwork.schema.GlobalIncrementalSnapshot) =>
+                    snap.stateChannelSnapshots.toList.traverse_ {
+                      case (mgAddr, binaries) =>
+                        val parents = binaries.toList.map(_.value.lastSnapshotHash).toSet
+                        committeeGate.pruneParents(mgAddr, parents)
+                    }
                 )
                 .compile
                 .drain
@@ -812,7 +983,12 @@ object GlobalSnapshotConsensus {
                   // §1.2 Slice 5/6/9: KES sender-side signing + receiver-side load-bearing verify.
                   // Always-on; no env flag — verification failures drop the message.
                   operationalKeyMaker = operationalKeyMaker,
-                  kesRegistry = kesRegistry
+                  kesRegistry = kesRegistry,
+                  // Slice S3: gate metagraph binaries on committee threshold + verify received
+                  // committee attestations against the aggregator.
+                  committeeGate = committeeGate,
+                  etaForParentOrdinal = committeeEtaForOrdinal,
+                  senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.optimisticRelativeStake(peer)
                 )
                 .compile
                 .drain

@@ -27,6 +27,12 @@ object SidecarClient {
     def publishAttestation(msg: TipAttestation): F[PublishResponse]
     def publishRumor(msg: Rumor): F[PublishResponse]
     def publishMetagraphBinary(msg: MetagraphBinary): F[PublishResponse]
+
+    /** Slice S2: publish a per-metagraph committee attestation. The Go sidecar's `PublishMetagraphAttestation` RPC was wired in S2
+      * (`de15d0b3d`); this is the JVM caller surface used by `MetagraphCommitteeGate` in S3 once the sender path goes load-bearing.
+      */
+    def publishMetagraphAttestation(msg: MetagraphAttestation): F[PublishResponse]
+
     def health: F[HealthResponse]
     def peers: F[PeerCountResponse]
     def channel: ManagedChannel
@@ -67,6 +73,9 @@ object SidecarClient {
 
       def publishMetagraphBinary(msg: MetagraphBinary): F[PublishResponse] =
         liftFuture(stub.publishMetagraphBinary(msg))
+
+      def publishMetagraphAttestation(msg: MetagraphAttestation): F[PublishResponse] =
+        liftFuture(stub.publishMetagraphAttestation(msg))
 
       def health: F[HealthResponse] =
         liftFuture(stub.health(HealthRequest()))
@@ -152,5 +161,28 @@ object SidecarClient {
     MetagraphBinary(
       address = address,
       binary = ByteString.copyFrom(binary)
+    )
+
+  /** Slice S2/S3 helper: construct a `MetagraphAttestation` proto from raw byte fields. The fields' meanings match the proto definition in
+    * `p2p/proto/sidecar.proto` — kept here so callers don't have to import the proto types directly. `kesSignature` is REQUIRED in S3
+    * (load-bearing flip); empty by default for tests that exercise the "reject empty KES" path.
+    */
+  def mkMetagraphAttestation(
+    peerIdBytes: Array[Byte],
+    metagraphAddress: String,
+    parentHash: Array[Byte],
+    binaryHash: Array[Byte],
+    committeeVrfProof: Array[Byte],
+    signature: Array[Byte],
+    kesSignature: Array[Byte] = Array.empty[Byte]
+  ): MetagraphAttestation =
+    MetagraphAttestation(
+      peerId = ByteString.copyFrom(peerIdBytes),
+      metagraphAddress = metagraphAddress,
+      parentHash = ByteString.copyFrom(parentHash),
+      binaryHash = ByteString.copyFrom(binaryHash),
+      committeeVrfProof = ByteString.copyFrom(committeeVrfProof),
+      signature = ByteString.copyFrom(signature),
+      kesSignature = ByteString.copyFrom(kesSignature)
     )
 }
