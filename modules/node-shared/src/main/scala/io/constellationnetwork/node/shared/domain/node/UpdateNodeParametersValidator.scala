@@ -10,8 +10,6 @@ import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.ext.cats.syntax.validated._
 import io.constellationnetwork.node.shared.domain.node.UpdateNodeParametersValidator.UpdateNodeParametersValidationErrorOr
 import io.constellationnetwork.schema.ID.Id
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.node.{RewardFraction, UpdateNodeParameters, UpdateNodeParametersReference}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
@@ -40,9 +38,7 @@ object UpdateNodeParametersValidator {
     minRewardValue: RewardFraction,
     maxRewardValue: RewardFraction,
     maxMetadataFieldsChars: PosInt,
-    seedList: Option[Set[SeedlistEntry]],
-    mptStore: Option[MptStore[F, GlobalStateKey]] = None,
-    shouldUseMptStore: Boolean = false
+    seedList: Option[Set[SeedlistEntry]]
   ): UpdateNodeParametersValidator[F] =
     new UpdateNodeParametersValidator[F] {
       override def validate(
@@ -120,14 +116,10 @@ object UpdateNodeParametersValidator {
       private def readPriorParams(
         peerId: Id,
         lastSnapshotContext: GlobalSnapshotInfo
-      ): F[Option[(Signed[UpdateNodeParameters], SnapshotOrdinal)]] =
-        if (shouldUseMptStore)
-          mptStore.fold(none[(Signed[UpdateNodeParameters], SnapshotOrdinal)].pure[F])(_.getUpdateNodeParameters(peerId))
-        else
-          lastSnapshotContext.updateNodeParameters
-            .getOrElse(SortedMap.empty[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)])
-            .get(peerId)
-            .pure[F]
+      ): Option[(Signed[UpdateNodeParameters], SnapshotOrdinal)] =
+        lastSnapshotContext.updateNodeParameters
+          .getOrElse(SortedMap.empty[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)])
+          .get(peerId)
 
       private def validateParent(
         signed: Signed[UpdateNodeParameters],
@@ -141,7 +133,7 @@ object UpdateNodeParametersValidator {
         def invalidParent: UpdateNodeParametersValidationErrorOr[Signed[UpdateNodeParameters]] = InvalidParent(parent).invalidNec
 
         val peerId = getPeerId(signed)
-        readPriorParams(peerId, lastSnapshotContext).flatMap {
+        readPriorParams(peerId, lastSnapshotContext) match {
           case Some((existing, _)) =>
             UpdateNodeParametersReference.of(existing).map { ref =>
               if (ref === parent)

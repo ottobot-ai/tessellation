@@ -255,7 +255,6 @@ abstract class TessellationIOApp[A <: CliMethod](
                                             Hasher.forKryo[IO],
                                             cfg.delegatedStaking,
                                             cfg.priceOracle,
-                                            Some(storages.mptStore),
                                             Some(sharedReader)
                                           )
                                         }

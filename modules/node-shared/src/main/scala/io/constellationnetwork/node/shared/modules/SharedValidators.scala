@@ -26,7 +26,6 @@ import io.constellationnetwork.node.shared.infrastructure.gossip.RumorValidator
 import io.constellationnetwork.node.shared.infrastructure.snapshot.{CurrencyMessageValidator, GlobalSnapshotSyncValidator}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.signature.SignedValidator
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
@@ -46,7 +45,6 @@ object SharedValidators {
     txHasher: Hasher[F],
     delegatedStaking: DelegatedStakingConfig,
     priceOracleConfig: PriceOracleConfig,
-    maybeMptStore: Option[MptStore[F, GlobalStateKey]] = None,
     // #198: Class-2 validator path migrated to GlobalStateReader (#118 follow-up). On gl0,
     // pass `GlobalStateReader.pending(overlay, bestTipFn)` so HTTP intake + acceptance see the
     // chain's pending writes under MultiBranch. On followers (gl1/cl1/dl1/ml0) pass
@@ -88,9 +86,7 @@ object SharedValidators {
       delegatedStaking.minRewardFraction,
       delegatedStaking.maxRewardFraction,
       delegatedStaking.maxMetadataFieldsChars,
-      l0Seedlist,
-      maybeMptStore,
-      shouldUseMptStore = false
+      l0Seedlist
     )
     val updateDelegatedStakeValidator = maybeReader match {
       case Some(reader) => UpdateDelegatedStakeValidator.make[F](signedValidator, l0Seedlist, reader)
