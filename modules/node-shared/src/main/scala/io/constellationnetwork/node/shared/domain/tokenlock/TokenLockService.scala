@@ -18,7 +18,6 @@ import io.constellationnetwork.node.shared.domain.tokenlock.ContextualTokenLockV
 import io.constellationnetwork.schema.GlobalIncrementalSnapshot
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo, StateProof}
 import io.constellationnetwork.schema.tokenLock.TokenLock
 import io.constellationnetwork.security.hash.Hash
@@ -35,28 +34,17 @@ object TokenLockService {
   def make[F[_]: Async, P <: StateProof, S <: Snapshot, SI <: SnapshotInfo[P]](
     tokenLockStorage: TokenLockStorage[F],
     lastSnapshotStorage: LastSnapshotStorage[F, S, SI] with LatestBalances[F],
-    tokenLockValidator: TokenLockValidator[F],
-    maybeMptStore: Option[MptStore[F, GlobalStateKey]] = None
+    tokenLockValidator: TokenLockValidator[F]
   ): TokenLockService[F] = new TokenLockService[F] {
-
-    import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 
     private def getBalanceAndTokenLocks(
       si: SI,
       address: io.constellationnetwork.schema.address.Address
-    ): F[(Balance, SortedSet[Signed[TokenLock]])] =
-      maybeMptStore match {
-        case Some(mptStore) =>
-          for {
-            balance <- mptStore.getBalance(address).map(_.getOrElse(Balance.empty))
-            tokenLocks <- mptStore.getActiveTokenLocks(address).map(_.getOrElse(SortedSet.empty[Signed[TokenLock]]))
-          } yield (balance, tokenLocks)
-        case None =>
-          (
-            si.balances.getOrElse(address, Balance.empty),
-            si.getActiveTokenLocks.getOrElse(address, SortedSet.empty[Signed[TokenLock]])
-          ).pure[F]
-      }
+    ): (Balance, SortedSet[Signed[TokenLock]]) =
+      (
+        si.balances.getOrElse(address, Balance.empty),
+        si.getActiveTokenLocks.getOrElse(address, SortedSet.empty[Signed[TokenLock]])
+      )
 
     def offer(
       tokenLock: Hashed[TokenLock]
@@ -91,14 +79,13 @@ object TokenLockService {
               // the answer — producing InsufficientBalance{balance:0} for
               // genesis-funded addresses. Mirror of the e7a8daa8 fix in
               // dag-l1 TransactionService: drop None emissions via `collect`,
-              // then run getBalanceAndTokenLocks on the first Some.
+              // then read (balance, activeTokenLocks) from the first Some(si).
               lastSnapshotStorage.getCombinedStream.collect {
                 case Some(value) => value
-              }.evalMap {
+              }.map {
                 case (s, si) =>
-                  getBalanceAndTokenLocks(si, tokenLock.source).map {
-                    case (balance, activeTokenLocks) => (s.ordinal, balance, activeTokenLocks)
-                  }
+                  val (balance, activeTokenLocks) = getBalanceAndTokenLocks(si, tokenLock.source)
+                  (s.ordinal, balance, activeTokenLocks)
               }.changes.switchMap {
                 case (latestOrdinal, balance, activeTokenLocks) =>
                   Stream.eval(tokenLockStorage.tryPut(tokenLock, latestOrdinal, lastGlobalEpochProgress, balance, activeTokenLocks))
