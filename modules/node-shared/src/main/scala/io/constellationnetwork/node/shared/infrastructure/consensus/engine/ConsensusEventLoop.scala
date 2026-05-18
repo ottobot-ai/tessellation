@@ -211,15 +211,41 @@ object ConsensusEventLoop {
                           // Track the failure so that after maxTotalRecoveryAttempts the node force-leaves
                           // (prevents infinite download → init fail → download loops).
                           // Transition back to WaitingForDownload so the DownloadDaemon can retry with fresh state.
+                          //
+                          // CRITICAL: reset consensus storage (observation key, last outcome, peer registrations)
+                          // BEFORE transitioning. The first attempt registerForConsensus(observationLimit=K1)
+                          // populates observationKeyR. If we don't clear it here, the next download's
+                          // registerForConsensus(observationLimit=K2) hits trySetObservationKey's orElse(...)
+                          // semantics and silently keeps the stale K1, then ConsensusManager raises
+                          // "Registration failed: already registered at different key" — which escapes
+                          // Download.observe() and the DownloadDaemon retry loop hits the same collision
+                          // forever (the node stays stuck in WaitingForObserving with no further state events
+                          // emitted because tryModifyState already advanced it inside download.download()).
+                          // This is the same reset that AbandonmentTracker.attemptRecoveryDownload performs.
                           ctx.logger.error(err)("InitializeFromDownload failed after exhausting retries, triggering recovery download") >>
                             Metrics[F].incrementCounter("dag_consensus_init_download_failure") >>
                             abandonmentTracker.trackInitFromDownloadFailure >>
+                            storage.clearAllConsensusState >>
+                            storage.clearAllPeerRegistrations >>
+                            storage.clearTimeTrigger >>
+                            storage.clearObservationKey >>
+                            storage.clearAndGetLastConsensusOutcome.void >>
+                            pending.clear() >>
+                            nodeStorage.setRecoveryDownload >>
                             nodeStorage.tryModifyStateGetResult(NodeState.Observing, NodeState.WaitingForDownload).flatMap {
                               case NodeStateTransition.Success =>
                                 ctx.logger.info("Recovery: transitioned Observing → WaitingForDownload for DownloadDaemon retry")
                               case _ =>
-                                // May already be in a different state; try from Ready as well
-                                nodeStorage.tryModifyStateGetResult(NodeState.Ready, NodeState.WaitingForDownload).void
+                                // May already be in a different state; try from Ready or WaitingForObserving too.
+                                // WaitingForObserving is the most common in our observed failure mode: download.download()
+                                // calls tryModifyState(WaitingForDownload, DownloadInProgress, WaitingForObserving) inside
+                                // its own observe-then-register flow, so by the time registerForConsensus fails the node
+                                // is already in WaitingForObserving and the FSM has no further state events to emit.
+                                nodeStorage.tryModifyStateGetResult(NodeState.Ready, NodeState.WaitingForDownload).flatMap {
+                                  case NodeStateTransition.Success => Async[F].unit
+                                  case _ =>
+                                    nodeStorage.tryModifyStateGetResult(NodeState.WaitingForObserving, NodeState.WaitingForDownload).void
+                                }
                             }
                         case _ => Async[F].unit
                       })
