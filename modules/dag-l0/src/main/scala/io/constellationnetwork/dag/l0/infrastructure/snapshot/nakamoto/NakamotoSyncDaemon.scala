@@ -441,23 +441,43 @@ object NakamotoSyncDaemon {
                             handleAttestation(att, tipTracker, kesRegistry, etaRotationSnapshots, logger)
 
                           case pb.GossipMessage.Body.MetagraphBinary(mb) =>
-                            handleMetagraphBinary(
-                              mb,
-                              processMetagraphBinary,
-                              committeeGate,
-                              etaForParentOrdinal,
-                              stakeRegistry.optimisticRelativeStake(selfId),
-                              logger
-                            )
+                            // Background-fire: the gate's `attestAndAdmit` blocks up to gateTimeoutMs
+                            // (30s default) waiting for ⌈2K/3⌉ committee attestations. Running it on
+                            // the gossip stream's `evalMap` thread serializes EVERY message behind
+                            // every pending gate — gl0 TipAttestations from peers then arrive past
+                            // `TipTracker.MaxAttestationSkewMs` and get rejected (skew=200+s observed
+                            // in iter-s3prep-baseline). Gate work is naturally concurrent-safe: the
+                            // aggregator is a `Ref[F, ...]`, `processMetagraphBinary` writes to a
+                            // queue, and per-binary state is keyed by (mgAddr, parentHash, binaryHash).
+                            Async[F]
+                              .start(
+                                handleMetagraphBinary(
+                                  mb,
+                                  processMetagraphBinary,
+                                  committeeGate,
+                                  etaForParentOrdinal,
+                                  stakeRegistry.optimisticRelativeStake(selfId),
+                                  logger
+                                )
+                              )
+                              .void
 
                           case pb.GossipMessage.Body.MetagraphAttestation(att) =>
-                            handleMetagraphAttestation(
-                              att,
-                              committeeGate,
-                              etaForParentOrdinal,
-                              senderStakeLookup,
-                              logger
-                            )
+                            // Background-fire: VRF verify + KES verify + Ed25519 verify add up to
+                            // tens of ms per attestation. In bursts (each peer attests each binary),
+                            // this would queue up behind the stream's serial evalMap. Aggregator
+                            // record is concurrent-safe.
+                            Async[F]
+                              .start(
+                                handleMetagraphAttestation(
+                                  att,
+                                  committeeGate,
+                                  etaForParentOrdinal,
+                                  senderStakeLookup,
+                                  logger
+                                )
+                              )
+                              .void
 
                           case pb.GossipMessage.Body.AllowSpendBlock(asb) =>
                             handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)
