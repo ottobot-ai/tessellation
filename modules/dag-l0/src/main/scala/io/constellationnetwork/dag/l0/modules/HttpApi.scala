@@ -208,7 +208,7 @@ sealed abstract class HttpApi[
       services.pendingReader
     )
   }
-  private val tokenLockRoutes = GL0TokenLockRoutes(storages.globalSnapshot, storages.mptStore)
+  private val tokenLockRoutes = GL0TokenLockRoutes(storages.globalSnapshot, services.pendingReader)
 
   // Chain-quality / finality-triggers observable (#138). Reads the FinalityTriggerView Ref
   // populated by SnapshotLeaderLoop after trigger construction. Pure observability — no
