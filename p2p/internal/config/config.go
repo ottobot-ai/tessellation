@@ -22,6 +22,8 @@ type Config struct {
 	MetagraphBinaryTopic      string
 	MetagraphAttestationTopic string
 	AllowSpendBlockTopic      string
+	DAGBlockTopic             string
+	TokenLockBlockTopic       string
 
 	// GossipSub parameters
 	MeshD   int // target mesh degree (default 6)
@@ -42,6 +44,8 @@ type Config struct {
 	MetagraphBinaryBufferSize      int
 	MetagraphAttestationBufferSize int
 	AllowSpendBlockBufferSize      int
+	DAGBlockBufferSize             int
+	TokenLockBlockBufferSize       int
 
 	// Outbox parameters. The sidecar keeps an in-memory ledger of recently-
 	// published AllowSpendBlock / MetagraphBinary / MetagraphAttestation
@@ -83,6 +87,8 @@ func DefaultConfig() Config {
 		MetagraphBinaryTopic:      "/tessellation/metagraph-binaries/1.0.0",
 		MetagraphAttestationTopic: "/tessellation/metagraph-attestations/1.0.0",
 		AllowSpendBlockTopic:      "/tessellation/allow-spend-blocks/1.0.0",
+		DAGBlockTopic:             "/tessellation/dag-blocks/1.0.0",
+		TokenLockBlockTopic:       "/tessellation/token-lock-blocks/1.0.0",
 		MeshD:                     6,
 		MeshDLo:                   4,
 		MeshDHi:                   12,
@@ -103,7 +109,11 @@ func DefaultConfig() Config {
 		// (~5s cadence in prod), so burst rate is comparable to metagraph
 		// binaries. Same 256-slot buffer.
 		AllowSpendBlockBufferSize: 256,
-		OutboxRepublishInterval:   30 * time.Second,
-		OutboxTTL:                 1 * time.Hour,
+		// DAGBlock + TokenLockBlock: same ~5s consensus cadence on dl1 as
+		// AllowSpendBlock; reuse the 256-slot default.
+		DAGBlockBufferSize:       256,
+		TokenLockBlockBufferSize: 256,
+		OutboxRepublishInterval:  30 * time.Second,
+		OutboxTTL:                1 * time.Hour,
 	}
 }

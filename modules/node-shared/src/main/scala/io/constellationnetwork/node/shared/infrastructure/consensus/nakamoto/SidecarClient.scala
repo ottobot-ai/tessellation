@@ -43,6 +43,25 @@ object SidecarClient {
       */
     def publishAllowSpendBlock(payload: Array[Byte]): F[PublishResponse]
 
+    /** Publish a Signed[Block] (DAG block) to all GL0 nodes via the durable-publish outbox. Extends the #196 pattern to the DAG-block hop —
+      * replaces the single-peer HTTP POST path from `StateChannel.sendBlockToL0` (`p2pClient.l0BlockOutputClient.sendL1Output` → POST
+      * `/dag/l1-output`).
+      *
+      * @param payload
+      *   serialized `Signed[Block]` bytes (via JsonSerializer); opaque to the sidecar but used by the sidecar's outbox to derive the
+      *   message id (sha256 first 32 bytes).
+      */
+    def publishDAGBlock(payload: Array[Byte]): F[PublishResponse]
+
+    /** Publish a Signed[TokenLockBlock] to all GL0 nodes via the durable-publish outbox. Extends the #196 pattern to the token-lock-block
+      * hop — replaces the single-peer HTTP POST path from `TokenLock.sendBlockToL0`.
+      *
+      * @param payload
+      *   serialized `Signed[TokenLockBlock]` bytes (via JsonSerializer); opaque to the sidecar but used by the sidecar's outbox to derive
+      *   the message id (sha256 first 32 bytes).
+      */
+    def publishTokenLockBlock(payload: Array[Byte]): F[PublishResponse]
+
     /** Ack to the sidecar that the listed message ids on `topic` have reached Phase-3 finality and may be dropped from the outbox. Each id
       * is the sha256 (first 32 bytes) of the same payload bytes the JVM published.
       *
@@ -66,6 +85,8 @@ object SidecarClient {
     val AllowSpendBlock = "allow-spend-block"
     val MetagraphBinary = "metagraph-binary"
     val MetagraphAttestation = "metagraph-attestation"
+    val DAGBlock = "dag-block"
+    val TokenLockBlock = "token-lock-block"
   }
 
   /** Create a gRPC client Resource that opens a channel and cleans up on release. */
@@ -109,6 +130,12 @@ object SidecarClient {
 
       def publishAllowSpendBlock(payload: Array[Byte]): F[PublishResponse] =
         liftFuture(stub.publishAllowSpendBlock(AllowSpendBlock(payload = ByteString.copyFrom(payload))))
+
+      def publishDAGBlock(payload: Array[Byte]): F[PublishResponse] =
+        liftFuture(stub.publishDAGBlock(DAGBlock(payload = ByteString.copyFrom(payload))))
+
+      def publishTokenLockBlock(payload: Array[Byte]): F[PublishResponse] =
+        liftFuture(stub.publishTokenLockBlock(TokenLockBlock(payload = ByteString.copyFrom(payload))))
 
       def confirmFinalized(topic: String, msgIds: List[Array[Byte]]): F[ConfirmFinalizedResponse] =
         liftFuture(

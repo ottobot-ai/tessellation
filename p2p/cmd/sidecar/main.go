@@ -55,6 +55,8 @@ func main() {
 	flag.IntVar(&cfg.MetagraphBinaryBufferSize, "metagraph-binary-buffer", cfg.MetagraphBinaryBufferSize, "per-subscriber relay buffer size for metagraph binaries")
 	flag.IntVar(&cfg.MetagraphAttestationBufferSize, "metagraph-attestation-buffer", cfg.MetagraphAttestationBufferSize, "per-subscriber relay buffer size for metagraph attestations")
 	flag.IntVar(&cfg.AllowSpendBlockBufferSize, "allow-spend-block-buffer", cfg.AllowSpendBlockBufferSize, "per-subscriber relay buffer size for allow-spend blocks")
+	flag.IntVar(&cfg.DAGBlockBufferSize, "dag-block-buffer", cfg.DAGBlockBufferSize, "per-subscriber relay buffer size for dag blocks")
+	flag.IntVar(&cfg.TokenLockBlockBufferSize, "token-lock-block-buffer", cfg.TokenLockBlockBufferSize, "per-subscriber relay buffer size for token-lock blocks")
 	flag.DurationVar(&cfg.OutboxRepublishInterval, "outbox-republish-interval", cfg.OutboxRepublishInterval, "outbox re-publish cadence (#196)")
 	flag.DurationVar(&cfg.OutboxTTL, "outbox-ttl", cfg.OutboxTTL, "outbox entry max age before drop without confirmation (#196)")
 
@@ -177,13 +179,15 @@ func main() {
 	for _, addr := range node.Host.Addrs() {
 		fmt.Printf("  Listen: %s/p2p/%s\n", addr, node.Host.ID())
 	}
-	fmt.Printf("  Topics: %s, %s, %s, %s, %s, %s\n",
+	fmt.Printf("  Topics: %s, %s, %s, %s, %s, %s, %s, %s\n",
 		cfg.SnapshotTopic,
 		cfg.AttestationTopic,
 		cfg.RumorTopic,
 		cfg.MetagraphBinaryTopic,
 		cfg.MetagraphAttestationTopic,
 		cfg.AllowSpendBlockTopic,
+		cfg.DAGBlockTopic,
+		cfg.TokenLockBlockTopic,
 	)
 	fmt.Printf("  gRPC:   %s\n", cfg.GRPCAddr)
 
@@ -329,6 +333,10 @@ func startOutboxRepublisher(ctx context.Context, node *gossip.Node, ob *outbox.O
 					perr = node.PublishMetagraphBinary(ctx, e.Payload)
 				case grpcserver.TopicMetagraphAttestation:
 					perr = node.PublishMetagraphAttestation(ctx, e.Payload)
+				case grpcserver.TopicDAGBlock:
+					perr = node.PublishDAGBlock(ctx, e.Payload)
+				case grpcserver.TopicTokenLockBlock:
+					perr = node.PublishTokenLockBlock(ctx, e.Payload)
 				default:
 					// Unknown topic in outbox — bug elsewhere; drop the
 					// entry so it doesn't loop forever.

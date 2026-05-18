@@ -123,6 +123,8 @@ type TopicSet struct {
 	MetagraphBinary      *pubsub.Topic
 	MetagraphAttestation *pubsub.Topic
 	AllowSpendBlock      *pubsub.Topic
+	DAGBlock             *pubsub.Topic
+	TokenLockBlock       *pubsub.Topic
 }
 
 // StartGaugeUpdater launches a background goroutine that periodically updates
@@ -146,6 +148,12 @@ func StartGaugeUpdater(ctx context.Context, h host.Host, kadDHT *dht.IpfsDHT, to
 			}
 			if topics.AllowSpendBlock != nil {
 				MeshPeers.WithLabelValues("allow_spend_block").Set(float64(len(topics.AllowSpendBlock.ListPeers())))
+			}
+			if topics.DAGBlock != nil {
+				MeshPeers.WithLabelValues("dag_block").Set(float64(len(topics.DAGBlock.ListPeers())))
+			}
+			if topics.TokenLockBlock != nil {
+				MeshPeers.WithLabelValues("token_lock_block").Set(float64(len(topics.TokenLockBlock.ListPeers())))
 			}
 
 			// Total connected peers

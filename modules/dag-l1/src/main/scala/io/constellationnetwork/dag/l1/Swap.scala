@@ -13,7 +13,6 @@ import io.constellationnetwork.currency.swap.ConsensusInput.OwnerConsensusInput
 import io.constellationnetwork.currency.swap.{ConsensusInput, ConsensusOutput}
 import io.constellationnetwork.dag.l1.domain.swap.block.AllowSpendBlockService
 import io.constellationnetwork.dag.l1.modules.{Queues, Services}
-import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
 import io.constellationnetwork.node.shared.domain.consensus.config.SwapConsensusConfig
@@ -28,10 +27,11 @@ import io.constellationnetwork.node.shared.domain.swap.consensus.Validator.{
 }
 import io.constellationnetwork.node.shared.domain.swap.consensus.{ConsensusClient, ConsensusState, Engine}
 import io.constellationnetwork.node.shared.domain.swap.{AllowSpendStorage, AllowSpendValidator}
-import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo, StateProof}
+import io.constellationnetwork.schema.swap.AllowSpendBlock
+import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
 
 import fs2.{Pipe, Stream}
@@ -39,7 +39,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object Swap {
   def run[
-    F[_]: Async: Hasher: JsonSerializer: SecurityProvider: Random,
+    F[_]: Async: Hasher: SecurityProvider: Random,
     P <: StateProof,
     S <: Snapshot,
     SI <: SnapshotInfo[P],
@@ -49,7 +49,11 @@ object Swap {
     clusterStorage: ClusterStorage[F],
     lastGlobalSnapshot: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     nodeStorage: NodeStorage[F],
-    sidecarClient: SidecarClient.SidecarClientAlgebra[F],
+    // (#196 follow-up) Per-call-site dispatch for the L0 send hop. dl1 → gl0
+    // passes a sidecar-publish lambda (durable outbox; the prior #196 path);
+    // cl1 → cl0 keeps the single-peer HTTP POST shape (cl0 has no sidecar).
+    // The lambda owns its own error handling.
+    sendBlockToL0Fn: Signed[AllowSpendBlock] => F[Unit],
     consensusClient: ConsensusClient[F],
     services: Services[F, P, S, SI, R],
     allowSpendStorage: AllowSpendStorage[F],
@@ -124,36 +128,13 @@ object Swap {
         case (_, ConsensusOutput.Noop) => Stream.empty
       }
 
-    // Publish the AllowSpendBlock via the libp2p sidecar's durable outbox
-    // (#196). Replaces the prior single-peer HTTP POST lottery that dropped
-    // blocks when the chosen gl0 peer was in reorg-recovery
-    // (iter-s3prep-baseline-mg4 diagnostic). The sidecar re-publishes every
-    // outbox-republish-interval (default 30s) until the JVM acks Phase-3
-    // finality via SidecarClient.confirmFinalized.
-    //
-    // Serialization mirrors StateChannelRoutes.broadcastMetagraphBinary:
-    // `JsonSerializer[F].serialize(signed)` produces the canonical
-    // JSON+Brotli bytes that gl0 receivers re-deserialize through the same
-    // typeclass. No bespoke envelope, no manual hash bytes — the Hasher
-    // typeclass + JsonSerializer typeclass are the single sources of truth
-    // (project rule feedback_use_hasher_no_manual_serialize).
-    //
-    // l0ClusterStorage + collateral filtering removed: the outbox publishes
-    // to the GossipSub topic mesh, not to a chosen peer, so peer selection
-    // is no longer this layer's responsibility.
+    // (#196 follow-up) Delegate the L0 send hop to the call-site-supplied
+    // `sendBlockToL0Fn`. dl1 → gl0 uses a sidecar-publish lambda (the prior
+    // #196 durable-outbox path); cl1 → cl0 keeps the previous HTTP POST
+    // shape (cl0 doesn't run a sidecar). The pipe only sequences; the
+    // lambda owns error handling.
     def sendBlockToL0: Pipe[F, ConsensusOutput.FinalBlock, ConsensusOutput.FinalBlock] =
-      _.evalTap { fb =>
-        JsonSerializer[F]
-          .serialize(fb.hashedBlock.signed)
-          .flatMap(sidecarClient.publishAllowSpendBlock)
-          .flatMap { resp =>
-            if (resp.ok)
-              logger.debug(s"AllowSpendBlock published to sidecar outbox: hash=${fb.hashedBlock.hash}")
-            else
-              logger.warn(s"Sidecar publishAllowSpendBlock returned ok=false: ${resp.error}")
-          }
-          .handleErrorWith(e => logger.warn(e)("Error publishing AllowSpendBlock to sidecar"))
-      }
+      _.evalTap(fb => sendBlockToL0Fn(fb.hashedBlock.signed))
 
     def gossipBlock: Pipe[F, ConsensusOutput.FinalBlock, ConsensusOutput.FinalBlock] =
       _.evalTap { fb =>

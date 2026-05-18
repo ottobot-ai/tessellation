@@ -175,8 +175,16 @@ object SnapshotLeaderLoop {
       snapshot.allowSpendBlocks.fold(List.empty[Signed[io.constellationnetwork.schema.swap.AllowSpendBlock]])(_.toList)
     val stateChannelBinaries: List[Signed[io.constellationnetwork.statechannel.StateChannelSnapshotBinary]] =
       snapshot.stateChannelSnapshots.values.toList.flatMap(_.toList)
+    // (#196 follow-up) DAGBlock + TokenLockBlock finality. DAG blocks live inside
+    // `BlockAsActiveTip` wrappers; we ack on the inner `Signed[Block]` since that's
+    // what the JVM serialized at publish time (and what the sidecar's outbox keys on).
+    val dagBlocks: List[Signed[io.constellationnetwork.schema.Block]] =
+      snapshot.blocks.toList.map(_.block)
+    val tokenLockBlocks: List[Signed[io.constellationnetwork.schema.tokenLock.TokenLockBlock]] =
+      snapshot.tokenLockBlocks.fold(List.empty[Signed[io.constellationnetwork.schema.tokenLock.TokenLockBlock]])(_.toList)
 
-    if (allowSpendBlocks.isEmpty && stateChannelBinaries.isEmpty) Async[F].unit
+    if (allowSpendBlocks.isEmpty && stateChannelBinaries.isEmpty && dagBlocks.isEmpty && tokenLockBlocks.isEmpty)
+      Async[F].unit
     else
       HasherSelector[F].withCurrent { implicit hasher =>
         // Convert Hasher's hex Hash value back to the raw 32-byte sha256 the
@@ -205,6 +213,12 @@ object SnapshotLeaderLoop {
           scbIds <- stateChannelBinaries.traverse { signed =>
             JsonSerializer[F].serialize(signed).flatMap(idFor)
           }
+          dagIds <- dagBlocks.traverse { signed =>
+            JsonSerializer[F].serialize(signed).flatMap(idFor)
+          }
+          tlbIds <- tokenLockBlocks.traverse { signed =>
+            JsonSerializer[F].serialize(signed).flatMap(idFor)
+          }
           _ <- Async[F].whenA(asbIds.nonEmpty) {
             sidecarClient
               .confirmFinalized(OutboxTopic.AllowSpendBlock, asbIds)
@@ -216,6 +230,18 @@ object SnapshotLeaderLoop {
               .confirmFinalized(OutboxTopic.MetagraphBinary, scbIds)
               .flatMap(resp => logger.debug(s"outbox confirm metagraph-binary: dropped=${resp.dropped}/${scbIds.size}"))
               .handleErrorWith(e => logger.warn(s"⚠️ confirmFinalized(metagraph-binary) failed: ${e.getMessage}"))
+          }
+          _ <- Async[F].whenA(dagIds.nonEmpty) {
+            sidecarClient
+              .confirmFinalized(OutboxTopic.DAGBlock, dagIds)
+              .flatMap(resp => logger.debug(s"outbox confirm dag-block: dropped=${resp.dropped}/${dagIds.size}"))
+              .handleErrorWith(e => logger.warn(s"⚠️ confirmFinalized(dag-block) failed: ${e.getMessage}"))
+          }
+          _ <- Async[F].whenA(tlbIds.nonEmpty) {
+            sidecarClient
+              .confirmFinalized(OutboxTopic.TokenLockBlock, tlbIds)
+              .flatMap(resp => logger.debug(s"outbox confirm token-lock-block: dropped=${resp.dropped}/${tlbIds.size}"))
+              .handleErrorWith(e => logger.warn(s"⚠️ confirmFinalized(token-lock-block) failed: ${e.getMessage}"))
           }
         } yield ()
       }

@@ -25,6 +25,8 @@ const (
 	SidecarService_PublishMetagraphBinary_FullMethodName      = "/nakamoto.p2p.SidecarService/PublishMetagraphBinary"
 	SidecarService_PublishMetagraphAttestation_FullMethodName = "/nakamoto.p2p.SidecarService/PublishMetagraphAttestation"
 	SidecarService_PublishAllowSpendBlock_FullMethodName      = "/nakamoto.p2p.SidecarService/PublishAllowSpendBlock"
+	SidecarService_PublishDAGBlock_FullMethodName             = "/nakamoto.p2p.SidecarService/PublishDAGBlock"
+	SidecarService_PublishTokenLockBlock_FullMethodName       = "/nakamoto.p2p.SidecarService/PublishTokenLockBlock"
 	SidecarService_ConfirmFinalized_FullMethodName            = "/nakamoto.p2p.SidecarService/ConfirmFinalized"
 	SidecarService_Subscribe_FullMethodName                   = "/nakamoto.p2p.SidecarService/Subscribe"
 	SidecarService_PeerCount_FullMethodName                   = "/nakamoto.p2p.SidecarService/PeerCount"
@@ -50,6 +52,15 @@ type SidecarServiceClient interface {
 	// Publish an AllowSpendBlock to all GL0 nodes via the durable outbox path
 	// (task #196: replaces the single-peer HTTP POST from Swap.sendBlockToL0).
 	PublishAllowSpendBlock(ctx context.Context, in *AllowSpendBlock, opts ...grpc.CallOption) (*PublishResponse, error)
+	// Publish a DAG block to all GL0 nodes via the durable outbox path. Replaces
+	// the single-peer HTTP POST from `StateChannel.sendBlockToL0`. Same durable-
+	// outbox machinery as #196 — the sidecar re-publishes on a ticker until the
+	// JVM acks Phase-3 finality via `ConfirmFinalized`.
+	PublishDAGBlock(ctx context.Context, in *DAGBlock, opts ...grpc.CallOption) (*PublishResponse, error)
+	// Publish a TokenLockBlock to all GL0 nodes via the durable outbox path.
+	// Replaces the single-peer HTTP POST from `TokenLock.sendBlockToL0`. Same
+	// durable-outbox machinery as #196 / PublishAllowSpendBlock.
+	PublishTokenLockBlock(ctx context.Context, in *TokenLockBlock, opts ...grpc.CallOption) (*PublishResponse, error)
 	// JVM tells sidecar that the listed message_ids on `topic` reached Phase-3
 	// finality. The sidecar drops the corresponding outbox entries; until this
 	// call arrives the outbox keeps republishing them periodically. Idempotent
@@ -132,6 +143,26 @@ func (c *sidecarServiceClient) PublishAllowSpendBlock(ctx context.Context, in *A
 	return out, nil
 }
 
+func (c *sidecarServiceClient) PublishDAGBlock(ctx context.Context, in *DAGBlock, opts ...grpc.CallOption) (*PublishResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PublishResponse)
+	err := c.cc.Invoke(ctx, SidecarService_PublishDAGBlock_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *sidecarServiceClient) PublishTokenLockBlock(ctx context.Context, in *TokenLockBlock, opts ...grpc.CallOption) (*PublishResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PublishResponse)
+	err := c.cc.Invoke(ctx, SidecarService_PublishTokenLockBlock_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *sidecarServiceClient) ConfirmFinalized(ctx context.Context, in *ConfirmFinalizedRequest, opts ...grpc.CallOption) (*ConfirmFinalizedResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ConfirmFinalizedResponse)
@@ -200,6 +231,15 @@ type SidecarServiceServer interface {
 	// Publish an AllowSpendBlock to all GL0 nodes via the durable outbox path
 	// (task #196: replaces the single-peer HTTP POST from Swap.sendBlockToL0).
 	PublishAllowSpendBlock(context.Context, *AllowSpendBlock) (*PublishResponse, error)
+	// Publish a DAG block to all GL0 nodes via the durable outbox path. Replaces
+	// the single-peer HTTP POST from `StateChannel.sendBlockToL0`. Same durable-
+	// outbox machinery as #196 — the sidecar re-publishes on a ticker until the
+	// JVM acks Phase-3 finality via `ConfirmFinalized`.
+	PublishDAGBlock(context.Context, *DAGBlock) (*PublishResponse, error)
+	// Publish a TokenLockBlock to all GL0 nodes via the durable outbox path.
+	// Replaces the single-peer HTTP POST from `TokenLock.sendBlockToL0`. Same
+	// durable-outbox machinery as #196 / PublishAllowSpendBlock.
+	PublishTokenLockBlock(context.Context, *TokenLockBlock) (*PublishResponse, error)
 	// JVM tells sidecar that the listed message_ids on `topic` reached Phase-3
 	// finality. The sidecar drops the corresponding outbox entries; until this
 	// call arrives the outbox keeps republishing them periodically. Idempotent
@@ -239,6 +279,12 @@ func (UnimplementedSidecarServiceServer) PublishMetagraphAttestation(context.Con
 }
 func (UnimplementedSidecarServiceServer) PublishAllowSpendBlock(context.Context, *AllowSpendBlock) (*PublishResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PublishAllowSpendBlock not implemented")
+}
+func (UnimplementedSidecarServiceServer) PublishDAGBlock(context.Context, *DAGBlock) (*PublishResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PublishDAGBlock not implemented")
+}
+func (UnimplementedSidecarServiceServer) PublishTokenLockBlock(context.Context, *TokenLockBlock) (*PublishResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PublishTokenLockBlock not implemented")
 }
 func (UnimplementedSidecarServiceServer) ConfirmFinalized(context.Context, *ConfirmFinalizedRequest) (*ConfirmFinalizedResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ConfirmFinalized not implemented")
@@ -381,6 +427,42 @@ func _SidecarService_PublishAllowSpendBlock_Handler(srv interface{}, ctx context
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SidecarService_PublishDAGBlock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DAGBlock)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SidecarServiceServer).PublishDAGBlock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SidecarService_PublishDAGBlock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SidecarServiceServer).PublishDAGBlock(ctx, req.(*DAGBlock))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _SidecarService_PublishTokenLockBlock_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TokenLockBlock)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SidecarServiceServer).PublishTokenLockBlock(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SidecarService_PublishTokenLockBlock_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SidecarServiceServer).PublishTokenLockBlock(ctx, req.(*TokenLockBlock))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SidecarService_ConfirmFinalized_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ConfirmFinalizedRequest)
 	if err := dec(in); err != nil {
@@ -476,6 +558,14 @@ var SidecarService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PublishAllowSpendBlock",
 			Handler:    _SidecarService_PublishAllowSpendBlock_Handler,
+		},
+		{
+			MethodName: "PublishDAGBlock",
+			Handler:    _SidecarService_PublishDAGBlock_Handler,
+		},
+		{
+			MethodName: "PublishTokenLockBlock",
+			Handler:    _SidecarService_PublishTokenLockBlock_Handler,
 		},
 		{
 			MethodName: "ConfirmFinalized",

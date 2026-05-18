@@ -220,6 +220,64 @@ abstract class CurrencyL1App(
       _ <- MkHttpServer[IO].newEmber(ServerName("p2p"), cfg.http.p2pHttp, api.p2pApp)
       _ <- MkHttpServer[IO].newEmber(ServerName("cli"), cfg.http.cliHttp, api.cliApp)
 
+      // (#196 follow-up) cl1 → cl0 send-block hop: the upstream `StateChannel`
+      // + `TokenLock` were refactored to take a per-call-site lambda so the
+      // dl1 → gl0 hop can publish via the gl0 sidecar's durable outbox
+      // (replaces the brittle single-peer HTTP POST lottery). cl0 has no
+      // sidecar wiring, so the cl1 → cl0 path keeps the previous semantics:
+      // pick a random gl0-cl0 alignment peer with collateral, HTTP-POST to
+      // it, log + retry on failure. Behaviourally identical to the pre-#196
+      // implementation. If/when cl0 grows a sidecar we can lift these
+      // lambdas to publish through it instead.
+      sendDAGBlockToL0Fn = (signed: io.constellationnetwork.security.signature.Signed[io.constellationnetwork.schema.Block]) =>
+        storages.l0Cluster.getPeers
+          .map(_.toNonEmptyList.toList)
+          .flatMap(_.filterA(p => services.collateral.hasCollateral(p.id)))
+          .flatMap(peers => cats.effect.std.Random[IO].shuffleList(peers))
+          .map(_.headOption)
+          .flatMap {
+            case Some(l0Peer) =>
+              dagP2PClient.l0BlockOutputClient
+                .sendL1Output(signed)(l0Peer)
+                .ifM(IO.unit, logger.warn("Sending DAG block to cl0 failed."))
+            case None => logger.warn("No available cl0 peer")
+          }
+          .handleErrorWith(err => logger.error(err)("Error sending DAG block to cl0"))
+
+      sendTokenLockBlockToL0Fn = (signed: io.constellationnetwork.security.signature.Signed[
+        io.constellationnetwork.schema.tokenLock.TokenLockBlock
+      ]) =>
+        storages.l0Cluster.getPeers
+          .map(_.toNonEmptyList.toList)
+          .flatMap(_.filterA(p => services.collateral.hasCollateral(p.id)))
+          .flatMap(peers => cats.effect.std.Random[IO].shuffleList(peers))
+          .map(_.headOption)
+          .flatMap {
+            case Some(l0Peer) =>
+              dagP2PClient.l0BlockOutputClient
+                .sendTokenLockBlock(signed)(l0Peer)
+                .handleErrorWith(e => logger.error(e)("Error when sending token-lock block to cl0").as(false))
+                .ifM(IO.unit, logger.warn("Sending token-lock block to cl0 failed"))
+            case None => logger.warn("No available cl0 peer")
+          }
+
+      sendAllowSpendBlockToL0Fn = (signed: io.constellationnetwork.security.signature.Signed[
+        io.constellationnetwork.schema.swap.AllowSpendBlock
+      ]) =>
+        storages.l0Cluster.getPeers
+          .map(_.toNonEmptyList.toList)
+          .flatMap(_.filterA(p => services.collateral.hasCollateral(p.id)))
+          .flatMap(peers => cats.effect.std.Random[IO].shuffleList(peers))
+          .map(_.headOption)
+          .flatMap {
+            case Some(l0Peer) =>
+              dagP2PClient.l0BlockOutputClient
+                .sendAllowSpendBlock(signed)(l0Peer)
+                .handleErrorWith(e => logger.error(e)("Error when sending allow-spend block to cl0").as(false))
+                .ifM(IO.unit, logger.warn("Sending allow-spend block to cl0 failed"))
+            case None => logger.warn("No available cl0 peer")
+          }
+
       stateChannel <- StateChannel
         .make[IO, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotInfo, Run](
           cfg,
@@ -231,7 +289,8 @@ abstract class CurrencyL1App(
           services,
           storages,
           validators,
-          txHasher
+          txHasher,
+          sendDAGBlockToL0Fn
         )
         .asResource
 
@@ -332,10 +391,9 @@ abstract class CurrencyL1App(
             .run[IO, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotInfo, Run](
               cfg.swap,
               storages.cluster,
-              storages.l0Cluster,
               sharedStorages.lastGlobalSnapshot,
               storages.node,
-              p2pClient.l0BlockOutputClient,
+              sendAllowSpendBlockToL0Fn,
               p2pClient.swapConsensusClient,
               services,
               storages.allowSpend,
@@ -350,10 +408,9 @@ abstract class CurrencyL1App(
               TokenLock.run[IO, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotInfo, Run](
                 cfg.tokenLock,
                 storages.cluster,
-                storages.l0Cluster,
                 sharedStorages.lastGlobalSnapshot,
                 storages.node,
-                p2pClient.l0BlockOutputClient,
+                sendTokenLockBlockToL0Fn,
                 p2pClient.tokenLockConsensusClient,
                 services,
                 storages.tokenLock,

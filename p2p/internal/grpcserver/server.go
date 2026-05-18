@@ -24,6 +24,8 @@ const (
 	TopicAllowSpendBlock      = "allow-spend-block"
 	TopicMetagraphBinary      = "metagraph-binary"
 	TopicMetagraphAttestation = "metagraph-attestation"
+	TopicDAGBlock             = "dag-block"
+	TopicTokenLockBlock       = "token-lock-block"
 )
 
 // Server implements the SidecarService and ChainSyncOutbound gRPC interfaces.
@@ -182,6 +184,40 @@ func (s *Server) PublishAllowSpendBlock(ctx context.Context, asb *pb.AllowSpendB
 	return &pb.PublishResponse{Ok: true}, nil
 }
 
+// PublishDAGBlock broadcasts a Signed[Block] to all GL0 nodes over the
+// dag-block topic. Replaces the single-peer HTTP POST from
+// StateChannel.sendBlockToL0; same #196 durable-outbox semantics.
+func (s *Server) PublishDAGBlock(ctx context.Context, blk *pb.DAGBlock) (*pb.PublishResponse, error) {
+	data, err := proto.Marshal(blk)
+	if err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	if err := s.node.PublishDAGBlock(ctx, data); err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	// Outbox id = sha256 of the inner Signed[Block] payload — matches how the
+	// JVM addresses the block in ConfirmFinalized.
+	s.outbox.Add(TopicDAGBlock, outbox.MsgIDFor(blk.Payload), data)
+	return &pb.PublishResponse{Ok: true}, nil
+}
+
+// PublishTokenLockBlock broadcasts a Signed[TokenLockBlock] to all GL0 nodes
+// over the token-lock-block topic. Replaces the single-peer HTTP POST from
+// TokenLock.sendBlockToL0; same #196 durable-outbox semantics.
+func (s *Server) PublishTokenLockBlock(ctx context.Context, blk *pb.TokenLockBlock) (*pb.PublishResponse, error) {
+	data, err := proto.Marshal(blk)
+	if err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	if err := s.node.PublishTokenLockBlock(ctx, data); err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	// Outbox id = sha256 of the inner Signed[TokenLockBlock] payload — matches
+	// how the JVM addresses the block in ConfirmFinalized.
+	s.outbox.Add(TopicTokenLockBlock, outbox.MsgIDFor(blk.Payload), data)
+	return &pb.PublishResponse{Ok: true}, nil
+}
+
 // ConfirmFinalized drops outbox entries for the named ids on the named
 // topic. Called by the JVM Phase-3 finality hook after a global snapshot
 // is fully finalized — at that point the entries it includes are durably
@@ -204,6 +240,8 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 	mbCh := s.node.MetagraphBinaryMessages(ctx)
 	maCh := s.node.MetagraphAttestationMessages(ctx)
 	asbCh := s.node.AllowSpendBlockMessages(ctx)
+	dagCh := s.node.DAGBlockMessages(ctx)
+	tlbCh := s.node.TokenLockBlockMessages(ctx)
 	reconnectCh := s.node.ReconnectCh()
 
 	for {
@@ -302,6 +340,36 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 				return err
 			}
 
+		case data, ok := <-dagCh:
+			if !ok {
+				return nil
+			}
+			var blk pb.DAGBlock
+			if err := proto.Unmarshal(data, &blk); err != nil {
+				continue
+			}
+			msg := &pb.GossipMessage{
+				Body: &pb.GossipMessage_DagBlock{DagBlock: &blk},
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+
+		case data, ok := <-tlbCh:
+			if !ok {
+				return nil
+			}
+			var blk pb.TokenLockBlock
+			if err := proto.Unmarshal(data, &blk); err != nil {
+				continue
+			}
+			msg := &pb.GossipMessage{
+				Body: &pb.GossipMessage_TokenLockBlock{TokenLockBlock: &blk},
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -310,7 +378,7 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 
 // PeerCount returns mesh membership stats.
 func (s *Server) PeerCount(ctx context.Context, req *pb.PeerCountRequest) (*pb.PeerCountResponse, error) {
-	snPeers, atPeers, ruPeers, mbPeers, maPeers, asbPeers := s.node.MeshPeerCount()
+	snPeers, atPeers, ruPeers, mbPeers, maPeers, asbPeers, dagPeers, tlbPeers := s.node.MeshPeerCount()
 	total := len(s.node.Host.Network().Peers())
 	return &pb.PeerCountResponse{
 		Total:                     int32(total),
@@ -320,6 +388,8 @@ func (s *Server) PeerCount(ctx context.Context, req *pb.PeerCountRequest) (*pb.P
 		MeshMetagraphBinaries:     int32(mbPeers),
 		MeshMetagraphAttestations: int32(maPeers),
 		MeshAllowSpendBlocks:      int32(asbPeers),
+		MeshDagBlocks:             int32(dagPeers),
+		MeshTokenLockBlocks:       int32(tlbPeers),
 	}, nil
 }
 

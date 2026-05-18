@@ -2,7 +2,6 @@ package io.constellationnetwork.dag.l1
 
 import java.security.KeyPair
 
-import cats.Applicative
 import cats.data.OptionT
 import cats.effect.Async
 import cats.effect.std.{Random, Semaphore}
@@ -14,7 +13,6 @@ import cats.syntax.functor._
 import cats.syntax.order._
 import cats.syntax.show._
 import cats.syntax.traverse._
-import cats.syntax.traverseFilter._
 
 import scala.concurrent.duration.DurationInt
 
@@ -31,10 +29,12 @@ import io.constellationnetwork.kernel.CellError
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.domain.block.processing.BlockNotAcceptedReason
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
+import io.constellationnetwork.schema.Block
 import io.constellationnetwork.schema.height.Height
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo, StateProof}
 import io.constellationnetwork.security._
+import io.constellationnetwork.security.signature.Signed
 
 import fs2.{Pipe, Stream}
 import org.typelevel.log4cats.SelfAwareStructuredLogger
@@ -59,7 +59,15 @@ class StateChannel[
   services: Services[F, P, S, SI, R],
   storages: Storages[F, P, S, SI],
   validators: Validators[F],
-  txHasher: Hasher[F]
+  txHasher: Hasher[F],
+  // (#196 follow-up) Per-call-site dispatch for the L0 send hop. dl1 → gl0
+  // passes a sidecar-publish lambda (durable outbox); cl1 → cl0 keeps the
+  // single-peer HTTP POST shape (cl0 has no sidecar wiring). Decoupling here
+  // means the dl1 → gl0 fragility is fixed without changing the cl1 → cl0
+  // semantics that aren't broken. Errors are logged + swallowed inside this
+  // pipe; the lambda itself can no-op + log on failure or fail loudly — the
+  // contract here is "fire and observe".
+  sendBlockToL0Fn: Signed[Block] => F[Unit]
 ) {
 
   private implicit val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLogger[F]
@@ -179,24 +187,14 @@ class StateChannel[
       }
     }
 
+  // (#196 follow-up) Delegates the L0 send hop to the call-site-supplied
+  // `sendBlockToL0Fn`. dl1 → gl0 uses a sidecar-publish lambda (durable
+  // outbox path); cl1 → cl0 keeps the previous HTTP POST shape (cl0 doesn't
+  // run a sidecar). The pipe only sequences + logs at the outer layer; the
+  // lambda owns its own error handling so we don't blanket-eat sidecar
+  // errors into the cl0 path.
   private val sendBlockToL0: Pipe[F, FinalBlock, FinalBlock] =
-    _.evalTap { fb =>
-      storages.l0Cluster.getPeers
-        .map(_.toNonEmptyList.toList)
-        .flatMap(_.filterA(p => services.collateral.hasCollateral(p.id)))
-        .flatMap(peers => Random[F].shuffleList(peers))
-        .map(peers => peers.headOption)
-        .flatMap { maybeL0Peer =>
-          maybeL0Peer.fold(logger.warn("No available L0 peer")) { l0Peer =>
-            p2PClient.l0BlockOutputClient
-              .sendL1Output(fb.hashedBlock.signed)(l0Peer)
-              .ifM(Applicative[F].unit, logger.warn("Sending block to L0 failed."))
-          }
-        }
-        .handleErrorWith { err =>
-          logger.error(err)("Error sending block to L0")
-        }
-    }
+    _.evalTap(fb => sendBlockToL0Fn(fb.hashedBlock.signed))
 
   private val blockAcceptance: Stream[F, Unit] = Stream
     .awakeEvery(1.seconds)
@@ -265,7 +263,8 @@ object StateChannel {
     services: Services[F, P, S, SI, R],
     storages: Storages[F, P, S, SI],
     validators: Validators[F],
-    txHasher: Hasher[F]
+    txHasher: Hasher[F],
+    sendBlockToL0Fn: Signed[Block] => F[Unit]
   ): F[StateChannel[F, P, S, SI, R]] =
     for {
       blockAcceptanceS <- Semaphore(1)
@@ -285,6 +284,7 @@ object StateChannel {
         services,
         storages,
         validators,
-        txHasher
+        txHasher,
+        sendBlockToL0Fn
       )
 }

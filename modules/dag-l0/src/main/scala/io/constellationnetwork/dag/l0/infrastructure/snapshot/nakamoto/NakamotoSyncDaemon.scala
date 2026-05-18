@@ -234,6 +234,18 @@ object NakamotoSyncDaemon {
     enqueueAllowSpendBlock: io.constellationnetwork.security.signature.Signed[
       io.constellationnetwork.schema.swap.AllowSpendBlock
     ] => F[Unit],
+    // (#196 follow-up) Sinks for inbound DAGBlock + TokenLockBlock gossip.
+    // Replace the HTTP POST paths from DAGBlockRoutes (`/dag/l1-output`, via Cell
+    // pipeline → `queues.l1Output`) and TokenLockBlockRoutes (`/dag/l1-token-lock-output`,
+    // via direct offer → `queues.l1TokenLockOutput`). The Cell pipeline for DAGBlock
+    // was a pure pass-through in the L0Cell (processDAGL1 → enqueueDAGL1Data →
+    // queue.offer); the new gossip path skips that no-op layer.
+    enqueueDAGBlock: io.constellationnetwork.security.signature.Signed[
+      io.constellationnetwork.schema.Block
+    ] => F[Unit],
+    enqueueTokenLockBlock: io.constellationnetwork.security.signature.Signed[
+      io.constellationnetwork.schema.tokenLock.TokenLockBlock
+    ] => F[Unit],
     // Shared `Option` ref so other components (e.g. the reactive finality-walkback
     // ChainSyncRequestQueue) can route through the same hash-keyed dedup + fetch
     // machinery without needing their own `ChainSyncManager`. We publish our
@@ -424,6 +436,12 @@ object NakamotoSyncDaemon {
 
                           case pb.GossipMessage.Body.AllowSpendBlock(asb) =>
                             handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)
+
+                          case pb.GossipMessage.Body.DagBlock(blk) =>
+                            handleDAGBlock(blk, enqueueDAGBlock, logger)
+
+                          case pb.GossipMessage.Body.TokenLockBlock(blk) =>
+                            handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)
 
                           case _: pb.GossipMessage.Body.Rumor =>
                             Async[F].unit
@@ -1308,6 +1326,62 @@ object NakamotoSyncDaemon {
         case Right(signed) =>
           enqueue(signed)
             .handleErrorWith(e => logger.warn(s"⚠️ enqueueAllowSpendBlock failed: ${e.getMessage}"))
+      }
+  }
+
+  /** Route an incoming DAG block from gossip into the same `l1Output` queue the (now-removed) HTTP POST endpoint populated. The
+    * DAGBlockRoutes pipeline ran through L0Cell.processDAGL1 → EnqueueDAGL1Data → queue.offer; that path was a pure pass-through with no
+    * extra validation, so the new gossip path enqueues directly. Sender serializes `Signed[Block]` via JsonSerializer in
+    * `StateChannel.sendBlockToL0`; we use the same typeclass to deserialize. Errors are logged and swallowed — gossip is fire-and-forget.
+    * (#196 follow-up)
+    */
+  private def handleDAGBlock[F[_]: Async: io.constellationnetwork.json.JsonSerializer](
+    blk: pb.DAGBlock,
+    enqueue: io.constellationnetwork.security.signature.Signed[
+      io.constellationnetwork.schema.Block
+    ] => F[Unit],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] = {
+    import io.constellationnetwork.schema.Block
+    import io.constellationnetwork.security.signature.Signed
+
+    val bytes = blk.payload.toByteArray
+    io.constellationnetwork.json
+      .JsonSerializer[F]
+      .deserialize[Signed[Block]](bytes)
+      .flatMap {
+        case Left(err) =>
+          logger.warn(s"⚠️ Rejecting dag-block gossip: decode failed (${err.getMessage})")
+        case Right(signed) =>
+          enqueue(signed)
+            .handleErrorWith(e => logger.warn(s"⚠️ enqueueDAGBlock failed: ${e.getMessage}"))
+      }
+  }
+
+  /** Route an incoming TokenLockBlock from gossip into the same `l1TokenLockOutput` queue the (now-removed) HTTP POST endpoint populated.
+    * Sender serializes `Signed[TokenLockBlock]` via JsonSerializer in `TokenLock.sendBlockToL0`; we use the same typeclass to deserialize.
+    * Errors are logged and swallowed — gossip is fire-and-forget. (#196 follow-up)
+    */
+  private def handleTokenLockBlock[F[_]: Async: io.constellationnetwork.json.JsonSerializer](
+    blk: pb.TokenLockBlock,
+    enqueue: io.constellationnetwork.security.signature.Signed[
+      io.constellationnetwork.schema.tokenLock.TokenLockBlock
+    ] => F[Unit],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] = {
+    import io.constellationnetwork.schema.tokenLock.TokenLockBlock
+    import io.constellationnetwork.security.signature.Signed
+
+    val bytes = blk.payload.toByteArray
+    io.constellationnetwork.json
+      .JsonSerializer[F]
+      .deserialize[Signed[TokenLockBlock]](bytes)
+      .flatMap {
+        case Left(err) =>
+          logger.warn(s"⚠️ Rejecting token-lock-block gossip: decode failed (${err.getMessage})")
+        case Right(signed) =>
+          enqueue(signed)
+            .handleErrorWith(e => logger.warn(s"⚠️ enqueueTokenLockBlock failed: ${e.getMessage}"))
       }
   }
 

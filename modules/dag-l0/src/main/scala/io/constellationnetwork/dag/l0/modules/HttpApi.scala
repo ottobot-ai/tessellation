@@ -122,17 +122,6 @@ sealed abstract class HttpApi[
   maybeMarkSeen: Option[Hash => F[Unit]] = None
 ) {
 
-  private val mkDagCell = (block: Signed[Block]) =>
-    L0Cell
-      .mkL0Cell(
-        queues.l1Output,
-        queues.stateChannelOutput,
-        queues.updateNodeParametersOutput,
-        queues.delegatedStakeOutput,
-        queues.nodeCollateralOutput
-      )
-      .apply(L0CellInput.HandleDAGL1(block))
-
   private val mkNodeParametersCell = (params: Signed[UpdateNodeParameters]) =>
     L0Cell
       .mkL0Cell(
@@ -188,8 +177,6 @@ sealed abstract class HttpApi[
         services.sidecarClient
       )
     }
-  private val dagRoutes = DAGBlockRoutes[F](mkDagCell)
-  private val tokenLockBlockRoutes = TokenLockBlockRoutes[F](queues.l1TokenLockOutput)
   private val nodeParametersRoutes = HasherSelector[F].withCurrent { implicit hasher =>
     NodeParametersRoutes[F](
       mkNodeParametersCell,
@@ -266,12 +253,10 @@ sealed abstract class HttpApi[
                 clusterRoutes.publicRoutes <+>
                 snapshotRoutes.publicRoutes <+>
                 finalityTriggersRoutes.publicRoutes <+>
-                dagRoutes.publicRoutes <+>
                 walletRoutes.publicRoutes <+>
                 nodeRoutes.publicRoutes <+>
                 consensusInfoRoutes.publicRoutes <+>
                 tokenLockRoutes.publicRoutes <+>
-                tokenLockBlockRoutes.publicRoutes <+>
                 nodeParametersRoutes.publicRoutes <+>
                 delegatedStakesRoutes.publicRoutes <+>
                 nodeCollateralsRoutes.publicRoutes
