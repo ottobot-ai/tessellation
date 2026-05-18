@@ -1416,6 +1416,7 @@ object NakamotoSyncDaemon {
     *
     * The proto fields map 1:1 to `IncomingAttestation`:
     *   - `att.peerId` (UTF-8 hex bytes) → `senderPeerId`
+    *   - `att.vrfPublicKey` (32 bytes) → `senderVrfVk`
     *   - `att.metagraphAddress` (DAG base58 string) → `metagraphAddress`
     *   - `att.parentHash` (UTF-8 bytes of canonical Hash hex) → `parentHash`
     *   - `att.binaryHash` (UTF-8 bytes of canonical Hash hex) → `binaryHash`
@@ -1423,10 +1424,11 @@ object NakamotoSyncDaemon {
     *   - `att.signature` → `longTermSignature`
     *   - `att.kesSignature` → `kesSignature`
     *
-    * '''Note on `senderVrfVk`.''' The wire message does NOT carry the sender's committee VRF public key — that's looked up from the stake
-    * registry's published per-operator-key VRF VK. For v1 (degenerate K = N), all operator keys share the long-term peer-id keypair's
-    * derived VRF VK, so we re-derive it from `senderPeerId` via the same `VrfKeyDeriver` path the sender used. When per-operator-key VRF
-    * keys land (#180/§1.1 follow-up), this lookup moves to the stake registry.
+    * '''Why `vrf_public_key` is on the wire.''' The receiver can't re-derive the sender's VRF VK from `senderPeerId` alone: `VrfKeyDeriver`
+    * needs the sender's PRIVATE key. The S2/S3 wire format carries the sender's VRF VK directly so verification works for any operator the
+    * receiver hasn't yet observed. The gate's committee-VRF verifier checks `proof` against this VK; if the published VK is not the
+    * sender's true VK, the proof fails to verify and the attestation is dropped. When per-operator-key VRF keys land (#180), the field
+    * plumbs through unchanged — only the sender's source-of-VK shifts to the registration table.
     */
   private def handleMetagraphAttestation[F[_]: Async](
     att: pb.MetagraphAttestation,
@@ -1448,14 +1450,7 @@ object NakamotoSyncDaemon {
         val senderPeerId = peer.PeerId(senderHex)
         val parentHash = Hash(new String(att.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
         val binaryHash = Hash(new String(att.binaryHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
-        // Look up the sender's VRF VK by re-deriving from their long-term key. For v1 with the
-        // peer-id-derived VRF, this is correct by construction. The committee-VRF verifier uses
-        // this VK to check `proof`, then applies the threshold against σ_sender. If the sender's
-        // derived VK doesn't match the proof, the verifier returns `InvalidCommitteeVrf` and the
-        // attestation is dropped — fail-closed semantics.
-        val senderVrfVk =
-          io.constellationnetwork.security.vrf.VrfKeyDeriver
-            .deriveVrfSeed(senderPeerId.value.value.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+        val senderVrfVk = att.vrfPublicKey.toByteArray
         val incoming = IncomingAttestation(
           senderPeerId = senderPeerId,
           senderVrfVk = senderVrfVk,

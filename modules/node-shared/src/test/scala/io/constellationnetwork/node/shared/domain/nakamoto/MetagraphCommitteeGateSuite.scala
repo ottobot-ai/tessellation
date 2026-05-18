@@ -67,7 +67,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
           binaryHashBytes: Array[Byte],
           committeeVrfProof: Array[Byte],
           longTermSignature: Array[Byte],
-          kesSignature: Array[Byte]
+          kesSignature: Array[Byte],
+          vrfPublicKey: Array[Byte]
         ): IO[Unit] =
           ref.update(
             StubPublished(
@@ -77,7 +78,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
               new String(binaryHashBytes, java.nio.charset.StandardCharsets.UTF_8),
               committeeVrfProof.length,
               longTermSignature.length,
-              kesSignature.length
+              kesSignature.length,
+              vrfPublicKey.length
             ) :: _
           )
       }
@@ -91,7 +93,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
     binaryHash: String,
     proofLen: Int,
     edSigLen: Int,
-    kesSigLen: Int
+    kesSigLen: Int,
+    vrfVkLen: Int
   )
 
   /** Stub KES signer that always returns a deterministic 8-byte placeholder. The receiver-side test stubs KES-verify directly; the
@@ -115,8 +118,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
     ): IO[Boolean] = IO.pure(acceptFn(kesSigBytes))
   }
 
-  /** Build a `CommitteeSortition` and `Aggregator` pair plus a real `KeyPair`. K target controls in/out of committee — picking `K * sigma >=
-    * 1` puts us always-in-committee (threshold saturation), `K = 0` would be invalid; for "out of committee" we use σ=0.
+  /** Build a `CommitteeSortition` and `Aggregator` pair plus a real `KeyPair`. K target controls in/out of committee — picking `K * sigma
+    * >= 1` puts us always-in-committee (threshold saturation), `K = 0` would be invalid; for "out of committee" we use σ=0.
     */
   private def buildSortition(
     implicit h: Hasher[IO]
@@ -146,6 +149,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
         selfVrfSk = vrfSk,
+        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
         keyPair = kp,
         sortition = sortition,
         aggregator = agg,
@@ -190,6 +194,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
         selfVrfSk = vrfSk,
+        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
         keyPair = kp,
         sortition = sortition,
         aggregator = agg,
@@ -237,6 +242,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
         selfVrfSk = vrfSk,
+        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
         keyPair = kp,
         sortition = sortition,
         aggregator = agg,
@@ -279,6 +285,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
         selfVrfSk = vrfSk,
+        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
         keyPair = kp,
         sortition = sortition,
         aggregator = agg,
@@ -322,6 +329,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
         selfVrfSk = vrfSk,
+        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
         keyPair = selfKp,
         sortition = sortition,
         aggregator = agg,
@@ -341,13 +349,13 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       edSig <- io.constellationnetwork.security.signature.Signing.signData[IO](msgBytes)(senderKp.getPrivate)
       incoming = IncomingAttestation(
         senderPeerId = senderId,
-        senderVrfVk = Array.fill[Byte](32)(0xAA.toByte), // VRF would also fail since the proof is fake — we tag KES-fail first
+        senderVrfVk = Array.fill[Byte](32)(0xaa.toByte), // VRF would also fail since the proof is fake — we tag KES-fail first
         metagraphAddress = mg,
         parentHash = parent,
         binaryHash = binary,
-        committeeVrfProof = Array.fill[Byte](64)(0xBB.toByte),
+        committeeVrfProof = Array.fill[Byte](64)(0xbb.toByte),
         longTermSignature = edSig,
-        kesSignature = Array.fill[Byte](8)(0xCC.toByte) // present but verifier rejects
+        kesSignature = Array.fill[Byte](8)(0xcc.toByte) // present but verifier rejects
       )
       _ <- gate.recordReceivedAttestation(incoming, eta, _ => IO.pure(Ratio(1, 8)))
       count <- agg.countFor(mg, parent, binary)
@@ -373,7 +381,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       (sortition, agg) <- buildSortition
       (publisher, _) <- stubPublisher
       // Build a valid sender draw — VRF SK from a deterministic seed, K·σ=100·(1/1)=100 → in committee
-      senderVrfSk = Array.fill[Byte](32)(0xDD.toByte)
+      senderVrfSk = Array.fill[Byte](32)(0xdd.toByte)
       senderVrfVk = new io.constellationnetwork.security.vrf.EcVrf25519().getVerificationKey(senderVrfSk)
       drawResult <- sortition.isInCommittee(senderVrfSk, eta, mg, parent, Ratio(1, 1), kTarget)
       proof = drawResult.map(_._1).getOrElse(Array.empty[Byte])
@@ -383,7 +391,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       // Stub KES verifier accepts (sig length > 0 → accept)
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
-        selfVrfSk = Array.fill[Byte](32)(0xEE.toByte),
+        selfVrfSk = Array.fill[Byte](32)(0xee.toByte),
+        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
         keyPair = selfKp,
         sortition = sortition,
         aggregator = agg,
@@ -404,7 +413,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         binaryHash = binary,
         committeeVrfProof = proof,
         longTermSignature = edSig,
-        kesSignature = Array.fill[Byte](8)(0xFF.toByte) // non-empty → stub verifier accepts
+        kesSignature = Array.fill[Byte](8)(0xff.toByte) // non-empty → stub verifier accepts
       )
       _ <- gate.recordReceivedAttestation(incoming, eta, _ => IO.pure(Ratio(1, 1)))
       count <- agg.countFor(mg, parent, binary)
@@ -427,6 +436,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
         selfVrfSk = Array.fill[Byte](32)(0x11.toByte),
+        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
         keyPair = kp,
         sortition = sortition,
         aggregator = agg,

@@ -15,8 +15,8 @@ import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
 /** Typed read accessors over `GlobalStateReader[F]`, mirroring the `MptStoreReadOps` extension defined in `GlobalStateConverter` for
-  * `MptStore[F, GlobalStateKey]`. Lets call sites that already write `mptStore.getBalance(addr)` switch to `reader.getBalance(addr)`
-  * with no change to body code — the only difference is that `reader` resolves via the branch-aware path (under `OverlayMode.MultiBranch`
+  * `MptStore[F, GlobalStateKey]`. Lets call sites that already write `mptStore.getBalance(addr)` switch to `reader.getBalance(addr)` with
+  * no change to body code — the only difference is that `reader` resolves via the branch-aware path (under `OverlayMode.MultiBranch`
   * `pending` reader picks up the chain's pending writes, `finalized` reader reads base directly).
   *
   * Only the accessors actually used by the Phase 2 migrated sites are mirrored here — `getBalance`, `getDelegatedStakes`,

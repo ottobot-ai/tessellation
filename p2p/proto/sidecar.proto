@@ -150,6 +150,12 @@ message MetagraphAttestation {
   bytes committee_vrf_proof = 5; // committee VRF proof — gates membership
   bytes signature = 6;           // long-term-key signature over the canonical bytes
   bytes kes_signature = 7;       // KES product signature (Slice 9 path); empty during S2 warn-only
+  bytes vrf_public_key = 8;      // sender's committee VRF VK (32 bytes); receiver verifies committee_vrf_proof
+                                 // against this. Required because deriving the sender's VRF VK from the public
+                                 // peer-id alone is cryptographically impossible — `VrfKeyDeriver` needs the
+                                 // sender's PRIVATE key. When per-operator-key VRF keys land (#180), this field
+                                 // plumbs through unchanged; the source of the VK shifts on the sender side to
+                                 // the per-operator registration table.
 }
 
 // Envelope for GossipSub messages.

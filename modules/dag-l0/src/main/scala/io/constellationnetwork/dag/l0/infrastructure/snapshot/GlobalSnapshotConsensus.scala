@@ -776,7 +776,8 @@ object GlobalSnapshotConsensus {
               binaryHashBytes: Array[Byte],
               committeeVrfProof: Array[Byte],
               longTermSignature: Array[Byte],
-              kesSignature: Array[Byte]
+              kesSignature: Array[Byte],
+              vrfPublicKey: Array[Byte]
             ): F[Unit] = {
               val msg = io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
                 .mkMetagraphAttestation(
@@ -786,7 +787,8 @@ object GlobalSnapshotConsensus {
                   binaryHash = binaryHashBytes,
                   committeeVrfProof = committeeVrfProof,
                   signature = longTermSignature,
-                  kesSignature = kesSignature
+                  kesSignature = kesSignature,
+                  vrfPublicKey = vrfPublicKey
                 )
               sidecarClient.publishMetagraphAttestation(msg).void.handleErrorWith { e =>
                 committeeGateLogger.warn(s"Failed to publish metagraph attestation for $metagraphAddress: ${e.getMessage}")
@@ -809,6 +811,7 @@ object GlobalSnapshotConsensus {
             io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.make[F](
               selfPeerId = selfId,
               selfVrfSk = committeeVrfKeys._1,
+              selfVrfVk = committeeVrfKeys._2,
               keyPair = keyPair,
               sortition = committeeSortition,
               aggregator = committeeAggregator,
