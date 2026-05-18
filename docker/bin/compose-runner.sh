@@ -458,9 +458,15 @@ else
     cd ./nodes/$i/
 
     if [ "$i" -lt "$NUM_GL1_NODES" ]; then
+      # Apply nakamoto overlays for gl1 too — gl1 forwards DAG/AllowSpend/TokenLock
+      # blocks to gl0 via the sidecar (#196/#197), which requires the SIDECAR_HOST
+      # env defined in docker-compose.nakamoto-overlay.yaml's gl1 service block.
+      # Without these `-f` flags the overlay is silently skipped and gl1 falls back
+      # to 127.0.0.1:50051 with nothing listening → publishes silently drop.
       docker compose -f docker-compose.test.yaml \
       -f docker-compose.yaml \
       -f docker-compose.volumes.yaml \
+      $nakamoto_compose_args \
       --profile l1 \
       up -d
     fi
