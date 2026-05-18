@@ -40,3 +40,14 @@ services:
     depends_on:
       sidecar:
         condition: service_healthy
+  gl1:
+    environment:
+      # #196/#197: gl1 forwards DAG/AllowSpend/TokenLock blocks to gl0 via the
+      # sidecar's libp2p mesh (replacing the prior single-peer HTTP POST). Same
+      # SIDECAR_HOST format as gl0 — each gl1-N container colocates with sidecar-N
+      # on the matching CONTAINER_NAME_SUFFIX so the gRPC call stays local-network.
+      - SIDECAR_HOST=sidecar${CONTAINER_NAME_SUFFIX:-}
+      - SIDECAR_GRPC_PORT=50051
+    depends_on:
+      sidecar:
+        condition: service_healthy
