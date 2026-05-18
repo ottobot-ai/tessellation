@@ -18,6 +18,7 @@ import io.constellationnetwork.node.shared.app._
 import io.constellationnetwork.node.shared.app.{DagL1 => DagL1Layer}
 import io.constellationnetwork.node.shared.ext.pureconfig._
 import io.constellationnetwork.node.shared.infrastructure.DagL1
+import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.node.shared.infrastructure.gossip.{GossipDaemon, RumorHandlers}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.LastNGlobalSnapshotStorage
 import io.constellationnetwork.node.shared.resources.MkHttpServer
@@ -105,6 +106,17 @@ object Main
         cfg.priorityPeerIds,
         cfg.environment
       ).asResource
+
+      // Sidecar gRPC client for libp2p GossipSub (#196). Replaces the
+      // single-peer HTTP POST path from Swap.sendBlockToL0 with a durable
+      // outbox publish. Held as a Resource so the gRPC channel is shut
+      // down cleanly on app teardown.
+      sidecarClient <- SidecarClient.makeResource[IO](
+        SidecarClient.SidecarConfig(
+          host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
+          grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
+        )
+      )
       services = Services.make[IO, GlobalSnapshotStateProof, GlobalIncrementalSnapshot, GlobalSnapshotInfo, Run](
         storages,
         storages.lastSnapshot,
@@ -195,10 +207,9 @@ object Main
         Swap.run(
           cfg.swap,
           storages.cluster,
-          storages.l0Cluster,
           storages.lastSnapshot,
           storages.node,
-          p2pClient.l0BlockOutputClient,
+          sidecarClient,
           p2pClient.swapConsensusClient,
           services,
           storages.allowSpend,

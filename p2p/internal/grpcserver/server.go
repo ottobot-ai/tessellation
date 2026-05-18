@@ -12,7 +12,18 @@ import (
 
 	"github.com/scasplte2/tessellation/p2p/internal/chainsync"
 	"github.com/scasplte2/tessellation/p2p/internal/gossip"
+	"github.com/scasplte2/tessellation/p2p/internal/outbox"
 	pb "github.com/scasplte2/tessellation/p2p/proto"
+)
+
+// Topic name labels used on the outbox + ConfirmFinalized wire. Kept in one
+// place so the JVM caller can match by string literal — these are the
+// authoritative names. Distinct from the GossipSub topic strings (which are
+// versioned multistream paths); the outbox labels are short and stable.
+const (
+	TopicAllowSpendBlock      = "allow-spend-block"
+	TopicMetagraphBinary      = "metagraph-binary"
+	TopicMetagraphAttestation = "metagraph-attestation"
 )
 
 // Server implements the SidecarService and ChainSyncOutbound gRPC interfaces.
@@ -22,15 +33,20 @@ type Server struct {
 
 	node      *gossip.Node
 	chainSync *chainsync.Handler
+	outbox    *outbox.Outbox
 	startedAt time.Time
 	grpcSrv   *grpc.Server
 }
 
-// New creates a gRPC server backed by the gossip node.
-func New(node *gossip.Node, cs *chainsync.Handler) *Server {
+// New creates a gRPC server backed by the gossip node. The outbox is the
+// shared durable-publish ledger (#196); the same instance is also held by
+// the republish goroutine in main.go so confirmed entries disappear from
+// the periodic resend immediately.
+func New(node *gossip.Node, cs *chainsync.Handler, ob *outbox.Outbox) *Server {
 	return &Server{
 		node:      node,
 		chainSync: cs,
+		outbox:    ob,
 		startedAt: time.Now(),
 	}
 }
@@ -108,7 +124,8 @@ func (s *Server) PublishRumor(ctx context.Context, ru *pb.Rumor) (*pb.PublishRes
 
 // PublishMetagraphBinary broadcasts a state channel snapshot binary to all
 // GL0 nodes over the metagraph-binary topic. Opaque payload — sidecar only
-// wraps and routes.
+// wraps and routes. Tracked in the outbox so the periodic ticker can resend
+// if a transient mesh stall ate the first publish (#196).
 func (s *Server) PublishMetagraphBinary(ctx context.Context, mb *pb.MetagraphBinary) (*pb.PublishResponse, error) {
 	data, err := proto.Marshal(mb)
 	if err != nil {
@@ -117,12 +134,17 @@ func (s *Server) PublishMetagraphBinary(ctx context.Context, mb *pb.MetagraphBin
 	if err := s.node.PublishMetagraphBinary(ctx, data); err != nil {
 		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
 	}
+	// Outbox key = sha256 of the SIGNED PAYLOAD (mb.Binary), not the
+	// proto-marshalled wrapper. The JVM addresses entries by the bytes it
+	// serialized, not by the proto envelope it built around them. Same
+	// rule for the other two topics below.
+	s.outbox.Add(TopicMetagraphBinary, outbox.MsgIDFor(mb.Binary), data)
 	return &pb.PublishResponse{Ok: true}, nil
 }
 
 // PublishMetagraphAttestation broadcasts a per-metagraph committee attestation
 // (Slice S2) to all GL0 nodes over the metagraph-attestation topic. Opaque
-// payload — sidecar only wraps and routes.
+// payload — sidecar only wraps and routes. Outbox-tracked (#196).
 func (s *Server) PublishMetagraphAttestation(ctx context.Context, ma *pb.MetagraphAttestation) (*pb.PublishResponse, error) {
 	data, err := proto.Marshal(ma)
 	if err != nil {
@@ -131,7 +153,45 @@ func (s *Server) PublishMetagraphAttestation(ctx context.Context, ma *pb.Metagra
 	if err := s.node.PublishMetagraphAttestation(ctx, data); err != nil {
 		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
 	}
+	// MetagraphAttestation id = sha256 of the wire-level proto-marshalled
+	// bytes (task brief §JVM hook). Unlike MetagraphBinary, the attestation
+	// has no single "payload" field — the entire structured message IS the
+	// payload. Both sender and receiver compute the id from these bytes.
+	s.outbox.Add(TopicMetagraphAttestation, outbox.MsgIDFor(data), data)
 	return &pb.PublishResponse{Ok: true}, nil
+}
+
+// PublishAllowSpendBlock broadcasts a Signed[AllowSpendBlock] to all GL0
+// nodes over the allow-spend-block topic. Replaces the single-peer HTTP POST
+// from Swap.sendBlockToL0 — the prior code's "pick a random peer" lottery
+// dropped the block when the chosen peer was in reorg-recovery
+// (iter-s3prep-baseline-mg4 diagnostic). Outbox-tracked so transient mesh
+// stalls don't drop the block; the JVM acks via ConfirmFinalized after the
+// block reaches Phase-3 finality on a global snapshot. (#196)
+func (s *Server) PublishAllowSpendBlock(ctx context.Context, asb *pb.AllowSpendBlock) (*pb.PublishResponse, error) {
+	data, err := proto.Marshal(asb)
+	if err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	if err := s.node.PublishAllowSpendBlock(ctx, data); err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	// Outbox id = sha256 of the inner Signed[AllowSpendBlock] payload —
+	// matches how the JVM addresses the block in ConfirmFinalized.
+	s.outbox.Add(TopicAllowSpendBlock, outbox.MsgIDFor(asb.Payload), data)
+	return &pb.PublishResponse{Ok: true}, nil
+}
+
+// ConfirmFinalized drops outbox entries for the named ids on the named
+// topic. Called by the JVM Phase-3 finality hook after a global snapshot
+// is fully finalized — at that point the entries it includes are durably
+// committed network-wide and the sidecar can stop re-gossiping. Idempotent
+// at every level: duplicate confirmations and unknown ids are silently
+// accepted; the response carries the actual number of entries dropped so
+// JVM-side logs can detect total-mismatch (a real bug worth surfacing).
+func (s *Server) ConfirmFinalized(ctx context.Context, req *pb.ConfirmFinalizedRequest) (*pb.ConfirmFinalizedResponse, error) {
+	dropped := s.outbox.Confirm(req.Topic, req.MessageIds)
+	return &pb.ConfirmFinalizedResponse{Dropped: int32(dropped)}, nil
 }
 
 // Subscribe streams incoming gossip messages to the JVM.
@@ -143,6 +203,7 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 	ruCh := s.node.RumorMessages(ctx)
 	mbCh := s.node.MetagraphBinaryMessages(ctx)
 	maCh := s.node.MetagraphAttestationMessages(ctx)
+	asbCh := s.node.AllowSpendBlockMessages(ctx)
 	reconnectCh := s.node.ReconnectCh()
 
 	for {
@@ -226,6 +287,21 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 				return err
 			}
 
+		case data, ok := <-asbCh:
+			if !ok {
+				return nil
+			}
+			var asb pb.AllowSpendBlock
+			if err := proto.Unmarshal(data, &asb); err != nil {
+				continue
+			}
+			msg := &pb.GossipMessage{
+				Body: &pb.GossipMessage_AllowSpendBlock{AllowSpendBlock: &asb},
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -234,7 +310,7 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 
 // PeerCount returns mesh membership stats.
 func (s *Server) PeerCount(ctx context.Context, req *pb.PeerCountRequest) (*pb.PeerCountResponse, error) {
-	snPeers, atPeers, ruPeers, mbPeers, maPeers := s.node.MeshPeerCount()
+	snPeers, atPeers, ruPeers, mbPeers, maPeers, asbPeers := s.node.MeshPeerCount()
 	total := len(s.node.Host.Network().Peers())
 	return &pb.PeerCountResponse{
 		Total:                     int32(total),
@@ -243,6 +319,7 @@ func (s *Server) PeerCount(ctx context.Context, req *pb.PeerCountRequest) (*pb.P
 		MeshRumors:                int32(ruPeers),
 		MeshMetagraphBinaries:     int32(mbPeers),
 		MeshMetagraphAttestations: int32(maPeers),
+		MeshAllowSpendBlocks:      int32(asbPeers),
 	}, nil
 }
 

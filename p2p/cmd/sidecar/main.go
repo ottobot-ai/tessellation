@@ -26,6 +26,7 @@ import (
 	"github.com/scasplte2/tessellation/p2p/internal/grpcserver"
 	"github.com/scasplte2/tessellation/p2p/internal/httpbridge"
 	"github.com/scasplte2/tessellation/p2p/internal/metrics"
+	"github.com/scasplte2/tessellation/p2p/internal/outbox"
 )
 
 func main() {
@@ -53,6 +54,9 @@ func main() {
 	flag.IntVar(&cfg.RumorBufferSize, "rumor-buffer", cfg.RumorBufferSize, "per-subscriber relay buffer size for rumors")
 	flag.IntVar(&cfg.MetagraphBinaryBufferSize, "metagraph-binary-buffer", cfg.MetagraphBinaryBufferSize, "per-subscriber relay buffer size for metagraph binaries")
 	flag.IntVar(&cfg.MetagraphAttestationBufferSize, "metagraph-attestation-buffer", cfg.MetagraphAttestationBufferSize, "per-subscriber relay buffer size for metagraph attestations")
+	flag.IntVar(&cfg.AllowSpendBlockBufferSize, "allow-spend-block-buffer", cfg.AllowSpendBlockBufferSize, "per-subscriber relay buffer size for allow-spend blocks")
+	flag.DurationVar(&cfg.OutboxRepublishInterval, "outbox-republish-interval", cfg.OutboxRepublishInterval, "outbox re-publish cadence (#196)")
+	flag.DurationVar(&cfg.OutboxTTL, "outbox-ttl", cfg.OutboxTTL, "outbox entry max age before drop without confirmation (#196)")
 
 	var generateKey bool
 	var showPeerID bool
@@ -173,7 +177,14 @@ func main() {
 	for _, addr := range node.Host.Addrs() {
 		fmt.Printf("  Listen: %s/p2p/%s\n", addr, node.Host.ID())
 	}
-	fmt.Printf("  Topics: %s, %s, %s\n", cfg.SnapshotTopic, cfg.AttestationTopic, cfg.RumorTopic)
+	fmt.Printf("  Topics: %s, %s, %s, %s, %s, %s\n",
+		cfg.SnapshotTopic,
+		cfg.AttestationTopic,
+		cfg.RumorTopic,
+		cfg.MetagraphBinaryTopic,
+		cfg.MetagraphAttestationTopic,
+		cfg.AllowSpendBlockTopic,
+	)
 	fmt.Printf("  gRPC:   %s\n", cfg.GRPCAddr)
 
 	// Bootstrap the Kademlia DHT routing table and start the rendezvous
@@ -264,8 +275,17 @@ func main() {
 		fmt.Printf("  ChainSync: /nakamoto/chainsync/1.0.0 (JVM inbound: %s)\n", jvmGRPCAddr)
 	}
 
+	// Durable-publish outbox (#196). The same instance is wired into the gRPC
+	// server (where Publish handlers Add and ConfirmFinalized Confirm) AND
+	// into the republish goroutine below (which re-publishes due entries on
+	// a ticker). In-memory only — if the sidecar crashes the JVM resubmits
+	// on reconnect.
+	ob := outbox.New(cfg.OutboxRepublishInterval, cfg.OutboxTTL)
+	fmt.Printf("  Outbox: republish=%s ttl=%s\n", cfg.OutboxRepublishInterval, cfg.OutboxTTL)
+	startOutboxRepublisher(ctx, node, ob, cfg.OutboxRepublishInterval)
+
 	// Start gRPC server (blocks until shutdown)
-	srv := grpcserver.New(node, csHandler)
+	srv := grpcserver.New(node, csHandler, ob)
 	go func() {
 		<-ctx.Done()
 		srv.Stop()
@@ -275,4 +295,61 @@ func main() {
 		fmt.Fprintf(os.Stderr, "ERROR: gRPC server: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// startOutboxRepublisher launches a single goroutine that ticks every
+// `interval` and (a) prunes TTL-expired entries, (b) re-publishes due
+// entries. Routing per-topic to the correct gossip primitive keeps
+// the outbox itself transport-agnostic. The goroutine exits when ctx is
+// done. See task #196.
+func startOutboxRepublisher(ctx context.Context, node *gossip.Node, ob *outbox.Outbox, interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+			if dropped := ob.Prune(); dropped > 0 {
+				fmt.Printf("outbox: pruned %d TTL-expired entries (Phase-3 finality stalled?)\n", dropped)
+				metrics.OutboxPrunedTTL.Add(float64(dropped))
+			}
+			due := ob.DueForRepublish()
+			for _, e := range due {
+				// Route by topic label — single static switch, no
+				// indirection. The published bytes are exactly the
+				// proto-marshalled wrapper the Publish RPC produced.
+				var perr error
+				switch e.Topic {
+				case grpcserver.TopicAllowSpendBlock:
+					perr = node.PublishAllowSpendBlock(ctx, e.Payload)
+				case grpcserver.TopicMetagraphBinary:
+					perr = node.PublishMetagraphBinary(ctx, e.Payload)
+				case grpcserver.TopicMetagraphAttestation:
+					perr = node.PublishMetagraphAttestation(ctx, e.Payload)
+				default:
+					// Unknown topic in outbox — bug elsewhere; drop the
+					// entry so it doesn't loop forever.
+					fmt.Printf("outbox: unknown topic %q, dropping entry\n", e.Topic)
+					ob.Confirm(e.Topic, [][]byte{e.MsgID})
+					continue
+				}
+				if perr != nil {
+					// Don't drop the entry — next tick will try again.
+					// Single log line per re-publish failure is loud
+					// enough; volume goes nowhere unless the mesh is
+					// actually broken.
+					fmt.Printf("outbox: republish %s/%x failed: %v\n", e.Topic, e.MsgID[:8], perr)
+				}
+				// Update LastRepublishedAt regardless of publish error —
+				// a publish that errored is still "we tried recently",
+				// which is exactly the semantic the rate-limit wants.
+				ob.MarkRepublished(e.Topic, e.MsgID)
+				metrics.OutboxRepublished.Inc()
+			}
+			metrics.OutboxSize.Set(float64(ob.Size()))
+		}
+	}()
 }

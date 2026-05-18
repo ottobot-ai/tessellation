@@ -189,7 +189,6 @@ sealed abstract class HttpApi[
       )
     }
   private val dagRoutes = DAGBlockRoutes[F](mkDagCell)
-  private val allowSpendRoutes = AllowSpendBlockRoutes[F](queues.l1AllowSpendOutput)
   private val tokenLockBlockRoutes = TokenLockBlockRoutes[F](queues.l1TokenLockOutput)
   private val nodeParametersRoutes = HasherSelector[F].withCurrent { implicit hasher =>
     NodeParametersRoutes[F](
@@ -271,7 +270,6 @@ sealed abstract class HttpApi[
                 walletRoutes.publicRoutes <+>
                 nodeRoutes.publicRoutes <+>
                 consensusInfoRoutes.publicRoutes <+>
-                allowSpendRoutes.publicRoutes <+>
                 tokenLockRoutes.publicRoutes <+>
                 tokenLockBlockRoutes.publicRoutes <+>
                 nodeParametersRoutes.publicRoutes <+>

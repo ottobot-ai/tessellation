@@ -165,6 +165,14 @@ object Services {
           case None => Async[F].unit
         }
 
+      // (#196) Sink for inbound AllowSpendBlock gossip — same queue
+      // GlobalSnapshotEventsPublisherDaemon drains into the event mempool. The
+      // HTTP route that previously did this offer (AllowSpendBlockRoutes) was
+      // removed in the same change; this is now the sole entry point.
+      enqueueAllowSpendBlock = (signed: io.constellationnetwork.security.signature.Signed[
+        io.constellationnetwork.schema.swap.AllowSpendBlock
+      ]) => queues.l1AllowSpendOutput.offer(signed)
+
       consensus <- HasherSelector[F].withCurrent { implicit hs =>
         GlobalSnapshotConsensus
           .make[F, R](
@@ -202,6 +210,7 @@ object Services {
             nakamotoFinalizedOrdinalRef,
             finalityTriggerViewRef,
             processMetagraphBinary,
+            enqueueAllowSpendBlock,
             sidecarClient,
             kesRegistry
           )

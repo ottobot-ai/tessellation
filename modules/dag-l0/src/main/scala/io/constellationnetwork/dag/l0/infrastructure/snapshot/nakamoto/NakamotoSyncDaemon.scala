@@ -226,6 +226,14 @@ object NakamotoSyncDaemon {
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     dataDir: java.nio.file.Path,
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
+    // (#196) Sink for inbound AllowSpendBlock gossip — same queue
+    // GlobalSnapshotEventsPublisherDaemon drains into the event mempool.
+    // Replaces the HTTP POST path from AllowSpendBlockRoutes (which was
+    // wired to `queues.l1AllowSpendOutput`); the new outbox-backed gossip
+    // path feeds the same queue from a different transport.
+    enqueueAllowSpendBlock: io.constellationnetwork.security.signature.Signed[
+      io.constellationnetwork.schema.swap.AllowSpendBlock
+    ] => F[Unit],
     // Shared `Option` ref so other components (e.g. the reactive finality-walkback
     // ChainSyncRequestQueue) can route through the same hash-keyed dedup + fetch
     // machinery without needing their own `ChainSyncManager`. We publish our
@@ -413,6 +421,9 @@ object NakamotoSyncDaemon {
                             // wiring is Slice S3 (load-bearing pre-inclusion gate). No-op here
                             // keeps the gossip stream flowing in the warn-only window.
                             Async[F].unit
+
+                          case pb.GossipMessage.Body.AllowSpendBlock(asb) =>
+                            handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)
 
                           case _: pb.GossipMessage.Body.Rumor =>
                             Async[F].unit
@@ -1271,6 +1282,33 @@ object NakamotoSyncDaemon {
         } yield ()
       }
     }
+  }
+
+  /** Route an incoming AllowSpendBlock from gossip into the same `l1AllowSpendOutput` queue the (now-removed) HTTP POST endpoint populated.
+    * Sender serializes `Signed[AllowSpendBlock]` via JsonSerializer in `Swap.sendBlockToL0`; we use the same typeclass to deserialize.
+    * Errors (decode failure) are logged and swallowed — gossip is fire-and-forget. (#196)
+    */
+  private def handleAllowSpendBlock[F[_]: Async: io.constellationnetwork.json.JsonSerializer](
+    asb: pb.AllowSpendBlock,
+    enqueue: io.constellationnetwork.security.signature.Signed[
+      io.constellationnetwork.schema.swap.AllowSpendBlock
+    ] => F[Unit],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] = {
+    import io.constellationnetwork.schema.swap.AllowSpendBlock
+    import io.constellationnetwork.security.signature.Signed
+
+    val bytes = asb.payload.toByteArray
+    io.constellationnetwork.json
+      .JsonSerializer[F]
+      .deserialize[Signed[AllowSpendBlock]](bytes)
+      .flatMap {
+        case Left(err) =>
+          logger.warn(s"⚠️ Rejecting allow-spend-block gossip: decode failed (${err.getMessage})")
+        case Right(signed) =>
+          enqueue(signed)
+            .handleErrorWith(e => logger.warn(s"⚠️ enqueueAllowSpendBlock failed: ${e.getMessage}"))
+      }
   }
 
   /** Route an incoming state channel binary from gossip into the same acceptance pipeline as the HTTP POST endpoint. The sender serialized

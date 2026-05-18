@@ -157,6 +157,12 @@ object GlobalSnapshotConsensus {
     // Invoked by NakamotoSyncDaemon when a metagraph-binary arrives via gossip.
     // Routes the binary through the same pipeline as the HTTP endpoint (stateChannelService.process).
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
+    // (#196) Invoked by NakamotoSyncDaemon when an AllowSpendBlock arrives via gossip.
+    // Feeds the same `l1AllowSpendOutput` queue that the now-removed HTTP route fed; the
+    // GlobalSnapshotEventsPublisherDaemon drains the queue into the event mempool unchanged.
+    enqueueAllowSpendBlock: io.constellationnetwork.security.signature.Signed[
+      io.constellationnetwork.schema.swap.AllowSpendBlock
+    ] => F[Unit],
     // Created in Services.make (hoisted so HTTP routes and stateChannelService can also publish).
     sidecarClient: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarClientAlgebra[F],
     // §1.2 Slice 3c: (peerId → KES master VK) registry loaded from L0 genesis. Empty for the CSV-
@@ -808,6 +814,7 @@ object GlobalSnapshotConsensus {
                   eventMempool = eventMempool,
                   dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data")),
                   processMetagraphBinary = processMetagraphBinary,
+                  enqueueAllowSpendBlock = enqueueAllowSpendBlock,
                   sharedChainSyncManagerRef = sharedChainSyncManagerRef,
                   // §1.2 Slice 5/6/9: KES sender-side signing + receiver-side load-bearing verify.
                   // Always-on; no env flag — verification failures drop the message.

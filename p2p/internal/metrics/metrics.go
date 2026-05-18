@@ -68,6 +68,37 @@ var (
 			Help: "Number of peers in the Kademlia DHT routing table.",
 		},
 	)
+
+	// OutboxSize tracks the number of entries the outbox is holding for
+	// periodic re-gossip. Should drop to near-zero after each Phase-3
+	// finality batch; a steady non-zero count means finality is stalled or
+	// the JVM-side ConfirmFinalized ack path is broken. (#196)
+	OutboxSize = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sidecar_outbox_entries",
+			Help: "Number of unconfirmed entries held in the outbox.",
+		},
+	)
+
+	// OutboxRepublished counts entries the outbox re-published due to no
+	// confirmation arriving within republish_interval. A sustained non-zero
+	// rate indicates mesh degradation or JVM-side confirmation delay.
+	OutboxRepublished = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sidecar_outbox_republished_total",
+			Help: "Total outbox entries re-published by the periodic ticker.",
+		},
+	)
+
+	// OutboxPrunedTTL counts entries the outbox dropped due to TTL expiry
+	// without confirmation. Non-zero means finality didn't reach a topic's
+	// message before its TTL — investigate the JVM finalize path.
+	OutboxPrunedTTL = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sidecar_outbox_pruned_ttl_total",
+			Help: "Total outbox entries dropped without confirmation due to TTL expiry.",
+		},
+	)
 )
 
 func init() {
@@ -78,6 +109,9 @@ func init() {
 		MeshPeers,
 		ConnectedPeers,
 		DHTRoutingTableSize,
+		OutboxSize,
+		OutboxRepublished,
+		OutboxPrunedTTL,
 	)
 }
 
@@ -88,6 +122,7 @@ type TopicSet struct {
 	Rumor                *pubsub.Topic
 	MetagraphBinary      *pubsub.Topic
 	MetagraphAttestation *pubsub.Topic
+	AllowSpendBlock      *pubsub.Topic
 }
 
 // StartGaugeUpdater launches a background goroutine that periodically updates
@@ -108,6 +143,9 @@ func StartGaugeUpdater(ctx context.Context, h host.Host, kadDHT *dht.IpfsDHT, to
 			}
 			if topics.MetagraphAttestation != nil {
 				MeshPeers.WithLabelValues("metagraph_attestation").Set(float64(len(topics.MetagraphAttestation.ListPeers())))
+			}
+			if topics.AllowSpendBlock != nil {
+				MeshPeers.WithLabelValues("allow_spend_block").Set(float64(len(topics.AllowSpendBlock.ListPeers())))
 			}
 
 			// Total connected peers

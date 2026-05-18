@@ -86,6 +86,16 @@ message MetagraphBinary {
   bytes binary = 2;
 }
 
+// AllowSpend block produced by a metagraph dl1, broadcast to all GL0 nodes via
+// GossipSub. Replaces the single-peer HTTP POST path from `Swap.sendBlockToL0`
+// (task #196: lottery to one gl0 peer hits unhealthy nodes in reorg-recovery
+// and drops the block). The sidecar treats the payload as opaque; the JVM
+// serializes Signed[AllowSpendBlock] via the project JsonSerializer.
+message AllowSpendBlock {
+  // Signed[AllowSpendBlock] bytes, opaque to the sidecar.
+  bytes payload = 1;
+}
+
 // Per-metagraph committee attestation (Slice S2, task #188).
 //
 // Emitted by a gl0 operator key that wins the committee VRF for a given
@@ -127,6 +137,7 @@ message GossipMessage {
     Rumor rumor = 3;
     MetagraphBinary metagraph_binary = 4;
     MetagraphAttestation metagraph_attestation = 5;
+    AllowSpendBlock allow_spend_block = 6;
   }
 }
 
@@ -148,6 +159,16 @@ service SidecarService {
 
   // Publish a per-metagraph committee attestation to all GL0 nodes (Slice S2).
   rpc PublishMetagraphAttestation(MetagraphAttestation) returns (PublishResponse);
+
+  // Publish an AllowSpendBlock to all GL0 nodes via the durable outbox path
+  // (task #196: replaces the single-peer HTTP POST from Swap.sendBlockToL0).
+  rpc PublishAllowSpendBlock(AllowSpendBlock) returns (PublishResponse);
+
+  // JVM tells sidecar that the listed message_ids on `topic` reached Phase-3
+  // finality. The sidecar drops the corresponding outbox entries; until this
+  // call arrives the outbox keeps republishing them periodically. Idempotent
+  // — unknown ids are silently ignored. See task #196.
+  rpc ConfirmFinalized(ConfirmFinalizedRequest) returns (ConfirmFinalizedResponse);
 
   // Subscribe to incoming messages from the network.
   // Server-streaming: sidecar pushes received gossip to JVM.
@@ -179,6 +200,24 @@ message PeerCountResponse {
   int32 mesh_rumors = 4;                 // peers in rumor topic mesh
   int32 mesh_metagraph_binaries = 5;     // peers in metagraph binary topic mesh
   int32 mesh_metagraph_attestations = 6; // peers in metagraph attestation topic mesh (Slice S2)
+  int32 mesh_allow_spend_blocks = 7;     // peers in allow-spend-block topic mesh (#196)
+}
+
+// ConfirmFinalized request: drop outbox entries for the given message ids on
+// the named topic. Used by the JVM Phase-3 finality hook to ack durable-outbox
+// delivery. Sent in batches at finalize time.
+message ConfirmFinalizedRequest {
+  // Topic the message_ids belong to (e.g. "allow-spend-block",
+  // "metagraph-binary", "metagraph-attestation").
+  string topic = 1;
+  // Message ids previously assigned by the sidecar on Publish; each is the
+  // first 32 bytes of sha256(payload). Unknown ids are ignored.
+  repeated bytes message_ids = 2;
+}
+
+message ConfirmFinalizedResponse {
+  // Number of outbox entries actually dropped. 0 if all ids were unknown.
+  int32 dropped = 1;
 }
 
 message HealthRequest {}

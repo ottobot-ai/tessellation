@@ -21,6 +21,7 @@ type Config struct {
 	RumorTopic                string
 	MetagraphBinaryTopic      string
 	MetagraphAttestationTopic string
+	AllowSpendBlockTopic      string
 
 	// GossipSub parameters
 	MeshD   int // target mesh degree (default 6)
@@ -40,6 +41,22 @@ type Config struct {
 	RumorBufferSize                int
 	MetagraphBinaryBufferSize      int
 	MetagraphAttestationBufferSize int
+	AllowSpendBlockBufferSize      int
+
+	// Outbox parameters. The sidecar keeps an in-memory ledger of recently-
+	// published AllowSpendBlock / MetagraphBinary / MetagraphAttestation
+	// messages and re-publishes them on a ticker until the JVM acknowledges
+	// Phase-3 finality via ConfirmFinalized. See task #196 / outbox package.
+	//
+	// OutboxRepublishInterval: minimum age of an entry's last publish before
+	//   the ticker re-publishes it. Default 30s — balances "loud enough to
+	//   recover from transient mesh degradation" against "not flooding the
+	//   topic when finality is just slow".
+	// OutboxTTL: maximum age of an unconfirmed entry. After this, the entry
+	//   is dropped without confirmation; the JVM will eventually re-submit
+	//   on reconnect (sidecar restart is the disaster fallback). Default 1h.
+	OutboxRepublishInterval time.Duration
+	OutboxTTL               time.Duration
 
 	// PrivateKey is the libp2p identity key (Ed25519).
 	// If empty, a new one is generated each run.
@@ -65,6 +82,7 @@ func DefaultConfig() Config {
 		RumorTopic:                "/tessellation/rumors/1.0.0",
 		MetagraphBinaryTopic:      "/tessellation/metagraph-binaries/1.0.0",
 		MetagraphAttestationTopic: "/tessellation/metagraph-attestations/1.0.0",
+		AllowSpendBlockTopic:      "/tessellation/allow-spend-blocks/1.0.0",
 		MeshD:                     6,
 		MeshDLo:                   4,
 		MeshDHi:                   12,
@@ -81,5 +99,11 @@ func DefaultConfig() Config {
 		RumorBufferSize:                1024,
 		MetagraphBinaryBufferSize:      256,
 		MetagraphAttestationBufferSize: 256,
+		// AllowSpendBlock: single fb produced per dl1 swap consensus round
+		// (~5s cadence in prod), so burst rate is comparable to metagraph
+		// binaries. Same 256-slot buffer.
+		AllowSpendBlockBufferSize: 256,
+		OutboxRepublishInterval:   30 * time.Second,
+		OutboxTTL:                 1 * time.Hour,
 	}
 }
