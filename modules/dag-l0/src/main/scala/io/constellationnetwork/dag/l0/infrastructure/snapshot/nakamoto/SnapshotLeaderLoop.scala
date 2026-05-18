@@ -333,7 +333,14 @@ object SnapshotLeaderLoop {
     // function; `etaRotationSnapshots` is already in this signature above so we don't add it.
     // Receivers (NakamotoSyncDaemon) re-derive the same period from the wire ordinal and
     // verify with the master VK looked up in the registry — warn-only this slice.
-    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F]
+    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
+    // Slice S3: invoked at finalize sinks (depth-k AND attestation-2/3) with the canonical
+    // GlobalIncrementalSnapshot. Iterates `stateChannelSnapshots` to drop `(metagraphAddress,
+    // parentHash)` tally entries from the committee-attestation aggregator once their binary
+    // has rolled into a finalized global snapshot. Without this the aggregator grows
+    // monotonically (one entry per `(metagraph, parent, binary)` seen on the wire). Callers
+    // that haven't wired the gate yet can pass `_ => Async[F].unit`.
+    onFinalize: io.constellationnetwork.schema.GlobalIncrementalSnapshot => F[Unit]
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -706,6 +713,10 @@ object SnapshotLeaderLoop {
                                           // catches it eventually and the next finalize call would re-confirm
                                           // anyway (Confirm is idempotent on the sidecar side).
                                           confirmSnapshotOutbox(canonicalSnapshot, sidecarClient, logger) >>
+                                          // Slice S3: drop committee-attestation tally entries for `(metagraphAddress,
+                                          // parentHash)` pairs whose binary just rolled into a finalized gl0 snapshot.
+                                          // Default is a no-op; the gate-wired path iterates `stateChannelSnapshots`.
+                                          onFinalize(canonicalSnapshot.signedSnapshot.value) >>
                                           // #56.6: notify the MPT overlay that this branch is finalized. With
                                           // accept() not yet migrated, this is a runtime no-op (pending=empty
                                           // returns NoOp). When #56.10 migrates accept() to commit branches,
@@ -800,6 +811,10 @@ object SnapshotLeaderLoop {
                                           chainStore.finalize(canonicalHash, finalOrdinal) >>
                                           // (#196) Phase-3 outbox ack — see DEPTH-FINALIZED branch for rationale.
                                           confirmSnapshotOutbox(stored, sidecarClient, logger) >>
+                                          // Slice S3: drop committee-attestation tally entries for `(metagraphAddress,
+                                          // parentHash)` pairs whose binary just rolled into a finalized gl0 snapshot.
+                                          // Same site as the depth-finality path above.
+                                          onFinalize(stored.signedSnapshot.value) >>
                                           // #56.6: see depth-k branch above. Same wiring at the attestation-2/3 sink.
                                           mptOverlay
                                             .finalizeBranch(BranchId(canonicalHash), SnapshotOrdinal.unsafeApply(finalOrdinal))

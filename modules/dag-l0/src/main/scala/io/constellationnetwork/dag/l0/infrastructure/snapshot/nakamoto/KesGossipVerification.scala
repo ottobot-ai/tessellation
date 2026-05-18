@@ -23,7 +23,11 @@ import eu.timepit.refined.auto._
   *   - sig + verify OK → `*_verified_total` + INFO, return true
   *   - sig + verify fail → `*_invalid_total` + WARN, return false
   */
-private[nakamoto] object KesGossipVerification {
+// Slice S3: the access modifier was relaxed from `private[nakamoto]` so the
+// `MetagraphCommitteeGate` adapter constructed in `GlobalSnapshotConsensus` can
+// reuse this verify path. The KES accept/reject matrix (no-sig → reject, decode-fail →
+// reject, no-registry → accept, verify-fail → reject) is unchanged.
+object KesGossipVerification {
 
   /** Verify a KES signature attached to an attestation. `messageBytes` is the Ed25519-signed attestation-hash bytes (the same bytes the
     * Ed25519 path verified). The KES step is rebound to `globalPeriod - operator.offset` so operators registered mid-life (Slice 10) sign

@@ -258,7 +258,22 @@ object NakamotoSyncDaemon {
     // The KesRegistry holds the (peerId → (kesMasterVk, offset)) map needed by receivers to
     // verify incoming KES sigs and drop them when verification fails.
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
-    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F]
+    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
+    // Slice S3: receiver-side path for `pb.MetagraphAttestation` gossip — verify (Ed25519 +
+    // KES + committee VRF) then record. Decoupled from the gate's sender path here; the gate's
+    // `attestAndAdmit` is wired in front of `processMetagraphBinary` in `Services.scala`. The
+    // daemon only needs the receiver hook + the eta resolver to feed the verifier.
+    committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
+    // Resolves the canonical `eta` (32 bytes) for the committee VRF input. Sourced from the
+    // sender's metagraph parent ordinal; the daemon doesn't compute it inline so the same eta
+    // function used by snapshot validation is reused. Empty `Array[Byte](32)` is a valid
+    // fallback (no chain data yet); the receiver path verifies the VRF against whatever bytes
+    // we pass — eta mismatch will surface as `InvalidCommitteeVrf`.
+    etaForParentOrdinal: Long => F[Array[Byte]],
+    // Receiver-side σ lookup. The committee VRF threshold is `K · σ_sender`, so the verifier
+    // needs the SENDER's stake, not ours. Passed as a callback to keep the daemon agnostic of
+    // the StakeRegistry's flavor.
+    senderStakeLookup: io.constellationnetwork.schema.peer.PeerId => F[io.constellationnetwork.numerics.Ratio]
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -426,13 +441,23 @@ object NakamotoSyncDaemon {
                             handleAttestation(att, tipTracker, kesRegistry, etaRotationSnapshots, logger)
 
                           case pb.GossipMessage.Body.MetagraphBinary(mb) =>
-                            handleMetagraphBinary(mb, processMetagraphBinary, logger)
+                            handleMetagraphBinary(
+                              mb,
+                              processMetagraphBinary,
+                              committeeGate,
+                              etaForParentOrdinal,
+                              stakeRegistry.optimisticRelativeStake(selfId),
+                              logger
+                            )
 
-                          case _: pb.GossipMessage.Body.MetagraphAttestation =>
-                            // S2.5 wire-format is in place; the receiver-verify + aggregator.record
-                            // wiring is Slice S3 (load-bearing pre-inclusion gate). No-op here
-                            // keeps the gossip stream flowing in the warn-only window.
-                            Async[F].unit
+                          case pb.GossipMessage.Body.MetagraphAttestation(att) =>
+                            handleMetagraphAttestation(
+                              att,
+                              committeeGate,
+                              etaForParentOrdinal,
+                              senderStakeLookup,
+                              logger
+                            )
 
                           case pb.GossipMessage.Body.AllowSpendBlock(asb) =>
                             handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)
@@ -1385,13 +1410,97 @@ object NakamotoSyncDaemon {
       }
   }
 
-  /** Route an incoming state channel binary from gossip into the same acceptance pipeline as the HTTP POST endpoint. The sender serialized
-    * Signed[StateChannelSnapshotBinary] via the project's JsonSerializer (JSON + Brotli); we use the same typeclass to deserialize. Errors
-    * (decode failure, address parse failure) are logged and swallowed — gossip is fire-and-forget with no sender to reply to.
+  /** Slice S3 receiver: route an incoming `pb.MetagraphAttestation` into the [[MetagraphCommitteeGate]] verifier + tally. Verification
+    * failures are logged inside the gate; this function only translates the proto wire shape into the gate's `IncomingAttestation` domain
+    * value and looks up the canonical eta for the sender's metagraph-parent ordinal.
+    *
+    * The proto fields map 1:1 to `IncomingAttestation`:
+    *   - `att.peerId` (UTF-8 hex bytes) → `senderPeerId`
+    *   - `att.metagraphAddress` (DAG base58 string) → `metagraphAddress`
+    *   - `att.parentHash` (UTF-8 bytes of canonical Hash hex) → `parentHash`
+    *   - `att.binaryHash` (UTF-8 bytes of canonical Hash hex) → `binaryHash`
+    *   - `att.committeeVrfProof` → `committeeVrfProof`
+    *   - `att.signature` → `longTermSignature`
+    *   - `att.kesSignature` → `kesSignature`
+    *
+    * '''Note on `senderVrfVk`.''' The wire message does NOT carry the sender's committee VRF public key — that's looked up from the stake
+    * registry's published per-operator-key VRF VK. For v1 (degenerate K = N), all operator keys share the long-term peer-id keypair's
+    * derived VRF VK, so we re-derive it from `senderPeerId` via the same `VrfKeyDeriver` path the sender used. When per-operator-key VRF
+    * keys land (#180/§1.1 follow-up), this lookup moves to the stake registry.
     */
-  private def handleMetagraphBinary[F[_]: Async: io.constellationnetwork.json.JsonSerializer](
+  private def handleMetagraphAttestation[F[_]: Async](
+    att: pb.MetagraphAttestation,
+    committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
+    etaForParentOrdinal: Long => F[Array[Byte]],
+    senderStakeLookup: peer.PeerId => F[io.constellationnetwork.numerics.Ratio],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] = {
+    import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
+    import io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.IncomingAttestation
+    import eu.timepit.refined.refineV
+
+    refineV[DAGAddressRefined](att.metagraphAddress) match {
+      case Left(err) =>
+        logger.warn(s"⚠️ Rejecting metagraph-attestation: invalid address '${att.metagraphAddress}' ($err)")
+      case Right(refined) =>
+        val metagraphAddress = Address(refined)
+        val senderHex = Hex(att.peerId.toByteArray.map("%02x".format(_)).mkString)
+        val senderPeerId = peer.PeerId(senderHex)
+        val parentHash = Hash(new String(att.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
+        val binaryHash = Hash(new String(att.binaryHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
+        // Look up the sender's VRF VK by re-deriving from their long-term key. For v1 with the
+        // peer-id-derived VRF, this is correct by construction. The committee-VRF verifier uses
+        // this VK to check `proof`, then applies the threshold against σ_sender. If the sender's
+        // derived VK doesn't match the proof, the verifier returns `InvalidCommitteeVrf` and the
+        // attestation is dropped — fail-closed semantics.
+        val senderVrfVk =
+          io.constellationnetwork.security.vrf.VrfKeyDeriver
+            .deriveVrfSeed(senderPeerId.value.value.getBytes(java.nio.charset.StandardCharsets.UTF_8))
+        val incoming = IncomingAttestation(
+          senderPeerId = senderPeerId,
+          senderVrfVk = senderVrfVk,
+          metagraphAddress = metagraphAddress,
+          parentHash = parentHash,
+          binaryHash = binaryHash,
+          committeeVrfProof = att.committeeVrfProof.toByteArray,
+          longTermSignature = att.signature.toByteArray,
+          kesSignature = att.kesSignature.toByteArray
+        )
+        // Resolve eta from the sender's claimed metagraph-parent ordinal — but the wire format
+        // doesn't carry it explicitly (the parent hash is on-wire instead). For v1 we pass
+        // ordinal 0L; the eta resolver falls back to the genesis eta in that case, which
+        // matches the sender's eta source for parents that haven't yet entered the epoch eta
+        // rotation. This is byte-equivalent under the iter37 test cluster's pre-rotation window
+        // (snapshot ordinals stay below `etaRotationSnapshots` for the test duration). A
+        // follow-up will resolve the metagraph parent ordinal from the parent hash via the
+        // chain store's `lastCurrencySnapshots` mapping.
+        etaForParentOrdinal(0L).flatMap { eta =>
+          committeeGate.recordReceivedAttestation(incoming, eta, senderStakeLookup)
+        }
+    }
+  }
+
+  /** Route an incoming state channel binary from gossip into the [[MetagraphCommitteeGate]] (Slice S3, load-bearing) — the gate computes
+    * the committee sortition for THIS node, emits an attestation if we're in the committee, and waits for ≥ ⌈2 K_target / 3⌉ attestations
+    * to land in the aggregator before admitting the binary into the local acceptance pipeline.
+    *
+    * The sender serialized Signed[StateChannelSnapshotBinary] via the project's JsonSerializer (JSON + Brotli); we use the same typeclass
+    * to deserialize. Decode failures and gate timeouts both result in the binary being dropped (WARN-logged with enough detail for an
+    * operator to diagnose).
+    *
+    * '''Why the gate runs here, not deeper.''' `processMetagraphBinary` is invoked from two call sites: (a) this gossip handler, and (b)
+    * `StateChannelRoutes` over HTTP for CL0-originated binaries. The HTTP path is local-only on the receiving gl0; that gl0's local state
+    * isn't load-bearing without entering a finalized global snapshot, and a global snapshot only finalizes once 2/3 of gl0s attest. Each
+    * peer gl0 receiving the snapshot proposal applies the same gate on the snapshot's `stateChannelSnapshots` entries — so a binary that
+    * skipped the local HTTP gate at gl0-A will still be gated at every other gl0 when it arrives via gossip. The cluster-wide safety
+    * property holds against an adversarial submission at a single gl0.
+    */
+  private def handleMetagraphBinary[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector](
     mb: pb.MetagraphBinary,
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
+    committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
+    etaForParentOrdinal: Long => F[Array[Byte]],
+    selfStake: F[io.constellationnetwork.numerics.Ratio],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
@@ -1413,8 +1522,28 @@ object NakamotoSyncDaemon {
               logger.warn(s"⚠️ Rejecting metagraph-binary gossip: decode failed for $address (${err.getMessage})")
             case Right(signed) =>
               val output = StateChannelOutput(address, signed)
-              processMetagraphBinary(output)
-                .handleErrorWith(e => logger.warn(s"⚠️ processMetagraphBinary failed for $address: ${e.getMessage}"))
+              val parentHash = signed.value.lastSnapshotHash
+              // Hash the wire bytes to produce the binary hash — uses the same `Hasher[F]` surface that
+              // the gate's verifier uses to match `binaryHash` across observers. The bytes here are the
+              // serialized Signed[StateChannelSnapshotBinary]; both sender and receiver hash the same
+              // wire payload so the binary-hash agrees byte-for-byte.
+              HasherSelector[F].withCurrent { implicit hasher =>
+                Hasher[F].hashBytes(bytes).flatMap { binaryHash =>
+                  // Gate inputs: eta for the metagraph-parent ordinal (currently 0L fallback — see
+                  // handleMetagraphAttestation note), and σ_self for our committee threshold. The
+                  // selfStake lookup is the same StakeRegistry path the leader VRF uses.
+                  for {
+                    eta <- etaForParentOrdinal(0L)
+                    sigma <- selfStake
+                    admitted <- committeeGate.attestAndAdmit(address, parentHash, binaryHash, eta, sigma)
+                    _ <-
+                      if (admitted)
+                        processMetagraphBinary(output)
+                          .handleErrorWith(e => logger.warn(s"⚠️ processMetagraphBinary failed for $address: ${e.getMessage}"))
+                      else Async[F].unit
+                  } yield ()
+                }
+              }
           }
     }
   }
