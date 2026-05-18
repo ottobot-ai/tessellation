@@ -408,6 +408,12 @@ object NakamotoSyncDaemon {
                           case pb.GossipMessage.Body.MetagraphBinary(mb) =>
                             handleMetagraphBinary(mb, processMetagraphBinary, logger)
 
+                          case _: pb.GossipMessage.Body.MetagraphAttestation =>
+                            // S2.5 wire-format is in place; the receiver-verify + aggregator.record
+                            // wiring is Slice S3 (load-bearing pre-inclusion gate). No-op here
+                            // keeps the gossip stream flowing in the warn-only window.
+                            Async[F].unit
+
                           case _: pb.GossipMessage.Body.Rumor =>
                             Async[F].unit
 
