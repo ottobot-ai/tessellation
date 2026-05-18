@@ -10,6 +10,7 @@ import scala.concurrent.duration._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
 import io.constellationnetwork.ext.crypto._
+import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, MptOverlay}
@@ -149,6 +150,103 @@ object SnapshotLeaderLoop {
     (seed, pk)
   }
 
+  /** (#196) Notify the sidecar outbox that the entries included in `stored` are durably committed at network scale and may be dropped from
+    * the periodic re-gossip loop.
+    *
+    * Per-topic id derivation MUST match what `Publish*` registered in the outbox:
+    *   - AllowSpendBlock: id = sha256(JsonSerializer.serialize(signedBlock))
+    *   - StateChannelSnapshot binary: id = sha256(JsonSerializer.serialize(signedBinary)) Both paths route through
+    *     `JsonSerializer[F].serialize` so the senders (Swap.scala and StateChannelRoutes.broadcastMetagraphBinary) produce the same byte
+    *     sequence. The sha256-truncation lives in the JVM here (mirrors the Go sidecar's MsgIDFor) and is invoked via `Hasher[F].hashBytes`
+    *     to keep the project rule of "Hasher[F] is the only hash surface" — even though the type is fixed to JSON here, the project
+    *     standardises on the Hasher typeclass for every hashing site.
+    *
+    * Errors are logged and swallowed — the outbox TTL is the safety net.
+    */
+  private def confirmSnapshotOutbox[F[_]: Async: HasherSelector: JsonSerializer](
+    stored: NakamotoChainStore.StoredSnapshot,
+    sidecarClient: SidecarClient.SidecarClientAlgebra[F],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] = {
+    import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.OutboxTopic
+
+    val snapshot = stored.signedSnapshot.value
+    val allowSpendBlocks: List[Signed[io.constellationnetwork.schema.swap.AllowSpendBlock]] =
+      snapshot.allowSpendBlocks.fold(List.empty[Signed[io.constellationnetwork.schema.swap.AllowSpendBlock]])(_.toList)
+    val stateChannelBinaries: List[Signed[io.constellationnetwork.statechannel.StateChannelSnapshotBinary]] =
+      snapshot.stateChannelSnapshots.values.toList.flatMap(_.toList)
+    // (#196 follow-up) DAGBlock + TokenLockBlock finality. DAG blocks live inside
+    // `BlockAsActiveTip` wrappers; we ack on the inner `Signed[Block]` since that's
+    // what the JVM serialized at publish time (and what the sidecar's outbox keys on).
+    val dagBlocks: List[Signed[io.constellationnetwork.schema.Block]] =
+      snapshot.blocks.toList.map(_.block)
+    val tokenLockBlocks: List[Signed[io.constellationnetwork.schema.tokenLock.TokenLockBlock]] =
+      snapshot.tokenLockBlocks.fold(List.empty[Signed[io.constellationnetwork.schema.tokenLock.TokenLockBlock]])(_.toList)
+
+    if (allowSpendBlocks.isEmpty && stateChannelBinaries.isEmpty && dagBlocks.isEmpty && tokenLockBlocks.isEmpty)
+      Async[F].unit
+    else
+      HasherSelector[F].withCurrent { implicit hasher =>
+        // Convert Hasher's hex Hash value back to the raw 32-byte sha256 the
+        // sidecar outbox keys on (sidecar `outbox.MsgIDFor` = sha256.Sum256
+        // raw bytes). `Hash.value` is `toHexString(sha256(bytes))` length 64;
+        // we decode hex → 32 bytes. Using Hasher[F].hashBytes keeps the
+        // project rule of "Hasher is the only hash surface" intact even
+        // though the wire format is raw bytes.
+        def hexToBytes(hex: String): Array[Byte] = {
+          val out = new Array[Byte](hex.length / 2)
+          var i = 0
+          while (i < out.length) {
+            out(i) = ((Character.digit(hex.charAt(i * 2), 16) << 4)
+              + Character.digit(hex.charAt(i * 2 + 1), 16)).toByte
+            i += 1
+          }
+          out
+        }
+        def idFor(bytes: Array[Byte]): F[Array[Byte]] =
+          Hasher[F].hashBytes(bytes).map(h => hexToBytes(h.value))
+
+        for {
+          asbIds <- allowSpendBlocks.traverse { signed =>
+            JsonSerializer[F].serialize(signed).flatMap(idFor)
+          }
+          scbIds <- stateChannelBinaries.traverse { signed =>
+            JsonSerializer[F].serialize(signed).flatMap(idFor)
+          }
+          dagIds <- dagBlocks.traverse { signed =>
+            JsonSerializer[F].serialize(signed).flatMap(idFor)
+          }
+          tlbIds <- tokenLockBlocks.traverse { signed =>
+            JsonSerializer[F].serialize(signed).flatMap(idFor)
+          }
+          _ <- Async[F].whenA(asbIds.nonEmpty) {
+            sidecarClient
+              .confirmFinalized(OutboxTopic.AllowSpendBlock, asbIds)
+              .flatMap(resp => logger.debug(s"outbox confirm allow-spend-block: dropped=${resp.dropped}/${asbIds.size}"))
+              .handleErrorWith(e => logger.warn(s"⚠️ confirmFinalized(allow-spend-block) failed: ${e.getMessage}"))
+          }
+          _ <- Async[F].whenA(scbIds.nonEmpty) {
+            sidecarClient
+              .confirmFinalized(OutboxTopic.MetagraphBinary, scbIds)
+              .flatMap(resp => logger.debug(s"outbox confirm metagraph-binary: dropped=${resp.dropped}/${scbIds.size}"))
+              .handleErrorWith(e => logger.warn(s"⚠️ confirmFinalized(metagraph-binary) failed: ${e.getMessage}"))
+          }
+          _ <- Async[F].whenA(dagIds.nonEmpty) {
+            sidecarClient
+              .confirmFinalized(OutboxTopic.DAGBlock, dagIds)
+              .flatMap(resp => logger.debug(s"outbox confirm dag-block: dropped=${resp.dropped}/${dagIds.size}"))
+              .handleErrorWith(e => logger.warn(s"⚠️ confirmFinalized(dag-block) failed: ${e.getMessage}"))
+          }
+          _ <- Async[F].whenA(tlbIds.nonEmpty) {
+            sidecarClient
+              .confirmFinalized(OutboxTopic.TokenLockBlock, tlbIds)
+              .flatMap(resp => logger.debug(s"outbox confirm token-lock-block: dropped=${resp.dropped}/${tlbIds.size}"))
+              .handleErrorWith(e => logger.warn(s"⚠️ confirmFinalized(token-lock-block) failed: ${e.getMessage}"))
+          }
+        } yield ()
+      }
+  }
+
   /** Run the pure attestation snapshot leader loop.
     *
     * This is the main consensus loop — call it instead of starting the BFT ConsensusEventLoop.
@@ -180,7 +278,7 @@ object SnapshotLeaderLoop {
     *   days. Rotation is keyed on **ordinal**, not slot — see `docs/nakamoto/attestation-and-finality.md` §1 for the R ≥ 3·k₁ stability
     *   bound rationale.
     */
-  def run[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
+  def run[F[_]: Async: SecurityProvider: HasherSelector: JsonSerializer: Metrics](
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
@@ -601,6 +699,13 @@ object SnapshotLeaderLoop {
                                         tipTracker.markFinalized(canonicalHash, finalizeAtSlot) >>
                                           tipTracker.pruneBelow(finalizeAtSlot) >>
                                           chainStore.finalize(canonicalHash, finalizeAtOrdinal) >>
+                                          // (#196) Phase-3 ack to the sidecar outbox. After this finalize call
+                                          // the snapshot's AllowSpendBlocks + StateChannelSnapshots are durably
+                                          // committed; the sidecar can drop the corresponding outbox entries
+                                          // and stop re-gossiping. Failure here is non-fatal — the outbox TTL
+                                          // catches it eventually and the next finalize call would re-confirm
+                                          // anyway (Confirm is idempotent on the sidecar side).
+                                          confirmSnapshotOutbox(canonicalSnapshot, sidecarClient, logger) >>
                                           // #56.6: notify the MPT overlay that this branch is finalized. With
                                           // accept() not yet migrated, this is a runtime no-op (pending=empty
                                           // returns NoOp). When #56.10 migrates accept() to commit branches,
@@ -693,6 +798,8 @@ object SnapshotLeaderLoop {
                                         tipTracker.markFinalized(canonicalHash, finalSlot) >>
                                           tipTracker.pruneBelow(finalSlot) >>
                                           chainStore.finalize(canonicalHash, finalOrdinal) >>
+                                          // (#196) Phase-3 outbox ack — see DEPTH-FINALIZED branch for rationale.
+                                          confirmSnapshotOutbox(stored, sidecarClient, logger) >>
                                           // #56.6: see depth-k branch above. Same wiring at the attestation-2/3 sink.
                                           mptOverlay
                                             .finalizeBranch(BranchId(canonicalHash), SnapshotOrdinal.unsafeApply(finalOrdinal))

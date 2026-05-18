@@ -14,10 +14,12 @@ import io.constellationnetwork.dag.l1.infrastructure.tokenlock.rumor.handler.tok
 import io.constellationnetwork.dag.l1.modules._
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.ext.kryo._
+import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.app._
 import io.constellationnetwork.node.shared.app.{DagL1 => DagL1Layer}
 import io.constellationnetwork.node.shared.ext.pureconfig._
 import io.constellationnetwork.node.shared.infrastructure.DagL1
+import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.node.shared.infrastructure.gossip.{GossipDaemon, RumorHandlers}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.LastNGlobalSnapshotStorage
 import io.constellationnetwork.node.shared.resources.MkHttpServer
@@ -105,6 +107,17 @@ object Main
         cfg.priorityPeerIds,
         cfg.environment
       ).asResource
+
+      // Sidecar gRPC client for libp2p GossipSub (#196). Replaces the
+      // single-peer HTTP POST path from Swap.sendBlockToL0 with a durable
+      // outbox publish. Held as a Resource so the gRPC channel is shut
+      // down cleanly on app teardown.
+      sidecarClient <- SidecarClient.makeResource[IO](
+        SidecarClient.SidecarConfig(
+          host = sys.env.getOrElse("SIDECAR_HOST", "127.0.0.1"),
+          grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
+        )
+      )
       services = Services.make[IO, GlobalSnapshotStateProof, GlobalIncrementalSnapshot, GlobalSnapshotInfo, Run](
         storages,
         storages.lastSnapshot,
@@ -168,6 +181,50 @@ object Main
       _ <- MkHttpServer[IO].newEmber(ServerName("p2p"), cfg.http.p2pHttp, api.p2pApp)
       _ <- MkHttpServer[IO].newEmber(ServerName("cli"), cfg.http.cliHttp, api.cliApp)
 
+      // (#196 follow-up) dl1 → gl0 send-block hop: publish through the sidecar
+      // durable outbox instead of the prior single-peer HTTP POST lottery.
+      // Serialization mirrors the AllowSpendBlock path — JsonSerializer[F]
+      // produces the canonical JSON+Brotli bytes that gl0 receivers
+      // round-trip on the same typeclass. Errors logged and swallowed:
+      // gossip is fire-and-forget, the outbox TTL is the safety net.
+      sendDAGBlockToL0Fn = (signed: io.constellationnetwork.security.signature.Signed[io.constellationnetwork.schema.Block]) =>
+        JsonSerializer[IO]
+          .serialize(signed)
+          .flatMap(sidecarClient.publishDAGBlock)
+          .flatMap { resp =>
+            if (resp.ok) IO.unit
+            else logger.warn(s"Sidecar publishDAGBlock returned ok=false: ${resp.error}")
+          }
+          .handleErrorWith(e => logger.warn(e)("Error publishing DAGBlock to sidecar"))
+
+      sendTokenLockBlockToL0Fn = (signed: io.constellationnetwork.security.signature.Signed[
+        io.constellationnetwork.schema.tokenLock.TokenLockBlock
+      ]) =>
+        JsonSerializer[IO]
+          .serialize(signed)
+          .flatMap(sidecarClient.publishTokenLockBlock)
+          .flatMap { resp =>
+            if (resp.ok) IO.unit
+            else logger.warn(s"Sidecar publishTokenLockBlock returned ok=false: ${resp.error}")
+          }
+          .handleErrorWith(e => logger.warn(e)("Error publishing TokenLockBlock to sidecar"))
+
+      // (#196) AllowSpendBlock dl1 → gl0 send hop: lift the (still-current) #196
+      // sidecar-publish path into a lambda so `dag.l1.Swap` can be parameterised the
+      // same way as `dag.l1.StateChannel` and `dag.l1.TokenLock`. The cl1 → cl0
+      // call site supplies an HTTP-POST lambda instead (cl0 has no sidecar).
+      sendAllowSpendBlockToL0Fn = (signed: io.constellationnetwork.security.signature.Signed[
+        io.constellationnetwork.schema.swap.AllowSpendBlock
+      ]) =>
+        JsonSerializer[IO]
+          .serialize(signed)
+          .flatMap(sidecarClient.publishAllowSpendBlock)
+          .flatMap { resp =>
+            if (resp.ok) IO.unit
+            else logger.warn(s"Sidecar publishAllowSpendBlock returned ok=false: ${resp.error}")
+          }
+          .handleErrorWith(e => logger.warn(e)("Error publishing AllowSpendBlock to sidecar"))
+
       stateChannel <- StateChannel
         .make[IO, GlobalSnapshotStateProof, GlobalIncrementalSnapshot, GlobalSnapshotInfo, Run](
           cfg,
@@ -179,7 +236,8 @@ object Main
           services,
           storages,
           validators,
-          Hasher.forKryo[IO]
+          Hasher.forKryo[IO],
+          sendDAGBlockToL0Fn
         )
         .asResource
 
@@ -195,10 +253,9 @@ object Main
         Swap.run(
           cfg.swap,
           storages.cluster,
-          storages.l0Cluster,
           storages.lastSnapshot,
           storages.node,
-          p2pClient.l0BlockOutputClient,
+          sendAllowSpendBlockToL0Fn,
           p2pClient.swapConsensusClient,
           services,
           storages.allowSpend,
@@ -215,10 +272,9 @@ object Main
         TokenLock.run(
           cfg.tokenLock,
           storages.cluster,
-          storages.l0Cluster,
           storages.lastSnapshot,
           storages.node,
-          p2pClient.l0BlockOutputClient,
+          sendTokenLockBlockToL0Fn,
           p2pClient.tokenLockConsensusClient,
           services,
           storages.tokenLock,

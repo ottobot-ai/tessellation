@@ -178,6 +178,26 @@ object Services {
           case None => Async[F].unit
         }
 
+      // (#196) Sink for inbound AllowSpendBlock gossip — same queue
+      // GlobalSnapshotEventsPublisherDaemon drains into the event mempool. The
+      // HTTP route that previously did this offer (AllowSpendBlockRoutes) was
+      // removed in the same change; this is now the sole entry point.
+      enqueueAllowSpendBlock = (signed: io.constellationnetwork.security.signature.Signed[
+        io.constellationnetwork.schema.swap.AllowSpendBlock
+      ]) => queues.l1AllowSpendOutput.offer(signed)
+
+      // (#196 follow-up) Sinks for inbound DAGBlock + TokenLockBlock gossip.
+      // Same queues GlobalSnapshotEventsPublisherDaemon drains. The HTTP
+      // routes that previously did these offers (DAGBlockRoutes wrapped in a
+      // Cell pipeline, TokenLockBlockRoutes via queue.offer) were removed in
+      // the same change; these are now the sole entry points.
+      enqueueDAGBlock = (signed: io.constellationnetwork.security.signature.Signed[
+        io.constellationnetwork.schema.Block
+      ]) => queues.l1Output.offer(signed)
+      enqueueTokenLockBlock = (signed: io.constellationnetwork.security.signature.Signed[
+        io.constellationnetwork.schema.tokenLock.TokenLockBlock
+      ]) => queues.l1TokenLockOutput.offer(signed)
+
       consensus <- HasherSelector[F].withCurrent { implicit hs =>
         GlobalSnapshotConsensus
           .make[F, R](
@@ -217,6 +237,9 @@ object Services {
             nakamotoFinalizedOrdinalRef,
             finalityTriggerViewRef,
             processMetagraphBinary,
+            enqueueAllowSpendBlock,
+            enqueueDAGBlock,
+            enqueueTokenLockBlock,
             sidecarClient,
             kesRegistry
           )

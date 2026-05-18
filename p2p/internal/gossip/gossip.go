@@ -36,6 +36,9 @@ type Node struct {
 	rumorTopic                *pubsub.Topic
 	metagraphBinaryTopic      *pubsub.Topic
 	metagraphAttestationTopic *pubsub.Topic
+	allowSpendBlockTopic      *pubsub.Topic
+	dagBlockTopic             *pubsub.Topic
+	tokenLockBlockTopic       *pubsub.Topic
 
 	cfg config.Config
 
@@ -186,6 +189,24 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		return nil, fmt.Errorf("join metagraph-attestation topic: %w", err)
 	}
 
+	asbTopic, err := ps.Join(cfg.AllowSpendBlockTopic)
+	if err != nil {
+		h.Close()
+		return nil, fmt.Errorf("join allow-spend-block topic: %w", err)
+	}
+
+	dagBlockTopic, err := ps.Join(cfg.DAGBlockTopic)
+	if err != nil {
+		h.Close()
+		return nil, fmt.Errorf("join dag-block topic: %w", err)
+	}
+
+	tokenLockBlockTopic, err := ps.Join(cfg.TokenLockBlockTopic)
+	if err != nil {
+		h.Close()
+		return nil, fmt.Errorf("join token-lock-block topic: %w", err)
+	}
+
 	node := &Node{
 		Host:                      h,
 		PubSub:                    ps,
@@ -195,6 +216,9 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		rumorTopic:                ruTopic,
 		metagraphBinaryTopic:      mbTopic,
 		metagraphAttestationTopic: maTopic,
+		allowSpendBlockTopic:      asbTopic,
+		dagBlockTopic:             dagBlockTopic,
+		tokenLockBlockTopic:       tokenLockBlockTopic,
 		cfg:                       cfg,
 		reconnectCh:               make(chan struct{}),
 	}
@@ -388,6 +412,42 @@ func (n *Node) PublishMetagraphAttestation(ctx context.Context, data []byte) err
 	return err
 }
 
+// PublishAllowSpendBlock publishes raw bytes to the allow-spend-block topic.
+// Carries Signed[AllowSpendBlock] serialized by the JVM JsonSerializer; the
+// sidecar treats the payload as opaque. Replaces the single-peer HTTP POST
+// path from Swap.sendBlockToL0 (task #196).
+func (n *Node) PublishAllowSpendBlock(ctx context.Context, data []byte) error {
+	err := n.allowSpendBlockTopic.Publish(ctx, data)
+	if err == nil {
+		metrics.MessagesPublished.WithLabelValues("allow_spend_block").Inc()
+	}
+	return err
+}
+
+// PublishDAGBlock publishes raw bytes to the dag-block topic. Carries
+// Signed[Block] serialized by the JVM JsonSerializer; the sidecar treats the
+// payload as opaque. Replaces the single-peer HTTP POST path from
+// StateChannel.sendBlockToL0 (extends #196 to the DAG block hop).
+func (n *Node) PublishDAGBlock(ctx context.Context, data []byte) error {
+	err := n.dagBlockTopic.Publish(ctx, data)
+	if err == nil {
+		metrics.MessagesPublished.WithLabelValues("dag_block").Inc()
+	}
+	return err
+}
+
+// PublishTokenLockBlock publishes raw bytes to the token-lock-block topic.
+// Carries Signed[TokenLockBlock] serialized by the JVM JsonSerializer; the
+// sidecar treats the payload as opaque. Replaces the single-peer HTTP POST
+// path from TokenLock.sendBlockToL0 (extends #196 to the token-lock-block hop).
+func (n *Node) PublishTokenLockBlock(ctx context.Context, data []byte) error {
+	err := n.tokenLockBlockTopic.Publish(ctx, data)
+	if err == nil {
+		metrics.MessagesPublished.WithLabelValues("token_lock_block").Inc()
+	}
+	return err
+}
+
 // subscribeAndRelay creates a per-caller subscription on the given topic and
 // relays incoming messages (excluding self-published) into the returned channel.
 // The subscription is cancelled when ctx is done. The topicLabel is used for
@@ -487,13 +547,52 @@ func (n *Node) MetagraphAttestationMessages(ctx context.Context) <-chan []byte {
 	return ch
 }
 
+// AllowSpendBlockMessages returns a channel of incoming allow-spend-block messages.
+func (n *Node) AllowSpendBlockMessages(ctx context.Context) <-chan []byte {
+	ch, err := n.subscribeAndRelay(ctx, n.allowSpendBlockTopic, n.cfg.AllowSpendBlockBufferSize, "allow_spend_block")
+	if err != nil {
+		fmt.Printf("ERROR: subscribe allow_spend_block: %v\n", err)
+		empty := make(chan []byte)
+		close(empty)
+		return empty
+	}
+	return ch
+}
+
+// DAGBlockMessages returns a channel of incoming dag-block messages.
+func (n *Node) DAGBlockMessages(ctx context.Context) <-chan []byte {
+	ch, err := n.subscribeAndRelay(ctx, n.dagBlockTopic, n.cfg.DAGBlockBufferSize, "dag_block")
+	if err != nil {
+		fmt.Printf("ERROR: subscribe dag_block: %v\n", err)
+		empty := make(chan []byte)
+		close(empty)
+		return empty
+	}
+	return ch
+}
+
+// TokenLockBlockMessages returns a channel of incoming token-lock-block messages.
+func (n *Node) TokenLockBlockMessages(ctx context.Context) <-chan []byte {
+	ch, err := n.subscribeAndRelay(ctx, n.tokenLockBlockTopic, n.cfg.TokenLockBlockBufferSize, "token_lock_block")
+	if err != nil {
+		fmt.Printf("ERROR: subscribe token_lock_block: %v\n", err)
+		empty := make(chan []byte)
+		close(empty)
+		return empty
+	}
+	return ch
+}
+
 // MeshPeerCount returns the number of peers in each topic mesh.
-func (n *Node) MeshPeerCount() (snapshots, attestations, rumors, metagraphBinaries, metagraphAttestations int) {
+func (n *Node) MeshPeerCount() (snapshots, attestations, rumors, metagraphBinaries, metagraphAttestations, allowSpendBlocks, dagBlocks, tokenLockBlocks int) {
 	return len(n.snapshotTopic.ListPeers()),
 		len(n.attestationTopic.ListPeers()),
 		len(n.rumorTopic.ListPeers()),
 		len(n.metagraphBinaryTopic.ListPeers()),
-		len(n.metagraphAttestationTopic.ListPeers())
+		len(n.metagraphAttestationTopic.ListPeers()),
+		len(n.allowSpendBlockTopic.ListPeers()),
+		len(n.dagBlockTopic.ListPeers()),
+		len(n.tokenLockBlockTopic.ListPeers())
 }
 
 // TriggerSubscriberReconnect broadcasts to all active Subscribe handlers that
@@ -538,7 +637,7 @@ func (n *Node) StartMeshHealthMonitor(ctx context.Context) {
 			case <-ticker.C:
 			}
 
-			sn, at, ru, mb, ma := n.MeshPeerCount()
+			sn, at, ru, mb, ma, asb, dag, tlb := n.MeshPeerCount()
 			connectedPeers := len(n.Host.Network().Peers())
 
 			// Degraded = no topic subscribers OR no connected peers at all.
@@ -546,8 +645,8 @@ func (n *Node) StartMeshHealthMonitor(ctx context.Context) {
 			// so connectedPeers==0 is the more reliable partition signal.
 			if sn == 0 || at == 0 || connectedPeers == 0 {
 				emptyMeshStreak++
-				fmt.Printf("mesh-health: DEGRADED streak=%d snapshots=%d attestations=%d rumors=%d metagraph_binaries=%d metagraph_attestations=%d connected=%d\n",
-					emptyMeshStreak, sn, at, ru, mb, ma, connectedPeers)
+				fmt.Printf("mesh-health: DEGRADED streak=%d snapshots=%d attestations=%d rumors=%d metagraph_binaries=%d metagraph_attestations=%d allow_spend_blocks=%d dag_blocks=%d token_lock_blocks=%d connected=%d\n",
+					emptyMeshStreak, sn, at, ru, mb, ma, asb, dag, tlb, connectedPeers)
 
 				// After 2 consecutive degraded checks (~60s), force seedlist reconnection.
 				if emptyMeshStreak >= 2 && len(n.cfg.Seedlist) > 0 {
@@ -582,8 +681,8 @@ func (n *Node) StartMeshHealthMonitor(ctx context.Context) {
 				}
 			} else {
 				if emptyMeshStreak > 0 {
-					fmt.Printf("mesh-health: RECOVERED snapshots=%d attestations=%d rumors=%d metagraph_binaries=%d metagraph_attestations=%d connected=%d (was degraded for %d checks)\n",
-						sn, at, ru, mb, ma, connectedPeers, emptyMeshStreak)
+					fmt.Printf("mesh-health: RECOVERED snapshots=%d attestations=%d rumors=%d metagraph_binaries=%d metagraph_attestations=%d allow_spend_blocks=%d dag_blocks=%d token_lock_blocks=%d connected=%d (was degraded for %d checks)\n",
+						sn, at, ru, mb, ma, asb, dag, tlb, connectedPeers, emptyMeshStreak)
 					// Force all active Subscribe handlers to terminate so JVM clients
 					// reconnect and receive gossip from the now-healthy mesh.
 					n.TriggerSubscriberReconnect()
@@ -603,6 +702,9 @@ func (n *Node) Topics() metrics.TopicSet {
 		Rumor:                n.rumorTopic,
 		MetagraphBinary:      n.metagraphBinaryTopic,
 		MetagraphAttestation: n.metagraphAttestationTopic,
+		AllowSpendBlock:      n.allowSpendBlockTopic,
+		DAGBlock:             n.dagBlockTopic,
+		TokenLockBlock:       n.tokenLockBlockTopic,
 	}
 }
 
@@ -631,6 +733,9 @@ func buildPeerScoreParams(cfg config.Config) *pubsub.PeerScoreParams {
 		cfg.RumorTopic:                buildTopicScoreParams(cfg.HeartbeatInterval),
 		cfg.MetagraphBinaryTopic:      buildTopicScoreParams(cfg.HeartbeatInterval),
 		cfg.MetagraphAttestationTopic: buildTopicScoreParams(cfg.HeartbeatInterval),
+		cfg.AllowSpendBlockTopic:      buildTopicScoreParams(cfg.HeartbeatInterval),
+		cfg.DAGBlockTopic:             buildTopicScoreParams(cfg.HeartbeatInterval),
+		cfg.TokenLockBlockTopic:       buildTopicScoreParams(cfg.HeartbeatInterval),
 	}
 	return &pubsub.PeerScoreParams{
 		Topics:                      topics,

@@ -12,15 +12,13 @@ import scala.concurrent.duration._
 import io.constellationnetwork.currency.swap.ConsensusInput.OwnerConsensusInput
 import io.constellationnetwork.currency.swap.{ConsensusInput, ConsensusOutput}
 import io.constellationnetwork.dag.l1.domain.swap.block.AllowSpendBlockService
-import io.constellationnetwork.dag.l1.http.p2p.L0BlockOutputClient
 import io.constellationnetwork.dag.l1.modules.{Queues, Services}
 import io.constellationnetwork.node.shared.cli.CliMethod
-import io.constellationnetwork.node.shared.config.types.SharedConfig
-import io.constellationnetwork.node.shared.domain.cluster.storage.{ClusterStorage, L0ClusterStorage}
+import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
 import io.constellationnetwork.node.shared.domain.consensus.config.SwapConsensusConfig
 import io.constellationnetwork.node.shared.domain.globalAlignment.GlobalL0AlignmentStorage
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
-import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage}
+import io.constellationnetwork.node.shared.domain.snapshot.storage.LastSnapshotStorage
 import io.constellationnetwork.node.shared.domain.swap.block.{AllowSpendBlockNotAcceptedReason, AllowSpendBlockStorage}
 import io.constellationnetwork.node.shared.domain.swap.consensus.Validator.{
   canStartOwnSwapConsensus,
@@ -32,6 +30,8 @@ import io.constellationnetwork.node.shared.domain.swap.{AllowSpendStorage, Allow
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo, StateProof}
+import io.constellationnetwork.schema.swap.AllowSpendBlock
+import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
 
 import fs2.{Pipe, Stream}
@@ -47,10 +47,13 @@ object Swap {
   ](
     swapConsensusCfg: SwapConsensusConfig,
     clusterStorage: ClusterStorage[F],
-    l0ClusterStorage: L0ClusterStorage[F],
     lastGlobalSnapshot: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     nodeStorage: NodeStorage[F],
-    blockOutputClient: L0BlockOutputClient[F],
+    // (#196 follow-up) Per-call-site dispatch for the L0 send hop. dl1 → gl0
+    // passes a sidecar-publish lambda (durable outbox; the prior #196 path);
+    // cl1 → cl0 keeps the single-peer HTTP POST shape (cl0 has no sidecar).
+    // The lambda owns its own error handling.
+    sendBlockToL0Fn: Signed[AllowSpendBlock] => F[Unit],
     consensusClient: ConsensusClient[F],
     services: Services[F, P, S, SI, R],
     allowSpendStorage: AllowSpendStorage[F],
@@ -125,22 +128,13 @@ object Swap {
         case (_, ConsensusOutput.Noop) => Stream.empty
       }
 
+    // (#196 follow-up) Delegate the L0 send hop to the call-site-supplied
+    // `sendBlockToL0Fn`. dl1 → gl0 uses a sidecar-publish lambda (the prior
+    // #196 durable-outbox path); cl1 → cl0 keeps the previous HTTP POST
+    // shape (cl0 doesn't run a sidecar). The pipe only sequences; the
+    // lambda owns error handling.
     def sendBlockToL0: Pipe[F, ConsensusOutput.FinalBlock, ConsensusOutput.FinalBlock] =
-      _.evalTap { fb =>
-        l0ClusterStorage.getPeers
-          .map(_.toNonEmptyList.toList)
-          .flatMap(_.filterA(p => services.collateral.hasCollateral(p.id)))
-          .flatMap(peers => Random[F].shuffleList(peers))
-          .map(peers => peers.headOption)
-          .flatMap { maybeL0Peer =>
-            maybeL0Peer.fold(logger.warn("No available L0 peer")) { l0Peer =>
-              blockOutputClient
-                .sendAllowSpendBlock(fb.hashedBlock.signed)(l0Peer)
-                .handleErrorWith(e => logger.error(e)("Error when sending block to L0").as(false))
-                .ifM(Applicative[F].unit, logger.warn("Sending block to L0 failed"))
-            }
-          }
-      }
+      _.evalTap(fb => sendBlockToL0Fn(fb.hashedBlock.signed))
 
     def gossipBlock: Pipe[F, ConsensusOutput.FinalBlock, ConsensusOutput.FinalBlock] =
       _.evalTap { fb =>
