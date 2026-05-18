@@ -9,7 +9,9 @@ Greenfield rollout — no production migration constraint. Defaults can be aggre
 
 ## 1. Goal
 
-A committee member that signs two contradictory `MetagraphAttestation`s on the same `(metagraph_address, snapshot_ord)` with different `binary_hash` is provably equivocating. The chain accepts a `SlashableEvidence` transaction proving this and applies:
+A committee member that signs two contradictory `MetagraphAttestation`s on the same `(metagraph_address, parent_hash)` with different `binary_hash` is provably equivocating. The chain accepts a `SlashableEvidence` transaction proving this and applies:
+
+(Why `parent_hash` and not `snapshot_ord` — see `COMMITTEE-SORTITION-DESIGN.md` §2. Two binaries built on different parents have *different* committee VRF inputs, so a single key signing both isn't actually equivocating, it's voting on two distinct fork points. Keying both the VRF *and* the evidence identity on the parent makes "same VRF input ⇒ slashable" hold as a tight algebraic identity.)
 
 1. **Stake reduction** — the offender's combined (delegated + collateral) stake drops by `slash_fraction`.
 2. **Eviction** — operator key is removed from the active registry for `cooldown_epochs`.
@@ -23,12 +25,12 @@ Per-epoch committees become safe to adopt (`COMMITTEE-SORTITION-DESIGN.md` §8 Q
 
 The adversary controls some subset of operator keys with total stake fraction `f_adv ≤ 1/3` and wants to either:
 
-- (a) get two competing binaries committee-attested at the same metagraph snapshot ord (creates ambiguity about what was finalized), or
+- (a) get two competing binaries committee-attested on the same parent (creates ambiguity about what was finalized at that fork point), or
 - (b) selectively attest one binary while privately holding back evidence for a fork attack.
 
-Both require at least one committee key to sign two distinct binaries at the same `(metagraph_address, snapshot_ord)`. That signature pair is the slashable evidence.
+Both require at least one committee key to sign two distinct binaries at the same `(metagraph_address, parent_hash)`. That signature pair is the slashable evidence.
 
-Honest committee members never produce contradictory signatures. The KES (`§1.2`) ensures the secret key is bound to a specific period; once an honest operator signs binary A at period p, the only way to sign binary B at the same `(metagraph_address, snapshot_ord)` is to deliberately re-sign — i.e., adversarial choice, not a glitch.
+Honest committee members never produce contradictory signatures. The KES (`§1.2`) ensures the secret key is bound to a specific period; once an honest operator signs binary A at period p, the only way to sign binary B at the same `(metagraph_address, parent_hash)` is to deliberately re-sign — i.e., adversarial choice, not a glitch.
 
 ---
 
@@ -38,14 +40,14 @@ Observers maintain a window of recent `MetagraphAttestation`s. When a second att
 
 - same `peer_id`
 - same `metagraph_address`
-- same `snapshot_ord`
+- same `parent_hash`
 - different `binary_hash`
 
 …it's evidence. Both attestations are KES- and committee-VRF-verified before observing peers submit a `SlashableEvidence` tx.
 
 **Where the detector lives:** JVM-side observer in `node-shared/domain/nakamoto/SlashingDetector.scala`. Reads from the same `MetagraphAttestationAggregator` that S3's pre-inclusion gate uses — single source of truth for inbound attestations. Detector emits a `SlashableEvidence` candidate to the local mempool; the first-to-include operator earns the bounty.
 
-**Race avoidance:** two operators may both detect the same equivocation and submit duplicate evidence transactions. The duplicate-detection rule is "first SlashableEvidence for `(slashed_peer_id, metagraph_address, snapshot_ord, binary_hash_a, binary_hash_b)` wins." Subsequent duplicates fail validation as "already slashed."
+**Race avoidance:** two operators may both detect the same equivocation and submit duplicate evidence transactions. The duplicate-detection rule is "first SlashableEvidence for `(slashed_peer_id, metagraph_address, parent_hash, binary_hash_a, binary_hash_b)` wins." Subsequent duplicates fail validation as "already slashed."
 
 ---
 
@@ -70,11 +72,11 @@ This is **NOT** a sidecar gossip message — it's a regular L0 transaction inclu
 
 1. **Identity match.** `evidenceA.peerId == evidenceB.peerId`.
 2. **Subject match.** `evidenceA.metagraphAddress == evidenceB.metagraphAddress`.
-3. **Ord match.** `evidenceA.snapshotOrd == evidenceB.snapshotOrd`.
+3. **Parent match.** `evidenceA.parentHash == evidenceB.parentHash`. (Same VRF input ⇒ a single committee draw; signing two binaries on it is equivocation.)
 4. **Distinct binaries.** `evidenceA.binaryHash != evidenceB.binaryHash` (otherwise it's just a duplicate retransmission).
 5. **Both KES-signed by the same master VK.** Reuses `KesRegistry.verify` (Slice 9 path).
 6. **Both committee VRF proofs verify** under the accused operator's published VRF VK and the N-2 stake fraction at the relevant eta period. Reuses `CommitteeSortition.verifyMembership`.
-7. **Not already slashed.** Lookup MPT key `slashings/<peer_id>/<metagraph_address>/<snapshot_ord>` — if present, reject.
+7. **Not already slashed.** Lookup MPT key `slashings/<peer_id>/<metagraph_address>/<parent_hash>` — if present, reject.
 8. **Within evidence window.** Current epoch ≤ `event_epoch + evidence_window`.
 9. **Submitter signature.** `bountySignature` verifies over `Blake2b256(evidenceA.bytes ‖ evidenceB.bytes ‖ submitterId.bytes)` under `submitterId`'s long-term key.
 
@@ -91,7 +93,7 @@ When `SlashableEvidence` is accepted in a global snapshot, GSAM applies the foll
 | `activeDelegatedStakes[address][peer_id]` | × `(1 - slash_fraction)` for every record on the peer; reduces both numerator and denominator of stake-weighted VRF |
 | `activeNodeCollaterals[address][peer_id]` | × `(1 - slash_fraction)` similarly |
 | `slashedRegistry[peer_id]` | new entry: `{ event_ord, cooldown_until_epoch, evidence_digest }` |
-| `slashings/<peer_id>/<metagraph_address>/<snapshot_ord>` (MPT key) | set to `evidence_digest` to block double-slashing |
+| `slashings/<peer_id>/<metagraph_address>/<parent_hash>` (MPT key) | set to `evidence_digest` to block double-slashing |
 | `balances[submitter_address]` | += `slashed_amount × bounty_fraction` |
 | (burn) | `slashed_amount × (1 - bounty_fraction)` is removed from circulating supply — no minter, destroyed |
 
@@ -140,7 +142,7 @@ This doc covers what S4 of `COMMITTEE-SORTITION-DESIGN.md` §9 produces. The ful
 | S4a | `SlashableEvidence` schema + validator + tests | this doc |
 | S4b | `SlashingDetector[F]` + bounty path | this doc |
 | S4c | GSAM accept-time ledger effects (stake reduction + cooldown + burn) | this doc |
-| S5 | Per-epoch committee shift (VRF msg uses `eta_period` not `snapshot_ord`) | this doc (gated by S4) |
+| S5 | Per-epoch committee shift (VRF msg uses `eta_period` not `parent_hash`) | this doc (gated by S4) |
 | S6 | e2e validation at degenerate K=N | final |
 
 S4 is structured as three sub-slices (schema, detector, accept) so each is independently reviewable.

@@ -9,12 +9,12 @@
 
 Each metagraph snapshot must be validated by a randomly-sampled **committee** of operator keys rather than by every gl0 operator. The sortition function must:
 
-1. Be **deterministic** given public inputs `(eta, metagraph_id, snapshot_ord)` and the N-2 stake distribution — every honest node arrives at the same committee.
+1. Be **deterministic** given public inputs `(eta, metagraph_id, parent_hash)` and the N-2 stake distribution — every honest node arrives at the same committee.
 2. Be **locally-checkable**: an operator can determine "am I in this committee?" from their own VRF SK + public stake state, without coordinating with peers.
 3. Produce a committee with **honest majority** under our standard adversarial model (≤ 1/3 stake adversarial) with parametric confidence ε.
 4. Compose with existing primitives: VRF (§1.1, `EligibilityChecker`), KES (§1.2, per-operator-key), stake registry (N-2 frozen, per `consensus-epoch-staggering`).
 
-The committee's role downstream: every committee member emits a KES-signed attestation on the metagraph's snapshot. Non-committee operators ignore the snapshot. Slashing (Option C, out of scope here) catches a committee member that emits contradictory attestations on competing snapshots.
+The committee's role downstream: every committee member emits a KES-signed attestation on the metagraph's snapshot. Non-committee operators ignore the snapshot. Slashing (Option C, see [`SLASHING-DESIGN.md`](SLASHING-DESIGN.md)) catches a committee member that emits contradictory attestations on competing snapshots that share the same parent.
 
 ---
 
@@ -23,12 +23,19 @@ The committee's role downstream: every committee member emits a KES-signed attes
 | Input | Source | Why |
 |---|---|---|
 | `eta` (32 B) | current epoch's eta seed, computed from 2/3-mark of N-1 per `consensus-epoch-staggering` | freshness — adversary can't pre-compute next committee |
-| `metagraph_id` (32 B) | the address/id of the metagraph being validated | per-metagraph isolation |
-| `snapshot_ord` (8 B) | the metagraph snapshot ordinal being voted on | committee rotates per snapshot |
+| `metagraph_id` | the DAG address of the metagraph being validated | per-metagraph isolation |
+| `parent_hash` | the metagraph snapshot's `lastSnapshotHash` (parent pointer) | committee rotates per parent; two competing binaries on the same parent share one VRF input ⇒ a key that signs both equivocates (slashable, §8 Q#2) |
 | `stake_dist` | N-2 frozen StakeRegistry | adversary can't reshuffle stake mid-epoch to bias committee |
 | `K_target` | metagraph-supplied parameter (with floor enforced by L0) | committee size target |
 
-VRF message: `Blake2b-256(eta || metagraph_id || snapshot_ord || "committee")` — domain-separated from leader VRF so a leader VRF win doesn't leak committee eligibility for any metagraph.
+VRF message: `Hasher.hash(CommitteeVrfInput("committee", eta, metagraph_id, parent_hash))` — Circe-canonical JSON encoded then SHA-256'd via the standard `Hasher[F]` typeclass (the same serialization surface the rest of the codebase uses for cross-implementation byte equality, including the Go sidecar). Domain-separated from leader VRF by the in-band `"committee"` tag field so a leader VRF win doesn't leak committee eligibility for any metagraph.
+
+**Why parent_hash, not snapshot_ord.** Two independent reasons converge on the same answer:
+
+1. **Slashing identity (S4).** If two competing binaries appear with the *same* `snapshot_ord` but were built on different parents (e.g. an ml0 reorg), they have different committee VRFs — a single key signing both isn't actually equivocating, it's voting on two different fork-points. Keying the VRF on the parent hash gives "same VRF input ⇒ equivocation evidence" as a tight algebraic identity, which is what makes [`SLASHING-DESIGN.md`](SLASHING-DESIGN.md) §4.1's identity-match validator clean. Keying on the ordinal would let an honest validator that observed two distinct parents look guilty.
+2. **Uniform readability across metagraph types.** The committee sortition has to run identically against *every* metagraph the cluster hosts — currency metagraphs and custom (data-only) metagraphs alike. For currency metagraphs, gl0 already materializes `lastCurrencySnapshots[metagraphAddress] → (hash, ordinal)` in GSAM accept (`#52`), so an ordinal would be reachable cheaply. But for custom metagraphs gl0 has no schema for the binary's content — only the envelope's parent-hash field is universally structured at the gl0 layer regardless of metagraph type. Picking `parent_hash` keeps the sortition primitive uniform across the heterogeneous metagraph fleet; picking `snapshot_ord` would force a per-metagraph-type code path in the gate (currency uses structured lookup, custom does its own thing), with no upside.
+
+Tradeoff accepted: pruning the aggregator's per-(metagraph, parent, binary) tally is now driven by an explicit `pruneParents(metagraph, Set[Hash])` call from the caller — no natural `pruneBelow(N)` because hashes don't carry an order. The S3 gate already needs to know "which parents are still live" anyway (to decide whether an in-flight binary is worth waiting on), so the caller has that set on hand.
 
 ---
 
@@ -145,28 +152,29 @@ Stake-fraction over **active** N-2 registered stake (matches `MinActiveQuorumFra
 
 ## 5. Recommended primitive
 
-```
-def isInCommittee(
-  operatorKey: PeerId,
+```scala
+def isInCommittee[F[_]: Sync: Hasher](
   vrfSk: Array[Byte],
   eta: Array[Byte],
-  metagraphId: MetagraphId,
-  snapshotOrd: Long,
+  metagraphAddress: Address,
+  parentHash: Hash,
   sigmaOperatorKey: Ratio,    // stake fraction over N-2 active stake
   kTarget: Int
-): Option[(VrfProof, VrfOutput)] = {
-  val message = Blake2b256(eta ++ metagraphId.bytes ++ snapshotOrd.toBigEndianBytes ++ "committee".getBytes)
-  val proof = vrf.prove(vrfSk, message)
-  val output = vrf.proofToHash(proof)
-  val testValue = vrfOutputAsRatio(output)              // Ratio in [0, 1)
-  val threshold = Ratio(kTarget) * sigmaOperatorKey     // K · σ_i; saturates at 1
-  if (testValue < threshold) Some((proof, output)) else None
-}
+): F[Option[(VrfProof, VrfOutput)]] =
+  for {
+    msg <- Hasher[F].hash(CommitteeVrfInput("committee", Hex.fromBytes(eta), metagraphAddress, parentHash))
+    proof = vrf.prove(vrfSk, msg.getBytes)
+    output = vrf.proofToHash(proof)
+    testValue = vrfOutputAsRatio(output)              // Ratio in [0, 1)
+    threshold = Ratio(kTarget) * sigmaOperatorKey     // K · σ_i; saturates at 1
+  } yield if (testValue < threshold) Some((proof, output)) else None
 ```
 
-Verifier counterpart: `verifyCommitteeMembership(operatorVk, eta, metagraphId, snapshotOrd, sigmaOperatorKey, kTarget, proof)` — checks both VRF verification AND that `testValue < threshold`.
+Verifier counterpart: `verifyMembership(operatorVk, eta, metagraphAddress, parentHash, sigmaOperatorKey, kTarget, proof)` — checks both VRF verification AND that `testValue < threshold`.
 
-Domain separation: `"committee"` byte-suffix in the hash input makes the committee VRF independent from the leader VRF. A leader winning a slot reveals their leader-VRF output, but not their committee-VRF output for any future snapshot.
+**Serialization rule.** The VRF message is *only* ever produced via `Hasher[F].hash(CommitteeVrfInput(...))`. No hand-rolled `Blake2bDigest` concatenation in this primitive — that would create a second serialization surface that the JVM, the Go sidecar, and any future light-client verifier would all have to keep byte-identical with the rest of the codebase as encodings drift. Routing through `Hasher` (Circe JSON + SHA-256) means the canonical bytes are *defined by* the case class's encoder, which is the same surface every other consensus message uses.
+
+Domain separation: the `tag = "committee"` field on `CommitteeVrfInput` makes the committee VRF independent from any other VRF input in the system. A leader winning a slot reveals their leader-VRF output, but not their committee-VRF output for any future snapshot.
 
 ---
 
@@ -209,8 +217,8 @@ trait CommitteeSortition[F[_]] {
   def isInCommittee(
     vrfSk: Array[Byte],
     eta: Array[Byte],
-    metagraphId: MetagraphId,
-    snapshotOrd: Long,
+    metagraphAddress: Address,
+    parentHash: Hash,
     sigmaOperatorKey: Ratio,
     kTarget: Int
   ): F[Option[(Array[Byte], Array[Byte])]]                  // (proof, output)
@@ -218,8 +226,8 @@ trait CommitteeSortition[F[_]] {
   def verifyMembership(
     vrfVk: Array[Byte],
     eta: Array[Byte],
-    metagraphId: MetagraphId,
-    snapshotOrd: Long,
+    metagraphAddress: Address,
+    parentHash: Hash,
     sigmaOperatorKey: Ratio,
     kTarget: Int,
     proof: Array[Byte]
@@ -227,7 +235,7 @@ trait CommitteeSortition[F[_]] {
 }
 ```
 
-Reuses `EligibilityChecker.vrfOutputAsRatio` and the `EcVrf25519` instance. Threshold is multiplicative (`K · σ_i`) rather than LDD-snowplow — no `Log1p` / `Exp` needed. Self-contained module + property tests + golden-vector determinism test land first, no consensus wiring.
+Reuses `EligibilityChecker.vrfOutputAsRatio` and the `EcVrf25519` instance. Threshold is multiplicative (`K · σ_i`) rather than LDD-snowplow — no `Log1p` / `Exp` needed. The VRF input goes through `Hasher[F].hash(CommitteeVrfInput(...))` so the bytes hashed are determined by the case class's Circe encoder, not by a parallel byte-concat scheme. Self-contained module + property tests + golden-vector determinism test land first, no consensus wiring.
 
 ### Integration point — and the architectural choice it forces
 
@@ -244,8 +252,8 @@ In the current codebase metagraph snapshots flow through gl0 as `StateChannelOut
 ### Slice-by-slice (Option A)
 
 1. **S1 — `CommitteeSortition[F]` + property tests + golden vectors.** Pure module; no consensus wiring. Confirms VRF + threshold determinism + Chernoff sim against `K_target = 100` honest-majority bound.
-2. **S2 — Protobuf bump.** New `pb.MetagraphAttestation { peer_id, metagraph_id, snapshot_ord, committee_vrf_proof, kes_signature }`. KES-signed end-to-end (reuses Slice 9 verify path). Aggregator stub gossips + collects but doesn't gate yet (warn-only).
-3. **S3 — Pre-inclusion gate (load-bearing).** `processMetagraphBinary` waits for ≥ 2K/3 committee attestations before admitting the binary. Backed by a per-binary `Ref[F, Set[PeerId]]` with timeout.
+2. **S2 — Protobuf bump.** New `pb.MetagraphAttestation { peer_id, metagraph_address, parent_hash, binary_hash, committee_vrf_proof, signature, kes_signature }`. KES-signed end-to-end (reuses Slice 9 verify path). Aggregator stub gossips + collects but doesn't gate yet (warn-only).
+3. **S3 — Pre-inclusion gate (load-bearing).** `processMetagraphBinary` waits for ≥ 2K/3 committee attestations before admitting the binary. Backed by `MetagraphAttestationAggregator` keyed by `(metagraph_address, parent_hash, binary_hash)` with explicit `pruneParents` eviction once a parent has rolled out of the live decision window.
 4. **S4 — Slashing detection (Option C).** Two contradictory `MetagraphAttestation`s from the same committee key → emit a `SlashableEvidence` tx. Stake-burn logic is a separate follow-up doc.
 5. **S5 — e2e validation.** K_target=8 on 8 gl0 cluster (degenerate — every operator always in every committee, sortition acts as pass-through). Validates wiring. Security validation needs ≥ 50 operators per metagraph; deferred to scale-test infra.
 
@@ -265,7 +273,7 @@ In the current codebase metagraph snapshots flow through gl0 as `StateChannelOut
 3. **Mid-life joiners (KES Slice 10, #179).** Operators registered mid-life sign with a KES offset. Committee sortition uses VRF + stake fraction, both of which are independent of KES offset, so no interaction. Receiver MUST still verify the operator was in the N-2 active set at this epoch — a brand-new joiner is excluded from the committee until N-2 epochs after their registration finalizes.
 4. **K_target governance.** Fixed for v1. v2 would let each metagraph pick K, with L0-enforced `K ≥ K_floor`. Out of scope here.
 5. **Algorand committee-vs-block-proposer split.** Algorand also uses VRF sortition to elect the proposer separately. We already have a leader VRF for that role (`EligibilityChecker`), so no new design needed.
-6. **Per-snapshot vs per-epoch committee.** Per-snapshot for v1; per-epoch is the v2 end-state and is safe **only after slashing lands** (`SLASHING-DESIGN.md`). Per-epoch cuts gossip volume ~K_committee_epoch× (≈ 8× at default cadence: ~60s epoch / ~7s snapshot) — substantial at thousands of metagraphs. Without slashing, per-epoch enables an adaptive-corruption attack: adversary identifies the committee at epoch start, corrupts ⅔ of those specific keys, equivocates with no consequence. Slashing closes that attack — equivocation costs 100% of the stake. v5 of the sequencing flips the VRF message from `snapshot_ord` → `eta_period`; the primitive is unchanged. See §9 S5.
+6. **Per-snapshot vs per-epoch committee.** Per-snapshot (parent-hash-keyed) for v1; per-epoch (eta-period-keyed) is the v2 end-state and is safe **only after slashing lands** (`SLASHING-DESIGN.md`). Per-epoch cuts gossip volume ~K_committee_epoch× (≈ 8× at default cadence: ~60s epoch / ~7s snapshot) — substantial at thousands of metagraphs. Without slashing, per-epoch enables an adaptive-corruption attack: adversary identifies the committee at epoch start, corrupts ⅔ of those specific keys, equivocates with no consequence. Slashing closes that attack — equivocation costs 100% of the stake. v5 of the sequencing replaces `parent_hash` with `eta_period` in `CommitteeVrfInput`; the primitive is unchanged. See §9 S5.
 
 ---
 
@@ -281,7 +289,7 @@ In the current codebase metagraph snapshots flow through gl0 as `StateChannelOut
 8. **Impl S4a — `SlashableEvidence` schema + validator.**
 9. **Impl S4b — `SlashingDetector[F]` reads aggregator, emits evidence.**
 10. **Impl S4c — GSAM accept-time stake reduction + cooldown + bounty + burn.**
-11. **Impl S5 — per-epoch committee shift.** VRF message `snapshot_ord → eta_period`. Safe only after S4. Cuts gossip ~K_committee_epoch×.
+11. **Impl S5 — per-epoch committee shift.** VRF message swaps `parent_hash → eta_period` in `CommitteeVrfInput`. Safe only after S4. Cuts gossip ~K_committee_epoch×.
 12. **Impl S6 — e2e validation** at degenerate K=N. Larger-N security validation deferred to scale-test infra.
 
 S2 must land warn-only before S3 flips load-bearing — same staging pattern that worked for KES Slice 5→9. Skipping the warn-only middle would break liveness the moment the pre-inclusion gate goes live because no operator has historic committee attestations to forward yet. S5 (per-epoch) must come AFTER S4 (slashing) — without the deterrent, per-epoch enables the adaptive-corruption attack documented in §8 Q#6.

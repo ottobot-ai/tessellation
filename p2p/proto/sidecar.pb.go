@@ -410,16 +410,22 @@ func (x *MetagraphBinary) GetBinary() []byte {
 // Per-metagraph committee attestation (Slice S2, task #188).
 //
 // Emitted by a gl0 operator key that wins the committee VRF for a given
-// (metagraph_address, snapshot_ord) under the per-metagraph sortition
+// (metagraph_address, parent_hash) under the per-metagraph sortition
 // (`docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md`). The receiver verifies the
 // VRF proof against the sender's published VK + the threshold `K · σ`, then
 // tallies toward the per-binary `≥ 2K/3` quorum. Slice S3 will flip the
 // aggregate from warn-only observability into the load-bearing pre-inclusion
 // gate that lets non-committee operators skip the binary entirely.
 //
+// `parent_hash` is the metagraph's lastSnapshotHash — the parent pointer of
+// the binary being attested. Keying on the parent (not the ordinal) means two
+// competing binaries on the same fork point share one VRF input; a committee
+// member that signs both is detectably equivocating (slashing-condition
+// substrate, S4). UTF-8 of the canonical hex Hash representation; matches the
+// JVM-side `Hash.getBytes` form used to build `CommitteeVrfInput`.
+//
 // `binary_hash` ties the attestation to a specific MetagraphBinary so we don't
-// double-count attestations across competing binaries on the same snapshot ord
-// (slashing-condition substrate, S4).
+// double-count attestations across competing binaries on the same parent.
 //
 // `kes_signature` covers the same bytes as `signature` and follows the same
 // Slice 9 verify path used for TipAttestation. Empty during the warn-only
@@ -428,7 +434,7 @@ type MetagraphAttestation struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	PeerId            []byte                 `protobuf:"bytes,1,opt,name=peer_id,json=peerId,proto3" json:"peer_id,omitempty"`                                    // operator's long-term peer id
 	MetagraphAddress  string                 `protobuf:"bytes,2,opt,name=metagraph_address,json=metagraphAddress,proto3" json:"metagraph_address,omitempty"`      // DAG base58 string; subject metagraph
-	SnapshotOrd       int64                  `protobuf:"varint,3,opt,name=snapshot_ord,json=snapshotOrd,proto3" json:"snapshot_ord,omitempty"`                    // metagraph snapshot ordinal being attested
+	ParentHash        []byte                 `protobuf:"bytes,3,opt,name=parent_hash,json=parentHash,proto3" json:"parent_hash,omitempty"`                        // metagraph snapshot parent hash (UTF-8 of canonical Hash hex)
 	BinaryHash        []byte                 `protobuf:"bytes,4,opt,name=binary_hash,json=binaryHash,proto3" json:"binary_hash,omitempty"`                        // 32 bytes; hash of the MetagraphBinary
 	CommitteeVrfProof []byte                 `protobuf:"bytes,5,opt,name=committee_vrf_proof,json=committeeVrfProof,proto3" json:"committee_vrf_proof,omitempty"` // committee VRF proof — gates membership
 	Signature         []byte                 `protobuf:"bytes,6,opt,name=signature,proto3" json:"signature,omitempty"`                                            // long-term-key signature over the canonical bytes
@@ -481,11 +487,11 @@ func (x *MetagraphAttestation) GetMetagraphAddress() string {
 	return ""
 }
 
-func (x *MetagraphAttestation) GetSnapshotOrd() int64 {
+func (x *MetagraphAttestation) GetParentHash() []byte {
 	if x != nil {
-		return x.SnapshotOrd
+		return x.ParentHash
 	}
-	return 0
+	return nil
 }
 
 func (x *MetagraphAttestation) GetBinaryHash() []byte {
@@ -1709,11 +1715,12 @@ const file_proto_sidecar_proto_rawDesc = "" +
 	"\torigin_id\x18\x03 \x01(\fR\boriginId\"C\n" +
 	"\x0fMetagraphBinary\x12\x18\n" +
 	"\aaddress\x18\x01 \x01(\tR\aaddress\x12\x16\n" +
-	"\x06binary\x18\x02 \x01(\fR\x06binary\"\x93\x02\n" +
+	"\x06binary\x18\x02 \x01(\fR\x06binary\"\x91\x02\n" +
 	"\x14MetagraphAttestation\x12\x17\n" +
 	"\apeer_id\x18\x01 \x01(\fR\x06peerId\x12+\n" +
-	"\x11metagraph_address\x18\x02 \x01(\tR\x10metagraphAddress\x12!\n" +
-	"\fsnapshot_ord\x18\x03 \x01(\x03R\vsnapshotOrd\x12\x1f\n" +
+	"\x11metagraph_address\x18\x02 \x01(\tR\x10metagraphAddress\x12\x1f\n" +
+	"\vparent_hash\x18\x03 \x01(\fR\n" +
+	"parentHash\x12\x1f\n" +
 	"\vbinary_hash\x18\x04 \x01(\fR\n" +
 	"binaryHash\x12.\n" +
 	"\x13committee_vrf_proof\x18\x05 \x01(\fR\x11committeeVrfProof\x12\x1c\n" +
