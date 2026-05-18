@@ -9,12 +9,12 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.ext.cats.syntax.validated._
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeValidator.UpdateDelegatedStakeValidationErrorOr
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, UpdateNodeCollateral}
 import io.constellationnetwork.schema.peer.PeerId
@@ -52,7 +52,7 @@ object UpdateDelegatedStakeValidator {
   def make[F[_]: Async: SecurityProvider](
     signedValidator: SignedValidator[F],
     seedlist: Option[Set[SeedlistEntry]],
-    mptStore: MptStore[F, GlobalStateKey]
+    reader: GlobalStateReader[F]
   )(implicit hasher: Hasher[F]): UpdateDelegatedStakeValidator[F] =
     new UpdateDelegatedStakeValidator[F] {
 
@@ -117,7 +117,7 @@ object UpdateDelegatedStakeValidator {
         signed: Signed[UpdateDelegatedStake.Create]
       ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]]] =
         for {
-          maybeDelegatedStakes <- mptStore.getDelegatedStakes(signed.source)
+          maybeDelegatedStakes <- reader.getDelegatedStakes(signed.source)
           // Sort by event.ordinal (account-local sequence) to find the latest reference,
           // consistent with DelegatedStakesRoutes.getLastReference and NodeCollateralValidator.
           lastRef <- maybeDelegatedStakes
@@ -155,7 +155,7 @@ object UpdateDelegatedStakeValidator {
           .getOrElse(SortedMap.empty[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)])
           .get(signed.nodeId.toId)
 
-        mptStore.getDelegatedStakes(signed.source).map { maybeDelegatedStakes =>
+        reader.getDelegatedStakes(signed.source).map { maybeDelegatedStakes =>
           val activeDelegatedStakes = maybeDelegatedStakes
             .getOrElse(SortedSet.empty[DelegatedStakeRecord])
             .toList
@@ -173,7 +173,7 @@ object UpdateDelegatedStakeValidator {
       private def validatePendingWithdrawal(
         signed: Signed[UpdateDelegatedStake.Create]
       ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]]] =
-        mptStore.getDelegatedStakeWithdrawals(signed.source).map { maybeWithdrawals =>
+        reader.getDelegatedStakeWithdrawals(signed.source).map { maybeWithdrawals =>
           val withdrawalRef = maybeWithdrawals
             .getOrElse(SortedSet.empty[PendingDelegatedStakeWithdrawal])
             .find { case w: PendingDelegatedStakeWithdrawal => signed.tokenLockRef == w.tokenLockRef }
@@ -189,7 +189,7 @@ object UpdateDelegatedStakeValidator {
       ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Withdraw]]] = {
 
         def validateUniqueness(address: Address): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Withdraw]]] =
-          mptStore.getDelegatedStakeWithdrawals(address).flatMap { maybeWithdrawals =>
+          reader.getDelegatedStakeWithdrawals(address).flatMap { maybeWithdrawals =>
             val withdrawals = maybeWithdrawals
               .getOrElse(SortedSet.empty[PendingDelegatedStakeWithdrawal])
             for {
@@ -203,7 +203,7 @@ object UpdateDelegatedStakeValidator {
           }
 
         def validateCreate(address: Address): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Withdraw]]] =
-          mptStore.getDelegatedStakes(address).flatMap { maybeDelegatedStakes =>
+          reader.getDelegatedStakes(address).flatMap { maybeDelegatedStakes =>
             val delegatedStakes = maybeDelegatedStakes
               .getOrElse(SortedSet.empty[DelegatedStakeRecord])
             getParent(delegatedStakes, signed).map {
@@ -229,8 +229,8 @@ object UpdateDelegatedStakeValidator {
 
         def tokenLockAvailable(address: Address): F[Boolean] =
           for {
-            maybeDelegatedStakes <- mptStore.getDelegatedStakes(address)
-            maybeNodeCollaterals <- mptStore.getNodeCollaterals(address)
+            maybeDelegatedStakes <- reader.getDelegatedStakes(address)
+            maybeNodeCollaterals <- reader.getNodeCollaterals(address)
           } yield {
             val maybeExistingStake = maybeDelegatedStakes
               .getOrElse(SortedSet.empty[DelegatedStakeRecord])
@@ -244,7 +244,7 @@ object UpdateDelegatedStakeValidator {
           }
 
         def tokenLockValid(address: Address): F[Boolean] =
-          mptStore.getActiveTokenLocks(address).flatMap { maybeTokenLocks =>
+          reader.getActiveTokenLocks(address).flatMap { maybeTokenLocks =>
             val tokenLocks = maybeTokenLocks
               .getOrElse(SortedSet.empty[Signed[TokenLock]])
             for {

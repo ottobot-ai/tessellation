@@ -11,6 +11,7 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types.{AddressesConfig, DelegatedStakingConfig, PriceOracleConfig}
 import io.constellationnetwork.node.shared.domain.block.processing.BlockValidator
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeValidator
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.node.UpdateNodeParametersValidator
 import io.constellationnetwork.node.shared.domain.nodeCollateral.UpdateNodeCollateralValidator
 import io.constellationnetwork.node.shared.domain.priceOracle.PricingUpdateValidator
@@ -45,7 +46,19 @@ object SharedValidators {
     txHasher: Hasher[F],
     delegatedStaking: DelegatedStakingConfig,
     priceOracleConfig: PriceOracleConfig,
-    maybeMptStore: Option[MptStore[F, GlobalStateKey]] = None
+    maybeMptStore: Option[MptStore[F, GlobalStateKey]] = None,
+    // #198: Class-2 validator path migrated to GlobalStateReader (#118 follow-up). On gl0,
+    // pass `GlobalStateReader.pending(overlay, bestTipFn)` so HTTP intake + acceptance see the
+    // chain's pending writes under MultiBranch. On followers (gl1/cl1/dl1/ml0) pass
+    // `GlobalStateReader.finalized(mptStore)`. When `None`, the reader-dependent validators
+    // fall through to the `lastContext`-based fallbacks (legacy/test path).
+    //
+    // On gl0 the natural construction point of `pending` is after `Services.make` builds the
+    // overlay-aware reader — but `SharedValidators.make` runs earlier in startup. Callers
+    // should pass `GlobalStateReader.fromMptStore(storages.mptStore)` here as a finalized
+    // default, then call `withOverlayReader(services.pendingReader)` after `Services.make`
+    // to swap in the overlay-aware reader before `HttpApi.make` consumes the validators.
+    maybeReader: Option[GlobalStateReader[F]] = None
   ): SharedValidators[F] = {
     val signedValidator = SignedValidator.make[F]
     val transactionChainValidator = TransactionChainValidator.make[F](txHasher)
@@ -79,13 +92,13 @@ object SharedValidators {
       maybeMptStore,
       shouldUseMptStore = false
     )
-    val updateDelegatedStakeValidator = maybeMptStore match {
-      case Some(mptStore) => UpdateDelegatedStakeValidator.make[F](signedValidator, l0Seedlist, mptStore)
-      case None           => UpdateDelegatedStakeValidator.make[F](signedValidator, l0Seedlist)
+    val updateDelegatedStakeValidator = maybeReader match {
+      case Some(reader) => UpdateDelegatedStakeValidator.make[F](signedValidator, l0Seedlist, reader)
+      case None         => UpdateDelegatedStakeValidator.make[F](signedValidator, l0Seedlist)
     }
-    val updateNodeCollateralValidator = maybeMptStore match {
-      case Some(mptStore) => UpdateNodeCollateralValidator.make[F](signedValidator, l0Seedlist, mptStore)
-      case None           => UpdateNodeCollateralValidator.rejectAll[F]
+    val updateNodeCollateralValidator = maybeReader match {
+      case Some(reader) => UpdateNodeCollateralValidator.make[F](signedValidator, l0Seedlist, reader)
+      case None         => UpdateNodeCollateralValidator.rejectAll[F]
     }
 
     val spendActionValidator = SpendActionValidator.make[F]
@@ -141,4 +154,46 @@ sealed abstract class SharedValidators[F[_]] private (
   val updateDelegatedStakeValidator: UpdateDelegatedStakeValidator[F],
   val updateNodeCollateralValidator: UpdateNodeCollateralValidator[F],
   val pricingUpdateValidator: PricingUpdateValidator[F]
-)
+) {
+
+  /** #198: Class-2 validator path migrated to GlobalStateReader (#118 follow-up). Returns a copy of this `SharedValidators` with
+    * `updateDelegatedStakeValidator` and `updateNodeCollateralValidator` rebuilt against the supplied `reader`. Used by gl0's `Main.scala`
+    * to swap in the overlay-aware `pendingReader` after `Services.make` constructs it — the initial `SharedValidators.make` call happens
+    * before the overlay exists, so it's seeded with the finalized adapter and upgraded here. The other validators are reused unchanged.
+    *
+    * The `l0Seedlist` arg must match the value passed to `SharedValidators.make`; the rebuild uses it for `validateAuthorizedNodeId`. Type-
+    * class constraints `Async`, `SecurityProvider`, `Hasher` are not captured by the class (kept stateless / re-summoned per call) so the
+    * caller re-supplies them at the swap point.
+    */
+  def withOverlayReader(reader: GlobalStateReader[F], l0Seedlist: Option[Set[SeedlistEntry]])(
+    implicit F: Async[F],
+    sp: SecurityProvider[F],
+    hasher: Hasher[F]
+  ): SharedValidators[F] = {
+    val newDelegated = UpdateDelegatedStakeValidator.make[F](signedValidator, l0Seedlist, reader)
+    val newCollateral = UpdateNodeCollateralValidator.make[F](signedValidator, l0Seedlist, reader)
+    new SharedValidators[F](
+      signedValidator,
+      transactionChainValidator,
+      transactionValidator,
+      feeTransactionValidator,
+      currencyTransactionChainValidator,
+      currencyTransactionValidator,
+      blockValidator,
+      currencyBlockValidator,
+      rumorValidator,
+      stateChannelValidator,
+      currencyMessageValidator,
+      globalSnapshotSyncValidator,
+      tokenLockBlockValidator,
+      allowSpendBlockValidator,
+      allowSpendValidator,
+      tokenLockValidator,
+      updateNodeParametersValidator,
+      spendActionValidator,
+      newDelegated,
+      newCollateral,
+      pricingUpdateValidator
+    ) {}
+  }
+}

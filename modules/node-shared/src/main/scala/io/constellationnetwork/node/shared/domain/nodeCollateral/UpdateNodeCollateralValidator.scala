@@ -8,12 +8,12 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.ext.cats.syntax.validated._
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
 import io.constellationnetwork.node.shared.domain.nodeCollateral.UpdateNodeCollateralValidator.UpdateNodeCollateralValidationErrorOr
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, UpdateDelegatedStake}
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
@@ -66,7 +66,7 @@ object UpdateNodeCollateralValidator {
   def make[F[_]: Async: SecurityProvider](
     signedValidator: SignedValidator[F],
     seedlist: Option[Set[SeedlistEntry]],
-    mptStore: MptStore[F, GlobalStateKey]
+    reader: GlobalStateReader[F]
   )(
     implicit hasher: Hasher[F]
   ): UpdateNodeCollateralValidator[F] =
@@ -132,7 +132,7 @@ object UpdateNodeCollateralValidator {
       private def validateNodeId(
         signed: Signed[UpdateNodeCollateral.Create]
       ): F[UpdateNodeCollateralValidationErrorOr[Signed[UpdateNodeCollateral.Create]]] =
-        mptStore.getNodeCollaterals(signed.source).map { maybeCollaterals =>
+        reader.getNodeCollaterals(signed.source).map { maybeCollaterals =>
           val activeNodeCollaterals = maybeCollaterals.getOrElse(SortedSet.empty[NodeCollateralRecord]).toList
           if (activeNodeCollaterals.exists(s => s.event.nodeId == signed.nodeId)) {
             StakeExistsForNode(signed.nodeId).invalidNec
@@ -145,7 +145,7 @@ object UpdateNodeCollateralValidator {
         signed: Signed[UpdateNodeCollateral.Create]
       ): F[UpdateNodeCollateralValidationErrorOr[Signed[UpdateNodeCollateral.Create]]] =
         for {
-          maybeCollaterals <- mptStore.getNodeCollaterals(signed.source)
+          maybeCollaterals <- reader.getNodeCollaterals(signed.source)
           lastRef <- maybeCollaterals
             .getOrElse(SortedSet.empty[NodeCollateralRecord])
             .toList
@@ -172,7 +172,7 @@ object UpdateNodeCollateralValidator {
       private def validatePendingWithdrawal(
         signed: Signed[UpdateNodeCollateral.Create]
       ): F[UpdateNodeCollateralValidationErrorOr[Signed[UpdateNodeCollateral.Create]]] =
-        mptStore.getNodeCollateralWithdrawals(signed.source).map { maybeWithdrawals =>
+        reader.getNodeCollateralWithdrawals(signed.source).map { maybeWithdrawals =>
           val withdrawalRef = maybeWithdrawals
             .getOrElse(SortedSet.empty[PendingNodeCollateralWithdrawal])
             .find(w => w.event.tokenLockRef == signed.value.tokenLockRef)
@@ -188,7 +188,7 @@ object UpdateNodeCollateralValidator {
       ): F[UpdateNodeCollateralValidationErrorOr[Signed[UpdateNodeCollateral.Withdraw]]] = {
 
         def validateUniqueness(address: Address): F[UpdateNodeCollateralValidationErrorOr[Signed[UpdateNodeCollateral.Withdraw]]] =
-          mptStore.getNodeCollateralWithdrawals(address).flatMap { maybeWithdrawals =>
+          reader.getNodeCollateralWithdrawals(address).flatMap { maybeWithdrawals =>
             val withdrawals = maybeWithdrawals.getOrElse(SortedSet.empty[PendingNodeCollateralWithdrawal])
             for {
               refs <- withdrawals.toList.traverse(w => NodeCollateralReference.of(w.event))
@@ -201,7 +201,7 @@ object UpdateNodeCollateralValidator {
           }
 
         def validateCreate(address: Address): F[UpdateNodeCollateralValidationErrorOr[Signed[UpdateNodeCollateral.Withdraw]]] =
-          mptStore.getNodeCollaterals(address).flatMap { maybeCollaterals =>
+          reader.getNodeCollaterals(address).flatMap { maybeCollaterals =>
             getParent(maybeCollaterals.getOrElse(SortedSet.empty), signed).map {
               case Some(nodeCollateral) =>
                 if (nodeCollateral.source =!= signed.source)
@@ -225,8 +225,8 @@ object UpdateNodeCollateralValidator {
 
         def tokenLockAvailable(address: Address): F[Boolean] =
           for {
-            maybeDelegatedStakes <- mptStore.getDelegatedStakes(signed.source)
-            maybeNodeCollaterals <- mptStore.getNodeCollaterals(address)
+            maybeDelegatedStakes <- reader.getDelegatedStakes(signed.source)
+            maybeNodeCollaterals <- reader.getNodeCollaterals(address)
           } yield {
             val maybeExistingStake = maybeDelegatedStakes
               .getOrElse(SortedSet.empty[DelegatedStakeRecord])
@@ -242,7 +242,7 @@ object UpdateNodeCollateralValidator {
         // Verify the token lock belongs to the signing address (address === tokenLock.source),
         // consistent with UpdateDelegatedStakeValidator.tokenLockValid.
         def tokenLockValid(address: Address): F[Boolean] =
-          mptStore.getActiveTokenLocks(address).flatMap { maybeTokenLocks =>
+          reader.getActiveTokenLocks(address).flatMap { maybeTokenLocks =>
             val tokenLocks = maybeTokenLocks.getOrElse(SortedSet.empty[Signed[TokenLock]])
             for {
               tokenLocksWithReferences <- tokenLocks.toList.traverse(t => TokenLockReference.of(t).map(r => (t, r)))
