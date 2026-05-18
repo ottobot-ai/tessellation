@@ -795,16 +795,33 @@ object GlobalSnapshotConsensus {
               }
             }
           }
-          // KES period and parent-ordinal lookups. For v1 with a single metagraph + non-rotating eta,
-          // the metagraph parent ordinal is approximated by the current gl0 finalized ordinal — the
-          // KES period derived from it matches what the sender's leader VRF used for the gl0 snapshot
-          // that included this binary. Follow-up: resolve via `lastCurrencySnapshots[mg]` from the GSI.
+          // KES period derivation — pure function of the parent ordinal + cluster's rotation cadence.
+          // Matches the gl0 leader VRF's period derivation so the receiver-side gate computes the same
+          // KES period the sender did, IFF both peers resolve the same parent ordinal (#201). The
+          // resolver below is the load-bearing piece.
           committeeKesPeriodFor = (parentOrdinal: Long) =>
             io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
               .rotationPeriod(parentOrdinal, etaRotationSnapshots.toLong)
               .toInt
-          committeeParentOrdinalFor = (_: io.constellationnetwork.security.hash.Hash) =>
-            nakamotoFinalizedOrdinalRef.get.map(o => Option(o.value.value))
+          // #201: resolve the metagraph parent ordinal from `(metagraphAddress, parentHash)` via the
+          // gl0 GSI's `lastStateChannelSnapshotHashes` + `lastIncrementalCurrencySnapshots` partitions.
+          // The previous shortcut (gl0 finalized ordinal) was asymmetric across peers (each peer has
+          // its own `nakamotoFinalizedOrdinalRef` value at the same wallclock) and unrelated to the
+          // metagraph's own snapshot progress, so the KES period peers derived disagreed and verifies
+          // failed. The resolver reads through `pendingReader` so under MultiBranch we pick up the
+          // chain's pending writes; #118's overlay-aware reader already handles the
+          // pending-vs-finalized fallback.
+          committeeParentOrdinalFor: (
+            (
+              io.constellationnetwork.schema.address.Address,
+              io.constellationnetwork.security.hash.Hash
+            ) => F[
+              Option[Long]
+            ]
+          ) = (mg, parent) => {
+            implicit val resolverLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
+            io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver.resolve[F](pendingReader, mg, parent)
+          }
           committeeGate = {
             implicit val gateLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
             implicit val gateHasher: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
@@ -1029,8 +1046,11 @@ object GlobalSnapshotConsensus {
                   operationalKeyMaker = operationalKeyMaker,
                   kesRegistry = kesRegistry,
                   // Slice S3: gate metagraph binaries on committee threshold + verify received
-                  // committee attestations against the aggregator.
+                  // committee attestations against the aggregator. The daemon needs both an ordinal
+                  // resolver (#201) and an ordinal-to-eta function (#202) — handlers chain them so
+                  // the eta passed to the gate is byte-equivalent to the sender's eta.
                   committeeGate = committeeGate,
+                  parentOrdinalFor = committeeParentOrdinalFor,
                   etaForParentOrdinal = committeeEtaForOrdinal,
                   senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.optimisticRelativeStake(peer)
                 )

@@ -133,6 +133,12 @@ object MetagraphCommitteeGate {
   object SenderOutcome {
     case object NotInCommittee extends SenderOutcome
     final case class Attested(proof: Array[Byte], output: Array[Byte]) extends SenderOutcome
+
+    /** The metagraph parent ordinal could not be resolved (see `MetagraphParentOrdinalResolver`). We skip publishing — emitting an
+      * attestation with a guessed period would be byte-asymmetric to peers who can resolve the right one, so the receivers would reject it
+      * anyway and we'd just spam the wire.
+      */
+    case object UnknownParentOrdinal extends SenderOutcome
   }
 
   /** Outcome of the `recordReceivedAttestation` path. Tests assert these values; the daemon path consumes the unit variant of the receiver
@@ -146,6 +152,12 @@ object MetagraphCommitteeGate {
     case object EmptyKesSig extends ReceiverOutcome
     case object InvalidKesSig extends ReceiverOutcome
     case object InvalidCommitteeVrf extends ReceiverOutcome
+
+    /** The metagraph parent ordinal lookup returned `None`. Either (a) the gl0 GSI hasn't yet observed a tip for this metagraph
+      * (pre-bootstrap window), or (b) the incoming binary's `parentHash` doesn't match the gl0-recorded
+      * `lastStateChannelSnapshotHashes[mg]` — see `MetagraphParentOrdinalResolver`. Fail-closed: drop the attestation.
+      */
+    case object UnknownParentOrdinal extends ReceiverOutcome
   }
 
   /** The pre-message that gets Hasher-hashed for both the long-term Ed25519 signature and (separately) any future domain-separation.
@@ -233,7 +245,12 @@ object MetagraphCommitteeGate {
     *   - `kesSigner` / `kesVerifier` for the REQUIRED KES product signature path (reuses Slice 9),
     *   - `publisher` for the sidecar `PublishMetagraphAttestation` RPC,
     *   - `kesPeriodFor` to derive the KES product period from a parent ordinal (the gl0 ordinal of the parent metagraph snapshot — matches
-    *     the leader VRF's existing period derivation).
+    *     the leader VRF's existing period derivation),
+    *   - `parentOrdinalFor` to resolve the metagraph parent's ordinal from `(metagraphAddress, parentHash)` against the gl0 GSI's
+    *     `lastCurrencySnapshots[mg]` (#201). The two-arg signature is load-bearing: KES period and eta both derive from this ordinal, and
+    *     the gl0 finalized ordinal is the wrong quantity (it's asymmetric across peers and unrelated to the metagraph's progress). When
+    *     this returns `None` (mismatch, no entry, pre-bootstrap), the gate fails closed — sender skips publish, receiver drops the
+    *     attestation. See `MetagraphParentOrdinalResolver`.
     *
     * `selfPeerId`, `selfVrfSk`, `keyPair` are this operator's identity keys: VRF SK for the committee draw, long-term Ed25519 key
     * (`keyPair.getPrivate`) for the outer signature.
@@ -252,7 +269,7 @@ object MetagraphCommitteeGate {
     gateTimeoutMs: Long,
     pollIntervalMs: Long,
     kesPeriodFor: Long => Int,
-    parentOrdinalFor: Hash => F[Option[Long]]
+    parentOrdinalFor: (Address, Hash) => F[Option[Long]]
   ): MetagraphCommitteeGate[F] =
     new MetagraphCommitteeGate[F] {
 
@@ -292,32 +309,47 @@ object MetagraphCommitteeGate {
                 )
                 .as(SenderOutcome.NotInCommittee: SenderOutcome)
             case Some((proof, output)) =>
-              for {
-                _ <- aggregator.record(metagraphAddress, parentHash, binaryHash, selfPeerId)
-                msgBytes <- messageBytes[F](selfPeerId, metagraphAddress, parentHash, binaryHash)
-                edSig <- Signing.signData[F](msgBytes)(keyPair.getPrivate)
-                kesOrdinal <- parentOrdinalFor(parentHash).map(_.getOrElse(0L))
-                kesSig <- kesSigner.signAt(kesPeriodFor(kesOrdinal), msgBytes)
-                // KES is REQUIRED for committee attestations. An empty kesSig from a signer
-                // failure is treated as a soft fail — we still record locally (Ed25519 already
-                // authenticated our own draw) but the receiver-side gate will reject our wire
-                // message. The sign attempt itself is non-cancelling: better to ship than to
-                // silently drop our own committee vote.
-                _ <- publisher.publish(
-                  senderPeerIdBytes = selfPeerId.value.toBytes,
-                  metagraphAddress = metagraphAddress.value.value,
-                  parentHashBytes = parentHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                  binaryHashBytes = binaryHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                  committeeVrfProof = proof,
-                  longTermSignature = edSig,
-                  kesSignature = kesSig,
-                  vrfPublicKey = selfVrfVk
-                )
-                _ <- logger.info(
-                  s"📢 committee-attested mg=$metagraphAddress parent=${parentHash.value.take(12)}... binary=${binaryHash.value
-                      .take(12)}... kTarget=$kTarget"
-                )
-              } yield SenderOutcome.Attested(proof, output): SenderOutcome
+              // Resolve the metagraph parent ordinal FIRST. If the lookup fails, fail closed:
+              // skip the publish entirely. Publishing with a guessed KES period would be
+              // byte-asymmetric to peers who CAN resolve it (their kesPeriodFor disagrees with
+              // ours) → KES verify fails → gate times out anyway, but with extra wire noise. We
+              // also skip the self-record so the local aggregator doesn't show a phantom vote
+              // for a binary the cluster can't actually attest to.
+              parentOrdinalFor(metagraphAddress, parentHash).flatMap {
+                case None =>
+                  logger
+                    .warn(
+                      s"⛔ committee-gate sender: unresolved parent ordinal mg=$metagraphAddress parent=${parentHash.value
+                          .take(12)}... — skipping publish (fail-closed, #201)"
+                    )
+                    .as(SenderOutcome.UnknownParentOrdinal: SenderOutcome)
+                case Some(parentOrdinal) =>
+                  for {
+                    _ <- aggregator.record(metagraphAddress, parentHash, binaryHash, selfPeerId)
+                    msgBytes <- messageBytes[F](selfPeerId, metagraphAddress, parentHash, binaryHash)
+                    edSig <- Signing.signData[F](msgBytes)(keyPair.getPrivate)
+                    kesSig <- kesSigner.signAt(kesPeriodFor(parentOrdinal), msgBytes)
+                    // KES is REQUIRED for committee attestations. An empty kesSig from a signer
+                    // failure is treated as a soft fail — we still record locally (Ed25519 already
+                    // authenticated our own draw) but the receiver-side gate will reject our wire
+                    // message. The sign attempt itself is non-cancelling: better to ship than to
+                    // silently drop our own committee vote.
+                    _ <- publisher.publish(
+                      senderPeerIdBytes = selfPeerId.value.toBytes,
+                      metagraphAddress = metagraphAddress.value.value,
+                      parentHashBytes = parentHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                      binaryHashBytes = binaryHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                      committeeVrfProof = proof,
+                      longTermSignature = edSig,
+                      kesSignature = kesSig,
+                      vrfPublicKey = selfVrfVk
+                    )
+                    _ <- logger.info(
+                      s"📢 committee-attested mg=$metagraphAddress parent=${parentHash.value.take(12)}... binary=${binaryHash.value
+                          .take(12)}... kTarget=$kTarget parentOrd=$parentOrdinal"
+                    )
+                  } yield SenderOutcome.Attested(proof, output): SenderOutcome
+              }
           }
 
       private def waitForThreshold(
@@ -396,43 +428,52 @@ object MetagraphCommitteeGate {
         else if (att.kesSignature.isEmpty)
           Async[F].pure(ReceiverOutcome.EmptyKesSig: ReceiverOutcome)
         else
-          for {
-            msgBytes <- messageBytes[F](att.senderPeerId, att.metagraphAddress, att.parentHash, att.binaryHash)
-            senderPubKey <- att.senderPeerId.value.toPublicKey[F]
-            edOk <- Signing.verifySignature[F](msgBytes, att.longTermSignature)(senderPubKey)
-            outcome <-
-              if (!edOk) Async[F].pure(ReceiverOutcome.InvalidLongTermSig: ReceiverOutcome)
-              else
-                for {
-                  kesOrdinal <- parentOrdinalFor(att.parentHash).map(_.getOrElse(0L))
-                  kesOk <- kesVerifier.verify(
-                    messageBytes = msgBytes,
-                    kesSigBytes = att.kesSignature,
-                    attesterId = att.senderPeerId,
-                    attesterHex = att.senderPeerId.value,
-                    kesOrdinal = kesOrdinal
-                  )
-                  result <-
-                    if (!kesOk) Async[F].pure(ReceiverOutcome.InvalidKesSig: ReceiverOutcome)
-                    else
-                      lookupSenderStake(att.senderPeerId).flatMap { sigmaSender =>
-                        sortition
-                          .verifyMembership(
-                            att.senderVrfVk,
-                            eta,
-                            att.metagraphAddress,
-                            att.parentHash,
-                            sigmaSender,
-                            kTarget,
-                            att.committeeVrfProof
-                          )
-                          .map { vrfOk =>
-                            if (vrfOk) ReceiverOutcome.Recorded
-                            else ReceiverOutcome.InvalidCommitteeVrf
+          // Resolve the metagraph parent ordinal up front. If we can't, fail-closed: drop
+          // the attestation. Calling kesVerifier with a guessed ordinal (the previous
+          // `.getOrElse(0L)` shortcut) computes a KES period that disagrees with the sender's →
+          // the verify fails anyway, just with a less specific reason. `UnknownParentOrdinal`
+          // names the actual cause for the operator to see (#201).
+          parentOrdinalFor(att.metagraphAddress, att.parentHash).flatMap {
+            case None =>
+              Async[F].pure(ReceiverOutcome.UnknownParentOrdinal: ReceiverOutcome)
+            case Some(kesOrdinal) =>
+              for {
+                msgBytes <- messageBytes[F](att.senderPeerId, att.metagraphAddress, att.parentHash, att.binaryHash)
+                senderPubKey <- att.senderPeerId.value.toPublicKey[F]
+                edOk <- Signing.verifySignature[F](msgBytes, att.longTermSignature)(senderPubKey)
+                outcome <-
+                  if (!edOk) Async[F].pure(ReceiverOutcome.InvalidLongTermSig: ReceiverOutcome)
+                  else
+                    for {
+                      kesOk <- kesVerifier.verify(
+                        messageBytes = msgBytes,
+                        kesSigBytes = att.kesSignature,
+                        attesterId = att.senderPeerId,
+                        attesterHex = att.senderPeerId.value,
+                        kesOrdinal = kesOrdinal
+                      )
+                      result <-
+                        if (!kesOk) Async[F].pure(ReceiverOutcome.InvalidKesSig: ReceiverOutcome)
+                        else
+                          lookupSenderStake(att.senderPeerId).flatMap { sigmaSender =>
+                            sortition
+                              .verifyMembership(
+                                att.senderVrfVk,
+                                eta,
+                                att.metagraphAddress,
+                                att.parentHash,
+                                sigmaSender,
+                                kTarget,
+                                att.committeeVrfProof
+                              )
+                              .map { vrfOk =>
+                                if (vrfOk) ReceiverOutcome.Recorded
+                                else ReceiverOutcome.InvalidCommitteeVrf
+                              }
                           }
-                      }
-                } yield result
-          } yield outcome
+                    } yield result
+              } yield outcome
+          }
 
       def pruneParents(metagraphAddress: Address, parents: Set[Hash]): F[Unit] =
         aggregator.pruneParents(metagraphAddress, parents)

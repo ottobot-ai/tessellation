@@ -264,11 +264,21 @@ object NakamotoSyncDaemon {
     // `attestAndAdmit` is wired in front of `processMetagraphBinary` in `Services.scala`. The
     // daemon only needs the receiver hook + the eta resolver to feed the verifier.
     committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
-    // Resolves the canonical `eta` (32 bytes) for the committee VRF input. Sourced from the
-    // sender's metagraph parent ordinal; the daemon doesn't compute it inline so the same eta
-    // function used by snapshot validation is reused. Empty `Array[Byte](32)` is a valid
-    // fallback (no chain data yet); the receiver path verifies the VRF against whatever bytes
-    // we pass — eta mismatch will surface as `InvalidCommitteeVrf`.
+    // #201/#202: resolve `(metagraphAddress, parentHash) → metagraph parent ordinal` via the gl0
+    // GSI. Previously the handlers hardcoded `0L` here, which made `etaForParentOrdinal` return
+    // the genesis eta regardless of how far the chain had progressed — receivers verified the
+    // committee VRF against the wrong eta and dropped attestations once the cluster crossed the
+    // first eta rotation boundary. Handlers chain this resolver into `etaForParentOrdinal` and
+    // fail-closed if the resolver returns `None` (no eta to verify against → drop the message).
+    parentOrdinalFor: (
+      io.constellationnetwork.schema.address.Address,
+      io.constellationnetwork.security.hash.Hash
+    ) => F[Option[Long]],
+    // Resolves the canonical `eta` (32 bytes) for the committee VRF input from the metagraph
+    // parent ordinal. The daemon's handlers resolve the ordinal via `parentOrdinalFor` first then
+    // pass it here — the receiver-side eta must be byte-equivalent to the sender's eta, and the
+    // sender derived its eta from the same ordinal. Mismatch surfaces as `InvalidCommitteeVrf` on
+    // the gate's verify path.
     etaForParentOrdinal: Long => F[Array[Byte]],
     // Receiver-side σ lookup. The committee VRF threshold is `K · σ_sender`, so the verifier
     // needs the SENDER's stake, not ours. Passed as a callback to keep the daemon agnostic of
@@ -455,6 +465,7 @@ object NakamotoSyncDaemon {
                                   mb,
                                   processMetagraphBinary,
                                   committeeGate,
+                                  parentOrdinalFor,
                                   etaForParentOrdinal,
                                   stakeRegistry.optimisticRelativeStake(selfId),
                                   logger
@@ -472,6 +483,7 @@ object NakamotoSyncDaemon {
                                 handleMetagraphAttestation(
                                   att,
                                   committeeGate,
+                                  parentOrdinalFor,
                                   etaForParentOrdinal,
                                   senderStakeLookup,
                                   logger
@@ -1453,6 +1465,10 @@ object NakamotoSyncDaemon {
   private def handleMetagraphAttestation[F[_]: Async](
     att: pb.MetagraphAttestation,
     committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
+    parentOrdinalFor: (
+      io.constellationnetwork.schema.address.Address,
+      io.constellationnetwork.security.hash.Hash
+    ) => F[Option[Long]],
     etaForParentOrdinal: Long => F[Array[Byte]],
     senderStakeLookup: peer.PeerId => F[io.constellationnetwork.numerics.Ratio],
     logger: org.typelevel.log4cats.Logger[F]
@@ -1481,16 +1497,24 @@ object NakamotoSyncDaemon {
           longTermSignature = att.signature.toByteArray,
           kesSignature = att.kesSignature.toByteArray
         )
-        // Resolve eta from the sender's claimed metagraph-parent ordinal — but the wire format
-        // doesn't carry it explicitly (the parent hash is on-wire instead). For v1 we pass
-        // ordinal 0L; the eta resolver falls back to the genesis eta in that case, which
-        // matches the sender's eta source for parents that haven't yet entered the epoch eta
-        // rotation. This is byte-equivalent under the iter37 test cluster's pre-rotation window
-        // (snapshot ordinals stay below `etaRotationSnapshots` for the test duration). A
-        // follow-up will resolve the metagraph parent ordinal from the parent hash via the
-        // chain store's `lastCurrencySnapshots` mapping.
-        etaForParentOrdinal(0L).flatMap { eta =>
-          committeeGate.recordReceivedAttestation(incoming, eta, senderStakeLookup)
+        // #202: resolve the actual metagraph parent ordinal from `(metagraphAddress, parentHash)`
+        // via the gl0 GSI before computing eta. The previous shortcut (`etaForParentOrdinal(0L)`)
+        // always returned the genesis eta, which agreed with senders only inside the first
+        // `etaRotationSnapshots` window of the cluster — after the first eta rotation, the eta the
+        // sender used differs from genesis, and the committee VRF on the gate's verify path drops
+        // every attestation as `InvalidCommitteeVrf`. Fail closed on None: if we can't resolve the
+        // parent ordinal we can't derive the right eta, so the verify is guaranteed to fail anyway.
+        // Drop early with a specific log instead of a noisy down-stack rejection.
+        parentOrdinalFor(metagraphAddress, parentHash).flatMap {
+          case None =>
+            logger.warn(
+              s"⚠️ Rejecting metagraph-attestation: unresolved parent ordinal for mg=$metagraphAddress " +
+                s"parent=${parentHash.value.take(12)}... (fail-closed, #202)"
+            )
+          case Some(parentOrdinal) =>
+            etaForParentOrdinal(parentOrdinal).flatMap { eta =>
+              committeeGate.recordReceivedAttestation(incoming, eta, senderStakeLookup)
+            }
         }
     }
   }
@@ -1514,6 +1538,10 @@ object NakamotoSyncDaemon {
     mb: pb.MetagraphBinary,
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
     committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
+    parentOrdinalFor: (
+      io.constellationnetwork.schema.address.Address,
+      io.constellationnetwork.security.hash.Hash
+    ) => F[Option[Long]],
     etaForParentOrdinal: Long => F[Array[Byte]],
     selfStake: F[io.constellationnetwork.numerics.Ratio],
     logger: org.typelevel.log4cats.Logger[F]
@@ -1544,19 +1572,31 @@ object NakamotoSyncDaemon {
               // wire payload so the binary-hash agrees byte-for-byte.
               HasherSelector[F].withCurrent { implicit hasher =>
                 Hasher[F].hashBytes(bytes).flatMap { binaryHash =>
-                  // Gate inputs: eta for the metagraph-parent ordinal (currently 0L fallback — see
-                  // handleMetagraphAttestation note), and σ_self for our committee threshold. The
-                  // selfStake lookup is the same StakeRegistry path the leader VRF uses.
-                  for {
-                    eta <- etaForParentOrdinal(0L)
-                    sigma <- selfStake
-                    admitted <- committeeGate.attestAndAdmit(address, parentHash, binaryHash, eta, sigma)
-                    _ <-
-                      if (admitted)
-                        processMetagraphBinary(output)
-                          .handleErrorWith(e => logger.warn(s"⚠️ processMetagraphBinary failed for $address: ${e.getMessage}"))
-                      else Async[F].unit
-                  } yield ()
+                  // Gate inputs: σ_self for our committee threshold + eta derived from the actual
+                  // metagraph parent ordinal (#202). The selfStake lookup is the same StakeRegistry
+                  // path the leader VRF uses. The parent-ordinal resolve via `parentOrdinalFor` is
+                  // load-bearing: the previous `etaForParentOrdinal(0L)` shortcut returned genesis
+                  // eta for every parent regardless of where the chain actually was. Fail-closed on
+                  // None — without the right eta, the receiver's committee VRF verify is guaranteed
+                  // to drop our attestation, so we'd just be putting noise on the wire.
+                  parentOrdinalFor(address, parentHash).flatMap {
+                    case None =>
+                      logger.warn(
+                        s"⚠️ Rejecting metagraph-binary gossip: unresolved parent ordinal for mg=$address " +
+                          s"parent=${parentHash.value.take(12)}... (fail-closed, #202)"
+                      )
+                    case Some(parentOrdinal) =>
+                      for {
+                        eta <- etaForParentOrdinal(parentOrdinal)
+                        sigma <- selfStake
+                        admitted <- committeeGate.attestAndAdmit(address, parentHash, binaryHash, eta, sigma)
+                        _ <-
+                          if (admitted)
+                            processMetagraphBinary(output)
+                              .handleErrorWith(e => logger.warn(s"⚠️ processMetagraphBinary failed for $address: ${e.getMessage}"))
+                          else Async[F].unit
+                      } yield ()
+                  }
                 }
               }
           }

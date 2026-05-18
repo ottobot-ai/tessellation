@@ -4,14 +4,17 @@ import cats.effect.Async
 
 import scala.collection.immutable.SortedSet
 
-import io.constellationnetwork.currency.schema.currency.CurrencySnapshotInfo
+import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshotInfo}
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
+import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
+import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutableCodec}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
 /** Typed read accessors over `GlobalStateReader[F]`, mirroring the `MptStoreReadOps` extension defined in `GlobalStateConverter` for
@@ -48,5 +51,21 @@ object GlobalStateReaderOps {
 
     def getCurrencySnapshotInfo(metagraphAddress: Address): F[Option[CurrencySnapshotInfo]] =
       reader.get[CurrencySnapshotInfo](GlobalStateKey.metagraph(metagraphAddress, GlobalStateFieldId.LastCurrencySnapshotInfo))
+
+    /** Hash of the most-recently-accepted state-channel binary for a metagraph — the "binary chain" tip used by
+      * `Signed[StateChannelSnapshotBinary].lastSnapshotHash` for parent-chain validation. A new incoming binary's `parentHash` MUST equal
+      * this value when its parent is the metagraph's current tip (v1: no metagraph reorgs).
+      */
+    def getLastStateChannelSnapshotHash(metagraphAddress: Address): F[Option[Hash]] =
+      reader.get[Hash](GlobalStateKey.metagraph(metagraphAddress, GlobalStateFieldId.LastStateChannelSnapshotHashes))
+
+    /** The signed incremental snapshot at the metagraph's current tip — `.value.ordinal` gives the metagraph parent's ordinal that the
+      * committee gate's KES period and eta derivation need. None when the metagraph is at its genesis (legacy `LastCurrencySnapshots`
+      * partition) or the partition is unwritten (pre-bootstrap).
+      */
+    def getLastIncrementalCurrencySnapshot(metagraphAddress: Address): F[Option[Signed[CurrencyIncrementalSnapshot]]] =
+      reader.get[Signed[CurrencyIncrementalSnapshot]](
+        GlobalStateKey.metagraph(metagraphAddress, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
+      )
   }
 }

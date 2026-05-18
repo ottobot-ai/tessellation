@@ -160,7 +160,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         gateTimeoutMs = 500L,
         pollIntervalMs = 25L,
         kesPeriodFor = _ => 0,
-        parentOrdinalFor = _ => IO.pure(Some(0L))
+        parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       admitted <- gate.attestAndAdmit(mg, parent, binary, eta, sigmaOperatorKey = Ratio(1, 1))
       published <- publishedRef.get
@@ -205,7 +205,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         gateTimeoutMs = 200L,
         pollIntervalMs = 25L,
         kesPeriodFor = _ => 0,
-        parentOrdinalFor = _ => IO.pure(Some(0L))
+        parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       // σ = 0 → not in committee
       admitted <- gate.attestAndAdmit(mg, parent, binary, eta, sigmaOperatorKey = Ratio.Zero)
@@ -253,7 +253,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         gateTimeoutMs = 2000L,
         pollIntervalMs = 25L,
         kesPeriodFor = _ => 0,
-        parentOrdinalFor = _ => IO.pure(Some(0L))
+        parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       // Schedule the 4th attestation to arrive after a small delay — gate must wait then admit.
       _ <- (IO.sleep(100.millis) >> agg.record(mg, parent, binary, PeerId(Hex("dd" * 64)))).start
@@ -296,7 +296,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         gateTimeoutMs = 250L,
         pollIntervalMs = 25L,
         kesPeriodFor = _ => 0,
-        parentOrdinalFor = _ => IO.pure(Some(0L))
+        parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       // σ=0 so sender skips; no other arrivals → timeout
       admitted <- gate.attestAndAdmit(mg, parent, binary, eta, sigmaOperatorKey = Ratio.Zero)
@@ -340,7 +340,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         gateTimeoutMs = 200L,
         pollIntervalMs = 25L,
         kesPeriodFor = _ => 0,
-        parentOrdinalFor = _ => IO.pure(Some(0L))
+        parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       // Build a fake-but-structurally-valid incoming attestation. The long-term Ed25519 sig
       // needs to verify against the sender's pubkey, so we sign the canonical message bytes
@@ -362,6 +362,69 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
     } yield
       // Verifier rejected → aggregator untouched
       expect(count == 0)
+  }
+
+  // ===== (f) #201/#202 parent-ordinal resolve returns None → fail-closed =====
+
+  test("(f) parent-ordinal resolve returns None — sender does not publish, receiver drops") { res =>
+    implicit val (h, sp, _) = res
+    val mg = mkAddress("mg-f")
+    val parent = mkParent("p-f")
+    val binary = mkBinaryHash("bin-f")
+    val eta = Array.fill[Byte](32)(0x07.toByte)
+    val kTarget = 1 // sender path: K · σ = 1 puts us in committee — but resolver returns None
+    for {
+      selfKp <- KeyPairGenerator.makeKeyPair[IO]
+      senderKp <- KeyPairGenerator.makeKeyPair[IO]
+      selfId = PeerId.fromPublic(selfKp.getPublic)
+      senderId = PeerId.fromPublic(senderKp.getPublic)
+      vrfSk = Array.fill[Byte](32)(0xa1.toByte)
+      (sortition, agg) <- buildSortition
+      (publisher, publishedRef) <- stubPublisher
+      gate = MetagraphCommitteeGate.make[IO](
+        selfPeerId = selfId,
+        selfVrfSk = vrfSk,
+        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
+        keyPair = selfKp,
+        sortition = sortition,
+        aggregator = agg,
+        kesSigner = stubKesSigner,
+        kesVerifier = stubKesVerifier(_ => true),
+        publisher = publisher,
+        kTarget = kTarget,
+        gateTimeoutMs = 200L,
+        pollIntervalMs = 25L,
+        kesPeriodFor = _ => 0,
+        parentOrdinalFor = (_, _) => IO.pure(Option.empty[Long]) // <-- fail-closed
+      )
+      // Sender path — even though σ=1 makes us in-committee, the unresolved parent ordinal makes
+      // us skip the publish + skip the self-record. The aggregator stays empty → admit times out.
+      admitted <- gate.attestAndAdmit(mg, parent, binary, eta, sigmaOperatorKey = Ratio(1, 1))
+      published <- publishedRef.get
+      countAfterSender <- agg.countFor(mg, parent, binary)
+
+      // Receiver path — build a structurally valid attestation; the resolver returns None so the
+      // gate fires `UnknownParentOrdinal` and never reaches the KES / VRF verifies. No record.
+      msgBytes <- MetagraphCommitteeGate.messageBytes[IO](senderId, mg, parent, binary)
+      edSig <- io.constellationnetwork.security.signature.Signing.signData[IO](msgBytes)(senderKp.getPrivate)
+      incoming = IncomingAttestation(
+        senderPeerId = senderId,
+        senderVrfVk = Array.fill[Byte](32)(0xaa.toByte),
+        metagraphAddress = mg,
+        parentHash = parent,
+        binaryHash = binary,
+        committeeVrfProof = Array.fill[Byte](64)(0xbb.toByte),
+        longTermSignature = edSig,
+        kesSignature = Array.fill[Byte](8)(0xcc.toByte)
+      )
+      _ <- gate.recordReceivedAttestation(incoming, eta, _ => IO.pure(Ratio(1, 1)))
+      countAfterReceiver <- agg.countFor(mg, parent, binary)
+    } yield
+      // Fail-closed on both sides: no publish, no record.
+      expect(!admitted)
+        .and(expect(published.isEmpty))
+        .and(expect(countAfterSender == 0))
+        .and(expect(countAfterReceiver == 0))
   }
 
   // ===== happy-path receiver record (sanity) =====
@@ -403,7 +466,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         gateTimeoutMs = 200L,
         pollIntervalMs = 25L,
         kesPeriodFor = _ => 0,
-        parentOrdinalFor = _ => IO.pure(Some(0L))
+        parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       incoming = IncomingAttestation(
         senderPeerId = senderId,
@@ -447,7 +510,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         gateTimeoutMs = 100L,
         pollIntervalMs = 25L,
         kesPeriodFor = _ => 0,
-        parentOrdinalFor = _ => IO.pure(Some(0L))
+        parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       before <- agg.countFor(mg, parent, binary)
       _ <- gate.pruneParents(mg, Set(parent))
