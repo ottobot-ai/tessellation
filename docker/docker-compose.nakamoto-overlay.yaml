@@ -48,6 +48,8 @@ services:
       # on the matching CONTAINER_NAME_SUFFIX so the gRPC call stays local-network.
       - SIDECAR_HOST=sidecar${CONTAINER_NAME_SUFFIX:-}
       - SIDECAR_GRPC_PORT=50051
-    depends_on:
-      sidecar:
-        condition: service_healthy
+    # NOTE: no `depends_on: sidecar` here — the `sidecar` service is in profile
+    # `l0` (started by the gl0 launch), and adding a depends_on under the `l1`
+    # profile would make compose error with "undefined service sidecar". The
+    # compose-runner orchestrates startup order: gl0 (which brings sidecar)
+    # finishes booting before gl1 launches.
