@@ -77,13 +77,27 @@ object Download {
     type DownloadResult = (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)
     type ObservationLimit = SnapshotOrdinal
 
-    // Currency L0 recovery delegates to the full download path for now.
-    // The download walker is already incremental (fetches only the gap),
-    // so the main cost is cache clearing + observe phase — acceptable
-    // until a dedicated recovery path is warranted.
-    def recoveryDownload(implicit hasherSelector: HasherSelector[F]): F[Unit] = download
+    // Currency L0 recovery uses the same fetch-and-observe path as the initial download,
+    // but switches the head-installation step to setHeadForRecovery instead of prepend.
+    //
+    // Rationale: a prior failed-and-recovered InitializeFromDownload may have already
+    // prepended a partial-observation snapshot (e.g. ordinal=2 from a chain that needed
+    // this node for quorum) into snapshotStorage. The fresh recovery cycle will observe
+    // a later tip (e.g. ordinal=14). prepend's `isNextSnapshot` check would reject the
+    // non-sequential jump 2 → 14 and raise; the daemon's retry would then abort because
+    // the FSM is no longer in WaitingForDownload. setHeadForRecovery bypasses the
+    // sequential-link requirement (mirrors dag-l0's lastNGlobalSnapshotStorage.setForRecovery
+    // in its recoveryDownload path) so the second download cycle can complete and the
+    // node can finally reach Ready. The setHead approach is safe here because the snapshot
+    // was content-validated during observe() (createContext succeeded for every fetched
+    // ordinal).
+    def recoveryDownload(implicit hasherSelector: HasherSelector[F]): F[Unit] =
+      downloadInternal(useRecoveryHead = true)
 
-    def download(implicit hasherSelector: HasherSelector[F]): F[Unit] = {
+    def download(implicit hasherSelector: HasherSelector[F]): F[Unit] =
+      downloadInternal(useRecoveryHead = false)
+
+    private def downloadInternal(useRecoveryHead: Boolean)(implicit hasherSelector: HasherSelector[F]): F[Unit] = {
       implicit val hasher = hasherSelector.getCurrent
 
       nodeStorage
@@ -92,17 +106,24 @@ object Download {
         .flatMap { result =>
           val ((snapshot, context), observationLimit) = result
 
+          val installHead: F[Unit] =
+            if (useRecoveryHead)
+              logger.info(s"[Download] Recovery head install (setHeadForRecovery) at ordinal ${snapshot.ordinal.show}") >>
+                snapshotStorage.setHeadForRecovery(snapshot, context)
+            else
+              snapshotStorage.prepend(snapshot, context).flatMap { prepended =>
+                if (!prepended)
+                  (new Exception(s"Failed to prepend currency snapshot ordinal=${snapshot.ordinal} to storage")).raiseError[F, Unit]
+                else
+                  Applicative[F].unit
+              }
+
           logger.info(s"[Download] Cleanup for snapshots greater than ${snapshot.ordinal}") >>
             currencySnapshotCleanupStorage.cleanupAbove(snapshot.ordinal) >>
             combinedSnapshotCheckpointFileSystemStorage.deleteAbove(snapshot.ordinal) >>
             eventMempool.clear >>
             logger.info("[Download] Cleared event mempool for recovery") >>
-            snapshotStorage.prepend(snapshot, context).flatMap { prepended =>
-              if (!prepended)
-                (new Exception(s"Failed to prepend currency snapshot ordinal=${snapshot.ordinal} to storage")).raiseError[F, Unit]
-              else
-                Applicative[F].unit
-            } >>
+            installHead >>
             fetchAndSetCalculatedState(snapshot) >>
             identifierStorage.get.flatMap { currencyAddress =>
               consensus.manager
