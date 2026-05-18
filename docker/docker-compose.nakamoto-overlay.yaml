@@ -33,6 +33,11 @@ services:
       # cases flake — the WithdrawalTimeLimit window closes before the L1 syncs the
       # new lock. If we want faster slots we'd need to scale slots-per-epoch too.
       - NAKAMOTO_SLOT_DURATION_MS=${NAKAMOTO_SLOT_DURATION_MS:-1000}
+      # Committee-sortition target size. Unset → gate is degenerate (K=N, all
+      # validators in committee, sortition is a no-op). Set to a value < N for
+      # genuine sortition: each metagraph binary requires ceil(2K/3) attestations
+      # from the K-sized committee. Plumbed by `--shards=N` in set-env.sh.
+      - NAKAMOTO_COMMITTEE_K_TARGET=${NAKAMOTO_COMMITTEE_K_TARGET:-}
       # Local sidecar gRPC endpoint — sidecar service runs on the same docker
       # network with the matching CONTAINER_NAME_SUFFIX.
       - SIDECAR_HOST=sidecar${CONTAINER_NAME_SUFFIX:-}

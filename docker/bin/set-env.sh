@@ -257,6 +257,16 @@ for arg in "$@"; do
       # NAKAMOTO_STAKE_DISTRIBUTION after all args parse (needs NUM_GL0_NODES).
       export STAKE_DIST_SPEC="${arg#*=}"
       ;;
+    --shards=*)
+      # Committee-sortition target size K. Exports NAKAMOTO_COMMITTEE_K_TARGET,
+      # which docker-compose.nakamoto-overlay.yaml forwards to gl0 containers.
+      # Validated after NUM_GL0_NODES is known (must be 1 ≤ K ≤ N).
+      export NAKAMOTO_COMMITTEE_K_TARGET="${arg#*=}"
+      if ! [[ "$NAKAMOTO_COMMITTEE_K_TARGET" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: --shards must be a positive integer (got: $NAKAMOTO_COMMITTEE_K_TARGET)"
+        exit 1
+      fi
+      ;;
     *)
       echo "Unknown argument: $arg"
       exit 1
@@ -477,6 +487,17 @@ if [ -z "$METAGRAPH" ]; then
     export NUM_ML0_NODES="0"
     export NUM_CL1_NODES="0"
     export NUM_DL1_NODES="0"
+fi
+
+# --shards=K validation now that NUM_GL0_NODES is known. K=N is the degenerate
+# committee (sortition no-op). K<N gives genuine per-metagraph sortition; the
+# gate requires ceil(2K/3) attestations from a K-sized committee.
+if [ -n "${NAKAMOTO_COMMITTEE_K_TARGET:-}" ]; then
+    if [ "$NAKAMOTO_COMMITTEE_K_TARGET" -gt "$NUM_GL0_NODES" ]; then
+        echo "Error: --shards=$NAKAMOTO_COMMITTEE_K_TARGET exceeds --num-gl0=$NUM_GL0_NODES"
+        exit 1
+    fi
+    echo "[set-env] --shards=$NAKAMOTO_COMMITTEE_K_TARGET → NAKAMOTO_COMMITTEE_K_TARGET=$NAKAMOTO_COMMITTEE_K_TARGET (gate is real sortition since K<N=$NUM_GL0_NODES is $([ "$NAKAMOTO_COMMITTEE_K_TARGET" -lt "$NUM_GL0_NODES" ] && echo true || echo "false — gate is degenerate K=N"))"
 fi
 
 # Remote host: default to 1 gl0 node, 1 gl1 node, 0 metagraph nodes for health check

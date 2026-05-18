@@ -117,14 +117,19 @@ const postNodeParamsNodeId = async (
 }
 
 const createDelegatedStake = async (account, lockHash, lockAmount, nodeId) => {
-  // Retry on InvalidTokenLock: GL0's delegated-stake validator reads from the
-  // local MPT (`mptStore.getActiveTokenLocks`). Under Nakamoto, an accepted
-  // token lock can transiently disappear from the serving node's MPT during
-  // a chain reorg — the MPT rewinds and reapplies, so there's a short window
-  // where the lock isn't in `activeTokenLocks`. At 3 nodes reorgs are rare,
-  // so 90s (30 × 3s) was plenty. At 8 nodes reorg churn is higher, so we
-  // extend the window to 6 min to weather multiple reorg cycles. This is
-  // still cheap when the cluster is healthy (first retry usually succeeds).
+  // Retry on InvalidTokenLock and InvalidParent: GL0's delegated-stake
+  // validator reads from the local MPT directly (`mptStore.getActiveTokenLocks`,
+  // `mptStore.getDelegatedStakes`) while the HTTP routes that advertise
+  // tokenLockRef / lastReference back to the client read through the
+  // overlay-aware `pendingReader`. The two views disagree during the window
+  // between a write landing in the overlay's pending branch and that branch
+  // being folded into the underlying base MPT (typically a few hundred ms,
+  // longer during reorgs or finality stalls). The route hands the client a
+  // parent reference the validator hasn't seen yet → InvalidParent. Retry
+  // semantics mirror the InvalidTokenLock case below: 120 × 3s = 6 min.
+  // The architecturally correct fix is to migrate the validator to read
+  // through the same `GlobalStateReader` the routes use (#198 in the task
+  // list); this retry is the JS-side workaround until that lands.
   const maxAttempts = 120
   const intervalMs = 3000
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -139,7 +144,7 @@ const createDelegatedStake = async (account, lockHash, lockAmount, nodeId) => {
       return hash
     } catch (error) {
       const msg = error?.message || String(error)
-      if (msg.includes('InvalidTokenLock') && attempt < maxAttempts) {
+      if ((msg.includes('InvalidTokenLock') || msg.includes('InvalidParent')) && attempt < maxAttempts) {
         await new Promise(r => setTimeout(r, intervalMs))
         continue
       }
