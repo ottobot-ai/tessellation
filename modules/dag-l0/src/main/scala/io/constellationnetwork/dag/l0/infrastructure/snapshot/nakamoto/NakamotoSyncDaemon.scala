@@ -296,121 +296,41 @@ object NakamotoSyncDaemon {
     // When a snapshot is stored in the chain store, we check this buffer and validate any
     // snapshots that were waiting for it. This creates a validation cascade from genesis.
     fs2.Stream.eval(Ref.of[F, Map[Hash, List[pb.Snapshot]]](Map.empty)).flatMap { pendingParentRef =>
-      fs2.Stream.eval(Ref.of[F, SyncState](SyncState.initial)).flatMap { stateRef =>
-        // ChainSyncManager for active parent fetching. Uses a Ref to break the
-        // circular dependency: handleSnapshot needs chainSyncManager, but
-        // chainSyncManager's callback needs handleSnapshot.
-        fs2.Stream
-          .eval(
-            Ref.of[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]](None).flatMap { csRef =>
-              ChainSyncManager
-                .make[F](
-                  channel,
-                  { resp: io.constellationnetwork.node.shared.domain.nakamoto.chainsync.ChainSyncStateResponse[pb.Snapshot] =>
-                    // #56.8: ADT pattern-match on the chain-sync disposition. Today's `handleSnapshot`
-                    // pipeline doesn't yet differentiate finalized vs provisional — both are validated
-                    // and stored identically. The structural distinction lands here so #56.10's
-                    // overlay-aware accept() can route Provisional fetches to overlay-local commits
-                    // (matching codex's NakamotoSyncDaemon catch in plan rev4 phase E) and Finalized
-                    // fetches straight to base. NotFound logs and unwinds the inflight tracker.
-                    import io.constellationnetwork.node.shared.domain.nakamoto.chainsync.ChainSyncStateResponse
-                    val fetchedSnap: Option[pb.Snapshot] = resp match {
-                      case ChainSyncStateResponse.Finalized(snap)      => Some(snap)
-                      case ChainSyncStateResponse.Provisional(snap, _) => Some(snap)
-                      case ChainSyncStateResponse.NotFound(_)          => None
-                    }
-                    fetchedSnap match {
-                      case Some(snap) =>
-                        csRef.get.flatMap {
-                          case Some(csm) =>
-                            snapshotSemaphore.permit.use { _ =>
-                              handleSnapshot(
-                                snap,
-                                stateRef,
-                                pendingParentRef,
-                                chainStore,
-                                nodeStorage,
-                                tipTracker,
-                                stakeRegistry,
-                                sidecarClient,
-                                selfId,
-                                keyPair,
-                                lddConfig,
-                                eligibilityChecker,
-                                lastKnownSlotRef,
-                                epochStateRef,
-                                etaRotationSnapshots,
-                                consensusFns,
-                                snapshotStorage,
-                                lastGlobalSnapshotStorage,
-                                lastNGlobalSnapshotStorage,
-                                productionGate,
-                                mptStore,
-                                mptOverlay,
-                                eventMempool,
-                                csm,
-                                channel,
-                                dataDir,
-                                operationalKeyMaker,
-                                kesRegistry,
-                                logger
-                              )
-                            }
-                          case None => Async[F].unit
+      // Parallel buffer for metagraph state-channel binaries whose `lastSnapshotHash` (parent) the gl0 GSI hasn't recorded yet (#213).
+      // At 4-mg+committee-gate scale, ml0 outpaces gl0 — by the time gl0 finalizes a metagraph's genesis binary, ml0 has produced
+      // several more incremental binaries chained off the first. Without buffering, the first incremental never matches gl0's stored
+      // tip → all subsequent binaries cascade-reject → metagraph chain permanently stuck from gl0's view. Buffer + drain-on-accept
+      // unwinds the gap.
+      fs2.Stream
+        .eval(io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer.make[F](logger))
+        .flatMap { orphanBuffer =>
+          fs2.Stream.eval(Ref.of[F, SyncState](SyncState.initial)).flatMap { stateRef =>
+            // ChainSyncManager for active parent fetching. Uses a Ref to break the
+            // circular dependency: handleSnapshot needs chainSyncManager, but
+            // chainSyncManager's callback needs handleSnapshot.
+            fs2.Stream
+              .eval(
+                Ref.of[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]](None).flatMap { csRef =>
+                  ChainSyncManager
+                    .make[F](
+                      channel,
+                      { resp: io.constellationnetwork.node.shared.domain.nakamoto.chainsync.ChainSyncStateResponse[pb.Snapshot] =>
+                        // #56.8: ADT pattern-match on the chain-sync disposition. Today's `handleSnapshot`
+                        // pipeline doesn't yet differentiate finalized vs provisional — both are validated
+                        // and stored identically. The structural distinction lands here so #56.10's
+                        // overlay-aware accept() can route Provisional fetches to overlay-local commits
+                        // (matching codex's NakamotoSyncDaemon catch in plan rev4 phase E) and Finalized
+                        // fetches straight to base. NotFound logs and unwinds the inflight tracker.
+                        import io.constellationnetwork.node.shared.domain.nakamoto.chainsync.ChainSyncStateResponse
+                        val fetchedSnap: Option[pb.Snapshot] = resp match {
+                          case ChainSyncStateResponse.Finalized(snap)      => Some(snap)
+                          case ChainSyncStateResponse.Provisional(snap, _) => Some(snap)
+                          case ChainSyncStateResponse.NotFound(_)          => None
                         }
-                      case None =>
-                        // NotFound — peer doesn't have the requested hash. Inflight tracking is
-                        // unwound by ChainSyncManager's `guaranteeCase`; nothing further to do here.
-                        Async[F].unit
-                    }
-                  }
-                )
-                .flatMap(csm => csRef.set(Some(csm)) >> sharedChainSyncManagerRef.set(Some(csm)).as(csm))
-            }
-          )
-          .flatMap { chainSyncManager =>
-            // Gossip stream with two-layer reconnection:
-            //
-            // Layer 1 (sidecar-triggered): When the sidecar's mesh health monitor
-            //   recovers from degradation, it closes the gRPC Subscribe stream.
-            //   handleErrorWith catches the error and re-subscribes.
-            //
-            // Layer 2 (idle watchdog): If the gRPC connection dies silently (e.g.,
-            //   Docker network disconnect — gRPC Java doesn't propagate channel
-            //   failures to blocking server-stream reads), the stream hangs forever.
-            //   A concurrent watchdog checks the last-received timestamp every 30s
-            //   and raises an error after 120s of idle. In normal operation (messages
-            //   every ~10s), the watchdog never fires.
-            //
-            // Shared state (pendingParentRef, stateRef, chainSyncManager) survives.
-            def gossipStream: fs2.Stream[F, Unit] =
-              fs2.Stream
-                .eval(Ref.of[F, Long](System.currentTimeMillis()))
-                .flatMap { lastMsgRef =>
-                  val watchdog = fs2.Stream.fixedRate[F](30.seconds).evalMap { _ =>
-                    Async[F].delay(System.currentTimeMillis()).flatMap { now =>
-                      lastMsgRef.get.flatMap { lastMsg =>
-                        val idleMs = now - lastMsg
-                        if (idleMs > 120000L)
-                          logger.warn(s"Gossip stream idle for ${idleMs / 1000}s, forcing reconnect") >>
-                            Async[F].raiseError[Unit](new RuntimeException(s"Gossip idle timeout (${idleMs / 1000}s)"))
-                        else
-                          Async[F].unit
-                      }
-                    }
-                  }
-
-                  val gossip = GossipStream
-                    .subscribe[F](channel)
-                    .evalMap { msg =>
-                      lastMsgRef.set(System.currentTimeMillis()) >>
-                        (msg.body match {
-                          case pb.GossipMessage.Body.Snapshot(snap) =>
-                            val incomingOrdinal = snap.ordinal
-                            chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
-                              val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
-                              (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
-                               else Async[F].unit) >>
+                        fetchedSnap match {
+                          case Some(snap) =>
+                            csRef.get.flatMap {
+                              case Some(csm) =>
                                 snapshotSemaphore.permit.use { _ =>
                                   handleSnapshot(
                                     snap,
@@ -436,95 +356,185 @@ object NakamotoSyncDaemon {
                                     mptStore,
                                     mptOverlay,
                                     eventMempool,
-                                    chainSyncManager,
+                                    csm,
                                     channel,
                                     dataDir,
                                     operationalKeyMaker,
                                     kesRegistry,
                                     logger
                                   )
-                                } >>
-                                productionGate.resume(ProductionGate.BetterGossipReceived)
+                                }
+                              case None => Async[F].unit
                             }
-
-                          case pb.GossipMessage.Body.Attestation(att) =>
-                            handleAttestation(att, tipTracker, kesRegistry, etaRotationSnapshots, logger)
-
-                          case pb.GossipMessage.Body.MetagraphBinary(mb) =>
-                            // Background-fire: the gate's `attestAndAdmit` blocks up to gateTimeoutMs
-                            // (30s default) waiting for ⌈2K/3⌉ committee attestations. Running it on
-                            // the gossip stream's `evalMap` thread serializes EVERY message behind
-                            // every pending gate — gl0 TipAttestations from peers then arrive past
-                            // `TipTracker.MaxAttestationSkewMs` and get rejected (skew=200+s observed
-                            // in iter-s3prep-baseline). Gate work is naturally concurrent-safe: the
-                            // aggregator is a `Ref[F, ...]`, `processMetagraphBinary` writes to a
-                            // queue, and per-binary state is keyed by (mgAddr, parentHash, binaryHash).
-                            Async[F]
-                              .start(
-                                handleMetagraphBinary(
-                                  mb,
-                                  processMetagraphBinary,
-                                  committeeGate,
-                                  parentOrdinalFor,
-                                  etaForParentOrdinal,
-                                  stakeRegistry.optimisticRelativeStake(selfId),
-                                  logger
-                                )
-                              )
-                              .void
-
-                          case pb.GossipMessage.Body.MetagraphAttestation(att) =>
-                            // Background-fire: VRF verify + KES verify + Ed25519 verify add up to
-                            // tens of ms per attestation. In bursts (each peer attests each binary),
-                            // this would queue up behind the stream's serial evalMap. Aggregator
-                            // record is concurrent-safe.
-                            Async[F]
-                              .start(
-                                handleMetagraphAttestation(
-                                  att,
-                                  committeeGate,
-                                  parentOrdinalFor,
-                                  etaForParentOrdinal,
-                                  senderStakeLookup,
-                                  logger
-                                )
-                              )
-                              .void
-
-                          case pb.GossipMessage.Body.AllowSpendBlock(asb) =>
-                            handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)
-
-                          case pb.GossipMessage.Body.DagBlock(blk) =>
-                            handleDAGBlock(blk, enqueueDAGBlock, logger)
-
-                          case pb.GossipMessage.Body.TokenLockBlock(blk) =>
-                            handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)
-
-                          case _: pb.GossipMessage.Body.Rumor =>
+                          case None =>
+                            // NotFound — peer doesn't have the requested hash. Inflight tracking is
+                            // unwound by ChainSyncManager's `guaranteeCase`; nothing further to do here.
                             Async[F].unit
-
-                          case pb.GossipMessage.Body.Empty =>
-                            Async[F].unit
-                        })
-                    }
-
-                  gossip.concurrently(watchdog)
+                        }
+                      }
+                    )
+                    .flatMap(csm => csRef.set(Some(csm)) >> sharedChainSyncManagerRef.set(Some(csm)).as(csm))
                 }
-                .handleErrorWith { e =>
-                  fs2.Stream.eval(
-                    logger.warn(s"Gossip stream error: ${e.getMessage}. Reconnecting in 5s...")
-                  ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
-                } ++ fs2.Stream.eval(
-                // Normal termination: gRPC StreamObserver.onError puts None in the
-                // queue, causing fromQueueNoneTerminated to end the stream normally
-                // (not as an error). This happens when the sidecar connection dies
-                // during a partition. Restart after a short delay.
-                logger.warn("Gossip stream terminated (sidecar connection lost). Reconnecting in 5s...")
-              ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
+              )
+              .flatMap { chainSyncManager =>
+                // Gossip stream with two-layer reconnection:
+                //
+                // Layer 1 (sidecar-triggered): When the sidecar's mesh health monitor
+                //   recovers from degradation, it closes the gRPC Subscribe stream.
+                //   handleErrorWith catches the error and re-subscribes.
+                //
+                // Layer 2 (idle watchdog): If the gRPC connection dies silently (e.g.,
+                //   Docker network disconnect — gRPC Java doesn't propagate channel
+                //   failures to blocking server-stream reads), the stream hangs forever.
+                //   A concurrent watchdog checks the last-received timestamp every 30s
+                //   and raises an error after 120s of idle. In normal operation (messages
+                //   every ~10s), the watchdog never fires.
+                //
+                // Shared state (pendingParentRef, stateRef, chainSyncManager) survives.
+                def gossipStream: fs2.Stream[F, Unit] =
+                  fs2.Stream
+                    .eval(Ref.of[F, Long](System.currentTimeMillis()))
+                    .flatMap { lastMsgRef =>
+                      val watchdog = fs2.Stream.fixedRate[F](30.seconds).evalMap { _ =>
+                        Async[F].delay(System.currentTimeMillis()).flatMap { now =>
+                          lastMsgRef.get.flatMap { lastMsg =>
+                            val idleMs = now - lastMsg
+                            if (idleMs > 120000L)
+                              logger.warn(s"Gossip stream idle for ${idleMs / 1000}s, forcing reconnect") >>
+                                Async[F].raiseError[Unit](new RuntimeException(s"Gossip idle timeout (${idleMs / 1000}s)"))
+                            else
+                              Async[F].unit
+                          }
+                        }
+                      }
 
-            gossipStream
+                      val gossip = GossipStream
+                        .subscribe[F](channel)
+                        .evalMap { msg =>
+                          lastMsgRef.set(System.currentTimeMillis()) >>
+                            (msg.body match {
+                              case pb.GossipMessage.Body.Snapshot(snap) =>
+                                val incomingOrdinal = snap.ordinal
+                                chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
+                                  val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
+                                  (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
+                                   else Async[F].unit) >>
+                                    snapshotSemaphore.permit.use { _ =>
+                                      handleSnapshot(
+                                        snap,
+                                        stateRef,
+                                        pendingParentRef,
+                                        chainStore,
+                                        nodeStorage,
+                                        tipTracker,
+                                        stakeRegistry,
+                                        sidecarClient,
+                                        selfId,
+                                        keyPair,
+                                        lddConfig,
+                                        eligibilityChecker,
+                                        lastKnownSlotRef,
+                                        epochStateRef,
+                                        etaRotationSnapshots,
+                                        consensusFns,
+                                        snapshotStorage,
+                                        lastGlobalSnapshotStorage,
+                                        lastNGlobalSnapshotStorage,
+                                        productionGate,
+                                        mptStore,
+                                        mptOverlay,
+                                        eventMempool,
+                                        chainSyncManager,
+                                        channel,
+                                        dataDir,
+                                        operationalKeyMaker,
+                                        kesRegistry,
+                                        logger
+                                      )
+                                    } >>
+                                    productionGate.resume(ProductionGate.BetterGossipReceived)
+                                }
+
+                              case pb.GossipMessage.Body.Attestation(att) =>
+                                handleAttestation(att, tipTracker, kesRegistry, etaRotationSnapshots, logger)
+
+                              case pb.GossipMessage.Body.MetagraphBinary(mb) =>
+                                // Background-fire: the gate's `attestAndAdmit` blocks up to gateTimeoutMs
+                                // (30s default) waiting for ⌈2K/3⌉ committee attestations. Running it on
+                                // the gossip stream's `evalMap` thread serializes EVERY message behind
+                                // every pending gate — gl0 TipAttestations from peers then arrive past
+                                // `TipTracker.MaxAttestationSkewMs` and get rejected (skew=200+s observed
+                                // in iter-s3prep-baseline). Gate work is naturally concurrent-safe: the
+                                // aggregator is a `Ref[F, ...]`, `processMetagraphBinary` writes to a
+                                // queue, and per-binary state is keyed by (mgAddr, parentHash, binaryHash).
+                                Async[F]
+                                  .start(
+                                    handleMetagraphBinary(
+                                      mb,
+                                      processMetagraphBinary,
+                                      committeeGate,
+                                      parentOrdinalFor,
+                                      etaForParentOrdinal,
+                                      stakeRegistry.optimisticRelativeStake(selfId),
+                                      orphanBuffer,
+                                      logger
+                                    )
+                                  )
+                                  .void
+
+                              case pb.GossipMessage.Body.MetagraphAttestation(att) =>
+                                // Background-fire: VRF verify + KES verify + Ed25519 verify add up to
+                                // tens of ms per attestation. In bursts (each peer attests each binary),
+                                // this would queue up behind the stream's serial evalMap. Aggregator
+                                // record is concurrent-safe.
+                                Async[F]
+                                  .start(
+                                    handleMetagraphAttestation(
+                                      att,
+                                      committeeGate,
+                                      parentOrdinalFor,
+                                      etaForParentOrdinal,
+                                      senderStakeLookup,
+                                      logger
+                                    )
+                                  )
+                                  .void
+
+                              case pb.GossipMessage.Body.AllowSpendBlock(asb) =>
+                                handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)
+
+                              case pb.GossipMessage.Body.DagBlock(blk) =>
+                                handleDAGBlock(blk, enqueueDAGBlock, logger)
+
+                              case pb.GossipMessage.Body.TokenLockBlock(blk) =>
+                                handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)
+
+                              case _: pb.GossipMessage.Body.Rumor =>
+                                Async[F].unit
+
+                              case pb.GossipMessage.Body.Empty =>
+                                Async[F].unit
+                            })
+                        }
+
+                      gossip.concurrently(watchdog)
+                    }
+                    .handleErrorWith { e =>
+                      fs2.Stream.eval(
+                        logger.warn(s"Gossip stream error: ${e.getMessage}. Reconnecting in 5s...")
+                      ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
+                    } ++ fs2.Stream.eval(
+                    // Normal termination: gRPC StreamObserver.onError puts None in the
+                    // queue, causing fromQueueNoneTerminated to end the stream normally
+                    // (not as an error). This happens when the sidecar connection dies
+                    // during a partition. Restart after a short delay.
+                    logger.warn("Gossip stream terminated (sidecar connection lost). Reconnecting in 5s...")
+                  ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
+
+                gossipStream
+              }
           }
-      }
+        }
     }
   }
 
@@ -1546,6 +1556,7 @@ object NakamotoSyncDaemon {
     ) => F[Option[Long]],
     etaForParentOrdinal: Long => F[Array[Byte]],
     selfStake: F[io.constellationnetwork.numerics.Ratio],
+    orphanBuffer: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
@@ -1553,55 +1564,93 @@ object NakamotoSyncDaemon {
     import io.constellationnetwork.security.signature.Signed
     import eu.timepit.refined.refineV
 
+    // Resolver wrapper that bridges gl0's GSI lag. After we admit a binary X via the committee gate,
+    // X is enqueued for processing but won't land in gl0's `lastStateChannelSnapshotHashes` until the
+    // next global snapshot finalizes (~7s later). Without a shortcut, any drained child of X would
+    // hit `parentOrdinalFor` → None and immediately re-buffer, never making progress.
+    // The orphan buffer's admission cache holds `(mg, X.value.hash) → mgOrd_X` for that GSI-lag window.
+    def resolveParent(address: Address, parentHash: Hash): F[Option[Long]] =
+      orphanBuffer.lookupAdmittedOrd(address, parentHash).flatMap {
+        case s @ Some(_) => Async[F].pure(s)
+        case None        => parentOrdinalFor(address, parentHash)
+      }
+
+    // Local recursive helper. After a binary is admitted, drain any orphans whose parent equals
+    // the just-accepted binary's *value*-hash (`signed.value.hash`) — same hash gl0's GSAM writes
+    // into `lastStateChannelSnapshotHashes`. Each drained child runs through the same path, which
+    // may itself unblock further descendants, so the chain unwinds in order. #213.
+    def processBytes(address: Address, bytes: Array[Byte]): F[Unit] =
+      io.constellationnetwork.json
+        .JsonSerializer[F]
+        .deserialize[Signed[StateChannelSnapshotBinary]](bytes)
+        .flatMap {
+          case Left(err) =>
+            logger.warn(s"⚠️ Rejecting metagraph-binary gossip: decode failed for $address (${err.getMessage})")
+          case Right(signed) =>
+            val output = StateChannelOutput(address, signed)
+            val parentHash = signed.value.lastSnapshotHash
+            // Hash the wire bytes to produce the binary hash — uses the same `Hasher[F]` surface that
+            // the gate's verifier uses to match `binaryHash` across observers. The bytes here are the
+            // serialized Signed[StateChannelSnapshotBinary]; both sender and receiver hash the same
+            // wire payload so the binary-hash agrees byte-for-byte.
+            HasherSelector[F].withCurrent { implicit hasher =>
+              Hasher[F].hashBytes(bytes).flatMap { binaryHash =>
+                // Gate inputs: σ_self for our committee threshold + eta derived from the actual
+                // metagraph parent ordinal (#202). The selfStake lookup is the same StakeRegistry
+                // path the leader VRF uses.
+                //
+                // Resolver returns None when gl0's GSI doesn't yet have a metagraph snapshot under
+                // this parent hash AND the admission cache doesn't either. At 4-mg+committee-gate
+                // scale this is the normal state for any binary chained off something we haven't
+                // admitted yet: ml0 races ahead of gl0's gate cadence and chains forward off
+                // binaries gl0 hasn't seen yet. Buffer in the orphan pool keyed by parentHash;
+                // when the matching binary IS admitted, drainChildren replays them in chronological
+                // order. #213.
+                resolveParent(address, parentHash).flatMap {
+                  case None =>
+                    orphanBuffer.record(address, parentHash, bytes).flatMap { sz =>
+                      logger.info(
+                        s"📦 Orphan-buffered mg=$address parent=${parentHash.value.take(12)}... (parent not yet admitted) bufferSize=$sz"
+                      )
+                    }
+                  case Some(parentOrdinal) =>
+                    for {
+                      eta <- etaForParentOrdinal(parentOrdinal)
+                      sigma <- selfStake
+                      admitted <- committeeGate.attestAndAdmit(address, parentHash, binaryHash, eta, sigma)
+                      _ <-
+                        if (admitted) {
+                          // Compute the just-accepted binary's *value* hash. This is the chain-link
+                          // identity that the next binary's `lastSnapshotHash` will point at
+                          // (see GlobalSnapshotAcceptanceManager.scala:908 / StateChannelSnapshotService.scala:112).
+                          // We must use signed.value.hash here, NOT `binaryHash` (wire-bytes digest).
+                          signed.toHashed
+                            .map(_.hash)
+                            .flatMap { valueHash =>
+                              // Record into the admission cache BEFORE processing, so any concurrent
+                              // gossip of this binary's children resolves cleanly. parentOrdinal+1 is
+                              // the metagraph ordinal this binary occupies — the next binary's parent
+                              // ordinal will be that.
+                              orphanBuffer.recordAdmission(address, valueHash, parentOrdinal + 1L) >>
+                                processMetagraphBinary(output)
+                                  .handleErrorWith(e => logger.warn(s"⚠️ processMetagraphBinary failed for $address: ${e.getMessage}"))
+                                  .flatMap(_ => orphanBuffer.drainChildren(address, valueHash))
+                                  .flatMap(_.traverse_(child => processBytes(address, child)))
+                            }
+                        } else Async[F].unit
+                    } yield ()
+                }
+              }
+            }
+        }
+
     refineV[DAGAddressRefined](mb.address) match {
       case Left(err) =>
         logger.warn(s"⚠️ Rejecting metagraph-binary gossip: invalid address '${mb.address}' ($err)")
       case Right(refined) =>
         val address = Address(refined)
         val bytes = mb.binary.toByteArray
-        io.constellationnetwork.json
-          .JsonSerializer[F]
-          .deserialize[Signed[StateChannelSnapshotBinary]](bytes)
-          .flatMap {
-            case Left(err) =>
-              logger.warn(s"⚠️ Rejecting metagraph-binary gossip: decode failed for $address (${err.getMessage})")
-            case Right(signed) =>
-              val output = StateChannelOutput(address, signed)
-              val parentHash = signed.value.lastSnapshotHash
-              // Hash the wire bytes to produce the binary hash — uses the same `Hasher[F]` surface that
-              // the gate's verifier uses to match `binaryHash` across observers. The bytes here are the
-              // serialized Signed[StateChannelSnapshotBinary]; both sender and receiver hash the same
-              // wire payload so the binary-hash agrees byte-for-byte.
-              HasherSelector[F].withCurrent { implicit hasher =>
-                Hasher[F].hashBytes(bytes).flatMap { binaryHash =>
-                  // Gate inputs: σ_self for our committee threshold + eta derived from the actual
-                  // metagraph parent ordinal (#202). The selfStake lookup is the same StakeRegistry
-                  // path the leader VRF uses. The parent-ordinal resolve via `parentOrdinalFor` is
-                  // load-bearing: the previous `etaForParentOrdinal(0L)` shortcut returned genesis
-                  // eta for every parent regardless of where the chain actually was. Fail-closed on
-                  // None — without the right eta, the receiver's committee VRF verify is guaranteed
-                  // to drop our attestation, so we'd just be putting noise on the wire.
-                  parentOrdinalFor(address, parentHash).flatMap {
-                    case None =>
-                      logger.warn(
-                        s"⚠️ Rejecting metagraph-binary gossip: unresolved parent ordinal for mg=$address " +
-                          s"parent=${parentHash.value.take(12)}... (fail-closed, #202)"
-                      )
-                    case Some(parentOrdinal) =>
-                      for {
-                        eta <- etaForParentOrdinal(parentOrdinal)
-                        sigma <- selfStake
-                        admitted <- committeeGate.attestAndAdmit(address, parentHash, binaryHash, eta, sigma)
-                        _ <-
-                          if (admitted)
-                            processMetagraphBinary(output)
-                              .handleErrorWith(e => logger.warn(s"⚠️ processMetagraphBinary failed for $address: ${e.getMessage}"))
-                          else Async[F].unit
-                      } yield ()
-                  }
-                }
-              }
-          }
+        processBytes(address, bytes)
     }
   }
 
