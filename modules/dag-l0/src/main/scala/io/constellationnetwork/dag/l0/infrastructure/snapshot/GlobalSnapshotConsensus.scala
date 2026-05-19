@@ -1051,7 +1051,7 @@ object GlobalSnapshotConsensus {
                   committeeGate = committeeGate,
                   parentOrdinalFor = committeeParentOrdinalFor,
                   etaForParentOrdinal = committeeEtaForOrdinal,
-                  senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.optimisticRelativeStake(peer)
+                  senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.committeeStake(peer)
                 )
                 .compile
                 .drain

@@ -360,7 +360,11 @@ object MetagraphCommitteeGate {
                     )
                     _ <- logger.info(
                       s"📢 committee-attested mg=$metagraphAddress parent=${parentHash.value.take(12)}... binary=${binaryHash.value
-                          .take(12)}... kTarget=$kTarget parentOrd=$parentOrdinal kesStep=$kesStep"
+                          .take(12)}... kTarget=$kTarget parentOrd=$parentOrdinal kesStep=$kesStep " +
+                        s"sentEtaFull=${eta.map("%02x".format(_)).mkString} " +
+                        s"sentVrfVkFull=${selfVrfVk.map("%02x".format(_)).mkString} " +
+                        s"sentProofFull=${proof.map("%02x".format(_)).mkString} " +
+                        s"sentSigma=$sigmaOperatorKey"
                     )
                   } yield SenderOutcome.Attested(proof, output): SenderOutcome
               }
@@ -451,7 +455,7 @@ object MetagraphCommitteeGate {
           parentOrdinalFor(att.metagraphAddress, att.parentHash).flatMap {
             case None =>
               Async[F].pure(ReceiverOutcome.UnknownParentOrdinal: ReceiverOutcome)
-            case Some(_) =>
+            case Some(receiverParentOrd) =>
               for {
                 msgBytes <- messageBytes[F](att.senderPeerId, att.metagraphAddress, att.parentHash, att.binaryHash)
                 senderPubKey <- att.senderPeerId.value.toPublicKey[F]
@@ -472,7 +476,7 @@ object MetagraphCommitteeGate {
                         else
                           lookupSenderStake(att.senderPeerId).flatMap { sigmaSender =>
                             sortition
-                              .verifyMembership(
+                              .verifyMembershipDetailed(
                                 att.senderVrfVk,
                                 eta,
                                 att.metagraphAddress,
@@ -481,9 +485,34 @@ object MetagraphCommitteeGate {
                                 kTarget,
                                 att.committeeVrfProof
                               )
-                              .map { vrfOk =>
-                                if (vrfOk) ReceiverOutcome.Recorded
-                                else ReceiverOutcome.InvalidCommitteeVrf
+                              .flatMap {
+                                case io.constellationnetwork.node.shared.domain.nakamoto.CommitteeSortition.VerifyOutcome.Valid =>
+                                  Async[F].pure(ReceiverOutcome.Recorded: ReceiverOutcome)
+                                case io.constellationnetwork.node.shared.domain.nakamoto.CommitteeSortition.VerifyOutcome.InvalidProof =>
+                                  // #216 diagnostic: bit-level VRF-verify FAIL (cryptographic). Distinguishes from threshold-fail.
+                                  logger.warn(
+                                    s"🔬 InvalidCommitteeVrf [InvalidProof] mg=${att.metagraphAddress} parent=${att.parentHash.value
+                                        .take(12)}... binary=${att.binaryHash.value.take(12)}... " +
+                                      s"recvParentOrd=$receiverParentOrd " +
+                                      s"etaFull=${eta.map("%02x".format(_)).mkString} " +
+                                      s"vrfVkFull=${att.senderVrfVk.map("%02x".format(_)).mkString} " +
+                                      s"proofFull=${att.committeeVrfProof.map("%02x".format(_)).mkString} " +
+                                      s"sigmaSender=$sigmaSender kTarget=$kTarget from=${att.senderPeerId.value.value.take(16)}..."
+                                  ) >>
+                                    Async[F].pure(ReceiverOutcome.InvalidCommitteeVrf: ReceiverOutcome)
+                                case io.constellationnetwork.node.shared.domain.nakamoto.CommitteeSortition.VerifyOutcome
+                                      .BelowThreshold(testValue, thresh) =>
+                                  // #216 diagnostic: VRF proof verifies but testValue >= K · σ. Localizes the issue to receiver-side
+                                  // stake-lookup divergence from sender (sigma is time-variant; sender locked it at attest time, receiver
+                                  // reads current GSI which has drifted).
+                                  logger.warn(
+                                    s"🔬 InvalidCommitteeVrf [BelowThreshold] mg=${att.metagraphAddress} parent=${att.parentHash.value
+                                        .take(12)}... binary=${att.binaryHash.value.take(12)}... " +
+                                      s"recvParentOrd=$receiverParentOrd " +
+                                      s"testValue=$testValue threshold=$thresh " +
+                                      s"sigmaSender=$sigmaSender kTarget=$kTarget from=${att.senderPeerId.value.value.take(16)}..."
+                                  ) >>
+                                    Async[F].pure(ReceiverOutcome.InvalidCommitteeVrf: ReceiverOutcome)
                               }
                           }
                     } yield result

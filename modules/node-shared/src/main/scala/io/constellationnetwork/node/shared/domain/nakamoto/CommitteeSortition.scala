@@ -69,9 +69,33 @@ trait CommitteeSortition[F[_]] {
     kTarget: Int,
     proof: Array[Byte]
   ): F[Boolean]
+
+  /** Same as `verifyMembership` but returns the richer outcome distinguishing VRF-proof verification failure from threshold-bound failure.
+    * Used by the gate's diagnostic path to localize the InvalidCommitteeVrf cause (#216).
+    */
+  def verifyMembershipDetailed(
+    vrfVk: Array[Byte],
+    eta: Array[Byte],
+    metagraphAddress: Address,
+    parentHash: Hash,
+    sigmaOperatorKey: Ratio,
+    kTarget: Int,
+    proof: Array[Byte]
+  ): F[CommitteeSortition.VerifyOutcome]
 }
 
 object CommitteeSortition {
+
+  /** Outcome of `verifyMembershipDetailed` — distinguishes the two reject paths inside [[CommitteeSortition.verifyMembership]] so the
+    * gate's `InvalidCommitteeVrf` log can name the actual failing predicate (#216 diagnostic). `Valid` means both predicates passed; the
+    * other two mean exactly one failed (VRF cryptographic verification, or threshold-bound check).
+    */
+  sealed trait VerifyOutcome
+  object VerifyOutcome {
+    case object Valid extends VerifyOutcome
+    case object InvalidProof extends VerifyOutcome
+    case class BelowThreshold(testValue: Ratio, threshold: Ratio) extends VerifyOutcome
+  }
 
   private val vrf = EcVrf25519.default
 
@@ -146,14 +170,30 @@ object CommitteeSortition {
       kTarget: Int,
       proof: Array[Byte]
     ): F[Boolean] =
+      verifyMembershipDetailed(vrfVk, eta, metagraphAddress, parentHash, sigmaOperatorKey, kTarget, proof).map {
+        case VerifyOutcome.Valid => true
+        case _                   => false
+      }
+
+    def verifyMembershipDetailed(
+      vrfVk: Array[Byte],
+      eta: Array[Byte],
+      metagraphAddress: Address,
+      parentHash: Hash,
+      sigmaOperatorKey: Ratio,
+      kTarget: Int,
+      proof: Array[Byte]
+    ): F[VerifyOutcome] =
       message[F](eta, metagraphAddress, parentHash).map { msg =>
-        if (!vrf.vrfVerify(vrfVk, msg, proof)) false
+        if (!vrf.vrfVerify(vrfVk, msg, proof)) VerifyOutcome.InvalidProof
         else
           vrf.vrfProofToHash(proof) match {
-            case None => false
+            case None => VerifyOutcome.InvalidProof
             case Some(vrfOutput) =>
               val testValue = EligibilityChecker.vrfOutputAsRatio(vrfOutput)
-              testValue < threshold(kTarget, sigmaOperatorKey)
+              val thresh = threshold(kTarget, sigmaOperatorKey)
+              if (testValue < thresh) VerifyOutcome.Valid
+              else VerifyOutcome.BelowThreshold(testValue, thresh)
           }
       }
   }

@@ -475,7 +475,7 @@ object NakamotoSyncDaemon {
                                       committeeGate,
                                       parentOrdinalFor,
                                       etaForParentOrdinal,
-                                      stakeRegistry.optimisticRelativeStake(selfId),
+                                      stakeRegistry.committeeStake(selfId),
                                       orphanBuffer,
                                       logger
                                     )

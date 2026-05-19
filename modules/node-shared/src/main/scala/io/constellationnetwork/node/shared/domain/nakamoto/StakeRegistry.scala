@@ -52,6 +52,17 @@ trait StakeRegistry[F[_]] {
   /** Get relative stake computed against observed active peers only (for optimistic finality). Returns 0 if peer is not active.
     */
   def optimisticRelativeStake(peerId: PeerId): F[Ratio]
+
+  /** Stable σ for committee sortition — `1 / |validators|` if `peerId` is a validator, else `0`. Independent of GSI evolution and observed-
+    * active set churn, so sender and receiver always agree on the same value within an eta period. The committee VRF assumes σ_sender =
+    * σ_receiver for the threshold `K · σ` to evaluate identically on both sides; the `optimisticRelativeStake` path drifts (active set
+    * changes, GSI totalStake grows) and broke the gate's verify-receive consistently (#216).
+    *
+    * v1 trade-off: equal weight per validator instead of stake-weighted. Loses Algorand's stake-weighted sampling property but gains
+    * cluster-wide determinism without historical-stake-lookback infrastructure. Stake-weighted committee sortition (anchored to eta-period
+    * boundary) is the §3/NIPoPoW path.
+    */
+  def committeeStake(peerId: PeerId): F[Ratio]
 }
 
 object StakeRegistry {
@@ -135,6 +146,12 @@ object StakeRegistry {
               Ratio(1, effectiveActive.size)
             else if (validators.contains(peerId) && validators.nonEmpty)
               Ratio(1, validators.size) // fallback to full seedlist weight
+            else Ratio.Zero
+          }
+
+        def committeeStake(peerId: PeerId): F[Ratio] =
+          validatorsRef.get.map { validators =>
+            if (validators.contains(peerId) && validators.nonEmpty) Ratio(1, validators.size)
             else Ratio.Zero
           }
       }
@@ -277,6 +294,12 @@ object StakeRegistry {
                   else Ratio(stakeOf(info, peerId), totalSeedlist)
                 } else Ratio.Zero
               }
+          }
+
+        def committeeStake(peerId: PeerId): F[Ratio] =
+          validatorsRef.get.map { validators =>
+            if (validators.contains(peerId) && validators.nonEmpty) Ratio(1, validators.size)
+            else Ratio.Zero
           }
       }
     }
