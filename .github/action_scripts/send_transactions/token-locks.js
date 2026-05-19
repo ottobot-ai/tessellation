@@ -27,8 +27,24 @@ const CONSTANTS = {
     // pipeline observation peak holds steady; expiration test gets 10-epoch margin
     // (~100s at ~10s/epoch), unlock test keeps 20-epoch headroom for the extra
     // DAG-balance-restoration pipeline stage.
-    EPOCH_PROGRESS_BUFFER_EXPIRATION_TEST: 20,
-    EPOCH_PROGRESS_BUFFER_TOKEN_UNLOCK_TEST: 30
+    // 2026-05-19 (#217 follow-up): 20 → 200 for 8gl0+4mg+4shards scale. Direct
+    // observation (iter-198std-v21): epoch advanced 213 → 920+ during the
+    // ~50min `verifyBalance` polling window — chain-link backlog at 4-mg scale
+    // makes gl0 cadence ~13s/snapshot under load, and the gl0 `/latest/combined`
+    // endpoint had multi-minute serving delays during cluster bootstrap. By the
+    // time `verifyGlobalL0` succeeded and `verifyBalance` started polling, the
+    // 20-epoch buffer had long expired and CL0 had already restored the balance
+    // (activeTokenLocks: {}, balances[source] = initial). The test was looking
+    // for `initial - 100` but the lock had already cycled deduct → expire →
+    // refund. 200 keeps the lock active well past the verify window at 8mg
+    // scale while still firing within the subsequent `verifyTokenLockExpiration`
+    // step's 50-min polling budget. The deeper fix is the cluster slowdown
+    // itself (#214 chain-link drain at scale), tracked separately.
+    EPOCH_PROGRESS_BUFFER_EXPIRATION_TEST: 200,
+    // 2026-05-19 (#217 follow-up): 30 → 200 to match expiration test buffer
+    // bump. Same root cause: at 8gl0+4mg+4shards scale the chain-link backlog
+    // makes verifyBalance polling outrun the lock lifetime.
+    EPOCH_PROGRESS_BUFFER_TOKEN_UNLOCK_TEST: 200
 };
 
 const createConfig = () => {
