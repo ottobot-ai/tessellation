@@ -331,11 +331,33 @@ object StateChannel {
 
     val pullFinalityGated: F[Either[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo), List[Hashed[GlobalIncrementalSnapshot]]]] =
       (storages.lastSyncGlobalSnapshot.get.map(_.map(_.ordinal)), services.globalL0.pullLatestFinalizedOrdinal).flatMapN {
-        case (None, _) =>
-          // Bootstrap: no stored snapshot yet. Defer to legacy bootstrap pull (canonical
-          // latest with majority verification) which yields a Left → handleInitialSnapshot.
-          // Finality gating kicks in on the next 10s tick once lastSyncGlobalSnapshot is set.
-          logger.info("ml0 pullFinalityGated: no stored last snapshot, falling back to bootstrap pull") >>
+        case (None, None) =>
+          // Bootstrap: no stored snapshot yet AND gl0 hasn't reported a finalized ordinal.
+          // Idle and retry — bootstrapping against the gl0 best-tip while gl0 is still
+          // resolving its own first incrementals causes ml0's first currency snapshot's
+          // globalSyncView to reference a transient gl0 hash that gl0 later reorgs away
+          // from. The receiver-side check (CurrencySnapshotAcceptanceManager:329) then
+          // rejects with `Forced globalSyncView hash mismatch` and the metagraph never
+          // advances past genesis on gl0's view. Waiting for at least one gl0 incremental
+          // (ord >= 1) to finalize ensures it is stable as a globalSyncView referent. #217.
+          logger
+            .info("ml0 pullFinalityGated: bootstrap idle — waiting for gl0 first finality (None)")
+            .as(List.empty[Hashed[GlobalIncrementalSnapshot]].asRight)
+        case (None, Some(finalizedOrd)) if finalizedOrd.value.value < BigInt(1) =>
+          // Bootstrap gate strict variant: gl0 reports finalized ord=0 (genesis only).
+          // ord=0 is trivially finalized but no incremental exists yet — gl0 may still be
+          // racing/reorging ord=1. Idle until at least one incremental is finalized. #217.
+          logger
+            .info(s"ml0 pullFinalityGated: bootstrap idle — gl0 finalizedOrd=${finalizedOrd.show} < 1 (no incremental finalized yet)")
+            .as(List.empty[Hashed[GlobalIncrementalSnapshot]].asRight)
+        case (None, Some(finalizedOrd)) =>
+          // Bootstrap: no stored snapshot yet. gl0 has finalized at least one incremental
+          // (finalizedOrd >= 1) so bootstrap is now safe — the lineage anchor for any
+          // subsequent globalSyncView reference is stable. Defer to legacy bootstrap pull
+          // (canonical latest with majority verification) which yields a Left →
+          // handleInitialSnapshot. Finality gating kicks in on the next 10s tick once
+          // lastSyncGlobalSnapshot is set.
+          logger.info(s"ml0 pullFinalityGated: bootstrapping after gl0 first finality observed (finalizedOrd=${finalizedOrd.show})") >>
             services.globalL0.pullGlobalSnapshots
         case (Some(lastOrd), None) =>
           logger

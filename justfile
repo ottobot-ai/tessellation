@@ -44,13 +44,15 @@ clean-data:
 	  for layer in gl0 gl1 ml0 cl1 dl1; do \
 	    rm -rf /nodes/*/\$layer-data /nodes/*/\$layer-logs; \
 	  done; \
-	  rm -rf /nodes/*/kes" 2>/dev/null || true
+	  rm -rf /nodes/*/kes; \
+	  rm -f /nodes/*/genesis.snapshot /nodes/*/genesis.address" 2>/dev/null || true
 	@docker run --rm -v $(pwd)/docker/nodes:/nodes alpine sh -c "\
 	  for layer in gl0 gl1 ml0 cl1 dl1; do \
 	    rm -rf /nodes/*/\$layer-data /nodes/*/\$layer-logs; \
 	  done; \
-	  rm -rf /nodes/*/kes" 2>/dev/null || true
-	@echo "Node data and logs cleaned for gl0/gl1/ml0/cl1/dl1 + kes/ (nodes/ and docker/nodes/)"
+	  rm -rf /nodes/*/kes; \
+	  rm -f /nodes/*/genesis.snapshot /nodes/*/genesis.address" 2>/dev/null || true
+	@echo "Node data and logs cleaned for gl0/gl1/ml0/cl1/dl1 + kes/ + metagraph genesis (nodes/ and docker/nodes/)"
 
 clean-configs:
 	@bash docker/bin/clean-configs.sh
