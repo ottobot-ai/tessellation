@@ -63,6 +63,25 @@ trait StakeRegistry[F[_]] {
     * boundary) is the §3/NIPoPoW path.
     */
   def committeeStake(peerId: PeerId): F[Ratio]
+
+  /** §3 NIPoPoW N-2 lookback: relative stake as recorded at the boundary of eta-period `etaPeriod`, against the **current** validator set.
+    *
+    * The verifier needs this view to deterministically reconstruct who held what stake at the snapshot's production time. Today's snapshot
+    * at ordinal X is produced under the stake distribution that was finalized at the boundary of `(X.etaPeriod - 2)` — Cardano's
+    * mark/set/go pipeline applied here.
+    *
+    * '''Fallback semantics (load-bearing for boot):'''
+    *   - If `etaPeriod` is negative or the historical snapshot for that period is not yet recorded (pre-genesis warmup, the first 2 eta
+    *     periods after genesis), the impl returns the genesis distribution's view. The boot path stays correct as long as the
+    *     genesis-loader stamps period -1 / 0 / 1 with the same starting distribution (§ S0.5).
+    *   - If `peerId` is not in the current validator set, returns `Ratio.Zero` regardless of history. Slashed/removed validators get 0 even
+    *     if they had stake in the lookback period.
+    *
+    * '''Why against the current validator set, not the historical one.''' Validator membership is governed by the seedlist, not by stake.
+    * Slashing and registration mutate the validator set at the moment of acceptance, not at the eta-period boundary. The historical stake
+    * distribution captures *amounts*; the current seedlist is the gate.
+    */
+  def relativeStakeAt(peerId: PeerId, etaPeriod: EtaPeriod): F[Ratio]
 }
 
 object StakeRegistry {
@@ -154,6 +173,11 @@ object StakeRegistry {
             if (validators.contains(peerId) && validators.nonEmpty) Ratio(1, validators.size)
             else Ratio.Zero
           }
+
+        // Equal-weight is history-independent: every validator gets 1/N regardless of period.
+        // N-2 staggering is moot when there are no stake-amount variations to stagger.
+        def relativeStakeAt(peerId: PeerId, etaPeriod: EtaPeriod): F[Ratio] =
+          relativeStake(peerId)
       }
     }
 
@@ -169,11 +193,13 @@ object StakeRegistry {
     * Boot fallback: when `snapshotInfoR` returns `None` (the node has not loaded a GSI yet), relative stake falls back to `Ratio(1,
     * validators.size)` so leader-loop wiring before genesis still elects.
     *
-    * §3 NIPoPoW follow-on: this constructor reads the *latest* GSI on every call. Eta-period historical stake look-back (read the stake
-    * snapshot from the eta-boundary, not the chain head) is out of scope for §1.1.
+    * §3 NIPoPoW N-2 lookback: `historicalDistributionFor` resolves a previously-recorded stake snapshot for an eta period. Used by
+    * [[StakeRegistry.relativeStakeAt]]. Returning `None` means "not yet recorded"; the caller falls through to the current GSI as a warmup
+    * default (correct only during the first 2 eta periods, by which time `historicalDistributionFor` MUST be returning real data).
     */
   def stakeWeighted[F[_]: Async](
-    snapshotInfoR: F[Option[GlobalSnapshotInfo]]
+    snapshotInfoR: F[Option[GlobalSnapshotInfo]],
+    historicalDistributionFor: EtaPeriod => F[Option[StakeDistribution]]
   ): F[StakeRegistry[F]] =
     (Ref.of[F, Set[PeerId]](Set.empty), Ref.of[F, Set[PeerId]](Set.empty)).mapN { (validatorsRef, activeRef) =>
       new StakeRegistry[F] {
@@ -300,6 +326,36 @@ object StakeRegistry {
           validatorsRef.get.map { validators =>
             if (validators.contains(peerId) && validators.nonEmpty) Ratio(1, validators.size)
             else Ratio.Zero
+          }
+
+        // §3 NIPoPoW N-2: read the stake distribution that was finalized at the boundary of `etaPeriod`,
+        // compute relativeStake against the current validator set. Fallback chain:
+        //   1. historical snapshot exists → use it (post-warmup steady state)
+        //   2. period < 0 OR no historical record yet → fall through to current GSI (warmup; valid for
+        //      periods 0 and 1 because the genesis loader stamps those with the genesis distribution)
+        //   3. GSI also unavailable (very early boot) → 1/N fallback (mirrors relativeStake's bootstrap path)
+        def relativeStakeAt(peerId: PeerId, etaPeriod: EtaPeriod): F[Ratio] =
+          (historicalDistributionFor(etaPeriod), validatorsRef.get).flatMapN {
+            case (Some(distribution), validators) =>
+              Async[F].pure {
+                if (!validators.contains(peerId) || validators.isEmpty) Ratio.Zero
+                else distribution.relativeStakeAgainst(peerId, validators)
+              }
+            case (None, validators) =>
+              // Warmup fall-through: use the current GSI as the stake distribution. Correct during
+              // the first 2 eta periods after genesis because the genesis distribution is unchanged.
+              snapshotInfoR.map {
+                case None =>
+                  if (validators.contains(peerId) && validators.nonEmpty) Ratio(1, validators.size)
+                  else Ratio.Zero
+                case Some(info) =>
+                  if (!validators.contains(peerId) || validators.isEmpty) Ratio.Zero
+                  else {
+                    val total = totalStakeOver(info, validators)
+                    if (total == BigInt(0)) Ratio.Zero
+                    else Ratio(stakeOf(info, peerId), total)
+                  }
+              }
           }
       }
     }

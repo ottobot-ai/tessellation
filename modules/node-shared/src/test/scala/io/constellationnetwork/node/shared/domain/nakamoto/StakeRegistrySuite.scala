@@ -252,7 +252,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
     val info = mkSnapshotInfo(Map.empty, Map.empty)
     val p1 = pid("p1")
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(Set(p1, pid("p2"), pid("p3")))
       s <- registry.relativeStake(p1)
     } yield expect.same(Ratio.Zero, s)
@@ -261,7 +261,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
   test("stakeWeighted: None snapshot info falls back to 1/N (boot path)") {
     val peers = (1 to 4).map(i => pid(s"p$i")).toSet
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(None))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(None), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(peers)
       s1 <- registry.relativeStake(pid("p1"))
       s2 <- registry.relativeStake(pid("p2"))
@@ -278,7 +278,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
     val c = pid("c")
     val info = mkSnapshotInfo(delegated = Map(a -> 100L, b -> 200L, c -> 700L), collateral = Map.empty)
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(Set(a, b, c))
       sA <- registry.relativeStake(a)
       sB <- registry.relativeStake(b)
@@ -295,7 +295,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
     val c = pid("c")
     val info = mkSnapshotInfo(delegated = Map.empty, collateral = Map(a -> 100L, b -> 200L, c -> 700L))
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(Set(a, b, c))
       sA <- registry.relativeStake(a)
       sB <- registry.relativeStake(b)
@@ -317,7 +317,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
       collateral = List(a -> 100L, c -> 700L)
     )
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(Set(a, b, c))
       sA <- registry.relativeStake(a)
       sB <- registry.relativeStake(b)
@@ -338,7 +338,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
       collateral = Map.empty
     )
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(Set(a, b))
       sA <- registry.relativeStake(a)
       sB <- registry.relativeStake(b)
@@ -357,7 +357,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
     val b = pid("b") // no stake records
     val info = mkSnapshotInfo(delegated = Map(a -> 100L), collateral = Map.empty)
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(Set(a, b))
       sA <- registry.relativeStake(a)
       sB <- registry.relativeStake(b)
@@ -372,7 +372,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
     val c = pid("c")
     val info = mkSnapshotInfo(delegated = Map(a -> 100L, b -> 250L, c -> 650L), collateral = Map.empty)
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(Set(a, b, c))
       stakes <- registry.allStakes
     } yield {
@@ -386,7 +386,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
     val amounts = List(10L, 20L, 30L, 40L, 50L)
     val info = mkSnapshotInfo(delegated = peers.zip(amounts).toMap, collateral = Map.empty)
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(peers.toSet)
       stakes <- registry.allStakes
       perPeer <- peers.toList.traverseListIO(registry.relativeStake)
@@ -403,7 +403,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
     val info = mkSnapshotInfo(delegated = peers.zip(amounts).toMap, collateral = Map.empty)
     val expected = amounts.map(a => Ratio(BigInt(a), BigInt(100)))
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(peers.toSet)
       observed <- peers.toList.traverseListIO(registry.relativeStake)
     } yield expect(observed == expected)
@@ -418,7 +418,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
     val d = pid("d") // 40 — active
     val info = mkSnapshotInfo(delegated = Map(a -> 10L, b -> 20L, c -> 30L, d -> 40L), collateral = Map.empty)
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(Set(a, b, c, d))
       _ <- registry.markActive(b)
       _ <- registry.markActive(c)
@@ -440,7 +440,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
     val d = pid("d") // 40
     val info = mkSnapshotInfo(delegated = Map(a -> 10L, b -> 20L, c -> 30L, d -> 40L), collateral = Map.empty)
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(Set(a, b, c, d))
       _ <- registry.markActive(c)
       sC <- registry.optimisticRelativeStake(c)
@@ -454,7 +454,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
     val d = pid("d") // 40 — active
     val info = mkSnapshotInfo(delegated = Map(a -> 10L, b -> 20L, c -> 30L, d -> 40L), collateral = Map.empty)
     for {
-      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+      registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
       _ <- registry.updateValidators(Set(a, b, c, d))
       _ <- registry.markActive(b)
       _ <- registry.markActive(c)
@@ -481,7 +481,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
       case (peers, weights) =>
         val info = mkSnapshotInfo(delegated = weights, collateral = Map.empty)
         for {
-          registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+          registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
           _ <- registry.updateValidators(peers)
           stakes <- registry.allStakes
         } yield {
@@ -507,7 +507,7 @@ object StakeRegistrySuite extends SimpleIOSuite with Checkers {
       case (peers, weights, sample) =>
         val info = mkSnapshotInfo(delegated = weights, collateral = Map.empty)
         for {
-          registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)))
+          registry <- StakeRegistry.stakeWeighted[IO](IO.pure(Some(info)), _ => IO.pure(Option.empty[StakeDistribution]))
           _ <- registry.updateValidators(peers)
           s <- registry.relativeStake(sample)
         } yield expect(s >= Ratio.Zero) && expect(s <= Ratio.One)

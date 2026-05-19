@@ -457,7 +457,13 @@ object GlobalSnapshotConsensus {
           // inside the constructor; updateValidators / markActive / markInactive semantics are
           // unchanged from equalWeight.
           stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry
-            .stakeWeighted[F](lastGlobalSnapshotStorage.getCombined.map(_.map(_._2)))
+            .stakeWeighted[F](
+              lastGlobalSnapshotStorage.getCombined.map(_.map(_._2)),
+              // §3 NIPoPoW S0.2 stub: historicalDistributionFor returns None until S0.3 wires the GSI
+              // `historicalStakeSnapshots` field. Until then, every relativeStakeAt call falls through
+              // to the warmup branch (current GSI), which is equivalent to today's relativeStake.
+              _ => cats.effect.kernel.Async[F].pure(Option.empty[io.constellationnetwork.node.shared.domain.nakamoto.StakeDistribution])
+            )
             .toResource
           // Filter out entries marked with alias="metagraph-op". They live in the seedlist
           // so state-channel binary signature validation accepts them as known signers,
