@@ -34,14 +34,16 @@ object MetagraphOrphanBufferSuite extends SimpleIOSuite {
       s3 <- buf.record(mgA, parent, b3)
       drained <- buf.drainChildren(mgA, parent)
       sizeAfter <- buf.size
-    } yield expect.eql(1, s1)
-      .and(expect.eql(2, s2))
-      .and(expect.eql(3, s3))
-      .and(expect.eql(3, drained.length))
-      .and(expect(java.util.Arrays.equals(drained(0), b1)))
-      .and(expect(java.util.Arrays.equals(drained(1), b2)))
-      .and(expect(java.util.Arrays.equals(drained(2), b3)))
-      .and(expect.eql(0, sizeAfter))
+    } yield
+      expect
+        .eql(1, s1)
+        .and(expect.eql(2, s2))
+        .and(expect.eql(3, s3))
+        .and(expect.eql(3, drained.length))
+        .and(expect(java.util.Arrays.equals(drained(0), b1)))
+        .and(expect(java.util.Arrays.equals(drained(1), b2)))
+        .and(expect(java.util.Arrays.equals(drained(2), b3)))
+        .and(expect.eql(0, sizeAfter))
   }
 
   test("drainChildren — wrong parent returns empty list") {
@@ -87,10 +89,12 @@ object MetagraphOrphanBufferSuite extends SimpleIOSuite {
       // Buffer holds: (mgA, parent) → [bytes(2)], (mgB, parent) → [bytes(3)]
       drainedA <- buf.drainChildren(mgA, parent)
       drainedB <- buf.drainChildren(mgB, parent)
-    } yield expect.eql(1, drainedA.length)
-      .and(expect(java.util.Arrays.equals(drainedA.head, mkBytes(2))))
-      .and(expect.eql(1, drainedB.length))
-      .and(expect(java.util.Arrays.equals(drainedB.head, mkBytes(3))))
+    } yield
+      expect
+        .eql(1, drainedA.length)
+        .and(expect(java.util.Arrays.equals(drainedA.head, mkBytes(2))))
+        .and(expect.eql(1, drainedB.length))
+        .and(expect(java.util.Arrays.equals(drainedB.head, mkBytes(3))))
   }
 
   test("recordAdmission + lookupAdmittedOrd round-trip") {
@@ -103,10 +107,12 @@ object MetagraphOrphanBufferSuite extends SimpleIOSuite {
       otherHash <- IO.pure(mkHash("5678"))
       missing2 <- buf.lookupAdmittedOrd(mgA, otherHash)
       sz <- buf.admissionsSize
-    } yield expect.eql(Some(5L), found)
-      .and(expect.eql(None, missing))
-      .and(expect.eql(None, missing2))
-      .and(expect.eql(1, sz))
+    } yield
+      expect
+        .eql(Some(5L), found)
+        .and(expect.eql(None, missing))
+        .and(expect.eql(None, missing2))
+        .and(expect.eql(1, sz))
   }
 
   test("admission cap evicts oldest entries first") {
@@ -123,10 +129,12 @@ object MetagraphOrphanBufferSuite extends SimpleIOSuite {
       lookup2 <- buf.lookupAdmittedOrd(mgA, h2)
       lookup3 <- buf.lookupAdmittedOrd(mgA, h3)
       sz <- buf.admissionsSize
-    } yield expect.eql(None, lookup1)
-      .and(expect.eql(Some(2L), lookup2))
-      .and(expect.eql(Some(3L), lookup3))
-      .and(expect.eql(2, sz))
+    } yield
+      expect
+        .eql(None, lookup1)
+        .and(expect.eql(Some(2L), lookup2))
+        .and(expect.eql(Some(3L), lookup3))
+        .and(expect.eql(2, sz))
   }
 
   test("re-admission updates the cached ordinal") {

@@ -11,14 +11,13 @@ import org.typelevel.log4cats.Logger
 /** In-memory bridge over gl0's GSI lag for metagraph state-channel binaries. Two coupled concerns:
   *
   *   1. '''Orphan buffer.''' Holds wire bytes of binaries whose `lastSnapshotHash` (parent) the local GSI doesn't yet recognize. Drained
-  *      when the parent binary itself becomes resolvable.
-  *   2. '''Recent-admission cache.''' Holds `(metagraphAddress, valueHash) → metagraphOrdinal` for binaries we just admitted via the
-  *      committee gate. Allows the resolver wrapper to answer "what's this binary's metagraph ordinal?" before the GSI catches up (which
-  *      only happens on the next gl0 snapshot finalize, ~7s later).
+  *      when the parent binary itself becomes resolvable. 2. '''Recent-admission cache.''' Holds `(metagraphAddress, valueHash) →
+  *      metagraphOrdinal` for binaries we just admitted via the committee gate. Allows the resolver wrapper to answer "what's this binary's
+  *      metagraph ordinal?" before the GSI catches up (which only happens on the next gl0 snapshot finalize, ~7s later).
   *
-  * '''Why this exists (#213).''' At 8gl0+4mg+4shards the metagraph CL0 ("ml0") produces incremental binaries faster than gl0 can admit
-  * them through the committee gate. Between the moment gl0 finalizes a metagraph's genesis binary into its global state and the moment the
-  * first incremental binary lands at the resolver, ml0 may have produced several more incremental binaries chained off the first. The first
+  * '''Why this exists (#213).''' At 8gl0+4mg+4shards the metagraph CL0 ("ml0") produces incremental binaries faster than gl0 can admit them
+  * through the committee gate. Between the moment gl0 finalizes a metagraph's genesis binary into its global state and the moment the first
+  * incremental binary lands at the resolver, ml0 may have produced several more incremental binaries chained off the first. The first
   * incremental's parent matches the genesis hash, but by the time gl0 sees binary ord=N the parent points to ord=(N-1), a binary gl0 never
   * recorded. `MetagraphParentOrdinalResolver` fail-closes on every such binary; the metagraph chain is then permanently stuck from gl0's
   * point of view.
@@ -52,12 +51,12 @@ import org.typelevel.log4cats.Logger
   * aggregator is a different identity and is irrelevant here.
   *
   * '''Not a substitute for chain-sync.''' If gl0 misses binaries beyond what the sidecar outbox retains (large outages), an orphan buffer
-  * alone cannot recover — a metagraph-binary fetch protocol is the longer-term fix. The buffer is the smallest sufficient mechanism for
-  * the 4-mg scale race.
+  * alone cannot recover — a metagraph-binary fetch protocol is the longer-term fix. The buffer is the smallest sufficient mechanism for the
+  * 4-mg scale race.
   *
   * '''Payload type.''' We store the raw `Array[Byte]` of the wire-level `pb.MetagraphBinary.binary` field plus the metagraph address (the
-  * proto wrapper), not the parsed `Signed[StateChannelSnapshotBinary]`. This way re-drain hands the same byte sequence back to the
-  * daemon's handler which already knows how to deserialize and process it; no separate "post-deserialize re-entry" code path.
+  * proto wrapper), not the parsed `Signed[StateChannelSnapshotBinary]`. This way re-drain hands the same byte sequence back to the daemon's
+  * handler which already knows how to deserialize and process it; no separate "post-deserialize re-entry" code path.
   */
 trait MetagraphOrphanBuffer[F[_]] {
 
@@ -83,9 +82,9 @@ trait MetagraphOrphanBuffer[F[_]] {
     */
   def recordAdmission(metagraphAddress: Address, valueHash: Hash, mgOrdinal: Long): F[Unit]
 
-  /** Look up a recently-admitted binary's metagraph ordinal. Returns `Some(mgOrdinal)` if we admitted a binary with
-    * `(metagraphAddress, valueHash)` in the recent past. Used by the resolver wrapper to bridge the gap between admit (in-memory) and
-    * the next gl0 snapshot finalize (GSI). When `None`, the caller falls through to the GSI-backed `MetagraphParentOrdinalResolver`.
+  /** Look up a recently-admitted binary's metagraph ordinal. Returns `Some(mgOrdinal)` if we admitted a binary with `(metagraphAddress,
+    * valueHash)` in the recent past. Used by the resolver wrapper to bridge the gap between admit (in-memory) and the next gl0 snapshot
+    * finalize (GSI). When `None`, the caller falls through to the GSI-backed `MetagraphParentOrdinalResolver`.
     */
   def lookupAdmittedOrd(metagraphAddress: Address, valueHash: Hash): F[Option[Long]]
 
@@ -101,8 +100,8 @@ object MetagraphOrphanBuffer {
   val DefaultCap: Int =
     sys.env.get("NAKAMOTO_ORPHAN_BUFFER_CAP").flatMap(_.toIntOption).getOrElse(256)
 
-  /** Default cap on the recent-admission cache. Larger than the orphan cap because admissions persist for the ~7s GSI catch-up window
-    * and we want headroom across all metagraphs during that window. 1024 entries × ~96 B (Address + Hash + Long + bookkeeping) ≈ 100 KB.
+  /** Default cap on the recent-admission cache. Larger than the orphan cap because admissions persist for the ~7s GSI catch-up window and
+    * we want headroom across all metagraphs during that window. 1024 entries × ~96 B (Address + Hash + Long + bookkeeping) ≈ 100 KB.
     * Overridable via `NAKAMOTO_RECENT_ADMIT_CAP`.
     */
   val DefaultAdmissionsCap: Int =
@@ -111,8 +110,8 @@ object MetagraphOrphanBuffer {
   /** Buffer key. Keying on `(metagraphAddress, parentHash)` lets us drain all children of a freshly-accepted binary in one lookup. */
   private final case class Key(metagraphAddress: Address, parentHash: Hash)
 
-  /** Internal entry. `seq` is a monotonic counter for FIFO eviction; `wireBytes` is the queued payload. We compare bytes by content
-    * via `java.util.Arrays.equals` (Scala's `Array[Byte]` `==` is identity-only).
+  /** Internal entry. `seq` is a monotonic counter for FIFO eviction; `wireBytes` is the queued payload. We compare bytes by content via
+    * `java.util.Arrays.equals` (Scala's `Array[Byte]` `==` is identity-only).
     */
   private final case class Entry(seq: Long, wireBytes: Array[Byte])
 
@@ -130,42 +129,41 @@ object MetagraphOrphanBuffer {
       seqRef <- Ref.of[F, Long](0L)
       admissionsRef <- Ref.of[F, Map[(Address, Hash), AdmissionEntry]](Map.empty)
       admissionsSeqRef <- Ref.of[F, Long](0L)
-    } yield new MetagraphOrphanBuffer[F] {
+    } yield
+      new MetagraphOrphanBuffer[F] {
 
-      private val logger: Logger[F] = logger0
+        private val logger: Logger[F] = logger0
 
-      def record(metagraphAddress: Address, parentHash: Hash, wireBytes: Array[Byte]): F[Int] =
-        for {
-          nextSeq <- seqRef.updateAndGet(_ + 1L)
-          newSize <- stateRef.modify { state =>
-            val key = Key(metagraphAddress, parentHash)
-            val existing = state.getOrElse(key, Nil)
-            if (existing.exists(e => java.util.Arrays.equals(e.wireBytes, wireBytes)))
-              (state, totalSize(state))
-            else {
-              val withNew = state.updated(key, Entry(nextSeq, wireBytes) :: existing)
-              val sized = enforceCap(withNew, cap)
-              (sized, totalSize(sized))
+        def record(metagraphAddress: Address, parentHash: Hash, wireBytes: Array[Byte]): F[Int] =
+          for {
+            nextSeq <- seqRef.updateAndGet(_ + 1L)
+            newSize <- stateRef.modify { state =>
+              val key = Key(metagraphAddress, parentHash)
+              val existing = state.getOrElse(key, Nil)
+              if (existing.exists(e => java.util.Arrays.equals(e.wireBytes, wireBytes)))
+                (state, totalSize(state))
+              else {
+                val withNew = state.updated(key, Entry(nextSeq, wireBytes) :: existing)
+                val sized = enforceCap(withNew, cap)
+                (sized, totalSize(sized))
+              }
             }
-          }
-          _ <- logger.debug(
-            s"📦 orphan-buffer: recorded mg=$metagraphAddress parent=${parentHash.value.take(12)}... bufferSize=$newSize"
-          )
-        } yield newSize
+            _ <- logger.debug(
+              s"📦 orphan-buffer: recorded mg=$metagraphAddress parent=${parentHash.value.take(12)}... bufferSize=$newSize"
+            )
+          } yield newSize
 
-      def drainChildren(metagraphAddress: Address, acceptedValueHash: Hash): F[List[Array[Byte]]] =
-        stateRef
-          .modify { state =>
+        def drainChildren(metagraphAddress: Address, acceptedValueHash: Hash): F[List[Array[Byte]]] =
+          stateRef.modify { state =>
             val key = Key(metagraphAddress, acceptedValueHash)
             state.get(key) match {
-              case None => (state, Nil)
+              case None          => (state, Nil)
               case Some(entries) =>
                 // Drain in insertion order: entries were prepended (newest first), so reverse for chronological replay.
                 val drained = entries.reverse.map(_.wireBytes)
                 (state - key, drained)
             }
-          }
-          .flatTap { drained =>
+          }.flatTap { drained =>
             if (drained.isEmpty) Async[F].unit
             else
               logger.info(
@@ -174,25 +172,25 @@ object MetagraphOrphanBuffer {
               )
           }
 
-      def size: F[Int] = stateRef.get.map(totalSize)
+        def size: F[Int] = stateRef.get.map(totalSize)
 
-      def recordAdmission(metagraphAddress: Address, valueHash: Hash, mgOrdinal: Long): F[Unit] =
-        for {
-          nextSeq <- admissionsSeqRef.updateAndGet(_ + 1L)
-          _ <- admissionsRef.update { admissions =>
-            val withNew = admissions.updated((metagraphAddress, valueHash), AdmissionEntry(nextSeq, mgOrdinal))
-            enforceAdmissionsCap(withNew, admissionsCap)
-          }
-          _ <- logger.debug(
-            s"📌 orphan-buffer: cached admission mg=$metagraphAddress valueHash=${valueHash.value.take(12)}... mgOrd=$mgOrdinal"
-          )
-        } yield ()
+        def recordAdmission(metagraphAddress: Address, valueHash: Hash, mgOrdinal: Long): F[Unit] =
+          for {
+            nextSeq <- admissionsSeqRef.updateAndGet(_ + 1L)
+            _ <- admissionsRef.update { admissions =>
+              val withNew = admissions.updated((metagraphAddress, valueHash), AdmissionEntry(nextSeq, mgOrdinal))
+              enforceAdmissionsCap(withNew, admissionsCap)
+            }
+            _ <- logger.debug(
+              s"📌 orphan-buffer: cached admission mg=$metagraphAddress valueHash=${valueHash.value.take(12)}... mgOrd=$mgOrdinal"
+            )
+          } yield ()
 
-      def lookupAdmittedOrd(metagraphAddress: Address, valueHash: Hash): F[Option[Long]] =
-        admissionsRef.get.map(_.get((metagraphAddress, valueHash)).map(_.mgOrdinal))
+        def lookupAdmittedOrd(metagraphAddress: Address, valueHash: Hash): F[Option[Long]] =
+          admissionsRef.get.map(_.get((metagraphAddress, valueHash)).map(_.mgOrdinal))
 
-      def admissionsSize: F[Int] = admissionsRef.get.map(_.size)
-    }
+        def admissionsSize: F[Int] = admissionsRef.get.map(_.size)
+      }
 
   /** Total entry count across all keys. Linear in number of keys; cheap given the small cap. */
   private def totalSize(state: Map[Key, List[Entry]]): Int =
