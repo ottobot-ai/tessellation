@@ -55,21 +55,36 @@ object MetagraphParentOrdinalResolver {
   ): F[Option[Long]] =
     reader.getLastStateChannelSnapshotHash(metagraphAddress).flatMap {
       case Some(storedHash) if storedHash === parentHash =>
+        // Tip matches. Try the Right side (incremental snapshots) first. After the first incremental binary is accepted, the metagraph
+        // tip is recorded in `LastIncrementalCurrencySnapshots`; before that (genesis-only window between the genesis binary's
+        // acceptance and the first incremental binary's acceptance), only `LastCurrencySnapshots` (Left side) is populated. The
+        // genesis-only window is a real call site for production traffic: ml0 sends the genesis binary AND the first incremental
+        // binary back-to-back at boot (see `Genesis.acceptSignedGenesis` — the genesis binary's hash becomes the parent of the first
+        // incremental binary). Other gl0 peers receiving the first incremental binary's gossip must be able to resolve its parent
+        // ordinal even though only the Left side is set on this peer; otherwise the gate fail-closes and the first incremental binary
+        // (and every binary chained off it) never reaches majority — manifests at 4-metagraph scale where the chain-link rejection
+        // strands all metagraphs at gl0.lastCurrencySnapshots ord=1 forever.
         reader.getLastIncrementalCurrencySnapshot(metagraphAddress).flatMap {
           case Some(signed) =>
             // `Signed[CurrencyIncrementalSnapshot].value.ordinal: SnapshotOrdinal` — `.value.value` unwraps the NonNegLong newtype.
             Async[F].pure(Some(signed.value.ordinal.value.value))
           case None =>
-            // The state-channel hash partition is populated but the incremental-snapshot partition isn't yet. This is the genesis-only
-            // case (`LastCurrencySnapshots` Left side, not Right) — for v1 no metagraph has been bootstrapped to this state, but if/when
-            // one is, the genesis snapshot lives in the `LastCurrencySnapshots` partition with ordinal 0 by definition. Returning None
-            // here keeps the fail-closed invariant; production traffic shouldn't hit this for any in-flight binary.
-            Logger[F]
-              .warn(
-                s"⚠️ parent-ordinal resolve: lastStateChannelSnapshotHashes hit but no incremental snapshot for mg=$metagraphAddress " +
-                  s"parent=${parentHash.value.take(12)}... — returning None (fail-closed)"
-              )
-              .as(Option.empty[Long])
+            // Right side empty — fall back to the Left side (genesis-only window). The genesis snapshot's ordinal is the parent
+            // ordinal that ml0's first incremental binary chains off.
+            reader.getLastCurrencySnapshot(metagraphAddress).flatMap {
+              case Some(genesis) =>
+                Async[F].pure(Some(genesis.value.ordinal.value.value))
+              case None =>
+                // Both partitions empty — but `LastStateChannelSnapshotHashes` was set. The acceptance manager writes all three
+                // partitions in the same `processStateChannelEvents` pass, so this state shouldn't appear post-genesis under normal
+                // operation. Log and fail closed.
+                Logger[F]
+                  .warn(
+                    s"⚠️ parent-ordinal resolve: lastStateChannelSnapshotHashes hit but neither incremental nor genesis snapshot " +
+                      s"present for mg=$metagraphAddress parent=${parentHash.value.take(12)}... — returning None (fail-closed)"
+                  )
+                  .as(Option.empty[Long])
+            }
         }
       case Some(storedHash) =>
         Logger[F]

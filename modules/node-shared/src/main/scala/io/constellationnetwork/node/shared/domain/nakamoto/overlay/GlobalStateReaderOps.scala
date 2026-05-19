@@ -4,7 +4,7 @@ import cats.effect.Async
 
 import scala.collection.immutable.SortedSet
 
-import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshotInfo}
+import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot, CurrencySnapshotInfo}
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
@@ -70,6 +70,17 @@ object GlobalStateReaderOps {
     def getLastIncrementalCurrencySnapshot(metagraphAddress: Address): F[Option[Signed[CurrencyIncrementalSnapshot]]] =
       reader.get[Signed[CurrencyIncrementalSnapshot]](
         GlobalStateKey.metagraph(metagraphAddress, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
+      )
+
+    /** The signed genesis (full) snapshot at the metagraph's current tip — populated only at the post-genesis pre-first-incremental window.
+      * After the first incremental binary is accepted, the metagraph moves to the `LastIncrementalCurrencySnapshots` partition and this
+      * returns `None`. Used by `MetagraphParentOrdinalResolver` to recover the genesis ordinal so the very-first-incremental binary's
+      * parent-ordinal can be resolved against the genesis Left-side state (otherwise the gate would fail-close on every cluster with >1
+      * metagraph the moment ml0 sends its post-genesis incremental binary).
+      */
+    def getLastCurrencySnapshot(metagraphAddress: Address): F[Option[Signed[CurrencySnapshot]]] =
+      reader.get[Signed[CurrencySnapshot]](
+        GlobalStateKey.metagraph(metagraphAddress, GlobalStateFieldId.LastCurrencySnapshots)
       )
   }
 }
