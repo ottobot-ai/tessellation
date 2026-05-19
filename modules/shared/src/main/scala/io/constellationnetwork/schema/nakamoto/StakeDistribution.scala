@@ -56,8 +56,8 @@ object StakeDistribution {
   val Empty: StakeDistribution = StakeDistribution(SortedMap.empty[PeerId, BigInt])
 
   /** Manual `Show` to avoid the cats / `OrphanInstances.showSortedMapAsList` ambiguity that bites every `@derive(show)` over a
-    * `SortedMap[K, V]` inside the `io.constellationnetwork.schema` package. `Show.fromToString` is fine — this is only used for
-    * diagnostic output.
+    * `SortedMap[K, V]` inside the `io.constellationnetwork.schema` package. `Show.fromToString` is fine — this is only used for diagnostic
+    * output.
     */
   implicit val show: Show[StakeDistribution] = Show.fromToString
 }

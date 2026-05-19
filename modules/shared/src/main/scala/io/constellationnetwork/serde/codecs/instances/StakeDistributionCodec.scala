@@ -14,14 +14,14 @@ import scodec.{Attempt, Codec}
 /** Canonical scodec codecs for §3 NIPoPoW stake-distribution types.
   *
   *   - `EtaPeriod` — int64. `EtaPeriod.value` can go negative during eligibility-query fall-through; the codec preserves sign.
-  *   - `BigInt` — two's-complement variable-length bytes, length-prefixed with uint32. Matches `java.math.BigInteger.toByteArray` /
-  *     `new BigInteger(bytes)` round-trip — the canonical wire form for arbitrary-precision integers. Stake sums in practice fit
-  *     comfortably in 16 bytes but the codec accepts anything we'd ever produce.
+  *   - `BigInt` — two's-complement variable-length bytes, length-prefixed with uint32. Matches `java.math.BigInteger.toByteArray` / `new
+  *     BigInteger(bytes)` round-trip — the canonical wire form for arbitrary-precision integers. Stake sums in practice fit comfortably in
+  *     16 bytes but the codec accepts anything we'd ever produce.
   *   - `StakeDistribution` — sortedMap(PeerId, BigInt). Determinism comes from the `SortedMap` insertion order plus PeerId's canonical
   *     `Order` instance.
   *
-  * Used both by the GSI capstone codec ([[GlobalSnapshotInfoCodec]]) and by the MPT projection that authenticates the per-period
-  * partition under [[io.constellationnetwork.schema.mpt.GlobalStateFieldId.HistoricalStakeSnapshots]].
+  * Used both by the GSI capstone codec ([[GlobalSnapshotInfoCodec]]) and by the MPT projection that authenticates the per-period partition
+  * under [[io.constellationnetwork.schema.mpt.GlobalStateFieldId.HistoricalStakeSnapshots]].
   */
 object StakeDistributionCodec {
 
