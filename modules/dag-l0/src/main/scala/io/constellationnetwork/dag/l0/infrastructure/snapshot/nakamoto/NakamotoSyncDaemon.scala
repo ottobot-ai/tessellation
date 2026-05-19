@@ -1455,6 +1455,7 @@ object NakamotoSyncDaemon {
     *   - `att.committeeVrfProof` → `committeeVrfProof`
     *   - `att.signature` → `longTermSignature`
     *   - `att.kesSignature` → `kesSignature`
+    *   - `att.senderTreeStep` (uint32 wire field) → `senderTreeStep`
     *
     * '''Why `vrf_public_key` is on the wire.''' The receiver can't re-derive the sender's VRF VK from `senderPeerId` alone: `VrfKeyDeriver`
     * needs the sender's PRIVATE key. The S2/S3 wire format carries the sender's VRF VK directly so verification works for any operator the
@@ -1495,7 +1496,8 @@ object NakamotoSyncDaemon {
           binaryHash = binaryHash,
           committeeVrfProof = att.committeeVrfProof.toByteArray,
           longTermSignature = att.signature.toByteArray,
-          kesSignature = att.kesSignature.toByteArray
+          kesSignature = att.kesSignature.toByteArray,
+          senderTreeStep = att.senderTreeStep
         )
         // #202: resolve the actual metagraph parent ordinal from `(metagraphAddress, parentHash)`
         // via the gl0 GSI before computing eta. The previous shortcut (`etaForParentOrdinal(0L)`)

@@ -731,43 +731,49 @@ object GlobalSnapshotConsensus {
             .getLoggerFromName[F]("MetagraphCommitteeGate")
             .pure[F]
             .toResource
-          // KES adapter — the gate calls `signAt` with the period derived from the metagraph-parent
-          // ordinal (via `kesPeriodFor` below). The signer returns the encoded bytes; on `signAt`
-          // failure, returns empty bytes which the receiver-side gate treats as "no KES sig" and
-          // rejects. This matches the existing Slice 9 sender-failure-emits-empty pattern.
+          // KES adapter — sender signs at the operator's CURRENT KES tree-internal step (read via
+          // `operationalKeyMaker.currentPeriod`) and embeds that step on the wire so the receiver can
+          // verify non-interactively. `signAt` returns the encoded bytes; on signer failure (e.g.
+          // `StepNotMonotonic` if the caller passed a stale step) returns empty bytes which the
+          // receiver-side gate treats as "no KES sig" and rejects. The gate always passes
+          // `currentPeriod` here so monotonic failure cannot happen in normal operation.
           committeeKesSigner = new io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.KesSigner[F] {
-            def signAt(kesPeriod: Int, message: Array[Byte]): F[Array[Byte]] =
-              operationalKeyMaker.signAt(kesPeriod, message).map {
+            def currentPeriod: F[Int] = operationalKeyMaker.currentPeriod
+            def signAt(kesStep: Int, message: Array[Byte]): F[Array[Byte]] =
+              operationalKeyMaker.signAt(kesStep, message).map {
                 case Right(sig) => io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(sig)
                 case Left(_)    => Array.empty[Byte]
               }
           }
-          // KES verifier — reuses the Slice 9 verify path (`KesGossipVerification.verifyAttestation`)
-          // so empty/decode-fail/verify-fail/step-out-of-range → false (reject), no-registry-entry →
-          // true (Ed25519 already authenticated). Same accept matrix as TipAttestation's KES gate.
+          // KES verifier — uses `verifyAttestationByStep` so the tree-internal step comes straight off
+          // the wire (`MetagraphAttestation.sender_tree_step`). No chain-state derivation, no
+          // operator-offset lookup — receiver-side verification is non-interactive. Accept matrix:
+          // empty/decode-fail/verify-fail → false (reject); no-registry-entry → true (Ed25519 already
+          // authenticated; Slice 10 mid-life join carve-out).
           committeeKesVerifier = new io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.KesVerifier[F] {
             def verify(
               messageBytes: Array[Byte],
               kesSigBytes: Array[Byte],
               attesterId: io.constellationnetwork.schema.peer.PeerId,
               attesterHex: io.constellationnetwork.security.hex.Hex,
-              kesOrdinal: Long
+              kesStep: Int
             ): F[Boolean] =
               io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.KesGossipVerification
-                .verifyAttestation[F](
+                .verifyAttestationByStep[F](
                   messageBytes = messageBytes,
                   kesSigBytes = kesSigBytes,
                   attesterId = attesterId,
                   attesterHex = attesterHex,
-                  tipOrdinal = kesOrdinal,
+                  kesStep = kesStep,
                   kesRegistry = kesRegistry,
-                  etaRotationSnapshots = etaRotationSnapshots.toLong,
                   logger = committeeGateLogger
                 )
           }
           // Publisher — wraps `sidecarClient.publishMetagraphAttestation`; failures are logged and
           // swallowed (gossip best-effort). Receivers re-emit if the publish lost in the libp2p mesh,
-          // matching the existing fire-and-forget pattern for `publishAttestation`.
+          // matching the existing fire-and-forget pattern for `publishAttestation`. `kesStep` is
+          // forwarded into the proto field `sender_tree_step` so receivers verify against exactly
+          // the tree-internal step the sender used.
           committeePublisher = new io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.Publisher[F] {
             def publish(
               senderPeerIdBytes: Array[Byte],
@@ -777,7 +783,8 @@ object GlobalSnapshotConsensus {
               committeeVrfProof: Array[Byte],
               longTermSignature: Array[Byte],
               kesSignature: Array[Byte],
-              vrfPublicKey: Array[Byte]
+              vrfPublicKey: Array[Byte],
+              kesStep: Int
             ): F[Unit] = {
               val msg = io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
                 .mkMetagraphAttestation(
@@ -788,21 +795,14 @@ object GlobalSnapshotConsensus {
                   committeeVrfProof = committeeVrfProof,
                   signature = longTermSignature,
                   kesSignature = kesSignature,
-                  vrfPublicKey = vrfPublicKey
+                  vrfPublicKey = vrfPublicKey,
+                  senderTreeStep = kesStep
                 )
               sidecarClient.publishMetagraphAttestation(msg).void.handleErrorWith { e =>
                 committeeGateLogger.warn(s"Failed to publish metagraph attestation for $metagraphAddress: ${e.getMessage}")
               }
             }
           }
-          // KES period derivation — pure function of the parent ordinal + cluster's rotation cadence.
-          // Matches the gl0 leader VRF's period derivation so the receiver-side gate computes the same
-          // KES period the sender did, IFF both peers resolve the same parent ordinal (#201). The
-          // resolver below is the load-bearing piece.
-          committeeKesPeriodFor = (parentOrdinal: Long) =>
-            io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
-              .rotationPeriod(parentOrdinal, etaRotationSnapshots.toLong)
-              .toInt
           // #201: resolve the metagraph parent ordinal from `(metagraphAddress, parentHash)` via the
           // gl0 GSI's `lastStateChannelSnapshotHashes` + `lastIncrementalCurrencySnapshots` partitions.
           // The previous shortcut (gl0 finalized ordinal) was asymmetric across peers (each peer has
@@ -838,7 +838,6 @@ object GlobalSnapshotConsensus {
               kTarget = committeeKTarget,
               gateTimeoutMs = io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.DefaultGateTimeoutMs,
               pollIntervalMs = io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.DefaultPollIntervalMs,
-              kesPeriodFor = committeeKesPeriodFor,
               parentOrdinalFor = committeeParentOrdinalFor
             )
           }

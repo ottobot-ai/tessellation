@@ -245,7 +245,8 @@ object SidecarClient {
     committeeVrfProof: Array[Byte],
     signature: Array[Byte],
     kesSignature: Array[Byte] = Array.empty[Byte],
-    vrfPublicKey: Array[Byte] = Array.empty[Byte]
+    vrfPublicKey: Array[Byte] = Array.empty[Byte],
+    senderTreeStep: Int = 0
   ): MetagraphAttestation =
     MetagraphAttestation(
       peerId = ByteString.copyFrom(peerIdBytes),
@@ -255,6 +256,7 @@ object SidecarClient {
       committeeVrfProof = ByteString.copyFrom(committeeVrfProof),
       signature = ByteString.copyFrom(signature),
       kesSignature = ByteString.copyFrom(kesSignature),
-      vrfPublicKey = ByteString.copyFrom(vrfPublicKey)
+      vrfPublicKey = ByteString.copyFrom(vrfPublicKey),
+      senderTreeStep = senderTreeStep
     )
 }

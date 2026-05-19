@@ -102,6 +102,77 @@ object KesGossipVerification {
     }
   }
 
+  /** Verify a KES signature whose tree-internal step is carried directly on the wire (Slice S3 follow-up).
+    *
+    * The sender embeds its `OperationalKeyMakerAlgebra.currentPeriod` on the proto message (e.g. `MetagraphAttestation.sender_tree_step`)
+    * so the receiver doesn't need to derive a step from chain state. This eliminates the asymmetry caused by per-operator KES activation
+    * offsets and per-peer eta-rotation views: the receiver verifies non-interactively, using only the wire bytes + the registered master
+    * VK. Same accept/reject matrix as [[verifyAttestation]] minus the chain-state-dependent step derivation:
+    *
+    *   - empty sig → reject
+    *   - decode fail → reject
+    *   - no registry entry → accept (Ed25519 already authenticated; Slice 10 mid-life join carve-out)
+    *   - registry entry + `kesStep < 0` → reject (impossible by construction; nonetheless guarded)
+    *   - registry entry + verify ok → accept
+    *   - registry entry + verify fail → reject
+    *
+    * The `kesStep` passed in is interpreted as the tree-internal step (i.e. step relative to the master VK at the operator's activation
+    * period) — exactly what `kesVk.copy(step = ...)` expects for the `SumComposition.verify` walk.
+    */
+  def verifyAttestationByStep[F[_]: Async: Metrics](
+    messageBytes: Array[Byte],
+    kesSigBytes: Array[Byte],
+    attesterId: peer.PeerId,
+    attesterHex: Hex,
+    kesStep: Int,
+    kesRegistry: KesRegistry[F],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Boolean] = {
+    val tag = "KES-MGATT"
+    if (kesSigBytes.isEmpty) {
+      Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_no_sig_total") >>
+        logger.warn(s"⚠️ $tag missing sig — rejecting step=$kesStep from=${attesterHex.value.take(16)}...").as(false)
+    } else {
+      OperationalKeyMaker.decodeSignature(kesSigBytes) match {
+        case Left(err) =>
+          Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_decode_failed_total") >>
+            logger
+              .warn(s"⚠️ $tag decode failed step=$kesStep from=${attesterHex.value.take(16)}...: ${err.message} — rejecting")
+              .as(false)
+        case Right(kSig) =>
+          kesRegistry.getKesVk(attesterId).flatMap {
+            case None =>
+              Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_no_registry_entry_total") >>
+                logger
+                  .debug(
+                    s"$tag no registry entry step=$kesStep from=${attesterHex.value.take(16)}... — accepting (Ed25519 already authenticated)"
+                  )
+                  .as(true)
+            case Some(entry) =>
+              if (kesStep < 0)
+                Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_invalid_total") >>
+                  logger
+                    .warn(s"⚠️ $tag negative step=$kesStep from=${attesterHex.value.take(16)}... — rejecting")
+                    .as(false)
+              else {
+                val vkAtStep = entry.vk.copy(step = kesStep)
+                val ok = OperationalKeyMaker.verify(kSig, messageBytes, vkAtStep)
+                if (ok)
+                  Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_verified_total") >>
+                    logger
+                      .info(s"🔐 $tag verified step=$kesStep from=${attesterHex.value.take(16)}...")
+                      .as(true)
+                else
+                  Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_invalid_total") >>
+                    logger
+                      .warn(s"⚠️ $tag invalid step=$kesStep from=${attesterHex.value.take(16)}... — rejecting")
+                      .as(false)
+              }
+          }
+      }
+    }
+  }
+
   /** Verify a KES signature attached to a snapshot. Same accept/reject semantics as [[verifyAttestation]]. */
   def verifySnapshot[F[_]: Async: Metrics](
     messageBytes: Array[Byte],

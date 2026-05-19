@@ -156,6 +156,16 @@ message MetagraphAttestation {
                                  // sender's PRIVATE key. When per-operator-key VRF keys land (#180), this field
                                  // plumbs through unchanged; the source of the VK shifts on the sender side to
                                  // the per-operator registration table.
+  uint32 sender_tree_step = 9;   // KES tree-internal step the sender used for `kes_signature`. This is the
+                                 // sender's OperationalKeyMaker.currentPeriod at sign time — i.e. the offset
+                                 // from the sender's own KES activation period, not the global eta period.
+                                 // Receiver passes this directly to `kesVk.copy(step = sender_tree_step)`
+                                 // (SumComposition tree-walk index) without any chain-state lookup. This makes
+                                 // KES verification non-interactive: the sender's evolution offset is operator-
+                                 // private; the receiver never needs to know the operator's activation period
+                                 // or eta-rotation cadence to verify. Freshness (no replay) is gated separately
+                                 // by the `parent_hash` + `binary_hash` pinning the attestation to a specific
+                                 // commitment point, plus the per-binary aggregator dedup.
 }
 
 // Envelope for GossipSub messages.

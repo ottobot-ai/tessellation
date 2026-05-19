@@ -68,7 +68,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
           committeeVrfProof: Array[Byte],
           longTermSignature: Array[Byte],
           kesSignature: Array[Byte],
-          vrfPublicKey: Array[Byte]
+          vrfPublicKey: Array[Byte],
+          kesStep: Int
         ): IO[Unit] =
           ref.update(
             StubPublished(
@@ -79,7 +80,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
               committeeVrfProof.length,
               longTermSignature.length,
               kesSignature.length,
-              vrfPublicKey.length
+              vrfPublicKey.length,
+              kesStep
             ) :: _
           )
       }
@@ -94,14 +96,18 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
     proofLen: Int,
     edSigLen: Int,
     kesSigLen: Int,
-    vrfVkLen: Int
+    vrfVkLen: Int,
+    kesStep: Int
   )
 
-  /** Stub KES signer that always returns a deterministic 8-byte placeholder. The receiver-side test stubs KES-verify directly; the
-    * sender-side test only needs `signAt` to produce non-empty bytes so the gate doesn't tag the wire field as "empty KES".
+  /** Stub KES signer that always returns a deterministic 8-byte placeholder. `currentPeriod` returns a fixed value (7) so the gate's
+    * sender path embeds a recognizable non-zero step on the wire; tests can assert against it. The receiver-side test stubs KES-verify
+    * directly; the sender-side test only needs `signAt` to produce non-empty bytes so the gate doesn't tag the wire field as "empty
+    * KES".
     */
   private val stubKesSigner: KesSigner[IO] = new KesSigner[IO] {
-    def signAt(kesPeriod: Int, message: Array[Byte]): IO[Array[Byte]] =
+    def currentPeriod: IO[Int] = IO.pure(7)
+    def signAt(kesStep: Int, message: Array[Byte]): IO[Array[Byte]] =
       IO.pure(Array.fill[Byte](8)(0x42.toByte))
   }
 
@@ -114,7 +120,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       kesSigBytes: Array[Byte],
       attesterId: PeerId,
       attesterHex: Hex,
-      kesOrdinal: Long
+      kesStep: Int
     ): IO[Boolean] = IO.pure(acceptFn(kesSigBytes))
   }
 
@@ -159,7 +165,6 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kTarget = kTarget,
         gateTimeoutMs = 500L,
         pollIntervalMs = 25L,
-        kesPeriodFor = _ => 0,
         parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       admitted <- gate.attestAndAdmit(mg, parent, binary, eta, sigmaOperatorKey = Ratio(1, 1))
@@ -174,6 +179,9 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         .and(expect(published.head.metagraphAddress == mg.value.value))
         .and(expect(published.head.kesSigLen == 8)) // stubKesSigner returns 8 bytes
         .and(expect(published.head.edSigLen > 0)) // long-term Ed25519 sig length is non-zero
+        // The sender embeds the KES tree-internal step on the wire (proto sender_tree_step).
+        // stubKesSigner.currentPeriod returns 7, so that's exactly what should land here.
+        .and(expect(published.head.kesStep == 7))
   }
 
   // ===== (b) sender-not-in-committee path is silent =====
@@ -204,7 +212,6 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kTarget = kTarget,
         gateTimeoutMs = 200L,
         pollIntervalMs = 25L,
-        kesPeriodFor = _ => 0,
         parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       // σ = 0 → not in committee
@@ -252,7 +259,6 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kTarget = kTarget,
         gateTimeoutMs = 2000L,
         pollIntervalMs = 25L,
-        kesPeriodFor = _ => 0,
         parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       // Schedule the 4th attestation to arrive after a small delay — gate must wait then admit.
@@ -295,7 +301,6 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kTarget = kTarget,
         gateTimeoutMs = 250L,
         pollIntervalMs = 25L,
-        kesPeriodFor = _ => 0,
         parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       // σ=0 so sender skips; no other arrivals → timeout
@@ -339,7 +344,6 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kTarget = kTarget,
         gateTimeoutMs = 200L,
         pollIntervalMs = 25L,
-        kesPeriodFor = _ => 0,
         parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       // Build a fake-but-structurally-valid incoming attestation. The long-term Ed25519 sig
@@ -355,7 +359,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         binaryHash = binary,
         committeeVrfProof = Array.fill[Byte](64)(0xbb.toByte),
         longTermSignature = edSig,
-        kesSignature = Array.fill[Byte](8)(0xcc.toByte) // present but verifier rejects
+        kesSignature = Array.fill[Byte](8)(0xcc.toByte), // present but verifier rejects
+        senderTreeStep = 0
       )
       _ <- gate.recordReceivedAttestation(incoming, eta, _ => IO.pure(Ratio(1, 8)))
       count <- agg.countFor(mg, parent, binary)
@@ -394,7 +399,6 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kTarget = kTarget,
         gateTimeoutMs = 200L,
         pollIntervalMs = 25L,
-        kesPeriodFor = _ => 0,
         parentOrdinalFor = (_, _) => IO.pure(Option.empty[Long]) // <-- fail-closed
       )
       // Sender path — even though σ=1 makes us in-committee, the unresolved parent ordinal makes
@@ -415,7 +419,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         binaryHash = binary,
         committeeVrfProof = Array.fill[Byte](64)(0xbb.toByte),
         longTermSignature = edSig,
-        kesSignature = Array.fill[Byte](8)(0xcc.toByte)
+        kesSignature = Array.fill[Byte](8)(0xcc.toByte),
+        senderTreeStep = 0
       )
       _ <- gate.recordReceivedAttestation(incoming, eta, _ => IO.pure(Ratio(1, 1)))
       countAfterReceiver <- agg.countFor(mg, parent, binary)
@@ -465,7 +470,6 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kTarget = kTarget,
         gateTimeoutMs = 200L,
         pollIntervalMs = 25L,
-        kesPeriodFor = _ => 0,
         parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       incoming = IncomingAttestation(
@@ -476,7 +480,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         binaryHash = binary,
         committeeVrfProof = proof,
         longTermSignature = edSig,
-        kesSignature = Array.fill[Byte](8)(0xff.toByte) // non-empty → stub verifier accepts
+        kesSignature = Array.fill[Byte](8)(0xff.toByte), // non-empty → stub verifier accepts
+        senderTreeStep = 0
       )
       _ <- gate.recordReceivedAttestation(incoming, eta, _ => IO.pure(Ratio(1, 1)))
       count <- agg.countFor(mg, parent, binary)
@@ -509,7 +514,6 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kTarget = 100,
         gateTimeoutMs = 100L,
         pollIntervalMs = 25L,
-        kesPeriodFor = _ => 0,
         parentOrdinalFor = (_, _) => IO.pure(Some(0L))
       )
       before <- agg.countFor(mg, parent, binary)
