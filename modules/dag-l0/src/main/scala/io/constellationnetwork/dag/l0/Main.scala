@@ -92,11 +92,21 @@ object Main
       // exposing /global-snapshots/latest/finalized-ordinal so CL0 can gate state-channel
       // -binary pruning on actual finality. Stays at 0 in BFT mode (HttpApi only consults
       // it when nakamoto mode is on).
-      // Seed with 1 (genesis ordinal) so the genesis snapshot is always servable
-      // on finality-gated endpoints. Updated by SnapshotLeaderLoop as finality advances.
+      //
+      // Seed with MinValue (= ord 0, pre-genesis sentinel) so finality-gated endpoints
+      // return NotFound until the leader loop actually finalizes the first ord. Previous
+      // seed of MinIncrementalValue (= ord 1) was the root of #215: it claimed ord=1
+      // was finalized before any attestation ran, so /latest/combined/stream served
+      // whatever ord=1 the local peer happened to hold — which under 8gl0 fork races was
+      // a transient hash later reorged away. ml0 bootstrapped against that dead hash, and
+      // every CL0 binary it built referenced a `globalSyncView` gl0 ord=1 hash that no
+      // longer matched canonical → `Forced globalSyncView hash mismatch` at GSAM →
+      // metagraph chain stuck at genesis. By seeding MinValue we make ml0 wait for the
+      // first ACTUAL finality before bootstrapping; once SnapshotLeaderLoop advances
+      // the ref past MinValue, ml0 picks up the canonical finalized snapshot.
       // Constructed BEFORE Storages so SnapshotStorage.setHeadForRecovery can enforce
       // the finality-safety guard (refuses different-hash overwrites at-or-below finalized).
-      nakamotoFinalizedOrdinalRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinIncrementalValue).asResource
+      nakamotoFinalizedOrdinalRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue).asResource
       // Chain-quality observable seam (#138). Set by SnapshotLeaderLoop after trigger
       // construction; read by the new /global-snapshots/{ord}/finality-triggers HTTP
       // route. Lives at the same lifetime as nakamotoFinalizedOrdinalRef — created here
