@@ -46,7 +46,7 @@ object LevelTrialComputerSuite extends MutableIOSuite {
     val t1 = LevelTrialComputer.tauForLevel(rho, 1)
     val t2 = LevelTrialComputer.tauForLevel(rho, 2)
     val t3 = LevelTrialComputer.tauForLevel(rho, 3)
-    IO.pure(expect(t1 != t2) and expect(t2 != t3) and expect(t1 != t3))
+    IO.pure(expect(t1 != t2).and(expect(t2 != t3)).and(expect(t1 != t3)))
   }
 
   test("tauForLevel — different ρ → different τ at same µ") { _ =>
@@ -57,13 +57,12 @@ object LevelTrialComputerSuite extends MutableIOSuite {
 
   test("tauForLevel — τ ∈ [0, 1)") { _ =>
     val t = LevelTrialComputer.tauForLevel(rho, 5)
-    IO.pure(expect(t >= Ratio.Zero) and expect(t < Ratio.One))
+    IO.pure(expect(t >= Ratio.Zero).and(expect(t < Ratio.One)))
   }
 
   test("gating — δ_S ≤ 0 → 0") { computer =>
     IO.pure(
-      expect(computer.gating(0L, gamma) == Ratio.Zero) and
-        expect(computer.gating(-5L, gamma) == Ratio.Zero)
+      expect(computer.gating(0L, gamma) == Ratio.Zero).and(expect(computer.gating(-5L, gamma) == Ratio.Zero))
     )
   }
 
@@ -96,7 +95,7 @@ object LevelTrialComputerSuite extends MutableIOSuite {
     // saturation assertion — the convergence is asymptotic and not exact at finite g_µ).
     val params = SuperLevelParams.at(1).get
     computer.thresholdMu(10L, params).map { r =>
-      expect(r > Ratio.Zero) and expect(r <= params.pMax)
+      expect(r > Ratio.Zero).and(expect(r <= params.pMax))
     }
   }
 
@@ -128,8 +127,7 @@ object LevelTrialComputerSuite extends MutableIOSuite {
   test("runAll — returns SuperLevelCount trials, levels 1..L-1 in order") { computer =>
     val gaps = Vector.fill(SuperLevelParams.SuperLevelCount)(5L)
     computer.runAll(rho, gaps, deltaSlot = 7L, gamma = gamma).map { trials =>
-      expect(trials.size == SuperLevelParams.SuperLevelCount) and
-        expect(trials.zipWithIndex.forall { case (t, i) => t.level == i + 1 })
+      expect(trials.size == SuperLevelParams.SuperLevelCount).and(expect(trials.zipWithIndex.forall { case (t, i) => t.level == i + 1 }))
     }
   }
 
@@ -148,7 +146,7 @@ object LevelTrialComputerSuite extends MutableIOSuite {
     val gaps = Vector.fill(SuperLevelParams.SuperLevelCount)(10L)
     val rhos = (0 until 30).map { i =>
       val a = new Array[Byte](64)
-      val seed = (i * 0x9E3779B97F4A7C15L)
+      val seed = i * 0x9e3779b97f4a7c15L
       java.nio.ByteBuffer.wrap(a).putLong(0, seed).putLong(8, ~seed).putLong(16, seed >>> 1).putLong(24, ~(seed >>> 1))
       a
     }
