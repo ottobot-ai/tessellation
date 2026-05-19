@@ -866,6 +866,30 @@ object GlobalSnapshotConsensus {
               s"🏛️ Committee gate constructed: kTarget=$committeeKTarget, validatorPeers=${validatorPeers.size}, K=N (sortition no-op until K_TARGET < N)"
             )
             .toResource
+          // #214: orphan buffer + admission cache. Hoisted from `NakamotoSyncDaemon.run` so the
+          // SnapshotLeaderLoop.onFinalize drain hook below and the daemon's gossip handler share
+          // the same in-memory instance. The orphan-drain on finalize unsticks chains where the
+          // local committee gate dropped a binary that nevertheless reached cluster finalization
+          // via 2/3-attestation or depth-k.
+          orphanBufferLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger
+            .fromName[F]("MetagraphOrphanBuffer")
+            .toResource
+          orphanBuffer <- io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer
+            .make[F](orphanBufferLogger)
+            .toResource
+          // Gate-aware closure for processing a `(metagraphAddress, wireBytes)` pair. Built once
+          // here so both call sites (daemon gossip handler and finalize-drain hook) share the
+          // same orphan buffer + admission cache. See `NakamotoSyncDaemon.makeMetagraphBinaryProcessor`.
+          processOrphanedMetagraphBinary = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon
+            .makeMetagraphBinaryProcessor[F](
+              processMetagraphBinary = processMetagraphBinary,
+              committeeGate = committeeGate,
+              parentOrdinalFor = committeeParentOrdinalFor,
+              etaForParentOrdinal = committeeEtaForOrdinal,
+              selfStake = stakeRegistry.committeeStake(selfId),
+              orphanBuffer = orphanBuffer,
+              logger = orphanBufferLogger
+            )
           _ <- supervisor
             .supervise(
               io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
@@ -900,11 +924,41 @@ object GlobalSnapshotConsensus {
                   operationalKeyMaker = operationalKeyMaker,
                   // Slice S3: drop aggregator entries for `(mg, parent)` pairs in the finalized
                   // snapshot's `stateChannelSnapshots`. Otherwise the tally grows monotonically.
+                  //
+                  // #214 piggyback: drain any orphan-buffered children waiting on each binary's
+                  // value-hash. Cluster-wide finalization (2/3 peer attestation OR depth-k) is
+                  // authoritative; if the local gate dropped the parent at `count < kTarget`,
+                  // the just-finalized snapshot proves the cluster admitted it anyway. Re-feed
+                  // each drained child through the SAME gate-aware processor used for fresh
+                  // gossip — `processOrphanedMetagraphBinary` — NOT direct `processMetagraphBinary`.
+                  // The earlier attempt (ad7d4f041, reverted in fea66fc7d) bypassed the gate and
+                  // polluted the state-channel queue with locally-unverified binaries.
+                  //
+                  // After finalize gl0's GSI contains the just-finalized binary's value-hash, so
+                  // `resolveParent` inside the processor will resolve via `parentOrdinalFor` and
+                  // the child enters `attestAndAdmit` normally — accumulating peer attestations
+                  // already arrived during the GSI-lag window, plus the local self-attestation.
+                  // Background-fire (`Async.start`) so the 30s gate timeout doesn't block the
+                  // SnapshotLeaderLoop's finalize sink.
                   onFinalize = (snap: io.constellationnetwork.schema.GlobalIncrementalSnapshot) =>
                     snap.stateChannelSnapshots.toList.traverse_ {
                       case (mgAddr, binaries) =>
                         val parents = binaries.toList.map(_.value.lastSnapshotHash).toSet
-                        committeeGate.pruneParents(mgAddr, parents)
+                        committeeGate.pruneParents(mgAddr, parents) >>
+                          HasherSelector[F].withCurrent { implicit hasher =>
+                            // Drain children for EVERY binary in the batch, not just `.last`. gl0's
+                            // canonical chain-link tip is the last binary's value-hash, but ml0 may
+                            // have produced children chained off intermediate binaries before learning
+                            // of the more recent ones (network races / split-view at production time).
+                            // Each `drainChildren` call is O(1) hashmap lookup — cheap to fan-wide.
+                            binaries.toList.traverse_ { binary =>
+                              binary.toHashed.flatMap { hashed =>
+                                orphanBuffer.drainChildren(mgAddr, hashed.hash).flatMap { drained =>
+                                  drained.traverse_(child => Async[F].start(processOrphanedMetagraphBinary(mgAddr, child)).void)
+                                }
+                              }
+                            }
+                          }
                     }
                 )
                 .compile
@@ -1035,7 +1089,6 @@ object GlobalSnapshotConsensus {
                   mptOverlay = mptOverlay,
                   eventMempool = eventMempool,
                   dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data")),
-                  processMetagraphBinary = processMetagraphBinary,
                   enqueueAllowSpendBlock = enqueueAllowSpendBlock,
                   enqueueDAGBlock = enqueueDAGBlock,
                   enqueueTokenLockBlock = enqueueTokenLockBlock,
@@ -1051,7 +1104,8 @@ object GlobalSnapshotConsensus {
                   committeeGate = committeeGate,
                   parentOrdinalFor = committeeParentOrdinalFor,
                   etaForParentOrdinal = committeeEtaForOrdinal,
-                  senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.committeeStake(peer)
+                  senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.committeeStake(peer),
+                  processOrphanedMetagraphBinary = processOrphanedMetagraphBinary
                 )
                 .compile
                 .drain

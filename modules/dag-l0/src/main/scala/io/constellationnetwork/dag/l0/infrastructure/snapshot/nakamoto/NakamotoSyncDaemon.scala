@@ -225,7 +225,6 @@ object NakamotoSyncDaemon {
     mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     dataDir: java.nio.file.Path,
-    processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
     // (#196) Sink for inbound AllowSpendBlock gossip — same queue
     // GlobalSnapshotEventsPublisherDaemon drains into the event mempool.
     // Replaces the HTTP POST path from AllowSpendBlockRoutes (which was
@@ -283,7 +282,16 @@ object NakamotoSyncDaemon {
     // Receiver-side σ lookup. The committee VRF threshold is `K · σ_sender`, so the verifier
     // needs the SENDER's stake, not ours. Passed as a callback to keep the daemon agnostic of
     // the StakeRegistry's flavor.
-    senderStakeLookup: io.constellationnetwork.schema.peer.PeerId => F[io.constellationnetwork.numerics.Ratio]
+    senderStakeLookup: io.constellationnetwork.schema.peer.PeerId => F[io.constellationnetwork.numerics.Ratio],
+    // #214: pre-built gate-aware closure that processes a single `(metagraphAddress, wireBytes)`
+    // pair through the same committee gate + orphan buffer path. Constructed in
+    // `GlobalSnapshotConsensus.make` via `makeMetagraphBinaryProcessor`, so the SAME instance is
+    // shared with the `SnapshotLeaderLoop.onFinalize` orphan-drain hook. The shared instance is
+    // what makes the drain work: both sites must address the same in-memory orphan buffer.
+    processOrphanedMetagraphBinary: (
+      io.constellationnetwork.schema.address.Address,
+      Array[Byte]
+    ) => F[Unit]
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -296,41 +304,126 @@ object NakamotoSyncDaemon {
     // When a snapshot is stored in the chain store, we check this buffer and validate any
     // snapshots that were waiting for it. This creates a validation cascade from genesis.
     fs2.Stream.eval(Ref.of[F, Map[Hash, List[pb.Snapshot]]](Map.empty)).flatMap { pendingParentRef =>
-      // Parallel buffer for metagraph state-channel binaries whose `lastSnapshotHash` (parent) the gl0 GSI hasn't recorded yet (#213).
-      // At 4-mg+committee-gate scale, ml0 outpaces gl0 — by the time gl0 finalizes a metagraph's genesis binary, ml0 has produced
-      // several more incremental binaries chained off the first. Without buffering, the first incremental never matches gl0's stored
-      // tip → all subsequent binaries cascade-reject → metagraph chain permanently stuck from gl0's view. Buffer + drain-on-accept
-      // unwinds the gap.
-      fs2.Stream
-        .eval(io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer.make[F](logger))
-        .flatMap { orphanBuffer =>
-          fs2.Stream.eval(Ref.of[F, SyncState](SyncState.initial)).flatMap { stateRef =>
-            // ChainSyncManager for active parent fetching. Uses a Ref to break the
-            // circular dependency: handleSnapshot needs chainSyncManager, but
-            // chainSyncManager's callback needs handleSnapshot.
-            fs2.Stream
-              .eval(
-                Ref.of[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]](None).flatMap { csRef =>
-                  ChainSyncManager
-                    .make[F](
-                      channel,
-                      { resp: io.constellationnetwork.node.shared.domain.nakamoto.chainsync.ChainSyncStateResponse[pb.Snapshot] =>
-                        // #56.8: ADT pattern-match on the chain-sync disposition. Today's `handleSnapshot`
-                        // pipeline doesn't yet differentiate finalized vs provisional — both are validated
-                        // and stored identically. The structural distinction lands here so #56.10's
-                        // overlay-aware accept() can route Provisional fetches to overlay-local commits
-                        // (matching codex's NakamotoSyncDaemon catch in plan rev4 phase E) and Finalized
-                        // fetches straight to base. NotFound logs and unwinds the inflight tracker.
-                        import io.constellationnetwork.node.shared.domain.nakamoto.chainsync.ChainSyncStateResponse
-                        val fetchedSnap: Option[pb.Snapshot] = resp match {
-                          case ChainSyncStateResponse.Finalized(snap)      => Some(snap)
-                          case ChainSyncStateResponse.Provisional(snap, _) => Some(snap)
-                          case ChainSyncStateResponse.NotFound(_)          => None
+      // Metagraph state-channel binary orphan buffer (#213) is now constructed by the caller
+      // (GlobalSnapshotConsensus.make, #214) and threaded into this daemon as
+      // `processOrphanedMetagraphBinary`. The caller shares the same buffer instance with the
+      // SnapshotLeaderLoop.onFinalize drain hook so finalized-parent children re-enter through
+      // the same gate-aware path used here.
+      fs2.Stream.eval(Ref.of[F, SyncState](SyncState.initial)).flatMap { stateRef =>
+        // ChainSyncManager for active parent fetching. Uses a Ref to break the
+        // circular dependency: handleSnapshot needs chainSyncManager, but
+        // chainSyncManager's callback needs handleSnapshot.
+        fs2.Stream
+          .eval(
+            Ref.of[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]](None).flatMap { csRef =>
+              ChainSyncManager
+                .make[F](
+                  channel,
+                  { resp: io.constellationnetwork.node.shared.domain.nakamoto.chainsync.ChainSyncStateResponse[pb.Snapshot] =>
+                    // #56.8: ADT pattern-match on the chain-sync disposition. Today's `handleSnapshot`
+                    // pipeline doesn't yet differentiate finalized vs provisional — both are validated
+                    // and stored identically. The structural distinction lands here so #56.10's
+                    // overlay-aware accept() can route Provisional fetches to overlay-local commits
+                    // (matching codex's NakamotoSyncDaemon catch in plan rev4 phase E) and Finalized
+                    // fetches straight to base. NotFound logs and unwinds the inflight tracker.
+                    import io.constellationnetwork.node.shared.domain.nakamoto.chainsync.ChainSyncStateResponse
+                    val fetchedSnap: Option[pb.Snapshot] = resp match {
+                      case ChainSyncStateResponse.Finalized(snap)      => Some(snap)
+                      case ChainSyncStateResponse.Provisional(snap, _) => Some(snap)
+                      case ChainSyncStateResponse.NotFound(_)          => None
+                    }
+                    fetchedSnap match {
+                      case Some(snap) =>
+                        csRef.get.flatMap {
+                          case Some(csm) =>
+                            snapshotSemaphore.permit.use { _ =>
+                              handleSnapshot(
+                                snap,
+                                stateRef,
+                                pendingParentRef,
+                                chainStore,
+                                nodeStorage,
+                                tipTracker,
+                                stakeRegistry,
+                                sidecarClient,
+                                selfId,
+                                keyPair,
+                                lddConfig,
+                                eligibilityChecker,
+                                lastKnownSlotRef,
+                                epochStateRef,
+                                etaRotationSnapshots,
+                                consensusFns,
+                                snapshotStorage,
+                                lastGlobalSnapshotStorage,
+                                lastNGlobalSnapshotStorage,
+                                productionGate,
+                                mptStore,
+                                mptOverlay,
+                                eventMempool,
+                                csm,
+                                channel,
+                                dataDir,
+                                operationalKeyMaker,
+                                kesRegistry,
+                                logger
+                              )
+                            }
+                          case None => Async[F].unit
                         }
-                        fetchedSnap match {
-                          case Some(snap) =>
-                            csRef.get.flatMap {
-                              case Some(csm) =>
+                      case None =>
+                        // NotFound — peer doesn't have the requested hash. Inflight tracking is
+                        // unwound by ChainSyncManager's `guaranteeCase`; nothing further to do here.
+                        Async[F].unit
+                    }
+                  }
+                )
+                .flatMap(csm => csRef.set(Some(csm)) >> sharedChainSyncManagerRef.set(Some(csm)).as(csm))
+            }
+          )
+          .flatMap { chainSyncManager =>
+            // Gossip stream with two-layer reconnection:
+            //
+            // Layer 1 (sidecar-triggered): When the sidecar's mesh health monitor
+            //   recovers from degradation, it closes the gRPC Subscribe stream.
+            //   handleErrorWith catches the error and re-subscribes.
+            //
+            // Layer 2 (idle watchdog): If the gRPC connection dies silently (e.g.,
+            //   Docker network disconnect — gRPC Java doesn't propagate channel
+            //   failures to blocking server-stream reads), the stream hangs forever.
+            //   A concurrent watchdog checks the last-received timestamp every 30s
+            //   and raises an error after 120s of idle. In normal operation (messages
+            //   every ~10s), the watchdog never fires.
+            //
+            // Shared state (pendingParentRef, stateRef, chainSyncManager) survives.
+            def gossipStream: fs2.Stream[F, Unit] =
+              fs2.Stream
+                .eval(Ref.of[F, Long](System.currentTimeMillis()))
+                .flatMap { lastMsgRef =>
+                  val watchdog = fs2.Stream.fixedRate[F](30.seconds).evalMap { _ =>
+                    Async[F].delay(System.currentTimeMillis()).flatMap { now =>
+                      lastMsgRef.get.flatMap { lastMsg =>
+                        val idleMs = now - lastMsg
+                        if (idleMs > 120000L)
+                          logger.warn(s"Gossip stream idle for ${idleMs / 1000}s, forcing reconnect") >>
+                            Async[F].raiseError[Unit](new RuntimeException(s"Gossip idle timeout (${idleMs / 1000}s)"))
+                        else
+                          Async[F].unit
+                      }
+                    }
+                  }
+
+                  val gossip = GossipStream
+                    .subscribe[F](channel)
+                    .evalMap { msg =>
+                      lastMsgRef.set(System.currentTimeMillis()) >>
+                        (msg.body match {
+                          case pb.GossipMessage.Body.Snapshot(snap) =>
+                            val incomingOrdinal = snap.ordinal
+                            chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
+                              val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
+                              (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
+                               else Async[F].unit) >>
                                 snapshotSemaphore.permit.use { _ =>
                                   handleSnapshot(
                                     snap,
@@ -356,185 +449,87 @@ object NakamotoSyncDaemon {
                                     mptStore,
                                     mptOverlay,
                                     eventMempool,
-                                    csm,
+                                    chainSyncManager,
                                     channel,
                                     dataDir,
                                     operationalKeyMaker,
                                     kesRegistry,
                                     logger
                                   )
-                                }
-                              case None => Async[F].unit
+                                } >>
+                                productionGate.resume(ProductionGate.BetterGossipReceived)
                             }
-                          case None =>
-                            // NotFound — peer doesn't have the requested hash. Inflight tracking is
-                            // unwound by ChainSyncManager's `guaranteeCase`; nothing further to do here.
+
+                          case pb.GossipMessage.Body.Attestation(att) =>
+                            handleAttestation(att, tipTracker, kesRegistry, etaRotationSnapshots, logger)
+
+                          case pb.GossipMessage.Body.MetagraphBinary(mb) =>
+                            // Background-fire: the gate's `attestAndAdmit` blocks up to gateTimeoutMs
+                            // (30s default) waiting for ⌈2K/3⌉ committee attestations. Running it on
+                            // the gossip stream's `evalMap` thread serializes EVERY message behind
+                            // every pending gate — gl0 TipAttestations from peers then arrive past
+                            // `TipTracker.MaxAttestationSkewMs` and get rejected (skew=200+s observed
+                            // in iter-s3prep-baseline). Gate work is naturally concurrent-safe: the
+                            // aggregator is a `Ref[F, ...]`, `processMetagraphBinary` writes to a
+                            // queue, and per-binary state is keyed by (mgAddr, parentHash, binaryHash).
+                            Async[F]
+                              .start(
+                                handleMetagraphBinary(mb, processOrphanedMetagraphBinary, logger)
+                              )
+                              .void
+
+                          case pb.GossipMessage.Body.MetagraphAttestation(att) =>
+                            // Background-fire: VRF verify + KES verify + Ed25519 verify add up to
+                            // tens of ms per attestation. In bursts (each peer attests each binary),
+                            // this would queue up behind the stream's serial evalMap. Aggregator
+                            // record is concurrent-safe.
+                            Async[F]
+                              .start(
+                                handleMetagraphAttestation(
+                                  att,
+                                  committeeGate,
+                                  parentOrdinalFor,
+                                  etaForParentOrdinal,
+                                  senderStakeLookup,
+                                  logger
+                                )
+                              )
+                              .void
+
+                          case pb.GossipMessage.Body.AllowSpendBlock(asb) =>
+                            handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)
+
+                          case pb.GossipMessage.Body.DagBlock(blk) =>
+                            handleDAGBlock(blk, enqueueDAGBlock, logger)
+
+                          case pb.GossipMessage.Body.TokenLockBlock(blk) =>
+                            handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)
+
+                          case _: pb.GossipMessage.Body.Rumor =>
                             Async[F].unit
-                        }
-                      }
-                    )
-                    .flatMap(csm => csRef.set(Some(csm)) >> sharedChainSyncManagerRef.set(Some(csm)).as(csm))
-                }
-              )
-              .flatMap { chainSyncManager =>
-                // Gossip stream with two-layer reconnection:
-                //
-                // Layer 1 (sidecar-triggered): When the sidecar's mesh health monitor
-                //   recovers from degradation, it closes the gRPC Subscribe stream.
-                //   handleErrorWith catches the error and re-subscribes.
-                //
-                // Layer 2 (idle watchdog): If the gRPC connection dies silently (e.g.,
-                //   Docker network disconnect — gRPC Java doesn't propagate channel
-                //   failures to blocking server-stream reads), the stream hangs forever.
-                //   A concurrent watchdog checks the last-received timestamp every 30s
-                //   and raises an error after 120s of idle. In normal operation (messages
-                //   every ~10s), the watchdog never fires.
-                //
-                // Shared state (pendingParentRef, stateRef, chainSyncManager) survives.
-                def gossipStream: fs2.Stream[F, Unit] =
-                  fs2.Stream
-                    .eval(Ref.of[F, Long](System.currentTimeMillis()))
-                    .flatMap { lastMsgRef =>
-                      val watchdog = fs2.Stream.fixedRate[F](30.seconds).evalMap { _ =>
-                        Async[F].delay(System.currentTimeMillis()).flatMap { now =>
-                          lastMsgRef.get.flatMap { lastMsg =>
-                            val idleMs = now - lastMsg
-                            if (idleMs > 120000L)
-                              logger.warn(s"Gossip stream idle for ${idleMs / 1000}s, forcing reconnect") >>
-                                Async[F].raiseError[Unit](new RuntimeException(s"Gossip idle timeout (${idleMs / 1000}s)"))
-                            else
-                              Async[F].unit
-                          }
-                        }
-                      }
 
-                      val gossip = GossipStream
-                        .subscribe[F](channel)
-                        .evalMap { msg =>
-                          lastMsgRef.set(System.currentTimeMillis()) >>
-                            (msg.body match {
-                              case pb.GossipMessage.Body.Snapshot(snap) =>
-                                val incomingOrdinal = snap.ordinal
-                                chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
-                                  val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
-                                  (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
-                                   else Async[F].unit) >>
-                                    snapshotSemaphore.permit.use { _ =>
-                                      handleSnapshot(
-                                        snap,
-                                        stateRef,
-                                        pendingParentRef,
-                                        chainStore,
-                                        nodeStorage,
-                                        tipTracker,
-                                        stakeRegistry,
-                                        sidecarClient,
-                                        selfId,
-                                        keyPair,
-                                        lddConfig,
-                                        eligibilityChecker,
-                                        lastKnownSlotRef,
-                                        epochStateRef,
-                                        etaRotationSnapshots,
-                                        consensusFns,
-                                        snapshotStorage,
-                                        lastGlobalSnapshotStorage,
-                                        lastNGlobalSnapshotStorage,
-                                        productionGate,
-                                        mptStore,
-                                        mptOverlay,
-                                        eventMempool,
-                                        chainSyncManager,
-                                        channel,
-                                        dataDir,
-                                        operationalKeyMaker,
-                                        kesRegistry,
-                                        logger
-                                      )
-                                    } >>
-                                    productionGate.resume(ProductionGate.BetterGossipReceived)
-                                }
-
-                              case pb.GossipMessage.Body.Attestation(att) =>
-                                handleAttestation(att, tipTracker, kesRegistry, etaRotationSnapshots, logger)
-
-                              case pb.GossipMessage.Body.MetagraphBinary(mb) =>
-                                // Background-fire: the gate's `attestAndAdmit` blocks up to gateTimeoutMs
-                                // (30s default) waiting for ⌈2K/3⌉ committee attestations. Running it on
-                                // the gossip stream's `evalMap` thread serializes EVERY message behind
-                                // every pending gate — gl0 TipAttestations from peers then arrive past
-                                // `TipTracker.MaxAttestationSkewMs` and get rejected (skew=200+s observed
-                                // in iter-s3prep-baseline). Gate work is naturally concurrent-safe: the
-                                // aggregator is a `Ref[F, ...]`, `processMetagraphBinary` writes to a
-                                // queue, and per-binary state is keyed by (mgAddr, parentHash, binaryHash).
-                                Async[F]
-                                  .start(
-                                    handleMetagraphBinary(
-                                      mb,
-                                      processMetagraphBinary,
-                                      committeeGate,
-                                      parentOrdinalFor,
-                                      etaForParentOrdinal,
-                                      stakeRegistry.committeeStake(selfId),
-                                      orphanBuffer,
-                                      logger
-                                    )
-                                  )
-                                  .void
-
-                              case pb.GossipMessage.Body.MetagraphAttestation(att) =>
-                                // Background-fire: VRF verify + KES verify + Ed25519 verify add up to
-                                // tens of ms per attestation. In bursts (each peer attests each binary),
-                                // this would queue up behind the stream's serial evalMap. Aggregator
-                                // record is concurrent-safe.
-                                Async[F]
-                                  .start(
-                                    handleMetagraphAttestation(
-                                      att,
-                                      committeeGate,
-                                      parentOrdinalFor,
-                                      etaForParentOrdinal,
-                                      senderStakeLookup,
-                                      logger
-                                    )
-                                  )
-                                  .void
-
-                              case pb.GossipMessage.Body.AllowSpendBlock(asb) =>
-                                handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)
-
-                              case pb.GossipMessage.Body.DagBlock(blk) =>
-                                handleDAGBlock(blk, enqueueDAGBlock, logger)
-
-                              case pb.GossipMessage.Body.TokenLockBlock(blk) =>
-                                handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)
-
-                              case _: pb.GossipMessage.Body.Rumor =>
-                                Async[F].unit
-
-                              case pb.GossipMessage.Body.Empty =>
-                                Async[F].unit
-                            })
-                        }
-
-                      gossip.concurrently(watchdog)
+                          case pb.GossipMessage.Body.Empty =>
+                            Async[F].unit
+                        })
                     }
-                    .handleErrorWith { e =>
-                      fs2.Stream.eval(
-                        logger.warn(s"Gossip stream error: ${e.getMessage}. Reconnecting in 5s...")
-                      ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
-                    } ++ fs2.Stream.eval(
-                    // Normal termination: gRPC StreamObserver.onError puts None in the
-                    // queue, causing fromQueueNoneTerminated to end the stream normally
-                    // (not as an error). This happens when the sidecar connection dies
-                    // during a partition. Restart after a short delay.
-                    logger.warn("Gossip stream terminated (sidecar connection lost). Reconnecting in 5s...")
-                  ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
 
-                gossipStream
-              }
+                  gossip.concurrently(watchdog)
+                }
+                .handleErrorWith { e =>
+                  fs2.Stream.eval(
+                    logger.warn(s"Gossip stream error: ${e.getMessage}. Reconnecting in 5s...")
+                  ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
+                } ++ fs2.Stream.eval(
+                // Normal termination: gRPC StreamObserver.onError puts None in the
+                // queue, causing fromQueueNoneTerminated to end the stream normally
+                // (not as an error). This happens when the sidecar connection dies
+                // during a partition. Restart after a short delay.
+                logger.warn("Gossip stream terminated (sidecar connection lost). Reconnecting in 5s...")
+              ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
+
+            gossipStream
           }
-        }
+      }
     }
   }
 
@@ -1546,8 +1541,23 @@ object NakamotoSyncDaemon {
     * skipped the local HTTP gate at gl0-A will still be gated at every other gl0 when it arrives via gossip. The cluster-wide safety
     * property holds against an adversarial submission at a single gl0.
     */
-  private def handleMetagraphBinary[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector](
-    mb: pb.MetagraphBinary,
+  /** Build the gate-aware metagraph-binary processor: a closure that takes `(metagraphAddress, wireBytes)` and runs the binary through the
+    * committee gate (#192 Slice S3), processing it on admit and orphan-buffering it on parent-not-yet-resolved (#213). The same closure is
+    * invoked from both call sites that need this path:
+    *
+    *   - `handleMetagraphBinary` (the daemon's gossip handler) — for fresh `pb.MetagraphBinary` arrivals on the wire.
+    *   - `SnapshotLeaderLoop.onFinalize` (via `GlobalSnapshotConsensus.make`) — for orphan-drain on gl0 snapshot finalize (#214). When gl0
+    *     finalizes a global snapshot containing a metagraph binary that some peers' local gates dropped, those local nodes' orphan-buffered
+    *     children of the just-finalized binary become resolvable (the parent's value-hash now lives in gl0's GSI). Re-feeding them through
+    *     THIS gate-aware processor — not direct `processMetagraphBinary` — is the load-bearing safety property: the local gate still
+    *     attests and the child gets cluster-confirmed normally. The earlier attempt (reverted, ad7d4f041 → fea66fc7d) bypassed the gate and
+    *     polluted the state-channel queue.
+    *
+    * '''Why a factory.''' Both call sites need the same closure, and the closure recursively re-enters itself when draining children of a
+    * just-admitted parent. Defining the closure top-level (rather than nested inside `handleMetagraphBinary`) lets the finalize-hook
+    * callable share the exact same shape — same orphan buffer, same admission cache, same recursive drain.
+    */
+  def makeMetagraphBinaryProcessor[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector](
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
     committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
     parentOrdinalFor: (
@@ -1558,11 +1568,10 @@ object NakamotoSyncDaemon {
     selfStake: F[io.constellationnetwork.numerics.Ratio],
     orphanBuffer: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer[F],
     logger: org.typelevel.log4cats.Logger[F]
-  ): F[Unit] = {
-    import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
+  ): (io.constellationnetwork.schema.address.Address, Array[Byte]) => F[Unit] = {
+    import io.constellationnetwork.schema.address.Address
     import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelSnapshotBinary}
     import io.constellationnetwork.security.signature.Signed
-    import eu.timepit.refined.refineV
 
     // Resolver wrapper that bridges gl0's GSI lag. After we admit a binary X via the committee gate,
     // X is enqueued for processing but won't land in gl0's `lastStateChannelSnapshotHashes` until the
@@ -1575,10 +1584,10 @@ object NakamotoSyncDaemon {
         case None        => parentOrdinalFor(address, parentHash)
       }
 
-    // Local recursive helper. After a binary is admitted, drain any orphans whose parent equals
-    // the just-accepted binary's *value*-hash (`signed.value.hash`) — same hash gl0's GSAM writes
-    // into `lastStateChannelSnapshotHashes`. Each drained child runs through the same path, which
-    // may itself unblock further descendants, so the chain unwinds in order. #213.
+    // After a binary is admitted, drain any orphans whose parent equals the just-accepted binary's
+    // *value*-hash (`signed.value.hash`) — same hash gl0's GSAM writes into `lastStateChannelSnapshotHashes`.
+    // Each drained child runs through the same path, which may itself unblock further descendants, so
+    // the chain unwinds in order. #213.
     def processBytes(address: Address, bytes: Array[Byte]): F[Unit] =
       io.constellationnetwork.json
         .JsonSerializer[F]
@@ -1644,13 +1653,24 @@ object NakamotoSyncDaemon {
             }
         }
 
+    processBytes
+  }
+
+  private def handleMetagraphBinary[F[_]](
+    mb: pb.MetagraphBinary,
+    processOrphanedBinary: (io.constellationnetwork.schema.address.Address, Array[Byte]) => F[Unit],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] = {
+    import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
+    import eu.timepit.refined.refineV
+
     refineV[DAGAddressRefined](mb.address) match {
       case Left(err) =>
         logger.warn(s"⚠️ Rejecting metagraph-binary gossip: invalid address '${mb.address}' ($err)")
       case Right(refined) =>
         val address = Address(refined)
         val bytes = mb.binary.toByteArray
-        processBytes(address, bytes)
+        processOrphanedBinary(address, bytes)
     }
   }
 
