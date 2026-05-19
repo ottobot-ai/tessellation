@@ -866,6 +866,16 @@ object GlobalSnapshotConsensus {
               s"🏛️ Committee gate constructed: kTarget=$committeeKTarget, validatorPeers=${validatorPeers.size}, K=N (sortition no-op until K_TARGET < N)"
             )
             .toResource
+          // #214: orphan buffer + admission cache. Hoisted from NakamotoSyncDaemon.run to this scope so the
+          // on-finalize drain hook in `SnapshotLeaderLoop.onFinalize` can use the same instance the gossip
+          // handler uses. The finalize-side drain unsticks chains where the local committee gate dropped
+          // the first incremental binary (cluster-wide finalization via 2/3 peer attestation is authoritative).
+          orphanBufferLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger
+            .fromName[F]("MetagraphOrphanBuffer")
+            .toResource
+          orphanBuffer <- io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer
+            .make[F](orphanBufferLogger)
+            .toResource
           _ <- supervisor
             .supervise(
               io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
@@ -900,11 +910,52 @@ object GlobalSnapshotConsensus {
                   operationalKeyMaker = operationalKeyMaker,
                   // Slice S3: drop aggregator entries for `(mg, parent)` pairs in the finalized
                   // snapshot's `stateChannelSnapshots`. Otherwise the tally grows monotonically.
+                  //
+                  // #214 piggyback: after committee-gate cleanup, drain any orphans waiting on the
+                  // last finalized binary's value-hash for each metagraph and re-feed them through
+                  // `processMetagraphBinary`. Cluster-wide finalization (2/3 peer attestation) is
+                  // authoritative regardless of whether the LOCAL committee gate fired, so the drained
+                  // child no longer needs a local kTarget attestation count — it just needs to be
+                  // processed into gl0's state channel storage so it lands in the next gl0 snapshot.
+                  // gl0's GSI (`storages.globalSnapshot.head`) already reflects the finalized binary at
+                  // this point — `stateChannelService.process` chain-validates the drained child's
+                  // parent against that. We deliberately do NOT recordAdmission here: the admission
+                  // cache stores an ordinal used by future gossip handlers' eta lookup, and we don't
+                  // have an exact metagraph chain ord per binary in this scope. The cache's purpose
+                  // (bridging the local-admit → next-snapshot-finalize GSI lag) is irrelevant on the
+                  // finalize path; the GSI already has the binary, so subsequent gossip handlers
+                  // resolve via the GSI-backed `parentOrdinalFor` path correctly.
+                  //
+                  // Bypasses the local committee gate. Safe because the just-finalized parent is
+                  // cluster-confirmed — kTarget was already met (or finality reached via depth-k) at
+                  // the global-snapshot level. Unblocks the 4mg+8gl0 scenario where kTarget=4/30s
+                  // local gates frequently time out at count=2 while peers admit successfully.
                   onFinalize = (snap: io.constellationnetwork.schema.GlobalIncrementalSnapshot) =>
                     snap.stateChannelSnapshots.toList.traverse_ {
                       case (mgAddr, binaries) =>
                         val parents = binaries.toList.map(_.value.lastSnapshotHash).toSet
-                        committeeGate.pruneParents(mgAddr, parents)
+                        committeeGate.pruneParents(mgAddr, parents) >>
+                          HasherSelector[F].withCurrent { implicit hasher =>
+                            binaries.last.toHashed.flatMap { hashedLast =>
+                              orphanBuffer.drainChildren(mgAddr, hashedLast.hash).flatMap { drained =>
+                                drained.traverse_ { childBytes =>
+                                  io.constellationnetwork.json
+                                    .JsonSerializer[F]
+                                    .deserialize[io.constellationnetwork.security.signature.Signed[
+                                      io.constellationnetwork.statechannel.StateChannelSnapshotBinary
+                                    ]](childBytes)
+                                    .flatMap {
+                                      case Right(signedChild) =>
+                                        processMetagraphBinary(
+                                          io.constellationnetwork.statechannel
+                                            .StateChannelOutput(mgAddr, signedChild)
+                                        )
+                                      case Left(_) => cats.effect.kernel.Async[F].unit
+                                    }
+                                }
+                              }
+                            }
+                          }
                     }
                 )
                 .compile
@@ -1051,7 +1102,8 @@ object GlobalSnapshotConsensus {
                   committeeGate = committeeGate,
                   parentOrdinalFor = committeeParentOrdinalFor,
                   etaForParentOrdinal = committeeEtaForOrdinal,
-                  senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.optimisticRelativeStake(peer)
+                  senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.optimisticRelativeStake(peer),
+                  orphanBuffer = orphanBuffer
                 )
                 .compile
                 .drain
