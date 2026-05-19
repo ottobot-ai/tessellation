@@ -181,10 +181,9 @@ object MetagraphCommitteeGate {
   /** Trait describing the verification of a KES signature for a metagraph attestation. Decoupled from the dag-l0 implementation
     * (`KesGossipVerification`) so the gate can be tested without that file pulled in.
     *
-    * '''Contract.''' Returns `true` iff the KES signature verifies under the registered master VK at the tree-internal `kesStep`
-    * supplied by the call site (wire-carried from the sender). Returns `false` on empty sig, decode failure, or step-out-of-range.
-    * No chain-state lookup is involved — the receiver does not need to know the operator's activation offset or the global eta
-    * rotation cadence to verify.
+    * '''Contract.''' Returns `true` iff the KES signature verifies under the registered master VK at the tree-internal `kesStep` supplied
+    * by the call site (wire-carried from the sender). Returns `false` on empty sig, decode failure, or step-out-of-range. No chain-state
+    * lookup is involved — the receiver does not need to know the operator's activation offset or the global eta rotation cadence to verify.
     */
   trait KesVerifier[F[_]] {
     def verify(
@@ -205,14 +204,14 @@ object MetagraphCommitteeGate {
     */
   trait KesSigner[F[_]] {
 
-    /** The KES product step currently held by the in-memory key (offset from the operator's activation period). Sender embeds this on
-      * the wire so receivers know which tree-internal step to verify against.
+    /** The KES product step currently held by the in-memory key (offset from the operator's activation period). Sender embeds this on the
+      * wire so receivers know which tree-internal step to verify against.
       */
     def currentPeriod: F[Int]
 
     /** Sign `message` at `kesStep`. Returns empty bytes on signer failure — the receiver-side gate treats empty as `EmptyKesSig` and
-      * rejects. Callers should always pass `currentPeriod` here; signing at any other step is an error (`StepNotMonotonic` for past
-      * steps, or destroys forward-secrecy for future steps).
+      * rejects. Callers should always pass `currentPeriod` here; signing at any other step is an error (`StepNotMonotonic` for past steps,
+      * or destroys forward-secrecy for future steps).
       */
     def signAt(kesStep: Int, message: Array[Byte]): F[Array[Byte]]
   }
@@ -220,8 +219,8 @@ object MetagraphCommitteeGate {
   /** Algebra describing how to publish a `MetagraphAttestation` to the sidecar. The default impl in `GlobalSnapshotConsensus` wraps
     * `SidecarClient.publishMetagraphAttestation`; tests use a `Ref`-backed stub.
     *
-    * The wire-shape is isolated from the gate's pure logic — the gate computes everything, the publisher just sends the bytes. Failures
-    * are logged + swallowed inside the impl (matches the existing `publishAttestation` failure model). `kesStep` is the sender's
+    * The wire-shape is isolated from the gate's pure logic — the gate computes everything, the publisher just sends the bytes. Failures are
+    * logged + swallowed inside the impl (matches the existing `publishAttestation` failure model). `kesStep` is the sender's
     * `OperationalKeyMakerAlgebra.currentPeriod` at sign time — embedded on the wire so the receiver verifies non-interactively.
     */
   trait Publisher[F[_]] {
@@ -256,15 +255,15 @@ object MetagraphCommitteeGate {
     *   - `sortition` for the VRF threshold check (sender) + membership verify (receiver),
     *   - `aggregator` for the per-binary tally + threshold polling + pruning,
     *   - `kesSigner` / `kesVerifier` for the REQUIRED KES product signature path. Sender queries `kesSigner.currentPeriod` for the
-    *     tree-internal step it can sign at right now, signs at that step, and embeds the step on the wire (proto field
-    *     `sender_tree_step`). The receiver verifies using the wire-carried step — no chain-state lookup, no offset arithmetic. This
-    *     makes the verifier non-interactive (KES freshness/replay protection is provided separately by the `parentHash` + `binaryHash`
-    *     fields and the per-binary aggregator dedup, not by step bookkeeping).
+    *     tree-internal step it can sign at right now, signs at that step, and embeds the step on the wire (proto field `sender_tree_step`).
+    *     The receiver verifies using the wire-carried step — no chain-state lookup, no offset arithmetic. This makes the verifier
+    *     non-interactive (KES freshness/replay protection is provided separately by the `parentHash` + `binaryHash` fields and the
+    *     per-binary aggregator dedup, not by step bookkeeping).
     *   - `publisher` for the sidecar `PublishMetagraphAttestation` RPC,
     *   - `parentOrdinalFor` to resolve the metagraph parent's ordinal from `(metagraphAddress, parentHash)` against the gl0 GSI's
     *     `lastCurrencySnapshots[mg]` (#201). Required for committee VRF eta derivation (the eta the sender used must match the eta the
-    *     receiver computes). When this returns `None` (mismatch, no entry, pre-bootstrap), the gate fails closed — sender skips
-    *     publish, receiver drops the attestation. See `MetagraphParentOrdinalResolver`.
+    *     receiver computes). When this returns `None` (mismatch, no entry, pre-bootstrap), the gate fails closed — sender skips publish,
+    *     receiver drops the attestation. See `MetagraphParentOrdinalResolver`.
     *
     * `selfPeerId`, `selfVrfSk`, `keyPair` are this operator's identity keys: VRF SK for the committee draw, long-term Ed25519 key
     * (`keyPair.getPrivate`) for the outer signature.

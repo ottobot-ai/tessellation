@@ -100,10 +100,9 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
     kesStep: Int
   )
 
-  /** Stub KES signer that always returns a deterministic 8-byte placeholder. `currentPeriod` returns a fixed value (7) so the gate's
-    * sender path embeds a recognizable non-zero step on the wire; tests can assert against it. The receiver-side test stubs KES-verify
-    * directly; the sender-side test only needs `signAt` to produce non-empty bytes so the gate doesn't tag the wire field as "empty
-    * KES".
+  /** Stub KES signer that always returns a deterministic 8-byte placeholder. `currentPeriod` returns a fixed value (7) so the gate's sender
+    * path embeds a recognizable non-zero step on the wire; tests can assert against it. The receiver-side test stubs KES-verify directly;
+    * the sender-side test only needs `signAt` to produce non-empty bytes so the gate doesn't tag the wire field as "empty KES".
     */
   private val stubKesSigner: KesSigner[IO] = new KesSigner[IO] {
     def currentPeriod: IO[Int] = IO.pure(7)
