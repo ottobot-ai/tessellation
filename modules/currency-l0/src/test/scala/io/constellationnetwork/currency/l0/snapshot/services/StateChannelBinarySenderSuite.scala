@@ -282,7 +282,8 @@ object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
       Some(SortedMap.empty),
       Some(SortedMap.empty),
       Some(SortedMap.empty),
-      Some(SortedMap.empty)
+      Some(SortedMap.empty),
+      SortedMap.empty
     )
 
   type Res = (KryoSerializer[IO], Hasher[IO], SecurityProvider[IO], Metrics[IO], JsonSerializer[IO])

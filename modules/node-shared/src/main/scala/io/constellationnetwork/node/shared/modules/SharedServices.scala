@@ -176,7 +176,10 @@ object SharedServices {
         cfg.delegatedStaking.withdrawalTimeLimit.getOrElse(cfg.environment, EpochProgress.MinValue),
         storages.mptOverlay,
         loggerBundle,
-        maintainNodeCollateralWithdrawalExpiryIndex = true
+        maintainNodeCollateralWithdrawalExpiryIndex = true,
+        // §3 NIPoPoW S0.4: must match the producer's `NAKAMOTO_ETA_ROTATION_SNAPSHOTS`. Read at GSAM construction so the
+        // boundary-write check (`ord % R == R - 1`) inside accept() is deterministic across all nodes.
+        etaRotationSnapshots = sys.env.get("NAKAMOTO_ETA_ROTATION_SNAPSHOTS").flatMap(_.toLongOption).getOrElse(2550L)
       )
       globalSnapshotContextFns = GlobalSnapshotContextFunctions.make(
         globalSnapshotAcceptanceManager,

@@ -16,6 +16,7 @@ import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, Pend
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.MptStore
 import io.constellationnetwork.schema.mpt.PartitionNamespace.{AddressNamespace, MetagraphNamespace}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, StakeDistribution}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
@@ -80,7 +81,13 @@ object GlobalStateConverter {
     removedDelegatedStakeKeys: Set[Address] = Set.empty,
     removedDelegatedStakeWithdrawalKeys: Set[Address] = Set.empty,
     removedNodeCollateralKeys: Set[Address] = Set.empty,
-    removedNodeCollateralWithdrawalKeys: Set[Address] = Set.empty
+    removedNodeCollateralWithdrawalKeys: Set[Address] = Set.empty,
+    // §3 NIPoPoW S0.4 boundary delta. Non-empty only at boundary ordinals
+    // (`ord % etaRotationSnapshots == etaRotationSnapshots - 1L`); empty otherwise.
+    // `historicalStakeSnapshots` carries the new entry(ies) appended at this boundary;
+    // `removedHistoricalStakeSnapshotKeys` carries the period keys evicted by retention.
+    historicalStakeSnapshots: SortedMap[EtaPeriod, StakeDistribution] = SortedMap.empty,
+    removedHistoricalStakeSnapshotKeys: Set[EtaPeriod] = Set.empty
   )
 
   /** Apply a `(added, removed)` delta to the `ActiveAddressIndex` partition for `fieldId`. Read-modify-write on the single MPT entry that
@@ -464,6 +471,19 @@ object GlobalStateConverter {
         }
     }
 
+    // §3 NIPoPoW S0 historical stake snapshots: one entry per stored eta-period (retention cap = 4).
+    // Each entry's value is the scodec-encoded `StakeDistribution`. Covered by `mptRoot` and gets its
+    // own per-field subtree root via `FId.HistoricalStakeSnapshots` for efficient NIPoPoW Merkle proofs.
+    val historicalStakeSnapshotsF: F[List[(GlobalStateKey, Array[Byte])]] = {
+      import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{immutableCodec => stakeDistributionImmutable}
+      info.historicalStakeSnapshots.toList.parTraverse {
+        case (period, dist) =>
+          GlobalStateKey
+            .historicalStakeSnapshotsKey[F](period)
+            .map(k => k -> enc[io.constellationnetwork.schema.nakamoto.StakeDistribution](dist)(stakeDistributionImmutable))
+      }
+    }
+
     // Token-lock expiry index: one bucket per `unlockEpoch` (records with `None` unlock aren't indexed).
     val tokenLockExpiryIndexF: F[List[(GlobalStateKey, Array[Byte])]] = {
       val flat = info.activeTokenLocks.toList.flatMap(_.toList).flatMap {
@@ -512,17 +532,20 @@ object GlobalStateConverter {
       priceStateF,
       allowSpendExpiryIndexF,
       tokenLockExpiryIndexF,
-      nodeCollateralWithdrawalExpiryIndexF
-    ).mapN { (currencyEntries, unpEntries, priceEntries, allowSpendExpiryEntries, tokenLockExpiryEntries, ncwExpiryEntries) =>
-      val all: Iterable[(GlobalStateKey, Array[Byte])] =
-        stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
-          activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
-          lastAllowSpendRefs ++ lastTokenLockRefs ++
-          activeDelegatedStakes ++ delegatedStakesWithdrawals ++
-          activeNodeCollaterals ++ nodeCollateralWithdrawals ++
-          metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries ++
-          allowSpendExpiryEntries ++ tokenLockExpiryEntries ++ ncwExpiryEntries
-      all.toMap
+      nodeCollateralWithdrawalExpiryIndexF,
+      historicalStakeSnapshotsF
+    ).mapN {
+      (currencyEntries, unpEntries, priceEntries, allowSpendExpiryEntries, tokenLockExpiryEntries, ncwExpiryEntries, histStakeEntries) =>
+        val all: Iterable[(GlobalStateKey, Array[Byte])] =
+          stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
+            activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
+            lastAllowSpendRefs ++ lastTokenLockRefs ++
+            activeDelegatedStakes ++ delegatedStakesWithdrawals ++
+            activeNodeCollaterals ++ nodeCollateralWithdrawals ++
+            metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries ++
+            allowSpendExpiryEntries ++ tokenLockExpiryEntries ++ ncwExpiryEntries ++
+            histStakeEntries
+        all.toMap
     }
   }
 
@@ -628,15 +651,30 @@ object GlobalStateConverter {
         case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(k => k -> enc[PriceRecord](rec))
       }
 
-    (currencyEntriesF, updateNodeParametersF, priceStateF).mapN { (currencyEntries, unpEntries, priceEntries) =>
-      val all: Iterable[(GlobalStateKey, Array[Byte])] =
-        stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
-          activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
-          lastAllowSpendRefs ++ lastTokenLockRefs ++
-          activeDelegatedStakes ++ delegatedStakesWithdrawals ++
-          activeNodeCollaterals ++ nodeCollateralWithdrawals ++
-          metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries
-      all.toMap
+    // §3 NIPoPoW S0 historical-stake-snapshots delta: empty on non-boundary ordinals, otherwise the new
+    // entry(ies) appended at this boundary. Mirrors the projection in `toAllStateKeyValueBytes`'s
+    // `historicalStakeSnapshotsF` so the writer-bytes match the rebuild-bytes byte-for-byte.
+    val historicalStakeSnapshotsF: F[List[(GlobalStateKey, Array[Byte])]] = {
+      import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{immutableCodec => stakeDistributionImmutable}
+      acc.historicalStakeSnapshots.toList.parTraverse {
+        case (period, dist) =>
+          GlobalStateKey
+            .historicalStakeSnapshotsKey[F](period)
+            .map(k => k -> enc[StakeDistribution](dist)(stakeDistributionImmutable))
+      }
+    }
+
+    (currencyEntriesF, updateNodeParametersF, priceStateF, historicalStakeSnapshotsF).mapN {
+      (currencyEntries, unpEntries, priceEntries, histStakeEntries) =>
+        val all: Iterable[(GlobalStateKey, Array[Byte])] =
+          stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
+            activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
+            lastAllowSpendRefs ++ lastTokenLockRefs ++
+            activeDelegatedStakes ++ delegatedStakesWithdrawals ++
+            activeNodeCollaterals ++ nodeCollateralWithdrawals ++
+            metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries ++
+            histStakeEntries
+        all.toMap
     }
   }
 
@@ -655,7 +693,8 @@ object GlobalStateConverter {
     for {
       typedUpserts <- toAccumulatorBytesDelta[F](acc)
       upsertsHex <- typedUpserts.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }.map(_.toMap)
-      removalsHex <- toAccumulatorRemovalKeys(acc).toList.parTraverse(GlobalStateKey.toHex[F]).map(_.toSet)
+      removalKeys <- toAccumulatorRemovalKeys[F](acc)
+      removalsHex <- removalKeys.toList.parTraverse(GlobalStateKey.toHex[F]).map(_.toSet)
       asExp <- replayExpiryIndexDelta[F, AllowSpendExpiryKey](
         SystemNamespaceLabel.ExpiryIndexAllowSpends,
         acc.allowSpendExpiryIndex,
@@ -829,8 +868,11 @@ object GlobalStateConverter {
   }
 
   /** Removal keys derived from a `StateChangesAccumulator` — the delete half of `store.update(upserts, removes)` under MPT-as-primary.
+    *
+    * Lifted into `F` so historical-stake-snapshot keys (which require `Hasher[F]` to derive their `userNamespace` hash via
+    * `historicalStakeSnapshotsKey[F]`) can be folded into the result set alongside the F-free keys.
     */
-  def toAccumulatorRemovalKeys(acc: StateChangesAccumulator): Set[GlobalStateKey] = {
+  def toAccumulatorRemovalKeys[F[_]: Async: Parallel: Hasher](acc: StateChangesAccumulator): F[Set[GlobalStateKey]] = {
     import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
     val allowSpendKeys = acc.removedAllowSpendKeys.toList.map {
       case (metagraphIdOpt, address) => GlobalStateKey.hypergraph(ActiveAllowSpends, metagraphIdOpt, address)
@@ -845,9 +887,12 @@ object GlobalStateConverter {
     val nodeCollateralKeys = acc.removedNodeCollateralKeys.toList.map(addr => GlobalStateKey.hypergraph(ActiveNodeCollaterals, addr))
     val nodeCollateralWithdrawalKeys =
       acc.removedNodeCollateralWithdrawalKeys.toList.map(addr => GlobalStateKey.hypergraph(NodeCollateralWithdrawals, addr))
-    (allowSpendKeys ++ tokenLockKeys ++ tokenLockBalanceKeys ++
+    val pureKeys = (allowSpendKeys ++ tokenLockKeys ++ tokenLockBalanceKeys ++
       delegatedStakeKeys ++ delegatedStakeWithdrawalKeys ++
       nodeCollateralKeys ++ nodeCollateralWithdrawalKeys).toSet
+    acc.removedHistoricalStakeSnapshotKeys.toList
+      .parTraverse(period => GlobalStateKey.historicalStakeSnapshotsKey[F](period))
+      .map(historicalKeys => pureKeys ++ historicalKeys.toSet)
   }
 
   object syntax {
@@ -1442,11 +1487,18 @@ object GlobalStateConverter {
       ): F[Unit] = {
         // Caller-serialized — see MptStore.withTransaction.
         import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
+        // §3 NIPoPoW S0 historical-stake-snapshots writer: each MPT entry value is the scodec-encoded
+        // `StakeDistribution` keyed by `historicalStakeSnapshotsKey[F](period)` — same codec / same key
+        // shape as `toAllStateKeyValueBytes` so producer and verifier roots agree byte-for-byte.
+        import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{immutableCodec => stakeDistributionImmutable}
+        val _ = stakeDistributionImmutable // resolves `store.insert[StakeDistribution]` below
 
         val syncLogger = Slf4jLogger.getLoggerFromName[F]("MPT.Sync")
 
-        // Convert removal keys from accumulator to GlobalStateKey
-        def toRemovalGlobalStateKeys: Set[GlobalStateKey] = {
+        // Convert removal keys from accumulator to GlobalStateKey. Lifted to F because the §3 NIPoPoW
+        // historical-stake-snapshot removal keys are F-effecting (`historicalStakeSnapshotsKey[F]` hashes
+        // the eta-period via `Hasher[F]`); all the other partitions are F-free.
+        def toRemovalGlobalStateKeys: F[Set[GlobalStateKey]] = {
           val allowSpendKeys = acc.removedAllowSpendKeys.map {
             case (metagraphIdOpt, address) =>
               GlobalStateKey.hypergraph(ActiveAllowSpends, metagraphIdOpt, address)
@@ -1469,9 +1521,13 @@ object GlobalStateConverter {
           val nodeCollateralWithdrawalKeys = acc.removedNodeCollateralWithdrawalKeys.map { address =>
             GlobalStateKey.hypergraph(NodeCollateralWithdrawals, address)
           }
-          allowSpendKeys ++ tokenLockKeys ++ tokenLockBalanceKeys ++
-            delegatedStakeKeys ++ delegatedStakeWithdrawalKeys ++
-            nodeCollateralKeys ++ nodeCollateralWithdrawalKeys
+          val pureKeys =
+            allowSpendKeys ++ tokenLockKeys ++ tokenLockBalanceKeys ++
+              delegatedStakeKeys ++ delegatedStakeWithdrawalKeys ++
+              nodeCollateralKeys ++ nodeCollateralWithdrawalKeys
+          acc.removedHistoricalStakeSnapshotKeys.toList
+            .parTraverse(period => GlobalStateKey.historicalStakeSnapshotsKey[F](period))
+            .map(historicalKeys => pureKeys ++ historicalKeys.toSet)
         }
 
         // Per-field typed entry maps — writes go through `ImmutableCodec[V]` so bytes match
@@ -1560,7 +1616,14 @@ object GlobalStateConverter {
           acc.priceState.toList.parTraverse { case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(_ -> rec) }
             .map(_.toMap)
 
-        val keysToRemove = toRemovalGlobalStateKeys
+        // §3 NIPoPoW S0 historical-stake-snapshot upserts. Each entry's key is derived via
+        // `historicalStakeSnapshotsKey[F]` (hashed eta-period); the value is the scodec-encoded
+        // `StakeDistribution`. Non-empty only at boundary ordinals.
+        val historicalStakeEntriesF: F[Map[GlobalStateKey, StakeDistribution]] =
+          acc.historicalStakeSnapshots.toList.parTraverse {
+            case (period, dist) => GlobalStateKey.historicalStakeSnapshotsKey[F](period).map(_ -> dist)
+          }.map(_.toMap)
+
         val totalEntries =
           stateChanHashes.size + txRefs.size + balances.size + currencyProofs.size +
             acc.lastCurrencySnapshots.size * 2 +
@@ -1569,10 +1632,12 @@ object GlobalStateConverter {
             activeDelegatedStakesEntries.size + delegatedStakesWithdrawalsEntries.size +
             activeNodeCollateralsEntries.size + nodeCollateralWithdrawalsEntries.size +
             metagraphSyncDataEntries.size +
-            acc.updateNodeParameters.size + acc.priceState.size
+            acc.updateNodeParameters.size + acc.priceState.size +
+            acc.historicalStakeSnapshots.size
 
         for {
           t0 <- Async[F].monotonic.map(_.toMillis)
+          keysToRemove <- toRemovalGlobalStateKeys
 
           _ <- syncLogger.debug(
             s"[MPT.Sync] ordinal=$snapshotOrdinal delta: " +
@@ -1589,6 +1654,7 @@ object GlobalStateConverter {
               s"nodeCollaterals=${acc.activeNodeCollaterals.size} " +
               s"collateralWithdrawals=${acc.nodeCollateralWithdrawals.size} " +
               s"metagraphSync=${acc.metagraphSyncData.size} " +
+              s"historicalStake=${acc.historicalStakeSnapshots.size} " +
               s"totalEntries=$totalEntries removals=${keysToRemove.size}"
           )
 
@@ -1619,8 +1685,10 @@ object GlobalStateConverter {
           _ <- store.insert[MetagraphSyncDataInfo](metagraphSyncDataEntries)
           updateNodeParametersEntries <- updateNodeParametersEntriesF
           priceStateEntries <- priceStateEntriesF
+          historicalStakeEntries <- historicalStakeEntriesF
           _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
           _ <- store.insert[PriceRecord](priceStateEntries)
+          _ <- store.insert[StakeDistribution](historicalStakeEntries)
           _ <- applySystemIndexDelta[F, AllowSpendExpiryKey](
             store,
             SystemNamespaceLabel.ExpiryIndexAllowSpends,

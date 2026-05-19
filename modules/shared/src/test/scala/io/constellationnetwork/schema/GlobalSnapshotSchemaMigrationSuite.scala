@@ -145,7 +145,8 @@ object GlobalSnapshotSchemaMigrationSuite extends MutableIOSuite with Checkers {
           activeNodeCollaterals = Some(SortedMap.empty),
           nodeCollateralWithdrawals = Some(SortedMap.empty),
           priceState = Some(SortedMap.empty),
-          metagraphSyncData = Some(SortedMap.empty)
+          metagraphSyncData = Some(SortedMap.empty),
+          historicalStakeSnapshots = SortedMap.empty
         )
 
         // Test with legacy format (ordinal 5, boundary 10)

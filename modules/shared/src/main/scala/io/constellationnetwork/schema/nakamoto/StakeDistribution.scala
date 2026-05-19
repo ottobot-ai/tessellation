@@ -1,43 +1,45 @@
-package io.constellationnetwork.node.shared.domain.nakamoto
+package io.constellationnetwork.schema.nakamoto
 
+import cats.Show
 import cats.kernel.Order
-import cats.syntax.all._
+
+import scala.collection.immutable.SortedMap
 
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.GlobalSnapshotInfo
 import io.constellationnetwork.schema.peer.PeerId
 
-import derevo.cats.{eqv, show}
+import derevo.cats.eqv
+import derevo.circe.magnolia.{decoder, encoder}
 import derevo.derive
+import io.circe._
 
 /** Stake-distribution snapshot at an eta-period boundary, used by the §3 NIPoPoW N-2 lookback rule.
   *
   * '''Why raw amounts, not pre-normalized ratios.''' The denominator of `peerStake / totalStake` depends on which peer subset the caller
   * considers. The seedlist may change between snapshot time and read time (peer registration, slashing); the observed-active set is
-  * runtime-only and is meaningless to a verifier replaying history. Storing raw `BigInt` amounts lets the caller pick its own denominator at
-  * read time — the same way `StakeRegistry.stakeWeighted.totalStakeOver` does today against the live GSI.
+  * runtime-only and is meaningless to a verifier replaying history. Storing raw `BigInt` amounts lets the caller pick its own denominator
+  * at read time — the same way `StakeRegistry.stakeWeighted.totalStakeOver` does today against the live GSI.
   *
-  * '''Why summed delegated + collateral.''' Matches the §1.1 stake definition used in production (`StakeRegistry.stakeOf`,
-  * `StakeRegistry.scala:183`). Both tiers contribute to leader eligibility today, and any historical reconstruction must agree byte-for-byte
-  * with the producer's view at that moment.
+  * '''Why summed delegated + collateral.''' Matches the §1.1 stake definition used in production (`StakeRegistry.stakeOf`). Both tiers
+  * contribute to leader eligibility today, and any historical reconstruction must agree byte-for-byte with the producer's view at that
+  * moment.
   *
   * '''Identity at zero stake.''' A peer that registered no delegation and no collateral simply isn't in the map. `stakeOf` returns
   * `BigInt(0)` for missing keys — that's the same null behavior the live registry has when an unstaked peer is queried.
   */
-@derive(eqv, show)
-final case class StakeDistribution(stakes: Map[PeerId, BigInt]) {
+@derive(encoder, decoder, eqv)
+final case class StakeDistribution(stakes: SortedMap[PeerId, BigInt]) {
 
   /** Raw stake amount for a single peer. Returns 0 if the peer has no record. */
   def stakeOf(p: PeerId): BigInt = stakes.getOrElse(p, BigInt(0))
 
-  /** Total stake summed across an arbitrary peer set. Peers missing from `stakes` contribute 0; off-set peers in `stakes` are ignored. This
-    * is the canonical denominator for "what fraction of `peers` does `p` hold" queries.
-    */
+  /** Total stake summed across an arbitrary peer set. Peers missing from `stakes` contribute 0; off-set peers in `stakes` are ignored. */
   def totalOver(peers: Set[PeerId]): BigInt =
     peers.foldLeft(BigInt(0))((acc, p) => acc + stakeOf(p))
 
-  /** Relative stake `p` holds against a denominator peer set. Returns `Ratio.Zero` if the denominator is zero, `p` is not in the denominator
-    * set, or `p` has no stake recorded — same fail-closed semantics as `StakeRegistry.relativeStake`.
+  /** Relative stake `p` holds against a denominator peer set. Returns `Ratio.Zero` if the denominator is zero, `p` is not in the
+    * denominator set, or `p` has no stake recorded — same fail-closed semantics as `StakeRegistry.relativeStake`.
     */
   def relativeStakeAgainst(p: PeerId, denominator: Set[PeerId]): Ratio =
     if (!denominator.contains(p)) Ratio.Zero
@@ -50,8 +52,14 @@ final case class StakeDistribution(stakes: Map[PeerId, BigInt]) {
 
 object StakeDistribution {
 
-  /** The empty distribution — no peer has any stake. Read-side fallback for periods earlier than the first recorded snapshot. */
-  val Empty: StakeDistribution = StakeDistribution(Map.empty)
+  /** The empty distribution — no peer has any stake. */
+  val Empty: StakeDistribution = StakeDistribution(SortedMap.empty[PeerId, BigInt])
+
+  /** Manual `Show` to avoid the cats / `OrphanInstances.showSortedMapAsList` ambiguity that bites every `@derive(show)` over a
+    * `SortedMap[K, V]` inside the `io.constellationnetwork.schema` package. `Show.fromToString` is fine — this is only used for
+    * diagnostic output.
+    */
+  implicit val show: Show[StakeDistribution] = Show.fromToString
 }
 
 /** Eta-period index. Period N spans ordinals `[N · etaRotationSnapshots, (N+1) · etaRotationSnapshots)`. Computed via
@@ -61,7 +69,7 @@ object StakeDistribution {
   * 0 and 1). Lookups against a negative period fall through to the genesis stake distribution. Modelling that as Option-at-the-boundary
   * would force partial semantics through every call site for a transient bootstrap-only edge case.
   */
-@derive(eqv, show)
+@derive(eqv)
 final case class EtaPeriod(value: Long) {
 
   /** Period that is `n` boundaries earlier (may be negative; see class docs). */
@@ -74,7 +82,18 @@ final case class EtaPeriod(value: Long) {
 object EtaPeriod {
   val Zero: EtaPeriod = EtaPeriod(0L)
 
-  implicit val ordering: Order[EtaPeriod] = Order.by(_.value)
+  implicit val order: Order[EtaPeriod] = Order.by(_.value)
+  implicit val show: Show[EtaPeriod] = Show.show(p => s"EtaPeriod(${p.value})")
+
+  // Backing Scala Ordering — required to instantiate `SortedMap[EtaPeriod, _]`.
+  implicit val scalaOrdering: scala.math.Ordering[EtaPeriod] = scala.math.Ordering.by(_.value)
+
+  // JSON encoders for use both as a value and as a map key.
+  implicit val encoder: Encoder[EtaPeriod] = Encoder[Long].contramap(_.value)
+  implicit val decoder: Decoder[EtaPeriod] = Decoder[Long].map(EtaPeriod(_))
+  implicit val keyEncoder: KeyEncoder[EtaPeriod] = KeyEncoder.instance(_.value.toString)
+  implicit val keyDecoder: KeyDecoder[EtaPeriod] =
+    KeyDecoder.instance(s => scala.util.Try(s.toLong).toOption.map(EtaPeriod(_)))
 }
 
 /** Pure computation that lifts a `GlobalSnapshotInfo`'s `activeDelegatedStakes + activeNodeCollaterals` into a `StakeDistribution`.
@@ -84,32 +103,36 @@ object EtaPeriod {
   * eligibility two periods later (Cardano-style mark/set/go).
   *
   * '''Determinism.''' Identical inputs produce identical output. No `F[_]`, no Refs, no implicit state. Verifier-side reconstruction reads
-  * the same GSI and runs the same function to get the same `StakeDistribution` — load-bearing for NIPoPoW tower verification.
+  * the same GSI and runs the same function to get the same `StakeDistribution`.
   */
 object EpochStakeSnapshotter {
 
-  /** Build a stake-distribution from a GSI. Sums delegated-stake + node-collateral amounts per `nodeId`. Iteration order is irrelevant
-    * because `Map[PeerId, BigInt]` is keyed by content; addition is associative+commutative on `BigInt`.
+  /** Build a stake-distribution from a GSI. Sums delegated-stake + node-collateral amounts per `nodeId`.
+    *
+    * Materializes into `SortedMap` so the binary encoding (used by the MPT/Brotli state-proof codec) is deterministic — two nodes building
+    * the snapshot from the same GSI produce bit-identical bytes.
     */
   def snapshot(info: GlobalSnapshotInfo): StakeDistribution = {
     val delegated: Map[PeerId, BigInt] =
-      info.activeDelegatedStakes.toIterable.flatMap(_.valuesIterator).flatMap(_.iterator).foldLeft(Map.empty[PeerId, BigInt]) {
+      info.activeDelegatedStakes.iterator.flatMap(_.valuesIterator).flatMap(_.iterator).foldLeft(Map.empty[PeerId, BigInt]) {
         (acc, record) =>
           val p = record.event.value.nodeId
           val amt = BigInt(record.amount.value.value)
           acc.updated(p, acc.getOrElse(p, BigInt(0)) + amt)
       }
     val collateral: Map[PeerId, BigInt] =
-      info.activeNodeCollaterals.toIterable.flatMap(_.valuesIterator).flatMap(_.iterator).foldLeft(Map.empty[PeerId, BigInt]) {
+      info.activeNodeCollaterals.iterator.flatMap(_.valuesIterator).flatMap(_.iterator).foldLeft(Map.empty[PeerId, BigInt]) {
         (acc, record) =>
           val p = record.event.value.nodeId
           val amt = BigInt(record.event.value.amount.value.value)
           acc.updated(p, acc.getOrElse(p, BigInt(0)) + amt)
       }
-    val merged: Map[PeerId, BigInt] =
-      delegated.keySet.union(collateral.keySet).iterator
+    val merged: SortedMap[PeerId, BigInt] =
+      delegated.keySet
+        .union(collateral.keySet)
+        .iterator
         .map(p => p -> (delegated.getOrElse(p, BigInt(0)) + collateral.getOrElse(p, BigInt(0))))
-        .toMap
+        .to(SortedMap)
     StakeDistribution(merged)
   }
 }

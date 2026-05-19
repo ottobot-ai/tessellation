@@ -9,6 +9,7 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, StakeDistribution}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
@@ -38,6 +39,7 @@ import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs._
 import io.constellationnetwork.serde.codecs.instances.PriceOracleCodecs.{priceRecordCodec, tokenPairCodec}
 import io.constellationnetwork.serde.codecs.instances.SignatureCodecs.{idCodec, signatureProofCodec}
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
+import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{codec => stakeDistributionCodec, etaPeriodCodec}
 import io.constellationnetwork.serde.codecs.instances.TokenLockCodec.{codec => tokenLockCodec}
 import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{codec => tokenLockRefCodec}
 import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.{codec => transactionReferenceCodec}
@@ -46,14 +48,16 @@ import io.constellationnetwork.serde.codecs.instances.UpdateNodeParametersCodec.
 import scodec.Codec
 import shapeless.{::, HNil}
 
-/** Canonical scodec codec for `GlobalSnapshotInfo` — the 17-field current info record.
+/** Canonical scodec codec for `GlobalSnapshotInfo` — the 18-field current info record.
   *
   * Capstone codec for the info layer. Composes every inner-type codec built to this point.
   *
   * Wire layout matches the declared field order exactly:
   * 1..3 — required maps (last-state-channel-hashes, last-tx-refs, balances) 4 — lastCurrencySnapshots: SortedMap[Address,
   * Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]] 5 — lastCurrencySnapshotsProofs:
-  * SortedMap[Address, Proof] 6..17 — 12 Option[SortedMap[_, _]] fields for post-V1 feature activations
+  * SortedMap[Address, Proof] 6..17 — 12 Option[SortedMap[_, _]] fields for post-V1 feature activations 18 — historicalStakeSnapshots:
+  * SortedMap[EtaPeriod, StakeDistribution] (NIPoPoW S0 N-2 epoch staggering — required, not Option, since it has a sensible empty default
+  * the genesis loader / V1+V2 upgrade paths supply)
   */
 object GlobalSnapshotInfoCodec {
 
@@ -166,6 +170,13 @@ object GlobalSnapshotInfoCodec {
     sortedMap(addressCodec, metagraphSyncCodec)
   private val metagraphSyncDataOptCodec = option(metagraphSyncDataMapCodec)
 
+  // Field 18: NIPoPoW S0 historical stake — SortedMap[EtaPeriod, StakeDistribution]. Codecs for the leaf types live in
+  // [[StakeDistributionCodec]] because they're also used by the MPT projection (`toAllStateKeyValueBytes`) that authenticates
+  // the per-period partition under [[GlobalStateFieldId.HistoricalStakeSnapshots]]. Reusing the same `ImmutableCodec[StakeDistribution]`
+  // there means the bytes the MPT hashes equal the bytes this codec emits — required for cross-path determinism (parity gate #107).
+  private val historicalStakeSnapshotsMapCodec: Codec[SortedMap[EtaPeriod, StakeDistribution]] =
+    sortedMap(etaPeriodCodec, stakeDistributionCodec)
+
   // Witness to keep SignatureProof import referenced.
   private val _spWitness: Codec[SignatureProof] = signatureProofCodec
   locally { val _ = _spWitness }
@@ -189,13 +200,14 @@ object GlobalSnapshotInfoCodec {
       activeNodeCollateralsOptCodec ::
       nodeCollateralWithdrawalsOptCodec ::
       priceStateOptCodec ::
-      metagraphSyncDataOptCodec)
+      metagraphSyncDataOptCodec ::
+      historicalStakeSnapshotsMapCodec)
       .xmap[GlobalSnapshotInfo](
         {
           case sch :: tx :: bal :: lcs :: lcsp ::
               aas :: atl :: tlb :: lasr :: ltlr ::
               unp :: ads :: dsw :: anc :: ncw ::
-              ps :: msd :: HNil =>
+              ps :: msd :: hss :: HNil =>
             GlobalSnapshotInfo(
               sch,
               tx,
@@ -213,7 +225,8 @@ object GlobalSnapshotInfoCodec {
               anc,
               ncw,
               ps,
-              msd
+              msd,
+              hss
             )
         },
         i =>
@@ -234,6 +247,7 @@ object GlobalSnapshotInfoCodec {
             i.nodeCollateralWithdrawals ::
             i.priceState ::
             i.metagraphSyncData ::
+            i.historicalStakeSnapshots ::
             HNil
       )
 

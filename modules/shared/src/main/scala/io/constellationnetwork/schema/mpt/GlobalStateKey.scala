@@ -8,6 +8,7 @@ import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.PartitionNamespace._
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.priceOracle.TokenPair
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
@@ -198,6 +199,12 @@ object GlobalStateFieldId {
     */
   case object SystemIndex extends GlobalStateFieldId { def toInt: Int = 19 }
 
+  /** §3 NIPoPoW S0 stake-distribution snapshots, indexed by closing eta-period. One MPT entry per period under retention (last 4). Covered
+    * by the global mptRoot — light clients verifying NIPoPoW level-µ chain superblock proofs read the historical distribution from this
+    * partition and verify it against the snapshot's mptRoot.
+    */
+  case object HistoricalStakeSnapshots extends GlobalStateFieldId { def toInt: Int = 20 }
+
   implicit val ordering: Ordering[GlobalStateFieldId] = Ordering.by(_.toInt)
   implicit val show: Show[GlobalStateFieldId] = Show.show(_.toInt.toString)
 
@@ -227,6 +234,7 @@ object GlobalStateFieldId {
     case 17 => Some(PriceState)
     case 18 => Some(MetagraphSyncData)
     case 19 => Some(SystemIndex)
+    case 20 => Some(HistoricalStakeSnapshots)
     case _  => None
   }
 }
@@ -278,6 +286,14 @@ object GlobalStateKey {
   def expiryIndexKey[F[_]: Sync: Hasher](label: SystemNamespaceLabel, epoch: EpochProgress): F[GlobalStateKey] =
     Hasher[F].hash(epoch.show).map { h =>
       GlobalStateKey(SystemNamespace(label), GlobalStateFieldId.SystemIndex, EmptyNamespace, HashNamespace(h))
+    }
+
+  /** Key into the §3 NIPoPoW historical-stake-snapshots partition. `userNamespace` carries a hash of the eta-period's canonical string
+    * form. One MPT entry per stored period (last 4 under retention).
+    */
+  def historicalStakeSnapshotsKey[F[_]: Sync: Hasher](period: EtaPeriod): F[GlobalStateKey] =
+    Hasher[F].hash(period.value.toString).map { h =>
+      GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.HistoricalStakeSnapshots, EmptyNamespace, HashNamespace(h))
     }
 
   /** Key into the `ActiveAddressIndex` partition for a given user-visible field. `userNamespace` carries a hash of the fieldId's integer

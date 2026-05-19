@@ -15,6 +15,7 @@ import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, Pend
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt._
+import io.constellationnetwork.schema.nakamoto.StakeDistribution
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.priceOracle.PriceRecord
@@ -34,6 +35,7 @@ import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmu
 import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{immutableCodec => metagraphSyncImmutable}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.PriceOracleCodecs.priceRecordImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{immutableCodec => stakeDistributionImmutable}
 import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{immutableCodec => tokenLockRefImmutable}
 import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.{immutableCodec => txRefImmutable}
 
@@ -65,9 +67,12 @@ object AcceptanceMptStateChanges {
 
     // `stateProofSelector` is consumed by `CurrencyIncrementalSnapshot.fromCurrencySnapshot` below
     // (transitively) — keeping the binding makes that dependency explicit at the helper boundary.
-    val _ = stateProofSelector
+    // `stakeDistributionImmutable` resolves `mpt.insert[StakeDistribution]` (§3 NIPoPoW S0).
+    val _ = (stateProofSelector, stakeDistributionImmutable)
 
-    def toRemovalKeys: Set[GlobalStateKey] = {
+    // Lifted to F because the §3 NIPoPoW historical-stake-snapshot keys hash the eta-period via
+    // `Hasher[F]` inside `historicalStakeSnapshotsKey[F]`. All other partitions are F-free.
+    def toRemovalKeys: F[Set[GlobalStateKey]] = {
       val allowSpendKeys = acc.removedAllowSpendKeys.map {
         case (metagraphIdOpt, address) =>
           GlobalStateKey.hypergraph(ActiveAllowSpends, metagraphIdOpt, address)
@@ -82,9 +87,13 @@ object AcceptanceMptStateChanges {
       val nodeCollateralKeys = acc.removedNodeCollateralKeys.map(GlobalStateKey.hypergraph(ActiveNodeCollaterals, _))
       val nodeCollateralWithdrawalKeys =
         acc.removedNodeCollateralWithdrawalKeys.map(GlobalStateKey.hypergraph(NodeCollateralWithdrawals, _))
-      allowSpendKeys ++ tokenLockKeys ++ tokenLockBalanceKeys ++
-        delegatedStakeKeys ++ delegatedStakeWithdrawalKeys ++
-        nodeCollateralKeys ++ nodeCollateralWithdrawalKeys
+      val pureKeys =
+        allowSpendKeys ++ tokenLockKeys ++ tokenLockBalanceKeys ++
+          delegatedStakeKeys ++ delegatedStakeWithdrawalKeys ++
+          nodeCollateralKeys ++ nodeCollateralWithdrawalKeys
+      acc.removedHistoricalStakeSnapshotKeys.toList
+        .parTraverse(period => GlobalStateKey.historicalStakeSnapshotsKey[F](period))
+        .map(historicalKeys => pureKeys ++ historicalKeys.toSet)
     }
 
     val stateChanHashes: Map[GlobalStateKey, Hash] = acc.lastStateChannelSnapshotHashes.iterator.map {
@@ -167,9 +176,15 @@ object AcceptanceMptStateChanges {
       acc.priceState.toList.parTraverse { case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(_ -> rec) }
         .map(_.toMap)
 
-    val keysToRemove = toRemovalKeys
+    // §3 NIPoPoW S0 historical-stake-snapshot upserts. Non-empty only at boundary ordinals; the value is
+    // the scodec-encoded `StakeDistribution` keyed by `historicalStakeSnapshotsKey[F](period)`.
+    val historicalStakeEntriesF: F[Map[GlobalStateKey, StakeDistribution]] =
+      acc.historicalStakeSnapshots.toList.parTraverse {
+        case (period, dist) => GlobalStateKey.historicalStakeSnapshotsKey[F](period).map(_ -> dist)
+      }.map(_.toMap)
 
     for {
+      keysToRemove <- toRemovalKeys
       // Remove stale keys first — same as the legacy syncFromStateChanges (line 1597).
       _ <- if (keysToRemove.nonEmpty) mpt.remove(keysToRemove.toList) else Async[F].unit
 
@@ -192,8 +207,10 @@ object AcceptanceMptStateChanges {
       _ <- mpt.insert[MetagraphSyncDataInfo](metagraphSyncDataEntries)
       updateNodeParametersEntries <- updateNodeParametersEntriesF
       priceStateEntries <- priceStateEntriesF
+      historicalStakeEntries <- historicalStakeEntriesF
       _ <- mpt.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
       _ <- mpt.insert[PriceRecord](priceStateEntries)
+      _ <- mpt.insert[StakeDistribution](historicalStakeEntries)
 
       _ <- applySystemIndexDeltaViaMpt[F, AllowSpendExpiryKey](
         mpt,

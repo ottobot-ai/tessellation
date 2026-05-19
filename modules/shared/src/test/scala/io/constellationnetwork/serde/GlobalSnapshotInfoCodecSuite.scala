@@ -8,7 +8,7 @@ import io.constellationnetwork.serde.implicits._
 
 import weaver.FunSuite
 
-/** Round-trip suite for the 17-field `GlobalSnapshotInfo` capstone codec. */
+/** Round-trip suite for the 18-field `GlobalSnapshotInfo` capstone codec. */
 object GlobalSnapshotInfoCodecSuite extends FunSuite {
 
   private def empty = GlobalSnapshotInfo(
@@ -28,7 +28,8 @@ object GlobalSnapshotInfoCodecSuite extends FunSuite {
     activeNodeCollaterals = None,
     nodeCollateralWithdrawals = None,
     priceState = None,
-    metagraphSyncData = None
+    metagraphSyncData = None,
+    historicalStakeSnapshots = SortedMap.empty
   )
 
   test("Empty GlobalSnapshotInfo round-trips (all options absent, all maps empty)") {
@@ -38,10 +39,10 @@ object GlobalSnapshotInfoCodecSuite extends FunSuite {
   test("Empty GlobalSnapshotInfo has a minimal encoded size") {
     // 3 required maps (6 uint16 zero prefixes, 2 bytes each = 6 bytes for 3 count-only maps = 6 bytes,
     // but actually 2 more required maps = 5 × 2 = 10 bytes) + 12 absent-option discriminators (12 bytes)
-    //   required-map count prefixes: 5 × 2 = 10 bytes
+    //   required-map count prefixes: 5 × 2 = 10 bytes + 1 for historicalStakeSnapshots = 12 bytes
     //   option discriminators:        12 × 1 = 12 bytes
-    //   total:                        22 bytes
-    expect(empty.immutableBytes.length == 22L)
+    //   total:                        24 bytes
+    expect(empty.immutableBytes.length == 24L)
   }
 
   test("GlobalSnapshotInfo with Some(empty) options round-trips") {

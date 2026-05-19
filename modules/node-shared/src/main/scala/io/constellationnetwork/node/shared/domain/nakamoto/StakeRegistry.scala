@@ -6,6 +6,7 @@ import cats.syntax.all._
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema.GlobalSnapshotInfo
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, StakeDistribution}
 import io.constellationnetwork.schema.peer.PeerId
 
 /** Read-only view of validator stake for Nakamoto consensus.

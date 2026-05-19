@@ -34,6 +34,7 @@ case class GlobalSnapshotStateProofV1(
       None,
       None,
       None,
+      None,
       None
     )
 }
@@ -70,7 +71,13 @@ case class GlobalSnapshotStateProof(
   nodeCollateralWithdrawals: Option[Hash],
   priceState: Option[Hash],
   lastGlobalSnapshotsWithCurrency: Option[Hash],
-  mptRoot: Option[Hash]
+  mptRoot: Option[Hash],
+  /** §3 NIPoPoW S0: per-field MPT subtree root covering historicalStakeSnapshots entries. `Some` once any boundary has fired and the
+    * partition has at least one entry; `None` during the warmup window before the first eta-period closes. Transitively covered by
+    * `mptRoot` (which hashes over the full byte map including this partition's entries) — the per-field hash is supplied for efficient
+    * single-period Merkle proofs by NIPoPoW light clients.
+    */
+  historicalStakeSnapshots: Option[Hash]
 ) extends StateProof
 
 object GlobalSnapshotStateProof {
@@ -92,10 +99,11 @@ object GlobalSnapshotStateProof {
       Option[Hash],
       Option[Hash],
       Option[Hash],
+      Option[Hash],
       Option[Hash]
     )
   ) => GlobalSnapshotStateProof = {
-    case (x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17) =>
-      GlobalSnapshotStateProof.apply(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17)
+    case (x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18) =>
+      GlobalSnapshotStateProof.apply(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18)
   }
 }

@@ -63,7 +63,8 @@ object MerkleTreeValidatorSuite extends MutableIOSuite {
       Some(SortedMap.empty),
       Some(SortedMap.empty),
       Some(SortedMap.empty),
-      Some(SortedMap.empty)
+      Some(SortedMap.empty),
+      SortedMap.empty
     )
     for {
       implicit0(j: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO]
@@ -93,7 +94,8 @@ object MerkleTreeValidatorSuite extends MutableIOSuite {
       Some(SortedMap.empty),
       Some(SortedMap.empty),
       Some(SortedMap.empty),
-      Some(SortedMap.empty)
+      Some(SortedMap.empty),
+      SortedMap.empty
     )
 
     for {

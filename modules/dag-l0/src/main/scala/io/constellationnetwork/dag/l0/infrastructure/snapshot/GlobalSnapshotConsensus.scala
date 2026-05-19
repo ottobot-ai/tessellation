@@ -456,21 +456,17 @@ object GlobalSnapshotConsensus {
           // activeDelegatedStakes + activeNodeCollaterals. Boot path (no GSI yet) falls back to 1/N
           // inside the constructor; updateValidators / markActive / markInactive semantics are
           // unchanged from equalWeight.
-          // §3 NIPoPoW S0.3: in-memory historical stake store. Populated at period boundaries by the
-          // SnapshotLeaderLoop's finality hook (S0.4) and the genesis loader (S0.5). `relativeStakeAt`
-          // reads through this store; the stake-weighted registry's existing warmup fall-through covers
-          // the case where no entry has been recorded yet (first 2 eta periods of consensus, OR
-          // post-restart before backfill).
-          epochStakeHistoryLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger
-            .fromName[F]("EpochStakeHistory")
-            .toResource
-          epochStakeHistory <- io.constellationnetwork.node.shared.domain.nakamoto.EpochStakeHistory
-            .make[F](epochStakeHistoryLogger)
-            .toResource
+          // §3 NIPoPoW S0.3: historical stake distributions live in
+          // `GlobalSnapshotInfo.historicalStakeSnapshots`, written by GSAM.accept() at every eta-period
+          // boundary ordinal. The callback below is a thin reader that scopes the lookup to the current
+          // GSI's recorded map — no in-memory mirror needed because the GSI is already kept current by
+          // `lastGlobalSnapshotStorage`. Warmup (pre-genesis / no record yet) returns None and the
+          // registry's fall-through path uses the current GSI's distribution.
           stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry
             .stakeWeighted[F](
               lastGlobalSnapshotStorage.getCombined.map(_.map(_._2)),
-              epochStakeHistory.get
+              (period: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
+                lastGlobalSnapshotStorage.getCombined.map(_.flatMap(_._2.historicalStakeSnapshots.get(period)))
             )
             .toResource
           // Filter out entries marked with alias="metagraph-op". They live in the seedlist

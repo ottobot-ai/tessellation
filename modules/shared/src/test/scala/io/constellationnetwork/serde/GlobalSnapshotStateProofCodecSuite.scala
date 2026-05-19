@@ -12,7 +12,7 @@ import weaver.FunSuite
 
 /** Round-trip + structural suite for the state-proof family:
   *   - `GlobalSnapshotStateProofV1` (4 fields, legacy pre-MPT shape).
-  *   - `GlobalSnapshotStateProof` (17 fields, current transitional shape with optional MPT root).
+  *   - `GlobalSnapshotStateProof` (18 fields, current transitional shape with optional MPT root + NIPoPoW S0 historical-stake root).
   *
   * These compose `HashCodec`, `MerkleRootCodec`, and `OptionCodec.option`. Rather than a single hand-computed hex golden for each, we
   * assert:
@@ -62,13 +62,14 @@ object GlobalSnapshotStateProofCodecSuite extends FunSuite {
       .and(expect(v1CurrencyAbsent.immutableBytes.fromImmutableBytes[GlobalSnapshotStateProofV1] == Right(v1CurrencyAbsent)))
   }
 
-  // ---- Current (17-field) --------------------------------------------------
+  // ---- Current (18-field) --------------------------------------------------
 
   private def allAbsentCurrent: GlobalSnapshotStateProof =
     GlobalSnapshotStateProof(
       h1,
       h2,
       h3,
+      None,
       None,
       None,
       None,
@@ -103,21 +104,22 @@ object GlobalSnapshotStateProofCodecSuite extends FunSuite {
       Some(h("0a")),
       Some(h("0b")),
       Some(h("0c")),
-      Some(h("0d"))
+      Some(h("0d")),
+      Some(h("0e"))
     )
 
-  test("Current, all options absent: 3*32 + 14 * 1 = 110 bytes") {
-    expect(allAbsentCurrent.immutableBytes.length == 110L)
+  test("Current, all options absent: 3*32 + 15 * 1 = 111 bytes") {
+    expect(allAbsentCurrent.immutableBytes.length == 111L)
   }
 
-  test("Current, all options present: 3*32 + 1 + 36 + 13 * (1+32) = 562 bytes") {
-    // required 96 + merkleRoot option (1+36) + 13 hash options × 33 = 96 + 37 + 429 = 562
-    expect(allPresentCurrent.immutableBytes.length == 562L)
+  test("Current, all options present: 3*32 + 1 + 36 + 14 * (1+32) = 595 bytes") {
+    // required 96 + merkleRoot option (1+36) + 14 hash options × 33 = 96 + 37 + 462 = 595
+    expect(allPresentCurrent.immutableBytes.length == 595L)
   }
 
   test("Current, all options absent — every tail byte is 0x00") {
     val tail = allAbsentCurrent.immutableBytes.drop(96L)
-    expect(tail.length == 14L).and(expect(tail.toArray.forall(_ == 0x00.toByte)))
+    expect(tail.length == 15L).and(expect(tail.toArray.forall(_ == 0x00.toByte)))
   }
 
   test("Current round-trips — all absent and all present") {
@@ -137,11 +139,11 @@ object GlobalSnapshotStateProofCodecSuite extends FunSuite {
     expect(a.immutableBytes != b.immutableBytes)
   }
 
-  test("Current mptRoot is the LAST field — last 33 bytes when set are present-flag + hash") {
-    val sole = allAbsentCurrent.copy(mptRoot = Some(h("0d")))
+  test("Current historicalStakeSnapshots is the LAST field — last 33 bytes when set are present-flag + hash") {
+    val sole = allAbsentCurrent.copy(historicalStakeSnapshots = Some(h("0e")))
     val bytes = sole.immutableBytes
-    val mptSlice = bytes.drop(bytes.length - 33L)
+    val tailSlice = bytes.drop(bytes.length - 33L)
     // Last 32 bytes must be the hash; the preceding byte is the Some discriminator (non-zero).
-    expect(mptSlice.head != 0x00.toByte).and(expect(mptSlice.drop(1) == ByteVector.fromValidHex("0d" * 32)))
+    expect(tailSlice.head != 0x00.toByte).and(expect(tailSlice.drop(1) == ByteVector.fromValidHex("0e" * 32)))
   }
 }

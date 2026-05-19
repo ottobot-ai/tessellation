@@ -149,7 +149,8 @@ object RewardsServiceSuite extends SimpleIOSuite {
       nodeCollateralWithdrawals = None,
       priceState = None,
       lastGlobalSnapshotsWithCurrency = None,
-      mptRoot = None
+      mptRoot = None,
+      historicalStakeSnapshots = None
     ),
     allowSpendBlocks = Some(SortedSet.empty),
     tokenLockBlocks = Some(SortedSet.empty),
@@ -180,7 +181,8 @@ object RewardsServiceSuite extends SimpleIOSuite {
     activeNodeCollaterals = None,
     nodeCollateralWithdrawals = None,
     priceState = None,
-    metagraphSyncData = None
+    metagraphSyncData = None,
+    historicalStakeSnapshots = SortedMap.empty
   )
 
   test("calculateAndStoreRewardsInfo stores rewards info when calculator returns Some") {

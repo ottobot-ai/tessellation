@@ -350,7 +350,8 @@ object Mocks {
       Some(SortedMap.empty),
       Some(SortedMap.empty),
       Some(SortedMap.empty),
-      Some(SortedMap.empty)
+      Some(SortedMap.empty),
+      SortedMap.empty
     )
 
   private[snapshot] def mkTokenLock[F[_]: Async](

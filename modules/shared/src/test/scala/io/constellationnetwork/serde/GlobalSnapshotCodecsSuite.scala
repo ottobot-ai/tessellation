@@ -81,6 +81,7 @@ object GlobalSnapshotCodecsSuite extends FunSuite {
       None,
       None,
       None,
+      None,
       None
     )
     val sample = GlobalIncrementalSnapshot(

@@ -13,18 +13,19 @@ import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for the state-proof family:
   *   - `GlobalSnapshotStateProofV1` — 4 fields (3 required Hashes + 1 optional MerkleRoot).
-  *   - `GlobalSnapshotStateProof` — 17 fields (V1 + 13 optional Hashes).
+  *   - `GlobalSnapshotStateProof` — 18 fields (V1 + 14 optional Hashes; 14th = `historicalStakeSnapshots`, the §3 NIPoPoW per-field subtree
+  *     root over the stake-snapshot partition).
   *
-  * Both are FROZEN consensus types. V1 is the legacy, pre-MPT shape; the 17-field current variant adds optional witness hashes for features
+  * Both are FROZEN consensus types. V1 is the legacy, pre-MPT shape; the 18-field current variant adds optional witness hashes for features
   * that were added incrementally (allow-spends, token locks, delegated staking, node collaterals, price state, multi-currency snapshots,
-  * and the final `mptRoot` which is the Merkle-Patricia-Trie state root once the state-proof hardfork activates).
+  * the `mptRoot` covering all partitions, and the NIPoPoW historical-stake snapshot partition).
   *
   * Field order matches the case class declaration exactly. Adding / reordering / removing a field requires introducing a new era (e.g.
   * `GlobalSnapshotStateProofV2Codec`) — this codec is never mutated.
   *
   * Sizes:
   *   - V1: 32 + 32 + 32 + (1 | 37) = 97 or 129 bytes.
-  *   - Current: V1 payload + 13 × (1 | 33) = 110 .. 559 bytes. The 1-byte Option discriminator means the absent case is a single 0x00 byte
+  *   - Current: V1 payload + 14 × (1 | 33) = 111 .. 593 bytes. The 1-byte Option discriminator means the absent case is a single 0x00 byte
   *     — tight for the "legacy snapshot without any of the post-V1 features" case.
   *
   * The schemas are deliberately kept separate (not unified via "V1 is a prefix of current") — historical V1 bytes must decode via V1's
@@ -70,6 +71,7 @@ object GlobalSnapshotStateProofCodec {
       optionalHashCodec ::
       optionalHashCodec ::
       optionalHashCodec ::
+      optionalHashCodec ::
       optionalHashCodec)
       .xmap[GlobalSnapshotStateProof](
         {
@@ -78,7 +80,8 @@ object GlobalSnapshotStateProofCodec {
               lastAllowSpendRefs :: lastTokenLockRefs ::
               updateNodeParams :: activeDelegated :: delegatedWithdrawals ::
               activeCollaterals :: collateralWithdrawals ::
-              priceState :: lastGlobalWithCurrency :: mptRoot :: HNil =>
+              priceState :: lastGlobalWithCurrency :: mptRoot ::
+              historicalStakeSnapshots :: HNil =>
             GlobalSnapshotStateProof(
               sch,
               tx,
@@ -96,7 +99,8 @@ object GlobalSnapshotStateProofCodec {
               collateralWithdrawals,
               priceState,
               lastGlobalWithCurrency,
-              mptRoot
+              mptRoot,
+              historicalStakeSnapshots
             )
         },
         p =>
@@ -117,6 +121,7 @@ object GlobalSnapshotStateProofCodec {
             p.priceState ::
             p.lastGlobalSnapshotsWithCurrency ::
             p.mptRoot ::
+            p.historicalStakeSnapshots ::
             HNil
       )
 

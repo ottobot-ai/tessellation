@@ -479,7 +479,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
         nodeCollateralWithdrawals = None,
         priceState = None,
         lastGlobalSnapshotsWithCurrency = None,
-        mptRoot = None
+        mptRoot = None,
+        historicalStakeSnapshots = None
       ),
       Some(SortedSet.empty),
       Some(SortedSet.empty),
@@ -513,7 +514,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
       Some(SortedMap.empty),
       Some(SortedMap.empty),
       Some(SortedMap.empty),
-      Some(SortedMap.empty)
+      Some(SortedMap.empty),
+      SortedMap.empty
     )
   test("download should happen for the base no blocks case") {
     testResources.use {
@@ -584,7 +586,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             Some(SortedMap.empty),
             Some(SortedMap.empty),
             Some(SortedMap.empty),
-            Some(SortedMap.empty)
+            Some(SortedMap.empty),
+            SortedMap.empty
           )
           balancesBefore <- balancesR.get
           blocksBefore <- blocksR.toMap
@@ -764,7 +767,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             Some(SortedMap.empty),
             Some(SortedMap.empty),
             Some(SortedMap.empty),
-            Some(SortedMap.empty)
+            Some(SortedMap.empty),
+            SortedMap.empty
           )
 
           // Inserting blocks in required state
@@ -962,7 +966,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             Some(SortedMap.empty),
             Some(SortedMap.empty),
             Some(SortedMap.empty),
-            Some(SortedMap.empty)
+            Some(SortedMap.empty),
+            SortedMap.empty
           )
 
           // Inserting blocks in required state
@@ -1246,7 +1251,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             Some(SortedMap.empty),
             Some(SortedMap.empty),
             Some(SortedMap.empty),
-            Some(SortedMap.empty)
+            Some(SortedMap.empty),
+            SortedMap.empty
           )
           lastSnapshotStateProof <- {
             implicit val hasher = currentHasher
@@ -1544,7 +1550,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             Some(SortedMap.empty),
             Some(SortedMap.empty),
             Some(SortedMap.empty),
-            Some(SortedMap.empty)
+            Some(SortedMap.empty),
+            SortedMap.empty
           )
           lastSnapshotInfoStateProof <- {
             implicit val testGlobalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal.MinValue)

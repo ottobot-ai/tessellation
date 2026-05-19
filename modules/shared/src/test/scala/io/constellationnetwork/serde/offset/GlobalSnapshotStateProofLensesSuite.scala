@@ -35,6 +35,7 @@ object GlobalSnapshotStateProofLensesSuite extends FunSuite {
     None,
     None,
     None,
+    None,
     None
   )
 
@@ -55,7 +56,8 @@ object GlobalSnapshotStateProofLensesSuite extends FunSuite {
     Some(h("0a")),
     Some(h("0b")),
     Some(h("0c")),
-    Some(h("0d"))
+    Some(h("0d")),
+    Some(h("0e"))
   )
 
   test("Fixed lenses read the three required hashes from both all-absent and all-present layouts") {

@@ -17,6 +17,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, StakeDistribution}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
@@ -64,7 +65,8 @@ case class GlobalSnapshotInfoV1(
       Some(SortedMap.empty),
       Some(SortedMap.empty),
       Some(SortedMap.empty),
-      Some(SortedMap.empty)
+      Some(SortedMap.empty),
+      SortedMap.empty
     )
 
   def stateProof[F[_]: Parallel: Async: Hasher: JsonSerializer](ordinal: SnapshotOrdinal)(
@@ -105,7 +107,8 @@ case class GlobalSnapshotInfoV2(
       None,
       None,
       None,
-      None
+      None,
+      SortedMap.empty
     )
 
   def stateProof[F[_]: Parallel: Async: Hasher: JsonSerializer](ordinal: SnapshotOrdinal)(
@@ -154,7 +157,14 @@ case class GlobalSnapshotInfo(
   activeNodeCollaterals: Option[SortedMap[Address, SortedSet[NodeCollateralRecord]]],
   nodeCollateralWithdrawals: Option[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]],
   priceState: Option[SortedMap[TokenPair, PriceRecord]],
-  metagraphSyncData: Option[SortedMap[Address, MetagraphSyncDataInfo]]
+  metagraphSyncData: Option[SortedMap[Address, MetagraphSyncDataInfo]],
+  // §3 NIPoPoW S0: stake distribution snapshotted at each eta-period boundary, indexed by the
+  // closing period. Used by `StakeRegistry.relativeStakeAt(_, N-2)` for Cardano-style mark/set/go
+  // slot-leader eligibility. Updated by GSAM.accept() at boundary ordinals (`ord % R == R - 1`);
+  // retention pruning keeps the last 4 periods (algorithm needs N-2; extra grace for reorgs).
+  // Empty on V1/V2 upgrade and on genesis until the loader seeds it; eligibility reads fall through
+  // to the warmup branch (current GSI) in that case.
+  historicalStakeSnapshots: SortedMap[EtaPeriod, StakeDistribution]
 ) extends SnapshotInfo[GlobalSnapshotStateProof] {
 
   def toGlobalSnapshotInfo: GlobalSnapshotInfo =
@@ -175,7 +185,8 @@ case class GlobalSnapshotInfo(
       activeNodeCollaterals,
       nodeCollateralWithdrawals,
       priceState,
-      metagraphSyncData
+      metagraphSyncData,
+      historicalStakeSnapshots
     )
 
   def stateProof[F[_]: Parallel: Async: Hasher: JsonSerializer](ordinal: SnapshotOrdinal)(
@@ -265,7 +276,10 @@ object GlobalSnapshotInfo {
                           nodeCollateralWithdrawals = info.nodeCollateralWithdrawals.map(_ => fieldRoot(FId.NodeCollateralWithdrawals)),
                           priceState = info.priceState.map(_ => fieldRoot(FId.PriceState)),
                           lastGlobalSnapshotsWithCurrency = None,
-                          mptRoot = Some(value.value)
+                          mptRoot = Some(value.value),
+                          historicalStakeSnapshots =
+                            if (info.historicalStakeSnapshots.isEmpty) None
+                            else Some(fieldRoot(FId.HistoricalStakeSnapshots))
                         )
                       }
                     case None => MonadThrow[F].raiseError(new RuntimeException(s"Could not get mptRootHash for ordinal $ordinal"))
@@ -359,7 +373,10 @@ object GlobalSnapshotInfo {
         nodeCollateralWithdrawals = info.nodeCollateralWithdrawals.map(_ => fieldRoot(FId.NodeCollateralWithdrawals)),
         priceState = info.priceState.map(_ => fieldRoot(FId.PriceState)),
         lastGlobalSnapshotsWithCurrency = None,
-        mptRoot = Some(mptRoot.value)
+        mptRoot = Some(mptRoot.value),
+        historicalStakeSnapshots =
+          if (info.historicalStakeSnapshots.isEmpty) None
+          else Some(fieldRoot(FId.HistoricalStakeSnapshots))
       )
     }
   }
@@ -384,7 +401,7 @@ object GlobalSnapshotInfo {
       info.nodeCollateralWithdrawals.traverse(_.hash),
       info.priceState.traverse(_.hash),
       info.metagraphSyncData.traverse(_.hash)
-    ).mapN(GlobalSnapshotStateProof.apply(_, _, _, lastCurrencySnapshots.map(_.getRoot), _, _, _, _, _, _, _, _, _, _, _, _, None))
+    ).mapN(GlobalSnapshotStateProof.apply(_, _, _, lastCurrencySnapshots.map(_.getRoot), _, _, _, _, _, _, _, _, _, _, _, _, None, None))
 
   def empty: GlobalSnapshotInfo = GlobalSnapshotInfo(
     SortedMap.empty,
@@ -403,7 +420,8 @@ object GlobalSnapshotInfo {
     Some(SortedMap.empty),
     Some(SortedMap.empty),
     Some(SortedMap.empty),
-    Some(SortedMap.empty)
+    Some(SortedMap.empty),
+    SortedMap.empty
   )
 
   implicit val optionAddressKeyEncoder: KeyEncoder[Option[Address]] = new KeyEncoder[Option[Address]] {

@@ -24,8 +24,8 @@ import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, MptTxAction}
-import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot._
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig}
 import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
@@ -412,8 +412,21 @@ object SnapshotLeaderLoop {
 
                     slotRefined = Slot(NonNegLong.unsafeFrom(Math.max(0L, currentSlot)))
 
-                    // Query actual relative stake from registry
-                    myStake <- stakeRegistry.relativeStake(selfId)
+                    // §3 NIPoPoW S0.4 — N-2 epoch staggering: relative stake is read from the
+                    // distribution recorded at the boundary of `currentEtaPeriod - 2`, NOT from the
+                    // current GSI. This matches Cardano's mark/set/go pipeline: snapshot at the end
+                    // of period N is used for slot eligibility in period N+2. The 2-period gap gives
+                    // finality time for the snapshot to lock in before consensus relies on it.
+                    //
+                    // Fall-through semantics (in `StakeRegistry.relativeStakeAt`): for negative
+                    // lookback periods (the first 2 eta periods after genesis) and for periods that
+                    // EpochStakeHistory hasn't yet recorded (e.g., post-restart before backfill), the
+                    // impl falls back to the current GSI — correct because the genesis distribution
+                    // is unchanged during warmup.
+                    lastChainOrdinal <- chainStore.bestTipOrdinal.map(_.getOrElse(0L))
+                    currentPeriod = EtaCalculation.rotationPeriod(lastChainOrdinal, etaRotationSnapshots)
+                    lookbackPeriod = EtaPeriod(currentPeriod - 2L)
+                    myStake <- stakeRegistry.relativeStakeAt(selfId, lookbackPeriod)
 
                     // Chain-derived eta: deterministic from stored chain, no in-memory accumulator.
                     // Period 0: genesis eta (constant). Period N>=1: derived from VRF outputs in period N-1.
@@ -422,8 +435,6 @@ object SnapshotLeaderLoop {
                     // Rotation period is keyed on **ordinal**, not slot — slots are LDD-paced and lumpy;
                     // ordinals are 1:1 with snapshots and give a stable R that satisfies the R ≥ 3·k₁
                     // bound. See `docs/nakamoto/attestation-and-finality.md` §1.
-                    lastChainOrdinal <- chainStore.bestTipOrdinal.map(_.getOrElse(0L))
-                    currentPeriod = EtaCalculation.rotationPeriod(lastChainOrdinal, etaRotationSnapshots)
                     genesisEta <- epochStateRef.get.map(_.genesisEta)
                     eta <-
                       if (currentPeriod <= 0) {
