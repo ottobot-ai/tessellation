@@ -36,26 +36,45 @@ Estimate from the proposal §6.6: **~2,400 LOC, 6–10 engineer-weeks** in-node 
 
 ---
 
-## Slice S1 — Multi-level VRF trials (Phase A.1, ~3 days)
+## Slice S1 — Multi-level VRF trials (Phase A.1, ~3 days)  ✅ **LANDED `15f64d8fb`**
 
-Per proposal §2.1, each slot fires `L = 10` independent trials per validator using domain-separated VRF outputs from the single ρ. The level-µ trial passes iff `H(ρ ‖ µ) < τ_µ`, where `τ_µ` shrinks geometrically.
+Per proposal §2.1, each slot the producer runs L-1 independent eligibility trials (one per super-level µ ∈ {1..L-1}, default L=10) all derived from the single existing VRF output `ρ_S` via domain-separated rehashing. **L0 stays untouched** — every snapshot is a level-0 hit by chain construction (the existing `EligibilityChecker` against `f(δ)` is the L0 production gate; the level-0 trial in NIPoPoW framework is implicit).
 
-- `LevelTrial` data + helper computing all L trials from one ρ in O(L · hash) (~120 LOC, `modules/node-shared/.../nakamoto/nipopow/LevelTrial.scala`)
-- `LevelThreshold` parameter table from proposal §2.2 (`τ_µ = τ_0 · 2^(-µ)` with shifted-exp gating) (~150 LOC)
-- `SuperLevelParams` — the L0–L9 parameter table (~60 LOC)
-- Tests: L independent trials produce statistically independent passes; per-level density matches `f_0 · 2^(-µ)` over 10k slots (~80 LOC)
+```
+τ_µ(S) := Blake2b512(ρ_S ‖ "TEST-" ++ µ) / 2^512                          // domain-separated rehash
+S is a level-µ superblock  ⟺  τ_µ(S) < θ_µ^eff(g_µ, δ_S)                  // pass condition
+θ_µ(g_µ)   = p_µ^max · (1 − exp(−(g_µ − ψ_super) / σ_µ)) for g_µ ≥ ψ_super, else 0   // shifted-exp over base-block gap
+θ_µ^eff    = θ_µ(g_µ) · min(1, δ_S / γ)                                   // L0 slot-gap gating
+```
 
-**No consensus impact**: level trials are computed offline from the existing ρ; they don't change which slot is "won" (level-0 is identical to today's VRF check).
+**Critical**: this is L independent trials, NOT Kiayias nested rarity. Per paper §6, independence forces the adversary to satisfy L independent constraints simultaneously; the PoW `τ < 2^(-µ)` analog has correct densities but no security gain.
+
+Landed at `15f64d8fb`:
+- `SuperLevelParams.scala` — L1-L9 (p_µ^max, σ_µ, target density) table from proposal §2.2.
+- `LevelTrial.scala` — `LevelTrial(level, tau, effectiveThreshold, passed)`.
+- `LevelTrialComputer.scala` — pure F-effecting computer (τ rehash + gating + threshold + runAll).
+- 16/16 tests passing; uses Bifrost continued-fraction `Exp` (byte-deterministic).
+
+**No consensus impact**: level trials are pure offline computation from the existing ρ; level-0 production unchanged.
 
 ---
 
 ## Slice S2 — SubchainState header field (Phase A.2, ~2 days)
 
-- `SubchainState(levelCounts: Vector[Long])` carried in each snapshot's header (~120 LOC + codecs)
-- `SubchainStateUpdater`: `updateFrom(parentState, levelTrialOutcomes) → newState` (~150 LOC)
-- Slot-cert protobuf field for the L-vector (~100 LOC schema + scodec)
-- Backward-compat: old snapshots with no subchain field decode to `Vector.fill(L)(0L)`; new code accepts both for one eta period after deploy
-- Tests: 1k-snapshot replay produces identical level counts on every node (~100 LOC)
+Split into two phases against the "8gl0+4mg+4shards baseline that can't be broken" rule:
+
+### Phase 2a ✅ **LANDED `5ec3737f3`** — pure data + updater
+
+- `SubchainState(levelCounts: Vector[Long])` — per-super-level cumulative count, size-invariant via `require`.
+- `SubchainStateUpdater.updateFrom(parent, trials)` — pure F-free transformation. Validates trial vector size + level ordering.
+- 10/10 tests passing; no consensus path touched.
+
+### Phase 2b — header wiring (consensus-impacting, deferred)
+
+- Slot-cert protobuf field for the L-vector (~100 LOC schema + scodec; greenfield so no back-compat needed).
+- `SnapshotLeaderLoop` populates the field via `SubchainStateUpdater` at production time.
+- Verifier reads + validates the field on snapshot ingestion.
+- Tests: 1k-snapshot replay produces identical level counts on every node (~100 LOC).
 
 **Validation**: this should NEVER change finality — only adds a header observation. Run iter, verify cluster still finalizes at same cadence as pre-deploy.
 
@@ -95,7 +114,13 @@ Per proposal §2.1, each slot fires `L = 10` independent trials per validator us
 - 8-node cluster + bulk-tx load for 4+ hours
 - Build NIPoPoW proof of last 2 eta periods from gl0-0
 - Verify proof on gl0-7 + a fresh light-client harness (Scala-only, no JVM SDK yet — Phase E is separate)
-- Confirm: proof size ≤ 50 KB, verification time ≤ 200ms, level-density relative error ≤ 5% per level
+
+**Empirical acceptance criteria** (per paper §5.3, §5.4, §5.7):
+- Proof size ≤ 50 KB
+- Verification time ≤ 200ms
+- Per-level density relative error ≤ 5% across all super-levels (matches paper Fig 5 "Superblock Density Validation" — target densities `f_0 · 2^(-µ)` validated within 1-13% per level at 10M slots)
+- Honest cumulative weight outpaces a simulated burst adversary by ≥10× in fork-race ensemble (per paper §5.3 Fig 7)
+- Settlement-layer behavior unchanged: cluster finalizes at same cadence as pre-S2-phase-2b deploy (no consensus regression)
 
 ---
 

@@ -23,9 +23,9 @@ object SubchainStateUpdaterSuite extends FunSuite {
   }
 
   test("countAt out-of-range µ returns 0") {
-    expect(SubchainState.Genesis.countAt(0) == 0L) and
-      expect(SubchainState.Genesis.countAt(SuperLevelParams.SuperLevelCount + 1) == 0L) and
-      expect(SubchainState.Genesis.countAt(-1) == 0L)
+    expect(SubchainState.Genesis.countAt(0) == 0L)
+      .and(expect(SubchainState.Genesis.countAt(SuperLevelParams.SuperLevelCount + 1) == 0L))
+      .and(expect(SubchainState.Genesis.countAt(-1) == 0L))
   }
 
   test("updateFrom — all-fail leaves counts unchanged") {
@@ -49,10 +49,10 @@ object SubchainStateUpdaterSuite extends FunSuite {
     // L1 fails, L3 passes — this is independent NOT-nested rarity. Per paper §6.
     val passes = Vector.tabulate(SuperLevelParams.SuperLevelCount)(i => i == 2 || i == 5) // L3 and L6
     val updated = SubchainStateUpdater.updateFrom(SubchainState.Genesis, trials(passes))
-    expect(updated.countAt(1) == 0L) and
-      expect(updated.countAt(3) == 1L) and
-      expect(updated.countAt(6) == 1L) and
-      expect(updated.countAt(9) == 0L)
+    expect(updated.countAt(1) == 0L)
+      .and(expect(updated.countAt(3) == 1L))
+      .and(expect(updated.countAt(6) == 1L))
+      .and(expect(updated.countAt(9) == 0L))
   }
 
   test("updateFrom — composes: applying 5 all-pass updates → all counts = 5") {

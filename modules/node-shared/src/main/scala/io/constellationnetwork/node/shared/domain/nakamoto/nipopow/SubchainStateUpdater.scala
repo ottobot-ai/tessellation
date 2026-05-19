@@ -1,10 +1,10 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.nipopow
 
-/** Pure deterministic transformation: given the parent snapshot's [[SubchainState]] and this snapshot's level-trial outcomes,
-  * produce the new state. Increments each level-µ count by 1 iff that level's trial passed.
+/** Pure deterministic transformation: given the parent snapshot's [[SubchainState]] and this snapshot's level-trial outcomes, produce the
+  * new state. Increments each level-µ count by 1 iff that level's trial passed.
   *
-  * Producer and verifier run the same function on the same inputs — byte-identical output by construction. No `F[_]`, no side
-  * effects, no implicit state.
+  * Producer and verifier run the same function on the same inputs — byte-identical output by construction. No `F[_]`, no side effects, no
+  * implicit state.
   */
 object SubchainStateUpdater {
 
