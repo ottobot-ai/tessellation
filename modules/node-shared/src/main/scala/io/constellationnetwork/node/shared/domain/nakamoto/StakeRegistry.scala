@@ -74,7 +74,8 @@ trait StakeRegistry[F[_]] {
     * '''Fallback semantics (load-bearing for boot):'''
     *   - If `etaPeriod` is negative or the historical snapshot for that period is not yet recorded (pre-genesis warmup, the first 2 eta
     *     periods after genesis), the impl returns the genesis distribution's view. The boot path stays correct as long as the
-    *     genesis-loader stamps period -1 / 0 / 1 with the same starting distribution (§ S0.5).
+    *     genesis-loader stamps periods -2 / -1 / 0 with the genesis distribution (§ S0.5). Those three keys cover the lookback at ordinals
+    *     in periods 0, 1, and 2 (respectively `0-2`, `1-2`, `2-2`).
     *   - If `peerId` is not in the current validator set, returns `Ratio.Zero` regardless of history. Slashed/removed validators get 0 even
     *     if they had stake in the lookback period.
     *
@@ -332,8 +333,9 @@ object StakeRegistry {
         // §3 NIPoPoW N-2: read the stake distribution that was finalized at the boundary of `etaPeriod`,
         // compute relativeStake against the current validator set. Fallback chain:
         //   1. historical snapshot exists → use it (post-warmup steady state)
-        //   2. period < 0 OR no historical record yet → fall through to current GSI (warmup; valid for
-        //      periods 0 and 1 because the genesis loader stamps those with the genesis distribution)
+        //   2. period < 0 OR no historical record yet → fall through to current GSI (transient miss; the
+        //      genesis loader stamps periods -2/-1/0 with the genesis distribution via § S0.5, so the
+        //      fall-through fires only for clusters that bootstrapped before S0.5 landed)
         //   3. GSI also unavailable (very early boot) → 1/N fallback (mirrors relativeStake's bootstrap path)
         def relativeStakeAt(peerId: PeerId, etaPeriod: EtaPeriod): F[Ratio] =
           (historicalDistributionFor(etaPeriod), validatorsRef.get).flatMapN {
