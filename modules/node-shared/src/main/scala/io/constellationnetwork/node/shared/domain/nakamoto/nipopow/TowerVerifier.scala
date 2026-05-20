@@ -5,10 +5,14 @@ import cats.syntax.all._
 
 import io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker
 import io.constellationnetwork.numerics.Ratio
+import io.constellationnetwork.numerics.RatioInstances._
 import io.constellationnetwork.numerics.algebras.{Exp, Log1p}
 import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.LddConfig
+
+import io.circe.{Encoder, Json}
+import io.circe.syntax._
 
 /** §3 NIPoPoW S4.3 — structured error type for proof rejection. Each variant carries enough context for diagnostic logging without exposing
   * the validator internals.
@@ -39,6 +43,43 @@ object ProofError {
 
   /** A header's `subchainLevelCounts` size doesn't equal `SuperLevelParams.SuperLevelCount` — wire-shape violation. */
   final case class SubchainStateShape(ordinal: SnapshotOrdinal, observedSize: Int) extends ProofError
+
+  /** §3 NIPoPoW S5 — JSON encoder for `ProofError`, used by the HTTP verify endpoint. Hand-rolled (rather than derevo-derived) so we keep
+    * a stable `kind` discriminator field across all variants — the TS verifier matches on it. The discriminator name `kind` matches the
+    * trigger-name convention already exposed by `FinalityTriggersRoutes`.
+    */
+  implicit val encoder: Encoder[ProofError] = Encoder.instance {
+    case EmptyL0Suffix =>
+      Json.obj("kind" -> Json.fromString("empty_l0_suffix"))
+    case NonMonotonicOrdinals(level) =>
+      Json.obj("kind" -> Json.fromString("non_monotonic_ordinals"), "level" -> Json.fromInt(level))
+    case TrialFailed(level, ordinal, observedTau, threshold) =>
+      Json.obj(
+        "kind" -> Json.fromString("trial_failed"),
+        "level" -> Json.fromInt(level),
+        "ordinal" -> ordinal.asJson,
+        "observed_tau" -> observedTau.asJson,
+        "threshold" -> threshold.asJson
+      )
+    case DensityViolation(level, observed, target, relativeError) =>
+      Json.obj(
+        "kind" -> Json.fromString("density_violation"),
+        "level" -> Json.fromInt(level),
+        "observed" -> observed.asJson,
+        "target" -> target.asJson,
+        "relative_error" -> relativeError.asJson
+      )
+    case L0VrfFailed(ordinal) =>
+      Json.obj("kind" -> Json.fromString("l0_vrf_failed"), "ordinal" -> ordinal.asJson)
+    case EtaChainInconsistent(ordinal) =>
+      Json.obj("kind" -> Json.fromString("eta_chain_inconsistent"), "ordinal" -> ordinal.asJson)
+    case SubchainStateShape(ordinal, observedSize) =>
+      Json.obj(
+        "kind" -> Json.fromString("subchain_state_shape"),
+        "ordinal" -> ordinal.asJson,
+        "observed_size" -> Json.fromInt(observedSize)
+      )
+  }
 }
 
 /** §3 NIPoPoW S4.3 — pure verifier for a [[TowerProof]].

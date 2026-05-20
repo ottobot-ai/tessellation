@@ -215,6 +215,11 @@ sealed abstract class HttpApi[
   // consensus semantics change.
   private val finalityTriggersRoutes = FinalityTriggersRoutes[F](services.finalityTriggerViewRef)
 
+  // §3 NIPoPoW S5 — light-client proof + verify routes. Reads the NipopowProofProvider Ref
+  // populated by GlobalSnapshotConsensus.make once the tower store and snapshot storage are
+  // wired. Pure observability — never feeds back into consensus.
+  private val nipopowRoutes = NipopowRoutes[F](services.nipopowProofProviderRef)
+
   private val walletRoutes = WalletRoutes[F, GlobalIncrementalSnapshot]("/dag", services.address)
   private val consensusInfoRoutes =
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -253,6 +258,7 @@ sealed abstract class HttpApi[
                 clusterRoutes.publicRoutes <+>
                 snapshotRoutes.publicRoutes <+>
                 finalityTriggersRoutes.publicRoutes <+>
+                nipopowRoutes.publicRoutes <+>
                 walletRoutes.publicRoutes <+>
                 nodeRoutes.publicRoutes <+>
                 consensusInfoRoutes.publicRoutes <+>

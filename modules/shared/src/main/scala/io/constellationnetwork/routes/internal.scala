@@ -71,6 +71,7 @@ object internal {
       :: Equal["/node-collateral"]
       :: Equal["/events"]
       :: Equal["/mempool"]
+      :: Equal["/nakamoto"]
       :: HNil
   ]
 

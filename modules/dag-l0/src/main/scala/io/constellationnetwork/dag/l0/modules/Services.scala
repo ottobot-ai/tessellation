@@ -74,6 +74,12 @@ object Services {
     loggerBundle: LoggerBundle[F],
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
     finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
+    // §3 NIPoPoW S5 — observability seam for the NipopowRoutes light-client endpoints. Mirrors
+    // `finalityTriggerViewRef`; populated inside GlobalSnapshotConsensus.make once the tower store
+    // and snapshot storage are wired. The route handles `None` as a 503 (pre-startup).
+    nipopowProofProviderRef: Ref[F, Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.nipopow.NipopowProofProvider[F]
+    ]],
     // §1.2 Slice 3c: KesRegistry loaded from L0 genesis (or empty for CSV-genesis). Threaded
     // through to GlobalSnapshotConsensus.make.
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F]
@@ -259,6 +265,7 @@ object Services {
             queues.rumor,
             nakamotoFinalizedOrdinalRef,
             finalityTriggerViewRef,
+            nipopowProofProviderRef,
             processMetagraphBinary,
             enqueueAllowSpendBlock,
             enqueueDAGBlock,
@@ -290,6 +297,7 @@ object Services {
         eventMempool = eventMempoolService,
         sidecarClient = sidecarClient,
         finalityTriggerViewRef = finalityTriggerViewRef,
+        nipopowProofProviderRef = nipopowProofProviderRef,
         pendingReader = pendingReader
       ) {}
 }
@@ -312,6 +320,12 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   // SnapshotLeaderLoop after trigger construction; read by FinalityTriggersRoutes. The
   // route returns 503 while the Ref is empty (pre-startup window).
   val finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
+  // §3 NIPoPoW S5 — observability seam for /nakamoto/nipopow/* routes. Populated inside
+  // GlobalSnapshotConsensus.make once the tower store + snapshot storage are wired. The
+  // route returns 503 while the Ref is empty (pre-startup window).
+  val nipopowProofProviderRef: Ref[F, Option[
+    io.constellationnetwork.node.shared.domain.nakamoto.nipopow.NipopowProofProvider[F]
+  ]],
   // #117/#118 Phase 2: branch-aware reader for gl0 HTTP routes / read paths. Resolves to the
   // chain's bestTip under MultiBranch so reads pick up the chain's pending writes, falling
   // through to base on miss. See `GlobalStateReader.pending` for the contract.

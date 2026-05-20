@@ -114,6 +114,12 @@ object Main
       finalityTriggerViewRef <- Ref
         .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[IO]]](None)
         .asResource
+      // §3 NIPoPoW S5 — light-client proof + verify HTTP routes. Populated inside
+      // GlobalSnapshotConsensus.make once the tower store and snapshot storage are wired.
+      // Shared between Services and HttpApi the same way as `finalityTriggerViewRef`.
+      nipopowProofProviderRef <- Ref
+        .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.nipopow.NipopowProofProvider[IO]]](None)
+        .asResource
       storages <- Storages
         .make[IO](
           sharedStorages,
@@ -170,6 +176,7 @@ object Main
           nodeShared.loggerBundle,
           nakamotoFinalizedOrdinalRef,
           finalityTriggerViewRef,
+          nipopowProofProviderRef,
           kesRegistry
         )
 

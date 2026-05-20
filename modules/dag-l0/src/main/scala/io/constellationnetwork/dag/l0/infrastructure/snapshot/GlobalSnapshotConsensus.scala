@@ -165,6 +165,14 @@ object GlobalSnapshotConsensus {
     // "which triggers qualified ord N?" without owning trigger references. Empty until the
     // leader-loop fiber has started — the route handles `None` as a 503.
     finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
+    // §3 NIPoPoW S5 — observability seam for the NipopowRoutes light-client endpoints. Populated
+    // here in the resource block once the local `TowerStore` and snapshot storage are available.
+    // Read by `NipopowRoutes` to answer GET /nakamoto/nipopow/proof and POST /nakamoto/nipopow/verify
+    // without owning the builder/verifier references. Empty until this resource has produced the
+    // wired provider — the route handles `None` as a 503.
+    nipopowProofProviderRef: Ref[F, Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.nipopow.NipopowProofProvider[F]
+    ]],
     // Invoked by NakamotoSyncDaemon when a metagraph-binary arrives via gossip.
     // Routes the binary through the same pipeline as the HTTP endpoint (stateChannelService.process).
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
@@ -947,6 +955,27 @@ object GlobalSnapshotConsensus {
           towerFinalizer <- io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerFinalizer
             .make[F](towerStore, levelTrialComputer, lddConfig.lddCutoff.toLong)
             .toResource
+          // §3 NIPoPoW S5 — wire the proof builder + verifier and publish a `NipopowProofProvider` to the HTTP layer.
+          //   - Builder reads the local tower store + global snapshot storage to assemble per-level chains + L0 suffix.
+          //   - Verifier uses the same `(log1p, exp)` interpreters that drive the leader-loop's eligibility check, so any
+          //     proof a remote builder produces from this node's chain is byte-identical-verifiable here.
+          //   - Provider bakes in `(genesisEta, etaRotationSnapshots, lddConfig)` so the route doesn't need them.
+          // Provider is published once at startup — the towerStore + verifier are immutable for the lifetime of the
+          // process, so re-publishing under reorg is unnecessary.
+          _ <- {
+            val proofBuilder = io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerProofBuilder
+              .make[F](towerStore, globalSnapshotStorage)
+            val proofVerifier =
+              io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerVerifier.make[F](log1p, exp)
+            val provider = io.constellationnetwork.node.shared.domain.nakamoto.nipopow.NipopowProofProvider.make[F](
+              proofBuilder,
+              proofVerifier,
+              genesisEta = genesisEta,
+              etaRotationSnapshots = etaRotationSnapshots.toLong,
+              lddConfig = lddConfig
+            )
+            nipopowProofProviderRef.set(Some(provider))
+          }.toResource
           _ <- supervisor
             .supervise(
               io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
