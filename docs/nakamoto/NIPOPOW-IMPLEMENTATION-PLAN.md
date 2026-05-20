@@ -102,10 +102,16 @@ Split into two phases against the "8gl0+4mg+4shards baseline that can't be broke
 
 ---
 
-## Slice S5 — Inclusion proofs + HTTP routes (Phase D, ~3 days)
+## Slice S5 — Inclusion proofs + HTTP routes (Phase D)  ✅ **LANDED `bc58afca6` (2026-05-20)**
 
-- `GET /nakamoto/inclusion?ordinal={N}` — returns Merkle path from `(N, level=0)` up through finalized tower entries
-- Prometheus: `dag_nakamoto_tower_density_relative_error{level}` for cluster-wide quality observability
+- `GET /nakamoto/nipopow/proof?fromOrd=N&k=K` — returns Circe-encoded `NipopowProof` from ordinal N with L0-suffix length K
+- `GET /nakamoto/nipopow/proof/genesis?k=K` — convenience: full-chain proof from genesis
+- `POST /nakamoto/nipopow/verify` — server-side verification offload (returns `{verified: bool, error?: ProofError}`)
+- `NipopowProofProvider[F]` trait at `node-shared/.../nipopow/` wraps `(TowerProofBuilder, TowerVerifier)` with the `(genesisEta, etaRotationSnapshots, lddConfig)` bound at consensus-startup. Exposed via `Ref[F, Option[NipopowProofProvider[F]]]` populated inside `GlobalSnapshotConsensus.make` (pattern mirrors `finalityTriggerViewRef` from #138).
+- Routes at `dag-l0/.../http/routes/NipopowRoutes.scala`. URL prefix `"/nakamoto"` added to `InternalUrlPrefixes`.
+- `ProofError` JSON encoder routes through a stable `kind` discriminator (sealed-ADT, no string-matching).
+- 12/12 new `NipopowRoutesSuite` tests + 81/81 nipopow domain tests + 1069 total tests pass.
+- Prometheus `dag_nakamoto_tower_density_relative_error{level}` — DEFERRED to a follow-up; the metric infrastructure for the density check is wired in the dashboard revamp (`5338d6c59`), but the gauge sampler that feeds it isn't.
 
 ---
 
