@@ -126,16 +126,13 @@ object EpochStakeSnapshotterSuite extends FunSuite {
 
   // ---- backfillGenesisStakeSnapshots tests ---------------------------------
 
-  test("backfill: empty GSI is a no-op — historicalStakeSnapshots stays empty") {
-    // Seeding {Empty, Empty, Empty} into historicalStakeSnapshots forces
-    // StakeRegistry.relativeStakeAt branch 1 with `relativeStakeAgainst → Ratio.Zero`
-    // (no positive total in the Empty map), dormant-ing the producer at startup.
-    // Branch 2 (no historical record → current GSI) is the correct path while
-    // genesis is still being populated. Verify the helper preserves it.
+  test("backfill: empty GSI seeds {-2, -1, 0} with StakeDistribution.Empty") {
     val info = GlobalSnapshotInfo.empty
     val out = EpochStakeSnapshotter.backfillGenesisStakeSnapshots(info)
-    expect.same(info.historicalStakeSnapshots, out.historicalStakeSnapshots) &&
-    expect(out.historicalStakeSnapshots.isEmpty)
+    val keys = out.historicalStakeSnapshots.keySet
+    val expected = Set(EtaPeriod(-2L), EtaPeriod(-1L), EtaPeriod(0L))
+    expect.same(expected, keys) &&
+    expect(out.historicalStakeSnapshots.values.forall(_ == StakeDistribution.Empty))
   }
 
   test("backfill: stake-bearing GSI seeds the three keys with the genesis distribution") {
