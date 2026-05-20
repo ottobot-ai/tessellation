@@ -5,9 +5,11 @@ import cats.syntax.all._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics.unsafeLabelName
 import io.constellationnetwork.node.shared.infrastructure.metrics.{CountingMetrics, Metrics}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.algebras.Exp
+import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.numerics.interpreters.ExpInterpreter
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.security.hash.Hash
@@ -195,5 +197,94 @@ object TowerFinalizerSuite extends MutableIOSuite {
     for {
       v <- finalizer.finalizeFromParts(ord(5), synthHash("n"), synthVrf(0x00.toByte), deltaSlot = Gamma)
     } yield expect(v.isEmpty)
+  }
+
+  // ──────────────── Tower density gauge sampler (§5 — `dag_nakamoto_tower_density_relative_error{level}`) ────────────────
+
+  test("density gauge — one gauge value per super-level (1..9) emitted after each successful finalize") { res =>
+    val (_, _, _, computer, _) = res
+    for {
+      pair <- CountingMetrics.makeWithState
+      (stateRef, gaugeMetrics) = pair
+      implicit0(m: Metrics[IO]) = gaugeMetrics
+      tower <- freshTower(res)
+      finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
+      // ord=3 → gMu ≥ ψ_super, deltaSlot=γ → trial computer is invoked; the density sampler runs unconditionally.
+      _ <- finalizer.finalizeFromParts(ord(3), synthHash("d1"), synthVrf(0x42.toByte), deltaSlot = Gamma)
+      st <- stateRef.get
+    } yield {
+      // Expect exactly SuperLevelCount entries keyed by gauge name + `level=µ` tag.
+      val gaugeKeys = st.gauges.keys.filter(_._1 == "dag_nakamoto_tower_density_relative_error").toList
+      val levels = gaugeKeys.flatMap(_._2.collectFirst { case (k, v) if k.value == "level" => v.toInt }).sorted
+      expect(levels == (1 to SuperLevelParams.SuperLevelCount).toList)
+    }
+  }
+
+  test("density gauge — value matches DensityChecker.relativeError(cumulativeCount, finalizeCount, targetDensity)") { res =>
+    // Prime the tower with synthetic L1+L2 hits, then run one finalize with deltaSlot=0 (no new pass — neither tower
+    // counts nor the finalize counter is corrupted by the test scenario) and compare the per-level gauge against the
+    // independently-computed `DensityChecker.relativeError`.
+    val (_, _, _, computer, _) = res
+    for {
+      pair <- CountingMetrics.makeWithState
+      (stateRef, gaugeMetrics) = pair
+      implicit0(m: Metrics[IO]) = gaugeMetrics
+      tower <- freshTower(res)
+      // Prime: 2 L1 hits + 1 L2 hit at ord=2, 4, 6.
+      _ <- tower.appendAtFinality(
+        ord(2),
+        synthHash("p2"),
+        Vector(LevelTrial(1, Ratio.Zero, Ratio.Zero, passed = true)) ++ Vector
+          .tabulate(SuperLevelParams.SuperLevelCount - 1)(i => LevelTrial(i + 2, Ratio.Zero, Ratio.Zero, passed = false))
+      )
+      _ <- tower.appendAtFinality(
+        ord(4),
+        synthHash("p4"),
+        Vector(
+          LevelTrial(1, Ratio.Zero, Ratio.Zero, passed = true),
+          LevelTrial(2, Ratio.Zero, Ratio.Zero, passed = true)
+        ) ++ Vector.tabulate(SuperLevelParams.SuperLevelCount - 2)(i => LevelTrial(i + 3, Ratio.Zero, Ratio.Zero, passed = false))
+      )
+      finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
+      // One finalize call → finalizeCount becomes 1 (the L0 reference seen by the density sampler).
+      _ <- finalizer.finalizeFromParts(ord(10), synthHash("after"), synthVrf(0x55.toByte), deltaSlot = 0L)
+      st <- stateRef.get
+      // Independently compute the expected per-level gauge using the same DensityChecker call.
+      countsByLevel <- (1 to SuperLevelParams.SuperLevelCount).toVector.traverse(tower.cumulativeCount)
+    } yield {
+      val totalLevel0 = 1L // exactly one non-skipped finalize call has run
+      val expected = (1 to SuperLevelParams.SuperLevelCount).map { µ =>
+        val cnt = countsByLevel(µ - 1)
+        val tgt = SuperLevelParams.Levels(µ - 1).targetDensity
+        µ -> DensityChecker.relativeError(cnt, totalLevel0, tgt).toDouble
+      }.toMap
+      val observed = expected.keys.toList.sorted.map { µ =>
+        val tagKey = ("dag_nakamoto_tower_density_relative_error", Seq(unsafeLabelName("level") -> µ.toString))
+        µ -> st.gauges.getOrElse(tagKey, Double.NaN)
+      }.toMap
+      expect(observed == expected)
+    }
+  }
+
+  test("density gauge — empty tower yields relativeError=1.0 (DensityChecker defensive contract)") { res =>
+    // First non-skipped finalize: all per-level counts are 0; relative error = |0 - target|/target = 1.0 for every µ.
+    // This matches the [[DensityChecker.relativeError]] zero-observed-against-non-zero-target case.
+    val (_, _, _, computer, _) = res
+    for {
+      pair <- CountingMetrics.makeWithState
+      (stateRef, gaugeMetrics) = pair
+      implicit0(m: Metrics[IO]) = gaugeMetrics
+      tower <- freshTower(res)
+      finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
+      // deltaSlot=0 → no level passes → tower stays empty → every level-µ count is 0.
+      _ <- finalizer.finalizeFromParts(ord(5), synthHash("empty"), synthVrf(0x42.toByte), deltaSlot = 0L)
+      st <- stateRef.get
+    } yield {
+      val allOne = (1 to SuperLevelParams.SuperLevelCount).forall { µ =>
+        val tagKey = ("dag_nakamoto_tower_density_relative_error", Seq(unsafeLabelName("level") -> µ.toString))
+        st.gauges.get(tagKey).contains(1.0)
+      }
+      expect(allOne)
+    }
   }
 }
