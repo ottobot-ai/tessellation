@@ -159,12 +159,11 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
     GlobalSnapshotInfo.empty
 
   /** Build a chain of n+1 snapshots ordinal 0..n. Each snapshot's `lastSnapshotHash = h(s"snap-$prevOrdinal")`. */
-  private def chain(n: Int): Map[SnapshotOrdinal, Signed[GlobalIncrementalSnapshot]] = {
+  private def chain(n: Int): Map[SnapshotOrdinal, Signed[GlobalIncrementalSnapshot]] =
     (0 to n).map { i =>
       val prev = if (i == 0) h("genesis") else h(s"snap-${i - 1}")
       ord(i.toLong) -> syntheticSnapshot(ord(i.toLong), slot = (i * 10L) + 1L, parentSlot = math.max(0L, i * 10L - 9L), parentHash = prev)
     }.toMap
-  }
 
   /** Build the chain map plus head. Head is the snapshot at ordinal `n`. */
   private def chainWithHead(n: Int): (Map[SnapshotOrdinal, Signed[GlobalIncrementalSnapshot]], Signed[GlobalIncrementalSnapshot]) = {

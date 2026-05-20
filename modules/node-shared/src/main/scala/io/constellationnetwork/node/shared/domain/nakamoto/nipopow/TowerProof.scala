@@ -22,8 +22,8 @@ import derevo.derive
   *   - `activePoolSize` — passed through unchanged; verifier doesn't re-derive the eligibility relativeStake (would require historical
   *     state). Proof v1 just records the certificate's claimed `activePoolSize` for diagnostic completeness.
   *
-  * Size: 8 (ord) + 8 (slot) + 8 (parentSlot) + 80 (proof) + 64 (output) + 32 (pk) + 32 (eta) + 72 (9·int64 counts) + 32 (hash) +
-  * 4 (poolSize) = 340 bytes per header (raw); JSON-encoded ~600-800 bytes. Budget calculus: 250 headers cap → ~85 KB raw, ~200 KB JSON.
+  * Size: 8 (ord) + 8 (slot) + 8 (parentSlot) + 80 (proof) + 64 (output) + 32 (pk) + 32 (eta) + 72 (9·int64 counts) + 32 (hash) + 4
+  * (poolSize) = 340 bytes per header (raw); JSON-encoded ~600-800 bytes. Budget calculus: 250 headers cap → ~85 KB raw, ~200 KB JSON.
   * Suffix-trimmed proofs (k=5 L0 suffix + sparse upper levels) come in well under 50 KB.
   */
 @derive(eqv, encoder, decoder)
@@ -54,7 +54,8 @@ final case class TowerProofHeader(
   *     suffix and re-derives `g_µ` to prime its own tower view.
   *   - `levelChains` — per-super-level (1..9) chain of headers, one entry per level-µ tower hit since `since`. Sparse: lower-frequency
   *     levels (L7-L9) typically have ≤ 1 entry per eta period.
-  *   - `since` — anchor ordinal the proof is taken FROM (inclusive). Verifier uses this as the base for density-relative-error denominators.
+  *   - `since` — anchor ordinal the proof is taken FROM (inclusive). Verifier uses this as the base for density-relative-error
+  *     denominators.
   *   - `tipOrdinal` — the most-recent ordinal in the proof (== `level0Suffix.last.ordinal`). Verifier uses this as the upper-bound for the
   *     density window.
   *
@@ -63,9 +64,9 @@ final case class TowerProofHeader(
   *   - Every `header in levelChains(µ)` has ordinal ∈ [`since`, `tipOrdinal`].
   *   - Within each level, headers are strictly-ascending by ordinal.
   *
-  * '''Size bound (proposal §5.3 / S6 acceptance)''': ≤ 50 KB. At default `targetDensity = f_0 · 2^(-µ)` over an eta period (≈ 100 snapshots),
-  * the total header count is bounded by `k + Σ_µ count(µ)` ≈ `5 + 50 + 25 + 12 + 6 + 3 + 2 + 1 + 1 + 1` ≈ 106 headers per eta period; well
-  * below the 250-cap.
+  * '''Size bound (proposal §5.3 / S6 acceptance)''': ≤ 50 KB. At default `targetDensity = f_0 · 2^(-µ)` over an eta period (≈ 100
+  * snapshots), the total header count is bounded by `k + Σ_µ count(µ)` ≈ `5 + 50 + 25 + 12 + 6 + 3 + 2 + 1 + 1 + 1` ≈ 106 headers per eta
+  * period; well below the 250-cap.
   */
 @derive(eqv, encoder, decoder)
 final case class TowerProof(
@@ -75,8 +76,8 @@ final case class TowerProof(
   levelChains: Map[Int, Vector[TowerProofHeader]]
 ) {
 
-  /** Total header count across all levels — for size-cap enforcement at builder time. Headers at the L0 suffix are NOT double-counted in the
-    * level-µ chains (they're separate carriers).
+  /** Total header count across all levels — for size-cap enforcement at builder time. Headers at the L0 suffix are NOT double-counted in
+    * the level-µ chains (they're separate carriers).
     */
   def totalHeaderCount: Int =
     level0Suffix.size + levelChains.valuesIterator.map(_.size).sum

@@ -16,11 +16,9 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 /** §3 NIPoPoW S4.2 — builds a [[TowerProof]] from a local [[TowerStore]] + [[SnapshotStorage]].
   *
   * '''Algorithm''' (per `docs/nakamoto/NIPOPOW-IMPLEMENTATION-PLAN.md` §S4):
-  *   1. Read the local tip ordinal from the snapshot storage.
-  *   2. Collect the L0 suffix: the `k` most-recent snapshots `[tip-k+1, tip]` ordered ascending.
-  *   3. For each super-level µ ∈ {1..9}, call `store.entriesAtLevel(µ, since)` → fetch each entry's snapshot from
-  *      [[SnapshotStorage]] → extract the slot certificate → assemble [[TowerProofHeader]].
-  *   4. Pack everything into a [[TowerProof]].
+  *   1. Read the local tip ordinal from the snapshot storage. 2. Collect the L0 suffix: the `k` most-recent snapshots `[tip-k+1, tip]`
+  *      ordered ascending. 3. For each super-level µ ∈ {1..9}, call `store.entriesAtLevel(µ, since)` → fetch each entry's snapshot from
+  *      [[SnapshotStorage]] → extract the slot certificate → assemble [[TowerProofHeader]]. 4. Pack everything into a [[TowerProof]].
   *
   * '''Behavior under missing data''':
   *   - Snapshots without a `slotCertificate` (pre-activation) are silently skipped — they contributed no L0/level-µ hits. The level-chain
@@ -63,8 +61,8 @@ object TowerProofBuilder {
 
     private val logger = Slf4jLogger.getLoggerFromName[F]("TowerProofBuilder")
 
-    /** Convert a [[Signed]]`[`[[GlobalIncrementalSnapshot]]`]` + its `eta` field + finalized hash into a [[TowerProofHeader]]. Returns `None`
-      * for pre-activation snapshots (no `slotCertificate`).
+    /** Convert a [[Signed]]`[`[[GlobalIncrementalSnapshot]]`]` + its `eta` field + finalized hash into a [[TowerProofHeader]]. Returns
+      * `None` for pre-activation snapshots (no `slotCertificate`).
       */
     private def toHeader(
       signed: Signed[GlobalIncrementalSnapshot],
@@ -112,9 +110,9 @@ object TowerProofBuilder {
       ordinals.traverse(fetchSuffixHeader).map(_.flatten)
     }
 
-    /** For an L0 suffix snapshot, look up the snapshot's true content-address by reading `lastSnapshotHash` from the SUCCESSOR snapshot (ord
-      * + 1). If no successor exists (we're at the tip), we use `Hash.empty` as a benign sentinel — the verifier doesn't cross-reference the
-      * tip's hash against a tower entry (it's not a tower entry by construction; it's the leading L0 suffix item).
+    /** For an L0 suffix snapshot, look up the snapshot's true content-address by reading `lastSnapshotHash` from the SUCCESSOR snapshot
+      * (ord + 1). If no successor exists (we're at the tip), we use `Hash.empty` as a benign sentinel — the verifier doesn't
+      * cross-reference the tip's hash against a tower entry (it's not a tower entry by construction; it's the leading L0 suffix item).
       */
     private def fetchSuffixHeader(ord: SnapshotOrdinal): F[Option[TowerProofHeader]] =
       snapshotStorage.get(ord).flatMap {
@@ -135,7 +133,8 @@ object TowerProofBuilder {
           } yield toHeader(signed, snapshotHash)
       }
 
-    /** Materialize a single level's chain — for each tower entry at level µ at-or-after `since`, look up the snapshot and build a header. */
+    /** Materialize a single level's chain — for each tower entry at level µ at-or-after `since`, look up the snapshot and build a header.
+      */
     private def buildLevelChain(level: Int, since: SnapshotOrdinal): F[Vector[TowerProofHeader]] =
       for {
         entries <- tower.entriesAtLevel(level, since)
