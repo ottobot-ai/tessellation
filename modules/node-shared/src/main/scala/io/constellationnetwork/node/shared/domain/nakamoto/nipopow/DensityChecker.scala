@@ -6,8 +6,8 @@ import io.constellationnetwork.numerics.implicits._
 /** §3 NIPoPoW S4.4 — pure density-violation detector. Wraps the standalone relative-error computation that both the [[TowerVerifier]] and
   * the (S5) `dag_nakamoto_tower_density_relative_error{level}` Prometheus gauge consume.
   *
-  * '''Definition''' (per proposal §5.3): for a super-level µ with `observedDensity = chainLength / totalLevel0Length` and
-  * `targetDensity = f_0 · 2^(-µ)`, the relative error is
+  * '''Definition''' (per proposal §5.3): for a super-level µ with `observedDensity = chainLength / totalLevel0Length` and `targetDensity =
+  * f_0 · 2^(-µ)`, the relative error is
   *
   * `relativeError = |observedDensity - targetDensity| / targetDensity`
   *

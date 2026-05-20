@@ -20,10 +20,10 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *   - runs `LevelTrialComputer.runAll(vrfOutput, gapsPerLevel, δ_S, γ)`
   *   - appends per-level passes via `tower.appendAtFinality(ord, snapshotHash, trials)`
   *
-  * '''Strict-forward, idempotent.''' The finalizer is called with monotonically-increasing ordinals (driven by
-  * `lastArchivalOrdinalRef` advancing strictly forward). A snapshot replayed against a tower that already includes its passes is a no-op
-  * because the underlying MPT `insert` with the same `(level, ord)` key just overwrites with the same `snapshotHash` value, and the
-  * per-level computations are deterministic.
+  * '''Strict-forward, idempotent.''' The finalizer is called with monotonically-increasing ordinals (driven by `lastArchivalOrdinalRef`
+  * advancing strictly forward). A snapshot replayed against a tower that already includes its passes is a no-op because the underlying MPT
+  * `insert` with the same `(level, ord)` key just overwrites with the same `snapshotHash` value, and the per-level computations are
+  * deterministic.
   *
   * '''No-cert snapshots are skipped.''' Pre-activation snapshots have `slotCertificate = None` and `eta = None`; we skip them with a debug
   * log line — they contribute no level-µ hits because there's no `ρ_S` to rehash.
@@ -56,8 +56,8 @@ object TowerFinalizer {
     * @param tower
     *   sink — the local per-node store the finalizer writes into.
     * @param computer
-    *   pure computer for the L-1 level-µ trials. Same instance the producer can use offline; the trial is deterministic given
-    *   `(ρ_S, g_µ, δ_S, γ)`.
+    *   pure computer for the L-1 level-µ trials. Same instance the producer can use offline; the trial is deterministic given `(ρ_S, g_µ,
+    *   δ_S, γ)`.
     * @param lddCutoff
     *   `γ` for the L0 slot-gap gating multiplier `min(1, δ_S/γ)`. Sourced from `LddConfig.lddCutoff` at construction (typically 15).
     */

@@ -15,14 +15,14 @@ import io.constellationnetwork.security.{Hasher, SecurityProvider}
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
 
-/** §3 NIPoPoW S3 — [[TowerFinalizer]] unit tests. Drives the finalizer with synthetic VRF outputs and verifies the tower grows monotonically
-  * at the expected level-rates (no e2e cluster needed).
+/** §3 NIPoPoW S3 — [[TowerFinalizer]] unit tests. Drives the finalizer with synthetic VRF outputs and verifies the tower grows
+  * monotonically at the expected level-rates (no e2e cluster needed).
   *
   * Strategy: use `finalizeFromParts` to bypass the schema construction of `Hashed[GlobalIncrementalSnapshot]`. The pure inner method takes
   * the same ingredients the wire-level `finalize` extracts from the snapshot.
   *
-  * '''Exp convergence sweet spot.''' The Bifrost continued-fraction `Exp` is only fast for modest argument magnitudes. Tests stay with
-  * `g_µ ≤ 10` (matches `LevelTrialComputerSuite`'s "stay within the convergence sweet spot" comment); larger gaps push exp args toward
+  * '''Exp convergence sweet spot.''' The Bifrost continued-fraction `Exp` is only fast for modest argument magnitudes. Tests stay with `g_µ
+  * ≤ 10` (matches `LevelTrialComputerSuite`'s "stay within the convergence sweet spot" comment); larger gaps push exp args toward
   * `-2·g_µ/σ` which inflate test wall-time without any unique-to-the-finalizer signal.
   */
 object TowerFinalizerSuite extends MutableIOSuite {
@@ -91,9 +91,7 @@ object TowerFinalizerSuite extends MutableIOSuite {
       _ <- tower.appendAtFinality(
         ord(2),
         synthHash("prime"),
-        Vector.tabulate(SuperLevelParams.SuperLevelCount)(i =>
-          LevelTrial(i + 1, Ratio.Zero, Ratio.Zero, passed = i == 0)
-        )
+        Vector.tabulate(SuperLevelParams.SuperLevelCount)(i => LevelTrial(i + 1, Ratio.Zero, Ratio.Zero, passed = i == 0))
       )
       preL1 <- tower.latestAt(1)
       _ <- finalizer.finalizeFromParts(ord(5), synthHash("after"), synthVrf(0x77.toByte), deltaSlot = 0L)
