@@ -459,17 +459,7 @@ object Main
                             logger.info(s"Loaded ${accounts.size} genesis balances from $gPath") >> IO.pure(
                               (
                                 accounts.map(a => (a.address, a.balance)).toMap,
-                                // §3 NIPoPoW S0.5 — even on the CSV path (no delegated-stake / collateral
-                                // records), stamp `historicalStakeSnapshots[-2/-1/0]` with the genesis
-                                // distribution (which is empty in this case). Keeps the registry's N-2
-                                // lookback path uniform across CSV and JSON genesis bootstraps: either
-                                // path returns a real distribution at all three periods, instead of
-                                // falling through to the current-GSI default.
-                                (base: GlobalSnapshotInfo) =>
-                                  IO.pure(
-                                    io.constellationnetwork.schema.nakamoto.EpochStakeSnapshotter
-                                      .backfillGenesisStakeSnapshots(base)
-                                  )
+                                (base: GlobalSnapshotInfo) => IO.pure(base)
                               )
                             )
                         }
