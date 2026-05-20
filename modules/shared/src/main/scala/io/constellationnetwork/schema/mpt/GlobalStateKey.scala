@@ -205,6 +205,14 @@ object GlobalStateFieldId {
     */
   case object HistoricalStakeSnapshots extends GlobalStateFieldId { def toInt: Int = 20 }
 
+  /** §3 NIPoPoW S3 superblock-tower entries, indexed by `(level, ordinal)`. Used by the local per-node `MptTowerStore` — '''NOT''' part of
+    * the global stateProof / `mptRoot`. The tower is a derived persistent index (see proposal §4.5): each node maintains its own copy by
+    * replaying [[LevelTrialComputer.runAll]] on every finalized snapshot, so byte-equivalent tower bytes are not a producer/verifier
+    * requirement and corruption recovery is a chain replay (not a state-proof rollback). The FieldId slot is reserved here for taxonomy /
+    * `fieldIdFromHex` classification only; the tower lives in a dedicated MPT producer to keep its bytes out of consensus state.
+    */
+  case object TowerEntries extends GlobalStateFieldId { def toInt: Int = 21 }
+
   implicit val ordering: Ordering[GlobalStateFieldId] = Ordering.by(_.toInt)
   implicit val show: Show[GlobalStateFieldId] = Show.show(_.toInt.toString)
 
@@ -235,6 +243,7 @@ object GlobalStateFieldId {
     case 18 => Some(MetagraphSyncData)
     case 19 => Some(SystemIndex)
     case 20 => Some(HistoricalStakeSnapshots)
+    case 21 => Some(TowerEntries)
     case _  => None
   }
 }
