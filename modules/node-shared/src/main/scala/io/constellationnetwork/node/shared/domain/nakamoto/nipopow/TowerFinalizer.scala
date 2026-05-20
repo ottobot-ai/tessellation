@@ -1,6 +1,6 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.nipopow
 
-import cats.effect.Async
+import cats.effect.{Async, Ref}
 import cats.syntax.all._
 
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal}
@@ -65,51 +65,65 @@ object TowerFinalizer {
     tower: TowerStore[F],
     computer: LevelTrialComputer[F],
     lddCutoff: Long
-  ): TowerFinalizer[F] = new TowerFinalizer[F] {
+  ): F[TowerFinalizer[F]] =
+    Ref.of[F, SnapshotOrdinal](SnapshotOrdinal.MinValue).map { highWaterMarkRef =>
+      new TowerFinalizer[F] {
 
-    private val logger = Slf4jLogger.getLoggerFromName[F]("TowerFinalizer")
+        private val logger = Slf4jLogger.getLoggerFromName[F]("TowerFinalizer")
 
-    def finalize(snapshot: Hashed[GlobalIncrementalSnapshot]): F[Unit] =
-      snapshot.signed.value.slotCertificate match {
-        case None =>
-          logger.debug(
-            s"[TowerFinalizer] Skip ord=${snapshot.ordinal.value.value} hash=${snapshot.hash.value.take(16)} — no slotCertificate (pre-activation snapshot)"
-          )
-        case Some(cert) =>
-          val deltaSlot = cert.slot.value.value - cert.parentSlot.value.value
-          finalizeFromParts(snapshot.ordinal, snapshot.hash, cert.vrfOutput.toBytes, deltaSlot).void
-      }
-
-    def finalizeFromParts(
-      ordinal: SnapshotOrdinal,
-      snapshotHash: Hash,
-      vrfOutput: Array[Byte],
-      deltaSlot: Long
-    ): F[Vector[LevelTrial]] =
-      for {
-        // Per-level base-block gap g_µ = ord - (last level-µ ordinal, or 0 if none).
-        //
-        // Important: gaps are computed in ordinal units, not slot units (proposal §2.1).
-        // The producer-side equivalent in the next slice (S2 phase 2c, deferred) will track these gaps
-        // incrementally; here we recompute from the store on each finalize, which is fine because
-        // T_depth2 fires once per snapshot at Phase-3 and the read is a fixed L-1 prefix-scans.
-        gaps <- (1 to SuperLevelParams.SuperLevelCount).toVector.traverse { µ =>
-          tower.latestAt(µ).map { latest =>
-            val baseOrd = latest.map(_.ordinal.value.value).getOrElse(0L)
-            ordinal.value.value - baseOrd
+        def finalize(snapshot: Hashed[GlobalIncrementalSnapshot]): F[Unit] =
+          snapshot.signed.value.slotCertificate match {
+            case None =>
+              logger.debug(
+                s"[TowerFinalizer] Skip ord=${snapshot.ordinal.value.value} hash=${snapshot.hash.value.take(16)} — no slotCertificate (pre-activation snapshot)"
+              )
+            case Some(cert) =>
+              val deltaSlot = cert.slot.value.value - cert.parentSlot.value.value
+              finalizeFromParts(snapshot.ordinal, snapshot.hash, cert.vrfOutput.toBytes, deltaSlot).void
           }
-        }
-        trials <- computer.runAll(vrfOutput, gaps, deltaSlot, lddCutoff)
-        anyPassed = trials.exists(_.passed)
-        _ <- tower.appendAtFinality(ordinal, snapshotHash, trials).whenA(anyPassed)
-        _ <- logger
-          .debug(
-            s"[TowerFinalizer] Appended ord=${ordinal.value.value} levels=${trials.collect { case t if t.passed => t.level }.mkString(",")} " +
-              s"deltaSlot=$deltaSlot gaps=${gaps.mkString(",")}"
-          )
-          .whenA(anyPassed)
-      } yield trials
-  }
+
+        def finalizeFromParts(
+          ordinal: SnapshotOrdinal,
+          snapshotHash: Hash,
+          vrfOutput: Array[Byte],
+          deltaSlot: Long
+        ): F[Vector[LevelTrial]] =
+          highWaterMarkRef.get.flatMap { lastFinalized =>
+            if (ordinal.value.value <= lastFinalized.value.value && lastFinalized.value.value > 0L)
+              logger
+                .debug(
+                  s"[TowerFinalizer] Skip ord=${ordinal.value.value} — already at-or-below high-water-mark ${lastFinalized.value.value}"
+                )
+                .as(Vector.empty[LevelTrial])
+            else
+              for {
+                // Per-level base-block gap g_µ = ord - (last level-µ ordinal, or 0 if none).
+                //
+                // Important: gaps are computed in ordinal units, not slot units (proposal §2.1).
+                // The producer-side equivalent in the next slice (S2 phase 2c, deferred) will track these gaps
+                // incrementally; here we recompute from the store on each finalize, which is fine because
+                // T_depth2 fires once per snapshot at Phase-3 and the read is a fixed L-1 prefix-scans.
+                gaps <- (1 to SuperLevelParams.SuperLevelCount).toVector.traverse { µ =>
+                  tower.latestAt(µ).map { latest =>
+                    val baseOrd = latest.map(_.ordinal.value.value).getOrElse(0L)
+                    ordinal.value.value - baseOrd
+                  }
+                }
+                trials <- computer.runAll(vrfOutput, gaps, deltaSlot, lddCutoff)
+                anyPassed = trials.exists(_.passed)
+                _ <- tower.appendAtFinality(ordinal, snapshotHash, trials).whenA(anyPassed)
+                _ <- highWaterMarkRef.set(ordinal)
+                _ <- logger
+                  .debug(
+                    s"[TowerFinalizer] Appended ord=${ordinal.value.value} levels=${trials.collect { case t if t.passed => t.level }
+                        .mkString(",")} " +
+                      s"deltaSlot=$deltaSlot gaps=${gaps.mkString(",")}"
+                  )
+                  .whenA(anyPassed)
+              } yield trials
+          }
+      }
+    }
 
   /** No-op finalizer for layers that don't run the Phase-3 sink (cl0/dl1/etc). Allows the call site to wire a single value without
     * importing the trait directly.

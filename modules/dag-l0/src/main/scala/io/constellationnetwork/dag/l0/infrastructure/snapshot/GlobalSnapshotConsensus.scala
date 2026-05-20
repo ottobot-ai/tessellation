@@ -900,6 +900,24 @@ object GlobalSnapshotConsensus {
               orphanBuffer = orphanBuffer,
               logger = orphanBufferLogger
             )
+          // §3 NIPoPoW S3 — dedicated tower store + finalizer for the Phase-3 sink in SnapshotLeaderLoop.
+          // The tower lives in its own in-memory MPT producer (NOT the shared `mptStore`); proposal §4.5
+          // explicitly forbids anchoring the tower root in headers, so its bytes never enter the global
+          // `mptRoot` / `stateProof`. Each node maintains its own copy; corruption recovery is a chain
+          // replay (re-run LevelTrialComputer.runAll over finalized snapshots), not a state-proof rollback.
+          //
+          // The same `LevelTrialComputer` (using the byte-deterministic Bifrost `Exp` interpreter already
+          // built for L0 eligibility) drives both the per-snapshot trial computation and the finalizer's
+          // gap derivation. `HasherSelector.getCurrent` is fine here because the tower partition is local
+          // and doesn't participate in consensus-bytes hashing — same trick as `gateHasher` above.
+          towerStore <- {
+            implicit val towerHasher: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+            io.constellationnetwork.node.shared.domain.nakamoto.nipopow.MptTowerStore.inMemory[F].toResource
+          }
+          levelTrialComputer = io.constellationnetwork.node.shared.domain.nakamoto.nipopow.LevelTrialComputer.make[F](exp)
+          towerFinalizer <- io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerFinalizer
+            .make[F](towerStore, levelTrialComputer, lddConfig.lddCutoff.toLong)
+            .toResource
           _ <- supervisor
             .supervise(
               io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
@@ -969,7 +987,11 @@ object GlobalSnapshotConsensus {
                               }
                             }
                           }
-                    }
+                    },
+                  // §3 NIPoPoW S3: Phase-3 sink for the local TowerStore. Constructed above with
+                  // a dedicated MPT producer (NOT in the consensus stateProof). Invoked at T_depth2
+                  // archival watermark advance in SnapshotLeaderLoop.finalityMonitor.
+                  towerFinalizer = towerFinalizer
                 )
                 .compile
                 .drain

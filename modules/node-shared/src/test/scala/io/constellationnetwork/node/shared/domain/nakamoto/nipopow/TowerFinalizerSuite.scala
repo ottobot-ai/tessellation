@@ -59,7 +59,7 @@ object TowerFinalizerSuite extends MutableIOSuite {
     val (_, _, _, computer) = res
     for {
       tower <- freshTower(res)
-      finalizer = TowerFinalizer.make[IO](tower, computer, Gamma)
+      finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
       // deltaSlot = 0 → gating multiplier = 0 → effectiveThreshold = 0 → no level can pass.
       trials <- finalizer.finalizeFromParts(ord(10), synthHash("a"), synthVrf(0x42.toByte), deltaSlot = 0L)
       l1 <- tower.entriesAtLevel(1, ord(0))
@@ -70,7 +70,7 @@ object TowerFinalizerSuite extends MutableIOSuite {
     val (_, _, _, computer) = res
     for {
       tower <- freshTower(res)
-      finalizer = TowerFinalizer.make[IO](tower, computer, Gamma)
+      finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
       // ord=0 → g_µ = 0 < ψ_super=1 for every level → thresholdMu = 0 → no passes regardless of ρ.
       trials <- finalizer.finalizeFromParts(ord(0), synthHash("z"), synthVrf(0x42.toByte), deltaSlot = Gamma)
       counts <- (1 to SuperLevelParams.SuperLevelCount).toVector.traverse(tower.cumulativeCount)
@@ -86,7 +86,7 @@ object TowerFinalizerSuite extends MutableIOSuite {
     val (_, _, _, computer) = res
     for {
       tower <- freshTower(res)
-      finalizer = TowerFinalizer.make[IO](tower, computer, Gamma)
+      finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
       // Manually prime: append an L1 "synthetic" hit at ord=2.
       _ <- tower.appendAtFinality(
         ord(2),
@@ -105,7 +105,7 @@ object TowerFinalizerSuite extends MutableIOSuite {
     val (_, _, _, computer) = res
     for {
       tower <- freshTower(res)
-      finalizer = TowerFinalizer.make[IO](tower, computer, Gamma)
+      finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
       // ord=3 → g_1 = 3, ψ_super = 1 → L1 threshold is non-zero. deltaSlot=γ=15 → gating=1.
       // The trial is byte-deterministic given ρ, so either it passes or it doesn't — we just check the
       // computer was invoked (trial vector has the right size + level ordering) and the side-effect
@@ -127,10 +127,10 @@ object TowerFinalizerSuite extends MutableIOSuite {
     val (_, _, _, computer) = res
     for {
       tower1 <- freshTower(res)
-      finalizer1 = TowerFinalizer.make[IO](tower1, computer, Gamma)
+      finalizer1 <- TowerFinalizer.make[IO](tower1, computer, Gamma)
       trial1 <- finalizer1.finalizeFromParts(ord(3), synthHash("idem"), synthVrf(0x55.toByte), deltaSlot = Gamma)
       tower2 <- freshTower(res)
-      finalizer2 = TowerFinalizer.make[IO](tower2, computer, Gamma)
+      finalizer2 <- TowerFinalizer.make[IO](tower2, computer, Gamma)
       trial2 <- finalizer2.finalizeFromParts(ord(3), synthHash("idem"), synthVrf(0x55.toByte), deltaSlot = Gamma)
     } yield expect(trial1 == trial2)
   }
@@ -141,7 +141,7 @@ object TowerFinalizerSuite extends MutableIOSuite {
     // Per-level cumulative count can only grow or stay equal across calls.
     for {
       tower <- freshTower(res)
-      finalizer = TowerFinalizer.make[IO](tower, computer, Gamma)
+      finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
       // Ordinals 2..7 keep g_µ small (≤ 7) so the exp interpreter stays in its sweet spot.
       counts <- (2 to 7).toList.foldLeftM(Vector.empty[(Long, Long)]) { (acc, i) =>
         finalizer.finalizeFromParts(ord(i.toLong), synthHash(s"m$i"), synthVrf((0x40 + i).toByte), deltaSlot = Gamma) >>
@@ -153,6 +153,29 @@ object TowerFinalizerSuite extends MutableIOSuite {
       expect(l1Counts.zip(l1Counts.tail).forall { case (a, b) => b >= a })
         .and(expect(l2Counts.zip(l2Counts.tail).forall { case (a, b) => b >= a }))
     }
+  }
+
+  test("finalizeFromParts — high-water-mark skip: ord ≤ lastFinalized returns empty vector") { res =>
+    // After finalizing ord=5, a subsequent finalize at ord=3 (or ord=5 again) is skipped because
+    // production invariant is "strictly-forward only". The high-water-mark Ref enforces this even
+    // if the wire-level caller (SnapshotLeaderLoop.finalityMonitor) makes a mistake — the tower's
+    // contents stay deterministic.
+    val (_, _, _, computer) = res
+    for {
+      tower <- freshTower(res)
+      finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
+      first <- finalizer.finalizeFromParts(ord(5), synthHash("ok"), synthVrf(0x42.toByte), deltaSlot = Gamma)
+      // Re-finalize at the same ord — high-water-mark blocks it; empty trials returned.
+      replay <- finalizer.finalizeFromParts(ord(5), synthHash("ok"), synthVrf(0x42.toByte), deltaSlot = Gamma)
+      // Earlier ord also blocked.
+      earlier <- finalizer.finalizeFromParts(ord(3), synthHash("earlier"), synthVrf(0x42.toByte), deltaSlot = Gamma)
+      // Strictly-forward ord goes through.
+      later <- finalizer.finalizeFromParts(ord(6), synthHash("later"), synthVrf(0x42.toByte), deltaSlot = Gamma)
+    } yield
+      expect(first.nonEmpty) // first finalize ran
+        .and(expect(replay.isEmpty)) // re-finalize at same ord blocked
+        .and(expect(earlier.isEmpty)) // earlier ord blocked
+        .and(expect(later.nonEmpty)) // later ord ran
   }
 
   test("noop finalizer — finalizeFromParts returns empty vector, no store side effects") { res =>
