@@ -87,6 +87,7 @@ object Services {
       val allowSpend = AllowSpendService.make[F, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotInfo](
         storages.allowSpend,
         storages.lastSnapshot,
+        sharedStorages.lastNGlobalSnapshot,
         validators.allowSpend
       )
       val allowSpendBlock = AllowSpendBlockService.make[F, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotInfo](
@@ -95,7 +96,8 @@ object Services {
         storages.allowSpendBlock,
         storages.allowSpend,
         cfg.collateral.amount,
-        storages.lastSnapshot
+        storages.lastSnapshot,
+        sharedStorages.lastNGlobalSnapshot
       )
       val tokenLock = TokenLockService.make[F, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotInfo](
         storages.tokenLock,
