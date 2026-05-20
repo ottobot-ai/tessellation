@@ -15,8 +15,8 @@ import io.constellationnetwork.serde.codecs.instances.HashCodec._
 
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-/** §3 NIPoPoW S3 — typed key for the [[MptTowerStore]] partition. Encoded as a lexicographically-sortable hex string `(level, ordinal)` so a
-  * prefix scan against the level component returns entries in ordinal order. Not a `GlobalStateKey` — the tower lives in its own MPT
+/** §3 NIPoPoW S3 — typed key for the [[MptTowerStore]] partition. Encoded as a lexicographically-sortable hex string `(level, ordinal)` so
+  * a prefix scan against the level component returns entries in ordinal order. Not a `GlobalStateKey` — the tower lives in its own MPT
   * producer and its bytes never enter the consensus `mptRoot` / `stateProof` (proposal §4.5: tower root is NOT anchored in headers; each
   * node maintains its own tower locally, recreatable from chain replay).
   */
@@ -50,8 +50,8 @@ object TowerEntryKey {
   */
 object MptTowerStore {
 
-  /** Wrap an existing `MptStore[F, TowerEntryKey]` as a [[TowerStore]]. The store's underlying producer MUST be tower-dedicated — sharing it
-    * with the global GSI producer would conflate tower bytes into the consensus `mptRoot`, which proposal §4.5 forbids.
+  /** Wrap an existing `MptStore[F, TowerEntryKey]` as a [[TowerStore]]. The store's underlying producer MUST be tower-dedicated — sharing
+    * it with the global GSI producer would conflate tower bytes into the consensus `mptRoot`, which proposal §4.5 forbids.
     */
   def make[F[_]: Async](store: MptStore[F, TowerEntryKey]): TowerStore[F] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("MptTowerStore")
@@ -73,8 +73,7 @@ object MptTowerStore {
       override def entriesAtLevel(level: Int, since: SnapshotOrdinal): F[List[TowerEntry]] =
         store.getAllForPrefix[Hash](TowerEntryKey.levelPrefix(level)).map { hexMap =>
           val sinceHex = f"$level%08x${since.value.value}%016x"
-          hexMap.toList
-            .filter { case (hex, _) => hex.value >= sinceHex }
+          hexMap.toList.filter { case (hex, _) => hex.value >= sinceHex }
             .sortBy(_._1.value)
             .flatMap {
               case (hex, hash) => parseOrdinalFromHex(hex).map(ord => TowerEntry(level, ord, hash))

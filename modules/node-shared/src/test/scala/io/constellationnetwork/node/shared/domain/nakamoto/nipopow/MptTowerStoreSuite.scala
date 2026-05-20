@@ -30,8 +30,8 @@ object MptTowerStoreSuite extends MutableIOSuite {
 
   private def ord(n: Long): SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(n))
 
-  /** Build a synthetic `Hash` from a short label: emit the label's bytes as hex then right-pad to 64 chars. Ensures the hex is parseable
-    * by [[io.constellationnetwork.serde.codecs.instances.HashCodec]] (lowercase hex only) regardless of the label's text content.
+  /** Build a synthetic `Hash` from a short label: emit the label's bytes as hex then right-pad to 64 chars. Ensures the hex is parseable by
+    * [[io.constellationnetwork.serde.codecs.instances.HashCodec]] (lowercase hex only) regardless of the label's text content.
     */
   private def h(s: String): Hash =
     Hash(s.getBytes("UTF-8").map(b => f"${b & 0xff}%02x").mkString.padTo(64, '0').take(64))
