@@ -467,25 +467,35 @@ object GlobalSnapshotConsensus {
           // under MultiBranch — matches "view of stake at the parent the consensus is voting on".
           // Falls back to base when bestTipFn returns None (pre-bootstrap window).
           //
-          // §3 NIPoPoW S0.3: historical stake distributions live in
-          // `GlobalSnapshotInfo.historicalStakeSnapshots`, written by GSAM.accept() at every eta-period
-          // boundary ordinal. The callback below is a thin reader that scopes the lookup to the current
-          // GSI's recorded map — no in-memory mirror needed because the GSI is already kept current by
-          // `lastGlobalSnapshotStorage`. Warmup (pre-genesis / no record yet) returns None and the
-          // registry's fall-through path uses the live MPT aggregate.
+          // §3 NIPoPoW S0.3 / §G3: historical stake distributions are written by GSAM.accept() at every
+          // eta-period boundary ordinal into both the GSI map (`historicalStakeSnapshots`) and the MPT
+          // partition (`GlobalStateFieldId.HistoricalStakeSnapshots`, point key derived via
+          // `historicalStakeSnapshotsKey[F](period)`). The callback below is the MPT-primary reader —
+          // `HistoricalStakeReader` does a single point read against the `pendingReader` branch view,
+          // matching the live-stake-aggregate's view of the chain's parent branch. Warmup (pre-genesis
+          // / pre-boundary) returns None and the registry's fall-through path uses the live MPT
+          // aggregate.
           stakeAggregator <- io.constellationnetwork.node.shared.domain.nakamoto.NodeStakeAggregator
             .cached[F](
               io.constellationnetwork.node.shared.domain.nakamoto.NodeStakeAggregator.make[F](pendingReader),
               lastGlobalSnapshotStorage.getOrdinal
             )
             .toResource
+          // §G3 — historical-stake-snapshot reader migrated from GSI iteration to MPT point read.
+          // The GSAM boundary writer (`AcceptanceMptStateChanges.applyStateChanges`) lands one MPT
+          // entry per stored period keyed by `historicalStakeSnapshotsKey[F](period)`; this reader
+          // mirrors that key derivation against the same `pendingReader` the G1 stake aggregator uses,
+          // so both the live aggregate and the N-2 historical lookback observe the chain's parent-
+          // branch view under MultiBranch (consistent with the leader's commit view).
+          historicalStakeReader = io.constellationnetwork.node.shared.domain.nakamoto.HistoricalStakeReader
+            .make[F](pendingReader)
           stakeRegistry <- {
             implicit val stakeHasher: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
             io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry
               .stakeWeightedMpt[F](
                 stakeAggregator,
                 (period: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
-                  lastGlobalSnapshotStorage.getCombined.map(_.flatMap(_._2.historicalStakeSnapshots.get(period)))
+                  historicalStakeReader.lookup(period)
               )
               .toResource
           }
