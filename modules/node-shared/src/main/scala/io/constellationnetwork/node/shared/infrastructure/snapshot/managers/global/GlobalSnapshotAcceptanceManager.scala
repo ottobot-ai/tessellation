@@ -23,6 +23,7 @@ import io.constellationnetwork.node.shared.domain.delegatedStake.{
   UpdateDelegatedStakeAcceptanceManager,
   UpdateDelegatedStakeAcceptanceResult
 }
+import io.constellationnetwork.node.shared.domain.nakamoto.NodeStakeAggregator
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
 import io.constellationnetwork.node.shared.domain.node.UpdateNodeParametersAcceptanceManager
 import io.constellationnetwork.node.shared.domain.nodeCollateral.{
@@ -48,7 +49,7 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt._
-import io.constellationnetwork.schema.nakamoto.{EpochStakeSnapshotter, EtaPeriod, StakeDistribution}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, StakeDistribution}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal, UpdateNodeCollateral}
 import io.constellationnetwork.schema.peer.PeerId
@@ -198,9 +199,10 @@ object GlobalSnapshotAcceptanceManager {
     // that threading lands.
     maintainNodeCollateralWithdrawalExpiryIndex: Boolean = false,
     // §3 NIPoPoW S0.4: number of snapshots per eta-rotation period. At every boundary ordinal (`ord % R == R - 1`)
-    // accept() captures `EpochStakeSnapshotter.snapshot(builtInfo)` into `historicalStakeSnapshots[currentPeriod]`
-    // and prunes entries older than `currentPeriod - 3` (algorithm reads N-2; the extra slot is a reorg-grace).
-    // Must match the producer's `NAKAMOTO_ETA_ROTATION_SNAPSHOTS` for cross-node determinism.
+    // accept() captures `NodeStakeAggregator.snapshotFromMpt` (the §G2 MPT-primary path; byte-equivalent to the previous
+    // `EpochStakeSnapshotter.snapshot(builtInfo)` GSI walk) into `historicalStakeSnapshots[currentPeriod]` and prunes
+    // entries older than `currentPeriod - 3` (algorithm reads N-2; the extra slot is a reorg-grace). Must match the
+    // producer's `NAKAMOTO_ETA_ROTATION_SNAPSHOTS` for cross-node determinism.
     etaRotationSnapshots: Long = 2550L
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
@@ -234,6 +236,12 @@ object GlobalSnapshotAcceptanceManager {
       val delegatedStakeStateManager = DelegatedStakeStateManager.make[F](branchAwareReader)
       val nodeCollateralStateManager = NodeCollateralStateManager.make[F](branchAwareReader)
       val transactionReferenceManager = TransactionReferenceManager.make[F](branchAwareReader)
+      // §G2 — MPT-primary stake aggregator. Mirrors the per-state-manager pattern (each routed via the branch-aware reader so
+      // boundary-write reads under MultiBranch see pending parent-branch writes). Used by `computeHistoricalStakeBoundaryDelta`
+      // to materialize the §3 NIPoPoW S0.4 boundary `StakeDistribution` from MPT prefix-scans rather than walking the in-memory
+      // `baseInfo.activeDelegatedStakes / activeNodeCollaterals` maps; the two paths are byte-equivalent when MPT and GSI are in
+      // sync (which they are inside accept() since the GSI is built from the same accepted records the MPT writer then syncs).
+      val stakeAggregator: NodeStakeAggregator[F] = NodeStakeAggregator.make[F](branchAwareReader)
       val blockAcceptanceCoordinatorManager = BlockAcceptanceCoordinatorManager.make[F](
         blockAcceptanceManager,
         allowSpendBlockAcceptanceManager,
@@ -628,29 +636,38 @@ object GlobalSnapshotAcceptanceManager {
         private def computeHistoricalStakeBoundaryDelta(
           ordinal: SnapshotOrdinal,
           baseInfo: GlobalSnapshotInfo
-        ): (SortedMap[EtaPeriod, StakeDistribution], Set[EtaPeriod], SortedMap[EtaPeriod, StakeDistribution]) = {
+        )(
+          implicit hasher: Hasher[F]
+        ): F[(SortedMap[EtaPeriod, StakeDistribution], Set[EtaPeriod], SortedMap[EtaPeriod, StakeDistribution])] = {
           val ordValue = ordinal.value.value
           if (etaRotationSnapshots > 0L && ordValue % etaRotationSnapshots == etaRotationSnapshots - 1L) {
             val currentPeriod = EtaPeriod(ordValue / etaRotationSnapshots)
-            val newSnapshot = EpochStakeSnapshotter.snapshot(baseInfo)
-            val retentionMinPeriod = currentPeriod.value - 3L
-            val priorKeys = baseInfo.historicalStakeSnapshots.keySet
-            val pruned = baseInfo.historicalStakeSnapshots.filter(_._1.value >= retentionMinPeriod)
-            val next = pruned.updated(currentPeriod, newSnapshot)
-            // Adds: include the boundary write *and* any retained-prior entry whose value `next` newly
-            // exposes — in practice only `currentPeriod` is added because retained priors equal their
-            // pre-boundary values, but writing them is idempotent and stays consistent if retention rules
-            // ever evolve. Keep the minimal form to match `buildGlobalSnapshotInfo`'s `updated` semantics.
-            val adds: SortedMap[EtaPeriod, StakeDistribution] =
-              SortedMap[EtaPeriod, StakeDistribution](currentPeriod -> newSnapshot)
-            // Removes: prior keys that survived in `baseInfo.historicalStakeSnapshots` but are below the
-            // retention floor. The producer's MPT writer prunes them; the verifier rebuilds from `next` so
-            // it doesn't see them — without the explicit removal the producer's MPT keeps a stale entry
-            // and parity (#107) breaks at the next boundary.
-            val removes: Set[EtaPeriod] = priorKeys.filter(_.value < retentionMinPeriod).toSet
-            (adds, removes, next)
+            // §G2 — read the boundary `StakeDistribution` from the MPT via `NodeStakeAggregator` rather than from
+            // `baseInfo.{activeDelegatedStakes, activeNodeCollaterals}`. The two are byte-equivalent here (MPT was just synced
+            // from the same accepted records that built the GSI), and routing via MPT removes the redundant in-memory mirror —
+            // closing a class of #218-style cross-node drift bugs where two nodes' GSI iteration order produced divergent bytes.
+            NodeStakeAggregator.snapshotFromMpt[F](stakeAggregator).map { newSnapshot =>
+              val retentionMinPeriod = currentPeriod.value - 3L
+              val priorKeys = baseInfo.historicalStakeSnapshots.keySet
+              val pruned = baseInfo.historicalStakeSnapshots.filter(_._1.value >= retentionMinPeriod)
+              val next = pruned.updated(currentPeriod, newSnapshot)
+              // Adds: include the boundary write *and* any retained-prior entry whose value `next` newly
+              // exposes — in practice only `currentPeriod` is added because retained priors equal their
+              // pre-boundary values, but writing them is idempotent and stays consistent if retention rules
+              // ever evolve. Keep the minimal form to match `buildGlobalSnapshotInfo`'s `updated` semantics.
+              val adds: SortedMap[EtaPeriod, StakeDistribution] =
+                SortedMap[EtaPeriod, StakeDistribution](currentPeriod -> newSnapshot)
+              // Removes: prior keys that survived in `baseInfo.historicalStakeSnapshots` but are below the
+              // retention floor. The producer's MPT writer prunes them; the verifier rebuilds from `next` so
+              // it doesn't see them — without the explicit removal the producer's MPT keeps a stale entry
+              // and parity (#107) breaks at the next boundary.
+              val removes: Set[EtaPeriod] = priorKeys.filter(_.value < retentionMinPeriod).toSet
+              (adds, removes, next)
+            }
           } else {
-            (SortedMap.empty[EtaPeriod, StakeDistribution], Set.empty[EtaPeriod], baseInfo.historicalStakeSnapshots)
+            Async[F].pure(
+              (SortedMap.empty[EtaPeriod, StakeDistribution], Set.empty[EtaPeriod], baseInfo.historicalStakeSnapshots)
+            )
           }
         }
 
@@ -688,7 +705,9 @@ object GlobalSnapshotAcceptanceManager {
           updatedWithdrawNodeCollateralsCleaned: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
           updatedPriceState: SortedMap[TokenPair, PriceRecord],
           updatedAcceptedMetagraphSyncData: SortedMap[Address, MetagraphSyncDataInfo]
-        ): BuildGlobalSnapshotInfoResult = {
+        )(
+          implicit hasher: Hasher[F]
+        ): F[BuildGlobalSnapshotInfoResult] = {
           val baseInfo = GlobalSnapshotInfo(
             updatedLastStateChannelSnapshotHashes,
             if (era.beforeTess3(ordinal))
@@ -725,12 +744,17 @@ object GlobalSnapshotAcceptanceManager {
           // The boundary delta is computed in `computeHistoricalStakeBoundaryDelta` so the same logic feeds both this
           // GSI field set and the `StateChangesAccumulator.historicalStakeSnapshots` / `removedHistoricalStakeSnapshotKeys`
           // delta — keeping them in lockstep is the MPT parity contract.
-          val (adds, removes, nextHistorical) = computeHistoricalStakeBoundaryDelta(ordinal, baseInfo)
-          BuildGlobalSnapshotInfoResult(
-            gsi = baseInfo.copy(historicalStakeSnapshots = nextHistorical),
-            historicalStakeAdds = adds,
-            historicalStakeRemoves = removes
-          )
+          //
+          // §G2 — `computeHistoricalStakeBoundaryDelta` is now `F[]` (reads the boundary `StakeDistribution` from MPT via
+          // `NodeStakeAggregator.snapshotFromMpt`). `buildGlobalSnapshotInfo` lifts into `F[]` here.
+          computeHistoricalStakeBoundaryDelta(ordinal, baseInfo).map {
+            case (adds, removes, nextHistorical) =>
+              BuildGlobalSnapshotInfoResult(
+                gsi = baseInfo.copy(historicalStakeSnapshots = nextHistorical),
+                historicalStakeAdds = adds,
+                historicalStakeRemoves = removes
+              )
+          }
         }
 
         def accept(
@@ -1326,7 +1350,7 @@ object GlobalSnapshotAcceptanceManager {
                     epochProgress
                   )
 
-                gsiResult = buildGlobalSnapshotInfo(
+                gsiResult <- buildGlobalSnapshotInfo(
                   ordinal,
                   era,
                   lastSnapshotContext,

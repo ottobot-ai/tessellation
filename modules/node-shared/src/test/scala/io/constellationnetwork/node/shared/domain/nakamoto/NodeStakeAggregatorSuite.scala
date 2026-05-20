@@ -16,6 +16,7 @@ import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, WithdrawalTimeLimit}
+import io.constellationnetwork.schema.nakamoto.EpochStakeSnapshotter
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
@@ -23,6 +24,7 @@ import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.{Signed, signature}
+import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
@@ -31,15 +33,13 @@ import weaver.MutableIOSuite
   *
   * Covers the four properties the StakeRegistry.stakeWeightedMpt path depends on:
   *
-  *   1. Empty MPT → empty Map (boot fallback).
-  *   2. Multiple records pointing at the same nodeId on different source addresses sum into a single
-  *      aggregate per node.
-  *   3. Mixed delegated-stake + node-collateral for the same nodeId sum together (two-tier stake).
-  *   4. Byte-equivalent across independent MPT builds with the same input (core determinism — the
-  *      §G1 motivation: closing #218-style cross-node drift on stake reads).
+  *   1. Empty MPT → empty Map (boot fallback). 2. Multiple records pointing at the same nodeId on different source addresses sum into a
+  *      single aggregate per node. 3. Mixed delegated-stake + node-collateral for the same nodeId sum together (two-tier stake). 4.
+  *      Byte-equivalent across independent MPT builds with the same input (core determinism — the §G1 motivation: closing #218-style
+  *      cross-node drift on stake reads).
   *
-  * The per-snapshot-ordinal cached variant ([[NodeStakeAggregator.cached]]) is exercised in
-  * separate tests below: hit on same ordinal, miss on ordinal advance, None ordinal defeats cache.
+  * The per-snapshot-ordinal cached variant ([[NodeStakeAggregator.cached]]) is exercised in separate tests below: hit on same ordinal, miss
+  * on ordinal advance, None ordinal defeats cache.
   */
 object NodeStakeAggregatorSuite extends MutableIOSuite {
 
@@ -141,8 +141,7 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
       reader = GlobalStateReader.fromMptStore[IO](store)
       aggregator = NodeStakeAggregator.make[IO](reader)
       out <- aggregator.aggregateFromMpt
-    } yield
-      expect.same(Map(n -> BigInt(1000)), out)
+    } yield expect.same(Map(n -> BigInt(1000)), out)
   }
 
   test("mixed delegated + collateral for same nodeId → sum (two-tier)") { res =>
@@ -160,8 +159,7 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
       reader = GlobalStateReader.fromMptStore[IO](store)
       aggregator = NodeStakeAggregator.make[IO](reader)
       out <- aggregator.aggregateFromMpt
-    } yield
-      expect.same(Map(n -> BigInt(1000)), out)
+    } yield expect.same(Map(n -> BigInt(1000)), out)
   }
 
   test("byte-determinism — two independent MPT builds with same input agree") { res =>
@@ -295,5 +293,109 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
       _ <- cached.aggregateFromMpt
       calls <- callsR.get
     } yield expect.same(3, calls)
+  }
+
+  // ---- §G2 byte-equivalence parity ------------------------------------------
+  //
+  // The G2 migration replaces `EpochStakeSnapshotter.snapshot(info)` (walks the in-memory
+  // `activeDelegatedStakes + activeNodeCollaterals` GSI maps) with
+  // `NodeStakeAggregator.snapshotFromMpt(aggregator)` (prefix-scans the same data out of the MPT).
+  // The two MUST produce byte-identical `StakeDistribution` when MPT and GSI are in sync — which is
+  // the invariant inside `GlobalSnapshotAcceptanceManager.accept()` since both views are built from
+  // the same accepted records (GSI directly, MPT via `syncFromGlobalSnapshotInfo`).
+  //
+  // The MPT path returns a flat `Map[PeerId, BigInt]` aggregate (sum-as-we-fold), the GSI path
+  // computes separate delegated + collateral maps then merges. Both funnel through
+  // `EpochStakeSnapshotter.fromCombined`, which is the single point owning the `SortedMap`
+  // materialization — so the resulting scodec bytes are identical regardless of source.
+  //
+  // Asserting both `.stakes` (logical equality) and `StakeDistributionCodec` bytes (binary
+  // equality) covers the MPT/Brotli state-proof rebuild contract end-to-end.
+
+  test("snapshotFromMpt parity — single-tier delegated stakes byte-equal to GSI-primary snapshot") { res =>
+    implicit val (h, _, js) = res
+    val nA = pid("node-A")
+    val nB = pid("node-B")
+    val s1 = addr("s1")
+    val s2 = addr("s2")
+    val delegated = SortedMap[Address, SortedSet[DelegatedStakeRecord]](
+      s1 -> SortedSet(mkDelegated(nA, 100L, s1, ord = 1L)),
+      s2 -> SortedSet(mkDelegated(nB, 250L, s2, ord = 2L))
+    )
+    val info = GlobalSnapshotInfo.empty.copy(activeDelegatedStakes = Some(delegated))
+    val gsiPrimary = EpochStakeSnapshotter.snapshot(info)
+
+    for {
+      store <- mkStore(delegated, SortedMap.empty)
+      aggregator = NodeStakeAggregator.make[IO](GlobalStateReader.fromMptStore(store))
+      mptPrimary <- NodeStakeAggregator.snapshotFromMpt[IO](aggregator)
+      gsiBytes = StakeDistributionCodec.codec.encode(gsiPrimary).require.toByteArray
+      mptBytes = StakeDistributionCodec.codec.encode(mptPrimary).require.toByteArray
+    } yield
+      expect.same(gsiPrimary.stakes, mptPrimary.stakes) &&
+        expect(java.util.Arrays.equals(gsiBytes, mptBytes))
+  }
+
+  test("snapshotFromMpt parity — delegated + collateral two-tier sums byte-equal to GSI-primary snapshot") { res =>
+    implicit val (h, _, js) = res
+    val nA = pid("node-A")
+    val nB = pid("node-B")
+    val nC = pid("node-C")
+    val s1 = addr("s1")
+    val s2 = addr("s2")
+    val s3 = addr("s3")
+    // Mixed shape exercising the same nodeId from two delegated sources AND a collateral entry,
+    // plus a third-party collateral-only node. Mirrors the byte-determinism test above so the same
+    // input shape feeds both the GSI walk and the MPT prefix-scan and we can compare bytes head-to-
+    // head.
+    val delegated = SortedMap[Address, SortedSet[DelegatedStakeRecord]](
+      s1 -> SortedSet(mkDelegated(nA, 100L, s1, ord = 1L), mkDelegated(nB, 200L, s1, ord = 2L)),
+      s2 -> SortedSet(mkDelegated(nA, 50L, s2, ord = 3L))
+    )
+    val collateral = SortedMap[Address, SortedSet[NodeCollateralRecord]](
+      s2 -> SortedSet(mkCollateral(nB, 75L, s2, ord = 4L)),
+      s3 -> SortedSet(mkCollateral(nC, 300L, s3, ord = 5L))
+    )
+    val info = GlobalSnapshotInfo.empty.copy(
+      activeDelegatedStakes = Some(delegated),
+      activeNodeCollaterals = Some(collateral)
+    )
+    val gsiPrimary = EpochStakeSnapshotter.snapshot(info)
+
+    for {
+      store <- mkStore(delegated, collateral)
+      aggregator = NodeStakeAggregator.make[IO](GlobalStateReader.fromMptStore(store))
+      mptPrimary <- NodeStakeAggregator.snapshotFromMpt[IO](aggregator)
+      gsiBytes = StakeDistributionCodec.codec.encode(gsiPrimary).require.toByteArray
+      mptBytes = StakeDistributionCodec.codec.encode(mptPrimary).require.toByteArray
+    } yield
+      // Logical equality first (fast-fails on Map content) then byte equality (the load-bearing
+      // assertion for the MPT/Brotli state-proof rebuild contract).
+      expect.same(gsiPrimary.stakes, mptPrimary.stakes) &&
+        expect(java.util.Arrays.equals(gsiBytes, mptBytes)) &&
+        // Sanity-check the expected aggregate so a future StakeDistribution semantic change can't
+        // silently pass parity with two co-broken paths.
+        expect.same(BigInt(150), gsiPrimary.stakeOf(nA)) &&
+        expect.same(BigInt(275), gsiPrimary.stakeOf(nB)) &&
+        expect.same(BigInt(300), gsiPrimary.stakeOf(nC))
+  }
+
+  test("snapshotFromMpt parity — empty MPT/GSI both yield empty distribution (boot path)") { res =>
+    implicit val (h, _, js) = res
+    val info = GlobalSnapshotInfo.empty
+    val gsiPrimary = EpochStakeSnapshotter.snapshot(info)
+    for {
+      store <- mkStore(SortedMap.empty, SortedMap.empty)
+      aggregator = NodeStakeAggregator.make[IO](GlobalStateReader.fromMptStore(store))
+      mptPrimary <- NodeStakeAggregator.snapshotFromMpt[IO](aggregator)
+      gsiBytes = StakeDistributionCodec.codec.encode(gsiPrimary).require.toByteArray
+      mptBytes = StakeDistributionCodec.codec.encode(mptPrimary).require.toByteArray
+    } yield
+      // Both are `StakeDistribution.Empty` in shape; assert the bytes also agree so the boot path
+      // doesn't slip past the byte-equivalence contract on a technicality (e.g. a SortedMap with a
+      // different ordering instance would compare equal in `.stakes` but encode differently).
+      expect.same(gsiPrimary.stakes, mptPrimary.stakes) &&
+        expect(java.util.Arrays.equals(gsiBytes, mptBytes)) &&
+        expect(mptPrimary.stakes.isEmpty)
   }
 }

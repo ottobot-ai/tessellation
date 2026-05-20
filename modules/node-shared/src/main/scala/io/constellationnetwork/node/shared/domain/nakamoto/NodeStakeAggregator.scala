@@ -9,6 +9,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateRe
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
+import io.constellationnetwork.schema.nakamoto.{EpochStakeSnapshotter, StakeDistribution}
 import io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.Hasher
@@ -16,30 +17,26 @@ import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{dele
 
 /** G1 — MPT-backed per-node stake aggregator.
   *
-  * Sums `delegated-stake + node-collateral` amounts across both partitions, keyed by
-  * `record.event.value.nodeId`. Returns `Map[PeerId, BigInt]` of two-tier combined stake.
+  * Sums `delegated-stake + node-collateral` amounts across both partitions, keyed by `record.event.value.nodeId`. Returns `Map[PeerId,
+  * BigInt]` of two-tier combined stake.
   *
-  * Reads from the global-state MPT via prefix-scan against the two stake partitions
-  * (`ActiveDelegatedStakes` field id 13, `ActiveNodeCollaterals` field id 15). Records pointing at
-  * the same `nodeId` from different source addresses (or from a mix of delegated + collateral) sum
-  * into one aggregate per node.
+  * Reads from the global-state MPT via prefix-scan against the two stake partitions (`ActiveDelegatedStakes` field id 13,
+  * `ActiveNodeCollaterals` field id 15). Records pointing at the same `nodeId` from different source addresses (or from a mix of delegated
+  * + collateral) sum into one aggregate per node.
   *
-  * '''Why MPT prefix-scan, not GSI iteration.''' The legacy `StakeRegistry.stakeWeighted` walks
-  * `info.activeDelegatedStakes` / `info.activeNodeCollaterals` in-memory maps which are GSI-primary.
-  * Under the GSI-to-MPT migration the MPT is the canonical store; the GSI gets reconstructed from
-  * the MPT at boot, so reading from the MPT directly removes a redundant in-memory mirror and avoids
-  * the byte-determinism gap between two independent node MPT builds (closes a class of #218-style
-  * divergence bugs).
+  * '''Why MPT prefix-scan, not GSI iteration.''' The legacy `StakeRegistry.stakeWeighted` walks `info.activeDelegatedStakes` /
+  * `info.activeNodeCollaterals` in-memory maps which are GSI-primary. Under the GSI-to-MPT migration the MPT is the canonical store; the
+  * GSI gets reconstructed from the MPT at boot, so reading from the MPT directly removes a redundant in-memory mirror and avoids the
+  * byte-determinism gap between two independent node MPT builds (closes a class of #218-style divergence bugs).
   *
-  * '''Empty-MPT semantics.''' If the prefix scan returns no entries (pre-genesis / boot path, or a
-  * snapshot at ordinal 0 with no stake records yet), `aggregateFromMpt` returns an empty map. Caller
-  * is responsible for the 1/N fallback (current `StakeRegistry.stakeWeightedMpt` impl handles this).
+  * '''Empty-MPT semantics.''' If the prefix scan returns no entries (pre-genesis / boot path, or a snapshot at ordinal 0 with no stake
+  * records yet), `aggregateFromMpt` returns an empty map. Caller is responsible for the 1/N fallback (current
+  * `StakeRegistry.stakeWeightedMpt` impl handles this).
   *
-  * '''Caching.''' This trait exposes the raw, uncached read. For the consensus hot path —
-  * `EligibilityChecker.relativeStake` fires per-slot — wrap in [[NodeStakeAggregator.cached]] which
-  * memoizes the result keyed on `SnapshotOrdinal` and invalidates whenever the parent ordinal
-  * advances. The pattern mirrors `materializeActiveTokenLocksFromMpt` ("read once per accept") but
-  * with finer-grained per-ordinal invalidation since `relativeStake` is read-side, not write-side.
+  * '''Caching.''' This trait exposes the raw, uncached read. For the consensus hot path — `EligibilityChecker.relativeStake` fires per-slot
+  * — wrap in [[NodeStakeAggregator.cached]] which memoizes the result keyed on `SnapshotOrdinal` and invalidates whenever the parent
+  * ordinal advances. The pattern mirrors `materializeActiveTokenLocksFromMpt` ("read once per accept") but with finer-grained per-ordinal
+  * invalidation since `relativeStake` is read-side, not write-side.
   */
 trait NodeStakeAggregator[F[_]] {
 
@@ -52,10 +49,24 @@ trait NodeStakeAggregator[F[_]] {
 
 object NodeStakeAggregator {
 
-  /** Uncached pass-through implementation. Every call re-runs two MPT prefix scans + an in-memory
-    * fold. Suitable for low-frequency callers (boot, diagnostics, tests). Production hot-path uses
-    * [[cached]] which wraps this and serves repeated calls within the same snapshot ordinal from
-    * memory.
+  /** §G2 — MPT-primary equivalent of `EpochStakeSnapshotter.snapshot(info)`.
+    *
+    * Reads the per-node aggregate via `aggregator.aggregateFromMpt` and wraps it in a `StakeDistribution` through
+    * `EpochStakeSnapshotter.fromCombined`. The wrapping uses the same `SortedMap` materialization as the GSI-primary path — so when MPT and
+    * GSI are in sync (which is the case during `accept()` — the GSI is built from the same accepted records that the MPT writer then
+    * syncs), the resulting `StakeDistribution` bytes are identical to those produced by `EpochStakeSnapshotter.snapshot(info)`. This
+    * byte-equivalence is the §G2 migration contract; see `NodeStakeAggregatorSuite` "snapshotFromMpt parity" test.
+    *
+    * Effectful because the underlying MPT prefix-scan is `F[]`. Callers in `GlobalSnapshotAcceptanceManager.accept()` already run under an
+    * `implicit hasher: Hasher[F]` (set at the top of `accept()` from `HasherSelector.getForOrdinal(ordinal)`), so the additional `flatMap`
+    * lifts cleanly into the existing for-comprehension.
+    */
+  def snapshotFromMpt[F[_]: Async](aggregator: NodeStakeAggregator[F])(implicit hasher: Hasher[F]): F[StakeDistribution] =
+    aggregator.aggregateFromMpt.map(EpochStakeSnapshotter.fromCombined)
+
+  /** Uncached pass-through implementation. Every call re-runs two MPT prefix scans + an in-memory fold. Suitable for low-frequency callers
+    * (boot, diagnostics, tests). Production hot-path uses [[cached]] which wraps this and serves repeated calls within the same snapshot
+    * ordinal from memory.
     */
   def make[F[_]: Async](reader: GlobalStateReader[F]): NodeStakeAggregator[F] = new NodeStakeAggregator[F] {
 
@@ -93,23 +104,20 @@ object NodeStakeAggregator {
   /** Per-snapshot-ordinal cached wrapper.
     *
     * Caching question — three options:
-    *   - (a) Pure pass-through: every call re-reads MPT. Simple and correct but expensive when
-    *     `relativeStake` fires per slot at 1 Hz × N validators × per-leader-election × per-
-    *     attestation-verify. Two prefix scans per call.
-    *   - (b) '''Per-snapshot cache (this implementation).''' Hold a `Ref[F, Option[(SnapshotOrdinal,
-    *     Map[PeerId, BigInt])]]` and refresh when the snapshot ordinal advances. Matches
-    *     `materializeActiveTokenLocksFromMpt` semantics (read once per accept) but with finer-
-    *     grained per-ordinal invalidation. Trade-off: a stale read within the same snapshot
-    *     ordinal is by construction correct because the MPT view at that ordinal is immutable;
-    *     stake mutations only land at snapshot acceptance.
-    *   - (c) Caller passes the aggregate as a pure `Map[PeerId, BigInt]`, computed once. Requires
-    *     plumbing changes at every call site and loses the lazy boot path.
+    *   - (a) Pure pass-through: every call re-reads MPT. Simple and correct but expensive when `relativeStake` fires per slot at 1 Hz × N
+    *     validators × per-leader-election × per- attestation-verify. Two prefix scans per call.
+    *   - (b) '''Per-snapshot cache (this implementation).''' Hold a `Ref[F, Option[(SnapshotOrdinal, Map[PeerId, BigInt])]]` and refresh
+    *     when the snapshot ordinal advances. Matches `materializeActiveTokenLocksFromMpt` semantics (read once per accept) but with finer-
+    *     grained per-ordinal invalidation. Trade-off: a stale read within the same snapshot ordinal is by construction correct because the
+    *     MPT view at that ordinal is immutable; stake mutations only land at snapshot acceptance.
+    *   - (c) Caller passes the aggregate as a pure `Map[PeerId, BigInt]`, computed once. Requires plumbing changes at every call site and
+    *     loses the lazy boot path.
     *
-    * Choice rationale: (b) hits the hot path without a plumbing rewrite. (a) is too expensive at
-    * 8gl0+4mg+4shards (sims show ~200 calls/sec). (c) is correct but invasive.
+    * Choice rationale: (b) hits the hot path without a plumbing rewrite. (a) is too expensive at 8gl0+4mg+4shards (sims show ~200
+    * calls/sec). (c) is correct but invasive.
     *
-    * The `currentOrdinalF` callback resolves the "view ordinal" — typically
-    * `lastGlobalSnapshotStorage.getOrdinal`. `None` (pre-genesis) defeats caching (always reads).
+    * The `currentOrdinalF` callback resolves the "view ordinal" — typically `lastGlobalSnapshotStorage.getOrdinal`. `None` (pre-genesis)
+    * defeats caching (always reads).
     */
   def cached[F[_]: Async](
     underlying: NodeStakeAggregator[F],

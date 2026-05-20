@@ -120,19 +120,28 @@ object EpochStakeSnapshotter {
           val amt = BigInt(record.amount.value.value)
           acc.updated(p, acc.getOrElse(p, BigInt(0)) + amt)
       }
-    val collateral: Map[PeerId, BigInt] =
-      info.activeNodeCollaterals.iterator.flatMap(_.valuesIterator).flatMap(_.iterator).foldLeft(Map.empty[PeerId, BigInt]) {
-        (acc, record) =>
-          val p = record.event.value.nodeId
-          val amt = BigInt(record.event.value.amount.value.value)
-          acc.updated(p, acc.getOrElse(p, BigInt(0)) + amt)
+    val combined: Map[PeerId, BigInt] =
+      info.activeNodeCollaterals.iterator.flatMap(_.valuesIterator).flatMap(_.iterator).foldLeft(delegated) { (acc, record) =>
+        val p = record.event.value.nodeId
+        val amt = BigInt(record.event.value.amount.value.value)
+        acc.updated(p, acc.getOrElse(p, BigInt(0)) + amt)
       }
-    val merged: SortedMap[PeerId, BigInt] =
-      delegated.keySet
-        .union(collateral.keySet)
-        .iterator
-        .map(p => p -> (delegated.getOrElse(p, BigInt(0)) + collateral.getOrElse(p, BigInt(0))))
-        .to(SortedMap)
-    StakeDistribution(merged)
+    fromCombined(combined)
   }
+
+  /** §G2 — wrap a flat `Map[PeerId, BigInt]` (already combined delegated + collateral) into a byte-deterministic `StakeDistribution`. Used
+    * by both [[snapshot]] (GSI-primary) and the MPT-primary `snapshotFromMpt` path in `node-shared`
+    * (`io.constellationnetwork.node.shared.domain.nakamoto.NodeStakeAggregator.snapshotFromMpt`).
+    *
+    * Materializing into `SortedMap` via the same `iterator.to(SortedMap)` here is the single point that owns the byte-encoding contract.
+    * Both paths produce the same combined `Map[PeerId, BigInt]` upstream (sum across delegated + collateral records), and `SortedMap`
+    * ordering is determined by `Ordering[PeerId]` — so the resulting circe-encoded `StakeDistribution` bytes are identical across the GSI
+    * and MPT paths when the two sources are in sync (the §G2 byte-equivalence contract verified by `NodeStakeAggregatorSuite`
+    * "snapshotFromMpt parity").
+    *
+    * Public because the MPT-side aggregator lives in a different package (`node-shared`); restricting to `private[nakamoto]` here would
+    * only cover `io.constellationnetwork.schema.nakamoto.*` and shut out the `node-shared.domain.nakamoto` caller.
+    */
+  def fromCombined(combined: Map[PeerId, BigInt]): StakeDistribution =
+    StakeDistribution(combined.iterator.to(SortedMap))
 }
