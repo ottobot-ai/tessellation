@@ -274,13 +274,23 @@ each shard.
   registered keys. Mitigation requires KES forward-security and a
   registration window — additional protocol surface.
 
-### 2.4 Key parameters
+### 2.4 Key parameters — DECIDED 2026-05-20
 
-| Parameter | Recommendation | Tradeoff |
+User-locked decisions for v1 (per the metagraph-throughput / scaling thread, anchored on "tens of thousands of operators, hundreds-to-thousands of metagraphs" target). State-management ergonomics on a per-operator node was the dominant deciding factor.
+
+| Parameter | Value (v1) | Justification |
 |---|---|---|
-| **`E`** — epoch length in snapshots between reassignments | Tie to existing eta-rotation `R = 2550` (≈ 1 day at 7s snapshots) | Short `E` → less adversary-targeting opportunity, more churn. Long `E` → reduced churn, more time for adversary stake re-accumulation. |
-| **`m`** — shards per validator | `m = 1` for minimal infra cost; `m ≥ 2` for redundancy against single-shard liveness gaps | `m > 1` softens churn but does not change the structural bound. |
-| **Sortition unit** | **Open** — operator vs validator vs (operator, validator) tuple | The cleanest binding for the two-tier stake model is per-validator; the cleanest operational fit is per-operator. |
+| **`m`** — shards per operator | **1** (one shard + global) | Operational: each operator runs gl0 (universal) + exactly one metagraph's state. Per-operator state cost is O(1) regardless of total metagraph count. The liveness variance concern at small N/S is handled by staggered rotation (below), not by multi-shard overlap. |
+| **Stagger fraction per eta-boundary** | **1/4** | Each rotation only reassigns 1/4 of operators per shard; 75% continuity preserved across boundaries. Eth2 sync-committee precedent. Smooths bootstrap pressure 4× vs full rotation. |
+| **Sortition unit** | **per-operator (PeerId)** | Simpler than per-validator; matches existing seedlist semantics. Delegators stake to operators without re-staking per-shard. |
+| **`E`** — epoch length | **eta-rotation `R = 2550` snapshots (~6h at 7s)** | Reuses existing cadence. Adversary stake-rebalancing window matches the existing one. |
+| **`S`** — shard count (v1) | **static, `S = M` (one shard per metagraph)** | v1 simplicity. Defer multi-metagraph-per-shard to v2 when needed. At target scale (10K-100K operators × 1K-3K metagraphs) gives N/S = 10-100 operators/shard — comfortably above the N/S ≥ 12 honest-majority safety floor. |
+| **Pre-warm window** | **1 epoch advance notice** | Operator gets ~6h to sync the assigned shard's state before duty fires. |
+| **Onboarding lag** | **earliest sortition = `join_epoch + 1 + n_warm`** | New operator syncs gl0 first, then gets advance notice for first shard duty. |
+| **Emergency rotation** | **fallback if shard quorum drops <2/3 for K snapshots** | Liveness backstop. Pulls in spillover operators from adjacent shards. |
+| **Slashed-operator handling** | **rotate out at next eta-boundary** | Mid-epoch re-sortition adds complexity; stake is already gone so the operator has nothing to attack with mid-epoch. |
+
+**Configurability**: each parameter env-overridable so testnet can tune (e.g., `NAKAMOTO_SHARDS_PER_OPERATOR=1`, `NAKAMOTO_STAGGER_FRACTION=4`). Default to the values above.
 
 ### 2.5 Verdict
 
@@ -299,6 +309,15 @@ in ways §7 enumerates.
 2026-05-15 user directive selected Option A as the structural defence
 on the explicit grounds that modifying metagraph consensus (Option B)
 is out of scope.
+
+### 2.6 Operational considerations at scale
+
+At target scale (10K-100K operators, 1K-3K metagraphs), per-epoch bandwidth is the dominant operational cost:
+
+- **Per-rotation bootstrap**: with `stagger_fraction = 1/4` and N=10K, each eta-boundary triggers `N/4 = 2,500` operators-in-rotation. If each carries ~100MB of metagraph state, cluster-wide transfer ≈ 250GB per eta-boundary (~6h), or ~11MB/s sustained. Per-node sync is bounded at ~1Gbps → ~0.8s per operator, parallelizable.
+- **Pre-warming budget**: an operator notified at `join_epoch + 1` has ~6h to download state before being on-duty. 100MB in 6h is trivial; this concern is academic unless state grows to GB-scale per metagraph.
+- **gl0 stamping load**: aggregate snapshot includes one tip-hash per shard. At S=3000 shards, 32-byte hashes + metadata ≈ 100KB per gl0 snapshot. At 7s cadence ≈ 14KB/s — fine.
+- **gl0 acceptance CPU**: one VRF-eligibility check per binary admission. At 3000 binaries per gl0 snapshot × ~10ms each = 30s of work per snapshot — exceeds the 7s cadence. Mitigation: batched VRF verification, cached committee assignments per `(operator, epoch)`. Address in implementation phase A2.
 
 ---
 
