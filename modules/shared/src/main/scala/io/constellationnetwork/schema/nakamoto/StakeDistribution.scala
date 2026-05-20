@@ -156,12 +156,23 @@ object EpochStakeSnapshotter {
     * applied to the genesis GSI before any boundary-write history exists — so the three keys are written unconditionally. The first
     * acceptance after restart re-runs the producer's pipeline and overwrites at its boundary cadence; backfilled keys that have already
     * been pruned in the on-disk store will be re-introduced on this path. This is load-bearing only for the boot path of a fresh cluster.
+    *
+    * '''No-op on Empty distribution.''' The CSV genesis path (default for the e2e harness at `--num-gl0=8 --metagraphs=4 --shards=4`) calls
+    * this helper from `dag-l0/Main.scala` BEFORE delegated-stake/collateral records are populated into the GSI. The resulting
+    * `snapshot(info)` is therefore `StakeDistribution.Empty`, and seeding three periods with Empty forces `StakeRegistry.relativeStakeAt(_,
+    * period)` into branch-1 with `relativeStakeAgainst` returning `Ratio.Zero` (no positive total). The producer goes dormant and
+    * `assertRewardAndTokenUnlock` stalls (observed 2026-05-20 overnight bisect). When the snapshot is Empty, we return the `info` unchanged
+    * so `historicalDistributionFor` returns `None` and the registry falls through to the current GSI — which has the real stakes by the
+    * time the producer queries it (genesis loader writes them post-augment).
     */
   def backfillGenesisStakeSnapshots(info: GlobalSnapshotInfo): GlobalSnapshotInfo = {
     val genesisDistribution = snapshot(info)
-    val seeded: SortedMap[EtaPeriod, StakeDistribution] =
-      List(EtaPeriod(-2L), EtaPeriod(-1L), EtaPeriod(0L))
-        .foldLeft(info.historicalStakeSnapshots)((acc, k) => acc.updated(k, genesisDistribution))
-    info.copy(historicalStakeSnapshots = seeded)
+    if (genesisDistribution == StakeDistribution.Empty) info
+    else {
+      val seeded: SortedMap[EtaPeriod, StakeDistribution] =
+        List(EtaPeriod(-2L), EtaPeriod(-1L), EtaPeriod(0L))
+          .foldLeft(info.historicalStakeSnapshots)((acc, k) => acc.updated(k, genesisDistribution))
+      info.copy(historicalStakeSnapshots = seeded)
+    }
   }
 }
