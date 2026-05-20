@@ -247,51 +247,6 @@ object SnapshotLeaderLoop {
       }
   }
 
-  /** §3 NIPoPoW S3 — bound on the number of newly-archival ordinals processed per `finalityMonitor` tick. Catch-up after a process restart
-    * walks (`prev`, `archivalQualifying`] which could be many K₂ values if the leader-loop was offline; capping keeps each tick's wall-time
-    * predictable. Remaining ordinals roll forward on the next tick — the finalizer's high-water-mark guarantees forward-only progression
-    * regardless of how many ticks the catch-up spans.
-    */
-  private val TowerFinalizerMaxCatchupPerTick: Long = 100L
-
-  /** §3 NIPoPoW S3 — drive `towerFinalizer.finalize` for each newly-archival ordinal in `(prev, archivalQualifying]`. Resolves the
-    * canonical hash via `chainStore.walkBackTo(tipHash, ord)`, fetches the snapshot via `snapshotStorage.get(hash)`, and computes the
-    * content-address via `Signed.toHashed`. Errors are logged and swallowed — the next tick will retry remaining ordinals.
-    */
-  private def driveTowerFinalizer[F[_]: Async: HasherSelector](
-    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
-    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
-    towerFinalizer: io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerFinalizer[F],
-    tipHash: Hash,
-    prevWatermark: SnapshotOrdinal,
-    archivalQualifying: SnapshotOrdinal,
-    logger: org.typelevel.log4cats.Logger[F]
-  ): F[Unit] = {
-    val firstOrd = prevWatermark.value.value + 1L
-    val lastOrd = math.min(archivalQualifying.value.value, firstOrd + TowerFinalizerMaxCatchupPerTick - 1L)
-    if (lastOrd < firstOrd) Async[F].unit
-    else
-      (firstOrd to lastOrd).toList.traverse_ { ordValue =>
-        chainStore.walkBackTo(tipHash, ordValue).flatMap {
-          case Some(canonicalHash) =>
-            snapshotStorage.get(canonicalHash).flatMap {
-              case Some(signed) =>
-                HasherSelector[F].withCurrent { implicit hasher =>
-                  signed.toHashed.flatMap(towerFinalizer.finalize)
-                }
-              case None =>
-                logger.debug(
-                  s"[TowerFinalizer] No snapshot at ord=$ordValue hash=${canonicalHash.value.take(16)} (file missing); will retry next tick"
-                )
-            }
-          case None =>
-            logger.debug(s"[TowerFinalizer] No canonical hash at ord=$ordValue from tip=${tipHash.value.take(16)} (off canonical chain)")
-        }
-      }.handleErrorWith { err =>
-        logger.warn(err)(s"[TowerFinalizer] catch-up at range ($firstOrd..$lastOrd] failed")
-      }
-  }
-
   /** Run the pure attestation snapshot leader loop.
     *
     * This is the main consensus loop — call it instead of starting the BFT ConsensusEventLoop.
@@ -385,13 +340,7 @@ object SnapshotLeaderLoop {
     // has rolled into a finalized global snapshot. Without this the aggregator grows
     // monotonically (one entry per `(metagraph, parent, binary)` seen on the wire). Callers
     // that haven't wired the gate yet can pass `_ => Async[F].unit`.
-    onFinalize: io.constellationnetwork.schema.GlobalIncrementalSnapshot => F[Unit],
-    // §3 NIPoPoW S3: Phase-3 sink that grows the local TowerStore from finalized snapshots.
-    // Invoked next to the overlay history prune in `finalityMonitor` when T_depth2's archival
-    // watermark advances. The finalizer's high-water-mark Ref guarantees no double-write, so
-    // missed ticks (e.g. process restart) are safely re-driven from chain replay. Layers that
-    // don't run the Phase-3 sink (followers without the tower partition) pass `TowerFinalizer.noop`.
-    towerFinalizer: io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerFinalizer[F]
+    onFinalize: io.constellationnetwork.schema.GlobalIncrementalSnapshot => F[Unit]
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -995,36 +944,7 @@ object SnapshotLeaderLoop {
                                       // entries strictly below the new archival watermark — irreversible
                                       // and safe by depth-k₂ definition (reorgs at this depth excluded).
                                       // Logged at INFO inside the overlay when entries are dropped.
-                                      mptOverlay.pruneBelow(archivalQualifying) >>
-                                      // §3 NIPoPoW S3 Phase-3 sink. Walk newly-archival ordinals
-                                      // `(prev, archivalQualifying]` and feed each to the tower
-                                      // finalizer. The walk uses chainStore.walkBackTo from bestTip to
-                                      // resolve canonical hashes; snapshotStorage.get fetches the
-                                      // signed snapshot; toHashed re-computes the content hash. The
-                                      // finalizer's high-water-mark Ref guards against double-write.
-                                      //
-                                      // Bounded by `TowerFinalizerMaxCatchupPerTick` so catch-up after
-                                      // a process restart doesn't stall the leader loop's 5s tick.
-                                      // Remaining ordinals roll forward on the next tick — the
-                                      // finalizer's high-water-mark ensures forward-only progression
-                                      // even if the loop misses a window.
-                                      //
-                                      // Background-fire (`Async.start`) so the chain walk + L-1
-                                      // continued-fraction trial computations don't block the
-                                      // finality monitor's other sinks.
-                                      Async[F]
-                                        .start(
-                                          driveTowerFinalizer(
-                                            chainStore = chainStore,
-                                            snapshotStorage = snapshotStorage,
-                                            towerFinalizer = towerFinalizer,
-                                            tipHash = tip.hash,
-                                            prevWatermark = prev,
-                                            archivalQualifying = archivalQualifying,
-                                            logger = logger
-                                          )
-                                        )
-                                        .void
+                                      mptOverlay.pruneBelow(archivalQualifying)
                                   case None =>
                                     // Trigger advanced without a tip — shouldn't happen because the
                                     // trigger's evaluator returns MinValue when bestTip is None.
