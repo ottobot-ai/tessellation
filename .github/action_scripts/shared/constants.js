@@ -1,11 +1,13 @@
 const CONSTANTS = {
-    // 300 × 1s = 5 min. The previous 120 (2 min) was ~1 attempt above the
-    // observed time-to-include for late-test token locks; under cluster load,
-    // ML0 falls behind enough that propagation can take 2-3 min after a
-    // successful POST. 5 min gives consistent headroom without ballooning
-    // run-time when things are healthy (each verification short-circuits as
-    // soon as the lock appears).
-    MAX_VERIFICATION_ATTEMPTS: 300,
+    // 600 × 1s = 10 min. The 300 (5 min) value was the previous bump from 120
+    // (2 min) — sized as ~1 attempt above the observed time-to-include for
+    // late-test token locks. Under 8gl0+4mg+4shards load (2026-05-19/20), ml0
+    // → gl0 binary propagation runs longer: observed failures at 300 attempts
+    // with the cluster still healthy but not yet caught up. 10 min headroom
+    // absorbs the longer chain (m0..m3 each x cl1+ml0+dl1; gl0 has 8 voters)
+    // without ballooning run-time when healthy (the loop short-circuits as
+    // soon as the lock appears in gl0's combined snapshot).
+    MAX_VERIFICATION_ATTEMPTS: 600,
     VERIFICATION_INTERVAL_MS: 1000,
     EXPIRATION_VERIFICATION_INTERVAL_MS: 10 * 1000,
     SNAPSHOT_WAIT_TIME_MS: 15 * 1000,
