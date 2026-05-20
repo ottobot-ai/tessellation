@@ -27,17 +27,14 @@ import weaver.MutableIOSuite
 
 /** §G4: spec for the MPT-backed BlockAcceptanceContext factories.
   *
-  * Property under test: after `GlobalSnapshotInfo` is sync'd into an MPT store, point reads
-  * via [[BlockAcceptanceContext.fromMpt]] (and the AllowSpend / TokenLock siblings) return
-  * the SAME values that the legacy GSI-map factory would have returned. Plus the boundary
-  * case — missing keys return None — which downstream consumers fall through to `empty` /
-  * `initialTxRef` on.
+  * Property under test: after `GlobalSnapshotInfo` is sync'd into an MPT store, point reads via [[BlockAcceptanceContext.fromMpt]] (and the
+  * AllowSpend / TokenLock siblings) return the SAME values that the legacy GSI-map factory would have returned. Plus the boundary case —
+  * missing keys return None — which downstream consumers fall through to `empty` / `initialTxRef` on.
   *
-  * Why this matters: §G4 swaps the block-acceptance read path from `lastSnapshotContext.balances`
-  * (full map closure) to per-address MPT point reads. The migration is byte-equivalent only if
-  * GSI → MPT key derivation and value codec round-trips agree at the leaf level, for every
-  * field the acceptance path touches. These tests pin that agreement at the codec/key level so
-  * the GSI-to-MPT migration can't silently drift.
+  * Why this matters: §G4 swaps the block-acceptance read path from `lastSnapshotContext.balances` (full map closure) to per-address MPT
+  * point reads. The migration is byte-equivalent only if GSI → MPT key derivation and value codec round-trips agree at the leaf level, for
+  * every field the acceptance path touches. These tests pin that agreement at the codec/key level so the GSI-to-MPT migration can't
+  * silently drift.
   */
 object BlockAcceptanceContextMptSuite extends MutableIOSuite {
 

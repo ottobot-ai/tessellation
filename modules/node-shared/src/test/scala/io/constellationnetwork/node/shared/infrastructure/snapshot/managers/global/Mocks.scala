@@ -39,6 +39,7 @@ import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator.Spen
 import io.constellationnetwork.node.shared.domain.swap.block._
 import io.constellationnetwork.node.shared.domain.tokenlock.block._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.EventTrigger
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot.{DelegateRewardsInput, DelegatedRewardsResult, RewardsInput}
 import io.constellationnetwork.node.shared.logger.Slf4jLoggerBundle
 import io.constellationnetwork.schema.ID.Id
@@ -275,53 +276,55 @@ object Mocks {
     // Create the manager with mock dependencies
     implicit val hasherSelector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
     implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(Long.MaxValue))
-    JsonSerializer.forAsync[IO].flatMap { implicit j =>
-      Slf4jLoggerBundle.makeUnsafe[IO].flatMap { loggerBundle =>
-        InMemoryMerklePatriciaProducer.make[IO]().flatMap { mptProducer =>
-          MptStore
-            .make[IO, GlobalStateKey](
-              mptProducer,
-              GlobalStateKey.toHex[IO]
-            )
-            .flatMap { mptStore =>
-              for {
-                _ <- initialSnapshotInfo.traverse_(info => mptStore.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal.MinValue))
-                pcTree <- io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree.make[IO]
-                overlay = io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
-                  .passthrough[IO, GlobalStateKey](mptStore, pcTree)
-                mgr <- GlobalSnapshotAcceptanceManager
-                  .make[IO](
-                    FieldsAddedOrdinals(
-                      Map.empty,
-                      Map.empty,
-                      Map.empty,
-                      Map.empty,
-                      Map.empty,
-                      Map.empty,
-                      Map.empty,
-                      Map.empty,
-                      Map.empty,
-                      Map.empty
-                    ),
-                    MetagraphsSyncConfig(PosInt(100)),
-                    AppEnvironment.Dev,
-                    blockAcceptanceManager = mockBlockAcceptanceManager,
-                    allowSpendBlockAcceptanceManager = mockAllowSpendBlockAcceptanceManager,
-                    tokenLockBlockAcceptanceManager = mockTokenLockBlockAcceptanceManager,
-                    stateChannelEventsProcessor = mockStateChannelEventsProcessor,
-                    updateNodeParametersAcceptanceManager = mockUpdateNodeParametersAcceptanceManager,
-                    updateDelegatedStakeAcceptanceManager = updateDelegatedStakeAcceptanceManager,
-                    updateNodeCollateralAcceptanceManager = mockUpdateNodeCollateralAcceptanceManager,
-                    spendActionValidator = mockSpendActionValidator,
-                    pricingUpdateValidator = mockPricingUpdateValidator,
-                    priceStateUpdater = mockPriceStateUpdater,
-                    collateral = Amount.empty,
-                    withdrawalTimeLimit = EpochProgress(4L),
-                    loggerBundle = loggerBundle,
-                    overlay = overlay
-                  )
-              } yield mgr
-            }
+    Metrics.forAsync[IO](Seq.empty).use { implicit metrics =>
+      JsonSerializer.forAsync[IO].flatMap { implicit j =>
+        Slf4jLoggerBundle.makeUnsafe[IO].flatMap { loggerBundle =>
+          InMemoryMerklePatriciaProducer.make[IO]().flatMap { mptProducer =>
+            MptStore
+              .make[IO, GlobalStateKey](
+                mptProducer,
+                GlobalStateKey.toHex[IO]
+              )
+              .flatMap { mptStore =>
+                for {
+                  _ <- initialSnapshotInfo.traverse_(info => mptStore.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal.MinValue))
+                  pcTree <- io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree.make[IO]
+                  overlay = io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
+                    .passthrough[IO, GlobalStateKey](mptStore, pcTree)
+                  mgr <- GlobalSnapshotAcceptanceManager
+                    .make[IO](
+                      FieldsAddedOrdinals(
+                        Map.empty,
+                        Map.empty,
+                        Map.empty,
+                        Map.empty,
+                        Map.empty,
+                        Map.empty,
+                        Map.empty,
+                        Map.empty,
+                        Map.empty,
+                        Map.empty
+                      ),
+                      MetagraphsSyncConfig(PosInt(100)),
+                      AppEnvironment.Dev,
+                      blockAcceptanceManager = mockBlockAcceptanceManager,
+                      allowSpendBlockAcceptanceManager = mockAllowSpendBlockAcceptanceManager,
+                      tokenLockBlockAcceptanceManager = mockTokenLockBlockAcceptanceManager,
+                      stateChannelEventsProcessor = mockStateChannelEventsProcessor,
+                      updateNodeParametersAcceptanceManager = mockUpdateNodeParametersAcceptanceManager,
+                      updateDelegatedStakeAcceptanceManager = updateDelegatedStakeAcceptanceManager,
+                      updateNodeCollateralAcceptanceManager = mockUpdateNodeCollateralAcceptanceManager,
+                      spendActionValidator = mockSpendActionValidator,
+                      pricingUpdateValidator = mockPricingUpdateValidator,
+                      priceStateUpdater = mockPriceStateUpdater,
+                      collateral = Amount.empty,
+                      withdrawalTimeLimit = EpochProgress(4L),
+                      loggerBundle = loggerBundle,
+                      overlay = overlay
+                    )
+                } yield mgr
+              }
+          }
         }
       }
     }

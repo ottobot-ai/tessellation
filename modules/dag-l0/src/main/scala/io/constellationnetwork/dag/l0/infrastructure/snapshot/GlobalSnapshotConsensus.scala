@@ -494,8 +494,7 @@ object GlobalSnapshotConsensus {
             io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry
               .stakeWeightedMpt[F](
                 stakeAggregator,
-                (period: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
-                  historicalStakeReader.lookup(period)
+                (period: io.constellationnetwork.schema.nakamoto.EtaPeriod) => historicalStakeReader.lookup(period)
               )
               .toResource
           }

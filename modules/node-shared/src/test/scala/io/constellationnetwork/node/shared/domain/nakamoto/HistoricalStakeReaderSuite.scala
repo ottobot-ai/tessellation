@@ -22,20 +22,17 @@ import weaver.MutableIOSuite
 
 /** Spec assertions for the §G3 MPT-primary historical-stake-snapshots reader.
   *
-  * The reader is a thin point-read against `GlobalStateKey.historicalStakeSnapshotsKey[F](period)`.
-  * The boundary writer (`GSAM.accept()` via `AcceptanceMptStateChanges.applyStateChanges`) lands one
-  * MPT entry per stored period from the GSI's `historicalStakeSnapshots` map. The MPT projection in
-  * `GlobalStateConverter.toAllStateKeyValueBytes` produces byte-identical entries (verified by
+  * The reader is a thin point-read against `GlobalStateKey.historicalStakeSnapshotsKey[F](period)`. The boundary writer (`GSAM.accept()`
+  * via `AcceptanceMptStateChanges.applyStateChanges`) lands one MPT entry per stored period from the GSI's `historicalStakeSnapshots` map.
+  * The MPT projection in `GlobalStateConverter.toAllStateKeyValueBytes` produces byte-identical entries (verified by
   * `GsamWritePathParitySuite`); this suite asserts that the reader observes those entries.
   *
   * Covers the three properties the migration depends on:
   *
-  *   1. Lookup of a non-existent period → `None` (warmup / pre-boundary semantics).
-  *   2. Lookup of an existing period after a boundary write → `Some(distribution)` byte-equal to the
-  *      GSI snapshot that landed on the writer side.
-  *   3. Byte-determinism: two independent MPT builds with the same input agree on every lookup —
-  *      the core property §G3 buys over GSI iteration (closes the cross-node drift class on the
-  *      historical-distribution read path).
+  *   1. Lookup of a non-existent period → `None` (warmup / pre-boundary semantics). 2. Lookup of an existing period after a boundary write
+  *      → `Some(distribution)` byte-equal to the GSI snapshot that landed on the writer side. 3. Byte-determinism: two independent MPT
+  *      builds with the same input agree on every lookup — the core property §G3 buys over GSI iteration (closes the cross-node drift class
+  *      on the historical-distribution read path).
   */
 object HistoricalStakeReaderSuite extends MutableIOSuite {
 
@@ -59,18 +56,15 @@ object HistoricalStakeReaderSuite extends MutableIOSuite {
   private def dist(stakes: (PeerId, BigInt)*): StakeDistribution =
     StakeDistribution(SortedMap(stakes: _*))
 
-  /** Build an MPT store seeded with `historical` entries by writing each `(period, distribution)`
-    * directly via the same key derivation the GSAM boundary writer uses
-    * (`AcceptanceMptStateChanges.applyStateChanges` → `historicalStakeSnapshotsKey[F](period)` →
-    * `mpt.insert[StakeDistribution]`). The codec is the canonical `StakeDistributionCodec` shared by
-    * writer and reader.
+  /** Build an MPT store seeded with `historical` entries by writing each `(period, distribution)` directly via the same key derivation the
+    * GSAM boundary writer uses (`AcceptanceMptStateChanges.applyStateChanges` → `historicalStakeSnapshotsKey[F](period)` →
+    * `mpt.insert[StakeDistribution]`). The codec is the canonical `StakeDistributionCodec` shared by writer and reader.
     *
-    * Why direct writes, not `syncFromGlobalSnapshotInfo`. The bootstrap-projector at
-    * `GlobalStateConverter.toAllStateKeyValueBytes` includes the historical-stake-snapshots field, but
-    * the in-place writer `syncFromGlobalSnapshotInfo` does not — that path is intended to seed/reset
-    * the live-state partitions and the historical-snapshots partition is incrementally written by
-    * GSAM at every boundary ordinal. Writing here directly through `store.insert[StakeDistribution]`
-    * mirrors the boundary-time path exercised in production by `AcceptanceMptStateChanges`.
+    * Why direct writes, not `syncFromGlobalSnapshotInfo`. The bootstrap-projector at `GlobalStateConverter.toAllStateKeyValueBytes`
+    * includes the historical-stake-snapshots field, but the in-place writer `syncFromGlobalSnapshotInfo` does not — that path is intended
+    * to seed/reset the live-state partitions and the historical-snapshots partition is incrementally written by GSAM at every boundary
+    * ordinal. Writing here directly through `store.insert[StakeDistribution]` mirrors the boundary-time path exercised in production by
+    * `AcceptanceMptStateChanges`.
     */
   private def mkStore(
     historical: SortedMap[EtaPeriod, StakeDistribution]

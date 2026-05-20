@@ -37,6 +37,7 @@ import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator
 import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator.SpendActionValidationError
 import io.constellationnetwork.node.shared.domain.swap.block.{AllowSpendBlockAcceptanceManager, AllowSpendBlockAcceptanceResult}
 import io.constellationnetwork.node.shared.domain.tokenlock.block.{TokenLockBlockAcceptanceManager, TokenLockBlockAcceptanceResult}
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot._
 import io.constellationnetwork.node.shared.logger.LoggerBundle
 import io.constellationnetwork.schema.ID.Id
@@ -175,7 +176,7 @@ object GlobalSnapshotAcceptanceManager {
 
   private case object InvalidMerkleTree extends NoStackTrace
 
-  def make[F[_]: Async: Parallel: HasherSelector: SecurityProvider: JsonSerializer](
+  def make[F[_]: Async: Parallel: HasherSelector: SecurityProvider: JsonSerializer: Metrics](
     fieldsAddedOrdinals: FieldsAddedOrdinals,
     metagraphsSyncConfig: MetagraphsSyncConfig,
     environment: AppEnvironment,
