@@ -73,13 +73,20 @@ object GlobalSnapshot {
       )
     )
 
+  /** Build the ord=1 `GlobalIncrementalSnapshot` whose `stateProof` reflects the GSI that will actually be persisted at boot. The caller
+    * supplies `augmentedInfo` — the same value that downstream consumers (storages, MPT, consensus FSM) see at slot 0+. For the CSV path
+    * this is `hashedGenesis.info.toGlobalSnapshotInfo` (identity). For the Tier-1 JSON path this is the post-augmentation GSI overlaid with
+    * `activeDelegatedStakes` + `activeNodeCollaterals`. Passing the augmented GSI here keeps `snapshot.stateProof` consistent with the
+    * persisted GSI + MPT; see project memory `project_genesis_stateproof_consistency` for the bug this fixes.
+    */
   def mkFirstIncrementalSnapshot[F[_]: Parallel: Async: Hasher: JsonSerializer](
-    genesis: Hashed[GlobalSnapshot]
+    genesis: Hashed[GlobalSnapshot],
+    augmentedInfo: GlobalSnapshotInfo
   )(
     implicit stateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[GlobalIncrementalSnapshot] =
-    genesis.info.toGlobalSnapshotInfo.stateProof[F](genesis.ordinal).map { stateProof =>
+    augmentedInfo.stateProof[F](genesis.ordinal).map { stateProof =>
       GlobalIncrementalSnapshot(
         genesis.ordinal.next,
         genesis.height,
@@ -104,6 +111,18 @@ object GlobalSnapshot {
         Some(SortedMap.empty)
       )
     }
+
+  /** Backward-compatible overload — defaults `augmentedInfo` to the pre-augmentation GSI derived from `genesis.info.toGlobalSnapshotInfo`.
+    * Used by call sites where no augmenter is applied (e.g. the RollbackLoader path: rolling back to a previously-persisted full snapshot
+    * whose `info` is already the post-aug GSI by virtue of having been persisted that way).
+    */
+  def mkFirstIncrementalSnapshot[F[_]: Parallel: Async: Hasher: JsonSerializer](
+    genesis: Hashed[GlobalSnapshot]
+  )(
+    implicit stateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): F[GlobalIncrementalSnapshot] =
+    mkFirstIncrementalSnapshot[F](genesis, genesis.info.toGlobalSnapshotInfo)
 
   val nextFacilitators: NonEmptyList[PeerId] =
     NonEmptyList

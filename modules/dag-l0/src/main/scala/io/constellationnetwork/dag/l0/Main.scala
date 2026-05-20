@@ -474,53 +474,59 @@ object Main
                           GlobalSnapshotLocalFileSystemStorage.make[IO](cfg.snapshot.snapshotPath).flatMap {
                             fullGlobalSnapshotLocalFileSystemStorage =>
                               hasherSelector.withCurrent { implicit hasher =>
-                                fullGlobalSnapshotLocalFileSystemStorage.write(hashedGenesis.signed) >>
-                                  GlobalSnapshot.mkFirstIncrementalSnapshot[IO](hashedGenesis).flatMap { firstIncrementalSnapshot =>
-                                    Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](firstIncrementalSnapshot, keyPair).flatMap {
-                                      signedFirstIncrementalSnapshot =>
-                                        for {
-                                          hashedSnapshot <- signedFirstIncrementalSnapshot.toHashed[IO]
-                                          baseGsi = hashedGenesis.info.toGlobalSnapshotInfo
-                                          // Apply Tier-1 augmenter: CSV path is a no-op (identity);
-                                          // JSON path overlays delegated-stake + collateral entries.
-                                          // The augmented GSI is what downstream storage + consensus
-                                          // sees from slot 0 onward — no warm-up window.
-                                          globalSnapshotInfo <- augmenter(baseGsi)
-                                          _ <- initializeStorages[IO](
-                                            storages.globalSnapshot,
-                                            sharedStorages.lastNGlobalSnapshot,
-                                            sharedStorages.lastGlobalSnapshot,
-                                            programs.download,
-                                            hashedSnapshot,
-                                            globalSnapshotInfo
-                                          )
-                                          _ <- sharedStorages.mptStore
-                                            .syncFromGlobalSnapshotInfo(globalSnapshotInfo, hashedSnapshot.ordinal)(
-                                              globalStateProofSelector,
-                                              withdrawalTimeLimit
-                                            )
-                                          _ <- services.consensus.manager
-                                            .startFacilitatingAfterRollback(
-                                              signedFirstIncrementalSnapshot.ordinal,
-                                              GlobalConsensusOutcome(
-                                                signedFirstIncrementalSnapshot.ordinal,
-                                                Facilitators(List(nodeId)),
-                                                RemovedFacilitators.empty,
-                                                WithdrawnFacilitators.empty,
-                                                EligibleFacilitators.empty,
-                                                Finished(
-                                                  signedFirstIncrementalSnapshot,
-                                                  globalSnapshotInfo,
-                                                  EventTrigger,
-                                                  Candidates.empty,
-                                                  Hash.empty,
-                                                  hashedSnapshot.hash
-                                                )
+                                fullGlobalSnapshotLocalFileSystemStorage.write(hashedGenesis.signed) >> {
+                                  // Order matters: apply the Tier-1 augmenter BEFORE building the
+                                  // ord=1 incremental snapshot. The augmenter overlays
+                                  // `activeDelegatedStakes` + `activeNodeCollaterals` (JSON path);
+                                  // CSV path is identity. We pass the post-augmentation GSI to
+                                  // `mkFirstIncrementalSnapshot` so the stateProof in the snapshot
+                                  // matches the GSI + MPT we are about to persist. The CSV path
+                                  // is unaffected (augmenter == identity → same bytes as before).
+                                  val baseGsi = hashedGenesis.info.toGlobalSnapshotInfo
+                                  augmenter(baseGsi).flatMap { globalSnapshotInfo =>
+                                    GlobalSnapshot.mkFirstIncrementalSnapshot[IO](hashedGenesis, globalSnapshotInfo).flatMap {
+                                      firstIncrementalSnapshot =>
+                                        Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](firstIncrementalSnapshot, keyPair).flatMap {
+                                          signedFirstIncrementalSnapshot =>
+                                            for {
+                                              hashedSnapshot <- signedFirstIncrementalSnapshot.toHashed[IO]
+                                              _ <- initializeStorages[IO](
+                                                storages.globalSnapshot,
+                                                sharedStorages.lastNGlobalSnapshot,
+                                                sharedStorages.lastGlobalSnapshot,
+                                                programs.download,
+                                                hashedSnapshot,
+                                                globalSnapshotInfo
                                               )
-                                            )
-                                        } yield ()
+                                              _ <- sharedStorages.mptStore
+                                                .syncFromGlobalSnapshotInfo(globalSnapshotInfo, hashedSnapshot.ordinal)(
+                                                  globalStateProofSelector,
+                                                  withdrawalTimeLimit
+                                                )
+                                              _ <- services.consensus.manager
+                                                .startFacilitatingAfterRollback(
+                                                  signedFirstIncrementalSnapshot.ordinal,
+                                                  GlobalConsensusOutcome(
+                                                    signedFirstIncrementalSnapshot.ordinal,
+                                                    Facilitators(List(nodeId)),
+                                                    RemovedFacilitators.empty,
+                                                    WithdrawnFacilitators.empty,
+                                                    EligibleFacilitators.empty,
+                                                    Finished(
+                                                      signedFirstIncrementalSnapshot,
+                                                      globalSnapshotInfo,
+                                                      EventTrigger,
+                                                      Candidates.empty,
+                                                      Hash.empty,
+                                                      hashedSnapshot.hash
+                                                    )
+                                                  )
+                                                )
+                                            } yield ()
+                                        }
                                     }
                                   }
+                                }
                               }
                           }
                         }
