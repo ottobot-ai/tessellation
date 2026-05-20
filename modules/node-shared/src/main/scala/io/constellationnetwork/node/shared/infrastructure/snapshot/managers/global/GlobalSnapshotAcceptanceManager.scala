@@ -915,21 +915,45 @@ object GlobalSnapshotAcceptanceManager {
                 // `MetagraphNamespace(addr)` for pattern-match recovery. Read here (before
                 // `processStateChannelEvents`) so the StateChannelAcceptanceManager can be GSI-free.
                 // Phase J: route through `mpt` (branch-aware) — `mptStore` is base-only.
+                //
+                // #113 fallback: under MultiBranch, a transient chain-walk race (e.g. a sibling-branch eviction
+                // dropping an ancestor that held the index sidecar's latest write) can return an empty `addrSet`
+                // for one accept() call even when the keyset is fully populated in `lastSnapshotContext`. We union
+                // the GSI keyset in defensively so the materialized priors stay byte-equivalent across nodes.
+                // Under Passthrough this union is a no-op (MPT addrSet always equals GSI keyset). Under
+                // steady-state MultiBranch it's also a no-op for the same reason — the union only adds keys when
+                // MPT is transiently behind. Logged at warn when the union actually grows the keyset, so the
+                // diagnostic is visible without flooding logs in steady state.
                 priorLastStateChannelSnapshotHashes <- {
                   import io.constellationnetwork.schema.mpt.PartitionNamespace.MetagraphNamespace
                   for {
                     indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastStateChannelSnapshotHashes)
-                    addrSet <- mpt.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
+                    mptAddrSet <- mpt.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
+                    gsiAddrSet = lastSnapshotContext.lastStateChannelSnapshotHashes.keySet.to(SortedSet)
+                    addrSet = mptAddrSet ++ gsiAddrSet
+                    _ <-
+                      if (addrSet.size > mptAddrSet.size)
+                        loggerBundle.app.warn(
+                          s"#113 priorLastStateChannelSnapshotHashes: MPT addrSet=${mptAddrSet.size} GSI keyset=${gsiAddrSet.size} " +
+                            s"union=${addrSet.size} ord=$ordinal — using GSI fallback for ${addrSet.size - mptAddrSet.size} addr(s)"
+                        )
+                      else Async[F].unit
                     keys = addrSet.toList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastStateChannelSnapshotHashes))
                     values <- mpt.getMany[Hash](keys)
-                  } yield
-                    SortedMap.from(values.toList.flatMap {
+                    mptResult = SortedMap.from(values.toList.flatMap {
                       case (key, h) =>
                         key.networkNamespace match {
                           case MetagraphNamespace(addr) => List(addr -> h)
                           case _                        => Nil
                         }
                     })
+                    // For addresses where MPT had no value (e.g., the entry lives only in lastSnapshotContext
+                    // because the index race lost the write), fall back to the GSI's hash. Under steady-state
+                    // this branch never fires: every key in addrSet has an MPT value.
+                    result = lastSnapshotContext.lastStateChannelSnapshotHashes.foldLeft(mptResult) {
+                      case (acc, (addr, h)) => if (acc.contains(addr)) acc else acc.updated(addr, h)
+                    }
+                  } yield result
                 }
 
                 // Source prior `lastCurrencySnapshots` from the MPT instead of `lastSnapshotContext`. The
@@ -940,10 +964,27 @@ object GlobalSnapshotAcceptanceManager {
                 // StateChannelEventsProcessor can be GSI-free — `getFeeAddresses` and the `initialState` lookup
                 // both consume this materialized map.
                 // Phase J: route through `mpt` (branch-aware) — `mptStore` is base-only.
+                //
+                // #113 fallback: same defensive union pattern as priorLastStateChannelSnapshotHashes. When the
+                // MPT chain walk returns an empty `addrSet` due to a transient MultiBranch race, we union the
+                // GSI keyset and per-address fall back to the GSI value so the metagraph entry doesn't drop out
+                // of the prior map. Without this, `currencySnapshotsDeltas` for the subsequent ord would only
+                // see new SC events, and the `processStateChannelEvents` validation would treat the metagraph
+                // as having no prior history — slowing or breaking the state-channel pipeline that cl1 listens
+                // on for balance updates (root cause of L0-token reverse balance non-settlement).
                 priorLastCurrencySnapshots <- {
                   for {
                     indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastCurrencySnapshots)
-                    addrSet <- mpt.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
+                    mptAddrSet <- mpt.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
+                    gsiAddrSet = lastSnapshotContext.lastCurrencySnapshots.keySet.to(SortedSet)
+                    addrSet = mptAddrSet ++ gsiAddrSet
+                    _ <-
+                      if (addrSet.size > mptAddrSet.size)
+                        loggerBundle.app.warn(
+                          s"#113 priorLastCurrencySnapshots: MPT addrSet=${mptAddrSet.size} GSI keyset=${gsiAddrSet.size} " +
+                            s"union=${addrSet.size} ord=$ordinal — using GSI fallback for ${addrSet.size - mptAddrSet.size} addr(s)"
+                        )
+                      else Async[F].unit
                     addrList = addrSet.toList
                     leftKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots))
                     incKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots))
@@ -951,8 +992,7 @@ object GlobalSnapshotAcceptanceManager {
                     lefts <- mpt.getMany[Signed[CurrencySnapshot]](leftKeys)
                     incs <- mpt.getMany[Signed[CurrencyIncrementalSnapshot]](incKeys)
                     infos <- mpt.getMany[CurrencySnapshotInfo](infoKeys)
-                  } yield
-                    SortedMap.from(addrList.flatMap { addr =>
+                    mptResult = SortedMap.from(addrList.flatMap { addr =>
                       val leftKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots)
                       val incKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
                       val infoKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshotInfo)
@@ -965,6 +1005,12 @@ object GlobalSnapshotAcceptanceManager {
                           }
                       }
                     })
+                    // Per-address fallback: if MPT has no value but the GSI does, use the GSI's value.
+                    // Steady-state this loop is a no-op (every addrSet member has an MPT value).
+                    result = lastSnapshotContext.lastCurrencySnapshots.foldLeft(mptResult) {
+                      case (acc, (addr, v)) => if (acc.contains(addr)) acc else acc.updated(addr, v)
+                    }
+                  } yield result
                 }
 
                 StateChannelAcceptanceResult(
