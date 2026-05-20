@@ -5,14 +5,13 @@ import cats.data.NonEmptySetImpl.catsDataInstancesForNonEmptySet
 import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.immutable.{SortedMap, SortedSet}
+import scala.collection.immutable.SortedSet
 
 import io.constellationnetwork.node.shared.domain.block.processing._
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.swap.block._
 import io.constellationnetwork.node.shared.domain.tokenlock.block._
 import io.constellationnetwork.schema._
-import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
@@ -68,9 +67,13 @@ object BlockAcceptanceCoordinatorManager {
       ordinal: SnapshotOrdinal
     )(implicit hasher: Hasher[F]): F[BlockAcceptanceResult] = {
       val tipUsages = tipUsageManager.getTipsUsages(lastActiveTips, lastDeprecatedTips)
-      val context = BlockAcceptanceContext.fromStaticData(
-        lastSnapshotContext.balances,
-        lastSnapshotContext.lastTxRefs,
+      // §G4: balances + lastTxRefs sourced from the branch-aware MPT reader instead of the
+      // GSI map snapshot. The reader is scoped to the consensus parent branch (chain bestTip
+      // under MultiBranch) — same view `lastSnapshotContext` was derived from in §G1.
+      // `tipUsages` remains in-memory (TipUsageManager, not MPT). `lastSnapshotContext`
+      // stays on the trait surface for §G5/G6 (downstream managers still consume it).
+      val context = BlockAcceptanceContext.fromMpt[F](
+        reader,
         tipUsages,
         collateral,
         TransactionReference.empty
@@ -86,9 +89,9 @@ object BlockAcceptanceCoordinatorManager {
       fixingAllowSpendAndTokenLockValidation: SnapshotOrdinal,
       epochProgress: EpochProgress
     )(implicit hasher: Hasher[F]): F[AllowSpendBlockAcceptanceResult] = {
-      val context = AllowSpendBlockAcceptanceContext.fromStaticData(
-        lastSnapshotContext.balances,
-        lastSnapshotContext.lastAllowSpendRefs.getOrElse(Map.empty),
+      // §G4: balances + lastAllowSpendRefs sourced from the branch-aware MPT reader.
+      val context = AllowSpendBlockAcceptanceContext.fromMpt[F](
+        reader,
         collateral,
         AllowSpendReference.empty
       )
@@ -139,9 +142,10 @@ object BlockAcceptanceCoordinatorManager {
               }
           }
 
-        context = TokenLockBlockAcceptanceContext.fromStaticData(
-          lastSnapshotContext.balances,
-          lastSnapshotContext.lastTokenLockRefs.getOrElse(Map.empty),
+        // §G4: balances + lastTokenLockRefs sourced from the branch-aware MPT reader.
+        // `toBeReplacedHashedTokenLocks` already resolves via the same `reader` above.
+        context = TokenLockBlockAcceptanceContext.fromMpt[F](
+          reader,
           collateral,
           TokenLockReference.empty,
           toBeReplacedHashedTokenLocks
