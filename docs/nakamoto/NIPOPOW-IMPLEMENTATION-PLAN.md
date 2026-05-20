@@ -27,8 +27,8 @@ Estimate from the proposal §6.6: **~2,400 LOC, 6–10 engineer-weeks** in-node 
 | S0.2 | Extend `StakeRegistry` with `relativeStakeAt(peerId, etaPeriod)` | ~100 | edit existing |
 | S0.3 | `GlobalSnapshotInfo` — add `historicalStakeSnapshots: Map[EtaPeriod, StakeDistribution]` (capped at N-2 retention) | ~80 | schema + MPT keying |
 | S0.4 | Wire `EligibilityChecker` to read `relativeStakeAt(_, currentEtaPeriod - 2)` instead of latest | ~50 | edit |
-| S0.5 | Backfill at genesis: stamp the genesis stake distribution as N-2/N-1/N for the first 3 periods | ~60 | edit `L0GenesisLoader` |
-| S0.6 | Unit tests + property test (stake change at ord X is invisible to eligibility until ord X + 2 × eta-period) | ~200 | new |
+| ~~S0.5~~ | ~~Backfill at genesis: stamp the genesis stake distribution as N-2/N-1/N for the first 3 periods~~ — **DROPPED 2026-05-20** as redundant. `StakeRegistry.relativeStakeAt` already falls through to the current GSI when `historicalDistributionFor(period) = None`; during warmup (periods 0-2) the current GSI IS the genesis distribution (no stake events have fired yet), so both code paths return identical `Ratio`s. The "uniform always-branch-1" benefit doesn't justify the genesis-load stateProof/MPT triangle bug that S0.5 exposed (memory `project_nipopow_s0_s3_landing`). | — | — |
+| ~~S0.6~~ | ~~Unit tests + property test (stake change at ord X is invisible to eligibility until ord X + 2 × eta-period)~~ — **DROPPED 2026-05-20** alongside S0.5. The property holds anyway because of fall-through + GSAM boundary writes; re-introduce only if S0.5 is ever re-attempted. | — | — |
 
 **E2e milestone**: 8-node cluster with `NAKAMOTO_ETA_ROTATION_SNAPSHOTS=100`, mid-run delegate-stake change to op-7. Verify op-7's slot wins do NOT shift until after 2 full eta periods (~24 min wall clock at default cadence). This closes #177 cleanly because the demo's stake-change-impact assertion gets a deterministic deadline.
 
@@ -135,7 +135,9 @@ Split into two phases against the "8gl0+4mg+4shards baseline that can't be broke
 ## Risk register
 
 1. **Density-tuning empirical gap** — proposal §6.4 flags this as the hardest non-cryptographic part. We should validate density behavior on the iter-stake-1-1 cluster BEFORE building proof routes (catch parameter mismatch early).
-2. **N-2 staggering correctness** — if Slice S0 is wrong, all downstream NIPoPoW levels are silently broken because the verifier uses the wrong stake-at-period. Property test from S0.6 is load-bearing.
+2. **N-2 staggering correctness** — if Slice S0 is wrong, all downstream NIPoPoW levels are silently broken because the verifier uses the wrong stake-at-period. With S0.5/S0.6 dropped (see slice table), correctness is enforced by S0.4 boundary writes + StakeRegistry warmup fall-through — both deterministic. Re-introduce a property test if `StakeRegistry.relativeStakeAt` is ever refactored.
+
+4. **GSI/MPT/stateProof triangle at genesis** (uncovered 2026-05-20): `mkFirstIncrementalSnapshot` computes ord=1 stateProof from PRE-augmentation GSI; `augmenter` then overlays delegated-stake + collateral records; `syncFromGlobalSnapshotInfo` writes augmented bytes to MPT. The stored ord=1 snapshot.stateProof is inconsistent with the persisted GSI + MPT. Compounding factor: ECDSA signatures on `DelegatedStakeRecord` are generated at JSON load time and are NOT deterministic, so `SortedSet[DelegatedStakeRecord]` ordering varies per node — `activeDelegatedStakes` MPT bytes diverge across the cluster. This is the genuine bug behind the slot=3 `delegStakes,mptRoot` reject. Fix is on the genesis-path side (augment-before-mkFirstIncrementalSnapshot), not the NIPoPoW slice plan.
 3. **KES forward-security assumption** — Slice 9 made KES load-bearing unconditionally (no enforce flag; receivers drop any message that fails KES verify). NIPoPoW v1 can rely on KES authenticity end-to-end.
 
 ---
