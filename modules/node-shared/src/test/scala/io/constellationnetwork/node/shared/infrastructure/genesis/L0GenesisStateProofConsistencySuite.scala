@@ -23,6 +23,7 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops._
 
 import eu.timepit.refined.types.numeric.NonNegLong
+import io.estatico.newtype.ops._
 import weaver.MutableIOSuite
 
 /** Verifies the two genesis-path invariants that together resolve the stateProof / GSI / MPT consistency bug observed via
@@ -138,7 +139,7 @@ object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
   }
 
   test("Issue B: signedDeterministic produces byte-identical Signed[Event] across loads") { res =>
-    implicit val (_, _, h, sp) = res
+    implicit val (_, js, h, sp) = res
 
     for {
       data <- buildFixture[IO]
@@ -156,7 +157,7 @@ object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
   }
 
   test("Issue B: cross-node consistency — two GSIs built via augmentSnapshotInfo are byte-equal") { res =>
-    implicit val (_, _, h, sp) = res
+    implicit val (_, js, h, sp) = res
 
     // Simulates two nodes loading the same fixture: each calls augmentSnapshotInfo independently.
     // With the old (non-deterministic) path the Signed[Event] bytes differ → activeDelegatedStakes
