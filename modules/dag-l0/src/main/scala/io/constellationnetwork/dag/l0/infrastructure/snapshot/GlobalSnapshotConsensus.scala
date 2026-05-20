@@ -451,24 +451,44 @@ object GlobalSnapshotConsensus {
               s"🔧 Nakamoto config: LDD(cutoff=${lddConfig.lddCutoff}, offset=${lddConfig.offset}, baseline=${lddConfig.baselineDifficulty}, amplitude=${lddConfig.amplitude}), etaRotation=${etaRotationSnapshots} snapshots, slotsPerEpoch=${slotsPerEpoch}, genesisTime=${pureGenesisTimeMs}"
             )
             .toResource
-          // §1.1: switch from equal-weight to stake-weighted VRF election. `snapshotInfoR` re-reads
-          // the latest GSI on every call so per-validator stake reflects the most recent
-          // activeDelegatedStakes + activeNodeCollaterals. Boot path (no GSI yet) falls back to 1/N
-          // inside the constructor; updateValidators / markActive / markInactive semantics are
-          // unchanged from equalWeight.
+          // §1.1: switch from equal-weight to stake-weighted VRF election.
+          // §G1 (GSI → MPT migration): the per-node stake aggregate now reads from the global-state
+          // MPT via prefix-scan instead of iterating `GlobalSnapshotInfo.activeDelegatedStakes` /
+          // `activeNodeCollaterals` in-memory maps. The MPT is the canonical store under the
+          // GSI-to-MPT migration; reading from it directly drops a redundant in-memory mirror and
+          // closes a class of byte-determinism gaps between independent node MPT builds.
+          //
+          // Hot-path caching: `NodeStakeAggregator.cached` memoizes the result keyed on
+          // `SnapshotOrdinal` and invalidates whenever the parent ordinal advances. Without this
+          // the per-slot VRF eligibility (~200 calls/sec at 8gl0+4mg+4shards) would re-run two MPT
+          // prefix-scans per call. See `NodeStakeAggregator.cached` for the trade-off discussion.
+          //
+          // Reader: `pendingReader` is the `GlobalStateReader.pending` resolved to chain bestTip
+          // under MultiBranch — matches "view of stake at the parent the consensus is voting on".
+          // Falls back to base when bestTipFn returns None (pre-bootstrap window).
+          //
           // §3 NIPoPoW S0.3: historical stake distributions live in
           // `GlobalSnapshotInfo.historicalStakeSnapshots`, written by GSAM.accept() at every eta-period
           // boundary ordinal. The callback below is a thin reader that scopes the lookup to the current
           // GSI's recorded map — no in-memory mirror needed because the GSI is already kept current by
           // `lastGlobalSnapshotStorage`. Warmup (pre-genesis / no record yet) returns None and the
-          // registry's fall-through path uses the current GSI's distribution.
-          stakeRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry
-            .stakeWeighted[F](
-              lastGlobalSnapshotStorage.getCombined.map(_.map(_._2)),
-              (period: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
-                lastGlobalSnapshotStorage.getCombined.map(_.flatMap(_._2.historicalStakeSnapshots.get(period)))
+          // registry's fall-through path uses the live MPT aggregate.
+          stakeAggregator <- io.constellationnetwork.node.shared.domain.nakamoto.NodeStakeAggregator
+            .cached[F](
+              io.constellationnetwork.node.shared.domain.nakamoto.NodeStakeAggregator.make[F](pendingReader),
+              lastGlobalSnapshotStorage.getOrdinal
             )
             .toResource
+          stakeRegistry <- {
+            implicit val stakeHasher: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+            io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry
+              .stakeWeightedMpt[F](
+                stakeAggregator,
+                (period: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
+                  lastGlobalSnapshotStorage.getCombined.map(_.flatMap(_._2.historicalStakeSnapshots.get(period)))
+              )
+              .toResource
+          }
           // Filter out entries marked with alias="metagraph-op". They live in the seedlist
           // so state-channel binary signature validation accepts them as known signers,
           // but they must not count as Nakamoto validators (would dilute 1/N VRF stake).

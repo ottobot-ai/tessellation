@@ -1,0 +1,299 @@
+package io.constellationnetwork.node.shared.domain.nakamoto
+
+import cats.data.NonEmptySet
+import cats.effect.{IO, Ref, Resource}
+import cats.syntax.all._
+
+import scala.collection.immutable.{SortedMap, SortedSet}
+
+import io.constellationnetwork.ext.cats.effect.ResourceIO
+import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.schema.ID.Id
+import io.constellationnetwork.schema._
+import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.balance.Amount
+import io.constellationnetwork.schema.delegatedStake._
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, WithdrawalTimeLimit}
+import io.constellationnetwork.schema.nodeCollateral._
+import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.security._
+import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
+import io.constellationnetwork.security.signature.{Signed, signature}
+
+import eu.timepit.refined.types.numeric.NonNegLong
+import weaver.MutableIOSuite
+
+/** Spec assertions for the §G1 MPT-primary stake aggregator.
+  *
+  * Covers the four properties the StakeRegistry.stakeWeightedMpt path depends on:
+  *
+  *   1. Empty MPT → empty Map (boot fallback).
+  *   2. Multiple records pointing at the same nodeId on different source addresses sum into a single
+  *      aggregate per node.
+  *   3. Mixed delegated-stake + node-collateral for the same nodeId sum together (two-tier stake).
+  *   4. Byte-equivalent across independent MPT builds with the same input (core determinism — the
+  *      §G1 motivation: closing #218-style cross-node drift on stake reads).
+  *
+  * The per-snapshot-ordinal cached variant ([[NodeStakeAggregator.cached]]) is exercised in
+  * separate tests below: hit on same ordinal, miss on ordinal advance, None ordinal defeats cache.
+  */
+object NodeStakeAggregatorSuite extends MutableIOSuite {
+
+  implicit val globalStateProofSelector: GlobalStateProofSelector =
+    GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+  implicit val withdrawalTimeLimitCtx: WithdrawalTimeLimit = WithdrawalTimeLimit.none
+
+  type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO])
+
+  override def sharedResource: Resource[IO, Res] =
+    for {
+      sp <- SecurityProvider.forAsync[IO]
+      implicit0(j: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO].asResource
+      implicit0(h: Hasher[IO]) = Hasher.forJson[IO]
+    } yield (h, sp, j)
+
+  // ---- helpers --------------------------------------------------------------
+
+  private val testSignature = signature.Signature(Hex(""))
+  private val testSignatureProof = signature.SignatureProof(Id(Hex("")), testSignature)
+  private val testProofs = NonEmptySet.one(testSignatureProof)
+
+  private def pid(label: String): PeerId =
+    PeerId(Hex(label.getBytes("UTF-8").map(b => f"$b%02x").mkString))
+
+  private def addr(tag: String): Address =
+    Address.fromBytes(tag.getBytes("UTF-8"))
+
+  // `SortedSet[DelegatedStakeRecord]` orders by `(createdAt, rewards, event)`. Two records with the
+  // same createdAt+rewards collapse under the SortedSet builder if their derived `Ordering[Signed]`
+  // can't tell them apart. We make each record's `createdAt` distinct (the `ord` arg) so the test
+  // exercises a real multi-record set without dedup; mirrors production where every distinct stake
+  // event lands at a distinct snapshot ordinal.
+  private def mkDelegated(nodeId: PeerId, amt: Long, source: Address, ord: Long): DelegatedStakeRecord = {
+    val create = UpdateDelegatedStake.Create(
+      source = source,
+      nodeId = nodeId,
+      amount = DelegatedStakeAmount(NonNegLong.unsafeFrom(amt)),
+      fee = DelegatedStakeFee(NonNegLong(0L)),
+      tokenLockRef = Hash.empty,
+      parent = DelegatedStakeReference.empty
+    )
+    DelegatedStakeRecord(
+      event = Signed(create, testProofs),
+      createdAt = SnapshotOrdinal(NonNegLong.unsafeFrom(ord)),
+      rewards = Amount(NonNegLong(0L))
+    )
+  }
+
+  private def mkCollateral(nodeId: PeerId, amt: Long, source: Address, ord: Long): NodeCollateralRecord = {
+    val create = UpdateNodeCollateral.Create(
+      source = source,
+      nodeId = nodeId,
+      amount = NodeCollateralAmount(NonNegLong.unsafeFrom(amt)),
+      fee = NodeCollateralFee(NonNegLong(0L)),
+      tokenLockRef = Hash.empty,
+      parent = NodeCollateralReference.empty
+    )
+    NodeCollateralRecord(event = Signed(create, testProofs), createdAt = SnapshotOrdinal(NonNegLong.unsafeFrom(ord)))
+  }
+
+  private def mkStore(
+    delegated: SortedMap[Address, SortedSet[DelegatedStakeRecord]],
+    collateral: SortedMap[Address, SortedSet[NodeCollateralRecord]]
+  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[MptStore[IO, GlobalStateKey]] =
+    for {
+      producer <- InMemoryMerklePatriciaProducer.make[IO]()
+      store <- MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
+      info = GlobalSnapshotInfo.empty.copy(
+        activeDelegatedStakes = if (delegated.isEmpty) None else Some(delegated),
+        activeNodeCollaterals = if (collateral.isEmpty) None else Some(collateral)
+      )
+      _ <- store.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(1L)))
+    } yield store
+
+  // ---- core spec assertions ------------------------------------------------
+
+  test("empty MPT → empty Map") { res =>
+    implicit val (h, _, js) = res
+    for {
+      store <- mkStore(SortedMap.empty, SortedMap.empty)
+      reader = GlobalStateReader.fromMptStore[IO](store)
+      aggregator = NodeStakeAggregator.make[IO](reader)
+      out <- aggregator.aggregateFromMpt
+    } yield expect(out.isEmpty)
+  }
+
+  test("two records for same nodeId on different source addresses → sum") { res =>
+    implicit val (h, _, js) = res
+    val n = pid("node-A")
+    val src1 = addr("source-1")
+    val src2 = addr("source-2")
+    val delegated = SortedMap[Address, SortedSet[DelegatedStakeRecord]](
+      src1 -> SortedSet(mkDelegated(n, 300L, src1, ord = 1L)),
+      src2 -> SortedSet(mkDelegated(n, 700L, src2, ord = 1L))
+    )
+    for {
+      store <- mkStore(delegated, SortedMap.empty)
+      reader = GlobalStateReader.fromMptStore[IO](store)
+      aggregator = NodeStakeAggregator.make[IO](reader)
+      out <- aggregator.aggregateFromMpt
+    } yield
+      expect.same(Map(n -> BigInt(1000)), out)
+  }
+
+  test("mixed delegated + collateral for same nodeId → sum (two-tier)") { res =>
+    implicit val (h, _, js) = res
+    val n = pid("node-A")
+    val src = addr("source-1")
+    val delegated = SortedMap[Address, SortedSet[DelegatedStakeRecord]](
+      src -> SortedSet(mkDelegated(n, 400L, src, ord = 1L))
+    )
+    val collateral = SortedMap[Address, SortedSet[NodeCollateralRecord]](
+      src -> SortedSet(mkCollateral(n, 600L, src, ord = 1L))
+    )
+    for {
+      store <- mkStore(delegated, collateral)
+      reader = GlobalStateReader.fromMptStore[IO](store)
+      aggregator = NodeStakeAggregator.make[IO](reader)
+      out <- aggregator.aggregateFromMpt
+    } yield
+      expect.same(Map(n -> BigInt(1000)), out)
+  }
+
+  test("byte-determinism — two independent MPT builds with same input agree") { res =>
+    implicit val (h, _, js) = res
+    val nA = pid("node-A")
+    val nB = pid("node-B")
+    val nC = pid("node-C")
+    val s1 = addr("source-1")
+    val s2 = addr("source-2")
+    val s3 = addr("source-3")
+
+    // Two independently built MPT stores with the same logical input must produce identical
+    // aggregates. This is the core property §G1 buys over GSI iteration — under the GSI-primary
+    // path, cross-node map iteration order could produce divergent intermediate state; under MPT
+    // prefix-scan the order is determined by hex(serialize(addr)) and byte-identical across nodes.
+    //
+    // Each record at a distinct `createdAt` ordinal so the SortedSet builder doesn't collapse
+    // them under `Ordering[DelegatedStakeRecord] = Ordering.by((createdAt, rewards, event))`.
+    val delegated = SortedMap[Address, SortedSet[DelegatedStakeRecord]](
+      s1 -> SortedSet(mkDelegated(nA, 100L, s1, ord = 1L), mkDelegated(nB, 200L, s1, ord = 2L)),
+      s2 -> SortedSet(mkDelegated(nA, 50L, s2, ord = 3L), mkDelegated(nC, 300L, s2, ord = 4L))
+    )
+    val collateral = SortedMap[Address, SortedSet[NodeCollateralRecord]](
+      s3 -> SortedSet(mkCollateral(nB, 150L, s3, ord = 5L))
+    )
+
+    for {
+      store1 <- mkStore(delegated, collateral)
+      store2 <- mkStore(delegated, collateral)
+      agg1 <- NodeStakeAggregator.make[IO](GlobalStateReader.fromMptStore(store1)).aggregateFromMpt
+      agg2 <- NodeStakeAggregator.make[IO](GlobalStateReader.fromMptStore(store2)).aggregateFromMpt
+    } yield
+      // Expected: A = 100 + 50 = 150, B = 200 + 150 = 350, C = 300.
+      expect.same(agg1, agg2) &&
+        expect.same(Map(nA -> BigInt(150), nB -> BigInt(350), nC -> BigInt(300)), agg1)
+  }
+
+  test("off-seedlist nodeIds appear in the aggregate; seedlist filtering is the caller's job") { res =>
+    implicit val (h, _, js) = res
+    // The aggregator is a pure MPT read; it doesn't know about the seedlist. Confirms that
+    // `StakeRegistry.stakeWeightedMpt` is the layer that drops off-seedlist nodes from numerator
+    // AND denominator (matching the legacy `stakeWeighted` behaviour).
+    val seed = pid("in-seedlist")
+    val ghost = pid("ghost")
+    val src = addr("s")
+    val delegated = SortedMap[Address, SortedSet[DelegatedStakeRecord]](
+      src -> SortedSet(mkDelegated(seed, 100L, src, ord = 1L), mkDelegated(ghost, 900L, src, ord = 2L))
+    )
+    for {
+      store <- mkStore(delegated, SortedMap.empty)
+      out <- NodeStakeAggregator.make[IO](GlobalStateReader.fromMptStore(store)).aggregateFromMpt
+    } yield expect.same(Map(seed -> BigInt(100), ghost -> BigInt(900)), out)
+  }
+
+  // ---- cached wrapper -------------------------------------------------------
+
+  test("cached: same ordinal serves from cache (underlying called once)") { res =>
+    implicit val (h, _, js) = res
+    val n = pid("node-A")
+    val src = addr("s")
+    val delegated = SortedMap[Address, SortedSet[DelegatedStakeRecord]](
+      src -> SortedSet(mkDelegated(n, 500L, src, ord = 1L))
+    )
+    for {
+      store <- mkStore(delegated, SortedMap.empty)
+      reader = GlobalStateReader.fromMptStore[IO](store)
+      callsR <- Ref.of[IO, Int](0)
+      // Counting wrapper around the real aggregator — every aggregateFromMpt call bumps `callsR`.
+      countingAggregator = new NodeStakeAggregator[IO] {
+        private val underlying = NodeStakeAggregator.make[IO](reader)
+        def aggregateFromMpt(implicit hasher: Hasher[IO]): IO[Map[PeerId, BigInt]] =
+          callsR.update(_ + 1) >> underlying.aggregateFromMpt(hasher)
+      }
+      ord = SnapshotOrdinal(NonNegLong(7L))
+      cached <- NodeStakeAggregator.cached[IO](countingAggregator, IO.pure(Some(ord)))
+      _ <- cached.aggregateFromMpt
+      _ <- cached.aggregateFromMpt
+      _ <- cached.aggregateFromMpt
+      calls <- callsR.get
+    } yield expect.same(1, calls)
+  }
+
+  test("cached: ordinal advance invalidates cache (underlying re-fetched)") { res =>
+    implicit val (h, _, js) = res
+    val n = pid("node-A")
+    val src = addr("s")
+    val delegated = SortedMap[Address, SortedSet[DelegatedStakeRecord]](
+      src -> SortedSet(mkDelegated(n, 500L, src, ord = 1L))
+    )
+    for {
+      store <- mkStore(delegated, SortedMap.empty)
+      reader = GlobalStateReader.fromMptStore[IO](store)
+      callsR <- Ref.of[IO, Int](0)
+      countingAggregator = new NodeStakeAggregator[IO] {
+        private val underlying = NodeStakeAggregator.make[IO](reader)
+        def aggregateFromMpt(implicit hasher: Hasher[IO]): IO[Map[PeerId, BigInt]] =
+          callsR.update(_ + 1) >> underlying.aggregateFromMpt(hasher)
+      }
+      currentOrdR <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal(NonNegLong(1L)))
+      cached <- NodeStakeAggregator.cached[IO](countingAggregator, currentOrdR.get.map(_.some))
+      _ <- cached.aggregateFromMpt
+      _ <- cached.aggregateFromMpt
+      _ <- currentOrdR.set(SnapshotOrdinal(NonNegLong(2L))) // advance
+      _ <- cached.aggregateFromMpt
+      _ <- cached.aggregateFromMpt
+      _ <- currentOrdR.set(SnapshotOrdinal(NonNegLong(3L))) // advance again
+      _ <- cached.aggregateFromMpt
+      calls <- callsR.get
+    } yield expect.same(3, calls)
+  }
+
+  test("cached: None ordinal defeats cache (every call re-reads)") { res =>
+    implicit val (h, _, js) = res
+    val n = pid("node-A")
+    val src = addr("s")
+    val delegated = SortedMap[Address, SortedSet[DelegatedStakeRecord]](
+      src -> SortedSet(mkDelegated(n, 500L, src, ord = 1L))
+    )
+    for {
+      store <- mkStore(delegated, SortedMap.empty)
+      reader = GlobalStateReader.fromMptStore[IO](store)
+      callsR <- Ref.of[IO, Int](0)
+      countingAggregator = new NodeStakeAggregator[IO] {
+        private val underlying = NodeStakeAggregator.make[IO](reader)
+        def aggregateFromMpt(implicit hasher: Hasher[IO]): IO[Map[PeerId, BigInt]] =
+          callsR.update(_ + 1) >> underlying.aggregateFromMpt(hasher)
+      }
+      cached <- NodeStakeAggregator.cached[IO](countingAggregator, IO.pure(Option.empty[SnapshotOrdinal]))
+      _ <- cached.aggregateFromMpt
+      _ <- cached.aggregateFromMpt
+      _ <- cached.aggregateFromMpt
+      calls <- callsR.get
+    } yield expect.same(3, calls)
+  }
+}

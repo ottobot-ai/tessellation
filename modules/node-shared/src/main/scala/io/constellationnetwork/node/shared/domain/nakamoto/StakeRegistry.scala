@@ -360,4 +360,148 @@ object StakeRegistry {
           }
       }
     }
+
+  /** §G1 — MPT-primary stake-weighted registry.
+    *
+    * Identical surface to [[stakeWeighted]] but the per-node aggregate is sourced from the MPT prefix-scan via [[NodeStakeAggregator]]
+    * instead of iterating `GlobalSnapshotInfo`'s in-memory `activeDelegatedStakes` / `activeNodeCollaterals` maps. Production wiring should
+    * pass a [[NodeStakeAggregator.cached]] aggregator so the hot path (per-slot VRF eligibility) doesn't re-prefix-scan every call — see
+    * the caching trade-off discussion on [[NodeStakeAggregator.cached]].
+    *
+    * '''Boot fallback.''' When `aggregator.aggregateFromMpt` returns an empty map (the MPT has no stake entries — pre-genesis warmup or a
+    * tip whose ancestor's MPT hasn't been hydrated yet), relative stake falls back to `Ratio(1, validators.size)`. This matches
+    * [[stakeWeighted]]'s `snapshotInfoR = None` boot path so the leader-loop wiring elects pre-genesis just like before the migration.
+    *
+    * '''§3 NIPoPoW N-2 lookback.''' `relativeStakeAt` is unchanged from [[stakeWeighted]] — the historical-distribution path doesn't read
+    * from the live MPT; it consults `historicalDistributionFor(period)` (which today still reads from
+    * `GlobalSnapshotInfo.historicalStakeSnapshots`). The warmup fall-through reads the current MPT-derived aggregate via the same fallback
+    * chain — empty aggregate → 1/N.
+    */
+  def stakeWeightedMpt[F[_]: Async](
+    aggregator: NodeStakeAggregator[F],
+    historicalDistributionFor: EtaPeriod => F[Option[StakeDistribution]]
+  )(implicit hasher: io.constellationnetwork.security.Hasher[F]): F[StakeRegistry[F]] =
+    (Ref.of[F, Set[PeerId]](Set.empty), Ref.of[F, Set[PeerId]](Set.empty)).mapN { (validatorsRef, activeRef) =>
+      new StakeRegistry[F] {
+
+        // Combined-stake aggregate over an explicit peer set. Mirrors `totalStakeOver` in the
+        // [[stakeWeighted]] impl but reads from the pre-computed Map[PeerId, BigInt] aggregate
+        // instead of iterating GSI partitions; off-set node-ids are dropped from both numerator AND
+        // denominator (the aggregate is keyed by nodeId but we restrict to peers ∈ seedlist).
+        private def totalStakeOver(agg: Map[PeerId, BigInt], peers: Set[PeerId]): BigInt =
+          peers.foldLeft(BigInt(0))((acc, p) => acc + agg.getOrElse(p, BigInt(0)))
+
+        def relativeStake(peerId: PeerId): F[Ratio] =
+          (aggregator.aggregateFromMpt, validatorsRef.get).flatMapN { (agg, validators) =>
+            Async[F].pure {
+              if (!validators.contains(peerId) || validators.isEmpty) Ratio.Zero
+              else if (agg.isEmpty) {
+                // Boot fallback — MPT has no stake records yet. Mirror the [[stakeWeighted]]
+                // snapshotInfoR=None path so pre-genesis leader-loop elects via 1/N.
+                Ratio(1, validators.size)
+              } else {
+                val total = totalStakeOver(agg, validators)
+                if (total == BigInt(0)) Ratio.Zero
+                else Ratio(agg.getOrElse(peerId, BigInt(0)), total)
+              }
+            }
+          }
+
+        def allStakes: F[Map[PeerId, Ratio]] =
+          (aggregator.aggregateFromMpt, validatorsRef.get).flatMapN { (agg, validators) =>
+            Async[F].pure {
+              if (validators.isEmpty) Map.empty[PeerId, Ratio]
+              else if (agg.isEmpty) {
+                val stake = Ratio(1, validators.size)
+                validators.map(_ -> stake).toMap
+              } else {
+                val total = totalStakeOver(agg, validators)
+                if (total == BigInt(0)) Map.empty[PeerId, Ratio]
+                else validators.iterator.map(p => p -> Ratio(agg.getOrElse(p, BigInt(0)), total)).toMap
+              }
+            }
+          }
+
+        def validatorCount: F[Int] =
+          validatorsRef.get.map(_.size)
+
+        def observedActiveCount: F[Int] =
+          activeRef.get.map(_.size)
+
+        def activeValidators: F[Set[PeerId]] =
+          validatorsRef.get
+
+        def observedActive: F[Set[PeerId]] =
+          activeRef.get
+
+        def updateValidators(validators: Set[PeerId]): F[Unit] =
+          validatorsRef.set(validators)
+
+        def markActive(peerId: PeerId): F[Unit] =
+          validatorsRef.get.flatMap { validators =>
+            activeRef.update(_ + peerId).whenA(validators.contains(peerId))
+          }
+
+        def markInactive(peerId: PeerId): F[Unit] =
+          activeRef.update(_ - peerId)
+
+        def optimisticRelativeStake(peerId: PeerId): F[Ratio] =
+          (aggregator.aggregateFromMpt, validatorsRef.get, activeRef.get).flatMapN { (agg, validators, active) =>
+            Async[F].pure {
+              if (agg.isEmpty) {
+                // Pre-genesis fallback — equal-weight identical to [[stakeWeighted]] None path.
+                if (validators.contains(peerId) && validators.nonEmpty) Ratio(1, validators.size)
+                else Ratio.Zero
+              } else {
+                val effectiveActive = active.intersect(validators)
+                val totalSeedlist = totalStakeOver(agg, validators)
+                val totalActive = totalStakeOver(agg, effectiveActive)
+                val activeStakeFraction =
+                  if (totalSeedlist == BigInt(0)) Ratio.Zero
+                  else Ratio(totalActive, totalSeedlist)
+                val meetsQuorum = validators.nonEmpty && activeStakeFraction >= MinActiveQuorumFraction
+
+                if (meetsQuorum && effectiveActive.contains(peerId) && totalActive != BigInt(0))
+                  Ratio(agg.getOrElse(peerId, BigInt(0)), totalActive)
+                else if (validators.contains(peerId) && validators.nonEmpty) {
+                  if (totalSeedlist == BigInt(0)) Ratio.Zero
+                  else Ratio(agg.getOrElse(peerId, BigInt(0)), totalSeedlist)
+                } else Ratio.Zero
+              }
+            }
+          }
+
+        def committeeStake(peerId: PeerId): F[Ratio] =
+          validatorsRef.get.map { validators =>
+            if (validators.contains(peerId) && validators.nonEmpty) Ratio(1, validators.size)
+            else Ratio.Zero
+          }
+
+        // §3 NIPoPoW N-2: identical fallback chain to [[stakeWeighted]] but the warmup
+        // fall-through reads the live MPT aggregate (via `aggregator`) instead of the GSI maps.
+        def relativeStakeAt(peerId: PeerId, etaPeriod: EtaPeriod): F[Ratio] =
+          (historicalDistributionFor(etaPeriod), validatorsRef.get).flatMapN {
+            case (Some(distribution), validators) =>
+              Async[F].pure {
+                if (!validators.contains(peerId) || validators.isEmpty) Ratio.Zero
+                else distribution.relativeStakeAgainst(peerId, validators)
+              }
+            case (None, validators) =>
+              // Warmup fall-through: use the live MPT aggregate as the stake distribution. Correct
+              // during the first 2 eta periods after genesis because the genesis distribution is
+              // unchanged.
+              aggregator.aggregateFromMpt.map { agg =>
+                if (!validators.contains(peerId) || validators.isEmpty) Ratio.Zero
+                else if (agg.isEmpty) {
+                  // Very-early boot: no MPT records yet → 1/N fallback.
+                  Ratio(1, validators.size)
+                } else {
+                  val total = totalStakeOver(agg, validators)
+                  if (total == BigInt(0)) Ratio.Zero
+                  else Ratio(agg.getOrElse(peerId, BigInt(0)), total)
+                }
+              }
+          }
+      }
+    }
 }
