@@ -5,6 +5,7 @@ import cats.syntax.all._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.infrastructure.metrics.{CountingMetrics, Metrics}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.algebras.Exp
 import io.constellationnetwork.numerics.interpreters.ExpInterpreter
@@ -27,7 +28,7 @@ import weaver.MutableIOSuite
   */
 object TowerFinalizerSuite extends MutableIOSuite {
 
-  override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO], LevelTrialComputer[IO])
+  override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO], LevelTrialComputer[IO], Metrics[IO])
 
   override def sharedResource: Resource[IO, Res] =
     for {
@@ -36,7 +37,8 @@ object TowerFinalizerSuite extends MutableIOSuite {
       implicit0(h: Hasher[IO]) = Hasher.forJson[IO]
       exp <- ExpInterpreter.make[IO](maxIterations = 10000, precision = 38).asResource: Resource[IO, Exp[IO]]
       computer = LevelTrialComputer.make[IO](exp)
-    } yield (h, sp, j, computer)
+      metrics <- Resource.eval(CountingMetrics.make.map(_._2))
+    } yield (h, sp, j, computer, metrics)
 
   private def ord(n: Long): SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(n))
 
@@ -48,15 +50,18 @@ object TowerFinalizerSuite extends MutableIOSuite {
     Hash(label.getBytes("UTF-8").map(b => f"${b & 0xff}%02x").mkString.padTo(64, '0').take(64))
 
   private def freshTower(res: Res): IO[TowerStore[IO]] = {
-    implicit val (hh: Hasher[IO], sp: SecurityProvider[IO], js: JsonSerializer[IO], _comp: LevelTrialComputer[IO]) = res
-    val _ = (sp, _comp) // unused at construction; required by Res tuple
+    val (hh: Hasher[IO], sp: SecurityProvider[IO], js: JsonSerializer[IO], _comp: LevelTrialComputer[IO], _met: Metrics[IO]) = res
+    implicit val h: Hasher[IO] = hh
+    implicit val j: JsonSerializer[IO] = js
+    val _ = (sp, _comp, _met) // unused at construction; required by Res tuple
     MptTowerStore.inMemory[IO]
   }
 
   private val Gamma: Long = 15L
 
   test("finalizeFromParts — deltaSlot=0 yields no passes (gating multiplier = 0)") { res =>
-    val (_, _, _, computer) = res
+    val (_, _, _, computer, _) = res
+    implicit val metrics: Metrics[IO] = res._5
     for {
       tower <- freshTower(res)
       finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
@@ -67,7 +72,8 @@ object TowerFinalizerSuite extends MutableIOSuite {
   }
 
   test("finalizeFromParts — gMu < ψ_super yields no L1 pass (burst-zero condition)") { res =>
-    val (_, _, _, computer) = res
+    val (_, _, _, computer, _) = res
+    implicit val metrics: Metrics[IO] = res._5
     for {
       tower <- freshTower(res)
       finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
@@ -83,7 +89,8 @@ object TowerFinalizerSuite extends MutableIOSuite {
     // can confirm via the returned trial vector that the trial was computed at g_1=3 (effectiveThreshold
     // is non-zero only when g_µ > ψ_super=1 AND deltaSlot > 0, so we check the no-pass under
     // deltaSlot=0 is consistent with the post-prime state, NOT a fresh-tower state).
-    val (_, _, _, computer) = res
+    val (_, _, _, computer, _) = res
+    implicit val metrics: Metrics[IO] = res._5
     for {
       tower <- freshTower(res)
       finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
@@ -102,7 +109,8 @@ object TowerFinalizerSuite extends MutableIOSuite {
   }
 
   test("finalizeFromParts — when gMu ≥ ψ_super and deltaSlot > 0, threshold is non-zero (pass-or-fail is ρ-dependent)") { res =>
-    val (_, _, _, computer) = res
+    val (_, _, _, computer, _) = res
+    implicit val metrics: Metrics[IO] = res._5
     for {
       tower <- freshTower(res)
       finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
@@ -124,7 +132,8 @@ object TowerFinalizerSuite extends MutableIOSuite {
     // Production invariant: the finalizer is called once per archival-finalized ordinal; re-finalize
     // at the same ord is a non-scenario (watermark advances strictly forward). But the underlying
     // computation is byte-deterministic given the same inputs.
-    val (_, _, _, computer) = res
+    val (_, _, _, computer, _) = res
+    implicit val metrics: Metrics[IO] = res._5
     for {
       tower1 <- freshTower(res)
       finalizer1 <- TowerFinalizer.make[IO](tower1, computer, Gamma)
@@ -136,7 +145,8 @@ object TowerFinalizerSuite extends MutableIOSuite {
   }
 
   test("finalizeFromParts — monotonic ordinal stream grows tower counts monotonically (per-level appends never decrease)") { res =>
-    val (_, _, _, computer) = res
+    val (_, _, _, computer, _) = res
+    implicit val metrics: Metrics[IO] = res._5
     // Drive the finalizer with a synthetic snapshot stream of 6 finalizations at consecutive ordinals.
     // Per-level cumulative count can only grow or stay equal across calls.
     for {
@@ -160,7 +170,8 @@ object TowerFinalizerSuite extends MutableIOSuite {
     // production invariant is "strictly-forward only". The high-water-mark Ref enforces this even
     // if the wire-level caller (SnapshotLeaderLoop.finalityMonitor) makes a mistake — the tower's
     // contents stay deterministic.
-    val (_, _, _, computer) = res
+    val (_, _, _, computer, _) = res
+    implicit val metrics: Metrics[IO] = res._5
     for {
       tower <- freshTower(res)
       finalizer <- TowerFinalizer.make[IO](tower, computer, Gamma)
@@ -179,7 +190,7 @@ object TowerFinalizerSuite extends MutableIOSuite {
   }
 
   test("noop finalizer — finalizeFromParts returns empty vector, no store side effects") { res =>
-    val (_, _, _, _) = res
+    val (_, _, _, _, _) = res
     val finalizer = TowerFinalizer.noop[IO]
     for {
       v <- finalizer.finalizeFromParts(ord(5), synthHash("n"), synthVrf(0x00.toByte), deltaSlot = Gamma)

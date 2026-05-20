@@ -8,15 +8,9 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.genesis.types._
 import io.constellationnetwork.node.shared.nodeSharedKryoRegistrar
-import io.constellationnetwork.schema.GlobalSnapshot
-import io.constellationnetwork.schema.delegatedStake.{
-  DelegatedStakeAmount,
-  DelegatedStakeFee,
-  DelegatedStakeReference,
-  UpdateDelegatedStake
-}
+import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.{GlobalStateProofSelector, SnapshotOrdinal}
+import io.constellationnetwork.schema.{GlobalSnapshot, GlobalStateProofSelector, SnapshotOrdinal}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex

@@ -9,6 +9,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.infrastructure.metrics.{CountingMetrics, Metrics}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -48,6 +49,13 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
   implicit val withdrawalTimeLimitCtx: WithdrawalTimeLimit = WithdrawalTimeLimit.none
 
   type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO])
+
+  // Test-scope Metrics — no-op for non-counter calls, so the latency-distribution recording in
+  // `NodeStakeAggregator.make` becomes a no-op. The test assertions check aggregate output, not
+  // the metric side-effect. Made `implicit` here so all `NodeStakeAggregator.make[IO](...)`
+  // invocations below pick it up without each test having to rewire it.
+  implicit val testMetrics: Metrics[IO] =
+    CountingMetrics.instance(Ref.unsafe[IO, Map[String, Int]](Map.empty))
 
   override def sharedResource: Resource[IO, Res] =
     for {

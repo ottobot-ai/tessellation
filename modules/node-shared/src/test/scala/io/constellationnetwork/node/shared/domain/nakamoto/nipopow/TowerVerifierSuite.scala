@@ -54,8 +54,8 @@ object TowerVerifierSuite extends MutableIOSuite {
     VrfOutput(Hex.fromBytes(bytes))
   }
 
-  /** Find a VRF output bytes whose `tauForLevel(level)` lies BELOW a target tau. Used to forge passing-level-µ headers in
-    * happy-path tests. Brute-force search; per-level convergence depends on the level's target density (L1 ≈ 50%, L9 ≈ 0.2%).
+  /** Find a VRF output bytes whose `tauForLevel(level)` lies BELOW a target tau. Used to forge passing-level-µ headers in happy-path tests.
+    * Brute-force search; per-level convergence depends on the level's target density (L1 ≈ 50%, L9 ≈ 0.2%).
     */
   private def findPassingVrf(level: Int, maxTau: Ratio, maxAttempts: Int = 10000): VrfOutput = {
     var seed = 0
@@ -151,7 +151,7 @@ object TowerVerifierSuite extends MutableIOSuite {
     verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
       r match {
         case Left(ProofError.SubchainStateShape(o, sz)) => expect(o == ord(1L)).and(expect(sz == 3))
-        case other                                       => failure(s"expected SubchainStateShape, got $other")
+        case other                                      => failure(s"expected SubchainStateShape, got $other")
       }
     }
   }
@@ -176,7 +176,7 @@ object TowerVerifierSuite extends MutableIOSuite {
     verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
       r match {
         case Left(_: ProofError.TrialFailed) => failure(s"expected non-TrialFailed error, got TrialFailed")
-        case _                                 => success
+        case _                               => success
       }
     }
   }
@@ -223,7 +223,7 @@ object TowerVerifierSuite extends MutableIOSuite {
     verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
       r match {
         case Left(ProofError.DensityViolation(level, _, _, _)) => expect(level == 1)
-        case Left(_: ProofError.TrialFailed)                    =>
+        case Left(_: ProofError.TrialFailed)                   =>
           // Some headers might still fail the trial check (which runs before density). Acceptable —
           // the test demonstrates rejection of an over-dense proof; the rejection cause is correct.
           success
@@ -267,7 +267,7 @@ object TowerVerifierSuite extends MutableIOSuite {
     verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
       r match {
         case Left(_: ProofError.L0VrfFailed) => success
-        case other                            => failure(s"expected L0VrfFailed, got $other")
+        case other                           => failure(s"expected L0VrfFailed, got $other")
       }
     }
   }
@@ -310,17 +310,19 @@ object TowerVerifierSuite extends MutableIOSuite {
       since = ord(0L),
       tipOrdinal = ord(30L),
       level0Suffix = Vector(header(30L, 300L, 299L, anyVrf)),
-      levelChains = Map(7 -> Vector(
-        header(5L, 50L, 49L, anyVrf), // gMu=5, almost certainly fails L7
-        header(15L, 150L, 149L, anyVrf),
-        header(25L, 250L, 249L, anyVrf)
-      ))
+      levelChains = Map(
+        7 -> Vector(
+          header(5L, 50L, 49L, anyVrf), // gMu=5, almost certainly fails L7
+          header(15L, 150L, 149L, anyVrf),
+          header(25L, 250L, 249L, anyVrf)
+        )
+      )
     )
     verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
       r match {
         case Left(_: ProofError.TrialFailed) => success
-        case Left(_)                          => success // any other rejection is also acceptable here
-        case Right(())                        => failure("expected rejection of garbage L7 chain")
+        case Left(_)                         => success // any other rejection is also acceptable here
+        case Right(())                       => failure("expected rejection of garbage L7 chain")
       }
     }
   }

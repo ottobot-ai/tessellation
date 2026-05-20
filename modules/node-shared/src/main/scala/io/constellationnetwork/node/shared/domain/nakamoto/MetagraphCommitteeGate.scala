@@ -8,6 +8,7 @@ import cats.syntax.all._
 
 import scala.concurrent.duration._
 
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.peer.PeerId
@@ -16,6 +17,7 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signing
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
 
+import eu.timepit.refined.auto._
 import org.typelevel.log4cats.Logger
 
 /** Slice S3 — the load-bearing pre-inclusion gate for metagraph state-channel binaries.
@@ -268,7 +270,7 @@ object MetagraphCommitteeGate {
     * `selfPeerId`, `selfVrfSk`, `keyPair` are this operator's identity keys: VRF SK for the committee draw, long-term Ed25519 key
     * (`keyPair.getPrivate`) for the outer signature.
     */
-  def make[F[_]: Async: SecurityProvider: Hasher: Logger](
+  def make[F[_]: Async: SecurityProvider: Hasher: Logger: Metrics](
     selfPeerId: PeerId,
     selfVrfSk: Array[Byte],
     selfVrfVk: Array[Byte],
@@ -297,11 +299,34 @@ object MetagraphCommitteeGate {
         for {
           // Sender path — fire-and-forget the committee attestation if we're in this committee.
           // Wrapped in handleError so a sign/publish failure never blocks the gate poll loop.
-          _ <- senderPath(metagraphAddress, parentHash, binaryHash, eta, sigmaOperatorKey).void.handleErrorWith { err =>
-            logger.warn(s"⚠️ committee-attestation sender path failed for $metagraphAddress: ${err.getMessage}")
+          senderOutcome <- senderPath(metagraphAddress, parentHash, binaryHash, eta, sigmaOperatorKey).handleErrorWith { err =>
+            logger
+              .warn(s"⚠️ committee-attestation sender path failed for $metagraphAddress: ${err.getMessage}")
+              .as(SenderOutcome.NotInCommittee: SenderOutcome)
           }
+          _ <- emitSortitionSelfOutcome(senderOutcome)
           admitted <- waitForThreshold(metagraphAddress, parentHash, binaryHash)
+          _ <- Metrics[F].incrementCounter(
+            "dag_nakamoto_committee_admit_total",
+            Seq(Metrics.unsafeLabelName("outcome") -> (if (admitted) "accepted" else "timeout"))
+          )
         } yield admitted
+
+      /** Bumps `dag_nakamoto_committee_sortition_self_outcome_total{outcome}` — one of `in_committee` / `not_in_committee` /
+        * `unknown_parent`. Useful to confirm the per-operator sortition rate matches `K_target / N` over a long run (uniformity sanity
+        * check).
+        */
+      private def emitSortitionSelfOutcome(outcome: SenderOutcome): F[Unit] = {
+        val label = outcome match {
+          case SenderOutcome.Attested(_, _)       => "in_committee"
+          case SenderOutcome.NotInCommittee       => "not_in_committee"
+          case SenderOutcome.UnknownParentOrdinal => "unknown_parent"
+        }
+        Metrics[F].incrementCounter(
+          "dag_nakamoto_committee_sortition_self_outcome_total",
+          Seq(Metrics.unsafeLabelName("outcome") -> label)
+        )
+      }
 
       private def senderPath(
         metagraphAddress: Address,

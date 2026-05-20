@@ -45,20 +45,17 @@ object ProofError {
   *
   * '''Checks performed''' (in order; first failure wins):
   *   1. Structural invariants — non-empty L0 suffix (if proof is non-empty), monotone ordinals per-level + suffix, subchainLevelCounts size
-  *      matches `SuperLevelParams.SuperLevelCount`.
-  *   2. Per-level trial validity — for each header `h` at level µ, recompute the `(τ_µ, θ_µ^eff)` pair from `(h.vrfOutput, g_µ_from_chain,
-  *      h.deltaSlot)` and assert `τ < θ_eff` (the trial passes). `g_µ` is reconstructed from prior chain headers at the same level (chain is
-  *      self-consistent); first header anchors at `since`.
-  *   3. Density check — observed level-µ density `(chain length) / (level-0 reference length)` must fall within `targetDensity *
-  *      (1 ± DensityRelativeErrorBound)`. Uses the L0 suffix length as the reference (this is a coarse approximation for short proofs;
-  *      acceptable for v1 per the empirical 5% bound at 10M slots in `paper/main.tex`).
-  *   4. L0 suffix VRF — for each suffix header, re-verify `EligibilityChecker.verifyEligibility` with the certificate's VRF triple +
-  *      `LddConfig.Default` + an *approximate* relativeStake = 1/activePoolSize. The producer-side eligibility used the actual stake; we use
-  *      uniform stake as a v1 approximation (`activePoolSize` is the only stake-related field on the certificate). This is a sanity check,
-  *      not a security gate.
-  *   5. Eta-rotation reconstruction — verify that within the L0 suffix, consecutive headers in the same rotation period carry the same eta
-  *      (eta is a per-period invariant). Cross-period eta transitions cannot be verified from suffix alone; we trust the producer's
-  *      claimed eta in that case.
+  *      matches `SuperLevelParams.SuperLevelCount`. 2. Per-level trial validity — for each header `h` at level µ, recompute the `(τ_µ,
+  *      θ_µ^eff)` pair from `(h.vrfOutput, g_µ_from_chain, h.deltaSlot)` and assert `τ < θ_eff` (the trial passes). `g_µ` is reconstructed
+  *      from prior chain headers at the same level (chain is self-consistent); first header anchors at `since`. 3. Density check — observed
+  *      level-µ density `(chain length) / (level-0 reference length)` must fall within `targetDensity * (1 ± DensityRelativeErrorBound)`.
+  *      Uses the L0 suffix length as the reference (this is a coarse approximation for short proofs; acceptable for v1 per the empirical 5%
+  *      bound at 10M slots in `paper/main.tex`). 4. L0 suffix VRF — for each suffix header, re-verify
+  *      `EligibilityChecker.verifyEligibility` with the certificate's VRF triple + `LddConfig.Default` + an *approximate* relativeStake =
+  *      1/activePoolSize. The producer-side eligibility used the actual stake; we use uniform stake as a v1 approximation (`activePoolSize`
+  *      is the only stake-related field on the certificate). This is a sanity check, not a security gate. 5. Eta-rotation reconstruction —
+  *      verify that within the L0 suffix, consecutive headers in the same rotation period carry the same eta (eta is a per-period
+  *      invariant). Cross-period eta transitions cannot be verified from suffix alone; we trust the producer's claimed eta in that case.
   *
   * '''What this does NOT check''' (deferred to S5 + tower-anchored proofs):
   *   - State proof inclusion (no MPT path verification in v1 — that's S5).
@@ -122,7 +119,7 @@ object TowerVerifier {
         }
         levelMonotonic match {
           case Some((µ, _)) => Left(ProofError.NonMonotonicOrdinals(µ))
-          case None =>
+          case None         =>
             // Subchain state shape
             val badShape = proof.allHeadersByOrdinal.find(_.subchainLevelCounts.size != SuperLevelParams.SuperLevelCount)
             badShape match {

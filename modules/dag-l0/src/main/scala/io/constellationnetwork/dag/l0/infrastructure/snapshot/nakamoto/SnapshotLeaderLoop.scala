@@ -116,20 +116,41 @@ object SnapshotLeaderLoop {
     *
     * T_depth2 is intentionally not emitted as a fired counter here — that's the Phase 2→3 archival trigger and gets its own
     * `dag_nakamoto_archival_finalized` counter from the lastArchivalOrdinalRef branch below.
+    *
+    * '''Per-ordinal companion counters.''' If `finalizedOrdinal` is supplied, ALSO emits `*_per_ordinal_total` counters tagged with
+    * `snapshot_ordinal`. The original (unlabelled) counters stay so existing alerts continue to fire. Per-ordinal cardinality is bounded —
+    * each ordinal contributes at most one fire per kind, and Prometheus retention (default 15d) bounds the series lifetime.
     */
-  private def emitChainQuality[F[_]: cats.Monad: Metrics](qualifyingSet: Set[FinalityTrigger.Kind]): F[Unit] = {
+  private def emitChainQuality[F[_]: cats.Monad: Metrics](
+    qualifyingSet: Set[FinalityTrigger.Kind],
+    finalizedOrdinal: Option[Long] = None
+  ): F[Unit] = {
     val gauge = Metrics[F].updateGauge("dag_nakamoto_chain_quality", qualifyingSet.size)
+    val ordTagOpt: Seq[(Metrics.LabelName, String)] =
+      finalizedOrdinal.fold(Seq.empty[(Metrics.LabelName, String)])(o => Seq(Metrics.unsafeLabelName("snapshot_ordinal") -> o.toString))
     val tWeight =
       if (qualifyingSet.contains(FinalityTrigger.Kind.TWeight))
-        Metrics[F].incrementCounter("dag_nakamoto_finality_triggers_fired_t_weight_total")
+        Metrics[F].incrementCounter("dag_nakamoto_finality_triggers_fired_t_weight_total") >> {
+          if (ordTagOpt.nonEmpty)
+            Metrics[F].incrementCounter("dag_nakamoto_finality_triggers_fired_t_weight_per_ordinal_total", ordTagOpt)
+          else cats.Applicative[F].unit
+        }
       else cats.Applicative[F].unit
     val tCount =
       if (qualifyingSet.contains(FinalityTrigger.Kind.TCount))
-        Metrics[F].incrementCounter("dag_nakamoto_finality_triggers_fired_t_count_total")
+        Metrics[F].incrementCounter("dag_nakamoto_finality_triggers_fired_t_count_total") >> {
+          if (ordTagOpt.nonEmpty)
+            Metrics[F].incrementCounter("dag_nakamoto_finality_triggers_fired_t_count_per_ordinal_total", ordTagOpt)
+          else cats.Applicative[F].unit
+        }
       else cats.Applicative[F].unit
     val tDepth1 =
       if (qualifyingSet.contains(FinalityTrigger.Kind.TDepth1))
-        Metrics[F].incrementCounter("dag_nakamoto_finality_triggers_fired_t_depth1_total")
+        Metrics[F].incrementCounter("dag_nakamoto_finality_triggers_fired_t_depth1_total") >> {
+          if (ordTagOpt.nonEmpty)
+            Metrics[F].incrementCounter("dag_nakamoto_finality_triggers_fired_t_depth1_per_ordinal_total", ordTagOpt)
+          else cats.Applicative[F].unit
+        }
       else cats.Applicative[F].unit
     gauge >> tWeight >> tCount >> tDepth1
   }
@@ -815,7 +836,7 @@ object SnapshotLeaderLoop {
                                           // break down "what fired" over time.
                                           FinalityTrigger
                                             .triggersFor(phase12Triggers, SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
-                                            .flatMap(emitChainQuality[F]) >>
+                                            .flatMap(qs => emitChainQuality[F](qs, finalizedOrdinal = Some(finalizeAtOrdinal))) >>
                                           Async[F].pure(true)
                                       case None =>
                                         logger.warn(
@@ -904,7 +925,7 @@ object SnapshotLeaderLoop {
                                           // gauge update + per-kind counter increments.
                                           FinalityTrigger
                                             .triggersFor(phase12Triggers, SnapshotOrdinal.unsafeApply(finalOrdinal))
-                                            .flatMap(emitChainQuality[F])
+                                            .flatMap(qs => emitChainQuality[F](qs, finalizedOrdinal = Some(finalOrdinal)))
                                       case None =>
                                         logger.warn(
                                           s"⚠️ ATTEST-FINALIZE: chainStore.get returned None for hash=${canonicalHash.value.take(12)} at ordinal=$finalOrdinal"

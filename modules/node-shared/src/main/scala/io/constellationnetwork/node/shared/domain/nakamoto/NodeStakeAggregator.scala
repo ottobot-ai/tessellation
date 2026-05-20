@@ -4,8 +4,10 @@ import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
 import scala.collection.immutable.SortedSet
+import scala.concurrent.duration.{FiniteDuration, MILLISECONDS}
 
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
@@ -14,6 +16,8 @@ import io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{delegatedStakeRecordSetCodec, nodeCollateralRecordSetCodec}
+
+import eu.timepit.refined.auto._
 
 /** G1 — MPT-backed per-node stake aggregator.
   *
@@ -67,15 +71,24 @@ object NodeStakeAggregator {
   /** Uncached pass-through implementation. Every call re-runs two MPT prefix scans + an in-memory fold. Suitable for low-frequency callers
     * (boot, diagnostics, tests). Production hot-path uses [[cached]] which wraps this and serves repeated calls within the same snapshot
     * ordinal from memory.
+    *
+    * '''Latency observability.''' Each call records its wall-clock to the `dag_nakamoto_stake_aggregator_mpt_scan_ms` distribution — gives
+    * the operator a single Grafana series for "how expensive is the MPT prefix-scan in this run." Compared to a counter, the distribution
+    * exposes p50/p99 which is what matters when the per-slot hot path fires this thousands of times. Recorded on every call (including the
+    * cache-miss path inside `cached`, by virtue of the wrapper calling `underlying.aggregateFromMpt`).
     */
-  def make[F[_]: Async](reader: GlobalStateReader[F]): NodeStakeAggregator[F] = new NodeStakeAggregator[F] {
+  def make[F[_]: Async: Metrics](reader: GlobalStateReader[F]): NodeStakeAggregator[F] = new NodeStakeAggregator[F] {
 
     def aggregateFromMpt(implicit hasher: Hasher[F]): F[Map[PeerId, BigInt]] =
       for {
+        startNanos <- Async[F].monotonic.map(_.toNanos)
         delegatedPrefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveDelegatedStakes)
         delegatedEntries <- reader.getAllForPrefix[SortedSet[DelegatedStakeRecord]](delegatedPrefix)
         collateralPrefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveNodeCollaterals)
         collateralEntries <- reader.getAllForPrefix[SortedSet[NodeCollateralRecord]](collateralPrefix)
+        endNanos <- Async[F].monotonic.map(_.toNanos)
+        elapsedMs = (endNanos - startNanos) / 1000000L
+        _ <- Metrics[F].recordDistribution("dag_nakamoto_stake_aggregator_mpt_scan_ms", elapsedMs)
       } yield {
         // Each prefix entry is a SortedSet of records keyed by source address. Multiple sets across
         // addresses can point at the same nodeId — combine all amounts into a single Map[PeerId, BigInt].

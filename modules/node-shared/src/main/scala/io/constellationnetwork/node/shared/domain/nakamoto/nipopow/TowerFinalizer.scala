@@ -3,10 +3,12 @@ package io.constellationnetwork.node.shared.domain.nakamoto.nipopow
 import cats.effect.{Async, Ref}
 import cats.syntax.all._
 
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal}
 import io.constellationnetwork.security.Hashed
 import io.constellationnetwork.security.hash.Hash
 
+import eu.timepit.refined.auto._
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** §3 NIPoPoW S3 — Phase-3 sink that grows the local [[TowerStore]] from finalized snapshots.
@@ -61,7 +63,7 @@ object TowerFinalizer {
     * @param lddCutoff
     *   `γ` for the L0 slot-gap gating multiplier `min(1, δ_S/γ)`. Sourced from `LddConfig.lddCutoff` at construction (typically 15).
     */
-  def make[F[_]: Async](
+  def make[F[_]: Async: Metrics](
     tower: TowerStore[F],
     computer: LevelTrialComputer[F],
     lddCutoff: Long
@@ -70,6 +72,26 @@ object TowerFinalizer {
       new TowerFinalizer[F] {
 
         private val logger = Slf4jLogger.getLoggerFromName[F]("TowerFinalizer")
+
+        /** Per-super-level trial outcome counters — drive the dashboard's NIPoPoW level-µ panel. Two counters per level: `trial_total`
+          * (denominator) + `trial_pass_total` (numerator) → trivial Prometheus rate-ratio for the per-level pass-rate. Cardinality:
+          * `SuperLevelCount × cluster-size` = 6 × 8 = 48 series for the cluster — negligible.
+          *
+          * The `snapshot_ordinal` label is intentionally OMITTED here. NIPoPoW pass-rates are a *statistical* property of the chain —
+          * pinning a series per ordinal would explode cardinality (8000+ ordinals/run) for no benefit beyond what an aggregate
+          * rate-over-window already gives.
+          */
+        private def emitTrialMetrics(trials: Vector[LevelTrial]): F[Unit] =
+          trials.traverse_ { t =>
+            val levelTag = Seq(Metrics.unsafeLabelName("level") -> t.level.toString)
+            Metrics[F].incrementCounter("dag_nakamoto_nipopow_level_trial_total", levelTag) >>
+              (if (t.passed)
+                 Metrics[F].incrementCounter("dag_nakamoto_nipopow_level_trial_pass_total", levelTag)
+               else Async[F].unit)
+          } >> {
+            val passedCount = trials.count(_.passed)
+            Metrics[F].updateGauge("dag_nakamoto_nipopow_levels_passed", passedCount.toLong)
+          }
 
         def finalize(snapshot: Hashed[GlobalIncrementalSnapshot]): F[Unit] =
           snapshot.signed.value.slotCertificate match {
@@ -113,6 +135,7 @@ object TowerFinalizer {
                 anyPassed = trials.exists(_.passed)
                 _ <- tower.appendAtFinality(ordinal, snapshotHash, trials).whenA(anyPassed)
                 _ <- highWaterMarkRef.set(ordinal)
+                _ <- emitTrialMetrics(trials)
                 _ <- logger
                   .debug(
                     s"[TowerFinalizer] Appended ord=${ordinal.value.value} levels=${trials.collect { case t if t.passed => t.level }

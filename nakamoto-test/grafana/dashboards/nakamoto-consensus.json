@@ -447,8 +447,237 @@
         { "expr": "sum(dag_nakamoto_backfill_completed_total)", "legendFormat": "Completions" }
       ],
       "fieldConfig": { "defaults": { "unit": "none", "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}] } } }
+    },
+
+    {
+      "id": 200,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 92 },
+      "options": { "mode": "markdown", "content": "# Finality Triggers & Chain Quality (#138)" }
+    },
+    {
+      "id": 201,
+      "title": "Trigger fires / 5m (per kind)",
+      "description": "Per-kind finality-trigger fire counts. T_count = attestation-2/3, T_weight = stake-weight ≥ 2/3, T_depth1 = depth-k. Three lines tracking together = healthy convergence; one kind lagging = the dashboard's leading-indicator that the cluster is leaning on a single liveness path.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 94 },
+      "targets": [
+        { "expr": "sum(rate(dag_nakamoto_finality_triggers_fired_t_count_total[5m])) * 300", "legendFormat": "T_count fires/5m" },
+        { "expr": "sum(rate(dag_nakamoto_finality_triggers_fired_t_weight_total[5m])) * 300", "legendFormat": "T_weight fires/5m" },
+        { "expr": "sum(rate(dag_nakamoto_finality_triggers_fired_t_depth1_total[5m])) * 300", "legendFormat": "T_depth1 fires/5m" },
+        { "expr": "sum(rate(dag_nakamoto_archival_finalized[5m])) * 300", "legendFormat": "archival fires/5m (T_depth2)" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } } }
+    },
+    {
+      "id": 202,
+      "title": "Chain Quality (per node)",
+      "description": "Per-node `dag_nakamoto_chain_quality` gauge = number of finality triggers (T_count, T_weight, T_depth1) that fired together at the most recent finalize. 3 = rock-solid unanimous evidence. 1 = sketchy single-trigger evidence (small-cluster partition leans on depth-only).",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 94 },
+      "targets": [
+        { "expr": "dag_nakamoto_chain_quality", "legendFormat": "{{node}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 3, "decimals": 0, "custom": { "drawStyle": "line", "fillOpacity": 20, "lineWidth": 2 }, "thresholds": { "mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "yellow", "value": 2}, {"color": "green", "value": 3}] } } }
+    },
+    {
+      "id": 203,
+      "title": "Per-ordinal trigger fires (#138 per-ordinal companion)",
+      "description": "Each ordinal contributes at most one fire per kind. Use the legend to compare which kinds fired at each finalized ordinal (across the cluster). When this view stops scrolling forward, finality is stuck.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 101 },
+      "targets": [
+        { "expr": "sum by (snapshot_ordinal) (increase(dag_nakamoto_finality_triggers_fired_t_count_per_ordinal_total[$__range]))", "legendFormat": "T_count ord={{snapshot_ordinal}}" },
+        { "expr": "sum by (snapshot_ordinal) (increase(dag_nakamoto_finality_triggers_fired_t_weight_per_ordinal_total[$__range]))", "legendFormat": "T_weight ord={{snapshot_ordinal}}" },
+        { "expr": "sum by (snapshot_ordinal) (increase(dag_nakamoto_finality_triggers_fired_t_depth1_per_ordinal_total[$__range]))", "legendFormat": "T_depth1 ord={{snapshot_ordinal}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "points", "fillOpacity": 60 } } }
+    },
+
+    {
+      "id": 210,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 108 },
+      "options": { "mode": "markdown", "content": "# KES (Slice 9) — rotation & verification" }
+    },
+    {
+      "id": 211,
+      "title": "KES Period (per node)",
+      "description": "Each node's current KES tree-internal period. Should rotate in lockstep at the eta-aligned cadence; persistent skew = clock drift or registration lag.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 110 },
+      "targets": [
+        { "expr": "dag_nakamoto_kes_current_period", "legendFormat": "{{node}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "custom": { "drawStyle": "stepBefore", "fillOpacity": 10, "lineWidth": 2 } } }
+    },
+    {
+      "id": 212,
+      "title": "KES Rotations / 5m",
+      "description": "Per-node rotation count. Rotations should fire on eta boundaries; a node lagging the others by more than one period = sidecar missed the eta-rotation event.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 110 },
+      "targets": [
+        { "expr": "sum by (node) (rate(dag_nakamoto_kes_period_rotations_total[5m])) * 300", "legendFormat": "{{node}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "custom": { "drawStyle": "bars", "fillOpacity": 60 } } }
+    },
+    {
+      "id": 213,
+      "title": "KES Verify Failures / 5m",
+      "description": "Sum of all `dag_nakamoto_kes_*_invalid_total` / `_decode_failed_total` / `_no_sig_total` / `_no_registry_entry_total` counters across attestations + snapshots + mg-attestations. Persistent non-zero = wire-step desync or registry-staleness bug.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 110 },
+      "targets": [
+        { "expr": "sum(rate(dag_nakamoto_kes_attestations_invalid_total[5m])) * 300", "legendFormat": "att invalid/5m" },
+        { "expr": "sum(rate(dag_nakamoto_kes_attestations_no_sig_total[5m])) * 300", "legendFormat": "att no_sig/5m" },
+        { "expr": "sum(rate(dag_nakamoto_kes_attestations_decode_failed_total[5m])) * 300", "legendFormat": "att decode_fail/5m" },
+        { "expr": "sum(rate(dag_nakamoto_kes_attestations_no_registry_entry_total[5m])) * 300", "legendFormat": "att no_registry/5m" },
+        { "expr": "sum(rate(dag_nakamoto_kes_snapshots_invalid_total[5m])) * 300", "legendFormat": "snap invalid/5m" },
+        { "expr": "sum(rate(dag_nakamoto_kes_mg_attestations_invalid_total[5m])) * 300", "legendFormat": "mg invalid/5m" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 15 }, "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.1}, {"color": "red", "value": 1}] } } }
+    },
+    {
+      "id": 214,
+      "title": "KES Verify Successes (rate)",
+      "description": "Per-second rate of successful KES verifies. Three lines: tip attestations, snapshot sigs, metagraph attestations. Steady forward progress = production cluster.",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 117 },
+      "targets": [
+        { "expr": "sum(rate(dag_nakamoto_kes_attestations_verified_total[1m])) * 60", "legendFormat": "att verified/min" },
+        { "expr": "sum(rate(dag_nakamoto_kes_snapshots_verified_total[1m])) * 60", "legendFormat": "snap verified/min" },
+        { "expr": "sum(rate(dag_nakamoto_kes_mg_attestations_verified_total[1m])) * 60", "legendFormat": "mg-att verified/min" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 15 } } }
+    },
+
+    {
+      "id": 220,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 123 },
+      "options": { "mode": "markdown", "content": "# Avalanche / Snowball Attestation (#155)" }
+    },
+    {
+      "id": 221,
+      "title": "Snowball Decisions / 5m",
+      "description": "Per-second rate of Snowball decisions (`leader_count − runnerUp_count ≥ β`). Steady positive = healthy confidence cascade. Zero for extended periods with active chain = liveness regression (no quorum).",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 125 },
+      "targets": [
+        { "expr": "sum(rate(dag_nakamoto_snowball_decisions_total[5m])) * 300", "legendFormat": "decisions/5m" },
+        { "expr": "sum by (node) (rate(dag_nakamoto_snowball_decisions_total[5m])) * 300", "legendFormat": "{{node}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } } }
+    },
+    {
+      "id": 222,
+      "title": "Snowball Highest Decided Ordinal (monotone ratchet)",
+      "description": "Per-node highest ordinal Snowball has decided. Should track `dag_nakamoto_finalized_ordinal` closely; a sustained gap (decided behind finalized) = depth-k carried us forward without Snowball converging in time.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 125 },
+      "targets": [
+        { "expr": "dag_nakamoto_snowball_highest_decided_ordinal", "legendFormat": "{{node}} snowball" },
+        { "expr": "max(dag_nakamoto_finalized_ordinal)", "legendFormat": "max finalized" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 2 } } }
+    },
+
+    {
+      "id": 230,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 132 },
+      "options": { "mode": "markdown", "content": "# Committee Sortition & Gate" }
+    },
+    {
+      "id": 231,
+      "title": "Self Sortition Outcome / 5m (this node)",
+      "description": "Per-operator-key, per-(metagraph, parent-snapshot) sortition outcome. `in_committee` / `not_in_committee` ratio should converge to `K_target / N`; `unknown_parent` non-zero = #201 parent-ordinal-resolver still missing entries.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 134 },
+      "targets": [
+        { "expr": "sum by (outcome) (rate(dag_nakamoto_committee_sortition_self_outcome_total[5m])) * 300", "legendFormat": "{{outcome}}/5m" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 25, "lineWidth": 2, "stacking": { "mode": "normal", "group": "A" } } } }
+    },
+    {
+      "id": 232,
+      "title": "Committee Admit Outcome / 5m",
+      "description": "Per-binary admission outcome from `MetagraphCommitteeGate.attestAndAdmit`. `accepted` = quorum-attested. `timeout` = K_target attestations never arrived within `gateTimeoutMs` — binary dropped.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 134 },
+      "targets": [
+        { "expr": "sum by (outcome) (rate(dag_nakamoto_committee_admit_total[5m])) * 300", "legendFormat": "{{outcome}}/5m" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 25, "lineWidth": 2, "stacking": { "mode": "normal", "group": "A" } } } }
+    },
+
+    {
+      "id": 240,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 141 },
+      "options": { "mode": "markdown", "content": "# NIPoPoW Level-µ Trials (S3)" }
+    },
+    {
+      "id": 241,
+      "title": "Per-Level Trial Pass Rate",
+      "description": "`pass_total / trial_total` per super-level. Each level µ has a target rate set by `θ_µ`; observed should approach target as runs accumulate. Persistent deviation > 5% from target → calibration drift (proposal §5.3 bound).",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 143 },
+      "targets": [
+        { "expr": "sum by (level) (rate(dag_nakamoto_nipopow_level_trial_pass_total[15m])) / sum by (level) (rate(dag_nakamoto_nipopow_level_trial_total[15m]))", "legendFormat": "L{{level}} pass-rate" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "decimals": 4, "min": 0, "max": 0.6, "custom": { "drawStyle": "line", "fillOpacity": 5, "lineWidth": 2 } } }
+    },
+    {
+      "id": 242,
+      "title": "Cumulative Level-µ Passes (per level)",
+      "description": "Per-level cumulative pass count across cluster. L1 (densest, near-baseline rate) should outpace L2/L3/.../L_max by orders of magnitude. Inversions = §5.3 violation.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 143 },
+      "targets": [
+        { "expr": "sum by (level) (dag_nakamoto_nipopow_level_trial_pass_total)", "legendFormat": "L{{level}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 } } }
+    },
+    {
+      "id": 243,
+      "title": "Levels Passed Per Finalize (cluster max)",
+      "description": "`max(dag_nakamoto_nipopow_levels_passed)` — peak number of super-levels passing in a single finalize tick across the cluster. Bursts of multi-level passes are normal (an ordinal whose ρ wins L1 AND L2); sustained zero = tower not growing.",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 150 },
+      "targets": [
+        { "expr": "max(dag_nakamoto_nipopow_levels_passed)", "legendFormat": "max levels" },
+        { "expr": "avg(dag_nakamoto_nipopow_levels_passed)", "legendFormat": "avg levels" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 15 } } }
+    },
+
+    {
+      "id": 250,
+      "title": "",
+      "type": "text",
+      "gridPos": { "h": 2, "w": 24, "x": 0, "y": 156 },
+      "options": { "mode": "markdown", "content": "# Stake Aggregator MPT Prefix-Scan Latency (G1)" }
+    },
+    {
+      "id": 251,
+      "title": "MPT Prefix-Scan Latency / 5m",
+      "description": "Per-call wall-time for `NodeStakeAggregator.aggregateFromMpt`. Two MPT prefix scans + an in-memory fold. p99 here is the hot-path budget — if it climbs above ~50ms the consensus path may stall.",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 24, "x": 0, "y": 158 },
+      "targets": [
+        { "expr": "rate(dag_nakamoto_stake_aggregator_mpt_scan_ms_sum[5m]) / rate(dag_nakamoto_stake_aggregator_mpt_scan_ms_count[5m])", "legendFormat": "avg ms" },
+        { "expr": "max_over_time(dag_nakamoto_stake_aggregator_mpt_scan_ms_max[5m])", "legendFormat": "max ms" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ms", "decimals": 1, "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2 }, "thresholds": { "mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 50}, {"color": "red", "value": 200}] } } }
     }
   ],
   "schemaVersion": 39,
-  "version": 3
+  "version": 4
 }

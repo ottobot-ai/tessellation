@@ -7,6 +7,7 @@ import scala.concurrent.duration._
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate._
+import io.constellationnetwork.node.shared.infrastructure.metrics.{CountingMetrics, Metrics}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.peer.PeerId
@@ -44,6 +45,12 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
 
   private implicit val logger: SelfAwareStructuredLogger[IO] =
     Slf4jLogger.getLoggerFromName[IO]("MetagraphCommitteeGateSuite")
+
+  // No-op Metrics — the committee-gate now emits sortition / admit counters; tests don't assert
+  // on them (separate suite would, see CountingMetrics elsewhere) but the implicit must be
+  // resolvable at the make site.
+  private implicit val testMetrics: Metrics[IO] =
+    CountingMetrics.instance(Ref.unsafe[IO, Map[String, Int]](Map.empty))
 
   // ===== test fixtures =====
 
