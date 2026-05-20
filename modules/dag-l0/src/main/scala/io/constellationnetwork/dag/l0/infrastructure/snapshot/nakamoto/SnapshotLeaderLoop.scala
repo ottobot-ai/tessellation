@@ -1143,7 +1143,16 @@ object SnapshotLeaderLoop {
                       // re-key the overlay branch from raw → with-cert so ord N+1's
                       // `checkout(BranchId(getLastArtifactHash))` finds the parent.
                       rawArtifactHash <- hasher.hash(rawArtifact)
-                      artifact = rawArtifact.copy(slotCertificate = Some(cert), eta = Some(etaHash))
+                      // §3 NIPoPoW S2 phase 2b-2: carry forward parent's subchainLevelCounts. Until
+                      // S3 (TowerStore) lands and the producer can compute real level-trial passes,
+                      // the L-vector is a no-op pass-through — parent's value flows verbatim into
+                      // each new snapshot. Genesis (no parent cert) anchors at ZeroSubchainLevelCounts.
+                      // The verifier (NakamotoSnapshotValidator) enforces parity: incoming
+                      // subchainLevelCounts must equal parent's.
+                      parentSubchainLevelCounts = lastSigned.value.slotCertificate
+                        .fold(SlotCertificate.ZeroSubchainLevelCounts)(_.subchainLevelCounts)
+                      certWithSubchain = cert.copy(subchainLevelCounts = parentSubchainLevelCounts)
+                      artifact = rawArtifact.copy(slotCertificate = Some(certWithSubchain), eta = Some(etaHash))
                       signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)
                       snapshotHashedForStorage <- signed.toHashed[F]
                       parentHashValue = lastHashed.hash

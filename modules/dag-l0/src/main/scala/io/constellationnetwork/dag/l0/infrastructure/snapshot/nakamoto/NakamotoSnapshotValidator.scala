@@ -104,6 +104,13 @@ object NakamotoSnapshotValidator {
                     // Pre-activation snapshots don't have certs — accept for now
                     Right(())
                   case Some(cert) =>
+                    // §3 NIPoPoW S2 phase 2b-2: subchainLevelCounts must carry forward parent's
+                    // vector verbatim. Until S3 lands and trials start producing real passes,
+                    // any change between parent and child is a producer bug — reject.
+                    // Genesis (parent.slotCertificate.isEmpty) anchors at ZeroSubchainLevelCounts.
+                    val expectedSubchain = lastSignedArtifact.value.slotCertificate
+                      .fold(io.constellationnetwork.schema.nakamoto.slot.SlotCertificate.ZeroSubchainLevelCounts)(_.subchainLevelCounts)
+
                     // Verify cert slot matches gossip slot
                     if (cert.slot.value.value != slot)
                       Left(s"SlotCertificate slot (${cert.slot.value.value}) != gossip slot ($slot)")
@@ -113,6 +120,12 @@ object NakamotoSnapshotValidator {
                     // Verify VRF public key matches
                     else if (!java.util.Arrays.equals(cert.vrfPublicKey.toBytes, vrfPublicKey))
                       Left("SlotCertificate VRF public key doesn't match gossip key")
+                    // §3 NIPoPoW: subchainLevelCounts must carry forward from parent
+                    else if (cert.subchainLevelCounts != expectedSubchain)
+                      Left(
+                        s"SlotCertificate.subchainLevelCounts (${cert.subchainLevelCounts.mkString(",")}) " +
+                          s"!= expected carry-forward (${expectedSubchain.mkString(",")})"
+                      )
                     else
                       Right(())
                 }
