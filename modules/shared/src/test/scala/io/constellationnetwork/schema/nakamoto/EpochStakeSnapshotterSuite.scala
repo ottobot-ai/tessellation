@@ -125,61 +125,8 @@ object EpochStakeSnapshotterSuite extends FunSuite {
   }
 
   // ---- backfillGenesisStakeSnapshots tests ---------------------------------
-
-  test("backfill: empty GSI seeds {-2, -1, 0} with StakeDistribution.Empty") {
-    val info = GlobalSnapshotInfo.empty
-    val out = EpochStakeSnapshotter.backfillGenesisStakeSnapshots(info)
-    val keys = out.historicalStakeSnapshots.keySet
-    val expected = Set(EtaPeriod(-2L), EtaPeriod(-1L), EtaPeriod(0L))
-    expect.same(expected, keys) &&
-    expect(out.historicalStakeSnapshots.values.forall(_ == StakeDistribution.Empty))
-  }
-
-  test("backfill: stake-bearing GSI seeds the three keys with the genesis distribution") {
-    val a = pid("a")
-    val b = pid("b")
-    val info = mkSnapshotInfo(delegated = Map(a -> 100L, b -> 200L), collateral = Map.empty)
-    val genesisDist = EpochStakeSnapshotter.snapshot(info)
-    val out = EpochStakeSnapshotter.backfillGenesisStakeSnapshots(info)
-    val expected: SortedMap[EtaPeriod, StakeDistribution] =
-      SortedMap(EtaPeriod(-2L) -> genesisDist, EtaPeriod(-1L) -> genesisDist, EtaPeriod(0L) -> genesisDist)
-    expect.same(expected, out.historicalStakeSnapshots)
-  }
-
-  test("backfill: idempotent — applying twice produces the same output") {
-    val a = pid("a")
-    val info = mkSnapshotInfo(delegated = Map(a -> 100L), collateral = Map.empty)
-    val once = EpochStakeSnapshotter.backfillGenesisStakeSnapshots(info)
-    val twice = EpochStakeSnapshotter.backfillGenesisStakeSnapshots(once)
-    expect.same(once.historicalStakeSnapshots, twice.historicalStakeSnapshots)
-  }
-
-  test("backfill: preserves prior entries outside {-2, -1, 0} and overrides those three") {
-    // Simulate a non-genesis GSI that already has stamps for {5} and a stale {0} from a prior run.
-    val a = pid("a")
-    val stale = StakeDistribution(SortedMap(a -> BigInt(9999L)))
-    val info = mkSnapshotInfo(delegated = Map(a -> 100L), collateral = Map.empty).copy(
-      historicalStakeSnapshots = SortedMap[EtaPeriod, StakeDistribution](
-        EtaPeriod(0L) -> stale,
-        EtaPeriod(5L) -> stale
-      )
-    )
-    val genesisDist = EpochStakeSnapshotter.snapshot(info)
-    val out = EpochStakeSnapshotter.backfillGenesisStakeSnapshots(info)
-    // Period 5 untouched, periods {-2, -1, 0} all set to the genesis distribution (NOT the stale).
-    expect.same(stale, out.historicalStakeSnapshots(EtaPeriod(5L))) &&
-    expect.same(genesisDist, out.historicalStakeSnapshots(EtaPeriod(-2L))) &&
-    expect.same(genesisDist, out.historicalStakeSnapshots(EtaPeriod(-1L))) &&
-    expect.same(genesisDist, out.historicalStakeSnapshots(EtaPeriod(0L)))
-  }
-
-  test("backfill: leaves all other GSI fields unchanged") {
-    val a = pid("a")
-    val info = mkSnapshotInfo(delegated = Map(a -> 100L), collateral = Map.empty)
-    val out = EpochStakeSnapshotter.backfillGenesisStakeSnapshots(info)
-    expect.same(info.activeDelegatedStakes, out.activeDelegatedStakes) &&
-    expect.same(info.activeNodeCollaterals, out.activeNodeCollaterals) &&
-    expect.same(info.balances, out.balances) &&
-    expect.same(info.lastTxRefs, out.lastTxRefs)
-  }
+  // Deleted 2026-05-20 — S0.5 helper reverted out of `EpochStakeSnapshotter` after the
+  // overnight bisect showed `backfillGenesisStakeSnapshots` causes a consensus stall at
+  // `assertRewardAndTokenUnlock` ord=41 (see memory `project_nipopow_s0_s3_landing` for
+  // full trace). Tests will be re-introduced when a corrected S0.5 design lands.
 }
