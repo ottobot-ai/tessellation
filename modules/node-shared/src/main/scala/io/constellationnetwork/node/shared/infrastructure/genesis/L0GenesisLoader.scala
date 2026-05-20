@@ -14,6 +14,7 @@ import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, UpdateDelegatedStake}
+import io.constellationnetwork.schema.nakamoto.EpochStakeSnapshotter
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, UpdateNodeCollateral}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
@@ -136,11 +137,18 @@ object L0GenesisLoader {
           } yield addr -> bal
         }.foldLeft(base.balances) { case (acc, (a, b)) => acc.updated(a, b) }
 
-      base.copy(
+      // §3 NIPoPoW S0.5 — genesis backfill. Stamp the just-built genesis stake distribution under
+      // eta-period keys {-2, -1, 0} so the N-2 lookback used by slot-leader eligibility returns the
+      // genesis distribution during the first three eta periods (periods 0, 1, 2). Without this, the
+      // first three periods fall through to the current-GSI default — correct only by coincidence
+      // when the genesis distribution is unchanged. Backfill makes the lookup explicit and turns
+      // periods 0/1/2 leader election into a deterministic read against `historicalStakeSnapshots`.
+      val augmented = base.copy(
         balances = mergedBalances,
         activeDelegatedStakes = Some(stakeMap),
         activeNodeCollaterals = Some(collMap)
       )
+      EpochStakeSnapshotter.backfillGenesisStakeSnapshots(augmented)
     }
 
   /** Build a [[KesRegistry]] from the `kesRegistrations` field of an L0 genesis fixture. Each entry is hex-decoded into a

@@ -135,4 +135,33 @@ object EpochStakeSnapshotter {
         .to(SortedMap)
     StakeDistribution(merged)
   }
+
+  /** §3 NIPoPoW S0.5 — genesis backfill. Stamps the just-built genesis stake distribution under the three eta-period keys `{-2, -1, 0}` so
+    * that the N-2 lookback (`relativeStakeAt(_, currentPeriod - 2)`) returns the genesis distribution during the first three eta periods
+    * after boot — periods 0, 1, and 2.
+    *
+    * '''Why these three keys.''' The producer's lookup at ordinal in period `N` reads `historicalStakeSnapshots[N - 2]`. The GSAM boundary
+    * write at `ord % R == R - 1` writes `historicalStakeSnapshots[N]` at the close of period N — too late to serve the first three periods
+    * of slot-leader eligibility. Without backfill, the registry's `historicalDistributionFor` returns `None` and the fallback path lands on
+    * the current GSI (correct only by coincidence — the genesis distribution is unchanged during warmup). Stamping explicitly closes the
+    * gap: every periodic lookup returns the genesis distribution with no fall-through.
+    *
+    * '''Retention compatibility.''' GSAM prunes entries below `currentPeriod - 3` at each boundary. The backfill writes the exact set that
+    * retention would keep at the start of period 0 (`[currentPeriod - 3, currentPeriod] = [-3, 0]` excluding the un-needed `-3`). At the
+    * close of period 0, GSAM overwrites `0` with the actual end-of-period-0 distribution (no change if no stake events fired); at close of
+    * period 1, retention drops `-2`; at close of period 2, drops `-1`. So the backfill entries are pruned exactly as they become
+    * unreachable by lookback.
+    *
+    * '''Idempotent on re-load.''' If a node restarts and re-loads genesis after some boundary writes have already occurred, the backfill is
+    * applied to the genesis GSI before any boundary-write history exists — so the three keys are written unconditionally. The first
+    * acceptance after restart re-runs the producer's pipeline and overwrites at its boundary cadence; backfilled keys that have already
+    * been pruned in the on-disk store will be re-introduced on this path. This is load-bearing only for the boot path of a fresh cluster.
+    */
+  def backfillGenesisStakeSnapshots(info: GlobalSnapshotInfo): GlobalSnapshotInfo = {
+    val genesisDistribution = snapshot(info)
+    val seeded: SortedMap[EtaPeriod, StakeDistribution] =
+      List(EtaPeriod(-2L), EtaPeriod(-1L), EtaPeriod(0L))
+        .foldLeft(info.historicalStakeSnapshots)((acc, k) => acc.updated(k, genesisDistribution))
+    info.copy(historicalStakeSnapshots = seeded)
+  }
 }
