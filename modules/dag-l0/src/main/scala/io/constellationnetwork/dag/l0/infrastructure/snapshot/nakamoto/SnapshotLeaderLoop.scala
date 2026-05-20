@@ -1028,7 +1028,10 @@ object SnapshotLeaderLoop {
           vrfPublicKey = VrfPublicKey(pkHex),
           eta = etaHash,
           activePoolSize = activePoolSize,
-          activePoolHash = activePoolHash
+          activePoolHash = activePoolHash,
+          // §3 NIPoPoW S2 phase 2b-1: plumb the field with zeros. Phase 2b-2 wires the producer to
+          // compute via SubchainStateUpdater.updateFrom(parent.subchainLevelCounts, levelTrials).
+          subchainLevelCounts = SlotCertificate.ZeroSubchainLevelCounts
         )
 
         _ <- logger.info(s"WON slot $currentSlot (gap=$slotGap, parentSlot=$parentSlotValue, pool=$activePoolSize) — producing snapshot")

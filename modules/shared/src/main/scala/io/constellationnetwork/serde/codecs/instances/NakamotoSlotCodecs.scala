@@ -9,7 +9,7 @@ import io.constellationnetwork.serde.codecs.instances.HexContentCodec.{codec => 
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
 import scodec.Codec
-import scodec.codecs.int32
+import scodec.codecs.{int32, int64, vectorOfN}
 import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for the Nakamoto slot-certificate family.
@@ -17,7 +17,7 @@ import shapeless.{::, HNil}
   * Types (all hex newtypes + Slot + SlotCertificate):
   *   - `Slot` — NonNegLong wrapper (shape registered in `NewtypeLongShapes`).
   *   - `VrfProof`, `VrfOutput`, `VrfPublicKey` — Hex wrappers, length-prefixed raw bytes.
-  *   - `SlotCertificate` — 8-field record.
+  *   - `SlotCertificate` — 9-field record (8 VRF/pool fields + `subchainLevelCounts` for §3 NIPoPoW header observation).
   */
 object NakamotoSlotCodecs {
 
@@ -39,6 +39,12 @@ object NakamotoSlotCodecs {
   private val slotCodec: Codec[Slot] = Codec[Slot]
   private val hashAliasCodec: Codec[Hash] = hashCodec
 
+  /** Fixed-width 9-element vector of int64 for `SlotCertificate.subchainLevelCounts`. Size matches `SuperLevelParams.SuperLevelCount` in
+    * `node-shared`; we keep the literal here (in `shared`) to avoid pulling a `node-shared` dependency into the codec layer. Any size
+    * mismatch on encode will throw at scodec layer; decode of a longer/shorter wire payload is impossible because the width is constant.
+    */
+  private val subchainLevelCountsCodec: Codec[Vector[Long]] = vectorOfN(scodec.codecs.provide(9), int64)
+
   implicit val slotCertificateCodec: Codec[SlotCertificate] =
     (slotCodec ::
       slotCodec ::
@@ -47,13 +53,16 @@ object NakamotoSlotCodecs {
       vrfPublicKeyCodec ::
       hashAliasCodec ::
       int32 ::
-      hashAliasCodec)
+      hashAliasCodec ::
+      subchainLevelCountsCodec)
       .xmap[SlotCertificate](
         {
-          case s :: ps :: vp :: vo :: vpk :: eta :: aps :: aph :: HNil =>
-            SlotCertificate(s, ps, vp, vo, vpk, eta, aps, aph)
+          case s :: ps :: vp :: vo :: vpk :: eta :: aps :: aph :: slc :: HNil =>
+            SlotCertificate(s, ps, vp, vo, vpk, eta, aps, aph, slc)
         },
-        c => c.slot :: c.parentSlot :: c.vrfProof :: c.vrfOutput :: c.vrfPublicKey :: c.eta :: c.activePoolSize :: c.activePoolHash :: HNil
+        c =>
+          c.slot :: c.parentSlot :: c.vrfProof :: c.vrfOutput :: c.vrfPublicKey :: c.eta :: c.activePoolSize :: c.activePoolHash ::
+            c.subchainLevelCounts :: HNil
       )
 
   implicit val slotCertificateImmutableCodec: ImmutableCodec[SlotCertificate] =

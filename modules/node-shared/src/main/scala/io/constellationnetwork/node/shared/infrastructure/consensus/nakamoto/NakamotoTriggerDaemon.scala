@@ -127,7 +127,8 @@ object NakamotoTriggerDaemon {
                   VrfPublicKey(pkHex),
                   etaHash,
                   1,
-                  Hash("0" * 64)
+                  Hash("0" * 64),
+                  SlotCertificate.ZeroSubchainLevelCounts
                 )
 
               for {

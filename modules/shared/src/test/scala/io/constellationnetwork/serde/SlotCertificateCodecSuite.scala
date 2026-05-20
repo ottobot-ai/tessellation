@@ -16,7 +16,11 @@ import weaver.FunSuite
   */
 object SlotCertificateCodecSuite extends FunSuite {
 
-  private def sampleCert(slot: Long, parentSlot: Long): SlotCertificate =
+  private def sampleCert(
+    slot: Long,
+    parentSlot: Long,
+    subchainLevelCounts: Vector[Long] = SlotCertificate.ZeroSubchainLevelCounts
+  ): SlotCertificate =
     SlotCertificate(
       slot = Slot.unsafeApply(slot),
       parentSlot = Slot.unsafeApply(parentSlot),
@@ -25,7 +29,8 @@ object SlotCertificateCodecSuite extends FunSuite {
       vrfPublicKey = VrfPublicKey(Hex("0c" * 32)),
       eta = Hash("d" * 64),
       activePoolSize = 7,
-      activePoolHash = Hash("e" * 64)
+      activePoolHash = Hash("e" * 64),
+      subchainLevelCounts = subchainLevelCounts
     )
 
   test("SlotCertificate round-trips a non-genesis parentSlot through scodec") {
@@ -58,5 +63,35 @@ object SlotCertificateCodecSuite extends FunSuite {
     val cert = sampleCert(slot = 1L, parentSlot = 0L)
     val decoded = cert.immutableBytes.fromImmutableBytes[SlotCertificate]
     expect(decoded == Right(cert))
+  }
+
+  test("SlotCertificate.subchainLevelCounts round-trips a non-zero vector (§3 NIPoPoW S2 phase 2b-1)") {
+    // Hand-crafted level counts mimicking a mid-chain header: high-frequency L1
+    // hits, less-frequent L2/L3, sparse upper levels. Vector size MUST be 9
+    // (= SuperLevelParams.SuperLevelCount). The codec is fixed-width per-element
+    // int64 so a wrong-size vector would either fail to encode or silently
+    // corrupt the downstream fields.
+    val counts = Vector(100L, 47L, 22L, 11L, 5L, 2L, 1L, 0L, 0L)
+    val cert = sampleCert(slot = 7777L, parentSlot = 7770L, subchainLevelCounts = counts)
+    val decoded = cert.immutableBytes.fromImmutableBytes[SlotCertificate]
+    decoded match {
+      case Right(c) =>
+        expect(c.subchainLevelCounts == counts).and(expect(c.subchainLevelCounts.size == 9))
+      case Left(err) =>
+        failure(s"unexpected decode failure: $err")
+    }
+  }
+
+  test("SlotCertificate round-trips genesis zero subchain counts (default)") {
+    val cert = sampleCert(slot = 1L, parentSlot = 0L)
+    val decoded = cert.immutableBytes.fromImmutableBytes[SlotCertificate]
+    decoded match {
+      case Right(c) =>
+        expect(c.subchainLevelCounts == SlotCertificate.ZeroSubchainLevelCounts)
+          .and(expect(c.subchainLevelCounts.size == 9))
+          .and(expect(c.subchainLevelCounts.forall(_ == 0L)))
+      case Left(err) =>
+        failure(s"unexpected decode failure: $err")
+    }
   }
 }

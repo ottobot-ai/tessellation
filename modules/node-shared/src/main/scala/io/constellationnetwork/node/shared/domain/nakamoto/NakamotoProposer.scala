@@ -126,7 +126,8 @@ object NakamotoProposer {
                     vrfPublicKey = VrfPublicKey.fromBytes(vrfVK),
                     eta = Hash(Hex.fromBytes(eta).value),
                     activePoolSize = 1,
-                    activePoolHash = Hash("0" * 64)
+                    activePoolHash = Hash("0" * 64),
+                    subchainLevelCounts = SlotCertificate.ZeroSubchainLevelCounts
                   )
                 )
             }

@@ -121,6 +121,11 @@ object slot {
     * Verifiers check:
     *   1. slot is within clock tolerance (|mySlot - slot| ≤ skew) 2. VRF proof verifies against (eta || slot) with the given public key 3.
     *      VRF output normalized to [0,1) is below LDD threshold for the slot gap 4. Public key matches the producer's derived VRF key
+    *
+    * '''§3 NIPoPoW header field.''' `subchainLevelCounts` is the cumulative per-super-level hit count from genesis through this snapshot
+    * (size MUST equal `SuperLevelParams.SuperLevelCount` = 9; entry `i` is the L`i+1` count). Genesis = all zeros. Phase 2b-1 plumbs the
+    * field through schema + codec with a zero default; Phase 2b-2 wires the producer to populate it via `SubchainStateUpdater` and adds a
+    * verifier parity check. Header observation only — does NOT influence finality.
     */
   @derive(decoder, encoder, eqv, show)
   case class SlotCertificate(
@@ -131,6 +136,16 @@ object slot {
     vrfPublicKey: VrfPublicKey,
     eta: Hash,
     activePoolSize: Int,
-    activePoolHash: Hash
+    activePoolHash: Hash,
+    subchainLevelCounts: Vector[Long]
   )
+
+  object SlotCertificate {
+
+    /** Zero subchain-level counts vector — size = `SuperLevelParams.SuperLevelCount` = 9. Used as the genesis-snapshot value and as the
+      * phase-2b-1 default until producer wiring lands in phase 2b-2. Defined here (in `shared`) so we don't pull a `node-shared` dependency
+      * into the schema layer; the constant length must match `SuperLevelParams.SuperLevelCount` and is enforced at the verifier.
+      */
+    val ZeroSubchainLevelCounts: Vector[Long] = Vector.fill(9)(0L)
+  }
 }
