@@ -7,16 +7,20 @@ import scala.collection.immutable.SortedMap
 import scala.math.BigDecimal.RoundingMode
 
 import io.constellationnetwork.node.shared.infrastructure.snapshot.DelegatedRewardsDistributor
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
+  DelegatedStakeStateManager,
+  SpendTransactionBalanceManager,
+  UpdateNodeParametersStateReader
+}
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.PricingUpdate
 import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
-import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.utils.DecimalUtils
 
 import eu.timepit.refined.auto._
@@ -26,23 +30,37 @@ trait RewardsInfoCalculator[F[_]] {
   def calculateRewardsInfo(
     lastSnapshot: GlobalIncrementalSnapshot,
     lastSnapshotInfo: GlobalSnapshotInfo
-  ): F[Option[RewardsInfo]]
+  )(implicit hasher: Hasher[F]): F[Option[RewardsInfo]]
 }
 
 object RewardsInfoCalculator {
-  def make[F[_]: Async](delegatedRewardsDistributor: DelegatedRewardsDistributor[F]): RewardsInfoCalculator[F] = {
+
+  /** §G5 — MPT-primary RewardsInfo calculation.
+    *
+    * `delegatedStakeStateManager` provides per-address `activeDelegatedStakes` + per-address `delegatedStakesWithdrawals` full
+    * materializers. `updateNodeParametersStateReader` provides the per-Id `updateNodeParameters` full materializer.
+    * `spendTransactionBalanceManager` provides the full balances map (used to compute total spendable supply). All three reads come from a
+    * branch-aware MPT reader bound at construction time — under MultiBranch the view is scoped to the gl0 best-tip, matching the same
+    * convention as G1's `NodeStakeAggregator.cached`.
+    */
+  def make[F[_]: Async](
+    delegatedRewardsDistributor: DelegatedRewardsDistributor[F],
+    delegatedStakeStateManager: DelegatedStakeStateManager[F],
+    updateNodeParametersStateReader: UpdateNodeParametersStateReader[F],
+    spendTransactionBalanceManager: SpendTransactionBalanceManager[F]
+  ): RewardsInfoCalculator[F] = {
     new RewardsInfoCalculator[F] {
       override def calculateRewardsInfo(
         lastSnapshot: GlobalIncrementalSnapshot,
         lastSnapshotInfo: GlobalSnapshotInfo
-      ): F[Option[RewardsInfo]] =
+      )(implicit hasher: Hasher[F]): F[Option[RewardsInfo]] =
         if (lastSnapshot.delegateRewards.getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]]).isEmpty) {
           Option.empty[RewardsInfo].pure[F]
         } else {
           for {
-            latestDelegateRewardsNoCommission <- getLatestDelegateRewardTotal(lastSnapshot, lastSnapshotInfo)
+            latestDelegateRewardsNoCommission <- getLatestDelegateRewardTotal(lastSnapshot)
 
-            (_, _, totalDelegateStake, currentTotalSupply) <- processDelegations(lastSnapshotInfo)
+            (_, _, totalDelegateStake, currentTotalSupply) <- processDelegations
 
             currentPrice <- toAmount(getCurrentDagPrice(lastSnapshotInfo))
             nextPrice <- getNextDagPrice(lastSnapshotInfo)
@@ -65,57 +83,60 @@ object RewardsInfoCalculator {
             )
         }
 
-      private def processDelegations(info: GlobalSnapshotInfo): F[(Amount, Amount, Amount, Amount)] = {
-        val activeDelegatedStakes = info.activeDelegatedStakes
-          .getOrElse(SortedMap.empty[Address, List[DelegatedStakeRecord]])
+      // §G5: prior state for stake totals + balance supply is sourced from the MPT (via the
+      // injected state managers) rather than `info.activeDelegatedStakes` / `info.balances`. The
+      // MPT and GSI are in sync during a healthy boot, so the numerical totals are unchanged.
+      private def processDelegations(implicit hasher: Hasher[F]): F[(Amount, Amount, Amount, Amount)] =
+        for {
+          activeDelegatedStakes <- delegatedStakeStateManager.materializeActiveDelegatedStakesFromMpt
+          pendingWithdrawals <- delegatedStakeStateManager.materializeDelegatedStakeWithdrawalsFromMpt
+          balances <- spendTransactionBalanceManager.materializeAllBalancesFromMpt
 
-        val pendingWithdrawals = info.delegatedStakesWithdrawals
-          .getOrElse(SortedMap.empty[Address, List[PendingDelegatedStakeWithdrawal]])
+          totalSpendableSupply = balances.values.map(_.value.value).sum
+          totalPendingSupply = pendingWithdrawals.values.flatten.map(_.rewards.value.value).sum
 
-        val totalSpendableSupply = info.balances.values.map(_.value.value).sum
-        val totalPendingSupply = pendingWithdrawals.values.flatten.map(_.rewards.value.value).sum
+          (totalStakeLocked, totalActiveRewards) = activeDelegatedStakes.values.flatten.foldLeft((0L, 0L)) {
+            case ((stakeAcc, rewardsAcc), record) =>
+              val stakeAmount = record.event.value.amount.value.value
+              val rewardsAmount = record.rewards.value
+              (stakeAcc + stakeAmount, rewardsAcc + rewardsAmount)
+          }
 
-        val (totalStakeLocked, totalActiveRewards) = activeDelegatedStakes.values.flatten.foldLeft((0L, 0L)) {
-          case ((stakeAcc, rewardsAcc), record) =>
-            val stakeAmount = record.event.value.amount.value.value
-            val rewardsAmount = record.rewards.value
-            (stakeAcc + stakeAmount, rewardsAcc + rewardsAmount)
-        }
+          result <- (
+            toAmount(totalStakeLocked),
+            toAmount(totalActiveRewards),
+            toAmount(totalStakeLocked + totalActiveRewards), // totalDelegateStake
+            toAmount(totalSpendableSupply + totalPendingSupply + totalActiveRewards) // currentTotalSupply
+          ).mapN(Tuple4.apply)
+        } yield result
 
-        (
-          toAmount(totalStakeLocked),
-          toAmount(totalActiveRewards),
-          toAmount(totalStakeLocked + totalActiveRewards), // totalDelegateStake
-          toAmount(totalSpendableSupply + totalPendingSupply + totalActiveRewards) // currentTotalSupply
-        ).mapN(Tuple4.apply)
-      }
-
-      private def getLatestDelegateRewardTotal(snapshot: GlobalIncrementalSnapshot, info: GlobalSnapshotInfo): F[Amount] = {
+      private def getLatestDelegateRewardTotal(snapshot: GlobalIncrementalSnapshot)(implicit hasher: Hasher[F]): F[Amount] = {
         val delegateRewards = snapshot.delegateRewards.getOrElse(SortedMap.empty[PeerId, Map[Address, Amount]])
-        val nodeParams = info.updateNodeParameters
-          .getOrElse(SortedMap.empty[ID.Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)])
 
-        val calcFullReward: (Long, (PeerId, Map[Address, Amount])) => Long = {
-          case (acc, (peerId, rewards)) =>
-            val nodeCommissionValue = nodeParams.get(peerId.toId).map(_._1.delegatedStakeRewardParameters.reward).getOrElse(0.0)
-            val nodeCommission = BigDecimal(nodeCommissionValue)
+        // §G5: `updateNodeParameters` sourced from the MPT via the dedicated state reader.
+        updateNodeParametersStateReader.materializeUpdateNodeParametersFromMpt.flatMap { nodeParams =>
+          val calcFullReward: (Long, (PeerId, Map[Address, Amount])) => Long = {
+            case (acc, (peerId, rewards)) =>
+              val nodeCommissionValue = nodeParams.get(peerId.toId).map(_._1.delegatedStakeRewardParameters.reward).getOrElse(0.0)
+              val nodeCommission = BigDecimal(nodeCommissionValue)
 
-            val delegatePortion = if (nodeCommission >= 1.0) BigDecimal(0.0) else BigDecimal(1.0) - nodeCommission
+              val delegatePortion = if (nodeCommission >= 1.0) BigDecimal(0.0) else BigDecimal(1.0) - nodeCommission
 
-            val rewardsSum = rewards.values.map(_.value.value).sum
-            val rewardsBigDecimal = BigDecimal(rewardsSum)
+              val rewardsSum = rewards.values.map(_.value.value).sum
+              val rewardsBigDecimal = BigDecimal(rewardsSum)
 
-            if (delegatePortion == BigDecimal(0.0)) acc
-            else
-              acc + (rewardsBigDecimal / delegatePortion)
-                .setScale(0, RoundingMode.HALF_UP)
-                .longValue
+              if (delegatePortion == BigDecimal(0.0)) acc
+              else
+                acc + (rewardsBigDecimal / delegatePortion)
+                  .setScale(0, RoundingMode.HALF_UP)
+                  .longValue
+          }
+
+          delegateRewards
+            .foldLeft(0L)(calcFullReward)
+            .pure[F]
+            .flatMap(toAmount)
         }
-
-        delegateRewards
-          .foldLeft(0L)(calcFullReward)
-          .pure[F]
-          .flatMap(toAmount)
       }
 
       private def calculateAverageReward(latestRewards: Amount, totalStakedAmount: Amount): F[BigDecimal] =

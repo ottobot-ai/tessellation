@@ -173,8 +173,11 @@ object GlobalSnapshotContextFunctions {
                         udsar,
                         psu
                       )
+                      // §G5: source `activeDelegatedStakes` for withdrawal stake lookups from the MPT (per-address point reads).
+                      // Followers see the finalized base store directly via `GlobalStateReader.fromMptStore` — under MultiBranch
+                      // the validate path runs against an already-committed snapshot, so the branch dimension is moot here.
                       updatedWithdrawDelegatedStakes <- DelegatedRewardsDistributor.getUpdatedWithdrawalDelegatedStakes(
-                        context,
+                        io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore),
                         udsar,
                         psu
                       )

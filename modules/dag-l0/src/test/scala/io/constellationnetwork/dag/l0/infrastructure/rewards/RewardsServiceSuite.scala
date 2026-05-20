@@ -8,6 +8,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.currency.dataApplication.DataCalculatedState
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
+import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types.EmissionConfigEntry
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
 import io.constellationnetwork.node.shared.domain.rewards.Rewards
@@ -27,6 +28,7 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.schema.transaction.{RewardTransaction, Transaction}
 import io.constellationnetwork.schema.{SnapshotOrdinal, _}
+import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
@@ -36,6 +38,14 @@ import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
 import weaver.SimpleIOSuite
 
 object RewardsServiceSuite extends SimpleIOSuite {
+
+  // §G5: the `calculateAndStoreRewardsInfo` API now requires `implicit Hasher[F]`. Provide a single
+  // hasher per-test via this helper so the suite stays a `SimpleIOSuite` (no MutableIOSuite needed).
+  private def runWithHasher[A](f: Hasher[IO] => IO[A]): IO[A] =
+    JsonSerializer.forAsync[IO].flatMap { js =>
+      implicit val jsImpl: JsonSerializer[IO] = js
+      f(Hasher.forJson[IO])
+    }
 
   // Test data helpers
   val testPeerId1: PeerId = PeerId(Hex("test-peer-1"))
@@ -111,7 +121,7 @@ object RewardsServiceSuite extends SimpleIOSuite {
       override def calculateRewardsInfo(
         lastSnapshot: GlobalIncrementalSnapshot,
         lastSnapshotInfo: GlobalSnapshotInfo
-      ): IO[Option[RewardsInfo]] =
+      )(implicit hasher: Hasher[IO]): IO[Option[RewardsInfo]] =
         (if (shouldReturnRewardsInfo) Some(testRewardsInfo)
          else None).pure[IO]
     }
@@ -186,197 +196,211 @@ object RewardsServiceSuite extends SimpleIOSuite {
   )
 
   test("calculateAndStoreRewardsInfo stores rewards info when calculator returns Some") {
-    for {
-      storage <- RewardsInfoStorage.make[IO]
+    runWithHasher { implicit hasher =>
+      for {
+        storage <- RewardsInfoStorage.make[IO]
 
-      calculator = createMockRewardsInfoCalculator(shouldReturnRewardsInfo = true)
-      rewardsService = RewardsService(
-        classicRewards = createMockRewards,
-        delegatedRewards = createMockDelegatedRewardsDistributor,
-        rewardsInfoCalculator = calculator,
-        rewardsInfoStorage = storage
-      )
+        calculator = createMockRewardsInfoCalculator(shouldReturnRewardsInfo = true)
+        rewardsService = RewardsService(
+          classicRewards = createMockRewards,
+          delegatedRewards = createMockDelegatedRewardsDistributor,
+          rewardsInfoCalculator = calculator,
+          rewardsInfoStorage = storage
+        )
 
-      snapshot = createTestSnapshot
-      snapshotInfo = createTestSnapshotInfo
+        snapshot = createTestSnapshot
+        snapshotInfo = createTestSnapshotInfo
 
-      _ <- rewardsService.calculateAndStoreRewardsInfo(snapshot, snapshotInfo)
-      storedRewardsInfo <- storage.getRewardsInfo
-    } yield expect.same(storedRewardsInfo, Some(testRewardsInfo))
+        _ <- rewardsService.calculateAndStoreRewardsInfo(snapshot, snapshotInfo)
+        storedRewardsInfo <- storage.getRewardsInfo
+      } yield expect.same(storedRewardsInfo, Some(testRewardsInfo))
+    }
   }
 
   test("calculateAndStoreRewardsInfo does not store anything when calculator returns None") {
-    for {
-      storage <- RewardsInfoStorage.make[IO]
+    runWithHasher { implicit hasher =>
+      for {
+        storage <- RewardsInfoStorage.make[IO]
 
-      calculator = createMockRewardsInfoCalculator(shouldReturnRewardsInfo = false)
-      rewardsService = RewardsService(
-        classicRewards = createMockRewards,
-        delegatedRewards = createMockDelegatedRewardsDistributor,
-        rewardsInfoCalculator = calculator,
-        rewardsInfoStorage = storage
-      )
+        calculator = createMockRewardsInfoCalculator(shouldReturnRewardsInfo = false)
+        rewardsService = RewardsService(
+          classicRewards = createMockRewards,
+          delegatedRewards = createMockDelegatedRewardsDistributor,
+          rewardsInfoCalculator = calculator,
+          rewardsInfoStorage = storage
+        )
 
-      snapshot = createTestSnapshot
-      snapshotInfo = createTestSnapshotInfo
+        snapshot = createTestSnapshot
+        snapshotInfo = createTestSnapshotInfo
 
-      _ <- rewardsService.calculateAndStoreRewardsInfo(snapshot, snapshotInfo)
-      storedRewardsInfo <- storage.getRewardsInfo
-    } yield expect.same(storedRewardsInfo, None)
+        _ <- rewardsService.calculateAndStoreRewardsInfo(snapshot, snapshotInfo)
+        storedRewardsInfo <- storage.getRewardsInfo
+      } yield expect.same(storedRewardsInfo, None)
+    }
   }
 
   test("calculateAndStoreRewardsInfo calls calculator with correct parameters") {
-    for {
-      storage <- RewardsInfoStorage.make[IO]
+    runWithHasher { implicit hasher =>
+      for {
+        storage <- RewardsInfoStorage.make[IO]
 
-      // Create a calculator that tracks the parameters it was called with
-      calledWithSnapshotRef <- Ref[IO].of(Option.empty[GlobalIncrementalSnapshot])
-      calledWithSnapshotInfoRef <- Ref[IO].of(Option.empty[GlobalSnapshotInfo])
+        // Create a calculator that tracks the parameters it was called with
+        calledWithSnapshotRef <- Ref[IO].of(Option.empty[GlobalIncrementalSnapshot])
+        calledWithSnapshotInfoRef <- Ref[IO].of(Option.empty[GlobalSnapshotInfo])
 
-      calculator = new RewardsInfoCalculator[IO] {
-        override def calculateRewardsInfo(
-          lastSnapshot: GlobalIncrementalSnapshot,
-          lastSnapshotInfo: GlobalSnapshotInfo
-        ): IO[Option[RewardsInfo]] =
-          calledWithSnapshotRef.set(Some(lastSnapshot)) >>
-            calledWithSnapshotInfoRef.set(Some(lastSnapshotInfo)) >>
-            Some(testRewardsInfo).pure[IO]
-      }
+        calculator = new RewardsInfoCalculator[IO] {
+          override def calculateRewardsInfo(
+            lastSnapshot: GlobalIncrementalSnapshot,
+            lastSnapshotInfo: GlobalSnapshotInfo
+          )(implicit hasher: Hasher[IO]): IO[Option[RewardsInfo]] =
+            calledWithSnapshotRef.set(Some(lastSnapshot)) >>
+              calledWithSnapshotInfoRef.set(Some(lastSnapshotInfo)) >>
+              Some(testRewardsInfo).pure[IO]
+        }
 
-      rewardsService = RewardsService(
-        classicRewards = createMockRewards,
-        delegatedRewards = createMockDelegatedRewardsDistributor,
-        rewardsInfoCalculator = calculator,
-        rewardsInfoStorage = storage
-      )
+        rewardsService = RewardsService(
+          classicRewards = createMockRewards,
+          delegatedRewards = createMockDelegatedRewardsDistributor,
+          rewardsInfoCalculator = calculator,
+          rewardsInfoStorage = storage
+        )
 
-      snapshot = createTestSnapshot
-      snapshotInfo = createTestSnapshotInfo
+        snapshot = createTestSnapshot
+        snapshotInfo = createTestSnapshotInfo
 
-      _ <- rewardsService.calculateAndStoreRewardsInfo(snapshot, snapshotInfo)
-      calledWithSnapshot <- calledWithSnapshotRef.get
-      calledWithSnapshotInfo <- calledWithSnapshotInfoRef.get
-    } yield
-      expect.same(calledWithSnapshot, Some(snapshot)) &&
-        expect.same(calledWithSnapshotInfo, Some(snapshotInfo))
+        _ <- rewardsService.calculateAndStoreRewardsInfo(snapshot, snapshotInfo)
+        calledWithSnapshot <- calledWithSnapshotRef.get
+        calledWithSnapshotInfo <- calledWithSnapshotInfoRef.get
+      } yield
+        expect.same(calledWithSnapshot, Some(snapshot)) &&
+          expect.same(calledWithSnapshotInfo, Some(snapshotInfo))
+    }
   }
 
   test("calculateAndStoreRewardsInfo calls storage only when calculator returns Some") {
-    for {
-      storageRef <- Ref[IO].of(Option.empty[RewardsInfo])
-      storeCallCountRef <- Ref[IO].of(0)
+    runWithHasher { implicit hasher =>
+      for {
+        storageRef <- Ref[IO].of(Option.empty[RewardsInfo])
+        storeCallCountRef <- Ref[IO].of(0)
 
-      storage = new RewardsInfoStorage[IO] {
-        override def getRewardsInfo: IO[Option[RewardsInfo]] = storageRef.get
-        override def storeRewardsInfo(rewardsInfo: RewardsInfo): IO[Unit] =
-          storeCallCountRef.update(_ + 1) >>
-            storageRef.set(Some(rewardsInfo))
-      }
+        storage = new RewardsInfoStorage[IO] {
+          override def getRewardsInfo: IO[Option[RewardsInfo]] = storageRef.get
+          override def storeRewardsInfo(rewardsInfo: RewardsInfo): IO[Unit] =
+            storeCallCountRef.update(_ + 1) >>
+              storageRef.set(Some(rewardsInfo))
+        }
 
-      // Test with calculator that returns Some
-      calculatorWithSome = createMockRewardsInfoCalculator(shouldReturnRewardsInfo = true)
-      rewardsServiceWithSome = RewardsService(
-        classicRewards = createMockRewards,
-        delegatedRewards = createMockDelegatedRewardsDistributor,
-        rewardsInfoCalculator = calculatorWithSome,
-        rewardsInfoStorage = storage
-      )
+        // Test with calculator that returns Some
+        calculatorWithSome = createMockRewardsInfoCalculator(shouldReturnRewardsInfo = true)
+        rewardsServiceWithSome = RewardsService(
+          classicRewards = createMockRewards,
+          delegatedRewards = createMockDelegatedRewardsDistributor,
+          rewardsInfoCalculator = calculatorWithSome,
+          rewardsInfoStorage = storage
+        )
 
-      snapshot = createTestSnapshot
-      snapshotInfo = createTestSnapshotInfo
+        snapshot = createTestSnapshot
+        snapshotInfo = createTestSnapshotInfo
 
-      _ <- rewardsServiceWithSome.calculateAndStoreRewardsInfo(snapshot, snapshotInfo)
-      callCountAfterSome <- storeCallCountRef.get
+        _ <- rewardsServiceWithSome.calculateAndStoreRewardsInfo(snapshot, snapshotInfo)
+        callCountAfterSome <- storeCallCountRef.get
 
-      // Reset and test with calculator that returns None
-      _ <- storageRef.set(None)
-      _ <- storeCallCountRef.set(0)
+        // Reset and test with calculator that returns None
+        _ <- storageRef.set(None)
+        _ <- storeCallCountRef.set(0)
 
-      calculatorWithNone = createMockRewardsInfoCalculator(shouldReturnRewardsInfo = false)
-      rewardsServiceWithNone = RewardsService(
-        classicRewards = createMockRewards,
-        delegatedRewards = createMockDelegatedRewardsDistributor,
-        rewardsInfoCalculator = calculatorWithNone,
-        rewardsInfoStorage = storage
-      )
+        calculatorWithNone = createMockRewardsInfoCalculator(shouldReturnRewardsInfo = false)
+        rewardsServiceWithNone = RewardsService(
+          classicRewards = createMockRewards,
+          delegatedRewards = createMockDelegatedRewardsDistributor,
+          rewardsInfoCalculator = calculatorWithNone,
+          rewardsInfoStorage = storage
+        )
 
-      _ <- rewardsServiceWithNone.calculateAndStoreRewardsInfo(snapshot, snapshotInfo)
-      callCountAfterNone <- storeCallCountRef.get
-    } yield
-      expect.same(callCountAfterSome, 1) &&
-        expect.same(callCountAfterNone, 0)
+        _ <- rewardsServiceWithNone.calculateAndStoreRewardsInfo(snapshot, snapshotInfo)
+        callCountAfterNone <- storeCallCountRef.get
+      } yield
+        expect.same(callCountAfterSome, 1) &&
+          expect.same(callCountAfterNone, 0)
+    }
   }
 
   test("calculateAndStoreRewardsInfo handles storage errors gracefully") {
-    for {
-      storageRef <- Ref[IO].of(Option.empty[RewardsInfo])
-      storage = new RewardsInfoStorage[IO] {
-        override def getRewardsInfo: IO[Option[RewardsInfo]] = storageRef.get
-        override def storeRewardsInfo(rewardsInfo: RewardsInfo): IO[Unit] =
-          IO.raiseError(new RuntimeException("Storage error"))
-      }
+    runWithHasher { implicit hasher =>
+      for {
+        storageRef <- Ref[IO].of(Option.empty[RewardsInfo])
+        storage = new RewardsInfoStorage[IO] {
+          override def getRewardsInfo: IO[Option[RewardsInfo]] = storageRef.get
+          override def storeRewardsInfo(rewardsInfo: RewardsInfo): IO[Unit] =
+            IO.raiseError(new RuntimeException("Storage error"))
+        }
 
-      calculator = createMockRewardsInfoCalculator(shouldReturnRewardsInfo = true)
-      rewardsService = RewardsService(
-        classicRewards = createMockRewards,
-        delegatedRewards = createMockDelegatedRewardsDistributor,
-        rewardsInfoCalculator = calculator,
-        rewardsInfoStorage = storage
-      )
+        calculator = createMockRewardsInfoCalculator(shouldReturnRewardsInfo = true)
+        rewardsService = RewardsService(
+          classicRewards = createMockRewards,
+          delegatedRewards = createMockDelegatedRewardsDistributor,
+          rewardsInfoCalculator = calculator,
+          rewardsInfoStorage = storage
+        )
 
-      snapshot = createTestSnapshot
-      snapshotInfo = createTestSnapshotInfo
+        snapshot = createTestSnapshot
+        snapshotInfo = createTestSnapshotInfo
 
-      result <- rewardsService.calculateAndStoreRewardsInfo(snapshot, snapshotInfo).attempt
-    } yield
-      expect.same(result.isLeft, true) &&
-        expect.same(result.swap.getOrElse(throw new RuntimeException("Expected Left")).getMessage, "Storage error")
+        result <- rewardsService.calculateAndStoreRewardsInfo(snapshot, snapshotInfo).attempt
+      } yield
+        expect.same(result.isLeft, true) &&
+          expect.same(result.swap.getOrElse(throw new RuntimeException("Expected Left")).getMessage, "Storage error")
+    }
   }
 
   test("calculateAndStoreRewardsInfo handles calculator errors gracefully") {
-    for {
-      storage <- RewardsInfoStorage.make[IO]
+    runWithHasher { implicit hasher =>
+      for {
+        storage <- RewardsInfoStorage.make[IO]
 
-      calculator = new RewardsInfoCalculator[IO] {
-        override def calculateRewardsInfo(
-          lastSnapshot: GlobalIncrementalSnapshot,
-          lastSnapshotInfo: GlobalSnapshotInfo
-        ): IO[Option[RewardsInfo]] =
-          IO.raiseError(new RuntimeException("Calculator error"))
-      }
+        calculator = new RewardsInfoCalculator[IO] {
+          override def calculateRewardsInfo(
+            lastSnapshot: GlobalIncrementalSnapshot,
+            lastSnapshotInfo: GlobalSnapshotInfo
+          )(implicit hasher: Hasher[IO]): IO[Option[RewardsInfo]] =
+            IO.raiseError(new RuntimeException("Calculator error"))
+        }
 
-      rewardsService = RewardsService(
-        classicRewards = createMockRewards,
-        delegatedRewards = createMockDelegatedRewardsDistributor,
-        rewardsInfoCalculator = calculator,
-        rewardsInfoStorage = storage
-      )
+        rewardsService = RewardsService(
+          classicRewards = createMockRewards,
+          delegatedRewards = createMockDelegatedRewardsDistributor,
+          rewardsInfoCalculator = calculator,
+          rewardsInfoStorage = storage
+        )
 
-      snapshot = createTestSnapshot
-      snapshotInfo = createTestSnapshotInfo
+        snapshot = createTestSnapshot
+        snapshotInfo = createTestSnapshotInfo
 
-      result <- rewardsService.calculateAndStoreRewardsInfo(snapshot, snapshotInfo).attempt
-    } yield
-      expect.same(result.isLeft, true) &&
-        expect.same(result.swap.getOrElse(throw new RuntimeException("Expected Left")).getMessage, "Calculator error")
+        result <- rewardsService.calculateAndStoreRewardsInfo(snapshot, snapshotInfo).attempt
+      } yield
+        expect.same(result.isLeft, true) &&
+          expect.same(result.swap.getOrElse(throw new RuntimeException("Expected Left")).getMessage, "Calculator error")
+    }
   }
 
   test("calculateAndStoreRewardsInfo returns testRewardsInfo on success") {
-    for {
-      storage <- RewardsInfoStorage.make[IO]
+    runWithHasher { implicit hasher =>
+      for {
+        storage <- RewardsInfoStorage.make[IO]
 
-      calculator = createMockRewardsInfoCalculator(shouldReturnRewardsInfo = true)
-      rewardsService = RewardsService(
-        classicRewards = createMockRewards,
-        delegatedRewards = createMockDelegatedRewardsDistributor,
-        rewardsInfoCalculator = calculator,
-        rewardsInfoStorage = storage
-      )
+        calculator = createMockRewardsInfoCalculator(shouldReturnRewardsInfo = true)
+        rewardsService = RewardsService(
+          classicRewards = createMockRewards,
+          delegatedRewards = createMockDelegatedRewardsDistributor,
+          rewardsInfoCalculator = calculator,
+          rewardsInfoStorage = storage
+        )
 
-      snapshot = createTestSnapshot
-      snapshotInfo = createTestSnapshotInfo
+        snapshot = createTestSnapshot
+        snapshotInfo = createTestSnapshotInfo
 
-      result <- rewardsService.calculateAndStoreRewardsInfo(snapshot, snapshotInfo)
-    } yield expect.same(result, Some(testRewardsInfo))
+        result <- rewardsService.calculateAndStoreRewardsInfo(snapshot, snapshotInfo)
+      } yield expect.same(result, Some(testRewardsInfo))
+    }
   }
 }

@@ -535,6 +535,39 @@ object Mocks {
   import eu.timepit.refined.types.all.{NonNegLong, PosLong}
   import org.typelevel.log4cats.slf4j.Slf4jLogger
 
+  /** §G5 test stub — synthesize a `GlobalStateReader[F]` that serves only `ActiveDelegatedStakes` point reads from the in-memory
+    * `lastSnapshotContext.activeDelegatedStakes`. Other partitions return None / empty. Production code wires a real MPT-backed reader;
+    * this stub keeps the mock `GlobalDelegatedRewardsDistributor` runnable without setting up an in-memory MPT store.
+    */
+  private[snapshot] def mkInMemoryStakeReader[F[_]: Async](
+    info: GlobalSnapshotInfo
+  ): io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[F] = {
+    import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+    import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
+    import io.constellationnetwork.schema.mpt.PartitionNamespace.AddressNamespace
+    import io.constellationnetwork.security.hex.Hex
+    import io.constellationnetwork.serde.ImmutableCodec
+
+    val stakes = info.activeDelegatedStakes.getOrElse(SortedMap.empty[Address, SortedSet[DelegatedStakeRecord]])
+
+    new GlobalStateReader[F] {
+      def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]] =
+        if (key.fieldId == GlobalStateFieldId.ActiveDelegatedStakes) {
+          key.userNamespace match {
+            case AddressNamespace(addr) =>
+              Async[F].pure(stakes.get(addr).map(_.asInstanceOf[V]))
+            case _ => Async[F].pure(None)
+          }
+        } else Async[F].pure(None)
+
+      def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]] =
+        keys.traverse(k => get[V](k).map(_.map(k -> _))).map(_.flatten.toMap)
+
+      def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] =
+        Async[F].pure(Map.empty)
+    }
+  }
+
   object GlobalDelegatedRewardsDistributor {
 
     def make[F[_]: Async: Hasher](
@@ -998,8 +1031,14 @@ object Mocks {
             partitionedRecords
           )
 
+          // §G5: synthesize a `GlobalStateReader[F]` from `lastSnapshotContext.activeDelegatedStakes` so
+          // `getUpdatedWithdrawalDelegatedStakes`'s per-address point reads still see the same map the
+          // legacy GSI path used. Without this stub, withdrawal-after-creation tests fail because the
+          // reader returns None for every address. Uses a one-off in-memory reader scoped to this mock —
+          // production code wires a real MPT-backed `GlobalStateReader` here.
+          stubReader = mkInMemoryStakeReader[F](lastSnapshotContext)
           updatedWithdrawDelegatedStakes <- DelegatedRewardsDistributor.getUpdatedWithdrawalDelegatedStakes(
-            lastSnapshotContext,
+            stubReader,
             delegatedStakeDiffs,
             partitionedRecords
           )

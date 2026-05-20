@@ -6,9 +6,16 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types.EmissionConfigEntry
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.ConsensusTrigger
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
+  DelegatedStakeStateManager,
+  SpendTransactionBalanceManager,
+  UpdateNodeParametersStateReader
+}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.{
   DelegatedRewardsDistributor,
   DelegatedRewardsResult,
@@ -22,6 +29,7 @@ import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.schema.{SnapshotOrdinal, _}
+import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 
@@ -53,6 +61,27 @@ object RewardsInfoCalculatorSuite extends SimpleIOSuite {
     epochsPerMonth = NonNegLong(8L)
   )
 
+  // §G5: tests use an `empty` reader since the snapshot fixtures here pass empty `info.activeDelegatedStakes` /
+  // `info.balances` / `info.updateNodeParameters` — the calculator's MPT-backed materialize paths return
+  // empty maps under an empty reader, which is the same input the prior GSI-based variant would have observed.
+  private val emptyReader: GlobalStateReader[IO] = GlobalStateReader.empty[IO]
+  private val emptyStakeManager: DelegatedStakeStateManager[IO] = DelegatedStakeStateManager.make[IO](emptyReader)
+  private val emptyUnpReader: UpdateNodeParametersStateReader[IO] = UpdateNodeParametersStateReader.make[IO](emptyReader)
+  private val emptyBalanceManager: SpendTransactionBalanceManager[IO] = SpendTransactionBalanceManager.make[IO](emptyReader)
+
+  // §G5: the calculator's interface requires `Hasher[IO]` but the empty reader doesn't actually invoke it
+  // (the `hypergraphFieldPrefixAcrossContracts` call hashes namespace bytes only, which still works under
+  // the JSON hasher's stub). Provide a single hasher constructed once via `IO.delay` then memoized so the
+  // test stays a `SimpleIOSuite` (no MutableIOSuite shared-resource conversion needed).
+  private def runWithHasher[A](f: Hasher[IO] => IO[A]): IO[A] =
+    JsonSerializer.forAsync[IO].flatMap { js =>
+      implicit val jsImpl: JsonSerializer[IO] = js
+      f(Hasher.forJson[IO])
+    }
+
+  private def mkCalculator(d: DelegatedRewardsDistributor[IO]): RewardsInfoCalculator[IO] =
+    RewardsInfoCalculator.make[IO](d, emptyStakeManager, emptyUnpReader, emptyBalanceManager)
+
   def createMockDelegatedRewardsDistributor: DelegatedRewardsDistributor[IO] =
     new DelegatedRewardsDistributor[IO] {
       override def getEmissionConfig(epochProgress: EpochProgress): IO[EmissionConfigEntry] =
@@ -81,7 +110,7 @@ object RewardsInfoCalculatorSuite extends SimpleIOSuite {
     }
 
   test("calculateRewardsInfo returns None when delegate rewards are empty") {
-    val calculator = RewardsInfoCalculator.make[IO](createMockDelegatedRewardsDistributor)
+    val calculator = mkCalculator(createMockDelegatedRewardsDistributor)
 
     // Create a simple snapshot with empty delegate rewards
     val snapshot = GlobalIncrementalSnapshot(
@@ -149,13 +178,15 @@ object RewardsInfoCalculatorSuite extends SimpleIOSuite {
       historicalStakeSnapshots = SortedMap.empty
     )
 
-    for {
-      result <- calculator.calculateRewardsInfo(snapshot, snapshotInfo)
-    } yield expect.same(result, None)
+    runWithHasher { implicit hasher =>
+      for {
+        result <- calculator.calculateRewardsInfo(snapshot, snapshotInfo)
+      } yield expect.same(result, None)
+    }
   }
 
   test("calculateRewardsInfo returns None when delegate rewards is None") {
-    val calculator = RewardsInfoCalculator.make[IO](createMockDelegatedRewardsDistributor)
+    val calculator = mkCalculator(createMockDelegatedRewardsDistributor)
 
     val snapshot = GlobalIncrementalSnapshot(
       ordinal = SnapshotOrdinal(1L),
@@ -222,13 +253,15 @@ object RewardsInfoCalculatorSuite extends SimpleIOSuite {
       historicalStakeSnapshots = SortedMap.empty
     )
 
-    for {
-      result <- calculator.calculateRewardsInfo(snapshot, snapshotInfo)
-    } yield expect.same(result, None)
+    runWithHasher { implicit hasher =>
+      for {
+        result <- calculator.calculateRewardsInfo(snapshot, snapshotInfo)
+      } yield expect.same(result, None)
+    }
   }
 
   test("calculateRewardsInfo calculates correct rewards info with valid data") {
-    val calculator = RewardsInfoCalculator.make[IO](createMockDelegatedRewardsDistributor)
+    val calculator = mkCalculator(createMockDelegatedRewardsDistributor)
 
     val snapshot = GlobalIncrementalSnapshot(
       ordinal = SnapshotOrdinal(1L),
@@ -300,14 +333,16 @@ object RewardsInfoCalculatorSuite extends SimpleIOSuite {
       historicalStakeSnapshots = SortedMap.empty
     )
 
-    for {
-      result <- calculator.calculateRewardsInfo(snapshot, snapshotInfo)
-    } yield
-      result match {
-        case Some(rewardsInfo) =>
-          expect.same(rewardsInfo.epochsPerYear, testEmissionConfig.epochsPerYear) &&
-          expect.same(rewardsInfo.totalRewardPerEpoch, Amount(PosLong(300L))) // 100 + 200 = 300
-        case None => failure("Expected Some(RewardsInfo) but got None")
-      }
+    runWithHasher { implicit hasher =>
+      for {
+        result <- calculator.calculateRewardsInfo(snapshot, snapshotInfo)
+      } yield
+        result match {
+          case Some(rewardsInfo) =>
+            expect.same(rewardsInfo.epochsPerYear, testEmissionConfig.epochsPerYear) &&
+            expect.same(rewardsInfo.totalRewardPerEpoch, Amount(PosLong(300L))) // 100 + 200 = 300
+          case None => failure("Expected Some(RewardsInfo) but got None")
+        }
+    }
   }
 }

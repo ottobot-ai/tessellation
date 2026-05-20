@@ -31,6 +31,31 @@ trait DelegatedStakeStateManager[F[_]] {
 
   def materializeActiveDelegatedStakeAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]]
   def materializeDelegatedStakeWithdrawalAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]]
+
+  /** §G5 — Full-structure materializer for the `ActiveDelegatedStakes` partition.
+    *
+    * Returns the same `SortedMap[Address, SortedSet[DelegatedStakeRecord]]` shape that `info.activeDelegatedStakes` carries on the GSI
+    * side. Used by reward calculation paths (`GlobalDelegatedRewardsDistributor`, `RewardsInfoCalculator`) that need per-delegator-address
+    * + per-record-fee detail. When the MPT and GSI are in sync, the bytes are byte-equivalent (each prefix entry decodes via
+    * `delegatedStakeRecordSetCodec` which is the same codec the writer uses, keyed by source address derived from
+    * `record.event.value.source`).
+    *
+    * Empty result is returned via `SortedMap.empty` when the prefix scan returns no entries.
+    */
+  def materializeActiveDelegatedStakesFromMpt(
+    implicit hasher: Hasher[F]
+  ): F[SortedMap[Address, SortedSet[DelegatedStakeRecord]]]
+
+  /** §G5 — Full-structure materializer for the `DelegatedStakesWithdrawals` partition.
+    *
+    * Symmetric sibling of `materializeActiveDelegatedStakesFromMpt`. Returns `SortedMap[Address,
+    * SortedSet[PendingDelegatedStakeWithdrawal]]` matching the GSI shape. Used by
+    * `DelegatedRewardsDistributor.getUpdatedWithdrawalDelegatedStakes` which needs per-address withdrawal records to resolve `stakeRef` →
+    * record on the MPT-primary path.
+    */
+  def materializeDelegatedStakeWithdrawalsFromMpt(
+    implicit hasher: Hasher[F]
+  ): F[SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]]]
 }
 
 object DelegatedStakeStateManager {
@@ -145,6 +170,28 @@ object DelegatedStakeStateManager {
         prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.DelegatedStakesWithdrawals)
         entries <- reader.getAllForPrefix[SortedSet[PendingDelegatedStakeWithdrawal]](prefix)
       } yield entries.values.toList.mapFilter(s => s.headOption.map(_.event.value.source)).toSet
+
+    def materializeActiveDelegatedStakesFromMpt(
+      implicit hasher: Hasher[F]
+    ): F[SortedMap[Address, SortedSet[DelegatedStakeRecord]]] =
+      for {
+        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveDelegatedStakes)
+        entries <- reader.getAllForPrefix[SortedSet[DelegatedStakeRecord]](prefix)
+      } yield
+        SortedMap.from(
+          entries.values.toList.mapFilter(set => set.headOption.map(_.event.value.source -> set)).filter(_._2.nonEmpty)
+        )
+
+    def materializeDelegatedStakeWithdrawalsFromMpt(
+      implicit hasher: Hasher[F]
+    ): F[SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]]] =
+      for {
+        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.DelegatedStakesWithdrawals)
+        entries <- reader.getAllForPrefix[SortedSet[PendingDelegatedStakeWithdrawal]](prefix)
+      } yield
+        SortedMap.from(
+          entries.values.toList.mapFilter(set => set.headOption.map(_.event.value.source -> set)).filter(_._2.nonEmpty)
+        )
 
   }
 }

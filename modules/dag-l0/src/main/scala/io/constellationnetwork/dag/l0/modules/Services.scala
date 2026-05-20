@@ -91,16 +91,40 @@ object Services {
         .pure[F]
         .toResource
 
+      // §G5: build the MPT-backed state readers used by the reward distributor + RewardsInfoCalculator. Wired ahead
+      // of `delegatorRewards` so its `make` can take them as constructor parameters. Uses the same branch-aware
+      // `pendingReader` (constructed below) so reward calc sees the chain's best-tip view — matches G1's
+      // `NodeStakeAggregator.cached` convention. Note: GSAM constructs its own siblings (with `branchAwareReader`
+      // bound to its in-flight accept's parent branch); these are read-path-only.
+      pendingReader: GlobalStateReader[F] = GlobalStateReader.pending[F](
+        sharedStorages.mptOverlay,
+        sharedStorages.bestTipFn
+      )
+      delegatedStakeStateManagerForRewards =
+        io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.DelegatedStakeStateManager.make[F](pendingReader)
+      updateNodeParametersStateReader =
+        io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.UpdateNodeParametersStateReader.make[F](pendingReader)
+      spendTransactionBalanceManagerForRewards =
+        io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.SpendTransactionBalanceManager.make[F](pendingReader)
+
       delegatorRewards <- HasherSelector[F].withCurrent { implicit hasher =>
         GlobalDelegatedRewardsDistributor
           .make[F](
             cfg.environment,
-            DefaultDelegatedRewardsConfigProvider.getConfig()
+            DefaultDelegatedRewardsConfigProvider.getConfig(),
+            delegatedStakeStateManagerForRewards,
+            updateNodeParametersStateReader,
+            pendingReader
           )
           .pure[F]
       }.toResource
 
-      rewardsInfoCalculator = RewardsInfoCalculator.make(delegatorRewards)
+      rewardsInfoCalculator = RewardsInfoCalculator.make(
+        delegatorRewards,
+        delegatedStakeStateManagerForRewards,
+        updateNodeParametersStateReader,
+        spendTransactionBalanceManagerForRewards
+      )
 
       rewardsInfoStorage <- RewardsInfoStorage.make.toResource
 
@@ -139,10 +163,9 @@ object Services {
       // finality (~5s healthy) and unboundedly under finality stalls. Routing reads through
       // the overlay at the chain's bestTip walks pending → falls through to base. Followers
       // construct `GlobalStateReader.finalized` instead — see follower modules' Services.
-      pendingReader: GlobalStateReader[F] = GlobalStateReader.pending[F](
-        sharedStorages.mptOverlay,
-        sharedStorages.bestTipFn
-      )
+      //
+      // §G5: `pendingReader` is now constructed above (before `delegatorRewards`) so the reward
+      // distributor can be wired with MPT-backed state managers.
 
       // stateChannelService must exist before consensus so that the Nakamoto
       // gossip daemon can route metagraph-binary gossip messages through the

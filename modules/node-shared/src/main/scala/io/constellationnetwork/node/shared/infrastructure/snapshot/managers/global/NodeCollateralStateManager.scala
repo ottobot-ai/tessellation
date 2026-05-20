@@ -70,6 +70,19 @@ trait NodeCollateralStateManager[F[_]] {
   def materializeNodeCollateralWithdrawalsFromMpt(
     implicit hasher: Hasher[F]
   ): F[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]]
+
+  /** §G5 — Full-structure materializer for the `ActiveNodeCollaterals` partition.
+    *
+    * Returns the same `SortedMap[Address, SortedSet[NodeCollateralRecord]]` shape that `info.activeNodeCollaterals` carries on the GSI
+    * side. Used by reward calculation paths that need per-record detail. Byte-equivalent to the GSI map when MPT/GSI are in sync: each
+    * prefix entry decodes via `nodeCollateralRecordSetCodec` (same codec the writer uses) and is keyed by the source address from
+    * `record.event.value.source`.
+    *
+    * Empty result is returned via `SortedMap.empty` when the prefix scan returns no entries.
+    */
+  def materializeActiveNodeCollateralsFromMpt(
+    implicit hasher: Hasher[F]
+  ): F[SortedMap[Address, SortedSet[NodeCollateralRecord]]]
 }
 
 object NodeCollateralStateManager {
@@ -228,6 +241,17 @@ object NodeCollateralStateManager {
         SortedMap.from(
           entries.values.toList
             .mapFilter(set => set.headOption.map(h => h.event.value.source -> set))
+        )
+
+    def materializeActiveNodeCollateralsFromMpt(
+      implicit hasher: Hasher[F]
+    ): F[SortedMap[Address, SortedSet[NodeCollateralRecord]]] =
+      for {
+        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveNodeCollaterals)
+        entries <- reader.getAllForPrefix[SortedSet[NodeCollateralRecord]](prefix)
+      } yield
+        SortedMap.from(
+          entries.values.toList.mapFilter(set => set.headOption.map(_.event.value.source -> set)).filter(_._2.nonEmpty)
         )
   }
 }

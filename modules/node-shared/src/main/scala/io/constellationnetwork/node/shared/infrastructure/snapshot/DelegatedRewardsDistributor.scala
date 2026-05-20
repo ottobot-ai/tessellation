@@ -11,12 +11,14 @@ import io.constellationnetwork.currency.dataApplication.DataCalculatedState
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger, TimeTrigger}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.node.{DelegatedStakeRewardParameters, RewardFraction, UpdateNodeParameters}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.transaction.{RewardTransaction, Transaction, TransactionAmount}
@@ -24,6 +26,7 @@ import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshot
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.delegatedStakeRecordSetCodec
 import io.constellationnetwork.syntax.sortedCollection.{sortedMapSyntax, sortedSetSyntax}
 
 import eu.timepit.refined.auto._
@@ -175,8 +178,17 @@ object DelegatedRewardsDistributor {
     } yield activeStakes
   }
 
+  /** §G5 — MPT-backed equivalent of the legacy GSI-walked variant.
+    *
+    * For each accepted withdrawal `(ev, ep)` at address `addr`, find the matching record in `activeDelegatedStakes(addr)` by
+    * stake-reference hash. Reads come from `reader.get` against the `ActiveDelegatedStakes` partition keyed by `addr` (per-address point
+    * read; same partition the writer populates via `acc.activeDelegatedStakes.iterator.map { case (addr, s) => ... }`).
+    *
+    * Byte-equivalent to the legacy `lastSnapshotContext.activeDelegatedStakes` path: each per-address `SortedSet[DelegatedStakeRecord]`
+    * decodes via `delegatedStakeRecordSetCodec` which is the same codec used by the writer.
+    */
   def getUpdatedWithdrawalDelegatedStakes[F[_]: Async: Hasher](
-    lastSnapshotContext: GlobalSnapshotInfo,
+    reader: GlobalStateReader[F],
     delegatedStakeDiffs: UpdateDelegatedStakeAcceptanceResult,
     partitionedRecords: PartitionedStakeUpdates
   ): F[SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]]] =
@@ -184,16 +196,19 @@ object DelegatedRewardsDistributor {
       case (addr, acceptedWithdrawls) =>
         acceptedWithdrawls.traverse {
           case (ev, ep) =>
-            lastSnapshotContext.activeDelegatedStakes
-              .flatTraverse(_.get(addr).flatTraverse {
-                _.findM { s =>
-                  DelegatedStakeReference.of(s.event).map(_.hash === ev.stakeRef)
-                }.map(
-                  _.map(rec =>
-                    PendingDelegatedStakeWithdrawal(rec.event, rec.rewards, rec.createdAt, ep, rec.currentTokenLockRef, rec.currentAmount)
+            reader
+              .get[SortedSet[DelegatedStakeRecord]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveDelegatedStakes, addr))
+              .flatMap { maybeStakes =>
+                maybeStakes.flatTraverse {
+                  _.findM { s =>
+                    DelegatedStakeReference.of(s.event).map(_.hash === ev.stakeRef)
+                  }.map(
+                    _.map(rec =>
+                      PendingDelegatedStakeWithdrawal(rec.event, rec.rewards, rec.createdAt, ep, rec.currentTokenLockRef, rec.currentAmount)
+                    )
                   )
-                )
-              })
+                }
+              }
               .flatMap(Async[F].fromOption(_, new RuntimeException("Unexpected None when processing user delegations")))
         }.map { records =>
           addr -> records.toSortedSet

@@ -398,7 +398,17 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           dbLogger
         )
       rewardsInfoStorage <- RewardsInfoStorage.make
-      rewardsInfoCalculator = RewardsInfoCalculator.make(delegatorRewards)
+      // §G5: wire the same MPT-backed state managers used by the production code path. The test's
+      // `mptStore` is empty initially, so the materializers return empty maps — identical to the
+      // GSI-driven prior behaviour where `info.activeDelegatedStakes` defaulted to `SortedMap.empty`.
+      g5Reader = io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[IO](mptStore)
+      g5StakeManager = io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.DelegatedStakeStateManager
+        .make[IO](g5Reader)
+      g5UnpReader = io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.UpdateNodeParametersStateReader
+        .make[IO](g5Reader)
+      g5BalanceManager = io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.SpendTransactionBalanceManager
+        .make[IO](g5Reader)
+      rewardsInfoCalculator = RewardsInfoCalculator.make(delegatorRewards, g5StakeManager, g5UnpReader, g5BalanceManager)
       rewardsService = RewardsService[IO](classicRewards, delegatorRewards, rewardsInfoCalculator, rewardsInfoStorage)
       globalSnapshotConsensusFunction = GlobalSnapshotConsensusFunctions
         .make[IO](

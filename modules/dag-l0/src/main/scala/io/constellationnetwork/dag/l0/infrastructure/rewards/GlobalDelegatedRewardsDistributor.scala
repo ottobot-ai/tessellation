@@ -13,8 +13,13 @@ import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.node.shared.config.DefaultDelegatedRewardsConfigProvider
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger, TimeTrigger}
 import io.constellationnetwork.node.shared.infrastructure.snapshot._
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
+  DelegatedStakeStateManager,
+  UpdateNodeParametersStateReader
+}
 import io.constellationnetwork.schema.AmountOps._
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
@@ -39,9 +44,19 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object GlobalDelegatedRewardsDistributor {
 
+  /** §G5 — MPT-primary reward distribution. The state-manager parameters provide branch-aware MPT reads for `activeDelegatedStakes`
+    * (per-record) and `updateNodeParameters` (per-Id), replacing the legacy GSI map closures (`info.activeDelegatedStakes` /
+    * `info.updateNodeParameters`). `reader` is used by `DelegatedRewardsDistributor.getUpdatedWithdrawalDelegatedStakes` for per-address
+    * point reads when resolving withdrawal stake references. The caching strategy is per-snapshot-ordinal: callers should thread a
+    * `pendingReader` whose branch view is bound to the chain best-tip, so a single accept() cycle sees a consistent prior-state view across
+    * all reads (matches G1 pattern).
+    */
   def make[F[_]: Async: Hasher](
     environment: AppEnvironment,
-    delegatedRewardsConfig: DelegatedRewardsConfig
+    delegatedRewardsConfig: DelegatedRewardsConfig,
+    delegatedStakeStateManager: DelegatedStakeStateManager[F],
+    updateNodeParametersStateReader: UpdateNodeParametersStateReader[F],
+    reader: GlobalStateReader[F]
   ): DelegatedRewardsDistributor[F] = new DelegatedRewardsDistributor[F] {
 
     // Define a high precision MathContext for consistent calculations
@@ -109,8 +124,11 @@ object GlobalDelegatedRewardsDistributor {
             emitFromFunction <- calculateVariableInflation(epochProgress, lastSnapshotContext)
             pctConfig <- getDistributionProgram(epochProgress)
             epochSPerYear <- getEmissionConfig(epochProgress).map(_.epochsPerYear.value)
+            // §G5: read `activeDelegatedStakes` from the MPT (per-record full structure) instead of the
+            // GSI map closure. Byte-equivalent when MPT and GSI are in sync (which they are inside accept()).
+            activeDelegatedStakes <- delegatedStakeStateManager.materializeActiveDelegatedStakesFromMpt
             (reservedRewards, facilitatorRewardPool, delegatorRewardPool) <- calculateEmissionDistribution(
-              lastSnapshotContext.activeDelegatedStakes.getOrElse(SortedMap.empty),
+              activeDelegatedStakes,
               emitFromFunction,
               pctConfig,
               epochSPerYear
@@ -382,54 +400,58 @@ object GlobalDelegatedRewardsDistributor {
           .map(_.flatten)
       }
 
-      val activeDelegatedStakes =
-        lastSnapshotContext.activeDelegatedStakes.getOrElse(SortedMap.empty[Address, SortedSet[DelegatedStakeRecord]])
+      // §G5: read `activeDelegatedStakes` from the MPT instead of `lastSnapshotContext.activeDelegatedStakes`.
+      // The `lastSnapshotContext` parameter is retained here only for downstream callers (none in this
+      // function body); the field-level GSI read is replaced with the full-structure materializer.
+      val _ = lastSnapshotContext
 
-      if (activeDelegatedStakes.isEmpty || (delegatorRewardPool === BigDecimal(0) && facilitatorRewardPool === BigDecimal(0))) {
-        staticRewardsF.map(staticRewards => SortedSet.from(staticRewards))
-      } else {
-        for {
-          staticRewards <- staticRewardsF
-          modifiedStakes = DelegatedRewardsDistributor.identifyModifiedStakes(activeDelegatedStakes, acceptedCreates)
-          filteredActiveDelegatedStakes = DelegatedRewardsDistributor.filterOutModifiedStakes(activeDelegatedStakes, modifiedStakes)
-          nodeStakes = filteredActiveDelegatedStakes.values.flatten
-            .groupBy(_.event.value.nodeId.toId)
-            .view
-            .mapValues(stakes => stakes.map(s => BigDecimal(getStakedAmount(s), mc)).sum)
-            .toMap
+      delegatedStakeStateManager.materializeActiveDelegatedStakesFromMpt.flatMap { activeDelegatedStakes =>
+        if (activeDelegatedStakes.isEmpty || (delegatorRewardPool === BigDecimal(0) && facilitatorRewardPool === BigDecimal(0))) {
+          staticRewardsF.map(staticRewards => SortedSet.from(staticRewards))
+        } else {
+          for {
+            staticRewards <- staticRewardsF
+            modifiedStakes = DelegatedRewardsDistributor.identifyModifiedStakes(activeDelegatedStakes, acceptedCreates)
+            filteredActiveDelegatedStakes = DelegatedRewardsDistributor.filterOutModifiedStakes(activeDelegatedStakes, modifiedStakes)
+            nodeStakes = filteredActiveDelegatedStakes.values.flatten
+              .groupBy(_.event.value.nodeId.toId)
+              .view
+              .mapValues(stakes => stakes.map(s => BigDecimal(getStakedAmount(s), mc)).sum)
+              .toMap
 
-          facilitatorStakes = facilitators.map {
-            case (_, id) =>
-              (id, nodeStakes.getOrElse(id.toId, BigDecimal(0, mc)))
-          }
+            facilitatorStakes = facilitators.map {
+              case (_, id) =>
+                (id, nodeStakes.getOrElse(id.toId, BigDecimal(0, mc)))
+            }
 
-          totalFacilitatorStake = facilitatorStakes.map(_._2).sum
+            totalFacilitatorStake = facilitatorStakes.map(_._2).sum
 
-          dynamicRewards <- facilitatorStakes.flatMap {
-            case (nodeId, stakeAmount) =>
-              if (stakeAmount <= 0) None
-              else {
-                nodeParametersMap.get(nodeId.toId).flatMap {
-                  case (params, _) =>
-                    // RewardFraction is stored as a value from 0 to 100,000,000 representing 0% to 100%
-                    val operatorCommission = BigDecimal(params.value.delegatedStakeRewardParameters.rewardFraction, mc) /
-                      BigDecimal(100_000_000, mc)
+            dynamicRewards <- facilitatorStakes.flatMap {
+              case (nodeId, stakeAmount) =>
+                if (stakeAmount <= 0) None
+                else {
+                  nodeParametersMap.get(nodeId.toId).flatMap {
+                    case (params, _) =>
+                      // RewardFraction is stored as a value from 0 to 100,000,000 representing 0% to 100%
+                      val operatorCommission = BigDecimal(params.value.delegatedStakeRewardParameters.rewardFraction, mc) /
+                        BigDecimal(100_000_000, mc)
 
-                    val stakeRatio = stakeAmount / totalFacilitatorStake
-                    val dynamicRewardBD = delegatorRewardPool * stakeRatio * operatorCommission
-                    val roundedDynamicReward = dynamicRewardBD.roundedHalfUp(0)
-                    if (roundedDynamicReward <= 0) None
-                    else
-                      roundedDynamicReward
-                        .toTransactionAmount[F]
-                        .map(RewardTransaction(params.value.source, _))
-                        .some
+                      val stakeRatio = stakeAmount / totalFacilitatorStake
+                      val dynamicRewardBD = delegatorRewardPool * stakeRatio * operatorCommission
+                      val roundedDynamicReward = dynamicRewardBD.roundedHalfUp(0)
+                      if (roundedDynamicReward <= 0) None
+                      else
+                        roundedDynamicReward
+                          .toTransactionAmount[F]
+                          .map(RewardTransaction(params.value.source, _))
+                          .some
+                  }
                 }
-              }
-          }.sequence
+            }.sequence
 
-          allRewards = SortedSet.from(staticRewards ++ dynamicRewards)
-        } yield allRewards
+            allRewards = SortedSet.from(staticRewards ++ dynamicRewards)
+          } yield allRewards
+        }
       }
     }
 
@@ -469,17 +491,23 @@ object GlobalDelegatedRewardsDistributor {
       delegatorRewardPool: BigDecimal
     ): F[DelegatedRewardsResult] =
       for {
+        // §G5: materialize prior-state `activeDelegatedStakes` + `updateNodeParameters` from the MPT
+        // instead of the GSI map closures. One materialization per `applyDistribution` invocation —
+        // shared across `calculateDelegatorRewards` and `calculateNodeOperatorRewards` to avoid
+        // duplicate prefix scans (which would also produce identical results inside one accept()).
+        activeDelegatedStakes <- delegatedStakeStateManager.materializeActiveDelegatedStakesFromMpt
+        nodeParametersMap <- updateNodeParametersStateReader.materializeUpdateNodeParametersFromMpt
         delegatorRewardsMap <-
           calculateDelegatorRewards(
-            lastSnapshotContext.activeDelegatedStakes.getOrElse(SortedMap.empty),
-            lastSnapshotContext.updateNodeParameters.getOrElse(SortedMap.empty),
+            activeDelegatedStakes,
+            nodeParametersMap,
             delegatorRewardPool,
             delegatedStakeDiffs.acceptedCreates
           ).map(_.toSortedMap)
 
         nodeOperatorRewards <-
           calculateNodeOperatorRewards(
-            lastSnapshotContext.updateNodeParameters.getOrElse(SortedMap.empty),
+            nodeParametersMap,
             facilitators,
             facilitatorRewardPool,
             delegatorRewardPool,
@@ -501,7 +529,7 @@ object GlobalDelegatedRewardsDistributor {
         )
 
         updatedWithdrawDelegatedStakes <- DelegatedRewardsDistributor.getUpdatedWithdrawalDelegatedStakes(
-          lastSnapshotContext,
+          reader,
           delegatedStakeDiffs,
           partitionedRecords
         )

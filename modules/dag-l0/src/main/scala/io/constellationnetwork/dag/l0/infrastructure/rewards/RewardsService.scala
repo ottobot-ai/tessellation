@@ -11,6 +11,7 @@ import io.constellationnetwork.node.shared.infrastructure.delegatedStake.{Reward
 import io.constellationnetwork.node.shared.infrastructure.snapshot.DelegatedRewardsDistributor
 import io.constellationnetwork.schema.delegatedStake.RewardsInfo
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, GlobalSnapshotStateProof}
+import io.constellationnetwork.security.Hasher
 
 case class RewardsService[F[_]: Async](
   classicRewards: Rewards[F, GlobalSnapshotStateProof, GlobalIncrementalSnapshot, GlobalSnapshotEvent],
@@ -18,7 +19,10 @@ case class RewardsService[F[_]: Async](
   rewardsInfoCalculator: RewardsInfoCalculator[F],
   rewardsInfoStorage: RewardsInfoStorage[F]
 ) {
-  def calculateAndStoreRewardsInfo(lastSnapshot: GlobalIncrementalSnapshot, lastSnapshotInfo: GlobalSnapshotInfo): F[Option[RewardsInfo]] =
+  def calculateAndStoreRewardsInfo(
+    lastSnapshot: GlobalIncrementalSnapshot,
+    lastSnapshotInfo: GlobalSnapshotInfo
+  )(implicit hasher: Hasher[F]): F[Option[RewardsInfo]] =
     for {
       maybeRewardsInfo <- rewardsInfoCalculator.calculateRewardsInfo(lastSnapshot, lastSnapshotInfo)
       _ <- maybeRewardsInfo.traverse(rewardsInfoStorage.storeRewardsInfo)
