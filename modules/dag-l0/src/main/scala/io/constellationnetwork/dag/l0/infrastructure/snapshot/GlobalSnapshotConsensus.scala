@@ -441,7 +441,10 @@ object GlobalSnapshotConsensus {
       // R = 2550 = 10·k₁ (matches Cardano R/k ratio). Rotation is keyed on **ordinal**, not slot —
       // slots are LDD-paced and lumpy; ordinals are 1:1 with snapshots and give a stable R that
       // satisfies the Praos R ≥ 3·k₁ stability bound. See `docs/nakamoto/attestation-and-finality.md` §1.
-      etaRotationSnapshots = sys.env.get("NAKAMOTO_ETA_ROTATION_SNAPSHOTS").flatMap(_.toLongOption).getOrElse(2550L)
+      // Path 1 (heap-leak workstream): moved from `sys.env.get("NAKAMOTO_ETA_ROTATION_SNAPSHOTS")` to
+      // HOCON `nakamoto.eta-rotation-snapshots` (which still honors `${?NAKAMOTO_ETA_ROTATION_SNAPSHOTS}`
+      // substitution so ops scripts keep working).
+      etaRotationSnapshots = sharedCfg.nakamoto.etaRotationSnapshots.value
 
       // Start the Nakamoto SnapshotLeaderLoop + sidecar bridge.
       //
@@ -502,7 +505,9 @@ object GlobalSnapshotConsensus {
             io.constellationnetwork.node.shared.domain.nakamoto.StakeRegistry
               .stakeWeightedMpt[F](
                 stakeAggregator,
-                (period: io.constellationnetwork.schema.nakamoto.EtaPeriod) => historicalStakeReader.lookup(period)
+                // Path 1 (heap-leak workstream): the partition value is now `HistoricalStakeSnapshot`
+                // (stakes + eta). For `relativeStakeAt`'s N-2 lookback we project to the stake half.
+                (period: io.constellationnetwork.schema.nakamoto.EtaPeriod) => historicalStakeReader.lookup(period).map(_.map(_.stakes))
               )
               .toResource
           }
@@ -620,16 +625,16 @@ object GlobalSnapshotConsensus {
               case None     => cats.Applicative[F].pure(None: Option[io.constellationnetwork.schema.nakamoto.ChainTip])
             }
           chainSelection = io.constellationnetwork.node.shared.domain.nakamoto.ChainSelection.make[F](tipTracker, fetchParent)
-          // Heap-leak Fix B — `NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED` env override (default = k₁ =
-          // `NakamotoChainStore.DefaultKeepDepthBehindFinalized` = 255). Bounds in-memory canonical-
-          // chain retention to a sliding window behind the finalized tip; older lookups fall through
-          // to disk-backed `SnapshotStorage`. Production deployments where `etaRotationSnapshots` is
-          // larger than this default should set the env var to `>= 2 * etaRotationSnapshots` so
-          // `vrfOutputsForPeriod` walks don't lose VRF outputs older than the keep-window.
-          keepDepthBehindFinalized = sys.env
-            .get("NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED")
-            .flatMap(_.toLongOption)
-            .getOrElse(io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.DefaultKeepDepthBehindFinalized)
+          // Heap-leak Fix B — `nakamoto.keep-depth-behind-finalized` (default = k₁ = 255). Bounds
+          // in-memory canonical-chain retention to a sliding window behind the finalized tip; older
+          // lookups fall through to disk-backed `SnapshotStorage` via
+          // `NakamotoChainStore.getWithOrdinalFallback`. Path 1 of the workstream: with the disk
+          // fallback wired through `vrfOutputsForPeriod`, this is a perf knob (in-memory speed vs
+          // bounded heap), not a correctness gate, even when `etaRotationSnapshots > keepDepth`.
+          // Migrated from `sys.env.get("NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED")` to HOCON; the
+          // application.conf entry still honors `${?NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED}` so ops
+          // scripts keep working.
+          keepDepthBehindFinalized = sharedCfg.nakamoto.keepDepthBehindFinalized.value
           chainStore <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore
             .make[F](
               globalSnapshotStorage,

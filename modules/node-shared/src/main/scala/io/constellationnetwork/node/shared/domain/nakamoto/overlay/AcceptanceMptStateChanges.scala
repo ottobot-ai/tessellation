@@ -15,7 +15,7 @@ import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, Pend
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt._
-import io.constellationnetwork.schema.nakamoto.StakeDistribution
+import io.constellationnetwork.schema.nakamoto.HistoricalStakeSnapshot
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.priceOracle.PriceRecord
@@ -35,7 +35,7 @@ import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmu
 import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{immutableCodec => metagraphSyncImmutable}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.PriceOracleCodecs.priceRecordImmutableCodec
-import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{immutableCodec => stakeDistributionImmutable}
+import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{historicalImmutableCodec => historicalStakeSnapshotImmutable}
 import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{immutableCodec => tokenLockRefImmutable}
 import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.{immutableCodec => txRefImmutable}
 
@@ -67,8 +67,9 @@ object AcceptanceMptStateChanges {
 
     // `stateProofSelector` is consumed by `CurrencyIncrementalSnapshot.fromCurrencySnapshot` below
     // (transitively) — keeping the binding makes that dependency explicit at the helper boundary.
-    // `stakeDistributionImmutable` resolves `mpt.insert[StakeDistribution]` (§3 NIPoPoW S0).
-    val _ = (stateProofSelector, stakeDistributionImmutable)
+    // `historicalStakeSnapshotImmutable` resolves `mpt.insert[HistoricalStakeSnapshot]` (§3 NIPoPoW S0;
+    // Path 1 heap-leak workstream extended the partition value to (stakes, eta)).
+    val _ = (stateProofSelector, historicalStakeSnapshotImmutable)
 
     // Lifted to F because the §3 NIPoPoW historical-stake-snapshot keys hash the eta-period via
     // `Hasher[F]` inside `historicalStakeSnapshotsKey[F]`. All other partitions are F-free.
@@ -177,10 +178,11 @@ object AcceptanceMptStateChanges {
         .map(_.toMap)
 
     // §3 NIPoPoW S0 historical-stake-snapshot upserts. Non-empty only at boundary ordinals; the value is
-    // the scodec-encoded `StakeDistribution` keyed by `historicalStakeSnapshotsKey[F](period)`.
-    val historicalStakeEntriesF: F[Map[GlobalStateKey, StakeDistribution]] =
+    // the scodec-encoded `HistoricalStakeSnapshot` (combined stake + eta record) keyed by
+    // `historicalStakeSnapshotsKey[F](period)`.
+    val historicalStakeEntriesF: F[Map[GlobalStateKey, HistoricalStakeSnapshot]] =
       acc.historicalStakeSnapshots.toList.parTraverse {
-        case (period, dist) => GlobalStateKey.historicalStakeSnapshotsKey[F](period).map(_ -> dist)
+        case (period, entry) => GlobalStateKey.historicalStakeSnapshotsKey[F](period).map(_ -> entry)
       }.map(_.toMap)
 
     for {
@@ -210,7 +212,7 @@ object AcceptanceMptStateChanges {
       historicalStakeEntries <- historicalStakeEntriesF
       _ <- mpt.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
       _ <- mpt.insert[PriceRecord](priceStateEntries)
-      _ <- mpt.insert[StakeDistribution](historicalStakeEntries)
+      _ <- mpt.insert[HistoricalStakeSnapshot](historicalStakeEntries)
 
       _ <- applySystemIndexDeltaViaMpt[F, AllowSpendExpiryKey](
         mpt,
