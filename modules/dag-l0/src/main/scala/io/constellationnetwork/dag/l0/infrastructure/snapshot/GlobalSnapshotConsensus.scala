@@ -620,8 +620,24 @@ object GlobalSnapshotConsensus {
               case None     => cats.Applicative[F].pure(None: Option[io.constellationnetwork.schema.nakamoto.ChainTip])
             }
           chainSelection = io.constellationnetwork.node.shared.domain.nakamoto.ChainSelection.make[F](tipTracker, fetchParent)
+          // Heap-leak Fix B — `NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED` env override (default = k₁ =
+          // `NakamotoChainStore.DefaultKeepDepthBehindFinalized` = 255). Bounds in-memory canonical-
+          // chain retention to a sliding window behind the finalized tip; older lookups fall through
+          // to disk-backed `SnapshotStorage`. Production deployments where `etaRotationSnapshots` is
+          // larger than this default should set the env var to `>= 2 * etaRotationSnapshots` so
+          // `vrfOutputsForPeriod` walks don't lose VRF outputs older than the keep-window.
+          keepDepthBehindFinalized = sys.env
+            .get("NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED")
+            .flatMap(_.toLongOption)
+            .getOrElse(io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.DefaultKeepDepthBehindFinalized)
           chainStore <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore
-            .make[F](globalSnapshotStorage, chainSelection, tipTracker, nakamotoFinalizedOrdinalRef)
+            .make[F](
+              globalSnapshotStorage,
+              chainSelection,
+              tipTracker,
+              nakamotoFinalizedOrdinalRef,
+              keepDepthBehindFinalized
+            )
             .toResource
           _ <- chainStoreRef.set(Some(chainStore)).toResource
           _ <- chainStoreForLookupRef.set(Some(chainStore)).toResource

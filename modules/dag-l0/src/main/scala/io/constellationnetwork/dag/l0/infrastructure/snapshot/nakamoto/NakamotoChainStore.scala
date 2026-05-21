@@ -156,6 +156,20 @@ object NakamotoChainStore {
     def unsafe_clearFinality: F[Boolean]
   }
 
+  /** Default for `keepDepthBehindFinalized` — equals the operational confirmation depth k₁ (the default for `NAKAMOTO_CONFIRMATION_DEPTH`,
+    * see `SnapshotLeaderLoop.ConfirmationDepthK`). Tests and call sites that don't override receive this value; the production call site
+    * (`GlobalSnapshotConsensus`) reads `NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED` to override.
+    *
+    * Heap-leak Fix B: bounds the in-memory `ChainState.byHash` canonical-chain retention to a sliding window of `keepDepthBehindFinalized`
+    * ordinals behind the finalized tip. Older canonical entries are evicted on every `finalize` call and reads fall through to disk-backed
+    * `SnapshotStorage` (which retains every persisted snapshot for the lifetime of the data directory).
+    *
+    * `byHash` was previously unbounded; the 12h soak at commit `fb3394078` showed it growing to ~7-8 GiB after ~5300 finalized ordinals
+    * (each `StoredSnapshot` carrying a full `GlobalSnapshotInfo` with embedded per-metagraph `lastCurrencySnapshots`). With this default,
+    * 255 ordinals × ~1.4 MiB ≈ 360 MiB worst case — well below the GC pressure threshold.
+    */
+  val DefaultKeepDepthBehindFinalized: Long = 255L
+
   def make[F[_]: Async: HasherSelector](
     underlyingStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     chainSelection: ChainSelection[F],
@@ -170,7 +184,32 @@ object NakamotoChainStore {
     // Writes above finalized are always allowed (that's the normal reorg path). Writes
     // at-or-below finalized with MATCHING hash are no-ops (legitimate re-delivery or
     // download-replay). Only differing-hash writes at-or-below finalized are refused.
-    nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal]
+    nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
+    // Heap-leak Fix B. Number of ordinals BEHIND the finalized tip to retain in
+    // `ChainState.byHash`. Defaults to [[DefaultKeepDepthBehindFinalized]] = 255 (k₁,
+    // matching the operational confirmation depth). The production call site overrides via
+    // `NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED`.
+    //
+    // Safety: chain-selection / fork-choice operates only on the top-k₁ chain entries
+    // (`ChainSelection.shouldSwitch` walks at most `ConfirmationDepthK` ordinals via
+    // `chainStore.tipFor`; `walkBackTo` falls through to disk via `SnapshotStorage.getHash`
+    // when the in-memory chain breaks). Older `chainStore.get(hash)` lookups (e.g. the
+    // depth-finality `chainStore.get(canonicalHash)` site) target ordinals at depth ≤ k₁
+    // from the tip, so retaining `k₁` ordinals back keeps the consensus hot path entirely
+    // in-memory.
+    //
+    // Caveats observed during implementation (worth feeding back to operators):
+    //   - `vrfOutputsForPeriod(period - 1, etaRotationSnapshots)` walks back up to one
+    //     full eta-rotation window. Default rotation is 2550 ords (10·k₁); with
+    //     `keepDepthBehindFinalized = 255`, walks below 255 ords behind the finalized
+    //     tip return a partial set. This is fine for e2e tests (rotation period 0 never
+    //     leaves genesis-eta on the typical ~500-ord runs) but production deployments
+    //     should set `NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED` to at least
+    //     `2 * NAKAMOTO_ETA_ROTATION_SNAPSHOTS` if `etaRotationSnapshots > 255`.
+    //   - `ChainSyncServer.serveSnapshots` answers `NotFound` for hashes not in `byHash`;
+    //     historical-query peers can fall back to `serveByRange` (disk-backed) or full
+    //     catch-up.
+    keepDepthBehindFinalized: Long = DefaultKeepDepthBehindFinalized
   ): F[NakamotoChainStoreAlgebra[F]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoChainStore")
 
@@ -457,15 +496,46 @@ object NakamotoChainStore {
                 current = state.byHash.get(current.get.parentHash)
               }
 
-              // Prune: remove snapshots with ordinal <= finalized that aren't on canonical chain.
-              // If the canonical walk didn't reach genesis (parent pruned in a prior round),
-              // conservatively keep ALL snapshots below the finalized ordinal — we can't
-              // verify what's canonical below the break point.
+              // Heap-leak Fix B — bound canonical-chain retention.
+              //
+              // `keepFloor` is the lowest ordinal we retain in `byHash`. Anything at
+              // `ordinal < keepFloor` (canonical or orphan) is dropped on this finalize.
+              // We clamp to 0 so genesis / early-chain (ord < keepDepth) is a no-op:
+              // `keepFloor = max(0, ordinal - keepDepth)`.
+              //
+              // Pre-Fix-B behaviour kept the canonical chain end-to-end (filter retained
+              // `canonicalHashes.contains(h) || !walkReachedGenesis` regardless of ordinal),
+              // which leaked O(chain length) over the 12h soak. Post-Fix-B the canonical
+              // chain is bounded to a sliding window of `keepDepthBehindFinalized` ordinals
+              // behind finality. Reads at older ordinals fall through to disk via
+              // `SnapshotStorage.get(hash)` / `SnapshotStorage.getHash(ordinal)` in the
+              // existing `walkBackTo` impl and the `getByOrdinal` callers that already
+              // disk-first.
+              val keepFloor = math.max(0L, ordinal - keepDepthBehindFinalized)
+
+              // Prune predicate:
+              //   - keep anything strictly above the finalized ordinal (these are tentative
+              //     successors; eviction happens only at-or-below finality)
+              //   - keep canonical-chain entries down to `keepFloor`
+              //   - if the canonical walk broke before reaching genesis, keep entries at-or-
+              //     above `keepFloor` even if not on the just-walked canonical chain (we can't
+              //     verify what's canonical below the break point, so be conservative within
+              //     the keep-floor window; entries strictly below `keepFloor` are still
+              //     evicted because they're below the finality-safety horizon regardless)
               val pruned = state.byHash.filter {
                 case (h, s) =>
-                  s.ordinal > ordinal || canonicalHashes.contains(h) || !walkReachedGenesis
+                  s.ordinal > ordinal ||
+                  (canonicalHashes.contains(h) && s.ordinal >= keepFloor) ||
+                  (!walkReachedGenesis && s.ordinal >= keepFloor)
               }
               val prunedCount = state.byHash.size - pruned.size
+
+              // Approximate-bytes-dropped estimate for the CHAINSTORE-EVICT log line.
+              // `Signed[GlobalIncrementalSnapshot] + GlobalSnapshotInfo` ≈ 1.4 MiB per
+              // entry in the 12h soak's measurement (with 4 metagraphs). The constant is
+              // intentionally illustrative — call it a back-of-envelope tracker, not a
+              // precise size accountant.
+              val approxBytesFreedMiB = (prunedCount.toLong * 1400L) / 1024L
 
               // CRITICAL: if the previous best tip got pruned (it was on a fork branch that
               // lost finality), clear bestTipHash so subsequent stores reseed correctly. The
@@ -479,7 +549,17 @@ object NakamotoChainStore {
                 logger.info(
                   s"🔒 Finalized ordinal=$ordinal, pruned $prunedCount orphan snapshots (${pruned.size} remaining)" +
                     (if (bestTipCleared) s" [best tip cleared — was on pruned fork branch]" else "")
-                )
+                ) >>
+                  (if (prunedCount > 0)
+                     logger.info(
+                       s"CHAINSTORE-EVICT ordinal=$ordinal keepFloor=$keepFloor " +
+                         s"keepDepthBehindFinalized=$keepDepthBehindFinalized dropped=$prunedCount " +
+                         s"remaining=${pruned.size} ~freedKiB=$approxBytesFreedMiB"
+                     )
+                   else
+                     logger.debug(
+                       s"CHAINSTORE-EVICT ordinal=$ordinal keepFloor=$keepFloor no-op (nothing below floor)"
+                     ))
               )
             }
           }.flatten
