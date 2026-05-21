@@ -22,12 +22,12 @@ import io.constellationnetwork.security.kes.VerificationKeyKesProduct
   *
   * '''Backward compatibility.''' This overlay is constructed with the existing genesis [[KesRegistry]] as the base. Genesis lookups
   * continue to work unchanged until a runtime cert with `effectiveFromEpoch <= currentEpoch` lands for that operator, at which point the
-  * runtime cert takes precedence. A cert that hasn't reached its activation epoch yet is held as "pending" and not returned from
-  * `getKesVk` — it becomes effective on or after `effectiveFromEpoch`.
+  * runtime cert takes precedence. A cert that hasn't reached its activation epoch yet is held as "pending" and not returned from `getKesVk`
+  * — it becomes effective on or after `effectiveFromEpoch`.
   *
-  * '''State.''' Per-operator we keep a small chain `List[KesRegistrationRecord]` sorted by `acceptedAt` (latest first). Reads scan the
-  * head for the first record whose `effectiveFromEpoch <= currentEpoch`. The chain is also the source of truth for the chain-link
-  * validation in [[KesRegistrationCertValidator]] (the next-cert `parent` must match `KesRegistrationReference.of(latestAccepted)`).
+  * '''State.''' Per-operator we keep a small chain `List[KesRegistrationRecord]` sorted by `acceptedAt` (latest first). Reads scan the head
+  * for the first record whose `effectiveFromEpoch <= currentEpoch`. The chain is also the source of truth for the chain-link validation in
+  * [[KesRegistrationCertValidator]] (the next-cert `parent` must match `KesRegistrationReference.of(latestAccepted)`).
   *
   * The registry is held in a `Ref` so the GSAM accept handler can swap in a new snapshot of per-operator records each ordinal. This avoids
   * the user-visible epoch parameter being baked into the constructor — callers thread the current epoch through `getKesVk(peerId,

@@ -26,10 +26,10 @@ import shapeless.syntax.singleton._
 
 /** Slice 10 (#179): HTTP intake for runtime KES master-VK registration certs.
   *
-  * '''POST `/kes-registration`''' — Submit a `Signed[KesRegistrationCert]`. The route runs the standard
-  * [[KesRegistrationCertValidator]] checks against the current epoch (from the head snapshot) and the operator's `lastRef`
-  * (looked up in [[MutableKesRegistry]]). On success the cert is handed to the supplied `onAccepted` sink — typically a queue feeding
-  * the GSAM event pipeline, mirroring `NodeCollateralRoutes`' `mkCell` callback.
+  * '''POST `/kes-registration`''' — Submit a `Signed[KesRegistrationCert]`. The route runs the standard [[KesRegistrationCertValidator]]
+  * checks against the current epoch (from the head snapshot) and the operator's `lastRef` (looked up in [[MutableKesRegistry]]). On success
+  * the cert is handed to the supplied `onAccepted` sink — typically a queue feeding the GSAM event pipeline, mirroring
+  * `NodeCollateralRoutes`' `mkCell` callback.
   *
   * '''GET `/kes-registration/{peerId}/last-reference`''' — Returns the operator's most-recent accepted `KesRegistrationReference`, or
   * `KesRegistrationReference.empty` if none. Clients use this to populate the next cert's `parent` field.

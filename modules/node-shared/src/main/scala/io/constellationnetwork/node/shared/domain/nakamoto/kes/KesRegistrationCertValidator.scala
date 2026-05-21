@@ -20,8 +20,7 @@ import derevo.derive
 
 /** Validator for [[KesRegistrationCert]] — §1.2 Slice 10 (#179) runtime KES master-VK registration certs.
   *
-  * Rejection paths (validator is fail-closed across all of them; each is exercised in
-  * `KesRegistrationCertValidatorSuite`):
+  * Rejection paths (validator is fail-closed across all of them; each is exercised in `KesRegistrationCertValidatorSuite`):
   *
   *   1. '''InvalidSigned''' — envelope signature does not verify under the operator's long-term key, OR the cert is signed by more than one
   *      party. Delegated to [[SignedValidator]] (`validateSignatures` + `isSignedExclusivelyBy` against the operator's address).
@@ -167,8 +166,7 @@ object KesRegistrationCertValidator {
 
   case class InvalidParent(parent: KesRegistrationReference) extends KesRegistrationCertValidationError
 
-  case class NotForwardActivation(effectiveFromEpoch: EpochProgress, currentEpoch: EpochProgress)
-      extends KesRegistrationCertValidationError
+  case class NotForwardActivation(effectiveFromEpoch: EpochProgress, currentEpoch: EpochProgress) extends KesRegistrationCertValidationError
 
   case class MalformedVk(kesMasterVK: io.constellationnetwork.security.hex.Hex) extends KesRegistrationCertValidationError
 
