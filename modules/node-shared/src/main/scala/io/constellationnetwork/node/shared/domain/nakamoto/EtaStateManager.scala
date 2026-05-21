@@ -13,8 +13,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** §1 — eta resolver with MPT-cache + chainStore-walk fallback. Path 1 of the heap-leak workstream (Tessellation-Nakamoto).
   *
-  * '''Problem statement.''' `vrfOutputsForPeriod` walks back to `periodStart` of period N-1 to recompute eta_N from VRF outputs. Under Fix B's
-  * k₁-bounded `byHash` retention (default 255 ords), that walk hits the eviction floor for any `etaRotationSnapshots > 255` (production
+  * '''Problem statement.''' `vrfOutputsForPeriod` walks back to `periodStart` of period N-1 to recompute eta_N from VRF outputs. Under Fix
+  * B's k₁-bounded `byHash` retention (default 255 ords), that walk hits the eviction floor for any `etaRotationSnapshots > 255` (production
   * default is 2550 = 10·k₁). Without a disk-immune cache, eta silently degrades to `genesisEta` for every period after the first eviction
   * crosses the rotation boundary — pseudo-predictability defeated cluster-wide. (Findings 1 + 2 from the reviewer.)
   *
@@ -35,8 +35,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *   - Race with concurrent accept() writes to the same `historicalStakeSnapshotsKey[F](period)` key.
   *
   * Instead, the in-period chain-walk recompute is cheap enough (O(R/3) VRF outputs per call, post-fallback via `getWithOrdinalFallback`)
-  * and the MPT lookup post-boundary is O(1). The reviewer's "lazy write-through" suggestion is replaced by: MPT entry is the durable
-  * source after boundary; pre-boundary recompute is on-demand.
+  * and the MPT lookup post-boundary is O(1). The reviewer's "lazy write-through" suggestion is replaced by: MPT entry is the durable source
+  * after boundary; pre-boundary recompute is on-demand.
   *
   * '''Reorg handling.''' MPT writes go through the existing MultiBranch overlay; the overlay automatically drops writes from discarded
   * branches on chain selection rollback. No additional invalidation logic here. After a reorg, the MPT lookup naturally returns whatever
@@ -47,8 +47,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   */
 trait EtaStateManager[F[_]] {
 
-  /** Resolve eta for `period`. Returns the byte representation directly so callers can feed it into
-    * [[EligibilityChecker.checkEligibility]] / [[CommitteeSortition]] / etc. without re-decoding.
+  /** Resolve eta for `period`. Returns the byte representation directly so callers can feed it into [[EligibilityChecker.checkEligibility]]
+    * / [[CommitteeSortition]] / etc. without re-decoding.
     *
     *   - Period ≤ 1: returns `genesisEta`.
     *   - Period ≥ 2 with MPT cache hit: returns `entry.eta.toBytes`.
@@ -65,8 +65,8 @@ object EtaStateManager {
     * chain-walk callback that produces `(ordinal, vrfOutput)` pairs for the first 2/3 of `period`.
     *
     * The `chainWalkFallback` typically routes to `chainStore.vrfOutputsForPeriod(period, etaRotationSnapshots)` which under Path 1
-    * disk-falls-through via [[NakamotoChainStore.getWithOrdinalFallback]]. The MPT cache short-circuits the walk for periods whose
-    * boundary write has landed.
+    * disk-falls-through via [[NakamotoChainStore.getWithOrdinalFallback]]. The MPT cache short-circuits the walk for periods whose boundary
+    * write has landed.
     *
     * @param genesisEta
     *   bootstrap eta for periods ≤ 1 and for the degenerate empty-fallback path. 32 bytes.
@@ -110,7 +110,7 @@ object EtaStateManager {
                 walkCacheRef.get.flatMap { cache =>
                   cache.get(etaPeriod) match {
                     case Some(cached) => cached.pure[F]
-                    case None         =>
+                    case None =>
                       chainWalkFallback(period - 1L).flatMap { chainOutputs =>
                         if (chainOutputs.isEmpty) {
                           // Source-period not yet in store. Fall through to genesis — same
