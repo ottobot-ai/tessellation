@@ -76,7 +76,13 @@ object Mocks {
     io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
 
   private[snapshot] def mkManager(
-    initialSnapshotInfo: Option[GlobalSnapshotInfo] = None
+    initialSnapshotInfo: Option[GlobalSnapshotInfo] = None,
+    // Path 1 (heap-leak workstream): test knobs for the GSAM eta-rotation boundary writer. Defaults match the production
+    // defaults (`etaRotationSnapshots = 2550L`, `etaForPeriod = None`) so existing tests are unaffected; the new
+    // regression suite for the eta wiring overrides both with a small rotation + a real `EtaStateManager`-backed
+    // callback to drive the boundary fire inside a single-ordinal accept().
+    etaRotationSnapshots: Long = 2550L,
+    etaForPeriod: Option[io.constellationnetwork.schema.nakamoto.EtaPeriod => IO[Hash]] = None
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[GlobalSnapshotAcceptanceManager[IO]] = {
     // Create mock dependencies for testing
     val mockBlockAcceptanceManager = new BlockAcceptanceManager[IO] {
@@ -320,7 +326,9 @@ object Mocks {
                       collateral = Amount.empty,
                       withdrawalTimeLimit = EpochProgress(4L),
                       loggerBundle = loggerBundle,
-                      overlay = overlay
+                      overlay = overlay,
+                      etaRotationSnapshots = etaRotationSnapshots,
+                      etaForPeriod = etaForPeriod
                     )
                 } yield mgr
               }
