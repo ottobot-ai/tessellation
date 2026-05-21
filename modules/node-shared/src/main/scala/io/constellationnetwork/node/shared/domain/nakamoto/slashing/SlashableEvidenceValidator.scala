@@ -14,10 +14,10 @@ import io.constellationnetwork.security.{Hasher, SecurityProvider}
 
 /** Slice S4a — accept-time validator for a [[SlashableEvidence]] L0 transaction.
   *
-  * Each of the 9 steps from `SLASHING-DESIGN.md` §4.1 maps to a single `F[Either[SlashingRejection, ...]]` short-circuit. All steps are pure
-  * derivations from the evidence bytes + a small amount of finalized chain state:
+  * Each of the 9 steps from `SLASHING-DESIGN.md` §4.1 maps to a single `F[Either[SlashingRejection, ...]]` short-circuit. All steps are
+  * pure derivations from the evidence bytes + a small amount of finalized chain state:
   *
-  *   1. identity match (peerId equality on the two `Signed[MetagraphAttestation]`s)
+  *   1. identity match (peerId equality on the two [[MetagraphAttestation]] bodies)
   *   1. subject match (metagraph address equality)
   *   1. parent match (load-bearing — same VRF input ⇒ same committee draw)
   *   1. distinct binaries (different `binaryHash` ⇒ equivocation, equal ⇒ duplicate retransmission)
@@ -32,8 +32,9 @@ import io.constellationnetwork.security.{Hasher, SecurityProvider}
   * See `feedback_slashing_safety_bar`.
   *
   * '''Determinism.''' The validator is pure with respect to: KES registry contents, committee sortition (`CommitteeSortition.make`), the
-  * eta/sigma inputs supplied by the caller (which themselves are read from N-2 frozen GSI state — see `project_consensus_epoch_staggering`),
-  * and the `SlashedSeenReader` view (caller picks pending vs finalized branch view). No clock, no env reads, no I/O outside these.
+  * eta/sigma inputs supplied by the caller (which themselves are read from N-2 frozen GSI state — see
+  * `project_consensus_epoch_staggering`), and the `SlashedSeenReader` view (caller picks pending vs finalized branch view). No clock, no
+  * env reads, no I/O outside these.
   *
   * '''What's stubbed in S4a.''' The MPT partition `slashings/<peer>/<metagraph>/<parent>` is not yet implemented; this validator depends on
   * [[SlashedSeenReader]] which the test suite stubs and S4c will back with a `GlobalStateReader`-derived implementation. The validator
@@ -52,8 +53,8 @@ trait SlashableEvidenceValidator[F[_]] {
     *     attestation),
     *   - `sigmaForEvidenceA` / `sigmaForEvidenceB` MUST be the operator's N-2 frozen stake fraction at the same period,
     *   - `kTarget` MUST match what was in effect when the attestations were produced,
-    *   - `currentEpoch` MUST be the current chain epoch progress; `eventEpoch` is the epoch at which the attestations were produced
-    *     (caller derives this from the same epoch the parent snapshot was created in).
+    *   - `currentEpoch` MUST be the current chain epoch progress; `eventEpoch` is the epoch at which the attestations were produced (caller
+    *     derives this from the same epoch the parent snapshot was created in).
     *
     * Different inputs across nodes ⇒ different accept/reject ⇒ consensus split. The validator does not re-source these — that's the
     * caller's contract, same as every other gl0 acceptance validator.
@@ -106,8 +107,8 @@ object SlashableEvidenceValidator {
       eventEpoch: Long
     ): F[Either[SlashingRejection, SlashableEvidence]] = {
 
-      val attA: MetagraphAttestation = evidence.evidenceA.value
-      val attB: MetagraphAttestation = evidence.evidenceB.value
+      val attA: MetagraphAttestation = evidence.evidenceA
+      val attB: MetagraphAttestation = evidence.evidenceB
 
       // Step 1 — identity match. Same peer signed both.
       lazy val step1: Either[SlashingRejection, Unit] =
@@ -239,10 +240,14 @@ object SlashableEvidenceValidator {
 
   /** Helper: produce the canonical bytes the submitter signs to claim the bounty. Exposed so detector (S4b) + tests can build the
     * `bountySignature` field without re-deriving the digest recipe.
+    *
+    * Takes the bare [[MetagraphAttestation]] bodies (not `Signed[_]` envelopes) — the detector strips the gossip-layer envelope via
+    * `.value` before constructing evidence. See [[io.constellationnetwork.schema.slashing.SlashableEvidence]] scaladoc for why the outer
+    * envelope is dropped (KES + VRF in the body carry the safety).
     */
   def bountyDigestBytes[F[_]: cats.Functor: Hasher](
-    evidenceA: io.constellationnetwork.security.signature.Signed[MetagraphAttestation],
-    evidenceB: io.constellationnetwork.security.signature.Signed[MetagraphAttestation],
+    evidenceA: MetagraphAttestation,
+    evidenceB: MetagraphAttestation,
     submitterId: PeerId
   ): F[Array[Byte]] = {
     val preimage = BountyDigestPreimage(evidenceA, evidenceB, submitterId.value.value)

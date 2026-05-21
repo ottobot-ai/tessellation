@@ -12,10 +12,11 @@ import derevo.derive
 /** JVM-side domain shape of a per-metagraph committee VRF attestation (Slice S2+).
   *
   * '''Why this lives here.''' The wire form is `pb.MetagraphAttestation` (proto, generated from `p2p/proto/sidecar.proto`) and the gate's
-  * pre-parsed in-memory shape is [[io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.IncomingAttestation]]. Neither
-  * is a stable, codec-friendly case class that can sit inside `Signed[_]` and round-trip through `Hasher[F]` for inclusion in an L0
-  * transaction. Slashing evidence requires both: the validator (S4a) needs `Signed[MetagraphAttestation]` to identify the equivocator's
-  * long-term Ed25519 signature, and the GSAM accept path (S4c) needs deterministic bytes to MPT-key by.
+  * pre-parsed in-memory shape is [[io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.IncomingAttestation]].
+  * Neither is a stable, codec-friendly case class that round-trips through `Hasher[F]` for inclusion in an L0 transaction. Slashing
+  * evidence (S4a) carries two of these bodies directly (no outer `Signed[_]` envelope — KES + VRF in the body carry the safety; see
+  * [[io.constellationnetwork.schema.slashing.SlashableEvidence]] scaladoc), and the GSAM accept path (S4c) needs deterministic bytes to
+  * MPT-key by.
   *
   * '''Field set.''' Exactly what the slashing validator (`SLASHING-DESIGN.md` §4.1) reads:
   *   - `peerId` — committee member who signed
@@ -27,7 +28,10 @@ import derevo.derive
   *   - `kesSignature` — KES product signature reused by [[io.constellationnetwork.security.kes.OperationalKeyMaker.decodeSignature]]
   *   - `senderTreeStep` — KES tree-internal step at sign time, enables non-interactive receiver verify
   *
-  * '''No long-term Ed25519 sig on the body.''' The body is what gets Ed25519-signed; the signature lives in the `Signed[_]` envelope.
+  * '''No long-term Ed25519 sig on the body or evidence envelope.''' The gossip path wraps `MetagraphAttestation` in `Signed[_]` for Ed25519
+  * verification on receive; that envelope stays on the gossip path. Slashing evidence consumes the body directly because the KES product
+  * sig (step 5) plus committee VRF proof (step 6) are independently load-bearing — the outer Ed25519 sig added no safety the validator was
+  * reading.
   *
   * '''Byte storage choice.''' Raw VRF/KES material lives in [[Hex]] (newtype around `String`) rather than `Array[Byte]` so the case class
   * gets free Circe `decoder`/`encoder` instances and round-trips deterministically via the Hasher typeclass. The Hex form is exactly what

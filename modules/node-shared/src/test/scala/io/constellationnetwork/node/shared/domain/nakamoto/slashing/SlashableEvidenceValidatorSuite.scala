@@ -14,8 +14,8 @@ import io.constellationnetwork.schema.slashing.{MetagraphAttestation, SlashableE
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.kes._
+import io.constellationnetwork.security.signature.Signing
 import io.constellationnetwork.security.signature.signature.Signature
-import io.constellationnetwork.security.signature.{Signed, Signing}
 import io.constellationnetwork.security.vrf.EcVrf25519
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
 
@@ -71,16 +71,16 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
     def kesRegistry: KesRegistry[IO] =
       KesRegistry.make[IO](Map(offenderPeerId -> KesRegistryEntry(offenderKesVk, offset = 0L)))
 
-    /** Build a `Signed[MetagraphAttestation]` for the given binary, using the real KES + VRF keys.
+    /** Build a [[MetagraphAttestation]] body for the given binary, using the real KES + VRF keys.
       *
-      * The KES sig is produced by the OperationalKeyMaker; the committee VRF proof is produced by `CommitteeSortition.isInCommittee`; the
-      * outer Ed25519 sig is produced by the standard `SignatureProof.fromData` path.
+      * The KES sig is produced by the OperationalKeyMaker; the committee VRF proof is produced by `CommitteeSortition.isInCommittee`. No
+      * outer Ed25519 envelope — slashing evidence consumes bare attestation bodies (see the schema scaladoc for why).
       */
     def signAttestation(
       binary: Hash,
       sortition: CommitteeSortition[IO],
       kesMaker: OperationalKeyMakerAlgebra[IO]
-    )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[Signed[MetagraphAttestation]] =
+    )(implicit h: Hasher[IO]): IO[MetagraphAttestation] =
       for {
         drawOpt <- sortition.isInCommittee(offenderVrfSk, eta, metagraphAddress, parentHash, sigmaOperatorKey, kTarget)
         proof = drawOpt.map(_._1).getOrElse(Array.empty[Byte])
@@ -92,7 +92,8 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           case Right(sig) => OperationalKeyMaker.encodeSignature(sig)
           case Left(_)    => Array.empty[Byte]
         }
-        body = MetagraphAttestation(
+      } yield
+        MetagraphAttestation(
           peerId = offenderPeerId,
           metagraphAddress = metagraphAddress,
           parentHash = parentHash,
@@ -102,8 +103,6 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           kesSignature = Hex.fromBytes(kesSig),
           senderTreeStep = kesStep
         )
-        signed <- Signed.forAsyncHasher(body, offenderKp)
-      } yield signed
 
     def buildEvidence(
       sortition: CommitteeSortition[IO],
@@ -116,18 +115,19 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
       } yield evidence
 
     def buildEvidenceFrom(
-      attA: Signed[MetagraphAttestation],
-      attB: Signed[MetagraphAttestation]
+      attA: MetagraphAttestation,
+      attB: MetagraphAttestation
     )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[SlashableEvidence] =
       for {
         digestBytes <- SlashableEvidenceValidator.bountyDigestBytes[IO](attA, attB, submitterPeerId)
         sigBytes <- Signing.signData[IO](digestBytes)(submitterKp.getPrivate)
-      } yield SlashableEvidence(
-        evidenceA = attA,
-        evidenceB = attB,
-        submitterId = submitterPeerId,
-        bountySignature = Signature(Hex.fromBytes(sigBytes))
-      )
+      } yield
+        SlashableEvidence(
+          evidenceA = attA,
+          evidenceB = attB,
+          submitterId = submitterPeerId,
+          bountySignature = Signature(Hex.fromBytes(sigBytes))
+        )
   }
 
   /** Construct a fixture with K · σ = 1 (everyone in-committee — keeps the VRF draw saturating so we always get a valid proof).
@@ -147,23 +147,24 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
       kesMaterial <- OperationalKeyMaker.generateFreshKesKeyMaterial[IO](seed, height = (2, 2), offset = 0L)
       (encodedSk, masterVk) = kesMaterial
       _ <- store.write("kes-sk.bin", encodedSk)
-    } yield EquivocationFixture(
-      offenderKp = offenderKp,
-      offenderPeerId = PeerId.fromPublic(offenderKp.getPublic),
-      offenderVrfSk = offenderVrfSk,
-      offenderVrfVk = offenderVrfVk,
-      offenderKesVk = masterVk,
-      kesMakerResource = OperationalKeyMaker.make[IO](store, "kes-sk.bin", etaPeriodLength = 100L),
-      submitterKp = submitterKp,
-      submitterPeerId = PeerId.fromPublic(submitterKp.getPublic),
-      metagraphAddress = Address.fromBytes("mg-equiv".getBytes("UTF-8")),
-      parentHash = Hash.fromBytes("parent-1".getBytes("UTF-8")),
-      binaryHashA = Hash.fromBytes("binary-A".getBytes("UTF-8")),
-      binaryHashB = Hash.fromBytes("binary-B".getBytes("UTF-8")),
-      eta = Array.fill[Byte](32)(0x07.toByte),
-      kTarget = 1,
-      sigmaOperatorKey = Ratio(1, 1)
-    )
+    } yield
+      EquivocationFixture(
+        offenderKp = offenderKp,
+        offenderPeerId = PeerId.fromPublic(offenderKp.getPublic),
+        offenderVrfSk = offenderVrfSk,
+        offenderVrfVk = offenderVrfVk,
+        offenderKesVk = masterVk,
+        kesMakerResource = OperationalKeyMaker.make[IO](store, "kes-sk.bin", etaPeriodLength = 100L),
+        submitterKp = submitterKp,
+        submitterPeerId = PeerId.fromPublic(submitterKp.getPublic),
+        metagraphAddress = Address.fromBytes("mg-equiv".getBytes("UTF-8")),
+        parentHash = Hash.fromBytes("parent-1".getBytes("UTF-8")),
+        binaryHashA = Hash.fromBytes("binary-A".getBytes("UTF-8")),
+        binaryHashB = Hash.fromBytes("binary-B".getBytes("UTF-8")),
+        eta = Array.fill[Byte](32)(0x07.toByte),
+        kTarget = 1,
+        sigmaOperatorKey = Ratio(1, 1)
+      )
 
   // ===== happy path — all 9 steps pass =====
 
@@ -214,7 +215,7 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           attB <- f.signAttestation(f.binaryHashB, sortition, kesMaker)
           // Mutate the body of attB to have a different peerId — but keep the (now stale) sig.
           // The validator should reject at step 1 BEFORE reaching the KES check.
-          mutatedB = attB.copy(value = attB.value.copy(peerId = otherPeer))
+          mutatedB = attB.copy(peerId = otherPeer)
           evidence <- f.buildEvidenceFrom(attA, mutatedB)
           r <- validator.validate(
             evidence = evidence,
@@ -227,10 +228,11 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           )
         } yield r
       }
-    } yield matches(result) {
-      case Left(SlashingRejection.IdentityMismatch(a, b)) =>
-        expect(a == f.offenderPeerId).and(expect(b == otherPeer))
-    }
+    } yield
+      matches(result) {
+        case Left(SlashingRejection.IdentityMismatch(a, b)) =>
+          expect(a == f.offenderPeerId).and(expect(b == otherPeer))
+      }
   }
 
   // ===== step 2 — subject mismatch =====
@@ -250,7 +252,7 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
         for {
           attA <- f.signAttestation(f.binaryHashA, sortition, kesMaker)
           attB <- f.signAttestation(f.binaryHashB, sortition, kesMaker)
-          mutatedB = attB.copy(value = attB.value.copy(metagraphAddress = otherMg))
+          mutatedB = attB.copy(metagraphAddress = otherMg)
           evidence <- f.buildEvidenceFrom(attA, mutatedB)
           r <- validator.validate(
             evidence = evidence,
@@ -263,10 +265,11 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           )
         } yield r
       }
-    } yield matches(result) {
-      case Left(SlashingRejection.SubjectMismatch(a, b)) =>
-        expect(a == f.metagraphAddress).and(expect(b == otherMg))
-    }
+    } yield
+      matches(result) {
+        case Left(SlashingRejection.SubjectMismatch(a, b)) =>
+          expect(a == f.metagraphAddress).and(expect(b == otherMg))
+      }
   }
 
   // ===== step 3 — parent mismatch =====
@@ -286,7 +289,7 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
         for {
           attA <- f.signAttestation(f.binaryHashA, sortition, kesMaker)
           attB <- f.signAttestation(f.binaryHashB, sortition, kesMaker)
-          mutatedB = attB.copy(value = attB.value.copy(parentHash = otherParent))
+          mutatedB = attB.copy(parentHash = otherParent)
           evidence <- f.buildEvidenceFrom(attA, mutatedB)
           r <- validator.validate(
             evidence = evidence,
@@ -299,10 +302,11 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           )
         } yield r
       }
-    } yield matches(result) {
-      case Left(SlashingRejection.ParentMismatch(a, b)) =>
-        expect(a == f.parentHash).and(expect(b == otherParent))
-    }
+    } yield
+      matches(result) {
+        case Left(SlashingRejection.ParentMismatch(a, b)) =>
+          expect(a == f.parentHash).and(expect(b == otherParent))
+      }
   }
 
   // ===== step 4 — duplicate binary =====
@@ -334,9 +338,10 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           )
         } yield r
       }
-    } yield matches(result) {
-      case Left(SlashingRejection.DuplicateBinary(b)) => expect(b == f.binaryHashA)
-    }
+    } yield
+      matches(result) {
+        case Left(SlashingRejection.DuplicateBinary(b)) => expect(b == f.binaryHashA)
+      }
   }
 
   // ===== step 5 — invalid KES signature =====
@@ -358,11 +363,11 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           // Tamper KES sig bytes — flip the first byte. Resulting bytes will decode (likely) but
           // verify under master VK will fail.
           tamperedHex = {
-            val raw = attA.value.kesSignature.toBytes
+            val raw = attA.kesSignature.toBytes
             raw(0) = (raw(0) ^ 0xff).toByte
             Hex.fromBytes(raw)
           }
-          tamperedA = attA.copy(value = attA.value.copy(kesSignature = tamperedHex))
+          tamperedA = attA.copy(kesSignature = tamperedHex)
           evidence <- f.buildEvidenceFrom(tamperedA, attB)
           r <- validator.validate(
             evidence = evidence,
@@ -375,9 +380,10 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           )
         } yield r
       }
-    } yield matches(result) {
-      case Left(SlashingRejection.InvalidKesSignature.OnEvidenceA) => success
-    }
+    } yield
+      matches(result) {
+        case Left(SlashingRejection.InvalidKesSignature.OnEvidenceA) => success
+      }
   }
 
   // ===== step 6 — invalid committee VRF =====
@@ -397,8 +403,8 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           attA <- f.signAttestation(f.binaryHashA, sortition, kesMaker)
           attB <- f.signAttestation(f.binaryHashB, sortition, kesMaker)
           // Replace the VRF proof on B with garbage of the same length so the EcVrf25519 verifier rejects.
-          garbageProof = Array.fill[Byte](attB.value.committeeVrfProof.toBytes.length)(0xee.toByte)
-          tamperedB = attB.copy(value = attB.value.copy(committeeVrfProof = Hex.fromBytes(garbageProof)))
+          garbageProof = Array.fill[Byte](attB.committeeVrfProof.toBytes.length)(0xee.toByte)
+          tamperedB = attB.copy(committeeVrfProof = Hex.fromBytes(garbageProof))
           evidence <- f.buildEvidenceFrom(attA, tamperedB)
           r <- validator.validate(
             evidence = evidence,
@@ -411,9 +417,10 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           )
         } yield r
       }
-    } yield matches(result) {
-      case Left(SlashingRejection.InvalidCommitteeVrf.OnEvidenceB) => success
-    }
+    } yield
+      matches(result) {
+        case Left(SlashingRejection.InvalidCommitteeVrf.OnEvidenceB) => success
+      }
   }
 
   // ===== step 7 — already slashed =====
@@ -445,12 +452,13 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           )
         } yield r
       }
-    } yield matches(result) {
-      case Left(SlashingRejection.AlreadySlashed(peer, mg, parent)) =>
-        expect(peer == f.offenderPeerId)
-          .and(expect(mg == f.metagraphAddress))
-          .and(expect(parent == f.parentHash))
-    }
+    } yield
+      matches(result) {
+        case Left(SlashingRejection.AlreadySlashed(peer, mg, parent)) =>
+          expect(peer == f.offenderPeerId)
+            .and(expect(mg == f.metagraphAddress))
+            .and(expect(parent == f.parentHash))
+      }
   }
 
   // ===== step 8 — evidence window expired =====
@@ -481,10 +489,11 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           )
         } yield r
       }
-    } yield matches(result) {
-      case Left(SlashingRejection.EvidenceWindowExpired(cur, evt, win)) =>
-        expect(cur == 200L).and(expect(evt == 5L)).and(expect(win == 100L))
-    }
+    } yield
+      matches(result) {
+        case Left(SlashingRejection.EvidenceWindowExpired(cur, evt, win)) =>
+          expect(cur == 200L).and(expect(evt == 5L)).and(expect(win == 100L))
+      }
   }
 
   // ===== step 9 — invalid bounty signature =====
@@ -523,9 +532,10 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           )
         } yield r
       }
-    } yield matches(result) {
-      case Left(SlashingRejection.InvalidBountySignature) => success
-    }
+    } yield
+      matches(result) {
+        case Left(SlashingRejection.InvalidBountySignature) => success
+      }
   }
 
   // ===== property: single honest attestation can't be slashed =====
@@ -559,8 +569,9 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           )
         } yield r
       }
-    } yield matches(result) {
-      case Left(SlashingRejection.DuplicateBinary(b)) => expect(b == f.binaryHashA)
-    }
+    } yield
+      matches(result) {
+        case Left(SlashingRejection.DuplicateBinary(b)) => expect(b == f.binaryHashA)
+      }
   }
 }
