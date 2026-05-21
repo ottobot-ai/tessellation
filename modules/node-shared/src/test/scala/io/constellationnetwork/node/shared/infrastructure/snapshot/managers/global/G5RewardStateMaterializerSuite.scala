@@ -32,23 +32,20 @@ import weaver.MutableIOSuite
 
 /** §G5 — byte-equivalence assertions for the full-structure materializers used by reward + metagraph-sync paths.
   *
-  * Property under test: after `GlobalSnapshotInfo` is sync'd into an MPT store via the same
-  * `syncFromGlobalSnapshotInfo` the runtime uses on bootstrap, calling each materializer back through a
-  * `GlobalStateReader.fromMptStore` yields a `SortedMap` whose content equals `info.activeDelegatedStakes` /
-  * `info.activeNodeCollaterals` / `info.delegatedStakesWithdrawals` / `info.updateNodeParameters` —
-  * up to schema-level idempotent normalizations (`Hex` lowercasing on round-trip).
+  * Property under test: after `GlobalSnapshotInfo` is sync'd into an MPT store via the same `syncFromGlobalSnapshotInfo` the runtime uses
+  * on bootstrap, calling each materializer back through a `GlobalStateReader.fromMptStore` yields a `SortedMap` whose content equals
+  * `info.activeDelegatedStakes` / `info.activeNodeCollaterals` / `info.delegatedStakesWithdrawals` / `info.updateNodeParameters` — up to
+  * schema-level idempotent normalizations (`Hex` lowercasing on round-trip).
   *
-  * Why this matters: G5 swaps the production reward-calculation read path from `info.X` (full GSI map closures)
-  * to `materializeXFromMpt` (MPT prefix-scan + per-record source-keying). The migration is byte-equivalent
-  * only if the GSI → MPT key derivation and value codec round-trips agree on the leaf-level data the
-  * acceptance + verify paths consume. These tests pin that agreement at the codec/key level so the
-  * GSI-to-MPT migration can't silently drift.
+  * Why this matters: G5 swaps the production reward-calculation read path from `info.X` (full GSI map closures) to `materializeXFromMpt`
+  * (MPT prefix-scan + per-record source-keying). The migration is byte-equivalent only if the GSI → MPT key derivation and value codec
+  * round-trips agree on the leaf-level data the acceptance + verify paths consume. These tests pin that agreement at the codec/key level so
+  * the GSI-to-MPT migration can't silently drift.
   *
-  * Known caveat: the legacy `DelegatedStakeRecord` `Order` (= `Order[SnapshotOrdinal].contramap(_.createdAt)`)
-  * is narrower than the `Ordering` declared on the same type — `SortedSetCodec.sortedSet[A: Order]` uses the
-  * `Order`-derived `Ordering`. So a multi-record SortedSet whose records all share `createdAt` would
-  * collapse on round-trip. The tests below use distinct `createdAt` values to side-step this independent
-  * schema bug.
+  * Known caveat: the legacy `DelegatedStakeRecord` `Order` (= `Order[SnapshotOrdinal].contramap(_.createdAt)`) is narrower than the
+  * `Ordering` declared on the same type — `SortedSetCodec.sortedSet[A: Order]` uses the `Order`-derived `Ordering`. So a multi-record
+  * SortedSet whose records all share `createdAt` would collapse on round-trip. The tests below use distinct `createdAt` values to side-step
+  * this independent schema bug.
   */
 object G5RewardStateMaterializerSuite extends MutableIOSuite {
 
@@ -138,8 +135,10 @@ object G5RewardStateMaterializerSuite extends MutableIOSuite {
 
     // Distinct `createdAt` per record so the `Order[DelegatedStakeRecord]`-keyed SortedSet codec
     // doesn't collapse equal-ordered records (see suite scaladoc — independent schema bug).
-    val aliceStake1 = DelegatedStakeRecord(mkDelegatedStakeCreate(alice, nodeP, 1_000L, "alice-p"), SnapshotOrdinal(1L), Balance(0L), none, none)
-    val aliceStake2 = DelegatedStakeRecord(mkDelegatedStakeCreate(alice, nodeQ, 2_000L, "alice-q"), SnapshotOrdinal(2L), Balance(0L), none, none)
+    val aliceStake1 =
+      DelegatedStakeRecord(mkDelegatedStakeCreate(alice, nodeP, 1_000L, "alice-p"), SnapshotOrdinal(1L), Balance(0L), none, none)
+    val aliceStake2 =
+      DelegatedStakeRecord(mkDelegatedStakeCreate(alice, nodeQ, 2_000L, "alice-q"), SnapshotOrdinal(2L), Balance(0L), none, none)
     val bobStake = DelegatedStakeRecord(mkDelegatedStakeCreate(bob, nodeP, 3_000L, "bob-p"), SnapshotOrdinal(3L), Balance(0L), none, none)
 
     val expected: SortedMap[Address, SortedSet[DelegatedStakeRecord]] =

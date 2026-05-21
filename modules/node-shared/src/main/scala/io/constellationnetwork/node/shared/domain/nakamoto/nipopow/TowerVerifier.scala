@@ -11,8 +11,8 @@ import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.LddConfig
 
-import io.circe.{Encoder, Json}
 import io.circe.syntax._
+import io.circe.{Encoder, Json}
 
 /** §3 NIPoPoW S4.3 — structured error type for proof rejection. Each variant carries enough context for diagnostic logging without exposing
   * the validator internals.
@@ -44,8 +44,8 @@ object ProofError {
   /** A header's `subchainLevelCounts` size doesn't equal `SuperLevelParams.SuperLevelCount` — wire-shape violation. */
   final case class SubchainStateShape(ordinal: SnapshotOrdinal, observedSize: Int) extends ProofError
 
-  /** §3 NIPoPoW S5 — JSON encoder for `ProofError`, used by the HTTP verify endpoint. Hand-rolled (rather than derevo-derived) so we keep
-    * a stable `kind` discriminator field across all variants — the TS verifier matches on it. The discriminator name `kind` matches the
+  /** §3 NIPoPoW S5 — JSON encoder for `ProofError`, used by the HTTP verify endpoint. Hand-rolled (rather than derevo-derived) so we keep a
+    * stable `kind` discriminator field across all variants — the TS verifier matches on it. The discriminator name `kind` matches the
     * trigger-name convention already exposed by `FinalityTriggersRoutes`.
     */
   implicit val encoder: Encoder[ProofError] = Encoder.instance {

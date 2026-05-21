@@ -11,13 +11,11 @@ import weaver.SimpleIOSuite
 
 /** Targets the producer-side priority chain for the cl0 → gl0 sync ordinal.
   *
-  * Mode-2 bug (see docs/nakamoto/MODE2-GLOBAL-SYNC-VIEW-RCA.md): the chain used to prefer
-  * the prior CL0 snapshot's `globalSyncView.ordinal` over the local GL0 head, which created
-  * a fixed point at the genesis-inherited `GlobalSyncView(ord=1, epochProgress=1)`.
+  * Mode-2 bug (see docs/nakamoto/MODE2-GLOBAL-SYNC-VIEW-RCA.md): the chain used to prefer the prior CL0 snapshot's `globalSyncView.ordinal`
+  * over the local GL0 head, which created a fixed point at the genesis-inherited `GlobalSyncView(ord=1, epochProgress=1)`.
   *
-  * Fix: when no peer-sync quorum is available, take `max(prior_view, local_head)` instead of
-  * `prior_view.orElse(local_head)`. This preserves the prior view's monotonic lower-bound
-  * semantics while letting the producer escape the genesis seed once the local follower
+  * Fix: when no peer-sync quorum is available, take `max(prior_view, local_head)` instead of `prior_view.orElse(local_head)`. This
+  * preserves the prior view's monotonic lower-bound semantics while letting the producer escape the genesis seed once the local follower
   * advances.
   */
 object CurrencySnapshotAcceptanceManagerSuite extends SimpleIOSuite {

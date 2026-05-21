@@ -24,15 +24,15 @@ import org.http4s.{HttpRoutes, Response}
   *     - 400 if `fromOrd` is malformed, negative, or strictly greater than the local chain head.
   *     - 404 if the proof's `level0Suffix` is empty (no finalized snapshots in range — tower has no entries).
   *     - 503 while the provider Ref is still empty (pre-startup).
-  *   - `GET /nakamoto/nipopow/proof/genesis[?k=K]` — convenience for cold-start light clients; equivalent to the main route with
-  *     `fromOrd = SnapshotOrdinal.MinValue`.
-  *   - `POST /nakamoto/nipopow/verify` — server-side verifier offload. Accepts a Circe-encoded [[TowerProof]] body; returns 200
-  *     `{ verified: true }` or 400 `{ verified: false, error: <ProofError JSON> }` on first-failure.
+  *   - `GET /nakamoto/nipopow/proof/genesis[?k=K]` — convenience for cold-start light clients; equivalent to the main route with `fromOrd =
+  *     SnapshotOrdinal.MinValue`.
+  *   - `POST /nakamoto/nipopow/verify` — server-side verifier offload. Accepts a Circe-encoded [[TowerProof]] body; returns 200 `{
+  *     verified: true }` or 400 `{ verified: false, error: <ProofError JSON> }` on first-failure.
   *
   * '''Defaults''':
   *   - `k` defaults to [[TowerProof.DefaultSuffixLength]] (= 5, matching `T_depth2` finality depth). The "default k = ConfirmationDepthK"
-  *     wording in the implementation prompt refers to the L0 suffix anchor; the actual `k` value used by the proof builder is the
-  *     L0-suffix length, which is 5 by current convention. Callers may override via query string.
+  *     wording in the implementation prompt refers to the L0 suffix anchor; the actual `k` value used by the proof builder is the L0-suffix
+  *     length, which is 5 by current convention. Callers may override via query string.
   *
   * Mirrors `FinalityTriggersRoutes` (#138): pure observability, reads a Ref populated by the consensus startup once the tower store +
   * snapshot storage + numerics interpreters are wired. Never feeds back into consensus.
@@ -72,7 +72,7 @@ final case class NipopowRoutes[F[_]: Async](
           }
       }
       k <- kRaw match {
-        case None    => Right(TowerProof.DefaultSuffixLength)
+        case None => Right(TowerProof.DefaultSuffixLength)
         case Some(v) =>
           if (v < 1L) Left("k must be ≥ 1")
           else if (v > Int.MaxValue.toLong) Left("k overflows Int range")
@@ -87,8 +87,8 @@ final case class NipopowRoutes[F[_]: Async](
       case Some(provider) => f(provider)
     }
 
-  /** Build a proof anchored at `since` with suffix length `k`. Returns 200 on success, 404 when the proof has no L0 suffix (tower
-    * empty — no finalized headers in range).
+  /** Build a proof anchored at `since` with suffix length `k`. Returns 200 on success, 404 when the proof has no L0 suffix (tower empty —
+    * no finalized headers in range).
     */
   private def buildAndRespond(provider: NipopowProofProvider[F], since: SnapshotOrdinal, k: Int): F[Response[F]] =
     provider.build(since, k).flatMap { proof =>

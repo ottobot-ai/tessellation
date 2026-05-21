@@ -7,9 +7,9 @@ import io.constellationnetwork.schema.nakamoto.LddConfig
   * the verification parameters bound at consensus-startup time (genesis eta, eta-rotation period, LDD config).
   *
   * '''Pattern.''' Mirrors `FinalityTriggerView` (#138). Constructed inside the `GlobalSnapshotConsensus` resource block once the
-  * `TowerStore`, snapshot storage, and numerics interpreters are available; handed up to the HTTP layer via a
-  * `Ref[F, Option[NipopowProofProvider[F]]]` populated at startup. The route returns `503 Service Unavailable` while the Ref is empty —
-  * same pattern as `FinalityTriggersRoutes`.
+  * `TowerStore`, snapshot storage, and numerics interpreters are available; handed up to the HTTP layer via a `Ref[F,
+  * Option[NipopowProofProvider[F]]]` populated at startup. The route returns `503 Service Unavailable` while the Ref is empty — same
+  * pattern as `FinalityTriggersRoutes`.
   *
   * '''What the route gets from the provider:'''
   *   1. `build(since, k)` — delegates to [[TowerProofBuilder.build]]; the route enforces the `since ≤ head` bound itself before calling.
@@ -32,8 +32,8 @@ trait NipopowProofProvider[F[_]] {
 
 object NipopowProofProvider {
 
-  /** Wrap a `(builder, verifier)` pair with the verification parameters captured at startup. The genesis eta + rotation period + LDD
-    * config are immutable for the lifetime of a Nakamoto process, so binding them here is safe.
+  /** Wrap a `(builder, verifier)` pair with the verification parameters captured at startup. The genesis eta + rotation period + LDD config
+    * are immutable for the lifetime of a Nakamoto process, so binding them here is safe.
     */
   def make[F[_]](
     builder: TowerProofBuilder[F],

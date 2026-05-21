@@ -21,9 +21,9 @@ import suite.HttpSuite
 
 /** §3 NIPoPoW S5 — route-level tests for `NipopowRoutes`.
   *
-  * Brings up a stub [[NipopowProofProvider]] (no real chain) so we can exercise the route's response shape, error mapping, and JSON
-  * codec for [[TowerProof]] + [[ProofError]] in isolation. The provider stub returns canned proofs / verifier outcomes — testing the
-  * underlying builder + verifier behaviour is the job of `TowerProofBuilderSuite` / `TowerVerifierSuite`.
+  * Brings up a stub [[NipopowProofProvider]] (no real chain) so we can exercise the route's response shape, error mapping, and JSON codec
+  * for [[TowerProof]] + [[ProofError]] in isolation. The provider stub returns canned proofs / verifier outcomes — testing the underlying
+  * builder + verifier behaviour is the job of `TowerProofBuilderSuite` / `TowerVerifierSuite`.
   */
 object NipopowRoutesSuite extends HttpSuite {
 
@@ -36,8 +36,8 @@ object NipopowRoutesSuite extends HttpSuite {
   private def h(s: String): Hash =
     Hash(s.getBytes("UTF-8").map(b => f"${b & 0xff}%02x").mkString.padTo(64, '0').take(64))
 
-  /** Build a canned [[TowerProofHeader]] for use in canned proofs. The values don't need to be VRF-valid — this suite tests the
-    * route's surface, not the verifier's internals.
+  /** Build a canned [[TowerProofHeader]] for use in canned proofs. The values don't need to be VRF-valid — this suite tests the route's
+    * surface, not the verifier's internals.
     */
   private def header(ordinal: Long, slot: Long = 100L, parentSlot: Long = 99L): TowerProofHeader =
     TowerProofHeader(
@@ -178,7 +178,8 @@ object NipopowRoutesSuite extends HttpSuite {
       result <- resp match {
         case Some(r) =>
           r.as[Json].map { body =>
-            expect.same(r.status, Status.BadRequest)
+            expect
+              .same(r.status, Status.BadRequest)
               .and(expect(body.hcursor.downField("verified").as[Boolean].toOption.contains(false)))
               .and(expect(body.hcursor.downField("error").downField("kind").as[String].toOption.contains("non_monotonic_ordinals")))
               .and(expect(body.hcursor.downField("error").downField("level").as[Int].toOption.contains(2)))
@@ -199,7 +200,8 @@ object NipopowRoutesSuite extends HttpSuite {
       result <- resp match {
         case Some(r) =>
           r.as[Json].map { body =>
-            expect.same(r.status, Status.BadRequest)
+            expect
+              .same(r.status, Status.BadRequest)
               .and(expect(body.hcursor.downField("verified").as[Boolean].toOption.contains(false)))
           }
         case None => IO.pure(failure("route not found"))

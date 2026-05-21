@@ -16,21 +16,18 @@ import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.unpRe
 
 /** §G5 — MPT-backed reader for the `UpdateNodeParameters` partition.
   *
-  * The `UpdateNodeParameters` partition is keyed by a hash of `Id` (not by `Address`), so the
-  * MPT key alone cannot reconstruct the `Id`. Recovery uses the signed value's `proofs.head.id`
-  * — by GSAM convention the signer's `Id` equals the map's keying `Id`, so a prefix-scan +
-  * value-decode is sufficient.
+  * The `UpdateNodeParameters` partition is keyed by a hash of `Id` (not by `Address`), so the MPT key alone cannot reconstruct the `Id`.
+  * Recovery uses the signed value's `proofs.head.id` — by GSAM convention the signer's `Id` equals the map's keying `Id`, so a prefix-scan
+  * + value-decode is sufficient.
   *
-  * The reader returns the same `SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)]`
-  * shape that `info.updateNodeParameters` carries on the GSI side. Byte-equivalent to the GSI map
-  * when MPT and GSI are in sync: each entry decodes via `unpRecordImmutableCodec` (same codec used
-  * by `MptStore.syncFromGlobalSnapshotInfo`) and is keyed by the `Id` extracted from the signed
-  * record's first proof.
+  * The reader returns the same `SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)]` shape that `info.updateNodeParameters`
+  * carries on the GSI side. Byte-equivalent to the GSI map when MPT and GSI are in sync: each entry decodes via `unpRecordImmutableCodec`
+  * (same codec used by `MptStore.syncFromGlobalSnapshotInfo`) and is keyed by the `Id` extracted from the signed record's first proof.
   *
   * Used by:
   *   - `RewardsInfoCalculator` to look up commission rate per peer-node when totaling reward pools
-  *   - `GlobalDelegatedRewardsDistributor.calculateDelegatorRewards` /
-  *     `calculateNodeOperatorRewards` to look up `delegatedStakeRewardParameters` per node
+  *   - `GlobalDelegatedRewardsDistributor.calculateDelegatorRewards` / `calculateNodeOperatorRewards` to look up
+  *     `delegatedStakeRewardParameters` per node
   *
   * Empty result is returned via `SortedMap.empty` when the prefix scan returns no entries.
   */
