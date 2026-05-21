@@ -3,6 +3,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 import cats.effect.IO
 import cats.effect.kernel.Ref
 import cats.effect.std.Supervisor
+import cats.syntax.all._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.ext.crypto._
@@ -84,6 +85,8 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
 
   // Test fixture: NakamotoChainStore + the finalized-ordinal Ref it gates against.
   private def mkChainStore(
+    keepDepthBehindFinalized: Long = NakamotoChainStore.DefaultKeepDepthBehindFinalized
+  )(
     implicit hs: HasherSelector[IO]
   ): IO[
     (NakamotoChainStore.NakamotoChainStoreAlgebra[IO], Ref[IO, SnapshotOrdinal], TipTracker[IO], StakeRegistry[IO])
@@ -96,7 +99,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       // ChainSelection wants a fetchParent — for our P-11 surface tests we never trigger fork
       // selection, so a None-returning stub suffices.
       chainSelection = ChainSelection.make[IO](tipTracker, _ => IO.pure(None))
-      chainStore <- NakamotoChainStore.make[IO](stubStorage, chainSelection, tipTracker, finalizedRef)
+      chainStore <- NakamotoChainStore.make[IO](stubStorage, chainSelection, tipTracker, finalizedRef, keepDepthBehindFinalized)
     } yield (chainStore, finalizedRef, tipTracker, stakeRegistry)
 
   private def pid(name: String): PeerId =
@@ -136,10 +139,21 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     S: SecurityProvider[IO],
     j: JsonSerializer[IO]
   ): IO[(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)] =
+    mkSnapshotWithEpoch(epoch = 1L)
+
+  /** Build a signed snapshot whose content hash varies with `epoch`. Lets a single test build a sequence of `N` distinct-hash snapshots
+    * without colliding on bytes. Heap-leak Fix B tests use this to seed `byHash` with N entries and then assert eviction below the
+    * keep-window.
+    */
+  private def mkSnapshotWithEpoch(epoch: Long)(
+    implicit H: Hasher[IO],
+    S: SecurityProvider[IO],
+    j: JsonSerializer[IO]
+  ): IO[(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)] =
     KeyPairGenerator.makeKeyPair[IO].flatMap { keyPair =>
       Signed
         .forAsyncHasher[IO, GlobalSnapshot](
-          GlobalSnapshot.mkGenesis(Map.empty, EpochProgress(NonNegLong(1L))),
+          GlobalSnapshot.mkGenesis(Map.empty, EpochProgress(NonNegLong.unsafeFrom(epoch))),
           keyPair
         )
         .flatMap { genesis =>
@@ -151,11 +165,37 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
         }
     }
 
+  /** Seed a chain of `n` distinct-hash snapshots at ordinals 1..n into `chainStore`, parent-linked left-to-right. Returns the hash at each
+    * ordinal. The actual chain-linking via `parentHash` isn't tied to any production semantics here — we just need `byHash` populated;
+    * `chainStore`'s canonical-walk in `finalize` follows the parent chain so we link each new store to the prior.
+    */
+  private def seedChainOfLength(
+    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[IO],
+    n: Int
+  )(
+    implicit H: Hasher[IO],
+    S: SecurityProvider[IO],
+    j: JsonSerializer[IO]
+  ): IO[List[Hash]] =
+    (1 to n).toList
+      .foldLeftM[IO, (List[Hash], Hash)]((List.empty[Hash], Hash.empty)) {
+        case ((acc, parent), ord) =>
+          mkSnapshotWithEpoch(epoch = ord.toLong).flatMap {
+            case (signed, ctx) =>
+              signed.toHashed[IO].flatMap { hashed =>
+                chainStore
+                  .store(signed, ctx, ordinal = ord.toLong, slot = ord.toLong, parentHash = parent, vrfOutput = Array.empty)
+                  .as((acc :+ hashed.hash, hashed.hash))
+              }
+          }
+      }
+      .map(_._1)
+
   test("divergentRefuseCount starts at 0 and divergentRefuseSample is None") { res =>
     implicit val (_, _, _, h, _) = res
     implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
     for {
-      r <- mkChainStore
+      r <- mkChainStore()
       (chainStore, _, _, _) = r
       count <- chainStore.divergentRefuseCount
       sample <- chainStore.divergentRefuseSample
@@ -169,7 +209,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     implicit val spp: SecurityProvider[IO] = sp
     implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
     for {
-      r <- mkChainStore
+      r <- mkChainStore()
       (chainStore, finalizedRef, _, _) = r
       pair1 <- mkGenesis
       (s1, ctx1) = pair1
@@ -201,7 +241,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     implicit val spp: SecurityProvider[IO] = sp
     implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
     for {
-      r <- mkChainStore
+      r <- mkChainStore()
       (chainStore, finalizedRef, _, _) = r
       pair <- mkGenesis
       (s1, ctx1) = pair
@@ -220,7 +260,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     implicit val spp: SecurityProvider[IO] = sp
     implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
     for {
-      r <- mkChainStore
+      r <- mkChainStore()
       (chainStore, finalizedRef, _, _) = r
       pair1 <- mkGenesis
       (s1, ctx1) = pair1
@@ -268,7 +308,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     implicit val (_, _, _, h, _) = res
     implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
     for {
-      r <- mkChainStore
+      r <- mkChainStore()
       (chainStore, _, _, _) = r
       cleared <- chainStore.unsafe_clearFinality
     } yield expect.same(false, cleared)
@@ -281,7 +321,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     implicit val spp: SecurityProvider[IO] = sp
     implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
     for {
-      r <- mkChainStore
+      r <- mkChainStore()
       (chainStore, finalizedRef, _, _) = r
       // Seed local-finalized hash h1 at ord=1.
       pair1 <- mkGenesis
@@ -359,5 +399,117 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       cooldownMs = 5000L
     )
     expect.same(RebootstrapOrchestrator.Decision.Trigger, d)
+  }
+
+  // ============================================================
+  // Heap-leak Fix B: byHash retention bounded by keepDepthBehindFinalized.
+  // ============================================================
+
+  test("Fix B: byHash retains all entries when chain length below keepDepthBehindFinalized") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      // keepDepth=10, chain length=5 (well below). No eviction should fire.
+      r <- mkChainStore(keepDepthBehindFinalized = 10L)
+      (chainStore, _, _, _) = r
+      hashes <- seedChainOfLength(chainStore, n = 5)
+      preSize <- chainStore.size
+      // Finalize the tip — at ord=5, keepFloor = max(0, 5-10) = 0, so all canonical entries stay.
+      _ <- chainStore.finalize(hashes.last, ordinal = 5L)
+      postSize <- chainStore.size
+      tipPresent <- chainStore.get(hashes.last).map(_.isDefined)
+      genesisPresent <- chainStore.get(hashes.head).map(_.isDefined)
+    } yield
+      expect.all(
+        preSize == 5,
+        postSize == 5, // nothing evicted
+        tipPresent,
+        genesisPresent // genesis still in byHash because keepFloor=0
+      )
+  }
+
+  test("Fix B: byHash evicts canonical entries below finalizedOrd - keepDepthBehindFinalized on finalize") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      // keepDepth=3, chain length=10. Finalize at ord=10 ⇒ keepFloor=7. Ords 1..6 evicted.
+      r <- mkChainStore(keepDepthBehindFinalized = 3L)
+      (chainStore, _, _, _) = r
+      hashes <- seedChainOfLength(chainStore, n = 10)
+      preSize <- chainStore.size
+      _ <- chainStore.finalize(hashes.last, ordinal = 10L)
+      postSize <- chainStore.size
+      // Entries at ords 7..10 (the keep-window) should remain. 4 entries: 10, 9, 8, 7.
+      tipPresent <- chainStore.get(hashes(9)).map(_.isDefined) // ord 10
+      keepFloorPresent <- chainStore.get(hashes(6)).map(_.isDefined) // ord 7
+      belowKeepFloorAbsent <- chainStore.get(hashes(5)).map(_.isEmpty) // ord 6
+      genesisAbsent <- chainStore.get(hashes.head).map(_.isEmpty) // ord 1
+    } yield
+      expect.all(
+        preSize == 10,
+        postSize == 4, // 10, 9, 8, 7 retained
+        tipPresent,
+        keepFloorPresent,
+        belowKeepFloorAbsent,
+        genesisAbsent
+      )
+  }
+
+  test("Fix B: subsequent finalize advances eviction floor (sliding window)") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      r <- mkChainStore(keepDepthBehindFinalized = 3L)
+      (chainStore, _, _, _) = r
+      hashes <- seedChainOfLength(chainStore, n = 15)
+      // First finalize at ord=10 ⇒ keepFloor=7; entries 7..15 retained (9 entries).
+      _ <- chainStore.finalize(hashes(9), ordinal = 10L)
+      sizeAfterFirst <- chainStore.size
+      // Second finalize at ord=15 ⇒ keepFloor=12; entries 12..15 retained (4 entries).
+      _ <- chainStore.finalize(hashes(14), ordinal = 15L)
+      sizeAfterSecond <- chainStore.size
+      tipPresent <- chainStore.get(hashes(14)).map(_.isDefined) // ord 15
+      newFloorPresent <- chainStore.get(hashes(11)).map(_.isDefined) // ord 12
+      belowNewFloorAbsent <- chainStore.get(hashes(10)).map(_.isEmpty) // ord 11
+      priorFloorAbsent <- chainStore.get(hashes(6)).map(_.isEmpty) // ord 7
+    } yield
+      expect.all(
+        sizeAfterFirst == 9, // 7..15
+        sizeAfterSecond == 4, // 12..15
+        tipPresent,
+        newFloorPresent,
+        belowNewFloorAbsent,
+        priorFloorAbsent
+      )
+  }
+
+  test("Fix B: keepDepthBehindFinalized > 0 with finalizedOrd <= keepDepth is a no-op (genesis bootstrap)") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      // Production-ish: keepDepth=255. Chain shorter than that — keepFloor stays at 0.
+      r <- mkChainStore(keepDepthBehindFinalized = 255L)
+      (chainStore, _, _, _) = r
+      hashes <- seedChainOfLength(chainStore, n = 20)
+      _ <- chainStore.finalize(hashes.last, ordinal = 20L)
+      postSize <- chainStore.size
+      genesisPresent <- chainStore.get(hashes.head).map(_.isDefined)
+    } yield expect.all(postSize == 20, genesisPresent)
+  }
+
+  pureTest("Fix B: DefaultKeepDepthBehindFinalized is 255 (matches operational confirmation depth k₁)") {
+    expect.same(255L, NakamotoChainStore.DefaultKeepDepthBehindFinalized)
   }
 }
