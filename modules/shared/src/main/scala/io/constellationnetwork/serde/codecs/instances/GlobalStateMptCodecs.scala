@@ -6,6 +6,7 @@ import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnap
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
+import io.constellationnetwork.schema.kes.KesRegistrationCert.KesRegistrationRecord
 import io.constellationnetwork.schema.mpt.{AllowSpendExpiryKey, NodeCollateralWithdrawalExpiryKey, TokenLockExpiryKey}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
@@ -20,6 +21,7 @@ import io.constellationnetwork.serde.codecs.instances.AllowSpendCodec.{codec => 
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotCodecs._
 import io.constellationnetwork.serde.codecs.instances.DelegatedStakeCodecs._
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => hashCodec}
+import io.constellationnetwork.serde.codecs.instances.KesRegistrationCodecs._
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs._
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
@@ -62,6 +64,14 @@ object GlobalStateMptCodecs {
 
   implicit val pendingNodeCollateralWithdrawalSetCodec: ImmutableCodec[SortedSet[PendingNodeCollateralWithdrawal]] =
     ImmutableCodec.fromScodecCodec(sortedSet(pendingNodeCollateralWithdrawalCodec))
+
+  /** Per-operator history-set encoding for the `KesRegistrationCerts` MPT partition (§1.2 Slice 10 / #179). One MPT entry per `peerId`
+    * carrying the `SortedSet[KesRegistrationRecord]` of every accepted runtime cert for that operator. Ordering inside the set is
+    * `(acceptedAt, ordinal)` from `KesRegistrationRecord.ordering`, so the head is the earliest cert; lookups for "latest" iterate in
+    * reverse, which is fine for the bounded chains expected here (kept short by §1.2 rotation cadence).
+    */
+  implicit val kesRegistrationRecordSetCodec: ImmutableCodec[SortedSet[KesRegistrationRecord]] =
+    ImmutableCodec.fromScodecCodec(sortedSet(kesRegistrationRecordCodec))
 
   implicit val signedCurrencySnapshotImmutableCodec: ImmutableCodec[Signed[CurrencySnapshot]] =
     ImmutableCodec.fromScodecCodec(signedCurrencySnapshotCodec)
