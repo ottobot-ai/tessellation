@@ -3,11 +3,7 @@ package io.constellationnetwork.serde.codecs.instances
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.kes.KesRegistrationCert
-import io.constellationnetwork.schema.kes.KesRegistrationCert.{
-  KesRegistrationOrdinal,
-  KesRegistrationRecord,
-  KesRegistrationReference
-}
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationRecord, KesRegistrationReference}
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => hashCodec}
