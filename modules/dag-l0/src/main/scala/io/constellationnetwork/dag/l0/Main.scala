@@ -251,6 +251,7 @@ object Main
             .getOrElse(sharedConfig.environment, EpochProgress.MinValue),
           cfg.shared,
           storages.combinedGlobalSnapshotCheckpointStorage,
+          nodeShared.seedlist,
           getLocalChainTip = Some(forkRecoveryService.getLocalChainTip),
           maybeMarkSeen = Some(eventGossipDaemon.markSeen)
         )

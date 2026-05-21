@@ -183,7 +183,8 @@ object Services {
             queues.stateChannelOutput,
             queues.updateNodeParametersOutput,
             queues.delegatedStakeOutput,
-            queues.nodeCollateralOutput
+            queues.nodeCollateralOutput,
+            queues.kesRegistrationCertOutput
           ),
           validators.stateChannelValidator,
           pendingReader
@@ -281,6 +282,10 @@ object Services {
       )
       collateralService = MptStoreCollateral.make[F](cfg.collateral, pendingReader)
       recoveryPeerHintService <- RecoveryPeerHint.make[F].toResource
+      // §1.2 Slice 10 (#179): Runtime-mutable KES registry overlay built on top of the genesis-frozen
+      // `kesRegistry`. Lookups fall through to the genesis base until a Slice 10 registration cert finalizes for that
+      // operator. Wired here so HttpApi (POST /kes-registration) and GSAM accept-pipeline share the same instance.
+      mutableKesRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.kes.MutableKesRegistry.make[F](kesRegistry).toResource
     } yield
       new Services[F, R](
         localHealthcheck = sharedServices.localHealthcheck,
@@ -298,7 +303,8 @@ object Services {
         sidecarClient = sidecarClient,
         finalityTriggerViewRef = finalityTriggerViewRef,
         nipopowProofProviderRef = nipopowProofProviderRef,
-        pendingReader = pendingReader
+        pendingReader = pendingReader,
+        mutableKesRegistry = mutableKesRegistry
       ) {}
 }
 
@@ -329,5 +335,9 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   // #117/#118 Phase 2: branch-aware reader for gl0 HTTP routes / read paths. Resolves to the
   // chain's bestTip under MultiBranch so reads pick up the chain's pending writes, falling
   // through to base on miss. See `GlobalStateReader.pending` for the contract.
-  val pendingReader: GlobalStateReader[F]
+  val pendingReader: GlobalStateReader[F],
+  // §1.2 Slice 10 (#179): Runtime-mutable KES registry overlay shared by the HTTP intake
+  // (KesRegistrationCertRoutes) and the GSAM accept-pipeline (wave 2). Backed by an in-memory
+  // overlay until the MPT migration lands; reads fall through to the genesis-frozen base.
+  val mutableKesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.kes.MutableKesRegistry[F]
 )
