@@ -86,20 +86,14 @@ object Services {
         )
       val allowSpend =
         AllowSpendService
-          .make[F, P, S, SI](
-            storages.allowSpend,
-            storages.lastSnapshot,
-            sharedStorages.lastNGlobalSnapshot,
-            validators.allowSpend
-          )
+          .make[F, P, S, SI](storages.allowSpend, storages.lastSnapshot, validators.allowSpend)
       val allowSpendBlock = AllowSpendBlockService.make[F, P, S, SI](
         AllowSpendBlockAcceptanceManager.make[F](validators.allowSpendBlock),
         storages.address,
         storages.allowSpendBlock,
         storages.allowSpend,
         cfg.collateral.amount,
-        storages.lastSnapshot,
-        sharedStorages.lastNGlobalSnapshot
+        storages.lastSnapshot
       )
       val tokenLock =
         TokenLockService
