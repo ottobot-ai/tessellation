@@ -110,6 +110,21 @@ Test utilities are in `modules/test-shared/`.
 - Droste for recursion schemes
 - Newtype for zero-cost type wrappers
 
+## Config Conventions
+
+**Always prefer HOCON typed config over `sys.env.get(...)` reads in production code.** Scattered env reads risk cluster-split (different operators run with different defaults for consensus-critical values).
+
+When adding a new tunable, follow this pattern:
+
+1. Add the key to `modules/node-shared/src/main/resources/application.conf` under the `nakamoto { ... }` block (or appropriate namespace)
+2. Add a typed field on `NakamotoConfig` (or equivalent) at `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala`
+3. Thread the typed config through `SharedConfig.nakamoto.<field>` at use sites — NEVER `sys.env.get(...)`
+4. For env override, use HOCON's `${?ENV_VAR_NAME}` substitution **in `application.conf`** — concentrated config-level, not scattered code reads
+
+**If you encounter an existing `sys.env.get("NAKAMOTO_*")` call in code you're modifying, migrate it to HOCON as part of your change** unless the user explicitly says otherwise.
+
+This is a project-wide rule. Sub-agents and humans alike — encapsulate config, don't sprinkle env reads through the codebase.
+
 ## Codebase Overview
 
 Tessellation implements a hierarchical DAG consensus with L0 (global) aggregating L1 (metagraph) blocks. The largest module is `node-shared` (419k tokens) providing consensus FSM, anti-entropy gossip, and cluster management. Core data structures (transactions, blocks, snapshots, Merkle Patricia Tries) live in `shared`. Currency modules extend dag-l0/l1 with metagraph-specific logic and extension points for custom data applications.
