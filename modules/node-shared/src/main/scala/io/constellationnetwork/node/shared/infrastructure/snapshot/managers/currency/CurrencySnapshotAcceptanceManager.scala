@@ -74,6 +74,48 @@ trait CurrencySnapshotAcceptanceManager[F[_]] {
 }
 
 object CurrencySnapshotAcceptanceManager {
+
+  /** Select the GL0 ordinal the CL0 producer will sync to when stamping the next CL0 snapshot.
+    *
+    * Priority (producer path, when `forcedGlobalSyncView=None`): (A) peer `GlobalSnapshotSync` quorum (`maybeSnapshotOrdinalSync`) — when
+    * present, it is the consensus-derived sync point and wins outright (committee-of-peers can legitimately be ahead of the local follower
+    * at small CL0 cohort sizes). (B) prior CL0 snapshot's `globalSyncView.ordinal` (`maybeLastGlobalSyncView`) — a monotonic lower bound
+    * that protects against local-follower regression on reorg. (C) the producer's actual GL0 head (`fallbackOrdinal =
+    * lastUnsyncGlobalSnapshot.ordinal`) under finality, this is always reachable and advances monotonically.
+    *
+    * Bug fixed by this helper (see docs/nakamoto/MODE2-GLOBAL-SYNC-VIEW-RCA.md): The previous priority chain preferred (B) over (C)
+    * outright via `.orElse`, which created a strict fixed point at the genesis-inherited `GlobalSyncView(ord=1, epochProgress=1)`. Once
+    * seeded by `mkFirstIncrementalSnapshot`, the producer could not escape it without peer-sync quorum (A) materializing — which is racy at
+    * small ml0 cohorts. Symptom: cl1 reports `currentEpochProgress=1` indefinitely; AllowSpend rejects with
+    * `TooFarLastValidEpochProgress{epochProgress=<N>, currentEpochProgress=1}`.
+    *
+    * Fix: when (A) is None, take `max((B), (C))` rather than `(B).orElse((C))`. This preserves (B)'s lower-bound semantics for the rare
+    * local-regression case while letting the producer escape genesis once `lastUnsyncGlobalSnapshot.ordinal` advances.
+    *
+    * `MinValue` (ord=0) on path (B) is treated as "no prior view"; pre-fix logic already filtered this out and the helper retains that to
+    * avoid using the `Ord.MinValue` sentinel as a real ordinal.
+    */
+  private[currency] def selectOrdinalToFetchGlobalSnapshot(
+    forcedGlobalSyncView: Option[GlobalSyncView],
+    maybeSnapshotOrdinalSync: Option[SnapshotOrdinal],
+    maybeLastGlobalSyncView: Option[GlobalSyncView],
+    fallbackOrdinal: SnapshotOrdinal
+  ): SnapshotOrdinal =
+    forcedGlobalSyncView.map(_.ordinal) match {
+      case Some(forced) => forced
+      case None =>
+        maybeSnapshotOrdinalSync match {
+          case Some(peerSync) => peerSync
+          case None =>
+            val priorOrdinal =
+              maybeLastGlobalSyncView.map(_.ordinal).filter(_ =!= SnapshotOrdinal.MinValue)
+            priorOrdinal match {
+              case Some(prior) => if (prior >= fallbackOrdinal) prior else fallbackOrdinal
+              case None        => fallbackOrdinal
+            }
+        }
+    }
+
   def make[F[_]: Async: Parallel: JsonSerializer](
     fieldsAddedOrdinals: FieldsAddedOrdinals,
     environment: AppEnvironment,
@@ -305,14 +347,16 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     // local head) and use the exact ordinal the producer used. Under GL0 finality,
     // this ordinal is guaranteed reachable on our chain; hash is verified as a
     // sanity check.
-    ordinalToFetchGlobalSnapshot <- forcedGlobalSyncView
-      .map(_.ordinal)
-      .fold(
-        maybeSnapshotOrdinalSync
-          .orElse(maybeLastGlobalSyncView.map(_.ordinal))
-          .filter(_ =!= SnapshotOrdinal.MinValue)
-          .fold(fallbackOrdinal.pure[F])(_.pure[F])
-      )(_.pure[F])
+    //
+    // Producer path: see CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot
+    // for the priority semantics (peer-sync > max(prior-view, local-head)). Mode-2 bug fix
+    // documented in docs/nakamoto/MODE2-GLOBAL-SYNC-VIEW-RCA.md.
+    ordinalToFetchGlobalSnapshot = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
+      forcedGlobalSyncView,
+      maybeSnapshotOrdinalSync,
+      maybeLastGlobalSyncView,
+      fallbackOrdinal
+    )
 
     lastSyncGlobalSnapshot <- lastGlobalSnapshots.find(_.ordinal === ordinalToFetchGlobalSnapshot) match {
       case Some(value) => value.pure[F]
