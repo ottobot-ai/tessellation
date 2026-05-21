@@ -9,6 +9,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.PartitionNamespace._
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.priceOracle.TokenPair
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
@@ -213,6 +214,21 @@ object GlobalStateFieldId {
     */
   case object TowerEntries extends GlobalStateFieldId { def toInt: Int = 21 }
 
+  /** §1.2 Slice 10 KES runtime registration certs (#179). Per-operator full history of accepted certs, keyed by `peerId`, value
+    * `SortedSet[KesRegistrationRecord]`. This is the durable source of truth that `MutableKesRegistry` materializes its overlay from across
+    * node restarts and that newly-joining cluster peers replay from finalized state.
+    *
+    * Mirrors the `ActiveNodeCollaterals` shape: per-operator SortedSet of records, with cert chain ordering enforced by `parent`/`ordinal`
+    * inside each record. Paired with `LastKesRegistrationRefs` for O(1) lookup of the latest accepted cert per peer.
+    */
+  case object KesRegistrationCerts extends GlobalStateFieldId { def toInt: Int = 22 }
+
+  /** §1.2 Slice 10 last accepted `KesRegistrationReference` per operator (#179). Keyed by `peerId`, value `KesRegistrationReference`.
+    * Provides O(1) chain-link lookup for the validator (`parent` matching) and identifies the head of the per-peer cert history without
+    * needing to scan the full `KesRegistrationCerts` set. Mirrors the `LastTxRefs` / `LastAllowSpendRefs` pattern.
+    */
+  case object LastKesRegistrationRefs extends GlobalStateFieldId { def toInt: Int = 23 }
+
   implicit val ordering: Ordering[GlobalStateFieldId] = Ordering.by(_.toInt)
   implicit val show: Show[GlobalStateFieldId] = Show.show(_.toInt.toString)
 
@@ -244,6 +260,8 @@ object GlobalStateFieldId {
     case 19 => Some(SystemIndex)
     case 20 => Some(HistoricalStakeSnapshots)
     case 21 => Some(TowerEntries)
+    case 22 => Some(KesRegistrationCerts)
+    case 23 => Some(LastKesRegistrationRefs)
     case _  => None
   }
 }
@@ -281,6 +299,24 @@ object GlobalStateKey {
   def updateNodeParametersKey[F[_]: Sync: Hasher](id: Id): F[GlobalStateKey] =
     Hasher[F].hash(id.hex.value).map { h =>
       GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.UpdateNodeParameters, EmptyNamespace, HashNamespace(h))
+    }
+
+  /** Hypergraph key into the `KesRegistrationCerts` partition. Keyed by `peerId` (hex of operator's long-term pubkey) hashed into the
+    * user-namespace slot. One MPT entry per operator carrying the full `SortedSet[KesRegistrationRecord]` history (latest at head by
+    * `acceptedAt + ordinal`).
+    */
+  def kesRegistrationCertsKey[F[_]: Sync: Hasher](peerId: PeerId): F[GlobalStateKey] =
+    Hasher[F].hash(peerId.value.value).map { h =>
+      GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.KesRegistrationCerts, EmptyNamespace, HashNamespace(h))
+    }
+
+  /** Hypergraph key into the `LastKesRegistrationRefs` partition. Keyed by `peerId`. Value is the latest accepted
+    * `KesRegistrationReference` for the operator — provides O(1) chain-link lookup for the validator and the runtime registry without
+    * scanning the full cert history.
+    */
+  def lastKesRegistrationRefsKey[F[_]: Sync: Hasher](peerId: PeerId): F[GlobalStateKey] =
+    Hasher[F].hash(peerId.value.value).map { h =>
+      GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.LastKesRegistrationRefs, EmptyNamespace, HashNamespace(h))
     }
 
   /** Hypergraph key whose user-namespace component carries a pre-computed hash of a `TokenPair`. Used for the `PriceState` partition which

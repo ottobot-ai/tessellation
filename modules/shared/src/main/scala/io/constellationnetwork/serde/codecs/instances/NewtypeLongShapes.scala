@@ -9,6 +9,7 @@ import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeAmount, Dele
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.generation.Generation
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.kes.KesRegistrationCert.KesRegistrationOrdinal
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.node.UpdateNodeParametersOrdinal
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralAmount, NodeCollateralFee, NodeCollateralOrdinal}
@@ -113,6 +114,9 @@ object NewtypeLongShapes {
 
   implicit val nodeCollateralAmountShape: NonNegLongNewtype[NodeCollateralAmount] =
     NonNegLongNewtype.instance(NodeCollateralAmount(_), _.value)
+
+  implicit val kesRegistrationOrdinalShape: NonNegLongNewtype[KesRegistrationOrdinal] =
+    NonNegLongNewtype.instance(KesRegistrationOrdinal(_), _.value)
 
   implicit val messageOrdinalShape: NonNegLongNewtype[MessageOrdinal] =
     NonNegLongNewtype.instance(MessageOrdinal(_), _.value)

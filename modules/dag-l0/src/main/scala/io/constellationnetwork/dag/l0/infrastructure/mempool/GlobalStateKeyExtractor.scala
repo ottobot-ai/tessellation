@@ -60,6 +60,14 @@ class GlobalStateKeyExtractor[F[_]: Applicative] extends StateKeyExtractor[F, Gl
         Set(
           GlobalStateKey.hypergraph(NodeCollateralWithdrawals, signed.value.source)
         ).pure[F]
+
+      case KesRegistrationCertEvent(_) =>
+        // Slice 10 (#179): KES registration certs do not yet have a dedicated MPT partition. Returning an
+        // empty key set means the mempool's conflict detector treats them as never-conflicting; this is safe
+        // because per-operator chain-link / monotonic-ordinal enforcement happens in the validator + acceptance
+        // manager regardless of which other events are bundled into the same snapshot. A follow-up slice will
+        // introduce a `KesRegistrationCerts` FieldId and return the per-operator key here.
+        Set.empty[GlobalStateKey].pure[F]
     }
 
   private def extractDAGEventKeys(block: Block): Set[GlobalStateKey] =

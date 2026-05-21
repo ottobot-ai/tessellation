@@ -2,6 +2,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot
 
 import io.constellationnetwork.schema.Block
 import io.constellationnetwork.schema.delegatedStake.UpdateDelegatedStake
+import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
 import io.constellationnetwork.schema.swap.AllowSpendBlock
@@ -52,4 +53,10 @@ object event {
   case class CreateNodeCollateralEvent(value: Signed[UpdateNodeCollateral.Create]) extends UpdateNodeCollateralEvent
   @derive(eqv, decoder, encoder, show)
   case class WithdrawNodeCollateralEvent(value: Signed[UpdateNodeCollateral.Withdraw]) extends UpdateNodeCollateralEvent
+
+  /** §1.2 Slice 10 (#179) — runtime KES master-VK registration cert event. Carried alongside the other event types in the global snapshot's
+    * event set. Acceptance is handled by `KesRegistrationCertAcceptanceManager` (separate slice will wire it into GSAM).
+    */
+  @derive(eqv, decoder, encoder, show)
+  case class KesRegistrationCertEvent(value: Signed[KesRegistrationCert]) extends GlobalSnapshotEvent
 }
