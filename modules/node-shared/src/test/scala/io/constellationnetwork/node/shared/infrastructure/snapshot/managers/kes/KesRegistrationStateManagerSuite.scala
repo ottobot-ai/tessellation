@@ -41,8 +41,8 @@ import weaver.MutableIOSuite
   *   - `getUpdatedKesRegistrationCerts` is idempotent on `(peerId, ordinal)` replays.
   *   - `getUpdatedLastRefs` advances pointers for newly-accepted peers and preserves prior pointers for untouched peers.
   *
-  * Mirrors the test style of `NodeCollateralStateManager`-adjacent suites (no `NodeCollateralStateManagerSuite` exists in the
-  * repo today; closest match is `TokenLockStateManagerSuite`).
+  * Mirrors the test style of `NodeCollateralStateManager`-adjacent suites (no `NodeCollateralStateManagerSuite` exists in the repo today;
+  * closest match is `TokenLockStateManagerSuite`).
   */
 object KesRegistrationStateManagerSuite extends MutableIOSuite {
 
