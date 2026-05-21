@@ -75,7 +75,11 @@ shards) as structural defence + Option C (out-of-band slashing /
 governance) as economic deterrent. Option B (per-shard attestation-set
 on SC binaries) is REJECTED — modifying how metagraphs construct their
 submitted state-channel binaries is out of scope (user directive
-2026-05-15).**
+2026-05-15). The combined defence enables a load-bearing structural
+simplification at gl0: **removing universal currency re-validation**
+(§2.7). gl0 ceases re-executing metagraph currency-layer transitions;
+shard members are the sole re-executors; gl0 verifies state-proofs +
+shard-quorum signatures + slashing-protected operator identity.**
 
 The one-paragraph rationale: under the GKL §5.2 derivation, an
 adversary holding `α_total > 1/(2S)` global stake can concentrate
@@ -103,6 +107,21 @@ signatures we accept it. Modifying metagraph consensus is out of
 scope."* The structural-vs-deterrent split (A + C) substitutes for
 the rejected attestation-set approach (B) by moving the defence
 entirely to gl0's admission and post-hoc enforcement layers.
+
+**What changes architecturally (§2.7)**: today gl0 re-executes every
+metagraph's currency-layer transitions inside the global pipeline. This
+is universal-replicated work that does not parallelize across shards —
+and is what would require every operator to hold every metagraph's
+currency state. The proposed model keeps gl0's role universal but
+shifts re-execution to the sortitioned shard members. gl0 verifies
+state-proofs (`prev_root → applied_transitions → claimed_new_root`)
+against the previous aggregate snapshot's subtree root, no longer
+re-executes. Non-shard operators hold only the 32-byte subtree-root
+stub per metagraph; shard members hold the full subtree for their
+sortitioned metagraph. This is the original intent of the cross-shard
+sharding design and is the headline architectural payoff of Option A.
+**This change is hard-fork-gated** (sequenced last, per
+`:project_post_nipopow_phase_order`).
 
 ---
 
@@ -310,14 +329,56 @@ in ways §7 enumerates.
 on the explicit grounds that modifying metagraph consensus (Option B)
 is out of scope.
 
-### 2.6 Operational considerations at scale
+### 2.6 Operational considerations at scale — role decomposition + storage model
 
-At target scale (10K-100K operators, 1K-3K metagraphs), per-epoch bandwidth is the dominant operational cost:
+**Shard members are a sortitioned subset of the gl0 operator pool.** There is no separate operator class. Every operator runs gl0 (universal); each operator is additionally sortitioned (VRF, per epoch) to exactly one shard (`m = 1` per §2.4).
 
-- **Per-rotation bootstrap**: with `stagger_fraction = 1/4` and N=10K, each eta-boundary triggers `N/4 = 2,500` operators-in-rotation. If each carries ~100MB of metagraph state, cluster-wide transfer ≈ 250GB per eta-boundary (~6h), or ~11MB/s sustained. Per-node sync is bounded at ~1Gbps → ~0.8s per operator, parallelizable.
-- **Pre-warming budget**: an operator notified at `join_epoch + 1` has ~6h to download state before being on-duty. 100MB in 6h is trivial; this concern is academic unless state grows to GB-scale per metagraph.
-- **gl0 stamping load**: aggregate snapshot includes one tip-hash per shard. At S=3000 shards, 32-byte hashes + metadata ≈ 100KB per gl0 snapshot. At 7s cadence ≈ 14KB/s — fine.
-- **gl0 acceptance CPU**: one VRF-eligibility check per binary admission. At 3000 binaries per gl0 snapshot × ~10ms each = 30s of work per snapshot — exceeds the 7s cadence. Mitigation: batched VRF verification, cached committee assignments per `(operator, epoch)`. Address in implementation phase A2.
+| Operator role | State held | Re-executes metagraph transitions? |
+|---|---|---|
+| **gl0 participant (universal — every operator)** | gl0 aggregate (DAG balances, per-metagraph commitments: state root, lastTxRef root, balance root) + 32-byte subtree-root stub per metagraph | NO — only verifies state-proofs at SC binary admission |
+| **Shard member for metagraph X (sortitioned this epoch — `N/S` operators)** | Above + **full state subtree for metagraph X** | YES — re-executes metagraph X's currency-layer transitions inside the shard's consensus |
+
+**Subtree-stub pattern.** For metagraphs an operator is NOT sortitioned to, they hold only the **subtree root hash** (32 bytes per metagraph) in their local MPT. Inclusion proofs from shard members + verification against the stored root give them read-when-needed access to specific leaves without storing intermediate trie nodes. New shard members bootstrap by requesting the full subtree from current shard members + verifying the synced state matches gl0's stored subtree root for that metagraph. This is the standard "stateless verification + state-sync" pattern (Polkadot warp sync, Cosmos state sync, Eth2 checkpoint sync).
+
+**Per-operator storage**: bounded at `(gl0 state) + (one metagraph's full state) + (S × 32-byte subtree-root stubs)`. At S=3000 metagraphs: ~96KB of stubs + ~100MB of one metagraph's full state. **Independent of total metagraph count** for the full-state portion — this is the key scaling property.
+
+**Per-rotation bootstrap (state acquisition)**: when an operator is sortitioned out of shard X and into shard Y, they sync metagraph Y's state from existing shard Y members via inclusion proofs, verify the synced state matches gl0's stored subtree root for Y, then participate. With `stagger_fraction = 1/4` and N=10K operators: 2,500 operators rotate per eta-boundary (~6h), each downloading ~100MB ONCE. **Per-node** sync cost: 100MB / 6h ≈ 4.6KB/s sustained — trivial. The 250GB cluster-wide aggregate is split across 2,500 independent sync flows, not concentrated at any one source. The pre-warm window (1 epoch advance notice) gives the full 6h budget for the sync.
+
+**Cross-shard reads** (e.g., a spend-action in shard X references a balance in shard Y): the validator in shard X requests an inclusion proof from shard Y's members, verifies the proof against the locally-stored subtree root for Y, accepts the state read without re-executing shard Y's transition function.
+
+**gl0 stamping load**: aggregate snapshot includes one subtree root + commitment metadata per metagraph. At S=3000 metagraphs, ~100B/metagraph ≈ 300KB per gl0 snapshot. At 7s cadence: ~43KB/s — fine.
+
+**gl0 acceptance CPU**: one VRF-eligibility check per SC binary + one state-proof verification (verify `prev_root → applied_transitions → claimed_new_root` holds against the binary's embedded proof, NOT re-execute the transitions). At 3000 binaries per gl0 snapshot × (~10ms VRF + ~50ms proof verify) = 180s/snapshot — exceeds the 7s cadence. Mitigation: batched verification + cached committee assignments + parallelizable proof checks. Address in implementation phase A2.
+
+### 2.7 gl0 simplification — removing universal currency re-validation
+
+**This is the load-bearing structural change Option A enables.** Today gl0 re-executes every metagraph's currency-layer transitions inside the global pipeline (`SpendActionValidator` + `priorBalances` merge inside `GlobalSnapshotAcceptanceManager`). That re-execution is what makes "every gl0 operator must hold every metagraph's currency state" a current necessity — and is the implicit defence against captured-metagraph attacks (mint-from-thin-air). It is also what bounds throughput: currency re-validation is universal-replicated work that does not parallelize across shards.
+
+Under the proposed sharding model:
+
+- **gl0 stops re-executing currency-layer transitions.** The metagraph's shard members are the sole re-executors.
+- **gl0 verifies the SC binary's state proof.** Each binary embeds a proof that `prev_root → applied_transitions → claimed_new_root` holds. gl0 checks this proof against the previous aggregate snapshot's stored subtree root for that metagraph. Verification is cheap (Merkle path + transition algebra), not re-execution.
+- **Trust substitutes for re-execution.** The shard quorum signed off (Option A's VRF-sortitioned set), and the signers risk slashed collateral if the claimed state is fraudulent (Option C).
+
+**Safety substitute — the three legs the gl0 simplification stands on**:
+
+1. **Shard quorum unforgeable**: VRF assignment + `α_global · m/S < 1/3` per shard (the §1.1 / GKL §5.2 bound, defended by Option A) means no adversary can buy a shard's quorum.
+2. **Equivocation is permanently provable and economically suicidal**: KES forward-security (`:project_kes_port_constraints`) + slashing (Option C) means any signed-fraud is captured as on-chain evidence and burns collateral.
+3. **State transitions are succinctly verifiable**: the SC binary's state-proof against the previous aggregate root gives gl0 cryptographic certainty without re-execution.
+
+**What this lets us delete from gl0 hot path**:
+- `SpendActionValidator` priorBalances merge in `GlobalSnapshotAcceptanceManager`
+- Per-metagraph currency balance state inside `GlobalSnapshotInfo.lastCurrencySnapshots` (replaced by subtree-root commitment only)
+- The cross-metagraph currency-balance reconciliation step inside GSAM (replaced by state-proof verification at admission)
+
+**What gl0 keeps**:
+- Aggregate snapshot with per-metagraph commitments (subtree roots + metadata)
+- VRF-eligibility check on SC binary submitters (Option A)
+- Equivocation detector + slashing evidence pipeline (Option C)
+- DAG (Layer-0) balance / token-lock / delegated-stake state (universal, unsharded — this is the part user said "all nodes hold global state of all metagraphs" was about: the aggregate-level state, not the per-metagraph data)
+- Snowball cascade for gl0's own finality
+
+**Migration**: this is a hard fork. Per `:project_post_nipopow_phase_order`, hard fork is sequenced LAST. The sharding scaffolding (A1+A2+A3 from §5.3) can begin behind staged-rollout flags while gl0 still re-executes; the re-execution removal (A4 below) is the final step that lands at the hard fork boundary.
 
 ---
 
@@ -623,24 +684,39 @@ unchanged — still a single operator signature).
 
 ### 5.3 Sequencing
 
-1. **A0** — VRF-sortition design freeze: pick sortition unit
-   (per-operator vs per-validator vs hybrid — see §7.1), epoch length
-   `E` (see §7.3), and shard count `S` baseline. Closes via decision
-   in §7.
+1. **A0** — VRF-sortition design freeze: locked in §2.4
+   (per-operator-key sortition, `m=1`, stagger 1/4, eta-rotation
+   `R=2550`, `S=M` v1).
 2. **A1** — `OperatorShardAssignment` service in
    `node-shared/.../domain/sharding/` (location TBD pending the
    broader sharding skeleton). Reuses the VRF + eta pattern from
    [`EligibilityChecker.scala`](../../modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/EligibilityChecker.scala).
 3. **A2** — `StateChannelValidator` gains a `validateShardEligibility`
    step at `validateAllowedSignatures` (lines `164-167`); behind a
-   staged-rollout config flag.
-4. **C0** — KES port (`:project_kes_port_constraints`) — hard
+   staged-rollout config flag (`NAKAMOTO_SHARD_VRF_ELIGIBILITY_GATE`).
+4. **A3** — operator-side shard awareness: which metagraph am I
+   currently sortitioned to? Affects which shard cluster this operator
+   joins for state re-execution duties. State-sync infrastructure for
+   per-rotation bootstrap (§2.6). Subtree-stub population in
+   `GlobalSnapshotInfo` (non-shard members store only the 32-byte
+   subtree root; shard members store full subtree). **Operational
+   layer; not consensus-critical until A4.**
+5. **C0** — KES port (`:project_kes_port_constraints`) — hard
    prerequisite for C1.
-5. **C1** — Equivocation detector at gl0: monitors for two SC binaries
+6. **C1** — Equivocation detector at gl0: monitors for two SC binaries
    from same operator key at same shard slot with different state
    hashes; emits a slashing-evidence packet.
-6. **C2** — Slashing pipeline: on-chain consumption of evidence
+7. **C2** — Slashing pipeline: on-chain consumption of evidence
    packets; node-collateral burn / governance pause.
+8. **A4** — **gl0 simplification (HARD FORK)**: remove the
+   `SpendActionValidator` priorBalances merge from `GlobalSnapshotAcceptanceManager`;
+   replace metagraph currency re-execution with state-proof verification
+   at SC binary admission (§2.7). Replace `lastCurrencySnapshots` full
+   snapshot embedding with subtree-root commitment only. **Hard-prerequisites**:
+   A1+A2 load-bearing (VRF-eligibility live), A3 (subtree-stub MPT
+   pattern deployed), C1+C2 live (equivocation evidence + slashing
+   pipeline active). This is the final step of the sharding rollout and
+   lands at the hard fork boundary per `:project_post_nipopow_phase_order`.
 
 ### 5.4 What we are explicitly **not** committing to
 
@@ -811,32 +887,19 @@ on the gl0 admission and slashing layers.
 These are flagged for the implementation workstream and the
 Tier-2 sharding plan. This document does not attempt to close them.
 
-### 7.1 Sortition unit — **load-bearing under Options A + C**
+### 7.1 Sortition unit — **RESOLVED 2026-05-20**
 
-Under the chosen design the VRF-sortition input determines what kind
-of key is assigned to a shard. Per user directive (2026-05-15), the
-default is **per-operator-key** sortition: each operator public key
-draws its eligible shard from `VRF(operator_pk, ηₑ)`. But the two-
-tier stake model from `:project_sharding_strategic_signals` — combined
-**delegated stake + node collateral** — may push toward a finer-
-grained unit. Three candidates:
+**Decision: per-operator-key sortition.** Each operator public key draws its eligible shard from `VRF(operator_pk, ηₑ ‖ "SHARD-ASSIGN") mod S`. Resolved per the §2.4 locked decisions.
 
-- **Per-operator-key (default).** Sortition input is the operator's
-  L0 signing public key. Simplest; matches the directive's plain
-  reading. Concentration is structurally blocked at the eligible-
-  submitter set; an operator with N keys cannot place them all into
-  one shard.
-- **Per-validator (delegated-stake-weighted).** Sortition input is a
-  (validator, operator) tuple; eligibility is weighted by delegated
-  stake. Aligns the two-tier model: delegators staking to operator
-  `O` indirectly influence shard assignment.
-- **Hybrid.** Operators declare eligibility at registration time; VRF
-  picks the *active subset* of eligible operators per epoch per
-  shard. Lets operators opt into shards they have infrastructure
-  for, while preserving per-epoch VRF rotation.
+Rationale (per the user-confirmed metagraph-throughput thread):
+- Simplest semantics: matches existing seedlist + PeerId-keyed primitives.
+- Delegators stake to operators without re-staking per-shard — the delegated-stake-weighted variant would have required delegators to pre-commit to shard assignments, an untenable UX hit at the 10K-100K operator scale.
+- Concentration is structurally blocked: an operator controlling `N` keys cannot place them all in one shard because each key independently draws from `VRF(pk, ηₑ)`.
+- Two-tier stake (`:project_sharding_strategic_signals`) is preserved: stake-weighting can still inform *which* operators are *eligible to register* (e.g., minimum node collateral); sortition then assigns the registered set uniformly to shards via VRF.
 
-**Needs decision before A0.** The two-tier-stake interaction is the
-load-bearing constraint; see `:project_sharding_strategic_signals`.
+Rejected alternatives (retained for record):
+- **Per-validator (delegated-stake-weighted)**: too complex for the delegator UX; per-shard re-staking is operationally untenable at scale.
+- **Hybrid (operator-declared eligibility)**: defeats the structural defence — adversaries would declare eligibility only for their target shard.
 
 ### 7.2 `T_depth1` fallback at the per-shard sub-snapshot boundary
 
