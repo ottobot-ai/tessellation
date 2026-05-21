@@ -129,13 +129,13 @@ object KesRegistrationCodecsSuite extends FunSuite {
     // PeerId.codec writes a uint16 length prefix + hex bytes: "aabb" → "0002 aabb"
     // Hex codec same shape: "cafebabe" → "0004 cafebabe"
     val expected = ByteVector.fromValidHex(
-      "0002aabb" +              // peerId: len=2 + bytes aabb
-        "0004cafebabe" +        // kesMasterVK: len=4 + bytes cafebabe
-        "00000003" +            // kesMasterVKStep: int32 = 3
-        "0000000000000005" +    // offset: int64 = 5
-        "0000000000000064" +    // effectiveFromEpoch: 100
-        "0000000000000007" +    // ordinal: 7
-        ("00" * 40)             // parent: KesRegistrationReference.empty
+      "0002aabb" + // peerId: len=2 + bytes aabb
+        "0004cafebabe" + // kesMasterVK: len=4 + bytes cafebabe
+        "00000003" + // kesMasterVKStep: int32 = 3
+        "0000000000000005" + // offset: int64 = 5
+        "0000000000000064" + // effectiveFromEpoch: 100
+        "0000000000000007" + // ordinal: 7
+        ("00" * 40) // parent: KesRegistrationReference.empty
     )
     expect(bytes == expected)
   }
