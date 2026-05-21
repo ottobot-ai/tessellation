@@ -12,11 +12,13 @@ import io.constellationnetwork.dag.l0.http.routes._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotKey
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.schema.GlobalConsensusOutcome
+import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.env.AppEnvironment._
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.config.types.{HttpConfig, RouteRateLimiterConfig, SharedConfig}
+import io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertValidator
 import io.constellationnetwork.node.shared.domain.snapshot.finality.{FinalityGate, FinalizedSnapshotReader}
 import io.constellationnetwork.node.shared.http.p2p.middlewares.{MetricsMiddleware, PeerAuthMiddleware, `X-Id-Middleware`}
 import io.constellationnetwork.node.shared.http.routes._
@@ -26,6 +28,7 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.Combi
 import io.constellationnetwork.node.shared.modules.SharedValidators
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.peer.PeerId
@@ -59,6 +62,10 @@ object HttpApi {
       GlobalIncrementalSnapshot,
       GlobalSnapshotInfo
     ],
+    // §1.2 Slice 10 (#179): L0 seedlist threaded into the KES registration validator built inside HttpApi.
+    // Mirrors the seedlist that `SharedValidators` already received — the validator uses it to gate
+    // who is authorized to submit a runtime KES registration cert.
+    l0Seedlist: Option[Set[SeedlistEntry]],
     getLocalChainTip: Option[F[Option[ChainTip]]] = None,
     maybeMarkSeen: Option[Hash => F[Unit]] = None
   ): F[HttpApi[F, R]] = {
@@ -94,6 +101,7 @@ object HttpApi {
           delegatedStakingWithdrawalTimeLimit,
           sharedConfig,
           snapshotRoutes,
+          l0Seedlist,
           getLocalChainTip,
           maybeMarkSeen
         ) {}
@@ -118,6 +126,7 @@ sealed abstract class HttpApi[
   delegatedStakingWithdrawalTimeLimit: EpochProgress,
   sharedConfig: SharedConfig,
   snapshotRoutes: SnapshotRoutes[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+  l0Seedlist: Option[Set[SeedlistEntry]],
   getLocalChainTip: Option[F[Option[ChainTip]]] = None,
   maybeMarkSeen: Option[Hash => F[Unit]] = None
 ) {
@@ -129,7 +138,8 @@ sealed abstract class HttpApi[
         queues.stateChannelOutput,
         queues.updateNodeParametersOutput,
         queues.delegatedStakeOutput,
-        queues.nodeCollateralOutput
+        queues.nodeCollateralOutput,
+        queues.kesRegistrationCertOutput
       )
       .apply(L0CellInput.HandleUpdateNodeParameters(params))
 
@@ -140,7 +150,8 @@ sealed abstract class HttpApi[
         queues.stateChannelOutput,
         queues.updateNodeParametersOutput,
         queues.delegatedStakeOutput,
-        queues.nodeCollateralOutput
+        queues.nodeCollateralOutput,
+        queues.kesRegistrationCertOutput
       )
       .apply(L0CellInput.HandleDelegatedStake(data))
 
@@ -151,9 +162,26 @@ sealed abstract class HttpApi[
         queues.stateChannelOutput,
         queues.updateNodeParametersOutput,
         queues.delegatedStakeOutput,
-        queues.nodeCollateralOutput
+        queues.nodeCollateralOutput,
+        queues.kesRegistrationCertOutput
       )
       .apply(L0CellInput.HandleNodeCollateral(data))
+
+  // §1.2 Slice 10 (#179): Mirrors `mkNodeCollateralCell` — wraps the validated `Signed[KesRegistrationCert]`
+  // in an `L0Cell` whose algebra offers the cert into `queues.kesRegistrationCertOutput`. The events
+  // publisher daemon drains the queue and lifts each cert to a `KesRegistrationCertEvent` for the mempool,
+  // which the GSAM accept-pipeline (wave 2) picks up and applies to `services.mutableKesRegistry`.
+  private val mkKesRegistrationCertCell = (cert: Signed[KesRegistrationCert]) =>
+    L0Cell
+      .mkL0Cell(
+        queues.l1Output,
+        queues.stateChannelOutput,
+        queues.updateNodeParametersOutput,
+        queues.delegatedStakeOutput,
+        queues.nodeCollateralOutput,
+        queues.kesRegistrationCertOutput
+      )
+      .apply(L0CellInput.HandleKesRegistrationCert(cert))
 
   private val clusterRoutes =
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -208,6 +236,22 @@ sealed abstract class HttpApi[
       services.pendingReader
     )
   }
+
+  // §1.2 Slice 10 (#179): Runtime KES master-VK registration intake. The route validates the cert (signature,
+  // monotonic ordinal, chain-link parent, forward activation, well-formed VK) and on success offers it into
+  // the cell that publishes a `KesRegistrationCertEvent` for the mempool. Reads/writes the shared
+  // `services.mutableKesRegistry` so `lastReference` matches what the validator + GSAM accept-pipeline see.
+  private val kesRegistrationCertRoutes = HasherSelector[F].withCurrent { implicit hasher =>
+    val validator = KesRegistrationCertValidator.make[F](sharedValidators.signedValidator, l0Seedlist)
+    val onAccepted: Signed[KesRegistrationCert] => F[Unit] = cert => mkKesRegistrationCertCell(cert).run().void
+    KesRegistrationCertRoutes[F](
+      onAccepted,
+      validator,
+      storages.globalSnapshot,
+      services.mutableKesRegistry
+    )
+  }
+
   private val tokenLockRoutes = GL0TokenLockRoutes(storages.globalSnapshot, services.pendingReader)
 
   // Chain-quality / finality-triggers observable (#138). Reads the FinalityTriggerView Ref
@@ -265,7 +309,8 @@ sealed abstract class HttpApi[
                 tokenLockRoutes.publicRoutes <+>
                 nodeParametersRoutes.publicRoutes <+>
                 delegatedStakesRoutes.publicRoutes <+>
-                nodeCollateralsRoutes.publicRoutes
+                nodeCollateralsRoutes.publicRoutes <+>
+                kesRegistrationCertRoutes.publicRoutes
             }
           }
       }
