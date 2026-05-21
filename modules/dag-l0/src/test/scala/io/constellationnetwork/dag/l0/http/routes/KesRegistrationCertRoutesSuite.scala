@@ -40,17 +40,17 @@ import suite.HttpSuite
 
 /** §1.2 Slice 10 (#179) — route-level tests for `KesRegistrationCertRoutes`.
   *
-  * Mirrors `NodeCollateralRoutesSuite` (the foundation pattern): stub a `SnapshotStorage.head`, build a real
-  * `MutableKesRegistry` over an empty base `KesRegistry`, and exercise each rejection path the route surfaces:
+  * Mirrors `NodeCollateralRoutesSuite` (the foundation pattern): stub a `SnapshotStorage.head`, build a real `MutableKesRegistry` over an
+  * empty base `KesRegistry`, and exercise each rejection path the route surfaces:
   *
   *   - POST a well-formed cert → 200 + body carrying the persisted hash + the `onAccepted` sink saw the cert
   *   - POST cert with invalid sig (signer != operator) → 400
   *   - POST cert with stale ordinal (replay) → 400
   *   - GET `/last-reference` → returns the current registry head for that operator
   *
-  * The route's other rejection paths (TooManySignatures, NotForwardActivation, MalformedVk, ...) are exhaustively
-  * exercised in `KesRegistrationCertValidatorSuite`. The route's job is just to surface validator results as HTTP
-  * status codes; covering one valid + one rejected case per shape is sufficient at the route layer.
+  * The route's other rejection paths (TooManySignatures, NotForwardActivation, MalformedVk, ...) are exhaustively exercised in
+  * `KesRegistrationCertValidatorSuite`. The route's job is just to surface validator results as HTTP status codes; covering one valid + one
+  * rejected case per shape is sufficient at the route layer.
   */
 object KesRegistrationCertRoutesSuite extends HttpSuite {
 
@@ -85,8 +85,8 @@ object KesRegistrationCertRoutesSuite extends HttpSuite {
       parent = parent
     )
 
-  /** Stub `SnapshotStorage.head` returning a minimal `Signed[GlobalIncrementalSnapshot]` whose only relevant field is
-    * `epochProgress`. All other route paths route through the registry / validator we wire explicitly.
+  /** Stub `SnapshotStorage.head` returning a minimal `Signed[GlobalIncrementalSnapshot]` whose only relevant field is `epochProgress`. All
+    * other route paths route through the registry / validator we wire explicitly.
     */
   private def stubSnapshotStorage(
     headEpoch: EpochProgress
@@ -159,10 +159,13 @@ object KesRegistrationCertRoutesSuite extends HttpSuite {
       def writeForBackfill(snapshot: Signed[GlobalIncrementalSnapshot])(implicit hasher: Hasher[IO]): IO[Unit] = IO.unit
     }
 
-  /** Build the routes under test. Returns `(routes, capturedSink)` so tests can assert the `onAccepted` callback
-    * received the cert on the happy path.
+  /** Build the routes under test. Returns `(routes, capturedSink)` so tests can assert the `onAccepted` callback received the cert on the
+    * happy path.
     */
-  private def mkRoutes(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[(HttpRoutes[IO], Queue[IO, Signed[KesRegistrationCert]], MutableKesRegistry[IO])] =
+  private def mkRoutes(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO]
+  ): IO[(HttpRoutes[IO], Queue[IO, Signed[KesRegistrationCert]], MutableKesRegistry[IO])] =
     for {
       base <- IO.pure(KesRegistry.empty[IO])
       mutableRegistry <- MutableKesRegistry.make[IO](base)
