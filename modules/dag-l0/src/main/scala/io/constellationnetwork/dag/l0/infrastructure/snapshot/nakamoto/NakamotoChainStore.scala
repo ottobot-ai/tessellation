@@ -11,7 +11,7 @@ import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshot
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.security.{Hasher, HasherSelector}
+import io.constellationnetwork.security.{Hashed, Hasher, HasherSelector}
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import org.typelevel.log4cats.slf4j.Slf4jLogger
@@ -88,8 +88,30 @@ object NakamotoChainStore {
     /** Last finalized ordinal */
     def lastFinalizedOrdinal: F[Long]
 
-    /** Get a snapshot by hash */
+    /** Get a snapshot by hash. In-memory only — returns None for entries Fix B has evicted below `keepDepthBehindFinalized` even though the
+      * snapshot is on disk. Pure-hash callers (bootstrap-only) get this semantic; callers that already know the expected ordinal should
+      * prefer [[getWithOrdinalFallback]].
+      */
     def get(hash: Hash): F[Option[StoredSnapshot]]
+
+    /** Get a snapshot by hash, falling back to disk-backed `SnapshotStorage` when the in-memory `byHash` map misses. The fallback uses
+      * `expectedOrdinal` to read the snapshot from disk (which indexes by ordinal); on a successful disk read the returned snapshot's hash
+      * is checked against the requested `hash` to defend against forks (the disk's ordinal-N snapshot may belong to a different chain than
+      * the one the caller is walking — in which case we return None rather than a wrong-chain entry).
+      *
+      * '''Why hash + ordinal both.''' Disk indexes by ordinal; chain-walk callers know the parent's ordinal (`current.ordinal - 1`) and its
+      * hash. Combining them lets a single point read on disk produce a hash-verified result even though disk has no hash index. Tests this
+      * is the load-bearing path for:
+      *   - [[vrfOutputsForPeriod]] / [[collectVrfOutputsForPeriod]] walking back to `periodStart` of period N-1. With Fix B's k₁-bounded
+      *     in-memory retention the walk hits the eviction floor after ~k₁ ords; the fallback recovers VRF outputs from disk so eta rotation
+      *     is preserved across the eviction boundary (Path 1, Finding 1).
+      *   - [[ChainSyncServer.serveSnapshots]] hash-keyed peer queries (Path 1, Finding 2).
+      *
+      * '''Why not always disk-first.''' In-memory `byHash` is O(1) hash-map lookup; disk is a file open + parse. The hot path (chain
+      * extension, finality, depth-k traversal) operates within `keepDepthBehindFinalized` ords of the tip and never misses in-memory. Disk
+      * read is exercised only on the cross-eviction-boundary tail.
+      */
+    def getWithOrdinalFallback(hash: Hash, expectedOrdinal: Long): F[Option[StoredSnapshot]]
 
     /** Get the chain of snapshots from tip back to genesis (or pruning point) */
     def chainFromTip: F[List[StoredSnapshot]]
@@ -419,6 +441,81 @@ object NakamotoChainStore {
         def get(hash: Hash): F[Option[StoredSnapshot]] =
           stateRef.get.map(_.byHash.get(hash))
 
+        def getWithOrdinalFallback(hash: Hash, expectedOrdinal: Long): F[Option[StoredSnapshot]] =
+          stateRef.get.flatMap(_.byHash.get(hash) match {
+            case some @ Some(_) => Async[F].pure(some)
+            case None           =>
+              // In-memory miss — Fix B may have evicted this entry. Try disk via `SnapshotStorage`.
+              // SnapshotStorage indexes by ordinal; we use the caller-supplied `expectedOrdinal` to do
+              // the point read, then verify the returned snapshot's hash matches the requested `hash`.
+              // The hash-verify defends against forks: disk may hold an ordinal-N snapshot from a
+              // chain different from the one the caller is walking. Hash mismatch ⇒ None (caller's
+              // chain-walk treats this as broken and falls through to whatever non-canonical handling
+              // they want).
+              if (expectedOrdinal < 0L) Async[F].pure(None)
+              else {
+                val ord = SnapshotOrdinal(NonNegLong.unsafeFrom(expectedOrdinal))
+                HasherSelector[F].withCurrent { implicit hasher =>
+                  underlyingStorage.get(ord).flatMap {
+                    case None => Async[F].pure(None: Option[StoredSnapshot])
+                    case Some(signedSnap) =>
+                      signedSnap.toHashed[F].flatMap { hashed: Hashed[GlobalIncrementalSnapshot] =>
+                        if (hashed.hash =!= hash)
+                          // Disk's ordinal-N snapshot is from a different chain than the caller is
+                          // walking. Don't return it — chain-walks must stay on their requested
+                          // chain or correctness breaks.
+                          logger
+                            .debug(
+                              s"getWithOrdinalFallback ordinal=$expectedOrdinal hashMismatch: " +
+                                s"requested=${hash.value.take(12)} disk=${hashed.hash.value.take(12)}"
+                            )
+                            .as(None)
+                        else {
+                          // Reconstruct a `StoredSnapshot` from the on-disk record. The slot
+                          // certificate (when present) carries slot / parentSlot / vrfOutput; on
+                          // legacy / cert-less snapshots we synthesize zero defaults (those code
+                          // paths are pre-Nakamoto and won't be visited via this fallback under
+                          // production Nakamoto config). `parentHash` lives on the incremental
+                          // snapshot itself (`lastSnapshotHash`).
+                          val signed = hashed.signed
+                          val cert = signed.value.slotCertificate
+                          val slot = cert.map(_.slot.value.value).getOrElse(0L)
+                          val parentHash = signed.value.lastSnapshotHash
+                          val vrfBytes = cert.map(_.vrfOutput.value.toBytes).getOrElse(Array.empty[Byte])
+                          // Disk doesn't persist `GlobalSnapshotInfo`; the StoredSnapshot.context
+                          // is left as the snapshot's `info` slice from the toGlobalSnapshotInfo
+                          // path. For the chain-walk consumers wired by Path 1
+                          // (`vrfOutputsForPeriod` and `ChainSyncServer.serveSnapshots`) the
+                          // `context` field is unused on the fallback path — they read only
+                          // `signedSnapshot`, `ordinal`, `parentHash`, and `vrfOutput`. We populate
+                          // an empty placeholder GSI to satisfy the record shape; if a future
+                          // consumer reads `context` on the fallback path it should be migrated to
+                          // pull from `SnapshotStorage.head` / dedicated GSI storage instead.
+                          val placeholderGsi: GlobalSnapshotInfo =
+                            io.constellationnetwork.schema
+                              .GlobalSnapshotInfoV1(
+                                scala.collection.immutable.SortedMap.empty,
+                                scala.collection.immutable.SortedMap.empty,
+                                scala.collection.immutable.SortedMap.empty
+                              )
+                              .toGlobalSnapshotInfo
+                          val stored = StoredSnapshot(
+                            signedSnapshot = signed,
+                            context = placeholderGsi,
+                            ordinal = expectedOrdinal,
+                            slot = slot,
+                            parentHash = parentHash,
+                            hash = hash,
+                            vrfOutput = vrfBytes
+                          )
+                          Async[F].pure(Some(stored): Option[StoredSnapshot])
+                        }
+                      }
+                  }
+                }
+              }
+          })
+
         def chainFromTip: F[List[StoredSnapshot]] =
           stateRef.get.map { state =>
             state.bestTipHash match {
@@ -436,39 +533,73 @@ object NakamotoChainStore {
           }
 
         def vrfOutputsForPeriod(period: Long, etaRotationSnapshots: Long): F[List[(Long, Array[Byte])]] =
-          stateRef.get.map { state =>
+          stateRef.get.flatMap { state =>
             collectVrfOutputsForPeriod(state, period, etaRotationSnapshots, state.bestTipHash)
           }
 
         def vrfOutputsForPeriodFrom(period: Long, etaRotationSnapshots: Long, fromHash: Hash): F[List[(Long, Array[Byte])]] =
-          stateRef.get.map { state =>
+          stateRef.get.flatMap { state =>
             collectVrfOutputsForPeriod(state, period, etaRotationSnapshots, Some(fromHash))
           }
 
         // Filters by **ordinal**, not slot — rotation periods are snapshot-indexed so R satisfies the
         // Praos R ≥ 3·k₁ stability bound (see `docs/nakamoto/attestation-and-finality.md` §1). The
         // returned Long is the snapshot's ordinal.
+        //
+        // Path 1 (heap-leak workstream): the walk back to `periodStart` of period N-1 reaches O(R) ords
+        // behind the tip. Under Fix B's k₁-bounded `byHash` retention (default 255), the walk crosses
+        // the eviction floor for any R > k₁ (default R = 2550 = 10·k₁). To preserve eta-rotation
+        // determinism across the boundary we route every hop through [[getWithOrdinalFallback]]: each
+        // parent lookup tries in-memory `byHash` first; on miss it falls through to disk-backed
+        // `SnapshotStorage.get(ordinal)` with hash-verify. This is the load-bearing fix for Finding 1
+        // (eta silently degrading to genesis when Fix B evicts pre-rotation VRF outputs).
         private def collectVrfOutputsForPeriod(
           state: ChainState,
           period: Long,
           etaRotationSnapshots: Long,
           startHash: Option[Hash]
-        ): List[(Long, Array[Byte])] = {
+        ): F[List[(Long, Array[Byte])]] = {
           val periodStart = period * etaRotationSnapshots
           val cutoff = periodStart + (etaRotationSnapshots * 2 / 3)
           // Walk chain from the given starting hash backward.
           // Using byHash.values would include fork branches, causing different nodes
           // to compute different eta values → VRF verification failures at rotation boundaries.
-          val canonicalSnapshots = scala.collection.mutable.ListBuffer.empty[StoredSnapshot]
-          var current = startHash.flatMap(state.byHash.get)
-          while (current.isDefined && current.get.ordinal >= periodStart) {
-            if (current.get.ordinal < cutoff && current.get.vrfOutput.nonEmpty)
-              canonicalSnapshots += current.get
-            current = state.byHash.get(current.get.parentHash)
+          //
+          // Iterative monadic walk: at each hop, look up the parent via `getWithOrdinalFallback`.
+          // The starting hop is supplied by `startHash` (no ordinal known a priori), so we have to
+          // bootstrap from the in-memory lookup if available; for chains whose `startHash` has been
+          // evicted the caller's chain context already broke (this method is only invoked with a
+          // known live `bestTip` or a known-recent fork hash, both within `keepDepthBehindFinalized`
+          // of the tip).
+          def goImpl(
+            current: Option[StoredSnapshot],
+            acc: List[StoredSnapshot]
+          ): F[List[StoredSnapshot]] =
+            current match {
+              case None => Async[F].pure(acc)
+              case Some(cur) =>
+                if (cur.ordinal < periodStart) Async[F].pure(acc)
+                else {
+                  val nextAcc =
+                    if (cur.ordinal < cutoff && cur.vrfOutput.nonEmpty) cur :: acc
+                    else acc
+                  // Parent ordinal is `cur.ordinal - 1` (chain is linear by construction once we're
+                  // walking back from a tip). Use that to drive `getWithOrdinalFallback` so the disk
+                  // path engages when in-memory retention has evicted the parent.
+                  if (cur.ordinal <= 0L) Async[F].pure(nextAcc)
+                  else getWithOrdinalFallback(cur.parentHash, cur.ordinal - 1L).flatMap(goImpl(_, nextAcc))
+                }
+            }
+
+          val startStored = startHash.flatMap(state.byHash.get)
+          // Bootstrap: when `startHash` is itself in-memory we use it directly. The hash-only path
+          // (`get(hash)`) is in-memory-only; if `startHash` has been evicted the caller's chain
+          // context already broke (we have no `expectedOrdinal` for it). In practice every call site
+          // supplies a `startHash` taken from `bestTip` or a recent fork head, both within
+          // `keepDepthBehindFinalized` of the tip.
+          goImpl(startStored, Nil).map { collected =>
+            collected.sortBy(_.ordinal).map(s => (s.ordinal, s.vrfOutput))
           }
-          canonicalSnapshots.toList
-            .sortBy(_.ordinal)
-            .map(s => (s.ordinal, s.vrfOutput))
         }
 
         def finalize(hash: Hash, ordinal: Long): F[Unit] =

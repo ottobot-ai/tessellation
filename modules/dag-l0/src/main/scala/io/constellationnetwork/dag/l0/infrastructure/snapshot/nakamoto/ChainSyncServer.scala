@@ -48,7 +48,14 @@ object ChainSyncServer {
           // batch hashes spanning the finality boundary.
           chainStore.lastFinalizedOrdinal.flatMap { finalizedOrdinal =>
             hashes.toList.traverse_ { hash =>
-              // Try chain store first (in-memory, has full StoredSnapshot with context)
+              // Two-tier lookup (Path 1, Finding 2):
+              //   1. `chainStore.get(hash)` — in-memory `byHash`, full `StoredSnapshot` (hot path).
+              //   2. `snapshotStorage.get(hash)` — disk-backed by-hash file index; engaged whenever
+              //      Fix B's k₁-bounded retention has evicted the in-memory entry. Disk stores only
+              //      `Signed[GlobalIncrementalSnapshot]` (no GSI context), so the disk-fallback
+              //      response carries an empty/placeholder context-encoded payload — peer-side
+              //      handler must tolerate the slim form (matches the BackfillSnapshot shape and the
+              //      legacy `serveByRange` path).
               chainStore.get(hash).flatMap {
                 case Some(stored) =>
                   val payload = {
@@ -91,12 +98,63 @@ object ChainSyncServer {
                   Async[F].delay(responseObserver.onNext(snap))
 
                 case None =>
-                  // NotFound: emit nothing for this hash. Existing behavior. The Scala-side
-                  // `ChainSyncStateResponse.NotFound` ADT case is constructed by the consumer
-                  // when it observes a requested hash absent from the response stream — the wire
-                  // format hasn't been extended for explicit not-found yet.
-                  logger.info(s"ChainSync SERVE: hash ${hash.value.take(12)} NOT in chain store") >>
-                    Async[F].unit
+                  // In-memory miss — try disk-backed by-hash lookup. Path 1 Finding 2: under Fix B's
+                  // bounded retention, hashes older than `keepDepthBehindFinalized` are absent from
+                  // `byHash` even though the snapshot is on disk.
+                  HasherSelector[F].withCurrent { implicit hasher =>
+                    snapshotStorage.get(hash).flatMap {
+                      case Some(signedSnapshot) =>
+                        signedSnapshot.toHashed[F].flatMap { hashed =>
+                          import io.circe.syntax._
+                          // Disk doesn't carry `GlobalSnapshotInfo`; peer must reconstruct or
+                          // fall back to backfill. Encode snapshot-only to stay consistent with
+                          // `serveByRange`. Peers asking by-hash for evicted snapshots typically
+                          // are doing historical / NIPoPoW queries — those don't need GSI context.
+                          val payload = signedSnapshot.asJson.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                          val cert = signedSnapshot.value.slotCertificate
+                          val vrfProofBytes = cert.map(_.vrfProof.value.toBytes).getOrElse(Array.empty[Byte])
+                          val vrfPkBytes = cert.map(_.vrfPublicKey.value.toBytes).getOrElse(Array.empty[Byte])
+                          val producerIdBytes = signedSnapshot.proofs.head.id.hex.toBytes
+                          val slot = cert.map(_.slot.value.value).getOrElse(0L)
+                          val parentSlot = cert.map(_.parentSlot.value.value).getOrElse(0L)
+                          val ordinal = signedSnapshot.value.ordinal.value.value
+                          // Disposition uses the same finalizedOrdinal snapshot taken at request top.
+                          // A disk-resident snapshot below `finalizedOrdinal` is canonical by the
+                          // same Fix-B invariant (only canonical entries survive eviction at-or-below
+                          // finalized).
+                          val isFinalized = ordinal <= finalizedOrdinal
+                          val branchIdBytes =
+                            if (isFinalized) com.google.protobuf.ByteString.EMPTY
+                            else com.google.protobuf.ByteString.copyFrom(hashed.hash.value.getBytes)
+                          val snap = pb.Snapshot(
+                            hash = com.google.protobuf.ByteString.copyFrom(hashed.hash.value.getBytes),
+                            slot = slot,
+                            ordinal = ordinal,
+                            parentHash = com.google.protobuf.ByteString.copyFrom(hashed.lastSnapshotHash.value.getBytes),
+                            payload = com.google.protobuf.ByteString.copyFrom(payload),
+                            vrfProof = com.google.protobuf.ByteString.copyFrom(vrfProofBytes),
+                            vrfPublicKey = com.google.protobuf.ByteString.copyFrom(vrfPkBytes),
+                            producerId = com.google.protobuf.ByteString.copyFrom(producerIdBytes),
+                            parentSlot = parentSlot,
+                            finalized = isFinalized,
+                            branchId = branchIdBytes
+                          )
+                          logger
+                            .info(
+                              s"ChainSync SERVE: hash ${hash.value.take(12)} from disk (in-memory evicted, ordinal=$ordinal)"
+                            ) >>
+                            Async[F].delay(responseObserver.onNext(snap))
+                        }
+
+                      case None =>
+                        // NotFound on disk too. Existing behavior. The Scala-side
+                        // `ChainSyncStateResponse.NotFound` ADT case is constructed by the consumer
+                        // when it observes a requested hash absent from the response stream — the
+                        // wire format hasn't been extended for explicit not-found yet.
+                        logger.info(s"ChainSync SERVE: hash ${hash.value.take(12)} NOT in chain store or disk") >>
+                          Async[F].unit
+                    }
+                  }
               }
             } >> Async[F].delay(responseObserver.onCompleted())
           }
