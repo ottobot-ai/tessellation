@@ -57,12 +57,14 @@ JVM-side schema (`modules/shared/src/main/scala/io/constellationnetwork/schema/s
 
 ```scala
 final case class SlashableEvidence(
-  evidenceA: Signed[MetagraphAttestation],   // first conflicting attestation
-  evidenceB: Signed[MetagraphAttestation],   // second conflicting attestation
+  evidenceA: MetagraphAttestation,           // first conflicting attestation (bare body, no outer envelope)
+  evidenceB: MetagraphAttestation,           // second conflicting attestation
   submitterId: PeerId,                       // bounty recipient
   bountySignature: HashSignature             // submitter signs the evidence pair
 )
 ```
+
+**Why no outer `Signed[_]` envelope on the evidence attestations.** Each `MetagraphAttestation` body carries the KES product signature (verified at step 5) and the committee VRF proof (verified at step 6); KES + VRF together carry all the safety the validator needs. The gossip-path Ed25519 envelope was never re-verified by `SlashableEvidenceValidator`, so wrapping each attestation in `Signed[_]` only inflated the wire bytes and the bounty-digest preimage with a redundant signature. The detector (S4b) strips the gossip-layer envelope via `.value` when constructing evidence; the envelope continues to live on the gossip path where it does get verified.
 
 This is **NOT** a sidecar gossip message — it's a regular L0 transaction included in the gl0 global snapshot. The sidecar gossip carries `MetagraphAttestation`s; the JVM aggregates and detects equivocation; the JVM constructs and submits a `SlashableEvidence` through the same mempool that other L0 txs use.
 
