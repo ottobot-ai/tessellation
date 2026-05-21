@@ -20,6 +20,7 @@ import io.constellationnetwork.node.shared.domain.statechannel.{SnapshotFeesInfo
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.peer.PeerId
@@ -97,9 +98,10 @@ object StateChannelServiceSuite extends MutableIOSuite {
       unpQueue <- Queue.unbounded[IO, Signed[UpdateNodeParameters]]
       dsQueue <- Queue.unbounded[IO, DelegatedStakeOutput]
       ncQueue <- Queue.unbounded[IO, NodeCollateralOutput]
+      kesQueue <- Queue.unbounded[IO, Signed[KesRegistrationCert]]
     } yield
       StateChannelService.make[IO](
-        L0Cell.mkL0Cell[IO](dagQueue, scQueue, unpQueue, dsQueue, ncQueue),
+        L0Cell.mkL0Cell[IO](dagQueue, scQueue, unpQueue, dsQueue, ncQueue, kesQueue),
         validator,
         GlobalStateReader.finalized[IO](mptStore)
       )

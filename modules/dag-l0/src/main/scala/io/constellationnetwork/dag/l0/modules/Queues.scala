@@ -10,6 +10,7 @@ import io.constellationnetwork.dag.l0.domain.nodeCollateral.NodeCollateralOutput
 import io.constellationnetwork.node.shared.modules.SharedQueues
 import io.constellationnetwork.schema.Block
 import io.constellationnetwork.schema.gossip.RumorRaw
+import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.swap.AllowSpendBlock
 import io.constellationnetwork.schema.tokenLock.TokenLockBlock
@@ -28,6 +29,7 @@ object Queues {
       updateNodeParametersQueue <- Queue.unbounded[F, Signed[UpdateNodeParameters]]
       delegatedStakeOutputQueue <- Queue.unbounded[F, DelegatedStakeOutput]
       nodeCollateralOutputQueue <- Queue.unbounded[F, NodeCollateralOutput]
+      kesRegistrationCertQueue <- Queue.unbounded[F, Signed[KesRegistrationCert]]
     } yield
       new Queues[F] {
         val rumor = sharedQueues.rumor
@@ -38,6 +40,7 @@ object Queues {
         val updateNodeParametersOutput = updateNodeParametersQueue
         val delegatedStakeOutput = delegatedStakeOutputQueue
         val nodeCollateralOutput = nodeCollateralOutputQueue
+        val kesRegistrationCertOutput = kesRegistrationCertQueue
       }
 }
 
@@ -50,4 +53,5 @@ sealed abstract class Queues[F[_]] private {
   val updateNodeParametersOutput: Queue[F, Signed[UpdateNodeParameters]]
   val delegatedStakeOutput: Queue[F, DelegatedStakeOutput]
   val nodeCollateralOutput: Queue[F, NodeCollateralOutput]
+  val kesRegistrationCertOutput: Queue[F, Signed[KesRegistrationCert]]
 }

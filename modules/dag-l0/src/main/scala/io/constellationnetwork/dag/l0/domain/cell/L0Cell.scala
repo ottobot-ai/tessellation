@@ -16,6 +16,7 @@ import io.constellationnetwork.dag.l0.domain.nodeCollateral.NodeCollateralOutput
 import io.constellationnetwork.kernel.Cell.NullTerminal
 import io.constellationnetwork.kernel._
 import io.constellationnetwork.schema.Block
+import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.statechannel.StateChannelOutput
@@ -30,6 +31,7 @@ object L0CellInput {
   case class HandleUpdateNodeParameters(updateNodeParameters: Signed[UpdateNodeParameters]) extends L0CellInput
   case class HandleDelegatedStake(delegatedStake: DelegatedStakeOutput) extends L0CellInput
   case class HandleNodeCollateral(nodeCollateral: NodeCollateralOutput) extends L0CellInput
+  case class HandleKesRegistrationCert(cert: Signed[KesRegistrationCert]) extends L0CellInput
 }
 
 class L0Cell[F[_]: Async](
@@ -38,7 +40,8 @@ class L0Cell[F[_]: Async](
   stateChannelOutputQueue: Queue[F, StateChannelOutput],
   updateNodeParametersQueue: Queue[F, Signed[UpdateNodeParameters]],
   delegatedStakeOutputQueue: Queue[F, DelegatedStakeOutput],
-  nodeCollateralOutputQueue: Queue[F, NodeCollateralOutput]
+  nodeCollateralOutputQueue: Queue[F, NodeCollateralOutput],
+  kesRegistrationCertQueue: Queue[F, Signed[KesRegistrationCert]]
 ) extends Cell[F, StackF, L0CellInput, Either[CellError, Ω], CoalgebraCommand](
       data,
       scheme.hyloM(
@@ -54,6 +57,8 @@ class L0Cell[F[_]: Async](
                 Algebra.enqueueUpdateNodeParameters(updateNodeParametersQueue)(updateNodeParameters)
               case EnqueueDelegatedStake(data) => Algebra.enqueueDelegatedStake(delegatedStakeOutputQueue)(data)
               case EnqueueNodeCollateral(data) => Algebra.enqueueNodeCollateral(nodeCollateralOutputQueue)(data)
+              case EnqueueKesRegistrationCert(data) =>
+                Algebra.enqueueKesRegistrationCert(kesRegistrationCertQueue)(data)
               case NoAction =>
                 NullTerminal.asRight[CellError].widen[Ω].pure[F]
             }
@@ -65,6 +70,7 @@ class L0Cell[F[_]: Async](
           case ProcessUpdateNodeParameters(updateNodeParameters) => Coalgebra.processUpdateNodeParameters(updateNodeParameters)
           case ProcessDelegatedStake(data)                       => Coalgebra.processDelegatedStake(data)
           case ProcessNodeCollateral(data)                       => Coalgebra.processNodeCollateral(data)
+          case ProcessKesRegistrationCert(data)                  => Coalgebra.processKesRegistrationCert(data)
         }
       ),
       {
@@ -73,6 +79,7 @@ class L0Cell[F[_]: Async](
         case HandleUpdateNodeParameters(updateNodeParameters) => ProcessUpdateNodeParameters(updateNodeParameters)
         case HandleDelegatedStake(create)                     => ProcessDelegatedStake(create)
         case HandleNodeCollateral(create)                     => ProcessNodeCollateral(create)
+        case HandleKesRegistrationCert(cert)                  => ProcessKesRegistrationCert(cert)
       }
     )
 
@@ -85,7 +92,8 @@ object L0Cell {
     stateChannelOutputQueue: Queue[F, StateChannelOutput],
     updateNodeParametersQueue: Queue[F, Signed[UpdateNodeParameters]],
     delegatedStakeOutputQueue: Queue[F, DelegatedStakeOutput],
-    nodeCollateralOutputQueue: Queue[F, NodeCollateralOutput]
+    nodeCollateralOutputQueue: Queue[F, NodeCollateralOutput],
+    kesRegistrationCertQueue: Queue[F, Signed[KesRegistrationCert]]
   ): Mk[F] =
     data =>
       new L0Cell(
@@ -94,7 +102,8 @@ object L0Cell {
         stateChannelOutputQueue,
         updateNodeParametersQueue,
         delegatedStakeOutputQueue,
-        nodeCollateralOutputQueue
+        nodeCollateralOutputQueue,
+        kesRegistrationCertQueue
       )
 
   type AlgebraR[F[_]] = F[Either[CellError, Ω]]
@@ -129,6 +138,12 @@ object L0Cell {
     ): AlgebraR[F] =
       queue.offer(data) >>
         NullTerminal.asRight[CellError].widen[Ω].pure[F]
+
+    def enqueueKesRegistrationCert[F[_]: Async](queue: Queue[F, Signed[KesRegistrationCert]])(
+      data: Signed[KesRegistrationCert]
+    ): AlgebraR[F] =
+      queue.offer(data) >>
+        NullTerminal.asRight[CellError].widen[Ω].pure[F]
   }
 
   object Coalgebra {
@@ -159,6 +174,12 @@ object L0Cell {
 
     def processNodeCollateral[F[_]: Async](data: NodeCollateralOutput): CoalgebraR[F] = {
       def res: StackF[CoalgebraCommand] = Done(AlgebraCommand.EnqueueNodeCollateral(data).asRight[CellError])
+
+      res.pure[F]
+    }
+
+    def processKesRegistrationCert[F[_]: Async](data: Signed[KesRegistrationCert]): CoalgebraR[F] = {
+      def res: StackF[CoalgebraCommand] = Done(AlgebraCommand.EnqueueKesRegistrationCert(data).asRight[CellError])
 
       res.pure[F]
     }

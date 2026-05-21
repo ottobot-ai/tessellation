@@ -47,6 +47,7 @@ object Daemons {
           queues.updateNodeParametersOutput,
           queues.delegatedStakeOutput,
           queues.nodeCollateralOutput,
+          queues.kesRegistrationCertOutput,
           keyPair,
           services.eventMempool,
           gossip,

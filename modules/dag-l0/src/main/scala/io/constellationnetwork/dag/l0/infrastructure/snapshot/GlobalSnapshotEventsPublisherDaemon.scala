@@ -16,6 +16,7 @@ import io.constellationnetwork.node.shared.domain.gossip.Gossip
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.snapshot.EventTriggerGuard
 import io.constellationnetwork.schema.Block
+import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.swap.AllowSpendBlock
@@ -39,6 +40,7 @@ object GlobalSnapshotEventsPublisherDaemon {
     updateNodeParametersQueue: Queue[F, Signed[UpdateNodeParameters]],
     delegatedStakeOutputQueue: Queue[F, DelegatedStakeOutput],
     nodeCollateralOutputQueue: Queue[F, NodeCollateralOutput],
+    kesRegistrationCertQueue: Queue[F, Signed[KesRegistrationCert]],
     keyPair: KeyPair,
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     gossip: Gossip[F],
@@ -88,6 +90,11 @@ object GlobalSnapshotEventsPublisherDaemon {
             case CreateNodeCollateralOutput(data)   => CreateNodeCollateralEvent(data)
             case WithdrawNodeCollateralOutput(data) => WithdrawNodeCollateralEvent(data)
           }
+      )
+      .merge(
+        Stream
+          .fromQueueUnterminated(kesRegistrationCertQueue)
+          .map(KesRegistrationCertEvent(_))
       )
 
     Daemon.spawn {
