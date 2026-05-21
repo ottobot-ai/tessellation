@@ -8,6 +8,7 @@ import scala.collection.immutable.SortedMap
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.GlobalSnapshotInfo
 import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.security.hash.Hash
 
 import derevo.cats.eqv
 import derevo.circe.magnolia.{decoder, encoder}
@@ -144,4 +145,35 @@ object EpochStakeSnapshotter {
     */
   def fromCombined(combined: Map[PeerId, BigInt]): StakeDistribution =
     StakeDistribution(combined.iterator.to(SortedMap))
+}
+
+/** Per-period boundary record stored in the `historicalStakeSnapshots` MPT partition (one entry per closed eta-period). Captures BOTH the
+  * stake distribution and the eta randomness that pertain to period N's consensus configuration. Bundling them keeps the per-period
+  * partition's read-path uniform — a single MPT point read returns everything period N needs to be reconstructed deterministically.
+  *
+  * '''Stake_N: derived at end of period N''' from `activeDelegatedStakes + activeNodeCollaterals` at boundary ordinal `N·R + R - 1` (per
+  * the existing Cardano-style mark/set/go semantic, used by `relativeStakeAt(_, N)` two periods later).
+  *
+  * '''Eta_N: derived during period N-1''' from VRF outputs in its first 2/3 (see [[EtaCalculation.etaForOrdinal]]). Eta_N is the input
+  * randomness used by slot leaders DURING period N. By the time the boundary ordinal of period N is reached, eta_N has been "the" eta for
+  * the whole period — so writing it here is a deterministic snapshot of what was actually used, not a derivation that could drift.
+  *
+  * '''Why same MPT entry as stakes.''' Path 1 of the heap-leak workstream: `NakamotoChainStore.vrfOutputsForPeriod` walks back to
+  * `periodStart` of period N-1 to recompute eta_N on demand. After Fix B (k₁-bounded chainStore eviction), that walk falls off the
+  * in-memory keep-window and the disk-fallback path drives every recompute. Caching eta_N in the per-period MPT entry — alongside stake_N
+  * which already lives there — gives readers a deterministic, eviction-immune source: one MPT point read instead of a chain walk.
+  *
+  * '''Eta is stored as `Hash`.''' Matches [[io.constellationnetwork.schema.GlobalIncrementalSnapshot.eta]]'s wire shape (32-byte content
+  * digest). The conversion from `Array[Byte]` (what [[EtaCalculation.computeEta]] returns) to `Hash` is a 32-byte hex round-trip — same as
+  * every other 32-byte digest in this codebase.
+  *
+  * '''No `Option[Hash]`.''' Eta is REQUIRED. Every entry written into the partition carries it. Pre-boundary reads (periods with no MPT
+  * entry yet) return `None` from `HistoricalStakeReader.lookup`; callers fall back to a chain-walk recompute via `EtaStateManager.getEta`.
+  * There's no "stake-only" half-state in the partition.
+  */
+@derive(encoder, decoder, eqv)
+final case class HistoricalStakeSnapshot(stakes: StakeDistribution, eta: Hash)
+
+object HistoricalStakeSnapshot {
+  implicit val show: Show[HistoricalStakeSnapshot] = Show.fromToString
 }

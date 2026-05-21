@@ -9,7 +9,7 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, StakeDistribution}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
@@ -39,7 +39,10 @@ import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs._
 import io.constellationnetwork.serde.codecs.instances.PriceOracleCodecs.{priceRecordCodec, tokenPairCodec}
 import io.constellationnetwork.serde.codecs.instances.SignatureCodecs.{idCodec, signatureProofCodec}
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
-import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{codec => stakeDistributionCodec, etaPeriodCodec}
+import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{
+  etaPeriodCodec,
+  historicalCodec => historicalStakeSnapshotCodec
+}
 import io.constellationnetwork.serde.codecs.instances.TokenLockCodec.{codec => tokenLockCodec}
 import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{codec => tokenLockRefCodec}
 import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.{codec => transactionReferenceCodec}
@@ -170,12 +173,14 @@ object GlobalSnapshotInfoCodec {
     sortedMap(addressCodec, metagraphSyncCodec)
   private val metagraphSyncDataOptCodec = option(metagraphSyncDataMapCodec)
 
-  // Field 18: NIPoPoW S0 historical stake — SortedMap[EtaPeriod, StakeDistribution]. Codecs for the leaf types live in
+  // Field 18: NIPoPoW S0 historical stake — SortedMap[EtaPeriod, HistoricalStakeSnapshot]. Codecs for the leaf types live in
   // [[StakeDistributionCodec]] because they're also used by the MPT projection (`toAllStateKeyValueBytes`) that authenticates
-  // the per-period partition under [[GlobalStateFieldId.HistoricalStakeSnapshots]]. Reusing the same `ImmutableCodec[StakeDistribution]`
-  // there means the bytes the MPT hashes equal the bytes this codec emits — required for cross-path determinism (parity gate #107).
-  private val historicalStakeSnapshotsMapCodec: Codec[SortedMap[EtaPeriod, StakeDistribution]] =
-    sortedMap(etaPeriodCodec, stakeDistributionCodec)
+  // the per-period partition under [[GlobalStateFieldId.HistoricalStakeSnapshots]]. Reusing the same
+  // `ImmutableCodec[HistoricalStakeSnapshot]` there means the bytes the MPT hashes equal the bytes this codec emits — required for
+  // cross-path determinism (parity gate #107). Path 1 (heap-leak workstream): the per-period entry now bundles `(stakes, eta)` so
+  // `EtaStateManager.getEta` has a disk-immune cache against chainStore eviction.
+  private val historicalStakeSnapshotsMapCodec: Codec[SortedMap[EtaPeriod, HistoricalStakeSnapshot]] =
+    sortedMap(etaPeriodCodec, historicalStakeSnapshotCodec)
 
   // Witness to keep SignatureProof import referenced.
   private val _spWitness: Codec[SignatureProof] = signatureProofCodec
