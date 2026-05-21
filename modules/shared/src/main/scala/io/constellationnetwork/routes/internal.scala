@@ -72,6 +72,7 @@ object internal {
       :: Equal["/events"]
       :: Equal["/mempool"]
       :: Equal["/nakamoto"]
+      :: Equal["/kes-registration"]
       :: HNil
   ]
 
