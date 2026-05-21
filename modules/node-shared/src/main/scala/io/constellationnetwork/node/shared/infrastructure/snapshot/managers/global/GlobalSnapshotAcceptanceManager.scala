@@ -50,7 +50,7 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt._
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, StakeDistribution}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal, UpdateNodeCollateral}
 import io.constellationnetwork.schema.peer.PeerId
@@ -204,7 +204,17 @@ object GlobalSnapshotAcceptanceManager {
     // `EpochStakeSnapshotter.snapshot(builtInfo)` GSI walk) into `historicalStakeSnapshots[currentPeriod]` and prunes
     // entries older than `currentPeriod - 3` (algorithm reads N-2; the extra slot is a reorg-grace). Must match the
     // producer's `NAKAMOTO_ETA_ROTATION_SNAPSHOTS` for cross-node determinism.
-    etaRotationSnapshots: Long = 2550L
+    etaRotationSnapshots: Long = 2550L,
+    // Path 1 (heap-leak workstream): callback that returns eta_period for the just-closed eta-period at
+    // the boundary write. Eta_period is determined at the 2/3-mark of period (period-1) and used by slot
+    // leaders DURING period; by the time the boundary ordinal of period is reached, eta_period has been
+    // "the" eta for the whole window. This boundary write captures that deterministic value alongside
+    // stake_period so future reads (`EtaStateManager.getEta(period)`) hit the MPT cache instead of walking
+    // the chainStore (which Fix B's k₁-bounded retention can have evicted). Defaults to `None` —
+    // suitable for tests / pre-wire-up call sites where boundary writes can fall through to
+    // `Hash.empty`; production overrides at `GlobalSnapshotConsensus` construction with a
+    // chainStore-backed walk.
+    etaForPeriod: Option[EtaPeriod => F[Hash]] = None
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): F[GlobalSnapshotAcceptanceManager[F]] = {
@@ -639,7 +649,7 @@ object GlobalSnapshotAcceptanceManager {
           baseInfo: GlobalSnapshotInfo
         )(
           implicit hasher: Hasher[F]
-        ): F[(SortedMap[EtaPeriod, StakeDistribution], Set[EtaPeriod], SortedMap[EtaPeriod, StakeDistribution])] = {
+        ): F[(SortedMap[EtaPeriod, HistoricalStakeSnapshot], Set[EtaPeriod], SortedMap[EtaPeriod, HistoricalStakeSnapshot])] = {
           val ordValue = ordinal.value.value
           if (etaRotationSnapshots > 0L && ordValue % etaRotationSnapshots == etaRotationSnapshots - 1L) {
             val currentPeriod = EtaPeriod(ordValue / etaRotationSnapshots)
@@ -647,7 +657,14 @@ object GlobalSnapshotAcceptanceManager {
             // `baseInfo.{activeDelegatedStakes, activeNodeCollaterals}`. The two are byte-equivalent here (MPT was just synced
             // from the same accepted records that built the GSI), and routing via MPT removes the redundant in-memory mirror —
             // closing a class of #218-style cross-node drift bugs where two nodes' GSI iteration order produced divergent bytes.
-            NodeStakeAggregator.snapshotFromMpt[F](stakeAggregator).map { newSnapshot =>
+            //
+            // Path 1 (heap-leak workstream): also resolve eta_currentPeriod via `etaForPeriod` and pack it into the
+            // `HistoricalStakeSnapshot` boundary entry. Eta is deterministic from the canonical chain at this
+            // point (derived from period (currentPeriod-1)'s first 2/3 VRF outputs, fully knowable before
+            // currentPeriod even starts), so all honest verifiers produce byte-equivalent boundary entries.
+            val etaF: F[Hash] = etaForPeriod.map(_(currentPeriod)).getOrElse(Async[F].pure(Hash.empty))
+            (NodeStakeAggregator.snapshotFromMpt[F](stakeAggregator), etaF).mapN { (newStakeSnapshot, eta) =>
+              val newSnapshot = HistoricalStakeSnapshot(newStakeSnapshot, eta)
               val retentionMinPeriod = currentPeriod.value - 3L
               val priorKeys = baseInfo.historicalStakeSnapshots.keySet
               val pruned = baseInfo.historicalStakeSnapshots.filter(_._1.value >= retentionMinPeriod)
@@ -656,8 +673,8 @@ object GlobalSnapshotAcceptanceManager {
               // exposes — in practice only `currentPeriod` is added because retained priors equal their
               // pre-boundary values, but writing them is idempotent and stays consistent if retention rules
               // ever evolve. Keep the minimal form to match `buildGlobalSnapshotInfo`'s `updated` semantics.
-              val adds: SortedMap[EtaPeriod, StakeDistribution] =
-                SortedMap[EtaPeriod, StakeDistribution](currentPeriod -> newSnapshot)
+              val adds: SortedMap[EtaPeriod, HistoricalStakeSnapshot] =
+                SortedMap[EtaPeriod, HistoricalStakeSnapshot](currentPeriod -> newSnapshot)
               // Removes: prior keys that survived in `baseInfo.historicalStakeSnapshots` but are below the
               // retention floor. The producer's MPT writer prunes them; the verifier rebuilds from `next` so
               // it doesn't see them — without the explicit removal the producer's MPT keeps a stale entry
@@ -667,7 +684,11 @@ object GlobalSnapshotAcceptanceManager {
             }
           } else {
             Async[F].pure(
-              (SortedMap.empty[EtaPeriod, StakeDistribution], Set.empty[EtaPeriod], baseInfo.historicalStakeSnapshots)
+              (
+                SortedMap.empty[EtaPeriod, HistoricalStakeSnapshot],
+                Set.empty[EtaPeriod],
+                baseInfo.historicalStakeSnapshots
+              )
             )
           }
         }
@@ -678,7 +699,7 @@ object GlobalSnapshotAcceptanceManager {
           */
         private case class BuildGlobalSnapshotInfoResult(
           gsi: GlobalSnapshotInfo,
-          historicalStakeAdds: SortedMap[EtaPeriod, StakeDistribution],
+          historicalStakeAdds: SortedMap[EtaPeriod, HistoricalStakeSnapshot],
           historicalStakeRemoves: Set[EtaPeriod]
         )
 

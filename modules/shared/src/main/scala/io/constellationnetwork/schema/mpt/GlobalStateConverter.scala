@@ -16,7 +16,7 @@ import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, Pend
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.MptStore
 import io.constellationnetwork.schema.mpt.PartitionNamespace.{AddressNamespace, MetagraphNamespace}
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, StakeDistribution}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
@@ -84,9 +84,11 @@ object GlobalStateConverter {
     removedNodeCollateralWithdrawalKeys: Set[Address] = Set.empty,
     // §3 NIPoPoW S0.4 boundary delta. Non-empty only at boundary ordinals
     // (`ord % etaRotationSnapshots == etaRotationSnapshots - 1L`); empty otherwise.
-    // `historicalStakeSnapshots` carries the new entry(ies) appended at this boundary;
+    // `historicalStakeSnapshots` carries the new entry(ies) appended at this boundary — each carries
+    // BOTH stake_N and eta_N (Path 1 of the heap-leak workstream; the eta half is a disk-immune cache
+    // for `EtaStateManager.getEta(period)` against chainStore eviction).
     // `removedHistoricalStakeSnapshotKeys` carries the period keys evicted by retention.
-    historicalStakeSnapshots: SortedMap[EtaPeriod, StakeDistribution] = SortedMap.empty,
+    historicalStakeSnapshots: SortedMap[EtaPeriod, HistoricalStakeSnapshot] = SortedMap.empty,
     removedHistoricalStakeSnapshotKeys: Set[EtaPeriod] = Set.empty
   )
 
@@ -472,15 +474,18 @@ object GlobalStateConverter {
     }
 
     // §3 NIPoPoW S0 historical stake snapshots: one entry per stored eta-period (retention cap = 4).
-    // Each entry's value is the scodec-encoded `StakeDistribution`. Covered by `mptRoot` and gets its
-    // own per-field subtree root via `FId.HistoricalStakeSnapshots` for efficient NIPoPoW Merkle proofs.
+    // Each entry's value is the scodec-encoded `HistoricalStakeSnapshot` — the combined stake +
+    // eta record (Path 1, heap-leak workstream). Covered by `mptRoot` and gets its own per-field
+    // subtree root via `FId.HistoricalStakeSnapshots` for efficient NIPoPoW Merkle proofs.
     val historicalStakeSnapshotsF: F[List[(GlobalStateKey, Array[Byte])]] = {
-      import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{immutableCodec => stakeDistributionImmutable}
+      import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{
+        historicalImmutableCodec => historicalStakeSnapshotImmutable
+      }
       info.historicalStakeSnapshots.toList.parTraverse {
-        case (period, dist) =>
+        case (period, entry) =>
           GlobalStateKey
             .historicalStakeSnapshotsKey[F](period)
-            .map(k => k -> enc[io.constellationnetwork.schema.nakamoto.StakeDistribution](dist)(stakeDistributionImmutable))
+            .map(k => k -> enc[HistoricalStakeSnapshot](entry)(historicalStakeSnapshotImmutable))
       }
     }
 
@@ -655,12 +660,14 @@ object GlobalStateConverter {
     // entry(ies) appended at this boundary. Mirrors the projection in `toAllStateKeyValueBytes`'s
     // `historicalStakeSnapshotsF` so the writer-bytes match the rebuild-bytes byte-for-byte.
     val historicalStakeSnapshotsF: F[List[(GlobalStateKey, Array[Byte])]] = {
-      import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{immutableCodec => stakeDistributionImmutable}
+      import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{
+        historicalImmutableCodec => historicalStakeSnapshotImmutable
+      }
       acc.historicalStakeSnapshots.toList.parTraverse {
-        case (period, dist) =>
+        case (period, entry) =>
           GlobalStateKey
             .historicalStakeSnapshotsKey[F](period)
-            .map(k => k -> enc[StakeDistribution](dist)(stakeDistributionImmutable))
+            .map(k => k -> enc[HistoricalStakeSnapshot](entry)(historicalStakeSnapshotImmutable))
       }
     }
 
@@ -1488,10 +1495,13 @@ object GlobalStateConverter {
         // Caller-serialized — see MptStore.withTransaction.
         import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
         // §3 NIPoPoW S0 historical-stake-snapshots writer: each MPT entry value is the scodec-encoded
-        // `StakeDistribution` keyed by `historicalStakeSnapshotsKey[F](period)` — same codec / same key
-        // shape as `toAllStateKeyValueBytes` so producer and verifier roots agree byte-for-byte.
-        import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{immutableCodec => stakeDistributionImmutable}
-        val _ = stakeDistributionImmutable // resolves `store.insert[StakeDistribution]` below
+        // `HistoricalStakeSnapshot` (combined stake + eta) keyed by `historicalStakeSnapshotsKey[F](period)` —
+        // same codec / same key shape as `toAllStateKeyValueBytes` so producer and verifier roots agree
+        // byte-for-byte.
+        import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{
+          historicalImmutableCodec => historicalStakeSnapshotImmutable
+        }
+        val _ = historicalStakeSnapshotImmutable // resolves `store.insert[HistoricalStakeSnapshot]` below
 
         val syncLogger = Slf4jLogger.getLoggerFromName[F]("MPT.Sync")
 
@@ -1618,10 +1628,10 @@ object GlobalStateConverter {
 
         // §3 NIPoPoW S0 historical-stake-snapshot upserts. Each entry's key is derived via
         // `historicalStakeSnapshotsKey[F]` (hashed eta-period); the value is the scodec-encoded
-        // `StakeDistribution`. Non-empty only at boundary ordinals.
-        val historicalStakeEntriesF: F[Map[GlobalStateKey, StakeDistribution]] =
+        // `HistoricalStakeSnapshot` (combined stake + eta). Non-empty only at boundary ordinals.
+        val historicalStakeEntriesF: F[Map[GlobalStateKey, HistoricalStakeSnapshot]] =
           acc.historicalStakeSnapshots.toList.parTraverse {
-            case (period, dist) => GlobalStateKey.historicalStakeSnapshotsKey[F](period).map(_ -> dist)
+            case (period, entry) => GlobalStateKey.historicalStakeSnapshotsKey[F](period).map(_ -> entry)
           }.map(_.toMap)
 
         val totalEntries =
@@ -1688,7 +1698,7 @@ object GlobalStateConverter {
           historicalStakeEntries <- historicalStakeEntriesF
           _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
           _ <- store.insert[PriceRecord](priceStateEntries)
-          _ <- store.insert[StakeDistribution](historicalStakeEntries)
+          _ <- store.insert[HistoricalStakeSnapshot](historicalStakeEntries)
           _ <- applySystemIndexDelta[F, AllowSpendExpiryKey](
             store,
             SystemNamespaceLabel.ExpiryIndexAllowSpends,

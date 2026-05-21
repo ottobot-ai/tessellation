@@ -2,10 +2,12 @@ package io.constellationnetwork.serde.codecs.instances
 
 import scala.collection.immutable.SortedMap
 
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, StakeDistribution}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot, StakeDistribution}
 import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMap
+import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => hashCodec}
 import io.constellationnetwork.serde.codecs.instances.PeerIdCodec.{codec => peerIdCodec}
 
 import scodec.codecs._
@@ -19,6 +21,9 @@ import scodec.{Attempt, Codec}
   *     16 bytes but the codec accepts anything we'd ever produce.
   *   - `StakeDistribution` — sortedMap(PeerId, BigInt). Determinism comes from the `SortedMap` insertion order plus PeerId's canonical
   *     `Order` instance.
+  *   - `HistoricalStakeSnapshot` — pair-codec `(StakeDistribution, Hash)`. The stake half rides the same `stakeDistributionCodec`; the eta
+  *     half rides `HashCodec` (fixed-width 32 bytes). Order: stakes first, then eta — chosen to keep the GSI / MPT byte-prefix of an
+  *     extended entry stable with the legacy stake-only encoding for the bytes that overlap.
   *
   * Used both by the GSI capstone codec ([[GlobalSnapshotInfoCodec]]) and by the MPT projection that authenticates the per-period partition
   * under [[io.constellationnetwork.schema.mpt.GlobalStateFieldId.HistoricalStakeSnapshots]].
@@ -41,4 +46,28 @@ object StakeDistributionCodec {
     stakesMapCodec.xmap[StakeDistribution](StakeDistribution(_), _.stakes)
 
   implicit val immutableCodec: ImmutableCodec[StakeDistribution] = ImmutableCodec.fromScodecCodec(codec)
+
+  /** Pair codec for the combined stake + eta record stored under
+    * [[io.constellationnetwork.schema.mpt.GlobalStateFieldId.HistoricalStakeSnapshots]]. Bound here (next to the `StakeDistribution` codec
+    * it composes with) so the per-period partition writer and the GSI capstone share a single source.
+    */
+  implicit val historicalCodec: Codec[HistoricalStakeSnapshot] = {
+    val _ = (codec, hashCodec) // bind context-bound implicits for the tuple below
+    (codec :: hashCodec)
+      .as[HistoricalStakeSnapshot]
+  }
+
+  implicit val historicalImmutableCodec: ImmutableCodec[HistoricalStakeSnapshot] =
+    ImmutableCodec.fromScodecCodec(historicalCodec)
+
+  /** Codec for the eta scalar by itself. The boundary writer in GSAM also lands a per-period eta-only entry under
+    * [[io.constellationnetwork.schema.mpt.GlobalStateFieldId.HistoricalStakeSnapshots]] when the stake side is unchanged from the previous
+    * period — not used today but kept exported so other call sites can decode the eta half independently if they already hold `Hash` in
+    * their consumer schema.
+    */
+  implicit val historicalEtaCodec: Codec[Hash] = hashCodec
+
+  /** Bind so `_ = stakeDistributionImmutable` style imports keep resolving even when callers only need the pair codec. */
+  val _stakeDistributionImmutable: ImmutableCodec[StakeDistribution] = immutableCodec
+  locally { val _ = _stakeDistributionImmutable }
 }

@@ -71,6 +71,22 @@ object types {
     maxUnappliedGlobalChangeOrdinals: PosInt
   )
 
+  /** Path 1 (heap-leak workstream): the two consensus-critical Nakamoto knobs that previously read directly from `sys.env`
+    * (`NAKAMOTO_ETA_ROTATION_SNAPSHOTS` and `NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED`) routed through HOCON. The HOCON values keep the env-var
+    * fallback for ops continuity (the application.conf entries use `${?NAKAMOTO_...}` substitution), so existing deploy scripts that set
+    * the env vars continue to work — but the read in production code goes through this typed struct.
+    *
+    * Defaults match the pre-migration env-var defaults exactly: `eta-rotation-snapshots = 2550` (10·k₁); `keep-depth-behind-finalized =
+    * 255` (k₁).
+    *
+    * Other `NAKAMOTO_*` env vars (LDD knobs, slots-per-epoch, etc.) are NOT migrated here — Wave 2 of the sys.env-to-HOCON sweep handles
+    * the rest of the namespace in one pass.
+    */
+  case class NakamotoConfig(
+    etaRotationSnapshots: PosLong,
+    keepDepthBehindFinalized: PosLong
+  )
+
   case class SharedConfigReader(
     gossip: GossipConfig,
     leavingDelay: FiniteDuration,
@@ -93,7 +109,8 @@ object types {
     metagraphsSync: MetagraphsSyncConfig,
     priceOracle: Map[AppEnvironment, PriceOracleConfig],
     snapshotBinarySenderTimeouts: SnapshotBinarySenderTimeoutsConfig,
-    clickHouseConfig: ClickHouseAppConfig
+    clickHouseConfig: ClickHouseAppConfig,
+    nakamoto: NakamotoConfig
   )
 
   case class SharedConfig(
@@ -122,7 +139,8 @@ object types {
     snapshotBinarySenderTimeouts: SnapshotBinarySenderTimeoutsConfig,
     snapshotTimeoutsConfig: SnapshotTimeoutsConfig,
     clickHouseConfig: ClickHouseAppConfig,
-    mptSnapshotInfoPath: Path
+    mptSnapshotInfoPath: Path,
+    nakamoto: NakamotoConfig
   )
 
   case class SharedSnapshotConfig(

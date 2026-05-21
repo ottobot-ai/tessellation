@@ -17,7 +17,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, StakeDistribution}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot, StakeDistribution}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
@@ -158,13 +158,16 @@ case class GlobalSnapshotInfo(
   nodeCollateralWithdrawals: Option[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]],
   priceState: Option[SortedMap[TokenPair, PriceRecord]],
   metagraphSyncData: Option[SortedMap[Address, MetagraphSyncDataInfo]],
-  // §3 NIPoPoW S0: stake distribution snapshotted at each eta-period boundary, indexed by the
-  // closing period. Used by `StakeRegistry.relativeStakeAt(_, N-2)` for Cardano-style mark/set/go
-  // slot-leader eligibility. Updated by GSAM.accept() at boundary ordinals (`ord % R == R - 1`);
+  // §3 NIPoPoW S0: per-period boundary record (stake distribution + eta randomness), indexed by the
+  // closing period. Stake half: used by `StakeRegistry.relativeStakeAt(_, N-2)` for Cardano-style
+  // mark/set/go slot-leader eligibility. Eta half: deterministic snapshot of the randomness used by
+  // period N's slot leaders — read by `EtaStateManager.getEta(period)` as the disk-immune cache
+  // (Path 1 of the heap-leak workstream; chainStore eviction can truncate the VRF chain walk that
+  // would otherwise recompute eta). Updated by GSAM.accept() at boundary ordinals (`ord % R == R - 1`);
   // retention pruning keeps the last 4 periods (algorithm needs N-2; extra grace for reorgs).
-  // Empty on V1/V2 upgrade and on genesis until the loader seeds it; eligibility reads fall through
-  // to the warmup branch (current GSI) in that case.
-  historicalStakeSnapshots: SortedMap[EtaPeriod, StakeDistribution]
+  // Empty on V1/V2 upgrade and on genesis until the loader seeds it; eligibility / eta reads fall
+  // through to the warmup branch (current GSI / genesis eta) in that case.
+  historicalStakeSnapshots: SortedMap[EtaPeriod, HistoricalStakeSnapshot]
 ) extends SnapshotInfo[GlobalSnapshotStateProof] {
 
   def toGlobalSnapshotInfo: GlobalSnapshotInfo =

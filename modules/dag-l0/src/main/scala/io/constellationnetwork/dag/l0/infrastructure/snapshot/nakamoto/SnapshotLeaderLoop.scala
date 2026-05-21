@@ -689,376 +689,436 @@ object SnapshotLeaderLoop {
                     // plumbing. The Ref is constructed inside this Stream so its lifetime
                     // matches the leader loop's fiber.
                     Stream.eval(Ref.of[F, SnapshotOrdinal](SnapshotOrdinal.MinValue)).flatMap { lastArchivalOrdinalRef =>
-                      // Tick at 5× slot duration: 5s in prod (1000ms slot), 2.5s in e2e (500ms slot).
-                      // Slightly faster than the expected snapshot arrival rate so the finality
-                      // monitor catches new tips reactively, but still amortizes the chain-walk +
-                      // weight-fold cost over multiple slots.
-                      val finalityMonitor: Stream[F, Unit] = Stream
-                        .awakeEvery[F](FiniteDuration(5L * slotDurationMs, MILLISECONDS))
-                        .evalMap { _ =>
-                          for {
-                            allAtts <- tipTracker.allAttestations
-                            validatorCount <- stakeRegistry.validatorCount
-                            activeCount <- stakeRegistry.observedActiveCount
-                            bestTip <- chainStore.bestTip
+                      // Heap-leak Fix A: operational-k₁ overlay-prune watermark. Drives
+                      // `mptOverlay.pruneBelow` once per advance of `T_depth1.latestQualifyingOrdinal`
+                      // (the operational k₁ finality trigger). Decoupling from the k₂ archival watermark
+                      // means undoJournalRef + finalizedRef are bounded by k₁ ords instead of k₂ — a
+                      // ~257× reduction in worst-case retention (255 vs 65536).
+                      //
+                      // Safety: reorg-replace at depth > k₁ is excluded by `ConfirmationDepthK`
+                      // semantics, so the journal entry at `ord` for `ord < tip.ord - k₁` cannot ever
+                      // be replayed. The reorg-replace finalize paths
+                      // (`MptOverlay.finalizeBranch`'s `case Some(prev) =>` arms) only consult
+                      // `undoJournalRef[ord]` when re-finalizing at the same ord — beyond k₁ depth
+                      // that's a CP violation, not a normal reorg.
+                      //
+                      // Monotone advance via `Ref` mirrors the archival pattern. The overlay's
+                      // `pruneBelow` is itself idempotent and monotone — the local Ref just dedups
+                      // the call so we don't emit OVERLAY-PRUNE-BELOW log noise per finality tick.
+                      Stream.eval(Ref.of[F, SnapshotOrdinal](SnapshotOrdinal.MinValue)).flatMap { lastOperationalPruneOrdinalRef =>
+                        // Tick at 5× slot duration: 5s in prod (1000ms slot), 2.5s in e2e (500ms slot).
+                        // Slightly faster than the expected snapshot arrival rate so the finality
+                        // monitor catches new tips reactively, but still amortizes the chain-walk +
+                        // weight-fold cost over multiple slots.
+                        val finalityMonitor: Stream[F, Unit] = Stream
+                          .awakeEvery[F](FiniteDuration(5L * slotDurationMs, MILLISECONDS))
+                          .evalMap { _ =>
+                            for {
+                              allAtts <- tipTracker.allAttestations
+                              validatorCount <- stakeRegistry.validatorCount
+                              activeCount <- stakeRegistry.observedActiveCount
+                              bestTip <- chainStore.bestTip
 
-                            // §5.1 visibility ticker. If our last self-attestation doesn't match current
-                            // bestTip — because chain-selection switched after a fork-branch arrived, a reorg
-                            // promoted a different tip, or we never attested anything yet — emit a fresh
-                            // self-attestation pointing at canonical. Without this, a stale self-att gets
-                            // filtered to zero weight by TipTracker.highestFinalizedOrdinal:143-151 (canonical-
-                            // hash filter) and our own vote never contributes to bestTip finality.
-                            //
-                            // `attestedAt` is wall-clock epoch ms via `Clock[F].realTime` — same Chronos-prep
-                            // semantics as the peer-receive becameBestTip emit. Not a consensus slot.
-                            _ <- bestTip match {
-                              case Some(tip) if !allAtts.get(selfId).exists(_.tipHash === tip.hash) =>
-                                Clock[F].realTime.map(_.toMillis).flatMap { attestedAt =>
-                                  NakamotoSyncDaemon.emitTipAttestation[F](
-                                    tipHash = tip.hash,
-                                    tipSlot = Slot(NonNegLong.unsafeFrom(tip.slot)),
-                                    tipOrdinal = tip.ordinal,
-                                    attestedAt = attestedAt,
-                                    sidecarClient = sidecarClient,
-                                    tipTracker = tipTracker,
-                                    selfId = selfId,
-                                    keyPair = keyPair,
-                                    operationalKeyMaker = operationalKeyMaker,
-                                    etaRotationSnapshots = etaRotationSnapshots,
-                                    logger = logger
-                                  ) >> logger.info(
-                                    s"RE-ATTEST bestTip change: ord=${tip.ordinal} slot=${tip.slot} hash=${tip.hash.value.take(12)} " +
-                                      s"attestedAt=${attestedAt} " +
-                                      s"(prior self-att=${allAtts.get(selfId).map(_.tipHash.value.take(12)).getOrElse("none")})"
-                                  )
-                                }
-                              case _ => Async[F].unit
-                            }
+                              // §5.1 visibility ticker. If our last self-attestation doesn't match current
+                              // bestTip — because chain-selection switched after a fork-branch arrived, a reorg
+                              // promoted a different tip, or we never attested anything yet — emit a fresh
+                              // self-attestation pointing at canonical. Without this, a stale self-att gets
+                              // filtered to zero weight by TipTracker.highestFinalizedOrdinal:143-151 (canonical-
+                              // hash filter) and our own vote never contributes to bestTip finality.
+                              //
+                              // `attestedAt` is wall-clock epoch ms via `Clock[F].realTime` — same Chronos-prep
+                              // semantics as the peer-receive becameBestTip emit. Not a consensus slot.
+                              _ <- bestTip match {
+                                case Some(tip) if !allAtts.get(selfId).exists(_.tipHash === tip.hash) =>
+                                  Clock[F].realTime.map(_.toMillis).flatMap { attestedAt =>
+                                    NakamotoSyncDaemon.emitTipAttestation[F](
+                                      tipHash = tip.hash,
+                                      tipSlot = Slot(NonNegLong.unsafeFrom(tip.slot)),
+                                      tipOrdinal = tip.ordinal,
+                                      attestedAt = attestedAt,
+                                      sidecarClient = sidecarClient,
+                                      tipTracker = tipTracker,
+                                      selfId = selfId,
+                                      keyPair = keyPair,
+                                      operationalKeyMaker = operationalKeyMaker,
+                                      etaRotationSnapshots = etaRotationSnapshots,
+                                      logger = logger
+                                    ) >> logger.info(
+                                      s"RE-ATTEST bestTip change: ord=${tip.ordinal} slot=${tip.slot} hash=${tip.hash.value.take(12)} " +
+                                        s"attestedAt=${attestedAt} " +
+                                        s"(prior self-att=${allAtts.get(selfId).map(_.tipHash.value.take(12)).getOrElse("none")})"
+                                    )
+                                  }
+                                case _ => Async[F].unit
+                              }
 
-                            // The last-finalized **ordinal** must come from chainStore — tipTracker.lastFinalized
-                            // only carries (Hash, Slot), and slots are LDD-paced not 1:1 with ordinals. The
-                            // previous code derived this from the slot value which silently disabled the depth
-                            // gate (as soon as any attestation finality fired, the slot value far outran any
-                            // tip.ordinal under LDD slot fill, making `tip.ordinal - lastFinalizedSlot > k`
-                            // perpetually false).
-                            lastFinalizedOrdinal <- chainStore.lastFinalizedOrdinal
+                              // The last-finalized **ordinal** must come from chainStore — tipTracker.lastFinalized
+                              // only carries (Hash, Slot), and slots are LDD-paced not 1:1 with ordinals. The
+                              // previous code derived this from the slot value which silently disabled the depth
+                              // gate (as soon as any attestation finality fired, the slot value far outran any
+                              // tip.ordinal under LDD slot fill, making `tip.ordinal - lastFinalizedSlot > k`
+                              // perpetually false).
+                              lastFinalizedOrdinal <- chainStore.lastFinalizedOrdinal
 
-                            // Evaluate every trigger against the current ConsensusState. Each
-                            // `evaluateAndAdvance` updates that trigger's monotone Ref so
-                            // `FinalityTrigger.triggersFor(ord)` correctly reports membership for
-                            // later lookups. We still re-fetch `t_weight`'s `(ordinal, weight)`
-                            // tuple separately below for the ATTEST-FINALIZED log line, which
-                            // requires the cumulative-weight value (idempotent pure read).
-                            _ <- bestTip match {
-                              case Some(tip) =>
-                                val state = FinalityTrigger.ConsensusState[F](
-                                  selfId = selfId,
-                                  bestTipOrdinal = SnapshotOrdinal.unsafeApply(tip.ordinal),
-                                  bestTipHash = tip.hash,
-                                  canonicalHashAt = ord => chainStore.walkBackTo(tip.hash, ord)
-                                )
-                                tWeight.evaluateAndAdvance(state) >>
-                                  tCount.evaluateAndAdvance(state) >>
-                                  tDepth1.evaluateAndAdvance(state) >>
-                                  tDepth2.evaluateAndAdvance(state).void
-                              case None =>
-                                Async[F].unit
-                            }
-
-                            // Depth-based finality: a snapshot is final once k+ snapshots sit above it on
-                            // the canonical chain — `tip.ordinal - snapshotOrdinal > k`.
-                            //
-                            // Driven by `tDepth1.latestQualifyingOrdinal` (the trigger). The trigger's
-                            // monotone-advance Ref was just updated above; we read it here to drive
-                            // the side-effecting finalization below.
-                            depthQualifying <- tDepth1.latestQualifyingOrdinal
-                            depthFinalized <- bestTip match {
-                              case Some(tip) if depthQualifying.value.value > lastFinalizedOrdinal =>
-                                val finalizeAtOrdinal = depthQualifying.value.value
-                                // Walk the canonical chain from best tip to the hash at finalizeAtOrdinal,
-                                // then look up its actual slot from the chain store. The slot is needed by
-                                // tipTracker.markFinalized / pruneBelow which key attestations by slot. Do
-                                // NOT compute it as `tip.slot - k` — that mixes slot-units with ordinal-units
-                                // (the old bug) and produces a slot far above the canonical snapshot's real
-                                // slot, over-pruning attestations.
-                                chainStore.walkBackTo(tip.hash, finalizeAtOrdinal).flatMap {
-                                  case Some(canonicalHash) =>
-                                    chainStore.get(canonicalHash).flatMap {
-                                      case Some(canonicalSnapshot) =>
-                                        val finalizeAtSlot = Slot(NonNegLong.unsafeFrom(canonicalSnapshot.slot))
-                                        tipTracker.markFinalized(canonicalHash, finalizeAtSlot) >>
-                                          tipTracker.pruneBelow(finalizeAtSlot) >>
-                                          chainStore.finalize(canonicalHash, finalizeAtOrdinal) >>
-                                          // (#196) Phase-3 ack to the sidecar outbox. After this finalize call
-                                          // the snapshot's AllowSpendBlocks + StateChannelSnapshots are durably
-                                          // committed; the sidecar can drop the corresponding outbox entries
-                                          // and stop re-gossiping. Failure here is non-fatal — the outbox TTL
-                                          // catches it eventually and the next finalize call would re-confirm
-                                          // anyway (Confirm is idempotent on the sidecar side).
-                                          confirmSnapshotOutbox(canonicalSnapshot, sidecarClient, logger) >>
-                                          // Slice S3: drop committee-attestation tally entries for `(metagraphAddress,
-                                          // parentHash)` pairs whose binary just rolled into a finalized gl0 snapshot.
-                                          // Default is a no-op; the gate-wired path iterates `stateChannelSnapshots`.
-                                          onFinalize(canonicalSnapshot.signedSnapshot.value) >>
-                                          // #56.6: notify the MPT overlay that this branch is finalized. With
-                                          // accept() not yet migrated, this is a runtime no-op (pending=empty
-                                          // returns NoOp). When #56.10 migrates accept() to commit branches,
-                                          // this becomes the fold-forward sink without touching this site.
-                                          mptOverlay
-                                            .finalizeBranch(BranchId(canonicalHash), SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
-                                            .void >>
-                                          // Advance the finalized-ordinal tracker so HttpApi
-                                          // /latest/finalized-ordinal reflects the new high-water mark. CL0
-                                          // polls this to gate state-channel-binary pruning on actual finality
-                                          // (not just first sight).
-                                          nakamotoFinalizedOrdinalRef
-                                            .update(prev =>
-                                              cats.Order[SnapshotOrdinal].max(prev, SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
-                                            ) >>
-                                          logger
-                                            .info(
-                                              s"DEPTH-FINALIZED ordinal=$finalizeAtOrdinal slot=${canonicalSnapshot.slot} (tip ord=${tip.ordinal} slot=${tip.slot}, k=$ConfirmationDepthK)"
-                                            ) >>
-                                          Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
-                                          Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalizeAtOrdinal) >>
-                                          productionTimestamps.getAndUpdate(_ - finalizeAtOrdinal).flatMap { ts =>
-                                            ts.get(finalizeAtOrdinal).traverse_ { prodMs =>
-                                              val latencyMs = System.currentTimeMillis() - prodMs
-                                              Metrics[F].recordDistribution("dag_nakamoto_finality_latency_ms", latencyMs.toInt)
-                                            }
-                                          } >>
-                                          // Chain-quality observable (#138): sample which Phase 1→2 triggers
-                                          // qualified this ordinal at finalize time. Pure observability — the
-                                          // qualifying-set lookup walks each trigger's monotone Ref (no chain
-                                          // walk). Value ∈ {1, 2, 3}: 1 = sketchy single-trigger evidence
-                                          // (typically depth-only in a small-cluster partition), 3 = rock-solid
-                                          // unanimous evidence. The per-kind counter increments let dashboards
-                                          // break down "what fired" over time.
-                                          FinalityTrigger
-                                            .triggersFor(phase12Triggers, SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
-                                            .flatMap(qs => emitChainQuality[F](qs, finalizedOrdinal = Some(finalizeAtOrdinal))) >>
-                                          Async[F].pure(true)
-                                      case None =>
-                                        logger.warn(
-                                          s"⚠️ DEPTH-FINALIZE: walked back to ordinal=$finalizeAtOrdinal but chainStore.get returned None for hash=${canonicalHash.value
-                                              .take(12)}"
-                                        ) >> Async[F].pure(false)
-                                    }
-                                  case None =>
-                                    logger.warn(
-                                      s"⚠️ DEPTH-FINALIZE: could not find canonical hash at ordinal=$finalizeAtOrdinal from tip=${tip.hash.value
-                                          .take(12)}"
-                                    ) >> Async[F].pure(false)
-                                }
-                              case _ => Async[F].pure(false)
-                            }
-
-                            // GRANDPA-style chain finality, chain-aware: attesting to ordinal N with a hash on
-                            // OUR chain implicitly attests to all ancestors. Attestations with a different hash
-                            // at ordinal N are on a different fork and must NOT contribute weight here — the
-                            // canonicalHashAt predicate filters them out. Walk attestation ordinals from highest
-                            // down, accumulating only matching-hash weight. The highest ordinal where cumulative
-                            // weight >= 2/3 is finalized.
-                            //
-                            // The trigger's `tWeight.latestQualifyingOrdinal` already reflects this evaluation
-                            // (from `evaluateAndAdvance` above) — but `tWeight` now reads the Snowball
-                            // accumulator, not the legacy weight-sum path. The legacy
-                            // `highestFinalizedOrdinal` call below is retained for the ATTEST-FINALIZED log
-                            // line's cumulative `weight` value (downstream log-parsing depends on
-                            // `weight=X.XX` exactly) and as parallel evidence at the same ordinal. The work is
-                            // idempotent — a pure read against the attestations map + canonical chain walk.
-                            //
-                            // '''P-11b rolled back (Snowball commit).''' This call NO LONGER passes `selfId`.
-                            // Snowball's observer-independent decision rule is the primary T_weight driver;
-                            // the legacy weight-sum here can safely include self again. NID is restored at the
-                            // T_weight position. See `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §3.1.
-                            chainFinalizedOrdinal <- bestTip match {
-                              case Some(tip) =>
-                                tipTracker.highestFinalizedOrdinal(
-                                  TipTracker.FinalityThreshold,
-                                  ord => chainStore.walkBackTo(tip.hash, ord)
-                                )
-                              case None =>
-                                Async[F].pure(Option.empty[(Long, Ratio)])
-                            }
-                            _ <- (chainFinalizedOrdinal, bestTip) match {
-                              case (Some((finalOrdinal, weight)), Some(tip)) if finalOrdinal > lastFinalizedOrdinal && !depthFinalized =>
-                                // Walk the canonical chain to find the hash at finalOrdinal
-                                chainStore.walkBackTo(tip.hash, finalOrdinal).flatMap {
-                                  case Some(canonicalHash) =>
-                                    chainStore.get(canonicalHash).flatMap {
-                                      case Some(stored) =>
-                                        val finalSlot = Slot(NonNegLong.unsafeFrom(stored.slot))
-                                        tipTracker.markFinalized(canonicalHash, finalSlot) >>
-                                          tipTracker.pruneBelow(finalSlot) >>
-                                          chainStore.finalize(canonicalHash, finalOrdinal) >>
-                                          // (#196) Phase-3 outbox ack — see DEPTH-FINALIZED branch for rationale.
-                                          confirmSnapshotOutbox(stored, sidecarClient, logger) >>
-                                          // Slice S3: drop committee-attestation tally entries for `(metagraphAddress,
-                                          // parentHash)` pairs whose binary just rolled into a finalized gl0 snapshot.
-                                          // Same site as the depth-finality path above.
-                                          onFinalize(stored.signedSnapshot.value) >>
-                                          // #56.6: see depth-k branch above. Same wiring at the attestation-2/3 sink.
-                                          mptOverlay
-                                            .finalizeBranch(BranchId(canonicalHash), SnapshotOrdinal.unsafeApply(finalOrdinal))
-                                            .void >>
-                                          nakamotoFinalizedOrdinalRef
-                                            .update(prev =>
-                                              cats.Order[SnapshotOrdinal].max(prev, SnapshotOrdinal.unsafeApply(finalOrdinal))
-                                            ) >>
-                                          snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(finalOrdinal))) >>
-                                          logger.info(
-                                            s"ATTEST-FINALIZED ordinal=$finalOrdinal slot=${stored.slot} (weight=${"%.2f".format(weight.toDouble)}, " +
-                                              s"${allAtts.size}/${activeCount} active of ${validatorCount} seedlist)"
-                                          ) >>
-                                          Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
-                                          Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalOrdinal) >>
-                                          productionTimestamps.getAndUpdate(_ - finalOrdinal).flatMap { ts =>
-                                            ts.get(finalOrdinal).traverse_ { prodMs =>
-                                              val latencyMs = System.currentTimeMillis() - prodMs
-                                              Metrics[F].recordDistribution("dag_nakamoto_finality_latency_ms", latencyMs.toInt)
-                                            }
-                                          } >>
-                                          // Chain-quality observable (#138): see the matching block in the
-                                          // DEPTH-FINALIZED branch above for the rationale. Same sample at
-                                          // the attestation-2/3 sink so both finalize paths produce a
-                                          // gauge update + per-kind counter increments.
-                                          FinalityTrigger
-                                            .triggersFor(phase12Triggers, SnapshotOrdinal.unsafeApply(finalOrdinal))
-                                            .flatMap(qs => emitChainQuality[F](qs, finalizedOrdinal = Some(finalOrdinal)))
-                                      case None =>
-                                        logger.warn(
-                                          s"⚠️ ATTEST-FINALIZE: chainStore.get returned None for hash=${canonicalHash.value.take(12)} at ordinal=$finalOrdinal"
-                                        )
-                                    }
-                                  case None =>
-                                    // We're on a fork that doesn't contain the attested ordinal. The periodic sync will notice eventually,
-                                    // but in practice that takes ~tens of seconds (observed 48s stall in one incident). Enqueue a targeted
-                                    // ChainSync request so we start pulling the better chain now. Idempotent: repeated 5s ticks over the same
-                                    // gap collapse into one in-flight request.
-                                    logger
-                                      .warn(
-                                        s"⚠️ ATTEST-FINALIZE: walkBackTo found no hash at ordinal=$finalOrdinal from tip=${tip.hash.value.take(12)}"
-                                      ) >>
-                                      chainSyncRequestQueue.request(finalOrdinal)
-                                }
-                              case _ =>
-                                Async[F].whenA(allAtts.nonEmpty) {
-                                  val ordinals = allAtts.values.map(_.tipOrdinal).toList.sorted
-                                  logger.debug(
-                                    s"Attestations: ${allAtts.size} attesters, ordinals=[${ordinals.mkString(",")}], lastFinalized=$lastFinalizedOrdinal"
-                                  )
-                                }
-                            }
-
-                            // T_count observability: log when T_count strictly outruns both T_weight AND
-                            // T_depth1 (i.e. it would have driven the finalize on its own, if the max-of
-                            // semantics ever consumed it). Today's sinks are driven by T_weight / T_depth1;
-                            // this log line is purely diagnostic so we can see when count-based finality
-                            // would beat the others. Under equal stake T_count ties with T_weight (same
-                            // 2/3 threshold, equal weights ⇒ count is just `weight * validatorCount`), so
-                            // this branch is silent on healthy clusters. It only fires once stake-weighted
-                            // VRF lands and a high-stake validator can hit 2/3 weight alone while count
-                            // remains below threshold (T_weight > T_count) OR when an attestation set has
-                            // wide count coverage but low aggregate weight (T_count > T_weight).
-                            countQualifying <- tCount.latestQualifyingOrdinal
-                            weightQualifying <- tWeight.latestQualifyingOrdinal
-                            _ <- Async[F].whenA(
-                              countQualifying.value.value > lastFinalizedOrdinal &&
-                                countQualifying.value.value > weightQualifying.value.value &&
-                                countQualifying > depthQualifying
-                            ) {
-                              // Recompute the contributing count on the current canonical chain, purely for
-                              // the log line (does not drive state). Mirrors TCountTrigger's filter so the
-                              // logged K/V matches what the trigger saw.
-                              val countSnapshotF = bestTip match {
+                              // Evaluate every trigger against the current ConsensusState. Each
+                              // `evaluateAndAdvance` updates that trigger's monotone Ref so
+                              // `FinalityTrigger.triggersFor(ord)` correctly reports membership for
+                              // later lookups. We still re-fetch `t_weight`'s `(ordinal, weight)`
+                              // tuple separately below for the ATTEST-FINALIZED log line, which
+                              // requires the cumulative-weight value (idempotent pure read).
+                              _ <- bestTip match {
                                 case Some(tip) =>
-                                  allAtts.iterator.filter { case (peerId, _) => peerId =!= selfId }.toList
-                                    .traverse[F, Boolean] {
-                                      case (_, att) =>
-                                        chainStore.walkBackTo(tip.hash, att.tipOrdinal).map {
-                                          case Some(localHash) if localHash === att.tipHash => true
-                                          case _                                            => false
-                                        }
-                                    }
-                                    .map(_.count(identity))
-                                case None => Async[F].pure(0)
+                                  val state = FinalityTrigger.ConsensusState[F](
+                                    selfId = selfId,
+                                    bestTipOrdinal = SnapshotOrdinal.unsafeApply(tip.ordinal),
+                                    bestTipHash = tip.hash,
+                                    canonicalHashAt = ord => chainStore.walkBackTo(tip.hash, ord)
+                                  )
+                                  tWeight.evaluateAndAdvance(state) >>
+                                    tCount.evaluateAndAdvance(state) >>
+                                    tDepth1.evaluateAndAdvance(state) >>
+                                    tDepth2.evaluateAndAdvance(state).void
+                                case None =>
+                                  Async[F].unit
                               }
-                              countSnapshotF.flatMap { k =>
-                                logger.info(
-                                  s"T_COUNT-FINALIZED ordinal=${countQualifying.value.value} count=$k/$validatorCount " +
-                                    s"(V=$validatorCount, T_weight=${weightQualifying.value.value}, T_depth1=${depthQualifying.value.value})"
-                                )
-                              }
-                            }
 
-                            // T_depth2 (Phase 2 → Phase 3, ARCHIVAL) observability + scaffolding.
-                            //
-                            // When `tDepth2.latestQualifyingOrdinal` strictly outruns our local archival
-                            // watermark, advance the watermark, emit the log line + counters, AND drive
-                            // the Phase-3 overlay-history prune sink (#139) so long-running nodes don't
-                            // leak the per-ordinal undo journal / finalizedRef accumulators that grow
-                            // monotonically with every finalize. Future Phase-3 sinks (Mithril aggregate
-                            // cert, light-client trust anchor) plug in here too.
-                            archivalQualifying <- tDepth2.latestQualifyingOrdinal
-                            _ <- lastArchivalOrdinalRef.get.flatMap { prev =>
-                              if (archivalQualifying.value.value > prev.value.value)
-                                bestTip match {
-                                  case Some(tip) =>
-                                    lastArchivalOrdinalRef.set(archivalQualifying) >>
-                                      logger.info(
-                                        s"ARCHIVAL-FINALIZED ordinal=${archivalQualifying.value.value} " +
-                                          s"(tip ord=${tip.ordinal}, k₂=$ArchivalDepthK)"
-                                      ) >>
-                                      Metrics[F].incrementCounter("dag_nakamoto_archival_finalized") >>
-                                      Metrics[F].updateGauge("dag_nakamoto_archival_ordinal", archivalQualifying.value.value) >>
-                                      // Phase-3 archival prune (#139). `pruneBelow` drops overlay history
-                                      // entries strictly below the new archival watermark — irreversible
-                                      // and safe by depth-k₂ definition (reorgs at this depth excluded).
-                                      // Logged at INFO inside the overlay when entries are dropped.
-                                      mptOverlay.pruneBelow(archivalQualifying) >>
-                                      // §3 NIPoPoW S3 Phase-3 sink. Walk newly-archival ordinals
-                                      // `(prev, archivalQualifying]` and feed each to the tower
-                                      // finalizer. The walk uses chainStore.walkBackTo from bestTip to
-                                      // resolve canonical hashes; snapshotStorage.get fetches the
-                                      // signed snapshot; toHashed re-computes the content hash. The
-                                      // finalizer's high-water-mark Ref guards against double-write.
-                                      //
-                                      // Bounded by `TowerFinalizerMaxCatchupPerTick` so catch-up after
-                                      // a process restart doesn't stall the leader loop's 5s tick.
-                                      // Remaining ordinals roll forward on the next tick — the
-                                      // finalizer's high-water-mark ensures forward-only progression
-                                      // even if the loop misses a window.
-                                      //
-                                      // Background-fire (`Async.start`) so the chain walk + L-1
-                                      // continued-fraction trial computations don't block the
-                                      // finality monitor's other sinks.
-                                      Async[F]
-                                        .start(
-                                          driveTowerFinalizer(
-                                            chainStore = chainStore,
-                                            snapshotStorage = snapshotStorage,
-                                            towerFinalizer = towerFinalizer,
-                                            tipHash = tip.hash,
-                                            prevWatermark = prev,
-                                            archivalQualifying = archivalQualifying,
-                                            logger = logger
+                              // Depth-based finality: a snapshot is final once k+ snapshots sit above it on
+                              // the canonical chain — `tip.ordinal - snapshotOrdinal > k`.
+                              //
+                              // Driven by `tDepth1.latestQualifyingOrdinal` (the trigger). The trigger's
+                              // monotone-advance Ref was just updated above; we read it here to drive
+                              // the side-effecting finalization below.
+                              depthQualifying <- tDepth1.latestQualifyingOrdinal
+                              depthFinalized <- bestTip match {
+                                case Some(tip) if depthQualifying.value.value > lastFinalizedOrdinal =>
+                                  val finalizeAtOrdinal = depthQualifying.value.value
+                                  // Walk the canonical chain from best tip to the hash at finalizeAtOrdinal,
+                                  // then look up its actual slot from the chain store. The slot is needed by
+                                  // tipTracker.markFinalized / pruneBelow which key attestations by slot. Do
+                                  // NOT compute it as `tip.slot - k` — that mixes slot-units with ordinal-units
+                                  // (the old bug) and produces a slot far above the canonical snapshot's real
+                                  // slot, over-pruning attestations.
+                                  chainStore.walkBackTo(tip.hash, finalizeAtOrdinal).flatMap {
+                                    case Some(canonicalHash) =>
+                                      chainStore.get(canonicalHash).flatMap {
+                                        case Some(canonicalSnapshot) =>
+                                          val finalizeAtSlot = Slot(NonNegLong.unsafeFrom(canonicalSnapshot.slot))
+                                          tipTracker.markFinalized(canonicalHash, finalizeAtSlot) >>
+                                            tipTracker.pruneBelow(finalizeAtSlot) >>
+                                            chainStore.finalize(canonicalHash, finalizeAtOrdinal) >>
+                                            // (#196) Phase-3 ack to the sidecar outbox. After this finalize call
+                                            // the snapshot's AllowSpendBlocks + StateChannelSnapshots are durably
+                                            // committed; the sidecar can drop the corresponding outbox entries
+                                            // and stop re-gossiping. Failure here is non-fatal — the outbox TTL
+                                            // catches it eventually and the next finalize call would re-confirm
+                                            // anyway (Confirm is idempotent on the sidecar side).
+                                            confirmSnapshotOutbox(canonicalSnapshot, sidecarClient, logger) >>
+                                            // Slice S3: drop committee-attestation tally entries for `(metagraphAddress,
+                                            // parentHash)` pairs whose binary just rolled into a finalized gl0 snapshot.
+                                            // Default is a no-op; the gate-wired path iterates `stateChannelSnapshots`.
+                                            onFinalize(canonicalSnapshot.signedSnapshot.value) >>
+                                            // #56.6: notify the MPT overlay that this branch is finalized. With
+                                            // accept() not yet migrated, this is a runtime no-op (pending=empty
+                                            // returns NoOp). When #56.10 migrates accept() to commit branches,
+                                            // this becomes the fold-forward sink without touching this site.
+                                            mptOverlay
+                                              .finalizeBranch(BranchId(canonicalHash), SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
+                                              .void >>
+                                            // Advance the finalized-ordinal tracker so HttpApi
+                                            // /latest/finalized-ordinal reflects the new high-water mark. CL0
+                                            // polls this to gate state-channel-binary pruning on actual finality
+                                            // (not just first sight).
+                                            nakamotoFinalizedOrdinalRef
+                                              .update(prev =>
+                                                cats.Order[SnapshotOrdinal].max(prev, SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
+                                              ) >>
+                                            logger
+                                              .info(
+                                                s"DEPTH-FINALIZED ordinal=$finalizeAtOrdinal slot=${canonicalSnapshot.slot} (tip ord=${tip.ordinal} slot=${tip.slot}, k=$ConfirmationDepthK)"
+                                              ) >>
+                                            Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
+                                            Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalizeAtOrdinal) >>
+                                            productionTimestamps.getAndUpdate(_ - finalizeAtOrdinal).flatMap { ts =>
+                                              ts.get(finalizeAtOrdinal).traverse_ { prodMs =>
+                                                val latencyMs = System.currentTimeMillis() - prodMs
+                                                Metrics[F].recordDistribution("dag_nakamoto_finality_latency_ms", latencyMs.toInt)
+                                              }
+                                            } >>
+                                            // Chain-quality observable (#138): sample which Phase 1→2 triggers
+                                            // qualified this ordinal at finalize time. Pure observability — the
+                                            // qualifying-set lookup walks each trigger's monotone Ref (no chain
+                                            // walk). Value ∈ {1, 2, 3}: 1 = sketchy single-trigger evidence
+                                            // (typically depth-only in a small-cluster partition), 3 = rock-solid
+                                            // unanimous evidence. The per-kind counter increments let dashboards
+                                            // break down "what fired" over time.
+                                            FinalityTrigger
+                                              .triggersFor(phase12Triggers, SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
+                                              .flatMap(qs => emitChainQuality[F](qs, finalizedOrdinal = Some(finalizeAtOrdinal))) >>
+                                            Async[F].pure(true)
+                                        case None =>
+                                          logger.warn(
+                                            s"⚠️ DEPTH-FINALIZE: walked back to ordinal=$finalizeAtOrdinal but chainStore.get returned None for hash=${canonicalHash.value
+                                                .take(12)}"
+                                          ) >> Async[F].pure(false)
+                                      }
+                                    case None =>
+                                      logger.warn(
+                                        s"⚠️ DEPTH-FINALIZE: could not find canonical hash at ordinal=$finalizeAtOrdinal from tip=${tip.hash.value
+                                            .take(12)}"
+                                      ) >> Async[F].pure(false)
+                                  }
+                                case _ => Async[F].pure(false)
+                              }
+
+                              // GRANDPA-style chain finality, chain-aware: attesting to ordinal N with a hash on
+                              // OUR chain implicitly attests to all ancestors. Attestations with a different hash
+                              // at ordinal N are on a different fork and must NOT contribute weight here — the
+                              // canonicalHashAt predicate filters them out. Walk attestation ordinals from highest
+                              // down, accumulating only matching-hash weight. The highest ordinal where cumulative
+                              // weight >= 2/3 is finalized.
+                              //
+                              // The trigger's `tWeight.latestQualifyingOrdinal` already reflects this evaluation
+                              // (from `evaluateAndAdvance` above) — but `tWeight` now reads the Snowball
+                              // accumulator, not the legacy weight-sum path. The legacy
+                              // `highestFinalizedOrdinal` call below is retained for the ATTEST-FINALIZED log
+                              // line's cumulative `weight` value (downstream log-parsing depends on
+                              // `weight=X.XX` exactly) and as parallel evidence at the same ordinal. The work is
+                              // idempotent — a pure read against the attestations map + canonical chain walk.
+                              //
+                              // '''P-11b rolled back (Snowball commit).''' This call NO LONGER passes `selfId`.
+                              // Snowball's observer-independent decision rule is the primary T_weight driver;
+                              // the legacy weight-sum here can safely include self again. NID is restored at the
+                              // T_weight position. See `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §3.1.
+                              chainFinalizedOrdinal <- bestTip match {
+                                case Some(tip) =>
+                                  tipTracker.highestFinalizedOrdinal(
+                                    TipTracker.FinalityThreshold,
+                                    ord => chainStore.walkBackTo(tip.hash, ord)
+                                  )
+                                case None =>
+                                  Async[F].pure(Option.empty[(Long, Ratio)])
+                              }
+                              _ <- (chainFinalizedOrdinal, bestTip) match {
+                                case (Some((finalOrdinal, weight)), Some(tip)) if finalOrdinal > lastFinalizedOrdinal && !depthFinalized =>
+                                  // Walk the canonical chain to find the hash at finalOrdinal
+                                  chainStore.walkBackTo(tip.hash, finalOrdinal).flatMap {
+                                    case Some(canonicalHash) =>
+                                      chainStore.get(canonicalHash).flatMap {
+                                        case Some(stored) =>
+                                          val finalSlot = Slot(NonNegLong.unsafeFrom(stored.slot))
+                                          tipTracker.markFinalized(canonicalHash, finalSlot) >>
+                                            tipTracker.pruneBelow(finalSlot) >>
+                                            chainStore.finalize(canonicalHash, finalOrdinal) >>
+                                            // (#196) Phase-3 outbox ack — see DEPTH-FINALIZED branch for rationale.
+                                            confirmSnapshotOutbox(stored, sidecarClient, logger) >>
+                                            // Slice S3: drop committee-attestation tally entries for `(metagraphAddress,
+                                            // parentHash)` pairs whose binary just rolled into a finalized gl0 snapshot.
+                                            // Same site as the depth-finality path above.
+                                            onFinalize(stored.signedSnapshot.value) >>
+                                            // #56.6: see depth-k branch above. Same wiring at the attestation-2/3 sink.
+                                            mptOverlay
+                                              .finalizeBranch(BranchId(canonicalHash), SnapshotOrdinal.unsafeApply(finalOrdinal))
+                                              .void >>
+                                            nakamotoFinalizedOrdinalRef
+                                              .update(prev =>
+                                                cats.Order[SnapshotOrdinal].max(prev, SnapshotOrdinal.unsafeApply(finalOrdinal))
+                                              ) >>
+                                            snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(finalOrdinal))) >>
+                                            logger.info(
+                                              s"ATTEST-FINALIZED ordinal=$finalOrdinal slot=${stored.slot} (weight=${"%.2f".format(weight.toDouble)}, " +
+                                                s"${allAtts.size}/${activeCount} active of ${validatorCount} seedlist)"
+                                            ) >>
+                                            Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
+                                            Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalOrdinal) >>
+                                            productionTimestamps.getAndUpdate(_ - finalOrdinal).flatMap { ts =>
+                                              ts.get(finalOrdinal).traverse_ { prodMs =>
+                                                val latencyMs = System.currentTimeMillis() - prodMs
+                                                Metrics[F].recordDistribution("dag_nakamoto_finality_latency_ms", latencyMs.toInt)
+                                              }
+                                            } >>
+                                            // Chain-quality observable (#138): see the matching block in the
+                                            // DEPTH-FINALIZED branch above for the rationale. Same sample at
+                                            // the attestation-2/3 sink so both finalize paths produce a
+                                            // gauge update + per-kind counter increments.
+                                            FinalityTrigger
+                                              .triggersFor(phase12Triggers, SnapshotOrdinal.unsafeApply(finalOrdinal))
+                                              .flatMap(qs => emitChainQuality[F](qs, finalizedOrdinal = Some(finalOrdinal)))
+                                        case None =>
+                                          logger.warn(
+                                            s"⚠️ ATTEST-FINALIZE: chainStore.get returned None for hash=${canonicalHash.value.take(12)} at ordinal=$finalOrdinal"
                                           )
-                                        )
-                                        .void
-                                  case None =>
-                                    // Trigger advanced without a tip — shouldn't happen because the
-                                    // trigger's evaluator returns MinValue when bestTip is None.
-                                    // Still, advance the Ref idempotently so we don't re-log on the
-                                    // next tick.
-                                    lastArchivalOrdinalRef.set(archivalQualifying)
-                                }
-                              else Async[F].unit
-                            }
-                          } yield ()
-                        }
+                                      }
+                                    case None =>
+                                      // We're on a fork that doesn't contain the attested ordinal. The periodic sync will notice eventually,
+                                      // but in practice that takes ~tens of seconds (observed 48s stall in one incident). Enqueue a targeted
+                                      // ChainSync request so we start pulling the better chain now. Idempotent: repeated 5s ticks over the same
+                                      // gap collapse into one in-flight request.
+                                      logger
+                                        .warn(
+                                          s"⚠️ ATTEST-FINALIZE: walkBackTo found no hash at ordinal=$finalOrdinal from tip=${tip.hash.value.take(12)}"
+                                        ) >>
+                                        chainSyncRequestQueue.request(finalOrdinal)
+                                  }
+                                case _ =>
+                                  Async[F].whenA(allAtts.nonEmpty) {
+                                    val ordinals = allAtts.values.map(_.tipOrdinal).toList.sorted
+                                    logger.debug(
+                                      s"Attestations: ${allAtts.size} attesters, ordinals=[${ordinals.mkString(",")}], lastFinalized=$lastFinalizedOrdinal"
+                                    )
+                                  }
+                              }
 
-                      seedChainStore ++ slotTick.merge(finalityMonitor)
+                              // T_count observability: log when T_count strictly outruns both T_weight AND
+                              // T_depth1 (i.e. it would have driven the finalize on its own, if the max-of
+                              // semantics ever consumed it). Today's sinks are driven by T_weight / T_depth1;
+                              // this log line is purely diagnostic so we can see when count-based finality
+                              // would beat the others. Under equal stake T_count ties with T_weight (same
+                              // 2/3 threshold, equal weights ⇒ count is just `weight * validatorCount`), so
+                              // this branch is silent on healthy clusters. It only fires once stake-weighted
+                              // VRF lands and a high-stake validator can hit 2/3 weight alone while count
+                              // remains below threshold (T_weight > T_count) OR when an attestation set has
+                              // wide count coverage but low aggregate weight (T_count > T_weight).
+                              countQualifying <- tCount.latestQualifyingOrdinal
+                              weightQualifying <- tWeight.latestQualifyingOrdinal
+                              _ <- Async[F].whenA(
+                                countQualifying.value.value > lastFinalizedOrdinal &&
+                                  countQualifying.value.value > weightQualifying.value.value &&
+                                  countQualifying > depthQualifying
+                              ) {
+                                // Recompute the contributing count on the current canonical chain, purely for
+                                // the log line (does not drive state). Mirrors TCountTrigger's filter so the
+                                // logged K/V matches what the trigger saw.
+                                val countSnapshotF = bestTip match {
+                                  case Some(tip) =>
+                                    allAtts.iterator.filter { case (peerId, _) => peerId =!= selfId }.toList
+                                      .traverse[F, Boolean] {
+                                        case (_, att) =>
+                                          chainStore.walkBackTo(tip.hash, att.tipOrdinal).map {
+                                            case Some(localHash) if localHash === att.tipHash => true
+                                            case _                                            => false
+                                          }
+                                      }
+                                      .map(_.count(identity))
+                                  case None => Async[F].pure(0)
+                                }
+                                countSnapshotF.flatMap { k =>
+                                  logger.info(
+                                    s"T_COUNT-FINALIZED ordinal=${countQualifying.value.value} count=$k/$validatorCount " +
+                                      s"(V=$validatorCount, T_weight=${weightQualifying.value.value}, T_depth1=${depthQualifying.value.value})"
+                                  )
+                                }
+                              }
+
+                              // Heap-leak Fix A — operational-k₁ overlay prune.
+                              //
+                              // Drives `mptOverlay.pruneBelow` once per advance of `tDepth1.latestQualifyingOrdinal`
+                              // (the operational k₁ finality trigger). Previously the only `pruneBelow` site was
+                              // wired to `tDepth2` (k₂ ≈ 65536 ≈ 6 days at ~445 snapshots/h), so the overlay's
+                              // `undoJournalRef` + `finalizedRef` accumulators grew linearly across every 12h soak.
+                              // Decoupling to k₁ (≈ 255 ≈ 30 min at the same rate) bounds the in-memory overlay-
+                              // history sets and was the dominant contributor to the leak documented in
+                              // `test-runs/soak-12h-preserve-20260521-083116/HEAP-LEAK-DIAGNOSIS.md` §1.
+                              //
+                              // Safety: reorg-replace at depth > k₁ is excluded by `ConfirmationDepthK` semantics.
+                              // The reorg-replace finalize paths in `MptOverlay.finalizeBranch` (`case Some(prev) =>`
+                              // arms at MptOverlay.scala:703, :768) consult `undoJournalRef[ord]` only when a
+                              // different canonical re-finalizes at the same `ord`. Beyond k₁ depth that would be
+                              // a common-prefix violation — outside our adversarial model — not a recoverable
+                              // chain switch. Dropping journal entries below the operational k₁ watermark
+                              // therefore cannot break any reachable code path.
+                              //
+                              // The k₂ archival prune below this block is now a strict subset of what this k₁
+                              // prune already did and is retained only for its side-effects (NIPoPoW tower
+                              // finalizer drive at archival depth + ARCHIVAL-FINALIZED log line). The
+                              // `mptOverlay.pruneBelow(archivalQualifying)` call there becomes a no-op once this
+                              // k₁ block has already dropped its slice.
+                              operationalPruneQualifying <- tDepth1.latestQualifyingOrdinal
+                              _ <- lastOperationalPruneOrdinalRef.get.flatMap { prev =>
+                                if (operationalPruneQualifying.value.value > prev.value.value)
+                                  lastOperationalPruneOrdinalRef.set(operationalPruneQualifying) >>
+                                    mptOverlay.pruneBelow(operationalPruneQualifying) >>
+                                    Metrics[F].updateGauge(
+                                      "dag_nakamoto_overlay_prune_ordinal",
+                                      operationalPruneQualifying.value.value
+                                    )
+                                else Async[F].unit
+                              }
+
+                              // T_depth2 (Phase 2 → Phase 3, ARCHIVAL) observability + scaffolding.
+                              //
+                              // When `tDepth2.latestQualifyingOrdinal` strictly outruns our local archival
+                              // watermark, advance the watermark, emit the log line + counters, AND drive
+                              // the Phase-3 overlay-history prune sink (#139) so long-running nodes don't
+                              // leak the per-ordinal undo journal / finalizedRef accumulators that grow
+                              // monotonically with every finalize. Future Phase-3 sinks (Mithril aggregate
+                              // cert, light-client trust anchor) plug in here too.
+                              //
+                              // Heap-leak Fix A note: the `mptOverlay.pruneBelow(archivalQualifying)` call
+                              // below is now effectively a no-op for `undoJournalRef`/`finalizedRef` because
+                              // the k₁-driven prune above already dropped entries below `tDepth1` (which is
+                              // strictly less than `tDepth2`). It remains in place so the archival pattern
+                              // is still self-contained — adding Mithril / light-client sinks later won't
+                              // need to coordinate with the operational-prune block.
+                              archivalQualifying <- tDepth2.latestQualifyingOrdinal
+                              _ <- lastArchivalOrdinalRef.get.flatMap { prev =>
+                                if (archivalQualifying.value.value > prev.value.value)
+                                  bestTip match {
+                                    case Some(tip) =>
+                                      lastArchivalOrdinalRef.set(archivalQualifying) >>
+                                        logger.info(
+                                          s"ARCHIVAL-FINALIZED ordinal=${archivalQualifying.value.value} " +
+                                            s"(tip ord=${tip.ordinal}, k₂=$ArchivalDepthK)"
+                                        ) >>
+                                        Metrics[F].incrementCounter("dag_nakamoto_archival_finalized") >>
+                                        Metrics[F].updateGauge("dag_nakamoto_archival_ordinal", archivalQualifying.value.value) >>
+                                        // Phase-3 archival prune (#139). `pruneBelow` drops overlay history
+                                        // entries strictly below the new archival watermark — irreversible
+                                        // and safe by depth-k₂ definition (reorgs at this depth excluded).
+                                        // Logged at INFO inside the overlay when entries are dropped.
+                                        mptOverlay.pruneBelow(archivalQualifying) >>
+                                        // §3 NIPoPoW S3 Phase-3 sink. Walk newly-archival ordinals
+                                        // `(prev, archivalQualifying]` and feed each to the tower
+                                        // finalizer. The walk uses chainStore.walkBackTo from bestTip to
+                                        // resolve canonical hashes; snapshotStorage.get fetches the
+                                        // signed snapshot; toHashed re-computes the content hash. The
+                                        // finalizer's high-water-mark Ref guards against double-write.
+                                        //
+                                        // Bounded by `TowerFinalizerMaxCatchupPerTick` so catch-up after
+                                        // a process restart doesn't stall the leader loop's 5s tick.
+                                        // Remaining ordinals roll forward on the next tick — the
+                                        // finalizer's high-water-mark ensures forward-only progression
+                                        // even if the loop misses a window.
+                                        //
+                                        // Background-fire (`Async.start`) so the chain walk + L-1
+                                        // continued-fraction trial computations don't block the
+                                        // finality monitor's other sinks.
+                                        Async[F]
+                                          .start(
+                                            driveTowerFinalizer(
+                                              chainStore = chainStore,
+                                              snapshotStorage = snapshotStorage,
+                                              towerFinalizer = towerFinalizer,
+                                              tipHash = tip.hash,
+                                              prevWatermark = prev,
+                                              archivalQualifying = archivalQualifying,
+                                              logger = logger
+                                            )
+                                          )
+                                          .void
+                                    case None =>
+                                      // Trigger advanced without a tip — shouldn't happen because the
+                                      // trigger's evaluator returns MinValue when bestTip is None.
+                                      // Still, advance the Ref idempotently so we don't re-log on the
+                                      // next tick.
+                                      lastArchivalOrdinalRef.set(archivalQualifying)
+                                  }
+                                else Async[F].unit
+                              }
+                            } yield ()
+                          }
+
+                        seedChainStore ++ slotTick.merge(finalityMonitor)
+                      }
                     }
                   }
               }
