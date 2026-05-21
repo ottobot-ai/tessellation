@@ -70,7 +70,8 @@ object method {
       c.snapshotBinarySenderTimeouts,
       c.snapshot.timeouts,
       c.clickHouseConfig,
-      c.snapshot.mptSnapshotInfoPath
+      c.snapshot.mptSnapshotInfoPath,
+      c.nakamoto
     )
   }
 
