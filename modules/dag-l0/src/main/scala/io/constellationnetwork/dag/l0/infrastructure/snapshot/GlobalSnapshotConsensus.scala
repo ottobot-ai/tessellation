@@ -103,6 +103,32 @@ object GlobalSnapshotConsensus {
   val nakamotoGenesisTimeMs: Long =
     sys.env.get("NAKAMOTO_GENESIS_TIME_MS").flatMap(_.toLongOption).getOrElse(System.currentTimeMillis())
 
+  /** §3 NIPoPoW genesis eta — Blake2b-256 digest of a fixed domain string. 32 bytes; used to seed `EtaCalculation` for periods ≤ 1 and as
+    * the bootstrap fall-through for `EtaStateManager`. Must be identical across all nodes in a cluster — derived from a constant rather
+    * than env var to avoid a config-drift class of bug (different operators setting different `NAKAMOTO_GENESIS_ETA` values would silently
+    * fork the chain). Future work: derive from the genesis snapshot hash so it's chain-bound instead of literal-bound.
+    *
+    * Path 1 (heap-leak workstream): hoisted to a top-level helper so the boundary-write `etaForPeriod` callback in `make` can construct an
+    * `EtaStateManager` BEFORE the GSAM (and before the chain store is built); the previous in-place definition lived inside the inner
+    * nakamotoBlock Resource and wasn't reachable at the GSAM construction site.
+    */
+  def nakamotoGenesisEta: Array[Byte] = {
+    val genesisEtaSeed = "tessellation-nakamoto-genesis-eta-v1".getBytes(java.nio.charset.StandardCharsets.UTF_8)
+    val genesisEtaDigest = new org.bouncycastle.crypto.digests.Blake2bDigest(256)
+    genesisEtaDigest.update(genesisEtaSeed, 0, genesisEtaSeed.length)
+    val genesisEtaBytes = new Array[Byte](32)
+    genesisEtaDigest.doFinal(genesisEtaBytes, 0)
+    genesisEtaBytes
+  }
+
+  /** Path 1 (heap-leak workstream): hex-encode a 32-byte eta into the [[Hash]] shape the [[GlobalSnapshotAcceptanceManager]] boundary
+    * writer stores in `HistoricalStakeSnapshot.eta`. Mirrors the inverse decode in
+    * [[io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.make]] (`entry.eta.value.grouped(2)…`); the round-trip is
+    * byte-identical so the MPT entries are deterministic across nodes.
+    */
+  def etaBytesToHash(bytes: Array[Byte]): io.constellationnetwork.security.hash.Hash =
+    io.constellationnetwork.security.hash.Hash(bytes.map(b => f"$b%02x").mkString)
+
   def make[F[_]: Async: Parallel: Random: JsonSerializer: HasherSelector: SecurityProvider: Metrics, R <: CliMethod](
     sharedCfg: SharedConfig,
     gossip: Gossip[F],
@@ -238,6 +264,47 @@ object GlobalSnapshotConsensus {
           }
       }
 
+      // Path 1 (heap-leak workstream) — wire `etaForPeriod` for the GSAM boundary writer.
+      //
+      // The boundary write at ord `% R == R - 1` packs `HistoricalStakeSnapshot(stakes, eta)` into the MPT. Without a real
+      // callback here it would write `Hash.empty` (the GSAM default), permanently degrading the §3 NIPoPoW N-2 historical
+      // distribution read path and silently defeating pseudo-predictability cluster-wide. Findings 1 + 2 from the reviewer.
+      //
+      // Pattern:
+      //   - The eta resolver is an [[EtaStateManager]] (MPT-cache point read first; chainStore-walk fallback on cache miss).
+      //   - The chain-walk fallback routes to `chainStore.vrfOutputsForPeriod` for `period - 1`. Because the chain store
+      //     is built *later* in the inner Resource block (after this GSAM is constructed), we route the walk through
+      //     [[chainStoreForLookupRef]] (the same Ref that backs the `getGlobalSnapshotByOrdinalWithFallback` indirection
+      //     above) — set once by the inner block, observed by every walk thereafter.
+      //   - The [[HistoricalStakeReader]] is built against `GlobalStateReader.fromMptStore(mptStore)` because GSAM accept()
+      //     runs against the underlying base store at boundary-write time; the per-call branch-aware reader is only used
+      //     for prior-state reads from within accept(), not for boundary lookups (the boundary key is being WRITTEN this
+      //     ordinal — the reader will miss either way, and chain-walk takes over).
+      //
+      // Note: pre-chainStore-setup boundary writes (genesis seed + period 0/1) compute genesisEta via EtaCalculation; this
+      // is the same value `EtaStateManager.getEta` returns when the walk yields an empty list, so the pre-/post-setup
+      // boundary writes are byte-identical and the MPT entry is deterministic across nodes.
+      etaForPeriodCallback <- {
+        val historicalStakeReaderForOuterGsam =
+          io.constellationnetwork.node.shared.domain.nakamoto.HistoricalStakeReader
+            .make[F](io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore))
+        val chainWalkFallback: Long => F[List[(Long, Array[Byte])]] = (sourcePeriod: Long) =>
+          chainStoreForLookupRef.get.flatMap {
+            case Some(cs) => cs.vrfOutputsForPeriod(sourcePeriod, sharedCfg.nakamoto.etaRotationSnapshots.value)
+            case None     => Async[F].pure(List.empty[(Long, Array[Byte])])
+          }
+        io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager
+          .make[F](
+            genesisEta = nakamotoGenesisEta,
+            historicalStakeReader = historicalStakeReaderForOuterGsam,
+            chainWalkFallback = chainWalkFallback
+          )
+          .map { mgr => (period: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
+            HasherSelector[F].withCurrent(implicit hasher => mgr.getEta(period.value).map(etaBytesToHash))
+          }
+          .toResource
+      }
+
       snapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager
         .make[F](
           sharedCfg.fieldsAddedOrdinals,
@@ -263,7 +330,12 @@ object GlobalSnapshotConsensus {
           sharedCfg.delegatedStaking.withdrawalTimeLimit
             .getOrElse(sharedCfg.environment, EpochProgress.MinValue),
           mptOverlay,
-          loggerBundle
+          loggerBundle,
+          // `maintainNodeCollateralWithdrawalExpiryIndex` left at default (false) here to preserve
+          // existing behavior of this construction site — the SharedServices GSAM sets it to true,
+          // but reconciling the two flags is out of scope for the Path 1 fix.
+          etaRotationSnapshots = sharedCfg.nakamoto.etaRotationSnapshots.value,
+          etaForPeriod = Some(etaForPeriodCallback)
         )
         .toResource
 
@@ -705,17 +777,12 @@ object GlobalSnapshotConsensus {
               Async[F].unit
           }.toResource
           lastKnownSlotRef <- cats.effect.kernel.Ref.of[F, Option[Long]](None).toResource
-          // Shared epoch state: VRF outputs from ALL sources accumulate here for eta rotation
-          genesisEta = {
-            // Genesis eta must be identical across all nodes — derive from a fixed domain string
-            // (In production, derive from genesis snapshot hash. For now, use a deterministic constant.)
-            val genesisEtaSeed = "tessellation-nakamoto-genesis-eta-v1".getBytes(java.nio.charset.StandardCharsets.UTF_8)
-            val genesisEtaDigest = new org.bouncycastle.crypto.digests.Blake2bDigest(256)
-            genesisEtaDigest.update(genesisEtaSeed, 0, genesisEtaSeed.length)
-            val genesisEtaBytes = new Array[Byte](32)
-            genesisEtaDigest.doFinal(genesisEtaBytes, 0)
-            genesisEtaBytes
-          }
+          // Shared epoch state: VRF outputs from ALL sources accumulate here for eta rotation.
+          // Path 1 (heap-leak workstream): genesis eta lifted to the top-level helper
+          // `GlobalSnapshotConsensus.nakamotoGenesisEta` so the outer GSAM construction (above) and
+          // the inner epoch state (here) read the same 32-byte value — byte-identical to the GSAM
+          // boundary writer's eta and to the receiver-side `EtaStateManager` cache fallback.
+          genesisEta = nakamotoGenesisEta
           epochStateRef <- cats.effect.kernel.Ref
             .of[F, io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState](
               io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SharedEpochState.initial(genesisEta)
