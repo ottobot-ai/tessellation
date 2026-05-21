@@ -1,91 +1,111 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.kes
 
-import cats.effect.kernel.{Ref, Sync}
+import cats.effect.kernel.Async
 import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
 
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, KesRegistryEntry}
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.kes.KesRegistrationStateManager
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.kes.KesRegistrationCert.KesRegistrationRecord
 import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.kes.VerificationKeyKesProduct
 
 /** Runtime-mutable [[KesRegistry]] that overlays genesis-frozen entries with Slice 10 registration certs.
   *
   * Lookup precedence (per-operator):
   *
-  *   1. If the operator has at least one runtime cert with `effectiveFromEpoch <= currentEpoch`, use the highest-ordinal such cert.
-  *      Rotations apply because each cert overrides the prior one once its activation epoch passes.
+  *   1. If the operator has at least one MPT-persisted runtime cert with `effectiveFromEpoch <= currentEpoch`, use the highest-ordinal such
+  *      cert. Rotations apply because each cert overrides the prior one once its activation epoch passes.
   *   1. Otherwise fall back to the genesis-frozen [[KesRegistry]] entry (Slice 3).
   *   1. Otherwise `None` — the operator is unknown.
   *
-  * '''Backward compatibility.''' This overlay is constructed with the existing genesis [[KesRegistry]] as the base. Genesis lookups
-  * continue to work unchanged until a runtime cert with `effectiveFromEpoch <= currentEpoch` lands for that operator, at which point the
-  * runtime cert takes precedence. A cert that hasn't reached its activation epoch yet is held as "pending" and not returned from `getKesVk`
-  * — it becomes effective on or after `effectiveFromEpoch`.
+  * '''Durability (S10 persistence iteration B).''' Unlike the iteration-A in-memory `Ref`-backed registry, this implementation is
+  * MPT-backed: every `getKesVk` call resolves through `KesRegistrationStateManager.materializeFromMpt`. After a node restart, MPT is the
+  * source of truth — no in-memory state to lose. Newly-joining cluster peers reach the same registry view as live peers because the MPT is
+  * byte-equivalent across honest nodes by the consensus state-proof contract.
   *
-  * '''State.''' Per-operator we keep a small chain `List[KesRegistrationRecord]` sorted by `acceptedAt` (latest first). Reads scan the head
-  * for the first record whose `effectiveFromEpoch <= currentEpoch`. The chain is also the source of truth for the chain-link validation in
-  * [[KesRegistrationCertValidator]] (the next-cert `parent` must match `KesRegistrationReference.of(latestAccepted)`).
+  * '''Backward compatibility.''' Constructed with the existing genesis [[KesRegistry]] as the base. Genesis lookups continue to work
+  * unchanged until a runtime cert with `effectiveFromEpoch <= currentEpoch` lands in MPT for that operator, at which point the runtime cert
+  * takes precedence. A cert that hasn't reached its activation epoch yet is held as "pending" and not returned from `getKesVk` — it becomes
+  * effective on or after `effectiveFromEpoch`.
   *
-  * The registry is held in a `Ref` so the GSAM accept handler can swap in a new snapshot of per-operator records each ordinal. This avoids
-  * the user-visible epoch parameter being baked into the constructor — callers thread the current epoch through `getKesVk(peerId,
-  * currentEpoch)` instead.
+  * '''Write path.''' This trait deliberately exposes NO mutators. The MPT writes are owned by the GSAM accept pipeline (S10-wiring-B,
+  * landing in a follow-up): `KesRegistrationCertAcceptanceManager.accept` partitions candidates → `KesRegistrationStateManager` computes
+  * the new per-peer SortedSet / pointer → `AcceptanceMptStateChanges.applyStateChanges` persists. The runtime registry is a pure reader
+  * over that durable state.
   */
 trait MutableKesRegistry[F[_]] {
 
   /** Returns the active KES master VK for `peerId` at `currentEpoch`. Runtime cert overrides genesis if and only if the cert's
-    * `effectiveFromEpoch <= currentEpoch`.
+    * `effectiveFromEpoch <= currentEpoch`. Goes through the MPT-backed [[KesRegistrationStateManager]] on every call; reorg-aware via the
+    * underlying [[GlobalStateReader]] (branch-aware reads pick up pending writes on the chain's current tip).
     */
-  def getKesVk(peerId: PeerId, currentEpoch: EpochProgress): F[Option[KesRegistryEntry]]
+  def getKesVk(peerId: PeerId, currentEpoch: EpochProgress)(implicit hasher: Hasher[F]): F[Option[KesRegistryEntry]]
 
-  /** The per-operator chain of accepted runtime certs (latest-first). Used by the validator to look up `lastRef` for chain-link checks. */
-  def runtimeCertsFor(peerId: PeerId): F[List[KesRegistrationRecord]]
-
-  /** Apply a new batch of accepted certs from the GSAM accept handler. Each accepted record is appended to the head of its operator's
-    * chain. Idempotent on a record by `(operatorPeerId, ordinal)` — re-applying the same record is a no-op.
+  /** The latest accepted runtime cert for `peerId`, regardless of `effectiveFromEpoch`. Used by the validator to look up `lastRef` for
+    * chain-link checks (the next-cert `parent` must match `KesRegistrationReference.of(latestAccepted)`). Diagnostic / observability.
     */
-  def applyAccepted(accepted: SortedMap[PeerId, KesRegistrationRecord]): F[Unit]
+  def latestRuntimeCertFor(peerId: PeerId)(implicit hasher: Hasher[F]): F[Option[KesRegistrationRecord]]
 
-  /** All currently-held runtime cert chains. Diagnostic / observability. */
-  def list: F[SortedMap[PeerId, List[KesRegistrationRecord]]]
+  /** Full per-operator cert history (latest-first), recovered from MPT. Replaces the iteration-A in-memory list. Routes call this when they
+    * need the canonical "what certs has this operator submitted" view; under multi-branch the chain's tip-aware reader picks up pending
+    * certs ahead of the finalized base.
+    *
+    * Returns `Nil` when no runtime certs exist for the operator (genesis-only). The list is sorted by `SortedSet.ordering` reversed, so the
+    * head is the most-recent record by `(acceptedAt, ordinal)`.
+    */
+  def runtimeCertsFor(peerId: PeerId)(implicit hasher: Hasher[F]): F[List[KesRegistrationRecord]]
+
+  /** Snapshot of every per-operator latest-accepted runtime cert. Diagnostic / observability. Implemented via
+    * `KesRegistrationStateManager.materializeAllFromMpt` — full prefix scan, not a hot path; intended for debug routes and reorg- rebuild
+    * tests.
+    */
+  def list(implicit hasher: Hasher[F]): F[SortedMap[PeerId, KesRegistrationRecord]]
 }
 
 object MutableKesRegistry {
 
-  def make[F[_]: Sync](base: KesRegistry[F]): F[MutableKesRegistry[F]] =
-    Ref.of[F, SortedMap[PeerId, List[KesRegistrationRecord]]](SortedMap.empty).map { ref =>
-      new MutableKesRegistry[F] {
+  /** Construct the MPT-backed mutable registry overlay.
+    *
+    * `base` is the frozen genesis registry (Slice 3); `reader` is the read-only handle into the runtime cert partition. Both come from the
+    * node's `Services.make` wiring — `base` from `L0GenesisData.kesRegistrations`, `reader` from the per-mode overlay factory (`pending` on
+    * gl0, `finalized` on followers).
+    *
+    * No mutable state is allocated here. The MPT IS the state.
+    */
+  def make[F[_]: Async](
+    base: KesRegistry[F],
+    reader: GlobalStateReader[F]
+  ): F[MutableKesRegistry[F]] = {
+    val manager = KesRegistrationStateManager.make[F](reader)
+    Async[F].pure(new MutableKesRegistry[F] {
 
-        override def getKesVk(peerId: PeerId, currentEpoch: EpochProgress): F[Option[KesRegistryEntry]] =
-          ref.get.flatMap { state =>
-            val runtimeMatch: Option[KesRegistryEntry] = state.get(peerId).flatMap { records =>
-              records.find(_.event.value.effectiveFromEpoch <= currentEpoch).map(toEntry)
-            }
-            runtimeMatch match {
-              case Some(entry) => Sync[F].pure(Some(entry))
-              case None        => base.getKesVk(peerId)
-            }
-          }
+      override def getKesVk(peerId: PeerId, currentEpoch: EpochProgress)(implicit hasher: Hasher[F]): F[Option[KesRegistryEntry]] =
+        manager.materializeFromMpt(peerId).flatMap {
+          case Some(record) if record.event.value.effectiveFromEpoch <= currentEpoch =>
+            (Some(toEntry(record)): Option[KesRegistryEntry]).pure[F]
+          case _ =>
+            // Pointer record either absent, or present but not yet active at `currentEpoch` (held as "pending").
+            // Fall through to the genesis-frozen base in both cases.
+            base.getKesVk(peerId)
+        }
 
-        override def runtimeCertsFor(peerId: PeerId): F[List[KesRegistrationRecord]] =
-          ref.get.map(_.getOrElse(peerId, Nil))
+      override def latestRuntimeCertFor(peerId: PeerId)(implicit hasher: Hasher[F]): F[Option[KesRegistrationRecord]] =
+        manager.materializeFromMpt(peerId)
 
-        override def applyAccepted(accepted: SortedMap[PeerId, KesRegistrationRecord]): F[Unit] =
-          ref.update { state =>
-            accepted.foldLeft(state) {
-              case (acc, (peerId, record)) =>
-                val existing = acc.getOrElse(peerId, Nil)
-                val isDuplicate = existing.exists(_.event.value.ordinal === record.event.value.ordinal)
-                if (isDuplicate) acc
-                else acc.updated(peerId, record :: existing)
-            }
-          }
+      override def runtimeCertsFor(peerId: PeerId)(implicit hasher: Hasher[F]): F[List[KesRegistrationRecord]] =
+        // MPT SortedSet is ordered head=earliest, last=latest. The legacy iteration-A API returns latest-first,
+        // so reverse here to keep the wire / caller contract stable across the migration.
+        manager.materializeChainForPeer(peerId).map(_.toList.reverse)
 
-        override def list: F[SortedMap[PeerId, List[KesRegistrationRecord]]] = ref.get
-      }
-    }
+      override def list(implicit hasher: Hasher[F]): F[SortedMap[PeerId, KesRegistrationRecord]] =
+        manager.materializeAllFromMpt
+    })
+  }
 
   /** Decode the runtime cert's `kesMasterVK` hex bytes into a `VerificationKeyKesProduct` entry suitable for the read-only `KesRegistry`
     * contract. The cert's hex bytes are decoded eagerly; a malformed `kesMasterVK` would surface here as a `Hex.toBytes` exception — but
