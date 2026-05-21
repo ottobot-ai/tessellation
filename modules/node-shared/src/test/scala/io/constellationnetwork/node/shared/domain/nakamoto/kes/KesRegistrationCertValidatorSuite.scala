@@ -89,7 +89,7 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(cert, kp)
       seedlist <- mkSeedlist(operatorId)
       v = mkValidator(seedlist)
-      result <- v.validate(signed, KesRegistrationReference.empty, defaultEpoch)
+      result <- v.validate(signed, KesRegistrationReference.empty, EpochProgress.MinValue, defaultEpoch)
     } yield expect.same(Valid(signed), result)
   }
 
@@ -99,7 +99,7 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
     for {
       signed <- forAsyncHasher(cert, kp)
       v = mkValidator(None)
-      result <- v.validate(signed, KesRegistrationReference.empty, defaultEpoch)
+      result <- v.validate(signed, KesRegistrationReference.empty, EpochProgress.MinValue, defaultEpoch)
     } yield expect.same(Valid(signed), result)
   }
 
@@ -112,7 +112,7 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(cert, otherKp)
       seedlist <- mkSeedlist(operatorId, PeerId.fromPublic(otherKp.getPublic))
       v = mkValidator(seedlist)
-      result <- v.validate(signed, KesRegistrationReference.empty, defaultEpoch)
+      result <- v.validate(signed, KesRegistrationReference.empty, EpochProgress.MinValue, defaultEpoch)
     } yield
       expect.all(result match {
         case Invalid(errors) =>
@@ -131,7 +131,7 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(cert, kp)
       seedlist <- mkSeedlist() // operator NOT in seedlist
       v = mkValidator(seedlist)
-      result <- v.validate(signed, KesRegistrationReference.empty, defaultEpoch)
+      result <- v.validate(signed, KesRegistrationReference.empty, EpochProgress.MinValue, defaultEpoch)
     } yield expect.same(UnauthorizedOperator(operatorId).invalidNec, result)
   }
 
@@ -145,7 +145,7 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
       multiSigned = signed1.addProof(signed2.proofs.head)
       seedlist <- mkSeedlist(operatorId)
       v = mkValidator(seedlist)
-      result <- v.validate(multiSigned, KesRegistrationReference.empty, defaultEpoch)
+      result <- v.validate(multiSigned, KesRegistrationReference.empty, EpochProgress.MinValue, defaultEpoch)
     } yield
       expect.all(result match {
         case Invalid(errors) =>
@@ -166,7 +166,7 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(cert, kp)
       seedlist <- mkSeedlist(operatorId)
       v = mkValidator(seedlist)
-      result <- v.validate(signed, lastRef, defaultEpoch)
+      result <- v.validate(signed, lastRef, EpochProgress.MinValue, defaultEpoch)
     } yield
       expect.all(result match {
         case Invalid(errors) =>
@@ -191,7 +191,7 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(cert, kp)
       seedlist <- mkSeedlist(operatorId)
       v = mkValidator(seedlist)
-      result <- v.validate(signed, lastRef, defaultEpoch)
+      result <- v.validate(signed, lastRef, EpochProgress.MinValue, defaultEpoch)
     } yield
       expect.all(result match {
         case Invalid(errors) =>
@@ -211,7 +211,7 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(cert, kp)
       seedlist <- mkSeedlist(operatorId)
       v = mkValidator(seedlist)
-      result <- v.validate(signed, KesRegistrationReference.empty, defaultEpoch)
+      result <- v.validate(signed, KesRegistrationReference.empty, EpochProgress.MinValue, defaultEpoch)
     } yield
       expect.all(result match {
         case Invalid(errors) =>
@@ -230,7 +230,7 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(cert, kp)
       seedlist <- mkSeedlist(operatorId)
       v = mkValidator(seedlist)
-      result <- v.validate(signed, KesRegistrationReference.empty, defaultEpoch)
+      result <- v.validate(signed, KesRegistrationReference.empty, EpochProgress.MinValue, defaultEpoch)
     } yield
       expect.all(result match {
         case Invalid(errors) =>
@@ -249,7 +249,7 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(cert, kp)
       seedlist <- mkSeedlist(operatorId)
       v = mkValidator(seedlist)
-      result <- v.validate(signed, KesRegistrationReference.empty, defaultEpoch)
+      result <- v.validate(signed, KesRegistrationReference.empty, EpochProgress.MinValue, defaultEpoch)
     } yield
       expect.all(result match {
         case Invalid(errors) =>
@@ -268,7 +268,7 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(cert, kp)
       seedlist <- mkSeedlist(operatorId)
       v = mkValidator(seedlist)
-      result <- v.validate(signed, KesRegistrationReference.empty, defaultEpoch)
+      result <- v.validate(signed, KesRegistrationReference.empty, EpochProgress.MinValue, defaultEpoch)
     } yield
       expect.all(result match {
         case Invalid(errors) =>
@@ -286,8 +286,119 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
     for {
       signed <- forAsyncHasher(cert, kp)
       v = rejectAll[IO]
-      result <- v.validate(signed, KesRegistrationReference.empty, defaultEpoch)
+      result <- v.validate(signed, KesRegistrationReference.empty, EpochProgress.MinValue, defaultEpoch)
     } yield expect.same((Rejected: KesRegistrationCertValidationError).invalidNec, result)
+  }
+
+  test("rejects when effectiveFromEpoch < prior cert's effectiveFromEpoch (NonMonotonicEffectiveFromEpoch)") { res =>
+    implicit val (_, h, sp, kp, operatorId) = res
+    // Prior cert had effectiveFromEpoch=300; submitted cert claims effectiveFromEpoch=250.
+    // Both > currentEpoch (100), so NotForwardActivation does not fire — only the new monotonic-epoch check.
+    val priorEffective = EpochProgress(NonNegLong(300L))
+    val lastRef = KesRegistrationReference(KesRegistrationOrdinal(NonNegLong(1L)), io.constellationnetwork.security.hash.Hash("aa" * 32))
+    val cert = mkCert(
+      operatorId,
+      effectiveFromEpoch = EpochProgress(NonNegLong(250L)),
+      ordinal = KesRegistrationOrdinal(NonNegLong(2L)),
+      parent = lastRef
+    )
+    for {
+      signed <- forAsyncHasher(cert, kp)
+      seedlist <- mkSeedlist(operatorId)
+      v = mkValidator(seedlist)
+      result <- v.validate(signed, lastRef, priorEffective, defaultEpoch)
+    } yield
+      expect.all(result match {
+        case Invalid(errors) =>
+          errors.exists {
+            case _: NonMonotonicEffectiveFromEpoch => true
+            case _                                 => false
+          }
+        case _ => false
+      })
+  }
+
+  test("rejects when effectiveFromEpoch == prior cert's effectiveFromEpoch (strict monotone)") { res =>
+    implicit val (_, h, sp, kp, operatorId) = res
+    val priorEffective = EpochProgress(NonNegLong(300L))
+    val lastRef = KesRegistrationReference(KesRegistrationOrdinal(NonNegLong(1L)), io.constellationnetwork.security.hash.Hash("aa" * 32))
+    // ordinal increases (1 -> 2) and effectiveFromEpoch stays the same (300 == 300) — must still reject.
+    val cert = mkCert(
+      operatorId,
+      effectiveFromEpoch = priorEffective,
+      ordinal = KesRegistrationOrdinal(NonNegLong(2L)),
+      parent = lastRef
+    )
+    for {
+      signed <- forAsyncHasher(cert, kp)
+      seedlist <- mkSeedlist(operatorId)
+      v = mkValidator(seedlist)
+      result <- v.validate(signed, lastRef, priorEffective, defaultEpoch)
+    } yield
+      expect.all(result match {
+        case Invalid(errors) =>
+          errors.exists {
+            case _: NonMonotonicEffectiveFromEpoch => true
+            case _                                 => false
+          }
+        case _ => false
+      })
+  }
+
+  test("accepts when effectiveFromEpoch > prior cert's effectiveFromEpoch (strict monotone passes)") { res =>
+    implicit val (_, h, sp, kp, operatorId) = res
+    val priorEffective = EpochProgress(NonNegLong(150L))
+    val lastRef = KesRegistrationReference(KesRegistrationOrdinal(NonNegLong(1L)), io.constellationnetwork.security.hash.Hash("aa" * 32))
+    val cert = mkCert(
+      operatorId,
+      effectiveFromEpoch = EpochProgress(NonNegLong(300L)),
+      ordinal = KesRegistrationOrdinal(NonNegLong(2L)),
+      parent = lastRef
+    )
+    for {
+      signed <- forAsyncHasher(cert, kp)
+      hashedFirst <- signed.toHashed
+      _ = hashedFirst // unused suppression
+      // We use a hand-rolled lastRef hash since the test's purpose is the monotonicity check, not chain-link verification —
+      // the parent ref must match `lastRef` exactly. Use the same hash.
+      certWithMatchingParent = cert.copy(parent = lastRef)
+      signedMatched <- forAsyncHasher(certWithMatchingParent, kp)
+      seedlist <- mkSeedlist(operatorId)
+      v = mkValidator(seedlist)
+      result <- v.validate(signedMatched, lastRef, priorEffective, defaultEpoch)
+    } yield expect.same(Valid(signedMatched), result)
+  }
+
+  test(
+    "Risk-5 regression — chain {ord=1, eff=300; ord=2, eff=200} is REJECTED, preventing the genesis-fallback hole"
+  ) { res =>
+    implicit val (_, h, sp, kp, operatorId) = res
+    // Build cert1 (ord=1, eff=300) signed-and-hashed so its real ref can chain cert2.
+    val cert1 = mkCert(operatorId, effectiveFromEpoch = EpochProgress(NonNegLong(300L)), ordinal = KesRegistrationOrdinal.first)
+    for {
+      signed1 <- forAsyncHasher(cert1, kp)
+      hashed1 <- signed1.toHashed
+      ref1 = KesRegistrationReference.of(hashed1)
+      // Attempted cert2: ord=2 (monotone-ordinal passes) but eff=200 < cert1.eff=300 — must be rejected by the new check.
+      cert2 = mkCert(
+        operatorId,
+        effectiveFromEpoch = EpochProgress(NonNegLong(200L)),
+        ordinal = KesRegistrationOrdinal(NonNegLong(2L)),
+        parent = ref1
+      )
+      signed2 <- forAsyncHasher(cert2, kp)
+      seedlist <- mkSeedlist(operatorId)
+      v = mkValidator(seedlist)
+      result <- v.validate(signed2, ref1, cert1.effectiveFromEpoch, defaultEpoch)
+    } yield
+      expect.all(result match {
+        case Invalid(errors) =>
+          errors.exists {
+            case _: NonMonotonicEffectiveFromEpoch => true
+            case _                                 => false
+          }
+        case _ => false
+      })
   }
 
   test("monotonicity property — replays of the same ordinal are always rejected") { res =>
@@ -306,10 +417,10 @@ object KesRegistrationCertValidatorSuite extends MutableIOSuite {
       v = mkValidator(seedlist)
 
       // After accepting cert1, ref1 is the lastRef; replaying signed1 with the new lastRef must fail.
-      r1 <- v.validate(signed1, ref1, defaultEpoch)
+      r1 <- v.validate(signed1, ref1, EpochProgress.MinValue, defaultEpoch)
       // After accepting cert2, ref2 is lastRef; replaying signed1 and signed2 both fail.
-      r2 <- v.validate(signed1, ref2, defaultEpoch)
-      r3 <- v.validate(signed2, ref2, defaultEpoch)
+      r2 <- v.validate(signed1, ref2, EpochProgress.MinValue, defaultEpoch)
+      r3 <- v.validate(signed2, ref2, EpochProgress.MinValue, defaultEpoch)
     } yield
       expect.all(
         r1.isInvalid,

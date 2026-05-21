@@ -67,6 +67,7 @@ object KesRegistrationCertAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         List(signed),
         SortedMap.empty,
+        SortedMap.empty,
         EpochProgress(NonNegLong(100L)),
         SnapshotOrdinal.MinValue
       )
@@ -92,6 +93,7 @@ object KesRegistrationCertAcceptanceManagerSuite extends MutableIOSuite {
       result <- manager.accept(
         List(signed),
         SortedMap(operatorId -> lastRef),
+        SortedMap.empty,
         EpochProgress(NonNegLong(100L)),
         SnapshotOrdinal.MinValue
       )
@@ -115,6 +117,7 @@ object KesRegistrationCertAcceptanceManagerSuite extends MutableIOSuite {
       manager = KesRegistrationCertAcceptanceManager.make[IO](validator)
       result <- manager.accept(
         List(signed1, signed2),
+        SortedMap.empty,
         SortedMap.empty,
         EpochProgress(NonNegLong(100L)),
         SnapshotOrdinal.MinValue

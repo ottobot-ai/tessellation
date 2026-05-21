@@ -35,14 +35,34 @@ import derevo.derive
   *      `NodeCollateralValidator.validateParent` chain-link check.
   *   1. '''NotForwardActivation''' — `effectiveFromEpoch <= currentEpoch`. Retroactive registration would skip the N-2-style staggering
   *      window receivers need to observe finality before a new VK becomes load-bearing.
+  *   1. '''NonMonotonicEffectiveFromEpoch''' — the cert's `effectiveFromEpoch` is `<= lastSeen.effectiveFromEpoch` for this operator.
+  *      Closes the Risk-5 lookup hole: without this check, a cert with a LOWER `effectiveFromEpoch` could be accepted at a higher ordinal,
+  *      meaning the pointer-only lookup in `MutableKesRegistry.getKesVk` would falsely fall through to genesis when an earlier (lower-
+  *      ordinal) cert IS active at `currentEpoch`. By enforcing strict monotonicity, the latest accepted cert is guaranteed to have the
+  *      highest `effectiveFromEpoch`, so pointer-only lookup is correct: if the pointer's cert is effective, return it; if not, the genesis
+  *      fallback is unambiguous.
   *   1. '''MalformedVk''' — the `kesMasterVK` bytes are empty, or `kesMasterVKStep < 0`, or `offset < 0`. Cryptographic well-formedness of
   *      the bytes (that they form a valid super × sub Merkle root) is intentionally not checked here — that's the verifier-side check at
   *      sig-presentation time. We catch only the obvious structural breakage.
   */
 trait KesRegistrationCertValidator[F[_]] {
+
+  /** Validate a new cert against the operator's last-seen state.
+    *
+    * @param signed
+    *   the candidate cert wrapped in its long-term-key signature
+    * @param lastRef
+    *   the previously-accepted [[KesRegistrationReference]] for this operator, or [[KesRegistrationReference.empty]] for a fresh operator
+    * @param lastEffectiveFromEpoch
+    *   the `effectiveFromEpoch` of the previously-accepted cert for this operator. Used by the monotonic-effective-epoch check (Risk 5).
+    *   `EpochProgress(0)` for a fresh operator (matches `KesRegistrationReference.empty`'s implicit zero baseline).
+    * @param currentEpoch
+    *   the snapshot epoch the cert is being evaluated against
+    */
   def validate(
     signed: Signed[KesRegistrationCert],
     lastRef: KesRegistrationReference,
+    lastEffectiveFromEpoch: EpochProgress,
     currentEpoch: EpochProgress
   ): F[KesRegistrationCertValidator.KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]]]
 }
@@ -56,6 +76,7 @@ object KesRegistrationCertValidator {
     def validate(
       signed: Signed[KesRegistrationCert],
       lastRef: KesRegistrationReference,
+      lastEffectiveFromEpoch: EpochProgress,
       currentEpoch: EpochProgress
     ): F[KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]]] =
       (Rejected: KesRegistrationCertValidationError).invalidNec[Signed[KesRegistrationCert]].pure[F]
@@ -70,6 +91,7 @@ object KesRegistrationCertValidator {
       def validate(
         signed: Signed[KesRegistrationCert],
         lastRef: KesRegistrationReference,
+        lastEffectiveFromEpoch: EpochProgress,
         currentEpoch: EpochProgress
       ): F[KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]]] =
         for {
@@ -82,6 +104,7 @@ object KesRegistrationCertValidator {
           monotonicV = validateOrdinalMonotonic(signed, lastRef)
           parentV = validateParentLink(signed, lastRef)
           activationV = validateForwardActivation(signed, currentEpoch)
+          monotonicEpochV = validateMonotonicEffectiveFromEpoch(signed, lastRef, lastEffectiveFromEpoch)
           wellFormedV = validateVkWellFormedness(signed)
         } yield
           numberOfSignaturesV
@@ -91,6 +114,7 @@ object KesRegistrationCertValidator {
             .productR(monotonicV)
             .productR(parentV)
             .productR(activationV)
+            .productR(monotonicEpochV)
             .productR(wellFormedV)
 
       private def validateNumberOfSignatures(
@@ -140,6 +164,27 @@ object KesRegistrationCertValidator {
         if (signed.value.effectiveFromEpoch > currentEpoch) signed.validNec
         else NotForwardActivation(signed.value.effectiveFromEpoch, currentEpoch).invalidNec
 
+      /** Risk-5 fix: enforce that `effectiveFromEpoch` is strictly increasing across the operator's per-peer cert chain. Skipped when this
+        * is the operator's first cert (`lastRef == KesRegistrationReference.empty`) — no prior effectiveFromEpoch to compare against.
+        * Closes the bug where the pointer-only lookup in [[MutableKesRegistry.getKesVk]] would fall through to genesis when the latest
+        * pointer's cert was pending (eff > current) but an earlier (lower-ordinal) cert was active. Mirrors the per-peer
+        * `validateOrdinalMonotonic` shape.
+        */
+      private def validateMonotonicEffectiveFromEpoch(
+        signed: Signed[KesRegistrationCert],
+        lastRef: KesRegistrationReference,
+        lastEffectiveFromEpoch: EpochProgress
+      ): KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]] =
+        if (lastRef === KesRegistrationReference.empty) signed.validNec
+        else if (signed.value.effectiveFromEpoch > lastEffectiveFromEpoch) signed.validNec
+        else
+          NonMonotonicEffectiveFromEpoch(
+            signed.value.ordinal,
+            signed.value.effectiveFromEpoch,
+            lastRef.ordinal,
+            lastEffectiveFromEpoch
+          ).invalidNec
+
       private def validateVkWellFormedness(
         signed: Signed[KesRegistrationCert]
       ): KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]] = {
@@ -167,6 +212,18 @@ object KesRegistrationCertValidator {
   case class InvalidParent(parent: KesRegistrationReference) extends KesRegistrationCertValidationError
 
   case class NotForwardActivation(effectiveFromEpoch: EpochProgress, currentEpoch: EpochProgress) extends KesRegistrationCertValidationError
+
+  /** Risk-5 (#179) — the operator's per-peer cert chain must have strictly-increasing `effectiveFromEpoch`. Without this constraint, the
+    * pointer-only lookup in [[MutableKesRegistry.getKesVk]] (which checks ONLY the latest cert's effective-epoch) could fall through to
+    * genesis when the highest-ordinal cert is pending, even though an earlier cert IS active at `currentEpoch`. Enforced strictly so
+    * (ordinal, effective) are jointly monotone.
+    */
+  case class NonMonotonicEffectiveFromEpoch(
+    certOrdinal: KesRegistrationOrdinal,
+    certEffectiveFromEpoch: EpochProgress,
+    lastOrdinal: KesRegistrationOrdinal,
+    lastEffectiveFromEpoch: EpochProgress
+  ) extends KesRegistrationCertValidationError
 
   case class MalformedVk(kesMasterVK: io.constellationnetwork.security.hex.Hex) extends KesRegistrationCertValidationError
 

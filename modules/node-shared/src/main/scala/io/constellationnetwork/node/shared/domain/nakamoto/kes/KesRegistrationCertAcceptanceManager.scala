@@ -35,9 +35,19 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * unless the validator chain-link allows it).
   */
 trait KesRegistrationCertAcceptanceManager[F[_]] {
+
+  /** Validate the input certs against the per-operator `lastRefs` and `lastEffectiveFromEpochs`, and return the accepted records
+    * partitioned from those that failed validation.
+    *
+    * @param lastEffectiveFromEpochs
+    *   per-operator `effectiveFromEpoch` of the most-recently accepted cert. Required by the Risk-5 strict-monotonicity check
+    *   ([[KesRegistrationCertValidator.NonMonotonicEffectiveFromEpoch]]). Operators without a prior accepted cert default to
+    *   `EpochProgress(0)`, which is consistent with `KesRegistrationReference.empty`'s zero baseline.
+    */
   def accept(
     certs: List[Signed[KesRegistrationCert]],
     lastRefs: SortedMap[PeerId, KesRegistrationReference],
+    lastEffectiveFromEpochs: SortedMap[PeerId, EpochProgress],
     currentEpoch: EpochProgress,
     snapshotOrdinal: SnapshotOrdinal
   ): F[KesRegistrationCertAcceptanceResult]
@@ -58,6 +68,7 @@ object KesRegistrationCertAcceptanceManager {
       def accept(
         certs: List[Signed[KesRegistrationCert]],
         lastRefs: SortedMap[PeerId, KesRegistrationReference],
+        lastEffectiveFromEpochs: SortedMap[PeerId, EpochProgress],
         currentEpoch: EpochProgress,
         snapshotOrdinal: SnapshotOrdinal
       ): F[KesRegistrationCertAcceptanceResult] = {
@@ -65,7 +76,8 @@ object KesRegistrationCertAcceptanceManager {
         for {
           validated <- sorted.traverse { c =>
             val lastRef = lastRefs.getOrElse(c.value.operatorPeerId, KesRegistrationReference.empty)
-            validator.validate(c, lastRef, currentEpoch).map((c, _))
+            val lastEffective = lastEffectiveFromEpochs.getOrElse(c.value.operatorPeerId, EpochProgress.MinValue)
+            validator.validate(c, lastRef, lastEffective, currentEpoch).map((c, _))
           }
           partitioned = partition(validated)
           accepted = partitioned._1

@@ -58,6 +58,12 @@ final case class KesRegistrationCertRoutes[F[_]: Async: Hasher](
       }
     }
 
+  /** Look up the prior cert's `effectiveFromEpoch` for the per-operator monotonicity check (Risk 5). Returns `EpochProgress.MinValue` if no
+    * prior runtime cert exists — matching the validator's empty-lastRef short-circuit.
+    */
+  private def lastEffectiveFromEpochFor(peerId: PeerId): F[EpochProgress] =
+    registry.runtimeCertsFor(peerId).map(_.headOption.fold(EpochProgress.MinValue)(_.event.value.effectiveFromEpoch))
+
   /** Per-operator info: list of accepted records + indication of which one is active at the current epoch. */
   private def infoFor(peerId: PeerId, currentEpoch: EpochProgress): F[KesRegistrationInfo] =
     for {
@@ -79,7 +85,8 @@ final case class KesRegistrationCertRoutes[F[_]: Async: Hasher](
           for {
             signed <- req.as[Signed[KesRegistrationCert]]
             lastRef <- lastReferenceFor(signed.value.operatorPeerId)
-            result <- validator.validate(signed, lastRef, currentEpoch)
+            lastEffective <- lastEffectiveFromEpochFor(signed.value.operatorPeerId)
+            result <- validator.validate(signed, lastRef, lastEffective, currentEpoch)
             response <- result match {
               case Valid(validSigned) =>
                 logger.info(
