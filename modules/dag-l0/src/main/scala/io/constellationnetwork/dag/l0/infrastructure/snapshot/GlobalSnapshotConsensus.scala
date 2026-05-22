@@ -305,6 +305,46 @@ object GlobalSnapshotConsensus {
           .toResource
       }
 
+      // ─── LocalEventsService — gl0 reactive event stream (gated on HOCON enabled) ───
+      // Constructed BEFORE GSAM so the publisher can be threaded in. When `nakamoto.local-events.enabled`
+      // is false (the production default), publisher = noop and no gRPC server is bound. When true,
+      // builds a `Topic`-backed publisher + an `io.grpc.Server` on `nakamoto.local-events.port`
+      // (default 50054 — distinct from ChainSyncInbound's 50053).
+      localEventsCfg = sharedCfg.nakamoto.localEvents
+      // Epoch-progress Ref so the StreamStarted envelope can report the current epoch. Updated on
+      // each finalize sink below if needed; for v1 we leave it at 0 and let clients read REST.
+      localEventsEpochRef <- cats.effect.kernel.Ref.of[F, Long](0L).toResource
+      localEventsService <- {
+        if (!localEventsCfg.enabled)
+          Resource.pure[F, Option[
+            io.constellationnetwork.node.shared.infrastructure.local_events.LocalEventsService.Service[F]
+          ]](None)
+        else
+          for {
+            dispatcher <- cats.effect.std.Dispatcher.parallel[F]
+            svc <- io.constellationnetwork.node.shared.infrastructure.local_events.LocalEventsService
+              .make[F](
+                finalizedOrdinalRef = nakamotoFinalizedOrdinalRef,
+                epochProgressRef = localEventsEpochRef,
+                maxQueuedPerSubscriber = localEventsCfg.maxQueuedPerSubscriber,
+                publisherBufferSize = localEventsCfg.publisherBufferSize,
+                dispatcher = dispatcher
+              )
+              .toResource
+            _ <- io.constellationnetwork.node.shared.infrastructure.local_events.LocalEventsService
+              .serverResource[F](
+                svc,
+                bindAddress = localEventsCfg.bindAddress,
+                port = localEventsCfg.port.value,
+                shutdownGraceSeconds = localEventsCfg.shutdownGraceSeconds.value,
+                ec = scala.concurrent.ExecutionContext.global
+              )
+          } yield Some(svc)
+      }
+      localEventsPublisher = localEventsService
+        .map(_.publisher)
+        .getOrElse(io.constellationnetwork.node.shared.infrastructure.local_events.LocalEventsPublisher.noop[F])
+
       snapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager
         .make[F](
           sharedCfg.fieldsAddedOrdinals,
@@ -335,7 +375,8 @@ object GlobalSnapshotConsensus {
           // existing behavior of this construction site — the SharedServices GSAM sets it to true,
           // but reconciling the two flags is out of scope for the Path 1 fix.
           etaRotationSnapshots = sharedCfg.nakamoto.etaRotationSnapshots.value,
-          etaForPeriod = Some(etaForPeriodCallback)
+          etaForPeriod = Some(etaForPeriodCallback),
+          localEventsPublisher = Some(localEventsPublisher)
         )
         .toResource
 
@@ -1133,6 +1174,24 @@ object GlobalSnapshotConsensus {
                               }
                             }
                           }
+                    } >> {
+                      // LocalEvents: emit `SnapshotFinalized` for this just-finalized snapshot. The publisher
+                      // is wired up above; default = noop when local events disabled, so this call is cheap.
+                      // The actual snapshot hash is computed via Hasher; the `triggerMask` is intentionally 0
+                      // here because that value is computed inside SnapshotLeaderLoop's finality monitor and not
+                      // routed through `onFinalize`. The test client filters on ordinal + kind, not mask.
+                      HasherSelector[F].withCurrent { implicit hasher =>
+                        hasher.hash(snap).flatMap { hash =>
+                          val event =
+                            io.constellationnetwork.node.shared.infrastructure.local_events.proto.local_events.SnapshotFinalized(
+                              finalizedOrdinal = snap.ordinal.value.value,
+                              snapshotHash = com.google.protobuf.ByteString.copyFrom(hash.value.getBytes),
+                              slot = snap.slotCertificate.map(_.slot.value.value).getOrElse(0L),
+                              triggerMask = 0 // see comment above
+                            )
+                          localEventsPublisher.publishSnapshotFinalized(snap.ordinal, event).attempt.void
+                        }
+                      }
                     },
                   // §3 NIPoPoW S3: Phase-3 sink for the local TowerStore. Constructed above with
                   // a dedicated MPT producer (NOT in the consensus stateProof). Invoked at T_depth2

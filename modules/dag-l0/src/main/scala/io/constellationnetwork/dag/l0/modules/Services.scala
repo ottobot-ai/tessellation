@@ -285,7 +285,9 @@ object Services {
       // §1.2 Slice 10 (#179): Runtime-mutable KES registry overlay built on top of the genesis-frozen
       // `kesRegistry`. Lookups fall through to the genesis base until a Slice 10 registration cert finalizes for that
       // operator. Wired here so HttpApi (POST /kes-registration) and GSAM accept-pipeline share the same instance.
-      mutableKesRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.kes.MutableKesRegistry.make[F](kesRegistry, pendingReader).toResource
+      mutableKesRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.kes.MutableKesRegistry
+        .make[F](kesRegistry, pendingReader)
+        .toResource
     } yield
       new Services[F, R](
         localHealthcheck = sharedServices.localHealthcheck,
