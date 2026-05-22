@@ -1,0 +1,255 @@
+syntax = "proto3";
+
+package nakamoto.local_events;
+
+option java_package = "io.constellationnetwork.node.shared.infrastructure.local_events.proto";
+
+// ─── Service ────────────────────────────────────────────────────────
+//
+// gl0-embedded reactive event stream. Replaces polling-based e2e test waits with
+// reactive subscription. Localhost-only in v1; mTLS / API tokens deferred (§3 of
+// docs/nakamoto/LOCAL-EVENTS-SERVICE-DESIGN.md).
+//
+// Wire contract: the FIRST event on every Subscribe stream is `StreamStarted` —
+// it carries the finalized ordinal at subscribe time. Clients pair this with a
+// REST `/snapshots/at-ordinal/N` call to bootstrap state without missing events
+// in the gap between REST and first delta (User Override Q3).
+
+service LocalEvents {
+  // Server-streaming subscription. Client opens once; server pushes
+  // EventEnvelopes until the client closes the stream or the server
+  // shuts down. The FIRST event on the stream is always a StreamStarted
+  // envelope (Q3 user override) — gives clients a deterministic catch-up
+  // anchor against `/snapshots/at-ordinal/N`.
+  rpc Subscribe(SubscribeRequest) returns (stream EventEnvelope);
+
+  // Health probe. Returns immediately; used by clients to verify the
+  // service is up before subscribing.
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+// ─── Subscribe request ──────────────────────────────────────────────
+
+message SubscribeRequest {
+  // Conjunctive filter set. Empty = receive ALL events.
+  repeated EventFilter filters = 1;
+
+  // Reserved for replay (v2). v1: server returns UNIMPLEMENTED if set.
+  optional int64 replay_from_ord = 2;
+
+  // Client tag — logged server-side for debugging slow subscribers.
+  // E.g. "e2e/token-locks/expiration".
+  string client_tag = 3;
+}
+
+message EventFilter {
+  repeated EventKind kinds = 1;
+  // Restrict to events touching one of these addresses (DAG base58).
+  repeated string addresses = 2;
+  // Restrict to events touching one of these metagraph addresses.
+  repeated string metagraph_addresses = 3;
+  // Inclusive ordinal range. -1 = unbounded.
+  int64 min_ordinal = 4;
+  int64 max_ordinal = 5;
+}
+
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  // Stream lifecycle
+  STREAM_STARTED = 14;       // first envelope on every Subscribe stream (Q3)
+  // Immediate (v1 emitted)
+  SNAPSHOT_FINALIZED = 1;
+  BALANCE_CHANGE = 2;
+  TOKEN_LOCK_STATE_CHANGE = 3;
+  ALLOW_SPEND_STATE_CHANGE = 4;
+  TRANSACTION_ACCEPTED = 5;
+  METAGRAPH_SNAPSHOT_ACCEPTED = 6;
+  METAGRAPH_BALANCE_CHANGE = 7;
+  // Future (§1 future-extensibility; schema-only in v1)
+  KES_ROTATED = 8;
+  ETA_ROTATED = 9;
+  SNOWBALL_DECISION = 10;
+  CHAIN_QUALITY_CHANGE = 11;
+  VALIDATOR_PARTICIPATION = 12;
+  SLASHING_EVENT = 13;
+}
+
+// ─── Envelope ───────────────────────────────────────────────────────
+
+message EventEnvelope {
+  // Bumped on breaking schema change. v1.
+  uint32 wire_version = 1;
+
+  // Monotone per-server-process sequence number. Lets clients detect
+  // server-internal drops (slow-subscriber prune).
+  uint64 seq = 2;
+
+  // Server wall-clock at publish time (millis since epoch). NOT a
+  // consensus timestamp.
+  int64 published_at_millis = 3;
+
+  // The ordinal this event is associated with. For SnapshotFinalized this is
+  // the finalized ordinal. For BalanceChange / TokenLock / AllowSpend /
+  // TransactionAccepted / Metagraph* it's the gl0 ordinal during whose
+  // accept() the change occurred. For StreamStarted it's the current
+  // finalized ordinal at subscribe time.
+  int64 ordinal = 4;
+
+  oneof event {
+    StreamStarted stream_started = 9;
+    SnapshotFinalized snapshot_finalized = 10;
+    BalanceChange balance_change = 11;
+    TokenLockStateChange token_lock_state_change = 12;
+    AllowSpendStateChange allow_spend_state_change = 13;
+    TransactionAccepted transaction_accepted = 14;
+    MetagraphSnapshotAccepted metagraph_snapshot_accepted = 15;
+    MetagraphBalanceChange metagraph_balance_change = 16;
+    // Future variants — reserved field numbers. Adding any of these
+    // does NOT bump wire_version.
+    KesRotated kes_rotated = 20;
+    EtaRotated eta_rotated = 21;
+    SnowballDecision snowball_decision = 22;
+    ChainQualityChange chain_quality_change = 23;
+    ValidatorParticipation validator_participation = 24;
+    SlashingEvent slashing_event = 25;
+  }
+}
+
+// ─── Stream lifecycle (Q3 user override) ────────────────────────────
+
+// First event sent on every Subscribe stream. Carries the current finalized
+// ordinal so clients can fetch REST `/snapshots/at-ordinal/N` for bootstrap
+// state without missing events in the gap between REST + first delta.
+//
+// `server_session_id` is a server-generated per-process random value; clients
+// that see a different session_id after reconnect know the server restarted
+// (sequence numbers reset).
+message StreamStarted {
+  int64 start_ordinal = 1;       // current finalized ordinal at subscribe time
+  int64 epoch_progress = 2;      // current epoch progress at subscribe time
+  uint64 server_session_id = 3;  // per-process random; bump = server restart
+}
+
+// ─── Immediate event variants ───────────────────────────────────────
+
+message SnapshotFinalized {
+  int64 finalized_ordinal = 1;
+  bytes snapshot_hash = 2;
+  int64 slot = 3;
+  // Which Phase-1→2 trigger(s) qualified this finalization. Bitmask of
+  // {1=t_weight, 2=t_count, 4=t_depth1, 8=t_depth2}.
+  uint32 trigger_mask = 4;
+}
+
+message BalanceChange {
+  string address = 1;     // DAG base58
+  uint64 old_balance = 2;
+  uint64 new_balance = 3;
+  // Optional cause hint. "block" / "reward" / "tokenlock" / "allowspend" /
+  // "spend_transaction". Free-form so we can refine without schema churn.
+  string cause = 4;
+}
+
+message TokenLockStateChange {
+  enum Transition {
+    UNSPECIFIED = 0;
+    CREATED = 1;
+    EXPIRED = 2;       // unlockEpoch passed; activeTokenLocks evicted
+    WITHDRAWN = 3;     // explicit unlock tx accepted
+  }
+  string address = 1;
+  bytes token_lock_ref = 2;        // hash of the Signed[TokenLock]
+  Transition transition = 3;
+  uint64 amount = 4;
+  // 0 sentinel for omitted.
+  uint64 unlock_epoch = 5;
+}
+
+message AllowSpendStateChange {
+  enum Transition {
+    UNSPECIFIED = 0;
+    CREATED = 1;
+    CONSUMED = 2;      // SpendAction applied
+    EXPIRED = 3;       // epoch deadline passed
+  }
+  string address = 1;
+  bytes allow_spend_ref = 2;
+  Transition transition = 3;
+  uint64 amount = 4;
+  string destination = 5;          // empty if not applicable
+  uint64 expiry_epoch = 6;
+}
+
+message TransactionAccepted {
+  bytes tx_hash = 1;
+  string source = 2;
+  string destination = 3;
+  uint64 amount = 4;
+  uint64 fee = 5;
+}
+
+message MetagraphSnapshotAccepted {
+  string metagraph_address = 1;
+  int64 metagraph_ordinal = 2;
+  bytes metagraph_snapshot_hash = 3;
+  int64 gl0_ordinal = 4;
+}
+
+message MetagraphBalanceChange {
+  string metagraph_address = 1;
+  string address = 2;
+  uint64 old_balance = 3;
+  uint64 new_balance = 4;
+  string cause = 5;
+}
+
+// ─── Future event variants (schema-only; not emitted in v1) ─────────
+
+message KesRotated {
+  uint32 from_period = 1;
+  uint32 to_period = 2;
+  int64 at_finalized_ordinal = 3;
+}
+
+message EtaRotated {
+  uint32 from_period = 1;
+  uint32 to_period = 2;
+  bytes new_eta = 3;
+}
+
+message SnowballDecision {
+  bytes snapshot_hash = 1;
+  bool accepted = 2;
+  uint32 confidence = 3;
+}
+
+message ChainQualityChange {
+  double cq = 1;
+  int64 finalized_ordinal = 2;
+  uint32 trigger_mask = 3;
+}
+
+message ValidatorParticipation {
+  string peer_id = 1;
+  uint32 eta_period = 2;
+  uint64 wins = 3;
+  uint64 attestations = 4;
+}
+
+message SlashingEvent {
+  string offender_peer_id = 1;
+  string offense_kind = 2;
+  bytes evidence_hash = 3;
+  uint64 slashed_amount = 4;
+}
+
+// ─── Health ─────────────────────────────────────────────────────────
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool healthy = 1;
+  int64 subscriber_count = 2;
+  uint64 last_published_seq = 3;
+  uint64 dropped_to_slow_subscribers_total = 4;
+}
