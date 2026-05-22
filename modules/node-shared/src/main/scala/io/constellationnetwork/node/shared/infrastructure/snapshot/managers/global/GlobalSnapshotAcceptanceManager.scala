@@ -37,6 +37,15 @@ import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator
 import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator.SpendActionValidationError
 import io.constellationnetwork.node.shared.domain.swap.block.{AllowSpendBlockAcceptanceManager, AllowSpendBlockAcceptanceResult}
 import io.constellationnetwork.node.shared.domain.tokenlock.block.{TokenLockBlockAcceptanceManager, TokenLockBlockAcceptanceResult}
+import io.constellationnetwork.node.shared.infrastructure.local_events.LocalEventsPublisher
+import io.constellationnetwork.node.shared.infrastructure.local_events.proto.local_events.{
+  AllowSpendStateChange => PbAllowSpendStateChange,
+  BalanceChange => PbBalanceChange,
+  MetagraphBalanceChange => PbMetagraphBalanceChange,
+  MetagraphSnapshotAccepted => PbMetagraphSnapshotAccepted,
+  TokenLockStateChange => PbTokenLockStateChange,
+  TransactionAccepted => PbTransactionAccepted
+}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot._
 import io.constellationnetwork.node.shared.logger.LoggerBundle
@@ -214,10 +223,23 @@ object GlobalSnapshotAcceptanceManager {
     // suitable for tests / pre-wire-up call sites where boundary writes can fall through to
     // `Hash.empty`; production overrides at `GlobalSnapshotConsensus` construction with a
     // chainStore-backed walk.
-    etaForPeriod: Option[EtaPeriod => F[Hash]] = None
+    etaForPeriod: Option[EtaPeriod => F[Hash]] = None,
+    // [[LocalEventsPublisher]] gates emission of consensus events into the gl0-embedded gRPC stream
+    // (`docs/nakamoto/LOCAL-EVENTS-SERVICE-DESIGN.md`). Production wiring at `GlobalSnapshotConsensus` /
+    // `SharedServices` constructs a `Topic`-backed publisher when `nakamoto.local-events.enabled = true`;
+    // currency-l0 and tests pass `LocalEventsPublisher.noop`. The Q2 user override (hoist the double-walk)
+    // is implemented inside `accept()`: TokenLock/AllowSpend expired sets are computed once and feed both
+    // the manager call sites and the publisher's `EXPIRED` emissions.
+    //
+    // `Option` rather than a defaulted value because Scala can't resolve the `Applicative[F]` instance for
+    // `LocalEventsPublisher.noop[F]` at the def's default-parameter site (the context-bound implicits are
+    // bound on the outer method, not on default-arg expressions). `None` collapses to `noop` inside the
+    // body where the implicits are in scope.
+    localEventsPublisher: Option[LocalEventsPublisher[F]] = None
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): F[GlobalSnapshotAcceptanceManager[F]] = {
+    val publisher: LocalEventsPublisher[F] = localEventsPublisher.getOrElse(LocalEventsPublisher.noop[F])
     // Establish the WithdrawalTimeLimit implicit from the explicit constructor param so that the rebuild paths
     // (`syncFromGlobalSnapshotInfo`, `stateProofBuilder` → `mptStateProof`) see the same limit the accept path uses
     // to compute expiry-index buckets. Gated by the feature flag until the threading below lands everywhere.
@@ -779,6 +801,174 @@ object GlobalSnapshotAcceptanceManager {
           }
         }
 
+        /** Bundle GSAM-derived diffs into typed proto events and route them to the publisher.
+          *
+          * All emissions are best-effort: this method's errors are swallowed by `attempt.void` at the call site, so a publisher fault never
+          * blocks consensus.
+          */
+        private def emitLocalEvents(
+          ordinal: SnapshotOrdinal,
+          priorBalances: SortedMap[Address, Balance],
+          postBalances: SortedMap[Address, Balance],
+          acceptedGlobalAllowSpends: List[Signed[AllowSpend]],
+          acceptedGlobalTokenLocks: List[Signed[TokenLock]],
+          expiredAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
+          expiredTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+          tokenUnlocks: Map[Address, List[TokenUnlock]],
+          acceptedTransactions: SortedSet[Signed[Transaction]],
+          scSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+          currencyAcceptanceBalanceUpdate: SortedMap[Address, Balance],
+          lastSnapshotContext: GlobalSnapshotInfo
+        )(implicit hasher: Hasher[F]): F[Unit] = {
+          // BalanceChange — diff post-vs-prior, emit one envelope per delta. The cause is left
+          // free-form `"accept"` here; finer granularity (block / reward / tokenlock / allowspend /
+          // spend) would require threading more context in.
+          val balanceChanges: List[PbBalanceChange] = {
+            val keys = (priorBalances.keySet ++ postBalances.keySet).toList
+            keys.flatMap { addr =>
+              val o = priorBalances.get(addr).map(_.value.value).getOrElse(0L)
+              val n = postBalances.get(addr).map(_.value.value).getOrElse(0L)
+              if (o == n) Nil
+              else List(PbBalanceChange(address = addr.value.value, oldBalance = o, newBalance = n, cause = "accept"))
+            }
+          }
+
+          // TokenLockStateChange.CREATED for accepted; .EXPIRED for the hoisted expired set.
+          val tlCreated: F[List[PbTokenLockStateChange]] =
+            acceptedGlobalTokenLocks.traverse { signed =>
+              signed.toHashed.map { h =>
+                PbTokenLockStateChange(
+                  address = signed.value.source.value.value,
+                  tokenLockRef = com.google.protobuf.ByteString.copyFrom(h.hash.value.getBytes),
+                  transition = PbTokenLockStateChange.Transition.CREATED,
+                  amount = signed.value.amount.value.value,
+                  unlockEpoch = signed.value.unlockEpoch.map(_.value.value).getOrElse(0L)
+                )
+              }
+            }
+          val tlExpired: F[List[PbTokenLockStateChange]] =
+            expiredTokenLocks.toList.flatMap { case (addr, set) => set.toList.map(addr -> _) }.traverse {
+              case (addr, signed) =>
+                signed.toHashed.map { h =>
+                  PbTokenLockStateChange(
+                    address = addr.value.value,
+                    tokenLockRef = com.google.protobuf.ByteString.copyFrom(h.hash.value.getBytes),
+                    transition = PbTokenLockStateChange.Transition.EXPIRED,
+                    amount = signed.value.amount.value.value,
+                    unlockEpoch = signed.value.unlockEpoch.map(_.value.value).getOrElse(0L)
+                  )
+                }
+            }
+          // TokenLockStateChange.WITHDRAWN from generated unlocks (one TokenUnlock per ref).
+          val tlWithdrawn: List[PbTokenLockStateChange] =
+            tokenUnlocks.toList.flatMap {
+              case (addr, unlocks) =>
+                unlocks.map { u =>
+                  PbTokenLockStateChange(
+                    address = addr.value.value,
+                    tokenLockRef = com.google.protobuf.ByteString.copyFrom(u.tokenLockRef.value.getBytes),
+                    transition = PbTokenLockStateChange.Transition.WITHDRAWN,
+                    amount = u.amount.value.value,
+                    unlockEpoch = 0L
+                  )
+                }
+            }
+
+          // AllowSpendStateChange.CREATED for accepted; .EXPIRED for the hoisted expired set.
+          val asCreated: F[List[PbAllowSpendStateChange]] =
+            acceptedGlobalAllowSpends.traverse { signed =>
+              signed.toHashed.map { h =>
+                PbAllowSpendStateChange(
+                  address = signed.value.source.value.value,
+                  allowSpendRef = com.google.protobuf.ByteString.copyFrom(h.hash.value.getBytes),
+                  transition = PbAllowSpendStateChange.Transition.CREATED,
+                  amount = signed.value.amount.value.value,
+                  destination = signed.value.destination.value.value,
+                  expiryEpoch = signed.value.lastValidEpochProgress.value.value
+                )
+              }
+            }
+          val asExpired: F[List[PbAllowSpendStateChange]] =
+            expiredAllowSpends.toList.flatMap { case (addr, set) => set.toList.map(addr -> _) }.traverse {
+              case (addr, signed) =>
+                signed.toHashed.map { h =>
+                  PbAllowSpendStateChange(
+                    address = addr.value.value,
+                    allowSpendRef = com.google.protobuf.ByteString.copyFrom(h.hash.value.getBytes),
+                    transition = PbAllowSpendStateChange.Transition.EXPIRED,
+                    amount = signed.value.amount.value.value,
+                    destination = signed.value.destination.value.value,
+                    expiryEpoch = signed.value.lastValidEpochProgress.value.value
+                  )
+                }
+            }
+
+          // TransactionAccepted for every accepted DAG tx this ordinal.
+          val txs: F[List[PbTransactionAccepted]] =
+            acceptedTransactions.toList.traverse { signed =>
+              signed.toHashed.map { h =>
+                PbTransactionAccepted(
+                  txHash = com.google.protobuf.ByteString.copyFrom(h.hash.value.getBytes),
+                  source = signed.value.source.value.value,
+                  destination = signed.value.destination.value.value,
+                  amount = signed.value.amount.value.value,
+                  fee = signed.value.fee.value.value
+                )
+              }
+            }
+
+          // MetagraphSnapshotAccepted for every (mgAddr, snapshot) pair in scSnapshots.
+          val mgSnapshots: F[List[PbMetagraphSnapshotAccepted]] =
+            scSnapshots.toList.flatMap {
+              case (mgAddr, nel) => nel.toList.map(mgAddr -> _)
+            }.traverse {
+              case (mgAddr, signed) =>
+                signed.toHashed.map { h =>
+                  PbMetagraphSnapshotAccepted(
+                    metagraphAddress = mgAddr.value.value,
+                    metagraphOrdinal = 0L, // ordinal not cheap to decode here; left at 0 until needed
+                    metagraphSnapshotHash = com.google.protobuf.ByteString.copyFrom(h.hash.value.getBytes),
+                    gl0Ordinal = ordinal.value.value
+                  )
+                }
+            }
+
+          // MetagraphBalanceChange — derive from `currencyAcceptanceBalanceUpdate`. The update is
+          // DAG-side balance changes triggered by SC events; the metagraph context is captured by
+          // the snapshot event above. Until we thread per-metagraph balance diffs, leave the
+          // metagraphAddress empty and let the test client filter by address.
+          val mgBalances: List[PbMetagraphBalanceChange] =
+            currencyAcceptanceBalanceUpdate.toList.flatMap {
+              case (addr, newBal) =>
+                val oldBal = lastSnapshotContext.balances.getOrElse(addr, io.constellationnetwork.schema.balance.Balance.empty)
+                if (oldBal == newBal) Nil
+                else
+                  List(
+                    PbMetagraphBalanceChange(
+                      metagraphAddress = "",
+                      address = addr.value.value,
+                      oldBalance = oldBal.value.value,
+                      newBalance = newBal.value.value,
+                      cause = "currency_accept"
+                    )
+                  )
+            }
+
+          for {
+            _ <- publisher.publishBalanceChanges(ordinal, balanceChanges)
+            tlc <- tlCreated
+            tle <- tlExpired
+            _ <- publisher.publishTokenLockChanges(ordinal, tlc ++ tle ++ tlWithdrawn)
+            asc <- asCreated
+            ase <- asExpired
+            _ <- publisher.publishAllowSpendChanges(ordinal, asc ++ ase)
+            tx <- txs
+            _ <- publisher.publishTransactionsAccepted(ordinal, tx)
+            mgs <- mgSnapshots
+            _ <- publisher.publishMetagraphEvents(ordinal, mgs, mgBalances)
+          } yield ()
+        }
+
         def accept(
           ordinal: SnapshotOrdinal,
           epochProgress: EpochProgress,
@@ -876,6 +1066,23 @@ object GlobalSnapshotAcceptanceManager {
                 acceptedGlobalTokenLocks <- tokenLockStateManager.acceptReplacementTokenLocks(
                   tokenLockBlockAcceptanceResult.accepted.flatMap(_.value.tokenLocks.toList),
                   lastSnapshotContext
+                )
+
+                // ─── Q2 hoist: compute expired sets ONCE per accept() ──────────────────────────
+                // Both the TokenLockStateManager and the AllowSpendStateManager internally call
+                // `findExpired...ViaIndexFromMpt(previousEpochProgress, epochProgress)` from at least
+                // two sites each (`accept*FromMpt` + `updateGlobalBalancesBy*FromMpt`). The walk traverses
+                // an MPT epoch-index range per accept; hoisting the result up here means a SINGLE walk
+                // per accept(), then we thread the precomputed expired sets through the new
+                // `*WithExpired` variants. Same byte-equivalent outputs as before; just one MPT walk
+                // instead of four. The publisher also reads this single source for EXPIRED events.
+                expiredTokenLocksHoisted <- tokenLockStateManager.findExpiredGlobalTokenLocksViaIndexFromMpt(
+                  previousEpochProgress,
+                  epochProgress
+                )
+                expiredAllowSpendsHoisted <- allowSpendStateManager.findExpiredGlobalAllowSpendsViaIndexFromMpt(
+                  previousEpochProgress,
+                  epochProgress
                 )
 
                 initialData <-
@@ -1205,13 +1412,13 @@ object GlobalSnapshotAcceptanceManager {
                 globalLastAllowSpendRefs <- allowSpendStateManager.materializeLastAllowSpendRefsFromMpt
                 globalLastTokenLockRefs <- tokenLockStateManager.materializeLastTokenLockRefsFromMpt
 
-                allowSpendAcceptanceResult <- allowSpendStateManager.acceptAllowSpends(
+                allowSpendAcceptanceResult <- allowSpendStateManager.acceptAllowSpendsWithExpired(
                   epochProgress,
-                  previousEpochProgress,
                   activeAllowSpendsFromCurrencySnapshots,
                   globalAllowSpends,
                   globalActiveAllowSpends,
-                  allAcceptedSpendTxns
+                  allAcceptedSpendTxns,
+                  expiredAllowSpendsHoisted
                 )
                 updatedAllowSpends = allowSpendAcceptanceResult.fullState
                 allowSpendsDeltas = allowSpendAcceptanceResult.deltas
@@ -1223,12 +1430,11 @@ object GlobalSnapshotAcceptanceManager {
                   allowSpendBlockAcceptanceResult.contextUpdate.lastTxRefs
                 )
 
-                allowSpendBalancesResult <- allowSpendStateManager.updateGlobalBalancesByAllowSpends(
+                allowSpendBalancesResult <- allowSpendStateManager.updateGlobalBalancesByAllowSpendsWithExpired(
                   epochProgress,
-                  previousEpochProgress,
                   updatedBalancesByRewards,
                   globalAllowSpends,
-                  globalActiveAllowSpends
+                  expiredAllowSpendsHoisted
                 )
                 (updatedBalancesByAllowSpends, updatedBalancesByAllowSpendsDeltas) <- Async[F].fromEither(
                   allowSpendBalancesResult
@@ -1263,12 +1469,12 @@ object GlobalSnapshotAcceptanceManager {
                   .leftMap(error => new RuntimeException(s"Error generating token unlocks: $error"))
                   .liftTo[F]
 
-                tokenLockAcceptanceResult <- tokenLockStateManager.acceptTokenLocks(
+                tokenLockAcceptanceResult <- tokenLockStateManager.acceptTokenLocksWithExpired(
                   epochProgress,
-                  previousEpochProgress,
                   globalTokenLocks,
                   globalActiveTokenLocks,
-                  generatedTokenUnlocks
+                  generatedTokenUnlocks,
+                  expiredTokenLocksHoisted
                 )
                 updatedGlobalTokenLocks = tokenLockAcceptanceResult.fullState
                 tokenLocksDeltas = tokenLockAcceptanceResult.deltas
@@ -1288,12 +1494,12 @@ object GlobalSnapshotAcceptanceManager {
                       priorTokenLockBalances.some
                     )
 
-                tokenLockBalancesResult <- tokenLockStateManager.updateGlobalBalancesByTokenLocks(
+                tokenLockBalancesResult <- tokenLockStateManager.updateGlobalBalancesByTokenLocksWithExpired(
                   epochProgress,
-                  previousEpochProgress,
                   updatedBalancesByAllowSpends,
                   globalTokenLocks,
-                  generatedTokenUnlocks
+                  generatedTokenUnlocks,
+                  expiredTokenLocksHoisted
                 )
                 (updatedBalancesByTokenLocks, updatedBalancesByTokenLocksDeltas) <- Async[F].fromEither(
                   tokenLockBalancesResult
@@ -1742,14 +1948,10 @@ object GlobalSnapshotAcceptanceManager {
                   lastActiveGlobalAllowSpends,
                   epochProgress
                 )
-                expiredTokenLocks <- tokenLockStateManager.findExpiredGlobalTokenLocksViaIndexFromMpt(
-                  previousEpochProgress,
-                  epochProgress
-                )
 
                 artifactsFromExpired <- artifactEmissionManager.emitAllExpiredArtifacts(
                   expiredAllowSpends,
-                  expiredTokenLocks
+                  expiredTokenLocksHoisted
                 )
 
                 allowSpendsExpiredEvents = artifactsFromExpired.collect { case a: AllowSpendExpiration => a }
@@ -1764,6 +1966,27 @@ object GlobalSnapshotAcceptanceManager {
                       }
                     )
                 )
+
+                // ─── LocalEvents publisher emissions ─────────────────────────────────────
+                // Best-effort fire-and-forget: emit a batch of typed events derived from this accept's
+                // diffs. Wired through `publisher` (no-op by default; production overrides at
+                // GlobalSnapshotConsensus when `nakamoto.local-events.enabled = true`). Errors here
+                // must NOT block consensus — wrap in `attempt.void` so a publisher fault drops the
+                // event(s) silently.
+                _ <- emitLocalEvents(
+                  ordinal,
+                  priorBalances = priorBalances,
+                  postBalances = gsi.balances,
+                  acceptedGlobalAllowSpends = acceptedGlobalAllowSpends,
+                  acceptedGlobalTokenLocks = acceptedGlobalTokenLocks,
+                  expiredAllowSpends = expiredAllowSpendsHoisted,
+                  expiredTokenLocks = expiredTokenLocksHoisted,
+                  tokenUnlocks = generatedTokenUnlocks,
+                  acceptedTransactions = acceptedTransactions,
+                  scSnapshots = scSnapshots,
+                  currencyAcceptanceBalanceUpdate = currencyAcceptanceBalanceUpdate,
+                  lastSnapshotContext = lastSnapshotContext
+                ).attempt.void
               } yield
                 (
                   initialData.blockResult,

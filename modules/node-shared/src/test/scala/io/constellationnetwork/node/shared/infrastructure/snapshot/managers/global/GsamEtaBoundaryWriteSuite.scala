@@ -29,27 +29,27 @@ import weaver.MutableIOSuite
   * ([[io.constellationnetwork.node.shared.modules.SharedServices.make]] and
   * [[io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotConsensus.make]]) passed `etaForPeriod = None` (the GSAM
   * default). At every boundary ordinal `ord % R == R - 1` the eta half of the `HistoricalStakeSnapshot` MPT entry was written as
-  * [[Hash.empty]] — pseudo-predictability defeated cluster-wide because the §3 NIPoPoW N-2 historical-distribution read path saw a
-  * sentinel `Hash.empty` instead of the real chain-derived eta.
+  * [[Hash.empty]] — pseudo-predictability defeated cluster-wide because the §3 NIPoPoW N-2 historical-distribution read path saw a sentinel
+  * `Hash.empty` instead of the real chain-derived eta.
   *
-  * '''The fix.''' Both production GSAM construction sites now pass `etaForPeriod = Some(period => etaStateManager.getEta(period.value).map(etaBytesToHash))`
-  * backed by a real [[EtaStateManager]] (MPT cache + chain-walk fallback). This suite exercises the GSAM accept pipeline with both
-  * arrangements:
+  * '''The fix.''' Both production GSAM construction sites now pass `etaForPeriod = Some(period =>
+  * etaStateManager.getEta(period.value).map(etaBytesToHash))` backed by a real [[EtaStateManager]] (MPT cache + chain-walk fallback). This
+  * suite exercises the GSAM accept pipeline with both arrangements:
   *
-  *   1. `etaForPeriod = None` — reproduces the bug; eta = `Hash.empty`.
-  *   2. `etaForPeriod = Some(EtaStateManager-backed)` for period ≤ 1 — eta = `etaBytesToHash(genesisEta)` (NOT `Hash.empty`).
-  *   3. `etaForPeriod = Some(EtaStateManager-backed)` for period 2 with non-empty chain walk — eta =
-  *      `etaBytesToHash(EtaCalculation.computeEta(genesisEta, 2, vrfOutputs))` (NOT `Hash.empty`, NOT `etaBytesToHash(genesisEta)`).
+  *   1. `etaForPeriod = None` — reproduces the bug; eta = `Hash.empty`. 2. `etaForPeriod = Some(EtaStateManager-backed)` for period ≤ 1 —
+  *      eta = `etaBytesToHash(genesisEta)` (NOT `Hash.empty`). 3. `etaForPeriod = Some(EtaStateManager-backed)` for period 2 with non-empty
+  *      chain walk — eta = `etaBytesToHash(EtaCalculation.computeEta(genesisEta, 2, vrfOutputs))` (NOT `Hash.empty`, NOT
+  *      `etaBytesToHash(genesisEta)`).
   *
-  * Arrangement (1) is load-bearing: it FAILS the post-fix expectation `eta != Hash.empty` if anyone re-introduces `etaForPeriod = None`
-  * at a production GSAM construction site (caught by `expect.all(... !entry.map(_.eta).contains(Hash.empty))` in arrangements 2-3 if
-  * paired against the regressed production wiring). The bug docs (Path 1 reviewer findings) are reproduced in arrangement (1) here
-  * directly so the contrast is unambiguous.
+  * Arrangement (1) is load-bearing: it FAILS the post-fix expectation `eta != Hash.empty` if anyone re-introduces `etaForPeriod = None` at
+  * a production GSAM construction site (caught by `expect.all(... !entry.map(_.eta).contains(Hash.empty))` in arrangements 2-3 if paired
+  * against the regressed production wiring). The bug docs (Path 1 reviewer findings) are reproduced in arrangement (1) here directly so the
+  * contrast is unambiguous.
   *
   * '''Test inputs are real, not pure mocks.''' Arrangement (3) feeds 5 synthetic VRF outputs through `EtaCalculation.computeEta` —
   * exercising the same byte-deterministic Blake2b digest the production code uses, with the same `genesisEta` seed (32-byte Blake2b of
-  * `"tessellation-nakamoto-genesis-eta-v1"`) — so the assertion `expect.same(expectedHash, observedHash)` would catch any silent
-  * regression in either the GSAM wiring or the EtaStateManager → Hash projection.
+  * `"tessellation-nakamoto-genesis-eta-v1"`) — so the assertion `expect.same(expectedHash, observedHash)` would catch any silent regression
+  * in either the GSAM wiring or the EtaStateManager → Hash projection.
   */
 object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
 
@@ -154,8 +154,7 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
         historicalStakeReader = emptyMptReader,
         chainWalkFallback = chainWalk
       )
-      callback = (period: EtaPeriod) =>
-        etaMgr.getEta(period.value).map(SharedServices.etaBytesToHash)
+      callback = (period: EtaPeriod) => etaMgr.getEta(period.value).map(SharedServices.etaBytesToHash)
       mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
       entry <- runBoundary(mgr, boundaryOrd = 9L, expectedPeriod = 0L)
     } yield
@@ -174,8 +173,8 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
     // R=10, ord 29 = period 2 closing boundary (29/10 == 2, 29 % 10 == 9 == R-1). At period 2
     // the EtaStateManager falls through to `chainWalkFallback(1L)` (source-period = currentPeriod-1)
     // and computes `EtaCalculation.computeEta(genesisEta, 2, syntheticVrfOutputs.map(_._2))`.
-    val chainWalk: Long => IO[List[(Long, Array[Byte])]] = (sourcePeriod: Long) =>
-      if (sourcePeriod == 1L) IO.pure(syntheticVrfOutputs) else IO.pure(List.empty)
+    val chainWalk: Long => IO[List[(Long, Array[Byte])]] =
+      (sourcePeriod: Long) => if (sourcePeriod == 1L) IO.pure(syntheticVrfOutputs) else IO.pure(List.empty)
     val expectedEtaBytes = EtaCalculation.computeEta(genesisEta, 2L, syntheticVrfOutputs.map(_._2))
     val expectedEtaHash = SharedServices.etaBytesToHash(expectedEtaBytes)
 
@@ -185,8 +184,7 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
         historicalStakeReader = emptyMptReader,
         chainWalkFallback = chainWalk
       )
-      callback = (period: EtaPeriod) =>
-        etaMgr.getEta(period.value).map(SharedServices.etaBytesToHash)
+      callback = (period: EtaPeriod) => etaMgr.getEta(period.value).map(SharedServices.etaBytesToHash)
       mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
       entry <- runBoundary(mgr, boundaryOrd = 29L, expectedPeriod = 2L)
     } yield
