@@ -162,6 +162,13 @@ for i in $(seq 0 $((MAX_HG_NODES - 1))); do
   echo "CL_DOCKER_EXTERNAL_GL1_P2P=${L1_PORT}1" >> .env
   echo "CL_DOCKER_EXTERNAL_GL1_CLI=${L1_PORT}2" >> .env
 
+  # LocalEvents reactive gRPC stream — bind:50054 inside the container (set by
+  # application.conf via NAKAMOTO_LOCAL_EVENTS_PORT). Host-side port stripes by
+  # node index using the existing pattern: external port = 50054 + i*10 (50054 for
+  # gl0-0, 50064 for gl0-1, etc.) so concurrent nodes don't collide on the host.
+  # Tests reach gl0-0 at host port 50054 via TEST_HOST resolution.
+  echo "CL_DOCKER_EXTERNAL_GL0_LOCAL_EVENTS=$((50054 + i*10))" >> .env
+
   # These are only required on systems that implement docker with a host networking bridge
   # Port conflicts cause it to fail with external networks that re-use ports
   # internal ports
