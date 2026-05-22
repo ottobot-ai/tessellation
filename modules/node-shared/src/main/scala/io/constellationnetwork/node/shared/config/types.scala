@@ -84,7 +84,28 @@ object types {
     */
   case class NakamotoConfig(
     etaRotationSnapshots: PosLong,
-    keepDepthBehindFinalized: PosLong
+    keepDepthBehindFinalized: PosLong,
+    localEvents: LocalEventsConfig
+  )
+
+  /** Configuration for the gl0-embedded `LocalEvents` reactive event stream (see `docs/nakamoto/LOCAL-EVENTS-SERVICE-DESIGN.md`). Drives
+    * the gRPC server that publishes consensus events to local subscribers (e2e tests, operator GUI).
+    *
+    *   - `enabled`: master switch. Default OFF in production; e2e flips to true via HOCON or `${?NAKAMOTO_LOCAL_EVENTS_ENABLED}` env
+    *     substitution. When false the gRPC server is not started and `LocalEventsPublisher.noop` is wired into GSAM.
+    *   - `bindAddress`: default loopback. Docker e2e flips to `0.0.0.0` so the host reaches the container.
+    *   - `port`: defaults to 50054 (distinct from `ChainSyncInbound`'s 50053).
+    *   - `maxQueuedPerSubscriber`: per-subscriber queue depth before drop-oldest; ~15 min buffer at 8 events/ord × 7s/ord.
+    *   - `publisherBufferSize`: process-wide FS2 `Topic` backstop. Should never be reached under normal load.
+    *   - `shutdownGraceSeconds`: shutdown grace period matching the existing `ChainSyncInbound` 5-second grace.
+    */
+  case class LocalEventsConfig(
+    enabled: Boolean,
+    bindAddress: String,
+    port: PosInt,
+    maxQueuedPerSubscriber: PosInt,
+    publisherBufferSize: PosInt,
+    shutdownGraceSeconds: PosInt
   )
 
   case class SharedConfigReader(
