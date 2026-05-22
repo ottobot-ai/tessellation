@@ -62,9 +62,14 @@ object LocalEventsService {
     * @param epochProgressRef
     *   read at subscribe time to populate `StreamStarted.epoch_progress`. Caller can pass a noop Ref(0) for tests.
     * @param maxQueuedPerSubscriber
-    *   per-subscriber buffer depth before drop-oldest.
+    *   reserved for a future two-tier buffer scheme. Currently NOT used to size the topic — see `publisherBufferSize` note below.
     * @param publisherBufferSize
-    *   process-wide FS2 `Topic` backstop. Set higher than `maxQueuedPerSubscriber`.
+    *   live: passed straight to `topic.subscribeAwait` to size the per-subscriber bounded queue. FS2's `Topic` has no separate process-wide
+    *   buffer in its 3.x API, so the per-subscriber queue is the only backpressure boundary between the publishing fiber and slow
+    *   subscribers. Naming convention is asymmetric on purpose: HOCON exposes `publisher-buffer-size` (the operator-facing knob "how many
+    *   events can pile up in the server before backpressure kicks in"), wired through `LocalEventsConfig.publisherBufferSize` and passed
+    *   here. `maxQueuedPerSubscriber` is retained as a separate config knob so a future revision can split the two without churn at the
+    *   call sites.
     */
   def make[F[_]: Async](
     finalizedOrdinalRef: Ref[F, SnapshotOrdinal],
@@ -83,10 +88,15 @@ object LocalEventsService {
       droppedRef <- Ref.of[F, Long](0L)
       subscriberCountRef <- Ref.of[F, Long](0L)
       _ <- logger.info(
-        s"LocalEventsService init: sessionId=$sessionId maxQueued=${maxQueuedPerSubscriber.value} bufferSize=${publisherBufferSize.value}"
+        s"LocalEventsService init: sessionId=$sessionId publisherBufferSize=${publisherBufferSize.value} (live; sizes per-subscriber queue) " +
+          s"maxQueuedPerSubscriber=${maxQueuedPerSubscriber.value} (reserved)"
       )
     } yield {
       val publisher = mkPublisher[F](topic, seqRef, droppedRef, dispatcher, logger)
+      // Wire `publisherBufferSize` (not `maxQueuedPerSubscriber`) to `mkGrpcImpl` because the
+      // subscriber bounded queue IS the publisher-backpressure boundary in FS2's Topic API.
+      // `maxQueuedPerSubscriber` is intentionally unused at this call — see the scaladoc above.
+      val _unusedMaxQueuedPerSubscriberReservedForFutureUse = maxQueuedPerSubscriber
       val grpcImpl = mkGrpcImpl[F](
         topic,
         seqRef,
@@ -95,7 +105,7 @@ object LocalEventsService {
         finalizedOrdinalRef,
         epochProgressRef,
         sessionId,
-        maxQueuedPerSubscriber,
+        publisherBufferSize,
         dispatcher,
         logger
       )
@@ -270,7 +280,7 @@ object LocalEventsService {
     finalizedOrdinalRef: Ref[F, SnapshotOrdinal],
     epochProgressRef: Ref[F, Long],
     sessionId: Long,
-    maxQueuedPerSubscriber: PosInt,
+    subscriberQueueDepth: PosInt,
     dispatcher: Dispatcher[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): LocalEventsGrpc.LocalEvents = new LocalEventsGrpc.LocalEvents {
@@ -364,8 +374,11 @@ object LocalEventsService {
             // `topic.publish1` and our subscription: the publisher would otherwise drop events that
             // arrive between the test's `subscribe()` call returning and FS2 actually pulling from
             // `topic.subscribe`.
+            //
+            // The integer here SIZES THE PER-SUBSCRIBER BOUNDED QUEUE — see scaladoc on `make` for
+            // the rationale on passing `publisherBufferSize` here vs. `maxQueuedPerSubscriber`.
             topic
-              .subscribeAwait(maxQueuedPerSubscriber.value)
+              .subscribeAwait(subscriberQueueDepth.value)
               .use { subscribedStream =>
                 (fs2.Stream.eval(streamStartedEnvelopeF) ++ subscribedStream)
                   .filter(matchesFilters(_, request.filters))
