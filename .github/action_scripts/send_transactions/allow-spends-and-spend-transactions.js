@@ -20,6 +20,7 @@ const {
     isStaleParentError,
     isServerRetriable
 } = require('../shared');
+const { pollWithEventKick } = require('../lib/awaitChainEvent');
 
 const CONSTANTS = {
     ...sharedConstants,
@@ -1707,51 +1708,52 @@ const verifyUnauthorizedSpendActionInGlobalL0 = async (urls, tokenId, update) =>
 const waitForAllAllowSpendsToExpire = async (l0Url) => {
     try {
         logWorkflow.info('Waiting for all allow spends to expire...');
-
-        const maxAttempts = 240;
-        const checkInterval = CONSTANTS.EXPIRATION_VERIFICATION_INTERVAL_MS;
-
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            logWorkflow.info(`Checking for active allow spends (attempt ${attempt}/${maxAttempts})...`);
-
-            const snapshot = await getCombinedSnapshot(`${l0Url}/global-snapshots/latest/combined`);
-
-            if (!snapshot[1]?.activeAllowSpends) {
-                logWorkflow.success('No active allow spends found, proceeding with workflow');
-                return true;
-            }
-
-            const { totalActiveAllowSpends, hasActiveAllowSpends } = Object.keys(snapshot[1].activeAllowSpends)
-                .reduce((acc, tokenId) => {
-                    const tokenAllowSpends = snapshot[1].activeAllowSpends[tokenId];
-
-                    if (!tokenAllowSpends) {
-                        return acc;
+        // Reactive replacement for the prior 240-attempt × 10s wall-clock poll (40min budget).
+        // Driven off gl0's SNAPSHOT_FINALIZED kicks — each new finalized snapshot is the only
+        // moment activeAllowSpends could possibly have shrunk, so we wake exactly once per
+        // candidate event instead of polling on a fixed cadence.
+        //
+        // Original behavior: returns true on success, returns false on timeout (a non-fatal
+        // "proceed anyway" path the surrounding workflow tolerates). We preserve that by
+        // catching the timeout error and logging it, mirroring the legacy "Maximum attempts
+        // reached" branch.
+        try {
+            await pollWithEventKick({
+                endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
+                maxWait: 240 * CONSTANTS.EXPIRATION_VERIFICATION_INTERVAL_MS,
+                tag: 'waitForAllAllowSpendsToExpire',
+                kickFilter: { kinds: ['SNAPSHOT_FINALIZED', 'ALLOW_SPEND_STATE_CHANGE'] },
+                checkFn: async () => {
+                    const snapshot = await getCombinedSnapshot(`${l0Url}/global-snapshots/latest/combined`);
+                    if (!snapshot[1]?.activeAllowSpends) {
+                        return { hasActiveAllowSpends: false };
                     }
-
-                    return Object.keys(tokenAllowSpends).reduce((innerAcc, address) => {
-                        const addressAllowSpends = tokenAllowSpends[address] || [];
-                        const count = addressAllowSpends.length;
-
-                        return {
-                            totalActiveAllowSpends: innerAcc.totalActiveAllowSpends + count,
-                            hasActiveAllowSpends: innerAcc.hasActiveAllowSpends || count > 0
-                        };
-                    }, acc);
-                }, { totalActiveAllowSpends: 0, hasActiveAllowSpends: false });
-
-            if (!hasActiveAllowSpends) {
-                logWorkflow.success('No active allow spends found, proceeding with workflow');
-                return true;
-            }
-
-            logWorkflow.info(`Found ${totalActiveAllowSpends} active allow spends, waiting for them to expire...`);
-
-            await sleep(checkInterval);
+                    const { totalActiveAllowSpends, hasActiveAllowSpends } = Object.keys(snapshot[1].activeAllowSpends)
+                        .reduce((acc, tokenId) => {
+                            const tokenAllowSpends = snapshot[1].activeAllowSpends[tokenId];
+                            if (!tokenAllowSpends) return acc;
+                            return Object.keys(tokenAllowSpends).reduce((innerAcc, address) => {
+                                const addressAllowSpends = tokenAllowSpends[address] || [];
+                                const count = addressAllowSpends.length;
+                                return {
+                                    totalActiveAllowSpends: innerAcc.totalActiveAllowSpends + count,
+                                    hasActiveAllowSpends: innerAcc.hasActiveAllowSpends || count > 0
+                                };
+                            }, acc);
+                        }, { totalActiveAllowSpends: 0, hasActiveAllowSpends: false });
+                    if (!hasActiveAllowSpends) {
+                        return { hasActiveAllowSpends: false };
+                    }
+                    throw new Error(`still ${totalActiveAllowSpends} active allow spends`);
+                }
+            });
+            logWorkflow.success('No active allow spends found, proceeding with workflow');
+            return true;
+        } catch (e) {
+            // Timeout — preserve legacy semantic (warning + return false, NOT throw).
+            logWorkflow.warning(`Maximum wait reached, proceeding with workflow despite active allow spends: ${e.message}`);
+            return false;
         }
-
-        logWorkflow.warning('Maximum attempts reached, proceeding with workflow despite active allow spends');
-        return false;
     } catch (error) {
         logWorkflow.error(`Error waiting for allow spends to expire: ${error.message}`);
         throw error;

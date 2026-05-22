@@ -12,6 +12,16 @@ services:
       # written into each per-node .env file. Every node MUST agree on this.
       - NAKAMOTO_GENESIS_TIME_MS=${NAKAMOTO_GENESIS_TIME_MS}
       - NAKAMOTO_GENESIS_ETA=tessellation-nakamoto-genesis
+      # LocalEvents reactive gRPC stream (replaces polling-based e2e test waits).
+      # On by default in the test cluster so the JS test scripts can subscribe via
+      # @grpc/grpc-js. Toggle off by overriding NAKAMOTO_LOCAL_EVENTS_ENABLED=false.
+      # The HOCON `${?NAKAMOTO_LOCAL_EVENTS_ENABLED}` substitution in application.conf
+      # reads this env var at JVM startup — NEVER `sys.env.get` in code (project rule).
+      - NAKAMOTO_LOCAL_EVENTS_ENABLED=${NAKAMOTO_LOCAL_EVENTS_ENABLED:-true}
+      # 0.0.0.0 so the test container can reach the service across the docker network
+      # (default is loopback for production safety; e2e clusters override here).
+      - NAKAMOTO_LOCAL_EVENTS_BIND=${NAKAMOTO_LOCAL_EVENTS_BIND:-0.0.0.0}
+      - NAKAMOTO_LOCAL_EVENTS_PORT=${NAKAMOTO_LOCAL_EVENTS_PORT:-50054}
       # LDD snowplow tunables — production-aligned values (within rounding) so
       # the test cluster exercises the same eligibility curve as mainnet.
       # Earlier 2× test overrides (32/2/0.1/1.0) didn't actually speed up chain
@@ -51,6 +61,12 @@ services:
       # network with the matching CONTAINER_NAME_SUFFIX.
       - SIDECAR_HOST=sidecar${CONTAINER_NAME_SUFFIX:-}
       - SIDECAR_GRPC_PORT=50051
+    ports:
+      # Expose LocalEvents gRPC to the host so the JS e2e scripts can subscribe.
+      # External port per node (50054 for gl0-0, 50064 for gl0-1, etc. — see
+      # docker-env-setup.sh CL_DOCKER_EXTERNAL_GL0_LOCAL_EVENTS calculation).
+      # Internal port is whatever NAKAMOTO_LOCAL_EVENTS_PORT resolves to (default 50054).
+      - "${CL_DOCKER_BIND_INTERFACE:-}${CL_DOCKER_EXTERNAL_GL0_LOCAL_EVENTS:-50054}:${NAKAMOTO_LOCAL_EVENTS_PORT:-50054}"
     depends_on:
       sidecar:
         condition: service_healthy

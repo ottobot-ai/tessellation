@@ -23,6 +23,8 @@ const {
   logWorkflow,
 } = require('../shared')
 
+const { pollWithEventKick } = require('../lib/awaitChainEvent')
+
 const {
   checkOk,
   checkBadRequest,
@@ -108,17 +110,22 @@ const checkInitialNodeParamsNode = async (urls, nodeId) => {
 }
 
 const waitForNodeParamsUpdate = async (urls, verifyFn, maxAttempts = 30, intervalMs = 5000) => {
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
+  // Reactive replacement for the prior 30 × 5s wall-clock poll. We keep the same
+  // 30 × 5s = 150s budget by default but drive checks off SNAPSHOT_FINALIZED kicks
+  // instead — node-params updates only land at a snapshot boundary, so polling between
+  // boundaries was pure noise. The `maxAttempts` / `intervalMs` parameters are
+  // retained for API compatibility and converted into the equivalent maxWait budget.
+  return pollWithEventKick({
+    endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
+    maxWait: maxAttempts * intervalMs,
+    tag: 'waitForNodeParamsUpdate',
+    kickFilter: { kinds: ['SNAPSHOT_FINALIZED'] },
+    checkFn: async () => {
       const nodeParams = await getNodeParams(urls)
       verifyFn(nodeParams)
       return nodeParams
-    } catch (e) {
-      if (attempt === maxAttempts) throw e
-      logWorkflow.info(`Waiting for node params to propagate (attempt ${attempt}/${maxAttempts}): ${e.message}`)
-      await sleep(intervalMs)
     }
-  }
+  })
 }
 
 const verifyNodeParamsResponse = (
@@ -153,70 +160,82 @@ const getNodeParamsNodeIdVerify = async (
 ) => {
   const maxAttempts = 30;
   const intervalMs = 5000;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    await sleep(intervalMs);
-    let response;
-    try {
-      response = await axios.get(
-        `${urls.globalL0Url}/node-params/${nodeId}?t=${Date.now()}`,
-        {
-          headers: {
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            Pragma: 'no-cache',
-            Expires: '0',
+  // Reactive replacement for the prior 30 × 5s wall-clock poll. Node-params updates
+  // land at snapshot boundaries, so polling between snapshots is wasted work; we drive
+  // checks off SNAPSHOT_FINALIZED kicks. The structured error on timeout carries the
+  // last 10 cluster events for diagnostic, replacing the silent attempt-by-attempt
+  // log lines.
+  //
+  // Preserves all original assertion semantics: name + fraction must match exactly,
+  // ordinal is monotonic-only (see comment block below).
+  let lastReceived = null;
+  return pollWithEventKick({
+    endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
+    maxWait: maxAttempts * intervalMs,
+    tag: `getNodeParamsNodeIdVerify:${nodeId.slice(0, 8)}`,
+    kickFilter: { kinds: ['SNAPSHOT_FINALIZED'] },
+    checkFn: async () => {
+      let response;
+      try {
+        response = await axios.get(
+          `${urls.globalL0Url}/node-params/${nodeId}?t=${Date.now()}`,
+          {
+            headers: {
+              'Cache-Control': 'no-cache, no-store, must-revalidate',
+              Pragma: 'no-cache',
+              Expires: '0',
+            },
           },
-        },
-      )
-    } catch (err) {
-      if (err.response && err.response.status === 404 && attempt < maxAttempts) {
-        logWorkflow.info(`Waiting for node-params/${nodeId} to appear (attempt ${attempt}/${maxAttempts}): 404`)
-        continue;
+        );
+      } catch (err) {
+        if (err.response && err.response.status === 404) {
+          throw new Error(`node-params/${nodeId} not yet present (404)`);
+        }
+        throw err;
       }
-      throw err;
-    }
 
-    if (response.status !== 200)
-      throw new Error(`NodeParamsNode returned ${response.status} instead of 200`)
+      if (response.status !== 200)
+        throw new Error(`NodeParamsNode returned ${response.status} instead of 200`);
 
-    const receivedRewardFraction =
-      response.data.latest.value.delegatedStakeRewardParameters.rewardFraction
-    const receivedName = response.data.latest.value.nodeMetadataParameters.name
-    const receivedOrdinal = response.data.latest.value.parent.ordinal
+      const receivedRewardFraction =
+        response.data.latest.value.delegatedStakeRewardParameters.rewardFraction;
+      const receivedName = response.data.latest.value.nodeMetadataParameters.name;
+      const receivedOrdinal = response.data.latest.value.parent.ordinal;
+      lastReceived = { receivedRewardFraction, receivedName, receivedOrdinal };
 
-    const fractionOk = receivedRewardFraction === expectedRewardFraction;
-    const nameOk = receivedName === expectedName;
-    // In Nakamoto mode, seedlist nodes have pre-existing params at non-zero
-    // ordinals (auto-publish at startup). With larger clusters (8 gl0) the
-    // address can accumulate >1 pre-existing updates before the test's first
-    // create, so the test's hardcoded expectedOrdinal=N drifts. We only verify
-    // monotonic progress (receivedOrdinal >= expectedOrdinal) — name/fraction
-    // checks already confirm the latest update landed.
-    const ordinalOk = expectedOrdinal === 0 ? true : receivedOrdinal >= expectedOrdinal;
+      const fractionOk = receivedRewardFraction === expectedRewardFraction;
+      const nameOk = receivedName === expectedName;
+      // In Nakamoto mode, seedlist nodes have pre-existing params at non-zero
+      // ordinals (auto-publish at startup). With larger clusters (8 gl0) the
+      // address can accumulate >1 pre-existing updates before the test's first
+      // create, so the test's hardcoded expectedOrdinal=N drifts. We only verify
+      // monotonic progress (receivedOrdinal >= expectedOrdinal) — name/fraction
+      // checks already confirm the latest update landed.
+      const ordinalOk = expectedOrdinal === 0 ? true : receivedOrdinal >= expectedOrdinal;
 
-    if (fractionOk && nameOk && ordinalOk) {
-      return;
-    }
-
-    if (attempt < maxAttempts) {
+      if (fractionOk && nameOk && ordinalOk) {
+        return lastReceived;
+      }
       const reasons = [];
       if (!nameOk) reasons.push(`name=${receivedName} expected=${expectedName}`);
       if (!fractionOk) reasons.push(`fraction=${receivedRewardFraction} expected=${expectedRewardFraction}`);
-      if (!ordinalOk) reasons.push(`ordinal=${receivedOrdinal} expected=${expectedOrdinal}`);
-      logWorkflow.info(`Waiting for node-params/${nodeId} to update (attempt ${attempt}/${maxAttempts}): ${reasons.join(', ')}`)
-      continue;
+      if (!ordinalOk) reasons.push(`ordinal=${receivedOrdinal} expected>=${expectedOrdinal}`);
+      throw new Error(`node-params not yet at expected state: ${reasons.join(', ')}`);
     }
-
-    if (!fractionOk)
-      throw new Error(`Node parameters node rewardFraction expected ${expectedRewardFraction} but received ${receivedRewardFraction}`)
-    if (!nameOk)
-      throw new Error(`Node parameters node name expected ${expectedName} but received ${receivedName}`)
-    // Monotonic-only check: receivedOrdinal must be >= expectedOrdinal (see
-    // comment above on relaxed semantics for Nakamoto/seedlist pre-existing
-    // updates).
-    if (!ordinalOk && expectedOrdinal > 0)
-      throw new Error(`Node parameters ordinal expected >=${expectedOrdinal} but received ${receivedOrdinal}`)
-  }
+  }).catch((err) => {
+    // Reshape the timeout error to match the legacy thrown-error messages so existing
+    // CI failure parsers continue to recognize them.
+    if (err.code === 'EVENT_WAIT_TIMEOUT' && lastReceived) {
+      const { receivedRewardFraction, receivedName, receivedOrdinal } = lastReceived;
+      if (receivedRewardFraction !== expectedRewardFraction)
+        throw new Error(`Node parameters node rewardFraction expected ${expectedRewardFraction} but received ${receivedRewardFraction}`);
+      if (receivedName !== expectedName)
+        throw new Error(`Node parameters node name expected ${expectedName} but received ${receivedName}`);
+      if (expectedOrdinal > 0 && receivedOrdinal < expectedOrdinal)
+        throw new Error(`Node parameters ordinal expected >=${expectedOrdinal} but received ${receivedOrdinal}`);
+    }
+    throw err;
+  });
 }
 
 

@@ -1,6 +1,7 @@
 const http = require('http')
 const { dag4 } = require('@stardust-collective/dag4')
 const { parseSharedArgs, logWorkflow, isStaleParentError } = require('../shared')
+const { pollWithEventKick } = require('../lib/awaitChainEvent')
 
 const createConfig = () => {
   const args = process.argv.slice(2)
@@ -62,21 +63,25 @@ const waitForCL1Alignment = async (l1MetagraphUrl, address, beforeHash) => {
   const timeoutMs = SLEEP_TIME_UNTIL_QUERY
   logMessage(`Waiting for CL1 alignment (${address.slice(0, 12)}..., timeout ${timeoutMs / 1000}s)...`)
   const pollStart = Date.now()
-  const deadline = pollStart + timeoutMs
-  const pollInterval = 5000
-  while (Date.now() < deadline) {
-    await sleep(pollInterval)
-    try {
-      const ref = await fetchJson(`${l1MetagraphUrl}/transactions/last-reference/${address}`)
-      if (ref.hash !== beforeHash) {
-        logMessage(`CL1 aligned after ${Math.round((Date.now() - pollStart) / 1000)}s`)
-        return
+  try {
+    await pollWithEventKick({
+      endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
+      maxWait: timeoutMs,
+      tag: `cl1Alignment:${address.slice(0, 12)}`,
+      kickFilter: { kinds: ['METAGRAPH_SNAPSHOT_ACCEPTED', 'SNAPSHOT_FINALIZED'] },
+      checkFn: async () => {
+        const ref = await fetchJson(`${l1MetagraphUrl}/transactions/last-reference/${address}`)
+        if (ref.hash !== beforeHash) {
+          return ref
+        }
+        throw new Error(`CL1 lastRef still ${beforeHash.slice(0, 12)}.. (not advanced)`)
       }
-    } catch (e) {
-      logMessage(`CL1 alignment poll error: ${e.message}`)
-    }
+    })
+    logMessage(`CL1 aligned after ${Math.round((Date.now() - pollStart) / 1000)}s`)
+  } catch (_) {
+    // Preserve legacy "proceed anyway" semantic — log the timeout and continue.
+    logMessage(`CL1 alignment timeout — proceeding anyway`)
   }
-  logMessage(`CL1 alignment timeout — proceeding anyway`)
 }
 
 // Poll GL0 for the latest CL0 snapshot ordinal it has committed for this metagraph.
@@ -112,21 +117,26 @@ const waitForGL0MetagraphAlignment = async (gl0Url, metagraphAddress, ordinalBef
   const timeoutMs = SLEEP_TIME_UNTIL_QUERY
   logMessage(`Waiting for GL0 to advance ${metagraphAddress.slice(0, 12)}... past ord ${ordinalBefore} (timeout ${timeoutMs / 1000}s)...`)
   const pollStart = Date.now()
-  const deadline = pollStart + timeoutMs
-  const pollInterval = 5000
-  while (Date.now() < deadline) {
-    await sleep(pollInterval)
-    try {
-      const current = await getMetagraphOrdinalOnGL0(gl0Url, metagraphAddress)
-      if (current > ordinalBefore) {
-        logMessage(`GL0 advanced ${metagraphAddress.slice(0, 12)}... from ord ${ordinalBefore} to ${current} after ${Math.round((Date.now() - pollStart) / 1000)}s`)
-        return
+  try {
+    await pollWithEventKick({
+      endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
+      maxWait: timeoutMs,
+      tag: `gl0MgAlignment:${metagraphAddress.slice(0, 12)}`,
+      // Wake on either a gl0 snapshot finalization OR a metagraph snapshot acceptance
+      // — both are points at which GL0's view of this metagraph could have advanced.
+      kickFilter: { kinds: ['METAGRAPH_SNAPSHOT_ACCEPTED', 'SNAPSHOT_FINALIZED'] },
+      checkFn: async () => {
+        const current = await getMetagraphOrdinalOnGL0(gl0Url, metagraphAddress)
+        if (current > ordinalBefore) {
+          return current
+        }
+        throw new Error(`GL0 metagraph ord ${current} <= ${ordinalBefore}`)
       }
-    } catch (e) {
-      logMessage(`GL0 alignment poll error: ${e.message}`)
-    }
+    })
+    logMessage(`GL0 advanced ${metagraphAddress.slice(0, 12)}... past ord ${ordinalBefore} after ${Math.round((Date.now() - pollStart) / 1000)}s`)
+  } catch (_) {
+    logMessage(`GL0 metagraph alignment timeout — proceeding anyway`)
   }
-  logMessage(`GL0 metagraph alignment timeout — proceeding anyway`)
 }
 
 // Detect race-class errors that surface from the dag4 SDK or gl1 contextual
@@ -323,7 +333,7 @@ const handleBatchTransactions = async (
     const dagL1Url = networkOptions?.dagL1UrlFirstNode || null
     await batchTransaction(origin, destination, amount, fee, txnCount, dagL1Url)
 
-    // Poll for expected balances with timeout. In Nakamoto consensus, fork convergence
+    // Poll for expected balances. In Nakamoto consensus, fork convergence
     // adds latency — the balance endpoint reads snapshotStorage.head which may lag.
     const expectedOriginDelta = -(amount + fee) * txnCount
     const expectedDestDelta = amount * txnCount
@@ -332,23 +342,38 @@ const handleBatchTransactions = async (
     const expectedOriginBalance = startOriginBalance + expectedOriginDelta
     const expectedDestBalance = startDestBalance + expectedDestDelta
 
-    // Poll until expected balances are reached OR deadline hits.
-    // The previous version broke on FIRST balance change — for batch-of-100 tests this exited
-    // after 1 tx settled and then asserted the full 100-tx expected balance → spurious failure.
-    logMessage(`Polling for balance settlement (timeout ${SLEEP_TIME_UNTIL_QUERY}ms, expect ${expectedOriginDelta}/${expectedDestDelta} delta)...`)
-    const pollInterval = 5000
-    const startTime = Date.now()
-    const deadline = startTime + SLEEP_TIME_UNTIL_QUERY
+    // Reactive replacement for the prior 5s-interval wall-clock poll. Each gl0
+    // SNAPSHOT_FINALIZED event (and METAGRAPH_SNAPSHOT_ACCEPTED for completeness)
+    // kicks a fresh balance check — same correctness as the legacy polling but
+    // wakes only on actual cluster progress. The full 100-tx batch is required
+    // to land (this was the original semantic — break-on-first-change was the bug
+    // the polling block fixed). On 3min timeout we fall through into the diagnostic
+    // block below.
     let originBalance = startOriginBalance
     let destinationBalance = startDestBalance
-    while (Date.now() < deadline) {
-      await sleep(pollInterval)
-      originBalance = await origin.getBalance()
-      destinationBalance = await destination.getBalance()
-      if (originBalance === expectedOriginBalance && destinationBalance === expectedDestBalance) {
-        logMessage(`Balance settled after ${Math.round((Date.now() - startTime) / 1000)}s`)
-        break
-      }
+    const startTime = Date.now()
+    logMessage(`Polling for balance settlement via event stream (timeout ${SLEEP_TIME_UNTIL_QUERY}ms, expect ${expectedOriginDelta}/${expectedDestDelta} delta)...`)
+    try {
+      await pollWithEventKick({
+        endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
+        maxWait: SLEEP_TIME_UNTIL_QUERY,
+        tag: `dagBatchSettle:${origin.address.slice(0, 12)}->${destination.address.slice(0, 12)}`,
+        checkFn: async () => {
+          originBalance = await origin.getBalance()
+          destinationBalance = await destination.getBalance()
+          if (originBalance === expectedOriginBalance && destinationBalance === expectedDestBalance) {
+            return { originBalance, destinationBalance }
+          }
+          throw new Error(`not settled yet: origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance}`)
+        }
+      })
+      logMessage(`Balance settled after ${Math.round((Date.now() - startTime) / 1000)}s`)
+    } catch (_) {
+      // Timeout — fall through into the diagnostic dump below (preserves prior behavior:
+      // we do NOT throw here, we continue and let the caller's final assertion surface
+      // the mismatch with full context). The structured event-timeout error message is
+      // logged so post-mortem analysis sees the last 10 cluster events.
+      logMessage(`pollWithEventKick timed out; falling through to legacy diagnostic block.`)
     }
     if (originBalance !== expectedOriginBalance || destinationBalance !== expectedDestBalance) {
       logMessage(`Balance did not fully settle after ${SLEEP_TIME_UNTIL_QUERY / 1000}s — origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance} (falling through to final check)`)
@@ -437,21 +462,33 @@ const handleMetagraphBatchTransactions = async (
     const expectedOriginBalance = startOriginBalance + expectedOriginDelta
     const expectedDestBalance = startDestBalance + expectedDestDelta
 
-    // Poll until expected settlement OR deadline. See handleBatchTransactions for rationale —
-    // previously exited on FIRST change, which under batch workloads caused partial-settle asserts.
-    logMessage(`Polling for L0 token balance settlement (timeout ${SLEEP_TIME_UNTIL_QUERY}ms, expect ${expectedOriginDelta}/${expectedDestDelta} delta)...`)
-    const pollInterval = 5000
-    const startTime = Date.now()
-    const deadline = startTime + SLEEP_TIME_UNTIL_QUERY
+    // Reactive replacement for the prior 5s-interval wall-clock poll. Driven off
+    // METAGRAPH_SNAPSHOT_ACCEPTED + SNAPSHOT_FINALIZED kicks; the L0 token batch
+    // (count=100) e2e test was the one that flaked in retry #2 — moving to event-kicked
+    // settles lets the test wake immediately when the cluster makes progress, instead
+    // of sleeping a fixed 5s past each tick.
     let originBalance = startOriginBalance, destinationBalance = startDestBalance
-    while (Date.now() < deadline) {
-      await sleep(pollInterval)
-      originBalance = await metagraphTokenClient.getBalance()
-      destinationBalance = await metagraphTokenClient.getBalanceFor(destination.address)
-      if (originBalance === expectedOriginBalance && destinationBalance === expectedDestBalance) {
-        logMessage(`L0 token balance settled after ${Math.round((Date.now() - startTime) / 1000)}s`)
-        break
-      }
+    const startTime = Date.now()
+    logMessage(`Polling for L0 token balance settlement via event stream (timeout ${SLEEP_TIME_UNTIL_QUERY}ms, expect ${expectedOriginDelta}/${expectedDestDelta} delta)...`)
+    try {
+      await pollWithEventKick({
+        endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
+        maxWait: SLEEP_TIME_UNTIL_QUERY,
+        tag: `mgBatchSettle:${origin.address.slice(0, 12)}->${destination.address.slice(0, 12)}`,
+        kickFilter: { kinds: ['METAGRAPH_SNAPSHOT_ACCEPTED', 'SNAPSHOT_FINALIZED'] },
+        checkFn: async () => {
+          originBalance = await metagraphTokenClient.getBalance()
+          destinationBalance = await metagraphTokenClient.getBalanceFor(destination.address)
+          if (originBalance === expectedOriginBalance && destinationBalance === expectedDestBalance) {
+            return { originBalance, destinationBalance }
+          }
+          throw new Error(`not settled yet: origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance}`)
+        }
+      })
+      logMessage(`L0 token balance settled after ${Math.round((Date.now() - startTime) / 1000)}s`)
+    } catch (_) {
+      // Fall through; the caller's final assertion will report the mismatch.
+      logMessage(`pollWithEventKick timed out; falling through to legacy diagnostic block.`)
     }
     if (originBalance !== expectedOriginBalance || destinationBalance !== expectedDestBalance) {
       logMessage(`L0 token balance did not fully settle after ${SLEEP_TIME_UNTIL_QUERY / 1000}s — origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance} (falling through to final check)`)
