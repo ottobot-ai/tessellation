@@ -19,8 +19,7 @@ import weaver.MutableIOSuite
   *   - Filter matching narrows correctly by kind + by address + by ordinal range
   *   - Slow-consumer backpressure does not block the publisher
   *
-  * Uses gRPC's `InProcessTransport` to avoid binding a real port — tests are deterministic and don't
-  * leak listen sockets across the suite.
+  * Uses gRPC's `InProcessTransport` to avoid binding a real port — tests are deterministic and don't leak listen sockets across the suite.
   */
 object LocalEventsServiceSuite extends MutableIOSuite {
 
@@ -30,9 +29,9 @@ object LocalEventsServiceSuite extends MutableIOSuite {
   private val maxQueued: PosInt = PosInt.unsafeFrom(64)
   private val publisherBuf: PosInt = PosInt.unsafeFrom(256)
 
-  /** Build the service + a real gRPC server on an ephemeral localhost port + a client stub. The
-    * production wiring uses `ServerBuilder.forPort(...)`; we mirror that with `port = 0` so the JVM
-    * picks a free port. Server + channel are released on `Resource.release`.
+  /** Build the service + a real gRPC server on an ephemeral localhost port + a client stub. The production wiring uses
+    * `ServerBuilder.forPort(...)`; we mirror that with `port = 0` so the JVM picks a free port. Server + channel are released on
+    * `Resource.release`.
     */
   private def fixture(
     finalizedOrd: SnapshotOrdinal = SnapshotOrdinal.unsafeApply(42L)
@@ -186,8 +185,7 @@ object LocalEventsServiceSuite extends MutableIOSuite {
             )
           )
           delivered <- IO.blocking(iter.next())
-        } yield
-          expect(delivered.event.balanceChange.exists(_.address == "DAGwanted"))
+        } yield expect(delivered.event.balanceChange.exists(_.address == "DAGwanted"))
     }
   }
 
@@ -197,9 +195,7 @@ object LocalEventsServiceSuite extends MutableIOSuite {
     fixture().use {
       case (svc, _, _) =>
         val ord = SnapshotOrdinal.unsafeApply(1L)
-        val many = (1 to 200).toList.map(i =>
-          BalanceChange(address = s"DAG$i", oldBalance = 0L, newBalance = i.toLong, cause = "burst")
-        )
+        val many = (1 to 200).toList.map(i => BalanceChange(address = s"DAG$i", oldBalance = 0L, newBalance = i.toLong, cause = "burst"))
         // No subscriber attached — publisher fans out to nothing. Calls must return quickly.
         // (If publishX blocked, this test would hang past the suite-wide timeout.)
         svc.publisher.publishBalanceChanges(ord, many).timeout(5.seconds).as(success)

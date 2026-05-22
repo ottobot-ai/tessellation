@@ -26,10 +26,10 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * Wire shape (per the design's Section 4 + the Q3 user override):
   *
   *   1. Every Subscribe call returns a stream whose FIRST envelope is a `StreamStarted` carrying the current finalized ordinal. Lets the
-  *      client REST-fetch `/snapshots/at-ordinal/N` for bootstrap state without missing deltas in the gap.
-  *   2. After that, the stream emits real events filtered by `SubscribeRequest.filters`. Empty filter list = receive everything.
-  *   3. The publisher assigns each envelope a monotone `seq` via `seqRef`; clients see gaps when the subscriber's per-subscriber queue
-  *      drops on slow consumption (`Topic.subscribe(maxQueued)` semantics — see §7 of the design).
+  *      client REST-fetch `/snapshots/at-ordinal/N` for bootstrap state without missing deltas in the gap. 2. After that, the stream emits
+  *      real events filtered by `SubscribeRequest.filters`. Empty filter list = receive everything. 3. The publisher assigns each envelope
+  *      a monotone `seq` via `seqRef`; clients see gaps when the subscriber's per-subscriber queue drops on slow consumption
+  *      (`Topic.subscribe(maxQueued)` semantics — see §7 of the design).
   *
   * Notes:
   *   - This service is in-process; we use `Dispatcher` to bridge `F[_]` effects into gRPC's `StreamObserver` callbacks.
@@ -57,8 +57,8 @@ object LocalEventsService {
   /** Construct the LocalEvents server-side machinery.
     *
     * @param finalizedOrdinalRef
-    *   read at subscribe time to populate `StreamStarted.start_ordinal`. Production wiring threads
-    *   `nakamotoFinalizedOrdinalRef` from `GlobalSnapshotConsensus.make`.
+    *   read at subscribe time to populate `StreamStarted.start_ordinal`. Production wiring threads `nakamotoFinalizedOrdinalRef` from
+    *   `GlobalSnapshotConsensus.make`.
     * @param epochProgressRef
     *   read at subscribe time to populate `StreamStarted.epoch_progress`. Caller can pass a noop Ref(0) for tests.
     * @param maxQueuedPerSubscriber
@@ -155,33 +155,25 @@ object LocalEventsService {
         ordinal: SnapshotOrdinal,
         changes: List[io.constellationnetwork.node.shared.infrastructure.local_events.proto.local_events.BalanceChange]
       ): F[Unit] =
-        changes.traverse_(c =>
-          nextEnvelope(ordinal, EventEnvelope.Event.BalanceChange(c)).flatMap(publishOne)
-        )
+        changes.traverse_(c => nextEnvelope(ordinal, EventEnvelope.Event.BalanceChange(c)).flatMap(publishOne))
 
       def publishTokenLockChanges(
         ordinal: SnapshotOrdinal,
         changes: List[io.constellationnetwork.node.shared.infrastructure.local_events.proto.local_events.TokenLockStateChange]
       ): F[Unit] =
-        changes.traverse_(c =>
-          nextEnvelope(ordinal, EventEnvelope.Event.TokenLockStateChange(c)).flatMap(publishOne)
-        )
+        changes.traverse_(c => nextEnvelope(ordinal, EventEnvelope.Event.TokenLockStateChange(c)).flatMap(publishOne))
 
       def publishAllowSpendChanges(
         ordinal: SnapshotOrdinal,
         changes: List[io.constellationnetwork.node.shared.infrastructure.local_events.proto.local_events.AllowSpendStateChange]
       ): F[Unit] =
-        changes.traverse_(c =>
-          nextEnvelope(ordinal, EventEnvelope.Event.AllowSpendStateChange(c)).flatMap(publishOne)
-        )
+        changes.traverse_(c => nextEnvelope(ordinal, EventEnvelope.Event.AllowSpendStateChange(c)).flatMap(publishOne))
 
       def publishTransactionsAccepted(
         ordinal: SnapshotOrdinal,
         txs: List[io.constellationnetwork.node.shared.infrastructure.local_events.proto.local_events.TransactionAccepted]
       ): F[Unit] =
-        txs.traverse_(t =>
-          nextEnvelope(ordinal, EventEnvelope.Event.TransactionAccepted(t)).flatMap(publishOne)
-        )
+        txs.traverse_(t => nextEnvelope(ordinal, EventEnvelope.Event.TransactionAccepted(t)).flatMap(publishOne))
 
       def publishMetagraphEvents(
         ordinal: SnapshotOrdinal,
@@ -192,12 +184,8 @@ object LocalEventsService {
           io.constellationnetwork.node.shared.infrastructure.local_events.proto.local_events.MetagraphBalanceChange
         ]
       ): F[Unit] =
-        snapshots.traverse_(s =>
-          nextEnvelope(ordinal, EventEnvelope.Event.MetagraphSnapshotAccepted(s)).flatMap(publishOne)
-        ) >>
-          balances.traverse_(b =>
-            nextEnvelope(ordinal, EventEnvelope.Event.MetagraphBalanceChange(b)).flatMap(publishOne)
-          )
+        snapshots.traverse_(s => nextEnvelope(ordinal, EventEnvelope.Event.MetagraphSnapshotAccepted(s)).flatMap(publishOne)) >>
+          balances.traverse_(b => nextEnvelope(ordinal, EventEnvelope.Event.MetagraphBalanceChange(b)).flatMap(publishOne))
     }
   }
 
@@ -226,12 +214,12 @@ object LocalEventsService {
   /** Returns the address fields visible on this envelope (used by filter matching). Returns Nil for events that don't carry addresses.
     */
   private[local_events] def addressesOf(env: EventEnvelope): List[String] = env.event match {
-    case EventEnvelope.Event.BalanceChange(c)             => List(c.address)
-    case EventEnvelope.Event.TokenLockStateChange(c)      => List(c.address)
-    case EventEnvelope.Event.AllowSpendStateChange(c)     => List(c.address)
-    case EventEnvelope.Event.TransactionAccepted(c)       => List(c.source, c.destination)
-    case EventEnvelope.Event.MetagraphBalanceChange(c)    => List(c.address)
-    case _                                                => Nil
+    case EventEnvelope.Event.BalanceChange(c)          => List(c.address)
+    case EventEnvelope.Event.TokenLockStateChange(c)   => List(c.address)
+    case EventEnvelope.Event.AllowSpendStateChange(c)  => List(c.address)
+    case EventEnvelope.Event.TransactionAccepted(c)    => List(c.source, c.destination)
+    case EventEnvelope.Event.MetagraphBalanceChange(c) => List(c.address)
+    case _                                             => Nil
   }
 
   /** Returns the metagraph addresses visible on this envelope. */
@@ -328,19 +316,20 @@ object LocalEventsService {
             epoch <- epochProgressRef.get
             seq <- seqRef.updateAndGet(_ + 1L)
             _ <- logger.info(s"LocalEvents subscribe: tag=$clientTag startOrdinal=${finalizedOrd.value.value} sessionId=$sessionId")
-          } yield EventEnvelope(
-            wireVersion = 1,
-            seq = seq,
-            publishedAtMillis = System.currentTimeMillis(),
-            ordinal = finalizedOrd.value.value,
-            event = EventEnvelope.Event.StreamStarted(
-              StreamStarted(
-                startOrdinal = finalizedOrd.value.value,
-                epochProgress = epoch,
-                serverSessionId = sessionId
+          } yield
+            EventEnvelope(
+              wireVersion = 1,
+              seq = seq,
+              publishedAtMillis = System.currentTimeMillis(),
+              ordinal = finalizedOrd.value.value,
+              event = EventEnvelope.Event.StreamStarted(
+                StreamStarted(
+                  startOrdinal = finalizedOrd.value.value,
+                  epochProgress = epoch,
+                  serverSessionId = sessionId
+                )
               )
             )
-          )
 
         // Poll the cancelled flag periodically as a Stream-of-Boolean for `interruptWhen`. Cheap:
         // a 200ms tick is well under the wire round-trip; clients see at most ~one extra envelope
@@ -402,21 +391,22 @@ object LocalEventsService {
         seq <- seqRef.get
         dropped <- droppedRef.get
         subs <- subscriberCountRef.get
-      } yield HealthResponse(
-        healthy = true,
-        subscriberCount = subs,
-        lastPublishedSeq = seq,
-        droppedToSlowSubscribersTotal = dropped
-      )
+      } yield
+        HealthResponse(
+          healthy = true,
+          subscriberCount = subs,
+          lastPublishedSeq = seq,
+          droppedToSlowSubscribersTotal = dropped
+        )
       dispatcher.unsafeToFuture(effect)
     }
   }
 
   // ─── Server lifecycle ───────────────────────────────────────────────
 
-  /** Starts an `io.grpc.Server` bound to `bindAddress:port` and serving the LocalEvents service. Mirrors the existing
-    * `ChainSyncInbound` lifecycle at `GlobalSnapshotConsensus.scala:1220-1240`: graceful `shutdown()` + `awaitTermination(grace)` on
-    * `Resource.release`, errors during teardown are swallowed (a hung subscriber must not block app shutdown).
+  /** Starts an `io.grpc.Server` bound to `bindAddress:port` and serving the LocalEvents service. Mirrors the existing `ChainSyncInbound`
+    * lifecycle at `GlobalSnapshotConsensus.scala:1220-1240`: graceful `shutdown()` + `awaitTermination(grace)` on `Resource.release`,
+    * errors during teardown are swallowed (a hung subscriber must not block app shutdown).
     */
   def serverResource[F[_]: Async](
     service: Service[F],
@@ -436,12 +426,11 @@ object LocalEventsService {
         srv
       } <* logger.info(s"LocalEventsService gRPC server started on $bindAddress:$port")
     )(srv =>
-      Async[F]
-        .blocking {
-          srv.shutdown()
-          srv.awaitTermination(shutdownGraceSeconds.toLong, java.util.concurrent.TimeUnit.SECONDS)
-          ()
-        }
+      Async[F].blocking {
+        srv.shutdown()
+        srv.awaitTermination(shutdownGraceSeconds.toLong, java.util.concurrent.TimeUnit.SECONDS)
+        ()
+      }
         .handleError(_ => ()) >>
         logger.info("LocalEventsService gRPC server stopped").handleError(_ => ())
     )

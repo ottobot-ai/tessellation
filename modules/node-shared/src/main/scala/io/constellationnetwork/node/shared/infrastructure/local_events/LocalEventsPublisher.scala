@@ -12,10 +12,10 @@ import io.constellationnetwork.schema.SnapshotOrdinal
   *
   *   - All methods are `F[Unit]` — emission never blocks consensus. Slow-subscriber pruning is the gRPC server's responsibility, not the
   *     publisher's.
-  *   - All methods are idempotent at the wire level: re-emitting an event after a crash recovery is safe (subscribers see a duplicate
-  *     `seq` from the previous session, fixed by the per-session reset).
-  *   - Group methods (e.g. `publishBalanceChanges`) take a `List` so callers can batch the per-ordinal diff into a single allocation;
-  *     the publisher writes one envelope per element to the topic.
+  *   - All methods are idempotent at the wire level: re-emitting an event after a crash recovery is safe (subscribers see a duplicate `seq`
+  *     from the previous session, fixed by the per-session reset).
+  *   - Group methods (e.g. `publishBalanceChanges`) take a `List` so callers can batch the per-ordinal diff into a single allocation; the
+  *     publisher writes one envelope per element to the topic.
   */
 trait LocalEventsPublisher[F[_]] {
 
@@ -24,8 +24,8 @@ trait LocalEventsPublisher[F[_]] {
     */
   def publishSnapshotFinalized(ordinal: SnapshotOrdinal, event: SnapshotFinalized): F[Unit]
 
-  /** Publish a batch of balance diffs derived inside GSAM's `accept()`. The `cause` field is best-effort; callers can pass a free-form
-    * tag (`"block"`, `"reward"`, `"tokenlock"`, etc.) — receivers ignore values they don't recognize.
+  /** Publish a batch of balance diffs derived inside GSAM's `accept()`. The `cause` field is best-effort; callers can pass a free-form tag
+    * (`"block"`, `"reward"`, `"tokenlock"`, etc.) — receivers ignore values they don't recognize.
     */
   def publishBalanceChanges(ordinal: SnapshotOrdinal, changes: List[BalanceChange]): F[Unit]
 
@@ -43,8 +43,7 @@ trait LocalEventsPublisher[F[_]] {
   def publishTransactionsAccepted(ordinal: SnapshotOrdinal, txs: List[TransactionAccepted]): F[Unit]
 
   /** Publish metagraph-snapshot acceptance events (one per `(metagraph, snapshot)` rolled into this gl0 ordinal) and any DAG-side balance
-    * changes derived from the same processor output. Two lists in one call so the publisher emits both as a single GSAM-side
-    * write-through.
+    * changes derived from the same processor output. Two lists in one call so the publisher emits both as a single GSAM-side write-through.
     */
   def publishMetagraphEvents(
     ordinal: SnapshotOrdinal,
@@ -55,8 +54,8 @@ trait LocalEventsPublisher[F[_]] {
 
 object LocalEventsPublisher {
 
-  /** No-op publisher. Wired into currency-l0 and any GSAM-construction site that doesn't run the LocalEvents server (cl0, tests).
-    * Doesn't allocate per call — `().pure[F]` is the only effect.
+  /** No-op publisher. Wired into currency-l0 and any GSAM-construction site that doesn't run the LocalEvents server (cl0, tests). Doesn't
+    * allocate per call — `().pure[F]` is the only effect.
     */
   def noop[F[_]: Applicative]: LocalEventsPublisher[F] =
     new LocalEventsPublisher[F] {
