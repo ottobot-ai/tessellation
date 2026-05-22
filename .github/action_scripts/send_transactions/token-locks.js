@@ -15,6 +15,7 @@ const {
     SerializerType,
     createSerializer
 } = require('../shared');
+const { pollWithEventKick } = require('../lib/awaitChainEvent');
 
 const CONSTANTS = {
     ...sharedConstants,
@@ -289,46 +290,46 @@ const createDataUpdateTransactionHandler = (urls) => {
 
 const verifyTokenLockExpiration = async (address, hash, initialBalance, urls, unlockEpoch) => {
     const l0Url = urls.currencyL0Url;
+    const snapshotUrl = `${l0Url}/snapshots/latest/combined`;
 
-    await withRetry(
-        async () => {
+    // Replaces the previous two-stage wall-clock polling (interval = 10s × 600 attempts
+    // each) with a SINGLE reactive subscription to gl0's LocalEvents stream. Each
+    // gl0 snapshot finalization OR metagraph snapshot acceptance kicks our REST check;
+    // the structured timeout fires at 30min (well past observed worst-case) with a
+    // diagnostic dump of the last 10 cluster events.
+    //
+    // The combined check rolled into one pollWithEventKick:
+    //   (a) epoch progress on currency L0 has advanced past unlockEpoch
+    //   (b) the lock has been evicted from activeTokenLocks (or is no longer matchable)
+    //   (c) the source balance has been reverted to `initialBalance`
+    //
+    // The original code asserted (c) at the end as a non-retried failure; we KEEP that
+    // semantic by failing the predicate at (c)-success rather than retry, so a balance
+    // mismatch surfaces as the structured event-timeout error if the cluster never
+    // reaches the expected state in 30min.
+    let lastReason = null;
+    const snapshot = await pollWithEventKick({
+        endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
+        maxWait: '30min',
+        tag: `tokenLockExpiration:${address.slice(0, 12)}`,
+        checkFn: async () => {
             const currentEpochProgress = await getEpochProgress(l0Url, true);
             if (currentEpochProgress <= unlockEpoch) {
-                throw new Error(
-                    `Current epoch progress (${currentEpochProgress}) has not passed unlockEpoch (${unlockEpoch})`
-                );
+                lastReason = `Current epoch progress (${currentEpochProgress}) has not passed unlockEpoch (${unlockEpoch})`;
+                throw new Error(lastReason);
             }
-            console.log(`Epoch progress advanced past ${unlockEpoch}`);
-        },
-        {
-            name: `Currency epoch progress advancement`,
-            interval: CONSTANTS.EXPIRATION_VERIFICATION_INTERVAL_MS
-        }
-    );
-
-    const snapshotUrl = `${l0Url}/snapshots/latest/combined`
-
-    // The epoch just crossed unlockEpoch. CL0 still needs to produce at least
-    // one snapshot whose acceptance phase evicts the now-expired token lock
-    // from activeTokenLocks. Retry until we see the eviction (or timeout).
-    // Without this retry the check races CL0 snapshot production and flakes.
-    const snapshot = await withRetry(
-        async () => {
             const snap = await getCombinedSnapshot(snapshotUrl);
             const activeTokenLocks = snap[1]?.activeTokenLocks?.[address];
             if (activeTokenLocks && activeTokenLocks.length > 0) {
                 const hasMatchingHash = await findMatchingHash(activeTokenLocks, hash);
                 if (hasMatchingHash) {
-                    throw new Error('Token lock still active after expiration');
+                    lastReason = 'Token lock still active after expiration';
+                    throw new Error(lastReason);
                 }
             }
             return snap;
-        },
-        {
-            name: 'Token lock expiration eviction',
-            interval: CONSTANTS.EXPIRATION_VERIFICATION_INTERVAL_MS
         }
-    );
+    });
 
     const currentBalance = snapshot[1]?.balances?.[address] || 0;
     const expectedBalance = initialBalance;
@@ -344,30 +345,27 @@ const verifyTokenLockExpiration = async (address, hash, initialBalance, urls, un
 
 const verifyTriggerTokenUnlock = async (address, initialBalance, urls) => {
     const l0Url = urls.currencyL0Url;
+    const snapshotUrl = `${l0Url}/snapshots/latest/combined`;
 
-    await withRetry(
-        async () => {
-            const snapshotUrl = `${l0Url}/snapshots/latest/combined`
-
-            const snapshot = await getCombinedSnapshot(snapshotUrl);
-            const activeTokenLocks = snapshot[1]?.activeTokenLocks?.[address]
-
+    // Replaces the previous wall-clock-only `withRetry` (600 attempts × 10s = 100 min)
+    // with reactive event-kicked polling. We still hit the metagraph's REST endpoint
+    // for the source of truth (gl0 emits TOKEN_LOCK_STATE_CHANGE only for GLOBAL
+    // token-locks; this test uses a CURRENCY token-lock, so we drive the check off
+    // gl0's snapshot/metagraph-snapshot kicks).
+    const snapshot = await pollWithEventKick({
+        endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
+        maxWait: '30min',
+        tag: `tokenUnlockTrigger:${address.slice(0, 12)}`,
+        checkFn: async () => {
+            const snap = await getCombinedSnapshot(snapshotUrl);
+            const activeTokenLocks = snap[1]?.activeTokenLocks?.[address];
             if (activeTokenLocks && Object.keys(activeTokenLocks).length > 0) {
-                throw new Error(
-                    `TokenLock still active`
-                );
+                throw new Error(`TokenLock still active`);
             }
-            console.log(`TokenLock not active anymore`);
-        },
-        {
-            name: `Check manual token unlock`,
-            interval: CONSTANTS.EXPIRATION_VERIFICATION_INTERVAL_MS
+            return snap;
         }
-    );
+    });
 
-    const snapshotUrl = `${l0Url}/snapshots/latest/combined`
-
-    const snapshot = await getCombinedSnapshot(snapshotUrl);
     const currentBalance = snapshot[1]?.balances?.[address] || 0;
     const expectedBalance = initialBalance;
 
