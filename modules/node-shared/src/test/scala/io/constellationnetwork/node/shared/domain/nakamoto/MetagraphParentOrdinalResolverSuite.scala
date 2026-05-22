@@ -47,9 +47,9 @@ import weaver.MutableIOSuite
   *      cross-resolve (history walk keyed on `(mg, hash)`).
   *
   * The resolver's fast path uses three reader accessors (`getLastStateChannelSnapshotHash`, `getLastIncrementalCurrencySnapshot`,
-  * `getLastCurrencySnapshot`) — all reduce to `reader.get[V](GlobalStateKey)`. The tests use a `StubReader` that holds a `Map[GlobalStateKey,
-  * Any]` and returns matches against pure type-tags carried by the test fixtures. This avoids depending on the full `MptStore` codec
-  * machinery while exercising the same surface the production code reads.
+  * `getLastCurrencySnapshot`) — all reduce to `reader.get[V](GlobalStateKey)`. The tests use a `StubReader` that holds a
+  * `Map[GlobalStateKey, Any]` and returns matches against pure type-tags carried by the test fixtures. This avoids depending on the full
+  * `MptStore` codec machinery while exercising the same surface the production code reads.
   */
 object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
 
@@ -103,7 +103,8 @@ object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
     Signed(inc, testProofs)
   }
 
-  /** Build a minimal `Signed[CurrencySnapshot]` (the Left side, genesis-only window). Resolver consumes only `.value.ordinal.value.value`. */
+  /** Build a minimal `Signed[CurrencySnapshot]` (the Left side, genesis-only window). Resolver consumes only `.value.ordinal.value.value`.
+    */
   private def mkSignedGenesisSnapshot(ord: Long): Signed[CurrencySnapshot] = {
     val genesis = CurrencySnapshot(
       ordinal = SnapshotOrdinal(NonNegLong.unsafeFrom(ord)),
@@ -121,12 +122,12 @@ object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
 
   /** Stub reader that pattern-matches on `GlobalStateKey` and returns canned values from a per-test fixture map.
     *
-    * Why a stub rather than a real `MptStore.fromMptStore`. The resolver consumes `reader.get[Hash]`, `reader.get[Signed[CurrencyIncrementalSnapshot]]`,
-    * and `reader.get[Signed[CurrencySnapshot]]`. Round-tripping the last two through an MPT codec requires the full ImmutableCodec instance
-    * for `Signed[...]` over the snapshot types — heavy lifting irrelevant to the resolver's logic. The stub interprets the
-    * `(metagraphAddress, GlobalStateFieldId)` tuple directly, returning whatever the test fixture stored under it. The price: tests can't
-    * assert codec parity with production (that's covered elsewhere — `GsamWritePathParitySuite`), but the dispatch + None-vs-Some + history
-    * lookup are all faithfully exercised.
+    * Why a stub rather than a real `MptStore.fromMptStore`. The resolver consumes `reader.get[Hash]`,
+    * `reader.get[Signed[CurrencyIncrementalSnapshot]]`, and `reader.get[Signed[CurrencySnapshot]]`. Round-tripping the last two through an
+    * MPT codec requires the full ImmutableCodec instance for `Signed[...]` over the snapshot types — heavy lifting irrelevant to the
+    * resolver's logic. The stub interprets the `(metagraphAddress, GlobalStateFieldId)` tuple directly, returning whatever the test fixture
+    * stored under it. The price: tests can't assert codec parity with production (that's covered elsewhere — `GsamWritePathParitySuite`),
+    * but the dispatch + None-vs-Some + history lookup are all faithfully exercised.
     */
   private final class StubReader(
     entries: Map[(Address, GlobalStateFieldId), Any]
@@ -148,8 +149,9 @@ object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
       // GlobalStateKey is opaque at this layer. The fixture pre-renders every (mg, fid) pair the test uses; missing entries return None.
       keyToTuple.get(key)
 
-    val keyToTuple: Map[GlobalStateKey, (Address, GlobalStateFieldId)] = entries.keys.map { case (addr, fid) =>
-      GlobalStateKey.metagraph(addr, fid) -> (addr, fid)
+    val keyToTuple: Map[GlobalStateKey, (Address, GlobalStateFieldId)] = entries.keys.map {
+      case (addr, fid) =>
+        GlobalStateKey.metagraph(addr, fid) -> (addr, fid)
     }.toMap
   }
 
@@ -189,9 +191,12 @@ object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
       resolved <- MetagraphParentOrdinalResolver.resolve[IO](reader, mgA, tipHash, history)
       historyCalls <- invocations.get
     } yield
-      expect.eql(Some(incrementalOrdinal), resolved) and
-        // Fast path must NOT consult history when tip matches — guards against perf regression.
-        expect.eql(0, historyCalls.length)
+      expect
+        .eql(Some(incrementalOrdinal), resolved)
+        .and(
+          // Fast path must NOT consult history when tip matches — guards against perf regression.
+          expect.eql(0, historyCalls.length)
+        )
   }
 
   test("(2) historical match: parentHash mismatches GSI tip but history walk recovers the ordinal") { _ =>
@@ -208,10 +213,13 @@ object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
       resolved <- MetagraphParentOrdinalResolver.resolve[IO](reader, mgA, pastTip, history)
       historyCalls <- invocations.get
     } yield
-      expect.eql(Some(pastOrdinal), resolved) and
-        expect.eql(1, historyCalls.length) and
-        // Verify the resolver asked history about the RIGHT (mg, hash) tuple — no cross-metagraph leak.
-        expect.eql((mgA, pastTip), historyCalls.head)
+      expect
+        .eql(Some(pastOrdinal), resolved)
+        .and(expect.eql(1, historyCalls.length))
+        .and(
+          // Verify the resolver asked history about the RIGHT (mg, hash) tuple — no cross-metagraph leak.
+          expect.eql((mgA, pastTip), historyCalls.head)
+        )
   }
 
   test("(3) true unknown parent: tip mismatch AND history walk miss → None (fail-closed)") { _ =>
@@ -227,9 +235,12 @@ object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
       resolved <- MetagraphParentOrdinalResolver.resolve[IO](reader, mgA, unknownHash, history)
       historyCalls <- invocations.get
     } yield
-      expect.eql(None, resolved) and
-        // The resolver must HAVE called history (not just fail-closed without trying).
-        expect.eql(1, historyCalls.length)
+      expect
+        .eql(None, resolved)
+        .and(
+          // The resolver must HAVE called history (not just fail-closed without trying).
+          expect.eql(1, historyCalls.length)
+        )
   }
 
   test("(4) eviction survival: gl0 GSI has no entry for the metagraph at all → history walk recovers the ordinal") { _ =>
@@ -241,9 +252,7 @@ object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
       (history, invocations) <- StubHistory.make((mgA, parentHash) -> recoveredOrdinal)
       resolved <- MetagraphParentOrdinalResolver.resolve[IO](reader, mgA, parentHash, history)
       historyCalls <- invocations.get
-    } yield
-      expect.eql(Some(recoveredOrdinal), resolved) and
-        expect.eql(1, historyCalls.length)
+    } yield expect.eql(Some(recoveredOrdinal), resolved).and(expect.eql(1, historyCalls.length))
   }
 
   test("(5) multi-metagraph isolation: mgA binary whose parentHash equals an mgB binary hash → None (no cross-resolve)") { _ =>
@@ -261,10 +270,13 @@ object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
       resolved <- MetagraphParentOrdinalResolver.resolve[IO](readerWithMgA, mgA, mgBBinaryHash, history)
       historyCalls <- invocations.get
     } yield
-      expect.eql(None, resolved) and
-        expect.eql(1, historyCalls.length) and
-        // The resolver MUST have queried with mgA (the caller's metagraph), not mgB.
-        expect.eql((mgA, mgBBinaryHash), historyCalls.head)
+      expect
+        .eql(None, resolved)
+        .and(expect.eql(1, historyCalls.length))
+        .and(
+          // The resolver MUST have queried with mgA (the caller's metagraph), not mgB.
+          expect.eql((mgA, mgBBinaryHash), historyCalls.head)
+        )
   }
 
   // -------------- existing-behaviour preservation --------------
