@@ -443,7 +443,8 @@ object GlobalSnapshotContextFunctions {
       diffOptHash("activeNodeCollaterals", computed.activeNodeCollaterals, claimed.activeNodeCollaterals),
       diffOptHash("nodeCollateralWithdrawals", computed.nodeCollateralWithdrawals, claimed.nodeCollateralWithdrawals),
       diffOptHash("priceState", computed.priceState, claimed.priceState),
-      diffOptHash("lastGlobalSnapshotsWithCurrency", computed.lastGlobalSnapshotsWithCurrency, claimed.lastGlobalSnapshotsWithCurrency)
+      diffOptHash("lastGlobalSnapshotsWithCurrency", computed.lastGlobalSnapshotsWithCurrency, claimed.lastGlobalSnapshotsWithCurrency),
+      diffOptHash("historicalStakeSnapshots", computed.historicalStakeSnapshots, claimed.historicalStakeSnapshots)
     ).flatten
   }
 }
