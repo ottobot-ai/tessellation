@@ -875,6 +875,11 @@ object GlobalSnapshotAcceptanceManager {
             }
 
           // AllowSpendStateChange.CREATED for accepted; .EXPIRED for the hoisted expired set.
+          // TODO(LocalEvents v2): AllowSpendStateChange.CONSUMED is not emitted yet.
+          // Adding it requires hooking into SpendActionValidator / SpendTransactionBalanceManager
+          // where consumption is finalized. Proto reserves CONSUMED = 2 (oneof tag in
+          // AllowSpendStateChange.Transition) so addition is additive. See
+          // docs/nakamoto/LOCAL-EVENTS-SERVICE-DESIGN.md §11.
           val asCreated: F[List[PbAllowSpendStateChange]] =
             acceptedGlobalAllowSpends.traverse { signed =>
               signed.toHashed.map { h =>
