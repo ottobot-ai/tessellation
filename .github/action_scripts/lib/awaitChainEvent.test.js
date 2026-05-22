@@ -16,6 +16,7 @@ const {
   awaitBalanceMatches,
   awaitTransactionAccepted,
   awaitSnapshotOrdinal,
+  pollWithEventKick,
   parseMaxWait,
   resolveEndpoint,
   normalizeEnvelope,
@@ -402,6 +403,58 @@ const main = async () => {
       maxWait: '5s'
     })
     assertEq(e.kind, 'STREAM_STARTED')
+  })
+
+  // ── pollWithEventKick ──
+  await test('pollWithEventKick: succeeds on first immediate check', async () => {
+    let calls = 0
+    const result = await pollWithEventKick({
+      checkFn: async () => { calls++; return { ok: 'first try' } },
+      maxWait: '5s',
+      // Won't actually subscribe because checkImmediately=true and first call succeeds.
+      _eventSource: () => mockEventSource([])
+    })
+    assertEq(result.ok, 'first try')
+    assertEq(calls, 1)
+  })
+
+  await test('pollWithEventKick: re-checks on each kick event until success', async () => {
+    let checkCount = 0
+    const result = await pollWithEventKick({
+      checkFn: async () => {
+        checkCount++
+        if (checkCount < 3) throw new Error(`not ready yet (call ${checkCount})`)
+        return { ord: checkCount }
+      },
+      maxWait: '5s',
+      _eventSource: () => mockEventSource([
+        streamStarted(1),
+        snapshotFinalized(10),
+        snapshotFinalized(11),
+        snapshotFinalized(12),
+        snapshotFinalized(13)
+      ])
+    })
+    assert(checkCount >= 3, `expected at least 3 checks, got ${checkCount}`)
+    assertEq(result.ord, 3)
+  })
+
+  await test('pollWithEventKick: timeout produces structured diagnostic', async () => {
+    let err = null
+    const script = [streamStarted(1)]
+    for (let i = 0; i < 10; i++) script.push(snapshotFinalized(20 + i))
+    const delays = script.map((_, i) => i === 0 ? 1 : 60) // 10*60 = 600ms > 200ms maxWait
+    try {
+      await pollWithEventKick({
+        checkFn: async () => { throw new Error('never ready') },
+        maxWait: '200ms',
+        tag: 'kick-timeout',
+        _eventSource: () => mockEventSource(script, delays)
+      })
+    } catch (e) { err = e }
+    assert(err, 'expected throw')
+    assertEq(err.code, 'EVENT_WAIT_TIMEOUT')
+    assertEq(err.tag, 'kick-timeout')
   })
 
   // ── Summary ──

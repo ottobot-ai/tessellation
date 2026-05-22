@@ -491,12 +491,126 @@ const awaitSnapshotOrdinal = (targetOrd, opts = {}) => {
   })
 }
 
+/**
+ * Event-kicked REST poll.
+ *
+ * Subscribes to gl0's LocalEvents stream and re-runs `checkFn` (a caller-supplied
+ * async REST check) every time a matching kick-event arrives — replacing the
+ * traditional `for (i=0; i<N; i++) { await checkFn(); await sleep(1000) }` with a
+ * reactive pattern that wakes ONLY when the cluster makes progress.
+ *
+ * This is the right migration pattern for tests that need to read state through a
+ * non-event-covered REST endpoint (e.g. ml0/cl0 `/snapshots/latest/combined`,
+ * which is a metagraph-internal view gl0 doesn't emit events for in v1) — the event
+ * stream tells us "something changed", the REST call tells us "what changed".
+ *
+ * @param {Object} opts
+ * @param {Function} opts.checkFn — async () => result; throws if check should retry
+ * @param {Object} [opts.kickFilter] — same shape as awaitChainEvent.filters; defaults
+ *   to SNAPSHOT_FINALIZED + METAGRAPH_SNAPSHOT_ACCEPTED (every cluster progress tick)
+ * @param {string|number} [opts.maxWait='10min']
+ * @param {string} [opts.tag]
+ * @param {boolean} [opts.checkImmediately=true] — run checkFn once before subscribing
+ * @param {Function} [opts._eventSource] — test-only injection
+ */
+const pollWithEventKick = async (opts) => {
+  if (!opts || typeof opts.checkFn !== 'function') {
+    throw new Error('pollWithEventKick: opts.checkFn is required')
+  }
+  const tag = opts.tag || 'pollWithEventKick'
+  const maxWaitMs = parseMaxWait(opts.maxWait || '10min')
+  const startedAt = Date.now()
+  const kickFilter = opts.kickFilter || { kinds: ['SNAPSHOT_FINALIZED', 'METAGRAPH_SNAPSHOT_ACCEPTED'] }
+  let lastError = null
+  let checkCount = 0
+  const lastEvents = []
+  const pushDiag = (e) => {
+    lastEvents.push(compactEnvelope(e))
+    if (lastEvents.length > 10) lastEvents.shift()
+  }
+
+  // Try once before subscribing — covers the case where the answer is already correct.
+  if (opts.checkImmediately !== false) {
+    try {
+      checkCount++
+      return await opts.checkFn({ kickEvent: null, checkCount })
+    } catch (e) {
+      lastError = e
+    }
+  }
+
+  const filter = buildFilter(kickFilter)
+  const clientTag = opts.tag || ''
+  const eventSource = opts._eventSource
+    ? opts._eventSource(filter, clientTag)
+    : openGrpcStream(opts.endpoint, filter, clientTag)
+
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      try { eventSource.cancel() } catch (_) {}
+      reject(buildTimeoutError({
+        tag,
+        elapsedMs: Date.now() - startedAt,
+        maxWaitMs,
+        filter: kickFilter,
+        lastEvents,
+        streamStarted: null
+      }))
+    }, maxWaitMs)
+
+    const cleanup = () => {
+      clearTimeout(timer)
+      try { eventSource.cancel() } catch (_) {}
+    }
+
+    eventSource.on('data', async (envRaw) => {
+      if (settled) return
+      const env = normalizeEnvelope(envRaw)
+      pushDiag(env)
+      if (env.kind === EventKind.STREAM_STARTED) return
+      try {
+        checkCount++
+        const result = await opts.checkFn({ kickEvent: env, checkCount })
+        if (!settled) {
+          settled = true
+          cleanup()
+          resolve(result)
+        }
+      } catch (e) {
+        lastError = e
+        // expected: keep waiting for the next kick
+      }
+    })
+
+    eventSource.on('error', (err) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(new Error(`pollWithEventKick[${tag}]: stream error after ${Date.now() - startedAt}ms: ${err.message || err}`))
+    })
+
+    eventSource.on('end', () => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(new Error(
+        `pollWithEventKick[${tag}]: stream ended without success after ${Date.now() - startedAt}ms ` +
+        `(${checkCount} REST checks made; last error: ${lastError ? (lastError.message || lastError) : 'n/a'})`
+      ))
+    })
+  })
+}
+
 module.exports = {
   awaitChainEvent,
   awaitTokenLockExpired,
   awaitBalanceMatches,
   awaitTransactionAccepted,
   awaitSnapshotOrdinal,
+  pollWithEventKick,
   EventKind,
   // Exported for tests + advanced callers
   parseMaxWait,
