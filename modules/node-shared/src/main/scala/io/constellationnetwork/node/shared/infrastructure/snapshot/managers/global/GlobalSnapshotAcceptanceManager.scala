@@ -1968,25 +1968,39 @@ object GlobalSnapshotAcceptanceManager {
                 )
 
                 // ─── LocalEvents publisher emissions ─────────────────────────────────────
-                // Best-effort fire-and-forget: emit a batch of typed events derived from this accept's
-                // diffs. Wired through `publisher` (no-op by default; production overrides at
-                // GlobalSnapshotConsensus when `nakamoto.local-events.enabled = true`). Errors here
-                // must NOT block consensus — wrap in `attempt.void` so a publisher fault drops the
-                // event(s) silently.
-                _ <- emitLocalEvents(
-                  ordinal,
-                  priorBalances = priorBalances,
-                  postBalances = gsi.balances,
-                  acceptedGlobalAllowSpends = acceptedGlobalAllowSpends,
-                  acceptedGlobalTokenLocks = acceptedGlobalTokenLocks,
-                  expiredAllowSpends = expiredAllowSpendsHoisted,
-                  expiredTokenLocks = expiredTokenLocksHoisted,
-                  tokenUnlocks = generatedTokenUnlocks,
-                  acceptedTransactions = acceptedTransactions,
-                  scSnapshots = scSnapshots,
-                  currencyAcceptanceBalanceUpdate = currencyAcceptanceBalanceUpdate,
-                  lastSnapshotContext = lastSnapshotContext
-                ).attempt.void
+                // Fire-and-forget: spawn the emit onto a separate fiber so a slow/wedged subscriber
+                // CANNOT semantically-block consensus. FS2 `Topic.publish1` returns
+                // `F[Either[Topic.Closed, Unit]]` whose acquire suspends on the per-subscriber
+                // bounded queue's `Queue.offer` — if a subscriber stops draining, the publishing
+                // fiber blocks. Routing `emitLocalEvents` through `Async[F].start(...).void`
+                // decouples consensus completion from event emission entirely.
+                //
+                // Per-event ordering inside `emitLocalEvents` is preserved by its internal serial
+                // `>>` composition (publisher methods chain via `for`). Outer ordering across the
+                // accept call vs. its emission is NOT load-bearing: subscribers receive events
+                // tagged with `ordinal`, so observers reorder by `ordinal` if needed.
+                //
+                // `.attempt.void` retained as a defense-in-depth for any synchronous exception
+                // before the publisher hits the fiber-blocking boundary (e.g. allocation failure
+                // in the encoder).
+                _ <- Async[F]
+                  .start(
+                    emitLocalEvents(
+                      ordinal,
+                      priorBalances = priorBalances,
+                      postBalances = gsi.balances,
+                      acceptedGlobalAllowSpends = acceptedGlobalAllowSpends,
+                      acceptedGlobalTokenLocks = acceptedGlobalTokenLocks,
+                      expiredAllowSpends = expiredAllowSpendsHoisted,
+                      expiredTokenLocks = expiredTokenLocksHoisted,
+                      tokenUnlocks = generatedTokenUnlocks,
+                      acceptedTransactions = acceptedTransactions,
+                      scSnapshots = scSnapshots,
+                      currencyAcceptanceBalanceUpdate = currencyAcceptanceBalanceUpdate,
+                      lastSnapshotContext = lastSnapshotContext
+                    ).attempt.void
+                  )
+                  .void
               } yield
                 (
                   initialData.blockResult,
