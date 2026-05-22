@@ -85,7 +85,19 @@ object types {
   case class NakamotoConfig(
     etaRotationSnapshots: PosLong,
     keepDepthBehindFinalized: PosLong,
-    localEvents: LocalEventsConfig
+    localEvents: LocalEventsConfig,
+    committee: NakamotoCommitteeConfig
+  )
+
+  /** Committee-gate tunables. The `parentResolverHistoryDepth` knob bounds how far back `MetagraphParentOrdinalResolver`'s history walk
+    * scans the gl0 chain store for an `lastStateChannelSnapshotHashes[mg]` entry matching the incoming binary's `parentHash`. Default 200
+    * covers the 4-metagraph stress regime (where gl0 lags the cluster by ≤ a handful of metagraph ordinals); production deployments with
+    * deeper reorg windows or larger metagraph counts can raise it.
+    *
+    * Bound, not a target — the resolver returns on first match, so most calls return at depth 1 or below.
+    */
+  case class NakamotoCommitteeConfig(
+    parentResolverHistoryDepth: PosInt
   )
 
   /** Configuration for the gl0-embedded `LocalEvents` reactive event stream (see `docs/nakamoto/LOCAL-EVENTS-SERVICE-DESIGN.md`). Drives
