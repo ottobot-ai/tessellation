@@ -987,16 +987,6 @@ object GlobalSnapshotConsensus {
           // failed. The resolver reads through `pendingReader` so under MultiBranch we pick up the
           // chain's pending writes; #118's overlay-aware reader already handles the
           // pending-vs-finalized fallback.
-          // #202 v2 (history walk). The resolver consults a chain-store-backed history lookup on tip
-          // mismatch — walks back through the gl0 chain store's recent finalized snapshots'
-          // `lastStateChannelSnapshotHashes[mg]` looking for the incoming binary's parentHash. This
-          // catches the 4-mg-stress failure mode where the GSI tip lags the cluster by ≥1 metagraph
-          // ordinal. Bounded by HOCON `nakamoto.committee.parent-resolver-history-depth` (default 200).
-          parentResolverHistoryLookup = {
-            implicit val resolverLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
-            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainStoreScHashHistoryLookup
-              .make[F](chainStore, sharedCfg.nakamoto.committee.parentResolverHistoryDepth.value)
-          }
           committeeParentOrdinalFor: (
             (
               io.constellationnetwork.schema.address.Address,
@@ -1006,8 +996,7 @@ object GlobalSnapshotConsensus {
             ]
           ) = (mg, parent) => {
             implicit val resolverLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
-            io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver
-              .resolve[F](pendingReader, mg, parent, parentResolverHistoryLookup)
+            io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver.resolve[F](pendingReader, mg, parent)
           }
           committeeGate = {
             implicit val gateLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
