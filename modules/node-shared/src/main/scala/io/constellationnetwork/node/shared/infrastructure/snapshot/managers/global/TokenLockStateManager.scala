@@ -73,6 +73,19 @@ trait TokenLockStateManager[F[_]] {
     generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
   )(implicit hasher: Hasher[F]): F[TokenLockAcceptanceResult]
 
+  /** Hoisted variant of `acceptTokenLocks` that takes a pre-computed `expiredGlobalTokenLocks` set, avoiding the redundant
+    * `findExpiredGlobalTokenLocksViaIndexFromMpt` call. Used by GSAM's local-events hoist (Q2 user override): the expired set is computed
+    * once per accept() and threaded into both this and `updateGlobalBalancesByTokenLocksWithExpired`, then used as the source of
+    * EXPIRED-transition events.
+    */
+  def acceptTokenLocksWithExpired(
+    epochProgress: EpochProgress,
+    acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]],
+    expiredGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+  )(implicit hasher: Hasher[F]): F[TokenLockAcceptanceResult]
+
   def acceptReplacementTokenLocks(
     acceptedTokenLocks: List[Signed[TokenLock]],
     lastSnapshotContext: GlobalSnapshotInfo
@@ -101,6 +114,15 @@ trait TokenLockStateManager[F[_]] {
     generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
   )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
 
+  /** Hoisted variant of `updateGlobalBalancesByTokenLocks` that takes a pre-computed expired set. See `acceptTokenLocksWithExpired`. */
+  def updateGlobalBalancesByTokenLocksWithExpired(
+    epochProgress: EpochProgress,
+    currentBalances: SortedMap[Address, Balance],
+    acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]],
+    expiredGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+  )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
+
   /** MPT-backed `acceptTokenLocks`. Reads current active sets per-address via `mptStore.getActiveTokenLocks` instead of iterating an
     * in-memory map. Returns deltas + removedKeys + expiry-index delta; caller reconstructs full state if needed.
     */
@@ -110,6 +132,23 @@ trait TokenLockStateManager[F[_]] {
     acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
     generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
   )(implicit hasher: Hasher[F]): F[TokenLockAcceptanceDeltas]
+
+  /** Hoisted variant of `acceptTokenLocksFromMpt` that takes a pre-computed `expiredGlobalTokenLocks`. */
+  def acceptTokenLocksFromMptWithExpired(
+    epochProgress: EpochProgress,
+    acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]],
+    expiredGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+  )(implicit hasher: Hasher[F]): F[TokenLockAcceptanceDeltas]
+
+  /** Hoisted variant of `updateGlobalBalancesByTokenLocksFromMpt`. */
+  def updateGlobalBalancesByTokenLocksFromMptWithExpired(
+    epochProgress: EpochProgress,
+    currentBalances: SortedMap[Address, Balance],
+    acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]],
+    expiredGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+  )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
 
   /** MPT-backed `findExpiredGlobalTokenLocksViaIndex`. Resolves each expiring hash via
     * `reader.get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, addr))` instead of an
@@ -187,9 +226,31 @@ object TokenLockStateManager {
         lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
         generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
       )(implicit hasher: Hasher[F]): F[TokenLockAcceptanceResult] =
+        findExpiredGlobalTokenLocksViaIndexFromMpt(previousEpochProgress, epochProgress).flatMap { expired =>
+          acceptTokenLocksWithExpired(
+            epochProgress,
+            acceptedGlobalTokenLocks,
+            lastActiveGlobalTokenLocks,
+            generatedTokenUnlocksByAddress,
+            expired
+          )
+        }
+
+      def acceptTokenLocksWithExpired(
+        epochProgress: EpochProgress,
+        acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+        lastActiveGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+        generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]],
+        expiredGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+      )(implicit hasher: Hasher[F]): F[TokenLockAcceptanceResult] =
         // No map iteration inside the manager; reconstruct fullState from caller's `lastActive` for API compat.
         // Future #91/#77 work removes `fullState` from the return contract entirely.
-        acceptTokenLocksFromMpt(epochProgress, previousEpochProgress, acceptedGlobalTokenLocks, generatedTokenUnlocksByAddress).map { d =>
+        acceptTokenLocksFromMptWithExpired(
+          epochProgress,
+          acceptedGlobalTokenLocks,
+          generatedTokenUnlocksByAddress,
+          expiredGlobalTokenLocks
+        ).map { d =>
           val reconstructed: SortedMap[Address, SortedSet[Signed[TokenLock]]] =
             (lastActiveGlobalTokenLocks -- d.removedKeys) ++ d.deltas
           val cleaned = reconstructed.filter(_._2.nonEmpty)
@@ -296,7 +357,17 @@ object TokenLockStateManager {
         acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
         generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
       )(implicit hasher: Hasher[F]): F[TokenLockAcceptanceDeltas] =
-        findExpiredGlobalTokenLocksViaIndexFromMpt(previousEpochProgress, epochProgress).flatMap { expiredGlobalTokenLocks =>
+        findExpiredGlobalTokenLocksViaIndexFromMpt(previousEpochProgress, epochProgress).flatMap { expired =>
+          acceptTokenLocksFromMptWithExpired(epochProgress, acceptedGlobalTokenLocks, generatedTokenUnlocksByAddress, expired)
+        }
+
+      def acceptTokenLocksFromMptWithExpired(
+        epochProgress: EpochProgress,
+        acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+        generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]],
+        expiredGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+      )(implicit hasher: Hasher[F]): F[TokenLockAcceptanceDeltas] =
+        Async[F].pure(expiredGlobalTokenLocks).flatMap { expiredGlobalTokenLocks =>
           // Touched addresses = everything that might change this ordinal:
           //   - addresses with incoming locks (`acceptedGlobalTokenLocks`)
           //   - addresses with expiring locks (`expiredGlobalTokenLocks`)
@@ -380,7 +451,24 @@ object TokenLockStateManager {
         acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
         generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]]
       )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] =
-        findExpiredGlobalTokenLocksViaIndexFromMpt(previousEpochProgress, epochProgress).flatMap { expiredGlobalTokenLocks =>
+        findExpiredGlobalTokenLocksViaIndexFromMpt(previousEpochProgress, epochProgress).flatMap { expired =>
+          updateGlobalBalancesByTokenLocksFromMptWithExpired(
+            epochProgress,
+            currentBalances,
+            acceptedGlobalTokenLocks,
+            generatedTokenUnlocksByAddress,
+            expired
+          )
+        }
+
+      def updateGlobalBalancesByTokenLocksFromMptWithExpired(
+        epochProgress: EpochProgress,
+        currentBalances: SortedMap[Address, Balance],
+        acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+        generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]],
+        expiredGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+      )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] =
+        Async[F].pure(expiredGlobalTokenLocks).flatMap { expiredGlobalTokenLocks =>
           val afterTokenLocksF = (acceptedGlobalTokenLocks |+| expiredGlobalTokenLocks).toList
             .foldM[F, Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
               Right((currentBalances, SortedMap.empty[Address, Balance]))
@@ -547,6 +635,21 @@ object TokenLockStateManager {
           currentBalances,
           acceptedGlobalTokenLocks,
           generatedTokenUnlocksByAddress
+        )
+
+      def updateGlobalBalancesByTokenLocksWithExpired(
+        epochProgress: EpochProgress,
+        currentBalances: SortedMap[Address, Balance],
+        acceptedGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+        generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]],
+        expiredGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+      )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] =
+        updateGlobalBalancesByTokenLocksFromMptWithExpired(
+          epochProgress,
+          currentBalances,
+          acceptedGlobalTokenLocks,
+          generatedTokenUnlocksByAddress,
+          expiredGlobalTokenLocks
         )
 
       private def readBalance(

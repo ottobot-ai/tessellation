@@ -44,6 +44,23 @@ trait AllowSpendStateManager[F[_]] {
     allAcceptedSpendTxns: List[SpendTransaction]
   )(implicit hasher: Hasher[F]): F[AllowSpendAcceptanceResult]
 
+  /** Hoisted variant of `acceptAllowSpends` that takes a pre-computed `expiredGlobalAllowSpends` set, avoiding the redundant
+    * `findExpiredGlobalAllowSpendsViaIndexFromMpt` call inside the manager. Used by GSAM's local-events hoist (Q2 user override): the
+    * expired set is computed once per accept(), threaded into both this and `updateGlobalBalancesByAllowSpendsWithExpired`, and used as the
+    * source of EXPIRED-transition events.
+    *
+    * Behavioural equivalent of `acceptAllowSpends(...)` when the passed `expiredGlobalAllowSpends` matches
+    * `findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress)`.
+    */
+  def acceptAllowSpendsWithExpired(
+    epochProgress: EpochProgress,
+    activeAllowSpendsFromCurrencySnapshots: SortedMap[Address, SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+    globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
+    lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+    allAcceptedSpendTxns: List[SpendTransaction],
+    expiredGlobalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]]
+  )(implicit hasher: Hasher[F]): F[AllowSpendAcceptanceResult]
+
   def acceptAllowSpendRefs(
     lastAllowSpendRefs: SortedMap[Address, AllowSpendReference],
     lastAllowSpendContextUpdate: Map[Address, AllowSpendReference]
@@ -72,6 +89,16 @@ trait AllowSpendStateManager[F[_]] {
     currentBalances: SortedMap[Address, Balance],
     globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
     lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+  )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
+
+  /** Hoisted variant of `updateGlobalBalancesByAllowSpends` that takes a pre-computed expired set. See `acceptAllowSpendsWithExpired` for
+    * the Q2 user-override hoist rationale.
+    */
+  def updateGlobalBalancesByAllowSpendsWithExpired(
+    epochProgress: EpochProgress,
+    currentBalances: SortedMap[Address, Balance],
+    globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
+    expiredGlobalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]]
   )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
 
   /** Materialize the full `Option[contract] → user → active-allow-spend-set` view by prefix-scanning the MPT under `(HypergraphNamespace,
@@ -107,6 +134,25 @@ object AllowSpendStateManager {
       globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
       lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
       allAcceptedSpendTxns: List[SpendTransaction]
+    )(implicit hasher: Hasher[F]): F[AllowSpendAcceptanceResult] =
+      findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress).flatMap { expired =>
+        acceptAllowSpendsWithExpired(
+          epochProgress,
+          activeAllowSpendsFromCurrencySnapshots,
+          globalAllowSpends,
+          lastActiveAllowSpends,
+          allAcceptedSpendTxns,
+          expired
+        )
+      }
+
+    def acceptAllowSpendsWithExpired(
+      epochProgress: EpochProgress,
+      activeAllowSpendsFromCurrencySnapshots: SortedMap[Address, SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+      globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
+      lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+      allAcceptedSpendTxns: List[SpendTransaction],
+      expiredGlobalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]]
     )(implicit hasher: Hasher[F]): F[AllowSpendAcceptanceResult] = {
       val allAcceptedSpendTxnsAllowSpendsRefs =
         allAcceptedSpendTxns
@@ -114,7 +160,7 @@ object AllowSpendStateManager {
 
       val lastActiveGlobalAllowSpends = lastActiveAllowSpends.getOrElse(None, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
 
-      findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress).flatMap { expiredGlobalAllowSpends =>
+      Async[F].pure(expiredGlobalAllowSpends).flatMap { expiredGlobalAllowSpends =>
         val unexpiredGlobalAllowSpends = (globalAllowSpends |+| expiredGlobalAllowSpends).foldLeft(lastActiveGlobalAllowSpends) {
           case (acc, (address, allowSpends)) =>
             val lastAddressAllowSpends = acc.getOrElse(address, SortedSet.empty[Signed[AllowSpend]])
@@ -333,8 +379,20 @@ object AllowSpendStateManager {
       currentBalances: SortedMap[Address, Balance],
       globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
       lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+    )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] = {
+      val _ = lastActiveAllowSpends // unused; preserved for API compat
+      findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress).flatMap { expired =>
+        updateGlobalBalancesByAllowSpendsWithExpired(epochProgress, currentBalances, globalAllowSpends, expired)
+      }
+    }
+
+    def updateGlobalBalancesByAllowSpendsWithExpired(
+      epochProgress: EpochProgress,
+      currentBalances: SortedMap[Address, Balance],
+      globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
+      expiredGlobalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]]
     )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] =
-      findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress).flatMap { expiredGlobalAllowSpends =>
+      Async[F].pure(expiredGlobalAllowSpends).flatMap { expiredGlobalAllowSpends =>
         (globalAllowSpends |+| expiredGlobalAllowSpends).toList
           .foldM[F, Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
             Right((currentBalances, SortedMap.empty[Address, Balance]))
