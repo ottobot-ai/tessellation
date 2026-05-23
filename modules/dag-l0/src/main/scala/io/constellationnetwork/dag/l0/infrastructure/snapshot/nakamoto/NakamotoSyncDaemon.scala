@@ -1223,12 +1223,15 @@ object NakamotoSyncDaemon {
 
             _ <-
               if (reorgHappened) {
-                // ChainSelection picked this fork as denser — adopt its state via catch-up.
+                // ChainSelection picked this fork — adopt its state via catch-up.
                 // This is the deferred validation: catch-up resets canonical state to the fork's
                 // context and performs MPT self-healing. Subsequent snapshots that build on the
                 // new canonical tip will go through the normal Valid path (full content validation).
+                // At depth < k1 the chosen rule is Taktikos `maxvalid-tk` (length, then lower
+                // head-slot tiebreaker); the Genesis density rule fires only on deep forks (>=k1).
                 logger.info(
-                  s"🔄 Reorg to fork at ordinal=${snap.ordinal} slot=${snap.slot} (denser chain). Validating via catch-up."
+                  s"🔄 Reorg to fork at ordinal=${snap.ordinal} slot=${snap.slot} (ChainSelection.standardCompare picked it: maxvalid-tk for shallow forks, density only fires at depth>=k1). " +
+                    s"prevBestTip=${prevBestTip.map(_.value.take(12)).getOrElse("none")} newBestTip=${newBestTip.map(_.value.take(12)).getOrElse("none")}. Validating via catch-up."
                 ) >>
                   productionGate.pause(ProductionGate.ReorgInProgress) >>
                   HasherSelector[F].withCurrent { implicit hasher =>
