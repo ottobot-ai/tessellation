@@ -254,14 +254,20 @@ object GlobalSnapshotAcceptanceManager {
     // a dynamic branch-aware reader (`branchTipRef` set at accept() top) so under MultiBranch a
     // child sees its parent branch's pending writes (#56.10 Phase J).
     val mptStore: MptStore[F, GlobalStateKey] = overlay.base
-    (cats.effect.Ref.of[F, BranchId](BranchId.base), cats.effect.std.Semaphore[F](1)).mapN { (branchTipRef, acceptMutex) =>
+    // Slice 12: `MetagraphSyncManager.make` is now effectful (allocates internal `Ref`s for the cross-shard receipt consumer's
+    // pending accumulator + seen-set). Threaded into the `mapN` alongside the existing `Ref.of`/`Semaphore.apply` allocations
+    // so the construction stays a single `F` action with no nested `flatMap` ceremony.
+    (
+      cats.effect.Ref.of[F, BranchId](BranchId.base),
+      cats.effect.std.Semaphore[F](1),
+      MetagraphSyncManager.make[F](metagraphsSyncConfig)
+    ).mapN { (branchTipRef, acceptMutex, metagraphSyncManager) =>
       val branchAwareReader = io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.dynamic[F](
         overlay,
         branchTipRef.get
       )
       val artifactEmissionManager = ArtifactEmissionManager.make[F]()
       val tipUsageManager = TipUsageManager.make[F]()
-      val metagraphSyncManager = MetagraphSyncManager.make[F](metagraphsSyncConfig)
       val rewardAcceptanceManager = RewardAcceptanceManager.make[F](branchAwareReader)
       val allowSpendStateManager = AllowSpendStateManager.make[F](branchAwareReader)
       val tokenLockStateManager = TokenLockStateManager.make[F](branchAwareReader)
