@@ -7,15 +7,14 @@ import pureconfig.ConfigSource
 import pureconfig.generic.auto._
 import weaver.SimpleIOSuite
 
-/** Round-trip tests for [[ShardingConfig]] — the hierarchical-shard-checkpoints v1 typed config shape
-  * (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §4.2).
+/** Round-trip tests for [[ShardingConfig]] — the hierarchical-shard-checkpoints v1 typed config shape (see
+  * `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §4.2).
   *
-  *   - The defaults declared in `application.conf` under `nakamoto.sharding` decode to a degenerate single-shard config
-  *     (`numShards = 1`) — the new code path is a no-op for current setups.
-  *   - Overrides supplied via HOCON (mirroring what the `${?NAKAMOTO_*}` env substitutions would yield) decode through
-  *     the same path. We use HOCON-string overrides instead of mutating real env vars because the JVM cannot mutate its
-  *     own `System.getenv()`; the `${?ENV_VAR}` substitution itself is well-tested by typesafe-config and is not
-  *     re-verified here.
+  *   - The defaults declared in `application.conf` under `nakamoto.sharding` decode to a degenerate single-shard config (`numShards = 1`) —
+  *     the new code path is a no-op for current setups.
+  *   - Overrides supplied via HOCON (mirroring what the `${?NAKAMOTO_*}` env substitutions would yield) decode through the same path. We
+  *     use HOCON-string overrides instead of mutating real env vars because the JVM cannot mutate its own `System.getenv()`; the
+  *     `${?ENV_VAR}` substitution itself is well-tested by typesafe-config and is not re-verified here.
   */
 object ShardingConfigSuite extends SimpleIOSuite {
 
@@ -23,8 +22,8 @@ object ShardingConfigSuite extends SimpleIOSuite {
   private def loadDefault: ShardingConfig =
     ConfigSource.default.at("nakamoto.sharding").loadOrThrow[ShardingConfig]
 
-  /** Build a `ShardingConfig` by parsing an inline HOCON string that overrides `nakamoto.sharding.*` keys. The fallback
-    * chain mirrors what the application would see at runtime: caller-provided HOCON > `application.conf` defaults.
+  /** Build a `ShardingConfig` by parsing an inline HOCON string that overrides `nakamoto.sharding.*` keys. The fallback chain mirrors what
+    * the application would see at runtime: caller-provided HOCON > `application.conf` defaults.
     */
   private def loadWithOverride(overrideHocon: String): ShardingConfig = {
     val parsed = ConfigFactory

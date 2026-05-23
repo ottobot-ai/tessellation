@@ -66,8 +66,8 @@ final case class ShardCheckpoint(
     * envelope, hashes, signs, and contributes a [[CommitteeMemberSignature]].
     *
     * '''Why a method, not a separate constructor.''' The preimage is always derived from a full envelope at both producer and verifier
-    * sites — there's no path where one would build the preimage independently. Co-locating the projection on the envelope keeps the
-    * "what bytes get signed" contract one method-call away from the envelope itself.
+    * sites — there's no path where one would build the preimage independently. Co-locating the projection on the envelope keeps the "what
+    * bytes get signed" contract one method-call away from the envelope itself.
     */
   def signingPreimage: ShardCheckpointSigPreimage =
     ShardCheckpointSigPreimage(
@@ -87,8 +87,8 @@ final case class ShardCheckpoint(
   *
   * '''Wire-byte stability (consensus-load-bearing).''' Field order and field set here are part of the consensus contract. Adding a field,
   * reordering, or wrapping a field in `Option` silently changes the derevo magnolia-derived Circe JSON, which silently changes the
-  * `Hasher[F]` output, which silently changes the bytes every signer expected to sign and every verifier expects to verify. Bump the
-  * case class explicitly (`ShardCheckpointSigPreimageV2`) and version the verifier branch — never silently mutate the field set. Same
+  * `Hasher[F]` output, which silently changes the bytes every signer expected to sign and every verifier expects to verify. Bump the case
+  * class explicitly (`ShardCheckpointSigPreimageV2`) and version the verifier branch — never silently mutate the field set. Same
   * frozen-shape discipline as [[io.constellationnetwork.schema.slashing.SlashableEvidence.BountyDigestPreimage]].
   */
 @derive(encoder, decoder, eqv, show)

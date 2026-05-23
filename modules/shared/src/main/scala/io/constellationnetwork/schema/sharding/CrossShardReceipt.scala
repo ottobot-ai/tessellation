@@ -10,8 +10,8 @@ import derevo.derive
 
 /** Cross-shard receipt — an asynchronous message from one shard committee to another.
   *
-  * Two roles in v1 (see [`CROSS-SHARD-PROTOCOL-RESEARCH.md`](../../../../../../../../docs/nakamoto/CROSS-SHARD-PROTOCOL-RESEARCH.md)
-  * §3.1 Option I + §3.2/§3.3 for the cross-MG SpendAction case):
+  * Two roles in v1 (see [`CROSS-SHARD-PROTOCOL-RESEARCH.md`](../../../../../../../../docs/nakamoto/CROSS-SHARD-PROTOCOL-RESEARCH.md) §3.1
+  * Option I + §3.2/§3.3 for the cross-MG SpendAction case):
   *
   *   1. `StateReadAck`: optional carrier for "I served your read request with proof X at ord Y" — surfaced only for observability /
   *      monitoring. Not consensus-load-bearing because the read happened P2P during the shard's accept window (see
@@ -21,9 +21,9 @@ import derevo.derive
   *      shard Y's metagraph; shard X records the intent here; shard Y consumes from gl0's aggregated view at the next checkpoint window.
   *
   * '''Scope for slice 1.''' Only `MetagraphSyncDataWrite` is defined; `StateReadAck` is documented above and slated for a follow-up slice
-  * if observability needs it. The sealed-trait shape with one initial case keeps the codec path warm for the second case to drop in
-  * without a schema rev (greenfield — see `feedback_greenfield_no_wire_compat` — but the cleanest extension point is still one case-class
-  * variant per role).
+  * if observability needs it. The sealed-trait shape with one initial case keeps the codec path warm for the second case to drop in without
+  * a schema rev (greenfield — see `feedback_greenfield_no_wire_compat` — but the cleanest extension point is still one case-class variant
+  * per role).
   */
 @derive(encoder, decoder, eqv, show)
 sealed trait CrossShardReceipt extends Product with Serializable
@@ -44,9 +44,9 @@ object CrossShardReceipt {
     * mapping (§4.1) to verify both sides land on the expected shards. If `numShards` is misconfigured at any operator the shardId fields
     * surface the disagreement explicitly, preventing silent cross-shard mis-routing.
     *
-    * '''Why `sourceCheckpointHash` is included.''' Traceability — operators investigating an unexpected target-side state change can
-    * trace back to the exact source checkpoint that emitted the receipt. Not load-bearing for consensus (the gl0 snapshot already
-    * carries the source `ShardCheckpoint`'s signature).
+    * '''Why `sourceCheckpointHash` is included.''' Traceability — operators investigating an unexpected target-side state change can trace
+    * back to the exact source checkpoint that emitted the receipt. Not load-bearing for consensus (the gl0 snapshot already carries the
+    * source `ShardCheckpoint`'s signature).
     *
     * @param sourceShardId
     *   shard that emitted the receipt (derives from `shardIdFor(sourceMetagraph)` per §4.1)

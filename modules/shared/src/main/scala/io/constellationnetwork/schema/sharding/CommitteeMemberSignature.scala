@@ -16,18 +16,19 @@ import derevo.derive
   *
   * '''Field order rationale.''' Mirrors `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §3.1 exactly so the on-wire JSON shape
   * matches the documented spec one-to-one. Encoding via derevo magnolia uses field positional order; reordering silently changes the
-  * canonical hash bytes, which would break cross-version signature verification (see [[ShardCheckpointSigPreimage]] scaladoc on
-  * wire-byte stability).
+  * canonical hash bytes, which would break cross-version signature verification (see [[ShardCheckpointSigPreimage]] scaladoc on wire-byte
+  * stability).
   *
-  * '''Why `Hex` for raw bytes.''' Same rationale as `MetagraphAttestation` (see [[io.constellationnetwork.schema.slashing.MetagraphAttestation]]
-  * scaladoc): `Hex` is a newtype over `String` so the case class gets free Circe `decoder`/`encoder` instances and round-trips
-  * deterministically. The Hex form is exactly what the wire-side `ByteString.copyFrom` ↔ JVM bytes path produces.
+  * '''Why `Hex` for raw bytes.''' Same rationale as `MetagraphAttestation` (see
+  * [[io.constellationnetwork.schema.slashing.MetagraphAttestation]] scaladoc): `Hex` is a newtype over `String` so the case class gets free
+  * Circe `decoder`/`encoder` instances and round-trips deterministically. The Hex form is exactly what the wire-side `ByteString.copyFrom`
+  * ↔ JVM bytes path produces.
   *
   * '''Why no outer `Signed[_]` envelope around the committee member's contribution.''' All three signatures (Ed25519, KES product, VRF
   * proof) live in the body directly. KES product + VRF proof are independently load-bearing (KES proves the operator's per-period key
   * controls the long-term identity; VRF proof proves committee membership at the sortition slot); the Ed25519 sig is the gossip-layer
-  * convention so receivers can authenticate the message origin without parsing the KES tree. Wrapping in `Signed[_]` would inflate the
-  * wire bytes with a redundant fourth proof and the canonical-hash pre-image. Same design decision as
+  * convention so receivers can authenticate the message origin without parsing the KES tree. Wrapping in `Signed[_]` would inflate the wire
+  * bytes with a redundant fourth proof and the canonical-hash pre-image. Same design decision as
   * [[io.constellationnetwork.schema.slashing.SlashableEvidence]].
   *
   * @param peerId

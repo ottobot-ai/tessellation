@@ -20,10 +20,11 @@ import io.circe._
   * to be in the 4..1000 range (test/laptop = 4; production target ≈ 100; see §4.1). Using `Int` rather than `Long` keeps the wire bytes
   * short and matches the `mod numShards` arithmetic at the assignment site.
   *
-  * '''Why a refined newtype, not a raw Int.''' Matches the prevailing pattern in this package (e.g., [[io.constellationnetwork.schema.SnapshotOrdinal]]
-  * wraps a `NonNegLong` for the same reason): a stray negative literal becomes a compile-time refinement failure rather than a runtime
-  * surprise inside `SortedMap[ShardId, _]` ordering, MPT-key construction, or sortition arithmetic. The cost is one allocation per
-  * construction; the benefit is that every downstream call site can assume non-negativity without re-checking.
+  * '''Why a refined newtype, not a raw Int.''' Matches the prevailing pattern in this package (e.g.,
+  * [[io.constellationnetwork.schema.SnapshotOrdinal]] wraps a `NonNegLong` for the same reason): a stray negative literal becomes a
+  * compile-time refinement failure rather than a runtime surprise inside `SortedMap[ShardId, _]` ordering, MPT-key construction, or
+  * sortition arithmetic. The cost is one allocation per construction; the benefit is that every downstream call site can assume
+  * non-negativity without re-checking.
   */
 @derive(order, ordering, show)
 case class ShardId(value: NonNegInt)

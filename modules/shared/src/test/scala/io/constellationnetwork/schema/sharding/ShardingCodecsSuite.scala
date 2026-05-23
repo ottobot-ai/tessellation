@@ -33,17 +33,17 @@ import weaver.FunSuite
   *
   * '''What this suite proves.''' Every new case class:
   *   1. Round-trips through Circe (encode → decode → equality preserved)
-  *   1. Carries deterministic encoding for ordered collections — `SortedMap` keys come out in `Ordering[K]` order, `NonEmptyList`
-  *      elements come out in input order. This matters because the checkpoint's canonical hash (the bytes signed by committee members)
-  *      is derived from this encoding via `Hasher[F]`; two operators encoding the same logical content must produce byte-identical
-  *      bytes or signature verification fails (`feedback_use_hasher_no_manual_serialize` rationale).
+  *   1. Carries deterministic encoding for ordered collections — `SortedMap` keys come out in `Ordering[K]` order, `NonEmptyList` elements
+  *      come out in input order. This matters because the checkpoint's canonical hash (the bytes signed by committee members) is derived
+  *      from this encoding via `Hasher[F]`; two operators encoding the same logical content must produce byte-identical bytes or signature
+  *      verification fails (`feedback_use_hasher_no_manual_serialize` rationale).
   *
   * '''What this suite does NOT exercise.''' No `Hasher[F]` integration (that's the producer/verifier wiring, slice 2+). No signature
   * verification (slice 3+). No state-application semantics (slice 4+, gl0 admission). Pure schema-level codec contract.
   *
-  * '''Why `FunSuite`, not `MutableIOSuite`.''' Circe codecs are pure functions; no `IO` is needed to construct or verify them. The
-  * existing codec test files in this project (e.g. `KesRegistrationCodecsSuite`, `MetagraphSyncDataInfoCodecSuite`,
-  * `EpochStakeSnapshotterSuite`) settled on `FunSuite` for the same reason — keep the test free of irrelevant resource scaffolding.
+  * '''Why `FunSuite`, not `MutableIOSuite`.''' Circe codecs are pure functions; no `IO` is needed to construct or verify them. The existing
+  * codec test files in this project (e.g. `KesRegistrationCodecsSuite`, `MetagraphSyncDataInfoCodecSuite`, `EpochStakeSnapshotterSuite`)
+  * settled on `FunSuite` for the same reason — keep the test free of irrelevant resource scaffolding.
   */
 object ShardingCodecsSuite extends FunSuite {
 
@@ -84,8 +84,8 @@ object ShardingCodecsSuite extends FunSuite {
   private def mkSig(peerN: Int, step: Int): CommitteeMemberSignature =
     CommitteeMemberSignature(
       peerId = peerIdN(peerN),
-      vrfProof = hex("aa" * 80),       // 80 bytes hex
-      ed25519Sig = hex("bb" * 64),     // 64 bytes hex
+      vrfProof = hex("aa" * 80), // 80 bytes hex
+      ed25519Sig = hex("bb" * 64), // 64 bytes hex
       kesProductSig = hex("cc" * 128), // 128 bytes hex
       kesTreeStep = step
     )

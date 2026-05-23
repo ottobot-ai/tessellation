@@ -8,13 +8,14 @@ import io.circe._
 
 /** Monotonic per-shard sequence number for the shard's mini-Taktikos chain.
   *
-  * Each shard runs its own micro-chain producing one `ShardCheckpoint` per shard-ordinal (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`
-  * §5). The shard committee chain-links checkpoints via `parentCheckpointHash`; the `shardOrdinal` is the chain height within the shard.
+  * Each shard runs its own micro-chain producing one `ShardCheckpoint` per shard-ordinal
+  * (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §5). The shard committee chain-links checkpoints via `parentCheckpointHash`;
+  * the `shardOrdinal` is the chain height within the shard.
   *
   * '''Backing type: raw `Long`.''' The design doc (§3.1) specifies `value: Long`. Negative shard-ordinals aren't a domain concept, but the
-  * arithmetic at the producer site (e.g. lookback into prior shard heights for fork-choice) can go negative transiently during initialization,
-  * mirroring the rationale on [[io.constellationnetwork.schema.nakamoto.EtaPeriod]]. Modelling that as `NonNegLong` would force partial
-  * semantics through every call site for the bootstrap edge case; keeping `Long` matches the existing convention.
+  * arithmetic at the producer site (e.g. lookback into prior shard heights for fork-choice) can go negative transiently during
+  * initialization, mirroring the rationale on [[io.constellationnetwork.schema.nakamoto.EtaPeriod]]. Modelling that as `NonNegLong` would
+  * force partial semantics through every call site for the bootstrap edge case; keeping `Long` matches the existing convention.
   *
   * '''Why a newtype rather than a bare `Long`.''' Type safety against accidental cross-use with `SnapshotOrdinal` (gl0 height) or
   * `ChainTip.ordinal` (per-chain height) — different domains, different scopes, do not pun arithmetic across them.
@@ -22,7 +23,8 @@ import io.circe._
 @derive(order, ordering, show)
 case class ShardOrdinal(value: Long) {
 
-  /** Increment by one. Used at the shard committee's chain-extension site (each new accepted checkpoint advances the shard ordinal by 1). */
+  /** Increment by one. Used at the shard committee's chain-extension site (each new accepted checkpoint advances the shard ordinal by 1).
+    */
   def next: ShardOrdinal = ShardOrdinal(value + 1L)
 }
 

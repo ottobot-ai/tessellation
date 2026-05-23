@@ -13,16 +13,16 @@ import derevo.derive
   * slashing-evidence tx (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §10.2). The handler is v2 because the
   * social-cost-vs-bond-balance design needs production data we don't have yet.
   *
-  * '''Why land the wire shape now even though there's no handler.''' Greenfield (see memory `feedback_greenfield_no_wire_compat`) means
-  * we don't need to preserve wire-format compatibility. But the schema is what gets serialized into snapshot files and the slashing
-  * partition; pinning the field set before v2 means the v2 handler can be added without disturbing already-written disk state. Cost is
-  * ~30 lines of inert schema; benefit is one fewer schema rev when the handler lands.
+  * '''Why land the wire shape now even though there's no handler.''' Greenfield (see memory `feedback_greenfield_no_wire_compat`) means we
+  * don't need to preserve wire-format compatibility. But the schema is what gets serialized into snapshot files and the slashing partition;
+  * pinning the field set before v2 means the v2 handler can be added without disturbing already-written disk state. Cost is ~30 lines of
+  * inert schema; benefit is one fewer schema rev when the handler lands.
   *
   * '''Why `Hex` for [[reexecutionWitness]], not `Array[Byte]`.''' The design doc (§3.2) sketches it as `Array[Byte]`, but the project
-  * convention for "opaque variable-length bytes carried in a Circe-serialized case class" is `Hex` (newtype over `String`) — same
-  * choice made by [[io.constellationnetwork.schema.slashing.MetagraphAttestation.kesSignature]], `CommitteeMemberSignature.vrfProof`,
-  * etc. Bytes encoded as a Circe array of ints round-trip but bloat the JSON ~3× and complicate human inspection. `Hex` round-trips
-  * to the same underlying bytes deterministically and keeps the wire shape consistent across the package.
+  * convention for "opaque variable-length bytes carried in a Circe-serialized case class" is `Hex` (newtype over `String`) — same choice
+  * made by [[io.constellationnetwork.schema.slashing.MetagraphAttestation.kesSignature]], `CommitteeMemberSignature.vrfProof`, etc. Bytes
+  * encoded as a Circe array of ints round-trip but bloat the JSON ~3× and complicate human inspection. `Hex` round-trips to the same
+  * underlying bytes deterministically and keeps the wire shape consistent across the package.
   *
   * '''Witness schema TBD per derivation type.''' v2 handler will define re-execution witness shapes per shard-derivation kind (MPT root
   * mismatch witness is one shape; SC binary chain-link mismatch is another; cross-shard receipt drift is a third). v1 keeps the field as
