@@ -505,6 +505,19 @@ object NakamotoSyncDaemon {
                           case pb.GossipMessage.Body.TokenLockBlock(blk) =>
                             handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)
 
+                          // Slice 14: shard-checkpoint envelope + attestation gossip routing. Wire format landed in this slice; the
+                          // load-bearing receiver-side handler that decodes + routes to `ShardCheckpointGl0AcceptanceManager` (Slice 9)
+                          // is a follow-up slice. For now we surface arrivals as a low-frequency log so an operator can confirm the
+                          // gossip path is alive without taking a dependency on Slice 9 here. The handler returns immediately — no
+                          // blocking work on the gossip evalMap thread.
+                          case _: pb.GossipMessage.Body.ShardCheckpoint =>
+                            logger.debug("Received pb.GossipMessage.Body.ShardCheckpoint — handler deferred to Slice 9 wiring")
+
+                          case _: pb.GossipMessage.Body.ShardCheckpointAttestation =>
+                            logger.debug(
+                              "Received pb.GossipMessage.Body.ShardCheckpointAttestation — handler deferred to Slice 9 wiring"
+                            )
+
                           case _: pb.GossipMessage.Body.Rumor =>
                             Async[F].unit
 

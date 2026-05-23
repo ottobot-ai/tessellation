@@ -168,6 +168,114 @@ message MetagraphAttestation {
                                  // commitment point, plus the per-binary aggregator dedup.
 }
 
+// ─── Hierarchical-shard-checkpoints v1 — Slice 14 wire format ───────
+//
+// Shard checkpoint envelope. Mirrors the Scala
+// `io.constellationnetwork.schema.sharding.ShardCheckpoint` shape (Slice 1).
+// Produced by a shard committee member (Slice 8 `ShardCheckpointProducer`)
+// and gossipped on per-shard topic `shard-checkpoint-<shardId>` so non-shard
+// gl0 operators can shed the network load (design doc §6.4).
+//
+// Wire-format conventions follow existing project patterns:
+//   - `parent_checkpoint_hash` / `checkpoint_hash`: UTF-8 of the canonical
+//     `Hash` hex string — matches `MetagraphAttestation.parent_hash` /
+//     `Snapshot.hash` and the JVM-side `Hash.getBytes` (UTF-8) decode form.
+//   - Heavy structural payloads (`ShardDerivedStateDeltaWire.payload_json`,
+//     `PerMetagraphSnapshots.signed_snapshots_json`, `emitted_receipts_json`)
+//     are opaque JSON bytes serialized via the project `JsonSerializer`
+//     (deterministic — sortKeys + dropNullValues per `JsonSerializer.forAsync`).
+//     Mirrors `MetagraphBinary.binary` / `AllowSpendBlock.payload` pattern:
+//     the sidecar treats these as opaque bytes; only the JVM serializes /
+//     deserializes via Circe. Keeps the proto schema stable across schema
+//     evolutions of the inner Scala types.
+//   - `committee_signatures` carry fields directly (not opaque) because gl0
+//     acceptance (`ShardCheckpointGl0AcceptanceManager`, Slice 9) needs them
+//     in a structured form for VRF + Ed25519 + KES verification.
+//
+// Greenfield rule: no compat ceremony. Field set and field numbers are pinned
+// to v1; reordering, renaming, or wrapping in `Option`/`optional` silently
+// changes the bytes producers signed (sig pre-image is the JSON-encoded
+// `ShardCheckpointSigPreimage`, not the wire bytes — but the wire shape itself
+// is also frozen at v1 to keep sidecar-bridge parsing stable). Add a new
+// `ShardCheckpointWireV2` if a future evolution is needed.
+message ShardCheckpointWire {
+  uint32 shard_id = 1;
+  uint64 shard_ordinal = 2;
+  bytes parent_checkpoint_hash = 3;      // UTF-8 of canonical Hash hex
+  uint64 gl0_anchor_ordinal = 4;
+  uint64 epoch = 5;
+  repeated PerMetagraphSnapshots included_snapshots = 6;  // NonEmptyList<Signed[SCSB]> per MG, key-ordered
+  ShardDerivedStateDeltaWire derived_state_delta = 7;
+  repeated CommitteeMemberSignatureWire committee_signatures = 8;
+  bytes emitted_receipts_json = 9;       // JSON bytes for List[CrossShardReceipt]; empty == empty list
+}
+
+// Per-metagraph slice of `ShardDerivedStateDelta.includedSnapshots`. The
+// SortedMap ordering is preserved by emitting entries in key order on encode;
+// the decode path re-sorts on the JVM side (cats `Address.OrderingInstance`).
+//
+// `signed_snapshots_json` is a repeated bytes field — each element is a JSON-
+// encoded `Signed[StateChannelSnapshotBinary]` via the project `JsonSerializer`.
+// Order is preserved across the wire (mirrors `NonEmptyList` semantics).
+// A NonEmptyList contract: this list MUST contain ≥ 1 element; an empty list
+// is a protocol violation (Slice 1's `includedSnapshots` value type is
+// `NonEmptyList`). Codecs enforce this on decode.
+message PerMetagraphSnapshots {
+  string metagraph_address = 1;          // DAG base58 string
+  repeated bytes signed_snapshots_json = 2;  // each = Signed[StateChannelSnapshotBinary] JSON bytes
+}
+
+// `ShardDerivedStateDelta` carried as opaque JSON bytes. The inner type has
+// heterogeneous nested structure (`SortedMap[Address, List[SharedArtifact]]`
+// with `SharedArtifact` a sealed trait — SpendAction/PricingUpdate/etc., each
+// with its own discriminator), and the per-MG MPT subtree roots, token-lock
+// balance deltas, sync-data deltas, etc. Field-by-field re-implementation in
+// proto would double the schema surface for zero gain — the bytes that
+// committee members signed are the JSON-encoded `ShardCheckpointSigPreimage`
+// (`Hasher[F].hash` of the Circe-encoded case class), so JSON IS the
+// authoritative encoding regardless. The wire just transports the bytes.
+//
+// Carrying as a single bytes field (rather than per-section) keeps the codec
+// path minimal and avoids drift between the wire's section decomposition and
+// the Scala case-class field set when Slice 9/13 adds new derivations.
+message ShardDerivedStateDeltaWire {
+  bytes payload_json = 1;                // JSON bytes of ShardDerivedStateDelta via JsonSerializer
+}
+
+// One committee member's signature contribution. Mirrors
+// `io.constellationnetwork.schema.sharding.CommitteeMemberSignature` (Slice 1).
+// All three signatures (VRF + Ed25519 + KES product) are independently
+// load-bearing — see the Scala case class scaladoc for the rationale on why
+// they are not wrapped in an outer `Signed[_]` envelope.
+//
+// `peer_id` is UTF-8 of the Hex string carrying the PeerId's underlying hex
+// (matches the existing `MetagraphAttestation.peer_id` decode pattern, which
+// hex-encodes the raw bytes back). Receiver: `Hex(peer_id.toByteArray.map(...))`.
+message CommitteeMemberSignatureWire {
+  bytes peer_id = 1;                     // raw bytes; receiver hex-encodes back to PeerId.value
+  bytes vrf_proof = 2;                   // raw VRF proof bytes
+  bytes ed25519_sig = 3;                 // raw Ed25519 signature bytes
+  bytes kes_product_sig = 4;             // raw KES product signature bytes
+  uint32 kes_tree_step = 5;              // KES tree-internal step the sender used (non-interactive verify)
+}
+
+// Attestation by a committee member who did NOT produce the checkpoint but is
+// signing off on it after observing it on the gossip path. Mirrors how a
+// non-producing committee member attests to a metagraph binary in Slice S2/S3
+// (`pb.MetagraphAttestation`). The attestation references the checkpoint by
+// hash (UTF-8 of the canonical `ShardCheckpointSigPreimage` `Hasher[F]` hex);
+// the receiver looks up the checkpoint envelope by hash + verifies the attester
+// signature, then tallies toward the per-checkpoint `≥ ⌈2/3 K_S⌉` quorum.
+//
+// `shard_id` is on the wire (despite being derivable from the checkpoint) so
+// gossip-layer routing can dispatch to the right per-shard handler without
+// requiring the checkpoint to be available locally first.
+message ShardCheckpointAttestationWire {
+  uint32 shard_id = 1;
+  bytes checkpoint_hash = 2;             // UTF-8 of canonical Hasher[F] of ShardCheckpointSigPreimage
+  CommitteeMemberSignatureWire attester_signature = 3;
+}
+
 // Envelope for GossipSub messages.
 message GossipMessage {
   oneof body {
@@ -179,6 +287,8 @@ message GossipMessage {
     AllowSpendBlock allow_spend_block = 6;
     DAGBlock dag_block = 7;
     TokenLockBlock token_lock_block = 8;
+    ShardCheckpointWire shard_checkpoint = 9;                  // Slice 14
+    ShardCheckpointAttestationWire shard_checkpoint_attestation = 10;  // Slice 14
   }
 }
 
@@ -215,6 +325,20 @@ service SidecarService {
   // Replaces the single-peer HTTP POST from `TokenLock.sendBlockToL0`. Same
   // durable-outbox machinery as #196 / PublishAllowSpendBlock.
   rpc PublishTokenLockBlock(TokenLockBlock) returns (PublishResponse);
+
+  // Slice 14: publish a shard checkpoint to the per-shard topic
+  // `shard-checkpoint-<shardId>`. Only operators sitting in shard `shardId`
+  // subscribe to that topic; non-shard gl0s shed the network load (design doc
+  // §6.4 — sharding payoff). The fully-signed envelope (once `committeeSignatures`
+  // reaches threshold) gets re-published on a separate gl0-wide topic for
+  // consumption by gl0 leaders; that flow lives on top of this primitive.
+  rpc PublishShardCheckpoint(ShardCheckpointWire) returns (PublishResponse);
+
+  // Slice 14: publish a shard checkpoint attestation by a non-producing
+  // committee member. Routed on the same per-shard topic as the checkpoint
+  // envelope. Receivers tally toward the per-checkpoint `≥ ⌈2/3 K_S⌉` quorum
+  // (see Slice 9's `ShardCheckpointGl0AcceptanceManager`).
+  rpc PublishShardCheckpointAttestation(ShardCheckpointAttestationWire) returns (PublishResponse);
 
   // JVM tells sidecar that the listed message_ids on `topic` reached Phase-3
   // finality. The sidecar drops the corresponding outbox entries; until this
@@ -255,6 +379,8 @@ message PeerCountResponse {
   int32 mesh_allow_spend_blocks = 7;     // peers in allow-spend-block topic mesh (#196)
   int32 mesh_dag_blocks = 8;             // peers in dag-block topic mesh (#196 follow-up)
   int32 mesh_token_lock_blocks = 9;      // peers in token-lock-block topic mesh (#196 follow-up)
+  int32 mesh_shard_checkpoints = 10;     // peers in shard-checkpoint topic mesh (Slice 14) — aggregate across shards
+  int32 mesh_shard_checkpoint_attestations = 11;  // peers in shard-checkpoint-attestation topic mesh (Slice 14)
 }
 
 // ConfirmFinalized request: drop outbox entries for the given message ids on

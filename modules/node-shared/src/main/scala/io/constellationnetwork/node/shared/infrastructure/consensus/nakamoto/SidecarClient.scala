@@ -62,6 +62,18 @@ object SidecarClient {
       */
     def publishTokenLockBlock(payload: Array[Byte]): F[PublishResponse]
 
+    /** Slice 14: publish a shard checkpoint on the per-shard topic `shard-checkpoint-<shardId>`. The wire payload is already a
+      * proto-encoded `ShardCheckpointWire` produced via `ShardCheckpointWireCodecs.shardCheckpointToWire`; the sidecar treats it as opaque
+      * and gossips on the per-shard topic indicated by `msg.shardId`. The fully-signed (post-threshold) checkpoint envelope flow rides on
+      * top of this primitive; the gossip topic name routing is the sidecar's responsibility.
+      */
+    def publishShardCheckpoint(msg: ShardCheckpointWire): F[PublishResponse]
+
+    /** Slice 14: publish a shard-checkpoint attestation (non-producing committee member's attestation, post-envelope-observation). Same
+      * per-shard topic as `publishShardCheckpoint`. Receivers tally toward the `≥ ⌈2/3 K_S⌉` quorum (Slice 9).
+      */
+    def publishShardCheckpointAttestation(msg: ShardCheckpointAttestationWire): F[PublishResponse]
+
     /** Ack to the sidecar that the listed message ids on `topic` have reached Phase-3 finality and may be dropped from the outbox. Each id
       * is the sha256 (first 32 bytes) of the same payload bytes the JVM published.
       *
@@ -87,6 +99,18 @@ object SidecarClient {
     val MetagraphAttestation = "metagraph-attestation"
     val DAGBlock = "dag-block"
     val TokenLockBlock = "token-lock-block"
+
+    /** Slice 14: shard checkpoint outbox label. The per-shard GossipSub topic the sidecar publishes on is `shard-checkpoint-<shardId>`
+      * (with the shard-id suffix); this label is the short stable family-prefix shared across all per-shard topics. The sidecar reads
+      * `msg.shardId` to derive the actual topic string at publish time. Matches the design doc §6.4 routing convention.
+      */
+    val ShardCheckpoint = "shard-checkpoint"
+
+    /** Slice 14: shard-checkpoint attestation outbox label — same per-shard topic family as `ShardCheckpoint`
+      * (`shard-checkpoint-<shardId>`). Attestations and the envelopes themselves ride the same topic so receivers can join the per-shard
+      * mesh once and process both.
+      */
+    val ShardCheckpointAttestation = "shard-checkpoint-attestation"
   }
 
   /** Create a gRPC client Resource that opens a channel and cleans up on release. */
@@ -136,6 +160,12 @@ object SidecarClient {
 
       def publishTokenLockBlock(payload: Array[Byte]): F[PublishResponse] =
         liftFuture(stub.publishTokenLockBlock(TokenLockBlock(payload = ByteString.copyFrom(payload))))
+
+      def publishShardCheckpoint(msg: ShardCheckpointWire): F[PublishResponse] =
+        liftFuture(stub.publishShardCheckpoint(msg))
+
+      def publishShardCheckpointAttestation(msg: ShardCheckpointAttestationWire): F[PublishResponse] =
+        liftFuture(stub.publishShardCheckpointAttestation(msg))
 
       def confirmFinalized(topic: String, msgIds: List[Array[Byte]]): F[ConfirmFinalizedResponse] =
         liftFuture(

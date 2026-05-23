@@ -54,6 +54,10 @@ object SidecarClientOutboxSuite extends SimpleIOSuite {
       ref.update(s => s.copy(dagPublished = payload :: s.dagPublished)).as(PublishResponse(ok = true))
     def publishTokenLockBlock(payload: Array[Byte]) =
       ref.update(s => s.copy(tlbPublished = payload :: s.tlbPublished)).as(PublishResponse(ok = true))
+    // Slice 14: shard-checkpoint stubs — outbox unit tests don't exercise these paths, but the algebra
+    // is now total over the trait and the stub must implement every method to construct.
+    def publishShardCheckpoint(msg: ShardCheckpointWire) = IO.pure(PublishResponse(ok = true))
+    def publishShardCheckpointAttestation(msg: ShardCheckpointAttestationWire) = IO.pure(PublishResponse(ok = true))
     def confirmFinalized(topic: String, msgIds: List[Array[Byte]]) =
       ref
         .update(s => s.copy(confirmCalls = (topic, msgIds) :: s.confirmCalls))

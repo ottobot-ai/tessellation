@@ -19,7 +19,7 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
+import io.constellationnetwork.security.signature.signature.SignatureProof
 import io.constellationnetwork.security.signature.{Signed, Signing}
 import io.constellationnetwork.security.{Hashed, Hasher, SecurityProvider}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
@@ -63,6 +63,47 @@ object ShardCheckpointPublisher {
       val read: F[List[Signed[ShardCheckpoint]]] = ref.get
       (publisher, read)
     }
+
+  /** Slice 14: sidecar-backed publisher. Encodes the envelope via [[ShardCheckpointWireCodecs.signedShardCheckpointToWire]] and forwards to
+    * `SidecarClient.publishShardCheckpoint`.
+    *
+    * '''Failure model''' (mirrors `MetagraphCommitteeGate.Publisher`):
+    *   - Wire-codec failures (`JsonSerializer` round-trip throws): logged + swallowed. The producer's slot-leader path MUST NOT block on a
+    *     publish failure.
+    *   - gRPC failure (`ok = false` response or future-side exception): logged + swallowed.
+    *
+    * Failures are intentionally not propagated up — the producer's contract is "fire-and-forget once we've signed". A persistent publisher
+    * failure is observable in cluster-level metrics (Slice 9's gl0 acceptance manager will record absent shard checkpoints), not by raising
+    * errors at the producer.
+    */
+  def sidecar[F[_]: Async: io.constellationnetwork.json.JsonSerializer: org.typelevel.log4cats.Logger](
+    sidecarClient: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarClientAlgebra[F]
+  ): ShardCheckpointPublisher[F] = {
+    val logger = org.typelevel.log4cats.Logger[F]
+    new ShardCheckpointPublisher[F] {
+      def publish(checkpoint: Signed[ShardCheckpoint]): F[Unit] =
+        ShardCheckpointWireCodecs
+          .signedShardCheckpointToWire[F](checkpoint)
+          .flatMap { wire =>
+            sidecarClient.publishShardCheckpoint(wire).flatMap { resp =>
+              if (resp.ok) Async[F].unit
+              else
+                logger.warn(
+                  s"ShardCheckpointPublisher.sidecar: sidecar PublishShardCheckpoint returned not-ok " +
+                    s"(shardId=${checkpoint.value.shardId.value.value} shardOrdinal=${checkpoint.value.shardOrdinal.value} " +
+                    s"gl0Anchor=${checkpoint.value.gl0AnchorOrdinal.value.value}): ${resp.error}"
+                )
+            }
+          }
+          .handleErrorWith { err =>
+            logger.warn(
+              s"ShardCheckpointPublisher.sidecar: publish failed for " +
+                s"shardId=${checkpoint.value.shardId.value.value} shardOrdinal=${checkpoint.value.shardOrdinal.value} " +
+                s"gl0Anchor=${checkpoint.value.gl0AnchorOrdinal.value.value}: ${err.getMessage}"
+            )
+          }
+    }
+  }
 }
 
 /** Produces (and signs, and publishes) one [[ShardCheckpoint]] per call — slice 8 of
