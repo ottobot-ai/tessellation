@@ -85,8 +85,42 @@ object types {
   case class NakamotoConfig(
     etaRotationSnapshots: PosLong,
     keepDepthBehindFinalized: PosLong,
-    localEvents: LocalEventsConfig
+    localEvents: LocalEventsConfig,
+    sharding: ShardingConfig
   )
+
+  /** Hierarchical-shard-checkpoints v1 typed config shape (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §4.2). Defaults
+    * collapse to the degenerate single-shard case (`numShards = 1`) so this block is a no-op until other slices consume it.
+    *
+    *   - `numShards`: cluster-wide static shard count. Metagraph → shard is deterministic via `Hasher.hash(metagraphAddress) mod
+    *     numShards`. Default `1` ⇒ every metagraph maps to shard 0.
+    *   - `committeeKTarget`: target committee size per shard per epoch (the `K_target` of `COMMITTEE-SORTITION-DESIGN.md` §5). v1: fixed
+    *     cluster-wide.
+    *   - `finality`: per-shard FinalityTrigger params (`k1Shard` is the depth-finality fallback in the shard's own mini-chain — smaller
+    *     than gl0 k₁=255 because shard ords are sparser).
+    *   - `checkpoint`: emission cadence + burst cap for shard checkpoints (Option C per `SHARD-CHECKPOINT-GRANULARITY.md`).
+    */
+  case class ShardingConfig(
+    numShards: Int,
+    committeeKTarget: Int,
+    finality: ShardFinalityConfig,
+    checkpoint: ShardCheckpointConfig
+  )
+
+  /** `k1Shard` maps to HOCON key `k1-shard` (the digit binds tight to the preceding letter — same convention as `k₁` in the design doc). A
+    * `ProductHint` is supplied in [[ShardFinalityConfig]]'s companion so pureconfig's default `CamelCase` → `KebabCase` doesn't split the
+    * field into the unwanted `k-1-shard`.
+    */
+  case class ShardFinalityConfig(k1Shard: Long)
+
+  object ShardFinalityConfig {
+    implicit val configHint: _root_.pureconfig.generic.ProductHint[ShardFinalityConfig] =
+      _root_.pureconfig.generic.ProductHint[ShardFinalityConfig](
+        _root_.pureconfig.ConfigFieldMapping(Map("k1Shard" -> "k1-shard"))
+      )
+  }
+
+  case class ShardCheckpointConfig(tAliveMs: Long, tBurst: Int)
 
   /** Configuration for the gl0-embedded `LocalEvents` reactive event stream (see `docs/nakamoto/LOCAL-EVENTS-SERVICE-DESIGN.md`). Drives
     * the gRPC server that publishes consensus events to local subscribers (e2e tests, operator GUI).
