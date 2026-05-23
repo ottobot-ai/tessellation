@@ -39,7 +39,7 @@ import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator.Spen
 import io.constellationnetwork.node.shared.domain.swap.block._
 import io.constellationnetwork.node.shared.domain.tokenlock.block._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.EventTrigger
-import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
+import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.{DelegateRewardsInput, DelegatedRewardsResult, RewardsInput}
 import io.constellationnetwork.node.shared.logger.Slf4jLoggerBundle
 import io.constellationnetwork.schema.ID.Id
@@ -282,7 +282,15 @@ object Mocks {
     // Create the manager with mock dependencies
     implicit val hasherSelector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
     implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(Long.MaxValue))
-    Metrics.forAsync[IO](Seq.empty).use { implicit metrics =>
+    // `NoOpMetrics` instead of `Metrics.forAsync[IO]` — the production constructor binds `LogbackMetrics()`,
+    // which holds a JVM-global slf4j singleton handle. Weaver runs tests in parallel and the LogbackMetrics
+    // initialization races inside the same sbt JVM (only one binding succeeds; the rest CCE
+    // `SubstituteLoggerFactory cannot be cast to ch.qos.logback.classic.LoggerContext`). NoOpMetrics is the
+    // convention used by every other test file in this package (FinalityTriggerSuite, ChainSelectionSuite,
+    // ShardCheckpointGl0AcceptanceManagerSuite, etc.) and keeps the regression bar from flaking on a test
+    // infrastructure quirk that has nothing to do with the GSAM contract under test.
+    implicit val noOpMetrics: Metrics[IO] = NoOpMetrics.make
+    locally {
       JsonSerializer.forAsync[IO].flatMap { implicit j =>
         Slf4jLoggerBundle.makeUnsafe[IO].flatMap { loggerBundle =>
           InMemoryMerklePatriciaProducer.make[IO]().flatMap { mptProducer =>
