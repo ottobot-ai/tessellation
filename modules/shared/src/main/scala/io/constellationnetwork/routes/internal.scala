@@ -73,6 +73,7 @@ object internal {
       :: Equal["/mempool"]
       :: Equal["/nakamoto"]
       :: Equal["/kes-registration"]
+      :: Equal["/shard"]
       :: HNil
   ]
 
