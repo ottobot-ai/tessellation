@@ -42,7 +42,10 @@ object ShardingConfigSuite extends SimpleIOSuite {
       cfg.checkpoint.tAliveMs == 30000L,
       cfg.checkpoint.tBurst == 64,
       // Slice 19: default partition-hard threshold is 10 minutes.
-      cfg.observability.tPartitionHardMs == 600000L
+      cfg.observability.tPartitionHardMs == 600000L,
+      // Slice 17: default non-participation slashing — 33% missed-rate ceiling, min 5 duties before evaluating.
+      cfg.slashing.maxMissedPctPerEpoch == 33,
+      cfg.slashing.minDenominatorPerEpoch == 5L
     )
   }
 
@@ -55,6 +58,7 @@ object ShardingConfigSuite extends SimpleIOSuite {
         |  finality { k1-shard = 16 }
         |  checkpoint { t-alive-ms = 45000, t-burst = 128 }
         |  observability { t-partition-hard-ms = 90000 }
+        |  slashing { max-missed-pct-per-epoch = 50, min-denominator-per-epoch = 10 }
         |}
       """.stripMargin
     )
@@ -64,7 +68,9 @@ object ShardingConfigSuite extends SimpleIOSuite {
       cfg.finality.k1Shard == 16L,
       cfg.checkpoint.tAliveMs == 45000L,
       cfg.checkpoint.tBurst == 128,
-      cfg.observability.tPartitionHardMs == 90000L
+      cfg.observability.tPartitionHardMs == 90000L,
+      cfg.slashing.maxMissedPctPerEpoch == 50,
+      cfg.slashing.minDenominatorPerEpoch == 10L
     )
   }
 
@@ -82,7 +88,9 @@ object ShardingConfigSuite extends SimpleIOSuite {
       cfg.finality.k1Shard == 8L,
       cfg.checkpoint.tAliveMs == 30000L,
       cfg.checkpoint.tBurst == 64,
-      cfg.observability.tPartitionHardMs == 600000L
+      cfg.observability.tPartitionHardMs == 600000L,
+      cfg.slashing.maxMissedPctPerEpoch == 33,
+      cfg.slashing.minDenominatorPerEpoch == 5L
     )
   }
 }

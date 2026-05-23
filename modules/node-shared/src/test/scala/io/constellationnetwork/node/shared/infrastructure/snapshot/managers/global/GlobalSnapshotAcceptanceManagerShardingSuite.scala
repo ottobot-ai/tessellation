@@ -447,7 +447,8 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       committeeKTarget = 4,
       finality = ShardFinalityConfig(k1Shard = 8L),
       checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100),
-      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L)
+      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L),
+      slashing = ShardSlashingConfig(maxMissedPctPerEpoch = 33, minDenominatorPerEpoch = 5L)
     )
 
   /** Shared no-op rewards function — none of the suite tests exercise the rewards path. */

@@ -11,6 +11,7 @@ import io.constellationnetwork.schema.mpt.PartitionNamespace._
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.priceOracle.TokenPair
+import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -229,6 +230,19 @@ object GlobalStateFieldId {
     */
   case object LastKesRegistrationRefs extends GlobalStateFieldId { def toInt: Int = 23 }
 
+  /** Slice 17 — per-(shard, peer, epoch) non-participation accumulator (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`
+    * §10.3). One MPT entry per `(shardId, peerId, epoch)` triple carrying a
+    * [[io.constellationnetwork.schema.sharding.ShardNonParticipationCounter]] — the running tally of missed slot-leader and missed
+    * attestation duties. Written by `ShardNonParticipationStateManager` during the shard's `accept`/attestation paths; read at gl0 epoch
+    * boundary by `ShardNonParticipationSlasher` to produce the slash list for the just-closed epoch.
+    *
+    * '''Why a hypergraph-namespaced field, not system-namespaced.''' The counter is user-addressable in the sense that operator tooling
+    * needs to query it (operators want to know "am I close to being slashed for non-participation?"). System-namespaced partitions are
+    * reserved for derived/internal indices; a per-peer ledger-relevant counter is closer to `ActiveDelegatedStakes` (per-peer state) than
+    * to `ExpiryIndexTokenLocks` (derived index). Following the pattern lets the standard hypergraph key constructors apply.
+    */
+  case object ShardNonParticipation extends GlobalStateFieldId { def toInt: Int = 24 }
+
   implicit val ordering: Ordering[GlobalStateFieldId] = Ordering.by(_.toInt)
   implicit val show: Show[GlobalStateFieldId] = Show.show(_.toInt.toString)
 
@@ -262,6 +276,7 @@ object GlobalStateFieldId {
     case 21 => Some(TowerEntries)
     case 22 => Some(KesRegistrationCerts)
     case 23 => Some(LastKesRegistrationRefs)
+    case 24 => Some(ShardNonParticipation)
     case _  => None
   }
 }
@@ -331,6 +346,27 @@ object GlobalStateKey {
   def expiryIndexKey[F[_]: Sync: Hasher](label: SystemNamespaceLabel, epoch: EpochProgress): F[GlobalStateKey] =
     Hasher[F].hash(epoch.show).map { h =>
       GlobalStateKey(SystemNamespace(label), GlobalStateFieldId.SystemIndex, EmptyNamespace, HashNamespace(h))
+    }
+
+  /** Slice 17 — key into the per-(shard, peer, epoch) [[GlobalStateFieldId.ShardNonParticipation]] partition. The composite tuple is folded
+    * into a single hash so each `(shardId, peerId, epoch)` triple maps to one MPT entry under the hypergraph namespace.
+    *
+    * '''Why one composite hash rather than three nested namespaces.''' `GlobalStateKey` has exactly four slots (network, field, contract,
+    * user); the natural layout for this partition would be three keyed slots (shard, peer, epoch) plus the field. Folding to one composite
+    * hash keeps the field's MPT root scannable with a single prefix (`hypergraphFieldPrefix(ShardNonParticipation)`) for the slasher's
+    * `materializeAllForEpoch` and avoids forcing structural changes to `GlobalStateKey`.
+    *
+    * '''Per-epoch filtering at materialize-time.''' Because all `(shardId, peerId, epoch)` triples share one prefix, the slasher's
+    * per-epoch scan filters the prefix-scan results by `counter.epoch === closedEpoch` rather than narrowing the prefix. This is fine for
+    * the expected partition size (at most `numShards * |operators| * retentionEpochs` entries ≈ 4 × 100 × 4 = 1600 in v1).
+    */
+  def shardNonParticipationKey[F[_]: Sync: Hasher](
+    shardId: ShardId,
+    peerId: PeerId,
+    epoch: EtaPeriod
+  ): F[GlobalStateKey] =
+    Hasher[F].hash(s"${shardId.value.value}|${peerId.value.value}|${epoch.value}").map { h =>
+      GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.ShardNonParticipation, EmptyNamespace, HashNamespace(h))
     }
 
   /** Key into the §3 NIPoPoW historical-stake-snapshots partition. `userNamespace` carries a hash of the eta-period's canonical string

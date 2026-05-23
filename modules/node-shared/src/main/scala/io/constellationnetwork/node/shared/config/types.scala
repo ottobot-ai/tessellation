@@ -105,7 +105,8 @@ object types {
     committeeKTarget: Int,
     finality: ShardFinalityConfig,
     checkpoint: ShardCheckpointConfig,
-    observability: ShardObservabilityConfig
+    observability: ShardObservabilityConfig,
+    slashing: ShardSlashingConfig
   )
 
   /** `k1Shard` maps to HOCON key `k1-shard` (the digit binds tight to the preceding letter — same convention as `k₁` in the design doc). A
@@ -131,6 +132,19 @@ object types {
     *     automatic rotation. Default `600000` ms = 10 minutes (≥ `5 × t-alive-ms` in any realistic deploy).
     */
   case class ShardObservabilityConfig(tPartitionHardMs: Long)
+
+  /** Slice 17 (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §10.3) — per-epoch non-participation slashing.
+    *
+    *   - `maxMissedPctPerEpoch`: percentage threshold (0..100) — a committee member whose `missedSlotsAsLeader / totalSlotsAsLeader` or
+    *     `missedAttestationWindows / totalCheckpointsReceived` exceeds this fraction in the just-closed epoch is added to the slash list at
+    *     the epoch boundary. Default `33` ⇒ slash when more than ~one-third of duties are missed.
+    *   - `minDenominatorPerEpoch`: minimum number of duties (slot-leader elections OR checkpoints received) that must have occurred before
+    *     the rate is evaluated for that obligation. Without this floor, a peer elected leader once and missing that single slot would
+    *     register 100% missed and be slashed — a single sample is noise, not evidence of non-participation. Default `5` ⇒ ignore rates when
+    *     fewer than 5 duties were attempted; matches the slashing-safety bar (evidence + determinism + standard patterns —
+    *     `feedback_slashing_safety_bar`) which favours false-negatives over false-positives.
+    */
+  case class ShardSlashingConfig(maxMissedPctPerEpoch: Int, minDenominatorPerEpoch: Long)
 
   /** Configuration for the gl0-embedded `LocalEvents` reactive event stream (see `docs/nakamoto/LOCAL-EVENTS-SERVICE-DESIGN.md`). Drives
     * the gRPC server that publishes consensus events to local subscribers (e2e tests, operator GUI).

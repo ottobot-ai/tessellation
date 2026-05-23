@@ -10,6 +10,7 @@ import io.constellationnetwork.schema.kes.KesRegistrationCert.KesRegistrationRec
 import io.constellationnetwork.schema.mpt.{AllowSpendExpiryKey, NodeCollateralWithdrawalExpiryKey, TokenLockExpiryKey}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
+import io.constellationnetwork.schema.sharding.{ShardId, ShardNonParticipationCounter}
 import io.constellationnetwork.schema.swap.AllowSpend
 import io.constellationnetwork.schema.tokenLock.TokenLock
 import io.constellationnetwork.security.signature.Signed
@@ -24,11 +25,14 @@ import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => hashCo
 import io.constellationnetwork.serde.codecs.instances.KesRegistrationCodecs._
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs._
+import io.constellationnetwork.serde.codecs.instances.PeerIdCodec.{codec => peerIdCodec}
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
+import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{etaPeriodCodec => etaPeriodScodec}
 import io.constellationnetwork.serde.codecs.instances.TokenLockCodec.{codec => tokenLockCodec}
 import io.constellationnetwork.serde.codecs.instances.UpdateNodeParametersCodec.updateNodeParametersCodec
 
 import scodec.Codec
+import scodec.codecs._
 import shapeless.{::, HNil}
 
 /** Aggregator for the composite value-type `ImmutableCodec` instances stored in the global-state MPT via `MptStore[F, GlobalStateKey]`.
@@ -140,4 +144,44 @@ object GlobalStateMptCodecs {
 
   implicit val addressPairSetImmutableCodec: ImmutableCodec[SortedSet[(Address, Address)]] =
     ImmutableCodec.fromScodecCodec(sortedSet(addressPairCodec))
+
+  // ---- Slice 17 — Shard non-participation counter --------------------------
+
+  /** Wire shape for `ShardId` — `int32` of the underlying refined `NonNegInt`. The refinement is enforced on decode through
+    * `ShardId.unsafeApply` because the codec already constrains the source to a non-negative producer (`ShardId.value.value`). Production
+    * decodes always come from prior encodes, so the round-trip is the discipline; should a corrupt byte stream surface a negative value
+    * `unsafeApply` will throw at decode time, which is the desired loud failure for consensus-bytes.
+    */
+  private val shardIdCodec: Codec[ShardId] =
+    int32.xmap[ShardId](ShardId.unsafeApply, _.value.value)
+
+  /** Scodec for the `ShardNonParticipationCounter` record. Field order mirrors the case-class declaration order; changing the order would
+    * shift the on-disk bytes and is a hard-fork move. Per-(shard, peer, epoch) tuples plus four `Long` tallies — total wire size is ~58
+    * bytes for typical PeerId hex lengths, well inside the MPT entry budget.
+    */
+  private val shardNonParticipationCounterCodec: Codec[ShardNonParticipationCounter] = {
+    val _ = (etaPeriodScodec, peerIdCodec) // bind context-bound implicits
+    (shardIdCodec :: peerIdCodec :: etaPeriodScodec :: int64 :: int64 :: int64 :: int64).xmap[ShardNonParticipationCounter](
+      {
+        case sid :: pid :: ep :: missedSlots :: missedAtts :: totalSlots :: totalCps :: HNil =>
+          ShardNonParticipationCounter(sid, pid, ep, missedSlots, missedAtts, totalSlots, totalCps)
+      },
+      c =>
+        c.shardId :: c.peerId :: c.epoch :: c.missedSlotsAsLeader :: c.missedAttestationWindows ::
+          c.totalSlotsAsLeader :: c.totalCheckpointsReceived :: HNil
+    )
+  }
+
+  /** Bound here so MPT reads/writes for the shard non-participation partition (`GlobalStateFieldId.ShardNonParticipation`) resolve
+    * `store.get[ShardNonParticipationCounter](...)` and `store.insert[ShardNonParticipationCounter](...)` without each call site importing
+    * `shardNonParticipationCounterCodec` explicitly.
+    */
+  implicit val shardNonParticipationCounterImmutableCodec: ImmutableCodec[ShardNonParticipationCounter] =
+    ImmutableCodec.fromScodecCodec(shardNonParticipationCounterCodec)
+
+  /** `ShardId` codec re-export so `EpochBucket`-style consumers that need a typed key codec (e.g. cross-shard sortition tests) can pick up
+    * the same wire bytes the counter partition writes use. Public-but-explicit avoids implicit pollution at unrelated call sites.
+    */
+  val shardIdScodec: Codec[ShardId] = shardIdCodec
+  locally { val _ = shardIdScodec }
 }
