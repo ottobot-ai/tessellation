@@ -23,16 +23,16 @@ import weaver.MutableIOSuite
   * [[io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker]] (slice 7 of hierarchical-shard-checkpoints v1, §5.3 + §5.6).
   *
   * Coverage:
-  *   1. '''`computeShardEta` determinism''' — same `(shardId, gl0Eta)` ⇒ identical bytes across invocations.
-  *   2. '''`computeShardEta` domain separation''' — two different `shardId`s with same `gl0Eta` produce different shardEtas (§5.6 — the
-  *      load-bearing property that per-shard slot lotteries don't collide).
-  *   3. '''`computeShardEta` length invariant''' — output is exactly 32 bytes (matches the invariant `EligibilityChecker.vrfProofForSlot`
-  *      asserts on its `eta` argument; a regression here would surface as an IllegalArgumentException at the first `isLeader` call).
-  *   4. '''`isLeader` expected fire rate''' — over a sweep of 1000 slots with K_S=4 committee members at σ=1/4 each, the per-validator
-  *      fire count matches the LDD-derived expectation within a generous tolerance (sanity bound, not Chernoff-tight).
-  *   5. '''`isLeader` ↔ `verifyLeader` round-trip''' — a leader's proof verifies under their VK for the same `(shardEta, slot, σ, ldd)`.
-  *   6. '''`verifyLeader` rejects on wrong shardEta''' — a proof for shardEta_X does NOT verify under shardEta_Y (cross-shard isolation
-  *      at the verifier; a defensive check that catches both eta-derivation drift and a confused-deputy attack across shards).
+  *   1. '''`computeShardEta` determinism''' — same `(shardId, gl0Eta)` ⇒ identical bytes across invocations. 2. '''`computeShardEta` domain
+  *      separation''' — two different `shardId`s with same `gl0Eta` produce different shardEtas (§5.6 — the load-bearing property that
+  *      per-shard slot lotteries don't collide). 3. '''`computeShardEta` length invariant''' — output is exactly 32 bytes (matches the
+  *      invariant `EligibilityChecker.vrfProofForSlot` asserts on its `eta` argument; a regression here would surface as an
+  *      IllegalArgumentException at the first `isLeader` call). 4. '''`isLeader` expected fire rate''' — over a sweep of 1000 slots with
+  *      K_S=4 committee members at σ=1/4 each, the per-validator fire count matches the LDD-derived expectation within a generous tolerance
+  *      (sanity bound, not Chernoff-tight). 5. '''`isLeader` ↔ `verifyLeader` round-trip''' — a leader's proof verifies under their VK for
+  *      the same `(shardEta, slot, σ, ldd)`. 6. '''`verifyLeader` rejects on wrong shardEta''' — a proof for shardEta_X does NOT verify
+  *      under shardEta_Y (cross-shard isolation at the verifier; a defensive check that catches both eta-derivation drift and a
+  *      confused-deputy attack across shards).
   */
 object ShardSlotLeaderSuite extends MutableIOSuite {
 
@@ -172,7 +172,7 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
       val totalExpectedFiresPerValidator = for {
         threshold <- ec.threshold(sigma, slotGap, cfg)
         // Convert exact Ratio to Double only to set up the test tolerance — the threshold ITSELF in the runtime path stays exact.
-      } yield (numSlots * threshold.toDouble)
+      } yield numSlots * threshold.toDouble
 
       for {
         shardEta <- ssl.computeShardEta(shardId, gl0Eta)
@@ -282,8 +282,9 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
             for {
               verifiedUnderX <- ssl.verifyLeader(vk, shardEtaX, slot, slotGap, sigma, cfg, proof)
               verifiedUnderY <- ssl.verifyLeader(vk, shardEtaY, slot, slotGap, sigma, cfg, proof)
-            } yield expect(verifiedUnderX, "control: proof verifies under shardEtaX")
-              .and(expect(!verifiedUnderY, "cross-shard isolation: proof for shardX MUST NOT verify under shardY's eta"))
+            } yield
+              expect(verifiedUnderX, "control: proof verifies under shardEtaX")
+                .and(expect(!verifiedUnderY, "cross-shard isolation: proof for shardX MUST NOT verify under shardY's eta"))
           case None =>
             IO.pure(failure("did not find a winning slot for the cross-shard isolation test in 1000 attempts"))
         }

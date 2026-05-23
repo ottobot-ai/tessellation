@@ -43,9 +43,9 @@ import weaver.FunSuite
   *      emits a `shardCheckpoints` key, the decoder still requires the other 24 fields, and equality holds.
   *
   * '''What this suite does NOT exercise.''' No state-application semantics (acceptance into MPT, fork-choice, etc.) — those land in later
-  * slices (9, 13). No scodec wire-format coverage — `JsonScodecParitySuite` proves scodec parity on pre-Slice-4 fixtures continues to
-  * work, and a dedicated `ShardingScodecCodecs` package (for non-empty `ShardCheckpoint` scodec encoding) is deferred to a follow-up slice
-  * (see scaladoc in `GlobalSnapshotCodecs.globalIncrementalSnapshotCodec`).
+  * slices (9, 13). No scodec wire-format coverage — `JsonScodecParitySuite` proves scodec parity on pre-Slice-4 fixtures continues to work,
+  * and a dedicated `ShardingScodecCodecs` package (for non-empty `ShardCheckpoint` scodec encoding) is deferred to a follow-up slice (see
+  * scaladoc in `GlobalSnapshotCodecs.globalIncrementalSnapshotCodec`).
   *
   * '''Why `FunSuite`, not `MutableIOSuite`.''' Circe codecs are pure functions; no `IO` is needed. Matches `ShardingCodecsSuite` (Slice 1)
   * and `GlobalSnapshotCodecsSuite` (the existing top-level snapshot round-trip suite).

@@ -46,8 +46,8 @@ object ShardAssignmentSuite extends MutableIOSuite {
   }
 
   /** Generate a random address via the same `Address.fromBytes` path the production code uses to construct addresses from public-key bytes.
-    * Each address is a SHA-256 over the random byte input, so the distribution over the `Address` newtype is whatever `fromBytes` happens to
-    * produce — which is what we ultimately want to bucket-test.
+    * Each address is a SHA-256 over the random byte input, so the distribution over the `Address` newtype is whatever `fromBytes` happens
+    * to produce — which is what we ultimately want to bucket-test.
     */
   private def randomAddress(rng: SecureRandom): Address = {
     val bytes = new Array[Byte](32)
@@ -65,8 +65,9 @@ object ShardAssignmentSuite extends MutableIOSuite {
     for {
       // 8 repeated invocations; all must produce the same ShardId.
       results <- List.fill(8)(service.shardIdFor(addr)).sequence
-    } yield expect(results.distinct.size == 1)
-      .and(expect(results.head.value.value >= 0 && results.head.value.value < 16))
+    } yield
+      expect(results.distinct.size == 1)
+        .and(expect(results.head.value.value >= 0 && results.head.value.value < 16))
   }
 
   // ---- Test 2: Uniform distribution -----------------------------------------
@@ -96,8 +97,9 @@ object ShardAssignmentSuite extends MutableIOSuite {
       // Every shard MUST have received samples — a shard with zero hits is itself a strong bias signal.
       missing: Set[ShardId] = (0 until numShards).map(i => ShardId(NonNegInt.unsafeFrom(i))).toSet -- counts.keySet
       outliers: Map[ShardId, Int] = counts.filter { case (_, n) => n < lowerBound || n > upperBound }
-    } yield expect(missing.isEmpty, s"shards with zero samples: ${missing.toList.map(_.value.value).sorted}")
-      .and(expect(outliers.isEmpty, s"shards outside [$lowerBound, $upperBound]: ${outliers.toList.sortBy(_._1.value.value)}"))
+    } yield
+      expect(missing.isEmpty, s"shards with zero samples: ${missing.toList.map(_.value.value).sorted}")
+        .and(expect(outliers.isEmpty, s"shards outside [$lowerBound, $upperBound]: ${outliers.toList.sortBy(_._1.value.value)}"))
   }
 
   // ---- Test 3: M=1 collapse --------------------------------------------------
@@ -133,13 +135,14 @@ object ShardAssignmentSuite extends MutableIOSuite {
       // Addresses that landed in shard 0 under each M.
       m2InZero: Set[Address] = addresses.zip(m2Ids).collect { case (a, sid) if sid == shardZero => a }.toSet
       m4InZero: Set[Address] = addresses.zip(m4Ids).collect { case (a, sid) if sid == shardZero => a }.toSet
-    } yield expect(m2InZero.nonEmpty, "M=2 produced no shard-0 hits — sampling issue?")
-      .and(expect(m4InZero.nonEmpty, "M=4 produced no shard-0 hits — sampling issue?"))
-      // Under uniform hashing, an address in M=4 shard 0 ⇒ also in M=2 shard 0 (since 4 mod 2 = 0
-      // for half the M=4 buckets). But the converse fails: M=2 shard 0 only matches M=4 shards 0
-      // and 2. So m4InZero ⊊ m2InZero strictly. We assert the strict-subset relation.
-      .and(expect(m4InZero.subsetOf(m2InZero), "M=4 shard-0 should be a subset of M=2 shard-0 under hash-mod"))
-      .and(expect(m4InZero.size < m2InZero.size, "M=4 shard-0 should be strictly smaller than M=2 shard-0 (otherwise mapping ignored M)"))
+    } yield
+      expect(m2InZero.nonEmpty, "M=2 produced no shard-0 hits — sampling issue?")
+        .and(expect(m4InZero.nonEmpty, "M=4 produced no shard-0 hits — sampling issue?"))
+        // Under uniform hashing, an address in M=4 shard 0 ⇒ also in M=2 shard 0 (since 4 mod 2 = 0
+        // for half the M=4 buckets). But the converse fails: M=2 shard 0 only matches M=4 shards 0
+        // and 2. So m4InZero ⊊ m2InZero strictly. We assert the strict-subset relation.
+        .and(expect(m4InZero.subsetOf(m2InZero), "M=4 shard-0 should be a subset of M=2 shard-0 under hash-mod"))
+        .and(expect(m4InZero.size < m2InZero.size, "M=4 shard-0 should be strictly smaller than M=2 shard-0 (otherwise mapping ignored M)"))
   }
 
   // ---- Test 5: require(numShards > 0) at construction time -------------------

@@ -22,12 +22,12 @@ import weaver.FunSuite
   *      on the parsed `FraudProofEnvelope` being structurally complete.
   *   1. '''Deterministic encoding.''' The challenger's `challengerSignature` is computed over the JSON-encoded preimage of the envelope's
   *      other fields. If two encodings of the same envelope produced different bytes (e.g. because the encoder happened to randomise field
-  *      order), every challenger would sign a unique byte sequence and verifiers couldn't reproduce the signed bytes. Pinning byte
-  *      equality of two successive encodes makes this assumption an enforced contract instead of folklore.
-  *   1. '''Empty + large `reexecutionWitness`.''' v1 carries `Array.empty` witness bytes (§11.3 — challenger construction lives in v2);
-  *      v2 will carry per-derivation witnesses that can be sizeable. The `Hex`-backed wire shape needs to handle both ends without
-  *      surprise — a zero-length string should encode and decode cleanly (no edge-case crash), and a witness on the order of 10 KB should
-  *      round-trip identically (no implicit truncation, no buffer-limit collision).
+  *      order), every challenger would sign a unique byte sequence and verifiers couldn't reproduce the signed bytes. Pinning byte equality
+  *      of two successive encodes makes this assumption an enforced contract instead of folklore.
+  *   1. '''Empty + large `reexecutionWitness`.''' v1 carries `Array.empty` witness bytes (§11.3 — challenger construction lives in v2); v2
+  *      will carry per-derivation witnesses that can be sizeable. The `Hex`-backed wire shape needs to handle both ends without surprise —
+  *      a zero-length string should encode and decode cleanly (no edge-case crash), and a witness on the order of 10 KB should round-trip
+  *      identically (no implicit truncation, no buffer-limit collision).
   *
   * '''What this suite does NOT exercise.''' The basic happy-path round-trip is already covered by
   * `ShardingCodecsSuite.test("FraudProofEnvelope: round-trips through Circe")` — see the "Optional addendum" guidance in the slice 18

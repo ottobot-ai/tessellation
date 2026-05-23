@@ -14,8 +14,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *
   * Holds the fork-DAG of `Signed[ShardCheckpoint]`s produced by a single shard's mini-Taktikos chain. Each shard committee maintains one
   * instance per shard it participates in. The store is analogous to `NakamotoChainStore` for gl0 (see
-  * `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoChainStore.scala`) but scoped to a
-  * single shard rather than the global chain.
+  * `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoChainStore.scala`) but scoped to
+  * a single shard rather than the global chain.
   *
   * '''Scope''' (per design doc §5.5):
   *   - In-memory map `byHash` of all known shard checkpoints (fork-DAG, not just canonical chain). Bounded by `keepDepthBehindFinalized` to
@@ -80,8 +80,8 @@ trait ShardChainStore[F[_]] {
   /** Mark a checkpoint as locally-finalized at the shard layer (Phase 1→2 transition per §5.4). Advances `lastFinalizedOrdinal` and evicts
     * entries whose ordinal is strictly below the keep-floor (`finalized.ordinal - keepDepthBehindFinalized`, clamped to 0).
     *
-    * Idempotent: calling with the same hash twice is a no-op on the second call. Monotone: never moves `lastFinalizedOrdinal` backward —
-    * a finalize at an ordinal at-or-below the current finalized ordinal is dropped without side effect.
+    * Idempotent: calling with the same hash twice is a no-op on the second call. Monotone: never moves `lastFinalizedOrdinal` backward — a
+    * finalize at an ordinal at-or-below the current finalized ordinal is dropped without side effect.
     */
   def `finalize`(checkpointHash: Hash): F[Unit]
 
@@ -119,8 +119,8 @@ object ShardChainStore {
     * @param hash
     *   `Hasher[F]` of the `ShardCheckpointSigPreimage` (design doc §3.3) — the bytes every committee member signed
     * @param proofsHash
-    *   `Hasher[F]` of the outer `Signed` envelope's proofs set; carried so `toHashed` is byte-faithful to the standard `Hashed`
-    *   contract (no synthesized placeholder)
+    *   `Hasher[F]` of the outer `Signed` envelope's proofs set; carried so `toHashed` is byte-faithful to the standard `Hashed` contract
+    *   (no synthesized placeholder)
     * @param shardOrdinal
     *   the chain height within this shard (also carried on the envelope; replicated here for fast access)
     * @param slot
@@ -195,64 +195,65 @@ object ShardChainStore {
           //     member signed. The store keys its `byHash` map by this so lookups by canonical-hash work everywhere.
           //   - `proofsHash` = `Hasher[F]` over the outer Signed envelope's proofs set — carried on the `Hashed` wrapper for parity with
           //     the standard contract (no synthesized placeholder).
-          (deriveHash(checkpoint), checkpoint.proofsHash[F]).tupled.flatMap { case (snapshotHash, sigProofsHash) =>
-            val stored = StoredShardCheckpoint(
-              signedCheckpoint = checkpoint,
-              hash = snapshotHash,
-              proofsHash = sigProofsHash,
-              shardOrdinal = shardOrdinal,
-              slot = slot,
-              parentHash = parentHash,
-              vrfOutput = vrfOutput
-            )
+          (deriveHash(checkpoint), checkpoint.proofsHash[F]).tupled.flatMap {
+            case (snapshotHash, sigProofsHash) =>
+              val stored = StoredShardCheckpoint(
+                signedCheckpoint = checkpoint,
+                hash = snapshotHash,
+                proofsHash = sigProofsHash,
+                shardOrdinal = shardOrdinal,
+                slot = slot,
+                parentHash = parentHash,
+                vrfOutput = vrfOutput
+              )
 
-            stateRef.modify { state =>
-              if (state.byHash.contains(snapshotHash)) {
-                // Duplicate — already stored. Idempotent no-op.
-                (state, logger.debug(s"store: duplicate hash=${snapshotHash.value.take(12)}; ignoring").as(false))
-              } else {
-                val newByHash = state.byHash + (snapshotHash -> stored)
+              stateRef.modify { state =>
+                if (state.byHash.contains(snapshotHash)) {
+                  // Duplicate — already stored. Idempotent no-op.
+                  (state, logger.debug(s"store: duplicate hash=${snapshotHash.value.take(12)}; ignoring").as(false))
+                } else {
+                  val newByHash = state.byHash + (snapshotHash -> stored)
 
-                // Resolve current tip defensively — if `bestTipHash` points at a hash no longer in `byHash` (eviction race), treat as no
-                // best tip. Mirrors the `resolvedBest = state.bestTipHash.flatMap(...)` pattern in `NakamotoChainStore.store`.
-                val resolvedBest: Option[StoredShardCheckpoint] =
-                  state.bestTipHash.flatMap(state.byHash.get)
+                  // Resolve current tip defensively — if `bestTipHash` points at a hash no longer in `byHash` (eviction race), treat as no
+                  // best tip. Mirrors the `resolvedBest = state.bestTipHash.flatMap(...)` pattern in `NakamotoChainStore.store`.
+                  val resolvedBest: Option[StoredShardCheckpoint] =
+                    state.bestTipHash.flatMap(state.byHash.get)
 
-                val newBestTipHash: Hash = resolvedBest match {
-                  case None         => snapshotHash // first store OR stale best tip — incoming becomes the best
-                  case Some(curBest) =>
-                    if (compareMaxvalidTk(stored, curBest) > 0) snapshotHash else curBest.hash
+                  val newBestTipHash: Hash = resolvedBest match {
+                    case None => snapshotHash // first store OR stale best tip — incoming becomes the best
+                    case Some(curBest) =>
+                      if (compareMaxvalidTk(stored, curBest) > 0) snapshotHash else curBest.hash
+                  }
+
+                  val newState = state.copy(byHash = newByHash, bestTipHash = Some(newBestTipHash))
+                  val effect: F[Boolean] = (newBestTipHash === snapshotHash, resolvedBest) match {
+                    case (true, None) =>
+                      logger
+                        .info(s"store: chain bootstrapped at shardOrdinal=${shardOrdinal.value} slot=$slot")
+                        .as(true)
+                    case (true, Some(prior)) if stored.parentHash === prior.hash =>
+                      logger
+                        .debug(s"store: linear extension shardOrdinal=${shardOrdinal.value} slot=$slot")
+                        .as(true)
+                    case (true, Some(prior)) =>
+                      logger
+                        .info(
+                          s"store: reorg — new tip shardOrdinal=${shardOrdinal.value} slot=$slot beats " +
+                            s"prior shardOrdinal=${prior.shardOrdinal.value} slot=${prior.slot}"
+                        )
+                        .as(true)
+                    case (false, _) =>
+                      logger
+                        .debug(
+                          s"store: alternate branch shardOrdinal=${shardOrdinal.value} slot=$slot " +
+                            s"(parent=${parentHash.value.take(8)}, not switching from currentBest)"
+                        )
+                        .as(true)
+                  }
+
+                  (newState, effect)
                 }
-
-                val newState = state.copy(byHash = newByHash, bestTipHash = Some(newBestTipHash))
-                val effect: F[Boolean] = (newBestTipHash === snapshotHash, resolvedBest) match {
-                  case (true, None) =>
-                    logger
-                      .info(s"store: chain bootstrapped at shardOrdinal=${shardOrdinal.value} slot=$slot")
-                      .as(true)
-                  case (true, Some(prior)) if stored.parentHash === prior.hash =>
-                    logger
-                      .debug(s"store: linear extension shardOrdinal=${shardOrdinal.value} slot=$slot")
-                      .as(true)
-                  case (true, Some(prior)) =>
-                    logger
-                      .info(
-                        s"store: reorg — new tip shardOrdinal=${shardOrdinal.value} slot=$slot beats " +
-                          s"prior shardOrdinal=${prior.shardOrdinal.value} slot=${prior.slot}"
-                      )
-                      .as(true)
-                  case (false, _) =>
-                    logger
-                      .debug(
-                        s"store: alternate branch shardOrdinal=${shardOrdinal.value} slot=$slot " +
-                          s"(parent=${parentHash.value.take(8)}, not switching from currentBest)"
-                      )
-                      .as(true)
-                }
-
-                (newState, effect)
-              }
-            }.flatten
+              }.flatten
           }
 
         def bestTip: F[Option[Hashed[ShardCheckpoint]]] =
@@ -353,7 +354,7 @@ object ShardChainStore {
         def getByOrdinal(shardOrdinal: ShardOrdinal): F[Option[Hashed[ShardCheckpoint]]] =
           stateRef.get.map { state =>
             state.bestTipHash.flatMap(state.byHash.get) match {
-              case None => None
+              case None      => None
               case Some(tip) =>
                 // Walk back from bestTip until we find the requested ordinal or drop off the bottom.
                 if (shardOrdinal.value > tip.shardOrdinal.value) None // requested future
@@ -385,9 +386,10 @@ object ShardChainStore {
           *
           * Returns positive when `a` beats `b`; negative when `b` beats `a`; zero when they're indistinguishable on these criteria.
           *
-          * Identical algorithm to `ChainSelection.standardCompare` (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/ChainSelection.scala:180-192`).
-          * That method is `private` on the gl0 `ChainSelection` impl so we replicate the algorithm here rather than refactoring the
-          * public surface of `ChainSelection`. If a future refactor exposes a shared comparator, this site should re-route through it.
+          * Identical algorithm to `ChainSelection.standardCompare`
+          * (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/ChainSelection.scala:180-192`). That
+          * method is `private` on the gl0 `ChainSelection` impl so we replicate the algorithm here rather than refactoring the public
+          * surface of `ChainSelection`. If a future refactor exposes a shared comparator, this site should re-route through it.
           */
         private def compareMaxvalidTk(a: StoredShardCheckpoint, b: StoredShardCheckpoint): Int =
           if (a.shardOrdinal.value != b.shardOrdinal.value) {

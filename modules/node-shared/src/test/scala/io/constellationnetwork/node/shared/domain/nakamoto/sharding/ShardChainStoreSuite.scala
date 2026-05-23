@@ -36,9 +36,9 @@ import weaver.MutableIOSuite
   *
   * '''Fixture pattern''':
   *   - We synthesize `Signed[ShardCheckpoint]` instances deterministically with a single fake signature proof — the store doesn't verify
-  *     signatures (verification lives in the acceptance layer slice down), so a sentinel proof is sufficient. The signing preimage hash
-  *     is computed via `ShardChainStore.deriveHash`-equivalent (Hasher.forJson over the preimage), which the store does internally to
-  *     key its `byHash` map. Tests retrieve the canonical hash via `chainStore.bestTip.map(_.hash)` after store to keep the fixture
+  *     signatures (verification lives in the acceptance layer slice down), so a sentinel proof is sufficient. The signing preimage hash is
+  *     computed via `ShardChainStore.deriveHash`-equivalent (Hasher.forJson over the preimage), which the store does internally to key its
+  *     `byHash` map. Tests retrieve the canonical hash via `chainStore.bestTip.map(_.hash)` after store to keep the fixture
   *     side-effect-free w.r.t. the deriveHash details.
   */
 object ShardChainStoreSuite extends MutableIOSuite {
@@ -78,8 +78,8 @@ object ShardChainStoreSuite extends MutableIOSuite {
       kesTreeStep = 0
     )
 
-  /** Build a `ShardCheckpoint` with the given shard ordinal and parent hash. The `committeeSignatures` field is the only non-trivial
-    * field — we keep one sentinel signature per checkpoint with varying `peerByte` so two checkpoints at the same shard ordinal but with
+  /** Build a `ShardCheckpoint` with the given shard ordinal and parent hash. The `committeeSignatures` field is the only non-trivial field
+    * — we keep one sentinel signature per checkpoint with varying `peerByte` so two checkpoints at the same shard ordinal but with
     * different parents (fork case) produce DIFFERENT canonical hashes (otherwise the store would idempotent-collapse them).
     */
   private def mkCheckpoint(
@@ -216,14 +216,14 @@ object ShardChainStoreSuite extends MutableIOSuite {
       store <- ShardChainStore.make[IO](shardZero, keepDepthBehindFinalized = keepDepth)
       // Seed a chain of 6 chained checkpoints (ords 0..5).
       hashesIO = (0L until 6L).toList.foldLeftM[IO, (List[Hash], Hash)]((List.empty, Hash.empty)) {
-                   case ((acc, parent), ord) =>
-                     val signed = mkSignedCheckpoint(ord, parent = parent, peerByte = ord.toInt + 1)
-                     store
-                       .store(signed, parentHash = parent, shardOrdinal = ShardOrdinal(ord), slot = ord + 1, vrfOutput = vrf(ord.toInt + 1))
-                       .flatMap { _ =>
-                         store.bestTip.map(_.get.hash).map(h => (acc :+ h, h))
-                       }
-                 }
+        case ((acc, parent), ord) =>
+          val signed = mkSignedCheckpoint(ord, parent = parent, peerByte = ord.toInt + 1)
+          store
+            .store(signed, parentHash = parent, shardOrdinal = ShardOrdinal(ord), slot = ord + 1, vrfOutput = vrf(ord.toInt + 1))
+            .flatMap { _ =>
+              store.bestTip.map(_.get.hash).map(h => (acc :+ h, h))
+            }
+      }
       hashesPair <- hashesIO
       (hashes, _) = hashesPair
       preFinalized <- store.lastFinalizedOrdinal
@@ -335,12 +335,12 @@ object ShardChainStoreSuite extends MutableIOSuite {
       store <- ShardChainStore.make[IO](shardZero, keepDepthBehindFinalized = keepDepth)
       // Seed and finalize each ord one at a time — simulates production Phase 1→2 transitions.
       _ <- (0L until totalOrds).toList.foldLeftM[IO, Hash](Hash.empty) {
-             case (parent, ord) =>
-               val signed = mkSignedCheckpoint(ord, parent = parent, peerByte = (ord.toInt % 200) + 1)
-               store
-                 .store(signed, parentHash = parent, shardOrdinal = ShardOrdinal(ord), slot = ord + 1, vrfOutput = vrf(ord.toInt + 1)) >>
-                 store.bestTip.map(_.get.hash).flatTap(h => store.`finalize`(h))
-           }
+        case (parent, ord) =>
+          val signed = mkSignedCheckpoint(ord, parent = parent, peerByte = (ord.toInt % 200) + 1)
+          store
+            .store(signed, parentHash = parent, shardOrdinal = ShardOrdinal(ord), slot = ord + 1, vrfOutput = vrf(ord.toInt + 1)) >>
+            store.bestTip.map(_.get.hash).flatTap(h => store.`finalize`(h))
+      }
       finalSize <- store.size
       finalFinalized <- store.lastFinalizedOrdinal
     } yield
