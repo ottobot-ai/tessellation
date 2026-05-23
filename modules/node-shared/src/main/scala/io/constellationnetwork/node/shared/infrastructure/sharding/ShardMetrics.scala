@@ -19,12 +19,13 @@ import eu.timepit.refined.auto._
   * `dag_nakamoto_shard_` to keep the existing `dag_nakamoto_*` family separable in Grafana.
   *
   * '''Why a thin helper, not a typeclass.''' The Slice 19 surface is six metrics; introducing a new typeclass would require wiring the
-  * helper as an injected dep through every call site even though the underlying `Metrics[F]` typeclass is already in scope. The thin
-  * helper preserves the existing pattern from `NakamotoMetrics` (`modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoMetrics.scala`)
-  * — top-level constants + small `Metrics[F]`-using methods.
+  * helper as an injected dep through every call site even though the underlying `Metrics[F]` typeclass is already in scope. The thin helper
+  * preserves the existing pattern from `NakamotoMetrics`
+  * (`modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoMetrics.scala`) — top-level
+  * constants + small `Metrics[F]`-using methods.
   *
-  * '''Why `unsafeLabelName`.''' The label names are compile-time literals known to satisfy the
-  * `[a-z0-9]+(?:_[a-z0-9]+)*` Refined regex; we'd otherwise wrap each in `refineV` boilerplate.
+  * '''Why `unsafeLabelName`.''' The label names are compile-time literals known to satisfy the `[a-z0-9]+(?:_[a-z0-9]+)*` Refined regex;
+  * we'd otherwise wrap each in `refineV` boilerplate.
   */
 object ShardMetrics {
 
@@ -45,8 +46,8 @@ object ShardMetrics {
   /** Counter — one increment when a shard takes the `T_depth1_shard` fallback path (committee partly offline). Labels: `shard_id`. */
   val CommitteePartitionTotal: MetricKey = "dag_nakamoto_shard_committee_partition_total"
 
-  /** Counter — one increment when a shard has been in `T_depth1`-only mode beyond `t-partition-hard-ms` without any `T_count` fire.
-    * Labels: `shard_id`.
+  /** Counter — one increment when a shard has been in `T_depth1`-only mode beyond `t-partition-hard-ms` without any `T_count` fire. Labels:
+    * `shard_id`.
     */
   val PartitionHardTotal: MetricKey = "dag_nakamoto_shard_partition_hard_total"
 
@@ -81,12 +82,12 @@ object ShardMetrics {
     val Other = "other"
 
     /** Map a free-form diagnostic string from `ShardCheckpointAcceptResult.Rejected.reason` to a bucket label so we don't blow up
-      * Prometheus cardinality. Pattern matching here is on the SAME diagnostic prefixes the manager emits in its log lines —
-      * see `ShardCheckpointGl0AcceptanceManager.preCheck`.
+      * Prometheus cardinality. Pattern matching here is on the SAME diagnostic prefixes the manager emits in its log lines — see
+      * `ShardCheckpointGl0AcceptanceManager.preCheck`.
       *
-      * Note this is the ONLY place in the system that pattern-matches the diagnostic string, and only for label bucketing — control
-      * flow is governed by the `ShardCheckpointAcceptResult` ADT branches (per `[[feedback-no-string-matching]]`). Bucketing for
-      * label cardinality is the design intent of `[[feedback-no-string-matching]]`'s carve-out.
+      * Note this is the ONLY place in the system that pattern-matches the diagnostic string, and only for label bucketing — control flow is
+      * governed by the `ShardCheckpointAcceptResult` ADT branches (per `[[feedback-no-string-matching]]`). Bucketing for label cardinality
+      * is the design intent of `[[feedback-no-string-matching]]`'s carve-out.
       */
     def fromDiagnostic(reason: String): String =
       if (reason.contains("not in committee")) PreCheckCommittee
@@ -124,8 +125,8 @@ object ShardMetrics {
   def incCheckpointAccepted[F[_]: Async: Metrics](shardId: ShardId, path: String): F[Unit] =
     Metrics[F].incrementCounter(CheckpointTotal, shardIdPathTags(shardId, path))
 
-  /** Increment [[CheckpointRejectedTotal]]`{shard_id, reason}`. Caller supplies the bucket via [[RejectReason.fromDiagnostic]] or
-    * directly with one of the [[RejectReason]] constants. Call from `ShardCheckpointGl0AcceptanceManager` on `Rejected` /
+  /** Increment [[CheckpointRejectedTotal]]`{shard_id, reason}`. Caller supplies the bucket via [[RejectReason.fromDiagnostic]] or directly
+    * with one of the [[RejectReason]] constants. Call from `ShardCheckpointGl0AcceptanceManager` on `Rejected` /
     * `RejectedReExecutionMismatch`.
     */
   def incCheckpointRejected[F[_]: Async: Metrics](shardId: ShardId, reason: String): F[Unit] =
@@ -137,14 +138,14 @@ object ShardMetrics {
   def incCommitteeAttestation[F[_]: Async: Metrics](shardId: ShardId): F[Unit] =
     Metrics[F].incrementCounter(CommitteeAttestationTotal, shardIdTag(shardId))
 
-  /** Increment [[CommitteePartitionTotal]]`{shard_id}`. Call from `ShardCheckpointGl0AcceptanceManager` when the `T_depth1_shard`
-    * fallback path fires (committee partly offline; depth fallback covers liveness).
+  /** Increment [[CommitteePartitionTotal]]`{shard_id}`. Call from `ShardCheckpointGl0AcceptanceManager` when the `T_depth1_shard` fallback
+    * path fires (committee partly offline; depth fallback covers liveness).
     */
   def incCommitteePartition[F[_]: Async: Metrics](shardId: ShardId): F[Unit] =
     Metrics[F].incrementCounter(CommitteePartitionTotal, shardIdTag(shardId))
 
-  /** Increment [[PartitionHardTotal]]`{shard_id}`. Call from `ShardPartitionMonitor` when the per-shard "last T_count fire" timestamp
-    * is older than `t-partition-hard-ms`.
+  /** Increment [[PartitionHardTotal]]`{shard_id}`. Call from `ShardPartitionMonitor` when the per-shard "last T_count fire" timestamp is
+    * older than `t-partition-hard-ms`.
     */
   def incPartitionHard[F[_]: Async: Metrics](shardId: ShardId): F[Unit] =
     Metrics[F].incrementCounter(PartitionHardTotal, shardIdTag(shardId))
@@ -164,6 +165,6 @@ object ShardMetrics {
   private[sharding] def labelNamePath: LabelName = PathLabel
   private[sharding] def labelNameReason: LabelName = ReasonLabel
   private[sharding] val _unusedLabelHelpers: Unit = {
-    val _ = (unsafeLabelName("dummy"))
+    val _ = unsafeLabelName("dummy")
   }
 }

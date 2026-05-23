@@ -16,8 +16,8 @@ import weaver.SimpleIOSuite
   *   1. Suppression — once a WARN fires for shard `s`, subsequent ticks within `tPartitionHardMs` do not re-fire
   *   1. `notifyTDepth1` on a brand-new shard seeds the timestamp at `now` (so we don't WARN immediately on bootstrap)
   *
-  * '''Test clock''': all tests use a `Ref[IO, Long]`-backed clock so we can step time deterministically. Production wiring
-  * passes `Async[IO].realTime.map(_.toMillis)`.
+  * '''Test clock''': all tests use a `Ref[IO, Long]`-backed clock so we can step time deterministically. Production wiring passes
+  * `Async[IO].realTime.map(_.toMillis)`.
   */
 object ShardPartitionMonitorSuite extends SimpleIOSuite {
 
@@ -53,10 +53,11 @@ object ShardPartitionMonitorSuite extends SimpleIOSuite {
       _ <- clock.set(250L) // 250ms in — well past 100ms threshold.
       tick2 <- monitor.check
       stateAfter <- stateRef.get
-    } yield expect(tick1.isEmpty) &&
-      expect(stateMid.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 0) &&
-      expect.same(Set(s0), tick2) &&
-      expect(stateAfter.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 1)
+    } yield
+      expect(tick1.isEmpty) &&
+        expect(stateMid.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 0) &&
+        expect.same(Set(s0), tick2) &&
+        expect(stateAfter.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 1)
   }
 
   // ============================================================================
@@ -73,8 +74,9 @@ object ShardPartitionMonitorSuite extends SimpleIOSuite {
       _ <- clock.set(120L) // 70ms since last T_count — still under 100ms threshold
       tick <- monitor.check
       state <- stateRef.get
-    } yield expect(tick.isEmpty) &&
-      expect(state.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 0)
+    } yield
+      expect(tick.isEmpty) &&
+        expect(state.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 0)
   }
 
   // ============================================================================
@@ -96,10 +98,11 @@ object ShardPartitionMonitorSuite extends SimpleIOSuite {
       tick3 <- monitor.check
 
       state <- stateRef.get
-    } yield expect.same(Set(s0), tick1) &&
-      expect(tick2.isEmpty) &&
-      expect.same(Set(s0), tick3) &&
-      expect(state.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 2)
+    } yield
+      expect.same(Set(s0), tick1) &&
+        expect(tick2.isEmpty) &&
+        expect.same(Set(s0), tick3) &&
+        expect(state.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 2)
   }
 
   // ============================================================================
@@ -119,8 +122,9 @@ object ShardPartitionMonitorSuite extends SimpleIOSuite {
       _ <- clock.set(200L) // s0 stale (200ms since last T_count); s1 fresh (50ms since last)
       tick <- monitor.check
       state <- stateRef.get
-    } yield expect.same(Set(s0), tick) &&
-      expect(state.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 1)
+    } yield
+      expect.same(Set(s0), tick) &&
+        expect(state.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 1)
   }
 
   // ============================================================================
@@ -140,9 +144,10 @@ object ShardPartitionMonitorSuite extends SimpleIOSuite {
       tick2 <- monitor.check
 
       state <- stateRef.get
-    } yield expect(tick1.isEmpty) &&
-      expect.same(Set(s0), tick2) &&
-      expect(state.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 1)
+    } yield
+      expect(tick1.isEmpty) &&
+        expect.same(Set(s0), tick2) &&
+        expect(state.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 1)
   }
 
   // ============================================================================
@@ -159,7 +164,8 @@ object ShardPartitionMonitorSuite extends SimpleIOSuite {
       _ <- clock.set(150L) // 150ms since last T_count → stale
       tick <- monitor.check
       state <- stateRef.get
-    } yield expect.same(Set(s0), tick) &&
-      expect(state.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 1)
+    } yield
+      expect.same(Set(s0), tick) &&
+        expect(state.counters.getOrElse(ShardMetrics.PartitionHardTotal.value, 0) == 1)
   }
 }

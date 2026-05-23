@@ -37,37 +37,32 @@ import eu.timepit.refined.types.numeric.NonNegLong
 import io.circe.syntax._
 import weaver.MutableIOSuite
 
-/** Slice 11 cross-shard coverage for [[SpendActionValidator]] — exercises the
-  * `ShardSubtreeProofClient`-aware constructor introduced by `feat(shard): slice 11`.
+/** Slice 11 cross-shard coverage for [[SpendActionValidator]] — exercises the `ShardSubtreeProofClient`-aware constructor introduced by
+  * `feat(shard): slice 11`.
   *
   * '''Coverage''' (per slice 11 task spec):
-  *   1. '''Same-shard SpendAction''' — target MG hashes to the current shard → uses in-process
-  *      state; proofClient MUST NOT be invoked.
-  *   1. '''Cross-shard happy path''' — target MG hashes to a different shard → proofClient is
-  *      invoked, returns proven `AllowSpend` bytes, validator accepts.
-  *   1. '''Cross-shard proof fails''' — proofClient returns `None` → SpendAction rejected with
-  *      [[CrossShardProofUnavailable]] (validator retries next round).
-  *   1. '''Cross-shard tampered value''' — proofClient returns a proof whose value bytes don't
-  *      decode as `SortedSet[Signed[AllowSpend]]` → SpendAction rejected with
-  *      [[CrossShardProofTampered]] (defence-in-depth at the validator).
-  *   1. '''Cross-shard balance proof fails''' — for the no-`allowSpendRef` branch, proofClient
-  *      `None` rejects with [[CrossShardProofUnavailable]].
-  *   1. '''Local fallback (single-shard cluster)''' — `numShards = 1` collapses every MG to
-  *      shard 0; proofClient never invoked even for SpendActions referencing other MGs.
+  *   1. '''Same-shard SpendAction''' — target MG hashes to the current shard → uses in-process state; proofClient MUST NOT be invoked.
+  *   1. '''Cross-shard happy path''' — target MG hashes to a different shard → proofClient is invoked, returns proven `AllowSpend` bytes,
+  *      validator accepts.
+  *   1. '''Cross-shard proof fails''' — proofClient returns `None` → SpendAction rejected with [[CrossShardProofUnavailable]] (validator
+  *      retries next round).
+  *   1. '''Cross-shard tampered value''' — proofClient returns a proof whose value bytes don't decode as `SortedSet[Signed[AllowSpend]]` →
+  *      SpendAction rejected with [[CrossShardProofTampered]] (defence-in-depth at the validator).
+  *   1. '''Cross-shard balance proof fails''' — for the no-`allowSpendRef` branch, proofClient `None` rejects with
+  *      [[CrossShardProofUnavailable]].
+  *   1. '''Local fallback (single-shard cluster)''' — `numShards = 1` collapses every MG to shard 0; proofClient never invoked even for
+  *      SpendActions referencing other MGs.
   *
   * '''Fixture strategy''':
-  *   - Real [[ShardAssignment]] via `ShardAssignment.make`; tests scan `numShards` to ensure
-  *     two test MG addresses split across different shards (same trick the Slice 10 suite uses
-  *     via `findNumShardsSplitting`).
-  *   - Mock [[ShardSubtreeProofClient]] backed by a `Ref` so each test can (a) seed a response
-  *     and (b) assert on the invocation count after the fact. The mock doesn't run any
-  *     verification — the production `httpStub` would, but the validator's contract here is to
-  *     trust the client's return value and decode the bytes; tampering is exercised via "value
-  *     bytes that decode to the wrong type", which the validator catches structurally.
-  *   - Real Circe encoding for the proof's value bytes: `SortedSet[Signed[AllowSpend]].asJson`
-  *     serialized as UTF-8 — the same shape the validator decodes via `io.circe.parser`. This
-  *     gives end-to-end byte-fidelity coverage of the cross-shard wire path without dragging in
-  *     the full MPT-prover infrastructure (which is Slice 10's concern, separately covered).
+  *   - Real [[ShardAssignment]] via `ShardAssignment.make`; tests scan `numShards` to ensure two test MG addresses split across different
+  *     shards (same trick the Slice 10 suite uses via `findNumShardsSplitting`).
+  *   - Mock [[ShardSubtreeProofClient]] backed by a `Ref` so each test can (a) seed a response and (b) assert on the invocation count after
+  *     the fact. The mock doesn't run any verification — the production `httpStub` would, but the validator's contract here is to trust the
+  *     client's return value and decode the bytes; tampering is exercised via "value bytes that decode to the wrong type", which the
+  *     validator catches structurally.
+  *   - Real Circe encoding for the proof's value bytes: `SortedSet[Signed[AllowSpend]].asJson` serialized as UTF-8 — the same shape the
+  *     validator decodes via `io.circe.parser`. This gives end-to-end byte-fidelity coverage of the cross-shard wire path without dragging
+  *     in the full MPT-prover infrastructure (which is Slice 10's concern, separately covered).
   */
 object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
 
@@ -85,9 +80,8 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
   // Mock proof client (Ref-backed — captures invocations + returns canned responses)
   // ===========================================================================
 
-  /** Snapshot of one invocation of [[ShardSubtreeProofClient.fetchAndVerify]] — surfaces the
-    * args so tests can assert on which (shard, MG, key) tuples the validator queried. The
-    * test for "same-shard MUST NOT invoke proofClient" asserts on this list being empty.
+  /** Snapshot of one invocation of [[ShardSubtreeProofClient.fetchAndVerify]] — surfaces the args so tests can assert on which (shard, MG,
+    * key) tuples the validator queried. The test for "same-shard MUST NOT invoke proofClient" asserts on this list being empty.
     */
   private final case class FetchCall(
     targetShardId: ShardId,
@@ -95,9 +89,8 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
     key: GlobalStateKey
   )
 
-  /** Construct a Ref-backed mock client. The `responder` callback maps each call to a response;
-    * the call is also recorded in `callsRef`. The default responder returns `None` — the test
-    * overrides per-scenario.
+  /** Construct a Ref-backed mock client. The `responder` callback maps each call to a response; the call is also recorded in `callsRef`.
+    * The default responder returns `None` — the test overrides per-scenario.
     */
   private def mkMockClient(
     callsRef: Ref[IO, List[FetchCall]],
@@ -113,11 +106,10 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
     }
   }
 
-  /** A sentinel [[ShardSubtreeProof]] — value-bearing field is only the `value` (the validator
-    * uses it to extract bytes); the rest are placeholders. The validator does NOT re-run MPT
-    * verification against the proof envelope; that's the client implementation's responsibility
-    * (the production `httpStub` would verify before surfacing). The mock simulates a verified
-    * proof by always returning Some(_).
+  /** A sentinel [[ShardSubtreeProof]] — value-bearing field is only the `value` (the validator uses it to extract bytes); the rest are
+    * placeholders. The validator does NOT re-run MPT verification against the proof envelope; that's the client implementation's
+    * responsibility (the production `httpStub` would verify before surfacing). The mock simulates a verified proof by always returning
+    * Some(_).
     */
   private def sentinelProof(value: Option[Hex]): ShardSubtreeProof =
     ShardSubtreeProof(
@@ -133,9 +125,8 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
   // Helpers for finding a shard split that makes two addresses cross-shard
   // ===========================================================================
 
-  /** Scan `numShards` in [2, 64] for a value that places `addrA` and `addrB` in DIFFERENT
-    * shards. Same trick as `ShardSubtreeProofServiceSuite.findNumShardsSplitting` — keeps the
-    * test independent of which specific shard each addr maps to.
+  /** Scan `numShards` in [2, 64] for a value that places `addrA` and `addrB` in DIFFERENT shards. Same trick as
+    * `ShardSubtreeProofServiceSuite.findNumShardsSplitting` — keeps the test independent of which specific shard each addr maps to.
     */
   private def findNumShardsSplitting(addrA: Address, addrB: Address)(implicit hasher: Hasher[IO]): IO[Int] = {
     def tryN(n: Int): IO[Boolean] = {
@@ -324,55 +315,54 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
   // Test 4: cross-shard tampered value — validator rejects with CrossShardProofTampered
   // ===========================================================================
 
-  test("cross-shard SpendAction: proofClient returns proof with undecodable value, validator rejects with CrossShardProofTampered") {
-    res =>
-      implicit val (_, hs, sp) = res
+  test("cross-shard SpendAction: proofClient returns proof with undecodable value, validator rejects with CrossShardProofTampered") { res =>
+    implicit val (_, hs, sp) = res
 
-      for {
-        keyPair1 <- KeyPairGenerator.makeKeyPair[IO]
-        keyPairCurrentMg <- KeyPairGenerator.makeKeyPair[IO]
-        keyPairTargetMg <- KeyPairGenerator.makeKeyPair[IO]
-        address = keyPair1.getPublic.toAddress
-        currentMgAddr = keyPairCurrentMg.getPublic.toAddress
-        targetMgAddr = keyPairTargetMg.getPublic.toAddress
+    for {
+      keyPair1 <- KeyPairGenerator.makeKeyPair[IO]
+      keyPairCurrentMg <- KeyPairGenerator.makeKeyPair[IO]
+      keyPairTargetMg <- KeyPairGenerator.makeKeyPair[IO]
+      address = keyPair1.getPublic.toAddress
+      currentMgAddr = keyPairCurrentMg.getPublic.toAddress
+      targetMgAddr = keyPairTargetMg.getPublic.toAddress
 
-        numShards <- findNumShardsSplitting(currentMgAddr, targetMgAddr)
-        shardAssignment = ShardAssignment.make[IO](numShards)
+      numShards <- findNumShardsSplitting(currentMgAddr, targetMgAddr)
+      shardAssignment = ShardAssignment.make[IO](numShards)
 
-        // Garbage bytes — definitely not a valid JSON-encoded SortedSet[Signed[AllowSpend]]. The
-        // validator's Circe decode step rejects and surfaces CrossShardProofTampered. Stands in
-        // for a malicious peer that returns structurally-valid proof bytes but the wrong type
-        // (or just random bytes). A peer that returned bytes for, e.g., a `Balance` instead of
-        // an `AllowSpends` set would land in the same rejection: Circe decode fails because the
-        // expected shape is a JSON array of signed AllowSpends.
-        garbageBytes = "this is not valid AllowSpend JSON".getBytes("UTF-8")
+      // Garbage bytes — definitely not a valid JSON-encoded SortedSet[Signed[AllowSpend]]. The
+      // validator's Circe decode step rejects and surfaces CrossShardProofTampered. Stands in
+      // for a malicious peer that returns structurally-valid proof bytes but the wrong type
+      // (or just random bytes). A peer that returned bytes for, e.g., a `Balance` instead of
+      // an `AllowSpends` set would land in the same rejection: Circe decode fails because the
+      // expected shape is a JSON array of signed AllowSpends.
+      garbageBytes = "this is not valid AllowSpend JSON".getBytes("UTF-8")
 
-        callsRef <- Ref.of[IO, List[FetchCall]](List.empty)
-        proofClient = mkMockClient(
-          callsRef,
-          _ => IO.pure(Some((Some(garbageBytes), sentinelProof(Hex.fromBytes(garbageBytes).some))))
-        )
-        validator = SpendActionValidator.make[IO](proofClient, shardAssignment)
+      callsRef <- Ref.of[IO, List[FetchCall]](List.empty)
+      proofClient = mkMockClient(
+        callsRef,
+        _ => IO.pure(Some((Some(garbageBytes), sentinelProof(Hex.fromBytes(garbageBytes).some))))
+      )
+      validator = SpendActionValidator.make[IO](proofClient, shardAssignment)
 
-        targetCurrencyId = CurrencyId(targetMgAddr)
-        userSpendTx =
-          SpendTransaction(Hash("bb" * 32).some, targetCurrencyId.some, SwapAmount(1L), address, currentMgAddr)
-        spendAction = SpendAction(NonEmptyList.of(userSpendTx))
+      targetCurrencyId = CurrencyId(targetMgAddr)
+      userSpendTx =
+        SpendTransaction(Hash("bb" * 32).some, targetCurrencyId.some, SwapAmount(1L), address, currentMgAddr)
+      spendAction = SpendAction(NonEmptyList.of(userSpendTx))
 
-        activeAllowSpends = SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
-        balances = Map.empty[Option[Address], SortedMap[Address, Balance]]
+      activeAllowSpends = SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+      balances = Map.empty[Option[Address], SortedMap[Address, Balance]]
 
-        result <- validator.validate(spendAction, activeAllowSpends, balances, currentMgAddr)
-        calls <- callsRef.get
-      } yield
-        expect.all(
-          result.isInvalid,
-          result.toEither.left.exists(_.exists {
-            case CrossShardProofTampered(_) => true
-            case _                          => false
-          }),
-          calls.length === 1
-        )
+      result <- validator.validate(spendAction, activeAllowSpends, balances, currentMgAddr)
+      calls <- callsRef.get
+    } yield
+      expect.all(
+        result.isInvalid,
+        result.toEither.left.exists(_.exists {
+          case CrossShardProofTampered(_) => true
+          case _                          => false
+        }),
+        calls.length === 1
+      )
   }
 
   // ===========================================================================

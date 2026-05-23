@@ -46,8 +46,8 @@ import weaver.MutableIOSuite
   *   1. '''Chain height + finalized gauges''' → set after `store` / `finalize` calls
   *
   * The fixture pattern mirrors `ShardCheckpointGl0AcceptanceManagerSuite` — real `Hasher`, real `KeyPair`-derived signatures, fresh
-  * `ShardChainStore` + `ShardTipTracker` per test. Only deviation: each test wires a `CountingMetrics` interpreter into the implicit
-  * scope so we can read back per-counter / per-gauge values at the end.
+  * `ShardChainStore` + `ShardTipTracker` per test. Only deviation: each test wires a `CountingMetrics` interpreter into the implicit scope
+  * so we can read back per-counter / per-gauge values at the end.
   */
 object ShardMetricsSuite extends MutableIOSuite {
 

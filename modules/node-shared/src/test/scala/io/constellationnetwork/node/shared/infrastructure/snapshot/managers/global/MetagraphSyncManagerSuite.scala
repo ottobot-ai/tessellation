@@ -26,17 +26,16 @@ import weaver.MutableIOSuite
   *   1. '''Multiple receipts applied in order''' — three receipts to three different MGs all land
   *   1. '''Same receipt twice is no-op''' — duplicate apply does not double-update
   *   1. '''Empty receipt list''' — `consumeReceipts(Nil)` is a no-op and doesn't crash
-  *   1. '''Receipt for unknown target MG''' — handled by initialising from `MetagraphSyncDataInfo.empty` (same pattern as the
-  *      existing `updateFromSpendActions` path)
+  *   1. '''Receipt for unknown target MG''' — handled by initialising from `MetagraphSyncDataInfo.empty` (same pattern as the existing
+  *      `updateFromSpendActions` path)
   *
-  * '''Test fixture pattern.''' Uses [[MetagraphSyncManager.makeWithInspector]] which returns a `Built` handle bundling the manager
-  * plus reads of its internal Refs. The Refs are normally hidden from production callers (Slice 13 will drain them through a
-  * different surface inside GSAM); the inspector handle exists solely to let these tests assert state-after-consume cleanly
-  * without poking at private fields via reflection.
+  * '''Test fixture pattern.''' Uses [[MetagraphSyncManager.makeWithInspector]] which returns a `Built` handle bundling the manager plus
+  * reads of its internal Refs. The Refs are normally hidden from production callers (Slice 13 will drain them through a different surface
+  * inside GSAM); the inspector handle exists solely to let these tests assert state-after-consume cleanly without poking at private fields
+  * via reflection.
   *
   * Address fixtures use deterministic well-formed DAG strings — same pattern as
-  * [[io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBufferSuite]] and
-  * [[GlobalSnapshotAcceptanceManagerSuite]].
+  * [[io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBufferSuite]] and [[GlobalSnapshotAcceptanceManagerSuite]].
   */
 object MetagraphSyncManagerSuite extends MutableIOSuite {
 
@@ -73,12 +72,12 @@ object MetagraphSyncManagerSuite extends MutableIOSuite {
   private def testHash(label: String): Hash =
     Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
 
-  /** Build an `increment` payload. Distinct `globalOrdinalLastAcceptedOn` per call so the merge semantics test (multiple
-    * receipts to the same target) can distinguish ordering: the highest-watermark increment wins on the scalar field while the
+  /** Build an `increment` payload. Distinct `globalOrdinalLastAcceptedOn` per call so the merge semantics test (multiple receipts to the
+    * same target) can distinguish ordering: the highest-watermark increment wins on the scalar field while the
     * `unappliedGlobalChangeOrdinals` union accumulates.
     *
-    * Three explicit parameters (no defaults) — scalafix's `NoDefaultArgs` rule for private helpers (the rule guards against
-    * unused defaults silently drifting) is satisfied by requiring every call site to pass `epoch` and `unapplied` explicitly.
+    * Three explicit parameters (no defaults) — scalafix's `NoDefaultArgs` rule for private helpers (the rule guards against unused defaults
+    * silently drifting) is satisfied by requiring every call site to pass `epoch` and `unapplied` explicitly.
     */
   private def mkIncrement(
     ord: Long,
@@ -91,9 +90,9 @@ object MetagraphSyncManagerSuite extends MutableIOSuite {
       unappliedGlobalChangeOrdinals = unapplied
     )
 
-  /** Build a `MetagraphSyncDataWrite` receipt. The `sourceCheckpointHash` distinguishes receipts under the seen-set hash
-    * (Circe encodes the field directly, so two receipts with otherwise-identical fields but different `sourceCheckpointHash`
-    * values hash differently and both go through the apply path).
+  /** Build a `MetagraphSyncDataWrite` receipt. The `sourceCheckpointHash` distinguishes receipts under the seen-set hash (Circe encodes the
+    * field directly, so two receipts with otherwise-identical fields but different `sourceCheckpointHash` values hash differently and both
+    * go through the apply path).
     */
   private def mkReceipt(
     target: Address,
@@ -123,11 +122,12 @@ object MetagraphSyncManagerSuite extends MutableIOSuite {
       _ <- built.manager.consumeReceipts(List(receipt))
       pending <- built.pendingCrossShardWrites
       seen <- built.seenReceiptHashes
-    } yield expect.all(
-      pending.size == 1,
-      pending.get(mgA).contains(increment),
-      seen.size == 1
-    )
+    } yield
+      expect.all(
+        pending.size == 1,
+        pending.get(mgA).contains(increment),
+        seen.size == 1
+      )
   }
 
   test("consumeReceipts — multiple receipts to different MGs all apply in order") { res =>
@@ -146,13 +146,14 @@ object MetagraphSyncManagerSuite extends MutableIOSuite {
       _ <- built.manager.consumeReceipts(receipts)
       pending <- built.pendingCrossShardWrites
       seen <- built.seenReceiptHashes
-    } yield expect.all(
-      pending.size == 3,
-      pending.get(mgA).contains(incA),
-      pending.get(mgB).contains(incB),
-      pending.get(mgC).contains(incC),
-      seen.size == 3
-    )
+    } yield
+      expect.all(
+        pending.size == 3,
+        pending.get(mgA).contains(incA),
+        pending.get(mgB).contains(incB),
+        pending.get(mgC).contains(incC),
+        seen.size == 3
+      )
   }
 
   test("consumeReceipts — same receipt twice is no-op: state matches single-apply") { res =>
@@ -173,15 +174,16 @@ object MetagraphSyncManagerSuite extends MutableIOSuite {
       _ <- twice.manager.consumeReceipts(List(receipt))
       pendingTwice <- twice.pendingCrossShardWrites
       seenTwice <- twice.seenReceiptHashes
-    } yield expect.all(
-      // Single-apply baseline
-      pendingSingle.size == 1,
-      pendingSingle.get(mgA).contains(increment),
-      seenSingle.size == 1,
-      // Idempotence: double-apply must equal single-apply
-      pendingTwice == pendingSingle,
-      seenTwice.size == 1
-    )
+    } yield
+      expect.all(
+        // Single-apply baseline
+        pendingSingle.size == 1,
+        pendingSingle.get(mgA).contains(increment),
+        seenSingle.size == 1,
+        // Idempotence: double-apply must equal single-apply
+        pendingTwice == pendingSingle,
+        seenTwice.size == 1
+      )
   }
 
   test("consumeReceipts — empty receipt list is a no-op and doesn't crash") { res =>
@@ -192,10 +194,11 @@ object MetagraphSyncManagerSuite extends MutableIOSuite {
       _ <- built.manager.consumeReceipts(List.empty)
       pending <- built.pendingCrossShardWrites
       seen <- built.seenReceiptHashes
-    } yield expect.all(
-      pending.isEmpty,
-      seen.isEmpty
-    )
+    } yield
+      expect.all(
+        pending.isEmpty,
+        seen.isEmpty
+      )
   }
 
   test("consumeReceipts — receipt for previously-unknown target MG starts from `empty` and folds the increment") { res =>
@@ -210,13 +213,14 @@ object MetagraphSyncManagerSuite extends MutableIOSuite {
       preState <- built.pendingCrossShardWrites
       _ <- built.manager.consumeReceipts(List(receipt))
       postState <- built.pendingCrossShardWrites
-    } yield expect.all(
-      // Confirm we really started from nothing.
-      preState.isEmpty,
-      // Post-consume: exactly one entry, equal to the increment.
-      postState.size == 1,
-      postState.get(mgB).contains(increment)
-    )
+    } yield
+      expect.all(
+        // Confirm we really started from nothing.
+        preState.isEmpty,
+        // Post-consume: exactly one entry, equal to the increment.
+        postState.size == 1,
+        postState.get(mgB).contains(increment)
+      )
   }
 
   test("consumeReceipts — two receipts to the same target merge monotonically (max ord, max epoch, union of ordinals)") { res =>
@@ -239,10 +243,11 @@ object MetagraphSyncManagerSuite extends MutableIOSuite {
       built <- MetagraphSyncManager.makeWithInspector[IO](cfg)
       _ <- built.manager.consumeReceipts(List(mkReceipt(mgA, low, "cp-merge-low"), mkReceipt(mgA, high, "cp-merge-high")))
       pending <- built.pendingCrossShardWrites
-    } yield expect.all(
-      pending.size == 1,
-      pending.get(mgA).contains(expectedMerged)
-    )
+    } yield
+      expect.all(
+        pending.size == 1,
+        pending.get(mgA).contains(expectedMerged)
+      )
   }
 
   test("consumeReceipts — out-of-order receipts still produce monotone result (low after high doesn't roll back)") { res =>
@@ -265,9 +270,10 @@ object MetagraphSyncManagerSuite extends MutableIOSuite {
       built <- MetagraphSyncManager.makeWithInspector[IO](cfg)
       _ <- built.manager.consumeReceipts(List(mkReceipt(mgA, high, "cp-reverse-high"), mkReceipt(mgA, low, "cp-reverse-low")))
       pending <- built.pendingCrossShardWrites
-    } yield expect.all(
-      pending.size == 1,
-      pending.get(mgA).contains(expectedMerged)
-    )
+    } yield
+      expect.all(
+        pending.size == 1,
+        pending.get(mgA).contains(expectedMerged)
+      )
   }
 }
