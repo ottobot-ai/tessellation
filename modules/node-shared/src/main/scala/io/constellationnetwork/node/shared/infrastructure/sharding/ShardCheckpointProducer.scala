@@ -37,8 +37,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   */
 trait ShardCheckpointPublisher[F[_]] {
 
-  /** Publish a produced (signed) checkpoint envelope. Failures are the publisher's responsibility to log + swallow — they MUST NOT block the
-    * producer's slot-leader path (mirrors the `MetagraphCommitteeGate.Publisher` failure model).
+  /** Publish a produced (signed) checkpoint envelope. Failures are the publisher's responsibility to log + swallow — they MUST NOT block
+    * the producer's slot-leader path (mirrors the `MetagraphCommitteeGate.Publisher` failure model).
     */
   def publish(checkpoint: Signed[ShardCheckpoint]): F[Unit]
 }
@@ -51,9 +51,10 @@ object ShardCheckpointPublisher {
   def noop[F[_]: Applicative]: ShardCheckpointPublisher[F] =
     (_: Signed[ShardCheckpoint]) => Applicative[F].unit
 
-  /** Recording publisher: every published checkpoint is appended (in publish order) to a `Ref`. The returned `F[List[Signed[ShardCheckpoint]]]`
-    * snapshots the current recorded list — repeated calls reflect any new publishes that happened in between. Pattern matches the
-    * `Ref`-backed publisher stubs already in use by `MetagraphCommitteeGateSuite` (see `Publisher.recording` in tests).
+  /** Recording publisher: every published checkpoint is appended (in publish order) to a `Ref`. The returned
+    * `F[List[Signed[ShardCheckpoint]]]` snapshots the current recorded list — repeated calls reflect any new publishes that happened in
+    * between. Pattern matches the `Ref`-backed publisher stubs already in use by `MetagraphCommitteeGateSuite` (see `Publisher.recording`
+    * in tests).
     */
   def recording[F[_]: Sync]: F[(ShardCheckpointPublisher[F], F[List[Signed[ShardCheckpoint]]])] =
     Ref.of[F, List[Signed[ShardCheckpoint]]](List.empty).map { ref =>
@@ -69,9 +70,9 @@ object ShardCheckpointPublisher {
   *
   * '''Scope''' (per slice 8 task spec):
   *   1. Take the queue of pending per-MG SC binary snapshots assigned to this shard (input — caller manages the queue).
-  *   1. Run [[ShardSlotLeader.isLeader]] for this node's `(vrfSk, shardEta, slot, σ_in_committee)` draw. If we don't win this slot,
-  *      return `None` and do NOT publish (per design doc §6.3 — "only winning slot leaders fire checkpoints; other committee members attest
-  *      later via gossip", which is slice 14 territory).
+  *   1. Run [[ShardSlotLeader.isLeader]] for this node's `(vrfSk, shardEta, slot, σ_in_committee)` draw. If we don't win this slot, return
+  *      `None` and do NOT publish (per design doc §6.3 — "only winning slot leaders fire checkpoints; other committee members attest later
+  *      via gossip", which is slice 14 territory).
   *   1. If we win, compute the [[ShardDerivedStateDelta]] via the injectable per-MG derivation callback (slice 8 doesn't reach into
   *      `TokenLockStateManager` etc. directly — that wiring is slice 9 / 13).
   *   1. Read `parentCheckpointHash` and `parentShardOrdinal` from `chainStore.bestTip` (genesis = `Hash.empty` + `ShardOrdinal.Genesis` for
@@ -84,8 +85,8 @@ object ShardCheckpointPublisher {
   *
   * '''What this slice does NOT do''':
   *   - Manage the pending-snapshot queue (caller-supplied via `pendingSnapshots`).
-  *   - Reach directly into `TokenLockStateManager`, `MetagraphSyncManager` etc. — those slot in via `derivePerMgState` callback. Slice 9
-  *     / 13 will wire the actual derivation closure.
+  *   - Reach directly into `TokenLockStateManager`, `MetagraphSyncManager` etc. — those slot in via `derivePerMgState` callback. Slice 9 /
+  *     13 will wire the actual derivation closure.
   *   - Aggregate signatures from other committee members. v1 only attaches THIS node's sig; others sign + gossip in slice 14.
   *   - Wire the GossipSub side — that's slice 14. Uses [[ShardCheckpointPublisher]] abstraction here.
   *   - Modify `GlobalSnapshotAcceptanceManager` (GSAM). Wiring into GSAM is slice 9 / 13.
@@ -108,14 +109,14 @@ trait ShardCheckpointProducer[F[_]] {
     * Inputs:
     *   - `pendingSnapshots`: per-MG queued SC binary chains for the MGs in this shard. Caller manages the queue; producer reads it once,
     *     emits the checkpoint, leaves the queue alone (caller drops accepted entries after observing the produced envelope).
-    *   - `gl0AnchorOrdinal`: the gl0 ord this checkpoint will ride into (loose coupling; gl0 accepts at this ord or any later — see
-    *     design doc §7.2).
+    *   - `gl0AnchorOrdinal`: the gl0 ord this checkpoint will ride into (loose coupling; gl0 accepts at this ord or any later — see design
+    *     doc §7.2).
     *   - `epoch`: the sortition epoch the local committee was drawn from (passed through to the envelope's `epoch` field so verifiers can
     *     look up the right active set for VRF verification).
     *
     * Returns:
-    *   - `Some(checkpoint)` if this node won the slot lottery AND there's something to publish — the caller can take the produced hash
-    *     (via `checkpoint.signingPreimage` ⇒ `Hasher[F]`) for local tracking.
+    *   - `Some(checkpoint)` if this node won the slot lottery AND there's something to publish — the caller can take the produced hash (via
+    *     `checkpoint.signingPreimage` ⇒ `Hasher[F]`) for local tracking.
     *   - `None` if this node didn't win the slot OR `pendingSnapshots` is empty AND no T_alive liveness ping is due (slice 8 v1 — T_alive
     *     liveness pings are handled at the caller layer; this slice returns `None` on empty input regardless. Future slice can introduce a
     *     T_alive override flag if needed).
@@ -142,7 +143,8 @@ object ShardCheckpointProducer {
   trait KesSigner[F[_]] {
 
     /** Current KES tree-internal step the in-memory key holds. The producer embeds this on the envelope's
-      * [[CommitteeMemberSignature.kesTreeStep]] field so receivers can verify non-interactively (same #211 wire-step pattern). */
+      * [[CommitteeMemberSignature.kesTreeStep]] field so receivers can verify non-interactively (same #211 wire-step pattern).
+      */
     def currentPeriod: F[Int]
 
     /** Sign `message` at `kesStep`. Returns empty bytes on signer failure — the produced checkpoint will carry an empty `kesProductSig` in
@@ -189,12 +191,12 @@ object ShardCheckpointProducer {
     *   pre-computed shard-eta bytes (32 bytes, output of `slotLeader.computeShardEta(shardId, gl0Eta)`). Caller pre-computes once per
     *   gl0-eta-rotation rather than re-computing on every `produce(...)` call — it doesn't change within an eta period.
     * @param sigmaInCommittee
-    *   this operator's stake share within the shard committee. Per v1 stable-σ rule
-    *   (`[[project-216-committee-stake-drift-fix]]`) this is `1 / K_S`. Production wiring passes the typed value; tests inject directly.
+    *   this operator's stake share within the shard committee. Per v1 stable-σ rule (`[[project-216-committee-stake-drift-fix]]`) this is
+    *   `1 / K_S`. Production wiring passes the typed value; tests inject directly.
     * @param slotForGl0Anchor
-    *   pure function mapping `(gl0AnchorOrdinal)` to the per-shard `Slot` used in the leader VRF draw + maxvalid-tk tiebreaks. The
-    *   simplest production wiring is `ord => Slot.unsafeApply(ord.value.value * snapshotsPerSecond)` — the exact mapping is the caller's
-    *   choice and depends on the slot-cadence convention. Tests pass identity-ish functions.
+    *   pure function mapping `(gl0AnchorOrdinal)` to the per-shard `Slot` used in the leader VRF draw + maxvalid-tk tiebreaks. The simplest
+    *   production wiring is `ord => Slot.unsafeApply(ord.value.value * snapshotsPerSecond)` — the exact mapping is the caller's choice and
+    *   depends on the slot-cadence convention. Tests pass identity-ish functions.
     * @param slotGapFor
     *   pure function from `(currentSlot, parentSlotOpt)` returning the LDD slot-gap. Genesis case (no parent): caller supplies a sensible
     *   default — typically the slot itself (matches `EligibilityChecker`'s "first wins always" semantics at the chain seed).
@@ -328,25 +330,23 @@ object ShardCheckpointProducer {
         // Slice 9 / 13 wiring will pass a real derivation closure that walks the chain and re-executes the per-MG processCurrencySnapshots
         // logic; for slice 8 the callback signature is `(Address, Signed[StateChannelSnapshotBinary]) => F[Hash]` and the producer just
         // collects the results.
-        pendingSnapshots.toList
-          .traverse {
-            case (mg, snaps) =>
-              derivePerMgState(mg, snaps.head).map(h => mg -> h)
-          }
-          .map { perMg =>
-            ShardDerivedStateDelta(
-              perMetagraphMptRoots = SortedMap.from(perMg),
-              includedSnapshots = pendingSnapshots,
-              tokenLockBalancesDelta = SortedMap.empty,
-              perMetagraphArtifacts = SortedMap.empty,
-              perMetagraphSyncDataDelta = SortedMap.empty
-            )
-          }
+        pendingSnapshots.toList.traverse {
+          case (mg, snaps) =>
+            derivePerMgState(mg, snaps.head).map(h => mg -> h)
+        }.map { perMg =>
+          ShardDerivedStateDelta(
+            perMetagraphMptRoots = SortedMap.from(perMg),
+            includedSnapshots = pendingSnapshots,
+            tokenLockBalancesDelta = SortedMap.empty,
+            perMetagraphArtifacts = SortedMap.empty,
+            perMetagraphSyncDataDelta = SortedMap.empty
+          )
+        }
 
-      /** Placeholder committee-member signature used at envelope-construction time; immediately overwritten via `.copy(committeeSignatures =
-        * ...)` after the real signature is computed. The signing flow needs the envelope shape (sans the signature itself) to compute the
-        * canonical preimage hash, so this is a chicken-and-egg dance: we build a sentinel envelope, hash its preimage (the preimage excludes
-        * `committeeSignatures` per slice 1 design), sign the hash, then replace the sentinel with the real signature.
+      /** Placeholder committee-member signature used at envelope-construction time; immediately overwritten via `.copy(committeeSignatures
+        * \= ...)` after the real signature is computed. The signing flow needs the envelope shape (sans the signature itself) to compute
+        * the canonical preimage hash, so this is a chicken-and-egg dance: we build a sentinel envelope, hash its preimage (the preimage
+        * excludes `committeeSignatures` per slice 1 design), sign the hash, then replace the sentinel with the real signature.
         *
         * '''Why a constant placeholder instead of `Option[NonEmptyList[...]]`.''' The envelope's `committeeSignatures: NonEmptyList[...]`
         * is consensus-load-bearing (slice 1 scaladoc — "empty would be vacuously safe but is a protocol-violation signal — keep the wire
@@ -367,8 +367,8 @@ object ShardCheckpointProducer {
   /** Convenience: derive a producer's expected output hash without running `produce(...)`. The canonical preimage hash IS the bytes the
     * committee member's signatures cover, and IS the chain-link `parentCheckpointHash` the next checkpoint will reference.
     *
-    * Exposed for tests / callers that want to track the produced hash without re-deriving the preimage projection at the call site.
-    * Pure delegation to `checkpoint.signingPreimage` + `Hasher[F].hash`.
+    * Exposed for tests / callers that want to track the produced hash without re-deriving the preimage projection at the call site. Pure
+    * delegation to `checkpoint.signingPreimage` + `Hasher[F].hash`.
     */
   def hashOf[F[_]: Hasher](checkpoint: ShardCheckpoint): F[Hash] =
     Hasher[F].hash(checkpoint.signingPreimage)

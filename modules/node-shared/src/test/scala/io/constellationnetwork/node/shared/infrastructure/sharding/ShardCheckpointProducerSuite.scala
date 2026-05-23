@@ -32,8 +32,7 @@ import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
 
-/** Tests for [[ShardCheckpointProducer]] — slice 8 of
-  * `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §6.
+/** Tests for [[ShardCheckpointProducer]] — slice 8 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §6.
   *
   * Required coverage (per slice 8 task spec):
   *   1. '''Happy path''': this node wins the slot VRF ⇒ produce returns `Some`, publisher recorded the checkpoint, checkpoint has correct
@@ -118,8 +117,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     Signed(body, NonEmptySet.of(sentinelProof))
   }
 
-  /** Build pending snapshots map for `numMgs` MGs, with one signed binary each. The `SortedMap` order is the same as the address ordering
-    * — the test asserts that `derivePerMgState` is called once per MG regardless of order.
+  /** Build pending snapshots map for `numMgs` MGs, with one signed binary each. The `SortedMap` order is the same as the address ordering —
+    * the test asserts that `derivePerMgState` is called once per MG regardless of order.
     */
   private def mkPendingSnapshots(numMgs: Int): SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] =
     SortedMap.from(
@@ -129,8 +128,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       }
     )
 
-  /** Deterministic `derivePerMgState` that returns a `Hash` derived from `(mg, snapshot.lastSnapshotHash)`. Lets tests assert on the
-    * per-MG hash values present in the produced `derivedStateDelta.perMetagraphMptRoots`.
+  /** Deterministic `derivePerMgState` that returns a `Hash` derived from `(mg, snapshot.lastSnapshotHash)`. Lets tests assert on the per-MG
+    * hash values present in the produced `derivedStateDelta.perMetagraphMptRoots`.
     */
   private def deterministicDerive(mg: Address, snap: Signed[StateChannelSnapshotBinary]): IO[Hash] =
     IO.pure(hashFromString(s"derived-${mg.value.value}-${snap.value.lastSnapshotHash.value.take(8)}"))
@@ -174,8 +173,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       kp <- KeyPairGenerator.makeKeyPair[IO]
     } yield TestRig(store, pubPair._1, pubPair._2, kp, PeerId.fromPublic(kp.getPublic))
 
-  /** Build a producer wired with the common defaults: real ShardSlotLeader, real chain store, stub KES, stub derive. The two knobs
-    * exposed to tests are `sigmaInCommittee` (σ=1 ⇒ always wins, σ=0 ⇒ never wins) and the optional `derivePerMgState` override.
+  /** Build a producer wired with the common defaults: real ShardSlotLeader, real chain store, stub KES, stub derive. The two knobs exposed
+    * to tests are `sigmaInCommittee` (σ=1 ⇒ always wins, σ=0 ⇒ never wins) and the optional `derivePerMgState` override.
     */
   private def makeProducer(
     ssl: ShardSlotLeader[IO],
@@ -220,17 +219,18 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       result <- tryProduceUntilSome(producer, startOrd = 1000L, EtaPeriod(0L), maxAttempts = 100)
       produced <- IO.fromOption(result)(new RuntimeException("happy path: σ=1 producer should win within 100 attempts"))
       recorded <- rig.recorded
-    } yield expect.all(
-      produced.value.shardId == shardZero,
-      produced.value.shardOrdinal == ShardOrdinal(1L),
-      produced.value.committeeSignatures.size == 1,
-      produced.value.committeeSignatures.head.peerId == rig.selfPeerId,
-      produced.value.committeeSignatures.head.kesTreeStep == 7,
-      recorded.size == 1,
-      recorded.head.value.shardOrdinal == ShardOrdinal(1L),
-      recorded.head.value.shardId == shardZero,
-      produced.value.parentCheckpointHash == Hash.empty // genesis
-    )
+    } yield
+      expect.all(
+        produced.value.shardId == shardZero,
+        produced.value.shardOrdinal == ShardOrdinal(1L),
+        produced.value.committeeSignatures.size == 1,
+        produced.value.committeeSignatures.head.peerId == rig.selfPeerId,
+        produced.value.committeeSignatures.head.kesTreeStep == 7,
+        recorded.size == 1,
+        recorded.head.value.shardOrdinal == ShardOrdinal(1L),
+        recorded.head.value.shardId == shardZero,
+        produced.value.parentCheckpointHash == Hash.empty // genesis
+      )
   }
 
   // ===========================================================================
@@ -410,11 +410,12 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       _ <- pub.publish(cp1)
       _ <- pub.publish(cp2)
       recorded <- read
-    } yield expect.all(
-      recorded.size == 2,
-      recorded.head.value.shardOrdinal == ShardOrdinal(1L),
-      recorded(1).value.shardOrdinal == ShardOrdinal(2L)
-    )
+    } yield
+      expect.all(
+        recorded.size == 2,
+        recorded.head.value.shardOrdinal == ShardOrdinal(1L),
+        recorded(1).value.shardOrdinal == ShardOrdinal(2L)
+      )
   }
 
   test("noop publisher: publish is a no-op (returns successfully without side effects)") { _ =>
@@ -431,8 +432,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
 
   /** Loop until `produce(...)` returns `Some` or `maxAttempts` is reached. We iterate over `startOrd` upward — each iteration is a
     * different `(slot, gl0AnchorOrdinal)` pair, which gives a fresh VRF input and therefore a fresh draw. At σ=1 with the LDD recovery
-    * regime, the draw saturates and the first try usually wins; the defensive loop is there for the rare miss when the test seed lands
-    * the VRF output near the threshold.
+    * regime, the draw saturates and the first try usually wins; the defensive loop is there for the rare miss when the test seed lands the
+    * VRF output near the threshold.
     */
   private def tryProduceUntilSome(
     producer: ShardCheckpointProducer[IO],
