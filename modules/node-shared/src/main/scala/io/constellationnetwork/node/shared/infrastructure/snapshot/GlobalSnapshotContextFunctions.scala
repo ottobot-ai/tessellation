@@ -296,7 +296,10 @@ object GlobalSnapshotContextFunctions {
                       val balDeltaKeys = (priorBalances.keySet ++ computedBalances.keySet).filter { addr =>
                         priorBalances.get(addr) != computedBalances.get(addr)
                       }
-                      val balDeltaSample = balDeltaKeys.toList.take(10).map { addr =>
+                      // #257 instrumentation: dump ALL diverging balance entries (was top-10). The producer
+                      // (gl0 leader) dumps its full balances delta uncapped at the matching ordinal — both
+                      // logs can be cross-diffed to identify which (address, balance) pairs disagree.
+                      val balDeltaSample = balDeltaKeys.toList.map { addr =>
                         val before = priorBalances.get(addr).map(_.value.value.toString).getOrElse("none")
                         val after = computedBalances.get(addr).map(_.value.value.toString).getOrElse("none")
                         s"${addr.value.value.take(10)}=$before->$after"
@@ -311,6 +314,21 @@ object GlobalSnapshotContextFunctions {
                         val after = computedScHashes.get(addr).map(_.show.take(8)).getOrElse("none")
                         s"${addr.value.value.take(10)}=$before->$after"
                       }
+                      // #257 instrumentation: when activeDelegatedStakes is in perFieldDiffs, dump per-address
+                      // record-set size + content hash so producer-vs-verifier divergence localizes per address.
+                      // SortedSet[DelegatedStakeRecord] is render-stable; hashing its toString is order-aware.
+                      val priorDS: SortedMap[Address, SortedSet[DelegatedStakeRecord]] =
+                        context.activeDelegatedStakes.getOrElse(SortedMap.empty[Address, SortedSet[DelegatedStakeRecord]])
+                      val computedDS: SortedMap[Address, SortedSet[DelegatedStakeRecord]] =
+                        snapshotInfo.activeDelegatedStakes.getOrElse(SortedMap.empty[Address, SortedSet[DelegatedStakeRecord]])
+                      val dsDeltaKeys = (priorDS.keySet ++ computedDS.keySet).filter { addr =>
+                        priorDS.get(addr) != computedDS.get(addr)
+                      }
+                      val dsDeltaSample = dsDeltaKeys.toList.map { addr =>
+                        val before = priorDS.get(addr).map(r => s"${r.size}:${"%08x".format(r.toString.hashCode)}").getOrElse("none")
+                        val after = computedDS.get(addr).map(r => s"${r.size}:${"%08x".format(r.toString.hashCode)}").getOrElse("none")
+                        s"${addr.value.value.take(10)}=$before->$after"
+                      }
                       logger.error(
                         s"StateProofMismatch at ordinal=${signedArtifact.ordinal.show}: " +
                           s"computed.mptRoot=${computedStateProof.mptRoot.map(_.show.take(12)).getOrElse("none")} " +
@@ -323,6 +341,8 @@ object GlobalSnapshotContextFunctions {
                           s"balDeltaCount=${balDeltaKeys.size} balDeltaSample=[${balDeltaSample.mkString(",")}] " +
                           s"prior.scHashes.size=${priorScHashes.size} computed.scHashes.size=${computedScHashes.size} " +
                           s"scDeltaCount=${scDeltaKeys.size} scDeltaSample=[${scDeltaSample.mkString(",")}] " +
+                          s"prior.activeDS.size=${priorDS.size} computed.activeDS.size=${computedDS.size} " +
+                          s"dsDeltaCount=${dsDeltaKeys.size} dsDeltaSample=[${dsDeltaSample.mkString(",")}] " +
                           s"signed.lastSnapshotHash=${signedArtifact.value.lastSnapshotHash.show.take(12)} " +
                           s"signed.scSnapshots.metagraphs=${signedArtifact.stateChannelSnapshots.size}"
                       ) >> Async[F].raiseError[(GlobalSnapshotInfo, MptTxAction)](

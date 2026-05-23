@@ -1068,8 +1068,17 @@ object GlobalSnapshotAcceptanceManager {
                   )
 
                 acceptedGlobalAllowSpends = allowSpendBlockAcceptanceResult.accepted.flatMap(_.value.transactions.toList)
+                _dagLayerTokenLocks = tokenLockBlockAcceptanceResult.accepted.flatMap(_.value.tokenLocks.toList)
+                _ <- loggerBundle.app.info {
+                  val sigs = _dagLayerTokenLocks
+                    .map(tl =>
+                      s"src=${tl.value.source.value.value.takeRight(8)}/amt=${tl.value.amount.value.value}/lastRef=${tl.value.parent.ordinal.value.value}"
+                    )
+                    .mkString(",")
+                  s"[Q2/gl0-DAG-extract] ordinal=$ordinal dagLayerTokenLocks=${_dagLayerTokenLocks.size} sigs=[$sigs]"
+                }
                 acceptedGlobalTokenLocks <- tokenLockStateManager.acceptReplacementTokenLocks(
-                  tokenLockBlockAcceptanceResult.accepted.flatMap(_.value.tokenLocks.toList),
+                  _dagLayerTokenLocks,
                   lastSnapshotContext
                 )
 
@@ -1498,6 +1507,28 @@ object GlobalSnapshotAcceptanceManager {
                       currencySnapshots,
                       priorTokenLockBalances.some
                     )
+                // #259 instrumentation (Q2/gl0-currency-extract): currency-snapshot-side token-lock balance flow.
+                // updateTokenLockBalances pulls token-lock balances from `currencySnapshots` (which contain
+                // currency-l0's incremental snapshots). If this delta is empty when test creates a metagraph lock,
+                // it means the currency snapshot fed in here did NOT carry the lock. Compare with [Q2/cl0-snapshot]
+                // logs on the same metagraph to see if cl0 included it but gl0 lost it.
+                _ <- loggerBundle.app.info {
+                  val perMg = currencySnapshots.toList.map {
+                    case (mgAddr, Right((signed, _))) =>
+                      val locks = signed.value.tokenLockBlocks.map(_.toList).getOrElse(List.empty).flatMap(_.tokenLocks.toList)
+                      val sigs =
+                        locks.map(tl => s"src=${tl.value.source.value.value.takeRight(8)}/amt=${tl.value.amount.value.value}").mkString(",")
+                      s"${mgAddr.value.value.takeRight(8)}:ord=${signed.ordinal.value}/locks=${locks.size}[$sigs]"
+                    case (mgAddr, Left(_)) => s"${mgAddr.value.value.takeRight(8)}:full-snap"
+                  }.mkString(" ")
+                  val deltaSigs = tokenLockBalancesDeltas.toList.flatMap {
+                    case (mgAddr, perAddr) =>
+                      perAddr.toList.map {
+                        case (a, b) => s"${mgAddr.value.value.takeRight(8)}->${a.value.value.takeRight(8)}=${b.value.value}"
+                      }
+                  }.mkString(",")
+                  s"[Q2/gl0-currency-extract] ordinal=$ordinal currSnapshots={$perMg} tlbDeltaCount=${tokenLockBalancesDeltas.size} tlbDelta=[$deltaSigs]"
+                }
 
                 tokenLockBalancesResult <- tokenLockStateManager.updateGlobalBalancesByTokenLocksWithExpired(
                   epochProgress,
@@ -1794,15 +1825,27 @@ object GlobalSnapshotAcceptanceManager {
 
                 // Per-entry balance delta dump for #70 dl1/gl0 mptRoot.balances divergence diagnosis.
                 // SortedMap iteration is deterministic; Balance.toString is a Long — both content-stable
-                // across nodes. Each entry: <addr-last8>=<balance>. Capped to 32 entries to keep logs sane.
+                // across nodes. Each entry: <addr-last8>=<balance>. Uncapped (#257 instrumentation): the
+                // 32-cap was masking divergences whose tell lay beyond the head sample. Verify-side dumps
+                // its full computed map (uncapped) on mismatch — both sides need full coverage to cross-diff.
                 _ <- loggerBundle.app.info {
                   val entries = stateChangesAccumulator.balances.toSeq.map {
                     case (addr, bal) => s"${addr.value.value.takeRight(8)}=${bal.value.value}"
                   }
-                  val rendered =
-                    if (entries.size > 32) entries.take(32).mkString(",") + s",...(${entries.size - 32} more)"
-                    else entries.mkString(",")
-                  s"[ACCEPTANCE] ordinal=$ordinal MPT_SYNC_FP_BAL_DELTA: [$rendered]"
+                  s"[ACCEPTANCE] ordinal=$ordinal MPT_SYNC_FP_BAL_DELTA: [${entries.mkString(",")}]"
+                }
+                // #257 instrumentation: per-entry activeDelegatedStakes delta dump. Verify-side flagged this
+                // partition as a diverging field (cl1/dl1 vs gl0). Render each entry as
+                // <addr-last8>=<recordCount>:<hash> so per-address divergence localizes without dumping the
+                // full DelegatedStakeRecord (which contains nested Signed structures). Uncapped — sample size
+                // is bounded by the active stake set.
+                _ <- loggerBundle.app.info {
+                  val entries = stateChangesAccumulator.activeDelegatedStakes.toSeq.map {
+                    case (addr, records) =>
+                      val rh = "%08x".format(records.toString.hashCode)
+                      s"${addr.value.value.takeRight(8)}=${records.size}:$rh"
+                  }
+                  s"[ACCEPTANCE] ordinal=$ordinal MPT_SYNC_FP_DS_DELTA: [${entries.mkString(",")}]"
                 }
                 _ <- loggerBundle.app.info {
                   val pipelineEntries = List(

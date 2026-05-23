@@ -168,22 +168,26 @@ object TokenLock {
             }.flatMap {
               _.toList.traverse {
                 case (hash, signedBlock) =>
-                  services.tokenLockBlock
-                    .accept(signedBlock, snapshotOrdinal)
-                    .handleErrorWith {
-                      // Permanent rejection — block was already dropped from Waiting in `processAcceptanceError`.
-                      case e: TokenLockBlockService.TokenLockBlockAcceptanceError
-                          if TokenLockBlockNotAcceptedReason.isPermanent(e.reason) =>
-                        logger.warn(s"Permanently rejected token lock block ${hash.show}: ${e.reason} — dropped, no redownload")
-                      case error =>
-                        for {
-                          _ <- logger.warn(error)(s"Failed acceptance of a token lock block with ${hash.show}")
-                          _ <- globalL0AlignmentStorage.updateShouldRedownload(
-                            value = true,
-                            reasons = List(s"Token Lock block acceptance failed for ${hash.show}: ${error.getMessage}")
-                          )
-                        } yield ()
-                    }
+                  val q2Sigs = signedBlock.value.tokenLocks.toList.map { tl =>
+                    s"src=${tl.value.source.value.value.takeRight(8)}/amt=${tl.value.amount.value.value}/lastRef=${tl.value.parent.ordinal.value.value}"
+                  }.mkString(",")
+                  logger.info(s"[Q2/cl1-accept] block=${hash.show.take(12)} count=${signedBlock.value.tokenLocks.size} locks=[$q2Sigs]") >>
+                    services.tokenLockBlock
+                      .accept(signedBlock, snapshotOrdinal)
+                      .handleErrorWith {
+                        // Permanent rejection — block was already dropped from Waiting in `processAcceptanceError`.
+                        case e: TokenLockBlockService.TokenLockBlockAcceptanceError
+                            if TokenLockBlockNotAcceptedReason.isPermanent(e.reason) =>
+                          logger.warn(s"Permanently rejected token lock block ${hash.show}: ${e.reason} — dropped, no redownload")
+                        case error =>
+                          for {
+                            _ <- logger.warn(error)(s"Failed acceptance of a token lock block with ${hash.show}")
+                            _ <- globalL0AlignmentStorage.updateShouldRedownload(
+                              value = true,
+                              reasons = List(s"Token Lock block acceptance failed for ${hash.show}: ${error.getMessage}")
+                            )
+                          } yield ()
+                      }
               }
             }.void
           case None => ().pure[F]

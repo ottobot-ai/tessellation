@@ -891,6 +891,14 @@ object CurrencySnapshotConsensusStateAdvancer {
         val tokenLockTxCount = allTokenLocks.size
         val tokenLockAmountTotal = allTokenLocks.map(_.amount.value.value).sum
         val tokenLockFeeTotal = allTokenLocks.map(_.fee.value.value).sum
+        // #259 instrumentation (Q2/cl0-snapshot): currency-side per-snapshot token-lock summary. Each lock
+        // logged with source/amount/parent.ord so we can correlate the SAME lock across the 5-hop cross-layer
+        // path (cl1-accept → cl0-snapshot → gl0-SCAcceptance → gl0-GSAM-extract → MPT).
+        val q2TokenLockSigs = allTokenLocks
+          .map(tl =>
+            s"src=${tl.value.source.value.value.takeRight(8)}/amt=${tl.value.amount.value.value}/lastRef=${tl.value.parent.ordinal.value.value}"
+          )
+          .mkString(",")
 
         // Data application
         val dataAppOnChainStateBytes = signed.dataApplication.map(_.onChainState.length.toLong).getOrElse(0L)
@@ -950,7 +958,12 @@ object CurrencySnapshotConsensusStateAdvancer {
           Metrics[F].updateGauge("dag_currency_snapshot_incremental_data_app_blocks_total_bytes", dataAppBlocksTotalBytes) >>
           // Binary size and fee
           Metrics[F].updateGauge("dag_currency_snapshot_binary_content_bytes", binaryContentBytes) >>
-          Metrics[F].updateGauge("dag_currency_snapshot_binary_fee", binaryFee)
+          Metrics[F].updateGauge("dag_currency_snapshot_binary_fee", binaryFee) >>
+          // #259 instrumentation (Q2/cl0-snapshot): log per-snapshot token-lock summary so the same lock
+          // can be traced across all 5 cross-layer hops.
+          logger.info(
+            s"[Q2/cl0-snapshot] ordinal=${signed.ordinal.value} blocks=$tokenLockBlocksCount tokenLocks=$tokenLockTxCount sigs=[$q2TokenLockSigs]"
+          )
       }
 
       private def notifyDataApplication(signedArtifact: Signed[CurrencySnapshotArtifact]): F[Unit] =
