@@ -5,6 +5,8 @@ import cats.syntax.all._
 
 import io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardFinalityTriggers}
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
+import io.constellationnetwork.node.shared.infrastructure.sharding.ShardMetrics
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
@@ -124,7 +126,7 @@ object ShardCheckpointGl0AcceptanceManager {
     *   (Slice 13) passes the closure that walks the per-MG chain and runs the existing `processCurrencySnapshots` derivation to compute the
     *   local `mptRoot`. For tests: stub the callback to return a known hash (matching or not matching the checkpoint delta) per scenario.
     */
-  def make[F[_]: Async: Hasher: SecurityProvider](
+  def make[F[_]: Async: Hasher: SecurityProvider: Metrics](
     finalityTriggers: ShardId => F[Option[ShardFinalityTriggers[F]]],
     chainStore: ShardId => F[Option[ShardChainStore[F]]],
     committeeMembership: (ShardId, EtaPeriod) => F[Set[PeerId]],
@@ -157,15 +159,22 @@ object ShardCheckpointGl0AcceptanceManager {
           preCheck(checkpoint).flatMap {
             case Left(reason) =>
               logger
-                .warn(s"reject pre-check: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} reason=$reason")
-                .as(ShardCheckpointAcceptResult.Rejected(reason): ShardCheckpointAcceptResult)
+                .warn(s"reject pre-check: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} reason=$reason") >>
+                // Slice 19: emit `dag_nakamoto_shard_checkpoint_rejected_total{shard_id, reason}`. Bucket the free-form diagnostic
+                // through `RejectReason.fromDiagnostic` to keep Prometheus cardinality bounded — see the helper's scaladoc.
+                ShardMetrics
+                  .incCheckpointRejected[F](checkpoint.shardId, ShardMetrics.RejectReason.fromDiagnostic(reason))
+                  .as(ShardCheckpointAcceptResult.Rejected(reason): ShardCheckpointAcceptResult)
             case Right(()) =>
               // Step 2: resolve the per-shard finality triggers. None ⇒ unknown shard ⇒ reject (we can't tell if T_count or T_depth1
               // qualifies because we don't track this shard).
               finalityTriggers(checkpoint.shardId).flatMap {
                 case None =>
                   val msg = s"unknown shard: shardId=${checkpoint.shardId} not in finalityTriggers map"
-                  logger.warn(msg).as(ShardCheckpointAcceptResult.Rejected(msg): ShardCheckpointAcceptResult)
+                  logger.warn(msg) >>
+                    ShardMetrics
+                      .incCheckpointRejected[F](checkpoint.shardId, ShardMetrics.RejectReason.UnknownShard)
+                      .as(ShardCheckpointAcceptResult.Rejected(msg): ShardCheckpointAcceptResult)
                 case Some(triggers) =>
                   // Step 3: read the latest qualifying ord from each inner trigger. The triggers are advanced asynchronously by the
                   // shard chain's tick loop; we read here, not advance — same pattern as the gl0 finality monitor (`evaluate` is read-only).
@@ -187,13 +196,17 @@ object ShardCheckpointGl0AcceptanceManager {
                           .info(
                             s"accept T_count_shard: shardId=${checkpoint.shardId} shardOrd=${checkpointOrd.value} " +
                               s"countQualifying=${countOrdSnap.value.value}"
-                          )
-                          .as(ShardCheckpointAcceptResult.Accepted: ShardCheckpointAcceptResult)
+                          ) >>
+                          ShardMetrics
+                            .incCheckpointAccepted[F](checkpoint.shardId, ShardMetrics.Path.TCount)
+                            .as(ShardCheckpointAcceptResult.Accepted: ShardCheckpointAcceptResult)
                       } else if (depthQualifies) {
                         // §7.3 degraded path: no quorum but the shard chain has advanced past `k1_shard` past this checkpoint. Re-exec
                         // the per-MG derivations and compare. Mismatch ⇒ slash (the lone-survivor committee signer(s) deviated from
-                        // determinism).
-                        reExecPath(checkpoint)
+                        // determinism). Slice 19: bump `committee_partition_total` — the shard is degraded; the depth-fallback
+                        // path is the load-bearing liveness rail right now.
+                        ShardMetrics.incCommitteePartition[F](checkpoint.shardId) >>
+                          reExecPath(checkpoint)
                       } else {
                         // Neither trigger qualifies — checkpoint is too new (no quorum + no depth coverage). Defer; the gl0 leader
                         // will try again at the next gl0 ord (per §7.2 the `gl0AnchorOrdinal` permits the checkpoint to ride into a
@@ -338,8 +351,10 @@ object ShardCheckpointGl0AcceptanceManager {
                 .info(
                   s"accept T_depth1_shard re-exec OK: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} " +
                     s"mgsReExecuted=${included.size}"
-                )
-                .as(ShardCheckpointAcceptResult.Accepted: ShardCheckpointAcceptResult)
+                ) >>
+                ShardMetrics
+                  .incCheckpointAccepted[F](checkpoint.shardId, ShardMetrics.Path.TDepth1)
+                  .as(ShardCheckpointAcceptResult.Accepted: ShardCheckpointAcceptResult)
             } else {
               val firstReason = mismatches.head._2
               val mismatchedMgs = mismatches.map(_._1).map(_.value.value).mkString(", ")
@@ -347,10 +362,12 @@ object ShardCheckpointGl0AcceptanceManager {
                 .warn(
                   s"reject T_depth1_shard re-exec mismatch: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} " +
                     s"mismatchedMgs=[$mismatchedMgs] firstReason=$firstReason slashSigners=${signers.map(_.value.value.take(16) + "...").mkString(",")}"
-                )
-                .as(
-                  ShardCheckpointAcceptResult.RejectedReExecutionMismatch(firstReason, signers): ShardCheckpointAcceptResult
-                )
+                ) >>
+                ShardMetrics
+                  .incCheckpointRejected[F](checkpoint.shardId, ShardMetrics.RejectReason.ReExecMismatch)
+                  .as(
+                    ShardCheckpointAcceptResult.RejectedReExecutionMismatch(firstReason, signers): ShardCheckpointAcceptResult
+                  )
             }
           }
         }

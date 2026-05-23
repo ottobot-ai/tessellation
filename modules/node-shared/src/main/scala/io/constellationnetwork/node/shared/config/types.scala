@@ -104,7 +104,8 @@ object types {
     numShards: Int,
     committeeKTarget: Int,
     finality: ShardFinalityConfig,
-    checkpoint: ShardCheckpointConfig
+    checkpoint: ShardCheckpointConfig,
+    observability: ShardObservabilityConfig
   )
 
   /** `k1Shard` maps to HOCON key `k1-shard` (the digit binds tight to the preceding letter — same convention as `k₁` in the design doc). A
@@ -121,6 +122,15 @@ object types {
   }
 
   case class ShardCheckpointConfig(tAliveMs: Long, tBurst: Int)
+
+  /** Slice 19 observability tunables (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §13 row 19 + §9.4).
+    *
+    *   - `tPartitionHardMs`: if a shard goes longer than this without ANY `T_count_shard` attestation reaching threshold (only the
+    *     `T_depth1_shard` fallback fires), the gl0 leader logs a `SHARD-PARTITION-SUSPECT` WARN and increments
+    *     `dag_nakamoto_shard_partition_hard_total{shard_id}`. Operator intervention is expected; per design-doc §9.4, v1 does not perform
+    *     automatic rotation. Default `600000` ms = 10 minutes (≥ `5 × t-alive-ms` in any realistic deploy).
+    */
+  case class ShardObservabilityConfig(tPartitionHardMs: Long)
 
   /** Configuration for the gl0-embedded `LocalEvents` reactive event stream (see `docs/nakamoto/LOCAL-EVENTS-SERVICE-DESIGN.md`). Drives
     * the gRPC server that publishes consensus events to local subscribers (e2e tests, operator GUI).

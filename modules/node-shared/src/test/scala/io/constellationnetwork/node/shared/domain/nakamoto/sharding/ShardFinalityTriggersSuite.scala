@@ -6,6 +6,7 @@ import cats.syntax.all._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
@@ -34,6 +35,11 @@ import weaver.MutableIOSuite
 object ShardFinalityTriggersSuite extends MutableIOSuite {
 
   override type Res = Hasher[IO]
+
+  // Slice 19: ShardChainStore + ShardTipTracker constructors now require an implicit Metrics[F]. Tests use a no-op
+  // interpreter so they keep asserting on chain-store / tracker semantics rather than metric mechanics (which are
+  // covered by Slice 19's own ShardMetricsSuite).
+  implicit val metrics: Metrics[IO] = NoOpMetrics.make
 
   override def sharedResource: Resource[IO, Res] =
     for {

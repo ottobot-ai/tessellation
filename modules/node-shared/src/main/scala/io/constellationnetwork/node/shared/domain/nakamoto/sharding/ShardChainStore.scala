@@ -3,6 +3,8 @@ package io.constellationnetwork.node.shared.domain.nakamoto.sharding
 import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
+import io.constellationnetwork.node.shared.infrastructure.sharding.ShardMetrics
 import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId, ShardOrdinal}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
@@ -171,7 +173,7 @@ object ShardChainStore {
     * design doc §3.3 — "the bytes a signer signs are `Hasher[F](ShardCheckpointSigPreimage)`"). Routing through the typeclass avoids
     * hand-rolled serialization (`[[feedback-use-hasher-no-manual-serialize]]`) and keeps cluster-wide hash determinism.
     */
-  def make[F[_]: Async: Hasher](
+  def make[F[_]: Async: Hasher: Metrics](
     shardId: ShardId,
     keepDepthBehindFinalized: Long = DefaultKeepDepthBehindFinalized
   ): F[ShardChainStore[F]] = {
@@ -226,14 +228,22 @@ object ShardChainStore {
                   }
 
                   val newState = state.copy(byHash = newByHash, bestTipHash = Some(newBestTipHash))
+                  // Slice 19: emit per-shard `dag_nakamoto_shard_chain_height{shard_id}` gauge whenever the bestTip moves.
+                  // The gauge follows the highest-stored-tip ord, so we only emit on the three branches where the bestTip
+                  // ACTUALLY advanced (bootstrap, linear-extension, reorg). The alternate-branch case keeps the prior tip.
+                  val newTipOrd: ShardOrdinal = ShardOrdinal(
+                    newState.byHash.get(newBestTipHash).map(_.shardOrdinal.value).getOrElse(0L)
+                  )
                   val effect: F[Boolean] = (newBestTipHash === snapshotHash, resolvedBest) match {
                     case (true, None) =>
                       logger
                         .info(s"store: chain bootstrapped at shardOrdinal=${shardOrdinal.value} slot=$slot")
+                        .productR(ShardMetrics.setChainHeight[F](outerShardId, newTipOrd))
                         .as(true)
                     case (true, Some(prior)) if stored.parentHash === prior.hash =>
                       logger
                         .debug(s"store: linear extension shardOrdinal=${shardOrdinal.value} slot=$slot")
+                        .productR(ShardMetrics.setChainHeight[F](outerShardId, newTipOrd))
                         .as(true)
                     case (true, Some(prior)) =>
                       logger
@@ -241,6 +251,7 @@ object ShardChainStore {
                           s"store: reorg — new tip shardOrdinal=${shardOrdinal.value} slot=$slot beats " +
                             s"prior shardOrdinal=${prior.shardOrdinal.value} slot=${prior.slot}"
                         )
+                        .productR(ShardMetrics.setChainHeight[F](outerShardId, newTipOrd))
                         .as(true)
                     case (false, _) =>
                       logger
@@ -339,10 +350,15 @@ object ShardChainStore {
                   )
                   (
                     nextState,
-                    logger.info(
-                      s"finalize: shardOrdinal=${targetOrd.value} keepFloor=$keepFloor dropped=$prunedCount " +
-                        s"remaining=${pruned.size}"
-                    )
+                    logger
+                      .info(
+                        s"finalize: shardOrdinal=${targetOrd.value} keepFloor=$keepFloor dropped=$prunedCount " +
+                          s"remaining=${pruned.size}"
+                      )
+                      // Slice 19: emit per-shard `dag_nakamoto_shard_chain_finalized_ordinal{shard_id}`. The advance is
+                      // monotone (guarded above by `targetOrd <= lastFinalizedOrdinal` no-op), so the gauge tracks the highest
+                      // ord we've ever finalized.
+                      .productR(ShardMetrics.setChainFinalized[F](outerShardId, targetOrd))
                   )
                 }
             }

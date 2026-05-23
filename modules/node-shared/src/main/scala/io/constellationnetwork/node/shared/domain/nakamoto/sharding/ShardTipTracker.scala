@@ -3,6 +3,8 @@ package io.constellationnetwork.node.shared.domain.nakamoto.sharding
 import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
+import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
+import io.constellationnetwork.node.shared.infrastructure.sharding.ShardMetrics
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.{ShardId, ShardOrdinal}
 import io.constellationnetwork.security.hash.Hash
@@ -96,7 +98,7 @@ object ShardTipTracker {
     *   the local node's PeerId — captured here so `attestationCountFor(excludeSelf = true)` (the default) can apply the #133/P-11b
     *   self-exclusion without re-threading the identity through every call site.
     */
-  def make[F[_]: Async](
+  def make[F[_]: Async: Metrics](
     shardId: ShardId,
     selfPeerId: PeerId
   ): F[ShardTipTracker[F]] = {
@@ -110,9 +112,16 @@ object ShardTipTracker {
         val shardId: ShardId = outerShardId
 
         def recordAttestation(checkpointHash: Hash, peerId: PeerId): F[Unit] =
-          attestationsRef.update { current =>
+          attestationsRef.modify { current =>
             val priorSet = current.getOrElse(checkpointHash, Set.empty[PeerId])
-            current.updated(checkpointHash, priorSet + peerId)
+            val newSet = priorSet + peerId
+            // Per scaladoc: idempotent — peer re-attesting same hash is a no-op. We only bump the metric on the FIRST
+            // attestation from this (peer, hash) pair so the counter tracks distinct attestation events, not gossip-replay events.
+            val isFirst = priorSet.size != newSet.size
+            (current.updated(checkpointHash, newSet), isFirst)
+          }.flatMap {
+            case true  => ShardMetrics.incCommitteeAttestation[F](outerShardId)
+            case false => Async[F].unit
           }
 
         def attestationCountFor(checkpointHash: Hash, excludeSelf: Boolean = true): F[Int] =

@@ -13,6 +13,7 @@ import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardSlotLeader}
+import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
 import io.constellationnetwork.schema.SnapshotOrdinal
@@ -56,6 +57,10 @@ import weaver.MutableIOSuite
 object ShardCheckpointProducerSuite extends MutableIOSuite {
 
   override type Res = (Hasher[IO], SecurityProvider[IO], ShardSlotLeader[IO])
+
+  // Slice 19: ShardChainStore.make requires Metrics[F]. No-op interpreter keeps the producer tests focused on
+  // chain-link + signature semantics.
+  implicit val metrics: Metrics[IO] = NoOpMetrics.make
 
   override def sharedResource: Resource[IO, Res] =
     for {

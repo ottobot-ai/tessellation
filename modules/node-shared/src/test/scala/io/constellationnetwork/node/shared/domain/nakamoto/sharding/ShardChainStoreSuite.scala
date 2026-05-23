@@ -8,6 +8,7 @@ import scala.collection.immutable.SortedMap
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
@@ -44,6 +45,10 @@ import weaver.MutableIOSuite
 object ShardChainStoreSuite extends MutableIOSuite {
 
   override type Res = Hasher[IO]
+
+  // Slice 19: ShardChainStore.make now requires Metrics[F]. Tests get a no-op interpreter to keep assertions focused on
+  // chain-store mechanics; per-test capture of metric calls lives in Slice 19's own ShardMetricsSuite.
+  implicit val metrics: Metrics[IO] = NoOpMetrics.make
 
   override def sharedResource: Resource[IO, Res] =
     for {

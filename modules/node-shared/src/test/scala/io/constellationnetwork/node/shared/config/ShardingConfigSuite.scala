@@ -40,7 +40,9 @@ object ShardingConfigSuite extends SimpleIOSuite {
       cfg.committeeKTarget == 4,
       cfg.finality.k1Shard == 8L,
       cfg.checkpoint.tAliveMs == 30000L,
-      cfg.checkpoint.tBurst == 64
+      cfg.checkpoint.tBurst == 64,
+      // Slice 19: default partition-hard threshold is 10 minutes.
+      cfg.observability.tPartitionHardMs == 600000L
     )
   }
 
@@ -52,6 +54,7 @@ object ShardingConfigSuite extends SimpleIOSuite {
         |  committee-k-target = 8
         |  finality { k1-shard = 16 }
         |  checkpoint { t-alive-ms = 45000, t-burst = 128 }
+        |  observability { t-partition-hard-ms = 90000 }
         |}
       """.stripMargin
     )
@@ -60,7 +63,8 @@ object ShardingConfigSuite extends SimpleIOSuite {
       cfg.committeeKTarget == 8,
       cfg.finality.k1Shard == 16L,
       cfg.checkpoint.tAliveMs == 45000L,
-      cfg.checkpoint.tBurst == 128
+      cfg.checkpoint.tBurst == 128,
+      cfg.observability.tPartitionHardMs == 90000L
     )
   }
 
@@ -77,7 +81,8 @@ object ShardingConfigSuite extends SimpleIOSuite {
       cfg.committeeKTarget == 4,
       cfg.finality.k1Shard == 8L,
       cfg.checkpoint.tAliveMs == 30000L,
-      cfg.checkpoint.tBurst == 64
+      cfg.checkpoint.tBurst == 64,
+      cfg.observability.tPartitionHardMs == 600000L
     )
   }
 }

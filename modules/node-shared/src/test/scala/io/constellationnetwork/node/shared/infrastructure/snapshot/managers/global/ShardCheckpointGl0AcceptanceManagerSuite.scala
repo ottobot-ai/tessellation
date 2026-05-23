@@ -13,6 +13,7 @@ import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardFinalityTriggers, ShardTipTracker}
+import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
@@ -52,6 +53,10 @@ import weaver.MutableIOSuite
 object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
 
   override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO])
+
+  // Slice 19: ShardChainStore, ShardTipTracker, and ShardCheckpointGl0AcceptanceManager constructors now all require
+  // Metrics[F]. No-op interpreter — slice-19 metric semantics are covered by ShardMetricsSuite.
+  implicit val metrics: Metrics[IO] = NoOpMetrics.make
 
   override def sharedResource: Resource[IO, Res] =
     for {
