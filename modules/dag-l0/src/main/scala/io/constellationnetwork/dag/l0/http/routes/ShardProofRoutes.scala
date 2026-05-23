@@ -22,38 +22,31 @@ import org.http4s.{HttpRoutes, Response}
   * `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §8.6.
   *
   * '''Endpoint''':
-  *   - `POST /shard/{shardId}/proof?metagraph={addr}` — generate an MPT inclusion proof for a
-  *     [[GlobalStateKey]] (passed as the JSON request body) under the named metagraph's subtree.
+  *   - `POST /shard/{shardId}/proof?metagraph={addr}` — generate an MPT inclusion proof for a [[GlobalStateKey]] (passed as the JSON
+  *     request body) under the named metagraph's subtree.
   *     - 200 [[ShardSubtreeProof]] JSON on success.
-  *     - 400 if `shardId` is malformed, `metagraph` query param is missing/malformed, OR the
-  *       shard doesn't own the metagraph per the deterministic static assignment (defence
-  *       against probing peers / stale config).
-  *     - 404 if the shard owns the MG but the requested key is absent from the underlying MPT
-  *       (v1 doesn't ship proof-of-absence).
-  *     - 503 while the service Ref is still empty (pre-startup) OR the shard has no current
-  *       checkpoint (bootstrap, paused shard).
+  *     - 400 if `shardId` is malformed, `metagraph` query param is missing/malformed, OR the shard doesn't own the metagraph per the
+  *       deterministic static assignment (defence against probing peers / stale config).
+  *     - 404 if the shard owns the MG but the requested key is absent from the underlying MPT (v1 doesn't ship proof-of-absence).
+  *     - 503 while the service Ref is still empty (pre-startup) OR the shard has no current checkpoint (bootstrap, paused shard).
   *
   * '''Wire shape rationale (deviation from design doc §8.6 `GET` shape)''':
-  *   - Design §8.6 specifies `GET /shard/{shardId}/proof?metagraph={addr}&key={hexKey}`. v1 uses
-  *     `POST` with a JSON body for the key because [[GlobalStateKey]] is a structured 4-tuple
-  *     (network namespace, fieldId, contract namespace, user namespace) — passing it as a
-  *     URL-encoded JSON or as the `GlobalStateKey.toHex` output adds an extra serialization
-  *     surface that's load-bearing for cluster-wide proof reproducibility. POST with a JSON body
-  *     decoded by the same magnolia-derived `GlobalStateKey` decoder used everywhere else
+  *   - Design §8.6 specifies `GET /shard/{shardId}/proof?metagraph={addr}&key={hexKey}`. v1 uses `POST` with a JSON body for the key
+  *     because [[GlobalStateKey]] is a structured 4-tuple (network namespace, fieldId, contract namespace, user namespace) — passing it as
+  *     a URL-encoded JSON or as the `GlobalStateKey.toHex` output adds an extra serialization surface that's load-bearing for cluster-wide
+  *     proof reproducibility. POST with a JSON body decoded by the same magnolia-derived `GlobalStateKey` decoder used everywhere else
   *     eliminates that surface.
-  *   - The `anchor` query param from §8.6 is OMITTED in v1 — the prover anchors at whatever
-  *     branch+ordinal the [[ShardSubtreeProofService]] was constructed with (typically the
-  *     last-finalized snapshot). Adding caller-driven anchor is a v2 feature when multiple
-  *     historical anchors are needed (light-client time-travel queries).
+  *   - The `anchor` query param from §8.6 is OMITTED in v1 — the prover anchors at whatever branch+ordinal the [[ShardSubtreeProofService]]
+  *     was constructed with (typically the last-finalized snapshot). Adding caller-driven anchor is a v2 feature when multiple historical
+  *     anchors are needed (light-client time-travel queries).
   *
-  * '''Mirrors''' [[NipopowRoutes]] (#138): pure observability, reads a Ref populated by the
-  * consensus startup once the proof service is wired. Never feeds back into consensus.
+  * '''Mirrors''' [[NipopowRoutes]] (#138): pure observability, reads a Ref populated by the consensus startup once the proof service is
+  * wired. Never feeds back into consensus.
   *
-  * '''Greenfield rule''' (per `[[feedback-greenfield-no-wire-compat]]`): fresh route for the
-  * cross-shard read path. No compat ceremony.
+  * '''Greenfield rule''' (per `[[feedback-greenfield-no-wire-compat]]`): fresh route for the cross-shard read path. No compat ceremony.
   *
-  * '''HOCON rule''' (per `[[feedback-prefer-hocon-over-sysenv]]`): no `sys.env.get` — all knobs
-  * (`numShards` via the underlying [[ShardSubtreeProofService]]) come from typed HOCON config.
+  * '''HOCON rule''' (per `[[feedback-prefer-hocon-over-sysenv]]`): no `sys.env.get` — all knobs (`numShards` via the underlying
+  * [[ShardSubtreeProofService]]) come from typed HOCON config.
   */
 final case class ShardProofRoutes[F[_]: Async](
   serviceRef: Ref[F, Option[ShardSubtreeProofService[F]]]
@@ -62,8 +55,8 @@ final case class ShardProofRoutes[F[_]: Async](
 
   protected val prefixPath: InternalUrlPrefix = "/shard"
 
-  /** Run the inner handler with the proof service if present; respond 503 otherwise. Mirrors
-    * [[NipopowRoutes.withProvider]] so the startup-ordering gate is consistent across routes.
+  /** Run the inner handler with the proof service if present; respond 503 otherwise. Mirrors [[NipopowRoutes.withProvider]] so the
+    * startup-ordering gate is consistent across routes.
     */
   private def withService(f: ShardSubtreeProofService[F] => F[Response[F]]): F[Response[F]] =
     serviceRef.get.flatMap {
@@ -71,8 +64,7 @@ final case class ShardProofRoutes[F[_]: Async](
       case Some(service) => f(service)
     }
 
-  /** Parse a non-negative shard id from a path segment. Returns `None` if the segment is not a
-    * valid non-negative integer.
+  /** Parse a non-negative shard id from a path segment. Returns `None` if the segment is not a valid non-negative integer.
     */
   private def parseShardId(raw: String): Option[ShardId] =
     for {
@@ -80,8 +72,8 @@ final case class ShardProofRoutes[F[_]: Async](
       n <- NonNegInt.from(i).toOption
     } yield ShardId(n)
 
-  /** Extract the `metagraph` query param and decode it as an [[io.constellationnetwork.schema.address.Address]].
-    * Routes through the same [[AddressVar]] extractor the other gl0 routes use.
+  /** Extract the `metagraph` query param and decode it as an [[io.constellationnetwork.schema.address.Address]]. Routes through the same
+    * [[AddressVar]] extractor the other gl0 routes use.
     */
   private def extractMetagraph(req: org.http4s.Request[F]) =
     req.params.get("metagraph").flatMap { raw =>
@@ -147,15 +139,13 @@ final case class ShardProofRoutes[F[_]: Async](
 
 object ShardProofRoutes {
 
-  /** Convenience constructor that wraps a service in a `Ref[F, Option[_]]`. Mirrors how
-    * [[NipopowRoutes]] expects its provider — the startup ordering populates the Ref once all
-    * dependencies (per-shard chain stores, MPT proof service, shard assignment) are wired.
+  /** Convenience constructor that wraps a service in a `Ref[F, Option[_]]`. Mirrors how [[NipopowRoutes]] expects its provider — the
+    * startup ordering populates the Ref once all dependencies (per-shard chain stores, MPT proof service, shard assignment) are wired.
     */
   def make[F[_]: Async](service: ShardSubtreeProofService[F]): F[ShardProofRoutes[F]] =
     Ref.of[F, Option[ShardSubtreeProofService[F]]](service.some).map(ShardProofRoutes(_))
 
-  /** Convenience constructor for a pre-startup empty Ref. The wiring code populates it later via
-    * `routes.serviceRef.set(Some(service))`.
+  /** Convenience constructor for a pre-startup empty Ref. The wiring code populates it later via `routes.serviceRef.set(Some(service))`.
     */
   def empty[F[_]: Async]: F[ShardProofRoutes[F]] =
     Ref.of[F, Option[ShardSubtreeProofService[F]]](None).map(ShardProofRoutes(_))

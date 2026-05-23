@@ -20,8 +20,7 @@ import io.constellationnetwork.security.signature.signature.{Signature, Signatur
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
 
-/** Tests for [[ShardTipTracker]] and [[ShardFinalityTriggers]] — Slice 6 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`
-  * §5.4.
+/** Tests for [[ShardTipTracker]] and [[ShardFinalityTriggers]] — Slice 6 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §5.4.
   *
   * '''Required coverage''' (per slice spec):
   *   1. `T_count_shard` qualifies at threshold — `K_S=4`, 3 attesters → ceil(2·4/3) = 3 → qualifies; 2 attesters → does not.
@@ -107,15 +106,17 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
     store: ShardChainStore[IO],
     n: Int
   )(implicit hasher: Hasher[IO]): IO[List[Hash]] =
-    (0L until n.toLong).toList.foldLeftM[IO, (List[Hash], Hash)]((List.empty, Hash.empty)) {
-      case ((acc, parent), ord) =>
-        val signed = mkSignedCheckpoint(ord, parent = parent, peerByte = ord.toInt + 1, gl0Anchor = 100L + ord)
-        store
-          .store(signed, parentHash = parent, shardOrdinal = ShardOrdinal(ord), slot = ord + 1L, vrfOutput = vrf(ord.toInt + 1))
-          .flatMap { _ =>
-            store.bestTip.map(_.get.hash).map(h => (acc :+ h, h))
-          }
-    }.map(_._1)
+    (0L until n.toLong).toList
+      .foldLeftM[IO, (List[Hash], Hash)]((List.empty, Hash.empty)) {
+        case ((acc, parent), ord) =>
+          val signed = mkSignedCheckpoint(ord, parent = parent, peerByte = ord.toInt + 1, gl0Anchor = 100L + ord)
+          store
+            .store(signed, parentHash = parent, shardOrdinal = ShardOrdinal(ord), slot = ord + 1L, vrfOutput = vrf(ord.toInt + 1))
+            .flatMap { _ =>
+              store.bestTip.map(_.get.hash).map(h => (acc :+ h, h))
+            }
+      }
+      .map(_._1)
 
   // ============================================================================
   // Test 1: T_count_shard qualifies at threshold (K_S=4 → required = ceil(2·4/3) = 3)
@@ -169,36 +170,35 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
   // Test 2: T_count_shard self-exclusion (#133 / P-11b mirror)
   // ============================================================================
 
-  test("T_count_shard: self-exclusion — local node + 2 others attest → only 2 count → does not qualify (K_S=4)") {
-    implicit hasher =>
-      val self = pid("self")
-      for {
-        store <- ShardChainStore.make[IO](shardZero)
-        _ <- seedChain(store, 1)
-        tip <- store.bestTip.map(_.get)
-        tracker <- ShardTipTracker.make[IO](shardZero, self)
-        _ <- tracker.recordAttestation(tip.hash, self) // self attests
-        _ <- tracker.recordAttestation(tip.hash, pid("attester-1"))
-        _ <- tracker.recordAttestation(tip.hash, pid("attester-2"))
-        // With self-exclusion (the default), only attester-1 and attester-2 count → count = 2 < 3 required → MinValue.
-        // Without exclusion, count would be 3 ≥ 3 → qualifies. The point of this test is to verify the #133/P-11b mirror is wired
-        // through ShardTipTracker.attestationCountFor's `excludeSelf = true` default.
-        triggers <- ShardFinalityTriggers.make[IO](
-          shardId = shardZero,
-          kTarget = 4,
-          k1Shard = 100L,
-          chainStore = store,
-          tipTracker = tracker
-        )
-        _ <- triggers.advance
-        result <- triggers.tCountShard.latestQualifyingOrdinal
-        // Sanity: the underlying tracker without self-exclusion would have returned 3.
-        rawCount <- tracker.attestationCountFor(tip.hash, excludeSelf = false)
-        excludedCount <- tracker.attestationCountFor(tip.hash, excludeSelf = true)
-      } yield
-        expect.same(SnapshotOrdinal.MinValue, result) &&
-          expect.same(3, rawCount) &&
-          expect.same(2, excludedCount)
+  test("T_count_shard: self-exclusion — local node + 2 others attest → only 2 count → does not qualify (K_S=4)") { implicit hasher =>
+    val self = pid("self")
+    for {
+      store <- ShardChainStore.make[IO](shardZero)
+      _ <- seedChain(store, 1)
+      tip <- store.bestTip.map(_.get)
+      tracker <- ShardTipTracker.make[IO](shardZero, self)
+      _ <- tracker.recordAttestation(tip.hash, self) // self attests
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-1"))
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-2"))
+      // With self-exclusion (the default), only attester-1 and attester-2 count → count = 2 < 3 required → MinValue.
+      // Without exclusion, count would be 3 ≥ 3 → qualifies. The point of this test is to verify the #133/P-11b mirror is wired
+      // through ShardTipTracker.attestationCountFor's `excludeSelf = true` default.
+      triggers <- ShardFinalityTriggers.make[IO](
+        shardId = shardZero,
+        kTarget = 4,
+        k1Shard = 100L,
+        chainStore = store,
+        tipTracker = tracker
+      )
+      _ <- triggers.advance
+      result <- triggers.tCountShard.latestQualifyingOrdinal
+      // Sanity: the underlying tracker without self-exclusion would have returned 3.
+      rawCount <- tracker.attestationCountFor(tip.hash, excludeSelf = false)
+      excludedCount <- tracker.attestationCountFor(tip.hash, excludeSelf = true)
+    } yield
+      expect.same(SnapshotOrdinal.MinValue, result) &&
+        expect.same(3, rawCount) &&
+        expect.same(2, excludedCount)
   }
 
   // ============================================================================
@@ -294,82 +294,80 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
   // Test 5: monotone — latestQualifyingOrdinal Ref never goes backwards
   // ============================================================================
 
-  test("monotone: after T_count qualifies ord N, dropping the attester set does NOT roll the Ref back to MinValue") {
-    implicit hasher =>
-      // Mirrors `FinalityTriggerSuite`'s "evaluateAndAdvance is monotone: never decreases the Ref" assertion, scoped to the shard
-      // composite. We record attestations to qualify, advance, then prune the tracker so the next advance would see count=0.
-      // The monotone Ref must NOT roll back.
-      val self = pid("self")
-      for {
-        store <- ShardChainStore.make[IO](shardZero)
-        _ <- seedChain(store, 1)
-        tip <- store.bestTip.map(_.get)
-        tracker <- ShardTipTracker.make[IO](shardZero, self)
-        // Record enough to qualify (K_S=4 → required=3).
-        _ <- tracker.recordAttestation(tip.hash, pid("attester-1"))
-        _ <- tracker.recordAttestation(tip.hash, pid("attester-2"))
-        _ <- tracker.recordAttestation(tip.hash, pid("attester-3"))
-        triggers <- ShardFinalityTriggers.make[IO](
-          shardId = shardZero,
-          kTarget = 4,
-          k1Shard = 100L,
-          chainStore = store,
-          tipTracker = tracker
-        )
-        _ <- triggers.advance
-        qualifyingAfter <- triggers.tCountShard.latestQualifyingOrdinal
-        // Now wipe all attestations for the tip by pruning everything below ord 999 (which is above any ord we have).
-        // Use the chain store's getByHash as the ordinal lookup so the prune lookup matches what production callers would do.
-        _ <- tracker.pruneBelow(
-          ShardOrdinal(999L),
-          h => store.getByHash(h).map(_.map(_.signed.value.shardOrdinal))
-        )
-        // Confirm the tracker is wiped: count goes back to 0.
-        countAfterPrune <- tracker.attestationCountFor(tip.hash, excludeSelf = true)
-        _ <- triggers.advance
-        qualifyingAfterPrune <- triggers.tCountShard.latestQualifyingOrdinal
-      } yield
-        // The first advance set the Ref to the bestTip ord.
-        expect.same(SnapshotOrdinal.unsafeApply(tip.signed.value.shardOrdinal.value), qualifyingAfter) &&
-          // Tracker is wiped.
-          expect.same(0, countAfterPrune) &&
-          // The Ref MUST NOT have rolled back even though `attestationCountFor` returned 0 → eval would return MinValue. This is
-          // the monotone-Ref contract guaranteed by `FinalityTrigger.fromRef`.
-          expect.same(qualifyingAfter, qualifyingAfterPrune)
+  test("monotone: after T_count qualifies ord N, dropping the attester set does NOT roll the Ref back to MinValue") { implicit hasher =>
+    // Mirrors `FinalityTriggerSuite`'s "evaluateAndAdvance is monotone: never decreases the Ref" assertion, scoped to the shard
+    // composite. We record attestations to qualify, advance, then prune the tracker so the next advance would see count=0.
+    // The monotone Ref must NOT roll back.
+    val self = pid("self")
+    for {
+      store <- ShardChainStore.make[IO](shardZero)
+      _ <- seedChain(store, 1)
+      tip <- store.bestTip.map(_.get)
+      tracker <- ShardTipTracker.make[IO](shardZero, self)
+      // Record enough to qualify (K_S=4 → required=3).
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-1"))
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-2"))
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-3"))
+      triggers <- ShardFinalityTriggers.make[IO](
+        shardId = shardZero,
+        kTarget = 4,
+        k1Shard = 100L,
+        chainStore = store,
+        tipTracker = tracker
+      )
+      _ <- triggers.advance
+      qualifyingAfter <- triggers.tCountShard.latestQualifyingOrdinal
+      // Now wipe all attestations for the tip by pruning everything below ord 999 (which is above any ord we have).
+      // Use the chain store's getByHash as the ordinal lookup so the prune lookup matches what production callers would do.
+      _ <- tracker.pruneBelow(
+        ShardOrdinal(999L),
+        h => store.getByHash(h).map(_.map(_.signed.value.shardOrdinal))
+      )
+      // Confirm the tracker is wiped: count goes back to 0.
+      countAfterPrune <- tracker.attestationCountFor(tip.hash, excludeSelf = true)
+      _ <- triggers.advance
+      qualifyingAfterPrune <- triggers.tCountShard.latestQualifyingOrdinal
+    } yield
+      // The first advance set the Ref to the bestTip ord.
+      expect.same(SnapshotOrdinal.unsafeApply(tip.signed.value.shardOrdinal.value), qualifyingAfter) &&
+        // Tracker is wiped.
+        expect.same(0, countAfterPrune) &&
+        // The Ref MUST NOT have rolled back even though `attestationCountFor` returned 0 → eval would return MinValue. This is
+        // the monotone-Ref contract guaranteed by `FinalityTrigger.fromRef`.
+        expect.same(qualifyingAfter, qualifyingAfterPrune)
   }
 
   // ============================================================================
   // Test 6: pruning — pruneBelow(ord) drops attestations for checkpoints with shardOrd < ord
   // ============================================================================
 
-  test("pruning: after pruneBelow(5), attestations for ord 0..4 are gone; attestations for ord 5..9 retained") {
-    implicit hasher =>
-      val self = pid("self")
-      for {
-        store <- ShardChainStore.make[IO](shardZero)
-        hashes <- seedChain(store, 10)
-        tracker <- ShardTipTracker.make[IO](shardZero, self)
-        // Record one attestation per checkpoint hash so we can verify the prune drops some and keeps others.
-        _ <- hashes.zipWithIndex.traverse_ { case (h, i) => tracker.recordAttestation(h, pid(s"attester-$i")) }
-        // Count before prune: 10 distinct hashes each with 1 attester (peerId distinct per hash).
-        attsBefore <- tracker.allAttestations
-        _ <- tracker.pruneBelow(
-          ShardOrdinal(5L),
-          h => store.getByHash(h).map(_.map(_.signed.value.shardOrdinal))
-        )
-        attsAfter <- tracker.allAttestations
-        // Per-hash post-prune counts: ords 0..4 → 0 (dropped), ords 5..9 → 1 each (retained).
-        countOrd0 <- tracker.attestationCountFor(hashes(0), excludeSelf = false)
-        countOrd4 <- tracker.attestationCountFor(hashes(4), excludeSelf = false)
-        countOrd5 <- tracker.attestationCountFor(hashes(5), excludeSelf = false)
-        countOrd9 <- tracker.attestationCountFor(hashes(9), excludeSelf = false)
-      } yield
-        expect.same(10, attsBefore.size) &&
-          expect.same(5, attsAfter.size) && // ords 5..9 retained
-          expect.same(0, countOrd0) &&
-          expect.same(0, countOrd4) &&
-          expect.same(1, countOrd5) &&
-          expect.same(1, countOrd9)
+  test("pruning: after pruneBelow(5), attestations for ord 0..4 are gone; attestations for ord 5..9 retained") { implicit hasher =>
+    val self = pid("self")
+    for {
+      store <- ShardChainStore.make[IO](shardZero)
+      hashes <- seedChain(store, 10)
+      tracker <- ShardTipTracker.make[IO](shardZero, self)
+      // Record one attestation per checkpoint hash so we can verify the prune drops some and keeps others.
+      _ <- hashes.zipWithIndex.traverse_ { case (h, i) => tracker.recordAttestation(h, pid(s"attester-$i")) }
+      // Count before prune: 10 distinct hashes each with 1 attester (peerId distinct per hash).
+      attsBefore <- tracker.allAttestations
+      _ <- tracker.pruneBelow(
+        ShardOrdinal(5L),
+        h => store.getByHash(h).map(_.map(_.signed.value.shardOrdinal))
+      )
+      attsAfter <- tracker.allAttestations
+      // Per-hash post-prune counts: ords 0..4 → 0 (dropped), ords 5..9 → 1 each (retained).
+      countOrd0 <- tracker.attestationCountFor(hashes(0), excludeSelf = false)
+      countOrd4 <- tracker.attestationCountFor(hashes(4), excludeSelf = false)
+      countOrd5 <- tracker.attestationCountFor(hashes(5), excludeSelf = false)
+      countOrd9 <- tracker.attestationCountFor(hashes(9), excludeSelf = false)
+    } yield
+      expect.same(10, attsBefore.size) &&
+        expect.same(5, attsAfter.size) && // ords 5..9 retained
+        expect.same(0, countOrd0) &&
+        expect.same(0, countOrd4) &&
+        expect.same(1, countOrd5) &&
+        expect.same(1, countOrd9)
   }
 
   // ============================================================================

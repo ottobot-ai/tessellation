@@ -17,26 +17,26 @@ import eu.timepit.refined.types.numeric.NonNegLong
   * Holds the two shard-layer Phase 1→2 [[FinalityTrigger]] instances built from the existing typeclass machinery
   * (`FinalityTrigger.scala:124-144`):
   *
-  *   - `tCountShard` — qualifies a shard ord N when `attestationCountFor(checkpoint-at-N) >= ⌈2·K_S/3⌉` (per design doc §5.4 row 2,
-  *     §5.3 quorum rule).
+  *   - `tCountShard` — qualifies a shard ord N when `attestationCountFor(checkpoint-at-N) >= ⌈2·K_S/3⌉` (per design doc §5.4 row 2, §5.3
+  *     quorum rule).
   *   - `tDepth1Shard` — qualifies a shard ord N when `bestTipOrd - N > k1Shard` (per design doc §5.4 row 3; degraded-liveness depth
   *     fallback that fires when the attestation gate stalls).
   *
-  * The `latestQualifyingOrdinal` composite follows the same **max-of** composition as the gl0 finality monitor uses across its Phase
-  * 1→2 triggers (see `docs/nakamoto/attestation-and-finality.md` §0.2 — "The semantics are max-of: the Phase 2 boundary at any tick is
-  * the maximum `latestQualifying` ordinal across all registered Phase-2 triggers. Each trigger gives a *sufficient* condition, not a
+  * The `latestQualifyingOrdinal` composite follows the same **max-of** composition as the gl0 finality monitor uses across its Phase 1→2
+  * triggers (see `docs/nakamoto/attestation-and-finality.md` §0.2 — "The semantics are max-of: the Phase 2 boundary at any tick is the
+  * maximum `latestQualifying` ordinal across all registered Phase-2 triggers. Each trigger gives a *sufficient* condition, not a
   * *necessary* one."). Mirrors `FinalityTrigger.maxLatestQualifyingOrdinal` (`FinalityTrigger.scala:107-113`).
   *
-  * '''Phase 2→3 trigger.''' Not included here — per design doc §5.4 row 4, "ARCHIVAL is NOT required for shard chains in v1 — gl0 is
-  * the archival anchor". A shard checkpoint becomes archival-finalized when its gl0 admission ord (gl0 ord N that included
-  * `shardCheckpoints[s] = sc`) reaches gl0's Phase 3 (T_depth2 at k₂ = 65536). The shard layer has no `T_depth2_shard` analog.
+  * '''Phase 2→3 trigger.''' Not included here — per design doc §5.4 row 4, "ARCHIVAL is NOT required for shard chains in v1 — gl0 is the
+  * archival anchor". A shard checkpoint becomes archival-finalized when its gl0 admission ord (gl0 ord N that included `shardCheckpoints[s]
+  * \= sc`) reaches gl0's Phase 3 (T_depth2 at k₂ = 65536). The shard layer has no `T_depth2_shard` analog.
   *
-  * '''Why the trigger functions ignore [[FinalityTrigger.ConsensusState]].''' The shard triggers' eval functions close over their
-  * captured dependencies ([[ShardChainStore]] and [[ShardTipTracker]]) rather than reading from the [[FinalityTrigger.ConsensusState]]
-  * argument. This matches the typeclass scaladoc — "concrete triggers ignore fields they don't care about" — and avoids inventing a
-  * second `ConsensusState` shape just for the shard layer. `ConsensusState[F]` carries gl0-flavored fields (`selfId`,
-  * `bestTipOrdinal`, `bestTipHash`, `canonicalHashAt`) that aren't load-bearing for shard finality; we pass a dummy state when invoking
-  * `evaluateAndAdvance` (see [[ShardFinalityTriggers.advance]]).
+  * '''Why the trigger functions ignore [[FinalityTrigger.ConsensusState]].''' The shard triggers' eval functions close over their captured
+  * dependencies ([[ShardChainStore]] and [[ShardTipTracker]]) rather than reading from the [[FinalityTrigger.ConsensusState]] argument.
+  * This matches the typeclass scaladoc — "concrete triggers ignore fields they don't care about" — and avoids inventing a second
+  * `ConsensusState` shape just for the shard layer. `ConsensusState[F]` carries gl0-flavored fields (`selfId`, `bestTipOrdinal`,
+  * `bestTipHash`, `canonicalHashAt`) that aren't load-bearing for shard finality; we pass a dummy state when invoking `evaluateAndAdvance`
+  * (see [[ShardFinalityTriggers.advance]]).
   *
   * '''Greenfield rule''' (per `[[feedback-greenfield-no-wire-compat]]`):
   *   - Fresh composite for the shard layer. The gl0 finality monitor composes its own triggers via
@@ -69,9 +69,8 @@ final case class ShardFinalityTriggers[F[_]](
 
 object ShardFinalityTriggers {
 
-  /** Construct the per-shard composite finality triggers. Returns a `F[ShardFinalityTriggers[F]]` because the inner
-    * [[FinalityTrigger]] instances back themselves with `Ref[F, SnapshotOrdinal]` and so must be constructed in `F` (per
-    * `FinalityTrigger.fromRef[F]`).
+  /** Construct the per-shard composite finality triggers. Returns a `F[ShardFinalityTriggers[F]]` because the inner [[FinalityTrigger]]
+    * instances back themselves with `Ref[F, SnapshotOrdinal]` and so must be constructed in `F` (per `FinalityTrigger.fromRef[F]`).
     *
     * @param shardId
     *   the shard this trigger pair is scoped to. Stamped on the returned record for diagnostic logging and observability; the inner
@@ -82,12 +81,12 @@ object ShardFinalityTriggers {
     *   stable-σ rule (`[[project-216-committee-stake-drift-fix]]`) treats every committee member as equally weighted; the count check
     *   degenerates to a 1-validator-1-vote tally over a uniform committee.
     * @param k1Shard
-    *   shard-layer depth-finality fallback (design doc §5.4 row 3 — the per-shard `k₁`). Default per HOCON is 8 shard-ords ≈ 56s,
-    *   smaller than gl0's `k₁ = 255` because shard ords are sparser.
+    *   shard-layer depth-finality fallback (design doc §5.4 row 3 — the per-shard `k₁`). Default per HOCON is 8 shard-ords ≈ 56s, smaller
+    *   than gl0's `k₁ = 255` because shard ords are sparser.
     * @param chainStore
-    *   per-shard chain store from Slice 5 (`ShardChainStore`). Read on every advance — `bestTip` provides the head ordinal +
-    *   canonical hash; `walkBackTo` (transitively, via `getByOrdinal`) is used by `T_count_shard` to resolve the canonical hash at the
-    *   tip's ord for the attestation-count lookup.
+    *   per-shard chain store from Slice 5 (`ShardChainStore`). Read on every advance — `bestTip` provides the head ordinal + canonical
+    *   hash; `walkBackTo` (transitively, via `getByOrdinal`) is used by `T_count_shard` to resolve the canonical hash at the tip's ord for
+    *   the attestation-count lookup.
     * @param tipTracker
     *   per-shard attestation tracker (Slice 6 — this same file's sibling `ShardTipTracker`). Drives `T_count_shard` via
     *   `attestationCountFor(checkpointHash, excludeSelf = true)`.
@@ -160,33 +159,34 @@ object ShardFinalityTriggers {
     for {
       tCount <- FinalityTrigger.fromRef[F](FinalityTrigger.Kind.TCount, SnapshotOrdinal.MinValue)(countEval)
       tDepth1 <- FinalityTrigger.fromRef[F](FinalityTrigger.Kind.TDepth1, SnapshotOrdinal.MinValue)(depthEval)
-    } yield ShardFinalityTriggers(
-      shardId = shardId,
-      tCountShard = tCount,
-      tDepth1Shard = tDepth1,
-      advance = {
-        // Drive both inner triggers via their `evaluateAndAdvance` with a dummy ConsensusState — the eval functions ignore the state,
-        // so the values inside are irrelevant. We pass `selfId = dummySelfId`, ords at MinValue, an empty canonicalHashAt — pure
-        // sentinels. The shard-scoped advance returns the new composite max-of in `F[ShardOrdinal]`.
-        val dummyState = FinalityTrigger.ConsensusState[F](
-          selfId = ShardFinalityTriggers.dummySelfId,
-          bestTipOrdinal = SnapshotOrdinal.MinValue,
-          bestTipHash = ShardFinalityTriggers.dummyHash,
-          canonicalHashAt = _ => Async[F].pure(Option.empty[Hash])
-        )
-        for {
-          _ <- tCount.evaluateAndAdvance(dummyState)
-          _ <- tDepth1.evaluateAndAdvance(dummyState)
-          maxOrd <- FinalityTrigger.maxLatestQualifyingOrdinal[F](List(tCount, tDepth1))
-        } yield snapshotOrdinalToShardOrdinal(maxOrd)
-      }
-    )
+    } yield
+      ShardFinalityTriggers(
+        shardId = shardId,
+        tCountShard = tCount,
+        tDepth1Shard = tDepth1,
+        advance = {
+          // Drive both inner triggers via their `evaluateAndAdvance` with a dummy ConsensusState — the eval functions ignore the state,
+          // so the values inside are irrelevant. We pass `selfId = dummySelfId`, ords at MinValue, an empty canonicalHashAt — pure
+          // sentinels. The shard-scoped advance returns the new composite max-of in `F[ShardOrdinal]`.
+          val dummyState = FinalityTrigger.ConsensusState[F](
+            selfId = ShardFinalityTriggers.dummySelfId,
+            bestTipOrdinal = SnapshotOrdinal.MinValue,
+            bestTipHash = ShardFinalityTriggers.dummyHash,
+            canonicalHashAt = _ => Async[F].pure(Option.empty[Hash])
+          )
+          for {
+            _ <- tCount.evaluateAndAdvance(dummyState)
+            _ <- tDepth1.evaluateAndAdvance(dummyState)
+            maxOrd <- FinalityTrigger.maxLatestQualifyingOrdinal[F](List(tCount, tDepth1))
+          } yield snapshotOrdinalToShardOrdinal(maxOrd)
+        }
+      )
   }
 
   /** Ceil-div of `2 * x / 3` over `BigInt` — byte-identical across all JVMs/CPUs. Mirrors the threshold math in
     * `TCountTrigger.scala:330-335` (which keys off the `Ratio` denominator/numerator pair; with the fixed shard-layer 2/3 threshold the
-    * shape simplifies to this inline helper). Returning `BigInt` keeps the comparison `BigInt >=` consistent with the rest of the
-    * shard threshold paths.
+    * shape simplifies to this inline helper). Returning `BigInt` keeps the comparison `BigInt >=` consistent with the rest of the shard
+    * threshold paths.
     */
   private[sharding] def ceilTwoThirds(x: BigInt): BigInt = {
     val n: BigInt = 2 * x
@@ -198,15 +198,14 @@ object ShardFinalityTriggers {
     *
     * Bridging is byte-faithful for the shard domain (ord >= 0): `ShardOrdinal` is a raw `Long` per `ShardOrdinal.scala:24-29`
     * (negative-during-bootstrap-init tolerated), but the trigger Refs hold `SnapshotOrdinal` (`NonNegLong`-backed per
-    * `SnapshotOrdinal.scala:21-23`). Negative shard ords are clamped to `SnapshotOrdinal.MinValue` (0) here so the bridge never
-    * throws — matches the same clamp-at-zero discipline `TDepth1Trigger` uses for chains shorter than `k`.
+    * `SnapshotOrdinal.scala:21-23`). Negative shard ords are clamped to `SnapshotOrdinal.MinValue` (0) here so the bridge never throws —
+    * matches the same clamp-at-zero discipline `TDepth1Trigger` uses for chains shorter than `k`.
     */
   private[sharding] def shardOrdinalToSnapshotOrdinal(o: ShardOrdinal): SnapshotOrdinal =
     if (o.value <= 0L) SnapshotOrdinal.MinValue
     else SnapshotOrdinal(NonNegLong.unsafeFrom(o.value))
 
-  /** Inverse projection — the inner trigger Refs only ever hold non-negative values (clamped at construction), so the conversion is
-    * total.
+  /** Inverse projection — the inner trigger Refs only ever hold non-negative values (clamped at construction), so the conversion is total.
     */
   private[sharding] def snapshotOrdinalToShardOrdinal(o: SnapshotOrdinal): ShardOrdinal =
     ShardOrdinal(o.value.value)

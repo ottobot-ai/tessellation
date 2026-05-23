@@ -24,8 +24,7 @@ import com.google.protobuf.ByteString
 import eu.timepit.refined.refineV
 import eu.timepit.refined.types.numeric.NonNegLong
 
-/** Scala ⇄ protobuf wire codecs for shard-checkpoint gossip (Slice 14 of
-  * `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §6.4).
+/** Scala ⇄ protobuf wire codecs for shard-checkpoint gossip (Slice 14 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §6.4).
   *
   * '''Why a separate codecs object''' — the schema package (`schema.sharding`) lives in `modules/shared`, which doesn't depend on
   * `node-shared` and therefore can't see the protobuf-generated types under `node.shared.infrastructure.consensus.nakamoto.proto`. The
@@ -34,29 +33,29 @@ import eu.timepit.refined.types.numeric.NonNegLong
   * `IncomingAttestation`.
   *
   * '''Wire-format conventions''' (mirrored from the proto comments):
-  *   - `Hash` ⇄ `bytes`: UTF-8 of the canonical hex representation. Matches the existing `Snapshot.hash` / `MetagraphAttestation.parent_hash`
-  *     decode pattern in `NakamotoSyncDaemon` and uses the same `Hash.getBytes` (UTF-8) form so a future receiver can equate the value
-  *     byte-identically.
+  *   - `Hash` ⇄ `bytes`: UTF-8 of the canonical hex representation. Matches the existing `Snapshot.hash` /
+  *     `MetagraphAttestation.parent_hash` decode pattern in `NakamotoSyncDaemon` and uses the same `Hash.getBytes` (UTF-8) form so a future
+  *     receiver can equate the value byte-identically.
   *   - `PeerId` ⇄ `bytes`: hex-encoded back to a `Hex` string on the JVM side. Matches `MetagraphAttestation.peer_id` (raw bytes →
   *     `peerIdBytes.map("%02x".format(_)).mkString` → `Hex` → `PeerId`).
-  *   - `Hex` (sig fields) ⇄ `bytes`: `.toBytes` on encode, `Hex.fromBytes` on decode. The raw bytes form is the cheap wire
-  *     representation, the `Hex` newtype is the schema-side representation.
+  *   - `Hex` (sig fields) ⇄ `bytes`: `.toBytes` on encode, `Hex.fromBytes` on decode. The raw bytes form is the cheap wire representation,
+  *     the `Hex` newtype is the schema-side representation.
   *   - Heavy structural payloads (`Signed[StateChannelSnapshotBinary]`, the entire `ShardDerivedStateDelta`, `List[CrossShardReceipt]`) are
   *     opaque JSON bytes via the project `JsonSerializer`. This mirrors how `MetagraphBinary.binary` carries `Signed[SCSB]` JSON and how
-  *     `AllowSpendBlock.payload` carries `Signed[AllowSpendBlock]` JSON. Because `JsonSerializer.forAsync` uses a `Printer` with
-  *     `sortKeys = true` + `dropNullValues = true`, repeated encodes are byte-identical — the canonical-preimage hash signers compute is
-  *     stable across encode/decode round-trips.
+  *     `AllowSpendBlock.payload` carries `Signed[AllowSpendBlock]` JSON. Because `JsonSerializer.forAsync` uses a `Printer` with `sortKeys
+  *     \= true` + `dropNullValues = true`, repeated encodes are byte-identical — the canonical-preimage hash signers compute is stable
+  *     across encode/decode round-trips.
   *
-  * '''Why `Async[F]` and `JsonSerializer[F]` constraints''' — JSON ser/de is the existing `JsonSerializer[F]` typeclass, which surfaces
-  * an `F[Either[Throwable, A]]` on deserialize. Codec functions return `F[A]` (with `fromWire` lifting the deserialize failure into
+  * '''Why `Async[F]` and `JsonSerializer[F]` constraints''' — JSON ser/de is the existing `JsonSerializer[F]` typeclass, which surfaces an
+  * `F[Either[Throwable, A]]` on deserialize. Codec functions return `F[A]` (with `fromWire` lifting the deserialize failure into
   * `F.raiseError`) so callers don't have to thread `Either` plumbing through every gossip handler.
   *
-  * '''Greenfield rule''' (per `feedback_greenfield_no_wire_compat`): no compat ceremony. Field-set and order are pinned to v1; add
-  * a new `*Wire2` shape if a future evolution is needed rather than mutating these codecs in place.
+  * '''Greenfield rule''' (per `feedback_greenfield_no_wire_compat`): no compat ceremony. Field-set and order are pinned to v1; add a new
+  * `*Wire2` shape if a future evolution is needed rather than mutating these codecs in place.
   *
-  * '''Why no `Hasher[F]` here''' — the codec is pure structural translation; it does not compute consensus-load-bearing hashes (those
-  * stay routed through `Hasher[F]` at the producer + verifier sites — see `feedback_use_hasher_no_manual_serialize`). The codec
-  * preserves byte content; downstream paths that need a hash call `Hasher[F].hash(...)` against the schema-side value.
+  * '''Why no `Hasher[F]` here''' — the codec is pure structural translation; it does not compute consensus-load-bearing hashes (those stay
+  * routed through `Hasher[F]` at the producer + verifier sites — see `feedback_use_hasher_no_manual_serialize`). The codec preserves byte
+  * content; downstream paths that need a hash call `Hasher[F].hash(...)` against the schema-side value.
   */
 object ShardCheckpointWireCodecs {
 
@@ -170,36 +169,33 @@ object ShardCheckpointWireCodecs {
   def includedSnapshotsFromWire[F[_]: Async: JsonSerializer](
     wires: Seq[pb.PerMetagraphSnapshots]
   ): F[SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]] =
-    wires.toList
-      .traverse { w =>
-        addressFromString(w.metagraphAddress) match {
-          case Left(err) =>
-            Async[F].raiseError[(Address, NonEmptyList[Signed[StateChannelSnapshotBinary]])](
-              new RuntimeException(s"PerMetagraphSnapshots: invalid metagraph address '${w.metagraphAddress}' ($err)")
-            )
-          case Right(addr) =>
-            w.signedSnapshotsJson.toList match {
-              case Nil =>
-                Async[F].raiseError[(Address, NonEmptyList[Signed[StateChannelSnapshotBinary]])](
-                  new RuntimeException(
-                    s"PerMetagraphSnapshots: empty signed_snapshots_json for $addr — schema requires NonEmptyList"
-                  )
+    wires.toList.traverse { w =>
+      addressFromString(w.metagraphAddress) match {
+        case Left(err) =>
+          Async[F].raiseError[(Address, NonEmptyList[Signed[StateChannelSnapshotBinary]])](
+            new RuntimeException(s"PerMetagraphSnapshots: invalid metagraph address '${w.metagraphAddress}' ($err)")
+          )
+        case Right(addr) =>
+          w.signedSnapshotsJson.toList match {
+            case Nil =>
+              Async[F].raiseError[(Address, NonEmptyList[Signed[StateChannelSnapshotBinary]])](
+                new RuntimeException(
+                  s"PerMetagraphSnapshots: empty signed_snapshots_json for $addr — schema requires NonEmptyList"
                 )
-              case head :: tail =>
-                (head :: tail)
-                  .traverse { bytes =>
-                    JsonSerializer[F].deserialize[Signed[StateChannelSnapshotBinary]](bytes.toByteArray).flatMap {
-                      case Right(s) => Async[F].pure(s)
-                      case Left(e) =>
-                        Async[F].raiseError[Signed[StateChannelSnapshotBinary]](
-                          new RuntimeException(s"Signed[SCSB] JSON decode failed for $addr: ${e.getMessage}", e)
-                        )
-                    }
-                  }
-                  .map { case h :: t => (addr, NonEmptyList(h, t)); case _ => throw new IllegalStateException("unreachable") }
-            }
-        }
+              )
+            case head :: tail =>
+              (head :: tail).traverse { bytes =>
+                JsonSerializer[F].deserialize[Signed[StateChannelSnapshotBinary]](bytes.toByteArray).flatMap {
+                  case Right(s) => Async[F].pure(s)
+                  case Left(e) =>
+                    Async[F].raiseError[Signed[StateChannelSnapshotBinary]](
+                      new RuntimeException(s"Signed[SCSB] JSON decode failed for $addr: ${e.getMessage}", e)
+                    )
+                }
+              }.map { case h :: t => (addr, NonEmptyList(h, t)); case _ => throw new IllegalStateException("unreachable") }
+          }
       }
+    }
       .map(entries => SortedMap.from(entries)(address.Address.OrderingInstance))
 
   // ===========================================================================
@@ -252,17 +248,18 @@ object ShardCheckpointWireCodecs {
       included <- includedSnapshotsToWire[F](cp.derivedStateDelta.includedSnapshots)
       derivedDelta <- derivedStateDeltaToWire[F](cp.derivedStateDelta)
       receiptsJson <- emittedReceiptsToWire[F](cp.emittedReceipts)
-    } yield pb.ShardCheckpointWire(
-      shardId = cp.shardId.value.value,
-      shardOrdinal = cp.shardOrdinal.value,
-      parentCheckpointHash = hashToBytes(cp.parentCheckpointHash),
-      gl0AnchorOrdinal = cp.gl0AnchorOrdinal.value.value,
-      epoch = cp.epoch.value,
-      includedSnapshots = included,
-      derivedStateDelta = Some(derivedDelta),
-      committeeSignatures = cp.committeeSignatures.toList.map(committeeSignatureToWire),
-      emittedReceiptsJson = receiptsJson
-    )
+    } yield
+      pb.ShardCheckpointWire(
+        shardId = cp.shardId.value.value,
+        shardOrdinal = cp.shardOrdinal.value,
+        parentCheckpointHash = hashToBytes(cp.parentCheckpointHash),
+        gl0AnchorOrdinal = cp.gl0AnchorOrdinal.value.value,
+        epoch = cp.epoch.value,
+        includedSnapshots = included,
+        derivedStateDelta = Some(derivedDelta),
+        committeeSignatures = cp.committeeSignatures.toList.map(committeeSignatureToWire),
+        emittedReceiptsJson = receiptsJson
+      )
 
   def shardCheckpointFromWire[F[_]: Async: JsonSerializer](
     w: pb.ShardCheckpointWire
@@ -282,9 +279,9 @@ object ShardCheckpointWireCodecs {
         for {
           // The derived-state-delta wire is required; a None is wire-shape-level invalid.
           deltaWire <- w.derivedStateDelta
-                         .liftTo[F](
-                           new RuntimeException("ShardCheckpointWire: missing required derived_state_delta")
-                         )
+            .liftTo[F](
+              new RuntimeException("ShardCheckpointWire: missing required derived_state_delta")
+            )
           delta <- derivedStateDeltaFromWire[F](deltaWire)
           // Validate cross-consistency: the wire-side derived delta carries its own includedSnapshots; the wire-side
           // includedSnapshots message field is the per-MG repeated decomposition. The two must agree. We treat the
@@ -294,24 +291,25 @@ object ShardCheckpointWireCodecs {
           receipts <- emittedReceiptsFromWire[F](w.emittedReceiptsJson)
           sigsList = w.committeeSignatures.toList.map(committeeSignatureFromWire)
           sigsNel <- sigsList match {
-                       case Nil =>
-                         Async[F].raiseError[NonEmptyList[CommitteeMemberSignature]](
-                           new RuntimeException(
-                             "ShardCheckpointWire: empty committee_signatures — schema requires NonEmptyList"
-                           )
-                         )
-                       case head :: tail => Async[F].pure(NonEmptyList(head, tail))
-                     }
-        } yield ShardCheckpoint(
-          shardId = sid,
-          parentCheckpointHash = bytesToHash(w.parentCheckpointHash),
-          shardOrdinal = ShardOrdinal(w.shardOrdinal),
-          gl0AnchorOrdinal = gl0Ord,
-          derivedStateDelta = delta,
-          emittedReceipts = receipts,
-          committeeSignatures = sigsNel,
-          epoch = EtaPeriod(w.epoch)
-        )
+            case Nil =>
+              Async[F].raiseError[NonEmptyList[CommitteeMemberSignature]](
+                new RuntimeException(
+                  "ShardCheckpointWire: empty committee_signatures — schema requires NonEmptyList"
+                )
+              )
+            case head :: tail => Async[F].pure(NonEmptyList(head, tail))
+          }
+        } yield
+          ShardCheckpoint(
+            shardId = sid,
+            parentCheckpointHash = bytesToHash(w.parentCheckpointHash),
+            shardOrdinal = ShardOrdinal(w.shardOrdinal),
+            gl0AnchorOrdinal = gl0Ord,
+            derivedStateDelta = delta,
+            emittedReceipts = receipts,
+            committeeSignatures = sigsNel,
+            epoch = EtaPeriod(w.epoch)
+          )
     }
   }
 

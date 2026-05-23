@@ -33,8 +33,8 @@ import com.google.protobuf.ByteString
 import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
 import weaver.MutableIOSuite
 
-/** Wire-format round-trip suite for [[ShardCheckpointWireCodecs]] — Slice 14 of
-  * `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §6.4.
+/** Wire-format round-trip suite for [[ShardCheckpointWireCodecs]] — Slice 14 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`
+  * §6.4.
   *
   * '''Property under test (round-trip).''' For every fixture value `v`:
   *   - encode via the codec ⇒ `pb.<Wire>` proto
@@ -243,12 +243,13 @@ object ShardCheckpointWireCodecsSuite extends MutableIOSuite {
       wires <- ShardCheckpointWireCodecs.includedSnapshotsToWire[IO](singletonMap)
       reparsed = wires.map(w => viaProtoBytes(w, pb.PerMetagraphSnapshots))
       decoded <- ShardCheckpointWireCodecs.includedSnapshotsFromWire[IO](reparsed)
-    } yield expect.all(
-      decoded.size == 1,
-      decoded.contains(mgAddrA),
-      decoded(mgAddrA).size == 1L, // NEL size == 1
-      Eq[Signed[StateChannelSnapshotBinary]].eqv(decoded(mgAddrA).head, singletonMap(mgAddrA).head)
-    )
+    } yield
+      expect.all(
+        decoded.size == 1,
+        decoded.contains(mgAddrA),
+        decoded(mgAddrA).size == 1L, // NEL size == 1
+        Eq[Signed[StateChannelSnapshotBinary]].eqv(decoded(mgAddrA).head, singletonMap(mgAddrA).head)
+      )
   }
 
   // ===========================================================================
@@ -419,16 +420,16 @@ object ShardCheckpointWireCodecsSuite extends MutableIOSuite {
     for {
       delta <- ShardCheckpointWireCodecs.derivedStateDeltaToWire[IO](ShardDerivedStateDelta.empty)
       bogus = pb.ShardCheckpointWire(
-                shardId = 0,
-                shardOrdinal = 0L,
-                parentCheckpointHash = ByteString.EMPTY,
-                gl0AnchorOrdinal = 0L,
-                epoch = 0L,
-                includedSnapshots = Seq.empty,
-                derivedStateDelta = Some(delta),
-                committeeSignatures = Seq.empty, // <-- intentional violation
-                emittedReceiptsJson = ByteString.EMPTY
-              )
+        shardId = 0,
+        shardOrdinal = 0L,
+        parentCheckpointHash = ByteString.EMPTY,
+        gl0AnchorOrdinal = 0L,
+        epoch = 0L,
+        includedSnapshots = Seq.empty,
+        derivedStateDelta = Some(delta),
+        committeeSignatures = Seq.empty, // <-- intentional violation
+        emittedReceiptsJson = ByteString.EMPTY
+      )
       attempted <- ShardCheckpointWireCodecs.shardCheckpointFromWire[IO](bogus).attempt
     } yield expect(attempted.isLeft)
   }
@@ -446,10 +447,11 @@ object ShardCheckpointWireCodecsSuite extends MutableIOSuite {
     for {
       encoded <- ShardCheckpointWireCodecs.emittedReceiptsToWire[IO](List.empty[CrossShardReceipt])
       decoded <- ShardCheckpointWireCodecs.emittedReceiptsFromWire[IO](encoded)
-    } yield expect.all(
-      encoded.isEmpty,
-      decoded.isEmpty
-    )
+    } yield
+      expect.all(
+        encoded.isEmpty,
+        decoded.isEmpty
+      )
   }
 
   test("emittedReceipts: non-empty list round-trips via opaque JSON bytes") { res =>

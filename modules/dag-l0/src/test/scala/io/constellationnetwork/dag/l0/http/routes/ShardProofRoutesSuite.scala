@@ -24,10 +24,9 @@ import suite.HttpSuite
 
 /** Slice 10 — route-level tests for [[ShardProofRoutes]].
   *
-  * Brings up a stub [[ShardSubtreeProofService]] (no real chain or MPT) so we can exercise the
-  * route's response shape, error mapping, and JSON codec for [[ShardSubtreeProof]] in isolation.
-  * The service stub returns canned proofs / `None` — testing the underlying proof generation +
-  * verification is the job of `ShardSubtreeProofServiceSuite`.
+  * Brings up a stub [[ShardSubtreeProofService]] (no real chain or MPT) so we can exercise the route's response shape, error mapping, and
+  * JSON codec for [[ShardSubtreeProof]] in isolation. The service stub returns canned proofs / `None` — testing the underlying proof
+  * generation + verification is the job of `ShardSubtreeProofServiceSuite`.
   *
   * '''Coverage'''
   *   - 503 when the service Ref is empty (pre-startup).
@@ -49,15 +48,14 @@ object ShardProofRoutesSuite extends HttpSuite {
   /** Deterministic Address from a label — same convention as `ShardSubtreeProofServiceSuite`. */
   private def addr(label: String): Address = Address.fromBytes(label.getBytes("UTF-8"))
 
-  /** Canned key — Balances partition for a specific user. The route doesn't inspect the key's
-    * structure; the JSON-encoded form is decoded by the route and passed to the service stub.
+  /** Canned key — Balances partition for a specific user. The route doesn't inspect the key's structure; the JSON-encoded form is decoded
+    * by the route and passed to the service stub.
     */
   private val cannedKey: GlobalStateKey =
     GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr("user-routes-suite"))
 
-  /** Canned [[ShardSubtreeProof]] — used as the service stub's positive return value. The route
-    * encodes it as JSON and returns 200. Field values don't need to verify; the route just streams
-    * them as-is.
+  /** Canned [[ShardSubtreeProof]] — used as the service stub's positive return value. The route encodes it as JSON and returns 200. Field
+    * values don't need to verify; the route just streams them as-is.
     */
   private val cannedProof: ShardSubtreeProof =
     ShardSubtreeProof(
@@ -87,8 +85,8 @@ object ShardProofRoutesSuite extends HttpSuite {
       ): IO[Boolean] = IO.pure(verifyResult)
     }
 
-  /** Build the routes wired to a service `Ref`. `s = None` exercises the 503 startup-not-ready
-    * path; `s = Some(stub)` exercises the happy + 404 paths.
+  /** Build the routes wired to a service `Ref`. `s = None` exercises the 503 startup-not-ready path; `s = Some(stub)` exercises the happy +
+    * 404 paths.
     */
   private def mkRoutes(s: Option[ShardSubtreeProofService[IO]]): IO[HttpRoutes[IO]] =
     Ref.of[IO, Option[ShardSubtreeProofService[IO]]](s).map(ShardProofRoutes[IO](_).publicRoutes)

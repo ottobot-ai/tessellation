@@ -29,35 +29,28 @@ import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
 
-/** Tests for [[ShardSubtreeProofService]] — Slice 10 of
-  * `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §8.5.
+/** Tests for [[ShardSubtreeProofService]] — Slice 10 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §8.5.
   *
   * '''Coverage''' (per slice 10 task spec):
-  *   1. '''Round-trip happy''': generate proof for (shardId, mgAddr, key); verifyProof returns
-  *      true.
-  *   1. '''Verify rejects wrong checkpoint hash''': tamper with the proof's checkpointHash; verify
-  *      returns false.
-  *   1. '''Verify rejects wrong root''': tamper with the proof's perMgMptRoot; verify returns
+  *   1. '''Round-trip happy''': generate proof for (shardId, mgAddr, key); verifyProof returns true.
+  *   1. '''Verify rejects wrong checkpoint hash''': tamper with the proof's checkpointHash; verify returns false.
+  *   1. '''Verify rejects wrong root''': tamper with the proof's perMgMptRoot; verify returns false.
+  *   1. '''Verify rejects mismatched value''': tamper with the value bytes via the embedded MPT proof leaf commitment; verify returns
   *      false.
-  *   1. '''Verify rejects mismatched value''': tamper with the value bytes via the embedded MPT
-  *      proof leaf commitment; verify returns false.
-  *   1. '''Non-membership''': generate proof for a key NOT in the MPT; generate returns None.
-  *      The v1 underlying [[io.constellationnetwork.security.mpt.verifier.MerklePatriciaInclusionVerifier]]
-  *      has no absence-witness support, so v1 only ships membership proofs and surfaces absence
-  *      by [[ShardSubtreeProofService.generateProofForMetagraph]] returning None (per the
-  *      service's scaladoc).
-  *   1. '''Shard ownership mismatch''': request proof from shard 0 for an MG that hashes to a
-  *      different shard; `generateProofForMetagraph` returns None.
+  *   1. '''Non-membership''': generate proof for a key NOT in the MPT; generate returns None. The v1 underlying
+  *      [[io.constellationnetwork.security.mpt.verifier.MerklePatriciaInclusionVerifier]] has no absence-witness support, so v1 only ships
+  *      membership proofs and surfaces absence by [[ShardSubtreeProofService.generateProofForMetagraph]] returning None (per the service's
+  *      scaladoc).
+  *   1. '''Shard ownership mismatch''': request proof from shard 0 for an MG that hashes to a different shard; `generateProofForMetagraph`
+  *      returns None.
   *
   * '''Fixture strategy''' (per slice 10 task spec):
-  *   - Real [[HistoricalMptProofService]] over an in-memory MPT producer — the proof generation
-  *     path is exercised end-to-end. No mocking on the prover/verifier side; tampering tests use
-  *     real cryptographic primitives.
-  *   - Real [[ShardAssignment]] over a configurable `numShards`. Shard-ownership tests pick a
-  *     `numShards` that splits the test MG addresses across multiple shards.
-  *   - Stubbed `lookupShardCheckpoint`: a `Ref`-backed test fixture that returns a
-  *     pre-constructed [[ShardCheckpoint]] for the matching shard. Decoupled from
-  *     [[ShardChainStore]] so this slice doesn't pull that dependency into its tests.
+  *   - Real [[HistoricalMptProofService]] over an in-memory MPT producer — the proof generation path is exercised end-to-end. No mocking on
+  *     the prover/verifier side; tampering tests use real cryptographic primitives.
+  *   - Real [[ShardAssignment]] over a configurable `numShards`. Shard-ownership tests pick a `numShards` that splits the test MG addresses
+  *     across multiple shards.
+  *   - Stubbed `lookupShardCheckpoint`: a `Ref`-backed test fixture that returns a pre-constructed [[ShardCheckpoint]] for the matching
+  *     shard. Decoupled from [[ShardChainStore]] so this slice doesn't pull that dependency into its tests.
   */
 object ShardSubtreeProofServiceSuite extends MutableIOSuite {
 
@@ -74,37 +67,35 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
   // Fixtures
   // ===========================================================================
 
-  /** Deterministic Address derived from a label — same shape as `ShardChainStoreSuite` /
-    * `HistoricalMptProofServiceSuite` use, so the per-MG addresses are stable across test runs.
+  /** Deterministic Address derived from a label — same shape as `ShardChainStoreSuite` / `HistoricalMptProofServiceSuite` use, so the
+    * per-MG addresses are stable across test runs.
     */
   private def addr(label: String): Address =
     Address.fromBytes(label.getBytes("UTF-8"))
 
-  /** Key under the user-keyed `Balances` partition for a given holder address. Picked because
-    * `Balances` is one of the simpler partitions to seed and the existing
-    * `HistoricalMptProofServiceSuite` uses the same shape — keeps the test scope tight.
+  /** Key under the user-keyed `Balances` partition for a given holder address. Picked because `Balances` is one of the simpler partitions
+    * to seed and the existing `HistoricalMptProofServiceSuite` uses the same shape — keeps the test scope tight.
     */
   private def gskBalance(user: Address): GlobalStateKey =
     GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, user)
 
-  /** Standard test ordinal — fixed because the proof service's branch+ordinal parameters are
-    * pre-computed at construction time in production wiring.
+  /** Standard test ordinal — fixed because the proof service's branch+ordinal parameters are pre-computed at construction time in
+    * production wiring.
     */
   private val testOrdinal: SnapshotOrdinal = SnapshotOrdinal(NonNegLong(1L))
 
-  /** Use `BranchId.base` (Hash.empty) so the overlay falls through to the base trie — there's no
-    * branch checkout in these tests, only base inserts.
+  /** Use `BranchId.base` (Hash.empty) so the overlay falls through to the base trie — there's no branch checkout in these tests, only base
+    * inserts.
     */
   private val testBranch: BranchId = BranchId.base
 
-  /** Single sentinel signature — the verify path doesn't check outer-envelope signatures; that's
-    * the gossip layer's job. The test only exercises the MPT proof + per-MG-root cross-check.
+  /** Single sentinel signature — the verify path doesn't check outer-envelope signatures; that's the gossip layer's job. The test only
+    * exercises the MPT proof + per-MG-root cross-check.
     */
   private def sentinelProof: SignatureProof =
     SignatureProof(Id(Hex("11" * 64)), Signature(Hex("22" * 70)))
 
-  /** Build a sentinel [[CommitteeMemberSignature]] — verify path doesn't inspect its contents
-    * either.
+  /** Build a sentinel [[CommitteeMemberSignature]] — verify path doesn't inspect its contents either.
     */
   private def sentinelCommitteeSig: CommitteeMemberSignature =
     CommitteeMemberSignature(
@@ -115,9 +106,8 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
       kesTreeStep = 0
     )
 
-  /** Construct a [[ShardCheckpoint]] with a single MG in `perMetagraphMptRoots`. Used to drive the
-    * service's verify path — the per-MG root is what `verifyProof` cross-checks against, so the
-    * checkpoint fixture only needs to populate that one field.
+  /** Construct a [[ShardCheckpoint]] with a single MG in `perMetagraphMptRoots`. Used to drive the service's verify path — the per-MG root
+    * is what `verifyProof` cross-checks against, so the checkpoint fixture only needs to populate that one field.
     */
   private def mkCheckpoint(
     shardId: ShardId,
@@ -143,10 +133,9 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
   /** Wrap a value in a [[Signed]] envelope with the sentinel proof. */
   private def mkSigned[A](value: A): Signed[A] = Signed(value, NonEmptySet.of(sentinelProof))
 
-  /** Find a numShards value such that two given addresses map to DIFFERENT shards. Used by the
-    * shard-ownership-mismatch test — we need addrA in shard 0 and addrB in shard ≠ 0 so the
-    * mismatch path is exercised. We scan [2, 16] which is fast and always finds a split for any
-    * two distinct addresses (with overwhelming probability under SHA-256 uniformity).
+  /** Find a numShards value such that two given addresses map to DIFFERENT shards. Used by the shard-ownership-mismatch test — we need
+    * addrA in shard 0 and addrB in shard ≠ 0 so the mismatch path is exercised. We scan [2, 16] which is fast and always finds a split for
+    * any two distinct addresses (with overwhelming probability under SHA-256 uniformity).
     */
   private def findNumShardsSplitting(
     addrA: Address,
@@ -164,16 +153,15 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
       .map(_.getOrElse(throw new AssertionError(s"Could not split $addrA and $addrB across any numShards in [2,64]")))
   }
 
-  /** Build the in-memory MPT proof service plus a way to (a) seed the MPT (b) compute the real
-    * trie root (which production wiring would carry on the checkpoint's `perMetagraphMptRoots`).
+  /** Build the in-memory MPT proof service plus a way to (a) seed the MPT (b) compute the real trie root (which production wiring would
+    * carry on the checkpoint's `perMetagraphMptRoots`).
     *
     * We return:
     *   - `store`: the MPT store, so the test can `insert[V]` keys directly
     *   - `proofSvc`: the proof service wired over `store + overlay`
-    *   - `currentTrieRoot`: helper that builds the trie at the test ordinal and returns its
-    *     root hash — used by the test to construct a [[ShardCheckpoint]] whose
-    *     `perMetagraphMptRoots[mgAddress]` matches the actual trie root the proof was generated
-    *     against (so the round-trip verify succeeds).
+    *   - `currentTrieRoot`: helper that builds the trie at the test ordinal and returns its root hash — used by the test to construct a
+    *     [[ShardCheckpoint]] whose `perMetagraphMptRoots[mgAddress]` matches the actual trie root the proof was generated against (so the
+    *     round-trip verify succeeds).
     */
   private def mkProofSetup(
     implicit hasher: Hasher[IO],
@@ -196,8 +184,8 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
         .map(_.toOption.get.rootHash.value)
     } yield (store, proofSvc, currentTrieRoot)
 
-  /** Construct a [[ShardSubtreeProofService.ShardCheckpointLookup]] that always returns the same
-    * pre-built checkpoint for the matching shard. Returns `None` for any other shard.
+  /** Construct a [[ShardSubtreeProofService.ShardCheckpointLookup]] that always returns the same pre-built checkpoint for the matching
+    * shard. Returns `None` for any other shard.
     */
   private def fixedLookup(
     expectedShard: ShardId,
