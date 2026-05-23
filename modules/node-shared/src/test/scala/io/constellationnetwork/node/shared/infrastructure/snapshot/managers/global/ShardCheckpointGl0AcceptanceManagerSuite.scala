@@ -21,7 +21,6 @@ import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.security.signature.{Signed, Signing}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
@@ -45,8 +44,8 @@ import weaver.MutableIOSuite
   *   - Build the `Signed[ShardCheckpoint]` envelopes with REAL `KeyPair`s for the committee signers so the Ed25519 pre-check verifies
   *     against the recovered public key from each `PeerId`. The KES sig is structurally valid (8-byte placeholder); the manager's KES
   *     verify reads from the injected `KesRegistry` and uses the "no registry entry → accept" carve-out for tests.
-  *   - VRF proof bytes use the structural minimum length (80 bytes per `EcVrf25519`); the Slice 9 manager runs a structural check
-  *     only — full cryptographic VRF verify ships in Slice 13 when the VRF VK registry is wired.
+  *   - VRF proof bytes use the structural minimum length (80 bytes per `EcVrf25519`); the Slice 9 manager runs a structural check only —
+  *     full cryptographic VRF verify ships in Slice 13 when the VRF VK registry is wired.
   *   - `ShardFinalityTriggers` is built fresh per test off a `ShardChainStore` + `ShardTipTracker` pair so we control which trigger
   *     qualifies which ordinal exactly.
   */
@@ -91,13 +90,14 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
     for {
       preimageHash <- Hasher[IO].hash(checkpoint.signingPreimage)
       edSig <- Signing.signData[IO](preimageHash.getBytes)(kp.getPrivate)
-    } yield CommitteeMemberSignature(
-      peerId = peerId,
-      vrfProof = Hex.fromBytes(Array.fill[Byte](80)(0x42.toByte)), // structural-min length passes the slice-9 VRF check
-      ed25519Sig = Hex.fromBytes(edSig),
-      kesProductSig = Hex.fromBytes(Array.fill[Byte](32)(0x43.toByte)), // non-empty; registry-absent carve-out → accept
-      kesTreeStep = 0
-    )
+    } yield
+      CommitteeMemberSignature(
+        peerId = peerId,
+        vrfProof = Hex.fromBytes(Array.fill[Byte](80)(0x42.toByte)), // structural-min length passes the slice-9 VRF check
+        ed25519Sig = Hex.fromBytes(edSig),
+        kesProductSig = Hex.fromBytes(Array.fill[Byte](32)(0x43.toByte)), // non-empty; registry-absent carve-out → accept
+        kesTreeStep = 0
+      )
 
   /** Build a committee-member sig whose Ed25519 sig is RANDOM (won't verify). Used by the "pre-check Ed25519 fail" test. */
   private def mkBadEdSig(peerId: PeerId): CommitteeMemberSignature =
@@ -109,8 +109,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       kesTreeStep = 0
     )
 
-  /** Build a fully-signed `Signed[ShardCheckpoint]` (NOT used by the manager — the manager reads committeeSignatures field directly,
-    * but we wrap in `Signed` for compatibility with the producer/store APIs that some test scenarios may transitively touch).
+  /** Build a fully-signed `Signed[ShardCheckpoint]` (NOT used by the manager — the manager reads committeeSignatures field directly, but we
+    * wrap in `Signed` for compatibility with the producer/store APIs that some test scenarios may transitively touch).
     */
   private def mkSignedCheckpoint(cp: ShardCheckpoint, sigs: NonEmptyList[CommitteeMemberSignature]): Signed[ShardCheckpoint] = {
     val sentinelProof: SignatureProof =
@@ -145,8 +145,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       epoch = epochZero
     )
 
-  /** Build a `ShardDerivedStateDelta` with one MG carrying `(mgAddr → mptRoot, mgAddr → headBinary)`. The included-snapshots map drives
-    * the re-exec path: for each MG, the manager calls `reExecuteDerivation(mg, head)` and compares against `perMetagraphMptRoots(mg)`.
+  /** Build a `ShardDerivedStateDelta` with one MG carrying `(mgAddr → mptRoot, mgAddr → headBinary)`. The included-snapshots map drives the
+    * re-exec path: for each MG, the manager calls `reExecuteDerivation(mg, head)` and compares against `perMetagraphMptRoots(mg)`.
     */
   private def mkDelta(mg: Address, root: Hash, binary: Signed[StateChannelSnapshotBinary]): ShardDerivedStateDelta =
     ShardDerivedStateDelta(
@@ -157,8 +157,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       perMetagraphSyncDataDelta = SortedMap.empty
     )
 
-  /** Build a fake `Signed[StateChannelSnapshotBinary]` for the included-snapshots field. The manager doesn't validate the binary's
-    * inner crypto — it only passes the head to `reExecuteDerivation`. A sentinel `Signed` wrapper is fine.
+  /** Build a fake `Signed[StateChannelSnapshotBinary]` for the included-snapshots field. The manager doesn't validate the binary's inner
+    * crypto — it only passes the head to `reExecuteDerivation`. A sentinel `Signed` wrapper is fine.
     */
   private def mkSignedBinary(content: Array[Byte]): Signed[StateChannelSnapshotBinary] = {
     val sentinelProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("11" * 64)), Signature(Hex("22" * 70)))
@@ -172,9 +172,9 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
     )
   }
 
-  /** Build a `ShardChainStore` containing a single checkpoint at the given ordinal (so `bestTip` resolves), and a
-    * `ShardFinalityTriggers` instance wired with the provided `kTarget` and `k1Shard`. The composite advances on construction so the
-    * inner triggers' Refs reflect the current chain state.
+  /** Build a `ShardChainStore` containing a single checkpoint at the given ordinal (so `bestTip` resolves), and a `ShardFinalityTriggers`
+    * instance wired with the provided `kTarget` and `k1Shard`. The composite advances on construction so the inner triggers' Refs reflect
+    * the current chain state.
     */
   private def mkFinalityTriggers(
     kTarget: Int,
@@ -192,41 +192,50 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       _ <- triggers.advance
     } yield (store, triggers)
 
-  /** Seed a linear chain of `n` checkpoints (ords 0..n-1) into the store. Used by the depth-finality + tip-tracker tests so the
-    * `bestTip` resolves at the highest ord. Returns the canonical hash list in chain order.
+  /** Seed a linear chain of `n` checkpoints (ords 0..n-1) into the store. Used by the depth-finality + tip-tracker tests so the `bestTip`
+    * resolves at the highest ord. Returns the canonical hash list in chain order. The `Hasher[IO]` consumed by `store.store` is captured at
+    * store construction time (via `ShardChainStore.make[F: Hasher]`), so seedChain doesn't need an implicit param of its own.
     */
   private def seedChain(
     store: ShardChainStore[IO],
     n: Int
-  )(implicit h: Hasher[IO]): IO[List[Hash]] =
-    (0L until n.toLong).toList.foldLeftM[IO, (List[Hash], Hash)]((List.empty, Hash("0" * 64))) {
-      case ((acc, parent), ord) =>
-        val cp = ShardCheckpoint(
-          shardId = shardZero,
-          parentCheckpointHash = parent,
-          shardOrdinal = ShardOrdinal(ord),
-          gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(100L + ord)),
-          derivedStateDelta = ShardDerivedStateDelta.empty,
-          emittedReceipts = List.empty,
-          committeeSignatures = NonEmptyList.of(
-            CommitteeMemberSignature(
-              peerId = PeerId(Hex(f"${ord.toInt + 1}%02x" * 64)),
-              vrfProof = Hex("aa" * 80),
-              ed25519Sig = Hex("bb" * 64),
-              kesProductSig = Hex("cc" * 128),
-              kesTreeStep = 0
+  ): IO[List[Hash]] =
+    (0L until n.toLong).toList
+      .foldLeftM[IO, (List[Hash], Hash)]((List.empty, Hash("0" * 64))) {
+        case ((acc, parent), ord) =>
+          val cp = ShardCheckpoint(
+            shardId = shardZero,
+            parentCheckpointHash = parent,
+            shardOrdinal = ShardOrdinal(ord),
+            gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(100L + ord)),
+            derivedStateDelta = ShardDerivedStateDelta.empty,
+            emittedReceipts = List.empty,
+            committeeSignatures = NonEmptyList.of(
+              CommitteeMemberSignature(
+                peerId = PeerId(Hex(f"${ord.toInt + 1}%02x" * 64)),
+                vrfProof = Hex("aa" * 80),
+                ed25519Sig = Hex("bb" * 64),
+                kesProductSig = Hex("cc" * 128),
+                kesTreeStep = 0
+              )
+            ),
+            epoch = epochZero
+          )
+          val sentinelProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("11" * 64)), Signature(Hex("22" * 70)))
+          val signed = Signed(cp, NonEmptySet.of(sentinelProof))
+          store
+            .store(
+              signed,
+              parentHash = parent,
+              shardOrdinal = ShardOrdinal(ord),
+              slot = ord + 1L,
+              vrfOutput = Array.fill[Byte](32)(ord.toByte)
             )
-          ),
-          epoch = epochZero
-        )
-        val sentinelProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("11" * 64)), Signature(Hex("22" * 70)))
-        val signed = Signed(cp, NonEmptySet.of(sentinelProof))
-        store
-          .store(signed, parentHash = parent, shardOrdinal = ShardOrdinal(ord), slot = ord + 1L, vrfOutput = Array.fill[Byte](32)(ord.toByte))
-          .flatMap { _ =>
-            store.bestTip.map(_.get.hash).map(h => (acc :+ h, h))
-          }
-    }.map(_._1)
+            .flatMap { _ =>
+              store.bestTip.map(_.get.hash).map(h => (acc :+ h, h))
+            }
+      }
+      .map(_._1)
 
   /** Build the manager under test with stubbed callbacks. Each callback is a parameter so individual tests can override exactly the
     * surfaces under test (e.g., wire a different `committeeMembership` to control the pre-check membership predicate).
@@ -278,11 +287,12 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         selfId = selfPeer
       )
       result <- mgr.evaluate(checkpoint)
-    } yield result match {
-      case ShardCheckpointAcceptResult.Rejected(reason) =>
-        expect(reason.contains("not in committee"))
-      case other => failure(s"Expected Rejected(not in committee), got $other")
-    }
+    } yield
+      result match {
+        case ShardCheckpointAcceptResult.Rejected(reason) =>
+          expect(reason.contains("not in committee"))
+        case other => failure(s"Expected Rejected(not in committee), got $other")
+      }
   }
 
   // ============================================================================
@@ -313,11 +323,12 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         selfId = selfPeer
       )
       result <- mgr.evaluate(checkpoint)
-    } yield result match {
-      case ShardCheckpointAcceptResult.Rejected(reason) =>
-        expect(reason.contains("Ed25519"))
-      case other => failure(s"Expected Rejected(Ed25519 ...), got $other")
-    }
+    } yield
+      result match {
+        case ShardCheckpointAcceptResult.Rejected(reason) =>
+          expect(reason.contains("Ed25519"))
+        case other => failure(s"Expected Rejected(Ed25519 ...), got $other")
+      }
   }
 
   // ============================================================================
@@ -357,8 +368,10 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
 
       // Re-exec returns a HASH THAT DOES NOT MATCH — proves the manager never enters the re-exec path on the T_count fast path.
       reExecCalledRef <- cats.effect.Ref.of[IO, Boolean](false)
-      reExecCb = ((_: Address, _: Signed[StateChannelSnapshotBinary]) =>
-        reExecCalledRef.set(true).as(Hash("ff" * 32))): (Address, Signed[StateChannelSnapshotBinary]) => IO[Hash]
+      reExecCb = ((_: Address, _: Signed[StateChannelSnapshotBinary]) => reExecCalledRef.set(true).as(Hash("ff" * 32))): (
+        Address,
+        Signed[StateChannelSnapshotBinary]
+      ) => IO[Hash]
 
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
@@ -401,7 +414,10 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         selfId = selfPeer
       )
       // Re-exec returns the SAME mptRoot the delta claims → all-match path → Accepted.
-      reExecCb = ((_: Address, _: Signed[StateChannelSnapshotBinary]) => IO.pure(mptRoot)): (Address, Signed[StateChannelSnapshotBinary]) => IO[Hash]
+      reExecCb = ((_: Address, _: Signed[StateChannelSnapshotBinary]) => IO.pure(mptRoot)): (
+        Address,
+        Signed[StateChannelSnapshotBinary]
+      ) => IO[Hash]
 
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
@@ -417,48 +433,50 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   // Test 5: T_depth1-only re-exec mismatch — slash signers
   // ============================================================================
 
-  test("T_depth1-only re-exec mismatch: re-exec returns DIFFERENT hash → RejectedReExecutionMismatch with slash list = signers") {
-    res =>
-      implicit val (h, sp, _) = res
-      for {
-        (signerKp1, signerPeer1) <- mkSigner
-        (signerKp2, signerPeer2) <- mkSigner
-        (_, selfPeer) <- mkSigner
+  test("T_depth1-only re-exec mismatch: re-exec returns DIFFERENT hash → RejectedReExecutionMismatch with slash list = signers") { res =>
+    implicit val (h, sp, _) = res
+    for {
+      (signerKp1, signerPeer1) <- mkSigner
+      (signerKp2, signerPeer2) <- mkSigner
+      (_, selfPeer) <- mkSigner
 
-        mg = Address.fromBytes("mg-e".getBytes("UTF-8"))
-        mptRoot = Hash("11" * 32)
-        binary = mkSignedBinary("binary-content".getBytes("UTF-8"))
-        delta = mkDelta(mg, mptRoot, binary)
-        shell = mkCheckpointShell(shardOrd = 2L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer1)
+      mg = Address.fromBytes("mg-e".getBytes("UTF-8"))
+      mptRoot = Hash("11" * 32)
+      binary = mkSignedBinary("binary-content".getBytes("UTF-8"))
+      delta = mkDelta(mg, mptRoot, binary)
+      shell = mkCheckpointShell(shardOrd = 2L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer1)
 
-        // TWO real signers — both go in the slash list when the re-exec mismatches.
-        sig1 <- mkValidSig(shell, signerKp1, signerPeer1)
-        sig2 <- mkValidSig(shell, signerKp2, signerPeer2)
-        checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig1, sig2))
+      // TWO real signers — both go in the slash list when the re-exec mismatches.
+      sig1 <- mkValidSig(shell, signerKp1, signerPeer1)
+      sig2 <- mkValidSig(shell, signerKp2, signerPeer2)
+      checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig1, sig2))
 
-        // T_depth1 qualifies; T_count doesn't.
-        (_, triggers) <- mkFinalityTriggers(
-          kTarget = 1000,
-          k1Shard = 3L,
-          chainLength = 10,
-          selfId = selfPeer
-        )
-        // Re-exec returns a WRONG hash for the MG — the manager should detect mismatch.
-        wrongRoot = Hash("ff" * 32)
-        reExecCb = ((_: Address, _: Signed[StateChannelSnapshotBinary]) =>
-          IO.pure(wrongRoot)): (Address, Signed[StateChannelSnapshotBinary]) => IO[Hash]
+      // T_depth1 qualifies; T_count doesn't.
+      (_, triggers) <- mkFinalityTriggers(
+        kTarget = 1000,
+        k1Shard = 3L,
+        chainLength = 10,
+        selfId = selfPeer
+      )
+      // Re-exec returns a WRONG hash for the MG — the manager should detect mismatch.
+      wrongRoot = Hash("ff" * 32)
+      reExecCb = ((_: Address, _: Signed[StateChannelSnapshotBinary]) => IO.pure(wrongRoot)): (
+        Address,
+        Signed[StateChannelSnapshotBinary]
+      ) => IO[Hash]
 
-        mgr <- mkManager(
-          finalityTriggers = Map(shardZero -> triggers),
-          committeeMembership = Set(signerPeer1, signerPeer2),
-          selfId = selfPeer,
-          reExecuteDerivation = reExecCb
-        )
-        result <- mgr.evaluate(checkpoint)
-      } yield result match {
+      mgr <- mkManager(
+        finalityTriggers = Map(shardZero -> triggers),
+        committeeMembership = Set(signerPeer1, signerPeer2),
+        selfId = selfPeer,
+        reExecuteDerivation = reExecCb
+      )
+      result <- mgr.evaluate(checkpoint)
+    } yield
+      result match {
         case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, slashSigners) =>
           expect(reason.contains("re-exec mismatch")) &&
-            expect.same(List(signerPeer1, signerPeer2), slashSigners)
+          expect.same(List(signerPeer1, signerPeer2), slashSigners)
         case other => failure(s"Expected RejectedReExecutionMismatch, got $other")
       }
   }
@@ -526,11 +544,12 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         selfId = selfPeer
       )
       result <- mgr.evaluate(checkpoint)
-    } yield result match {
-      case ShardCheckpointAcceptResult.Rejected(reason) =>
-        expect(reason.contains("unknown shard"))
-      case other => failure(s"Expected Rejected(unknown shard), got $other")
-    }
+    } yield
+      result match {
+        case ShardCheckpointAcceptResult.Rejected(reason) =>
+          expect(reason.contains("unknown shard"))
+        case other => failure(s"Expected Rejected(unknown shard), got $other")
+      }
   }
 
   // ============================================================================
