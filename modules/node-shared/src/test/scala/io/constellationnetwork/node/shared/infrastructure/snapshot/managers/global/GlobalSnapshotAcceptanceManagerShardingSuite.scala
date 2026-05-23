@@ -12,10 +12,7 @@ import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.node.shared.domain.block.processing._
-import io.constellationnetwork.node.shared.domain.delegatedStake.{
-  UpdateDelegatedStakeAcceptanceManager,
-  UpdateDelegatedStakeValidator
-}
+import io.constellationnetwork.node.shared.domain.delegatedStake.{UpdateDelegatedStakeAcceptanceManager, UpdateDelegatedStakeValidator}
 import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
 import io.constellationnetwork.node.shared.domain.node.{UpdateNodeParametersAcceptanceManager, UpdateNodeParametersAcceptanceResult}
 import io.constellationnetwork.node.shared.domain.nodeCollateral.{
@@ -74,11 +71,11 @@ import weaver.MutableIOSuite
   *   - Uses a "captor" `GlobalSnapshotStateChannelEventsProcessor` that records the SC-event list it received. This is the strongest
   *     observable for asserting the input shape that flowed through `processStateChannelEvents` after the Slice 13 pre-processor ran.
   *   - The `ShardCheckpointGl0AcceptanceManager` is fully stubbed (returns a configurable result per call) — no real KES/Ed25519/VRF
-  *     fixture is needed; the GSAM contract under test is "stitch checkpoint outputs into the SC pipeline", not "verify checkpoint
-  *     crypto" (which is [[ShardCheckpointGl0AcceptanceManagerSuite]]'s job).
+  *     fixture is needed; the GSAM contract under test is "stitch checkpoint outputs into the SC pipeline", not "verify checkpoint crypto"
+  *     (which is [[ShardCheckpointGl0AcceptanceManagerSuite]]'s job).
   *   - `MetagraphSyncManager` is real (constructed from production `make`), so `consumeReceipts` actually drains into its internal
-  *     accumulator; verification happens via injecting the manager into the captor stack and asserting via the production-trait surface
-  *     (no inspector handle is leaked to GSAM users).
+  *     accumulator; verification happens via injecting the manager into the captor stack and asserting via the production-trait surface (no
+  *     inspector handle is leaked to GSAM users).
   */
 object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
 
@@ -105,8 +102,8 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   private val genesisHash: Hash = Hash("0" * 64)
   private val epochZero: EtaPeriod = EtaPeriod(0L)
 
-  /** Build a sentinel `Signed[StateChannelSnapshotBinary]` — only used to populate `includedSnapshots` in the test checkpoints. The
-    * captor processor never inspects the content; it just records the address+binary pair.
+  /** Build a sentinel `Signed[StateChannelSnapshotBinary]` — only used to populate `includedSnapshots` in the test checkpoints. The captor
+    * processor never inspects the content; it just records the address+binary pair.
     */
   private def mkSignedBinary(content: Array[Byte]): Signed[StateChannelSnapshotBinary] = {
     val sentinelProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("11" * 64)), Signature(Hex("22" * 70)))
@@ -158,8 +155,8 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
     )
   }
 
-  /** Captor processor that records the SC-event list it was called with. Returns an empty
-    * [[StateChannelAcceptanceResult]] — the test only asserts what flowed IN, not what comes back.
+  /** Captor processor that records the SC-event list it was called with. Returns an empty [[StateChannelAcceptanceResult]] — the test only
+    * asserts what flowed IN, not what comes back.
     */
   private def mkCaptorProcessor(
     capturedEventsRef: Ref[IO, List[StateChannelOutput]]
@@ -176,15 +173,17 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
         validationType: StateChannelValidationType,
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(implicit hasher: Hasher[IO]): IO[StateChannelAcceptanceResult] =
-        capturedEventsRef.set(events).as(
-          StateChannelAcceptanceResult(
-            accepted = SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-            calculatedCurrencyState = SortedMap.empty[Address, CurrencySnapshotWithState],
-            returned = Set.empty[StateChannelOutput],
-            balanceUpdate = SortedMap.empty[Address, Balance],
-            incomingCurrencySnapshotsWithState = SortedMap.empty[Address, List[CurrencySnapshotWithState]]
+        capturedEventsRef
+          .set(events)
+          .as(
+            StateChannelAcceptanceResult(
+              accepted = SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+              calculatedCurrencyState = SortedMap.empty[Address, CurrencySnapshotWithState],
+              returned = Set.empty[StateChannelOutput],
+              balanceUpdate = SortedMap.empty[Address, Balance],
+              incomingCurrencySnapshotsWithState = SortedMap.empty[Address, List[CurrencySnapshotWithState]]
+            )
           )
-        )
 
       override def processCurrencySnapshots(
         snapshotOrdinal: SnapshotOrdinal,
@@ -439,8 +438,8 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
     }
   }
 
-  /** Build a [[ShardingConfig]] with the supplied `numShards`. Other fields use representative defaults — only `numShards` is consulted
-    * by the Slice 13 gate.
+  /** Build a [[ShardingConfig]] with the supplied `numShards`. Other fields use representative defaults — only `numShards` is consulted by
+    * the Slice 13 gate.
     */
   private def mkShardingConfig(numShards: Int): ShardingConfig =
     ShardingConfig(
