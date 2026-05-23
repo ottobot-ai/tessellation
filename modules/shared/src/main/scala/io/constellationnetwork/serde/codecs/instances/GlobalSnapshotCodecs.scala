@@ -247,6 +247,12 @@ object GlobalSnapshotCodecs {
           case ord :: h :: sh :: lsh :: blks :: scs :: rws :: dr ::
               ep :: nf :: tips :: sp :: asb :: tlb :: sa :: unp ::
               art :: ads :: dsw :: anc :: ncw :: v :: slot :: eta :: HNil =>
+            // `shardCheckpoints` (`GlobalIncrementalSnapshot.scala:108`, added by Slice 4 of
+            // `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §3.4) is intentionally NOT on the scodec wire yet — a
+            // dedicated `ShardingScodecCodecs` package (for `ShardCheckpoint` + sub-types) is deferred to a follow-up slice
+            // alongside scodec parity tests with non-empty checkpoints. Constructing with `SortedMap.empty` here keeps the
+            // existing pre-sharding Brotli-JSON parity fixtures (`JsonScodecParitySuite`) green: Circe-decoded values use the
+            // case-class default (empty), scodec-roundtripped values are explicitly empty, both compare equal under `Eq`.
             GlobalIncrementalSnapshot(
               ord,
               h,
@@ -254,6 +260,7 @@ object GlobalSnapshotCodecs {
               lsh,
               blks,
               scs,
+              SortedMap.empty[io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint],
               rws,
               dr,
               ep,

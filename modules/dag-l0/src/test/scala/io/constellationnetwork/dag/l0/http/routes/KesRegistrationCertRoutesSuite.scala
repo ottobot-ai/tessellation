@@ -100,6 +100,7 @@ object KesRegistrationCertRoutesSuite extends HttpSuite {
           lastSnapshotHash = Hash.empty,
           blocks = SortedSet.empty,
           stateChannelSnapshots = SortedMap.empty,
+          shardCheckpoints = SortedMap.empty,
           rewards = SortedSet.empty,
           delegateRewards = None,
           epochProgress = headEpoch,

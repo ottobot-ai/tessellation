@@ -475,6 +475,9 @@ object GlobalSnapshotConsensusFunctions {
           lastArtifactHash,
           accepted,
           scSnapshots,
+          // shardCheckpoints — Slice 4 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §3.4; pre-sharding leader builds an
+          // empty map. Population by `ShardCheckpointGl0AcceptanceManager` (slice 9) and stitching refactor (slice 13) come later.
+          SortedMap.empty[io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint],
           acceptedRewardTxs,
           delegatorRewardsMap.some,
           currentEpochProgress,

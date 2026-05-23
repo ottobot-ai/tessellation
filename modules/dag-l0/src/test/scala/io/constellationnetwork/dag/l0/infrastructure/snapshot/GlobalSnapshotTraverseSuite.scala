@@ -214,6 +214,7 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
         lastHash,
         blocks.toSortedSet,
         SortedMap.empty,
+        SortedMap.empty[io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint],
         SortedSet.empty,
         None,
         lastSnapshot.epochProgress,

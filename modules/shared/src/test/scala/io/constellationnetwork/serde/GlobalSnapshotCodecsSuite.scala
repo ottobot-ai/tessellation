@@ -91,6 +91,7 @@ object GlobalSnapshotCodecsSuite extends FunSuite {
       lastSnapshotHash = Hash("0" * 64),
       blocks = SortedSet.empty,
       stateChannelSnapshots = SortedMap.empty,
+      shardCheckpoints = SortedMap.empty,
       rewards = SortedSet.empty,
       delegateRewards = None,
       epochProgress = EpochProgress(NonNegLong.unsafeFrom(0L)),

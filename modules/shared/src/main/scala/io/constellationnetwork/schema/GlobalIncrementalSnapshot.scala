@@ -21,6 +21,7 @@ import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.SnapshotVersion
+import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId}
 import io.constellationnetwork.schema.snapshot.{FullSnapshot, IncrementalSnapshot}
 import io.constellationnetwork.schema.swap.AllowSpendBlock
 import io.constellationnetwork.schema.tokenLock.TokenLockBlock
@@ -61,6 +62,7 @@ case class GlobalIncrementalSnapshotV1(
       lastSnapshotHash,
       blocks,
       stateChannelSnapshots,
+      SortedMap.empty[ShardId, ShardCheckpoint], // shardCheckpoints — V1 pre-dates sharding; absence = empty map (§3.4)
       rewards,
       Some(SortedMap.empty),
       epochProgress,
@@ -98,7 +100,7 @@ object GlobalIncrementalSnapshotV1 {
     )
 }
 
-@derive(eqv, show, encoder, decoder)
+@derive(eqv, show, encoder)
 case class GlobalIncrementalSnapshot(
   ordinal: SnapshotOrdinal,
   height: Height,
@@ -106,6 +108,10 @@ case class GlobalIncrementalSnapshot(
   lastSnapshotHash: Hash,
   blocks: SortedSet[BlockAsActiveTip],
   stateChannelSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+  // Hierarchical shard checkpoints — one entry per shard per ord; absent shards mean "no checkpoint produced this ord"
+  // (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §3.4). Empty map is the bootstrap-window / pre-sharding default
+  // and is represented as `SortedMap.empty` (NOT `Option`) — absence is the empty map per design-doc convention.
+  shardCheckpoints: SortedMap[ShardId, ShardCheckpoint],
   rewards: SortedSet[RewardTransaction],
   delegateRewards: Option[SortedMap[PeerId, Map[Address, Amount]]],
   epochProgress: EpochProgress,
@@ -127,6 +133,88 @@ case class GlobalIncrementalSnapshot(
 ) extends IncrementalSnapshot[GlobalSnapshotStateProof]
 
 object GlobalIncrementalSnapshot {
+
+  /** Forgiving Circe decoder — defaults `shardCheckpoints` to [[SortedMap.empty]] when the field is absent.
+    *
+    * Replaces the derevo-derived decoder so that pre-Slice-4 (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §3.4) brotli
+    * fixtures still round-trip through `JsonScodecParitySuite` (those fixtures were captured before this field existed). New encodings
+    * always include the field via the derived encoder, so round-trips on current snapshots are unaffected. Mirrors the same pattern as
+    * `SlotCertificate.decoder` in `schema.nakamoto.slot` for the `subchainLevelCounts` field.
+    *
+    * '''Why hand-rolled instead of `circe-magnolia.configured.withDefaults`.''' The rest of the schema package uses derevo's standard
+    * (non-configured) magnolia derivation; introducing a per-type `Configuration` here would diverge from the project-wide convention.
+    * Hand-rolling one decoder mirrors the existing precedent in `slot.scala:157` and keeps the customization narrow and explicit.
+    */
+  implicit val decoder: io.circe.Decoder[GlobalIncrementalSnapshot] = io.circe.Decoder.instance { c =>
+    for {
+      ordinal <- c.downField("ordinal").as[SnapshotOrdinal]
+      height <- c.downField("height").as[Height]
+      subHeight <- c.downField("subHeight").as[SubHeight]
+      lastSnapshotHash <- c.downField("lastSnapshotHash").as[Hash]
+      blocks <- c.downField("blocks").as[SortedSet[BlockAsActiveTip]]
+      stateChannelSnapshots <- c
+        .downField("stateChannelSnapshots")
+        .as[SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]]
+      shardCheckpoints <- c
+        .downField("shardCheckpoints")
+        .as[Option[SortedMap[ShardId, ShardCheckpoint]]]
+        .map(_.getOrElse(SortedMap.empty[ShardId, ShardCheckpoint]))
+      rewards <- c.downField("rewards").as[SortedSet[RewardTransaction]]
+      delegateRewards <- c.downField("delegateRewards").as[Option[SortedMap[PeerId, Map[Address, Amount]]]]
+      epochProgress <- c.downField("epochProgress").as[EpochProgress]
+      nextFacilitators <- c.downField("nextFacilitators").as[NonEmptyList[PeerId]]
+      tips <- c.downField("tips").as[SnapshotTips]
+      stateProof <- c.downField("stateProof").as[GlobalSnapshotStateProof]
+      allowSpendBlocks <- c.downField("allowSpendBlocks").as[Option[SortedSet[Signed[AllowSpendBlock]]]]
+      tokenLockBlocks <- c.downField("tokenLockBlocks").as[Option[SortedSet[Signed[TokenLockBlock]]]]
+      spendActions <- c.downField("spendActions").as[Option[SortedMap[Address, List[SpendAction]]]]
+      updateNodeParameters <- c.downField("updateNodeParameters").as[Option[SortedMap[Id, Signed[UpdateNodeParameters]]]]
+      artifacts <- c.downField("artifacts").as[Option[SortedSet[SharedArtifact]]]
+      activeDelegatedStakes <- c
+        .downField("activeDelegatedStakes")
+        .as[Option[SortedMap[Address, List[Signed[UpdateDelegatedStake.Create]]]]]
+      delegatedStakesWithdrawals <- c
+        .downField("delegatedStakesWithdrawals")
+        .as[Option[SortedMap[Address, List[Signed[UpdateDelegatedStake.Withdraw]]]]]
+      activeNodeCollaterals <- c
+        .downField("activeNodeCollaterals")
+        .as[Option[SortedMap[Address, List[Signed[UpdateNodeCollateral.Create]]]]]
+      nodeCollateralWithdrawals <- c
+        .downField("nodeCollateralWithdrawals")
+        .as[Option[SortedMap[Address, List[Signed[UpdateNodeCollateral.Withdraw]]]]]
+      version <- c.downField("version").as[Option[SnapshotVersion]].map(_.getOrElse(SnapshotVersion("0.0.1")))
+      slotCertificate <- c.downField("slotCertificate").as[Option[io.constellationnetwork.schema.nakamoto.slot.SlotCertificate]]
+      eta <- c.downField("eta").as[Option[io.constellationnetwork.security.hash.Hash]]
+    } yield
+      GlobalIncrementalSnapshot(
+        ordinal,
+        height,
+        subHeight,
+        lastSnapshotHash,
+        blocks,
+        stateChannelSnapshots,
+        shardCheckpoints,
+        rewards,
+        delegateRewards,
+        epochProgress,
+        nextFacilitators,
+        tips,
+        stateProof,
+        allowSpendBlocks,
+        tokenLockBlocks,
+        spendActions,
+        updateNodeParameters,
+        artifacts,
+        activeDelegatedStakes,
+        delegatedStakesWithdrawals,
+        activeNodeCollaterals,
+        nodeCollateralWithdrawals,
+        version,
+        slotCertificate,
+        eta
+      )
+  }
+
   def fromGlobalSnapshot[F[_]: Parallel: Async: Hasher: JsonSerializer](snapshot: GlobalSnapshot)(
     implicit stateProofSelector: StateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
@@ -140,6 +228,7 @@ object GlobalIncrementalSnapshot {
         snapshot.lastSnapshotHash,
         snapshot.blocks,
         snapshot.stateChannelSnapshots,
+        SortedMap.empty[ShardId, ShardCheckpoint], // shardCheckpoints — pre-sharding genesis path; absence = empty map (§3.4)
         snapshot.rewards,
         Some(SortedMap.empty),
         snapshot.epochProgress,

@@ -133,6 +133,7 @@ object RewardsServiceSuite extends SimpleIOSuite {
     lastSnapshotHash = Hash("test-hash"),
     blocks = SortedSet.empty,
     stateChannelSnapshots = SortedMap.empty,
+    shardCheckpoints = SortedMap.empty,
     rewards = SortedSet.empty,
     delegateRewards = Some(
       SortedMap(

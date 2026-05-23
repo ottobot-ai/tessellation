@@ -73,6 +73,7 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
       lastSnapshotHash = parentHash,
       blocks = SortedSet.empty,
       stateChannelSnapshots = SortedMap.empty,
+      shardCheckpoints = SortedMap.empty,
       rewards = SortedSet.empty,
       delegateRewards = None,
       epochProgress = EpochProgress(NonNegLong(0L)),

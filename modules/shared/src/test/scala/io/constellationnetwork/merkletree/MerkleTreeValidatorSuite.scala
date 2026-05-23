@@ -119,6 +119,7 @@ object MerkleTreeValidatorSuite extends MutableIOSuite {
           Hash.empty,
           SortedSet.empty,
           SortedMap.empty,
+          SortedMap.empty[io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint],
           SortedSet.empty,
           None,
           EpochProgress.MinValue,

@@ -457,6 +457,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
       lastSnapshotHash,
       SortedSet.empty,
       SortedMap.empty,
+      SortedMap.empty[io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint],
       SortedSet.empty,
       None,
       EpochProgress.MinValue,

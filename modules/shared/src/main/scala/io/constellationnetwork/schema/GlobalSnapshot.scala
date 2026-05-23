@@ -94,6 +94,9 @@ object GlobalSnapshot {
         genesis.hash,
         SortedSet.empty,
         SortedMap.empty,
+        // shardCheckpoints — bootstrap-window snapshot (first incremental after genesis) is pre-sharding by construction;
+        // shard-checkpoint stitching activates later in the chain when shards are wired in (§3.4 of design doc).
+        SortedMap.empty[io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint],
         SortedSet.empty,
         Some(SortedMap.empty),
         genesis.epochProgress.next,
