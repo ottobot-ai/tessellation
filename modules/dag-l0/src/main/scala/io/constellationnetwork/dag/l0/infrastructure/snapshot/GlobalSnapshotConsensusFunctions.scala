@@ -437,6 +437,24 @@ object GlobalSnapshotConsensusFunctions {
         // shard-ord qualified by `T_count_shard` OR `T_depth1_shard`, max-of), and pull the canonical
         // checkpoint at that ord from the chain store. Skip shards whose latest qualifying ord is
         // Genesis (nothing finalized yet) or whose canonical entry was already evicted.
+        //
+        // ─── Q1 — deterministic inclusion cutoff ──────────────────────────────────────────────────────
+        // Without a cutoff, the chosen checkpoint depends on how far this node's shard chain + attestation
+        // tally have advanced at the wall-clock moment `produce` runs — gossip-timing-dependent, so two
+        // honest leaders producing the SAME gl0 ord N could fold DIFFERENT shard checkpoints and diverge.
+        // The cutoff makes the selection a pure function of `(N, shard chain)`: clamp to the deterministic
+        // MAX checkpoint whose `gl0AnchorOrdinal <= N` (N = `currentOrdinal`, the ord being produced) AND
+        // is Phase-2-qualified. Since `gl0AnchorOrdinal` is monotone non-decreasing along the canonical
+        // shard chain (each checkpoint anchors to a gl0 ord >= its parent's), and any ancestor of a
+        // Phase-2-qualified checkpoint is itself Phase-2-qualified (more depth / older), walking back from
+        // the qualifying checkpoint to the highest-ord ancestor with `gl0AnchorOrdinal <= N` preserves the
+        // qualified invariant while removing the timing dependence. A checkpoint that nominated a FUTURE
+        // gl0 ord (> N) is excluded this ord and folds at a later gl0 ord (loose-coupling §7.2).
+        //
+        // This clamp runs ONLY on the leader path (`sourceShardCheckpoints = true`). The follower path
+        // (`validateArtifact`) never enters this branch — it replays the leader's embedded
+        // `stateChannelSnapshots`, so it must NOT re-source node-local shard state (the split-safety
+        // invariant). See the determinism contract on `createProposalArtifactInternal`.
         shardCheckpoints <- shardAcceptanceDeps match {
           case Some(deps) if sourceShardCheckpoints =>
             deps.registry.toList.traverse {
@@ -447,9 +465,26 @@ object GlobalSnapshotConsensusFunctions {
                       none[(io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint)]
                         .pure[F]
                     else
-                      entry.chainStore.getByOrdinal(qualifyingOrd).map {
-                        case Some(hashed) => (shardId -> hashed.signed.value).some
-                        case None         => none
+                      entry.chainStore.getByOrdinal(qualifyingOrd).flatMap {
+                        case None =>
+                          none[(io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint)]
+                            .pure[F]
+                        case Some(qualifying) =>
+                          // Fast path: the qualifying checkpoint itself anchors at-or-below N.
+                          if (qualifying.signed.value.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value)
+                            (shardId -> qualifying.signed.value).some.pure[F]
+                          else
+                            // Walk back from the qualifying checkpoint to the highest-ord ancestor whose
+                            // gl0AnchorOrdinal <= N. `walkBackTo` returns tip-first order (head = the entry
+                            // at `hash`, tail toward genesis), so `.find` yields the MAX-ord match. Depth =
+                            // the qualifying ord (full canonical chain bounded by the keep-window).
+                            entry.chainStore
+                              .walkBackTo(qualifying.hash, qualifyingOrd.value)
+                              .map { chain =>
+                                chain
+                                  .find(_.signed.value.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value)
+                                  .map(h => shardId -> h.signed.value)
+                              }
                       }
                   }
             }
