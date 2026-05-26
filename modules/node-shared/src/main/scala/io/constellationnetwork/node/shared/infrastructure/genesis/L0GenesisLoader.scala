@@ -11,7 +11,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.crypto._
 import io.constellationnetwork.node.shared.domain.genesis.types.{L0GenesisData, L0GenesisDelegatedStake, L0GenesisNodeCollateral}
-import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, KesRegistryEntry}
+import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, KesRegistryEntry, VrfRegistry}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
@@ -251,5 +251,34 @@ object L0GenesisLoader {
           }
           .toMap
       KesRegistry.make[F](parsed)
+    }
+
+  /** Build a [[VrfRegistry]] from the `operators` field of an L0 genesis fixture. Each operator's `vrfPublicKey` (hex-encoded VRF
+    * verification key) is hex-decoded and keyed by the operator `PeerId`. Operators with no `vrfPublicKey` (the field is `Option[String]`),
+    * or whose `peerId` / `vrfPublicKey` fail to hex-decode, are dropped silently — Tier-1 fixtures are reviewed before landing, so a
+    * malformed entry is best surfaced as "peer absent from registry" rather than a hard boot failure.
+    *
+    * '''Determinism.''' The generator (`GenesisGenerator`) populates `vrfPublicKey` via `VrfKeyDeriver.deriveVrfKeyPair(operatorKeyPair)`,
+    * the SAME derivation the gl0 runtime applies in `SnapshotLeaderLoop.deriveVrfKeys`. So the bytes recovered here byte-match the
+    * operator's live VRF identity — the invariant a later slice's `CommitteeSortition.verifyShardMembership` depends on. As of Slice S1 the
+    * registry is built + threaded as an AVAILABLE dependency but not yet consumed for committee membership.
+    *
+    *   - Operators absent / all `vrfPublicKey = None` ⇒ empty registry. Fixtures predating the §1.3 VRF populate produce an empty registry,
+    *     and the (S1-unconsumed) registry simply returns `None` for every lookup.
+    */
+  def buildVrfRegistry[F[_]: Async](data: L0GenesisData): F[VrfRegistry[F]] =
+    Async[F].delay {
+      val parsed: Map[PeerId, Array[Byte]] =
+        data.operators.flatMap { op =>
+          op.vrfPublicKey.flatMap { vkHex =>
+            val peerOpt = scala.util.Try(Id(Hex(op.peerId)).toPeerId).toOption
+            val vkBytesOpt = scala.util.Try(Hex(vkHex).toBytes).toOption
+            (peerOpt, vkBytesOpt) match {
+              case (Some(p), Some(vkBytes)) => Some(p -> vkBytes)
+              case _                        => None
+            }
+          }
+        }.toMap
+      VrfRegistry.make[F](parsed)
     }
 }

@@ -246,6 +246,10 @@ object SharedServices {
         cfg = cfg.nakamoto.sharding,
         selfPeerId = nodeId,
         kesRegistry = io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[F],
+        // Slice S1: the verify/follower path has no genesis-loaded VRF registry in scope (it lives at the gl0
+        // layer — see GlobalSnapshotConsensus). Pass `VrfRegistry.empty`; the registry is unconsumed in S1
+        // (full-set committee membership), so empty here is a no-op exactly as `KesRegistry.empty` is.
+        vrfRegistry = io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[F],
         activeValidators = Async[F].pure(
           seedlist
             .map(_.collect { case e if !e.alias.exists(_.value.value == "metagraph-op") => e.peerId })

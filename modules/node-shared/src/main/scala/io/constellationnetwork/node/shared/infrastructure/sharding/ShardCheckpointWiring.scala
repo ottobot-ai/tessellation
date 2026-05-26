@@ -5,7 +5,7 @@ import cats.syntax.all._
 
 import io.constellationnetwork.node.shared.config.types.ShardingConfig
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardFinalityTriggers, ShardTipTracker}
-import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, ShardAssignment}
+import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, ShardAssignment, VrfRegistry}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointGl0AcceptanceManager
 import io.constellationnetwork.schema.address.Address
@@ -113,6 +113,10 @@ object ShardCheckpointWiring {
     * @param kesRegistry
     *   registered KES master VKs. Used by the acceptance manager's per-signer KES product-sig verification (registry-absent carve-out for
     *   the bootstrap window).
+    * @param vrfRegistry
+    *   registered per-operator VRF verification keys (Slice S1). Threaded as an AVAILABLE dependency so a later slice (S2) can swap the
+    *   full-set `committeeMembership` predicate for a real per-signer `CommitteeSortition.verifyShardMembership(vrfVk, …)`. As of S1 it is
+    *   NOT consumed — `committeeFor` still returns the full active validator set, so behavior is byte-identical at every `numShards`.
     * @param activeValidators
     *   callback returning the current active gl0 validator set. Used by the v1 `committeeMembership` predicate (full-set membership — see
     *   the object scaladoc). Read on every checkpoint pre-check so a validator-set change (registration/slashing) is observed without
@@ -127,12 +131,17 @@ object ShardCheckpointWiring {
     cfg: ShardingConfig,
     selfPeerId: PeerId,
     kesRegistry: KesRegistry[F],
+    vrfRegistry: VrfRegistry[F],
     activeValidators: F[Set[PeerId]],
     reExecuteDerivation: Option[(Address, Signed[StateChannelSnapshotBinary]) => F[Hash]] = None
   ): F[Option[AcceptanceDeps[F]]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointWiring")
     val reExec: (Address, Signed[StateChannelSnapshotBinary]) => F[Hash] =
       reExecuteDerivation.getOrElse(noReExecDerivation[F])
+    // Slice S1: the VRF-VK registry is plumbed through but not yet consumed — `committeeFor` still returns the
+    // full active validator set (see object scaladoc). Bound here so the param is wired end-to-end ahead of the
+    // S2 swap to `CommitteeSortition.verifyShardMembership`. Referenced to keep the unused-param warning silent.
+    val _ = vrfRegistry
 
     if (cfg.numShards <= 1)
       // Regression bar: at the production default `numShards = 1`, construct NOTHING and return None. The two GSAM call sites then pass

@@ -157,6 +157,22 @@ object Main
           io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO].pure[IO].asResource
       }
 
+      // Slice S1: VRF-VK registry from the SAME L0 genesis JSON the KES registry above reads. Each operator's
+      // `vrfPublicKey` was populated by the generator via `VrfKeyDeriver.deriveVrfKeyPair`, the SAME derivation
+      // the gl0 leader loop applies — so the loaded VKs byte-match each operator's runtime VRF identity. Empty
+      // for non-JSON bootstrap paths (rollback / join / CSV-genesis). Threaded into Services → consensus →
+      // ShardCheckpointWiring as an AVAILABLE-but-unconsumed dependency this slice (no behavior change).
+      vrfRegistry <- (method.genesisPath, method.genesisPath.exists(_.extName == ".json")) match {
+        case (Some(gPath), true) =>
+          GenesisLoader
+            .make[IO, GlobalSnapshot]
+            .loadL0Genesis(gPath)
+            .flatMap(L0GenesisLoader.buildVrfRegistry[IO])
+            .asResource
+        case _ =>
+          io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[IO].pure[IO].asResource
+      }
+
       services <- Services
         .make[IO, RunNakamoto](
           sharedConfig,
@@ -177,7 +193,8 @@ object Main
           nakamotoFinalizedOrdinalRef,
           finalityTriggerViewRef,
           nipopowProofProviderRef,
-          kesRegistry
+          kesRegistry,
+          vrfRegistry
         )
 
       programs = Programs.make[IO, RunNakamoto](

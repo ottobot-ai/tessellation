@@ -162,20 +162,11 @@ object SnapshotLeaderLoop {
     * `ShardCheckpointProducer`'s slot-leader VRF. v1 reuses the gl0 leader VRF identity for the shard slot lottery (per-operator-key VRF
     * lands later, #180) — so the seed must be derived identically on both sides.
     */
-  private[snapshot] def deriveVrfKeys(keyPair: KeyPair): (Array[Byte], Array[Byte]) = {
-    val rawPrivKey: Array[Byte] = keyPair.getPrivate match {
-      case ecKey: java.security.interfaces.ECPrivateKey =>
-        val bytes = ecKey.getS.toByteArray
-        if (bytes.length > 32) bytes.drop(bytes.length - 32)
-        else if (bytes.length < 32) Array.fill(32 - bytes.length)(0.toByte) ++ bytes
-        else bytes
-      case other =>
-        other.getEncoded.takeRight(32)
-    }
-    val seed = VrfKeyDeriver.deriveVrfSeed(rawPrivKey)
-    val pk = new io.constellationnetwork.security.vrf.EcVrf25519().getVerificationKey(seed)
-    (seed, pk)
-  }
+  private[snapshot] def deriveVrfKeys(keyPair: KeyPair): (Array[Byte], Array[Byte]) =
+    // Delegates to the single canonical derivation (normalize EC scalar → deriveVrfSeed → getVerificationKey)
+    // so the gl0 runtime and the genesis tool (`GenesisGenerator`, which populates `L0GenesisOperator.vrfPublicKey`)
+    // produce byte-identical VRF VKs. See `VrfKeyDeriver.deriveVrfKeyPair` for the determinism contract (Slice S1).
+    VrfKeyDeriver.deriveVrfKeyPair(keyPair)
 
   /** (#196) Notify the sidecar outbox that the entries included in `stored` are durably committed at network scale and may be dropped from
     * the periodic re-gossip loop.

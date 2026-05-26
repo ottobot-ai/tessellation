@@ -82,7 +82,11 @@ object Services {
     ]],
     // §1.2 Slice 3c: KesRegistry loaded from L0 genesis (or empty for CSV-genesis). Threaded
     // through to GlobalSnapshotConsensus.make.
-    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F]
+    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
+    // Slice S1: VrfRegistry loaded from L0 genesis (`operators[].vrfPublicKey`) or empty for CSV-genesis.
+    // Threaded through to GlobalSnapshotConsensus.make → ShardCheckpointWiring.acceptanceDeps as an
+    // AVAILABLE dependency. Unconsumed in S1 (committee membership is still full-set) — no-op at any numShards.
+    vrfRegistry: io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
@@ -272,7 +276,8 @@ object Services {
             enqueueDAGBlock,
             enqueueTokenLockBlock,
             sidecarClient,
-            kesRegistry
+            kesRegistry,
+            vrfRegistry
           )
       }
       addressService = AddressService.make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](

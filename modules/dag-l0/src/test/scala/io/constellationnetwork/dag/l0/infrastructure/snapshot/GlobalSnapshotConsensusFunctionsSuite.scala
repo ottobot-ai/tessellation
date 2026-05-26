@@ -553,6 +553,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           cfg = shardingCfg,
           selfPeerId = selfId,
           kesRegistry = io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO],
+          vrfRegistry = io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[IO],
           activeValidators = IO.pure(Set(selfId))
         )
       followerGscf <- mkGlobalSnapshotConsensusFunctions(followerDeps)

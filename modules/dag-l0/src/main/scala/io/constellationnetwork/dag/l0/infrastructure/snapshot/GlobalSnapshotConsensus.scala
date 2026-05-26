@@ -225,7 +225,13 @@ object GlobalSnapshotConsensus {
     // genesis bootstrap path (no per-operator KES VKs registered). Read by Slice 5/6 verification
     // on every incoming attestation/snapshot to confirm the sender's KES signature against the
     // genesis-registered VK without trusting the sender to ship its own VK in-band.
-    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F]
+    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
+    // Slice S1: (peerId → VRF verification key) registry loaded from L0 genesis (`operators[].vrfPublicKey`,
+    // derived via the SAME `VrfKeyDeriver.deriveVrfKeyPair` the gl0 leader loop uses). Threaded as an
+    // AVAILABLE dependency into `ShardCheckpointWiring.acceptanceDeps` so a later slice (S2) can do real
+    // per-signer committee sortition. NOT consumed in S1 — committee membership is still full-set, so this
+    // is a no-op at every `numShards`. Empty for the CSV-genesis bootstrap path.
+    vrfRegistry: io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[F]
   )(
     implicit supervisor: Supervisor[F],
     globalStateProofSelector: GlobalStateProofSelector,
@@ -366,6 +372,8 @@ object GlobalSnapshotConsensus {
           cfg = sharedCfg.nakamoto.sharding,
           selfPeerId = selfId,
           kesRegistry = kesRegistry,
+          // Slice S1: genesis-loaded VRF-VK registry, threaded available-but-unused (full-set membership).
+          vrfRegistry = vrfRegistry,
           activeValidators = Async[F].pure(
             seedlist
               .map(_.collect { case e if !e.alias.exists(_.value.value == "metagraph-op") => e.peerId })

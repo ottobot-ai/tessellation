@@ -6,7 +6,7 @@ import cats.syntax.all._
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types._
-import io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry
+import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, VrfRegistry}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
@@ -67,6 +67,7 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
       cfg = mkShardingConfig(numShards),
       selfPeerId = selfPeerId,
       kesRegistry = KesRegistry.empty[IO],
+      vrfRegistry = VrfRegistry.empty[IO],
       activeValidators = IO.pure(validators)
     )(implicitly, h, sp, implicitly)
 

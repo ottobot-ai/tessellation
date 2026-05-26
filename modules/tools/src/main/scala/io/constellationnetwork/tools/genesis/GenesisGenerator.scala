@@ -22,6 +22,7 @@ import io.constellationnetwork.security.kes.OperationalKeyMaker
 import io.constellationnetwork.security.key.ops._
 import io.constellationnetwork.security.key.{ECDSA, secp256k}
 import io.constellationnetwork.security.signature.Signing
+import io.constellationnetwork.security.vrf.VrfKeyDeriver
 
 import eu.timepit.refined.refineV
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -188,10 +189,17 @@ object GenesisGenerator {
       }
       operators = operatorKeys.zipWithIndex.map {
         case (kp, _) =>
+          // §1.3 / Slice S1: populate the per-operator VRF verification key from the operator's long-term
+          // keypair via the SHARED `VrfKeyDeriver.deriveVrfKeyPair` — the SAME derivation the gl0 runtime
+          // applies in `SnapshotLeaderLoop.deriveVrfKeys` (normalize EC scalar → deriveVrfSeed →
+          // EcVrf25519.getVerificationKey). Byte-identity with the runtime is the determinism contract that
+          // lets a later slice's `CommitteeSortition.verifyShardMembership` accept honest signers. We MUST NOT
+          // re-implement the normalization here — both sides funnel through `deriveVrfKeyPair`.
+          val (_, vrfVk) = VrfKeyDeriver.deriveVrfKeyPair(kp)
           L0GenesisOperator(
             peerId = PeerId.fromPublic(kp.getPublic).value.value,
             address = kp.getPublic.toAddress.value.value,
-            vrfPublicKey = None,
+            vrfPublicKey = Some(Hex.fromBytes(vrfVk).value),
             kesPublicKey = None
           )
       }
