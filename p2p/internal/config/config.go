@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"strconv"
 	"time"
 )
 
@@ -41,6 +43,20 @@ type Config struct {
 	// pb.MetagraphBinary and pb.MetagraphAttestation".
 	ShardCheckpointTopicPrefix            string
 	ShardCheckpointAttestationTopicPrefix string
+
+	// NumShards is the number of execution shards (M) the cluster is running.
+	// Read from env NAKAMOTO_NUM_SHARDS (default 1) — mirrors the gl0 overlay's
+	// `${?NAKAMOTO_NUM_SHARDS}` plumbing so the sidecar and the JVM see the SAME
+	// M. The sidecar needs M at startup so a node can EAGERLY join every shard's
+	// checkpoint + attestation topic (shards 0 .. M-1), rather than lazily joining
+	// only the shards it has itself published to. In v1 the shard committee is the
+	// full validator set, so every node must receive every shard's gossip; a
+	// receiver-only node never publishes and so would never lazy-join.
+	//
+	// `NumShards <= 1` (the production default) is the regression bar: the sidecar
+	// performs NO startup shard-topic joins and behaves byte-identically to before
+	// this field existed. See gossip.New.
+	NumShards int
 
 	// GossipSub parameters
 	MeshD   int // target mesh degree (default 6)
@@ -145,5 +161,24 @@ func DefaultConfig() Config {
 		ShardCheckpointBufferSize: 256,
 		OutboxRepublishInterval:   30 * time.Second,
 		OutboxTTL:                 1 * time.Hour,
+		// M (number of execution shards). Env-driven so the sidecar agrees with the
+		// gl0 JVM (both read NAKAMOTO_NUM_SHARDS). Default 1 = sharding inactive.
+		NumShards: envInt("NAKAMOTO_NUM_SHARDS", 1),
 	}
+}
+
+// envInt reads an integer from the named environment variable, returning
+// `fallback` when the variable is unset, empty, or not a valid integer.
+// Mirrors the JVM-side `${?ENV}` HOCON substitution: a missing/garbage value
+// silently falls back to the safe default rather than failing startup.
+func envInt(name string, fallback int) int {
+	v := os.Getenv(name)
+	if v == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return fallback
+	}
+	return n
 }

@@ -24,6 +24,16 @@ services:
       - "-key"
       - "/keys/sidecar.key"
       - "-disable-mdns"
+    environment:
+      # Hierarchical shard-checkpoint sharding. The sidecar reads M so it can
+      # EAGERLY join every shard's checkpoint + attestation GossipSub topic
+      # (shards 0 .. M-1) at startup — in v1 the shard committee is the full
+      # validator set, so every node must receive every shard's gossip even on
+      # shards it never produces to. Mirrors the gl0 overlay's NAKAMOTO_NUM_SHARDS
+      # plumbing so sidecar and JVM agree on M. num-shards = 1 (the default) keeps
+      # the sidecar byte-identical to pre-sharding: NO startup shard-topic joins.
+      # Default MUST mirror the gl0 overlay default (1).
+      - NAKAMOTO_NUM_SHARDS=${NAKAMOTO_NUM_SHARDS:-1}
     volumes:
       - ./sidecar.key:/keys/sidecar.key:ro
     networks:
