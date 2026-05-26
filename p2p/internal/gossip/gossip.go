@@ -264,6 +264,49 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		shardRelayCtx:            ctx,
 	}
 
+	// ── Eager per-shard topic join (sharding active: NumShards > 1) ──
+	//
+	// The lazy `joinShard*` helpers only join a shard's topic on the FIRST
+	// publish or Subscribe for that shard. A node that is not the current shard
+	// leader never publishes to that shard, so under the lazy model it would
+	// never join the topic and never receive any other node's checkpoint —
+	// which is exactly the cross-node-propagation bug: shard chains grow by one
+	// (the producer's own self-store) and then stall because no peer is
+	// subscribed to relay the gossip.
+	//
+	// In v1 the shard committee membership is the FULL validator set
+	// (ShardCheckpointWiring.committeeFor returns every active validator), so
+	// EVERY node must subscribe to EVERY shard's checkpoint + attestation topic.
+	// We therefore eagerly join shards 0 .. NumShards-1 here, reusing the same
+	// idempotent join helpers the publish path uses (so a later publish on a
+	// shard finds the topic already joined and its lifetime relay already
+	// running). Each helper starts a shardRelayCtx-scoped relay goroutine that
+	// fans received messages into shardCheckpointCh / shardCheckpointAttCh —
+	// identical fan-in to a lazy publish-triggered join — which the single gRPC
+	// Subscribe stream drains to the JVM NakamotoSyncDaemon (GAP B handler).
+	//
+	// Regression bar: at NumShards <= 1 (the production default) this loop runs
+	// zero iterations, so the sidecar is byte-identical to pre-sharding — no
+	// shard-topic joins, no relay goroutines.
+	if cfg.NumShards > 1 {
+		for shardID := 0; shardID < cfg.NumShards; shardID++ {
+			id := uint32(shardID)
+			if _, jerr := node.joinShardCheckpointTopic(id); jerr != nil {
+				h.Close()
+				return nil, fmt.Errorf("eager join shard-checkpoint topic shard=%d: %w", id, jerr)
+			}
+			if _, jerr := node.joinShardCheckpointAttestationTopic(id); jerr != nil {
+				h.Close()
+				return nil, fmt.Errorf("eager join shard-checkpoint-attestation topic shard=%d: %w", id, jerr)
+			}
+		}
+		fmt.Printf("shard-checkpoints: eagerly joined %d shard topic pair(s) [%s{0..%d} + %s{0..%d}]\n",
+			cfg.NumShards,
+			cfg.ShardCheckpointTopicPrefix, cfg.NumShards-1,
+			cfg.ShardCheckpointAttestationTopicPrefix, cfg.NumShards-1,
+		)
+	}
+
 	// Start mDNS discovery for automatic peer finding on local network / Docker bridge.
 	// Skipped when -disable-mdns is set, which forces all peer discovery through the
 	// Kademlia DHT — useful for multi-host validation where mDNS cannot cross subnets.

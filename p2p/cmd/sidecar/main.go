@@ -191,6 +191,17 @@ func main() {
 		cfg.DAGBlockTopic,
 		cfg.TokenLockBlockTopic,
 	)
+	if cfg.NumShards > 1 {
+		// Shard-checkpoint topics are per-shard (`<prefix><shardId>`); the sidecar
+		// eagerly joins shards 0 .. NumShards-1 in gossip.New (v1 full-set committee
+		// membership). Surface them on startup so the join is observable — the
+		// pre-fix sidecar's "Topics:" line never listed any shard-checkpoint topic.
+		fmt.Printf("  Shard topics: %s{0..%d}, %s{0..%d} (numShards=%d)\n",
+			cfg.ShardCheckpointTopicPrefix, cfg.NumShards-1,
+			cfg.ShardCheckpointAttestationTopicPrefix, cfg.NumShards-1,
+			cfg.NumShards,
+		)
+	}
 	fmt.Printf("  gRPC:   %s\n", cfg.GRPCAddr)
 
 	// Bootstrap the Kademlia DHT routing table and start the rendezvous
