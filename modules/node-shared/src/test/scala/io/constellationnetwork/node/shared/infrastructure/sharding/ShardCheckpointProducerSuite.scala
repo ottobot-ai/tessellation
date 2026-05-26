@@ -197,7 +197,10 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       selfKeyPair = rig.keyPair,
       selfVrfSk = randomVrfSk(),
       kesSigner = stubKesSigner,
-      shardEta = shardEta,
+      // Slice S4: producer takes an epoch-keyed eta resolver. Tests pass a fixed precomputed shardEta regardless of
+      // epoch — the producer/verifier-agreement property is exercised in ShardSlotLeaderSuite; here we only assert the
+      // producer threads the resolved eta through its leader draw, so a constant is sufficient.
+      shardEtaFor = _ => IO.pure(shardEta),
       sigmaInCommittee = sigma,
       slotForGl0Anchor = slotForGl0Anchor,
       slotGapFor = slotGapFor,

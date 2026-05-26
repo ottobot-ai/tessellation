@@ -1163,14 +1163,17 @@ object GlobalSnapshotConsensus {
           // VRF seed: the SAME `deriveVrfKeys(keyPair)._1` the gl0 leader loop uses. v1 reuses the gl0
           // leader VRF identity for the shard slot lottery (per-operator-key VRF lands later, #180), so
           // the seed must be derived identically. KES adapter mirrors the gl0 `committeeKesSigner`
-          // (signAt → `OperationalKeyMaker.encodeSignature`). `shardEta` is computed once per shard from
-          // `nakamotoGenesisEta`.
+          // (signAt → `OperationalKeyMaker.encodeSignature`).
           //
-          // v1 imprecision (acceptable for first-period validation): `shardEta` is derived from
-          // `nakamotoGenesisEta` and NOT rotated per eta-period — so after the first eta rotation the
-          // shard-leader VRF eta no longer tracks the gl0 eta. For numShards>1 validation within the
-          // first eta period this is exact; TODO(#shard-eta-rotation): thread the live rotated gl0 eta
-          // (from `epochStateRef`) into `computeShardEta` so the shard VRF domain rotates in lockstep.
+          // Slice S4 — shardEta ROTATES per eta-period: the producer takes `shardEtaFor: EtaPeriod => F[Array[Byte]]`
+          // and resolves it per `produce` call keyed on the CHECKPOINT'S own `epoch` (== rotationPeriod(gl0AnchorOrdinal)).
+          // The per-period gl0 eta comes from `etaForPeriodCallback` (the SAME `EtaStateManager.getEta` resolver GSAM's
+          // boundary writer uses); we convert the returned `Hash` to the 32 raw digest bytes (`Hex(h.value).toBytes` —
+          // the byte shape `computeShardEta` requires, mirroring `ShardSlotLeader.computeShardEta`) and feed
+          // `computeShardEta(shardId, gl0Eta)`. After the first gl0 eta rotation the shard-leader VRF domain now rotates
+          // in lockstep instead of being pinned to genesis randomness. Determinism: `eta_epoch` is fixed at the 2/3-mark
+          // of the prior period (`EtaCalculation`), so it is knowable at produce + verify time and every node keying the
+          // lookup on the wire-carried `checkpoint.epoch` derives byte-identical bytes.
           shardProducers <- shardAcceptanceDeps match {
             case None =>
               Async[F]
@@ -1211,30 +1214,41 @@ object GlobalSnapshotConsensus {
                 (cur, parentOpt) => parentOpt.fold(cur.value.value)(p => math.max(1L, cur.value.value - p.value.value))
               val sigmaInCommittee =
                 io.constellationnetwork.numerics.Ratio(1, math.max(1, deps.shardingConfig.committeeKTarget))
+              // Slice S4: per-period rotated gl0 eta → 32 raw digest bytes. `etaForPeriodCallback` is the SAME
+              // `EtaStateManager.getEta` resolver the GSAM boundary writer uses; it returns a hex `Hash`, which we decode
+              // to the 32-byte shape `computeShardEta` requires (mirrors `ShardSlotLeader.computeShardEta`'s own
+              // `Hex(h.value).toBytes`). Keyed on the checkpoint's `epoch`, this is byte-identical across all nodes.
+              val gl0EtaBytesForPeriod: io.constellationnetwork.schema.nakamoto.EtaPeriod => F[Array[Byte]] =
+                (epoch: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
+                  etaForPeriodCallback(epoch).map(h => io.constellationnetwork.security.hex.Hex(h.value).toBytes)
               deps.registry.toList.traverse {
                 case (shardId, entry) =>
-                  shardSlotLeader.computeShardEta(shardId, nakamotoGenesisEta).flatMap { shardEta =>
-                    io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer
-                      .make[F](
-                        shardId = shardId,
-                        chainStore = entry.chainStore,
-                        slotLeader = shardSlotLeader,
-                        publisher = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointPublisher
-                          .sidecar[F](sidecarClient),
-                        selfPeerId = selfId,
-                        selfKeyPair = keyPair,
-                        selfVrfSk = shardVrfSk,
-                        kesSigner = shardKesSigner,
-                        shardEta = shardEta,
-                        sigmaInCommittee = sigmaInCommittee,
-                        slotForGl0Anchor = slotForGl0Anchor,
-                        slotGapFor = slotGapFor,
-                        lddConfig = lddConfig,
-                        derivePerMgState =
-                          io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.noReExecDerivation[F]
-                      )
-                      .map(shardId -> _)
-                  }
+                  // Per-shard closure: resolve the rotated gl0 eta for the checkpoint's epoch, then domain-separate to
+                  // this shard's leader-VRF eta. Computed per `produce` call (keyed on `checkpoint.epoch`), NOT once at
+                  // construction — so the shard VRF domain rotates in lockstep with gl0.
+                  val shardEtaFor: io.constellationnetwork.schema.nakamoto.EtaPeriod => F[Array[Byte]] =
+                    (epoch: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
+                      gl0EtaBytesForPeriod(epoch).flatMap(gl0Eta => shardSlotLeader.computeShardEta(shardId, gl0Eta))
+                  io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer
+                    .make[F](
+                      shardId = shardId,
+                      chainStore = entry.chainStore,
+                      slotLeader = shardSlotLeader,
+                      publisher = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointPublisher
+                        .sidecar[F](sidecarClient),
+                      selfPeerId = selfId,
+                      selfKeyPair = keyPair,
+                      selfVrfSk = shardVrfSk,
+                      kesSigner = shardKesSigner,
+                      shardEtaFor = shardEtaFor,
+                      sigmaInCommittee = sigmaInCommittee,
+                      slotForGl0Anchor = slotForGl0Anchor,
+                      slotGapFor = slotGapFor,
+                      lddConfig = lddConfig,
+                      derivePerMgState =
+                        io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.noReExecDerivation[F]
+                    )
+                    .map(shardId -> _)
               }
                 .map(_.toMap)
                 .flatTap(m => nakLogger.info(s"🧩 Shard producers built: ${m.size} shard(s) (numShards>1 active)"))
@@ -1279,16 +1293,26 @@ object GlobalSnapshotConsensus {
                 (cur, parentOpt) => parentOpt.fold(cur.value.value)(p => math.max(1L, cur.value.value - p.value.value))
               val sigmaInCommittee =
                 io.constellationnetwork.numerics.Ratio(1, math.max(1, deps.shardingConfig.committeeKTarget))
-              // Precompute the per-shard leader-VRF eta map once (same `computeShardEta(shardId, nakamotoGenesisEta)`
-              // the producers use). Cheap pure hashing; recomputed here so the producer block above stays untouched.
-              deps.registry.toList.traverse {
-                case (shardId, _) => shardSlotLeader.computeShardEta(shardId, nakamotoGenesisEta).map(shardId -> _)
-              }
-                .map(_.toMap)
-                .map { shardEtas =>
-                  val tipTrackerFor =
-                    (sid: io.constellationnetwork.schema.sharding.ShardId) => deps.registry.get(sid).map(_.tipTracker)
-                  val shardEtaFor = (sid: io.constellationnetwork.schema.sharding.ShardId) => shardEtas.get(sid)
+              // Slice S4: epoch-aware per-shard leader-VRF eta resolver — MUST match the producer's `shardEtaFor`
+              // byte-for-byte for the same `(shardId, epoch)` so the attester's VRF message agrees. Same
+              // `etaForPeriodCallback` → 32-byte decode → `computeShardEta(shardId, gl0Eta)` chain. Keyed on the
+              // wire-carried `checkpoint.epoch` (passed to `emit`), NOT a wall-clock period, so a checkpoint produced
+              // near an eta boundary verifies identically after it. `None` for shards not in this node's registry —
+              // the same "shard not tracked locally" disposition the emitter skips on.
+              val gl0EtaBytesForPeriod: io.constellationnetwork.schema.nakamoto.EtaPeriod => F[Array[Byte]] =
+                (epoch: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
+                  etaForPeriodCallback(epoch).map(h => io.constellationnetwork.security.hex.Hex(h.value).toBytes)
+              val tipTrackerFor =
+                (sid: io.constellationnetwork.schema.sharding.ShardId) => deps.registry.get(sid).map(_.tipTracker)
+              val shardEtaFor: (io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.nakamoto.EtaPeriod) => F[
+                Option[Array[Byte]]
+              ] =
+                (sid: io.constellationnetwork.schema.sharding.ShardId, epoch: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
+                  if (deps.registry.contains(sid))
+                    gl0EtaBytesForPeriod(epoch).flatMap(gl0Eta => shardSlotLeader.computeShardEta(sid, gl0Eta)).map(Some(_))
+                  else Async[F].pure(Option.empty[Array[Byte]])
+              Async[F]
+                .pure(
                   Some(
                     io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter.make[F](
                       selfPeerId = selfId,
@@ -1305,7 +1329,7 @@ object GlobalSnapshotConsensus {
                       lddConfig = lddConfig
                     )
                   ): Option[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]]
-                }
+                )
                 .flatTap(_ => nakLogger.info("🧩 Shard checkpoint attestation emitter built (numShards>1 active)"))
                 .toResource
           }

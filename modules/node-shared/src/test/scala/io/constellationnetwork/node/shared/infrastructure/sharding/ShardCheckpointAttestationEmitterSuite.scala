@@ -116,7 +116,9 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         eligibilityChecker = ec,
         sidecarClient = recordingSidecar(published),
         tipTrackerFor = sid => if (sid == shardZero) Some(tracker) else None,
-        shardEtaFor = sid => if (sid == shardZero) Some(shardEta) else None,
+        // Slice S4: epoch-keyed eta resolver. Fixed precomputed eta for shardZero regardless of epoch — the emitter
+        // threads the resolved eta into its VRF membership proof; rotation correctness is covered in ShardSlotLeaderSuite.
+        shardEtaFor = (sid, _) => IO.pure(if (sid == shardZero) Some(shardEta) else None),
         sigmaInCommittee = Ratio(1, 4),
         slotForGl0Anchor = ord => Slot.unsafeApply(ord.value.value),
         slotGapFor = (cur, parentOpt) => parentOpt.fold(cur.value.value)(p => math.max(1L, cur.value.value - p.value.value)),
@@ -159,7 +161,7 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         eligibilityChecker = ec,
         sidecarClient = recordingSidecar(published),
         tipTrackerFor = _ => Some(tracker),
-        shardEtaFor = _ => None, // no eta for any shard ⇒ skip
+        shardEtaFor = (_, _) => IO.pure(Option.empty[Array[Byte]]), // no eta for any shard ⇒ skip
         sigmaInCommittee = Ratio(1, 4),
         slotForGl0Anchor = ord => Slot.unsafeApply(ord.value.value),
         slotGapFor = (cur, _) => cur.value.value,

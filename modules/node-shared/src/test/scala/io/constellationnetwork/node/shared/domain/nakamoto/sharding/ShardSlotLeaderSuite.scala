@@ -11,8 +11,8 @@ import io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
-import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig}
 import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.vrf.EcVrf25519
@@ -319,6 +319,138 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
           case Some((slot, proof)) =>
             ssl.verifyLeader(vkOther, shardEta, slot, slotGap, sigma, cfg, proof).map(v => expect(!v))
           case None => IO.pure(failure("did not find a winning slot for the wrong-VK test in 1000 attempts"))
+        }
+      } yield outcome
+  }
+
+  // ============ §7 Slice S4 — per-period eta rotation + producer/verifier agreement ==========
+  //
+  // Slice S4 makes `shardEta` rotate per eta-period instead of being pinned to genesis randomness. The producer/verifier
+  // wiring resolves `shardEta = computeShardEta(shardId, etaForPeriod(epoch))` keyed on the CHECKPOINT'S epoch. These tests
+  // model that resolver (a period → gl0Eta map) at the `ShardSlotLeader` level and pin the two load-bearing properties:
+  //   (a) ROTATION: distinct periods (distinct gl0 etas) ⇒ distinct shard etas, so the shard-leader lottery domain actually
+  //       changes across eta rotations (the regression S4 fixes — a fixed genesis eta gave the same domain forever).
+  //   (b) DETERMINISM INVARIANT: producer + verifier, both keying the SAME resolver on the SAME `(shardId, epoch)`, derive a
+  //       byte-identical shardEta and a leader's proof round-trips; keying on the WRONG epoch derives a different eta under
+  //       which the proof does NOT verify (the exact failure mode that would stall a shard chain if a verifier used the
+  //       wall-clock period instead of `checkpoint.epoch`).
+
+  /** A per-period gl0-eta resolver — the unit-test analog of production's `etaForPeriodCallback` (`EtaStateManager.getEta`). Each period
+    * maps to a distinct 32-byte gl0 eta; the shard layer derives `computeShardEta(shardId, etaForPeriod(epoch))`.
+    */
+  private def etaForPeriod(period: EtaPeriod): IO[Array[Byte]] = IO.pure {
+    val eta = new Array[Byte](ShardSlotLeader.EtaLength)
+    // Deterministic, period-dependent fill — distinct per period so two periods give distinct gl0 etas (and therefore,
+    // by §2's domain-separation property, distinct shard etas). Not a real eta derivation; just a stable per-period seed.
+    java.util.Arrays.fill(eta, (0x10 + period.value.toInt).toByte)
+    eta
+  }
+
+  /** The production resolver shape: `(shardId, epoch) => F[shardEta]` = `computeShardEta(shardId, etaForPeriod(epoch))`. */
+  private def resolveShardEta(ssl: ShardSlotLeader[IO], shardId: ShardId, epoch: EtaPeriod)(implicit h: Hasher[IO]): IO[Array[Byte]] =
+    etaForPeriod(epoch).flatMap(gl0Eta => ssl.computeShardEta(shardId, gl0Eta))
+
+  test("S4 rotation: computeShardEta over two distinct period etas yields distinct shard etas") {
+    case (hasher, _, ssl) =>
+      implicit val h: Hasher[IO] = hasher
+      val shardId = ShardId.unsafeApply(2)
+      for {
+        etaP0 <- resolveShardEta(ssl, shardId, EtaPeriod(0L))
+        etaP1 <- resolveShardEta(ssl, shardId, EtaPeriod(1L))
+        etaP2 <- resolveShardEta(ssl, shardId, EtaPeriod(2L))
+        // Same period ⇒ identical (the resolver is pure), confirming the rotation is keyed on the period, not nondeterminism.
+        etaP1again <- resolveShardEta(ssl, shardId, EtaPeriod(1L))
+      } yield
+        expect(!java.util.Arrays.equals(etaP0, etaP1), "period 0 and period 1 shard etas must differ (rotation)")
+          .and(expect(!java.util.Arrays.equals(etaP1, etaP2), "period 1 and period 2 shard etas must differ (rotation)"))
+          .and(expect(!java.util.Arrays.equals(etaP0, etaP2), "period 0 and period 2 shard etas must differ (rotation)"))
+          .and(expect(java.util.Arrays.equals(etaP1, etaP1again), "same period ⇒ identical shard eta (deterministic)"))
+  }
+
+  test(
+    "S4 determinism: producer + verifier keyed on the same (shardId, epoch) derive identical shardEta and a leader's proof round-trips"
+  ) {
+    case (hasher, _, ssl) =>
+      implicit val h: Hasher[IO] = hasher
+      val cfg = LddConfig.Default
+      val sigma = Ratio(1, 2) // higher σ ⇒ win a slot quickly
+      val slotGap = 100L
+      val shardId = ShardId.unsafeApply(5)
+      val epoch = EtaPeriod(7L)
+      val sk = randomSk()
+      val vk = vrf.getVerificationKey(sk)
+
+      def loop(shardEta: Array[Byte], attempt: Int): IO[Option[(Slot, Array[Byte])]] =
+        if (attempt >= 1000) IO.pure(None)
+        else {
+          val slot = Slot.unsafeApply(attempt.toLong)
+          ssl.isLeader(sk, shardEta, slot, slotGap, sigma, cfg).flatMap {
+            case Some((proof, _)) => IO.pure(Some((slot, proof)))
+            case None             => loop(shardEta, attempt + 1)
+          }
+        }
+
+      for {
+        // Producer resolves the eta for the checkpoint's epoch...
+        producerEta <- resolveShardEta(ssl, shardId, epoch)
+        // ...verifier independently resolves it for the SAME (shardId, epoch).
+        verifierEta <- resolveShardEta(ssl, shardId, epoch)
+        winOpt <- loop(producerEta, 0)
+        outcome <- winOpt match {
+          case Some((slot, proof)) =>
+            ssl.verifyLeader(vk, verifierEta, slot, slotGap, sigma, cfg, proof).map { verifiedSameEpoch =>
+              expect(
+                java.util.Arrays.equals(producerEta, verifierEta),
+                "producer + verifier shard etas for the same epoch must be byte-identical"
+              )
+                .and(expect(verifiedSameEpoch, "leader proof verifies under the verifier's same-epoch shard eta"))
+            }
+          case None => IO.pure(failure("did not find a winning slot for the S4 determinism test in 1000 attempts at σ=1/2"))
+        }
+      } yield outcome
+  }
+
+  test("S4 determinism failure mode: a verifier keyed on the WRONG epoch derives a different eta and the leader's proof does NOT verify") {
+    case (hasher, _, ssl) =>
+      implicit val h: Hasher[IO] = hasher
+      val cfg = LddConfig.Default
+      val sigma = Ratio(1, 2)
+      val slotGap = 100L
+      val shardId = ShardId.unsafeApply(5)
+      val producerEpoch = EtaPeriod(7L)
+      val wrongEpoch = EtaPeriod(8L) // e.g. a verifier mistakenly using the current wall-clock period after a boundary
+      val sk = randomSk()
+      val vk = vrf.getVerificationKey(sk)
+
+      def loop(shardEta: Array[Byte], attempt: Int): IO[Option[(Slot, Array[Byte])]] =
+        if (attempt >= 1000) IO.pure(None)
+        else {
+          val slot = Slot.unsafeApply(attempt.toLong)
+          ssl.isLeader(sk, shardEta, slot, slotGap, sigma, cfg).flatMap {
+            case Some((proof, _)) => IO.pure(Some((slot, proof)))
+            case None             => loop(shardEta, attempt + 1)
+          }
+        }
+
+      for {
+        producerEta <- resolveShardEta(ssl, shardId, producerEpoch)
+        wrongEpochEta <- resolveShardEta(ssl, shardId, wrongEpoch)
+        _ = require(!java.util.Arrays.equals(producerEta, wrongEpochEta), "test setup: the two epoch etas must differ")
+        winOpt <- loop(producerEta, 0)
+        outcome <- winOpt match {
+          case Some((slot, proof)) =>
+            for {
+              verifiedUnderProducerEpoch <- ssl.verifyLeader(vk, producerEta, slot, slotGap, sigma, cfg, proof)
+              verifiedUnderWrongEpoch <- ssl.verifyLeader(vk, wrongEpochEta, slot, slotGap, sigma, cfg, proof)
+            } yield
+              expect(verifiedUnderProducerEpoch, "control: proof verifies under the producer's epoch eta")
+                .and(
+                  expect(
+                    !verifiedUnderWrongEpoch,
+                    "proof for the producer's epoch MUST NOT verify under a wrong-epoch eta — this is why the lookup MUST key on checkpoint.epoch"
+                  )
+                )
+          case None => IO.pure(failure("did not find a winning slot for the S4 failure-mode test in 1000 attempts at σ=1/2"))
         }
       } yield outcome
   }

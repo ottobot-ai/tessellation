@@ -83,8 +83,9 @@ trait ShardCheckpointAttestationEmitter[F[_]] {
     *   the checkpoint's gl0 anchor ordinal. Mapped to the shard-local slot via the same `slotForGl0Anchor` the producer uses, so the VRF
     *   message `(shardEta, slot)` is byte-equivalent on producer + attester.
     * @param epoch
-    *   the checkpoint's sortition epoch — carried through for symmetry with the producer (not load-bearing on the attestation wire today,
-    *   but kept on the signature path for the v2 VRF-enumeration follow-up).
+    *   the checkpoint's sortition epoch (the wire-carried `checkpoint.epoch`). Slice S4: load-bearing — it is the key for the
+    *   shard-leader-VRF eta lookup (`shardEtaFor(shardId, epoch)`). The producer signed its leader proof under the eta of THIS epoch, so
+    *   the attester MUST resolve the eta for the SAME epoch (not a wall-clock period) to compute a byte-equivalent VRF message.
     * @param parentGl0AnchorOpt
     *   the parent checkpoint's gl0 anchor ordinal (genesis ⇒ `None`). The emitter maps it through the same `slotForGl0Anchor` to recover
     *   the parent's shard-local slot for the LDD `slotGap`, mirroring `ShardCheckpointProducer`'s parent-slot derivation. Passing the
@@ -124,8 +125,12 @@ object ShardCheckpointAttestationEmitter {
     *   `shardId => registry.get(shardId).map(_.tipTracker)`). The self-record writes here so `allAttestations` stays complete; the local
     *   threshold count still excludes self by default.
     * @param shardEtaFor
-    *   `shardId => Option[Array[Byte]]` — the precomputed 32-byte per-shard leader-VRF eta (`ShardSlotLeader.computeShardEta`). MUST be the
-    *   SAME value the producer used for this shard so the VRF message matches.
+    *   `(shardId, epoch) => F[Option[Array[Byte]]]` — resolves the 32-byte per-shard leader-VRF eta (`ShardSlotLeader.computeShardEta`) for
+    *   the GIVEN eta-period (Slice S4). `None` ⇒ this shard is not a tracked committee shard locally (skip silently). MUST be derived from
+    *   the eta of the CHECKPOINT'S epoch (the `emit` `epoch` arg, sourced from the wire-carried `checkpoint.epoch`), NOT a wall-clock
+    *   period — a checkpoint produced near an eta boundary may be verified after it, so producer + every verifier MUST key the eta lookup
+    *   on `checkpoint.epoch` to derive byte-identical bytes (the load-bearing determinism invariant: divergent shardEta ⇒ `verifyLeader`
+    *   disagreement ⇒ the shard chain stalls). Production wiring closes over `etaForPeriod(epoch) ⇒ computeShardEta(shardId, gl0Eta)`.
     * @param sigmaInCommittee
     *   this operator's stake share within the shard committee (v1 stable-σ rule: `1 / K_S`). Not load-bearing for the proof bytes (the
     *   proof is over `(shardEta, slot)` only) but carried for symmetry / future threshold use.
@@ -144,7 +149,7 @@ object ShardCheckpointAttestationEmitter {
     eligibilityChecker: EligibilityChecker[F],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTrackerFor: ShardId => Option[ShardTipTracker[F]],
-    shardEtaFor: ShardId => Option[Array[Byte]],
+    shardEtaFor: (ShardId, EtaPeriod) => F[Option[Array[Byte]]],
     sigmaInCommittee: Ratio,
     slotForGl0Anchor: SnapshotOrdinal => Slot,
     slotGapFor: (Slot, Option[Slot]) => Long,
@@ -164,7 +169,12 @@ object ShardCheckpointAttestationEmitter {
         epoch: EtaPeriod,
         parentGl0AnchorOpt: Option[SnapshotOrdinal]
       ): F[Unit] =
-        shardEtaFor(shardId) match {
+        // Slice S4: resolve the shard-leader-VRF eta keyed on the CHECKPOINT'S epoch (the wire-carried `checkpoint.epoch`, passed in as
+        // `epoch`), NOT a wall-clock period. The producer signed its leader proof under `computeShardEta(shardId, etaForPeriod(epoch))`;
+        // every verifier MUST re-derive the SAME eta for the SAME `epoch` or `ShardSlotLeader.verifyLeader` disagrees and the shard chain
+        // stalls. `epoch == rotationPeriod(gl0AnchorOrdinal)` and `eta_epoch` is fixed at the 2/3-mark of the prior period, so it is knowable
+        // here even for a checkpoint produced near an eta boundary and verified after it.
+        shardEtaFor(shardId, epoch).flatMap {
           case None =>
             // No leader-VRF eta for this shard ⇒ we don't track it as a committee participant. Skip silently (debug) — this is the
             // same "shard not tracked locally" disposition the acceptance side uses; we simply don't attest.
@@ -176,7 +186,7 @@ object ShardCheckpointAttestationEmitter {
             // The canonical hash bytes every committee member signs (design doc §3.3). UTF-8 of the hex Hash string — identical to the
             // producer's `preimageHash.getBytes` path.
             val msgBytes = checkpointHash.value.getBytes(StandardCharsets.UTF_8)
-            val _ = (slotGap, epoch) // slotGap/epoch are part of the membership-draw context; v1 proof is over (shardEta, slot).
+            val _ = slotGap // slotGap is part of the membership-draw context; v1 proof is over (shardEta, slot).
             for {
               // VRF membership proof over `(shardEta, slot)` — the SAME message the slot-leader lottery draws from. Deterministic +
               // verifiable later via `ShardSlotLeader.verifyLeader`. NOT a leadership claim: a non-leader still has a valid proof of having

@@ -140,7 +140,9 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
       selfKeyPair = keyPair,
       selfVrfSk = randomVrfSk(),
       kesSigner = stubKesSigner,
-      shardEta = shardEta,
+      // Slice S4: epoch-keyed eta resolver; the fan-out tests don't exercise eta rotation, so a constant precomputed
+      // shardEta (independent of epoch) keeps the slot-leader draw deterministic.
+      shardEtaFor = _ => IO.pure(shardEta),
       sigmaInCommittee = sigma,
       slotForGl0Anchor = slotForGl0Anchor,
       slotGapFor = slotGapFor,

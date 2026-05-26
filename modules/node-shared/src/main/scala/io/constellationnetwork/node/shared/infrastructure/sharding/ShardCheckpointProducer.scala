@@ -237,9 +237,17 @@ object ShardCheckpointProducer {
     * @param kesSigner
     *   this operator's KES product signer. Yields the `kesTreeStep` + `kesProductSig` carried on the envelope's
     *   [[CommitteeMemberSignature]]. The injectable trait shape keeps the producer testable without a full KES bootstrap.
-    * @param shardEta
-    *   pre-computed shard-eta bytes (32 bytes, output of `slotLeader.computeShardEta(shardId, gl0Eta)`). Caller pre-computes once per
-    *   gl0-eta-rotation rather than re-computing on every `produce(...)` call — it doesn't change within an eta period.
+    * @param shardEtaFor
+    *   `epoch => F[shardEta]` — resolves the 32-byte shard-leader-VRF eta for the GIVEN eta-period (Slice S4). The producer calls this once
+    *   per `produce(...)` keyed on the checkpoint's own `epoch` arg, so the shard-leader lottery rotates in lockstep with the gl0 eta
+    *   instead of being pinned to genesis randomness. Production wiring closes over `etaForPeriod(epoch) ⇒ computeShardEta(shardId,
+    *   gl0Eta)` (the per-period rotated gl0 eta from `EtaStateManager.getEta`); tests pass a closure returning a fixed precomputed eta.
+    *
+    * '''Determinism invariant (Slice S4).''' The eta MUST be resolved for the CHECKPOINT'S epoch (the `epoch` arg threaded onto the
+    * envelope), NOT the current wall-clock period — a checkpoint produced near an eta boundary may be verified after the boundary, and
+    * producer + every verifier must derive the SAME shard-leader eta or `verifyLeader` disagrees and the shard chain stalls. The eta for
+    * the checkpoint's epoch is always knowable here: `epoch == rotationPeriod(gl0AnchorOrdinal)` and `eta_N` is fixed at the 2/3-mark of
+    * period `N-1` (per `EtaCalculation`), strictly before any ordinal in period `N`.
     * @param sigmaInCommittee
     *   this operator's stake share within the shard committee. Per v1 stable-σ rule (`[[project-216-committee-stake-drift-fix]]`) this is
     *   `1 / K_S`. Production wiring passes the typed value; tests inject directly.
@@ -269,7 +277,7 @@ object ShardCheckpointProducer {
     selfKeyPair: KeyPair,
     selfVrfSk: Array[Byte],
     kesSigner: KesSigner[F],
-    shardEta: Array[Byte],
+    shardEtaFor: EtaPeriod => F[Array[Byte]],
     sigmaInCommittee: Ratio,
     slotForGl0Anchor: SnapshotOrdinal => Slot,
     slotGapFor: (Slot, Option[Slot]) => Long,
@@ -306,63 +314,70 @@ object ShardCheckpointProducer {
             val currentSlot: Slot = slotForGl0Anchor(gl0AnchorOrdinal)
             val slotGap: Long = slotGapFor(currentSlot, parentSlotOpt)
 
-            slotLeader
-              .isLeader(selfVrfSk, shardEta, currentSlot, slotGap, sigmaInCommittee, lddConfig)
-              .flatMap {
-                case None =>
-                  // Not the slot leader — per design doc §6.3, other committee members attest later via gossip (slice 14).
-                  logger
-                    .debug(
-                      s"produce: not slot leader at slot=${currentSlot.value.value} gl0Anchor=${gl0AnchorOrdinal.value.value}; " +
-                        s"deferring to gossip-path attestation (slice 14)"
-                    )
-                    .as(None: Option[Signed[ShardCheckpoint]])
+            // Slice S4: resolve the shard-leader-VRF eta for the CHECKPOINT'S OWN `epoch` (the one stamped on the envelope below), NOT a
+            // wall-clock period. `epoch == rotationPeriod(gl0AnchorOrdinal)`, and `eta_epoch` is fixed at the 2/3-mark of the prior period
+            // (`EtaCalculation`), so it is knowable here and every verifier — who keys the same lookup on the wire-carried `checkpoint.epoch`
+            // — derives byte-identical bytes. This is the load-bearing determinism invariant: if producer + verifier disagreed on shardEta,
+            // `ShardSlotLeader.verifyLeader` would reject and the shard chain would stall.
+            shardEtaFor(epoch).flatMap { shardEta =>
+              slotLeader
+                .isLeader(selfVrfSk, shardEta, currentSlot, slotGap, sigmaInCommittee, lddConfig)
+                .flatMap {
+                  case None =>
+                    // Not the slot leader — per design doc §6.3, other committee members attest later via gossip (slice 14).
+                    logger
+                      .debug(
+                        s"produce: not slot leader at slot=${currentSlot.value.value} gl0Anchor=${gl0AnchorOrdinal.value.value}; " +
+                          s"deferring to gossip-path attestation (slice 14)"
+                      )
+                      .as(None: Option[Signed[ShardCheckpoint]])
 
-                case Some((vrfProof, _)) =>
-                  // Won the lottery — build the checkpoint, sign it, publish it.
-                  for {
-                    delta <- assembleDelta(pendingSnapshots)
-                    checkpoint = ShardCheckpoint(
-                      shardId = shardId,
-                      parentCheckpointHash = parentHash,
-                      shardOrdinal = nextShardOrdinal,
-                      gl0AnchorOrdinal = gl0AnchorOrdinal,
-                      derivedStateDelta = delta,
-                      emittedReceipts = List.empty,
-                      // Placeholder — populated below by replacing with the real committee-member sig. NonEmptyList requires at least one
-                      // element to construct; we use a throwaway sentinel and overwrite in `.copy(...)`. Cleaner than threading the
-                      // signing into the case-class constructor.
-                      committeeSignatures = NonEmptyList.of(placeholderSig),
-                      epoch = epoch
-                    )
-                    // Compute the canonical preimage hash via Hasher[F]. This is the bytes every committee member signs (design doc §3.3).
-                    preimageHash <- Hasher[F].hash(checkpoint.signingPreimage)
-                    // Sign with Ed25519 long-term + KES product. Both sign the canonical preimage hash's UTF-8 bytes (`getBytes` matches
-                    // the `MetagraphCommitteeGate.messageBytes` pattern — Hasher result's UTF-8 byte form is what other sign paths use).
-                    msgBytes = preimageHash.getBytes
-                    edSig <- Signing.signData[F](msgBytes)(selfKeyPair.getPrivate)
-                    kesStep <- kesSigner.currentPeriod
-                    kesSig <- kesSigner.signAt(kesStep, msgBytes)
-                    committeeSig = CommitteeMemberSignature(
-                      peerId = selfPeerId,
-                      vrfProof = Hex.fromBytes(vrfProof),
-                      ed25519Sig = Hex.fromBytes(edSig),
-                      kesProductSig = Hex.fromBytes(kesSig),
-                      kesTreeStep = kesStep
-                    )
-                    finalCheckpoint = checkpoint.copy(committeeSignatures = NonEmptyList.of(committeeSig))
-                    // Wrap in Signed envelope. The outer Signed contract uses the operator's long-term Ed25519 signature over the
-                    // envelope's value bytes; this is the canonical "this operator authored this message" attestation that gl0 and other
-                    // peers use to authenticate the gossip path. Mirrors how `GlobalIncrementalSnapshot` is signed.
-                    proof <- SignatureProof.fromHash(selfKeyPair, preimageHash)
-                    signedCheckpoint = Signed(finalCheckpoint, NonEmptySet.of(proof))
-                    _ <- publisher.publish(signedCheckpoint)
-                    _ <- logger.info(
-                      s"produce: emitted shardOrdinal=${nextShardOrdinal.value} gl0Anchor=${gl0AnchorOrdinal.value.value} " +
-                        s"slot=${currentSlot.value.value} mgs=${pendingSnapshots.keys.size} kesStep=$kesStep"
-                    )
-                  } yield Some(signedCheckpoint): Option[Signed[ShardCheckpoint]]
-              }
+                  case Some((vrfProof, _)) =>
+                    // Won the lottery — build the checkpoint, sign it, publish it.
+                    for {
+                      delta <- assembleDelta(pendingSnapshots)
+                      checkpoint = ShardCheckpoint(
+                        shardId = shardId,
+                        parentCheckpointHash = parentHash,
+                        shardOrdinal = nextShardOrdinal,
+                        gl0AnchorOrdinal = gl0AnchorOrdinal,
+                        derivedStateDelta = delta,
+                        emittedReceipts = List.empty,
+                        // Placeholder — populated below by replacing with the real committee-member sig. NonEmptyList requires at least one
+                        // element to construct; we use a throwaway sentinel and overwrite in `.copy(...)`. Cleaner than threading the
+                        // signing into the case-class constructor.
+                        committeeSignatures = NonEmptyList.of(placeholderSig),
+                        epoch = epoch
+                      )
+                      // Compute the canonical preimage hash via Hasher[F]. This is the bytes every committee member signs (design doc §3.3).
+                      preimageHash <- Hasher[F].hash(checkpoint.signingPreimage)
+                      // Sign with Ed25519 long-term + KES product. Both sign the canonical preimage hash's UTF-8 bytes (`getBytes` matches
+                      // the `MetagraphCommitteeGate.messageBytes` pattern — Hasher result's UTF-8 byte form is what other sign paths use).
+                      msgBytes = preimageHash.getBytes
+                      edSig <- Signing.signData[F](msgBytes)(selfKeyPair.getPrivate)
+                      kesStep <- kesSigner.currentPeriod
+                      kesSig <- kesSigner.signAt(kesStep, msgBytes)
+                      committeeSig = CommitteeMemberSignature(
+                        peerId = selfPeerId,
+                        vrfProof = Hex.fromBytes(vrfProof),
+                        ed25519Sig = Hex.fromBytes(edSig),
+                        kesProductSig = Hex.fromBytes(kesSig),
+                        kesTreeStep = kesStep
+                      )
+                      finalCheckpoint = checkpoint.copy(committeeSignatures = NonEmptyList.of(committeeSig))
+                      // Wrap in Signed envelope. The outer Signed contract uses the operator's long-term Ed25519 signature over the
+                      // envelope's value bytes; this is the canonical "this operator authored this message" attestation that gl0 and other
+                      // peers use to authenticate the gossip path. Mirrors how `GlobalIncrementalSnapshot` is signed.
+                      proof <- SignatureProof.fromHash(selfKeyPair, preimageHash)
+                      signedCheckpoint = Signed(finalCheckpoint, NonEmptySet.of(proof))
+                      _ <- publisher.publish(signedCheckpoint)
+                      _ <- logger.info(
+                        s"produce: emitted shardOrdinal=${nextShardOrdinal.value} gl0Anchor=${gl0AnchorOrdinal.value.value} " +
+                          s"slot=${currentSlot.value.value} mgs=${pendingSnapshots.keys.size} kesStep=$kesStep"
+                      )
+                    } yield Some(signedCheckpoint): Option[Signed[ShardCheckpoint]]
+                }
+            }
           }
         }
 
