@@ -62,8 +62,11 @@ object NakamotoSyncDaemon {
 
   /** Derive VRF output from proof bytes. The chain store needs the output (not the proof) for eta computation. The producer stores
     * vrfOutput directly, but gossip only carries the proof — we must derive the output here to match what the producer stored.
+    *
+    * Visibility `private[nakamoto]` (Gap A/B shard wiring): `SnapshotLeaderLoop`'s shard-producer store path uses the SAME derivation to
+    * recompute the producer's own checkpoint vrfOutput, so producer + receiver store byte-identical values for the same checkpoint.
     */
-  private def vrfOutputFromProof(proofBytes: Array[Byte]): Array[Byte] =
+  private[nakamoto] def vrfOutputFromProof(proofBytes: Array[Byte]): Array[Byte] =
     vrf.vrfProofToHash(proofBytes).getOrElse(proofBytes) // fallback to raw proof if derivation fails
 
   /** Ethereum-style mempool reconciliation after catch-up/reorg.
@@ -291,7 +294,15 @@ object NakamotoSyncDaemon {
     processOrphanedMetagraphBinary: (
       io.constellationnetwork.schema.address.Address,
       Array[Byte]
-    ) => F[Unit]
+    ) => F[Unit],
+    // ─── Hierarchical-shard-checkpoints v1 — Gap B receiver routing ──────────────────────────────
+    // Acceptance-side per-shard deps (registry of `(chainStore, tipTracker, finalityTriggers)` +
+    // acceptance manager). `None` at `numShards = 1` (regression bar) ⇒ incoming `ShardCheckpoint` /
+    // `ShardCheckpointAttestation` gossip is dropped with a single debug log, byte-identical to the
+    // pre-wiring daemon. `Some(deps)` activates cross-node checkpoint reconstruction + chain growth.
+    shardAcceptanceDeps: Option[
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[F]
+    ] = None
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -505,18 +516,20 @@ object NakamotoSyncDaemon {
                           case pb.GossipMessage.Body.TokenLockBlock(blk) =>
                             handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)
 
-                          // Slice 14: shard-checkpoint envelope + attestation gossip routing. Wire format landed in this slice; the
-                          // load-bearing receiver-side handler that decodes + routes to `ShardCheckpointGl0AcceptanceManager` (Slice 9)
-                          // is a follow-up slice. For now we surface arrivals as a low-frequency log so an operator can confirm the
-                          // gossip path is alive without taking a dependency on Slice 9 here. The handler returns immediately — no
-                          // blocking work on the gossip evalMap thread.
-                          case _: pb.GossipMessage.Body.ShardCheckpoint =>
-                            logger.debug("Received pb.GossipMessage.Body.ShardCheckpoint — handler deferred to Slice 9 wiring")
+                          // Gap B: shard-checkpoint envelope + attestation gossip routing (load-bearing cross-node
+                          // reconstruction). `shardAcceptanceDeps = None` (numShards=1, regression bar) ⇒ both
+                          // handlers drop with a single debug log. When active, the checkpoint is decoded,
+                          // reconstructed into a `Signed[ShardCheckpoint]` (the wire drops slot/vrfOutput — both are
+                          // recovered deterministically), stored into the per-shard chain store so the chain grows
+                          // cross-node, each committee signer is recorded into the tip tracker (so `T_count_shard`
+                          // reaches quorum), and the acceptance manager is run diagnostically. Background-fire with
+                          // `Async.start` so the multi-step verify never blocks the gossip evalMap thread (mirrors
+                          // the MetagraphAttestation handling above).
+                          case pb.GossipMessage.Body.ShardCheckpoint(cp) =>
+                            Async[F].start(handleShardCheckpoint(cp, shardAcceptanceDeps, logger)).void
 
-                          case _: pb.GossipMessage.Body.ShardCheckpointAttestation =>
-                            logger.debug(
-                              "Received pb.GossipMessage.Body.ShardCheckpointAttestation — handler deferred to Slice 9 wiring"
-                            )
+                          case pb.GossipMessage.Body.ShardCheckpointAttestation(att) =>
+                            Async[F].start(handleShardCheckpointAttestation(att, shardAcceptanceDeps, logger)).void
 
                           case _: pb.GossipMessage.Body.Rumor =>
                             Async[F].unit
@@ -1541,6 +1554,120 @@ object NakamotoSyncDaemon {
         }
     }
   }
+
+  /** Gap B — handle an incoming `ShardCheckpointWire` from gossip (load-bearing cross-node reconstruction).
+    *
+    * Steps (per the wiring plan §B):
+    *   1. Decode the wire into the schema-side `ShardCheckpoint` via `ShardCheckpointWireCodecs.shardCheckpointFromWire`.
+    *   1. Look up `deps.registry.get(shardId)`; drop if the shard is untracked locally.
+    *   1. Reconstruct slot + vrfOutput (the wire drops both): the slot is derived the SAME deterministic way the producer uses —
+    *      `Slot(gl0AnchorOrdinal.value)` (shard-LOCAL, not gl0 wall-clock slot); vrfOutput is recovered from the producer's first
+    *      `CommitteeMemberSignature.vrfProof` via `vrfOutputFromProof` (the same recovery the gl0 snapshot path uses), so both the
+    *      producer's own store and every receiver store byte-identical vrfOutput. Re-wrap the bare `ShardCheckpoint` into a
+    *      `Signed[ShardCheckpoint]` from the committee signatures present (the codec scaladoc describes the re-wrap — the producer's own
+    *      committee `ed25519Sig` IS `signData(preimageHash)`, byte-identical to the outer `Signed` proof it built).
+    *   1. Store into `entry.chainStore` so the chain grows + depth/attestation finality can advance across nodes.
+    *   1. Record each `committeeSignatures` signer into `entry.tipTracker.recordAttestation` so `T_count_shard` can reach quorum.
+    *   1. Run `deps.acceptanceManager.evaluate(checkpoint)` and log the result diagnostically.
+    *
+    * `None` deps (numShards=1, regression bar) ⇒ single debug log + drop.
+    */
+  private def handleShardCheckpoint[F[_]: Async: JsonSerializer: HasherSelector: Metrics](
+    cp: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar.ShardCheckpointWire,
+    shardAcceptanceDeps: Option[
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[F]
+    ],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] =
+    shardAcceptanceDeps match {
+      case None =>
+        logger.debug("Received ShardCheckpoint but sharding inactive (numShards=1); dropping")
+      case Some(deps) =>
+        io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWireCodecs
+          .shardCheckpointFromWire[F](cp)
+          .flatMap { checkpoint =>
+            deps.registry.get(checkpoint.shardId) match {
+              case None =>
+                logger.debug(
+                  s"Received ShardCheckpoint for untracked shard=${checkpoint.shardId.value.value}; dropping"
+                )
+              case Some(entry) =>
+                // Reconstruct the Signed[ShardCheckpoint] envelope from the committee signatures. Each
+                // CommitteeMemberSignature carries (peerId, ed25519Sig); SignatureProof(peerId.toId,
+                // Signature(ed25519Sig)) is byte-faithful to what the producer built (the producer's own
+                // committee ed25519Sig == its outer Signed proof signature; see codec scaladoc).
+                val proofs = checkpoint.committeeSignatures.map { sig =>
+                  io.constellationnetwork.security.signature.signature.SignatureProof(
+                    sig.peerId.toId,
+                    io.constellationnetwork.security.signature.signature.Signature(sig.ed25519Sig)
+                  )
+                }
+                val proofSet = cats.data.NonEmptySet.of(proofs.head, proofs.tail: _*)
+                val signedCheckpoint = Signed(checkpoint, proofSet)
+                // Reconstruct slot + vrfOutput deterministically (the wire drops both).
+                val localSlot = checkpoint.gl0AnchorOrdinal.value.value
+                val vrfOut = vrfOutputFromProof(checkpoint.committeeSignatures.head.vrfProof.toBytes)
+                HasherSelector[F].withCurrent { implicit hasher =>
+                  hasher.hash(checkpoint.signingPreimage).flatMap { checkpointHash =>
+                    entry.chainStore
+                      .store(signedCheckpoint, checkpoint.parentCheckpointHash, checkpoint.shardOrdinal, localSlot, vrfOut)
+                      .flatMap { stored =>
+                        // Record every committee signer into the tip tracker so T_count_shard can reach quorum.
+                        checkpoint.committeeSignatures.toList
+                          .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId)) >>
+                          deps.acceptanceManager.evaluate(checkpoint).flatMap { result =>
+                            logger.info(
+                              s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
+                                s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
+                                s"signers=${checkpoint.committeeSignatures.size} storedNew=$stored evaluate=$result"
+                            )
+                          }
+                      }
+                  }
+                }
+            }
+          }
+          .handleErrorWith { err =>
+            logger.warn(s"⚠️ Failed to handle ShardCheckpoint: ${err.getMessage}")
+          }
+    }
+
+  /** Gap B — handle an incoming `ShardCheckpointAttestationWire` from gossip. Decode + record the attester into the per-shard tip tracker
+    * so `T_count_shard` can reach quorum from after-the-fact (non-producing) committee attestations. `None` deps (numShards=1) ⇒ drop with
+    * a debug log.
+    */
+  private def handleShardCheckpointAttestation[F[_]: Async: Metrics](
+    att: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar.ShardCheckpointAttestationWire,
+    shardAcceptanceDeps: Option[
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[F]
+    ],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] =
+    shardAcceptanceDeps match {
+      case None =>
+        logger.debug("Received ShardCheckpointAttestation but sharding inactive (numShards=1); dropping")
+      case Some(deps) =>
+        io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWireCodecs
+          .shardCheckpointAttestationFromWire[F](att)
+          .flatMap { attestation =>
+            deps.registry.get(attestation.shardId) match {
+              case None =>
+                logger.debug(
+                  s"Received ShardCheckpointAttestation for untracked shard=${attestation.shardId.value.value}; dropping"
+                )
+              case Some(entry) =>
+                entry.tipTracker
+                  .recordAttestation(attestation.checkpointHash, attestation.attesterSignature.peerId) >>
+                  logger.debug(
+                    s"🧩 ShardCheckpointAttestation rx shard=${attestation.shardId.value.value} " +
+                      s"checkpoint=${attestation.checkpointHash.value.take(12)} attester=${attestation.attesterSignature.peerId.value.value.take(12)}"
+                  )
+            }
+          }
+          .handleErrorWith { err =>
+            logger.warn(s"⚠️ Failed to handle ShardCheckpointAttestation: ${err.getMessage}")
+          }
+    }
 
   /** Route an incoming state channel binary from gossip into the [[MetagraphCommitteeGate]] (Slice S3, load-bearing) — the gate computes
     * the committee sortition for THIS node, emits an attestation if we're in the committee, and waits for ≥ ⌈2 K_target / 3⌉ attestations
