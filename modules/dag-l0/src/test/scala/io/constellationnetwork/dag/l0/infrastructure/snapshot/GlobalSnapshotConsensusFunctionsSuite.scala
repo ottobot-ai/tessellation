@@ -332,6 +332,10 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
   }
 
   def mkGlobalSnapshotConsensusFunctions(
+    shardAcceptanceDeps: Option[
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[IO]
+    ] = None
+  )(
     implicit j: JsonSerializer[IO],
     sp: SecurityProvider[IO],
     h: Hasher[IO],
@@ -423,7 +427,8 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           SnapshotOrdinal.MinValue,
           SnapshotOrdinal.MinValue,
           mptStore,
-          mptOverlay
+          mptOverlay,
+          shardAcceptanceDeps
         )
     } yield globalSnapshotConsensusFunction
   }
@@ -437,7 +442,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
     for {
       keyPair <- KeyPairGenerator.makeKeyPair[F]
 
-      gscf <- mkGlobalSnapshotConsensusFunctions
+      gscf <- mkGlobalSnapshotConsensusFunctions()
       facilitators = Set.empty[PeerId]
 
       genesis = GlobalSnapshot.mkGenesis(Map.empty, EpochProgress.MinValue)
@@ -505,6 +510,84 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         _ => None.pure[IO]
       )
     } yield expect.same(true, result.isLeft)
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────────────────────────
+  // R2 — follower-replay invariant (split-safety): `validateArtifact` always re-derives with
+  // `sourceShardCheckpoints = false`. A follower whose shard deps are PRESENT (numShards > 1) but whose
+  // local shard chain is EMPTY still validates a leader's artifact by REPLAYING the embedded
+  // `stateChannelSnapshots` as ordinary SC events — it does NOT re-source node-local shard finality state.
+  //
+  // This is the entire reason the decoupled design is split-safe: followers reach byte-identical state
+  // only by replaying the leader's embedded binaries, never by re-running their own shard sourcing on the
+  // validate path. The invariant is statically guaranteed in source (`validateArtifact` → `usingJson` →
+  // `createProposalArtifactInternal(..., sourceShardCheckpoints = false)`); this test exercises it through
+  // a follower wired WITH active sharding deps so a regression that flipped the follower to source would
+  // surface as a mismatch (the followers's empty-chain source would still be empty here, but the test pins
+  // the contract that the validate path tolerates + ignores present sharding deps).
+  // ───────────────────────────────────────────────────────────────────────────────────────────────
+  test(
+    "R2 follower-replay: validateArtifact (sourceShardCheckpoints=false) succeeds for a follower with active shard deps + EMPTY shard chain"
+  ) { res =>
+    implicit val (_, j, h, sp, m) = res
+
+    val shardingCfg: ShardingConfig =
+      ShardingConfig(
+        numShards = 4,
+        committeeKTarget = 4,
+        finality = ShardFinalityConfig(k1Shard = 8L),
+        checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100),
+        observability = ShardObservabilityConfig(tPartitionHardMs = 600000L),
+        slashing = ShardSlashingConfig(maxMissedPctPerEpoch = 33, minDenominatorPerEpoch = 5L)
+      )
+
+    for {
+      keyPair <- KeyPairGenerator.makeKeyPair[F]
+      selfId = PeerId.fromPublic(keyPair.getPublic)
+      // Leader: NO sharding deps (numShards=1 regression-bar leader). It folds NO shard checkpoints, so
+      // its artifact's stateChannelSnapshots come purely from the SC event we pass.
+      leaderGscf <- mkGlobalSnapshotConsensusFunctions()
+      // Follower: ACTIVE sharding deps (numShards=4) with a fresh, EMPTY per-shard chain registry.
+      followerDeps <- io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+        .acceptanceDeps[IO](
+          cfg = shardingCfg,
+          selfPeerId = selfId,
+          kesRegistry = io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO],
+          activeValidators = IO.pure(Set(selfId))
+        )
+      followerGscf <- mkGlobalSnapshotConsensusFunctions(followerDeps)
+
+      facilitators = Set.empty[PeerId]
+      genesis = GlobalSnapshot.mkGenesis(Map.empty, EpochProgress.MinValue)
+      signedGenesis <- Signed.forAsyncHasher[F, GlobalSnapshot](genesis, keyPair)
+      lastArtifact <- GlobalIncrementalSnapshot.fromGlobalSnapshot[IO](signedGenesis.value)
+      signedLastArtifact <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](lastArtifact, keyPair)
+      scEvent <- mkStateChannelEvent()
+
+      // Leader produces an artifact carrying the SC binary in `stateChannelSnapshots`.
+      (artifact, _, _) <- leaderGscf.createProposalArtifact(
+        SnapshotOrdinal.MinValue,
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        h,
+        EventTrigger,
+        Set(scEvent),
+        facilitators,
+        _ => None.pure[IO]
+      )
+      // Follower (active shard deps, empty shard chain) validates by REPLAYING the embedded SC binary —
+      // `sourceShardCheckpoints = false` means it never consults its own shard chain on this path.
+      result <- followerGscf.validateArtifact(
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        EventTrigger,
+        artifact,
+        facilitators,
+        _ => None.pure[IO]
+      )
+      expected = Right(NonEmptyList.one(scEvent.value.snapshotBinary))
+      actual = result.map(_._1.stateChannelSnapshots(scEvent.value.address))
+    } yield expect.same(true, result.isRight) && expect.same(expected, actual)
   }
 
   test("gossip signed artifacts") { res =>
@@ -787,8 +870,8 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
 
       // Build two independent consensus function instances (each with its own MptStore)
       // to ensure no shared mutable state affects the output
-      gscf1 <- mkGlobalSnapshotConsensusFunctions
-      gscf2 <- mkGlobalSnapshotConsensusFunctions
+      gscf1 <- mkGlobalSnapshotConsensusFunctions()
+      gscf2 <- mkGlobalSnapshotConsensusFunctions()
 
       (artifact1, ctx1, _) <- gscf1.createProposalArtifact(
         SnapshotOrdinal.MinValue,

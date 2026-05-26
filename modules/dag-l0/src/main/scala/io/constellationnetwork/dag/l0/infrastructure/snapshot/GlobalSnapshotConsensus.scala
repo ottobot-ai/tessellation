@@ -1558,7 +1558,14 @@ object GlobalSnapshotConsensus {
                   shardAcceptanceDeps = shardAcceptanceDeps,
                   // T_count_shard quorum closure: on best-tip receipt, sign + gossip our own attestation so
                   // peers cross ⌈2·K_S/3⌉. `None` at numShards=1 (regression bar) ⇒ no emit.
-                  shardCheckpointAttestationEmitter = shardCheckpointAttestationEmitter
+                  shardCheckpointAttestationEmitter = shardCheckpointAttestationEmitter,
+                  // Per-ord producer fan-out (decoupled from gl0-leader win): EVERY node fans out shard
+                  // checkpoints for each canonical (best-tip) gl0 ord it receives via gossip. Reuses the
+                  // SAME `shardProducers` the leader loop uses + the `shardAssignment` off `shardAcceptanceDeps`.
+                  // The daemon derives `shardChainStores` in-daemon from `shardAcceptanceDeps.registry`. EMPTY /
+                  // `None` at numShards=1 (regression bar) ⇒ the per-ord hook is `whenA(false)`.
+                  shardProducers = shardProducers,
+                  shardAssignment = shardAcceptanceDeps.map(_.shardAssignment)
                 )
                 .compile
                 .drain

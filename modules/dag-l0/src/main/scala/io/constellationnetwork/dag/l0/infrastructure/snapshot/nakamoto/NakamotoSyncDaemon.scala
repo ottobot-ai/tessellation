@@ -25,7 +25,7 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.slot.Slot
-import io.constellationnetwork.schema.nakamoto.{LddConfig, TipAttestation => DomainTipAttestation}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig, TipAttestation => DomainTipAttestation}
 import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.security._
@@ -144,6 +144,18 @@ object NakamotoSyncDaemon {
     dataDir: java.nio.file.Path,
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
+    // Hierarchical-shard-checkpoints v1 — per-ord producer fan-out, threaded through `handleSnapshot`
+    // so drained children also fan out shard checkpoints on their becameBestTip path. EMPTY / `None` at
+    // numShards=1 (regression bar).
+    shardProducers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[F]
+    ],
+    shardChainStores: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
+    ],
+    shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -187,6 +199,9 @@ object NakamotoSyncDaemon {
               dataDir,
               operationalKeyMaker,
               kesRegistry,
+              shardProducers,
+              shardChainStores,
+              shardAssignment,
               logger
             )
           }
@@ -310,13 +325,37 @@ object NakamotoSyncDaemon {
     // gl0-leader-produce path (`GlobalSnapshotConsensus.make`), where the operator's signing material lives.
     shardCheckpointAttestationEmitter: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]
-    ] = None
+    ] = None,
+    // ─── Hierarchical-shard-checkpoints v1 — per-ord producer fan-out (decoupled from gl0-leader win) ──
+    // Per-shard checkpoint producers + the static metagraph→shard assignment, threaded so EVERY node fans
+    // out shard checkpoints for each canonical (best-tip) gl0 ord it receives via gossip — NOT only the
+    // gl0 slot winner. The gl0 leader still fans out for its OWN produced ord via `SnapshotLeaderLoop`
+    // (GossipSub doesn't echo a publisher its own message), so together these fire the fan-out exactly
+    // once per canonical ord per node. `shardChainStores` is derived in-daemon from
+    // `shardAcceptanceDeps.registry` (the SAME instances the acceptance side + producers share). EMPTY /
+    // `None` at `numShards = 1` (regression bar) ⇒ the per-ord hook is gated `whenA(false)` ⇒ no allocation.
+    shardProducers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[F]
+    ] = Map.empty,
+    shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]] = None
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
     supervisor: Supervisor[F]
   ): fs2.Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
+
+    // Per-shard chain stores derived from the acceptance-side registry (the SAME instances the producers
+    // write into + the consumer reads). Empty at numShards=1 (`shardAcceptanceDeps = None`). Mirrors the
+    // projection `GlobalSnapshotConsensus.make` does for the leader loop's `shardChainStores` param.
+    val shardChainStores: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
+    ] =
+      shardAcceptanceDeps
+        .map(_.registry.map { case (sid, entry) => sid -> entry.chainStore })
+        .getOrElse(Map.empty)
 
     // Buffer for gossip snapshots whose parent isn't in the chain store yet.
     // Keyed by missing parent hash → list of raw gossip snapshots waiting for that parent.
@@ -385,6 +424,9 @@ object NakamotoSyncDaemon {
                                 dataDir,
                                 operationalKeyMaker,
                                 kesRegistry,
+                                shardProducers,
+                                shardChainStores,
+                                shardAssignment,
                                 logger
                               )
                             }
@@ -473,6 +515,9 @@ object NakamotoSyncDaemon {
                                     dataDir,
                                     operationalKeyMaker,
                                     kesRegistry,
+                                    shardProducers,
+                                    shardChainStores,
+                                    shardAssignment,
                                     logger
                                   )
                                 } >>
@@ -599,6 +644,17 @@ object NakamotoSyncDaemon {
     // §1.2 Slice 5/6/9: KES infrastructure for sender-side signing + receiver-side load-bearing verify.
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
+    // Hierarchical-shard-checkpoints v1 — per-ord producer fan-out, threaded through to
+    // `processValidSnapshotInner`'s becameBestTip branch. EMPTY / `None` at numShards=1 (regression bar).
+    shardProducers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[F]
+    ],
+    shardChainStores: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
+    ],
+    shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -850,6 +906,9 @@ object NakamotoSyncDaemon {
             productionGate,
             operationalKeyMaker,
             kesRegistry,
+            shardProducers,
+            shardChainStores,
+            shardAssignment,
             logger
           ) >> {
             // This snapshot is now stored — drain any children that were waiting for it.
@@ -883,6 +942,9 @@ object NakamotoSyncDaemon {
               dataDir,
               operationalKeyMaker,
               kesRegistry,
+              shardProducers,
+              shardChainStores,
+              shardAssignment,
               logger
             )
           }
@@ -1017,6 +1079,17 @@ object NakamotoSyncDaemon {
     productionGate: ProductionGate[F],
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
+    // Hierarchical-shard-checkpoints v1 — per-ord producer fan-out (becameBestTip-gated). EMPTY / `None`
+    // at numShards=1 ⇒ the fan-out is `whenA(false)` in `processValidSnapshotInner`.
+    shardProducers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[F]
+    ],
+    shardChainStores: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
+    ],
+    shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     // §1.2 Slice 9: snapshot KES gate runs BEFORE any state mutation. On no-sig /
@@ -1059,6 +1132,9 @@ object NakamotoSyncDaemon {
           productionGate,
           operationalKeyMaker,
           kesRegistry,
+          shardProducers,
+          shardChainStores,
+          shardAssignment,
           logger
         )
     }
@@ -1085,6 +1161,15 @@ object NakamotoSyncDaemon {
     productionGate: ProductionGate[F],
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
+    shardProducers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[F]
+    ],
+    shardChainStores: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
+    ],
+    shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     for {
@@ -1125,6 +1210,42 @@ object NakamotoSyncDaemon {
             } >>
             productionGate.resume(ProductionGate.ReorgInProgress)
         case _ => Async[F].unit
+      }
+
+      // ─── Hierarchical-shard-checkpoints v1 — per-ord producer fan-out (decoupled from gl0-leader win) ──
+      // EVERY node drives its per-shard producers for this canonical gl0 ord, INSIDE the becameBestTip
+      // gate. This is what decouples shard-checkpoint production from the gl0-slot win: the gl0 leader
+      // produced the snapshot, but any node that received it as its best tip (including non-leaders) fans
+      // out the shard checkpoints here — so a shard whose committee leader is NOT the gl0 leader still
+      // produces. The gl0 leader itself fans out for its own ord via `SnapshotLeaderLoop.onSlotWon`
+      // (GossipSub doesn't echo a publisher its own message), so together these fire exactly once per
+      // canonical ord per node. `ShardChainStore.store` is idempotent by hash, so an accidental double on
+      // the same checkpoint dedups.
+      //
+      // MUST gate on becameBestTip — NEVER the `storeForkBranch` / `becameBest == false` path. A checkpoint
+      // anchored to a non-canonical gl0 ord is a bug (it would chain off a gl0 ord that never committed).
+      // `signedSnapshot` carries the canonical snapshot here; its `stateChannelSnapshots` are the binaries
+      // partitioned per shard (an empty shard this ord ⇒ `produce` returns `None` ⇒ no empty checkpoint).
+      //
+      // EMPTY / `None` at numShards=1 ⇒ `whenA(false)` ⇒ no allocation/log (regression bar).
+      _ <- Async[F].whenA(becameBestTip && shardProducers.nonEmpty && shardAssignment.isDefined) {
+        signedSnapshot match {
+          case Some(signed) =>
+            val producedOrd = SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal))
+            val rotationPeriod = EtaCalculation.rotationPeriod(snap.ordinal, etaRotationSnapshots)
+            HasherSelector[F].withCurrent { implicit hasher =>
+              io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointFanOut.run[F](
+                stateChannelSnapshots = signed.value.stateChannelSnapshots,
+                producedOrd = producedOrd,
+                epoch = EtaPeriod(rotationPeriod),
+                shardProducers = shardProducers,
+                shardChainStores = shardChainStores,
+                shardAssignment = shardAssignment.get,
+                logger = logger
+              )
+            }
+          case None => Async[F].unit
+        }
       }
 
       // Record in TipTracker (snapshot producer attests to their own tip).

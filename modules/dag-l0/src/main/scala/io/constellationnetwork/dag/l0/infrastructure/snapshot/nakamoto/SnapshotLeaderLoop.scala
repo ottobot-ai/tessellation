@@ -1531,21 +1531,22 @@ object SnapshotLeaderLoop {
                       }
                   }
 
-                  // ─── Gap A — shard-checkpoint producer fan-out ───────────────────────────────
+                  // ─── Gap A — shard-checkpoint producer fan-out (gl0-leader self-call) ───────────
                   // After the gl0 snapshot is produced (+ published when the gate stayed open), drive each
-                  // per-shard checkpoint producer. EMPTY map at `numShards = 1` ⇒ `traverse_` over Nil ⇒
-                  // no-op (regression bar). When sharding is active:
-                  //   1. partition the just-produced `stateChannelSnapshots` by `shardAssignment.shardIdFor`
-                  //      (same deterministic mapping every gl0 op computes — see `ShardAssignment`),
-                  //   2. hand each shard's slice to its producer at the produced gl0 ordinal + this ordinal's
-                  //      eta-rotation period. `produce(...)` returns `None` unless THIS node won the shard
-                  //      slot lottery, so it's a no-op on non-leader ords / non-leader shards,
-                  //   3. on `Some(checkpoint)`, store the producer's OWN checkpoint into the shared per-shard
-                  //      chain store so the shard chain grows + reaches depth/attestation finality locally
-                  //      (the gossip echo of our own checkpoint would otherwise be the only writer). slot +
-                  //      vrfOutput are recomputed locally from the same pure mapping the receiver uses
-                  //      (`slotForGl0Anchor(gl0AnchorOrdinal) = Slot(gl0AnchorOrdinal.value)` — shard-local,
-                  //      NOT gl0 wall-clock slot) and the producer's own committee VRF proof.
+                  // per-shard checkpoint producer for THIS leader's own produced ord, via the shared
+                  // `ShardCheckpointFanOut.run` body (the SAME body the daemon invokes for gossip-received
+                  // ords — see `NakamotoSyncDaemon.processValidSnapshotInner`).
+                  //
+                  // '''Why this self-call is required, not redundant.''' GossipSub does NOT echo a publisher
+                  // its own message, so the gl0 leader never sees its own produced ord arrive on the daemon's
+                  // gossip path. Without this seam the leader would skip producing shard checkpoints for every
+                  // ord it produced. Together with the daemon's per-ord hook this fires the fan-out exactly
+                  // once per canonical ord per node (leader here for its own ord; everyone else via the daemon).
+                  //
+                  // EMPTY map at `numShards = 1` ⇒ `whenA(false)` ⇒ this is never entered (regression bar).
+                  // `produce(...)` returns `None` unless THIS node won the shard slot lottery, and `None` on
+                  // an empty per-shard slice (§15.5 content-only), so it's a no-op on non-leader shards /
+                  // empty shards.
                   //
                   // Gated on `stillOpen` so we only fan out when the gl0 snapshot was actually published +
                   // chain-stored — abandoning gl0 production (gate closed pre-publish, MPT rolled back) must
@@ -1554,63 +1555,16 @@ object SnapshotLeaderLoop {
                     val producedOrd =
                       SnapshotOrdinal(NonNegLong.unsafeFrom(producedOrdinal))
                     val rotationPeriod = EtaCalculation.rotationPeriod(producedOrdinal, etaRotationSnapshots)
-                    val assignment = shardAssignment.get
-                    val scSnapshots = signed.value.stateChannelSnapshots
                     HasherSelector[F].withCurrent { implicit hasher =>
-                      // Group MG addresses by their shard once, then drive each producer.
-                      scSnapshots.toList.traverse {
-                        case (mgAddr, binaries) => assignment.shardIdFor(mgAddr).map(sid => sid -> (mgAddr, binaries))
-                      }.map { tagged =>
-                        tagged.groupBy(_._1).map {
-                          case (sid, entries) =>
-                            sid -> scala.collection.immutable.SortedMap
-                              .from(entries.map(_._2))(io.constellationnetwork.schema.address.Address.OrderingInstance)
-                        }
-                      }.flatMap { perShard =>
-                        shardProducers.toList.traverse_ {
-                          case (sid, producer) =>
-                            val forShard = perShard.getOrElse(
-                              sid,
-                              scala.collection.immutable.SortedMap
-                                .empty[
-                                  io.constellationnetwork.schema.address.Address,
-                                  cats.data.NonEmptyList[Signed[io.constellationnetwork.statechannel.StateChannelSnapshotBinary]]
-                                ](io.constellationnetwork.schema.address.Address.OrderingInstance)
-                            )
-                            producer
-                              .produce(forShard, producedOrd, EtaPeriod(rotationPeriod))
-                              .flatMap {
-                                case None             => Async[F].unit
-                                case Some(checkpoint) =>
-                                  // Recompute the producer's own (slot, vrfOutput) for the chain-store write.
-                                  // `slotForGl0Anchor(gl0AnchorOrdinal) = Slot(gl0AnchorOrdinal.value)` — identical
-                                  // pure mapping on producer + receiver so `maxvalid-tk` tiebreaks agree. vrfOutput is
-                                  // derived from the producer's own committee VRF proof (first committee signature),
-                                  // mirroring the receiver-side `vrfOutputFromProof` recovery so both writers store
-                                  // byte-identical vrfOutput for the same checkpoint.
-                                  val cp = checkpoint.value
-                                  val localSlot = cp.gl0AnchorOrdinal.value.value
-                                  val vrfProofBytes = cp.committeeSignatures.head.vrfProof.toBytes
-                                  val vrfOut = NakamotoSyncDaemon.vrfOutputFromProof(vrfProofBytes)
-                                  shardChainStores.get(sid) match {
-                                    case Some(store) =>
-                                      store
-                                        .store(checkpoint, cp.parentCheckpointHash, cp.shardOrdinal, localSlot, vrfOut)
-                                        .flatMap { stored =>
-                                          logger.info(
-                                            s"🧩 Shard producer: stored own checkpoint shard=${sid.value.value} " +
-                                              s"shardOrd=${cp.shardOrdinal.value} gl0Anchor=${cp.gl0AnchorOrdinal.value.value} " +
-                                              s"new=$stored mgs=${forShard.size}"
-                                          )
-                                        }
-                                    case None =>
-                                      logger.warn(
-                                        s"🧩 Shard producer won shard=${sid.value.value} but no chain store registered; checkpoint not stored locally"
-                                      )
-                                  }
-                              }
-                        }
-                      }
+                      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointFanOut.run[F](
+                        stateChannelSnapshots = signed.value.stateChannelSnapshots,
+                        producedOrd = producedOrd,
+                        epoch = EtaPeriod(rotationPeriod),
+                        shardProducers = shardProducers,
+                        shardChainStores = shardChainStores,
+                        shardAssignment = shardAssignment.get,
+                        logger = logger
+                      )
                     }
                   }
                 } yield ()
