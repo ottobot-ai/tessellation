@@ -37,10 +37,9 @@ import io.constellationnetwork.security.{Hasher, SecurityProvider}
   * envelopes, `equivocatingSigner`) and the `KesRegistry` contents. The implicit `Hasher[F]` is the project's canonical-JSON SHA-256
   * surface — byte-identical across all JVMs. No clock, no env reads, no I/O outside the `KesRegistry` lookup.
   *
-  * '''What this slice doesn't do.''' Following the
-  * [[ShardCheckpointEquivocationEvidence]] scaladoc — bounty/submitter logic lives on the wrapping L0 tx type (handled by the GSAM
-  * accept-path agent, mirroring `SLASHING-DESIGN.md` §5). Already-slashed deduplication + evidence-window checks live downstream too,
-  * keyed by `(equivocatingSigner, shardId, parentCheckpointHash)` — same triple shape as
+  * '''What this slice doesn't do.''' Following the [[ShardCheckpointEquivocationEvidence]] scaladoc — bounty/submitter logic lives on the
+  * wrapping L0 tx type (handled by the GSAM accept-path agent, mirroring `SLASHING-DESIGN.md` §5). Already-slashed deduplication +
+  * evidence-window checks live downstream too, keyed by `(equivocatingSigner, shardId, parentCheckpointHash)` — same triple shape as
   * [[io.constellationnetwork.schema.slashing.SlashingRejection.AlreadySlashed]] just with `shardId` substituted for `metagraphAddress`.
   * Slice 16 delivers the cryptographic-proof half; ledger effects (stake reduction, eviction, bounty, burn) compose downstream per
   * [[https://github.com/Constellation-Labs/tessellation-nakamoto/blob/main/docs/nakamoto/SLASHING-DESIGN.md SLASHING-DESIGN.md]] §5.
@@ -120,9 +119,9 @@ object ShardCheckpointEquivocationValidator {
         val sigAOpt = childA.committeeSignatures.find(_.peerId === signer)
         val sigBOpt = childB.committeeSignatures.find(_.peerId === signer)
         (sigAOpt, sigBOpt) match {
-          case (None, _)             => Left(ShardCheckpointEquivocationRejection.SignerNotPresent.OnChildA(signer))
-          case (_, None)             => Left(ShardCheckpointEquivocationRejection.SignerNotPresent.OnChildB(signer))
-          case (Some(a), Some(b))    => Right((a, b))
+          case (None, _)          => Left(ShardCheckpointEquivocationRejection.SignerNotPresent.OnChildA(signer))
+          case (_, None)          => Left(ShardCheckpointEquivocationRejection.SignerNotPresent.OnChildB(signer))
+          case (Some(a), Some(b)) => Right((a, b))
         }
       }
 
@@ -191,32 +190,31 @@ object ShardCheckpointEquivocationValidator {
       // The crypto-verify steps need (a) the per-child preimage-hash bytes and (b) the per-child signer sig. We compute them once after
       // the cheap checks pass and thread them into the verify closures. If steps 1-4 fail the closures are never invoked.
       val pipeline: F[Either[ShardCheckpointEquivocationRejection, ShardCheckpointEquivocationEvidence]] =
-        chain(List(lift(step1), lift(step2), step3Check)).flatMap {
-          (cheapResult: Either[ShardCheckpointEquivocationRejection, Unit]) =>
-            cheapResult match {
-              case Left(r) =>
-                Async[F].pure(Left(r): Either[ShardCheckpointEquivocationRejection, Unit])
-              case Right(_) =>
-                lookupSignerSigs() match {
-                  case Left(r) =>
-                    Async[F].pure(Left(r): Either[ShardCheckpointEquivocationRejection, Unit])
-                  case Right((sigA, sigB)) =>
-                    for {
-                      hashA <- Hasher[F].hash(childA.signingPreimage)
-                      hashB <- Hasher[F].hash(childB.signingPreimage)
-                      msgBytesA = hashA.getBytes
-                      msgBytesB = hashB.getBytes
-                      result <- chain(
-                        List(
-                          verifyEd25519(sigA, msgBytesA, ShardCheckpointEquivocationRejection.InvalidEd25519Signature.OnChildA),
-                          verifyEd25519(sigB, msgBytesB, ShardCheckpointEquivocationRejection.InvalidEd25519Signature.OnChildB),
-                          verifyKes(sigA, msgBytesA, ShardCheckpointEquivocationRejection.InvalidKesSignature.OnChildA),
-                          verifyKes(sigB, msgBytesB, ShardCheckpointEquivocationRejection.InvalidKesSignature.OnChildB)
-                        )
+        chain(List(lift(step1), lift(step2), step3Check)).flatMap { (cheapResult: Either[ShardCheckpointEquivocationRejection, Unit]) =>
+          cheapResult match {
+            case Left(r) =>
+              Async[F].pure(Left(r): Either[ShardCheckpointEquivocationRejection, Unit])
+            case Right(_) =>
+              lookupSignerSigs() match {
+                case Left(r) =>
+                  Async[F].pure(Left(r): Either[ShardCheckpointEquivocationRejection, Unit])
+                case Right((sigA, sigB)) =>
+                  for {
+                    hashA <- Hasher[F].hash(childA.signingPreimage)
+                    hashB <- Hasher[F].hash(childB.signingPreimage)
+                    msgBytesA = hashA.getBytes
+                    msgBytesB = hashB.getBytes
+                    result <- chain(
+                      List(
+                        verifyEd25519(sigA, msgBytesA, ShardCheckpointEquivocationRejection.InvalidEd25519Signature.OnChildA),
+                        verifyEd25519(sigB, msgBytesB, ShardCheckpointEquivocationRejection.InvalidEd25519Signature.OnChildB),
+                        verifyKes(sigA, msgBytesA, ShardCheckpointEquivocationRejection.InvalidKesSignature.OnChildA),
+                        verifyKes(sigB, msgBytesB, ShardCheckpointEquivocationRejection.InvalidKesSignature.OnChildB)
                       )
-                    } yield result
-                }
-            }
+                    )
+                  } yield result
+              }
+          }
         }.map(_.map(_ => evidence))
 
       pipeline

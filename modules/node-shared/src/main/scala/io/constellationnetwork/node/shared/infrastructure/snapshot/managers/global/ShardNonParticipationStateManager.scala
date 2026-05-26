@@ -11,8 +11,8 @@ import io.constellationnetwork.schema.sharding.{ShardId, ShardNonParticipationCo
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
 
-/** Per-(shard, peer, epoch) non-participation accumulator manager — slice 17 of
-  * `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §10.3.
+/** Per-(shard, peer, epoch) non-participation accumulator manager — slice 17 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`
+  * §10.3.
   *
   * The state manager owns four mutating `record*` entry points (one per duty/total combination) and two read-side `materialize*` entry
   * points. Increments are read-modify-write against the [[GlobalStateFieldId.ShardNonParticipation]] MPT partition: a missing entry is
@@ -64,10 +64,10 @@ trait ShardNonParticipationStateManager[F[_]] {
     epoch: EtaPeriod
   )(implicit hasher: Hasher[F]): F[Option[ShardNonParticipationCounter]]
 
-  /** Materialize every counter that pertains to `epoch`. Implementation: prefix-scan the
-    * [[GlobalStateFieldId.ShardNonParticipation]] partition, decode each entry, then filter by `epoch`. The resulting map is keyed by the
-    * counter's `(ShardId, PeerId)` because the epoch is already constant across the result. Used by
-    * [[ShardNonParticipationSlasher.evaluateEpochBoundary]] which needs every peer/shard pair to evaluate the threshold.
+  /** Materialize every counter that pertains to `epoch`. Implementation: prefix-scan the [[GlobalStateFieldId.ShardNonParticipation]]
+    * partition, decode each entry, then filter by `epoch`. The resulting map is keyed by the counter's `(ShardId, PeerId)` because the
+    * epoch is already constant across the result. Used by [[ShardNonParticipationSlasher.evaluateEpochBoundary]] which needs every
+    * peer/shard pair to evaluate the threshold.
     */
   def materializeAllForEpoch(
     epoch: EtaPeriod
@@ -135,18 +135,18 @@ object ShardNonParticipationStateManager {
 /** Per-epoch boundary slash evaluator — slice 17 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §10.3.
   *
   * Given the just-closed `EtaPeriod`, materialize every non-participation counter and emit the slash list — distinct `PeerId`s whose
-  * missed-rate on either duty exceeds the configured threshold AND whose denominator on that duty meets the minimum sample floor. The
-  * slash list is what the gl0 epoch-boundary hook will eventually feed into the standard `SLASHING-DESIGN.md` §5 ledger-effect pipeline;
-  * v1 returns it for the calling integration slice to wire.
+  * missed-rate on either duty exceeds the configured threshold AND whose denominator on that duty meets the minimum sample floor. The slash
+  * list is what the gl0 epoch-boundary hook will eventually feed into the standard `SLASHING-DESIGN.md` §5 ledger-effect pipeline; v1
+  * returns it for the calling integration slice to wire.
   *
   * '''Determinism (slashing-safety bar).''' Inputs: the partition state at epoch close + the static [[ShardSlashingConfig]]. Outputs: a
   * deterministic `List[PeerId]` sorted by `PeerId.value.value` so two honest nodes compute the same list byte-for-byte. The fold over the
-  * MPT prefix-scan results is order-independent (we sort at emit time); the percent comparison uses integer arithmetic
-  * (`missed * 100 > total * threshold`) to avoid float drift.
+  * MPT prefix-scan results is order-independent (we sort at emit time); the percent comparison uses integer arithmetic (`missed * 100 >
+  * total * threshold`) to avoid float drift.
   *
   * '''Why per-peer not per-(peer, shard) in the output.''' The slash list is consumed by the ledger-effect pipeline which acts on peerIds.
-  * If a peer is non-participating in multiple shards in the same epoch we don't double-slash (the §10.4 severity tier is per-epoch per-peer).
-  * The set semantics in the implementation (toSet → sort) collapse duplicates.
+  * If a peer is non-participating in multiple shards in the same epoch we don't double-slash (the §10.4 severity tier is per-epoch
+  * per-peer). The set semantics in the implementation (toSet → sort) collapse duplicates.
   */
 trait ShardNonParticipationSlasher[F[_]] {
 

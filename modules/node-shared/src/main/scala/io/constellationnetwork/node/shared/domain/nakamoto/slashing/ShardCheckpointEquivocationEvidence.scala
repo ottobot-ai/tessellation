@@ -10,8 +10,8 @@ import derevo.derive
 
 /** Slice 16 — shard-checkpoint equivocation evidence.
   *
-  * Companion piece to [[io.constellationnetwork.schema.slashing.SlashableEvidence]]: the same algebra (cryptographically verifiable proof of
-  * a single signer producing two contradictory artefacts) lifted to the shard-checkpoint layer per
+  * Companion piece to [[io.constellationnetwork.schema.slashing.SlashableEvidence]]: the same algebra (cryptographically verifiable proof
+  * of a single signer producing two contradictory artefacts) lifted to the shard-checkpoint layer per
   * `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §10.1.
   *
   * '''Equivocation identity.''' The equivocation key is `(shardId, parentCheckpointHash)` — exactly mirroring the metagraph case where the
@@ -22,10 +22,10 @@ import derevo.derive
   *
   * '''Why this is a separate evidence type, not a variant of `SlashableEvidence`.''' The existing schema is tightly coupled to
   * [[io.constellationnetwork.schema.slashing.MetagraphAttestation]] bodies, which carry the per-binary attestation fields (`binaryHash`,
-  * `vrfPublicKey`, `senderTreeStep`). Shard-checkpoint equivocation lives one layer up: the offence is producing two
-  * conflicting [[ShardCheckpoint]] envelopes, not two conflicting metagraph attestations. The on-wire fields needed to prove it (full
-  * envelopes with their `committeeSignatures` lists vs. raw attestation bodies) don't compose into a single ADT cleanly. Following the
-  * design-doc §10.1 sketch literally — separate evidence case class, same ledger-effect pipeline downstream.
+  * `vrfPublicKey`, `senderTreeStep`). Shard-checkpoint equivocation lives one layer up: the offence is producing two conflicting
+  * [[ShardCheckpoint]] envelopes, not two conflicting metagraph attestations. The on-wire fields needed to prove it (full envelopes with
+  * their `committeeSignatures` lists vs. raw attestation bodies) don't compose into a single ADT cleanly. Following the design-doc §10.1
+  * sketch literally — separate evidence case class, same ledger-effect pipeline downstream.
   *
   * '''No bounty/submitter fields on this case class.''' Unlike [[io.constellationnetwork.schema.slashing.SlashableEvidence]] the evidence
   * here is the pure equivocation proof — the bounty / submitter / replay-bound-signature concerns live on the wrapping L0 tx type. Slice 16
@@ -48,11 +48,10 @@ import derevo.derive
   *   1. Both signer KES product signatures verify under the signer's KES master VK at the wire-carried `kesTreeStep` — the deliberate
   *      adversarial-action proof (KES forward-security means the offender had to keep two-period material live, which is provably wrong).
   *
-  * '''Determinism contract.''' Same as
-  * [[io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashableEvidenceValidator]]: every honest node computing this validator
-  * over the same `(evidence, kesRegistry)` inputs returns byte-equivalent accept/reject. No clock, no env reads, no consensus-state
-  * heuristics. The `Hasher[F]` invocations (signing-preimage hashing for cryptographic verification) are deterministic by construction
-  * — same canonical-JSON serialization surface as everywhere else in the codebase.
+  * '''Determinism contract.''' Same as [[io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashableEvidenceValidator]]: every
+  * honest node computing this validator over the same `(evidence, kesRegistry)` inputs returns byte-equivalent accept/reject. No clock, no
+  * env reads, no consensus-state heuristics. The `Hasher[F]` invocations (signing-preimage hashing for cryptographic verification) are
+  * deterministic by construction — same canonical-JSON serialization surface as everywhere else in the codebase.
   *
   * '''Frozen wire shape.''' The fields here are part of the consensus contract — they participate in any wrapping L0 tx's canonical bytes.
   * Adding optional fields, reordering, or wrapping a field in `Option` silently changes the digest and breaks cross-version evidence
@@ -60,8 +59,8 @@ import derevo.derive
   * to evolve, version the case class explicitly (`ShardCheckpointEquivocationEvidenceV2`) and version the validator branch.
   *
   * @param shardId
-  *   the shard whose committee produced the conflicting checkpoints. Header equality with `childA.shardId` / `childB.shardId` is asserted by
-  *   validator step 2 — keeping the field redundantly on the envelope means downstream MPT-key derivation can use it without re-deriving
+  *   the shard whose committee produced the conflicting checkpoints. Header equality with `childA.shardId` / `childB.shardId` is asserted
+  *   by validator step 2 — keeping the field redundantly on the envelope means downstream MPT-key derivation can use it without re-deriving
   *   from either child.
   * @param parentCheckpointHash
   *   the parent checkpoint both children chain off. Header equality with `childA.parentCheckpointHash` / `childB.parentCheckpointHash` is

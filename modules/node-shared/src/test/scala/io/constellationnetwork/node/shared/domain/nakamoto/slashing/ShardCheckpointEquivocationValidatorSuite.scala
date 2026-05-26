@@ -39,10 +39,10 @@ import weaver.MutableIOSuite
   * recipe (Hasher of `signingPreimage` → `getBytes` → real Ed25519 + real KES sigs). A faked-signature happy path would not catch
   * verification regressions in the validator.
   *
-  * '''Two distinct children.''' We vary `shardOrdinal` (and through it the canonical preimage hash) while keeping
-  * `(shardId, parentCheckpointHash)` identical — that's the precise equivocation algebra. The producer's actual chain-continuity rule
-  * would forbid a single committee member from signing two distinct children at the same parent in honest operation; here we deliberately
-  * produce the second signature to simulate adversarial behaviour.
+  * '''Two distinct children.''' We vary `shardOrdinal` (and through it the canonical preimage hash) while keeping `(shardId,
+  * parentCheckpointHash)` identical — that's the precise equivocation algebra. The producer's actual chain-continuity rule would forbid a
+  * single committee member from signing two distinct children at the same parent in honest operation; here we deliberately produce the
+  * second signature to simulate adversarial behaviour.
   */
 object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
 
