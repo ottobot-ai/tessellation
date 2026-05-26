@@ -86,7 +86,16 @@ object ShardCheckpointPublisher {
           .signedShardCheckpointToWire[F](checkpoint)
           .flatMap { wire =>
             sidecarClient.publishShardCheckpoint(wire).flatMap { resp =>
-              if (resp.ok) Async[F].unit
+              if (resp.ok)
+                // Observability seam: the publish itself is otherwise silent (the producer's
+                // `produce: emitted ...` INFO fires regardless of whether this sidecar call
+                // succeeded). A dedicated INFO here makes the actual on-wire gossip publish
+                // visible per shard/ordinal so cross-node propagation can be traced end-to-end.
+                logger.info(
+                  s"ShardCheckpointPublisher.sidecar: published " +
+                    s"shard=${checkpoint.value.shardId.value.value} shardOrd=${checkpoint.value.shardOrdinal.value} " +
+                    s"gl0Anchor=${checkpoint.value.gl0AnchorOrdinal.value.value}"
+                )
               else
                 logger.warn(
                   s"ShardCheckpointPublisher.sidecar: sidecar PublishShardCheckpoint returned not-ok " +
