@@ -447,7 +447,11 @@ object GlobalSnapshotConsensus {
           sharedCfg.incrementalDelegatedStakingStartingOrdinal
             .getOrElse(sharedCfg.environment, SnapshotOrdinal.MinValue),
           mptStore,
-          mptOverlay
+          mptOverlay,
+          // Gap C — feed finalized shard checkpoints into accept(). `None` at numShards=1 (regression
+          // bar) ⇒ accept() receives `shardCheckpoints = SortedMap.empty`. Same `shardAcceptanceDeps`
+          // instance the GSAM acceptance side, the Gap-A producers, and the Gap-B receiver use.
+          shardAcceptanceDeps = shardAcceptanceDeps
         )
 
       stateAdvancer =
@@ -1140,6 +1144,95 @@ object GlobalSnapshotConsensus {
             )
             nipopowProofProviderRef.set(Some(provider))
           }.toResource
+
+          // ─── Gap A — per-shard checkpoint producers ──────────────────────────────────────────
+          // Build one `ShardCheckpointProducer` per shard the operator tracks, REUSING the SAME
+          // per-shard `ShardChainStore` the acceptance side (`shardAcceptanceDeps.registry`) reads —
+          // producer writes ⇒ consumer reads ⇒ the shard chain grows toward finality. `None` deps
+          // (numShards <= 1, the production default) ⇒ empty map ⇒ the `SnapshotLeaderLoop` fan-out is
+          // inert (regression bar). Every allocation below sits behind the `Some(deps)` gate.
+          //
+          // VRF seed: the SAME `deriveVrfKeys(keyPair)._1` the gl0 leader loop uses. v1 reuses the gl0
+          // leader VRF identity for the shard slot lottery (per-operator-key VRF lands later, #180), so
+          // the seed must be derived identically. KES adapter mirrors the gl0 `committeeKesSigner`
+          // (signAt → `OperationalKeyMaker.encodeSignature`). `shardEta` is computed once per shard from
+          // `nakamotoGenesisEta`.
+          //
+          // v1 imprecision (acceptable for first-period validation): `shardEta` is derived from
+          // `nakamotoGenesisEta` and NOT rotated per eta-period — so after the first eta rotation the
+          // shard-leader VRF eta no longer tracks the gl0 eta. For numShards>1 validation within the
+          // first eta period this is exact; TODO(#shard-eta-rotation): thread the live rotated gl0 eta
+          // (from `epochStateRef`) into `computeShardEta` so the shard VRF domain rotates in lockstep.
+          shardProducers <- shardAcceptanceDeps match {
+            case None =>
+              Async[F]
+                .pure(
+                  Map.empty[
+                    io.constellationnetwork.schema.sharding.ShardId,
+                    io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[
+                      F
+                    ]
+                  ]
+                )
+                .toResource
+            case Some(deps) =>
+              implicit val shardHasher: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+              implicit val shardLogger: org.typelevel.log4cats.Logger[F] = nakLogger
+              val shardSlotLeader =
+                io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSlotLeader.make[F](eligibilityChecker)
+              val shardKesSigner = new io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer.KesSigner[F] {
+                def currentPeriod: F[Int] = operationalKeyMaker.currentPeriod
+                def signAt(kesStep: Int, message: Array[Byte]): F[Array[Byte]] =
+                  operationalKeyMaker.signAt(kesStep, message).map {
+                    case Right(sig) => io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(sig)
+                    case Left(_)    => Array.empty[Byte]
+                  }
+              }
+              val shardVrfSk = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
+                .deriveVrfKeys(keyPair)
+                ._1
+              // Shard-local slot mapping (MUST be identical on producer + receiver so the leader VRF
+              // verify agrees): the gl0 anchor ordinal IS the shard-local slot index. NOT gl0 wall-clock
+              // slot — the shard chain advances at gl0-ordinal cadence, one anchor per gl0 ord.
+              val slotForGl0Anchor: SnapshotOrdinal => io.constellationnetwork.schema.nakamoto.slot.Slot =
+                (ord: SnapshotOrdinal) => io.constellationnetwork.schema.nakamoto.slot.Slot.unsafeApply(ord.value.value)
+              // LDD slot-gap: genesis (no parent) → the slot itself (EligibilityChecker "first wins"
+              // seed); else currentSlot - parentSlot clamped to ≥ 1 (mirrors the gl0 loop's clamp).
+              val slotGapFor
+                : (io.constellationnetwork.schema.nakamoto.slot.Slot, Option[io.constellationnetwork.schema.nakamoto.slot.Slot]) => Long =
+                (cur, parentOpt) => parentOpt.fold(cur.value.value)(p => math.max(1L, cur.value.value - p.value.value))
+              val sigmaInCommittee =
+                io.constellationnetwork.numerics.Ratio(1, math.max(1, deps.shardingConfig.committeeKTarget))
+              deps.registry.toList.traverse {
+                case (shardId, entry) =>
+                  shardSlotLeader.computeShardEta(shardId, nakamotoGenesisEta).flatMap { shardEta =>
+                    io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer
+                      .make[F](
+                        shardId = shardId,
+                        chainStore = entry.chainStore,
+                        slotLeader = shardSlotLeader,
+                        publisher = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointPublisher
+                          .sidecar[F](sidecarClient),
+                        selfPeerId = selfId,
+                        selfKeyPair = keyPair,
+                        selfVrfSk = shardVrfSk,
+                        kesSigner = shardKesSigner,
+                        shardEta = shardEta,
+                        sigmaInCommittee = sigmaInCommittee,
+                        slotForGl0Anchor = slotForGl0Anchor,
+                        slotGapFor = slotGapFor,
+                        lddConfig = lddConfig,
+                        derivePerMgState =
+                          io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.noReExecDerivation[F]
+                      )
+                      .map(shardId -> _)
+                  }
+              }
+                .map(_.toMap)
+                .flatTap(m => nakLogger.info(s"🧩 Shard producers built: ${m.size} shard(s) (numShards>1 active)"))
+                .toResource
+          }
+
           _ <- supervisor
             .supervise(
               io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
@@ -1231,7 +1324,17 @@ object GlobalSnapshotConsensus {
                   // §3 NIPoPoW S3: Phase-3 sink for the local TowerStore. Constructed above with
                   // a dedicated MPT producer (NOT in the consensus stateProof). Invoked at T_depth2
                   // archival watermark advance in SnapshotLeaderLoop.finalityMonitor.
-                  towerFinalizer = towerFinalizer
+                  towerFinalizer = towerFinalizer,
+                  // Gap A — per-shard checkpoint producers + the SAME chain stores they write into +
+                  // the static metagraph→shard assignment. Empty / None at numShards=1 (regression bar);
+                  // the fan-out in `onSlotWon` is a no-op `traverse_` over the empty map. `shardChainStores`
+                  // is projected off the SAME `shardAcceptanceDeps.registry` entries the acceptance side
+                  // reads, so the producer's own-checkpoint store and the consumer reads share one instance.
+                  shardProducers = shardProducers,
+                  shardChainStores = shardAcceptanceDeps
+                    .map(_.registry.map { case (sid, entry) => sid -> entry.chainStore })
+                    .getOrElse(Map.empty),
+                  shardAssignment = shardAcceptanceDeps.map(_.shardAssignment)
                 )
                 .compile
                 .drain
@@ -1377,7 +1480,13 @@ object GlobalSnapshotConsensus {
                   parentOrdinalFor = committeeParentOrdinalFor,
                   etaForParentOrdinal = committeeEtaForOrdinal,
                   senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.committeeStake(peer),
-                  processOrphanedMetagraphBinary = processOrphanedMetagraphBinary
+                  processOrphanedMetagraphBinary = processOrphanedMetagraphBinary,
+                  // Gap B — acceptance-side shard deps for the receiver-routing handlers. `None` at
+                  // numShards=1 (regression bar) ⇒ inbound shard-checkpoint gossip is dropped with a
+                  // debug log. The SAME `shardAcceptanceDeps` instance the GSAM acceptance side + the
+                  // Gap-A producers use, so the chain stores incoming checkpoints land in are the ones
+                  // the producers + finality triggers read.
+                  shardAcceptanceDeps = shardAcceptanceDeps
                 )
                 .compile
                 .drain

@@ -155,8 +155,14 @@ object SnapshotLeaderLoop {
     gauge >> tWeight >> tCount >> tDepth1
   }
 
-  /** Derive VRF keys from node's secp256k1 identity key. */
-  private def deriveVrfKeys(keyPair: KeyPair): (Array[Byte], Array[Byte]) = {
+  /** Derive VRF keys from node's secp256k1 identity key.
+    *
+    * Visibility widened to `private[snapshot]` (Gap A, shard-checkpoint producer wiring) so `GlobalSnapshotConsensus.make` (in the parent
+    * `...infrastructure.snapshot` package) can derive the SAME (vrfSeed, vrfPk) pair this loop uses, to seed each per-shard
+    * `ShardCheckpointProducer`'s slot-leader VRF. v1 reuses the gl0 leader VRF identity for the shard slot lottery (per-operator-key VRF
+    * lands later, #180) — so the seed must be derived identically on both sides.
+    */
+  private[snapshot] def deriveVrfKeys(keyPair: KeyPair): (Array[Byte], Array[Byte]) = {
     val rawPrivKey: Array[Byte] = keyPair.getPrivate match {
       case ecKey: java.security.interfaces.ECPrivateKey =>
         val bytes = ecKey.getS.toByteArray
@@ -412,7 +418,34 @@ object SnapshotLeaderLoop {
     // watermark advances. The finalizer's high-water-mark Ref guarantees no double-write, so
     // missed ticks (e.g. process restart) are safely re-driven from chain replay. Layers that
     // don't run the Phase-3 sink (followers without the tower partition) pass `TowerFinalizer.noop`.
-    towerFinalizer: io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerFinalizer[F]
+    towerFinalizer: io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerFinalizer[F],
+    // ─── Hierarchical-shard-checkpoints v1 — Gap A producer loop ───────────────────────────────
+    // Per-shard checkpoint producers, keyed by `ShardId`. EMPTY at `numShards = 1` (the regression
+    // bar — the default below), so the `onSlotWon` shard fan-out is a no-op `traverse_` over an empty
+    // map: byte-identical to the pre-wiring loop. When `numShards > 1`, `GlobalSnapshotConsensus.make`
+    // populates one producer per shard the operator tracks, each reusing the SAME per-shard
+    // `ShardChainStore` the acceptance side reads (so producer writes ⇒ consumer reads ⇒ chain grows).
+    shardProducers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[
+        F
+      ]
+    ] = Map.empty,
+    // Per-shard chain stores (the SAME instances `shardProducers` write into). After a producer wins
+    // its shard slot lottery and returns `Some(checkpoint)`, the producing node stores its own
+    // checkpoint here (it has the full `Signed[ShardCheckpoint]` + can recompute slot/vrfOutput
+    // locally) so the local chain advances toward finality without waiting for its own gossip echo.
+    // Empty at `numShards = 1`.
+    shardChainStores: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[
+        F
+      ]
+    ] = Map.empty,
+    // Static metagraph→shard mapping. `None` at `numShards = 1` (no fan-out). `Some(...)` when sharding
+    // is active, used to partition the just-produced snapshot's `stateChannelSnapshots` per shard so
+    // each producer only sees the MGs assigned to it.
+    shardAssignment: Option[ShardAssignment[F]] = None
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -568,6 +601,9 @@ object SnapshotLeaderLoop {
                             mptStore,
                             mptOverlay,
                             operationalKeyMaker,
+                            shardProducers,
+                            shardChainStores,
+                            shardAssignment,
                             logger
                           )
                         } // snapshotSemaphore.permit
@@ -1162,6 +1198,18 @@ object SnapshotLeaderLoop {
     mptOverlay: MptOverlay[F, GlobalStateKey],
     // §1.2 Slice 6: KES parallel-signing for the published snapshot's `kes_signature` field.
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
+    // Gap A — per-shard checkpoint producers + the SAME chain stores they write into + the static
+    // metagraph→shard assignment. Empty / None at numShards=1 (regression bar) ⇒ the fan-out below is
+    // a no-op `traverse_` over the empty map. Passed through from `run`'s same-named params.
+    shardProducers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[F]
+    ],
+    shardChainStores: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
+    ],
+    shardAssignment: Option[ShardAssignment[F]],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -1481,6 +1529,89 @@ object SnapshotLeaderLoop {
                             else updated
                           }
                       }
+                  }
+
+                  // ─── Gap A — shard-checkpoint producer fan-out ───────────────────────────────
+                  // After the gl0 snapshot is produced (+ published when the gate stayed open), drive each
+                  // per-shard checkpoint producer. EMPTY map at `numShards = 1` ⇒ `traverse_` over Nil ⇒
+                  // no-op (regression bar). When sharding is active:
+                  //   1. partition the just-produced `stateChannelSnapshots` by `shardAssignment.shardIdFor`
+                  //      (same deterministic mapping every gl0 op computes — see `ShardAssignment`),
+                  //   2. hand each shard's slice to its producer at the produced gl0 ordinal + this ordinal's
+                  //      eta-rotation period. `produce(...)` returns `None` unless THIS node won the shard
+                  //      slot lottery, so it's a no-op on non-leader ords / non-leader shards,
+                  //   3. on `Some(checkpoint)`, store the producer's OWN checkpoint into the shared per-shard
+                  //      chain store so the shard chain grows + reaches depth/attestation finality locally
+                  //      (the gossip echo of our own checkpoint would otherwise be the only writer). slot +
+                  //      vrfOutput are recomputed locally from the same pure mapping the receiver uses
+                  //      (`slotForGl0Anchor(gl0AnchorOrdinal) = Slot(gl0AnchorOrdinal.value)` — shard-local,
+                  //      NOT gl0 wall-clock slot) and the producer's own committee VRF proof.
+                  //
+                  // Gated on `stillOpen` so we only fan out when the gl0 snapshot was actually published +
+                  // chain-stored — abandoning gl0 production (gate closed pre-publish, MPT rolled back) must
+                  // NOT produce a shard checkpoint anchored to a gl0 ord that never committed.
+                  _ <- Async[F].whenA(stillOpen && shardProducers.nonEmpty && shardAssignment.isDefined) {
+                    val producedOrd =
+                      SnapshotOrdinal(NonNegLong.unsafeFrom(producedOrdinal))
+                    val rotationPeriod = EtaCalculation.rotationPeriod(producedOrdinal, etaRotationSnapshots)
+                    val assignment = shardAssignment.get
+                    val scSnapshots = signed.value.stateChannelSnapshots
+                    HasherSelector[F].withCurrent { implicit hasher =>
+                      // Group MG addresses by their shard once, then drive each producer.
+                      scSnapshots.toList.traverse {
+                        case (mgAddr, binaries) => assignment.shardIdFor(mgAddr).map(sid => sid -> (mgAddr, binaries))
+                      }.map { tagged =>
+                        tagged.groupBy(_._1).map {
+                          case (sid, entries) =>
+                            sid -> scala.collection.immutable.SortedMap
+                              .from(entries.map(_._2))(io.constellationnetwork.schema.address.Address.OrderingInstance)
+                        }
+                      }.flatMap { perShard =>
+                        shardProducers.toList.traverse_ {
+                          case (sid, producer) =>
+                            val forShard = perShard.getOrElse(
+                              sid,
+                              scala.collection.immutable.SortedMap
+                                .empty[
+                                  io.constellationnetwork.schema.address.Address,
+                                  cats.data.NonEmptyList[Signed[io.constellationnetwork.statechannel.StateChannelSnapshotBinary]]
+                                ](io.constellationnetwork.schema.address.Address.OrderingInstance)
+                            )
+                            producer
+                              .produce(forShard, producedOrd, EtaPeriod(rotationPeriod))
+                              .flatMap {
+                                case None             => Async[F].unit
+                                case Some(checkpoint) =>
+                                  // Recompute the producer's own (slot, vrfOutput) for the chain-store write.
+                                  // `slotForGl0Anchor(gl0AnchorOrdinal) = Slot(gl0AnchorOrdinal.value)` — identical
+                                  // pure mapping on producer + receiver so `maxvalid-tk` tiebreaks agree. vrfOutput is
+                                  // derived from the producer's own committee VRF proof (first committee signature),
+                                  // mirroring the receiver-side `vrfOutputFromProof` recovery so both writers store
+                                  // byte-identical vrfOutput for the same checkpoint.
+                                  val cp = checkpoint.value
+                                  val localSlot = cp.gl0AnchorOrdinal.value.value
+                                  val vrfProofBytes = cp.committeeSignatures.head.vrfProof.toBytes
+                                  val vrfOut = NakamotoSyncDaemon.vrfOutputFromProof(vrfProofBytes)
+                                  shardChainStores.get(sid) match {
+                                    case Some(store) =>
+                                      store
+                                        .store(checkpoint, cp.parentCheckpointHash, cp.shardOrdinal, localSlot, vrfOut)
+                                        .flatMap { stored =>
+                                          logger.info(
+                                            s"🧩 Shard producer: stored own checkpoint shard=${sid.value.value} " +
+                                              s"shardOrd=${cp.shardOrdinal.value} gl0Anchor=${cp.gl0AnchorOrdinal.value.value} " +
+                                              s"new=$stored mgs=${forShard.size}"
+                                          )
+                                        }
+                                    case None =>
+                                      logger.warn(
+                                        s"🧩 Shard producer won shard=${sid.value.value} but no chain store registered; checkpoint not stored locally"
+                                      )
+                                  }
+                              }
+                        }
+                      }
+                    }
                   }
                 } yield ()
             }
