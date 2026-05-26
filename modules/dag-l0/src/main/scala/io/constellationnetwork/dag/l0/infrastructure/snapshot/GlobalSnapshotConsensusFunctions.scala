@@ -81,7 +81,15 @@ object GlobalSnapshotConsensusFunctions {
     setSumFixOrdinal: SnapshotOrdinal,
     incrementalDelegatedStakingStartingOrdinal: SnapshotOrdinal,
     mptStore: MptStore[F, GlobalStateKey],
-    overlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey]
+    overlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
+    // ─── Hierarchical-shard-checkpoints v1 — Gap C: feed finalized checkpoints into accept() ───
+    // Acceptance-side per-shard deps. `None` at `numShards = 1` (the production default) ⇒ the GSAM
+    // `accept(...)` call below passes `shardCheckpoints = SortedMap.empty` — byte-identical to today's
+    // behavior (the regression bar). `Some(deps)` sources the phase-2-finalized checkpoint per shard
+    // from the per-shard chain stores and passes them into `accept(shardCheckpoints = ...)`.
+    shardAcceptanceDeps: Option[
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[F]
+    ] = None
   ): GlobalSnapshotConsensusFunctions[F] = new GlobalSnapshotConsensusFunctions[F] {
 
     private val logger = Slf4jLogger.getLoggerFromClass[F](getClass)
@@ -149,7 +157,12 @@ object GlobalSnapshotConsensusFunctions {
         else
           EventTrigger
 
-      def usingJson = createProposalArtifact(
+      // Gap C: re-derive with `sourceShardCheckpoints = false`. The leader's chosen shard checkpoints
+      // already folded their per-MG binaries into the received artifact's `stateChannelSnapshots`, which
+      // are extracted above as `scEvents` and replayed here — so the recreated artifact matches WITHOUT
+      // re-sourcing node-local shard finality state (which could diverge from the leader and spuriously
+      // fail the byte-exact `recreatedArtifact === artifact` check).
+      def usingJson = createProposalArtifactInternal(
         lastSignedArtifact.ordinal,
         lastSignedArtifact,
         lastContext,
@@ -157,7 +170,8 @@ object GlobalSnapshotConsensusFunctions {
         artifactTrigger,
         events,
         facilitators,
-        getGlobalSnapshotByOrdinal
+        getGlobalSnapshotByOrdinal,
+        sourceShardCheckpoints = false
       )
 
       def check(result: F[(GlobalSnapshotArtifact, GlobalSnapshotContext, Set[GlobalSnapshotEvent])]) =
@@ -191,6 +205,14 @@ object GlobalSnapshotConsensusFunctions {
       *   Current round's facilitators (deterministic: all nodes must receive all facility declarations before advancing from
       *   CollectingFacilities).
       */
+    // Public trait entry point (the genuine produce path — SnapshotLeaderLoop). Sources finalized
+    // shard checkpoints (Gap C) so they fold into accept(). The follower re-derivation path
+    // (`validateArtifact`) calls `createProposalArtifactInternal(..., sourceShardCheckpoints = false)`
+    // directly so it does NOT re-source node-local finality state — the leader's folded shard binaries
+    // already live in the artifact's `stateChannelSnapshots` and the follower reproduces them by
+    // replaying those as ordinary SC events. Re-sourcing on the follower would compare the leader's
+    // embedded set against the follower's own (possibly-divergent) chain-store view and spuriously
+    // reject a valid snapshot. See the determinism note on `createProposalArtifactInternal`.
     def createProposalArtifact(
       lastKey: GlobalSnapshotKey,
       lastArtifact: Signed[GlobalSnapshotArtifact],
@@ -200,6 +222,37 @@ object GlobalSnapshotConsensusFunctions {
       events: Set[GlobalSnapshotEvent],
       facilitators: Set[PeerId],
       getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+    )(implicit hasher: Hasher[F]): F[(GlobalSnapshotArtifact, GlobalSnapshotContext, Set[GlobalSnapshotEvent])] =
+      createProposalArtifactInternal(
+        lastKey,
+        lastArtifact,
+        snapshotContext,
+        lastArtifactHasher,
+        trigger,
+        events,
+        facilitators,
+        getGlobalSnapshotByOrdinal,
+        sourceShardCheckpoints = true
+      )
+
+    /** Implementation of [[createProposalArtifact]] with an explicit `sourceShardCheckpoints` gate.
+      *
+      * '''Gap C determinism contract.''' `sourceShardCheckpoints = true` ONLY on the genuine produce path (the public trait method, called
+      * by `SnapshotLeaderLoop`). The follower validation path (`validateArtifact`) passes `false` so it never reads node-local shard
+      * finality state during a byte-exact re-derivation. At `numShards = 1` the flag is irrelevant — `shardAcceptanceDeps = None` forces
+      * `shardCheckpoints = SortedMap.empty` regardless, so this method is byte-identical to the pre-wiring code on both paths (the
+      * regression bar).
+      */
+    def createProposalArtifactInternal(
+      lastKey: GlobalSnapshotKey,
+      lastArtifact: Signed[GlobalSnapshotArtifact],
+      snapshotContext: GlobalSnapshotContext,
+      lastArtifactHasher: Hasher[F],
+      trigger: ConsensusTrigger,
+      events: Set[GlobalSnapshotEvent],
+      facilitators: Set[PeerId],
+      getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
+      sourceShardCheckpoints: Boolean
     )(implicit hasher: Hasher[F]): F[(GlobalSnapshotArtifact, GlobalSnapshotContext, Set[GlobalSnapshotEvent])] = {
       val scEventsBeforeCut = events.collect { case sc: StateChannelEvent => sc }
       val dagEventsBeforeCut = events.collect { case d: DAGEvent => d }
@@ -375,6 +428,38 @@ object GlobalSnapshotConsensusFunctions {
           "nodeCollWithdraw" -> sortedWncEvents.size.toString
         )
 
+        // Gap C — source the phase-2-finalized shard checkpoint per shard, to feed into `accept()`.
+        // Empty (byte-identical to today, the regression bar) when EITHER `numShards = 1` (deps None)
+        // OR this is the follower validation re-derivation (`sourceShardCheckpoints = false` — see the
+        // determinism contract on `createProposalArtifactInternal`). On the genuine produce path with
+        // sharding active: for each tracked shard, advance the composite finality triggers (reads the
+        // chain store's bestTip + attestation tally), read `latestQualifyingOrdinal` (the highest
+        // shard-ord qualified by `T_count_shard` OR `T_depth1_shard`, max-of), and pull the canonical
+        // checkpoint at that ord from the chain store. Skip shards whose latest qualifying ord is
+        // Genesis (nothing finalized yet) or whose canonical entry was already evicted.
+        shardCheckpoints <- shardAcceptanceDeps match {
+          case Some(deps) if sourceShardCheckpoints =>
+            deps.registry.toList.traverse {
+              case (shardId, entry) =>
+                entry.finalityTriggers.advance >>
+                  entry.finalityTriggers.latestQualifyingOrdinal.flatMap { qualifyingOrd =>
+                    if (qualifyingOrd.value <= 0L)
+                      none[(io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint)]
+                        .pure[F]
+                    else
+                      entry.chainStore.getByOrdinal(qualifyingOrd).map {
+                        case Some(hashed) => (shardId -> hashed.signed.value).some
+                        case None         => none
+                      }
+                  }
+            }
+              .map(entries => SortedMap.from(entries.flatten))
+          case _ =>
+            SortedMap
+              .empty[io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint]
+              .pure[F]
+        }
+
         acceptStartMs <- Async[F].monotonic.map(_.toMillis)
         (
           acceptanceResult,
@@ -419,7 +504,10 @@ object GlobalSnapshotConsensusFunctions {
               // wiring flips to MultiBranch (Phase J / #56.10). Until then `OverlayMode.Passthrough`
               // ignores the BranchId on every read/write — the byte-parity contract from #107
               // covers the rewire under that mode.
-              io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(lastArtifactHash)
+              io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(lastArtifactHash),
+              // Gap C — finalized shard checkpoints sourced above. Empty at numShards=1 (regression
+              // bar): GSAM's `processShardCheckpoints` only fires when `numShards > 1 && nonEmpty`.
+              shardCheckpoints = shardCheckpoints
             )
         acceptEndMs <- Async[F].monotonic.map(_.toMillis)
         _ <- ConsensusLog.info(
