@@ -267,6 +267,19 @@ for arg in "$@"; do
         exit 1
       fi
       ;;
+    --num-shards=*)
+      # Hierarchical shard count M (HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md).
+      # Exports NAKAMOTO_NUM_SHARDS, which docker-compose.nakamoto-overlay.yaml
+      # forwards to gl0 containers and application.conf reads via ${?...}.
+      # num-shards = 1 (default/unset) keeps the shard path inert (byte-identical
+      # to pre-sharding). num-shards > 1 activates per-shard ShardCheckpoint
+      # production + gl0 aggregation. Distinct from --shards (committee K target).
+      export NAKAMOTO_NUM_SHARDS="${arg#*=}"
+      if ! [[ "$NAKAMOTO_NUM_SHARDS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: --num-shards must be a positive integer (got: $NAKAMOTO_NUM_SHARDS)"
+        exit 1
+      fi
+      ;;
     *)
       echo "Unknown argument: $arg"
       exit 1

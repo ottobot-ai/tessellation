@@ -57,6 +57,12 @@ services:
       # genuine sortition: each metagraph binary requires ceil(2K/3) attestations
       # from the K-sized committee. Plumbed by `--shards=N` in set-env.sh.
       - NAKAMOTO_COMMITTEE_K_TARGET=${NAKAMOTO_COMMITTEE_K_TARGET:-}
+      # Hierarchical shard-checkpoint sharding. num-shards = 1 (default, unset)
+      # keeps the new shard path inert — byte-identical to pre-sharding behavior.
+      # num-shards > 1 activates per-shard ShardCheckpoint production + gl0
+      # aggregation (HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md). Read via the
+      # `${?NAKAMOTO_NUM_SHARDS}` substitution in application.conf — never sys.env.
+      - NAKAMOTO_NUM_SHARDS=${NAKAMOTO_NUM_SHARDS:-}
       # Local sidecar gRPC endpoint — sidecar service runs on the same docker
       # network with the matching CONTAINER_NAME_SUFFIX.
       - SIDECAR_HOST=sidecar${CONTAINER_NAME_SUFFIX:-}
