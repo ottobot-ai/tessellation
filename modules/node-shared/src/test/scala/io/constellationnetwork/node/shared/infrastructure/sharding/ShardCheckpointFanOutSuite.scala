@@ -3,10 +3,12 @@ package io.constellationnetwork.node.shared.infrastructure.sharding
 import java.security.{KeyPair, SecureRandom}
 
 import cats.data.NonEmptyList
-import cats.effect.{IO, Resource}
+import cats.effect.std.Supervisor
+import cats.effect.{Deferred, IO, Resource}
 import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
+import scala.concurrent.duration._
 
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
@@ -298,5 +300,56 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
       )
       tips <- (0 until numShards).toList.traverse(i => rig.chainStores(ShardId.unsafeApply(i)).bestTip)
     } yield expect(tips.forall(_.isEmpty))
+  }
+
+  // ===========================================================================
+  // Test 4 — Slice S6: the fan-out runs OFF the caller's critical path
+  // ===========================================================================
+  //
+  // Both production call sites (`NakamotoSyncDaemon.processValidSnapshotInner` and
+  // `SnapshotLeaderLoop.onSlotWon`) launch `ShardCheckpointFanOut.run` via `supervisor.supervise(...)`
+  // INSTEAD of inline under `snapshotSemaphore.permit`, so the heavy S3 re-exec no longer adds latency
+  // to the snapshot-processing critical path. This test exercises that exact seam: it supervises a
+  // fan-out whose body is deliberately slow, and asserts the supervise call RETURNS to the caller before
+  // the body completes (i.e. the caller is not blocked), while the body still finishes in the background.
+  // It also confirms `supervise` does not propagate the body's effects synchronously — mirroring the
+  // lifetime-scoped fiber the daemon/leader use (not a leaked bare `Async.start`).
+  test("S6: supervise(fan-out) returns to the caller without awaiting the (slow) fan-out body") { res =>
+    implicit val (h, sp, ssl) = res
+    Supervisor[IO].use { supervisor =>
+      for {
+        rig <- freshRig(ssl, Ratio.One)
+        sc <- mkScSnapshots(numMgs = 8).map(_._1)
+        bodyDone <- Deferred[IO, Unit]
+        // The supervised effect: pause long enough that an inline call would dominate the caller's
+        // timing, then run the real fan-out, then signal completion.
+        slowFanOut =
+          IO.sleep(300.millis) >>
+            ShardCheckpointFanOut.run[IO](
+              stateChannelSnapshots = sc,
+              producedOrd = mkOrd(8000L),
+              epoch = EtaPeriod(0L),
+              shardProducers = rig.producers,
+              shardChainStores = rig.chainStores,
+              shardAssignment = rig.assignment,
+              logger = logger
+            ) >> bodyDone.complete(()).void
+        // Time how long it takes the CALLER to get past `supervisor.supervise(...)`. This is the exact
+        // shape of both fan-out sites; it must not include the 300ms body.
+        started <- IO.monotonic
+        _ <- supervisor.supervise(slowFanOut)
+        elapsed <- IO.monotonic.map(_ - started)
+        // The caller returned — the body has NOT signaled completion yet (it's still sleeping on the fiber).
+        notDoneYet <- bodyDone.tryGet.map(_.isEmpty)
+        // Background fiber eventually completes its fan-out + store off the critical path.
+        _ <- bodyDone.get.timeout(10.seconds)
+      } yield
+        expect.all(
+          // Caller unblocked well under the body's own 300ms sleep ⇒ the fan-out is genuinely off the
+          // caller's path (generous ceiling to avoid CI flakiness; the real gap is ~0ms vs 300ms).
+          elapsed < 200.millis,
+          notDoneYet
+        )
+    }
   }
 }

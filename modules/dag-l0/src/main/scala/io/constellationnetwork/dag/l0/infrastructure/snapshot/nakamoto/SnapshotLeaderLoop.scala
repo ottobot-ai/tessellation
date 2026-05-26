@@ -3,6 +3,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 import java.security.KeyPair
 
 import cats.effect.kernel.{Async, Clock, Ref}
+import cats.effect.std.Supervisor
 import cats.syntax.all._
 
 import scala.concurrent.duration._
@@ -437,6 +438,14 @@ object SnapshotLeaderLoop {
     // is active, used to partition the just-produced snapshot's `stateChannelSnapshots` per shard so
     // each producer only sees the MGs assigned to it.
     shardAssignment: Option[ShardAssignment[F]] = None
+  )(
+    // Slice S6: app-scoped Supervisor used to run the producer shard-checkpoint fan-out OFF the
+    // `snapshotSemaphore.permit` critical path in `onSlotWon`. Implicit so the existing
+    // `supervisor.supervise(SnapshotLeaderLoop.run[F](...))` call site in `GlobalSnapshotConsensus.make`
+    // resolves it from the SAME in-scope Supervisor with no positional change. The numShards=1 path is
+    // unaffected — the fan-out stays gated on `shardProducers.nonEmpty`, so the supervised block is never
+    // entered there regardless of this param.
+    implicit supervisor: Supervisor[F]
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
@@ -1202,6 +1211,9 @@ object SnapshotLeaderLoop {
     ],
     shardAssignment: Option[ShardAssignment[F]],
     logger: org.typelevel.log4cats.Logger[F]
+  )(
+    // Slice S6: app-scoped Supervisor for the off-critical-path producer fan-out (see Gap A below).
+    implicit supervisor: Supervisor[F]
   ): F[Unit] = {
     HasherSelector[F].withCurrent { implicit hasher =>
       for {
@@ -1542,21 +1554,48 @@ object SnapshotLeaderLoop {
                   // Gated on `stillOpen` so we only fan out when the gl0 snapshot was actually published +
                   // chain-stored — abandoning gl0 production (gate closed pre-publish, MPT rolled back) must
                   // NOT produce a shard checkpoint anchored to a gl0 ord that never committed.
+                  //
+                  // ─── Slice S6 — OFF the snapshot-processing critical path ───────────────────────────
+                  // `onSlotWon` runs INSIDE `snapshotSemaphore.permit.use` (see the call site in `run`). After
+                  // S3 the fan-out → `producer.produce` → `derivePerMgState` runs a full
+                  // `processCurrencySnapshots` re-execution per shard per ord — heavy. Running it inline under
+                  // the permit serialized that re-exec into every leader's per-ord production window and made
+                  // straggler nodes lag (one fell ~13 ords behind, tripping the ±3 cluster-sync check). We
+                  // launch it on the app-scoped `Supervisor` (lifetime-scoped — NOT a bare `Async.start`,
+                  // which previously leaked a fiber outliving its owner).
+                  //
+                  // DETERMINISM (why async is safe for the gl0 snapshot):
+                  //   1. Inputs captured BY VALUE here (`capturedStateChannelSnapshots`, `producedOrd`,
+                  //      `epoch`) before `supervise`, so the fiber sees the snapshot for THIS produced ord,
+                  //      not a later one. `signed.value.stateChannelSnapshots` is an immutable `SortedMap`.
+                  //   2. We're past the gl0 publish + chainStore write here (`stillOpen` confirms the gl0
+                  //      snapshot committed). The fan-out only SELF-stores its checkpoint into the per-shard
+                  //      `ShardChainStore` and publishes it — it never feeds back into the gl0 snapshot just
+                  //      produced, so inline-vs-fiber cannot change the gl0 snapshot's bytes.
+                  //   3. `ShardChainStore.store` is idempotent by hash + monotonic by shard ordinal, so the
+                  //      async write racing the next ord's read dedups safely.
                   _ <- Async[F].whenA(stillOpen && shardProducers.nonEmpty && shardAssignment.isDefined) {
+                    // Capture BY VALUE before starting the fiber (determinism point 1 above).
+                    val capturedStateChannelSnapshots = signed.value.stateChannelSnapshots
                     val producedOrd =
                       SnapshotOrdinal(NonNegLong.unsafeFrom(producedOrdinal))
                     val rotationPeriod = EtaCalculation.rotationPeriod(producedOrdinal, etaRotationSnapshots)
-                    HasherSelector[F].withCurrent { implicit hasher =>
-                      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointFanOut.run[F](
-                        stateChannelSnapshots = signed.value.stateChannelSnapshots,
-                        producedOrd = producedOrd,
-                        epoch = EtaPeriod(rotationPeriod),
-                        shardProducers = shardProducers,
-                        shardChainStores = shardChainStores,
-                        shardAssignment = shardAssignment.get,
-                        logger = logger
+                    val epoch = EtaPeriod(rotationPeriod)
+                    supervisor
+                      .supervise(
+                        HasherSelector[F].withCurrent { implicit hasher =>
+                          io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointFanOut.run[F](
+                            stateChannelSnapshots = capturedStateChannelSnapshots,
+                            producedOrd = producedOrd,
+                            epoch = epoch,
+                            shardProducers = shardProducers,
+                            shardChainStores = shardChainStores,
+                            shardAssignment = shardAssignment.get,
+                            logger = logger
+                          )
+                        }.handleErrorWith(e => logger.warn(e)(s"🧩 Shard producer fan-out failed for ord=$producedOrdinal"))
                       )
-                    }
+                      .void
                   }
                 } yield ()
             }

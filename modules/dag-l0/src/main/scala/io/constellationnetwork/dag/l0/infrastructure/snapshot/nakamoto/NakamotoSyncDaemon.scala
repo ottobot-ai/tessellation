@@ -1110,6 +1110,12 @@ object NakamotoSyncDaemon {
     ],
     shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
     logger: org.typelevel.log4cats.Logger[F]
+  )(
+    // Slice S6: the producer shard-checkpoint fan-out is moved OFF the snapshot-processing
+    // critical path (it's launched on this app-scoped Supervisor inside `processValidSnapshotInner`,
+    // not run inline under `snapshotSemaphore.permit`). Implicit so the existing positional call
+    // site needs no change — it resolves from `run`'s implicit `Supervisor[F]`.
+    implicit supervisor: Supervisor[F]
   ): F[Unit] = {
     // §1.2 Slice 9: snapshot KES gate runs BEFORE any state mutation. On no-sig /
     // decode-fail / verify-fail / step-out-of-range, drop the snapshot entirely — no
@@ -1190,6 +1196,9 @@ object NakamotoSyncDaemon {
     ],
     shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
     logger: org.typelevel.log4cats.Logger[F]
+  )(
+    // Slice S6: app-scoped Supervisor for the off-critical-path producer fan-out (see below).
+    implicit supervisor: Supervisor[F]
   ): F[Unit] =
     for {
       // Update network tip tracking
@@ -1246,23 +1255,54 @@ object NakamotoSyncDaemon {
       // `signedSnapshot` carries the canonical snapshot here; its `stateChannelSnapshots` are the binaries
       // partitioned per shard (an empty shard this ord ⇒ `produce` returns `None` ⇒ no empty checkpoint).
       //
-      // EMPTY / `None` at numShards=1 ⇒ `whenA(false)` ⇒ no allocation/log (regression bar).
+      // ─── Slice S6 — OFF the snapshot-processing critical path ───────────────────────────────────────
+      // S3 made this fan-out HEAVY: `ShardCheckpointFanOut.run` → `producer.produce` → `derivePerMgState`
+      // now runs a full `processCurrencySnapshots` re-execution per shard per ord. Running that inline
+      // here — while `processValidSnapshotInner`'s caller holds `snapshotSemaphore.permit` — added that
+      // re-exec latency to every node every ordinal, so a straggler fell ~13 ords behind and tripped the
+      // ±3 cluster-sync check. We launch it on the app-scoped `Supervisor` instead of inline (and instead
+      // of a bare `Async.start`, which previously leaked a fiber that outlived the daemon — see the
+      // backfill seam at the bottom of this object). The fiber is lifetime-scoped to the daemon.
+      //
+      // DETERMINISM (why moving this async is safe for the gl0 snapshot):
+      //   1. Inputs captured BY VALUE here — `stateChannelSnapshots`, `producedOrd`, `epoch` are bound
+      //      to immutable `val`s before `supervise`, so the fiber sees the canonical snapshot for THIS
+      //      ordinal, never a later mutated reference. `signed.value.stateChannelSnapshots` is itself an
+      //      immutable `SortedMap`, so the capture is a stable snapshot of the binaries for this ord.
+      //   2. The gl0 snapshot is ALREADY committed by the time we get here — the canonical-storage writes
+      //      above (setHeadForRecovery / setForRecovery) and the chainStore best-tip have already run for
+      //      this becameBestTip ord. The fan-out only SELF-stores its produced checkpoint into the
+      //      per-shard `ShardChainStore` and publishes it; it never feeds back into the gl0 snapshot being
+      //      processed. So whether it runs inline or on a fiber cannot change the gl0 snapshot's bytes.
+      //   3. `ShardChainStore.store` is idempotent by hash (per FanOut scaladoc) and monotonic by shard
+      //      ordinal, so the async write racing the NEXT ord's fan-out read is safe — an echo of the same
+      //      checkpoint dedups.
+      //
+      // EMPTY / `None` at numShards=1 ⇒ `whenA(false)` ⇒ nothing is captured or supervised (byte-identical
+      // to the pre-S6 inline path, which was itself `whenA(false)` there). Regression bar preserved.
       _ <- Async[F].whenA(becameBestTip && shardProducers.nonEmpty && shardAssignment.isDefined) {
         signedSnapshot match {
           case Some(signed) =>
+            // Capture BY VALUE before starting the fiber (determinism point 1 above).
+            val capturedStateChannelSnapshots = signed.value.stateChannelSnapshots
             val producedOrd = SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal))
             val rotationPeriod = EtaCalculation.rotationPeriod(snap.ordinal, etaRotationSnapshots)
-            HasherSelector[F].withCurrent { implicit hasher =>
-              io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointFanOut.run[F](
-                stateChannelSnapshots = signed.value.stateChannelSnapshots,
-                producedOrd = producedOrd,
-                epoch = EtaPeriod(rotationPeriod),
-                shardProducers = shardProducers,
-                shardChainStores = shardChainStores,
-                shardAssignment = shardAssignment.get,
-                logger = logger
+            val epoch = EtaPeriod(rotationPeriod)
+            supervisor
+              .supervise(
+                HasherSelector[F].withCurrent { implicit hasher =>
+                  io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointFanOut.run[F](
+                    stateChannelSnapshots = capturedStateChannelSnapshots,
+                    producedOrd = producedOrd,
+                    epoch = epoch,
+                    shardProducers = shardProducers,
+                    shardChainStores = shardChainStores,
+                    shardAssignment = shardAssignment.get,
+                    logger = logger
+                  )
+                }.handleErrorWith(e => logger.warn(e)(s"🧩 Shard producer fan-out failed for ord=${snap.ordinal}"))
               )
-            }
+              .void
           case None => Async[F].unit
         }
       }
