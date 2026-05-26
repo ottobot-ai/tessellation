@@ -47,6 +47,7 @@ import io.constellationnetwork.node.shared.infrastructure.gossip.event.EventGoss
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
+import io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
 import io.constellationnetwork.node.shared.infrastructure.snapshot._
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
   GlobalSnapshotAcceptanceManager,
@@ -345,6 +346,34 @@ object GlobalSnapshotConsensus {
         .map(_.publisher)
         .getOrElse(io.constellationnetwork.node.shared.infrastructure.local_events.LocalEventsPublisher.noop[F])
 
+      // Hierarchical-shard-checkpoints v1 — ACCEPTANCE-side production wiring (priority 1). Gated on
+      // `sharedCfg.nakamoto.sharding.numShards > 1`. At the production default `numShards = 1` this returns
+      // `None` (constructs nothing) and the GSAM `make` below passes `None` for all three sharding params —
+      // byte-identical to the pre-wiring call (the regression bar). See `ShardCheckpointWiring` scaladoc.
+      //
+      // This is the gl0-leader produce path, so the genesis-loaded `kesRegistry` (the make() param) IS in
+      // scope here — passed through so the acceptance manager verifies each checkpoint signer's KES product
+      // sig against the registered master VK. The active-validator set is the seedlist minus `metagraph-op`
+      // aliases (same derivation as `validatorPeers` in the inner block), falling back to `{selfId}`.
+      //
+      // `reExecuteDerivation` left at the `ShardCheckpointWiring.noReExecDerivation` default — the real
+      // per-MG re-exec needs GSAM's own `processCurrencySnapshots` pipeline, which is not available at this
+      // construction point (GSAM is being constructed). The stub fail-closes the `T_depth1_shard` degraded
+      // path (rejects non-quorum non-empty checkpoints) rather than admitting on an unverified derivation;
+      // no false slash occurs because Slice 13 only logs the mismatch signer list. See the wiring scaladoc.
+      shardAcceptanceDeps <- ShardCheckpointWiring
+        .acceptanceDeps[F](
+          cfg = sharedCfg.nakamoto.sharding,
+          selfPeerId = selfId,
+          kesRegistry = kesRegistry,
+          activeValidators = Async[F].pure(
+            seedlist
+              .map(_.collect { case e if !e.alias.exists(_.value.value == "metagraph-op") => e.peerId })
+              .getOrElse(Set(selfId))
+          )
+        )(Async[F], HasherSelector[F].getCurrent, implicitly[SecurityProvider[F]], implicitly[Metrics[F]])
+        .toResource
+
       snapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager
         .make[F](
           sharedCfg.fieldsAddedOrdinals,
@@ -376,7 +405,13 @@ object GlobalSnapshotConsensus {
           // but reconciling the two flags is out of scope for the Path 1 fix.
           etaRotationSnapshots = sharedCfg.nakamoto.etaRotationSnapshots.value,
           etaForPeriod = Some(etaForPeriodCallback),
-          localEventsPublisher = Some(localEventsPublisher)
+          localEventsPublisher = Some(localEventsPublisher),
+          // Hierarchical-shard-checkpoints v1 acceptance-side deps. `None` at `numShards = 1` (regression bar);
+          // `Some(...)` activates the shard-checkpoint admission path inside `accept()`. Mirrors the SharedServices
+          // GSAM construction so the gl0-leader-produce and verify paths stay consistent.
+          shardingConfig = shardAcceptanceDeps.map(_.shardingConfig),
+          shardCheckpointAcceptanceManager = shardAcceptanceDeps.map(_.acceptanceManager),
+          shardAssignment = shardAcceptanceDeps.map(_.shardAssignment)
         )
         .toResource
 

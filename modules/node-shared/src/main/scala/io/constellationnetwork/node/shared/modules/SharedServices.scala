@@ -33,6 +33,7 @@ import io.constellationnetwork.node.shared.infrastructure.gossip.{Gossip => Goss
 import io.constellationnetwork.node.shared.infrastructure.healthcheck.LocalHealthcheck
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
+import io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
 import io.constellationnetwork.node.shared.infrastructure.snapshot._
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.currency.CurrencySnapshotAcceptanceManager
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
@@ -231,6 +232,26 @@ object SharedServices {
           chainWalkFallback = nakamotoEtaChainWalkFallback.getOrElse(SharedServices.noopEtaChainWalk[F])
         )
       sharedEtaForPeriod = SharedServices.etaForPeriodCallback[F](etaStateManager)
+      // Hierarchical-shard-checkpoints v1 — ACCEPTANCE-side production wiring (priority 1). Gated on
+      // `cfg.nakamoto.sharding.numShards > 1`. At the production default `numShards = 1` this returns
+      // `None` (constructs nothing) and the GSAM call below passes `None` for all three sharding params —
+      // byte-identical to the pre-wiring call (the regression bar). See `ShardCheckpointWiring` scaladoc.
+      //
+      // The SharedServices GSAM is the verify/follower path (cl0/cl1/dl1/gl1 + gl0 follower). It has no
+      // genesis-loaded KesRegistry in scope (that lives at the gl0 layer — see GlobalSnapshotConsensus),
+      // so we pass `KesRegistry.empty`: the acceptance manager's registry-absent carve-out accepts on the
+      // Ed25519 signature strength alone. The active-validator set is the seedlist minus `metagraph-op`
+      // aliases (mirrors `GlobalSnapshotConsensus`'s `validatorPeers` derivation), falling back to `{nodeId}`.
+      shardAcceptanceDeps <- ShardCheckpointWiring.acceptanceDeps[F](
+        cfg = cfg.nakamoto.sharding,
+        selfPeerId = nodeId,
+        kesRegistry = io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[F],
+        activeValidators = Async[F].pure(
+          seedlist
+            .map(_.collect { case e if !e.alias.exists(_.value.value == "metagraph-op") => e.peerId })
+            .getOrElse(Set(nodeId))
+        )
+      )(Async[F], HasherSelector[F].getCurrent, implicitly[SecurityProvider[F]], implicitly[Metrics[F]])
       globalSnapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager.make(
         cfg.fieldsAddedOrdinals,
         cfg.metagraphsSync,
@@ -267,7 +288,13 @@ object SharedServices {
         // Path 1 (heap-leak workstream): wire the eta callback so the boundary-write at `ord % R == R - 1` lands a
         // real computed eta in the `HistoricalStakeSnapshot` MPT entry instead of `Hash.empty`. The callback is backed
         // by an [[EtaStateManager]] (MPT cache + caller-supplied chain-walk fallback) constructed above.
-        etaForPeriod = Some(sharedEtaForPeriod)
+        etaForPeriod = Some(sharedEtaForPeriod),
+        // Hierarchical-shard-checkpoints v1 acceptance-side deps. `None` at `numShards = 1` (regression bar);
+        // `Some(...)` activates the shard-checkpoint admission path inside `accept()`. The same
+        // `ShardCheckpointWiring.acceptanceDeps` result feeds both GSAM construction sites so they stay consistent.
+        shardingConfig = shardAcceptanceDeps.map(_.shardingConfig),
+        shardCheckpointAcceptanceManager = shardAcceptanceDeps.map(_.acceptanceManager),
+        shardAssignment = shardAcceptanceDeps.map(_.shardAssignment)
       )
       globalSnapshotContextFns = GlobalSnapshotContextFunctions.make(
         globalSnapshotAcceptanceManager,
