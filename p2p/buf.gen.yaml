@@ -1,0 +1,26 @@
+# buf code-generation template for the Go sidecar protobuf bindings.
+#
+# Reproducible regen (run from inside p2p/):
+#
+#   buf generate --template buf.gen.yaml --path proto/sidecar.proto
+#
+# MUST be scoped to `proto/sidecar.proto` via `--path`. The sibling
+# `proto/local_events.proto` has no `go_package` option and is NOT a Go
+# target (it is a JVM+JS gRPC service); including it makes
+# protoc-gen-go-grpc fail.
+#
+# `out: .` (the p2p module root) combined with `opt: paths=source_relative`
+# preserves the `proto/` prefix from the input path, so the generated files
+# land at `proto/sidecar.pb.go` + `proto/sidecar_grpc.pb.go` — NOT in a
+# nested `proto/proto/` directory.
+#
+# Remote plugin pins match the protoc-gen-go version recorded in the
+# generated file headers; bump both together if upgrading.
+version: v2
+plugins:
+  - remote: buf.build/protocolbuffers/go:v1.36.10
+    out: .
+    opt: paths=source_relative
+  - remote: buf.build/grpc/go:v1.6.1
+    out: .
+    opt: paths=source_relative
