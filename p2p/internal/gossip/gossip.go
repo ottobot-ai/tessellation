@@ -42,6 +42,38 @@ type Node struct {
 
 	cfg config.Config
 
+	// ── Per-shard checkpoint topics (Slice 14) ──
+	//
+	// Unlike the eight universal topics above — each a single handle joined
+	// once at construction — shard-checkpoint topics are per-shard
+	// (`<prefix><shardId>`) and the shard id is only known at publish/receive
+	// time, so they CANNOT be pre-joined. We keep two lazily-populated
+	// registries keyed by shard id (one for checkpoint envelopes, one for
+	// attestations), guarded by shardMu. The first publish or first Subscribe
+	// call for a given shard joins that shard's topic; thereafter the handle is
+	// reused.
+	//
+	// Two registries / two topic families mirror the MetagraphBinary /
+	// MetagraphAttestation split (design doc §6.4: the sidecar publishes
+	// checkpoints + attestations "analogous to pb.MetagraphBinary and
+	// pb.MetagraphAttestation"). Each per-shard topic therefore carries exactly
+	// one message type, so the relay never has to discriminate opaque bytes.
+	//
+	// Received messages from every joined shard fan IN to two shared,
+	// per-message-type channels (shardCheckpointCh / shardCheckpointAttCh) so
+	// the single gRPC Subscribe stream sees them without needing to know the
+	// shard set up front. The relay goroutine for a (shard, family) pair is
+	// started exactly once when its topic is first joined and runs for the
+	// node's lifetime (shardRelayCtx-scoped) — distinct from the
+	// per-Subscribe-call relays of the universal topics, because there is no
+	// per-call channel to key a shard subscription to.
+	shardMu                  sync.Mutex
+	shardCheckpointTopics    map[uint32]*pubsub.Topic
+	shardCheckpointAttTopics map[uint32]*pubsub.Topic
+	shardCheckpointCh        chan []byte
+	shardCheckpointAttCh     chan []byte
+	shardRelayCtx            context.Context // lifetime ctx for per-shard relay goroutines
+
 	// reconnectMu guards reconnectCh. When the mesh health monitor recovers
 	// from degradation, it closes reconnectCh (broadcasting to all Subscribe
 	// handlers) and creates a fresh channel.
@@ -221,6 +253,15 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		tokenLockBlockTopic:       tokenLockBlockTopic,
 		cfg:                       cfg,
 		reconnectCh:               make(chan struct{}),
+		// Per-shard checkpoint plumbing (Slice 14). Topics are joined lazily;
+		// the two shared fan-in channels are sized from cfg and drained by the
+		// gRPC Subscribe stream. `shardRelayCtx` ties per-shard relay goroutines
+		// to the node lifetime — they outlive any single Subscribe call.
+		shardCheckpointTopics:    make(map[uint32]*pubsub.Topic),
+		shardCheckpointAttTopics: make(map[uint32]*pubsub.Topic),
+		shardCheckpointCh:        make(chan []byte, cfg.ShardCheckpointBufferSize),
+		shardCheckpointAttCh:     make(chan []byte, cfg.ShardCheckpointBufferSize),
+		shardRelayCtx:            ctx,
 	}
 
 	// Start mDNS discovery for automatic peer finding on local network / Docker bridge.
@@ -446,6 +487,141 @@ func (n *Node) PublishTokenLockBlock(ctx context.Context, data []byte) error {
 		metrics.MessagesPublished.WithLabelValues("token_lock_block").Inc()
 	}
 	return err
+}
+
+// joinShardCheckpointTopic lazily joins the per-shard checkpoint-envelope
+// topic `<prefix><shardId>` and, on first join, starts a lifetime relay that
+// fans received envelopes into the shared shardCheckpointCh. Idempotent: the
+// second+ call for a shard returns the cached handle without re-joining or
+// re-subscribing. Mirrors the construction-time `ps.Join(...)` of the universal
+// topics, deferred to first use because the shard id is only known here.
+func (n *Node) joinShardCheckpointTopic(shardID uint32) (*pubsub.Topic, error) {
+	n.shardMu.Lock()
+	defer n.shardMu.Unlock()
+	if t, ok := n.shardCheckpointTopics[shardID]; ok {
+		return t, nil
+	}
+	topicName := fmt.Sprintf("%s%d", n.cfg.ShardCheckpointTopicPrefix, shardID)
+	t, err := n.PubSub.Join(topicName)
+	if err != nil {
+		return nil, fmt.Errorf("join shard-checkpoint topic %q: %w", topicName, err)
+	}
+	n.shardCheckpointTopics[shardID] = t
+	n.startShardRelay(t, n.shardCheckpointCh, "shard_checkpoint")
+	return t, nil
+}
+
+// joinShardCheckpointAttestationTopic is the attestation-family analog of
+// joinShardCheckpointTopic — separate topic `<attPrefix><shardId>`, relayed
+// into shardCheckpointAttCh.
+func (n *Node) joinShardCheckpointAttestationTopic(shardID uint32) (*pubsub.Topic, error) {
+	n.shardMu.Lock()
+	defer n.shardMu.Unlock()
+	if t, ok := n.shardCheckpointAttTopics[shardID]; ok {
+		return t, nil
+	}
+	topicName := fmt.Sprintf("%s%d", n.cfg.ShardCheckpointAttestationTopicPrefix, shardID)
+	t, err := n.PubSub.Join(topicName)
+	if err != nil {
+		return nil, fmt.Errorf("join shard-checkpoint-attestation topic %q: %w", topicName, err)
+	}
+	n.shardCheckpointAttTopics[shardID] = t
+	n.startShardRelay(t, n.shardCheckpointAttCh, "shard_checkpoint_attestation")
+	return t, nil
+}
+
+// startShardRelay subscribes to a per-shard topic and relays incoming
+// messages (excluding self-published) into the supplied shared channel,
+// dropping (and counting) when the channel is full. Same backpressure policy
+// as subscribeAndRelay; the difference is the destination channel is shared
+// across all shards of the same family and lives for the node lifetime
+// (shardRelayCtx), since there is no per-Subscribe-call channel to key a shard
+// subscription to. Caller holds shardMu (called only from the join helpers on
+// first join), so each topic gets exactly one relay goroutine.
+func (n *Node) startShardRelay(topic *pubsub.Topic, dst chan<- []byte, topicLabel string) {
+	sub, err := topic.Subscribe()
+	if err != nil {
+		fmt.Printf("ERROR: subscribe %s topic %q: %v\n", topicLabel, topic.String(), err)
+		return
+	}
+	go func() {
+		defer sub.Cancel()
+		for {
+			msg, err := sub.Next(n.shardRelayCtx)
+			if err != nil {
+				return
+			}
+			if msg.ReceivedFrom == n.Host.ID() {
+				continue
+			}
+			metrics.MessagesReceived.WithLabelValues(topicLabel).Inc()
+			select {
+			case dst <- msg.Data:
+			default:
+				metrics.MessagesDropped.WithLabelValues(topicLabel).Inc()
+			}
+		}
+	}()
+}
+
+// PublishShardCheckpoint publishes raw bytes to the per-shard checkpoint-
+// envelope topic `<prefix><shardId>` (Slice 14). Joins the topic on first use.
+// Carries a proto-marshalled ShardCheckpointWire serialized by the JVM; the
+// sidecar treats the payload as opaque and only derives the topic from shardID.
+// Analog of PublishMetagraphBinary, parameterized by shard.
+func (n *Node) PublishShardCheckpoint(ctx context.Context, shardID uint32, data []byte) error {
+	topic, err := n.joinShardCheckpointTopic(shardID)
+	if err != nil {
+		return err
+	}
+	err = topic.Publish(ctx, data)
+	if err == nil {
+		metrics.MessagesPublished.WithLabelValues("shard_checkpoint").Inc()
+	}
+	return err
+}
+
+// PublishShardCheckpointAttestation publishes raw bytes to the per-shard
+// checkpoint-attestation topic `<attPrefix><shardId>` (Slice 14). Joins the
+// topic on first use. Carries a proto-marshalled ShardCheckpointAttestationWire;
+// the sidecar treats the payload as opaque. Analog of
+// PublishMetagraphAttestation, parameterized by shard.
+func (n *Node) PublishShardCheckpointAttestation(ctx context.Context, shardID uint32, data []byte) error {
+	topic, err := n.joinShardCheckpointAttestationTopic(shardID)
+	if err != nil {
+		return err
+	}
+	err = topic.Publish(ctx, data)
+	if err == nil {
+		metrics.MessagesPublished.WithLabelValues("shard_checkpoint_attestation").Inc()
+	}
+	return err
+}
+
+// ShardCheckpointMessages returns the shared channel of incoming shard-
+// checkpoint envelopes, fanned in from every shard topic this node has joined
+// (Slice 14). Unlike the universal *Messages methods, this returns the single
+// node-lifetime channel rather than creating a fresh per-call subscription:
+// per-shard relays are started lazily by the publish path and write into this
+// one channel, which the gRPC Subscribe stream drains.
+//
+// Topic-join lifecycle: a committee member joins a shard's topic the first
+// time it publishes there (PublishShardCheckpoint /
+// PublishShardCheckpointAttestation), after which it relays in all other
+// members' messages on that shard. Because committee slot-leadership rotates,
+// every member joins through its own publish activity in steady state. An
+// explicit receiver-only join (a pure consumer that never publishes — e.g. the
+// separate gl0-wide signed-envelope topic of design doc §6.4) needs a join
+// hook the current proto does not yet expose; that path is part of the
+// deferred Slice 9 receiver-side wiring (NakamotoSyncDaemon).
+func (n *Node) ShardCheckpointMessages() <-chan []byte {
+	return n.shardCheckpointCh
+}
+
+// ShardCheckpointAttestationMessages returns the shared channel of incoming
+// shard-checkpoint attestations (Slice 14). See ShardCheckpointMessages.
+func (n *Node) ShardCheckpointAttestationMessages() <-chan []byte {
+	return n.shardCheckpointAttCh
 }
 
 // subscribeAndRelay creates a per-caller subscription on the given topic and

@@ -26,6 +26,16 @@ const (
 	TopicMetagraphAttestation = "metagraph-attestation"
 	TopicDAGBlock             = "dag-block"
 	TopicTokenLockBlock       = "token-lock-block"
+
+	// Slice 14: shard-checkpoint outbox labels. These are the stable
+	// family-prefix labels the JVM addresses entries by (matching
+	// SidecarClient.OutboxTopic.ShardCheckpoint /
+	// .ShardCheckpointAttestation); the actual per-shard GossipSub topic
+	// (`<topic-prefix><shardId>`) is derived from the message's shard_id at
+	// publish time. Distinct from the GossipSub topic-path prefixes in
+	// config.Config.
+	TopicShardCheckpoint            = "shard-checkpoint"
+	TopicShardCheckpointAttestation = "shard-checkpoint-attestation"
 )
 
 // Server implements the SidecarService and ChainSyncOutbound gRPC interfaces.
@@ -218,6 +228,45 @@ func (s *Server) PublishTokenLockBlock(ctx context.Context, blk *pb.TokenLockBlo
 	return &pb.PublishResponse{Ok: true}, nil
 }
 
+// PublishShardCheckpoint broadcasts a shard checkpoint envelope to the
+// per-shard checkpoint topic (Slice 14). The sidecar derives the GossipSub
+// topic from sc.ShardId — only operators in that shard subscribe, so non-shard
+// gl0s shed the load (design doc §6.4). Opaque payload — sidecar only wraps and
+// routes. Outbox-tracked; mirrors PublishMetagraphAttestation, with the shard
+// id threaded through so the periodic republisher can re-derive the topic.
+func (s *Server) PublishShardCheckpoint(ctx context.Context, sc *pb.ShardCheckpointWire) (*pb.PublishResponse, error) {
+	data, err := proto.Marshal(sc)
+	if err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	if err := s.node.PublishShardCheckpoint(ctx, sc.ShardId, data); err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	// Like MetagraphAttestation, the entire structured message IS the payload —
+	// no single inner field — so the outbox id is sha256 of the wire-level
+	// proto bytes. Both sender and receiver compute the id from these bytes.
+	// The shard id needed to re-derive the per-shard topic on republish is read
+	// back out of these same bytes in main.go's republisher.
+	s.outbox.Add(TopicShardCheckpoint, outbox.MsgIDFor(data), data)
+	return &pb.PublishResponse{Ok: true}, nil
+}
+
+// PublishShardCheckpointAttestation broadcasts a non-producing committee
+// member's attestation to the per-shard checkpoint-attestation topic (Slice
+// 14). Topic derived from sca.ShardId. Opaque payload — sidecar only wraps and
+// routes. Outbox-tracked; mirrors PublishMetagraphAttestation.
+func (s *Server) PublishShardCheckpointAttestation(ctx context.Context, sca *pb.ShardCheckpointAttestationWire) (*pb.PublishResponse, error) {
+	data, err := proto.Marshal(sca)
+	if err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	if err := s.node.PublishShardCheckpointAttestation(ctx, sca.ShardId, data); err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	s.outbox.Add(TopicShardCheckpointAttestation, outbox.MsgIDFor(data), data)
+	return &pb.PublishResponse{Ok: true}, nil
+}
+
 // ConfirmFinalized drops outbox entries for the named ids on the named
 // topic. Called by the JVM Phase-3 finality hook after a global snapshot
 // is fully finalized — at that point the entries it includes are durably
@@ -242,6 +291,14 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 	asbCh := s.node.AllowSpendBlockMessages(ctx)
 	dagCh := s.node.DAGBlockMessages(ctx)
 	tlbCh := s.node.TokenLockBlockMessages(ctx)
+	// Slice 14: shared per-shard fan-in channels. Unlike the universal topics
+	// these are node-lifetime channels (not per-call subscriptions) populated
+	// by relays started when each shard topic is first joined — so a single
+	// Subscribe stream sees envelopes/attestations from every shard this node
+	// has joined. Multiple concurrent Subscribe streams would race to drain
+	// these channels; in practice the JVM holds exactly one stream.
+	scCh := s.node.ShardCheckpointMessages()
+	scaCh := s.node.ShardCheckpointAttestationMessages()
 	reconnectCh := s.node.ReconnectCh()
 
 	for {
@@ -365,6 +422,36 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 			}
 			msg := &pb.GossipMessage{
 				Body: &pb.GossipMessage_TokenLockBlock{TokenLockBlock: &blk},
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+
+		case data, ok := <-scCh:
+			if !ok {
+				return nil
+			}
+			var sc pb.ShardCheckpointWire
+			if err := proto.Unmarshal(data, &sc); err != nil {
+				continue
+			}
+			msg := &pb.GossipMessage{
+				Body: &pb.GossipMessage_ShardCheckpoint{ShardCheckpoint: &sc},
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+
+		case data, ok := <-scaCh:
+			if !ok {
+				return nil
+			}
+			var sca pb.ShardCheckpointAttestationWire
+			if err := proto.Unmarshal(data, &sca); err != nil {
+				continue
+			}
+			msg := &pb.GossipMessage{
+				Body: &pb.GossipMessage_ShardCheckpointAttestation{ShardCheckpointAttestation: &sca},
 			}
 			if err := stream.Send(msg); err != nil {
 				return err

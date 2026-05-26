@@ -19,6 +19,7 @@ import (
 	libp2pnet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/scasplte2/tessellation/p2p/internal/chainsync"
 	"github.com/scasplte2/tessellation/p2p/internal/config"
@@ -27,6 +28,7 @@ import (
 	"github.com/scasplte2/tessellation/p2p/internal/httpbridge"
 	"github.com/scasplte2/tessellation/p2p/internal/metrics"
 	"github.com/scasplte2/tessellation/p2p/internal/outbox"
+	pb "github.com/scasplte2/tessellation/p2p/proto"
 )
 
 func main() {
@@ -337,6 +339,26 @@ func startOutboxRepublisher(ctx context.Context, node *gossip.Node, ob *outbox.O
 					perr = node.PublishDAGBlock(ctx, e.Payload)
 				case grpcserver.TopicTokenLockBlock:
 					perr = node.PublishTokenLockBlock(ctx, e.Payload)
+				case grpcserver.TopicShardCheckpoint:
+					// Slice 14: per-shard topic — re-derive the shard id from
+					// the stored wire bytes (the payload IS a marshalled
+					// ShardCheckpointWire) so the republish lands on the same
+					// per-shard topic the original publish used.
+					var sc pb.ShardCheckpointWire
+					if uerr := proto.Unmarshal(e.Payload, &sc); uerr != nil {
+						fmt.Printf("outbox: shard-checkpoint payload unmarshal failed, dropping entry: %v\n", uerr)
+						ob.Confirm(e.Topic, [][]byte{e.MsgID})
+						continue
+					}
+					perr = node.PublishShardCheckpoint(ctx, sc.ShardId, e.Payload)
+				case grpcserver.TopicShardCheckpointAttestation:
+					var sca pb.ShardCheckpointAttestationWire
+					if uerr := proto.Unmarshal(e.Payload, &sca); uerr != nil {
+						fmt.Printf("outbox: shard-checkpoint-attestation payload unmarshal failed, dropping entry: %v\n", uerr)
+						ob.Confirm(e.Topic, [][]byte{e.MsgID})
+						continue
+					}
+					perr = node.PublishShardCheckpointAttestation(ctx, sca.ShardId, e.Payload)
 				default:
 					// Unknown topic in outbox — bug elsewhere; drop the
 					// entry so it doesn't loop forever.

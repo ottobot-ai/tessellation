@@ -25,6 +25,23 @@ type Config struct {
 	DAGBlockTopic             string
 	TokenLockBlockTopic       string
 
+	// ShardCheckpointTopicPrefix / ShardCheckpointAttestationTopicPrefix are
+	// the GossipSub topic-path prefixes for the per-shard checkpoint topics
+	// (Slice 14). The actual topic joined at publish/receive time is
+	// `<prefix><shardId>` (e.g. .../0, .../1), so operators only subscribe to
+	// the shards they sit in (design doc §6.4 — sharding payoff). Unlike the
+	// eight universal topics above, these are prefixes rather than fixed
+	// topics: the shard id is only known at message time.
+	//
+	// Two distinct prefixes mirror the MetagraphBinary / MetagraphAttestation
+	// split exactly: the checkpoint envelope (analog of MetagraphBinary) and
+	// the non-producer attestation (analog of MetagraphAttestation) ride
+	// separate topics so each carries exactly one message type — the design
+	// doc §6.4 states the sidecar publishes them "analogous to today's
+	// pb.MetagraphBinary and pb.MetagraphAttestation".
+	ShardCheckpointTopicPrefix            string
+	ShardCheckpointAttestationTopicPrefix string
+
 	// GossipSub parameters
 	MeshD   int // target mesh degree (default 6)
 	MeshDLo int // low watermark (default 4)
@@ -46,6 +63,11 @@ type Config struct {
 	AllowSpendBlockBufferSize      int
 	DAGBlockBufferSize             int
 	TokenLockBlockBufferSize       int
+
+	// ShardCheckpointBufferSize sizes the per-shard relay channel for both
+	// checkpoint envelopes and attestations (Slice 14). One shared buffer
+	// applies to every shard's subscription.
+	ShardCheckpointBufferSize int
 
 	// Outbox parameters. The sidecar keeps an in-memory ledger of recently-
 	// published AllowSpendBlock / MetagraphBinary / MetagraphAttestation
@@ -89,10 +111,14 @@ func DefaultConfig() Config {
 		AllowSpendBlockTopic:      "/tessellation/allow-spend-blocks/1.0.0",
 		DAGBlockTopic:             "/tessellation/dag-blocks/1.0.0",
 		TokenLockBlockTopic:       "/tessellation/token-lock-blocks/1.0.0",
-		MeshD:                     6,
-		MeshDLo:                   4,
-		MeshDHi:                   12,
-		HeartbeatInterval:         10 * time.Second,
+		// Per-shard topics are `<prefix><shardId>` — e.g.
+		// /tessellation/shard-checkpoints/1.0.0/0 for shard 0.
+		ShardCheckpointTopicPrefix:            "/tessellation/shard-checkpoints/1.0.0/",
+		ShardCheckpointAttestationTopicPrefix: "/tessellation/shard-checkpoint-attestations/1.0.0/",
+		MeshD:                                 6,
+		MeshDLo:                               4,
+		MeshDHi:                               12,
+		HeartbeatInterval:                     10 * time.Second,
 		// Buffer sizes scale with expected burst rate per topic.
 		// Slots tick at 1 Hz; snapshots arrive ~every 7s (winning slots are sparse).
 		// Snapshot: ~1 per 7s → 64 tolerates ~7 min of backlog for a slow JVM consumer.
@@ -113,7 +139,11 @@ func DefaultConfig() Config {
 		// AllowSpendBlock; reuse the 256-slot default.
 		DAGBlockBufferSize:       256,
 		TokenLockBlockBufferSize: 256,
-		OutboxRepublishInterval:  30 * time.Second,
-		OutboxTTL:                1 * time.Hour,
+		// ShardCheckpoint: checkpoints are produced ~once per shard ordinal
+		// (gl0-anchor cadence) plus a committee-sized attestation fan-in;
+		// reuse the 256-slot default shared by the other low-cadence topics.
+		ShardCheckpointBufferSize: 256,
+		OutboxRepublishInterval:   30 * time.Second,
+		OutboxTTL:                 1 * time.Hour,
 	}
 }
