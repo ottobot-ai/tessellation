@@ -178,8 +178,8 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
         chainStores = perShard.map { case (sid, _, s) => sid -> s }.toMap
       )
 
-  /** Build SC snapshots for `numMgs` metagraphs (one binary each). Returns the map + the per-shard partition (so the test can assert
-    * which shards received content under the SAME deterministic mapping the fan-out uses).
+  /** Build SC snapshots for `numMgs` metagraphs (one binary each). Returns the map + the per-shard partition (so the test can assert which
+    * shards received content under the SAME deterministic mapping the fan-out uses).
     */
   private def mkScSnapshots(numMgs: Int)(
     implicit h: Hasher[IO]

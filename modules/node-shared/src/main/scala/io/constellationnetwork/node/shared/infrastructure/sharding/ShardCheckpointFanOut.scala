@@ -22,8 +22,8 @@ import org.typelevel.log4cats.Logger
 /** Shared shard-checkpoint producer fan-out — the seam that drives each per-shard [[ShardCheckpointProducer]] for ONE canonical gl0
   * ordinal, decoupled from the gl0-leader win.
   *
-  * '''Why this exists (decoupling per `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §6.1).''' Production used to live only inside
-  * `SnapshotLeaderLoop.onSlotWon`, which runs only on the node that won the gl0 slot. That made checkpoint production require a
+  * '''Why this exists (decoupling per `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §6.1).''' Production used to live only
+  * inside `SnapshotLeaderLoop.onSlotWon`, which runs only on the node that won the gl0 slot. That made checkpoint production require a
   * triple-coincidence (win gl0 slot + win shard slot + content present), so most shards stayed silent. The design intent is one checkpoint
   * per shard per gl0 ord, produced by the shard committee's slot leader — independent of who produced the gl0 snapshot. This helper is the
   * shared body invoked from BOTH seams:
@@ -49,9 +49,9 @@ object ShardCheckpointFanOut {
   /** Recover the VRF output (beta) from VRF proof bytes.
     *
     * '''Why duplicated here (module layering).''' `NakamotoSyncDaemon.vrfOutputFromProof` is the canonical copy, but it lives in `dag-l0`;
-    * `node-shared` (this module) cannot reference it without inverting the dependency direction. Both copies are the SAME one-liner over the
-    * SAME `EcVrf25519.default.vrfProofToHash`, so producer + receiver store byte-identical `vrfOutput` for the same checkpoint. If a future
-    * refactor lifts the daemon helper into `shared`/`node-shared`, both sites should re-route through it.
+    * `node-shared` (this module) cannot reference it without inverting the dependency direction. Both copies are the SAME one-liner over
+    * the SAME `EcVrf25519.default.vrfProofToHash`, so producer + receiver store byte-identical `vrfOutput` for the same checkpoint. If a
+    * future refactor lifts the daemon helper into `shared`/`node-shared`, both sites should re-route through it.
     */
   private val vrf = EcVrf25519.default
 
