@@ -1,5 +1,6 @@
 package io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global
 
+import cats.data.NonEmptyList
 import cats.effect.kernel.Async
 import cats.syntax.all._
 
@@ -7,6 +8,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardFinalityTriggers}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.sharding.ShardMetrics
+import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
@@ -122,9 +124,12 @@ object ShardCheckpointGl0AcceptanceManager {
     *   on the strength of the Ed25519 signature alone (Slice 10 will introduce runtime registration; this carve-out covers the bootstrap
     *   window).
     * @param reExecuteDerivation
-    *   `(metagraphAddress, headBinary) => F[Hash]`. Called only on the T_depth1-only path. Slice 9 ships this injectable; production wiring
-    *   (Slice 13) passes the closure that walks the per-MG chain and runs the existing `processCurrencySnapshots` derivation to compute the
-    *   local `mptRoot`. For tests: stub the callback to return a known hash (matching or not matching the checkpoint delta) per scenario.
+    *   `(metagraphAddress, includedChain) => F[Hash]`. Called only on the T_depth1-only path. Production wiring (S3) passes the closure
+    *   that re-runs the existing `GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot` (the SAME currency derivation gl0 uses for
+    *   metagraph snapshots) over the metagraph's full included SC-binary chain to compute the local per-MG MPT root, then compares it
+    *   byte-for-byte against the committee-signed `perMetagraphMptRoots(mg)`. This is the committee re-execution heart of S3 — an
+    *   attestation means "I independently re-ran this metagraph's derivation and got result R". For tests: stub the callback to return a
+    *   known hash (matching or not matching the checkpoint delta) per scenario.
     */
   def make[F[_]: Async: Hasher: SecurityProvider: Metrics](
     finalityTriggers: ShardId => F[Option[ShardFinalityTriggers[F]]],
@@ -133,7 +138,7 @@ object ShardCheckpointGl0AcceptanceManager {
     kTarget: Int,
     selfPeerId: PeerId,
     kesRegistry: KesRegistry[F],
-    reExecuteDerivation: (Address, Signed[StateChannelSnapshotBinary]) => F[Hash]
+    reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash]
   ): F[ShardCheckpointGl0AcceptanceManager[F]] = {
 
     // chainStore + selfPeerId + kTarget are reserved for forward compatibility (see scaladoc on the parameters); reference once to
@@ -332,10 +337,11 @@ object ShardCheckpointGl0AcceptanceManager {
 
           included.toList.traverse {
             case (mg, snaps) =>
-              // Head of the per-MG chain. Mirrors `ShardCheckpointProducer.assembleDelta` — the producer derives the MPT root
-              // off the head of the included chain, and the gl0 verifier re-runs that same derivation off the same head.
-              val head = snaps.head
-              reExecuteDerivation(mg, head).map { actual =>
+              // Full per-MG chain + the checkpoint's wire-carried `gl0AnchorOrdinal`. Mirrors `ShardCheckpointProducer.assembleDelta` —
+              // the producer derives the per-MG root off the whole included chain at the same anchor ordinal, and the gl0 verifier re-runs
+              // the SAME derivation off the SAME chain + ordinal. Byte-identical inputs ⇒ byte-identical roots (the S3 no-false-slashing
+              // contract).
+              reExecuteDerivation(mg, snaps, checkpoint.gl0AnchorOrdinal).map { actual =>
                 claimedRoots.get(mg) match {
                   case Some(claimed) if claimed === actual => Right(mg)
                   case Some(claimed) =>

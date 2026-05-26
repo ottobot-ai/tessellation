@@ -197,6 +197,13 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
         implicit hasher: Hasher[IO]
       ): IO[SortedMap[Address, MetagraphAcceptanceResult]] =
         SortedMap.empty[Address, MetagraphAcceptanceResult].pure[IO]
+
+      override def deriveMetagraphRoot(
+        metagraphAddress: Address,
+        binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+        snapshotOrdinal: SnapshotOrdinal,
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
+      )(implicit hasher: Hasher[IO]): IO[Hash] = Hash.empty.pure[IO]
     }
 
   /** Stubbed `ShardCheckpointGl0AcceptanceManager` — returns the configured result per checkpoint and records every call. */

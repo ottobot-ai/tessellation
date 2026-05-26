@@ -117,8 +117,14 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
   private def stubKesSigner: ShardCheckpointProducer.KesSigner[IO] =
     ShardCheckpointProducer.KesSigner.fixed[IO](period = 7, signatureBytes = fixedKesPayload)
 
-  private def deterministicDerive(mg: Address, snap: Signed[StateChannelSnapshotBinary]): IO[Hash] =
-    IO.pure(hashFromString(s"derived-${mg.value.value}-${snap.value.lastSnapshotHash.value.take(8)}"))
+  private def deterministicDerive(
+    mg: Address,
+    snaps: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+    anchor: SnapshotOrdinal
+  ): IO[Hash] = {
+    val _ = anchor
+    IO.pure(hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}"))
+  }
 
   private def mkOrd(value: Long): SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(value))
 

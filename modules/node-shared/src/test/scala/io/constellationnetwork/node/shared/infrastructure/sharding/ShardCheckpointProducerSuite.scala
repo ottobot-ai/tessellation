@@ -133,17 +133,25 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       }
     )
 
-  /** Deterministic `derivePerMgState` that returns a `Hash` derived from `(mg, snapshot.lastSnapshotHash)`. Lets tests assert on the per-MG
-    * hash values present in the produced `derivedStateDelta.perMetagraphMptRoots`.
+  /** Deterministic `derivePerMgState` that returns a `Hash` derived from `(mg, headBinary.lastSnapshotHash)`. Lets tests assert on the
+    * per-MG hash values present in the produced `derivedStateDelta.perMetagraphMptRoots`.
     */
-  private def deterministicDerive(mg: Address, snap: Signed[StateChannelSnapshotBinary]): IO[Hash] =
-    IO.pure(hashFromString(s"derived-${mg.value.value}-${snap.value.lastSnapshotHash.value.take(8)}"))
+  private def deterministicDerive(
+    mg: Address,
+    snaps: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+    anchor: SnapshotOrdinal
+  ): IO[Hash] = {
+    val _ = anchor
+    IO.pure(hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}"))
+  }
 
   /** A `derivePerMgState` callback that records which MGs it was invoked for. The test uses this to assert callback invocation count and
     * argument coverage matches the input map.
     */
-  private def recordingDerive(seen: cats.effect.kernel.Ref[IO, List[Address]]): (Address, Signed[StateChannelSnapshotBinary]) => IO[Hash] =
-    (mg, snap) => seen.update(_ :+ mg) >> deterministicDerive(mg, snap)
+  private def recordingDerive(
+    seen: cats.effect.kernel.Ref[IO, List[Address]]
+  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] =
+    (mg, snaps, anchor) => seen.update(_ :+ mg) >> deterministicDerive(mg, snaps, anchor)
 
   // Simple slot mapping: 1 slot per gl0 ord. Matches the e2e default cadence in spirit (slot-cadence is per-shard config; for tests,
   // identity-ish keeps the slot value bounded so the LDD ramp parameters are predictable).
@@ -186,7 +194,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     rig: TestRig,
     sigma: Ratio,
     shardEta: Array[Byte],
-    derive: (Address, Signed[StateChannelSnapshotBinary]) => IO[Hash] = deterministicDerive
+    derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] = deterministicDerive
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     ShardCheckpointProducer.make[IO](
       shardId = shardZero,

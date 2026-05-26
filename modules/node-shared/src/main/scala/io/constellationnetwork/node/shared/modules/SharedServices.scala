@@ -242,6 +242,18 @@ object SharedServices {
       // so we pass `KesRegistry.empty`: the acceptance manager's registry-absent carve-out accepts on the
       // Ed25519 signature strength alone. The active-validator set is the seedlist minus `metagraph-op`
       // aliases (mirrors `GlobalSnapshotConsensus`'s `validatorPeers` derivation), falling back to `{nodeId}`.
+      // S3 committee re-execution: the SAME `GlobalSnapshotStateChannelEventsProcessor` this (verify/follower) GSAM
+      // uses is built once and shared by the shard verifier's `reExecuteDerivation`, so the verifier re-runs the
+      // IDENTICAL currency derivation a producer used — the byte-identity contract that prevents false-slashing
+      // (see `GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot`).
+      shardScEventsProcessor = GlobalSnapshotStateChannelEventsProcessor
+        .make[F](
+          validators.stateChannelValidator,
+          globalSnapshotStateChannelManager,
+          currencySnapshotContextFns,
+          feeCalculator,
+          io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(storages.mptStore)
+        )
       shardAcceptanceDeps <- ShardCheckpointWiring.acceptanceDeps[F](
         cfg = cfg.nakamoto.sharding,
         selfPeerId = nodeId,
@@ -254,6 +266,11 @@ object SharedServices {
           seedlist
             .map(_.collect { case e if !e.alias.exists(_.value.value == "metagraph-op") => e.peerId })
             .getOrElse(Set(nodeId))
+        ),
+        // S3: real committee re-execution closure (replaces the `noReExecDerivation` fail-closed stub). Same shared
+        // processor as GSAM so producer↔verifier roots are byte-identical.
+        reExecuteDerivation = Some(
+          ShardCheckpointWiring.reExecDerivation[F](shardScEventsProcessor)(Async[F], HasherSelector[F].getCurrent)
         )
       )(Async[F], HasherSelector[F].getCurrent, implicitly[SecurityProvider[F]], implicitly[Metrics[F]])
       globalSnapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager.make(
@@ -263,14 +280,7 @@ object SharedServices {
         BlockAcceptanceManager.make[F](validators.blockValidator, txHasher),
         AllowSpendBlockAcceptanceManager.make[F](validators.allowSpendBlockValidator),
         TokenLockBlockAcceptanceManager.make[F](validators.tokenLockBlockValidator),
-        GlobalSnapshotStateChannelEventsProcessor
-          .make[F](
-            validators.stateChannelValidator,
-            globalSnapshotStateChannelManager,
-            currencySnapshotContextFns,
-            feeCalculator,
-            io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(storages.mptStore)
-          ),
+        shardScEventsProcessor,
         updateNodeParametersAcceptanceManager,
         updateDelegatedStakeAcceptanceManager,
         updateNodeCollateralAcceptanceManager,

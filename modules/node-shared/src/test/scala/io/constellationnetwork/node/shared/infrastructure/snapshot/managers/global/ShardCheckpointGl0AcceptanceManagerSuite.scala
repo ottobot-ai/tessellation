@@ -252,7 +252,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
     kTarget: Int = 4,
     selfId: PeerId,
     kesRegistry: KesRegistry[IO] = KesRegistry.empty[IO],
-    reExecuteDerivation: (Address, Signed[StateChannelSnapshotBinary]) => IO[Hash] = (_, _) => IO.pure(Hash("0" * 64))
+    reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] = (_, _, _) =>
+      IO.pure(Hash("0" * 64))
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointGl0AcceptanceManager[IO]] =
     ShardCheckpointGl0AcceptanceManager.make[IO](
       finalityTriggers = sid => IO.pure(finalityTriggers.get(sid)),
@@ -373,9 +374,16 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
 
       // Re-exec returns a HASH THAT DOES NOT MATCH — proves the manager never enters the re-exec path on the T_count fast path.
       reExecCalledRef <- cats.effect.Ref.of[IO, Boolean](false)
-      reExecCb = ((_: Address, _: Signed[StateChannelSnapshotBinary]) => reExecCalledRef.set(true).as(Hash("ff" * 32))): (
+      reExecCb = (
+        (
+          _: Address,
+          _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+          _: SnapshotOrdinal
+        ) => reExecCalledRef.set(true).as(Hash("ff" * 32))
+      ): (
         Address,
-        Signed[StateChannelSnapshotBinary]
+        NonEmptyList[Signed[StateChannelSnapshotBinary]],
+        SnapshotOrdinal
       ) => IO[Hash]
 
       mgr <- mkManager(
@@ -419,9 +427,10 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         selfId = selfPeer
       )
       // Re-exec returns the SAME mptRoot the delta claims → all-match path → Accepted.
-      reExecCb = ((_: Address, _: Signed[StateChannelSnapshotBinary]) => IO.pure(mptRoot)): (
+      reExecCb = ((_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal) => IO.pure(mptRoot)): (
         Address,
-        Signed[StateChannelSnapshotBinary]
+        NonEmptyList[Signed[StateChannelSnapshotBinary]],
+        SnapshotOrdinal
       ) => IO[Hash]
 
       mgr <- mkManager(
@@ -465,9 +474,10 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       )
       // Re-exec returns a WRONG hash for the MG — the manager should detect mismatch.
       wrongRoot = Hash("ff" * 32)
-      reExecCb = ((_: Address, _: Signed[StateChannelSnapshotBinary]) => IO.pure(wrongRoot)): (
+      reExecCb = ((_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal) => IO.pure(wrongRoot)): (
         Address,
-        Signed[StateChannelSnapshotBinary]
+        NonEmptyList[Signed[StateChannelSnapshotBinary]],
+        SnapshotOrdinal
       ) => IO[Hash]
 
       mgr <- mkManager(

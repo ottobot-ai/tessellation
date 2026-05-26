@@ -362,11 +362,24 @@ object GlobalSnapshotConsensus {
       // sig against the registered master VK. The active-validator set is the seedlist minus `metagraph-op`
       // aliases (same derivation as `validatorPeers` in the inner block), falling back to `{selfId}`.
       //
-      // `reExecuteDerivation` left at the `ShardCheckpointWiring.noReExecDerivation` default — the real
-      // per-MG re-exec needs GSAM's own `processCurrencySnapshots` pipeline, which is not available at this
-      // construction point (GSAM is being constructed). The stub fail-closes the `T_depth1_shard` degraded
-      // path (rejects non-quorum non-empty checkpoints) rather than admitting on an unverified derivation;
-      // no false slash occurs because Slice 13 only logs the mismatch signer list. See the wiring scaladoc.
+      // S3 committee re-execution: the SAME `GlobalSnapshotStateChannelEventsProcessor` gl0 uses for metagraph
+      // snapshots is built once here and shared by (a) GSAM acceptance, (b) the shard verifier's
+      // `reExecuteDerivation`, and (c) the shard producer's `derivePerMgState`. Sharing one instance is what
+      // guarantees producer + verifier run the IDENTICAL currency derivation — the byte-identity contract that
+      // prevents false-slashing (see `GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot`).
+      shardScEventsProcessor = GlobalSnapshotStateChannelEventsProcessor.make[F](
+        validators.stateChannelValidator,
+        globalStateChannelManager,
+        sharedServices.currencySnapshotContextFns,
+        feeCalculator,
+        io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
+      )
+
+      // `reExecuteDerivation` = the real S3 committee re-execution closure (replaces the
+      // `ShardCheckpointWiring.noReExecDerivation` fail-closed stub). On the `T_depth1_shard` degraded path the
+      // verifier re-runs each MG's derivation over its included chain at the wire-carried `gl0AnchorOrdinal` and
+      // rejects (+ surfaces slash signers) on a byte-mismatch. S3 wires re-exec → reject; APPLYING the slash
+      // penalty stays a separate slice (S2.0) — `processShardCheckpoints` still only logs the signer list.
       shardAcceptanceDeps <- ShardCheckpointWiring
         .acceptanceDeps[F](
           cfg = sharedCfg.nakamoto.sharding,
@@ -378,6 +391,9 @@ object GlobalSnapshotConsensus {
             seedlist
               .map(_.collect { case e if !e.alias.exists(_.value.value == "metagraph-op") => e.peerId })
               .getOrElse(Set(selfId))
+          ),
+          reExecuteDerivation = Some(
+            ShardCheckpointWiring.reExecDerivation[F](shardScEventsProcessor)(Async[F], HasherSelector[F].getCurrent)
           )
         )(Async[F], HasherSelector[F].getCurrent, implicitly[SecurityProvider[F]], implicitly[Metrics[F]])
         .toResource
@@ -390,13 +406,7 @@ object GlobalSnapshotConsensus {
           BlockAcceptanceManager.make[F](validators.blockValidator, txHasher),
           AllowSpendBlockAcceptanceManager.make[F](validators.allowSpendBlockValidator),
           TokenLockBlockAcceptanceManager.make[F](validators.tokenLockBlockValidator),
-          GlobalSnapshotStateChannelEventsProcessor.make[F](
-            validators.stateChannelValidator,
-            globalStateChannelManager,
-            sharedServices.currencySnapshotContextFns,
-            feeCalculator,
-            io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
-          ),
+          shardScEventsProcessor,
           sharedServices.updateNodeParametersAcceptanceManager,
           sharedServices.updateDelegatedStakeAcceptanceManager,
           sharedServices.updateNodeCollateralAcceptanceManager,
@@ -1245,8 +1255,11 @@ object GlobalSnapshotConsensus {
                       slotForGl0Anchor = slotForGl0Anchor,
                       slotGapFor = slotGapFor,
                       lddConfig = lddConfig,
-                      derivePerMgState =
-                        io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.noReExecDerivation[F]
+                      // S3: the SAME committee re-execution closure the verifier uses (built from the shared
+                      // `shardScEventsProcessor`), so the producer's `perMetagraphMptRoots` are recomputed
+                      // byte-identically by every verifier's `reExecuteDerivation`.
+                      derivePerMgState = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+                        .reExecDerivation[F](shardScEventsProcessor)(Async[F], shardHasher)
                     )
                     .map(shardId -> _)
               }

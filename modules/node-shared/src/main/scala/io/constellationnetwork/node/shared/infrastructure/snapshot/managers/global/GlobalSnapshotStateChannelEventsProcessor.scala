@@ -32,6 +32,7 @@ import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelSnapshotBinary, StateChannelValidationType}
 
 import io.circe.Decoder
+import io.circe.disjunctionCodecs._
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
@@ -62,6 +63,54 @@ trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
   )(
     implicit hasher: Hasher[F]
   ): F[SortedMap[Address, MetagraphAcceptanceResult]]
+
+  /** Re-execute one metagraph's included SC-binary chain and return its canonical per-MG MPT root — the hierarchical-shard-checkpoints S3
+    * committee re-execution primitive (`docs/nakamoto/SHARD-SORTITION-WORKSTREAM-PLAN.md` slice S3).
+    *
+    * '''What it computes.''' Runs the SAME [[processCurrencySnapshots]] derivation gl0 uses for metagraph snapshots over the single-MG
+    * window `Map(metagraphAddress -> binaries)`, takes the LAST resulting [[CurrencySnapshotWithState]] (mirrors
+    * `calculateLastCurrencySnapshots`, which is what feeds `GlobalSnapshotInfo.lastCurrencySnapshots` →
+    * `GlobalSnapshotAcceptanceManager.buildMerkleTreeAndProofs` → `stateProof.lastCurrencySnapshotsProof`). When a state is derived it
+    * hashes the bare `(metagraphAddress, lastState)` — byte-identical to the per-MG leaf `buildMerkleTreeAndProofs` hashes (`(address,
+    * state).hash`), i.e. the per-MG canonical root the design's `ShardDerivedStateDelta.perMetagraphMptRoots` carries. When NO state is
+    * derived (empty-prior incremental-only window) it hashes the address alone as a deterministic sentinel. The S3 contract is
+    * producer-root == verifier-root (both call THIS function over the same inputs), which holds on both branches.
+    *
+    * '''Determinism contract (the S3 false-slashing crux — Q2).''' The root MUST be a pure function of the included `binaries` alone, so
+    * the producer and EVERY committee verifier compute byte-identical results regardless of when/where they re-execute. To guarantee that,
+    * the re-execution runs with `priorLastCurrencySnapshots = SortedMap.empty` — it does NOT read prior metagraph state from the live
+    * `MptStore` (which would differ across nodes: the producer's fan-out runs after the gl0 MPT was committed to the produced ord —
+    * POST-apply — while the gl0 verifier re-runs inside `accept()` PRE-apply, and the gossip-handler verifier reads whatever ordinal the
+    * live MPT currently holds). Reading the live MPT here would make honest committee members compute divergent roots and falsely slash
+    * each other.
+    *
+    * '''Consequence (documented boundary).''' With an empty prior, the root is fully correct and meaningful for any chain whose head begins
+    * from a full `CurrencySnapshot` (genesis-rooted, or any window carrying a full snapshot) — `processCurrencySnapshots` seeds the prior
+    * state from `fullSnapshot.value.info` self-containedly. For incremental-ONLY windows over a non-empty prior, the empty-prior re-exec
+    * yields a deterministic but prior-agnostic root; carrying the real gl0-finalized prior at `gl0AnchorOrdinal` byte-identically across
+    * nodes needs an ordinal-pinned base read (or a re-exec-gated parent-result cache) and is a follow-up. The byte-identity contract — and
+    * therefore the no-false-slashing safety bar — holds in BOTH cases because producer and verifier run the IDENTICAL function over the
+    * IDENTICAL inputs.
+    *
+    * @param metagraphAddress
+    *   the metagraph this root is for. The single key of the re-execution window.
+    * @param binaries
+    *   the metagraph's included SC-binary chain for this checkpoint (the `ShardCheckpoint.derivedStateDelta.includedSnapshots(mg)`
+    *   `NonEmptyList`). Re-executed head-to-tail by `processCurrencySnapshots`.
+    * @param snapshotOrdinal
+    *   the gl0 anchor ordinal the checkpoint rides into. Feeds the fee-required cutover (`feeCalculator.isFeeRequired`) so the producer +
+    *   verifier agree on whether fees are deducted. Wire-carried (`ShardCheckpoint.gl0AnchorOrdinal`) so all members pass the same value.
+    * @param getGlobalSnapshotByOrdinal
+    *   passthrough to `processCurrencySnapshots` (used by `applyCurrencySnapshot` for cross-snapshot context). For S3 the producer +
+    *   verifier wire the same gl0 snapshot lookup; on the no-prior path it is only consulted for the second-and-subsequent incremental,
+    *   which the empty-prior window does not reach for a genesis-rooted chain.
+    */
+  def deriveMetagraphRoot(
+    metagraphAddress: Address,
+    binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+    snapshotOrdinal: SnapshotOrdinal,
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+  )(implicit hasher: Hasher[F]): F[Hash]
 }
 
 object GlobalSnapshotStateChannelEventsProcessor {
@@ -382,6 +431,42 @@ object GlobalSnapshotStateChannelEventsProcessor {
           }
         }
       }
+
+      def deriveMetagraphRoot(
+        metagraphAddress: Address,
+        binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+        snapshotOrdinal: SnapshotOrdinal,
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+      )(implicit hasher: Hasher[F]): F[Hash] =
+        // Re-run the SAME currency derivation gl0 uses, scoped to this single MG. Empty `priorLastCurrencySnapshots` (and empty
+        // `currentBalances`) keeps the result a PURE function of `binaries` — the producer + every verifier compute byte-identical
+        // roots regardless of their live MPT state (the S3 false-slashing crux; see the trait scaladoc).
+        processCurrencySnapshots(
+          snapshotOrdinal,
+          SortedMap.empty[Address, Balance],
+          SortedMap.empty[Address, CurrencySnapshotWithState],
+          SortedMap(metagraphAddress -> binaries),
+          getGlobalSnapshotByOrdinal
+        ).flatMap { accepted =>
+          // Mirror `calculateLastCurrencySnapshots`: the LAST resulting state across the re-executed chain is what feeds
+          // `lastCurrencySnapshots` → `buildMerkleTreeAndProofs`.
+          val lastState: Option[CurrencySnapshotWithState] =
+            accepted.get(metagraphAddress).flatMap { case (pairs, _) => pairs.toList.flatMap(_._2).lastOption }
+          lastState match {
+            // Canonical per-MG Merkle leaf — byte-identical to `GlobalSnapshotAcceptanceManager.buildMerkleTreeAndProofs`'s
+            // `(address, state).hash` over the JsonHash logic (this is the leaf the gl0 metagraph-tree is built from).
+            case Some(state) => hasher.hash((metagraphAddress, state))
+            // No state derived (e.g. an incremental-only chain over an empty prior). Deterministic address-only sentinel so the
+            // producer + verifier still agree on a value (the byte-identity contract holds — both reach this branch identically).
+            case None => hasher.hash(metagraphAddress)
+          }
+        }.handleErrorWith { _ =>
+          // A derivation crash (e.g. a malformed binary whose `content` fails brotli decompression — the `(None, head :: tail)` deserialize
+          // path in `processCurrencySnapshots` does not catch that) maps to the SAME deterministic address-only sentinel. Keeping
+          // `deriveMetagraphRoot` total + node-agnostic preserves the byte-identity contract (producer + every verifier crash identically
+          // on the identical malformed input) rather than propagating a non-deterministic failure into the slot-leader / accept path.
+          hasher.hash(metagraphAddress)
+        }
 
       private def processStateChannelEvents(
         ordinal: SnapshotOrdinal,

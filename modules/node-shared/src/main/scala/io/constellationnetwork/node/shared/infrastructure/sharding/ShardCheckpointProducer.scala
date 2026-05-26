@@ -261,9 +261,12 @@ object ShardCheckpointProducer {
     * @param lddConfig
     *   per-shard LDD config. Production wiring uses `LddConfig.Default` (matches gl0) unless a per-shard tuning is later introduced.
     * @param derivePerMgState
-    *   injectable per-MG derivation. Slice 8 doesn't reach into `TokenLockStateManager` etc. — caller (slice 9 / 13 wiring) supplies the
-    *   actual derivation closure that computes the per-MG MPT subtree root from the binary. For tests, pass a fake closure that returns a
-    *   deterministic stub hash per MG.
+    *   injectable per-MG derivation `(metagraphAddress, includedChain, gl0AnchorOrdinal) => F[Hash]` that re-runs the metagraph's currency
+    *   derivation over its full included SC-binary chain and returns the canonical per-MG MPT root. The `gl0AnchorOrdinal` (the
+    *   checkpoint's own anchor) feeds the fee-required cutover so the producer + verifier agree. Production wiring (S3) closes over
+    *   `GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot` — the SAME derivation gl0 uses for metagraph snapshots — so the
+    *   committee verifier (`ShardCheckpointGl0AcceptanceManager.reExecuteDerivation`) recomputes a byte-identical `Hash` over the same
+    *   inputs. For tests, pass a fake closure that returns a deterministic stub hash per MG.
     *
     * The implicit `Hasher[F]` is required for the canonical preimage hash; `SecurityProvider[F]` is required for the Ed25519 sign path
     * (`Signing.signData`).
@@ -282,7 +285,7 @@ object ShardCheckpointProducer {
     slotForGl0Anchor: SnapshotOrdinal => Slot,
     slotGapFor: (Slot, Option[Slot]) => Long,
     lddConfig: LddConfig,
-    derivePerMgState: (Address, Signed[StateChannelSnapshotBinary]) => F[Hash]
+    derivePerMgState: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash]
   ): F[ShardCheckpointProducer[F]] = Async[F].delay {
     val logger = Slf4jLogger.getLoggerFromName[F](s"ShardCheckpointProducer[$shardId]")
 
@@ -335,7 +338,7 @@ object ShardCheckpointProducer {
                   case Some((vrfProof, _)) =>
                     // Won the lottery — build the checkpoint, sign it, publish it.
                     for {
-                      delta <- assembleDelta(pendingSnapshots)
+                      delta <- assembleDelta(pendingSnapshots, gl0AnchorOrdinal)
                       checkpoint = ShardCheckpoint(
                         shardId = shardId,
                         parentCheckpointHash = parentHash,
@@ -383,21 +386,22 @@ object ShardCheckpointProducer {
 
       /** Build the [[ShardDerivedStateDelta]] from the pending per-MG snapshots.
         *
-        * '''Slice 8 scope''': only `perMetagraphMptRoots` (from the injectable callback) and `includedSnapshots` (verbatim from the input)
-        * are populated. The other fields (`tokenLockBalancesDelta`, `perMetagraphArtifacts`, `perMetagraphSyncDataDelta`) are left empty —
-        * the actual derivation logic for those slots in via slice 9 / 13 when the real derivation closure is wired into GSAM.
+        * '''Scope''': `perMetagraphMptRoots` (from the injectable re-exec callback) and `includedSnapshots` (verbatim from the input) are
+        * populated. The other fields (`tokenLockBalancesDelta`, `perMetagraphArtifacts`, `perMetagraphSyncDataDelta`) are left empty —
+        * those per-MG derivations migrate from gl0 to the shard in a later slice.
         */
       private def assembleDelta(
-        pendingSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]
+        pendingSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+        gl0AnchorOrdinal: SnapshotOrdinal
       ): F[ShardDerivedStateDelta] =
-        // For each MG, call the injectable `derivePerMgState(mg, headBinary)` once on the head of the per-MG chain. The head is the
-        // "newest" SC binary in this checkpoint's window (`NonEmptyList.head`) — the producer uses it as the per-MG state representative.
-        // Slice 9 / 13 wiring will pass a real derivation closure that walks the chain and re-executes the per-MG processCurrencySnapshots
-        // logic; for slice 8 the callback signature is `(Address, Signed[StateChannelSnapshotBinary]) => F[Hash]` and the producer just
-        // collects the results.
+        // For each MG, call the injectable `derivePerMgState(mg, includedChain, gl0AnchorOrdinal)` over the FULL per-MG chain (S3). The
+        // closure re-runs the metagraph's currency derivation (`GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot`)
+        // head-to-tail and returns the canonical per-MG MPT root. Passing the whole `NonEmptyList` (not just the head) re-executes a
+        // multi-binary window correctly; passing the wire-carried `gl0AnchorOrdinal` makes the fee cutover byte-identical to what the gl0
+        // verifier's `reExecuteDerivation` re-runs over the same `includedSnapshots(mg)`.
         pendingSnapshots.toList.traverse {
           case (mg, snaps) =>
-            derivePerMgState(mg, snaps.head).map(h => mg -> h)
+            derivePerMgState(mg, snaps, gl0AnchorOrdinal).map(h => mg -> h)
         }.map { perMg =>
           ShardDerivedStateDelta(
             perMetagraphMptRoots = SortedMap.from(perMg),

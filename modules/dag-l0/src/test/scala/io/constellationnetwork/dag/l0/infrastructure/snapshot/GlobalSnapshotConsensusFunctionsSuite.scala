@@ -228,6 +228,13 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       ]
     ] = ???
 
+    def deriveMetagraphRoot(
+      metagraphAddress: Address,
+      binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+      snapshotOrdinal: SnapshotOrdinal,
+      getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+    )(implicit hasher: Hasher[F]): IO[Hash] = ???
+
   }
 
   private val signedValidator = new SignedValidator[IO] {

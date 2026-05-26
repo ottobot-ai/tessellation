@@ -197,6 +197,13 @@ object Mocks {
         SortedMap
           .empty[Address, (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], BalanceUpdate)]
           .pure[IO]
+
+      override def deriveMetagraphRoot(
+        metagraphAddress: Address,
+        binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+        snapshotOrdinal: SnapshotOrdinal,
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
+      )(implicit hasher: Hasher[IO]): IO[Hash] = Hash.empty.pure[IO]
     }
 
     val mockUpdateNodeParametersAcceptanceManager = new UpdateNodeParametersAcceptanceManager[IO] {
