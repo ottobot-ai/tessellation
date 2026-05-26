@@ -21,6 +21,7 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.{Go
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics._
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointAcceptResult
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
@@ -68,6 +69,24 @@ object NakamotoSyncDaemon {
     */
   private[nakamoto] def vrfOutputFromProof(proofBytes: Array[Byte]): Array[Byte] =
     vrf.vrfProofToHash(proofBytes).getOrElse(proofBytes) // fallback to raw proof if derivation fails
+
+  /** S3 attestation-inversion gate: decides whether a re-exec/validated `ShardCheckpoint` may be adopted as best-tip and attested.
+    *
+    * Mirrors the global chain's validate-by-replay → adopt → attest discipline: a node adopts (+ counts the signers' attestations + emits
+    * its own attestation) ONLY for a checkpoint that passed `ShardCheckpointGl0AcceptanceManager.evaluate`'s pre-checks AND
+    * (quorum-attested OR re-exec matched). A `Rejected` (pre-check fail) or `RejectedReExecutionMismatch` (wrong-derivation) checkpoint is
+    * NOT admissible — never adopted, signers never counted toward quorum, no attestation emitted. `PendingMoreAttestations` is admissible
+    * (valid-so-far; the chain must advance toward quorum/depth, and re-exec — if it ever fires on the degraded path — gates a later eval).
+    *
+    * Pure + package-visible so the inversion gate is unit-testable without standing up the full gossip handler.
+    */
+  private[nakamoto] def shardCheckpointAdmissible(result: ShardCheckpointAcceptResult): Boolean =
+    result match {
+      case ShardCheckpointAcceptResult.Accepted                          => true
+      case ShardCheckpointAcceptResult.PendingMoreAttestations           => true
+      case ShardCheckpointAcceptResult.Rejected(_)                       => false
+      case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(_, _) => false
+    }
 
   /** Ethereum-style mempool reconciliation after catch-up/reorg.
     *
@@ -1743,47 +1762,75 @@ object NakamotoSyncDaemon {
                 val vrfOut = vrfOutputFromProof(checkpoint.committeeSignatures.head.vrfProof.toBytes)
                 HasherSelector[F].withCurrent { implicit hasher =>
                   hasher.hash(checkpoint.signingPreimage).flatMap { checkpointHash =>
-                    entry.chainStore
-                      .store(signedCheckpoint, checkpoint.parentCheckpointHash, checkpoint.shardOrdinal, localSlot, vrfOut)
-                      .flatMap { stored =>
-                        // Became-best-tip gate — byte-identical to the gl0 `becameBest = isNew && bestTipOpt.exists(_.hash === thisHash)`
-                        // seam (see the global handler). `store` returns `isNew`; if the incoming checkpoint is now the canonical bestTip
-                        // (per ShardChainStore maxvalid-tk fork choice), THIS node attests once for this winning hash.
-                        entry.chainStore.bestTip.flatMap { bestTipOpt =>
-                          val becameBestTip = stored && bestTipOpt.exists(_.hash === checkpointHash)
-                          // Record every committee signer (the producer's own sig seeds 1 attestation) into the tip tracker.
-                          checkpoint.committeeSignatures.toList
-                            .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId)) >>
-                            // T_count_shard quorum closure: on best-tip, sign + gossip OUR own attestation so every OTHER node's tracker
-                            // crosses ⌈2·K_S/3⌉. Self-exclusion (P-11b) keeps it out of our own threshold count. `None` emitter
-                            // (numShards=1 regression bar) ⇒ no emit. Background-fire so the multi-step sign+publish never blocks this
-                            // handler (the handler is already inside an `Async.start`, but the emit is an independent fire-and-forget).
-                            Async[F].whenA(becameBestTip) {
-                              shardCheckpointAttestationEmitter match {
-                                case None          => Async[F].unit
-                                case Some(emitter) =>
-                                  // Resolve the parent's gl0 anchor ordinal (for the LDD slot-gap) from the chain store. Genesis parent
-                                  // (Hash.empty, not stored) ⇒ None ⇒ the emitter's `slotGapFor` handles the no-parent case.
-                                  entry.chainStore.getByHash(checkpoint.parentCheckpointHash).flatMap { parentOpt =>
-                                    emitter.emit(
-                                      checkpoint.shardId,
-                                      checkpointHash,
-                                      checkpoint.gl0AnchorOrdinal,
-                                      checkpoint.epoch,
-                                      parentOpt.map(_.signed.value.gl0AnchorOrdinal)
-                                    )
+                    // S3 — FIX THE ATTESTATION INVERSION. Mirror the global chain's gate
+                    // (validate-by-replay → adopt as best-tip → emitAttestation): re-exec/validate the checkpoint FIRST, and
+                    // only adopt it into the fork DAG + count its signers' attestations + emit OUR own attestation if the
+                    // derivation matched. Previously the emit fired on `becameBestTip` BEFORE `evaluate`, so a node could attest
+                    // (and adopt) a checkpoint whose derivation it had not re-run. `evaluate` runs the committee re-execution
+                    // (`reExecuteDerivation`) on the degraded `T_depth1_shard` path; on the `T_count_shard` fast path it is
+                    // quorum-attested (already cryptographically pre-checked). A `Rejected`/`RejectedReExecutionMismatch` result
+                    // is DROPPED — not stored as adoptable, signers NOT counted, NO attestation emitted (a re-exec deviator must
+                    // not have its checkpoint adopted nor be rewarded with our attestation). Per Q4 the handler stays
+                    // `Async.start`-ed off the gossip thread (see the caller), but WITHIN it the emit is gated on re-exec success.
+                    deps.acceptanceManager.evaluate(checkpoint).flatMap { result =>
+                      // Inversion gate (see `shardCheckpointAdmissible`): adopt + count signers + emit ONLY on a non-rejecting result.
+                      val admissible = shardCheckpointAdmissible(result)
+                      val adoptAndAttest =
+                        entry.chainStore
+                          .store(signedCheckpoint, checkpoint.parentCheckpointHash, checkpoint.shardOrdinal, localSlot, vrfOut)
+                          .flatMap { stored =>
+                            // Became-best-tip gate — byte-identical to the gl0 `becameBest = isNew && bestTipOpt.exists(_.hash ===
+                            // thisHash)` seam. `store` returns `isNew`; if the (re-exec-validated) checkpoint is now the canonical
+                            // bestTip (per ShardChainStore maxvalid-tk fork choice), THIS node attests once for this winning hash.
+                            entry.chainStore.bestTip.flatMap { bestTipOpt =>
+                              val becameBestTip = stored && bestTipOpt.exists(_.hash === checkpointHash)
+                              // Record every committee signer (the producer's own sig seeds 1 attestation) into the tip tracker —
+                              // only now that re-exec validated the checkpoint (so a wrong-derivation envelope never inflates quorum).
+                              checkpoint.committeeSignatures.toList
+                                .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId)) >>
+                                // T_count_shard quorum closure: on best-tip, sign + gossip OUR own attestation so every OTHER node's
+                                // tracker crosses ⌈2·K_S/3⌉. Self-exclusion (P-11b) keeps it out of our own threshold count. `None`
+                                // emitter (numShards=1 regression bar) ⇒ no emit. Background-fire so the multi-step sign+publish
+                                // never blocks this handler (the handler is already inside an `Async.start`).
+                                Async[F]
+                                  .whenA(becameBestTip) {
+                                    shardCheckpointAttestationEmitter match {
+                                      case None          => Async[F].unit
+                                      case Some(emitter) =>
+                                        // Resolve the parent's gl0 anchor ordinal (for the LDD slot-gap) from the chain store. Genesis
+                                        // parent (Hash.empty, not stored) ⇒ None ⇒ the emitter's `slotGapFor` handles the no-parent case.
+                                        entry.chainStore.getByHash(checkpoint.parentCheckpointHash).flatMap { parentOpt =>
+                                          emitter.emit(
+                                            checkpoint.shardId,
+                                            checkpointHash,
+                                            checkpoint.gl0AnchorOrdinal,
+                                            checkpoint.epoch,
+                                            parentOpt.map(_.signed.value.gl0AnchorOrdinal)
+                                          )
+                                        }
+                                    }
                                   }
-                              }
-                            } >>
-                            deps.acceptanceManager.evaluate(checkpoint).flatMap { result =>
-                              logger.info(
-                                s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
-                                  s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
-                                  s"signers=${checkpoint.committeeSignatures.size} storedNew=$stored becameBestTip=$becameBestTip evaluate=$result"
-                              )
+                                  .as(becameBestTip)
                             }
+                          }
+                      val logSkipped =
+                        logger
+                          .info(
+                            s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
+                              s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
+                              s"signers=${checkpoint.committeeSignatures.size} evaluate=$result — NOT adopted/attested (re-exec/pre-check reject)"
+                          )
+                          .as(false)
+                      (if (admissible) adoptAndAttest else logSkipped).flatMap { becameBestTip =>
+                        Async[F].whenA(admissible) {
+                          logger.info(
+                            s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
+                              s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
+                              s"signers=${checkpoint.committeeSignatures.size} becameBestTip=$becameBestTip evaluate=$result (re-exec validated)"
+                          )
                         }
                       }
+                    }
                   }
                 }
             }
