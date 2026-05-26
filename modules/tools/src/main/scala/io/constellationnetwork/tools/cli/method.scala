@@ -53,6 +53,29 @@ object method {
 
   case class TxSenderCmd(configPath: String) extends CliMethod
 
+  /** Shard-assignment query helper (shard-sortition workstream Slice S7 — e2e harness).
+    *
+    * Given a DAG address and a shard count `M`, prints the [[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment]]
+    * `shardId` to stdout. Reuses the production `ShardAssignment.make[F](numShards).shardIdFor(addr)` path verbatim — the address is routed
+    * through the same `Hasher[F]` (`SHA256(Brotli(circeJson(addr)))`) the consensus code uses, so there is zero risk of hash-chain drift
+    * between this helper and the running cluster.
+    *
+    * Used by the metagraph key-grinding routine in `docker/bin/compose-runner.sh` (and its dry-run in
+    * `docker/bin/grind-metagraph-shards-dryrun.sh`) to spread metagraphs evenly across shards for the N≫K_S test topology. No consensus
+    * behaviour changes — this is a read-only diagnostic over existing schema.
+    */
+  case class ShardIdCmd(address: String, numShards: Int) extends CliMethod
+
+  /** Batch shard-assignment scan (shard-sortition workstream Slice S7 — e2e harness dry-run).
+    *
+    * Mints `count` fresh Ed25519 keypairs, derives each public key's DAG address (the same `toAddress` derivation the metagraph genesis
+    * operator key feeds into), and prints one `address shardId` line per keypair under
+    * [[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment]] with the given shard count. Folding the keygen + shardId
+    * computation into a SINGLE JVM invocation makes the bash grind dry-run fast (one process instead of `3 * candidates`). Read-only over
+    * existing schema — no consensus behaviour changes.
+    */
+  case class ShardScanCmd(count: Int, numShards: Int) extends CliMethod
+
   /** Tier-1 test-vector generator. See `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` §1.1 and `project_test_vector_pattern` for
     * the design rationale. Emits a byte-deterministic `l0-genesis.json` (operator set + delegated-stake records + node-collateral records +
     * protocol params + initial balances) into `outputDir`. Optionally synthesizes a `cl1-genesis.json` (single-metagraph for Tier-1).
@@ -187,12 +210,38 @@ object method {
     }
   }
 
+  object ShardIdCmd {
+    val opts: Opts[ShardIdCmd] = Opts.subcommand(
+      "shard-id",
+      "Print the static ShardAssignment shardId for a DAG address under a given shard count (e2e harness — Slice S7)."
+    ) {
+      (
+        Opts.option[String]("address", "DAG address to assign (the metagraph identifier / genesis.address)."),
+        Opts.option[Int]("num-shards", "Cluster-wide shard count M (must be > 0).")
+      ).mapN(ShardIdCmd.apply)
+    }
+  }
+
+  object ShardScanCmd {
+    val opts: Opts[ShardScanCmd] = Opts.subcommand(
+      "shard-scan",
+      "Mint N random keypairs and print 'address shardId' for each under a shard count (e2e harness dry-run — Slice S7)."
+    ) {
+      (
+        Opts.option[Int]("count", "Number of random keypairs/addresses to generate."),
+        Opts.option[Int]("num-shards", "Cluster-wide shard count M (must be > 0).")
+      ).mapN(ShardScanCmd.apply)
+    }
+  }
+
   val opts: Opts[CliMethod] =
     SendTransactionsCmd.opts
       .orElse(SendStateChannelSnapshotCmd.opts)
       .orElse(GetLatestSnapshotInfoCmd.opts)
       .orElse(TxSenderCmd.opts)
       .orElse(GenerateGenesisCmd.opts)
+      .orElse(ShardIdCmd.opts)
+      .orElse(ShardScanCmd.opts)
 
   private val defaultProtocol = "http://"
 

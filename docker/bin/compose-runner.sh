@@ -46,6 +46,105 @@ cur_dir=$(pwd)
 export PROJECT_ROOT=$cur_dir
 echo "Running in top level directory $cur_dir"
 
+# ============================================================================
+# Shard-sortition Slice S7 — metagraph key-grinding for EVEN shard distribution
+# ============================================================================
+# The runtime fan-out routes each metagraph's state-channel binaries to
+# ShardAssignment.shardIdFor(metagraphAddress) = BigInt(1, SHA256(brotli(circeJson(addr)))) mod M
+# (see modules/.../domain/nakamoto/ShardAssignment.scala). Under the raw hash, K
+# metagraphs clump unevenly across M shards. To get a clean N≫K_S eval topology
+# (e.g. 8 metagraphs, 2 per shard over 4 shards) we GRIND each metagraph's genesis
+# keypair: regenerate m${k}-0 until shardIdFor(its genesis.address) == (k mod M).
+#
+# The shardId ORACLE is `tools.jar shard-id` — it calls the SAME ShardAssignment
+# code path, so there is zero hash-chain drift (the brotli+circe+sha256 chain is
+# not reproducible in bash; see the snapshot-streaming proofsHash note below).
+#
+# shard_id_of_address <address> <num_shards>  → echoes the integer shardId, or
+# returns non-zero on a bad address / oracle failure.
+shard_id_of_address() {
+  local addr="$1" m="$2"
+  local out
+  out=$(java -jar "$PROJECT_ROOT/docker/jars/tools.jar" shard-id --address "$addr" --num-shards "$m" 2>/dev/null) || return 1
+  # Oracle prints exactly one "shardId=<n>" line; extract <n>.
+  echo "$out" | sed -n 's/^shardId=\([0-9][0-9]*\)$/\1/p' | head -n1
+}
+
+# regenerate_metagraph_genesis_key <k> — mint a FRESH keypair for the metagraph-k
+# genesis operator (nodes/m${k}-0), refreshing the cached copy + derived
+# address/peer_id. Mirrors generate_metagraph_keys in node-key-env-setup.sh but
+# unconditional (always overwrites) so the grind loop can draw a new candidate.
+# Runs in a subshell (sources .envrc) so CL_* env does not leak into the caller.
+regenerate_metagraph_genesis_key() {
+  local k="$1"
+  local d="$PROJECT_ROOT/nodes/m${k}-0"
+  (
+    cd "$d"
+    java -jar ../keytool.jar generate >/dev/null 2>&1
+    java -jar ../wallet.jar show-address > address 2>/dev/null
+    java -jar ../wallet.jar show-id > peer_id 2>/dev/null
+    java -jar ../keytool.jar export >/dev/null 2>&1
+  )
+  # Refresh the per-metagraph key cache so populate_metagraph_keys stays consistent.
+  local cache="$PROJECT_ROOT/docker/config/local-test-keys/m${k}/0"
+  mkdir -p "$cache"
+  cp "$d/key.p12" "$d/address" "$d/peer_id" "$d/id_ecdsa.hex" "$cache/" 2>/dev/null || true
+}
+
+# refresh_gl0_seedlist_and_restart — rebuild every gl0 node's seedlist.csv from
+# the CURRENT gl0 + metagraph peer_ids and restart the gl0 containers so they
+# reload it. Needed after a grind changes an m${k}-0 peer_id: gl0 loads its
+# seedlist once at startup and only accepts state-channel binaries signed by a
+# seedlisted peer (StateChannelValidator.validateSignaturesWithSeedlist), so the
+# ground signer must be in the seedlist BEFORE that metagraph's ml0 produces
+# snapshots. Mirrors the seedlist construction earlier in this script.
+refresh_gl0_seedlist_and_restart() {
+  local sl=""
+  local j
+  # gl0 hypergraph peers (arithmetic IP/port — must match docker-env-setup.sh).
+  for j in $(seq 0 $((NUM_GL0_NODES - 1))); do
+    local pid; pid=$(cat "$PROJECT_ROOT/nodes/$j/peer_id" 2>/dev/null || echo "")
+    [ -z "$pid" ] && continue
+    local ip="${NET_PREFIX}.$((10 + j))"
+    local p2p=$(( DAG_L0_PORT_PREFIX * 100 + j*10 + 1 ))
+    sl="${sl}${pid},${ip},${p2p},,\n"
+  done
+  # Per-metagraph operator peers (alias=metagraph-op), reading the CURRENT (post-
+  # grind) peer_id files.
+  local kk ii
+  for kk in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
+    local mpfx="${NET_BASE}.$((kk + 1))"
+    local mml0pp=$((ML0_PORT_PREFIX - kk*10))
+    for ii in $(seq 0 $((${MAX_METAGRAPH_NODES:-$MAX_NODES} - 1))); do
+      local mpf="$PROJECT_ROOT/nodes/m${kk}-${ii}/peer_id"
+      [ -f "$mpf" ] || continue
+      local mpid; mpid=$(cat "$mpf")
+      local mip="${mpfx}.3${ii}"
+      local mp2p="${mml0pp}${ii}1"
+      sl="${sl}${mpid},${mip},${mp2p},metagraph-op,\n"
+    done
+  done
+  for j in $(seq 0 $((NUM_GL0_NODES - 1))); do
+    printf "$sl" > "$PROJECT_ROOT/nodes/$j/seedlist.csv"
+  done
+  echo "[grind] refreshed gl0 seedlist with post-grind metagraph peer_ids; restarting gl0 containers"
+  for j in $(seq 0 $((NUM_GL0_NODES - 1))); do
+    docker restart "gl0-$j" >/dev/null 2>&1 || true
+  done
+  # Wait for gl0-0 to be reachable again before continuing (next metagraph's
+  # genesis container needs gl0 up, and metagraph SC binaries need a healthy gl0).
+  local gl0_url="${TEST_HOST:-http://localhost}:${DAG_L0_PORT_PREFIX}00"
+  local a
+  for a in $(seq 1 60); do
+    if curl -s "${gl0_url}/cluster/info" 2>/dev/null | jq 'length' >/dev/null 2>&1; then
+      echo "[grind] gl0 healthy again after seedlist refresh"
+      return 0
+    fi
+    sleep 3
+  done
+  echo "[grind] WARN: gl0 did not report healthy within 180s after seedlist refresh"
+}
+
 
 source ./docker/bin/set-env.sh "$@"
 
@@ -361,9 +460,12 @@ else
         echo "ERROR: missing peer_id for node $j (expected at ./nodes/$j/peer_id)"
         exit 1
       fi
-      # Compute per-node IP and P2P port from the test cluster layout
-      NODE_IP="${NET_PREFIX}.1${j}"
-      NODE_P2P_PORT="${DAG_L0_PORT_PREFIX}${j}1"
+      # Compute per-node IP and P2P port from the test cluster layout.
+      # MUST mirror the ARITHMETIC gl0 allocation in docker-env-setup.sh
+      # (IP = ${NET_PREFIX}.(10+j); P2P port = ${PREFIX}00 + j*10 + 1) so the
+      # seedlist matches the containers' actual addresses past 9 nodes.
+      NODE_IP="${NET_PREFIX}.$((10 + j))"
+      NODE_P2P_PORT=$(( DAG_L0_PORT_PREFIX * 100 + j*10 + 1 ))
       NAKAMOTO_JVM_SEEDLIST="${NAKAMOTO_JVM_SEEDLIST}${PEER_ID},${NODE_IP},${NODE_P2P_PORT},,\n"
     done
 
@@ -520,15 +622,62 @@ else
         cd ./nodes/${M_PREFIX}-${i}/
 
         if [ ! -f "./genesis.snapshot" ] && [ "$i" -eq 0 ]; then
-          echo "Generating metagraph $k genesis snapshot"
-          cp .env .env.bak
-          echo "CL_ML0_GENERATE_GENESIS=true" >> .env
-          docker compose $metagraph_args -f docker-compose.metagraph-genesis.yaml --profile ml0 up
-          docker stop ml0-${M_PREFIX}-0
-          docker rm ml0-${M_PREFIX}-0
-          cp ml0-data/genesis.snapshot .
-          cp ml0-data/genesis.address .
-          mv .env.bak .env
+          # One genesis-generation attempt: run the ML0 genesis container (gl0
+          # must be up — it supplies the embedded GlobalSyncView), then lift the
+          # produced genesis.snapshot + genesis.address into the node root.
+          _gen_genesis_attempt() {
+            cp .env .env.bak
+            echo "CL_ML0_GENERATE_GENESIS=true" >> .env
+            docker compose $metagraph_args -f docker-compose.metagraph-genesis.yaml --profile ml0 up
+            docker stop ml0-${M_PREFIX}-0 2>/dev/null || true
+            docker rm ml0-${M_PREFIX}-0 2>/dev/null || true
+            cp ml0-data/genesis.snapshot .
+            cp ml0-data/genesis.address .
+            mv .env.bak .env
+          }
+
+          if [ "${NAKAMOTO_GRIND_METAGRAPH_SHARDS:-false}" = "true" ]; then
+            # Slice S7 grind: regenerate m${k}-0 + re-derive genesis until
+            # shardIdFor(genesis.address) == (k mod NAKAMOTO_NUM_SHARDS), spreading
+            # the K metagraphs evenly. The genesis address is f(m${k}-0 signature,
+            # gl0 GlobalSyncView) so it MUST be checked live (here), per attempt.
+            target_shard=$(( k % NAKAMOTO_NUM_SHARDS ))
+            max_attempts=${NAKAMOTO_GRIND_MAX_ATTEMPTS:-60}
+            echo "[grind] metagraph $k → target shard $target_shard (M=$NAKAMOTO_NUM_SHARDS), up to $max_attempts attempts"
+            attempt=0
+            while :; do
+              attempt=$((attempt + 1))
+              _gen_genesis_attempt
+              cand_addr=$(head -n 1 genesis.address)
+              cand_shard=$(shard_id_of_address "$cand_addr" "$NAKAMOTO_NUM_SHARDS" || echo "")
+              echo "[grind] metagraph $k attempt $attempt: addr=$cand_addr shard=${cand_shard:-ERR} (want $target_shard)"
+              if [ "$cand_shard" = "$target_shard" ]; then
+                echo "[grind] metagraph $k landed on shard $target_shard after $attempt attempt(s)"
+                break
+              fi
+              if [ "$attempt" -ge "$max_attempts" ]; then
+                echo "ERROR: [grind] metagraph $k failed to hit shard $target_shard in $max_attempts attempts"
+                exit 1
+              fi
+              # Miss: draw a fresh genesis keypair and clear stale genesis artifacts
+              # so the next container run re-derives from the new key.
+              cd ../../
+              regenerate_metagraph_genesis_key "$k"
+              cd ./nodes/${M_PREFIX}-${i}/
+              rm -f genesis.snapshot genesis.address ml0-data/genesis.snapshot ml0-data/genesis.address 2>/dev/null || true
+            done
+            # The ground m${k}-0 peer_id likely changed. Refresh the gl0 seedlist
+            # + restart gl0 NOW — before this metagraph's ml0 produces snapshots —
+            # so gl0 accepts binaries signed by the (new) seedlisted peer. Done
+            # per-metagraph for correct timing; gl0 recovers before the next
+            # metagraph's genesis container needs it.
+            cd ../../
+            refresh_gl0_seedlist_and_restart
+            cd ./nodes/${M_PREFIX}-${i}/
+          else
+            echo "Generating metagraph $k genesis snapshot"
+            _gen_genesis_attempt
+          fi
         fi
         # Ensure genesis.snapshot is in ml0-data (clean-data wipes ml0-data/ but
         # leaves ./genesis.snapshot in the node root, so regeneration is skipped)

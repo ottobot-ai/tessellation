@@ -18,9 +18,10 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.keytool.KeyStoreUtils
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.genesis.types.GenesisCSVAccount
+import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.GlobalSnapshotInfoLocalFileSystemStorage
 import io.constellationnetwork.schema._
-import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.address.{Address, DAGAddress, DAGAddressRefined}
 import io.constellationnetwork.schema.transaction._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -36,6 +37,7 @@ import com.monovore.decline._
 import com.monovore.decline.effect._
 import eu.timepit.refined.auto._
 import eu.timepit.refined.cats._
+import eu.timepit.refined.refineV
 import eu.timepit.refined.types.numeric._
 import fs2.data.csv._
 import fs2.data.csv.generic.semiauto.deriveRowEncoder
@@ -90,6 +92,10 @@ object Main
                         getLatestSnapshotInfo(client, networkHost, networkPort)
                       case g: GenerateGenesisCmd =>
                         generateGenesis[IO](g)
+                      case ShardIdCmd(address, numShards) =>
+                        runShardId[IO](address, numShards)
+                      case ShardScanCmd(count, numShards) =>
+                        runShardScan[IO](count, numShards)
                       case _ => IO.raiseError(new Throwable("Not implemented"))
                     }).as(ExitCode.Success)
                   }
@@ -312,6 +318,51 @@ object Main
       _ <- console.green[F](s"  kesSecretKeys written: ${skPaths.size} (under ${cmd.outputDir}/keys/operator-*)")
     } yield ()
   }
+
+  /** Shard-sortition workstream Slice S7 (e2e harness): print the static `ShardAssignment` shardId for a DAG address.
+    *
+    * Delegates to the production `ShardAssignment.make[F](numShards).shardIdFor(addr)` so the byte-exact hash chain
+    * (`SHA256(Brotli(circeJson(addr)))`) matches what every gl0 operator computes at runtime. The grinding routine in
+    * `docker/bin/compose-runner.sh` calls this once per candidate to decide whether a metagraph's genesis address landed on its target
+    * shard.
+    *
+    * Output contract: prints exactly one line `shardId=<n>` to stdout on success (parsed by the bash grind loop). Any malformed input (bad
+    * address / non-positive numShards) raises and exits non-zero.
+    */
+  def runShardId[F[_]: Async: Hasher: Console](address: String, numShards: Int): F[Unit] =
+    for {
+      _ <- Async[F].raiseWhen(numShards <= 0)(new IllegalArgumentException(s"num-shards must be > 0, got $numShards"))
+      addr <- Async[F].fromEither(
+        refineV[DAGAddressRefined](address).bimap(
+          err => new IllegalArgumentException(s"Invalid DAG address '$address': $err"),
+          (refined: DAGAddress) => Address(refined)
+        )
+      )
+      shardId <- ShardAssignment.make[F](numShards).shardIdFor(addr)
+      // Stable, grep-friendly stdout line consumed by the bash grind loop.
+      _ <- Console[F].println(s"shardId=${shardId.value.value}")
+    } yield ()
+
+  /** Shard-sortition workstream Slice S7 (e2e harness dry-run): mint `count` random keypairs and print `address shardId` per line.
+    *
+    * Generates each address via the same `KeyPair.getPublic.toAddress` path the metagraph genesis operator key feeds into, then runs every
+    * address through the production `ShardAssignment` (one shared instance). Collapsing keygen + shardId computation into ONE JVM keeps the
+    * bash grind dry-run fast. Output contract: `<DAGaddress> <shardId>` per line, one per keypair.
+    */
+  def runShardScan[F[_]: Async: SecurityProvider: Hasher: Console](count: Int, numShards: Int): F[Unit] =
+    for {
+      _ <- Async[F].raiseWhen(numShards <= 0)(new IllegalArgumentException(s"num-shards must be > 0, got $numShards"))
+      _ <- Async[F].raiseWhen(count <= 0)(new IllegalArgumentException(s"count must be > 0, got $count"))
+      assignment = ShardAssignment.make[F](numShards)
+      _ <- (1 to count).toList.traverse_ { _ =>
+        for {
+          kp <- KeyPairGenerator.makeKeyPair[F]
+          addr = kp.getPublic.toAddress
+          shardId <- assignment.shardIdFor(addr)
+          _ <- Console[F].println(s"${addr.value.value} ${shardId.value.value}")
+        } yield ()
+      }
+    } yield ()
 
   def printProgress[F[_]: Async: Console](startTime: FiniteDuration, counter: Long): F[Unit] =
     Clock[F].monotonic.flatMap { currentTime =>
