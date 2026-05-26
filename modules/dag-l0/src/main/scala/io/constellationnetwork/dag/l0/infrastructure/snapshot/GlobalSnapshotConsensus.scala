@@ -1233,6 +1233,75 @@ object GlobalSnapshotConsensus {
                 .toResource
           }
 
+          // ─── T_count_shard quorum closure — receiver-side attestation emitter ──────────────────
+          // Built alongside the producers, reusing the SAME signing material (selfId, keyPair, KES adapter,
+          // shard VRF sk) + the SAME per-shard leader-VRF etas + slot mappings. When a received checkpoint
+          // becomes a node's best tip, `NakamotoSyncDaemon.handleShardCheckpoint` invokes this emitter to sign +
+          // gossip a `ShardCheckpointAttestation` — the missing seam that lets every OTHER node's `ShardTipTracker`
+          // cross `⌈2·K_S/3⌉` so `T_count_shard` fires (the producer's lone self-excluded signature can't).
+          // `None` (numShards <= 1, regression bar) ⇒ the daemon's emit branch is skipped — byte-identical no-op.
+          shardCheckpointAttestationEmitter <- shardAcceptanceDeps match {
+            case None =>
+              Async[F]
+                .pure(
+                  Option.empty[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]]
+                )
+                .toResource
+            case Some(deps) =>
+              implicit val emitHasher: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+              val shardSlotLeader =
+                io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSlotLeader.make[F](eligibilityChecker)
+              val shardKesSigner = new io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer.KesSigner[F] {
+                def currentPeriod: F[Int] = operationalKeyMaker.currentPeriod
+                def signAt(kesStep: Int, message: Array[Byte]): F[Array[Byte]] =
+                  operationalKeyMaker.signAt(kesStep, message).map {
+                    case Right(sig) => io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(sig)
+                    case Left(_)    => Array.empty[Byte]
+                  }
+              }
+              val shardVrfSk = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
+                .deriveVrfKeys(keyPair)
+                ._1
+              // MUST be byte-identical to the producer's mappings (above) so the attester's VRF message + slot-gap
+              // match the producer's. The gl0 anchor ordinal IS the shard-local slot index.
+              val slotForGl0Anchor: SnapshotOrdinal => io.constellationnetwork.schema.nakamoto.slot.Slot =
+                (ord: SnapshotOrdinal) => io.constellationnetwork.schema.nakamoto.slot.Slot.unsafeApply(ord.value.value)
+              val slotGapFor
+                : (io.constellationnetwork.schema.nakamoto.slot.Slot, Option[io.constellationnetwork.schema.nakamoto.slot.Slot]) => Long =
+                (cur, parentOpt) => parentOpt.fold(cur.value.value)(p => math.max(1L, cur.value.value - p.value.value))
+              val sigmaInCommittee =
+                io.constellationnetwork.numerics.Ratio(1, math.max(1, deps.shardingConfig.committeeKTarget))
+              // Precompute the per-shard leader-VRF eta map once (same `computeShardEta(shardId, nakamotoGenesisEta)`
+              // the producers use). Cheap pure hashing; recomputed here so the producer block above stays untouched.
+              deps.registry.toList.traverse {
+                case (shardId, _) => shardSlotLeader.computeShardEta(shardId, nakamotoGenesisEta).map(shardId -> _)
+              }
+                .map(_.toMap)
+                .map { shardEtas =>
+                  val tipTrackerFor =
+                    (sid: io.constellationnetwork.schema.sharding.ShardId) => deps.registry.get(sid).map(_.tipTracker)
+                  val shardEtaFor = (sid: io.constellationnetwork.schema.sharding.ShardId) => shardEtas.get(sid)
+                  Some(
+                    io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter.make[F](
+                      selfPeerId = selfId,
+                      selfKeyPair = keyPair,
+                      selfVrfSk = shardVrfSk,
+                      kesSigner = shardKesSigner,
+                      eligibilityChecker = eligibilityChecker,
+                      sidecarClient = sidecarClient,
+                      tipTrackerFor = tipTrackerFor,
+                      shardEtaFor = shardEtaFor,
+                      sigmaInCommittee = sigmaInCommittee,
+                      slotForGl0Anchor = slotForGl0Anchor,
+                      slotGapFor = slotGapFor,
+                      lddConfig = lddConfig
+                    )
+                  ): Option[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]]
+                }
+                .flatTap(_ => nakLogger.info("🧩 Shard checkpoint attestation emitter built (numShards>1 active)"))
+                .toResource
+          }
+
           _ <- supervisor
             .supervise(
               io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
@@ -1486,7 +1555,10 @@ object GlobalSnapshotConsensus {
                   // debug log. The SAME `shardAcceptanceDeps` instance the GSAM acceptance side + the
                   // Gap-A producers use, so the chain stores incoming checkpoints land in are the ones
                   // the producers + finality triggers read.
-                  shardAcceptanceDeps = shardAcceptanceDeps
+                  shardAcceptanceDeps = shardAcceptanceDeps,
+                  // T_count_shard quorum closure: on best-tip receipt, sign + gossip our own attestation so
+                  // peers cross ⌈2·K_S/3⌉. `None` at numShards=1 (regression bar) ⇒ no emit.
+                  shardCheckpointAttestationEmitter = shardCheckpointAttestationEmitter
                 )
                 .compile
                 .drain

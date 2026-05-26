@@ -302,6 +302,14 @@ object NakamotoSyncDaemon {
     // pre-wiring daemon. `Some(deps)` activates cross-node checkpoint reconstruction + chain growth.
     shardAcceptanceDeps: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[F]
+    ] = None,
+    // Hierarchical-shard-checkpoints v1 — `T_count_shard` quorum closure. When a received `ShardCheckpoint`
+    // becomes this node's best tip, `handleShardCheckpoint` invokes this emitter to sign + gossip a
+    // `ShardCheckpointAttestation` (mirrors the gl0 `emitAttestation` becameBestTip seam). `None` at
+    // `numShards = 1` (regression bar) ⇒ no emit; byte-identical to the pre-wiring daemon. Built only on the
+    // gl0-leader-produce path (`GlobalSnapshotConsensus.make`), where the operator's signing material lives.
+    shardCheckpointAttestationEmitter: Option[
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]
     ] = None
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
@@ -526,7 +534,9 @@ object NakamotoSyncDaemon {
                           // `Async.start` so the multi-step verify never blocks the gossip evalMap thread (mirrors
                           // the MetagraphAttestation handling above).
                           case pb.GossipMessage.Body.ShardCheckpoint(cp) =>
-                            Async[F].start(handleShardCheckpoint(cp, shardAcceptanceDeps, logger)).void
+                            Async[F]
+                              .start(handleShardCheckpoint(cp, shardAcceptanceDeps, shardCheckpointAttestationEmitter, logger))
+                              .void
 
                           case pb.GossipMessage.Body.ShardCheckpointAttestation(att) =>
                             Async[F].start(handleShardCheckpointAttestation(att, shardAcceptanceDeps, logger)).void
@@ -1577,6 +1587,9 @@ object NakamotoSyncDaemon {
     shardAcceptanceDeps: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[F]
     ],
+    shardCheckpointAttestationEmitter: Option[
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]
+    ],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     shardAcceptanceDeps match {
@@ -1612,16 +1625,43 @@ object NakamotoSyncDaemon {
                     entry.chainStore
                       .store(signedCheckpoint, checkpoint.parentCheckpointHash, checkpoint.shardOrdinal, localSlot, vrfOut)
                       .flatMap { stored =>
-                        // Record every committee signer into the tip tracker so T_count_shard can reach quorum.
-                        checkpoint.committeeSignatures.toList
-                          .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId)) >>
-                          deps.acceptanceManager.evaluate(checkpoint).flatMap { result =>
-                            logger.info(
-                              s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
-                                s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
-                                s"signers=${checkpoint.committeeSignatures.size} storedNew=$stored evaluate=$result"
-                            )
-                          }
+                        // Became-best-tip gate — byte-identical to the gl0 `becameBest = isNew && bestTipOpt.exists(_.hash === thisHash)`
+                        // seam (see the global handler). `store` returns `isNew`; if the incoming checkpoint is now the canonical bestTip
+                        // (per ShardChainStore maxvalid-tk fork choice), THIS node attests once for this winning hash.
+                        entry.chainStore.bestTip.flatMap { bestTipOpt =>
+                          val becameBestTip = stored && bestTipOpt.exists(_.hash === checkpointHash)
+                          // Record every committee signer (the producer's own sig seeds 1 attestation) into the tip tracker.
+                          checkpoint.committeeSignatures.toList
+                            .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId)) >>
+                            // T_count_shard quorum closure: on best-tip, sign + gossip OUR own attestation so every OTHER node's tracker
+                            // crosses ⌈2·K_S/3⌉. Self-exclusion (P-11b) keeps it out of our own threshold count. `None` emitter
+                            // (numShards=1 regression bar) ⇒ no emit. Background-fire so the multi-step sign+publish never blocks this
+                            // handler (the handler is already inside an `Async.start`, but the emit is an independent fire-and-forget).
+                            Async[F].whenA(becameBestTip) {
+                              shardCheckpointAttestationEmitter match {
+                                case None          => Async[F].unit
+                                case Some(emitter) =>
+                                  // Resolve the parent's gl0 anchor ordinal (for the LDD slot-gap) from the chain store. Genesis parent
+                                  // (Hash.empty, not stored) ⇒ None ⇒ the emitter's `slotGapFor` handles the no-parent case.
+                                  entry.chainStore.getByHash(checkpoint.parentCheckpointHash).flatMap { parentOpt =>
+                                    emitter.emit(
+                                      checkpoint.shardId,
+                                      checkpointHash,
+                                      checkpoint.gl0AnchorOrdinal,
+                                      checkpoint.epoch,
+                                      parentOpt.map(_.signed.value.gl0AnchorOrdinal)
+                                    )
+                                  }
+                              }
+                            } >>
+                            deps.acceptanceManager.evaluate(checkpoint).flatMap { result =>
+                              logger.info(
+                                s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
+                                  s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
+                                  s"signers=${checkpoint.committeeSignatures.size} storedNew=$stored becameBestTip=$becameBestTip evaluate=$result"
+                              )
+                            }
+                        }
                       }
                   }
                 }
@@ -1632,11 +1672,18 @@ object NakamotoSyncDaemon {
           }
     }
 
-  /** Gap B — handle an incoming `ShardCheckpointAttestationWire` from gossip. Decode + record the attester into the per-shard tip tracker
-    * so `T_count_shard` can reach quorum from after-the-fact (non-producing) committee attestations. `None` deps (numShards=1) ⇒ drop with
-    * a debug log.
+  /** Gap B — handle an incoming `ShardCheckpointAttestationWire` from gossip. Decode, '''verify the attester's Ed25519 signature over the
+    * checkpoint hash''', then record the attester into the per-shard tip tracker so `T_count_shard` can reach quorum from after-the-fact
+    * (non-producing) committee attestations. `None` deps (numShards=1) ⇒ drop with a debug log.
+    *
+    * '''Why verify before recording (mirrors the gl0 `handleAttestation` path).''' `T_count_shard` counts DISTINCT attester peerIds;
+    * without a signature check any peer could forge an attestation under another operator's `peerId` and inflate the count toward false
+    * quorum (a cluster-split risk). The emitter signs the canonical checkpoint hash's UTF-8 bytes with the operator's long-term Ed25519 key
+    * (the SAME bytes + key the producer's committee sig uses), so we recover the VK from `attesterSignature.peerId` and verify exactly as
+    * `handleAttestation` does (`Signing.verifySignature`). Unsigned / invalid-sig attestations are dropped (WARN) and never reach the
+    * tracker — matching the slashing safety bar (only cryptographically verifiable evidence counts).
     */
-  private def handleShardCheckpointAttestation[F[_]: Async: Metrics](
+  private def handleShardCheckpointAttestation[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     att: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar.ShardCheckpointAttestationWire,
     shardAcceptanceDeps: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[F]
@@ -1656,12 +1703,33 @@ object NakamotoSyncDaemon {
                   s"Received ShardCheckpointAttestation for untracked shard=${attestation.shardId.value.value}; dropping"
                 )
               case Some(entry) =>
-                entry.tipTracker
-                  .recordAttestation(attestation.checkpointHash, attestation.attesterSignature.peerId) >>
-                  logger.debug(
-                    s"🧩 ShardCheckpointAttestation rx shard=${attestation.shardId.value.value} " +
-                      s"checkpoint=${attestation.checkpointHash.value.take(12)} attester=${attestation.attesterSignature.peerId.value.value.take(12)}"
+                val attesterId = attestation.attesterSignature.peerId
+                val sigBytes = attestation.attesterSignature.ed25519Sig.toBytes
+                // The attester signed the canonical checkpoint hash's UTF-8 bytes (design doc §3.3) — the same bytes the producer's
+                // committee `ed25519Sig` covers. Recover the VK from the peerId and verify; mirrors `handleAttestation`.
+                val msgBytes = attestation.checkpointHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                if (sigBytes.isEmpty)
+                  logger.warn(
+                    s"⚠️ Rejecting unsigned ShardCheckpointAttestation shard=${attestation.shardId.value.value} " +
+                      s"checkpoint=${attestation.checkpointHash.value.take(12)} from=${attesterId.value.value.take(16)}..."
                   )
+                else
+                  (for {
+                    pubKey <- attesterId.value.toPublicKey[F]
+                    valid <- Signing.verifySignature[F](msgBytes, sigBytes)(pubKey)
+                  } yield valid).handleError(_ => false).flatMap {
+                    case false =>
+                      logger.warn(
+                        s"⚠️ Rejecting ShardCheckpointAttestation with invalid signature shard=${attestation.shardId.value.value} " +
+                          s"checkpoint=${attestation.checkpointHash.value.take(12)} from=${attesterId.value.value.take(16)}..."
+                      )
+                    case true =>
+                      entry.tipTracker.recordAttestation(attestation.checkpointHash, attesterId) >>
+                        logger.debug(
+                          s"🧩 ShardCheckpointAttestation rx shard=${attestation.shardId.value.value} " +
+                            s"checkpoint=${attestation.checkpointHash.value.take(12)} attester=${attesterId.value.value.take(12)}"
+                        )
+                  }
             }
           }
           .handleErrorWith { err =>
