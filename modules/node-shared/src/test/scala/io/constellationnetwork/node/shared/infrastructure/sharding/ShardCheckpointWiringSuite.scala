@@ -118,8 +118,10 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
 
   test("committeeFor (v1): returns the full active validator set regardless of shardId/epoch") { res =>
     implicit val (_h, _sp) = res
-    val s0 = ShardCheckpointWiring.committeeFor[IO](ShardId.unsafeApply(0), io.constellationnetwork.schema.nakamoto.EtaPeriod(7L), IO.pure(validators))
-    val s2 = ShardCheckpointWiring.committeeFor[IO](ShardId.unsafeApply(2), io.constellationnetwork.schema.nakamoto.EtaPeriod(99L), IO.pure(validators))
+    val s0 = ShardCheckpointWiring
+      .committeeFor[IO](ShardId.unsafeApply(0), io.constellationnetwork.schema.nakamoto.EtaPeriod(7L), IO.pure(validators))
+    val s2 = ShardCheckpointWiring
+      .committeeFor[IO](ShardId.unsafeApply(2), io.constellationnetwork.schema.nakamoto.EtaPeriod(99L), IO.pure(validators))
     (s0, s2).tupled.map { case (c0, c2) => expect.all(c0 == validators, c2 == validators) }
   }
 }

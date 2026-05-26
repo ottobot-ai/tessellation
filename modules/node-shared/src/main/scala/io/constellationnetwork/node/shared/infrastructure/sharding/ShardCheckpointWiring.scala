@@ -35,21 +35,21 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *
   * '''Per-shard registry.''' On the activated branch we build a `Map[ShardId, (ShardChainStore, ShardTipTracker, ShardFinalityTriggers)]`
   * for shards `0 .. numShards - 1`. Each entry is the consumer-side state for one shard the gl0 operator tracks: the fork-DAG chain store
-  * (Slice 5), the committee attestation tracker (Slice 6), and the composite Phase 1→2 finality triggers (Slice 6). The acceptance manager's
-  * `finalityTriggers` / `chainStore` callbacks are simple `Map.get` lookups against this registry — `None` ⇒ "shard not tracked locally" ⇒
-  * reject, exactly as the manager's scaladoc specifies.
+  * (Slice 5), the committee attestation tracker (Slice 6), and the composite Phase 1→2 finality triggers (Slice 6). The acceptance
+  * manager's `finalityTriggers` / `chainStore` callbacks are simple `Map.get` lookups against this registry — `None` ⇒ "shard not tracked
+  * locally" ⇒ reject, exactly as the manager's scaladoc specifies.
   *
   * '''committeeMembership(shardId, epoch) — v1 simplification.''' The acceptance manager's pre-check confirms each checkpoint signer is in
-  * `committeeMembership(shardId, epoch)`. The authoritative per-`(shard, epoch)` committee draw is a VRF sortition over each operator's
-  * VRF VK — but v1 has no cluster-wide VRF-VK registry (only the [[KesRegistry]] exists; see the manager's `verifyVrfStructural` scaladoc and
-  * `[[project-cross-shard-cq-collapse-bound]]`). So for v1 the membership predicate returns the full active validator set: "a peer may be in
-  * shard S's committee iff it's a known gl0 operator". This is sound at the admission layer because the manager STILL authenticates every
-  * signer cryptographically — Ed25519 over the canonical preimage (recovered VK from the PeerId) + KES product sig (registry carve-out for
-  * the bootstrap window) + a structural VRF-proof check. The set-membership predicate only gates "is this peer even an operator"; the
-  * crypto gates "did this specific peer actually sign". Replacing the full-set predicate with a real VRF-enumerated draw is the v2 follow-up
-  * (needs the VRF-VK registry + `CommitteeSortition.verifyMembership` per peer — mirrors `MetagraphCommitteeGate`'s receiver path, which
-  * verifies a single arriving attestation rather than enumerating the whole committee). Until then the structural+crypto checks carry the
-  * admission safety bar.
+  * `committeeMembership(shardId, epoch)`. The authoritative per-`(shard, epoch)` committee draw is a VRF sortition over each operator's VRF
+  * VK — but v1 has no cluster-wide VRF-VK registry (only the [[KesRegistry]] exists; see the manager's `verifyVrfStructural` scaladoc and
+  * `[[project-cross-shard-cq-collapse-bound]]`). So for v1 the membership predicate returns the full active validator set: "a peer may be
+  * in shard S's committee iff it's a known gl0 operator". This is sound at the admission layer because the manager STILL authenticates
+  * every signer cryptographically — Ed25519 over the canonical preimage (recovered VK from the PeerId) + KES product sig (registry
+  * carve-out for the bootstrap window) + a structural VRF-proof check. The set-membership predicate only gates "is this peer even an
+  * operator"; the crypto gates "did this specific peer actually sign". Replacing the full-set predicate with a real VRF-enumerated draw is
+  * the v2 follow-up (needs the VRF-VK registry + `CommitteeSortition.verifyMembership` per peer — mirrors `MetagraphCommitteeGate`'s
+  * receiver path, which verifies a single arriving attestation rather than enumerating the whole committee). Until then the
+  * structural+crypto checks carry the admission safety bar.
   *
   * '''reExecuteDerivation — caller-supplied.''' The `T_depth1_shard` degraded path re-runs each MG's derivation and compares the recomputed
   * `mptRoot` byte-for-byte against the committee-signed value. Wiring the REAL per-MG derivation requires reaching into GSAM's own
@@ -74,8 +74,8 @@ object ShardCheckpointWiring {
     *
     * `Some(...)` ⇒ `numShards > 1`, the activated path. `None` ⇒ `numShards <= 1`, the regression-bar path (call sites pass all-`None`).
     *
-    * `registry` is exposed so the producer-side wiring (priority 2, deferred) can reuse the SAME per-shard chain stores rather than building
-    * a second disjoint set — the producer writes into the chain store the consumer reads from.
+    * `registry` is exposed so the producer-side wiring (priority 2, deferred) can reuse the SAME per-shard chain stores rather than
+    * building a second disjoint set — the producer writes into the chain store the consumer reads from.
     */
   final case class AcceptanceDeps[F[_]](
     shardingConfig: ShardingConfig,
@@ -120,7 +120,8 @@ object ShardCheckpointWiring {
     * @param reExecuteDerivation
     *   the `T_depth1_shard` re-exec derivation closure. `None` (the default) ⇒ [[noReExecDerivation]] (the documented v1 stub). Modelled as
     *   `Option` rather than a defaulted closure because Scala can't resolve `Async[F]` for `noReExecDerivation[F]` at the default-arg site
-    *   (the context bound is on the method, not on the default expression) — the same constraint the GSAM `localEventsPublisher` param hits.
+    *   (the context bound is on the method, not on the default expression) — the same constraint the GSAM `localEventsPublisher` param
+    *   hits.
     */
   def acceptanceDeps[F[_]: Async: Hasher: SecurityProvider: Metrics](
     cfg: ShardingConfig,
@@ -171,21 +172,20 @@ object ShardCheckpointWiring {
     cfg: ShardingConfig,
     selfPeerId: PeerId
   ): F[Map[ShardId, ShardRegistryEntry[F]]] =
-    (0 until cfg.numShards).toList
-      .traverse { idx =>
-        val shardId = ShardId(NonNegInt.unsafeFrom(idx))
-        for {
-          chainStore <- ShardChainStore.make[F](shardId, keepDepthBehindFinalized = cfg.finality.k1Shard)
-          tipTracker <- ShardTipTracker.make[F](shardId, selfPeerId)
-          triggers <- ShardFinalityTriggers.make[F](
-            shardId = shardId,
-            kTarget = cfg.committeeKTarget,
-            k1Shard = cfg.finality.k1Shard,
-            chainStore = chainStore,
-            tipTracker = tipTracker
-          )
-        } yield shardId -> ShardRegistryEntry(chainStore, tipTracker, triggers)
-      }
+    (0 until cfg.numShards).toList.traverse { idx =>
+      val shardId = ShardId(NonNegInt.unsafeFrom(idx))
+      for {
+        chainStore <- ShardChainStore.make[F](shardId, keepDepthBehindFinalized = cfg.finality.k1Shard)
+        tipTracker <- ShardTipTracker.make[F](shardId, selfPeerId)
+        triggers <- ShardFinalityTriggers.make[F](
+          shardId = shardId,
+          kTarget = cfg.committeeKTarget,
+          k1Shard = cfg.finality.k1Shard,
+          chainStore = chainStore,
+          tipTracker = tipTracker
+        )
+      } yield shardId -> ShardRegistryEntry(chainStore, tipTracker, triggers)
+    }
       .map(_.toMap)
 
   /** v1 `committeeMembership(shardId, epoch)` — returns the full active validator set (see object scaladoc for the safety rationale and the
