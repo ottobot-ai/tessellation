@@ -94,10 +94,14 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
     ).pure[IO]
 
   // Run accept() at the given boundary ordinal and return the post-accept GSI's per-period entry.
+  // `adoptedBoundaryEta` models the #259 verifier-replay path: `Some(eta)` adopts gl0's authoritative
+  // per-period eta verbatim (the value the follower receives on the artifact's `eta` wire field) instead
+  // of recomputing via the `etaForPeriod` callback. `None` (default) preserves the producer recompute path.
   private def runBoundary(
     mgr: GlobalSnapshotAcceptanceManager[IO],
     boundaryOrd: Long,
-    expectedPeriod: Long
+    expectedPeriod: Long,
+    adoptedBoundaryEta: Option[Hash] = None
   ): IO[Option[HistoricalStakeSnapshot]] = {
     val priorInfo = mkGlobalSnapshotInfo()
     for {
@@ -120,7 +124,8 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
         calculateRewardsFn = emptyRewardsFn,
         validationType = StateChannelValidationType.Full,
         getGlobalSnapshotByOrdinal = _ => IO.pure(None),
-        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
+        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough,
+        adoptedBoundaryEta = adoptedBoundaryEta
       )
       (_, _, _, _, _, _, _, _, snapshotInfo, _, _, _, _, _, _) = result
     } yield snapshotInfo.historicalStakeSnapshots.get(EtaPeriod(expectedPeriod))
@@ -199,6 +204,71 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
         // equivalence contract between independent verifiers (one of the §3 NIPoPoW determinism
         // invariants).
         entry.map(_.eta).contains(expectedEtaHash)
+      )
+  }
+
+  // ── #259: verifier-replay eta adoption ────────────────────────────────────────────────────────
+  //
+  // A metagraph follower (cl0/cl1/dl1) replaying a gl0 snapshot CANNOT reproduce gl0's per-period eta:
+  // it has no gl0 VRF-output chain, so its `etaForPeriod` chain-walk fallback degrades to `genesisEta`,
+  // diverging from gl0's committed boundary entry → StateProofMismatch every period (#259). The fix lets
+  // the follower ADOPT gl0's authoritative eta (received on the artifact's `eta` wire field) for the
+  // boundary entry via `accept(..., adoptedBoundaryEta = signedArtifact.eta)`, so its recomputed entry
+  // matches gl0's by construction.
+  //
+  // These two tests share one setup that reproduces the divergence: the period-2 boundary with an
+  // `etaForPeriod` callback whose chain walk is EMPTY (the follower's reality) ⇒ recompute yields
+  // `genesisEta`. gl0's authoritative value is the real `computeEta` output. The contrast is the whole
+  // bug: recompute (None) lands the wrong value; adopt (Some) lands gl0's.
+
+  // gl0's authoritative period-2 eta (what a real producer with the VRF chain computes + commits).
+  private val gl0AuthoritativeEtaHash: Hash =
+    SharedServices.etaBytesToHash(EtaCalculation.computeEta(genesisEta, 2L, syntheticVrfOutputs.map(_._2)))
+
+  // A follower's `etaForPeriod`: empty chain walk ⇒ EtaStateManager falls through to `genesisEta`,
+  // which is NOT gl0's authoritative value for period ≥ 2 — this is the source of the #259 divergence.
+  private def followerEtaCallback(implicit h: Hasher[IO]): IO[EtaPeriod => IO[Hash]] = {
+    val emptyChainWalk: Long => IO[List[(Long, Array[Byte])]] = (_: Long) => IO.pure(List.empty)
+    EtaStateManager
+      .make[IO](genesisEta = genesisEta, historicalStakeReader = emptyMptReader, chainWalkFallback = emptyChainWalk)
+      .map(etaMgr => (period: EtaPeriod) => etaMgr.getEta(period.value).map(SharedServices.etaBytesToHash))
+  }
+
+  test("#259 contrast: follower recompute (adoptedBoundaryEta=None) DIVERGES from gl0 at the period-2 boundary") { res =>
+    implicit val (h, sp) = res
+    // R=10, ord 29 = period 2 closing boundary. Follower callback ⇒ empty walk ⇒ genesisEta.
+    for {
+      callback <- followerEtaCallback
+      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
+      entry <- runBoundary(mgr, boundaryOrd = 29L, expectedPeriod = 2L, adoptedBoundaryEta = None)
+    } yield
+      expect.all(
+        entry.isDefined,
+        // The follower's recomputed eta is the genesis fall-through...
+        entry.map(_.eta).contains(SharedServices.etaBytesToHash(genesisEta)),
+        // ...which does NOT match gl0's authoritative value → this is exactly the divergence that
+        // produced StateProofMismatch every period before the fix.
+        !entry.map(_.eta).contains(gl0AuthoritativeEtaHash)
+      )
+  }
+
+  test("#259 fix: follower adopting gl0's eta (adoptedBoundaryEta=Some) MATCHES gl0 at the period-2 boundary") { res =>
+    implicit val (h, sp) = res
+    // Same follower setup (empty walk ⇒ recompute would yield genesisEta), but now the verifier-replay
+    // path supplies gl0's authoritative eta from the artifact's wire field. The boundary entry must take
+    // the adopted value verbatim — overriding the (wrong) recompute — so the entry matches gl0's.
+    for {
+      callback <- followerEtaCallback
+      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
+      entry <- runBoundary(mgr, boundaryOrd = 29L, expectedPeriod = 2L, adoptedBoundaryEta = Some(gl0AuthoritativeEtaHash))
+    } yield
+      expect.all(
+        entry.isDefined,
+        // The boundary entry adopted gl0's authoritative eta...
+        entry.map(_.eta).contains(gl0AuthoritativeEtaHash),
+        // ...and did NOT fall through to the follower's divergent genesis recompute. (genesisEta != the
+        // period-2 computeEta output, so these are distinct hashes — the adoption is load-bearing.)
+        !entry.map(_.eta).contains(SharedServices.etaBytesToHash(genesisEta))
       )
   }
 }

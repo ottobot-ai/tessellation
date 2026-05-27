@@ -224,7 +224,19 @@ object GlobalSnapshotContextFunctions {
               // Follower-side validation: branch identity is the parent's hash so the algebra reads at
               // the same parent view the proposer constructed against. Phase D (Passthrough) ignores
               // the BranchId on every read/write — the byte-parity contract from #107 covers the rewire.
-              io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(lastArtifactHash)
+              io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(lastArtifactHash),
+              // #259 — verifier-replay eta adoption. This is the follower/verifier path: adopt gl0's
+              // authoritative per-period eta from the incoming artifact's `eta` wire field for the
+              // `historicalStakeSnapshots` boundary entry, instead of recomputing it (which the follower
+              // cannot do — it lacks gl0's VRF-output chain, so its `etaForPeriod` chain-walk degrades to
+              // `genesisEta` and diverges from gl0's committed value, failing the boundary mptRoot check
+              // every period). gl0 PRODUCERS go through `GlobalSnapshotConsensusFunctions` (not this path)
+              // and keep `adoptedBoundaryEta = None` ⇒ recompute via `etaForPeriod`, untouched. The wire
+              // `eta` equals gl0's boundary eta byte-for-byte at boundary ordinals (same `%02x` hex
+              // encoding, same period = closingOrdinal / R). Pre-boundary / pre-S0.4 artifacts carry
+              // `eta = None`, which only matters at boundary ordinals — at a boundary the producer always
+              // populated it (`SnapshotLeaderLoop` sets `eta = Some(etaHash)` on every produced snapshot).
+              adoptedBoundaryEta = signedArtifact.eta
             )
             .flatMap {
               case (

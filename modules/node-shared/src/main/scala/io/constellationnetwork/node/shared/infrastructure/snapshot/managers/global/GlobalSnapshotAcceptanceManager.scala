@@ -164,7 +164,19 @@ trait GlobalSnapshotAcceptanceManager[F[_]] {
     // sync-data write effect (§8.4). Default `SortedMap.empty` preserves byte-identical behavior at
     // `numShards = 1` (today's production default) — the new branch never fires until shard wiring is enabled at
     // the gl0 consensus layer (a later slice).
-    shardCheckpoints: SortedMap[ShardId, ShardCheckpoint] = SortedMap.empty
+    shardCheckpoints: SortedMap[ShardId, ShardCheckpoint] = SortedMap.empty,
+    // #259 — verifier-replay eta adoption. On the follower/verifier path
+    // (`GlobalSnapshotContextFunctions.createContext`) this carries gl0's authoritative per-period eta, taken
+    // verbatim from the incoming signed artifact's `eta` wire field, and is used as the eta half of the
+    // `historicalStakeSnapshots[currentPeriod]` boundary entry instead of recomputing it via `etaForPeriod`.
+    // Followers cannot reproduce gl0's eta (no gl0 VRF-output chain ⇒ `etaForPeriod` degrades to `genesisEta`),
+    // so recomputing diverges from gl0's committed value and fails the boundary `mptRoot` check every period
+    // (#259). Adopting gl0's value makes the recomputed root match by construction; the metagraph never reads
+    // `historicalStakeSnapshots` (it is gl0 leader-election state), so nothing is lost. `None` (the default) on
+    // the gl0-producer path (`GlobalSnapshotConsensusFunctions`) keeps the recompute-via-`etaForPeriod` behavior
+    // unchanged — producers MUST keep computing it. Only consulted at boundary ordinals (`ord % R == R - 1`);
+    // ignored otherwise.
+    adoptedBoundaryEta: Option[Hash] = None
   ): F[
     (
       BlockAcceptanceResult,
@@ -795,7 +807,13 @@ object GlobalSnapshotAcceptanceManager {
           */
         private def computeHistoricalStakeBoundaryDelta(
           ordinal: SnapshotOrdinal,
-          baseInfo: GlobalSnapshotInfo
+          baseInfo: GlobalSnapshotInfo,
+          // #259 — verifier-replay eta adoption. `Some(eta)` ONLY on the follower/verifier path
+          // (`GlobalSnapshotContextFunctions.createContext`), carrying gl0's authoritative per-period eta
+          // taken verbatim from the incoming signed artifact's `eta` wire field. `None` on the gl0-producer
+          // path (`GlobalSnapshotConsensusFunctions`), which recomputes via `etaForPeriod` as before. See the
+          // adoption rationale on the `adoptedBoundaryEta` param of `accept` below.
+          adoptedBoundaryEta: Option[Hash]
         )(
           implicit hasher: Hasher[F]
         ): F[(SortedMap[EtaPeriod, HistoricalStakeSnapshot], Set[EtaPeriod], SortedMap[EtaPeriod, HistoricalStakeSnapshot])] = {
@@ -807,11 +825,23 @@ object GlobalSnapshotAcceptanceManager {
             // from the same accepted records that built the GSI), and routing via MPT removes the redundant in-memory mirror —
             // closing a class of #218-style cross-node drift bugs where two nodes' GSI iteration order produced divergent bytes.
             //
-            // Path 1 (heap-leak workstream): also resolve eta_currentPeriod via `etaForPeriod` and pack it into the
-            // `HistoricalStakeSnapshot` boundary entry. Eta is deterministic from the canonical chain at this
-            // point (derived from period (currentPeriod-1)'s first 2/3 VRF outputs, fully knowable before
-            // currentPeriod even starts), so all honest verifiers produce byte-equivalent boundary entries.
-            val etaF: F[Hash] = etaForPeriod.map(_(currentPeriod)).getOrElse(Async[F].pure(Hash.empty))
+            // Path 1 (heap-leak workstream): the gl0-producer resolves eta_currentPeriod via `etaForPeriod` and packs it into
+            // the `HistoricalStakeSnapshot` boundary entry. Eta is deterministic from the canonical chain at this point
+            // (derived from period (currentPeriod-1)'s first 2/3 VRF outputs, fully knowable before currentPeriod even starts).
+            //
+            // #259: a metagraph follower (cl0/cl1/dl1) replaying a gl0 snapshot CANNOT reproduce eta_currentPeriod — it has no
+            // gl0 VRF-output chain, so its `etaForPeriod` chain-walk fallback degrades to `genesisEta`, diverging from gl0's
+            // committed value and breaking the `mptRoot` check every boundary. Instead the follower ADOPTS gl0's authoritative
+            // eta verbatim from the artifact's `eta` wire field (set by the leader at `SnapshotLeaderLoop.scala`'s
+            // `eta = Some(etaHash)`; same `%02x` hex encoding as `SharedServices.etaBytesToHash`, same period at a boundary
+            // ordinal since both reduce to `closingOrdinal / R`). The metagraph never reads `historicalStakeSnapshots` (every
+            // consumer is gl0 leader-election state), so adopting gl0's value loses no guarantee while making the recomputed
+            // root match gl0's by construction.
+            val etaF: F[Hash] =
+              adoptedBoundaryEta match {
+                case Some(eta) => Async[F].pure(eta)
+                case None      => etaForPeriod.map(_(currentPeriod)).getOrElse(Async[F].pure(Hash.empty))
+              }
             (NodeStakeAggregator.snapshotFromMpt[F](stakeAggregator), etaF).mapN { (newStakeSnapshot, eta) =>
               val newSnapshot = HistoricalStakeSnapshot(newStakeSnapshot, eta)
               val retentionMinPeriod = currentPeriod.value - 3L
@@ -875,7 +905,10 @@ object GlobalSnapshotAcceptanceManager {
           updatedCreateNodeCollateralsCleaned: SortedMap[Address, SortedSet[NodeCollateralRecord]],
           updatedWithdrawNodeCollateralsCleaned: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
           updatedPriceState: SortedMap[TokenPair, PriceRecord],
-          updatedAcceptedMetagraphSyncData: SortedMap[Address, MetagraphSyncDataInfo]
+          updatedAcceptedMetagraphSyncData: SortedMap[Address, MetagraphSyncDataInfo],
+          // #259 — gl0's authoritative per-period eta on the verifier-replay path; `None` for gl0 producers.
+          // Threaded verbatim into `computeHistoricalStakeBoundaryDelta`.
+          adoptedBoundaryEta: Option[Hash]
         )(
           implicit hasher: Hasher[F]
         ): F[BuildGlobalSnapshotInfoResult] = {
@@ -918,7 +951,7 @@ object GlobalSnapshotAcceptanceManager {
           //
           // §G2 — `computeHistoricalStakeBoundaryDelta` is now `F[]` (reads the boundary `StakeDistribution` from MPT via
           // `NodeStakeAggregator.snapshotFromMpt`). `buildGlobalSnapshotInfo` lifts into `F[]` here.
-          computeHistoricalStakeBoundaryDelta(ordinal, baseInfo).map {
+          computeHistoricalStakeBoundaryDelta(ordinal, baseInfo, adoptedBoundaryEta).map {
             case (adds, removes, nextHistorical) =>
               BuildGlobalSnapshotInfoResult(
                 gsi = baseInfo.copy(historicalStakeSnapshots = nextHistorical),
@@ -1121,7 +1154,9 @@ object GlobalSnapshotAcceptanceManager {
           validationType: StateChannelValidationType,
           getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
           parentTip: BranchId,
-          shardCheckpoints: SortedMap[ShardId, ShardCheckpoint] = SortedMap.empty
+          shardCheckpoints: SortedMap[ShardId, ShardCheckpoint] = SortedMap.empty,
+          // #259 — see the trait scaladoc on this param. `Some` on verifier-replay (adopt gl0's eta), `None` on producers.
+          adoptedBoundaryEta: Option[Hash] = None
         ): F[
           (
             BlockAcceptanceResult,
@@ -1827,7 +1862,8 @@ object GlobalSnapshotAcceptanceManager {
                   updatedCreateNodeCollateralsCleaned,
                   updatedWithdrawNodeCollateralsCleaned,
                   updatedPriceState,
-                  updatedAcceptedMetagraphSyncData
+                  updatedAcceptedMetagraphSyncData,
+                  adoptedBoundaryEta
                 )
                 gsi = gsiResult.gsi
 
