@@ -126,9 +126,7 @@ verify_healthy() {
     fi
 
     if [ "$NUM_GL1_NODES" -gt 0 ]; then
-      # gl1-0 HOST port = GL1_EXT_BASE (==9100 for ≤9 gl0; lifted above the gl0
-      # band for larger N — shard-sortition Slice S7). Exported by set-env.sh.
-      check_health "${host}:${GL1_EXT_BASE:-${DAG_L1_PORT_PREFIX}00}" "gl1-0" "$NUM_GL1_NODES" || any_failed=true
+      check_health "${host}:${DAG_L1_PORT_PREFIX}00" "gl1-0" "$NUM_GL1_NODES" || any_failed=true
     fi
 
     # Per-metagraph health: each metagraph k has its own ml0/cl1/dl1 cluster

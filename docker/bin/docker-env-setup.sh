@@ -47,9 +47,7 @@ CL_DOCKER_GL0_JOIN_ID=$GL0_GENERATED_WALLET_PEER_ID
 CL_DOCKER_GL1_JOIN_ID=$GL0_GENERATED_WALLET_PEER_ID
 
 CL_DOCKER_GL0_JOIN_IP=${NET_PREFIX}.10
-# gl1-0 base moved 20→60 (matches CL_DOCKER_GL1_IPV4 arithmetic in the per-node
-# loop) so gl0 (.10..) and gl1 (.60..) IP ranges stay disjoint at >9 nodes.
-CL_DOCKER_GL1_JOIN_IP=${NET_PREFIX}.60
+CL_DOCKER_GL1_JOIN_IP=${NET_PREFIX}.20
 
 CL_DOCKER_GL0_JOIN_PORT=${DAG_L0_PORT_PREFIX}01
 CL_DOCKER_GL1_JOIN_PORT=${DAG_L1_PORT_PREFIX}01
@@ -127,24 +125,6 @@ for k in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
 done
 
 
-# gl0/gl1 port bases. GL1_EXT_BASE (gl1 HOST port base) is computed once in
-# set-env.sh and inherited here (shard-sortition Slice S7); recompute as a
-# fallback if this script is sourced standalone. For ≤9 gl0 nodes GL1_EXT_BASE
-# == ${DAG_L1_PORT_PREFIX}00 (9100, legacy). For larger N it lifts above the gl0
-# external band so gl0/gl1 never share a host port. gl1's INTERNAL/container port
-# stays at the legacy 9100 band (GL1_PORT_BASE), so the `gl1-0:9100` container
-# alias (tx-sender.conf, in-network clients) is unaffected.
-GL0_PORT_BASE=$((DAG_L0_PORT_PREFIX * 100))
-GL1_PORT_BASE=$((DAG_L1_PORT_PREFIX * 100))
-if [ -z "${GL1_EXT_BASE:-}" ]; then
-  GL0_EXT_TOP=$((GL0_PORT_BASE + (${NUM_GL0_NODES:-MAX_HG_NODES} - 1) * 10 + 2))
-  GL0_EXT_TOP_ROUNDED=$(( (GL0_EXT_TOP / 100 + 1) * 100 ))
-  GL1_EXT_BASE=$GL1_PORT_BASE
-  [ "$GL0_EXT_TOP_ROUNDED" -gt "$GL1_EXT_BASE" ] && GL1_EXT_BASE=$GL0_EXT_TOP_ROUNDED
-  export GL1_EXT_BASE
-fi
-echo "[docker-env] gl0 ext base ${GL0_PORT_BASE}; gl1 ext base ${GL1_EXT_BASE}; gl1 internal base ${GL1_PORT_BASE}"
-
 # === Hypergraph operators (nodes/$i — gl0 + gl1 only) ===
 for i in $(seq 0 $((MAX_HG_NODES - 1))); do
   cd ./nodes/$i
@@ -170,35 +150,17 @@ for i in $(seq 0 $((MAX_HG_NODES - 1))); do
   echo "CONTAINER_NAME_SUFFIX=-$i" >> .env
   echo "CONTAINER_OFFSET=$i" >> .env
 
-  # Per-node ports — ARITHMETIC allocation (shard-sortition Slice S7).
-  # stride = 10 ⇒ node i owns the 10-port window [base + i*10 .. +2].
-  #   * gl0 external==internal at ${PREFIX0}00 + i*10 — byte-identical to the
-  #     legacy "${PREFIX0}${i}{0,1,2}" string-concat for i<10 (gl0-0=9000/1/2 ..
-  #     gl0-9=9090/1/2) and extending past 9 (32 gl0 → 9000..9312, < 65536).
-  #   * gl1 INTERNAL stays at ${PREFIX1}00 + i*10 (legacy 9100 band) so the
-  #     `gl1-0:9100` container alias keeps working.
-  #   * gl1 EXTERNAL uses GL1_EXT_BASE (==9100 for ≤9 gl0, lifted above the gl0
-  #     band for larger N) so gl0 and gl1 never collide on a host port.
-  L0_PUBLIC=$((GL0_PORT_BASE + i*10))
-  L1_PUBLIC_INT=$((GL1_PORT_BASE + i*10))
-  L1_PUBLIC_EXT=$((GL1_EXT_BASE + i*10))
+  L0_PORT="$DAG_L0_PORT_PREFIX$i"
+  L1_PORT="$DAG_L1_PORT_PREFIX$i"
 
-  # Per-node IP octet — ARITHMETIC so the hypergraph scales past 9 nodes.
-  # gl0 lives at ${NET_PREFIX}.(10+i), gl1 at ${NET_PREFIX}.(60+i): disjoint
-  # ranges (gl0 .10.., gl1 .60..) up to 49 nodes/tier, and byte-identical to the
-  # legacy ".1${i}" gl0 layout for i<10 (.10..19). gl1's base moves 20→60 to keep
-  # the ranges disjoint at scale; the matching join IP below is updated in lockstep.
-  echo "CL_DOCKER_GL0_IPV4=${NET_PREFIX}.$((10 + i))" >> .env
-  echo "CL_DOCKER_GL1_IPV4=${NET_PREFIX}.$((60 + i))" >> .env
+  # External ports
+  echo "CL_DOCKER_EXTERNAL_GL0_PUBLIC=${L0_PORT}0" >> .env
+  echo "CL_DOCKER_EXTERNAL_GL0_P2P=${L0_PORT}1" >> .env
+  echo "CL_DOCKER_EXTERNAL_GL0_CLI=${L0_PORT}2" >> .env
 
-  # External (host) ports
-  echo "CL_DOCKER_EXTERNAL_GL0_PUBLIC=${L0_PUBLIC}" >> .env
-  echo "CL_DOCKER_EXTERNAL_GL0_P2P=$((L0_PUBLIC + 1))" >> .env
-  echo "CL_DOCKER_EXTERNAL_GL0_CLI=$((L0_PUBLIC + 2))" >> .env
-
-  echo "CL_DOCKER_EXTERNAL_GL1_PUBLIC=${L1_PUBLIC_EXT}" >> .env
-  echo "CL_DOCKER_EXTERNAL_GL1_P2P=$((L1_PUBLIC_EXT + 1))" >> .env
-  echo "CL_DOCKER_EXTERNAL_GL1_CLI=$((L1_PUBLIC_EXT + 2))" >> .env
+  echo "CL_DOCKER_EXTERNAL_GL1_PUBLIC=${L1_PORT}0" >> .env
+  echo "CL_DOCKER_EXTERNAL_GL1_P2P=${L1_PORT}1" >> .env
+  echo "CL_DOCKER_EXTERNAL_GL1_CLI=${L1_PORT}2" >> .env
 
   # LocalEvents reactive gRPC stream — bind:50054 inside the container (set by
   # application.conf via NAKAMOTO_LOCAL_EVENTS_PORT). Host-side port stripes by
@@ -209,15 +171,14 @@ for i in $(seq 0 $((MAX_HG_NODES - 1))); do
 
   # These are only required on systems that implement docker with a host networking bridge
   # Port conflicts cause it to fail with external networks that re-use ports
-  # internal ports (same arithmetic window as external — preserves the existing
-  # external==internal invariant for the test cluster)
-  echo "CL_DOCKER_INTERNAL_GL0_PUBLIC=${L0_PUBLIC}" >> .env
-  echo "CL_DOCKER_INTERNAL_GL0_P2P=$((L0_PUBLIC + 1))" >> .env
-  echo "CL_DOCKER_INTERNAL_GL0_CLI=$((L0_PUBLIC + 2))" >> .env
+  # internal ports
+  echo "CL_DOCKER_INTERNAL_GL0_PUBLIC=${L0_PORT}0" >> .env
+  echo "CL_DOCKER_INTERNAL_GL0_P2P=${L0_PORT}1" >> .env
+  echo "CL_DOCKER_INTERNAL_GL0_CLI=${L0_PORT}2" >> .env
 
-  echo "CL_DOCKER_INTERNAL_GL1_PUBLIC=${L1_PUBLIC_INT}" >> .env
-  echo "CL_DOCKER_INTERNAL_GL1_P2P=$((L1_PUBLIC_INT + 1))" >> .env
-  echo "CL_DOCKER_INTERNAL_GL1_CLI=$((L1_PUBLIC_INT + 2))" >> .env
+  echo "CL_DOCKER_INTERNAL_GL1_PUBLIC=${L1_PORT}0" >> .env
+  echo "CL_DOCKER_INTERNAL_GL1_P2P=${L1_PORT}1" >> .env
+  echo "CL_DOCKER_INTERNAL_GL1_CLI=${L1_PORT}2" >> .env
 
   echo "CL_DOCKER_GL1_JOIN_INITIAL_DELAY=$((i*12 + 30))" >> .env
 

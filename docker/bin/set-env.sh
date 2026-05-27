@@ -267,15 +267,6 @@ for arg in "$@"; do
         exit 1
       fi
       ;;
-    --grind-metagraph-shards)
-      # Shard-sortition Slice S7: regenerate each metagraph's genesis keypair until
-      # ShardAssignment.shardIdFor(genesisAddress) == (k mod NAKAMOTO_NUM_SHARDS), so
-      # the K metagraphs spread EVENLY across shards (2/shard for 8mg/4shard) instead
-      # of clumping by the raw hash. Requires --num-shards>1. Off by default (the plain
-      # hash mapping is fine for single-shard / small runs); compose-runner.sh gates the
-      # grind loop on NAKAMOTO_GRIND_METAGRAPH_SHARDS=true.
-      export NAKAMOTO_GRIND_METAGRAPH_SHARDS=true
-      ;;
     --num-shards=*)
       # Hierarchical shard count M (HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md).
       # Exports NAKAMOTO_NUM_SHARDS, which docker-compose.nakamoto-overlay.yaml
@@ -522,15 +513,6 @@ if [ -n "${NAKAMOTO_COMMITTEE_K_TARGET:-}" ]; then
     echo "[set-env] --shards=$NAKAMOTO_COMMITTEE_K_TARGET → NAKAMOTO_COMMITTEE_K_TARGET=$NAKAMOTO_COMMITTEE_K_TARGET (gate is real sortition since K<N=$NUM_GL0_NODES is $([ "$NAKAMOTO_COMMITTEE_K_TARGET" -lt "$NUM_GL0_NODES" ] && echo true || echo "false — gate is degenerate K=N"))"
 fi
 
-# --grind-metagraph-shards validation (Slice S7): only meaningful with >1 shard.
-if [ "${NAKAMOTO_GRIND_METAGRAPH_SHARDS:-false}" = "true" ]; then
-    if [ -z "${NAKAMOTO_NUM_SHARDS:-}" ] || [ "${NAKAMOTO_NUM_SHARDS:-1}" -le 1 ]; then
-        echo "Error: --grind-metagraph-shards requires --num-shards=M with M > 1 (got: '${NAKAMOTO_NUM_SHARDS:-unset}')"
-        exit 1
-    fi
-    echo "[set-env] --grind-metagraph-shards enabled → each metagraph k will be ground onto shard (k mod $NAKAMOTO_NUM_SHARDS)"
-fi
-
 # Remote host: default to 1 gl0 node, 1 gl1 node, 0 metagraph nodes for health check
 # unless explicitly overridden via --num-* args
 if [ "$TEST_HOST" != "http://localhost" ]; then
@@ -547,7 +529,7 @@ if [ -n "$METAGRAPH" ]; then
     fi
 fi
 
-# Compute MAX_NODES as the maximum of all NUM_*_NODES values.
+# Compute MAX_NODES as the maximum of all NUM_*_NODES values (capped at 10).
 # Hypergraph operators live in nodes/$i/ and run gl0+gl1; their count comes
 # from NUM_GL0_NODES / NUM_GL1_NODES.
 #
@@ -558,60 +540,24 @@ fi
 #
 # MAX_NODES is the unified ceiling — drives directory creation for both
 # hypergraph and metagraph operators (the latter via K parallel m${k}-* dirs).
-#
-# Node-count caps (shard-sortition Slice S7 — N≫K_S topology):
-#   * HYPERGRAPH (gl0/gl1) scales to MAX_HG_NODES_CAP (default 32). The per-node
-#     IP octet + host ports are computed ARITHMETICALLY in docker-env-setup.sh /
-#     docker-compose.test.yaml (base + i*stride), which is byte-identical to the
-#     old "90${i}" string-concat scheme for i<10 and extends cleanly to i≥10
-#     without overflowing the 65535 port ceiling (32 nodes → 9000..9312) or
-#     colliding IP octets (gl0 .10..(.10+N-1), gl1 .60..(.60+N-1)).
-#   * METAGRAPH nodes stay single-digit (cap 9): each metagraph runs 2-3
-#     operators and keeps the legacy ".3${i}/.4${i}/.5${i}" string-concat IP +
-#     "${prefix}${i}" port scheme. 8 metagraphs spread across distinct /24s and
-#     port prefixes (m0=92xx .. m7=22xx), so the metagraph count (NUM_METAGRAPHS)
-#     is unrelated to this per-metagraph node cap.
-#
-# Override the hypergraph cap with NAKAMOTO_MAX_HG_NODES (e.g. dial 32→24 if RAM
-# is tight). Hard ceiling 86 = highest IP octet that keeps gl0 (.10+i) and gl1
-# (.60+i) ranges disjoint inside the /24 (.10..95 for gl0, .60..145 for gl1 —
-# bounded so both stay < .200 and clear of the .200+ snapshot-streaming band).
 _max_of() { [ "$1" -gt "$2" ] && echo "$1" || echo "$2"; }
-MAX_HG_NODES_CAP=${NAKAMOTO_MAX_HG_NODES:-32}
-[ "$MAX_HG_NODES_CAP" -gt 86 ] && MAX_HG_NODES_CAP=86
 MAX_HG_NODES=$(_max_of ${NUM_GL0_NODES:-0} ${NUM_GL1_NODES:-0})
 MAX_METAGRAPH_NODES=$(_max_of ${NUM_ML0_NODES:-0} ${NUM_CL1_NODES:-0})
 MAX_METAGRAPH_NODES=$(_max_of $MAX_METAGRAPH_NODES ${NUM_DL1_NODES:-0})
 MAX_NODES=$(_max_of $MAX_HG_NODES $MAX_METAGRAPH_NODES)
-# Ensure at least 3 (legacy default). Hypergraph caps at MAX_HG_NODES_CAP;
-# metagraph operators stay single-digit (≤ 9).
+# Ensure at least 3 (legacy default) and at most 9 (single-digit IP/port offset limit)
 MAX_NODES=$(_max_of $MAX_NODES 3)
-[ "$MAX_HG_NODES" -gt "$MAX_HG_NODES_CAP" ] && MAX_HG_NODES=$MAX_HG_NODES_CAP
+[ "$MAX_NODES" -gt 9 ] && MAX_NODES=9
+[ "$MAX_HG_NODES" -gt 9 ] && MAX_HG_NODES=9
 [ "$MAX_METAGRAPH_NODES" -gt 9 ] && MAX_METAGRAPH_NODES=9
-# MAX_NODES is only used as a fallback when a per-tier cap is unset; bound it by
-# the hypergraph cap so it never drives a >cap loop.
-[ "$MAX_NODES" -gt "$MAX_HG_NODES_CAP" ] && MAX_NODES=$MAX_HG_NODES_CAP
-export MAX_NODES MAX_HG_NODES MAX_METAGRAPH_NODES MAX_HG_NODES_CAP
-
-# gl1 HOST (external) port base — single source of truth, reused by
-# docker-env-setup.sh (shard-sortition Slice S7). For ≤9 gl0 nodes this is the
-# legacy ${DAG_L1_PORT_PREFIX}00 (9100). For larger N it lifts above the gl0
-# external band (${DAG_L0_PORT_PREFIX}00 + (N-1)*10 + 2, rounded up to the next
-# 100) so gl0 and gl1 never share a host port. gl1's INTERNAL port stays 9100.
-GL0_PORT_BASE=$((DAG_L0_PORT_PREFIX * 100))
-GL1_PORT_BASE=$((DAG_L1_PORT_PREFIX * 100))
-GL0_EXT_TOP=$((GL0_PORT_BASE + (${NUM_GL0_NODES:-1} - 1) * 10 + 2))
-GL0_EXT_TOP_ROUNDED=$(( (GL0_EXT_TOP / 100 + 1) * 100 ))
-GL1_EXT_BASE=$GL1_PORT_BASE
-[ "$GL0_EXT_TOP_ROUNDED" -gt "$GL1_EXT_BASE" ] && GL1_EXT_BASE=$GL0_EXT_TOP_ROUNDED
-export GL1_EXT_BASE
+export MAX_NODES MAX_HG_NODES MAX_METAGRAPH_NODES
 
 # Layer URLs: explicit overrides take priority, otherwise built from TEST_HOST + port prefix
 # When using a remote host, GL1 defaults to port 9010 instead of 9100
 if [ "$TEST_HOST" != "http://localhost" ]; then
   GL1_DEFAULT_PORT=9010
 else
-  GL1_DEFAULT_PORT="$GL1_EXT_BASE"
+  GL1_DEFAULT_PORT="${DAG_L1_PORT_PREFIX}00"
 fi
 export GL0_URL=${GL0_URL:-"${TEST_HOST}:${DAG_L0_PORT_PREFIX}00"}
 export GL1_URL=${GL1_URL:-"${TEST_HOST}:${GL1_DEFAULT_PORT}"}

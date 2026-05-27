@@ -19,18 +19,14 @@ services:
       tessellation_common:
         aliases:
           - gl0${CONTAINER_NAME_SUFFIX:-}
-        # Per-node IP computed ARITHMETICALLY in docker-env-setup.sh (CL_DOCKER_GL0_IPV4)
-        # so the hypergraph scales past 9 nodes. Falls back to the legacy
-        # "${NET_PREFIX}.1${offset}" string form (byte-identical for offset<10) when
-        # CL_DOCKER_GL0_IPV4 is unset (single-node / non-Nakamoto paths).
-        ipv4_address: ${CL_DOCKER_GL0_IPV4:-${NET_PREFIX}.1${CONTAINER_OFFSET:-0}}
+        ipv4_address: ${NET_PREFIX}.1${CONTAINER_OFFSET:-0}
   gl1:
     # merge in an extra network just for tests
     networks:
       tessellation_common:
         aliases:
           - gl1${CONTAINER_NAME_SUFFIX:-}
-        ipv4_address: ${CL_DOCKER_GL1_IPV4:-${NET_PREFIX}.2${CONTAINER_OFFSET:-0}}
+        ipv4_address: ${NET_PREFIX}.2${CONTAINER_OFFSET:-0}
 # declare the external network (must already exist)
 networks:
   tessellation_common:
