@@ -258,6 +258,14 @@ object NakamotoChainStore {
             signedSnapshot.toHashed[F].flatMap { hashed =>
               val snapshotHash = hashed.hash
               val stored = StoredSnapshot(signedSnapshot, context, ordinal, slot, parentHash, snapshotHash, vrfOutput)
+              val vrfHex = VrfOutput(Hex(vrfOutput.map("%02x".format(_)).mkString))
+              val newTip = ChainTip(
+                snapshotHash,
+                Slot(NonNegLong.unsafeFrom(slot)),
+                ordinal,
+                parentHash,
+                vrfHex
+              )
 
               // Finality-safety gate. If `ordinal` is at-or-below finalized AND a DIFFERENT hash is
               // already stored at that ordinal, refuse the write — accepting would silently rewrite
@@ -303,88 +311,70 @@ object NakamotoChainStore {
                       )
 
                     case Some((currentBestHash, currentBest)) =>
+                      // currentBestHash and currentBest both bound from the destructured pair
+                      val currentTip = ChainTip(
+                        currentBestHash,
+                        Slot(NonNegLong.unsafeFrom(currentBest.slot)),
+                        currentBest.ordinal,
+                        currentBest.parentHash,
+                        VrfOutput(Hex(currentBest.vrfOutput.map("%02x".format(_)).mkString))
+                      )
+
                       val newState = state.copy(byHash = newByHash)
 
-                      // GLOBAL-ARGMAX FORK CHOICE (#order-independence).
+                      // Extension-first dispatch. Three architecturally distinct outcomes from a peer-received
+                      // snapshot:
                       //
-                      // Best-tip is recomputed as a global argmax over the live-tip set rather than mutated by a
-                      // single pairwise `shouldSwitch(currentTip, incoming)` decision. The pairwise rule only ever
-                      // compared the *incoming* tip against the *current* best, so the resulting head was
-                      // path-dependent on gossip arrival order: a tip that lost on arrival was filed as an alternate
-                      // branch and never reconsidered as a head unless a child of it later arrived and itself beat
-                      // the current best. Recomputing `selectBest(allTips)` removes that order-dependence — every
-                      // honest node holding the same tip set picks the same head, because the head is a pure
-                      // function of the tip set + the (unchanged) maxvalid-tk / maxvalid-bg comparator.
+                      //   1. CANONICAL EXTENSION: incoming snapshot's parentHash IS our current bestTip. The new
+                      //      tip naturally extends the chain we're already on. `prepend` is the optimized linear
+                      //      append, with the `isNextSnapshot` invariant check. No state proofs need re-anchoring,
+                      //      no MPT base reset is implied. (Pre-#117 fix this case was conflated with reorg
+                      //      because `chainSelection.shouldSwitch` returns true for any longer chain — including
+                      //      a child of currentBestTip — so it routed through `setHeadForRecovery` and logged
+                      //      "Chain reorg" misleadingly. The DEBUG-level "Chain extended" leg below was dead code.)
                       //
-                      // `selectBest` folds the SAME total-order comparator (`compare` → standardCompare /
-                      // densityCompare) that `shouldSwitch` used; only the *selection strategy* (argmax vs pairwise)
-                      // changes, not the comparator semantics (VRF tiebreak and all fall-through legs intact).
+                      //   2. TRUE REORG: incoming snapshot's parentHash is NOT our current bestTip AND
+                      //      ChainSelection picks the incoming chain over ours (longer / denser / lower-VRF
+                      //      tiebreak per maxvalid-tk + maxvalid-bg). We're switching to a different branch.
+                      //      `setHeadForRecovery` is the right API — it allows non-sequential head movement.
                       //
-                      // The candidate tip set is captured here at modify-time from `newByHash` (the post-insert map),
-                      // so the argmax input is deterministic w.r.t. this store. `fetchParent` (wired to
-                      // `chainStore.tipFor`) reads live `stateRef`, which already contains the just-inserted snapshot
-                      // by the time the effect below runs (modify commits before `.flatten` runs the effect), so
-                      // ancestor traversal during `selectBest` is complete.
-                      val parentHashes = newByHash.values.map(_.parentHash).toSet
-                      val candidateTips: List[ChainTip] =
-                        newByHash.iterator.collect {
-                          case (h, s) if !parentHashes.contains(h) =>
-                            ChainTip(
-                              h,
-                              Slot(NonNegLong.unsafeFrom(s.slot)),
-                              s.ordinal,
-                              s.parentHash,
-                              VrfOutput(Hex(s.vrfOutput.map("%02x".format(_)).mkString))
-                            )
-                        }.toList
-
-                      // Finalized-head lock (preserved from `shouldSwitch`: ChainSelection.scala `!currentIsFinalized`).
-                      // A finalized current head is never reverted, even if the argmax would prefer a different tip.
-                      // Fork choice picks the best LIVE branch; finality is a hard constraint layered on top.
-                      val effect = pcTree.associate(snapshotHash, parentHash) >>
-                        tipTracker.lastFinalized.flatMap { lastFinalized =>
-                          val currentIsFinalized = lastFinalized.exists { case (fh, _) => fh === currentBestHash }
-                          chainSelection.selectBest(candidateTips).flatMap { selected =>
-                            val newBestHash = selected.map(_.hash).getOrElse(currentBestHash)
-                            if (newBestHash === currentBestHash || currentIsFinalized) {
-                              // No head change. Either the current tip is still the argmax winner, or it is
-                              // finalized and locked. The incoming snapshot is retained in `byHash`/`pcTree` as an
-                              // alternate-branch head (visible to eviction-protection + future reorg) but bestTip
-                              // does not move.
+                      //   3. ALTERNATE BRANCH: incoming snapshot is on a different branch and ChainSelection
+                      //      keeps our current tip. Store the snapshot in the chain store as an alternate branch
+                      //      head (so eviction / future reorg-detection sees it) but don't change bestTip.
+                      //
+                      // The order matters: case 1 must be checked BEFORE invoking `shouldSwitch`, because
+                      // `shouldSwitch` cannot distinguish "child of current" from "competing chain at higher
+                      // ord" — both make the candidate win in `compare`.
+                      val effect = pcTree.associate(snapshotHash, parentHash) >> {
+                        if (parentHash === currentBestHash) {
+                          // CASE 1: canonical chain extension — append linearly
+                          stateRef.update(_.copy(bestTipHash = Some(snapshotHash))) >>
+                            persistLinear(stored) >>
+                            logger.debug(s"Chain extended to ordinal=$ordinal slot=$slot").as(true)
+                        } else {
+                          chainSelection.shouldSwitch(currentTip, newTip).flatMap {
+                            case true =>
+                              // CASE 2: real reorg — different branch wins
+                              stateRef.update(_.copy(bestTipHash = Some(snapshotHash))) >>
+                                persistHead(stored, snapshotHash) >>
+                                logger
+                                  .info(
+                                    s"Chain reorg: ordinal=$ordinal slot=$slot (parent=${parentHash.value.take(8)}) beats " +
+                                      s"previous tip ordinal=${currentBest.ordinal} slot=${currentBest.slot} " +
+                                      s"hash=${currentBestHash.value.take(8)}"
+                                  )
+                                  .as(true)
+                            case false =>
+                              // CASE 3: alternate branch loses ChainSelection — store but don't switch
                               logger
                                 .debug(
-                                  s"🔀 Argmax keeps currentBest=${currentBestHash.value.take(8)} after storing " +
-                                    s"ordinal=$ordinal slot=$slot (parent=${parentHash.value.take(8)}" +
-                                    (if (currentIsFinalized) ", current is finalized — locked" else "") + ")"
+                                  s"🔀 Stored alternate branch snapshot ordinal=$ordinal slot=$slot " +
+                                    s"(parent=${parentHash.value.take(8)}, not switching from currentBest=${currentBestHash.value.take(8)})"
                                 )
                                 .as(true)
-                            } else {
-                              // Head moves to `newBestHash`. Distinguish the optimized linear-append from a true
-                              // reorg by whether the new head's parent IS the old head:
-                              //   - linear extension  → `persistLinear` (prepend; isNextSnapshot invariant)
-                              //   - reorg             → `persistHead`    (setHeadForRecovery; non-sequential move)
-                              // The new head may be the just-inserted snapshot OR a previously-stored alternate tip
-                              // that now wins the global argmax (the case the old pairwise path could miss), so fetch
-                              // its StoredSnapshot from `newByHash` rather than assuming it is `stored`.
-                              val newBestStored = newByHash.getOrElse(newBestHash, stored)
-                              val isLinearExtension = newBestStored.parentHash === currentBestHash
-                              stateRef.update(_.copy(bestTipHash = Some(newBestHash))) >> {
-                                if (isLinearExtension)
-                                  persistLinear(newBestStored) >>
-                                    logger.debug(s"Chain extended to ordinal=${newBestStored.ordinal} slot=${newBestStored.slot}").as(true)
-                                else
-                                  persistHead(newBestStored, newBestHash) >>
-                                    logger
-                                      .info(
-                                        s"Chain reorg: ordinal=${newBestStored.ordinal} slot=${newBestStored.slot} " +
-                                          s"(parent=${newBestStored.parentHash.value.take(8)}) beats previous tip " +
-                                          s"ordinal=${currentBest.ordinal} slot=${currentBest.slot} hash=${currentBestHash.value.take(8)}"
-                                      )
-                                      .as(true)
-                              }
-                            }
                           }
                         }
+                      }
 
                       (newState, effect)
                   }

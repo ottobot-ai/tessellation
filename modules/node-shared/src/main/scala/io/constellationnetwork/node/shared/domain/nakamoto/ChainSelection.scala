@@ -193,15 +193,6 @@ object ChainSelection {
 
       /** Density comparison: count blocks within sWindow from the fork point. More blocks in the window = denser chain = better. On tie:
         * fall back to VRF tiebreak on tips.
-        *
-        * '''Symmetric window origin (antisymmetry fix).''' `buildTines` has two exit paths that route here: (1) the common ancestor was
-        * found but at `depth > kLookback`, in which case `tineA.head` and `tineB.head` are the SAME snapshot (the shared ancestor); and (2)
-        * `depth > kLookback` was hit BEFORE the tines converged, in which case `tineA.head` and `tineB.head` are DIFFERENT snapshots at the
-        * same fork depth. Deriving the window origin from `tineA.head` alone (as a prior version did) makes case (2) A-biased:
-        * `densityCompare(A, B)` and `densityCompare(B, A)` measure each tine against a different origin and can disagree, breaking the
-        * antisymmetry the fork-choice total order requires at fork-depth ≥ kLookback. We take the origin as the MIN of both tine-head
-        * slots, which is invariant under argument swap: in case (1) both heads coincide so it equals either; in case (2) `min` is symmetric
-        * by construction. Both tines are then counted against the SAME yardstick, so the comparison is order-independent.
         */
       private def densityCompare(
         tineA: List[ChainTip],
@@ -209,16 +200,8 @@ object ChainSelection {
         tipA: ChainTip,
         tipB: ChainTip
       ): ChainTip = {
-        // Symmetric fork-window origin: the earliest of the two tine heads. Invariant under (A,B)→(B,A)
-        // swap, so density counts use the same lower bound on both calls (see scaladoc above).
-        val originA = tineA.headOption.map(_.slot.value.value)
-        val originB = tineB.headOption.map(_.slot.value.value)
-        val forkSlot = (originA, originB) match {
-          case (Some(a), Some(b)) => math.min(a, b)
-          case (Some(a), None)    => a
-          case (None, Some(b))    => b
-          case (None, None)       => 0L
-        }
+        // The fork point is the common ancestor (head of each tine)
+        val forkSlot = tineA.headOption.map(_.slot.value.value).getOrElse(0L)
 
         // Count blocks within sWindow slots from fork point
         val densityA = tineA.count(t => t.slot.value.value - forkSlot <= sWindow)
