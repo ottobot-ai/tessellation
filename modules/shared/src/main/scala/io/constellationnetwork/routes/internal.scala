@@ -74,6 +74,7 @@ object internal {
       :: Equal["/nakamoto"]
       :: Equal["/kes-registration"]
       :: Equal["/shard"]
+      :: Equal["/global-follow"]
       :: HNil
   ]
 

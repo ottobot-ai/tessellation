@@ -346,9 +346,11 @@ object GlobalSnapshotInfo {
         io.constellationnetwork.security.mpt.MerklePatriciaTrie.makeParallelFromBytes[F](entries).map(_.rootHash),
         perFieldGrouping.toList.parTraverse {
           case (fieldId, fieldEntries) =>
-            io.constellationnetwork.security.mpt.MerklePatriciaTrie
-              .makeParallelFromBytes[F](fieldEntries)
-              .map(t => fieldId -> t.rootHash.value)
+            // Shared per-field root computation — keep in lockstep with the producer path
+            // (`stateProofBuilder` → `buildPerFieldMptRoots`) and the gl1 follow verifier; all three
+            // route through `GlobalStateConverter.fieldRootFromBytes` so a field's signed root can never
+            // depend on which path produced it.
+            io.constellationnetwork.schema.mpt.GlobalStateConverter.fieldRootFromBytes[F](fieldEntries).tupleLeft(fieldId)
         }
       ).parTupled
       (mptRoot, perFieldList) = results

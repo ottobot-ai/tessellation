@@ -200,6 +200,20 @@ object GlobalSnapshotConsensus {
     nipopowProofProviderRef: Ref[F, Option[
       io.constellationnetwork.node.shared.domain.nakamoto.nipopow.NipopowProofProvider[F]
     ]],
+    // Axis 2 (gl1 inclusion-proof follow) — observability seam for the GlobalFollowRoutes
+    // `GET /global-follow/slice/latest` endpoint. Populated below:
+    //   - `globalFollowSliceServiceRef` gets `GlobalFollowSliceService.make(latestFinalizedSliceSourceRef.get)`,
+    //     where the Ref is captured by `SnapshotLeaderLoop` at each finalize sink (the `StoredSnapshot.context`
+    //     of the snapshot it just finalized) — the latest-FINALIZED GSI, NOT `lastNGlobalSnapshotStorage.getCombined`
+    //     (which holds the latest PRODUCED GSI, ahead of the finalized watermark and unresolvable by a
+    //     finality-gated (#122) gl1 follower). The service projects the four consumed fields Address-keyed from
+    //     that finalized GSI and carries the finalized ordinal itself, so the follower's verifier forward-hashes
+    //     them to reproduce gl0's stateProof.<field>Proof roots.
+    // Read by `GlobalFollowRoutes` (mounted in HttpApi); the route returns 503 while it is still in its
+    // pre-wiring state. Empty until this resource has produced it.
+    globalFollowSliceServiceRef: Ref[F, Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService[F]
+    ]],
     // Invoked by NakamotoSyncDaemon when a metagraph-binary arrives via gossip.
     // Routes the binary through the same pipeline as the HTTP endpoint (stateChannelService.process).
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
@@ -231,7 +245,14 @@ object GlobalSnapshotConsensus {
     // AVAILABLE dependency into `ShardCheckpointWiring.acceptanceDeps` so a later slice (S2) can do real
     // per-signer committee sortition. NOT consumed in S1 — committee membership is still full-set, so this
     // is a no-op at every `numShards`. Empty for the CSV-genesis bootstrap path.
-    vrfRegistry: io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[F]
+    vrfRegistry: io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[F],
+    // Split-safety (#261, eta axis): the deferred chain-walk handle the follower / `createContext` GSAM's
+    // committee-eta resolver reads (created in `TessellationIOApp.make`, threaded here via `Services.make`).
+    // Set ONCE below — right after the leader's own `chainStoreForLookupRef` — to the SAME
+    // `chainStore.vrfOutputsForPeriod`-backed walk the leader uses, so the follower `EtaStateManager.getEta(P)`
+    // returns byte-identical eta to the leader's for EVERY period P (incl. the cross-period checkpoint ride).
+    // gl0 is the only layer that sets it; non-gl0 layers leave it `None` (empty walk → genesis, unchanged).
+    setFollowerEtaChainWalk: (Long => F[List[(Long, Array[Byte])]]) => F[Unit]
   )(
     implicit supervisor: Supervisor[F],
     globalStateProofSelector: GlobalStateProofSelector,
@@ -251,6 +272,15 @@ object GlobalSnapshotConsensus {
         .of[F, Option[
           io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.NakamotoChainStoreAlgebra[F]
         ]](None)
+        .toResource
+      // Axis 2 (gl1 inclusion-proof follow) — the latest-FINALIZED `(ordinal, GlobalSnapshotInfo)` the slice producer serves.
+      // Captured by `SnapshotLeaderLoop` at each finalize sink (the `StoredSnapshot.context` of the snapshot it just finalized
+      // — that GSI is genuinely in-memory at the sink, see the note at the sink). The `GlobalFollowSliceService` reads THIS,
+      // NOT `lastNGlobalSnapshotStorage.getCombined` (which holds the latest PRODUCED GSI, ahead of the finalized watermark).
+      // gl1 is finality-gated (#122): it can only resolve a snapshot at the slice's ordinal if that ordinal is finalized, so
+      // the slice MUST carry a finalized ordinal + its GSI. `None` until the first ordinal finalizes (cold start).
+      latestFinalizedSliceSourceRef <- cats.effect.kernel.Ref
+        .of[F, Option[(SnapshotOrdinal, GlobalSnapshotInfo)]](None)
         .toResource
       getGlobalSnapshotByOrdinalWithFallback: (SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]) = {
         (ordinal: SnapshotOrdinal) =>
@@ -379,19 +409,24 @@ object GlobalSnapshotConsensus {
       // `ShardCheckpointWiring.noReExecDerivation` fail-closed stub). On the `T_depth1_shard` degraded path the
       // verifier re-runs each MG's derivation over its included chain at the wire-carried `gl0AnchorOrdinal` and
       // rejects (+ surfaces slash signers) on a byte-mismatch. S3 wires re-exec → reject; APPLYING the slash
-      // penalty stays a separate slice (S2.0) — `processShardCheckpoints` still only logs the signer list.
+      // penalty stays a separate slice (S2.0) — `adoptShardCheckpoints` still only logs the signer list.
       shardAcceptanceDeps <- ShardCheckpointWiring
         .acceptanceDeps[F](
           cfg = sharedCfg.nakamoto.sharding,
           selfPeerId = selfId,
           kesRegistry = kesRegistry,
-          // Slice S1: genesis-loaded VRF-VK registry, threaded available-but-unused (full-set membership).
+          // EXECUTION-SHARDING: genesis-loaded VRF-VK registry — the per-operator seed for the real shard-committee sortition.
           vrfRegistry = vrfRegistry,
           activeValidators = Async[F].pure(
             seedlist
               .map(_.collect { case e if !e.alias.exists(_.value.value == "metagraph-op") => e.peerId })
               .getOrElse(Set(selfId))
           ),
+          // Per-period eta for `committeeFor`: the SAME `EtaStateManager.getEta` resolver the GSAM boundary writer uses, decoded
+          // from the hex `Hash` to the 32 raw eta bytes (mirrors `gl0EtaBytesForPeriod` below). MPT-committed ⇒ byte-identical
+          // cluster-wide, keyed on the wire-carried `checkpoint.epoch`.
+          etaForEpoch = (epoch: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
+            etaForPeriodCallback(epoch).map(h => io.constellationnetwork.security.hex.Hex(h.value).toBytes),
           reExecuteDerivation = Some(
             ShardCheckpointWiring.reExecDerivation[F](shardScEventsProcessor)(Async[F], HasherSelector[F].getCurrent)
           )
@@ -816,6 +851,19 @@ object GlobalSnapshotConsensus {
             .toResource
           _ <- chainStoreRef.set(Some(chainStore)).toResource
           _ <- chainStoreForLookupRef.set(Some(chainStore)).toResource
+          // Split-safety (#261, eta axis): install the SAME chain-walk the leader's committee-eta resolver uses
+          // (`etaForPeriodCallback`'s `chainWalkFallback` at the top of this `make`) into the follower /
+          // `createContext` GSAM's `EtaStateManager` via the deferred Ref. Both walks read the identical
+          // `chainStoreForLookupRef` and call `cs.vrfOutputsForPeriod(sourcePeriod, etaRotationSnapshots)`, so the
+          // follower's `getEta(P)` now byte-equals the leader's for EVERY period P ≥ 2 — closing the
+          // `C_real ≠ C_genesis` committee split on the gl0 Download / RollbackLoader rebuild paths. Set AFTER
+          // `chainStoreForLookupRef` so the very first follower walk already observes the chain store.
+          _ <- setFollowerEtaChainWalk { (sourcePeriod: Long) =>
+            chainStoreForLookupRef.get.flatMap {
+              case Some(cs) => cs.vrfOutputsForPeriod(sourcePeriod, sharedCfg.nakamoto.etaRotationSnapshots.value)
+              case None     => Async[F].pure(List.empty[(Long, Array[Byte])])
+            }
+          }.toResource
           // #56.10 Phase I (multi-tip in #115): wire the overlay's eviction `bestTipsFn` to
           // `chainStore.allTips` so ancestor protection covers EVERY viable chain head — the
           // canonical bestTip AND any tentative-branch heads being followed during fork-recovery.
@@ -1163,6 +1211,27 @@ object GlobalSnapshotConsensus {
             nipopowProofProviderRef.set(Some(provider))
           }.toResource
 
+          // Axis 2 (gl1 inclusion-proof follow) — publish the gl0-side slice producer so
+          // `GlobalFollowRoutes` (mounted in HttpApi) can serve `GET /global-follow/slice/latest`.
+          // ADDITIVE / observability-only: the route reads this Ref and never feeds back into consensus —
+          // exactly like the NipopowRoutes seam above.
+          //   - The slice service reads `latestFinalizedSliceSourceRef` — the latest-FINALIZED
+          //     `(ordinal, GlobalSnapshotInfo)` captured by `SnapshotLeaderLoop` at the finalize sink (the
+          //     `StoredSnapshot.context` of the snapshot it just finalized). This is NOT
+          //     `lastNGlobalSnapshotStorage.getCombined`, which holds the latest PRODUCED GSI — ahead of the
+          //     finalized watermark and therefore UNRESOLVABLE by a finality-gated (#122) gl1 follower. The
+          //     service projects the four consumed fields Address-keyed from the finalized GSI (`gsi.balances`
+          //     / `gsi.lastTxRefs` / `gsi.lastAllowSpendRefs` / `gsi.lastTokenLockRefs`) and carries the
+          //     finalized ordinal itself, so the follower can resolve the snapshot at that ordinal for the
+          //     trusted roots and forward-hash each `(Address, value)` to reproduce gl0's
+          //     stateProof.<field>Proof on recompute-and-match. No MPT store/overlay read here — the
+          //     byte-identity is reproduced on the verify side, not extracted from the store.
+          _ <- {
+            val sliceService = io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService
+              .make[F](latestFinalizedSliceSourceRef.get)
+            globalFollowSliceServiceRef.set(Some(sliceService))
+          }.toResource
+
           // ─── Gap A — per-shard checkpoint producers ──────────────────────────────────────────
           // Build one `ShardCheckpointProducer` per shard the operator tracks, REUSING the SAME
           // per-shard `ShardChainStore` the acceptance side (`shardAcceptanceDeps.registry`) reads —
@@ -1375,6 +1444,10 @@ object GlobalSnapshotConsensus {
                   mptStore = mptStore,
                   mptOverlay = mptOverlay,
                   nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef,
+                  // Axis 2 (gl1 follow): capture the just-finalized snapshot's GSI here so the slice producer
+                  // serves the latest-FINALIZED `(ordinal, GSI)` (resolvable by a finality-gated gl1) rather
+                  // than the latest-produced one. Updated monotonically at both finalize sinks.
+                  latestFinalizedSliceSourceRef = latestFinalizedSliceSourceRef,
                   chainSyncRequestQueue = chainSyncRequestQueue,
                   finalityTriggerViewRef = finalityTriggerViewRef,
                   // §1.2 Slice 5/6: parallel-sign attestations + snapshots with KES.
@@ -1439,16 +1512,29 @@ object GlobalSnapshotConsensus {
                   // a dedicated MPT producer (NOT in the consensus stateProof). Invoked at T_depth2
                   // archival watermark advance in SnapshotLeaderLoop.finalityMonitor.
                   towerFinalizer = towerFinalizer,
-                  // Gap A — per-shard checkpoint producers + the SAME chain stores they write into +
-                  // the static metagraph→shard assignment. Empty / None at numShards=1 (regression bar);
-                  // the fan-out in `onSlotWon` is a no-op `traverse_` over the empty map. `shardChainStores`
-                  // is projected off the SAME `shardAcceptanceDeps.registry` entries the acceptance side
-                  // reads, so the producer's own-checkpoint store and the consumer reads share one instance.
+                  // Gap A — per-shard checkpoint producers + the SAME chain stores they write into + the
+                  // per-shard raw-binary buffers (EXECUTION-SHARDING R-1, the producer fan-out input) + the
+                  // static metagraph→shard assignment. Empty / None at numShards=1 (regression bar); the
+                  // fan-out in `onSlotWon` is a no-op `traverse_` over the empty map. `shardChainStores` and
+                  // `shardBinaryBuffers` are projected off the SAME `shardAcceptanceDeps.registry` entries the
+                  // acceptance side + the daemon's intake share, so producer writes ⇒ consumer reads ⇒ chain
+                  // grows, and the daemon buffers raw binaries ⇒ the fan-out reads them.
                   shardProducers = shardProducers,
                   shardChainStores = shardAcceptanceDeps
                     .map(_.registry.map { case (sid, entry) => sid -> entry.chainStore })
                     .getOrElse(Map.empty),
-                  shardAssignment = shardAcceptanceDeps.map(_.shardAssignment)
+                  shardBinaryBuffers = shardAcceptanceDeps
+                    .map(_.registry.map { case (sid, entry) => sid -> entry.binaryBuffer })
+                    .getOrElse(Map.empty),
+                  shardAssignment = shardAcceptanceDeps.map(_.shardAssignment),
+                  // EXECUTION-SHARDING Task 2: the SAME deterministic committee draw the acceptance manager uses, so the produce
+                  // membership gate is consistent with admission. `None` (numShards=1) ⇒ empty-set draw (the fan-out is gated on
+                  // `shardProducers.nonEmpty` first, so it is never reached there).
+                  shardCommitteeMembership = shardAcceptanceDeps
+                    .map(_.committeeMembership)
+                    .getOrElse((_: io.constellationnetwork.schema.sharding.ShardId, _: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
+                      Async[F].pure(Set.empty[io.constellationnetwork.schema.peer.PeerId])
+                    )
                 )
                 .compile
                 .drain

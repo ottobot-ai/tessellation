@@ -1,0 +1,36 @@
+flowchart TB
+    subgraph EXEC["EXECUTION SHARDS — independent streams, each evolving over its own ordinals, all anchored to gl0-ordinal time"]
+      direction LR
+      subgraph BASE["BASE / GLOBAL shard · UNIVERSAL (every gl0 op executes it — NOT sortitioned)"]
+        direction TB
+        DAGTX["DAG transactions (wallets)"]
+        GL1["gl1 = DAG-L1<br/>L1 blocks: b₀ → b₁ → b₂ → …"]
+        GL0X["gl0 = Global-L0 EXECUTION<br/>global state: balances · delegated-stake · node-collateral<br/>· DAG token-locks/allow-spends · rewards · pricing<br/>+ ADOPT metagraph checkpoints"]
+        DAGTX --> GL1 --> GL0X
+      end
+      subgraph MGS["METAGRAPH-N shards · SORTITIONED committees (ONLY the committee re-executes)"]
+        direction TB
+        MGN["metagraph-N = ml0+cl1 (internal BFT)<br/>currency snapshot stream: cs₀ → cs₁ → cs₂ → …"]
+        COMM["shard committee = VRF subset of gl0 ops<br/>re-executes the per-MG slice"]
+        CP["ShardCheckpoint mini-chain (per shard)<br/>cp₀ → cp₁ → … (parent-linked, Taktikos fork-choice)"]
+        MGN --> COMM --> CP
+      end
+    end
+
+    GL0X --> GS["gl0 GLOBAL SNAPSHOT chain — the CANONICAL timeline<br/>gs₀ → gs₁ → … → gsₜ  (Taktikos; finalized by attestation-quorum OR depth-k)"]
+    CP -->|"gossip signed envelope → gl0 verifies committee-sig threshold and ADOPTS (no re-exec)"| GS
+
+    GS ==> MPT["HYPERGRAPH DATA LAYER = MPT  (formerly the GSI)<br/>the SINGLE materialized state @ each finalized ordinal · per-field state-proof<br/>namespaces: Hypergraph(global) · Metagraph(addr) · Address(addr) · System · Hash"]
+
+    GS -.->|"followers consume ONLY finalized gsₜ (#122 G1):<br/>gl1, ml0, other gl0 nodes sync the finalized chain"| GL1
+    GLITCH["⚠ gl1 sync-storm lives HERE — base-layer L1↔L0:<br/>gl1 can't follow gl0's finalized timeline cleanly<br/>(NotNext / Recovery-reset loop). NOT the metagraph shards, NOT shardCheckpoints."]
+    GLITCH -.-> GL1
+
+    classDef base fill:#e0f0ff,stroke:#2471a3,color:#1a5276;
+    classDef mg fill:#e0f7e0,stroke:#27ae60,color:#145a32;
+    classDef data fill:#fff3d6,stroke:#b9770e,color:#7e5109;
+    classDef warn fill:#ffe0e0,stroke:#c0392b,color:#7b241c;
+    class DAGTX,GL1,GL0X,GS base;
+    class MGN,COMM,CP mg;
+    class MPT data;
+    class GLITCH warn;

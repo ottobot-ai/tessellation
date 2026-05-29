@@ -902,6 +902,25 @@ object GlobalStateConverter {
       .map(historicalKeys => pureKeys ++ historicalKeys.toSet)
   }
 
+  /** Canonical per-field MPT subtree-root computation, shared by EVERY path that derives a `stateProof.<field>Proof` value: the producer
+    * path (`GlobalSnapshotInfo.stateProofBuilder` → [[buildPerFieldMptRoots]]), the overlay/GSAM path
+    * (`GlobalSnapshotInfo.mptStateProofFromBytes`), and the gl1 follow-mirror verifier
+    * (`io.constellationnetwork.schema.nakamoto.follow.FollowVerifyCore.verifyFieldRoots`).
+    *
+    * A field's subtree root is '''not''' an extraction from the global trie — it is the `rootHash` of a standalone MPT built from ONLY that
+    * field's `(hex key → value bytes)` entries via `MerklePatriciaTrie.makeParallelFromBytes`. Centralizing it here means the three callers
+    * can never drift on either the build algorithm or the empty-field convention, which is the byte-identity contract the follow path's
+    * FIELD-ROOT-MATCH verify depends on (see `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`, "correct-by-design contract").
+    *
+    * '''Empty-field convention (determinism-load-bearing).''' An empty field maps to [[Hash.empty]] — NOT to
+    * `makeParallelFromBytes(Map.empty).rootHash` (which is the digest of an empty `Branch`, a different value). Both gl0 paths
+    * short-circuit the empty case to `Hash.empty` (producer: this guard; overlay: absent fields default via `getOrElse(_, Hash.empty)`), so
+    * the verifier must reproduce exactly that to match a signed root for a field that became empty.
+    */
+  def fieldRootFromBytes[F[_]: Parallel: Async: Hasher: JsonSerializer](fieldEntries: Map[Hex, Array[Byte]]): F[Hash] =
+    if (fieldEntries.isEmpty) Hash.empty.pure[F]
+    else MerklePatriciaTrie.makeParallelFromBytes[F](fieldEntries).map(_.rootHash.value)
+
   object syntax {
     implicit class GlobalSnapshotInfoMptOps(val info: GlobalSnapshotInfo) extends AnyVal {
       def allStateEntries[F[_]: Async: Parallel: Hasher: JsonSerializer](
@@ -951,10 +970,8 @@ object GlobalStateConverter {
           grouped = kvPairs.groupBy(_._1.fieldId).toList
           perField <- grouped.parTraverse {
             case (fieldId, entries) =>
-              if (entries.isEmpty) (fieldId -> Hash.empty).pure[F]
-              else
-                entries.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }
-                  .flatMap(pairs => MerklePatriciaTrie.makeParallelFromBytes[F](pairs.toMap).map(t => fieldId -> t.rootHash.value))
+              entries.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }
+                .flatMap(pairs => fieldRootFromBytes[F](pairs.toMap).tupleLeft(fieldId))
           }
         } yield perField.toMap
     }

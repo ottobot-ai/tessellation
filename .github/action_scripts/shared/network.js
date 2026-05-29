@@ -6,13 +6,22 @@ const createNetworkConfig = (args) => {
     const { dagL0PortPrefix, dagL1PortPrefix, metagraphL0PortPrefix, currencyL1PortPrefix, dataL1PortPrefix } = args;
     const host = process.env.TEST_HOST || 'http://localhost';
 
+    // gl1 EXTERNAL host ports = GL1_EXT_PORT_BASE + i*10 (9600 band) — the gl1
+    // container-internal port stays in the dagL1PortPrefix (9100) band. GL1_URL
+    // already targets node 0's external port; the extended (gl1-5) URL must use
+    // the same external base, not the internal-band prefix.
+    const gl1ExtPortBase = parseInt(
+        process.env.GL1_EXT_PORT_BASE || `${Number(dagL1PortPrefix) * 100}`,
+        10
+    );
+
     return {
         globalL0Url: process.env.GL0_URL || `${host}:${dagL0PortPrefix}00`,
-        dagL1Url: process.env.GL1_URL || `${host}:${dagL1PortPrefix}00`,
+        dagL1Url: process.env.GL1_URL || `${host}:${gl1ExtPortBase}`,
         currencyL0Url: process.env.ML0_URL || `${host}:${metagraphL0PortPrefix}00`,
         currencyL1Url: process.env.CL1_URL || `${host}:${currencyL1PortPrefix}00`,
         dataL1Url: process.env.DL1_URL || `${host}:${dataL1PortPrefix}00`,
-        extendedDagL1Url: process.env.EXT_GL1_URL || `${host}:${dagL1PortPrefix}50`,
+        extendedDagL1Url: process.env.EXT_GL1_URL || `${host}:${gl1ExtPortBase + 5 * 10}`,
         extendedDataL1Url: process.env.EXT_DL1_URL || `${host}:${dataL1PortPrefix}50`
     };
 };

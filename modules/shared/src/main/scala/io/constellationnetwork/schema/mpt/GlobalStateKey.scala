@@ -155,9 +155,14 @@ object PartitionNamespace {
     cursor.downField("type").as[String].flatMap {
       case "empty"      => Right(EmptyNamespace)
       case "hypergraph" => Right(HypergraphNamespace)
-      case "metagraph"  => cursor.downField("address").as[String].map(s => MetagraphNamespace(Address.fromBytes(s.getBytes)))
-      case "address"    => cursor.downField("address").as[String].map(s => AddressNamespace(Address.fromBytes(s.getBytes)))
-      case "hash"       => cursor.downField("hash").as[String].map(s => HashNamespace(Hash(s)))
+      // Decode via the canonical Decoder[Address] — the exact inverse of the encoder above
+      // (`Json.fromString(addr.value.value)`). The previous `Address.fromBytes(s.getBytes)` was a
+      // BUG: `fromBytes` SHA-256-hashes its input (address.scala:30-40), so it produced the address
+      // OF THE HASH OF the address string, not the original — making address/metagraph-keyed
+      // GlobalStateKeys non-round-trippable over JSON (blocked inclusion-proof fetch for balances).
+      case "metagraph" => cursor.downField("address").as[Address].map(MetagraphNamespace(_))
+      case "address"   => cursor.downField("address").as[Address].map(AddressNamespace(_))
+      case "hash"      => cursor.downField("hash").as[String].map(s => HashNamespace(Hash(s)))
       case "system" =>
         cursor
           .downField("label")

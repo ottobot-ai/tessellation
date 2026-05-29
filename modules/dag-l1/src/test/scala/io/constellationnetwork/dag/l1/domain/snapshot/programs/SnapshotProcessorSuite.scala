@@ -56,6 +56,7 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.nakamoto.follow.{ConsumedFieldDelta, GlobalFollowSliceResponse}
 import io.constellationnetwork.schema.node.RewardFraction
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.swap.AllowSpendReference
@@ -104,7 +105,9 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
     Ref[IO, SortedMap[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]]],
     Hasher[IO],
     MptStore[IO, GlobalStateKey],
-    JsonSerializer[IO]
+    JsonSerializer[IO],
+    // gl1 own-slice follow CUTOVER (S3b′): the slice `getLatestFollowSlice` serves to `applyGlobalSnapshotFn`.
+    Ref[IO, Option[GlobalFollowSliceResponse]]
   )
 
   def testResources: Resource[IO, TestResources] =
@@ -116,6 +119,10 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
               implicit0(jhs: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO].asResource
               implicit0(h: Hasher[IO]) = Hasher.forJson[IO]
               balancesR <- Ref.of[IO, Map[Address, Balance]](Map.empty).asResource
+              // gl1 own-slice follow CUTOVER (S3b′): the slice the mocked GlobalL0Service serves. Default None
+              // (download-path tests never reach `applySnapshotFn`). NextSubHeight / NextHeight alignment tests set
+              // it to a slice that recompute-matches the processed snapshot's stateProof via `withFollowSlice`.
+              followSliceR <- Ref.of[IO, Option[GlobalFollowSliceResponse]](None).asResource
               blocksR <- MapRef.ofConcurrentHashMap[IO, ProofsHash, StoredBlock]().asResource
               lastSnapR <- SignallingRef.of[IO, Option[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)]](None).asResource
               lastNSnapR <- SignallingRef.of[IO, Option[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)]](None).asResource
@@ -363,6 +370,12 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                     lastOrdinal: SnapshotOrdinal,
                     finalizedOrdinal: SnapshotOrdinal
                   ): IO[List[Hashed[GlobalIncrementalSnapshot]]] = List.empty[Hashed[GlobalIncrementalSnapshot]].pure[IO]
+
+                  // gl1 own-slice follow CUTOVER (S3b′): per-test mutable hook. Default None (no slice) so the
+                  // download-path tests, which never reach `applySnapshotFn`, are unaffected. The NextSubHeight /
+                  // NextHeight alignment tests set this to a slice that recompute-matches the processed snapshot's
+                  // stateProof (see `withFollowSlice`).
+                  override def getLatestFollowSlice: IO[Option[GlobalFollowSliceResponse]] = followSliceR.get
                 }
                 val lastNSnapshotStorage =
                   LastNGlobalSnapshotStorage.make[IO](lastGlobalSnapshotsSyncConfig, lastNSnapR, incLastNSnapR)
@@ -375,7 +388,6 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                     transactionStorage,
                     allowSpendStorage,
                     tokenLockStorage,
-                    globalSnapshotContextFns,
                     Hasher.forKryo[IO],
                     globalL0Service.pullGlobalSnapshot,
                     globalL0Service,
@@ -415,7 +427,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                 incLastNSnapR,
                 k,
                 mptStore,
-                jhs
+                jhs,
+                followSliceR
               )
           }
         }
@@ -540,7 +553,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             incLastNSnapR,
             k,
             _,
-            jhs
+            jhs,
+            followSliceR
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -675,7 +689,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             incLastNSnapR,
             k,
             _,
-            jhs
+            jhs,
+            followSliceR
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -865,7 +880,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             incLastNSnapR,
             k,
             _,
-            jhs
+            jhs,
+            followSliceR
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -1072,7 +1088,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             incLastNSnapR,
             k,
             mptStore,
-            jhs
+            jhs,
+            followSliceR
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -1104,6 +1121,11 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           incLastN = SortedMap(hashedLastSnapshot.ordinal -> hashedLastSnapshot)
           _ <- lastNSnapsR.set(lastN)
           _ <- incLastNSnapR.set(incLastN)
+          // gl1 own-slice follow CUTOVER (S3b′): serve the empty consumed-field slice at the processed ordinal.
+          // `hashedNextSnapshot`'s stateProof (from `generateSnapshot`) carries `balancesProof=Hash.empty`,
+          // `lastTxRefsProof=Hash.empty`, allow/tokenlock refs = None, so an empty slice recompute-matches
+          // (`fieldRootFromBytes(empty) == Hash.empty`).
+          _ <- followSliceR.set(GlobalFollowSliceResponse(snapshotOrdinal11, ConsumedFieldDelta.empty).some)
 
           processingResult <- snapshotProcessor.process(
             hashedNextSnapshot.asRight[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)]
@@ -1132,9 +1154,191 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
               ),
               Map.empty,
               Map.empty,
-              Some((hashedNextSnapshot, snapshotInfo)),
+              // gl1 own-slice follow CUTOVER: the stored GSI is now the verified 4-field consumed-field slice
+              // (here all-empty), NOT the re-executed full GSI. `lastStateChannelSnapshotHashes` (a field gl1 does
+              // NOT consume) is intentionally dropped — its absence is the visible effect of the cutover.
+              Some((hashedNextSnapshot, GlobalSnapshotInfo.empty)),
               Map.empty
             )
+          )
+    }
+  }
+
+  // gl1 inclusion-proof follow CATCH-UP FIX (2026-05-29): the slice is ALWAYS the LATEST finalized, so its ordinal M is a
+  // moving target >= the processing ordinal N — N == M rarely/never holds during catch-up/lag. The verify must anchor to
+  // gl1's OWN LOCAL finalized snapshot at M (`lastNGlobalSnapshotStorage.getByOrdinal`), NOT a peer re-pull. Here the slice
+  // ordinal is the PREVIOUS finalized ordinal (10), which is in the lastN window, while the processed snapshot is ordinal 11.
+  // The mocked `pullGlobalSnapshot` returns None, so a success proves the local lookup is used (the old re-pull path would
+  // have deferred forever — the 0-Verified gl1-formation bug).
+  test("alignment uses gl1's LOCAL finalized snapshot at the slice ordinal when slice ordinal != processed ordinal") {
+    testResources.use {
+      case (
+            snapshotProcessor,
+            sp,
+            h,
+            _,
+            _,
+            srcKey,
+            _,
+            _,
+            _,
+            peerId,
+            balancesR,
+            blocksR,
+            lastSnapR,
+            ts,
+            _,
+            lastNSnapsR,
+            incLastNSnapR,
+            k,
+            mptStore,
+            jhs,
+            followSliceR
+          ) =>
+        implicit val securityProvider: SecurityProvider[IO] = sp
+        implicit val hasher = h
+        implicit val js = jhs
+        implicit val globalStateProofSelector: GlobalStateProofSelector =
+          GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+
+        val address = Address("DAG0y4eLqhhXUafeE3mgBstezPTnr8L3tZjAtMWB")
+        val snapshotInfo = mkGlobalSnapshotInfo(
+          SortedMap(address -> Hash("someHash".getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64)))
+        )
+        for {
+          hashedLastSnapshot <- forAsyncHasher(
+            generateSnapshot(peerId),
+            srcKey
+          ).flatMap(_.toHashedWithSignatureCheck.map(_.toOption.get))
+          hashedNextSnapshot <- forAsyncHasher(
+            generateSnapshot(peerId).copy(
+              ordinal = snapshotOrdinal11,
+              subHeight = snapshotSubHeight1,
+              lastSnapshotHash = hashedLastSnapshot.hash,
+              delegateRewards = None
+            ),
+            srcKey
+          ).flatMap(_.toHashedWithSignatureCheck.map(_.toOption.get))
+          _ <- mptStore.syncFromGlobalSnapshotInfo(snapshotInfo, hashedLastSnapshot.ordinal)
+          _ <- lastSnapR.set((hashedLastSnapshot, snapshotInfo).some)
+          lastN = (hashedLastSnapshot, snapshotInfo).some
+          // gl1's lastN window holds the finalized snapshot at ordinal 10 — the slice's ordinal — keyed by ordinal.
+          incLastN = SortedMap(hashedLastSnapshot.ordinal -> hashedLastSnapshot)
+          _ <- lastNSnapsR.set(lastN)
+          _ <- incLastNSnapR.set(incLastN)
+          // Slice ordinal = 10 (the PREVIOUS finalized, != processed ordinal 11). An empty slice recompute-matches
+          // ordinal-10's empty stateProof (resolved from the LOCAL lastN store via `getByOrdinal`, no peer pull).
+          _ <- followSliceR.set(GlobalFollowSliceResponse(snapshotOrdinal10, ConsumedFieldDelta.empty).some)
+
+          processingResult <- snapshotProcessor.process(
+            hashedNextSnapshot.asRight[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)]
+          )
+
+          balancesAfter <- balancesR.get
+          blocksAfter <- blocksR.toMap
+          lastGlobalSnapshotAfter <- lastSnapR.get
+          lastAcceptedTxRAfter <- ts.getState.flatMap { m =>
+            m.toList.traverse { case (address, _) => ts.getLastProcessedTransaction(address).map(address -> _) }.map(_.toMap)
+          }
+        } yield
+          expect.same(
+            (processingResult, balancesAfter, blocksAfter, lastGlobalSnapshotAfter, lastAcceptedTxRAfter),
+            (
+              Aligned(
+                SnapshotReference(
+                  snapshotHeight6,
+                  snapshotSubHeight1,
+                  snapshotOrdinal11,
+                  hashedLastSnapshot.hash,
+                  hashedNextSnapshot.hash,
+                  hashedNextSnapshot.proofsHash
+                ),
+                Set.empty
+              ),
+              Map.empty,
+              Map.empty,
+              // The verified slice was anchored to the LOCAL ordinal-10 snapshot's stateProof (empty) — the stored GSI is
+              // the verified 4-field consumed-field slice (all-empty here), advancing the chain pointer to ordinal 11.
+              Some((hashedNextSnapshot, GlobalSnapshotInfo.empty)),
+              Map.empty
+            )
+          )
+    }
+  }
+
+  // gl1 inclusion-proof follow CATCH-UP FIX (2026-05-29): when the slice's ordinal M is NOT yet in gl1's local lastN window
+  // (its finalized-follow has not reached M), the verify DEFERS this tick — raises the retryable `FollowSliceVerificationError`
+  // WITHOUT a peer re-pull and WITHOUT advancing the chain pointer (no recovery storm). It resolves once the follow reaches M.
+  test("alignment defers (no advance, no re-pull) when the slice ordinal is not yet in gl1's local lastN window") {
+    testResources.use {
+      case (
+            snapshotProcessor,
+            sp,
+            h,
+            _,
+            _,
+            srcKey,
+            _,
+            _,
+            _,
+            peerId,
+            _,
+            _,
+            lastSnapR,
+            _,
+            _,
+            lastNSnapsR,
+            incLastNSnapR,
+            k,
+            mptStore,
+            jhs,
+            followSliceR
+          ) =>
+        implicit val securityProvider: SecurityProvider[IO] = sp
+        implicit val hasher = h
+        implicit val js = jhs
+        implicit val globalStateProofSelector: GlobalStateProofSelector =
+          GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+
+        val address = Address("DAG0y4eLqhhXUafeE3mgBstezPTnr8L3tZjAtMWB")
+        val snapshotInfo = mkGlobalSnapshotInfo(
+          SortedMap(address -> Hash("someHash".getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64)))
+        )
+        for {
+          hashedLastSnapshot <- forAsyncHasher(
+            generateSnapshot(peerId),
+            srcKey
+          ).flatMap(_.toHashedWithSignatureCheck.map(_.toOption.get))
+          hashedNextSnapshot <- forAsyncHasher(
+            generateSnapshot(peerId).copy(
+              ordinal = snapshotOrdinal11,
+              subHeight = snapshotSubHeight1,
+              lastSnapshotHash = hashedLastSnapshot.hash,
+              delegateRewards = None
+            ),
+            srcKey
+          ).flatMap(_.toHashedWithSignatureCheck.map(_.toOption.get))
+          _ <- mptStore.syncFromGlobalSnapshotInfo(snapshotInfo, hashedLastSnapshot.ordinal)
+          _ <- lastSnapR.set((hashedLastSnapshot, snapshotInfo).some)
+          lastN = (hashedLastSnapshot, snapshotInfo).some
+          // lastN window holds ONLY ordinal 10; the slice below is at ordinal 9, which is absent.
+          incLastN = SortedMap(hashedLastSnapshot.ordinal -> hashedLastSnapshot)
+          _ <- lastNSnapsR.set(lastN)
+          _ <- incLastNSnapR.set(incLastN)
+          // Slice ordinal = 9: != processed ordinal 11 AND not in the lastN window -> `getByOrdinal(9)` = None -> defer.
+          _ <- followSliceR.set(GlobalFollowSliceResponse(snapshotOrdinal9, ConsumedFieldDelta.empty).some)
+
+          processingResult <- snapshotProcessor
+            .process(hashedNextSnapshot.asRight[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)])
+            .map(_.asRight[Throwable])
+            .handleErrorWith(e => IO.pure(e.asLeft[SnapshotProcessingResult]))
+          lastSnapshotAfter <- lastSnapR.get.map(_.get)
+        } yield
+          expect(
+            processingResult.isLeft &&
+              processingResult.swap.exists(_.isInstanceOf[DAGSnapshotProcessor.FollowSliceVerificationError]) &&
+              // chain pointer did NOT advance — still at the previous finalized snapshot (ordinal 10).
+              lastSnapshotAfter == ((hashedLastSnapshot, snapshotInfo))
           )
     }
   }
@@ -1161,7 +1365,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             incLastNSnapR,
             k,
             _,
-            jhs
+            jhs,
+            followSliceR
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val kryo = ks
@@ -1298,10 +1503,10 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           }
           newSnapshotInfoStateProof <- {
             implicit val hasher = currentHasher
-            // Selector must match the one the acceptance manager uses at accept() time
-            // (LegacyFormat, see Mocks selector above) so the claimed proof and the
-            // locally-computed proof agree on whether `mptRoot` is present.
-            implicit val selector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+            // gl1 own-slice follow CUTOVER (S3b′): the follower now verifies the slice by MPT FIELD-ROOT equality
+            // (`GlobalFollowMirrorVerifier` → `fieldRootFromBytes`), so the snapshot's claimed per-field roots must be
+            // MPT roots — use the MerklePatriciaFormat selector (MinValue) here, not the legacy hash format.
+            implicit val selector = GlobalStateProofSelector(SnapshotOrdinal.MinValue)
 
             newSnapshotInfo.stateProof[IO](snapshotOrdinal11)
           }
@@ -1336,6 +1541,23 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           lastN = (hashedLastSnapshot, GlobalSnapshotInfo.empty).some
           _ <- lastNSnapR.set(lastN)
           _ <- incLastNSnapR.set(incLastN)
+          // gl1 own-slice follow CUTOVER (S3b′): serve the consumed-field slice projected from `newSnapshotInfo`
+          // (the four Address-keyed fields gl1 reads) at the processed ordinal. It recompute-matches
+          // `hashedNextSnapshot`'s MPT-format stateProof, and the verifier rebuilds exactly these fields → the stored
+          // GSI equals `newSnapshotInfo` (which has only these fields populated).
+          _ <- followSliceR.set(
+            GlobalFollowSliceResponse(
+              snapshotOrdinal11,
+              ConsumedFieldDelta(
+                balances = newSnapshotInfo.balances,
+                lastTxRefs = newSnapshotInfo.lastTxRefs,
+                lastAllowSpendRefs = SortedMap.empty,
+                lastTokenLockRefs = SortedMap.empty,
+                activeTokenLocks = SortedMap.empty,
+                removals = SortedMap.empty
+              )
+            ).some
+          )
           // Inserting tips
           _ <- blocksR(parent1.hash).set(MajorityBlock(parent1, 2L, Deprecated).some)
           _ <- blocksR(parent2.hash).set(MajorityBlock(parent2, 2L, Deprecated).some)
@@ -1454,7 +1676,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             incLastNSnapR,
             k,
             _,
-            jhs
+            jhs,
+            followSliceR
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -1590,10 +1813,10 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             )
           }
           newSnapshotInfoStateProof <- {
-            // Align with the Mocks selector so claimed proof and acceptance-computed proof
-            // agree on whether `mptRoot` is present.
+            // gl1 own-slice follow CUTOVER (S3b′): MerklePatriciaFormat so the snapshot's claimed per-field roots are
+            // the MPT roots the follower's `GlobalFollowMirrorVerifier` recompute-matches.
             implicit val testGlobalStateProofSelector: GlobalStateProofSelector =
-              GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+              GlobalStateProofSelector(SnapshotOrdinal.MinValue)
             newSnapshotInfo.stateProof[IO](snapshotOrdinal11)
           }
           hashedNextSnapshot <- forAsyncHasher(
@@ -1630,6 +1853,22 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           incLastN = SortedMap(hashedLastSnapshot.ordinal -> hashedLastSnapshot)
           _ <- lastNSnapR.set(lastN)
           _ <- incLastNSnapR.set(incLastN)
+          // gl1 own-slice follow CUTOVER (S3b′): serve the consumed-field slice projected from `newSnapshotInfo`;
+          // it recompute-matches `hashedNextSnapshot`'s MPT-format stateProof so the verify succeeds and the built
+          // GSI equals `newSnapshotInfo` before the redownload reconciliation runs.
+          _ <- followSliceR.set(
+            GlobalFollowSliceResponse(
+              snapshotOrdinal11,
+              ConsumedFieldDelta(
+                balances = newSnapshotInfo.balances,
+                lastTxRefs = newSnapshotInfo.lastTxRefs,
+                lastAllowSpendRefs = SortedMap.empty,
+                lastTokenLockRefs = SortedMap.empty,
+                activeTokenLocks = SortedMap.empty,
+                removals = SortedMap.empty
+              )
+            ).some
+          )
           // Inserting tips
           _ <- blocksR(parent1.hash).set(MajorityBlock(parent1, 2L, Deprecated).some)
           _ <- blocksR(parent2.hash).set(MajorityBlock(parent2, 2L, Deprecated).some)
@@ -1758,7 +1997,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
 
   test("snapshot should be ignored when a snapshot pushed for processing is not a next one") {
     testResources.use {
-      case (snapshotProcessor, sp, h, _, _, srcKey, _, _, _, peerId, _, _, lastSnapR, _, _, lastNSnapR, incLastNSnapR, k, _, jhs) =>
+      case (snapshotProcessor, sp, h, _, _, srcKey, _, _, _, peerId, _, _, lastSnapR, _, _, lastNSnapR, incLastNSnapR, k, _, jhs, _) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
         implicit val js = jhs
@@ -1823,7 +2062,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             incLastNSnapR,
             k,
             mptStore,
-            jhs
+            jhs,
+            followSliceR
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -1868,6 +2108,10 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           _ <- lastNSnapR.set(lastN)
           incLastN = SortedMap(hashedLastSnapshot.ordinal -> hashedLastSnapshot)
           _ <- incLastNSnapR.set(incLastN)
+          // gl1 own-slice follow CUTOVER (S3b′): an empty slice recompute-matches `hashedNextSnapshot`'s empty
+          // stateProof roots, so `applyGlobalSnapshotFn` succeeds and the FSM reaches the tips-alignment check that
+          // this test exercises (the failure must come from misaligned tips, not from a missing follow slice).
+          _ <- followSliceR.set(GlobalFollowSliceResponse(snapshotOrdinal11, ConsumedFieldDelta.empty).some)
           // Inserting tips
           _ <- blocksR(parent2.hash).set(MajorityBlock(parent2, 1L, Active).some)
 

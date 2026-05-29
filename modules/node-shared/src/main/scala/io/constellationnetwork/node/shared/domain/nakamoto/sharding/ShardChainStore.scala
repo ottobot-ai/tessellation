@@ -3,8 +3,11 @@ package io.constellationnetwork.node.shared.domain.nakamoto.sharding
 import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
+import scala.collection.immutable.SortedMap
+
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.sharding.ShardMetrics
+import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId, ShardOrdinal}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
@@ -73,6 +76,19 @@ trait ShardChainStore[F[_]] {
 
   /** Current canonical tip per Taktikos `maxvalid-tk`. None when the store is empty or all entries have been pruned. */
   def bestTip: F[Option[Hashed[ShardCheckpoint]]]
+
+  /** Per-metagraph chain-link tip of the current best-tip checkpoint — the hash of the LAST included SC binary for each in-shard MG.
+    *
+    * This is what the shard's slot leader chain-links its freshly-buffered binaries off of (EXECUTION-SHARDING design R-2): for metagraph
+    * `mg`, the next admissible binary must carry `lastSnapshotHash == perMgTip(mg)`. It is derived from
+    * `bestTip.derivedStateDelta.includedSnapshots(mg).last` — i.e. `Hasher[F]` over the last `Signed[StateChannelSnapshotBinary]` in that
+    * MG's included chain (the same canonical binary hash the chain-link admission compares against, NOT the binary's own `lastSnapshotHash`
+    * field, which points one step further back).
+    *
+    * Returns an EMPTY map at genesis (no best tip). Callers treat a missing MG as `Hash.empty` (the genesis chain-link anchor, matching
+    * `GlobalSnapshotStateChannelAcceptanceManager`'s `priorLastStateChannelSnapshotHashes.getOrElse(address, Hash.empty)`).
+    */
+  def perMgTip: F[SortedMap[Address, Hash]]
 
   /** Walk back `depth` parents from `hash`. Returns the chain in tip-first order (head of the returned list is the entry at `hash`, tail
     * walks toward genesis). Stops early if the chain breaks (parent not in `byHash`) or if `depth` entries have been collected.
@@ -270,6 +286,21 @@ object ShardChainStore {
         def bestTip: F[Option[Hashed[ShardCheckpoint]]] =
           stateRef.get.map { state =>
             state.bestTipHash.flatMap(state.byHash.get).map(_.toHashed)
+          }
+
+        def perMgTip: F[SortedMap[Address, Hash]] =
+          bestTip.flatMap {
+            case None      => Async[F].pure(SortedMap.empty[Address, Hash](Address.OrderingInstance))
+            case Some(tip) =>
+              // For each in-shard MG, the chain-link tip is `Hasher[F]` over the LAST included binary in that MG's window.
+              // That hash is what the next round's first binary must carry as its `lastSnapshotHash`. Route through the
+              // typeclass (`toHashed`) so it is byte-identical to the canonical binary hash the chain-link admission compares.
+              import io.constellationnetwork.security.signature.Signed.SignedOps
+              tip.signed.value.derivedStateDelta.includedSnapshots.toList.traverse {
+                case (mg, binaries) =>
+                  SignedOps(binaries.last).toHashed[F].map(h => mg -> h.hash)
+              }
+                .map(pairs => SortedMap.from(pairs)(Address.OrderingInstance))
           }
 
         def walkBackTo(hash: Hash, depth: Long): F[List[Hashed[ShardCheckpoint]]] =

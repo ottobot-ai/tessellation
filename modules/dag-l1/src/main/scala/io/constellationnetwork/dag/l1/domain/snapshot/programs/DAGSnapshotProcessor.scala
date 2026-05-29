@@ -4,24 +4,26 @@ import cats.Parallel
 import cats.effect.Async
 import cats.syntax.all._
 
+import scala.collection.immutable.SortedMap
+
 import io.constellationnetwork.dag.l1.domain.address.storage.AddressStorage
 import io.constellationnetwork.dag.l1.domain.block.BlockStorage
 import io.constellationnetwork.dag.l1.domain.transaction.TransactionStorage
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.config.types.LastGlobalSnapshotsSyncConfig
 import io.constellationnetwork.node.shared.domain.globalAlignment.GlobalL0AlignmentStorage
-import io.constellationnetwork.node.shared.domain.snapshot.SnapshotContextFunctions
+import io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowMirrorVerifier
 import io.constellationnetwork.node.shared.domain.snapshot.services.GlobalL0Service
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage}
 import io.constellationnetwork.node.shared.domain.swap.AllowSpendStorage
 import io.constellationnetwork.node.shared.domain.tokenlock.TokenLockStorage
-import io.constellationnetwork.node.shared.modules.SharedStorages
 import io.constellationnetwork.schema._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.nakamoto.follow.{ConsumedFieldState, FollowVerificationError, GlobalFollowSliceResponse}
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher, SecurityProvider}
 
-import io.circe.Json
+import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object DAGSnapshotProcessor {
 
@@ -33,7 +35,6 @@ object DAGSnapshotProcessor {
     transactionStorage: TransactionStorage[F],
     allowSpendStorage: AllowSpendStorage[F],
     tokenLockStorage: TokenLockStorage[F],
-    globalSnapshotContextFns: SnapshotContextFunctions[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     txHasher: Hasher[F],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     l0Service: GlobalL0Service[F],
@@ -43,6 +44,8 @@ object DAGSnapshotProcessor {
     new SnapshotProcessor[F, GlobalSnapshotStateProof, GlobalIncrementalSnapshot, GlobalSnapshotInfo] {
 
       import SnapshotProcessor._
+
+      private val followLogger = Slf4jLogger.getLoggerFromName[F]("io.constellationnetwork.dag.l1.GlobalFollow")
 
       override def onDownload(snapshot: Hashed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo): F[Unit] =
         allowSpendStorage.initByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
@@ -110,17 +113,147 @@ object DAGSnapshotProcessor {
       )(implicit hasher: Hasher[F]): F[GlobalSnapshotInfo] =
         applyGlobalSnapshotFn(lastState, lastSnapshot, snapshot, getGlobalSnapshotByOrdinal)
 
+      // CUTOVER (S3b′ — `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`): gl1 no longer re-executes the
+      // finalized gl0 snapshot (`GlobalSnapshotContextFunctions.createContext → GSAM.accept`), which re-derived the
+      // FULL global MPT and stormed on `StateProofMismatch` over fields gl1 never reads (the `historicalStakeSnapshots`
+      // carry-forward divergence at the ordinal after an eta boundary — the 2026-05-28 gl1-formation blocker).
+      //
+      // Instead it FETCHES gl0's latest-finalized consumed-field SLICE (`l0Service.getLatestFollowSlice`), VERIFIES it
+      // by field-root equality against the signed snapshot AT THE SLICE'S OWN ordinal (recompute-and-match — completeness
+      // correct-by-design for a full-content holder; see `GlobalFollowMirrorVerifier`), and BUILDS a `GlobalSnapshotInfo`
+      // populated with ONLY the five Address-keyed consumed fields gl1 actually reads
+      // (`balances`, `lastTxRefs`, `lastAllowSpendRefs`, `lastTokenLockRefs`, `activeTokenLocks`); all ~12 other GSI fields are left at
+      // their empty/default values. The 5-field GSI flows downstream UNCHANGED — `lastSnapshotStorage.set`, `extractMajority*`,
+      // `mptStore.syncFromGlobalSnapshotInfo` (which tolerates a partial GSI: `store.clear` + per-field inserts where empty
+      // maps are no-op), `Collateral`/`CollateralDaemon`, `TransactionService` tx-validation (reads `si.balances`), and
+      // `TokenLockService` token-lock-replacement validation (reads `si.getActiveTokenLocks` + `si.balances`).
+      //
+      // ALIGNMENT (slice ordinal M vs processed ordinal N — see the file-level note): the slice producer serves only the
+      // LATEST-finalized GSI (the `MptOverlay` cannot read value-bytes at a historical ordinal — S2a finding — and gl1 only
+      // needs the latest finalized state for tx validation, not per-ordinal replay). M is therefore a moving target, always
+      // >= N: during catch-up (and even in steady-state lag) gl1's processing ordinal N trails the latest-finalized slice
+      // ordinal M. So the verify is ALWAYS anchored to the snapshot at the slice's OWN ordinal M (`signedFieldRoots` taken
+      // from THAT snapshot's `stateProof`, never the ordinal-N snapshot being walked), which makes the field-root match
+      // cryptographically self-consistent and never a cross-ordinal mismatch.
+      //
+      // CATCH-UP FIX (gl1-formation, 2026-05-29): the snapshot at M is resolved from gl1's OWN LOCAL store — the lastN
+      // finalized signed snapshots `lastNGlobalSnapshotStorage` retains by ordinal — NOT re-pulled from a peer. Because gl1
+      // follows the FINALIZED chain and the slice IS the latest finalized, gl1 already holds M's signed snapshot locally once
+      // its follow reaches M (it stored it via `setLastNSnapshots` when it finalized M); that is the SAME signed snapshot gl0
+      // projected the slice from, so its `stateProof` per-field roots are byte-identical to what the slice recompute-matches.
+      // This decouples the verify from the per-ordinal "processing N == M" constraint: the old code only avoided the re-pull
+      // when N == M (which rarely/never holds, since the slice is always the latest finalized), so the M-re-pull fell through
+      // to a peer fetch that returned None during catch-up -> "could not resolve" -> defer forever (0 Verified). If gl1 has
+      // NOT yet followed to M (M not in its lastN window) the verify simply defers THIS tick and resolves as soon as gl1's
+      // follow reaches M. Net effect: gl1's consumed-field state = the latest verified finalized slice, verified against
+      // gl1's local copy of that finalized snapshot; as M advances gl1 follows to M and re-verifies, so steady-state lag no
+      // longer blocks verification. On the happy-path tail N == M and state+chain-pointer coincide exactly.
+      //
+      // No `StateProofMismatch` raise/recovery on this path: a verify failure / unavailable slice raises the retryable
+      // `FollowSliceVerificationError`, which the batch loop logs + skips WITHOUT `shouldRedownload` (no recovery storm) —
+      // gl1 simply retries next 10s tick.
       def applyGlobalSnapshotFn(
         lastGlobalState: GlobalSnapshotInfo,
         lastGlobalSnapshot: Signed[GlobalIncrementalSnapshot],
         globalSnapshot: Signed[GlobalIncrementalSnapshot],
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
-      )(implicit hasher: Hasher[F]): F[GlobalSnapshotInfo] =
-        globalSnapshotContextFns.createContext(
-          lastGlobalState,
-          lastGlobalSnapshot,
-          globalSnapshot,
-          getGlobalSnapshotByOrdinal
-        )
+      )(implicit hasher: Hasher[F]): F[GlobalSnapshotInfo] = {
+        val verifier = GlobalFollowMirrorVerifier.make[F]
+
+        // The signed per-field roots for the snapshot at the slice's own ordinal `sliceOrdinal`, resolved from gl1's OWN
+        // LOCAL state (no peer re-pull — see the CATCH-UP FIX note above):
+        //   - if the slice is at the ordinal currently being processed (N == M), use the in-hand snapshot's `stateProof`
+        //     directly (it is not yet in the lastN window — `setLastNSnapshots` runs only after this apply);
+        //   - otherwise look up gl1's local finalized snapshot at `sliceOrdinal` in `lastNGlobalSnapshotStorage` and take
+        //     THAT snapshot's `stateProof`. This is the same signed snapshot gl0 projected the slice from, so the field-root
+        //     match is byte-exact. `None` (M not yet followed) defers this tick and resolves once the follow reaches M.
+        def signedRootsAt(sliceOrdinal: SnapshotOrdinal): F[Option[GlobalSnapshotStateProof]] =
+          if (sliceOrdinal === globalSnapshot.value.ordinal)
+            globalSnapshot.value.stateProof.some.pure[F]
+          else
+            lastNGlobalSnapshotStorage.getByOrdinal(sliceOrdinal).map(_.map(_.signed.value.stateProof))
+
+        l0Service.getLatestFollowSlice.flatMap {
+          case None =>
+            // No slice yet (no GlobalFollowClient wired, peer down, or gl0 has no finalized ordinal). Don't advance.
+            FollowSliceVerificationError(
+              s"no follow slice available while processing ordinal=${globalSnapshot.value.ordinal.show}"
+            ).raiseError[F, GlobalSnapshotInfo]
+          case Some(GlobalFollowSliceResponse(sliceOrdinal, slice)) =>
+            signedRootsAt(sliceOrdinal).flatMap {
+              case None =>
+                // gl1 has not yet followed (and locally retained) the finalized snapshot at the slice's ordinal M. Defer
+                // this tick WITHOUT a peer re-pull; it resolves as soon as gl1's finalized-follow reaches M.
+                FollowSliceVerificationError(
+                  s"local finalized snapshot at slice ordinal=${sliceOrdinal.show} not yet followed " +
+                    s"(processing ordinal=${globalSnapshot.value.ordinal.show}) — deferring slice verify"
+                ).raiseError[F, GlobalSnapshotInfo]
+              case Some(stateProof) =>
+                verifier
+                  .verifyByFieldRoot(ConsumedFieldState.empty, sliceOrdinal, slice, signedFieldRoots(stateProof))
+                  .flatMap {
+                    case Right(verified) =>
+                      consumedFieldsToGlobalSnapshotInfo(verified.value).pure[F]
+                    case Left(err) =>
+                      // Verify failed against the trusted signed roots — log + don't advance. NO recovery storm.
+                      followLogger.warn(
+                        s"follow-slice verify FAILED at sliceOrdinal=${sliceOrdinal.show} " +
+                          s"(processing ordinal=${globalSnapshot.value.ordinal.show}): ${describe(err)} — not advancing"
+                      ) >>
+                        FollowSliceVerificationError(
+                          s"follow-slice verify failed at ordinal=${sliceOrdinal.show}: ${describe(err)}"
+                        ).raiseError[F, GlobalSnapshotInfo]
+                  }
+            }
+        }
+      }
     }
+
+  /** Map the snapshot's `stateProof` per-field roots onto the five [[GlobalStateFieldId]]s gl1 consumes, in the shape
+    * [[GlobalFollowMirrorVerifier.verifyByFieldRoot]] expects. `Balances` / `LastTxRefs` are always-present `Hash`es; `LastAllowSpendRefs`
+    * / `LastTokenLockRefs` / `ActiveTokenLocks` are `Option[Hash]` on the proof (the GSI fields are `Option`-typed) — `None` is OMITTED
+    * from the map, and the verifier treats an absent field as [[Hash.empty]] (matching gl0's `getOrElse(_, Hash.empty)`), so an empty
+    * consumed field recompute-matches.
+    */
+  private def signedFieldRoots(stateProof: GlobalSnapshotStateProof): SortedMap[GlobalStateFieldId, Hash] =
+    SortedMap.from(
+      List(
+        Some(GlobalStateFieldId.Balances -> stateProof.balancesProof),
+        Some(GlobalStateFieldId.LastTxRefs -> stateProof.lastTxRefsProof),
+        stateProof.lastAllowSpendRefs.map(GlobalStateFieldId.LastAllowSpendRefs -> _),
+        stateProof.lastTokenLockRefs.map(GlobalStateFieldId.LastTokenLockRefs -> _),
+        stateProof.activeTokenLocks.map(GlobalStateFieldId.ActiveTokenLocks -> _)
+      ).flatten
+    )
+
+  /** Build a `GlobalSnapshotInfo` populated with ONLY the five Address-keyed consumed fields from a verified [[ConsumedFieldState]]; every
+    * other field is left at `GlobalSnapshotInfo.empty`'s value. The three `Option`-typed consumed fields are lifted into `Some(...)`
+    * (matching gl0's GSI, where these are always `Some` post-V2). This partial GSI is what gl1 stores + tx-validates against;
+    * `mptStore.syncFromGlobalSnapshotInfo` tolerates the empty fields (no-op inserts). `activeTokenLocks` is THE bug-fix: it is read by
+    * gl1's token-lock-replacement validator (via `TokenLockService.getActiveTokenLocks`); without it the mirror stays empty and every
+    * replacement fails `NothingToReplace`.
+    */
+  private def consumedFieldsToGlobalSnapshotInfo(state: ConsumedFieldState): GlobalSnapshotInfo =
+    GlobalSnapshotInfo.empty.copy(
+      lastTxRefs = state.lastTxRefs,
+      balances = state.balances,
+      lastAllowSpendRefs = state.lastAllowSpendRefs.some,
+      lastTokenLockRefs = state.lastTokenLockRefs.some,
+      activeTokenLocks = state.activeTokenLocks.some
+    )
+
+  private def describe(err: FollowVerificationError): String = err match {
+    case FollowVerificationError.CommittedRootMismatch(expected, got) =>
+      s"CommittedRootMismatch(expected=${expected.show.take(12)}, got=${got.show.take(12)})"
+    case FollowVerificationError.RangeProofInvalid(field, _)  => s"RangeProofInvalid($field)"
+    case FollowVerificationError.ValueBindingFailed(field, _) => s"ValueBindingFailed($field)"
+    case FollowVerificationError.FieldRootMismatch(field, expected, got) =>
+      s"FieldRootMismatch($field, expected=${expected.show.take(12)}, got=${got.show.take(12)})"
+  }
+
+  /** Raised by [[applyGlobalSnapshotFn]] when the follow slice is unavailable or fails to verify against the trusted signed roots. Distinct
+    * from `GlobalSnapshotContextFunctions.StateProofMismatch` — it carries NO recovery semantics: the batch loop logs it and idles (no
+    * `shouldRedownload`, no `replaceByRefs`), so gl1 retries cleanly on the next tick.
+    */
+  final case class FollowSliceVerificationError(message: String) extends RuntimeException(message) with scala.util.control.NoStackTrace
 }

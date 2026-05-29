@@ -205,9 +205,16 @@ const checkGlobalL0Node = async (config) => {
     await clusterCheck(infos, true, 'Global L0', 1, true);
   } else {
     const numGL0 = parseInt(process.env.NUM_GL0_NODES || '3', 10);
+    // gl0 host port = GL0_PORT_BASE + i*10 (arithmetic — same single source of
+    // truth as docker-env-setup.sh / set-env.sh). GL0_PORT_BASE defaults to
+    // DAG_L0_PORT_PREFIX*100, so for i<10 this is byte-identical to the legacy
+    // `${dagL0PortPrefix}${i*10 padStart 2}` string-concat (9000..9090); for
+    // i>=10 the old concat produced invalid 6-digit ports (e.g. 90120) — this
+    // computes the correct 9100/9150 etc.
+    const gl0PortBase = parseInt(process.env.GL0_PORT_BASE || `${Number(dagL0PortPrefix) * 100}`, 10);
     const infos = [];
     for (let i = 0; i < numGL0; i++) {
-      const port = `${dagL0PortPrefix}${String(i * 10).padStart(2, '0')}`;
+      const port = gl0PortBase + i * 10;
       const name = i === 0 ? 'Global L0 Genesis' : `Global L0 Validator ${i}`;
       infos.push({ name, baseUrl: `${host}:${port}` });
     }

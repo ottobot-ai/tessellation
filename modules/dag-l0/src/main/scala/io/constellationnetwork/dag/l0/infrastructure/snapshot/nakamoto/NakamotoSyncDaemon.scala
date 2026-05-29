@@ -174,7 +174,17 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
     ],
+    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers — the producer fan-out input (the inversion).
+    shardBinaryBuffers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
+    ],
     shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
+    // EXECUTION-SHARDING Task 2: deterministic committee draw, threaded through the drain → handleSnapshot cascade.
+    shardCommitteeMembership: (
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.schema.nakamoto.EtaPeriod
+    ) => F[Set[peer.PeerId]],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -220,7 +230,9 @@ object NakamotoSyncDaemon {
               kesRegistry,
               shardProducers,
               shardChainStores,
+              shardBinaryBuffers,
               shardAssignment,
+              shardCommitteeMembership,
               logger
             )
           }
@@ -376,6 +388,31 @@ object NakamotoSyncDaemon {
         .map(_.registry.map { case (sid, entry) => sid -> entry.chainStore })
         .getOrElse(Map.empty)
 
+    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers, also projected off the SAME registry. The
+    // gossip-intake (`MetagraphBinary` handler) writes into these; the producer fan-out reads them. This
+    // shared instance is the inversion — the producer's input comes from buffered binaries, not gl0's
+    // post-chain-link `stateChannelSnapshots`. Empty at numShards=1.
+    val shardBinaryBuffers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
+    ] =
+      shardAcceptanceDeps
+        .map(_.registry.map { case (sid, entry) => sid -> entry.binaryBuffer })
+        .getOrElse(Map.empty)
+
+    // EXECUTION-SHARDING Task 2: the deterministic committee draw, projected from the SAME `shardAcceptanceDeps` the acceptance
+    // manager closes over, so the daemon's producer fan-out gates produce on the IDENTICAL committee the verifier admits against.
+    // `None` (numShards=1) ⇒ empty-set draw (never reached: the fan-out is gated on `shardProducers.nonEmpty` first).
+    val shardCommitteeMembership: (
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.schema.nakamoto.EtaPeriod
+    ) => F[Set[peer.PeerId]] =
+      shardAcceptanceDeps
+        .map(_.committeeMembership)
+        .getOrElse((_: io.constellationnetwork.schema.sharding.ShardId, _: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
+          Async[F].pure(Set.empty[peer.PeerId])
+        )
+
     // Buffer for gossip snapshots whose parent isn't in the chain store yet.
     // Keyed by missing parent hash → list of raw gossip snapshots waiting for that parent.
     // When a snapshot is stored in the chain store, we check this buffer and validate any
@@ -445,7 +482,9 @@ object NakamotoSyncDaemon {
                                 kesRegistry,
                                 shardProducers,
                                 shardChainStores,
+                                shardBinaryBuffers,
                                 shardAssignment,
+                                shardCommitteeMembership,
                                 logger
                               )
                             }
@@ -536,7 +575,9 @@ object NakamotoSyncDaemon {
                                     kesRegistry,
                                     shardProducers,
                                     shardChainStores,
+                                    shardBinaryBuffers,
                                     shardAssignment,
+                                    shardCommitteeMembership,
                                     logger
                                   )
                                 } >>
@@ -555,11 +596,28 @@ object NakamotoSyncDaemon {
                             // in iter-s3prep-baseline). Gate work is naturally concurrent-safe: the
                             // aggregator is a `Ref[F, ...]`, `processMetagraphBinary` writes to a
                             // queue, and per-binary state is keyed by (mgAddr, parentHash, binaryHash).
+                            //
+                            // EXECUTION-SHARDING R-1 (additive — the inversion intake): when sharding is active
+                            // (`numShards > 1` ⇒ `shardBinaryBuffers.nonEmpty`), ALSO buffer this raw binary into
+                            // the buffer for its shard, off the EXISTING global binaries gossip topic (no Go
+                            // per-shard topic — that's a later load-shedding optimization). The shard producer
+                            // reads `snapshotPending` from this SAME buffer. The legacy `handleMetagraphBinary`
+                            // chain-link admission path is kept UNCHANGED — this is purely additive (R-3 retires
+                            // legacy later). At `numShards = 1` the buffer map is empty ⇒ this is a no-op, the
+                            // legacy path is the sole path, byte-identical.
                             Async[F]
                               .start(
                                 handleMetagraphBinary(mb, processOrphanedMetagraphBinary, logger)
                               )
-                              .void
+                              .void *>
+                              Async[F]
+                                .whenA(shardBinaryBuffers.nonEmpty)(
+                                  Async[F]
+                                    .start(
+                                      bufferReceivedBinaryForShard(mb, shardBinaryBuffers, shardAssignment, logger)
+                                    )
+                                    .void
+                                )
 
                           case pb.GossipMessage.Body.MetagraphAttestation(att) =>
                             // Background-fire: VRF verify + KES verify + Ed25519 verify add up to
@@ -599,7 +657,9 @@ object NakamotoSyncDaemon {
                           // the MetagraphAttestation handling above).
                           case pb.GossipMessage.Body.ShardCheckpoint(cp) =>
                             Async[F]
-                              .start(handleShardCheckpoint(cp, shardAcceptanceDeps, shardCheckpointAttestationEmitter, logger))
+                              .start(
+                                handleShardCheckpoint(cp, shardAcceptanceDeps, shardCheckpointAttestationEmitter, selfId, logger)
+                              )
                               .void
 
                           case pb.GossipMessage.Body.ShardCheckpointAttestation(att) =>
@@ -673,7 +733,17 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
     ],
+    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers — the producer fan-out input (the inversion).
+    shardBinaryBuffers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
+    ],
     shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
+    // EXECUTION-SHARDING Task 2: deterministic committee draw, threaded through to `processValidSnapshotInner`'s fan-out gate.
+    shardCommitteeMembership: (
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.schema.nakamoto.EtaPeriod
+    ) => F[Set[peer.PeerId]],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -927,7 +997,9 @@ object NakamotoSyncDaemon {
             kesRegistry,
             shardProducers,
             shardChainStores,
+            shardBinaryBuffers,
             shardAssignment,
+            shardCommitteeMembership,
             logger
           ) >> {
             // This snapshot is now stored — drain any children that were waiting for it.
@@ -963,7 +1035,9 @@ object NakamotoSyncDaemon {
               kesRegistry,
               shardProducers,
               shardChainStores,
+              shardBinaryBuffers,
               shardAssignment,
+              shardCommitteeMembership,
               logger
             )
           }
@@ -1108,7 +1182,17 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
     ],
+    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers — the producer fan-out input (the inversion).
+    shardBinaryBuffers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
+    ],
     shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
+    // EXECUTION-SHARDING Task 2: deterministic committee draw, threaded into `processValidSnapshotInner`'s producer fan-out gate.
+    shardCommitteeMembership: (
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.schema.nakamoto.EtaPeriod
+    ) => F[Set[peer.PeerId]],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     // Slice S6: the producer shard-checkpoint fan-out is moved OFF the snapshot-processing
@@ -1159,7 +1243,9 @@ object NakamotoSyncDaemon {
           kesRegistry,
           shardProducers,
           shardChainStores,
+          shardBinaryBuffers,
           shardAssignment,
+          shardCommitteeMembership,
           logger
         )
     }
@@ -1194,7 +1280,18 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
     ],
+    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers — the producer fan-out input (the inversion).
+    shardBinaryBuffers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
+    ],
     shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
+    // EXECUTION-SHARDING Task 2: deterministic committee draw — the producer fan-out runs for a shard only if this node is in its
+    // committee (membership gate in `ShardCheckpointFanOut.run`). The SAME draw the verifier admits against.
+    shardCommitteeMembership: (
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.schema.nakamoto.EtaPeriod
+    ) => F[Set[peer.PeerId]],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     // Slice S6: app-scoped Supervisor for the off-critical-path producer fan-out (see below).
@@ -1282,9 +1379,10 @@ object NakamotoSyncDaemon {
       // to the pre-S6 inline path, which was itself `whenA(false)` there). Regression bar preserved.
       _ <- Async[F].whenA(becameBestTip && shardProducers.nonEmpty && shardAssignment.isDefined) {
         signedSnapshot match {
-          case Some(signed) =>
-            // Capture BY VALUE before starting the fiber (determinism point 1 above).
-            val capturedStateChannelSnapshots = signed.value.stateChannelSnapshots
+          // R-1: the fan-out no longer reads the produced snapshot's `stateChannelSnapshots` (the inversion);
+          // it reads each shard's `shardBinaryBuffers`. We still gate on a canonical (`Some`) signed snapshot —
+          // only fan out for a committed best-tip ord, never a fork branch — but no longer capture its SC map.
+          case Some(_) =>
             val producedOrd = SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal))
             val rotationPeriod = EtaCalculation.rotationPeriod(snap.ordinal, etaRotationSnapshots)
             val epoch = EtaPeriod(rotationPeriod)
@@ -1292,12 +1390,13 @@ object NakamotoSyncDaemon {
               .supervise(
                 HasherSelector[F].withCurrent { implicit hasher =>
                   io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointFanOut.run[F](
-                    stateChannelSnapshots = capturedStateChannelSnapshots,
+                    shardBinaryBuffers = shardBinaryBuffers,
                     producedOrd = producedOrd,
                     epoch = epoch,
                     shardProducers = shardProducers,
                     shardChainStores = shardChainStores,
-                    shardAssignment = shardAssignment.get,
+                    selfPeerId = selfId,
+                    committeeMembership = shardCommitteeMembership,
                     logger = logger
                   )
                 }.handleErrorWith(e => logger.warn(e)(s"🧩 Shard producer fan-out failed for ord=${snap.ordinal}"))
@@ -1770,6 +1869,7 @@ object NakamotoSyncDaemon {
     shardCheckpointAttestationEmitter: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]
     ],
+    selfId: peer.PeerId,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     shardAcceptanceDeps match {
@@ -1837,16 +1937,28 @@ object NakamotoSyncDaemon {
                                     shardCheckpointAttestationEmitter match {
                                       case None          => Async[F].unit
                                       case Some(emitter) =>
-                                        // Resolve the parent's gl0 anchor ordinal (for the LDD slot-gap) from the chain store. Genesis
-                                        // parent (Hash.empty, not stored) ⇒ None ⇒ the emitter's `slotGapFor` handles the no-parent case.
-                                        entry.chainStore.getByHash(checkpoint.parentCheckpointHash).flatMap { parentOpt =>
-                                          emitter.emit(
-                                            checkpoint.shardId,
-                                            checkpointHash,
-                                            checkpoint.gl0AnchorOrdinal,
-                                            checkpoint.epoch,
-                                            parentOpt.map(_.signed.value.gl0AnchorOrdinal)
-                                          )
+                                        // EXECUTION-SHARDING Task 2 attest gate: emit OUR attestation only if THIS node is in shard
+                                        // `s`'s committee for the checkpoint's epoch. A non-member's attestation is rejected by every
+                                        // verifier's `verifyEmbedded` membership pre-check (so it can't count toward quorum) — gating
+                                        // here skips the wasted sign+gossip. The SAME deterministic draw the verifier admits against.
+                                        deps.committeeMembership(checkpoint.shardId, checkpoint.epoch).flatMap { committee =>
+                                          if (!committee.contains(selfId))
+                                            logger.debug(
+                                              s"🧩 ShardCheckpoint attest: self not in committee for shard=${checkpoint.shardId.value.value} " +
+                                                s"epoch=${checkpoint.epoch.value}; skipping attestation"
+                                            )
+                                          else
+                                            // Resolve the parent's gl0 anchor ordinal (for the LDD slot-gap) from the chain store. Genesis
+                                            // parent (Hash.empty, not stored) ⇒ None ⇒ the emitter's `slotGapFor` handles the no-parent case.
+                                            entry.chainStore.getByHash(checkpoint.parentCheckpointHash).flatMap { parentOpt =>
+                                              emitter.emit(
+                                                checkpoint.shardId,
+                                                checkpointHash,
+                                                checkpoint.gl0AnchorOrdinal,
+                                                checkpoint.epoch,
+                                                parentOpt.map(_.signed.value.gl0AnchorOrdinal)
+                                              )
+                                            }
                                         }
                                     }
                                   }
@@ -2090,6 +2202,62 @@ object NakamotoSyncDaemon {
         val address = Address(refined)
         val bytes = mb.binary.toByteArray
         processOrphanedBinary(address, bytes)
+    }
+  }
+
+  /** EXECUTION-SHARDING R-1 (additive intake): buffer a received raw metagraph binary into the buffer for ITS shard, off the EXISTING
+    * global binaries gossip topic. Runs ALONGSIDE the legacy `handleMetagraphBinary` chain-link admission path (which is unchanged) — the
+    * producer fan-out reads `snapshotPending` from the SAME buffer instances projected from `shardAcceptanceDeps.registry`.
+    *
+    * '''Determinism model.''' Leader-proposes / members-attest: the buffer is node-local and need NOT converge across committee members —
+    * only the shard slot leader builds the checkpoint from its own buffer; others attest the gossiped envelope (see
+    * [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer]]). So we just deserialize, resolve the shard via the
+    * SAME deterministic `ShardAssignment.shardIdFor` mapping, and `bufferBinary` (idempotent by hash) — no multi-proposer machinery.
+    *
+    * Only invoked when `shardBinaryBuffers.nonEmpty` (`numShards > 1`); at `numShards = 1` the caller's `whenA` gate makes this a no-op.
+    */
+  private def bufferReceivedBinaryForShard[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector](
+    mb: pb.MetagraphBinary,
+    shardBinaryBuffers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
+    ],
+    shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] = {
+    import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
+    import io.constellationnetwork.security.signature.Signed
+    import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
+    import eu.timepit.refined.refineV
+
+    (refineV[DAGAddressRefined](mb.address), shardAssignment) match {
+      case (Right(refined), Some(assignment)) =>
+        val address = Address(refined)
+        val bytes = mb.binary.toByteArray
+        // Deserialize with the SAME typeclass + wire format the legacy `processMetagraphBinary` path uses
+        // (`JsonSerializer` = JSON + Brotli). On decode failure, log + drop — the legacy path logs the same.
+        io.constellationnetwork.json
+          .JsonSerializer[F]
+          .deserialize[Signed[StateChannelSnapshotBinary]](bytes)
+          .flatMap {
+            case Left(err) =>
+              logger.debug(s"R-1 shard-buffer: decode failed for $address (${err.getMessage}); not buffering")
+            case Right(signed) =>
+              HasherSelector[F].withCurrent { implicit hasher =>
+                assignment.shardIdFor(address).flatMap { sid =>
+                  shardBinaryBuffers.get(sid) match {
+                    case Some(buffer) => buffer.bufferBinary(address, signed)
+                    case None         =>
+                      // Address maps to a shard this operator doesn't track a buffer for — drop quietly (the
+                      // legacy admission path still ran). Expected only if numShards/registry disagree.
+                      logger.debug(s"R-1 shard-buffer: no buffer for shard=${sid.value.value} (mg=$address); skipping")
+                  }
+                }
+              }
+          }
+      case _ =>
+        // Invalid address (legacy path already warned) or no assignment (numShards=1) — nothing to buffer.
+        Async[F].unit
     }
   }
 

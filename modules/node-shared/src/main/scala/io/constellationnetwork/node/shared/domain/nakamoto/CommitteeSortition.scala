@@ -6,6 +6,8 @@ import cats.syntax.all._
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -139,6 +141,81 @@ object CommitteeSortition {
     val raw = Ratio(kTarget) * sigmaOperatorKey
     if (raw >= Ratio.One) Ratio.One else raw
   }
+
+  // ─── Shard-committee sortition (EXECUTION-SHARDING — `ShardCheckpointWiring.committeeFor`) ──────────────────────────
+  //
+  // The per-metagraph committee VRF above (`message` / `isInCommittee` / `verifyMembership`) is a TRUE VRF: each operator
+  // evaluates its own VRF SK over `(eta, metagraphAddress, parentHash)` and attaches an unforgeable proof a verifier checks
+  // against that operator's VK. That mechanism elects a committee from an ARRIVING proof — a verifier confirms a single claim,
+  // it cannot ENUMERATE the whole committee (a VRF output is not computable from the VK alone).
+  //
+  // The gl0 shard-checkpoint adopt path needs a different shape: `committeeFor(shardId, epoch)` must DETERMINISTICALLY
+  // ENUMERATE the committee SET on every node (it feeds both the per-signer set-membership pre-check AND the `kS = |committee|`
+  // quorum denominator in `ShardCheckpointGl0AcceptanceManager.verifyEmbedded`). Enumeration from public material only is the
+  // hard requirement (no node holds peers' VRF SKs). So the shard draw is a DETERMINISTIC PSEUDO-RANDOM draw keyed on each
+  // operator's registered VRF *VK* (a public PRF), NOT a per-operator VRF evaluation: `H(tag, eta, shardId, epoch, vrfVk)`
+  // interpreted as a Ratio in `[0,1)` (the SAME interpretation `EligibilityChecker.vrfOutputAsRatio` uses) compared against
+  // the SAME `threshold(kTarget, σ)`. Reusing the registered VK as the per-operator seed makes the draw (a) enumerable from
+  // the cluster-wide-identical VRF-VK registry + the cluster-wide-identical eta, and (b) per-operator (different VKs ⇒
+  // different draws) and per-shard (shardId is in the preimage). v1 trade-off (acceptable per design §10 — honest-testnet,
+  // slashing is the v2 backstop): the committee for a future `(shard, epoch)` is PREDICTABLE because VKs are public; the
+  // Algorand player-replaceability property is a v2 hardening. It is still UNFORGEABLE in the sense that matters for v1: a
+  // non-drawn operator cannot place itself in the set (every node computes the same set), and cannot forge a drawn operator's
+  // Ed25519/KES signatures over the checkpoint.
+
+  /** Domain-separation tag for the shard-committee VK-seeded draw. Distinct from [[DomainTag]] so the shard draw can never collide with the
+    * per-metagraph committee VRF or the leader VRF.
+    */
+  private val ShardDomainTag: String = "shard-committee"
+
+  /** Canonical hash preimage for the shard-committee VK-seeded draw. `vrfVk` is the operator's registered VRF verification key (the
+    * per-operator seed); `shardId` + `epoch` + `eta` scope the draw to one `(shard, epoch)` with that epoch's randomness. Encoded via the
+    * standard `Hasher` surface (canonical Circe JSON + SHA-256) so every node derives byte-identical bytes.
+    */
+  final case class CommitteeShardVrfInput(
+    tag: String,
+    eta: Hex,
+    shardId: ShardId,
+    epoch: EtaPeriod,
+    vrfVk: Hex
+  )
+
+  object CommitteeShardVrfInput {
+    implicit val encoder: Encoder[CommitteeShardVrfInput] = deriveEncoder
+  }
+
+  /** Deterministic per-operator draw value for the shard committee: `Hasher.hash(CommitteeShardVrfInput(...))` interpreted as a `Ratio ∈
+    * [0,1)` via the same `BigInt(1, bytes) / 2^(8·len)` convention `EligibilityChecker.vrfOutputAsRatio` uses. Pure + deterministic in
+    * `(eta, shardId, epoch, vrfVk)`.
+    *
+    * `eta` MUST be 32 bytes (epoch randomness), matching the per-metagraph [[message]] contract.
+    */
+  def shardDrawValue[F[_]: Sync: Hasher](
+    eta: Array[Byte],
+    shardId: ShardId,
+    epoch: EtaPeriod,
+    vrfVk: Array[Byte]
+  ): F[Ratio] = {
+    require(eta.length == 32, s"Eta must be 32 bytes, got ${eta.length}")
+    val input = CommitteeShardVrfInput(ShardDomainTag, Hex.fromBytes(eta), shardId, epoch, Hex.fromBytes(vrfVk))
+    Hasher[F].hash(input).map(h => Ratio(BigInt(1, h.getBytes), BigInt(2).pow(8 * h.getBytes.length)))
+  }
+
+  /** Deterministic shard-committee membership predicate for the holder of `vrfVk`: `shardDrawValue(...) < threshold(kTarget, σ)`.
+    * Enumerated over all active operators by
+    * [[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.committeeFor]] to materialize the committee SET —
+    * identical on every node because every input is cluster-wide-identical (registry VK + eta + HOCON kTarget + uniform σ). `kTarget · σ ≥
+    * 1` saturates to "always a member" via [[threshold]].
+    */
+  def isInShardCommittee[F[_]: Sync: Hasher](
+    vrfVk: Array[Byte],
+    eta: Array[Byte],
+    shardId: ShardId,
+    epoch: EtaPeriod,
+    sigmaOperatorKey: Ratio,
+    kTarget: Int
+  ): F[Boolean] =
+    shardDrawValue[F](eta, shardId, epoch, vrfVk).map(_ < threshold(kTarget, sigmaOperatorKey))
 
   def make[F[_]: Sync: Hasher]: CommitteeSortition[F] = new CommitteeSortition[F] {
 

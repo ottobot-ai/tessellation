@@ -183,9 +183,13 @@ const bulkSubmitTest = async () => {
     throw new Error('Port prefixes must be valid numbers')
   }
   
+  // gl1 EXTERNAL host port for node 0 = GL1_EXT_PORT_BASE (9600 band), NOT the
+  // dagL1PortPrefix (9100) container-internal band. GL1_URL (set by set-env.sh)
+  // takes priority; the fallback mirrors the external base.
+  const gl1ExtPortBase = parseInt(process.env.GL1_EXT_PORT_BASE || `${parseInt(dagL1PortPrefix, 10) * 100}`, 10)
   const networkConfig = {
     l0Url: process.env.GL0_URL || `${process.env.TEST_HOST || 'http://localhost'}:${dagL0PortPrefix}00`,
-    l1Url: process.env.GL1_URL || `${process.env.TEST_HOST || 'http://localhost'}:${dagL1PortPrefix}00`,
+    l1Url: process.env.GL1_URL || `${process.env.TEST_HOST || 'http://localhost'}:${gl1ExtPortBase}`,
   }
   
   logMessage('Loading private keys...')

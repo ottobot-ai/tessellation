@@ -72,16 +72,33 @@ if [ "$ID" == "dl1" ]; then
 fi
 
 if [ -z "$CL_EXTERNAL_IP" ]; then
-  # Metagraph layers (ml0/cl1/dl1) live in their own /24 subnet per metagraph
-  # k at NET_BASE.${k+1}.*; hg layers (gl0/gl1) stay at NET_PREFIX.* (= NET_BASE.0).
-  # METAGRAPH_NET_PREFIX is set per-metagraph by docker-env-setup.sh and is the
-  # right base for ml0/cl1/dl1; NET_PREFIX is the legacy single-subnet fallback.
-  if [ "$ID" == "ml0" ] || [ "$ID" == "cl1" ] || [ "$ID" == "dl1" ]; then
-    BASE_PREFIX=${METAGRAPH_NET_PREFIX:-${NET_PREFIX}}
+  # The self-advertised IP MUST equal the container's bound docker IP (the static
+  # ipv4_address), or two-way-handshake reach-back dials an unrouted address and
+  # fails with NoRouteToHostException — peers can never join.
+  #
+  # hg layers (gl0/gl1): docker-env-setup.sh is the single source of truth for the
+  # bound IP — it writes CL_DOCKER_GL0_IPV4 = NET_PREFIX.(GL0_IP_BASE+i) and
+  # CL_DOCKER_GL1_IPV4 = NET_PREFIX.(GL1_IP_BASE+i). Advertise THOSE. The legacy
+  # .${SUFFIX}${OFFSET} string-concat below silently diverged when GL1_IP_BASE
+  # moved .20 → .30 (suffix stayed 2 ⇒ advertised .2X while bound at .3X).
+  #
+  # Metagraph layers (ml0/cl1/dl1) live in their own /24 per metagraph k at
+  # NET_BASE.(k+1).* and have no *_IPV4 var; their suffix (3/4/5) still aligns
+  # with the bound {30,40,50}+i band, so they keep the concat fallback below.
+  if [ "$ID" == "gl0" ] && [ -n "$CL_DOCKER_GL0_IPV4" ]; then
+    export CL_EXTERNAL_IP=${CL_DOCKER_GL0_IPV4}
+  elif [ "$ID" == "gl1" ] && [ -n "$CL_DOCKER_GL1_IPV4" ]; then
+    export CL_EXTERNAL_IP=${CL_DOCKER_GL1_IPV4}
   else
-    BASE_PREFIX=${NET_PREFIX}
+    # METAGRAPH_NET_PREFIX is set per-metagraph by docker-env-setup.sh and is the
+    # right base for ml0/cl1/dl1; NET_PREFIX is the legacy single-subnet fallback.
+    if [ "$ID" == "ml0" ] || [ "$ID" == "cl1" ] || [ "$ID" == "dl1" ]; then
+      BASE_PREFIX=${METAGRAPH_NET_PREFIX:-${NET_PREFIX}}
+    else
+      BASE_PREFIX=${NET_PREFIX}
+    fi
+    export CL_EXTERNAL_IP=${BASE_PREFIX}.${CL_DOCKER_TEST_NETWORK_SUFFIX:-1}${CONTAINER_OFFSET:-0}
   fi
-  export CL_EXTERNAL_IP=${BASE_PREFIX}.${CL_DOCKER_TEST_NETWORK_SUFFIX:-1}${CONTAINER_OFFSET:-0}
 fi
 
 echo "Using external IP $CL_EXTERNAL_IP for service $ID"

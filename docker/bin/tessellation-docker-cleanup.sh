@@ -15,8 +15,20 @@ cleanup_container() {
     docker volume rm ${vol} 2>/dev/null || true
 }
 
+# Upper index for the per-node cleanup sweep. MUST cover the full hypergraph
+# node range, otherwise higher-index containers (gl0-10..gl0-N) keep their
+# endpoints on tessellation_common and the network-removal loop below spins
+# forever on "has active endpoints". The node-CREATION ceiling is
+# NAKAMOTO_MAX_HG_NODES (set-env.sh, default 20 = the IP-safe max), so the
+# teardown sweep must match it. This script runs standalone (set-env.sh is not
+# sourced), so read the same env var with the same default and clamp to a sane
+# floor of 10 to preserve the legacy seq-0-9 behaviour for small/unset cases.
+CLEANUP_MAX_HG_NODES=${NAKAMOTO_MAX_HG_NODES:-20}
+[ "$CLEANUP_MAX_HG_NODES" -lt 10 ] 2>/dev/null && CLEANUP_MAX_HG_NODES=10
+CLEANUP_MAX_IDX=$((CLEANUP_MAX_HG_NODES - 1))
+
 cleanup() {
-    for i in $(seq 0 9); do
+    for i in $(seq 0 "$CLEANUP_MAX_IDX"); do
         cleanup_container gl0-$i gl0-data-$i &
         cleanup_container gl1-$i gl1-data-$i &
         # Nakamoto sidecar containers
@@ -52,8 +64,15 @@ cleanup() {
 
 cleanup &
 export CLEANUP_PID=$!
-# 8. Remove the network with better error handling and retry logic
+# 8. Remove the network with better error handling and retry logic.
+# Bounded retry + force-disconnect fallback: if some endpoint outlives the
+# cleanup sweep (e.g. a container the name-based sweep above didn't enumerate),
+# the old `while true` spun forever. After NET_RM_MAX_TRIES attempts we
+# force-disconnect every remaining endpoint by ID and retry, so `just down`
+# can never wedge on a stray endpoint.
 echo "Removing tessellation_common network..."
+NET_RM_MAX_TRIES=${NET_RM_MAX_TRIES:-30}
+net_rm_try=0
 while true; do
   output=$(docker network rm tessellation_common 2>&1) || true
   if [[ $output == *"not found"* ]]; then
@@ -65,7 +84,19 @@ while true; do
     echo $output
     break
   fi
-  echo "Network has active endpoints, retrying in 1 second..."
+  net_rm_try=$((net_rm_try + 1))
+  if [ "$net_rm_try" -ge "$NET_RM_MAX_TRIES" ]; then
+    echo "Network still has active endpoints after $net_rm_try tries — force-disconnecting stragglers..."
+    for cid in $(docker network inspect tessellation_common --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null); do
+      echo "  force-disconnect + rm: $cid"
+      docker network disconnect -f tessellation_common "$cid" 2>/dev/null || true
+      docker rm -f "$cid" 2>/dev/null || true
+    done
+    docker network rm tessellation_common 2>/dev/null || true
+    echo "Network removed (forced) or already gone"
+    break
+  fi
+  echo "Network has active endpoints, retrying in 1 second... ($net_rm_try/$NET_RM_MAX_TRIES)"
   sleep 1
 done
 

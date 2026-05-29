@@ -5,7 +5,7 @@
  * ensuring ordinals advance between TimeTrigger cycles.
  *
  * Usage: node send-background-txns.js [gl1_url] [interval_ms]
- *   gl1_url      - GL1 node URL (default: http://localhost:9100)
+ *   gl1_url      - GL1 node URL (default: $GL1_URL, else gl1-0 external 9600)
  *   interval_ms  - Send interval in ms (default: 5000)
  *
  * Requires: @stardust-collective/dag4 (installed in CI)
@@ -15,7 +15,11 @@
 
 const dag4 = require('@stardust-collective/dag4').dag4
 
-const GL1_URL = process.argv[2] || 'http://localhost:9100'
+// gl1-0's EXTERNAL host port is GL1_EXT_PORT_BASE (9600), not the 9100
+// container-internal band. Prefer an explicit arg, then GL1_URL (set-env.sh),
+// then the external base.
+const _gl1ExtBase = parseInt(process.env.GL1_EXT_PORT_BASE || '9600', 10)
+const GL1_URL = process.argv[2] || process.env.GL1_URL || `${process.env.TEST_HOST || 'http://localhost'}:${_gl1ExtBase}`
 const INTERVAL_MS = parseInt(process.argv[3] || '5000', 10)
 
 // Genesis wallet seed phrases (test wallets, duplicated from shared.js for independence)

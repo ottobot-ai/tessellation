@@ -2,6 +2,7 @@ package io.constellationnetwork.node.shared.app
 
 import java.security.KeyPair
 
+import cats.effect.kernel.Ref
 import cats.effect.std.{Random, Supervisor}
 
 import io.constellationnetwork.domain.allowance_list.AllowanceListEntry
@@ -54,6 +55,18 @@ trait NodeShared[F[_], A <: CliMethod] {
   val hashSelect: HashSelect
 
   val loggerBundle: LoggerBundle[F]
+
+  /** Split-safety (#261, eta axis): the deferred handle that lets the gl0 follower / `createContext` GSAM's committee-eta resolver walk the
+    * SAME chain the leader's resolver walks. The follower GSAM is built in [[TessellationIOApp]] (early, before any chain store exists), so
+    * its `EtaStateManager` is wired against a chain-walk closure that reads THIS Ref; gl0's `Main.run` flows
+    * `chainStore.vrfOutputsForPeriod` into it once `GlobalSnapshotConsensus.make` has built the chain store (mirrors the leader's own
+    * `chainStoreForLookupRef` deferred handle). Stays `None` for every non-gl0 layer (cl0/cl1/dl1/gl1) — the follower eta walk then returns
+    * an empty list, byte-identical to the prior `noopEtaChainWalk`, so those layers' startup is unchanged.
+    *
+    * Type is a plain `Long => F[List[(Long, Array[Byte])]]` (a `vrfOutputsForPeriod(sourcePeriod, etaRotationSnapshots)`-shaped closure
+    * with the rotation length already partially applied) so node-shared has no dependency on the dag-l0 `NakamotoChainStore` type.
+    */
+  val nakamotoFollowerEtaChainWalkRef: Ref[F, Option[Long => F[List[(Long, Array[Byte])]]]]
 
   def restartSignal: SignallingRef[F, Option[A]]
   def stopSignal: SignallingRef[F, Boolean]

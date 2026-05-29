@@ -41,6 +41,8 @@ object ShardingConfigSuite extends SimpleIOSuite {
       cfg.finality.k1Shard == 8L,
       cfg.checkpoint.tAliveMs == 30000L,
       cfg.checkpoint.tBurst == 64,
+      // EXECUTION-SHARDING R-1: default per-shard raw-binary buffer cap.
+      cfg.checkpoint.binaryBufferCap == 4096,
       // Slice 19: default partition-hard threshold is 10 minutes.
       cfg.observability.tPartitionHardMs == 600000L,
       // Slice 17: default non-participation slashing — 33% missed-rate ceiling, min 5 duties before evaluating.
@@ -56,7 +58,7 @@ object ShardingConfigSuite extends SimpleIOSuite {
         |  num-shards = 4
         |  committee-k-target = 8
         |  finality { k1-shard = 16 }
-        |  checkpoint { t-alive-ms = 45000, t-burst = 128 }
+        |  checkpoint { t-alive-ms = 45000, t-burst = 128, binary-buffer-cap = 8192 }
         |  observability { t-partition-hard-ms = 90000 }
         |  slashing { max-missed-pct-per-epoch = 50, min-denominator-per-epoch = 10 }
         |}
@@ -68,6 +70,7 @@ object ShardingConfigSuite extends SimpleIOSuite {
       cfg.finality.k1Shard == 16L,
       cfg.checkpoint.tAliveMs == 45000L,
       cfg.checkpoint.tBurst == 128,
+      cfg.checkpoint.binaryBufferCap == 8192,
       cfg.observability.tPartitionHardMs == 90000L,
       cfg.slashing.maxMissedPctPerEpoch == 50,
       cfg.slashing.minDenominatorPerEpoch == 10L
@@ -88,6 +91,7 @@ object ShardingConfigSuite extends SimpleIOSuite {
       cfg.finality.k1Shard == 8L,
       cfg.checkpoint.tAliveMs == 30000L,
       cfg.checkpoint.tBurst == 64,
+      cfg.checkpoint.binaryBufferCap == 4096,
       cfg.observability.tPartitionHardMs == 600000L,
       cfg.slashing.maxMissedPctPerEpoch == 33,
       cfg.slashing.minDenominatorPerEpoch == 5L

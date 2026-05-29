@@ -139,7 +139,6 @@ object Main
         storages.transaction,
         storages.allowSpend,
         storages.tokenLock,
-        sharedServices.globalSnapshotContextFns,
         Hasher.forKryo[IO],
         services.globalL0.pullGlobalSnapshot,
         services.globalL0,

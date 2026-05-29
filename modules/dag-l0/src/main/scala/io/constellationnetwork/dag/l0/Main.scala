@@ -70,6 +70,39 @@ object Main
   val kryoRegistrar: Map[Class[_], KryoRegistrationId[KryoRegistrationIdRange]] =
     dagL0KryoRegistrar
 
+  /** Split-safety (#261): give the createContext / follower GSAM (built inside `SharedServices.make`) the SAME genesis-derived KES + VRF
+    * registries the gl0 produce + validateArtifact paths use, so `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` draws the IDENTICAL
+    * VRF-VK-sortitioned committee and verifies KES identically on every gl0 path. Loaded from the SAME L0 genesis JSON `run` reads for
+    * `GlobalSnapshotConsensus.make`; empty for non-JSON bootstrap paths (rollback / join / CSV-genesis) where the verify path likewise has
+    * no registry.
+    */
+  override protected def nakamotoShardRegistries(method: RunNakamoto)(
+    implicit jsonSerializer: io.constellationnetwork.json.JsonSerializer[IO]
+  ): Resource[
+    IO,
+    (
+      io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[IO],
+      io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[IO]
+    )
+  ] =
+    (method.genesisPath, method.genesisPath.exists(_.extName == ".json")) match {
+      case (Some(gPath), true) =>
+        GenesisLoader
+          .make[IO, GlobalSnapshot]
+          .loadL0Genesis(gPath)
+          .flatMap { data =>
+            (L0GenesisLoader.buildKesRegistry[IO](data), L0GenesisLoader.buildVrfRegistry[IO](data)).tupled
+          }
+          .asResource
+      case _ =>
+        Resource.pure(
+          (
+            io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO],
+            io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[IO]
+          )
+        )
+    }
+
   def run(method: RunNakamoto, nodeShared: NodeShared[IO, RunNakamoto]): Resource[IO, Unit] = {
     import nodeShared._
 
@@ -119,6 +152,14 @@ object Main
       // Shared between Services and HttpApi the same way as `finalityTriggerViewRef`.
       nipopowProofProviderRef <- Ref
         .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.nipopow.NipopowProofProvider[IO]]](None)
+        .asResource
+      // Axis 2 (gl1 inclusion-proof follow) — observability seam for the GlobalFollowRoutes
+      // `GET /global-follow/slice/latest` endpoint. Populated inside GlobalSnapshotConsensus.make once
+      // the finalized GSI source (`lastNGlobalSnapshotStorage`) is wired; the slice service reads the
+      // latest-finalized `(ordinal, GSI)` itself. Shared between Services and HttpApi exactly like
+      // `nipopowProofProviderRef`; the route returns 503 while it is still `None`.
+      globalFollowSliceServiceRef <- Ref
+        .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService[IO]]](None)
         .asResource
       storages <- Storages
         .make[IO](
@@ -193,8 +234,14 @@ object Main
           nakamotoFinalizedOrdinalRef,
           finalityTriggerViewRef,
           nipopowProofProviderRef,
+          globalFollowSliceServiceRef,
           kesRegistry,
-          vrfRegistry
+          vrfRegistry,
+          // Split-safety (#261, eta axis): install the leader's chain-walk into the follower / `createContext`
+          // GSAM's deferred committee-eta resolver (the Ref created in `TessellationIOApp.make`, exposed on
+          // `NodeShared`). `GlobalSnapshotConsensus.make` invokes this once the chain store exists so the
+          // follower `EtaStateManager.getEta(P)` byte-matches the leader's for every period P.
+          setFollowerEtaChainWalk = (walk: Long => IO[List[(Long, Array[Byte])]]) => nakamotoFollowerEtaChainWalkRef.set(Some(walk))
         )
 
       programs = Programs.make[IO, RunNakamoto](

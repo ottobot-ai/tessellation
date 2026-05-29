@@ -1,0 +1,17 @@
+flowchart TB
+    B["Metagraph ml0<br/>SC binaries (BFT, unchanged)"]
+    B -->|gossip| RX["gl0 receives sc=N events"]
+    RX --> CL{"gl0 chain-link admission<br/>onlyPossibleReferences"}
+    CL -->|"gl0 tip diverges:<br/>rejects forever (#259 freeze)"| FROZEN["stateChannelSnapshots<br/>frozen / partial"]
+    CL --> SCS["stateChannelSnapshots<br/>(gl0 committed, post-admission)"]
+    SCS -->|"CHANGE-3 filter empties (sharded)"| EMPTY["stateChannelSnapshots = empty"]
+    EMPTY --> FO["ShardCheckpointFanOut<br/>reads stateChannelSnapshots"]
+    FO -->|"empty: traverse no-op"| NOP["no producer runs<br/>(produce() never called)"]
+    NOP --> NOCP["no checkpoint produced"]
+    NOCP --> AD["nothing to adopt"]
+    AD --> RES["gl0 sees 0/4 metagraphs<br/>currSnapshots = 0"]
+    NOCP -.->|"circular: no checkpoint keeps SCS empty"| EMPTY
+    classDef bad fill:#ffe0e0,stroke:#c0392b,color:#7b241c;
+    classDef neu fill:#eef2f7,stroke:#5d6d7e,color:#1b2631;
+    class FROZEN,EMPTY,NOP,NOCP,AD,RES bad;
+    class B,RX,CL,SCS,FO neu;

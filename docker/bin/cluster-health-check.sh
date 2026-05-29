@@ -126,7 +126,11 @@ verify_healthy() {
     fi
 
     if [ "$NUM_GL1_NODES" -gt 0 ]; then
-      check_health "${host}:${DAG_L1_PORT_PREFIX}00" "gl1-0" "$NUM_GL1_NODES" || any_failed=true
+      # gl1-0's EXTERNAL host port is GL1_EXT_PORT_BASE (9600), NOT the
+      # DAG_L1_PORT_PREFIX (9100) band — that's the gl1 container-internal port.
+      # GL1_URL is set by set-env.sh to the gl1 external base for local runs.
+      local gl1_health_url="${GL1_URL:-${host}:${GL1_EXT_PORT_BASE}}"
+      check_health "$gl1_health_url" "gl1-0" "$NUM_GL1_NODES" || any_failed=true
     fi
 
     # Per-metagraph health: each metagraph k has its own ml0/cl1/dl1 cluster

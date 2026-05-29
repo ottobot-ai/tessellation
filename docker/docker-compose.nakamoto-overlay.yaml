@@ -90,6 +90,9 @@ services:
       # on the matching CONTAINER_NAME_SUFFIX so the gRPC call stays local-network.
       - SIDECAR_HOST=sidecar${CONTAINER_NAME_SUFFIX:-}
       - SIDECAR_GRPC_PORT=50051
+      # #259: gl1 also follows gl0 + recomputes the historicalStakeSnapshots stateProof,
+      # so it needs the same eta-rotation R as gl0/metagraph (verifier determinism).
+      - NAKAMOTO_ETA_ROTATION_SNAPSHOTS=${NAKAMOTO_ETA_ROTATION_SNAPSHOTS:-100}
     # NOTE: no `depends_on: sidecar` here — the `sidecar` service is in profile
     # `l0` (started by the gl0 launch), and adding a depends_on under the `l1`
     # profile would make compose error with "undefined service sidecar". The

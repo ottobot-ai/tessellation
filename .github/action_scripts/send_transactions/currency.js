@@ -782,6 +782,10 @@ const sendTransactions = async () => {
     currencyL1PortPrefix,
   } = createConfig()
 
+  // gl1 EXTERNAL host port for node 0 = GL1_EXT_PORT_BASE (9600 band), NOT the
+  // dagL1PortPrefix (9100) container-internal band. GL1_URL (set by set-env.sh)
+  // takes priority; the fallback mirrors the external base.
+  const gl1ExtPortBase = parseInt(process.env.GL1_EXT_PORT_BASE || `${parseInt(dagL1PortPrefix, 10) * 100}`, 10)
   const networkOptions = {
     // Fallback "custom_id" is the dag4.js SDK placeholder for "look up the
     // metagraph from the network config"; it's NOT a real DAG address. Real
@@ -789,7 +793,7 @@ const sendTransactions = async () => {
     // address, which compose-runner exports as METAGRAPH_ID.
     metagraphId: process.env.METAGRAPH_ID || 'custom_id',
     l0GlobalUrl: process.env.GL0_URL || `${process.env.TEST_HOST || 'http://localhost'}:${dagL0PortPrefix}00`,
-    dagL1UrlFirstNode: process.env.GL1_URL || `${process.env.TEST_HOST || 'http://localhost'}:${dagL1PortPrefix}00`,
+    dagL1UrlFirstNode: process.env.GL1_URL || `${process.env.TEST_HOST || 'http://localhost'}:${gl1ExtPortBase}`,
     l0MetagraphUrl: process.env.ML0_URL || `${process.env.TEST_HOST || 'http://localhost'}:${metagraphL0PortPrefix}00`,
     l1MetagraphUrl: process.env.CL1_URL || `${process.env.TEST_HOST || 'http://localhost'}:${currencyL1PortPrefix}00`,
   }

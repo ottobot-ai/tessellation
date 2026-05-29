@@ -22,8 +22,8 @@ import io.constellationnetwork.schema.peer.PeerId
   * behavior is unchanged at any `numShards`.
   *
   * '''Read-only.''' This trait does not expose mutators — the v1 registry is loaded once from `L0GenesisData.operators` at startup and
-  * frozen for the lifetime of the node. Runtime joiners (via `KesRegistrationCert.vrfVK`) are a follow-up; when wired they will overlay this
-  * frozen base the same way [[io.constellationnetwork.node.shared.domain.nakamoto.kes.MutableKesRegistry]] overlays the genesis KES
+  * frozen for the lifetime of the node. Runtime joiners (via `KesRegistrationCert.vrfVK`) are a follow-up; when wired they will overlay
+  * this frozen base the same way [[io.constellationnetwork.node.shared.domain.nakamoto.kes.MutableKesRegistry]] overlays the genesis KES
   * registry.
   *
   * '''Public material only.''' The registry stores ONLY the VRF verification key (a 32-byte Ed25519 public key). The VRF secret key is

@@ -204,6 +204,24 @@ object Mocks {
         snapshotOrdinal: SnapshotOrdinal,
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(implicit hasher: Hasher[IO]): IO[Hash] = Hash.empty.pure[IO]
+
+      override def assembleAcceptanceResult(
+        processed: SortedMap[
+          Address,
+          (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], BalanceUpdate)
+        ],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+        returned: Set[StateChannelOutput]
+      ): StateChannelAcceptanceResult =
+        StateChannelAcceptanceResult(
+          accepted = SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+          calculatedCurrencyState = priorLastCurrencySnapshots,
+          returned = returned,
+          balanceUpdate = SortedMap.empty[Address, Balance],
+          incomingCurrencySnapshotsWithState = SortedMap.empty[Address, List[CurrencySnapshotWithState]]
+        )
     }
 
     val mockUpdateNodeParametersAcceptanceManager = new UpdateNodeParametersAcceptanceManager[IO] {

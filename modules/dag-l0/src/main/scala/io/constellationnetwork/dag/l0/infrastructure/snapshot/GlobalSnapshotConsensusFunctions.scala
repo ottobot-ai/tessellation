@@ -26,7 +26,10 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog
 import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog.{Category, Event}
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger, TimeTrigger}
 import io.constellationnetwork.node.shared.infrastructure.delegatedStake.RewardsInfoStorage
-import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.GlobalSnapshotAcceptanceManager
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
+  GlobalSnapshotAcceptanceManager,
+  ShardCheckpointAcceptResult
+}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.{RewardsInput, _}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
@@ -171,7 +174,14 @@ object GlobalSnapshotConsensusFunctions {
         events,
         facilitators,
         getGlobalSnapshotByOrdinal,
-        sourceShardCheckpoints = false
+        sourceShardCheckpoints = false,
+        // Split-safety (CHANGE 5): the follower/validator re-derivation MUST thread the leader's embedded
+        // `artifact.shardCheckpoints` into accept() (so it ADOPTS the same committee checkpoints via the
+        // deterministic `verifyEmbedded`) AND re-embed the SAME map, so the recreated artifact's
+        // `shardCheckpoints` field equals `artifact.shardCheckpoints` and `recreatedArtifact === artifact`
+        // holds. The leader already filtered these to the `verifyEmbedded`-accepted subset, so the
+        // follower's `verifyEmbedded` re-accepts all of them (deterministic) and the embedded set round-trips.
+        incomingShardCheckpoints = artifact.shardCheckpoints
       )
 
       def check(result: F[(GlobalSnapshotArtifact, GlobalSnapshotContext, Set[GlobalSnapshotEvent])]) =
@@ -232,16 +242,32 @@ object GlobalSnapshotConsensusFunctions {
         events,
         facilitators,
         getGlobalSnapshotByOrdinal,
-        sourceShardCheckpoints = true
+        sourceShardCheckpoints = true,
+        // Produce path sources its own candidate checkpoints from the per-shard chain stores below; nothing incoming.
+        incomingShardCheckpoints = SortedMap.empty
       )
 
     /** Implementation of [[createProposalArtifact]] with an explicit `sourceShardCheckpoints` gate.
       *
       * '''Gap C determinism contract.''' `sourceShardCheckpoints = true` ONLY on the genuine produce path (the public trait method, called
-      * by `SnapshotLeaderLoop`). The follower validation path (`validateArtifact`) passes `false` so it never reads node-local shard
-      * finality state during a byte-exact re-derivation. At `numShards = 1` the flag is irrelevant — `shardAcceptanceDeps = None` forces
-      * `shardCheckpoints = SortedMap.empty` regardless, so this method is byte-identical to the pre-wiring code on both paths (the
-      * regression bar).
+      * by `SnapshotLeaderLoop`). It sources candidate checkpoints from the node-local per-shard chain stores (a liveness/selection
+      * decision, gossip-timing-tolerant by §7.2) and then FILTERS them to the `verifyEmbedded`-accepted subset
+      * (`adoptableShardCheckpoints`). That subset is BOTH (a) passed into `accept()` — which adopts them via the deterministic
+      * `verifyEmbedded` into `scSnapshots` (the adopt-won `stateChannelSnapshots`) — AND (b) embedded in the produced artifact's
+      * `shardCheckpoints` field. So the embedded checkpoints exactly attest the adopted binaries.
+      *
+      * The follower validation path (`validateArtifact`) passes `sourceShardCheckpoints = false` and supplies the leader's embedded
+      * `artifact.shardCheckpoints` via [[incomingShardCheckpoints]]. Those are already the leader's accepted subset; the follower threads
+      * them into `accept()` (re-adopting the same set via the deterministic `verifyEmbedded`) and re-embeds the SAME map, so the recreated
+      * artifact's `shardCheckpoints` AND `stateChannelSnapshots` match the leader's byte-for-byte (no node-local shard state is read on the
+      * follower — the split-safety invariant).
+      *
+      * At `numShards = 1` the flag is irrelevant — `shardAcceptanceDeps = None` forces `adoptableShardCheckpoints = SortedMap.empty`
+      * regardless, so this method is byte-identical to the pre-wiring code on both paths (the regression bar).
+      *
+      * @param incomingShardCheckpoints
+      *   on the follower/validator re-derivation path, the leader's embedded `artifact.shardCheckpoints`. Empty on the produce path (which
+      *   sources its own). See the split-safety note above.
       */
     def createProposalArtifactInternal(
       lastKey: GlobalSnapshotKey,
@@ -252,7 +278,11 @@ object GlobalSnapshotConsensusFunctions {
       events: Set[GlobalSnapshotEvent],
       facilitators: Set[PeerId],
       getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
-      sourceShardCheckpoints: Boolean
+      sourceShardCheckpoints: Boolean,
+      incomingShardCheckpoints: SortedMap[
+        io.constellationnetwork.schema.sharding.ShardId,
+        io.constellationnetwork.schema.sharding.ShardCheckpoint
+      ]
     )(implicit hasher: Hasher[F]): F[(GlobalSnapshotArtifact, GlobalSnapshotContext, Set[GlobalSnapshotEvent])] = {
       val scEventsBeforeCut = events.collect { case sc: StateChannelEvent => sc }
       val dagEventsBeforeCut = events.collect { case d: DAGEvent => d }
@@ -455,7 +485,9 @@ object GlobalSnapshotConsensusFunctions {
         // (`validateArtifact`) never enters this branch — it replays the leader's embedded
         // `stateChannelSnapshots`, so it must NOT re-source node-local shard state (the split-safety
         // invariant). See the determinism contract on `createProposalArtifactInternal`.
-        shardCheckpoints <- shardAcceptanceDeps match {
+        // Candidate checkpoints to consider this ord. Produce path: source from the node-local per-shard chain stores
+        // (selection only). Follower/validator path: the leader's embedded `incomingShardCheckpoints`. Empty otherwise.
+        candidateShardCheckpoints <- shardAcceptanceDeps match {
           case Some(deps) if sourceShardCheckpoints =>
             deps.registry.toList.traverse {
               case (shardId, entry) =>
@@ -489,6 +521,32 @@ object GlobalSnapshotConsensusFunctions {
                   }
             }
               .map(entries => SortedMap.from(entries.flatten))
+          case Some(_) =>
+            // Follower/validator path: thread the leader's embedded checkpoints through unchanged. They are already the
+            // leader's `verifyEmbedded`-accepted subset; the filter below re-confirms each one deterministically.
+            incomingShardCheckpoints.pure[F]
+          case None =>
+            SortedMap
+              .empty[io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint]
+              .pure[F]
+        }
+
+        // CHANGE 4 — keep ONLY the checkpoints the DETERMINISTIC `verifyEmbedded` accepts. These are exactly the ones
+        // GSAM's adopt path will fold into `scSnapshots`, so embedding this same subset in the produced artifact keeps the
+        // `shardCheckpoints` field consistent with `stateChannelSnapshots`. `verifyEmbedded` reads no node-local state, so
+        // the leader (produce) and every follower/validator compute the SAME accepted subset over the SAME candidates —
+        // the follower's candidates ARE the leader's embedded set, so the subset round-trips identically (recreated
+        // artifact === artifact). At `numShards = 1` (deps None) `candidateShardCheckpoints` is empty ⇒ this is empty too.
+        adoptableShardCheckpoints <- shardAcceptanceDeps match {
+          case Some(deps) if candidateShardCheckpoints.nonEmpty =>
+            candidateShardCheckpoints.toList.traverseFilter {
+              case (shardId, cp) =>
+                deps.acceptanceManager.verifyEmbedded(cp).map {
+                  case ShardCheckpointAcceptResult.Accepted => (shardId -> cp).some
+                  case _ => none[(io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint)]
+                }
+            }
+              .map(entries => SortedMap.from(entries))
           case _ =>
             SortedMap
               .empty[io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint]
@@ -540,9 +598,11 @@ object GlobalSnapshotConsensusFunctions {
               // ignores the BranchId on every read/write — the byte-parity contract from #107
               // covers the rewire under that mode.
               io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(lastArtifactHash),
-              // Gap C — finalized shard checkpoints sourced above. Empty at numShards=1 (regression
-              // bar): GSAM's `processShardCheckpoints` only fires when `numShards > 1 && nonEmpty`.
-              shardCheckpoints = shardCheckpoints
+              // Gap C — the `verifyEmbedded`-accepted checkpoint subset. GSAM's `adoptShardCheckpoints` re-runs
+              // `verifyEmbedded` and adopts each into `scSnapshots`; passing the already-accepted subset makes the
+              // adopt-won `stateChannelSnapshots` correspond exactly to the embedded `shardCheckpoints` field below.
+              // Empty at numShards=1 (regression bar): the adopt path only fires when `numShards > 1 && nonEmpty`.
+              shardCheckpoints = adoptableShardCheckpoints
             )
         acceptEndMs <- Async[F].monotonic.map(_.toMillis)
         _ <- ConsensusLog.info(
@@ -598,9 +658,11 @@ object GlobalSnapshotConsensusFunctions {
           lastArtifactHash,
           accepted,
           scSnapshots,
-          // shardCheckpoints — Slice 4 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §3.4; pre-sharding leader builds an
-          // empty map. Population by `ShardCheckpointGl0AcceptanceManager` (slice 9) and stitching refactor (slice 13) come later.
-          SortedMap.empty[io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint],
+          // shardCheckpoints (§3.4) — embed the SAME `verifyEmbedded`-accepted subset GSAM adopted into `scSnapshots`
+          // above, so the artifact's `shardCheckpoints` field and its `stateChannelSnapshots` (adopt-won) are mutually
+          // consistent and a follower/validator threading `artifact.shardCheckpoints` back through accept() recreates
+          // both byte-identically. Empty at numShards=1 (regression bar) — `adoptableShardCheckpoints` is empty there.
+          adoptableShardCheckpoints,
           acceptedRewardTxs,
           delegatorRewardsMap.some,
           currentEpochProgress,

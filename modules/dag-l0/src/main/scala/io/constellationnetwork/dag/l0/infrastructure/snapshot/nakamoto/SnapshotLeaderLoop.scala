@@ -379,6 +379,16 @@ object SnapshotLeaderLoop {
     // /global-snapshots/latest/finalized-ordinal. Updated after every successful
     // chainStore.finalize call (depth-k or attestation-2/3, whichever fires first).
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
+    // Axis 2 (gl1 inclusion-proof follow) — the latest-FINALIZED `(ordinal, GlobalSnapshotInfo)` the gl0-side
+    // slice producer (`GlobalFollowSliceService`) serves. Captured at the SAME two finalize sinks that advance
+    // `nakamotoFinalizedOrdinalRef`, from the `StoredSnapshot.context` of the snapshot just finalized — that GSI
+    // is genuinely in-memory at the sink (the `chainStore.get` that resolved the canonical snapshot returns the
+    // real in-memory `context`, never the disk-fallback placeholder, which only `getWithOrdinalFallback` uses).
+    // Updated MONOTONICALLY (only on ordinal advance) so a stale-by-a-tick reorg can't move the served slice
+    // backward. The producer MUST serve a finalized ordinal: gl1 is finality-gated (#122) and can only resolve a
+    // snapshot at the slice's ordinal — the latest PRODUCED GSI (`lastNGlobalSnapshotStorage.getCombined`) is
+    // ahead of the finalized watermark and therefore unresolvable by a follower (the bug this closes).
+    latestFinalizedSliceSourceRef: Ref[F, Option[(SnapshotOrdinal, GlobalSnapshotInfo)]],
     // Fire-and-forget ChainSync trigger for the finality walkback path. When the
     // finality monitor tries to confirm ancestry at an attested ordinal that we
     // don't have on our local canonical chain (we're on a fork), we enqueue a
@@ -434,10 +444,27 @@ object SnapshotLeaderLoop {
         F
       ]
     ] = Map.empty,
-    // Static metagraph→shard mapping. `None` at `numShards = 1` (no fan-out). `Some(...)` when sharding
-    // is active, used to partition the just-produced snapshot's `stateChannelSnapshots` per shard so
-    // each producer only sees the MGs assigned to it.
-    shardAssignment: Option[ShardAssignment[F]] = None
+    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers (the producer fan-out input — the inversion). The SAME
+    // instances the daemon's gossip-intake writes into, projected off `shardAcceptanceDeps.registry`. Empty at
+    // `numShards = 1` ⇒ the fan-out stays a no-op `traverse_`.
+    shardBinaryBuffers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[
+        F
+      ]
+    ] = Map.empty,
+    // Static metagraph→shard mapping. `None` at `numShards = 1` (no fan-out). `Some(...)` when sharding is active.
+    // Used by the fan-out gate (`shardAssignment.isDefined`); per-shard binary partitioning now lives in the
+    // daemon's gossip-intake (R-1), so it is no longer used to partition here.
+    shardAssignment: Option[ShardAssignment[F]] = None,
+    // EXECUTION-SHARDING Task 2: the deterministic `committeeFor(shardId, epoch)` draw, threaded into the producer fan-out so a
+    // node only produces a checkpoint for shards it is a committee member of. Required (no default — `Async[F]` of an empty-set
+    // default can't resolve at the default-arg site); `GlobalSnapshotConsensus.make` passes the real draw, or a numShards=1 empty-set
+    // closure (never reached: the fan-out is gated on `shardProducers.nonEmpty` first).
+    shardCommitteeMembership: (
+      io.constellationnetwork.schema.sharding.ShardId,
+      EtaPeriod
+    ) => F[Set[io.constellationnetwork.schema.peer.PeerId]]
   )(
     // Slice S6: app-scoped Supervisor used to run the producer shard-checkpoint fan-out OFF the
     // `snapshotSemaphore.permit` critical path in `onSlotWon`. Implicit so the existing
@@ -603,7 +630,9 @@ object SnapshotLeaderLoop {
                             operationalKeyMaker,
                             shardProducers,
                             shardChainStores,
+                            shardBinaryBuffers,
                             shardAssignment,
+                            shardCommitteeMembership,
                             logger
                           )
                         } // snapshotSemaphore.permit
@@ -868,6 +897,16 @@ object SnapshotLeaderLoop {
                                               .update(prev =>
                                                 cats.Order[SnapshotOrdinal].max(prev, SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
                                               ) >>
+                                            // Axis 2 (gl1 follow): capture this just-finalized snapshot's GSI as the slice
+                                            // producer's source. `canonicalSnapshot.context` is the in-memory finalized GSI
+                                            // (the `chainStore.get(canonicalHash)` above returned it). Monotone: only advance
+                                            // when this ordinal is strictly higher than the stored one.
+                                            latestFinalizedSliceSourceRef.update {
+                                              case Some((o, _)) if o.value.value >= finalizeAtOrdinal =>
+                                                Some((o, canonicalSnapshot.context))
+                                              case _ =>
+                                                Some((SnapshotOrdinal.unsafeApply(finalizeAtOrdinal), canonicalSnapshot.context))
+                                            } >>
                                             logger
                                               .info(
                                                 s"DEPTH-FINALIZED ordinal=$finalizeAtOrdinal slot=${canonicalSnapshot.slot} (tip ord=${tip.ordinal} slot=${tip.slot}, k=$ConfirmationDepthK)"
@@ -959,6 +998,12 @@ object SnapshotLeaderLoop {
                                               .update(prev =>
                                                 cats.Order[SnapshotOrdinal].max(prev, SnapshotOrdinal.unsafeApply(finalOrdinal))
                                               ) >>
+                                            // Axis 2 (gl1 follow): same finalized-GSI capture as the DEPTH-FINALIZED branch
+                                            // above. `stored.context` is the in-memory finalized GSI. Monotone advance.
+                                            latestFinalizedSliceSourceRef.update {
+                                              case Some((o, _)) if o.value.value >= finalOrdinal => Some((o, stored.context))
+                                              case _ => Some((SnapshotOrdinal.unsafeApply(finalOrdinal), stored.context))
+                                            } >>
                                             snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(finalOrdinal))) >>
                                             logger.info(
                                               s"ATTEST-FINALIZED ordinal=$finalOrdinal slot=${stored.slot} (weight=${"%.2f".format(weight.toDouble)}, " +
@@ -1209,7 +1254,17 @@ object SnapshotLeaderLoop {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
     ],
+    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers (the producer fan-out input — the inversion).
+    shardBinaryBuffers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
+    ],
     shardAssignment: Option[ShardAssignment[F]],
+    // EXECUTION-SHARDING Task 2: deterministic committee draw, threaded into the producer fan-out (membership gate). See `run`'s param.
+    shardCommitteeMembership: (
+      io.constellationnetwork.schema.sharding.ShardId,
+      EtaPeriod
+    ) => F[Set[io.constellationnetwork.schema.peer.PeerId]],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     // Slice S6: app-scoped Supervisor for the off-critical-path producer fan-out (see Gap A below).
@@ -1575,8 +1630,9 @@ object SnapshotLeaderLoop {
                   //   3. `ShardChainStore.store` is idempotent by hash + monotonic by shard ordinal, so the
                   //      async write racing the next ord's read dedups safely.
                   _ <- Async[F].whenA(stillOpen && shardProducers.nonEmpty && shardAssignment.isDefined) {
-                    // Capture BY VALUE before starting the fiber (determinism point 1 above).
-                    val capturedStateChannelSnapshots = signed.value.stateChannelSnapshots
+                    // R-1: the fan-out reads each shard's `shardBinaryBuffers` (the inversion), NOT the just-produced
+                    // snapshot's `stateChannelSnapshots`. We still only fan out when the gl0 snapshot actually
+                    // committed (`stillOpen`), so a checkpoint is never anchored to a gl0 ord that never committed.
                     val producedOrd =
                       SnapshotOrdinal(NonNegLong.unsafeFrom(producedOrdinal))
                     val rotationPeriod = EtaCalculation.rotationPeriod(producedOrdinal, etaRotationSnapshots)
@@ -1585,12 +1641,13 @@ object SnapshotLeaderLoop {
                       .supervise(
                         HasherSelector[F].withCurrent { implicit hasher =>
                           io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointFanOut.run[F](
-                            stateChannelSnapshots = capturedStateChannelSnapshots,
+                            shardBinaryBuffers = shardBinaryBuffers,
                             producedOrd = producedOrd,
                             epoch = epoch,
                             shardProducers = shardProducers,
                             shardChainStores = shardChainStores,
-                            shardAssignment = shardAssignment.get,
+                            selfPeerId = selfId,
+                            committeeMembership = shardCommitteeMembership,
                             logger = logger
                           )
                         }.handleErrorWith(e => logger.warn(e)(s"🧩 Shard producer fan-out failed for ord=$producedOrdinal"))

@@ -50,3 +50,8 @@ docker/snapshot-streaming/*.conf
 docker/snapshot-streaming/data/
 docker/snapshot-streaming/.build/
 docker/snapshot-streaming/block-explorer/
+
+.claude/
+test-runs/
+iter-*/
+nodes/

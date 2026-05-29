@@ -264,6 +264,17 @@ sealed abstract class HttpApi[
   // wired. Pure observability — never feeds back into consensus.
   private val nipopowRoutes = NipopowRoutes[F](services.nipopowProofProviderRef)
 
+  // Axis 2 Slice 3a (gl1 inclusion-proof follow) — serves `GET /global-follow/slice/latest` so a gl1
+  // `GlobalFollowClient` can fetch the latest-finalized consumed-field slice. Reaches gl0 over the
+  // PUBLIC HTTP port: gl1 resolves gl0 as an `L0Peer` whose `port = publicPort` (see
+  // `L0Peer.toP2PContext` / `fromPeer`), the SAME PeerResponse path `L0GlobalSnapshotClient` uses to
+  // pull global snapshots — so the route is a `PublicRoutes` mounted in `openRoutes` alongside
+  // `nipopowRoutes`. Reads the service Ref populated by GlobalSnapshotConsensus.make (the slice producer
+  // over the SAME finalized GSI source `getCombined` serves; the slice service carries the finalized
+  // ordinal itself). Pure observability — never feeds back into consensus.
+  private val globalFollowRoutes =
+    GlobalFollowRoutes[F](services.globalFollowSliceServiceRef)
+
   private val walletRoutes = WalletRoutes[F, GlobalIncrementalSnapshot]("/dag", services.address)
   private val consensusInfoRoutes =
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -303,6 +314,7 @@ sealed abstract class HttpApi[
                 snapshotRoutes.publicRoutes <+>
                 finalityTriggersRoutes.publicRoutes <+>
                 nipopowRoutes.publicRoutes <+>
+                globalFollowRoutes.publicRoutes <+>
                 walletRoutes.publicRoutes <+>
                 nodeRoutes.publicRoutes <+>
                 consensusInfoRoutes.publicRoutes <+>

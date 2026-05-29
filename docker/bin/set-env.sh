@@ -529,7 +529,7 @@ if [ -n "$METAGRAPH" ]; then
     fi
 fi
 
-# Compute MAX_NODES as the maximum of all NUM_*_NODES values (capped at 10).
+# Compute MAX_NODES as the maximum of all NUM_*_NODES values.
 # Hypergraph operators live in nodes/$i/ and run gl0+gl1; their count comes
 # from NUM_GL0_NODES / NUM_GL1_NODES.
 #
@@ -540,24 +540,105 @@ fi
 #
 # MAX_NODES is the unified ceiling — drives directory creation for both
 # hypergraph and metagraph operators (the latter via K parallel m${k}-* dirs).
+#
+# Node-count ceilings (HG vs metagraph differ, because their IP/port allocation
+# schemes differ):
+#   * Hypergraph (gl0+gl1) uses ARITHMETIC IP/port allocation (docker-env-setup.sh
+#     + docker-compose.test.yaml) so it scales past a single digit. The ceiling is
+#     NAKAMOTO_MAX_HG_NODES (default 20). 20 keeps gl0 at IP octets .10..29 and gl1
+#     at .30..49 within the shared /24, disjoint from each other and from
+#     snapshot-streaming (.60/.61); gl0 host ports stay 9000..9192 and gl1 host
+#     ports 9600..9792 — all well under 65535. Override via the env var if you grow
+#     the layout, but re-verify the IP/port arithmetic in docker-env-setup.sh first.
+#   * Metagraph (ml0/cl1/dl1) still uses single-digit STRING-CONCAT IP/port
+#     allocation (.3${i}/.4${i}/.5${i}, 92${i}0/93${i}0/94${i}0) on its own per-k
+#     /24, so it remains capped at 9. Metagraphs only ever run ~3 nodes in e2e, so
+#     this is not a practical limit; lifting it would require the same arithmetic
+#     refactor applied to the metagraph compose files.
+# --- Hypergraph IP / host-port bases (single source of truth) ---
+# Consumed by docker-env-setup.sh (per-node .env) AND the JVM/sidecar seedlist
+# builders in compose-runner.sh. They MUST agree byte-for-byte or gl0 consensus
+# peering breaks (the seedlist tells each gl0 node where to dial its peers, and
+# the dial target is the container's bound IP + internal P2P port). All values
+# are ARITHMETIC (base + i*stride) so the hypergraph scales past a single digit;
+# for i<10 every value below is byte-identical to the legacy string-concat scheme
+# (gl0 IP .10..19, gl0 ports 9000..9092), so small-N runs are unchanged.
+#
+# IP layout (shared /24 ${NET_PREFIX}.x — gl0/gl1 + snapshot-streaming .60/.61):
+#   gl0  .(GL0_IP_BASE + i)   = .10..  (legacy .1${i})
+#   gl1  .(GL1_IP_BASE + i)   = .30..  (legacy was .2${i}; moved to .30 so gl0's
+#                                       arithmetic band can't overlap gl1)
+# Host-port layout:
+#   gl0  external==internal = GL0_PORT_BASE + i*10  {+0 public,+1 p2p,+2 cli}
+#   gl1  internal           = GL1_INT_PORT_BASE + i*10   (legacy 9100 band — keeps
+#                                                         the `gl1-0:9100` DNS alias
+#                                                         and BFT join port working)
+#   gl1  external (host)    = GL1_EXT_PORT_BASE + i*10   (lifted to 9600 so it never
+#                                                         collides with the gl0 host
+#                                                         band 9000.. or the m0
+#                                                         metagraph band 9200..9492)
+export GL0_IP_BASE=${GL0_IP_BASE:-10}
+export GL1_IP_BASE=${GL1_IP_BASE:-30}
+export GL0_PORT_BASE=${GL0_PORT_BASE:-$((DAG_L0_PORT_PREFIX * 100))}
+export GL1_INT_PORT_BASE=${GL1_INT_PORT_BASE:-$((DAG_L1_PORT_PREFIX * 100))}
+export GL1_EXT_PORT_BASE=${GL1_EXT_PORT_BASE:-9600}
+
+# snapshot-streaming reserves these two octets on the shared /24 (its compose
+# pins .60 postgres / .61 streaming). gl0's IP band must stop before .60.
+SS_IP_FLOOR=60
+
+# Hypergraph node-count ceiling. Default 20 — the largest N the default IP layout
+# can host without collision (see derivation below), giving the 16-gl0 scale-up
+# target comfortable headroom. Override via NAKAMOTO_MAX_HG_NODES, but we clamp it
+# to the IP-safe maximum so an over-eager override can't silently produce
+# overlapping gl0/gl1/streaming IPs.
+#
+# Safe-N derivation (octet bands, gl0 below gl1, both ≤254, gl0 clear of streaming):
+#   gl0 occupies [GL0_IP_BASE, GL0_IP_BASE+N-1]; must stay < min(GL1_IP_BASE, SS_IP_FLOOR)
+#   gl1 occupies [GL1_IP_BASE, GL1_IP_BASE+N-1]; must stay ≤ 254
+# With defaults (gl0=.10, gl1=.30, streaming=.60): gl0 limit ⇒ N≤20 (.10..29),
+# gl1 limit ⇒ N≤225. So the IP-safe ceiling is 20. Going beyond 20 means shifting
+# GL1_IP_BASE up (clear of streaming .60/.61) or moving to a wider NET_PREFIX.
+export NAKAMOTO_MAX_HG_NODES=${NAKAMOTO_MAX_HG_NODES:-20}
+_gl0_ip_room=$(( (GL1_IP_BASE < SS_IP_FLOOR ? GL1_IP_BASE : SS_IP_FLOOR) - GL0_IP_BASE ))
+_gl1_ip_room=$(( 255 - GL1_IP_BASE ))
+HG_IP_SAFE_MAX=$(( _gl0_ip_room < _gl1_ip_room ? _gl0_ip_room : _gl1_ip_room ))
+if [ "$NAKAMOTO_MAX_HG_NODES" -gt "$HG_IP_SAFE_MAX" ]; then
+  echo "WARN: NAKAMOTO_MAX_HG_NODES=$NAKAMOTO_MAX_HG_NODES exceeds the IP-safe ceiling $HG_IP_SAFE_MAX"
+  echo "      (gl0 base .$GL0_IP_BASE / gl1 base .$GL1_IP_BASE / streaming floor .$SS_IP_FLOOR); clamping to $HG_IP_SAFE_MAX."
+  NAKAMOTO_MAX_HG_NODES=$HG_IP_SAFE_MAX
+fi
+
 _max_of() { [ "$1" -gt "$2" ] && echo "$1" || echo "$2"; }
 MAX_HG_NODES=$(_max_of ${NUM_GL0_NODES:-0} ${NUM_GL1_NODES:-0})
 MAX_METAGRAPH_NODES=$(_max_of ${NUM_ML0_NODES:-0} ${NUM_CL1_NODES:-0})
 MAX_METAGRAPH_NODES=$(_max_of $MAX_METAGRAPH_NODES ${NUM_DL1_NODES:-0})
 MAX_NODES=$(_max_of $MAX_HG_NODES $MAX_METAGRAPH_NODES)
-# Ensure at least 3 (legacy default) and at most 9 (single-digit IP/port offset limit)
+# Ensure at least 3 (legacy default).
 MAX_NODES=$(_max_of $MAX_NODES 3)
-[ "$MAX_NODES" -gt 9 ] && MAX_NODES=9
-[ "$MAX_HG_NODES" -gt 9 ] && MAX_HG_NODES=9
+# Hypergraph ceiling = NAKAMOTO_MAX_HG_NODES (arithmetic allocation).
+if [ "$MAX_HG_NODES" -gt "$NAKAMOTO_MAX_HG_NODES" ]; then
+  echo "ERROR: hypergraph node count ($MAX_HG_NODES) exceeds NAKAMOTO_MAX_HG_NODES=$NAKAMOTO_MAX_HG_NODES."
+  echo "       Raise NAKAMOTO_MAX_HG_NODES (up to the IP-safe ceiling $HG_IP_SAFE_MAX) to go higher;"
+  echo "       beyond that, shift GL1_IP_BASE / NET_PREFIX and re-verify docker-env-setup.sh arithmetic."
+  exit 1
+fi
+# Metagraph ceiling stays single-digit (string-concat allocation).
 [ "$MAX_METAGRAPH_NODES" -gt 9 ] && MAX_METAGRAPH_NODES=9
-export MAX_NODES MAX_HG_NODES MAX_METAGRAPH_NODES
+# MAX_NODES is the unified directory-creation ceiling; bound it by the HG ceiling.
+[ "$MAX_NODES" -gt "$NAKAMOTO_MAX_HG_NODES" ] && MAX_NODES=$NAKAMOTO_MAX_HG_NODES
+export MAX_NODES MAX_HG_NODES MAX_METAGRAPH_NODES HG_IP_SAFE_MAX
 
 # Layer URLs: explicit overrides take priority, otherwise built from TEST_HOST + port prefix
-# When using a remote host, GL1 defaults to port 9010 instead of 9100
+# When using a remote host, GL1 defaults to port 9010 instead of the local band.
+# Locally, gl1's EXTERNAL host port for node 0 is GL1_EXT_PORT_BASE (9600) — the
+# gl1 container's internal port stays in the DAG_L1_PORT_PREFIX (9100) band, but
+# the host reaches it via the lifted external port. This is the single source of
+# truth shared with docker-env-setup.sh and the JS test client.
 if [ "$TEST_HOST" != "http://localhost" ]; then
   GL1_DEFAULT_PORT=9010
 else
-  GL1_DEFAULT_PORT="${DAG_L1_PORT_PREFIX}00"
+  GL1_DEFAULT_PORT="${GL1_EXT_PORT_BASE}"
 fi
 export GL0_URL=${GL0_URL:-"${TEST_HOST}:${DAG_L0_PORT_PREFIX}00"}
 export GL1_URL=${GL1_URL:-"${TEST_HOST}:${GL1_DEFAULT_PORT}"}

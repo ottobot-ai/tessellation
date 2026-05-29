@@ -20,10 +20,11 @@ import io.constellationnetwork.node.shared.domain.cluster.storage.L0ClusterStora
 import io.constellationnetwork.node.shared.domain.snapshot.Validator.isNextSnapshot
 import io.constellationnetwork.node.shared.domain.snapshot.storage.LastSnapshotStorage
 import io.constellationnetwork.node.shared.http.p2p.PeerResponse
-import io.constellationnetwork.node.shared.http.p2p.clients.L0GlobalSnapshotClient
+import io.constellationnetwork.node.shared.http.p2p.clients.{GlobalFollowClient, L0GlobalSnapshotClient}
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.nakamoto.follow.GlobalFollowSliceResponse
 import io.constellationnetwork.schema.peer.{L0Peer, PeerId}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -68,6 +69,20 @@ trait GlobalL0Service[F[_]] {
     lastOrdinal: SnapshotOrdinal,
     finalizedOrdinal: SnapshotOrdinal
   ): F[List[Hashed[GlobalIncrementalSnapshot]]]
+
+  /** Fetch the latest-finalized consumed-field slice from a random GL0 peer (`GET /global-follow/slice/latest`).
+    *
+    * The gl1 own-slice follow path (Axis 2 — see `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`) uses this to obtain gl0's claimed
+    * Address-keyed slice (`balances`, `lastTxRefs`, `lastAllowSpendRefs`, `lastTokenLockRefs`) at the latest finalized global ordinal,
+    * which a follower then recompute-matches against the matching signed snapshot's `stateProof.<field>Proof` roots
+    * ([[io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowMirrorVerifier]]). The slice carries its OWN ordinal, so the
+    * verifier anchors against the snapshot AT that ordinal — never a cross-ordinal mismatch.
+    *
+    * Returns `None` when no [[GlobalFollowClient]] is wired (the cl0/cl1 callers that don't follow this path) or the peer has no finalized
+    * ordinal yet / the request fails. The caller (`DAGSnapshotProcessor.applyGlobalSnapshotFn`) treats `None` as "do not advance, retry
+    * next tick" — there is no `StateProofMismatch`-style recovery storm.
+    */
+  def getLatestFollowSlice: F[Option[GlobalFollowSliceResponse]]
 }
 
 object GlobalL0Service {
@@ -84,7 +99,10 @@ object GlobalL0Service {
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     singlePullLimit: Option[PosLong],
     maybeMajorityPeerIdSet: Option[NonEmptySet[PeerId]],
-    mptStore: MptStore[F, GlobalStateKey]
+    mptStore: MptStore[F, GlobalStateKey],
+    // gl1 own-slice follow transport (Axis 2). Optional so the cl0/cl1 callers that don't follow this
+    // path keep their existing wiring; gl1's Main wires `Some(GlobalFollowClient.make(client))`.
+    maybeGlobalFollowClient: Option[GlobalFollowClient[F]] = None
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
@@ -127,6 +145,21 @@ object GlobalL0Service {
           l0GlobalSnapshotClient.getLatestFinalizedOrdinal.run(peer).map(_.some)
         }.handleErrorWith { e =>
           logger.warn(e)(s"Failure pulling latest finalized ordinal").as(none)
+        }
+
+      def getLatestFollowSlice: F[Option[GlobalFollowSliceResponse]] =
+        maybeGlobalFollowClient match {
+          case None                     => none[GlobalFollowSliceResponse].pure[F]
+          case Some(globalFollowClient) =>
+            // gl0 serves the slice on the PUBLIC port — the same port the L0Peer already targets — so we resolve a random
+            // L0 cluster peer and run the PeerResponse against it, exactly like `pullLatestFinalizedOrdinal` above
+            // (`L0Peer <: P2PContext`). Errors (peer down, 503 before any finalized ordinal) → None so the caller idles
+            // and retries next tick (no recovery storm).
+            globalL0ClusterStorage.getRandomPeer.flatMap { peer =>
+              globalFollowClient.getLatestSlice.run(peer).map(_.some)
+            }.handleErrorWith { e =>
+              logger.warn(e)(s"Failure pulling latest follow slice").as(none)
+            }
         }
 
       def pullGlobalSnapshots: F[Either[LatestSnapshotTuple, List[Hashed[GlobalIncrementalSnapshot]]]] =

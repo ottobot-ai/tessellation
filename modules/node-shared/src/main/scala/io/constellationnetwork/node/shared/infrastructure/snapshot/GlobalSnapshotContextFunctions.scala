@@ -225,6 +225,13 @@ object GlobalSnapshotContextFunctions {
               // the same parent view the proposer constructed against. Phase D (Passthrough) ignores
               // the BranchId on every read/write — the byte-parity contract from #107 covers the rewire.
               io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(lastArtifactHash),
+              // CHANGE 5 (split-safety) — thread the leader's embedded `shardCheckpoints` into the follower's
+              // adopt path. At `numShards > 1` GSAM runs the DETERMINISTIC `verifyEmbedded` over these and adopts
+              // the accepted ones into the committed state — byte-identically to what the gl0 leader/peer computed
+              // (the leader already filtered them to the accepted subset). Without this the follower would chain-link
+              // the sharded MGs' binaries (extracted from `stateChannelSnapshots`) and diverge. Empty at numShards=1
+              // (the artifact carries an empty map) ⇒ byte-identical to today.
+              shardCheckpoints = signedArtifact.shardCheckpoints,
               // #259 — verifier-replay eta adoption. This is the follower/verifier path: adopt gl0's
               // authoritative per-period eta from the incoming artifact's `eta` wire field for the
               // `historicalStakeSnapshots` boundary entry, instead of recomputing it (which the follower

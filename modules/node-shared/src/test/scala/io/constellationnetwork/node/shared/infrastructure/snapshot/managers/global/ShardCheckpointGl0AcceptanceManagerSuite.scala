@@ -568,6 +568,173 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   }
 
   // ============================================================================
+  // verifyEmbedded — DETERMINISTIC adopt-verifier (the split-safety contract)
+  // ============================================================================
+
+  /** The load-bearing determinism test: `verifyEmbedded` MUST return the SAME result under TWO DIFFERENT node-local `finalityTriggers`
+    * states. This proves it reads NO node-local input (no triggers, no shard tip) — the property the whole symmetric-adopt design rests on.
+    * Node A's triggers qualify the checkpoint's ord (T_count fires); node B's triggers never qualify (short chain, huge kTarget, zero
+    * attestations). `verifyEmbedded` ignores both and decides purely from the committee-quorum count, so both nodes return `Accepted`.
+    */
+  test("verifyEmbedded determinism: SAME result under two DIFFERENT finalityTriggers states (no node-local dependency)") { res =>
+    implicit val (h, sp, _) = res
+    for {
+      (signerKp, signerPeer) <- mkSigner
+      (_, selfPeerA) <- mkSigner
+      (_, selfPeerB) <- mkSigner
+
+      mg = Address.fromBytes("mg-det".getBytes("UTF-8"))
+      mptRoot = Hash("11" * 32)
+      binary = mkSignedBinary("binary-content".getBytes("UTF-8"))
+      delta = mkDelta(mg, mptRoot, binary)
+      shell = mkCheckpointShell(shardOrd = 1L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer)
+      validSig <- mkValidSig(shell, signerKp, signerPeer)
+      checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
+
+      // committee size = 1 ⇒ threshold = ceil(2/3) = 1; the single valid signer meets quorum ⇒ Accepted, regardless of triggers.
+
+      // Node A: triggers FULLY qualify the checkpoint ord (T_count fires, deep chain).
+      (storeA, _) <- mkFinalityTriggers(kTarget = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeerA)
+      tipA <- storeA.bestTip.map(_.get)
+      trackerA <- ShardTipTracker.make[IO](shardZero, selfPeerA)
+      _ <- trackerA.recordAttestation(tipA.hash, signerPeer)
+      triggersA <- ShardFinalityTriggers.make[IO](shardZero, kTarget = 1, k1Shard = 1L, storeA, trackerA)
+      _ <- triggersA.advance
+
+      // Node B: triggers NEVER qualify (short chain, huge kTarget, no attestations) — neither T_count nor T_depth1.
+      (_, triggersB) <- mkFinalityTriggers(kTarget = 1000, k1Shard = 1000L, chainLength = 2, selfId = selfPeerB)
+
+      mgrA <- mkManager(
+        finalityTriggers = Map(shardZero -> triggersA),
+        committeeMembership = Set(signerPeer),
+        selfId = selfPeerA
+      )
+      mgrB <- mkManager(
+        finalityTriggers = Map(shardZero -> triggersB),
+        committeeMembership = Set(signerPeer),
+        selfId = selfPeerB
+      )
+      resultA <- mgrA.verifyEmbedded(checkpoint)
+      resultB <- mgrB.verifyEmbedded(checkpoint)
+    } yield
+      expect.same(ShardCheckpointAcceptResult.Accepted, resultA) &&
+        expect.same(ShardCheckpointAcceptResult.Accepted, resultB) &&
+        expect.same(resultA, resultB) // the determinism assertion: byte-identical outcome on two different-trigger nodes
+  }
+
+  test("verifyEmbedded: quorum met (distinctSigners >= ceil(2*kS/3)) → Accepted") { res =>
+    implicit val (h, sp, _) = res
+    for {
+      (kp1, p1) <- mkSigner
+      (kp2, p2) <- mkSigner
+      (kp3, p3) <- mkSigner
+      (_, selfPeer) <- mkSigner
+
+      mg = Address.fromBytes("mg-quorum".getBytes("UTF-8"))
+      binary = mkSignedBinary("c".getBytes("UTF-8"))
+      delta = mkDelta(mg, Hash("11" * 32), binary)
+      shell = mkCheckpointShell(shardOrd = 1L, gl0Anchor = 100L, delta = delta, placeholderPeerId = p1)
+      sig1 <- mkValidSig(shell, kp1, p1)
+      sig2 <- mkValidSig(shell, kp2, p2)
+      sig3 <- mkValidSig(shell, kp3, p3)
+      // committee size 4 ⇒ threshold = ceil(8/3) = 3; 3 distinct valid signers meet quorum ⇒ Accepted (re-exec never runs).
+      (_, anyTriggers) <- mkFinalityTriggers(kTarget = 1, k1Shard = 1L, chainLength = 3, selfId = selfPeer)
+      reExecCalledRef <- cats.effect.Ref.of[IO, Boolean](false)
+      reExecCb = (
+        (
+          _: Address,
+          _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+          _: SnapshotOrdinal
+        ) => reExecCalledRef.set(true).as(Hash("ff" * 32))
+      ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[
+        Hash
+      ]
+      checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig1, sig2, sig3))
+      mgr <- mkManager(
+        finalityTriggers = Map(shardZero -> anyTriggers),
+        committeeMembership = Set(p1, p2, p3, selfPeer),
+        selfId = selfPeer,
+        reExecuteDerivation = reExecCb
+      )
+      result <- mgr.verifyEmbedded(checkpoint)
+      reExecCalled <- reExecCalledRef.get
+    } yield expect.same(ShardCheckpointAcceptResult.Accepted, result) && expect(!reExecCalled)
+  }
+
+  test("verifyEmbedded: sub-quorum → deterministic re-exec failover (fail-closed stub → mismatch), trigger-independent") { res =>
+    implicit val (h, sp, _) = res
+    for {
+      (kp1, p1) <- mkSigner
+      (_, selfPeerA) <- mkSigner
+      (_, selfPeerB) <- mkSigner
+
+      mg = Address.fromBytes("mg-subquorum".getBytes("UTF-8"))
+      mptRoot = Hash("11" * 32)
+      binary = mkSignedBinary("c".getBytes("UTF-8"))
+      delta = mkDelta(mg, mptRoot, binary)
+      shell = mkCheckpointShell(shardOrd = 1L, gl0Anchor = 100L, delta = delta, placeholderPeerId = p1)
+      sig1 <- mkValidSig(shell, kp1, p1)
+      // committee size 4 ⇒ threshold = 3; only 1 valid signer ⇒ sub-quorum ⇒ re-exec failover.
+      checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig1))
+
+      // re-exec returns a WRONG root vs the delta's claimed root ⇒ RejectedReExecutionMismatch, deterministically.
+      reExecWrong = ((_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal) => IO.pure(Hash("ff" * 32))): (
+        Address,
+        NonEmptyList[Signed[StateChannelSnapshotBinary]],
+        SnapshotOrdinal
+      ) => IO[Hash]
+
+      // Two different trigger states again — the re-exec failover must also be node-local-independent.
+      (_, triggersA) <- mkFinalityTriggers(kTarget = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeerA)
+      (_, triggersB) <- mkFinalityTriggers(kTarget = 1000, k1Shard = 1000L, chainLength = 2, selfId = selfPeerB)
+      mgrA <- mkManager(
+        finalityTriggers = Map(shardZero -> triggersA),
+        committeeMembership = Set(p1) ++ (1 to 3).map(i => PeerId(Hex(f"$i%02x" * 64))).toSet,
+        selfId = selfPeerA,
+        reExecuteDerivation = reExecWrong
+      )
+      mgrB <- mkManager(
+        finalityTriggers = Map(shardZero -> triggersB),
+        committeeMembership = Set(p1) ++ (1 to 3).map(i => PeerId(Hex(f"$i%02x" * 64))).toSet,
+        selfId = selfPeerB,
+        reExecuteDerivation = reExecWrong
+      )
+      resultA <- mgrA.verifyEmbedded(checkpoint)
+      resultB <- mgrB.verifyEmbedded(checkpoint)
+    } yield {
+      val isMismatch: ShardCheckpointAcceptResult => Boolean = {
+        case _: ShardCheckpointAcceptResult.RejectedReExecutionMismatch => true
+        case _                                                          => false
+      }
+      expect(isMismatch(resultA)) && expect(isMismatch(resultB)) && expect.same(resultA, resultB)
+    }
+  }
+
+  test("verifyEmbedded: pre-check fail (signer not in committee) → Rejected (deterministic)") { res =>
+    implicit val (h, sp, _) = res
+    for {
+      (kp, p) <- mkSigner
+      (_, selfPeer) <- mkSigner
+      mg = Address.fromBytes("mg-precheck".getBytes("UTF-8"))
+      delta = mkDelta(mg, Hash("11" * 32), mkSignedBinary("c".getBytes("UTF-8")))
+      shell = mkCheckpointShell(shardOrd = 1L, gl0Anchor = 100L, delta = delta, placeholderPeerId = p)
+      sig <- mkValidSig(shell, kp, p)
+      checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig))
+      (_, triggers) <- mkFinalityTriggers(kTarget = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeer)
+      mgr <- mkManager(
+        finalityTriggers = Map(shardZero -> triggers),
+        committeeMembership = Set.empty[PeerId], // signer not in committee ⇒ pre-check rejects before quorum
+        selfId = selfPeer
+      )
+      result <- mgr.verifyEmbedded(checkpoint)
+    } yield
+      result match {
+        case ShardCheckpointAcceptResult.Rejected(reason) => expect(reason.contains("not in committee"))
+        case other                                        => failure(s"Expected Rejected(not in committee), got $other")
+      }
+  }
+
+  // ============================================================================
   // Sanity: signed-checkpoint helper round-trips (kept to confirm fixture builds work)
   // ============================================================================
 

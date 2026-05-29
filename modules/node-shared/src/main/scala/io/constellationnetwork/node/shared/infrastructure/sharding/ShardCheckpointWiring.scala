@@ -5,13 +5,14 @@ import cats.effect.kernel.Async
 import cats.syntax.all._
 
 import io.constellationnetwork.node.shared.config.types.ShardingConfig
-import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardFinalityTriggers, ShardTipTracker}
-import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, ShardAssignment, VrfRegistry}
+import io.constellationnetwork.node.shared.domain.nakamoto._
+import io.constellationnetwork.node.shared.domain.nakamoto.sharding._
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
   GlobalSnapshotStateChannelEventsProcessor,
   ShardCheckpointGl0AcceptanceManager
 }
+import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
@@ -44,17 +45,18 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * manager's `finalityTriggers` / `chainStore` callbacks are simple `Map.get` lookups against this registry — `None` ⇒ "shard not tracked
   * locally" ⇒ reject, exactly as the manager's scaladoc specifies.
   *
-  * '''committeeMembership(shardId, epoch) — v1 simplification.''' The acceptance manager's pre-check confirms each checkpoint signer is in
-  * `committeeMembership(shardId, epoch)`. The authoritative per-`(shard, epoch)` committee draw is a VRF sortition over each operator's VRF
-  * VK — but v1 has no cluster-wide VRF-VK registry (only the [[KesRegistry]] exists; see the manager's `verifyVrfStructural` scaladoc and
-  * `[[project-cross-shard-cq-collapse-bound]]`). So for v1 the membership predicate returns the full active validator set: "a peer may be
-  * in shard S's committee iff it's a known gl0 operator". This is sound at the admission layer because the manager STILL authenticates
-  * every signer cryptographically — Ed25519 over the canonical preimage (recovered VK from the PeerId) + KES product sig (registry
-  * carve-out for the bootstrap window) + a structural VRF-proof check. The set-membership predicate only gates "is this peer even an
-  * operator"; the crypto gates "did this specific peer actually sign". Replacing the full-set predicate with a real VRF-enumerated draw is
-  * the v2 follow-up (needs the VRF-VK registry + `CommitteeSortition.verifyMembership` per peer — mirrors `MetagraphCommitteeGate`'s
-  * receiver path, which verifies a single arriving attestation rather than enumerating the whole committee). Until then the
-  * structural+crypto checks carry the admission safety bar.
+  * '''committeeMembership(shardId, epoch) — real VRF-VK sortition.''' The acceptance manager's pre-check confirms each checkpoint signer is
+  * in `committeeMembership(shardId, epoch)`, and `verifyEmbedded` uses `kS = |committeeMembership(shardId, epoch)|` as the quorum
+  * denominator. [[committeeFor]] materializes that committee as a DETERMINISTIC VRF-VK-sortitioned SUBSET of the active operator set (size
+  * `≈ committeeKTarget`, NOT the full `N`) — so only a metagraph's shard committee re-executes it (genuine execution segmentation). The
+  * draw is a deterministic pseudo-random sortition keyed on each operator's registered VRF *VK* + the epoch eta + the shardId (see
+  * [[committeeFor]] scaladoc for the determinism argument and `CommitteeSortition.isInShardCommittee` for why a VK-seeded PRF, not a true
+  * per-operator VRF eval, is the only enumerable-by-a-non-member option). The structural VRF-proof check + Ed25519 + KES product sig per
+  * signer still authenticate "did this specific peer sign"; the sortitioned set gates "is this peer even in shard S's committee". v1
+  * trade-off (acceptable per design §10 — honest-testnet, slashing is the v2 backstop): the committee is PREDICTABLE because VKs are
+  * public; Algorand player-replaceability is a v2 hardening (would require carrying a true per-operator VRF proof on each
+  * `CommitteeMemberSignature` and verifying it with `CommitteeSortition.verifyMembership`, plus the producer/emitter signing a
+  * committee-VRF proof rather than the leader-VRF proof they sign today).
   *
   * '''reExecuteDerivation — caller-supplied (S3: real committee re-execution).''' The `T_depth1_shard` degraded path re-runs each MG's
   * derivation and compares the recomputed `mptRoot` byte-for-byte against the committee-signed value. The closure is supplied as a
@@ -68,11 +70,19 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   */
 object ShardCheckpointWiring {
 
-  /** The per-shard consumer-side state bundle for one shard. Held in the registry the acceptance manager's lookups close over. */
+  /** The per-shard consumer-side state bundle for one shard. Held in the registry the acceptance manager's lookups close over.
+    *
+    * '''binaryBuffer (EXECUTION-SHARDING R-1 — the inversion intake).''' The per-shard raw-binary accumulator. The daemon's gossip-handler
+    * buffers each received metagraph binary for ITS shard here; the producer-fan-out reads `binaryBuffer.snapshotPending` from the SAME
+    * instance. This is what decouples shard-checkpoint production from gl0's post-chain-link `stateChannelSnapshots` map (see
+    * [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer]] for the determinism model — leader-proposes /
+    * members-attest, so node-local selection is fine).
+    */
   final case class ShardRegistryEntry[F[_]](
     chainStore: ShardChainStore[F],
     tipTracker: ShardTipTracker[F],
-    finalityTriggers: ShardFinalityTriggers[F]
+    finalityTriggers: ShardFinalityTriggers[F],
+    binaryBuffer: ShardBinaryBuffer[F]
   )
 
   /** The acceptance-side sharding dependencies, returned as the exact `Option`-tuple the two GSAM call sites forward into
@@ -87,7 +97,13 @@ object ShardCheckpointWiring {
     shardingConfig: ShardingConfig,
     acceptanceManager: ShardCheckpointGl0AcceptanceManager[F],
     shardAssignment: ShardAssignment[F],
-    registry: Map[ShardId, ShardRegistryEntry[F]]
+    registry: Map[ShardId, ShardRegistryEntry[F]],
+    /** The SAME deterministic `committeeFor(shardId, epoch)` draw the acceptance manager's pre-check / quorum uses. Exposed so the
+      * produce/attest gates (`ShardCheckpointFanOut`, the `ShardCheckpointAttestationEmitter` call site) reuse the IDENTICAL committee set:
+      * a node produces/attests for shard `s` only when it is in `committeeMembership(s, epoch)`. Routing both the gate and the verifier
+      * through one closure keeps "who is in the committee" defined in exactly one place.
+      */
+    committeeMembership: (ShardId, EtaPeriod) => F[Set[PeerId]]
   )
 
   /** Fail-closed fallback for the `T_depth1_shard` re-exec derivation. Returns a fixed sentinel hash for every `(metagraphAddress,
@@ -102,9 +118,9 @@ object ShardCheckpointWiring {
     *   - For a non-empty-window checkpoint the sentinel will (almost surely) NOT equal the real committed root, so the manager returns
     *     `RejectedReExecutionMismatch`. The checkpoint is DROPPED (fail-closed) — the binaries do NOT enter the gl0 snapshot. This is the
     *     conservative outcome: a degraded shard's non-quorum checkpoint is rejected rather than admitted on an unverified derivation. It
-    *     does NOT cause a false slash: `GlobalSnapshotAcceptanceManager.processShardCheckpoints` only LOGS the rejected-mismatch signer
-    *     list (the slash penalty is a separate slice, S2.0). So the worst case is "degraded-shard non-quorum checkpoints are not admitted
-    *     until quorum returns", never "honest signers slashed".
+    *     does NOT cause a false slash: `GlobalSnapshotAcceptanceManager.adoptShardCheckpoints` only LOGS the rejected-mismatch signer list
+    *     (the slash penalty is a separate slice, S2.0). So the worst case is "degraded-shard non-quorum checkpoints are not admitted until
+    *     quorum returns", never "honest signers slashed".
     */
   def noReExecDerivation[F[_]: Async]: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash] =
     (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal) => Async[F].pure(Hash.empty)
@@ -148,13 +164,19 @@ object ShardCheckpointWiring {
     *   registered KES master VKs. Used by the acceptance manager's per-signer KES product-sig verification (registry-absent carve-out for
     *   the bootstrap window).
     * @param vrfRegistry
-    *   registered per-operator VRF verification keys (Slice S1). Threaded as an AVAILABLE dependency so a later slice (S2) can swap the
-    *   full-set `committeeMembership` predicate for a real per-signer `CommitteeSortition.verifyShardMembership(vrfVk, …)`. As of S1 it is
-    *   NOT consumed — `committeeFor` still returns the full active validator set, so behavior is byte-identical at every `numShards`.
+    *   registered per-operator VRF verification keys. CONSUMED by [[committeeFor]] — each operator's registered VK is the per-operator seed
+    *   for the deterministic shard-committee draw. MUST be the genesis/seedlist-loaded registry (identical cluster-wide) on EVERY path that
+    *   runs `verifyEmbedded` (produce + validateArtifact + the follower createContext), or the committee — and thus the adopt decision —
+    *   diverges and the cluster splits (#261). An operator absent from the registry is never sortitioned into any committee.
     * @param activeValidators
-    *   callback returning the current active gl0 validator set. Used by the v1 `committeeMembership` predicate (full-set membership — see
-    *   the object scaladoc). Read on every checkpoint pre-check so a validator-set change (registration/slashing) is observed without
-    *   reconstruction.
+    *   callback returning the current active gl0 validator set — the candidate pool [[committeeFor]] sortitions over (also fixes `σ =
+    *   1/N`). Read on every checkpoint pre-check so a validator-set change (registration/slashing) is observed without reconstruction. MUST
+    *   be identical cluster-wide (seedlist minus `metagraph-op`).
+    * @param etaForEpoch
+    *   resolves the 32 raw eta-randomness bytes for a given eta-period — the SAME `EtaStateManager.getEta`-backed resolver the GSAM
+    *   boundary writer uses (returns a hex [[Hash]] at the call site; decode to 32 bytes via `Hex(h.value).toBytes`). Feeds
+    *   [[committeeFor]] keyed on the wire-carried `checkpoint.epoch`, so producer + every verifier draw the SAME committee for the SAME
+    *   epoch even across an eta boundary. MPT-committed ⇒ byte-identical cluster-wide.
     * @param reExecuteDerivation
     *   the `T_depth1_shard` re-exec derivation closure `(metagraphAddress, includedChain) => F[Hash]`. `Some(...)` (S3 wiring) ⇒ the real
     *   `GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot` closure — committee re-execution that recomputes the per-MG root and
@@ -169,15 +191,12 @@ object ShardCheckpointWiring {
     kesRegistry: KesRegistry[F],
     vrfRegistry: VrfRegistry[F],
     activeValidators: F[Set[PeerId]],
+    etaForEpoch: EtaPeriod => F[Array[Byte]],
     reExecuteDerivation: Option[(Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash]] = None
   ): F[Option[AcceptanceDeps[F]]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointWiring")
     val reExec: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash] =
       reExecuteDerivation.getOrElse(noReExecDerivation[F])
-    // Slice S1: the VRF-VK registry is plumbed through but not yet consumed — `committeeFor` still returns the
-    // full active validator set (see object scaladoc). Bound here so the param is wired end-to-end ahead of the
-    // S2 swap to `CommitteeSortition.verifyShardMembership`. Referenced to keep the unused-param warning silent.
-    val _ = vrfRegistry
 
     if (cfg.numShards <= 1)
       // Regression bar: at the production default `numShards = 1`, construct NOTHING and return None. The two GSAM call sites then pass
@@ -188,7 +207,11 @@ object ShardCheckpointWiring {
     else
       for {
         registry <- buildRegistry[F](cfg, selfPeerId)
-        committeeMembership = (shardId: ShardId, epoch: EtaPeriod) => committeeFor[F](shardId, epoch, activeValidators)
+        // EXECUTION-SHARDING — real VRF-VK-sortitioned committee. The ONE closure that defines "who is in shard s's committee
+        // for this epoch", reused by (a) the acceptance manager's per-signer set-membership pre-check + `kS` quorum denominator,
+        // and (b) the produce/attest membership gates. Deterministic on every node — see `committeeFor` scaladoc.
+        committeeMembership = (shardId: ShardId, epoch: EtaPeriod) =>
+          committeeFor[F](shardId, epoch, activeValidators, vrfRegistry, etaForEpoch, cfg.committeeKTarget)
         acceptanceManager <- ShardCheckpointGl0AcceptanceManager.make[F](
           finalityTriggers = (sid: ShardId) => Async[F].pure(registry.get(sid).map(_.finalityTriggers)),
           chainStore = (sid: ShardId) => Async[F].pure(registry.get(sid).map(_.chainStore)),
@@ -201,9 +224,10 @@ object ShardCheckpointWiring {
         shardAssignment = ShardAssignment.make[F](cfg.numShards)
         _ <- logger.info(
           s"sharding ACTIVE: numShards=${cfg.numShards} committeeKTarget=${cfg.committeeKTarget} " +
-            s"k1Shard=${cfg.finality.k1Shard} — built per-shard registry (${registry.size} shards) + gl0 acceptance manager"
+            s"k1Shard=${cfg.finality.k1Shard} — built per-shard registry (${registry.size} shards) + gl0 acceptance manager " +
+            s"(real VRF-VK committee sortition)"
         )
-      } yield Some(AcceptanceDeps(cfg, acceptanceManager, shardAssignment, registry))
+      } yield Some(AcceptanceDeps(cfg, acceptanceManager, shardAssignment, registry, committeeMembership))
   }
 
   /** Construct the per-shard `(ShardChainStore, ShardTipTracker, ShardFinalityTriggers)` registry for shards `0 .. numShards - 1`.
@@ -229,21 +253,63 @@ object ShardCheckpointWiring {
           chainStore = chainStore,
           tipTracker = tipTracker
         )
-      } yield shardId -> ShardRegistryEntry(chainStore, tipTracker, triggers)
+        // R-1: the per-shard raw-binary accumulator. The SAME instance feeds the gossip-intake (daemon) and the producer-fan-out — that
+        // shared instance IS the inversion: the producer reads buffered binaries here instead of gl0's post-chain-link map.
+        binaryBuffer <- ShardBinaryBuffer.make[F](shardId, cap = cfg.checkpoint.binaryBufferCap)
+      } yield shardId -> ShardRegistryEntry(chainStore, tipTracker, triggers, binaryBuffer)
     }
       .map(_.toMap)
 
-  /** v1 `committeeMembership(shardId, epoch)` — returns the full active validator set (see object scaladoc for the safety rationale and the
-    * v2 VRF-enumeration follow-up). `shardId` / `epoch` are accepted to satisfy the manager's callback shape and to leave a single
-    * touch-point for the v2 swap; v1 ignores them because the membership predicate is "is this peer an operator", not "did this peer win
-    * shard S's VRF draw for this epoch".
+  /** Real VRF-VK-sortitioned `committeeFor(shardId, epoch)` — the deterministic committee SET for one `(shard, epoch)`.
+    *
+    * '''Algorithm.''' Enumerate the active operators in a STABLE order (sorted by `PeerId`, so iteration is order-independent); for each
+    * operator look up its registered VRF VK in `vrfRegistry` and keep it iff `CommitteeSortition.isInShardCommittee(vrfVk, eta, shardId,
+    * epoch, σ, kTarget)` — i.e. its `H(eta, shardId, epoch, vrfVk)` draw value falls below `threshold(kTarget, σ)`. An operator with NO
+    * registered VK cannot be sortitioned (no seed) ⇒ excluded. `σ` (per-operator stake share) is the uniform `1/N` rule (`committeeStake`,
+    * `[[project-216-committee-stake-drift-fix]]`), computed here from `N = |activeValidators|` so `threshold = kTarget/N` and the expected
+    * committee size is `≈ kTarget` — the sortitioned committee `K_S`, NOT the full set `N`.
+    *
+    * '''Determinism (the #261 split invariant).''' Every input is identical on every gl0 node:
+    *   - `activeValidators` — seedlist (minus `metagraph-op`), loaded identically cluster-wide;
+    *   - each operator's VRF VK — from `L0GenesisData.operators[].vrfPublicKey` (or the runtime registration cert), the SAME genesis bytes
+    *     on every node (`VrfRegistry`/`L0GenesisLoader.buildVrfRegistry`);
+    *   - `eta` — `etaForEpoch(epoch)` resolves the per-period eta from the MPT-committed `HistoricalStakeSnapshot.eta` (`EtaStateManager`),
+    *     byte-identical cluster-wide once the boundary is written, keyed on the WIRE-CARRIED `checkpoint.epoch`;
+    *   - `kTarget` — HOCON `nakamoto.sharding.committee-k-target`, the same on every node;
+    *   - `σ = 1/N` — derived from the same `activeValidators`. No node-local state (no chain height, no Refs, no wall-clock) enters the
+    *     draw, so `committeeFor(shardId, epoch)` resolves to the SAME `Set[PeerId]` on every node — the hard requirement for
+    *     `verifyEmbedded` to admit byte-identically.
+    *
+    * The result is returned as a sorted-order traversal collapsed into a `Set` (membership + size are all the callers need); the traversal
+    * order does not affect the resulting set.
     */
-  private[sharding] def committeeFor[F[_]](
+  private[sharding] def committeeFor[F[_]: Async: Hasher](
     shardId: ShardId,
     epoch: EtaPeriod,
-    activeValidators: F[Set[PeerId]]
-  ): F[Set[PeerId]] = {
-    val _ = (shardId, epoch) // referenced to keep the unused-warning silent; v2 enumerates per (shard, epoch).
-    activeValidators
-  }
+    activeValidators: F[Set[PeerId]],
+    vrfRegistry: VrfRegistry[F],
+    etaForEpoch: EtaPeriod => F[Array[Byte]],
+    kTarget: Int
+  ): F[Set[PeerId]] =
+    (activeValidators, etaForEpoch(epoch)).tupled.flatMap {
+      case (validators, eta) =>
+        val n = validators.size
+        if (n <= 0) Async[F].pure(Set.empty[PeerId])
+        else {
+          val sigma = Ratio(1, n) // uniform per-operator stake share (committeeStake): threshold = kTarget/N ⇒ E[|committee|] ≈ kTarget
+          // Stable iteration order (sorted by PeerId) so the fold is order-independent; the result is a Set so order is moot anyway.
+          validators.toList
+            .sortBy(_.value.value)
+            .traverse { peerId =>
+              vrfRegistry.getVrfVk(peerId).flatMap {
+                case None => Async[F].pure(Option.empty[PeerId]) // no registered VRF VK ⇒ not sortitionable ⇒ excluded
+                case Some(vrfVk) =>
+                  CommitteeSortition
+                    .isInShardCommittee[F](vrfVk, eta, shardId, epoch, sigma, kTarget)
+                    .map(if (_) Some(peerId) else None)
+              }
+            }
+            .map(_.flatten.toSet)
+        }
+    }
 }

@@ -245,36 +245,60 @@ class GlobalSnapshotAlignment[F[
       }
   }
 
+  // gl1 inclusion-proof follow DEADLOCK FIX (#287-adjacent): register the pulled FINALIZED batch into the by-ordinal lastN
+  // index BEFORE the per-ordinal walk. gl1's GSI comes from gl0's LATEST-finalized slice (ordinal M = the batch tip), but
+  // `DAGSnapshotProcessor.applyGlobalSnapshotFn` resolves M's signed `stateProof` from the LOCAL lastN window via
+  // `getByOrdinal(M)`, and the per-ordinal `setLastNSnapshots` only advances that window AFTER a successful apply. So while
+  // processing the FIRST ordinal of the batch, `getByOrdinal(M)` was `None` → the slice verify deferred forever → the batch
+  // halted → the window never advanced → permanent deadlock (the 102-defer / 0-Verified gl1-formation symptom). Populating the
+  // index up-front from the already-pulled, chain-link-verified, finality-gated batch lets `getByOrdinal(M)` resolve so the
+  // verify succeeds and the walk advances. This touches ONLY the by-ordinal index that `getByOrdinal` (the slice verify) reads —
+  // it does NOT advance the chain pointer (`lastGlobalSnapshot`) nor the `(snapshot, state)` combined window (`getLastN`,
+  // currency-only); those still advance per-ordinal post-apply via `setLastNSnapshots`. `set` re-registering the same ordinals
+  // post-apply is idempotent-by-ordinal (a plain map upsert). Finality-gating (#122) is preserved: the batch is finalized.
   private def performSnapshotsBatchProcessing(
     snapshots: List[Hashed[GlobalIncrementalSnapshot]]
   )(
     implicit stateProofSelector: StateProofSelector
   ): F[List[SnapshotProcessingResult]] =
-    (snapshots, List.empty[SnapshotProcessingResult]).tailRecM {
-      case (snapshot :: nextSnapshots, aggResults) =>
-        HasherSelector[F].withCurrent { implicit hasher =>
-          programs.snapshotProcessor
-            .process(snapshot.asRight[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)])
-        }
-          .map(result => (nextSnapshots, aggResults :+ result).asLeft[List[SnapshotProcessingResult]])
-          .handleErrorWith {
-            case e: io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalSnapshotContextFunctions.StateProofMismatch =>
-              recoverFromOrphan(snapshot, e)
-                .as((nextSnapshots, aggResults).asLeft[List[SnapshotProcessingResult]])
-            case e =>
-              val message = s"Failed to process snapshot ${SnapshotReference.fromHashedSnapshot(snapshot).show}, skipping"
-              for {
-                _ <- storages.globalL0Alignment.updateShouldRedownload(
-                  value = true,
-                  reasons = List(message)
-                )
-                _ <- logger.error(e)(message)
-              } yield (nextSnapshots, aggResults).asLeft[List[SnapshotProcessingResult]]
+    sharedStorages.lastNGlobalSnapshot.registerFinalized(snapshots) >>
+      (snapshots, List.empty[SnapshotProcessingResult]).tailRecM {
+        case (snapshot :: nextSnapshots, aggResults) =>
+          HasherSelector[F].withCurrent { implicit hasher =>
+            programs.snapshotProcessor
+              .process(snapshot.asRight[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)])
           }
+            .map(result => (nextSnapshots, aggResults :+ result).asLeft[List[SnapshotProcessingResult]])
+            .handleErrorWith {
+              case e: io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalSnapshotContextFunctions.StateProofMismatch =>
+                recoverFromOrphan(snapshot, e)
+                  .as((nextSnapshots, aggResults).asLeft[List[SnapshotProcessingResult]])
+              case e: io.constellationnetwork.dag.l1.domain.snapshot.programs.DAGSnapshotProcessor.FollowSliceVerificationError =>
+                // gl1 own-slice follow CUTOVER (S3b′): the follow slice is unavailable or failed to verify against the
+                // trusted signed roots. Do NOT advance, do NOT set shouldRedownload (no recovery storm — distinct from the
+                // StateProofMismatch path above). Just log + stop this batch; gl1 retries on the next 10s tick. The chain
+                // pointer (`lastGlobalSnapshot`) is untouched because `lastSnapshotStorage.set` only runs after a successful
+                // `applySnapshotFn` in `processAlignment`.
+                logger
+                  .info(
+                    s"Follow-slice not ready / verify deferred at ${SnapshotReference.fromHashedSnapshot(snapshot).show}: " +
+                      s"${e.getMessage} — not advancing, will retry next tick"
+                  )
+                  .as(aggResults.asRight[(List[Hashed[GlobalIncrementalSnapshot]], List[SnapshotProcessingResult])])
+              case e =>
+                val message = s"Failed to process snapshot ${SnapshotReference.fromHashedSnapshot(snapshot).show}, skipping"
+                for {
+                  _ <- storages.globalL0Alignment.updateShouldRedownload(
+                    value = true,
+                    reasons = List(message)
+                  )
+                  _ <- logger.error(e)(message)
+                } yield (nextSnapshots, aggResults).asLeft[List[SnapshotProcessingResult]]
+            }
 
-      case (Nil, aggResults) =>
-        aggResults.asRight[(List[Hashed[GlobalIncrementalSnapshot]], List[SnapshotProcessingResult])].pure[F]
-    }
+        case (Nil, aggResults) =>
+          aggResults.asRight[(List[Hashed[GlobalIncrementalSnapshot]], List[SnapshotProcessingResult])].pure[F]
+      }
 
   private def checkAlignment: Stream[F, Unit] = Stream
     .awakeEvery(1.minute)

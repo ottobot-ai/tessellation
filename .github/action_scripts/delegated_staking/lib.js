@@ -259,8 +259,51 @@ const fetchStakeWithRewardsBalance = async (
   )
 }
 
+// Poll gl1's token-lock last-reference until it reflects `expectedHash` as the chain tip.
+// gl1's last-reference advances on gl1's OWN follow/accept clock — it mirrors gl0's FINALIZED
+// `lastTokenLockRefs` via the inclusion-proof follow — which lags gl0's stake-acceptance clock
+// that the rest of this test polls. Used as the chain-parent precondition for replacements.
+const waitForTokenLockLastRef = async (urls, address, expectedHash, options = {}) => {
+  const maxAttempts = options.maxAttempts || 90
+  const intervalMs = options.interval || 2000
+  let lastSeen = null
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const response = await axios.get(
+      `${urls.dagL1Url}/token-locks/last-reference/${address}?t=${Date.now()}`,
+      {
+        headers: {
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          Pragma: 'no-cache',
+          Expires: '0',
+        },
+      }
+    )
+    checkOk(response)
+    lastSeen = response.data && response.data.hash
+    if (lastSeen === expectedHash) return response.data
+    await new Promise(r => setTimeout(r, intervalMs))
+  }
+  throw new Error(
+    `gl1 token-lock last-reference for ${address.substring(0, 12)}... did not advance to ` +
+      `${expectedHash.substring(0, 16)}... within ${(maxAttempts * intervalMs) / 1000}s ` +
+      `(last seen: ${(lastSeen || 'none').substring(0, 16)}...)`
+  )
+}
+
 const createTokenLock = async (account, urls, lockAmount, replaceRef = null, replaceBalance = 0) => {
   const initialBalance = dagToDatum(await account.getBalance())
+
+  // CHAIN-PARENT PRECONDITION (gl1 follow-lag, 2026-05-29): for a replacement, the dag4 SDK builds the
+  // new lock's chain parent from gl1's CURRENT /token-locks/last-reference. That advances on gl1's own
+  // follow/accept clock (mirroring gl0's FINALIZED lastTokenLockRefs via the inclusion-proof follow),
+  // which lags gl0's stake-acceptance clock the rest of this test polls. If we submit before gl1 reflects
+  // the lock being replaced as the chain tip, the SDK fetches a STALE parent, the replacement is assigned
+  // the same ordinal as the lock it replaces, and gl1 rejects it with Conflict{ordinal=...}. Wait until
+  // gl1's last-reference IS the lock we're replacing so the replacement chains on the correct parent.
+  // Correct-by-design precondition (wait for the dependency), not an error-string retry.
+  if (replaceRef) {
+    await waitForTokenLockLastRef(urls, account.address, replaceRef)
+  }
 
   // Retry on NothingToReplace: L1's `TokenLockService.offer` validator reads from the local MPT
   // (`mptStore.getActiveTokenLocks`). Under Nakamoto, an accepted token lock can transiently disappear

@@ -64,6 +64,26 @@ trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
     implicit hasher: Hasher[F]
   ): F[SortedMap[Address, MetagraphAcceptanceResult]]
 
+  /** Assemble a [[StateChannelAcceptanceResult]] from the per-MG output of [[processCurrencySnapshots]].
+    *
+    * This is the SINGLE definition of the "accepted-map → result" assembly (the `calculateLastCurrencySnapshots` + result construction that
+    * the [[process]] tail performs). It is shared by:
+    *   - [[process]] — the legacy/standard chain-link path (passes the chain-linked `accepted` + the `returnedSCEvents`).
+    *   - `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState` (#259 adopt path) — passes the committee-adopted `accepted` and an
+    *     empty `returned` (adopted snapshots are committee-accepted, never gl0-returned).
+    *   - `GlobalSnapshotAcceptanceManagerAdoptParitySuite` — so the test exercises the EXACT production assembly (N1; no hand-copy).
+    *
+    * Pure function of its arguments: `calculatedCurrencyState = priorLastCurrencySnapshots ++ lastStatePerAddress`, and the `accepted` /
+    * `incomingCurrencySnapshotsWithState` / `balanceUpdate` projections off `processed`.
+    */
+  def assembleAcceptanceResult(
+    processed: SortedMap[Address, MetagraphAcceptanceResult],
+    priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+      CurrencySnapshot
+    ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+    returned: Set[StateChannelOutput]
+  ): StateChannelAcceptanceResult
+
   /** Re-execute one metagraph's included SC-binary chain and return its canonical per-MG MPT root — the hierarchical-shard-checkpoints S3
     * committee re-execution primitive (`docs/nakamoto/SHARD-SORTITION-WORKSTREAM-PLAN.md` slice S3).
     *
@@ -215,21 +235,34 @@ object GlobalSnapshotStateChannelEventsProcessor {
                 scSnapshots,
                 getGlobalSnapshotByOrdinal
               ).map { accepted =>
-                val (lastCurrencyStates, incomingCurrencyState) = calculateLastCurrencySnapshots(accepted, priorLastCurrencySnapshots)
-                val finalScSnapshots = accepted.map { case (k, (v, _)) => k -> v.map(_._1) }
-                // TODO: ASSUMING that owner addresses are restricted from being shared at this point
-                val balanceUpdates = accepted.values.map(_._2).foldLeft(SortedMap.empty[Address, Balance])(_ ++ _)
-
-                StateChannelAcceptanceResult(
-                  finalScSnapshots,
-                  lastCurrencyStates,
-                  returnedSCEvents,
-                  balanceUpdates,
-                  incomingCurrencyState
-                )
+                // Shared assembly (N1) — IDENTICAL construction the #259 adopt path runs, so the chain-link result and the
+                // adopt result are byte-equivalent for the same `accepted` map (the load-bearing #259 byte-exactness claim).
+                assembleAcceptanceResult(accepted, priorLastCurrencySnapshots, returnedSCEvents)
               }
           }
       }
+
+      def assembleAcceptanceResult(
+        processed: SortedMap[Address, MetagraphAcceptanceResult],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+        returned: Set[StateChannelOutput]
+      ): StateChannelAcceptanceResult = {
+        val (lastCurrencyStates, incomingCurrencyState) = calculateLastCurrencySnapshots(processed, priorLastCurrencySnapshots)
+        val finalScSnapshots = processed.map { case (k, (v, _)) => k -> v.map(_._1) }
+        // TODO: ASSUMING that owner addresses are restricted from being shared at this point
+        val balanceUpdates = processed.values.map(_._2).foldLeft(SortedMap.empty[Address, Balance])(_ ++ _)
+
+        StateChannelAcceptanceResult(
+          finalScSnapshots,
+          lastCurrencyStates,
+          returned,
+          balanceUpdates,
+          incomingCurrencyState
+        )
+      }
+
       private def calculateLastCurrencySnapshots(
         processedCurrencySnapshots: SortedMap[Address, MetagraphAcceptanceResult],
         priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[

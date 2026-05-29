@@ -156,14 +156,34 @@ trait GlobalSnapshotAcceptanceManager[F[_]] {
     validationType: StateChannelValidationType,
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     parentTip: BranchId,
-    // Slice 13 (hierarchical-shard-checkpoints v1, §13 row 13). When non-empty AND the manager is wired with a
-    // `shardCheckpointAcceptanceManager` AND `shardingConfig.numShards > 1`, the new shard-checkpoint admission
-    // path runs: each checkpoint is verified, its `derivedStateDelta.includedSnapshots` are folded into the SC
-    // event stream so the standard `processStateChannelEvents` consumes the shard-committee-attested per-MG
-    // binaries, and `emittedReceipts` are drained into [[MetagraphSyncManager.consumeReceipts]] for the cross-MG
-    // sync-data write effect (§8.4). Default `SortedMap.empty` preserves byte-identical behavior at
-    // `numShards = 1` (today's production default) — the new branch never fires until shard wiring is enabled at
-    // the gl0 consensus layer (a later slice).
+    // Axis 1a (#259 token-lock stall fix). When non-empty AND the manager is wired with a
+    // `shardCheckpointAcceptanceManager` AND `shardingConfig.numShards > 1`, the shard-checkpoint ADOPT path runs:
+    // each checkpoint is verified via `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` — the DETERMINISTIC
+    // adopt-verifier. The COMMON acceptance path is committee QUORUM SIGNATURE (preCheck proves every signer is a
+    // valid distinct committee member via Ed25519 + KES + VRF-structural; a count gate proves ≥ ⌈2·kS/3⌉ attested),
+    // NOT a per-MptRoot recomputation. The `perMetagraphMptRoots` are byte-compared only on the sub-quorum re-exec
+    // failover. Crucially `verifyEmbedded` reads NO node-local state (no finalityTriggers / shard tip), so the
+    // leader, follower (`createContext`), and gl0 peer (`validateArtifact`) all compute the same decision. Each
+    // accepted checkpoint's `derivedStateDelta.includedSnapshots` is ADOPTED DIRECTLY as the accepted per-metagraph
+    // SC-snapshot chain — BYPASSING the `onlyPossibleReferences` chain-link check in
+    // `GlobalSnapshotStateChannelAcceptanceManager`.
+    //
+    // Why bypass chain-link: gl0's own `lastStateChannelSnapshotHashes` tip can freeze under early divergence; the
+    // standard processor then rejects every checkpoint binary forever (`lastSnapshotHash` ≠ gl0's tip) so the
+    // metagraph's currency tip stalls and token locks never reach Global L0 (#259). The shard committee already
+    // chain-link-validated and signed these binaries, so gl0 re-running the chain-link is both redundant and the
+    // stall.
+    //
+    // What is preserved (byte-exact): the adopted `includedSnapshots` are fed through the SAME currency-snapshot
+    // derivation the standard path uses (`GlobalSnapshotStateChannelEventsProcessor.processCurrencySnapshots` +
+    // `calculateLastCurrencySnapshots`), so the resulting `currencySnapshots`/`tokenLockBalances`/Merkle proofs/
+    // syncData are byte-identical to what re-execution of the same binaries produces (the committee re-executed
+    // deterministically; gl0 re-derives the same). Only the SOURCE of the accepted `scSnapshots` changes for sharded
+    // MGs (adopt vs chain-link unfold); everything downstream is unchanged. `emittedReceipts` are drained into
+    // [[MetagraphSyncManager.consumeReceipts]] for the cross-MG sync-data write effect (§8.4).
+    //
+    // Default `SortedMap.empty` preserves byte-identical behavior at `numShards = 1` (today's production default) —
+    // the adopt branch never fires; raw `scEvents` flow through the unchanged chain-link path.
     shardCheckpoints: SortedMap[ShardId, ShardCheckpoint] = SortedMap.empty,
     // #259 — verifier-replay eta adoption. On the follower/verifier path
     // (`GlobalSnapshotContextFunctions.createContext`) this carries gl0's authoritative per-period eta, taken
@@ -267,19 +287,20 @@ object GlobalSnapshotAcceptanceManager {
     // (3) a non-empty `accept(..., shardCheckpoints)` argument. Production wiring will populate all three at
     // `GlobalSnapshotConsensus` construction once a later slice surfaces the wired shard pipeline.
     //
-    // `shardAssignment` is currently carried through for forward-compat / future expansion (e.g., a future
-    // slice that uses gl0-side reverse-lookup of "is this MG in shard `s`" before applying a delta). At
-    // Slice 13 it's referenced once below to keep the unused-warning silent.
+    // `shardAssignment` is the deterministic, cluster-wide static metagraph → shard map (Hasher-based; identical
+    // on every node). At `numShards > 1` it is consulted in `accept()` to PARTITION the raw `scEvents`: a metagraph
+    // address that maps to a shard flows ONLY through the adopt path (its committee-attested checkpoint), so it is
+    // EXCLUDED from the base `processStateChannelEvents` chain-link call. Because the static assignment is total,
+    // in practice this excludes every metagraph SC event at `numShards > 1`; the base path then handles only any
+    // genuinely non-sharded events (none under the current total assignment). This removes the double-path, the
+    // per-node pending-checkpoint divergence window, and the fee-payer balanceUpdate overlap. At `numShards = 1`
+    // (or `shardAssignment = None`) NO filter is applied — byte-identical to today.
     shardingConfig: Option[ShardingConfig] = None,
     shardCheckpointAcceptanceManager: Option[ShardCheckpointGl0AcceptanceManager[F]] = None,
     shardAssignment: Option[ShardAssignment[F]] = None
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): F[GlobalSnapshotAcceptanceManager[F]] = {
-    // Reserved for forward-compat — see scaladoc on the parameter. Forces the `Option`-typed field to be
-    // referenced exactly once so the Scala -Wunused warning doesn't fire when `None` is in play.
-    val _unusedShardAssignment = shardAssignment
-    val _ = _unusedShardAssignment
     val publisher: LocalEventsPublisher[F] = localEventsPublisher.getOrElse(LocalEventsPublisher.noop[F])
     // Establish the WithdrawalTimeLimit implicit from the explicit constructor param so that the rebuild paths
     // (`syncFromGlobalSnapshotInfo`, `stateProofBuilder` → `mptStateProof`) see the same limit the accept path uses
@@ -434,59 +455,77 @@ object GlobalSnapshotAcceptanceManager {
             getGlobalSnapshotByOrdinal
           )
 
-        /** Slice 13 (hierarchical-shard-checkpoints v1, §13 row 13, §7 admission flow). Pre-process the per-shard checkpoint envelopes
-          * supplied by the gl0 leader (`shardCheckpoints` parameter on `accept()`) before the standard SC-event pipeline runs.
+        /** Axis 1a (#259 token-lock stall fix, §7 admission flow). Pre-process the per-shard checkpoint envelopes supplied by the gl0
+          * leader (`shardCheckpoints` parameter on `accept()`) into the ADOPTED per-metagraph SC-snapshot chains, BEFORE the standard
+          * SC-event pipeline runs on the (DAG-layer / non-sharded) raw `scEvents`.
           *
           * For each (shardId, checkpoint) tuple:
           *
-          *   1. Run [[ShardCheckpointGl0AcceptanceManager.evaluate]] — pre-checks (signatures, committee membership, KES, VRF structural) +
-          *      finality-trigger phase (`T_count_shard` fast-path / `T_depth1_shard` re-exec degraded-path). Result branches:
-          *      - `Accepted`: harvest the checkpoint's contributions (per-MG SC binaries + cross-shard receipts).
+          *   1. Run [[ShardCheckpointGl0AcceptanceManager.verifyEmbedded]] — the DETERMINISTIC adopt-verifier (NOT node-local `evaluate`).
+          *      It runs the SAME pre-checks (committee membership, Ed25519, KES, VRF structural) and then a deterministic count-based
+          *      quorum decision (`distinctSigners >= ceil(2·kS/3)`, `kS = |committee(shardId, epoch)|`) — with NO `finalityTriggers` /
+          *      node-local depth read, so the leader, follower (`createContext`), and gl0 peer (`validateArtifact`) reach a byte-identical
+          *      adopt decision and committed state. The common-path acceptance evidence is the committee QUORUM SIGNATURE (pre-check proves
+          *      every signer is a valid distinct committee member; the count gate proves ≥ 2/3 attested). The per-MG `perMetagraphMptRoots`
+          *      are byte-compared ONLY on the sub-quorum re-exec failover (`reExecPath`), not on the common quorum path. Result branches:
+          *      - `Accepted`: ADOPT the checkpoint's `derivedStateDelta.includedSnapshots` directly (per-MG `NonEmptyList` of chain-linked
+          *        binaries) and collect the cross-shard receipts.
           *      - `PendingMoreAttestations`: skip this checkpoint for this ord; the gl0 leader will retry next ord (§7.2 `gl0AnchorOrdinal`
           *        loose coupling permits a checkpoint to ride into N, N+1, …).
           *      - `Rejected` / `RejectedReExecutionMismatch`: log + drop. Slashing emission for the re-exec mismatch case (§10.2) is Slice
-          *        16/17 territory; Slice 13 surfaces the rejection but does not yet emit evidence.
+          *        16/17 territory; this slice surfaces the rejection but does not yet emit evidence.
           *
-          *   1. Convert each accepted shard checkpoint's `derivedStateDelta.includedSnapshots` into [[StateChannelOutput]] entries and
-          *      append to the raw `scEvents` list. Rationale: the shard committee has already chain-link-validated the per-MG binaries;
-          *      gl0's standard `processStateChannelEvents` will accept them through the same predicates the raw events go through, so
-          *      double-application is impossible (the chain-link check inside the processor naturally deduplicates). At `numShards = 1`
-          *      with empty `shardCheckpoints` this branch is a no-op — the regression bar.
+          *   1. Merge every accepted checkpoint's `includedSnapshots` into a single adopted map. The map key is the metagraph address; the
+          *      static §4 assignment makes one MG belong to exactly one shard, so the per-shard contributions are disjoint and the union is
+          *      unambiguous. The adopted NEL is taken VERBATIM — gl0 does NOT re-run `onlyPossibleReferences` (the chain-link check that
+          *      would reject these binaries forever once gl0's own tip freezes, the #259 stall). gl0 trusts the committee's chain-link,
+          *      which `evaluate` already verified.
           *
           *   1. Drain the union of `emittedReceipts` from accepted checkpoints into [[MetagraphSyncManager.consumeReceipts]]. The cross-MG
           *      `MetagraphSyncDataWrite` effect (§8.4) is folded into the manager's pending accumulator; the cumulative state is read later
-          *      by `acceptMetagraphSyncData` (which sees the union of "raw scEvents-produced sync updates" AND "shard-committee-attested
-          *      cross-shard receipts"). Idempotent per the consumer's seen-set gate.
+          *      by `acceptMetagraphSyncData`. Idempotent per the consumer's seen-set gate.
           *
-          * '''Returns''' the supplemented event list (existing `scEvents` ++ shard-derived `StateChannelOutput`s for accepted shards). The
-          * cross-shard receipt drain is a side-effect on the [[MetagraphSyncManager]] instance — no value flows back through this method's
-          * return type.
+          * '''Returns''' the adopted per-metagraph SC-snapshot chains (`SortedMap[Address,
+          * NonEmptyList[Signed[StateChannelSnapshotBinary]]]`) — the SAME shape `GlobalSnapshotStateChannelAcceptanceManager.accept`
+          * produces, ready to feed `GlobalSnapshotStateChannelEventsProcessor.processCurrencySnapshots` (the unchanged currency-snapshot
+          * derivation). The cross-shard receipt drain is a side-effect on the [[MetagraphSyncManager]] instance.
           *
-          * '''Gating contract''': this method is only invoked when `shardingActive(shardCheckpoints)` returns `true`. The gate check lives
-          * at the single call site below to keep the no-op fast-path obvious.
+          * '''Gating contract''': this method is only invoked when the sharding gate (`numShards > 1` AND non-empty `shardCheckpoints` AND
+          * a wired `shardCheckpointAcceptanceManager`) holds. The gate check lives at the single call site below to keep the no-op
+          * fast-path obvious — at `numShards = 1` this method never runs and `accept()` is byte-identical to the pre-shard path.
           */
-        private def processShardCheckpoints(
+        private def adoptShardCheckpoints(
           ordinal: SnapshotOrdinal,
           shardCheckpoints: SortedMap[ShardId, ShardCheckpoint],
-          rawScEvents: List[StateChannelOutput],
           checkpointManager: ShardCheckpointGl0AcceptanceManager[F]
-        )(implicit hasher: Hasher[F]): F[List[StateChannelOutput]] =
+        )(implicit hasher: Hasher[F]): F[SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]] =
           shardCheckpoints.toList
-            .foldM((List.empty[StateChannelOutput], List.empty[io.constellationnetwork.schema.sharding.CrossShardReceipt])) {
-              case ((acceptedBinariesAcc, receiptsAcc), (shardId, cp)) =>
-                checkpointManager.evaluate(cp).flatMap {
+            .foldM(
+              (
+                SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+                List.empty[io.constellationnetwork.schema.sharding.CrossShardReceipt]
+              )
+            ) {
+              case ((adoptedAcc, receiptsAcc), (shardId, cp)) =>
+                // DETERMINISTIC adopt-verifier — NOT node-local `evaluate`. `verifyEmbedded` decides purely from the checkpoint bytes +
+                // the committee membership for `(shardId, epoch)`, so the leader (produce), the follower (`createContext`), and every gl0
+                // peer (`validateArtifact`) reach a byte-identical adopt decision + committed state. Using `evaluate` here (which reads the
+                // node-local `ShardFinalityTriggers`) would split the cluster — the prior-pass bug this change fixes.
+                checkpointManager.verifyEmbedded(cp).flatMap {
                   case ShardCheckpointAcceptResult.Accepted =>
-                    val newBinaries: List[StateChannelOutput] =
-                      cp.derivedStateDelta.includedSnapshots.toList.flatMap {
-                        case (mgAddr, nel) => nel.toList.map(b => StateChannelOutput(mgAddr, b))
-                      }
+                    // ADOPT — no `onlyPossibleReferences` chain-link. The committee chain-link-validated these binaries
+                    // and signed them; `evaluate` re-verified the signatures + per-MG roots. Union into the adopted map
+                    // (disjoint per-MG by the §4 static assignment; `++` is unambiguous).
+                    val adoptedFromCp: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] =
+                      cp.derivedStateDelta.includedSnapshots
                     val newReceipts: List[io.constellationnetwork.schema.sharding.CrossShardReceipt] = cp.emittedReceipts
                     loggerBundle.app
                       .info(
                         s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                          s"ACCEPTED binaries=${newBinaries.size} receipts=${newReceipts.size}"
+                          s"ACCEPTED adopt mgs=${adoptedFromCp.size} binaries=${adoptedFromCp.values.map(_.size).sum} " +
+                          s"receipts=${newReceipts.size}"
                       )
-                      .as((acceptedBinariesAcc ++ newBinaries, receiptsAcc ++ newReceipts))
+                      .as((adoptedAcc ++ adoptedFromCp, receiptsAcc ++ newReceipts))
 
                   case ShardCheckpointAcceptResult.PendingMoreAttestations =>
                     loggerBundle.app
@@ -494,36 +533,76 @@ object GlobalSnapshotAcceptanceManager {
                         s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                           s"PENDING — will retry next gl0 ord"
                       )
-                      .as((acceptedBinariesAcc, receiptsAcc))
+                      .as((adoptedAcc, receiptsAcc))
 
                   case ShardCheckpointAcceptResult.Rejected(reason) =>
                     // Logged at info (not warn) because a Rejected checkpoint can be a legitimate operator-level transient
                     // (e.g., a shard not yet in the local finalityTriggers map during bootstrap). Slashing for malicious
-                    // rejections is Slice 16/17 territory; Slice 13 surfaces the rejection but takes no slashing action.
+                    // rejections is Slice 16/17 territory; this slice surfaces the rejection but takes no slashing action.
                     loggerBundle.app
                       .info(
                         s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                           s"REJECTED reason=$reason"
                       )
-                      .as((acceptedBinariesAcc, receiptsAcc))
+                      .as((adoptedAcc, receiptsAcc))
 
                   case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, slashSigners) =>
                     // Wrong-derivation result. Slashing evidence emission lands in Slice 16/17 (signer list surfaced here
-                    // for the future hook). Slice 13 logs the rejection at warn so operators can spot the deviation.
+                    // for the future hook). This slice logs the rejection at warn so operators can spot the deviation.
                     loggerBundle.app
                       .warn(
                         s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                           s"REJECTED-REEXEC-MISMATCH reason=$reason slashSigners=${slashSigners.size}"
                       )
-                      .as((acceptedBinariesAcc, receiptsAcc))
+                      .as((adoptedAcc, receiptsAcc))
                 }
             }
             .flatMap {
-              case (acceptedBinaries, receipts) =>
+              case (adopted, receipts) =>
                 // Side-effect: drain the union of cross-shard receipts into the shared MetagraphSyncManager accumulator.
                 // The manager's internal seen-set gate makes the apply idempotent — duplicate receipts (operator replay,
                 // gossip duplication, or repeat-evaluation in a re-acceptance turn) are silently dropped after first sight.
-                metagraphSyncManager.consumeReceipts(receipts).as(rawScEvents ++ acceptedBinaries)
+                metagraphSyncManager.consumeReceipts(receipts).as(adopted)
+            }
+
+        /** Axis 1a (#259). Derive the per-metagraph accepted-currency-snapshot view from ADOPTED shard-checkpoint SC-snapshot chains,
+          * BYPASSING `onlyPossibleReferences` (the chain-link unfold inside `GlobalSnapshotStateChannelAcceptanceManager.accept`) while
+          * running the IDENTICAL currency derivation the standard `process()` path runs on its chain-linked output.
+          *
+          * '''Byte-exactness contract.''' The standard path is `process = chainLink(scEvents) → processCurrencySnapshots → calculate`. This
+          * method is the `process` tail with the chain-link stage replaced by the committee's already-verified `adoptedScSnapshots`. It
+          * calls the EXACT same `stateChannelEventsProcessor.processCurrencySnapshots` and replicates the EXACT four derivations the
+          * processor's private `calculateLastCurrencySnapshots` + result assembly perform (see
+          * [[GlobalSnapshotStateChannelEventsProcessor.process]] computing `finalScSnapshots` / `lastCurrencyStates` / `balanceUpdates` /
+          * `incomingCurrencyState`). Because `processCurrencySnapshots` is a pure function of `(adoptedScSnapshots,
+          * priorLastCurrencySnapshots, currentBalances, ordinal)`, the result is byte-identical to what re-executing those same binaries
+          * produces — which is exactly what the shard committee computed and signed.
+          *
+          * `returned` is empty: an adopted snapshot is never "returned to the metagraph" (it was committee-accepted, not gl0-rejected).
+          *
+          * N1: the result assembly is the SINGLE shared `GlobalSnapshotStateChannelEventsProcessor.assembleAcceptanceResult` — the EXACT
+          * same construction the standard `process()` tail uses — so there is no hand-copied replica to keep in lockstep.
+          */
+        private def deriveAdoptedCurrencyState(
+          ordinal: SnapshotOrdinal,
+          currentBalances: SortedMap[Address, Balance],
+          priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+            CurrencySnapshot
+          ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+          adoptedScSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+          getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+        )(implicit hasher: Hasher[F]): F[StateChannelAcceptanceResult] =
+          stateChannelEventsProcessor
+            .processCurrencySnapshots(
+              ordinal,
+              currentBalances,
+              priorLastCurrencySnapshots,
+              adoptedScSnapshots,
+              getGlobalSnapshotByOrdinal
+            )
+            .map { accepted =>
+              // `returned = Set.empty` — adopted snapshots are committee-accepted, never gl0-returned.
+              stateChannelEventsProcessor.assembleAcceptanceResult(accepted, priorLastCurrencySnapshots, Set.empty[StateChannelOutput])
             }
 
         private def calculateRewards(
@@ -1418,39 +1497,91 @@ object GlobalSnapshotAcceptanceManager {
                   } yield result
                 }
 
-                // Slice 13 (hierarchical-shard-checkpoints v1, §13 row 13). Gate: the new shard-checkpoint admission path
-                // only fires when (a) the manager was wired with `shardingConfig.numShards > 1` AND
-                // `shardCheckpointAcceptanceManager.isDefined`, AND (b) the caller actually supplied a non-empty
-                // `shardCheckpoints` map for this ord. All three conditions must hold; otherwise `effectiveScEvents`
-                // collapses to the raw input `scEvents` and the rest of `accept()` runs byte-identically to today
-                // (the regression bar — see make()'s shardingConfig scaladoc).
-                //
-                // The shard-derived `StateChannelOutput`s are APPENDED (not replacement) to handle the mixed-bootstrap
-                // case: a shard not yet wired with a committee can still feed binaries via the legacy raw event path
-                // for the same gl0 ord; the standard `processStateChannelEvents` chain-link check naturally
-                // deduplicates per-MG.
-                effectiveScEvents <-
+                // Axis 1a (#259 token-lock stall fix). Sharding gate: the shard-checkpoint ADOPT path only fires when
+                // (a) the manager was wired with `shardingConfig.numShards > 1` AND `shardCheckpointAcceptanceManager.isDefined`,
+                // AND (b) the caller actually supplied a non-empty `shardCheckpoints` map for this ord. All three conditions
+                // must hold; otherwise `adoptedScSnapshots` is empty, the standard chain-link path runs on the raw `scEvents`
+                // verbatim, and the rest of `accept()` is byte-identical to today (the regression bar — see make()'s
+                // shardingConfig scaladoc).
+                adoptedScSnapshots <-
                   (shardingConfig, shardCheckpointAcceptanceManager) match {
                     case (Some(cfg), Some(scMgr)) if cfg.numShards > 1 && shardCheckpoints.nonEmpty =>
-                      processShardCheckpoints(ordinal, shardCheckpoints, scEvents, scMgr)
+                      adoptShardCheckpoints(ordinal, shardCheckpoints, scMgr)
+                    case _ => Async[F].pure(SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]])
+                  }
+
+                // CHANGE 3 — partition the raw `scEvents` by the deterministic static shard assignment. When sharding is
+                // active (`numShards > 1` AND `shardAssignment` wired), a metagraph address that maps to a shard flows ONLY
+                // via the adopt path (its committee checkpoint), so it is EXCLUDED from the base chain-link call below. This
+                // removes the double-path: a sharded MG's binary is no longer processed by BOTH the adopt path AND the raw
+                // chain-link path (which would otherwise leave a per-node pending-checkpoint divergence window and a fee-payer
+                // `balanceUpdate` overlap). `shardIdFor` is `Hasher`-based and deterministic, so the partition is byte-identical
+                // on every node. Because the static assignment is total, in practice EVERY metagraph SC event is excluded at
+                // `numShards > 1`; only genuinely non-sharded events (none today) survive to the base path. At `numShards = 1`
+                // (or `shardAssignment = None`) the filter is skipped and `baseScEvents == scEvents` — byte-identical to today.
+                baseScEvents <-
+                  (shardingConfig, shardAssignment) match {
+                    case (Some(cfg), Some(assignment)) if cfg.numShards > 1 =>
+                      // Route every event's address through the deterministic `shardIdFor` (the same `Hasher`-based map on
+                      // every node) and KEEP only events whose address is NOT assigned to a shard. The static assignment is
+                      // total — every metagraph address resolves to some shard — so this keeps NOTHING (`baseScEvents = Nil`)
+                      // today; the partition is written generically so a future non-sharded carve-out would be honoured, and
+                      // the `shardIdFor` call makes the exclusion a deterministic function of the address on every node.
+                      scEvents.traverse(out => assignment.shardIdFor(out.address).map(_ => out -> true)).map { annotated =>
+                        annotated.collect { case (out, isSharded) if !isSharded => out }
+                      }
                     case _ => Async[F].pure(scEvents)
                   }
 
+                // Standard chain-link path on the (DAG-layer / non-sharded) SC events. At numShards=1 `baseScEvents == scEvents`
+                // and this is the only source of accepted SC snapshots, so the byte-identical regression bar holds:
+                // `adoptedScSnapshots` is empty and the merge below is skipped, yielding exactly `baseAcceptance`.
+                baseAcceptance <- processStateChannelEvents(
+                  ordinal,
+                  updatedGlobalBalances,
+                  priorLastStateChannelSnapshotHashes,
+                  priorLastCurrencySnapshots,
+                  baseScEvents,
+                  validationType,
+                  getGlobalSnapshotByOrdinal
+                )
+
+                // Merge the committee-adopted SC snapshots (chain-link bypassed; currency derivation re-run identically via
+                // `deriveAdoptedCurrencyState`) with the standard chain-link result. The two MG sets are disjoint in normal
+                // operation (a sharded MG flows only via its committee; a non-sharded/bootstrap MG only via raw scEvents), but
+                // on the rare mixed-bootstrap overlap the ADOPTED entry wins (`++` right-biased) — committee acceptance is the
+                // authoritative source for a sharded MG. When `adoptedScSnapshots` is empty (numShards=1 OR no checkpoints
+                // this ord) the result IS `baseAcceptance` verbatim — no `deriveAdoptedCurrencyState` call, no merge.
                 StateChannelAcceptanceResult(
                   scSnapshots,
                   currencySnapshots,
                   returnedSCEvents,
                   currencyAcceptanceBalanceUpdate,
                   incomingCurrencySnapshots
-                ) <- processStateChannelEvents(
-                  ordinal,
-                  updatedGlobalBalances,
-                  priorLastStateChannelSnapshotHashes,
-                  priorLastCurrencySnapshots,
-                  effectiveScEvents,
-                  validationType,
-                  getGlobalSnapshotByOrdinal
-                )
+                ) <-
+                  if (adoptedScSnapshots.isEmpty) Async[F].pure(baseAcceptance)
+                  else
+                    deriveAdoptedCurrencyState(
+                      ordinal,
+                      updatedGlobalBalances,
+                      priorLastCurrencySnapshots,
+                      adoptedScSnapshots,
+                      getGlobalSnapshotByOrdinal
+                    ).map { adoptedAcceptance =>
+                      StateChannelAcceptanceResult(
+                        accepted = baseAcceptance.accepted ++ adoptedAcceptance.accepted,
+                        // Both base + adopt return `priorLastCurrencySnapshots.concat(<states>)`. Merging them right-biased
+                        // yields `prior ++ baseStates ++ adoptedStates` — the prior keys are overwritten with identical
+                        // values, so this is exactly what a single combined `calculateLastCurrencySnapshots` would produce.
+                        calculatedCurrencyState = baseAcceptance.calculatedCurrencyState ++ adoptedAcceptance.calculatedCurrencyState,
+                        // Adopted snapshots are never "returned" (committee-accepted, not gl0-rejected); only the raw-event
+                        // chain-link path can return events to a metagraph.
+                        returned = baseAcceptance.returned ++ adoptedAcceptance.returned,
+                        balanceUpdate = baseAcceptance.balanceUpdate ++ adoptedAcceptance.balanceUpdate,
+                        incomingCurrencySnapshotsWithState =
+                          baseAcceptance.incomingCurrencySnapshotsWithState ++ adoptedAcceptance.incomingCurrencySnapshotsWithState
+                      )
+                    }
 
                 transactionsRefsDeltas <- transactionReferenceManager.acceptTransactionRefs(
                   initialData.blockResult.contextUpdate.lastTxRefs,

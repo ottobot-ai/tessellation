@@ -1,0 +1,17 @@
+flowchart LR
+    subgraph GL0["gl0 — finalized snapshots (Phase 2+)"]
+        direction LR
+        F1["F_e<br/>epoch e"] --> F2["F_e+1<br/>epoch e+1"] --> F3["F_e+2<br/>epoch e+2"]
+    end
+    subgraph ML0["ml0_A — own BFT chain"]
+        direction LR
+        C1["CA_k"] --> C2["CA_k+1"] --> C3["CA_k+2"]
+    end
+    F1 -. globalSyncView .-> C1
+    F2 -. globalSyncView .-> C2
+    F3 -. "globalSyncView pins a FINALIZED gl0 ord;<br/>ml0 reads epochProgress (token-lock clock),<br/>balances, allow-spends — never best-tip" .-> C3
+
+    classDef gl0 fill:#e3f2fd,stroke:#1565c0,color:#0d2a4d;
+    classDef ml0 fill:#e8f5e9,stroke:#2e7d32,color:#13361a;
+    class F1,F2,F3 gl0;
+    class C1,C2,C3 ml0;

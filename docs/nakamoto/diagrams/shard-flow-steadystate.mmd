@@ -1,0 +1,34 @@
+sequenceDiagram
+    autonumber
+    participant A as ml0_A (BFT)
+    participant S0 as Shard-0 committee
+    participant S1 as Shard-1 committee
+    participant B as ml0_B (BFT)
+    participant GL as gl0 leader @ ord N
+    participant GF as gl0 followers
+
+    Note over A,S0: metagraph_A maps to shard 0 = hash(A) mod numShards
+    A->>A: BFT-finalize currency snap CA_k<br/>parent CA_k-1, globalSyncView = gl0 finalized ord F
+    A->>S0: broadcast Signed[StateChannelSnapshotBinary] bA_k (sidecar/libp2p)
+    S0->>S0: slot leader re-executes A's derivation<br/>(currency snapshot, tokenLockBalances, subtree root)
+    S0->>S0: build ShardCheckpoint cpA (shardId 0, anchor=N, derivedStateDelta)
+    S0->>S0: members re-exec + byte-compare + co-sign (Ed25519+KES+VRF)<br/>T_count_shard 2/3 reached -> Phase 2 SETTLED
+
+    Note over S1,B: metagraph_B maps to shard 1 (fully independent lane)
+    B->>B: BFT-finalize CB_j -> bB_j
+    B->>S1: broadcast bB_j
+    S1->>S1: re-exec B -> cpB (shardId 1, anchor=N), committee co-sign -> Phase 2
+
+    S0->>GL: gossip fully-signed cpA
+    S1->>GL: gossip fully-signed cpB
+    GL->>GL: build global snapshot N: shardCheckpoints = 0:cpA, 1:cpB<br/>(maxvalid-tk per shard, accept where anchor <= N)
+    GL->>GL: verify committee signatures per shard (VRF + Ed25519 + KES)
+
+    alt DESIGN (sec 7.3 verifyAllAndApply)
+        GL->>GL: apply derivedStateDelta DIRECTLY to MPT<br/>lastCurrencySnapshots, tokenLockBalances, perMetagraphMptRoots<br/>NO re-exec, NO chain-link -- trust the quorum
+    else CURRENT Slice-13 (GSAM 450-489)
+        GL-->>GL: re-feed includedSnapshots into legacy processStateChannelEvents<br/>re-execute + onlyPossibleReferences vs gl0's own tip<br/>frozen tip -> REJECT -> 259 stall
+    end
+
+    GL->>GF: global snapshot N -> Phase 1 -> attestation 2/3 or depth-k -> Phase 2 final
+    GF->>GF: followers adopt N's state<br/>(non-committee gl0 ops hold no shard-chain state)

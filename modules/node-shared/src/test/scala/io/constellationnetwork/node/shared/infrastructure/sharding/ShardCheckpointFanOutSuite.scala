@@ -13,7 +13,7 @@ import scala.concurrent.duration._
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardSlotLeader}
+import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardBinaryBuffer, ShardChainStore, ShardSlotLeader}
 import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, ShardAssignment}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.numerics.Ratio
@@ -95,13 +95,18 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
   private def hashFromString(s: String): Hash =
     Hash.fromBytes(s.getBytes("UTF-8"))
 
+  // EXECUTION-SHARDING R-2: the producer now chain-link-orders buffered binaries off the shard's own `perMgTip`
+  // (genesis ⇒ `Hash.empty`). So the single genesis binary per MG in these fixtures MUST carry
+  // `lastSnapshotHash = Hash.empty` to be admissible at the shard's genesis; otherwise the producer's
+  // `chainLinkOrder` finds nothing chaining off the tip and returns None.
   private def mkSignedBinary(mgLabel: String, idx: Int): Signed[StateChannelSnapshotBinary] = {
     import cats.data.NonEmptySet
     import io.constellationnetwork.schema.ID.Id
     import io.constellationnetwork.security.hex.Hex
     import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
+    val _ = mgLabel
     val body = StateChannelSnapshotBinary(
-      lastSnapshotHash = hashFromString(s"$mgLabel-parent-$idx"),
+      lastSnapshotHash = Hash.empty,
       content = Array.fill[Byte](16)(idx.toByte),
       fee = SnapshotFee(NonNegLong.unsafeFrom(0L))
     )
@@ -129,6 +134,13 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
   }
 
   private def mkOrd(value: Long): SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(value))
+
+  // EXECUTION-SHARDING Task 2 — fan-out committee gate fixtures. `gateSelf` is the fan-out's `selfPeerId`; `allowAllCommittee`
+  // returns a committee containing it for every shard, so the gate passes and the existing produce/store assertions are unchanged.
+  // The producer's OWN selfPeerId (from its keypair) is independent of the gate — the gate consults only the fan-out's `selfPeerId`.
+  private val gateSelf: PeerId = PeerId(io.constellationnetwork.security.hex.Hex("ee" * 64))
+  private val allowAllCommittee: (ShardId, EtaPeriod) => IO[Set[PeerId]] = (_, _) => IO.pure(Set(gateSelf))
+  private val denyAllCommittee: (ShardId, EtaPeriod) => IO[Set[PeerId]] = (_, _) => IO.pure(Set.empty[PeerId])
 
   /** Build a producer for one shard wired against `chainStore`, with the supplied σ. */
   private def makeProducer(
@@ -158,11 +170,12 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
       derivePerMgState = deterministicDerive
     )
 
-  /** Per-shard rig: a chain store + a producer for every shard `0 .. numShards-1`, all sharing one keypair + σ. */
+  /** Per-shard rig: a chain store + a raw-binary buffer + a producer for every shard `0 .. numShards-1`, sharing one keypair + σ. */
   private case class Rig(
     assignment: ShardAssignment[IO],
     producers: Map[ShardId, ShardCheckpointProducer[IO]],
-    chainStores: Map[ShardId, ShardChainStore[IO]]
+    chainStores: Map[ShardId, ShardChainStore[IO]],
+    buffers: Map[ShardId, ShardBinaryBuffer[IO]]
   )
 
   private def freshRig(
@@ -177,16 +190,34 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
         val sid = ShardId.unsafeApply(i)
         for {
           store <- ShardChainStore.make[IO](sid)
+          buffer <- ShardBinaryBuffer.make[IO](sid, cap = 4096)
           shardEta <- ssl.computeShardEta(sid, gl0Eta)
           producer <- makeProducer(ssl, sid, store, keyPair, sigma, shardEta)
-        } yield (sid, producer, store)
+        } yield (sid, producer, store, buffer)
       }
     } yield
       Rig(
         assignment = assignment,
-        producers = perShard.map { case (sid, p, _) => sid -> p }.toMap,
-        chainStores = perShard.map { case (sid, _, s) => sid -> s }.toMap
+        producers = perShard.map { case (sid, p, _, _) => sid -> p }.toMap,
+        chainStores = perShard.map { case (sid, _, s, _) => sid -> s }.toMap,
+        buffers = perShard.map { case (sid, _, _, b) => sid -> b }.toMap
       )
+
+  /** EXECUTION-SHARDING R-1: feed the per-shard buffers from `sc`, partitioned by the SAME deterministic shard mapping the daemon's
+    * gossip-intake uses. After this, `buffer.snapshotPending` is the producer fan-out's input — replacing the old gl0
+    * `stateChannelSnapshots` partition.
+    */
+  private def populateBuffers(
+    buffers: Map[ShardId, ShardBinaryBuffer[IO]],
+    sc: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    assignment: ShardAssignment[IO]
+  )(implicit h: Hasher[IO]): IO[Unit] =
+    sc.toList.traverse_ {
+      case (mg, binaries) =>
+        assignment.shardIdFor(mg).flatMap { sid =>
+          buffers.get(sid).traverse_(buf => binaries.traverse_(b => buf.bufferBinary(mg, b)))
+        }
+    }
 
   /** Build SC snapshots for `numMgs` metagraphs (one binary each). Returns the map + the per-shard partition (so the test can assert which
     * shards received content under the SAME deterministic mapping the fan-out uses).
@@ -213,16 +244,17 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
 
   test("empty producer map ⇒ no-op: no checkpoints produced or stored") { res =>
     implicit val (h, sp, _) = res
+    val _ = sp
     for {
-      assignment <- IO.pure(ShardAssignment.make[IO](numShards))
-      sc <- mkScSnapshots(numMgs = 4).map(_._1)
+      _ <- IO.unit
       _ <- ShardCheckpointFanOut.run[IO](
-        stateChannelSnapshots = sc,
+        shardBinaryBuffers = Map.empty,
         producedOrd = mkOrd(1000L),
         epoch = EtaPeriod(0L),
         shardProducers = Map.empty,
         shardChainStores = Map.empty,
-        shardAssignment = assignment,
+        selfPeerId = gateSelf,
+        committeeMembership = allowAllCommittee,
         logger = logger
       )
     } yield expect(true) // sanity: completes without error, allocates nothing
@@ -238,20 +270,25 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
       rig <- freshRig(ssl, Ratio.One)
       scAndPartition <- mkScSnapshots(numMgs = 8)
       (sc, partition) = scAndPartition
+      // R-1: populate each shard's buffer from `sc` (the inversion intake). The fan-out then reads
+      // `snapshotPending` per shard instead of partitioning a gl0 `stateChannelSnapshots` map.
+      _ <- populateBuffers(rig.buffers, sc, rig.assignment)
       // Fan out over a window of distinct ords. The per-shard VRF lottery isn't guaranteed at every single
-      // ord (or for every shard's eta) even at σ=1, so a window ensures wins land. Each ord re-partitions
-      // the SAME `sc` (deterministic), so each producer is driven with its own shard's content every time.
-      // `ShardChainStore.store` is idempotent by hash; chain growth happens on wins.
+      // ord (or for every shard's eta) even at σ=1, so a window ensures wins land. Each shard's genesis binary
+      // (lastSnapshotHash=Hash.empty) chain-links off the empty perMgTip on the FIRST win; after that the
+      // shard's perMgTip has advanced and the (same, non-destructively-read) binary no longer chains, so each
+      // shard's chain grows by exactly one genesis checkpoint — sufficient to prove produce → self-store.
       lo = 6000L
       hi = 6099L
       _ <- (lo to hi).toList.traverse_ { ord =>
         ShardCheckpointFanOut.run[IO](
-          stateChannelSnapshots = sc,
+          shardBinaryBuffers = rig.buffers,
           producedOrd = mkOrd(ord),
           epoch = EtaPeriod(0L),
           shardProducers = rig.producers,
           shardChainStores = rig.chainStores,
-          shardAssignment = rig.assignment,
+          selfPeerId = gateSelf,
+          committeeMembership = allowAllCommittee,
           logger = logger
         )
       }
@@ -281,6 +318,35 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
   }
 
   // ===========================================================================
+  // Task 2 — committee membership gate: a non-member produces nothing even with content + σ=1
+  // ===========================================================================
+
+  test("committee gate: self NOT in committee ⇒ zero checkpoints stored despite content + σ=1") { res =>
+    implicit val (h, sp, ssl) = res
+    val _ = sp
+    for {
+      rig <- freshRig(ssl, Ratio.One)
+      sc <- mkScSnapshots(numMgs = 8).map(_._1)
+      _ <- populateBuffers(rig.buffers, sc, rig.assignment)
+      // Same window the σ=1 test uses, but `denyAllCommittee` ⇒ the per-shard membership gate fails for every shard,
+      // so NO producer is invoked regardless of the leader lottery (which would otherwise win at σ=1).
+      _ <- (6000L to 6099L).toList.traverse_ { ord =>
+        ShardCheckpointFanOut.run[IO](
+          shardBinaryBuffers = rig.buffers,
+          producedOrd = mkOrd(ord),
+          epoch = EtaPeriod(0L),
+          shardProducers = rig.producers,
+          shardChainStores = rig.chainStores,
+          selfPeerId = gateSelf,
+          committeeMembership = denyAllCommittee,
+          logger = logger
+        )
+      }
+      tips <- (0 until numShards).toList.traverse(i => rig.chainStores(ShardId.unsafeApply(i)).bestTip)
+    } yield expect(tips.forall(_.isEmpty))
+  }
+
+  // ===========================================================================
   // Test 3 — σ=0 ⇒ no shard wins ⇒ nothing stored even with content
   // ===========================================================================
 
@@ -289,13 +355,15 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
     for {
       rig <- freshRig(ssl, Ratio.Zero)
       sc <- mkScSnapshots(numMgs = 8).map(_._1)
+      _ <- populateBuffers(rig.buffers, sc, rig.assignment)
       _ <- ShardCheckpointFanOut.run[IO](
-        stateChannelSnapshots = sc,
+        shardBinaryBuffers = rig.buffers,
         producedOrd = mkOrd(7000L),
         epoch = EtaPeriod(0L),
         shardProducers = rig.producers,
         shardChainStores = rig.chainStores,
-        shardAssignment = rig.assignment,
+        selfPeerId = gateSelf,
+        committeeMembership = allowAllCommittee,
         logger = logger
       )
       tips <- (0 until numShards).toList.traverse(i => rig.chainStores(ShardId.unsafeApply(i)).bestTip)
@@ -320,18 +388,20 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
       for {
         rig <- freshRig(ssl, Ratio.One)
         sc <- mkScSnapshots(numMgs = 8).map(_._1)
+        _ <- populateBuffers(rig.buffers, sc, rig.assignment)
         bodyDone <- Deferred[IO, Unit]
         // The supervised effect: pause long enough that an inline call would dominate the caller's
         // timing, then run the real fan-out, then signal completion.
         slowFanOut =
           IO.sleep(300.millis) >>
             ShardCheckpointFanOut.run[IO](
-              stateChannelSnapshots = sc,
+              shardBinaryBuffers = rig.buffers,
               producedOrd = mkOrd(8000L),
               epoch = EtaPeriod(0L),
               shardProducers = rig.producers,
               shardChainStores = rig.chainStores,
-              shardAssignment = rig.assignment,
+              selfPeerId = gateSelf,
+              committeeMembership = allowAllCommittee,
               logger = logger
             ) >> bodyDone.complete(()).void
         // Time how long it takes the CALLER to get past `supervisor.supervise(...)`. This is the exact

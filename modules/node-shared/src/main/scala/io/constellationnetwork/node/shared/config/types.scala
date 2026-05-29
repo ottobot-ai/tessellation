@@ -122,7 +122,7 @@ object types {
       )
   }
 
-  case class ShardCheckpointConfig(tAliveMs: Long, tBurst: Int)
+  case class ShardCheckpointConfig(tAliveMs: Long, tBurst: Int, binaryBufferCap: Int)
 
   /** Slice 19 observability tunables (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §13 row 19 + §9.4).
     *

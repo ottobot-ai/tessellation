@@ -6,11 +6,11 @@ import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
 
-import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
-import io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore
+import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardBinaryBuffer, ShardChainStore}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
@@ -40,9 +40,17 @@ import org.typelevel.log4cats.Logger
   * those are `Map.empty` / `None` ⇒ the call site is `whenA(false)` ⇒ this helper is never entered (no allocation, no log). Even if entered
   * with an empty producer map, `traverse_` over Nil is a no-op (the empty-producer-map short-circuit is preserved).
   *
-  * '''§15.5 — content-only production.''' Each producer is handed only the SC binaries partitioned to ITS shard. A shard with no content
-  * this ord receives an empty `SortedMap`, and [[ShardCheckpointProducer.produce]] returns `None` on empty input — so an empty shard
+  * '''§15.5 — content-only production.''' Each producer is handed only the binaries buffered for ITS shard. A shard with no buffered
+  * content receives an empty `SortedMap`, and [[ShardCheckpointProducer.produce]] returns `None` on empty input — so an empty shard
   * produces nothing and no empty checkpoint reaches gl0.
+  *
+  * '''EXECUTION-SHARDING R-1 — the inversion (input source).''' The fan-out NO LONGER partitions gl0's post-chain-link
+  * `stateChannelSnapshots` map (which the `CHANGE-3` Axis-1a filter empties at `numShards > 1`, and which inherits gl0's #259 freeze).
+  * Instead each producer is fed `shardBinaryBuffers(sid).snapshotPending` — the RAW metagraph binaries the committee buffered for ITS shard
+  * off the global binaries gossip topic. The producer then chain-link-orders them off the SHARD's own prior-checkpoint tip
+  * (`ShardChainStore.perMgTip`). This is the centerpiece of the inversion: production is driven by what the shard has buffered, fully
+  * decoupled from gl0's chain-link admission. The buffer is already shard-scoped (the daemon buffers by `ShardAssignment.shardIdFor`), so
+  * no partition step is needed here.
   */
 object ShardCheckpointFanOut {
 
@@ -60,9 +68,11 @@ object ShardCheckpointFanOut {
 
   /** Drive every per-shard producer for the single gl0 ord `producedOrd`.
     *
-    * @param stateChannelSnapshots
-    *   the canonical SC binaries for THIS gl0 ord (the produced/gossip-received snapshot's `stateChannelSnapshots`). Partitioned per shard
-    *   via `shardAssignment.shardIdFor` — the SAME deterministic mapping every gl0 operator computes.
+    * @param shardBinaryBuffers
+    *   per-shard raw-binary accumulators keyed by `ShardId` (EXECUTION-SHARDING R-1). For each producer, `snapshotPending` on its shard's
+    *   buffer is the input — the RAW metagraph binaries the committee buffered for that shard, NOT gl0's post-chain-link map. A shard with
+    *   an absent / empty buffer feeds the producer an empty map ⇒ `produce` returns `None`. SAME instances the daemon's gossip-intake
+    *   writes into.
     * @param producedOrd
     *   the gl0 ordinal this fan-out is for. Passed to each producer as `gl0AnchorOrdinal` and used to recompute the shard-local slot.
     * @param epoch
@@ -73,66 +83,84 @@ object ShardCheckpointFanOut {
     * @param shardChainStores
     *   the SAME per-shard chain stores the producers + the acceptance side share. On `Some(checkpoint)` the producing node stores its own
     *   checkpoint here so the local chain advances toward finality without waiting for its own gossip echo.
-    * @param shardAssignment
-    *   static metagraph → shard mapping used to partition `stateChannelSnapshots`.
+    * @param selfPeerId
+    *   this gl0 operator's PeerId. With real VRF-VK committees a producer runs for shard `s` only when `selfPeerId` is in
+    *   `committeeMembership(s, epoch)` (Task 2 membership gate) — a non-member's checkpoint can never reach committee quorum at any
+    *   verifier's `verifyEmbedded`, so producing it is wasted work / liveness drag.
+    * @param committeeMembership
+    *   the SAME deterministic `committeeFor(shardId, epoch)` draw the acceptance manager uses (from `AcceptanceDeps.committeeMembership`).
+    *   Gating produce through it keeps "who may produce for shard s" consistent with "whose signature counts toward quorum for shard s".
     */
   def run[F[_]: Async: Hasher](
-    stateChannelSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    shardBinaryBuffers: Map[ShardId, ShardBinaryBuffer[F]],
     producedOrd: SnapshotOrdinal,
     epoch: EtaPeriod,
     shardProducers: Map[ShardId, ShardCheckpointProducer[F]],
     shardChainStores: Map[ShardId, ShardChainStore[F]],
-    shardAssignment: ShardAssignment[F],
+    selfPeerId: PeerId,
+    committeeMembership: (ShardId, EtaPeriod) => F[Set[PeerId]],
     logger: Logger[F]
   ): F[Unit] =
-    // Group MG addresses by their shard once, then drive each producer. `traverse_` over an empty
+    // Drive each producer from ITS shard's buffered binaries (the inversion). `traverse_` over an empty
     // `shardProducers` map is a no-op — the regression-bar short-circuit.
-    stateChannelSnapshots.toList.traverse {
-      case (mgAddr, binaries) => shardAssignment.shardIdFor(mgAddr).map(sid => sid -> (mgAddr, binaries))
-    }.map { tagged =>
-      tagged.groupBy(_._1).map {
-        case (sid, entries) =>
-          sid -> SortedMap.from(entries.map(_._2))(Address.OrderingInstance)
-      }
-    }.flatMap { perShard =>
-      shardProducers.toList.traverse_ {
-        case (sid, producer) =>
-          val forShard = perShard.getOrElse(
-            sid,
-            SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]](Address.OrderingInstance)
-          )
-          producer
-            .produce(forShard, producedOrd, epoch)
-            .flatMap {
-              case None             => Async[F].unit
-              case Some(checkpoint) =>
-                // Recompute the producer's own (slot, vrfOutput) for the chain-store write.
-                // `slotForGl0Anchor(gl0AnchorOrdinal) = Slot(gl0AnchorOrdinal.value)` — identical
-                // pure mapping on producer + receiver so `maxvalid-tk` tiebreaks agree. vrfOutput is
-                // derived from the producer's own committee VRF proof (first committee signature),
-                // mirroring the receiver-side `vrfOutputFromProof` recovery so both writers store
-                // byte-identical vrfOutput for the same checkpoint.
-                val cp = checkpoint.value
-                val localSlot = cp.gl0AnchorOrdinal.value.value
-                val vrfProofBytes = cp.committeeSignatures.head.vrfProof.toBytes
-                val vrfOut = vrfOutputFromProof(vrfProofBytes)
-                shardChainStores.get(sid) match {
-                  case Some(store) =>
-                    store
-                      .store(checkpoint, cp.parentCheckpointHash, cp.shardOrdinal, localSlot, vrfOut)
-                      .flatMap { stored =>
-                        logger.info(
-                          s"🧩 Shard producer: stored own checkpoint shard=${sid.value.value} " +
-                            s"shardOrd=${cp.shardOrdinal.value} gl0Anchor=${cp.gl0AnchorOrdinal.value.value} " +
-                            s"new=$stored mgs=${forShard.size}"
+    shardProducers.toList.traverse_ {
+      case (sid, producer) =>
+        // EXECUTION-SHARDING committee gate (Task 2): with real VRF-VK-sortitioned committees, only run the producer for shard
+        // `sid` if THIS node is in `committeeMembership(sid, epoch)`. A non-member's checkpoint can never reach committee quorum at
+        // any verifier's `verifyEmbedded` (its signer fails the membership pre-check), so producing it is pure wasted work (and a
+        // non-member winning the LEADER lottery would emit a checkpoint no quorum can attest → liveness drag). Gate the whole
+        // produce path on membership; `committeeMembership` is the SAME deterministic draw the acceptance manager uses, so the gate
+        // is consistent with admission cluster-wide.
+        committeeMembership(sid, epoch).flatMap { committee =>
+          if (!committee.contains(selfPeerId))
+            logger.debug(
+              s"🧩 Shard producer: self not in committee for shard=${sid.value.value} epoch=${epoch.value}; skipping produce"
+            )
+          else {
+            // Read this shard's buffered raw binaries (non-destructive). Absent buffer ⇒ empty input ⇒ producer returns None.
+            val pendingF: F[SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]] =
+              shardBinaryBuffers.get(sid) match {
+                case Some(buffer) => buffer.snapshotPending
+                case None =>
+                  Async[F].pure(
+                    SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]](Address.OrderingInstance)
+                  )
+              }
+            pendingF.flatMap { forShard =>
+              producer
+                .produce(forShard, producedOrd, epoch)
+                .flatMap {
+                  case None             => Async[F].unit
+                  case Some(checkpoint) =>
+                    // Recompute the producer's own (slot, vrfOutput) for the chain-store write.
+                    // `slotForGl0Anchor(gl0AnchorOrdinal) = Slot(gl0AnchorOrdinal.value)` — identical
+                    // pure mapping on producer + receiver so `maxvalid-tk` tiebreaks agree. vrfOutput is
+                    // derived from the producer's own committee VRF proof (first committee signature),
+                    // mirroring the receiver-side `vrfOutputFromProof` recovery so both writers store
+                    // byte-identical vrfOutput for the same checkpoint.
+                    val cp = checkpoint.value
+                    val localSlot = cp.gl0AnchorOrdinal.value.value
+                    val vrfProofBytes = cp.committeeSignatures.head.vrfProof.toBytes
+                    val vrfOut = vrfOutputFromProof(vrfProofBytes)
+                    shardChainStores.get(sid) match {
+                      case Some(store) =>
+                        store
+                          .store(checkpoint, cp.parentCheckpointHash, cp.shardOrdinal, localSlot, vrfOut)
+                          .flatMap { stored =>
+                            logger.info(
+                              s"🧩 Shard producer: stored own checkpoint shard=${sid.value.value} " +
+                                s"shardOrd=${cp.shardOrdinal.value} gl0Anchor=${cp.gl0AnchorOrdinal.value.value} " +
+                                s"new=$stored mgs=${forShard.size}"
+                            )
+                          }
+                      case None =>
+                        logger.warn(
+                          s"🧩 Shard producer won shard=${sid.value.value} but no chain store registered; checkpoint not stored locally"
                         )
-                      }
-                  case None =>
-                    logger.warn(
-                      s"🧩 Shard producer won shard=${sid.value.value} but no chain store registered; checkpoint not stored locally"
-                    )
+                    }
                 }
             }
-      }
+          }
+        }
     }
 }

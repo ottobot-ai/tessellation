@@ -46,8 +46,11 @@ CL_DOCKER_GL0_PEER_HTTP_PORT=${DAG_L0_PORT_PREFIX}00
 CL_DOCKER_GL0_JOIN_ID=$GL0_GENERATED_WALLET_PEER_ID
 CL_DOCKER_GL1_JOIN_ID=$GL0_GENERATED_WALLET_PEER_ID
 
-CL_DOCKER_GL0_JOIN_IP=${NET_PREFIX}.10
-CL_DOCKER_GL1_JOIN_IP=${NET_PREFIX}.20
+CL_DOCKER_GL0_JOIN_IP=${NET_PREFIX}.$((GL0_IP_BASE + 0))
+# gl1-0's IP moved with GL1_IP_BASE (.20 → .30) so gl0's arithmetic IP band can't
+# overlap gl1. The BFT join target (gl1-0) is updated here in lockstep with the
+# per-node CL_DOCKER_GL1_IPV4 written in the loop below.
+CL_DOCKER_GL1_JOIN_IP=${NET_PREFIX}.$((GL1_IP_BASE + 0))
 
 CL_DOCKER_GL0_JOIN_PORT=${DAG_L0_PORT_PREFIX}01
 CL_DOCKER_GL1_JOIN_PORT=${DAG_L1_PORT_PREFIX}01
@@ -150,17 +153,31 @@ for i in $(seq 0 $((MAX_HG_NODES - 1))); do
   echo "CONTAINER_NAME_SUFFIX=-$i" >> .env
   echo "CONTAINER_OFFSET=$i" >> .env
 
-  L0_PORT="$DAG_L0_PORT_PREFIX$i"
-  L1_PORT="$DAG_L1_PORT_PREFIX$i"
+  # Per-node IP + ports — ARITHMETIC allocation (bases exported by set-env.sh) so
+  # the hypergraph scales past a single digit. Byte-identical to the legacy
+  # string-concat scheme for i<10. The seedlist builders in compose-runner.sh use
+  # the SAME bases, so the dial targets stay consistent with these bound ports/IPs.
+  #
+  #   gl0 IP   .(GL0_IP_BASE + i)            (legacy .1${i})
+  #   gl1 IP   .(GL1_IP_BASE + i)            (legacy .2${i}; base moved to .30)
+  #   gl0 ports  GL0_PORT_BASE + i*10        external==internal (legacy 90${i}{0,1,2})
+  #   gl1 internal ports  GL1_INT_PORT_BASE + i*10   (legacy 9100 band — gl1-0:9100 alias)
+  #   gl1 external ports  GL1_EXT_PORT_BASE + i*10   (lifted to avoid gl0/metagraph bands)
+  L0_PUBLIC=$((GL0_PORT_BASE + i*10))
+  L1_PUBLIC_EXT=$((GL1_EXT_PORT_BASE + i*10))
+  L1_PUBLIC_INT=$((GL1_INT_PORT_BASE + i*10))
 
-  # External ports
-  echo "CL_DOCKER_EXTERNAL_GL0_PUBLIC=${L0_PORT}0" >> .env
-  echo "CL_DOCKER_EXTERNAL_GL0_P2P=${L0_PORT}1" >> .env
-  echo "CL_DOCKER_EXTERNAL_GL0_CLI=${L0_PORT}2" >> .env
+  echo "CL_DOCKER_GL0_IPV4=${NET_PREFIX}.$((GL0_IP_BASE + i))" >> .env
+  echo "CL_DOCKER_GL1_IPV4=${NET_PREFIX}.$((GL1_IP_BASE + i))" >> .env
 
-  echo "CL_DOCKER_EXTERNAL_GL1_PUBLIC=${L1_PORT}0" >> .env
-  echo "CL_DOCKER_EXTERNAL_GL1_P2P=${L1_PORT}1" >> .env
-  echo "CL_DOCKER_EXTERNAL_GL1_CLI=${L1_PORT}2" >> .env
+  # External (host) ports
+  echo "CL_DOCKER_EXTERNAL_GL0_PUBLIC=${L0_PUBLIC}" >> .env
+  echo "CL_DOCKER_EXTERNAL_GL0_P2P=$((L0_PUBLIC + 1))" >> .env
+  echo "CL_DOCKER_EXTERNAL_GL0_CLI=$((L0_PUBLIC + 2))" >> .env
+
+  echo "CL_DOCKER_EXTERNAL_GL1_PUBLIC=${L1_PUBLIC_EXT}" >> .env
+  echo "CL_DOCKER_EXTERNAL_GL1_P2P=$((L1_PUBLIC_EXT + 1))" >> .env
+  echo "CL_DOCKER_EXTERNAL_GL1_CLI=$((L1_PUBLIC_EXT + 2))" >> .env
 
   # LocalEvents reactive gRPC stream — bind:50054 inside the container (set by
   # application.conf via NAKAMOTO_LOCAL_EVENTS_PORT). Host-side port stripes by
@@ -171,14 +188,16 @@ for i in $(seq 0 $((MAX_HG_NODES - 1))); do
 
   # These are only required on systems that implement docker with a host networking bridge
   # Port conflicts cause it to fail with external networks that re-use ports
-  # internal ports
-  echo "CL_DOCKER_INTERNAL_GL0_PUBLIC=${L0_PORT}0" >> .env
-  echo "CL_DOCKER_INTERNAL_GL0_P2P=${L0_PORT}1" >> .env
-  echo "CL_DOCKER_INTERNAL_GL0_CLI=${L0_PORT}2" >> .env
+  # internal (container) ports — gl0 keeps external==internal; gl1 internal stays
+  # in the legacy 9100 band (so gl1-0:9100 + the BFT join port 9101 still resolve)
+  # while gl1 external is lifted to GL1_EXT_PORT_BASE above.
+  echo "CL_DOCKER_INTERNAL_GL0_PUBLIC=${L0_PUBLIC}" >> .env
+  echo "CL_DOCKER_INTERNAL_GL0_P2P=$((L0_PUBLIC + 1))" >> .env
+  echo "CL_DOCKER_INTERNAL_GL0_CLI=$((L0_PUBLIC + 2))" >> .env
 
-  echo "CL_DOCKER_INTERNAL_GL1_PUBLIC=${L1_PORT}0" >> .env
-  echo "CL_DOCKER_INTERNAL_GL1_P2P=${L1_PORT}1" >> .env
-  echo "CL_DOCKER_INTERNAL_GL1_CLI=${L1_PORT}2" >> .env
+  echo "CL_DOCKER_INTERNAL_GL1_PUBLIC=${L1_PUBLIC_INT}" >> .env
+  echo "CL_DOCKER_INTERNAL_GL1_P2P=$((L1_PUBLIC_INT + 1))" >> .env
+  echo "CL_DOCKER_INTERNAL_GL1_CLI=$((L1_PUBLIC_INT + 2))" >> .env
 
   echo "CL_DOCKER_GL1_JOIN_INITIAL_DELAY=$((i*12 + 30))" >> .env
 

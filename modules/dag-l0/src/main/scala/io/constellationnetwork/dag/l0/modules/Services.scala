@@ -80,13 +80,26 @@ object Services {
     nipopowProofProviderRef: Ref[F, Option[
       io.constellationnetwork.node.shared.domain.nakamoto.nipopow.NipopowProofProvider[F]
     ]],
+    // Axis 2 (gl1 inclusion-proof follow) — observability seam for the GlobalFollowRoutes
+    // `GET /global-follow/slice/latest` endpoint. Mirrors `nipopowProofProviderRef`: created in
+    // Main, populated inside GlobalSnapshotConsensus.make (where the finalized GSI source is in scope),
+    // read by HttpApi. The service Ref carries the gl0-side slice producer, which reads the latest-
+    // finalized `(ordinal, GSI)` itself; the route returns 503 while it is still in its pre-wiring state.
+    globalFollowSliceServiceRef: Ref[F, Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService[F]
+    ]],
     // §1.2 Slice 3c: KesRegistry loaded from L0 genesis (or empty for CSV-genesis). Threaded
     // through to GlobalSnapshotConsensus.make.
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
     // Slice S1: VrfRegistry loaded from L0 genesis (`operators[].vrfPublicKey`) or empty for CSV-genesis.
     // Threaded through to GlobalSnapshotConsensus.make → ShardCheckpointWiring.acceptanceDeps as an
     // AVAILABLE dependency. Unconsumed in S1 (committee membership is still full-set) — no-op at any numShards.
-    vrfRegistry: io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[F]
+    vrfRegistry: io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[F],
+    // Split-safety (#261, eta axis): setter for the follower / `createContext` GSAM's deferred committee-eta
+    // chain walk (the Ref lives on `NodeShared`, created in `TessellationIOApp.make`). Flowed straight into
+    // `GlobalSnapshotConsensus.make`, which calls it once the chain store is built so the follower
+    // `EtaStateManager.getEta(P)` walks the SAME chain as the leader for every period P.
+    setFollowerEtaChainWalk: (Long => F[List[(Long, Array[Byte])]]) => F[Unit]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
@@ -271,13 +284,15 @@ object Services {
             nakamotoFinalizedOrdinalRef,
             finalityTriggerViewRef,
             nipopowProofProviderRef,
+            globalFollowSliceServiceRef,
             processMetagraphBinary,
             enqueueAllowSpendBlock,
             enqueueDAGBlock,
             enqueueTokenLockBlock,
             sidecarClient,
             kesRegistry,
-            vrfRegistry
+            vrfRegistry,
+            setFollowerEtaChainWalk
           )
       }
       addressService = AddressService.make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
@@ -310,6 +325,7 @@ object Services {
         sidecarClient = sidecarClient,
         finalityTriggerViewRef = finalityTriggerViewRef,
         nipopowProofProviderRef = nipopowProofProviderRef,
+        globalFollowSliceServiceRef = globalFollowSliceServiceRef,
         pendingReader = pendingReader,
         mutableKesRegistry = mutableKesRegistry
       ) {}
@@ -338,6 +354,12 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   // route returns 503 while the Ref is empty (pre-startup window).
   val nipopowProofProviderRef: Ref[F, Option[
     io.constellationnetwork.node.shared.domain.nakamoto.nipopow.NipopowProofProvider[F]
+  ]],
+  // Axis 2 (gl1 inclusion-proof follow) — observability seam for /global-follow/slice/latest.
+  // Populated inside GlobalSnapshotConsensus.make once the finalized GSI source is wired; read by
+  // HttpApi to build GlobalFollowRoutes. The route returns 503 while the service is still `None`.
+  val globalFollowSliceServiceRef: Ref[F, Option[
+    io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService[F]
   ]],
   // #117/#118 Phase 2: branch-aware reader for gl0 HTTP routes / read paths. Resolves to the
   // chain's bestTip under MultiBranch so reads pick up the chain's pending writes, falling

@@ -271,9 +271,24 @@ else
   # /16 subnet — hypergraph at NET_BASE.0.0/24, metagraph k at NET_BASE.${k+1}.0/24.
   # Allows K parallel metagraph clusters with disjoint /24s, no IP collisions.
   NET_BASE_SUBNET=${NET_PREFIX%.*}
+  # --ip-range confines Docker's DYNAMIC IP allocation to the UPPER half of the /16
+  # (NET_BASE.128.0/17 = .128.0 .. .255.254) so it can NEVER overlap the STATIC
+  # assignments, which all live in the LOWER half (NET_BASE.0..127.x):
+  #   gl0  NET_BASE.0.(GL0_IP_BASE+i)   = .0.10..   (docker-env-setup.sh)
+  #   gl1  NET_BASE.0.(GL1_IP_BASE+i)   = .0.30..
+  #   snapshot-streaming               = .0.60 / .0.61
+  #   metagraph k {ml0,cl1,dl1}        = NET_BASE.(k+1).{30,40,50}+i  (k>=0 ⇒ <.128.0)
+  # Containers with NO ipv4_address — the Go sidecars (one per gl0, addressed by
+  # container DNS name so a dynamic IP is fine), plus prometheus/nakamoto-grafana/
+  # grafana-renderer/tx-sender — used to climb from .0.2 upward and collided with
+  # gl0's static band once the 9th sidecar reached .0.10+. Pinning the dynamic pool
+  # to .128.0/17 (~32k addrs, far more than the ~25 unpinned containers at N=16)
+  # removes that collision class entirely while leaving every static IP outside the
+  # range (Docker requires static IPs to be in the subnet but NOT in --ip-range).
   docker network create \
     --driver=bridge \
     --subnet=${NET_BASE_SUBNET}.0.0/16 \
+    --ip-range=${NET_BASE_SUBNET}.128.0/17 \
     tessellation_common
 
   # Phase 1a: Seed compose files into hypergraph operator dirs (gl0+gl1)
@@ -361,9 +376,13 @@ else
         echo "ERROR: missing peer_id for node $j (expected at ./nodes/$j/peer_id)"
         exit 1
       fi
-      # Compute per-node IP and P2P port from the test cluster layout
-      NODE_IP="${NET_PREFIX}.1${j}"
-      NODE_P2P_PORT="${DAG_L0_PORT_PREFIX}${j}1"
+      # Compute per-node IP and P2P port from the test cluster layout. ARITHMETIC
+      # (bases exported by set-env.sh) — MUST match the bound IP/internal-P2P port
+      # written by docker-env-setup.sh (CL_DOCKER_GL0_IPV4 / CL_DOCKER_INTERNAL_GL0_P2P),
+      # since gl0 nodes dial each other at this address. Byte-identical to the legacy
+      # "${NET_PREFIX}.1${j}" / "${DAG_L0_PORT_PREFIX}${j}1" string-concat for j<10.
+      NODE_IP="${NET_PREFIX}.$((GL0_IP_BASE + j))"
+      NODE_P2P_PORT="$((GL0_PORT_BASE + j*10 + 1))"
       NAKAMOTO_JVM_SEEDLIST="${NAKAMOTO_JVM_SEEDLIST}${PEER_ID},${NODE_IP},${NODE_P2P_PORT},,\n"
     done
 
@@ -758,7 +777,11 @@ PROMEOF
     echo "    metrics_path: '/metrics'" >> "$PROM_CFG"
     echo "    static_configs:" >> "$PROM_CFG"
     for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
-      port=$((${DAG_L0_PORT_PREFIX}${i}0))
+      # gl0 metrics = its public HTTP port (internal == external for gl0).
+      # ARITHMETIC, matching docker-env-setup.sh; byte-identical to the legacy
+      # "${DAG_L0_PORT_PREFIX}${i}0" string-concat for i<10. (Prometheus scrapes
+      # by container DNS name + INTERNAL port, so the lifted host band is irrelevant.)
+      port=$((GL0_PORT_BASE + i*10))
       echo "      - targets: ['gl0-$i:$port']" >> "$PROM_CFG"
       echo "        labels: { layer: 'gl0', node: 'gl0-$i' }" >> "$PROM_CFG"
     done
@@ -783,9 +806,14 @@ PROMEOF
       -e ENABLE_METRICS=true \
       --restart unless-stopped grafana/grafana-image-renderer:latest >/dev/null 2>&1
 
+    # Prometheus HOST port: gl0-9's public port is 9090 (GL0_PORT_BASE + 9*10), so
+    # the legacy `-p 9090:9090` collides with the gl0 host band once N>9. Lift the
+    # host mapping to PROMETHEUS_HOST_PORT (default 19090); the container port stays
+    # 9090 so Grafana's `http://prometheus:9090` datasource is unaffected.
+    PROMETHEUS_HOST_PORT=${PROMETHEUS_HOST_PORT:-19090}
     docker run -d --name prometheus --network tessellation_common \
       -v "$PROM_CFG:/etc/prometheus/prometheus.yml:ro" \
-      -p 9090:9090 --restart unless-stopped prom/prometheus:latest >/dev/null 2>&1
+      -p ${PROMETHEUS_HOST_PORT}:9090 --restart unless-stopped prom/prometheus:latest >/dev/null 2>&1
 
     docker run -d --name nakamoto-grafana --network tessellation_common \
       -e GF_SECURITY_ADMIN_USER=admin -e GF_SECURITY_ADMIN_PASSWORD=admin \
@@ -798,7 +826,7 @@ PROMEOF
       --restart unless-stopped grafana/grafana:latest >/dev/null 2>&1
 
     echo "  Grafana: http://localhost:3000 (admin/admin)"
-    echo "  Prometheus: http://localhost:9090"
+    echo "  Prometheus: http://localhost:${PROMETHEUS_HOST_PORT}"
     echo "  Renderer: http://grafana-renderer:8081 (internal)"
     show_time "Monitoring started"
   fi

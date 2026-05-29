@@ -207,5 +207,21 @@ object LastNGlobalSnapshotStorage {
 
       def getLastN: F[List[Hashed[GlobalIncrementalSnapshot]]] =
         incrementalSnapshotsR.get.map(_.values.toList)
+
+      def getByOrdinal(ordinal: SnapshotOrdinal): F[Option[Hashed[GlobalIncrementalSnapshot]]] =
+        incrementalSnapshotsR.get.map(_.get(ordinal))
+
+      def registerFinalized(snapshots: List[Hashed[GlobalIncrementalSnapshot]]): F[Unit] =
+        incrementalSnapshotsR.update { incrementalSnapshots =>
+          val maxLastGlobalSnapshotsInMemory = lastGlobalSnapshotsSyncConfig.maxLastGlobalSnapshotsInMemory.value
+          val updated = snapshots.foldLeft(incrementalSnapshots) {
+            case (acc, current) => acc.updated(current.ordinal, current)
+          }
+          if (updated.size > maxLastGlobalSnapshotsInMemory)
+            updated.toSeq.sortBy(_._1.value.value).takeRight(maxLastGlobalSnapshotsInMemory).toSortedMap
+          else
+            updated
+        }
+          .whenA(snapshots.nonEmpty)
     }
 }

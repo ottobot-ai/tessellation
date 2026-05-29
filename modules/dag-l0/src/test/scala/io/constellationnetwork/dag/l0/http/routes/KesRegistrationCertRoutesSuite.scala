@@ -14,20 +14,25 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.{KesRegistrationCertValidator, MutableKesRegistry}
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.node.shared.http.routes.KesRegistrationCertRoutes
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.kes.KesRegistrationCert
-import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationReference}
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationRecord, KesRegistrationReference}
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.Signed.forAsyncHasher
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.kesRegistrationRecordSetCodec
+import io.constellationnetwork.serde.codecs.instances.KesRegistrationCodecs.kesRegistrationReferenceImmutableCodec
 import io.constellationnetwork.shared.sharedKryoRegistrar
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -160,16 +165,40 @@ object KesRegistrationCertRoutesSuite extends HttpSuite {
       def writeForBackfill(snapshot: Signed[GlobalIncrementalSnapshot])(implicit hasher: Hasher[IO]): IO[Unit] = IO.unit
     }
 
-  /** Build the routes under test. Returns `(routes, capturedSink)` so tests can assert the `onAccepted` callback received the cert on the
-    * happy path.
+  /** Seed the MPT-backed reader with one accepted cert under the canonical `KesRegistrationCerts` + `LastKesRegistrationRefs` partitions —
+    * the read path `MutableKesRegistry.runtimeCertsFor` resolves through. Mirrors `MutableKesRegistrySuite.writeRecord`; the runtime
+    * registry is now a pure MPT reader (the old `applyAccepted` mutator was removed), so seeding goes through the store directly.
+    */
+  private def writeRecord(
+    store: MptStore[IO, GlobalStateKey],
+    record: KesRegistrationRecord
+  )(implicit h: Hasher[IO]): IO[Unit] = {
+    val peerId = record.event.value.operatorPeerId
+    for {
+      certsKey <- GlobalStateKey.kesRegistrationCertsKey[IO](peerId)
+      existing <- store.get[SortedSet[KesRegistrationRecord]](certsKey)
+      newSet = existing.getOrElse(SortedSet.empty[KesRegistrationRecord]) + record
+      _ <- store.insert[SortedSet[KesRegistrationRecord]](Map(certsKey -> newSet))
+      ref <- KesRegistrationReference.of[IO](record.event)
+      refKey <- GlobalStateKey.lastKesRegistrationRefsKey[IO](peerId)
+      _ <- store.insert[KesRegistrationReference](Map(refKey -> ref))
+    } yield ()
+  }
+
+  /** Build the routes under test. Returns `(routes, capturedSink, mptStore)` — the store is exposed so seeding tests can write accepted
+    * certs into the canonical MPT partitions the registry reads from (the registry is now a pure MPT reader).
     */
   private def mkRoutes(
     implicit h: Hasher[IO],
-    sp: SecurityProvider[IO]
-  ): IO[(HttpRoutes[IO], Queue[IO, Signed[KesRegistrationCert]], MutableKesRegistry[IO])] =
+    sp: SecurityProvider[IO],
+    j: JsonSerializer[IO]
+  ): IO[(HttpRoutes[IO], Queue[IO, Signed[KesRegistrationCert]], MptStore[IO, GlobalStateKey])] =
     for {
       base <- IO.pure(KesRegistry.empty[IO])
-      mutableRegistry <- MutableKesRegistry.make[IO](base)
+      producer <- InMemoryMerklePatriciaProducer.make[IO]()
+      store <- MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
+      reader = GlobalStateReader.fromMptStore[IO](store)
+      mutableRegistry <- MutableKesRegistry.make[IO](base, reader)
       sinkQueue <- Queue.unbounded[IO, Signed[KesRegistrationCert]]
       validator = KesRegistrationCertValidator.make[IO](
         io.constellationnetwork.security.signature.SignedValidator.make[IO],
@@ -182,10 +211,10 @@ object KesRegistrationCertRoutesSuite extends HttpSuite {
         stubSnapshotStorage(currentEpoch),
         mutableRegistry
       ).publicRoutes
-    } yield (routes, sinkQueue, mutableRegistry)
+    } yield (routes, sinkQueue, store)
 
   test("POST a well-formed cert → 200 OK + body has hash + onAccepted sink received the cert") { res =>
-    implicit val (h, sp, _, kp, operatorId) = res
+    implicit val (h, sp, j, kp, operatorId) = res
     val cert = mkCert(operatorId)
     for {
       signed <- forAsyncHasher(cert, kp)
@@ -197,7 +226,7 @@ object KesRegistrationCertRoutesSuite extends HttpSuite {
   }
 
   test("POST cert signed by a key that is not the operator → 400 Bad Request") { res =>
-    implicit val (h, sp, _, kp, operatorId) = res
+    implicit val (h, sp, j, kp, operatorId) = res
     val cert = mkCert(operatorId)
     for {
       otherKp <- KeyPairGenerator.makeKeyPair[IO]
@@ -211,7 +240,7 @@ object KesRegistrationCertRoutesSuite extends HttpSuite {
   }
 
   test("POST cert with stale ordinal (ordinal <= lastSeen) → 400 Bad Request (NonMonotonicOrdinal)") { res =>
-    implicit val (h, sp, _, kp, operatorId) = res
+    implicit val (h, sp, j, kp, operatorId) = res
     // First, seed the registry with an accepted cert at ordinal=2.
     val firstCert = mkCert(operatorId, ordinal = KesRegistrationOrdinal(NonNegLong(2L)))
     // Then replay ordinal=2 again — must be rejected as NonMonotonicOrdinal.
@@ -219,11 +248,9 @@ object KesRegistrationCertRoutesSuite extends HttpSuite {
     for {
       signedFirst <- forAsyncHasher(firstCert, kp)
       signedReplay <- forAsyncHasher(replayCert, kp)
-      (routes, sinkQueue, mutableRegistry) <- mkRoutes
-      // Seed the registry so `lastReferenceFor(operatorId)` returns the first cert's ref.
-      _ <- mutableRegistry.applyAccepted(
-        SortedMap(operatorId -> KesRegistrationCert.KesRegistrationRecord(signedFirst, SnapshotOrdinal(NonNegLong(1L))))
-      )
+      (routes, sinkQueue, store) <- mkRoutes
+      // Seed the MPT (the registry's read source) so `lastReferenceFor(operatorId)` returns the first cert's ref.
+      _ <- writeRecord(store, KesRegistrationRecord(signedFirst, SnapshotOrdinal(NonNegLong(1L))))
       req = POST(signedReplay, uri"/kes-registration")
       result <- expectHttpStatus(routes, req)(Status.BadRequest)
       sinkSize <- sinkQueue.size
@@ -231,20 +258,18 @@ object KesRegistrationCertRoutesSuite extends HttpSuite {
   }
 
   test("GET /kes-registration/{peerId}/last-reference → 200 + registry head for that operator") { res =>
-    implicit val (h, sp, _, kp, operatorId) = res
+    implicit val (h, sp, j, kp, operatorId) = res
     // Empty case first.
     for {
-      (routes, _, mutableRegistry) <- mkRoutes
+      (routes, _, store) <- mkRoutes
       emptyReq = GET(Uri.unsafeFromString(s"/kes-registration/${operatorId.value.value}/last-reference"))
       emptyExpected = KesRegistrationReference.empty
       emptyResult <- expectHttpBodyAndStatus(routes, emptyReq)(emptyExpected, Status.Ok)
 
-      // Seed registry, then GET again.
+      // Seed the MPT (the registry's read source), then GET again.
       seededCert = mkCert(operatorId, ordinal = KesRegistrationOrdinal(NonNegLong(7L)))
       signedSeeded <- forAsyncHasher(seededCert, kp)
-      _ <- mutableRegistry.applyAccepted(
-        SortedMap(operatorId -> KesRegistrationCert.KesRegistrationRecord(signedSeeded, SnapshotOrdinal(NonNegLong(1L))))
-      )
+      _ <- writeRecord(store, KesRegistrationRecord(signedSeeded, SnapshotOrdinal(NonNegLong(1L))))
       seededReq = GET(Uri.unsafeFromString(s"/kes-registration/${operatorId.value.value}/last-reference"))
       expectedRef <- signedSeeded.toHashed.map(KesRegistrationReference.of)
       seededResult <- expectHttpBodyAndStatus(routes, seededReq)(expectedRef, Status.Ok)

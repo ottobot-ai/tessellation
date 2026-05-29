@@ -134,7 +134,15 @@ object SharedServices {
     // reads from a `Ref[Option[NakamotoChainStoreAlgebra[F]]]`). See `GlobalSnapshotConsensus.make` for the
     // dag-l0 GSAM construction which also uses the same `EtaStateManager.make` shape.
     nakamotoGenesisEta: Array[Byte] = SharedServices.DefaultNakamotoGenesisEta,
-    nakamotoEtaChainWalkFallback: Option[Long => F[List[(Long, Array[Byte])]]] = None
+    nakamotoEtaChainWalkFallback: Option[Long => F[List[(Long, Array[Byte])]]] = None,
+    // Split-safety (#261): the genesis-derived KES + VRF registries the createContext / follower GSAM uses to verify embedded shard
+    // checkpoints IDENTICALLY to the gl0 produce + validateArtifact paths. With real VRF-VK committee sortition + KES, an empty registry
+    // here would draw a DIFFERENT committee than the leader (and skip KES verify), so a follower could ADOPT a checkpoint the leader
+    // REJECTED → StateProofMismatch split. The sole caller `TessellationIOApp.make` supplies these via the overridable
+    // `nakamotoShardRegistries` hook: gl0's `Main` loads the real genesis registries; layers that don't run shard-committee acceptance
+    // (cl0/cl1/dl1/gl1) pass empty — byte-identical to before, since those layers don't activate shard-committee acceptance.
+    shardKesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
+    shardVrfRegistry: io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     currencyStateProofSelector: CurrencyStateProofSelector
@@ -257,16 +265,21 @@ object SharedServices {
       shardAcceptanceDeps <- ShardCheckpointWiring.acceptanceDeps[F](
         cfg = cfg.nakamoto.sharding,
         selfPeerId = nodeId,
-        kesRegistry = io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[F],
-        // Slice S1: the verify/follower path has no genesis-loaded VRF registry in scope (it lives at the gl0
-        // layer — see GlobalSnapshotConsensus). Pass `VrfRegistry.empty`; the registry is unconsumed in S1
-        // (full-set committee membership), so empty here is a no-op exactly as `KesRegistry.empty` is.
-        vrfRegistry = io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[F],
+        // Split-safety (#261): the createContext / follower GSAM MUST use the SAME genesis-derived KES + VRF registries the gl0
+        // produce path uses, or `verifyEmbedded` draws a different committee (VRF) / skips KES verify and the adopt decision
+        // diverges → StateProofMismatch split. Passed in via `TessellationIOApp.nakamotoShardRegistries` (gl0 loads the real ones;
+        // other layers + tests get empty — identical to before, since those layers don't activate shard-committee acceptance).
+        kesRegistry = shardKesRegistry,
+        vrfRegistry = shardVrfRegistry,
         activeValidators = Async[F].pure(
           seedlist
             .map(_.collect { case e if !e.alias.exists(_.value.value == "metagraph-op") => e.peerId })
             .getOrElse(Set(nodeId))
         ),
+        // Per-period eta for the committee draw — the SAME `EtaStateManager.getEta` resolver (`sharedEtaForPeriod`) the GSAM
+        // boundary writer uses, decoded to 32 raw bytes. MPT-committed ⇒ byte-identical to the gl0 produce path's `etaForEpoch`.
+        etaForEpoch = (epoch: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
+          sharedEtaForPeriod(epoch).map(h => io.constellationnetwork.security.hex.Hex(h.value).toBytes),
         // S3: real committee re-execution closure (replaces the `noReExecDerivation` fail-closed stub). Same shared
         // processor as GSAM so producer↔verifier roots are byte-identical.
         reExecuteDerivation = Some(

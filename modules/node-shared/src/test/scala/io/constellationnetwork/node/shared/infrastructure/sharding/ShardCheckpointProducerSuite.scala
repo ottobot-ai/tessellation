@@ -106,15 +106,19 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
   private def hashFromString(s: String): Hash =
     Hash.fromBytes(s.getBytes("UTF-8"))
 
-  /** Build a stub `Signed[StateChannelSnapshotBinary]`. The producer doesn't run any chain-link validation on the binary itself — it only
-    * passes the binary to `derivePerMgState` — so a hand-crafted body + sentinel signature is sufficient.
+  /** Build a stub `Signed[StateChannelSnapshotBinary]` anchored on `parent`.
+    *
+    * EXECUTION-SHARDING R-2: `produce` now chain-link-orders pending binaries off the shard's `perMgTip` (genesis ⇒ `Hash.empty`). So the
+    * binary's `lastSnapshotHash` MUST equal the anchor it is meant to chain off — `Hash.empty` for the genesis round, or the prior round's
+    * included-binary hash thereafter. `content` varies by `(mgLabel, idx)` so distinct binaries get distinct canonical hashes.
     */
-  private def mkSignedBinary(mgLabel: String, idx: Int): Signed[StateChannelSnapshotBinary] = {
+  private def mkSignedBinary(mgLabel: String, idx: Int, parent: Hash = Hash.empty): Signed[StateChannelSnapshotBinary] = {
     import cats.data.NonEmptySet
     import io.constellationnetwork.schema.ID.Id
     import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
+    val _ = mgLabel
     val body = StateChannelSnapshotBinary(
-      lastSnapshotHash = hashFromString(s"$mgLabel-parent-$idx"),
+      lastSnapshotHash = parent,
       content = Array.fill[Byte](16)(idx.toByte),
       fee = SnapshotFee(NonNegLong.unsafeFrom(0L))
     )
@@ -122,14 +126,31 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     Signed(body, NonEmptySet.of(sentinelProof))
   }
 
-  /** Build pending snapshots map for `numMgs` MGs, with one signed binary each. The `SortedMap` order is the same as the address ordering —
-    * the test asserts that `derivePerMgState` is called once per MG regardless of order.
+  /** Build pending snapshots map for `numMgs` MGs, with one signed binary each, all anchored at genesis (`Hash.empty`). The `SortedMap`
+    * order is the same as the address ordering — the test asserts that `derivePerMgState` is called once per MG regardless of order.
     */
   private def mkPendingSnapshots(numMgs: Int): SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] =
     SortedMap.from(
       (0 until numMgs).map { i =>
         val mg = mkAddress(s"mg-$i")
         mg -> NonEmptyList.of(mkSignedBinary(s"mg-$i", i))
+      }
+    )
+
+  /** EXECUTION-SHARDING R-2: build the next-round pending set chained off the shard's current `perMgTip`. For each MG present in
+    * `perMgTip`, the new binary references that tip (so it's admissible to the producer's `chainLinkOrder`); for MGs absent from `perMgTip`
+    * (none, in the sequential-produce tests) it anchors at genesis. Keeps the producer's chain-link gate satisfied across successive
+    * produces.
+    */
+  private def mkPendingChainedOff(
+    perMgTip: SortedMap[Address, Hash],
+    round: Int
+  ): SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] =
+    SortedMap.from(
+      (0 until 2).map { i =>
+        val mg = mkAddress(s"mg-$i")
+        val parent = perMgTip.getOrElse(mg, Hash.empty)
+        mg -> NonEmptyList.of(mkSignedBinary(s"mg-$i", i + round * 100, parent))
       }
     )
 
@@ -294,14 +315,29 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       gl0Eta = randomGl0Eta()
       shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
       producer <- makeProducer(ssl, rig, Ratio.One, shardEta)
-      // Produce one — its parent is Hash.empty (genesis), then insert it into the chain store so the next produce sees a non-empty tip.
-      first <- tryProduceUntilSome(producer, startOrd = 2000L, EtaPeriod(0L), maxAttempts = 100)
+      // Produce one — its binaries are genesis-anchored (Hash.empty), then insert it into the chain store so the next produce sees a
+      // non-empty tip. (R-2: the FIRST round's pending must chain off the empty perMgTip ⇒ Hash.empty-anchored binaries.)
+      first <- tryProduceUntilSome(
+        producer,
+        startOrd = 2000L,
+        EtaPeriod(0L),
+        maxAttempts = 100,
+        pending = mkPendingChainedOff(SortedMap.empty, round = 0)
+      )
       firstCp <- IO.fromOption(first)(new RuntimeException("produce-1 should win at σ=1 within 100 attempts"))
       _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty, slot = 1L)
       tipAfterFirst <- rig.chainStore.bestTip
       firstHash = tipAfterFirst.get.hash
-      // Produce a second — its parent should now be the first's canonical hash.
-      second <- tryProduceUntilSome(producer, startOrd = 2100L, EtaPeriod(0L), maxAttempts = 100)
+      // R-2: the second round's pending binaries must now chain off the SHARD's advanced perMgTip (the first round's included-binary
+      // hashes), or the producer's chain-link gate omits them and produce returns None.
+      perMgTipAfterFirst <- rig.chainStore.perMgTip
+      second <- tryProduceUntilSome(
+        producer,
+        startOrd = 2100L,
+        EtaPeriod(0L),
+        maxAttempts = 100,
+        pending = mkPendingChainedOff(perMgTipAfterFirst, round = 1)
+      )
       secondCp <- IO.fromOption(second)(new RuntimeException("produce-2 should win at σ=1 within 100 attempts"))
     } yield
       expect.all(
@@ -323,12 +359,19 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
       producer <- makeProducer(ssl, rig, Ratio.One, shardEta)
       // Produce 3 in sequence; ordinals should be 1, 2, 3. After each produce, install the result in the chain store so the next call
-      // observes the updated tip.
+      // observes the updated tip. R-2: each round's pending binaries chain off the SHARD's current perMgTip (genesis on round 0).
       ords <- (0 until 3).toList
         .foldLeftM[IO, (List[Long], Hash)]((List.empty, Hash.empty)) {
           case ((acc, parentHash), i) =>
             for {
-              produced <- tryProduceUntilSome(producer, startOrd = 3000L + i * 100L, EtaPeriod(0L), maxAttempts = 100)
+              perMgTip <- rig.chainStore.perMgTip
+              produced <- tryProduceUntilSome(
+                producer,
+                startOrd = 3000L + i * 100L,
+                EtaPeriod(0L),
+                maxAttempts = 100,
+                pending = mkPendingChainedOff(perMgTip, round = i)
+              )
               cp <- IO.fromOption(produced)(new RuntimeException(s"produce-${i + 1} should win at σ=1 within 100 attempts"))
               _ <- insertIntoStore(rig.chainStore, cp, parentHash = parentHash, slot = i.toLong + 1L)
               tip <- rig.chainStore.bestTip
@@ -361,7 +404,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         seenList.toSet == pending.keys.toSet,
         cp.value.derivedStateDelta.perMetagraphMptRoots.size == pending.keys.size,
         cp.value.derivedStateDelta.perMetagraphMptRoots.keys.toSet == pending.keys.toSet,
-        // includedSnapshots is the verbatim input — slice 8 doesn't transform the per-MG SC binary chain.
+        // includedSnapshots is the chain-link-ordered input (R-2). For single-binary genesis-anchored MGs the order
+        // equals the input, so it round-trips to `pending`.
         cp.value.derivedStateDelta.includedSnapshots == pending,
         // Other delta fields are empty in slice 8 (wired in slice 9/13 when real derivation closure is plugged in).
         cp.value.derivedStateDelta.tokenLockBalancesDelta.isEmpty,

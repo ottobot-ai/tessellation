@@ -89,10 +89,38 @@ trait ShardCheckpointGl0AcceptanceManager[F[_]] {
 
   /** gl0 leader runs this for each candidate [[ShardCheckpoint]] under consideration for inclusion in the next gl0 snapshot.
     *
+    * '''Node-local — selection / finality-monitor path only.''' [[evaluate]] consults the node-local [[ShardFinalityTriggers]] (read of
+    * `tCountShard` / `tDepth1Shard` `latestQualifyingOrdinal`). Those are advanced by the shard chain's tick loop at wall-clock-dependent
+    * speed, so two honest nodes can return DIFFERENT results for the same checkpoint at the same instant. That is acceptable for the gl0
+    * leader's PRODUCE-side selection (which checkpoints to even consider this ord — a liveness/selection decision, gossip-timing-tolerant
+    * by §7.2 loose coupling) but is NOT safe for the consensus-critical ADOPT decision. The adopt path uses [[verifyEmbedded]] instead.
+    *
     * Returns one of the [[ShardCheckpointAcceptResult]] variants; the caller branches on the variant for inclusion / deferral / rejection
     * (+ optional slashing evidence emission).
     */
   def evaluate(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult]
+
+  /** DETERMINISTIC adopt-verifier — the consensus-critical counterpart of [[evaluate]].
+    *
+    * '''Why a separate method (split-safety, the central invariant).''' At `numShards > 1` gl0 ADOPTS embedded checkpoints rather than
+    * re-running the legacy SC chain-link, so the adopt decision (and the committed state that follows) MUST be a PURE function of the
+    * checkpoint's own bytes + the deterministic committee membership for `(shardId, epoch)` + the prior gl0 finalized state — with NO
+    * node-local inputs. Every gl0 node (leader producing, follower in `createContext`, gl0 peer in `validateArtifact`) calls THIS over the
+    * same embedded checkpoint and computes a byte-identical outcome. [[evaluate]] cannot be used here because it reads the node-local
+    * [[ShardFinalityTriggers]] (see its scaladoc) — two honest nodes would diverge and the cluster would split.
+    *
+    * '''Decision (deterministic, count-based quorum — no triggers).'''
+    *   1. Run the SAME [[evaluate]] pre-checks (committee membership + Ed25519 + KES + VRF-structural per signer) — fully deterministic.
+    *      `Left` ⇒ [[ShardCheckpointAcceptResult.Rejected]].
+    *   1. Compute `kS = committeeMembership(shardId, epoch).size` and `threshold = ceil(2·kS/3)`. The pre-check already proved every
+    *      embedded signature is a valid distinct committee member, so the count of (deduplicated-by-peerId) signatures IS the
+    *      valid-attestation count. `count >= threshold` ⇒ [[ShardCheckpointAcceptResult.Accepted]]. This is "Phase 2 broadly" (§7.3
+    *      `T_count_shard`) made deterministic directly from the embedded attestation; count-based ≡ stake-based at the v1 uniform-σ
+    *      committee rule (design §5.4).
+    *   1. Otherwise (degraded / sub-quorum) ⇒ the existing re-exec failover (`reExecPath`). With the fail-closed `reExecuteDerivation` stub
+    *      it yields a deterministic [[ShardCheckpointAcceptResult.Rejected]] / mismatch — never a node-local-dependent answer.
+    */
+  def verifyEmbedded(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult]
 }
 
 object ShardCheckpointGl0AcceptanceManager {
@@ -224,6 +252,50 @@ object ShardCheckpointGl0AcceptanceManager {
                           .as(ShardCheckpointAcceptResult.PendingMoreAttestations: ShardCheckpointAcceptResult)
                       }
                   } yield result
+              }
+          }
+
+        def verifyEmbedded(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult] =
+          // Step 1: pre-checks — IDENTICAL to `evaluate` (committee membership + Ed25519 + KES + VRF-structural per signer). Fully
+          // deterministic: the only inputs are the checkpoint bytes + the deterministic `committeeMembership(shardId, epoch)` draw.
+          preCheck(checkpoint).flatMap {
+            case Left(reason) =>
+              logger.warn(
+                s"verifyEmbedded reject pre-check: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} reason=$reason"
+              ) >>
+                ShardMetrics
+                  .incCheckpointRejected[F](checkpoint.shardId, ShardMetrics.RejectReason.fromDiagnostic(reason))
+                  .as(ShardCheckpointAcceptResult.Rejected(reason): ShardCheckpointAcceptResult)
+            case Right(()) =>
+              // Step 2: DETERMINISTIC quorum from the embedded attestation — NO `finalityTriggers`, NO node-local depth/tip. The pre-check
+              // already proved every signature is a valid distinct committee member; dedup by peerId defensively (a duplicate signer must
+              // not inflate the count) and compare against `ceil(2·kS/3)` where `kS = |committee(shardId, epoch)|`. Identical on every node.
+              committeeMembership(checkpoint.shardId, checkpoint.epoch).flatMap { committee =>
+                val kS = committee.size
+                // ⌈2·kS/3⌉ via integer ceil-division: (2·kS + 2) / 3. A degenerate empty committee (kS = 0) yields threshold 0; the
+                // pre-check would already have rejected (no signer can be a member of the empty set), so this branch is unreachable for
+                // kS = 0 — but the formula stays safe regardless.
+                val threshold = (2 * kS + 2) / 3
+                val distinctSigners = checkpoint.committeeSignatures.toList.map(_.peerId).toSet.size
+                if (distinctSigners >= threshold)
+                  logger.info(
+                    s"verifyEmbedded accept quorum: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} " +
+                      s"distinctSigners=$distinctSigners threshold=$threshold kS=$kS"
+                  ) >>
+                    ShardMetrics
+                      .incCheckpointAccepted[F](checkpoint.shardId, ShardMetrics.Path.TCount)
+                      .as(ShardCheckpointAcceptResult.Accepted: ShardCheckpointAcceptResult)
+                else {
+                  // Sub-quorum (degraded liveness): fall back to the deterministic re-exec failover. With the production fail-closed
+                  // `reExecuteDerivation` stub this yields a deterministic Rejected/mismatch; with a real derivation it byte-compares the
+                  // recomputed per-MG roots against the committee-signed `perMetagraphMptRoots` — both node-agnostic.
+                  logger.info(
+                    s"verifyEmbedded sub-quorum → re-exec: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} " +
+                      s"distinctSigners=$distinctSigners threshold=$threshold kS=$kS"
+                  ) >>
+                    ShardMetrics.incCommitteePartition[F](checkpoint.shardId) >>
+                    reExecPath(checkpoint)
+                }
               }
           }
 

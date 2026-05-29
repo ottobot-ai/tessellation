@@ -235,6 +235,17 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
     )(implicit hasher: Hasher[F]): IO[Hash] = ???
 
+    def assembleAcceptanceResult(
+      processed: SortedMap[
+        Address,
+        (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], SortedMap[Address, Balance])
+      ],
+      priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+        CurrencySnapshot
+      ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+      returned: Set[StateChannelOutput]
+    ): StateChannelAcceptanceResult = ???
+
   }
 
   private val signedValidator = new SignedValidator[IO] {
@@ -543,7 +554,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         numShards = 4,
         committeeKTarget = 4,
         finality = ShardFinalityConfig(k1Shard = 8L),
-        checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100),
+        checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100, binaryBufferCap = 4096),
         observability = ShardObservabilityConfig(tPartitionHardMs = 600000L),
         slashing = ShardSlashingConfig(maxMissedPctPerEpoch = 33, minDenominatorPerEpoch = 5L)
       )
@@ -561,7 +572,8 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           selfPeerId = selfId,
           kesRegistry = io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO],
           vrfRegistry = io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[IO],
-          activeValidators = IO.pure(Set(selfId))
+          activeValidators = IO.pure(Set(selfId)),
+          etaForEpoch = (_: io.constellationnetwork.schema.nakamoto.EtaPeriod) => IO.pure(Array.fill[Byte](32)(0.toByte))
         )
       followerGscf <- mkGlobalSnapshotConsensusFunctions(followerDeps)
 

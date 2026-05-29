@@ -75,7 +75,10 @@ object Services {
           lastGlobalSnapshotStorage,
           None,
           maybeMajorityPeerIds,
-          sharedStorages.mptStore
+          sharedStorages.mptStore,
+          // gl1 own-slice follow transport (Axis 2) — enables `getLatestFollowSlice`, consumed by
+          // `DAGSnapshotProcessor.applyGlobalSnapshotFn` to fetch+verify gl0's slice instead of re-executing.
+          Some(p2PClient.globalFollow)
         )
       val session = sharedServices.session
       val transaction =

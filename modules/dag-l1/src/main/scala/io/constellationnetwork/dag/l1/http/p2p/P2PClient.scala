@@ -32,7 +32,10 @@ object P2PClient {
       BlockConsensusClient.make(client),
       L0GlobalSnapshotClient.make(client, none, sharedConfig.snapshotTimeoutsConfig),
       SwapConsensusClient.make(client),
-      TokenLockConsensusClient.make(client)
+      TokenLockConsensusClient.make(client),
+      // gl1 own-slice follow transport (Axis 2): GET /global-follow/slice/latest against a GL0 peer.
+      // Same `Client[F]`/PeerResponse pattern as L0GlobalSnapshotClient above.
+      GlobalFollowClient.make(client)
     ) {}
 }
 
@@ -46,5 +49,6 @@ sealed abstract class P2PClient[F[_]] private (
   val blockConsensus: BlockConsensusClient[F],
   val l0GlobalSnapshot: L0GlobalSnapshotClient[F],
   val swapConsensusClient: SwapConsensusClient[F],
-  val tokenLockConsensusClient: TokenLockConsensusClient[F]
+  val tokenLockConsensusClient: TokenLockConsensusClient[F],
+  val globalFollow: GlobalFollowClient[F]
 )
