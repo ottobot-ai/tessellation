@@ -494,7 +494,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
         priceState = None,
         lastGlobalSnapshotsWithCurrency = None,
         mptRoot = None,
-        historicalStakeSnapshots = None
+        historicalStakeSnapshots = None,
+        smtRoot = None
       ),
       Some(SortedSet.empty),
       Some(SortedSet.empty),

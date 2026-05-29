@@ -35,6 +35,7 @@ case class GlobalSnapshotStateProofV1(
       None,
       None,
       None,
+      None,
       None
     )
 }
@@ -77,7 +78,17 @@ case class GlobalSnapshotStateProof(
     * `mptRoot` (which hashes over the full byte map including this partition's entries) — the per-field hash is supplied for efficient
     * single-period Merkle proofs by NIPoPoW light clients.
     */
-  historicalStakeSnapshots: Option[Hash]
+  historicalStakeSnapshots: Option[Hash],
+  /** §3 NIPoPoW historical-commitment SMT: the SINGLE root of the unbounded, on-disk SMT keyed by snapshot ordinal whose leaves are
+    * `PerOrdinalCommitment(hypergraphRoot, incrementalSnapshotHash, towerEligibility)` (see
+    * `node.shared.domain.nakamoto.nipopow.HistoricalCommitmentSmtStore`). `smtRoot(N) = SMT({ (i, commitment_i) : i ≤ N−k }).root`, `k` =
+    * the confirmation depth, so it commits ONLY finalized ordinals (circularity-free: snapshot N's own incremental hash first appears in
+    * `smtRoot(N+k)`). `None` in the genesis/warmup window (`N ≤ k`) and on any proof-build path that lacks the maintained store (those are
+    * EXCLUDED from the `StateProofValidator` `===` via `StateProofComparison`; the field is populated + cross-checked on the
+    * producer/follower-symmetric GSAM accept path). NOT transitively covered by `mptRoot` — the SMT is a SEPARATE on-disk store, so the
+    * hypergraph (ledger) root stays independent of `smtRoot`.
+    */
+  smtRoot: Option[Hash]
 ) extends StateProof
 
 object GlobalSnapshotStateProof {
@@ -100,10 +111,11 @@ object GlobalSnapshotStateProof {
       Option[Hash],
       Option[Hash],
       Option[Hash],
+      Option[Hash],
       Option[Hash]
     )
   ) => GlobalSnapshotStateProof = {
-    case (x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18) =>
-      GlobalSnapshotStateProof.apply(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18)
+    case (x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19) =>
+      GlobalSnapshotStateProof.apply(x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19)
   }
 }

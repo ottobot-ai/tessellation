@@ -63,7 +63,7 @@ object StateProofValidator {
     make(CurrencySnapshotInfo.stateProofBuilder[F])
 
   /** Create a StateProofValidator from a custom StateProofBuilder. */
-  def make[F[_]: Async: Parallel: JsonSerializer, I <: SnapshotInfo[P], P <: StateProof: Eq](
+  def make[F[_]: Async: Parallel: JsonSerializer, I <: SnapshotInfo[P], P <: StateProof: StateProofComparison](
     builder: StateProofBuilder[F, I, P]
   ): StateProofValidator[F, I, P] =
     new StateProofValidator[F, I, P] {
@@ -82,7 +82,7 @@ object StateProofValidator {
     }
 
   /** Validate a pre-computed state proof against the snapshot. */
-  def validateProof[F[_]: Async, P <: StateProof: Eq, A <: IncrementalSnapshot[P]](
+  def validateProof[F[_]: Async, P <: StateProof: StateProofComparison, A <: IncrementalSnapshot[P]](
     snapshot: Hashed[A],
     stateProof: P
   ): F[Validated[StateBroken, Unit]] = {
@@ -90,7 +90,9 @@ object StateProofValidator {
     val expectedStateProof = snapshot.signed.value.stateProof
 
     val result = Validated.cond(
-      stateProof === expectedStateProof,
+      // `equivalent` is structural equality for every field EXCEPT GlobalSnapshotStateProof.smtRoot (not recomputable on this rebuild
+      // path; see StateProofComparison). Every other proof type uses full Eq via `StateProofComparison.fromEq`.
+      StateProofComparison[P].equivalent(stateProof, expectedStateProof),
       (),
       StateBroken(snapshot.ordinal, snapshot.hash)
     )

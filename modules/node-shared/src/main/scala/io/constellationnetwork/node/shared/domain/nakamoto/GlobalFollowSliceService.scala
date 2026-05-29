@@ -14,35 +14,36 @@ import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
 /** gl0-side SLICE PRODUCER for the gl1 own-slice follow path (Axis 2 — see `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`).
   *
   * gl1 holds ONLY its slice — the five consumed fields ([[io.constellationnetwork.schema.nakamoto.follow.FollowVerifyCore.consumedFields]]:
-  * `Balances`, `LastTxRefs`, `LastAllowSpendRefs`, `LastTokenLockRefs`, `ActiveTokenLocks`) — and verifies by recompute-and-match (field-root
-  * equality). This service is the gl0 half that PRODUCES the slice a follower applies + recompute-matches against the signed
+  * `Balances`, `LastTxRefs`, `LastAllowSpendRefs`, `LastTokenLockRefs`, `ActiveTokenLocks`) — and verifies by recompute-and-match
+  * (field-root equality). This service is the gl0 half that PRODUCES the slice a follower applies + recompute-matches against the signed
   * `stateProof.<field>Proof`.
   *
   * '''Sourced from the GSI, not the MPT (own-slice rework, 2026-05-28).''' The slice is projected directly from gl0's latest-FINALIZED
   * `GlobalSnapshotInfo`, captured by `SnapshotLeaderLoop` at its finalize sink (the `StoredSnapshot.context` of the snapshot it just
   * finalized) into a `Ref` this service reads. It must be the FINALIZED GSI, NOT `LastNGlobalSnapshotStorage.getCombined` /
   * `combinedSnapshotsR` (which holds the latest PRODUCED GSI — ahead of the finalized watermark and therefore unresolvable by a
-  * finality-gated (#122) gl1 follower, the alignment bug this closes). The five consumed fields are already Address-keyed typed maps
-  * there (`gsi.balances: SortedMap[Address, Balance]`, `gsi.lastTxRefs`, `gsi.lastAllowSpendRefs`, `gsi.lastTokenLockRefs`,
-  * `gsi.getActiveTokenLocks`), so the producer hands them back unchanged. This drops the prior Hex-MPT read path entirely: the follower's verifier forward-hashes each `(Address, value)`
-  * to its MPT leaf (`toHex(hypergraph(field, address))` + `immutableBytes(value)`) to recompute the field roots, so byte-identity with gl0's
-  * leaves is reproduced on the verify side, not extracted from the store here. Address-keyed keeps gl1's downstream
-  * (`TransactionService` / `Collateral` / `CollateralDaemon` / `mptStore.syncFromGlobalSnapshotInfo`) unchanged.
+  * finality-gated (#122) gl1 follower, the alignment bug this closes). The five consumed fields are already Address-keyed typed maps there
+  * (`gsi.balances: SortedMap[Address, Balance]`, `gsi.lastTxRefs`, `gsi.lastAllowSpendRefs`, `gsi.lastTokenLockRefs`,
+  * `gsi.getActiveTokenLocks`), so the producer hands them back unchanged. This drops the prior Hex-MPT read path entirely: the follower's
+  * verifier forward-hashes each `(Address, value)` to its MPT leaf (`toHex(hypergraph(field, address))` + `immutableBytes(value)`) to
+  * recompute the field roots, so byte-identity with gl0's leaves is reproduced on the verify side, not extracted from the store here.
+  * Address-keyed keeps gl1's downstream (`TransactionService` / `Collateral` / `CollateralDaemon` / `mptStore.syncFromGlobalSnapshotInfo`)
+  * unchanged.
   *
   * '''Why the latest-finalized FULL slice, not a per-ordinal diff''' (locked decision 1, "Transfer model"): the `MptOverlay` cannot read
-  * value-bytes at an arbitrary historical ordinal, so per-ordinal historical deltas aren't available — and gl1 only needs the latest finalized
-  * state for tx validation. So the producer serves the latest-finalized full slice as a delta-from-empty (every entry an upsert, no removals)
-  * and the follower recompute-matches it. O(slice)/poll now; accept-time delta-capture (#287) for O(changes) transfer is the tracked
-  * optimization and doesn't change the verify path.
+  * value-bytes at an arbitrary historical ordinal, so per-ordinal historical deltas aren't available — and gl1 only needs the latest
+  * finalized state for tx validation. So the producer serves the latest-finalized full slice as a delta-from-empty (every entry an upsert,
+  * no removals) and the follower recompute-matches it. O(slice)/poll now; accept-time delta-capture (#287) for O(changes) transfer is the
+  * tracked optimization and doesn't change the verify path.
   *
   * '''Additive, no wiring change to consensus state.''' The slice is a pure projection of finalized state read through the injected GSI
   * thunk; it never feeds back into consensus.
   */
 trait GlobalFollowSliceService[F[_]] {
 
-  /** The full consumed-field slice at the latest finalized global ordinal, as a [[ConsumedFieldDelta]] of all-upserts (removals empty). A gl1
-    * follower applies it on top of its current verified mirror (empty on bootstrap) and recompute-matches each field root against the matching
-    * signed snapshot's `stateProof.<field>Proof`. `None` when no global ordinal has finalized yet (cold start).
+  /** The full consumed-field slice at the latest finalized global ordinal, as a [[ConsumedFieldDelta]] of all-upserts (removals empty). A
+    * gl1 follower applies it on top of its current verified mirror (empty on bootstrap) and recompute-matches each field root against the
+    * matching signed snapshot's `stateProof.<field>Proof`. `None` when no global ordinal has finalized yet (cold start).
     */
   def latestSlice: F[Option[(SnapshotOrdinal, ConsumedFieldDelta)]]
 }
@@ -63,11 +64,11 @@ object GlobalFollowSliceService {
       latestFinalized.map(_.map { case (ordinal, gsi) => ordinal -> sliceFromGsi(gsi) })
   }
 
-  /** Project a finalized [[GlobalSnapshotInfo]] onto the five consumed fields as a delta-from-empty: every Address-keyed entry an upsert, no
-    * removals. The `lastAllowSpendRefs` / `lastTokenLockRefs` / `activeTokenLocks` fields are `Option`-typed on the GSI (absent ⇒ empty);
-    * `balances` / `lastTxRefs` are always present. `activeTokenLocks` is sourced via `gsi.getActiveTokenLocks` (the same `getOrElse(empty)`
-    * accessor `TokenLockService` reads), so the slice carries exactly what gl1's token-lock-replacement validator consumes. Pure /
-    * package-private so tests can exercise it directly and so the F-bound `make` stays a thin GSI-read shell over it.
+  /** Project a finalized [[GlobalSnapshotInfo]] onto the five consumed fields as a delta-from-empty: every Address-keyed entry an upsert,
+    * no removals. The `lastAllowSpendRefs` / `lastTokenLockRefs` / `activeTokenLocks` fields are `Option`-typed on the GSI (absent ⇒
+    * empty); `balances` / `lastTxRefs` are always present. `activeTokenLocks` is sourced via `gsi.getActiveTokenLocks` (the same
+    * `getOrElse(empty)` accessor `TokenLockService` reads), so the slice carries exactly what gl1's token-lock-replacement validator
+    * consumes. Pure / package-private so tests can exercise it directly and so the F-bound `make` stays a thin GSI-read shell over it.
     */
   private[nakamoto] def sliceFromGsi(gsi: GlobalSnapshotInfo): ConsumedFieldDelta =
     ConsumedFieldDelta(

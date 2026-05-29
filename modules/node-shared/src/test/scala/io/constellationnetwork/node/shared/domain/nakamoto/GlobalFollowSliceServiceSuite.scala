@@ -35,16 +35,18 @@ import weaver.MutableIOSuite
 /** The gl0-side SLICE PRODUCER ([[GlobalFollowSliceService]]) — `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`.
   *
   * The producer is sourced from gl0's latest-finalized `GlobalSnapshotInfo` (Address-keyed): it projects the five consumed fields
-  * (`gsi.balances`, `gsi.lastTxRefs`, `gsi.lastAllowSpendRefs`, `gsi.lastTokenLockRefs`) into a [[ConsumedFieldDelta]] of all-upserts that a
-  * follower applies + recompute-matches via [[GlobalFollowMirrorVerifier.verifyByFieldRoot]].
+  * (`gsi.balances`, `gsi.lastTxRefs`, `gsi.lastAllowSpendRefs`, `gsi.lastTokenLockRefs`) into a [[ConsumedFieldDelta]] of all-upserts that
+  * a follower applies + recompute-matches via [[GlobalFollowMirrorVerifier.verifyByFieldRoot]].
   *
   * Coverage:
-  *   1. projection — `sliceFromGsi` carries exactly the five GSI consumed fields, Address-keyed, no removals; ignores the other ~12 GSI fields.
+  *   1. projection — `sliceFromGsi` carries exactly the five GSI consumed fields, Address-keyed, no removals; ignores the other ~12 GSI
+  *      fields.
   *   1. cold start — `latestSlice` over a `None` finalized source → `None`.
   *   1. END-TO-END round-trip (THE IMPORTANT ONE) — produce the slice from a GSI, hand it to `verifyByFieldRoot` with `signedFieldRoots`
-  *      derived in-test from a REFERENCE MPT built the way gl0 builds it (`MptStore.insert[V]` → `toHex(hypergraph(field, addr))` keys + scodec
-  *      `immutableBytes` values → `GlobalStateConverter.fieldRootFromBytes`, NEVER hardcoded), assert `Verified` whose `ConsumedFieldState`
-  *      (Address-keyed) == the GSI's five maps. THIS PROVES the Address-keyed forward-hash reproduces gl0's signed roots byte-identically.
+  *      derived in-test from a REFERENCE MPT built the way gl0 builds it (`MptStore.insert[V]` → `toHex(hypergraph(field, addr))` keys +
+  *      scodec `immutableBytes` values → `GlobalStateConverter.fieldRootFromBytes`, NEVER hardcoded), assert `Verified` whose
+  *      `ConsumedFieldState` (Address-keyed) == the GSI's five maps. THIS PROVES the Address-keyed forward-hash reproduces gl0's signed
+  *      roots byte-identically.
   */
 object GlobalFollowSliceServiceSuite extends MutableIOSuite {
 
@@ -64,11 +66,12 @@ object GlobalFollowSliceServiceSuite extends MutableIOSuite {
 
   private def bal(n: Long): Balance = Balance(NonNegLong.unsafeFrom(n))
   private def txRef(n: Long): TransactionReference = TransactionReference(TransactionOrdinal(NonNegLong.unsafeFrom(n)), Hash(f"$n%064d"))
-  private def allowSpendRef(n: Long): AllowSpendReference = AllowSpendReference(AllowSpendOrdinal(NonNegLong.unsafeFrom(n)), Hash(f"$n%064d"))
+  private def allowSpendRef(n: Long): AllowSpendReference =
+    AllowSpendReference(AllowSpendOrdinal(NonNegLong.unsafeFrom(n)), Hash(f"$n%064d"))
   private def tokenLockRef(n: Long): TokenLockReference = TokenLockReference(TokenLockOrdinal(NonNegLong.unsafeFrom(n)), Hash(f"$n%064d"))
 
-  /** A dummy `Signed[TokenLock]` — the signature isn't verified on this path (the recompute hashes encoded bytes); a fixed placeholder proof
-    * keeps the encoding deterministic so the reference-MPT root and the verifier's recompute are byte-identical.
+  /** A dummy `Signed[TokenLock]` — the signature isn't verified on this path (the recompute hashes encoded bytes); a fixed placeholder
+    * proof keeps the encoding deterministic so the reference-MPT root and the verifier's recompute are byte-identical.
     */
   private def signedTokenLock(seed: Int, amount: Long): Signed[TokenLock] =
     Signed(
@@ -87,7 +90,8 @@ object GlobalFollowSliceServiceSuite extends MutableIOSuite {
   // The five consumed fields, Address-keyed — the slice the producer must serve.
   private val balances: SortedMap[Address, Balance] = SortedMap(addr(1) -> bal(1000), addr(2) -> bal(2000), addr(4) -> bal(4000))
   private val lastTxRefs: SortedMap[Address, TransactionReference] = SortedMap(addr(1) -> txRef(1), addr(2) -> txRef(5))
-  private val lastAllowSpendRefs: SortedMap[Address, AllowSpendReference] = SortedMap(addr(1) -> allowSpendRef(10), addr(2) -> allowSpendRef(20))
+  private val lastAllowSpendRefs: SortedMap[Address, AllowSpendReference] =
+    SortedMap(addr(1) -> allowSpendRef(10), addr(2) -> allowSpendRef(20))
   private val lastTokenLockRefs: SortedMap[Address, TokenLockReference] = SortedMap(addr(1) -> tokenLockRef(101))
   private val activeTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]] = SortedMap(addr(1) -> SortedSet(signedTokenLock(1, 600)))
 
@@ -108,16 +112,18 @@ object GlobalFollowSliceServiceSuite extends MutableIOSuite {
   private def service(latest: Option[(SnapshotOrdinal, GlobalSnapshotInfo)]): GlobalFollowSliceService[IO] =
     GlobalFollowSliceService.make[IO](IO.pure(latest))
 
-  /** gl0's exact signed per-field roots for the five consumed fields — built the PRODUCTION way: insert each field's entries into a real MPT
-    * store via `MptStore.insert[V]` (which keys by `toHex(hypergraph(field, addr))` and encodes values via scodec `immutableBytes`), read the
-    * bytes back, group by the consumed field's prefix, and feed each group to `GlobalStateConverter.fieldRootFromBytes` — the SAME callable
-    * gl0's stateProof builder routes through. NOT hardcoded; this is the determinism cross-check.
+  /** gl0's exact signed per-field roots for the five consumed fields — built the PRODUCTION way: insert each field's entries into a real
+    * MPT store via `MptStore.insert[V]` (which keys by `toHex(hypergraph(field, addr))` and encodes values via scodec `immutableBytes`),
+    * read the bytes back, group by the consumed field's prefix, and feed each group to `GlobalStateConverter.fieldRootFromBytes` — the SAME
+    * callable gl0's stateProof builder routes through. NOT hardcoded; this is the determinism cross-check.
     */
   private def signedRootsFromReferenceMpt(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[SortedMap[GlobalStateFieldId, Hash]] =
     for {
       mptProducer <- io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer.make[IO]()
       store <- MptStore.make[IO, GlobalStateKey](mptProducer, GlobalStateKey.toHex[IO])
-      _ <- store.insert[Balance](balances.toList.map { case (a, v) => GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, a) -> v }.toMap)
+      _ <- store.insert[Balance](balances.toList.map {
+        case (a, v) => GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, a) -> v
+      }.toMap)
       _ <- store.insert[TransactionReference](
         lastTxRefs.toList.map { case (a, v) => GlobalStateKey.hypergraph(GlobalStateFieldId.LastTxRefs, a) -> v }.toMap
       )
@@ -134,7 +140,9 @@ object GlobalFollowSliceServiceSuite extends MutableIOSuite {
       entries <- store.allEntriesAsBytes
       roots <- FollowVerifyCore.consumedFields.traverse { field =>
         GlobalStateKey.hypergraphFieldPrefix[IO](field).flatMap { prefix =>
-          GlobalStateConverter.fieldRootFromBytes[IO](entries.filter { case (hex, _) => hex.value.startsWith(prefix.value) }).map(field -> _)
+          GlobalStateConverter
+            .fieldRootFromBytes[IO](entries.filter { case (hex, _) => hex.value.startsWith(prefix.value) })
+            .map(field -> _)
         }
       }
     } yield SortedMap.from(roots)

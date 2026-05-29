@@ -27,11 +27,11 @@ import weaver.MutableIOSuite
 
 /** Unit suite for [[LastNGlobalSnapshotStorage.registerFinalized]] — the gl1 inclusion-proof follow deadlock-breaker.
   *
-  * The deadlock (see `GlobalSnapshotAlignment.performSnapshotsBatchProcessing`): gl1's GSI comes from gl0's LATEST-finalized slice
-  * (ordinal M = the pulled batch's tip), but `DAGSnapshotProcessor.applyGlobalSnapshotFn` resolves M's signed `stateProof` from the
-  * by-ordinal lastN index via `getByOrdinal(M)`, and the per-ordinal `set` only seeds that index AFTER a successful apply — so while the
-  * FIRST batch ordinal is processed, `getByOrdinal(M)` is None and the slice verify defers forever. `registerFinalized` seeds the index
-  * up-front from the already-pulled finalized batch so `getByOrdinal(M)` resolves.
+  * The deadlock (see `GlobalSnapshotAlignment.performSnapshotsBatchProcessing`): gl1's GSI comes from gl0's LATEST-finalized slice (ordinal
+  * M = the pulled batch's tip), but `DAGSnapshotProcessor.applyGlobalSnapshotFn` resolves M's signed `stateProof` from the by-ordinal lastN
+  * index via `getByOrdinal(M)`, and the per-ordinal `set` only seeds that index AFTER a successful apply — so while the FIRST batch ordinal
+  * is processed, `getByOrdinal(M)` is None and the slice verify defers forever. `registerFinalized` seeds the index up-front from the
+  * already-pulled finalized batch so `getByOrdinal(M)` resolves.
   *
   * Asserts the contract `applyGlobalSnapshotFn` relies on: (1) empty input is a no-op; (2) the by-ordinal index is populated
   * idempotently/order-independently so `getByOrdinal(tip)` resolves (the deadlock-breaker); (3) trimming to
@@ -85,6 +85,7 @@ object LastNGlobalSnapshotStorageSuite extends MutableIOSuite {
         None,
         None,
         Some(h("00")),
+        None,
         None
       ),
       allowSpendBlocks = None,

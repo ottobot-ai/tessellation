@@ -25,7 +25,8 @@ import suite.HttpSuite
   * `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`).
   *
   * Brings up a stub [[GlobalFollowSliceService]] (no real GSI source) so we exercise the route's response shape, the 503 startup/cold-start
-  * gates, and the [[GlobalFollowSliceResponse]] JSON codec in isolation — the real slice production is covered by `GlobalFollowSliceServiceSuite`.
+  * gates, and the [[GlobalFollowSliceResponse]] JSON codec in isolation — the real slice production is covered by
+  * `GlobalFollowSliceServiceSuite`.
   *
   * '''Coverage'''
   *   - 503 when the service `Ref` is empty (pre-startup).
@@ -45,8 +46,8 @@ object GlobalFollowRoutesSuite extends HttpSuite {
 
   private def addr(seed: Int): Address = Address.fromBytes(s"global-follow-routes-suite-seed-$seed".getBytes("UTF-8"))
 
-  /** Canned Address-keyed slice — one Balances entry, one LastTxRefs entry. The route doesn't inspect the slice's contents; it just wraps it
-    * in the response envelope, so any well-formed [[ConsumedFieldDelta]] exercises the codec.
+  /** Canned Address-keyed slice — one Balances entry, one LastTxRefs entry. The route doesn't inspect the slice's contents; it just wraps
+    * it in the response envelope, so any well-formed [[ConsumedFieldDelta]] exercises the codec.
     */
   private val cannedSlice: ConsumedFieldDelta =
     ConsumedFieldDelta.empty.copy(

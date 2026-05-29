@@ -19,21 +19,22 @@ import io.constellationnetwork.security.hash.Hash
   * to the pure core [[io.constellationnetwork.schema.nakamoto.follow.FollowVerifyCore.verifyFieldRoots]]. This is the FIELD-ROOT-EQUALITY
   * counterpart to [[GlobalFollowProofService]]'s per-key range-proof prover.
   *
-  * '''Stateless over the GSI-sourced slice (own-slice rework, 2026-05-28).''' The producer
-  * ([[GlobalFollowSliceService]]) now serves the latest-finalized FULL slice (Address-keyed, delta-from-empty) projected from gl0's
-  * `GlobalSnapshotInfo`, so the verifier no longer reads the follower's MPT branch to obtain a prior state — it takes the follower's current
-  * verified `ConsumedFieldState` mirror directly (`ConsumedFieldState.empty` for the bootstrap fetch). The verify is a pure forward-hash:
-  * apply the Address-keyed delta on top of `prior`, forward-hash each `(Address, value)` to its MPT leaf the way gl0's writer does, recompute
-  * each field's subtree root via gl0's exact `GlobalStateConverter.fieldRootFromBytes`, and match against the signed
-  * `stateProof.<field>Proof`. No `MptStore` / `MptOverlay` dependency.
+  * '''Stateless over the GSI-sourced slice (own-slice rework, 2026-05-28).''' The producer ([[GlobalFollowSliceService]]) now serves the
+  * latest-finalized FULL slice (Address-keyed, delta-from-empty) projected from gl0's `GlobalSnapshotInfo`, so the verifier no longer reads
+  * the follower's MPT branch to obtain a prior state — it takes the follower's current verified `ConsumedFieldState` mirror directly
+  * (`ConsumedFieldState.empty` for the bootstrap fetch). The verify is a pure forward-hash: apply the Address-keyed delta on top of
+  * `prior`, forward-hash each `(Address, value)` to its MPT leaf the way gl0's writer does, recompute each field's subtree root via gl0's
+  * exact `GlobalStateConverter.fieldRootFromBytes`, and match against the signed `stateProof.<field>Proof`. No `MptStore` / `MptOverlay`
+  * dependency.
   *
   * '''Why field-root equality, not the range proof.''' For a holder of the full content of the five consumed fields, completeness is
   * correct-by-design: a wrong / missing / extra entry yields a different subtree root ⇒ mismatch. The range verifier (S1) cannot catch an
-  * omitted entry dropped together with its inclusion proof; root equality catches every divergence. S1's per-key inclusion path is unchanged
-  * — it stays the mechanism for cross-shard / light-client consumers that do NOT hold the field content.
+  * omitted entry dropped together with its inclusion proof; root equality catches every divergence. S1's per-key inclusion path is
+  * unchanged — it stays the mechanism for cross-shard / light-client consumers that do NOT hold the field content.
   *
   * '''Additive, no wiring.''' This verifier + the shared field-root core + tests only. Nothing here is wired into Main /
-  * `GlobalSnapshotAlignment` / `DAGSnapshotProcessor` / gl1 runtime, and `createContext` re-execution is NOT removed — those are later slices.
+  * `GlobalSnapshotAlignment` / `DAGSnapshotProcessor` / gl1 runtime, and `createContext` re-execution is NOT removed — those are later
+  * slices.
   */
 trait GlobalFollowMirrorVerifier[F[_]] {
 

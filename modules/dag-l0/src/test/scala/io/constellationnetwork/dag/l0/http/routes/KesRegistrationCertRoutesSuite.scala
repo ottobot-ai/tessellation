@@ -129,7 +129,8 @@ object KesRegistrationCertRoutesSuite extends HttpSuite {
             priceState = None,
             lastGlobalSnapshotsWithCurrency = None,
             mptRoot = None,
-            historicalStakeSnapshots = None
+            historicalStakeSnapshots = None,
+            smtRoot = None
           ),
           allowSpendBlocks = None,
           tokenLockBlocks = None,

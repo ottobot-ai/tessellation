@@ -26,16 +26,16 @@ import org.http4s.{HttpRoutes, Response}
   *     - 200 [[GlobalFollowSliceResponse]] JSON on success.
   *     - 503 while the service `Ref` is still empty (pre-startup) OR no global ordinal has finalized yet (no GSI to project).
   *
-  * '''Why the LATEST-finalized slice, not a per-ordinal historical diff''' (locked decision 1, "Transfer model"): the slice is projected from
-  * gl0's latest-finalized `GlobalSnapshotInfo` (the SAME source the `getCombined` snapshot endpoint serves). The `MptOverlay` cannot serve a
-  * value-accurate slice at a non-tip ordinal, and gl1 only needs the latest finalized state for tx validation, so we expose ONLY the
-  * latest-finalized endpoint. O(slice)/poll now; accept-time delta-capture (#287) is the tracked O(changes) optimization.
+  * '''Why the LATEST-finalized slice, not a per-ordinal historical diff''' (locked decision 1, "Transfer model"): the slice is projected
+  * from gl0's latest-finalized `GlobalSnapshotInfo` (the SAME source the `getCombined` snapshot endpoint serves). The `MptOverlay` cannot
+  * serve a value-accurate slice at a non-tip ordinal, and gl1 only needs the latest finalized state for tx validation, so we expose ONLY
+  * the latest-finalized endpoint. O(slice)/poll now; accept-time delta-capture (#287) is the tracked O(changes) optimization.
   *
   * '''Ordinal carried by the service''' (own-slice rework, 2026-05-28): the service reads the latest-finalized `(ordinal, GSI)` itself and
   * returns the ordinal alongside the slice, so the route no longer needs an external finalized-anchor resolver.
   *
-  * '''Mirrors''' [[io.constellationnetwork.node.shared.http.routes.nakamoto.NipopowRoutes]] / `ShardProofRoutes` (#138): pure observability,
-  * reads a `Ref` populated by the consensus startup once the slice service is wired. Never feeds back into consensus.
+  * '''Mirrors''' [[io.constellationnetwork.node.shared.http.routes.nakamoto.NipopowRoutes]] / `ShardProofRoutes` (#138): pure
+  * observability, reads a `Ref` populated by the consensus startup once the slice service is wired. Never feeds back into consensus.
   *
   * '''Greenfield rule''' (per `[[feedback-greenfield-no-wire-compat]]`): fresh route for the follow transport. No compat ceremony.
   *
@@ -75,8 +75,8 @@ final case class GlobalFollowRoutes[F[_]: Async](
 
 object GlobalFollowRoutes {
 
-  /** Convenience constructor wrapping a service in a `Ref[F, Option[_]]`. Mirrors `ShardProofRoutes.make` — the startup ordering populates the
-    * `Ref` once the GSI source (and hence the slice service) is wired.
+  /** Convenience constructor wrapping a service in a `Ref[F, Option[_]]`. Mirrors `ShardProofRoutes.make` — the startup ordering populates
+    * the `Ref` once the GSI source (and hence the slice service) is wired.
     */
   def make[F[_]: Async](service: GlobalFollowSliceService[F]): F[GlobalFollowRoutes[F]] =
     Ref.of[F, Option[GlobalFollowSliceService[F]]](service.some).map(GlobalFollowRoutes(_))

@@ -43,13 +43,13 @@ import scodec.bits.ByteVector
   *   - [[FollowVerificationError.ValueBindingFailed]] — a `(keyHex → valueHex)` pair in `proof.values` does not bind to the corresponding
   *     leaf's `dataDigest` (no leaf at that key, leaf is not a value leaf, or `Hasher.hashBytes(value) =!= dataDigest`). The value is
   *     mandatory; there is no verify variant that skips this step (contract bar #2).
-  *   - [[FollowVerificationError.FieldRootMismatch]] — the '''own-slice mirror''' (gl1) verify path: after applying a producer's claimed slice
-  *     to a consumed field, forward-hashing each `(Address, value)` to its MPT leaf the way gl0's writer does, and recomputing the subtree's
-  *     root via gl0's exact `fieldRootFromBytes`, the recomputed root did not equal the signed `stateProof.<field>Proof`. Catches any wrong /
-  *     missing / extra entry — a different entry set yields a different subtree root. This is the completeness mechanism for a full-content
-  *     holder (correct-by-design via field-root equality), distinct from the per-key [[RangeProofInvalid]] / [[ValueBindingFailed]] path used
-  *     by cross-shard / light-client consumers. See `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`, "Locked decisions" → recompute-and-
-  *     match (field-root equality).
+  *   - [[FollowVerificationError.FieldRootMismatch]] — the '''own-slice mirror''' (gl1) verify path: after applying a producer's claimed
+  *     slice to a consumed field, forward-hashing each `(Address, value)` to its MPT leaf the way gl0's writer does, and recomputing the
+  *     subtree's root via gl0's exact `fieldRootFromBytes`, the recomputed root did not equal the signed `stateProof.<field>Proof`. Catches
+  *     any wrong / missing / extra entry — a different entry set yields a different subtree root. This is the completeness mechanism for a
+  *     full-content holder (correct-by-design via field-root equality), distinct from the per-key [[RangeProofInvalid]] /
+  *     [[ValueBindingFailed]] path used by cross-shard / light-client consumers. See `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`,
+  *     "Locked decisions" → recompute-and- match (field-root equality).
   */
 sealed trait FollowVerificationError extends Product with Serializable
 
@@ -84,19 +84,18 @@ object FollowVerificationError {
   * bytes only AFTER [[FollowVerifyCore.verifyFieldRoots]] has matched every consumed field's recomputed subtree root against gl0's signed
   * `stateProof.<field>Proof`.
   *
-  * Private constructor: the only way to obtain a `ConsumedFieldState` wrapped in [[Verified]] is through the verifier. This is the
-  * "no path to use unproven state" half of contract bar #1.
+  * Private constructor: the only way to obtain a `ConsumedFieldState` wrapped in [[Verified]] is through the verifier. This is the "no path
+  * to use unproven state" half of contract bar #1.
   *
   * '''Address-keyed (own-slice rework, 2026-05-28).''' Keyed by plaintext [[Address]] — the SAME key type gl1's downstream consumers use
   * (`TransactionService.balances`, `TokenLockService.getActiveTokenLocks`, `Collateral` / `CollateralDaemon`,
-  * `mptStore.syncFromGlobalSnapshotInfo`, `getLatestBalances`). The own-
-  * slice producer ([[io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService]]) now reads these maps directly from
-  * gl0's finalized `GlobalSnapshotInfo` (`gsi.balances`, `gsi.lastTxRefs`, `gsi.lastAllowSpendRefs`, `gsi.lastTokenLockRefs`,
-  * `gsi.activeTokenLocks`), so the address
-  * is in hand; the verifier forward-hashes `(Address, value)` to the MPT leaf (`toHex(hypergraph(field, address))` + `immutableBytes(value)`)
-  * to recompute the field roots. Keeping the address keeps gl1's downstream unchanged (no leaf-path-`Hex` → `Address` reverse map needed).
-  * The per-key inclusion path (S1, light clients / cross-shard point reads) is unchanged and stays leaf-path-`Hex`-keyed in
-  * [[ConsumedFieldLeaves]].
+  * `mptStore.syncFromGlobalSnapshotInfo`, `getLatestBalances`). The own- slice producer
+  * ([[io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService]]) now reads these maps directly from gl0's finalized
+  * `GlobalSnapshotInfo` (`gsi.balances`, `gsi.lastTxRefs`, `gsi.lastAllowSpendRefs`, `gsi.lastTokenLockRefs`, `gsi.activeTokenLocks`), so
+  * the address is in hand; the verifier forward-hashes `(Address, value)` to the MPT leaf (`toHex(hypergraph(field, address))` +
+  * `immutableBytes(value)`) to recompute the field roots. Keeping the address keeps gl1's downstream unchanged (no leaf-path-`Hex` →
+  * `Address` reverse map needed). The per-key inclusion path (S1, light clients / cross-shard point reads) is unchanged and stays
+  * leaf-path-`Hex`-keyed in [[ConsumedFieldLeaves]].
   */
 final class ConsumedFieldState private (
   val balances: SortedMap[Address, Balance],
@@ -136,15 +135,15 @@ object ConsumedFieldState {
 }
 
 /** The per-key-inclusion (S1) view of the consumed-field slice, keyed by the MPT '''leaf path''' (`Hex`). Produced by
-  * [[FollowVerifyCore.verifyConsumedFields]] for cross-shard / light-client consumers that hold NONE of the field content and prove individual
-  * keys via [[MerklePatriciaRangeProof]] + value-binding.
+  * [[FollowVerifyCore.verifyConsumedFields]] for cross-shard / light-client consumers that hold NONE of the field content and prove
+  * individual keys via [[MerklePatriciaRangeProof]] + value-binding.
   *
   * '''Why leaf-path `Hex`, not `Address`, for THIS path.''' The MPT key for these hypergraph fields hashes the `Address` into the
   * `userNamespace` slot (`GlobalStateKey.toHex` → SHA over `addr.value.value`), which is '''one-way'''. A per-key inclusion proof
-  * cryptographically commits only the MPT leaf path, not the plaintext address, so the only key a stateless verifier can soundly attach to a
-  * proven value is that `Hex` path. The own-slice path ([[ConsumedFieldState]]) recovers the address instead because its producer reads the
-  * Address-keyed `GlobalSnapshotInfo` directly — it doesn't reverse a hash. See the design doc "Locked decisions" #5 (one trust model, two
-  * access patterns).
+  * cryptographically commits only the MPT leaf path, not the plaintext address, so the only key a stateless verifier can soundly attach to
+  * a proven value is that `Hex` path. The own-slice path ([[ConsumedFieldState]]) recovers the address instead because its producer reads
+  * the Address-keyed `GlobalSnapshotInfo` directly — it doesn't reverse a hash. See the design doc "Locked decisions" #5 (one trust model,
+  * two access patterns).
   */
 final class ConsumedFieldLeaves private (
   val balances: SortedMap[Hex, Balance],
@@ -182,10 +181,10 @@ object ConsumedFieldLeaves {
   * gl0's MPT writer uses (`GlobalStateConverter.toAllStateKeyValueBytes` → `enc[V]` → `ImmutableCodec[V].immutableBytes`) when recomputing
   * the field root, so re-encoding reproduces gl0's leaf `dataDigest` byte-identically.
   *
-  *   - `balances` / `lastTxRefs` / `lastAllowSpendRefs` / `lastTokenLockRefs` / `activeTokenLocks` — the upserted entries per consumed field,
-  *     Address-keyed and typed (`activeTokenLocks` is read by the token-lock-replacement validator, hence in-slice). Under the locked Transfer
-  *     model (latest-finalized full slice) every consumed-field entry is an upsert and there are no
-  *     removals; the typed-per-field shape and the removals map below still support an incremental delta (accept-time delta-capture, #287).
+  *   - `balances` / `lastTxRefs` / `lastAllowSpendRefs` / `lastTokenLockRefs` / `activeTokenLocks` — the upserted entries per consumed
+  *     field, Address-keyed and typed (`activeTokenLocks` is read by the token-lock-replacement validator, hence in-slice). Under the
+  *     locked Transfer model (latest-finalized full slice) every consumed-field entry is an upsert and there are no removals; the
+  *     typed-per-field shape and the removals map below still support an incremental delta (accept-time delta-capture, #287).
   *   - `removals` — per [[GlobalStateFieldId]], the `Address` set gl0 deleted. Applied before upserts so a key removed-then-reupserted ends
   *     with the new value, matching `MerklePatriciaTrie.withChanges`.
   */
@@ -260,24 +259,27 @@ object Verified {
   * Two entry points, each producing a [[Verified]] gate but via a different completeness mechanism and a different key type (see
   * `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`, "Locked decisions"):
   *
-  *   - [[verifyConsumedFields]] — '''per-key inclusion''' for cross-shard / light-client consumers that do NOT hold the field content. Range
-  *     proof + value-binding vs the signed `mptRoot`. Returns [[Verified]]`[`[[ConsumedFieldLeaves]]`]` (leaf-path-`Hex`-keyed — a stateless
-  *     verifier cannot reverse the one-way address hash).
+  *   - [[verifyConsumedFields]] — '''per-key inclusion''' for cross-shard / light-client consumers that do NOT hold the field content.
+  *     Range proof + value-binding vs the signed `mptRoot`. Returns [[Verified]]`[`[[ConsumedFieldLeaves]]`]` (leaf-path-`Hex`-keyed — a
+  *     stateless verifier cannot reverse the one-way address hash).
   *   - [[verifyFieldRoots]] — '''field-root equality''' for the own-slice mirror follower (gl1) that DOES hold the full content of the four
-  *     consumed fields. Apply the producer's claimed Address-keyed slice on top of the follower's prior state, forward-hash each
-  *     `(Address, value)` to its MPT leaf the way gl0's writer does, recompute the subtree root via gl0's exact
-  *     `GlobalStateConverter.fieldRootFromBytes`, and assert it equals the signed `stateProof.<field>Proof`. A wrong / missing / extra entry
-  *     yields a different subtree root ⇒ [[FollowVerificationError.FieldRootMismatch]]. Returns [[Verified]]`[`[[ConsumedFieldState]]`]`
-  *     (Address-keyed — the producer read the address from the GSI, so gl1's downstream stays unchanged).
+  *     consumed fields. Apply the producer's claimed Address-keyed slice on top of the follower's prior state, forward-hash each `(Address,
+  *     value)` to its MPT leaf the way gl0's writer does, recompute the subtree root via gl0's exact
+  *     `GlobalStateConverter.fieldRootFromBytes`, and assert it equals the signed `stateProof.<field>Proof`. A wrong / missing / extra
+  *     entry yields a different subtree root ⇒ [[FollowVerificationError.FieldRootMismatch]]. Returns
+  *     [[Verified]]`[`[[ConsumedFieldState]]`]` (Address-keyed — the producer read the address from the GSI, so gl1's downstream stays
+  *     unchanged).
   *
   * [[verifyConsumedFields]] performs, '''in order''':
   *   a. committed-root check — `proof.committedRoot === attestedRoot`, else [[FollowVerificationError.CommittedRootMismatch]].
   *   a. per-field range-proof check — `MerklePatriciaRangeVerifier.make(attestedRoot).confirmRange(rangeProof)`, else
   *      [[FollowVerificationError.RangeProofInvalid]]. This is where inclusion, in-range, ordering, and exclusion-boundary completeness are
   *      enforced cryptographically — a hidden update or forged absence cannot pass.
-  *   a. value-binding (mandatory, internal) — for each `(keyHex → valueHex)` in `proof.values(field)`, find the matching leaf in the field's
-  *      range proof and assert `Hasher.hashBytes(valueHex.toBytes) === leaf.dataDigest`, else [[FollowVerificationError.ValueBindingFailed]].
-  *   a. assemble + wrap — decode the now-bound value bytes into typed leaf-keyed maps and return `Right(Verified(ConsumedFieldLeaves(...)))`.
+  *   a. value-binding (mandatory, internal) — for each `(keyHex → valueHex)` in `proof.values(field)`, find the matching leaf in the
+  *      field's range proof and assert `Hasher.hashBytes(valueHex.toBytes) === leaf.dataDigest`, else
+  *      [[FollowVerificationError.ValueBindingFailed]].
+  *   a. assemble + wrap — decode the now-bound value bytes into typed leaf-keyed maps and return
+  *      `Right(Verified(ConsumedFieldLeaves(...)))`.
   */
 object FollowVerifyCore {
 
@@ -285,9 +287,9 @@ object FollowVerifyCore {
     * these; the verifier processes whichever of them appear in the payload and ignores any extra field a (possibly buggy) prover added —
     * extra fields cannot widen the verified state because [[ConsumedFieldState]] / [[ConsumedFieldLeaves]] only expose these five.
     *
-    * `ActiveTokenLocks` is consumed by gl1's token-lock-replacement validator
-    * (`ContextualTokenLockValidator.validateReplaceTokenLockRef` / `getBalanceAffectedByTxs`, fed from `TokenLockService.getActiveTokenLocks`);
-    * without it the follower's mirror keeps `activeTokenLocks` empty and every replacement fails `NothingToReplace`.
+    * `ActiveTokenLocks` is consumed by gl1's token-lock-replacement validator (`ContextualTokenLockValidator.validateReplaceTokenLockRef` /
+    * `getBalanceAffectedByTxs`, fed from `TokenLockService.getActiveTokenLocks`); without it the follower's mirror keeps `activeTokenLocks`
+    * empty and every replacement fails `NothingToReplace`.
     */
   val consumedFields: List[GlobalStateFieldId] = List(
     GlobalStateFieldId.Balances,
@@ -297,30 +299,30 @@ object FollowVerifyCore {
     GlobalStateFieldId.ActiveTokenLocks
   )
 
-  /** FIELD-ROOT-MATCH verify for an own-slice mirror follower (gl1). Correct-by-design completeness via field-root equality, for a holder of
-    * the full content of the four consumed fields — Address-keyed throughout (own-slice rework, 2026-05-28).
+  /** FIELD-ROOT-MATCH verify for an own-slice mirror follower (gl1). Correct-by-design completeness via field-root equality, for a holder
+    * of the full content of the four consumed fields — Address-keyed throughout (own-slice rework, 2026-05-28).
     *
-    * `prior` is the follower's current verified consumed-field state BEFORE this ordinal's writes (Address-keyed); under the locked Transfer
-    * model the producer serves the latest-finalized FULL slice as a delta-from-empty, so `prior` is [[ConsumedFieldState.empty]] for the
-    * bootstrap fetch (the typed-per-field delta + removals still support an incremental apply, #287). `delta` is gl0's claimed slice;
-    * `signedFieldRoots` are the `stateProof.<field>Proof` values from the signed, finality-gated snapshot.
+    * `prior` is the follower's current verified consumed-field state BEFORE this ordinal's writes (Address-keyed); under the locked
+    * Transfer model the producer serves the latest-finalized FULL slice as a delta-from-empty, so `prior` is [[ConsumedFieldState.empty]]
+    * for the bootstrap fetch (the typed-per-field delta + removals still support an incremental apply, #287). `delta` is gl0's claimed
+    * slice; `signedFieldRoots` are the `stateProof.<field>Proof` values from the signed, finality-gated snapshot.
     *
     * Steps, '''in order''' (short-circuits on the first mismatch):
     *   a. '''apply''' — for each consumed field, `(prior(field) -- delta.removals(field)) ++ delta.<field>` (removals first matches
     *      `MerklePatriciaTrie.withChanges`), yielding the post-state Address-keyed map.
-    *   a. '''forward-hash''' — for each `(Address, value)` in the post-state, derive the MPT leaf key `toHex(hypergraph(field, address))` and
-    *      the leaf value bytes `ImmutableCodec[V].immutableBytes(value).toArray` — the EXACT key derivation and value encoding gl0's MPT
-    *      writer uses (`GlobalStateConverter.toAllStateKeyValueBytes`: `GlobalStateKey.hypergraph(fieldId, addr)` + `enc[V]`), so the rebuilt
-    *      leaf digests are byte-identical to gl0's.
+    *   a. '''forward-hash''' — for each `(Address, value)` in the post-state, derive the MPT leaf key `toHex(hypergraph(field, address))`
+    *      and the leaf value bytes `ImmutableCodec[V].immutableBytes(value).toArray` — the EXACT key derivation and value encoding gl0's
+    *      MPT writer uses (`GlobalStateConverter.toAllStateKeyValueBytes`: `GlobalStateKey.hypergraph(fieldId, addr)` + `enc[V]`), so the
+    *      rebuilt leaf digests are byte-identical to gl0's.
     *   a. '''recompute''' — recompute the field's subtree root via [[GlobalStateConverter.fieldRootFromBytes]] — the SAME callable gl0 uses
     *      for `stateProof.<field>Proof` (producer + overlay paths). Byte-identity is by construction, not by re-implementation.
     *   a. '''match''' — assert the recomputed root `=== signedFieldRoots(field)` (a field absent from `signedFieldRoots` is treated as
     *      [[Hash.empty]], matching gl0's `getOrElse(_, Hash.empty)` default), else [[FollowVerificationError.FieldRootMismatch]].
     *   a. '''assemble + wrap''' — return `Right(Verified(ConsumedFieldState(<post-state maps>)))`.
     *
-    * Note the [[Async]]`/`[[Parallel]]`/`[[JsonSerializer]] constraints (vs [[verifyConsumedFields]]'s `Async: Hasher`): recomputing a subtree
-    * root rebuilds an MPT from bytes via `MerklePatriciaTrie.makeParallelFromBytes`, which needs them, and `GlobalStateKey.toHex` needs a
-    * [[Hasher]]. This is required to reuse gl0's exact `fieldRootFromBytes` + key derivation rather than re-implementing them.
+    * Note the [[Async]]`/`[[Parallel]]`/`[[JsonSerializer]] constraints (vs [[verifyConsumedFields]]'s `Async: Hasher`): recomputing a
+    * subtree root rebuilds an MPT from bytes via `MerklePatriciaTrie.makeParallelFromBytes`, which needs them, and `GlobalStateKey.toHex`
+    * needs a [[Hasher]]. This is required to reuse gl0's exact `fieldRootFromBytes` + key derivation rather than re-implementing them.
     */
   def verifyFieldRoots[F[_]: Async: Parallel: Hasher: JsonSerializer](
     prior: ConsumedFieldState,
@@ -419,8 +421,8 @@ object FollowVerifyCore {
 
   /** Value-binding for one field: every `(keyHex → valueHex)` must hash to the `dataDigest` of the leaf at `keyHex` in `rangeProof`. The
     * leaf commitment is the head of the inclusion proof's witness (the prover prepends root→leaf, so the deepest/leaf commitment ends up at
-    * the head; the verifier walks `witness.reverse`). `rangeProof` has already been confirmed against the trusted root by the caller, so the
-    * `dataDigest` we read here is cryptographically bound to `attestedRoot`; binding ties the actual value bytes to it.
+    * the head; the verifier walks `witness.reverse`). `rangeProof` has already been confirmed against the trusted root by the caller, so
+    * the `dataDigest` we read here is cryptographically bound to `attestedRoot`; binding ties the actual value bytes to it.
     */
   private def bindValues[F[_]: Async: Hasher](
     field: GlobalStateFieldId,
@@ -461,14 +463,18 @@ object FollowVerifyCore {
     */
   private def assemble[F[_]: Async](proof: GlobalFollowProof): F[ConsumedFieldLeaves] = {
     def decodeMap[V: ImmutableCodec](field: GlobalStateFieldId): F[SortedMap[Hex, V]] =
-      proof.values.getOrElse(field, SortedMap.empty[Hex, Hex]).toList.traverse {
-        case (keyHex, valueHex) =>
-          ImmutableCodec[V].fromImmutableBytes(ByteVector.view(valueHex.toBytes)) match {
-            case Right(v) => (keyHex -> v).pure[F]
-            case Left(err) =>
-              new RuntimeException(s"Follow-proof value decode failed for field $field at $keyHex: $err").raiseError[F, (Hex, V)]
-          }
-      }.map(SortedMap.from(_))
+      proof.values
+        .getOrElse(field, SortedMap.empty[Hex, Hex])
+        .toList
+        .traverse {
+          case (keyHex, valueHex) =>
+            ImmutableCodec[V].fromImmutableBytes(ByteVector.view(valueHex.toBytes)) match {
+              case Right(v) => (keyHex -> v).pure[F]
+              case Left(err) =>
+                new RuntimeException(s"Follow-proof value decode failed for field $field at $keyHex: $err").raiseError[F, (Hex, V)]
+            }
+        }
+        .map(SortedMap.from(_))
 
     for {
       balances <- decodeMap[Balance](GlobalStateFieldId.Balances)

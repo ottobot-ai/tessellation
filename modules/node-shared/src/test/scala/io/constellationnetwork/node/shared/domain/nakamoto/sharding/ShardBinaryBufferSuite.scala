@@ -100,8 +100,7 @@ object ShardBinaryBufferSuite extends MutableIOSuite {
       _ <- buffer.bufferBinary(mg, b1)
       _ <- buffer.bufferBinary(mg, b2)
       pending <- buffer.snapshotPending
-    } yield
-      expect(pending.get(mg).map(_.toList) == Some(List(b0, b1, b2)))
+    } yield expect(pending.get(mg).map(_.toList) == Some(List(b0, b1, b2)))
   }
 
   test("dedup by binary hash: re-buffering the same binary is a no-op") { res =>

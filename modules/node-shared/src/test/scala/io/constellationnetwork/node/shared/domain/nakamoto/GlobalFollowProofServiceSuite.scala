@@ -40,8 +40,9 @@ import weaver.MutableIOSuite
 /** Slice 1 of the gl1 inclusion-proof follow design (`docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`).
   *
   * End-to-end exercise of the gl0-side prover ([[GlobalFollowProofService]]) against the correct-by-design shared verify core
-  * ([[FollowVerifyCore]]). The trie is built the production way — via `MptStore.insert[V]` (scodec `ImmutableCodec` bytes) over an in-memory
-  * producer, so each leaf's `dataDigest = Hasher.hashBytes(immutableBytes)`; value-binding in the verifier reproduces that exact digest.
+  * ([[FollowVerifyCore]]). The trie is built the production way — via `MptStore.insert[V]` (scodec `ImmutableCodec` bytes) over an
+  * in-memory producer, so each leaf's `dataDigest = Hasher.hashBytes(immutableBytes)`; value-binding in the verifier reproduces that exact
+  * digest.
   *
   * Coverage (per the slice task spec):
   *   1. round-trip — prove → verify → `Right(Verified(state))` whose maps equal the seeded entries.

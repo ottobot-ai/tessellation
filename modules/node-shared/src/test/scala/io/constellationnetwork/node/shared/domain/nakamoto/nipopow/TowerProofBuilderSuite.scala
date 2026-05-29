@@ -97,6 +97,7 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
         None,
         None,
         Some(h("00")),
+        None,
         None
       ),
       allowSpendBlocks = None,

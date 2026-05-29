@@ -148,7 +148,8 @@ object StateChannelServiceSuite extends MutableIOSuite {
             priceState = None,
             lastGlobalSnapshotsWithCurrency = None,
             mptRoot = None,
-            historicalStakeSnapshots = None
+            historicalStakeSnapshots = None,
+            smtRoot = None
           ),
           None,
           None,

@@ -14,20 +14,19 @@ import io.constellationnetwork.security.Hasher
 
 import weaver.MutableIOSuite
 
-/** Tests for the EXECUTION-SHARDING shard-committee sortition primitive on [[CommitteeSortition]] —
-  * `shardDrawValue` / `isInShardCommittee` (the VK-seeded deterministic draw `ShardCheckpointWiring.committeeFor` enumerates over).
+/** Tests for the EXECUTION-SHARDING shard-committee sortition primitive on [[CommitteeSortition]] — `shardDrawValue` / `isInShardCommittee`
+  * (the VK-seeded deterministic draw `ShardCheckpointWiring.committeeFor` enumerates over).
   *
-  * Unlike the per-metagraph committee VRF (covered by [[CommitteeSortitionSuite]]), this draw is a deterministic PSEUDO-RANDOM
-  * function of the operator's PUBLIC VRF VK (so a non-member can enumerate the whole committee — see the primitive's scaladoc). The
-  * load-bearing property is byte-determinism cluster-wide: every gl0 node MUST compute the identical committee for the same
-  * `(shardId, epoch, VK set, eta)`, or the shard-checkpoint adopt decision diverges and the cluster splits (#261).
+  * Unlike the per-metagraph committee VRF (covered by [[CommitteeSortitionSuite]]), this draw is a deterministic PSEUDO-RANDOM function of
+  * the operator's PUBLIC VRF VK (so a non-member can enumerate the whole committee — see the primitive's scaladoc). The load-bearing
+  * property is byte-determinism cluster-wide: every gl0 node MUST compute the identical committee for the same `(shardId, epoch, VK set,
+  * eta)`, or the shard-checkpoint adopt decision diverges and the cluster splits (#261).
   *
   * Coverage:
-  *   1. Determinism across two INDEPENDENT `Hasher` instances — same `(shardId, epoch, vrfVk, eta)` ⇒ identical draw value + membership.
-  *   2. Per-shard independence — different shardId (same VK/epoch/eta) generally yields a different draw value.
-  *   3. Threshold edges — `kTarget·σ ≥ 1` ⇒ always in; σ=0 ⇒ always out.
-  *   4. Enumerated committee ⊆ the candidate set, with mean size ≈ kTarget at uniform σ = 1/N (the sortition denominator is K_S ≈ kTarget,
-  *      NOT N).
+  *   1. Determinism across two INDEPENDENT `Hasher` instances — same `(shardId, epoch, vrfVk, eta)` ⇒ identical draw value + membership. 2.
+  *      Per-shard independence — different shardId (same VK/epoch/eta) generally yields a different draw value. 3. Threshold edges —
+  *      `kTarget·σ ≥ 1` ⇒ always in; σ=0 ⇒ always out. 4. Enumerated committee ⊆ the candidate set, with mean size ≈ kTarget at uniform σ =
+  *      1/N (the sortition denominator is K_S ≈ kTarget, NOT N).
   */
 object CommitteeShardSortitionSuite extends MutableIOSuite {
 
@@ -37,7 +36,7 @@ object CommitteeShardSortitionSuite extends MutableIOSuite {
   // byte-equality, proving the result is a pure function of the inputs and not of any per-instance state. Built in separate scopes so
   // only one `JsonSerializer` is ever in implicit scope at a time (two in one for-comprehension would be ambiguous).
   private def freshHasher: Resource[IO, Hasher[IO]] =
-    JsonSerializer.forAsync[IO].asResource.map { implicit j => Hasher.forJson[IO] }
+    JsonSerializer.forAsync[IO].asResource.map(implicit j => Hasher.forJson[IO])
 
   override def sharedResource: Resource[IO, Res] =
     for {
@@ -85,13 +84,12 @@ object CommitteeShardSortitionSuite extends MutableIOSuite {
     // Sample many VKs; assert the per-shard draws differ for the overwhelming majority (a hash collision across two shards for the same
     // VK is cryptographically negligible). Use > 90% as a robust lower bound that still catches a "shardId not in the preimage" bug.
     val vks = List.fill(64)(randomVk())
-    vks
-      .traverse { vk =>
-        (
-          CommitteeSortition.shardDrawValue[IO](eta, ShardId.unsafeApply(0), EtaPeriod(9L), vk),
-          CommitteeSortition.shardDrawValue[IO](eta, ShardId.unsafeApply(1), EtaPeriod(9L), vk)
-        ).tupled.map { case (a, b) => a != b }
-      }
+    vks.traverse { vk =>
+      (
+        CommitteeSortition.shardDrawValue[IO](eta, ShardId.unsafeApply(0), EtaPeriod(9L), vk),
+        CommitteeSortition.shardDrawValue[IO](eta, ShardId.unsafeApply(1), EtaPeriod(9L), vk)
+      ).tupled.map { case (a, b) => a != b }
+    }
       .map(diffs => expect(diffs.count(identity) >= 60))
   }
 
@@ -118,27 +116,24 @@ object CommitteeShardSortitionSuite extends MutableIOSuite {
     val candidateVks: Vector[(Int, Array[Byte])] = Vector.tabulate(n)(i => i -> randomVk())
     val shards = (0 until 50).toList
 
-    shards
-      .traverse { s =>
-        candidateVks.toList
-          .traverse {
-            case (i, vk) =>
-              CommitteeSortition
-                .isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(s), EtaPeriod(2L), sigma, kTarget)
-                .map(in => if (in) Some(i) else None)
-          }
-          .map(_.flatten.toSet)
+    shards.traverse { s =>
+      candidateVks.toList.traverse {
+        case (i, vk) =>
+          CommitteeSortition
+            .isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(s), EtaPeriod(2L), sigma, kTarget)
+            .map(in => if (in) Some(i) else None)
       }
-      .map { committees =>
-        val allSubsets = committees.forall(_.subsetOf(candidateVks.map(_._1).toSet))
-        val totalSize = committees.foldLeft(0)((acc, c) => acc + c.size)
-        val meanSize = totalSize.toDouble / committees.size
-        expect.all(
-          allSubsets,
-          // Generous band around K=8 (binomial mean over 40 trials, averaged across 50 shards): well inside ±50%.
-          meanSize >= 4.0,
-          meanSize <= 12.0
-        )
-      }
+        .map(_.flatten.toSet)
+    }.map { committees =>
+      val allSubsets = committees.forall(_.subsetOf(candidateVks.map(_._1).toSet))
+      val totalSize = committees.foldLeft(0)((acc, c) => acc + c.size)
+      val meanSize = totalSize.toDouble / committees.size
+      expect.all(
+        allSubsets,
+        // Generous band around K=8 (binomial mean over 40 trials, averaged across 50 shards): well inside ±50%.
+        meanSize >= 4.0,
+        meanSize <= 12.0
+      )
+    }
   }
 }

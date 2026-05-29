@@ -282,7 +282,12 @@ object GlobalSnapshotInfo {
                           mptRoot = Some(value.value),
                           historicalStakeSnapshots =
                             if (info.historicalStakeSnapshots.isEmpty) None
-                            else Some(fieldRoot(FId.HistoricalStakeSnapshots))
+                            else Some(fieldRoot(FId.HistoricalStakeSnapshots)),
+                          // smtRoot is NOT reproducible from `info` alone (it needs the maintained HistoricalCommitmentSmtStore over
+                          // finalized ordinals ≤ N−k). It is populated only on the producer/follower-symmetric GSAM accept path and is
+                          // EXCLUDED from the `StateProofValidator` `===` via `StateProofComparison`. None here keeps this rebuild path
+                          // (download/traverse/sync) deterministic.
+                          smtRoot = None
                         )
                       }
                     case None => MonadThrow[F].raiseError(new RuntimeException(s"Could not get mptRootHash for ordinal $ordinal"))
@@ -381,7 +386,10 @@ object GlobalSnapshotInfo {
         mptRoot = Some(mptRoot.value),
         historicalStakeSnapshots =
           if (info.historicalStakeSnapshots.isEmpty) None
-          else Some(fieldRoot(FId.HistoricalStakeSnapshots))
+          else Some(fieldRoot(FId.HistoricalStakeSnapshots)),
+        // smtRoot intentionally None on this byte-rebuild path — see the producer-path note above. GSAM's accept() overrides it with the
+        // maintained store's cutoff-root after calling this helper (smtRoot is set on the returned proof, not derived from `entries`).
+        smtRoot = None
       )
     }
   }
@@ -406,7 +414,9 @@ object GlobalSnapshotInfo {
       info.nodeCollateralWithdrawals.traverse(_.hash),
       info.priceState.traverse(_.hash),
       info.metagraphSyncData.traverse(_.hash)
-    ).mapN(GlobalSnapshotStateProof.apply(_, _, _, lastCurrencySnapshots.map(_.getRoot), _, _, _, _, _, _, _, _, _, _, _, _, None, None))
+    ).mapN(
+      GlobalSnapshotStateProof.apply(_, _, _, lastCurrencySnapshots.map(_.getRoot), _, _, _, _, _, _, _, _, _, _, _, _, None, None, None)
+    )
 
   def empty: GlobalSnapshotInfo = GlobalSnapshotInfo(
     SortedMap.empty,

@@ -85,8 +85,20 @@ object types {
   case class NakamotoConfig(
     etaRotationSnapshots: PosLong,
     keepDepthBehindFinalized: PosLong,
+    // Confirmation depth k₁ — REUSED by the §3 NIPoPoW historical-commitment SMT as its finalized cutoff (`smtRoot(N)` commits
+    // ordinals i ≤ N − k). Mirrors the existing `NAKAMOTO_CONFIRMATION_DEPTH` env default (255) via the HOCON `${?...}` substitution
+    // so the gl0 SMT wiring, `SnapshotLeaderLoop.ConfirmationDepthK`, and `NakamotoSyncDaemon` all agree.
+    confirmationDepthK: PosLong,
+    commitmentSmt: CommitmentSmtConfig,
     localEvents: LocalEventsConfig,
     sharding: ShardingConfig
+  )
+
+  /** §3 NIPoPoW historical-commitment SMT tunables. The tree is unbounded; `versionRootRetention` bounds only how many recent historical
+    * ROOTS stay queryable for past-ordinal inclusion proofs (separate from the `confirmationDepthK` finalized lag). Must be >= 1.
+    */
+  case class CommitmentSmtConfig(
+    versionRootRetention: PosInt
   )
 
   /** Hierarchical-shard-checkpoints v1 typed config shape (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §4.2). Defaults

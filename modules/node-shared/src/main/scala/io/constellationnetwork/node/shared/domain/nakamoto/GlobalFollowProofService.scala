@@ -25,9 +25,9 @@ import io.constellationnetwork.security.mpt.prover.attestation.MerklePatriciaRan
   *
   * '''Per-field full range.''' Each consumed field is proven over its '''entire''' key-range via the field's hypergraph prefix
   * ([[GlobalStateKey.hypergraphFieldPrefix]]). The range `[prefix + 0…, prefix + f…]` brackets every possible `userNamespace` encoding for
-  * that field (the suffix is `01` + a 64-hex address hash, which sorts strictly between the all-`0` and all-`f` bounds), so the range proof's
-  * inclusion + exclusion boundaries cover the whole field — completeness and absence are then cryptographic on the verifier side. The
-  * delta-scoped optimization (re-prove only changed sub-ranges) is deferred (design "Open / deferred").
+  * that field (the suffix is `01` + a 64-hex address hash, which sorts strictly between the all-`0` and all-`f` bounds), so the range
+  * proof's inclusion + exclusion boundaries cover the whole field — completeness and absence are then cryptographic on the verifier side.
+  * The delta-scoped optimization (re-prove only changed sub-ranges) is deferred (design "Open / deferred").
   *
   * '''Additive, no wiring.''' Slice 1 builds this service + the shared verify core + tests only. Nothing here is wired into Main / routes /
   * consensus / gl1 — that's Slice 2+.

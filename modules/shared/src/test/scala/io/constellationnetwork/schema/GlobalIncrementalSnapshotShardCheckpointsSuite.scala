@@ -156,7 +156,8 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
       priceState = None,
       lastGlobalSnapshotsWithCurrency = None,
       mptRoot = None,
-      historicalStakeSnapshots = None
+      historicalStakeSnapshots = None,
+      smtRoot = None
     )
 
   private def mkSnapshot(shardCps: SortedMap[ShardId, ShardCheckpoint]): GlobalIncrementalSnapshot =

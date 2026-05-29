@@ -144,7 +144,8 @@ object RewardsInfoCalculatorSuite extends SimpleIOSuite {
         priceState = None,
         lastGlobalSnapshotsWithCurrency = None,
         mptRoot = None,
-        historicalStakeSnapshots = None
+        historicalStakeSnapshots = None,
+        smtRoot = None
       ),
       allowSpendBlocks = Some(SortedSet.empty),
       tokenLockBlocks = Some(SortedSet.empty),
@@ -220,7 +221,8 @@ object RewardsInfoCalculatorSuite extends SimpleIOSuite {
         priceState = None,
         lastGlobalSnapshotsWithCurrency = None,
         mptRoot = None,
-        historicalStakeSnapshots = None
+        historicalStakeSnapshots = None,
+        smtRoot = None
       ),
       allowSpendBlocks = Some(SortedSet.empty),
       tokenLockBlocks = Some(SortedSet.empty),
@@ -301,7 +303,8 @@ object RewardsInfoCalculatorSuite extends SimpleIOSuite {
         priceState = None,
         lastGlobalSnapshotsWithCurrency = None,
         mptRoot = None,
-        historicalStakeSnapshots = None
+        historicalStakeSnapshots = None,
+        smtRoot = None
       ),
       allowSpendBlocks = Some(SortedSet.empty),
       tokenLockBlocks = Some(SortedSet.empty),

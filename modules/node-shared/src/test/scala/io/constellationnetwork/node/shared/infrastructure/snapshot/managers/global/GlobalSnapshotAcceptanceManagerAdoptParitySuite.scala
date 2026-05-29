@@ -50,8 +50,8 @@ import weaver.MutableIOSuite
   *      legacy code already handled.
   *
   * A genesis full `CurrencySnapshot` binary (the `Left` case) is used deliberately: `processCurrencySnapshots` derives its state via the
-  * pure `deserialize[Signed[CurrencySnapshot]]` branch and never calls `applyCurrencySnapshot`, so a no-op `CurrencySnapshotContextFunctions`
-  * stub suffices and the derivation stays a pure function of the binary (the byte-identity premise).
+  * pure `deserialize[Signed[CurrencySnapshot]]` branch and never calls `applyCurrencySnapshot`, so a no-op
+  * `CurrencySnapshotContextFunctions` stub suffices and the derivation stays a pure function of the binary (the byte-identity premise).
   */
 object GlobalSnapshotAcceptanceManagerAdoptParitySuite extends MutableIOSuite {
 
@@ -103,7 +103,8 @@ object GlobalSnapshotAcceptanceManagerAdoptParitySuite extends MutableIOSuite {
     }
 
     for {
-      manager <- GlobalSnapshotStateChannelAcceptanceManager.make[IO](None, pullDelay = NonNegLong.MinValue, purgeDelay = NonNegLong.MinValue)
+      manager <- GlobalSnapshotStateChannelAcceptanceManager
+        .make[IO](None, pullDelay = NonNegLong.MinValue, purgeDelay = NonNegLong.MinValue)
       mptProducer <- InMemoryMerklePatriciaProducer.make[IO]()
       mptStore <- MptStore.make[IO, GlobalStateKey](mptProducer, GlobalStateKey.toHex[IO])
       reader = io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)

@@ -37,10 +37,10 @@ import weaver.MutableIOSuite
   *   - the [[GlobalFollowSliceResponse]] Circe codec round-trips (encode → decode == identity), incl. a non-empty [[ConsumedFieldDelta]];
   *   - the client issues the correct request: `GET /global-follow/slice/latest` against the supplied peer.
   *
-  * The request-shape test captures the outgoing request inside a stub inner [[Client]]. `responseVerifierMiddleware` calls `client.run(req)`
-  * (passing the request through unchanged) before it attempts to verify the response, so the capture sees the exact URI the client built;
-  * the subsequent signature verification fails (the stub response is unsigned), which we discard via `.attempt` — only the captured URI is
-  * asserted.
+  * The request-shape test captures the outgoing request inside a stub inner [[Client]]. `responseVerifierMiddleware` calls
+  * `client.run(req)` (passing the request through unchanged) before it attempts to verify the response, so the capture sees the exact URI
+  * the client built; the subsequent signature verification fails (the stub response is unsigned), which we discard via `.attempt` — only
+  * the captured URI is asserted.
   */
 object GlobalFollowClientSuite extends MutableIOSuite {
 
@@ -74,7 +74,8 @@ object GlobalFollowClientSuite extends MutableIOSuite {
       ordinal = SnapshotOrdinal(NonNegLong(42L)),
       slice = ConsumedFieldDelta(
         balances = SortedMap[Address, Balance](addr(1) -> Balance(NonNegLong(1000L)), addr(2) -> Balance(NonNegLong(2000L))),
-        lastTxRefs = SortedMap[Address, TransactionReference](addr(3) -> TransactionReference(TransactionOrdinal(NonNegLong(5L)), Hash("ab" * 32))),
+        lastTxRefs =
+          SortedMap[Address, TransactionReference](addr(3) -> TransactionReference(TransactionOrdinal(NonNegLong(5L)), Hash("ab" * 32))),
         lastAllowSpendRefs = SortedMap.empty,
         lastTokenLockRefs = SortedMap.empty,
         // A non-empty `activeTokenLocks` so the 5th consumed field round-trips through the Circe codec too.
@@ -115,12 +116,13 @@ object GlobalFollowClientSuite extends MutableIOSuite {
       client = GlobalFollowClient.make[IO](innerClient)
       _ <- client.getLatestSlice.run(peer).attempt
       uriOpt <- captured.get
-    } yield uriOpt match {
-      case Some(uri) =>
-        expect(uri.path.renderString == "/global-follow/slice/latest") &&
+    } yield
+      uriOpt match {
+        case Some(uri) =>
+          expect(uri.path.renderString == "/global-follow/slice/latest") &&
           expect(uri.host.map(_.value).contains("127.0.0.1")) &&
           expect(uri.port.contains(9000))
-      case None => failure("client did not issue any request")
-    }
+        case None => failure("client did not issue any request")
+      }
   }
 }

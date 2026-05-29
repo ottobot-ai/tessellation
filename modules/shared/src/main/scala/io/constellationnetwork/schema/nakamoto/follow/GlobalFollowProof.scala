@@ -23,9 +23,9 @@ import io.circe.syntax._
   *     is `committedRoot`.
   *   - `committedRoot` — the MPT root the prover built the range proofs against. The verifier rejects the whole payload unless this equals
   *     the follower's trusted `attestedRoot` (contract bar #1). Every range proof in `fields` is rooted at this same hash.
-  *   - `fields` — per consumed [[GlobalStateFieldId]], a [[MerklePatriciaRangeProof]] over that field's '''full''' key-range. The range proof
-  *     proves structure + inclusion + exclusion boundaries (so neither a hidden update nor a forged absence can pass), but its leaves carry
-  *     only `dataDigest` — NOT the value bytes.
+  *   - `fields` — per consumed [[GlobalStateFieldId]], a [[MerklePatriciaRangeProof]] over that field's '''full''' key-range. The range
+  *     proof proves structure + inclusion + exclusion boundaries (so neither a hidden update nor a forged absence can pass), but its leaves
+  *     carry only `dataDigest` — NOT the value bytes.
   *   - `values` — per field, the `(keyHex → valueHex)` pairs the leaves commit to. The value bytes travel alongside the proof because the
   *     range proof's leaves only hold `dataDigest`; the verifier binds `Hasher.hashBytes(valueHex.toBytes) == leaf.dataDigest` internally
   *     (contract bar #2). Mirrors how [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProof.value]] carries the

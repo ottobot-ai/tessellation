@@ -483,7 +483,13 @@ object GlobalSnapshotContextFunctions {
       diffOptHash("nodeCollateralWithdrawals", computed.nodeCollateralWithdrawals, claimed.nodeCollateralWithdrawals),
       diffOptHash("priceState", computed.priceState, claimed.priceState),
       diffOptHash("lastGlobalSnapshotsWithCurrency", computed.lastGlobalSnapshotsWithCurrency, claimed.lastGlobalSnapshotsWithCurrency),
-      diffOptHash("historicalStakeSnapshots", computed.historicalStakeSnapshots, claimed.historicalStakeSnapshots)
+      diffOptHash("historicalStakeSnapshots", computed.historicalStakeSnapshots, claimed.historicalStakeSnapshots),
+      // §3 NIPoPoW historical-commitment SMT root. DIAGNOSTIC ONLY here: the live-follower mismatch (above) deliberately compares only the
+      // consensus-canonical `mptRoot`, and `smtRoot` is gl0-maintained — non-gl0 followers (cl0/dl1) run accept() WITHOUT the
+      // HistoricalCommitmentSmtStore, so their `computed.smtRoot` is None while the gl0-signed `claimed.smtRoot` is Some. That asymmetry is
+      // EXPECTED (the same reason the 16 legacy per-field roots aren't the follower's source of truth). gl0-producer↔gl0-peer agreement is
+      // enforced separately on the accept-with-store path. This row only surfaces the value in the diff log.
+      diffOptHash("smtRoot", computed.smtRoot, claimed.smtRoot)
     ).flatten
   }
 }

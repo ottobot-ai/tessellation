@@ -434,6 +434,16 @@ object GlobalSnapshotConsensus {
         )(Async[F], HasherSelector[F].getCurrent, implicitly[SecurityProvider[F]], implicitly[Metrics[F]])
         .toResource
 
+      // §3 NIPoPoW historical-commitment SMT store — gl0-only (this produce/verify GSAM has the finalized global-snapshot chain
+      // via `getGlobalSnapshotByOrdinalWithFallback`, which accept() reads to derive each finalized ordinal's commitment). In-memory
+      // reference (durable MPT producer + versioned SMT); recoverable by chain-replay like `MptTowerStore`. The SharedServices
+      // (cl0/dl1 follower) GSAM is NOT given the store, so those layers keep `smtRoot = None`.
+      historicalCommitmentSmtStore <- {
+        implicit val h: Hasher[F] = HasherSelector[F].getCurrent
+        io.constellationnetwork.node.shared.domain.nakamoto.nipopow.HistoricalCommitmentSmtStore
+          .inMemory[F](sharedCfg.nakamoto.commitmentSmt.versionRootRetention.value)
+      }.toResource
+
       snapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager
         .make[F](
           sharedCfg.fieldsAddedOrdinals,
@@ -465,7 +475,11 @@ object GlobalSnapshotConsensus {
           // GSAM construction so the gl0-leader-produce and verify paths stay consistent.
           shardingConfig = shardAcceptanceDeps.map(_.shardingConfig),
           shardCheckpointAcceptanceManager = shardAcceptanceDeps.map(_.acceptanceManager),
-          shardAssignment = shardAcceptanceDeps.map(_.shardAssignment)
+          shardAssignment = shardAcceptanceDeps.map(_.shardAssignment),
+          // §3 NIPoPoW historical-commitment SMT: wire the gl0 store + the confirmation-depth cutoff so accept() anchors
+          // `smtRoot(N)`. Same k the leader loop / sync daemon use (`nakamoto.confirmation-depth-k`, default 255).
+          historicalCommitmentSmtStore = Some(historicalCommitmentSmtStore),
+          confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK.value
         )
         .toResource
 

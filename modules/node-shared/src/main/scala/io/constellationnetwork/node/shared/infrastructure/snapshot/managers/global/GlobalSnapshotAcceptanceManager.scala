@@ -297,7 +297,21 @@ object GlobalSnapshotAcceptanceManager {
     // (or `shardAssignment = None`) NO filter is applied — byte-identical to today.
     shardingConfig: Option[ShardingConfig] = None,
     shardCheckpointAcceptanceManager: Option[ShardCheckpointGl0AcceptanceManager[F]] = None,
-    shardAssignment: Option[ShardAssignment[F]] = None
+    shardAssignment: Option[ShardAssignment[F]] = None,
+    // §3 NIPoPoW historical-commitment SMT. `Some(store)` is wired ONLY at the gl0 produce/verify GSAM
+    // (`GlobalSnapshotConsensus.make`) — that path has the finalized global-snapshot chain (`getGlobalSnapshotByOrdinal`)
+    // needed to derive the per-ordinal commitment for the eligible finalized ordinal `N − confirmationDepthK`. When present,
+    // accept() folds that ordinal's `PerOrdinalCommitment(hypergraphRoot, incrementalSnapshotHash, towerEligibility)` into the
+    // store and overrides `stateProof.smtRoot` with `smtRoot(N)` (= root over commitments ≤ N − k). gl0-leader and gl0-peer
+    // share this single GSAM/store, so they compute byte-identical roots. `None` (cl0/dl1/tests) leaves `smtRoot = None` —
+    // byte-identical to pre-SMT behavior, and excluded from the `StateProofValidator` `===` via `StateProofComparison`.
+    historicalCommitmentSmtStore: Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.nipopow.HistoricalCommitmentSmtStore[F]
+    ] = None,
+    // The existing confirmation depth k (`ConfirmationDepthK`). The cutoff ordinal committed at accept(N) is `N − k`. Defaults
+    // to 255 (the production default) but the gl0 wiring passes the same value the leader loop / sync daemon read, so producer
+    // and verifier agree. Only consulted when `historicalCommitmentSmtStore` is `Some`.
+    confirmationDepthK: Long = 255L
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): F[GlobalSnapshotAcceptanceManager[F]] = {
@@ -354,6 +368,52 @@ object GlobalSnapshotAcceptanceManager {
 
       new GlobalSnapshotAcceptanceManager[F] {
         private val builder = GlobalSnapshotInfo.stateProofBuilder(Some(mptStore.underlying))
+
+        /** §3 NIPoPoW historical-commitment SMT: override `proof.smtRoot` with `smtRoot(ordinal)` when the gl0 store is wired.
+          *
+          * Deterministic + producer/verifier-symmetric:
+          *   - eligible ordinal `j = ordinal − k`; below the genesis/warmup window (`ordinal ≤ k`, or `j` not yet a finalized snapshot)
+          *     there is nothing to commit ⇒ leave `smtRoot = None` (the same value on every node).
+          *   - read snapshot `j` from the finalized chain (`getGlobalSnapshotByOrdinal`); derive `PerOrdinalCommitment(hypergraphRoot =
+          *     snap.stateProof.mptRoot.getOrElse(empty), incrementalSnapshotHash = snap.hash, towerEligibility = NotComputed)`. All three
+          *     are deterministic functions of the immutable snapshot at `j`, so leader and every gl0 peer derive byte-identical
+          *     commitments. (towerEligibility is reserved but not yet tower-sourced — see PerOrdinalCommitment / report STAGING.)
+          *   - fold it into the store under version `ordinal` and read the resulting cutoff-root. `appendAtFinality` is idempotent, so
+          *     re-running accept(ordinal) (validateArtifact after produce, or a re-proposal) reproduces the same root.
+          *   - if snapshot `j` is not retrievable (bootstrapped node lacking ancestors < its join ordinal), leave `smtRoot = None` — that
+          *     node simply doesn't anchor smtRoot until it has accumulated the ancestor; it is NOT a wrong root. See report "bootstrap" for
+          *     the sync-vs-skip options.
+          */
+        private def attachSmtRoot(
+          ordinal: SnapshotOrdinal,
+          proof: GlobalSnapshotStateProof,
+          getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+        ): F[GlobalSnapshotStateProof] =
+          historicalCommitmentSmtStore match {
+            case None => proof.pure[F]
+            case Some(store) =>
+              val ordValue = ordinal.value.value
+              if (ordValue < confirmationDepthK) proof.pure[F]
+              else {
+                val eligibleOrdinal =
+                  SnapshotOrdinal(eu.timepit.refined.types.numeric.NonNegLong.unsafeFrom(ordValue - confirmationDepthK))
+                getGlobalSnapshotByOrdinal(eligibleOrdinal).flatMap {
+                  case None =>
+                    // Eligible ancestor not on disk (bootstrap / pruned). Deterministic fallback: no smtRoot this ordinal.
+                    proof.pure[F]
+                  case Some(eligibleSnapshot) =>
+                    val commitment =
+                      io.constellationnetwork.node.shared.domain.nakamoto.nipopow.PerOrdinalCommitment(
+                        hypergraphRoot = eligibleSnapshot.signed.value.stateProof.mptRoot.getOrElse(Hash.empty),
+                        incrementalSnapshotHash = eligibleSnapshot.hash,
+                        towerEligibility = io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerEligibility.NotComputed
+                      )
+                    store
+                      .appendAtFinality(ordinal, eligibleOrdinal, commitment)
+                      .map(smtRoot => proof.copy(smtRoot = Some(smtRoot.value)))
+                }
+              }
+          }
 
         case class InitialData(
           blockResult: BlockAcceptanceResult,
@@ -2256,7 +2316,7 @@ object GlobalSnapshotAcceptanceManager {
                     builder.buildProof(gsi, ordinal)
                 incrementalRoot = incrementalProof.mptRoot.map(_.show).getOrElse("none")
 
-                stateProof <-
+                stateProofBeforeSmt <-
                   if (!isMptFormat) {
                     loggerBundle.app
                       .info(
@@ -2304,6 +2364,13 @@ object GlobalSnapshotAcceptanceManager {
                         }
                     } yield result
                   }
+
+                // §3 NIPoPoW historical-commitment SMT: when the gl0 store is wired, fold the now-finalized eligible ordinal's
+                // commitment in and anchor `smtRoot(ordinal)`. Self-contained + producer/verifier-symmetric: the eligible
+                // ordinal `ordinal − k` and its `(mptRoot, snapshotHash)` are read from the SAME on-disk finalized snapshot via
+                // `getGlobalSnapshotByOrdinal`, so the leader and every gl0 peer derive byte-identical commitments and roots.
+                // `None` store (cl0/dl1/tests) ⇒ `stateProof = stateProofBeforeSmt` unchanged (smtRoot stays None).
+                stateProof <- attachSmtRoot(ordinal, stateProofBeforeSmt, getGlobalSnapshotByOrdinal)
 
                 expiredAllowSpends = allowSpendStateManager.filterExpiredAllowSpends(
                   lastActiveGlobalAllowSpends,

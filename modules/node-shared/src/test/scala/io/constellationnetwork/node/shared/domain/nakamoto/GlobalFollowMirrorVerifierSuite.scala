@@ -37,16 +37,16 @@ import weaver.MutableIOSuite
 /** The FIELD-ROOT-MATCH verify path for an own-slice mirror follower (gl1) — `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`.
   *
   * This is the correct-by-design proof for a holder of the full content of the five consumed fields. The mechanism: apply a producer's
-  * claimed Address-keyed slice on top of the follower's prior state, forward-hash each `(Address, value)` to its MPT leaf the way gl0's writer
-  * does (`toHex(hypergraph(field, addr))` + `immutableBytes(value)`), recompute each field's subtree root via gl0's EXACT
+  * claimed Address-keyed slice on top of the follower's prior state, forward-hash each `(Address, value)` to its MPT leaf the way gl0's
+  * writer does (`toHex(hypergraph(field, addr))` + `immutableBytes(value)`), recompute each field's subtree root via gl0's EXACT
   * `GlobalStateConverter.fieldRootFromBytes`, and assert it equals the signed `stateProof.<field>Proof`. A wrong / missing / extra entry
   * yields a different subtree root ⇒ [[FollowVerificationError.FieldRootMismatch]].
   *
   * '''Determinism cross-check (byte-identity by construction).''' The `signedFieldRoots` the verifier matches against are NEVER hardcoded —
-  * they are derived in-test from a REFERENCE post-state MPT built the way gl0 builds it (via `MptStore.insert[V]` → `toHex(hypergraph(field,
-  * addr))` keys + scodec `immutableBytes` values), read back as `(leaf-path Hex → bytes)` and fed to the SAME
-  * `GlobalStateConverter.fieldRootFromBytes` callable gl0's `stateProofBuilder` / `mptStateProofFromBytes` route through. So a passing match
-  * proves the Address-keyed forward-hash reproduces gl0's signed root byte-identically. See `expectedRootsFromReference`.
+  * they are derived in-test from a REFERENCE post-state MPT built the way gl0 builds it (via `MptStore.insert[V]` →
+  * `toHex(hypergraph(field, addr))` keys + scodec `immutableBytes` values), read back as `(leaf-path Hex → bytes)` and fed to the SAME
+  * `GlobalStateConverter.fieldRootFromBytes` callable gl0's `stateProofBuilder` / `mptStateProofFromBytes` route through. So a passing
+  * match proves the Address-keyed forward-hash reproduces gl0's signed root byte-identically. See `expectedRootsFromReference`.
   *
   * Coverage:
   *   1. correct delta → all five field roots match → `Verified(ConsumedFieldState)` equal to the reference post-state (Address-keyed).
@@ -80,11 +80,12 @@ object GlobalFollowMirrorVerifierSuite extends MutableIOSuite {
 
   private def bal(n: Long): Balance = Balance(NonNegLong.unsafeFrom(n))
   private def txRef(n: Long): TransactionReference = TransactionReference(TransactionOrdinal(NonNegLong.unsafeFrom(n)), Hash(f"$n%064d"))
-  private def allowSpendRef(n: Long): AllowSpendReference = AllowSpendReference(AllowSpendOrdinal(NonNegLong.unsafeFrom(n)), Hash(f"$n%064d"))
+  private def allowSpendRef(n: Long): AllowSpendReference =
+    AllowSpendReference(AllowSpendOrdinal(NonNegLong.unsafeFrom(n)), Hash(f"$n%064d"))
   private def tokenLockRef(n: Long): TokenLockReference = TokenLockReference(TokenLockOrdinal(NonNegLong.unsafeFrom(n)), Hash(f"$n%064d"))
 
-  /** A dummy `Signed[TokenLock]` keyed by `(holder seed, amount)` — `amount` lets a test bump the value to force a different field root. The
-    * signature is never verified on this path (the recompute hashes the encoded bytes); a fixed placeholder proof keeps the encoding
+  /** A dummy `Signed[TokenLock]` keyed by `(holder seed, amount)` — `amount` lets a test bump the value to force a different field root.
+    * The signature is never verified on this path (the recompute hashes the encoded bytes); a fixed placeholder proof keeps the encoding
     * deterministic so the reference root and the verifier's recompute are byte-identical.
     */
   private def signedTokenLock(seed: Int, amount: Long): Signed[TokenLock] =
@@ -125,7 +126,8 @@ object GlobalFollowMirrorVerifierSuite extends MutableIOSuite {
 
   /** The PRIOR consumed-field state — what the follower's mirror holds before this ordinal's writes (Address-keyed). Three balances, two
     * txRefs, one allowSpendRef, one tokenLockRef. addr(3) balance is included so a later test can prove a REMOVAL. Built via the verifier
-    * itself (verify a delta-from-empty against its own recomputed roots) so it is a real `Verified` value with no public-constructor access.
+    * itself (verify a delta-from-empty against its own recomputed roots) so it is a real `Verified` value with no public-constructor
+    * access.
     */
   private def mkPriorState(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[ConsumedFieldState] =
     verifyToState(
@@ -155,32 +157,34 @@ object GlobalFollowMirrorVerifierSuite extends MutableIOSuite {
     * Address-keyed upserts exactly the way the verifier does (`toHex(hypergraph(field, addr))` + `immutableBytes`), then
     * `fieldRootFromBytes`. Used only to self-seed `verifyToState`.
     */
-  private def selfRoots(delta: ConsumedFieldDelta)(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[SortedMap[GlobalStateFieldId, Hash]] =
+  private def selfRoots(
+    delta: ConsumedFieldDelta
+  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[SortedMap[GlobalStateFieldId, Hash]] =
     for {
       bal <- rootOf(GlobalStateFieldId.Balances, delta.balances)
       tx <- rootOf(GlobalStateFieldId.LastTxRefs, delta.lastTxRefs)
       as <- rootOf(GlobalStateFieldId.LastAllowSpendRefs, delta.lastAllowSpendRefs)
       tl <- rootOf(GlobalStateFieldId.LastTokenLockRefs, delta.lastTokenLockRefs)
       atl <- rootOf(GlobalStateFieldId.ActiveTokenLocks, delta.activeTokenLocks)
-    } yield SortedMap(
-      GlobalStateFieldId.Balances -> bal,
-      GlobalStateFieldId.LastTxRefs -> tx,
-      GlobalStateFieldId.LastAllowSpendRefs -> as,
-      GlobalStateFieldId.LastTokenLockRefs -> tl,
-      GlobalStateFieldId.ActiveTokenLocks -> atl
-    )
+    } yield
+      SortedMap(
+        GlobalStateFieldId.Balances -> bal,
+        GlobalStateFieldId.LastTxRefs -> tx,
+        GlobalStateFieldId.LastAllowSpendRefs -> as,
+        GlobalStateFieldId.LastTokenLockRefs -> tl,
+        GlobalStateFieldId.ActiveTokenLocks -> atl
+      )
 
   private def rootOf[V: ImmutableCodec](
     field: GlobalStateFieldId,
     m: SortedMap[Address, V]
   )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[Hash] =
-    m.toList
-      .traverse {
-        case (a, v) =>
-          GlobalStateKey
-            .toHex[IO](GlobalStateKey.hypergraph(field, a))
-            .map(_ -> ImmutableCodec[V].immutableBytes(v).toArray)
-      }
+    m.toList.traverse {
+      case (a, v) =>
+        GlobalStateKey
+          .toHex[IO](GlobalStateKey.hypergraph(field, a))
+          .map(_ -> ImmutableCodec[V].immutableBytes(v).toArray)
+    }
       .map(_.toMap)
       .flatMap(GlobalStateConverter.fieldRootFromBytes[IO])
 
@@ -199,21 +203,20 @@ object GlobalFollowMirrorVerifierSuite extends MutableIOSuite {
       _ <- store.commit(ordinal)
     } yield ()
 
-  /** gl0's exact signed per-field roots for the reference store: read the reference store's bytes the way the MPT writer wrote them, group by
-    * the consumed field's prefix, and feed each group to `GlobalStateConverter.fieldRootFromBytes` — the SAME callable gl0's stateProof builder
-    * routes through. NOT hardcoded; this is the determinism cross-check.
+  /** gl0's exact signed per-field roots for the reference store: read the reference store's bytes the way the MPT writer wrote them, group
+    * by the consumed field's prefix, and feed each group to `GlobalStateConverter.fieldRootFromBytes` — the SAME callable gl0's stateProof
+    * builder routes through. NOT hardcoded; this is the determinism cross-check.
     */
   private def expectedRootsFromReference(
     refStore: MptStore[IO, GlobalStateKey]
   )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[SortedMap[GlobalStateFieldId, Hash]] =
     refStore.allEntriesAsBytes.flatMap { entries =>
-      FollowVerifyCore.consumedFields
-        .traverse { field =>
-          GlobalStateKey.hypergraphFieldPrefix[IO](field).flatMap { prefix =>
-            val fieldEntries = entries.filter { case (hex, _) => hex.value.startsWith(prefix.value) }
-            GlobalStateConverter.fieldRootFromBytes[IO](fieldEntries).map(field -> _)
-          }
+      FollowVerifyCore.consumedFields.traverse { field =>
+        GlobalStateKey.hypergraphFieldPrefix[IO](field).flatMap { prefix =>
+          val fieldEntries = entries.filter { case (hex, _) => hex.value.startsWith(prefix.value) }
+          GlobalStateConverter.fieldRootFromBytes[IO](fieldEntries).map(field -> _)
         }
+      }
         .map(SortedMap.from(_))
     }
 

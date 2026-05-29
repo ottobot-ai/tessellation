@@ -34,8 +34,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *
   * '''Non-destructive read.''' [[snapshotPending]] is a read, not a take — it does not clear the buffer. Re-buffering the same binary is an
   * idempotent no-op (dedup by binary hash), and `ShardChainStore.store` is idempotent by checkpoint hash, so re-reading a still-pending
-  * window across successive gl0 ords does not double-include. Pruning of finalized binaries is a later slice (on finalize); v1 relies on the
-  * cap below to bound growth.
+  * window across successive gl0 ords does not double-include. Pruning of finalized binaries is a later slice (on finalize); v1 relies on
+  * the cap below to bound growth.
   *
   * '''Bounded (HOCON, not sys.env)''' per `[[feedback-prefer-hocon-over-sysenv]]`: the per-shard cap comes from
   * `cfg.nakamoto.sharding.checkpoint.binaryBufferCap` (typed [[io.constellationnetwork.node.shared.config.types.ShardCheckpointConfig]]),
@@ -88,8 +88,8 @@ object ShardBinaryBuffer {
     *   [[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.ShardRegistryEntry]] so intake + producer share
     *   the SAME instance).
     * @param cap
-    *   max number of distinct binaries buffered for this shard at once (from
-    *   `cfg.nakamoto.sharding.checkpoint.binaryBufferCap`). At cap, new distinct binaries are rejected (chain-safe overflow).
+    *   max number of distinct binaries buffered for this shard at once (from `cfg.nakamoto.sharding.checkpoint.binaryBufferCap`). At cap,
+    *   new distinct binaries are rejected (chain-safe overflow).
     */
   def make[F[_]: Async: Hasher](shardId: ShardId, cap: Int): F[ShardBinaryBuffer[F]] = {
     val outerShardId = shardId
