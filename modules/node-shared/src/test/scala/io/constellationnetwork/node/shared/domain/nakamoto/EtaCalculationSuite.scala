@@ -35,9 +35,28 @@ object EtaCalculationSuite extends SimpleIOSuite {
     expect(eta.sameElements(genesisEta))
   }
 
-  pureTest("period 1 uses genesis eta") {
+  pureTest("period 1 with empty period-0 outputs falls back to genesis eta (warmup)") {
+    // #259 COMPUTED convention: period 1 is no longer hard-coded to genesis; it derives from period 0's
+    // VRF outputs. With NO period-0 outputs the derivation degenerates back to genesis (warmup window).
     val eta = EtaCalculation.etaForOrdinal(700, etaRotation, genesisEta, _ => Nil)
     expect(eta.sameElements(genesisEta))
+  }
+
+  pureTest("period 1 derives from period 0 VRF outputs (COMPUTED convention, #259)") {
+    // Period 1 = ordinals [600, 1200); its source period is period 0 = [0, 600). With non-empty
+    // period-0 outputs the eta is `computeEta(genesisEta, 1, outputs)` — NOT genesis — matching the
+    // wire / eligibility / committee eta the rest of the system computes for period 1.
+    val fakeVrfOutputs = List(Array.fill(64)(0x01.toByte), Array.fill(64)(0x02.toByte))
+    val eta = EtaCalculation.etaForOrdinal(
+      700, // period 1
+      etaRotation,
+      genesisEta,
+      period => if (period == 0) fakeVrfOutputs else Nil
+    )
+    val expected = EtaCalculation.computeEta(genesisEta, 1, fakeVrfOutputs)
+    expect(!eta.sameElements(genesisEta)) &&
+    expect(eta.sameElements(expected)) &&
+    expect(eta.length == 32)
   }
 
   pureTest("period 2 derives from period 1 VRF outputs") {
@@ -133,26 +152,24 @@ object EtaCalculationSuite extends SimpleIOSuite {
     expect(eta.length == 32)
   }
 
-  pureTest("full flow: period 0 → 1 → 2 with chain data") {
+  pureTest("full flow: period 0 → 1 → 2 with chain data (COMPUTED convention, #259)") {
     // Simulate chain: some snapshots in period 0, some in period 1
     val period0Outputs = (0 until 10).map(i => (i * 50L, Array.fill(64)(i.toByte))).toList
     val period1Outputs = (0 until 8).map(i => ((600 + i * 50).toLong, Array.fill(64)((i + 100).toByte))).toList
     val allOutputs = period0Outputs ++ period1Outputs
+    val lookup: Long => List[Array[Byte]] = period => EtaCalculation.extractVrfOutputsForPeriod(allOutputs, period, etaRotation)
 
-    // Period 0 and 1: genesis eta
-    val eta0 = EtaCalculation.etaForOrdinal(100, etaRotation, genesisEta, _ => Nil)
-    val eta1 = EtaCalculation.etaForOrdinal(700, etaRotation, genesisEta, _ => Nil)
+    // Period 0: genesis eta (no predecessor). Period 1: derived from period 0's first 2/3 outputs
+    // (the #259 unification — no longer genesis). Period 2: derived from period 1's first 2/3 outputs.
+    val eta0 = EtaCalculation.etaForOrdinal(100, etaRotation, genesisEta, lookup)
+    val eta1 = EtaCalculation.etaForOrdinal(700, etaRotation, genesisEta, lookup)
+    val eta2 = EtaCalculation.etaForOrdinal(1300, etaRotation, genesisEta, lookup)
     expect(eta0.sameElements(genesisEta)) &&
-    expect(eta1.sameElements(genesisEta)) && {
-      // Period 2: derived from period 1's first 2/3 outputs
-      val eta2 = EtaCalculation.etaForOrdinal(
-        1300,
-        etaRotation,
-        genesisEta,
-        period => EtaCalculation.extractVrfOutputsForPeriod(allOutputs, period, etaRotation)
-      )
-      expect(!eta2.sameElements(genesisEta)) &&
-      expect(eta2.length == 32)
-    }
+    expect(!eta1.sameElements(genesisEta)) &&
+    expect(eta1.sameElements(EtaCalculation.computeEta(genesisEta, 1, lookup(0)))) &&
+    expect(eta1.length == 32) &&
+    expect(!eta2.sameElements(genesisEta)) &&
+    expect(!eta2.sameElements(eta1)) &&
+    expect(eta2.length == 32)
   }
 }

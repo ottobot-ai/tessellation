@@ -104,10 +104,11 @@ object GlobalSnapshotConsensus {
   val nakamotoGenesisTimeMs: Long =
     sys.env.get("NAKAMOTO_GENESIS_TIME_MS").flatMap(_.toLongOption).getOrElse(System.currentTimeMillis())
 
-  /** §3 NIPoPoW genesis eta — Blake2b-256 digest of a fixed domain string. 32 bytes; used to seed `EtaCalculation` for periods ≤ 1 and as
-    * the bootstrap fall-through for `EtaStateManager`. Must be identical across all nodes in a cluster — derived from a constant rather
-    * than env var to avoid a config-drift class of bug (different operators setting different `NAKAMOTO_GENESIS_ETA` values would silently
-    * fork the chain). Future work: derive from the genesis snapshot hash so it's chain-bound instead of literal-bound.
+  /** §3 NIPoPoW genesis eta — Blake2b-256 digest of a fixed domain string. 32 bytes; used to seed `EtaCalculation` for period 0 (and as the
+    * empty-chain-walk fallback at every higher period, incl. the COMPUTED period 1, #259) and as the bootstrap fall-through for
+    * `EtaStateManager`. Must be identical across all nodes in a cluster — derived from a constant rather than env var to avoid a
+    * config-drift class of bug (different operators setting different `NAKAMOTO_GENESIS_ETA` values would silently fork the chain). Future
+    * work: derive from the genesis snapshot hash so it's chain-bound instead of literal-bound.
     *
     * Path 1 (heap-leak workstream): hoisted to a top-level helper so the boundary-write `etaForPeriod` callback in `make` can construct an
     * `EtaStateManager` BEFORE the GSAM (and before the chain store is built); the previous in-place definition lived inside the inner

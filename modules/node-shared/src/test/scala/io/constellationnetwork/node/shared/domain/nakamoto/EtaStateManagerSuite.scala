@@ -14,9 +14,11 @@ import weaver.MutableIOSuite
 
 /** Spec assertions for [[EtaStateManager]] — Path 1 of the heap-leak workstream.
   *
-  *   - Periods 0 and 1 return `genesisEta` without touching MPT or chain.
-  *   - Period ≥ 2 with MPT cache hit returns the cached eta bytes.
-  *   - Period ≥ 2 with MPT cache miss falls back to chain-walk and computes via `EtaCalculation.computeEta`.
+  *   - Period 0 returns `genesisEta` without touching MPT or chain.
+  *   - Period 1 follows the COMPUTED convention (#259): MPT-lookup → chain-walk → `EtaCalculation.computeEta(genesisEta, 1, …)`,
+  *     byte-matching the wire / eligibility / committee eta. Only an empty chain walk falls back to `genesisEta`.
+  *   - Period ≥ 1 with MPT cache hit returns the cached eta bytes.
+  *   - Period ≥ 1 with MPT cache miss falls back to chain-walk and computes via `EtaCalculation.computeEta`.
   *   - Chain-walk recompute is memoized in-process so repeated `getEta(N)` calls on a cache-miss path don't re-walk.
   *   - Empty chain walk (no VRF outputs) returns `genesisEta`.
   */
@@ -59,16 +61,95 @@ object EtaStateManagerSuite extends MutableIOSuite {
     } yield expect.all(out.sameElements(genesisEta), walked.isEmpty)
   }
 
-  test("period 1 → genesisEta (no MPT, no chain)") { res =>
+  test("period 1 with MPT cache miss + non-empty chain walk → computed eta (COMPUTED convention, #259)") { res =>
     implicit val (h, _) = res
+    // #259 unification: period 1 is NOT special-cased to genesis. With a non-empty chain walk over
+    // period 0's VRF outputs it computes `EtaCalculation.computeEta(genesisEta, 1, outputs)` — the SAME
+    // bytes the wire / eligibility / committee eta produces. The walk fires for source period = 0.
+    val vrfOutputs = List[(Long, Array[Byte])](
+      (0L, Array.fill[Byte](16)(0x01.toByte)),
+      (1L, Array.fill[Byte](16)(0x02.toByte))
+    )
+    val expectedEta = EtaCalculation.computeEta(genesisEta, 1L, vrfOutputs.map(_._2))
     for {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
+      walkRef <- Ref.of[IO, List[Long]](Nil)
+      reader = stubReader(mptRef)
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, sp => walkRef.update(sp :: _).as(vrfOutputs))
+      out <- mgr.getEta(1L)
+      walked <- walkRef.get
+    } yield
+      expect.all(
+        out.sameElements(expectedEta),
+        walked == List(0L) // walk was called for source period = currentPeriod - 1 = 0
+      )
+  }
+
+  test("period 1 with MPT cache miss + empty chain walk → genesisEta (warmup fall-through)") { res =>
+    implicit val (h, _) = res
+    // Before any period-0 VRF outputs exist the walk is empty, so period 1 falls back to genesisEta —
+    // matching `SnapshotLeaderLoop`'s empty-`vrfOutputsForPeriod(0)` branch. The walk IS engaged
+    // (source period 0), unlike period 0 which short-circuits before touching MPT/chain.
+    for {
+      mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
+      walkRef <- Ref.of[IO, List[Long]](Nil)
+      reader = stubReader(mptRef)
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, sp => walkRef.update(sp :: _).as(List.empty[(Long, Array[Byte])]))
+      out <- mgr.getEta(1L)
+      walked <- walkRef.get
+    } yield expect.all(out.sameElements(genesisEta), walked == List(0L))
+  }
+
+  test("period 1 with MPT cache hit returns the cached eta bytes") { res =>
+    implicit val (h, _) = res
+    // The MPT boundary record for period 1 (written by GSAM at the period-0 closing boundary, ord R-1)
+    // is now authoritative for period 1 just like any higher period.
+    val etaBytes = Array.fill[Byte](32)(0x37.toByte)
+    val cached = HistoricalStakeSnapshot(StakeDistribution.Empty, hashOf(etaBytes))
+    for {
+      mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap(EtaPeriod(1L) -> cached))
       walkRef <- Ref.of[IO, List[Long]](Nil)
       reader = stubReader(mptRef)
       mgr <- EtaStateManager.make[IO](genesisEta, reader, p => walkRef.update(p :: _).as(List.empty[(Long, Array[Byte])]))
       out <- mgr.getEta(1L)
       walked <- walkRef.get
-    } yield expect.all(out.sameElements(genesisEta), walked.isEmpty)
+    } yield expect.all(out.sameElements(etaBytes), walked.isEmpty)
+  }
+
+  // #259 byte-exactness: getEta(1) MUST equal SnapshotLeaderLoop's wire / eligibility eta at period 1.
+  // The leader computes `eta = if (currentPeriod <= 0) genesisEta else { val o = vrfOutputsForPeriod(0);
+  // if (o.nonEmpty) computeEta(genesisEta, 1, o.map(_._2)) else genesisEta }`. With the SAME chain-walk
+  // source and the SAME genesis-on-empty fallback, getEta(1) reproduces those exact bytes — so the
+  // producer's MPT boundary record (etaForPeriod=getEta) == committee draw == wire == follower-adopt.
+  test("#259 byte-exactness: getEta(1) == SnapshotLeaderLoop wire eta at period 1 (non-empty walk)") { res =>
+    implicit val (h, _) = res
+    val period0Outputs = List[(Long, Array[Byte])](
+      (0L, Array.fill[Byte](16)(0xa1.toByte)),
+      (1L, Array.fill[Byte](16)(0xb2.toByte)),
+      (2L, Array.fill[Byte](16)(0xc3.toByte))
+    )
+    // Mirror of SnapshotLeaderLoop.scala:572-583 at currentPeriod=1.
+    val leaderWireEta: Array[Byte] =
+      if (period0Outputs.nonEmpty) EtaCalculation.computeEta(genesisEta, 1L, period0Outputs.map(_._2)) else genesisEta
+    for {
+      mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
+      reader = stubReader(mptRef)
+      // chainWalkFallback(period-1) is invoked with source period 0; return period-0 outputs.
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, sp => if (sp == 0L) IO.pure(period0Outputs) else IO.pure(Nil))
+      getEta1 <- mgr.getEta(1L)
+    } yield expect(getEta1.sameElements(leaderWireEta))
+  }
+
+  test("#259 byte-exactness: getEta(1) == SnapshotLeaderLoop wire eta at period 1 (empty walk → genesis)") { res =>
+    implicit val (h, _) = res
+    // Mirror of SnapshotLeaderLoop's empty-`vrfOutputsForPeriod(0)` branch: both yield genesisEta.
+    val leaderWireEta: Array[Byte] = genesisEta // empty period-0 outputs branch
+    for {
+      mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
+      reader = stubReader(mptRef)
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, _ => IO.pure(List.empty[(Long, Array[Byte])]))
+      getEta1 <- mgr.getEta(1L)
+    } yield expect(getEta1.sameElements(leaderWireEta))
   }
 
   test("period 2 with MPT cache hit returns the cached eta bytes") { res =>

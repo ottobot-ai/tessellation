@@ -7,7 +7,8 @@ import org.bouncycastle.crypto.digests.Blake2bDigest
 /** Chain-derived eta calculation following Bifrost/Cardano pattern.
   *
   * Eta for rotation period N is derived from VRF outputs in the first 2/3 of rotation period N-1. Genesis eta is used for rotation period 0
-  * (and period 1, since period 0 has no predecessor).
+  * only (no predecessor period to derive from); period 1 derives from period 0's VRF outputs (the COMPUTED convention, #259). When the
+  * predecessor period has no VRF outputs yet (the period 0 → 1 warmup window) the derivation degenerates back to genesis eta.
   *
   * Rotation periods are keyed on **snapshot ordinal**, not slot — slots are LDD-paced and lumpy; ordinals are 1:1 with snapshots and give a
   * stable R that satisfies the Praos R ≥ 3·k₁ stability bound. See `docs/nakamoto/attestation-and-finality.md` §1.
@@ -43,9 +44,14 @@ object EtaCalculation {
 
   /** Determine which eta to use for a given ordinal.
     *
-    *   - Period 0: genesis eta
-    *   - Period 1: genesis eta (no predecessor period to derive from)
-    *   - Period N (N >= 2): eta derived from VRF outputs in first 2/3 of period N-1
+    *   - Period 0: genesis eta (no predecessor period to derive from)
+    *   - Period N (N >= 1): eta derived from VRF outputs in first 2/3 of period N-1; falls back to genesis eta when period N-1 has no VRF
+    *     outputs yet (the period 0 → 1 warmup window or bootstrap edge cases)
+    *
+    * #259 — COMPUTED period-1 convention: period 1 is NOT special-cased to genesis. It computes `computeEta(genesisEta, 1,
+    * vrfOutputsForPeriod(0))` so this reference function agrees byte-for-byte with the canonical per-period eta resolved by
+    * [[EtaStateManager.getEta]] (which keys on `period <= 0`) and the wire / eligibility eta in `SnapshotLeaderLoop`. There is now a single
+    * eta convention across producer record, committee draw, wire, and follower adoption.
     *
     * The caller must supply the VRF outputs from the chain for the relevant period. This method only handles the "which period and what
     * inputs" logic.
@@ -58,17 +64,18 @@ object EtaCalculation {
   ): Array[Byte] = {
     val period = rotationPeriod(ordinal, etaRotationSnapshots)
 
-    if (period <= 1) {
-      // Periods 0 and 1 use genesis eta
+    if (period <= 0) {
+      // Period 0 uses genesis eta (no predecessor period)
       genesisEta
     } else {
-      // Period N (>= 2): derive from VRF outputs in first 2/3 of period N-1
+      // Period N (>= 1): derive from VRF outputs in first 2/3 of period N-1
       val sourcePeriod = period - 1
       val vrfOutputs = lookupVrfOutputsForPeriod(sourcePeriod)
 
       if (vrfOutputs.isEmpty) {
-        // No blocks in source period — use previous eta (degenerate case)
-        // In production, this should be rare with reasonable LDD params
+        // No blocks in source period — use genesis eta (degenerate / warmup case).
+        // Matches `SnapshotLeaderLoop`'s empty-`vrfOutputsForPeriod(period-1)` branch and
+        // `EtaStateManager.getEta`'s empty-chain-walk fallback.
         genesisEta
       } else {
         computeEta(genesisEta, period, vrfOutputs)

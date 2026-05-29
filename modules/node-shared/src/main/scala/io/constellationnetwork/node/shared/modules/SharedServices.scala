@@ -55,7 +55,7 @@ import fs2.concurrent.SignallingRef
 object SharedServices {
 
   /** Path 1 (heap-leak workstream): the default genesis eta seed used as a 32-byte fall-through whenever the §3 NIPoPoW boundary writer
-    * cannot derive eta from the chain (period ≤ 1, no chain-store, empty chain walk). Mirrors the per-cluster constant the dag-l0
+    * cannot derive eta from the chain (period 0, no chain-store, or empty chain walk). Mirrors the per-cluster constant the dag-l0
     * `GlobalSnapshotConsensus.nakamotoGenesisEta` helper computes — both call sites produce byte-identical bytes so the MPT entry is
     * deterministic across the leader (gl0 with chain-store walk) and the follower-path SharedServices GSAM (no-op walk → genesisEta).
     *
@@ -224,9 +224,9 @@ object SharedServices {
       // The manager wraps an MPT-cache point read (`HistoricalStakeReader.lookup(period)`) + a caller-supplied chain-walk fallback.
       // On the SharedServices side both the MPT cache and the chain walk are layer-agnostic — gl0 still gets a richer chain walk via
       // the `GlobalSnapshotConsensus` GSAM (which has access to `NakamotoChainStore.vrfOutputsForPeriod`). Layers without a chain
-      // store (cl0, cl1, dl1, gl1) use the default no-op walk; their boundary write at `ord % R == R - 1` lands the
-      // `EtaCalculation.computeEta(genesisEta, period, [])` fallback for periods ≤ 1, and the period-N writeover lazily falls back to
-      // `genesisEta` for higher periods until/unless a custom walk is wired.
+      // store (cl0, cl1, dl1, gl1) use the default no-op walk; their boundary write at `ord % R == R - 1` lands
+      // `genesisEta` for period 0 and the empty-chain-walk genesis fallback for every higher period (incl. the
+      // COMPUTED period 1, #259) until/unless a custom walk is wired.
       //
       // Wiring through a fresh MPT-only `GlobalStateReader.fromMptStore(storages.mptStore)` matches the existing
       // `HistoricalStakeReader` usage in `GlobalSnapshotConsensus.make` — both producer and reader observe the same per-key bytes that

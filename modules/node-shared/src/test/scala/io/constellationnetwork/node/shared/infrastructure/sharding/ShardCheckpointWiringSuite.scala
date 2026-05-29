@@ -236,8 +236,9 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   }
 
   // The leader's chain-walk fallback: returns the REAL VRF outputs for ANY source period ≥ 1 (so periods ≥ 2 compute a
-  // non-genesis eta), and empty for source period 0 (mirrors a chain that hasn't accumulated period-0 VRF outputs — keeps
-  // periods ≤ 1 on the genesisEta convention via `EtaStateManager`).
+  // non-genesis eta), and empty for source period 0. With an empty source-period-0 walk period 1 falls back to genesisEta
+  // (the warmup branch — #259 COMPUTED convention: period 1 derives from period 0, which is empty here). Period 0 is the
+  // only intrinsic genesis case (short-circuits before the walk).
   private val realChainWalk: Long => IO[List[(Long, Array[Byte])]] = (sourcePeriod: Long) =>
     if (sourcePeriod >= 1L) IO.pure(realVrfOutputs) else IO.pure(List.empty[(Long, Array[Byte])])
 

@@ -36,10 +36,10 @@ import weaver.MutableIOSuite
   * etaStateManager.getEta(period.value).map(etaBytesToHash))` backed by a real [[EtaStateManager]] (MPT cache + chain-walk fallback). This
   * suite exercises the GSAM accept pipeline with both arrangements:
   *
-  *   1. `etaForPeriod = None` — reproduces the bug; eta = `Hash.empty`. 2. `etaForPeriod = Some(EtaStateManager-backed)` for period ≤ 1 —
-  *      eta = `etaBytesToHash(genesisEta)` (NOT `Hash.empty`). 3. `etaForPeriod = Some(EtaStateManager-backed)` for period 2 with non-empty
-  *      chain walk — eta = `etaBytesToHash(EtaCalculation.computeEta(genesisEta, 2, vrfOutputs))` (NOT `Hash.empty`, NOT
-  *      `etaBytesToHash(genesisEta)`).
+  *   1. `etaForPeriod = None` — reproduces the bug; eta = `Hash.empty`. 2. `etaForPeriod = Some(EtaStateManager-backed)` for period 0 — eta
+  *      \= `etaBytesToHash(genesisEta)` (NOT `Hash.empty`). 3. `etaForPeriod = Some(EtaStateManager-backed)` for period 1 (COMPUTED
+  *      convention, #259) and period 2 with non-empty chain walk — eta = `etaBytesToHash(EtaCalculation.computeEta(genesisEta, period,
+  *      vrfOutputs))` (NOT `Hash.empty`, NOT `etaBytesToHash(genesisEta)`).
   *
   * Arrangement (1) is load-bearing: it FAILS the post-fix expectation `eta != Hash.empty` if anyone re-introduces `etaForPeriod = None` at
   * a production GSAM construction site (caught by `expect.all(... !entry.map(_.eta).contains(Hash.empty))` in arrangements 2-3 if paired
@@ -170,6 +170,40 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
         // For period 0 the EtaStateManager returns `genesisEta` (bypass per `EtaCalculation`); the
         // boundary write packs it through `etaBytesToHash` so the hex matches the genesis seed.
         entry.map(_.eta).contains(SharedServices.etaBytesToHash(genesisEta))
+      )
+  }
+
+  test("post-fix period 1 (COMPUTED convention #259): callback writes computeEta(genesisEta, 1, chainOutputs)") { res =>
+    implicit val (h, sp) = res
+    // R=10, ord 19 = period 1 closing boundary (19/10 == 1, 19 % 10 == 9 == R-1). #259 unification:
+    // period 1 is NOT special-cased to genesis — the EtaStateManager falls through to
+    // `chainWalkFallback(0L)` (source-period = currentPeriod-1 = 0) and computes
+    // `EtaCalculation.computeEta(genesisEta, 1, syntheticVrfOutputs.map(_._2))`. This is the byte-exact
+    // value the wire / eligibility / committee eta also computes for period 1, so producer record ==
+    // committee == wire == follower-adopt at period 1 (the divergence #259 closes).
+    val chainWalk: Long => IO[List[(Long, Array[Byte])]] =
+      (sourcePeriod: Long) => if (sourcePeriod == 0L) IO.pure(syntheticVrfOutputs) else IO.pure(List.empty)
+    val expectedEtaBytes = EtaCalculation.computeEta(genesisEta, 1L, syntheticVrfOutputs.map(_._2))
+    val expectedEtaHash = SharedServices.etaBytesToHash(expectedEtaBytes)
+
+    for {
+      etaMgr <- EtaStateManager.make[IO](
+        genesisEta = genesisEta,
+        historicalStakeReader = emptyMptReader,
+        chainWalkFallback = chainWalk
+      )
+      callback = (period: EtaPeriod) => etaMgr.getEta(period.value).map(SharedServices.etaBytesToHash)
+      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
+      entry <- runBoundary(mgr, boundaryOrd = 19L, expectedPeriod = 1L)
+    } yield
+      expect.all(
+        entry.isDefined,
+        // eta is NOT `Hash.empty`.
+        !entry.map(_.eta).contains(Hash.empty),
+        // eta is NOT the genesis fall-through — period 1 now computes from period-0 outputs.
+        !entry.map(_.eta).contains(SharedServices.etaBytesToHash(genesisEta)),
+        // eta is the deterministic `computeEta(genesisEta, 1, chainOutputs)` — the unified value.
+        entry.map(_.eta).contains(expectedEtaHash)
       )
   }
 

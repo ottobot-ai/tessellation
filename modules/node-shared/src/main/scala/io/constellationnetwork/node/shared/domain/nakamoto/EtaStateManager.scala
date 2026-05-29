@@ -42,19 +42,25 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * branches on chain selection rollback. No additional invalidation logic here. After a reorg, the MPT lookup naturally returns whatever
   * the canonical chain's boundary write put there — or `None` if the canonical chain hasn't crossed the boundary yet.
   *
-  * '''Periods 0 and 1.''' These use `genesisEta` by [[EtaCalculation]] convention (no predecessor period to derive from). [[getEta]] for
-  * periods ≤ 1 returns `genesisEta` without touching MPT or chain.
+  * '''Period 0 (and the COMPUTED period-1 convention, #259).''' Period 0 has no predecessor period to derive from, so [[getEta]] returns
+  * `genesisEta` directly for period ≤ 0 without touching MPT or chain. Period 1 is NOT special-cased: it falls through to the MPT-lookup →
+  * chain-walk path and computes `EtaCalculation.computeEta(genesisEta, 1, vrfOutputsForPeriod(0))` — BYTE-IDENTICAL to the wire /
+  * eligibility eta in `SnapshotLeaderLoop` (which keys on `currentPeriod <= 0`) and to the committee draw. This unifies the per-period eta
+  * across ALL sources (producer MPT boundary record == committee == wire == follower adopt) at every period, closing the #259 period-1
+  * divergence where the record/committee said `genesisEta` while the wire said `computeEta(...)`. When period-0 VRF outputs do not yet
+  * exist the chain walk is empty and the fallback returns `genesisEta` — matching `SnapshotLeaderLoop`'s empty-`vrfOutputsForPeriod(0)`
+  * branch, so the period 0 → 1 rotation stays consistent across sources during warmup.
   */
 trait EtaStateManager[F[_]] {
 
   /** Resolve eta for `period`. Returns the byte representation directly so callers can feed it into [[EligibilityChecker.checkEligibility]]
     * / [[CommitteeSortition]] / etc. without re-decoding.
     *
-    *   - Period ≤ 1: returns `genesisEta`.
-    *   - Period ≥ 2 with MPT cache hit: returns `entry.eta.toBytes`.
-    *   - Period ≥ 2 with MPT cache miss: falls back to `chainWalkFallback(period - 1)`; if non-empty, computes eta via
-    *     [[EtaCalculation.computeEta]]; if empty, returns `genesisEta` (parent chain not yet in store — first 2 periods after genesis or
-    *     bootstrap edge cases).
+    *   - Period ≤ 0: returns `genesisEta`.
+    *   - Period ≥ 1 with MPT cache hit: returns `entry.eta.toBytes`.
+    *   - Period ≥ 1 with MPT cache miss: falls back to `chainWalkFallback(period - 1)`; if non-empty, computes eta via
+    *     [[EtaCalculation.computeEta]]; if empty, returns `genesisEta` (parent chain not yet in store — the period 0 → 1 warmup window or
+    *     bootstrap edge cases). Period 1 follows the COMPUTED convention (#259) so it byte-matches the wire / eligibility / committee eta.
     */
   def getEta(period: Long)(implicit hasher: Hasher[F]): F[Array[Byte]]
 }
@@ -69,7 +75,7 @@ object EtaStateManager {
     * write has landed.
     *
     * @param genesisEta
-    *   bootstrap eta for periods ≤ 1 and for the degenerate empty-fallback path. 32 bytes.
+    *   bootstrap eta for period ≤ 0 and for the degenerate empty-chain-walk fallback path. 32 bytes.
     * @param historicalStakeReader
     *   MPT-primary reader for the per-period boundary record. Returns `None` when the boundary hasn't yet been crossed.
     * @param chainWalkFallback
@@ -93,7 +99,17 @@ object EtaStateManager {
       new EtaStateManager[F] {
 
         def getEta(period: Long)(implicit hasher: Hasher[F]): F[Array[Byte]] =
-          if (period <= 1L) genesisEta.pure[F]
+          // Unified per-period eta — COMPUTED convention (#259). Only period 0 is the true genesis
+          // case (no predecessor period to derive from). Period 1 falls through to the MPT-lookup →
+          // chain-walk path so it computes `EtaCalculation.computeEta(genesisEta, 1, vrfOutputsForPeriod(0))`
+          // BYTE-IDENTICALLY to the wire / eligibility eta in `SnapshotLeaderLoop` (which keys on
+          // `currentPeriod <= 0`) and to the committee draw. This makes producer-record == committee ==
+          // wire == follower-adopt at EVERY period: gl0 followers verifying the `historicalStakeSnapshots`
+          // boundary entry now reproduce gl0's committed eta at period 1 instead of diverging to genesis.
+          // The empty-chain-walk fallback below still returns `genesisEta`, matching `SnapshotLeaderLoop`'s
+          // empty-`vrfOutputsForPeriod(0)` branch — so the first eta rotation (period 0 → 1) is consistent
+          // across all sources even before any period-0 VRF outputs exist.
+          if (period <= 0L) genesisEta.pure[F]
           else {
             val etaPeriod = EtaPeriod(period)
             historicalStakeReader.lookup(etaPeriod).flatMap {
