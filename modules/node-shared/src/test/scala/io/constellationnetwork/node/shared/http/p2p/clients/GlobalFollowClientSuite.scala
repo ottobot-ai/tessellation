@@ -83,7 +83,9 @@ object GlobalFollowClientSuite extends MutableIOSuite {
         removals = SortedMap[GlobalStateFieldId, Set[Address]](
           GlobalStateFieldId.LastAllowSpendRefs -> Set(addr(4), addr(5))
         )
-      )
+      ),
+      // #287: a diff response carries baseOrdinal = Some(b); exercise the codec on that shape too.
+      baseOrdinal = SnapshotOrdinal(NonNegLong(40L)).some
     )
 
   test("GlobalFollowSliceResponse round-trips through its Circe codec (incl. a non-empty slice)") { _ =>
@@ -93,15 +95,35 @@ object GlobalFollowClientSuite extends MutableIOSuite {
     IO.pure(
       expect(decoded == Right(sampleResponse)) &&
         // the encoded envelope has the contract field names
-        expect(sampleResponse.asJson.hcursor.keys.map(_.toList).contains(List("ordinal", "slice")))
+        expect(sampleResponse.asJson.hcursor.keys.map(_.toList).contains(List("ordinal", "slice", "baseOrdinal")))
     )
   }
 
-  test("GlobalFollowSliceResponse round-trips when the slice is empty") { _ =>
+  test("GlobalFollowSliceResponse round-trips when the slice is empty (baseOrdinal None)") { _ =>
     import io.circe.syntax._
 
-    val r = GlobalFollowSliceResponse(SnapshotOrdinal(NonNegLong(0L)), ConsumedFieldDelta.empty)
+    val r = GlobalFollowSliceResponse(SnapshotOrdinal(NonNegLong(0L)), ConsumedFieldDelta.empty, none)
     IO.pure(expect(r.asJson.as[GlobalFollowSliceResponse] == Right(r)))
+  }
+
+  test("getSliceSince issues GET /global-follow/slice?since=N against the peer") { implicit sp =>
+    for {
+      captured <- Ref.of[IO, Option[Uri]](none[Uri])
+      innerClient = Client[IO] { (req: Request[IO]) =>
+        Resource.eval(captured.set(req.uri.some)).as(Response[IO]())
+      }
+      client = GlobalFollowClient.make[IO](innerClient)
+      _ <- client.getSliceSince(SnapshotOrdinal(NonNegLong(7L))).run(peer).attempt
+      uriOpt <- captured.get
+    } yield
+      uriOpt match {
+        case Some(uri) =>
+          expect(uri.path.renderString == "/global-follow/slice") &&
+          expect(uri.query.params.get("since").contains("7")) &&
+          expect(uri.host.map(_.value).contains("127.0.0.1")) &&
+          expect(uri.port.contains(9000))
+        case None => failure("client did not issue any request")
+      }
   }
 
   test("getLatestSlice issues GET /global-follow/slice/latest against the peer") { implicit sp =>

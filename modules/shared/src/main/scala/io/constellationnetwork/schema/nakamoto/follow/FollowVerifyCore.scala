@@ -209,6 +209,37 @@ object ConsumedFieldDelta {
       SortedMap.empty[GlobalStateFieldId, Set[Address]]
     )
 
+  /** Incremental delta between two FULL-from-empty projections (`prev`, `curr` — both all-upserts / empty removals, as produced by
+    * [[io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService.sliceFromGsi]]). Per consumed field: an entry is an
+    * UPSERT iff absent from `prev` or its value changed; an `Address` present in `prev` but absent from `curr` is a REMOVAL. Applying the
+    * result on `prev` via [[FollowVerifyCore.verifyFieldRoots]] (`(prior -- removals) ++ upserts`) reproduces `curr` exactly — so a
+    * follower holding `prev` reaches `curr` by transferring only the changes (#287). Pure; `prev == curr` ⇒ [[empty]]. `removals` carries
+    * only the non-empty per-field address sets. The two input deltas are expected to be full projections (removals ignored on the inputs);
+    * the OUTPUT is the genuine diff.
+    */
+  def diff(prev: ConsumedFieldDelta, curr: ConsumedFieldDelta): ConsumedFieldDelta = {
+    def upserts[V](p: SortedMap[Address, V], c: SortedMap[Address, V]): SortedMap[Address, V] =
+      c.filter { case (addr, v) => !p.get(addr).contains(v) }
+    def removed[V](p: SortedMap[Address, V], c: SortedMap[Address, V]): Set[Address] =
+      p.keySet.diff(c.keySet)
+    val removalsByField: SortedMap[GlobalStateFieldId, Set[Address]] =
+      SortedMap[GlobalStateFieldId, Set[Address]](
+        GlobalStateFieldId.Balances -> removed(prev.balances, curr.balances),
+        GlobalStateFieldId.LastTxRefs -> removed(prev.lastTxRefs, curr.lastTxRefs),
+        GlobalStateFieldId.LastAllowSpendRefs -> removed(prev.lastAllowSpendRefs, curr.lastAllowSpendRefs),
+        GlobalStateFieldId.LastTokenLockRefs -> removed(prev.lastTokenLockRefs, curr.lastTokenLockRefs),
+        GlobalStateFieldId.ActiveTokenLocks -> removed(prev.activeTokenLocks, curr.activeTokenLocks)
+      ).filter { case (_, addrs) => addrs.nonEmpty }
+    ConsumedFieldDelta(
+      balances = upserts(prev.balances, curr.balances),
+      lastTxRefs = upserts(prev.lastTxRefs, curr.lastTxRefs),
+      lastAllowSpendRefs = upserts(prev.lastAllowSpendRefs, curr.lastAllowSpendRefs),
+      lastTokenLockRefs = upserts(prev.lastTokenLockRefs, curr.lastTokenLockRefs),
+      activeTokenLocks = upserts(prev.activeTokenLocks, curr.activeTokenLocks),
+      removals = removalsByField
+    )
+  }
+
   // `GlobalStateFieldId` has no circe KeyEncoder/KeyDecoder (only Encoder[Int]) — encode `removals` as an
   // association list keyed by the fieldId's Int code, exactly like `GlobalFollowProof` does. `Address` has
   // KeyEncoder/KeyDecoder, so the typed upsert maps stay plain JSON objects.

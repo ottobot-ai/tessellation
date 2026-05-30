@@ -32,9 +32,11 @@ import io.constellationnetwork.security.hash.Hash
   * omitted entry dropped together with its inclusion proof; root equality catches every divergence. S1's per-key inclusion path is
   * unchanged — it stays the mechanism for cross-shard / light-client consumers that do NOT hold the field content.
   *
-  * '''Additive, no wiring.''' This verifier + the shared field-root core + tests only. Nothing here is wired into Main /
-  * `GlobalSnapshotAlignment` / `DAGSnapshotProcessor` / gl1 runtime, and `createContext` re-execution is NOT removed — those are later
-  * slices.
+  * '''Wired (S3b′ / #287).''' This verifier IS the live gl1 follow verify path: [[DAGSnapshotProcessor.applyGlobalSnapshotFn]] constructs
+  * it each tick, fetches gl0's slice (full via `getLatestFollowSlice`, or the incremental #287 diff via `getFollowSliceSince`), and calls
+  * [[verifyByFieldRoot]] with the `prior` consumed-field state the follower holds in its mirror `Ref` (empty on bootstrap / after any
+  * reset). `createContext` re-execution for the global slice has been removed on that path. A verify failure resets the mirror so the next
+  * tick re-fetches a full from-empty slice (the guaranteed fallback).
   */
 trait GlobalFollowMirrorVerifier[F[_]] {
 

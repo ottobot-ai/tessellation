@@ -19,10 +19,10 @@ import io.circe.syntax.EncoderOps
   *
   *   - [[TowerEligibility.Level]] — the snapshot's highest passed super-level (`0` = level-0-only, the by-construction baseline).
   *   - [[TowerEligibility.NotComputed]] — the value has not (yet) been sourced from the tower at this commitment site. Distinct from
-  *     `Level(0)`: `Level(0)` is an asserted "no super-level fired"; `NotComputed` is "the tower was not consulted here". This is the
-  *     value the steady-state core commits until the tower-sourcing follow-up lands (see [[HistoricalCommitmentSmtStore]] /
-  *     report STAGING). Keeping it a distinct, sealed case (rather than overloading `Level(0)`) means the eventual flip to real values is a
-  *     pure value change with NO tuple-shape churn and NO ambiguity about which ordinals predate the wiring.
+  *     `Level(0)`: `Level(0)` is an asserted "no super-level fired"; `NotComputed` is "the tower was not consulted here". This is the value
+  *     the steady-state core commits until the tower-sourcing follow-up lands (see [[HistoricalCommitmentSmtStore]] / report STAGING).
+  *     Keeping it a distinct, sealed case (rather than overloading `Level(0)`) means the eventual flip to real values is a pure value
+  *     change with NO tuple-shape churn and NO ambiguity about which ordinals predate the wiring.
   */
 @derive(encoder, decoder, eqv, show)
 sealed trait TowerEligibility extends Product with Serializable
@@ -46,8 +46,8 @@ object TowerEligibility {
   * commitments from the same on-disk snapshot at `i`):
   *
   *   - [[hypergraphRoot]] — the global MPT root at ordinal `i` (the existing `stateProof_i.mptRoot`, over LEDGER state). Independent of
-  *     `smtRoot` (it is committed in snapshot `i` already), so it is committable even at the current ordinal — but the SMT uses the same
-  *     `i ≤ N−k` finalized cutoff for all three fields for uniformity + reorg-safety.
+  *     `smtRoot` (it is committed in snapshot `i` already), so it is committable even at the current ordinal — but the SMT uses the same `i
+  *     ≤ N−k` finalized cutoff for all three fields for uniformity + reorg-safety.
   *   - [[incrementalSnapshotHash]] — the content hash of the incremental snapshot at `i`. THIS is the field that would be circular if
   *     committed for the CURRENT ordinal (`smtRoot(N) → incrementalHash(N) → hash(snapshot N) → stateProof_N → smtRoot(N)`); the `i ≤ N−k`
   *     cutoff dissolves it — snapshot `i`'s incremental hash is only committed by `smtRoot(i+k)`, once `i` is finalized + immutable, so

@@ -55,10 +55,16 @@ object GlobalFollowRoutesSuite extends HttpSuite {
       lastTxRefs = SortedMap(addr(2) -> TransactionReference(TransactionOrdinal(NonNegLong(3L)), Hash("ab" * 32)))
     )
 
-  /** Service stub: `latestSlice` returns the canned `(ordinal, slice)` or `None` (cold start) per the fixture. */
-  private def stubService(latest: Option[(SnapshotOrdinal, ConsumedFieldDelta)]): GlobalFollowSliceService[IO] =
+  /** Service stub: `latestSlice` returns the canned `(ordinal, slice)` or `None` (cold start) per the fixture; `sliceSince` returns
+    * `sinceResponse` (the #287 diff endpoint fixture, default `None`).
+    */
+  private def stubService(
+    latest: Option[(SnapshotOrdinal, ConsumedFieldDelta)],
+    sinceResponse: Option[GlobalFollowSliceResponse] = None
+  ): GlobalFollowSliceService[IO] =
     new GlobalFollowSliceService[IO] {
       def latestSlice: IO[Option[(SnapshotOrdinal, ConsumedFieldDelta)]] = IO.pure(latest)
+      def sliceSince(since: SnapshotOrdinal): IO[Option[GlobalFollowSliceResponse]] = IO.pure(sinceResponse)
     }
 
   /** Build the routes wired to a service `Ref`. `service = None` exercises the 503 startup path; a present service whose `latestSlice` is
@@ -89,9 +95,28 @@ object GlobalFollowRoutesSuite extends HttpSuite {
 
   test("GET /global-follow/slice/latest returns 200 with the service's (ordinal, slice)") {
     val req = GET(uri"/global-follow/slice/latest")
-    val expected = GlobalFollowSliceResponse(anchorOrdinal, cannedSlice)
+    val expected = GlobalFollowSliceResponse(anchorOrdinal, cannedSlice, none)
     for {
       routes <- mkRoutes(stubService((anchorOrdinal -> cannedSlice).some).some)
+      r <- expectHttpBodyAndStatus(routes, req)(expected, Status.Ok)
+    } yield r
+  }
+
+  // #287 "send diffs" endpoint
+  test("GET /global-follow/slice?since=N returns 503 when no global ordinal has finalized yet") {
+    val req = GET(uri"/global-follow/slice".withQueryParam("since", 3L))
+    for {
+      // latest = None AND sinceResponse = None ⇒ the service yields None ⇒ 503
+      routes <- mkRoutes(stubService(none, none).some)
+      r <- expectHttpStatus(routes, req)(Status.ServiceUnavailable)
+    } yield r
+  }
+
+  test("GET /global-follow/slice?since=N returns 200 with the service's sliceSince response") {
+    val req = GET(uri"/global-follow/slice".withQueryParam("since", 3L))
+    val expected = GlobalFollowSliceResponse(anchorOrdinal, cannedSlice, SnapshotOrdinal(NonNegLong(3L)).some)
+    for {
+      routes <- mkRoutes(stubService(none, expected.some).some)
       r <- expectHttpBodyAndStatus(routes, req)(expected, Status.Ok)
     } yield r
   }

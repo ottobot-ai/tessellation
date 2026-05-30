@@ -283,6 +283,20 @@ object GlobalSnapshotConsensus {
       latestFinalizedSliceSourceRef <- cats.effect.kernel.Ref
         .of[F, Option[(SnapshotOrdinal, GlobalSnapshotInfo)]](None)
         .toResource
+      // ── gl1 follow-slice diff ring (Axis 2, #287 "send diffs") ────────────────────────────────────
+      // Bounded ring of recent finalized 5-field PROJECTIONS keyed by ordinal (NOT full GSIs). `SnapshotLeaderLoop`
+      // populates it at the SAME finalize sinks that update `latestFinalizedSliceSourceRef`, storing
+      // `GlobalFollowSliceService.sliceFromGsi(finalizedGsi)` trimmed to the last
+      // `GlobalFollowSliceService.recentProjectionsToKeep`. The slice service reads it to compute the incremental
+      // diff a gl1 follower requests via `GET /global-follow/slice?since=<ordinal>` (a pure transport optimization —
+      // a follower whose `since` fell out of the ring falls back to the full slice; field-root equality rejects a
+      // wrong base, so the diff can never regress correctness).
+      recentFollowProjectionsRef <- cats.effect.kernel.Ref
+        .of[F, scala.collection.immutable.SortedMap[
+          SnapshotOrdinal,
+          io.constellationnetwork.schema.nakamoto.follow.ConsumedFieldDelta
+        ]](scala.collection.immutable.SortedMap.empty)
+        .toResource
       getGlobalSnapshotByOrdinalWithFallback: (SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]) = {
         (ordinal: SnapshotOrdinal) =>
           getGlobalSnapshotByOrdinal(ordinal).flatMap {
@@ -1243,7 +1257,7 @@ object GlobalSnapshotConsensus {
           //     byte-identity is reproduced on the verify side, not extracted from the store.
           _ <- {
             val sliceService = io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService
-              .make[F](latestFinalizedSliceSourceRef.get)
+              .make[F](latestFinalizedSliceSourceRef.get, recentFollowProjectionsRef.get)
             globalFollowSliceServiceRef.set(Some(sliceService))
           }.toResource
 
@@ -1463,6 +1477,9 @@ object GlobalSnapshotConsensus {
                   // serves the latest-FINALIZED `(ordinal, GSI)` (resolvable by a finality-gated gl1) rather
                   // than the latest-produced one. Updated monotonically at both finalize sinks.
                   latestFinalizedSliceSourceRef = latestFinalizedSliceSourceRef,
+                  // #287 "send diffs": the bounded recent-projection ring the loop also fills at both finalize
+                  // sinks, read by `GlobalFollowSliceService.sliceSince` to serve incremental gl1 follow diffs.
+                  recentFollowProjectionsRef = recentFollowProjectionsRef,
                   chainSyncRequestQueue = chainSyncRequestQueue,
                   finalityTriggerViewRef = finalityTriggerViewRef,
                   // §1.2 Slice 5/6: parallel-sign attestations + snapshots with KES.

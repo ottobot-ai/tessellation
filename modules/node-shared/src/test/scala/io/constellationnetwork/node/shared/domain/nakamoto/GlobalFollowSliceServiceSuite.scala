@@ -110,7 +110,11 @@ object GlobalFollowSliceServiceSuite extends MutableIOSuite {
     )
 
   private def service(latest: Option[(SnapshotOrdinal, GlobalSnapshotInfo)]): GlobalFollowSliceService[IO] =
-    GlobalFollowSliceService.make[IO](IO.pure(latest))
+    GlobalFollowSliceService.make[IO](IO.pure(latest), IO.pure(SortedMap.empty))
+
+  // #287: a service over an explicit recent-projection ring (the bootstrap thunk is `None`, exercising only `sliceSince`).
+  private def sliceSinceService(ring: SortedMap[SnapshotOrdinal, ConsumedFieldDelta]): GlobalFollowSliceService[IO] =
+    GlobalFollowSliceService.make[IO](IO.pure(none), IO.pure(ring))
 
   /** gl0's exact signed per-field roots for the five consumed fields — built the PRODUCTION way: insert each field's entries into a real
     * MPT store via `MptStore.insert[V]` (which keys by `toHex(hypergraph(field, addr))` and encodes values via scodec `immutableBytes`),
@@ -173,6 +177,57 @@ object GlobalFollowSliceServiceSuite extends MutableIOSuite {
     }
   }
 
+  // ── #287 sliceSince — the incremental transport ──────────────────────────────────────────────
+  // Two projection-ring fixtures: a SUBSET projection at the prior ordinal and the FULL projection at the latest, so
+  // `diff(subset → full)` is a real upsert (addr(4)'s balance) — the exact change-set the producer must serve.
+  private val priorOrdinal: SnapshotOrdinal = SnapshotOrdinal(NonNegLong(1L))
+  private val subsetProjection: ConsumedFieldDelta =
+    GlobalFollowSliceService.sliceFromGsi(GlobalSnapshotInfo.empty.copy(balances = SortedMap(addr(1) -> bal(1000), addr(2) -> bal(2000))))
+  private val fullProjection: ConsumedFieldDelta = GlobalFollowSliceService.sliceFromGsi(gsi)
+
+  test("sliceSince: empty ring (cold start) → None") {
+    sliceSinceService(SortedMap.empty).sliceSince(priorOrdinal).map(o => expect(o.isEmpty))
+  }
+
+  test("sliceSince: since == latest → NO-CHANGE (empty delta), baseOrdinal=Some(since), ordinal=latest") {
+    val ring = SortedMap(ordinal -> fullProjection)
+    sliceSinceService(ring).sliceSince(ordinal).map {
+      case Some(r) =>
+        expect.all(
+          r.ordinal == ordinal,
+          r.baseOrdinal == ordinal.some,
+          r.slice == ConsumedFieldDelta.empty
+        )
+      case None => failure("expected Some(no-change response)")
+    }
+  }
+
+  test("sliceSince: since in ring → diff(proj@since, proj@latest), baseOrdinal=Some(since), ordinal=latest") {
+    val ring = SortedMap(priorOrdinal -> subsetProjection, ordinal -> fullProjection)
+    sliceSinceService(ring).sliceSince(priorOrdinal).map {
+      case Some(r) =>
+        expect.all(
+          r.ordinal == ordinal,
+          r.baseOrdinal == priorOrdinal.some,
+          r.slice == ConsumedFieldDelta.diff(subsetProjection, fullProjection)
+        )
+      case None => failure("expected Some(diff response)")
+    }
+  }
+
+  test("sliceSince: since NOT in ring (evicted) → full proj@latest with baseOrdinal=None (full fallback)") {
+    val ring = SortedMap(ordinal -> fullProjection) // priorOrdinal evicted
+    sliceSinceService(ring).sliceSince(priorOrdinal).map {
+      case Some(r) =>
+        expect.all(
+          r.ordinal == ordinal,
+          r.baseOrdinal.isEmpty,
+          r.slice == fullProjection
+        )
+      case None => failure("expected Some(full-fallback response)")
+    }
+  }
+
   // THE IMPORTANT ONE — produce (from GSI) → verify (forward-hash) → Verified == GSI's slice, with gl0-style signed roots.
   test("end-to-end round-trip: latestSlice(GSI) → verifyByFieldRoot(empty mirror) → Verified == GSI's five Address-keyed maps") { res =>
     implicit val (h, _, js) = res
@@ -202,4 +257,88 @@ object GlobalFollowSliceServiceSuite extends MutableIOSuite {
         case Left(err) => failure(s"expected Right(Verified) from the round-trip, got Left($err)")
       }
   }
+
+  // #287 "send diffs" — the core safety property on a NON-EMPTY prior: apply diff(prev, curr) on the state a follower
+  // holds at `prev` (verified there) and recompute-match against `curr`'s gl0 roots ⇒ the verifier reconstructs EXACTLY
+  // `curr`'s five maps. This is what `DAGSnapshotProcessor` does on the incremental path (held prior + matching base).
+  test("#287 round-trip on a non-empty prior: verifyFieldRoots(prevState, diff(prev,curr), currRoots) == curr") { res =>
+    implicit val (h, _, js) = res
+    val verifier = GlobalFollowMirrorVerifier.make[IO]
+    // prev = the reference state MINUS addr(4)'s balance; curr = the full reference state. diff = upsert addr(4).
+    val prevGsi = gsi.copy(balances = SortedMap(addr(1) -> bal(1000), addr(2) -> bal(2000)))
+    val prevProjection = GlobalFollowSliceService.sliceFromGsi(prevGsi)
+    val currProjection = GlobalFollowSliceService.sliceFromGsi(gsi)
+    val theDiff = ConsumedFieldDelta.diff(prevProjection, currProjection)
+    for {
+      // gl0's signed roots at `prev` and at `curr`, both from reference MPTs built the gl0 way.
+      prevRoots <- rootsForGsi(prevGsi)
+      currRoots <- signedRootsFromReferenceMpt
+      // 1) verify the follower reaches `prev`'s state from empty (the prior it holds).
+      prevVerifiedE <- verifier.verifyByFieldRoot(ConsumedFieldState.empty, priorOrdinal, prevProjection, prevRoots)
+      prevState <- IO.fromEither(prevVerifiedE.leftMap(e => new RuntimeException(s"prev verify failed: $e")))
+      // 2) apply the DIFF on the held prior and recompute-match `curr`'s roots.
+      currVerifiedE <- verifier.verifyByFieldRoot(prevState.value, ordinal, theDiff, currRoots)
+    } yield
+      currVerifiedE match {
+        case Right(v) =>
+          val st = v.value
+          expect.all(
+            // the diff is genuinely incremental (only addr(4)'s balance upserted, nothing removed)
+            theDiff.balances == SortedMap(addr(4) -> bal(4000)),
+            theDiff.removals.isEmpty,
+            // applying it on the held prior reconstructs the FULL reference state
+            st.balances == balances,
+            st.lastTxRefs == lastTxRefs,
+            st.lastAllowSpendRefs == lastAllowSpendRefs,
+            st.lastTokenLockRefs == lastTokenLockRefs,
+            st.activeTokenLocks == activeTokenLocks
+          )
+        case Left(err) => failure(s"expected Right(Verified) from the diff-on-prior round-trip, got Left($err)")
+      }
+  }
+
+  // gl0's signed roots for an arbitrary consumed-field GSI, built the gl0 way (same as signedRootsFromReferenceMpt
+  // but parameterised) — lets the #287 prior round-trip anchor a verify at the `prev` state.
+  private def rootsForGsi(g: GlobalSnapshotInfo)(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[SortedMap[GlobalStateFieldId, Hash]] =
+    for {
+      mptProducer <- io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer.make[IO]()
+      store <- MptStore.make[IO, GlobalStateKey](mptProducer, GlobalStateKey.toHex[IO])
+      _ <- store.insert[Balance](g.balances.toList.map {
+        case (a, v) => GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, a) -> v
+      }.toMap)
+      _ <- store.insert[TransactionReference](
+        g.lastTxRefs.toList.map { case (a, v) => GlobalStateKey.hypergraph(GlobalStateFieldId.LastTxRefs, a) -> v }.toMap
+      )
+      _ <- store.insert[AllowSpendReference](
+        g.lastAllowSpendRefs
+          .getOrElse(SortedMap.empty[Address, AllowSpendReference])
+          .toList
+          .map {
+            case (a, v) => GlobalStateKey.hypergraph(GlobalStateFieldId.LastAllowSpendRefs, a) -> v
+          }
+          .toMap
+      )
+      _ <- store.insert[TokenLockReference](
+        g.lastTokenLockRefs
+          .getOrElse(SortedMap.empty[Address, TokenLockReference])
+          .toList
+          .map {
+            case (a, v) => GlobalStateKey.hypergraph(GlobalStateFieldId.LastTokenLockRefs, a) -> v
+          }
+          .toMap
+      )
+      _ <- store.insert[SortedSet[Signed[TokenLock]]](
+        g.getActiveTokenLocks.toList.map { case (a, v) => GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, a) -> v }.toMap
+      )
+      _ <- store.commit(ordinal)
+      entries <- store.allEntriesAsBytes
+      roots <- FollowVerifyCore.consumedFields.traverse { field =>
+        GlobalStateKey.hypergraphFieldPrefix[IO](field).flatMap { prefix =>
+          GlobalStateConverter
+            .fieldRootFromBytes[IO](entries.filter { case (hex, _) => hex.value.startsWith(prefix.value) })
+            .map(field -> _)
+        }
+      }
+    } yield SortedMap.from(roots)
+
 }

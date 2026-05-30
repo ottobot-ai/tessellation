@@ -9,12 +9,10 @@ import weaver.FunSuite
 
 /** JSON (Circe) round-trip for `PartitionNamespace`.
   *
-  * Distinct from `GlobalStateKeyCodecSuite` (binary/scodec `immutableBytes`) and
-  * `GlobalStateKeySerializationSuite` (one-way `toHex`): this guards the *JSON* codec used on the
-  * wire (the inclusion-proof / `GlobalStateProofRoutes` path), which previously decoded the address
-  * field via `Address.fromBytes(s.getBytes)` — `fromBytes` SHA-256-hashes its input
-  * (`address.scala:30-40`), so it produced the address OF THE HASH OF the address string, making
-  * `Address`/`Metagraph` namespaces non-round-trippable over JSON. The fix decodes via the canonical
+  * Distinct from `GlobalStateKeyCodecSuite` (binary/scodec `immutableBytes`) and `GlobalStateKeySerializationSuite` (one-way `toHex`): this
+  * guards the *JSON* codec used on the wire (the inclusion-proof / `GlobalStateProofRoutes` path), which previously decoded the address
+  * field via `Address.fromBytes(s.getBytes)` — `fromBytes` SHA-256-hashes its input (`address.scala:30-40`), so it produced the address OF
+  * THE HASH OF the address string, making `Address`/`Metagraph` namespaces non-round-trippable over JSON. The fix decodes via the canonical
   * `Decoder[Address]` (the exact inverse of the encoder's `addr.value.value`).
   */
 object PartitionNamespaceJsonCodecSuite extends FunSuite {

@@ -2,6 +2,7 @@ package io.constellationnetwork.dag.l1.domain.snapshot.programs
 
 import cats.Parallel
 import cats.effect.Async
+import cats.effect.kernel.Ref
 import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
@@ -39,7 +40,16 @@ object DAGSnapshotProcessor {
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     l0Service: GlobalL0Service[F],
     globalL0AlignmentStorage: GlobalL0AlignmentStorage[F],
-    mptStore: MptStore[F, GlobalStateKey]
+    mptStore: MptStore[F, GlobalStateKey],
+    // #287 "send diffs": the follower's verified-mirror state across ticks — `Some((lastVerifiedTip, state))` or
+    // `None` (bootstrap / post-reset). Created ONCE at the dag-l1 construction site (`Main`) and threaded here.
+    // When `Some`, this tick requests the INCREMENTAL slice since `lastVerifiedTip` and applies the returned delta
+    // on `state` (only if the response's `baseOrdinal` matches `lastVerifiedTip`); otherwise it requests the FULL
+    // latest slice and applies from empty. ANY verify failure RESETS the mirror to `None`, so the next tick
+    // re-fetches a full from-empty slice — the optimization can never regress the safety invariant (field-root
+    // equality already rejects a wrong/stale diff with `FieldRootMismatch`). `getByOrdinal`-defer (M not yet
+    // followed) leaves the mirror untouched so it resolves once the follow reaches M.
+    followMirrorRef: Ref[F, Option[(SnapshotOrdinal, ConsumedFieldState)]]
   ): SnapshotProcessor[F, GlobalSnapshotStateProof, GlobalIncrementalSnapshot, GlobalSnapshotInfo] =
     new SnapshotProcessor[F, GlobalSnapshotStateProof, GlobalIncrementalSnapshot, GlobalSnapshotInfo] {
 
@@ -63,6 +73,10 @@ object DAGSnapshotProcessor {
             s"dl1 onRedownload firing for finalized snapshot ord=${snapshot.ordinal.show} — destructive replaceByRefs path " +
               s"should be unreachable under finality-gating (#122); investigate"
           ) >>
+          // #287: a redownload/recovery rebuilds the follower's consumed-field storage from scratch, so the diff
+          // mirror's held `(tip, state)` is no longer a valid base — RESET it so the next follow tick re-fetches a
+          // FULL from-empty slice instead of diffing against a stale tip.
+          followMirrorRef.set(none) >>
           allowSpendStorage.replaceByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
           tokenLockStorage.replaceByRefs(state.lastTokenLockRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal)
 
@@ -173,38 +187,62 @@ object DAGSnapshotProcessor {
           else
             lastNGlobalSnapshotStorage.getByOrdinal(sliceOrdinal).map(_.map(_.signed.value.stateProof))
 
-        l0Service.getLatestFollowSlice.flatMap {
-          case None =>
-            // No slice yet (no GlobalFollowClient wired, peer down, or gl0 has no finalized ordinal). Don't advance.
-            FollowSliceVerificationError(
-              s"no follow slice available while processing ordinal=${globalSnapshot.value.ordinal.show}"
-            ).raiseError[F, GlobalSnapshotInfo]
-          case Some(GlobalFollowSliceResponse(sliceOrdinal, slice)) =>
-            signedRootsAt(sliceOrdinal).flatMap {
-              case None =>
-                // gl1 has not yet followed (and locally retained) the finalized snapshot at the slice's ordinal M. Defer
-                // this tick WITHOUT a peer re-pull; it resolves as soon as gl1's finalized-follow reaches M.
-                FollowSliceVerificationError(
-                  s"local finalized snapshot at slice ordinal=${sliceOrdinal.show} not yet followed " +
-                    s"(processing ordinal=${globalSnapshot.value.ordinal.show}) — deferring slice verify"
-                ).raiseError[F, GlobalSnapshotInfo]
-              case Some(stateProof) =>
-                verifier
-                  .verifyByFieldRoot(ConsumedFieldState.empty, sliceOrdinal, slice, signedFieldRoots(stateProof))
-                  .flatMap {
-                    case Right(verified) =>
-                      consumedFieldsToGlobalSnapshotInfo(verified.value).pure[F]
-                    case Left(err) =>
-                      // Verify failed against the trusted signed roots — log + don't advance. NO recovery storm.
-                      followLogger.warn(
-                        s"follow-slice verify FAILED at sliceOrdinal=${sliceOrdinal.show} " +
-                          s"(processing ordinal=${globalSnapshot.value.ordinal.show}): ${describe(err)} — not advancing"
-                      ) >>
-                        FollowSliceVerificationError(
-                          s"follow-slice verify failed at ordinal=${sliceOrdinal.show}: ${describe(err)}"
-                        ).raiseError[F, GlobalSnapshotInfo]
-                  }
-            }
+        // #287 "send diffs": fetch the INCREMENTAL slice since the held tip when the mirror is populated, else the FULL
+        // latest slice. The mirror holds `(lastVerifiedTip, state)`; on a populated mirror we ask gl0 for the change-set
+        // since `lastVerifiedTip` and apply it on `state` — but ONLY if the response's `baseOrdinal` matches that tip
+        // (otherwise gl0 fell back to a full from-empty slice, or the bases diverged, and we apply from empty). This is
+        // a pure optimization: field-root equality below rejects any wrong/stale base as `FieldRootMismatch`, which
+        // resets the mirror and forces a full re-fetch next tick — so the diff path can never advance bad state.
+        followMirrorRef.get.flatMap { mirror =>
+          val fetch: F[Option[GlobalFollowSliceResponse]] = mirror match {
+            case Some((heldTip, _)) => l0Service.getFollowSliceSince(heldTip)
+            case None               => l0Service.getLatestFollowSlice
+          }
+          fetch.flatMap {
+            case None =>
+              // No slice yet (no GlobalFollowClient wired, peer down, or gl0 has no finalized ordinal). Don't advance.
+              FollowSliceVerificationError(
+                s"no follow slice available while processing ordinal=${globalSnapshot.value.ordinal.show}"
+              ).raiseError[F, GlobalSnapshotInfo]
+            case Some(GlobalFollowSliceResponse(sliceOrdinal, slice, baseOrdinal)) =>
+              // Apply the delta on the held state iff the producer diffed against EXACTLY the tip we hold; any other case
+              // (full slice `baseOrdinal=None`, a base we don't hold, or an empty mirror) applies from empty.
+              val prior = mirror match {
+                case Some((heldTip, st)) if baseOrdinal.contains(heldTip) => st
+                case _                                                    => ConsumedFieldState.empty
+              }
+              signedRootsAt(sliceOrdinal).flatMap {
+                case None =>
+                  // gl1 has not yet followed (and locally retained) the finalized snapshot at the slice's ordinal M. Defer
+                  // this tick WITHOUT a peer re-pull AND WITHOUT clearing the mirror; it resolves as soon as gl1's
+                  // finalized-follow reaches M.
+                  FollowSliceVerificationError(
+                    s"local finalized snapshot at slice ordinal=${sliceOrdinal.show} not yet followed " +
+                      s"(processing ordinal=${globalSnapshot.value.ordinal.show}) — deferring slice verify"
+                  ).raiseError[F, GlobalSnapshotInfo]
+                case Some(stateProof) =>
+                  verifier
+                    .verifyByFieldRoot(prior, sliceOrdinal, slice, signedFieldRoots(stateProof))
+                    .flatMap {
+                      case Right(verified) =>
+                        // Advance the mirror to the verified tip + post-state so the NEXT tick can request a diff since M.
+                        followMirrorRef.set((sliceOrdinal, verified.value).some) >>
+                          consumedFieldsToGlobalSnapshotInfo(verified.value).pure[F]
+                      case Left(err) =>
+                        // Verify failed against the trusted signed roots — RESET the mirror so the next tick re-fetches a
+                        // FULL from-empty slice (the guaranteed fallback), log + don't advance. NO recovery storm.
+                        followMirrorRef.set(none) >>
+                          followLogger.warn(
+                            s"follow-slice verify FAILED at sliceOrdinal=${sliceOrdinal.show} " +
+                              s"(processing ordinal=${globalSnapshot.value.ordinal.show}, base=${baseOrdinal.map(_.show).getOrElse("none")}): " +
+                              s"${describe(err)} — resetting follow mirror, not advancing"
+                          ) >>
+                          FollowSliceVerificationError(
+                            s"follow-slice verify failed at ordinal=${sliceOrdinal.show}: ${describe(err)}"
+                          ).raiseError[F, GlobalSnapshotInfo]
+                    }
+              }
+          }
         }
       }
     }

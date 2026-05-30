@@ -56,7 +56,7 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
-import io.constellationnetwork.schema.nakamoto.follow.{ConsumedFieldDelta, GlobalFollowSliceResponse}
+import io.constellationnetwork.schema.nakamoto.follow.{ConsumedFieldDelta, ConsumedFieldState, GlobalFollowSliceResponse}
 import io.constellationnetwork.schema.node.RewardFraction
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.swap.AllowSpendReference
@@ -82,6 +82,16 @@ import weaver.SimpleIOSuite
 object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
   val TestValidationErrorStorageMaxSize: PosInt = PosInt(16)
 
+  /** gl1 follow-path test hooks, bundled so `TestResources` stays within Scala's 22-tuple limit (#287 added two more Refs). `latest` feeds
+    * `getLatestFollowSlice`; `sinceResponder` feeds `getFollowSliceSince` (default serves the same `latest` value, so single-tick tests
+    * with an empty mirror are unaffected); `mirror` is the follower's cross-tick verified-mirror Ref threaded into the processor.
+    */
+  final case class FollowTestHooks(
+    latest: Ref[IO, Option[GlobalFollowSliceResponse]],
+    sinceResponder: Ref[IO, SnapshotOrdinal => IO[Option[GlobalFollowSliceResponse]]],
+    mirror: Ref[IO, Option[(SnapshotOrdinal, ConsumedFieldState)]]
+  )
+
   implicit val withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
     io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
 
@@ -106,8 +116,10 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
     Hasher[IO],
     MptStore[IO, GlobalStateKey],
     JsonSerializer[IO],
-    // gl1 own-slice follow CUTOVER (S3b′): the slice `getLatestFollowSlice` serves to `applyGlobalSnapshotFn`.
-    Ref[IO, Option[GlobalFollowSliceResponse]]
+    // gl1 own-slice follow CUTOVER (S3b′) + #287 "send diffs": the slice fetches `getLatestFollowSlice` /
+    // `getFollowSliceSince` serve, plus the follower's cross-tick verified-mirror Ref. Bundled as one element so the
+    // tuple stays within Scala's 22-element limit.
+    FollowTestHooks
   )
 
   def testResources: Resource[IO, TestResources] =
@@ -123,6 +135,13 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
               // (download-path tests never reach `applySnapshotFn`). NextSubHeight / NextHeight alignment tests set
               // it to a slice that recompute-matches the processed snapshot's stateProof via `withFollowSlice`.
               followSliceR <- Ref.of[IO, Option[GlobalFollowSliceResponse]](None).asResource
+              // #287: the incremental-fetch responder + the follower's cross-tick mirror. The responder defaults to
+              // serving the SAME `followSliceR` value so the existing single-tick tests (empty mirror ⇒ they call
+              // `getLatestFollowSlice`) are unaffected; the #287 tests override it.
+              followSliceSinceR <- Ref
+                .of[IO, SnapshotOrdinal => IO[Option[GlobalFollowSliceResponse]]](_ => followSliceR.get)
+                .asResource
+              followMirrorR <- Ref.of[IO, Option[(SnapshotOrdinal, ConsumedFieldState)]](None).asResource
               blocksR <- MapRef.ofConcurrentHashMap[IO, ProofsHash, StoredBlock]().asResource
               lastSnapR <- SignallingRef.of[IO, Option[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)]](None).asResource
               lastNSnapR <- SignallingRef.of[IO, Option[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)]](None).asResource
@@ -376,6 +395,13 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                   // NextHeight alignment tests set this to a slice that recompute-matches the processed snapshot's
                   // stateProof (see `withFollowSlice`).
                   override def getLatestFollowSlice: IO[Option[GlobalFollowSliceResponse]] = followSliceR.get
+
+                  // #287 "send diffs": per-test mutable hook for the incremental fetch. The function in
+                  // `followSliceSinceR` is applied to the `since` ordinal the follower's held mirror tip implies.
+                  // Default = serve the SAME `followSliceR` value as the full path (so existing single-tick tests,
+                  // which start with an empty mirror and therefore call `getLatestFollowSlice` anyway, are unaffected).
+                  override def getFollowSliceSince(since: SnapshotOrdinal): IO[Option[GlobalFollowSliceResponse]] =
+                    followSliceSinceR.get.flatMap(_(since))
                 }
                 val lastNSnapshotStorage =
                   LastNGlobalSnapshotStorage.make[IO](lastGlobalSnapshotsSyncConfig, lastNSnapR, incLastNSnapR)
@@ -392,7 +418,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                     globalL0Service.pullGlobalSnapshot,
                     globalL0Service,
                     globalL0AlignmentStorage,
-                    mptStore
+                    mptStore,
+                    followMirrorR
                   )
               }
               keys <- (
@@ -428,7 +455,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                 k,
                 mptStore,
                 jhs,
-                followSliceR
+                FollowTestHooks(followSliceR, followSliceSinceR, followMirrorR)
               )
           }
         }
@@ -555,7 +582,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             k,
             _,
             jhs,
-            followSliceR
+            FollowTestHooks(followSliceR, followSliceSinceR, followMirrorR)
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -691,7 +718,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             k,
             _,
             jhs,
-            followSliceR
+            FollowTestHooks(followSliceR, followSliceSinceR, followMirrorR)
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -882,7 +909,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             k,
             _,
             jhs,
-            followSliceR
+            FollowTestHooks(followSliceR, followSliceSinceR, followMirrorR)
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -1090,7 +1117,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             k,
             mptStore,
             jhs,
-            followSliceR
+            FollowTestHooks(followSliceR, followSliceSinceR, followMirrorR)
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -1126,7 +1153,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           // `hashedNextSnapshot`'s stateProof (from `generateSnapshot`) carries `balancesProof=Hash.empty`,
           // `lastTxRefsProof=Hash.empty`, allow/tokenlock refs = None, so an empty slice recompute-matches
           // (`fieldRootFromBytes(empty) == Hash.empty`).
-          _ <- followSliceR.set(GlobalFollowSliceResponse(snapshotOrdinal11, ConsumedFieldDelta.empty).some)
+          _ <- followSliceR.set(GlobalFollowSliceResponse(snapshotOrdinal11, ConsumedFieldDelta.empty, none).some)
 
           processingResult <- snapshotProcessor.process(
             hashedNextSnapshot.asRight[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)]
@@ -1194,7 +1221,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             k,
             mptStore,
             jhs,
-            followSliceR
+            FollowTestHooks(followSliceR, followSliceSinceR, followMirrorR)
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -1229,7 +1256,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           _ <- incLastNSnapR.set(incLastN)
           // Slice ordinal = 10 (the PREVIOUS finalized, != processed ordinal 11). An empty slice recompute-matches
           // ordinal-10's empty stateProof (resolved from the LOCAL lastN store via `getByOrdinal`, no peer pull).
-          _ <- followSliceR.set(GlobalFollowSliceResponse(snapshotOrdinal10, ConsumedFieldDelta.empty).some)
+          _ <- followSliceR.set(GlobalFollowSliceResponse(snapshotOrdinal10, ConsumedFieldDelta.empty, none).some)
 
           processingResult <- snapshotProcessor.process(
             hashedNextSnapshot.asRight[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)]
@@ -1293,7 +1320,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             k,
             mptStore,
             jhs,
-            followSliceR
+            FollowTestHooks(followSliceR, followSliceSinceR, followMirrorR)
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -1327,7 +1354,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           _ <- lastNSnapsR.set(lastN)
           _ <- incLastNSnapR.set(incLastN)
           // Slice ordinal = 9: != processed ordinal 11 AND not in the lastN window -> `getByOrdinal(9)` = None -> defer.
-          _ <- followSliceR.set(GlobalFollowSliceResponse(snapshotOrdinal9, ConsumedFieldDelta.empty).some)
+          _ <- followSliceR.set(GlobalFollowSliceResponse(snapshotOrdinal9, ConsumedFieldDelta.empty, none).some)
 
           processingResult <- snapshotProcessor
             .process(hashedNextSnapshot.asRight[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)])
@@ -1367,7 +1394,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             k,
             _,
             jhs,
-            followSliceR
+            FollowTestHooks(followSliceR, followSliceSinceR, followMirrorR)
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val kryo = ks
@@ -1556,7 +1583,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                 lastTokenLockRefs = SortedMap.empty,
                 activeTokenLocks = SortedMap.empty,
                 removals = SortedMap.empty
-              )
+              ),
+              none
             ).some
           )
           // Inserting tips
@@ -1678,7 +1706,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             k,
             _,
             jhs,
-            followSliceR
+            FollowTestHooks(followSliceR, followSliceSinceR, followMirrorR)
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -1867,7 +1895,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                 lastTokenLockRefs = SortedMap.empty,
                 activeTokenLocks = SortedMap.empty,
                 removals = SortedMap.empty
-              )
+              ),
+              none
             ).some
           )
           // Inserting tips
@@ -2064,7 +2093,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
             k,
             mptStore,
             jhs,
-            followSliceR
+            FollowTestHooks(followSliceR, followSliceSinceR, followMirrorR)
           ) =>
         implicit val securityProvider: SecurityProvider[IO] = sp
         implicit val hasher = h
@@ -2112,7 +2141,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           // gl1 own-slice follow CUTOVER (S3b′): an empty slice recompute-matches `hashedNextSnapshot`'s empty
           // stateProof roots, so `applyGlobalSnapshotFn` succeeds and the FSM reaches the tips-alignment check that
           // this test exercises (the failure must come from misaligned tips, not from a missing follow slice).
-          _ <- followSliceR.set(GlobalFollowSliceResponse(snapshotOrdinal11, ConsumedFieldDelta.empty).some)
+          _ <- followSliceR.set(GlobalFollowSliceResponse(snapshotOrdinal11, ConsumedFieldDelta.empty, none).some)
           // Inserting tips
           _ <- blocksR(parent2.hash).set(MajorityBlock(parent2, 1L, Active).some)
 

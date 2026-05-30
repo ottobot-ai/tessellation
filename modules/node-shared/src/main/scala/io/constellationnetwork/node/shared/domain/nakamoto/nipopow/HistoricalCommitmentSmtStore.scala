@@ -37,12 +37,12 @@ object CommitmentKey {
 /** §3 NIPoPoW — the UNBOUNDED, on-disk SMT keyed by snapshot ordinal whose single root is anchored as `smtRoot` in the gl0
   * `GlobalSnapshotStateProof`. Each leaf is a [[PerOrdinalCommitment]] (commitment hash) for one finalized ordinal.
   *
-  * '''Two layers, the MptTowerStore relationship.''' The DURABLE substrate is a scodec-coded, MPT-backed commitment KV
-  * (`MptStore[F, CommitmentKey]`, value = the ordinal's commitment [[Hash]]) — the same on-disk persistence shape as `MptTowerStore`'s
-  * partition. The SMT itself is a DERIVED in-memory index ([[VersionedSmt]], structural-sharing) recomputable from the persisted
-  * commitments by a chain replay ([[replayFrom]]) — again exactly the `MptTowerStore` model (durable inputs + derived reads,
-  * recoverable by replay). Crucially the commitment KV is its OWN MPT producer, NOT a `GlobalStateKey` partition, so its bytes NEVER enter
-  * the consensus `mptRoot`/`hypergraphRoot` — keeping the hypergraph root independent of `smtRoot` (the circularity rule).
+  * '''Two layers, the MptTowerStore relationship.''' The DURABLE substrate is a scodec-coded, MPT-backed commitment KV (`MptStore[F,
+  * CommitmentKey]`, value = the ordinal's commitment [[Hash]]) — the same on-disk persistence shape as `MptTowerStore`'s partition. The SMT
+  * itself is a DERIVED in-memory index ([[VersionedSmt]], structural-sharing) recomputable from the persisted commitments by a chain replay
+  * ([[replayFrom]]) — again exactly the `MptTowerStore` model (durable inputs + derived reads, recoverable by replay). Crucially the
+  * commitment KV is its OWN MPT producer, NOT a `GlobalStateKey` partition, so its bytes NEVER enter the consensus
+  * `mptRoot`/`hypergraphRoot` — keeping the hypergraph root independent of `smtRoot` (the circularity rule).
   *
   * '''Cutoff / determinism.''' `smtRoot(N) = SMT({ (i, commitment_i) : 0 ≤ i ≤ N−k }).root`, where `k` is the existing confirmation depth.
   * Below the cutoff every ordinal is finalized + immutable, so all nodes agree and there is no rollback — a LAG, not a size bound (the leaf
@@ -81,9 +81,9 @@ trait HistoricalCommitmentSmtStore[F[_]] {
   /** The commitment hash persisted for `ordinal`, or `None` if not present in the durable KV. */
   def commitmentHashAt(ordinal: SnapshotOrdinal): F[Option[Hash]]
 
-  /** Chain-replay recovery: rebuild the in-memory SMT version-roots from the durable commitment KV. Re-applies every persisted
-    * `(ordinal i, commitmentHash)` as a leaf and re-snapshots the root under version `i + k` (so `rootForSnapshot` is reproduced for the
-    * retained window). Idempotent. Called at boot before the first proof is built. `k` is the confirmation depth.
+  /** Chain-replay recovery: rebuild the in-memory SMT version-roots from the durable commitment KV. Re-applies every persisted `(ordinal i,
+    * commitmentHash)` as a leaf and re-snapshots the root under version `i + k` (so `rootForSnapshot` is reproduced for the retained
+    * window). Idempotent. Called at boot before the first proof is built. `k` is the confirmation depth.
     */
   def replayFrom(k: Long): F[Unit]
 }
@@ -93,8 +93,8 @@ object HistoricalCommitmentSmtStore {
   /** Wrap a durable `MptStore[F, CommitmentKey]` + an in-memory [[VersionedSmt]] as a [[HistoricalCommitmentSmtStore]].
     *
     * The `k` cutoff is owned by the CALLER: [[appendAtFinality]] takes `(snapshotOrdinal, eligibleOrdinal)` explicitly, so the store is a
-    * pure ordinal-keyed structure with no snapshot-lookup dependency. The caller (GSAM wiring) computes `eligibleOrdinal = snapshotOrdinal −
-    * k` from the existing confirmation depth and is responsible for passing the matching `k` to [[replayFrom]].
+    * pure ordinal-keyed structure with no snapshot-lookup dependency. The caller (GSAM wiring) computes `eligibleOrdinal = snapshotOrdinal
+    * − k` from the existing confirmation depth and is responsible for passing the matching `k` to [[replayFrom]].
     */
   def make[F[_]: Async: Hasher](
     durable: MptStore[F, CommitmentKey],

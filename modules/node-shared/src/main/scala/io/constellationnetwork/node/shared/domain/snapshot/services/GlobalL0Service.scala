@@ -83,6 +83,14 @@ trait GlobalL0Service[F[_]] {
     * next tick" — there is no `StateProofMismatch`-style recovery storm.
     */
   def getLatestFollowSlice: F[Option[GlobalFollowSliceResponse]]
+
+  /** The #287 incremental fetch: `GET /global-follow/slice?since=<ordinalLong>`. Returns the change-set a follower holding the
+    * consumed-field state at `since` needs to reach gl0's latest finalized ordinal (`baseOrdinal = Some(since)`), or — if `since` fell out
+    * of gl0's projection ring — the full from-empty slice (`baseOrdinal = None`). Same `None` / no-recovery-storm semantics as
+    * [[getLatestFollowSlice]]. The follower applies the diff only when `baseOrdinal` matches the tip it holds and falls back to a full
+    * fetch otherwise, so a wrong base cannot advance the mirror.
+    */
+  def getFollowSliceSince(since: SnapshotOrdinal): F[Option[GlobalFollowSliceResponse]]
 }
 
 object GlobalL0Service {
@@ -159,6 +167,18 @@ object GlobalL0Service {
               globalFollowClient.getLatestSlice.run(peer).map(_.some)
             }.handleErrorWith { e =>
               logger.warn(e)(s"Failure pulling latest follow slice").as(none)
+            }
+        }
+
+      def getFollowSliceSince(since: SnapshotOrdinal): F[Option[GlobalFollowSliceResponse]] =
+        maybeGlobalFollowClient match {
+          case None                     => none[GlobalFollowSliceResponse].pure[F]
+          case Some(globalFollowClient) =>
+            // #287 incremental fetch — same peer-resolution + error-to-None handling as `getLatestFollowSlice`.
+            globalL0ClusterStorage.getRandomPeer.flatMap { peer =>
+              globalFollowClient.getSliceSince(since).run(peer).map(_.some)
+            }.handleErrorWith { e =>
+              logger.warn(e)(s"Failure pulling follow slice since=${since.show}").as(none)
             }
         }
 

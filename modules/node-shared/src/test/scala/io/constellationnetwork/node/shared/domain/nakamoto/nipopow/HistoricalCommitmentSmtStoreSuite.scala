@@ -54,7 +54,10 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
       towerEligibility = TowerEligibility.NotComputed
     )
 
-  private def fresh(res: Res, retention: Int = HistoricalCommitmentSmtStore.UnboundedVersionRetention): IO[HistoricalCommitmentSmtStore[IO]] = {
+  private def fresh(
+    res: Res,
+    retention: Int = HistoricalCommitmentSmtStore.UnboundedVersionRetention
+  ): IO[HistoricalCommitmentSmtStore[IO]] = {
     implicit val (hh: Hasher[IO], sp: SecurityProvider[IO], js: JsonSerializer[IO]) = res
     val _ = (sp, js)
     HistoricalCommitmentSmtStore.inMemory[IO](retention)
@@ -141,7 +144,7 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
       selfAbsent <- proofSelf match {
         case Right(abs: SmtProof.Absence) =>
           verifier.verify(root, abs).map {
-            case Right(v) => v.value match { case SmtEntry.Absent(_) => success; case o => failure(s"expected Absent, got $o") }
+            case Right(v)  => v.value match { case SmtEntry.Absent(_) => success; case o => failure(s"expected Absent, got $o") }
             case Left(err) => failure(s"verify absence failed: $err")
           }
         case other => IO.pure(failure(s"expected Absence for ordinal N in smtRoot(N), got $other"))

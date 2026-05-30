@@ -1,6 +1,6 @@
 package io.constellationnetwork.dag.l1
 
-import cats.effect.{IO, Resource}
+import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all._
 
 import io.constellationnetwork.BuildInfo
@@ -26,6 +26,7 @@ import io.constellationnetwork.node.shared.resources.MkHttpServer
 import io.constellationnetwork.node.shared.resources.MkHttpServer.ServerName
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.cluster.ClusterId
+import io.constellationnetwork.schema.nakamoto.follow.ConsumedFieldState
 import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.node.NodeState.SessionStarted
 import io.constellationnetwork.schema.semver.TessellationVersion
@@ -131,6 +132,11 @@ object Main
         sharedStorages
       )
 
+      // #287 "send diffs": the follower's verified-mirror Ref `(lastVerifiedTip, ConsumedFieldState)`, created ONCE
+      // here and threaded into the processor so it persists across follow ticks. `None` on cold start ⇒ the first
+      // tick fetches the FULL slice; thereafter each tick fetches the incremental diff since the held tip and falls
+      // back to a full from-empty fetch on any verify miss / reset.
+      followMirrorRef <- Ref.of[IO, Option[(SnapshotOrdinal, ConsumedFieldState)]](none).asResource
       snapshotProcessor = DAGSnapshotProcessor.make(
         storages.address,
         storages.block,
@@ -143,7 +149,8 @@ object Main
         services.globalL0.pullGlobalSnapshot,
         services.globalL0,
         storages.globalL0Alignment,
-        sharedStorages.mptStore
+        sharedStorages.mptStore,
+        followMirrorRef
       )
       programs = Programs.make(sharedPrograms, p2pClient, storages, snapshotProcessor)
 

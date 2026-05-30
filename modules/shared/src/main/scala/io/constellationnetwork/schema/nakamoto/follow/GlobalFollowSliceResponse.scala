@@ -18,9 +18,16 @@ import io.circe.syntax._
   *
   *   - `ordinal` — the finalized global ordinal `slice` was read at. The follower uses it to pick the matching signed snapshot to recompute
   *     the field roots against; the cryptographic anchor is that snapshot's roots, not this number.
-  *   - `slice` — the full consumed-field slice at `ordinal`, expressed as an Address-keyed [[ConsumedFieldDelta]] of all-upserts. The
-  *     follower's verifier forward-hashes each `(Address, value)` to its MPT leaf the way gl0's writer does (`toHex(hypergraph(field,
-  *     address))` + `immutableBytes(value)`), reproducing gl0's leaf digests and therefore gl0's subtree roots.
+  *   - `slice` — the consumed-field slice, expressed as an Address-keyed [[ConsumedFieldDelta]]. When `baseOrdinal` is `None` it is a
+  *     FULL-from-empty projection at `ordinal` (every entry an upsert, removals empty); when `baseOrdinal` is `Some(b)` it is an
+  *     INCREMENTAL diff of gl0's finalized projection from `b` to `ordinal` (`ConsumedFieldDelta.diff`, #287). The follower's verifier
+  *     forward-hashes each post-apply `(Address, value)` to its MPT leaf the way gl0's writer does (`toHex(hypergraph(field, address))` +
+  *     `immutableBytes(value)`), reproducing gl0's leaf digests and therefore gl0's subtree roots.
+  *   - `baseOrdinal` — `None` ⇒ `slice` is a full-from-empty projection (apply on [[ConsumedFieldState.empty]]); `Some(b)` ⇒ `slice` is a
+  *     diff the follower must apply on top of the consumed-field state it holds AT ordinal `b` (#287, "send diffs"). The follower only
+  *     trusts a `Some(b)` diff when `b` equals the tip it currently holds; any mismatch / verify failure falls back to a full-from-empty
+  *     fetch, so a stale or wrong base can never advance the mirror (field-root equality catches it as
+  *     [[FollowVerificationError.FieldRootMismatch]]).
   *
   * '''Greenfield rule''' (per `[[feedback-greenfield-no-wire-compat]]`): fresh payload for the follow transport, no compat ceremony. Field
   * order is the protocol contract once the route + client are load-bearing — add a field = bump the case class explicitly, same discipline
@@ -28,7 +35,8 @@ import io.circe.syntax._
   */
 final case class GlobalFollowSliceResponse(
   ordinal: SnapshotOrdinal,
-  slice: ConsumedFieldDelta
+  slice: ConsumedFieldDelta,
+  baseOrdinal: Option[SnapshotOrdinal]
 )
 
 object GlobalFollowSliceResponse {
@@ -40,14 +48,16 @@ object GlobalFollowSliceResponse {
   implicit val encoder: Encoder[GlobalFollowSliceResponse] = (r: GlobalFollowSliceResponse) =>
     Json.obj(
       "ordinal" -> r.ordinal.asJson,
-      "slice" -> r.slice.asJson
+      "slice" -> r.slice.asJson,
+      "baseOrdinal" -> r.baseOrdinal.asJson
     )
 
   implicit val decoder: Decoder[GlobalFollowSliceResponse] = (c: HCursor) =>
     for {
       ordinal <- c.downField("ordinal").as[SnapshotOrdinal]
       slice <- c.downField("slice").as[ConsumedFieldDelta]
-    } yield GlobalFollowSliceResponse(ordinal, slice)
+      baseOrdinal <- c.downField("baseOrdinal").as[Option[SnapshotOrdinal]]
+    } yield GlobalFollowSliceResponse(ordinal, slice, baseOrdinal)
 
   // Structural Eq via the canonical JSON encoding (byte-stable: `SnapshotOrdinal` is a number, `slice`'s Eq
   // is already JSON-based and uses sorted maps). For test assertions / dedup, never control flow — same

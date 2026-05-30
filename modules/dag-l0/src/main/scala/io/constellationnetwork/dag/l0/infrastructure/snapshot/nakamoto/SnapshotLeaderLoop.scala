@@ -389,6 +389,17 @@ object SnapshotLeaderLoop {
     // snapshot at the slice's ordinal — the latest PRODUCED GSI (`lastNGlobalSnapshotStorage.getCombined`) is
     // ahead of the finalized watermark and therefore unresolvable by a follower (the bug this closes).
     latestFinalizedSliceSourceRef: Ref[F, Option[(SnapshotOrdinal, GlobalSnapshotInfo)]],
+    // Axis 2 (gl1 follow), #287 "send diffs" — the bounded ring of recent finalized 5-field PROJECTIONS keyed by
+    // ordinal (NOT full GSIs). Filled at the SAME two finalize sinks that update `latestFinalizedSliceSourceRef`,
+    // storing `GlobalFollowSliceService.sliceFromGsi(finalizedGsi)` and trimmed to the last
+    // `GlobalFollowSliceService.recentProjectionsToKeep`. `GlobalFollowSliceService.sliceSince` reads it to compute
+    // the incremental diff a gl1 follower requests via `GET /global-follow/slice?since=<ordinal>`. Pure transport
+    // optimization: a follower whose `since` fell out of the ring re-fetches the full slice, and field-root equality
+    // rejects a wrong base — so the ring bound is a memory bound, not a consensus parameter.
+    recentFollowProjectionsRef: Ref[F, scala.collection.immutable.SortedMap[
+      SnapshotOrdinal,
+      io.constellationnetwork.schema.nakamoto.follow.ConsumedFieldDelta
+    ]],
     // Fire-and-forget ChainSync trigger for the finality walkback path. When the
     // finality monitor tries to confirm ancestry at an attested ordinal that we
     // don't have on our local canonical chain (we're on a fork), we enqueue a
@@ -476,6 +487,18 @@ object SnapshotLeaderLoop {
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("SnapshotLeaderLoop")
     val (vrfSeed, vrfPK) = deriveVrfKeys(keyPair)
+
+    // #287 "send diffs": record a just-finalized GSI's 5-field projection into the bounded ring keyed by ordinal,
+    // trimmed to the last `recentProjectionsToKeep` (drop the lowest ordinals). `GlobalFollowSliceService.sliceSince`
+    // diffs `proj@since → proj@latest` from this ring. Pure projection (no hashing); idempotent on re-finalize of
+    // the same ordinal. A bound miss only forces a follower back to the full slice — no consensus effect.
+    def recordFollowProjection(ordinal: SnapshotOrdinal, gsi: GlobalSnapshotInfo): F[Unit] =
+      recentFollowProjectionsRef.update { ring =>
+        val updated = ring.updated(ordinal, GlobalFollowSliceService.sliceFromGsi(gsi))
+        if (updated.size > GlobalFollowSliceService.recentProjectionsToKeep)
+          updated.drop(updated.size - GlobalFollowSliceService.recentProjectionsToKeep)
+        else updated
+      }
     // Use shared genesis time if provided, else fall back to wall clock
     val effectiveGenesisTime = if (genesisTimeMs > 0) genesisTimeMs else System.currentTimeMillis()
 
@@ -907,6 +930,12 @@ object SnapshotLeaderLoop {
                                               case _ =>
                                                 Some((SnapshotOrdinal.unsafeApply(finalizeAtOrdinal), canonicalSnapshot.context))
                                             } >>
+                                            // #287: record this finalized projection in the bounded diff ring (trimmed to the
+                                            // last K), so `GlobalFollowSliceService.sliceSince` can serve incremental gl1 diffs.
+                                            recordFollowProjection(
+                                              SnapshotOrdinal.unsafeApply(finalizeAtOrdinal),
+                                              canonicalSnapshot.context
+                                            ) >>
                                             logger
                                               .info(
                                                 s"DEPTH-FINALIZED ordinal=$finalizeAtOrdinal slot=${canonicalSnapshot.slot} (tip ord=${tip.ordinal} slot=${tip.slot}, k=$ConfirmationDepthK)"
@@ -1004,6 +1033,8 @@ object SnapshotLeaderLoop {
                                               case Some((o, _)) if o.value.value >= finalOrdinal => Some((o, stored.context))
                                               case _ => Some((SnapshotOrdinal.unsafeApply(finalOrdinal), stored.context))
                                             } >>
+                                            // #287: same recent-projection ring update as the DEPTH-FINALIZED branch above.
+                                            recordFollowProjection(SnapshotOrdinal.unsafeApply(finalOrdinal), stored.context) >>
                                             snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(finalOrdinal))) >>
                                             logger.info(
                                               s"ATTEST-FINALIZED ordinal=$finalOrdinal slot=${stored.slot} (weight=${"%.2f".format(weight.toDouble)}, " +
