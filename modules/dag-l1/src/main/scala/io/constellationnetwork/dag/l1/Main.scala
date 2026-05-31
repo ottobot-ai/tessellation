@@ -313,7 +313,7 @@ object Main
         method match {
           case cfg: RunInitialValidator =>
             gossipDaemon.startAsInitialValidator >>
-              programs.l0PeerDiscovery.discoverFrom(cfg.l0Peer) >>
+              programs.l0PeerDiscovery.discoverFromWithRetry(cfg.l0Peer) >>
               storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin) >>
               services.cluster.createSession >>
               services.session.createSession >>
@@ -350,7 +350,7 @@ object Main
 
           case cfg: RunValidator =>
             gossipDaemon.startAsRegularValidator >>
-              programs.l0PeerDiscovery.discoverFrom(cfg.l0Peer) >>
+              programs.l0PeerDiscovery.discoverFromWithRetry(cfg.l0Peer) >>
               storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin) >>
               services.restart.setNodeForkedRestartMethod(
                 RunValidatorWithJoinAttempt(
@@ -370,7 +370,7 @@ object Main
 
           case cfg: RunValidatorWithJoinAttempt =>
             gossipDaemon.startAsRegularValidator >>
-              programs.l0PeerDiscovery.discoverFrom(cfg.l0Peer) >>
+              programs.l0PeerDiscovery.discoverFromWithRetry(cfg.l0Peer) >>
               storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin) >>
               programs.joining.joinOneOf(cfg.majorityForkPeerIds) >>
               services.restart.setClusterLeaveRestartMethod(

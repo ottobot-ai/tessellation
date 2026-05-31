@@ -323,8 +323,8 @@ abstract class CurrencyL1App(
           case cfg: RunInitialValidator =>
             storages.identifier.setInitial(cfg.identifier) >>
               gossipDaemon.startAsInitialValidator >>
-              programs.l0PeerDiscovery.discoverFrom(cfg.l0Peer) >>
-              programs.globalL0PeerDiscovery.discoverFrom(cfg.globalL0Peer) >>
+              programs.l0PeerDiscovery.discoverFromWithRetry(cfg.l0Peer) >>
+              programs.globalL0PeerDiscovery.discoverFromWithRetry(cfg.globalL0Peer) >>
               storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin) >>
               services.cluster.createSession >>
               services.session.createSession >>
@@ -349,15 +349,15 @@ abstract class CurrencyL1App(
           case cfg: RunValidator =>
             storages.identifier.setInitial(cfg.identifier) >>
               gossipDaemon.startAsRegularValidator >>
-              programs.l0PeerDiscovery.discoverFrom(cfg.l0Peer) >>
-              programs.globalL0PeerDiscovery.discoverFrom(cfg.globalL0Peer) >>
+              programs.l0PeerDiscovery.discoverFromWithRetry(cfg.l0Peer) >>
+              programs.globalL0PeerDiscovery.discoverFromWithRetry(cfg.globalL0Peer) >>
               storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin)
 
           case cfg: RunValidatorWithJoinAttempt =>
             storages.identifier.setInitial(cfg.identifier) >>
               gossipDaemon.startAsRegularValidator >>
-              programs.l0PeerDiscovery.discoverFrom(cfg.l0Peer) >>
-              programs.globalL0PeerDiscovery.discoverFrom(cfg.globalL0Peer) >>
+              programs.l0PeerDiscovery.discoverFromWithRetry(cfg.l0Peer) >>
+              programs.globalL0PeerDiscovery.discoverFromWithRetry(cfg.globalL0Peer) >>
               storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin) >>
               programs.joining.joinOneOf(cfg.majorityForkPeerIds)
         }
