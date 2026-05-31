@@ -175,6 +175,19 @@ object LastNGlobalSnapshotStorage {
               (trimmed, Applicative[F].unit)
             case Some((_, latest)) if latest.hash === snapshot.hash =>
               (incrementalSnapshots, Applicative[F].unit)
+            // #287 regression fix: `registerFinalized` (the gl1 inclusion-proof follow batch
+            // pre-population path, added in 8a9d54836) upserts finalized snapshots into this by-ordinal
+            // index AHEAD of the per-ordinal `set` walk, so `lastOption` is already at the batch tip when
+            // `set` runs for an earlier ordinal in the batch. `combinedSnapshotsR` (block 1 above) is the
+            // authoritative strict-contiguity / fork gate and has already accepted this advance; this
+            // index is only a by-ordinal lookup cache (getByOrdinal / getLastN). So when the snapshot is
+            // already present at its ordinal with a matching hash, treat it as idempotent success rather
+            // than failing the strict `isNextSnapshot(lastOption, _)` check — which spuriously threw
+            // "Failure during putting" on every batch ordinal whose index tip was ahead (observed as 89
+            // caught-and-skipped failures in one 8gl0+4mg run, stalling the follower's lastN advance). A
+            // genuinely divergent snapshot (absent, or present with a different hash) still throws below.
+            case _ if incrementalSnapshots.get(snapshot.ordinal).exists(_.hash === snapshot.hash) =>
+              (incrementalSnapshots, Applicative[F].unit)
             case _ =>
               (incrementalSnapshots, MonadThrow[F].raiseError[Unit](new Throwable("Failure during putting new global snapshot!")))
           }
