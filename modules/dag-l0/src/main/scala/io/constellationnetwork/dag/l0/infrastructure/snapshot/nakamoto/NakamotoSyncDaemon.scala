@@ -2091,9 +2091,18 @@ object NakamotoSyncDaemon {
   def makeMetagraphBinaryProcessor[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector](
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
     committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
+    // #213/#290: ADMISSION-path parent-ordinal resolver. The third arg is the incoming binary's OWN
+    // `content` bytes; the resolver derives the parent ordinal as (this binary's currency-snapshot
+    // ordinal − 1), a deterministic pure function of the content, NOT read from gl0's currency
+    // partitions (which `calculateLastCurrencySnapshots` drops via `.filterNot(_.isEmpty)` whenever the
+    // mg produced no state in the window → the permanent admission deadlock at 8gl0+4mg). The identity
+    // guard (`lastStateChannelSnapshotHashes[mg] == parentHash`) still runs inside the resolver. This
+    // affects ONLY the admission decision — the committee attestation gate (sender/receiver VRF eta +
+    // wire format) is unchanged and still resolves via the GSI-only `MetagraphParentOrdinalResolver.resolve`.
     parentOrdinalFor: (
       io.constellationnetwork.schema.address.Address,
-      io.constellationnetwork.security.hash.Hash
+      io.constellationnetwork.security.hash.Hash,
+      Array[Byte]
     ) => F[Option[Long]],
     etaForParentOrdinal: Long => F[Array[Byte]],
     selfStake: F[io.constellationnetwork.numerics.Ratio],
@@ -2109,10 +2118,17 @@ object NakamotoSyncDaemon {
     // next global snapshot finalizes (~7s later). Without a shortcut, any drained child of X would
     // hit `parentOrdinalFor` → None and immediately re-buffer, never making progress.
     // The orphan buffer's admission cache holds `(mg, X.value.hash) → mgOrd_X` for that GSI-lag window.
-    def resolveParent(address: Address, parentHash: Hash): F[Option[Long]] =
+    //
+    // ARITHMETIC (cache fast-path == content derivation, end-to-end): on admit of binary B we record
+    // `(mg, valueHash(B)) → parentOrdinal + 1 = ord(B)` (B's own ordinal). The next child C chains off B
+    // (`C.parentHash = valueHash(B)`, `ord(C) = ord(B)+1`). Resolving C's parent ordinal: cache hit on
+    // `valueHash(B)` → `ord(B)`; content path → `ord(C) − 1 = ord(B)`. Identical. (Genesis ord 0 → first
+    // incremental ord 1 has parent ordinal 0; admitted ord 1 records admission value 1; child ord 2 resolves 1.)
+    // `incomingContent` is THIS binary's `content` bytes, fed to the content-derivation resolver on cache miss.
+    def resolveParent(address: Address, parentHash: Hash, incomingContent: Array[Byte]): F[Option[Long]] =
       orphanBuffer.lookupAdmittedOrd(address, parentHash).flatMap {
         case s @ Some(_) => Async[F].pure(s)
-        case None        => parentOrdinalFor(address, parentHash)
+        case None        => parentOrdinalFor(address, parentHash, incomingContent)
       }
 
     // After a binary is admitted, drain any orphans whose parent equals the just-accepted binary's
@@ -2146,7 +2162,7 @@ object NakamotoSyncDaemon {
                 // binaries gl0 hasn't seen yet. Buffer in the orphan pool keyed by parentHash;
                 // when the matching binary IS admitted, drainChildren replays them in chronological
                 // order. #213.
-                resolveParent(address, parentHash).flatMap {
+                resolveParent(address, parentHash, signed.value.content).flatMap {
                   case None =>
                     orphanBuffer.record(address, parentHash, bytes).flatMap { sz =>
                       logger.info(

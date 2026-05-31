@@ -1132,6 +1132,30 @@ object GlobalSnapshotConsensus {
             implicit val resolverLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
             io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver.resolve[F](pendingReader, mg, parent)
           }
+          // #213/#290: ADMISSION-path parent-ordinal resolver. Identical to `committeeParentOrdinalFor`
+          // EXCEPT it derives the ordinal from the incoming binary's own content (ordinal − 1) once the
+          // GSI identity guard (`lastStateChannelSnapshotHashes[mg] == parentHash`) passes, instead of
+          // reading gl0's currency partitions — which `calculateLastCurrencySnapshots` drops via
+          // `.filterNot(_.isEmpty)` whenever the mg produced no state in the window, while still writing
+          // `lastStateChannelSnapshotHashes[mg]`. That GSI gap made the legacy `resolve` return `None`
+          // (tip-matched, both currency partitions empty) → the admission path fail-closed → the
+          // metagraph tip froze and 0 incrementals were ever admitted at 8gl0+4mg. Wired ONLY into
+          // `makeMetagraphBinaryProcessor` (the admission decision). The committee attestation gate
+          // keeps using the GSI-only `committeeParentOrdinalFor` on BOTH its sender and receiver paths,
+          // so the committee-VRF eta (and its cross-node determinism) is byte-for-byte unchanged.
+          committeeParentOrdinalForBinary: (
+            (
+              io.constellationnetwork.schema.address.Address,
+              io.constellationnetwork.security.hash.Hash,
+              Array[Byte]
+            ) => F[
+              Option[Long]
+            ]
+          ) = (mg, parent, content) => {
+            implicit val resolverLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
+            io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver
+              .resolveFromBinary[F](pendingReader, mg, parent, content)
+          }
           committeeGate = {
             implicit val gateLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
             implicit val gateHasher: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
@@ -1194,7 +1218,10 @@ object GlobalSnapshotConsensus {
             .makeMetagraphBinaryProcessor[F](
               processMetagraphBinary = processMetagraphBinary,
               committeeGate = committeeGate,
-              parentOrdinalFor = committeeParentOrdinalFor,
+              // #213/#290: admission resolver derives the parent ordinal from the incoming binary's own
+              // content (ordinal − 1), not the (possibly-dropped) gl0 currency partition. Committee gate
+              // wiring (below + the receiver attestation handler) is unchanged — still GSI-only.
+              parentOrdinalFor = committeeParentOrdinalForBinary,
               etaForParentOrdinal = committeeEtaForOrdinal,
               selfStake = stakeRegistry.committeeStake(selfId),
               orphanBuffer = orphanBuffer,
