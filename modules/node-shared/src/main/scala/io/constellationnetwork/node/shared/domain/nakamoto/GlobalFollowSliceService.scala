@@ -128,6 +128,10 @@ object GlobalFollowSliceService {
       lastAllowSpendRefs = gsi.lastAllowSpendRefs.getOrElse(SortedMap.empty[Address, AllowSpendReference]),
       lastTokenLockRefs = gsi.lastTokenLockRefs.getOrElse(SortedMap.empty[Address, TokenLockReference]),
       activeTokenLocks = gsi.getActiveTokenLocks,
+      // 6th consumed field (cl1/dl1). Read directly from the finalized GSI — same Address-keyed shape. gl1 receives it too but
+      // never verifies/reads it (it passes `currencySnapshotsRoots = None`); cl1/dl1 need it for the metagraph's own
+      // currency-genesis bootstrap (`globalState.lastCurrencySnapshots.get(identifier)`).
+      lastCurrencySnapshots = gsi.lastCurrencySnapshots,
       removals = SortedMap.empty
     )
 }

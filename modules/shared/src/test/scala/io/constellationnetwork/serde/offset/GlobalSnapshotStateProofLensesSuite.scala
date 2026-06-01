@@ -1,12 +1,10 @@
 package io.constellationnetwork.serde.offset
 
-import io.constellationnetwork.merkletree.MerkleRoot
-import io.constellationnetwork.schema.GlobalSnapshotStateProof
+import io.constellationnetwork.schema.{CurrencySnapshotMptRoots, GlobalSnapshotStateProof}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.serde.codecs.instances.GlobalSnapshotStateProofCodec
 import io.constellationnetwork.serde.codecs.offset._
 
-import eu.timepit.refined.types.numeric.NonNegInt
 import weaver.FunSuite
 
 /** Lens suite for `GlobalSnapshotStateProof` — exercises both the fixed-offset hashes at the head of the record and the dynamic-offset
@@ -16,7 +14,7 @@ object GlobalSnapshotStateProofLensesSuite extends FunSuite {
 
   private def h(byte: String): Hash = Hash(byte * 32)
 
-  private def merkleRoot = MerkleRoot(NonNegInt.unsafeFrom(7), h("dd"))
+  private def currencyRoots = CurrencySnapshotMptRoots(h("10"), h("11"))
 
   private def allAbsent = GlobalSnapshotStateProof(
     h("aa"),
@@ -44,7 +42,7 @@ object GlobalSnapshotStateProofLensesSuite extends FunSuite {
     h("aa"),
     h("bb"),
     h("cc"),
-    Some(merkleRoot),
+    Some(currencyRoots),
     Some(h("01")),
     Some(h("02")),
     Some(h("03")),
@@ -104,7 +102,7 @@ object GlobalSnapshotStateProofLensesSuite extends FunSuite {
 
   test("mptRoot lens works on a mixed-presence layout") {
     val mixed = allAbsent.copy(
-      lastCurrencySnapshotsProof = Some(merkleRoot),
+      lastCurrencySnapshotsProof = Some(currencyRoots),
       activeAllowSpends = Some(h("11")),
       priceState = None,
       mptRoot = Some(h("99"))

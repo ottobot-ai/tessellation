@@ -76,7 +76,10 @@ object Services {
             lastGlobalSnapshotStorage,
             None,
             maybeMajorityPeerIds,
-            sharedStorages.mptStore
+            sharedStorages.mptStore,
+            // cl1/dl1 own-slice follow transport (Axis 2) — enables `getLatestFollowSlice` / `getFollowSliceSince`, consumed by
+            // `CurrencySnapshotProcessor.applyGlobalSnapshotFn` to fetch+verify gl0's slice instead of re-executing it.
+            Some(p2PClient.globalFollow)
           )
       val session = sharedServices.session
       val transaction = TransactionService.make[F, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotInfo](

@@ -29,8 +29,8 @@ import weaver.MutableIOSuite
   * `.filterNot(_.isEmpty)` whenever the metagraph produced no state in the window → the permanent admission deadlock).
   *
   * The crux test is `tip-match + both currency partitions empty → resolves via ordinal − 1`: that is the EXACT state the bug produced
-  * (`lastStateChannelSnapshotHashes[mg]` written, both currency partitions dropped). The legacy `resolve` path returns `None` there; the new
-  * `resolveFromBinary` path returns `Some(ordinal − 1)`.
+  * (`lastStateChannelSnapshotHashes[mg]` written, both currency partitions dropped). The legacy `resolve` path returns `None` there; the
+  * new `resolveFromBinary` path returns `Some(ordinal − 1)`.
   */
 object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
 
@@ -51,8 +51,8 @@ object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
 
   /** A `GlobalStateReader` stub that answers the `LastStateChannelSnapshotHashes` key with `tipHashOpt` (the mg's recorded tip on this
     * peer) and returns `None` for EVERYTHING else — including both currency partitions (`LastIncrementalCurrencySnapshots` /
-    * `LastCurrencySnapshots`). That `None` for the currency partitions is precisely the post-`.filterNot(_.isEmpty)` state that deadlocks the
-    * legacy GSI resolver; `resolveFromBinary` must not depend on it.
+    * `LastCurrencySnapshots`). That `None` for the currency partitions is precisely the post-`.filterNot(_.isEmpty)` state that deadlocks
+    * the legacy GSI resolver; `resolveFromBinary` must not depend on it.
     */
   private def readerWithTip(tipHashOpt: Option[Hash]): GlobalStateReader[IO] =
     new GlobalStateReader[IO] {

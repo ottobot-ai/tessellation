@@ -1,7 +1,7 @@
 package io.constellationnetwork.serde.codecs.instances
 
 import io.constellationnetwork.merkletree.MerkleRoot
-import io.constellationnetwork.schema.{GlobalSnapshotStateProof, GlobalSnapshotStateProofV1}
+import io.constellationnetwork.schema.{CurrencySnapshotMptRoots, GlobalSnapshotStateProof, GlobalSnapshotStateProofV1}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.OptionCodec.option
@@ -13,22 +13,25 @@ import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for the state-proof family:
   *   - `GlobalSnapshotStateProofV1` — 4 fields (3 required Hashes + 1 optional MerkleRoot).
-  *   - `GlobalSnapshotStateProof` — 19 fields (V1 + 15 optional Hashes; 14th = `historicalStakeSnapshots`, the §3 NIPoPoW per-field subtree
-  *     root over the stake-snapshot partition; 15th = `smtRoot`, the §3 NIPoPoW historical-commitment SMT root).
+  *   - `GlobalSnapshotStateProof` — 19 fields (3 required Hashes + 1 optional `CurrencySnapshotMptRoots` at field 4 + 15 optional Hashes).
+  *     Field 4 is the SIGNED pair of currency MPT partition roots — `incrementalRoot` (fieldId 5) + `infoRoot` (fieldId 6) — that anchor
+  *     the cl1/dl1-consumed `lastCurrencySnapshots` field (this slot held the legacy pre-MPT `Option[MerkleRoot]` on V1, now repurposed).
+  *     The 18th optional = `historicalStakeSnapshots`, the §3 NIPoPoW per-field subtree root over the stake-snapshot partition; the 19th
+  *     (last) = `smtRoot`, the §3 NIPoPoW historical-commitment SMT root.
   *
   * Both are FROZEN consensus types. V1 is the legacy, pre-MPT shape; the 19-field current variant adds optional witness hashes for features
   * that were added incrementally (allow-spends, token locks, delegated staking, node collaterals, price state, multi-currency snapshots,
-  * the `mptRoot` covering all partitions, the NIPoPoW historical-stake snapshot partition, and the NIPoPoW historical-commitment
-  * `smtRoot`).
+  * the `mptRoot` covering all partitions, the NIPoPoW historical-stake snapshot partition, the NIPoPoW historical-commitment `smtRoot`) and
+  * carries the signed currency-snapshots partition roots in its field-4 slot.
   *
   * Field order matches the case class declaration exactly. Adding / reordering / removing a field requires introducing a new era (e.g.
-  * `GlobalSnapshotStateProofV2Codec`) — this codec is never mutated. (Greenfield: no on-wire back-compat is owed, so appending the optional
-  * `smtRoot` to the current codec is acceptable — old bytes that lacked it never existed in a released chain.)
+  * `GlobalSnapshotStateProofV2Codec`) — this codec is never mutated. (Greenfield: no on-wire back-compat is owed — old bytes for these
+  * shapes never existed in a released chain.)
   *
   * Sizes:
   *   - V1: 32 + 32 + 32 + (1 | 37) = 97 or 129 bytes.
-  *   - Current: V1 payload + 15 × (1 | 33) = 112 .. 626 bytes. The 1-byte Option discriminator means the absent case is a single 0x00 byte
-  *     — tight for the "legacy snapshot without any of the post-V1 features" case.
+  *   - Current: 96 required + (1 | 65) currency-roots option + 15 × (1 | 33) = 112 .. 656 bytes. The 1-byte Option discriminator means the
+  *     absent case is a single 0x00 byte — tight for the "legacy snapshot without any of the post-V1 features" case.
   *
   * The schemas are deliberately kept separate (not unified via "V1 is a prefix of current") — historical V1 bytes must decode via V1's
   * codec, and current bytes via the current codec. Mixing them would be an ordinal-era bug.
@@ -37,6 +40,16 @@ object GlobalSnapshotStateProofCodec {
 
   private val optionalMerkleRootCodec: Codec[Option[MerkleRoot]] = option(merkleRootCodec)
   private val optionalHashCodec: Codec[Option[Hash]] = option(hashCodec)
+
+  /** The two currency MPT partition roots `(incrementalRoot, infoRoot)` for the field-4 `lastCurrencySnapshotsProof` field — two
+    * fixed-width 32-byte hashes. Fixed order matches the case class declaration.
+    */
+  private val currencySnapshotMptRootsCodec: Codec[CurrencySnapshotMptRoots] =
+    (hashCodec :: hashCodec).xmap[CurrencySnapshotMptRoots](
+      { case inc :: info :: HNil => CurrencySnapshotMptRoots(inc, info) },
+      r => r.incrementalRoot :: r.infoRoot :: HNil
+    )
+  private val optionalCurrencySnapshotMptRootsCodec: Codec[Option[CurrencySnapshotMptRoots]] = option(currencySnapshotMptRootsCodec)
 
   implicit val v1Codec: Codec[GlobalSnapshotStateProofV1] =
     (hashCodec :: hashCodec :: hashCodec :: optionalMerkleRootCodec)
@@ -60,7 +73,7 @@ object GlobalSnapshotStateProofCodec {
     (hashCodec ::
       hashCodec ::
       hashCodec ::
-      optionalMerkleRootCodec ::
+      optionalCurrencySnapshotMptRootsCodec ::
       optionalHashCodec ::
       optionalHashCodec ::
       optionalHashCodec ::

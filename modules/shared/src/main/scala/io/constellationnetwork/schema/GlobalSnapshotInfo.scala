@@ -266,7 +266,18 @@ object GlobalSnapshotInfo {
                           lastStateChannelSnapshotHashesProof = fieldRoot(FId.LastStateChannelSnapshotHashes),
                           lastTxRefsProof = fieldRoot(FId.LastTxRefs),
                           balancesProof = fieldRoot(FId.Balances),
-                          lastCurrencySnapshotsProof = None,
+                          // SIGNED currency-snapshots per-field roots from the SAME `perField` map (fieldIds 5 + 6). Kept in lockstep with
+                          // `mptStateProofFromBytes` below — same fieldRoot mapping, same `nonEmpty`-gated Option lifting. This is field 4
+                          // (it reuses the legacy `lastCurrencySnapshotsProof` slot, now typed as the currency MPT partition roots).
+                          lastCurrencySnapshotsProof =
+                            if (info.lastCurrencySnapshots.isEmpty) None
+                            else
+                              Some(
+                                CurrencySnapshotMptRoots(
+                                  fieldRoot(FId.LastIncrementalCurrencySnapshots),
+                                  fieldRoot(FId.LastCurrencySnapshotInfo)
+                                )
+                              ),
                           activeAllowSpends = info.activeAllowSpends.map(_ => fieldRoot(FId.ActiveAllowSpends)),
                           activeTokenLocks = info.activeTokenLocks.map(_ => fieldRoot(FId.ActiveTokenLocks)),
                           tokenLockBalances = info.tokenLockBalances.map(_ => fieldRoot(FId.TokenLockBalances)),
@@ -368,9 +379,20 @@ object GlobalSnapshotInfo {
         lastStateChannelSnapshotHashesProof = fieldRoot(FId.LastStateChannelSnapshotHashes),
         lastTxRefsProof = fieldRoot(FId.LastTxRefs),
         balancesProof = fieldRoot(FId.Balances),
-        // Currency-snapshots slot is a Merkle tree (not MPT); the MPT format tracks
-        // LastIncrementalCurrencySnapshots/LastCurrencySnapshotInfo via the global mptRoot.
-        lastCurrencySnapshotsProof = None,
+        // SIGNED currency-snapshots per-field roots. Both partition roots come from the ALREADY-COMPUTED `perField` map (fieldIds 5 + 6) —
+        // no extra computation, just stop discarding them. `Some` iff the currency map is non-empty (matches the `info.<field>.map(_ => …)`
+        // present-only convention); when empty both subtree roots would be `Hash.empty`, so `None` is the canonical empty value. Byte-
+        // identical to the follower's `GlobalStateConverter.currencySnapshotFieldRoots` recompute (same `fieldRootFromBytes` path). This is
+        // field 4 (it reuses the legacy `lastCurrencySnapshotsProof` slot, now typed as the currency MPT partition roots).
+        lastCurrencySnapshotsProof =
+          if (info.lastCurrencySnapshots.isEmpty) None
+          else
+            Some(
+              CurrencySnapshotMptRoots(
+                fieldRoot(FId.LastIncrementalCurrencySnapshots),
+                fieldRoot(FId.LastCurrencySnapshotInfo)
+              )
+            ),
         activeAllowSpends = info.activeAllowSpends.map(_ => fieldRoot(FId.ActiveAllowSpends)),
         activeTokenLocks = info.activeTokenLocks.map(_ => fieldRoot(FId.ActiveTokenLocks)),
         tokenLockBalances = info.tokenLockBalances.map(_ => fieldRoot(FId.TokenLockBalances)),
@@ -415,7 +437,11 @@ object GlobalSnapshotInfo {
       info.priceState.traverse(_.hash),
       info.metagraphSyncData.traverse(_.hash)
     ).mapN(
-      GlobalSnapshotStateProof.apply(_, _, _, lastCurrencySnapshots.map(_.getRoot), _, _, _, _, _, _, _, _, _, _, _, _, None, None, None)
+      // Field 4 on V2 is now the SIGNED currency MPT partition roots; the legacy separate-Merkle-tree currency root
+      // (`lastCurrencySnapshots.map(_.getRoot)`) has no MPT-partition representation, so this legacy-format path drops it to `None`
+      // (consistent with `GlobalSnapshotStateProofV1.toGlobalSnapshotStateProof`). The MerkleTree arg is now unused here.
+      GlobalSnapshotStateProof
+        .apply(_, _, _, None, _, _, _, _, _, _, _, _, _, _, _, _, None, None, None)
     )
 
   def empty: GlobalSnapshotInfo = GlobalSnapshotInfo(

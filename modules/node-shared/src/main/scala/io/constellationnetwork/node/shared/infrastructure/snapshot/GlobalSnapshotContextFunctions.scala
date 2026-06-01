@@ -447,7 +447,7 @@ object GlobalSnapshotContextFunctions {
     claimed: GlobalSnapshotStateProof
   ): List[String] = {
     def shortHash(h: io.constellationnetwork.security.hash.Hash): String = h.show.take(12)
-    def shortMerkle(m: io.constellationnetwork.merkletree.MerkleRoot): String = m.show.take(12)
+    def shortCurrencyRoots(r: io.constellationnetwork.schema.CurrencySnapshotMptRoots): String = r.show.take(12)
     def diffHash(
       label: String,
       a: io.constellationnetwork.security.hash.Hash,
@@ -460,17 +460,18 @@ object GlobalSnapshotContextFunctions {
       b: Option[io.constellationnetwork.security.hash.Hash]
     ): Option[String] =
       if (a === b) None else Some(s"$label(c=${a.map(shortHash).getOrElse("none")},l=${b.map(shortHash).getOrElse("none")})")
-    def diffOptMerkle(
+    def diffOptCurrencyRoots(
       label: String,
-      a: Option[io.constellationnetwork.merkletree.MerkleRoot],
-      b: Option[io.constellationnetwork.merkletree.MerkleRoot]
+      a: Option[io.constellationnetwork.schema.CurrencySnapshotMptRoots],
+      b: Option[io.constellationnetwork.schema.CurrencySnapshotMptRoots]
     ): Option[String] =
-      if (a === b) None else Some(s"$label(c=${a.map(shortMerkle).getOrElse("none")},l=${b.map(shortMerkle).getOrElse("none")})")
+      if (a === b) None
+      else Some(s"$label(c=${a.map(shortCurrencyRoots).getOrElse("none")},l=${b.map(shortCurrencyRoots).getOrElse("none")})")
     List(
       diffHash("lastStateChannelSnapshotHashes", computed.lastStateChannelSnapshotHashesProof, claimed.lastStateChannelSnapshotHashesProof),
       diffHash("lastTxRefs", computed.lastTxRefsProof, claimed.lastTxRefsProof),
       diffHash("balances", computed.balancesProof, claimed.balancesProof),
-      diffOptMerkle("lastCurrencySnapshots", computed.lastCurrencySnapshotsProof, claimed.lastCurrencySnapshotsProof),
+      diffOptCurrencyRoots("lastCurrencySnapshots", computed.lastCurrencySnapshotsProof, claimed.lastCurrencySnapshotsProof),
       diffOptHash("activeAllowSpends", computed.activeAllowSpends, claimed.activeAllowSpends),
       diffOptHash("activeTokenLocks", computed.activeTokenLocks, claimed.activeTokenLocks),
       diffOptHash("tokenLockBalances", computed.tokenLockBalances, claimed.tokenLockBalances),

@@ -513,23 +513,11 @@ object GlobalStateConverter {
       }
     }
 
-    // Currency snapshots encode as two separate keys (Signed[CurrencyIncrementalSnapshot] + CurrencySnapshotInfo)
-    val currencyEntriesF = info.lastCurrencySnapshots.toList.parTraverse {
-      case (metagraphAddr, Left(fullSnapshot)) =>
-        CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value).map { inc =>
-          List(
-            GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) ->
-              enc[Signed[CurrencyIncrementalSnapshot]](Signed(inc, fullSnapshot.proofs)),
-            GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) ->
-              enc[CurrencySnapshotInfo](fullSnapshot.info.toCurrencySnapshotInfo)
-          )
-        }
-      case (metagraphAddr, Right((inc, snInfo))) =>
-        List(
-          GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> enc[Signed[CurrencyIncrementalSnapshot]](inc),
-          GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> enc[CurrencySnapshotInfo](snInfo)
-        ).pure[F]
-    }
+    // Currency snapshots encode as two separate keys (Signed[CurrencyIncrementalSnapshot] + CurrencySnapshotInfo) per
+    // metagraph address. Delegated to the shared `currencySnapshotEntryBytes` so the producer and the gl1-style follow
+    // verifier (`FollowVerifyCore` / `GlobalStateConverter.currencySnapshotFieldRoots`) encode these bytes through ONE code
+    // path — byte-identity by construction, not by two implementations kept in lockstep.
+    val currencyEntriesF = currencySnapshotEntryBytes[F](info.lastCurrencySnapshots)
 
     (
       currencyEntriesF,
@@ -547,7 +535,7 @@ object GlobalStateConverter {
             lastAllowSpendRefs ++ lastTokenLockRefs ++
             activeDelegatedStakes ++ delegatedStakesWithdrawals ++
             activeNodeCollaterals ++ nodeCollateralWithdrawals ++
-            metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries ++
+            metagraphSyncData ++ currencyEntries ++ unpEntries ++ priceEntries ++
             allowSpendExpiryEntries ++ tokenLockExpiryEntries ++ ncwExpiryEntries ++
             histStakeEntries
         all.toMap
@@ -920,6 +908,72 @@ object GlobalStateConverter {
   def fieldRootFromBytes[F[_]: Parallel: Async: Hasher: JsonSerializer](fieldEntries: Map[Hex, Array[Byte]]): F[Hash] =
     if (fieldEntries.isEmpty) Hash.empty.pure[F]
     else MerklePatriciaTrie.makeParallelFromBytes[F](fieldEntries).map(_.rootHash.value)
+
+  /** Canonical typed MPT entries for the `lastCurrencySnapshots` GSI field — the EXACT producer encoding gl0 writes in
+    * [[toAllStateKeyValueBytes]] / [[convertCurrencySnapshots]]: each `Address` entry expands to TWO `metagraph`-namespaced keys,
+    * `LastIncrementalCurrencySnapshots` (fieldId 5, the `Signed[CurrencyIncrementalSnapshot]`) and `LastCurrencySnapshotInfo` (fieldId 6,
+    * the `CurrencySnapshotInfo`), each encoded via its canonical `ImmutableCodec`. A `Left` (genesis full snapshot) is reduced to its
+    * incremental form exactly as gl0 does (`CurrencyIncrementalSnapshot.fromCurrencySnapshot` + `info.toCurrencySnapshotInfo`).
+    *
+    * Factored out of [[toAllStateKeyValueBytes]] so the gl1-style follow verifier
+    * ([[io.constellationnetwork.schema.nakamoto.follow.FollowVerifyCore.verifyFieldRoots]]) recomputes the currency-snapshot subtree roots
+    * through gl0's EXACT byte-production path rather than a re-implementation — the byte-identity contract the field-root-match verify
+    * depends on (see `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`). `toAllStateKeyValueBytes`'s inline `currencyEntriesF` MUST stay
+    * in lockstep with this method.
+    *
+    * Unlike the five hypergraph-namespaced consumed fields (each a single `Hash`), `lastCurrencySnapshots` SPLITS into two MPT partition
+    * roots, carried together in the signed `GlobalSnapshotStateProof` field-4 slot `lastCurrencySnapshotsProof`
+    * (`CurrencySnapshotMptRoots`); they are also covered transitively by the global `mptRoot`. This callable exists so the follower can
+    * deterministically recompute the cl1/dl1-consumed currency-snapshot bytes byte-identically to gl0.
+    */
+  def currencySnapshotEntryBytes[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    data: SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
+  )(
+    implicit stateProofSelector: StateProofSelector
+  ): F[Map[GlobalStateKey, Array[Byte]]] = {
+    def enc[V](v: V)(implicit c: ImmutableCodec[V]): Array[Byte] = c.immutableBytes(v).toArray
+    data.toList.parTraverse {
+      case (metagraphAddr, Left(fullSnapshot)) =>
+        CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value).map { inc =>
+          List(
+            GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastIncrementalCurrencySnapshots) ->
+              enc[Signed[CurrencyIncrementalSnapshot]](Signed(inc, fullSnapshot.proofs)),
+            GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastCurrencySnapshotInfo) ->
+              enc[CurrencySnapshotInfo](fullSnapshot.info.toCurrencySnapshotInfo)
+          )
+        }
+      case (metagraphAddr, Right((inc, snInfo))) =>
+        List(
+          GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastIncrementalCurrencySnapshots) ->
+            enc[Signed[CurrencyIncrementalSnapshot]](inc),
+          GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastCurrencySnapshotInfo) ->
+            enc[CurrencySnapshotInfo](snInfo)
+        ).pure[F]
+    }.map(_.flatten.toMap)
+
+  }
+
+  /** The pair of MPT subtree roots `(LastIncrementalCurrencySnapshots, LastCurrencySnapshotInfo)` for a `lastCurrencySnapshots` map,
+    * computed by encoding via [[currencySnapshotEntryBytes]] (gl0's exact producer bytes), grouping by `fieldId`, hexing the keys, and
+    * routing each group through [[fieldRootFromBytes]] — the SAME callable that backs every other per-field root. Empty map ⇒ `(Hash.empty,
+    * Hash.empty)` (the [[fieldRootFromBytes]] empty convention). Used by the follow verifier to recompute-match the cl1/dl1-consumed
+    * `lastCurrencySnapshots` field deterministically.
+    */
+  def currencySnapshotFieldRoots[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    data: SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
+  )(
+    implicit stateProofSelector: StateProofSelector
+  ): F[(Hash, Hash)] =
+    currencySnapshotEntryBytes[F](data).flatMap { typed =>
+      def rootForField(fieldId: GlobalStateFieldId): F[Hash] =
+        typed.toList.filter { case (k, _) => k.fieldId == fieldId }.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }
+          .map(_.toMap)
+          .flatMap(fieldRootFromBytes[F])
+      (
+        rootForField(GlobalStateFieldId.LastIncrementalCurrencySnapshots),
+        rootForField(GlobalStateFieldId.LastCurrencySnapshotInfo)
+      ).tupled
+    }
 
   object syntax {
     implicit class GlobalSnapshotInfoMptOps(val info: GlobalSnapshotInfo) extends AnyVal {

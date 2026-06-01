@@ -7,6 +7,7 @@ import cats.{Eq, Parallel}
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot, CurrencySnapshotInfo}
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
@@ -29,6 +30,7 @@ import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{i
 import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.{immutableCodec => txRefImmutable}
 
 import io.circe._
+import io.circe.disjunctionCodecs._
 import io.circe.syntax._
 import scodec.bits.ByteVector
 
@@ -102,15 +104,28 @@ final class ConsumedFieldState private (
   val lastTxRefs: SortedMap[Address, TransactionReference],
   val lastAllowSpendRefs: SortedMap[Address, AllowSpendReference],
   val lastTokenLockRefs: SortedMap[Address, TokenLockReference],
-  val activeTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+  val activeTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+  // 6th consumed field — cl1/dl1 ONLY (gl1 leaves it empty). The metagraph's OWN currency-genesis bootstrap reads
+  // `globalState.lastCurrencySnapshots.get(identifier)` (CurrencySnapshotProcessor); gl1 never reads it. Address-keyed,
+  // value type identical to `GlobalSnapshotInfo.lastCurrencySnapshots`. See `LastCurrencySnapshots` below.
+  val lastCurrencySnapshots: ConsumedFieldState.LastCurrencySnapshots
 ) {
   override def toString: String =
     s"ConsumedFieldState(balances=${balances.size}, lastTxRefs=${lastTxRefs.size}, " +
       s"lastAllowSpendRefs=${lastAllowSpendRefs.size}, lastTokenLockRefs=${lastTokenLockRefs.size}, " +
-      s"activeTokenLocks=${activeTokenLocks.size})"
+      s"activeTokenLocks=${activeTokenLocks.size}, lastCurrencySnapshots=${lastCurrencySnapshots.size})"
 }
 
 object ConsumedFieldState {
+
+  /** The `lastCurrencySnapshots` value shape — IDENTICAL to `GlobalSnapshotInfo.lastCurrencySnapshots`. Shape-different from the five
+    * uniform-`Hash` fields: per `Address` the value is the metagraph's latest currency snapshot, either a `Left` (genesis full snapshot) or
+    * a `Right((incremental, info))`. In gl0's MPT it is SPLIT into two `metagraph`-namespaced sub-keys (`LastIncrementalCurrencySnapshots`
+    * + `LastCurrencySnapshotInfo`), so its recompute-and-match is shape-aware (see [[FollowVerifyCore.verifyFieldRoots]],
+    * `currencySnapshotsRoots`).
+    */
+  type LastCurrencySnapshots =
+    SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
 
   val empty: ConsumedFieldState =
     new ConsumedFieldState(
@@ -118,7 +133,8 @@ object ConsumedFieldState {
       SortedMap.empty[Address, TransactionReference],
       SortedMap.empty[Address, AllowSpendReference],
       SortedMap.empty[Address, TokenLockReference],
-      SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
+      SortedMap.empty[Address, SortedSet[Signed[TokenLock]]],
+      SortedMap.empty: LastCurrencySnapshots
     )
 
   /** Sole builder — `private[follow]` so only the verifier in this compilation unit can call it. Mirrors the `Verified` private-constructor
@@ -129,9 +145,10 @@ object ConsumedFieldState {
     lastTxRefs: SortedMap[Address, TransactionReference],
     lastAllowSpendRefs: SortedMap[Address, AllowSpendReference],
     lastTokenLockRefs: SortedMap[Address, TokenLockReference],
-    activeTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+    activeTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    lastCurrencySnapshots: LastCurrencySnapshots
   ): ConsumedFieldState =
-    new ConsumedFieldState(balances, lastTxRefs, lastAllowSpendRefs, lastTokenLockRefs, activeTokenLocks)
+    new ConsumedFieldState(balances, lastTxRefs, lastAllowSpendRefs, lastTokenLockRefs, activeTokenLocks, lastCurrencySnapshots)
 }
 
 /** The per-key-inclusion (S1) view of the consumed-field slice, keyed by the MPT '''leaf path''' (`Hex`). Produced by
@@ -194,6 +211,12 @@ final case class ConsumedFieldDelta(
   lastAllowSpendRefs: SortedMap[Address, AllowSpendReference],
   lastTokenLockRefs: SortedMap[Address, TokenLockReference],
   activeTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+  // 6th consumed field (cl1/dl1 ONLY; empty for gl1). Address-keyed currency-snapshot map, same shape as
+  // `GlobalSnapshotInfo.lastCurrencySnapshots` / [[ConsumedFieldState.LastCurrencySnapshots]]. Carried as a typed map (not
+  // bytes); the verifier re-encodes via gl0's exact `GlobalStateConverter.currencySnapshotEntryBytes`. Under the locked
+  // latest-finalized Transfer model every entry is an upsert; the diff/removals machinery still supports an incremental delta.
+  // Defaulted to empty so existing named-arg / gl1 constructions (which never set it) stay source-compatible — additive.
+  lastCurrencySnapshots: ConsumedFieldState.LastCurrencySnapshots = SortedMap.empty,
   removals: SortedMap[GlobalStateFieldId, Set[Address]]
 )
 
@@ -206,6 +229,7 @@ object ConsumedFieldDelta {
       SortedMap.empty[Address, AllowSpendReference],
       SortedMap.empty[Address, TokenLockReference],
       SortedMap.empty[Address, SortedSet[Signed[TokenLock]]],
+      SortedMap.empty: ConsumedFieldState.LastCurrencySnapshots,
       SortedMap.empty[GlobalStateFieldId, Set[Address]]
     )
 
@@ -228,7 +252,10 @@ object ConsumedFieldDelta {
         GlobalStateFieldId.LastTxRefs -> removed(prev.lastTxRefs, curr.lastTxRefs),
         GlobalStateFieldId.LastAllowSpendRefs -> removed(prev.lastAllowSpendRefs, curr.lastAllowSpendRefs),
         GlobalStateFieldId.LastTokenLockRefs -> removed(prev.lastTokenLockRefs, curr.lastTokenLockRefs),
-        GlobalStateFieldId.ActiveTokenLocks -> removed(prev.activeTokenLocks, curr.activeTokenLocks)
+        GlobalStateFieldId.ActiveTokenLocks -> removed(prev.activeTokenLocks, curr.activeTokenLocks),
+        // `LastCurrencySnapshots` (fieldId 3) is the LOGICAL removal key for the currency-snapshot map; the verifier applies
+        // it to the Address-keyed map BEFORE re-encoding to the fieldId-5/6 MPT sub-keys, so the logical-field key is correct.
+        GlobalStateFieldId.LastCurrencySnapshots -> removed(prev.lastCurrencySnapshots, curr.lastCurrencySnapshots)
       ).filter { case (_, addrs) => addrs.nonEmpty }
     ConsumedFieldDelta(
       balances = upserts(prev.balances, curr.balances),
@@ -236,6 +263,7 @@ object ConsumedFieldDelta {
       lastAllowSpendRefs = upserts(prev.lastAllowSpendRefs, curr.lastAllowSpendRefs),
       lastTokenLockRefs = upserts(prev.lastTokenLockRefs, curr.lastTokenLockRefs),
       activeTokenLocks = upserts(prev.activeTokenLocks, curr.activeTokenLocks),
+      lastCurrencySnapshots = upserts(prev.lastCurrencySnapshots, curr.lastCurrencySnapshots),
       removals = removalsByField
     )
   }
@@ -255,6 +283,7 @@ object ConsumedFieldDelta {
       "lastAllowSpendRefs" -> d.lastAllowSpendRefs.asJson,
       "lastTokenLockRefs" -> d.lastTokenLockRefs.asJson,
       "activeTokenLocks" -> d.activeTokenLocks.asJson,
+      "lastCurrencySnapshots" -> d.lastCurrencySnapshots.asJson,
       "removals" -> d.removals.asJson
     )
 
@@ -265,8 +294,14 @@ object ConsumedFieldDelta {
       lastAllowSpendRefs <- c.downField("lastAllowSpendRefs").as[SortedMap[Address, AllowSpendReference]]
       lastTokenLockRefs <- c.downField("lastTokenLockRefs").as[SortedMap[Address, TokenLockReference]]
       activeTokenLocks <- c.downField("activeTokenLocks").as[SortedMap[Address, SortedSet[Signed[TokenLock]]]]
+      // 6th field. Absent on a gl1-produced payload (gl1 never sets it) — default to empty so a gl1 slice still decodes.
+      lastCurrencySnapshots <- c
+        .downField("lastCurrencySnapshots")
+        .as[Option[ConsumedFieldState.LastCurrencySnapshots]]
+        .map(_.getOrElse(SortedMap.empty: ConsumedFieldState.LastCurrencySnapshots))
       removals <- c.downField("removals").as[SortedMap[GlobalStateFieldId, Set[Address]]]
-    } yield ConsumedFieldDelta(balances, lastTxRefs, lastAllowSpendRefs, lastTokenLockRefs, activeTokenLocks, removals)
+    } yield
+      ConsumedFieldDelta(balances, lastTxRefs, lastAllowSpendRefs, lastTokenLockRefs, activeTokenLocks, lastCurrencySnapshots, removals)
 
   // Structural Eq via the canonical JSON encoding — byte-stable (sorted maps, deterministic field order),
   // same approach `GlobalFollowProof` uses. For test assertions / dedup, never control flow.
@@ -351,6 +386,26 @@ object FollowVerifyCore {
     *      [[Hash.empty]], matching gl0's `getOrElse(_, Hash.empty)` default), else [[FollowVerificationError.FieldRootMismatch]].
     *   a. '''assemble + wrap''' — return `Right(Verified(ConsumedFieldState(<post-state maps>)))`.
     *
+    * '''The 6th field — `lastCurrencySnapshots` (cl1/dl1 only; `currencySnapshotsRoots`).''' gl1 consumes only the five uniform-`Hash`
+    * hypergraph fields above and passes `currencySnapshotsRoots = None`, so its path is unchanged (the currency map stays empty and is
+    * never checked). cl1/dl1 ALSO need `lastCurrencySnapshots` (the metagraph's own currency-genesis bootstrap reads
+    * `globalState.lastCurrencySnapshots.get(identifier)`), which is SHAPE-DIFFERENT: in gl0's MPT it splits per `Address` into TWO
+    * `metagraph`-namespaced sub-keys (`LastIncrementalCurrencySnapshots` fieldId 5 + `LastCurrencySnapshotInfo` fieldId 6), so it has TWO
+    * per-fieldId subtree roots. These ARE carried in the signed `GlobalSnapshotStateProof` field-4 slot `lastCurrencySnapshotsProof` (typed
+    * as `Option[CurrencySnapshotMptRoots]` on V2 — the same slot that held the legacy `Option[MerkleRoot]` on V1). So when
+    * `currencySnapshotsCheck` is `Some(check)` the verifier applies the currency delta on `prior.lastCurrencySnapshots` and runs `check` on
+    * the resulting post-state map; the cl1/dl1 caller
+    * ([[io.constellationnetwork.currency.l1.domain.snapshot.programs.CurrencySnapshotProcessor]]) supplies a closure that recomputes BOTH
+    * subtree roots of the applied post-state via gl0's exact [[GlobalStateConverter.currencySnapshotFieldRoots]] (reusing gl0's exact
+    * [[GlobalStateConverter.currencySnapshotEntryBytes]] + [[GlobalStateConverter.fieldRootFromBytes]]) and matches them against the SIGNED
+    * `lastCurrencySnapshotsProof` field-4 roots, surfacing [[FollowVerificationError.FieldRootMismatch]] on fieldId 5 or 6 if
+    * delta-application did not reproduce the consensus-anchored root. This is a TRUE Byzantine anchor SYMMETRIC with the five
+    * uniform-`Hash` fields (recompute-vs-SIGNED, correct-by-construction) — superseding the prior recompute-vs-producer-claimed-map guard.
+    * Injecting the check as a closure keeps the `StateProofSelector` that the currency recompute needs (for the genesis `Left` case via
+    * `CurrencyIncrementalSnapshot.fromCurrencySnapshot`) OUT of this core and out of the gl1 path — gl1 passes `None`, so its signature,
+    * behavior, and tests are untouched. The post-state currency map is carried into the returned [[ConsumedFieldState]] regardless (it is
+    * the value cl1/dl1 read). See `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`.
+    *
     * Note the [[Async]]`/`[[Parallel]]`/`[[JsonSerializer]] constraints (vs [[verifyConsumedFields]]'s `Async: Hasher`): recomputing a
     * subtree root rebuilds an MPT from bytes via `MerklePatriciaTrie.makeParallelFromBytes`, which needs them, and `GlobalStateKey.toHex`
     * needs a [[Hasher]]. This is required to reuse gl0's exact `fieldRootFromBytes` + key derivation rather than re-implementing them.
@@ -358,7 +413,8 @@ object FollowVerifyCore {
   def verifyFieldRoots[F[_]: Async: Parallel: Hasher: JsonSerializer](
     prior: ConsumedFieldState,
     delta: ConsumedFieldDelta,
-    signedFieldRoots: SortedMap[GlobalStateFieldId, Hash]
+    signedFieldRoots: SortedMap[GlobalStateFieldId, Hash],
+    currencySnapshotsCheck: Option[ConsumedFieldState.LastCurrencySnapshots => F[Either[FollowVerificationError, Unit]]] = None
   ): F[Either[FollowVerificationError, Verified[ConsumedFieldState]]] = {
     // (a) apply: removals first, then upserts (upsert-wins, matches `MerklePatriciaTrie.withChanges`).
     // Explicit foldLeft (not `++`) so the upsert-wins merge is intentional, satisfying NoMapConcat.
@@ -372,6 +428,9 @@ object FollowVerifyCore {
     val postAllowSpendRefs = applyField(prior.lastAllowSpendRefs, delta.lastAllowSpendRefs, GlobalStateFieldId.LastAllowSpendRefs)
     val postTokenLockRefs = applyField(prior.lastTokenLockRefs, delta.lastTokenLockRefs, GlobalStateFieldId.LastTokenLockRefs)
     val postActiveTokenLocks = applyField(prior.activeTokenLocks, delta.activeTokenLocks, GlobalStateFieldId.ActiveTokenLocks)
+    // 6th field — logical removal key is `LastCurrencySnapshots` (fieldId 3); applied before the MPT 5/6 re-encoding.
+    val postCurrencySnapshots: ConsumedFieldState.LastCurrencySnapshots =
+      applyField(prior.lastCurrencySnapshots, delta.lastCurrencySnapshots, GlobalStateFieldId.LastCurrencySnapshots)
 
     // (b) forward-hash one field's Address-keyed post-state into the MPT `(leaf-path Hex → value bytes)` map,
     // using the EXACT key derivation + value encoding gl0's MPT writer uses (see `toAllStateKeyValueBytes`).
@@ -394,13 +453,24 @@ object FollowVerifyCore {
           }
       )
 
+    // 6th-field shape-aware check (cl1/dl1 only): run the caller-injected closure over the applied post-state currency map.
+    // The closure recomputes the two currency-snapshot subtree roots (fieldId 5 + 6) via gl0's EXACT producer encoding +
+    // `fieldRootFromBytes` and matches them against the roots of the producer's claimed full currency map. No-op when the check
+    // is None (the gl1 path) — keeps the `StateProofSelector` the recompute needs out of this core and off gl1.
+    val checkCurrencySnapshots: EitherT[F, FollowVerificationError, Unit] =
+      currencySnapshotsCheck match {
+        case None        => EitherT.rightT[F, FollowVerificationError](())
+        case Some(check) => EitherT(check(postCurrencySnapshots))
+      }
+
     val checkAll: F[Either[FollowVerificationError, Unit]] =
       (
         checkField[Balance](GlobalStateFieldId.Balances, postBalances) >>
           checkField[TransactionReference](GlobalStateFieldId.LastTxRefs, postTxRefs) >>
           checkField[AllowSpendReference](GlobalStateFieldId.LastAllowSpendRefs, postAllowSpendRefs) >>
           checkField[TokenLockReference](GlobalStateFieldId.LastTokenLockRefs, postTokenLockRefs) >>
-          checkField[SortedSet[Signed[TokenLock]]](GlobalStateFieldId.ActiveTokenLocks, postActiveTokenLocks)
+          checkField[SortedSet[Signed[TokenLock]]](GlobalStateFieldId.ActiveTokenLocks, postActiveTokenLocks) >>
+          checkCurrencySnapshots
       ).value
 
     checkAll.map {
@@ -408,10 +478,51 @@ object FollowVerifyCore {
       case Right(()) =>
         Verified
           .makeInternal(
-            ConsumedFieldState.make(postBalances, postTxRefs, postAllowSpendRefs, postTokenLockRefs, postActiveTokenLocks)
+            ConsumedFieldState
+              .make(postBalances, postTxRefs, postAllowSpendRefs, postTokenLockRefs, postActiveTokenLocks, postCurrencySnapshots)
           )
           .asRight[FollowVerificationError]
     }
+  }
+
+  /** Build the cl1/dl1 6th-field check closure for [[verifyFieldRoots]] / [[GlobalFollowMirrorVerifier.verifyByFieldRoot]].
+    *
+    * `signedRoots` is the SIGNED field-4 `lastCurrencySnapshotsProof` from the snapshot's `GlobalSnapshotStateProof` — the TWO
+    * consensus-anchored currency MPT partition roots (`incrementalRoot` = fieldId 5, `infoRoot` = fieldId 6), or `None` when the snapshot's
+    * currency map is empty (the producer emits `None` only in that case, where both subtree roots would be [[Hash.empty]]). The returned
+    * closure receives the verifier's APPLIED post-state currency map and:
+    *   a. recomputes both subtree roots (`LastIncrementalCurrencySnapshots` fieldId 5, `LastCurrencySnapshotInfo` fieldId 6) of the applied
+    *      post-state via gl0's exact [[GlobalStateConverter.currencySnapshotFieldRoots]] (reusing gl0's exact `currencySnapshotEntryBytes`
+    *      + `fieldRootFromBytes` — byte-identical to the producer);
+    *   a. asserts each equals the corresponding SIGNED root (`signedRoots` if `Some`, else `Hash.empty` — the empty-map convention) — else
+    *      [[FollowVerificationError.FieldRootMismatch]] on fieldId 5 or 6.
+    *
+    * This makes `lastCurrencySnapshots` a TRUE Byzantine anchor SYMMETRIC with the five uniform-`Hash` consumed fields
+    * (recompute-vs-SIGNED, correct-by-construction) — superseding the prior recompute-vs-producer-claimed-map guard, which bound only to
+    * the (unsigned) served map. It carries the [[StateProofSelector]] the currency recompute needs (genesis `Left` case via
+    * `CurrencyIncrementalSnapshot.fromCurrencySnapshot`) on the cl1/dl1 side only, keeping gl1 + the pure core decoupled from it (gl1
+    * passes `None`).
+    */
+  def currencySnapshotsCheck[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    signedRoots: Option[io.constellationnetwork.schema.CurrencySnapshotMptRoots]
+  )(
+    implicit stateProofSelector: io.constellationnetwork.schema.StateProofSelector
+  ): ConsumedFieldState.LastCurrencySnapshots => F[Either[FollowVerificationError, Unit]] = {
+    val expInc: Hash = signedRoots.map(_.incrementalRoot).getOrElse(Hash.empty)
+    val expInfo: Hash = signedRoots.map(_.infoRoot).getOrElse(Hash.empty)
+    (postState: ConsumedFieldState.LastCurrencySnapshots) =>
+      GlobalStateConverter.currencySnapshotFieldRoots[F](postState).map {
+        case (postInc, postInfo) =>
+          if (postInc =!= expInc)
+            (FollowVerificationError
+              .FieldRootMismatch(GlobalStateFieldId.LastIncrementalCurrencySnapshots, expInc, postInc): FollowVerificationError)
+              .asLeft[Unit]
+          else if (postInfo =!= expInfo)
+            (FollowVerificationError
+              .FieldRootMismatch(GlobalStateFieldId.LastCurrencySnapshotInfo, expInfo, postInfo): FollowVerificationError)
+              .asLeft[Unit]
+          else ().asRight[FollowVerificationError]
+      }
   }
 
   def verifyConsumedFields[F[_]: Async: Hasher](

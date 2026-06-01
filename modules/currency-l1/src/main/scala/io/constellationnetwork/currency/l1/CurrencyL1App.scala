@@ -1,5 +1,6 @@
 package io.constellationnetwork.currency.l1
 
+import cats.effect.kernel.Ref
 import cats.effect.{IO, Resource}
 import cats.syntax.all._
 
@@ -32,6 +33,7 @@ import io.constellationnetwork.node.shared.resources.MkHttpServer.ServerName
 import io.constellationnetwork.node.shared.{NodeSharedOrSharedRegistrationIdRange, nodeSharedKryoRegistrar}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.cluster.ClusterId
+import io.constellationnetwork.schema.nakamoto.follow.ConsumedFieldState
 import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.node.NodeState.SessionStarted
 import io.constellationnetwork.schema.semver.{MetagraphVersion, TessellationVersion}
@@ -155,6 +157,10 @@ abstract class CurrencyL1App(
           Hasher.forKryo[IO],
           sharedStorages
         )
+      // CUTOVER (mirrors gl1's dag-l1 Main): the follower's verified-mirror Ref `(lastVerifiedTip, ConsumedFieldState)`, created
+      // ONCE here and threaded into the processor so it persists across follow ticks. `None` cold start ⇒ first tick fetches the
+      // FULL slice; thereafter the #287 incremental diff since the held tip, with full-fetch fallback on any verify miss / reset.
+      followMirrorRef <- Ref.of[IO, Option[(SnapshotOrdinal, ConsumedFieldState)]](none).asResource
       snapshotProcessor = CurrencySnapshotProcessor.make(
         method.identifier,
         storages.address,
@@ -163,7 +169,6 @@ abstract class CurrencyL1App(
         sharedStorages.lastNGlobalSnapshot,
         storages.lastSnapshot,
         storages.transaction,
-        sharedServices.globalSnapshotContextFns,
         sharedServices.currencySnapshotContextFns,
         cfg.transactionLimit,
         sharedConfig.allowSpends,
@@ -174,7 +179,8 @@ abstract class CurrencyL1App(
         services.globalL0.pullGlobalSnapshot,
         services.globalL0,
         storages.globalL0Alignment,
-        sharedStorages.mptStore
+        sharedStorages.mptStore,
+        followMirrorRef
       )
       programs = Programs
         .make[IO, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotInfo, Run](

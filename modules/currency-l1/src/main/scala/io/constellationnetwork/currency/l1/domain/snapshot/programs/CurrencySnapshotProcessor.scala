@@ -2,13 +2,17 @@ package io.constellationnetwork.currency.l1.domain.snapshot.programs
 
 import cats.data.{NonEmptyList, Validated, ValidatedNel}
 import cats.effect.Async
+import cats.effect.kernel.Ref
 import cats.effect.std.Random
 import cats.syntax.all._
 import cats.{Applicative, Parallel}
 
+import scala.collection.immutable.SortedMap
+
 import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.dag.l1.domain.address.storage.AddressStorage
 import io.constellationnetwork.dag.l1.domain.block.BlockStorage
+import io.constellationnetwork.dag.l1.domain.snapshot.programs.DAGSnapshotProcessor.FollowSliceVerificationError
 import io.constellationnetwork.dag.l1.domain.snapshot.programs.SnapshotProcessor
 import io.constellationnetwork.dag.l1.domain.snapshot.programs.SnapshotProcessor._
 import io.constellationnetwork.dag.l1.domain.transaction.{ContextualTransactionValidator, TransactionLimitConfig, TransactionStorage}
@@ -16,6 +20,7 @@ import io.constellationnetwork.dag.l1.infrastructure.address.storage.AddressStor
 import io.constellationnetwork.json.{JsonBrotliBinarySerializer, JsonSerializer}
 import io.constellationnetwork.node.shared.config.types.{AllowSpendsConfig, LastGlobalSnapshotsSyncConfig, TokenLocksConfig}
 import io.constellationnetwork.node.shared.domain.globalAlignment.GlobalL0AlignmentStorage
+import io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowMirrorVerifier
 import io.constellationnetwork.node.shared.domain.snapshot.services.GlobalL0Service
 import io.constellationnetwork.node.shared.domain.snapshot.storage._
 import io.constellationnetwork.node.shared.domain.snapshot.{SnapshotContextFunctions, Validator}
@@ -25,10 +30,12 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.LastS
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.nakamoto.follow._
 import io.constellationnetwork.schema.swap.{AllowSpendReference, CurrencyId}
 import io.constellationnetwork.schema.tokenLock.TokenLockReference
 import io.constellationnetwork.schema.transaction.TransactionReference
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.Signed.InvalidSignatureForHash
 import io.constellationnetwork.security.{Hashed, Hasher, SecurityProvider}
@@ -54,7 +61,6 @@ object CurrencySnapshotProcessor {
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     lastCurrencySnapshotStorage: LastSnapshotStorage[F, CurrencyIncrementalSnapshot, CurrencySnapshotInfo],
     transactionStorage: TransactionStorage[F],
-    globalSnapshotContextFns: SnapshotContextFunctions[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     currencySnapshotContextFns: SnapshotContextFunctions[F, CurrencyIncrementalSnapshot, CurrencySnapshotContext],
     transactionLimitConfig: TransactionLimitConfig,
     allowSpendsConfig: AllowSpendsConfig,
@@ -65,7 +71,18 @@ object CurrencySnapshotProcessor {
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     l0Service: GlobalL0Service[F],
     globalL0AlignmentStorage: GlobalL0AlignmentStorage[F],
-    mptStore: MptStore[F, GlobalStateKey]
+    mptStore: MptStore[F, GlobalStateKey],
+    // CUTOVER (mirrors gl1's `DAGSnapshotProcessor`): the follower's verified-mirror Ref `(lastVerifiedTip, ConsumedFieldState)`
+    // for the gl0 own-slice follow path (#287 "send diffs"). Created ONCE at the cl1/dl1 construction site (`CurrencyL1App`).
+    // `None` on cold start ⇒ next tick fetches the FULL slice; thereafter the incremental diff since the held tip. ANY verify
+    // failure RESETS it to `None` so the next tick re-fetches a full from-empty slice — never regresses the safety invariant.
+    followMirrorRef: Ref[F, Option[(SnapshotOrdinal, ConsumedFieldState)]]
+  )(
+    // Captured in the processor instance so `applyGlobalSnapshotFn` can build the cl1/dl1 6th-field (`lastCurrencySnapshots`)
+    // check closure, which needs it for `CurrencyIncrementalSnapshot.fromCurrencySnapshot` (genesis `Left` case). The trait's
+    // `applyGlobalSnapshotFn` override signature is fixed at `(implicit hasher)`, so the selector is threaded via the closure
+    // environment here rather than the method's implicit list.
+    implicit globalStateProofSelector: GlobalStateProofSelector
   ): CurrencySnapshotProcessor[F] =
     new CurrencySnapshotProcessor[F] {
       def process(
@@ -174,18 +191,102 @@ object CurrencySnapshotProcessor {
             }
         }
 
+      private val followLogger = Slf4jLogger.getLoggerFromName[F]("io.constellationnetwork.currency.l1.GlobalFollow")
+
+      // CUTOVER (mirrors gl1's `DAGSnapshotProcessor.applyGlobalSnapshotFn`, S3b′): cl1/dl1 no longer re-execute the finalized gl0
+      // snapshot (`globalSnapshotContextFns.createContext → GSAM.accept`) to derive the global state. That full re-derivation
+      // re-hashes the whole signed `GlobalIncrementalSnapshot` and re-walks the entire global MPT — the path that DEADLOCKED at
+      // ordinal 256 with `Signed$InvalidSignatureForHash` (the PULL re-hash) / stormed on `StateProofMismatch` over fields cl1/dl1
+      // never read.
+      //
+      // Instead it FETCHES gl0's latest-finalized consumed-field SLICE (`l0Service.getLatestFollowSlice` / the #287 incremental
+      // `getFollowSliceSince`), VERIFIES it by field-root equality against the signed snapshot AT THE SLICE'S OWN ordinal (resolved
+      // from cl1/dl1's OWN local lastN store — no peer re-pull), and BUILDS a partial `GlobalSnapshotInfo` populated with the SIX
+      // fields cl1/dl1 read: the five Address-keyed consumed fields (balances, lastTxRefs, lastAllowSpendRefs, lastTokenLockRefs,
+      // activeTokenLocks) PLUS `lastCurrencySnapshots` (the metagraph's own currency-genesis bootstrap reads
+      // `globalState.lastCurrencySnapshots.get(identifier)` in `processCurrencySnapshots`). All other GSI fields stay empty.
+      //
+      // The 6th field carries its SIGNED per-field roots in the live MPT-format `GlobalSnapshotStateProof` field-4 slot
+      // (`lastCurrencySnapshotsProof`, the two MPT subtree roots — `LastIncrementalCurrencySnapshots` + `LastCurrencySnapshotInfo`, also
+      // covered transitively by the global `mptRoot`). It is verified by a recompute against that SIGNED anchor:
+      // `FollowVerifyCore.currencySnapshotsCheck` recomputes both subtree roots of the applied post-state via gl0's EXACT
+      // `GlobalStateConverter.currencySnapshotFieldRoots` and asserts delta-application reproduced the signed roots. The five Hash-rooted fields keep their full
+      // signed-root cryptographic match (`GlobalFollowMirrorVerifier`); the currency-genesis state's cryptographic trust additionally
+      // rests on its downstream `toHashedWithSignatureCheck` (`fetchCurrencySnapshots`) + finalized-GSI sourcing.
+      //
+      // A verify failure / unavailable slice raises the retryable `FollowSliceVerificationError`, which the batch loop logs + skips
+      // WITHOUT `shouldRedownload` (no recovery storm) — cl1/dl1 retry next tick. Same alignment/catch-up semantics as gl1.
       def applyGlobalSnapshotFn(
-        lastState: GlobalSnapshotInfo,
-        lastSnapshot: Signed[GlobalIncrementalSnapshot],
-        snapshot: Signed[GlobalIncrementalSnapshot],
+        lastGlobalState: GlobalSnapshotInfo,
+        lastGlobalSnapshot: Signed[GlobalIncrementalSnapshot],
+        globalSnapshot: Signed[GlobalIncrementalSnapshot],
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
-      )(implicit hasher: Hasher[F]): F[GlobalSnapshotInfo] =
-        globalSnapshotContextFns.createContext(
-          lastState,
-          lastSnapshot,
-          snapshot,
-          getGlobalSnapshotByOrdinal
-        )
+      )(implicit hasher: Hasher[F]): F[GlobalSnapshotInfo] = {
+        val verifier = GlobalFollowMirrorVerifier.make[F]
+
+        // The signed per-field roots for the snapshot at the slice's own ordinal, resolved from cl1/dl1's OWN LOCAL state (no peer
+        // re-pull): if the slice is at the ordinal being processed (N == M) use the in-hand snapshot's stateProof; otherwise look up
+        // the local finalized snapshot at the slice ordinal in `lastNGlobalSnapshotStorage` and take ITS stateProof. `None` (M not
+        // yet followed) defers this tick and resolves once the follow reaches M.
+        def signedRootsAt(sliceOrdinal: SnapshotOrdinal): F[Option[GlobalSnapshotStateProof]] =
+          if (sliceOrdinal === globalSnapshot.value.ordinal)
+            globalSnapshot.value.stateProof.some.pure[F]
+          else
+            lastNGlobalSnapshotStorage.getByOrdinal(sliceOrdinal).map(_.map(_.signed.value.stateProof))
+
+        followMirrorRef.get.flatMap { mirror =>
+          val fetch: F[Option[GlobalFollowSliceResponse]] = mirror match {
+            case Some((heldTip, _)) => l0Service.getFollowSliceSince(heldTip)
+            case None               => l0Service.getLatestFollowSlice
+          }
+          fetch.flatMap {
+            case None =>
+              FollowSliceVerificationError(
+                s"no follow slice available while processing ordinal=${globalSnapshot.value.ordinal.show}"
+              ).raiseError[F, GlobalSnapshotInfo]
+            case Some(GlobalFollowSliceResponse(sliceOrdinal, slice, baseOrdinal)) =>
+              val prior = mirror match {
+                case Some((heldTip, st)) if baseOrdinal.contains(heldTip) => st
+                case _                                                    => ConsumedFieldState.empty
+              }
+              signedRootsAt(sliceOrdinal).flatMap {
+                case None =>
+                  FollowSliceVerificationError(
+                    s"local finalized snapshot at slice ordinal=${sliceOrdinal.show} not yet followed " +
+                      s"(processing ordinal=${globalSnapshot.value.ordinal.show}) — deferring slice verify"
+                  ).raiseError[F, GlobalSnapshotInfo]
+                case Some(stateProof) =>
+                  verifier
+                    .verifyByFieldRoot(
+                      prior,
+                      sliceOrdinal,
+                      slice,
+                      signedFieldRoots(stateProof),
+                      // The 6th field is now anchored to the SIGNED currency-snapshots roots in the snapshot's stateProof
+                      // (`lastCurrencySnapshotsProof`, the field-4 currency MPT partition roots) — a TRUE Byzantine anchor symmetric with
+                      // the five Hash fields, instead of recompute-vs-producer-served-map. `None` (empty currency map) ⇒ both expected roots
+                      // are `Hash.empty`.
+                      FollowVerifyCore.currencySnapshotsCheck[F](stateProof.lastCurrencySnapshotsProof).some
+                    )
+                    .flatMap {
+                      case Right(verified) =>
+                        followMirrorRef.set((sliceOrdinal, verified.value).some) >>
+                          consumedFieldsToGlobalSnapshotInfo(verified.value).pure[F]
+                      case Left(err) =>
+                        followMirrorRef.set(none) >>
+                          followLogger.warn(
+                            s"follow-slice verify FAILED at sliceOrdinal=${sliceOrdinal.show} " +
+                              s"(processing ordinal=${globalSnapshot.value.ordinal.show}, base=${baseOrdinal.map(_.show).getOrElse("none")}): " +
+                              s"${describe(err)} — resetting follow mirror, not advancing"
+                          ) >>
+                          FollowSliceVerificationError(
+                            s"follow-slice verify failed at ordinal=${sliceOrdinal.show}: ${describe(err)}"
+                          ).raiseError[F, GlobalSnapshotInfo]
+                    }
+              }
+          }
+        }
+      }
 
       def applySnapshotFn(
         lastState: CurrencySnapshotInfo,
@@ -218,6 +319,9 @@ object CurrencySnapshotProcessor {
             s"cl1 onRedownload firing for currency snapshot ord=${snapshot.ordinal.show} — destructive replaceByRefs path " +
               s"should be unreachable under finality-gating (#122); investigate"
           ) >>
+          // CUTOVER: a redownload/recovery rebuilds the follower's consumed-field storage, so the diff mirror's held
+          // `(tip, state)` is no longer a valid base — RESET it so the next follow tick re-fetches a FULL from-empty slice.
+          followMirrorRef.set(none) >>
           allowSpendStorage.replaceByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
           tokenLockStorage.replaceByRefs(state.lastTokenLockRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal)
 
@@ -406,4 +510,47 @@ object CurrencySnapshotProcessor {
           case None => Async[F].pure(none)
         }
     }
+
+  /** Map the snapshot's `stateProof` per-field roots onto the five uniform-`Hash` [[GlobalStateFieldId]]s, in the shape
+    * [[GlobalFollowMirrorVerifier.verifyByFieldRoot]] expects. Identical to gl1's `DAGSnapshotProcessor.signedFieldRoots`: `Balances` /
+    * `LastTxRefs` are always-present; the three `Option[Hash]` fields omit `None` (the verifier treats an absent field as [[Hash.empty]],
+    * matching gl0's `getOrElse(_, Hash.empty)`). The 6th field (`lastCurrencySnapshots`) is NOT here — it has no per-field root slot and is
+    * verified by the injected `currencySnapshotsCheck` recompute instead.
+    */
+  private def signedFieldRoots(stateProof: GlobalSnapshotStateProof): SortedMap[GlobalStateFieldId, Hash] =
+    SortedMap.from(
+      List(
+        Some(GlobalStateFieldId.Balances -> stateProof.balancesProof),
+        Some(GlobalStateFieldId.LastTxRefs -> stateProof.lastTxRefsProof),
+        stateProof.lastAllowSpendRefs.map(GlobalStateFieldId.LastAllowSpendRefs -> _),
+        stateProof.lastTokenLockRefs.map(GlobalStateFieldId.LastTokenLockRefs -> _),
+        stateProof.activeTokenLocks.map(GlobalStateFieldId.ActiveTokenLocks -> _)
+      ).flatten
+    )
+
+  /** Build a `GlobalSnapshotInfo` populated with the SIX fields cl1/dl1 consume from a verified [[ConsumedFieldState]]; every other field
+    * stays at `GlobalSnapshotInfo.empty`'s value. The five Address-keyed consumed fields match gl1's
+    * `DAGSnapshotProcessor.consumedFieldsToGlobalSnapshotInfo`; the cl1/dl1 ADDITION is `lastCurrencySnapshots`, which
+    * `processCurrencySnapshots` reads (`globalState.lastCurrencySnapshots.get(identifier)`) for the metagraph's own currency-genesis
+    * bootstrap. `lastCurrencySnapshotsProofs` is left empty — the MPT-format proof carries no such field root and cl1/dl1 never read the
+    * proofs map (only the snapshot+info value via `.get(identifier)`).
+    */
+  private def consumedFieldsToGlobalSnapshotInfo(state: ConsumedFieldState): GlobalSnapshotInfo =
+    GlobalSnapshotInfo.empty.copy(
+      lastTxRefs = state.lastTxRefs,
+      balances = state.balances,
+      lastCurrencySnapshots = state.lastCurrencySnapshots,
+      lastAllowSpendRefs = state.lastAllowSpendRefs.some,
+      lastTokenLockRefs = state.lastTokenLockRefs.some,
+      activeTokenLocks = state.activeTokenLocks.some
+    )
+
+  private def describe(err: FollowVerificationError): String = err match {
+    case FollowVerificationError.CommittedRootMismatch(expected, got) =>
+      s"CommittedRootMismatch(expected=${expected.show.take(12)}, got=${got.show.take(12)})"
+    case FollowVerificationError.RangeProofInvalid(field, _)  => s"RangeProofInvalid($field)"
+    case FollowVerificationError.ValueBindingFailed(field, _) => s"ValueBindingFailed($field)"
+    case FollowVerificationError.FieldRootMismatch(field, expected, got) =>
+      s"FieldRootMismatch($field, expected=${expected.show.take(12)}, got=${got.show.take(12)})"
+  }
 }

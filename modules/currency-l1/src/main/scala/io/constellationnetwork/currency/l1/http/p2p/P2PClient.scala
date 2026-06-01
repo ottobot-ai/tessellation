@@ -30,7 +30,10 @@ object P2PClient {
       dagL1P2PClient.l0GlobalSnapshot,
       ConsensusClient.make(client),
       SwapConsensusClient.make(client),
-      TokenLockConsensusClient.make(client)
+      TokenLockConsensusClient.make(client),
+      // gl1-style own-slice follow transport (Axis 2) for cl1/dl1 — reuse the underlying dag-l1 client's
+      // GlobalFollowClient so cl1/dl1 can fetch gl0's consumed-field slice instead of re-executing snapshots.
+      dagL1P2PClient.globalFollow
     ) {}
 }
 
@@ -45,5 +48,6 @@ sealed abstract class P2PClient[F[_]] private (
   val l0GlobalSnapshot: L0GlobalSnapshotClient[F],
   val consensusClient: ConsensusClient[F],
   val swapConsensusClient: SwapConsensusClient[F],
-  val tokenLockConsensusClient: TokenLockConsensusClient[F]
+  val tokenLockConsensusClient: TokenLockConsensusClient[F],
+  val globalFollow: GlobalFollowClient[F]
 )

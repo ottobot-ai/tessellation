@@ -55,7 +55,11 @@ trait GlobalFollowMirrorVerifier[F[_]] {
     prior: ConsumedFieldState,
     ordinal: SnapshotOrdinal,
     delta: ConsumedFieldDelta,
-    signedFieldRoots: SortedMap[GlobalStateFieldId, Hash]
+    signedFieldRoots: SortedMap[GlobalStateFieldId, Hash],
+    // 6th-field check, cl1/dl1 ONLY (gl1 omits it ⇒ `None` ⇒ unchanged behavior). The closure recomputes the
+    // `lastCurrencySnapshots` subtree roots via gl0's exact callable and matches delta-application — see
+    // `FollowVerifyCore.verifyFieldRoots`. Injected (not an implicit selector) so gl1 stays decoupled from `StateProofSelector`.
+    currencySnapshotsCheck: Option[ConsumedFieldState.LastCurrencySnapshots => F[Either[FollowVerificationError, Unit]]] = None
   ): F[Either[FollowVerificationError, Verified[ConsumedFieldState]]]
 }
 
@@ -67,8 +71,9 @@ object GlobalFollowMirrorVerifier {
       prior: ConsumedFieldState,
       ordinal: SnapshotOrdinal,
       delta: ConsumedFieldDelta,
-      signedFieldRoots: SortedMap[GlobalStateFieldId, Hash]
+      signedFieldRoots: SortedMap[GlobalStateFieldId, Hash],
+      currencySnapshotsCheck: Option[ConsumedFieldState.LastCurrencySnapshots => F[Either[FollowVerificationError, Unit]]] = None
     ): F[Either[FollowVerificationError, Verified[ConsumedFieldState]]] =
-      FollowVerifyCore.verifyFieldRoots[F](prior, delta, signedFieldRoots)
+      FollowVerifyCore.verifyFieldRoots[F](prior, delta, signedFieldRoots, currencySnapshotsCheck)
   }
 }
