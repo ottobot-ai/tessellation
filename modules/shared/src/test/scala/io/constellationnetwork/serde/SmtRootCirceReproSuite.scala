@@ -24,13 +24,12 @@ import eu.timepit.refined.auto._
 import io.circe.syntax._
 import weaver.MutableIOSuite
 
-/** PART-1 repro: round-trips a `GlobalSnapshotStateProof` (and a `Signed[GlobalIncrementalSnapshot]` carrying one) with
-  * `smtRoot = Some(...)` through the EXACT circe path the cl1/dl1 follower uses, to confirm/exonerate the hypothesis that the
-  * circe decoder mishandles the 19th field and breaks `toHashedWithSignatureCheck` at ordinal 256.
+/** PART-1 repro: round-trips a `GlobalSnapshotStateProof` (and a `Signed[GlobalIncrementalSnapshot]` carrying one) with `smtRoot =
+  * Some(...)` through the EXACT circe path the cl1/dl1 follower uses, to confirm/exonerate the hypothesis that the circe decoder mishandles
+  * the 19th field and breaks `toHashedWithSignatureCheck` at ordinal 256.
   *
-  * The follower's re-hash is purely a function of the ENCODER (Hasher.forJson → JsonSerializer.serialize → Blake2b). The signed
-  * value the follower holds is `decode(wireBytes)`. So the load-bearing property is hash-stability:
-  *   encode(decode(encode(x))) == encode(x).
+  * The follower's re-hash is purely a function of the ENCODER (Hasher.forJson → JsonSerializer.serialize → Blake2b). The signed value the
+  * follower holds is `decode(wireBytes)`. So the load-bearing property is hash-stability: encode(decode(encode(x))) == encode(x).
   */
 object SmtRootCirceReproSuite extends MutableIOSuite {
 
@@ -269,10 +268,10 @@ object SmtRootCirceReproSuite extends MutableIOSuite {
       } yield expect(decodedE.isRight)
   }
 
-  /** MECHANISM TEST: if any serve/store path serves a 256 whose `stateProof.smtRoot` differs from what was SIGNED (e.g. a
-    * GSI-rebuild path that drops smtRoot to None, while the signature covers smtRoot=Some), the follower's
-    * `toHashedWithSignatureCheck` MUST yield InvalidSignatureForHash. This pins whether "smtRoot present in sig but
-    * altered/absent in served value" reproduces the production symptom.
+  /** MECHANISM TEST: if any serve/store path serves a 256 whose `stateProof.smtRoot` differs from what was SIGNED (e.g. a GSI-rebuild path
+    * that drops smtRoot to None, while the signature covers smtRoot=Some), the follower's `toHashedWithSignatureCheck` MUST yield
+    * InvalidSignatureForHash. This pins whether "smtRoot present in sig but altered/absent in served value" reproduces the production
+    * symptom.
     */
   test("(MECHANISM) signature over smtRoot=Some but served value has smtRoot stripped → InvalidSignatureForHash") {
     case (json, _, sp) =>
@@ -296,10 +295,10 @@ object SmtRootCirceReproSuite extends MutableIOSuite {
       } yield expect(checkedStripped.isLeft).and(expect(checkedAltered.isLeft))
   }
 
-  /** Exhaustively simulate the HTTP serve→client path on the REAL ord-256 value: encode with EVERY printer the serve path
-    * could pick (BlockingEntityEncoder = noSpaces+dropNullValues+NO sortKeys; standard http4s circe = noSpaces, NO dropNull;
-    * canonical = the JsonSerializer printer), then decode via the follower's decoder and re-hash. If ANY variant breaks the
-    * follower re-hash, that pins the transport asymmetry.
+  /** Exhaustively simulate the HTTP serve→client path on the REAL ord-256 value: encode with EVERY printer the serve path could pick
+    * (BlockingEntityEncoder = noSpaces+dropNullValues+NO sortKeys; standard http4s circe = noSpaces, NO dropNull; canonical = the
+    * JsonSerializer printer), then decode via the follower's decoder and re-hash. If ANY variant breaks the follower re-hash, that pins the
+    * transport asymmetry.
     */
   test("(HTTP-sim) every serve printer of real ord-256 survives follower decode→re-hash byte-stably") {
     case (json, _, sp) =>
@@ -315,16 +314,15 @@ object SmtRootCirceReproSuite extends MutableIOSuite {
         signed = decodedE.toOption.get
         baseHash <- hasher.hash(signed.value)
         // encode the SIGNED envelope (value+proofs) the way the route does (Ok(snapshot))
-        results <- List("serve(dropNull,noSort)" -> servePrinter, "std(noDropNull)" -> stdPrinter, "canonical" -> canonical)
-          .traverse {
-            case (label, printer) =>
-              val wireJson = signed.asJson.printWith(printer)
-              IO.fromEither(io.circe.parser.decode[Signed[GlobalIncrementalSnapshot]](wireJson)).flatMap { redecoded =>
-                hasher.hash(redecoded.value).map { rh =>
-                  (label, redecoded.value == signed.value, rh.value == baseHash.value, redecoded.value.stateProof.smtRoot)
-                }
+        results <- List("serve(dropNull,noSort)" -> servePrinter, "std(noDropNull)" -> stdPrinter, "canonical" -> canonical).traverse {
+          case (label, printer) =>
+            val wireJson = signed.asJson.printWith(printer)
+            IO.fromEither(io.circe.parser.decode[Signed[GlobalIncrementalSnapshot]](wireJson)).flatMap { redecoded =>
+              hasher.hash(redecoded.value).map { rh =>
+                (label, redecoded.value == signed.value, rh.value == baseHash.value, redecoded.value.stateProof.smtRoot)
               }
-          }
+            }
+        }
         _ <- results.traverse_ {
           case (label, valueEq, hashEq, smt) =>
             IO(println(s"[HTTP-sim] $label valueEq=$valueEq hashEq=$hashEq smtRoot=${smt.isDefined}"))

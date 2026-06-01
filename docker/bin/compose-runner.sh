@@ -866,7 +866,7 @@ echo "------------------------------------------------"
 # Install dependencies
 cd $PROJECT_ROOT/.github/action_scripts
 echo "Installing Node.js dependencies..."
-npm i @stardust-collective/dag4 js-sha256 axios brotli zod elliptic
+npm i @stardust-collective/dag4 js-sha256 axios zod elliptic
 
 if [ -z "$REMOTE_HOST" ] || [ "$REMOTE_HOST" = "http://localhost" ]; then
   sleep 10

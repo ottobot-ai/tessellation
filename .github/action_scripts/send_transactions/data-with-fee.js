@@ -2,7 +2,12 @@ const {dag4} = require('@stardust-collective/dag4');
 const jsSha256 = require('js-sha256');
 const axios = require('axios');
 const { z } = require('zod');
-const { compress } = require("brotli");
+// Use the SDK's own serializeBrotli (brotli-wasm-backed, key-sorted + null-dropped to match the
+// node's circe Printer(sortKeys=true, dropNullValues=true) + brotli4j-q2 signing preimage). The
+// standalone `brotli` npm pkg (Emscripten build) crashed the process via an uncaught exception
+// (exit 7) AND did not normalize keys, so it never matched the node preimage. The SDK helper is the
+// same one the (passing) currency-tx path signs with, so the node accepts these bytes.
+const { serializeBrotli } = require('@stardust-collective/dag4-keystore');
 const {parseSharedArgs, withRetry} = require('../shared');
 
 const CliArgsSchema = z.object({
@@ -36,13 +41,6 @@ const getEncoded = (value) => {
     return energyValue;
 };
 
-const serializeBrotli = (content, compressionLevel = 2) => {
-    const jsonString = JSON.stringify(content);
-    const encoder = new TextEncoder();
-    const utf8Bytes = encoder.encode(jsonString);
-    return compress(utf8Bytes, {quality: compressionLevel});
-};
-
 const serialize = (msg) => {
     const coded = Buffer.from(msg, 'utf8').toString('hex');
     return coded;
@@ -65,8 +63,11 @@ const generateProof = async (message, walletPrivateKey, account) => {
 };
 
 const generateProofFee = async (message, privateKey, account) => {
+    // serializeBrotli returns a Uint8Array of the brotli4j-q2-compatible, key-sorted/null-dropped
+    // JSON bytes — the exact preimage the node hashes via Hash.fromBytes (sha256 hex of the raw
+    // bytes). Hash those raw bytes directly (no hex round-trip).
     const serializedTx = await serializeBrotli(message);
-    const messageHash = jsSha256.sha256(Buffer.from(serializedTx, "hex"));
+    const messageHash = jsSha256.sha256(Buffer.from(serializedTx));
     const signature = await dag4.keyStore.sign(privateKey, messageHash);
 
     const publicKey = account.publicKey;

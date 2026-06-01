@@ -28,20 +28,21 @@ import weaver.MutableIOSuite
   * (`docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`; the cl1/dl1 extension of the gl1 own-slice follow).
   *
   * Unlike the five uniform-`Hash` hypergraph fields, `lastCurrencySnapshots` is SHAPE-DIFFERENT: per `Address` the value is the metagraph's
-  * latest currency snapshot (`Left` genesis full / `Right((incremental, info))`), and in gl0's MPT it SPLITS into two `metagraph`-namespaced
-  * sub-keys (`LastIncrementalCurrencySnapshots` fieldId 5 + `LastCurrencySnapshotInfo` fieldId 6). In the signed `GlobalSnapshotStateProof`
-  * it IS carried in the field-4 slot `lastCurrencySnapshotsProof` (the two partition roots). It is verified by a
+  * latest currency snapshot (`Left` genesis full / `Right((incremental, info))`), and in gl0's MPT it SPLITS into two
+  * `metagraph`-namespaced sub-keys (`LastIncrementalCurrencySnapshots` fieldId 5 + `LastCurrencySnapshotInfo` fieldId 6). In the signed
+  * `GlobalSnapshotStateProof` it IS carried in the field-4 slot `lastCurrencySnapshotsProof` (the two partition roots). It is verified by a
   * recompute-vs-SIGNED match: `FollowVerifyCore.currencySnapshotsCheck` recomputes both subtree roots of the applied post-state via gl0's
-  * EXACT `GlobalStateConverter.currencySnapshotFieldRoots` (which reuses gl0's exact `currencySnapshotEntryBytes` + `fieldRootFromBytes`) and
-  * asserts they equal the SIGNED roots — a TRUE Byzantine anchor symmetric with the five uniform-`Hash` fields.
+  * EXACT `GlobalStateConverter.currencySnapshotFieldRoots` (which reuses gl0's exact `currencySnapshotEntryBytes` + `fieldRootFromBytes`)
+  * and asserts they equal the SIGNED roots — a TRUE Byzantine anchor symmetric with the five uniform-`Hash` fields.
   *
   * Coverage:
-  *   1. correct currency map matching the SIGNED roots → `Verified` carrying the currency map through `ConsumedFieldState.lastCurrencySnapshots`,
-  *      AND the recomputed roots equal gl0's exact `currencySnapshotFieldRoots` (determinism cross-check, NOT hardcoded).
+  *   1. correct currency map matching the SIGNED roots → `Verified` carrying the currency map through
+  *      `ConsumedFieldState.lastCurrencySnapshots`, AND the recomputed roots equal gl0's exact `currencySnapshotFieldRoots` (determinism
+  *      cross-check, NOT hardcoded).
   *   1. an INCREMENTAL slice whose applied post-state diverges from the SIGNED roots (a dropped/changed entry) → `FieldRootMismatch` on
   *      fieldId 5 or 6 (the omission/tamper the structure must catch).
-  *   1. the SIGNED-anchor property: a correct applied map but WRONG signed roots → `FieldRootMismatch` (proves it binds to the SIGNED value,
-  *      not the served map).
+  *   1. the SIGNED-anchor property: a correct applied map but WRONG signed roots → `FieldRootMismatch` (proves it binds to the SIGNED
+  *      value, not the served map).
   *   1. the empty-map case: empty applied map + `signedRoots = None` ⇒ both expected roots `Hash.empty` ⇒ verify SUCCEEDS.
   *   1. the 5-field gl1 path with `currencySnapshotsCheck = None` IGNORES `lastCurrencySnapshots` entirely (carried through, not checked) —
   *      proves the additive 6th field never touches gl1's behavior.
@@ -107,7 +108,10 @@ object CurrencySnapshotsFollowFieldSuite extends MutableIOSuite {
   private def currencyEntry(
     snapOrdinal: Long,
     balance: Long
-  )(implicit sp: SecurityProvider[IO], h: Hasher[IO]): IO[Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]] =
+  )(
+    implicit sp: SecurityProvider[IO],
+    h: Hasher[IO]
+  ): IO[Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]] =
     signedIncremental(snapOrdinal).map(s => (s, currencyInfo(balance)).asRight)
 
   private def verifier(implicit h: Hasher[IO], js: JsonSerializer[IO]): GlobalFollowMirrorVerifier[IO] = GlobalFollowMirrorVerifier.make[IO]

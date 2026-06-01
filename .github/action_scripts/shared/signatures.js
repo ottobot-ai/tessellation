@@ -1,5 +1,10 @@
 const { dag4 } = require('@stardust-collective/dag4');
-const { compress } = require('brotli');
+// Use the SDK keystore's serializeBrotli (brotli-wasm-backed) instead of the standalone `brotli`
+// npm pkg. The standalone pkg's Emscripten build installs a process-level uncaughtException handler
+// that crashes the harness (exit 7) on real payloads. serializeBrotli normalizes (sort keys + drop
+// nulls) and brotli-compresses, matching the node's circe Printer(sortKeys, dropNullValues) +
+// brotli4j-q2 signing preimage — it's the same helper the (passing) currency-tx path signs with.
+const { serializeBrotli } = require('@stardust-collective/dag4-keystore');
 const jsSha256 = require('js-sha256');
 const { CONSTANTS } = require("./constants");
 
@@ -39,11 +44,13 @@ const SerializerType = {
     BROTLI: 'brotli'
 };
 
-const brotliSerialize = async (content, compressionLevel = CONSTANTS.DEFAULT_COMPRESSION_LEVEL) => {
-    const jsonString = content;
-    const encoder = new TextEncoder();
-    const utf8Bytes = encoder.encode(jsonString);
-    return compress(utf8Bytes, { quality: compressionLevel });
+// Returns the brotli-compressed signing preimage as a HEX string (same return shape as the
+// standard serializer below), so the shared generateProof can uniformly `Buffer.from(_, 'hex')`.
+// `serializeBrotli` performs its own normalization (sort keys + drop nulls, identical to
+// sortAndRemoveNulls) and returns a Uint8Array, which we hex-encode.
+const brotliSerialize = async (value, compressionLevel = CONSTANTS.DEFAULT_COMPRESSION_LEVEL) => {
+    const compressed = await serializeBrotli(value, compressionLevel);
+    return Buffer.from(compressed).toString('hex');
 };
 
 const createSerializer = (type = SerializerType.STANDARD) => {
@@ -54,7 +61,7 @@ const createSerializer = (type = SerializerType.STANDARD) => {
 
     const brotliSerializer = {
         serialize: async (value) =>
-            await brotliSerialize(sortedJsonStringify(value))
+            await brotliSerialize(value)
     };
 
     return type === SerializerType.BROTLI ? brotliSerializer : standardSerializer;
