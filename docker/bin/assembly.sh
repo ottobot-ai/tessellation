@@ -125,21 +125,31 @@ move_metagraph_jar() {
   local destination=$2
   path=$(ls -1t modules/${module}/target/scala-2.13/*-assembly*.jar | head -n1)
   dest="$PROJECT_ROOT/docker/jars/${destination}.jar"
-  # Stale-JAR guard (the recurring metagraph cl1/dl1 Zinc gotcha): when assembly actually ran this
-  # invocation, the produced JAR MUST be newer than the marker stamped just before assembly. Zinc does
-  # not reliably invalidate a metagraph subproject's compiled classes when only the upstream
-  # tessellation-sdk ivy version bumps, so `sbt <module>/assembly` can be a silent no-op that reuses a
-  # months-old JAR — which `ls -1t | head` then happily deploys, shipping a schema-mismatched metagraph
-  # node (decode failures vs the new gl0 wire format). Fail LOUDLY instead of silently deploying stale.
-  # Skipped only when METAGRAPH_ASSEMBLY_MARKER is unset (SKIP_METAGRAPH_ASSEMBLY=true path legitimately
-  # reuses existing JARs).
-  if [ -n "${METAGRAPH_ASSEMBLY_MARKER:-}" ] && [ -f "$METAGRAPH_ASSEMBLY_MARKER" ]; then
-    if [ -z "$path" ] || [ ! "$path" -nt "$METAGRAPH_ASSEMBLY_MARKER" ]; then
-      echo "❌ STALE METAGRAPH JAR for module '$module' → '$destination': '$path' is older than this run's"
-      echo "   assembly marker — sbt assembly was a no-op (Zinc did not recompile, likely an SDK"
-      echo "   version bump that didn't invalidate the subproject). Deploying it would ship a"
-      echo "   schema-mismatched node. Force a clean rebuild: rm -rf '$METAGRAPH'/modules/*/target"
-      echo "   (or 'just nuke'), then re-run without --skip-metagraph-assembly."
+  # Stale-JAR guard (the recurring metagraph cl1/dl1 Zinc gotcha): catch the case where a SOURCE file
+  # changed but `sbt <module>/assembly` produced no fresh JAR — Zinc doesn't reliably invalidate a
+  # metagraph subproject when only the upstream tessellation-sdk ivy version bumps, so the assembly can
+  # be a silent no-op that `ls -1t | head` then deploys as a schema-mismatched node (decode failures vs
+  # the new gl0 wire format). The correct signal is "JAR reflects current source", NOT "JAR newer than
+  # this run" — Zinc legitimately SKIPS recompiling when nothing changed since the last build, and that
+  # up-to-date reused JAR must pass. So compare the JAR's mtime against the NEWEST source file under the
+  # module: stale (a source is newer than the JAR) -> fail loudly; up-to-date (JAR >= all sources, incl.
+  # the Zinc-skipped-no-change case) -> deploy. Guard active only when assembly ran this invocation
+  # (METAGRAPH_ASSEMBLY_MARKER set; the SKIP_METAGRAPH_ASSEMBLY=true path legitimately reuses JARs).
+  if [ -n "${METAGRAPH_ASSEMBLY_MARKER:-}" ]; then
+    if [ -z "$path" ]; then
+      echo "❌ NO METAGRAPH JAR for module '$module' → '$destination': assembly produced nothing."
+      echo "   Force a clean rebuild: rm -rf '$METAGRAPH'/modules/*/target (or 'just nuke')."
+      exit 1
+    fi
+    # Newest .scala source under the module (build.sbt too); empty if none found.
+    newest_src=$(find "modules/${module}/src" "modules/${module}/build.sbt" -type f \( -name '*.scala' -o -name 'build.sbt' \) 2>/dev/null \
+      | xargs -r ls -1t 2>/dev/null | head -n1)
+    if [ -n "$newest_src" ] && [ "$newest_src" -nt "$path" ]; then
+      echo "❌ STALE METAGRAPH JAR for module '$module' → '$destination': source '$newest_src' is newer"
+      echo "   than the assembled JAR '$path' — sbt assembly was a no-op (Zinc did not recompile a"
+      echo "   changed source, likely an SDK version bump that didn't invalidate the subproject)."
+      echo "   Deploying it would ship a schema-mismatched node. Force a clean rebuild:"
+      echo "   rm -rf '$METAGRAPH'/modules/*/target (or 'just nuke'), then re-run."
       exit 1
     fi
   fi

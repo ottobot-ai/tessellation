@@ -32,8 +32,8 @@ import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.
   * descriptor captures the per-field bits that differ — the `fieldId`, the value type `V` + its codec, where the field lives on the
   * `GlobalSnapshotInfo` (read/write), where it lives on a verified [[ConsumedFieldState]] (typed read), and which `stateProof.<field>Proof`
   * slot carries its signed root — so the five places that used to hand-duplicate "which fields a follower syncs" (`consumedFields`, the two
-  * processors' `signedFieldRoots`, the two processors' `consumedFieldsToGlobalSnapshotInfo`, `GlobalFollowSliceService.sliceFromGsi`) can be
-  * expressed ONCE over [[SyncedField.baseRegistry]] and drift becomes a compile/CI failure (`RegistryConsistencySuite`).
+  * processors' `signedFieldRoots`, the two processors' `consumedFieldsToGlobalSnapshotInfo`, `GlobalFollowSliceService.sliceFromGsi`) can
+  * be expressed ONCE over [[SyncedField.baseRegistry]] and drift becomes a compile/CI failure (`RegistryConsistencySuite`).
   *
   * '''Scope — the five UNIFORM fields only.''' `lastCurrencySnapshots` (the 6th consumed field, cl1/dl1 only) is deliberately NOT modeled
   * here: it is `Either`-valued, splits into TWO `metagraph`-namespaced MPT partitions, carries a paired `CurrencySnapshotMptRoots` root via
@@ -44,8 +44,8 @@ import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.
   * '''Path-dependent `V` never leaks.''' `V` is an abstract type MEMBER (not a type parameter), so the existential `List[SyncedField]` in
   * [[SyncedField.baseRegistry]] holds heterogeneous value types without an unsafe cast. The per-field operations are METHODS on the
   * descriptor (`readFromGsi` / `writeToGsi` / `readFromState` / `signedRoot` / `fieldRoot`), each round-tripping through its own `V`, so a
-  * caller folding over the registry (`baseRegistry.flatMap(sf => sf.signedRoot(p).map(sf.fieldId -> _))`,
-  * `baseRegistry.foldLeft(gsi)((g, sf) => sf.writeToGsi(g, sf.readFromState(s)))`) never names `V` and never casts.
+  * caller folding over the registry (`baseRegistry.flatMap(sf => sf.signedRoot(p).map(sf.fieldId -> _))`, `baseRegistry.foldLeft(gsi)((g,
+  * sf) => sf.writeToGsi(g, sf.readFromState(s)))`) never names `V` and never casts.
   */
 sealed trait SyncedField {
 
@@ -74,8 +74,9 @@ sealed trait SyncedField {
   def readFromState(s: ConsumedFieldState): SortedMap[Address, V]
 
   /** Write this field's Address-keyed map (all-upsert) onto a [[ConsumedFieldDelta]] — the slice-producer side
-    * (`GlobalFollowSliceService.sliceFromGsi`). Both the GSI source field and the delta target field are plain Address-keyed maps, so this is
-    * a straight `delta.copy(<field> = m)`; it lets the slice producer be expressed as a registry projection rather than a per-field literal.
+    * (`GlobalFollowSliceService.sliceFromGsi`). Both the GSI source field and the delta target field are plain Address-keyed maps, so this
+    * is a straight `delta.copy(<field> = m)`; it lets the slice producer be expressed as a registry projection rather than a per-field
+    * literal.
     */
   def writeToDelta(delta: ConsumedFieldDelta, m: SortedMap[Address, V]): ConsumedFieldDelta
 
@@ -84,10 +85,10 @@ sealed trait SyncedField {
     */
   def signedRoot(proof: GlobalSnapshotStateProof): Option[Hash]
 
-  /** Recompute this field's subtree root from an Address-keyed map the way gl0's writer does: forward-hash each `(Address, value)` to its MPT
-    * leaf (`toHex(hypergraph(fieldId, address))` + `codec.immutableBytes(value)`) and route the `(leaf-path Hex → value bytes)` map through
-    * gl0's EXACT [[GlobalStateConverter.fieldRootFromBytes]] — byte-identity by construction, not re-implementation. Identical math to
-    * `FollowVerifyCore.verifyFieldRoots`'s `leafBytes` + `checkField`.
+  /** Recompute this field's subtree root from an Address-keyed map the way gl0's writer does: forward-hash each `(Address, value)` to its
+    * MPT leaf (`toHex(hypergraph(fieldId, address))` + `codec.immutableBytes(value)`) and route the `(leaf-path Hex → value bytes)` map
+    * through gl0's EXACT [[GlobalStateConverter.fieldRootFromBytes]] — byte-identity by construction, not re-implementation. Identical math
+    * to `FollowVerifyCore.verifyFieldRoots`'s `leafBytes` + `checkField`.
     */
   def fieldRoot[F[_]: Async: Parallel: Hasher: JsonSerializer](m: SortedMap[Address, V]): F[Hash] =
     m.toList.traverse {
@@ -127,8 +128,8 @@ object SyncedField {
   /** The single source of truth for the five UNIFORM hypergraph fields a follower syncs, in [[GlobalStateFieldId.ordering]]-irrelevant
     * declaration order (callers that need a `SortedMap` build one explicitly). Mirrors EXACTLY the hand-duplicated logic this refactor
     * collapses:
-    *   - `readFromGsi` — `gsi.balances` / `gsi.lastTxRefs` / `gsi.lastAllowSpendRefs.getOrElse(empty)` / `gsi.lastTokenLockRefs.getOrElse(empty)`
-    *     / `gsi.getActiveTokenLocks` (== `GlobalFollowSliceService.sliceFromGsi`);
+    *   - `readFromGsi` — `gsi.balances` / `gsi.lastTxRefs` / `gsi.lastAllowSpendRefs.getOrElse(empty)` /
+    *     `gsi.lastTokenLockRefs.getOrElse(empty)` / `gsi.getActiveTokenLocks` (== `GlobalFollowSliceService.sliceFromGsi`);
     *   - `writeToGsi` — `g.copy(<field> = m)` for the always-bare slots, `g.copy(<field> = m.some)` for the `Option`-typed slots (==
     *     `consumedFieldsToGlobalSnapshotInfo`);
     *   - `readFromState` — the matching `ConsumedFieldState` accessor;
