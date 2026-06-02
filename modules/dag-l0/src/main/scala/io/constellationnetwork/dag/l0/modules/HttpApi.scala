@@ -273,7 +273,7 @@ sealed abstract class HttpApi[
   // over the SAME finalized GSI source `getCombined` serves; the slice service carries the finalized
   // ordinal itself). Pure observability — never feeds back into consensus.
   private val globalFollowRoutes =
-    GlobalFollowRoutes[F](services.globalFollowSliceServiceRef)
+    GlobalFollowRoutes[F](services.globalFollowSliceServiceRef, services.globalChangeSetServiceRef)
 
   private val walletRoutes = WalletRoutes[F, GlobalIncrementalSnapshot]("/dag", services.address)
   private val consensusInfoRoutes =

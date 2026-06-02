@@ -24,7 +24,7 @@ import io.constellationnetwork.node.shared.http.p2p.clients.{GlobalFollowClient,
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
-import io.constellationnetwork.schema.nakamoto.follow.GlobalFollowSliceResponse
+import io.constellationnetwork.schema.nakamoto.follow.{GlobalChangeSetResponse, GlobalFollowSliceResponse}
 import io.constellationnetwork.schema.peer.{L0Peer, PeerId}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -91,6 +91,15 @@ trait GlobalL0Service[F[_]] {
     * fetch otherwise, so a wrong base cannot advance the mirror.
     */
   def getFollowSliceSince(since: SnapshotOrdinal): F[Option[GlobalFollowSliceResponse]]
+
+  /** The currency-l0 (ml0) ADOPT fetch (task #12): `GET /global-follow/changeset?since=<ordinalLong>`. Returns the contiguous per-ordinal
+    * typed [[io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator]] deltas a FULL-state follower holding the GSI
+    * at `since` adopts sequentially to reach gl0's latest finalized ordinal (`baseOrdinal = Some(since)`), or — if `since` fell out of
+    * gl0's served ring — `baseOrdinal = None` (the follower full-GSI-adopts instead). The wire body is a FULLY-SCODEC octet-stream (the
+    * accumulator binary is scodec, never Circe). Same `None` / no-recovery-storm semantics as [[getFollowSliceSince]]: a wrong base
+    * surfaces as an `mptRoot` mismatch on the verify side, never as silently-advanced state.
+    */
+  def getChangeSetSince(since: SnapshotOrdinal): F[Option[GlobalChangeSetResponse]]
 }
 
 object GlobalL0Service {
@@ -179,6 +188,18 @@ object GlobalL0Service {
               globalFollowClient.getSliceSince(since).run(peer).map(_.some)
             }.handleErrorWith { e =>
               logger.warn(e)(s"Failure pulling follow slice since=${since.show}").as(none)
+            }
+        }
+
+      def getChangeSetSince(since: SnapshotOrdinal): F[Option[GlobalChangeSetResponse]] =
+        maybeGlobalFollowClient match {
+          case None                     => none[GlobalChangeSetResponse].pure[F]
+          case Some(globalFollowClient) =>
+            // Task #12 ml0 adopt fetch — same peer-resolution + error-to-None handling as `getFollowSliceSince`.
+            globalL0ClusterStorage.getRandomPeer.flatMap { peer =>
+              globalFollowClient.getChangeSetSince(since).run(peer).map(_.some)
+            }.handleErrorWith { e =>
+              logger.warn(e)(s"Failure pulling changeset since=${since.show}").as(none)
             }
         }
 

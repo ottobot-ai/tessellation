@@ -109,6 +109,42 @@ object SnapshotLeaderLoop {
       )
   }
 
+  // ── Task #12 (ml0 adopt) changeset-ring helpers ──────────────────────────────────────────────
+  // Extracted PURE so the produce→finalize→ring path is unit-testable end-to-end (the whole point of
+  // slice 2b's blocker: an accumulator staged under the RAW artifact hash must be rekeyed raw→with-cert
+  // at the produce path and then promoted at a finalize sink, or the served ring never populates for
+  // self-produced snapshots). The production sites below call these; a focused suite drives them and
+  // asserts the promoted delta surfaces via `GlobalChangeSetService.changeSetSince`.
+
+  /** Produce-path rekey: an accumulator was staged under the RAW artifact hash (pre slotCertificate+eta), but the finalize-sink promotion
+    * ([[promoteFinalizedAccumulator]]) looks it up under the with-cert canonical hash (`signedHashed.hash`). Move the staged entry `rawHash
+    * → withCertHash` (no-op if nothing is staged under `rawHash`). Mirrors the overlay branch rekey done alongside it.
+    */
+  def rekeyStagedAccumulator(
+    staged: Map[Hash, StateChangesAccumulator],
+    rawHash: Hash,
+    withCertHash: Hash
+  ): Map[Hash, StateChangesAccumulator] =
+    staged
+      .get(rawHash)
+      .fold(staged)(acc => (staged - rawHash).updated(withCertHash, acc))
+
+  /** Finalize-sink ring insert: put `acc` at `ordinal` into the served ordinal-keyed ring, trimmed to the last
+    * [[GlobalChangeSetService.recentAccumulatorsToKeep]] (dropping the lowest ordinals). The promote at the finalize sink pulls `acc` out
+    * of staging atomically and then calls this to insert it; idempotent on re-finalize of the same ordinal (overwrites with the same
+    * value).
+    */
+  def ringInsertTrimmed(
+    ring: scala.collection.immutable.SortedMap[SnapshotOrdinal, StateChangesAccumulator],
+    ordinal: SnapshotOrdinal,
+    acc: StateChangesAccumulator
+  ): scala.collection.immutable.SortedMap[SnapshotOrdinal, StateChangesAccumulator] = {
+    val withNew = ring.updated(ordinal, acc)
+    if (withNew.size > GlobalChangeSetService.recentAccumulatorsToKeep)
+      withNew.drop(withNew.size - GlobalChangeSetService.recentAccumulatorsToKeep)
+    else withNew
+  }
+
   /** Emit the chain-quality gauge + per-kind "fired" counters for task #138.
     *
     * Called from both finalize sites (depth-k and attestation-2/3). Counter names are spelled out literally so the [[Metrics.MetricKey]]
@@ -531,20 +567,18 @@ object SnapshotLeaderLoop {
     // Idempotent on re-finalize of the same ordinal (re-promote is a no-op once staging is drained). Called at
     // BOTH finalize sinks (depth-k AND attestation-2/3), exactly paralleling `recordFollowProjection`.
     def recordFinalizedAccumulator(ordinal: SnapshotOrdinal, finalizedHash: Hash): F[Unit] =
+      // Atomically pull the staged accumulator out (removing it so fork candidates can't leak), then atomically
+      // insert it into the served ring via the pure `ringInsertTrimmed` helper. Two separate atomic ops on the two
+      // refs preserves the original `.modify`/`.update` semantics; the pure trim helper is what the regression suite
+      // drives directly (after the produce-path `rekeyStagedAccumulator`).
       pendingAccumulatorsRef.modify { staged =>
         staged.get(finalizedHash) match {
           case Some(acc) => (staged - finalizedHash, Some(acc))
           case None      => (staged, None)
         }
       }.flatMap {
-        case Some(acc) =>
-          recentFinalizedAccumulatorsRef.update { ring =>
-            val updated = ring.updated(ordinal, acc)
-            if (updated.size > GlobalChangeSetService.recentAccumulatorsToKeep)
-              updated.drop(updated.size - GlobalChangeSetService.recentAccumulatorsToKeep)
-            else updated
-          }
-        case None => Async[F].unit
+        case Some(acc) => recentFinalizedAccumulatorsRef.update(ring => ringInsertTrimmed(ring, ordinal, acc))
+        case None      => Async[F].unit
       }
     // Use shared genesis time if provided, else fall back to wall clock
     val effectiveGenesisTime = if (genesisTimeMs > 0) genesisTimeMs else System.currentTimeMillis()
@@ -1543,11 +1577,7 @@ object SnapshotLeaderLoop {
                           // for self-produced snapshots — the same raw->with-cert problem the overlay rekey beside
                           // it already solves.
                           mptOverlay.rekey(BranchId(rawArtifactHash), BranchId(snapshotHashedForStorage.hash)) >>
-                            pendingAccumulatorsRef.update { staged =>
-                              staged
-                                .get(rawArtifactHash)
-                                .fold(staged)(acc => (staged - rawArtifactHash).updated(snapshotHashedForStorage.hash, acc))
-                            }
+                            pendingAccumulatorsRef.update(rekeyStagedAccumulator(_, rawArtifactHash, snapshotHashedForStorage.hash))
                         else
                           // Abandoned fork: drop both the overlay branch and its staged accumulator.
                           mptOverlay.discardBranch(BranchId(rawArtifactHash)) >>

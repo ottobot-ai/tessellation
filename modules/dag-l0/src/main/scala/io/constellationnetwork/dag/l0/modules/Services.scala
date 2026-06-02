@@ -88,6 +88,14 @@ object Services {
     globalFollowSliceServiceRef: Ref[F, Option[
       io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService[F]
     ]],
+    // Task #12 (ml0 adopt) — observability seam for the GlobalFollowRoutes
+    // `GET /global-follow/changeset?since=<ord>` endpoint. Mirrors `globalFollowSliceServiceRef`: created in
+    // Main, populated inside GlobalSnapshotConsensus.make (where the finalized accumulator ring is in scope),
+    // read by HttpApi. The service Ref carries the gl0-side changeset producer, which reads the bounded ring of
+    // recent finalized per-ordinal accumulators; the route returns 503 while it is still in its pre-wiring state.
+    globalChangeSetServiceRef: Ref[F, Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService[F]
+    ]],
     // §1.2 Slice 3c: KesRegistry loaded from L0 genesis (or empty for CSV-genesis). Threaded
     // through to GlobalSnapshotConsensus.make.
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
@@ -285,6 +293,7 @@ object Services {
             finalityTriggerViewRef,
             nipopowProofProviderRef,
             globalFollowSliceServiceRef,
+            globalChangeSetServiceRef,
             processMetagraphBinary,
             enqueueAllowSpendBlock,
             enqueueDAGBlock,
@@ -326,6 +335,7 @@ object Services {
         finalityTriggerViewRef = finalityTriggerViewRef,
         nipopowProofProviderRef = nipopowProofProviderRef,
         globalFollowSliceServiceRef = globalFollowSliceServiceRef,
+        globalChangeSetServiceRef = globalChangeSetServiceRef,
         pendingReader = pendingReader,
         mutableKesRegistry = mutableKesRegistry
       ) {}
@@ -360,6 +370,12 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   // HttpApi to build GlobalFollowRoutes. The route returns 503 while the service is still `None`.
   val globalFollowSliceServiceRef: Ref[F, Option[
     io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService[F]
+  ]],
+  // Task #12 (ml0 adopt) — observability seam for /global-follow/changeset. Populated inside
+  // GlobalSnapshotConsensus.make once the finalized accumulator ring is wired; read by HttpApi to
+  // build GlobalFollowRoutes. The route returns 503 while the service is still `None`.
+  val globalChangeSetServiceRef: Ref[F, Option[
+    io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService[F]
   ]],
   // #117/#118 Phase 2: branch-aware reader for gl0 HTTP routes / read paths. Resolves to the
   // chain's bestTip under MultiBranch so reads pick up the chain's pending writes, falling

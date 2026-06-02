@@ -56,7 +56,7 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
-import io.constellationnetwork.schema.nakamoto.follow.{ConsumedFieldDelta, ConsumedFieldState, GlobalFollowSliceResponse}
+import io.constellationnetwork.schema.nakamoto.follow._
 import io.constellationnetwork.schema.node.RewardFraction
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.swap.AllowSpendReference
@@ -402,6 +402,11 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                   // which start with an empty mirror and therefore call `getLatestFollowSlice` anyway, are unaffected).
                   override def getFollowSliceSince(since: SnapshotOrdinal): IO[Option[GlobalFollowSliceResponse]] =
                     followSliceSinceR.get.flatMap(_(since))
+
+                  // Task #12 (ml0 adopt) changeset fetch — not exercised by these gl1 own-slice follow tests
+                  // (only ml0 follows the changeset path), so it serves None like the unwired cl0/cl1 callers.
+                  override def getChangeSetSince(since: SnapshotOrdinal): IO[Option[GlobalChangeSetResponse]] =
+                    none[GlobalChangeSetResponse].pure[IO]
                 }
                 val lastNSnapshotStorage =
                   LastNGlobalSnapshotStorage.make[IO](lastGlobalSnapshotsSyncConfig, lastNSnapR, incLastNSnapR)

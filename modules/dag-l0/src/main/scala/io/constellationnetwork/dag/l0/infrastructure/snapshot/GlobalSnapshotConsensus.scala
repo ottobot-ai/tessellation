@@ -215,6 +215,15 @@ object GlobalSnapshotConsensus {
     globalFollowSliceServiceRef: Ref[F, Option[
       io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService[F]
     ]],
+    // Task #12 (ml0 adopt) — observability seam for the GlobalFollowRoutes
+    // `GET /global-follow/changeset?since=<ord>` endpoint. Populated below with
+    // `GlobalChangeSetService.make(recentFinalizedAccumulatorsRef.get)` — the same `recentFinalizedAccumulatorsRef`
+    // (slice 2b) `SnapshotLeaderLoop` promotes finalized per-ordinal accumulators into at its finalize sinks. Read by
+    // `GlobalFollowRoutes` (mounted in HttpApi); the route returns 503 while it is still in its pre-wiring state.
+    // ADDITIVE / observability-only — a pure read of finalized state, never feeds back into consensus.
+    globalChangeSetServiceRef: Ref[F, Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService[F]
+    ]],
     // Invoked by NakamotoSyncDaemon when a metagraph-binary arrives via gossip.
     // Routes the binary through the same pipeline as the HTTP endpoint (stateChannelService.process).
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
@@ -1316,6 +1325,18 @@ object GlobalSnapshotConsensus {
             val sliceService = io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService
               .make[F](latestFinalizedSliceSourceRef.get, recentFollowProjectionsRef.get)
             globalFollowSliceServiceRef.set(Some(sliceService))
+          }.toResource
+
+          // Task #12 (ml0 adopt) — publish the gl0-side changeset producer so `GlobalFollowRoutes` (mounted in
+          // HttpApi) can serve `GET /global-follow/changeset?since=<ord>`. ADDITIVE / observability-only, exactly
+          // like the slice service above: the changeset service reads the bounded `recentFinalizedAccumulatorsRef`
+          // ring (slice 2b) that `SnapshotLeaderLoop` promotes finalized per-ordinal accumulators into at its
+          // finalize sinks, and serves the contiguous deltas a full-state ml0 follower adopts to reach the latest
+          // finalized ordinal. Never feeds back into consensus.
+          _ <- {
+            val changeSetService = io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService
+              .make[F](recentFinalizedAccumulatorsRef.get)
+            globalChangeSetServiceRef.set(Some(changeSetService))
           }.toResource
 
           // ─── Gap A — per-shard checkpoint producers ──────────────────────────────────────────

@@ -68,10 +68,14 @@ object GlobalFollowRoutesSuite extends HttpSuite {
     }
 
   /** Build the routes wired to a service `Ref`. `service = None` exercises the 503 startup path; a present service whose `latestSlice` is
-    * `None` exercises the no-finalized-ordinal 503 path.
+    * `None` exercises the no-finalized-ordinal 503 path. The changeset service Ref is left empty here — the changeset endpoint is covered
+    * by its own suite ([[GlobalChangeSetRoutesSuite]]); these slice-route tests only exercise the slice service Ref.
     */
   private def mkRoutes(service: Option[GlobalFollowSliceService[IO]]): IO[HttpRoutes[IO]] =
-    Ref.of[IO, Option[GlobalFollowSliceService[IO]]](service).map(GlobalFollowRoutes[IO](_).publicRoutes)
+    for {
+      sliceRef <- Ref.of[IO, Option[GlobalFollowSliceService[IO]]](service)
+      changeSetRef <- Ref.of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService[IO]]](None)
+    } yield GlobalFollowRoutes[IO](sliceRef, changeSetRef).publicRoutes
 
   // ===========================================================================
   // Tests

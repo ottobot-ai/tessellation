@@ -161,6 +161,14 @@ object Main
       globalFollowSliceServiceRef <- Ref
         .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowSliceService[IO]]](None)
         .asResource
+      // Task #12 (ml0 adopt) — observability seam for the GlobalFollowRoutes
+      // `GET /global-follow/changeset?since=<ord>` endpoint. Populated inside GlobalSnapshotConsensus.make once
+      // the finalized accumulator ring (`recentFinalizedAccumulatorsRef`) is wired; the changeset service reads
+      // that ring. Shared between Services and HttpApi exactly like `globalFollowSliceServiceRef`; the route
+      // returns 503 while it is still `None`.
+      globalChangeSetServiceRef <- Ref
+        .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService[IO]]](None)
+        .asResource
       storages <- Storages
         .make[IO](
           sharedStorages,
@@ -235,6 +243,7 @@ object Main
           finalityTriggerViewRef,
           nipopowProofProviderRef,
           globalFollowSliceServiceRef,
+          globalChangeSetServiceRef,
           kesRegistry,
           vrfRegistry,
           // Split-safety (#261, eta axis): install the leader's chain-walk into the follower / `createContext`

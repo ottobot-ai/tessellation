@@ -126,6 +126,29 @@ object GlobalFollowClientSuite extends MutableIOSuite {
       }
   }
 
+  // Task #12 (ml0 adopt) changeset endpoint — same request-shape capture as `getSliceSince` (the octet-stream
+  // scodec decode is covered round-trip server-side by `GlobalChangeSetRoutesSuite`; here we only assert the
+  // client builds the right URI).
+  test("getChangeSetSince issues GET /global-follow/changeset?since=N against the peer") { implicit sp =>
+    for {
+      captured <- Ref.of[IO, Option[Uri]](none[Uri])
+      innerClient = Client[IO] { (req: Request[IO]) =>
+        Resource.eval(captured.set(req.uri.some)).as(Response[IO]())
+      }
+      client = GlobalFollowClient.make[IO](innerClient)
+      _ <- client.getChangeSetSince(SnapshotOrdinal(NonNegLong(11L))).run(peer).attempt
+      uriOpt <- captured.get
+    } yield
+      uriOpt match {
+        case Some(uri) =>
+          expect(uri.path.renderString == "/global-follow/changeset") &&
+          expect(uri.query.params.get("since").contains("11")) &&
+          expect(uri.host.map(_.value).contains("127.0.0.1")) &&
+          expect(uri.port.contains(9000))
+        case None => failure("client did not issue any request")
+      }
+  }
+
   test("getLatestSlice issues GET /global-follow/slice/latest against the peer") { implicit sp =>
     for {
       captured <- Ref.of[IO, Option[Uri]](none[Uri])
