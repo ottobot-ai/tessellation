@@ -50,7 +50,7 @@ All release branches receive code **only** by merging from develop (or in rare c
 
 ### 3. Environment-specific configuration via environment variables
 
-Network-specific tuning (gossip parameters, facilitator counts, hardfork ordinals) must be managed through deployment configuration (environment variables, Kubernetes ConfigMaps), **not** through branch-specific code changes.
+Network-specific tuning (gossip parameters, facilitator counts, hardfork ordinals) must be managed through deployment configuration (environment variables passed at runtime; use HOCON `${?VAR}` substitution in `application.conf`), **not** through branch-specific code changes.
 
 The `application.conf` files support environment variable overrides using the HOCON `${?VAR}` pattern:
 

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Tessellation is the Constellation Network Node Software - a DAG (Directed Acyclic Graph) based distributed ledger with Layer 0 (L0) and Layer 1 (L1) validators. Written in Scala 2.13, designed for Kubernetes deployment.
+Tessellation is the Constellation Network Node Software - a DAG (Directed Acyclic Graph) based distributed ledger with Layer 0 (L0) and Layer 1 (L1) validators. Written in Scala 2.13. Runs as bare JARs in production; test clusters are brought up via `just` recipes and Docker images.
 
 ## Build Commands
 

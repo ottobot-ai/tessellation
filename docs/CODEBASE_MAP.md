@@ -60,7 +60,6 @@ tessellation/
 │   ├── tools/            # CLI utilities for testing (4k tokens)
 │   └── test-shared/      # Test utilities and generators (0.8k tokens)
 ├── docker/               # Docker configuration (27k tokens)
-├── kubernetes/           # K8s deployment manifests (38k tokens)
 ├── .github/              # CI/CD workflows (77k tokens)
 ├── doc/                  # API documentation (82k tokens)
 └── project/              # SBT build configuration (4k tokens)
@@ -413,6 +412,5 @@ just down                    # Stop environment
 3. `release.yml` - Version, tag, build JARs, publish SDK
 
 ### Deployment Targets
-- **Docker**: `docker-compose.yaml` with profiles
-- **Kubernetes**: Kustomize overlays in `kubernetes/`
-- **Skaffold**: Local K8s development
+- **Test clusters**: `just` recipes bring up Docker-based multi-node clusters (`just test`, `just up`, `just down`)
+- **Production**: bare JARs run as standalone Java processes (no container orchestration)
