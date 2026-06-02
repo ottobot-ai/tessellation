@@ -127,7 +127,7 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough,
         adoptedBoundaryEta = adoptedBoundaryEta
       )
-      (_, _, _, _, _, _, _, _, snapshotInfo, _, _, _, _, _, _) = result
+      (_, _, _, _, _, _, _, _, snapshotInfo, _, _, _, _, _, _, _) = result
     } yield snapshotInfo.historicalStakeSnapshots.get(EtaPeriod(expectedPeriod))
   }
 

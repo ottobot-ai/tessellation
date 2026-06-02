@@ -218,7 +218,14 @@ trait GlobalSnapshotAcceptanceManager[F[_]] {
       // sealed — that's the only point at which `childTip` (the just-produced snapshot's hash)
       // is known. Committing inside `accept()` with `parentTip` as childTip would self-loop
       // pendingRef under MultiBranch.
-      BranchHandle[F, GlobalStateKey]
+      BranchHandle[F, GlobalStateKey],
+      // Task #12 slice 2b — the typed per-ordinal global-state delta gl0 just applied. Built
+      // mid-comprehension, consumed internally for the MPT writes, and ALSO returned so the gl0
+      // producer (`GlobalSnapshotConsensusFunctions`) can stage it hash-keyed and `SnapshotLeaderLoop`
+      // can promote the FINALIZED ordinal's accumulator into the bounded changeset ring the ml0
+      // adopt-and-verify follow path serves. Followers (`GlobalSnapshotContextFunctions`) ignore it.
+      // Pure read-out — does NOT change snapshot content / finality / mptRoot.
+      StateChangesAccumulator
     )
   ]
 }
@@ -1312,7 +1319,10 @@ object GlobalSnapshotAcceptanceManager {
             SortedMap[Id, Signed[UpdateNodeParameters]],
             SortedSet[SharedArtifact],
             SortedMap[PeerId, Map[Address, Amount]],
-            BranchHandle[F, GlobalStateKey]
+            BranchHandle[F, GlobalStateKey],
+            // Task #12 slice 2b — see the trait return type. The typed per-ordinal delta, returned for the
+            // producer's changeset-ring staging. Additive; followers ignore it.
+            StateChangesAccumulator
           )
         ] = {
           implicit val hasher: Hasher[F] = HasherSelector[F].getForOrdinal(ordinal)
@@ -2445,7 +2455,10 @@ object GlobalSnapshotAcceptanceManager {
                   updatedUpdateNodeParameters.view.mapValues(_._1).toSortedMap,
                   (allowSpendsExpiredEvents ++ tokenUnlocksEvents ++ generatedTokenUnlockArtifacts).toSortedSet,
                   delegatorRewardsMap,
-                  handle
+                  handle,
+                  // Task #12 slice 2b — the typed per-ordinal delta this accept() applied (built at the
+                  // `stateChangesAccumulator = StateChangesAccumulator(...)` step above, still in scope).
+                  stateChangesAccumulator
                 )
             }
           }

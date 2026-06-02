@@ -432,6 +432,11 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         .make[IO](g5Reader)
       rewardsInfoCalculator = RewardsInfoCalculator.make(delegatorRewards, g5StakeManager, g5UnpReader, g5BalanceManager)
       rewardsService = RewardsService[IO](classicRewards, delegatorRewards, rewardsInfoCalculator, rewardsInfoStorage)
+      // Task #12 slice 2b — the producer's hash-keyed changeset-staging Ref (empty for this unit suite; the
+      // promotion/finality path is exercised in the dag-l0 integration loop, not here).
+      pendingAccumulatorsRef <- Ref.of[IO, Map[Hash, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator]](
+        Map.empty
+      )
       globalSnapshotConsensusFunction = GlobalSnapshotConsensusFunctions
         .make[IO](
           snapshotAcceptanceManager,
@@ -446,7 +451,8 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           SnapshotOrdinal.MinValue,
           mptStore,
           mptOverlay,
-          shardAcceptanceDeps
+          shardAcceptanceDeps,
+          pendingAccumulatorsRef
         )
     } yield globalSnapshotConsensusFunction
   }

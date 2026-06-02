@@ -18,8 +18,8 @@ import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import scodec.Codec
 import shapeless.{::, HNil}
 
-/** Explicit scodec codecs for the system-index delta family carried by `StateChangesAccumulator`:
-  * the three expiry-index key types and the `SystemIndexDelta` ADT.
+/** Explicit scodec codecs for the system-index delta family carried by `StateChangesAccumulator`: the three expiry-index key types and the
+  * `SystemIndexDelta` ADT.
   *
   * Hand-written (no auto-derivation) so the binary layout is a stable, audited spec — these bytes feed the per-ordinal state-diff wire
   * (currency-l0 adopt path). Field order matches the case-class declarations exactly.

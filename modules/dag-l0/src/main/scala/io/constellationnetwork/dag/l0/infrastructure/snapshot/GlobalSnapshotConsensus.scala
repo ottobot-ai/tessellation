@@ -297,6 +297,32 @@ object GlobalSnapshotConsensus {
           io.constellationnetwork.schema.nakamoto.follow.ConsumedFieldDelta
         ]](scala.collection.immutable.SortedMap.empty)
         .toResource
+      // ── ml0 changeset-adopt rings (Task #12 slice 2b) ─────────────────────────────────────────────
+      // STAGING map: the gl0 producer (`GlobalSnapshotConsensusFunctions`) fills this hash-keyed when it
+      // builds a snapshot artifact; `SnapshotLeaderLoop` reads it at the two finalize sinks to PROMOTE the
+      // just-finalized snapshot's typed per-ordinal delta into the served ring below and then remove the hash.
+      // BOUNDED by the producer to `GlobalSnapshotConsensusFunctions.pendingAccumulatorsToKeep` insertions so
+      // fork candidates that never finalize cannot leak. The same instance is injected into BOTH the consensus
+      // functions (producer/staging) and `SnapshotLeaderLoop` (promote/drain). `None` analogue elsewhere — only
+      // gl0 produces a changeset ring.
+      pendingAccumulatorsRef <- cats.effect.kernel.Ref
+        .of[F, Map[
+          io.constellationnetwork.security.hash.Hash,
+          io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
+        ]](Map.empty)
+        .toResource
+      // SERVED ring: bounded ordinal-keyed ring of recent FINALIZED per-ordinal accumulators (the ml0-side
+      // analogue of `recentFollowProjectionsRef`). `SnapshotLeaderLoop` promotes into it at the SAME finalize
+      // sinks, trimmed to the last `GlobalChangeSetService.recentAccumulatorsToKeep`. A later slice wires
+      // `GlobalChangeSetService.make(recentFinalizedAccumulatorsRef.get)` to serve `changeSetSince`. Memory
+      // bound, not a consensus parameter (a follower past the ring re-fetches via full-GSI adopt; the signed
+      // `mptRoot` at each delta's ordinal rejects a wrong base). Empty until the first ordinal finalizes.
+      recentFinalizedAccumulatorsRef <- cats.effect.kernel.Ref
+        .of[F, scala.collection.immutable.SortedMap[
+          SnapshotOrdinal,
+          io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
+        ]](scala.collection.immutable.SortedMap.empty)
+        .toResource
       getGlobalSnapshotByOrdinalWithFallback: (SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]) = {
         (ordinal: SnapshotOrdinal) =>
           getGlobalSnapshotByOrdinal(ordinal).flatMap {
@@ -533,7 +559,11 @@ object GlobalSnapshotConsensus {
           // Gap C — feed finalized shard checkpoints into accept(). `None` at numShards=1 (regression
           // bar) ⇒ accept() receives `shardCheckpoints = SortedMap.empty`. Same `shardAcceptanceDeps`
           // instance the GSAM acceptance side, the Gap-A producers, and the Gap-B receiver use.
-          shardAcceptanceDeps = shardAcceptanceDeps
+          shardAcceptanceDeps = shardAcceptanceDeps,
+          // Task #12 slice 2b — the hash-keyed STAGING map. The producer stages each built snapshot's typed
+          // per-ordinal delta here; `SnapshotLeaderLoop` (same Ref, injected below) promotes the finalized
+          // ones into `recentFinalizedAccumulatorsRef`. Additive — never feeds back into consensus.
+          pendingAccumulatorsRef = pendingAccumulatorsRef
         )
 
       stateAdvancer =
@@ -1507,6 +1537,12 @@ object GlobalSnapshotConsensus {
                   // #287 "send diffs": the bounded recent-projection ring the loop also fills at both finalize
                   // sinks, read by `GlobalFollowSliceService.sliceSince` to serve incremental gl1 follow diffs.
                   recentFollowProjectionsRef = recentFollowProjectionsRef,
+                  // Task #12 slice 2b: the SAME staging map the consensus functions fill (above), read here at
+                  // both finalize sinks to promote the finalized snapshot's accumulator into the served ring.
+                  pendingAccumulatorsRef = pendingAccumulatorsRef,
+                  // Task #12 slice 2b: the served changeset ring the loop fills at both finalize sinks; a later
+                  // slice wires `GlobalChangeSetService.make(recentFinalizedAccumulatorsRef.get)` to serve it.
+                  recentFinalizedAccumulatorsRef = recentFinalizedAccumulatorsRef,
                   chainSyncRequestQueue = chainSyncRequestQueue,
                   finalityTriggerViewRef = finalityTriggerViewRef,
                   // §1.2 Slice 5/6: parallel-sign attestations + snapshots with KES.

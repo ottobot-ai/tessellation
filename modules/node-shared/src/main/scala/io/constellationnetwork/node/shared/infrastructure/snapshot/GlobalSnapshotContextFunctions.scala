@@ -261,7 +261,11 @@ object GlobalSnapshotContextFunctions {
                     _,
                     _,
                     _,
-                    overlayHandle
+                    overlayHandle,
+                    // Task #12 slice 2b — the producer-only changeset accumulator. The follower/verifier path
+                    // does NOT stage it (only the gl0 producer fills the changeset ring); ignored here. No
+                    // behavior change.
+                    _
                   ) =>
                 // For followers (currency-l0, dag-l1, currency-l1), we log warnings instead of raising errors
                 // for blocks, state channels, and rewards validation divergences.

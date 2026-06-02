@@ -31,7 +31,10 @@ import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs._
 import io.constellationnetwork.serde.codecs.instances.PriceOracleCodecs.{priceRecordCodec, tokenPairCodec}
 import io.constellationnetwork.serde.codecs.instances.SignatureCodecs.idCodec
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
-import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{etaPeriodCodec, historicalCodec => historicalStakeSnapshotCodec}
+import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{
+  etaPeriodCodec,
+  historicalCodec => historicalStakeSnapshotCodec
+}
 import io.constellationnetwork.serde.codecs.instances.SystemIndexDeltaCodecs._
 import io.constellationnetwork.serde.codecs.instances.TokenLockCodec.{codec => tokenLockCodec}
 import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{codec => tokenLockRefCodec}
@@ -43,11 +46,11 @@ import shapeless.{::, HNil}
 
 /** Canonical scodec codec for `GlobalStateConverter.StateChangesAccumulator` — the typed per-ordinal global-state delta.
   *
-  * This is the wire form of the gl0→currency-l0 state-diff (the adopt-and-verify follow path that replaces full re-execution). It is
-  * NOT a signing/hashing preimage — the cryptographic anchor is the snapshot's `mptRoot`, recomputed independently by applying this
-  * delta. The encoding is nonetheless an explicit, hand-written spec (no auto-derivation): the wire layout follows the case-class field
-  * order exactly (1..17 the GSI-shaped partition deltas, 18..20 the system expiry-index deltas, 21..27 the removed-key sets, 28..29 the
-  * historical-stake delta + removed periods). `Set` fields are sorted on encode for determinism (see [[SetCodec]]).
+  * This is the wire form of the gl0→currency-l0 state-diff (the adopt-and-verify follow path that replaces full re-execution). It is NOT a
+  * signing/hashing preimage — the cryptographic anchor is the snapshot's `mptRoot`, recomputed independently by applying this delta. The
+  * encoding is nonetheless an explicit, hand-written spec (no auto-derivation): the wire layout follows the case-class field order exactly
+  * (1..17 the GSI-shaped partition deltas, 18..20 the system expiry-index deltas, 21..27 the removed-key sets, 28..29 the historical-stake
+  * delta + removed periods). `Set` fields are sorted on encode for determinism (see [[SetCodec]]).
   */
 object StateChangesAccumulatorCodec {
 
@@ -130,9 +133,35 @@ object StateChangesAccumulatorCodec {
               ads :: dsw :: anc :: ncw :: msd :: unp :: ps :: asei :: tlei :: ncwei ::
               rask :: rtlk :: rtlbk :: rdsk :: rdswk :: rnck :: rncwk :: hss :: rhssk :: HNil =>
             StateChangesAccumulator(
-              lsch, ltx, bal, lcs, lcsp, aas, atl, tlb, lasr, ltlr,
-              ads, dsw, anc, ncw, msd, unp, ps, asei, tlei, ncwei,
-              rask, rtlk, rtlbk, rdsk, rdswk, rnck, rncwk, hss, rhssk
+              lsch,
+              ltx,
+              bal,
+              lcs,
+              lcsp,
+              aas,
+              atl,
+              tlb,
+              lasr,
+              ltlr,
+              ads,
+              dsw,
+              anc,
+              ncw,
+              msd,
+              unp,
+              ps,
+              asei,
+              tlei,
+              ncwei,
+              rask,
+              rtlk,
+              rtlbk,
+              rdsk,
+              rdswk,
+              rnck,
+              rncwk,
+              hss,
+              rhssk
             )
         },
         a =>

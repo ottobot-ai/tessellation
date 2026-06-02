@@ -3,6 +3,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot
 import cats.Order
 import cats.data.NonEmptySet
 import cats.effect.Async
+import cats.effect.kernel.Ref
 import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
@@ -37,12 +38,14 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake.UpdateDelegatedStake
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.transaction.Transaction
 import io.constellationnetwork.security._
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelValidationType}
 import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
@@ -72,6 +75,17 @@ abstract class GlobalSnapshotConsensusFunctions[F[_]: Async: SecurityProvider]
 
 object GlobalSnapshotConsensusFunctions {
 
+  /** Task #12 slice 2b — bound on the producer's hash-keyed STAGING map of per-ordinal accumulators awaiting finalization. Sized
+    * comfortably above the served ring
+    * ([[io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService.recentAccumulatorsToKeep]] \= 256) so concurrent fork
+    * candidates at the depth-k window all have room to stage before one finalizes and promotes; entries for candidates that never finalize
+    * are evicted in arbitrary hash-iteration order on overflow (a plain `Map` is NOT insertion-ordered — `.drop` is non-deterministic). In
+    * steady state the map DRAINS on finalize (promotion rekeys raw->with-cert then removes the finalized hash), so this cap is only a
+    * backstop for never-finalizing forks. Pure memory bound (a dropped pre-finalize staging entry only forces a follower into the full-GSI
+    * adopt fallback), never a consensus parameter.
+    */
+  val pendingAccumulatorsToKeep: Int = 512
+
   def make[F[_]: Async: SecurityProvider: JsonSerializer](
     globalSnapshotAcceptanceManager: GlobalSnapshotAcceptanceManager[F],
     collateral: Amount,
@@ -92,7 +106,19 @@ object GlobalSnapshotConsensusFunctions {
     // from the per-shard chain stores and passes them into `accept(shardCheckpoints = ...)`.
     shardAcceptanceDeps: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[F]
-    ] = None
+    ] = None,
+    // Task #12 slice 2b — STAGING map for the gl0 changeset-ring producer. After this node builds a
+    // snapshot artifact and knows its hash (`currentSnapshotHash`, the `overlay.commit` site below), it
+    // stages the typed per-ordinal `StateChangesAccumulator` accept() returned, keyed by that hash. The
+    // accumulator only PROMOTES into the served ordinal-keyed ring once `SnapshotLeaderLoop` finalizes the
+    // matching hash (depth-k OR attestation-2/3 sink). Hash-keyed because the produced/validated snapshot's
+    // ordinal isn't yet finalized here and forks at the same ordinal must not collide. BOUNDED to at most
+    // `pendingAccumulatorsToKeep` entries (arbitrary-order eviction on overflow) so fork candidates that never
+    // finalize cannot leak memory. Pure side effect after the artifact is sealed — never feeds back into
+    // consensus/finality. Required param (no default — `Ref.of` is effectful): cl0/dl1/test sites pass
+    // `Ref.of(Map.empty)` (those paths never finalize a gl0 changeset ring); production passes the shared Ref
+    // from `GlobalSnapshotConsensus.make`.
+    pendingAccumulatorsRef: Ref[F, Map[Hash, StateChangesAccumulator]]
   ): GlobalSnapshotConsensusFunctions[F] = new GlobalSnapshotConsensusFunctions[F] {
 
     private val logger = Slf4jLogger.getLoggerFromClass[F](getClass)
@@ -569,7 +595,10 @@ object GlobalSnapshotConsensusFunctions {
           updateNodeParameters,
           sharedArtifacts,
           delegatorRewardsMap,
-          overlayHandle
+          overlayHandle,
+          // Task #12 slice 2b — the typed per-ordinal delta accept() applied. Staged hash-keyed below (at
+          // the `overlay.commit` site, once `currentSnapshotHash` is known) for the gl0 changeset ring.
+          stateChangesAccumulator
         ) <-
           globalSnapshotAcceptanceManager
             .accept(
@@ -693,6 +722,23 @@ object GlobalSnapshotConsensusFunctions {
           io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(currentSnapshotHash),
           currentOrdinal
         )
+        // Task #12 slice 2b — STAGE the typed per-ordinal delta keyed by this snapshot's hash, right where
+        // the hash first becomes known (mirrors the `overlay.commit(BranchId(currentSnapshotHash), ...)` use
+        // of the same hash above). `SnapshotLeaderLoop` PROMOTES this into the served ordinal-keyed changeset
+        // ring iff the matching hash finalizes (depth-k OR attestation-2/3 sink), then removes it; staged
+        // entries for fork candidates that never finalize are evicted by the size bound below. Hash-keyed
+        // (not ordinal) because two competing proposals at `currentOrdinal` must not collide pre-finality. A
+        // plain `Map` has no insertion order, so on overflow we drop excess via `.drop` — a non-deterministic
+        // eviction is fine here: this is a transport memory bound, and a dropped pre-finalize entry only
+        // forces a follower into the full-GSI adopt fallback for that ordinal, never an incorrect result.
+        // Reached on BOTH the genuine produce path AND the follower/validator re-derivation (validateArtifact)
+        // — both build a real candidate whose hash, if finalized, the sink promotes; that is intended.
+        _ <- pendingAccumulatorsRef.update { staged =>
+          val updated = staged.updated(currentSnapshotHash, stateChangesAccumulator)
+          if (updated.size > GlobalSnapshotConsensusFunctions.pendingAccumulatorsToKeep)
+            updated.drop(updated.size - GlobalSnapshotConsensusFunctions.pendingAccumulatorsToKeep)
+          else updated
+        }
         returnedEvents = returnedSCEvents.map(StateChannelEvent(_)) ++ returnedDAGEvents
         _ <- ConsensusLog.info(
           logger,

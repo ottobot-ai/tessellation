@@ -24,6 +24,7 @@ import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.schema._
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, MptTxAction}
 import io.constellationnetwork.schema.nakamoto.slot._
 import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig}
@@ -400,6 +401,25 @@ object SnapshotLeaderLoop {
       SnapshotOrdinal,
       io.constellationnetwork.schema.nakamoto.follow.ConsumedFieldDelta
     ]],
+    // Task #12 slice 2b (ml0 changeset-adopt follow, the FULL-state analogue of the #287 gl1 slice ring
+    // above). STAGING map the gl0 producer (`GlobalSnapshotConsensusFunctions`) fills hash-keyed when it
+    // builds a snapshot; read here at the two finalize sinks to PROMOTE the just-finalized snapshot's
+    // accumulator into the served ring and then remove that hash. A finalized hash absent from the staging
+    // map (a snapshot this node did NOT itself produce, so it never staged) is skipped — the ml0 follower
+    // full-GSI-adopts that gap; absence MUST NOT error. Same instance `GlobalSnapshotConsensus.make` injects
+    // into the consensus functions.
+    pendingAccumulatorsRef: Ref[F, Map[Hash, StateChangesAccumulator]],
+    // Task #12 slice 2b — the SERVED bounded ring of recent FINALIZED per-ordinal accumulators keyed by
+    // ordinal (the ml0-side analogue of `recentFollowProjectionsRef`). Promoted at BOTH finalize sinks from
+    // `pendingAccumulatorsRef`, trimmed to the last `GlobalChangeSetService.recentAccumulatorsToKeep` (= 256,
+    // drop lowest ordinals). `GlobalChangeSetService.changeSetSince` (wired in a later slice) reads it to
+    // serve the per-ordinal deltas an ml0 follower adopts-and-verifies. Pure transport optimization: a
+    // follower whose `since` fell out of the ring re-fetches via full-GSI adopt, and the signed `mptRoot` at
+    // each delta's ordinal rejects a wrong base — so this bound is a memory bound, NOT a consensus parameter.
+    recentFinalizedAccumulatorsRef: Ref[F, scala.collection.immutable.SortedMap[
+      SnapshotOrdinal,
+      StateChangesAccumulator
+    ]],
     // Fire-and-forget ChainSync trigger for the finality walkback path. When the
     // finality monitor tries to confirm ancestry at an attested ordinal that we
     // don't have on our local canonical chain (we're on a fork), we enqueue a
@@ -498,6 +518,33 @@ object SnapshotLeaderLoop {
         if (updated.size > GlobalFollowSliceService.recentProjectionsToKeep)
           updated.drop(updated.size - GlobalFollowSliceService.recentProjectionsToKeep)
         else updated
+      }
+
+    // Task #12 slice 2b — PROMOTE the just-finalized snapshot's per-ordinal accumulator from the producer's
+    // hash-keyed staging map into the served ordinal-keyed changeset ring (the ml0-adopt analogue of
+    // `recordFollowProjection`). Look up `finalizedHash` in `pendingAccumulatorsRef`:
+    //   - present (this node produced/validated and staged it) ⇒ insert ordinal→acc into the served ring
+    //     trimmed to the last `GlobalChangeSetService.recentAccumulatorsToKeep` (drop lowest ordinals), AND
+    //     remove the hash from staging so it can't leak;
+    //   - absent (a snapshot this node did NOT itself stage) ⇒ skip — the ml0 follower full-GSI-adopts that
+    //     gap. Absence MUST NOT error; this is a best-effort transport optimization.
+    // Idempotent on re-finalize of the same ordinal (re-promote is a no-op once staging is drained). Called at
+    // BOTH finalize sinks (depth-k AND attestation-2/3), exactly paralleling `recordFollowProjection`.
+    def recordFinalizedAccumulator(ordinal: SnapshotOrdinal, finalizedHash: Hash): F[Unit] =
+      pendingAccumulatorsRef.modify { staged =>
+        staged.get(finalizedHash) match {
+          case Some(acc) => (staged - finalizedHash, Some(acc))
+          case None      => (staged, None)
+        }
+      }.flatMap {
+        case Some(acc) =>
+          recentFinalizedAccumulatorsRef.update { ring =>
+            val updated = ring.updated(ordinal, acc)
+            if (updated.size > GlobalChangeSetService.recentAccumulatorsToKeep)
+              updated.drop(updated.size - GlobalChangeSetService.recentAccumulatorsToKeep)
+            else updated
+          }
+        case None => Async[F].unit
       }
     // Use shared genesis time if provided, else fall back to wall clock
     val effectiveGenesisTime = if (genesisTimeMs > 0) genesisTimeMs else System.currentTimeMillis()
@@ -656,6 +703,7 @@ object SnapshotLeaderLoop {
                             shardBinaryBuffers,
                             shardAssignment,
                             shardCommitteeMembership,
+                            pendingAccumulatorsRef,
                             logger
                           )
                         } // snapshotSemaphore.permit
@@ -936,6 +984,14 @@ object SnapshotLeaderLoop {
                                               SnapshotOrdinal.unsafeApply(finalizeAtOrdinal),
                                               canonicalSnapshot.context
                                             ) >>
+                                            // Task #12 slice 2b: promote this finalized snapshot's per-ordinal accumulator
+                                            // (staged hash-keyed by the producer under `canonicalHash`) into the served
+                                            // changeset ring for the ml0 adopt-and-verify follow path. No-op if this node
+                                            // never staged it (didn't produce it) — the follower full-GSI-adopts that gap.
+                                            recordFinalizedAccumulator(
+                                              SnapshotOrdinal.unsafeApply(finalizeAtOrdinal),
+                                              canonicalHash
+                                            ) >>
                                             logger
                                               .info(
                                                 s"DEPTH-FINALIZED ordinal=$finalizeAtOrdinal slot=${canonicalSnapshot.slot} (tip ord=${tip.ordinal} slot=${tip.slot}, k=$ConfirmationDepthK)"
@@ -1035,6 +1091,9 @@ object SnapshotLeaderLoop {
                                             } >>
                                             // #287: same recent-projection ring update as the DEPTH-FINALIZED branch above.
                                             recordFollowProjection(SnapshotOrdinal.unsafeApply(finalOrdinal), stored.context) >>
+                                            // Task #12 slice 2b: same changeset-ring promotion as the DEPTH-FINALIZED branch
+                                            // above. No-op when this node didn't stage `canonicalHash` (didn't produce it).
+                                            recordFinalizedAccumulator(SnapshotOrdinal.unsafeApply(finalOrdinal), canonicalHash) >>
                                             snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(finalOrdinal))) >>
                                             logger.info(
                                               s"ATTEST-FINALIZED ordinal=$finalOrdinal slot=${stored.slot} (weight=${"%.2f".format(weight.toDouble)}, " +
@@ -1296,6 +1355,10 @@ object SnapshotLeaderLoop {
       io.constellationnetwork.schema.sharding.ShardId,
       EtaPeriod
     ) => F[Set[io.constellationnetwork.schema.peer.PeerId]],
+    // Task #12 slice 2b — the gl0 changeset STAGING map (threaded from `run`'s same-named param). The
+    // produce path below rekeys the staged accumulator raw->with-cert alongside the overlay rekey so the
+    // finalize-sink promotion (`recordFinalizedAccumulator`, in `run`) can find it under the canonical hash.
+    pendingAccumulatorsRef: Ref[F, Map[Hash, StateChangesAccumulator]],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     // Slice S6: app-scoped Supervisor for the off-critical-path producer fan-out (see Gap A below).
@@ -1472,9 +1535,23 @@ object SnapshotLeaderLoop {
                       // `discardBranch` has already cleaned up the now-orphan `pendingRef` entry.
                       _ <-
                         if (stored)
-                          mptOverlay.rekey(BranchId(rawArtifactHash), BranchId(snapshotHashedForStorage.hash))
+                          // Rekey the overlay branch AND the gl0 changeset staging map raw -> with-cert. The
+                          // accumulator was staged (GlobalSnapshotConsensusFunctions) under the RAW artifact hash
+                          // (== `rawArtifactHash`, pre slotCertificate+eta), but the finalize-sink promotion
+                          // (`recordFinalizedAccumulator`) looks it up under the with-cert canonical hash
+                          // (`snapshotHashedForStorage.hash`). Without this rekey the served ring never populates
+                          // for self-produced snapshots — the same raw->with-cert problem the overlay rekey beside
+                          // it already solves.
+                          mptOverlay.rekey(BranchId(rawArtifactHash), BranchId(snapshotHashedForStorage.hash)) >>
+                            pendingAccumulatorsRef.update { staged =>
+                              staged
+                                .get(rawArtifactHash)
+                                .fold(staged)(acc => (staged - rawArtifactHash).updated(snapshotHashedForStorage.hash, acc))
+                            }
                         else
-                          mptOverlay.discardBranch(BranchId(rawArtifactHash))
+                          // Abandoned fork: drop both the overlay branch and its staged accumulator.
+                          mptOverlay.discardBranch(BranchId(rawArtifactHash)) >>
+                            pendingAccumulatorsRef.update(_ - rawArtifactHash)
                       action: MptTxAction = if (stored) MptTxAction.Commit else MptTxAction.Rollback
                     } yield ((signed, context, returnedEvents, stored, snapshotHashedForStorage, parentHashValue), action)
                   }
