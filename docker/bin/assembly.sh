@@ -125,6 +125,24 @@ move_metagraph_jar() {
   local destination=$2
   path=$(ls -1t modules/${module}/target/scala-2.13/*-assembly*.jar | head -n1)
   dest="$PROJECT_ROOT/docker/jars/${destination}.jar"
+  # Stale-JAR guard (the recurring metagraph cl1/dl1 Zinc gotcha): when assembly actually ran this
+  # invocation, the produced JAR MUST be newer than the marker stamped just before assembly. Zinc does
+  # not reliably invalidate a metagraph subproject's compiled classes when only the upstream
+  # tessellation-sdk ivy version bumps, so `sbt <module>/assembly` can be a silent no-op that reuses a
+  # months-old JAR — which `ls -1t | head` then happily deploys, shipping a schema-mismatched metagraph
+  # node (decode failures vs the new gl0 wire format). Fail LOUDLY instead of silently deploying stale.
+  # Skipped only when METAGRAPH_ASSEMBLY_MARKER is unset (SKIP_METAGRAPH_ASSEMBLY=true path legitimately
+  # reuses existing JARs).
+  if [ -n "${METAGRAPH_ASSEMBLY_MARKER:-}" ] && [ -f "$METAGRAPH_ASSEMBLY_MARKER" ]; then
+    if [ -z "$path" ] || [ ! "$path" -nt "$METAGRAPH_ASSEMBLY_MARKER" ]; then
+      echo "❌ STALE METAGRAPH JAR for module '$module' → '$destination': '$path' is older than this run's"
+      echo "   assembly marker — sbt assembly was a no-op (Zinc did not recompile, likely an SDK"
+      echo "   version bump that didn't invalidate the subproject). Deploying it would ship a"
+      echo "   schema-mismatched node. Force a clean rebuild: rm -rf '$METAGRAPH'/modules/*/target"
+      echo "   (or 'just nuke'), then re-run without --skip-metagraph-assembly."
+      exit 1
+    fi
+  fi
   cp "$path" "$dest"
 }
 
@@ -132,6 +150,14 @@ move_metagraph_jar() {
 if [ -n "$METAGRAPH" ]; then
   echo "Assembling $METAGRAPH"
   cd $METAGRAPH
+
+  # Stamp a marker just before assembly so move_metagraph_jar can assert each produced JAR is newer
+  # (catches the Zinc-no-op stale-JAR trap). Only set when assembly will actually run — the
+  # SKIP_METAGRAPH_ASSEMBLY=true path intentionally reuses existing JARs, so leave the marker unset
+  # there to disable the freshness assertion.
+  if [ "$SKIP_METAGRAPH_ASSEMBLY" != "true" ]; then
+    export METAGRAPH_ASSEMBLY_MARKER="$(mktemp)"
+  fi
 
   missing=false
 
