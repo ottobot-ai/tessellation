@@ -5,10 +5,7 @@ import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
 
-import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.nakamoto.follow.{ConsumedFieldDelta, GlobalFollowSliceResponse}
-import io.constellationnetwork.schema.swap.AllowSpendReference
-import io.constellationnetwork.schema.tokenLock.TokenLockReference
+import io.constellationnetwork.schema.nakamoto.follow.{ConsumedFieldDelta, GlobalFollowSliceResponse, SyncedField}
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
 
 /** gl0-side SLICE PRODUCER for the gl1 own-slice follow path (Axis 2 — see `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`).
@@ -122,16 +119,14 @@ object GlobalFollowSliceService {
     * package, so a `private[nakamoto]` qualifier would not reach it).
     */
   def sliceFromGsi(gsi: GlobalSnapshotInfo): ConsumedFieldDelta =
-    ConsumedFieldDelta(
-      balances = gsi.balances,
-      lastTxRefs = gsi.lastTxRefs,
-      lastAllowSpendRefs = gsi.lastAllowSpendRefs.getOrElse(SortedMap.empty[Address, AllowSpendReference]),
-      lastTokenLockRefs = gsi.lastTokenLockRefs.getOrElse(SortedMap.empty[Address, TokenLockReference]),
-      activeTokenLocks = gsi.getActiveTokenLocks,
-      // 6th consumed field (cl1/dl1). Read directly from the finalized GSI — same Address-keyed shape. gl1 receives it too but
-      // never verifies/reads it (it passes `currencySnapshotsRoots = None`); cl1/dl1 need it for the metagraph's own
-      // currency-genesis bootstrap (`globalState.lastCurrencySnapshots.get(identifier)`).
-      lastCurrencySnapshots = gsi.lastCurrencySnapshots,
-      removals = SortedMap.empty
-    )
+    // Five UNIFORM consumed fields single-sourced via the registry (`sf.writeToDelta ∘ sf.readFromGsi`) onto a from-empty
+    // (all-upsert, no removals) delta — byte-identical to the prior per-field literal: each `writeToDelta` is an independent
+    // `copy` of a distinct slot and `readFromGsi` carries the SAME reads (`gsi.balances` / `gsi.lastTxRefs` /
+    // `gsi.lastAllowSpendRefs.getOrElse(empty)` / `gsi.lastTokenLockRefs.getOrElse(empty)` / `gsi.getActiveTokenLocks`).
+    SyncedField.baseRegistry
+      .foldLeft(ConsumedFieldDelta.empty)((d, sf) => sf.writeToDelta(d, sf.readFromGsi(gsi)))
+      // 6th consumed field (cl1/dl1) — the bespoke outlier NOT in the uniform registry. Read directly from the finalized GSI
+      // (same Address-keyed shape). gl1 receives it too but never verifies/reads it (it passes `currencySnapshotsRoots = None`);
+      // cl1/dl1 need it for the metagraph's own currency-genesis bootstrap (`globalState.lastCurrencySnapshots.get(identifier)`).
+      .copy(lastCurrencySnapshots = gsi.lastCurrencySnapshots)
 }

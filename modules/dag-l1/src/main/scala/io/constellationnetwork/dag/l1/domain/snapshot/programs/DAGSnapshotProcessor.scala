@@ -19,7 +19,7 @@ import io.constellationnetwork.node.shared.domain.swap.AllowSpendStorage
 import io.constellationnetwork.node.shared.domain.tokenlock.TokenLockStorage
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
-import io.constellationnetwork.schema.nakamoto.follow.{ConsumedFieldState, FollowVerificationError, GlobalFollowSliceResponse}
+import io.constellationnetwork.schema.nakamoto.follow._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher, SecurityProvider}
@@ -254,15 +254,7 @@ object DAGSnapshotProcessor {
     * consumed field recompute-matches.
     */
   private def signedFieldRoots(stateProof: GlobalSnapshotStateProof): SortedMap[GlobalStateFieldId, Hash] =
-    SortedMap.from(
-      List(
-        Some(GlobalStateFieldId.Balances -> stateProof.balancesProof),
-        Some(GlobalStateFieldId.LastTxRefs -> stateProof.lastTxRefsProof),
-        stateProof.lastAllowSpendRefs.map(GlobalStateFieldId.LastAllowSpendRefs -> _),
-        stateProof.lastTokenLockRefs.map(GlobalStateFieldId.LastTokenLockRefs -> _),
-        stateProof.activeTokenLocks.map(GlobalStateFieldId.ActiveTokenLocks -> _)
-      ).flatten
-    )
+    FollowVerifyCore.signedFieldRoots(stateProof)
 
   /** Build a `GlobalSnapshotInfo` populated with ONLY the five Address-keyed consumed fields from a verified [[ConsumedFieldState]]; every
     * other field is left at `GlobalSnapshotInfo.empty`'s value. The three `Option`-typed consumed fields are lifted into `Some(...)`
@@ -272,13 +264,7 @@ object DAGSnapshotProcessor {
     * replacement fails `NothingToReplace`.
     */
   private def consumedFieldsToGlobalSnapshotInfo(state: ConsumedFieldState): GlobalSnapshotInfo =
-    GlobalSnapshotInfo.empty.copy(
-      lastTxRefs = state.lastTxRefs,
-      balances = state.balances,
-      lastAllowSpendRefs = state.lastAllowSpendRefs.some,
-      lastTokenLockRefs = state.lastTokenLockRefs.some,
-      activeTokenLocks = state.activeTokenLocks.some
-    )
+    FollowVerifyCore.toGlobalSnapshotInfo(state)
 
   private def describe(err: FollowVerificationError): String = err match {
     case FollowVerificationError.CommittedRootMismatch(expected, got) =>

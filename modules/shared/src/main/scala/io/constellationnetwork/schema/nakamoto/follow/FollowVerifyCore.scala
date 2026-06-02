@@ -15,6 +15,7 @@ import io.constellationnetwork.schema.mpt.{GlobalStateConverter, GlobalStateFiel
 import io.constellationnetwork.schema.swap.AllowSpendReference
 import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
 import io.constellationnetwork.schema.transaction.TransactionReference
+import io.constellationnetwork.schema.{GlobalSnapshotInfo, GlobalSnapshotStateProof}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -357,13 +358,35 @@ object FollowVerifyCore {
     * `getBalanceAffectedByTxs`, fed from `TokenLockService.getActiveTokenLocks`); without it the follower's mirror keeps `activeTokenLocks`
     * empty and every replacement fails `NothingToReplace`.
     */
-  val consumedFields: List[GlobalStateFieldId] = List(
-    GlobalStateFieldId.Balances,
-    GlobalStateFieldId.LastTxRefs,
-    GlobalStateFieldId.LastAllowSpendRefs,
-    GlobalStateFieldId.LastTokenLockRefs,
-    GlobalStateFieldId.ActiveTokenLocks
-  )
+  val consumedFields: List[GlobalStateFieldId] = SyncedField.baseRegistry.map(_.fieldId)
+
+  /** Map a snapshot's signed `stateProof` per-field roots onto the five UNIFORM [[GlobalStateFieldId]]s a follower syncs, in the shape
+    * [[GlobalFollowMirrorVerifier.verifyByFieldRoot]] / [[verifyFieldRoots]] expect. `Balances` / `LastTxRefs` are always-present `Hash`es;
+    * `LastAllowSpendRefs` / `LastTokenLockRefs` / `ActiveTokenLocks` are `Option[Hash]` on the proof — a `None` is OMITTED from the map,
+    * and the verifier treats an absent field as [[Hash.empty]] (matching gl0's `getOrElse(_, Hash.empty)` empty-field convention), so an
+    * empty consumed field recompute-matches.
+    *
+    * Single-sourced over [[SyncedField.baseRegistry]] (`sf.signedRoot`): byte-identical to the per-field literal it replaces — `flatMap`
+    * drops the `None`s exactly as the old `List(Some(...), ..., proof.<opt>.map(...)).flatten` did, and `SortedMap.from` sorts the
+    * surviving `(fieldId, hash)` pairs the same way regardless of input order. The 6th field (`lastCurrencySnapshots`) is NOT here — it has
+    * no single `stateProof.<field>Proof` slot and is verified by the injected [[currencySnapshotsCheck]] recompute instead.
+    */
+  def signedFieldRoots(proof: GlobalSnapshotStateProof): SortedMap[GlobalStateFieldId, Hash] =
+    SortedMap.from(SyncedField.baseRegistry.flatMap(sf => sf.signedRoot(proof).map(sf.fieldId -> _)))
+
+  /** Build a [[GlobalSnapshotInfo]] populated with ONLY the five UNIFORM Address-keyed consumed fields from a verified
+    * [[ConsumedFieldState]]; every other GSI field stays at [[GlobalSnapshotInfo.empty]]'s value. This is the partial GSI a gl1 follower
+    * stores + tx-validates against; `mptStore.syncFromGlobalSnapshotInfo` tolerates the empty fields (no-op inserts). `activeTokenLocks` is
+    * the load-bearing one — it is read by gl1's token-lock-replacement validator (via `TokenLockService.getActiveTokenLocks`); without it
+    * the mirror stays empty and every replacement fails `NothingToReplace`.
+    *
+    * Single-sourced over [[SyncedField.baseRegistry]] (`sf.writeToGsi ∘ sf.readFromState`): byte-identical to the gl1 literal it replaces —
+    * each `writeToGsi` is an independent `copy` of a distinct slot (`= m` for the always-bare slots, `= m.some` for the `Option`-typed
+    * slots), so the fold order is immaterial. cl1/dl1 callers add the 6th `lastCurrencySnapshots` slot on top via `.copy(...)` — it is the
+    * bespoke outlier deliberately NOT in the uniform registry.
+    */
+  def toGlobalSnapshotInfo(state: ConsumedFieldState): GlobalSnapshotInfo =
+    SyncedField.baseRegistry.foldLeft(GlobalSnapshotInfo.empty)((g, sf) => sf.writeToGsi(g, sf.readFromState(state)))
 
   /** FIELD-ROOT-MATCH verify for an own-slice mirror follower (gl1). Correct-by-design completeness via field-root equality, for a holder
     * of the full content of the four consumed fields — Address-keyed throughout (own-slice rework, 2026-05-28).

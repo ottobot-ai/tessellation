@@ -518,15 +518,7 @@ object CurrencySnapshotProcessor {
     * verified by the injected `currencySnapshotsCheck` recompute instead.
     */
   private def signedFieldRoots(stateProof: GlobalSnapshotStateProof): SortedMap[GlobalStateFieldId, Hash] =
-    SortedMap.from(
-      List(
-        Some(GlobalStateFieldId.Balances -> stateProof.balancesProof),
-        Some(GlobalStateFieldId.LastTxRefs -> stateProof.lastTxRefsProof),
-        stateProof.lastAllowSpendRefs.map(GlobalStateFieldId.LastAllowSpendRefs -> _),
-        stateProof.lastTokenLockRefs.map(GlobalStateFieldId.LastTokenLockRefs -> _),
-        stateProof.activeTokenLocks.map(GlobalStateFieldId.ActiveTokenLocks -> _)
-      ).flatten
-    )
+    FollowVerifyCore.signedFieldRoots(stateProof)
 
   /** Build a `GlobalSnapshotInfo` populated with the SIX fields cl1/dl1 consume from a verified [[ConsumedFieldState]]; every other field
     * stays at `GlobalSnapshotInfo.empty`'s value. The five Address-keyed consumed fields match gl1's
@@ -536,14 +528,9 @@ object CurrencySnapshotProcessor {
     * proofs map (only the snapshot+info value via `.get(identifier)`).
     */
   private def consumedFieldsToGlobalSnapshotInfo(state: ConsumedFieldState): GlobalSnapshotInfo =
-    GlobalSnapshotInfo.empty.copy(
-      lastTxRefs = state.lastTxRefs,
-      balances = state.balances,
-      lastCurrencySnapshots = state.lastCurrencySnapshots,
-      lastAllowSpendRefs = state.lastAllowSpendRefs.some,
-      lastTokenLockRefs = state.lastTokenLockRefs.some,
-      activeTokenLocks = state.activeTokenLocks.some
-    )
+    // Five UNIFORM consumed fields single-sourced via the registry; the 6th (`lastCurrencySnapshots`, the bespoke
+    // outlier deliberately NOT in the registry) is layered on top — byte-identical to the prior 6-field literal.
+    FollowVerifyCore.toGlobalSnapshotInfo(state).copy(lastCurrencySnapshots = state.lastCurrencySnapshots)
 
   private def describe(err: FollowVerificationError): String = err match {
     case FollowVerificationError.CommittedRootMismatch(expected, got) =>

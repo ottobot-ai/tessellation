@@ -30,15 +30,15 @@ import weaver.MutableIOSuite
   *
   * THE VULNERABILITY this guards: the deep-catch-up path adopts a gossiped `(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)` as the
   * node's ENTIRE canonical gl0 state (balances/txRefs/stakes/locks + MPT) WITHOUT the snapshot's parent — so the full
-  * `NakamotoSnapshotValidator.validate` (VRF + slot-cert) can't run. Before the fix, that adoption was UNVERIFIED: a single peer gossiping a
-  * forged tuple could unilaterally reset the victim's state. `verifyCatchUpSnapshot` closes this with two parent-free, deterministic gates —
-  * envelope signature (gate 1) and stateProof-vs-GSI consistency (gate 2) — that BOTH pass for an honest snapshot and BOTH fail-closed for a
-  * forged / inconsistent one.
+  * `NakamotoSnapshotValidator.validate` (VRF + slot-cert) can't run. Before the fix, that adoption was UNVERIFIED: a single peer gossiping
+  * a forged tuple could unilaterally reset the victim's state. `verifyCatchUpSnapshot` closes this with two parent-free, deterministic
+  * gates — envelope signature (gate 1) and stateProof-vs-GSI consistency (gate 2) — that BOTH pass for an honest snapshot and BOTH
+  * fail-closed for a forged / inconsistent one.
   *
   *   1. '''honest tuple → Accept''' — a correctly-signed snapshot whose `stateProof` was built from the carried GSI is adopted (legitimate
   *      catch-up still recovers).
-  *   1. '''forged signature → RejectedInvalidSignature''' — a snapshot whose body was tampered after signing (signature no longer matches the
-  *      hash) is rejected by gate 1.
+  *   1. '''forged signature → RejectedInvalidSignature''' — a snapshot whose body was tampered after signing (signature no longer matches
+  *      the hash) is rejected by gate 1.
   *   1. '''mismatched GSI → RejectedStateProofMismatch''' — a validly-signed snapshot paired with a DIFFERENT GlobalSnapshotInfo (attacker-
   *      chosen state) is rejected by gate 2.
   */
