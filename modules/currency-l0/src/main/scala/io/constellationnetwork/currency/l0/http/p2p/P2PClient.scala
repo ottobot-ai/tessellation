@@ -31,7 +31,11 @@ object P2PClient {
       StateChannelSnapshotClient.make(client, sharedConfig.snapshotBinarySenderTimeouts),
       L0GlobalSnapshotClient.make(client, none, sharedConfig.snapshotTimeoutsConfig),
       CurrencySnapshotClient.make[F](client, session, sharedConfig.snapshotTimeoutsConfig),
-      DataApplicationClient.make(client, session)
+      DataApplicationClient.make(client, session),
+      // ml0 global-FOLLOW adopt transport (task #12): GET /global-follow/changeset?since=<ord> against a GL0 peer.
+      // Same `Client[F]`/PeerResponse pattern as L0GlobalSnapshotClient above; wired into GlobalL0Service so
+      // `getChangeSetSince` is live for ml0 (the adopt-and-verify follow path).
+      GlobalFollowClient.make(client)
     ) {}
 }
 
@@ -43,5 +47,6 @@ sealed abstract class P2PClient[F[_]] private (
   val stateChannelSnapshot: StateChannelSnapshotClient[F],
   val l0GlobalSnapshot: L0GlobalSnapshotClient[F],
   val currencySnapshot: CurrencySnapshotClient[F],
-  val dataApplication: DataApplicationClient[F]
+  val dataApplication: DataApplicationClient[F],
+  val globalFollow: GlobalFollowClient[F]
 )

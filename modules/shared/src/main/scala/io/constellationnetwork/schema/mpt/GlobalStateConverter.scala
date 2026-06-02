@@ -92,6 +92,244 @@ object GlobalStateConverter {
     removedHistoricalStakeSnapshotKeys: Set[EtaPeriod] = Set.empty
   )
 
+  /** Apply a per-ordinal typed [[StateChangesAccumulator]] delta to a prior [[GlobalSnapshotInfo]], yielding the GSI the producer's
+    * `GlobalSnapshotAcceptanceManager.accept()` would have built for that ordinal. PURE data logic — no codec, no auto-derivation, no MPT.
+    *
+    * This is the typed mirror of `MptStore.syncFromStateChanges` (which applies the SAME accumulator to the MPT byte store). The two stay
+    * in lockstep: for every field, the merge rule here is byte-for-byte the same shape the MPT writer applies, so a follower that adopts
+    * this GSI and recomputes the MPT root over its bytes lands on the producer's signed `mptRoot` (the verify-before-adopt anchor). 1:1 GSI
+    * ↔ accumulator field correspondence (~18 per-field merges):
+    *
+    *   - '''Always-present overwrite''' (`prior.field ++ delta.field` — the delta carries the COMPLETE new value per touched key): the five
+    *     mandatory maps (`lastStateChannelSnapshotHashes`, `lastTxRefs`, `balances`, `lastCurrencySnapshots`,
+    *     `lastCurrencySnapshotsProofs`) plus the per-key-additive Option maps (`lastAllowSpendRefs`, `lastTokenLockRefs`,
+    *     `metagraphSyncData`, `updateNodeParameters`, `priceState`) and the bare `historicalStakeSnapshots` (with its retention removals).
+    *   - '''Removal-set fields''' (`(prior.field -- removedXKeys) ++ delta.field`): `activeTokenLocks`(`removedTokenLockKeys`),
+    *     `tokenLockBalances`(`removedTokenLockBalanceKeys`), `activeDelegatedStakes`(`removedDelegatedStakeKeys`),
+    *     `delegatedStakesWithdrawals`(`removedDelegatedStakeWithdrawalKeys`), `activeNodeCollaterals`(`removedNodeCollateralKeys`),
+    *     `nodeCollateralWithdrawals`(`removedNodeCollateralWithdrawalKeys`).
+    *   - '''Nested allow-spends''' (`activeAllowSpends`): merged at the FLATTENED `(optAddr, addr)` granularity — exactly how the MPT
+    *     writer keys it. Per `(optAddr, addr)` key: the delta's complete `SortedSet` value overwrites; `removedAllowSpendKeys` deletes. The
+    *     inner map is NOT wholesale-replaced at the top-level `optAddr` key, and an `optAddr` bucket left empty after removals is dropped.
+    *
+    * '''Option-emptiness convention.''' Post-tessellation3 (the steady-state ml0 follow path) the producer wraps every optional field in
+    * `Some(_)` even when the resulting map is empty (`Era.postTess3`). So when `prior.field` is `Some(_)` we keep `Some(merged)` (matching
+    * createContext); when `prior.field` is `None` we lift to `Some(merged)` only if the delta/removal touched it, else preserve `None`. The
+    * Some-vs-None distinction is MPT-invisible (both encode zero entries for an empty field), so the root-match cannot police it — getting
+    * it right here keeps the GSI ml0 KEEPS for reads + the data-application context faithful to the producer.
+    *
+    * Edge (accepted, not policed): `priceState` / `metagraphSyncData` activate at the LATER `postTess301` / `postMetagraphSync` thresholds,
+    * not `postTess3`. At a sub-threshold-boundary ordinal the producer may emit `None` where prior was `Some(empty)` (or vice versa). This
+    * is MPT-invisible / root-equivalent (verify still passes) and the candidate GSI is consumed by ml0 for READS + the data-application
+    * only (never consensus bytes), so the brief Some-vs-None drift on these two fields is harmless and intentionally left un-gated.
+    */
+  def applyAccumulatorToGSI(prior: GlobalSnapshotInfo, delta: StateChangesAccumulator): GlobalSnapshotInfo = {
+    // Always-present (mandatory) maps — overwrite per touched key.
+    val lastStateChannelSnapshotHashes = prior.lastStateChannelSnapshotHashes ++ delta.lastStateChannelSnapshotHashes
+    val lastTxRefs = prior.lastTxRefs ++ delta.lastTxRefs
+    val balances = prior.balances ++ delta.balances
+    val lastCurrencySnapshots = prior.lastCurrencySnapshots ++ delta.lastCurrencySnapshots
+    val lastCurrencySnapshotsProofs = prior.lastCurrencySnapshotsProofs ++ delta.lastCurrencySnapshotsProofs
+
+    // Bare (non-Option) historicalStakeSnapshots — apply retention removals then overlay boundary adds.
+    val historicalStakeSnapshots =
+      (prior.historicalStakeSnapshots -- delta.removedHistoricalStakeSnapshotKeys) ++ delta.historicalStakeSnapshots
+
+    // Option helper for per-key-additive optional maps (no removal set): result Some iff prior was Some or the delta is non-empty.
+    def mergeOptAdditive[K, V](
+      priorOpt: Option[SortedMap[K, V]],
+      deltaMap: SortedMap[K, V]
+    ): Option[SortedMap[K, V]] =
+      priorOpt match {
+        case Some(p) => Some(p ++ deltaMap)
+        case None    => if (deltaMap.nonEmpty) Some(deltaMap) else None
+      }
+
+    // Option helper for removal-set optional maps: `(prior -- removed) ++ delta`. Some iff prior was Some or the delta/removal touched it.
+    def mergeOptWithRemovals[K, V](
+      priorOpt: Option[SortedMap[K, V]],
+      deltaMap: SortedMap[K, V],
+      removedKeys: Set[K]
+    ): Option[SortedMap[K, V]] =
+      priorOpt match {
+        case Some(p) => Some((p -- removedKeys) ++ deltaMap)
+        case None    => if (deltaMap.nonEmpty || removedKeys.nonEmpty) Some(deltaMap) else None
+      }
+
+    // Generic two-level merge for a nested `Option[SortedMap[OuterK, SortedMap[InnerK, V]]]` whose MPT partition is keyed at the FLATTENED
+    // `(OuterK, InnerK)` granularity (activeAllowSpends, tokenLockBalances). Per flattened key: the delta's complete value overwrites and
+    // `removedFlatKeys` deletes; an outer bucket left empty after removals is dropped. Mirrors the MPT writer's per-flat-key insert/remove.
+    def mergeNestedFlat[OuterK: Ordering, InnerK: Ordering, V](
+      priorOpt: Option[SortedMap[OuterK, SortedMap[InnerK, V]]],
+      deltaMap: SortedMap[OuterK, SortedMap[InnerK, V]],
+      removedFlatKeys: Set[(OuterK, InnerK)]
+    ): Option[SortedMap[OuterK, SortedMap[InnerK, V]]] = {
+      val touched = deltaMap.nonEmpty || removedFlatKeys.nonEmpty
+      priorOpt match {
+        case None if !touched => None
+        case _ =>
+          val base = priorOpt.getOrElse(SortedMap.empty[OuterK, SortedMap[InnerK, V]])
+          val afterRemovals: Map[(OuterK, InnerK), V] =
+            base.iterator.flatMap {
+              case (outer, inner) => inner.iterator.map { case (innerK, v) => (outer, innerK) -> v }
+            }.toMap -- removedFlatKeys
+          val afterDelta: Map[(OuterK, InnerK), V] =
+            afterRemovals ++ deltaMap.iterator.flatMap {
+              case (outer, inner) => inner.iterator.map { case (innerK, v) => (outer, innerK) -> v }
+            }
+          val regrouped: SortedMap[OuterK, SortedMap[InnerK, V]] =
+            SortedMap.from(
+              afterDelta.toList
+                .groupBy(_._1._1)
+                .view
+                .mapValues(entries => SortedMap.from(entries.map { case ((_, innerK), v) => innerK -> v }))
+                .filter { case (_, inner) => inner.nonEmpty }
+                .toMap
+            )
+          Some(regrouped)
+      }
+    }
+
+    GlobalSnapshotInfo(
+      lastStateChannelSnapshotHashes = lastStateChannelSnapshotHashes,
+      lastTxRefs = lastTxRefs,
+      balances = balances,
+      lastCurrencySnapshots = lastCurrencySnapshots,
+      lastCurrencySnapshotsProofs = lastCurrencySnapshotsProofs,
+      activeAllowSpends = mergeNestedFlat(prior.activeAllowSpends, delta.activeAllowSpends, delta.removedAllowSpendKeys),
+      activeTokenLocks = mergeOptWithRemovals(prior.activeTokenLocks, delta.activeTokenLocks, delta.removedTokenLockKeys),
+      tokenLockBalances = mergeNestedFlat(prior.tokenLockBalances, delta.tokenLockBalances, delta.removedTokenLockBalanceKeys),
+      lastAllowSpendRefs = mergeOptAdditive(prior.lastAllowSpendRefs, delta.lastAllowSpendRefs),
+      lastTokenLockRefs = mergeOptAdditive(prior.lastTokenLockRefs, delta.lastTokenLockRefs),
+      updateNodeParameters = mergeOptAdditive(prior.updateNodeParameters, delta.updateNodeParameters),
+      activeDelegatedStakes =
+        mergeOptWithRemovals(prior.activeDelegatedStakes, delta.activeDelegatedStakes, delta.removedDelegatedStakeKeys),
+      delegatedStakesWithdrawals = mergeOptWithRemovals(
+        prior.delegatedStakesWithdrawals,
+        delta.delegatedStakesWithdrawals,
+        delta.removedDelegatedStakeWithdrawalKeys
+      ),
+      activeNodeCollaterals =
+        mergeOptWithRemovals(prior.activeNodeCollaterals, delta.activeNodeCollaterals, delta.removedNodeCollateralKeys),
+      nodeCollateralWithdrawals = mergeOptWithRemovals(
+        prior.nodeCollateralWithdrawals,
+        delta.nodeCollateralWithdrawals,
+        delta.removedNodeCollateralWithdrawalKeys
+      ),
+      priceState = mergeOptAdditive(prior.priceState, delta.priceState),
+      metagraphSyncData = mergeOptAdditive(prior.metagraphSyncData, delta.metagraphSyncData),
+      historicalStakeSnapshots = historicalStakeSnapshots
+    )
+  }
+
+  /** The exact O(changes) sidecar/index keys `toAccumulatorHexDelta`'s replay reads back from the store: the touched expiry-index epoch
+    * buckets (from the accumulator's three `SystemIndexDelta`s) and the active-address / address-pair index entries for the fields whose
+    * keyset this ordinal touched. Returns the HEX keys; the caller reads ONLY these from the store (no full-state scan).
+    *
+    * Keep in lockstep with `toAccumulatorHexDelta` — every key it `preSyncBytes.get(_)`s for must appear here, or the replayed bucket/index
+    * bytes silently diverge from the in-store sync and the recomputed root mismatches (which the verify gate then rejects, falling back to
+    * the full path — safe, but defeats the adopt fast-path).
+    */
+  def changeSetPreSyncHexKeys[F[_]: Async: Hasher](acc: StateChangesAccumulator): F[Set[Hex]] = {
+    import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
+
+    def expiryKeys(label: SystemNamespaceLabel, delta: SystemIndexDelta[_]): F[List[GlobalStateKey]] =
+      delta match {
+        case eb: SystemIndexDelta.EpochBucket[_] =>
+          eb.touchedEpochs.toList.traverse(epoch => GlobalStateKey.expiryIndexKey[F](label, epoch))
+      }
+
+    // Active-address-index fields whose keyset this ordinal touched (additive — refs/balances/etc. that don't embed their address).
+    val activeAddressIndexFields: List[GlobalStateFieldId] =
+      List(LastAllowSpendRefs, LastTokenLockRefs, LastTxRefs, Balances, LastStateChannelSnapshotHashes, LastCurrencySnapshots)
+
+    val touchedActiveAddressFields: List[GlobalStateFieldId] = activeAddressIndexFields.filter {
+      case LastAllowSpendRefs             => acc.lastAllowSpendRefs.nonEmpty
+      case LastTokenLockRefs              => acc.lastTokenLockRefs.nonEmpty
+      case LastTxRefs                     => acc.lastTxRefs.nonEmpty
+      case Balances                       => acc.balances.nonEmpty
+      case LastStateChannelSnapshotHashes => acc.lastStateChannelSnapshotHashes.nonEmpty
+      case LastCurrencySnapshots          => acc.lastCurrencySnapshots.nonEmpty
+      case _                              => false
+    }
+
+    val tokenLockBalanceTouched =
+      acc.tokenLockBalances.nonEmpty || acc.removedTokenLockBalanceKeys.nonEmpty
+
+    for {
+      asExpiry <- expiryKeys(SystemNamespaceLabel.ExpiryIndexAllowSpends, acc.allowSpendExpiryIndex)
+      tlExpiry <- expiryKeys(SystemNamespaceLabel.ExpiryIndexTokenLocks, acc.tokenLockExpiryIndex)
+      ncwExpiry <- expiryKeys(SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, acc.nodeCollateralWithdrawalExpiryIndex)
+      addrIdx <- touchedActiveAddressFields.traverse(fid => GlobalStateKey.activeAddressIndexKey[F](fid))
+      pairIdx <-
+        if (tokenLockBalanceTouched) GlobalStateKey.activeAddressIndexKey[F](TokenLockBalances).map(List(_))
+        else List.empty[GlobalStateKey].pure[F]
+      allKeys = asExpiry ++ tlExpiry ++ ncwExpiry ++ addrIdx ++ pairIdx
+      hexKeys <- allKeys.traverse(GlobalStateKey.toHex[F])
+    } yield hexKeys.toSet
+  }
+
+  /** ml0 (currency-l0) global-FOLLOW adopt-and-verify decision for ONE ordinal `N` (task #12). The verify-before-adopt safety gate,
+    * isolated from `StateChannel` so it is unit-testable without the full snapshot-processing loop.
+    *
+    * Given the prior GSI (ml0's `lastState`), the per-ordinal `delta`, the signed snapshot's claimed `signedMptRoot` for `N`, and `N`:
+    *
+    *   1. Builds `candidateGSI = applyAccumulatorToGSI(prior, delta)` (the typed GSI ml0 would keep). 2. Reads ONLY the O(changes)
+    *      sidecar/index keys the hex-delta replay needs (`changeSetPreSyncHexKeys`) from the store as `preSyncBytes`. 3. Derives `(hexUp,
+    *      hexRem) = toAccumulatorHexDelta(delta, preSyncBytes)` — the SAME typed→hex derivation the producer uses. 4. Inside
+    *      `mptStore.withTransaction`: applies `hexRem` then `hexUp` to the producer incrementally, builds at `N` to get `newRoot`, and — if
+    *      `Some(newRoot) === signedMptRoot` — yields `(Some(candidateGSI), Commit)`; otherwise `(None, Rollback)`.
+    *
+    * The `withTransaction` Commit/Rollback bracket is THE enforcement: on any mismatch (wrong/tampered delta, incomplete preSyncBytes,
+    * evicted base) the MPT mutations are rolled back and `None` is returned — the caller MUST then fall back to the full path and never
+    * advance ml0 state. `Some(gsi)` is returned ONLY when the recomputed root equals the signed root, so adoption is correct by
+    * construction.
+    *
+    * Returns `None` (caller falls back) on: root mismatch, OR `signedMptRoot = None` (legacy-format ordinal — no MPT anchor to verify
+    * against, so the cheap adopt path is not safe; defer to createContext).
+    */
+  def adoptAndVerifyChangeSetDelta[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    mptStore: MptStore[F, GlobalStateKey],
+    prior: GlobalSnapshotInfo,
+    delta: StateChangesAccumulator,
+    signedMptRoot: Option[Hash],
+    ordinal: SnapshotOrdinal
+  )(implicit stateProofSelector: StateProofSelector): F[Option[GlobalSnapshotInfo]] =
+    signedMptRoot match {
+      case None =>
+        // Legacy-format ordinal: no signed mptRoot to anchor verification → adopt path unsafe, fall back.
+        none[GlobalSnapshotInfo].pure[F]
+      case Some(expectedRoot) =>
+        val candidateGSI = applyAccumulatorToGSI(prior, delta)
+        for {
+          preSyncKeys <- changeSetPreSyncHexKeys[F](delta)
+          storeBytes <- mptStore.allEntriesAsBytes
+          preSyncBytes = storeBytes.view.filterKeys(preSyncKeys).toMap
+          hexDelta <- toAccumulatorHexDelta[F](delta, preSyncBytes)
+          (hexUp, hexRem) = hexDelta
+          result <- mptStore.withTransaction {
+            for {
+              _ <- mptStore.underlying.remove(hexRem.toList).whenA(hexRem.nonEmpty)
+              _ <- mptStore.underlying.insertBytes(hexUp).whenA(hexUp.nonEmpty)
+              _ <- mptStore.underlying.buildForOrdinal(ordinal)
+              newRoot <- mptStore.underlying.getRootHashForOrdinal(ordinal)
+              matches = newRoot.map(_.value).contains(expectedRoot)
+              out <-
+                if (matches)
+                  // On the verified-match branch ONLY, do the SAME tail work the retained
+                  // createContext -> syncFromStateChanges -> store.commit(ordinal) path does:
+                  // advance the store's last-synced ordinal + persist (build + persist + bookkeeping).
+                  // Without this the in-memory trie is correct but lastSyncedOrdinal stays stale and the
+                  // on-disk MPT lags across restarts. Kept inside this branch so a mismatch rolls back with
+                  // NO persist and ml0 never advances on an unverified delta.
+                  mptStore.commit(ordinal).as((candidateGSI.some, MptTxAction.Commit: MptTxAction))
+                else
+                  (none[GlobalSnapshotInfo], MptTxAction.Rollback: MptTxAction).pure[F]
+            } yield out
+          }
+        } yield result
+    }
+
   /** Apply a `(added, removed)` delta to the `ActiveAddressIndex` partition for `fieldId`. Read-modify-write on the single MPT entry that
     * holds the `SortedSet[Address]` for that field — no-ops when the resulting set is unchanged, deletes the entry when it becomes empty.
     *

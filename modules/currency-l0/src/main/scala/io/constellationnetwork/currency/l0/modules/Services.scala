@@ -146,7 +146,11 @@ object Services {
           storages.lastSyncGlobalSnapshot,
           None,
           maybeMajorityPeerIds,
-          sharedStorages.mptStore
+          sharedStorages.mptStore,
+          // Task #12: wire the changeset-fetch client so `getChangeSetSince` is live for ml0's
+          // adopt-and-verify global-follow path (StateChannel.handleIncrementalSnapshot). cl1/dl1
+          // are unaffected — they wire their own GlobalFollowClient for the 5-field slice path.
+          p2PClient.globalFollow.some
         )
 
       currencyMessagesService = CurrencyMessagesService.make[F](

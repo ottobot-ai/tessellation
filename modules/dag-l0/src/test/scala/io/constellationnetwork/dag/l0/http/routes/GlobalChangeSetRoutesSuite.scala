@@ -22,8 +22,8 @@ import org.http4s.syntax.literals._
 import scodec.bits.BitVector
 import suite.HttpSuite
 
-/** Route + service round-trip tests (test (b) of task #12 slice 3) for the ml0 changeset endpoint
-  * (`GET /global-follow/changeset?since=<ord>`) served by [[GlobalFollowRoutes]].
+/** Route + service round-trip tests (test (b) of task #12 slice 3) for the ml0 changeset endpoint (`GET
+  * /global-follow/changeset?since=<ord>`) served by [[GlobalFollowRoutes]].
   *
   * Builds a REAL [[GlobalChangeSetService]] over a populated ordinal-keyed accumulator ring (the same `SortedMap` shape
   * `recentFinalizedAccumulatorsRef` carries in production), wires it into the route, issues the HTTP GET, then decodes the FULLY-SCODEC
@@ -50,8 +50,8 @@ object GlobalChangeSetRoutesSuite extends HttpSuite {
   private val populatedRing: SortedMap[SnapshotOrdinal, StateChangesAccumulator] =
     SortedMap(ord(8L) -> acc(8L), ord(9L) -> acc(9L), ord(10L) -> acc(10L))
 
-  /** Build the routes wired to a changeset service over `ring` (None ⇒ empty service Ref, exercising the pre-startup 503). The slice service
-    * Ref is left empty — this suite only drives the changeset endpoint.
+  /** Build the routes wired to a changeset service over `ring` (None ⇒ empty service Ref, exercising the pre-startup 503). The slice
+    * service Ref is left empty — this suite only drives the changeset endpoint.
     */
   private def mkRoutes(ring: Option[SortedMap[SnapshotOrdinal, StateChangesAccumulator]]): IO[HttpRoutes[IO]] =
     for {

@@ -198,6 +198,76 @@ object StateChannel {
         )
       } yield ()
 
+    // ADOPT-AND-VERIFY follow state-advance (task #12). On the global-FOLLOW path ml0 no longer RE-EXECUTES global
+    // consensus (`createContext`) to derive the next GlobalSnapshotInfo for ordinal N. Instead it fetches gl0's typed
+    // per-ordinal `StateChangesAccumulator` change-set, applies the delta for N on top of `lastState` to get a candidate
+    // GSI, recomputes the MPT root incrementally, and adopts the candidate ONLY IF that root EQUALS the signed snapshot's
+    // `stateProof.mptRoot` (the `withTransaction` Commit/Rollback gate inside `adoptAndVerifyChangeSetDelta`). The signed
+    // mptRoot is the ONLY trust anchor: ANY miss (no client, `baseOrdinal=None`, missing delta for N, incomplete
+    // preSyncBytes, or a tampered delta → recomputed root ≠ signed) rolls back the MPT tx and FALLS BACK to the full
+    // `createContext` path for that ordinal — ml0 NEVER advances its global state on a mismatch.
+    //
+    // `createContext` is RETAINED, unchanged, for (a) this fallback and (b) ml0 producing its OWN currency snapshots — only
+    // the global-follow state-advance is replaced.
+    def deriveFollowContext(
+      snapshot: Hashed[GlobalIncrementalSnapshot],
+      lastSnapshot: Hashed[GlobalIncrementalSnapshot],
+      lastState: GlobalSnapshotInfo
+    ): F[GlobalSnapshotInfo] = {
+      val fallbackCreateContext: F[GlobalSnapshotInfo] =
+        services.globalSnapshotContextFunctions.createContext(
+          lastState,
+          lastSnapshot.signed,
+          snapshot.signed,
+          services.globalL0.pullGlobalSnapshot
+        )
+
+      def adopt(deltaN: io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator): F[GlobalSnapshotInfo] =
+        io.constellationnetwork.schema.mpt.GlobalStateConverter
+          .adoptAndVerifyChangeSetDelta[F](
+            sharedStorages.mptStore,
+            lastState,
+            deltaN,
+            snapshot.signed.value.stateProof.mptRoot,
+            snapshot.ordinal
+          )
+          .flatMap {
+            case Some(adoptedGsi) =>
+              logger
+                .debug(
+                  s"ml0 adopt-and-verify: adopted ordinal=${snapshot.ordinal.show} (recomputed mptRoot matched signed stateProof.mptRoot)"
+                )
+                .as(adoptedGsi)
+            case None =>
+              logger.info(
+                s"ml0 adopt-and-verify: verify FAILED for ordinal=${snapshot.ordinal.show} (recomputed mptRoot ≠ signed " +
+                  s"or legacy-format); MPT rolled back, falling back to createContext"
+              ) >> fallbackCreateContext
+          }
+
+      // `GlobalSnapshotInfo` carries no ordinal, so the state ml0 currently holds is identified by `lastSnapshot.ordinal`
+      // (the parent of `snapshot`; chain-link guarantees `snapshot.ordinal === lastSnapshot.ordinal.next`).
+      // `getChangeSetSince(lastSnapshot.ordinal)` returns the contiguous deltas for `(lastSnapshot.ordinal, latestFinalized]`.
+      // We adopt only the ONE delta for `snapshot.ordinal` here; the per-ordinal `processSnapshotList` loop advances the
+      // rest, each verified against its OWN signed mptRoot. (Re-fetching the change-set per ordinal-step is a perf
+      // follow-up — the verify gate's correctness does not depend on batching.)
+      val since = lastSnapshot.ordinal
+      services.globalL0.getChangeSetSince(since).flatMap {
+        case Some(resp) if resp.baseOrdinal.contains(since) =>
+          resp.deltas.collectFirst { case (o, d) if o === snapshot.ordinal => d } match {
+            case Some(deltaN) => adopt(deltaN)
+            case None =>
+              logger.debug(
+                s"ml0 adopt-and-verify: change-set has no delta for ordinal=${snapshot.ordinal.show} " +
+                  s"(base=${since.show}, latest=${resp.latestOrdinal.show}); falling back to createContext"
+              ) >> fallbackCreateContext
+          }
+        case _ =>
+          // No client wired, gl0 returned `baseOrdinal=None` (since fell out of the ring), or no response — full path.
+          fallbackCreateContext
+      }
+    }
+
     def handleIncrementalSnapshot(
       snapshot: Hashed[GlobalIncrementalSnapshot],
       lastSnapshot: Hashed[GlobalIncrementalSnapshot],
@@ -213,12 +283,7 @@ object StateChannel {
       // startup and via recoverFromOrphan / setForRecovery on rollback paths.
       (for {
         _ <- logger.info(s"Processing incremental snapshot ordinal=${snapshot.ordinal}")
-        context <- services.globalSnapshotContextFunctions.createContext(
-          lastState,
-          lastSnapshot.signed,
-          snapshot.signed,
-          services.globalL0.pullGlobalSnapshot
-        )
+        context <- deriveFollowContext(snapshot, lastSnapshot, lastState)
         _ <- storages.lastSyncGlobalSnapshot.set(snapshot, context)
         _ <- sharedStorages.lastNGlobalSnapshot.set(snapshot, context)
         _ <- sharedStorages.lastGlobalSnapshot.set(snapshot, context)

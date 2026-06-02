@@ -72,13 +72,13 @@ object ChangeSetRingPromotionSuite extends SimpleIOSuite {
       // A follower at ordinal-1 must receive the just-finalized delta.
       changeSet <- service.changeSetSince(ord(4L))
     } yield
-      expect(pulled.isDefined) &&                                   // rekey made the with-cert lookup succeed
-      expect.same(rekeyed.get(rawHash), None) &&                    // raw key removed by the rekey (no leak)
-      expect.same(ringAfter.get(ordinal), Some(a)) &&               // promoted into the served ring
-      expect(changeSet.isDefined) &&
-      expect.same(changeSet.flatMap(_.baseOrdinal), Some(ord(4L))) &&
-      expect.same(changeSet.map(_.latestOrdinal), Some(ordinal)) &&
-      expect.same(changeSet.map(_.deltas), Some(List(ordinal -> a)))
+      expect(pulled.isDefined) && // rekey made the with-cert lookup succeed
+        expect.same(rekeyed.get(rawHash), None) && // raw key removed by the rekey (no leak)
+        expect.same(ringAfter.get(ordinal), Some(a)) && // promoted into the served ring
+        expect(changeSet.isDefined) &&
+        expect.same(changeSet.flatMap(_.baseOrdinal), Some(ord(4L))) &&
+        expect.same(changeSet.map(_.latestOrdinal), Some(ordinal)) &&
+        expect.same(changeSet.map(_.deltas), Some(List(ordinal -> a)))
   }
 
   test("guard: WITHOUT the produce-path rekey, the finalize-sink lookup misses and the ring stays empty") {
@@ -98,9 +98,9 @@ object ChangeSetRingPromotionSuite extends SimpleIOSuite {
     for {
       changeSet <- service.changeSetSince(ord(4L))
     } yield
-      expect.same(pulled, None) &&            // the bug: with-cert lookup misses the raw-staged entry
-      expect(ringAfter.isEmpty) &&            // ring never populates
-      expect.same(changeSet, None)            // service has nothing to serve (cold ring)
+      expect.same(pulled, None) && // the bug: with-cert lookup misses the raw-staged entry
+        expect(ringAfter.isEmpty) && // ring never populates
+        expect.same(changeSet, None) // service has nothing to serve (cold ring)
   }
 
   test("ringInsertTrimmed bounds the served ring to recentAccumulatorsToKeep, dropping the lowest ordinals") {

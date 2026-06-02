@@ -16,16 +16,16 @@ import shapeless.{::, HNil}
   * slice 3; see `project_ml0_diff_adopt_design`).
   *
   * Explicit, hand-written (NO auto-derivation): the wire layout follows the case-class field order exactly —
-  *   1. `latestOrdinal` — a [[SnapshotOrdinal]] (NonNegLong newtype; codec via [[NewtypeLongShapes]]);
-  *   2. `baseOrdinal` — `Option[SnapshotOrdinal]` (1-byte present/absent flag + body, see [[io.constellationnetwork.serde.codecs.OptionCodec]]);
-  *   3. `deltas` — `List[(SnapshotOrdinal, StateChangesAccumulator)]` (2-byte count + insertion-order tuples, see
-   *     [[io.constellationnetwork.serde.codecs.ListCodec]]). The per-ordinal accumulator REUSES the canonical
-  *     [[StateChangesAccumulatorCodec]] — the accumulator binary is scodec, never Circe/auto-derived.
+  *   1. `latestOrdinal` — a [[SnapshotOrdinal]] (NonNegLong newtype; codec via [[NewtypeLongShapes]]); 2. `baseOrdinal` —
+  *      `Option[SnapshotOrdinal]` (1-byte present/absent flag + body, see [[io.constellationnetwork.serde.codecs.OptionCodec]]); 3.
+  *      `deltas` — `List[(SnapshotOrdinal, StateChangesAccumulator)]` (2-byte count + insertion-order tuples, see
+  *      [[io.constellationnetwork.serde.codecs.ListCodec]]). The per-ordinal accumulator REUSES the canonical
+  *      [[StateChangesAccumulatorCodec]] — the accumulator binary is scodec, never Circe/auto-derived.
   *
   * This is a TRANSPORT codec, not a signing/hashing preimage: the cryptographic anchor of each delta is the matching signed snapshot's
   * `mptRoot`, recomputed independently by applying the delta. The encoding is nonetheless frozen byte-for-byte like every other consensus
-  * codec — the per-ordinal accumulator's bytes are byte-identical to those `StateChangesAccumulatorCodec` produces standalone, so a follower
-  * can decode the embedded delta with the same codec it uses elsewhere.
+  * codec — the per-ordinal accumulator's bytes are byte-identical to those `StateChangesAccumulatorCodec` produces standalone, so a
+  * follower can decode the embedded delta with the same codec it uses elsewhere.
   */
 object GlobalChangeSetResponseCodec {
 
