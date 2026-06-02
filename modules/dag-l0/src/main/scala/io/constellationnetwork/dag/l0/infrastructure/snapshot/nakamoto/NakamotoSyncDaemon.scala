@@ -36,6 +36,7 @@ import io.constellationnetwork.security.signature.signature.Signature
 import io.constellationnetwork.security.signature.{Signed, Signing}
 import io.constellationnetwork.security.vrf.EcVrf25519
 import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
+import io.constellationnetwork.validator.StateProofValidator
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -86,6 +87,92 @@ object NakamotoSyncDaemon {
       case ShardCheckpointAcceptResult.PendingMoreAttestations           => true
       case ShardCheckpointAcceptResult.Rejected(_)                       => false
       case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(_, _) => false
+    }
+
+  /** Verdict of the parent-missing catch-up admission check ([[verifyCatchUpSnapshot]]). The deep-catch-up path adopts a gossiped
+    * `(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)` as the node's ENTIRE canonical gl0 state (balances/txRefs/stakes/locks +
+    * MPT), so — unlike the happy path — the carried snapshot's parent is not in the local chain store and the full
+    * `NakamotoSnapshotValidator.validate` (VRF + slot-cert) is unreachable. Without a gate, a single peer gossiping a forged tuple at
+    * `ordinal > k` would unilaterally reset the victim's state. The two gates below are each a PURE function of the gossiped bytes + the
+    * carried context (identical verdict on every honest node), and BOTH must pass before any canonical write.
+    */
+  sealed private[nakamoto] trait CatchUpVerdict
+  private[nakamoto] object CatchUpVerdict {
+
+    /** Both gates passed: envelope signature is valid AND the carried `GlobalSnapshotInfo` rebuilds to the exact `stateProof` the snapshot
+      * commits to. Safe to adopt. Carries the verified `Hashed` (sig-checked) so the caller reuses it for canonical storage instead of
+      * re-hashing via the no-check `toHashed`.
+      */
+    case class Accept(hashed: Hashed[GlobalIncrementalSnapshot]) extends CatchUpVerdict
+
+    /** Gate 1 failed: the envelope signature does not verify against the snapshot hash. Forged / unauthorized signer. Do NOT adopt. */
+    case object RejectedInvalidSignature extends CatchUpVerdict
+
+    /** Gate 2 failed: the carried `GlobalSnapshotInfo` does NOT rebuild to the `stateProof` baked into the (validly-signed) snapshot — the
+      * attacker (or a corrupt/mis-paired payload) supplied a context inconsistent with what was signed. Do NOT adopt the context into the
+      * MPT. Carries the verified `Hashed` for logging the ordinal/hash.
+      */
+    case class RejectedStateProofMismatch(hashed: Hashed[GlobalIncrementalSnapshot]) extends CatchUpVerdict
+  }
+
+  /** Parent-missing catch-up admission gate. Verifies a gossiped catch-up snapshot WITHOUT needing its parent (which the node lacks during
+    * deep catch-up), so the unilateral-state-reset attack is closed even though `NakamotoSnapshotValidator.validate` can't run here.
+    *
+    * Gate 1 — '''envelope signature''' (`toHashedWithSignatureCheck`, the SAME callable the normal pull path uses at
+    * `GlobalL0Service.pullLatestSnapshotFromPeer` / `pullSnapshots`): rejects a tuple whose `Signed[GlobalIncrementalSnapshot]` proofs
+    * don't verify against the snapshot hash. A forged snapshot from an unauthorized signer cannot pass.
+    *
+    * Gate 2 — '''stateProof consistency''': rebuilds the `GlobalSnapshotStateProof` from the carried `GlobalSnapshotInfo` alone (via
+    * `StateProofValidator.forGlobal(producer = None)` → `GlobalSnapshotInfo.mptStateProof`, a PURE function of the GSI bytes — it does NOT
+    * read or mutate the live `MptStore`) and requires it `equivalent` to the `stateProof` the signed snapshot commits to, using the EXACT
+    * symmetric `StateProofComparison` the producer/follower already use (`StateProofValidator.validateProof`). This binds the
+    * MPT-to-be-written GSI to the signed snapshot: an attacker cannot pair a validly-signed snapshot with an attacker-chosen state.
+    *
+    * Both gates are deterministic and side-effect-free w.r.t. canonical storage / MPT, so an honest snapshot (valid sig, GSI matching its
+    * own committed stateProof) ALWAYS yields `Accept` and legitimate catch-up still recovers.
+    *
+    * '''Why gates 1+2 suffice to close the unilateral-state-reset attack.''' The attack adopts an attacker-chosen `GlobalSnapshotInfo` as
+    * canonical state. Gate 1 forces the carried snapshot to be signed by a key whose proof verifies the snapshot hash; gate 2 forces the
+    * carried GSI to be EXACTLY the state that snapshot committed to (`stateProof` incl. `mptRoot`). So the only state an attacker can
+    * install is one already bound to a validly-signed snapshot — i.e. real consensus output, not a fabrication.
+    *
+    * '''Gate 3 (majority-hash) — DEFERRED, follow-up.''' The normal BFT pull path cross-checks a snapshot's hash against majority peers
+    * (`GlobalL0Service.getMajorityHash`). That machinery lives in node-shared's pull-mode `GlobalL0Service` and is NOT wired into this
+    * push-based sidecar-gossip daemon (`catchUpFromGossip` receives no `L0ClusterStorage` / snapshot client). Adding it means threading new
+    * peer-query infrastructure through the daemon constructor; out of scope here. Impact of omission: a validly-signed-but-MINORITY-fork
+    * snapshot could still be adopted during catch-up. That is bounded — it must be real signed consensus output, and on the next local
+    * production / gossip wave normal fork-choice (ChainSelection) reorgs to the denser chain — whereas the closed hole allowed adopting a
+    * fabrication with NO signer at all.
+    *
+    * '''Gate 4 (VRF / slot-cert) — DEFERRED, sound reason.''' Eligibility verification needs the period `eta` (and active-set/stake) at the
+    * snapshot's period; during deep catch-up (gap > k) the node lacks the chain history to derive that eta deterministically.
+    * `handleSnapshot` already falls back to the snapshot's OWN self-reported `eta` when the parent chain is absent — using that
+    * attacker-supplied eta to verify the attacker's own VRF is circular and adds no security. So VRF/slot-cert is not soundly checkable in
+    * the parent-missing case and is intentionally not attempted here; gates 1+2 carry the safety.
+    */
+  private[nakamoto] def verifyCatchUpSnapshot[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector](
+    signedSnapshot: Signed[GlobalIncrementalSnapshot],
+    context: GlobalSnapshotInfo
+  )(
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): F[CatchUpVerdict] =
+    HasherSelector[F].withCurrent { implicit hasher =>
+      // Gate 1: envelope signature. `toHashedWithSignatureCheck` returns Left(InvalidSignatureForHash) when any proof fails.
+      signedSnapshot.toHashedWithSignatureCheck.flatMap {
+        case Left(_) =>
+          (CatchUpVerdict.RejectedInvalidSignature: CatchUpVerdict).pure[F]
+        case Right(hashed) =>
+          // Gate 2: rebuild the state proof from the carried GSI (no producer ⇒ pure, no live-store access) and compare against the
+          // snapshot's committed `stateProof` via the shared symmetric comparison.
+          StateProofValidator
+            .forGlobal[F](None)
+            .validate(hashed, context)
+            .map {
+              case cats.data.Validated.Valid(_)   => CatchUpVerdict.Accept(hashed)
+              case cats.data.Validated.Invalid(_) => CatchUpVerdict.RejectedStateProofMismatch(hashed)
+            }
+      }
     }
 
   /** Ethereum-style mempool reconciliation after catch-up/reorg.
@@ -2389,8 +2476,12 @@ object NakamotoSyncDaemon {
   /** Catch up from a gossip payload when parent is missing (restart scenario).
     *
     * Instead of rejecting the snapshot, use it to reset local state to the network tip. The gossip message already contains the full
-    * Signed[GlobalIncrementalSnapshot] + GlobalSnapshotInfo. We skip validation (can't validate without parent) but reset our canonical
-    * storage so subsequent gossip messages WILL have parents we recognize.
+    * Signed[GlobalIncrementalSnapshot] + GlobalSnapshotInfo. The parent is absent so the full `NakamotoSnapshotValidator.validate` (VRF +
+    * slot-cert) can't run, but the two parent-free, deterministic gates in [[verifyCatchUpSnapshot]] (envelope signature +
+    * stateProof-vs-GSI consistency) DO run BEFORE any canonical/MPT write — an unsigned/forged or GSI-inconsistent tuple is rejected and
+    * nothing is written (the node retries on a later gossip wave; the 10s cooldown rate-limits). An honest snapshot passes both gates by
+    * construction, so we reset our canonical storage + MPT and subsequent gossip messages WILL have parents we recognize. See
+    * [[verifyCatchUpSnapshot]] for why majority-hash (gate 3) and VRF/slot-cert (gate 4) are NOT enforced on this path.
     */
   private def catchUpFromGossip[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
     snap: pb.Snapshot,
@@ -2426,83 +2517,115 @@ object NakamotoSyncDaemon {
             val parentHash = Hash(new String(snap.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
             for {
               _ <- stateRef.update(_.copy(lastCatchUpAttemptMs = now))
-              _ <- logger.warn(
-                s"\uD83D\uDD04 CATCH-UP: No parent found for ordinal=${snap.ordinal} slot=${snap.slot}. " +
-                  s"Resetting local state to network tip."
-              )
-              _ <- productionGate.pause("catch-up-sync")
+              // SECURITY: the parent is missing here, so `NakamotoSnapshotValidator.validate` (VRF + slot-cert) cannot run. Adopting an
+              // UNVERIFIED gossiped tuple as the entire canonical gl0 state would let any single peer reset our balances/txRefs/stakes/
+              // locks. Gate adoption on the two parent-free, deterministic checks (`verifyCatchUpSnapshot`) BEFORE touching any canonical
+              // storage or the MPT: a forged-signature tuple (gate 1) or a GSI inconsistent with the signed `stateProof` (gate 2) is
+              // rejected and nothing is written; the node retries on a later gossip wave (the 10s cooldown rate-limits). An HONEST
+              // snapshot (valid sig + GSI matching its committed stateProof) passes both gates by construction, so legitimate catch-up
+              // still recovers.
+              verdict <- verifyCatchUpSnapshot[F](signedSnapshot, context)
+              _ <- verdict match {
+                case CatchUpVerdict.RejectedInvalidSignature =>
+                  logger.warn(
+                    s"⛔ Rejecting catch-up snapshot ordinal=${snap.ordinal} slot=${snap.slot}: INVALID envelope signature. " +
+                      s"Not adopting (no canonical/MPT write). Will retry on next gossip wave."
+                  ) >>
+                    Metrics[F].incrementCounter(
+                      "dag_nakamoto_catchup_rejected",
+                      Seq(Metrics.unsafeLabelName("reason") -> "invalid_signature")
+                    )
+                case CatchUpVerdict.RejectedStateProofMismatch(rejectedHashed) =>
+                  logger.warn(
+                    s"⛔ Rejecting catch-up snapshot ordinal=${snap.ordinal} slot=${snap.slot} " +
+                      s"hash=${rejectedHashed.hash.value.take(12)}: carried GlobalSnapshotInfo does NOT match the snapshot's " +
+                      s"committed stateProof (state-proof mismatch). Not adopting (no canonical/MPT write). Retrying on next gossip wave."
+                  ) >>
+                    Metrics[F].incrementCounter(
+                      "dag_nakamoto_catchup_rejected",
+                      Seq(Metrics.unsafeLabelName("reason") -> "state_proof_mismatch")
+                    )
+                case CatchUpVerdict.Accept(verifiedHashed) =>
+                  for {
+                    _ <- logger.warn(
+                      s"\uD83D\uDD04 CATCH-UP: No parent found for ordinal=${snap.ordinal} slot=${snap.slot} " +
+                        s"(verified: signature OK, stateProof matches). Resetting local state to network tip."
+                    )
+                    _ <- productionGate.pause("catch-up-sync")
 
-              // Store in chain store (seed this snapshot as our new starting point)
-              _ <- chainStore.store(
-                signedSnapshot,
-                context,
-                snap.ordinal,
-                snap.slot,
-                parentHash,
-                vrfOutputFromProof(snap.vrfProof.toByteArray)
-              )
+                    // Store in chain store (seed this snapshot as our new starting point)
+                    _ <- chainStore.store(
+                      signedSnapshot,
+                      context,
+                      snap.ordinal,
+                      snap.slot,
+                      parentHash,
+                      vrfOutputFromProof(snap.vrfProof.toByteArray)
+                    )
 
-              // Update ALL canonical storages — snapshotStorage is what SnapshotLeaderLoop
-              // reads for its parent. Without this, the leader loop produces at the OLD ordinal
-              // after catch-up, causing the node to fall behind again immediately.
-              _ <- HasherSelector[F].withCurrent { implicit hasher =>
-                snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
-                  signedSnapshot.toHashed[F].flatMap { hashed =>
-                    lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
-                      lastNGlobalSnapshotStorage.setForRecovery(hashed, context)
-                  }
-              }
+                    // Update ALL canonical storages — snapshotStorage is what SnapshotLeaderLoop
+                    // reads for its parent. Without this, the leader loop produces at the OLD ordinal
+                    // after catch-up, causing the node to fall behind again immediately. Reuse the
+                    // signature-verified `Hashed` from `verifyCatchUpSnapshot` rather than re-hashing
+                    // via the no-signature-check `toHashed` (`setHeadForRecovery` needs the implicit Hasher).
+                    _ <- HasherSelector[F].withCurrent { implicit hasher =>
+                      snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
+                        lastGlobalSnapshotStorage.setForRecovery(verifiedHashed, context) >>
+                        lastNGlobalSnapshotStorage.setForRecovery(verifiedHashed, context)
+                    }
 
-              // MPT full sync from the context we received — critical for
-              // the acceptance manager to validate subsequent snapshots
-              _ <- logger.info(s"\uD83D\uDD04 CATCH-UP: Syncing MPT from received context...")
-              _ <- HasherSelector[F].withCurrent { implicit hasher =>
-                mptStore.syncFromGlobalSnapshotInfo(context, SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)))
-              }
-              // Don't overwrite lastKnownSlotRef with the gossip slot — it may be
-              // ahead of our wall clock, making slotGap negative and blocking VRF
-              // eligibility. Production will update it after its next successful store.
+                    // MPT full sync from the context we received — critical for
+                    // the acceptance manager to validate subsequent snapshots
+                    _ <- logger.info(s"\uD83D\uDD04 CATCH-UP: Syncing MPT from received context...")
+                    _ <- HasherSelector[F].withCurrent { implicit hasher =>
+                      mptStore.syncFromGlobalSnapshotInfo(context, SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)))
+                    }
+                    // Don't overwrite lastKnownSlotRef with the gossip slot — it may be
+                    // ahead of our wall clock, making slotGap negative and blocking VRF
+                    // eligibility. Production will update it after its next successful store.
 
-              // Reconcile event mempool — evict DAG blocks whose transactions are
-              // already consumed in the new context's lastTxRefs (prevents double-spend).
-              // Keep events whose transactions are still unconfirmed (prevents starvation).
-              _ <- reconcileMempool(eventMempool, context, logger)
+                    // Reconcile event mempool — evict DAG blocks whose transactions are
+                    // already consumed in the new context's lastTxRefs (prevents double-spend).
+                    // Keep events whose transactions are still unconfirmed (prevents starvation).
+                    _ <- reconcileMempool(eventMempool, context, logger)
 
-              _ <- stateRef.update(
-                _.copy(
-                  networkTipOrdinal = snap.ordinal,
-                  networkTipHash = Some(Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))),
-                  localTipOrdinal = snap.ordinal
-                )
-              )
+                    _ <- stateRef.update(
+                      _.copy(
+                        networkTipOrdinal = snap.ordinal,
+                        networkTipHash = Some(Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))),
+                        localTipOrdinal = snap.ordinal
+                      )
+                    )
 
-              _ <- productionGate.resume("catch-up-sync")
-              _ <- Metrics[F].incrementCounter("dag_nakamoto_catchups")
-              _ <- logger.info(
-                s"\u2705 CATCH-UP complete: now at ordinal=${snap.ordinal} slot=${snap.slot}. " +
-                  s"Subsequent gossip should find parents."
-              )
+                    _ <- productionGate.resume("catch-up-sync")
+                    _ <- Metrics[F].incrementCounter("dag_nakamoto_catchups")
+                    _ <- logger.info(
+                      s"\u2705 CATCH-UP complete: now at ordinal=${snap.ordinal} slot=${snap.slot}. " +
+                        s"Subsequent gossip should find parents."
+                    )
 
-              // Start backfill daemon in background to fill the gap from caught-up tip down to genesis.
-              // The parent hash of the caught-up snapshot is the starting point for the walk-back.
-              _ <- {
-                val cursor = BackfillDaemon.BackfillCursor(
-                  nextHashToFetch = parentHash.value,
-                  targetOrdinal = 1L,
-                  currentOrdinal = snap.ordinal,
-                  startedAtOrdinal = snap.ordinal,
-                  completedChunks = Set.empty,
-                  createdAtMs = System.currentTimeMillis()
-                )
-                // Scope the backfill fiber to the app Supervisor so shutdown cancels cleanly.
-                // Previously a raw Async.start leaked a fiber that outlived the owning daemon.
-                supervisor
-                  .supervise(
-                    BackfillDaemon
-                      .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
-                      .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
-                  )
-                  .void
+                    // Start backfill daemon in background to fill the gap from caught-up tip down to genesis.
+                    // The parent hash of the caught-up snapshot is the starting point for the walk-back.
+                    _ <- {
+                      val cursor = BackfillDaemon.BackfillCursor(
+                        nextHashToFetch = parentHash.value,
+                        targetOrdinal = 1L,
+                        currentOrdinal = snap.ordinal,
+                        startedAtOrdinal = snap.ordinal,
+                        completedChunks = Set.empty,
+                        createdAtMs = System.currentTimeMillis()
+                      )
+                      // Scope the backfill fiber to the app Supervisor so shutdown cancels cleanly.
+                      // Previously a raw Async.start leaked a fiber that outlived the owning daemon.
+                      supervisor
+                        .supervise(
+                          BackfillDaemon
+                            .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
+                            .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
+                        )
+                        .void
+                    }
+                  } yield ()
               }
             } yield ()
           case None =>
