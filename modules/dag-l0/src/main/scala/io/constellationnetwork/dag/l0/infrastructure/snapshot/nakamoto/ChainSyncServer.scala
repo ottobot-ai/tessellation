@@ -6,12 +6,18 @@ import cats.syntax.all._
 
 import scala.concurrent.{ExecutionContext, Future}
 
-import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
+import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer
+import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
+import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo}
 import io.constellationnetwork.security.HasherSelector
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
+import eu.timepit.refined.refineV
 import io.grpc.stub.StreamObserver
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
@@ -22,9 +28,16 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   */
 object ChainSyncServer {
 
-  def make[F[_]: Async: HasherSelector](
+  def make[F[_]: Async: HasherSelector: JsonSerializer](
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    // #259: recent-FINALIZED snapshots — the authoritative source for a peer's metagraph-binary
+    // fetch. We look up each requested value-hash among the binaries each finalized snapshot
+    // carries in `stateChannelSnapshots`.
+    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
+    // #259: orphan buffer, scanned NON-DESTRUCTIVELY (`peekForValueHash`) so we can also serve a
+    // binary that is buffered locally but not yet folded into a finalized snapshot.
+    orphanBuffer: MetagraphOrphanBuffer[F],
     dispatcher: Dispatcher[F]
   )(implicit ec: ExecutionContext): pb.ChainSyncInboundGrpc.ChainSyncInbound = {
     val logger = Slf4jLogger.getLoggerFromName[F]("ChainSyncServer")
@@ -232,6 +245,131 @@ object ChainSyncServer {
                 }
               }
             } >> Async[F].delay(responseObserver.onCompleted())
+        }
+
+      // #259: serve local metagraph state-channel binaries to a peer's active-recovery fetch.
+      //
+      // The peer's gl0 orphan-buffered a binary whose parent it never admitted; it now pulls that
+      // binary by VALUE-hash so it can re-feed it through its own committee gate. We answer from two
+      // local sources, in priority order:
+      //   1. RECENT-FINALIZED snapshots (`getLastN`): each carries its accepted binaries in
+      //      `stateChannelSnapshots[address]` as a `NonEmptyList[Signed[StateChannelSnapshotBinary]]`.
+      //      A binary here is authoritative — already admitted + finalized by this node.
+      //   2. ORPHAN BUFFER (NON-DESTRUCTIVE `peekForValueHash`): a binary we ourselves buffered but
+      //      have not yet folded into a finalized snapshot. Serving it does NOT remove it from our
+      //      buffer (correction A) — a peer fetch never mutates our admission state.
+      //
+      // Correction C (wire format): finalized-snapshot matches are serialized with
+      // `JsonSerializer[F].serialize(signed)` — the EXACT bytes the gossip path produces
+      // (StateChannelRoutes.broadcastMetagraphBinary), so the peer's re-feed
+      // (`handleMetagraphBinary` → `processBytes`) deserializes them identically. Orphan-buffer
+      // matches are served as the raw buffered wire bytes, which ARE those same gossip bytes.
+      //
+      // Correction D (value-hash identity): requested hashes arrive as UTF-8 of the canonical Hash
+      // hex string (matching `ChainSyncManager.requestMissing` / `serveSnapshots` decode). We compare
+      // against `signed.toHashed.map(_.hash)` = the binary's *value*-hash — the SAME identity the
+      // orphan buffer keys on and gl0 writes into `lastStateChannelSnapshotHashes`. NOT a wire-bytes
+      // digest.
+      //
+      // Correction B (no unsafeRunSync, no Any): the whole lookup is one `F` run via
+      // `dispatcher.unsafeRunAndForget`; inside it we use effectful `filterA` / `collectFirstSomeM`
+      // and a `Ref` dedup accumulator — never `.unsafeRunSync` in a loop.
+      override def serveMetagraphBinaries(
+        request: pb.FetchMetagraphBinariesRequest,
+        responseObserver: StreamObserver[pb.MetagraphBinaryResponse]
+      ): Unit =
+        dispatcher.unsafeRunAndForget {
+          refineV[DAGAddressRefined](request.metagraphAddress) match {
+            case Left(err) =>
+              logger.warn(
+                s"ChainSync SERVE BINARIES: invalid metagraph address '${request.metagraphAddress}' ($err)"
+              ) >> Async[F].delay(responseObserver.onCompleted())
+
+            case Right(refined) =>
+              val address = Address(refined)
+              // Value-hashes: UTF-8 of the canonical Hash hex string (correction D).
+              val requested: List[Hash] =
+                request.binaryHashes.toList.map(h => Hash(new String(h.toByteArray, java.nio.charset.StandardCharsets.UTF_8)))
+              val requestedSet: Set[Hash] = requested.toSet
+
+              def emit(bytes: Array[Byte]): F[Unit] =
+                Async[F].delay(
+                  responseObserver.onNext(
+                    pb.MetagraphBinaryResponse(signedBinary = com.google.protobuf.ByteString.copyFrom(bytes))
+                  )
+                )
+
+              if (requestedSet.isEmpty)
+                Async[F].delay(responseObserver.onCompleted())
+              else
+                HasherSelector[F].withCurrent { implicit hasher =>
+                  // Dedup so we serve each value-hash at most once across both sources.
+                  cats.effect.Ref.of[F, Set[Hash]](Set.empty[Hash]).flatMap { servedRef =>
+                    val serveFromFinalized: F[Unit] =
+                      lastNGlobalSnapshotStorage.getLastN.flatMap { snapshots =>
+                        snapshots.traverse_ { hashed =>
+                          hashed.signed.value.stateChannelSnapshots.get(address) match {
+                            case None           => Async[F].unit
+                            case Some(binaries) =>
+                              // Effectful filter on the binary's VALUE-hash, skipping anything already served.
+                              binaries.toList.filterA { signed =>
+                                signed.toHashed[F].flatMap { hb =>
+                                  servedRef.get.map(served => requestedSet.contains(hb.hash) && !served.contains(hb.hash))
+                                }
+                              }.flatMap {
+                                _.traverse_ { signed =>
+                                  signed.toHashed[F].flatMap { hb =>
+                                    // Correction C: exact gossip-path bytes.
+                                    JsonSerializer[F].serialize(signed).flatMap { wireBytes =>
+                                      servedRef.update(_ + hb.hash) >>
+                                        logger.info(
+                                          s"ChainSync SERVE BINARIES: mg=$address served value-hash ${hb.hash.value.take(12)} from finalized snapshot"
+                                        ) >>
+                                        emit(wireBytes)
+                                    }
+                                  }
+                                }
+                              }
+                          }
+                        }
+                      }
+
+                    // Correction A: NON-DESTRUCTIVE orphan-buffer peek for any still-unserved hash.
+                    val serveFromOrphanBuffer: F[Unit] =
+                      servedRef.get.flatMap { servedSoFar =>
+                        val stillMissing = requested.filterNot(servedSoFar.contains).distinct
+                        stillMissing.traverse_ { wanted =>
+                          orphanBuffer
+                            .peekForValueHash(address, wanted) { bytes =>
+                              // Deserialize-then-hash via the SAME gossip codec; return the value-hash.
+                              JsonSerializer[F]
+                                .deserialize[Signed[StateChannelSnapshotBinary]](bytes)
+                                .flatMap {
+                                  case Left(_)       => Async[F].pure(none[Hash])
+                                  case Right(signed) => signed.toHashed[F].map(hb => hb.hash.some)
+                                }
+                            }
+                            .flatMap {
+                              case None => Async[F].unit
+                              case Some(bytes) =>
+                                servedRef.update(_ + wanted) >>
+                                  logger.info(
+                                    s"ChainSync SERVE BINARIES: mg=$address served value-hash ${wanted.value.take(12)} from orphan buffer (non-destructive)"
+                                  ) >>
+                                  emit(bytes)
+                            }
+                        }
+                      }
+
+                    logger.info(
+                      s"ChainSync SERVE BINARIES: ${requested.size} value-hash(es) requested for mg=$address: ${requested.map(_.value.take(12)).mkString(",")}"
+                    ) >>
+                      serveFromFinalized >>
+                      serveFromOrphanBuffer >>
+                      Async[F].delay(responseObserver.onCompleted())
+                  }
+                }
+          }
         }
     }
   }

@@ -543,6 +543,25 @@ func (s *Server) FetchByRange(req *pb.FetchByRangeRequest, stream pb.ChainSyncOu
 	return nil
 }
 
+// FetchMetagraphBinaries pulls missing metagraph binaries by value-hash from a
+// peer (#259). Mirrors FetchByRange: relays to the chainsync handler, streams
+// each matched binary back to the JVM caller.
+func (s *Server) FetchMetagraphBinaries(req *pb.FetchMetagraphBinariesRequest, stream pb.ChainSyncOutbound_FetchMetagraphBinariesServer) error {
+	if s.chainSync == nil {
+		return fmt.Errorf("ChainSync not initialized")
+	}
+	responses, err := s.chainSync.FetchMetagraphBinaries(stream.Context(), req.MetagraphAddress, req.BinaryHashes)
+	if err != nil {
+		return err
+	}
+	for _, resp := range responses {
+		if err := stream.Send(resp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ListPeers returns IDs of all connected peers.
 func (s *Server) ListPeers(ctx context.Context, req *pb.ListPeersRequest) (*pb.ListPeersResponse, error) {
 	peers := s.chainSync.ListPeers()

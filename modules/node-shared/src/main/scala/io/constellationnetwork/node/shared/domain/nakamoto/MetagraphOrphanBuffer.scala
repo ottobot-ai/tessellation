@@ -75,6 +75,32 @@ trait MetagraphOrphanBuffer[F[_]] {
   /** Total number of buffered orphan entries across all metagraphs. Test + metrics aid. */
   def size: F[Int]
 
+  /** The distinct `(metagraphAddress, parentHash)` keys currently buffered — i.e. the set of parent hashes this node is waiting on. Used by
+    * the daemon's stuck-detection tick (#259): a parent that persists across multiple ticks is one the local committee gate never admitted
+    * and the orphan-drain never resolved, so the daemon actively PULLS the missing binary by hash from a peer over ChainSync. Read-only.
+    */
+  def listPendingParents: F[List[(Address, Hash)]]
+
+  /** NON-DESTRUCTIVELY scan the buffered wire bytes for `metagraphAddress` and return the FIRST entry whose *value*-hash equals
+    * `valueHash`, or `None`. The caller supplies `valueHashOf` — a deserialize-then-hash function (the serve handler passes
+    * `JsonSerializer.deserialize` + `Signed.toHashed.map(_.hash)`) — so this module stays free of the heavy JSON/Hasher dependencies and
+    * the hash identity is computed by exactly the gossip-path code. Used by the ChainSync serve handler (#259) to answer a peer's
+    * FetchMetagraphBinaries by value-hash when the binary is sitting in our orphan buffer but not yet in a finalized snapshot.
+    *
+    * '''Non-destructive (HARD requirement).''' Serving MUST NEVER mutate the buffer — unlike `drainChildren`, this does not remove the
+    * matched entry. A peer fetching a binary does not change our local admission state.
+    *
+    * '''Bounded scan.''' Only `metagraphAddress`'s entries are scanned, and the buffer is capped (`DefaultCap`), so the deserialize cost is
+    * bounded. Returns on the first match (short-circuits the effectful scan).
+    *
+    * '''Value-hash identity (#259 correction D).''' `valueHash` and the hashes produced by `valueHashOf` are *value*-hashes
+    * (`Signed[StateChannelSnapshotBinary].toHashed.hash` = `signed.value.hash`), matching the orphan-buffer key convention and gl0's
+    * `lastStateChannelSnapshotHashes` — NOT wire-bytes digests.
+    */
+  def peekForValueHash(metagraphAddress: Address, valueHash: Hash)(
+    valueHashOf: Array[Byte] => F[Option[Hash]]
+  ): F[Option[Array[Byte]]]
+
   /** Record that the committee gate just admitted a binary with value-hash `valueHash` for metagraph `metagraphAddress`, at metagraph
     * ordinal `mgOrdinal`. Caller computes the value-hash as `signed.toHashed.map(_.hash)` and the ordinal as `parentOrdinal + 1`. The entry
     * remains in the cache until evicted by FIFO; correctness is unaffected because once gl0's GSI catches up, the resolver answers from
@@ -94,18 +120,23 @@ trait MetagraphOrphanBuffer[F[_]] {
 
 object MetagraphOrphanBuffer {
 
-  /** Default cap on total buffered binaries. 256 is generous for the 4-mg scale (each metagraph might lag by a handful of binaries) and
-    * small enough that worst-case memory is bounded (256 × ~10 KiB per binary ≈ 2.5 MiB). Overridable via `NAKAMOTO_ORPHAN_BUFFER_CAP`.
+  /** Fallback cap on total buffered binaries, used only when [[make]] is called without an explicit `cap` (tests). Production threads the
+    * typed `nakamoto.orphan-buffer-cap` HOCON value (default 1024) through `GlobalSnapshotConsensus` — see
+    * `SharedConfig.nakamoto.orphanBufferCap` (overridable via the `${?NAKAMOTO_ORPHAN_BUFFER_CAP}` substitution in `application.conf`).
+    * #259 defense-in-depth: under larger outages / GossipSub churn a node can fall behind by more than a handful of binaries on a
+    * metagraph, and the orphan buffer must hold enough of the chain for the active-recovery fetch to walk it back. Worst-case memory is
+    * still bounded (1024 × ~10 KiB per binary ≈ 10 MiB) and only the in-flight backlog, not steady-state.
     */
-  val DefaultCap: Int =
-    sys.env.get("NAKAMOTO_ORPHAN_BUFFER_CAP").flatMap(_.toIntOption).getOrElse(256)
+  val DefaultCap: Int = 1024
 
-  /** Default cap on the recent-admission cache. Larger than the orphan cap because admissions persist for the ~7s GSI catch-up window and
-    * we want headroom across all metagraphs during that window. 1024 entries × ~96 B (Address + Hash + Long + bookkeeping) ≈ 100 KB.
-    * Overridable via `NAKAMOTO_RECENT_ADMIT_CAP`.
+  /** Fallback cap on the recent-admission cache, used only when [[make]] is called without an explicit `admissionsCap` (tests). Production
+    * threads the typed `nakamoto.recent-admit-cap` HOCON value (default 4096) — see `SharedConfig.nakamoto.recentAdmitCap` (overridable via
+    * `${?NAKAMOTO_RECENT_ADMIT_CAP}`). Kept proportionally larger than the orphan cap (4×, the original 1024/256 ratio → 4096) because
+    * admissions persist for the ~7s GSI catch-up window and we want headroom across all metagraphs during that window, especially when
+    * active recovery replays a backlog of buffered binaries in a burst. 4096 entries × ~96 B (Address + Hash + Long + bookkeeping) ≈ 400
+    * KB.
     */
-  val DefaultAdmissionsCap: Int =
-    sys.env.get("NAKAMOTO_RECENT_ADMIT_CAP").flatMap(_.toIntOption).getOrElse(1024)
+  val DefaultAdmissionsCap: Int = 4096
 
   /** Buffer key. Keying on `(metagraphAddress, parentHash)` lets us drain all children of a freshly-accepted binary in one lookup. */
   private final case class Key(metagraphAddress: Address, parentHash: Hash)
@@ -173,6 +204,41 @@ object MetagraphOrphanBuffer {
           }
 
         def size: F[Int] = stateRef.get.map(totalSize)
+
+        def listPendingParents: F[List[(Address, Hash)]] =
+          stateRef.get.map { state =>
+            // Only keys with at least one buffered entry are "pending". `enforceCap`/`drainChildren`
+            // remove emptied keys, so in practice every key is non-empty — guard anyway for safety.
+            // NB: iterate via `.iterator` BEFORE collecting to a List. Calling `.collect` directly on a
+            // `Map` whose partial function returns a 2-tuple rebuilds a `Map`, silently collapsing keys
+            // that share the same metagraph Address (e.g. two distinct parent hashes under one mg) — a
+            // single mg with multiple stuck parents would then be under-reported. The iterator path
+            // preserves every distinct `(Address, Hash)`.
+            state.iterator.collect {
+              case (key, entries) if entries.nonEmpty => (key.metagraphAddress, key.parentHash)
+            }.toList
+          }
+
+        def peekForValueHash(metagraphAddress: Address, valueHash: Hash)(
+          valueHashOf: Array[Byte] => F[Option[Hash]]
+        ): F[Option[Array[Byte]]] =
+          stateRef.get.flatMap { state =>
+            // Gather only this metagraph's buffered wire bytes (bounded by the cap). Insertion order is
+            // newest-first within a key; the scan returns on the first value-hash match regardless of order.
+            val candidates: List[Array[Byte]] =
+              state.iterator.collect {
+                case (key, entries) if key.metagraphAddress === metagraphAddress => entries.map(_.wireBytes)
+              }.flatten.toList
+
+            // Effectful short-circuiting scan: deserialize+hash each candidate, stop at the first whose
+            // value-hash matches. NON-DESTRUCTIVE — `stateRef` is read-only here. No `unsafeRunSync`.
+            candidates.collectFirstSomeM { bytes =>
+              valueHashOf(bytes).map {
+                case Some(h) if h === valueHash => Some(bytes)
+                case _                          => None
+              }
+            }
+          }
 
         def recordAdmission(metagraphAddress: Address, valueHash: Hash, mgOrdinal: Long): F[Unit] =
           for {

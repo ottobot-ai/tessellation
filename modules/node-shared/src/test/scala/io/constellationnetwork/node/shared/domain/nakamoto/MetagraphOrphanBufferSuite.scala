@@ -156,4 +156,103 @@ object MetagraphOrphanBufferSuite extends SimpleIOSuite {
       admissions <- buf.admissionsSize
     } yield expect.eql(1, orphans).and(expect.eql(1, admissions))
   }
+
+  // ─── #259: listPendingParents + non-destructive peekForValueHash ───────────────────────────
+
+  test("listPendingParents — distinct (mg, parentHash) keys currently buffered") {
+    val p1 = mkHash("p1")
+    val p2 = mkHash("p2")
+    for {
+      buf <- MetagraphOrphanBuffer.make[IO](logger)
+      _ <- buf.record(mgA, p1, mkBytes(1))
+      _ <- buf.record(mgA, p1, mkBytes(2)) // same key, 2 entries → still ONE pending key
+      _ <- buf.record(mgA, p2, mkBytes(3))
+      _ <- buf.record(mgB, p1, mkBytes(4))
+      pending <- buf.listPendingParents
+    } yield
+      expect
+        .eql(3, pending.size)
+        .and(expect(pending.toSet == Set((mgA, p1), (mgA, p2), (mgB, p1))))
+  }
+
+  test("listPendingParents — empty when nothing buffered (admissions don't count)") {
+    for {
+      buf <- MetagraphOrphanBuffer.make[IO](logger)
+      _ <- buf.recordAdmission(mgA, mkHash("v1"), 1L)
+      pending <- buf.listPendingParents
+    } yield expect.eql(0, pending.size)
+  }
+
+  test("listPendingParents — a drained parent no longer appears") {
+    val p1 = mkHash("p1")
+    for {
+      buf <- MetagraphOrphanBuffer.make[IO](logger)
+      _ <- buf.record(mgA, p1, mkBytes(1))
+      before <- buf.listPendingParents
+      _ <- buf.drainChildren(mgA, p1)
+      after <- buf.listPendingParents
+    } yield expect.eql(1, before.size).and(expect.eql(0, after.size))
+  }
+
+  test("peekForValueHash — finds the matching bytes NON-DESTRUCTIVELY") {
+    val parent = mkHash("parent")
+    val vh1 = mkHash("vh1")
+    val vh2 = mkHash("vh2")
+    val b1 = mkBytes(10)
+    val b2 = mkBytes(20)
+    // Fake decode: each byte array maps to a known value-hash. Real serve handler does
+    // JsonSerializer.deserialize + Signed.toHashed.map(_.hash); here we stub it deterministically.
+    def valueHashOf(bytes: Array[Byte]): IO[Option[Hash]] =
+      IO.pure {
+        if (java.util.Arrays.equals(bytes, b1)) Some(vh1)
+        else if (java.util.Arrays.equals(bytes, b2)) Some(vh2)
+        else None
+      }
+    for {
+      buf <- MetagraphOrphanBuffer.make[IO](logger)
+      _ <- buf.record(mgA, parent, b1)
+      _ <- buf.record(mgA, parent, b2)
+      sizeBefore <- buf.size
+      found2 <- buf.peekForValueHash(mgA, vh2)(valueHashOf)
+      found1 <- buf.peekForValueHash(mgA, vh1)(valueHashOf)
+      sizeAfter <- buf.size
+    } yield
+      expect(found1.exists(java.util.Arrays.equals(_, b1)))
+        .and(expect(found2.exists(java.util.Arrays.equals(_, b2))))
+        // NON-DESTRUCTIVE: two peeks did not change the buffer size.
+        .and(expect.eql(2, sizeBefore))
+        .and(expect.eql(2, sizeAfter))
+  }
+
+  test("peekForValueHash — miss returns None and leaves the buffer unchanged") {
+    val parent = mkHash("parent")
+    val b1 = mkBytes(10)
+    val wantedButAbsent = mkHash("absent")
+    def valueHashOf(bytes: Array[Byte]): IO[Option[Hash]] =
+      IO.pure(if (java.util.Arrays.equals(bytes, b1)) Some(mkHash("vh1")) else None)
+    for {
+      buf <- MetagraphOrphanBuffer.make[IO](logger)
+      _ <- buf.record(mgA, parent, b1)
+      result <- buf.peekForValueHash(mgA, wantedButAbsent)(valueHashOf)
+      sizeAfter <- buf.size
+    } yield expect(result.isEmpty).and(expect.eql(1, sizeAfter))
+  }
+
+  test("peekForValueHash — scopes to the requested metagraph (other mg's bytes not returned)") {
+    val parent = mkHash("parent")
+    val vh = mkHash("vh")
+    val bA = mkBytes(10)
+    val bB = mkBytes(20)
+    // BOTH byte arrays would hash to the SAME value-hash; only mgA's must be returned for an mgA query.
+    def valueHashOf(@annotation.unused bytes: Array[Byte]): IO[Option[Hash]] = IO.pure(Some(vh))
+    for {
+      buf <- MetagraphOrphanBuffer.make[IO](logger)
+      _ <- buf.record(mgA, parent, bA)
+      _ <- buf.record(mgB, parent, bB)
+      foundA <- buf.peekForValueHash(mgA, vh)(valueHashOf)
+      foundB <- buf.peekForValueHash(mgB, vh)(valueHashOf)
+    } yield
+      expect(foundA.exists(java.util.Arrays.equals(_, bA)))
+        .and(expect(foundB.exists(java.util.Arrays.equals(_, bB))))
+  }
 }

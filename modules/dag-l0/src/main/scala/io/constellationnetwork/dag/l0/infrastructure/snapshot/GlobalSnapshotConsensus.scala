@@ -1248,7 +1248,11 @@ object GlobalSnapshotConsensus {
             .fromName[F]("MetagraphOrphanBuffer")
             .toResource
           orphanBuffer <- io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer
-            .make[F](orphanBufferLogger)
+            .make[F](
+              orphanBufferLogger,
+              cap = sharedCfg.nakamoto.orphanBufferCap.value,
+              admissionsCap = sharedCfg.nakamoto.recentAdmitCap.value
+            )
             .toResource
           // Gate-aware closure for processing a `(metagraphAddress, wireBytes)` pair. Built once
           // here so both call sites (daemon gossip handler and finalize-drain hook) share the
@@ -1721,7 +1725,17 @@ object GlobalSnapshotConsensus {
           // snapshots or chain points for the ChainSync protocol.
           chainSyncDispatcher <- Dispatcher.sequential[F]
           chainSyncServer = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncServer
-            .make[F](chainStore, globalSnapshotStorage, chainSyncDispatcher)(
+            .make[F](
+              chainStore,
+              globalSnapshotStorage,
+              // #259: recent-finalized snapshots + the SAME orphan buffer the daemon writes into, so a
+              // peer's metagraph-binary fetch is answered from finalized state + a non-destructive
+              // orphan-buffer peek.
+              lastNGlobalSnapshotStorage,
+              orphanBuffer,
+              chainSyncDispatcher
+            )(
+              implicitly,
               implicitly,
               implicitly,
               scala.concurrent.ExecutionContext.global
@@ -1797,6 +1811,9 @@ object GlobalSnapshotConsensus {
                   etaForParentOrdinal = committeeEtaForOrdinal,
                   senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.committeeStake(peer),
                   processOrphanedMetagraphBinary = processOrphanedMetagraphBinary,
+                  // #259: same orphan-buffer instance the processor closure writes into — the
+                  // stuck-detection tick reads its pending parents to drive active recovery.
+                  orphanBuffer = orphanBuffer,
                   // Gap B — acceptance-side shard deps for the receiver-routing handlers. `None` at
                   // numShards=1 (regression bar) ⇒ inbound shard-checkpoint gossip is dropped with a
                   // debug log. The SAME `shardAcceptanceDeps` instance the GSAM acceptance side + the

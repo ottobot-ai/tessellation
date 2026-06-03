@@ -458,6 +458,38 @@ message ServeChainPointsResponse {
   int64 tip_ordinal = 3;
 }
 
+// ─── ChainSync: Metagraph-binary active recovery (#259) ──────────────
+//
+// Active pull of a missing metagraph state-channel binary by VALUE-hash.
+// Mirrors the FetchSnapshots/ServeSnapshots templates above. When a gl0
+// orphan buffer has a parent un-admitted past a timeout, the stuck-detection
+// tick pulls the missing binary by its value-hash from a peer over the SAME
+// /nakamoto/chainsync/1.0.0 protocol, then re-feeds it through the normal
+// committee-gate admission path (NEVER trust-on-fetch — the re-fed binary is
+// re-validated by the gate).
+//
+// `binary_hashes` are VALUE-hashes (`Signed[StateChannelSnapshotBinary]`
+// `toHashed.hash` / `signed.value.hash`) — the SAME identity the orphan
+// buffer keys on and gl0 writes into `lastStateChannelSnapshotHashes`. They
+// are NOT wire-bytes digests. On the wire each is UTF-8 of the canonical Hash
+// hex string (matching `FetchSnapshotsRequest.hashes` / `Snapshot.hash` /
+// `MetagraphAttestation.parent_hash`, all `Hash.getBytes` UTF-8 form), so the
+// JVM decode is `Hash(new String(bytes, UTF_8))`.
+message FetchMetagraphBinariesRequest {
+  string metagraph_address = 1;     // DAG base58 string; subject metagraph
+  repeated bytes binary_hashes = 2; // value-hashes; UTF-8 of canonical Hash hex
+}
+
+// One served metagraph binary. `signed_binary` is exactly
+// `JsonSerializer[F].serialize(signed)` of the matched
+// `Signed[StateChannelSnapshotBinary]` — byte-identical to the gossip path
+// (StateChannelRoutes.broadcastMetagraphBinary), so the re-feed
+// (`handleMetagraphBinary` → `processBytes`) deserializes it the same way a
+// fresh gossip arrival would.
+message MetagraphBinaryResponse {
+  bytes signed_binary = 1;          // JsonSerializer bytes of Signed[StateChannelSnapshotBinary]
+}
+
 // ─── Backfill: Range-Based Chain Sync ───────────────────────────────
 // Lightweight snapshot for backfill — no GlobalSnapshotInfo context.
 // Cuts per-snapshot transfer from 100KB-10MB to 1-5KB.
@@ -496,6 +528,8 @@ service ChainSyncOutbound {
   rpc FindIntersection(FindIntersectionRequest) returns (FindIntersectionResponse);
   rpc GetPeerTip(GetPeerTipRequest) returns (PeerTipResponse);
   rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
+  // #259: pull missing metagraph binaries by value-hash from a peer.
+  rpc FetchMetagraphBinaries(FetchMetagraphBinariesRequest) returns (stream MetagraphBinaryResponse);
 }
 
 // Sidecar → JVM: serve local chain data to incoming network requests.
@@ -505,4 +539,7 @@ service ChainSyncInbound {
   rpc ServeSnapshots(ServeSnapshotsRequest) returns (stream Snapshot);
   rpc ServeByRange(FetchByRangeRequest) returns (stream BackfillSnapshot);
   rpc ServeChainPoints(ServeChainPointsRequest) returns (ServeChainPointsResponse);
+  // #259: serve local metagraph binaries (recent-finalized snapshots +
+  // non-destructive orphan-buffer peek) to an incoming network request.
+  rpc ServeMetagraphBinaries(FetchMetagraphBinariesRequest) returns (stream MetagraphBinaryResponse);
 }

@@ -140,12 +140,18 @@ func DefaultConfig() Config {
 		// Snapshot: ~1 per 7s → 64 tolerates ~7 min of backlog for a slow JVM consumer.
 		// Attestation: N-of-N per snapshot → 256 tolerates attestation fan-in bursts.
 		// Rumor: BFT gossip can burst at consensus transitions → 1024.
-		// Metagraph binary: 500 KB/msg, ~8 concurrent metagraphs → 256.
+		// Metagraph binary: 500 KB/msg, ~8 concurrent metagraphs. Bumped
+		// 256 → 1024 (#259 defense-in-depth): under GossipSub churn a slow
+		// JVM consumer could overflow the relay channel and DROP a binary,
+		// which then orphan-buffers every later binary forever. A deeper
+		// relay buffer reduces how often the active-recovery fetch must
+		// engage. Worst-case memory 1024 × ~500 KB is bounded and only the
+		// in-flight burst, not steady-state.
 		// Metagraph attestation: committee fan-in per binary → 256.
 		SnapshotBufferSize:             64,
 		AttestationBufferSize:          256,
 		RumorBufferSize:                1024,
-		MetagraphBinaryBufferSize:      256,
+		MetagraphBinaryBufferSize:      1024,
 		MetagraphAttestationBufferSize: 256,
 		// AllowSpendBlock: single fb produced per dl1 swap consensus round
 		// (~5s cadence in prod), so burst rate is comparable to metagraph

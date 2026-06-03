@@ -6,6 +6,7 @@ import cats.syntax.all._
 import io.constellationnetwork.node.shared.domain.nakamoto.chainsync.ChainSyncStateResponse
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
+import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.security.hash.Hash
 
 import io.grpc.ManagedChannel
@@ -28,6 +29,18 @@ object ChainSyncManager {
       * call is a no-op.
       */
     def requestMissing(parentHash: Hash): F[Unit]
+
+    /** #259: actively pull missing metagraph state-channel binaries by VALUE-hash from a peer over the existing ChainSync protocol.
+      * Synchronous (the caller — the daemon's stuck-detection tick — already runs on its own fiber and rate-limits per `(mg, parentHash)`).
+      * Mirrors `requestMissing`'s blocking pattern: the call blocks on the gRPC server-stream, drains it to a `List`, and on ANY error logs
+      * a warning and returns an empty list (recovery is best-effort — the next tick retries). The returned `pb.MetagraphBinaryResponse`s
+      * carry `signedBinary` = the gossip-wire `JsonSerializer` bytes; the caller re-feeds each through the committee gate via the gossip
+      * path.
+      *
+      * `binaryHashes` are value-hashes (`signed.toHashed.hash`); they are encoded on the wire as UTF-8 of the canonical Hash hex string,
+      * identical to how `requestMissing` passes a hash (correction D — keep hex-vs-raw consistent or every server-side lookup misses).
+      */
+    def fetchMetagraphBinaries(metagraphAddress: Address, binaryHashes: List[Hash]): F[List[pb.MetagraphBinaryResponse]]
   }
 
   def make[F[_]: Async](
@@ -81,6 +94,31 @@ object ChainSyncManager {
             work.handleErrorWith(e => logger.warn(s"🔗 ChainSync: fetch failed for ${parentHash.value.take(16)}: ${e.getMessage}"))
           )(_ => inflightRef.update(_ - parentHash))
         }
+
+        def fetchMetagraphBinaries(metagraphAddress: Address, binaryHashes: List[Hash]): F[List[pb.MetagraphBinaryResponse]] =
+          if (binaryHashes.isEmpty) Async[F].pure(List.empty)
+          else {
+            // Same hex-vs-raw encoding as `requestMissing` (correction D): UTF-8 of the canonical hash hex.
+            val hashBytes = binaryHashes.map(h => com.google.protobuf.ByteString.copyFrom(h.value.getBytes))
+            val request = pb.FetchMetagraphBinariesRequest(
+              metagraphAddress = metagraphAddress.value.value,
+              binaryHashes = hashBytes
+            )
+            Async[F]
+              .blocking(stub.fetchMetagraphBinaries(request).toList)
+              .flatTap { responses =>
+                logger.info(
+                  s"🔗 ChainSync: fetched ${responses.size} metagraph binary(s) for mg=$metagraphAddress " +
+                    s"(${binaryHashes.size} value-hash(es) requested: ${binaryHashes.map(_.value.take(12)).mkString(",")})"
+                )
+              }
+              .handleErrorWith { e =>
+                logger.warn(
+                  s"🔗 ChainSync: metagraph-binary fetch failed for mg=$metagraphAddress " +
+                    s"(${binaryHashes.map(_.value.take(12)).mkString(",")}): ${e.getMessage}"
+                ) >> Async[F].pure(List.empty[pb.MetagraphBinaryResponse])
+              }
+          }
       }
   }
 

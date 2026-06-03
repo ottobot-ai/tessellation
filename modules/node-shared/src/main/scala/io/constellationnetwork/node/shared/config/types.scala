@@ -89,6 +89,11 @@ object types {
     // ordinals i ≤ N − k). Mirrors the existing `NAKAMOTO_CONFIRMATION_DEPTH` env default (255) via the HOCON `${?...}` substitution
     // so the gl0 SMT wiring, `SnapshotLeaderLoop.ConfirmationDepthK`, and `NakamotoSyncDaemon` all agree.
     confirmationDepthK: PosLong,
+    // #259 active-recovery: caps on the metagraph orphan buffer + recent-admission cache. Migrated from the
+    // `NAKAMOTO_ORPHAN_BUFFER_CAP` / `NAKAMOTO_RECENT_ADMIT_CAP` env reads to typed HOCON (project rule: no scattered
+    // sys.env). `recentAdmitCap` is kept proportionally larger (4×) — see `MetagraphOrphanBuffer.DefaultAdmissionsCap`.
+    orphanBufferCap: PosInt,
+    recentAdmitCap: PosInt,
     commitmentSmt: CommitmentSmtConfig,
     localEvents: LocalEventsConfig,
     sharding: ShardingConfig

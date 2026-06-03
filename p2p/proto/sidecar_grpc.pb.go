@@ -687,11 +687,12 @@ var SidecarService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	ChainSyncOutbound_FetchSnapshots_FullMethodName   = "/nakamoto.p2p.ChainSyncOutbound/FetchSnapshots"
-	ChainSyncOutbound_FetchByRange_FullMethodName     = "/nakamoto.p2p.ChainSyncOutbound/FetchByRange"
-	ChainSyncOutbound_FindIntersection_FullMethodName = "/nakamoto.p2p.ChainSyncOutbound/FindIntersection"
-	ChainSyncOutbound_GetPeerTip_FullMethodName       = "/nakamoto.p2p.ChainSyncOutbound/GetPeerTip"
-	ChainSyncOutbound_ListPeers_FullMethodName        = "/nakamoto.p2p.ChainSyncOutbound/ListPeers"
+	ChainSyncOutbound_FetchSnapshots_FullMethodName         = "/nakamoto.p2p.ChainSyncOutbound/FetchSnapshots"
+	ChainSyncOutbound_FetchByRange_FullMethodName           = "/nakamoto.p2p.ChainSyncOutbound/FetchByRange"
+	ChainSyncOutbound_FindIntersection_FullMethodName       = "/nakamoto.p2p.ChainSyncOutbound/FindIntersection"
+	ChainSyncOutbound_GetPeerTip_FullMethodName             = "/nakamoto.p2p.ChainSyncOutbound/GetPeerTip"
+	ChainSyncOutbound_ListPeers_FullMethodName              = "/nakamoto.p2p.ChainSyncOutbound/ListPeers"
+	ChainSyncOutbound_FetchMetagraphBinaries_FullMethodName = "/nakamoto.p2p.ChainSyncOutbound/FetchMetagraphBinaries"
 )
 
 // ChainSyncOutboundClient is the client API for ChainSyncOutbound service.
@@ -707,6 +708,8 @@ type ChainSyncOutboundClient interface {
 	FindIntersection(ctx context.Context, in *FindIntersectionRequest, opts ...grpc.CallOption) (*FindIntersectionResponse, error)
 	GetPeerTip(ctx context.Context, in *GetPeerTipRequest, opts ...grpc.CallOption) (*PeerTipResponse, error)
 	ListPeers(ctx context.Context, in *ListPeersRequest, opts ...grpc.CallOption) (*ListPeersResponse, error)
+	// #259: pull missing metagraph binaries by value-hash from a peer.
+	FetchMetagraphBinaries(ctx context.Context, in *FetchMetagraphBinariesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MetagraphBinaryResponse], error)
 }
 
 type chainSyncOutboundClient struct {
@@ -785,6 +788,25 @@ func (c *chainSyncOutboundClient) ListPeers(ctx context.Context, in *ListPeersRe
 	return out, nil
 }
 
+func (c *chainSyncOutboundClient) FetchMetagraphBinaries(ctx context.Context, in *FetchMetagraphBinariesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MetagraphBinaryResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ChainSyncOutbound_ServiceDesc.Streams[2], ChainSyncOutbound_FetchMetagraphBinaries_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[FetchMetagraphBinariesRequest, MetagraphBinaryResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ChainSyncOutbound_FetchMetagraphBinariesClient = grpc.ServerStreamingClient[MetagraphBinaryResponse]
+
 // ChainSyncOutboundServer is the server API for ChainSyncOutbound service.
 // All implementations must embed UnimplementedChainSyncOutboundServer
 // for forward compatibility.
@@ -798,6 +820,8 @@ type ChainSyncOutboundServer interface {
 	FindIntersection(context.Context, *FindIntersectionRequest) (*FindIntersectionResponse, error)
 	GetPeerTip(context.Context, *GetPeerTipRequest) (*PeerTipResponse, error)
 	ListPeers(context.Context, *ListPeersRequest) (*ListPeersResponse, error)
+	// #259: pull missing metagraph binaries by value-hash from a peer.
+	FetchMetagraphBinaries(*FetchMetagraphBinariesRequest, grpc.ServerStreamingServer[MetagraphBinaryResponse]) error
 	mustEmbedUnimplementedChainSyncOutboundServer()
 }
 
@@ -822,6 +846,9 @@ func (UnimplementedChainSyncOutboundServer) GetPeerTip(context.Context, *GetPeer
 }
 func (UnimplementedChainSyncOutboundServer) ListPeers(context.Context, *ListPeersRequest) (*ListPeersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListPeers not implemented")
+}
+func (UnimplementedChainSyncOutboundServer) FetchMetagraphBinaries(*FetchMetagraphBinariesRequest, grpc.ServerStreamingServer[MetagraphBinaryResponse]) error {
+	return status.Error(codes.Unimplemented, "method FetchMetagraphBinaries not implemented")
 }
 func (UnimplementedChainSyncOutboundServer) mustEmbedUnimplementedChainSyncOutboundServer() {}
 func (UnimplementedChainSyncOutboundServer) testEmbeddedByValue()                           {}
@@ -920,6 +947,17 @@ func _ChainSyncOutbound_ListPeers_Handler(srv interface{}, ctx context.Context, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ChainSyncOutbound_FetchMetagraphBinaries_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(FetchMetagraphBinariesRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ChainSyncOutboundServer).FetchMetagraphBinaries(m, &grpc.GenericServerStream[FetchMetagraphBinariesRequest, MetagraphBinaryResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ChainSyncOutbound_FetchMetagraphBinariesServer = grpc.ServerStreamingServer[MetagraphBinaryResponse]
+
 // ChainSyncOutbound_ServiceDesc is the grpc.ServiceDesc for ChainSyncOutbound service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -951,14 +989,20 @@ var ChainSyncOutbound_ServiceDesc = grpc.ServiceDesc{
 			Handler:       _ChainSyncOutbound_FetchByRange_Handler,
 			ServerStreams: true,
 		},
+		{
+			StreamName:    "FetchMetagraphBinaries",
+			Handler:       _ChainSyncOutbound_FetchMetagraphBinaries_Handler,
+			ServerStreams: true,
+		},
 	},
 	Metadata: "proto/sidecar.proto",
 }
 
 const (
-	ChainSyncInbound_ServeSnapshots_FullMethodName   = "/nakamoto.p2p.ChainSyncInbound/ServeSnapshots"
-	ChainSyncInbound_ServeByRange_FullMethodName     = "/nakamoto.p2p.ChainSyncInbound/ServeByRange"
-	ChainSyncInbound_ServeChainPoints_FullMethodName = "/nakamoto.p2p.ChainSyncInbound/ServeChainPoints"
+	ChainSyncInbound_ServeSnapshots_FullMethodName         = "/nakamoto.p2p.ChainSyncInbound/ServeSnapshots"
+	ChainSyncInbound_ServeByRange_FullMethodName           = "/nakamoto.p2p.ChainSyncInbound/ServeByRange"
+	ChainSyncInbound_ServeChainPoints_FullMethodName       = "/nakamoto.p2p.ChainSyncInbound/ServeChainPoints"
+	ChainSyncInbound_ServeMetagraphBinaries_FullMethodName = "/nakamoto.p2p.ChainSyncInbound/ServeMetagraphBinaries"
 )
 
 // ChainSyncInboundClient is the client API for ChainSyncInbound service.
@@ -972,6 +1016,9 @@ type ChainSyncInboundClient interface {
 	ServeSnapshots(ctx context.Context, in *ServeSnapshotsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Snapshot], error)
 	ServeByRange(ctx context.Context, in *FetchByRangeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackfillSnapshot], error)
 	ServeChainPoints(ctx context.Context, in *ServeChainPointsRequest, opts ...grpc.CallOption) (*ServeChainPointsResponse, error)
+	// #259: serve local metagraph binaries (recent-finalized snapshots +
+	// non-destructive orphan-buffer peek) to an incoming network request.
+	ServeMetagraphBinaries(ctx context.Context, in *FetchMetagraphBinariesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MetagraphBinaryResponse], error)
 }
 
 type chainSyncInboundClient struct {
@@ -1030,6 +1077,25 @@ func (c *chainSyncInboundClient) ServeChainPoints(ctx context.Context, in *Serve
 	return out, nil
 }
 
+func (c *chainSyncInboundClient) ServeMetagraphBinaries(ctx context.Context, in *FetchMetagraphBinariesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MetagraphBinaryResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ChainSyncInbound_ServiceDesc.Streams[2], ChainSyncInbound_ServeMetagraphBinaries_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[FetchMetagraphBinariesRequest, MetagraphBinaryResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ChainSyncInbound_ServeMetagraphBinariesClient = grpc.ServerStreamingClient[MetagraphBinaryResponse]
+
 // ChainSyncInboundServer is the server API for ChainSyncInbound service.
 // All implementations must embed UnimplementedChainSyncInboundServer
 // for forward compatibility.
@@ -1041,6 +1107,9 @@ type ChainSyncInboundServer interface {
 	ServeSnapshots(*ServeSnapshotsRequest, grpc.ServerStreamingServer[Snapshot]) error
 	ServeByRange(*FetchByRangeRequest, grpc.ServerStreamingServer[BackfillSnapshot]) error
 	ServeChainPoints(context.Context, *ServeChainPointsRequest) (*ServeChainPointsResponse, error)
+	// #259: serve local metagraph binaries (recent-finalized snapshots +
+	// non-destructive orphan-buffer peek) to an incoming network request.
+	ServeMetagraphBinaries(*FetchMetagraphBinariesRequest, grpc.ServerStreamingServer[MetagraphBinaryResponse]) error
 	mustEmbedUnimplementedChainSyncInboundServer()
 }
 
@@ -1059,6 +1128,9 @@ func (UnimplementedChainSyncInboundServer) ServeByRange(*FetchByRangeRequest, gr
 }
 func (UnimplementedChainSyncInboundServer) ServeChainPoints(context.Context, *ServeChainPointsRequest) (*ServeChainPointsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ServeChainPoints not implemented")
+}
+func (UnimplementedChainSyncInboundServer) ServeMetagraphBinaries(*FetchMetagraphBinariesRequest, grpc.ServerStreamingServer[MetagraphBinaryResponse]) error {
+	return status.Error(codes.Unimplemented, "method ServeMetagraphBinaries not implemented")
 }
 func (UnimplementedChainSyncInboundServer) mustEmbedUnimplementedChainSyncInboundServer() {}
 func (UnimplementedChainSyncInboundServer) testEmbeddedByValue()                          {}
@@ -1121,6 +1193,17 @@ func _ChainSyncInbound_ServeChainPoints_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ChainSyncInbound_ServeMetagraphBinaries_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(FetchMetagraphBinariesRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ChainSyncInboundServer).ServeMetagraphBinaries(m, &grpc.GenericServerStream[FetchMetagraphBinariesRequest, MetagraphBinaryResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ChainSyncInbound_ServeMetagraphBinariesServer = grpc.ServerStreamingServer[MetagraphBinaryResponse]
+
 // ChainSyncInbound_ServiceDesc is the grpc.ServiceDesc for ChainSyncInbound service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1142,6 +1225,11 @@ var ChainSyncInbound_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ServeByRange",
 			Handler:       _ChainSyncInbound_ServeByRange_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "ServeMetagraphBinaries",
+			Handler:       _ChainSyncInbound_ServeMetagraphBinaries_Handler,
 			ServerStreams: true,
 		},
 	},

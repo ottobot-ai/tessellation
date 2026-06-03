@@ -54,6 +54,23 @@ object NakamotoSyncDaemon {
   private val CatchUpThreshold = 6L
   private val CatchUpCooldownMs = 10000L // Don't retry catch-up more often than every 10s
 
+  // #259 metagraph-binary active-recovery (stuck-detection tick) tuning. Fixed internal cadence —
+  // NOT a consensus-critical value (recovery is additive + re-gated), so kept as plain constants
+  // rather than HOCON config (mirrors CatchUpThreshold/CatchUpCooldownMs above).
+  //   - Tick every 20s: the orphan-buffer pending-parents poll cadence.
+  //   - A parent must persist across ≥2 ticks (≥~20s genuinely stuck, not a mid-drain blip) before
+  //     we fetch — encoded as `consecutiveTicks >= 2` at the call site.
+  //   - After a fetch attempt, don't refetch the same (mg, parentHash) for 60s even if still pending.
+  private val StuckRefetchTickInterval: scala.concurrent.duration.FiniteDuration = 20.seconds
+  private val StuckRefetchCooldown: scala.concurrent.duration.FiniteDuration = 60.seconds
+
+  /** Per-(metagraph, parentHash) bookkeeping for the #259 stuck-detection tick. `consecutiveTicks` counts how many consecutive ticks this
+    * parent has stayed pending in the orphan buffer (reset to 0 — by omission from the carry-forward map — once it resolves);
+    * `lastFetchAtMillis` is the wall-clock ms of the last active fetch attempt, used for the per-pair refetch cooldown. Wall-clock here is
+    * fine: it gates a best-effort recovery cadence, not consensus.
+    */
+  final case class StuckParentState(consecutiveTicks: Int, lastFetchAtMillis: Long)
+
   /** Confirmation depth k — same as SnapshotLeaderLoop.ConfirmationDepthK. Used as the boundary between Tier 2 (sequential walk-back) and
     * Tier 3 (full catch-up + backfill). Gaps > k mean the network has finalized past our tip; sequential fetch won't work.
     */
@@ -428,6 +445,10 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.address.Address,
       Array[Byte]
     ) => F[Unit],
+    // #259: the SAME orphan-buffer instance the `processOrphanedMetagraphBinary` closure writes into
+    // (built in `GlobalSnapshotConsensus.make`). The stuck-detection tick below reads its pending
+    // parents via `listPendingParents` to decide which missing binaries to actively pull from peers.
+    orphanBuffer: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer[F],
     // ─── Hierarchical-shard-checkpoints v1 — Gap B receiver routing ──────────────────────────────
     // Acceptance-side per-shard deps (registry of `(chainStore, tipTracker, finalityTriggers)` +
     // acceptance manager). `None` at `numShards = 1` (regression bar) ⇒ incoming `ShardCheckpoint` /
@@ -774,7 +795,92 @@ object NakamotoSyncDaemon {
                 logger.warn("Gossip stream terminated (sidecar connection lost). Reconnecting in 5s...")
               ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
 
-            gossipStream
+            // #259: stuck-parent active-recovery tick. A metagraph binary whose parent the local
+            // committee gate never admitted (and whose orphan-drain never resolved) sits in the
+            // orphan buffer forever — every later binary chains off it and re-buffers, so the
+            // metagraph stalls from this node's view. This tick detects parents that persist across
+            // ≥2 ticks (a real timeout, not a transient mid-drain blip) and actively PULLS the
+            // missing binary by its value-hash from a peer over the existing ChainSync protocol,
+            // then re-feeds it through the SAME gate-aware path gossip uses (`processOrphanedMetagraphBinary`
+            // via `handleMetagraphBinary`). Purely additive recovery — never trust-on-fetch (the
+            // re-fed binary is re-validated by the committee gate).
+            //
+            // Rate-limited per `(mg, parentHash)`: after a fetch attempt we don't retry that pair
+            // for `StuckRefetchCooldown` (60s) even if it stays pending, so a genuinely-missing
+            // binary (no peer has it) doesn't hammer the mesh.
+            //
+            // The orphan's parent hash IS the value-hash of the un-admitted binary we need (orphan
+            // buffer keys on `parentHash == missing-binary.value.hash`), so we request
+            // `binaryHashes = [parentHash]` directly — the serve handler matches by value-hash.
+            def stuckDetectionStream: fs2.Stream[F, Unit] =
+              fs2.Stream
+                .eval(
+                  Ref.of[F, Map[
+                    (io.constellationnetwork.schema.address.Address, Hash),
+                    NakamotoSyncDaemon.StuckParentState
+                  ]](Map.empty)
+                )
+                .flatMap { stuckStateRef =>
+                  fs2.Stream.fixedRate[F](StuckRefetchTickInterval).evalMap { _ =>
+                    Async[F].realTimeInstant.map(_.toEpochMilli).flatMap { now =>
+                      orphanBuffer.listPendingParents.flatMap { pending =>
+                        val pendingSet = pending.toSet
+                        stuckStateRef.modify { prev =>
+                          // Carry forward only still-pending parents (a resolved parent resets its
+                          // tick count). Bump consecutiveTicks for each currently-pending key.
+                          val bumped = pendingSet.iterator.map { key =>
+                            val prior = prev.getOrElse(key, NakamotoSyncDaemon.StuckParentState(0, 0L))
+                            key -> prior.copy(consecutiveTicks = prior.consecutiveTicks + 1)
+                          }.toMap
+                          // Due-to-fetch: seen across ≥2 ticks AND past the per-pair cooldown.
+                          val due = bumped.collect {
+                            case (key, st) if st.consecutiveTicks >= 2 && (now - st.lastFetchAtMillis) >= StuckRefetchCooldown.toMillis =>
+                              key
+                          }.toList
+                          // Stamp lastFetchAt on the due keys so the cooldown starts now.
+                          val withStamp = due.foldLeft(bumped) { (acc, key) =>
+                            acc.updated(key, acc(key).copy(lastFetchAtMillis = now))
+                          }
+                          (withStamp, due)
+                        }.flatMap { due =>
+                          if (due.isEmpty) Async[F].unit
+                          else
+                            logger.info(
+                              s"🔎 ChainSync stuck-detection: ${due.size} stuck metagraph parent(s) past timeout — actively fetching: " +
+                                due.map { case (mg, h) => s"$mg/${h.value.take(12)}" }.mkString(", ")
+                            ) >>
+                              due.traverse_ {
+                                case (mg, parentHash) =>
+                                  chainSyncManager.fetchMetagraphBinaries(mg, List(parentHash)).flatMap { responses =>
+                                    if (responses.isEmpty)
+                                      logger.info(
+                                        s"🔎 ChainSync stuck-detection: no peer had mg=$mg parent=${parentHash.value.take(12)} (will retry after cooldown)"
+                                      )
+                                    else
+                                      responses.traverse_ { resp =>
+                                        // Re-feed through the SAME gossip entry point — goes through the
+                                        // committee gate + drains buffered children on admit.
+                                        handleMetagraphBinary(
+                                          pb.MetagraphBinary(address = mg.value.value, binary = resp.signedBinary),
+                                          processOrphanedMetagraphBinary,
+                                          logger
+                                        )
+                                      }
+                                  }
+                              }
+                        }
+                      }
+                    }
+                  }
+                }
+                .handleErrorWith { e =>
+                  // Never let a recovery-tick failure kill the daemon; log and restart the ticker.
+                  fs2.Stream.eval(
+                    logger.warn(s"ChainSync stuck-detection tick error: ${e.getMessage}. Restarting in 30s...")
+                  ) ++ fs2.Stream.sleep_[F](30.seconds) ++ stuckDetectionStream
+                }
+
+            gossipStream.concurrently(stuckDetectionStream)
           }
       }
     }

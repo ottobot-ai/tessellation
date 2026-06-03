@@ -111,7 +111,7 @@ func (h *Handler) handleIncoming(s network.Stream) {
 	case 0x03: // GetPeerTip — no body
 		h.serveGetPeerTip(s, remotePeer)
 		return
-	case 0x01, 0x02, 0x04: // FetchSnapshots / FindIntersection / FetchByRange — length-prefixed body
+	case 0x01, 0x02, 0x04, 0x05: // FetchSnapshots / FindIntersection / FetchByRange / FetchMetagraphBinaries — length-prefixed body
 		data, err := readLengthPrefixed(s)
 		if err != nil {
 			fmt.Printf("[chainsync] Failed to read request from %s: %v\n", remotePeer, err)
@@ -124,6 +124,8 @@ func (h *Handler) handleIncoming(s network.Stream) {
 			h.serveFindIntersection(s, data, remotePeer)
 		case 0x04:
 			h.serveFetchByRange(s, data, remotePeer)
+		case 0x05:
+			h.serveMetagraphBinaries(s, data, remotePeer)
 		}
 	default:
 		fmt.Printf("[chainsync] Unknown request type 0x%02x from %s\n", reqType[0], remotePeer)
@@ -404,6 +406,106 @@ func (h *Handler) serveFetchByRange(s network.Stream, data []byte, from peer.ID)
 			break
 		}
 	}
+}
+
+// serveMetagraphBinaries handles incoming metagraph-binary fetch requests (#259)
+// from peers by relaying to the JVM ServeMetagraphBinaries stream. The JVM looks
+// up each requested value-hash among recent-finalized snapshots + a non-destructive
+// orphan-buffer peek; the sidecar is a pure relay (mirrors serveFetchByRange).
+func (h *Handler) serveMetagraphBinaries(s network.Stream, data []byte, from peer.ID) {
+	conn := h.ensureJVMConn()
+	if conn == nil {
+		fmt.Printf("[chainsync] No JVM connection, cannot serve metagraph binaries to %s\n", from)
+		return
+	}
+
+	var req pb.FetchMetagraphBinariesRequest
+	if err := proto.Unmarshal(data, &req); err != nil {
+		fmt.Printf("[chainsync] Failed to unmarshal FetchMetagraphBinaries from %s: %v\n", from, err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
+	defer cancel()
+
+	client := pb.NewChainSyncInboundClient(conn)
+	stream, err := client.ServeMetagraphBinaries(ctx, &req)
+	if err != nil {
+		fmt.Printf("[chainsync] JVM ServeMetagraphBinaries failed: %v\n", err)
+		return
+	}
+
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			fmt.Printf("[chainsync] JVM ServeMetagraphBinaries stream error: %v\n", err)
+			break
+		}
+		respBytes, _ := proto.Marshal(resp)
+		if err := writeLengthPrefixed(s, respBytes); err != nil {
+			break
+		}
+	}
+}
+
+// FetchMetagraphBinaries sends a metagraph-binary fetch request (#259) to a
+// random peer and returns the matched binaries. Called by the JVM via
+// ChainSyncOutbound gRPC (mirrors the FetchSnapshots outgoing path). The
+// `binaryHashes` are value-hashes (UTF-8 of canonical Hash hex); the JVM
+// re-feeds each returned binary through the committee gate.
+func (h *Handler) FetchMetagraphBinaries(ctx context.Context, address string, hashes [][]byte) ([]*pb.MetagraphBinaryResponse, error) {
+	if len(hashes) > MaxHashesPerRequest {
+		return nil, fmt.Errorf("too many hashes: %d > %d", len(hashes), MaxHashesPerRequest)
+	}
+
+	target, err := h.pickPeer()
+	if err != nil {
+		return nil, err
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	defer cancel()
+
+	s, err := h.host.NewStream(reqCtx, target, ProtocolID)
+	if err != nil {
+		h.markFailed(target)
+		return nil, fmt.Errorf("stream to %s failed: %w", target, err)
+	}
+	defer s.Close()
+
+	req := &pb.FetchMetagraphBinariesRequest{MetagraphAddress: address, BinaryHashes: hashes}
+	reqBytes, _ := proto.Marshal(req)
+	if _, err := s.Write([]byte{0x05}); err != nil {
+		h.markFailed(target)
+		return nil, err
+	}
+	if err := writeLengthPrefixed(s, reqBytes); err != nil {
+		h.markFailed(target)
+		return nil, err
+	}
+	s.CloseWrite()
+
+	var responses []*pb.MetagraphBinaryResponse
+	for {
+		data, err := readLengthPrefixed(s)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			h.markFailed(target)
+			return responses, err
+		}
+		var resp pb.MetagraphBinaryResponse
+		if err := proto.Unmarshal(data, &resp); err != nil {
+			continue
+		}
+		responses = append(responses, &resp)
+	}
+
+	return responses, nil
 }
 
 // FetchByRange sends a range request to a specific peer (or random if no target).
