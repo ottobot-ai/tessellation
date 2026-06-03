@@ -1338,8 +1338,15 @@ object GlobalSnapshotConsensus {
           // finalize sinks, and serves the contiguous deltas a full-state ml0 follower adopts to reach the latest
           // finalized ordinal. Never feeds back into consensus.
           _ <- {
+            // Slice B — thread the gl0 §3-NIPoPoW historical-commitment SMT store + the SAME confirmation-depth cutoff
+            // accept() anchors `smtRoot(N)` with, so each served delta carries the inclusion proof (smtRoot(ord)) and
+            // absence-at-parent proof (smtRoot(ord−1)) ml0 verifies the signed smtRoot against by construction.
             val changeSetService = io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService
-              .make[F](recentFinalizedAccumulatorsRef.get)
+              .make[F](
+                recentFinalizedAccumulatorsRef.get,
+                Some(historicalCommitmentSmtStore),
+                sharedCfg.nakamoto.confirmationDepthK.value
+              )
             globalChangeSetServiceRef.set(Some(changeSetService))
           }.toResource
 

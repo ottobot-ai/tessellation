@@ -195,12 +195,33 @@ object GlobalL0Service {
         maybeGlobalFollowClient match {
           case None                     => none[GlobalChangeSetResponse].pure[F]
           case Some(globalFollowClient) =>
-            // Task #12 ml0 adopt fetch — same peer-resolution + error-to-None handling as `getFollowSliceSince`.
-            globalL0ClusterStorage.getRandomPeer.flatMap { peer =>
+            // Task #12 ml0 adopt fetch. Resolve to a MAJORITY-aligned peer (the same caught-up peers the
+            // snapshots themselves are pulled from), NOT a random one: a random L0 peer is frequently behind
+            // ml0's follow tip, so its finalized changeset ring lacks the just-pulled ordinal → the per-ordinal
+            // delta whiffs and ml0 falls back to full `createContext` re-execution, so the adopt path never
+            // fires for that ordinal (e2e: 6.4k whiffs vs 314 adopts). Majority peers finalized the ordinal ml0
+            // is following — that is HOW ml0 obtained the snapshot — so their ring holds the accumulator. Falls
+            // back to a random peer only when no majority set is configured (single-peer/dev), preserving prior
+            // behavior there.
+            resolveFollowFetchPeer.flatMap { peer =>
               globalFollowClient.getChangeSetSince(since).run(peer).map(_.some)
             }.handleErrorWith { e =>
               logger.warn(e)(s"Failure pulling changeset since=${since.show}").as(none)
             }
+        }
+
+      // Prefer a majority-aligned L0 peer for the ml0 adopt changeset fetch. The majority set is the group ml0
+      // already trusts and pulls finalized snapshots from, so those peers are caught up to ml0's follow tip and
+      // their finalized changeset rings hold the accumulators for the ordinals ml0 is processing. `getRandomPeer`
+      // (the fallback) draws from the whole L0 cluster, which routinely includes lagging peers.
+      private def resolveFollowFetchPeer: F[L0Peer] =
+        maybeMajorityPeerIds match {
+          case Some(majorityIds) =>
+            globalL0ClusterStorage.getRandomPeerExistentOnList(majorityIds.toList).flatMap {
+              case Some(peer) => peer.pure[F]
+              case None       => globalL0ClusterStorage.getRandomPeer
+            }
+          case None => globalL0ClusterStorage.getRandomPeer
         }
 
       def pullGlobalSnapshots: F[Either[LatestSnapshotTuple, List[Hashed[GlobalIncrementalSnapshot]]]] =

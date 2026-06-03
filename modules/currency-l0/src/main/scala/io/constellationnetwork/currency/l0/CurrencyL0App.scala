@@ -276,7 +276,8 @@ abstract class CurrencyL0App(
                       services,
                       dataApplicationService,
                       keyPair,
-                      mkCell
+                      mkCell,
+                      sharedConfig.nakamoto.confirmationDepthK.value
                     )
                   } >>
                   gossipDaemon.startAsRegularValidator >>
@@ -309,7 +310,8 @@ abstract class CurrencyL0App(
                       services,
                       dataApplicationService,
                       keyPair,
-                      mkCell
+                      mkCell,
+                      sharedConfig.nakamoto.confirmationDepthK.value
                     )
                   } >>
                   programs.globalL0PeerDiscovery.discoverFrom(cfg.globalL0Peer) >>
@@ -356,7 +358,8 @@ abstract class CurrencyL0App(
                       services,
                       dataApplicationService,
                       keyPair,
-                      mkCell
+                      mkCell,
+                      sharedConfig.nakamoto.confirmationDepthK.value
                     )
                   } >>
                   storages.node.tryModifyState(
@@ -455,7 +458,8 @@ abstract class CurrencyL0App(
                       services,
                       dataApplicationService,
                       keyPair,
-                      mkCell
+                      mkCell,
+                      sharedConfig.nakamoto.confirmationDepthK.value
                     )
                     _ <-
                       if (cfg.environment =!= AppEnvironment.Dev) {
@@ -550,7 +554,16 @@ abstract class CurrencyL0App(
             }
             _ <- HasherSelector[IO].withCurrent { implicit hs =>
               StateChannel
-                .run[IO](services, storages, sharedStorages, programs, dataApplicationService, keyPair, mkCell)
+                .run[IO](
+                  services,
+                  storages,
+                  sharedStorages,
+                  programs,
+                  dataApplicationService,
+                  keyPair,
+                  mkCell,
+                  sharedConfig.nakamoto.confirmationDepthK.value
+                )
                 .compile
                 .drain
             }

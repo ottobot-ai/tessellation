@@ -5,12 +5,16 @@ import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
 
+import io.constellationnetwork.node.shared.domain.nakamoto.nipopow.HistoricalCommitmentSmtStore
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
-import io.constellationnetwork.schema.nakamoto.follow.GlobalChangeSetResponse
+import io.constellationnetwork.schema.nakamoto.follow.{GlobalChangeSetDelta, GlobalChangeSetResponse}
+import io.constellationnetwork.security.smt.SmtProof
+
+import eu.timepit.refined.types.numeric.NonNegLong
 
 /** gl0-side CHANGESET PRODUCER for the currency-l0 (ml0) adopt-and-verify follow path (task #12, slice 2; see the
-  * `project_ml0_diff_adopt_design` notes).
+  * `project_ml0_diff_adopt_design` notes). SMT proofs added in Slice B.
   *
   * ml0 is a FULL-state follower (it persists the whole GSI and serves the hosted data-application), so — unlike the gl1 own-slice follower
   * ([[GlobalFollowSliceService]]) — it cannot reduce to a 5-field projection. Instead it adopts each finalized ordinal's typed
@@ -19,8 +23,10 @@ import io.constellationnetwork.schema.nakamoto.follow.GlobalChangeSetResponse
   * `mptRoot` — NO re-execution.
   *
   * This service serves those deltas from a BOUNDED ring of recent FINALIZED accumulators that `SnapshotLeaderLoop` fills at its finalize
-  * sinks (parallel to the #287 [[GlobalFollowSliceService]] projection ring). Additive: a pure read of finalized state; it never feeds back
-  * into consensus.
+  * sinks (parallel to the #287 [[GlobalFollowSliceService]] projection ring). Each served delta additionally carries the §3-NIPoPoW
+  * historical-commitment SMT proofs ([[HistoricalCommitmentSmtStore.proveAt]]) that let the follower VERIFY the signed `smtRoot` by
+  * construction (it re-derives the eligible ordinal's commitment leaf, binds the proof to it, and folds to the signed root). Additive: a
+  * pure read of finalized state; it never feeds back into consensus.
   */
 trait GlobalChangeSetService[F[_]] {
 
@@ -48,28 +54,69 @@ object GlobalChangeSetService {
   /** @param recentAccumulators
     *   thunk yielding the producer's bounded ring of recent FINALIZED per-ordinal accumulators keyed by ordinal — production reads the Ref
     *   `SnapshotLeaderLoop` updates at its finalize sinks. Empty until the first finalize.
+    * @param historicalCommitmentSmtStore
+    *   the gl0 §3-NIPoPoW historical-commitment SMT store, used to build each served delta's inclusion proof against `smtRoot(ordinal)` and
+    *   absence-at-parent proof against `smtRoot(ordinal − 1)`. `None` on followers that do not maintain the store (cl0/dl1 SharedServices),
+    *   in which case both proof fields are always `None` (the follower degrades to mptRoot-only adoption).
+    * @param confirmationDepthK
+    *   the confirmation-depth cutoff `k`: the eligible ordinal a proof targets is `ordinal − k` (the SAME cutoff `accept()` uses to anchor
+    *   `smtRoot(ordinal)`). For `ordinal ≤ k` no `smtRoot` exists (genesis/warmup) ⇒ both proofs `None`.
     */
   def make[F[_]: Monad](
-    recentAccumulators: F[SortedMap[SnapshotOrdinal, StateChangesAccumulator]]
+    recentAccumulators: F[SortedMap[SnapshotOrdinal, StateChangesAccumulator]],
+    historicalCommitmentSmtStore: Option[HistoricalCommitmentSmtStore[F]],
+    confirmationDepthK: Long
   ): GlobalChangeSetService[F] = new GlobalChangeSetService[F] {
 
+    /** Build the two SMT proofs for one served ordinal. `None` for both when no store is wired or the snapshot is in the warmup window
+      * (`ordinal ≤ k`, no `smtRoot`). A `proveAt` `Left` (e.g. the eligible ordinal's root fell out of retention) maps to `None` for that
+      * proof — the follower degrades that ordinal to mptRoot-only. Never fails the changeset.
+      */
+    private def proofsFor(ordinal: SnapshotOrdinal): F[(Option[SmtProof], Option[SmtProof])] =
+      historicalCommitmentSmtStore match {
+        case None => (none[SmtProof], none[SmtProof]).pure[F]
+        case Some(store) =>
+          val ordL = ordinal.value.value
+          // eligible = ordinal − k, parent = ordinal − 1; both are well-defined (≥ 0) iff ordinal > k.
+          (NonNegLong.from(ordL - confirmationDepthK).toOption, NonNegLong.from(ordL - 1L).toOption)
+            .mapN((eligible, parent) => (SnapshotOrdinal(eligible), SnapshotOrdinal(parent))) match {
+            case None if ordL > confirmationDepthK =>
+              // Shouldn't happen (ordinal > k ⇒ both refinements succeed); be safe and degrade.
+              (none[SmtProof], none[SmtProof]).pure[F]
+            case None =>
+              // Warmup window: ordinal ≤ k ⇒ no smtRoot anchored ⇒ no proof to build.
+              (none[SmtProof], none[SmtProof]).pure[F]
+            case Some((eligibleOrd, parentOrd)) =>
+              for {
+                inclusion <- store.proveAt(ordinal, eligibleOrd).map(_.toOption)
+                // Absence-at-parent: prove the eligible commitment against smtRoot(ordinal − 1). Populated for the FUTURE
+                // transition-verification variant; ml0 ignores it this slice. Degrade to None on any Left.
+                absenceAtParent <- store.proveAt(parentOrd, eligibleOrd).map(_.toOption)
+              } yield (inclusion, absenceAtParent)
+          }
+      }
+
     def changeSetSince(since: SnapshotOrdinal): F[Option[GlobalChangeSetResponse]] =
-      recentAccumulators.map { ring =>
-        ring.lastOption.map {
-          case (latestOrdinal, _) =>
+      recentAccumulators.flatMap { ring =>
+        ring.lastOption match {
+          case None => none[GlobalChangeSetResponse].pure[F]
+          case Some((latestOrdinal, _)) =>
             if (since === latestOrdinal)
-              GlobalChangeSetResponse(latestOrdinal, since.some, Nil)
+              GlobalChangeSetResponse(latestOrdinal, since.some, Nil).some.pure[F]
             else {
-              val deltas = ring.iterator.collect {
+              val rawDeltas = ring.iterator.collect {
                 case (o, acc) if o.value.value > since.value.value => (o, acc)
               }.toList
               // Contiguity: the first served delta must be exactly `since + 1`, else `since + 1` was evicted (a gap the
               // follower can't bridge incrementally) → signal a full-GSI fallback.
-              val contiguous = deltas.headOption.forall(_._1.value.value == since.value.value + 1L)
+              val contiguous = rawDeltas.headOption.forall(_._1.value.value == since.value.value + 1L)
               if (contiguous)
-                GlobalChangeSetResponse(latestOrdinal, since.some, deltas)
+                rawDeltas.traverse {
+                  case (o, acc) =>
+                    proofsFor(o).map { case (incl, abs) => GlobalChangeSetDelta(o, acc, incl, abs) }
+                }.map(deltas => GlobalChangeSetResponse(latestOrdinal, since.some, deltas).some)
               else
-                GlobalChangeSetResponse(latestOrdinal, none, Nil)
+                GlobalChangeSetResponse(latestOrdinal, none, Nil).some.pure[F]
             }
         }
       }
