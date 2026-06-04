@@ -33,6 +33,21 @@ export CLEANUP_DOCKER_AT_END=${CLEANUP_DOCKER_AT_END:-false}
 export REGENERATE_TEST_KEYS=${REGENERATE_TEST_KEYS:-false}
 export BUILD_ONLY=${BUILD_ONLY:-false}
 
+# --- Runner safety / control (auto-teardown + global hard timeout) ---
+# KEEP_ALIVE: when true, the cluster is LEFT UP after the e2e suite finishes
+#   (debugging). Default false ⇒ compose-runner.sh auto-tears-down the cluster
+#   via `just down` (clean-docker; PRESERVES nodes/ logs) once the suite ends,
+#   pass OR fail. Set by --keep-alive.
+export KEEP_ALIVE=${KEEP_ALIVE:-false}
+# TEARDOWN_GRACE_SECONDS: seconds to wait after the suite concludes before the
+#   auto-teardown fires (gives an operator a moment to attach / inspect a fresh
+#   failure before containers vanish; logs in nodes/ survive regardless).
+export TEARDOWN_GRACE_SECONDS=${TEARDOWN_GRACE_SECONDS:-45}
+# RUN_TIMEOUT_SECONDS: global hard ceiling on the WHOLE run. A background
+#   watchdog force-kills the runner (and triggers teardown) if exceeded, so a
+#   stuck/looping test can never run all night and leak containers. Default 3h.
+export RUN_TIMEOUT_SECONDS=${RUN_TIMEOUT_SECONDS:-10800}
+
 
 export DAG_L0_PORT_PREFIX=${DAG_L0_PORT_PREFIX:-90}
 export DAG_L1_PORT_PREFIX=${DAG_L1_PORT_PREFIX:-91}
@@ -221,6 +236,27 @@ for arg in "$@"; do
       ;;
     --grafana)
       export ENABLE_GRAFANA=true
+      ;;
+    --keep-alive)
+      # Skip the default post-suite auto-teardown — leave the cluster UP for
+      # debugging. (Logs are preserved either way; this keeps the containers.)
+      export KEEP_ALIVE=true
+      ;;
+    --teardown-grace=*)
+      export TEARDOWN_GRACE_SECONDS="${arg#*=}"
+      if ! [[ "$TEARDOWN_GRACE_SECONDS" =~ ^[0-9]+$ ]]; then
+        echo "Error: --teardown-grace must be a non-negative integer (got: $TEARDOWN_GRACE_SECONDS)"
+        exit 1
+      fi
+      ;;
+    --timeout=*)
+      # Global hard ceiling (seconds) on the whole run; watchdog kills + tears
+      # down if exceeded. Guards against an all-night stuck-test container leak.
+      export RUN_TIMEOUT_SECONDS="${arg#*=}"
+      if ! [[ "$RUN_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
+        echo "Error: --timeout must be a positive integer number of seconds (got: $RUN_TIMEOUT_SECONDS)"
+        exit 1
+      fi
       ;;
     --gl0-url=*)
       export GL0_URL="${arg#*=}"

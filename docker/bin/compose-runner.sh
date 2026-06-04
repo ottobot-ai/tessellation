@@ -20,20 +20,99 @@ show_time() {
   echo "$stage took: $DELTA_SECONDS seconds - total time: $DELTA_SECONDS_TOTAL seconds"
 }
 
-cleanup_end() {
-  # tx-sender is a test fixture — always remove when the test run ends.
-  docker rm -f tx-sender 2>/dev/null || true
-  # Prometheus + Grafana are monitoring dashboards we want to survive the test run
-  # (so you can inspect metrics after tests finish, same as the node containers
-  # which stay up with --restart unless-stopped). Only tear them down when the
-  # caller asked for a full docker cleanup — this mirrors how node containers
-  # are handled below.
-  if [ "$CLEANUP_DOCKER_AT_END" == "true" ] && { [ -z "$TEST_HOST" ] || [ "$TEST_HOST" = "http://localhost" ]; }; then
-    docker rm -f prometheus nakamoto-grafana 2>/dev/null || true
-    ./docker/bin/tessellation-docker-cleanup.sh
-  fi
+# --- Runner safety: global hard timeout (watchdog) + exit-code preservation ---
+# A background watchdog (started just after set-env.sh is sourced) SIGTERMs this
+# script if the whole run exceeds RUN_TIMEOUT_SECONDS, so a stuck/looping test
+# can never run all night and leak containers. The SIGTERM handler records the
+# timeout and exits, which fires the single EXIT trap (cleanup_end) below.
+#
+# Marker file is set by the watchdog/handler; cleanup_end reads it to force a
+# non-zero (124) exit on timeout. mktemp here is best-effort: if it fails the
+# handler still exits non-zero, just without the explicit 124 normalization.
+RUNNER_TIMEOUT_MARKER="$(mktemp 2>/dev/null || echo /tmp/compose-runner-timeout.$$)"
+WATCHDOG_PID=""
+
+on_timeout_signal() {
+  # Invoked when the watchdog SIGTERMs us. Convert the signal into a controlled,
+  # non-zero exit so cleanup_end runs teardown deterministically (a bare signal
+  # would otherwise exit 143 and skip the 124 normalization).
+  echo "" >&2
+  echo "============================================================" >&2
+  echo "RUN TIMEOUT: exceeded ${RUN_TIMEOUT_SECONDS:-?}s hard ceiling — killing run + tearing down." >&2
+  echo "============================================================" >&2
+  echo "timeout" > "$RUNNER_TIMEOUT_MARKER" 2>/dev/null || true
+  exit 124
 }
 
+# cleanup_end is the SINGLE teardown point for EVERY exit path (normal end,
+# mid-flow `exit N`, set -e failure, or watchdog timeout). It is status-
+# PRESERVING: it captures the pending exit code FIRST and re-exits with it LAST,
+# so the teardown (which itself returns 0) can never clobber the true result.
+cleanup_end() {
+  local code=$?
+
+  # Timeout normalization: a watchdog kill becomes a definite non-zero (124).
+  if [ -s "$RUNNER_TIMEOUT_MARKER" ]; then
+    code=124
+  fi
+
+  # Stop the watchdog so it can't fire after we've already exited. Reap its
+  # child `sleep` first (pkill -P) so the multi-hour timer doesn't linger as an
+  # orphan after the subshell dies.
+  if [ -n "$WATCHDOG_PID" ]; then
+    pkill -P "$WATCHDOG_PID" 2>/dev/null || true
+    kill "$WATCHDOG_PID" 2>/dev/null || true
+  fi
+  rm -f "$RUNNER_TIMEOUT_MARKER" 2>/dev/null || true
+
+  # tx-sender is a test fixture — always remove when the run ends.
+  docker rm -f tx-sender 2>/dev/null || true
+
+  # Auto-teardown decision. Default ON. Skip only when:
+  #   * --keep-alive          : operator wants the cluster left up for debugging
+  #   * --up (DOCKER_UP)      : `just up` intentionally leaves a long-lived cluster
+  #   * --build / --list-tests: no cluster was ever started (nothing to tear down)
+  #   * remote host           : we don't own the cluster, never touch it
+  # PRESERVES nodes/ logs: tessellation-docker-cleanup.sh (== `just down` ==
+  # clean-docker) only removes containers/volumes/network + snapshot-streaming
+  # scratch — it NEVER touches nodes/, so post-mortem logs survive. (Do NOT use
+  # clean-data here.)
+  local is_local="false"
+  if [ -z "${TEST_HOST:-}" ] || [ "${TEST_HOST:-}" = "http://localhost" ]; then
+    is_local="true"
+  fi
+
+  if [ "${KEEP_ALIVE:-false}" = "true" ]; then
+    echo "[cleanup] --keep-alive set: leaving cluster UP (logs in nodes/; run 'just down' when done). exit=$code"
+  elif [ "${DOCKER_UP:-false}" = "true" ]; then
+    echo "[cleanup] --up mode: leaving cluster UP. exit=$code"
+  elif [ "${BUILD_ONLY:-false}" = "true" ] || [ "${LIST_TESTS:-false}" = "true" ]; then
+    : # no cluster was started; nothing to tear down
+  elif [ "$is_local" != "true" ]; then
+    echo "[cleanup] remote host (${TEST_HOST:-}): not tearing down a cluster we don't own. exit=$code"
+  else
+    local grace="${TEARDOWN_GRACE_SECONDS:-45}"
+    echo "============================================================"
+    echo "[cleanup] e2e run finished (exit=$code). Auto-teardown in ${grace}s"
+    echo "          (--keep-alive to skip). nodes/ logs are PRESERVED."
+    echo "============================================================"
+    if [ "$grace" -gt 0 ] 2>/dev/null; then
+      sleep "$grace" || true
+    fi
+    echo "[cleanup] tearing down cluster via clean-docker (just down)..."
+    # Mirror `just down` exactly: clean-docker == tessellation-docker-cleanup.sh.
+    # Wrapped in `|| true` so a teardown hiccup can never overwrite $code.
+    ./docker/bin/tessellation-docker-cleanup.sh || true
+    echo "[cleanup] teardown complete. nodes/ preserved for post-mortem."
+  fi
+
+  # Remove our own EXIT trap and re-exit with the TRUE captured status so the
+  # caller (just / CI) sees 0 only on a real pass, non-zero on failure/timeout.
+  trap - EXIT
+  exit "$code"
+}
+
+trap on_timeout_signal TERM
 trap cleanup_end EXIT
 
 # Get the directory where this script is located
@@ -48,6 +127,22 @@ echo "Running in top level directory $cur_dir"
 
 
 source ./docker/bin/set-env.sh "$@"
+
+# --- Start the global hard-timeout watchdog ---
+# Bounds the WHOLE run (assembly + bringup + workflows). If RUN_TIMEOUT_SECONDS
+# elapses before the runner exits, the watchdog SIGTERMs us; on_timeout_signal
+# then converts that into a controlled exit, and cleanup_end tears the cluster
+# down. This makes an all-night stuck-test container leak impossible. The
+# watchdog is reaped by cleanup_end on every exit path (including the fast
+# --list-tests/--build/--up exits), so it never outlives the run.
+RUNNER_MAIN_PID=$$
+(
+  sleep "${RUN_TIMEOUT_SECONDS:-10800}"
+  echo "[watchdog] run exceeded ${RUN_TIMEOUT_SECONDS:-10800}s — sending SIGTERM to runner (pid $RUNNER_MAIN_PID)" >&2
+  kill -TERM "$RUNNER_MAIN_PID" 2>/dev/null || true
+) &
+WATCHDOG_PID=$!
+echo "[watchdog] armed: global run timeout = ${RUN_TIMEOUT_SECONDS:-10800}s (pid $WATCHDOG_PID)"
 
 if [ "$LIST_TESTS" = "true" ]; then
   echo "================================================"

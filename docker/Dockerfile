@@ -1,6 +1,13 @@
 FROM ubuntu:22.04
 
-RUN apt update && apt install -y openjdk-21-jre
+# Use the JDK (headless) rather than the JRE so the JDK diagnostic tools —
+# jcmd / jmap / jstack — are present in the node image. These let an operator
+# pull a live heap histogram (`jcmd <pid> GC.class_histogram`), thread dump
+# (`jstack`), or heap dump (`jmap`) from a running/leaking node container for
+# post-mortem, which the JRE-only image could not do. `-headless` drops the
+# X11/AWT GUI deps so the image stays lean while still shipping the tools; the
+# `java` launcher is fully present, so the entrypoint/CMD are unaffected.
+RUN apt update && apt install -y openjdk-21-jdk-headless
 
 # Dev tools
 RUN apt install -y curl iproute2 iputils-ping jq

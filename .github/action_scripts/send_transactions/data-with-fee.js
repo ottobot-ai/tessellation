@@ -9,6 +9,7 @@ const { z } = require('zod');
 // same one the (passing) currency-tx path signs with, so the node accepts these bytes.
 const { serializeBrotli } = require('@stardust-collective/dag4-keystore');
 const {parseSharedArgs, withRetry} = require('../shared');
+const { pollWithEventKick } = require('../lib/awaitChainEvent');
 
 const CliArgsSchema = z.object({
     privateKey: z.string()
@@ -152,73 +153,58 @@ const sendDataTransactionsUsingUrls = async (
     return [account.address, estimateFeeResponse];
 };
 
+// Reactive (event-kicked) wait: subscribe to gl0's LocalEvents stream and re-run the
+// metagraph-L0 REST check on every cluster-progress tick (SNAPSHOT_FINALIZED /
+// METAGRAPH_SNAPSHOT_ACCEPTED) instead of a fixed 120×1s wall-clock poll. Robust to ml0
+// recovery latency — it wakes on actual cluster progress, with a generous 30min safety
+// timeout that dumps the last 10 events on failure. Mirrors the token-locks migration.
 const checkDataTransactionInMetagraphL0 = async (metagraphL0Url, address) => {
-    const maxAttempts = 120
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
+    await pollWithEventKick({
+        endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
+        maxWait: '30min',
+        tag: `dataTxInMl0:${address.slice(0, 12)}`,
+        checkFn: async () => {
             const response = await axios.get(`${metagraphL0Url}/data-application/addresses/${address}`);
             const responseData = response.data;
-
             if (Object.keys(responseData).length > 0) {
-                console.log(`Transaction processed successfully. Response: ${JSON.stringify(responseData)}`);
-                return;
+                console.log(`Data transaction processed successfully. Response: ${JSON.stringify(responseData)}`);
+                return responseData;
             }
-
-            console.log(`Data transaction not processed yet. Retrying in 1 seconds (${attempt}/${maxAttempts})`);
-        } catch (error) {
-            console.error(`Attempt ${attempt} failed: ${error.message}`);
+            throw new Error('data-application state not updated yet');
         }
-
-        if (attempt === maxAttempts) {
-            throw new Error(`Max attempts reached. Could not get state updated after sending data transaction. Please check the logs.`);
-        }
-
-        await sleep(1000);
-    }
+    });
 }
 
 const checkFeeTransactionInGlobalL0 = async (globalL0Url, feeWallet) => {
-    const maxAttempts = 120
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
+    // Multi-metagraph aware: look up ONLY the target metagraph we sent the data update to.
+    // The project template's hardcoded fee address is identical across all metagraphs, so
+    // iterating all of them could false-pass on another metagraph's fee-wallet balance.
+    // The test always submits to metagraph k=0, whose identifier is exported as METAGRAPH_ID
+    // by compose-runner.sh.
+    const targetMetagraphId = process.env.METAGRAPH_ID;
+    if (!targetMetagraphId) {
+        throw new Error('METAGRAPH_ID env var not set — cannot identify target metagraph');
+    }
+    // Reactive event-kicked wait (see checkDataTransactionInMetagraphL0).
+    await pollWithEventKick({
+        endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
+        maxWait: '30min',
+        tag: `feeTxInGl0:${feeWallet.slice(0, 12)}`,
+        checkFn: async () => {
             const response = await axios.get(`${globalL0Url}/global-snapshots/latest/combined`);
             const [_, globalSnapshotInfo] = response.data;
-
-            // Multi-metagraph aware: look up ONLY the target metagraph that we
-            // sent the data update to. Previously we picked the first metagraph
-            // (Object.keys()[0]) which is wrong under --metagraphs>1; then we
-            // iterated all metagraphs which can false-pass on a shared fee
-            // wallet balance (the project template's hardcoded fee address is
-            // identical across all metagraphs, so any other metagraph holding
-            // a non-zero balance for that address would satisfy the check).
-            //
-            // The test always submits to metagraph k=0, whose identifier is
-            // exported as METAGRAPH_ID by compose-runner.sh.
-            const targetMetagraphId = process.env.METAGRAPH_ID;
-            if (!targetMetagraphId) {
-                throw new Error('METAGRAPH_ID env var not set — cannot identify target metagraph');
-            }
             const lcs = globalSnapshotInfo.lastCurrencySnapshots || {};
             const targetEntry = lcs[targetMetagraphId];
             if (targetEntry && targetEntry.Right && Array.isArray(targetEntry.Right) && targetEntry.Right.length >= 2) {
                 const balances = targetEntry.Right[1].balances || {};
                 if (balances[feeWallet] && balances[feeWallet] > 0) {
                     console.log(`Fee transaction processed successfully on metagraph ${targetMetagraphId}. Response: ${JSON.stringify(balances)}`);
-                    return;
+                    return balances;
                 }
             }
-
-            console.log(`Fee transaction not processed yet. Retrying in 1 seconds (${attempt}/${maxAttempts})`);
-        } catch (error) {
-            console.error(`Attempt ${attempt} failed: ${error.message}`);
+            throw new Error('fee transaction not yet reflected in global snapshot');
         }
-
-        if (attempt === maxAttempts) {
-            throw new Error(`Max attempts reached. Could not get state updated after sending data transaction. Please check the logs.`);
-        }
-
-        await sleep(1000);
-    }
+    });
 }
 
 
