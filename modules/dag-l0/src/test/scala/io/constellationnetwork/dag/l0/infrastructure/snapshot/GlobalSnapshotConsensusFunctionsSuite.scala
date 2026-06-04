@@ -434,7 +434,10 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       rewardsService = RewardsService[IO](classicRewards, delegatorRewards, rewardsInfoCalculator, rewardsInfoStorage)
       // Task #12 slice 2b — the producer's hash-keyed changeset-staging Ref (empty for this unit suite; the
       // promotion/finality path is exercised in the dag-l0 integration loop, not here).
-      pendingAccumulatorsRef <- Ref.of[IO, Map[Hash, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator]](
+      pendingAccumulatorsRef <- Ref.of[IO, Map[
+        Hash,
+        (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)
+      ]](
         Map.empty
       )
       globalSnapshotConsensusFunction = GlobalSnapshotConsensusFunctions

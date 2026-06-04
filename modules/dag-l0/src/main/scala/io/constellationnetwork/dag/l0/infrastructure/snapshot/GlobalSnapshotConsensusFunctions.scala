@@ -83,6 +83,11 @@ object GlobalSnapshotConsensusFunctions {
     * steady state the map DRAINS on finalize (promotion rekeys raw->with-cert then removes the finalized hash), so this cap is only a
     * backstop for never-finalizing forks. Pure memory bound (a dropped pre-finalize staging entry only forces a follower into the full-GSI
     * adopt fallback), never a consensus parameter.
+    *
+    * Since slice-2c the steady-state bound is the FINALIZED-watermark prune in `SnapshotLeaderLoop.recordFinalizedAccumulator` (drop every
+    * staged entry at-or-below the finalized tip). This size cap only backstops a burst of never-finalizing forks staged BETWEEN two
+    * finalize ticks. Sized comfortably above the depth-k (255) retention window plus expected fork churn, with EVERY node now staging via
+    * the validator adopt path (not just the ~1/N it produced).
     */
   val pendingAccumulatorsToKeep: Int = 512
 
@@ -118,7 +123,13 @@ object GlobalSnapshotConsensusFunctions {
     // consensus/finality. Required param (no default — `Ref.of` is effectful): cl0/dl1/test sites pass
     // `Ref.of(Map.empty)` (those paths never finalize a gl0 changeset ring); production passes the shared Ref
     // from `GlobalSnapshotConsensus.make`.
-    pendingAccumulatorsRef: Ref[F, Map[Hash, StateChangesAccumulator]]
+    //
+    // VALUE = `(ordinal, accumulator)`: the ordinal travels with the staged accumulator so the finalize-sink
+    // promotion (`SnapshotLeaderLoop.recordFinalizedAccumulator`) can prune by a FINALIZED watermark — drop every
+    // staged entry at-or-below the finalized tip (each is promoted-or-a-dead-fork), correct-by-construction rather
+    // than the earlier arbitrary `.drop` size eviction that could discard a not-yet-finalized entry under the
+    // depth-k (255) retention window + reorg churn (esp. now that EVERY node stages via the validator adopt path).
+    pendingAccumulatorsRef: Ref[F, Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)]]
   ): GlobalSnapshotConsensusFunctions[F] = new GlobalSnapshotConsensusFunctions[F] {
 
     private val logger = Slf4jLogger.getLoggerFromClass[F](getClass)
@@ -733,8 +744,11 @@ object GlobalSnapshotConsensusFunctions {
         // forces a follower into the full-GSI adopt fallback for that ordinal, never an incorrect result.
         // Reached on BOTH the genuine produce path AND the follower/validator re-derivation (validateArtifact)
         // — both build a real candidate whose hash, if finalized, the sink promotes; that is intended.
+        // Stage `(currentOrdinal, acc)` — the ordinal rides along so the finalize-sink can watermark-prune (drop
+        // everything at-or-below the finalized tip). The size bound below is now only a hard backstop for a runaway
+        // never-finalizing-fork burst between two finalize ticks; the watermark prune is the steady-state bound.
         _ <- pendingAccumulatorsRef.update { staged =>
-          val updated = staged.updated(currentSnapshotHash, stateChangesAccumulator)
+          val updated = staged.updated(currentSnapshotHash, (currentOrdinal, stateChangesAccumulator))
           if (updated.size > GlobalSnapshotConsensusFunctions.pendingAccumulatorsToKeep)
             updated.drop(updated.size - GlobalSnapshotConsensusFunctions.pendingAccumulatorsToKeep)
           else updated

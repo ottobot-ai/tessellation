@@ -52,21 +52,22 @@ object ChangeSetRingPromotionSuite extends SimpleIOSuite {
     val ordinal = ord(5L)
     val a = acc(5L)
 
-    // 1) PRODUCER stages the accumulator under the RAW artifact hash.
-    val stagedAtProduce: Map[Hash, StateChangesAccumulator] = Map(rawHash -> a)
+    // 1) PRODUCER stages `(ordinal, accumulator)` under the RAW artifact hash (the ordinal rides along for the
+    //    finalize-sink watermark prune).
+    val stagedAtProduce: Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)] = Map(rawHash -> ((ordinal, a)))
 
     // 2) PRODUCE-PATH rekey raw → with-cert (the real `SnapshotLeaderLoop.rekeyStagedAccumulator`).
     val rekeyed = SnapshotLeaderLoop.rekeyStagedAccumulator(stagedAtProduce, rawHash, withCertHash)
 
-    // 3) FINALIZE-SINK promote: pull from staging by the WITH-CERT hash, ring-insert (the real
-    //    `SnapshotLeaderLoop.ringInsertTrimmed`). This mirrors `recordFinalizedAccumulator`'s atomic
+    // 3) FINALIZE-SINK promote: pull from staging by the WITH-CERT hash (unwrapping the ordinal), ring-insert (the
+    //    real `SnapshotLeaderLoop.ringInsertTrimmed`). This mirrors `recordFinalizedAccumulator`'s atomic
     //    modify/update exactly.
-    val pulled = rekeyed.get(withCertHash)
+    val pulled = rekeyed.get(withCertHash).map { case (_, acc) => acc }
     val ring0 = SortedMap.empty[SnapshotOrdinal, StateChangesAccumulator]
     val ringAfter = pulled.fold(ring0)(p => SnapshotLeaderLoop.ringInsertTrimmed(ring0, ordinal, p))
 
-    // 4) The served changeset service reads THIS ring.
-    val service = GlobalChangeSetService.make[IO](IO.pure(ringAfter))
+    // 4) The served changeset service reads THIS ring (no SMT store wired ⇒ proof fields None).
+    val service = GlobalChangeSetService.make[IO](IO.pure(ringAfter), historicalCommitmentSmtStore = None, confirmationDepthK = 255L)
 
     for {
       // A follower at ordinal-1 must receive the just-finalized delta.
@@ -78,7 +79,8 @@ object ChangeSetRingPromotionSuite extends SimpleIOSuite {
         expect(changeSet.isDefined) &&
         expect.same(changeSet.flatMap(_.baseOrdinal), Some(ord(4L))) &&
         expect.same(changeSet.map(_.latestOrdinal), Some(ordinal)) &&
-        expect.same(changeSet.map(_.deltas), Some(List(ordinal -> a)))
+        // deltas are `GlobalChangeSetDelta` (ordinal + accumulator + SMT proofs); no store wired ⇒ proofs None.
+        expect.same(changeSet.map(_.deltas.map(d => (d.ordinal, d.accumulator))), Some(List((ordinal, a))))
   }
 
   test("guard: WITHOUT the produce-path rekey, the finalize-sink lookup misses and the ring stays empty") {
@@ -86,14 +88,14 @@ object ChangeSetRingPromotionSuite extends SimpleIOSuite {
     val a = acc(5L)
 
     // Producer stages under raw, but we SKIP the rekey — the slice-2b defect.
-    val stagedAtProduce: Map[Hash, StateChangesAccumulator] = Map(rawHash -> a)
+    val stagedAtProduce: Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)] = Map(rawHash -> ((ordinal, a)))
 
     // Finalize sink looks up under the with-cert hash → miss → nothing promoted.
-    val pulled = stagedAtProduce.get(withCertHash)
+    val pulled = stagedAtProduce.get(withCertHash).map { case (_, acc) => acc }
     val ring0 = SortedMap.empty[SnapshotOrdinal, StateChangesAccumulator]
     val ringAfter = pulled.fold(ring0)(p => SnapshotLeaderLoop.ringInsertTrimmed(ring0, ordinal, p))
 
-    val service = GlobalChangeSetService.make[IO](IO.pure(ringAfter))
+    val service = GlobalChangeSetService.make[IO](IO.pure(ringAfter), historicalCommitmentSmtStore = None, confirmationDepthK = 255L)
 
     for {
       changeSet <- service.changeSetSince(ord(4L))
@@ -101,6 +103,31 @@ object ChangeSetRingPromotionSuite extends SimpleIOSuite {
       expect.same(pulled, None) && // the bug: with-cert lookup misses the raw-staged entry
         expect(ringAfter.isEmpty) && // ring never populates
         expect.same(changeSet, None) // service has nothing to serve (cold ring)
+  }
+
+  test("pruneStagedAtOrBelow drops every staged entry at-or-below the finalized tip (incl. same-ordinal forks), keeps in-flight") {
+    val hAtFinalized: Hash = Hash("33" * 32) // the promoted snapshot at the finalized ordinal
+    val hForkAtFinalized: Hash = Hash("44" * 32) // a losing fork AT the finalized ordinal (must be dropped)
+    val hBelow: Hash = Hash("55" * 32) // a dead fork BELOW the finalized ordinal (must be dropped)
+    val hAbove1: Hash = Hash("66" * 32) // still in flight (must be kept)
+    val hAbove2: Hash = Hash("77" * 32) // still in flight (must be kept)
+
+    val staged: Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)] = Map(
+      hAtFinalized -> ((ord(10L), acc(1L))),
+      hForkAtFinalized -> ((ord(10L), acc(2L))),
+      hBelow -> ((ord(7L), acc(3L))),
+      hAbove1 -> ((ord(11L), acc(4L))),
+      hAbove2 -> ((ord(12L), acc(5L)))
+    )
+
+    val pruned = SnapshotLeaderLoop.pruneStagedAtOrBelow(staged, ord(10L))
+
+    IO.pure(
+      expect.same(pruned.keySet, Set(hAbove1, hAbove2)) && // only strictly-above survive
+        expect(!pruned.contains(hAtFinalized)) && // promoted-or-drained
+        expect(!pruned.contains(hForkAtFinalized)) && // same-ordinal losing fork dropped
+        expect(!pruned.contains(hBelow)) // below-tip dead fork dropped
+    )
   }
 
   test("ringInsertTrimmed bounds the served ring to recentAccumulatorsToKeep, dropping the lowest ordinals") {

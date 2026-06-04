@@ -19,8 +19,10 @@ object GlobalChangeSetServiceSuite extends FunSuite {
   private val ring: SortedMap[SnapshotOrdinal, StateChangesAccumulator] =
     SortedMap(ord(100) -> emptyAcc, ord(101) -> emptyAcc, ord(102) -> emptyAcc, ord(103) -> emptyAcc)
 
+  // No SMT store wired (proof fields always None) + an arbitrary depth-k: this suite covers only the
+  // changeSetSince ring-slice logic, which is independent of the SMT-proof attachment.
   private def svc(r: SortedMap[SnapshotOrdinal, StateChangesAccumulator]) =
-    GlobalChangeSetService.make[Id](r)
+    GlobalChangeSetService.make[Id](r, historicalCommitmentSmtStore = None, confirmationDepthK = 255L)
 
   test("empty ring → None") {
     expect(svc(SortedMap.empty[SnapshotOrdinal, StateChangesAccumulator]).changeSetSince(ord(100)).isEmpty)
@@ -34,13 +36,13 @@ object GlobalChangeSetServiceSuite extends FunSuite {
     val r = svc(ring).changeSetSince(ord(101)).get
     expect(r.latestOrdinal == ord(103))
       .and(expect(r.baseOrdinal == Some(ord(101))))
-      .and(expect(r.deltas.map(_._1) == List(ord(102), ord(103))))
+      .and(expect(r.deltas.map(_.ordinal) == List(ord(102), ord(103))))
   }
 
   test("since == ring.min - 1 → full contiguous ring served") {
     val r = svc(ring).changeSetSince(ord(99)).get
     expect(r.baseOrdinal == Some(ord(99)))
-      .and(expect(r.deltas.map(_._1) == List(ord(100), ord(101), ord(102), ord(103))))
+      .and(expect(r.deltas.map(_.ordinal) == List(ord(100), ord(101), ord(102), ord(103))))
   }
 
   test("since older than ring (gap) → baseOrdinal = None (full-GSI fallback)") {

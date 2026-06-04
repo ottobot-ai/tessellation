@@ -261,6 +261,13 @@ object NakamotoSyncDaemon {
     productionGate: ProductionGate[F],
     mptStore: MptStore[F, GlobalStateKey],
     mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
+    // Task #12 slice-2c — the gl0 changeset STAGING map (same Ref the consensus functions + leader loop hold).
+    // Threaded into `NakamotoSnapshotValidator.validate` so a NON-producer rekeys its just-staged accumulator
+    // stripped->canonical and thus promotes on finalize (complete served ring; was per-producer-sparse).
+    pendingAccumulatorsRef: Ref[
+      F,
+      Map[Hash, (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)]
+    ],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
@@ -326,6 +333,7 @@ object NakamotoSyncDaemon {
               productionGate,
               mptStore,
               mptOverlay,
+              pendingAccumulatorsRef,
               eventMempool,
               chainSyncManager,
               channel,
@@ -376,6 +384,13 @@ object NakamotoSyncDaemon {
     productionGate: ProductionGate[F],
     mptStore: MptStore[F, GlobalStateKey],
     mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
+    // Task #12 slice-2c — the gl0 changeset STAGING map (same Ref the consensus functions + leader loop hold).
+    // Threaded into `handleSnapshot` -> `NakamotoSnapshotValidator.validate` so a NON-producer rekeys its just-
+    // staged accumulator stripped->canonical and thus promotes on finalize (complete served ring).
+    pendingAccumulatorsRef: Ref[
+      F,
+      Map[Hash, (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)]
+    ],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     dataDir: java.nio.file.Path,
     // (#196) Sink for inbound AllowSpendBlock gossip — same queue
@@ -582,6 +597,7 @@ object NakamotoSyncDaemon {
                                 productionGate,
                                 mptStore,
                                 mptOverlay,
+                                pendingAccumulatorsRef,
                                 eventMempool,
                                 csm,
                                 channel,
@@ -675,6 +691,7 @@ object NakamotoSyncDaemon {
                                     productionGate,
                                     mptStore,
                                     mptOverlay,
+                                    pendingAccumulatorsRef,
                                     eventMempool,
                                     chainSyncManager,
                                     channel,
@@ -909,6 +926,13 @@ object NakamotoSyncDaemon {
     productionGate: ProductionGate[F],
     mptStore: MptStore[F, GlobalStateKey],
     mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
+    // Task #12 slice-2c — the gl0 changeset STAGING map (same Ref the consensus functions + leader loop hold).
+    // Threaded into `NakamotoSnapshotValidator.validate` so a NON-producer rekeys its just-staged accumulator
+    // stripped->canonical and thus promotes on finalize (complete served ring; was per-producer-sparse).
+    pendingAccumulatorsRef: Ref[
+      F,
+      Map[Hash, (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)]
+    ],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
@@ -1069,7 +1093,8 @@ object NakamotoSyncDaemon {
                       }
                   }
                 },
-                mptOverlay = mptOverlay
+                mptOverlay = mptOverlay,
+                pendingAccumulatorsRef = pendingAccumulatorsRef
               )
             case None =>
               // Parent not in chain store. Three-tier gap handling:
@@ -1220,6 +1245,7 @@ object NakamotoSyncDaemon {
               productionGate,
               mptStore,
               mptOverlay,
+              pendingAccumulatorsRef,
               eventMempool,
               chainSyncManager,
               channel,

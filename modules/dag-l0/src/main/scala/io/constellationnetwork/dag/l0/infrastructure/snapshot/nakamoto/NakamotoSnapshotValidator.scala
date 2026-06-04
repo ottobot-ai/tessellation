@@ -1,6 +1,6 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
-import cats.effect.kernel.Async
+import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
@@ -61,6 +61,20 @@ object NakamotoSnapshotValidator {
     mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[
       F,
       io.constellationnetwork.schema.mpt.GlobalStateKey
+    ],
+    // Task #12 slice-2c — the gl0 changeset STAGING map (same Ref `GlobalSnapshotConsensus.make` injects into the
+    // consensus functions + leader loop). On the content-valid path we REKEY the just-staged accumulator
+    // stripped-hash -> canonical (with-cert) hash, exactly mirroring the overlay rekey below. `validateArtifact`
+    // (called above on `strippedReceived`) re-derives the artifact and stages its accumulator under
+    // hash(strippedReceived) — the NO-cert hash — but the finalize-sink promotion
+    // (`SnapshotLeaderLoop.recordFinalizedAccumulator`) looks it up under the with-cert canonical hash. Without this
+    // rekey a NON-producer never promotes (its staging key never matches), so its served ring only ever held the
+    // ~1/N of ordinals it personally produced and ml0 followers whiffed ~(N-1)/N. With it, every node that finalizes
+    // a snapshot promotes -> the cluster-wide ring is complete. Pure transport: byte-identical accumulator, never
+    // feeds back into consensus.
+    pendingAccumulatorsRef: Ref[
+      F,
+      Map[Hash, (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)]
     ]
   ): F[ValidationResult] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoValidator")
@@ -170,6 +184,14 @@ object NakamotoSnapshotValidator {
                               io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(strippedHash),
                               io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(canonicalHash)
                             )
+                            // Task #12 slice-2c — mirror the overlay rekey for the changeset STAGING map.
+                            // `validateArtifact` staged this ordinal's accumulator under `strippedHash` (it re-derived
+                            // `strippedReceived`, whose hash is the no-cert hash); the finalize-sink promotion looks it
+                            // up under `canonicalHash`. Move stripped -> canonical so a NON-producer promotes on
+                            // finalize and the served ring is complete (no-op if nothing staged under `strippedHash`).
+                            _ <- pendingAccumulatorsRef.update(
+                              SnapshotLeaderLoop.rekeyStagedAccumulator(_, strippedHash, canonicalHash)
+                            )
                             _ <- logger.debug(s"✅ Full content validation passed: slot=$slot ordinal=${signedSnapshot.ordinal}")
                           } yield Valid(signedSnapshot, validatedContext): ValidationResult
                         case Left(err) =>
@@ -238,6 +260,10 @@ object NakamotoSnapshotValidator {
                             _ <- mptOverlay.discardBranch(
                               io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(strippedHash)
                             )
+                            // Symmetric to the overlay discard: drop the accumulator `validateArtifact` staged under
+                            // `strippedHash` for this rejected (mismatched) candidate so it doesn't sit in staging
+                            // until the watermark prune. Mirrors the producer's abandoned-fork `_ - rawArtifactHash`.
+                            _ <- pendingAccumulatorsRef.update(_ - strippedHash)
                             result <-
                               if (logMsg._2)
                                 logger.info(logMsg._1).as(Valid(signedSnapshot, context): ValidationResult)

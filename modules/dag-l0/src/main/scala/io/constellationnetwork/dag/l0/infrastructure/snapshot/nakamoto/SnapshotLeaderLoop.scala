@@ -121,13 +121,25 @@ object SnapshotLeaderLoop {
     * → withCertHash` (no-op if nothing is staged under `rawHash`). Mirrors the overlay branch rekey done alongside it.
     */
   def rekeyStagedAccumulator(
-    staged: Map[Hash, StateChangesAccumulator],
+    staged: Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)],
     rawHash: Hash,
     withCertHash: Hash
-  ): Map[Hash, StateChangesAccumulator] =
+  ): Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)] =
     staged
       .get(rawHash)
-      .fold(staged)(acc => (staged - rawHash).updated(withCertHash, acc))
+      .fold(staged)(entry => (staged - rawHash).updated(withCertHash, entry))
+
+  /** Finalize-sink FINALIZED-WATERMARK prune: keep only staged entries STRICTLY ABOVE the just-finalized `finalizedOrdinal` (still in
+    * flight). Every entry at-or-below it is either the snapshot we just promoted or a fork candidate at a now-finalized height that can
+    * never finalize on the canonical chain (depth-k finality settles ≤ finalized-tip), so it is dead. This is the correct-by-construction
+    * replacement for the earlier arbitrary size-`.drop` eviction (which could discard a not-yet-finalized entry under the depth-k retention
+    * window + reorg churn). Pure; idempotent; never errors.
+    */
+  def pruneStagedAtOrBelow(
+    staged: Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)],
+    finalizedOrdinal: SnapshotOrdinal
+  ): Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)] =
+    staged.filter { case (_, (o, _)) => o.value.value > finalizedOrdinal.value.value }
 
   /** Finalize-sink ring insert: put `acc` at `ordinal` into the served ordinal-keyed ring, trimmed to the last
     * [[GlobalChangeSetService.recentAccumulatorsToKeep]] (dropping the lowest ordinals). The promote at the finalize sink pulls `acc` out
@@ -440,11 +452,15 @@ object SnapshotLeaderLoop {
     // Task #12 slice 2b (ml0 changeset-adopt follow, the FULL-state analogue of the #287 gl1 slice ring
     // above). STAGING map the gl0 producer (`GlobalSnapshotConsensusFunctions`) fills hash-keyed when it
     // builds a snapshot; read here at the two finalize sinks to PROMOTE the just-finalized snapshot's
-    // accumulator into the served ring and then remove that hash. A finalized hash absent from the staging
-    // map (a snapshot this node did NOT itself produce, so it never staged) is skipped — the ml0 follower
-    // full-GSI-adopts that gap; absence MUST NOT error. Same instance `GlobalSnapshotConsensus.make` injects
-    // into the consensus functions.
-    pendingAccumulatorsRef: Ref[F, Map[Hash, StateChangesAccumulator]],
+    // accumulator into the served ring and then remove that hash. EVERY gl0 node stages a candidate's accumulator
+    // here — the PRODUCER via the produce path, and a NON-producer via `NakamotoSnapshotValidator.validate`'s
+    // `validateArtifact` re-derivation (rekeyed stripped->canonical there, mirroring the producer's raw->with-cert
+    // rekey) — so the promotion finds it under the canonical hash on every finalizer and the served ring is COMPLETE
+    // cluster-wide (was per-producer-sparse → ml0 whiffed ~7/8). A finalized hash still absent (e.g. dropped pre-
+    // finalize) is skipped — the ml0 follower full-GSI-adopts that gap; absence MUST NOT error. VALUE carries the
+    // ordinal for the finalize-sink watermark prune. Same instance `GlobalSnapshotConsensus.make` injects into the
+    // consensus functions AND the sync daemon.
+    pendingAccumulatorsRef: Ref[F, Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)]],
     // Task #12 slice 2b — the SERVED bounded ring of recent FINALIZED per-ordinal accumulators keyed by
     // ordinal (the ml0-side analogue of `recentFollowProjectionsRef`). Promoted at BOTH finalize sinks from
     // `pendingAccumulatorsRef`, trimmed to the last `GlobalChangeSetService.recentAccumulatorsToKeep` (= 256,
@@ -567,15 +583,20 @@ object SnapshotLeaderLoop {
     // Idempotent on re-finalize of the same ordinal (re-promote is a no-op once staging is drained). Called at
     // BOTH finalize sinks (depth-k AND attestation-2/3), exactly paralleling `recordFollowProjection`.
     def recordFinalizedAccumulator(ordinal: SnapshotOrdinal, finalizedHash: Hash): F[Unit] =
-      // Atomically pull the staged accumulator out (removing it so fork candidates can't leak), then atomically
-      // insert it into the served ring via the pure `ringInsertTrimmed` helper. Two separate atomic ops on the two
-      // refs preserves the original `.modify`/`.update` semantics; the pure trim helper is what the regression suite
-      // drives directly (after the produce-path `rekeyStagedAccumulator`).
+      // Atomically (a) pull the staged accumulator out under the finalized (with-cert canonical) hash, AND (b)
+      // FINALIZED-WATERMARK prune: drop every OTHER staged entry whose ordinal is at-or-below this just-finalized
+      // ordinal — each such entry is either the one we just promoted (removed here) or a fork candidate at a now-
+      // finalized height that can never finalize on the canonical chain, so it is dead. This replaces the earlier
+      // arbitrary size-`.drop` eviction (which could discard a not-yet-finalized entry under the depth-k retention
+      // window + reorg churn) with a correct-by-construction bound. Then atomically insert the promoted accumulator
+      // into the served ring via the pure `ringInsertTrimmed` helper. The pure trim helper is what the regression
+      // suite drives directly (after the produce-path `rekeyStagedAccumulator`).
       pendingAccumulatorsRef.modify { staged =>
-        staged.get(finalizedHash) match {
-          case Some(acc) => (staged - finalizedHash, Some(acc))
-          case None      => (staged, None)
-        }
+        val promoted = staged.get(finalizedHash).map { case (_, acc) => acc }
+        // Watermark prune via the pure helper: keep only entries strictly ABOVE the finalized tip (still in flight).
+        // This also removes `finalizedHash` itself (its ordinal == this ordinal, not strictly above) — the drain.
+        val pruned = pruneStagedAtOrBelow(staged, ordinal)
+        (pruned, promoted)
       }.flatMap {
         case Some(acc) => recentFinalizedAccumulatorsRef.update(ring => ringInsertTrimmed(ring, ordinal, acc))
         case None      => Async[F].unit
@@ -1019,9 +1040,10 @@ object SnapshotLeaderLoop {
                                               canonicalSnapshot.context
                                             ) >>
                                             // Task #12 slice 2b: promote this finalized snapshot's per-ordinal accumulator
-                                            // (staged hash-keyed by the producer under `canonicalHash`) into the served
-                                            // changeset ring for the ml0 adopt-and-verify follow path. No-op if this node
-                                            // never staged it (didn't produce it) — the follower full-GSI-adopts that gap.
+                                            // (staged hash-keyed under `canonicalHash` by BOTH the producer AND any non-
+                                            // producer that validated it — NakamotoSnapshotValidator rekeys stripped->
+                                            // canonical) into the served changeset ring. COMPLETE on every finalizer now;
+                                            // the rare no-op is a catch-up/download node that adopted without staging.
                                             recordFinalizedAccumulator(
                                               SnapshotOrdinal.unsafeApply(finalizeAtOrdinal),
                                               canonicalHash
@@ -1126,7 +1148,8 @@ object SnapshotLeaderLoop {
                                             // #287: same recent-projection ring update as the DEPTH-FINALIZED branch above.
                                             recordFollowProjection(SnapshotOrdinal.unsafeApply(finalOrdinal), stored.context) >>
                                             // Task #12 slice 2b: same changeset-ring promotion as the DEPTH-FINALIZED branch
-                                            // above. No-op when this node didn't stage `canonicalHash` (didn't produce it).
+                                            // above. Staged by producer + every validator (rekeyed canonical) → complete;
+                                            // rare no-op = a catch-up node that adopted without staging.
                                             recordFinalizedAccumulator(SnapshotOrdinal.unsafeApply(finalOrdinal), canonicalHash) >>
                                             snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(finalOrdinal))) >>
                                             logger.info(
@@ -1392,7 +1415,7 @@ object SnapshotLeaderLoop {
     // Task #12 slice 2b — the gl0 changeset STAGING map (threaded from `run`'s same-named param). The
     // produce path below rekeys the staged accumulator raw->with-cert alongside the overlay rekey so the
     // finalize-sink promotion (`recordFinalizedAccumulator`, in `run`) can find it under the canonical hash.
-    pendingAccumulatorsRef: Ref[F, Map[Hash, StateChangesAccumulator]],
+    pendingAccumulatorsRef: Ref[F, Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)]],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     // Slice S6: app-scoped Supervisor for the off-critical-path producer fan-out (see Gap A below).

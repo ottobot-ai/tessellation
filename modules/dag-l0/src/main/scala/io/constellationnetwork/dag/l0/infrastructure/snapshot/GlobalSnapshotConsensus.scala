@@ -317,7 +317,9 @@ object GlobalSnapshotConsensus {
       pendingAccumulatorsRef <- cats.effect.kernel.Ref
         .of[F, Map[
           io.constellationnetwork.security.hash.Hash,
-          io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
+          // VALUE = `(ordinal, accumulator)` — the ordinal rides along so the finalize-sink can FINALIZED-watermark-
+          // prune (drop every staged entry at-or-below the finalized tip), replacing the arbitrary size `.drop`.
+          (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)
         ]](Map.empty)
         .toResource
       // SERVED ring: bounded ordinal-keyed ring of recent FINALIZED per-ordinal accumulators (the ml0-side
@@ -1799,6 +1801,10 @@ object GlobalSnapshotConsensus {
                   productionGate = productionGate,
                   mptStore = mptStore,
                   mptOverlay = mptOverlay,
+                  // Task #12 slice-2c — same staging Ref the consensus functions (575) + leader loop (1574) hold.
+                  // Lets the daemon's validator-adopt path rekey a NON-producer's staged accumulator
+                  // stripped->canonical so it promotes on finalize (complete served changeset ring).
+                  pendingAccumulatorsRef = pendingAccumulatorsRef,
                   eventMempool = eventMempool,
                   dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data")),
                   enqueueAllowSpendBlock = enqueueAllowSpendBlock,

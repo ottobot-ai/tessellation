@@ -57,7 +57,8 @@ object GlobalChangeSetRoutesSuite extends HttpSuite {
     for {
       sliceRef <- Ref.of[IO, Option[GlobalFollowSliceService[IO]]](None)
       changeSetRef <- Ref.of[IO, Option[GlobalChangeSetService[IO]]](
-        ring.map(r => GlobalChangeSetService.make[IO](IO.pure(r)))
+        // No SMT store wired (proof fields None) — this suite covers the scodec route round-trip, not proofs.
+        ring.map(r => GlobalChangeSetService.make[IO](IO.pure(r), historicalCommitmentSmtStore = None, confirmationDepthK = 255L))
       )
     } yield GlobalFollowRoutes[IO](sliceRef, changeSetRef).publicRoutes
 
@@ -103,7 +104,8 @@ object GlobalChangeSetRoutesSuite extends HttpSuite {
         case Right(response) =>
           expect.same(response.latestOrdinal, ord(10L)) &&
           expect.same(response.baseOrdinal, ord(8L).some) &&
-          expect.same(response.deltas, List(ord(9L) -> acc(9L), ord(10L) -> acc(10L)))
+          // deltas are `GlobalChangeSetDelta` (ordinal + accumulator + SMT proofs); no store wired ⇒ proofs None.
+          expect.same(response.deltas.map(d => (d.ordinal, d.accumulator)), List((ord(9L), acc(9L)), (ord(10L), acc(10L))))
       }
   }
 

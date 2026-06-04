@@ -22,8 +22,8 @@ import shapeless.{::, HNil}
   *
   * `SmtProof` discriminator:
   *   - 0x00 [[SmtProof.Inclusion]] — `key` ([[HexContentCodec]], uint16-prefixed bytes) :: `value` (uint16-prefixed RAW bytes — NOT the
-  *     uint32 [[io.constellationnetwork.serde.codecs.ByteArrayCodec]]: an SMT leaf value is a 32-byte commitment digest, well under 64KB) ::
-  *     `valueDigest` ([[HashCodec]], fixed 32 bytes) :: `siblings` (List via [[ListCodec]], each an [[SmtSibling]] = one `Hash`).
+  *     uint32 [[io.constellationnetwork.serde.codecs.ByteArrayCodec]]: an SMT leaf value is a 32-byte commitment digest, well under 64KB)
+  *     :: `valueDigest` ([[HashCodec]], fixed 32 bytes) :: `siblings` (List via [[ListCodec]], each an [[SmtSibling]] = one `Hash`).
   *   - 0x01 [[SmtProof.Absence]] — `key` :: `witness` ([[AbsenceWitness]], 1-byte discriminator) :: `siblings`.
   *
   * `AbsenceWitness` discriminator:
@@ -33,9 +33,9 @@ import shapeless.{::, HNil}
   * `SmtSibling` is a single `Hash` (the sibling subtree digest). A `Hash.empty` sibling (collapsed default subtree) is encoded as 32 zero
   * bytes — the slot is kept explicit so the sibling index lines up with the position bit index (same contract as the JSON form).
   *
-  * Consensus contract: this is a TRANSPORT codec, not a signing/hashing preimage — the cryptographic anchor is the SIGNED `smtRoot`, against
-  * which the follower folds the decoded proof (the leaf-binding + `SmtVerifier` fold). The encoding is nonetheless frozen byte-for-byte like
-  * every other scodec codec.
+  * Consensus contract: this is a TRANSPORT codec, not a signing/hashing preimage — the cryptographic anchor is the SIGNED `smtRoot`,
+  * against which the follower folds the decoded proof (the leaf-binding + `SmtVerifier` fold). The encoding is nonetheless frozen
+  * byte-for-byte like every other scodec codec.
   */
 object SmtProofCodec {
 
