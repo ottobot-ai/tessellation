@@ -9,6 +9,7 @@ import cats.syntax.all._
 import cats.{Applicative, Parallel}
 
 import scala.concurrent.duration._
+import scala.util.control.NoStackTrace
 
 import io.constellationnetwork.currency.dataApplication.BaseDataApplicationL0Service
 import io.constellationnetwork.currency.l0.cli.method.Run
@@ -44,6 +45,24 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 object StateChannel {
 
   private val awakePeriod = 10.seconds
+
+  // Bound the in-tick re-pull loop in `resyncToCanonical` when gl0 serves a GSI inconsistent with its own signed mptRoot.
+  // A few attempts cover transient peer disagreement; if every attempt is inconsistent we idle and let the next 10s tick
+  // retry rather than spin forever.
+  private val maxResyncPullAttempts = 3
+
+  // Control-flow signal raised by the global-FOLLOW path (`deriveFollowContext`) when ml0 cannot adopt-and-verify the
+  // per-ordinal delta for ordinal N — either the delta is unavailable (ring-gap / no client / `baseOrdinal=None`) or the
+  // recomputed mptRoot did not match the signed root. INSTEAD of re-executing global consensus (`createContext`), which
+  // would recompute consensus-derived boundary state (`historicalStakeSnapshots`, `eta`, …) a follower structurally cannot
+  // reproduce — poisoning the base and cascading into further adopt-verify failures (prod: 238/294 StateProofMismatch
+  // diverged on `historicalStakeSnapshots`) — the follow path raises this. `handleIncrementalSnapshot`'s `handleErrorWith`
+  // catches it and RESYNCS to gl0's authoritative latest GSI via `resyncToCanonical` (adopt, never recompute). Modeled on
+  // `GlobalSnapshotContextFunctions.StateProofMismatch` (also `NoStackTrace`) — it is pure control flow on a hot path, so we
+  // do not pay for stack capture.
+  final case class FollowResyncNeeded(ordinal: SnapshotOrdinal, reason: String) extends NoStackTrace {
+    override def getMessage: String = s"ml0 follow resync-to-canonical needed at ordinal=${ordinal.show}: $reason"
+  }
 
   def run[F[_]: Async: HasherSelector: SecurityProvider: Metrics: Parallel: JsonSerializer: Hasher](
     services: Services[F, Run],
@@ -172,68 +191,128 @@ object StateChannel {
         _ <- logger.info(s"Successfully initialized global snapshot storages with ordinal=${snapshot.ordinal}")
       } yield ()
 
-    // Catch StateProofMismatch raised by createContext when ml0's stored lastState diverges
-    // from the producer's claimed mptRoot — happens when ml0 saved a snapshot from a gl0
-    // producer whose local-head was on a transient fork that the gl0 layer later reorg'd
-    // away from (maxvalid-tk). Without recovery the loop retries the same orphan forever
-    // (observed: 554 retries on ord 322 stalled spend tests at the bigset run).
+    // RESYNC-TO-CANONICAL: fetch gl0's authoritative latest (snapshot, GSI) and ADOPT it, atomically swapping all three
+    // storage refs via `setForRecovery`. This is the ONE recovery primitive for every "ml0 cannot advance from its current
+    // state" situation:
+    //   - StateProofMismatch (`recoverFromOrphan`, below): ml0 saved a snapshot from a gl0 producer whose local-head was on
+    //     a transient fork the gl0 layer later reorg'd away from (maxvalid-tk). Without recovery the loop retries the same
+    //     orphan forever (observed: 554 retries on ord 322 stalled spend tests at the bigset run).
+    //   - orphan-fork chain-link mismatch (`recoverFromOrphan` from `processSnapshotList`).
+    //   - FollowResyncNeeded (the new follow-path signal): the per-ordinal adopt-and-verify could not adopt (ring-gap, no
+    //     client, or recomputed mptRoot ≠ signed). We MUST NOT re-execute global consensus to fill the gap — that recomputes
+    //     `historicalStakeSnapshots`/`eta` boundary state a follower cannot reproduce. Adopting gl0's latest GSI (which
+    //     already carries the correct boundary state) is the only correct-by-construction recovery.
     //
-    // Recovery: fetch the canonical latest from majority and atomically swap all three
-    // storage refs via `setForRecovery`. Unlike `clear`, setForRecovery keeps stores
-    // populated, so downstream consumers (StateChannelBinarySender,
-    // CurrencySnapshotConsensusStateCreator, CurrencyMessagesService,
-    // StateChannelSnapshotService) continue to see a valid lastGlobalSnapshot and consensus
-    // stays Ready. MPT is realigned to the canonical state via syncFromGlobalSnapshotInfo.
-    def recoverFromOrphan(failedOrdinal: SnapshotOrdinal, cause: Throwable): F[Unit] =
-      for {
-        _ <- logger.warn(
-          s"ml0 StateProofMismatch at ord=${failedOrdinal.show} (${cause.getMessage}); fetching canonical latest from majority for setForRecovery"
-        )
-        canonical <- services.globalL0.pullLatestSnapshot
-        (canonicalSnapshot, canonicalState) = canonical
-        _ <- ensureMptInitialized(canonicalSnapshot.ordinal, canonicalState)
-        _ <- storages.lastSyncGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
-        _ <- sharedStorages.lastNGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
-        _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
-        _ <- persistGlobalSnapshot(canonicalSnapshot, canonicalState)
-        _ <- triggerOnGlobalSnapshotPullHook(canonicalSnapshot, canonicalState)
-        // Drop pending state-channel binaries built against the orphan gl0 chain. Their
-        // `globalSyncView` references gl0 ordinals whose hashes no longer match canonical;
-        // gl0 will reject them with `Forced globalSyncView hash mismatch`, leaving the queue
-        // poisoned (totalPending grows monotonically as ml0 produces new binaries). Clearing
-        // here lets the next currency-consensus round build binaries against the new canonical
-        // gl0 view, restoring the metagraph propagation chain on gl0. Binaries already
-        // confirmed by gl0 (state-channel-snapshot included in a finalized global snapshot)
-        // are unaffected — `markAsConfirmed` already removed them. (#113)
-        _ <- services.stateChannelBinarySender.clearPending
-        _ <- logger.info(
-          s"ml0 recovered to canonical ord=${canonicalSnapshot.ordinal.show}; will resume pulling forward on next tick"
-        )
-      } yield ()
+    // Unlike `clear`, `setForRecovery` keeps stores populated, so downstream consumers (StateChannelBinarySender,
+    // CurrencySnapshotConsensusStateCreator, CurrencyMessagesService, StateChannelSnapshotService) continue to see a valid
+    // lastGlobalSnapshot and consensus stays Ready. MPT is realigned to the canonical state via syncFromGlobalSnapshotInfo.
+    //
+    // VERIFY GATE (correct-by-construction): `pullLatestSnapshot` only checks the snapshot HASH against the majority — it
+    // explicitly DEFERS state-proof validation (it never confirms the served GSI reproduces the snapshot's SIGNED mptRoot).
+    // So after `ensureMptInitialized` rebuilds the MPT from the served GSI, we recompute its root at the snapshot ordinal and
+    // require it to equal the signed `stateProof.mptRoot` (mirroring `adoptAndVerifyChangeSetDelta`'s `getRootHashForOrdinal`
+    // ... `.map(_.value).contains(expectedRoot)` gate). On MATCH we adopt. On MISMATCH gl0 served a GSI inconsistent with its
+    // own signed root — we log loudly and RE-PULL (a fresh `pullLatestSnapshot` re-shuffles peers / re-verifies majority),
+    // bounded by `maxResyncPullAttempts`; we NEVER adopt unverified state. If all attempts fail we leave storages untouched
+    // and idle — the next 10s tick re-enters and retries, so a transient gl0 inconsistency self-heals without crashing the
+    // stream or adopting corrupt state.
+    def resyncToCanonical(failedOrdinal: SnapshotOrdinal, reason: String, clearPendingBinaries: Boolean): F[Unit] = {
+      def adoptCanonical(canonicalSnapshot: Hashed[GlobalIncrementalSnapshot], canonicalState: GlobalSnapshotInfo): F[Unit] =
+        for {
+          _ <- storages.lastSyncGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
+          _ <- sharedStorages.lastNGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
+          _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
+          _ <- persistGlobalSnapshot(canonicalSnapshot, canonicalState)
+          _ <- triggerOnGlobalSnapshotPullHook(canonicalSnapshot, canonicalState)
+          // Drop pending state-channel binaries — ONLY on a true orphan/divergence recovery
+          // (`clearPendingBinaries=true`, i.e. recoverFromOrphan on a StateProofMismatch), NEVER on
+          // a ring-gap FollowResyncNeeded resync. On an ORPHAN the pending binaries' `globalSyncView`
+          // references gl0 ordinals whose hashes no longer match canonical; gl0 rejects them
+          // (`Forced globalSyncView hash mismatch`) and the queue poisons, so clearing lets the next
+          // currency round rebuild against canonical. But a ring-gap resync only JUMPS ml0 FORWARD on
+          // the SAME canonical chain — the pending binaries reference STILL-canonical gl0 ordinals and
+          // are VALID. Clearing them there breaks the metagraph chain-link: the re-produced binary's
+          // parent was never accepted by gl0, so gl0 rejects every successor with `parentHash mismatch`
+          // in an unrecoverable re-send loop (the token-lock-never-lands regression). Confirmed binaries
+          // are untouched either way — `markAsConfirmed` already removed them. (#113)
+          _ <- if (clearPendingBinaries) services.stateChannelBinarySender.clearPending else Async[F].unit
+          _ <- logger.info(
+            s"ml0 resynced to canonical ord=${canonicalSnapshot.ordinal.show}; will resume pulling forward on next tick"
+          )
+        } yield ()
 
-    // ADOPT-AND-VERIFY follow state-advance (task #12). On the global-FOLLOW path ml0 no longer RE-EXECUTES global
-    // consensus (`createContext`) to derive the next GlobalSnapshotInfo for ordinal N. Instead it fetches gl0's typed
-    // per-ordinal `StateChangesAccumulator` change-set, applies the delta for N on top of `lastState` to get a candidate
-    // GSI, recomputes the MPT root incrementally, and adopts the candidate ONLY IF that root EQUALS the signed snapshot's
+      logger.warn(
+        s"ml0 resync-to-canonical triggered at ord=${failedOrdinal.show} ($reason); fetching canonical latest from majority for setForRecovery"
+      ) >>
+        1.tailRecM[F, Unit] { attempt =>
+          for {
+            canonical <- services.globalL0.pullLatestSnapshot
+            (canonicalSnapshot, canonicalState) = canonical
+            _ <- ensureMptInitialized(canonicalSnapshot.ordinal, canonicalState)
+            recomputedRoot <- sharedStorages.mptStore.underlying
+              .getRootHashForOrdinal(canonicalSnapshot.ordinal)
+              .map(_.map(_.value))
+            signedRoot = canonicalSnapshot.signed.value.stateProof.mptRoot
+            result <-
+              if (recomputedRoot === signedRoot)
+                adoptCanonical(canonicalSnapshot, canonicalState).as(().asRight[Int])
+              else if (attempt < maxResyncPullAttempts)
+                logger
+                  .error(
+                    s"ml0 resync-to-canonical: gl0 served GSI inconsistent with its OWN signed mptRoot at " +
+                      s"ord=${canonicalSnapshot.ordinal.show} (recomputed=${recomputedRoot.map(_.show.take(12)).getOrElse("none")} " +
+                      s"≠ signed=${signedRoot.map(_.show.take(12)).getOrElse("none")}); NOT adopting, re-pulling " +
+                      s"(attempt ${attempt + 1}/$maxResyncPullAttempts)"
+                  )
+                  .as((attempt + 1).asLeft[Unit])
+              else
+                logger
+                  .error(
+                    s"ml0 resync-to-canonical: gl0 served an inconsistent GSI on all $maxResyncPullAttempts attempts at " +
+                      s"ord=${canonicalSnapshot.ordinal.show} (recomputed=${recomputedRoot.map(_.show.take(12)).getOrElse("none")} " +
+                      s"≠ signed=${signedRoot.map(_.show.take(12)).getOrElse("none")}); leaving storages UNCHANGED, idling — " +
+                      s"next tick retries"
+                  )
+                  .as(().asRight[Int])
+          } yield result
+        }
+    }
+
+    // StateProofMismatch / orphan-fork recovery: thin wrapper over `resyncToCanonical`. Behavior is identical to the prior
+    // inline recovery for the non-pathological case (verify gate matches → adopt exactly as before); the gate only changes
+    // behavior when gl0 serves a GSI inconsistent with its own signed root, where re-pulling instead of adopting corrupt
+    // state is the correct improvement.
+    def recoverFromOrphan(failedOrdinal: SnapshotOrdinal, cause: Throwable): F[Unit] =
+      // StateProofMismatch / orphan-fork → real divergence: DO clear pending binaries (built against the orphan chain).
+      resyncToCanonical(failedOrdinal, cause.getMessage, clearPendingBinaries = true)
+
+    // ADOPT-AND-VERIFY follow state-advance (task #12). On the global-FOLLOW path ml0 NEVER RE-EXECUTES global consensus
+    // (`createContext`) to derive the next GlobalSnapshotInfo for ordinal N. Instead it fetches gl0's typed per-ordinal
+    // `StateChangesAccumulator` change-set, applies the delta for N on top of `lastState` to get a candidate GSI,
+    // recomputes the MPT root incrementally, and adopts the candidate ONLY IF that root EQUALS the signed snapshot's
     // `stateProof.mptRoot` (the `withTransaction` Commit/Rollback gate inside `adoptAndVerifyChangeSetDelta`). The signed
-    // mptRoot is the ONLY trust anchor: ANY miss (no client, `baseOrdinal=None`, missing delta for N, incomplete
-    // preSyncBytes, or a tampered delta → recomputed root ≠ signed) rolls back the MPT tx and FALLS BACK to the full
-    // `createContext` path for that ordinal — ml0 NEVER advances its global state on a mismatch.
+    // mptRoot is the ONLY trust anchor.
     //
-    // `createContext` is RETAINED, unchanged, for (a) this fallback and (b) ml0 producing its OWN currency snapshots — only
-    // the global-follow state-advance is replaced.
+    // When the delta is unavailable or the recomputed root does not match — ANY miss (no client, `baseOrdinal=None`,
+    // missing delta for N, incomplete preSyncBytes, or a tampered delta → recomputed root ≠ signed) — the path does NOT
+    // fall back to `createContext`. Re-executing global consensus would recompute `historicalStakeSnapshots` (and `eta`),
+    // CONSENSUS-DERIVED boundary state a follower structurally cannot reproduce; in production that poisoned the base and
+    // cascaded into hundreds of further adopt-verify failures. Instead it raises `FollowResyncNeeded`, which
+    // `handleIncrementalSnapshot` catches and routes to `resyncToCanonical`: ADOPT gl0's authoritative latest GSI (which
+    // already carries the correct boundary state) rather than recompute it. ml0 NEVER advances its global state on a
+    // mismatch — it resyncs.
+    //
+    // `createContext` is RETAINED, unchanged, ONLY for ml0 producing its OWN currency snapshots — it is no longer reachable
+    // from this global-follow state-advance path.
     def deriveFollowContext(
       snapshot: Hashed[GlobalIncrementalSnapshot],
       lastSnapshot: Hashed[GlobalIncrementalSnapshot],
       lastState: GlobalSnapshotInfo
     ): F[GlobalSnapshotInfo] = {
-      val fallbackCreateContext: F[GlobalSnapshotInfo] =
-        services.globalSnapshotContextFunctions.createContext(
-          lastState,
-          lastSnapshot.signed,
-          snapshot.signed,
-          services.globalL0.pullGlobalSnapshot
-        )
+      // The per-ordinal adopt-verify could not adopt for this `snapshot.ordinal`. Raise the resync signal with a
+      // site-specific reason INSTEAD of producing a re-executed GSI; `handleIncrementalSnapshot` resyncs to canonical.
+      def resyncSignal(reason: String): F[GlobalSnapshotInfo] =
+        FollowResyncNeeded(snapshot.ordinal, reason).raiseError[F, GlobalSnapshotInfo]
 
       // Slice B — VERIFY the signed `smtRoot` (GlobalSnapshotStateProof field 19) by construction, as a SECOND gate on top
       // of the mptRoot gate. ml0 derives the §3-NIPoPoW per-ordinal commitment leaf for the eligible ordinal `N − k`
@@ -242,8 +321,10 @@ object StateChannel {
       // only checks the proof is internally consistent against the root and would accept ANY leaf the producer placed
       // there; the bind is what proves ml0's OWN commitment is committed), then folds the proof to the SIGNED smtRoot.
       // Returns true ⇒ smt-verified (adopt); false ⇒ unverifiable (caller falls back, NEVER adopts on an unverified
-      // smtRoot). Additive: missing proof / bind-mismatch / verify-Left all degrade to the createContext fallback, exactly
-      // like the mptRoot-miss path — the mptRoot === remains the ledger gate, this never blocks it.
+      // smtRoot). Additive: missing proof / bind-mismatch / verify-Left all degrade to mptRoot-only adopt, exactly
+      // like the mptRoot-miss path — the mptRoot === remains the ledger gate, this never blocks it. NOTE: ml0 no longer
+      // re-executes (`createContext`) on ANY miss; the mptRoot-miss ledger path now raises `FollowResyncNeeded` →
+      // `resyncToCanonical`, while this smt-unverifiable path adopts on the already-passed mptRoot gate (mptRoot-only).
       def verifySmtRoot(signedSmtRoot: Hash, inclusionProof: Option[SmtProof]): F[Boolean] = {
         val eligibleOrdinalOpt: Option[SnapshotOrdinal] =
           NonNegLong.from(snapshot.ordinal.value.value - confirmationDepthK).toOption.map(SnapshotOrdinal(_))
@@ -254,14 +335,14 @@ object StateChannel {
             logger
               .info(
                 s"ml0 smt-verify: ordinal=${snapshot.ordinal.show} has a signed smtRoot but ordinal − k underflows " +
-                  s"(k=$confirmationDepthK); cannot derive eligible ordinal, falling back to createContext"
+                  s"(k=$confirmationDepthK); cannot derive eligible ordinal, degrading to mptRoot-only adopt"
               )
               .as(false)
           case (Some(_), None) =>
             logger
               .info(
                 s"ml0 smt-verify: ordinal=${snapshot.ordinal.show} has a signed smtRoot but the change-set delta carries no " +
-                  s"inclusion proof; falling back to createContext"
+                  s"inclusion proof; degrading to mptRoot-only adopt"
               )
               .as(false)
           case (Some(eligibleOrdinal), Some(proof)) =>
@@ -270,7 +351,7 @@ object StateChannel {
                 logger
                   .info(
                     s"ml0 smt-verify: ordinal=${snapshot.ordinal.show} eligible ordinal=${eligibleOrdinal.show} not " +
-                      s"retrievable (out of retention); degrading this ordinal to mptRoot-only via createContext fallback"
+                      s"retrievable (out of retention); degrading this ordinal to mptRoot-only adopt"
                   )
                   .as(false)
               case Some(eligibleSnapshot) =>
@@ -294,7 +375,7 @@ object StateChannel {
                       .warn(
                         s"ml0 smt-verify: ordinal=${snapshot.ordinal.show} LEAF-BINDING failed for eligible " +
                           s"ordinal=${eligibleOrdinal.show} (proof leaf bytes ≠ ml0-derived commitment, or not an Inclusion); " +
-                          s"falling back to createContext"
+                          s"degrading to mptRoot-only adopt"
                       )
                       .as(false)
                   else
@@ -310,7 +391,7 @@ object StateChannel {
                         logger
                           .warn(
                             s"ml0 smt-verify: ordinal=${snapshot.ordinal.show} smtRoot verify FAILED ($err) for eligible " +
-                              s"ordinal=${eligibleOrdinal.show}; falling back to createContext"
+                              s"ordinal=${eligibleOrdinal.show}; degrading to mptRoot-only adopt"
                           )
                           .as(false)
                     }
@@ -368,8 +449,8 @@ object StateChannel {
             case None =>
               logger.info(
                 s"ml0 adopt-and-verify: verify FAILED for ordinal=${snapshot.ordinal.show} (recomputed mptRoot ≠ signed " +
-                  s"or legacy-format); MPT rolled back, falling back to createContext"
-              ) >> fallbackCreateContext
+                  s"or legacy-format); MPT rolled back, resyncing to canonical (NOT re-executing global consensus)"
+              ) >> resyncSignal(s"adopt-verify mptRoot mismatch (recomputed ≠ signed, or legacy-format)")
           }
 
       // `GlobalSnapshotInfo` carries no ordinal, so the state ml0 currently holds is identified by `lastSnapshot.ordinal`
@@ -386,12 +467,13 @@ object StateChannel {
             case None =>
               logger.debug(
                 s"ml0 adopt-and-verify: change-set has no delta for ordinal=${snapshot.ordinal.show} " +
-                  s"(base=${since.show}, latest=${resp.latestOrdinal.show}); falling back to createContext"
-              ) >> fallbackCreateContext
+                  s"(base=${since.show}, latest=${resp.latestOrdinal.show}); resyncing to canonical (NOT re-executing global consensus)"
+              ) >> resyncSignal(s"change-set ring-gap: no delta for ordinal (base=${since.show}, latest=${resp.latestOrdinal.show})")
           }
         case _ =>
-          // No client wired, gl0 returned `baseOrdinal=None` (since fell out of the ring), or no response — full path.
-          fallbackCreateContext
+          // No client wired, gl0 returned `baseOrdinal=None` (`since` fell out of the ring), or no response. Cannot
+          // adopt-and-verify a per-ordinal delta → resync to canonical (NEVER re-execute global consensus).
+          resyncSignal(s"change-set unavailable for since=${since.show} (no client / baseOrdinal=None / no response)")
       }
     }
 
@@ -446,6 +528,14 @@ object StateChannel {
       } yield ()).handleErrorWith {
         case e: io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalSnapshotContextFunctions.StateProofMismatch =>
           recoverFromOrphan(snapshot.ordinal, e)
+        // The global-FOLLOW adopt-and-verify path could not adopt the per-ordinal delta (ring-gap / no client / recomputed
+        // mptRoot ≠ signed). Resync to gl0's authoritative latest GSI instead of re-executing global consensus — see
+        // `FollowResyncNeeded` and `resyncToCanonical`.
+        case e: FollowResyncNeeded =>
+          // Ring-gap / delta-miss → NOT a divergence: jump ml0 forward on the SAME canonical chain WITHOUT
+          // clearing the metagraph's pending binaries (they reference still-canonical gl0 ordinals and are valid;
+          // clearing them breaks the chain-link → parentHash-mismatch re-send loop).
+          resyncToCanonical(e.ordinal, e.reason, clearPendingBinaries = false)
         case other => Async[F].raiseError(other)
       }
 

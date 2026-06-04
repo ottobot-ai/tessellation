@@ -1511,8 +1511,16 @@ object GlobalStateConverter {
         import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmutableCodec
         import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{immutableCodec => metagraphSyncImmutable}
         import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
+        // §3 NIPoPoW S0 historical-stake-snapshots codec — the SAME instance the producer's
+        // `toAllStateKeyValueBytes` passes explicitly (`enc[HistoricalStakeSnapshot](entry)(historicalStakeSnapshotImmutable)`)
+        // and the delta writer `syncFromStateChanges` resolves for its `store.insert[HistoricalStakeSnapshot]`. Bringing it into
+        // implicit scope here makes this rebuild's bytes byte-identical to the producer's signed root for this partition.
+        import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{
+          historicalImmutableCodec => historicalStakeSnapshotImmutable
+        }
         import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{immutableCodec => tokenLockRefImmutable}
         import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.{immutableCodec => txRefImmutable}
+        val _ = historicalStakeSnapshotImmutable // resolves `store.insert[HistoricalStakeSnapshot]` below
 
         // Build the key-to-value maps for each typed field. Each field's codec produces
         // scodec-encoded bytes consistent with what the read methods decode.
@@ -1654,6 +1662,16 @@ object GlobalStateConverter {
             }
             .map(_.toMap)
 
+        // §3 NIPoPoW S0 historical-stake-snapshots rebuild: one entry per stored eta-period. Key derived via
+        // `historicalStakeSnapshotsKey[F]` (hashed eta-period), value = the `HistoricalStakeSnapshot` (combined stake + eta) —
+        // EXACTLY the key shape + type the producer's `toAllStateKeyValueBytes` (`historicalStakeSnapshotsF`) and the delta writer
+        // `syncFromStateChanges` (`historicalStakeEntriesF`) use, so all three rebuild paths land byte-identical bytes under
+        // `GlobalStateFieldId.HistoricalStakeSnapshots`.
+        val historicalStakeEntriesF: F[Map[GlobalStateKey, HistoricalStakeSnapshot]] =
+          info.historicalStakeSnapshots.toList.parTraverse {
+            case (period, entry) => GlobalStateKey.historicalStakeSnapshotsKey[F](period).map(_ -> entry)
+          }.map(_.toMap)
+
         // Reconstruct the allow-spend expiry index from `info.activeAllowSpends`: each active record contributes one entry in
         // `index[lastValidEpochProgress]`. Buckets are `SortedSet[AllowSpendExpiryKey]`; empty buckets are omitted entirely.
         val allowSpendExpiryBucketsF: F[Map[GlobalStateKey, SortedSet[AllowSpendExpiryKey]]] = {
@@ -1736,6 +1754,7 @@ object GlobalStateConverter {
           allowSpendExpiryBuckets <- allowSpendExpiryBucketsF
           tokenLockExpiryBuckets <- tokenLockExpiryBucketsF
           nodeCollateralWithdrawalExpiryBuckets <- nodeCollateralWithdrawalExpiryBucketsF
+          historicalStakeEntries <- historicalStakeEntriesF
           _ <- store.insert[Hash](stateChanHashes)
           _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
           _ <- store.insert[Balance](balances)
@@ -1756,6 +1775,7 @@ object GlobalStateConverter {
           _ <- store.insert[MetagraphSyncDataInfo](metagraphSyncData)
           _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
           _ <- store.insert[PriceRecord](priceStateEntries)
+          _ <- store.insert[HistoricalStakeSnapshot](historicalStakeEntries)
           _ <- store.insert[SortedSet[AllowSpendExpiryKey]](allowSpendExpiryBuckets)
           _ <- store.insert[SortedSet[TokenLockExpiryKey]](tokenLockExpiryBuckets)
           _ <- store.insert[SortedSet[NodeCollateralWithdrawalExpiryKey]](nodeCollateralWithdrawalExpiryBuckets)
