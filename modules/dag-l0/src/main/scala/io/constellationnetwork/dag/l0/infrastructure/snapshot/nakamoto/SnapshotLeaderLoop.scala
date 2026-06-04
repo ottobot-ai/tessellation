@@ -141,19 +141,21 @@ object SnapshotLeaderLoop {
   ): Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)] =
     staged.filter { case (_, (o, _)) => o.value.value > finalizedOrdinal.value.value }
 
-  /** Finalize-sink ring insert: put `acc` at `ordinal` into the served ordinal-keyed ring, trimmed to the last
-    * [[GlobalChangeSetService.recentAccumulatorsToKeep]] (dropping the lowest ordinals). The promote at the finalize sink pulls `acc` out
-    * of staging atomically and then calls this to insert it; idempotent on re-finalize of the same ordinal (overwrites with the same
-    * value).
+  /** Finalize-sink ring insert: put `acc` at `ordinal` into the served ordinal-keyed ring, trimmed to the last `recentAccumulatorsToKeep`
+    * (dropping the lowest ordinals). The cap is the typed `nakamoto.changeset-ring-depth` HOCON value
+    * (`SharedConfig.nakamoto.changesetRingDepth`, default 1024), threaded in from `GlobalSnapshotConsensus.make` — a pure transport memory
+    * bound, NOT a consensus parameter. The promote at the finalize sink pulls `acc` out of staging atomically and then calls this to insert
+    * it; idempotent on re-finalize of the same ordinal (overwrites with the same value).
     */
   def ringInsertTrimmed(
     ring: scala.collection.immutable.SortedMap[SnapshotOrdinal, StateChangesAccumulator],
     ordinal: SnapshotOrdinal,
-    acc: StateChangesAccumulator
+    acc: StateChangesAccumulator,
+    recentAccumulatorsToKeep: Int
   ): scala.collection.immutable.SortedMap[SnapshotOrdinal, StateChangesAccumulator] = {
     val withNew = ring.updated(ordinal, acc)
-    if (withNew.size > GlobalChangeSetService.recentAccumulatorsToKeep)
-      withNew.drop(withNew.size - GlobalChangeSetService.recentAccumulatorsToKeep)
+    if (withNew.size > recentAccumulatorsToKeep)
+      withNew.drop(withNew.size - recentAccumulatorsToKeep)
     else withNew
   }
 
@@ -472,6 +474,12 @@ object SnapshotLeaderLoop {
       SnapshotOrdinal,
       StateChangesAccumulator
     ]],
+    // Task #12 — bound on `recentFinalizedAccumulatorsRef` (the SERVED changeset ring). The typed
+    // `nakamoto.changeset-ring-depth` HOCON value (`SharedConfig.nakamoto.changesetRingDepth`, default 1024),
+    // threaded from `GlobalSnapshotConsensus.make` into the `ringInsertTrimmed` trim at both finalize sinks.
+    // Pure transport memory bound — a follower past this lag falls back to a full-GSI resync, never an
+    // incorrect adopt (the signed `mptRoot` at each delta rejects a wrong base). NOT a consensus parameter.
+    changesetRingDepth: Int,
     // Fire-and-forget ChainSync trigger for the finality walkback path. When the
     // finality monitor tries to confirm ancestry at an attested ordinal that we
     // don't have on our local canonical chain (we're on a fork), we enqueue a
@@ -598,9 +606,34 @@ object SnapshotLeaderLoop {
         val pruned = pruneStagedAtOrBelow(staged, ordinal)
         (pruned, promoted)
       }.flatMap {
-        case Some(acc) => recentFinalizedAccumulatorsRef.update(ring => ringInsertTrimmed(ring, ordinal, acc))
-        case None      => Async[F].unit
+        case Some(acc) =>
+          recentFinalizedAccumulatorsRef.update(ring => ringInsertTrimmed(ring, ordinal, acc, changesetRingDepth))
+        case None => Async[F].unit
       }
+
+    // Task #12 staging-completeness fix — promote the accumulator of EVERY ordinal that this finalize tick made
+    // final, not just the single highest one. Both finalize sinks jump straight to a single `finalizeAtOrdinal`
+    // (depth-k's `tip.ordinal − k`, or the attestation-2/3 qualifying ordinal) which can advance by MORE than one
+    // ordinal per tick whenever the tip grew several ordinals between two loop iterations. Finalizing the highest
+    // ordinal implicitly finalizes its canonical ancestors, but the single-ordinal `recordFinalizedAccumulator`
+    // call above promotes ONLY that highest ordinal AND its watermark prune then DROPS every staged ancestor
+    // (ordinal ≤ finalizeAtOrdinal). Those skipped intermediate ordinals were staged (produce or validate) but
+    // never reach the served ring → the ml0 follower hits "ring-gap: no delta for ordinal N" and is forced into a
+    // heavy full-GSI resync. Walk the canonical chain from `tipHash` for each ordinal in `(fromExclusive, toInclusive]`
+    // (ASCENDING, so the per-ordinal watermark prune never discards a not-yet-processed higher ancestor), resolve its
+    // canonical hash, and promote via the same atomic per-ordinal helper. A hash we never staged (or whose chain
+    // walk misses — e.g. mid-reorg) is skipped exactly as the single-ordinal path skips an absent hash: the follower
+    // full-GSI-adopts that one gap, but the common multi-ordinal-jump case is now COMPLETE. Idempotent on re-finalize
+    // (each ordinal drains its staging entry); absence never errors.
+    def recordFinalizedRange(fromExclusive: Long, toInclusive: Long, tipHash: Hash): F[Unit] =
+      if (toInclusive <= fromExclusive) Async[F].unit
+      else
+        (fromExclusive + 1L to toInclusive).toList.traverse_ { o =>
+          chainStore.walkBackTo(tipHash, o).flatMap {
+            case Some(hashAtOrdinal) => recordFinalizedAccumulator(SnapshotOrdinal.unsafeApply(o), hashAtOrdinal)
+            case None                => Async[F].unit
+          }
+        }
     // Use shared genesis time if provided, else fall back to wall clock
     val effectiveGenesisTime = if (genesisTimeMs > 0) genesisTimeMs else System.currentTimeMillis()
 
@@ -1044,10 +1077,10 @@ object SnapshotLeaderLoop {
                                             // producer that validated it — NakamotoSnapshotValidator rekeys stripped->
                                             // canonical) into the served changeset ring. COMPLETE on every finalizer now;
                                             // the rare no-op is a catch-up/download node that adopted without staging.
-                                            recordFinalizedAccumulator(
-                                              SnapshotOrdinal.unsafeApply(finalizeAtOrdinal),
-                                              canonicalHash
-                                            ) >>
+                                            // Promote the WHOLE just-finalized range `(lastFinalizedOrdinal, finalizeAtOrdinal]`,
+                                            // not just the top: depth-k can advance several ordinals in one tick and the skipped
+                                            // canonical ancestors are otherwise pruned from staging unpromoted (the ml0 "ring-gap").
+                                            recordFinalizedRange(lastFinalizedOrdinal, finalizeAtOrdinal, tip.hash) >>
                                             logger
                                               .info(
                                                 s"DEPTH-FINALIZED ordinal=$finalizeAtOrdinal slot=${canonicalSnapshot.slot} (tip ord=${tip.ordinal} slot=${tip.slot}, k=$ConfirmationDepthK)"
@@ -1149,8 +1182,10 @@ object SnapshotLeaderLoop {
                                             recordFollowProjection(SnapshotOrdinal.unsafeApply(finalOrdinal), stored.context) >>
                                             // Task #12 slice 2b: same changeset-ring promotion as the DEPTH-FINALIZED branch
                                             // above. Staged by producer + every validator (rekeyed canonical) → complete;
-                                            // rare no-op = a catch-up node that adopted without staging.
-                                            recordFinalizedAccumulator(SnapshotOrdinal.unsafeApply(finalOrdinal), canonicalHash) >>
+                                            // rare no-op = a catch-up node that adopted without staging. Promote the WHOLE
+                                            // just-finalized range — attestation weight can cross several ordinals in one tick
+                                            // and the skipped canonical ancestors are otherwise pruned from staging unpromoted.
+                                            recordFinalizedRange(lastFinalizedOrdinal, finalOrdinal, tip.hash) >>
                                             snapshotStorage.pruneTentative(SnapshotOrdinal(NonNegLong.unsafeFrom(finalOrdinal))) >>
                                             logger.info(
                                               s"ATTEST-FINALIZED ordinal=$finalOrdinal slot=${stored.slot} (weight=${"%.2f".format(weight.toDouble)}, " +

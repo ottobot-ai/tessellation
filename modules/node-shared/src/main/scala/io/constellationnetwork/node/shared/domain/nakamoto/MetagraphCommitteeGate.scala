@@ -261,11 +261,17 @@ object MetagraphCommitteeGate {
     *     The receiver verifies using the wire-carried step — no chain-state lookup, no offset arithmetic. This makes the verifier
     *     non-interactive (KES freshness/replay protection is provided separately by the `parentHash` + `binaryHash` fields and the
     *     per-binary aggregator dedup, not by step bookkeeping).
-    *   - `publisher` for the sidecar `PublishMetagraphAttestation` RPC,
-    *   - `parentOrdinalFor` to resolve the metagraph parent's ordinal from `(metagraphAddress, parentHash)` against the gl0 GSI's
-    *     `lastCurrencySnapshots[mg]` (#201). Required for committee VRF eta derivation (the eta the sender used must match the eta the
-    *     receiver computes). When this returns `None` (mismatch, no entry, pre-bootstrap), the gate fails closed — sender skips publish,
-    *     receiver drops the attestation. See `MetagraphParentOrdinalResolver`.
+    *   - `publisher` for the sidecar `PublishMetagraphAttestation` RPC.
+    *
+    * '''eta is supplied by the caller — the gate no longer re-resolves the parent ordinal (#213/#290).''' Both `attestAndAdmit` (sender)
+    * and `recordReceivedAttestation` (receiver) take `eta` as a parameter. The caller (the daemon / admission processor) resolves the
+    * metagraph parent ordinal from the incoming binary's OWN content via `MetagraphParentOrdinalResolver.resolveFromBinary` and computes
+    * the eta from it BEFORE invoking the gate — so the gate already receives the correct, content-derived, cross-node-deterministic eta.
+    * The gate used to additionally re-resolve the ordinal via a GSI-only `parentOrdinalFor` (used only to gate `Some`/`None` + a log line;
+    * the resolved value never fed the VRF/eta/signature). That GSI re-resolve returned `None` on the empty-currency-partition path — the
+    * exact deadlock this removal fixes — vetoing a publish/record whose eta the caller had already computed correctly. Safety is unchanged:
+    * the receiver's eta is derived from the binary's content (by the caller), so a forged ordinal yields a wrong eta and the committee-VRF
+    * verify below rejects it.
     *
     * `selfPeerId`, `selfVrfSk`, `keyPair` are this operator's identity keys: VRF SK for the committee draw, long-term Ed25519 key
     * (`keyPair.getPrivate`) for the outer signature.
@@ -282,8 +288,7 @@ object MetagraphCommitteeGate {
     publisher: Publisher[F],
     kTarget: Int,
     gateTimeoutMs: Long,
-    pollIntervalMs: Long,
-    parentOrdinalFor: (Address, Hash) => F[Option[Long]]
+    pollIntervalMs: Long
   ): MetagraphCommitteeGate[F] =
     new MetagraphCommitteeGate[F] {
 
@@ -346,53 +351,45 @@ object MetagraphCommitteeGate {
                 )
                 .as(SenderOutcome.NotInCommittee: SenderOutcome)
             case Some((proof, output)) =>
-              // Resolve the metagraph parent ordinal FIRST. If the lookup fails, fail closed:
-              // skip the publish entirely. The receiver-side committee VRF verify needs the same
-              // eta the sender used (and eta derives from parent ordinal), so unresolved parent
-              // → guaranteed verify mismatch on peers. We also skip the self-record so the local
-              // aggregator doesn't show a phantom vote for a binary the cluster can't actually
-              // attest to.
-              parentOrdinalFor(metagraphAddress, parentHash).flatMap {
-                case None =>
-                  logger
-                    .warn(
-                      s"⛔ committee-gate sender: unresolved parent ordinal mg=$metagraphAddress parent=${parentHash.value
-                          .take(12)}... — skipping publish (fail-closed, #201)"
-                    )
-                    .as(SenderOutcome.UnknownParentOrdinal: SenderOutcome)
-                case Some(parentOrdinal) =>
-                  for {
-                    _ <- aggregator.record(metagraphAddress, parentHash, binaryHash, selfPeerId)
-                    msgBytes <- messageBytes[F](selfPeerId, metagraphAddress, parentHash, binaryHash)
-                    edSig <- Signing.signData[F](msgBytes)(keyPair.getPrivate)
-                    // Sign at the CURRENT KES tree-internal step the in-memory key holds. Embedding
-                    // this step on the wire (proto `sender_tree_step`) lets the receiver verify
-                    // non-interactively — no chain-state lookup, no offset/eta-period derivation.
-                    // KES forward-security still holds: signAt mutates the key forward, and we never
-                    // ask it to sign at a past step.
-                    kesStep <- kesSigner.currentPeriod
-                    kesSig <- kesSigner.signAt(kesStep, msgBytes)
-                    _ <- publisher.publish(
-                      senderPeerIdBytes = selfPeerId.value.toBytes,
-                      metagraphAddress = metagraphAddress.value.value,
-                      parentHashBytes = parentHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                      binaryHashBytes = binaryHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                      committeeVrfProof = proof,
-                      longTermSignature = edSig,
-                      kesSignature = kesSig,
-                      vrfPublicKey = selfVrfVk,
-                      kesStep = kesStep
-                    )
-                    _ <- logger.info(
-                      s"📢 committee-attested mg=$metagraphAddress parent=${parentHash.value.take(12)}... binary=${binaryHash.value
-                          .take(12)}... kTarget=$kTarget parentOrd=$parentOrdinal kesStep=$kesStep " +
-                        s"sentEtaFull=${eta.map("%02x".format(_)).mkString} " +
-                        s"sentVrfVkFull=${selfVrfVk.map("%02x".format(_)).mkString} " +
-                        s"sentProofFull=${proof.map("%02x".format(_)).mkString} " +
-                        s"sentSigma=$sigmaOperatorKey"
-                    )
-                  } yield SenderOutcome.Attested(proof, output): SenderOutcome
-              }
+              // We're in the committee. Publish directly — the `eta` we sign/attest against was
+              // already resolved + computed by the caller (content-derived via
+              // `MetagraphParentOrdinalResolver.resolveFromBinary`, deterministic across peers).
+              // #213/#290: the previous redundant GSI-only `parentOrdinalFor` re-check here vetoed
+              // the publish whenever gl0's currency partition was empty (the `.filterNot(_.isEmpty)`
+              // drop), even though the caller had a valid eta — the metagraph-tip-freeze deadlock.
+              // The resolved value never fed the eta/VRF/signature (it was only a Some/None gate +
+              // a log token), so dropping it changes nothing but the spurious veto.
+              for {
+                _ <- aggregator.record(metagraphAddress, parentHash, binaryHash, selfPeerId)
+                msgBytes <- messageBytes[F](selfPeerId, metagraphAddress, parentHash, binaryHash)
+                edSig <- Signing.signData[F](msgBytes)(keyPair.getPrivate)
+                // Sign at the CURRENT KES tree-internal step the in-memory key holds. Embedding
+                // this step on the wire (proto `sender_tree_step`) lets the receiver verify
+                // non-interactively — no chain-state lookup, no offset/eta-period derivation.
+                // KES forward-security still holds: signAt mutates the key forward, and we never
+                // ask it to sign at a past step.
+                kesStep <- kesSigner.currentPeriod
+                kesSig <- kesSigner.signAt(kesStep, msgBytes)
+                _ <- publisher.publish(
+                  senderPeerIdBytes = selfPeerId.value.toBytes,
+                  metagraphAddress = metagraphAddress.value.value,
+                  parentHashBytes = parentHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                  binaryHashBytes = binaryHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                  committeeVrfProof = proof,
+                  longTermSignature = edSig,
+                  kesSignature = kesSig,
+                  vrfPublicKey = selfVrfVk,
+                  kesStep = kesStep
+                )
+                _ <- logger.info(
+                  s"📢 committee-attested mg=$metagraphAddress parent=${parentHash.value.take(12)}... binary=${binaryHash.value
+                      .take(12)}... kTarget=$kTarget kesStep=$kesStep " +
+                    s"sentEtaFull=${eta.map("%02x".format(_)).mkString} " +
+                    s"sentVrfVkFull=${selfVrfVk.map("%02x".format(_)).mkString} " +
+                    s"sentProofFull=${proof.map("%02x".format(_)).mkString} " +
+                    s"sentSigma=$sigmaOperatorKey"
+                )
+              } yield SenderOutcome.Attested(proof, output): SenderOutcome
           }
 
       private def waitForThreshold(
@@ -471,78 +468,75 @@ object MetagraphCommitteeGate {
         else if (att.kesSignature.isEmpty)
           Async[F].pure(ReceiverOutcome.EmptyKesSig: ReceiverOutcome)
         else
-          // Resolve the metagraph parent ordinal — required for the committee-VRF eta (not for
-          // KES verification, which uses the wire-carried `senderTreeStep` directly). If we
-          // can't resolve, fail-closed: drop the attestation. The eta the sender computed must
-          // match ours for the committee-VRF proof to verify; with `None`, we don't know which
-          // eta to use, so the VRF check is guaranteed to fail. `UnknownParentOrdinal` names the
-          // actual cause for the operator (#201/#202).
-          parentOrdinalFor(att.metagraphAddress, att.parentHash).flatMap {
-            case None =>
-              Async[F].pure(ReceiverOutcome.UnknownParentOrdinal: ReceiverOutcome)
-            case Some(receiverParentOrd) =>
-              for {
-                msgBytes <- messageBytes[F](att.senderPeerId, att.metagraphAddress, att.parentHash, att.binaryHash)
-                senderPubKey <- att.senderPeerId.value.toPublicKey[F]
-                edOk <- Signing.verifySignature[F](msgBytes, att.longTermSignature)(senderPubKey)
-                outcome <-
-                  if (!edOk) Async[F].pure(ReceiverOutcome.InvalidLongTermSig: ReceiverOutcome)
-                  else
-                    for {
-                      kesOk <- kesVerifier.verify(
-                        messageBytes = msgBytes,
-                        kesSigBytes = att.kesSignature,
-                        attesterId = att.senderPeerId,
-                        attesterHex = att.senderPeerId.value,
-                        kesStep = att.senderTreeStep
-                      )
-                      result <-
-                        if (!kesOk) Async[F].pure(ReceiverOutcome.InvalidKesSig: ReceiverOutcome)
-                        else
-                          lookupSenderStake(att.senderPeerId).flatMap { sigmaSender =>
-                            sortition
-                              .verifyMembershipDetailed(
-                                att.senderVrfVk,
-                                eta,
-                                att.metagraphAddress,
-                                att.parentHash,
-                                sigmaSender,
-                                kTarget,
-                                att.committeeVrfProof
-                              )
-                              .flatMap {
-                                case io.constellationnetwork.node.shared.domain.nakamoto.CommitteeSortition.VerifyOutcome.Valid =>
-                                  Async[F].pure(ReceiverOutcome.Recorded: ReceiverOutcome)
-                                case io.constellationnetwork.node.shared.domain.nakamoto.CommitteeSortition.VerifyOutcome.InvalidProof =>
-                                  // #216 diagnostic: bit-level VRF-verify FAIL (cryptographic). Distinguishes from threshold-fail.
-                                  logger.warn(
-                                    s"🔬 InvalidCommitteeVrf [InvalidProof] mg=${att.metagraphAddress} parent=${att.parentHash.value
-                                        .take(12)}... binary=${att.binaryHash.value.take(12)}... " +
-                                      s"recvParentOrd=$receiverParentOrd " +
-                                      s"etaFull=${eta.map("%02x".format(_)).mkString} " +
-                                      s"vrfVkFull=${att.senderVrfVk.map("%02x".format(_)).mkString} " +
-                                      s"proofFull=${att.committeeVrfProof.map("%02x".format(_)).mkString} " +
-                                      s"sigmaSender=$sigmaSender kTarget=$kTarget from=${att.senderPeerId.value.value.take(16)}..."
-                                  ) >>
-                                    Async[F].pure(ReceiverOutcome.InvalidCommitteeVrf: ReceiverOutcome)
-                                case io.constellationnetwork.node.shared.domain.nakamoto.CommitteeSortition.VerifyOutcome
-                                      .BelowThreshold(testValue, thresh) =>
-                                  // #216 diagnostic: VRF proof verifies but testValue >= K · σ. Localizes the issue to receiver-side
-                                  // stake-lookup divergence from sender (sigma is time-variant; sender locked it at attest time, receiver
-                                  // reads current GSI which has drifted).
-                                  logger.warn(
-                                    s"🔬 InvalidCommitteeVrf [BelowThreshold] mg=${att.metagraphAddress} parent=${att.parentHash.value
-                                        .take(12)}... binary=${att.binaryHash.value.take(12)}... " +
-                                      s"recvParentOrd=$receiverParentOrd " +
-                                      s"testValue=$testValue threshold=$thresh " +
-                                      s"sigmaSender=$sigmaSender kTarget=$kTarget from=${att.senderPeerId.value.value.take(16)}..."
-                                  ) >>
-                                    Async[F].pure(ReceiverOutcome.InvalidCommitteeVrf: ReceiverOutcome)
-                              }
+          // Verify directly against the caller-supplied `eta`. #213/#290: the gate no longer
+          // re-resolves the metagraph parent ordinal here — the daemon resolves it from the
+          // incoming binary's OWN content (`MetagraphParentOrdinalResolver.resolveFromBinary`)
+          // and passes the content-derived eta in. The old GSI-only re-resolve returned `None`
+          // on the empty-currency-partition path and dropped every attestation as
+          // `UnknownParentOrdinal` (the receiver-side half of the deadlock). The resolved value
+          // never affected verification — only the eta does, and that is now correct by
+          // construction. Safety: a forged ordinal yields a wrong (content-derived) eta upstream,
+          // so the committee-VRF verify below fails — the receiver trusts the binary's content,
+          // never the sender's claimed ordinal.
+          for {
+            msgBytes <- messageBytes[F](att.senderPeerId, att.metagraphAddress, att.parentHash, att.binaryHash)
+            senderPubKey <- att.senderPeerId.value.toPublicKey[F]
+            edOk <- Signing.verifySignature[F](msgBytes, att.longTermSignature)(senderPubKey)
+            outcome <-
+              if (!edOk) Async[F].pure(ReceiverOutcome.InvalidLongTermSig: ReceiverOutcome)
+              else
+                for {
+                  kesOk <- kesVerifier.verify(
+                    messageBytes = msgBytes,
+                    kesSigBytes = att.kesSignature,
+                    attesterId = att.senderPeerId,
+                    attesterHex = att.senderPeerId.value,
+                    kesStep = att.senderTreeStep
+                  )
+                  result <-
+                    if (!kesOk) Async[F].pure(ReceiverOutcome.InvalidKesSig: ReceiverOutcome)
+                    else
+                      lookupSenderStake(att.senderPeerId).flatMap { sigmaSender =>
+                        sortition
+                          .verifyMembershipDetailed(
+                            att.senderVrfVk,
+                            eta,
+                            att.metagraphAddress,
+                            att.parentHash,
+                            sigmaSender,
+                            kTarget,
+                            att.committeeVrfProof
+                          )
+                          .flatMap {
+                            case io.constellationnetwork.node.shared.domain.nakamoto.CommitteeSortition.VerifyOutcome.Valid =>
+                              Async[F].pure(ReceiverOutcome.Recorded: ReceiverOutcome)
+                            case io.constellationnetwork.node.shared.domain.nakamoto.CommitteeSortition.VerifyOutcome.InvalidProof =>
+                              // #216 diagnostic: bit-level VRF-verify FAIL (cryptographic). Distinguishes from threshold-fail.
+                              logger.warn(
+                                s"🔬 InvalidCommitteeVrf [InvalidProof] mg=${att.metagraphAddress} parent=${att.parentHash.value
+                                    .take(12)}... binary=${att.binaryHash.value.take(12)}... " +
+                                  s"etaFull=${eta.map("%02x".format(_)).mkString} " +
+                                  s"vrfVkFull=${att.senderVrfVk.map("%02x".format(_)).mkString} " +
+                                  s"proofFull=${att.committeeVrfProof.map("%02x".format(_)).mkString} " +
+                                  s"sigmaSender=$sigmaSender kTarget=$kTarget from=${att.senderPeerId.value.value.take(16)}..."
+                              ) >>
+                                Async[F].pure(ReceiverOutcome.InvalidCommitteeVrf: ReceiverOutcome)
+                            case io.constellationnetwork.node.shared.domain.nakamoto.CommitteeSortition.VerifyOutcome
+                                  .BelowThreshold(testValue, thresh) =>
+                              // #216 diagnostic: VRF proof verifies but testValue >= K · σ. Localizes the issue to receiver-side
+                              // stake-lookup divergence from sender (sigma is time-variant; sender locked it at attest time, receiver
+                              // reads current GSI which has drifted).
+                              logger.warn(
+                                s"🔬 InvalidCommitteeVrf [BelowThreshold] mg=${att.metagraphAddress} parent=${att.parentHash.value
+                                    .take(12)}... binary=${att.binaryHash.value.take(12)}... " +
+                                  s"testValue=$testValue threshold=$thresh " +
+                                  s"sigmaSender=$sigmaSender kTarget=$kTarget from=${att.senderPeerId.value.value.take(16)}..."
+                              ) >>
+                                Async[F].pure(ReceiverOutcome.InvalidCommitteeVrf: ReceiverOutcome)
                           }
-                    } yield result
-              } yield outcome
-          }
+                      }
+                } yield result
+          } yield outcome
 
       def pruneParents(metagraphAddress: Address, parents: Set[Hash]): F[Unit] =
         aggregator.pruneParents(metagraphAddress, parents)

@@ -129,7 +129,13 @@ object GlobalSnapshotConsensusFunctions {
     // staged entry at-or-below the finalized tip (each is promoted-or-a-dead-fork), correct-by-construction rather
     // than the earlier arbitrary `.drop` size eviction that could discard a not-yet-finalized entry under the
     // depth-k (255) retention window + reorg churn (esp. now that EVERY node stages via the validator adopt path).
-    pendingAccumulatorsRef: Ref[F, Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)]]
+    pendingAccumulatorsRef: Ref[F, Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)]],
+    // Task #19 — backstop size cap on `pendingAccumulatorsRef`. Typed `nakamoto.staging-accumulators-cap` HOCON
+    // value (`SharedConfig.nakamoto.stagingAccumulatorsCap`, default 2048 = 2× the served ring), threaded from
+    // `GlobalSnapshotConsensus.make`. The steady-state bound is the finalize-sink watermark prune; this only caps a
+    // burst of never-finalizing forks staged BETWEEN two finalize ticks. The default mirrors `pendingAccumulatorsToKeep`
+    // so the unit suite (and any caller relying on the default) is unaffected; production overrides it via HOCON.
+    stagingAccumulatorsCap: Int = GlobalSnapshotConsensusFunctions.pendingAccumulatorsToKeep
   ): GlobalSnapshotConsensusFunctions[F] = new GlobalSnapshotConsensusFunctions[F] {
 
     private val logger = Slf4jLogger.getLoggerFromClass[F](getClass)
@@ -736,22 +742,32 @@ object GlobalSnapshotConsensusFunctions {
         // Task #12 slice 2b — STAGE the typed per-ordinal delta keyed by this snapshot's hash, right where
         // the hash first becomes known (mirrors the `overlay.commit(BranchId(currentSnapshotHash), ...)` use
         // of the same hash above). `SnapshotLeaderLoop` PROMOTES this into the served ordinal-keyed changeset
-        // ring iff the matching hash finalizes (depth-k OR attestation-2/3 sink), then removes it; staged
-        // entries for fork candidates that never finalize are evicted by the size bound below. Hash-keyed
-        // (not ordinal) because two competing proposals at `currentOrdinal` must not collide pre-finality. A
-        // plain `Map` has no insertion order, so on overflow we drop excess via `.drop` — a non-deterministic
-        // eviction is fine here: this is a transport memory bound, and a dropped pre-finalize entry only
-        // forces a follower into the full-GSI adopt fallback for that ordinal, never an incorrect result.
+        // ring iff the matching hash finalizes (depth-k OR attestation-2/3 sink), then removes it. Hash-keyed
+        // (not ordinal) because two competing proposals at `currentOrdinal` must not collide pre-finality. The
+        // steady-state bound is the finalize-sink watermark prune (`SnapshotLeaderLoop.pruneStagedAtOrBelow` drops
+        // everything at-or-below the finalized tip); the size cap below is only a hard backstop for a runaway
+        // never-finalizing-fork burst staged BETWEEN two finalize ticks.
         // Reached on BOTH the genuine produce path AND the follower/validator re-derivation (validateArtifact)
         // — both build a real candidate whose hash, if finalized, the sink promotes; that is intended.
-        // Stage `(currentOrdinal, acc)` — the ordinal rides along so the finalize-sink can watermark-prune (drop
-        // everything at-or-below the finalized tip). The size bound below is now only a hard backstop for a runaway
-        // never-finalizing-fork burst between two finalize ticks; the watermark prune is the steady-state bound.
+        // Stage `(currentOrdinal, acc)` — the ordinal rides along so the finalize-sink can watermark-prune.
+        // Task #19 — when the backstop trips, evict the LOWEST-ordinal staged entries (deterministic), NOT an
+        // arbitrary hash-iteration `.drop`. The lowest ordinals are the furthest behind the depth-k (255) finality
+        // window and so the least likely to still finalize; arbitrary `.drop` could instead discard a high-ordinal
+        // entry about to finalize, which then never reaches the served ring → the ml0 follower hits a "ring-gap"
+        // and is forced into a heavy full-GSI resync. A dropped never-finalizing entry only costs that one ordinal
+        // the full-GSI fallback, never an incorrect adopt (the signed `mptRoot` rejects a wrong base). Cap is the
+        // typed `nakamoto.staging-accumulators-cap` HOCON value (default 2048), threaded in from `make`.
         _ <- pendingAccumulatorsRef.update { staged =>
           val updated = staged.updated(currentSnapshotHash, (currentOrdinal, stateChangesAccumulator))
-          if (updated.size > GlobalSnapshotConsensusFunctions.pendingAccumulatorsToKeep)
-            updated.drop(updated.size - GlobalSnapshotConsensusFunctions.pendingAccumulatorsToKeep)
-          else updated
+          if (updated.size > stagingAccumulatorsCap) {
+            // Drop the `excess` entries with the smallest ordinal (ties broken by hash for determinism).
+            val excess = updated.size - stagingAccumulatorsCap
+            val toEvict = updated.toList.sortBy { case (h, (o, _)) => (o.value.value, h.value) }
+              .take(excess)
+              .map(_._1)
+              .toSet
+            updated.filterNot { case (h, _) => toEvict.contains(h) }
+          } else updated
         }
         returnedEvents = returnedSCEvents.map(StateChannelEvent(_)) ++ returnedDAGEvents
         _ <- ConsensusLog.info(

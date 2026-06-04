@@ -431,15 +431,21 @@ object NakamotoSyncDaemon {
     // `attestAndAdmit` is wired in front of `processMetagraphBinary` in `Services.scala`. The
     // daemon only needs the receiver hook + the eta resolver to feed the verifier.
     committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
-    // #201/#202: resolve `(metagraphAddress, parentHash) → metagraph parent ordinal` via the gl0
-    // GSI. Previously the handlers hardcoded `0L` here, which made `etaForParentOrdinal` return
-    // the genesis eta regardless of how far the chain had progressed — receivers verified the
-    // committee VRF against the wrong eta and dropped attestations once the cluster crossed the
-    // first eta rotation boundary. Handlers chain this resolver into `etaForParentOrdinal` and
-    // fail-closed if the resolver returns `None` (no eta to verify against → drop the message).
+    // #213/#290: resolve `(metagraphAddress, parentHash, binaryContent) → metagraph parent ordinal`
+    // by deriving it from the INCOMING binary's OWN content (ordinal − 1), NOT from gl0's currency
+    // partitions (which `calculateLastCurrencySnapshots` drops via `.filterNot(_.isEmpty)` whenever
+    // the mg produced no state in the window → the GSI-only resolver returned `None` and every
+    // inbound attestation was dropped as `UnknownParentOrdinal` — the receiver-side half of the
+    // 8gl0+4mg deadlock). The third arg is the attested binary's `signed.value.content`; the handler
+    // looks the binary up in the orphan buffer by its wire digest (`att.binaryHash`), so a forged
+    // ordinal can never be trusted — the receiver derives the ordinal from the content it holds, and
+    // fails closed (drops the attestation) when it does not yet hold the binary. The identity guard
+    // (`lastStateChannelSnapshotHashes[mg] == parentHash`) still runs inside the resolver. Handlers
+    // chain this into `etaForParentOrdinal` and fail-closed on `None` (no eta to verify against).
     parentOrdinalFor: (
       io.constellationnetwork.schema.address.Address,
-      io.constellationnetwork.security.hash.Hash
+      io.constellationnetwork.security.hash.Hash,
+      Array[Byte]
     ) => F[Option[Long]],
     // Resolves the canonical `eta` (32 bytes) for the committee VRF input from the metagraph
     // parent ordinal. The daemon's handlers resolve the ordinal via `parentOrdinalFor` first then
@@ -757,6 +763,7 @@ object NakamotoSyncDaemon {
                                   parentOrdinalFor,
                                   etaForParentOrdinal,
                                   senderStakeLookup,
+                                  orphanBuffer,
                                   logger
                                 )
                               )
@@ -2005,19 +2012,28 @@ object NakamotoSyncDaemon {
     * sender's true VK, the proof fails to verify and the attestation is dropped. When per-operator-key VRF keys land (#180), the field
     * plumbs through unchanged — only the sender's source-of-VK shifts to the registration table.
     */
-  private def handleMetagraphAttestation[F[_]: Async](
+  private def handleMetagraphAttestation[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector](
     att: pb.MetagraphAttestation,
     committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
+    // #213/#290: content-derived parent-ordinal resolver — `(mg, parentHash, binaryContent)`. The third
+    // arg is the attested binary's `signed.value.content`, looked up from the orphan buffer (below).
     parentOrdinalFor: (
       io.constellationnetwork.schema.address.Address,
-      io.constellationnetwork.security.hash.Hash
+      io.constellationnetwork.security.hash.Hash,
+      Array[Byte]
     ) => F[Option[Long]],
     etaForParentOrdinal: Long => F[Array[Byte]],
     senderStakeLookup: peer.PeerId => F[io.constellationnetwork.numerics.Ratio],
+    // #213/#290: holds the inbound metagraph binaries (keyed by their parentHash) the local gate could
+    // not yet admit — exactly the binaries inbound attestations are about. The receiver looks the
+    // attested binary up here by its wire digest (`att.binaryHash`) to obtain its content, then derives
+    // the parent ordinal from THAT content (never from the sender's claim). Fail-closed if absent.
+    orphanBuffer: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] = {
     import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
     import io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.IncomingAttestation
+    import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
     import eu.timepit.refined.refineV
 
     refineV[DAGAddressRefined](att.metagraphAddress) match {
@@ -2041,23 +2057,66 @@ object NakamotoSyncDaemon {
           kesSignature = att.kesSignature.toByteArray,
           senderTreeStep = att.senderTreeStep
         )
-        // #202: resolve the actual metagraph parent ordinal from `(metagraphAddress, parentHash)`
-        // via the gl0 GSI before computing eta. The previous shortcut (`etaForParentOrdinal(0L)`)
-        // always returned the genesis eta, which agreed with senders only inside the first
-        // `etaRotationSnapshots` window of the cluster — after the first eta rotation, the eta the
-        // sender used differs from genesis, and the committee VRF on the gate's verify path drops
-        // every attestation as `InvalidCommitteeVrf`. Fail closed on None: if we can't resolve the
-        // parent ordinal we can't derive the right eta, so the verify is guaranteed to fail anyway.
-        // Drop early with a specific log instead of a noisy down-stack rejection.
-        parentOrdinalFor(metagraphAddress, parentHash).flatMap {
+        // #213/#290: resolve the metagraph parent ordinal — the quantity the committee-VRF eta is derived
+        // from — WITHOUT ever trusting the sender's claimed ordinal, via three tiers of gl0's own state:
+        //
+        //   (1) PENDING-PARENT-ORDINAL CACHE (the load-bearing fast path). When this node processed the
+        //       same gossiped binary in `processBytes` it cached `(wireHash → parentOrdinal)` before
+        //       attesting. A binary being attested is IN-FLIGHT — its parent is at the tip, so it was
+        //       NEVER buffered — which is exactly why the orphan-buffer scan (tier 2) cannot see it. Before
+        //       this cache existed the receiver had only tier 2, so every peer attested next-in-line
+        //       binaries no peer could resolve → eta undrivable → attestation dropped → committee threshold
+        //       reached ZERO times → metagraph chains froze at genesis. `att.binaryHash` == the wire digest
+        //       this node hashed in `processBytes`, so the key matches.
+        //   (2) BUFFERED-CONTENT FALLBACK. If we BUFFERED the binary instead (we're lagging — its parent
+        //       isn't admitted yet), derive the ordinal from the held content (`parentOrdinalFor` is the
+        //       content-only resolver) so we still record the attestation for when the binary is later
+        //       drained + admitted.
+        //   (3) FAIL CLOSED. We hold neither — a genuine gossip race (attestation outran the binary). Drop
+        //       it; the binary will arrive and its own admission re-drives the gate.
+        //
+        // SAFETY (anti-forgery): every tier reads gl0's OWN resolved/held state for THIS binary, never the
+        // sender's claimed ordinal — a forged ordinal yields a wrong eta and the committee-VRF verify
+        // below rejects it.
+        val recordWithOrdinal: Long => F[Unit] = parentOrdinal =>
+          etaForParentOrdinal(parentOrdinal).flatMap { eta =>
+            committeeGate.recordReceivedAttestation(incoming, eta, senderStakeLookup)
+          }
+        orphanBuffer.lookupPendingParentOrdinal(metagraphAddress, binaryHash).flatMap {
+          case Some(parentOrdinal) => recordWithOrdinal(parentOrdinal)
           case None =>
-            logger.warn(
-              s"⚠️ Rejecting metagraph-attestation: unresolved parent ordinal for mg=$metagraphAddress " +
-                s"parent=${parentHash.value.take(12)}... (fail-closed, #202)"
-            )
-          case Some(parentOrdinal) =>
-            etaForParentOrdinal(parentOrdinal).flatMap { eta =>
-              committeeGate.recordReceivedAttestation(incoming, eta, senderStakeLookup)
+            HasherSelector[F].withCurrent { implicit hasher =>
+              orphanBuffer
+                .peekForWireHash(metagraphAddress, binaryHash)(bytes => Hasher[F].hashBytes(bytes).map(_.some))
+                .flatMap {
+                  case None =>
+                    logger.warn(
+                      s"⚠️ Rejecting metagraph-attestation: binary neither resolved nor buffered locally mg=$metagraphAddress " +
+                        s"parent=${parentHash.value.take(12)}... binary=${binaryHash.value.take(12)}... " +
+                        s"(fail-closed — gossip race; binary will arrive + re-drive the gate; #213/#290)"
+                    )
+                  case Some(wireBytes) =>
+                    io.constellationnetwork.json
+                      .JsonSerializer[F]
+                      .deserialize[Signed[StateChannelSnapshotBinary]](wireBytes)
+                      .flatMap {
+                        case Left(decodeErr) =>
+                          logger.warn(
+                            s"⚠️ Rejecting metagraph-attestation: buffered binary decode failed mg=$metagraphAddress " +
+                              s"binary=${binaryHash.value.take(12)}... (${decodeErr.getMessage})"
+                          )
+                        case Right(signedBinary) =>
+                          parentOrdinalFor(metagraphAddress, parentHash, signedBinary.value.content).flatMap {
+                            case None =>
+                              logger.warn(
+                                s"⚠️ Rejecting metagraph-attestation: buffered binary content for mg=$metagraphAddress " +
+                                  s"binary=${binaryHash.value.take(12)}... is malformed (decoded as neither incremental " +
+                                  s"nor full currency snapshot) — fail-closed"
+                              )
+                            case Some(parentOrdinal) => recordWithOrdinal(parentOrdinal)
+                          }
+                      }
+                }
             }
         }
     }
@@ -2310,14 +2369,15 @@ object NakamotoSyncDaemon {
   def makeMetagraphBinaryProcessor[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector](
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
     committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
-    // #213/#290: ADMISSION-path parent-ordinal resolver. The third arg is the incoming binary's OWN
-    // `content` bytes; the resolver derives the parent ordinal as (this binary's currency-snapshot
-    // ordinal − 1), a deterministic pure function of the content, NOT read from gl0's currency
-    // partitions (which `calculateLastCurrencySnapshots` drops via `.filterNot(_.isEmpty)` whenever the
-    // mg produced no state in the window → the permanent admission deadlock at 8gl0+4mg). The identity
-    // guard (`lastStateChannelSnapshotHashes[mg] == parentHash`) still runs inside the resolver. This
-    // affects ONLY the admission decision — the committee attestation gate (sender/receiver VRF eta +
-    // wire format) is unchanged and still resolves via the GSI-only `MetagraphParentOrdinalResolver.resolve`.
+    // #213/#290: CONTENT-DERIVED parent-ordinal resolver (`MetagraphParentOrdinalResolver.resolveFromBinary`).
+    // The third arg is the incoming binary's OWN `content` bytes; the resolver derives the parent ordinal
+    // as (this binary's currency-snapshot ordinal − 1), a deterministic pure function of the content, NOT
+    // read from gl0's currency partitions (which `calculateLastCurrencySnapshots` drops via
+    // `.filterNot(_.isEmpty)` whenever the mg produced no state in the window → the permanent admission
+    // deadlock at 8gl0+4mg). The identity guard (`lastStateChannelSnapshotHashes[mg] == parentHash`) still
+    // runs inside the resolver. The SAME content-derived resolver is now wired into the inbound-attestation
+    // receiver (`NakamotoSyncDaemon.run`'s `parentOrdinalFor`), so sender (admission) and receiver derive
+    // byte-identical etas; the committee gate itself no longer re-resolves the ordinal.
     parentOrdinalFor: (
       io.constellationnetwork.schema.address.Address,
       io.constellationnetwork.security.hash.Hash,
@@ -2390,6 +2450,14 @@ object NakamotoSyncDaemon {
                     }
                   case Some(parentOrdinal) =>
                     for {
+                      // #213/#290 liveness: cache (this binary's WIRE hash → its parent ordinal) BEFORE we
+                      // attest, so inbound committee attestations for this SAME in-flight binary can recover
+                      // the eta on the receive path. The binary is NOT buffered here (its parent is at the
+                      // tip — that's why `resolveParent` returned `Some`), so the receiver's `peekForWireHash`
+                      // (orphan-buffer scan) would miss it → without this cache the committee threshold is
+                      // never reached and the chain freezes at genesis. `binaryHash` is the wire-bytes digest,
+                      // == `pb.MetagraphAttestation.binaryHash` on the receive side.
+                      _ <- orphanBuffer.recordPendingParentOrdinal(address, binaryHash, parentOrdinal)
                       eta <- etaForParentOrdinal(parentOrdinal)
                       sigma <- selfStake
                       admitted <- committeeGate.attestAndAdmit(address, parentHash, binaryHash, eta, sigma)

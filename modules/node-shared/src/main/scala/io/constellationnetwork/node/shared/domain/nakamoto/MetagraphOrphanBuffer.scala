@@ -8,12 +8,16 @@ import io.constellationnetwork.security.hash.Hash
 
 import org.typelevel.log4cats.Logger
 
-/** In-memory bridge over gl0's GSI lag for metagraph state-channel binaries. Two coupled concerns:
+/** In-memory bridge over gl0's GSI lag for metagraph state-channel binaries. Three coupled concerns:
   *
   *   1. '''Orphan buffer.''' Holds wire bytes of binaries whose `lastSnapshotHash` (parent) the local GSI doesn't yet recognize. Drained
   *      when the parent binary itself becomes resolvable. 2. '''Recent-admission cache.''' Holds `(metagraphAddress, valueHash) →
   *      metagraphOrdinal` for binaries we just admitted via the committee gate. Allows the resolver wrapper to answer "what's this binary's
-  *      metagraph ordinal?" before the GSI catches up (which only happens on the next gl0 snapshot finalize, ~7s later).
+  *      metagraph ordinal?" before the GSI catches up (which only happens on the next gl0 snapshot finalize, ~7s later). 3. '''Pending
+  *      parent-ordinal cache.''' Holds `(metagraphAddress, wireHash) → parentOrdinal` for binaries this node has RESOLVED (whether or not
+  *      it then admitted them), keyed on the wire-bytes hash. Lets the committee-attestation receiver recover a binary's eta even when the
+  *      binary is in-flight (parent at the tip → never buffered → invisible to the orphan-buffer scan) — without it the committee threshold
+  *      is reached zero times and metagraph chains freeze at genesis. See [[recordPendingParentOrdinal]].
   *
   * '''Why this exists (#213).''' At 8gl0+4mg+4shards the metagraph CL0 ("ml0") produces incremental binaries faster than gl0 can admit them
   * through the committee gate. Between the moment gl0 finalizes a metagraph's genesis binary into its global state and the moment the first
@@ -101,6 +105,28 @@ trait MetagraphOrphanBuffer[F[_]] {
     valueHashOf: Array[Byte] => F[Option[Hash]]
   ): F[Option[Array[Byte]]]
 
+  /** NON-DESTRUCTIVELY scan the buffered wire bytes for `metagraphAddress` and return the FIRST entry whose *wire-bytes* hash equals
+    * `wireHash`, or `None`. Mirrors [[peekForValueHash]] but keys on the WIRE-BYTES digest (`Hasher.hashBytes(wireBytes)`), the identity
+    * the committee-gate aggregator + `pb.MetagraphAttestation.binaryHash` use — NOT the value-hash. The caller supplies `wireHashOf` (a
+    * `Hasher.hashBytes` callback) so this module stays free of the heavy Hasher dependency and the hash identity is computed by exactly the
+    * gossip/gate-path code.
+    *
+    * '''Why this exists (#213/#290 receiver-side content lookup).''' The metagraph-attestation receiver
+    * (`NakamotoSyncDaemon.handleMetagraphAttestation`) must resolve the metagraph parent ordinal from the ATTESTED BINARY's OWN content
+    * (deterministic across peers), but the wire attestation carries only hashes, not the binary bytes. The attested binary — whose
+    * `lastSnapshotHash == att.parentHash` and whose wire digest == `att.binaryHash` — is sitting in this orphan buffer (it arrived via
+    * gossip but gl0 could not yet admit it: the exact deadlock state). This peek retrieves that binary's bytes by its wire digest so the
+    * receiver can derive the parent ordinal (and thus the committee-VRF eta) from content. If the binary has NOT arrived yet (attestation
+    * raced ahead of it), this returns `None` and the receiver fails closed — never trusting the sender's claimed ordinal.
+    *
+    * '''Non-destructive (HARD requirement).''' Peeking MUST NEVER mutate the buffer — recording an attestation does not change our local
+    * admission state. '''Bounded scan''' over only `metagraphAddress`'s entries; returns on the first match (short-circuits the effectful
+    * scan).
+    */
+  def peekForWireHash(metagraphAddress: Address, wireHash: Hash)(
+    wireHashOf: Array[Byte] => F[Option[Hash]]
+  ): F[Option[Array[Byte]]]
+
   /** Record that the committee gate just admitted a binary with value-hash `valueHash` for metagraph `metagraphAddress`, at metagraph
     * ordinal `mgOrdinal`. Caller computes the value-hash as `signed.toHashed.map(_.hash)` and the ordinal as `parentOrdinal + 1`. The entry
     * remains in the cache until evicted by FIFO; correctness is unaffected because once gl0's GSI catches up, the resolver answers from
@@ -116,6 +142,29 @@ trait MetagraphOrphanBuffer[F[_]] {
 
   /** Total number of cached admissions across all metagraphs. Test + metrics aid. */
   def admissionsSize: F[Int]
+
+  /** Record the parent ordinal THIS node resolved for a metagraph binary, keyed by the binary's WIRE-bytes hash
+    * (`Hasher.hashBytes(wireBytes)` == `pb.MetagraphAttestation.binaryHash`), NOT its value-hash. Written by the daemon in `processBytes`
+    * the instant it resolves a binary's parent ordinal (before `attestAndAdmit`).
+    *
+    * '''Why this exists (#213/#290 — committee-threshold liveness).''' A binary being attested has its parent AT THE TIP, so it is NOT
+    * buffered — it is in-flight through `attestAndAdmit`. The receiver (`handleMetagraphAttestation`) derives the committee-VRF eta from
+    * the binary's parent ordinal, and looked it up ONLY via `peekForWireHash` (an orphan-buffer scan), which by construction cannot see an
+    * in-flight (non-buffered) binary. So every peer attested next-in-line binaries that no peer could resolve on the receive path → eta
+    * undrivable → attestation dropped → the committee threshold was reached ZERO times → metagraph chains froze at genesis. Caching the
+    * parent ordinal here at resolve-time (when this node processes the same gossiped binary) lets the receiver recover it by
+    * `att.binaryHash`. Self-bootstrapping: the first incremental resolves via the tip-identity guard, admits, and `recordAdmission` then
+    * carries the chain.
+    *
+    * Keyed on the WIRE hash to match the attestation wire field; bounded FIFO, sharing the admission cache's cap.
+    */
+  def recordPendingParentOrdinal(metagraphAddress: Address, wireHash: Hash, parentOrdinal: Long): F[Unit]
+
+  /** Look up the parent ordinal cached by [[recordPendingParentOrdinal]] for the binary whose wire-bytes hash is `wireHash` (==
+    * `att.binaryHash`). `Some` once this node has processed the binary (the common case — the binary gossips ahead of its attestations);
+    * the receiver computes the committee-VRF eta from it. `None` falls through to the buffered-content path (`peekForWireHash`).
+    */
+  def lookupPendingParentOrdinal(metagraphAddress: Address, wireHash: Hash): F[Option[Long]]
 }
 
 object MetagraphOrphanBuffer {
@@ -160,6 +209,11 @@ object MetagraphOrphanBuffer {
       seqRef <- Ref.of[F, Long](0L)
       admissionsRef <- Ref.of[F, Map[(Address, Hash), AdmissionEntry]](Map.empty)
       admissionsSeqRef <- Ref.of[F, Long](0L)
+      // #213/#290 liveness: (wireHash → parentOrdinal) for binaries this node has resolved, so inbound
+      // committee attestations for in-flight (non-buffered) binaries can recover the eta. Same shape +
+      // cap as the admission cache, keyed on the wire-bytes hash instead of the value hash.
+      pendingParentOrdinalRef <- Ref.of[F, Map[(Address, Hash), AdmissionEntry]](Map.empty)
+      pendingParentSeqRef <- Ref.of[F, Long](0L)
     } yield
       new MetagraphOrphanBuffer[F] {
 
@@ -240,6 +294,25 @@ object MetagraphOrphanBuffer {
             }
           }
 
+        def peekForWireHash(metagraphAddress: Address, wireHash: Hash)(
+          wireHashOf: Array[Byte] => F[Option[Hash]]
+        ): F[Option[Array[Byte]]] =
+          stateRef.get.flatMap { state =>
+            // Gather only this metagraph's buffered wire bytes (bounded by the cap). The scan returns
+            // on the first wire-digest match. NON-DESTRUCTIVE — `stateRef` is read-only here.
+            val candidates: List[Array[Byte]] =
+              state.iterator.collect {
+                case (key, entries) if key.metagraphAddress === metagraphAddress => entries.map(_.wireBytes)
+              }.flatten.toList
+
+            candidates.collectFirstSomeM { bytes =>
+              wireHashOf(bytes).map {
+                case Some(h) if h === wireHash => Some(bytes)
+                case _                         => None
+              }
+            }
+          }
+
         def recordAdmission(metagraphAddress: Address, valueHash: Hash, mgOrdinal: Long): F[Unit] =
           for {
             nextSeq <- admissionsSeqRef.updateAndGet(_ + 1L)
@@ -256,6 +329,19 @@ object MetagraphOrphanBuffer {
           admissionsRef.get.map(_.get((metagraphAddress, valueHash)).map(_.mgOrdinal))
 
         def admissionsSize: F[Int] = admissionsRef.get.map(_.size)
+
+        def recordPendingParentOrdinal(metagraphAddress: Address, wireHash: Hash, parentOrdinal: Long): F[Unit] =
+          for {
+            nextSeq <- pendingParentSeqRef.updateAndGet(_ + 1L)
+            _ <- pendingParentOrdinalRef.update { pending =>
+              // `AdmissionEntry.mgOrdinal` carries the PARENT ordinal here (same (seq, Long) shape, different semantics).
+              val withNew = pending.updated((metagraphAddress, wireHash), AdmissionEntry(nextSeq, parentOrdinal))
+              enforceAdmissionsCap(withNew, admissionsCap)
+            }
+          } yield ()
+
+        def lookupPendingParentOrdinal(metagraphAddress: Address, wireHash: Hash): F[Option[Long]] =
+          pendingParentOrdinalRef.get.map(_.get((metagraphAddress, wireHash)).map(_.mgOrdinal))
       }
 
   /** Total entry count across all keys. Linear in number of keys; cheap given the small cap. */

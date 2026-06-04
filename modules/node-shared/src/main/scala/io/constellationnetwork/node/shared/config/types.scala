@@ -94,6 +94,16 @@ object types {
     // sys.env). `recentAdmitCap` is kept proportionally larger (4×) — see `MetagraphOrphanBuffer.DefaultAdmissionsCap`.
     orphanBufferCap: PosInt,
     recentAdmitCap: PosInt,
+    // ml0 gl0-follow changeset transport (task #12). `changesetRingDepth` bounds the gl0 producer's SERVED ring of
+    // recent finalized per-ordinal accumulators (`GlobalChangeSetService` / `SnapshotLeaderLoop.ringInsertTrimmed`) —
+    // a follower more than this many finalized ordinals behind falls back to a heavy full-GSI resync, so widening it
+    // cuts the "baseOrdinal=None" resync class at the cost of memory (each accumulator can be sizeable; ~1024 × the
+    // per-ordinal changeset). `stagingAccumulatorsCap` bounds the producer's hash-keyed STAGING map of accumulators
+    // awaiting finalization (`GlobalSnapshotConsensusFunctions`); the steady-state bound is the finalized-watermark
+    // prune, so this size cap is only a backstop for a burst of never-finalizing forks between two finalize ticks and
+    // is kept comfortably above `changesetRingDepth` (2×). Pure transport memory bounds — NOT consensus parameters.
+    changesetRingDepth: PosInt,
+    stagingAccumulatorsCap: PosInt,
     commitmentSmt: CommitmentSmtConfig,
     localEvents: LocalEventsConfig,
     sharding: ShardingConfig

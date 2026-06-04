@@ -574,7 +574,11 @@ object GlobalSnapshotConsensus {
           // Task #12 slice 2b — the hash-keyed STAGING map. The producer stages each built snapshot's typed
           // per-ordinal delta here; `SnapshotLeaderLoop` (same Ref, injected below) promotes the finalized
           // ones into `recentFinalizedAccumulatorsRef`. Additive — never feeds back into consensus.
-          pendingAccumulatorsRef = pendingAccumulatorsRef
+          pendingAccumulatorsRef = pendingAccumulatorsRef,
+          // Task #19 — staging-map backstop cap (typed HOCON, default 2048 = 2× the served ring), bumped from
+          // the prior hardcoded 512 so a burst of never-finalizing forks between two finalize ticks cannot evict
+          // a higher-ordinal staged entry about to finalize (which would force ml0 into a full-GSI resync).
+          stagingAccumulatorsCap = sharedCfg.nakamoto.stagingAccumulatorsCap.value
         )
 
       stateAdvancer =
@@ -1154,36 +1158,24 @@ object GlobalSnapshotConsensus {
               }
             }
           }
-          // #201: resolve the metagraph parent ordinal from `(metagraphAddress, parentHash)` via the
-          // gl0 GSI's `lastStateChannelSnapshotHashes` + `lastIncrementalCurrencySnapshots` partitions.
-          // The previous shortcut (gl0 finalized ordinal) was asymmetric across peers (each peer has
-          // its own `nakamotoFinalizedOrdinalRef` value at the same wallclock) and unrelated to the
-          // metagraph's own snapshot progress, so the KES period peers derived disagreed and verifies
-          // failed. The resolver reads through `pendingReader` so under MultiBranch we pick up the
-          // chain's pending writes; #118's overlay-aware reader already handles the
-          // pending-vs-finalized fallback.
-          committeeParentOrdinalFor: (
-            (
-              io.constellationnetwork.schema.address.Address,
-              io.constellationnetwork.security.hash.Hash
-            ) => F[
-              Option[Long]
-            ]
-          ) = (mg, parent) => {
-            implicit val resolverLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
-            io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver.resolve[F](pendingReader, mg, parent)
-          }
-          // #213/#290: ADMISSION-path parent-ordinal resolver. Identical to `committeeParentOrdinalFor`
-          // EXCEPT it derives the ordinal from the incoming binary's own content (ordinal − 1) once the
-          // GSI identity guard (`lastStateChannelSnapshotHashes[mg] == parentHash`) passes, instead of
+          // #213/#290: CONTENT-DERIVED parent-ordinal resolver — the SINGLE resolver used on every
+          // committee-gate parent-ordinal site (admission processor + inbound-attestation receiver).
+          // It derives the ordinal from the incoming binary's own content (ordinal − 1) once the GSI
+          // identity guard (`lastStateChannelSnapshotHashes[mg] == parentHash`) passes, instead of
           // reading gl0's currency partitions — which `calculateLastCurrencySnapshots` drops via
           // `.filterNot(_.isEmpty)` whenever the mg produced no state in the window, while still writing
-          // `lastStateChannelSnapshotHashes[mg]`. That GSI gap made the legacy `resolve` return `None`
-          // (tip-matched, both currency partitions empty) → the admission path fail-closed → the
-          // metagraph tip froze and 0 incrementals were ever admitted at 8gl0+4mg. Wired ONLY into
-          // `makeMetagraphBinaryProcessor` (the admission decision). The committee attestation gate
-          // keeps using the GSI-only `committeeParentOrdinalFor` on BOTH its sender and receiver paths,
-          // so the committee-VRF eta (and its cross-node determinism) is byte-for-byte unchanged.
+          // `lastStateChannelSnapshotHashes[mg]`. That GSI gap made the legacy GSI-only `resolve` return
+          // `None` (tip-matched, both currency partitions empty) → both the admission path AND the
+          // attestation gate fail-closed → the metagraph tip froze and 0 incrementals were admitted at
+          // 8gl0+4mg. Determinism is unchanged on the non-empty path: `resolveFromBinary` returns N−1,
+          // which equals the legacy `resolve`'s `lastIncrementalCurrencySnapshot.ordinal` (both = the
+          // parent ordinal), so the committee-VRF eta is byte-for-byte identical there; only the empty
+          // path changes (None → N−1). Reads through `pendingReader` (overlay-aware, #118).
+          //   - ADMISSION: `makeMetagraphBinaryProcessor` (this binary's `signed.value.content`).
+          //   - RECEIVER:  `NakamotoSyncDaemon.handleMetagraphAttestation` — looks the ATTESTED binary up
+          //     in the orphan buffer by its wire digest, then feeds its content here. Both sender and
+          //     receiver are now content-derived, so the eta agrees sender↔receiver. The committee gate
+          //     itself no longer resolves the ordinal at all — it verifies against the eta it is handed.
           committeeParentOrdinalForBinary: (
             (
               io.constellationnetwork.schema.address.Address,
@@ -1197,6 +1189,32 @@ object GlobalSnapshotConsensus {
             io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver
               .resolveFromBinary[F](pendingReader, mg, parent, content)
           }
+          // #213/#290 (liveness completion): the RECEIVER variant of the resolver — content ONLY, NO
+          // gl0-tip identity guard. The inbound-attestation handler needs only the parent ordinal the
+          // binary itself declares (ordinal − 1) to compute the eta it verifies the committee-VRF
+          // against; it already holds the attested binary (orphan-buffer wire-digest match) before
+          // resolving, so that ordinal is a pure, cross-node-deterministic function of the held content.
+          // The tip-guarded `committeeParentOrdinalForBinary` above (which the ADMISSION processor uses,
+          // where its `None` correctly BUFFERS an ahead-binary until its parent is admitted) fail-closed
+          // on the receiver path whenever gl0's tip trailed the binary's parent — the steady state, since
+          // ml0 outpaces gl0's gate cadence — and DROPPED the attestation, so binaries never reached the
+          // committee threshold, gl0's metagraph tip never advanced, and it trailed ml0 further: a
+          // self-reinforcing lag that stranded late state (e.g. an epoch-323 token lock) out of Global L0.
+          // Safety is unchanged: the guard never inspected the ordinal (only the parentHash), so a forged
+          // ordinal is exactly as (im)possible as before — the committee-VRF verify (against this
+          // content-derived eta) and the admission chain-check remain the real gates. Returns `None` ONLY
+          // when the binary content is malformed (decodes as neither incremental nor full snapshot).
+          committeeParentOrdinalFromContent: (
+            (
+              io.constellationnetwork.schema.address.Address,
+              io.constellationnetwork.security.hash.Hash,
+              Array[Byte]
+            ) => F[
+              Option[Long]
+            ]
+          ) = (_, _, content) =>
+            io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver
+              .parentOrdinalFromContent[F](content)
           committeeGate = {
             implicit val gateLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
             implicit val gateHasher: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
@@ -1212,8 +1230,7 @@ object GlobalSnapshotConsensus {
               publisher = committeePublisher,
               kTarget = committeeKTarget,
               gateTimeoutMs = io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.DefaultGateTimeoutMs,
-              pollIntervalMs = io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.DefaultPollIntervalMs,
-              parentOrdinalFor = committeeParentOrdinalFor
+              pollIntervalMs = io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.DefaultPollIntervalMs
             )
           }
           // Resolve eta for a metagraph-parent ordinal. For v1 we reuse the same logic the snapshot
@@ -1577,6 +1594,9 @@ object GlobalSnapshotConsensus {
                   // Task #12 slice 2b: the served changeset ring the loop fills at both finalize sinks; a later
                   // slice wires `GlobalChangeSetService.make(recentFinalizedAccumulatorsRef.get)` to serve it.
                   recentFinalizedAccumulatorsRef = recentFinalizedAccumulatorsRef,
+                  // Task #12: served-ring depth (typed HOCON, default 1024) — bumped from the prior hardcoded 256
+                  // to cut ml0 full-GSI resyncs by keeping a longer lag window on the light incremental path.
+                  changesetRingDepth = sharedCfg.nakamoto.changesetRingDepth.value,
                   chainSyncRequestQueue = chainSyncRequestQueue,
                   finalityTriggerViewRef = finalityTriggerViewRef,
                   // §1.2 Slice 5/6: parallel-sign attestations + snapshots with KES.
@@ -1820,7 +1840,19 @@ object GlobalSnapshotConsensus {
                   // resolver (#201) and an ordinal-to-eta function (#202) — handlers chain them so
                   // the eta passed to the gate is byte-equivalent to the sender's eta.
                   committeeGate = committeeGate,
-                  parentOrdinalFor = committeeParentOrdinalFor,
+                  // #213/#290 + liveness completion: the inbound-attestation receiver derives the parent
+                  // ordinal PURELY from the ATTESTED binary's own content (ordinal − 1; looked up in the
+                  // orphan buffer by wire digest) via the content-only resolver — NO gl0-tip identity
+                  // guard. The receiver only needs the binary's self-declared ordinal to compute the eta
+                  // it verifies the committee-VRF against, and it already holds the binary, so that
+                  // ordinal is pure + cross-node-deterministic. The tip-GUARDED resolver
+                  // (`committeeParentOrdinalForBinary`) is what the ADMISSION processor uses — there a
+                  // `None` correctly buffers an ahead-binary — but on THIS receiver path it fail-closed
+                  // whenever gl0's tip trailed the binary's parent (the steady state under ml0's faster
+                  // cadence) and DROPPED the attestation, so binaries never reached threshold and gl0's
+                  // metagraph tip never advanced (self-reinforcing lag behind ml0). Content-only here;
+                  // tip-guard stays on admission. Safety unchanged — the guard never inspected the ordinal.
+                  parentOrdinalFor = committeeParentOrdinalFromContent,
                   etaForParentOrdinal = committeeEtaForOrdinal,
                   senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.committeeStake(peer),
                   processOrphanedMetagraphBinary = processOrphanedMetagraphBinary,

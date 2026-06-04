@@ -64,7 +64,8 @@ object ChangeSetRingPromotionSuite extends SimpleIOSuite {
     //    modify/update exactly.
     val pulled = rekeyed.get(withCertHash).map { case (_, acc) => acc }
     val ring0 = SortedMap.empty[SnapshotOrdinal, StateChangesAccumulator]
-    val ringAfter = pulled.fold(ring0)(p => SnapshotLeaderLoop.ringInsertTrimmed(ring0, ordinal, p))
+    val ringAfter =
+      pulled.fold(ring0)(p => SnapshotLeaderLoop.ringInsertTrimmed(ring0, ordinal, p, GlobalChangeSetService.recentAccumulatorsToKeep))
 
     // 4) The served changeset service reads THIS ring (no SMT store wired ⇒ proof fields None).
     val service = GlobalChangeSetService.make[IO](IO.pure(ringAfter), historicalCommitmentSmtStore = None, confirmationDepthK = 255L)
@@ -93,7 +94,8 @@ object ChangeSetRingPromotionSuite extends SimpleIOSuite {
     // Finalize sink looks up under the with-cert hash → miss → nothing promoted.
     val pulled = stagedAtProduce.get(withCertHash).map { case (_, acc) => acc }
     val ring0 = SortedMap.empty[SnapshotOrdinal, StateChangesAccumulator]
-    val ringAfter = pulled.fold(ring0)(p => SnapshotLeaderLoop.ringInsertTrimmed(ring0, ordinal, p))
+    val ringAfter =
+      pulled.fold(ring0)(p => SnapshotLeaderLoop.ringInsertTrimmed(ring0, ordinal, p, GlobalChangeSetService.recentAccumulatorsToKeep))
 
     val service = GlobalChangeSetService.make[IO](IO.pure(ringAfter), historicalCommitmentSmtStore = None, confirmationDepthK = 255L)
 
@@ -130,11 +132,13 @@ object ChangeSetRingPromotionSuite extends SimpleIOSuite {
     )
   }
 
-  test("ringInsertTrimmed bounds the served ring to recentAccumulatorsToKeep, dropping the lowest ordinals") {
+  test("ringInsertTrimmed bounds the served ring to its `recentAccumulatorsToKeep` arg, dropping the lowest ordinals") {
+    // Task #19: the cap is now an explicit parameter (production threads the typed `nakamoto.changeset-ring-depth`
+    // HOCON value); this test drives the trim logic with an arbitrary cap value.
     val keep = GlobalChangeSetService.recentAccumulatorsToKeep
     // Insert keep+1 ordinals (1..keep+1); the lowest (ordinal 1) must be evicted, the rest retained.
     val ring = (1L to (keep.toLong + 1L)).foldLeft(SortedMap.empty[SnapshotOrdinal, StateChangesAccumulator]) {
-      case (r, n) => SnapshotLeaderLoop.ringInsertTrimmed(r, ord(n), acc(n))
+      case (r, n) => SnapshotLeaderLoop.ringInsertTrimmed(r, ord(n), acc(n), keep)
     }
     IO.pure(
       expect.same(ring.size, keep) &&
