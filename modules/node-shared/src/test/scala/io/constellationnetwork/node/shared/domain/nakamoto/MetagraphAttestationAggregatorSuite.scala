@@ -90,18 +90,30 @@ object MetagraphAttestationAggregatorSuite extends SimpleIOSuite {
 
   // ============ thresholdReached ============
 
-  test("thresholdReached fires only at ceil(2K/3) attestations") {
+  // Draw/quorum decouple: `thresholdReached(requiredQuorum)` now compares the distinct-attester count against `requiredQuorum` DIRECTLY
+  // (the cluster-uniform `nakamoto.committee.kQuorum`), NOT `ceil(2/3 · K)` of some draw target.
+  test("thresholdReached fires exactly at requiredQuorum attestations (direct count)") {
     val a = addr("mg-A")
     val p = parent("p-threshold")
     val h = hash("bin")
-    val k = 6 // ceil(2·6/3) = 4
+    val requiredQuorum = 4 // wait for 4 distinct attesters, directly
     for {
       agg <- MetagraphAttestationAggregator.make[IO]
       _ <- (1 to 3).toList.traverse_(i => agg.record(a, p, h, pid(s"p$i")))
-      below <- agg.thresholdReached(a, p, h, k)
+      below <- agg.thresholdReached(a, p, h, requiredQuorum)
       _ <- agg.record(a, p, h, pid("p4"))
-      atThreshold <- agg.thresholdReached(a, p, h, k)
+      atThreshold <- agg.thresholdReached(a, p, h, requiredQuorum)
     } yield expect(!below).and(expect(atThreshold))
+  }
+
+  test("thresholdReached rejects requiredQuorum = 0") {
+    for {
+      agg <- MetagraphAttestationAggregator.make[IO]
+      caught <- IO.delay {
+        try { agg.thresholdReached(addr("mg-A"), parent("p"), hash("bin"), 0); false }
+        catch { case _: IllegalArgumentException => true }
+      }
+    } yield expect(caught)
   }
 
   test("thresholdReached false when binary unknown") {

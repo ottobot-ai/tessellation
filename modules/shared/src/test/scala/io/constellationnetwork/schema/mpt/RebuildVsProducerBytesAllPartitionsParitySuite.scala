@@ -53,8 +53,8 @@ import weaver.MutableIOSuite
   * reject / 114× idle on the §3 NIPoPoW `historicalStakeSnapshots` partition, which `syncFromGlobalSnapshotInfo` was silently NOT writing).
   *
   * This suite drives one accumulator that populates EVERY partition (incl. `historicalStakeSnapshots`), derives the matching GSI via the
-  * canonical pairing `applyAccumulatorToGSI`, and asserts the two store roots agree. A single full-population equality therefore catches ANY
-  * future partition omission in `syncFromGlobalSnapshotInfo` — not just the historical-stake gap it was introduced for.
+  * canonical pairing `applyAccumulatorToGSI`, and asserts the two store roots agree. A single full-population equality therefore catches
+  * ANY future partition omission in `syncFromGlobalSnapshotInfo` — not just the historical-stake gap it was introduced for.
   */
 object RebuildVsProducerBytesAllPartitionsParitySuite extends MutableIOSuite {
 
@@ -254,8 +254,9 @@ object RebuildVsProducerBytesAllPartitionsParitySuite extends MutableIOSuite {
 
   /** Build a `StateChangesAccumulator` populating EVERY partition with exactly one representative record, including
     * `historicalStakeSnapshots`. The expiry-index `SystemIndexDelta`s are matched to the active allow-spend / token-lock /
-    * node-collateral-withdrawal records (keys hashed the same way the managers emit them) so the incremental path's SystemIndex writes equal
-    * what the rebuild derives from the resulting GSI. Returns the accumulator (the GSI is derived from it via `applyAccumulatorToGSI`).
+    * node-collateral-withdrawal records (keys hashed the same way the managers emit them) so the incremental path's SystemIndex writes
+    * equal what the rebuild derives from the resulting GSI. Returns the accumulator (the GSI is derived from it via
+    * `applyAccumulatorToGSI`).
     */
   private def fullyPopulatedAccumulator(implicit sp: SecurityProvider[IO], h: Hasher[IO]): IO[StateChangesAccumulator] =
     for {
@@ -287,42 +288,43 @@ object RebuildVsProducerBytesAllPartitionsParitySuite extends MutableIOSuite {
       currencyEntry <- signedIncremental(7L).map(s => (s, currencyInfo(mgAddr, 555L)).asRight[Signed[CurrencySnapshot]])
 
       stakeDist = StakeDistribution(SortedMap(peerId -> BigInt(123456789L)))
-    } yield StateChangesAccumulator(
-      lastStateChannelSnapshotHashes = SortedMap(mgAddr -> testHash("scsh")),
-      lastTxRefs = SortedMap(a1 -> TransactionReference(TransactionOrdinal(NonNegLong(3L)), testHash("txref"))),
-      balances = SortedMap(a1 -> Balance(NonNegLong(1000L)), a2 -> Balance(NonNegLong(2000L))),
-      lastCurrencySnapshots = SortedMap(mgAddr -> currencyEntry),
-      lastCurrencySnapshotsProofs =
-        SortedMap(mgAddr -> Proof(NonEmptyList.one(ProofEntry(testHash("cs-target"), Right(testHash("cs-sibling")))))),
-      activeAllowSpends = SortedMap(
-        Option.empty[Address] -> SortedMap(a1 -> SortedSet(asG)),
-        mgAddr.some -> SortedMap(a1 -> SortedSet(asM))
-      ),
-      activeTokenLocks = SortedMap(a1 -> SortedSet(tl)),
-      tokenLockBalances = SortedMap(mgAddr -> SortedMap(holder -> Balance(NonNegLong(777L)))),
-      lastAllowSpendRefs = SortedMap(a1 -> AllowSpendReference(AllowSpendOrdinal(NonNegLong(2L)), testHash("lasr"))),
-      lastTokenLockRefs = SortedMap(a1 -> TokenLockReference(TokenLockOrdinal(NonNegLong(2L)), testHash("ltlr"))),
-      activeDelegatedStakes = SortedMap(a1 -> SortedSet(mkStake(a1, peerId, "x"))),
-      delegatedStakesWithdrawals = SortedMap(a1 -> SortedSet(mkStakeWithdrawal(a1, peerId, "x"))),
-      activeNodeCollaterals = SortedMap(nodeAddr -> SortedSet(mkCollateral(nodeAddr, peerId, "x"))),
-      nodeCollateralWithdrawals = SortedMap(nodeAddr -> SortedSet(ncw)),
-      metagraphSyncData = SortedMap(mgAddr -> MetagraphSyncDataInfo.empty),
-      updateNodeParameters = SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)](nodeId -> ((mkUnp(nodeAddr, "u"), ord))),
-      priceState = SortedMap[TokenPair, PriceRecord](TokenPair.DAG_USD -> mkPriceRecord(99L)),
-      allowSpendExpiryIndex = SystemIndexDelta.EpochBucket[AllowSpendExpiryKey](
-        adds = SortedMap(
-          asExpiry -> Set(AllowSpendExpiryKey(None, a1, asGHashed.hash)),
-          EpochProgress(NonNegLong(600L)) -> Set(AllowSpendExpiryKey(mgAddr.some, a1, asMHashed.hash))
-        )
-      ),
-      tokenLockExpiryIndex = SystemIndexDelta.EpochBucket[TokenLockExpiryKey](
-        adds = SortedMap(tlUnlock -> Set(TokenLockExpiryKey(a1, tlHashed.hash)))
-      ),
-      nodeCollateralWithdrawalExpiryIndex = SystemIndexDelta.EpochBucket[NodeCollateralWithdrawalExpiryKey](
-        adds = SortedMap(ncwExpiry -> Set(NodeCollateralWithdrawalExpiryKey(nodeAddr, ncwHashed.hash)))
-      ),
-      historicalStakeSnapshots = SortedMap(EtaPeriod(1L) -> HistoricalStakeSnapshot(stakeDist, testHash("eta-period-1")))
-    )
+    } yield
+      StateChangesAccumulator(
+        lastStateChannelSnapshotHashes = SortedMap(mgAddr -> testHash("scsh")),
+        lastTxRefs = SortedMap(a1 -> TransactionReference(TransactionOrdinal(NonNegLong(3L)), testHash("txref"))),
+        balances = SortedMap(a1 -> Balance(NonNegLong(1000L)), a2 -> Balance(NonNegLong(2000L))),
+        lastCurrencySnapshots = SortedMap(mgAddr -> currencyEntry),
+        lastCurrencySnapshotsProofs =
+          SortedMap(mgAddr -> Proof(NonEmptyList.one(ProofEntry(testHash("cs-target"), Right(testHash("cs-sibling")))))),
+        activeAllowSpends = SortedMap(
+          Option.empty[Address] -> SortedMap(a1 -> SortedSet(asG)),
+          mgAddr.some -> SortedMap(a1 -> SortedSet(asM))
+        ),
+        activeTokenLocks = SortedMap(a1 -> SortedSet(tl)),
+        tokenLockBalances = SortedMap(mgAddr -> SortedMap(holder -> Balance(NonNegLong(777L)))),
+        lastAllowSpendRefs = SortedMap(a1 -> AllowSpendReference(AllowSpendOrdinal(NonNegLong(2L)), testHash("lasr"))),
+        lastTokenLockRefs = SortedMap(a1 -> TokenLockReference(TokenLockOrdinal(NonNegLong(2L)), testHash("ltlr"))),
+        activeDelegatedStakes = SortedMap(a1 -> SortedSet(mkStake(a1, peerId, "x"))),
+        delegatedStakesWithdrawals = SortedMap(a1 -> SortedSet(mkStakeWithdrawal(a1, peerId, "x"))),
+        activeNodeCollaterals = SortedMap(nodeAddr -> SortedSet(mkCollateral(nodeAddr, peerId, "x"))),
+        nodeCollateralWithdrawals = SortedMap(nodeAddr -> SortedSet(ncw)),
+        metagraphSyncData = SortedMap(mgAddr -> MetagraphSyncDataInfo.empty),
+        updateNodeParameters = SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)](nodeId -> ((mkUnp(nodeAddr, "u"), ord))),
+        priceState = SortedMap[TokenPair, PriceRecord](TokenPair.DAG_USD -> mkPriceRecord(99L)),
+        allowSpendExpiryIndex = SystemIndexDelta.EpochBucket[AllowSpendExpiryKey](
+          adds = SortedMap(
+            asExpiry -> Set(AllowSpendExpiryKey(None, a1, asGHashed.hash)),
+            EpochProgress(NonNegLong(600L)) -> Set(AllowSpendExpiryKey(mgAddr.some, a1, asMHashed.hash))
+          )
+        ),
+        tokenLockExpiryIndex = SystemIndexDelta.EpochBucket[TokenLockExpiryKey](
+          adds = SortedMap(tlUnlock -> Set(TokenLockExpiryKey(a1, tlHashed.hash)))
+        ),
+        nodeCollateralWithdrawalExpiryIndex = SystemIndexDelta.EpochBucket[NodeCollateralWithdrawalExpiryKey](
+          adds = SortedMap(ncwExpiry -> Set(NodeCollateralWithdrawalExpiryKey(nodeAddr, ncwHashed.hash)))
+        ),
+        historicalStakeSnapshots = SortedMap(EtaPeriod(1L) -> HistoricalStakeSnapshot(stakeDist, testHash("eta-period-1")))
+      )
 
   /** Cumulative incremental writer root (producer's signed root) — apply the accumulator, read the FULL in-store root for `ord`. */
   private def incrementalRoot(acc: StateChangesAccumulator)(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[Option[MptRoot]] =

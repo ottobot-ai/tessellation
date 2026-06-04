@@ -37,7 +37,6 @@ object ShardingConfigSuite extends SimpleIOSuite {
     val cfg = loadDefault
     expect.all(
       cfg.numShards == 1,
-      cfg.committeeKTarget == 4,
       cfg.finality.k1Shard == 8L,
       cfg.checkpoint.tAliveMs == 30000L,
       cfg.checkpoint.tBurst == 64,
@@ -56,7 +55,6 @@ object ShardingConfigSuite extends SimpleIOSuite {
       """
         |nakamoto.sharding {
         |  num-shards = 4
-        |  committee-k-target = 8
         |  finality { k1-shard = 16 }
         |  checkpoint { t-alive-ms = 45000, t-burst = 128, binary-buffer-cap = 8192 }
         |  observability { t-partition-hard-ms = 90000 }
@@ -66,7 +64,6 @@ object ShardingConfigSuite extends SimpleIOSuite {
     )
     expect.all(
       cfg.numShards == 4,
-      cfg.committeeKTarget == 8,
       cfg.finality.k1Shard == 16L,
       cfg.checkpoint.tAliveMs == 45000L,
       cfg.checkpoint.tBurst == 128,
@@ -87,7 +84,6 @@ object ShardingConfigSuite extends SimpleIOSuite {
     )
     expect.all(
       cfg.numShards == 2,
-      cfg.committeeKTarget == 4,
       cfg.finality.k1Shard == 8L,
       cfg.checkpoint.tAliveMs == 30000L,
       cfg.checkpoint.tBurst == 64,

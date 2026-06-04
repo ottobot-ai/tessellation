@@ -22,13 +22,19 @@ import org.typelevel.log4cats.Logger
 
 /** Slice S3 — the load-bearing pre-inclusion gate for metagraph state-channel binaries.
   *
-  * Sits in front of `processMetagraphBinary` and gates admission on `≥ ⌈2 K_target / 3⌉` committee attestations
+  * Sits in front of `processMetagraphBinary` and gates admission on `≥ kQuorum` committee attestations
   * (`MetagraphAttestationAggregator.thresholdReached`). This converts the warn-only S2/S2.5 aggregator into a cluster-coordination
   * primitive: non-committee operators skip the binary entirely (sharding payoff), and a binary cannot enter a global snapshot until its
   * committee has spoken.
   *
+  * '''Draw/quorum decouple.''' The committee DRAW (`isInCommittee` sender-side / `verifyMembership` receiver-side) uses `kDraw`; the admit
+  * quorum the gate polls for uses `kQuorum`. Both are cluster-uniform HOCON (`nakamoto.committee.{kDraw,kQuorum}`) so the draw is
+  * byte-identical sender↔receiver and every node admits at the same count. They are deliberately separate: when expected-committee ==
+  * admit-quorum, the binomial committee draw left ~36% of binaries with a committee too small to reach the quorum → gate timeout →
+  * re-buffer churn → gl0 trailed ml0. With `kDraw = N` the threshold saturates (committee = everyone) so `P(|committee| ≥ kQuorum) = 1`.
+  *
   * '''Sender path (`attestAndAdmit`).''' When this node observes a new `Signed[StateChannelSnapshotBinary]`:
-  *   1. Compute `committeeSortition.isInCommittee(vrfSk, eta, metagraphAddress, parentHash, sigmaOperatorKey, kTarget)`. 2. If we're in the
+  *   1. Compute `committeeSortition.isInCommittee(vrfSk, eta, metagraphAddress, parentHash, sigmaOperatorKey, kDraw)`. 2. If we're in the
   *      committee: build a `pb.MetagraphAttestation` carrying the VRF proof + an Ed25519 long-term-key sig + a REQUIRED KES product sig
   *      (Slice 9 path), record it locally in the aggregator, and gossip via the sidecar's `PublishMetagraphAttestation` RPC. 3. Either way,
   *      poll `aggregator.thresholdReached(...)` until it returns `true` OR the timeout fires. On threshold → admit (return `true`). On
@@ -41,19 +47,20 @@ import org.typelevel.log4cats.Logger
   *      `KesGossipVerification.verifyAttestation` is reused intact: Ed25519-authenticated peers that haven't completed Slice-10 runtime
   *      registration yet are accepted (the Ed25519 signature is itself an authenticator); this aligns with how TipAttestation handles the
   *      same case. 3. Verify the committee VRF: `CommitteeSortition.verifyMembership(senderVrfVk, eta, metagraphAddress, parentHash,
-  *      sigmaSender, kTarget, proof)`. Note σ_sender is looked up against the StakeRegistry — the sender's stake, not ours. The N-2 staging
+  *      sigmaSender, kDraw, proof)`. Note σ_sender is looked up against the StakeRegistry — the sender's stake, not ours. The N-2 staging
   *      will land later (#180); for now we read live stake, which is byte-equivalent under the no-mid-epoch-stake-change rule the test
   *      cluster runs under. 4. If all three verifies pass: `aggregator.record(metagraphAddress, parentHash, binaryHash, peerId)`. Otherwise
-  *      WARN and drop.
+  *      WARN and drop. The committee VRF check uses `kDraw` (the DRAW target), matching the sender's `isInCommittee(... kDraw)`.
   *
   * '''Pruning.''' `pruneParents(addr, parents)` is a pass-through to the underlying aggregator. Callers wire this at gl0 finality (see
   * `SnapshotLeaderLoop`): when a gl0 snapshot finalizes, iterate its `stateChannelSnapshots` and prune those `(metagraphAddress,
   * parentHash)` pairs out of the aggregator. The map then no longer grows monotonically.
   *
-  * '''Config (env, read once at construction).'''
-  *   - `NAKAMOTO_COMMITTEE_K_TARGET` — target committee size. If unset, the call site supplies a fallback derived from the active gl0
-  *     operator count (degenerate `K = N` puts everyone in every committee — the gate is a no-op except for proving the wiring works). For
-  *     e2e, `K = 4` on `N = 8` gives genuine sortition.
+  * '''Config.'''
+  *   - `nakamoto.committee.k-draw` (env `NAKAMOTO_COMMITTEE_K_DRAW`) — committee DRAW target, cluster-uniform HOCON. `kDraw = N` puts
+  *     everyone in every committee (threshold saturates) so `P(|committee| ≥ kQuorum) = 1`; smaller values give genuine sortition.
+  *   - `nakamoto.committee.k-quorum` (env `NAKAMOTO_COMMITTEE_K_QUORUM`) — admit quorum, cluster-uniform HOCON. The exact distinct-attester
+  *     count the gate waits for. Invariant (fail-fast at load): `0 < kQuorum <= kDraw`. 8-node testnet default: `kDraw = 8, kQuorum = 6`.
   *   - `NAKAMOTO_COMMITTEE_GATE_TIMEOUT_MS` — poll timeout for the sender path. Default 30000ms. Beyond this the binary is dropped
   *     (WARN-logged) and a counter `dag_nakamoto_committee_gate_dropped_total` is incremented.
   *   - `NAKAMOTO_COMMITTEE_GATE_POLL_INTERVAL_MS` — how often the gate re-checks the threshold while waiting. Default 250ms (a fraction of
@@ -286,7 +293,8 @@ object MetagraphCommitteeGate {
     kesSigner: KesSigner[F],
     kesVerifier: KesVerifier[F],
     publisher: Publisher[F],
-    kTarget: Int,
+    kDraw: Int,
+    kQuorum: Int,
     gateTimeoutMs: Long,
     pollIntervalMs: Long
   ): MetagraphCommitteeGate[F] =
@@ -341,7 +349,7 @@ object MetagraphCommitteeGate {
         sigmaOperatorKey: Ratio
       ): F[SenderOutcome] =
         sortition
-          .isInCommittee(selfVrfSk, eta, metagraphAddress, parentHash, sigmaOperatorKey, kTarget)
+          .isInCommittee(selfVrfSk, eta, metagraphAddress, parentHash, sigmaOperatorKey, kDraw)
           .flatMap {
             case None =>
               logger
@@ -383,7 +391,7 @@ object MetagraphCommitteeGate {
                 )
                 _ <- logger.info(
                   s"📢 committee-attested mg=$metagraphAddress parent=${parentHash.value.take(12)}... binary=${binaryHash.value
-                      .take(12)}... kTarget=$kTarget kesStep=$kesStep " +
+                      .take(12)}... kDraw=$kDraw kQuorum=$kQuorum kesStep=$kesStep " +
                     s"sentEtaFull=${eta.map("%02x".format(_)).mkString} " +
                     s"sentVrfVkFull=${selfVrfVk.map("%02x".format(_)).mkString} " +
                     s"sentProofFull=${proof.map("%02x".format(_)).mkString} " +
@@ -406,7 +414,7 @@ object MetagraphCommitteeGate {
             else
               logger.warn(
                 s"⛔ committee-gate timeout mg=$metagraphAddress parent=${parentHash.value.take(12)}... binary=${binaryHash.value
-                    .take(12)}... kTarget=$kTarget timeoutMs=$gateTimeoutMs — dropping binary"
+                    .take(12)}... kDraw=$kDraw kQuorum=$kQuorum timeoutMs=$gateTimeoutMs — dropping binary"
               )
         } yield result
 
@@ -416,7 +424,7 @@ object MetagraphCommitteeGate {
         binaryHash: Hash,
         deadlineMs: Long
       ): F[Boolean] =
-        aggregator.thresholdReached(metagraphAddress, parentHash, binaryHash, kTarget).flatMap { reached =>
+        aggregator.thresholdReached(metagraphAddress, parentHash, binaryHash, kQuorum).flatMap { reached =>
           if (reached) {
             logger
               .info(
@@ -504,7 +512,7 @@ object MetagraphCommitteeGate {
                             att.metagraphAddress,
                             att.parentHash,
                             sigmaSender,
-                            kTarget,
+                            kDraw,
                             att.committeeVrfProof
                           )
                           .flatMap {
@@ -518,7 +526,7 @@ object MetagraphCommitteeGate {
                                   s"etaFull=${eta.map("%02x".format(_)).mkString} " +
                                   s"vrfVkFull=${att.senderVrfVk.map("%02x".format(_)).mkString} " +
                                   s"proofFull=${att.committeeVrfProof.map("%02x".format(_)).mkString} " +
-                                  s"sigmaSender=$sigmaSender kTarget=$kTarget from=${att.senderPeerId.value.value.take(16)}..."
+                                  s"sigmaSender=$sigmaSender kDraw=$kDraw from=${att.senderPeerId.value.value.take(16)}..."
                               ) >>
                                 Async[F].pure(ReceiverOutcome.InvalidCommitteeVrf: ReceiverOutcome)
                             case io.constellationnetwork.node.shared.domain.nakamoto.CommitteeSortition.VerifyOutcome
@@ -530,7 +538,7 @@ object MetagraphCommitteeGate {
                                 s"🔬 InvalidCommitteeVrf [BelowThreshold] mg=${att.metagraphAddress} parent=${att.parentHash.value
                                     .take(12)}... binary=${att.binaryHash.value.take(12)}... " +
                                   s"testValue=$testValue threshold=$thresh " +
-                                  s"sigmaSender=$sigmaSender kTarget=$kTarget from=${att.senderPeerId.value.value.take(16)}..."
+                                  s"sigmaSender=$sigmaSender kDraw=$kDraw from=${att.senderPeerId.value.value.take(16)}..."
                               ) >>
                                 Async[F].pure(ReceiverOutcome.InvalidCommitteeVrf: ReceiverOutcome)
                           }

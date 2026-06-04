@@ -78,7 +78,8 @@ object ShardCheckpointAcceptResult {
   *     Slice 13 rewires GSAM to consume this; this slice creates the manager standalone.
   *
   * '''HOCON rule''' (per `[[feedback-prefer-hocon-over-sysenv]]`):
-  *   - `kTarget` is a constructor parameter; callers wire from `cfg.nakamoto.sharding.committeeKTarget`. No `sys.env.get` anywhere.
+  *   - `kDraw` (committee draw target) and `kQuorum` (admit count) are constructor parameters; callers wire from
+  *     `cfg.nakamoto.committee.{kDraw,kQuorum}`. No `sys.env.get` anywhere.
   *
   * '''Decoupling rule''':
   *   - All shard-scope lookups are injected as callbacks (`finalityTriggers`, `chainStore`, `committeeMembership`, `reExecuteDerivation`).
@@ -112,11 +113,14 @@ trait ShardCheckpointGl0AcceptanceManager[F[_]] {
     * '''Decision (deterministic, count-based quorum — no triggers).'''
     *   1. Run the SAME [[evaluate]] pre-checks (committee membership + Ed25519 + KES + VRF-structural per signer) — fully deterministic.
     *      `Left` ⇒ [[ShardCheckpointAcceptResult.Rejected]].
-    *   1. Compute `kS = committeeMembership(shardId, epoch).size` and `threshold = ceil(2·kS/3)`. The pre-check already proved every
-    *      embedded signature is a valid distinct committee member, so the count of (deduplicated-by-peerId) signatures IS the
-    *      valid-attestation count. `count >= threshold` ⇒ [[ShardCheckpointAcceptResult.Accepted]]. This is "Phase 2 broadly" (§7.3
-    *      `T_count_shard`) made deterministic directly from the embedded attestation; count-based ≡ stake-based at the v1 uniform-σ
-    *      committee rule (design §5.4).
+    *   1. Compare the distinct (deduplicated-by-peerId) embedded-signature count against the cluster-uniform admit quorum `kQuorum`
+    *      (`nakamoto.committee.kQuorum`), DECOUPLED from the committee draw target `kDraw` (the draw enumerates the membership the
+    *      pre-check validates against; the quorum is an independent count). The pre-check already proved every embedded signature is a
+    *      valid distinct committee member, so that count IS the valid-attestation count. `count >= kQuorum` ⇒
+    *      [[ShardCheckpointAcceptResult.Accepted]]. This is "Phase 2 broadly" (§7.3 `T_count_shard`) made deterministic directly from the
+    *      embedded attestation; count-based ≡ stake-based at the v1 uniform-σ committee rule (design §5.4). The old `ceil(2·|committee|/3)`
+    *      derived the quorum from the enumerated draw size — exactly the coupling that stranded sub-quorum committees; `kQuorum` is now
+    *      chosen independently.
     *   1. Otherwise (degraded / sub-quorum) ⇒ the existing re-exec failover (`reExecPath`). With the fail-closed `reExecuteDerivation` stub
     *      it yields a deterministic [[ShardCheckpointAcceptResult.Rejected]] / mismatch — never a node-local-dependent answer.
     */
@@ -138,10 +142,14 @@ object ShardCheckpointGl0AcceptanceManager {
     * @param committeeMembership
     *   `(shardId, epoch) => F[Set[PeerId]]`. The committee draw for this `(shard, epoch)`. Used in the pre-check to confirm each signer is
     *   actually a committee member at the claimed epoch. Empty set ⇒ any signer fails the membership pre-check ⇒ reject.
-    * @param kTarget
-    *   committee target size (`K_S` in design doc §5). Wired from `cfg.nakamoto.sharding.committeeKTarget`. v1 stable-σ rule treats every
-    *   committee member as uniform 1/K_S; the threshold check inside `CommitteeSortition.verifyMembership` uses `K · σ` so this is the `K`
-    *   factor.
+    * @param kDraw
+    *   committee DRAW target (`K_S` in design doc §5). Wired from `cfg.nakamoto.committee.kDraw`. v1 stable-σ rule treats every committee
+    *   member as uniform 1/N; the threshold check inside `CommitteeSortition.verifyMembership` uses `K_draw · σ` so this is the `K_draw`
+    *   factor (the future cryptographic VRF pre-check at Slice 13 consumes it). Reserved for forward compatibility today.
+    * @param kQuorum
+    *   committee ADMIT quorum — the cluster-uniform count (`cfg.nakamoto.committee.kQuorum`) `verifyEmbedded` requires of distinct embedded
+    *   committee signers. DECOUPLED from `kDraw`: the draw sizes the committee, the quorum is the independent admit count (no 2/3
+    *   multiplier). Invariant `0 < kQuorum <= kDraw` is enforced at config load (`CommitteeConfig.validated`).
     * @param selfPeerId
     *   this node's PeerId. Carried for diagnostic logging (so a slashing event surfaces which gl0 op spotted the deviation). NOT used to
     *   gate any acceptance logic — every honest gl0 op runs the same predicates and reaches the same outcome.
@@ -163,21 +171,22 @@ object ShardCheckpointGl0AcceptanceManager {
     finalityTriggers: ShardId => F[Option[ShardFinalityTriggers[F]]],
     chainStore: ShardId => F[Option[ShardChainStore[F]]],
     committeeMembership: (ShardId, EtaPeriod) => F[Set[PeerId]],
-    kTarget: Int,
+    kDraw: Int,
+    kQuorum: Int,
     selfPeerId: PeerId,
     kesRegistry: KesRegistry[F],
     reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash]
   ): F[ShardCheckpointGl0AcceptanceManager[F]] = {
 
-    // chainStore + selfPeerId + kTarget are reserved for forward compatibility (see scaladoc on the parameters); reference once to
+    // chainStore + selfPeerId + kDraw are reserved for forward compatibility (see scaladoc on the parameters); reference once to
     // avoid unused-warnings. Slice 13 wiring uses chainStore for the depth-k1 ancestor lookup in production accept loops; selfPeerId
-    // is used by diagnostic logging to surface which gl0 op spotted a slashable deviation; kTarget feeds the VRF threshold check
+    // is used by diagnostic logging to surface which gl0 op spotted a slashable deviation; kDraw feeds the VRF threshold check
     // when the real VRF VK registry is wired (Slice 13). For Slice 9 the VRF predicate is a non-empty proof bytes structural check
-    // (the VK registry doesn't exist yet — see scaladoc on `verifyVrfStructural`).
+    // (the VK registry doesn't exist yet — see scaladoc on `verifyVrfStructural`). kQuorum IS consumed below by `verifyEmbedded`.
     val _unusedChainStore = chainStore
     val _unusedSelfPeerId = selfPeerId
-    val _unusedKTarget = kTarget
-    val _ = (_unusedChainStore, _unusedSelfPeerId, _unusedKTarget)
+    val _unusedKDraw = kDraw
+    val _ = (_unusedChainStore, _unusedSelfPeerId, _unusedKDraw)
 
     val logger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointGl0AcceptanceManager")
 
@@ -224,7 +233,7 @@ object ShardCheckpointGl0AcceptanceManager {
                     result <-
                       if (countQualifies) {
                         // §7.3 fast path: signature-only acceptance. We already verified all signatures in step 1; the count trigger
-                        // confirms ≥ ⌈2·K_S/3⌉ committee members attested — quorum-attested ⇒ accept.
+                        // confirms ≥ kQuorum committee members attested (the cluster-uniform admit count, decoupled from the draw) ⇒ accept.
                         logger
                           .info(
                             s"accept T_count_shard: shardId=${checkpoint.shardId} shardOrd=${checkpointOrd.value} " +
@@ -269,18 +278,17 @@ object ShardCheckpointGl0AcceptanceManager {
             case Right(()) =>
               // Step 2: DETERMINISTIC quorum from the embedded attestation — NO `finalityTriggers`, NO node-local depth/tip. The pre-check
               // already proved every signature is a valid distinct committee member; dedup by peerId defensively (a duplicate signer must
-              // not inflate the count) and compare against `ceil(2·kS/3)` where `kS = |committee(shardId, epoch)|`. Identical on every node.
+              // not inflate the count) and compare against the cluster-uniform admit count `kQuorum` (`nakamoto.committee.kQuorum`)
+              // DIRECTLY. Draw/quorum decouple: the quorum is NO LONGER derived as `ceil(2·|committee|/3)` off the enumerated draw size
+              // (that coupling stranded sub-quorum committees); `kQuorum` is an independent cluster-uniform count, byte-identical on every
+              // node, with `0 < kQuorum <= kDraw` enforced at config load. `kS` (the draw size) is logged for diagnostics only.
               committeeMembership(checkpoint.shardId, checkpoint.epoch).flatMap { committee =>
                 val kS = committee.size
-                // ⌈2·kS/3⌉ via integer ceil-division: (2·kS + 2) / 3. A degenerate empty committee (kS = 0) yields threshold 0; the
-                // pre-check would already have rejected (no signer can be a member of the empty set), so this branch is unreachable for
-                // kS = 0 — but the formula stays safe regardless.
-                val threshold = (2 * kS + 2) / 3
                 val distinctSigners = checkpoint.committeeSignatures.toList.map(_.peerId).toSet.size
-                if (distinctSigners >= threshold)
+                if (distinctSigners >= kQuorum)
                   logger.info(
                     s"verifyEmbedded accept quorum: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} " +
-                      s"distinctSigners=$distinctSigners threshold=$threshold kS=$kS"
+                      s"distinctSigners=$distinctSigners kQuorum=$kQuorum kS=$kS"
                   ) >>
                     ShardMetrics
                       .incCheckpointAccepted[F](checkpoint.shardId, ShardMetrics.Path.TCount)
@@ -291,7 +299,7 @@ object ShardCheckpointGl0AcceptanceManager {
                   // recomputed per-MG roots against the committee-signed `perMetagraphMptRoots` — both node-agnostic.
                   logger.info(
                     s"verifyEmbedded sub-quorum → re-exec: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} " +
-                      s"distinctSigners=$distinctSigners threshold=$threshold kS=$kS"
+                      s"distinctSigners=$distinctSigners kQuorum=$kQuorum kS=$kS"
                   ) >>
                     ShardMetrics.incCommitteePartition[F](checkpoint.shardId) >>
                     reExecPath(checkpoint)

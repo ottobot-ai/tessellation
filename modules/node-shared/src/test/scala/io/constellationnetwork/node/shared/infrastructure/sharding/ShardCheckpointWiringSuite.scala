@@ -48,13 +48,13 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   private val otherPeerId: PeerId = PeerId(Hex("cd" * 64))
   private val validators: Set[PeerId] = Set(selfPeerId, otherPeerId)
 
-  /** Build a [[ShardingConfig]] with the supplied `numShards`. Other fields use representative defaults — only `numShards`,
-    * `committeeKTarget`, and `finality.k1Shard` are consulted by the wiring helper.
+  /** Build a [[ShardingConfig]] with the supplied `numShards`. Other fields use representative defaults — only `numShards` and
+    * `finality.k1Shard` are consulted by the wiring helper. The committee draw/quorum (`kDraw`/`kQuorum`) are now separate params, not on
+    * `ShardingConfig` (the test passes them directly to [[ShardCheckpointWiring.acceptanceDeps]]).
     */
   private def mkShardingConfig(numShards: Int): ShardingConfig =
     ShardingConfig(
       numShards = numShards,
-      committeeKTarget = 4,
       finality = ShardFinalityConfig(k1Shard = 8L),
       checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100, binaryBufferCap = 4096),
       observability = ShardObservabilityConfig(tPartitionHardMs = 600000L),
@@ -70,6 +70,8 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[Option[ShardCheckpointWiring.AcceptanceDeps[IO]]] =
     ShardCheckpointWiring.acceptanceDeps[IO](
       cfg = mkShardingConfig(numShards),
+      kDraw = 4,
+      kQuorum = 3,
       selfPeerId = selfPeerId,
       kesRegistry = KesRegistry.empty[IO],
       vrfRegistry = VrfRegistry.empty[IO],
@@ -95,7 +97,6 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
         val expectedShardIds = (0 until 4).map(ShardId.unsafeApply).toSet
         expect.all(
           deps.shardingConfig.numShards == 4,
-          deps.shardingConfig.committeeKTarget == 4,
           // acceptanceManager + shardAssignment are non-null references (constructed)
           deps.acceptanceManager != null,
           deps.shardAssignment != null,
@@ -108,7 +109,7 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
 
   test("buildRegistry: one entry per shard with the matching ShardId stamped on store + tracker + triggers") { res =>
     implicit val (h, sp) = res
-    ShardCheckpointWiring.buildRegistry[IO](mkShardingConfig(numShards = 3), selfPeerId).map { registry =>
+    ShardCheckpointWiring.buildRegistry[IO](mkShardingConfig(numShards = 3), kQuorum = 3, selfPeerId).map { registry =>
       val perShardIdConsistent = registry.toList.forall {
         case (sid, entry) =>
           entry.chainStore.shardId == sid &&
@@ -130,7 +131,7 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   private val vkOther: Array[Byte] = Array.fill[Byte](32)(0x22.toByte)
   private val vrfReg: VrfRegistry[IO] = VrfRegistry.make[IO](Map(selfPeerId -> vkSelf, otherPeerId -> vkOther))
 
-  private def committee(shardId: Int, epoch: Long, kTarget: Int, reg: VrfRegistry[IO] = vrfReg)(
+  private def committee(shardId: Int, epoch: Long, kDraw: Int, reg: VrfRegistry[IO] = vrfReg)(
     implicit h: Hasher[IO]
   ): IO[Set[PeerId]] =
     ShardCheckpointWiring.committeeFor[IO](
@@ -139,7 +140,7 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
       IO.pure(validators),
       reg,
       etaForEpoch,
-      kTarget
+      kDraw
     )
 
   test("committeeFor: result is always a SUBSET of the active validator set") { res =>
@@ -158,13 +159,13 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
     implicit val (h, _sp) = res
     // Registry missing `otherPeerId` ⇒ it can never be a committee member regardless of kTarget.
     val regSelfOnly = VrfRegistry.make[IO](Map(selfPeerId -> vkSelf))
-    committee(0, 7L, kTarget = 4, reg = regSelfOnly).map(c => expect(!c.contains(otherPeerId)))
+    committee(0, 7L, kDraw = 4, reg = regSelfOnly).map(c => expect(!c.contains(otherPeerId)))
   }
 
-  test("committeeFor: kTarget >= N saturates threshold to 1 ⇒ all registered operators are members") { res =>
+  test("committeeFor: kDraw >= N saturates threshold to 1 ⇒ all registered operators are members") { res =>
     implicit val (h, _sp) = res
-    // threshold = min(kTarget/N, 1); kTarget=8, N=2 ⇒ kTarget·σ = 8·(1/2) = 4 ≥ 1 ⇒ everyone in.
-    committee(0, 7L, kTarget = 8).map(c => expect(c == validators))
+    // threshold = min(kDraw/N, 1); kDraw=8, N=2 ⇒ kDraw·σ = 8·(1/2) = 4 ≥ 1 ⇒ everyone in.
+    committee(0, 7L, kDraw = 8).map(c => expect(c == validators))
   }
 
   test("committeeFor: empty active set ⇒ empty committee") { res =>
@@ -176,7 +177,7 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
         IO.pure(Set.empty[PeerId]),
         vrfReg,
         etaForEpoch,
-        kTarget = 4
+        kDraw = 4
       )
       .map(c => expect(c.isEmpty))
   }

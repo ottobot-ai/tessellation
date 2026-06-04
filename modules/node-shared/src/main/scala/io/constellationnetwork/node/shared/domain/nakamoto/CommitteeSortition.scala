@@ -19,8 +19,15 @@ import io.circe.generic.semiauto.deriveEncoder
 /** Per-metagraph committee sortition (Algorand-style VRF-threshold).
   *
   * Each operator key independently checks whether its VRF output for the canonical message `Hasher.hash(CommitteeVrfInput("committee", eta,
-  * metagraphAddress, parentHash))` falls below the stake-weighted threshold `K_target · σ_i`. Operators whose VRF output is below the
+  * metagraphAddress, parentHash))` falls below the stake-weighted threshold `K_draw · σ_i`. Operators whose VRF output is below the
   * threshold are committee members; non-committee operators ignore the metagraph snapshot.
+  *
+  * '''Draw/quorum decouple.''' `K_draw` is the committee DRAW target — it sizes the elected committee (`E[|committee|] ≈ K_draw · σ · N`).
+  * It is deliberately distinct from the admit-quorum the gate waits for (`MetagraphAttestationAggregator.thresholdReached`'s
+  * `requiredQuorum` / the shard `kQuorum`). Coupling the two (expected-committee == admit-quorum) made ~36% of binaries draw a committee
+  * SMALLER than the quorum they could never reach → committee-gate timeout → metagraph-admission lag. Keeping `K_draw` large (≥
+  * ~1.5·quorum, or `= N` so `K_draw · σ = 1` saturates and the committee is everyone) restores `P(|committee| ≥ quorum) ≈ 1`. This file
+  * owns ONLY the draw — the quorum lives in the aggregator / shard acceptance manager.
   *
   * See `docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md` for the design rationale, threat model, and Chernoff honest-majority bound. This file
   * is Slice S1 plus the S3-prep refactor to `parentHash` keying.
@@ -45,7 +52,7 @@ import io.circe.generic.semiauto.deriveEncoder
 trait CommitteeSortition[F[_]] {
 
   /** Check whether the holder of `vrfSk` is in the committee for `(metagraphAddress, parentHash)` given their `sigmaOperatorKey` stake
-    * share and the target committee size `kTarget`.
+    * share and the committee DRAW target `kDraw`.
     *
     * Returns the VRF proof + output on success (caller signs it with their KES key and gossips it as their committee-attestation
     * contribution). Returns `None` if the operator key is not in the committee for this `(eta, metagraphAddress, parentHash)`.
@@ -56,11 +63,11 @@ trait CommitteeSortition[F[_]] {
     metagraphAddress: Address,
     parentHash: Hash,
     sigmaOperatorKey: Ratio,
-    kTarget: Int
+    kDraw: Int
   ): F[Option[(Array[Byte], Array[Byte])]]
 
   /** Verifier counterpart. Given a published VRF proof from a claimed committee member, confirms (a) the proof verifies under `vrfVk` for
-    * the canonical message and (b) the proof's output falls below `K · σ`. Both must hold; otherwise reject.
+    * the canonical message and (b) the proof's output falls below `K_draw · σ`. Both must hold; otherwise reject.
     */
   def verifyMembership(
     vrfVk: Array[Byte],
@@ -68,7 +75,7 @@ trait CommitteeSortition[F[_]] {
     metagraphAddress: Address,
     parentHash: Hash,
     sigmaOperatorKey: Ratio,
-    kTarget: Int,
+    kDraw: Int,
     proof: Array[Byte]
   ): F[Boolean]
 
@@ -81,7 +88,7 @@ trait CommitteeSortition[F[_]] {
     metagraphAddress: Address,
     parentHash: Hash,
     sigmaOperatorKey: Ratio,
-    kTarget: Int,
+    kDraw: Int,
     proof: Array[Byte]
   ): F[CommitteeSortition.VerifyOutcome]
 }
@@ -132,13 +139,15 @@ object CommitteeSortition {
     Hasher[F].hash(input).map(_.getBytes)
   }
 
-  /** Committee threshold: `min(K · σ, 1)`. Saturates at one — an operator whose `K · σ` ≥ 1 is always in the committee. Per the design doc
-    * §3 this is fine for v1 since the sortition unit is per-operator-key (an operator with 40% total stake splits it across multiple keys
-    * to restore the sampling property at the cluster's K).
+  /** Committee threshold: `min(K_draw · σ, 1)`. Saturates at one — an operator whose `K_draw · σ` ≥ 1 is always in the committee (when
+    * `kDraw = N` and σ = 1/N this is `= 1` exactly, so the committee is everyone). `kDraw` is the DRAW target, decoupled from the admit
+    * quorum (see the class scaladoc's "draw/quorum decouple"). Per the design doc §3 this is fine for v1 since the sortition unit is
+    * per-operator-key (an operator with 40% total stake splits it across multiple keys to restore the sampling property at the cluster's
+    * K_draw).
     */
-  def threshold(kTarget: Int, sigmaOperatorKey: Ratio): Ratio = {
-    require(kTarget > 0, s"K_target must be positive, got $kTarget")
-    val raw = Ratio(kTarget) * sigmaOperatorKey
+  def threshold(kDraw: Int, sigmaOperatorKey: Ratio): Ratio = {
+    require(kDraw > 0, s"K_draw must be positive, got $kDraw")
+    val raw = Ratio(kDraw) * sigmaOperatorKey
     if (raw >= Ratio.One) Ratio.One else raw
   }
 
@@ -150,13 +159,14 @@ object CommitteeSortition {
   // it cannot ENUMERATE the whole committee (a VRF output is not computable from the VK alone).
   //
   // The gl0 shard-checkpoint adopt path needs a different shape: `committeeFor(shardId, epoch)` must DETERMINISTICALLY
-  // ENUMERATE the committee SET on every node (it feeds both the per-signer set-membership pre-check AND the `kS = |committee|`
-  // quorum denominator in `ShardCheckpointGl0AcceptanceManager.verifyEmbedded`). Enumeration from public material only is the
-  // hard requirement (no node holds peers' VRF SKs). So the shard draw is a DETERMINISTIC PSEUDO-RANDOM draw keyed on each
-  // operator's registered VRF *VK* (a public PRF), NOT a per-operator VRF evaluation: `H(tag, eta, shardId, epoch, vrfVk)`
-  // interpreted as a Ratio in `[0,1)` (the SAME interpretation `EligibilityChecker.vrfOutputAsRatio` uses) compared against
-  // the SAME `threshold(kTarget, σ)`. Reusing the registered VK as the per-operator seed makes the draw (a) enumerable from
-  // the cluster-wide-identical VRF-VK registry + the cluster-wide-identical eta, and (b) per-operator (different VKs ⇒
+  // ENUMERATE the committee SET on every node (it feeds the per-signer set-membership pre-check; the admit quorum in
+  // `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` is the decoupled `kQuorum`, NOT `|committee|`). Enumeration from
+  // public material only is the hard requirement (no node holds peers' VRF SKs). So the shard draw is a DETERMINISTIC
+  // PSEUDO-RANDOM draw keyed on each operator's registered VRF *VK* (a public PRF), NOT a per-operator VRF evaluation:
+  // `H(tag, eta, shardId, epoch, vrfVk)` interpreted as a Ratio in `[0,1)` (the SAME interpretation
+  // `EligibilityChecker.vrfOutputAsRatio` uses) compared against the SAME `threshold(kDraw, σ)`. Reusing the registered VK
+  // as the per-operator seed makes the draw (a) enumerable from the cluster-wide-identical VRF-VK registry + the
+  // cluster-wide-identical eta, and (b) per-operator (different VKs ⇒
   // different draws) and per-shard (shardId is in the preimage). v1 trade-off (acceptable per design §10 — honest-testnet,
   // slashing is the v2 backstop): the committee for a future `(shard, epoch)` is PREDICTABLE because VKs are public; the
   // Algorand player-replaceability property is a v2 hardening. It is still UNFORGEABLE in the sense that matters for v1: a
@@ -201,11 +211,11 @@ object CommitteeSortition {
     Hasher[F].hash(input).map(h => Ratio(BigInt(1, h.getBytes), BigInt(2).pow(8 * h.getBytes.length)))
   }
 
-  /** Deterministic shard-committee membership predicate for the holder of `vrfVk`: `shardDrawValue(...) < threshold(kTarget, σ)`.
-    * Enumerated over all active operators by
-    * [[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.committeeFor]] to materialize the committee SET —
-    * identical on every node because every input is cluster-wide-identical (registry VK + eta + HOCON kTarget + uniform σ). `kTarget · σ ≥
-    * 1` saturates to "always a member" via [[threshold]].
+  /** Deterministic shard-committee membership predicate for the holder of `vrfVk`: `shardDrawValue(...) < threshold(kDraw, σ)`. Enumerated
+    * over all active operators by [[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.committeeFor]] to
+    * materialize the committee SET — identical on every node because every input is cluster-wide-identical (registry VK + eta + HOCON kDraw
+    * + uniform σ). `kDraw · σ ≥ 1` saturates to "always a member" via [[threshold]]. `kDraw` is the DRAW target; the shard ADMIT quorum
+    * (`kQuorum`) is decoupled and lives in `ShardCheckpointGl0AcceptanceManager` / `ShardFinalityTriggers`.
     */
   def isInShardCommittee[F[_]: Sync: Hasher](
     vrfVk: Array[Byte],
@@ -213,9 +223,9 @@ object CommitteeSortition {
     shardId: ShardId,
     epoch: EtaPeriod,
     sigmaOperatorKey: Ratio,
-    kTarget: Int
+    kDraw: Int
   ): F[Boolean] =
-    shardDrawValue[F](eta, shardId, epoch, vrfVk).map(_ < threshold(kTarget, sigmaOperatorKey))
+    shardDrawValue[F](eta, shardId, epoch, vrfVk).map(_ < threshold(kDraw, sigmaOperatorKey))
 
   def make[F[_]: Sync: Hasher]: CommitteeSortition[F] = new CommitteeSortition[F] {
 
@@ -225,7 +235,7 @@ object CommitteeSortition {
       metagraphAddress: Address,
       parentHash: Hash,
       sigmaOperatorKey: Ratio,
-      kTarget: Int
+      kDraw: Int
     ): F[Option[(Array[Byte], Array[Byte])]] =
       message[F](eta, metagraphAddress, parentHash).map { msg =>
         val proof = vrf.vrfProof(vrfSk, msg)
@@ -233,7 +243,7 @@ object CommitteeSortition {
           case None => None
           case Some(vrfOutput) =>
             val testValue = EligibilityChecker.vrfOutputAsRatio(vrfOutput)
-            val thresh = threshold(kTarget, sigmaOperatorKey)
+            val thresh = threshold(kDraw, sigmaOperatorKey)
             if (testValue < thresh) Some((proof, vrfOutput)) else None
         }
       }
@@ -244,10 +254,10 @@ object CommitteeSortition {
       metagraphAddress: Address,
       parentHash: Hash,
       sigmaOperatorKey: Ratio,
-      kTarget: Int,
+      kDraw: Int,
       proof: Array[Byte]
     ): F[Boolean] =
-      verifyMembershipDetailed(vrfVk, eta, metagraphAddress, parentHash, sigmaOperatorKey, kTarget, proof).map {
+      verifyMembershipDetailed(vrfVk, eta, metagraphAddress, parentHash, sigmaOperatorKey, kDraw, proof).map {
         case VerifyOutcome.Valid => true
         case _                   => false
       }
@@ -258,7 +268,7 @@ object CommitteeSortition {
       metagraphAddress: Address,
       parentHash: Hash,
       sigmaOperatorKey: Ratio,
-      kTarget: Int,
+      kDraw: Int,
       proof: Array[Byte]
     ): F[VerifyOutcome] =
       message[F](eta, metagraphAddress, parentHash).map { msg =>
@@ -268,7 +278,7 @@ object CommitteeSortition {
             case None => VerifyOutcome.InvalidProof
             case Some(vrfOutput) =>
               val testValue = EligibilityChecker.vrfOutputAsRatio(vrfOutput)
-              val thresh = threshold(kTarget, sigmaOperatorKey)
+              val thresh = threshold(kDraw, sigmaOperatorKey)
               if (testValue < thresh) VerifyOutcome.Valid
               else VerifyOutcome.BelowThreshold(testValue, thresh)
           }

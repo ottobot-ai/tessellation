@@ -561,7 +561,6 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
     val shardingCfg: ShardingConfig =
       ShardingConfig(
         numShards = 4,
-        committeeKTarget = 4,
         finality = ShardFinalityConfig(k1Shard = 8L),
         checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100, binaryBufferCap = 4096),
         observability = ShardObservabilityConfig(tPartitionHardMs = 600000L),
@@ -578,6 +577,8 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       followerDeps <- io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
         .acceptanceDeps[IO](
           cfg = shardingCfg,
+          kDraw = 4,
+          kQuorum = 3,
           selfPeerId = selfId,
           kesRegistry = io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO],
           vrfRegistry = io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[IO],

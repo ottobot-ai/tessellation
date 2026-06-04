@@ -202,14 +202,15 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
       store <- ShardChainStore.make[IO](shardZero)
       _ <- seedChain(store, 10)
       tracker <- ShardTipTracker.make[IO](shardZero, selfId)
-      // kTarget huge + zero attestations ⇒ T_count never qualifies; k1Shard=3 vs bestOrd=9 ⇒ T_depth1 qualifies low ords.
-      triggers <- ShardFinalityTriggers.make[IO](shardZero, kTarget = 1000, k1Shard = 3L, store, tracker)
+      // kQuorum huge + zero attestations ⇒ T_count never qualifies; k1Shard=3 vs bestOrd=9 ⇒ T_depth1 qualifies low ords.
+      triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1000, k1Shard = 3L, store, tracker)
       _ <- triggers.advance
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
         finalityTriggers = sid => IO.pure(if (sid === shardZero) triggers.some else None),
         chainStore = _ => IO.pure(none[ShardChainStore[IO]]),
         committeeMembership = (_, _) => IO.pure(committee),
-        kTarget = 1000,
+        kDraw = 1000,
+        kQuorum = 1000,
         selfPeerId = selfId,
         kesRegistry = io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO],
         reExecuteDerivation = reExec

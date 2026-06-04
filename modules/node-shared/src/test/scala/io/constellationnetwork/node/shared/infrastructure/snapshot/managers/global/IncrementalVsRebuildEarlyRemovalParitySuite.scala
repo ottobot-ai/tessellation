@@ -32,10 +32,10 @@ import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
 import weaver.MutableIOSuite
 
-/** Consensus-correctness gate for the ml0 adopt path: the incrementally-maintained MPT (`syncFromStateChanges`, the producer's signed
-  * root) MUST be byte-identical to the from-active-records rebuild (`syncFromGlobalSnapshotInfo`, the ml0/bootstrap/recovery path) for the
-  * SAME logical state — including state reached via EARLY removal of an indexed record (an allow-spend consumed by a spend-tx, or a
-  * token-lock consumed by a token-unlock, BEFORE its future expiry/unlock epoch).
+/** Consensus-correctness gate for the ml0 adopt path: the incrementally-maintained MPT (`syncFromStateChanges`, the producer's signed root)
+  * MUST be byte-identical to the from-active-records rebuild (`syncFromGlobalSnapshotInfo`, the ml0/bootstrap/recovery path) for the SAME
+  * logical state — including state reached via EARLY removal of an indexed record (an allow-spend consumed by a spend-tx, or a token-lock
+  * consumed by a token-unlock, BEFORE its future expiry/unlock epoch).
   *
   * If the incremental writer leaves an orphan index entry (an expiry-bucket entry at the record's future epoch, or an active-address-index
   * entry) that the rebuild — which derives every index partition purely from the active records — never has, the two roots diverge. ml0's
@@ -205,75 +205,76 @@ object IncrementalVsRebuildEarlyRemovalParitySuite extends MutableIOSuite {
   // Token-lock EARLY removal (consumed by token-unlock before its future unlock)
   // ===========================================================================
 
-  test("token-lock unlocked early by a token-unlock: incremental MPT root === from-GSI rebuild root (no orphan future-epoch bucket)") { res =>
-    implicit val (h, sp, js) = res
-    val ord2 = SnapshotOrdinal(NonNegLong(2L))
-    val futureUnlock = EpochProgress(NonNegLong(500L))
-    val currentEpoch = EpochProgress(NonNegLong(300L))
-    val prevEpoch = EpochProgress(NonNegLong(299L))
+  test("token-lock unlocked early by a token-unlock: incremental MPT root === from-GSI rebuild root (no orphan future-epoch bucket)") {
+    res =>
+      implicit val (h, sp, js) = res
+      val ord2 = SnapshotOrdinal(NonNegLong(2L))
+      val futureUnlock = EpochProgress(NonNegLong(500L))
+      val currentEpoch = EpochProgress(NonNegLong(300L))
+      val prevEpoch = EpochProgress(NonNegLong(299L))
 
-    for {
-      kpSrc <- KeyPairGenerator.makeKeyPair[IO]
-      src = kpSrc.getPublic.toAddress
+      for {
+        kpSrc <- KeyPairGenerator.makeKeyPair[IO]
+        src = kpSrc.getPublic.toAddress
 
-      tl = mkTokenLock(src, futureUnlock.some, "early")
-      tlHashed <- tl.toHashed
+        tl = mkTokenLock(src, futureUnlock.some, "early")
+        tlHashed <- tl.toHashed
 
-      lastActive = SortedMap(src -> SortedSet(tl))
-      priorInfo = GlobalSnapshotInfo.empty.copy(
-        balances = SortedMap(src -> Balance(NonNegLong(1000L))),
-        activeTokenLocks = lastActive.some
-      )
+        lastActive = SortedMap(src -> SortedSet(tl))
+        priorInfo = GlobalSnapshotInfo.empty.copy(
+          balances = SortedMap(src -> Balance(NonNegLong(1000L))),
+          activeTokenLocks = lastActive.some
+        )
 
-      // --- PRODUCER PATH ---
-      prodStore <- freshStore
-      _ <- seedFromInfo(prodStore, priorInfo)
-      tlMgr = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(prodStore))
+        // --- PRODUCER PATH ---
+        prodStore <- freshStore
+        _ <- seedFromInfo(prodStore, priorInfo)
+        tlMgr = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(prodStore))
 
-      // A token-unlock referencing `tl` — removes it from active EARLY (epoch 300 < 500).
-      tokenUnlock = TokenUnlock(
-        tokenLockRef = tlHashed.hash,
-        amount = tl.amount,
-        currencyId = tl.currencyId,
-        source = src
-      )
+        // A token-unlock referencing `tl` — removes it from active EARLY (epoch 300 < 500).
+        tokenUnlock = TokenUnlock(
+          tokenLockRef = tlHashed.hash,
+          amount = tl.amount,
+          currencyId = tl.currencyId,
+          source = src
+        )
 
-      tlResult <- tlMgr.acceptTokenLocks(
-        currentEpoch,
-        prevEpoch,
-        SortedMap.empty[Address, SortedSet[Signed[TokenLock]]],
-        lastActive,
-        Map(src -> List(tokenUnlock))
-      )
+        tlResult <- tlMgr.acceptTokenLocks(
+          currentEpoch,
+          prevEpoch,
+          SortedMap.empty[Address, SortedSet[Signed[TokenLock]]],
+          lastActive,
+          Map(src -> List(tokenUnlock))
+        )
 
-      postActiveTl: SortedMap[Address, SortedSet[Signed[TokenLock]]] =
-        tlResult.fullState.filter(_._2.nonEmpty)
+        postActiveTl: SortedMap[Address, SortedSet[Signed[TokenLock]]] =
+          tlResult.fullState.filter(_._2.nonEmpty)
 
-      acc = StateChangesAccumulator(
-        activeTokenLocks = tlResult.deltas,
-        removedTokenLockKeys = tlResult.removedKeys,
-        tokenLockExpiryIndex = tlResult.expiryIndexDelta
-      )
-      _ <- prodStore.syncFromStateChanges(acc, ord2)
-      (incRoot, incBytes) <- rootAndBytes(prodStore, ord2)
-      orphanBucket <- prodStore.getExpiryBucket[TokenLockExpiryKey](SystemNamespaceLabel.ExpiryIndexTokenLocks, futureUnlock)
+        acc = StateChangesAccumulator(
+          activeTokenLocks = tlResult.deltas,
+          removedTokenLockKeys = tlResult.removedKeys,
+          tokenLockExpiryIndex = tlResult.expiryIndexDelta
+        )
+        _ <- prodStore.syncFromStateChanges(acc, ord2)
+        (incRoot, incBytes) <- rootAndBytes(prodStore, ord2)
+        orphanBucket <- prodStore.getExpiryBucket[TokenLockExpiryKey](SystemNamespaceLabel.ExpiryIndexTokenLocks, futureUnlock)
 
-      // --- REBUILD PATH ---
-      postInfo = priorInfo.copy(activeTokenLocks = postActiveTl.some)
-      rebuildStore <- freshStore
-      _ <- rebuildStore.syncFromGlobalSnapshotInfo(postInfo, ord2)
-      (rebuildRoot, rebuildBytes) <- rootAndBytes(rebuildStore, ord2)
-    } yield {
-      val onlyInInc = incBytes.keySet -- rebuildBytes.keySet
-      val onlyInRebuild = rebuildBytes.keySet -- incBytes.keySet
-      expect.all(
-        clue(incRoot) === clue(rebuildRoot),
-        clue(incBytes) == clue(rebuildBytes),
-        clue(onlyInInc).isEmpty,
-        clue(onlyInRebuild).isEmpty,
-        clue(orphanBucket).isEmpty
-      )
-    }
+        // --- REBUILD PATH ---
+        postInfo = priorInfo.copy(activeTokenLocks = postActiveTl.some)
+        rebuildStore <- freshStore
+        _ <- rebuildStore.syncFromGlobalSnapshotInfo(postInfo, ord2)
+        (rebuildRoot, rebuildBytes) <- rootAndBytes(rebuildStore, ord2)
+      } yield {
+        val onlyInInc = incBytes.keySet -- rebuildBytes.keySet
+        val onlyInRebuild = rebuildBytes.keySet -- incBytes.keySet
+        expect.all(
+          clue(incRoot) === clue(rebuildRoot),
+          clue(incBytes) == clue(rebuildBytes),
+          clue(onlyInInc).isEmpty,
+          clue(onlyInRebuild).isEmpty,
+          clue(orphanBucket).isEmpty
+        )
+      }
   }
 
   // ===========================================================================

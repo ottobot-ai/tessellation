@@ -51,14 +51,16 @@ trait MetagraphAttestationAggregator[F[_]] {
     binaryHash: Hash
   ): F[Int]
 
-  /** Check whether the binary has reached `⌈2 K_target / 3⌉` attestations. Threshold matches the `TipTracker.FinalityThreshold` semantics
-    * so committee finality parallels chain finality. `kTarget = 0` is rejected (would make the threshold meaningless).
+  /** Check whether the binary has reached `requiredQuorum` DISTINCT committee attestations. `requiredQuorum` is the admit-quorum count
+    * DIRECTLY (the cluster-uniform `nakamoto.committee.kQuorum`), decoupled from the committee DRAW target (`kDraw`) — see the
+    * draw/quorum-decouple note on [[CommitteeSortition]]. NOT a fraction of a target: the gate passes the exact count it waits for.
+    * `requiredQuorum = 0` is rejected (would admit on zero attestations).
     */
   def thresholdReached(
     metagraphAddress: Address,
     parentHash: Hash,
     binaryHash: Hash,
-    kTarget: Int
+    requiredQuorum: Int
   ): F[Boolean]
 
   /** Drop tally state for `metagraphAddress` entries whose parent hash is in `parents`. Called when those parents have moved past the live
@@ -79,6 +81,10 @@ object MetagraphAttestationAggregator {
 
   /** Compute the count required to reach `FinalityThreshold` of `kTarget`. `ceil(threshold · K)` computed in exact-Ratio so we stay
     * byte-identical across observers.
+    *
+    * '''Standalone helper after the draw/quorum decouple.''' [[thresholdReached]] no longer routes through this — the gate now passes the
+    * cluster-uniform `nakamoto.committee.kQuorum` count DIRECTLY. This 2/3-of-K conversion remains exported for the parallel finality
+    * semantics + its own tests; production no longer derives the metagraph admit quorum from it.
     */
   def requiredCount(kTarget: Int): Int = {
     require(kTarget > 0, s"kTarget must be positive, got $kTarget")
@@ -131,10 +137,10 @@ object MetagraphAttestationAggregator {
           metagraphAddress: Address,
           parentHash: Hash,
           binaryHash: Hash,
-          kTarget: Int
+          requiredQuorum: Int
         ): F[Boolean] = {
-          val required = requiredCount(kTarget)
-          countFor(metagraphAddress, parentHash, binaryHash).map(_ >= required)
+          require(requiredQuorum > 0, s"requiredQuorum must be positive, got $requiredQuorum")
+          countFor(metagraphAddress, parentHash, binaryHash).map(_ >= requiredQuorum)
         }
 
         def pruneParents(metagraphAddress: Address, parents: Set[Hash]): F[Unit] =

@@ -46,17 +46,19 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * locally" ⇒ reject, exactly as the manager's scaladoc specifies.
   *
   * '''committeeMembership(shardId, epoch) — real VRF-VK sortition.''' The acceptance manager's pre-check confirms each checkpoint signer is
-  * in `committeeMembership(shardId, epoch)`, and `verifyEmbedded` uses `kS = |committeeMembership(shardId, epoch)|` as the quorum
-  * denominator. [[committeeFor]] materializes that committee as a DETERMINISTIC VRF-VK-sortitioned SUBSET of the active operator set (size
-  * `≈ committeeKTarget`, NOT the full `N`) — so only a metagraph's shard committee re-executes it (genuine execution segmentation). The
-  * draw is a deterministic pseudo-random sortition keyed on each operator's registered VRF *VK* + the epoch eta + the shardId (see
-  * [[committeeFor]] scaladoc for the determinism argument and `CommitteeSortition.isInShardCommittee` for why a VK-seeded PRF, not a true
-  * per-operator VRF eval, is the only enumerable-by-a-non-member option). The structural VRF-proof check + Ed25519 + KES product sig per
-  * signer still authenticate "did this specific peer sign"; the sortitioned set gates "is this peer even in shard S's committee". v1
-  * trade-off (acceptable per design §10 — honest-testnet, slashing is the v2 backstop): the committee is PREDICTABLE because VKs are
-  * public; Algorand player-replaceability is a v2 hardening (would require carrying a true per-operator VRF proof on each
-  * `CommitteeMemberSignature` and verifying it with `CommitteeSortition.verifyMembership`, plus the producer/emitter signing a
-  * committee-VRF proof rather than the leader-VRF proof they sign today).
+  * in `committeeMembership(shardId, epoch)`; the admit quorum `verifyEmbedded` requires is the DECOUPLED cluster-uniform `kQuorum`
+  * (`nakamoto.committee.kQuorum`), NOT `|committeeMembership(shardId, epoch)|` (the enumerated draw size is logged for diagnostics only).
+  * [[committeeFor]] materializes that committee as a DETERMINISTIC VRF-VK-sortitioned SUBSET of the active operator set sized by the DRAW
+  * target `kDraw` (size `≈ kDraw`, NOT the full `N` — though the testnet default `kDraw = N` saturates the threshold so it IS everyone) —
+  * so only a metagraph's shard committee re-executes it (genuine execution segmentation). The draw is a deterministic pseudo-random
+  * sortition keyed on each operator's registered VRF *VK* + the epoch eta + the shardId (see [[committeeFor]] scaladoc for the determinism
+  * argument and `CommitteeSortition.isInShardCommittee` for why a VK-seeded PRF, not a true per-operator VRF eval, is the only
+  * enumerable-by-a-non-member option). The structural VRF-proof check + Ed25519 + KES product sig per signer still authenticate "did this
+  * specific peer sign"; the sortitioned set gates "is this peer even in shard S's committee". v1 trade-off (acceptable per design §10 —
+  * honest-testnet, slashing is the v2 backstop): the committee is PREDICTABLE because VKs are public; Algorand player-replaceability is a
+  * v2 hardening (would require carrying a true per-operator VRF proof on each `CommitteeMemberSignature` and verifying it with
+  * `CommitteeSortition.verifyMembership`, plus the producer/emitter signing a committee-VRF proof rather than the leader-VRF proof they
+  * sign today).
   *
   * '''reExecuteDerivation — caller-supplied (S3: real committee re-execution).''' The `T_depth1_shard` degraded path re-runs each MG's
   * derivation and compares the recomputed `mptRoot` byte-for-byte against the committee-signed value. The closure is supplied as a
@@ -157,6 +159,12 @@ object ShardCheckpointWiring {
     *
     * @param cfg
     *   the typed [[ShardingConfig]] from `cfg.nakamoto.sharding`. `numShards <= 1` ⇒ returns `None` (regression bar; nothing constructed).
+    * @param kDraw
+    *   committee DRAW target (cluster-uniform `cfg.nakamoto.committee.kDraw`). Threaded into [[committeeFor]]'s `isInShardCommittee` draw —
+    *   sizes the enumerated shard committee (`≈ kDraw`; `= N` saturates ⇒ everyone). Decoupled from the admit quorum.
+    * @param kQuorum
+    *   committee ADMIT quorum (cluster-uniform `cfg.nakamoto.committee.kQuorum`). The distinct-attester count `verifyEmbedded` /
+    *   `ShardFinalityTriggers.tCountShard` require — DIRECTLY (no 2/3 of the draw). Invariant `0 < kQuorum <= kDraw` enforced at load.
     * @param selfPeerId
     *   this gl0 operator's PeerId. Threaded into each per-shard [[ShardTipTracker]] (self-exclusion for `T_count_shard`) and the acceptance
     *   manager (diagnostic logging of which op spotted a deviation).
@@ -187,6 +195,8 @@ object ShardCheckpointWiring {
     */
   def acceptanceDeps[F[_]: Async: Hasher: SecurityProvider: Metrics](
     cfg: ShardingConfig,
+    kDraw: Int,
+    kQuorum: Int,
     selfPeerId: PeerId,
     kesRegistry: KesRegistry[F],
     vrfRegistry: VrfRegistry[F],
@@ -206,24 +216,26 @@ object ShardCheckpointWiring {
         .as(Option.empty[AcceptanceDeps[F]])
     else
       for {
-        registry <- buildRegistry[F](cfg, selfPeerId)
+        registry <- buildRegistry[F](cfg, kQuorum, selfPeerId)
         // EXECUTION-SHARDING — real VRF-VK-sortitioned committee. The ONE closure that defines "who is in shard s's committee
-        // for this epoch", reused by (a) the acceptance manager's per-signer set-membership pre-check + `kS` quorum denominator,
-        // and (b) the produce/attest membership gates. Deterministic on every node — see `committeeFor` scaladoc.
+        // for this epoch", reused by (a) the acceptance manager's per-signer set-membership pre-check, and (b) the produce/attest
+        // membership gates. The DRAW uses `kDraw`; the admit quorum (`kQuorum`) is decoupled (it is the count, not |committee|).
+        // Deterministic on every node — see `committeeFor` scaladoc.
         committeeMembership = (shardId: ShardId, epoch: EtaPeriod) =>
-          committeeFor[F](shardId, epoch, activeValidators, vrfRegistry, etaForEpoch, cfg.committeeKTarget)
+          committeeFor[F](shardId, epoch, activeValidators, vrfRegistry, etaForEpoch, kDraw)
         acceptanceManager <- ShardCheckpointGl0AcceptanceManager.make[F](
           finalityTriggers = (sid: ShardId) => Async[F].pure(registry.get(sid).map(_.finalityTriggers)),
           chainStore = (sid: ShardId) => Async[F].pure(registry.get(sid).map(_.chainStore)),
           committeeMembership = committeeMembership,
-          kTarget = cfg.committeeKTarget,
+          kDraw = kDraw,
+          kQuorum = kQuorum,
           selfPeerId = selfPeerId,
           kesRegistry = kesRegistry,
           reExecuteDerivation = reExec
         )
         shardAssignment = ShardAssignment.make[F](cfg.numShards)
         _ <- logger.info(
-          s"sharding ACTIVE: numShards=${cfg.numShards} committeeKTarget=${cfg.committeeKTarget} " +
+          s"sharding ACTIVE: numShards=${cfg.numShards} kDraw=$kDraw kQuorum=$kQuorum " +
             s"k1Shard=${cfg.finality.k1Shard} — built per-shard registry (${registry.size} shards) + gl0 acceptance manager " +
             s"(real VRF-VK committee sortition)"
         )
@@ -239,6 +251,7 @@ object ShardCheckpointWiring {
     */
   private[sharding] def buildRegistry[F[_]: Async: Hasher: Metrics](
     cfg: ShardingConfig,
+    kQuorum: Int,
     selfPeerId: PeerId
   ): F[Map[ShardId, ShardRegistryEntry[F]]] =
     (0 until cfg.numShards).toList.traverse { idx =>
@@ -248,7 +261,7 @@ object ShardCheckpointWiring {
         tipTracker <- ShardTipTracker.make[F](shardId, selfPeerId)
         triggers <- ShardFinalityTriggers.make[F](
           shardId = shardId,
-          kTarget = cfg.committeeKTarget,
+          kQuorum = kQuorum,
           k1Shard = cfg.finality.k1Shard,
           chainStore = chainStore,
           tipTracker = tipTracker
@@ -264,10 +277,11 @@ object ShardCheckpointWiring {
     *
     * '''Algorithm.''' Enumerate the active operators in a STABLE order (sorted by `PeerId`, so iteration is order-independent); for each
     * operator look up its registered VRF VK in `vrfRegistry` and keep it iff `CommitteeSortition.isInShardCommittee(vrfVk, eta, shardId,
-    * epoch, σ, kTarget)` — i.e. its `H(eta, shardId, epoch, vrfVk)` draw value falls below `threshold(kTarget, σ)`. An operator with NO
+    * epoch, σ, kDraw)` — i.e. its `H(eta, shardId, epoch, vrfVk)` draw value falls below `threshold(kDraw, σ)`. An operator with NO
     * registered VK cannot be sortitioned (no seed) ⇒ excluded. `σ` (per-operator stake share) is the uniform `1/N` rule (`committeeStake`,
-    * `[[project-216-committee-stake-drift-fix]]`), computed here from `N = |activeValidators|` so `threshold = kTarget/N` and the expected
-    * committee size is `≈ kTarget` — the sortitioned committee `K_S`, NOT the full set `N`.
+    * `[[project-216-committee-stake-drift-fix]]`), computed here from `N = |activeValidators|` so `threshold = kDraw/N` and the expected
+    * committee size is `≈ kDraw` — the sortitioned committee `K_S`, NOT the full set `N` (and `kDraw = N` saturates to everyone). The admit
+    * quorum is the SEPARATE `kQuorum`, applied in `verifyEmbedded` / `ShardFinalityTriggers`, NOT this draw.
     *
     * '''Determinism (the #261 split invariant).''' Every input is identical on every gl0 node:
     *   - `activeValidators` — seedlist (minus `metagraph-op`), loaded identically cluster-wide;
@@ -275,7 +289,7 @@ object ShardCheckpointWiring {
     *     on every node (`VrfRegistry`/`L0GenesisLoader.buildVrfRegistry`);
     *   - `eta` — `etaForEpoch(epoch)` resolves the per-period eta from the MPT-committed `HistoricalStakeSnapshot.eta` (`EtaStateManager`),
     *     byte-identical cluster-wide once the boundary is written, keyed on the WIRE-CARRIED `checkpoint.epoch`;
-    *   - `kTarget` — HOCON `nakamoto.sharding.committee-k-target`, the same on every node;
+    *   - `kDraw` — HOCON `nakamoto.committee.k-draw`, the same on every node;
     *   - `σ = 1/N` — derived from the same `activeValidators`. No node-local state (no chain height, no Refs, no wall-clock) enters the
     *     draw, so `committeeFor(shardId, epoch)` resolves to the SAME `Set[PeerId]` on every node — the hard requirement for
     *     `verifyEmbedded` to admit byte-identically.
@@ -289,14 +303,14 @@ object ShardCheckpointWiring {
     activeValidators: F[Set[PeerId]],
     vrfRegistry: VrfRegistry[F],
     etaForEpoch: EtaPeriod => F[Array[Byte]],
-    kTarget: Int
+    kDraw: Int
   ): F[Set[PeerId]] =
     (activeValidators, etaForEpoch(epoch)).tupled.flatMap {
       case (validators, eta) =>
         val n = validators.size
         if (n <= 0) Async[F].pure(Set.empty[PeerId])
         else {
-          val sigma = Ratio(1, n) // uniform per-operator stake share (committeeStake): threshold = kTarget/N ⇒ E[|committee|] ≈ kTarget
+          val sigma = Ratio(1, n) // uniform per-operator stake share (committeeStake): threshold = kDraw/N ⇒ E[|committee|] ≈ kDraw
           // Stable iteration order (sorted by PeerId) so the fold is order-independent; the result is a Set so order is moot anyway.
           validators.toList
             .sortBy(_.value.value)
@@ -305,7 +319,7 @@ object ShardCheckpointWiring {
                 case None => Async[F].pure(Option.empty[PeerId]) // no registered VRF VK ⇒ not sortitionable ⇒ excluded
                 case Some(vrfVk) =>
                   CommitteeSortition
-                    .isInShardCommittee[F](vrfVk, eta, shardId, epoch, sigma, kTarget)
+                    .isInShardCommittee[F](vrfVk, eta, shardId, epoch, sigma, kDraw)
                     .map(if (_) Some(peerId) else None)
               }
             }

@@ -172,7 +172,9 @@ object SlashableEvidenceValidator {
             metagraphAddress = att.metagraphAddress,
             parentHash = att.parentHash,
             sigmaOperatorKey = sigma,
-            kTarget = kTarget,
+            // The committee-membership re-verify uses the DRAW target (`CommitteeSortition.verifyMembership`'s `kDraw`); this validator's
+            // own `kTarget` param IS that draw value (it must match what was in effect when the attestation was produced).
+            kDraw = kTarget,
             proof = att.committeeVrfProof.toBytes
           )
           .map(ok => if (ok) Right(()) else Left(onFail))

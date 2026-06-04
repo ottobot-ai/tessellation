@@ -203,14 +203,15 @@ object ShardMetricsSuite extends MutableIOSuite {
       tip <- store.bestTip.map(_.get)
       tracker <- ShardTipTracker.make[IO](shardZero, selfPeer)
       _ <- tracker.recordAttestation(tip.hash, signerPeer)
-      triggers <- ShardFinalityTriggers.make[IO](shardZero, kTarget = 1, k1Shard = 100L, store, tracker)
+      triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1, k1Shard = 100L, store, tracker)
       _ <- triggers.advance
 
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
         finalityTriggers = _ => IO.pure(Some(triggers)),
         chainStore = _ => IO.pure(None),
         committeeMembership = (_, _) => IO.pure(Set(signerPeer)),
-        kTarget = 1,
+        kDraw = 1,
+        kQuorum = 1,
         selfPeerId = selfPeer,
         kesRegistry = KesRegistry.empty[IO],
         reExecuteDerivation = (_, _, _) => IO.pure(Hash("ff" * 32))
@@ -250,14 +251,15 @@ object ShardMetricsSuite extends MutableIOSuite {
       store <- ShardChainStore.make[IO](shardZero)
       _ <- seedChain(store, 10)
       tracker <- ShardTipTracker.make[IO](shardZero, selfPeer)
-      triggers <- ShardFinalityTriggers.make[IO](shardZero, kTarget = 1000, k1Shard = 3L, store, tracker)
+      triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1000, k1Shard = 3L, store, tracker)
       _ <- triggers.advance
 
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
         finalityTriggers = _ => IO.pure(Some(triggers)),
         chainStore = _ => IO.pure(None),
         committeeMembership = (_, _) => IO.pure(Set(signerPeer)),
-        kTarget = 1000,
+        kDraw = 1000,
+        kQuorum = 1000,
         selfPeerId = selfPeer,
         kesRegistry = KesRegistry.empty[IO],
         reExecuteDerivation = (_, _, _) => IO.pure(mptRoot)
@@ -298,14 +300,15 @@ object ShardMetricsSuite extends MutableIOSuite {
       store <- ShardChainStore.make[IO](shardZero)
       _ <- seedChain(store, 5)
       tracker <- ShardTipTracker.make[IO](shardZero, selfPeer)
-      triggers <- ShardFinalityTriggers.make[IO](shardZero, kTarget = 1, k1Shard = 100L, store, tracker)
+      triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1, k1Shard = 100L, store, tracker)
       _ <- triggers.advance
 
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
         finalityTriggers = _ => IO.pure(Some(triggers)),
         chainStore = _ => IO.pure(None),
         committeeMembership = (_, _) => IO.pure(Set.empty[PeerId]),
-        kTarget = 1,
+        kDraw = 1,
+        kQuorum = 1,
         selfPeerId = selfPeer,
         kesRegistry = KesRegistry.empty[IO],
         reExecuteDerivation = (_, _, _) => IO.pure(Hash("0" * 64))
@@ -344,14 +347,15 @@ object ShardMetricsSuite extends MutableIOSuite {
       store <- ShardChainStore.make[IO](shardZero)
       _ <- seedChain(store, 10)
       tracker <- ShardTipTracker.make[IO](shardZero, selfPeer)
-      triggers <- ShardFinalityTriggers.make[IO](shardZero, kTarget = 1000, k1Shard = 3L, store, tracker)
+      triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1000, k1Shard = 3L, store, tracker)
       _ <- triggers.advance
 
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
         finalityTriggers = _ => IO.pure(Some(triggers)),
         chainStore = _ => IO.pure(None),
         committeeMembership = (_, _) => IO.pure(Set(signerPeer)),
-        kTarget = 1000,
+        kDraw = 1000,
+        kQuorum = 1000,
         selfPeerId = selfPeer,
         kesRegistry = KesRegistry.empty[IO],
         reExecuteDerivation = (_, _, _) => IO.pure(Hash("ff" * 32))

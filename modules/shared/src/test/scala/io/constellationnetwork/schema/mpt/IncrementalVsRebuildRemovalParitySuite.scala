@@ -87,26 +87,41 @@ object IncrementalVsRebuildRemovalParitySuite extends MutableIOSuite {
 
   private def mkTokenLock(source: Address, unlockAt: Option[EpochProgress], label: String): Signed[TokenLock] =
     Signed(
-      TokenLock(source, TokenLockAmount(PosLong(200L)), TokenLockFee(NonNegLong(0L)),
-        TokenLockReference(TokenLockOrdinal(NonNegLong(0L)), testHash(s"tl-parent-$label")), None, unlockAt, None),
+      TokenLock(
+        source,
+        TokenLockAmount(PosLong(200L)),
+        TokenLockFee(NonNegLong(0L)),
+        TokenLockReference(TokenLockOrdinal(NonNegLong(0L)), testHash(s"tl-parent-$label")),
+        None,
+        unlockAt,
+        None
+      ),
       testProofs
     )
 
   private def mkStake(source: Address, nodeId: PeerId, amount: Long, label: String): DelegatedStakeRecord =
     DelegatedStakeRecord(
       Signed(
-        UpdateDelegatedStake.Create(source, nodeId, DelegatedStakeAmount(NonNegLong.unsafeFrom(amount)),
-          DelegatedStakeFee(0L), testHash(s"ds-tlr-$label")),
+        UpdateDelegatedStake
+          .Create(source, nodeId, DelegatedStakeAmount(NonNegLong.unsafeFrom(amount)), DelegatedStakeFee(0L), testHash(s"ds-tlr-$label")),
         NonEmptySet.one[signature.SignatureProof](signature.SignatureProof(nodeId.toId, signature.Signature(Hex(Hash.empty.value))))
       ),
-      ord1, Amount(NonNegLong(0L)), None, None
+      ord1,
+      Amount(NonNegLong(0L)),
+      None,
+      None
     )
 
   private def mkCollateral(source: Address, nodeId: PeerId, label: String): NodeCollateralRecord =
     NodeCollateralRecord(
       Signed(
-        UpdateNodeCollateral.Create(source, nodeId, NodeCollateralAmount(NonNegLong(1_000_000L)),
-          NodeCollateralFee(NonNegLong(0L)), testHash(s"nc-tlr-$label")),
+        UpdateNodeCollateral.Create(
+          source,
+          nodeId,
+          NodeCollateralAmount(NonNegLong(1_000_000L)),
+          NodeCollateralFee(NonNegLong(0L)),
+          testHash(s"nc-tlr-$label")
+        ),
         testProofs
       ),
       ord1
@@ -115,11 +130,17 @@ object IncrementalVsRebuildRemovalParitySuite extends MutableIOSuite {
   private def mkNcWithdrawal(source: Address, nodeId: PeerId, createdAt: EpochProgress, label: String): PendingNodeCollateralWithdrawal =
     PendingNodeCollateralWithdrawal(
       Signed(
-        UpdateNodeCollateral.Create(source, nodeId, NodeCollateralAmount(NonNegLong(1_000_000L)),
-          NodeCollateralFee(NonNegLong(0L)), testHash(s"ncw-tlr-$label")),
+        UpdateNodeCollateral.Create(
+          source,
+          nodeId,
+          NodeCollateralAmount(NonNegLong(1_000_000L)),
+          NodeCollateralFee(NonNegLong(0L)),
+          testHash(s"ncw-tlr-$label")
+        ),
         testProofs
       ),
-      ord1, createdAt
+      ord1,
+      createdAt
     )
 
   private def freshStore(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[MptStore[IO, GlobalStateKey]] =
@@ -193,7 +214,9 @@ object IncrementalVsRebuildRemovalParitySuite extends MutableIOSuite {
         removedAllowSpendKeys = Set((Option.empty[Address], src)),
         allowSpendExpiryIndex = SystemIndexDelta.EpochBucket(removes = SortedMap(EpochProgress(NonNegLong(500L)) -> Set(expiryKey)))
       )
-      postInfo = GlobalSnapshotInfo.empty.copy(activeAllowSpends = SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]].some)
+      postInfo = GlobalSnapshotInfo.empty.copy(activeAllowSpends =
+        SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]].some
+      )
       r <- assertParity(acc1, acc2, postInfo)
     } yield r
   }
@@ -216,7 +239,9 @@ object IncrementalVsRebuildRemovalParitySuite extends MutableIOSuite {
         removedAllowSpendKeys = Set((mid.some, src)),
         allowSpendExpiryIndex = SystemIndexDelta.EpochBucket(removes = SortedMap(EpochProgress(NonNegLong(500L)) -> Set(expiryKey)))
       )
-      postInfo = GlobalSnapshotInfo.empty.copy(activeAllowSpends = SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]].some)
+      postInfo = GlobalSnapshotInfo.empty.copy(activeAllowSpends =
+        SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]].some
+      )
       r <- assertParity(acc1, acc2, postInfo)
     } yield r
   }

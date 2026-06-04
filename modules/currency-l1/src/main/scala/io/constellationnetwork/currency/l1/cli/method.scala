@@ -66,7 +66,8 @@ object method {
       c.snapshot.timeouts,
       c.clickHouseConfig,
       c.snapshot.mptSnapshotInfoPath,
-      c.nakamoto
+      // Fail-fast at startup on the committee draw/quorum invariant (0 < k-quorum <= k-draw); see `CommitteeConfig.validated`.
+      c.nakamoto.copy(committee = c.nakamoto.committee.validated)
     )
   }
 

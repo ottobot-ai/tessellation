@@ -17,8 +17,8 @@ import eu.timepit.refined.types.numeric.NonNegLong
   * Holds the two shard-layer Phase 1→2 [[FinalityTrigger]] instances built from the existing typeclass machinery
   * (`FinalityTrigger.scala:124-144`):
   *
-  *   - `tCountShard` — qualifies a shard ord N when `attestationCountFor(checkpoint-at-N) >= ⌈2·K_S/3⌉` (per design doc §5.4 row 2, §5.3
-  *     quorum rule).
+  *   - `tCountShard` — qualifies a shard ord N when `attestationCountFor(checkpoint-at-N) >= kQuorum` (the cluster-uniform admit count
+  *     `nakamoto.committee.kQuorum`, decoupled from the committee DRAW target `kDraw`; per design doc §5.4 row 2, §5.3 quorum rule).
   *   - `tDepth1Shard` — qualifies a shard ord N when `bestTipOrd - N > k1Shard` (per design doc §5.4 row 3; degraded-liveness depth
   *     fallback that fires when the attestation gate stalls).
   *
@@ -43,7 +43,7 @@ import eu.timepit.refined.types.numeric.NonNegLong
   *     `FinalityTrigger.maxLatestQualifyingOrdinal` directly; this class is the analogous boundary for shards.
   *
   * '''HOCON rule''' (per `[[feedback-prefer-hocon-over-sysenv]]`):
-  *   - `kTarget` and `k1Shard` are constructor params. Callers wire from `cfg.nakamoto.sharding.committeeKTarget` and
+  *   - `kQuorum` and `k1Shard` are constructor params. Callers wire from `cfg.nakamoto.committee.kQuorum` and
   *     `cfg.nakamoto.sharding.finality.k1Shard`. No `sys.env.get` anywhere in this slice.
   */
 final case class ShardFinalityTriggers[F[_]](
@@ -75,11 +75,12 @@ object ShardFinalityTriggers {
     * @param shardId
     *   the shard this trigger pair is scoped to. Stamped on the returned record for diagnostic logging and observability; the inner
     *   triggers don't bind to it because they pull their inputs from the captured `chainStore` and `tipTracker`.
-    * @param kTarget
-    *   the shard committee's target size (`K_S` in design doc §5.4 row 2 — the cluster-wide constant from
-    *   `cfg.nakamoto.sharding.committeeKTarget`). The `T_count_shard` qualifier compares against `⌈2·K_S/3⌉` distinct attesters. v1
-    *   stable-σ rule (`[[project-216-committee-stake-drift-fix]]`) treats every committee member as equally weighted; the count check
-    *   degenerates to a 1-validator-1-vote tally over a uniform committee.
+    * @param kQuorum
+    *   the shard committee's admit-quorum count (the cluster-uniform `cfg.nakamoto.committee.kQuorum`, decoupled from the committee DRAW
+    *   target `kDraw`). The `T_count_shard` qualifier compares the distinct-attester count against `kQuorum` DIRECTLY (no further 2/3
+    *   multiplier — that is already folded into the chosen `kQuorum`, e.g. 6 = 2/3 of N=8). v1 stable-σ rule
+    *   (`[[project-216-committee-stake-drift-fix]]`) treats every committee member as equally weighted; the count check degenerates to a
+    *   1-validator-1-vote tally over a uniform committee.
     * @param k1Shard
     *   shard-layer depth-finality fallback (design doc §5.4 row 3 — the per-shard `k₁`). Default per HOCON is 8 shard-ords ≈ 56s, smaller
     *   than gl0's `k₁ = 255` because shard ords are sparser.
@@ -93,14 +94,18 @@ object ShardFinalityTriggers {
     */
   def make[F[_]: Async](
     shardId: ShardId,
-    kTarget: Int,
+    kQuorum: Int,
     k1Shard: Long,
     chainStore: ShardChainStore[F],
     tipTracker: ShardTipTracker[F]
   ): F[ShardFinalityTriggers[F]] = {
     // ----- T_count_shard ----------------------------------------------------
     //
-    // Qualifies a shard ord N when `attestationCountFor(canonicalHashAt(N), excludeSelf = true) >= ⌈2·K_S/3⌉`.
+    // Qualifies a shard ord N when `attestationCountFor(canonicalHashAt(N), excludeSelf = true) >= kQuorum`.
+    //
+    // Draw/quorum decouple: `kQuorum` is the cluster-uniform admit count (`nakamoto.committee.kQuorum`) — the count DIRECTLY, NOT a 2/3
+    // fraction of the committee DRAW target. (The old `⌈2·K_S/3⌉` conversion off the draw target is exactly the coupling that left
+    // sub-quorum committees stranded; the quorum is now chosen independently and large enough that a saturated draw clears it.)
     //
     // Threshold math via `BigInt` (matches `TCountTrigger.scala:330-335` for cluster-wide hash-determinism — both honest nodes
     // recompute byte-equivalent `required` values and either both qualify or both don't).
@@ -110,7 +115,7 @@ object ShardFinalityTriggers {
     //
     // The eval function closes over `chainStore` and `tipTracker`; the `ConsensusState[F]` arg is ignored — the trigger is shard-scoped
     // and reads ALL its inputs from the captured shard dependencies.
-    val requiredCount: BigInt = ceilTwoThirds(BigInt(kTarget))
+    val requiredCount: BigInt = BigInt(kQuorum)
 
     val countEval: FinalityTrigger.ConsensusState[F] => F[SnapshotOrdinal] = _ =>
       chainStore.bestTip.flatMap {

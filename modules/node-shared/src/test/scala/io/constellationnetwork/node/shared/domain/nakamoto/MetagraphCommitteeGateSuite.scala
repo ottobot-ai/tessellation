@@ -149,9 +149,10 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
     val parent = mkParent("p-a")
     val binary = mkBinaryHash("bin-a")
     val eta = Array.fill[Byte](32)(0x01.toByte)
-    // K=1 so required count = ceil(2/3 · 1) = 1; self-record satisfies threshold and admit=true.
+    // kDraw=1, σ=1 ⇒ in committee; self-records (count 1). kQuorum=1 ⇒ admit at 1 ⇒ admit=true.
     // This isolates "the sender path emits" from the threshold logic — covered separately in (c)/(d).
-    val kTarget = 1
+    val kDraw = 1
+    val kQuorum = 1
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       selfId = PeerId.fromPublic(kp.getPublic)
@@ -168,7 +169,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => true),
         publisher = publisher,
-        kTarget = kTarget,
+        kDraw = kDraw,
+        kQuorum = kQuorum,
         gateTimeoutMs = 500L,
         pollIntervalMs = 25L
       )
@@ -176,8 +178,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       published <- publishedRef.get
       count <- agg.countFor(mg, parent, binary)
     } yield
-      // K · σ = 1 → in committee; sender path emits exactly one publish and records self;
-      // required count = ⌈2·1/3⌉ = 1 → admit true.
+      // kDraw · σ = 1 → in committee; sender path emits exactly one publish and records self;
+      // kQuorum = 1 → admit true.
       expect(admitted)
         .and(expect(published.length == 1))
         .and(expect(count == 1))
@@ -197,7 +199,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
     val parent = mkParent("p-b")
     val binary = mkBinaryHash("bin-b")
     val eta = Array.fill[Byte](32)(0x02.toByte)
-    val kTarget = 1 // K · σ = 1 · 0 = 0 → never in committee
+    val kDraw = 1 // kDraw · σ = 1 · 0 = 0 → never in committee
+    val kQuorum = 1
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       selfId = PeerId.fromPublic(kp.getPublic)
@@ -214,7 +217,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => true),
         publisher = publisher,
-        kTarget = kTarget,
+        kDraw = kDraw,
+        kQuorum = kQuorum,
         gateTimeoutMs = 200L,
         pollIntervalMs = 25L
       )
@@ -231,22 +235,23 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
 
   // ===== (c) gate blocks until threshold reached =====
 
-  test("(c) gate admits as soon as aggregator threshold reaches ⌈2K/3⌉") { res =>
+  test("(c) gate admits as soon as aggregator count reaches kQuorum") { res =>
     implicit val (h, sp, _) = res
     val mg = mkAddress("mg-c")
     val parent = mkParent("p-c")
     val binary = mkBinaryHash("bin-c")
     val eta = Array.fill[Byte](32)(0x03.toByte)
-    val kTarget = 6 // ceil(2·6/3) = 4 attestations required
+    // Draw/quorum decouple: admit waits for kQuorum=4 distinct attesters DIRECTLY. kDraw is irrelevant here (σ=0 ⇒ sender skips).
+    val kDraw = 6
+    val kQuorum = 4
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       selfId = PeerId.fromPublic(kp.getPublic)
       vrfSk = Array.fill[Byte](32)(0x77.toByte)
       (sortition, agg) <- buildSortition
       (publisher, _) <- stubPublisher
-      // Pre-seed 3 attestations from peers (below threshold). Self will record one more
-      // when admitted, reaching threshold = 4. We use σ=0 so sender path skips, then
-      // separately race the threshold-reach with an external recorder fiber.
+      // Pre-seed 3 attestations from peers (below quorum). We use σ=0 so the sender path skips, then
+      // separately race the quorum-reach with an external recorder fiber that adds the 4th.
       _ <- agg.record(mg, parent, binary, PeerId(Hex("aa" * 64)))
       _ <- agg.record(mg, parent, binary, PeerId(Hex("bb" * 64)))
       _ <- agg.record(mg, parent, binary, PeerId(Hex("cc" * 64)))
@@ -260,7 +265,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => true),
         publisher = publisher,
-        kTarget = kTarget,
+        kDraw = kDraw,
+        kQuorum = kQuorum,
         gateTimeoutMs = 2000L,
         pollIntervalMs = 25L
       )
@@ -269,7 +275,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       admitted <- gate.attestAndAdmit(mg, parent, binary, eta, sigmaOperatorKey = Ratio.Zero)
       finalCount <- agg.countFor(mg, parent, binary)
     } yield
-      // Initial 3 + scheduled 1 = 4 ≥ ⌈2·6/3⌉ = 4 → threshold met within timeout
+      // Initial 3 + scheduled 1 = 4 ≥ kQuorum (4) → quorum met within timeout
       expect(admitted)
         .and(expect(finalCount == 4))
   }
@@ -282,7 +288,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
     val parent = mkParent("p-d")
     val binary = mkBinaryHash("bin-d")
     val eta = Array.fill[Byte](32)(0x04.toByte)
-    val kTarget = 6 // need 4 attestations; we'll only supply 2
+    val kDraw = 6
+    val kQuorum = 4 // need 4 attestations; we'll only supply 2
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       selfId = PeerId.fromPublic(kp.getPublic)
@@ -301,7 +308,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => true),
         publisher = publisher,
-        kTarget = kTarget,
+        kDraw = kDraw,
+        kQuorum = kQuorum,
         gateTimeoutMs = 250L,
         pollIntervalMs = 25L
       )
@@ -322,7 +330,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
     val parent = mkParent("p-e")
     val binary = mkBinaryHash("bin-e")
     val eta = Array.fill[Byte](32)(0x05.toByte)
-    val kTarget = 100
+    val kDraw = 100
+    val kQuorum = 1 // receiver-reject test: quorum is never reached (record never happens), value is incidental
     for {
       selfKp <- KeyPairGenerator.makeKeyPair[IO]
       senderKp <- KeyPairGenerator.makeKeyPair[IO]
@@ -343,7 +352,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => false), // <-- KES rejects
         publisher = publisher,
-        kTarget = kTarget,
+        kDraw = kDraw,
+        kQuorum = kQuorum,
         gateTimeoutMs = 200L,
         pollIntervalMs = 25L
       )
@@ -387,7 +397,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
     val parent = mkParent("p-f")
     val binary = mkBinaryHash("bin-f")
     val eta = Array.fill[Byte](32)(0x07.toByte)
-    val kTarget = 1 // K · σ = 1 puts the sender in committee; gate must publish + self-record
+    val kDraw = 1 // kDraw · σ = 1 puts the sender in committee; gate must publish + self-record
+    val kQuorum = 1
     for {
       selfKp <- KeyPairGenerator.makeKeyPair[IO]
       selfId = PeerId.fromPublic(selfKp.getPublic)
@@ -404,12 +415,13 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => true),
         publisher = publisher,
-        kTarget = kTarget,
+        kDraw = kDraw,
+        kQuorum = kQuorum,
         gateTimeoutMs = 500L,
         pollIntervalMs = 25L
       )
       // Sender path — σ=1 makes us in-committee; with no internal parent-ordinal veto the gate
-      // publishes and self-records, and required count = ⌈2·1/3⌉ = 1 → admit true.
+      // publishes and self-records, and kQuorum = 1 → admit true.
       admitted <- gate.attestAndAdmit(mg, parent, binary, eta, sigmaOperatorKey = Ratio(1, 1))
       published <- publishedRef.get
       countAfterSender <- agg.countFor(mg, parent, binary)
@@ -428,7 +440,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
     val parent = mkParent("p-recv")
     val binary = mkBinaryHash("bin-recv")
     val eta = Array.fill[Byte](32)(0x06.toByte)
-    val kTarget = 100
+    val kDraw = 100
+    val kQuorum = 1
     for {
       selfKp <- KeyPairGenerator.makeKeyPair[IO]
       senderKp <- KeyPairGenerator.makeKeyPair[IO]
@@ -436,10 +449,10 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       senderId = PeerId.fromPublic(senderKp.getPublic)
       (sortition, agg) <- buildSortition
       (publisher, _) <- stubPublisher
-      // Build a valid sender draw — VRF SK from a deterministic seed, K·σ=100·(1/1)=100 → in committee
+      // Build a valid sender draw — VRF SK from a deterministic seed, kDraw·σ=100·(1/1)=100 → in committee
       senderVrfSk = Array.fill[Byte](32)(0xdd.toByte)
       senderVrfVk = new io.constellationnetwork.security.vrf.EcVrf25519().getVerificationKey(senderVrfSk)
-      drawResult <- sortition.isInCommittee(senderVrfSk, eta, mg, parent, Ratio(1, 1), kTarget)
+      drawResult <- sortition.isInCommittee(senderVrfSk, eta, mg, parent, Ratio(1, 1), kDraw)
       proof = drawResult.map(_._1).getOrElse(Array.empty[Byte])
       // Build canonical message bytes + Ed25519 sig from senderKp.private
       msgBytes <- MetagraphCommitteeGate.messageBytes[IO](senderId, mg, parent, binary)
@@ -455,7 +468,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_.nonEmpty),
         publisher = publisher,
-        kTarget = kTarget,
+        kDraw = kDraw,
+        kQuorum = kQuorum,
         gateTimeoutMs = 200L,
         pollIntervalMs = 25L
       )
@@ -498,7 +512,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => true),
         publisher = publisher,
-        kTarget = 100,
+        kDraw = 100,
+        kQuorum = 1,
         gateTimeoutMs = 100L,
         pollIntervalMs = 25L
       )

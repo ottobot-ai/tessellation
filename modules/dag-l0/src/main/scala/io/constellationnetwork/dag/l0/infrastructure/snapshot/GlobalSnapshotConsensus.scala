@@ -465,6 +465,10 @@ object GlobalSnapshotConsensus {
       shardAcceptanceDeps <- ShardCheckpointWiring
         .acceptanceDeps[F](
           cfg = sharedCfg.nakamoto.sharding,
+          // Draw/quorum decouple — the SAME cluster-uniform `nakamoto.committee` params the per-metagraph gate uses. kDraw sizes the
+          // shard committee DRAW (`committeeFor`); kQuorum is the shard admit count (`verifyEmbedded` / `tCountShard`).
+          kDraw = sharedCfg.nakamoto.committee.kDraw,
+          kQuorum = sharedCfg.nakamoto.committee.kQuorum,
           selfPeerId = selfId,
           kesRegistry = kesRegistry,
           // EXECUTION-SHARDING: genesis-loaded VRF-VK registry — the per-operator seed for the real shard-committee sortition.
@@ -800,10 +804,10 @@ object GlobalSnapshotConsensus {
           tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry).toResource
           // Slice S3: committee sortition + per-binary attestation aggregator. The sortition is a
           // stateless function; the aggregator holds the per-`(metagraph, parent, binary)` tally
-          // until `pruneParents` is called from the finality hook. K_target defaults to the active
-          // gl0 operator count (degenerate K=N — everyone in every committee, gate is effectively a
-          // no-op). For genuine sortition set `NAKAMOTO_COMMITTEE_K_TARGET`. The gate itself is
-          // constructed below once the operationalKeyMaker + kesRegistry are in scope.
+          // until `pruneParents` is called from the finality hook. The committee DRAW target (kDraw)
+          // and ADMIT quorum (kQuorum) are the cluster-uniform `nakamoto.committee` HOCON params
+          // (kDraw=N ⇒ committee=everyone; admit at kQuorum). The gate itself is constructed below
+          // once the operationalKeyMaker + kesRegistry are in scope.
           // CommitteeSortition uses `Hasher[F]` to encode the canonical VRF input. The Selector's
           // current hasher matches the message-side encoding the rest of the consensus surface
           // uses; sortition messages aren't ordinal-bound (they key on parent hash) so picking
@@ -1057,14 +1061,17 @@ object GlobalSnapshotConsensus {
 
           // Slice S3: construct the committee gate. Sender path signs the per-metagraph attestation with
           // the operator's long-term Ed25519 key + KES product key (Slice 9 path) and gossips via the
-          // sidecar; receiver path verifies all three sigs then records into the aggregator. K_target
-          // defaults to the active gl0 operator count (degenerate K=N — gate effectively a no-op except
-          // to prove the wiring works). Env override `NAKAMOTO_COMMITTEE_K_TARGET` for genuine sortition
-          // (e.g., K=4 on N=8).
-          committeeKTarget = {
-            val active = validatorPeers.size
-            sys.env.get("NAKAMOTO_COMMITTEE_K_TARGET").flatMap(_.toIntOption).getOrElse(math.max(1, active))
-          }
+          // sidecar; receiver path verifies all three sigs then records into the aggregator.
+          //
+          // Draw/quorum decouple (cluster-uniform HOCON `nakamoto.committee`, NOT sys.env — project rule):
+          //   - kDraw sizes the committee DRAW (threshold = min(kDraw·σ, 1)); kDraw = N saturates ⇒
+          //     committee = everyone, so P(|committee| ≥ kQuorum) = 1.
+          //   - kQuorum is the admit count the gate waits for. The invariant 0 < kQuorum <= kDraw is
+          //     validated fail-fast at config load (`CommitteeConfig.validated`).
+          // Both are byte-identical across nodes so the draw agrees sender↔receiver and every node
+          // admits at the same threshold. 8-node testnet default: kDraw = 8, kQuorum = 6.
+          committeeKDraw = sharedCfg.nakamoto.committee.kDraw
+          committeeKQuorum = sharedCfg.nakamoto.committee.kQuorum
           // VRF SK/VK derived from the long-term keypair via the same `VrfKeyDeriver` path the leader
           // VRF uses. For v1 sortition uses the same VRF identity as leader election; per-operator-key
           // VRF keys land later (#180).
@@ -1228,7 +1235,8 @@ object GlobalSnapshotConsensus {
               kesSigner = committeeKesSigner,
               kesVerifier = committeeKesVerifier,
               publisher = committeePublisher,
-              kTarget = committeeKTarget,
+              kDraw = committeeKDraw,
+              kQuorum = committeeKQuorum,
               gateTimeoutMs = io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.DefaultGateTimeoutMs,
               pollIntervalMs = io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.DefaultPollIntervalMs
             )
@@ -1255,7 +1263,8 @@ object GlobalSnapshotConsensus {
 
           _ <- nakLogger
             .info(
-              s"🏛️ Committee gate constructed: kTarget=$committeeKTarget, validatorPeers=${validatorPeers.size}, K=N (sortition no-op until K_TARGET < N)"
+              s"🏛️ Committee gate constructed: kDraw=$committeeKDraw kQuorum=$committeeKQuorum, validatorPeers=${validatorPeers.size} " +
+                s"(kDraw=N ⇒ committee=everyone, threshold saturates; admit at kQuorum)"
             )
             .toResource
           // #214: orphan buffer + admission cache. Hoisted from `NakamotoSyncDaemon.run` so the
@@ -1428,8 +1437,10 @@ object GlobalSnapshotConsensus {
               val slotGapFor
                 : (io.constellationnetwork.schema.nakamoto.slot.Slot, Option[io.constellationnetwork.schema.nakamoto.slot.Slot]) => Long =
                 (cur, parentOpt) => parentOpt.fold(cur.value.value)(p => math.max(1L, cur.value.value - p.value.value))
+              // Shard slot-leader's relative stake for PRODUCE election — mirrors the committee DRAW denominator (committee size ≈ kDraw),
+              // so it uses `nakamoto.committee.kDraw` (the same cluster-uniform param the shard committee `committeeFor` draw uses).
               val sigmaInCommittee =
-                io.constellationnetwork.numerics.Ratio(1, math.max(1, deps.shardingConfig.committeeKTarget))
+                io.constellationnetwork.numerics.Ratio(1, math.max(1, sharedCfg.nakamoto.committee.kDraw))
               // Slice S4: per-period rotated gl0 eta → 32 raw digest bytes. `etaForPeriodCallback` is the SAME
               // `EtaStateManager.getEta` resolver the GSAM boundary writer uses; it returns a hex `Hash`, which we decode
               // to the 32-byte shape `computeShardEta` requires (mirrors `ShardSlotLeader.computeShardEta`'s own
@@ -1510,8 +1521,10 @@ object GlobalSnapshotConsensus {
               val slotGapFor
                 : (io.constellationnetwork.schema.nakamoto.slot.Slot, Option[io.constellationnetwork.schema.nakamoto.slot.Slot]) => Long =
                 (cur, parentOpt) => parentOpt.fold(cur.value.value)(p => math.max(1L, cur.value.value - p.value.value))
+              // Shard slot-leader's relative stake for PRODUCE election — mirrors the committee DRAW denominator (committee size ≈ kDraw),
+              // so it uses `nakamoto.committee.kDraw` (the same cluster-uniform param the shard committee `committeeFor` draw uses).
               val sigmaInCommittee =
-                io.constellationnetwork.numerics.Ratio(1, math.max(1, deps.shardingConfig.committeeKTarget))
+                io.constellationnetwork.numerics.Ratio(1, math.max(1, sharedCfg.nakamoto.committee.kDraw))
               // Slice S4: epoch-aware per-shard leader-VRF eta resolver — MUST match the producer's `shardEtaFor`
               // byte-for-byte for the same `(shardId, epoch)` so the attester's VRF message agrees. Same
               // `etaForPeriodCallback` → 32-byte decode → `computeShardEta(shardId, gl0Eta)` chain. Keyed on the

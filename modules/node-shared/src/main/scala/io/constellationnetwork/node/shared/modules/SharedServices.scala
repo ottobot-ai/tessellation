@@ -264,6 +264,10 @@ object SharedServices {
         )
       shardAcceptanceDeps <- ShardCheckpointWiring.acceptanceDeps[F](
         cfg = cfg.nakamoto.sharding,
+        // Draw/quorum decouple — cluster-uniform `nakamoto.committee` (shared with the per-metagraph gate). MUST match the gl0
+        // produce path's params (split-safety #261): kDraw sizes the committee DRAW, kQuorum is the admit count `verifyEmbedded` needs.
+        kDraw = cfg.nakamoto.committee.kDraw,
+        kQuorum = cfg.nakamoto.committee.kQuorum,
         selfPeerId = nodeId,
         // Split-safety (#261): the createContext / follower GSAM MUST use the SAME genesis-derived KES + VRF registries the gl0
         // produce path uses, or `verifyEmbedded` draws a different committee (VRF) / skips KES verify and the adopt decision

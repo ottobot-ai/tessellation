@@ -125,10 +125,10 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       .map(_._1)
 
   // ============================================================================
-  // Test 1: T_count_shard qualifies at threshold (K_S=4 → required = ceil(2·4/3) = 3)
+  // Test 1: T_count_shard qualifies at threshold (kQuorum=3 → required = 3 distinct attesters, DIRECTLY)
   // ============================================================================
 
-  test("T_count_shard: K_S=4, 3 non-self attesters attest bestTip → qualifies bestTip ord") { implicit hasher =>
+  test("T_count_shard: kQuorum=3, 3 non-self attesters attest bestTip → qualifies bestTip ord") { implicit hasher =>
     val self = pid("self")
     for {
       store <- ShardChainStore.make[IO](shardZero)
@@ -140,7 +140,7 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       _ <- tracker.recordAttestation(tip.hash, pid("attester-3"))
       triggers <- ShardFinalityTriggers.make[IO](
         shardId = shardZero,
-        kTarget = 4,
+        kQuorum = 3,
         k1Shard = 100L, // intentionally large so T_depth1_shard contributes nothing to this test
         chainStore = store,
         tipTracker = tracker
@@ -150,7 +150,7 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
     } yield expect.same(SnapshotOrdinal.unsafeApply(tip.signed.value.shardOrdinal.value), result)
   }
 
-  test("T_count_shard: K_S=4, only 2 non-self attesters → below threshold → MinValue") { implicit hasher =>
+  test("T_count_shard: kQuorum=3, only 2 non-self attesters → below threshold → MinValue") { implicit hasher =>
     val self = pid("self")
     for {
       store <- ShardChainStore.make[IO](shardZero)
@@ -162,7 +162,7 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       // only 2 attesters; required = 3
       triggers <- ShardFinalityTriggers.make[IO](
         shardId = shardZero,
-        kTarget = 4,
+        kQuorum = 3,
         k1Shard = 100L,
         chainStore = store,
         tipTracker = tracker
@@ -176,7 +176,7 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
   // Test 2: T_count_shard self-exclusion (#133 / P-11b mirror)
   // ============================================================================
 
-  test("T_count_shard: self-exclusion — local node + 2 others attest → only 2 count → does not qualify (K_S=4)") { implicit hasher =>
+  test("T_count_shard: self-exclusion — local node + 2 others attest → only 2 count → does not qualify (kQuorum=3)") { implicit hasher =>
     val self = pid("self")
     for {
       store <- ShardChainStore.make[IO](shardZero)
@@ -191,7 +191,7 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       // through ShardTipTracker.attestationCountFor's `excludeSelf = true` default.
       triggers <- ShardFinalityTriggers.make[IO](
         shardId = shardZero,
-        kTarget = 4,
+        kQuorum = 3,
         k1Shard = 100L,
         chainStore = store,
         tipTracker = tracker
@@ -219,7 +219,7 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       tracker <- ShardTipTracker.make[IO](shardZero, self)
       triggers <- ShardFinalityTriggers.make[IO](
         shardId = shardZero,
-        kTarget = 1000, // intentionally large so T_count_shard contributes nothing
+        kQuorum = 1000, // intentionally large so T_count_shard contributes nothing
         k1Shard = 5L,
         chainStore = store,
         tipTracker = tracker
@@ -242,7 +242,7 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       tracker <- ShardTipTracker.make[IO](shardZero, self)
       triggers <- ShardFinalityTriggers.make[IO](
         shardId = shardZero,
-        kTarget = 1000,
+        kQuorum = 1000,
         k1Shard = 10L, // k > bestOrd
         chainStore = store,
         tipTracker = tracker
@@ -267,8 +267,8 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       // ord 7. The composite reads via bestTip — so the scenario is: bestTip is at ord 7 (not 9), T_count threshold met for that
       // bestTip, T_depth1 sees a 7-ord chain with k1Shard=5 → qualifies ord 2.
       //
-      // Re-seed cleanly: build a fresh store of length 8 (ords 0..7) so bestTip = ord 7. k1Shard=5 ⇒ T_depth1 = 2. K_S=3 ⇒ required
-      // = ceil(2·3/3) = 2 attesters; 2 non-self attesters meet it.
+      // Re-seed cleanly: build a fresh store of length 8 (ords 0..7) so bestTip = ord 7. k1Shard=5 ⇒ T_depth1 = 2. kQuorum=2 ⇒ required
+      // = 2 attesters (DIRECTLY); 2 non-self attesters meet it.
       store2 <- ShardChainStore.make[IO](shardZero)
       hashes2 <- seedChain(store2, 8)
       tip2 <- store2.bestTip.map(_.get)
@@ -277,7 +277,7 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       _ <- tracker2.recordAttestation(tip2.hash, pid("attester-2"))
       triggers <- ShardFinalityTriggers.make[IO](
         shardId = shardZero,
-        kTarget = 3,
+        kQuorum = 2,
         k1Shard = 5L,
         chainStore = store2,
         tipTracker = tracker2
@@ -287,7 +287,7 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       depthQualifying <- triggers.tDepth1Shard.latestQualifyingOrdinal
       composite <- triggers.latestQualifyingOrdinal
     } yield
-      // ord 7 = bestTip, K_S=3 ⇒ required = 2 ⇒ T_count qualifies ord 7.
+      // ord 7 = bestTip, kQuorum=2 ⇒ required = 2 ⇒ T_count qualifies ord 7.
       expect.same(SnapshotOrdinal.unsafeApply(7L), countQualifying) &&
         // bestOrd = 7, k1Shard = 5 ⇒ T_depth1 qualifies ord 2.
         expect.same(SnapshotOrdinal.unsafeApply(2L), depthQualifying) &&
@@ -310,13 +310,13 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       _ <- seedChain(store, 1)
       tip <- store.bestTip.map(_.get)
       tracker <- ShardTipTracker.make[IO](shardZero, self)
-      // Record enough to qualify (K_S=4 → required=3).
+      // Record enough to qualify (kQuorum=3 → required=3 distinct attesters).
       _ <- tracker.recordAttestation(tip.hash, pid("attester-1"))
       _ <- tracker.recordAttestation(tip.hash, pid("attester-2"))
       _ <- tracker.recordAttestation(tip.hash, pid("attester-3"))
       triggers <- ShardFinalityTriggers.make[IO](
         shardId = shardZero,
-        kTarget = 4,
+        kQuorum = 3,
         k1Shard = 100L,
         chainStore = store,
         tipTracker = tracker

@@ -178,11 +178,11 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   }
 
   /** Build a `ShardChainStore` containing a single checkpoint at the given ordinal (so `bestTip` resolves), and a `ShardFinalityTriggers`
-    * instance wired with the provided `kTarget` and `k1Shard`. The composite advances on construction so the inner triggers' Refs reflect
-    * the current chain state.
+    * instance wired with the provided `kQuorum` (the T_count_shard admit count, DIRECTLY) and `k1Shard`. The composite advances on
+    * construction so the inner triggers' Refs reflect the current chain state.
     */
   private def mkFinalityTriggers(
-    kTarget: Int,
+    kQuorum: Int,
     k1Shard: Long,
     chainLength: Int,
     selfId: PeerId,
@@ -193,7 +193,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       _ <- seedChain(store, chainLength)
       tracker <- ShardTipTracker.make[IO](shardZero, selfId)
       _ <- attestations.traverse_ { case (hash, peer) => tracker.recordAttestation(hash, peer) }
-      triggers <- ShardFinalityTriggers.make[IO](shardZero, kTarget, k1Shard, store, tracker)
+      triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum, k1Shard, store, tracker)
       _ <- triggers.advance
     } yield (store, triggers)
 
@@ -249,7 +249,10 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
     finalityTriggers: Map[ShardId, ShardFinalityTriggers[IO]],
     chainStore: Map[ShardId, ShardChainStore[IO]] = Map.empty,
     committeeMembership: Set[PeerId],
-    kTarget: Int = 4,
+    // Draw/quorum decouple: `kDraw` sizes the committee draw (reserved for the future VRF check; no test outcome depends on it here);
+    // `kQuorum` is the admit count `verifyEmbedded` requires DIRECTLY (default 4 ≈ the old `ceil(2·committeeSize/3)` at committeeSize=4).
+    kDraw: Int = 4,
+    kQuorum: Int = 4,
     selfId: PeerId,
     kesRegistry: KesRegistry[IO] = KesRegistry.empty[IO],
     reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] = (_, _, _) =>
@@ -259,7 +262,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       finalityTriggers = sid => IO.pure(finalityTriggers.get(sid)),
       chainStore = sid => IO.pure(chainStore.get(sid)),
       committeeMembership = (_, _) => IO.pure(committeeMembership),
-      kTarget = kTarget,
+      kDraw = kDraw,
+      kQuorum = kQuorum,
       selfPeerId = selfId,
       kesRegistry = kesRegistry,
       reExecuteDerivation = reExecuteDerivation
@@ -285,7 +289,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
 
       // Build triggers so this is NOT the failing path — finality phase qualifies; pre-check must fire first and reject.
-      (_, triggers) <- mkFinalityTriggers(kTarget = 1, k1Shard = 100L, chainLength = 5, selfId = selfPeer)
+      (_, triggers) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 100L, chainLength = 5, selfId = selfPeer)
       // committeeMembership is EMPTY — signer is not in committee → pre-check membership predicate fails.
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
@@ -321,7 +325,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       badSig = mkBadEdSig(signerPeer)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(badSig))
 
-      (_, triggers) <- mkFinalityTriggers(kTarget = 1, k1Shard = 100L, chainLength = 5, selfId = selfPeer)
+      (_, triggers) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 100L, chainLength = 5, selfId = selfPeer)
       // committeeMembership includes our signer so the membership pre-check passes — Ed25519 must be the one that fails.
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
@@ -360,16 +364,16 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       validSig <- mkValidSig(shell, signerKp, signerPeer)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
 
-      // Wire T_count to qualify: K_S=1, attestation count = 1 (the only signer attests). ⌈2·1/3⌉ = 1 ⇒ trigger qualifies the
+      // Wire T_count to qualify: kQuorum=1, attestation count = 1 (the only signer attests) ⇒ trigger qualifies the
       // bestTip's ord (which we set to 5 by seeding a 6-chain). The checkpoint's ord is 1, comfortably ≤ 5 ⇒ T_count qualifies.
       // Use a fresh self for the tracker so the count includes the signer-as-attester (the self-exclusion default would otherwise
       // hide our attestation if signerPeer matched the tracker's self).
       attesterPeer = signerPeer // signer attests its own checkpoint hash
-      (store, _) <- mkFinalityTriggers(kTarget = 1, k1Shard = 100L, chainLength = 6, selfId = selfPeer)
+      (store, _) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 100L, chainLength = 6, selfId = selfPeer)
       tip <- store.bestTip.map(_.get)
       tracker <- ShardTipTracker.make[IO](shardZero, selfPeer)
       _ <- tracker.recordAttestation(tip.hash, attesterPeer)
-      triggers <- ShardFinalityTriggers.make[IO](shardZero, kTarget = 1, k1Shard = 100L, store, tracker)
+      triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1, k1Shard = 100L, store, tracker)
       _ <- triggers.advance
 
       // Re-exec returns a HASH THAT DOES NOT MATCH — proves the manager never enters the re-exec path on the T_count fast path.
@@ -421,7 +425,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       // T_depth1 qualifies (chain length 10, k1=3 → qualifies ord up to 7); T_count does NOT qualify (huge kTarget=1000,
       // 0 attestations → required threshold never met).
       (_, triggers) <- mkFinalityTriggers(
-        kTarget = 1000,
+        kQuorum = 1000,
         k1Shard = 3L,
         chainLength = 10,
         selfId = selfPeer
@@ -467,7 +471,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
 
       // T_depth1 qualifies; T_count doesn't.
       (_, triggers) <- mkFinalityTriggers(
-        kTarget = 1000,
+        kQuorum = 1000,
         k1Shard = 3L,
         chainLength = 10,
         selfId = selfPeer
@@ -519,7 +523,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       // Build triggers with a SHORT chain (length 3 → bestTip ord=2). T_count requires kTarget=100, no attestations → never
       // qualifies. T_depth1 with k1=10 vs bestOrd=2 → never qualifies. Both report MinValue → both predicates `false` for ord=50.
       (_, triggers) <- mkFinalityTriggers(
-        kTarget = 100,
+        kQuorum = 100,
         k1Shard = 10L,
         chainLength = 3,
         selfId = selfPeer
@@ -591,27 +595,29 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       validSig <- mkValidSig(shell, signerKp, signerPeer)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
 
-      // committee size = 1 ⇒ threshold = ceil(2/3) = 1; the single valid signer meets quorum ⇒ Accepted, regardless of triggers.
+      // kQuorum = 1 ⇒ the single valid signer meets the admit quorum ⇒ Accepted, regardless of triggers (committee size = 1 here).
 
       // Node A: triggers FULLY qualify the checkpoint ord (T_count fires, deep chain).
-      (storeA, _) <- mkFinalityTriggers(kTarget = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeerA)
+      (storeA, _) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeerA)
       tipA <- storeA.bestTip.map(_.get)
       trackerA <- ShardTipTracker.make[IO](shardZero, selfPeerA)
       _ <- trackerA.recordAttestation(tipA.hash, signerPeer)
-      triggersA <- ShardFinalityTriggers.make[IO](shardZero, kTarget = 1, k1Shard = 1L, storeA, trackerA)
+      triggersA <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1, k1Shard = 1L, storeA, trackerA)
       _ <- triggersA.advance
 
-      // Node B: triggers NEVER qualify (short chain, huge kTarget, no attestations) — neither T_count nor T_depth1.
-      (_, triggersB) <- mkFinalityTriggers(kTarget = 1000, k1Shard = 1000L, chainLength = 2, selfId = selfPeerB)
+      // Node B: triggers NEVER qualify (short chain, huge kQuorum, no attestations) — neither T_count nor T_depth1.
+      (_, triggersB) <- mkFinalityTriggers(kQuorum = 1000, k1Shard = 1000L, chainLength = 2, selfId = selfPeerB)
 
       mgrA <- mkManager(
         finalityTriggers = Map(shardZero -> triggersA),
         committeeMembership = Set(signerPeer),
+        kQuorum = 1,
         selfId = selfPeerA
       )
       mgrB <- mkManager(
         finalityTriggers = Map(shardZero -> triggersB),
         committeeMembership = Set(signerPeer),
+        kQuorum = 1,
         selfId = selfPeerB
       )
       resultA <- mgrA.verifyEmbedded(checkpoint)
@@ -622,7 +628,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         expect.same(resultA, resultB) // the determinism assertion: byte-identical outcome on two different-trigger nodes
   }
 
-  test("verifyEmbedded: quorum met (distinctSigners >= ceil(2*kS/3)) → Accepted") { res =>
+  test("verifyEmbedded: quorum met (distinctSigners >= kQuorum) → Accepted") { res =>
     implicit val (h, sp, _) = res
     for {
       (kp1, p1) <- mkSigner
@@ -637,8 +643,9 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       sig1 <- mkValidSig(shell, kp1, p1)
       sig2 <- mkValidSig(shell, kp2, p2)
       sig3 <- mkValidSig(shell, kp3, p3)
-      // committee size 4 ⇒ threshold = ceil(8/3) = 3; 3 distinct valid signers meet quorum ⇒ Accepted (re-exec never runs).
-      (_, anyTriggers) <- mkFinalityTriggers(kTarget = 1, k1Shard = 1L, chainLength = 3, selfId = selfPeer)
+      // kQuorum = 3; 3 distinct valid signers meet the admit quorum ⇒ Accepted (re-exec never runs). committee size is 4 here but the
+      // quorum is the DECOUPLED `kQuorum`, not `ceil(2·committeeSize/3)`.
+      (_, anyTriggers) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 1L, chainLength = 3, selfId = selfPeer)
       reExecCalledRef <- cats.effect.Ref.of[IO, Boolean](false)
       reExecCb = (
         (
@@ -653,6 +660,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> anyTriggers),
         committeeMembership = Set(p1, p2, p3, selfPeer),
+        kQuorum = 3,
         selfId = selfPeer,
         reExecuteDerivation = reExecCb
       )
@@ -674,7 +682,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       delta = mkDelta(mg, mptRoot, binary)
       shell = mkCheckpointShell(shardOrd = 1L, gl0Anchor = 100L, delta = delta, placeholderPeerId = p1)
       sig1 <- mkValidSig(shell, kp1, p1)
-      // committee size 4 ⇒ threshold = 3; only 1 valid signer ⇒ sub-quorum ⇒ re-exec failover.
+      // kQuorum = 3; only 1 valid signer ⇒ sub-quorum ⇒ re-exec failover (committee size 4, but the quorum is the decoupled kQuorum).
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig1))
 
       // re-exec returns a WRONG root vs the delta's claimed root ⇒ RejectedReExecutionMismatch, deterministically.
@@ -685,17 +693,19 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       ) => IO[Hash]
 
       // Two different trigger states again — the re-exec failover must also be node-local-independent.
-      (_, triggersA) <- mkFinalityTriggers(kTarget = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeerA)
-      (_, triggersB) <- mkFinalityTriggers(kTarget = 1000, k1Shard = 1000L, chainLength = 2, selfId = selfPeerB)
+      (_, triggersA) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeerA)
+      (_, triggersB) <- mkFinalityTriggers(kQuorum = 1000, k1Shard = 1000L, chainLength = 2, selfId = selfPeerB)
       mgrA <- mkManager(
         finalityTriggers = Map(shardZero -> triggersA),
         committeeMembership = Set(p1) ++ (1 to 3).map(i => PeerId(Hex(f"$i%02x" * 64))).toSet,
+        kQuorum = 3,
         selfId = selfPeerA,
         reExecuteDerivation = reExecWrong
       )
       mgrB <- mkManager(
         finalityTriggers = Map(shardZero -> triggersB),
         committeeMembership = Set(p1) ++ (1 to 3).map(i => PeerId(Hex(f"$i%02x" * 64))).toSet,
+        kQuorum = 3,
         selfId = selfPeerB,
         reExecuteDerivation = reExecWrong
       )
@@ -720,7 +730,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       shell = mkCheckpointShell(shardOrd = 1L, gl0Anchor = 100L, delta = delta, placeholderPeerId = p)
       sig <- mkValidSig(shell, kp, p)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig))
-      (_, triggers) <- mkFinalityTriggers(kTarget = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeer)
+      (_, triggers) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeer)
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
         committeeMembership = Set.empty[PeerId], // signer not in committee ⇒ pre-check rejects before quorum

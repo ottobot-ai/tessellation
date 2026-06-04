@@ -504,7 +504,6 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   private def mkShardingConfig(numShards: Int): ShardingConfig =
     ShardingConfig(
       numShards = numShards,
-      committeeKTarget = 4,
       finality = ShardFinalityConfig(k1Shard = 8L),
       checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100, binaryBufferCap = 4096),
       observability = ShardObservabilityConfig(tPartitionHardMs = 600000L),

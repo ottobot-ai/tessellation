@@ -106,8 +106,45 @@ object types {
     stagingAccumulatorsCap: PosInt,
     commitmentSmt: CommitmentSmtConfig,
     localEvents: LocalEventsConfig,
+    committee: CommitteeConfig,
     sharding: ShardingConfig
   )
+
+  /** Committee draw/quorum decouple — the two cluster-uniform knobs that size the per-metagraph committee gate AND (reused) the per-shard
+    * committee. Both MUST be byte-identical on every node: `kDraw` keys the VRF/VK-seeded DRAW so the elected committee is the SAME
+    * sender↔receiver and node↔node, and `kQuorum` is the admit count every node waits for, so they all admit at the same threshold.
+    *
+    *   - `kDraw` — committee DRAW target. Used in `CommitteeSortition.threshold(kDraw, σ) = min(kDraw·σ, 1)`, so the expected committee
+    *     size is `≈ kDraw·σ·N`. With uniform σ = 1/N this is `≈ kDraw`; setting `kDraw = N` makes `kDraw·σ = 1` saturate ⇒ committee =
+    *     everyone.
+    *   - `kQuorum` — admit quorum. The number of distinct committee attestations the metagraph gate waits for
+    *     (`MetagraphAttestationAggregator.thresholdReached`) and the per-shard acceptance count (`ShardCheckpointGl0AcceptanceManager` /
+    *     `ShardFinalityTriggers.tCountShard`). This is the count DIRECTLY (no further 2/3 multiplier).
+    *
+    * '''Invariant (validated fail-fast at config load via [[validated]]): `0 < kQuorum <= kDraw`.''' Decoupling the two fixes the
+    * throughput lag where expected-committee == admit-quorum: a binomial committee draw around `kDraw` left ~36% of binaries with a
+    * committee SMALLER than the quorum, which could never reach it → committee-gate timeout → re-buffer churn → gl0 admits metagraph
+    * binaries slower than ml0 produces. For liveness you want `kDraw` large enough that `P(|committee| ≥ kQuorum) ≈ 1` — e.g. `kDraw ≥
+    * ~1.5·kQuorum`, or `kDraw = N` (committee = everyone, threshold saturates at 1). Testnet default `kDraw = 8, kQuorum = 6` (N = 8):
+    * `8·(1/8) = 1` saturates ⇒ committee = all 8 ⇒ `P(8 ≥ 6) = 1`; admit at 2/3 of N.
+    */
+  case class CommitteeConfig(kDraw: Int, kQuorum: Int) {
+
+    /** Fail-fast invariant check, run once at startup wiring. Returns `this` on success; raises `IllegalArgumentException` with a clear,
+      * operator-actionable message on `kQuorum <= 0`, `kDraw <= 0`, or `kQuorum > kDraw` (the cluster-split footgun: a quorum larger than
+      * the draw can never be met by a committee the draw produces).
+      */
+    def validated: CommitteeConfig = {
+      require(kDraw > 0, s"nakamoto.committee.k-draw must be positive, got $kDraw")
+      require(kQuorum > 0, s"nakamoto.committee.k-quorum must be positive, got $kQuorum")
+      require(
+        kQuorum <= kDraw,
+        s"nakamoto.committee invariant violated: k-quorum ($kQuorum) must be <= k-draw ($kDraw) — " +
+          s"a quorum larger than the draw target can never be reached by the drawn committee (would stall metagraph/shard admission)"
+      )
+      this
+    }
+  }
 
   /** §3 NIPoPoW historical-commitment SMT tunables. The tree is unbounded; `versionRootRetention` bounds only how many recent historical
     * ROOTS stay queryable for past-ordinal inclusion proofs (separate from the `confirmationDepthK` finalized lag). Must be >= 1.
@@ -121,15 +158,16 @@ object types {
     *
     *   - `numShards`: cluster-wide static shard count. Metagraph → shard is deterministic via `Hasher.hash(metagraphAddress) mod
     *     numShards`. Default `1` ⇒ every metagraph maps to shard 0.
-    *   - `committeeKTarget`: target committee size per shard per epoch (the `K_target` of `COMMITTEE-SORTITION-DESIGN.md` §5). v1: fixed
-    *     cluster-wide.
     *   - `finality`: per-shard FinalityTrigger params (`k1Shard` is the depth-finality fallback in the shard's own mini-chain — smaller
     *     than gl0 k₁=255 because shard ords are sparser).
     *   - `checkpoint`: emission cadence + burst cap for shard checkpoints (Option C per `SHARD-CHECKPOINT-GRANULARITY.md`).
+    *
+    * NOTE: the shard committee DRAW target + ADMIT quorum are NOT here — they are the cluster-wide [[CommitteeConfig]] (`kDraw` /
+    * `kQuorum`), shared with the per-metagraph committee gate, threaded into the shard wiring from `nakamoto.committee`. (Previously this
+    * block carried a single overloaded `committeeKTarget` that conflated draw and quorum.)
     */
   case class ShardingConfig(
     numShards: Int,
-    committeeKTarget: Int,
     finality: ShardFinalityConfig,
     checkpoint: ShardCheckpointConfig,
     observability: ShardObservabilityConfig,

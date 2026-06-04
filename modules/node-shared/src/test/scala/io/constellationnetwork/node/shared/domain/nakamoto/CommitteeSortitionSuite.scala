@@ -334,13 +334,46 @@ object CommitteeSortitionSuite extends MutableIOSuite {
       } yield expect(results.forall(_.isDefined))
   }
 
-  test("K=0 is rejected by threshold") { _ =>
+  test("kDraw=0 is rejected by threshold") { _ =>
     IO.delay {
       val caught =
         try { CommitteeSortition.threshold(0, Ratio.One); false }
         catch { case _: IllegalArgumentException => true }
       expect(caught)
     }
+  }
+
+  // ============ Draw/quorum decouple ============
+  //
+  // `threshold` is keyed on the DRAW target `kDraw` (decoupled from the admit quorum). These pin the exact-Ratio behaviour the
+  // decouple relies on: the threshold uses `kDraw` (not some quorum), and at the 8-node testnet default it saturates so the
+  // committee is everyone — guaranteeing P(|committee| ≥ kQuorum) = 1.
+
+  test("threshold uses kDraw (exact Ratio): threshold(kDraw, σ) = kDraw·σ when below 1") { _ =>
+    // Two different kDraw values at the same σ produce thresholds in the kDraw ratio — proving kDraw (not a quorum) drives it.
+    val tDraw4 = CommitteeSortition.threshold(4, Ratio(1, 100)) // 4/100
+    val tDraw6 = CommitteeSortition.threshold(6, Ratio(1, 100)) // 6/100
+    IO.pure(
+      // exact-Ratio, no Double — `Ratio(4, 100)` and `Ratio(6, 100)` reduce canonically (1/25 and 3/50).
+      expect(tDraw4 == Ratio(4, 100))
+        .and(expect(tDraw6 == Ratio(6, 100)))
+        // kDraw scales the threshold: 6/100 = 3/50 differs from 4/100 = 1/25 — the larger kDraw gives the larger threshold.
+        .and(expect(tDraw6 != tDraw4))
+    )
+  }
+
+  test("testnet default kDraw=8 at σ=1/N (N=8) saturates threshold to Ratio.One (committee = everyone ⇒ ≥ kQuorum=6)") { _ =>
+    // kDraw = N = 8, σ = 1/8 ⇒ kDraw·σ = 8·(1/8) = 1 ⇒ saturates to Ratio.One ⇒ every operator is in committee.
+    // Expected committee size = N = 8 ≥ kQuorum = 6, so the gate's quorum is always reachable.
+    val n = 8
+    val kDraw = 8
+    val kQuorum = 6
+    val t = CommitteeSortition.threshold(kDraw, Ratio(1, n))
+    IO.pure(
+      expect(t == Ratio.One)
+        // The decouple invariant the default encodes: expected committee (= kDraw at saturation) ≥ admit quorum.
+        .and(expect(kDraw >= kQuorum))
+    )
   }
 
   // ============ Statistical inclusion-rate sanity check ============

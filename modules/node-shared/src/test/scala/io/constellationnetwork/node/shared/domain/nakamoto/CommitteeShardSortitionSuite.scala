@@ -73,8 +73,8 @@ object CommitteeShardSortitionSuite extends MutableIOSuite {
     val vk = randomVk()
     val sigma = Ratio(1, 8)
     (
-      CommitteeSortition.isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(1), EtaPeriod(5L), sigma, kTarget = 4)(implicitly, h1),
-      CommitteeSortition.isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(1), EtaPeriod(5L), sigma, kTarget = 4)(implicitly, h2)
+      CommitteeSortition.isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(1), EtaPeriod(5L), sigma, kDraw = 4)(implicitly, h1),
+      CommitteeSortition.isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(1), EtaPeriod(5L), sigma, kDraw = 4)(implicitly, h2)
     ).tupled.map { case (a, b) => expect(a == b) }
   }
 
@@ -98,20 +98,20 @@ object CommitteeShardSortitionSuite extends MutableIOSuite {
     implicit val h: Hasher[IO] = h1
     val vk = randomVk()
     (
-      // σ = 1/2, kTarget = 4 ⇒ kTarget·σ = 2 ≥ 1 ⇒ saturates ⇒ always in.
-      CommitteeSortition.isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(0), EtaPeriod(1L), Ratio(1, 2), kTarget = 4),
+      // σ = 1/2, kDraw = 4 ⇒ kDraw·σ = 2 ≥ 1 ⇒ saturates ⇒ always in.
+      CommitteeSortition.isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(0), EtaPeriod(1L), Ratio(1, 2), kDraw = 4),
       // σ = 0 ⇒ threshold 0 ⇒ draw value (in [0,1)) is never < 0 ⇒ always out.
-      CommitteeSortition.isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(0), EtaPeriod(1L), Ratio(0, 1), kTarget = 4)
+      CommitteeSortition.isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(0), EtaPeriod(1L), Ratio(0, 1), kDraw = 4)
     ).tupled.map { case (saturated, zero) => expect.all(saturated, !zero) }
   }
 
-  test("enumerated committee ⊆ candidate set with mean size ≈ kTarget at σ = 1/N") { res =>
+  test("enumerated committee ⊆ candidate set with mean size ≈ kDraw at σ = 1/N") { res =>
     val (h1, _) = res
     implicit val h: Hasher[IO] = h1
-    // N candidates, uniform σ = 1/N, kTarget = K ⇒ per-operator inclusion prob = K/N, so E[|committee|] = K. Average over many shards to
+    // N candidates, uniform σ = 1/N, kDraw = K ⇒ per-operator inclusion prob = K/N, so E[|committee|] = K. Average over many shards to
     // smooth binomial noise, then assert the mean is within a generous band of K and every committee is a subset of the candidates.
     val n = 40
-    val kTarget = 8
+    val kDraw = 8
     val sigma = Ratio(1, n)
     val candidateVks: Vector[(Int, Array[Byte])] = Vector.tabulate(n)(i => i -> randomVk())
     val shards = (0 until 50).toList
@@ -120,7 +120,7 @@ object CommitteeShardSortitionSuite extends MutableIOSuite {
       candidateVks.toList.traverse {
         case (i, vk) =>
           CommitteeSortition
-            .isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(s), EtaPeriod(2L), sigma, kTarget)
+            .isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(s), EtaPeriod(2L), sigma, kDraw)
             .map(in => if (in) Some(i) else None)
       }
         .map(_.flatten.toSet)
