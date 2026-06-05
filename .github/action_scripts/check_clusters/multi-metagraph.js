@@ -64,21 +64,25 @@ const verifyGl0SeesAllMetagraphs = async (ids) => {
     const host = process.env.TEST_HOST || 'http://localhost';
     const gl0Url = process.env.GL0_URL || `${host}:${dagL0PortPrefix}00`;
 
-    // gl0's latest global snapshot info contains lastCurrencySnapshots keyed by
-    // metagraph address. After enough time, every active metagraph should be
-    // present. May be partial during early startup; retry briefly.
+    // gl0's GlobalSnapshotInfo carries lastStateChannelSnapshotHashes keyed by metagraph
+    // address — written for EVERY admitted metagraph. That is the correct signal for this
+    // "gl0 sees all K metagraphs" sanity check. (lastCurrencySnapshots is the WRONG signal:
+    // calculateLastCurrencySnapshots drops any mg whose currency derivation produced no state
+    // in the window via `.filterNot(_.isEmpty)`, so a metagraph that hasn't had currency
+    // activity yet is present in gl0 but ABSENT from lastCurrencySnapshots — a false negative
+    // here. Real currency-state propagation is covered by the transfer/token-lock tests and the
+    // per-metagraph token-tx-senders.) May be partial during early startup; retry briefly.
     const maxAttempts = 30;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         try {
             const data = await fetchJson(`${gl0Url}/global-snapshots/latest/combined`);
-            // Response is Either-encoded as [snapshot, info]: index 1 holds the
-            // GlobalSnapshotInfo where lastCurrencySnapshots lives.
+            // Response is Either-encoded as [snapshot, info]: index 1 holds the GlobalSnapshotInfo.
             const info = Array.isArray(data) && data.length >= 2 ? data[1] : (data?.value?.info || {});
-            const lcs = info?.lastCurrencySnapshots || {};
-            const seen = Object.keys(lcs);
+            const scHashes = info?.lastStateChannelSnapshotHashes || {};
+            const seen = Object.keys(scHashes);
             const missing = ids.filter(id => !seen.includes(id));
             if (missing.length === 0) {
-                console.log(`gl0 lastCurrencySnapshots includes all ${ids.length} metagraphs ✓`);
+                console.log(`gl0 lastStateChannelSnapshotHashes includes all ${ids.length} metagraphs ✓`);
                 return;
             }
             if (attempt % 5 === 0) {
@@ -91,7 +95,7 @@ const verifyGl0SeesAllMetagraphs = async (ids) => {
         }
         await new Promise(r => setTimeout(r, 5000));
     }
-    throw new Error(`gl0 never observed all ${ids.length} metagraphs in lastCurrencySnapshots within ${maxAttempts * 5}s`);
+    throw new Error(`gl0 never observed all ${ids.length} metagraphs in lastStateChannelSnapshotHashes within ${maxAttempts * 5}s`);
 };
 
 const main = async () => {

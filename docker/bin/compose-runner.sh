@@ -65,8 +65,14 @@ cleanup_end() {
   fi
   rm -f "$RUNNER_TIMEOUT_MARKER" 2>/dev/null || true
 
-  # tx-sender is a test fixture — always remove when the run ends.
+  # tx-sender(s) are test fixtures — always remove when the run ends. Covers the
+  # legacy single `tx-sender` plus every per-metagraph `tx-sender-m${k}`. The
+  # `docker ps -aq --filter name=...` form is K-agnostic (works even if
+  # NUM_METAGRAPHS is unset on an early exit before metagraph setup).
   docker rm -f tx-sender 2>/dev/null || true
+  for c in $(docker ps -aq --filter "name=^tx-sender-m" 2>/dev/null); do
+    docker rm -f "$c" 2>/dev/null || true
+  done
 
   # Auto-teardown decision. Default ON. Skip only when:
   #   * --keep-alive          : operator wants the cluster left up for debugging
@@ -726,6 +732,97 @@ else
 
         cd ../../
       done
+
+      # --- Background currency-tx sender for THIS metagraph (additive fixture) ---
+      # One `tools.jar tx-sender` container per metagraph drips a small currency tx
+      # at a continuous low rate forever, so the metagraph always carries real
+      # currency state (kills the empty-currency flake) AND keeps continuous BFT
+      # pressure on metagraph consensus. The funded sender wallet
+      # (DAG1tE25RsKXpyHFByJwjgeG3CDLRHayNgoaENJQ) is seeded in .github/config/genesis.csv,
+      # which every metagraph's cl1 genesis is generated from (ml0.jar create-genesis
+      # reads that same CSV — see entrypoint.sh:204 + docker-env-setup.sh:124), and is
+      # NOT a wallet any JS test sends from (avoids nonce/parent-ref conflicts).
+      #
+      # ROBUSTNESS: this whole block is best-effort. A readiness probe that times out,
+      # a config write that fails, or a container that won't start is LOGGED and the run
+      # CONTINUES — a background sender must NEVER hard-fail the e2e. Gate: SKIP_TX_SENDERS.
+      if [ "$SKIP_TX_SENDERS" != "true" ] && [ "$NUM_CL1_NODES" -gt 0 ] && [ -d "./nodes/${M_PREFIX}-0" ]; then
+        (
+          set +e  # subshell: never let a sender hiccup abort the parent (set -e) run
+          M_CL1_PORT_PREFIX=$((CL1_PORT_PREFIX - k*10))
+          # cl1-0 container DNS + INTERNAL port on tessellation_common (external==internal).
+          CL1_CONTAINER_URL="http://cl1-${M_PREFIX}-0:${M_CL1_PORT_PREFIX}00"
+          # Host-reachable cl1-0 port for the readiness probe (external==internal port).
+          CL1_HOST_URL="${TEST_HOST:-http://localhost}:${M_CL1_PORT_PREFIX}00"
+          SENDER_ADDR="DAG1tE25RsKXpyHFByJwjgeG3CDLRHayNgoaENJQ"
+
+          echo "[tx-sender] metagraph $k: waiting for cl1-${M_PREFIX}-0 to accept last-reference lookups..."
+          cl1_ready=false
+          for attempt in $(seq 1 120); do
+            # Ready == cl1 answers the exact endpoint the sender hits first
+            # (/transactions/last-reference/<addr>); this also implies it has a
+            # currency snapshot to validate against.
+            if curl -sf "${CL1_HOST_URL}/transactions/last-reference/${SENDER_ADDR}" >/dev/null 2>&1; then
+              echo "[tx-sender] metagraph $k: cl1 ready (last-reference reachable)"
+              cl1_ready=true
+              break
+            fi
+            [ "$((attempt % 12))" -eq 0 ] && echo "[tx-sender] metagraph $k: cl1 not ready yet (attempt $attempt/120)..."
+            sleep 5
+          done
+
+          if [ "$cl1_ready" != "true" ]; then
+            echo "[tx-sender] metagraph $k: cl1 did not become ready in time — SKIPPING sender (run continues)."
+          else
+            SENDER_CONF_DIR="$PROJECT_ROOT/nodes/_tx-senders"
+            mkdir -p "$SENDER_CONF_DIR"
+            SENDER_CONF="$SENDER_CONF_DIR/tx-sender-m${k}.conf"
+            # Continuous drip: no burst, steady forever (cycles=0). amount small, fee=0.
+            cat > "$SENDER_CONF" <<TXCONF
+privateKeyHex = "f3706c6fbae826d5f3d7e25b490c0f123d00e680c33efa8d057facd1bcf997b2"
+l1BaseUrl = "${CL1_CONTAINER_URL}"
+recipients = [
+  "DAG0eQr94qUQSUhmYGNXt6CoBKWu5K6htvRMGC6M",
+  "DAG6jKcKHYVTMEf12111Nwv8kxcJ9D1sbQLYhKod",
+  "DAG2Gidk3QkSGPR1QbGpNbktETVqJbHjBkn7SGRD"
+]
+burstCount = 0
+burstTps = 1
+steadyCount = 1000000
+steadyIntervalSeconds = ${TX_SENDER_INTERVAL_SECONDS:-3}
+cycles = 0
+amountDatum = ${TX_SENDER_AMOUNT_DATUM:-100000000}
+feeDatum = 0
+TXCONF
+
+            # Run tools.jar (TransactionSender) inside the already-built tessellation
+            # image (has openjdk-21; on tessellation_common so the cl1 DNS name resolves).
+            # tools.jar is NOT baked into the image, so mount it + the conf and override
+            # the entrypoint to plain `java`. Same --add-opens flags as the in-script
+            # generate-genesis call (compose-runner.sh) for Kryo on Java 21.
+            # --restart on-failure:20 absorbs the sender's intentional exit on a transient
+            # rejection (it refetches last-ref on restart) without spinning forever.
+            echo "[tx-sender] metagraph $k: launching tx-sender-m${k} → ${CL1_CONTAINER_URL}"
+            docker rm -f "tx-sender-m${k}" >/dev/null 2>&1 || true
+            if docker run -d --name "tx-sender-m${k}" \
+                 --network tessellation_common \
+                 --restart on-failure:20 \
+                 --entrypoint java \
+                 -v "$PROJECT_ROOT/docker/jars/tools.jar:/tessellation/jars/tools.jar:ro" \
+                 -v "$SENDER_CONF:/tessellation/tx-sender.conf:ro" \
+                 "constellationnetwork/tessellation:${TESSELLATION_DOCKER_VERSION:-test}" \
+                 --add-opens=java.base/java.lang.invoke=ALL-UNNAMED \
+                 --add-opens=java.base/java.util=ALL-UNNAMED \
+                 --add-opens=java.base/java.security=ALL-UNNAMED \
+                 -jar /tessellation/jars/tools.jar tx-sender --config /tessellation/tx-sender.conf \
+                 >/dev/null 2>&1; then
+              echo "[tx-sender] metagraph $k: tx-sender-m${k} started."
+            else
+              echo "[tx-sender] metagraph $k: FAILED to start tx-sender-m${k} — logging and continuing (run not affected)."
+            fi
+          fi
+        ) || true
+      fi
     done
 
     # Export aggregate METAGRAPH_IDS_CSV so JS tests can iterate K metagraphs
@@ -1017,11 +1114,15 @@ if should_run_test "snapshot-streaming"; then
   echo "================================================"
   echo "Running snapshot-streaming E2E test"
   echo "================================================"
-  # Stop tx-sender before snapshot-streaming: the Prisma schema requires
+  # Stop tx-sender(s) before snapshot-streaming: the Prisma schema requires
   # dag_transactions.snapshot_ordinal NOT NULL but the trigger that populates it
   # from global_snapshots.hash is racy — if tx lands before the snapshot row
-  # exists, snapshot_ordinal stays NULL and the insert fails.
+  # exists, snapshot_ordinal stays NULL and the insert fails. Covers the legacy
+  # single tx-sender plus every per-metagraph tx-sender-m${k}.
   docker rm -f tx-sender 2>/dev/null || true
+  for c in $(docker ps -aq --filter "name=^tx-sender-m" 2>/dev/null); do
+    docker rm -f "$c" 2>/dev/null || true
+  done
   cd $PROJECT_ROOT
 
   ss_test_passed=false

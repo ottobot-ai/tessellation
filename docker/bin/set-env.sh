@@ -75,6 +75,22 @@ export USE_TEST_METAGRAPH=${USE_TEST_METAGRAPH:-false}
 export SELECTED_TESTS=${SELECTED_TESTS:-""}
 export LIST_TESTS=${LIST_TESTS:-false}
 
+# --- Per-metagraph background currency-tx senders (additive test fixture) ---
+# When METAGRAPH is set, compose-runner.sh launches one `tools.jar tx-sender`
+# container per metagraph (tx-sender-m${k}), pointed at that metagraph's cl1,
+# dripping a small currency tx every TX_SENDER_INTERVAL_SECONDS forever. This
+# (a) keeps every metagraph carrying real currency state (kills the empty-currency
+# flake) and (b) applies continuous BFT pressure on metagraph consensus.
+#
+# These are ADDITIVE — a sender that fails to start or errors is logged and the
+# run continues; it never hard-fails the e2e. Default ON; disable with
+# --skip-tx-senders (or SKIP_TX_SENDERS=true).
+export SKIP_TX_SENDERS=${SKIP_TX_SENDERS:-false}
+# Steady drip interval (seconds) per metagraph sender. ~1 tx / 3s by default.
+export TX_SENDER_INTERVAL_SECONDS=${TX_SENDER_INTERVAL_SECONDS:-3}
+# Per-tx amount (datum). Small, so the funded wallet lasts the whole run.
+export TX_SENDER_AMOUNT_DATUM=${TX_SENDER_AMOUNT_DATUM:-100000000}
+
 # Number of independent metagraphs to spin up against a single hypergraph.
 # K=1 (default) preserves the legacy single-metagraph behaviour. K>=2 spawns
 # additional metagraph clusters with their own keystore + genesis, sharing
@@ -227,6 +243,10 @@ for arg in "$@"; do
       ;;
     --skip-streaming)
       export SKIP_STREAMING=true
+      ;;
+    --skip-tx-senders)
+      # Opt out of the per-metagraph background currency-tx senders (default ON).
+      export SKIP_TX_SENDERS=true
       ;;
     --fail)
       export SET_FAILURE_BREAKPOINT_TIME=true
