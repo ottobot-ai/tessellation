@@ -721,12 +721,10 @@ object GlobalSnapshotConsensus {
         )
       }
       slotsPerEpoch = sys.env.get("NAKAMOTO_SLOTS_PER_EPOCH").flatMap(_.toLongOption).getOrElse(60L)
-      // R = 2550 = 10·k₁ (matches Cardano R/k ratio). Rotation is keyed on **ordinal**, not slot —
-      // slots are LDD-paced and lumpy; ordinals are 1:1 with snapshots and give a stable R that
-      // satisfies the Praos R ≥ 3·k₁ stability bound. See `docs/nakamoto/attestation-and-finality.md` §1.
-      // Path 1 (heap-leak workstream): moved from `sys.env.get("NAKAMOTO_ETA_ROTATION_SNAPSHOTS")` to
-      // HOCON `nakamoto.eta-rotation-snapshots` (which still honors `${?NAKAMOTO_ETA_ROTATION_SNAPSHOTS}`
-      // substitution so ops scripts keep working).
+      // R = eta-rotation period, now DERIVED in `NakamotoConfig` as `round(3.03·k₁)` from the single
+      // `nakamoto.confirmation-depth-k` knob (Ouroboros: first-2/3 nonce + last-1/3 ≥ k₁ stability; .03 margin).
+      // Rotation is keyed on **ordinal**, not slot — slots are LDD-paced and lumpy; ordinals are 1:1 with
+      // snapshots and give a stable R that satisfies the R ≥ 3·k₁ bound. See `docs/nakamoto/attestation-and-finality.md` §1.
       etaRotationSnapshots = sharedCfg.nakamoto.etaRotationSnapshots.value
 
       // Start the Nakamoto SnapshotLeaderLoop + sidecar bridge.
@@ -1586,6 +1584,9 @@ object GlobalSnapshotConsensus {
                   eligibilityChecker = eligibilityChecker,
                   slotsPerEpoch = slotsPerEpoch,
                   etaRotationSnapshots = etaRotationSnapshots,
+                  // k₁ — typed HOCON `nakamoto.confirmation-depth-k` (replaces the prior
+                  // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read inside the loop).
+                  confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK.value,
                   lastKnownSlotRef = lastKnownSlotRef,
                   epochStateRef = epochStateRef,
                   genesisTimeMs = pureGenesisTimeMs,
@@ -1826,6 +1827,9 @@ object GlobalSnapshotConsensus {
                   lastKnownSlotRef = lastKnownSlotRef,
                   epochStateRef = epochStateRef,
                   etaRotationSnapshots = etaRotationSnapshots,
+                  // k₁ — typed HOCON `nakamoto.confirmation-depth-k` (replaces the prior module-level
+                  // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read inside NakamotoSyncDaemon).
+                  confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK.value,
                   consensusFns = consensusFunctions,
                   snapshotStorage = globalSnapshotStorage,
                   lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,

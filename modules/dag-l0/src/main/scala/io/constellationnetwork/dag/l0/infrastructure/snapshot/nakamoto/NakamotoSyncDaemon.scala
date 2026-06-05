@@ -71,11 +71,11 @@ object NakamotoSyncDaemon {
     */
   final case class StuckParentState(consecutiveTicks: Int, lastFetchAtMillis: Long)
 
-  /** Confirmation depth k — same as SnapshotLeaderLoop.ConfirmationDepthK. Used as the boundary between Tier 2 (sequential walk-back) and
-    * Tier 3 (full catch-up + backfill). Gaps > k mean the network has finalized past our tip; sequential fetch won't work.
-    */
-  private val ConfirmationDepthK: Long =
-    sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH").flatMap(_.toLongOption).getOrElse(255L)
+  // Confirmation depth k₁ — same as SnapshotLeaderLoop.ConfirmationDepthK; the boundary between Tier 2 (sequential
+  // walk-back) and Tier 3 (full catch-up + backfill): gaps > k mean the network has finalized past our tip, so
+  // sequential fetch won't work. NO module-level sys.env read here anymore — the value is threaded in as the
+  // `confirmationDepthK` parameter of `run` -> `handleSnapshot` from `sharedCfg.nakamoto.confirmationDepthK.value`
+  // (project rule: HOCON over scattered env reads).
 
   private val vrf = EcVrf25519.default
 
@@ -254,6 +254,9 @@ object NakamotoSyncDaemon {
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSnapshots: Long,
+    // Confirmation depth k₁ (Tier-2 vs Tier-3 gap boundary). Forwarded from `run`; sourced from
+    // `sharedCfg.nakamoto.confirmationDepthK.value` (replaces the prior module-level sys.env read).
+    confirmationDepthK: Long,
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -326,6 +329,7 @@ object NakamotoSyncDaemon {
               lastKnownSlotRef,
               epochStateRef,
               etaRotationSnapshots,
+              confirmationDepthK,
               consensusFns,
               snapshotStorage,
               lastGlobalSnapshotStorage,
@@ -376,6 +380,11 @@ object NakamotoSyncDaemon {
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSnapshots: Long,
+    // Confirmation depth k₁ — threaded from `sharedCfg.nakamoto.confirmationDepthK.value` at the
+    // GlobalSnapshotConsensus.make call site (replaces the prior module-level
+    // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read; project rule: HOCON over scattered env reads).
+    // Used as the Tier-2 (sequential walk-back) vs Tier-3 (full catch-up) gap boundary in `handleSnapshot`.
+    confirmationDepthK: Long,
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -596,6 +605,7 @@ object NakamotoSyncDaemon {
                                 lastKnownSlotRef,
                                 epochStateRef,
                                 etaRotationSnapshots,
+                                confirmationDepthK,
                                 consensusFns,
                                 snapshotStorage,
                                 lastGlobalSnapshotStorage,
@@ -690,6 +700,7 @@ object NakamotoSyncDaemon {
                                     lastKnownSlotRef,
                                     epochStateRef,
                                     etaRotationSnapshots,
+                                    confirmationDepthK,
                                     consensusFns,
                                     snapshotStorage,
                                     lastGlobalSnapshotStorage,
@@ -926,6 +937,9 @@ object NakamotoSyncDaemon {
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSnapshots: Long,
+    // Confirmation depth k₁ (Tier-2 vs Tier-3 gap boundary). Forwarded from `run`; sourced from
+    // `sharedCfg.nakamoto.confirmationDepthK.value` (replaces the prior module-level sys.env read).
+    confirmationDepthK: Long,
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -1111,16 +1125,16 @@ object NakamotoSyncDaemon {
               chainStore.bestTipOrdinal.flatMap { localBestOrdinal =>
                 val localOrd = localBestOrdinal.getOrElse(0L)
                 val gap = snap.ordinal - localOrd
-                if (gap > ConfirmationDepthK) {
+                if (gap > confirmationDepthK) {
                   logger.warn(
-                    s"🔄 Tier 3: gap=$gap > k=$ConfirmationDepthK for ordinal=${snap.ordinal}. Triggering full catch-up."
+                    s"🔄 Tier 3: gap=$gap > k=$confirmationDepthK for ordinal=${snap.ordinal}. Triggering full catch-up."
                   ) >>
                     Async[F].pure(
                       NakamotoSnapshotValidator.ParentNotFound: NakamotoSnapshotValidator.ValidationResult
                     )
                 } else if (gap > CatchUpThreshold) {
                   logger.info(
-                    s"⏳ Tier 2: gap=$gap (>$CatchUpThreshold, <=$ConfirmationDepthK) for ordinal=${snap.ordinal}. " +
+                    s"⏳ Tier 2: gap=$gap (>$CatchUpThreshold, <=$confirmationDepthK) for ordinal=${snap.ordinal}. " +
                       s"Sequential walk-back from parent ${parentHash.value.take(12)}."
                   ) >>
                     pendingParentRef.update { m =>
@@ -1245,6 +1259,7 @@ object NakamotoSyncDaemon {
               lastKnownSlotRef,
               epochStateRef,
               etaRotationSnapshots,
+              confirmationDepthK,
               consensusFns,
               snapshotStorage,
               lastGlobalSnapshotStorage,

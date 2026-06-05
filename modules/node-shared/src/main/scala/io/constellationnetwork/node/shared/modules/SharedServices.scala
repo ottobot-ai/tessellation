@@ -309,12 +309,11 @@ object SharedServices {
         storages.mptOverlay,
         loggerBundle,
         maintainNodeCollateralWithdrawalExpiryIndex = true,
-        // §3 NIPoPoW S0.4: must match the producer's `NAKAMOTO_ETA_ROTATION_SNAPSHOTS`. Read at GSAM construction so the
-        // boundary-write check (`ord % R == R - 1`) inside accept() is deterministic across all nodes.
-        // Path 1 (heap-leak workstream): moved from `sys.env.get("NAKAMOTO_ETA_ROTATION_SNAPSHOTS")` to HOCON
-        // `nakamoto.eta-rotation-snapshots` (which still honors `${?NAKAMOTO_ETA_ROTATION_SNAPSHOTS}` substitution in
-        // `application.conf` so ops scripts keep working). Matches the migration already landed in
-        // `GlobalSnapshotConsensus.make` — the two GSAM construction sites now read the same typed config field.
+        // §3 NIPoPoW S0.4: the eta-rotation period R. Read at GSAM construction so the boundary-write check
+        // (`ord % R == R - 1`) inside accept() is deterministic across all nodes. R is now DERIVED in
+        // `NakamotoConfig` as `round(3.03·k₁)` from the single `nakamoto.confirmation-depth-k` knob (no longer a
+        // standalone HOCON key) — same typed field the leader loop / GlobalSnapshotConsensus.make read, so all
+        // sites stay in lockstep.
         etaRotationSnapshots = cfg.nakamoto.etaRotationSnapshots.value,
         // Path 1 (heap-leak workstream): wire the eta callback so the boundary-write at `ord % R == R - 1` lands a
         // real computed eta in the `HistoricalStakeSnapshot` MPT entry instead of `Hash.empty`. The callback is backed

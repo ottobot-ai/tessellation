@@ -409,7 +409,14 @@ object SnapshotLeaderLoop {
     lddConfig: LddConfig,
     eligibilityChecker: EligibilityChecker[F],
     slotsPerEpoch: Long = 60L,
+    // R = eta-rotation period. Threaded from `sharedCfg.nakamoto.etaRotationSnapshots.value`
+    // (derived = round(3.03·k₁)) at the GlobalSnapshotConsensus.make call site — NOT a config
+    // read here. The `2550L` literal is a dev/test fallback only; production always passes config.
     etaRotationSnapshots: Long = 2550L,
+    // Confirmation depth k₁ — threaded from `sharedCfg.nakamoto.confirmationDepthK.value` at the
+    // call site (replaces the prior `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read; project rule:
+    // HOCON over scattered sys.env). Drives the depth-k finality gate (`ConfirmationDepthK` below).
+    confirmationDepthK: Long = 255L,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     genesisTimeMs: Long = 0L,
@@ -827,10 +834,12 @@ object SnapshotLeaderLoop {
         //   - 2 nodes: depth-only (can't reach 2/3+1)
         //   - 3+ nodes: attestation finality kicks in fast, depth is the safety net
         //
-        // Override via NAKAMOTO_CONFIRMATION_DEPTH. Default 255 chosen to approximate Cardano-
-        // equivalent 10⁻¹² common-prefix violation against a 1/3 adversary under the LDD
-        // snowplow (ψ=0, γ=15, fA=0.5, fB=0.05). The k=31 sim result is 0.91% per-attempt;
-        // extrapolating the ~1-log-per-24-blocks slope puts 10⁻¹² at k≈271, so 255 is a
+        // Sourced from `sharedCfg.nakamoto.confirmationDepthK.value` (HOCON `nakamoto.confirmation-depth-k`,
+        // overridable via `${?NAKAMOTO_CONFIRMATION_DEPTH}`) — threaded in as the `confirmationDepthK` run
+        // parameter rather than read from sys.env here (project rule: HOCON over scattered env reads).
+        // Default 255 chosen to approximate Cardano-equivalent 10⁻¹² common-prefix violation against a 1/3
+        // adversary under the LDD snowplow (ψ=0, γ=15, fA=0.5, fB=0.05). The k=31 sim result is 0.91%
+        // per-attempt; extrapolating the ~1-log-per-24-blocks slope puts 10⁻¹² at k≈271, so 255 is a
         // deliberately-conservative operating point pending expanded-range sim verification
         // (research-nipopos-2026, sim/adv-7block-private, adv_depth_optimization.py).
         //
@@ -839,8 +848,7 @@ object SnapshotLeaderLoop {
         // for adversarial / partition conditions and only binds when attestation finality
         // stalls. Raising k therefore increases worst-case finality time during degraded
         // operation without affecting normal-case latency.
-        val ConfirmationDepthK: Long =
-          sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH").flatMap(_.toLongOption).getOrElse(255L)
+        val ConfirmationDepthK: Long = confirmationDepthK
 
         // Archival depth k₂ — Phase 2 → Phase 3 boundary (`T_depth2`, task #137).
         //

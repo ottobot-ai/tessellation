@@ -532,6 +532,31 @@ object NakamotoChainStore {
             }
           }
 
+        // TODO(eta-finality-gate): start this walk from the FINALIZED tip, not `bestTipHash`.
+        //
+        // Ouroboros finality requires the eta nonce to be computed from FINALIZED rho values: with
+        // R = round(3.03·k₁) the collection cutoff (`periodStart + 2R/3`) sits ~R/3 ≈ k₁ behind the
+        // period end, so by the time period N's eta is consumed (producing in period N+1) those inputs
+        // SHOULD be past depth-k. Walking from `bestTipHash` instead admits rho values from a
+        // not-yet-finalized fork head, which a later reorg could change → eta divergence at the
+        // rotation boundary.
+        //
+        // NOT changed here, deliberately — doing it correctly is non-trivial and consensus-critical:
+        //   1. `ChainState` (this file, ~:42) tracks `lastFinalizedOrdinal: Long` but does NOT retain a
+        //      finalized-tip HASH — `finalize(hash, ordinal)` (~:605) records only the ordinal (+ prunes)
+        //      and discards the canonical hash. So there is no finalized-tip hash to start from; it must
+        //      be resolved from `lastFinalizedOrdinal` (and may be below the in-memory keep-floor for
+        //      large R, requiring a disk `SnapshotStorage.getHash(ordinal)` hop).
+        //   2. `confirmationDepthK` is not plumbed into this store / method, so the alternative origin
+        //      `(bestTip.ordinal - k₁)` is not computable here without threading it in.
+        //   3. TIMING HAZARD: production calls `vrfOutputsForPeriod(currentPeriod - 1, …)` right as the
+        //      tip enters period N (tip ≈ N·R). At that instant `lastFinalizedOrdinal` can be as low as
+        //      `bestTip.ordinal − k₁`, i.e. just BELOW the period-(N−1) cutoff `N·R − R/3`. Starting the
+        //      walk from the finalized tip there would TRUNCATE the `[periodStart, cutoff)` set and yield
+        //      a DIFFERENT eta than the current best-tip walk — a cluster-splitting consensus change that
+        //      every node must flip together and validate e2e.
+        // Tracked for the eta-amortization rework; until then the existing best-tip walk is preserved so
+        // behavior is byte-identical to the validated baseline.
         def vrfOutputsForPeriod(period: Long, etaRotationSnapshots: Long): F[List[(Long, Array[Byte])]] =
           stateRef.get.flatMap { state =>
             collectVrfOutputsForPeriod(state, period, etaRotationSnapshots, state.bestTipHash)

@@ -71,23 +71,24 @@ object types {
     maxUnappliedGlobalChangeOrdinals: PosInt
   )
 
-  /** Path 1 (heap-leak workstream): the two consensus-critical Nakamoto knobs that previously read directly from `sys.env`
-    * (`NAKAMOTO_ETA_ROTATION_SNAPSHOTS` and `NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED`) routed through HOCON. The HOCON values keep the env-var
-    * fallback for ops continuity (the application.conf entries use `${?NAKAMOTO_...}` substitution), so existing deploy scripts that set
-    * the env vars continue to work — but the read in production code goes through this typed struct.
+  /** Consensus-parameter family. `confirmationDepthK` (k₁) is the SINGLE free config knob; the two related depths are DERIVED from it
+    * (settled by Ouroboros + our fork-race sims) rather than loaded independently — which removes the previous mis-configuration where
+    * `eta-rotation-snapshots` held k₂'s value (10·k₁) and `keep-depth-behind-finalized` held k₁'s.
     *
-    * Defaults match the pre-migration env-var defaults exactly: `eta-rotation-snapshots = 2550` (10·k₁); `keep-depth-behind-finalized =
-    * 255` (k₁).
+    *   - k₁ = `confirmationDepthK` — confirmation depth (fork-race statistical finality). Loaded from HOCON
+    *     (`nakamoto.confirmation-depth-k`, default 255, with `${?NAKAMOTO_CONFIRMATION_DEPTH}` substitution). REUSED by the §3 NIPoPoW
+    *     historical-commitment SMT as its finalized cutoff (`smtRoot(N)` commits ordinals i ≤ N − k₁), and by `SnapshotLeaderLoop` /
+    *     `NakamotoSyncDaemon`.
+    *   - R = `etaRotationSnapshots` = round(3.03·k₁) — eta-rotation period. Ouroboros: the eta nonce uses the first 2/3 of the period's VRF
+    *     rho values, so the last 1/3 = R/3 must be ≥ k₁ (those inputs finalized before use) ⇒ R ≥ 3·k₁; the .03 is the stability margin.
+    *   - k₂ = `keepDepthBehindFinalized` = 10·k₁ — historical-archive / phase-3 retention depth (the tower's moving checkpoint).
     *
     * Other `NAKAMOTO_*` env vars (LDD knobs, slots-per-epoch, etc.) are NOT migrated here — Wave 2 of the sys.env-to-HOCON sweep handles
     * the rest of the namespace in one pass.
     */
   case class NakamotoConfig(
-    etaRotationSnapshots: PosLong,
-    keepDepthBehindFinalized: PosLong,
-    // Confirmation depth k₁ — REUSED by the §3 NIPoPoW historical-commitment SMT as its finalized cutoff (`smtRoot(N)` commits
-    // ordinals i ≤ N − k). Mirrors the existing `NAKAMOTO_CONFIRMATION_DEPTH` env default (255) via the HOCON `${?...}` substitution
-    // so the gl0 SMT wiring, `SnapshotLeaderLoop.ConfirmationDepthK`, and `NakamotoSyncDaemon` all agree.
+    // Confirmation depth k₁ — the single loaded consensus-depth knob (`nakamoto.confirmation-depth-k`, default 255 via the
+    // `${?NAKAMOTO_CONFIRMATION_DEPTH}` substitution). R and k₂ below are DERIVED from it; see the `def`s in the body.
     confirmationDepthK: PosLong,
     // #259 active-recovery: caps on the metagraph orphan buffer + recent-admission cache. Migrated from the
     // `NAKAMOTO_ORPHAN_BUFFER_CAP` / `NAKAMOTO_RECENT_ADMIT_CAP` env reads to typed HOCON (project rule: no scattered
@@ -108,7 +109,13 @@ object types {
     localEvents: LocalEventsConfig,
     committee: CommitteeConfig,
     sharding: ShardingConfig
-  )
+  ) {
+    // R = 3.03·k₁ (Ouroboros: first-2/3 nonce + last-1/3 ≥ k₁ stability; .03 = margin). Derived from k₁, NOT loaded — keeps the
+    // eta-rotation period in lockstep with the confirmation depth so the boundary-write check (`ord % R == R - 1`) stays sound.
+    def etaRotationSnapshots: PosLong = PosLong.unsafeFrom(math.round(3.03d * confirmationDepthK.value))
+    // k₂ = 10·k₁ — historical-archive / phase-3 retention (tower moving checkpoint). Derived from k₁, NOT loaded.
+    def keepDepthBehindFinalized: PosLong = PosLong.unsafeFrom(10L * confirmationDepthK.value)
+  }
 
   /** Committee draw/quorum decouple — the two cluster-uniform knobs that size the per-metagraph committee gate AND (reused) the per-shard
     * committee. Both MUST be byte-identical on every node: `kDraw` keys the VRF/VK-seeded DRAW so the elected committee is the SAME

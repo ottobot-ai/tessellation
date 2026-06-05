@@ -29,19 +29,13 @@ services:
       # so doubling fA just changed the fill-rate metric without producing
       # snapshots faster.
       - NAKAMOTO_SLOTS_PER_EPOCH=${NAKAMOTO_SLOTS_PER_EPOCH:-60}
-      # R = 100 snapshots for e2e (production default 2550 = 10·k₁). Violates the
-      # R ≥ 3·k₁ bound but tests aren't adversarial; chosen to exercise rotation
-      # mechanism many times per run. See `docs/nakamoto/attestation-and-finality.md` §1.3.
-      - NAKAMOTO_ETA_ROTATION_SNAPSHOTS=${NAKAMOTO_ETA_ROTATION_SNAPSHOTS:-100}
-      # Heap-leak Fix B + Path 1 (heap-leak workstream): bound `NakamotoChainStore.byHash`
-      # retention to a sliding window behind the finalized tip. Default = k₁ = 255 ords.
-      # E2e variant for Path 1 acceptance: run with the default (255) AND
-      # NAKAMOTO_ETA_ROTATION_SNAPSHOTS=100 — VRF walks for eta rotation cross the
-      # eviction boundary (R=100 << keepDepth=255 so the walk stays in-memory; bumping
-      # R well above keepDepth would force the disk-fallback path. Production default
-      # for R is 2550). After Path 1, the disk fallback in `getWithOrdinalFallback`
-      # guarantees correctness even when the walk crosses the eviction floor.
-      - NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED=${NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED:-255}
+      # k₁ = confirmation depth — the SINGLE Nakamoto consensus-depth knob. R (eta-rotation
+      # period) and k₂ (keep-depth) are now DERIVED from k₁ in NakamotoConfig, NOT set here:
+      #   R  = round(3.03·k₁) = 100, k₂ = 10·k₁ = 330 at k₁ = 33.
+      # k₁ = 33 chosen for e2e (production default 255) so R = 100 exercises the rotation
+      # mechanism many times per run. (Tests aren't adversarial, so a small k₁ is fine.)
+      # See `docs/nakamoto/attestation-and-finality.md` §1.3.
+      - NAKAMOTO_CONFIRMATION_DEPTH=${NAKAMOTO_CONFIRMATION_DEPTH:-33}
       - NAKAMOTO_LDD_CUTOFF=${NAKAMOTO_LDD_CUTOFF:-16}
       - NAKAMOTO_LDD_OFFSET=${NAKAMOTO_LDD_OFFSET:-1}
       - NAKAMOTO_LDD_BASELINE=${NAKAMOTO_LDD_BASELINE:-0.05}
@@ -91,8 +85,9 @@ services:
       - SIDECAR_HOST=sidecar${CONTAINER_NAME_SUFFIX:-}
       - SIDECAR_GRPC_PORT=50051
       # #259: gl1 also follows gl0 + recomputes the historicalStakeSnapshots stateProof,
-      # so it needs the same eta-rotation R as gl0/metagraph (verifier determinism).
-      - NAKAMOTO_ETA_ROTATION_SNAPSHOTS=${NAKAMOTO_ETA_ROTATION_SNAPSHOTS:-100}
+      # so it needs the same k₁ as gl0/metagraph (R = round(3.03·k₁) is derived → verifier
+      # determinism). MUST match gl0's NAKAMOTO_CONFIRMATION_DEPTH default.
+      - NAKAMOTO_CONFIRMATION_DEPTH=${NAKAMOTO_CONFIRMATION_DEPTH:-33}
     # NOTE: no `depends_on: sidecar` here — the `sidecar` service is in profile
     # `l0` (started by the gl0 launch), and adding a depends_on under the `l1`
     # profile would make compose error with "undefined service sidecar". The
