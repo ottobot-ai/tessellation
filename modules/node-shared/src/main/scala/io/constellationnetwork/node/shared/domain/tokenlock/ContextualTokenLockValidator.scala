@@ -209,12 +209,21 @@ object ContextualTokenLockValidator {
       private def resolveConflict(
         tokenLock: Hashed[TokenLock],
         txs: SortedMap[TokenLockOrdinal, StoredTokenLock]
-      ): ConflictResolveResult =
+      ): ConflictResolveResult = {
+        val incomingRef = TokenLockReference.of(tokenLock)
         txs.get(tokenLock.ordinal) match {
+          // Idempotent re-submission: the exact same token lock (same ref = same
+          // ordinal+hash) is already stored at this ordinal. Re-sending it — a batch-submit
+          // retry or gossip redelivery of an already-accepted lock — must be a no-op accept,
+          // NOT a self-conflict. Without this it surfaced as Conflict{ordinal, h, h}
+          // (existingHash===newHash), which broke the submitter's retry-with-fresh-lastRef
+          // chain (the #186 token-lock replacement race).
+          case Some(stored) if stored.ref === incomingRef                       => NoConflict(tokenLock)
           case Some(WaitingTokenLock(existing)) if existing.fee < tokenLock.fee => CanOverride(tokenLock)
-          case Some(tx) => CannotOverride(tokenLock, tx.ref, TokenLockReference.of(tokenLock))
-          case None     => NoConflict(tokenLock)
+          case Some(tx)                                                         => CannotOverride(tokenLock, tx.ref, incomingRef)
+          case None                                                             => NoConflict(tokenLock)
         }
+      }
 
       private def getTransactionsAboveMajority(
         txs: SortedMap[TokenLockOrdinal, StoredTokenLock]
