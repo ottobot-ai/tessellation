@@ -446,21 +446,36 @@ object MetagraphCommitteeGate {
         eta: Array[Byte],
         lookupSenderStake: PeerId => F[Ratio]
       ): F[Unit] =
-        verifyReceived(att, eta, lookupSenderStake).flatMap {
-          case ReceiverOutcome.Recorded =>
-            aggregator
-              .record(att.metagraphAddress, att.parentHash, att.binaryHash, att.senderPeerId)
-              .flatMap { count =>
-                logger.info(
-                  s"📨 committee-attestation recorded from=${att.senderPeerId.value.value.take(16)}... mg=${att.metagraphAddress} parent=${att.parentHash.value
-                      .take(12)}... count=$count"
-                )
-              }
-          case other =>
-            logger.warn(
-              s"⚠️ committee-attestation rejected (reason=$other) from=${att.senderPeerId.value.value
+        // DEDUP-BEFORE-VERIFY: gossip re-delivers the same attestation constantly. Re-running the three
+        // crypto verifies (Ed25519 + KES + VRF-membership) for a re-delivery of an ALREADY verified+recorded
+        // (mg, parent, binary, sender) was CPU-saturating gl0 under multi-metagraph×sharding (load 156,
+        // attestation-finality grinding to >70s/snapshot, step-like progression). The tally is unchanged by a
+        // re-delivery, so this short-circuit is determinism-neutral. Safe: a NEW or forged attestation for an
+        // un-recorded key still takes the full-verify path below (a forged sig fails there; equivocation has a
+        // different binaryHash ⇒ different key ⇒ not deduped).
+        aggregator.alreadyRecorded(att.metagraphAddress, att.parentHash, att.binaryHash, att.senderPeerId).flatMap {
+          case true =>
+            logger.debug(
+              s"committee-attestation DEDUP (already recorded, skipped re-verify) from=${att.senderPeerId.value.value
                   .take(16)}... mg=${att.metagraphAddress} parent=${att.parentHash.value.take(12)}..."
             )
+          case false =>
+            verifyReceived(att, eta, lookupSenderStake).flatMap {
+              case ReceiverOutcome.Recorded =>
+                aggregator
+                  .record(att.metagraphAddress, att.parentHash, att.binaryHash, att.senderPeerId)
+                  .flatMap { count =>
+                    logger.info(
+                      s"📨 committee-attestation recorded from=${att.senderPeerId.value.value.take(16)}... mg=${att.metagraphAddress} parent=${att.parentHash.value
+                          .take(12)}... count=$count"
+                    )
+                  }
+              case other =>
+                logger.warn(
+                  s"⚠️ committee-attestation rejected (reason=$other) from=${att.senderPeerId.value.value
+                      .take(16)}... mg=${att.metagraphAddress} parent=${att.parentHash.value.take(12)}..."
+                )
+            }
         }
 
       /** Pure-ish verifier used by `recordReceivedAttestation` — returns the `ReceiverOutcome` ADT so callers and tests can observe which

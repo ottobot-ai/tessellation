@@ -63,6 +63,28 @@ object MetagraphAttestationAggregatorSuite extends SimpleIOSuite {
     } yield expect(c1 == 1).and(expect(c2 == 2)).and(expect(c3 == 2))
   }
 
+  // ============ alreadyRecorded — dedup-before-verify short-circuit ============
+
+  test("alreadyRecorded is true ONLY for the exact recorded (mg, parent, binary, peer); a new peer / mg / binary is NOT deduped") {
+    val mg = addr("mg-A")
+    val p = parent("p1")
+    val bin = hash("bin-1")
+    for {
+      agg <- MetagraphAttestationAggregator.make[IO]
+      before <- agg.alreadyRecorded(mg, p, bin, pid("peer-1"))
+      _ <- agg.record(mg, p, bin, pid("peer-1"))
+      sameKey <- agg.alreadyRecorded(mg, p, bin, pid("peer-1")) // gossip re-delivery → short-circuit verify
+      otherPeer <- agg.alreadyRecorded(mg, p, bin, pid("peer-2")) // different attester → must still verify
+      otherMg <- agg.alreadyRecorded(addr("mg-B"), p, bin, pid("peer-1")) // different metagraph
+      otherBin <- agg.alreadyRecorded(mg, p, hash("bin-2"), pid("peer-1")) // equivocation (diff binary) → must verify
+    } yield
+      expect(!before)
+        .and(expect(sameKey))
+        .and(expect(!otherPeer))
+        .and(expect(!otherMg))
+        .and(expect(!otherBin))
+  }
+
   // ============ per-binary isolation ============
 
   test("different (metagraph, parent, hash) keys tally independently") {

@@ -44,6 +44,19 @@ trait MetagraphAttestationAggregator[F[_]] {
     peerId: PeerId
   ): F[Int]
 
+  /** Has this EXACT `(metagraphAddress, parentHash, binaryHash, peerId)` already been recorded? Lets the committee gate SKIP the expensive
+    * Ed25519+KES+VRF re-verification of a gossip RE-DELIVERY of an already-verified attestation — the redundant verify was CPU-saturating
+    * gl0 under multi-metagraph×sharding (load 156, finality grinding to >70s/snapshot, step-like progression). Safe: a NEW or forged
+    * attestation for an un-recorded key is still fully verified (a forged sig fails verification; equivocation uses a different binaryHash
+    * → different key → not deduped). Only a re-delivery of the SAME already-verified sender's attestation is short-circuited.
+    */
+  def alreadyRecorded(
+    metagraphAddress: Address,
+    parentHash: Hash,
+    binaryHash: Hash,
+    peerId: PeerId
+  ): F[Boolean]
+
   /** Current count of distinct committee members that have attested this binary. */
   def countFor(
     metagraphAddress: Address,
@@ -121,6 +134,18 @@ object MetagraphAttestationAggregator {
             (updatedOuter, newPeers.size)
           }
         }
+
+        // Local read-only contains: is this (mg, parent, binary, peer) already in the tally?
+        // O(1) hash lookups; never serialized/hashed — pure local short-circuit for the gate.
+        def alreadyRecorded(
+          metagraphAddress: Address,
+          parentHash: Hash,
+          binaryHash: Hash,
+          peerId: PeerId
+        ): F[Boolean] =
+          tallyRef.get.map { outer =>
+            outer.get(metagraphAddress).flatMap(_.get(BinaryKey(parentHash, binaryHash))).exists(_.contains(peerId))
+          }
 
         def countFor(
           metagraphAddress: Address,
