@@ -165,6 +165,33 @@ trait MetagraphOrphanBuffer[F[_]] {
     * the receiver computes the committee-VRF eta from it. `None` falls through to the buffered-content path (`peekForWireHash`).
     */
   def lookupPendingParentOrdinal(metagraphAddress: Address, wireHash: Hash): F[Option[Long]]
+
+  /** Phase-0 of verify-on-attach (#29). Buffer an inbound committee attestation UN-VERIFIED, keyed by the binary's WIRE hash
+    * (`att.binaryHash`). Held while the attested binary is still an orphan — its parent not yet admitted to the canonical chain, so the
+    * binary sits on a tine this node is not (yet) attached to. We deliberately do NOT spend Ed25519+KES+VRF here: during an eta-rotation
+    * fork storm most competing tines get evicted, and verifying their attestations speculatively is the CPU sink that starved gl0 producers
+    * off the air. When the binary ATTACHES — drains from the orphan buffer and enters the `resolveParent == Some` admit path —
+    * [[drainAttestations]] releases these for verification (Phase 1), just before the committee threshold check. Idempotent per
+    * `senderPeerId`: a gossip re-delivery of the same sender's attestation is not re-buffered. Bounded FIFO across all in-flight binaries.
+    */
+  def bufferAttestation(
+    metagraphAddress: Address,
+    binaryHash: Hash,
+    att: MetagraphCommitteeGate.IncomingAttestation
+  ): F[Unit]
+
+  /** Phase-1 of verify-on-attach (#29). Remove and return (chronological order) the attestations buffered against `(metagraphAddress,
+    * binaryHash)`. Called at the attach point — the binary's `resolveParent == Some` admit path — so the now-canonical binary's
+    * attestations are verified + tallied just before the committee threshold gate. Empty if none were buffered (the common in-flight case,
+    * where attestations arrive after the binary and take the eager-verify Tier-1 path instead).
+    */
+  def drainAttestations(
+    metagraphAddress: Address,
+    binaryHash: Hash
+  ): F[List[MetagraphCommitteeGate.IncomingAttestation]]
+
+  /** Diagnostic: total Phase-0 (un-verified) attestations currently buffered across all binaries. */
+  def attestationsBufferSize: F[Int]
 }
 
 object MetagraphOrphanBuffer {
@@ -187,6 +214,13 @@ object MetagraphOrphanBuffer {
     */
   val DefaultAdmissionsCap: Int = 4096
 
+  /** Cap on Phase-0 buffered (un-verified) attestations across all in-flight orphan binaries (#29). Each orphan can accrue up to the
+    * committee size in attestations before it attaches; at the orphan cap × ~16-member committees this stays a few thousand. Bounded-FIFO
+    * like the binary buffer (oldest evicted on overflow). 8192 × ~320 B (PeerId + 2 hashes + 3 sig byte-arrays + bookkeeping) ≈ 2.6 MB
+    * worst case. Tests use the default; production can thread an explicit value through [[make]] like the other caps.
+    */
+  val DefaultAttestationsCap: Int = 8192
+
   /** Buffer key. Keying on `(metagraphAddress, parentHash)` lets us drain all children of a freshly-accepted binary in one lookup. */
   private final case class Key(metagraphAddress: Address, parentHash: Hash)
 
@@ -198,11 +232,15 @@ object MetagraphOrphanBuffer {
   /** Recent-admission entry. `seq` is monotonic for FIFO eviction; `mgOrdinal` is the value we return on lookup. */
   private final case class AdmissionEntry(seq: Long, mgOrdinal: Long)
 
+  /** Phase-0 buffered-attestation entry (#29). `seq` is monotonic for FIFO eviction; `att` is the un-verified inbound attestation. */
+  private final case class AttestationEntry(seq: Long, att: MetagraphCommitteeGate.IncomingAttestation)
+
   /** Build an in-memory buffer. */
   def make[F[_]: Async](
     logger0: Logger[F],
     cap: Int = DefaultCap,
-    admissionsCap: Int = DefaultAdmissionsCap
+    admissionsCap: Int = DefaultAdmissionsCap,
+    attestationsCap: Int = DefaultAttestationsCap
   ): F[MetagraphOrphanBuffer[F]] =
     for {
       stateRef <- Ref.of[F, Map[Key, List[Entry]]](Map.empty)
@@ -214,6 +252,10 @@ object MetagraphOrphanBuffer {
       // cap as the admission cache, keyed on the wire-bytes hash instead of the value hash.
       pendingParentOrdinalRef <- Ref.of[F, Map[(Address, Hash), AdmissionEntry]](Map.empty)
       pendingParentSeqRef <- Ref.of[F, Long](0L)
+      // #29 verify-on-attach: Phase-0 un-verified attestations keyed by (mg, WIRE hash). Drained + verified
+      // when the attested binary attaches (its `resolveParent == Some` admit path). Bounded-FIFO via `seq`.
+      attestationsRef <- Ref.of[F, Map[(Address, Hash), List[AttestationEntry]]](Map.empty)
+      attestationsSeqRef <- Ref.of[F, Long](0L)
     } yield
       new MetagraphOrphanBuffer[F] {
 
@@ -342,6 +384,38 @@ object MetagraphOrphanBuffer {
 
         def lookupPendingParentOrdinal(metagraphAddress: Address, wireHash: Hash): F[Option[Long]] =
           pendingParentOrdinalRef.get.map(_.get((metagraphAddress, wireHash)).map(_.mgOrdinal))
+
+        def bufferAttestation(
+          metagraphAddress: Address,
+          binaryHash: Hash,
+          att: MetagraphCommitteeGate.IncomingAttestation
+        ): F[Unit] =
+          for {
+            nextSeq <- attestationsSeqRef.updateAndGet(_ + 1L)
+            _ <- attestationsRef.update { state =>
+              val key = (metagraphAddress, binaryHash)
+              val existing = state.getOrElse(key, Nil)
+              // Idempotent per sender: a gossip re-delivery of the same sender's attestation is not re-buffered.
+              if (existing.exists(_.att.senderPeerId === att.senderPeerId)) state
+              else enforceAttestationsCap(state.updated(key, AttestationEntry(nextSeq, att) :: existing), attestationsCap)
+            }
+          } yield ()
+
+        def drainAttestations(
+          metagraphAddress: Address,
+          binaryHash: Hash
+        ): F[List[MetagraphCommitteeGate.IncomingAttestation]] =
+          attestationsRef.modify { state =>
+            val key = (metagraphAddress, binaryHash)
+            state.get(key) match {
+              case None => (state, Nil)
+              // Entries prepended (newest first) → reverse for chronological replay.
+              case Some(entries) => (state - key, entries.reverse.map(_.att))
+            }
+          }
+
+        def attestationsBufferSize: F[Int] =
+          attestationsRef.get.map(_.values.foldLeft(0)((acc, es) => acc + es.length))
       }
 
   /** Total entry count across all keys. Linear in number of keys; cheap given the small cap. */
@@ -379,4 +453,28 @@ object MetagraphOrphanBuffer {
       val sortedByAge = admissions.toList.sortBy(_._2.seq)
       sortedByAge.drop(admissions.size - cap).toMap
     }
+
+  /** FIFO eviction on the Phase-0 attestation buffer (#29). Drops the oldest (lowest seq) attestations across all binaries until the total
+    * ≤ cap. Mirrors [[enforceCap]] (the binary buffer): linear per eviction, bounded under the cap.
+    */
+  private def enforceAttestationsCap(
+    state: Map[(Address, Hash), List[AttestationEntry]],
+    cap: Int
+  ): Map[(Address, Hash), List[AttestationEntry]] = {
+    def total(s: Map[(Address, Hash), List[AttestationEntry]]): Int =
+      s.values.foldLeft(0)((acc, es) => acc + es.length)
+    @scala.annotation.tailrec
+    def loop(s: Map[(Address, Hash), List[AttestationEntry]]): Map[(Address, Hash), List[AttestationEntry]] =
+      if (total(s) <= cap) s
+      else {
+        val oldest = s.iterator.flatMap { case (k, es) => es.map(e => (k, e)) }.minByOption(_._2.seq)
+        oldest match {
+          case None => s
+          case Some((key, entry)) =>
+            val remaining = s(key).filterNot(_.seq == entry.seq)
+            loop(if (remaining.isEmpty) s - key else s.updated(key, remaining))
+        }
+      }
+    loop(state)
+  }
 }

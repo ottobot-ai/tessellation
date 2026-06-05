@@ -3,7 +3,9 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 import cats.effect.IO
 
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.hex.Hex
 
 import eu.timepit.refined.auto._
 import org.typelevel.log4cats.slf4j.Slf4jLogger
@@ -21,6 +23,97 @@ object MetagraphOrphanBufferSuite extends SimpleIOSuite {
     Hash(seed.padTo(64, '0').take(64))
 
   private def mkBytes(n: Int): Array[Byte] = Array.tabulate(64)(i => ((i + n) % 256).toByte)
+
+  private def pid(name: String): PeerId =
+    PeerId(Hex(name.getBytes("UTF-8").map(b => f"$b%02x").mkString))
+
+  private def mkAtt(
+    peer: String,
+    binaryHash: Hash,
+    parent: Hash = mkHash("p0"),
+    mg: Address = mgA
+  ): MetagraphCommitteeGate.IncomingAttestation =
+    MetagraphCommitteeGate.IncomingAttestation(
+      senderPeerId = pid(peer),
+      senderVrfVk = mkBytes(1),
+      metagraphAddress = mg,
+      parentHash = parent,
+      binaryHash = binaryHash,
+      committeeVrfProof = mkBytes(2),
+      longTermSignature = mkBytes(3),
+      kesSignature = mkBytes(4),
+      senderTreeStep = 0
+    )
+
+  // ─── #29 verify-on-attach: Phase-0 un-verified attestation buffer ───────────────────────────
+  // `bufferAttestation` holds inbound attestations for binaries we cannot yet attach (orphan tine / not-yet-
+  // arrived); `drainAttestations` releases them at the attach point for Phase-1 verification. No crypto in the
+  // buffer — these tests assert the bookkeeping (order, isolation, idempotency, FIFO cap) only.
+
+  test("bufferAttestation + drainAttestations — held un-verified, released in arrival order; buffer emptied") {
+    val bin = mkHash("b1n1")
+    for {
+      buf <- MetagraphOrphanBuffer.make[IO](logger)
+      _ <- buf.bufferAttestation(mgA, bin, mkAtt("peer-1", bin))
+      _ <- buf.bufferAttestation(mgA, bin, mkAtt("peer-2", bin))
+      sizeBefore <- buf.attestationsBufferSize
+      drained <- buf.drainAttestations(mgA, bin)
+      sizeAfter <- buf.attestationsBufferSize
+    } yield
+      expect
+        .eql(2, sizeBefore)
+        .and(expect.eql(2, drained.length))
+        .and(expect(drained.map(_.senderPeerId) == List(pid("peer-1"), pid("peer-2"))))
+        .and(expect.eql(0, sizeAfter))
+  }
+
+  test("drainAttestations — absent (mg, binary) returns empty and leaves the buffer intact") {
+    val bin = mkHash("b2n2")
+    for {
+      buf <- MetagraphOrphanBuffer.make[IO](logger)
+      _ <- buf.bufferAttestation(mgA, bin, mkAtt("peer-1", bin))
+      drainedOtherBin <- buf.drainAttestations(mgA, mkHash("nope"))
+      drainedOtherMg <- buf.drainAttestations(mgB, bin)
+      sizeAfter <- buf.attestationsBufferSize
+    } yield
+      expect
+        .eql(0, drainedOtherBin.length)
+        .and(expect.eql(0, drainedOtherMg.length))
+        .and(expect.eql(1, sizeAfter))
+  }
+
+  test("bufferAttestation — idempotent per senderPeerId (gossip re-delivery not re-buffered)") {
+    val bin = mkHash("b3n3")
+    for {
+      buf <- MetagraphOrphanBuffer.make[IO](logger)
+      _ <- buf.bufferAttestation(mgA, bin, mkAtt("peer-1", bin))
+      _ <- buf.bufferAttestation(mgA, bin, mkAtt("peer-1", bin)) // gossip re-delivery — same sender, dropped
+      _ <- buf.bufferAttestation(mgA, bin, mkAtt("peer-2", bin)) // distinct sender — kept
+      size <- buf.attestationsBufferSize
+      drained <- buf.drainAttestations(mgA, bin)
+    } yield
+      expect
+        .eql(2, size)
+        .and(expect(drained.map(_.senderPeerId).toSet == Set(pid("peer-1"), pid("peer-2"))))
+  }
+
+  test("bufferAttestation — FIFO cap evicts the oldest attestation across binaries") {
+    val cap = 3
+    for {
+      buf <- MetagraphOrphanBuffer.make[IO](logger, attestationsCap = cap)
+      _ <- buf.bufferAttestation(mgA, mkHash("c1"), mkAtt("p1", mkHash("c1")))
+      _ <- buf.bufferAttestation(mgA, mkHash("c2"), mkAtt("p2", mkHash("c2")))
+      _ <- buf.bufferAttestation(mgA, mkHash("c3"), mkAtt("p3", mkHash("c3")))
+      _ <- buf.bufferAttestation(mgA, mkHash("c4"), mkAtt("p4", mkHash("c4"))) // overflow → evict oldest (c1)
+      size <- buf.attestationsBufferSize
+      c1 <- buf.drainAttestations(mgA, mkHash("c1")) // oldest — evicted
+      c4 <- buf.drainAttestations(mgA, mkHash("c4")) // newest — retained
+    } yield
+      expect
+        .eql(cap, size)
+        .and(expect.eql(0, c1.length))
+        .and(expect.eql(1, c4.length))
+  }
 
   test("record + drainChildren — orphans drained in chronological order") {
     val parent = mkHash("aaaa")

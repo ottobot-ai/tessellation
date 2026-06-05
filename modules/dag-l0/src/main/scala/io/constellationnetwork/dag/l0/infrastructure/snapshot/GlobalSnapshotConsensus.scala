@@ -1293,6 +1293,10 @@ object GlobalSnapshotConsensus {
               parentOrdinalFor = committeeParentOrdinalForBinary,
               etaForParentOrdinal = committeeEtaForOrdinal,
               selfStake = stakeRegistry.committeeStake(selfId),
+              // #29 verify-on-attach: same per-sender stake lookup the inbound-attestation receiver uses (see the
+              // `senderStakeLookup` wiring below), so attestations buffered while a binary was an orphan verify
+              // identically when it attaches in the admit path.
+              senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.committeeStake(peer),
               orphanBuffer = orphanBuffer,
               logger = orphanBufferLogger
             )

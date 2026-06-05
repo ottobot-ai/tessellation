@@ -2030,8 +2030,10 @@ object NakamotoSyncDaemon {
   private def handleMetagraphAttestation[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector](
     att: pb.MetagraphAttestation,
     committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
-    // #213/#290: content-derived parent-ordinal resolver — `(mg, parentHash, binaryContent)`. The third
-    // arg is the attested binary's `signed.value.content`, looked up from the orphan buffer (below).
+    // #213/#290 content-derived parent-ordinal resolver — `(mg, parentHash, binaryContent)`. Unused in this
+    // handler since #29 (verify-on-attach): the receiver now buffers attestations un-verified and the admit
+    // path (`makeMetagraphBinaryProcessor`) resolves the ordinal + verifies them at attach time. Retained for
+    // signature parity with that processor; drop along the call chain in a later cleanup.
     parentOrdinalFor: (
       io.constellationnetwork.schema.address.Address,
       io.constellationnetwork.security.hash.Hash,
@@ -2048,7 +2050,6 @@ object NakamotoSyncDaemon {
   ): F[Unit] = {
     import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
     import io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.IncomingAttestation
-    import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
     import eu.timepit.refined.refineV
 
     refineV[DAGAddressRefined](att.metagraphAddress) match {
@@ -2072,67 +2073,55 @@ object NakamotoSyncDaemon {
           kesSignature = att.kesSignature.toByteArray,
           senderTreeStep = att.senderTreeStep
         )
-        // #213/#290: resolve the metagraph parent ordinal — the quantity the committee-VRF eta is derived
-        // from — WITHOUT ever trusting the sender's claimed ordinal, via three tiers of gl0's own state:
+        // #213/#290 + #29 (verify-on-attach): resolve the committee-VRF eta WITHOUT trusting the sender's
+        // claimed ordinal AND without spending crypto on tines we aren't attached to. Two paths (below):
         //
-        //   (1) PENDING-PARENT-ORDINAL CACHE (the load-bearing fast path). When this node processed the
-        //       same gossiped binary in `processBytes` it cached `(wireHash → parentOrdinal)` before
-        //       attesting. A binary being attested is IN-FLIGHT — its parent is at the tip, so it was
-        //       NEVER buffered — which is exactly why the orphan-buffer scan (tier 2) cannot see it. Before
-        //       this cache existed the receiver had only tier 2, so every peer attested next-in-line
-        //       binaries no peer could resolve → eta undrivable → attestation dropped → committee threshold
-        //       reached ZERO times → metagraph chains froze at genesis. `att.binaryHash` == the wire digest
-        //       this node hashed in `processBytes`, so the key matches.
-        //   (2) BUFFERED-CONTENT FALLBACK. If we BUFFERED the binary instead (we're lagging — its parent
-        //       isn't admitted yet), derive the ordinal from the held content (`parentOrdinalFor` is the
-        //       content-only resolver) so we still record the attestation for when the binary is later
-        //       drained + admitted.
-        //   (3) FAIL CLOSED. We hold neither — a genuine gossip race (attestation outran the binary). Drop
-        //       it; the binary will arrive and its own admission re-drives the gate.
+        //   TIER 1 — IN-FLIGHT → eager verify. When this node processed the same gossiped binary in
+        //       `processBytes` it cached `(wireHash → parentOrdinal)` (`recordPendingParentOrdinal`) before
+        //       attesting. A `Some` from `lookupPendingParentOrdinal` means the binary's parent is at the tip —
+        //       it is attaching NOW (running the `resolveParent == Some` admit path) — so it is a canonical
+        //       candidate and its attestation is worth verifying immediately, so `attestAndAdmit`'s threshold
+        //       sees it. `att.binaryHash` == the wire digest this node hashed in `processBytes`, so keys match.
+        //   PHASE 0 — NOT IN-FLIGHT → buffer, defer verify (#29). Otherwise the binary is orphan-buffered (its
+        //       parent isn't admitted — a tine we aren't attached to) or hasn't arrived. We do NOT verify now:
+        //       speculatively crypto-checking attestations for fork-storm tines that mostly get evicted is the
+        //       committee-gate CPU sink that starved gl0 producers off the air. `bufferAttestation` holds it
+        //       un-verified; when the binary ATTACHES (drains into the admit path) `drainAttestations` replays
+        //       it for verification right before the threshold gate. Losing tines' attestations expire
+        //       un-verified — zero crypto. (This subsumes the old buffered-content-deserialize tier AND the
+        //       fail-closed drop: a not-yet-arrived binary's attestation now waits in the buffer rather than
+        //       being dropped, and verifies if/when the binary lands and attaches.)
         //
-        // SAFETY (anti-forgery): every tier reads gl0's OWN resolved/held state for THIS binary, never the
-        // sender's claimed ordinal — a forged ordinal yields a wrong eta and the committee-VRF verify
-        // below rejects it.
+        // SAFETY (anti-forgery): Tier 1 reads gl0's OWN cached ordinal for THIS binary, never the sender's
+        // claim — a forged ordinal yields a wrong eta and the committee-VRF verify rejects it. Phase-0
+        // attestations are likewise verified at attach time against gl0's own resolved ordinal.
         val recordWithOrdinal: Long => F[Unit] = parentOrdinal =>
           etaForParentOrdinal(parentOrdinal).flatMap { eta =>
             committeeGate.recordReceivedAttestation(incoming, eta, senderStakeLookup)
           }
         orphanBuffer.lookupPendingParentOrdinal(metagraphAddress, binaryHash).flatMap {
-          case Some(parentOrdinal) => recordWithOrdinal(parentOrdinal)
+          case Some(parentOrdinal) =>
+            // Tier 1 — the binary is IN-FLIGHT: its parent is at the tip, so it is attaching NOW (running the
+            // `resolveParent == Some` admit path in `processBytes`). Verify eagerly so `attestAndAdmit`'s
+            // threshold sees this attestation immediately. `recordPendingParentOrdinal` seeded this lookup at
+            // resolve time, so a `Some` here means the binary is canonical-candidate — worth the crypto.
+            recordWithOrdinal(parentOrdinal)
           case None =>
-            HasherSelector[F].withCurrent { implicit hasher =>
-              orphanBuffer
-                .peekForWireHash(metagraphAddress, binaryHash)(bytes => Hasher[F].hashBytes(bytes).map(_.some))
-                .flatMap {
-                  case None =>
-                    logger.warn(
-                      s"⚠️ Rejecting metagraph-attestation: binary neither resolved nor buffered locally mg=$metagraphAddress " +
-                        s"parent=${parentHash.value.take(12)}... binary=${binaryHash.value.take(12)}... " +
-                        s"(fail-closed — gossip race; binary will arrive + re-drive the gate; #213/#290)"
-                    )
-                  case Some(wireBytes) =>
-                    io.constellationnetwork.json
-                      .JsonSerializer[F]
-                      .deserialize[Signed[StateChannelSnapshotBinary]](wireBytes)
-                      .flatMap {
-                        case Left(decodeErr) =>
-                          logger.warn(
-                            s"⚠️ Rejecting metagraph-attestation: buffered binary decode failed mg=$metagraphAddress " +
-                              s"binary=${binaryHash.value.take(12)}... (${decodeErr.getMessage})"
-                          )
-                        case Right(signedBinary) =>
-                          parentOrdinalFor(metagraphAddress, parentHash, signedBinary.value.content).flatMap {
-                            case None =>
-                              logger.warn(
-                                s"⚠️ Rejecting metagraph-attestation: buffered binary content for mg=$metagraphAddress " +
-                                  s"binary=${binaryHash.value.take(12)}... is malformed (decoded as neither incremental " +
-                                  s"nor full currency snapshot) — fail-closed"
-                              )
-                            case Some(parentOrdinal) => recordWithOrdinal(parentOrdinal)
-                          }
-                      }
-                }
-            }
+            // Phase-0 of verify-on-attach (#29). The binary is NOT in-flight — it is either orphan-buffered
+            // (its parent isn't admitted: a tine we aren't attached to) or simply hasn't arrived yet. EITHER
+            // way we must NOT spend Ed25519+KES+VRF on it now: speculatively verifying attestations for tines
+            // that mostly get evicted during an eta-rotation fork storm is the committee-gate CPU sink that
+            // starved gl0 producers off the air. Buffer the attestation UN-VERIFIED (keyed by the wire hash);
+            // when the binary ATTACHES (drains into the `resolveParent == Some` admit path) `drainAttestations`
+            // releases it for verification (Phase 1), right before the threshold gate. If the binary never
+            // attaches (losing tine) the buffered attestation is FIFO-evicted un-verified — zero crypto spent.
+            // Replaces the prior peekForWireHash-scan + eager recordWithOrdinal (the speculative-verify bug).
+            orphanBuffer.bufferAttestation(metagraphAddress, binaryHash, incoming) >>
+              logger.debug(
+                s"📥 Phase-0 buffered committee-attestation (un-verified) mg=$metagraphAddress " +
+                  s"binary=${binaryHash.value.take(12)}... parent=${parentHash.value.take(12)}... peer=$senderPeerId " +
+                  s"(verify deferred to attach; #29)"
+              )
         }
     }
   }
@@ -2400,6 +2389,10 @@ object NakamotoSyncDaemon {
     ) => F[Option[Long]],
     etaForParentOrdinal: Long => F[Array[Byte]],
     selfStake: F[io.constellationnetwork.numerics.Ratio],
+    // #29 verify-on-attach: per-sender stake lookup used to verify the attestations we BUFFERED un-verified
+    // while a binary was an orphan, replayed at attach time below (`drainAttestations`). Same lookup the
+    // inbound-attestation receiver uses — `stakeRegistry.committeeStake`.
+    senderStakeLookup: io.constellationnetwork.schema.peer.PeerId => F[io.constellationnetwork.numerics.Ratio],
     orphanBuffer: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): (io.constellationnetwork.schema.address.Address, Array[Byte]) => F[Unit] = {
@@ -2499,6 +2492,19 @@ object NakamotoSyncDaemon {
                       // unconditional write.
                       _ <- orphanBuffer.recordAdmission(address, valueHash, parentOrdinal + 1L)
                       eta <- etaForParentOrdinal(parentOrdinal)
+                      // Phase 1 of verify-on-attach (#29). The binary has ATTACHED (its parent resolved → we're on
+                      // the admit path). Verify NOW the attestations we buffered un-verified while it was an orphan,
+                      // so `attestAndAdmit`'s threshold below counts them. Only this canonical (attached) binary's
+                      // attestations get the crypto; losing tines' buffered attestations are never drained here and
+                      // expire un-verified — that is the fork-storm CPU the speculative path was burning. A single
+                      // forged/stale buffered attestation is logged + skipped, never aborts admission.
+                      _ <- orphanBuffer.drainAttestations(address, binaryHash).flatMap { buffered =>
+                        buffered.traverse_ { bufferedAtt =>
+                          committeeGate
+                            .recordReceivedAttestation(bufferedAtt, eta, senderStakeLookup)
+                            .handleErrorWith(e => logger.debug(s"⚠️ buffered attestation verify failed mg=$address: ${e.getMessage}"))
+                        }
+                      }
                       sigma <- selfStake
                       admitted <- committeeGate.attestAndAdmit(address, parentHash, binaryHash, eta, sigma)
                       _ <-
