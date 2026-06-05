@@ -3,16 +3,20 @@ services:
     image: constellationnetwork/tessellation${CL_DOCKER_CORE_REPO:-}:${TESSELLATION_DOCKER_VERSION:-latest}
     container_name: gl0${CONTAINER_NAME_SUFFIX:-}
     restart: unless-stopped
-    # Hard cgroup memory cap. WITHOUT this (and with no -Xmx anywhere) each JVM defaults
-    # MaxHeapSize to 25% of HOST RAM (~30GB on a 169GB box); the ~43 co-located node JVMs
-    # then grow into each other and OOM-crash docker (the whole host, not one container).
-    # A container can never exceed mem_limit, so the HOST stays safe regardless of restart
-    # policy. Host-tunable via CL_NODE_MEM_LIMIT; paired with -Xmx in nodes/.env.
-    mem_limit: ${CL_NODE_MEM_LIMIT:-2560m}
+    # PER-TYPE memory cap. gl0 holds the FULL global state (all metagraphs' currency+data +
+    # historicalStakeSnapshots + state proofs), so at the eta-rotation boundary its working set
+    # blows past a small heap → GC death spiral (Old=99.9%, hundreds of full GCs) → all 8 gl0
+    # thrash → CPU starves → the chain can't finalize the rotation. So gl0 gets a BIG heap; the
+    # 35 metagraph/gl1 nodes stay small (CL_NODE_MEM_LIMIT) — they were healthy at 1.5g.
+    # Host-tunable via CL_GL0_MEM_LIMIT; -Xmx is set in this service's environment block below.
+    mem_limit: ${CL_GL0_MEM_LIMIT:-9216m}
     env_file:
       - .env
     environment:
       - CL_DOCKER_ID=gl0
+      # gl0-specific big heap, overrides the default -Xmx in nodes/.env (entrypoint.sh appends
+      # --add-opens). Keep well under mem_limit above (heap + ~1g non-heap). Host-tunable.
+      - CL_DOCKER_JAVA_OPTS=-Xms512m -Xmx${CL_GL0_XMX:-7168m}
       - CL_KEYSTORE=/tessellation/key.p12
       - CL_PUBLIC_HTTP_PORT=${CL_DOCKER_INTERNAL_GL0_PUBLIC:-9000}
       - CL_P2P_HTTP_PORT=${CL_DOCKER_INTERNAL_GL0_P2P:-9001}
@@ -67,11 +71,12 @@ services:
     image: constellationnetwork/tessellation${CL_DOCKER_CORE_REPO:-}:${TESSELLATION_DOCKER_VERSION:-latest}
     container_name: gl1${CONTAINER_NAME_SUFFIX:-}
     restart: unless-stopped
-    mem_limit: ${CL_NODE_MEM_LIMIT:-2560m}  # see gl0 above — hard cap so co-located JVMs can't OOM the host
+    mem_limit: ${CL_GL1_MEM_LIMIT:-4096m}  # global-L1 state — moderate heap (more than metagraph, less than gl0)
     env_file:
       - .env
     environment:
       - CL_DOCKER_ID=gl1
+      - CL_DOCKER_JAVA_OPTS=-Xms512m -Xmx${CL_GL1_XMX:-3072m}
       - CL_L0_PEER_HTTP_HOST=${CL_DOCKER_GL0_PEER_HTTP_HOST:-gl0}
       - CL_L0_PEER_HTTP_PORT=${CL_DOCKER_GL0_PEER_HTTP_PORT:-9000}
       - CL_L0_PEER_ID=${CL_DOCKER_GL0_PEER_ID:-}
