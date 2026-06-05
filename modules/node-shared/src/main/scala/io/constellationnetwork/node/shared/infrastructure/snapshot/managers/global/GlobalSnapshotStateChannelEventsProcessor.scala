@@ -5,7 +5,7 @@ import cats.data._
 import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.immutable.SortedMap
+import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.ext.cats.syntax.validated.validatedSyntax
@@ -17,11 +17,14 @@ import io.constellationnetwork.node.shared.domain.statechannel._
 import io.constellationnetwork.node.shared.infrastructure.snapshot.CurrencySnapshotContextFunctions
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.balance.Balance
+import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
 import io.constellationnetwork.schema.currencyMessage._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal}
+import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendReference}
+import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
+import io.constellationnetwork.schema.transaction.{RewardTransaction, Transaction, TransactionReference}
+import io.constellationnetwork.schema.{CurrencyStateProofSelector, GlobalIncrementalSnapshot, SnapshotOrdinal}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
@@ -59,7 +62,25 @@ trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
       CurrencySnapshot
     ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
     events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
+    // #259 adopt (numShards>1). Selects how the second-and-subsequent incremental advances the per-MG
+    // `CurrencySnapshotInfo` in the `Right` branch:
+    //   - `Recreate` (DEFAULT) — the legacy gl0 path: re-derive the full state via `createContext`
+    //     (proposal-artifact recreate + byte-equality). This is what the chain-link `process()` path and the
+    //     `deriveMetagraphRoot` committee re-exec use; keeping it the default makes every existing call site
+    //     (numShards=1, `deriveMetagraphRoot`) byte-identical (the regression bar).
+    //   - `AdoptFromSignedFields` — DERIVE the per-MG state by replaying the adopted, committee-attested signed
+    //     binary's OWN already-accepted events (blocks, GIVEN rewards, token-locks, allow-spends, messages) onto the
+    //     prior Info, then VERIFY the derived root against the binary's committed `stateProof` (economic-security
+    //     gate; fall back to prior balances on mismatch, log loudly, never crash). The ordinal is taken from the
+    //     signed binary — NOT recomputed as `prior.ordinal.next`. This is the fix for the
+    //     `lastCurrencySnapshots`-frozen-at-genesis freeze: `createContext` re-derives ordinal 1 against gl0's
+    //     genesis prior and never matches the incoming ordinal N, so the commitment never advances. gl0 MAINTAINS +
+    //     VALIDATES the full metagraph currency state (balances/refs/token-locks/allow-spends/messages) so cl1 can
+    //     bootstrap from `lastCurrencySnapshots(identifier)`. The derivation is a pure function of `(signed binary,
+    //     prior Info)` — split-safe (leader embeds checkpoint, follower re-adopts identically).
+    adoptionMode: GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode =
+      GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode.Recreate
   )(
     implicit hasher: Hasher[F]
   ): F[SortedMap[Address, MetagraphAcceptanceResult]]
@@ -134,6 +155,27 @@ trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
 }
 
 object GlobalSnapshotStateChannelEventsProcessor {
+
+  /** Selects how `processCurrencySnapshots` advances a metagraph's per-MG `CurrencySnapshotInfo` in the second-and-subsequent incremental
+    * (`Right`) branch. See the `adoptionMode` param scaladoc on the trait method.
+    */
+  sealed trait CurrencyAdoptionMode
+  object CurrencyAdoptionMode {
+
+    /** Legacy gl0 path: re-derive the full per-MG state via `createContext` (recreate proposal artifact + byte-equality). Used by the
+      * chain-link `process()` path and the `deriveMetagraphRoot` committee re-exec; the default so existing call sites stay byte-identical.
+      */
+    case object Recreate extends CurrencyAdoptionMode
+
+    /** #259 adopt: DERIVE the per-MG state by replaying the adopted, committee-attested signed binary's OWN already-accepted events
+      * (blocks, GIVEN rewards, token-locks, allow-spends, messages) onto the prior Info, ordinal taken from the binary (no `createContext`,
+      * no reward re-derivation), then VERIFY the derived root against the committed `stateProof`. gl0 maintains + validates the FULL
+      * metagraph currency state; on root mismatch it falls back to prior balances (logs loudly) while still advancing the ordinal, so the
+      * freeze stays dead and no unverified balance map is ever committed.
+      */
+    case object AdoptFromSignedFields extends CurrencyAdoptionMode
+  }
+
   def make[F[_]: Async: JsonSerializer: Parallel](
     stateChannelValidator: StateChannelValidator[F],
     stateChannelManager: GlobalSnapshotStateChannelAcceptanceManager[F],
@@ -299,6 +341,181 @@ object GlobalSnapshotStateChannelEventsProcessor {
           )
           .map(_.snapshotInfo)
 
+      /** #259 adopt (`CurrencyAdoptionMode.AdoptFromSignedFields`). DERIVE the per-MG `CurrencySnapshotInfo` by replaying the adopted,
+        * committee-attested signed binary's OWN already-accepted events onto the prior `lastState` — replacing the diverging
+        * `createContext` recreate-and-byte-compare derivation that freezes `lastCurrencySnapshots` at genesis when gl0 folds a
+        * shard-tip-relative delta window against its own genesis prior (re-derives ordinal 1, never matches the incoming ordinal N).
+        *
+        * '''gl0 MAINTAINS + VALIDATES the metagraph currency state.''' Unlike the earlier roots-only variant (which emptied balances/refs
+        * and broke cl1 bootstrap — cl1 aligns its first currency state to gl0's `lastCurrencySnapshots(identifier)` Info,
+        * `CurrencySnapshotProcessor.scala:355-373`, and cannot bootstrap from an empty balance map), gl0 now holds the FULL per-MG state:
+        *   - `balances` — replay each accepted block's transactions (per-source `−amount −fee`, per-destination `+amount`, mirroring
+        *     `BlockAcceptanceLogic.processBalances`) then add the snapshot's GIVEN `rewards` (per-destination `+amount`, mirroring
+        *     `BalanceOpsManager.acceptRewardTxs`). Rewards are taken AS-GIVEN from `snapshot.value.rewards` — NOT recomputed; reward
+        *     recomputation is the consensus-derived divergence that froze the recreate path.
+        *   - `lastTxRefs` — the last (highest-ordinal) `TransactionReference` per source across accepted blocks; fresh destinations seed
+        *     `emptyCurrency(identifier)` (mirrors `BlockAcceptanceOpsManager.acceptTransactionRefs`).
+        *   - `activeTokenLocks` / `lastTokenLockRefs` — accepted token-locks grouped by source, merged into prior; refs = last per source.
+        *   - `activeAllowSpends` / `lastAllowSpendRefs` — accepted allow-spends grouped by source, merged into prior; refs = last per
+        *     source.
+        *   - `lastMessages` — CARRIED FORWARD: the prior `lastState.lastMessages` merged with THIS snapshot's accepted `messages`,
+        *     latest-per-`MessageType` (the exact `MessageValidationOpsManager.acceptMessages` fold). This is the genuine cross-MG
+        *     dependency `getFeeAddresses` / `fetchOwnerAddress` / `fetchStakingAddress` read for owner/staking config and fee deduction.
+        *
+        * '''Economic-security gate (root verification).''' The derived Info's `stateProof(ordinal)` (the same 9-field hash the metagraph's
+        * ml0 committed via `CurrencySnapshotAcceptanceManager` `csi.stateProof`) is compared against the binary's committed
+        * `snapshot.value.stateProof`. A lying/invalid metagraph currency state — or a snapshot whose state was shaped by effects this pure
+        * replay does not reproduce (cross-shard spend-actions, token-unlock expiry, fee deduction against owner balance) — fails the check.
+        * On MATCH the derived full Info is adopted. On MISMATCH we log LOUDLY and fall back to the prior balances/refs/token-locks/
+        * allow-spends (carried forward unchanged) with only `lastMessages` advanced — the ordinal still advances at the call site
+        * (`processCurrencySnapshots` commits `Right((snapshot, info))`, ordinal taken from `snapshot`), so the freeze stays dead while gl0
+        * never commits an UNVERIFIED balance map. The global snapshot is never crashed.
+        *
+        * '''Determinism / split-safety.''' A pure deterministic function of `(snapshot, lastState)` — replays only already-accepted events
+        * (no re-validation, no node-local shard-store / global-snapshot read, no `Double`; exact integer `Amount` arithmetic; hashing
+        * routed through `Hasher[F]`). Every gl0 node (leader producing, follower, validator) builds the byte-identical `Right((snapshot,
+        * info))` from the byte-identical adopted binary + prior, so the per-MG Merkle leaf and `lastCurrencySnapshotsProof` are
+        * byte-identical cross-node.
+        */
+      private def deriveAdoptedCurrencyInfo(
+        address: Address,
+        lastState: CurrencySnapshotInfo,
+        snapshot: Signed[CurrencyIncrementalSnapshot]
+      )(implicit hasher: Hasher[F]): F[CurrencySnapshotInfo] = {
+        implicit val currencyStateProofSelector: CurrencyStateProofSelector = CurrencyStateProofSelector.instance
+
+        val artifact = snapshot.value
+
+        // lastMessages carry-forward — the exact MessageValidationOpsManager.acceptMessages fold (ascending parentOrdinal,
+        // latest-per-MessageType wins). `messages` already holds only committee-accepted messages, so no re-validation here.
+        val priorLastMessages: SortedMap[MessageType, Signed[CurrencyMessage]] =
+          lastState.lastMessages.getOrElse(SortedMap.empty[MessageType, Signed[CurrencyMessage]])
+        val nextLastMessages: SortedMap[MessageType, Signed[CurrencyMessage]] =
+          artifact.messages
+            .map(_.toList.sortBy(_.parentOrdinal))
+            .getOrElse(List.empty)
+            .foldLeft(priorLastMessages) { (acc, message) =>
+              acc.updated(message.value.messageType, message)
+            }
+        val nextLastMessagesOpt = if (nextLastMessages.isEmpty) None else Some(nextLastMessages)
+
+        // Accepted events carried in the signed snapshot.
+        val acceptedTransactions: List[Signed[Transaction]] =
+          artifact.blocks.toList.flatMap(_.block.value.transactions.toSortedSet.toList)
+        val acceptedTokenLocks: List[Signed[TokenLock]] =
+          artifact.tokenLockBlocks.toList.flatMap(_.toList).flatMap(_.value.tokenLocks.toSortedSet.toList)
+        val acceptedAllowSpends: List[Signed[AllowSpend]] =
+          artifact.allowSpendBlocks.toList.flatMap(_.toList).flatMap(_.value.transactions.toSortedSet.toList)
+
+        // Balances: replay accepted block txs (BlockAcceptanceLogic.processBalances semantics) then GIVEN rewards
+        // (BalanceOpsManager.acceptRewardTxs semantics). Exact Amount arithmetic; on underflow/overflow the result will not
+        // match the committed stateProof and we fall back (see below) — we never throw here.
+        def applyDelta(
+          balances: Either[BalanceArithmeticError, SortedMap[Address, Balance]],
+          addr: Address,
+          op: Balance => Either[BalanceArithmeticError, Balance]
+        ): Either[BalanceArithmeticError, SortedMap[Address, Balance]] =
+          balances.flatMap { bs =>
+            op(bs.getOrElse(addr, Balance.empty)).map(updated => bs.updated(addr, updated))
+          }
+
+        val derivedBalancesE: Either[BalanceArithmeticError, SortedMap[Address, Balance]] = {
+          val afterTxs = acceptedTransactions.foldLeft(lastState.balances.asRight[BalanceArithmeticError]) { (acc, signedTx) =>
+            val tx = signedTx.value
+            // Mirror BlockAcceptanceLogic.processBalances: per-source `−amount −fee`, per-destination `+amount`.
+            // `TransactionAmount`/`TransactionFee` convert to `Amount` via their companion `toAmount` implicits.
+            val amount: Amount = tx.amount
+            val fee: Amount = tx.fee
+            val withDebit = applyDelta(applyDelta(acc, tx.source, _.minus(amount)), tx.source, _.minus(fee))
+            applyDelta(withDebit, tx.destination, _.plus(amount))
+          }
+          artifact.rewards.foldLeft(afterTxs) { (acc, reward) =>
+            val rewardAmount: Amount = reward.amount
+            applyDelta(acc, reward.destination, _.plus(rewardAmount))
+          }
+        }
+
+        // lastTxRefs: last (highest-ordinal) reference per source, plus emptyCurrency seed for fresh destinations
+        // (BlockAcceptanceOpsManager.acceptTransactionRefs semantics). Fold over hashed refs is deterministic.
+        for {
+          initialTxRef <- TransactionReference.emptyCurrency[F](address)
+
+          txRefUpdates <- acceptedTransactions.traverse { signedTx =>
+            TransactionReference.of[F](signedTx).map(signedTx.value.source -> _)
+          }.map(_.foldLeft(Map.empty[Address, TransactionReference]) {
+            case (acc, (src, ref)) => acc.updatedWith(src)(_.fold(ref)(prev => if (ref.ordinal > prev.ordinal) ref else prev).some)
+          })
+          updatedTxRefsBase = lastState.lastTxRefs ++ txRefUpdates
+          newDestinations = acceptedTransactions.map(_.value.destination).toSet -- updatedTxRefsBase.keySet
+          nextLastTxRefs = updatedTxRefsBase ++ newDestinations.toList.map(_ -> initialTxRef)
+
+          tokenLockRefUpdates <- acceptedTokenLocks.traverse { signedTl =>
+            TokenLockReference.of[F](signedTl).map(signedTl.value.source -> _)
+          }.map(_.foldLeft(Map.empty[Address, TokenLockReference]) {
+            case (acc, (src, ref)) => acc.updatedWith(src)(_.fold(ref)(prev => if (ref.ordinal > prev.ordinal) ref else prev).some)
+          })
+          priorTokenLockRefs = lastState.lastTokenLockRefs.getOrElse(SortedMap.empty[Address, TokenLockReference])
+          nextTokenLockRefs = priorTokenLockRefs ++ tokenLockRefUpdates
+
+          allowSpendRefUpdates <- acceptedAllowSpends.traverse { signedAs =>
+            AllowSpendReference.of[F](signedAs).map(signedAs.value.source -> _)
+          }.map(_.foldLeft(Map.empty[Address, AllowSpendReference]) {
+            case (acc, (src, ref)) => acc.updatedWith(src)(_.fold(ref)(prev => if (ref.ordinal > prev.ordinal) ref else prev).some)
+          })
+          priorAllowSpendRefs = lastState.lastAllowSpendRefs.getOrElse(SortedMap.empty[Address, AllowSpendReference])
+          nextAllowSpendRefs = priorAllowSpendRefs ++ allowSpendRefUpdates
+
+          // active token-locks / allow-spends: incoming grouped by source, merged into prior (mirrors `incoming |+| prior`
+          // shape from CurrencySnapshotAcceptanceManager; gl0 holds the committed set, expiry/unlock is re-verified via the
+          // stateProof gate below rather than recomputed here — node-local epoch is not split-safe).
+          incomingTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]] =
+            acceptedTokenLocks.groupBy(_.value.source).map { case (src, tls) => src -> SortedSet.from(tls) }.to(SortedMap)
+          priorActiveTokenLocks = lastState.activeTokenLocks.getOrElse(SortedMap.empty[Address, SortedSet[Signed[TokenLock]]])
+          nextActiveTokenLocks = (priorActiveTokenLocks |+| incomingTokenLocks).filter { case (_, s) => s.nonEmpty }
+
+          incomingAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]] =
+            acceptedAllowSpends.groupBy(_.value.source).map { case (src, as) => src -> SortedSet.from(as) }.to(SortedMap)
+          priorActiveAllowSpends = lastState.activeAllowSpends.getOrElse(SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
+          nextActiveAllowSpends = (priorActiveAllowSpends |+| incomingAllowSpends).filter { case (_, s) => s.nonEmpty }
+
+          // Build the candidate derived Info from the replayed deltas. Carry the prior shape of optional fields when nothing
+          // changed so the absent-vs-empty distinction matches what the metagraph committed.
+          derivedBalances = derivedBalancesE.getOrElse(lastState.balances)
+          candidate = CurrencySnapshotInfo(
+            lastTxRefs = nextLastTxRefs,
+            balances = derivedBalances,
+            lastMessages = nextLastMessagesOpt,
+            lastFeeTxRefs = lastState.lastFeeTxRefs,
+            lastAllowSpendRefs = if (nextAllowSpendRefs.isEmpty) lastState.lastAllowSpendRefs else nextAllowSpendRefs.some,
+            activeAllowSpends = if (nextActiveAllowSpends.isEmpty) lastState.activeAllowSpends else nextActiveAllowSpends.some,
+            globalSnapshotSyncView = lastState.globalSnapshotSyncView,
+            lastTokenLockRefs = if (nextTokenLockRefs.isEmpty) lastState.lastTokenLockRefs else nextTokenLockRefs.some,
+            activeTokenLocks = if (nextActiveTokenLocks.isEmpty) lastState.activeTokenLocks else nextActiveTokenLocks.some
+          )
+
+          // Economic-security gate: the derived Info must hash to the metagraph's committed stateProof.
+          derivedProof <- candidate.stateProof[F](artifact.ordinal)
+          committedProof = artifact.stateProof
+          balanceArithmeticOk = derivedBalancesE.isRight
+          result <-
+            if (balanceArithmeticOk && derivedProof === committedProof) candidate.pure[F]
+            else
+              logger
+                .warn(
+                  s"[ACCEPTANCE/ADOPT] address=${address.show} ordinal=${artifact.ordinal.show} derived currency state root " +
+                    s"MISMATCH vs committed stateProof (balanceArithmeticOk=$balanceArithmeticOk). Adopting ordinal but carrying " +
+                    s"forward prior balances/refs (this snapshot's state was shaped by effects not reproducible from a pure event " +
+                    s"replay, or the metagraph state is invalid). committed=${committedProof.show} derived=${derivedProof.show}"
+                )
+                .as(
+                  // Fall back: keep prior balances/refs/token-locks/allow-spends; only advance lastMessages. The ordinal still
+                  // advances (committed from `snapshot` at the call site) so the freeze does not return, but gl0 commits no
+                  // unverified balance map.
+                  lastState.copy(lastMessages = nextLastMessagesOpt)
+                )
+        } yield result
+      }
+
       /** Processes currency snapshots for each metagraph address, applying fee deduction logic.
         *
         * Fee deduction follows three cases per binary:
@@ -315,8 +532,30 @@ object GlobalSnapshotStateChannelEventsProcessor {
           CurrencySnapshot
         ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
         events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-        getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
+        adoptionMode: GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode =
+          GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode.Recreate
       )(implicit hasher: Hasher[F]): F[SortedMap[Address, MetagraphAcceptanceResult]] = {
+        import GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode
+
+        // The second-and-subsequent incremental advances the per-MG `CurrencySnapshotInfo`. Under `Recreate` (the legacy default,
+        // numShards=1 + `deriveMetagraphRoot`) gl0 re-derives the full state via `createContext` — byte-identical to before. Under
+        // `AdoptFromSignedFields` (#259 adopt path) gl0 DERIVES the full state by replaying the signed binary's own already-accepted
+        // events onto the prior Info and verifies the derived root against the committed `stateProof`, breaking the
+        // `createContext`-against-genesis freeze while still maintaining + validating the metagraph currency state.
+        def deriveNextCurrencyInfo(
+          address: Address,
+          lastState: CurrencySnapshotInfo,
+          lastIncremental: Signed[CurrencyIncrementalSnapshot],
+          snapshot: Signed[CurrencyIncrementalSnapshot]
+        ): F[CurrencySnapshotInfo] =
+          adoptionMode match {
+            case CurrencyAdoptionMode.Recreate =>
+              applyCurrencySnapshot(address, lastState, lastIncremental, snapshot, getGlobalSnapshotByOrdinal)
+            case CurrencyAdoptionMode.AdoptFromSignedFields =>
+              deriveAdoptedCurrencyInfo(address, lastState, snapshot)
+          }
+
         val isFeeRequired = feeCalculator.isFeeRequired(snapshotOrdinal)
 
         events.toList.parTraverse {
@@ -392,12 +631,11 @@ object GlobalSnapshotStateChannelEventsProcessor {
                     case (_, lastCurrState @ Some(Right((lastIncremental, lastState)))) =>
                       deserialize[Signed[CurrencyIncrementalSnapshot]](head).flatMap {
                         case Some(snapshot) => // second or subsequent incremental snapshot - we do subtract fee
-                          applyCurrencySnapshot(
+                          deriveNextCurrencyInfo(
                             address,
                             lastState,
                             lastIncremental,
-                            snapshot,
-                            getGlobalSnapshotByOrdinal
+                            snapshot
                           ).flatMap { state =>
                             val maybeFeeAddress = state.lastMessages.flatMap(_.get(MessageType.Owner)).map(_.address)
 

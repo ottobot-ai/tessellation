@@ -220,7 +220,9 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         CurrencySnapshot
       ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
       events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-      getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+      getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
+      adoptionMode: GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode =
+        GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode.Recreate
     )(implicit hasher: Hasher[F]): IO[
       SortedMap[
         Address,

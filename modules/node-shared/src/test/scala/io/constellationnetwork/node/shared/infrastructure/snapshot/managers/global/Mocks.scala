@@ -190,7 +190,8 @@ object Mocks {
           CurrencySnapshot
         ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
         events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]],
+        adoptionMode: GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode
       )(
         implicit hasher: Hasher[IO]
       ): IO[SortedMap[Address, (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], BalanceUpdate)]] =

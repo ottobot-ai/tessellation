@@ -665,7 +665,12 @@ object GlobalSnapshotAcceptanceManager {
               currentBalances,
               priorLastCurrencySnapshots,
               adoptedScSnapshots,
-              getGlobalSnapshotByOrdinal
+              getGlobalSnapshotByOrdinal,
+              // #259 adopt: DERIVE each MG's commitment by replaying the committee-attested signed binary's own already-accepted
+              // events onto the prior Info (NOT `createContext`), ordinal taken from the binary, root verified against the committed
+              // `stateProof` — so `lastCurrencySnapshots` advances past genesis instead of freezing while gl0 maintains + validates
+              // the full per-MG currency state (cl1 bootstraps from it). See the `CurrencyAdoptionMode` scaladoc.
+              GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode.AdoptFromSignedFields
             )
             .map { accepted =>
               // `returned = Set.empty` — adopted snapshots are committee-accepted, never gl0-returned.

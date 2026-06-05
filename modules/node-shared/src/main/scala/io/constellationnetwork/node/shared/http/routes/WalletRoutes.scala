@@ -22,6 +22,16 @@ final case class WalletRoutes[F[_]: Async, S <: Snapshot](
   import org.http4s.circe.CirceEntityCodec.circeEntityEncoder
 
   protected val public: HttpRoutes[F] = HttpRoutes.of[F] {
+    // Roots-only-sharding light-client endpoint: per-address balance + a Merkle-Patricia inclusion proof against the metagraph's committed
+    // balance root. Verifiable by a stock TS verifier (`mptVerifier.ts`) with no custom code. Must precede the `/balance` case below.
+    case GET -> Root / AddressVar(address) / "balance" / "proof" =>
+      addressService
+        .getBalanceProof(address)
+        .flatMap {
+          case Some(balanceProof) => Ok(balanceProof)
+          case _                  => NotFound()
+        }
+
     case GET -> Root / AddressVar(address) / "balance" =>
       addressService
         .getBalance(address)

@@ -209,7 +209,8 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
           CurrencySnapshot
         ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
         events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]],
+        adoptionMode: GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode
       )(
         implicit hasher: Hasher[IO]
       ): IO[SortedMap[Address, MetagraphAcceptanceResult]] =
@@ -925,7 +926,8 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
             CurrencySnapshot
           ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
           events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-          getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
+          getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]],
+          adoptionMode: GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode
         )(implicit hasher: Hasher[IO]): IO[SortedMap[Address, MetagraphAcceptanceResult]] =
           events.map {
             case (addr, bins) => addr -> ((bins.map(b => (b, none[CurrencySnapshotWithState])), SortedMap.empty[Address, Balance]))

@@ -355,21 +355,39 @@ object CurrencySnapshotProcessor {
                 lastCurrencySnapshotStorage.getCombined.flatMap {
                   case None =>
                     val snapshotToDownload = hashedSnapshots.last
-                    globalState.lastCurrencySnapshots.get(identifier) match {
-                      case Some(Right((_, stateToDownload))) =>
-                        val toPass = (snapshotToDownload, stateToDownload).asLeft[Hashed[CurrencyIncrementalSnapshot]]
 
-                        checkAlignment(
-                          toPass,
-                          bs,
-                          lcss,
-                          txHasher,
-                          getGlobalSnapshotByOrdinal,
-                          globalL0AlignmentStorage
-                        ).map { alignment =>
-                          NonEmptyList.one(alignment).some
-                        }
-                      case _ => (new Throwable("unexpected state")).raiseError[F, Option[Success]]
+                    // Bootstrap (cl1 has no local currency snapshot yet): download the metagraph's state from gl0's view of
+                    // this metagraph. gl0's view can legitimately be at one of three states, all of which must be handled
+                    // WITHOUT crashing the alignment stream (a `raiseError` here propagates up to `globalSnapshotProcessing`'s
+                    // `handleErrorWith` → "Global snapshot processing stream failed, restarting" → restart-loop; cl1 then never
+                    // establishes a currency snapshot and the first metagraph tx send dies).
+                    def bootstrapFrom(stateToDownload: CurrencySnapshotInfo): F[Option[Success]] = {
+                      val toPass = (snapshotToDownload, stateToDownload).asLeft[Hashed[CurrencyIncrementalSnapshot]]
+
+                      checkAlignment(
+                        toPass,
+                        bs,
+                        lcss,
+                        txHasher,
+                        getGlobalSnapshotByOrdinal,
+                        globalL0AlignmentStorage
+                      ).map { alignment =>
+                        NonEmptyList.one(alignment).some
+                      }
+                    }
+
+                    globalState.lastCurrencySnapshots.get(identifier) match {
+                      // gl0 has adopted a non-genesis incremental for this metagraph — bootstrap from the carried info.
+                      case Some(Right((_, stateToDownload))) => bootstrapFrom(stateToDownload)
+
+                      // gl0's view is still the metagraph's genesis FULL snapshot (gl0 lagging the metagraph). The full
+                      // snapshot carries the complete `CurrencySnapshotInfo` (as the V1 `info`), so cl1 CAN bootstrap from it
+                      // and then catches up by following ml0's incrementals forward.
+                      case Some(Left(genesisFullSnapshot)) => bootstrapFrom(genesisFullSnapshot.value.info.toCurrencySnapshotInfo)
+
+                      // The metagraph isn't in gl0's `lastCurrencySnapshots` at this gl0 ordinal yet — NOT an error. Return
+                      // `none` (no alignment this round) so the stream retries on the next gl0 snapshot, rather than crashing.
+                      case None => none[Success].pure[F]
                     }
 
                   case Some((_, _)) =>

@@ -2458,29 +2458,41 @@ object NakamotoSyncDaemon {
                       // never reached and the chain freezes at genesis. `binaryHash` is the wire-bytes digest,
                       // == `pb.MetagraphAttestation.binaryHash` on the receive side.
                       _ <- orphanBuffer.recordPendingParentOrdinal(address, binaryHash, parentOrdinal)
+                      // The just-resolved binary's *value* hash — the chain-link identity the NEXT binary's
+                      // `lastSnapshotHash` points at (GlobalSnapshotAcceptanceManager.scala:908 /
+                      // StateChannelSnapshotService.scala:112). NOT `binaryHash` (the wire-bytes digest). Uses
+                      // the `implicit hasher` already in scope from the enclosing `HasherSelector.withCurrent`.
+                      valueHash <- signed.toHashed.map(_.hash)
+                      // #213/#290 admission-lag fix: seed the value-hash→ordinal admission cache the instant we
+                      // RESOLVE the binary (we are in the `Some` branch, so `resolveParent` already verified its
+                      // parent matched this peer's recorded tip / a cached ancestor — the identity guard ran),
+                      // NOT only after the local committee gate admits it below. `parentOrdinal + 1` is THIS
+                      // binary's own metagraph ordinal — a pure function of its content (ordinal − 1, then + 1),
+                      // so every honest node caches the byte-identical value; recording it neither weakens the
+                      // identity guard nor can induce a fork (it only feeds the committee-VRF eta downstream — a
+                      // wrong ordinal makes that verify FAIL, fail-safe, never fork — and v1 metagraph chains do
+                      // not reorg). WHY at resolve-time, not admit-time: this node's local gate can TIME OUT (a
+                      // few peers were transiently behind and buffered this binary instead of attesting, so the
+                      // kQuorum was not reached) even though the binary's place in the chain is fixed and the
+                      // cluster admits it via 2/3-attestation or depth-k. If we cached only on local-admit, the
+                      // very next child would miss `lookupAdmittedOrd`, fall through to the tip-guarded resolver,
+                      // find gl0's GSI tip still trailing this not-yet-finalized binary → `parentHash mismatch`
+                      // → orphan-buffer; every successor then re-buffers off it (the 733-mismatch / orphan
+                      // re-buffer loop with gl0 trailing ml0). Caching the deterministic ordinal here lets the
+                      // child resolve and enter `attestAndAdmit` regardless of THIS node's gate outcome on the
+                      // parent. The post-admit `recordAdmission` is now redundant and folded into this single
+                      // unconditional write.
+                      _ <- orphanBuffer.recordAdmission(address, valueHash, parentOrdinal + 1L)
                       eta <- etaForParentOrdinal(parentOrdinal)
                       sigma <- selfStake
                       admitted <- committeeGate.attestAndAdmit(address, parentHash, binaryHash, eta, sigma)
                       _ <-
-                        if (admitted) {
-                          // Compute the just-accepted binary's *value* hash. This is the chain-link
-                          // identity that the next binary's `lastSnapshotHash` will point at
-                          // (see GlobalSnapshotAcceptanceManager.scala:908 / StateChannelSnapshotService.scala:112).
-                          // We must use signed.value.hash here, NOT `binaryHash` (wire-bytes digest).
-                          signed.toHashed
-                            .map(_.hash)
-                            .flatMap { valueHash =>
-                              // Record into the admission cache BEFORE processing, so any concurrent
-                              // gossip of this binary's children resolves cleanly. parentOrdinal+1 is
-                              // the metagraph ordinal this binary occupies — the next binary's parent
-                              // ordinal will be that.
-                              orphanBuffer.recordAdmission(address, valueHash, parentOrdinal + 1L) >>
-                                processMetagraphBinary(output)
-                                  .handleErrorWith(e => logger.warn(s"⚠️ processMetagraphBinary failed for $address: ${e.getMessage}"))
-                                  .flatMap(_ => orphanBuffer.drainChildren(address, valueHash))
-                                  .flatMap(_.traverse_(child => processBytes(address, child)))
-                            }
-                        } else Async[F].unit
+                        if (admitted)
+                          processMetagraphBinary(output)
+                            .handleErrorWith(e => logger.warn(s"⚠️ processMetagraphBinary failed for $address: ${e.getMessage}"))
+                            .flatMap(_ => orphanBuffer.drainChildren(address, valueHash))
+                            .flatMap(_.traverse_(child => processBytes(address, child)))
+                        else Async[F].unit
                     } yield ()
                 }
               }

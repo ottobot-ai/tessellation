@@ -1,5 +1,7 @@
 package io.constellationnetwork.security
 
+import java.nio.charset.StandardCharsets
+
 import cats.effect.kernel.Sync
 import cats.syntax.all._
 
@@ -10,7 +12,8 @@ import io.constellationnetwork.schema.transaction.Transaction
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, GlobalSnapshotInfoV2, SnapshotOrdinal}
 import io.constellationnetwork.security.hash.Hash
 
-import io.circe.Encoder
+import io.circe.syntax.EncoderOps
+import io.circe.{Encoder, Printer}
 
 sealed trait HashLogic
 case object JsonHash extends HashLogic
@@ -130,5 +133,46 @@ object Hasher {
         .serialize(data)
         .map(bytes => prefix ++ bytes)
         .flatMap(Hash.fromBytesForSync[F])
+  }
+
+  /** Brotli-free, RFC 8785-canonical-JSON Hasher. Hashes `SHA-256(prefix ++ canonicalJSON(data))`, where the canonical encoding is Circe's
+    * `Printer(dropNullValues = true, indent = "", sortKeys = true)` — the SAME printer `JsonSerializer.forAsync` feeds into Brotli, but
+    * WITHOUT the Brotli compression step in the pre-image.
+    *
+    * Why this exists: the roots-only sharding light client (`docs/nakamoto/ROOTS-ONLY-SHARDING-ARCHITECTURE.md`) needs a TypeScript
+    * verifier to recompute a Scala-produced Merkle-Patricia-Trie node digest with stock Web Crypto + an inline RFC 8785 canonicalizer and
+    * ZERO custom code. The default [[forJson]] / [[forKryo]] hashers fold Brotli (resp. Kryo) into the pre-image, which no off-the-shelf JS
+    * verifier can reproduce. This hasher's `prefixedHash` is byte-identical to that verifier's `SHA-256(prefixByte ++
+    * canonicalize(commitmentJSON))` for the MPT commitment shapes (`Leaf{remaining,dataDigest}` / `Branch{pathsDigest}` /
+    * `Extension{shared,childDigest}`), which `MerklePatriciaCommitment` already encodes — so building/proving a trie under this hasher
+    * yields a TS-verifiable root + inclusion proof. (Proven by the `mpt-crosslang-balance` cross-language KAT, which has the
+    * `digital-evidence-app` `mptVerifier.ts` accept a balance proof produced here.)
+    *
+    * Use this ONLY for the light-client commitment trees (e.g. the per-address balance MPT served at `/currency/{address}/balance/proof`).
+    * It is a deliberate sibling of [[forJson]] — they hash differently and MUST NOT be mixed within one tree. Consensus-bytes hashing stays
+    * on [[forJson]] / [[forKryo]] (Brotli/Kryo) as selected by [[HasherSelector]].
+    */
+  def forCanonicalJson[F[_]: Sync]: Hasher[F] = new Hasher[F] {
+    private val canonicalPrinter: Printer = Printer(dropNullValues = true, indent = "", sortKeys = true)
+
+    def getLogic(ordinal: SnapshotOrdinal): HashLogic = JsonHash
+
+    private def canonicalBytes[A: Encoder](data: A): Array[Byte] =
+      canonicalPrinter.print(data.asJson).getBytes(StandardCharsets.UTF_8)
+
+    def hashJson[A: Encoder](data: A): F[Hash] =
+      Hash.fromBytesForSync[F](canonicalBytes(data))
+
+    def hash[A: Encoder](data: A): F[Hash] =
+      hashJson(data)
+
+    def compare[A: Encoder](data: A, expectedHash: Hash): F[Boolean] =
+      hashJson(data).map(_ === expectedHash)
+
+    def hashBytes(bytes: Array[Byte]): F[Hash] =
+      Hash.fromBytesForSync[F](bytes)
+
+    def prefixedHash[A: Encoder](data: A, prefix: Array[Byte]): F[Hash] =
+      Hash.fromBytesForSync[F](prefix ++ canonicalBytes(data))
   }
 }

@@ -7,7 +7,7 @@ import cats.syntax.functor._
 import io.constellationnetwork.node.shared.config.types.AddressesConfig
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
-import io.constellationnetwork.node.shared.domain.snapshot.services.AddressService
+import io.constellationnetwork.node.shared.domain.snapshot.services.{AddressService, BalanceProof}
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
@@ -54,6 +54,17 @@ object AddressService {
                 val ordinal = snapshot.value.ordinal
                 (balance, ordinal)
             })
+        }
+
+      /** Builds the per-address balance MPT from the committed snapshot state (`state.balances`, NOT the overlay) and proves `address`'s
+        * inclusion against its root — so the returned `root`/`proof` are self-consistent and TS-verifiable for the same `ordinal`. `None`
+        * when there is no snapshot yet or `address` has no balance entry (no inclusion proof exists for an absent key → 404 at the route).
+        */
+      def getBalanceProof(address: Address): F[Option[BalanceProof]] =
+        snapshotStorage.head.flatMap {
+          case Some((snapshot, state)) =>
+            BalanceMpt.buildProof[F](state.balances, address, snapshot.value.ordinal)
+          case None => Async[F].pure(None)
         }
 
       def getTotalSupply: F[Option[(BigInt, SnapshotOrdinal)]] =

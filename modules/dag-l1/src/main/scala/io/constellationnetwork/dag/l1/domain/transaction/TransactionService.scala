@@ -72,7 +72,12 @@ object TransactionService {
             // bug. Surface it as a `503 Service Unavailable`-style error after a
             // bounded wait so the test fails loudly with the actual root-cause
             // rather than silently hanging the e2e for hours.
-            val firstSnapshotTimeout = 30.seconds
+            // Bumped 30s → 90s: with the committee-sortition gate active, cl1 cold-start
+            // (ml0 → gl0 SC-binary propagation + committee attestation before the first
+            // currency snapshot is processed) is busier, so 30s began tripping this guard
+            // during legitimate-but-slow bootstrap and masking it as the chain-link error
+            // below. 90s keeps the loud-fail safety net while giving cold-start headroom.
+            val firstSnapshotTimeout = 90.seconds
             val waitForFirstSnapshot: F[Option[Either[NonEmptyList[ContextualTransactionValidationError], Hash]]] =
               lastSnapshotStorage.getCombinedStream.collect {
                 case Some((s, si)) => (s.ordinal, si.balances.getOrElse(transaction.source, Balance.empty))
