@@ -150,6 +150,37 @@ object ContextualTokenLockValidatorSuite extends MutableIOSuite {
     } yield expect.all(res.isValid)
   }
 
+  test("resolveConflict - idempotent re-submission of the same lock is accepted, not a self-Conflict (#186)") { res =>
+    implicit val (h, sp) = res
+
+    val validator = ContextualTokenLockValidator.make(none, TokenLocksConfig(0L), none)
+
+    for {
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      // A single lock that is ALREADY stored at its ordinal — i.e. a batch-submit retry
+      // or gossip redelivery of an already-accepted lock. The exact same hash arrives again.
+      tokenLock <- buildSignedLockToken(keyPair, TokenLockAmount(30L), TokenLockFee(10L))
+      hashedTokenLock <- tokenLock.toHashed[IO]
+
+      storedTokenLock = WaitingTokenLock(hashedTokenLock)
+      sourceTokenLocks = SortedMap(hashedTokenLock.ordinal -> storedTokenLock)
+
+      context = TokenLockValidatorContext(
+        sourceTokenLocks = sourceTokenLocks.some,
+        sourceBalance = Balance(1000L),
+        sourceLastTokenLocksRef = TokenLockReference.empty,
+        currentOrdinal = SnapshotOrdinal.MinValue,
+        currentEpochProgress = EpochProgress.MinValue,
+        hashedActiveTokenLocks = List.empty[Hashed[TokenLock]]
+      )
+
+      // Same ref (ordinal+hash) as the stored lock => NoConflict (no-op accept). Before the
+      // fix this fell through to CannotOverride -> Conflict{ordinal, h, h} (existingHash===newHash),
+      // which broke the submitter's retry-with-fresh-lastRef chain and failed the e2e.
+      res = validator.validate(hashedTokenLock, context)
+    } yield expect.all(res.isValid)
+  }
+
   test("validate balances - insufficient balance with existing non-majority token locks") { res =>
     implicit val (h, sp) = res
 
