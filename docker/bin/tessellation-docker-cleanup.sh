@@ -6,6 +6,20 @@ set -e
 # 2. More thorough container cleanup with proper error handling
 echo "Stopping and removing gl0 containers..."
 
+# FAST + EXHAUSTIVE PATH: force-remove every container attached to tessellation_common
+# by ID *first*. The name-based sweep below enumerates fixed name patterns and can miss
+# containers (unenumerated patterns / higher indices), leaving endpoints that make the
+# network-removal loop spin forever on "has active endpoints" — the classic `just down`
+# wedge. Removing by live network membership is exhaustive + immediate. Idempotent
+# (no-op if the network is already gone).
+if docker network inspect tessellation_common >/dev/null 2>&1; then
+    _attached=$(docker network inspect tessellation_common --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null || true)
+    if [ -n "${_attached// /}" ]; then
+        echo "  force-removing attached containers: $_attached"
+        docker rm -f $_attached 2>/dev/null || true
+    fi
+fi
+
 
 cleanup_container() {
     local name=$1

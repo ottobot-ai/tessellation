@@ -12,6 +12,7 @@ services:
     image: nakamoto-sidecar:test
     container_name: sidecar${CONTAINER_NAME_SUFFIX:-}
     restart: unless-stopped
+    mem_limit: ${CL_SIDECAR_MEM_LIMIT:-384m}  # Go libp2p sidecar — small; cap it too so nothing is unbounded
     command:
       - "-grpc"
       - "0.0.0.0:50051"

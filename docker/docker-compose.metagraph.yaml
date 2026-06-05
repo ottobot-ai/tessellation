@@ -3,6 +3,11 @@ services:
     image: constellationnetwork/tessellation${CL_DOCKER_REPO:-}:${CL_DOCKER_METAGRAPH_IMAGE:-latest}
     container_name: ml0${CONTAINER_NAME_SUFFIX:-}
     restart: unless-stopped
+    # Hard cgroup memory cap — without it (and no -Xmx) each JVM defaults heap to 25% of
+    # HOST RAM (~30GB), and ~43 co-located node JVMs OOM-crash docker. Host-tunable via
+    # CL_NODE_MEM_LIMIT; paired with -Xmx in nodes/.env. A container can never exceed this,
+    # so the host stays safe regardless of restart policy.
+    mem_limit: ${CL_NODE_MEM_LIMIT:-2560m}
     env_file:
       - .env
     environment:
@@ -58,6 +63,7 @@ services:
     image: constellationnetwork/tessellation${CL_DOCKER_REPO:-}:${CL_DOCKER_METAGRAPH_IMAGE:-latest}
     container_name: cl1${CONTAINER_NAME_SUFFIX:-}
     restart: unless-stopped
+    mem_limit: ${CL_NODE_MEM_LIMIT:-2560m}  # see ml0 above — hard cap so co-located JVMs can't OOM the host
     env_file:
       - .env
     environment:
@@ -103,6 +109,7 @@ services:
     image: constellationnetwork/tessellation${CL_DOCKER_REPO:-}:${CL_DOCKER_METAGRAPH_IMAGE:-latest}
     container_name: dl1${CONTAINER_NAME_SUFFIX:-}
     restart: unless-stopped
+    mem_limit: ${CL_NODE_MEM_LIMIT:-2560m}  # see ml0 above — hard cap so co-located JVMs can't OOM the host
     env_file:
       - .env
     environment:

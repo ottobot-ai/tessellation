@@ -64,8 +64,12 @@ if [ -f "${EXTRA_ENV_PATH:-/dev/null}" ]; then
   echo "$EXTRA_ENV" >> ./nodes/.env
 fi
 
-# maybe re-enable later -- these are the current mainnet defaults
-# CL_DOCKER_JAVA_OPTS="-Xms512M -Xss256K -Xmx8192M"
+# Cap each node JVM's heap. WITHOUT this, the JVM defaults MaxHeapSize to 25% of HOST RAM
+# (~30GB on a 169GB box) — and the ~43 co-located node JVMs then OOM-crash docker (the whole
+# host, not one container). entrypoint.sh appends --add-opens to whatever we set here.
+# Host-tunable via CL_NODE_XMX. Paired with `mem_limit` in the compose files (the hard
+# cgroup cap) — belt and suspenders. (mainnet historically ran -Xms512M -Xss256K -Xmx8192M.)
+echo "CL_DOCKER_JAVA_OPTS=-Xms256m -Xmx${CL_NODE_XMX:-1536m}" >> ./nodes/.env
 
 # Append any CL_TEST_* environment variables from the current bash environment
 echo "" >> ./nodes/.env
