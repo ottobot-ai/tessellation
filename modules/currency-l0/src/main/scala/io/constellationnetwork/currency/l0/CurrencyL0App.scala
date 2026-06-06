@@ -174,7 +174,8 @@ abstract class CurrencyL0App(
         services,
         p2pClient,
         services.snapshotContextFunctions,
-        dataApplicationService.zip(storages.calculatedStateStorage)
+        dataApplicationService.zip(storages.calculatedStateStorage),
+        cfg.shared.nakamoto.sharding.numShards
       )
       rumorHandler = RumorHandlers
         .make[IO](storages.cluster, services.localHealthcheck, sharedStorages.forkInfo)
