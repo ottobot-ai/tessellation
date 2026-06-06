@@ -74,7 +74,8 @@ object StateChannel {
     enqueueConsensusEventFn: CurrencySnapshotEvent => Cell[F, StackF, _, Either[CellError, Ω], _],
     // Slice B — the confirmation-depth cutoff `k` (gl0 anchors `smtRoot(N)` over commitments `≤ N − k`). ml0 uses it on
     // the adopt path to derive the eligible ordinal `N − k` whose commitment the carried inclusion proof reveals, so it
-    // can verify the signed smtRoot by construction. Sourced from `SharedConfig.nakamoto.confirmationDepthK`.
+    // can verify the signed smtRoot by construction. Sourced from `SharedConfig.nakamoto.confirmationDepthK(env)`
+    // (resolved for the active `SharedConfig.environment` at the call site).
     confirmationDepthK: Long
   )(
     implicit S: Supervisor[F],

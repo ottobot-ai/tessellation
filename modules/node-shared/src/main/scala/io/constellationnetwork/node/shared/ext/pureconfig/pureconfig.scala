@@ -37,6 +37,8 @@ package object pureconfig {
   implicit val epochProgressReader: ConfigReader[EpochProgress] = ConfigReader[NonNegLong].map(EpochProgress(_))
   implicit val environmentToOrdinalMapReader: ConfigReader[Map[AppEnvironment, SnapshotOrdinal]] =
     genericMapReader[AppEnvironment, SnapshotOrdinal](catchReadError(AppEnvironment.withName))
+  implicit val environmentToPosLongMapReader: ConfigReader[Map[AppEnvironment, PosLong]] =
+    genericMapReader[AppEnvironment, PosLong](catchReadError(AppEnvironment.withName))
   implicit val environmentToEpochProgressMapReader: ConfigReader[Map[AppEnvironment, EpochProgress]] =
     genericMapReader[AppEnvironment, EpochProgress](catchReadError(AppEnvironment.withName))
   implicit val environmentToSetOfPeersReader: ConfigReader[Map[AppEnvironment, NonEmptySet[PeerId]]] =

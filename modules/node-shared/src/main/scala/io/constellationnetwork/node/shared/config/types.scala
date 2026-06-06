@@ -75,21 +75,28 @@ object types {
     * (settled by Ouroboros + our fork-race sims) rather than loaded independently — which removes the previous mis-configuration where
     * `eta-rotation-snapshots` held k₂'s value (10·k₁) and `keep-depth-behind-finalized` held k₁'s.
     *
-    *   - k₁ = `confirmationDepthK` — confirmation depth (fork-race statistical finality). Loaded from HOCON
-    *     (`nakamoto.confirmation-depth-k`, default 255, with `${?NAKAMOTO_CONFIRMATION_DEPTH}` substitution). REUSED by the §3 NIPoPoW
-    *     historical-commitment SMT as its finalized cutoff (`smtRoot(N)` commits ordinals i ≤ N − k₁), and by `SnapshotLeaderLoop` /
-    *     `NakamotoSyncDaemon`.
-    *   - R = `etaRotationSnapshots` = round(3.03·k₁) — eta-rotation period. Ouroboros: the eta nonce uses the first 2/3 of the period's VRF
-    *     rho values, so the last 1/3 = R/3 must be ≥ k₁ (those inputs finalized before use) ⇒ R ≥ 3·k₁; the .03 is the stability margin.
-    *   - k₂ = `keepDepthBehindFinalized` = 10·k₁ — historical-archive / phase-3 retention depth (the tower's moving checkpoint).
+    *   - k₁ = `confirmationDepthK(env)` — confirmation depth (fork-race statistical finality). Loaded from HOCON PER-ENVIRONMENT
+    *     (`nakamoto.confirmation-depth-k` is a `{ mainnet, testnet, integrationnet, dev }` block, mirroring `last-kryo-hash-ordinal`) and
+    *     resolved ONCE for the active `AppEnvironment` at the use site — mainnet 1024, test/integration nets 255, dev 33 (with the
+    *     `${?NAKAMOTO_CONFIRMATION_DEPTH}` override applied to the dev value only). REUSED by the §3 NIPoPoW historical-commitment SMT as
+    *     its finalized cutoff (`smtRoot(N)` commits ordinals i ≤ N − k₁), and by `SnapshotLeaderLoop` / `NakamotoSyncDaemon`.
+    *   - R = `etaRotationSnapshots(env)` = round(3.1·k₁) — eta-rotation period. Ouroboros: the eta nonce uses the first 2/3 of the period's
+    *     VRF rho values, so the last 1/3 = R/3 must be ≥ k₁ (those inputs FINALIZED before use) ⇒ R ≥ 3·k₁; the .1 over 3 is the worst-case
+    *     finalization margin (the 2/3-mark must FINALIZE before the boundary; finalization lags production by ≤ k₁) ⇒ (R/3−k₁)=0.033·k₁.
+    *   - k₂ = `keepDepthBehindFinalized(env)` = 100·k₁ — historical-archive / phase-3 retention depth (the tower's moving checkpoint).
+    *
+    * Both derived depths are env-parameterized methods (NOT vals) so they resolve from the SAME per-env k₁ as the active environment;
+    * resolve the env from the wrapping `SharedConfig.environment` and pass it once (see the call sites in `GlobalSnapshotConsensus` /
+    * `CurrencyL0App` / `SharedServices`).
     *
     * Other `NAKAMOTO_*` env vars (LDD knobs, slots-per-epoch, etc.) are NOT migrated here — Wave 2 of the sys.env-to-HOCON sweep handles
     * the rest of the namespace in one pass.
     */
   case class NakamotoConfig(
-    // Confirmation depth k₁ — the single loaded consensus-depth knob (`nakamoto.confirmation-depth-k`, default 255 via the
-    // `${?NAKAMOTO_CONFIRMATION_DEPTH}` substitution). R and k₂ below are DERIVED from it; see the `def`s in the body.
-    confirmationDepthK: PosLong,
+    // Confirmation depth k₁ — the single loaded consensus-depth knob, now PER-ENVIRONMENT (`nakamoto.confirmation-depth-k` block:
+    // mainnet 1024 / testnet 255 / integrationnet 255 / dev 33, dev overridable via `${?NAKAMOTO_CONFIRMATION_DEPTH}`). Resolve for the
+    // active env via the `confirmationDepthK(env)` accessor below — R and k₂ DERIVE from the resolved value (see the `def`s in the body).
+    confirmationDepthKByEnv: Map[AppEnvironment, PosLong],
     // #259 active-recovery: caps on the metagraph orphan buffer + recent-admission cache. Migrated from the
     // `NAKAMOTO_ORPHAN_BUFFER_CAP` / `NAKAMOTO_RECENT_ADMIT_CAP` env reads to typed HOCON (project rule: no scattered
     // sys.env). `recentAdmitCap` is kept proportionally larger (4×) — see `MetagraphOrphanBuffer.DefaultAdmissionsCap`.
@@ -110,11 +117,36 @@ object types {
     committee: CommitteeConfig,
     sharding: ShardingConfig
   ) {
-    // R = 3.03·k₁ (Ouroboros: first-2/3 nonce + last-1/3 ≥ k₁ stability; .03 = margin). Derived from k₁, NOT loaded — keeps the
-    // eta-rotation period in lockstep with the confirmation depth so the boundary-write check (`ord % R == R - 1`) stays sound.
-    def etaRotationSnapshots: PosLong = PosLong.unsafeFrom(math.round(3.03d * confirmationDepthK.value))
-    // k₂ = 10·k₁ — historical-archive / phase-3 retention (tower moving checkpoint). Derived from k₁, NOT loaded.
-    def keepDepthBehindFinalized: PosLong = PosLong.unsafeFrom(10L * confirmationDepthK.value)
+    // k₁ for the active environment. Resolved once at the use site from `SharedConfig.environment`. Falls back to the dev value
+    // (`NakamotoConfig.DefaultConfirmationDepthK`, 32) for any env absent from the HOCON block — same neutral-default convention as
+    // `Era.fromConfig` (which uses `SnapshotOrdinal.MinValue`). All four standard envs are always present in `application.conf`, so the
+    // fallback only fires under a hand-trimmed config; 32 keeps a node finalizing rather than failing at boot.
+    def confirmationDepthK(env: AppEnvironment): PosLong =
+      confirmationDepthKByEnv.getOrElse(env, NakamotoConfig.DefaultConfirmationDepthK)
+    // R = 3.1·k₁ (Ouroboros: eta uses the first 2/3 of the period; last 1/3 = R/3 ≥ k₁ so those inputs FINALIZE before use ⇒ R ≥ 3·k₁).
+    // The .1 over 3 (was .03) is the worst-case finalization margin: the 2/3-mark must FINALIZE before the boundary consumes the eta,
+    // and finalization can lag production by k₁ (depth-k, no optimistic finality) ⇒ margin (R/3 − k₁) = 0.033·k₁ (#31 eta-amortization).
+    // Derived from the per-env k₁, NOT loaded — keeps the eta-rotation period in lockstep with the confirmation depth.
+    def etaRotationSnapshots(env: AppEnvironment): PosLong =
+      PosLong.unsafeFrom(math.round(3.1d * confirmationDepthK(env).value))
+    // k₂ = 100·k₁ — historical-archive / phase-3 retention (tower moving checkpoint). Deep deliberately: prod keeps a long, slow,
+    // stable consensus history (≈8 days at k₁=1024 / 7s snapshots). Derived from the per-env k₁, NOT loaded.
+    def keepDepthBehindFinalized(env: AppEnvironment): PosLong =
+      PosLong.unsafeFrom(100L * confirmationDepthK(env).value)
+  }
+
+  object NakamotoConfig {
+    // Neutral fallback for `confirmationDepthK(env)` when an environment is missing from the HOCON block — the dev default (32).
+    val DefaultConfirmationDepthK: PosLong = PosLong.unsafeFrom(32L)
+
+    // The `confirmationDepthKByEnv` field reads from the HOCON key `confirmation-depth-k` (the per-env block), NOT the
+    // default kebab-cased `confirmation-depth-k-by-env`. Same `ProductHint` field-override technique as [[ShardFinalityConfig]];
+    // every OTHER field falls through to pureconfig's default `CamelCase` → `KebabCase` so they keep their existing keys.
+    implicit val configHint: _root_.pureconfig.generic.ProductHint[NakamotoConfig] =
+      _root_.pureconfig.generic.ProductHint[NakamotoConfig](_root_.pureconfig.ConfigFieldMapping {
+        case "confirmationDepthKByEnv" => "confirmation-depth-k"
+        case other => _root_.pureconfig.ConfigFieldMapping(_root_.pureconfig.CamelCase, _root_.pureconfig.KebabCase)(other)
+      })
   }
 
   /** Committee draw/quorum decouple — the two cluster-uniform knobs that size the per-metagraph committee gate AND (reused) the per-shard

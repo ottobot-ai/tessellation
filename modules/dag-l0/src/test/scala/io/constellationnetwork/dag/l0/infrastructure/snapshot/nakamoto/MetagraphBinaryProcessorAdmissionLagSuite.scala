@@ -37,9 +37,9 @@ import weaver.MutableIOSuite
   * orphan re-buffer loop, gl0 trailing ml0).
   *
   * '''The fix (under test).''' Seed the admission cache `(mg, valueHash(B)) → ord(B)` the instant the binary RESOLVES (its parent already
-  * passed the tip / cached-ancestor identity guard), BEFORE — and independent of — the local gate outcome. `ord(B) = parentOrdinal + 1` is a
-  * pure function of B's content, so every honest node caches the byte-identical value (split-safe). The child then resolves via the cache and
-  * enters `attestAndAdmit` regardless of this node's gate result on the parent.
+  * passed the tip / cached-ancestor identity guard), BEFORE — and independent of — the local gate outcome. `ord(B) = parentOrdinal + 1` is
+  * a pure function of B's content, so every honest node caches the byte-identical value (split-safe). The child then resolves via the cache
+  * and enters `attestAndAdmit` regardless of this node's gate result on the parent.
   *
   * '''Harness.''' A stub `MetagraphCommitteeGate` whose `attestAndAdmit` always returns `false` models the local gate timing out on every
   * binary. The stub `parentOrdinalFor` models the tip-identity guard: it resolves ONLY when the binary's parent is in a fixed known-tip set
@@ -157,6 +157,7 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
         parentOrdinalFor = tipGuardedResolver(Set(genesisTip)),
         etaForParentOrdinal = (_: Long) => IO.pure(Array.fill(32)(0.toByte)),
         selfStake = IO.pure(Ratio(1, 8)),
+        senderStakeLookup = (_: PeerId) => IO.pure(Ratio(1, 8)),
         orphanBuffer = buf,
         logger = logger
       )
@@ -190,6 +191,7 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
         parentOrdinalFor = tipGuardedResolver(Set(genesisTip)),
         etaForParentOrdinal = (_: Long) => IO.pure(Array.fill(32)(0.toByte)),
         selfStake = IO.pure(Ratio(1, 8)),
+        senderStakeLookup = (_: PeerId) => IO.pure(Ratio(1, 8)),
         orphanBuffer = buf,
         logger = logger
       )
@@ -226,6 +228,7 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
         parentOrdinalFor = tipGuardedResolver(Set(genesisTip)),
         etaForParentOrdinal = (_: Long) => IO.pure(Array.fill(32)(0.toByte)),
         selfStake = IO.pure(Ratio(1, 8)),
+        senderStakeLookup = (_: PeerId) => IO.pure(Ratio(1, 8)),
         orphanBuffer = buf,
         logger = logger
       )

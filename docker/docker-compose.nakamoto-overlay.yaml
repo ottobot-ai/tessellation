@@ -29,13 +29,11 @@ services:
       # so doubling fA just changed the fill-rate metric without producing
       # snapshots faster.
       - NAKAMOTO_SLOTS_PER_EPOCH=${NAKAMOTO_SLOTS_PER_EPOCH:-60}
-      # k₁ = confirmation depth — the SINGLE Nakamoto consensus-depth knob. R (eta-rotation
-      # period) and k₂ (keep-depth) are now DERIVED from k₁ in NakamotoConfig, NOT set here:
-      #   R  = round(3.03·k₁) = 100, k₂ = 10·k₁ = 330 at k₁ = 33.
-      # k₁ = 33 chosen for e2e (production default 255) so R = 100 exercises the rotation
-      # mechanism many times per run. (Tests aren't adversarial, so a small k₁ is fine.)
-      # See `docs/nakamoto/attestation-and-finality.md` §1.3.
-      - NAKAMOTO_CONFIRMATION_DEPTH=${NAKAMOTO_CONFIRMATION_DEPTH:-33}
+      # k₁ (confirmation depth) + derived R=round(3.1·k₁) and k₂=100·k₁ come from the per-env
+      # `confirmation-depth-k` block in application.conf. All e2e nodes run as Dev (CL_APP_ENV=dev),
+      # so they resolve k₁=32 → R=99, exercising the eta rotation many times per run (tests aren't
+      # adversarial, small k₁ is fine). No NAKAMOTO_CONFIRMATION_DEPTH override needed — the conf's
+      # per-env value is authoritative. See `docs/nakamoto/attestation-and-finality.md` §1.3.
       - NAKAMOTO_LDD_CUTOFF=${NAKAMOTO_LDD_CUTOFF:-16}
       - NAKAMOTO_LDD_OFFSET=${NAKAMOTO_LDD_OFFSET:-1}
       - NAKAMOTO_LDD_BASELINE=${NAKAMOTO_LDD_BASELINE:-0.05}
@@ -84,10 +82,9 @@ services:
       # on the matching CONTAINER_NAME_SUFFIX so the gRPC call stays local-network.
       - SIDECAR_HOST=sidecar${CONTAINER_NAME_SUFFIX:-}
       - SIDECAR_GRPC_PORT=50051
-      # #259: gl1 also follows gl0 + recomputes the historicalStakeSnapshots stateProof,
-      # so it needs the same k₁ as gl0/metagraph (R = round(3.03·k₁) is derived → verifier
-      # determinism). MUST match gl0's NAKAMOTO_CONFIRMATION_DEPTH default.
-      - NAKAMOTO_CONFIRMATION_DEPTH=${NAKAMOTO_CONFIRMATION_DEPTH:-33}
+      # gl1 follows gl0 + recomputes the historicalStakeSnapshots stateProof, so it needs the same
+      # k₁. It runs as Dev too → resolves k₁=32 from application.conf's per-env block, matching gl0
+      # by construction (verifier determinism). No env-var override needed.
     # NOTE: no `depends_on: sidecar` here — the `sidecar` service is in profile
     # `l0` (started by the gl0 launch), and adding a depends_on under the `l1`
     # profile would make compose error with "undefined service sidecar". The

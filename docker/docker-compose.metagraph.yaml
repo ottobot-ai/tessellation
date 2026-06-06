@@ -28,10 +28,9 @@ services:
       - CL_DOCKER_JOIN_RETRIES=${CL_DOCKER_ML0_JOIN_RETRIES:-10}
       - CL_DOCKER_JOIN_DELAY=${CL_DOCKER_ML0_JOIN_DELAY:-10}
       - CL_DOCKER_GENESIS=${CL_DOCKER_ML0_GENESIS:-false}
-      # #259: must match gl0's k₁ so the historicalStakeSnapshots stateProof boundary fires at
-      # the same ordinals (R = round(3.03·k₁) is derived → verifier determinism). Mirrors
-      # docker-compose.nakamoto-overlay.yaml's gl0 NAKAMOTO_CONFIRMATION_DEPTH default.
-      - NAKAMOTO_CONFIRMATION_DEPTH=${NAKAMOTO_CONFIRMATION_DEPTH:-33}
+      # k₁ (+ derived R, k₂) come from the per-env `confirmation-depth-k` block in application.conf;
+      # all nodes run as Dev → k₁=32, so ml0 matches gl0 by construction for the
+      # historicalStakeSnapshots stateProof boundary (verifier determinism). No env-var needed.
       - CL_DOCKER_ROLLBACK=${CL_DOCKER_ROLLBACK:-false}
       - CL_DOCKER_ROLLBACK_HASH=${CL_DOCKER_ROLLBACK_HASH:-}
       # Consensus timing overrides (set in CI to relax timeouts on slow runners)
@@ -85,9 +84,8 @@ services:
       - CL_DOCKER_JOIN_RETRIES=${CL_DOCKER_CL1_JOIN_RETRIES:-10}
       - CL_DOCKER_JOIN_DELAY=${CL_DOCKER_CL1_JOIN_DELAY:-10}
       - CL_DOCKER_GENESIS=${CL_DOCKER_CL1_GENESIS:-false}
-      # #259: must match gl0's k₁ for historicalStakeSnapshots stateProof determinism
-      # (R = round(3.03·k₁) is derived). MUST match gl0's NAKAMOTO_CONFIRMATION_DEPTH default.
-      - NAKAMOTO_CONFIRMATION_DEPTH=${NAKAMOTO_CONFIRMATION_DEPTH:-33}
+      # k₁ (+ derived R, k₂) come from application.conf's per-env `confirmation-depth-k` block;
+      # all nodes run as Dev → k₁=32, matching gl0 by construction (stateProof verifier determinism).
     ports:
       - "${CL_DOCKER_BIND_INTERFACE:-}${CL_DOCKER_EXTERNAL_CL1_PUBLIC:-9030}:${CL_DOCKER_INTERNAL_CL1_PUBLIC:-9030}"  # Public HTTP
       - "${CL_DOCKER_BIND_INTERFACE:-}${CL_DOCKER_EXTERNAL_CL1_P2P:-9031}:${CL_DOCKER_INTERNAL_CL1_P2P:-9031}"  # P2P HTTP
@@ -132,9 +130,8 @@ services:
       - CL_DOCKER_JOIN_RETRIES=${CL_DOCKER_DL1_JOIN_RETRIES:-10}
       - CL_DOCKER_JOIN_DELAY=${CL_DOCKER_DL1_JOIN_DELAY:-10}
       - CL_DOCKER_GENESIS=${CL_DOCKER_DL1_GENESIS:-false}
-      # #259: must match gl0's k₁ for historicalStakeSnapshots stateProof determinism
-      # (R = round(3.03·k₁) is derived). MUST match gl0's NAKAMOTO_CONFIRMATION_DEPTH default.
-      - NAKAMOTO_CONFIRMATION_DEPTH=${NAKAMOTO_CONFIRMATION_DEPTH:-33}
+      # k₁ (+ derived R, k₂) come from application.conf's per-env `confirmation-depth-k` block;
+      # all nodes run as Dev → k₁=32, matching gl0 by construction (stateProof verifier determinism).
     ports:
       - "${CL_DOCKER_BIND_INTERFACE:-}${CL_DOCKER_EXTERNAL_DL1_PUBLIC:-9040}:${CL_DOCKER_INTERNAL_DL1_PUBLIC:-9040}"  # Public HTTP
       - "${CL_DOCKER_BIND_INTERFACE:-}${CL_DOCKER_EXTERNAL_DL1_P2P:-9041}:${CL_DOCKER_INTERNAL_DL1_P2P:-9041}"  # P2P HTTP

@@ -314,7 +314,7 @@ object SharedServices {
         // `NakamotoConfig` as `round(3.03·k₁)` from the single `nakamoto.confirmation-depth-k` knob (no longer a
         // standalone HOCON key) — same typed field the leader loop / GlobalSnapshotConsensus.make read, so all
         // sites stay in lockstep.
-        etaRotationSnapshots = cfg.nakamoto.etaRotationSnapshots.value,
+        etaRotationSnapshots = cfg.nakamoto.etaRotationSnapshots(cfg.environment).value,
         // Path 1 (heap-leak workstream): wire the eta callback so the boundary-write at `ord % R == R - 1` lands a
         // real computed eta in the `HistoricalStakeSnapshot` MPT entry instead of `Hash.empty`. The callback is backed
         // by an [[EtaStateManager]] (MPT cache + caller-supplied chain-walk fallback) constructed above.

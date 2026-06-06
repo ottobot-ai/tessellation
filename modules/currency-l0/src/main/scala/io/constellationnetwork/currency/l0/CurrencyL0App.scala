@@ -277,7 +277,7 @@ abstract class CurrencyL0App(
                       dataApplicationService,
                       keyPair,
                       mkCell,
-                      sharedConfig.nakamoto.confirmationDepthK.value
+                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value
                     )
                   } >>
                   gossipDaemon.startAsRegularValidator >>
@@ -311,7 +311,7 @@ abstract class CurrencyL0App(
                       dataApplicationService,
                       keyPair,
                       mkCell,
-                      sharedConfig.nakamoto.confirmationDepthK.value
+                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value
                     )
                   } >>
                   programs.globalL0PeerDiscovery.discoverFrom(cfg.globalL0Peer) >>
@@ -359,7 +359,7 @@ abstract class CurrencyL0App(
                       dataApplicationService,
                       keyPair,
                       mkCell,
-                      sharedConfig.nakamoto.confirmationDepthK.value
+                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value
                     )
                   } >>
                   storages.node.tryModifyState(
@@ -459,7 +459,7 @@ abstract class CurrencyL0App(
                       dataApplicationService,
                       keyPair,
                       mkCell,
-                      sharedConfig.nakamoto.confirmationDepthK.value
+                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value
                     )
                     _ <-
                       if (cfg.environment =!= AppEnvironment.Dev) {
@@ -562,7 +562,7 @@ abstract class CurrencyL0App(
                   dataApplicationService,
                   keyPair,
                   mkCell,
-                  sharedConfig.nakamoto.confirmationDepthK.value
+                  sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value
                 )
                 .compile
                 .drain

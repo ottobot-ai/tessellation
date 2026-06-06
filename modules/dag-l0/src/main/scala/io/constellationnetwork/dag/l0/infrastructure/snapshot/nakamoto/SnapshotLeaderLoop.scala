@@ -409,11 +409,11 @@ object SnapshotLeaderLoop {
     lddConfig: LddConfig,
     eligibilityChecker: EligibilityChecker[F],
     slotsPerEpoch: Long = 60L,
-    // R = eta-rotation period. Threaded from `sharedCfg.nakamoto.etaRotationSnapshots.value`
-    // (derived = round(3.03·k₁)) at the GlobalSnapshotConsensus.make call site — NOT a config
+    // R = eta-rotation period. Threaded from `sharedCfg.nakamoto.etaRotationSnapshots(sharedCfg.environment).value`
+    // (derived = round(3.1·k₁) from the per-env k₁) at the GlobalSnapshotConsensus.make call site — NOT a config
     // read here. The `2550L` literal is a dev/test fallback only; production always passes config.
     etaRotationSnapshots: Long = 2550L,
-    // Confirmation depth k₁ — threaded from `sharedCfg.nakamoto.confirmationDepthK.value` at the
+    // Confirmation depth k₁ — threaded from `sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value` at the
     // call site (replaces the prior `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read; project rule:
     // HOCON over scattered sys.env). Drives the depth-k finality gate (`ConfirmationDepthK` below).
     confirmationDepthK: Long = 255L,
@@ -834,8 +834,8 @@ object SnapshotLeaderLoop {
         //   - 2 nodes: depth-only (can't reach 2/3+1)
         //   - 3+ nodes: attestation finality kicks in fast, depth is the safety net
         //
-        // Sourced from `sharedCfg.nakamoto.confirmationDepthK.value` (HOCON `nakamoto.confirmation-depth-k`,
-        // overridable via `${?NAKAMOTO_CONFIRMATION_DEPTH}`) — threaded in as the `confirmationDepthK` run
+        // Sourced from `sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value` (HOCON per-env
+        // `nakamoto.confirmation-depth-k`, dev overridable via `${?NAKAMOTO_CONFIRMATION_DEPTH}`) — threaded in as the `confirmationDepthK` run
         // parameter rather than read from sys.env here (project rule: HOCON over scattered env reads).
         // Default 255 chosen to approximate Cardano-equivalent 10⁻¹² common-prefix violation against a 1/3
         // adversary under the LDD snowplow (ψ=0, γ=15, fA=0.5, fB=0.05). The k=31 sim result is 0.91%

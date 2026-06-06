@@ -379,7 +379,7 @@ object GlobalSnapshotConsensus {
             .make[F](io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore))
         val chainWalkFallback: Long => F[List[(Long, Array[Byte])]] = (sourcePeriod: Long) =>
           chainStoreForLookupRef.get.flatMap {
-            case Some(cs) => cs.vrfOutputsForPeriod(sourcePeriod, sharedCfg.nakamoto.etaRotationSnapshots.value)
+            case Some(cs) => cs.vrfOutputsForPeriod(sourcePeriod, sharedCfg.nakamoto.etaRotationSnapshots(sharedCfg.environment).value)
             case None     => Async[F].pure(List.empty[(Long, Array[Byte])])
           }
         io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager
@@ -522,7 +522,7 @@ object GlobalSnapshotConsensus {
           // `maintainNodeCollateralWithdrawalExpiryIndex` left at default (false) here to preserve
           // existing behavior of this construction site — the SharedServices GSAM sets it to true,
           // but reconciling the two flags is out of scope for the Path 1 fix.
-          etaRotationSnapshots = sharedCfg.nakamoto.etaRotationSnapshots.value,
+          etaRotationSnapshots = sharedCfg.nakamoto.etaRotationSnapshots(sharedCfg.environment).value,
           etaForPeriod = Some(etaForPeriodCallback),
           localEventsPublisher = Some(localEventsPublisher),
           // Hierarchical-shard-checkpoints v1 acceptance-side deps. `None` at `numShards = 1` (regression bar);
@@ -534,7 +534,7 @@ object GlobalSnapshotConsensus {
           // §3 NIPoPoW historical-commitment SMT: wire the gl0 store + the confirmation-depth cutoff so accept() anchors
           // `smtRoot(N)`. Same k the leader loop / sync daemon use (`nakamoto.confirmation-depth-k`, default 255).
           historicalCommitmentSmtStore = Some(historicalCommitmentSmtStore),
-          confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK.value
+          confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value
         )
         .toResource
 
@@ -725,7 +725,7 @@ object GlobalSnapshotConsensus {
       // `nakamoto.confirmation-depth-k` knob (Ouroboros: first-2/3 nonce + last-1/3 ≥ k₁ stability; .03 margin).
       // Rotation is keyed on **ordinal**, not slot — slots are LDD-paced and lumpy; ordinals are 1:1 with
       // snapshots and give a stable R that satisfies the R ≥ 3·k₁ bound. See `docs/nakamoto/attestation-and-finality.md` §1.
-      etaRotationSnapshots = sharedCfg.nakamoto.etaRotationSnapshots.value
+      etaRotationSnapshots = sharedCfg.nakamoto.etaRotationSnapshots(sharedCfg.environment).value
 
       // Start the Nakamoto SnapshotLeaderLoop + sidecar bridge.
       //
@@ -915,7 +915,7 @@ object GlobalSnapshotConsensus {
           // Migrated from `sys.env.get("NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED")` to HOCON; the
           // application.conf entry still honors `${?NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED}` so ops
           // scripts keep working.
-          keepDepthBehindFinalized = sharedCfg.nakamoto.keepDepthBehindFinalized.value
+          keepDepthBehindFinalized = sharedCfg.nakamoto.keepDepthBehindFinalized(sharedCfg.environment).value
           chainStore <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore
             .make[F](
               globalSnapshotStorage,
@@ -936,7 +936,7 @@ object GlobalSnapshotConsensus {
           // `chainStoreForLookupRef` so the very first follower walk already observes the chain store.
           _ <- setFollowerEtaChainWalk { (sourcePeriod: Long) =>
             chainStoreForLookupRef.get.flatMap {
-              case Some(cs) => cs.vrfOutputsForPeriod(sourcePeriod, sharedCfg.nakamoto.etaRotationSnapshots.value)
+              case Some(cs) => cs.vrfOutputsForPeriod(sourcePeriod, sharedCfg.nakamoto.etaRotationSnapshots(sharedCfg.environment).value)
               case None     => Async[F].pure(List.empty[(Long, Array[Byte])])
             }
           }.toResource
@@ -1375,7 +1375,7 @@ object GlobalSnapshotConsensus {
               .make[F](
                 recentFinalizedAccumulatorsRef.get,
                 Some(historicalCommitmentSmtStore),
-                sharedCfg.nakamoto.confirmationDepthK.value
+                sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value
               )
             globalChangeSetServiceRef.set(Some(changeSetService))
           }.toResource
@@ -1590,7 +1590,7 @@ object GlobalSnapshotConsensus {
                   etaRotationSnapshots = etaRotationSnapshots,
                   // k₁ — typed HOCON `nakamoto.confirmation-depth-k` (replaces the prior
                   // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read inside the loop).
-                  confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK.value,
+                  confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value,
                   lastKnownSlotRef = lastKnownSlotRef,
                   epochStateRef = epochStateRef,
                   genesisTimeMs = pureGenesisTimeMs,
@@ -1833,7 +1833,7 @@ object GlobalSnapshotConsensus {
                   etaRotationSnapshots = etaRotationSnapshots,
                   // k₁ — typed HOCON `nakamoto.confirmation-depth-k` (replaces the prior module-level
                   // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read inside NakamotoSyncDaemon).
-                  confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK.value,
+                  confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value,
                   consensusFns = consensusFunctions,
                   snapshotStorage = globalSnapshotStorage,
                   lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,

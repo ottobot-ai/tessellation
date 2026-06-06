@@ -74,7 +74,7 @@ object NakamotoSyncDaemon {
   // Confirmation depth k₁ — same as SnapshotLeaderLoop.ConfirmationDepthK; the boundary between Tier 2 (sequential
   // walk-back) and Tier 3 (full catch-up + backfill): gaps > k mean the network has finalized past our tip, so
   // sequential fetch won't work. NO module-level sys.env read here anymore — the value is threaded in as the
-  // `confirmationDepthK` parameter of `run` -> `handleSnapshot` from `sharedCfg.nakamoto.confirmationDepthK.value`
+  // `confirmationDepthK` parameter of `run` -> `handleSnapshot` from `sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value`
   // (project rule: HOCON over scattered env reads).
 
   private val vrf = EcVrf25519.default
@@ -255,7 +255,7 @@ object NakamotoSyncDaemon {
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSnapshots: Long,
     // Confirmation depth k₁ (Tier-2 vs Tier-3 gap boundary). Forwarded from `run`; sourced from
-    // `sharedCfg.nakamoto.confirmationDepthK.value` (replaces the prior module-level sys.env read).
+    // `sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value` (replaces the prior module-level sys.env read).
     confirmationDepthK: Long,
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -380,7 +380,7 @@ object NakamotoSyncDaemon {
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSnapshots: Long,
-    // Confirmation depth k₁ — threaded from `sharedCfg.nakamoto.confirmationDepthK.value` at the
+    // Confirmation depth k₁ — threaded from `sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value` at the
     // GlobalSnapshotConsensus.make call site (replaces the prior module-level
     // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read; project rule: HOCON over scattered env reads).
     // Used as the Tier-2 (sequential walk-back) vs Tier-3 (full catch-up) gap boundary in `handleSnapshot`.
@@ -938,7 +938,7 @@ object NakamotoSyncDaemon {
     epochStateRef: Ref[F, SharedEpochState],
     etaRotationSnapshots: Long,
     // Confirmation depth k₁ (Tier-2 vs Tier-3 gap boundary). Forwarded from `run`; sourced from
-    // `sharedCfg.nakamoto.confirmationDepthK.value` (replaces the prior module-level sys.env read).
+    // `sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value` (replaces the prior module-level sys.env read).
     confirmationDepthK: Long,
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
