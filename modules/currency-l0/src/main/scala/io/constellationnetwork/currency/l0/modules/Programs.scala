@@ -36,10 +36,7 @@ object Programs {
     services: Services[F, R],
     p2pClient: P2PClient[F],
     currencySnapshotContextFns: CurrencySnapshotContextFunctions[F],
-    dataApplication: Option[(BaseDataApplicationL0Service[F], CalculatedStateLocalFileSystemStorage[F])],
-    // Cluster-wide static shard count (`SharedConfig.nakamoto.sharding.numShards`). Threaded into `Genesis.make` to
-    // gate the execution-sharding genesis-bridge enqueue; `1` (production default) ⇒ unsharded, byte-identical path.
-    numShards: Int
+    dataApplication: Option[(BaseDataApplicationL0Service[F], CalculatedStateLocalFileSystemStorage[F])]
   )(implicit context: L0NodeContext[F]): Programs[F] = {
     val peerSelect: PeerSelect[F] =
       PeerSelect.make(
@@ -75,13 +72,11 @@ object Programs {
       services.collateral,
       services.stateChannelSnapshot,
       p2pClient.stateChannelSnapshot,
-      services.stateChannelBinarySender,
       globalL0Peer,
       nodeId,
       genesisLoader,
       storages.identifier,
-      services.globalL0,
-      numShards
+      services.globalL0
     )
 
     val rollback = Rollback.make(

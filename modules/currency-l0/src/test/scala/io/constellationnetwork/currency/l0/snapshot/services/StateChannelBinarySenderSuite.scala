@@ -335,60 +335,6 @@ object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
     }
   }
 
-  // Genesis-bridge (#259 / numShards>1): the fix in `Genesis.acceptSignedGenesis` enqueues a fresh metagraph's
-  // GENESIS-full (currencySnapshotOrdinal = SnapshotOrdinal.MinValue) and its first-incremental (ordinal 1) onto THIS
-  // sender so the background worker retries the send and each successful send re-gossips the binary
-  // (`StateChannelRoutes.broadcastMetagraphBinary`) to every committee member's per-shard `ShardBinaryBuffer`. The
-  // load-bearing property the bridge relies on is that enqueuing genesis-ordinal binaries makes them visible as
-  // RETRIABLE pending entries (the worker's `getPendingToRetry` view) — they must NOT be silently dropped or GC'd for
-  // being at the minimum ordinal. This pins that property so a future tracker/GC change keyed on ordinal can't
-  // regress the genesis-bridge into the cl1-bootstrap-stall it fixes.
-  test("genesis-bridge: enqueued genesis-full (ord 0) and first-incremental (ord 1) are retriable pending") { res =>
-    implicit val (_, hs, sp, metrics, j) = res
-
-    val genGenesisBinaries = for {
-      genesisFull <- binaryGen
-      firstIncremental <- binaryGen
-    } yield (genesisFull, firstIncremental)
-
-    forall(genGenesisBinaries) {
-      case (genesisFull, firstIncremental) =>
-        (for {
-          kp <- Resource.eval(KeyPairGenerator.makeKeyPair)
-          // Fresh metagraph bootstrap: no global snapshot yet ⇒ currentOrdinal = MinValue, empty tracker.
-          (sender, tracker, _) <- mkService(
-            kp.getPublic.toAddress,
-            currentOrdinal = SnapshotOrdinal.MinValue,
-            state = TrackerState.empty
-          )
-          result <- Resource.eval(
-            for {
-              hashedGenesisFull <- genesisFull.toHashed
-              hashedFirstIncremental <- firstIncremental.toHashed
-              // Mirror the production genesis-bridge call exactly: enqueue both binaries with the genesis ordinals
-              // (genesis-full = MinValue = 0, first-incremental = 1) and `lastGlobalSnapshotSigners = None`.
-              _ <- sender.enqueue(hashedGenesisFull, SnapshotOrdinal.MinValue, none)
-              _ <- sender.enqueue(hashedFirstIncremental, SnapshotOrdinal(1L), none)
-              state <- tracker.getState
-              // The background worker pulls retriable work via `getPendingToRetry`; both genesis binaries must be there.
-              pendingToRetry <- tracker.getPendingToRetry(10)
-              pendingHashes = pendingToRetry.map(_.binary.hash).toSet
-            } yield
-              expect(state.tracked.size === 2)
-                .and(expect(pendingHashes.contains(hashedGenesisFull.hash)))
-                .and(expect(pendingHashes.contains(hashedFirstIncremental.hash)))
-                .and(
-                  // The two enqueued ordinals are exactly the genesis pair (0 and 1) — guards the ordinals the bridge passes.
-                  expect(
-                    pendingToRetry.map(_.currencySnapshotOrdinal).toSet ===
-                      Set(SnapshotOrdinal.MinValue, SnapshotOrdinal(1L))
-                  )
-                )
-          )
-        } yield result).use(IO.pure)
-    }
-  }
-
   test("should transition to retry mode when a snapshot is not confirmed for 5 or more ordinals") { res =>
     implicit val (_, hs, sp, metrics, j) = res
 
