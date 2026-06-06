@@ -104,6 +104,18 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         kesTreeStep = 0
       )
 
+  /** Dummy `CommitteeMemberSignature` used to satisfy the 3-arg `recordAttestation` signature in tests that only care about peerId-based
+    * counting. The tracker stores/counts by the explicit `peerId` argument, not by the sig's internal peerId.
+    */
+  private val dummyCommitteeSig: CommitteeMemberSignature =
+    CommitteeMemberSignature(
+      peerId = PeerId(Hex("00" * 64)),
+      vrfProof = Hex.fromBytes(Array.emptyByteArray),
+      ed25519Sig = Hex.fromBytes(Array.emptyByteArray),
+      kesProductSig = Hex.fromBytes(Array.emptyByteArray),
+      kesTreeStep = 0
+    )
+
   /** Build a committee-member sig whose Ed25519 sig is RANDOM (won't verify). Used by the "pre-check Ed25519 fail" test. */
   private def mkBadEdSig(peerId: PeerId): CommitteeMemberSignature =
     CommitteeMemberSignature(
@@ -192,7 +204,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       store <- ShardChainStore.make[IO](shardZero)
       _ <- seedChain(store, chainLength)
       tracker <- ShardTipTracker.make[IO](shardZero, selfId)
-      _ <- attestations.traverse_ { case (hash, peer) => tracker.recordAttestation(hash, peer) }
+      _ <- attestations.traverse_ { case (hash, peer) => tracker.recordAttestation(hash, peer, dummyCommitteeSig) }
       triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum, k1Shard, store, tracker)
       _ <- triggers.advance
     } yield (store, triggers)
@@ -372,7 +384,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       (store, _) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 100L, chainLength = 6, selfId = selfPeer)
       tip <- store.bestTip.map(_.get)
       tracker <- ShardTipTracker.make[IO](shardZero, selfPeer)
-      _ <- tracker.recordAttestation(tip.hash, attesterPeer)
+      _ <- tracker.recordAttestation(tip.hash, attesterPeer, dummyCommitteeSig)
       triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1, k1Shard = 100L, store, tracker)
       _ <- triggers.advance
 
@@ -601,7 +613,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       (storeA, _) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeerA)
       tipA <- storeA.bestTip.map(_.get)
       trackerA <- ShardTipTracker.make[IO](shardZero, selfPeerA)
-      _ <- trackerA.recordAttestation(tipA.hash, signerPeer)
+      _ <- trackerA.recordAttestation(tipA.hash, signerPeer, dummyCommitteeSig)
       triggersA <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1, k1Shard = 1L, storeA, trackerA)
       _ <- triggersA.advance
 

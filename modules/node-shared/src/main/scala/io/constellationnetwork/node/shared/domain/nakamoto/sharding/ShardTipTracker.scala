@@ -6,7 +6,7 @@ import cats.syntax.all._
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.sharding.ShardMetrics
 import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.schema.sharding.{ShardId, ShardOrdinal}
+import io.constellationnetwork.schema.sharding.{CommitteeMemberSignature, ShardId, ShardOrdinal}
 import io.constellationnetwork.security.hash.Hash
 
 import org.typelevel.log4cats.slf4j.Slf4jLogger
@@ -24,7 +24,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *     committee-size value drives its own `⌈2·K_S/3⌉` threshold.
   *   - '''Pruning floor.''' Each shard advances its `lastFinalizedOrdinal` independently. Pruning needs to know "what's below the shard's
   *     own floor" — a single mixed tracker would have to track per-(shardId) floors anyway, which is just this per-shard tracker
-  *     constructor-fed a `ShardId` for diagnostic logging plus a per-shard `Map[Hash, Set[PeerId]]`.
+  *     constructor-fed a `ShardId` for diagnostic logging plus a per-shard `Map[Hash, Map[PeerId, CommitteeMemberSignature]]`.
   *
   * '''Self-exclusion.''' `attestationCountFor` defaults to excluding the local node (`selfPeerId`) from the returned count. This mirrors
   * the [[io.constellationnetwork.node.shared.domain.nakamoto.TCountTrigger]] self-exclusion rule (#133 self-exclusion + P-11b small-cluster
@@ -40,25 +40,31 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *   - No env reads. `selfPeerId` and `shardId` are constructor params; `K_S` (committee size for threshold math) lives on
   *     [[ShardFinalityTriggers]] (the per-shard composite), not here.
   *
-  * '''Why `Map[Hash, Set[PeerId]]` and not the gl0 `Map[PeerId, attestation]`.''' The gl0 tracker is keyed by `PeerId` because each peer's
-  * latest attestation supersedes its previous (P-11b NID property: receiver-side observability). The shard committee membership is bounded
-  * (`K_S` ≈ small) and each committee member produces at most one signature per checkpoint, so the inverted shape — keyed by `Hash`, value
-  * `Set[PeerId]` — is simpler for the `⌈2·K_S/3⌉` count comparison and for the `pruneBelow` predicate (drop hashes whose shard-ord falls
-  * below the floor).
+  * '''Why `Map[Hash, Map[PeerId, CommitteeMemberSignature]]`.''' The shard committee membership is bounded (`K_S` ≈ small) and each
+  * committee member produces at most one signature per checkpoint, so the inverted shape — keyed by `Hash`, value a per-signer `Map[PeerId,
+  * CommitteeMemberSignature]` — is simple for the `⌈2·K_S/3⌉` count comparison (`= keySet.size`) and for the `pruneBelow` predicate (drop
+  * hashes whose shard-ord falls below the floor). Retaining the FULL signature (not just the `PeerId`, the original Slice-6 shape) is what
+  * slice 14 needs: the gl0 consensus leader reads [[signaturesFor]] and splices the ≥`kQuorum` collected signatures back into a candidate
+  * checkpoint's `committeeSignatures` before the DETERMINISTIC `verifyEmbedded` adopt gate — turning a sub-quorum re-exec failover into a
+  * fast count-verified adopt. (The gl0 `TipTracker` is keyed by `PeerId` instead because there each peer's latest attestation supersedes
+  * its previous — P-11b NID; the shard's one-sig-per-checkpoint invariant makes the `Hash`-keyed shape sound here.)
   */
 trait ShardTipTracker[F[_]] {
 
   /** Which shard this tracker is scoped to. Set at construction; immutable. */
   def shardId: ShardId
 
-  /** Record an attestation from a committee member on a particular shard checkpoint. Idempotent — a peer attesting the same
-    * `checkpointHash` twice is a no-op on the second call.
+  /** Record an attestation from a committee member on a particular shard checkpoint, retaining the member's full
+    * [[CommitteeMemberSignature]] (not just the `peerId`) so the gl0 consensus leader can splice ≥`kQuorum` collected signatures back into
+    * the checkpoint's `committeeSignatures` before the deterministic `verifyEmbedded` adopt gate (slice 14). Idempotent — a peer attesting
+    * the same `checkpointHash` twice keeps the FIRST signature (it is deterministic over the canonical preimage, so a re-gossiped copy is
+    * byte-identical and re-recording is a no-op on the second call).
     *
     * Note this records the (`checkpointHash`, `peerId`) pair; the shard-ordinal floor for pruning is supplied separately by [[pruneBelow]]
     * (the caller looks up the ordinal from the [[ShardChainStore]]). This avoids forcing every recorder to know the ordinal at recording
     * time — they only know the hash they're attesting.
     */
-  def recordAttestation(checkpointHash: Hash, peerId: PeerId): F[Unit]
+  def recordAttestation(checkpointHash: Hash, peerId: PeerId, signature: CommitteeMemberSignature): F[Unit]
 
   /** Count distinct attesters for a given checkpoint hash.
     *
@@ -71,6 +77,15 @@ trait ShardTipTracker[F[_]] {
     */
   def attestationCountFor(checkpointHash: Hash, excludeSelf: Boolean = true): F[Int]
 
+  /** The full set of committee-member signatures collected for `checkpointHash`, keyed by signer `PeerId`. This is the slice-14 read the
+    * gl0 consensus leader uses to enrich a candidate checkpoint's `committeeSignatures` to ≥`kQuorum` before the deterministic
+    * `verifyEmbedded` adopt gate. NO self-exclusion here (unlike [[attestationCountFor]]): the leader needs every distinct signer it has
+    * observed to reach quorum, and dedup-by-`peerId` in the merge keeps the producer's already-embedded signature from being
+    * double-counted. Empty map ⇒ no attestations collected for this hash yet (the leader falls back to the re-exec failover until gossip
+    * catches up).
+    */
+  def signaturesFor(checkpointHash: Hash): F[Map[PeerId, CommitteeMemberSignature]]
+
   /** Drop attestations for checkpoints below the supplied shard-ordinal floor. The caller supplies a `Hash => Option[ShardOrdinal]` lookup
     * (typically `ShardChainStore.getByHash(_).map(_.signed.value.shardOrdinal)`); hashes the lookup can't resolve are retained
     * conservatively (we don't drop attestations whose host checkpoint may simply have been evicted from the chain store first; another tick
@@ -81,8 +96,9 @@ trait ShardTipTracker[F[_]] {
     */
   def pruneBelow(shardOrdinal: ShardOrdinal, lookupOrdinal: Hash => F[Option[ShardOrdinal]]): F[Unit]
 
-  /** Diagnostic / observability — read the full attestation map. Production callers should NOT route control flow through this; use
-    * [[attestationCountFor]] which applies the self-exclusion semantics consistently.
+  /** Diagnostic / observability — read the full attestation map (signer sets per checkpoint hash). Production callers should NOT route
+    * control flow through this; use [[attestationCountFor]] (self-exclusion-consistent counting) or [[signaturesFor]] (the slice-14 signer
+    * signatures). The signature payloads are dropped here — observability only needs the signer identities.
     */
   def allAttestations: F[Map[Hash, Set[PeerId]]]
 }
@@ -106,19 +122,20 @@ object ShardTipTracker {
     val outerSelfId = selfPeerId
     val logger = Slf4jLogger.getLoggerFromName[F](s"ShardTipTracker[$shardId]")
 
-    Ref.of[F, Map[Hash, Set[PeerId]]](Map.empty).map { attestationsRef =>
+    Ref.of[F, Map[Hash, Map[PeerId, CommitteeMemberSignature]]](Map.empty).map { attestationsRef =>
       new ShardTipTracker[F] {
 
         val shardId: ShardId = outerShardId
 
-        def recordAttestation(checkpointHash: Hash, peerId: PeerId): F[Unit] =
+        def recordAttestation(checkpointHash: Hash, peerId: PeerId, signature: CommitteeMemberSignature): F[Unit] =
           attestationsRef.modify { current =>
-            val priorSet = current.getOrElse(checkpointHash, Set.empty[PeerId])
-            val newSet = priorSet + peerId
-            // Per scaladoc: idempotent — peer re-attesting same hash is a no-op. We only bump the metric on the FIRST
-            // attestation from this (peer, hash) pair so the counter tracks distinct attestation events, not gossip-replay events.
-            val isFirst = priorSet.size != newSet.size
-            (current.updated(checkpointHash, newSet), isFirst)
+            val priorSigs = current.getOrElse(checkpointHash, Map.empty[PeerId, CommitteeMemberSignature])
+            // Per scaladoc: idempotent — keep the FIRST signature seen for a (hash, peer) pair. The signature is deterministic over the
+            // canonical preimage, so a re-gossiped copy is byte-identical and re-recording is a no-op. We only bump the metric on the
+            // FIRST attestation from this (peer, hash) pair so the counter tracks distinct attestation events, not gossip-replay events.
+            val newSigs = if (priorSigs.contains(peerId)) priorSigs else priorSigs.updated(peerId, signature)
+            val isFirst = priorSigs.size != newSigs.size
+            (current.updated(checkpointHash, newSigs), isFirst)
           }.flatMap {
             case true  => ShardMetrics.incCommitteeAttestation[F](outerShardId)
             case false => Async[F].unit
@@ -128,11 +145,14 @@ object ShardTipTracker {
           attestationsRef.get.map { current =>
             current.get(checkpointHash) match {
               case None => 0
-              case Some(peers) =>
-                if (excludeSelf) peers.iterator.filter(_ =!= outerSelfId).size
-                else peers.size
+              case Some(sigs) =>
+                if (excludeSelf) sigs.keysIterator.filter(_ =!= outerSelfId).size
+                else sigs.size
             }
           }
+
+        def signaturesFor(checkpointHash: Hash): F[Map[PeerId, CommitteeMemberSignature]] =
+          attestationsRef.get.map(_.getOrElse(checkpointHash, Map.empty[PeerId, CommitteeMemberSignature]))
 
         def pruneBelow(shardOrdinal: ShardOrdinal, lookupOrdinal: Hash => F[Option[ShardOrdinal]]): F[Unit] =
           attestationsRef.get.flatMap { current =>
@@ -143,7 +163,7 @@ object ShardTipTracker {
             // tracker by a tick. The next prune call will catch them once we have evidence either
             // way; conservative retention is bounded by the tracker's overall pruning cadence.
             current.toList.traverse {
-              case (h, peers) => lookupOrdinal(h).map(maybeOrd => (h, peers, maybeOrd))
+              case (h, sigs) => lookupOrdinal(h).map(maybeOrd => (h, sigs, maybeOrd))
             }.flatMap { resolved =>
               val (toDrop, toKeep) = resolved.partition {
                 case (_, _, Some(ord)) => ord.value < shardOrdinal.value
@@ -151,7 +171,7 @@ object ShardTipTracker {
               }
               if (toDrop.isEmpty) cats.effect.kernel.Sync[F].unit
               else {
-                val newMap = toKeep.map { case (h, peers, _) => h -> peers }.toMap
+                val newMap = toKeep.map { case (h, sigs, _) => h -> sigs }.toMap
                 attestationsRef.set(newMap) >>
                   logger.debug(
                     s"pruneBelow: shardOrdinal=${shardOrdinal.value} dropped=${toDrop.size} remaining=${toKeep.size}"
@@ -161,7 +181,7 @@ object ShardTipTracker {
           }
 
         def allAttestations: F[Map[Hash, Set[PeerId]]] =
-          attestationsRef.get
+          attestationsRef.get.map(_.view.mapValues(_.keySet).toMap)
       }
     }
   }

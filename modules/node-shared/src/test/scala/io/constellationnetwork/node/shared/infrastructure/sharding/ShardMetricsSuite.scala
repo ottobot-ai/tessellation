@@ -90,6 +90,18 @@ object ShardMetricsSuite extends MutableIOSuite {
         kesTreeStep = 0
       )
 
+  /** Dummy `CommitteeMemberSignature` used to satisfy the 3-arg `recordAttestation` signature in tests that only care about peerId-based
+    * counting. The tracker stores/counts by the explicit `peerId` argument, not by the sig's internal peerId.
+    */
+  private val dummyCommitteeSig: CommitteeMemberSignature =
+    CommitteeMemberSignature(
+      peerId = PeerId(Hex("00" * 64)),
+      vrfProof = Hex.fromBytes(Array.emptyByteArray),
+      ed25519Sig = Hex.fromBytes(Array.emptyByteArray),
+      kesProductSig = Hex.fromBytes(Array.emptyByteArray),
+      kesTreeStep = 0
+    )
+
   private def mkSignedBinary(content: Array[Byte]): Signed[StateChannelSnapshotBinary] = {
     val sentinelProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("11" * 64)), Signature(Hex("22" * 70)))
     Signed(
@@ -202,7 +214,7 @@ object ShardMetricsSuite extends MutableIOSuite {
       _ <- seedChain(store, 6)
       tip <- store.bestTip.map(_.get)
       tracker <- ShardTipTracker.make[IO](shardZero, selfPeer)
-      _ <- tracker.recordAttestation(tip.hash, signerPeer)
+      _ <- tracker.recordAttestation(tip.hash, signerPeer, dummyCommitteeSig)
       triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1, k1Shard = 100L, store, tracker)
       _ <- triggers.advance
 
@@ -387,10 +399,10 @@ object ShardMetricsSuite extends MutableIOSuite {
       hashB = Hash("22" * 32)
       tracker <- ShardTipTracker.make[IO](shardZero, peer1)
 
-      _ <- tracker.recordAttestation(hashA, peer1) // 1
-      _ <- tracker.recordAttestation(hashA, peer1) // replay — no bump
-      _ <- tracker.recordAttestation(hashA, peer2) // 2
-      _ <- tracker.recordAttestation(hashB, peer1) // 3
+      _ <- tracker.recordAttestation(hashA, peer1, dummyCommitteeSig) // 1
+      _ <- tracker.recordAttestation(hashA, peer1, dummyCommitteeSig) // replay — no bump
+      _ <- tracker.recordAttestation(hashA, peer2, dummyCommitteeSig) // 2
+      _ <- tracker.recordAttestation(hashB, peer1, dummyCommitteeSig) // 3
 
       state <- stateRef.get
     } yield expect(state.counters.getOrElse(ShardMetrics.CommitteeAttestationTotal.value, 0) == 3)

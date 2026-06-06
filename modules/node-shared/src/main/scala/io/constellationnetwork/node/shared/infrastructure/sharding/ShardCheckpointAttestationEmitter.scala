@@ -211,7 +211,7 @@ object ShardCheckpointAttestationEmitter {
               // Record locally first (mirror `emitTipAttestation`: self sees its own attestation). The default `excludeSelf = true` on the
               // tracker keeps this out of OUR threshold count (P-11b) — it is the gossiped copy below that lifts every OTHER node to quorum.
               _ <- tipTrackerFor(shardId) match {
-                case Some(tracker) => tracker.recordAttestation(checkpointHash, selfPeerId)
+                case Some(tracker) => tracker.recordAttestation(checkpointHash, selfPeerId, committeeSig)
                 case None          => Async[F].unit
               }
               wire = ShardCheckpointWireCodecs.shardCheckpointAttestationToWire(attestation)

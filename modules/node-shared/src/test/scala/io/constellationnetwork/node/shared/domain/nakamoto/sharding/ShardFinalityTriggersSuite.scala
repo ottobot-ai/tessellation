@@ -78,6 +78,18 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       kesTreeStep = 0
     )
 
+  /** Dummy `CommitteeMemberSignature` used to satisfy the 3-arg `recordAttestation` signature in tests that only care about peerId-based
+    * counting. The tracker stores/counts by the explicit `peerId` argument, not by the sig's internal peerId.
+    */
+  private val dummyCommitteeSig: CommitteeMemberSignature =
+    CommitteeMemberSignature(
+      peerId = pid("self"),
+      vrfProof = Hex.fromBytes(Array.emptyByteArray),
+      ed25519Sig = Hex.fromBytes(Array.emptyByteArray),
+      kesProductSig = Hex.fromBytes(Array.emptyByteArray),
+      kesTreeStep = 0
+    )
+
   private def mkCheckpoint(
     ord: Long,
     parent: Hash,
@@ -135,9 +147,9 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       _ <- seedChain(store, 1)
       tip <- store.bestTip.map(_.get)
       tracker <- ShardTipTracker.make[IO](shardZero, self)
-      _ <- tracker.recordAttestation(tip.hash, pid("attester-1"))
-      _ <- tracker.recordAttestation(tip.hash, pid("attester-2"))
-      _ <- tracker.recordAttestation(tip.hash, pid("attester-3"))
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-1"), dummyCommitteeSig)
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-2"), dummyCommitteeSig)
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-3"), dummyCommitteeSig)
       triggers <- ShardFinalityTriggers.make[IO](
         shardId = shardZero,
         kQuorum = 3,
@@ -157,8 +169,8 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       _ <- seedChain(store, 1)
       tip <- store.bestTip.map(_.get)
       tracker <- ShardTipTracker.make[IO](shardZero, self)
-      _ <- tracker.recordAttestation(tip.hash, pid("attester-1"))
-      _ <- tracker.recordAttestation(tip.hash, pid("attester-2"))
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-1"), dummyCommitteeSig)
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-2"), dummyCommitteeSig)
       // only 2 attesters; required = 3
       triggers <- ShardFinalityTriggers.make[IO](
         shardId = shardZero,
@@ -183,9 +195,9 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       _ <- seedChain(store, 1)
       tip <- store.bestTip.map(_.get)
       tracker <- ShardTipTracker.make[IO](shardZero, self)
-      _ <- tracker.recordAttestation(tip.hash, self) // self attests
-      _ <- tracker.recordAttestation(tip.hash, pid("attester-1"))
-      _ <- tracker.recordAttestation(tip.hash, pid("attester-2"))
+      _ <- tracker.recordAttestation(tip.hash, self, dummyCommitteeSig) // self attests
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-1"), dummyCommitteeSig)
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-2"), dummyCommitteeSig)
       // With self-exclusion (the default), only attester-1 and attester-2 count → count = 2 < 3 required → MinValue.
       // Without exclusion, count would be 3 ≥ 3 → qualifies. The point of this test is to verify the #133/P-11b mirror is wired
       // through ShardTipTracker.attestationCountFor's `excludeSelf = true` default.
@@ -273,8 +285,8 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       hashes2 <- seedChain(store2, 8)
       tip2 <- store2.bestTip.map(_.get)
       tracker2 <- ShardTipTracker.make[IO](shardZero, self)
-      _ <- tracker2.recordAttestation(tip2.hash, pid("attester-1"))
-      _ <- tracker2.recordAttestation(tip2.hash, pid("attester-2"))
+      _ <- tracker2.recordAttestation(tip2.hash, pid("attester-1"), dummyCommitteeSig)
+      _ <- tracker2.recordAttestation(tip2.hash, pid("attester-2"), dummyCommitteeSig)
       triggers <- ShardFinalityTriggers.make[IO](
         shardId = shardZero,
         kQuorum = 2,
@@ -311,9 +323,9 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       tip <- store.bestTip.map(_.get)
       tracker <- ShardTipTracker.make[IO](shardZero, self)
       // Record enough to qualify (kQuorum=3 → required=3 distinct attesters).
-      _ <- tracker.recordAttestation(tip.hash, pid("attester-1"))
-      _ <- tracker.recordAttestation(tip.hash, pid("attester-2"))
-      _ <- tracker.recordAttestation(tip.hash, pid("attester-3"))
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-1"), dummyCommitteeSig)
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-2"), dummyCommitteeSig)
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-3"), dummyCommitteeSig)
       triggers <- ShardFinalityTriggers.make[IO](
         shardId = shardZero,
         kQuorum = 3,
@@ -354,7 +366,7 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       hashes <- seedChain(store, 10)
       tracker <- ShardTipTracker.make[IO](shardZero, self)
       // Record one attestation per checkpoint hash so we can verify the prune drops some and keeps others.
-      _ <- hashes.zipWithIndex.traverse_ { case (h, i) => tracker.recordAttestation(h, pid(s"attester-$i")) }
+      _ <- hashes.zipWithIndex.traverse_ { case (h, i) => tracker.recordAttestation(h, pid(s"attester-$i"), dummyCommitteeSig) }
       // Count before prune: 10 distinct hashes each with 1 attester (peerId distinct per hash).
       attsBefore <- tracker.allAttestations
       _ <- tracker.pruneBelow(
@@ -388,8 +400,8 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       tip <- store.bestTip.map(_.get)
       tracker <- ShardTipTracker.make[IO](shardZero, self)
       attester = pid("attester-1")
-      _ <- tracker.recordAttestation(tip.hash, attester)
-      _ <- tracker.recordAttestation(tip.hash, attester) // duplicate; Set semantics → no change
+      _ <- tracker.recordAttestation(tip.hash, attester, dummyCommitteeSig)
+      _ <- tracker.recordAttestation(tip.hash, attester, dummyCommitteeSig) // duplicate; Set semantics → no change
       count <- tracker.attestationCountFor(tip.hash, excludeSelf = false)
     } yield expect.same(1, count)
   }

@@ -1,7 +1,7 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot
 
 import cats.Order
-import cats.data.NonEmptySet
+import cats.data.{NonEmptyList, NonEmptySet}
 import cats.effect.Async
 import cats.effect.kernel.Ref
 import cats.syntax.all._
@@ -90,6 +90,34 @@ object GlobalSnapshotConsensusFunctions {
     * the validator adopt path (not just the ~1/N it produced).
     */
   val pendingAccumulatorsToKeep: Int = 512
+
+  /** Slice 14 — splice the committee attestations collected in the per-shard `ShardTipTracker` (gossiped `CommitteeMemberSignature`s, full
+    * signature form) into a candidate checkpoint's `committeeSignatures`, so the deterministic `ShardCheckpointGl0AcceptanceManager`
+    * `verifyEmbedded` adopt gate counts `>= kQuorum` distinct signers and admits via the FAST verify path instead of the re-exec failover.
+    *
+    * Pure + LEADER-PATH ONLY (callers gate on `sourceShardCheckpoints`): the produce leader enriches its candidates from its node-local
+    * tracker; the resulting checkpoint is what the leader embeds + proposes, and every follower threads that SAME embedded set unchanged
+    * (it does NOT re-source its own tracker), so `verifyEmbedded` — deterministic, reading no node-local state — re-accepts the leader's
+    * set on every node and the artifact round-trips byte-identically (the split-safety invariant). `committeeSignatures` is EXCLUDED from
+    * `ShardCheckpointSigPreimage`, so splicing extra signers leaves the canonical checkpoint hash (chain-link + signed bytes) untouched —
+    * the spliced signers each signed that same hash.
+    *
+    * Dedup by `peerId` (the producer's already-embedded signature is dropped from `collected` rather than double-counted) and the appended
+    * signers are sorted by `peerId` hex for a canonical, reproducible `committeeSignatures` order (so the leader re-validating its own
+    * artifact yields identical bytes regardless of `Map` iteration order — the BLS-design §8 canonical-ordering discipline).
+    */
+  private[snapshot] def spliceCommitteeSignatures(
+    cp: io.constellationnetwork.schema.sharding.ShardCheckpoint,
+    collected: Map[PeerId, io.constellationnetwork.schema.sharding.CommitteeMemberSignature]
+  ): io.constellationnetwork.schema.sharding.ShardCheckpoint = {
+    val embeddedPeers = cp.committeeSignatures.toList.iterator.map(_.peerId).toSet
+    val extra = collected.values.iterator
+      .filterNot(s => embeddedPeers.contains(s.peerId))
+      .toList
+      .sortBy(_.peerId.value.value)
+    if (extra.isEmpty) cp
+    else cp.copy(committeeSignatures = NonEmptyList(cp.committeeSignatures.head, cp.committeeSignatures.tail ++ extra))
+  }
 
   def make[F[_]: Async: SecurityProvider: JsonSerializer](
     globalSnapshotAcceptanceManager: GlobalSnapshotAcceptanceManager[F],
@@ -547,7 +575,13 @@ object GlobalSnapshotConsensusFunctions {
                         case Some(qualifying) =>
                           // Fast path: the qualifying checkpoint itself anchors at-or-below N.
                           if (qualifying.signed.value.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value)
-                            (shardId -> qualifying.signed.value).some.pure[F]
+                            // Slice 14: enrich the candidate with the committee attestations this node collected in the per-shard tracker
+                            // (keyed by the canonical checkpoint hash = chain-store `.hash`), so `verifyEmbedded` counts >= kQuorum and
+                            // adopts via the fast verify path instead of the re-exec failover. LEADER-path only (gated `sourceShardCheckpoints`
+                            // above); the follower threads the leader's already-enriched set unchanged (split-safety).
+                            entry.tipTracker
+                              .signaturesFor(qualifying.hash)
+                              .map(collected => (shardId -> spliceCommitteeSignatures(qualifying.signed.value, collected)).some)
                           else
                             // Walk back from the qualifying checkpoint to the highest-ord ancestor whose
                             // gl0AnchorOrdinal <= N. `walkBackTo` returns tip-first order (head = the entry
@@ -555,10 +589,21 @@ object GlobalSnapshotConsensusFunctions {
                             // the qualifying ord (full canonical chain bounded by the keep-window).
                             entry.chainStore
                               .walkBackTo(qualifying.hash, qualifyingOrd.value)
-                              .map { chain =>
-                                chain
-                                  .find(_.signed.value.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value)
-                                  .map(h => shardId -> h.signed.value)
+                              .flatMap { chain =>
+                                chain.find(_.signed.value.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value) match {
+                                  case None =>
+                                    none[
+                                      (
+                                        io.constellationnetwork.schema.sharding.ShardId,
+                                        io.constellationnetwork.schema.sharding.ShardCheckpoint
+                                      )
+                                    ].pure[F]
+                                  case Some(h) =>
+                                    // Slice 14 (see fast-path note) — enrich the walked-back ancestor from the tracker too.
+                                    entry.tipTracker
+                                      .signaturesFor(h.hash)
+                                      .map(collected => (shardId -> spliceCommitteeSignatures(h.signed.value, collected)).some)
+                                }
                               }
                       }
                   }

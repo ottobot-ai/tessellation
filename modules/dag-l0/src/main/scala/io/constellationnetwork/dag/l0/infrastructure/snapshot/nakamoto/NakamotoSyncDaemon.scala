@@ -2209,7 +2209,7 @@ object NakamotoSyncDaemon {
                               // Record every committee signer (the producer's own sig seeds 1 attestation) into the tip tracker —
                               // only now that re-exec validated the checkpoint (so a wrong-derivation envelope never inflates quorum).
                               checkpoint.committeeSignatures.toList
-                                .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId)) >>
+                                .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId, sig)) >>
                                 // T_count_shard quorum closure: on best-tip, sign + gossip OUR own attestation so every OTHER node's
                                 // tracker crosses ⌈2·K_S/3⌉. Self-exclusion (P-11b) keeps it out of our own threshold count. `None`
                                 // emitter (numShards=1 regression bar) ⇒ no emit. Background-fire so the multi-step sign+publish
@@ -2326,7 +2326,7 @@ object NakamotoSyncDaemon {
                           s"checkpoint=${attestation.checkpointHash.value.take(12)} from=${attesterId.value.value.take(16)}..."
                       )
                     case true =>
-                      entry.tipTracker.recordAttestation(attestation.checkpointHash, attesterId) >>
+                      entry.tipTracker.recordAttestation(attestation.checkpointHash, attesterId, attestation.attesterSignature) >>
                         logger.debug(
                           s"🧩 ShardCheckpointAttestation rx shard=${attestation.shardId.value.value} " +
                             s"checkpoint=${attestation.checkpointHash.value.take(12)} attester=${attesterId.value.value.take(12)}"
