@@ -139,6 +139,52 @@ const waitForGL0MetagraphAlignment = async (gl0Url, metagraphAddress, ordinalBef
   }
 }
 
+// Readiness gate for the FIRST L0-token (metagraph-currency) transfer.
+//
+// A metagraph's currency is not transactable until GL0 has committed its currency
+// state into `lastCurrencySnapshots[mg]`: cl1 bootstraps its first currency snapshot
+// FROM gl0's seeded view (CurrencySnapshotProcessor reads
+// `globalState.lastCurrencySnapshots.get(identifier)`), and cl1's tx-validation has
+// nothing to validate against until then (TransactionService waits for the first
+// currency snapshot, else times out → the SDK send fails). Under sharding the seed
+// travels mg → shard-committee ShardCheckpoint → gl0 verifyEmbedded-adopt, which at
+// cold start takes minutes — longer than cl1's tx-validation timeout. So before the
+// first metagraph transfer we poll the SAME field cl1 bootstraps from until it is
+// populated (ordinal >= 0). This makes the test transact only once the currency is
+// genuinely live on the global — mirroring production sequencing (a metagraph seeded
+// onto a running global state isn't transactable the instant its genesis is sent).
+//
+// Fail LOUDLY on timeout (do NOT "proceed anyway"): a currency that never goes live is
+// a real seeding regression and must surface as the cause, not be masked by the
+// downstream send error.
+const waitForMetagraphCurrencyLive = async (gl0Url, metagraphId) => {
+  const timeoutMs = 8 * 60 * 1000
+  const intervalMs = 5000
+  const start = Date.now()
+  logMessage(`Waiting for metagraph currency ${metagraphId.slice(0, 12)}... to go live on GL0 (lastCurrencySnapshots; timeout ${timeoutMs / 60000}m)...`)
+  while (Date.now() - start < timeoutMs) {
+    try {
+      // Read lastCurrencySnapshots via /latest/combined (FinalizedSnapshotReader-backed,
+      // ALWAYS available) rather than /latest/info, which 503s whenever gl0's head is
+      // ahead of finalized — the common case under depth-k finality — and would stall
+      // this poll. Combined is Either-encoded as [snapshot, info]; info is index 1.
+      const data = await fetchJson(`${gl0Url}/global-snapshots/latest/combined`)
+      const info = Array.isArray(data) && data.length >= 2 ? data[1] : (data && data.value && data.value.info) || {}
+      const lcs = (info && info.lastCurrencySnapshots) || {}
+      if (Object.prototype.hasOwnProperty.call(lcs, metagraphId)) {
+        logMessage(`Metagraph currency live on GL0 (in lastCurrencySnapshots) after ${Math.round((Date.now() - start) / 1000)}s`)
+        return
+      }
+    } catch (_) { /* gl0 transient — retry */ }
+    await sleep(intervalMs)
+  }
+  throw new Error(
+    `Metagraph currency ${metagraphId} never appeared in GL0 lastCurrencySnapshots within ${timeoutMs / 1000}s — ` +
+    `currency seeding (mg → shard-checkpoint → gl0 verifyEmbedded-adopt) did not complete. ` +
+    `Inspect gl0 ShardCheckpointGl0AcceptanceManager (verifyEmbedded accept/reject) + the per-shard binary buffer.`
+  )
+}
+
 // Detect race-class errors that surface from the dag4 SDK or gl1 contextual
 // validator. The SDK's `generateBatchTransactions` queries `lastReference`
 // fresh — if gl1's view lags a prior scenario's accepted tx by a snapshot or
@@ -429,11 +475,18 @@ const handleMetagraphBatchTransactions = async (
       testnet: true,
     })
 
-    // Capture destination's CL1 last-reference before sending. The destination's
-    // ref only changes when CL1 processes the snapshot (not on local block
-    // acceptance), so it's the correct signal for snapshot round-trip completion.
-    const destRefBefore = await fetchJson(
-      `${networkOptions.l1MetagraphUrl}/transactions/last-reference/${destination.address}`
+    // Capture the SENDER's CL1 last-reference before sending. cl1's
+    // /transactions/last-reference is keyed by SOURCE address (TransactionStorage
+    // `getLastProcessedTransaction(source)` — the outgoing tx chain), so only the
+    // SENDER's ref advances for this transfer; the destination merely receives and
+    // its source-chain ref never moves. Waiting on the destination (the prior bug)
+    // therefore timed out the full 180s on EVERY transfer. Wait on the origin
+    // instead — matching this helper's own doc ("the sender's last-reference ...
+    // reflects pre-transfer state") — which advances once cl1 processes the tx
+    // (already true by the time the balance settle below returns), so it resolves
+    // immediately instead of stalling.
+    const originRefBefore = await fetchJson(
+      `${networkOptions.l1MetagraphUrl}/transactions/last-reference/${origin.address}`
     )
 
     // Capture GL0's current CL0 ordinal for this metagraph before sending.
@@ -519,8 +572,8 @@ const handleMetagraphBatchTransactions = async (
     // disagrees with CL0's lastTxRefs.
     await waitForCL1Alignment(
       networkOptions.l1MetagraphUrl,
-      destination.address,
-      destRefBefore.hash
+      origin.address,
+      originRefBefore.hash
     )
 
     // Wait for GL0 to advance its view of this metagraph past its pre-transfer
@@ -759,7 +812,10 @@ const sendTransactionsUsingUrls = async (networkOptions) => {
   await transferTest(account1, account2, 10, 0.02, 100)
   await transferTest(account2, account1, 10, 0.02, 100)
 
-  // Metagraph
+  // Metagraph — gate on the currency being LIVE on gl0 first (seeding-race fix):
+  // under sharding the genesis currency takes minutes to travel mg → shard-checkpoint
+  // → gl0 adopt, and cl1 can't validate currency txs until gl0 has seeded it.
+  await waitForMetagraphCurrencyLive(networkOptions.l0GlobalUrl, networkOptions.metagraphId)
   await transferTest(account1, account2, 10, 0, 1, networkOptions)
   await transferTest(account2, account1, 10, 0, 1, networkOptions)
 
