@@ -53,6 +53,13 @@ services:
       # string "" (not absent), which fails NUMBER parsing. A bare `:-` empty
       # default crashes config load on any run that doesn't pass --shards.
       - NAKAMOTO_COMMITTEE_K_TARGET=${NAKAMOTO_COMMITTEE_K_TARGET:-4}
+      # Committee draw/quorum (COMMITTEE-SORTITION-DESIGN.md §5; decoupled from the dead K_TARGET above).
+      # k-draw sizes the committee draw (= N saturates ⇒ committee = all); k-quorum is the admit count.
+      # Defaults MUST mirror the HOCON defaults (k-draw=8, k-quorum=6) — same empty-string NUMBER-parse hazard
+      # as K_TARGET. For a reduced-gl0 run set BOTH coherently (invariant 0 < k-quorum <= k-draw, k-draw≈N):
+      # e.g. at --num-gl0=5 → NAKAMOTO_COMMITTEE_K_DRAW=5 NAKAMOTO_COMMITTEE_K_QUORUM=3.
+      - NAKAMOTO_COMMITTEE_K_DRAW=${NAKAMOTO_COMMITTEE_K_DRAW:-8}
+      - NAKAMOTO_COMMITTEE_K_QUORUM=${NAKAMOTO_COMMITTEE_K_QUORUM:-6}
       # Hierarchical shard-checkpoint sharding. num-shards = 1 (default) keeps the
       # new shard path inert — byte-identical to pre-sharding behavior. num-shards
       # > 1 activates per-shard ShardCheckpoint production + gl0 aggregation
