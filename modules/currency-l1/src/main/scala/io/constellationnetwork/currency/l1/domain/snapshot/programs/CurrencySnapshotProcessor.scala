@@ -155,28 +155,72 @@ object CurrencySnapshotProcessor {
                     }
 
                   case Validator.NotNext =>
-                    // Parent-hash mismatch between our stored last snapshot and the incoming one.
-                    // Under finality-gating (#122) followers consume only depth-k-finalized gl0
-                    // snapshots, so this branch should be unreachable on the happy path — a
-                    // mismatch at the finalized horizon implies either a genuine chain-fork bug
-                    // or local state divergence (e.g. stale storage). Defensive recovery kept:
-                    // clear our last snapshot state so the next pull falls into the bootstrap
-                    // (Left) branch, rebootstrapping from the canonical head. Without this, cl1
-                    // would SnapshotIgnored every subsequent snapshot forever (observed: cl1
-                    // stranded at ord 56 while gl0 reached ord 161+). Also sets the redownload
-                    // flag for observability / TooFarEpochProgress path consistency.
-                    val reason =
-                      s"Parent-hash mismatch at incoming ord=${globalSnapshotReference.ordinal.show}: stored last ord=${lastGlobalSnapshot.ordinal.show} hash=${lastGlobalSnapshot.hash.value
-                          .take(12)} but incoming.lastSnapshotHash=${globalSnapshot.signed.value.lastSnapshotHash.value.take(12)}. Clearing state + forcing redownload."
-                    Slf4jLogger
-                      .getLogger[F]
-                      .warn(
-                        s"cl1 NotNext on finalized snapshot (#122 anomaly) at ord=${globalSnapshotReference.ordinal.show} — destructive clear+redownload preserved as defense; investigate"
-                      ) >>
-                      globalL0AlignmentStorage.updateShouldRedownload(value = true, reasons = List(reason)) >>
-                      lastGlobalSnapshotStorage.clear >>
-                      lastNGlobalSnapshotStorage.clear
-                        .as[SnapshotProcessingResult](SnapshotIgnored(globalSnapshotReference))
+                    // FOLLOW RESYNC-TO-CANONICAL (replaces the old destructive `clear` — the #122 NotNext loop).
+                    // The stored snapshot's hash does not chain to the incoming finalized one (the snapshot-rehash
+                    // chain is brittle vs gl0's recorded `lastSnapshotHash`). The OLD behavior CLEARED
+                    // lastGlobalSnapshotStorage, which left `getOrdinal` = None → BlockService raised
+                    // `SnapshotOrdinalUnavailable` → currency block acceptance died → txns stuck WaitingTx →
+                    // `getLastProcessedTransaction` (the /transactions/last-reference the harness polls) frozen at
+                    // genesis → e2e hung at the L0-token transfer (observed: cl1 0 Aligned / 119 SnapshotIgnored,
+                    // perpetual clear→re-download loop). Instead we ADOPT-FORWARD onto the canonical chain, exactly
+                    // as ml0's `StateChannel.resyncToCanonical`: pull gl0's authoritative latest (the FULL GSI — never
+                    // a partial slice, so the follower lands on COMPLETE state), VERIFY the recomputed MPT root EQUALS
+                    // the snapshot's SIGNED `stateProof.mptRoot` (the deterministic trust anchor — `pullLatestSnapshot`
+                    // only checks the snapshot hash vs majority, NOT that the served GSI reproduces the signed root),
+                    // then `setForRecovery` which keeps storage POPULATED (unlike `clear`, so acceptance stays live).
+                    // We NEVER adopt unverified state: on root mismatch we re-pull (bounded), else leave storage
+                    // untouched and idle (next tick retries). This bypasses the brittle `Validator.compare` hash-chain
+                    // in favor of the mptRoot anchor — symmetric with how ml0 / gl1 already follow. Snapshots already
+                    // at-or-below our stored tip are skipped WITHOUT a resync so one batch triggers at most ONE jump.
+                    if (globalSnapshot.signed.value.ordinal <= lastGlobalSnapshot.ordinal)
+                      Async[F].pure[SnapshotProcessingResult](SnapshotIgnored(globalSnapshotReference))
+                    else {
+                      val maxResyncPullAttempts = 3
+                      Slf4jLogger
+                        .getLogger[F]
+                        .warn(
+                          s"cl1 NotNext on finalized snapshot (#122) at incoming ord=${globalSnapshotReference.ordinal.show} " +
+                            s"(stored ord=${lastGlobalSnapshot.ordinal.show}) — resync-to-canonical adopt-forward (setForRecovery, mptRoot-verified)"
+                        ) >>
+                        1.tailRecM[F, SnapshotProcessingResult] { attempt =>
+                          for {
+                            canonical <- l0Service.pullLatestSnapshot
+                            (canonicalSnapshot, canonicalState) = canonical
+                            canonicalRef = SnapshotReference.fromHashedSnapshot(canonicalSnapshot)
+                            _ <- mptStore.syncFromGlobalSnapshotInfo(canonicalState, canonicalSnapshot.ordinal)
+                            recomputedRoot <- mptStore.underlying.getRootHashForOrdinal(canonicalSnapshot.ordinal).map(_.map(_.value))
+                            signedRoot = canonicalSnapshot.signed.value.stateProof.mptRoot
+                            result <-
+                              if (recomputedRoot === signedRoot)
+                                lastGlobalSnapshotStorage.setForRecovery(canonicalSnapshot, canonicalState) >>
+                                  lastNGlobalSnapshotStorage.setForRecovery(canonicalSnapshot, canonicalState) >>
+                                  followMirrorRef.set(none) >>
+                                  Slf4jLogger
+                                    .getLogger[F]
+                                    .info(
+                                      s"cl1 resynced to canonical ord=${canonicalSnapshot.ordinal.show}; resuming forward follow next tick"
+                                    )
+                                    .as((DownloadPerformed(canonicalRef, Set.empty, Set.empty): SnapshotProcessingResult).asRight[Int])
+                              else if (attempt < maxResyncPullAttempts)
+                                Slf4jLogger
+                                  .getLogger[F]
+                                  .error(
+                                    s"cl1 resync-to-canonical: gl0 served GSI inconsistent with its OWN signed mptRoot at ord=${canonicalSnapshot.ordinal.show} " +
+                                      s"(recomputed=${recomputedRoot.map(_.show.take(12)).getOrElse("none")} ≠ signed=${signedRoot.map(_.show.take(12)).getOrElse("none")}); " +
+                                      s"NOT adopting, re-pulling (attempt ${attempt + 1}/$maxResyncPullAttempts)"
+                                  )
+                                  .as((attempt + 1).asLeft[SnapshotProcessingResult])
+                              else
+                                Slf4jLogger
+                                  .getLogger[F]
+                                  .error(
+                                    s"cl1 resync-to-canonical: gl0 served an inconsistent GSI on all $maxResyncPullAttempts attempts at " +
+                                      s"ord=${canonicalSnapshot.ordinal.show}; leaving storage UNCHANGED, idling — next tick retries"
+                                  )
+                                  .as((SnapshotIgnored(globalSnapshotReference): SnapshotProcessingResult).asRight[Int])
+                          } yield result
+                        }
+                    }
                 }
               case None =>
                 // Storage was cleared by the NotNext branch above (or by recoverFromOrphan + a
