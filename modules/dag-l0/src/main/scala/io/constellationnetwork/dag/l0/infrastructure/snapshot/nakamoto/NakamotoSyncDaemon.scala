@@ -893,13 +893,34 @@ object NakamotoSyncDaemon {
                                       )
                                     else
                                       responses.traverse_ { resp =>
+                                        val mb = pb.MetagraphBinary(address = mg.value.value, binary = resp.signedBinary)
                                         // Re-feed through the SAME gossip entry point — goes through the
                                         // committee gate + drains buffered children on admit.
                                         handleMetagraphBinary(
-                                          pb.MetagraphBinary(address = mg.value.value, binary = resp.signedBinary),
+                                          mb,
                                           processOrphanedMetagraphBinary,
                                           logger
-                                        )
+                                        ) *>
+                                          // GENESIS-BRIDGE (#28): ALSO feed the shard buffer, mirroring the gossip
+                                          // intake (the `MetagraphBinary` handler buffers for the shard right after
+                                          // `handleMetagraphBinary`). ChainSync recovers binaries whose gossip
+                                          // broadcast raced gl0 readiness — notably a FRESH metagraph's genesis-full
+                                          // `CurrencySnapshot` (sent once, un-retried, before gl0's head was ready, so
+                                          // `StateChannelRoutes` returned ServiceUnavailable and never re-broadcast it
+                                          // onto the topic that feeds the shard buffer). Without this the shard
+                                          // checkpoint's `includedSnapshots` is incremental-only → the gl0 adopt path
+                                          // `deriveAdoptedCurrencyState` cannot seed a fresh MG's currency (the
+                                          // genesis-FULL is mandatory as the chain head) → `lastCurrencySnapshots`
+                                          // freezes at genesis → cl1's first-currency-snapshot bootstrap 90s-times-out
+                                          // → L0-token transfers fail. Buffering the ChainSync-fetched genesis here
+                                          // lands it in the LEADER's checkpoint candidate (the leader ChainSyncs it via
+                                          // its own orphan stuck-detection); followers verify+attest the candidate.
+                                          // Split-safe: the genesis rides in the committee-SIGNED checkpoint, never a
+                                          // node-local read. Dynamic: fires for any metagraph onboarding (e2e-genesis
+                                          // OR a new metagraph joining a running gl0), keyed on "genesis binary fetched".
+                                          Async[F].whenA(shardBinaryBuffers.nonEmpty)(
+                                            bufferReceivedBinaryForShard(mb, shardBinaryBuffers, shardAssignment, logger)
+                                          )
                                       }
                                   }
                               }

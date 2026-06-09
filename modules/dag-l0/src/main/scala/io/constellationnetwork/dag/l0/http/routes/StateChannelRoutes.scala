@@ -7,6 +7,8 @@ import cats.syntax.flatMap._
 import cats.syntax.functor._
 import cats.syntax.traverse._
 
+import scala.concurrent.duration._
+
 import io.constellationnetwork.dag.l0.domain.statechannel.StateChannelService
 import io.constellationnetwork.ext.http4s.AddressVar
 import io.constellationnetwork.json.JsonSerializer
@@ -17,6 +19,7 @@ import io.constellationnetwork.routes.internal._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo}
 import io.constellationnetwork.security.Hasher
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelSnapshotBinary}
 
@@ -56,6 +59,25 @@ final case class StateChannelRoutes[F[_]: Async: Hasher: JsonSerializer](
       }
       .handleErrorWith(e => logger.warn(e)(s"Failed to gossip metagraph binary for $address"))
 
+  // RELIABLE GENESIS SEEDING (#28). A metagraph's genesis-full binary (`lastSnapshotHash == Hash.empty`) is sent ONCE by
+  // ml0; under sharding it must reach the shard committee's per-shard buffer (fed by this gossip topic via
+  // NakamotoSyncDaemon's `MetagraphBinary` intake) for gl0 to seed `lastCurrencySnapshots[mg]` and unblock cl1's
+  // first-currency-snapshot bootstrap. A single best-effort GossipSub publish can miss the (rotating) shard leader, after
+  // which the slow ChainSync stuck-detection fallback loses the race against cl1's 90s timeout. So we re-publish the
+  // genesis a few times: the sidecar uses GossipSub's DEFAULT seqno-based message-id, so each re-publish is a DISTINCT
+  // message (NOT seen-cache-deduped) and re-propagates, reliably reaching every gl0 node's shard buffer within seconds.
+  // Fired in the BACKGROUND so the inbound POST still returns promptly. Idempotent downstream (dedup by binary hash in the
+  // shard buffer + orphan buffer), so the extra publishes are harmless. Only the genesis is amplified — incrementals are
+  // frequent + each is already broadcast, so they need no help.
+  private val GenesisReGossipCount: Int = 5
+  private val GenesisReGossipInterval = 2.seconds
+
+  private def reGossipGenesis(address: Address, signed: Signed[StateChannelSnapshotBinary]): F[Unit] =
+    List
+      .fill(GenesisReGossipCount)(())
+      .traverse(_ => Async[F].sleep(GenesisReGossipInterval) >> broadcastMetagraphBinary(address, signed))
+      .void
+
   // Inbound metagraph binaries use whatever context is currently in head.
   // DO NOT finality-gate this path: in Nakamoto mode, head is ~always ahead
   // of finalized during active production, so gating here would reject every
@@ -77,8 +99,14 @@ final case class StateChannelRoutes[F[_]: Async: Hasher: JsonSerializer](
             })
             .flatMap {
               case Some(Left(errors)) => BadRequest(errors)
-              case Some(Right(_))     => broadcastMetagraphBinary(address, signed) >> Ok()
-              case None               => ServiceUnavailable(("message" ->> "Node not yet ready to accept metagraph snapshots.") :: HNil)
+              case Some(Right(_))     =>
+                // For the genesis-full (chain head), amplify the gossip in the background so it reliably reaches the
+                // shard committee buffer fast (see reGossipGenesis). Incrementals broadcast once (frequent → reliable).
+                val reGossip =
+                  if (signed.value.lastSnapshotHash === Hash.empty) Async[F].start(reGossipGenesis(address, signed)).void
+                  else Async[F].unit
+                broadcastMetagraphBinary(address, signed) >> reGossip >> Ok()
+              case None => ServiceUnavailable(("message" ->> "Node not yet ready to accept metagraph snapshots.") :: HNil)
             }
         }
   })
