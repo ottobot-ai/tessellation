@@ -600,23 +600,43 @@ object GlobalSnapshotConsensusFunctions {
                             .walkBackTo(qualifying.hash, qualifyingOrd.value)
                             .flatMap { chainTipFirst =>
                               val scTips = snapshotContext.lastStateChannelSnapshotHashes
+                              // TRIM-AWARE match (mirrors the GSAM adoption guard): a checkpoint is the next-to-adopt
+                              // if any of its windows CONTAINS the binary continuing gl0's SC tip — not only at the
+                              // window head. Post-reorg, canonical windows OVERLAP the already-adopted orphaned
+                              // prefix; head-only matching stalled adoption permanently (run bml994k4d shard 1)
+                              // while the chain kept producing. The adoption side trims the overlap.
                               val pick = chainTipFirst.reverse.find { h =>
                                 val cp = h.signed.value
                                 cp.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value &&
                                 cp.derivedStateDelta.includedSnapshots.nonEmpty &&
                                 cp.derivedStateDelta.includedSnapshots.exists {
                                   case (mg, nel) =>
-                                    nel.head.value.lastSnapshotHash === scTips.getOrElse(mg, Hash.empty)
+                                    val tip = scTips.getOrElse(mg, Hash.empty)
+                                    nel.exists(_.value.lastSnapshotHash === tip)
                                 }
                               }
                               pick match {
                                 case None =>
-                                  none[
-                                    (
-                                      io.constellationnetwork.schema.sharding.ShardId,
-                                      io.constellationnetwork.schema.sharding.ShardCheckpoint
+                                  // embed-none observability (mirrors produce-skip). This fires BOTH when fully
+                                  // caught up (normal: every window already adopted, tips == newest tail) AND on an
+                                  // adoption-side stall — the reader disambiguates by whether the shard chain height
+                                  // keeps growing while this line repeats with unchanged tips.
+                                  logger
+                                    .info(
+                                      s"🧩 embed-none shard=${shardId.value.value} " +
+                                        s"chainLen=${chainTipFirst.size} qualifyingOrd=${qualifyingOrd.value} " +
+                                        s"tips=${snapshotContext.lastStateChannelSnapshotHashes.toList.map {
+                                            case (mg, hh) => s"${mg.value.value.take(8)}:${hh.value.take(8)}"
+                                          }.mkString(",")}"
                                     )
-                                  ].pure[F]
+                                    .as(
+                                      none[
+                                        (
+                                          io.constellationnetwork.schema.sharding.ShardId,
+                                          io.constellationnetwork.schema.sharding.ShardCheckpoint
+                                        )
+                                      ]
+                                    )
                                 case Some(h) =>
                                   // Slice 14: enrich the candidate with the committee attestations this node collected in
                                   // the per-shard tracker (keyed by the canonical checkpoint hash = chain-store `.hash`),

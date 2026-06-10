@@ -592,21 +592,54 @@ object GlobalSnapshotAcceptanceManager {
                     // chain IN ORDER (no child window adopted while its parent window was never adopted — the genesis
                     // wedge). A non-continuous window is DEFERRED loudly; the leader re-offers the missing ancestor
                     // checkpoint at a later ord (ancestor-first selection in GlobalSnapshotConsensusFunctions).
-                    val (chainContinuous, deferred) =
-                      cp.derivedStateDelta.includedSnapshots.partition {
+                    // TRIM-AWARE anchoring (2026-06-10): all checkpoint windows partition the SAME linear ml0
+                    // binary chain, so after a shard-chain reorg gl0's recorded tip (an orphaned branch's window
+                    // tail) still lies ON that linear chain — the canonical window containing its continuation
+                    // OVERLAPS the already-adopted prefix rather than chaining exactly off it. Requiring exact
+                    // head==tip (the first guard shape) turned that overlap into a permanent adoption stall (run
+                    // bml994k4d, shard 1 frozen 30+ min while its chain advanced). Instead: find the binary INSIDE
+                    // the window whose lastSnapshotHash === tip (binaries carry their parent hash — no
+                    // recomputation) and adopt the suffix from there. Pure function of (window, prior GSI) —
+                    // split-safe. No continuation present at all ⇒ defer (true chain hole, the leader re-offers an
+                    // older ancestor).
+                    val tipFor: Address => Hash = mg => priorLastStateChannelSnapshotHashes.getOrElse(mg, Hash.empty)
+                    val trimResults: List[Either[
+                      (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]),
+                      (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], Int)
+                    ]] =
+                      cp.derivedStateDelta.includedSnapshots.toList.map {
                         case (mg, nel) =>
-                          nel.head.value.lastSnapshotHash === priorLastStateChannelSnapshotHashes.getOrElse(mg, Hash.empty)
+                          val idx = nel.toList.indexWhere(_.value.lastSnapshotHash === tipFor(mg))
+                          if (idx < 0) Left((mg, nel))
+                          else
+                            NonEmptyList
+                              .fromList(nel.toList.drop(idx))
+                              .map(suffix => Right((mg, suffix, idx)))
+                              .getOrElse(Left((mg, nel)))
                       }
+                    val deferred = trimResults.collect { case Left(d) => d }
+                    val adopted = trimResults.collect { case Right(r) => r }
+                    val chainContinuous: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] =
+                      SortedMap.from(adopted.map { case (mg, suffix, _) => mg -> suffix })(Address.OrderingInstance)
                     val newReceipts: List[io.constellationnetwork.schema.sharding.CrossShardReceipt] = cp.emittedReceipts
-                    deferred.toList.traverse_ {
+                    deferred.traverse_ {
                       case (mg, nel) =>
                         loggerBundle.app.warn(
                           s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                             s"DEFER-ANCHOR mg=$mg windowHeadParent=${nel.head.value.lastSnapshotHash.value.take(12)} " +
-                            s"gl0Tip=${priorLastStateChannelSnapshotHashes.getOrElse(mg, Hash.empty).value.take(12)} " +
-                            s"— window does not chain off gl0's SC tip (missing ancestor checkpoint); deferring"
+                            s"gl0Tip=${tipFor(mg).value.take(12)} " +
+                            s"— no continuation of gl0's SC tip anywhere in the window (missing ancestor checkpoint); deferring"
                         )
                     } >>
+                      adopted.traverse_ {
+                        case (mg, _, trimmedCount) =>
+                          Async[F].whenA(trimmedCount > 0) {
+                            loggerBundle.app.info(
+                              s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
+                                s"TRIM-ANCHOR mg=$mg trimmed=$trimmedCount already-adopted prefix binaries (post-reorg window overlap)"
+                            )
+                          }
+                      } >>
                       loggerBundle.app
                         .info(
                           s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
