@@ -573,38 +573,61 @@ object GlobalSnapshotConsensusFunctions {
                           none[(io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint)]
                             .pure[F]
                         case Some(qualifying) =>
-                          // Fast path: the qualifying checkpoint itself anchors at-or-below N.
-                          if (qualifying.signed.value.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value)
-                            // Slice 14: enrich the candidate with the committee attestations this node collected in the per-shard tracker
-                            // (keyed by the canonical checkpoint hash = chain-store `.hash`), so `verifyEmbedded` counts >= kQuorum and
-                            // adopts via the fast verify path instead of the re-exec failover. LEADER-path only (gated `sourceShardCheckpoints`
-                            // above); the follower threads the leader's already-enriched set unchanged (split-safety).
-                            entry.tipTracker
-                              .signaturesFor(qualifying.hash)
-                              .map(collected => (shardId -> spliceCommitteeSignatures(qualifying.signed.value, collected)).some)
-                          else
-                            // Walk back from the qualifying checkpoint to the highest-ord ancestor whose
-                            // gl0AnchorOrdinal <= N. `walkBackTo` returns tip-first order (head = the entry
-                            // at `hash`, tail toward genesis), so `.find` yields the MAX-ord match. Depth =
-                            // the qualifying ord (full canonical chain bounded by the keep-window).
-                            entry.chainStore
-                              .walkBackTo(qualifying.hash, qualifyingOrd.value)
-                              .flatMap { chain =>
-                                chain.find(_.signed.value.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value) match {
-                                  case None =>
-                                    none[
-                                      (
-                                        io.constellationnetwork.schema.sharding.ShardId,
-                                        io.constellationnetwork.schema.sharding.ShardCheckpoint
-                                      )
-                                    ].pure[F]
-                                  case Some(h) =>
-                                    // Slice 14 (see fast-path note) — enrich the walked-back ancestor from the tracker too.
-                                    entry.tipTracker
-                                      .signaturesFor(h.hash)
-                                      .map(collected => (shardId -> spliceCommitteeSignatures(h.signed.value, collected)).some)
+                          // ANCESTOR-FIRST SELECTION (chain-hole fix, 2026-06-10). Walk the canonical ancestry of the
+                          // qualifying checkpoint and embed the OLDEST entry that (a) anchors at-or-below N (the Q1
+                          // cutoff, unchanged) and (b) whose per-MG windows chain off gl0's CURRENT SC tips
+                          // (`snapshotContext.lastStateChannelSnapshotHashes`, `Hash.empty` for an unseeded MG).
+                          //
+                          // The previous rule embedded the NEWEST qualifying checkpoint regardless of ancestry. When an
+                          // ancestor never qualified (genesis fork split its attestations below kQuorum), the newest
+                          // child was embedded over a CHAIN HOLE: its windows are incrementals chained past the
+                          // never-adopted genesis window, the currency derivation silently produced nothing, the SC tip
+                          // advanced past genesis, and the MG wedged permanently (run brkbktoet, 2026-06-10).
+                          //
+                          // Walking back from the QUALIFYING checkpoint keeps the committee-endorsement invariant: the
+                          // ancestry is bound by each child's `parentCheckpointHash`, which the committee signatures on
+                          // the qualifying descendant transitively commit to. A sub-quorum ancestor (signers=1) embeds
+                          // with whatever attestations the tracker collected; followers re-verify it deterministically
+                          // via `verifyEmbedded`'s sub-quorum re-exec rail (byte-matched per-MG roots — wire-carried
+                          // bytes only, no node-local reads).
+                          //
+                          // Selecting NOTHING when no entry anchors at the tips (everything already adopted) also stops
+                          // the re-embed churn of already-adopted checkpoints. Empty-window checkpoints are skipped —
+                          // none are produced today (the producer omits empty rounds); when T_alive/receipts-only
+                          // checkpoints land they will need an adopted-checkpoint marker in the GSI to make progress
+                          // observable (flagged in PRODUCTION-READINESS-AUDIT.md).
+                          entry.chainStore
+                            .walkBackTo(qualifying.hash, qualifyingOrd.value)
+                            .flatMap { chainTipFirst =>
+                              val scTips = snapshotContext.lastStateChannelSnapshotHashes
+                              val pick = chainTipFirst.reverse.find { h =>
+                                val cp = h.signed.value
+                                cp.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value &&
+                                cp.derivedStateDelta.includedSnapshots.nonEmpty &&
+                                cp.derivedStateDelta.includedSnapshots.exists {
+                                  case (mg, nel) =>
+                                    nel.head.value.lastSnapshotHash === scTips.getOrElse(mg, Hash.empty)
                                 }
                               }
+                              pick match {
+                                case None =>
+                                  none[
+                                    (
+                                      io.constellationnetwork.schema.sharding.ShardId,
+                                      io.constellationnetwork.schema.sharding.ShardCheckpoint
+                                    )
+                                  ].pure[F]
+                                case Some(h) =>
+                                  // Slice 14: enrich the candidate with the committee attestations this node collected in
+                                  // the per-shard tracker (keyed by the canonical checkpoint hash = chain-store `.hash`),
+                                  // so `verifyEmbedded` counts >= kQuorum and adopts via the fast verify path when quorum
+                                  // exists. LEADER-path only (gated `sourceShardCheckpoints` above); the follower threads
+                                  // the leader's already-enriched set unchanged (split-safety).
+                                  entry.tipTracker
+                                    .signaturesFor(h.hash)
+                                    .map(collected => (shardId -> spliceCommitteeSignatures(h.signed.value, collected)).some)
+                              }
+                            }
                       }
                   }
             }

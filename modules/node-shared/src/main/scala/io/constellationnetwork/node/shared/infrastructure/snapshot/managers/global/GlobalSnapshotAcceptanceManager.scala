@@ -564,7 +564,13 @@ object GlobalSnapshotAcceptanceManager {
         private def adoptShardCheckpoints(
           ordinal: SnapshotOrdinal,
           shardCheckpoints: SortedMap[ShardId, ShardCheckpoint],
-          checkpointManager: ShardCheckpointGl0AcceptanceManager[F]
+          checkpointManager: ShardCheckpointGl0AcceptanceManager[F],
+          // CHAIN-HOLE GUARD (2026-06-10): gl0's per-MG SC tips from the PRIOR GlobalSnapshotInfo. A window may only be
+          // adopted if its head chains off this tip (Hash.empty for an unseeded MG) — adopting a child checkpoint whose
+          // parent was never adopted silently skips the genesis window, advances the SC tip past it, and permanently
+          // wedges the MG (the seeding flake's root cause). Pure function of (embedded checkpoint, prior GSI) — every
+          // node reaches the same adopt/defer decision.
+          priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash]
         )(implicit hasher: Hasher[F]): F[SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]] =
           shardCheckpoints.toList
             .foldM(
@@ -580,19 +586,34 @@ object GlobalSnapshotAcceptanceManager {
                 // node-local `ShardFinalityTriggers`) would split the cluster — the prior-pass bug this change fixes.
                 checkpointManager.verifyEmbedded(cp).flatMap {
                   case ShardCheckpointAcceptResult.Accepted =>
-                    // ADOPT — no `onlyPossibleReferences` chain-link. The committee chain-link-validated these binaries
-                    // and signed them; `evaluate` re-verified the signatures + per-MG roots. Union into the adopted map
-                    // (disjoint per-MG by the §4 static assignment; `++` is unambiguous).
-                    val adoptedFromCp: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] =
-                      cp.derivedStateDelta.includedSnapshots
+                    // ADOPT — no `onlyPossibleReferences` chain-link unfold, but with the CHAIN-HOLE GUARD: each per-MG
+                    // window must chain off gl0's recorded SC tip (`Hash.empty` for an unseeded MG). The committee
+                    // chain-link-validated these binaries against the SHARD chain; the guard ensures gl0 consumes that
+                    // chain IN ORDER (no child window adopted while its parent window was never adopted — the genesis
+                    // wedge). A non-continuous window is DEFERRED loudly; the leader re-offers the missing ancestor
+                    // checkpoint at a later ord (ancestor-first selection in GlobalSnapshotConsensusFunctions).
+                    val (chainContinuous, deferred) =
+                      cp.derivedStateDelta.includedSnapshots.partition {
+                        case (mg, nel) =>
+                          nel.head.value.lastSnapshotHash === priorLastStateChannelSnapshotHashes.getOrElse(mg, Hash.empty)
+                      }
                     val newReceipts: List[io.constellationnetwork.schema.sharding.CrossShardReceipt] = cp.emittedReceipts
-                    loggerBundle.app
-                      .info(
-                        s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                          s"ACCEPTED adopt mgs=${adoptedFromCp.size} binaries=${adoptedFromCp.values.map(_.size).sum} " +
-                          s"receipts=${newReceipts.size}"
-                      )
-                      .as((adoptedAcc ++ adoptedFromCp, receiptsAcc ++ newReceipts))
+                    deferred.toList.traverse_ {
+                      case (mg, nel) =>
+                        loggerBundle.app.warn(
+                          s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
+                            s"DEFER-ANCHOR mg=$mg windowHeadParent=${nel.head.value.lastSnapshotHash.value.take(12)} " +
+                            s"gl0Tip=${priorLastStateChannelSnapshotHashes.getOrElse(mg, Hash.empty).value.take(12)} " +
+                            s"— window does not chain off gl0's SC tip (missing ancestor checkpoint); deferring"
+                        )
+                    } >>
+                      loggerBundle.app
+                        .info(
+                          s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
+                            s"ACCEPTED adopt mgs=${chainContinuous.size} binaries=${chainContinuous.values.map(_.size).sum} " +
+                            s"deferredMgs=${deferred.size} receipts=${newReceipts.size}"
+                        )
+                        .as((adoptedAcc ++ chainContinuous, receiptsAcc ++ newReceipts))
 
                   case ShardCheckpointAcceptResult.PendingMoreAttestations =>
                     loggerBundle.app
@@ -1581,7 +1602,7 @@ object GlobalSnapshotAcceptanceManager {
                 adoptedScSnapshots <-
                   (shardingConfig, shardCheckpointAcceptanceManager) match {
                     case (Some(cfg), Some(scMgr)) if cfg.numShards > 1 && shardCheckpoints.nonEmpty =>
-                      adoptShardCheckpoints(ordinal, shardCheckpoints, scMgr)
+                      adoptShardCheckpoints(ordinal, shardCheckpoints, scMgr, priorLastStateChannelSnapshotHashes)
                     case _ => Async[F].pure(SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]])
                   }
 

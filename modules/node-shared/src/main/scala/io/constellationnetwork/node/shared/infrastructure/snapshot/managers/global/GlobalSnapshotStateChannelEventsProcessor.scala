@@ -659,15 +659,34 @@ object GlobalSnapshotStateChannelEventsProcessor {
                 case (state, Nil) => state.asRight[Agg].pure[F]
 
                 case (None, head :: tail) =>
-                  deserialize[Signed[CurrencySnapshot]](head).map {
+                  deserialize[Signed[CurrencySnapshot]](head).flatMap {
                     case Some(snapshot) => // full snapshot - we don't subtract fee
-                      (
-                        (NonEmptyList.one((head, snapshot.asLeft.some)), emptyBalanceUpdate).some,
-                        tail
-                      ).asLeft
-                    case None => // no full snapshot yet - we only accept the binary if fee is not required
-                      if (isFeeRequired) none.asRight
-                      else ((NonEmptyList.one((head, none)), emptyBalanceUpdate).some, tail).asLeft
+                      Async[F].pure(
+                        (
+                          (NonEmptyList.one((head, snapshot.asLeft.some)), emptyBalanceUpdate).some,
+                          tail
+                        ).asLeft[Result]
+                      )
+                    case None =>
+                      adoptionMode match {
+                        case CurrencyAdoptionMode.AdoptFromSignedFields =>
+                          // GENESIS-WINDOW GUARD (2026-06-10): on the adopt path, an unseeded MG's window MUST start with
+                          // its full genesis snapshot. Accepting a non-genesis head with `none` state (the legacy
+                          // fee-not-required branch below) advances the SC tip past the unprocessed genesis with ZERO
+                          // currency state — the silent half of the chain-hole wedge. Drop the WHOLE window loudly; the
+                          // ancestor checkpoint carrying the genesis adopts at a later ord and this window then chains.
+                          // Unreachable once the GSAM anchor guard holds — defense in depth.
+                          logger.error(
+                            s"Adopt-mode genesis-window guard: mg=${address.show} window head is not a full genesis " +
+                              s"snapshot while gl0 has no prior currency state — dropping window (no SC-tip advance)"
+                          ) >> Async[F].pure(none.asRight[Agg])
+                        case CurrencyAdoptionMode.Recreate =>
+                          // Legacy/numShards=1 behavior, byte-identical: accept the binary stateless if fee is not required.
+                          Async[F].pure(
+                            if (isFeeRequired) none.asRight[Agg]
+                            else ((NonEmptyList.one((head, none)), emptyBalanceUpdate).some, tail).asLeft[Result]
+                          )
+                      }
                   }
 
                 case (Some((nel, balanceUpdate)), head :: tail) =>
