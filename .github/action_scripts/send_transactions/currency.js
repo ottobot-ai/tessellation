@@ -731,6 +731,28 @@ const assertBalances = async (
   logMessage(`Correct Account 2 Balance: ${expectedAccount2Balance}`)
 }
 
+// After a transfer settles, the balance-READ source (dag4 getBalance, which reads gl0's finalized
+// GlobalSnapshotInfo) can lag the event-stream settlement that the batch helpers poll on — the settle
+// fires as soon as finality observes the delta, but the finalized read the NEXT transfer uses for its
+// start balance trails by a few finalization cycles. The next transfer then reads a STALE start and
+// computes a wrong expected delta (observed as "Wallet balances are different than expected" on the
+// 2nd DAG transfer). This is pure read-timing fragility, not a ledger bug, and it surfaces whenever gl0
+// finalization is slower (e.g. under the #259 metagraph-currency adopt work). Poll the SAME read source
+// transferTest uses for its start balance until it reflects this transfer, bounded; proceed on timeout.
+const waitForReadSourceCatchUp = async (getFromBal, getToBal, expectedFrom, expectedTo) => {
+  const timeoutMs = 60000
+  const intervalMs = 2000
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const [f, t] = await Promise.all([getFromBal(), getToBal()])
+      if (Number(f) === Number(expectedFrom) && Number(t) === Number(expectedTo)) return
+    } catch (_) { /* transient read error — retry */ }
+    await sleep(intervalMs)
+  }
+  logMessage(`read-source catch-up timeout — proceeding (getBalance still lags the settled balances)`)
+}
+
 const transferTest = async (
   fromAccount,
   toAccount,
@@ -739,22 +761,22 @@ const transferTest = async (
   txnCount,
   metagraphOpts,
 ) => {
-  let fromAccountStart, toAccountStart, isMetagraph
+  const isMetagraph = !!metagraphOpts
+  let getFromBal, getToBal
   if (metagraphOpts) {
-    isMetagraph = true
-
     const metagraphTokenClient = fromAccount.createMetagraphTokenClient({
       id: metagraphOpts.metagraphId,
       l0Url: metagraphOpts.l0MetagraphUrl,
       l1Url: metagraphOpts.l1MetagraphUrl,
     })
-
-    fromAccountStart = await metagraphTokenClient.getBalance()
-    toAccountStart = await metagraphTokenClient.getBalanceFor(toAccount.address)
+    getFromBal = () => metagraphTokenClient.getBalance()
+    getToBal = () => metagraphTokenClient.getBalanceFor(toAccount.address)
   } else {
-    fromAccountStart = await fromAccount.getBalance()
-    toAccountStart = await toAccount.getBalance()
+    getFromBal = () => fromAccount.getBalance()
+    getToBal = () => toAccount.getBalance()
   }
+  const fromAccountStart = await getFromBal()
+  const toAccountStart = await getToBal()
 
   logMessage(
     `========= Transfer test (${isMetagraph ? 'L0 token' : 'DAG'}): ${
@@ -787,6 +809,9 @@ const transferTest = async (
     expectedFromBalance,
     expectedToBalance,
   )
+
+  // Don't return until the read source reflects this transfer, so the next transferTest's start read is current.
+  await waitForReadSourceCatchUp(getFromBal, getToBal, expectedFromBalance, expectedToBalance)
 }
 
 const sendTransactionsUsingUrls = async (networkOptions) => {
