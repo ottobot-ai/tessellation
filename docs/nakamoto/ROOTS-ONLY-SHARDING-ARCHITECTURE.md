@@ -86,6 +86,9 @@ ml0 today has a balance endpoint but **no provable tree** (`CurrencySnapshotInfo
 | cl1/dl1 genesis bootstrap (own entry) | `CurrencySnapshotProcessor:358` | **thin** — fetch own genesis from own ml0 + verify vs gl0 root |
 | gl0 serves full map to followers | `GlobalFollowSliceService:131` | **replace** — serve `{M→R_M}` + config summary, not full state |
 | cross-MG consensus | `getFeeAddresses` (#7), `StateChannelValidator` (#8) | **keep via config summary** (not balances) |
+| **cross-MG spend-action validation (CONSENSUS-CRITICAL)** | `GlobalSnapshotAcceptanceManager.currencyBalances` (~:1674-1677) reads mirror `si.balances` → `SpendActionValidator` | **redesign** — spend actions must carry value + inclusion proof vs the committed `R_M` ([[project_cross_shard_message_passing_direction]]); validator verifies the proof, never reads a gl0-held balance map |
+| **token-lock balance deltas (CONSENSUS-CRITICAL)** | `TokenLockStateManager` (~:560, ~:587) reads mirror `activeTokenLocks` → `tokenLockBalances` MPT partition | **redesign with the MPT shrink** — metagraph-scoped token-lock accounting moves behind `R_M` or to proof-carried inputs |
+| metagraph-scoped allow-spends | `GlobalSnapshotAcceptanceManager` (~:1779) reads mirror `activeAllowSpends` | **redesign with the MPT shrink** — same treatment as token-locks (metagraph-internal; global allow-spends use DAG-layer blocks, unaffected) |
 | gl0 MPT storage of full per-MG state | `AcceptanceMptStateChanges` | **shrink** to root + summary |
 
 No gl0 HTTP balance route reads currency state (currency balances are already ml0-served), so client-facing read APIs are mostly unaffected except the new proof endpoint.
@@ -123,6 +126,7 @@ No gl0 HTTP balance route reads currency state (currency balances are already ml
 - **Split-safety in Slice 2** — gl0's roots-only commitment must remain a deterministic function of `(wire-carried checkpoint, prior)`; no node-local shard-store reads (the contract the freeze investigation flagged).
 - **`numShards=1` regression bar** — the production default path must stay byte-identical.
 - **Cross-MG consensus deps** — confirm the config summary fully covers `getFeeAddresses` + `StateChannelValidator`; if a validation genuinely needs another MG's *balance*, it must arrive as a proof-carrying input ([[project_cross_shard_message_passing_direction]]), not a gl0 full-state read.
+- **Mirror is consensus-load-bearing TODAY (audit 2026-06-09)** — three readers consume the mirrored per-MG state as authoritative: cross-MG spend-action validation (`GlobalSnapshotAcceptanceManager.currencyBalances` ~:1676 → `SpendActionValidator`), token-lock balance deltas (`TokenLockStateManager` ~:560/:587), metagraph-scoped allow-spends (~:1779). Under per-field adoption these fields are last-VERIFIED (never unverified) but can LAG when gl0 can't reproduce the field (`balances` under sharding). **Slice 2 must not delete the fold before these readers are reshaped or explicitly gated** — otherwise spend-action validation reads an empty/frozen balance map. Sequence the spend-action proof-carrying redesign with (or before) the fold deletion.
 
 ---
 
