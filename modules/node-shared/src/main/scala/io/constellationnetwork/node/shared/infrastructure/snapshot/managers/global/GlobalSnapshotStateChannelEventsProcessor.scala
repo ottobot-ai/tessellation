@@ -819,7 +819,19 @@ object GlobalSnapshotStateChannelEventsProcessor {
           SortedMap.empty[Address, Balance],
           SortedMap.empty[Address, CurrencySnapshotWithState],
           SortedMap(metagraphAddress -> binaries.reverse),
-          getGlobalSnapshotByOrdinal
+          getGlobalSnapshotByOrdinal,
+          // ADOPT mode, NOT Recreate (2026-06-10, run bebwls7ps): Recreate's `createContext` validation
+          // performs global-snapshot lookups (globalSyncView checks) through
+          // `GlobalSnapshotOpsManager.getGlobalSnapshotWithRetry` — ~31s of exponential-backoff retries
+          // per miss. This derivation is wired with `noGlobalSnapshotLookup` (pure None BY DESIGN — the
+          // split-safety contract forbids node-local global reads here), so every lookup paid the full
+          // 31s to learn a statically-known answer. During the seeding wave the sub-quorum re-exec rail
+          // runs INSIDE proposal validation, and gl0 production crawled to ~1 ordinal per 2-3 minutes
+          // (the ord-33..40 stalls of runs 9-10). AdoptFromSignedFields replays the binary's own
+          // accepted events with ZERO global lookups — the same derivation algebra the gl0 mirror uses —
+          // and the producer + every re-exec verifier share THIS function, so both flip together and the
+          // byte-identity contract holds (greenfield: roots change, deployed atomically).
+          GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode.AdoptFromSignedFields
         ).flatMap { accepted =>
           // Mirror `calculateLastCurrencySnapshots`: the LAST resulting state across the re-executed chain is what feeds
           // `lastCurrencySnapshots` → `buildMerkleTreeAndProofs`.
