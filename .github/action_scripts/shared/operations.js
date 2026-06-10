@@ -373,14 +373,18 @@ const waitForLastRefHash = async (axiosInst, l1Url, address, expectedHash, {
  * @param {Object} [options]
  * @param {string} [options.name='waitForFinality'] - Name for logging
  * @param {string} [options.trigger='t_count'] - Which trigger to wait for ('t_weight', 't_count', 't_depth1', 't_depth2')
- * @param {number} [options.timeoutMs=120000] - 2 min cap; t_count typically fires within ~seconds
+ * @param {number} [options.timeoutMs=360000] - 6 min cap. t_count typically fires within ~seconds on a
+ *   quiet host, but under CPU contention attestation gossip lags and t_count can trail head by minutes
+ *   (run bt0kv2gh0: ord 36 unfinalized for 120s while a runaway host process pegged a core; the ordinal
+ *   finalized shortly after the old 2-min cap expired). The wait returns the moment the trigger fires,
+ *   so healthy runs pay nothing for the wider cap.
  * @param {number} [options.intervalMs=3000] - Poll interval
  * @returns {Promise<Object>} - The finality-triggers payload at success
  */
 const waitForFinality = async (globalL0Url, targetOrdinal, {
     name = 'waitForFinality',
     trigger = 't_count',
-    timeoutMs = 2 * 60 * 1000,
+    timeoutMs = 6 * 60 * 1000,
     intervalMs = 3000,
 } = {}) => {
     const start = Date.now()
