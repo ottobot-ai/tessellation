@@ -12,7 +12,15 @@ services:
     image: nakamoto-sidecar:test
     container_name: sidecar${CONTAINER_NAME_SUFFIX:-}
     restart: unless-stopped
-    mem_limit: ${CL_SIDECAR_MEM_LIMIT:-384m}  # Go libp2p sidecar — small; cap it too so nothing is unbounded
+    # 2026-06-10 (run b28spqgci forensics): 384m was too small for long runs — sidecar memory grows with
+    # uptime (gossip dedup/cache sets) and ALL five sidecars pinned at 99.9% of the cap ~50-70 min in.
+    # With swap enabled (docker default memswap = 2x mem) the kernel SWAPPED the gossip layer instead of
+    # OOMing: ~340 MB/s of swap churn, attestation latency through the roof, T_count finality dropping to
+    # the depth-k rail, reorg density 4x — the late-run degradation seen across every long e2e. Bump the
+    # default AND set memswap_limit == mem_limit so the sidecar fail-fast OOM-restarts (visible!) rather
+    # than thrashing invisibly. Mirror the HOCON-default rule: keep the compose fallback non-empty.
+    mem_limit: ${CL_SIDECAR_MEM_LIMIT:-1024m}
+    memswap_limit: ${CL_SIDECAR_MEM_LIMIT:-1024m}  # == mem_limit ⇒ NO swap for the gossip layer
     command:
       - "-grpc"
       - "0.0.0.0:50051"
@@ -26,6 +34,10 @@ services:
       - "/keys/sidecar.key"
       - "-disable-mdns"
     environment:
+      # Go GC target just under the cgroup cap (mem_limit above) so the runtime collects
+      # aggressively BEFORE the kernel intervenes — without this Go has no idea a cgroup
+      # limit exists and grows heap straight into the cap (the 2026-06-10 swap-thrash).
+      - GOMEMLIMIT=${CL_SIDECAR_GOMEMLIMIT:-900MiB}
       # Hierarchical shard-checkpoint sharding. The sidecar reads M so it can
       # EAGERLY join every shard's checkpoint + attestation GossipSub topic
       # (shards 0 .. M-1) at startup — in v1 the shard committee is the full
