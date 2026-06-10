@@ -58,9 +58,19 @@ Verified state-layer gaps (with corrected costs at k₂ = 10·k₁ = 2550 prod /
 5. **P-11 demotion + docs**: rewrite attestation-and-finality.md §0.4 (Phase 2 = operationally final, density-revertable; Phase 3 = absolute), update TAKTIKOS notes, retire the Rebootstrap default-OFF caveat from the audit CRITICAL list.
 6. **Adversarial sim**: extend the GPU fork sims with the band-reorg scenario to validate the density bar parameters (sWindow vs eta-period interplay; sWindow=200 < R must hold so density windows don't straddle eta rotations — check).
 
-## 6. Open decisions for the owner
+## 6. Owner decisions — ALL RESOLVED (2026-06-10)
 
-1. Confirm followers stay on k₁-consumption + resync-on-ε-event (vs any k₂-gated surface, e.g. should SNAPSHOT_FINALIZED events stay k₁?).
-2. Confirm production floor stays at local k₁ (recommended) vs also moving to k₂.
-3. k₂ = 10·k₁ confirmed as THE common-prefix parameter (10⁻¹² band per sims ≈ k 271-290 — 10·k₁=2550 is ~9× deeper than the 10⁻¹² point; comfortable).
-4. Eta interaction: a Phase-2 revert crossing an eta-period boundary re-derives `historicalStakeSnapshots`/eta for the reverted band (the EtaStateManager chain-walk recompute path already exists and is deterministic) — accept recompute, or freeze eta at k₂ as well (stricter; delays epoch anchoring)?
+1. **Follower surfaces stay k₁-keyed; EXPOSE `settled` (k₂) as an additional API field.** Followers consume operational finality + resync on the ε-event (the existing `resyncToCanonical`/NotNext machinery). The finality-triggers route + snapshot info surfaces gain a `settledOrdinal` (k₂) field so integrators (exchanges, light clients) can opt into the absolute marker. SNAPSHOT_FINALIZED events stay k₁.
+2. **Production floor stays at local k₁.** A recovering node accepts the denser branch; it never produces below its own finality.
+3. **k₂ = 10·k₁ is THE common-prefix parameter** (derived, HOCON; the legacy `NAKAMOTO_ARCHIVAL_DEPTH=65536` env read is deleted in slice 1). 10⁻¹² fork-race ≈ k 271–290 per the sims; 10·k₁ = 2550 prod is ~9× deeper.
+4. **Eta on band-reorg: RECOMPUTE, by the bootstrap-equivalence principle.** A density-reorging node is a bootstrap peer joining from a deeper fork point — recovery reuses the SAME eta chain-walk a fresh peer runs (EtaStateManager), re-deriving boundary writes while traversing up the new branch. No parallel revert logic. The 2/3R staggering (eta(N) sources the first 2/3 of period N−1, hence ≥ R/3 ≈ k₁ deep at consumption) already guarantees agreement for ALL sub-k₁ operation — eta divergence is possible only inside the ε band-event, so freeze-at-k₂ (rejected) would tax every epoch's anchoring to defend a path the staggering already confines.
+
+## 7. Derived chain-selection parameters (replaces the stale fixed values)
+
+- **kLookback = k₁ + 1** (was fixed 50). The +1 is load-bearing: any fork that can contest a DEPTH-finalized snapshot (fork point ≥ k₁ deep) lands in density jurisdiction by construction; tk only ever adjudicates strictly-sub-k₁ forks where nothing depth-finalized is contested.
+- **sWindow ≈ R/3 ≈ k₁** (was fixed 200; derive, don't hardcode). Keeps the density window inside one eta-stabilization span so the compared branches share a randomness lineage; the exact constant is validated by the sim slice (§5.6).
+- Both derive in NakamotoConfig next to R and k₂ — k₁ remains the single free knob.
+
+## 8. The optimistic-finalization interim lock (analyzed; acceptable)
+
+Scenario: a node attestation-finalizes branch X at shallow depth d < k₁; the majority builds Y from a fork point in (d, k₁). The node refuses Y via the tk floor (its finalized marker) while density is not yet reachable (fork shallower than kLookback) — an INTERIM lock. It resolves by aging, with no deadlock, because: (1) the store gate (re-keyed to k₂) keeps STORING Y's branch as fork candidates — today's k₁ store-gate is what makes P-11 permanent, refusing to even retain the evidence; (2) chain retention reaches k₂ (0940a10ea); (3) when the fork point ages past kLookback = k₁+1, density jurisdiction activates and the node switches if Y is denser. Worst case ≈ k₁ ordinals (~30 min prod) of producing harmlessly-ignored snapshots on X. The chain-selection semantics preclude a soft lock; they impose only a bounded recovery delay on the ε path.
