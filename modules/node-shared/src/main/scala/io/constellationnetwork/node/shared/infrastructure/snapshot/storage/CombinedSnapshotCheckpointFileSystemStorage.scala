@@ -52,8 +52,15 @@ final class CombinedSnapshotCheckpointFileSystemStorage[
   implicit encSigned: Encoder[Signed[S]],
   encState: Encoder[SI]
 ) extends LocalFileSystemStorage[F, Array[Byte]](path) {
-  // These aren't necessary on pureconfig, because in theory they should never change, so I'll hardcode
-  private val maxCheckpointsStored = 2
+  // 2026-06-10 (run bf65au6y3 forensics): retention MUST out-live the head→finality gap. Checkpoints are
+  // written at HEAD ordinals every `checkpointIntervalEpochs`, but the Nakamoto `FinalizedSnapshotReader`
+  // only serves a checkpoint once it is AT-OR-BELOW the finalized ordinal. Under depth-rail finality the
+  // gap is exactly k₁ (32 dev / 255 prod) — with only 2 retained files at 5-epoch cadence (10-epoch
+  // coverage), every checkpoint was DELETED before finality could reach it and `/latest/combined` starved
+  // mathematically (404 on a healthy, producing node). The old value silently assumed T_count's ~1-3-ord
+  // gap, i.e. the serving layer depended on the FAST path of finality. 64 files × 5 epochs = 320-epoch
+  // coverage ≥ prod k₁ with margin; checkpoint files are the bound, not size (each ~1-5 MB).
+  private val maxCheckpointsStored = 64
   private val checkpointIntervalEpochs = 5
 
   private def writeJsonTupleStream(
@@ -237,5 +244,19 @@ object CombinedSnapshotCheckpointFileSystemStorage {
     concurrentStreams <- Semaphore[F](5)
     storage = new CombinedSnapshotCheckpointFileSystemStorage[F, S, SI](path, lastCheckpointInfo, concurrentStreams)
     _ <- storage.createDirectoryIfNotExists().rethrowT
+    // BOOT RESCAN (2026-06-10): a restart used to leave the tracked ref EMPTY even though servable
+    // checkpoint files sat on disk — the Nakamoto `FinalizedSnapshotReader` then 404'd `/latest/combined`
+    // until the next write landed AND finality overtook it (run bf65au6y3: a restarted node's combined
+    // endpoint starved for 30+ min during a depth-rail window, stalling the e2e driver). Restore the
+    // highest on-disk ordinal at boot; epochProgress/hash are sentinels (the storage holds Encoders only,
+    // not Decoders) — serving keys on the ordinal + the file bytes, and the sentinels are replaced by the
+    // next real `tryWrite` (≤ checkpointIntervalEpochs away). Note the sentinel also leaves the
+    // `last === empty()` force-write check inert, which is correct: with files on disk there is nothing
+    // to force.
+    restored <- storage.listStoredOrdinals.flatMap(_.compile.toList).map(_.maxOption)
+    _ <- restored match {
+      case Some(maxOrd) => lastCheckpointInfo.set(LastCheckpointInfo(maxOrd, EpochProgress.MinValue, Hash.empty))
+      case None         => Async[F].unit
+    }
   } yield storage
 }
