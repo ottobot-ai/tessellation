@@ -467,7 +467,25 @@ object ShardCheckpointProducer {
                 val byParent: Map[Hash, List[(Hash, Signed[StateChannelSnapshotBinary])]] =
                   hashed.groupBy(_._2.value.lastSnapshotHash)
 
-                // Unfold the chain from the anchor; deterministic pick when a parent has multiple children.
+                // FOLLOW-THE-EXTENSION fork choice (2026-06-10): when a parent has multiple children (an
+                // mg-level fork — ml0 re-emitted a binary, run bfb233uly DAG3CNj), prefer the child with the
+                // LONGEST descendant chain in the buffer: the branch the metagraph itself kept extending is
+                // its canonical one ("the next binary picks the parent"). The previous (-sigs, +hash)
+                // tiebreak could deterministically commit the committee to a DEAD branch forever — windows
+                // then never contain the live chain's continuation and the mg's gl0 mirror wedges
+                // (DEFER-ANCHOR loop). Signature count then hash remain as the residual tiebreaks.
+                // Depth is memoized; the buffer is a DAG under byParent (cycles impossible — a binary's
+                // parent hash is fixed at signing), so the recursion terminates.
+                val depthMemo = scala.collection.mutable.HashMap.empty[Hash, Int]
+                def descendantDepth(h: Hash): Int =
+                  depthMemo.getOrElseUpdate(
+                    h,
+                    byParent.get(h) match {
+                      case None | Some(Nil) => 0
+                      case Some(children)   => 1 + children.map { case (ch, _) => descendantDepth(ch) }.max
+                    }
+                  )
+
                 @annotation.tailrec
                 def unfold(
                   current: Hash,
@@ -477,7 +495,7 @@ object ShardCheckpointProducer {
                     case None | Some(Nil) => acc.reverse
                     case Some(candidates) =>
                       val (pickedHash, pickedBinary) =
-                        candidates.sortBy { case (h, b) => (-b.proofs.size, h.value) }.head
+                        candidates.sortBy { case (h, b) => (-descendantDepth(h), -b.proofs.size, h.value) }.head
                       unfold(pickedHash, pickedBinary :: acc)
                   }
 
