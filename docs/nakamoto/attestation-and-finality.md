@@ -124,8 +124,8 @@ subsystem has a well-defined active phase range:
 
 | Component | Active in phases | Notes |
 |---|---|---|
-| `ChainSelection.standardCompare` (Taktikos maxvalid-tk) | 0, 1 | short-fork rule (< k₁ back) |
-| `ChainSelection` density rule (Ouroboros Genesis maxvalid-bg) | 0, 1 | deep-fork rule (≥ k₁ back); operationally rare in steady state |
+| `ChainSelection.standardCompare` (Taktikos maxvalid-tk) | 0, 1 | short-fork rule (fork point < kLookback = k₁+1 back); never reverts past the k₁-finalized marker |
+| `ChainSelection` density rule (Ouroboros Genesis maxvalid-bg) | 0, 1, **2** | deep-fork recovery rule (fork point ≥ k₁+1 back); SOLE adjudicator in the (k₂-settled, k₁-finalized] band; the ε-event path |
 | Attestation triggers `T_count`, `T_weight` | 1 | accumulate weight on canonical-hash matches |
 | Depth trigger `T_depth1` | 1 → advances to 2 | structural fallback when attestation gates stall |
 | MPT overlay `pendingRef` writes | 0, 1 | per-branch ChangeSets above persistent base |
@@ -136,10 +136,23 @@ subsystem has a well-defined active phase range:
 | Undo journal pruning, overlay history shedding | from Phase 3 | **resolved** — `MptOverlay.pruneBelow(ord)` driven by `T_depth2.latestQualifyingOrdinal` (commit `173e6a7d`, #139) |
 | Aggregate-signature certificate (Mithril-equivalent) | from Phase 3 | *reserved* — light-client trust anchor |
 
-**The density rule (Genesis maxvalid-bg) is operationally bounded to
-Phase 0/1.** Once a snapshot reaches Phase 2, no chain-selection rule can
-touch it; once it reaches Phase 3, even cryptographic adversary advantage
-is negligible.
+**Finality is two-tier (corrected 2026-06-10 — the earlier text here codified a
+shortcut; see `GENESIS-DENSITY-PHASE2-REORG-AUDIT.md`).** Phase 1→2 (k₁, via
+T_count/T_weight/T_depth1 — whichever fires first) is **operational finality**:
+maxvalid-tk can never revert past it, followers consume it, and the residual
+reorg probability is ~10⁻¹¹ per attempt (sims). It is NOT an absolute floor:
+until a snapshot is k₂ deep (Phase 3 / SETTLED, k₂ = 10·k₁), the Ouroboros
+Genesis **density rule remains the lawful — and only — adjudicator** for a
+deeper fork (the rare deep-fork/bootstrap-recovery event). Only k₂ is the
+absolute, common-prefix floor; past it no chain-selection rule applies and
+adversary advantage is cryptographically negligible. A density-reorging node
+behaves exactly like a bootstrap peer joining from the fork point: it re-walks
+the new branch, re-deriving eta boundary records with the same chain-walk a
+fresh peer uses (bootstrap-equivalence). Production never goes below the
+producer's own k₁-finalized marker; only ADOPTION may, under density, down to
+k₂. Status: the k₂ floor + band-density adjudication are DESIGN-APPROVED, not
+yet implemented — the implementation currently clamps all fork choice at k₁
+(the shortcut); see the audit doc for the slice plan.
 
 > **Note on Cardano:** Cardano runs Praos as its steady-state consensus.
 > The Ouroboros Genesis density rule is included in `cardano-node` for
@@ -617,7 +630,7 @@ weight sum.
 | `modules/dag-l0/.../nakamoto/RebootstrapOrchestrator.scala` | fs2.Stream ticker (default 30s) consuming `chainStore.divergentRefuseCount` + cooldown to detect lock-out and call `unsafe_reset` on TipTracker/Overlay + `unsafe_clearFinality` on chainStore. Default-OFF via `NAKAMOTO_REBOOTSTRAP_ENABLED`. Pure `decide` function for unit testing. Commit `01ebcca6` (#141). |
 | `modules/node-shared/.../nakamoto/TipTracker.scala` | `Map[PeerId, TipAttestation]`. Newer-wins via `attestedAt`. `recordAttestation` enforces ±`MaxAttestationSkewMs` skew bound (env `NAKAMOTO_MAX_ATTESTATION_SKEW_MS`, default 60s — commit `422e1a6b`). `highestFinalizedOrdinal(selfId, …)` takes `selfId` parameter for #133 self-exclusion (commit `95471c7f`). Source for `T_weight` and `T_count`. `unsafe_reset` leaf primitive called only by `RebootstrapOrchestrator` (#141, commit `01ebcca6`). |
 | `modules/node-shared/.../nakamoto/overlay/MptOverlay.scala` | Branch-aware MPT: `pendingRef`, `BranchHandle`, `checkout/commit`, `finalizeBranch` (#56). Phase 0/1 writes live here; Phase 2 transition triggers `finalizeBranch`. Phase-3 `pruneBelow(ord)` (commit `173e6a7d`, #139) drops `undoJournalRef` and `finalizedRef` entries strictly below the archival watermark; idempotent and irreversible. `unsafe_reset` leaf primitive called only by `RebootstrapOrchestrator` (#141). |
-| `modules/node-shared/.../nakamoto/ChainSelection.scala` | Taktikos maxvalid-tk (short forks, Phase 0/1) + Ouroboros Genesis maxvalid-bg density rule (deep forks, Phase 0/1). Inactive from Phase 2. |
+| `modules/node-shared/.../nakamoto/ChainSelection.scala` | Taktikos maxvalid-tk (short forks, Phase 0/1) + Ouroboros Genesis maxvalid-bg density rule (deep forks; per the approved design also the Phase-2 band adjudicator down to k₂ — implementation pending, currently clamped at k₁). |
 | `modules/node-shared/.../nakamoto/EligibilityChecker.scala` | LDD threshold function (ψ, γ, fA, fB). |
 | `modules/node-shared/.../nakamoto/StakeRegistry.scala` | Per-peer stake fractions (delegated + collateral combined planned); `optimisticRelativeStake` for active-only weighting. `validatorCount` provides the `T_count` denominator (full seedlist). |
 | `modules/node-shared/.../nakamoto/SlotClock.scala` | Cluster-wide consensus slot provider. Not currently used by the attestation path (Chronos-prep wall-clock semantics; see §3.1); retained as a domain primitive for future consensus-slot consumers. |
