@@ -113,8 +113,13 @@ object ShardCheckpointFanOut {
         // is consistent with admission cluster-wide.
         committeeMembership(sid, epoch).flatMap { committee =>
           if (!committee.contains(selfPeerId))
-            logger.debug(
-              s"🧩 Shard producer: self not in committee for shard=${sid.value.value} epoch=${epoch.value}; skipping produce"
+            // INFO (not debug): produce-skips were invisible during the 2026-06-10 silent shard-chain stall —
+            // every skip path must say WHY at a visible level (one line per ord per shard; drop to a metric
+            // when task #25 lands). committeeSize=0 here would mean the (shard, epoch) draw came up EMPTY —
+            // the epoch-rotation failure mode that stalls all producers at once.
+            logger.info(
+              s"🧩 produce-skip shard=${sid.value.value} epoch=${epoch.value} reason=not-in-committee " +
+                s"committeeSize=${committee.size}"
             )
           else {
             // Read this shard's buffered raw binaries (non-destructive). Absent buffer ⇒ empty input ⇒ producer returns None.

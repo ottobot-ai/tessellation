@@ -301,7 +301,11 @@ object ShardCheckpointProducer {
         // Slice 8 v1: empty input ⇒ nothing to checkpoint. T_alive liveness pings (which permit empty payloads) are deferred to a future
         // slice that introduces an explicit `forceEmptyAlive: Boolean` flag — slice 8 keeps the contract simple.
         if (pendingSnapshots.isEmpty) {
-          logger.debug(s"produce: empty pendingSnapshots; nothing to checkpoint").as(None: Option[Signed[ShardCheckpoint]])
+          // INFO (not debug) on every skip path — the 2026-06-10 silent stall was invisible because all
+          // produce-skips logged at debug. One line per ord per shard; drop to a metric when task #25 lands.
+          logger
+            .info(s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=empty-pending")
+            .as(None: Option[Signed[ShardCheckpoint]])
         } else {
           // Resolve the parent — `bestTip` `None` ⇒ genesis (parent = Hash.empty, parent ord = Genesis). `perMgTip` is derived from the
           // SAME best tip (empty at genesis), so the chain-link anchor and the parent envelope are read consistently.
@@ -326,9 +330,12 @@ object ShardCheckpointProducer {
               chainLinkOrder(pendingSnapshots, perMgTip).flatMap { orderedSnapshots =>
                 if (orderedSnapshots.isEmpty)
                   logger
-                    .debug(
-                      s"produce: ${pendingSnapshots.size} MG(s) buffered but none chain-link off the shard tip at " +
-                        s"gl0Anchor=${gl0AnchorOrdinal.value.value}; nothing to checkpoint this round"
+                    .info(
+                      s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=no-chain-link " +
+                        s"pendingMgs=${pendingSnapshots.size} " +
+                        s"pendingCounts=${pendingSnapshots.toList.map { case (mg, nel) => s"${mg.value.value.take(8)}:${nel.size}" }
+                            .mkString(",")} " +
+                        s"tips=${perMgTip.toList.map { case (mg, h) => s"${mg.value.value.take(8)}:${h.value.take(8)}" }.mkString(",")}"
                     )
                     .as(None: Option[Signed[ShardCheckpoint]])
                 else
@@ -344,9 +351,9 @@ object ShardCheckpointProducer {
                         case None =>
                           // Not the slot leader — per design doc §6.3, other committee members attest later via gossip (slice 14).
                           logger
-                            .debug(
-                              s"produce: not slot leader at slot=${currentSlot.value.value} gl0Anchor=${gl0AnchorOrdinal.value.value}; " +
-                                s"deferring to gossip-path attestation (slice 14)"
+                            .info(
+                              s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=not-leader " +
+                                s"slot=${currentSlot.value.value} gap=$slotGap chainedMgs=${orderedSnapshots.size}"
                             )
                             .as(None: Option[Signed[ShardCheckpoint]])
 
