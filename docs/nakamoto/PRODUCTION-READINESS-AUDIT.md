@@ -48,6 +48,10 @@ As built (verified 2026-06-09):
 
 ## 4. MEDIUM (production-hardening)
 
+- **maxvalid-tk comparator DUPLICATED** in ShardChainStore (`compareMaxvalidTk`, replicated because `ChainSelection.standardCompare` is private — ShardChainStore.scala:34-37). Consensus-critical algorithm in two places = drift risk. Extract one shared pure comparator; both call it. (ShardFinalityTriggers correctly REUSES the `FinalityTrigger[F]` typeclass — only the comparator was duplicated.)
+- **Shard attestation quorum is not ancestry-transitive** (the GRANDPA half that wasn't carried over): an attestation for checkpoint C counts only toward C's hash, so a 1-slot fork at any ordinal can split quorum below kQuorum permanently even after maxvalid-tk converges (the 2026-06-10 genesis wedge's first domino). Fix: count an attestation toward the checkpoint AND its stored ancestors (pure function of attestation set + parentCheckpointHash ancestry; no timing, no re-emission — preserves the one-shot attestation rule adopted after the multi-emit fork bug). Pairs with GAP-1 (same emit/record seams). The ancestor-first embed selection (038c9b1d4) already heals adoption via the re-exec rail; this completes the fast path.
+- **Empty-window / receipts-only checkpoints have no adoption progress marker** — ancestor-first selection skips them (none produced today); needs an adopted-checkpoint marker in GSI before T_alive/receipts-only checkpoints land.
+
 - **Equivocation validator + ShardNonParticipationCounter built but unwired** (no callers; Slice 16/17 tallying + sink) — folds into item 3.
 - **cl1 resync-to-canonical trust gap**: mptRoot recompute-match only; served GSI internals not fully re-verified (CurrencySnapshotProcessor:157-223).
 - **changeset ring capacity vs finality window** unvalidated (`changeset-ring-depth=1024` HOCON; no sizing analysis vs ml0 catch-up).
