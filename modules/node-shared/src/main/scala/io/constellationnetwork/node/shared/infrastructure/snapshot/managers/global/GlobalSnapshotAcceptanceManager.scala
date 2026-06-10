@@ -685,7 +685,15 @@ object GlobalSnapshotAcceptanceManager {
               ordinal,
               currentBalances,
               priorLastCurrencySnapshots,
-              adoptedScSnapshots,
+              // ORDER CONTRACT (2026-06-10): `processCurrencySnapshots` expects NEWEST-FIRST input (it reverses
+              // internally — the legacy chain-link path's prepend-built convention) and returns oldest-first.
+              // Shard-checkpoint windows are built OLDEST-FIRST (`ShardCheckpointProducer.chainLinkOrder` unfolds
+              // anchor→tip), so reverse each window here. Without this, multi-binary windows were processed
+              // newest-first: the genesis-decode branch saw the newest incremental as "head" (the seeding failure
+              // on backlog windows — singleton windows were unaffected, which is why the flake varied by window
+              // size), the state fold ran in reverse, and the resulting NEL's `.last` (the SC-tip setter) was the
+              // OLDEST hash.
+              adoptedScSnapshots.map { case (mg, nel) => mg -> nel.reverse },
               getGlobalSnapshotByOrdinal,
               // #259 adopt: DERIVE each MG's commitment by replaying the committee-attested signed binary's own already-accepted
               // events onto the prior Info (NOT `createContext`), ordinal taken from the binary, root verified against the committed

@@ -57,6 +57,12 @@ trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
   )(implicit hasher: Hasher[F]): F[StateChannelAcceptanceResult]
 
+  /** ORDER CONTRACT: `events` NELs must be NEWEST-FIRST (the legacy chain-link path's prepend-built convention — the implementation
+    * reverses internally and processes oldest-first); the returned NELs are OLDEST-FIRST (`.last` = the newest binary, which is what the
+    * SC-tip setter reads). Callers holding oldest-first windows (shard-checkpoint `chainLinkOrder` output) MUST reverse before calling —
+    * see `deriveAdoptedCurrencyState` and `deriveMetagraphRoot`. Feeding oldest-first silently breaks multi-binary windows: the
+    * genesis-decode branch sees the newest incremental as "head" and the state fold runs in reverse (the 2026-06-10 seeding failure).
+    */
   def processCurrencySnapshots(
     snapshotOrdinal: SnapshotOrdinal,
     currentBalances: SortedMap[Address, Balance],
@@ -803,11 +809,16 @@ object GlobalSnapshotStateChannelEventsProcessor {
         // Re-run the SAME currency derivation gl0 uses, scoped to this single MG. Empty `priorLastCurrencySnapshots` (and empty
         // `currentBalances`) keeps the result a PURE function of `binaries` — the producer + every verifier compute byte-identical
         // roots regardless of their live MPT state (the S3 false-slashing crux; see the trait scaladoc).
+        //
+        // ORDER CONTRACT (2026-06-10): `processCurrencySnapshots` expects NEWEST-FIRST input (it reverses internally — the
+        // legacy chain-link prepend-built convention). Checkpoint windows arrive OLDEST-FIRST (`chainLinkOrder` unfolds
+        // anchor→tip), so reverse here. Producer and re-exec verifier share THIS function, so both flip together (the
+        // byte-identity contract is preserved); without the reverse, multi-binary windows folded newest-first.
         processCurrencySnapshots(
           snapshotOrdinal,
           SortedMap.empty[Address, Balance],
           SortedMap.empty[Address, CurrencySnapshotWithState],
-          SortedMap(metagraphAddress -> binaries),
+          SortedMap(metagraphAddress -> binaries.reverse),
           getGlobalSnapshotByOrdinal
         ).flatMap { accepted =>
           // Mirror `calculateLastCurrencySnapshots`: the LAST resulting state across the re-executed chain is what feeds
