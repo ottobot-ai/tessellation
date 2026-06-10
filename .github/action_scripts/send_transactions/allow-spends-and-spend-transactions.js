@@ -47,7 +47,19 @@ const CONSTANTS = {
     // observation peaks at ~10 epochs; 25 leaves 15-epoch (~90s at 6s/epoch) margin.
     // If expiration scenarios start racing, bump first to 30 or 40 — but only if
     // accompanied by a real diagnostic, since the historical root cause is closed.
-    EPOCH_PROGRESS_BUFFER: 25,
+    //
+    // 2026-06-10: 25 → 60 WITH the real diagnostic (run b3y7tf5wq). Under execution
+    // sharding (numShards>1) a metagraph allow-spend reaches gl0's global
+    // activeAllowSpends via the shard-checkpoint pipeline: ml0 snapshot → checkpoint
+    // produce (~1 per 6 gl0 ords) → committee quorum → gl0 adopt. Measured end-to-end
+    // visibility latency: 43 epochs (sent at 383, mirror-adopted at gl0 ~426) — the
+    // spend was already globally expired (408) when it arrived, so Global-L0
+    // verification saw {} for all 600 attempts while the per-mg mirror provably
+    // carried it (matching activeAllowSpends proofs at mg-ords 71-74). Token locks
+    // pass the same pipeline because their test window is +200 epochs. 60 covers
+    // steady-state latency (~10-20 epochs) with margin; the node-side cadence fix
+    // (batch checkpoint catch-up) is tracked in PRODUCTION-READINESS-AUDIT.md.
+    EPOCH_PROGRESS_BUFFER: 60,
 };
 
 const getRandomInt = (min, max) => {
