@@ -1,13 +1,14 @@
 package io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global
 
-import cats.Parallel
 import cats.data._
 import cats.effect.Async
 import cats.syntax.all._
+import cats.{Order, Parallel}
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.currency.schema.currency._
+import io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSnapshotSync
 import io.constellationnetwork.ext.cats.syntax.validated.validatedSyntax
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
@@ -15,14 +16,15 @@ import io.constellationnetwork.node.shared.domain.statechannel.StateChannelAccep
 import io.constellationnetwork.node.shared.domain.statechannel.StateChannelValidator.{StateChannelValidationError, getFeeAddresses}
 import io.constellationnetwork.node.shared.domain.statechannel._
 import io.constellationnetwork.node.shared.infrastructure.snapshot.CurrencySnapshotContextFunctions
-import io.constellationnetwork.schema.ID.Id
+import io.constellationnetwork.schema.ID.{Id, IdOps}
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
 import io.constellationnetwork.schema.currencyMessage._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
-import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendReference}
-import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
+import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.schema.swap._
+import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.transaction.{RewardTransaction, Transaction, TransactionReference}
 import io.constellationnetwork.schema.{CurrencyStateProofSelector, GlobalIncrementalSnapshot, SnapshotOrdinal}
 import io.constellationnetwork.security.hash.Hash
@@ -355,21 +357,35 @@ object GlobalSnapshotStateChannelEventsProcessor {
         *     recomputation is the consensus-derived divergence that froze the recreate path.
         *   - `lastTxRefs` — the last (highest-ordinal) `TransactionReference` per source across accepted blocks; fresh destinations seed
         *     `emptyCurrency(identifier)` (mirrors `BlockAcceptanceOpsManager.acceptTransactionRefs`).
-        *   - `activeTokenLocks` / `lastTokenLockRefs` — accepted token-locks grouped by source, merged into prior; refs = last per source.
-        *   - `activeAllowSpends` / `lastAllowSpendRefs` — accepted allow-spends grouped by source, merged into prior; refs = last per
+        *   - `activeTokenLocks` / `lastTokenLockRefs` — accepted token-locks grouped by source, merged into prior, then EXPIRED locks
+        *     dropped (`unlockEpoch < globalSyncView.epochProgress`, mirroring `TokenLockOpsManager`'s expiry filter); refs = last per
         *     source.
+        *   - `activeAllowSpends` / `lastAllowSpendRefs` — accepted allow-spends grouped by source, merged into prior, then EXPIRED
+        *     allow-spends dropped (`lastValidEpochProgress < globalSyncView.epochProgress`); refs = last per source.
+        *   - `globalSnapshotSyncView` — the exact `MessageValidationOpsManager.acceptGlobalSnapshotSyncs` fold: this snapshot's
+        *     `globalSnapshotSyncs` sorted by (`parentOrdinal`, full `Order[Signed[GlobalSnapshotSync]]`), folded latest-per-peer into the
+        *     prior view.
         *   - `lastMessages` — CARRIED FORWARD: the prior `lastState.lastMessages` merged with THIS snapshot's accepted `messages`,
         *     latest-per-`MessageType` (the exact `MessageValidationOpsManager.acceptMessages` fold). This is the genuine cross-MG
         *     dependency `getFeeAddresses` / `fetchOwnerAddress` / `fetchStakingAddress` read for owner/staking config and fee deduction.
         *
-        * '''Economic-security gate (root verification).''' The derived Info's `stateProof(ordinal)` (the same 9-field hash the metagraph's
-        * ml0 committed via `CurrencySnapshotAcceptanceManager` `csi.stateProof`) is compared against the binary's committed
-        * `snapshot.value.stateProof`. A lying/invalid metagraph currency state — or a snapshot whose state was shaped by effects this pure
-        * replay does not reproduce (cross-shard spend-actions, token-unlock expiry, fee deduction against owner balance) — fails the check.
-        * On MATCH the derived full Info is adopted. On MISMATCH we log LOUDLY and fall back to the prior balances/refs/token-locks/
-        * allow-spends (carried forward unchanged) with only `lastMessages` advanced — the ordinal still advances at the call site
-        * (`processCurrencySnapshots` commits `Right((snapshot, info))`, ordinal taken from `snapshot`), so the freeze stays dead while gl0
-        * never commits an UNVERIFIED balance map. The global snapshot is never crashed.
+        * Option SHAPES (None vs Some(empty)) on the candidate are mirrored from the binary's committed `stateProof` — the proof hashes each
+        * Option via `traverse(_.hash)`, so shape mismatch alone would fail field comparison even with identical contents.
+        *
+        * '''Economic-security gate (PER-FIELD root verification).''' The derived Info's `stateProof(ordinal)` (the same 9-field hash the
+        * metagraph's ml0 committed via `CurrencySnapshotAcceptanceManager` `csi.stateProof`) is compared against the binary's committed
+        * `snapshot.value.stateProof` FIELD BY FIELD. Each of the 9 fields is adopted iff ITS proof component matches; on a per-field
+        * mismatch that field alone is carried forward from `lastState` (kept at its last VERIFIED value) and a LOUD warn logs the
+        * committed-vs-derived proof pair. This keeps fields gl0 CAN reproduce (tx-refs, token-locks, messages, sync-view) fresh even when a
+        * field it CANNOT fully reproduce (`balances` shaped by cross-shard spend-actions / fee deduction) diverges. The ordinal still
+        * advances at the call site (`processCurrencySnapshots` commits `Right((snapshot, info))`, ordinal taken from `snapshot`), so the
+        * freeze stays dead while gl0 never commits an UNVERIFIED field value. The global snapshot is never crashed.
+        *
+        * CONSUMER CAVEAT: downstream consensus readers treat parts of this mirror as authoritative — `si.balances` feeds cross-metagraph
+        * spend-action validation (`GlobalSnapshotAcceptanceManager.currencyBalances`), `activeTokenLocks` feeds token-lock balance deltas
+        * (`TokenLockStateManager`), `activeAllowSpends` feeds metagraph-scoped allow-spend acceptance. A per-field-stale value is
+        * last-VERIFIED, never unverified — but it can LAG the metagraph's true state until the roots-only reshape
+        * (docs/nakamoto/ROOTS-ONLY-SHARDING-ARCHITECTURE.md §3.4) moves those readers off the mirror.
         *
         * '''Determinism / split-safety.''' A pure deterministic function of `(snapshot, lastState)` — replays only already-accepted events
         * (no re-validation, no node-local shard-store / global-snapshot read, no `Double`; exact integer `Amount` arithmetic; hashing
@@ -429,6 +445,12 @@ object GlobalSnapshotStateChannelEventsProcessor {
             val withDebit = applyDelta(applyDelta(acc, tx.source, _.minus(amount)), tx.source, _.minus(fee))
             applyDelta(withDebit, tx.destination, _.plus(amount))
           }
+          // NOTE: token-lock / allow-spend / unlock / fee-tx / cross-shard-spend BALANCE effects are intentionally
+          // NOT reproduced here. Matching ml0's `balances` byte-for-byte would mean re-running its FULL acceptance
+          // (currency-id filtering, epoch-based expiry, cross-shard spend-action data gl0 does not hold) — the thing
+          // execution-sharding exists to avoid. Instead the gate below adopts PER FIELD: gl0 commits each field it
+          // CAN reproduce (token-locks/allow-spends/refs/sync-view/messages — every one verified against the
+          // committee-attested proof) and carries `balances` forward for the ordinals it can't reproduce them.
           artifact.rewards.foldLeft(afterTxs) { (acc, reward) =>
             val rewardAmount: Amount = reward.amount
             applyDelta(acc, reward.destination, _.plus(rewardAmount))
@@ -468,52 +490,102 @@ object GlobalSnapshotStateChannelEventsProcessor {
           // active token-locks / allow-spends: incoming grouped by source, merged into prior (mirrors `incoming |+| prior`
           // shape from CurrencySnapshotAcceptanceManager; gl0 holds the committed set, expiry/unlock is re-verified via the
           // stateProof gate below rather than recomputed here — node-local epoch is not split-safe).
+          // The global epoch THIS snapshot synced to — exactly what ml0's TokenLockOpsManager / AllowSpendOpsManager
+          // pass as `lastGlobalSnapshotEpochProgress` for expiry. It rides in the signed snapshot (`globalSyncView`),
+          // so gl0 has it deterministically; when absent (pre-sync genesis snapshots, which carry no locks/allow-spends)
+          // no expiry is applied. Used below to DROP expired entries — ml0 removes them, so an add-only gl0 merge would
+          // retain stale (expired) locks/allow-spends and diverge from the committed proof forever (the token-lock
+          // EXPIRATION test: a prior lock expires in ml0, gl0 keeps it, so `{stale,new} ≠ committed {new}`).
+          syncEpoch = artifact.globalSyncView.map(_.epochProgress)
           incomingTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]] =
             acceptedTokenLocks.groupBy(_.value.source).map { case (src, tls) => src -> SortedSet.from(tls) }.to(SortedMap)
           priorActiveTokenLocks = lastState.activeTokenLocks.getOrElse(SortedMap.empty[Address, SortedSet[Signed[TokenLock]]])
-          nextActiveTokenLocks = (priorActiveTokenLocks |+| incomingTokenLocks).filter { case (_, s) => s.nonEmpty }
+          nextActiveTokenLocks = (priorActiveTokenLocks |+| incomingTokenLocks).map {
+            case (addr, locks) => addr -> locks.filter(l => syncEpoch.forall(e => l.value.unlockEpoch.forall(_ >= e)))
+          }.filter { case (_, s) => s.nonEmpty }
 
           incomingAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]] =
             acceptedAllowSpends.groupBy(_.value.source).map { case (src, as) => src -> SortedSet.from(as) }.to(SortedMap)
           priorActiveAllowSpends = lastState.activeAllowSpends.getOrElse(SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
-          nextActiveAllowSpends = (priorActiveAllowSpends |+| incomingAllowSpends).filter { case (_, s) => s.nonEmpty }
+          nextActiveAllowSpends = (priorActiveAllowSpends |+| incomingAllowSpends).map {
+            case (addr, as) => addr -> as.filter(a => syncEpoch.forall(e => a.value.lastValidEpochProgress >= e))
+          }.filter { case (_, s) => s.nonEmpty }
 
-          // Build the candidate derived Info from the replayed deltas. Carry the prior shape of optional fields when nothing
-          // changed so the absent-vs-empty distinction matches what the metagraph committed.
+          // globalSnapshotSyncView: prior view + this snapshot's accepted globalSnapshotSyncs, keyed by the signer's PeerId,
+          // byte-identical to MessageValidationOpsManager.acceptGlobalSnapshotSyncs (sort by parentOrdinal asc then default
+          // Signed order so latest-per-peer wins). The metagraph UPDATES this every snapshot, so the prior code's plain
+          // carry-forward (`= lastState.globalSnapshotSyncView`) mismatched the committed proof on every post-migration
+          // ordinal -> the gate fell back -> lastCurrencySnapshots froze at the seed (#259 token-lock / allow-spend / spend).
+          syncOrdering = Order
+            .whenEqual[Signed[GlobalSnapshotSync]](Order.by(_.value.parentOrdinal), Order[Signed[GlobalSnapshotSync]])
+            .toOrdering
+          nextGlobalSnapshotSyncView = artifact.globalSnapshotSyncs
+            .map(_.toList.sorted(syncOrdering))
+            .getOrElse(List.empty)
+            .foldLeft(lastState.globalSnapshotSyncView.getOrElse(SortedMap.empty[PeerId, Signed[GlobalSnapshotSync]])) { (acc, sync) =>
+              acc.updated(sync.proofs.head.id.toPeerId, sync)
+            }
+
+          // Build the candidate derived Info. The Option SHAPE of each field must equal the committed stateProof's
+          // (`stateProof` maps `None -> None`, `Some(map) -> Some(hash(map))` via `traverse(_.hash)`), and the metagraph emits
+          // `Some(map)`-even-when-empty post-tessellation3-migration (`None` pre-migration). Drive the shape off the committed
+          // proof per field so it matches both eras; the replayed map is the content, the economic-security gate below verifies
+          // the hash. (Prior `if (nextX.isEmpty) lastState.X else Some(nextX)` produced `None`/stale on the empty case, which
+          // never matched the metagraph's post-migration `Some(empty)`.)
           derivedBalances = derivedBalancesE.getOrElse(lastState.balances)
+          committedProof = artifact.stateProof
           candidate = CurrencySnapshotInfo(
             lastTxRefs = nextLastTxRefs,
             balances = derivedBalances,
             lastMessages = nextLastMessagesOpt,
-            lastFeeTxRefs = lastState.lastFeeTxRefs,
-            lastAllowSpendRefs = if (nextAllowSpendRefs.isEmpty) lastState.lastAllowSpendRefs else nextAllowSpendRefs.some,
-            activeAllowSpends = if (nextActiveAllowSpends.isEmpty) lastState.activeAllowSpends else nextActiveAllowSpends.some,
-            globalSnapshotSyncView = lastState.globalSnapshotSyncView,
-            lastTokenLockRefs = if (nextTokenLockRefs.isEmpty) lastState.lastTokenLockRefs else nextTokenLockRefs.some,
-            activeTokenLocks = if (nextActiveTokenLocks.isEmpty) lastState.activeTokenLocks else nextActiveTokenLocks.some
+            lastFeeTxRefs = None,
+            lastAllowSpendRefs = committedProof.lastAllowSpendRefsProof.map(_ => nextAllowSpendRefs),
+            activeAllowSpends = committedProof.activeAllowSpends.map(_ => nextActiveAllowSpends),
+            globalSnapshotSyncView = committedProof.globalSnapshotSync.map(_ => nextGlobalSnapshotSyncView),
+            lastTokenLockRefs = committedProof.lastTokenLockRefsProof.map(_ => nextTokenLockRefs),
+            activeTokenLocks = committedProof.activeTokenLocks.map(_ => nextActiveTokenLocks)
           )
 
-          // Economic-security gate: the derived Info must hash to the metagraph's committed stateProof.
+          // Economic-security gate, PER FIELD: commit each derived field whose hash matches the committee-attested
+          // committed proof (verified, safe); carry the prior value forward for any field gl0 cannot reproduce
+          // (notably `balances`, which needs currency-id / epoch-expiry / cross-shard-spend effects). Pure per-field
+          // hash compare ⇒ every gl0 node yields the same `adopted` ⇒ split-safe; gl0 never commits an unverified
+          // field. This replaces the prior all-or-nothing fallback that discarded EVERY verified field (token-locks,
+          // refs, sync-view) the moment `balances` diverged — which froze lastCurrencySnapshots at the seed.
           derivedProof <- candidate.stateProof[F](artifact.ordinal)
-          committedProof = artifact.stateProof
-          balanceArithmeticOk = derivedBalancesE.isRight
-          result <-
-            if (balanceArithmeticOk && derivedProof === committedProof) candidate.pure[F]
-            else
-              logger
-                .warn(
-                  s"[ACCEPTANCE/ADOPT] address=${address.show} ordinal=${artifact.ordinal.show} derived currency state root " +
-                    s"MISMATCH vs committed stateProof (balanceArithmeticOk=$balanceArithmeticOk). Adopting ordinal but carrying " +
-                    s"forward prior balances/refs (this snapshot's state was shaped by effects not reproducible from a pure event " +
-                    s"replay, or the metagraph state is invalid). committed=${committedProof.show} derived=${derivedProof.show}"
-                )
-                .as(
-                  // Fall back: keep prior balances/refs/token-locks/allow-spends; only advance lastMessages. The ordinal still
-                  // advances (committed from `snapshot` at the call site) so the freeze does not return, but gl0 commits no
-                  // unverified balance map.
-                  lastState.copy(lastMessages = nextLastMessagesOpt)
-                )
-        } yield result
+          adopted = CurrencySnapshotInfo(
+            lastTxRefs =
+              if (derivedProof.lastTxRefsProof === committedProof.lastTxRefsProof) candidate.lastTxRefs else lastState.lastTxRefs,
+            balances = if (derivedProof.balancesProof === committedProof.balancesProof) candidate.balances else lastState.balances,
+            lastMessages =
+              if (derivedProof.lastMessagesProof === committedProof.lastMessagesProof) candidate.lastMessages else lastState.lastMessages,
+            lastFeeTxRefs =
+              if (derivedProof.lastFeeTxRefsProof === committedProof.lastFeeTxRefsProof) candidate.lastFeeTxRefs
+              else lastState.lastFeeTxRefs,
+            lastAllowSpendRefs =
+              if (derivedProof.lastAllowSpendRefsProof === committedProof.lastAllowSpendRefsProof) candidate.lastAllowSpendRefs
+              else lastState.lastAllowSpendRefs,
+            activeAllowSpends =
+              if (derivedProof.activeAllowSpends === committedProof.activeAllowSpends) candidate.activeAllowSpends
+              else lastState.activeAllowSpends,
+            globalSnapshotSyncView =
+              if (derivedProof.globalSnapshotSync === committedProof.globalSnapshotSync) candidate.globalSnapshotSyncView
+              else lastState.globalSnapshotSyncView,
+            lastTokenLockRefs =
+              if (derivedProof.lastTokenLockRefsProof === committedProof.lastTokenLockRefsProof) candidate.lastTokenLockRefs
+              else lastState.lastTokenLockRefs,
+            activeTokenLocks =
+              if (derivedProof.activeTokenLocks === committedProof.activeTokenLocks) candidate.activeTokenLocks
+              else lastState.activeTokenLocks
+          )
+          _ <- Async[F].whenA(derivedProof =!= committedProof)(
+            logger.warn(
+              s"[ACCEPTANCE/ADOPT] address=${address.show} ordinal=${artifact.ordinal.show} per-field adopt: derived stateProof " +
+                s"differs from committed — committing matched fields, carrying prior forward for the rest (typically `balances`, " +
+                s"not reproducible from pure replay). committed=${committedProof.show} derived=${derivedProof.show}"
+            )
+          )
+        } yield adopted
       }
 
       /** Processes currency snapshots for each metagraph address, applying fee deduction logic.
