@@ -1,8 +1,10 @@
 package io.constellationnetwork.node.shared.infrastructure.sharding
 
 import cats.data.NonEmptyList
-import cats.effect.kernel.Async
+import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
+
+import scala.collection.immutable.Map
 
 import io.constellationnetwork.node.shared.config.types.ShardingConfig
 import io.constellationnetwork.node.shared.domain.nakamoto._
@@ -217,12 +219,26 @@ object ShardCheckpointWiring {
     else
       for {
         registry <- buildRegistry[F](cfg, kQuorum, selfPeerId)
-        // EXECUTION-SHARDING — real VRF-VK-sortitioned committee. The ONE closure that defines "who is in shard s's committee
-        // for this epoch", reused by (a) the acceptance manager's per-signer set-membership pre-check, and (b) the produce/attest
-        // membership gates. The DRAW uses `kDraw`; the admit quorum (`kQuorum`) is decoupled (it is the count, not |committee|).
-        // Deterministic on every node — see `committeeFor` scaladoc.
+        // MEMOIZE the committee draw per (shardId, epoch) (2026-06-10, run b31yifl23). `committeeFor` runs one
+        // VRF-sortition Hasher.hash PER VALIDATOR (~N hashes) every call, and the closure is invoked once per
+        // checkpoint per CANDIDATE BRANCH during `verifyEmbedded`/`preCheck` — so under a near-tip reorg storm
+        // (1650 reorg events observed) it fired ~N×1650 ≈ 165k hashes/run, the allocation spike that drove 4/5
+        // gl0 nodes across the -Xmx cliff into G1 death-thrash (HTTP starved → e2e poll timeout). The committee is
+        // a DETERMINISTIC function of (shardId, epoch) alone — `activeValidators` (seedlist), `vrfRegistry`
+        // (genesis/registration), `etaForEpoch(epoch)` (MPT-committed), `kDraw`/σ are all cluster-uniform — so the
+        // cache is semantically identical to recomputing (split-safe; pure optimization). Unbounded growth is a
+        // non-issue: cardinality = numShards × in-flight epochs (~handful). Mirrors EtaStateManager.walkCacheRef.
+        committeeCache <- Ref.of[F, Map[(ShardId, EtaPeriod), Set[PeerId]]](Map.empty)
         committeeMembership = (shardId: ShardId, epoch: EtaPeriod) =>
-          committeeFor[F](shardId, epoch, activeValidators, vrfRegistry, etaForEpoch, kDraw)
+          committeeCache.get.flatMap { cache =>
+            cache.get((shardId, epoch)) match {
+              case Some(members) => Async[F].pure(members)
+              case None =>
+                committeeFor[F](shardId, epoch, activeValidators, vrfRegistry, etaForEpoch, kDraw).flatTap { members =>
+                  committeeCache.update(_.updated((shardId, epoch), members))
+                }
+            }
+          }
         acceptanceManager <- ShardCheckpointGl0AcceptanceManager.make[F](
           finalityTriggers = (sid: ShardId) => Async[F].pure(registry.get(sid).map(_.finalityTriggers)),
           chainStore = (sid: ShardId) => Async[F].pure(registry.get(sid).map(_.chainStore)),

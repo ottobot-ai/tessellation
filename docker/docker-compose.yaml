@@ -8,15 +8,20 @@ services:
     # blows past a small heap → GC death spiral (Old=99.9%, hundreds of full GCs) → all 8 gl0
     # thrash → CPU starves → the chain can't finalize the rotation. So gl0 gets a BIG heap; the
     # 35 metagraph/gl1 nodes stay small (CL_NODE_MEM_LIMIT) — they were healthy at 1.5g.
+    # 2026-06-10 (run b31yifl23): the SAME GC death spiral recurred under the spend-action / double-spend
+    # workload — a near-tip reorg storm (1650 events) re-ran committee VRF sortition + MPT re-deserialization
+    # per competing branch, and 4/5 gl0 nodes crossed the 7168m cliff into continuous full-GC (HTTP starved →
+    # e2e poll timeout). Two fixes: (a) the committee-VRF memoization in ShardCheckpointWiring cut the
+    # allocation spike at its source; (b) headroom bump here. Box has ~100G free; 5 gl0 × 14g = 70g, safe.
     # Host-tunable via CL_GL0_MEM_LIMIT; -Xmx is set in this service's environment block below.
-    mem_limit: ${CL_GL0_MEM_LIMIT:-9216m}
+    mem_limit: ${CL_GL0_MEM_LIMIT:-14336m}
     env_file:
       - .env
     environment:
       - CL_DOCKER_ID=gl0
       # gl0-specific big heap, overrides the default -Xmx in nodes/.env (entrypoint.sh appends
       # --add-opens). Keep well under mem_limit above (heap + ~1g non-heap). Host-tunable.
-      - CL_DOCKER_JAVA_OPTS=-Xms512m -Xmx${CL_GL0_XMX:-7168m}
+      - CL_DOCKER_JAVA_OPTS=-Xms512m -Xmx${CL_GL0_XMX:-12288m}
       - CL_KEYSTORE=/tessellation/key.p12
       - CL_PUBLIC_HTTP_PORT=${CL_DOCKER_INTERNAL_GL0_PUBLIC:-9000}
       - CL_P2P_HTTP_PORT=${CL_DOCKER_INTERNAL_GL0_P2P:-9001}
