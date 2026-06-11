@@ -1479,7 +1479,11 @@ object GlobalSnapshotConsensus {
                       // `shardScEventsProcessor`), so the producer's `perMetagraphMptRoots` are recomputed
                       // byte-identically by every verifier's `reExecuteDerivation`.
                       derivePerMgState = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
-                        .reExecDerivation[F](shardScEventsProcessor)(Async[F], shardHasher)
+                        .reExecDerivation[F](shardScEventsProcessor)(Async[F], shardHasher),
+                      // Bounded checkpoint pipeline (2026-06-11): gl0's adopted-watermark from the acceptance
+                      // manager gates new window production so pending batches while embedding catches up.
+                      lastAdoptedOrd = deps.acceptanceManager.lastAdoptedOrd(shardId),
+                      pipelineDepth = deps.shardingConfig.checkpoint.pipelineDepth
                     )
                     .map(shardId -> _)
               }

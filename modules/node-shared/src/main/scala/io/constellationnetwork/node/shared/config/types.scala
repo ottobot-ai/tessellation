@@ -226,7 +226,15 @@ object types {
       )
   }
 
-  case class ShardCheckpointConfig(tAliveMs: Long, tBurst: Int, binaryBufferCap: Int)
+  case class ShardCheckpointConfig(
+    tAliveMs: Long,
+    tBurst: Int,
+    binaryBufferCap: Int,
+    /** Bounded checkpoint pipeline (2026-06-11): max unadopted windows in flight before the producer holds production so pending binaries
+      * batch into one bigger window (catch-up margin — see ShardCheckpointProducer).
+      */
+    pipelineDepth: Int = 2
+  )
 
   /** Slice 19 observability tunables (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §13 row 19 + §9.4).
     *

@@ -255,6 +255,10 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       callsRef.update(_ :+ checkpoint).as(decision(checkpoint))
     override def verifyEmbedded(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
       callsRef.update(_ :+ checkpoint).as(decision(checkpoint))
+    override def noteAdopted(shardId: io.constellationnetwork.schema.sharding.ShardId, shardOrdinal: ShardOrdinal): IO[Unit] =
+      IO.unit
+    override def lastAdoptedOrd(shardId: io.constellationnetwork.schema.sharding.ShardId): IO[Option[ShardOrdinal]] =
+      IO.pure(None)
   }
 
   /** Build the manager-under-test with the Slice 13 sharding deps, using the captor processor (records `process` events + adopted

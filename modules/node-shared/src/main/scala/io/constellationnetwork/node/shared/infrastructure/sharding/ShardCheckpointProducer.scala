@@ -285,7 +285,18 @@ object ShardCheckpointProducer {
     slotForGl0Anchor: SnapshotOrdinal => Slot,
     slotGapFor: (Slot, Option[Slot]) => Long,
     lddConfig: LddConfig,
-    derivePerMgState: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash]
+    derivePerMgState: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash],
+    /** Bounded checkpoint pipeline (2026-06-11, run bpc2yyegf): highest shard ordinal gl0 has ADOPTED for this shard on this node (the
+      * acceptance manager's watermark). Production POLICY input only — never a validity condition.
+      */
+    lastAdoptedOrd: F[Option[ShardOrdinal]],
+    /** Max unadopted checkpoints in flight before the producer stops minting new windows. Checkpoint production (1 per anchor) and gl0
+      * embedding (1 per shard per snapshot) run at EXACTLY the same rate, so without this gate an admission gap (e.g. the 5-min genesis
+      * quorum warmup) persists forever — the mirror trailed ml0 by ~50 ordinals and allow-spend windows died (run bpc2yyegf). Holding
+      * production while >= pipelineDepth windows await embed makes pending binaries accumulate into ONE bigger window, so a single embed
+      * drains the whole backlog: catch-up margin = window growth.
+      */
+    pipelineDepth: Int
   ): F[ShardCheckpointProducer[F]] = Async[F].delay {
     val logger = Slf4jLogger.getLoggerFromName[F](s"ShardCheckpointProducer[$shardId]")
 
@@ -309,103 +320,125 @@ object ShardCheckpointProducer {
         } else {
           // Resolve the parent — `bestTip` `None` ⇒ genesis (parent = Hash.empty, parent ord = Genesis). `perMgTip` is derived from the
           // SAME best tip (empty at genesis), so the chain-link anchor and the parent envelope are read consistently.
-          (chainStore.bestTip, chainStore.perMgTip).tupled.flatMap {
-            case (bestTipOpt, perMgTip) =>
-              val parentHash: Hash = bestTipOpt.map(_.hash).getOrElse(Hash.empty)
-              val parentOrd: ShardOrdinal = bestTipOpt.map(_.signed.value.shardOrdinal).getOrElse(ShardOrdinal.Genesis)
-              // Parent slot derivation:
-              //   - Genesis case: no parent slot (caller's `slotGapFor` handles `None`).
-              //   - Non-genesis: the parent envelope itself doesn't carry the parent's slot; we approximate by reading the parent's
-              //     `gl0AnchorOrdinal` and applying the same `slotForGl0Anchor` mapping the producer uses for `currentSlot`. This keeps
-              //     slot-derivation routed through one pure function rather than scattering Slot ⇄ ord conversions across the codebase.
-              val parentSlotOpt: Option[Slot] = bestTipOpt.map(t => slotForGl0Anchor(t.signed.value.gl0AnchorOrdinal))
-              val nextShardOrdinal: ShardOrdinal = parentOrd.next
-              val currentSlot: Slot = slotForGl0Anchor(gl0AnchorOrdinal)
-              val slotGap: Long = slotGapFor(currentSlot, parentSlotOpt)
-
-              // R-2: chain-link-order the buffered binaries off the shard's OWN tip (NOT gl0's). MGs with no admissible chain this round
-              // are omitted; if NOTHING chains off the tip, there is nothing to checkpoint → return None (don't emit an empty checkpoint
-              // and don't burn the slot lottery on it). This is the inversion's core: the admissible set comes from the shard's prior
-              // checkpoint, not gl0's post-chain-link `stateChannelSnapshots`.
-              chainLinkOrder(pendingSnapshots, perMgTip).flatMap { orderedSnapshots =>
-                if (orderedSnapshots.isEmpty)
-                  logger
-                    .info(
-                      s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=no-chain-link " +
-                        s"pendingMgs=${pendingSnapshots.size} " +
-                        s"pendingCounts=${pendingSnapshots.toList.map { case (mg, nel) => s"${mg.value.value.take(8)}:${nel.size}" }
-                            .mkString(",")} " +
-                        s"tips=${perMgTip.toList.map { case (mg, h) => s"${mg.value.value.take(8)}:${h.value.take(8)}" }.mkString(",")}"
-                    )
-                    .as(None: Option[Signed[ShardCheckpoint]])
-                else
-                  // Slice S4: resolve the shard-leader-VRF eta for the CHECKPOINT'S OWN `epoch` (the one stamped on the envelope below),
-                  // NOT a wall-clock period. `epoch == rotationPeriod(gl0AnchorOrdinal)`, and `eta_epoch` is fixed at the 2/3-mark of the
-                  // prior period (`EtaCalculation`), so it is knowable here and every verifier — who keys the same lookup on the
-                  // wire-carried `checkpoint.epoch` — derives byte-identical bytes. This is the load-bearing determinism invariant: if
-                  // producer + verifier disagreed on shardEta, `ShardSlotLeader.verifyLeader` would reject and the shard chain stalls.
-                  shardEtaFor(epoch).flatMap { shardEta =>
-                    slotLeader
-                      .isLeader(selfVrfSk, shardEta, currentSlot, slotGap, sigmaInCommittee, lddConfig)
-                      .flatMap {
-                        case None =>
-                          // Not the slot leader — per design doc §6.3, other committee members attest later via gossip (slice 14).
-                          logger
-                            .info(
-                              s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=not-leader " +
-                                s"slot=${currentSlot.value.value} gap=$slotGap chainedMgs=${orderedSnapshots.size}"
-                            )
-                            .as(None: Option[Signed[ShardCheckpoint]])
-
-                        case Some((vrfProof, _)) =>
-                          // Won the lottery — build the checkpoint, sign it, publish it.
-                          for {
-                            delta <- assembleDelta(orderedSnapshots, gl0AnchorOrdinal)
-                            checkpoint = ShardCheckpoint(
-                              shardId = shardId,
-                              parentCheckpointHash = parentHash,
-                              shardOrdinal = nextShardOrdinal,
-                              gl0AnchorOrdinal = gl0AnchorOrdinal,
-                              derivedStateDelta = delta,
-                              emittedReceipts = List.empty,
-                              // Placeholder — populated below by replacing with the real committee-member sig. NonEmptyList requires at
-                              // least one element to construct; we use a throwaway sentinel and overwrite in `.copy(...)`. Cleaner than
-                              // threading the signing into the case-class constructor.
-                              committeeSignatures = NonEmptyList.of(placeholderSig),
-                              epoch = epoch
-                            )
-                            // Compute the canonical preimage hash via Hasher[F]. This is the bytes every committee member signs (§3.3).
-                            preimageHash <- Hasher[F].hash(checkpoint.signingPreimage)
-                            // Sign with Ed25519 long-term + KES product. Both sign the canonical preimage hash's UTF-8 bytes (`getBytes`
-                            // matches `MetagraphCommitteeGate.messageBytes` — Hasher result's UTF-8 byte form is what other sign paths use).
-                            msgBytes = preimageHash.getBytes
-                            edSig <- Signing.signData[F](msgBytes)(selfKeyPair.getPrivate)
-                            kesStep <- kesSigner.currentPeriod
-                            kesSig <- kesSigner.signAt(kesStep, msgBytes)
-                            committeeSig = CommitteeMemberSignature(
-                              peerId = selfPeerId,
-                              vrfProof = Hex.fromBytes(vrfProof),
-                              ed25519Sig = Hex.fromBytes(edSig),
-                              kesProductSig = Hex.fromBytes(kesSig),
-                              kesTreeStep = kesStep
-                            )
-                            finalCheckpoint = checkpoint.copy(committeeSignatures = NonEmptyList.of(committeeSig))
-                            // Wrap in Signed envelope. The outer Signed contract uses the operator's long-term Ed25519 signature over the
-                            // envelope's value bytes; this is the canonical "this operator authored this message" attestation that gl0 and
-                            // other peers use to authenticate the gossip path. Mirrors how `GlobalIncrementalSnapshot` is signed.
-                            proof <- SignatureProof.fromHash(selfKeyPair, preimageHash)
-                            signedCheckpoint = Signed(finalCheckpoint, NonEmptySet.of(proof))
-                            _ <- publisher.publish(signedCheckpoint)
-                            _ <- logger.info(
-                              s"produce: emitted shardOrdinal=${nextShardOrdinal.value} gl0Anchor=${gl0AnchorOrdinal.value.value} " +
-                                s"slot=${currentSlot.value.value} mgs=${orderedSnapshots.keys.size} kesStep=$kesStep"
-                            )
-                          } yield Some(signedCheckpoint): Option[Signed[ShardCheckpoint]]
-                      }
-                  }
-              }
+          (chainStore.bestTip, chainStore.perMgTip, lastAdoptedOrd).tupled.flatMap {
+            case (bestTipOpt, perMgTip, adoptedOrdOpt) =>
+              val unadoptedDepth: Long =
+                bestTipOpt.map(_.signed.value.shardOrdinal.value).getOrElse(0L) - adoptedOrdOpt.map(_.value).getOrElse(0L)
+              if (bestTipOpt.isDefined && unadoptedDepth >= pipelineDepth.toLong) {
+                // Bounded pipeline: gl0 hasn't embedded our recent windows yet — let pending batch into the next one.
+                logger
+                  .info(
+                    s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=awaiting-embed " +
+                      s"unadoptedDepth=$unadoptedDepth pipelineDepth=$pipelineDepth " +
+                      s"tipShardOrd=${bestTipOpt.map(_.signed.value.shardOrdinal.value).getOrElse(0L)} " +
+                      s"adoptedShardOrd=${adoptedOrdOpt.map(_.value).getOrElse(0L)}"
+                  )
+                  .as(None: Option[Signed[ShardCheckpoint]])
+              } else produceInner(bestTipOpt, perMgTip, pendingSnapshots, gl0AnchorOrdinal, epoch)
           }
         }
+
+      private def produceInner(
+        bestTipOpt: Option[io.constellationnetwork.security.Hashed[ShardCheckpoint]],
+        perMgTip: SortedMap[Address, Hash],
+        pendingSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+        gl0AnchorOrdinal: SnapshotOrdinal,
+        epoch: EtaPeriod
+      ): F[Option[Signed[ShardCheckpoint]]] = {
+        val parentHash: Hash = bestTipOpt.map(_.hash).getOrElse(Hash.empty)
+        val parentOrd: ShardOrdinal = bestTipOpt.map(_.signed.value.shardOrdinal).getOrElse(ShardOrdinal.Genesis)
+        // Parent slot derivation:
+        //   - Genesis case: no parent slot (caller's `slotGapFor` handles `None`).
+        //   - Non-genesis: the parent envelope itself doesn't carry the parent's slot; we approximate by reading the parent's
+        //     `gl0AnchorOrdinal` and applying the same `slotForGl0Anchor` mapping the producer uses for `currentSlot`. This keeps
+        //     slot-derivation routed through one pure function rather than scattering Slot ⇄ ord conversions across the codebase.
+        val parentSlotOpt: Option[Slot] = bestTipOpt.map(t => slotForGl0Anchor(t.signed.value.gl0AnchorOrdinal))
+        val nextShardOrdinal: ShardOrdinal = parentOrd.next
+        val currentSlot: Slot = slotForGl0Anchor(gl0AnchorOrdinal)
+        val slotGap: Long = slotGapFor(currentSlot, parentSlotOpt)
+
+        // R-2: chain-link-order the buffered binaries off the shard's OWN tip (NOT gl0's). MGs with no admissible chain this round
+        // are omitted; if NOTHING chains off the tip, there is nothing to checkpoint → return None (don't emit an empty checkpoint
+        // and don't burn the slot lottery on it). This is the inversion's core: the admissible set comes from the shard's prior
+        // checkpoint, not gl0's post-chain-link `stateChannelSnapshots`.
+        chainLinkOrder(pendingSnapshots, perMgTip).flatMap { orderedSnapshots =>
+          if (orderedSnapshots.isEmpty)
+            logger
+              .info(
+                s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=no-chain-link " +
+                  s"pendingMgs=${pendingSnapshots.size} " +
+                  s"pendingCounts=${pendingSnapshots.toList.map { case (mg, nel) => s"${mg.value.value.take(8)}:${nel.size}" }
+                      .mkString(",")} " +
+                  s"tips=${perMgTip.toList.map { case (mg, h) => s"${mg.value.value.take(8)}:${h.value.take(8)}" }.mkString(",")}"
+              )
+              .as(None: Option[Signed[ShardCheckpoint]])
+          else
+            // Slice S4: resolve the shard-leader-VRF eta for the CHECKPOINT'S OWN `epoch` (the one stamped on the envelope below),
+            // NOT a wall-clock period. `epoch == rotationPeriod(gl0AnchorOrdinal)`, and `eta_epoch` is fixed at the 2/3-mark of the
+            // prior period (`EtaCalculation`), so it is knowable here and every verifier — who keys the same lookup on the
+            // wire-carried `checkpoint.epoch` — derives byte-identical bytes. This is the load-bearing determinism invariant: if
+            // producer + verifier disagreed on shardEta, `ShardSlotLeader.verifyLeader` would reject and the shard chain stalls.
+            shardEtaFor(epoch).flatMap { shardEta =>
+              slotLeader
+                .isLeader(selfVrfSk, shardEta, currentSlot, slotGap, sigmaInCommittee, lddConfig)
+                .flatMap {
+                  case None =>
+                    // Not the slot leader — per design doc §6.3, other committee members attest later via gossip (slice 14).
+                    logger
+                      .info(
+                        s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=not-leader " +
+                          s"slot=${currentSlot.value.value} gap=$slotGap chainedMgs=${orderedSnapshots.size}"
+                      )
+                      .as(None: Option[Signed[ShardCheckpoint]])
+
+                  case Some((vrfProof, _)) =>
+                    // Won the lottery — build the checkpoint, sign it, publish it.
+                    for {
+                      delta <- assembleDelta(orderedSnapshots, gl0AnchorOrdinal)
+                      checkpoint = ShardCheckpoint(
+                        shardId = shardId,
+                        parentCheckpointHash = parentHash,
+                        shardOrdinal = nextShardOrdinal,
+                        gl0AnchorOrdinal = gl0AnchorOrdinal,
+                        derivedStateDelta = delta,
+                        emittedReceipts = List.empty,
+                        // Placeholder — populated below by replacing with the real committee-member sig. NonEmptyList requires at
+                        // least one element to construct; we use a throwaway sentinel and overwrite in `.copy(...)`. Cleaner than
+                        // threading the signing into the case-class constructor.
+                        committeeSignatures = NonEmptyList.of(placeholderSig),
+                        epoch = epoch
+                      )
+                      // Compute the canonical preimage hash via Hasher[F]. This is the bytes every committee member signs (§3.3).
+                      preimageHash <- Hasher[F].hash(checkpoint.signingPreimage)
+                      // Sign with Ed25519 long-term + KES product. Both sign the canonical preimage hash's UTF-8 bytes (`getBytes`
+                      // matches `MetagraphCommitteeGate.messageBytes` — Hasher result's UTF-8 byte form is what other sign paths use).
+                      msgBytes = preimageHash.getBytes
+                      edSig <- Signing.signData[F](msgBytes)(selfKeyPair.getPrivate)
+                      kesStep <- kesSigner.currentPeriod
+                      kesSig <- kesSigner.signAt(kesStep, msgBytes)
+                      committeeSig = CommitteeMemberSignature(
+                        peerId = selfPeerId,
+                        vrfProof = Hex.fromBytes(vrfProof),
+                        ed25519Sig = Hex.fromBytes(edSig),
+                        kesProductSig = Hex.fromBytes(kesSig),
+                        kesTreeStep = kesStep
+                      )
+                      finalCheckpoint = checkpoint.copy(committeeSignatures = NonEmptyList.of(committeeSig))
+                      // Wrap in Signed envelope. The outer Signed contract uses the operator's long-term Ed25519 signature over the
+                      // envelope's value bytes; this is the canonical "this operator authored this message" attestation that gl0 and
+                      // other peers use to authenticate the gossip path. Mirrors how `GlobalIncrementalSnapshot` is signed.
+                      proof <- SignatureProof.fromHash(selfKeyPair, preimageHash)
+                      signedCheckpoint = Signed(finalCheckpoint, NonEmptySet.of(proof))
+                      _ <- publisher.publish(signedCheckpoint)
+                      _ <- logger.info(
+                        s"produce: emitted shardOrdinal=${nextShardOrdinal.value} gl0Anchor=${gl0AnchorOrdinal.value.value} " +
+                          s"slot=${currentSlot.value.value} mgs=${orderedSnapshots.keys.size} kesStep=$kesStep"
+                      )
+                    } yield Some(signedCheckpoint): Option[Signed[ShardCheckpoint]]
+                }
+            }
+        }
+      }
 
       /** Build the [[ShardDerivedStateDelta]] from the already chain-link-ordered per-MG snapshots.
         *

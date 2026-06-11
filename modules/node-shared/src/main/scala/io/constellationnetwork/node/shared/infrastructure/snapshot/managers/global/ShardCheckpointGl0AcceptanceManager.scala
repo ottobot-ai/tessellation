@@ -125,6 +125,16 @@ trait ShardCheckpointGl0AcceptanceManager[F[_]] {
     *      it yields a deterministic [[ShardCheckpointAcceptResult.Rejected]] / mismatch — never a node-local-dependent answer.
     */
   def verifyEmbedded(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult]
+
+  /** Record that a checkpoint at `shardOrdinal` for `shardId` was ADOPTED into a global snapshot on this node's accept path (leader-create
+    * AND follower-validate both call it via `adoptShardCheckpoints`). Max-monotone — replays of earlier ordinals (proposal/validation/reorg
+    * re-runs) never move the watermark backwards. Node-local observability; never read by any consensus-deterministic decision (the
+    * producer consumes it as a PRODUCTION POLICY gate — bounded pipeline depth).
+    */
+  def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal): F[Unit]
+
+  /** Highest shard ordinal adopted into a global snapshot for `shardId` on this node (None before the first adoption). */
+  def lastAdoptedOrd(shardId: ShardId): F[Option[ShardOrdinal]]
 }
 
 object ShardCheckpointGl0AcceptanceManager {
@@ -190,8 +200,17 @@ object ShardCheckpointGl0AcceptanceManager {
 
     val logger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointGl0AcceptanceManager")
 
-    Async[F].pure {
+    cats.effect.Ref.of[F, Map[ShardId, Long]](Map.empty).map { lastAdoptedR =>
       new ShardCheckpointGl0AcceptanceManager[F] {
+
+        def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal): F[Unit] =
+          lastAdoptedR.update { m =>
+            val cur = m.getOrElse(shardId, 0L)
+            if (shardOrdinal.value > cur) m.updated(shardId, shardOrdinal.value) else m
+          }
+
+        def lastAdoptedOrd(shardId: ShardId): F[Option[ShardOrdinal]] =
+          lastAdoptedR.get.map(_.get(shardId).map(ShardOrdinal(_)))
 
         def evaluate(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult] =
           // Step 1: pre-checks. Run on every signer; fail-fast at the first signer that doesn't pass all four predicates.

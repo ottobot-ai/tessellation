@@ -145,7 +145,9 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
       slotForGl0Anchor = slotForGl0Anchor,
       slotGapFor = slotGapFor,
       lddConfig = LddConfig.Default,
-      derivePerMgState = reExec
+      derivePerMgState = reExec,
+      lastAdoptedOrd = cats.effect.IO.pure(None),
+      pipelineDepth = Int.MaxValue
     )
 
   /** Loop produce over increasing gl0 anchors until σ=1 wins. */

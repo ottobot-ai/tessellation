@@ -167,7 +167,9 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
       slotForGl0Anchor = slotForGl0Anchor,
       slotGapFor = slotGapFor,
       lddConfig = LddConfig.Default,
-      derivePerMgState = deterministicDerive
+      derivePerMgState = deterministicDerive,
+      lastAdoptedOrd = cats.effect.IO.pure(None),
+      pipelineDepth = Int.MaxValue
     )
 
   /** Per-shard rig: a chain store + a raw-binary buffer + a producer for every shard `0 .. numShards-1`, sharing one keypair + σ. */

@@ -234,7 +234,9 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       slotForGl0Anchor = slotForGl0Anchor,
       slotGapFor = slotGapFor,
       lddConfig = LddConfig.Default,
-      derivePerMgState = derive
+      derivePerMgState = derive,
+      lastAdoptedOrd = cats.effect.IO.pure(None),
+      pipelineDepth = Int.MaxValue
     )
 
   // ===========================================================================

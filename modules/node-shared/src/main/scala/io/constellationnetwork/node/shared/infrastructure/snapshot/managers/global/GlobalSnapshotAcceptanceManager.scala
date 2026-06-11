@@ -645,7 +645,11 @@ object GlobalSnapshotAcceptanceManager {
                           s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                             s"ACCEPTED adopt mgs=${chainContinuous.size} binaries=${chainContinuous.values.map(_.size).sum} " +
                             s"deferredMgs=${deferred.size} receipts=${newReceipts.size}"
-                        )
+                        ) >>
+                      // Bounded-pipeline watermark (2026-06-11, run bpc2yyegf): record the adopted shard ordinal so the
+                      // producer can gate new window production on embed progress (max-monotone, node-local policy input).
+                      checkpointManager
+                        .noteAdopted(shardId, cp.shardOrdinal)
                         .as((adoptedAcc ++ chainContinuous, receiptsAcc ++ newReceipts))
 
                   case ShardCheckpointAcceptResult.PendingMoreAttestations =>
