@@ -157,6 +157,18 @@ Solo extension remains the N=1 normal case and the N>1 degraded case (all higher
 - All Slice-14 checkpoint/committee machinery (it *gains* a role: ml0's finality evidence).
 - L1 block engines (swap/token-lock/StateChannel batch-and-co-sign) — small, observable since `948d2b2e1`, candidates for a later "co-sign primitive" unification (separate doc, not this fork).
 
+### 5.6 Additional design considerations (owner-reviewed 2026-06-11)
+
+1. **δ (rank window) is metagraph-configurable, consensus-visible.** Default 5 slots. Lives in metagraph genesis / on-chain config, NOT per-node HOCON — policy skew cannot fork (fork choice absorbs it) but agreed δ keeps cadence clean.
+2. **Event-driven production with a max-gap heartbeat.** The metagraph `epochProgress` is a load-bearing clock (allow-spend/token-lock windows starve when it crawls — the entire 2026-06 window-failure family). Rank-0 produces on events; an empty heartbeat snapshot every T_max keeps the clock honest on quiet metagraphs.
+3. **Timestamp discipline.** Artifact timestamps: monotone vs parent, ≤ now + ε (skew bound, explicit). Validity bounds only — local time NEVER appears in fork choice; rank is the deterministic tiebreaker.
+4. **Censorship bound.** A tx censored by f colluding validators waits ≤ ~(f+1) intervals for an honest rank. This rotation property is the answer to "one signer per snapshot" at metagraph trust scale.
+5. **Equivocation accountability — start reputational, bond opt-in.** Two signed snapshots for one (parent, window) = byte-verifiable slashing evidence (safety bar: evidence-carrying tx, deterministic outcome). v1: record + demote via the epoch-participating-set (its missing consequence sink). Registry schema reserves an optional collateral/bond field for bonded metagraphs. OPEN: owner call on default.
+6. **Anchor cadence bounds client risk.** Soft-state reorg window ≈ checkpoint cadence + gl0 finality lag. Checkpoint cadence = metagraph config; expose `anchoredOrdinal` on the ml0 API (mirror of gl0's settled/k₂ field) so clients pick tip / countersigned / anchored.
+7. **Epoch-aware countersignatures.** Fast-rail denominator = registry at the attestation's epoch; attestations carry epoch and verify against registry-at-epoch (registry churn at boundaries cannot double-count or strand evidence).
+8. **Genesis edge.** Window 0 anchors on the genesis timestamp; initial registry ships in metagraph genesis (balance-CSV pattern).
+9. **Observability is part of the engine.** Ship with: expected-producer gauge, rank-window countdown, countersign coverage, anchor lag, per-interval production source (rank). Every 2026-06 failure hid in unlogged state; the engine must not be able to fail silently.
+
 ## 6. Migration plan (hard fork LAST, per standing phase order)
 
 | Phase | Content | Risk gate |
