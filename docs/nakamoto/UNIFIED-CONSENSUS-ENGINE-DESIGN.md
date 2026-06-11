@@ -114,19 +114,28 @@ Note how many cells say **exists**. The unified engine is mostly a *deletion* pr
 
 ## 5. ml0 specifics
 
-### 5.1 Eligibility — recommendation: uniform-weight Taktikos, eta from gl0
+### 5.1 Eligibility — DECIDED direction (owner, 2026-06-11): scheduled rank-staircase ("LDD over an ordered set")
 
-Reuse the gl0 lottery code wholesale with `stake(v) = 1/|registry|` and **eta derived from the finalized gl0 eta for the epoch** (the metagraph follows gl0 anyway; inheriting entropy removes the entire eta-computation subsystem from ml0 and makes grinding require attacking gl0). LDD parameters tuned for small N (higher fA so slots rarely go empty; ψ/γ as at gl0).
+The owner's requirement: the producer should be **known beforehand** at the metagraph level (predictable cadence, minimal fork rate, fast client finality), while still inheriting fresh randomness from gl0. Private/unpredictable election buys anti-targeting in OPEN networks of anonymous stakers; a metagraph registry is public, so privacy buys nothing — only **unbiasability of the order** matters, and eta-from-gl0 provides it.
 
-Properties: solo extension is the *normal* case at N=1 and the degraded case at N>1 (a node down ⟹ other nodes win the next slots — liveness with zero membership machinery). Forks between two simultaneous winners are routine and shallow; `ChainSelection` + the gl0 anchor settle them. There is no leader to be absent; there is no round to wedge.
+**The scheme** (a known-good shape — Ouroboros-BFT's deterministic schedule, expressed as an LDD variant):
 
-The alternative — deterministic rotation `leader(s) = registry[(s + offset) mod n]` with timeout fallback — gives a predictable cadence but reintroduces a timing parameter ("how long do I wait for the scheduled producer?") which is a mini-StallDetector. Listed as open question Q1, but the lottery is recommended *because it shares 100% of the gl0 code path*.
+  - Per epoch/interval, derive the priority permutation `π = shuffle(registry(epoch), eta_gl0(epoch), intervalIndex)`.
+  - **Rank staircase**: rank-r's production window opens at `r·δ` after the parent snapshot. Rank-0 emits immediately; if silent, rank-1 emits at δ, rank-2 at 2δ, … This is exactly the LDD δ-gap threshold with the continuous ramp replaced by a staircase over the ordered set — the same `Eligibility` instance shape as gl0's snowplow, with rank in place of stake.
+  - **Policy, not validity**: "I waited my turn" is unprovable (time is local), so the ladder is a PRODUCTION policy. Validity = signed by a registry member for the interval, correct chain link. The schedule is enforced by `ChainSelection`: at equal length, prefer the lower-rank producer (and prefer the attested tip — see 5.2). A withholding rank-0 can displace rank-1's block by at most depth-1, and loses outright once the fast rail attests rank-1's block.
 
-### 5.2 Finality and the follower trust model
+The pure uniform-weight lottery (previous recommendation) remains the fallback alternative; it shares more gl0 code but gives up the known-producer property. The staircase's single new parameter δ is benign in a chain-based engine: mis-tuning causes a shallow fork, never a wedge — unlike BFT timeouts, which gate progress.
 
-- A cl1/dl1/harness reader treats ml0 ordinal N as **final** when the gl0-anchored checkpoint covers it (queryable today via the combined-checkpoint serving path). This is the same trust boundary the trust-model audit greenlit: gl0 finality + committee attestation.
-- **Soft confirmation** for low-latency UX: tip-minus-1 (or a small depth d) — readers that act on soft state accept reorg risk bounded by the anchor cadence (seconds). Existing memory rule applies: state advancement finality-gated, SC-binary confirmation not.
-- A snapshot carries **one producer signature** (registry member, eligibility-proved). Followers verify: signature by a registry member + eligibility proof + chain link. Quorum confidence comes from the checkpoint committee, not from per-snapshot multi-sig.
+Solo extension remains the N=1 normal case and the N>1 degraded case (all higher ranks silent ⟹ your window opens). Liveness requires only ONE live registry member.
+
+### 5.2 Finality — two rails, mirroring gl0; the client-latency win lives here
+
+> **ml0 finality = countersign-2/3 (fast rail) ∥ gl0-anchor (slow rail, unconditional)**
+
+- **Fast rail**: validators countersign observed tips (the `Attestation` instance — same TipAttestation machinery as gl0). A snapshot with ≥2/3-of-registry countersignatures is final for metagraph clients ~1 gossip RTT after production (~1–2s). CRITICAL INVARIANT: **production never waits for countersignatures** — votes are evidence for finality, never a precondition for progress; the moment production depends on votes, a round (and its wedge class) has been rebuilt.
+- **Slow rail**: ordinal N is final unconditionally once a committee-attested shard checkpoint covering N is embedded in a *finalized* gl0 snapshot (Slice-14 — exists). If the fast rail starves (mass validator outage), the chain still grows (staircase) and the anchor still finalizes.
+- The two rails compose with 5.1: a known producer means there is almost never a competing tip to split attestations — the fast rail stays crisp (the genesis-fork seeding bug was precisely attestation-splitting between competing tips).
+- A snapshot carries **one producer signature**; followers verify registry membership + chain link, and read quorum confidence from countersignatures (fast) or the checkpoint committee (anchored). Existing rule preserved: state advancement finality-gated, SC-binary confirmation not.
 
 ### 5.3 Joining, leaving, misbehaving — all on-chain
 
@@ -161,7 +170,7 @@ The alternative — deterministic rotation `leader(s) = registry[(s + offset) mo
 
 ## 7. Open questions for owner review
 
-1. **ml0 eligibility: uniform-VRF lottery (recommended, §5.1) vs deterministic rotation?** Lottery = maximal code reuse, no timing parameters; rotation = predictable cadence but needs a fallback timeout.
+1. ~~ml0 eligibility: lottery vs rotation~~ **RESOLVED (owner, 2026-06-11): scheduled rank-staircase with eta-from-gl0 ordering (§5.1) + countersign fast rail (§5.2).** Remaining tunable: δ (per-rank window; straw-man δ = p99 mg gossip latency × 2 ≈ 2–4s) and the per-interval reshuffle granularity (per-snapshot vs per-epoch — per-snapshot ordering uses `intervalIndex = parent ordinal`, giving every snapshot a fresh ladder).
 2. **Soft-confirmation depth at ml0** for cl1/dl1 reads before the anchor lands (d=1? d=2? tip?).
 3. **Registry bootstrap**: initial validator set in the metagraph genesis file (extends the balance-CSV pattern) — confirm.
 4. **Demotion coupling**: adopt the epoch-participating-set design as the inactivity sink at ml0 in phase 2 or defer to its own workstream?
