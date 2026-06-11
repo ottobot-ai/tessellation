@@ -109,7 +109,7 @@ const checkInitialNodeParamsNode = async (urls, nodeId) => {
   }
 }
 
-const waitForNodeParamsUpdate = async (urls, verifyFn, maxAttempts = 30, intervalMs = 5000) => {
+const waitForNodeParamsUpdate = async (urls, verifyFn, maxAttempts = 72, intervalMs = 5000) => {
   // Reactive replacement for the prior 30 × 5s wall-clock poll. We keep the same
   // 30 × 5s = 150s budget by default but drive checks off SNAPSHOT_FINALIZED kicks
   // instead — node-params updates only land at a snapshot boundary, so polling between
@@ -158,7 +158,7 @@ const getNodeParamsNodeIdVerify = async (
   expectedRewardFraction,
   expectedOrdinal,
 ) => {
-  const maxAttempts = 30;
+  const maxAttempts = 72; // 2026-06-10: 30->72 (150s->360s) — event-kicked window survives host contention (matches waitForFinality)
   const intervalMs = 5000;
   // Reactive replacement for the prior 30 × 5s wall-clock poll. Node-params updates
   // land at snapshot boundaries, so polling between snapshots is wasted work; we drive
