@@ -2236,12 +2236,22 @@ object NakamotoSyncDaemon {
                               // only now that re-exec validated the checkpoint (so a wrong-derivation envelope never inflates quorum).
                               checkpoint.committeeSignatures.toList
                                 .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId, sig)) >>
-                                // T_count_shard quorum closure: on best-tip, sign + gossip OUR own attestation so every OTHER node's
-                                // tracker crosses ⌈2·K_S/3⌉. Self-exclusion (P-11b) keeps it out of our own threshold count. `None`
+                                // T_count_shard quorum closure: sign + gossip OUR attestations so every OTHER node's tracker
+                                // crosses ⌈2·K_S/3⌉. Self-exclusion (P-11b) keeps them out of our own threshold count. `None`
                                 // emitter (numShards=1 regression bar) ⇒ no emit. Background-fire so the multi-step sign+publish
                                 // never blocks this handler (the handler is already inside an `Async.start`).
+                                //
+                                // ATTEST ON EVERY ADMISSIBLE RECEIPT, not only on becameBestTip (2026-06-11, run bc5a17r12):
+                                // the best-tip-only gate + the tip-triggered ancestor walk still missed OUT-OF-ORDER arrivals —
+                                // when ord 12 gossips in before ord 11, 12 becomes best tip while 11 is unknown (the ancestor
+                                // walk hits getByHash=None and stops), and when 11 lands later it is NOT a new best tip, so no
+                                // emit ever fires for it. Checkpoints 11/12 then sat below quorum for ~3 min (19 consecutive
+                                // embed-none ords) — the admission plateaus that expired DoubleUse's allow-spend mid-flight.
+                                // The canonical-chain walk below starts from the CURRENT best tip on every receipt and attests
+                                // anything stored + not yet self-attested, so a late-arriving parent is attested the moment it
+                                // lands. Idempotent (tracker self-record) and cheap (≤16 tracker lookups per received envelope).
                                 Async[F]
-                                  .whenA(becameBestTip) {
+                                  .whenA(true) {
                                     shardCheckpointAttestationEmitter match {
                                       case None          => Async[F].unit
                                       case Some(emitter) =>
@@ -2256,18 +2266,6 @@ object NakamotoSyncDaemon {
                                                 s"epoch=${checkpoint.epoch.value}; skipping attestation"
                                             )
                                           else {
-                                            // Resolve the parent's gl0 anchor ordinal (for the LDD slot-gap) from the chain store. Genesis
-                                            // parent (Hash.empty, not stored) ⇒ None ⇒ the emitter's `slotGapFor` handles the no-parent case.
-                                            val emitTip =
-                                              entry.chainStore.getByHash(checkpoint.parentCheckpointHash).flatMap { parentOpt =>
-                                                emitter.emit(
-                                                  checkpoint.shardId,
-                                                  checkpointHash,
-                                                  checkpoint.gl0AnchorOrdinal,
-                                                  checkpoint.epoch,
-                                                  parentOpt.map(_.signed.value.gl0AnchorOrdinal)
-                                                )
-                                              }
 
                                             // ATTEST THE CHAIN, NOT JUST THE TIP (2026-06-11, run bp4wrh5zq): members previously attested
                                             // only the checkpoint that was the best tip AT THE MOMENT IT ARRIVED. During bootstrap, nodes
@@ -2310,7 +2308,13 @@ object NakamotoSyncDaemon {
                                                     }
                                                 }
 
-                                            emitTip >> attestMissingAncestors(checkpoint.parentCheckpointHash, MaxAncestorAttestWalk)
+                                            // Walk from the CURRENT canonical tip (not the received envelope): covers the received
+                                            // checkpoint when it IS the tip, late-arriving ancestors when it is not, and any other
+                                            // unattested canonical entries in between.
+                                            entry.chainStore.bestTip.flatMap {
+                                              case None      => Async[F].unit
+                                              case Some(tip) => attestMissingAncestors(tip.hash, MaxAncestorAttestWalk)
+                                            }
                                           }
                                         }
                                     }
