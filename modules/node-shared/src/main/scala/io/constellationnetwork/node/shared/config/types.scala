@@ -389,7 +389,14 @@ object types {
     eventTriggerCooldown: FiniteDuration = FiniteDuration(5, "s"),
     eventGossipHeartbeatInterval: FiniteDuration = FiniteDuration(10, "s"),
     eventGossipPullInterval: FiniteDuration = FiniteDuration(20, "s"),
-    forkLagThreshold: Long = 10
+    forkLagThreshold: Long = 10,
+    /** INTERIM kill-switch (2026-06-11, default OFF): when false, rounds neither propose registered peers as candidates nor fold approved
+      * candidates into the facilitator base — the cohort runs a SOLO producer with correct, non-forking followers (the production gate
+      * keeps unadmitted nodes inert). Multi-facilitator admission re-enables with the unified chain-based engine
+      * (docs/nakamoto/UNIFIED-CONSENSUS-ENGINE-DESIGN.md); the BFT round machinery cannot survive an admitted-but-absent facilitator
+      * (2-facilitator rounds wedge at progress=1/2 with no working eviction — run bmnnfnao7).
+      */
+    candidateAdmissionEnabled: Boolean = false
   ) {
 
     /** Deterministic hash of consensus-critical config values.

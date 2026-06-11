@@ -632,7 +632,8 @@ object GlobalSnapshotConsensus {
           peerQualityTracker,
           tcaFilter,
           eventMempool,
-          nakamotoStateRef
+          nakamotoStateRef,
+          appConfig.snapshot.consensus.candidateAdmissionEnabled
         )
 
       stateRemover =

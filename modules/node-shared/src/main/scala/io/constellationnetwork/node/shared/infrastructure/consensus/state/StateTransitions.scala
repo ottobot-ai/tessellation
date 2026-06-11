@@ -203,33 +203,29 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
                 s"keyMatch=$keyMatch, artifactMatch=$artifactMatch, contextMatch=$contextMatch"
             ).raiseError[F, Outcome]
         }
-      // ADMISSION GATE (2026-06-11, run bimn7o09f — the ml0 cohort boot-race fork): do NOT complete the
-      // join until the consensus-agreed outcome ADMITS this node (selfId ∈ eligible ∪ approved candidates).
-      // Becoming Ready unadmitted used to let the joiner self-appoint as Leader of its own solo round and
-      // permanently fork a 2-node cohort. Raising here keeps the node in the observe/download loop: the
-      // event-loop error handler resets consensus state and transitions back to WaitingForDownload, the
-      // DownloadDaemon re-downloads (fresh outcome each iteration), and the node's advertised registration
-      // lets the incumbent fold it through `candidates` into the eligible set within a round or two — at
-      // which point this gate passes and the node joins the SHARED consensus instead of starting its own.
-      // The empty-set escape covers degenerate outcomes with no facilitator information (defensive only;
-      // a finished outcome always carries its facilitators).
+      // ADMISSION OBSERVABILITY (2026-06-11): the consensus-agreed outcome tells the joiner whether it is
+      // admitted (selfId ∈ eligible ∪ approved candidates). An UNADMITTED node may still complete the join
+      // and sit Ready — the StateCreator production gate keeps it inert (it never facilitates), so it
+      // cannot self-appoint and fork. We deliberately do NOT block the join here: an earlier iteration
+      // raised on non-admission to loop the node through recovery downloads, but in a small cohort the
+      // incumbent's rounds wedge the moment they include a facilitator that is still joining (run
+      // bmnnfnao7: 2-facilitator rounds stall at progress=1/2 forever) — the download loop then waits on
+      // snapshots the wedged chain never produces. With candidate admission disabled (interim
+      // solo-producer mode) this node remains a follower indefinitely; with the unified chain-based
+      // engine, admission becomes an on-chain registry and this log marks the wait for rotation entry.
       admitted = outcomeAdmission.admittedPeers(outcome)
       _ <-
-        if (admitted.contains(ctx.selfId) || admitted.isEmpty) Async[F].unit
-        else
-          ConsensusLog.info(
+        ConsensusLog
+          .info(
             log,
             Category.Lifecycle,
             key.toString,
             "n/a",
             LogEvent.DownloadInitDeferred,
-            "reason" -> "not-yet-admitted",
+            "reason" -> "joining-unadmitted-as-follower",
             "admitted" -> admitted.size.toString
-          ) >>
-            new Throwable(
-              s"[DownloadInit] Not yet admitted at key=$key (admitted=${admitted.size} peers, self not among them) — " +
-                s"staying in download/observe loop until the incumbent folds our registration into the eligible set"
-            ).raiseError[F, Unit]
+          )
+          .whenA(!admitted.contains(ctx.selfId) && admitted.nonEmpty)
       _ <- storage
         .trySetInitialConsensusOutcome(outcome)
         .ifM(

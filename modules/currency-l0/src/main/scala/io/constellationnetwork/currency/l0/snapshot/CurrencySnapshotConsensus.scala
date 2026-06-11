@@ -142,7 +142,8 @@ object CurrencySnapshotConsensus {
           snapshotConfig.consensus.deterministicConfigHash,
           peerQualityTracker,
           tcaFilter,
-          eventMempool
+          eventMempool,
+          snapshotConfig.consensus.candidateAdmissionEnabled
         )
 
       consensusStateRemover =

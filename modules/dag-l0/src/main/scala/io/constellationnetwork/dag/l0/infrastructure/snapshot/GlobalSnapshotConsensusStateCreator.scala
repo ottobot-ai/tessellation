@@ -48,7 +48,8 @@ object GlobalSnapshotConsensusStateCreator {
     peerQualityTracker: PeerQualityTracker[F],
     tcaFilter: TrailingCommonAncestorFilter[F],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    nakamotoStateRef: Option[Ref[F, NakamotoTriggerState]] = None
+    nakamotoStateRef: Option[Ref[F, NakamotoTriggerState]] = None,
+    candidateAdmissionEnabled: Boolean = false
   ): GlobalSnapshotConsensusStateCreator[F] = new GlobalSnapshotConsensusStateCreator[F] {
 
     val nakamotoEnabled: Boolean = nakamotoStateRef.isDefined
@@ -95,9 +96,13 @@ object GlobalSnapshotConsensusStateCreator {
         registeredCandidates <- consensusStorage.getCandidates(key.next)
         previousEligible = lastOutcome.eligibleOrFacilitators
         // getCandidates is window-matched (registered-at ≤ key); filter already-admitted peers so the
-        // Facility declaration only proposes genuinely NEW candidates.
-        candidates = Candidates(registeredCandidates.value.filterNot(previousEligible.toSet))
-        approvedCandidates = lastOutcome.finished.candidates.value
+        // Facility declaration only proposes genuinely NEW candidates. With candidate admission DISABLED
+        // (interim solo-producer mode, ConsensusConfig.candidateAdmissionEnabled) nothing is proposed or
+        // folded in — see the currency creator for rationale.
+        candidates =
+          if (candidateAdmissionEnabled) Candidates(registeredCandidates.value.filterNot(previousEligible.toSet))
+          else Candidates(Set.empty)
+        approvedCandidates = if (candidateAdmissionEnabled) lastOutcome.finished.candidates.value else List.empty[PeerId]
         seedlistPeerIds = seedlist.map(_.map(_.peerId)).getOrElse(Set.empty)
 
         filteredPreviousEligible = previousEligible

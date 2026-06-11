@@ -50,7 +50,8 @@ object CurrencySnapshotConsensusStateCreator {
     consensusConfigHash: Hash,
     peerQualityTracker: PeerQualityTracker[F],
     tcaFilter: TrailingCommonAncestorFilter[F],
-    eventMempool: EventMempool[F, CurrencySnapshotEvent, CurrencyStateKey]
+    eventMempool: EventMempool[F, CurrencySnapshotEvent, CurrencyStateKey],
+    candidateAdmissionEnabled: Boolean = false
   ): CurrencySnapshotConsensusStateCreator[F] = new CurrencySnapshotConsensusStateCreator[F] {
 
     val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
@@ -99,9 +100,14 @@ object CurrencySnapshotConsensusStateCreator {
         previousEligible = lastOutcome.eligibleOrFacilitators
         // getCandidates is window-matched (registered-at ≤ key), so already-admitted peers keep matching
         // until their registration is pruned — filter them out so the Facility declaration only proposes
-        // genuinely NEW candidates.
-        candidates = Candidates(registeredCandidates.value.filterNot(previousEligible.toSet))
-        approvedCandidates = lastOutcome.finished.candidates.value
+        // genuinely NEW candidates. With candidate admission DISABLED (the interim solo-producer mode —
+        // see ConsensusConfig.candidateAdmissionEnabled), nothing is proposed and nothing approved is
+        // folded in: the round machinery cannot survive an admitted-but-absent facilitator, so followers
+        // stay inert (production-gated) until the unified chain-based engine lands.
+        candidates =
+          if (candidateAdmissionEnabled) Candidates(registeredCandidates.value.filterNot(previousEligible.toSet))
+          else Candidates(Set.empty)
+        approvedCandidates = if (candidateAdmissionEnabled) lastOutcome.finished.candidates.value else List.empty[PeerId]
         seedlistPeerIds = seedlist.map(_.map(_.peerId)).getOrElse(Set.empty)
 
         filteredPreviousEligible = previousEligible
