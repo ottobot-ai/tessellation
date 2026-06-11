@@ -91,9 +91,22 @@ object GossipDaemon {
           Stream
             .fromQueueUnterminated(rumorQueue)
             .evalTap(logConsumption)
-            .evalFilter(validateRumor)
+            // PARALLELIZE the CPU-bound validation (2026-06-10, run b6zx4w20b). `validateRumor` runs a full
+            // Ed25519 `signedValidator.validateSignatures` per rumor and was the serial bottleneck that let the
+            // bounded rumor queue back up under the gossip firehose (the JNumber heap leak). `parEvalMap(N)` runs
+            // up to N validations concurrently but EMITS IN INPUT ORDER, so the downstream stages keep their exact
+            // prior ordering — only the pure signature check fans out. `verifyCollateral` (a per-signer collateral
+            // read) folds into the same parallel stage; both are side-effect-free w.r.t. shared mutable state.
+            // The order-sensitive stages stay strictly serial below: `tryAddRumorToStore` (dedup/store mutation)
+            // and `handleRumor` (typed dispatch into consensus). N = available processors, bounded [2, 16].
+            .parEvalMap(rumorValidationParallelism) { hashedRumor =>
+              validateRumor(hashedRumor).flatMap {
+                case false => (hashedRumor, false).pure[F]
+                case true  => verifyCollateral(hashedRumor).map(hashedRumor -> _)
+              }
+            }
+            .collect { case (hashedRumor, true) => hashedRumor }
             .evalFilter(tryAddRumorToStore)
-            .evalFilter(verifyCollateral)
             .evalMap(handleRumor)
             .handleErrorWith { err =>
               Stream.eval(logger.error(err)(s"Unexpected error in gossip")) >> Stream.raiseError(err)
@@ -101,6 +114,11 @@ object GossipDaemon {
             .compile
             .drain
         }.void
+
+      // Fan-out width for parallel rumor signature validation. Bounded so a small box isn't starved and a large
+      // one isn't over-subscribed; the work is CPU-bound Ed25519 verification.
+      private val rumorValidationParallelism: Int =
+        math.max(2, math.min(16, Runtime.getRuntime.availableProcessors()))
 
       private def logConsumption(hashedRumor: Hashed[RumorRaw]): F[Unit] =
         rumorLogger.info(

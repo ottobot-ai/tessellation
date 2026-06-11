@@ -46,8 +46,11 @@ class ConsensusRoutes[F[_]: Async: HasherSelector, Key: Order: Encoder: Decoder,
         for {
           signedRumor <- req.as[Signed[RumorRaw]]
           hashedRumor <- signedRumor.toHashed[F]
-          _ <- rumorQueue.offer(hashedRumor)
-          result <- Ok()
+          // tryOffer-DROP under overload (2026-06-10): the rumor queue is bounded. A peer-pushed rumor that can't
+          // be enqueued returns 503 so the peer backs off and re-pushes; gossip rounds also re-replay it. Avoids
+          // blocking this request handler (HTTP-thread starvation) and keeps the queue from migrating the backlog.
+          offered <- rumorQueue.tryOffer(hashedRumor)
+          result <- if (offered) Ok() else ServiceUnavailable()
         } yield result
       }
   }

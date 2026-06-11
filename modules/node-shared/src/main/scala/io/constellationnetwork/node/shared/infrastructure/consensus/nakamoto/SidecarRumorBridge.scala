@@ -77,7 +77,20 @@ object SidecarRumorBridge {
             case Right(signed) =>
               hasherSelector
                 .withCurrent(implicit hasher => signed.toHashed)
-                .flatMap(rumorQueue.offer)
+                // tryOffer-DROP, not blocking offer (2026-06-10): the rumor queue is bounded. Blocking here would
+                // stall this GossipStream drain and migrate the backlog into GossipStream's own queue. Gossip is
+                // lossy + round-replayed (GossipRoundRunner re-pulls missing rumors from peers), so dropping an
+                // inbound PEER rumor under overload is correct and self-healing — never an OOM. (Local-produced
+                // rumors use blocking offer in Gossip.spread; those must not drop.)
+                .flatMap { hashed =>
+                  rumorQueue.tryOffer(hashed).flatMap {
+                    case true => Async[F].unit
+                    case false =>
+                      logger.warn(
+                        s"Rumor queue full — dropping inbound sidecar rumor (contentType=${rumor.contentType}); will re-replay via gossip rounds"
+                      )
+                  }
+                }
                 .handleErrorWith(err => logger.warn(err)(s"Failed to hash/enqueue sidecar rumor (contentType=${rumor.contentType})"))
             case Left(err) =>
               logger.warn(s"Failed to decode sidecar rumor (contentType=${rumor.contentType}): ${err.getMessage}")

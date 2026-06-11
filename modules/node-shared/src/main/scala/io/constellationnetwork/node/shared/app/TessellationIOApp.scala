@@ -220,7 +220,7 @@ abstract class TessellationIOApp[A <: CliMethod](
                                         res <- SharedResources.make[IO](cfg, _keyPair.getPrivate, storages.session, selfId)
                                         session = Session.make[IO](storages.session, storages.node, storages.cluster)
                                         p2pClient = SharedP2PClient.make[IO](res.client, session, cfg)
-                                        queues <- SharedQueues.make[IO].asResource
+                                        queues <- SharedQueues.make[IO]().asResource
 
                                         _loggerBundle <- {
                                           val useClickHouse = layer == DagL0 || layer == DagL1
