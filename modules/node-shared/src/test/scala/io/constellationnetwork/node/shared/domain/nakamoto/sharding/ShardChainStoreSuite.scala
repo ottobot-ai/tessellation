@@ -420,4 +420,37 @@ object ShardChainStoreSuite extends MutableIOSuite {
     val empty: SortedMap[ShardId, ShardChainStore[IO]] = SortedMap.empty
     IO.pure(expect(empty.isEmpty))
   }
+
+  // ===========================================================================
+  // Out-of-order arrival (2026-06-11, run bc5a17r12): connectivity-gated bestTip
+  // ===========================================================================
+
+  test("out-of-order arrival: child before parent stays ORPHAN (no floating tip); parent arrival cascades reconnect") { hasher =>
+    implicit val h: Hasher[IO] = hasher
+    for {
+      store <- ShardChainStore.make[IO](shardZero)
+      signedA = mkSignedCheckpoint(ord = 0L, parent = Hash.empty)
+      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(0L), slot = 1L, vrfOutput = vrf(1))
+      hashA <- store.bestTip.map(_.get.hash)
+      signedB = mkSignedCheckpoint(ord = 1L, parent = hashA, peerByte = 2)
+      hashB <- h.hash(signedB.value.signingPreimage)
+      signedC = mkSignedCheckpoint(ord = 2L, parent = hashB, peerByte = 3)
+      // C gossips in FIRST (its parent B is unknown). It must be stored but must NOT become a floating tip.
+      storedC <- store.store(signedC, parentHash = hashB, shardOrdinal = ShardOrdinal(2L), slot = 3L, vrfOutput = vrf(3))
+      tipAfterC <- store.bestTip
+      orphanHeld = tipAfterC.exists(_.hash === hashA)
+      // B lands — connectivity cascades: B connects to A, C reconnects through B, the tip jumps to C.
+      storedB <- store.store(signedB, parentHash = hashA, shardOrdinal = ShardOrdinal(1L), slot = 2L, vrfOutput = vrf(2))
+      tipAfterB <- store.bestTip
+      walk <- store.walkBackTo(tipAfterB.get.hash, depth = 3L)
+    } yield
+      expect.all(
+        storedC,
+        storedB,
+        orphanHeld,
+        tipAfterB.exists(_.signed.value.shardOrdinal == ShardOrdinal(2L)),
+        walk.size == 3,
+        walk.map(_.signed.value.shardOrdinal.value) == List(2L, 1L, 0L)
+      )
+  }
 }

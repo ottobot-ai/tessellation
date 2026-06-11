@@ -169,11 +169,20 @@ object ShardChainStore {
   case class ChainState(
     byHash: Map[Hash, StoredShardCheckpoint],
     bestTipHash: Option[Hash],
-    lastFinalizedOrdinal: ShardOrdinal
+    lastFinalizedOrdinal: ShardOrdinal,
+    /** CONNECTIVITY INVARIANT (2026-06-11, run bc5a17r12): hashes whose ancestry reaches genesis (`parentHash == Hash.empty`) or the
+      * finality boundary. ONLY connected entries are eligible for `bestTip` — an out-of-order arrival (child gossips in before its parent)
+      * is stored but waits as an ORPHAN; it cannot become a floating tip with a hole beneath it (the old behavior let `compareMaxvalidTk`
+      * promote ord N+1 while ord N was unknown, which broke ancestor walks, attestation gating, and embed views). When the missing parent
+      * lands, [[byParent]] cascades connectivity to the waiting descendants and the best tip re-evaluates.
+      */
+    connected: Set[Hash],
+    /** Child index for the connectivity cascade: parentHash → stored child hashes. */
+    byParent: Map[Hash, Set[Hash]]
   )
 
   object ChainState {
-    val empty: ChainState = ChainState(Map.empty, None, ShardOrdinal.Genesis)
+    val empty: ChainState = ChainState(Map.empty, None, ShardOrdinal.Genesis, Set.empty, Map.empty)
   }
 
   /** Construct a per-shard chain store.
@@ -231,19 +240,53 @@ object ShardChainStore {
                   (state, logger.debug(s"store: duplicate hash=${snapshotHash.value.take(12)}; ignoring").as(false))
                 } else {
                   val newByHash = state.byHash + (snapshotHash -> stored)
+                  val newByParent = state.byParent.updatedWith(parentHash)(c => Some(c.getOrElse(Set.empty) + snapshotHash))
+
+                  // CONNECTIVITY: the incoming entry is connected iff its parent is genesis, a connected entry, or evicted below the
+                  // finality keep-floor (a catch-up node whose retained chain starts at the boundary). Connected entries CASCADE to any
+                  // previously-orphaned descendants waiting in `byParent`.
+                  val parentConnected: Boolean =
+                    parentHash === Hash.empty ||
+                      state.connected.contains(parentHash) ||
+                      (!state.byHash.contains(parentHash) && shardOrdinal.value <= state.lastFinalizedOrdinal.value + 1L)
+
+                  val newlyConnected: Set[Hash] =
+                    if (!parentConnected) Set.empty
+                    else {
+                      val acc = scala.collection.mutable.Set.empty[Hash]
+                      val queue = scala.collection.mutable.Queue(snapshotHash)
+                      while (queue.nonEmpty) {
+                        val h = queue.dequeue()
+                        if (!acc.contains(h)) {
+                          acc += h
+                          newByParent.getOrElse(h, Set.empty).foreach(queue.enqueue(_))
+                        }
+                      }
+                      acc.toSet
+                    }
+                  val newConnected = state.connected ++ newlyConnected
 
                   // Resolve current tip defensively — if `bestTipHash` points at a hash no longer in `byHash` (eviction race), treat as no
                   // best tip. Mirrors the `resolvedBest = state.bestTipHash.flatMap(...)` pattern in `NakamotoChainStore.store`.
                   val resolvedBest: Option[StoredShardCheckpoint] =
                     state.bestTipHash.flatMap(state.byHash.get)
 
-                  val newBestTipHash: Hash = resolvedBest match {
-                    case None => snapshotHash // first store OR stale best tip — incoming becomes the best
-                    case Some(curBest) =>
-                      if (compareMaxvalidTk(stored, curBest) > 0) snapshotHash else curBest.hash
+                  // Best tip = maxvalid-tk over CONNECTED entries only. Fold every newly-connected entry (the incoming one plus any
+                  // reconnected descendants) against the current best; an orphan store leaves the tip untouched.
+                  val newBestTipHash: Hash = {
+                    val candidates = newlyConnected.toList.flatMap(newByHash.get)
+                    val seed = resolvedBest
+                    candidates.foldLeft(seed) {
+                      case (None, cand)       => Some(cand)
+                      case (Some(best), cand) => if (compareMaxvalidTk(cand, best) > 0) Some(cand) else Some(best)
+                    } match {
+                      case Some(best) => best.hash
+                      case None       => snapshotHash // unreachable in practice: first store is genesis-connected
+                    }
                   }
 
-                  val newState = state.copy(byHash = newByHash, bestTipHash = Some(newBestTipHash))
+                  val newState =
+                    state.copy(byHash = newByHash, bestTipHash = Some(newBestTipHash), connected = newConnected, byParent = newByParent)
                   // Slice 19: emit per-shard `dag_nakamoto_shard_chain_height{shard_id}` gauge whenever the bestTip moves.
                   // The gauge follows the highest-stored-tip ord, so we only emit on the three branches where the bestTip
                   // ACTUALLY advanced (bootstrap, linear-extension, reorg). The alternate-branch case keeps the prior tip.
@@ -272,7 +315,8 @@ object ShardChainStore {
                     case (false, _) =>
                       logger
                         .debug(
-                          s"store: alternate branch shardOrdinal=${shardOrdinal.value} slot=$slot " +
+                          s"store: ${if (parentConnected) "alternate branch" else "ORPHAN (parent unknown — awaiting reconnect)"} " +
+                            s"shardOrdinal=${shardOrdinal.value} slot=$slot " +
                             s"(parent=${parentHash.value.take(8)}, not switching from currentBest)"
                         )
                         .as(true)
@@ -374,10 +418,22 @@ object ShardChainStore {
                   // If the previous best tip got pruned (fork branch losing finality), clear it so subsequent stores reseed.
                   val newBestTip = state.bestTipHash.filter(pruned.contains)
 
+                  // Keep the connectivity indices consistent with the pruned map: drop evicted hashes from `connected`
+                  // and from both sides of `byParent` (a pruned parent's surviving children stay connected — they were
+                  // marked when the parent was live, and the keep-floor rule reconnects boundary children on catch-up).
+                  val prunedConnected = state.connected.filter(pruned.contains)
+                  val prunedByParent = state.byParent.iterator.flatMap {
+                    case (parent, children) =>
+                      val kept = children.filter(pruned.contains)
+                      if (kept.isEmpty) None else Some(parent -> kept)
+                  }.toMap
+
                   val nextState = state.copy(
                     byHash = pruned,
                     bestTipHash = newBestTip,
-                    lastFinalizedOrdinal = targetOrd
+                    lastFinalizedOrdinal = targetOrd,
+                    connected = prunedConnected,
+                    byParent = prunedByParent
                   )
                   (
                     nextState,
