@@ -357,7 +357,10 @@ object Engine {
                             owner = roundData.owner,
                             SwapCancellationReason.CreatedInvalidBlock
                           )
-                        processCancellation(newState, cancellation)
+                        logger.warn(
+                          s"Swap round ${roundData.roundId} cancelled: CreatedInvalidBlock — a formed allow-spend failed re-validation " +
+                            s"against lastGlobalEpochProgress=${lastGlobalEpochProgress.show} (txs=${signedBlock.transactions.size})"
+                        ) >> processCancellation(newState, cancellation)
                       }
                     )
                 }
@@ -369,7 +372,16 @@ object Engine {
                     owner = roundData.owner,
                     SwapCancellationReason.CreatedEmptyBlock
                   )
-                processCancellation(newState, cancellation)
+                // This fires when EVERY proposed allow-spend failed validation (e.g. lastValidEpochProgress
+                // below the node's CURRENT global epoch — a stale window) — without this log the round
+                // cancels invisibly and the submitter only sees a verification timeout (2026-06-11 run
+                // bimn7o09f: 46 silent cancels while the harness polled to exhaustion).
+                logger.warn(
+                  s"Swap round ${roundData.roundId} cancelled: CreatedEmptyBlock — all proposed allow-spends failed validation " +
+                    s"against lastGlobalEpochProgress=${lastGlobalEpochProgress.show} " +
+                    s"(proposals=${roundData.peerProposals.size + 1}, txs=${(roundData.ownProposal.transactions ++ roundData.peerProposals.values
+                        .flatMap(_.transactions)).size})"
+                ) >> processCancellation(newState, cancellation)
             }
           } yield result
         case (newState, _) => ().pure[F].tupleLeft(newState)
@@ -389,7 +401,8 @@ object Engine {
       def peersToInform = clusterStorage.getResponsivePeers
         .map(_.filter(peer => deriveConsensusPeerIds(proposal).contains(peer.id)))
 
-      (cancellationMsg, peersToInform).flatMapN(broadcast(_, _))
+      logger.warn(s"Swap round ${proposal.roundId}: cannot participate, cancelling — reason=$reason") >>
+        (cancellationMsg, peersToInform).flatMapN(broadcast(_, _))
     }
 
     def sendOwnProposal(ownProposal: Proposal, peers: Set[Peer]): F[Unit] =

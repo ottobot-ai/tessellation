@@ -369,7 +369,10 @@ object Engine {
                             owner = roundData.owner,
                             TokenLockCancellationReason.CreatedInvalidBlock
                           )
-                        processCancellation(newState, cancellation)
+                        logger.warn(
+                          s"TokenLock round ${roundData.roundId} cancelled: CreatedInvalidBlock — a formed token-lock failed re-validation " +
+                            s"against lastGlobalEpochProgress=$lastGlobalEpochProgress (txs=${signedBlock.tokenLocks.size})"
+                        ) >> processCancellation(newState, cancellation)
                       }
                     )
                 }
@@ -381,7 +384,13 @@ object Engine {
                     owner = roundData.owner,
                     TokenLockCancellationReason.CreatedEmptyBlock
                   )
-                processCancellation(newState, cancellation)
+                // Same silent-cancel class as the swap Engine (2026-06-11): when every proposed
+                // token-lock fails validation (e.g. stale epoch window) the round used to vanish
+                // without a trace while the submitter polled to timeout.
+                logger.warn(
+                  s"TokenLock round ${roundData.roundId} cancelled: CreatedEmptyBlock — all proposed token-locks failed validation " +
+                    s"against lastGlobalEpochProgress=$lastGlobalEpochProgress (proposals=${roundData.peerProposals.size + 1})"
+                ) >> processCancellation(newState, cancellation)
             }
           } yield result)
         case (newState, _) => ().pure[F].tupleLeft(newState)
@@ -405,7 +414,8 @@ object Engine {
       def peersToInform = clusterStorage.getResponsivePeers
         .map(_.filter(peer => deriveConsensusPeerIds(proposal).contains(peer.id)))
 
-      (cancellationMsg, peersToInform).flatMapN(broadcast(_, _))
+      logger.warn(s"TokenLock round ${proposal.roundId}: cannot participate, cancelling — reason=$reason") >>
+        (cancellationMsg, peersToInform).flatMapN(broadcast(_, _))
     }
 
     def sendOwnProposal(ownProposal: Proposal, peers: Set[Peer]): F[Unit] =
