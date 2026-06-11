@@ -185,10 +185,10 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
   }
 
   // ============================================================================
-  // Test 2: T_count_shard self-exclusion (#133 / P-11b mirror)
+  // Test 2: T_count_shard counts self (run-10 Gap-B alignment with verifyEmbedded's distinct-signer bar)
   // ============================================================================
 
-  test("T_count_shard: self-exclusion — local node + 2 others attest → only 2 count → does not qualify (kQuorum=3)") { implicit hasher =>
+  test("T_count_shard: self counted — local node + 2 others attest → count = 3 → qualifies (kQuorum=3)") { implicit hasher =>
     val self = pid("self")
     for {
       store <- ShardChainStore.make[IO](shardZero)
@@ -198,9 +198,10 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       _ <- tracker.recordAttestation(tip.hash, self, dummyCommitteeSig) // self attests
       _ <- tracker.recordAttestation(tip.hash, pid("attester-1"), dummyCommitteeSig)
       _ <- tracker.recordAttestation(tip.hash, pid("attester-2"), dummyCommitteeSig)
-      // With self-exclusion (the default), only attester-1 and attester-2 count → count = 2 < 3 required → MinValue.
-      // Without exclusion, count would be 3 ≥ 3 → qualifies. The point of this test is to verify the #133/P-11b mirror is wired
-      // through ShardTipTracker.attestationCountFor's `excludeSelf = true` default.
+      // The trigger counts self + attester-1 + attester-2 = 3 >= 3 → qualifies. This matches the bar the embed is held to:
+      // `verifyEmbedded` counts EVERY distinct signer (producer + self + remote) against kQuorum. The old self-excluded count
+      // demanded kQuorum REMOTE attestations — unanimity at N=5/kQuorum=4 — and one slow peer stalled every embed (run-10
+      // Gap-B). Self alone still can't qualify anything at kQuorum >= 2.
       triggers <- ShardFinalityTriggers.make[IO](
         shardId = shardZero,
         kQuorum = 3,
@@ -210,13 +211,33 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       )
       _ <- triggers.advance
       result <- triggers.tCountShard.latestQualifyingOrdinal
-      // Sanity: the underlying tracker without self-exclusion would have returned 3.
       rawCount <- tracker.attestationCountFor(tip.hash, excludeSelf = false)
       excludedCount <- tracker.attestationCountFor(tip.hash, excludeSelf = true)
     } yield
-      expect.same(SnapshotOrdinal.MinValue, result) &&
+      expect.same(SnapshotOrdinal.unsafeApply(tip.signed.value.shardOrdinal.value), result) &&
         expect.same(3, rawCount) &&
         expect.same(2, excludedCount)
+  }
+
+  test("T_count_shard: self + 1 other at kQuorum=3 → count = 2 → does not qualify (self grants no shortcut)") { implicit hasher =>
+    val self = pid("self")
+    for {
+      store <- ShardChainStore.make[IO](shardZero)
+      _ <- seedChain(store, 1)
+      tip <- store.bestTip.map(_.get)
+      tracker <- ShardTipTracker.make[IO](shardZero, self)
+      _ <- tracker.recordAttestation(tip.hash, self, dummyCommitteeSig)
+      _ <- tracker.recordAttestation(tip.hash, pid("attester-1"), dummyCommitteeSig)
+      triggers <- ShardFinalityTriggers.make[IO](
+        shardId = shardZero,
+        kQuorum = 3,
+        k1Shard = 100L,
+        chainStore = store,
+        tipTracker = tracker
+      )
+      _ <- triggers.advance
+      result <- triggers.tCountShard.latestQualifyingOrdinal
+    } yield expect.same(SnapshotOrdinal.MinValue, result)
   }
 
   // ============================================================================

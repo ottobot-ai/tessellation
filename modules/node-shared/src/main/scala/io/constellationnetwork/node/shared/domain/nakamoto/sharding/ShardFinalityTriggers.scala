@@ -133,7 +133,16 @@ object ShardFinalityTriggers {
           // only the canonical chain matters for that question. A fork-branch checkpoint with K_S attestations doesn't qualify
           // anything on OUR canonical chain because it's not on it — same cross-fork filter principle as `TCountTrigger`'s
           // canonical-hash filter (lines 305-312 in that file).
-          tipTracker.attestationCountFor(tip.hash, excludeSelf = true).map { count =>
+          //
+          // SELF INCLUDED (2026-06-11, run-10 Gap-B). The count must match the bar the embed is actually held to:
+          // `verifyEmbedded` accepts on `distinctSigners >= kQuorum` counting EVERY signer (producer + self + remote), and the
+          // leader's `signaturesFor` enrichment splices all collected signatures without self-exclusion. Excluding self here made
+          // the trigger strictly harsher than the acceptance bar — at N=5/kQuorum=4 it demanded all 4 REMOTE attestations
+          // (unanimity), so one slow-delivery peer stalled every shard embed (~3 min plateaus that expired allow-spends
+          // mid-flight). The P-11b solo-self-finalize hazard doesn't arise at kQuorum >= 2 (self alone can never clear the
+          // threshold), and adoption safety never rested on this trigger — `verifyEmbedded` deterministically re-checks the
+          // wire-carried signatures on every node.
+          tipTracker.attestationCountFor(tip.hash, excludeSelf = false).map { count =>
             if (BigInt(count) >= requiredCount)
               shardOrdinalToSnapshotOrdinal(tip.signed.value.shardOrdinal)
             else SnapshotOrdinal.MinValue
