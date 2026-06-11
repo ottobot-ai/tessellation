@@ -343,6 +343,19 @@ for arg in "$@"; do
   esac
 done
 
+# Committee sizing: scale K_DRAW/K_QUORUM with the actual gl0 count unless explicitly
+# provided. The compose overlay defaults (8/6) are the 8-node testnet constants; running
+# them on a smaller cluster makes the metagraph committee-gate quorum marginal or
+# impossible (observed at --num-gl0=5: K_QUORUM=6 vs 5 attesters → ~50% gate timeouts,
+# minutes of admission latency per binary, mirror lag past allow-spend windows — run
+# bo1rv812m). Formula reproduces the 8-node defaults: draw = N, quorum = ceil(2N/3).
+if [ -n "${NUM_GL0_NODES:-}" ] && [ -z "${NAKAMOTO_COMMITTEE_K_DRAW:-}" ]; then
+  export NAKAMOTO_COMMITTEE_K_DRAW="$NUM_GL0_NODES"
+fi
+if [ -n "${NUM_GL0_NODES:-}" ] && [ -z "${NAKAMOTO_COMMITTEE_K_QUORUM:-}" ]; then
+  export NAKAMOTO_COMMITTEE_K_QUORUM=$(( (2 * NUM_GL0_NODES + 2) / 3 ))
+fi
+
 # §1.1 stake-weighted VRF: resolve --stake-dist=<spec> into NAKAMOTO_STAKE_DISTRIBUTION
 # now that NUM_GL0_NODES is known. compose-runner.sh forwards the env var to the Tier-1
 # genesis generator path (test-vectors/genesis fixtures); when unset, default CSV path is used.

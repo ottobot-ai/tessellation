@@ -67,7 +67,8 @@ object CurrencySnapshotEventsPublisherDaemon {
                 lastTriggerRef,
                 logger,
                 eventTriggerThreshold,
-                eventTriggerCooldown
+                eventTriggerCooldown,
+                allowSoloEventTrigger = !consensusConfig.candidateAdmissionEnabled
               )
           }.compile.drain
         }

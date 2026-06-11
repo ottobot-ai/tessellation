@@ -31,7 +31,8 @@ object EventTriggerGuard {
     lastTriggerRef: Ref[F, Long],
     logger: SelfAwareStructuredLogger[F],
     threshold: Int,
-    cooldown: FiniteDuration
+    cooldown: FiniteDuration,
+    allowSoloEventTrigger: Boolean = false
   ): F[Unit] =
     triggerEventConsensus match {
       case None => Async[F].unit
@@ -39,7 +40,12 @@ object EventTriggerGuard {
         for {
           lastFacCount <- getLastFacilitatorCount
           _ <-
-            if (lastFacCount > 0 && lastFacCount < 2)
+            // The solo-genesis guard exists so a lone genesis node doesn't race ahead of validators that
+            // are about to join. In interim solo-producer mode (candidate admission disabled) nobody ever
+            // joins production, so the guard only inflicts the 43s TimeTrigger floor on the cohort — which
+            // made the gl0 currency mirror lag past allow-spend validity windows (run bo1rv812m). Callers
+            // pass allowSoloEventTrigger = !candidateAdmissionEnabled.
+            if (lastFacCount > 0 && lastFacCount < 2 && !allowSoloEventTrigger)
               logger.debug(
                 s"EventTrigger skipped: last round had $lastFacCount facilitator(s), waiting for multi-node consensus"
               )
