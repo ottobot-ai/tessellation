@@ -5,6 +5,7 @@ import cats.syntax.show._
 
 import scala.collection.immutable.SortedMap
 
+import io.constellationnetwork.node.shared.infrastructure.consensus.OutcomeAdmission
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.ConsensusTrigger
 import io.constellationnetwork.schema.peer.PeerId
@@ -123,5 +124,11 @@ object schema {
       GenLens[GlobalConsensusOutcome](_.key)
     implicit val _trigger: Lens[GlobalConsensusOutcome, ConsensusTrigger] =
       GenLens[GlobalConsensusOutcome](_.finished.majorityTrigger)
+
+    /** Consensus-agreed admission set: previous eligible facilitators plus the candidates the finished round approved. Consumed by the
+      * StateCreator production gate and the StateTransitions.initFromDownload join gate (the ml0 cohort boot-race fork fix).
+      */
+    implicit val _admission: OutcomeAdmission[GlobalConsensusOutcome] =
+      OutcomeAdmission.instance(o => (o.eligibleOrFacilitators ++ o.finished.candidates.value).toSet)
   }
 }

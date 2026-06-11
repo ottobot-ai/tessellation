@@ -95,7 +95,8 @@ object ConsensusEventLoop {
     implicit _key: monocle.Lens[Outcome, Key],
     _context: monocle.Lens[Outcome, Ctx],
     _artifact: monocle.Lens[Outcome, Signed[Artifact]],
-    _trigger: monocle.Lens[Outcome, ConsensusTrigger]
+    _trigger: monocle.Lens[Outcome, ConsensusTrigger],
+    _admission: OutcomeAdmission[Outcome]
   ): F[BuiltConsensusLoop[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind]] =
     for {
       queue <- Queue.unbounded[F, ConsensusCommand]

@@ -5,11 +5,11 @@ import cats.effect.std.Random
 import cats.syntax.all._
 import cats.{Eq, Show}
 
-import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog
 import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog.{Category, Event => LogEvent}
 import io.constellationnetwork.node.shared.infrastructure.consensus.engine.ConsensusCommand._
 import io.constellationnetwork.node.shared.infrastructure.consensus.engine._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger._
+import io.constellationnetwork.node.shared.infrastructure.consensus.{ConsensusLog, OutcomeAdmission}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics.unsafeLabelName
 import io.constellationnetwork.schema.node.NodeState
@@ -47,7 +47,8 @@ class ConsensusFSM[F[_]: Async: Metrics: HasherSelector: Random, Event, Key: Eq:
   implicit outcomeKey: Lens[Outcome, Key],
   outcomeArtifact: Lens[Outcome, Signed[Artifact]],
   outcomeContext: Lens[Outcome, Ctx],
-  outcomeTrigger: Lens[Outcome, ConsensusTrigger]
+  outcomeTrigger: Lens[Outcome, ConsensusTrigger],
+  outcomeAdmission: OutcomeAdmission[Outcome]
 ) {
 
   private val rumorHandler = new RumorHandler[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind](ctx)

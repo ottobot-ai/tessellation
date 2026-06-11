@@ -365,8 +365,16 @@ object ConsensusStorage {
         def getCandidates(key: Key): F[Candidates] =
           peerRegistrationsR.get.map { peerRegistrations =>
             peerRegistrations.toList.mapFilter {
-              case (peerId, at) if key === at => peerId.some
-              case _                          => none[PeerId]
+              // WINDOW match, not exact-key (2026-06-11, run bimn7o09f): a registration at key K makes the
+              // peer a candidate for EVERY round ≥ K. The previous `key === at` required the incumbent's
+              // round key to land EXACTLY on the registered key — but both pointers advance independently,
+              // so the exact match was a lottery that never hit: registrations fired
+              // (dag_consensus_peer_registered_total > 0) yet candidates=0 at every facilitator selection,
+              // leaving a 2-node ml0 cohort permanently forked into two solo self-signed chains. Stale
+              // registrations are bounded by pruneStalePeerRegistrations (peer departure) and by the
+              // creator filtering already-eligible peers out of the proposed candidate set.
+              case (peerId, at) if at <= key => peerId.some
+              case _                         => none[PeerId]
             }
           }.map(c => Candidates(c.toSet))
 

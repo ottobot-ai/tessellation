@@ -60,11 +60,33 @@ object CurrencySnapshotConsensusStateCreator {
       lastOutcome: CurrencyConsensusOutcome,
       maybeTrigger: Option[ConsensusTrigger],
       resources: ConsensusResources[CurrencySnapshotArtifact, CurrencyConsensusKind]
-    ): F[StateCreateResult] =
-      consensusStorage
-        .condModifyState(key)(toCreateStateFn(facilitateConsensus(key, lastOutcome, maybeTrigger, resources)))
-        .flatMap(evalEffect)
-        .flatTap(logIfCreated)
+    ): F[StateCreateResult] = {
+      // ADMISSION GATE (2026-06-11, run bimn7o09f — the ml0 cohort boot-race fork): only a node the
+      // consensus-agreed lastOutcome ADMITS (previous eligible set or the finished round's approved
+      // candidates) may facilitate a round. The facilitator base below appends selfId, so without this
+      // gate a joiner that reached Ready mid-round self-appointed as Leader of its own solo round and
+      // permanently forked a 2-node cohort (divergent facilitatorsHash → mutual eviction → two
+      // self-signed chains; a restart re-forked within one round). The empty-escape keeps the
+      // genesis/own-chain-start path producing (its own outcome admits it; a degenerate empty set must
+      // not wedge the chain).
+      val previousEligible = lastOutcome.eligibleOrFacilitators
+      val approvedCandidates = lastOutcome.finished.candidates.value
+      val selfAdmitted = previousEligible.contains(selfId) || approvedCandidates.contains(selfId) || previousEligible.isEmpty
+
+      if (!selfAdmitted)
+        logger
+          .info(
+            s"Not facilitating consensus at key=$key: self not admitted by lastOutcome " +
+              s"(eligible=${previousEligible.size}, approvedCandidates=${approvedCandidates.size}) — " +
+              s"observing until the incumbent folds our registration into the eligible set"
+          )
+          .as(none[CurrencySnapshotConsensusState])
+      else
+        consensusStorage
+          .condModifyState(key)(toCreateStateFn(facilitateConsensus(key, lastOutcome, maybeTrigger, resources)))
+          .flatMap(evalEffect)
+          .flatTap(logIfCreated)
+    }
 
     private def facilitateConsensus(
       key: CurrencySnapshotKey,
@@ -73,8 +95,12 @@ object CurrencySnapshotConsensusStateCreator {
       resources: ConsensusResources[CurrencySnapshotArtifact, CurrencyConsensusKind]
     ): F[(CurrencySnapshotConsensusState, F[Unit])] =
       for {
-        candidates <- consensusStorage.getCandidates(key.next)
+        registeredCandidates <- consensusStorage.getCandidates(key.next)
         previousEligible = lastOutcome.eligibleOrFacilitators
+        // getCandidates is window-matched (registered-at ≤ key), so already-admitted peers keep matching
+        // until their registration is pruned — filter them out so the Facility declaration only proposes
+        // genuinely NEW candidates.
+        candidates = Candidates(registeredCandidates.value.filterNot(previousEligible.toSet))
         approvedCandidates = lastOutcome.finished.candidates.value
         seedlistPeerIds = seedlist.map(_.map(_.peerId)).getOrElse(Set.empty)
 

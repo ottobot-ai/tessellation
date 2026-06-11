@@ -7,11 +7,11 @@ import cats.{Eq, Show}
 
 import scala.concurrent.duration._
 
-import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog
 import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog.{Category, Event => LogEvent}
 import io.constellationnetwork.node.shared.infrastructure.consensus.engine.ConsensusCommand._
 import io.constellationnetwork.node.shared.infrastructure.consensus.message.GetConsensusOutcomeRequest
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger._
+import io.constellationnetwork.node.shared.infrastructure.consensus.{ConsensusLog, OutcomeAdmission}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics.unsafeLabelName
 import io.constellationnetwork.schema.node.NodeState
@@ -71,7 +71,8 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
   implicit outcomeKey: Lens[Outcome, Key],
   outcomeArtifact: Lens[Outcome, Signed[Artifact]],
   outcomeContext: Lens[Outcome, Ctx],
-  outcomeTrigger: Lens[Outcome, ConsensusTrigger]
+  outcomeTrigger: Lens[Outcome, ConsensusTrigger],
+  outcomeAdmission: OutcomeAdmission[Outcome]
 ) {
 
   import ctx.{advancer, logger => log, queue, remover, storage, updater}
@@ -202,6 +203,33 @@ class StateTransitions[F[_]: Async: Random: Metrics, Event, Key: Eq: Show, Artif
                 s"keyMatch=$keyMatch, artifactMatch=$artifactMatch, contextMatch=$contextMatch"
             ).raiseError[F, Outcome]
         }
+      // ADMISSION GATE (2026-06-11, run bimn7o09f — the ml0 cohort boot-race fork): do NOT complete the
+      // join until the consensus-agreed outcome ADMITS this node (selfId ∈ eligible ∪ approved candidates).
+      // Becoming Ready unadmitted used to let the joiner self-appoint as Leader of its own solo round and
+      // permanently fork a 2-node cohort. Raising here keeps the node in the observe/download loop: the
+      // event-loop error handler resets consensus state and transitions back to WaitingForDownload, the
+      // DownloadDaemon re-downloads (fresh outcome each iteration), and the node's advertised registration
+      // lets the incumbent fold it through `candidates` into the eligible set within a round or two — at
+      // which point this gate passes and the node joins the SHARED consensus instead of starting its own.
+      // The empty-set escape covers degenerate outcomes with no facilitator information (defensive only;
+      // a finished outcome always carries its facilitators).
+      admitted = outcomeAdmission.admittedPeers(outcome)
+      _ <-
+        if (admitted.contains(ctx.selfId) || admitted.isEmpty) Async[F].unit
+        else
+          ConsensusLog.info(
+            log,
+            Category.Lifecycle,
+            key.toString,
+            "n/a",
+            LogEvent.DownloadInitDeferred,
+            "reason" -> "not-yet-admitted",
+            "admitted" -> admitted.size.toString
+          ) >>
+            new Throwable(
+              s"[DownloadInit] Not yet admitted at key=$key (admitted=${admitted.size} peers, self not among them) — " +
+                s"staying in download/observe loop until the incumbent folds our registration into the eligible set"
+            ).raiseError[F, Unit]
       _ <- storage
         .trySetInitialConsensusOutcome(outcome)
         .ifM(

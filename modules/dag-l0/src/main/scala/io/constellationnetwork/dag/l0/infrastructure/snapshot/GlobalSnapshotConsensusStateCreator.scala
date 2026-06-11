@@ -60,11 +60,30 @@ object GlobalSnapshotConsensusStateCreator {
       lastOutcome: GlobalConsensusOutcome,
       maybeTrigger: Option[ConsensusTrigger],
       resources: ConsensusResources[GlobalSnapshotArtifact, GlobalConsensusKind]
-    ): F[StateCreateResult] =
-      consensusStorage
-        .condModifyState(key)(toCreateStateFn(facilitateConsensus(key, lastOutcome, maybeTrigger, resources)))
-        .flatMap(evalEffect)
-        .flatTap(logIfCreated)
+    ): F[StateCreateResult] = {
+      // ADMISSION GATE (2026-06-11): only a node the consensus-agreed lastOutcome ADMITS (previous
+      // eligible set or the finished round's approved candidates) may facilitate a round. Mirrors the
+      // currency-l0 creator — the facilitator base appends selfId, so an unadmitted joiner reaching
+      // Ready mid-round would self-appoint as Leader of a solo round and fork the cohort (observed on
+      // the 2-node ml0 cohorts, run bimn7o09f). Empty-escape keeps genesis/own-chain-start producing.
+      val previousEligible = lastOutcome.eligibleOrFacilitators
+      val approvedCandidates = lastOutcome.finished.candidates.value
+      val selfAdmitted = previousEligible.contains(selfId) || approvedCandidates.contains(selfId) || previousEligible.isEmpty
+
+      if (!selfAdmitted)
+        logger
+          .info(
+            s"Not facilitating consensus at key=$key: self not admitted by lastOutcome " +
+              s"(eligible=${previousEligible.size}, approvedCandidates=${approvedCandidates.size}) — " +
+              s"observing until the incumbent folds our registration into the eligible set"
+          )
+          .as(none[GlobalSnapshotConsensusState])
+      else
+        consensusStorage
+          .condModifyState(key)(toCreateStateFn(facilitateConsensus(key, lastOutcome, maybeTrigger, resources)))
+          .flatMap(evalEffect)
+          .flatTap(logIfCreated)
+    }
 
     private def facilitateConsensus(
       key: GlobalSnapshotKey,
@@ -73,8 +92,11 @@ object GlobalSnapshotConsensusStateCreator {
       resources: ConsensusResources[GlobalSnapshotArtifact, GlobalConsensusKind]
     ): F[(GlobalSnapshotConsensusState, F[Unit])] =
       for {
-        candidates <- consensusStorage.getCandidates(key.next)
+        registeredCandidates <- consensusStorage.getCandidates(key.next)
         previousEligible = lastOutcome.eligibleOrFacilitators
+        // getCandidates is window-matched (registered-at ≤ key); filter already-admitted peers so the
+        // Facility declaration only proposes genuinely NEW candidates.
+        candidates = Candidates(registeredCandidates.value.filterNot(previousEligible.toSet))
         approvedCandidates = lastOutcome.finished.candidates.value
         seedlistPeerIds = seedlist.map(_.map(_.peerId)).getOrElse(Set.empty)
 
