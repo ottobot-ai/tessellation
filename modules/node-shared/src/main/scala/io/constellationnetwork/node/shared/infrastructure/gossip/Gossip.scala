@@ -2,7 +2,7 @@ package io.constellationnetwork.node.shared.infrastructure.gossip
 
 import java.security.KeyPair
 
-import cats.effect.std.Queue
+import cats.effect.std.{Queue, Supervisor}
 import cats.effect.{Async, Ref}
 import cats.syntax.all._
 
@@ -28,7 +28,7 @@ object Gossip {
     selfId: PeerId,
     generation: Generation,
     keyPair: KeyPair
-  ): F[GossipAlg[F]] =
+  )(implicit S: Supervisor[F]): F[GossipAlg[F]] =
     for {
       counter <- Ref.of[F, Counter](Counter.MinValue)
       directPushRef <- Ref.of[F, Option[GossipAlg.DirectPushFn[F]]](None)
@@ -78,7 +78,19 @@ object Gossip {
           for {
             signedRumor <- rumor.sign(keyPair)
             hashedRumor <- signedRumor.toHashed
-            _ <- rumorQueue.offer(hashedRumor)
+            // NEVER block the caller on a full rumor queue (2026-06-11, run b0xkqny6n post-mortem).
+            // `spread` is called from many fibers — including, transitively, fibers in the
+            // GossipDaemon CONSUMER pipeline (rumor handlers) and the l1-event publisher daemon.
+            // A plain blocking `offer` on the bounded queue turns queue-full into a cluster-wide
+            // self-deadlock: the consumer blocks offering into its own queue, the queue never
+            // drains, and every other `spread` caller wedges behind it (observed: all 5 gl0
+            // nodes' rumor publishing flatlined at 04:23:12 and never recovered, killing all
+            // l1-event intake for the rest of the run). Local rumors must not DROP either
+            // (own-rumor counters must stay gap-free), so fall back to a supervised background
+            // offer: the caller proceeds immediately and the parked offer completes as soon as
+            // the consumer frees a slot.
+            offered <- rumorQueue.tryOffer(hashedRumor)
+            _ <- if (offered) Async[F].unit else S.supervise(rumorQueue.offer(hashedRumor)).void
             _ <- metrics.updateRumorsSpread(signedRumor)
             _ <- logSpread(hashedRumor)
             maybeSidecarFn <- sidecarPublishRef.get

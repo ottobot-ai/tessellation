@@ -159,8 +159,14 @@ object GossipDaemon {
             rumorStorage
               .addPeerRumorIfConsecutive(hashedRumor.signed.asInstanceOf[Signed[PeerRumorRaw]])
               .flatTap { result =>
-                rumorQueue
-                  .offer(hashedRumor)
+                // Re-queue an out-of-order OWN rumor — but NEVER with a blocking offer
+                // (2026-06-11): this runs ON the consumer fiber, so a blocking offer into
+                // the bounded queue it is draining deadlocks the whole gossip pipeline the
+                // moment the queue is full (consumer waits for space only the consumer can
+                // free). The supervised background offer keeps the no-drop guarantee for own
+                // rumors (counter chain must stay gap-free) without ever parking the consumer.
+                S.supervise(rumorQueue.offer(hashedRumor))
+                  .void
                   .whenA(
                     result === CounterTooHigh && rumor.origin === selfId && rumor.ordinal.generation === generation
                   )
