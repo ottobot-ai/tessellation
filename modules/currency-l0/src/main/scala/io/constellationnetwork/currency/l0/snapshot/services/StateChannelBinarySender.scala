@@ -226,9 +226,14 @@ object StateChannelBinarySender {
       //
       // The oldest PENDING binary is by construction the child of gl0's last-confirmed tip, so the
       // consumable set is exactly the oldest-first contiguous prefix — send that, sized to outrun
-      // production during one confirmation round trip (floor 16 ≈ 2 min of 9s-cadence production).
-      // Re-sending binaries gl0 already buffered is cheap: the shard binary buffer dedupes by hash.
-      val retryBatchFloor = 16
+      // production during one confirmation round trip. Run bfcnpd5vc measured the consequence of a
+      // small floor: checkpoint windows are capped at exactly this batch size (the producer can only
+      // window what has been SENT contiguously), so floor 16 → 16-binary windows at ~1 adoption/min =
+      // +9/min catch-up — the genesis backlog took 10+ min to drain and allow-spend windows expired
+      // mid-lag (NoActiveAllowSpend). Floor 64 → 64-binary windows ≈ ~10× production, draining any
+      // warmup backlog in ~1-2 adoptions. The burst only fires while pending > floor (transient);
+      // re-sending binaries gl0 already buffered is cheap: the shard binary buffer dedupes by hash.
+      val retryBatchFloor = 64
       val effectiveCap = Math.max(cap, retryBatchFloor)
       tracker.getPendingToRetry(effectiveCap * 16).flatMap { allPending =>
         val sortedAsc = allPending.sortBy(_.currencySnapshotOrdinal.value.value)
