@@ -2164,6 +2164,11 @@ object NakamotoSyncDaemon {
     *
     * `None` deps (numShards=1, regression bar) ⇒ single debug log + drop.
     */
+  /** Bound on the retroactive ancestor-attestation walk (chain-not-tip, 2026-06-11). Genesis stalls involve a handful of ordinals; anything
+    * deeper is covered progressively by subsequent best-tip events.
+    */
+  private val MaxAncestorAttestWalk: Int = 16
+
   private def handleShardCheckpoint[F[_]: Async: JsonSerializer: HasherSelector: Metrics](
     cp: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar.ShardCheckpointWire,
     shardAcceptanceDeps: Option[
@@ -2250,18 +2255,63 @@ object NakamotoSyncDaemon {
                                               s"🧩 ShardCheckpoint attest: self not in committee for shard=${checkpoint.shardId.value.value} " +
                                                 s"epoch=${checkpoint.epoch.value}; skipping attestation"
                                             )
-                                          else
+                                          else {
                                             // Resolve the parent's gl0 anchor ordinal (for the LDD slot-gap) from the chain store. Genesis
                                             // parent (Hash.empty, not stored) ⇒ None ⇒ the emitter's `slotGapFor` handles the no-parent case.
-                                            entry.chainStore.getByHash(checkpoint.parentCheckpointHash).flatMap { parentOpt =>
-                                              emitter.emit(
-                                                checkpoint.shardId,
-                                                checkpointHash,
-                                                checkpoint.gl0AnchorOrdinal,
-                                                checkpoint.epoch,
-                                                parentOpt.map(_.signed.value.gl0AnchorOrdinal)
-                                              )
-                                            }
+                                            val emitTip =
+                                              entry.chainStore.getByHash(checkpoint.parentCheckpointHash).flatMap { parentOpt =>
+                                                emitter.emit(
+                                                  checkpoint.shardId,
+                                                  checkpointHash,
+                                                  checkpoint.gl0AnchorOrdinal,
+                                                  checkpoint.epoch,
+                                                  parentOpt.map(_.signed.value.gl0AnchorOrdinal)
+                                                )
+                                              }
+
+                                            // ATTEST THE CHAIN, NOT JUST THE TIP (2026-06-11, run bp4wrh5zq): members previously attested
+                                            // only the checkpoint that was the best tip AT THE MOMENT IT ARRIVED. During bootstrap, nodes
+                                            // join the shard topics staggered over minutes while the producer keeps extending, so early
+                                            // shardOrds scroll past before most members are listening — the genesis checkpoint sat at
+                                            // signers=1 for 7+ minutes, and because gl0 embedding is ancestor-first, the WHOLE shard chain's
+                                            // admission was blocked behind the under-attested ancestor (the run-6 DoubleUse spend-action
+                                            // timeout). On becoming best tip, also attest every stored canonical ancestor this node has not
+                                            // yet attested (walk bounded; per-ancestor committee gate on the ancestor's OWN epoch). More
+                                            // attestations are always safe — verifiers dedupe by peerId and check membership — and quorum
+                                            // closes retroactively, unblocking ancestor-first embedding.
+                                            def attestMissingAncestors(h: Hash, remaining: Int): F[Unit] =
+                                              if (remaining <= 0 || h === Hash.empty) Async[F].unit
+                                              else
+                                                entry.chainStore.getByHash(h).flatMap {
+                                                  case None => Async[F].unit // deeper than our stored view — stop
+                                                  case Some(anc) =>
+                                                    val ancCp = anc.signed.value
+                                                    entry.tipTracker.signaturesFor(anc.hash).flatMap { sigs =>
+                                                      Async[F].whenA(!sigs.contains(selfId)) {
+                                                        deps.committeeMembership(ancCp.shardId, ancCp.epoch).flatMap { ancCommittee =>
+                                                          Async[F].whenA(ancCommittee.contains(selfId)) {
+                                                            entry.chainStore.getByHash(ancCp.parentCheckpointHash).flatMap { gpOpt =>
+                                                              logger.info(
+                                                                s"🧩 ShardCheckpoint attest-ancestor: shard=${ancCp.shardId.value.value} " +
+                                                                  s"shardOrd=${ancCp.shardOrdinal.value} gl0Anchor=${ancCp.gl0AnchorOrdinal.value.value} " +
+                                                                  s"— retroactive attestation (chain-not-tip)"
+                                                              ) >>
+                                                                emitter.emit(
+                                                                  ancCp.shardId,
+                                                                  anc.hash,
+                                                                  ancCp.gl0AnchorOrdinal,
+                                                                  ancCp.epoch,
+                                                                  gpOpt.map(_.signed.value.gl0AnchorOrdinal)
+                                                                )
+                                                            }
+                                                          }
+                                                        }
+                                                      } >> attestMissingAncestors(ancCp.parentCheckpointHash, remaining - 1)
+                                                    }
+                                                }
+
+                                            emitTip >> attestMissingAncestors(checkpoint.parentCheckpointHash, MaxAncestorAttestWalk)
+                                          }
                                         }
                                     }
                                   }
