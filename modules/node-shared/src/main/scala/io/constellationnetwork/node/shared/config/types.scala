@@ -101,6 +101,15 @@ object types {
     // Drives the gl0 SnapshotLeaderLoop slot tick AND the per-slot shard-checkpoint lottery. Migrated from the
     // `NAKAMOTO_SLOT_DURATION_MS` sys.env read in SnapshotLeaderLoop (project rule: HOCON over scattered env reads).
     slotDurationMs: PosLong,
+    // gl0 LDD snowplow — consensus-critical; defaults mirror LddConfig.Default. Converted once via
+    // LddConfig.fromDoubles at the wiring site (exact rationals on the consensus path from there on).
+    ldd: GlobalLddConfig,
+    slotsPerEpoch: PosLong,
+    // Coordinated genesis time (epoch ms); 0 = unset -> local-clock fallback with WARN (solo dev only).
+    genesisTimeMs: NonNegLong,
+    genesisEtaSeed: String,
+    // Snowball decision margin (beta) for the attestation accumulator.
+    snowballBeta: PosInt,
     // #259 active-recovery: caps on the metagraph orphan buffer + recent-admission cache. Migrated from the
     // `NAKAMOTO_ORPHAN_BUFFER_CAP` / `NAKAMOTO_RECENT_ADMIT_CAP` env reads to typed HOCON (project rule: no scattered
     // sys.env). `recentAdmitCap` is kept proportionally larger (4×) — see `MetagraphOrphanBuffer.DefaultAdmissionsCap`.
@@ -138,6 +147,14 @@ object types {
     def keepDepthBehindFinalized(env: AppEnvironment): PosLong =
       PosLong.unsafeFrom(100L * confirmationDepthK(env).value)
   }
+
+  /** HOCON shape for the gl0 LDD snowplow (see [[NakamotoConfig.ldd]]). */
+  case class GlobalLddConfig(
+    cutoff: Int = 15,
+    offset: Int = 1,
+    baseline: Double = 0.05,
+    amplitude: Double = 0.5
+  )
 
   object NakamotoConfig {
     // Neutral fallback for `confirmationDepthK(env)` when an environment is missing from the HOCON block — the dev default (32).

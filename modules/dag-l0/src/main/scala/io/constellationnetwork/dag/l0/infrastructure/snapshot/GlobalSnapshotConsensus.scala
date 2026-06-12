@@ -101,8 +101,10 @@ object GlobalSnapshotConsensus {
     * Future work: derive from the genesis snapshot itself so validators discover it from the chain instead of needing the env var. See task
     * #2 / NAKAMOTO-PLAN.md.
     */
-  val nakamotoGenesisTimeMs: Long =
-    sys.env.get("NAKAMOTO_GENESIS_TIME_MS").flatMap(_.toLongOption).getOrElse(System.currentTimeMillis())
+  // Genesis time now lives in typed HOCON (`nakamoto.genesis-time-ms`, env override at the conf layer) and is
+  // resolved ONCE inside `make` via Clock[F].realTime when unset (solo-dev fallback, WARN) — the prior module-level
+  // `sys.env` + `System.currentTimeMillis()` val was both an idiom violation and an eager class-load clock read
+  // (2026-06-12 idiom audit, items #2/#3).
 
   /** §3 NIPoPoW genesis eta — Blake2b-256 digest of a fixed domain string. 32 bytes; used to seed `EtaCalculation` for period 0 (and as the
     * empty-chain-walk fallback at every higher period, incl. the COMPUTED period 1, #259) and as the bootstrap fall-through for
@@ -615,9 +617,22 @@ object GlobalSnapshotConsensus {
       tcaFilter = TrailingCommonAncestorFilter.make[F]
 
       // In Nakamoto mode, create state ref for VRF trigger daemon
+      resolvedGenesisTimeMs <- {
+        val configured = sharedCfg.nakamoto.genesisTimeMs.value
+        if (configured > 0L) Async[F].pure(configured)
+        else
+          cats.effect.Clock[F].realTime.map(_.toMillis).flatTap { fallback =>
+            org.typelevel.log4cats.slf4j.Slf4jLogger
+              .getLoggerFromName[F]("NakamotoConsensus")
+              .warn(
+                s"nakamoto.genesis-time-ms UNSET — falling back to local wall clock ($fallback). " +
+                  "Solo-dev only: multi-node clusters MUST configure an identical genesis time or slot indices diverge."
+              )
+          }
+      }.toResource
       nakamotoStateRef <- {
-        val genesisEta = sys.env.get("NAKAMOTO_GENESIS_ETA").map(_.getBytes).getOrElse("tessellation-nakamoto-genesis".getBytes)
-        Ref.of[F, NakamotoTriggerState](NakamotoTriggerState.initial(nakamotoGenesisTimeMs, genesisEta)).map(Some(_))
+        val genesisEta = sharedCfg.nakamoto.genesisEtaSeed.getBytes
+        Ref.of[F, NakamotoTriggerState](NakamotoTriggerState.initial(resolvedGenesisTimeMs, genesisEta)).map(Some(_))
       }.toResource
 
       stateCreator =
@@ -704,24 +719,13 @@ object GlobalSnapshotConsensus {
       // Nakamoto LDD + VRF config. Env vars are typed Double for backwards-compatible config; we lock
       // them into Ratio at boot via `Ratio.apply(double, prec)` so the threshold computation is exact
       // and reproducible across all JVMs/CPUs.
-      lddConfig = {
-        val default = io.constellationnetwork.schema.nakamoto.LddConfig.Default
-        io.constellationnetwork.schema.nakamoto.LddConfig(
-          lddCutoff = sys.env.get("NAKAMOTO_LDD_CUTOFF").flatMap(_.toIntOption).getOrElse(default.lddCutoff),
-          offset = sys.env.get("NAKAMOTO_LDD_OFFSET").flatMap(_.toIntOption).getOrElse(default.offset),
-          baselineDifficulty = sys.env
-            .get("NAKAMOTO_LDD_BASELINE")
-            .flatMap(_.toDoubleOption)
-            .map(io.constellationnetwork.numerics.Ratio(_, io.constellationnetwork.schema.nakamoto.LddConfig.DoubleParsePrecision))
-            .getOrElse(default.baselineDifficulty),
-          amplitude = sys.env
-            .get("NAKAMOTO_LDD_AMPLITUDE")
-            .flatMap(_.toDoubleOption)
-            .map(io.constellationnetwork.numerics.Ratio(_, io.constellationnetwork.schema.nakamoto.LddConfig.DoubleParsePrecision))
-            .getOrElse(default.amplitude)
-        )
-      }
-      slotsPerEpoch = sys.env.get("NAKAMOTO_SLOTS_PER_EPOCH").flatMap(_.toLongOption).getOrElse(60L)
+      lddConfig = io.constellationnetwork.schema.nakamoto.LddConfig.fromDoubles(
+        lddCutoff = sharedCfg.nakamoto.ldd.cutoff,
+        offset = sharedCfg.nakamoto.ldd.offset,
+        baselineDifficulty = sharedCfg.nakamoto.ldd.baseline,
+        amplitude = sharedCfg.nakamoto.ldd.amplitude
+      )
+      slotsPerEpoch = sharedCfg.nakamoto.slotsPerEpoch.value
       // R = eta-rotation period, now DERIVED in `NakamotoConfig` as `round(3.03·k₁)` from the single
       // `nakamoto.confirmation-depth-k` knob (Ouroboros: first-2/3 nonce + last-1/3 ≥ k₁ stability; .03 margin).
       // Rotation is keyed on **ordinal**, not slot — slots are LDD-paced and lumpy; ordinals are 1:1 with
@@ -736,7 +740,7 @@ object GlobalSnapshotConsensus {
       // escaped via `.allocated` and leaked across test restarts / shutdown.
       _ <- {
 
-        val pureGenesisTimeMs = nakamotoGenesisTimeMs
+        val pureGenesisTimeMs = resolvedGenesisTimeMs
         for {
           nakLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("NakamotoConsensus").pure[F].toResource
           _ <- nakLogger
@@ -800,7 +804,9 @@ object GlobalSnapshotConsensus {
             .map(_.collect { case e if !e.alias.exists(_.value.value == "metagraph-op") => e.peerId })
             .getOrElse(Set(selfId))
           _ <- stakeRegistry.updateValidators(validatorPeers).toResource
-          tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker.make[F](stakeRegistry).toResource
+          tipTracker <- io.constellationnetwork.node.shared.domain.nakamoto.TipTracker
+            .make[F](stakeRegistry, snowballBeta = sharedCfg.nakamoto.snowballBeta.value)
+            .toResource
           // Slice S3: committee sortition + per-binary attestation aggregator. The sortition is a
           // stateless function; the aggregator holds the per-`(metagraph, parent, binary)` tally
           // until `pruneParents` is called from the finality hook. The committee DRAW target (kDraw)

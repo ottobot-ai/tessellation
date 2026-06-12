@@ -97,8 +97,7 @@ object SnowballAccumulator {
     * Override via env `NAKAMOTO_SNOWBALL_BETA`. Smaller β decides faster but tolerates a higher noise envelope (proposal §3.4 — Snowball at
     * K=3/β=10 leaks 31 % under split_honest because the per-color accumulator is at noise floor; β=10 at K=8 is the structural fix).
     */
-  val Beta: Int =
-    sys.env.get("NAKAMOTO_SNOWBALL_BETA").flatMap(_.toIntOption).getOrElse(10)
+  val Beta: Int = 10 // default; production value flows from HOCON `nakamoto.snowball-beta` via TipTracker.make
 
   /** K — peer-sample size per cascade tick. Not used by this accumulator directly (the upstream cascade in §2.2 of the proposal samples K
     * peers per Δ); exposed here so the leader loop can read both K and β from the same configuration surface.
@@ -108,8 +107,7 @@ object SnowballAccumulator {
     *
     * Override via env `NAKAMOTO_SNOWBALL_K`.
     */
-  val K: Int =
-    sys.env.get("NAKAMOTO_SNOWBALL_K").flatMap(_.toIntOption).getOrElse(8)
+  val K: Int = 8 // GPU-sim-locked constant; moves to HOCON when the upstream cascade consumes it
 
   /** Alpha (α) — per-round α-majority recruitment threshold (out of K) in the upstream cascade. Not used by this accumulator directly.
     * Exposed for cluster-wide configuration parity.
@@ -118,8 +116,7 @@ object SnowballAccumulator {
     *
     * Override via env `NAKAMOTO_SNOWBALL_ALPHA`.
     */
-  val Alpha: Int =
-    sys.env.get("NAKAMOTO_SNOWBALL_ALPHA").flatMap(_.toIntOption).getOrElse(5)
+  val Alpha: Int = 5 // GPU-sim-locked constant; moves to HOCON when the upstream cascade consumes it
 
   /** Mutable internal state — kept in a single `Ref` so the decision evaluation can see a consistent pair-snapshot of `accum` + `decided` +
     * `lastByPeer`. The per-ordinal slice is a `Map[Hash, Int]` of distinct-peer counts.

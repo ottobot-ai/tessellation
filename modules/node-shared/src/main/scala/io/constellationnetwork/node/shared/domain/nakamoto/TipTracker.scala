@@ -152,8 +152,13 @@ object TipTracker {
       .flatMap(_.toLongOption)
       .getOrElse(60000L)
 
-  def make[F[_]: Sync: Metrics](stakeRegistry: StakeRegistry[F]): F[TipTracker[F]] =
-    SnowballAccumulator.make[F]().flatMap { snowball =>
+  def make[F[_]: Sync: Metrics](
+    stakeRegistry: StakeRegistry[F],
+    // Snowball decision margin (beta) — HOCON `nakamoto.snowball-beta` at the production wiring site; the default keeps
+    // existing test call sites at the GPU-sim-locked production point.
+    snowballBeta: Int = SnowballAccumulator.Beta
+  ): F[TipTracker[F]] =
+    SnowballAccumulator.make[F](snowballBeta).flatMap { snowball =>
       makeWithAccumulator(stakeRegistry, snowball)
     }
 
