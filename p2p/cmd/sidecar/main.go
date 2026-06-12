@@ -321,7 +321,14 @@ func main() {
 // done. See task #196.
 func startOutboxRepublisher(ctx context.Context, node *gossip.Node, ob *outbox.Outbox, interval time.Duration) {
 	go func() {
-		ticker := time.NewTicker(interval)
+		// Tick at interval/2, not interval: DueForRepublish requires
+		// age >= interval and MarkRepublished stamps AFTER the publish, so a
+		// ticker at exactly `interval` always finds entries a hair younger
+		// than the threshold and they slip to the NEXT tick — observed as
+		// 2×interval (60s for the 30s default) effective republish latency
+		// (task #40). Half-interval ticks bound worst-case latency at ~1.5×
+		// interval while DueForRepublish still rate-limits actual publishes.
+		ticker := time.NewTicker(interval / 2)
 		defer ticker.Stop()
 		for {
 			select {

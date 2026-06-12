@@ -2,6 +2,7 @@ package gossip
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
 	pubsub "github.com/libp2p/go-libp2p-pubsub"
+	pubsub_pb "github.com/libp2p/go-libp2p-pubsub/pb"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	libp2pnet "github.com/libp2p/go-libp2p/core/network"
@@ -184,6 +186,24 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		}),
 		pubsub.WithPeerScore(buildPeerScoreParams(cfg), buildPeerScoreThresholds()),
 		pubsub.WithPeerExchange(true),
+		// Flood publish: deliver our OWN publishes to ALL subscribed peers
+		// (score >= publishThreshold), not just the D mesh peers. At
+		// validator-set scale (small N) this closes the first-publish delivery
+		// gap observed on shard-checkpoint topics, where a not-yet-stabilized
+		// mesh missed some peers and the 30s outbox republisher became the de
+		// facto delivery path (task #40). Cost is O(subscribers) per publish —
+		// negligible at our N.
+		pubsub.WithFloodPublish(true),
+		// Content-derived message IDs: the default ID is (from, seqno), so an
+		// outbox REPUBLISH of identical bytes counts as a brand-new message and
+		// is re-delivered to every peer. Deriving the ID from a SHA-256 of the
+		// payload makes republishes hit peers' seen-caches and dedupe instead
+		// (task #40). All sidecars redeploy together (greenfield), so the
+		// network-wide ID function stays consistent.
+		pubsub.WithMessageIdFn(func(pmsg *pubsub_pb.Message) string {
+			digest := sha256.Sum256(pmsg.GetData())
+			return string(digest[:])
+		}),
 	)
 	if err != nil {
 		h.Close()
@@ -598,10 +618,20 @@ func (n *Node) startShardRelay(topic *pubsub.Topic, dst chan<- []byte, topicLabe
 				continue
 			}
 			metrics.MessagesReceived.WithLabelValues(topicLabel).Inc()
+			// Per-message receive log so sidecar-received can be bracketed
+			// against the JVM-side rx log (task #40). msg.ID is the
+			// content-derived SHA-256 set via WithMessageIdFn.
+			fmt.Printf("shard-relay: recv topic=%s from=%s msgid=%x len=%d\n",
+				topic.String(), msg.ReceivedFrom.ShortString(), msg.ID, len(msg.Data))
 			select {
 			case dst <- msg.Data:
 			default:
 				metrics.MessagesDropped.WithLabelValues(topicLabel).Inc()
+				// Loud drop: a full shared relay channel means the JVM consumer
+				// is not draining — this message is LOST until the publisher's
+				// outbox republishes it (task #40).
+				fmt.Printf("WARN: shard-relay: DROPPED message topic=%s len=%d (relay channel full — slow JVM consumer)\n",
+					topic.String(), len(msg.Data))
 			}
 		}
 	}()
@@ -814,6 +844,40 @@ func (n *Node) MeshPeerCount() (snapshots, attestations, rumors, metagraphBinari
 		len(n.tokenLockBlockTopic.ListPeers())
 }
 
+// ShardMeshPeerCount returns the mesh peer counts for the per-shard
+// checkpoint and checkpoint-attestation topic families, each SUMMED across
+// all joined shards. Sum (not max) is chosen so the metric reflects total
+// delivery fan-out capacity: 0 means no shard topic has any mesh peer at all
+// — the exact symptom behind the task #40 first-publish delivery gap.
+func (n *Node) ShardMeshPeerCount() (checkpoints, attestations int) {
+	n.shardMu.Lock()
+	defer n.shardMu.Unlock()
+	for _, t := range n.shardCheckpointTopics {
+		checkpoints += len(t.ListPeers())
+	}
+	for _, t := range n.shardCheckpointAttTopics {
+		attestations += len(t.ListPeers())
+	}
+	return checkpoints, attestations
+}
+
+// ShardMeshPeersByTopic returns per-shard mesh peer counts keyed by a stable
+// Prometheus label (`shard_checkpoint_<id>` / `shard_checkpoint_attestation_<id>`),
+// for the metrics gauge updater. Snapshot under shardMu; the returned map is
+// owned by the caller.
+func (n *Node) ShardMeshPeersByTopic() map[string]int {
+	n.shardMu.Lock()
+	defer n.shardMu.Unlock()
+	out := make(map[string]int, len(n.shardCheckpointTopics)+len(n.shardCheckpointAttTopics))
+	for id, t := range n.shardCheckpointTopics {
+		out[fmt.Sprintf("shard_checkpoint_%d", id)] = len(t.ListPeers())
+	}
+	for id, t := range n.shardCheckpointAttTopics {
+		out[fmt.Sprintf("shard_checkpoint_attestation_%d", id)] = len(t.ListPeers())
+	}
+	return out
+}
+
 // TriggerSubscriberReconnect broadcasts to all active Subscribe handlers that
 // they should terminate, forcing JVM clients to re-establish their gRPC streams.
 // Called by the mesh health monitor after recovering from degradation.
@@ -924,6 +988,9 @@ func (n *Node) Topics() metrics.TopicSet {
 		AllowSpendBlock:      n.allowSpendBlockTopic,
 		DAGBlock:             n.dagBlockTopic,
 		TokenLockBlock:       n.tokenLockBlockTopic,
+		// Per-shard topics are joined lazily, so expose a snapshot function
+		// rather than static handles (task #40 instrumentation).
+		ShardMeshPeers: n.ShardMeshPeersByTopic,
 	}
 }
 

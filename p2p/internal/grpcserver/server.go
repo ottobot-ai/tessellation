@@ -466,17 +466,23 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 // PeerCount returns mesh membership stats.
 func (s *Server) PeerCount(ctx context.Context, req *pb.PeerCountRequest) (*pb.PeerCountResponse, error) {
 	snPeers, atPeers, ruPeers, mbPeers, maPeers, asbPeers, dagPeers, tlbPeers := s.node.MeshPeerCount()
+	// Per-shard topic families, summed across joined shards (see
+	// Node.ShardMeshPeerCount for why sum, not max). 0 until the first shard
+	// topic is joined AND has mesh peers — exactly the visibility task #40 needs.
+	scPeers, scaPeers := s.node.ShardMeshPeerCount()
 	total := len(s.node.Host.Network().Peers())
 	return &pb.PeerCountResponse{
-		Total:                     int32(total),
-		MeshSnapshots:             int32(snPeers),
-		MeshAttestations:          int32(atPeers),
-		MeshRumors:                int32(ruPeers),
-		MeshMetagraphBinaries:     int32(mbPeers),
-		MeshMetagraphAttestations: int32(maPeers),
-		MeshAllowSpendBlocks:      int32(asbPeers),
-		MeshDagBlocks:             int32(dagPeers),
-		MeshTokenLockBlocks:       int32(tlbPeers),
+		Total:                           int32(total),
+		MeshSnapshots:                   int32(snPeers),
+		MeshAttestations:                int32(atPeers),
+		MeshRumors:                      int32(ruPeers),
+		MeshMetagraphBinaries:           int32(mbPeers),
+		MeshMetagraphAttestations:       int32(maPeers),
+		MeshAllowSpendBlocks:            int32(asbPeers),
+		MeshDagBlocks:                   int32(dagPeers),
+		MeshTokenLockBlocks:             int32(tlbPeers),
+		MeshShardCheckpoints:            int32(scPeers),
+		MeshShardCheckpointAttestations: int32(scaPeers),
 	}, nil
 }
 

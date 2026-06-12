@@ -125,6 +125,13 @@ type TopicSet struct {
 	AllowSpendBlock      *pubsub.Topic
 	DAGBlock             *pubsub.Topic
 	TokenLockBlock       *pubsub.Topic
+
+	// ShardMeshPeers, when non-nil, returns a snapshot of per-shard topic
+	// mesh sizes keyed by gauge label (e.g. "shard_checkpoint_3",
+	// "shard_checkpoint_attestation_3"). A function rather than topic handles
+	// because shard topics are joined lazily as shard ids become known
+	// (task #40 instrumentation).
+	ShardMeshPeers func() map[string]int
 }
 
 // StartGaugeUpdater launches a background goroutine that periodically updates
@@ -154,6 +161,16 @@ func StartGaugeUpdater(ctx context.Context, h host.Host, kadDHT *dht.IpfsDHT, to
 			}
 			if topics.TokenLockBlock != nil {
 				MeshPeers.WithLabelValues("token_lock_block").Set(float64(len(topics.TokenLockBlock.ListPeers())))
+			}
+			// Per-shard checkpoint/attestation topic meshes (lazily joined,
+			// hence the snapshot function). New shard labels appear as shards
+			// are joined; a label persists at its last value if a shard topic
+			// ever vanished, which cannot happen today (topics live for the
+			// node lifetime).
+			if topics.ShardMeshPeers != nil {
+				for label, count := range topics.ShardMeshPeers() {
+					MeshPeers.WithLabelValues(label).Set(float64(count))
+				}
 			}
 
 			// Total connected peers
