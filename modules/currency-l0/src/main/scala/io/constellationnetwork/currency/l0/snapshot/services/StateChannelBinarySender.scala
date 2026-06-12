@@ -126,6 +126,10 @@ object StateChannelBinarySender {
   )(implicit S: Supervisor[F])
       extends StateChannelBinarySender[F] {
 
+    // RetryMode tick counter — drives the re-send cadence gate (see processRetryMode). Plain unsynchronized
+    // monotone counter; the worker is a single fs2 stream so increments never race.
+    private val retryTickCounter = new java.util.concurrent.atomic.AtomicLong(0L)
+
     def enqueue(
       binary: Hashed[StateChannelSnapshotBinary],
       currencySnapshotOrdinal: SnapshotOrdinal,
@@ -232,19 +236,28 @@ object StateChannelBinarySender {
       // +9/min catch-up — the genesis backlog took 10+ min to drain and allow-spend windows expired
       // mid-lag (NoActiveAllowSpend). Floor 64 had the same shape one octave up (run 10 / design §5.8):
       // ANY per-tick cap becomes the window-size ceiling, so the sender — not the protocol — ends up
-      // governing how much chain one fold can advance. UN-CAPPED (owner, 2026-06-12): ship the FULL
-      // contiguous pending prefix every tick; checkpoint windows are variable-length by design and the
-      // window is what absorbs bursts (bulk-service queue). The fetch ceiling below (1024) is a
-      // concurrency bound on in-flight HTTP posts per tick, not a throughput policy — at 1024 binaries
-      // per fold it is far above any cadence the EventTrigger can produce. Re-sending binaries gl0
-      // already buffered stays cheap: the shard binary buffer dedupes by hash.
+      // governing how much chain one fold can advance.
+      //
+      // UN-CAPPED BUT CADENCE-GATED (run 12 post-mortem, 2026-06-12). The first un-cap shipped the FULL
+      // pending prefix EVERY 5s tick; with confirmation lagging, that re-POSTed the same ~100 binaries
+      // ~20×/min/mg — an intake storm on gl0 (committee-gate churn + orphan-buffer thrash) that starved
+      // the very checkpoint pipeline whose confirmations would have drained the queue (circular). The
+      // window-size goal only needs each binary DELIVERED ONCE (gl0 buffers + dedupes by hash); re-sends
+      // exist solely for loss recovery. So: NEVER-SENT binaries ship immediately on every tick
+      // (first-delivery latency preserved, no size cap), and the full contiguous prefix re-ships only
+      // every RESEND_EVERY_TICKS-th tick (~30s — matched to the checkpoint confirmation RTT).
       val inflightCeiling = 1024
+      val ResendEveryTicks = 6L
+      val tick = retryTickCounter.getAndIncrement()
+      val fullResendDue = tick % ResendEveryTicks === 0L
       tracker.getPendingToRetry(inflightCeiling).flatMap { allPending =>
-        val toRetry = allPending.sortBy(_.currencySnapshotOrdinal.value.value)
+        val sortedAsc = allPending.sortBy(_.currencySnapshotOrdinal.value.value)
+        val toRetry = if (fullResendDue) sortedAsc else sortedAsc.filter(_.sendsSoFar.value === 0L)
         if (toRetry.nonEmpty) {
           logger.info(
             s"[RetryMode] Processing ${toRetry.size} binaries (cap=$cap, " +
-              s"mix=contiguous-oldest-prefix-uncapped, totalPending=${allPending.size})"
+              s"mix=${if (fullResendDue) "contiguous-prefix-full-resend" else "unsent-only"}, " +
+              s"totalPending=${allPending.size})"
           ) >>
             toRetry.traverse_(p => sendBinaryInBackground(p, signers))
         } else {
