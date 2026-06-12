@@ -263,7 +263,13 @@ object types {
     /** Boot grace (run-17): no shard duty until Ready for this many slots — late-booting ranks must drain intake before taking (especially
       * genesis) duty, or they seed rival lineages while blind.
       */
-    bootGraceSlots: Int = 30
+    bootGraceSlots: Int = 30,
+    /** Loss-recovery re-publish cadence (task #45, run-19). A node mints each (shardId, shardOrdinal) at most ONCE and HOLDS it; until that
+      * ordinal is adopted or the tip moves out from under it (anchor-reorg), it re-gossips the SAME bytes every this-many produce ticks
+      * instead of re-minting with a fresh gl0Anchor+slot. Re-minting churned the checkpoint hash every tick (run-19: 34 variants for one
+      * ordinal) and split attestations below kQuorum. ~6 ticks ≈ confirmation RTT (mirrors the run-12 §5.8 sender cadence-gate).
+      */
+    republishEveryTicks: Int = 6
   )
 
   /** Slice 19 observability tunables (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §13 row 19 + §9.4).

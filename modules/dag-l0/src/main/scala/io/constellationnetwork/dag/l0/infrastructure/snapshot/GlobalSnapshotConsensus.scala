@@ -1457,7 +1457,10 @@ object GlobalSnapshotConsensus {
                       // Bounded checkpoint pipeline (2026-06-11): gl0's adopted-watermark from the acceptance
                       // manager gates new window production so pending batches while embedding catches up.
                       lastAdoptedOrd = deps.acceptanceManager.lastAdoptedOrd(shardId),
-                      pipelineDepth = deps.shardingConfig.checkpoint.pipelineDepth
+                      pipelineDepth = deps.shardingConfig.checkpoint.pipelineDepth,
+                      // Tier-1 idempotence cadence (task #45): re-publish a held checkpoint's bytes every N ticks
+                      // instead of re-minting (which churned the hash every tick and split attestations — run-19).
+                      republishEveryTicks = deps.shardingConfig.checkpoint.republishEveryTicks
                     )
                     .map(shardId -> _)
               }

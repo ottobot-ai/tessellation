@@ -182,6 +182,15 @@ trait ShardCheckpointProducer[F[_]] {
 
 object ShardCheckpointProducer {
 
+  /** Tier-1 idempotence memo (task #45, run-19). The single in-flight checkpoint this node has already minted for the ordinal it would mint
+    * next, plus the produce-tick at which it was last (re-)published. While held, the producer re-publishes these exact bytes
+    * (cadence-gated) instead of re-minting — re-minting churns `gl0AnchorOrdinal`+`slot` into a fresh hash every tick (run-19: 34 variants
+    * for one ordinal), splitting committee attestations below `kQuorum`. Single (not a `Map`): the pipeline gate + `nextShardOrdinal =
+    * bestTip.next` mean the producer only ever has one ordinal it would mint at a time. Dropped when that ordinal is adopted or the tip
+    * moves out from under it (detected via `parentCheckpointHash` — the anchor-reorg/sibling-flip case).
+    */
+  private final case class HeldCheckpoint(signed: Signed[ShardCheckpoint], lastPublishedTick: Long)
+
   /** Algebra describing the KES product signer for this operator. Mirrors
     * [[io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.KesSigner]] — the producer doesn't depend on the concrete
     * `OperationalKeyMakerAlgebra` so the test path can stub it.
@@ -290,9 +299,19 @@ object ShardCheckpointProducer {
       * production while >= pipelineDepth windows await embed makes pending binaries accumulate into ONE bigger window, so a single embed
       * drains the whole backlog: catch-up margin = window growth.
       */
-    pipelineDepth: Int
+    pipelineDepth: Int,
+    /** Loss-recovery re-publish cadence (task #45). While a checkpoint is held (already minted for the next ordinal), re-publish its exact
+      * bytes every this-many `produce` ticks instead of re-minting. `cfg.nakamoto.sharding.checkpoint.republishEveryTicks`; 1 = every tick.
+      */
+    republishEveryTicks: Int
   ): F[ShardCheckpointProducer[F]] = Async[F].delay {
     val logger = Slf4jLogger.getLoggerFromName[F](s"ShardCheckpointProducer[$shardId]")
+
+    // Tier-1 idempotence state (task #45): the single held checkpoint + a monotone produce-tick counter, both per-shard (one producer per
+    // shard). `Ref.unsafe` inside this `delay` is the codebase idiom for producer-local state (see AbandonmentTracker / ViewChangeManager) —
+    // the allocation is suspended with the rest of the block, so it's pure at the `make` boundary.
+    val heldRef: Ref[F, Option[HeldCheckpoint]] = Ref.unsafe(None)
+    val tickRef: Ref[F, Long] = Ref.unsafe(0L)
 
     // Capture the slot-leader VRF cache state — keyed by (slot, gl0AnchorOrdinal). Slice 8 v1 doesn't need cross-call state, but the
     // capture is required because `Slf4jLogger` returns a fresh instance every time and we want one stable logger per producer.
@@ -314,23 +333,78 @@ object ShardCheckpointProducer {
             .info(s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=empty-pending")
             .as(None: Option[Signed[ShardCheckpoint]])
         } else {
-          // Resolve the parent — `bestTip` `None` ⇒ genesis (parent = Hash.empty, parent ord = Genesis). `perMgTip` is derived from the
-          // SAME best tip (empty at genesis), so the chain-link anchor and the parent envelope are read consistently.
-          (chainStore.bestTip, chainStore.perMgTip, lastAdoptedOrd).tupled.flatMap {
-            case (bestTipOpt, perMgTip, adoptedOrdOpt) =>
-              val unadoptedDepth: Long =
-                bestTipOpt.map(_.signed.value.shardOrdinal.value).getOrElse(0L) - adoptedOrdOpt.map(_.value).getOrElse(0L)
-              if (bestTipOpt.isDefined && unadoptedDepth >= pipelineDepth.toLong) {
-                // Bounded pipeline: gl0 hasn't embedded our recent windows yet — let pending batch into the next one.
-                logger
-                  .info(
-                    s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=awaiting-embed " +
-                      s"unadoptedDepth=$unadoptedDepth pipelineDepth=$pipelineDepth " +
-                      s"tipShardOrd=${bestTipOpt.map(_.signed.value.shardOrdinal.value).getOrElse(0L)} " +
-                      s"adoptedShardOrd=${adoptedOrdOpt.map(_.value).getOrElse(0L)}"
-                  )
-                  .as(None: Option[Signed[ShardCheckpoint]])
-              } else produceInner(bestTipOpt, perMgTip, pendingSnapshots, gl0AnchorOrdinal, epoch, currentSlot, committee)
+          // Tier-1 idempotence (task #45): bump the per-produce tick once, then resolve the parent. `bestTip` `None` ⇒ genesis
+          // (parent = Hash.empty, parent ord = Genesis). `perMgTip` is derived from the SAME best tip so the chain-link anchor and
+          // the parent envelope are read consistently.
+          tickRef.updateAndGet(_ + 1L).flatMap { tick =>
+            (chainStore.bestTip, chainStore.perMgTip, lastAdoptedOrd, heldRef.get).tupled.flatMap {
+              case (bestTipOpt, perMgTip, adoptedOrdOpt, heldOpt) =>
+                val parentHash: Hash = bestTipOpt.map(_.hash).getOrElse(Hash.empty)
+                val nextShardOrdinal: ShardOrdinal =
+                  bestTipOpt.map(_.signed.value.shardOrdinal).getOrElse(ShardOrdinal.Genesis).next
+
+                heldOpt match {
+                  // ── MEMO HIT (task #45): we already minted this EXACT (shardOrdinal, parent) — re-publish the SAME bytes,
+                  // cadence-gated, NEVER re-mint. Re-minting would churn `gl0AnchorOrdinal`+`slot` into a fresh hash every tick
+                  // (run-19: 34 variants for one ordinal), splitting committee attestations below kQuorum. The anchor is loosely
+                  // coupled (gl0 accepts at the pinned ord or any later), so the held bytes still embed. The held checkpoint was
+                  // already published once at mint; FanOut's self-store is hash-idempotent, so returning it is a safe no-op there.
+                  case Some(held)
+                      if held.signed.value.shardOrdinal.value === nextShardOrdinal.value &&
+                        held.signed.value.parentCheckpointHash === parentHash =>
+                    if (tick - held.lastPublishedTick >= republishEveryTicks.toLong)
+                      publisher.publish(held.signed) *>
+                        heldRef.set(Some(held.copy(lastPublishedTick = tick))) *>
+                        logger
+                          .info(
+                            s"produce: re-publish-held shardOrdinal=${held.signed.value.shardOrdinal.value} " +
+                              s"gl0Anchor=${held.signed.value.gl0AnchorOrdinal.value.value} slot=${held.signed.value.slot.value.value} " +
+                              s"tick=$tick (idempotent hold — task #45)"
+                          )
+                          .as(Some(held.signed): Option[Signed[ShardCheckpoint]])
+                    else
+                      logger
+                        .info(
+                          s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=held-cadence-wait " +
+                            s"shardOrdinal=${held.signed.value.shardOrdinal.value} tick=$tick " +
+                            s"lastPublished=${held.lastPublishedTick} republishEvery=$republishEveryTicks"
+                        )
+                        .as(None: Option[Signed[ShardCheckpoint]])
+
+                  // ── MEMO MISS or STALE: no memo, OR the held one is for a different ordinal / parent (adopted past it, or an
+                  // anchor-reorg moved the tip out from under it). Drop any stale memo and run the normal gate + mint-ONCE path; the
+                  // fresh mint is recorded in the memo on success so subsequent ticks re-publish instead of re-minting.
+                  case _ =>
+                    val clearStale = if (heldOpt.isDefined) heldRef.set(None) else Async[F].unit
+                    val unadoptedDepth: Long =
+                      bestTipOpt.map(_.signed.value.shardOrdinal.value).getOrElse(0L) - adoptedOrdOpt.map(_.value).getOrElse(0L)
+                    clearStale *> {
+                      if (bestTipOpt.isDefined && unadoptedDepth >= pipelineDepth.toLong)
+                        // Bounded pipeline: gl0 hasn't embedded our recent windows yet — let pending batch into the next one.
+                        logger
+                          .info(
+                            s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=awaiting-embed " +
+                              s"unadoptedDepth=$unadoptedDepth pipelineDepth=$pipelineDepth " +
+                              s"tipShardOrd=${bestTipOpt.map(_.signed.value.shardOrdinal.value).getOrElse(0L)} " +
+                              s"adoptedShardOrd=${adoptedOrdOpt.map(_.value).getOrElse(0L)}"
+                          )
+                          .as(None: Option[Signed[ShardCheckpoint]])
+                      else
+                        produceInner(
+                          bestTipOpt,
+                          perMgTip,
+                          pendingSnapshots,
+                          gl0AnchorOrdinal,
+                          epoch,
+                          currentSlot,
+                          committee
+                        ).flatMap {
+                          case some @ Some(signed) => heldRef.set(Some(HeldCheckpoint(signed, tick))).as(some)
+                          case None                => Async[F].pure(None: Option[Signed[ShardCheckpoint]])
+                        }
+                    }
+                }
+            }
           }
         }
 

@@ -216,7 +216,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     rig: TestRig,
     sigma: Ratio,
     shardEta: Array[Byte],
-    derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] = deterministicDerive
+    derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] = deterministicDerive,
+    republishEveryTicks: Int = 1
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     ShardCheckpointProducer.make[IO](
       shardId = shardZero,
@@ -235,7 +236,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       staircaseDeltaSlots = 5,
       derivePerMgState = derive,
       lastAdoptedOrd = cats.effect.IO.pure(None),
-      pipelineDepth = Int.MaxValue
+      pipelineDepth = Int.MaxValue,
+      republishEveryTicks = republishEveryTicks
     )
 
   // ===========================================================================
@@ -495,6 +497,104 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
   test("noop publisher: publish is a no-op (returns successfully without side effects)") { _ =>
     val pub = ShardCheckpointPublisher.noop[IO]
     pub.publish(stubCheckpoint(99L)).map(_ => expect(true)) // sanity: doesn't throw
+  }
+
+  // ===========================================================================
+  // Tier-1 idempotence (task #45, run-19): a stuck ordinal is minted ONCE and
+  // re-published (cadence-gated) — NOT re-minted with a churning gl0Anchor+slot.
+  // ===========================================================================
+
+  test("task #45 idempotence: a stuck shardOrdinal is minted ONCE and re-published — no anchor/hash churn") { res =>
+    implicit val (h, sp, ssl) = res
+    for {
+      rig <- freshRig
+      gl0Eta = randomGl0Eta()
+      shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
+      // republishEveryTicks=1 ⇒ every memo-hit re-publishes. Single-member committee ⇒ always on duty, so the first produce mints.
+      producer <- makeProducer(ssl, rig, Ratio.One, shardEta, republishEveryTicks = 1)
+      // Drive 8 produces with ADVANCING gl0Anchor (2100..2107) + slot, and NEVER insert into the store, so bestTip stays None ⇒
+      // nextShardOrdinal stays ord-1 ⇒ every tick after the first is a memo HIT. Pre-fix, each tick re-minted a fresh hash anchored to
+      // the advancing gl0Anchor (run-19: 34 variants). Post-fix, every emitted checkpoint carries the gl0Anchor PINNED at first mint.
+      results <- (2100L to 2107L).toList.traverse(i =>
+        producer.produce(mkPendingSnapshots(2), mkOrd(i), EtaPeriod(0L), Slot.unsafeApply(i), Set(rig.selfPeerId))
+      )
+      somes = results.flatten
+      hashes <- somes.traverse(s => Hasher[IO].hash(s.value.signingPreimage))
+      recorded <- rig.recorded
+      recordedHashes <- recorded.traverse(s => Hasher[IO].hash(s.value.signingPreimage))
+    } yield
+      expect.all(
+        somes.size == 8, // mint (i=2100) + 7 re-publishes (single-member committee ⇒ always on duty)
+        hashes.distinct.size == 1, // EXACTLY ONE checkpoint identity across all returns — the anti-churn invariant
+        somes.map(_.value.gl0AnchorOrdinal).distinct == List(mkOrd(2100L)), // anchor PINNED at first mint, NOT churning 2100..2107
+        somes.forall(_.value.shardOrdinal == ShardOrdinal(1L)),
+        somes.forall(_.value.slot.value.value == 2100L), // slot pinned too
+        recorded.size == 8,
+        recordedHashes.distinct.size == 1 // every on-wire publish is the SAME bytes
+      )
+  }
+
+  test("task #45 cadence: with republishEveryTicks=3, a held checkpoint re-publishes only every 3rd produce tick") { res =>
+    implicit val (h, sp, ssl) = res
+    for {
+      rig <- freshRig
+      gl0Eta = randomGl0Eta()
+      shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
+      producer <- makeProducer(ssl, rig, Ratio.One, shardEta, republishEveryTicks = 3)
+      // 7 produces (ticks 1..7), ordinal stuck (never inserted). Mint at tick 1 (lastPublished=1); re-publish when
+      // tick - lastPublished >= 3 ⇒ ticks 4 and 7. So publishes at ticks {1,4,7} = 3; ticks {2,3,5,6} are cadence-wait (None).
+      results <- (3100L to 3106L).toList.traverse(i =>
+        producer.produce(mkPendingSnapshots(2), mkOrd(i), EtaPeriod(0L), Slot.unsafeApply(i), Set(rig.selfPeerId))
+      )
+      recorded <- rig.recorded
+      recordedHashes <- recorded.traverse(s => Hasher[IO].hash(s.value.signingPreimage))
+    } yield
+      expect.all(
+        results.flatten.size == 3, // Somes only on the publish ticks {1,4,7}
+        results.count(_.isEmpty) == 4, // cadence-wait Nones on ticks {2,3,5,6}
+        recorded.size == 3,
+        recordedHashes.distinct.size == 1 // all the same held bytes
+      )
+  }
+
+  test("task #45 advancement: the memo does NOT block the next ordinal — after the tip advances, produce mints N+1") { res =>
+    implicit val (h, sp, ssl) = res
+    for {
+      rig <- freshRig
+      gl0Eta = randomGl0Eta()
+      shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
+      producer <- makeProducer(ssl, rig, Ratio.One, shardEta, republishEveryTicks = 1)
+      // Mint ord-1 (held), then INSERT it so bestTip advances to ord-1. The next produce sees nextShardOrdinal=2 ⇒ the held ord-1 is a
+      // MISS (different ordinal) ⇒ the memo is dropped and ord-2 is minted (a new, distinct hash). Proves the memo never wedges progress.
+      first <- tryProduceUntilSome(
+        producer,
+        startOrd = 4000L,
+        epoch = EtaPeriod(0L),
+        maxAttempts = 100,
+        committee = Set(rig.selfPeerId),
+        pending = mkPendingChainedOff(SortedMap.empty, round = 0)
+      )
+      firstCp <- IO.fromOption(first)(new RuntimeException("produce-1 should win at σ=1 within 100 attempts"))
+      _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty, slot = 4000L)
+      perMgTip <- rig.chainStore.perMgTip
+      second <- tryProduceUntilSome(
+        producer,
+        startOrd = 4100L,
+        epoch = EtaPeriod(0L),
+        maxAttempts = 100,
+        committee = Set(rig.selfPeerId),
+        pending = mkPendingChainedOff(perMgTip, round = 1)
+      )
+      secondCp <- IO.fromOption(second)(new RuntimeException("produce-2 should win and advance to ord-2"))
+      firstHash <- Hasher[IO].hash(firstCp.value.signingPreimage)
+      secondHash <- Hasher[IO].hash(secondCp.value.signingPreimage)
+    } yield
+      expect.all(
+        firstCp.value.shardOrdinal == ShardOrdinal(1L),
+        secondCp.value.shardOrdinal == ShardOrdinal(2L),
+        secondCp.value.parentCheckpointHash == firstHash, // ord-2 chains off ord-1
+        firstHash =!= secondHash // a genuinely new mint, not a stale re-publish of ord-1
+      )
   }
 
   // ===========================================================================

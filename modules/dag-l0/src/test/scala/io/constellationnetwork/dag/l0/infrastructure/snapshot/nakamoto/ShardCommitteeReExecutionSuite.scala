@@ -146,7 +146,8 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
       staircaseDeltaSlots = 5,
       derivePerMgState = reExec,
       lastAdoptedOrd = cats.effect.IO.pure(None),
-      pipelineDepth = Int.MaxValue
+      pipelineDepth = Int.MaxValue,
+      republishEveryTicks = 1
     )
 
   /** Loop produce over increasing gl0 anchors until σ=1 wins. */

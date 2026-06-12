@@ -171,7 +171,8 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
       staircaseDeltaSlots = 5,
       derivePerMgState = deterministicDerive,
       lastAdoptedOrd = cats.effect.IO.pure(None),
-      pipelineDepth = Int.MaxValue
+      pipelineDepth = Int.MaxValue,
+      republishEveryTicks = 1
     )
 
   /** Per-shard rig: a chain store + a raw-binary buffer + a producer for every shard `0 .. numShards-1`, sharing one keypair + σ. */
