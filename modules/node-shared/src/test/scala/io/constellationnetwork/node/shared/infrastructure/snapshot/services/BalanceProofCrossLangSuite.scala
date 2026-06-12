@@ -25,8 +25,8 @@ import weaver.SimpleIOSuite
   * Builds the per-address balance MPT through the SAME production path the `/currency/{address}/balance/proof` route uses
   * ([[BalanceMpt.buildProof]] → [[Hasher.forCanonicalJson]] → tessellation's `StatelessMerklePatriciaProducer` + inclusion prover), then:
   *   1. self-verifies the proof in Scala against the emitted root with [[MerklePatriciaInclusionVerifier]] (the Scala analog of the TS
-  *      verifier — recomputes every node digest as `SHA-256(prefix ++ canonicalJSON(commitment))`), and
-  *   2. writes the proof (the real [[BalanceProof]] wire shape, plus a `targetKey` echo) to `mpt-crosslang-balance/fixtures/proof.json`.
+  *      verifier — recomputes every node digest as `SHA-256(prefix ++ canonicalJSON(commitment))`), and 2. writes the proof (the real
+  *      [[BalanceProof]] wire shape, plus a `targetKey` echo) to `mpt-crosslang-balance/fixtures/proof.json`.
   *
   * The companion `node mpt-crosslang-balance/verify.ts` step then feeds that fixture to the unmodified `mptVerifier.ts` lifted from the
   * `digital-evidence-app` Faraday backup — proving ml0's balance proof verifies in TypeScript byte-for-byte (no Brotli). Run the pair:
@@ -92,6 +92,6 @@ object BalanceProofCrossLangSuite extends SimpleIOSuite {
         s"[BalanceProofCrossLangSuite] wrote $fixturePath\n" +
           s"  root=${bp.root.value}\n  path=${bp.proof.path.value}\n  balance=${bp.balance.value.value}\n  witnessNodes=${bp.proof.witness.size}"
       )
-    } yield expect(confirmE.isRight) and expect(bp.balance == balances(target))
+    } yield expect(confirmE.isRight).and(expect(bp.balance == balances(target)))
   }
 }

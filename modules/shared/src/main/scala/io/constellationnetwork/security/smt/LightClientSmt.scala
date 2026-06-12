@@ -23,23 +23,23 @@ import io.circe.{Decoder, Encoder}
   *   - hash function (`smt-store.ts` `sha256Hash`): `createHash('sha256').update(childNodes.map(String).join('')).digest('hex')`. There is
   *     NO separator, NO domain prefix, NO Brotli — just the ASCII concatenation of the child hex strings, SHA-256'd, lowercase hex out.
   *   - node digest = `hash([left, right])` = `SHA-256_hex( utf8(leftHex + rightHex) )`.
-  *   - leaf digest (`smt.ts` `add`: `this.hash([key, value, this.entryMark])`) = `SHA-256_hex( utf8(keyHex + valueHex + "1") )` — the literal
-  *     entry-mark char `"1"` is appended.
+  *   - leaf digest (`smt.ts` `add`: `this.hash([key, value, this.entryMark])`) = `SHA-256_hex( utf8(keyHex + valueHex + "1") )` — the
+  *     literal entry-mark char `"1"` is appended.
   *   - zero node (`smt.ts` ctor: `this.zeroNode = "0"`) = the literal string `"0"`; `H(0,0) = 0` (an absent subtree contributes `"0"`).
   *   - key→path (`utils.ts` `keyToPath`): `hexToBin(key)` then `.padStart(256, "0").split("").reverse()` — left-pad to 256 bits then
-  *     REVERSE (LSB-first). `calculateRoot` folds siblings from index `siblings.length-1` down to `0`, choosing
-  *     `path(i) ? [sibling, node] : [node, sibling]`.
+  *     REVERSE (LSB-first). `calculateRoot` folds siblings from index `siblings.length-1` down to `0`, choosing `path(i) ? [sibling, node]
+  *     : [node, sibling]`.
   *   - keys/values must match `/^[0-9A-Fa-f]{1,64}$/` (`utils.ts` `checkHex`).
   *
   * ==Model==
-  * This mirrors `@zk-kit/smt`'s own internal representation 1:1 — a `Map[node, childNodes]` plus a `root` string — and re-implements
-  * `add` / `retrieveEntry` / `createProof` / `verifyProof` with the identical bottom-up node-rebuild. Because it IS the same algorithm over
-  * the same map, the resulting `root` and proofs are byte-identical to the TS library's, which the cross-language KAT proves. The tree is
-  * append-only here (members are distinct keys); persistence / update / delete / compaction are intentionally out of scope (the light-client
-  * commitment only needs build-root + inclusion/absence proof).
+  * This mirrors `@zk-kit/smt`'s own internal representation 1:1 — a `Map[node, childNodes]` plus a `root` string — and re-implements `add`
+  * / `retrieveEntry` / `createProof` / `verifyProof` with the identical bottom-up node-rebuild. Because it IS the same algorithm over the
+  * same map, the resulting `root` and proofs are byte-identical to the TS library's, which the cross-language KAT proves. The tree is
+  * append-only here (members are distinct keys); persistence / update / delete / compaction are intentionally out of scope (the
+  * light-client commitment only needs build-root + inclusion/absence proof).
   *
-  * Insertion-order independence (the `@zk-kit/smt` property): the final [[root]] is a pure function of the live key→value SET, regardless of
-  * the order [[add]] is called — verified by the order-independence KAT.
+  * Insertion-order independence (the `@zk-kit/smt` property): the final [[root]] is a pure function of the live key→value SET, regardless
+  * of the order [[add]] is called — verified by the order-independence KAT.
   */
 final class LightClientSmt private (
   private val nodes: Map[String, List[String]],
@@ -123,8 +123,8 @@ final class LightClientSmt private (
 
   // --- internals (1:1 with @zk-kit/smt `SMT`) ---------------------------------------------------------------------------------------------
 
-  /** `SMT.retrieveEntry`: walk from the root down the key's path. Returns the found leaf (member), or `[key]` with an optional matching leaf
-    * (non-member), always with the siblings collected along the way.
+  /** `SMT.retrieveEntry`: walk from the root down the key's path. Returns the found leaf (member), or `[key]` with an optional matching
+    * leaf (non-member), always with the siblings collected along the way.
     */
   private def retrieveEntry(keyHex: String): EntryResponse = {
     val path = keyToPath(keyHex)
@@ -149,8 +149,8 @@ final class LightClientSmt private (
     loop(root, 0)
   }
 
-  /** `SMT.addNewNodes`: fold the start `node` with each sibling from `siblings.length-1` down to `0`, hashing
-    * `path(i) ? [sibling, node] : [node, sibling]`, recording every created node. Returns the (updated map, root).
+  /** `SMT.addNewNodes`: fold the start `node` with each sibling from `siblings.length-1` down to `0`, hashing `path(i) ? [sibling, node] :
+    * [node, sibling]`, recording every created node. Returns the (updated map, root).
     */
   private def addNewNodes(
     start: String,
@@ -267,7 +267,9 @@ object LightClientSmt {
     min
   }
 
-  /** `SMT.calculateRoot`: fold `node` with each sibling from `siblings.length-1` down to `0` using `path(i) ? [sibling,node] : [node,sibling]`. */
+  /** `SMT.calculateRoot`: fold `node` with each sibling from `siblings.length-1` down to `0` using `path(i) ? [sibling,node] :
+    * [node,sibling]`.
+    */
   private def calculateRoot(node0: String, path: Vector[Int], siblings: List[String]): String = {
     val sib = siblings.toVector
     var node = node0

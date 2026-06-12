@@ -51,9 +51,7 @@ object ConsensusStorageCandidatesSuite extends SimpleIOSuite {
       afterRegistered <- storage.getCandidates(ord(9))
       farAfter <- storage.getCandidates(ord(1000))
     } yield
-      expect(atRegistered.value == Set(peerA)) and
-        expect(afterRegistered.value == Set(peerA)) and
-        expect(farAfter.value == Set(peerA))
+      expect(atRegistered.value == Set(peerA)).and(expect(afterRegistered.value == Set(peerA))).and(expect(farAfter.value == Set(peerA)))
   }
 
   test("a registration at key K is NOT a candidate for keys below K") {
@@ -71,9 +69,7 @@ object ConsensusStorageCandidatesSuite extends SimpleIOSuite {
       _ <- storage.registerPeer(peerA, ord(4))
       atLow <- storage.getCandidates(ord(5))
       atHigh <- storage.getCandidates(ord(9))
-    } yield
-      expect(atLow.value.isEmpty) and
-        expect(atHigh.value == Set(peerA))
+    } yield expect(atLow.value.isEmpty).and(expect(atHigh.value == Set(peerA)))
   }
 
   test("multiple peers window-match independently") {
@@ -83,8 +79,6 @@ object ConsensusStorageCandidatesSuite extends SimpleIOSuite {
       _ <- storage.registerPeer(peerB, ord(8))
       mid <- storage.getCandidates(ord(5))
       late <- storage.getCandidates(ord(8))
-    } yield
-      expect(mid.value == Set(peerA)) and
-        expect(late.value == Set(peerA, peerB))
+    } yield expect(mid.value == Set(peerA)).and(expect(late.value == Set(peerA, peerB)))
   }
 }

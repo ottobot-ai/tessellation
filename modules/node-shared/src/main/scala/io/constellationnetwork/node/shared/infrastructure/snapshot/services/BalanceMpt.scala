@@ -24,14 +24,14 @@ import io.circe.syntax.EncoderOps
   * ==Cross-language contract (must stay byte-identical to `mptVerifier.ts`)==
   *   - '''Path''' (`= SHA-256(address)` hex): [[path]] = `SHA-256(utf8(address.value))` lowercase-hex. A light client derives the same path
   *     from the bare DAG address string. NOTE: this hashes the raw address bytes, NOT a JSON-quoted string.
-  *   - '''Value''': the balance amount as a plain JSON number (`balance.value.value`). This is the leaf `dataDigest` pre-image; the verifier
-  *     treats `dataDigest` as opaque (it never re-hashes the value), so the value encoding only needs to be self-consistent here.
-  *   - '''Node hashing''': routed through [[Hasher.forCanonicalJson]] = `SHA-256(prefixByte ++ RFC8785-canonicalJSON(commitment))`, with the
-  *     `MerklePatriciaCommitment` shapes (`Leaf{remaining,dataDigest}` / `Branch{pathsDigest}` / `Extension{shared,childDigest}`) and prefix
-  *     bytes (Leaf=0, Branch=1, Extension=2) that the verifier reproduces. NO Brotli, NO Kryo.
+  *   - '''Value''': the balance amount as a plain JSON number (`balance.value.value`). This is the leaf `dataDigest` pre-image; the
+  *     verifier treats `dataDigest` as opaque (it never re-hashes the value), so the value encoding only needs to be self-consistent here.
+  *   - '''Node hashing''': routed through [[Hasher.forCanonicalJson]] = `SHA-256(prefixByte ++ RFC8785-canonicalJSON(commitment))`, with
+  *     the `MerklePatriciaCommitment` shapes (`Leaf{remaining,dataDigest}` / `Branch{pathsDigest}` / `Extension{shared,childDigest}`) and
+  *     prefix bytes (Leaf=0, Branch=1, Extension=2) that the verifier reproduces. NO Brotli, NO Kryo.
   *
-  * The whole trie is rebuilt on demand from the snapshot's `balances` map (the light-client commitment is read-only; persistence/update is out
-  * of scope here — this mirrors `LightClientSmt`).
+  * The whole trie is rebuilt on demand from the snapshot's `balances` map (the light-client commitment is read-only; persistence/update is
+  * out of scope here — this mirrors `LightClientSmt`).
   */
 object BalanceMpt {
 

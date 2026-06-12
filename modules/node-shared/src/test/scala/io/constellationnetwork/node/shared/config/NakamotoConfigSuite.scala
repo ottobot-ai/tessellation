@@ -11,12 +11,10 @@ import weaver.SimpleIOSuite
 
 /** Parse + invariant tests for the per-environment `nakamoto.confirmation-depth-k` (k₁) block.
   *
-  * k₁ moved from a single scalar to a `{ mainnet, testnet, integrationnet, dev }` block typed
-  * `Map[AppEnvironment, PosLong]`, resolved once at the use site (`confirmationDepthK(env)`). R and k₂
-  * DERIVE from the resolved k₁. This decode goes through two non-trivial pureconfig pieces compile can't
-  * check — the `environmentToPosLongMapReader` and the field-rename `ProductHint` (`confirmationDepthKByEnv`
-  * ← `confirmation-depth-k`) — so a regression here would only surface at node boot. Values are powers of
-  * two by design (no off-by-one).
+  * k₁ moved from a single scalar to a `{ mainnet, testnet, integrationnet, dev }` block typed `Map[AppEnvironment, PosLong]`, resolved once
+  * at the use site (`confirmationDepthK(env)`). R and k₂ DERIVE from the resolved k₁. This decode goes through two non-trivial pureconfig
+  * pieces compile can't check — the `environmentToPosLongMapReader` and the field-rename `ProductHint` (`confirmationDepthKByEnv` ←
+  * `confirmation-depth-k`) — so a regression here would only surface at node boot. Values are powers of two by design (no off-by-one).
   */
 object NakamotoConfigSuite extends SimpleIOSuite {
 

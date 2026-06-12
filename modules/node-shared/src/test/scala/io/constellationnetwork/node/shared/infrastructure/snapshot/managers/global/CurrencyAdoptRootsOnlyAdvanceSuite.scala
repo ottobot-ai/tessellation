@@ -36,24 +36,24 @@ import weaver.MutableIOSuite
 
 /** #259 roots-only adopt — the per-MG currency commitment ADVANCES PAST GENESIS even when `createContext` WOULD diverge.
   *
-  * This is the regression guard for the consensus freeze: at `numShards>1`, gl0's `lastCurrencySnapshots` was stuck at genesis
-  * for all metagraphs because the adopt path re-derived each currency snapshot via
-  * `CurrencySnapshotContextFunctions.createContext` (recreate proposal artifact + byte-equality) against gl0's FROZEN prior. The
-  * recreate produces ordinal 1, never matches the incoming ordinal N → `SnapshotDifferentThanExpected` → `CannotCreateContext` →
-  * caught by `processCurrencySnapshots`' `handleErrorWith` → the binary/incremental is dropped and the commitment never advances.
+  * This is the regression guard for the consensus freeze: at `numShards>1`, gl0's `lastCurrencySnapshots` was stuck at genesis for all
+  * metagraphs because the adopt path re-derived each currency snapshot via `CurrencySnapshotContextFunctions.createContext` (recreate
+  * proposal artifact + byte-equality) against gl0's FROZEN prior. The recreate produces ordinal 1, never matches the incoming ordinal N →
+  * `SnapshotDifferentThanExpected` → `CannotCreateContext` → caught by `processCurrencySnapshots`' `handleErrorWith` → the
+  * binary/incremental is dropped and the commitment never advances.
   *
-  * The fix (`CurrencyAdoptionMode.AdoptFromSignedFields`) advances the commitment DIRECTLY from the adopted, committee-attested
-  * signed binary's OWN committed fields — ordinal + owner/staking `messages` (carried forward) — with NO `createContext`. gl0
-  * commits the metagraph's state ROOT, not its full balance map (balances live at the metagraph's ml0).
+  * The fix (`CurrencyAdoptionMode.AdoptFromSignedFields`) advances the commitment DIRECTLY from the adopted, committee-attested signed
+  * binary's OWN committed fields — ordinal + owner/staking `messages` (carried forward) — with NO `createContext`. gl0 commits the
+  * metagraph's state ROOT, not its full balance map (balances live at the metagraph's ml0).
   *
-  * Setup that makes "createContext WOULD diverge" CONCRETE: the prior is a `Right` (a metagraph already past genesis in gl0's
-  * commitment, at ordinal 1), and the adopted binary is the SECOND incremental (ordinal 2) — the exact case that reaches
+  * Setup that makes "createContext WOULD diverge" CONCRETE: the prior is a `Right` (a metagraph already past genesis in gl0's commitment,
+  * at ordinal 1), and the adopted binary is the SECOND incremental (ordinal 2) — the exact case that reaches
   * `applyCurrencySnapshot`/`createContext`. The `CurrencySnapshotContextFunctions` stub RAISES on `createContext`, simulating the
   * `SnapshotDifferentThanExpected` divergence the real freeze hits. Then:
-  *   - `Recreate` (the legacy default) calls the raising `createContext`; the error is caught and the commitment stays FROZEN at
-  *     ordinal 1 — reproducing the freeze.
-  *   - `AdoptFromSignedFields` never calls `createContext`; the commitment ADVANCES to ordinal 2 and the owner message is carried
-  *     forward into `lastMessages` (the genuine cross-MG fee/config dependency `getFeeAddresses` reads).
+  *   - `Recreate` (the legacy default) calls the raising `createContext`; the error is caught and the commitment stays FROZEN at ordinal 1
+  *     — reproducing the freeze.
+  *   - `AdoptFromSignedFields` never calls `createContext`; the commitment ADVANCES to ordinal 2 and the owner message is carried forward
+  *     into `lastMessages` (the genuine cross-MG fee/config dependency `getFeeAddresses` reads).
   */
 object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
 
@@ -70,9 +70,9 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
 
   private val ordinal: SnapshotOrdinal = SnapshotOrdinal(NonNegLong(2L))
 
-  /** Build the processor with a `createContext` that ALWAYS RAISES — modeling the `SnapshotDifferentThanExpected` /
-    * `CannotCreateContext` divergence the freeze hits when gl0 recreates an ordinal-N currency snapshot against its genesis prior.
-    * Under `Recreate` this raise is reached (and caught → commitment frozen); under `AdoptFromSignedFields` it is never reached.
+  /** Build the processor with a `createContext` that ALWAYS RAISES — modeling the `SnapshotDifferentThanExpected` / `CannotCreateContext`
+    * divergence the freeze hits when gl0 recreates an ordinal-N currency snapshot against its genesis prior. Under `Recreate` this raise is
+    * reached (and caught → commitment frozen); under `AdoptFromSignedFields` it is never reached.
     */
   private def mkProcessor(
     implicit h: Hasher[IO],
@@ -113,8 +113,8 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
     } yield processor
   }
 
-  /** An empty-state `CurrencySnapshotInfo` carrying only an optional `lastMessages` — the roots-only shape gl0 commits on the
-    * adopt path. Used as the prior (`Right`) Info so the adopted binary is a SECOND incremental (reaches `createContext`).
+  /** An empty-state `CurrencySnapshotInfo` carrying only an optional `lastMessages` — the roots-only shape gl0 commits on the adopt path.
+    * Used as the prior (`Right`) Info so the adopted binary is a SECOND incremental (reaches `createContext`).
     */
   private def info(lastMessages: Option[SortedMap[MessageType, Signed[CurrencyMessage]]]): CurrencySnapshotInfo =
     CurrencySnapshotInfo(
@@ -160,9 +160,9 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
     forAsyncHasher[IO, CurrencyIncrementalSnapshot](snapshot, mgKeyPair)
   }
 
-  /** A signed plain transfer `source → destination` of `amount` (fee 0), parented at `emptyCurrency(metagraphIdentifier)` so the source
-    * ref advances to ordinal 1 — the on-disk shape a fresh metagraph wallet's first tx carries. Signed by the SOURCE key (irrelevant to
-    * the adopt derivation, which replays already-accepted events without re-validating signatures).
+  /** A signed plain transfer `source → destination` of `amount` (fee 0), parented at `emptyCurrency(metagraphIdentifier)` so the source ref
+    * advances to ordinal 1 — the on-disk shape a fresh metagraph wallet's first tx carries. Signed by the SOURCE key (irrelevant to the
+    * adopt derivation, which replays already-accepted events without re-validating signatures).
     */
   private def signedTransfer(
     source: Address,
@@ -184,7 +184,8 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
     )
 
   /** Wrap a single signed transaction into a `BlockAsActiveTip` (the on-wire shape `CurrencyIncrementalSnapshot.blocks` carries). The
-    * parent BlockReference is arbitrary — the adopt derivation reads only the block's transactions. */
+    * parent BlockReference is arbitrary — the adopt derivation reads only the block's transactions.
+    */
   private def blockOf(tx: Signed[Transaction]): BlockAsActiveTip =
     BlockAsActiveTip(
       Signed(
@@ -208,7 +209,10 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
 
   /** Extract the per-MG committed-state ordinal + lastMessages from a `processCurrencySnapshots` result. */
   private def committed(
-    result: SortedMap[Address, (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], SortedMap[Address, Balance])],
+    result: SortedMap[
+      Address,
+      (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], SortedMap[Address, Balance])
+    ],
     mgAddr: Address
   ): Option[(SnapshotOrdinal, Option[SortedMap[MessageType, Signed[CurrencyMessage]]])] =
     result
@@ -218,7 +222,10 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
 
   /** Extract the FULL per-MG committed `CurrencySnapshotInfo` (balances/refs/...) from a `processCurrencySnapshots` result. */
   private def committedInfo(
-    result: SortedMap[Address, (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], SortedMap[Address, Balance])],
+    result: SortedMap[
+      Address,
+      (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], SortedMap[Address, Balance])
+    ],
     mgAddr: Address
   ): Option[(SnapshotOrdinal, CurrencySnapshotInfo)] =
     result
@@ -237,7 +244,7 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
       // binary below into the second-incremental `Right` branch (the only branch that reaches `createContext`).
       firstIncremental <- signedIncremental(1L, Hash.empty, None, mgKeyPair)
       firstHash <- firstIncremental.toHashed.map(_.hash)
-      priorState = (Right((firstIncremental, info(None))): CurrencySnapshotWithState)
+      priorState = Right((firstIncremental, info(None))): CurrencySnapshotWithState
       prior: SortedMap[Address, CurrencySnapshotWithState] =
         SortedMap(mgAddr -> priorState)(Address.OrderingInstance)
 
@@ -301,7 +308,7 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
       priorMessages: SortedMap[MessageType, Signed[CurrencyMessage]] = SortedMap(MessageType.Owner -> priorOwner)
       firstIncremental <- signedIncremental(1L, Hash.empty, None, mgKeyPair)
       firstHash <- firstIncremental.toHashed.map(_.hash)
-      priorState = (Right((firstIncremental, info(Some(priorMessages)))): CurrencySnapshotWithState)
+      priorState = Right((firstIncremental, info(Some(priorMessages)))): CurrencySnapshotWithState
       prior: SortedMap[Address, CurrencySnapshotWithState] =
         SortedMap(mgAddr -> priorState)(Address.OrderingInstance)
 
@@ -327,149 +334,147 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
       )
   }
 
-  test("adopt path: balances + lastTxRefs are MAINTAINED (non-empty, correct) after applying a transfer, root matches stateProof") {
-    res =>
-      implicit val (h, sp, j) = res
-      // `CurrencySnapshotInfo.stateProof` ignores the selector value (always builds the 9-field currency proof), so the ambient
-      // `globalStateProofSelector` yields the byte-identical proof the production `CurrencyStateProofSelector` does.
-      for {
-        processor <- mkProcessor
-        mgKeyPair <- KeyPairGenerator.makeKeyPair[IO]
-        mgAddr = PublicKeyOps(mgKeyPair.getPublic).toAddress
-        mgIdentifier <- TransactionReference.emptyCurrency[IO](mgAddr).map(_.hash)
+  test("adopt path: balances + lastTxRefs are MAINTAINED (non-empty, correct) after applying a transfer, root matches stateProof") { res =>
+    implicit val (h, sp, j) = res
+    // `CurrencySnapshotInfo.stateProof` ignores the selector value (always builds the 9-field currency proof), so the ambient
+    // `globalStateProofSelector` yields the byte-identical proof the production `CurrencyStateProofSelector` does.
+    for {
+      processor <- mkProcessor
+      mgKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      mgAddr = PublicKeyOps(mgKeyPair.getPublic).toAddress
+      mgIdentifier <- TransactionReference.emptyCurrency[IO](mgAddr).map(_.hash)
 
-        sourceKp <- KeyPairGenerator.makeKeyPair[IO]
-        destKp <- KeyPairGenerator.makeKeyPair[IO]
-        source = PublicKeyOps(sourceKp.getPublic).toAddress
-        dest = PublicKeyOps(destKp.getPublic).toAddress
+      sourceKp <- KeyPairGenerator.makeKeyPair[IO]
+      destKp <- KeyPairGenerator.makeKeyPair[IO]
+      source = PublicKeyOps(sourceKp.getPublic).toAddress
+      dest = PublicKeyOps(destKp.getPublic).toAddress
 
-        // Prior `Right` at ordinal 1 with a FUNDED source — this is the genesis-rooted balance state gl0 holds (e.g. via the
-        // `Left(fullSnapshot)` adopt at GSCEP:377). The adopt derivation must apply the transfer forward onto this.
-        priorBalances = SortedMap(source -> Balance(NonNegLong(100L)))(Address.OrderingInstance)
-        priorInfo = info(None).copy(balances = priorBalances)
-        firstIncremental <- signedIncremental(1L, Hash.empty, None, mgKeyPair)
-        firstHash <- firstIncremental.toHashed.map(_.hash)
-        prior: SortedMap[Address, CurrencySnapshotWithState] =
-          SortedMap(mgAddr -> (Right((firstIncremental, priorInfo)): CurrencySnapshotWithState))(Address.OrderingInstance)
+      // Prior `Right` at ordinal 1 with a FUNDED source — this is the genesis-rooted balance state gl0 holds (e.g. via the
+      // `Left(fullSnapshot)` adopt at GSCEP:377). The adopt derivation must apply the transfer forward onto this.
+      priorBalances = SortedMap(source -> Balance(NonNegLong(100L)))(Address.OrderingInstance)
+      priorInfo = info(None).copy(balances = priorBalances)
+      firstIncremental <- signedIncremental(1L, Hash.empty, None, mgKeyPair)
+      firstHash <- firstIncremental.toHashed.map(_.hash)
+      prior: SortedMap[Address, CurrencySnapshotWithState] =
+        SortedMap(mgAddr -> (Right((firstIncremental, priorInfo)): CurrencySnapshotWithState))(Address.OrderingInstance)
 
-        // The adopted second incremental carries one accepted transfer: source → dest, amount 30, fee 0.
-        transfer <- signedTransfer(source, dest, 30L, mgIdentifier, sourceKp)
-        block = blockOf(transfer)
-        transferRef <- TransactionReference.of[IO](transfer)
+      // The adopted second incremental carries one accepted transfer: source → dest, amount 30, fee 0.
+      transfer <- signedTransfer(source, dest, 30L, mgIdentifier, sourceKp)
+      block = blockOf(transfer)
+      transferRef <- TransactionReference.of[IO](transfer)
 
-        // Compute the EXPECTED post-state Info the metagraph's ml0 would commit, and stamp its stateProof into the snapshot
-        // (exactly what `CurrencySnapshotAcceptanceManager` does: `csi.stateProof(ordinal)`). source 100−30=70, dest 0+30=30;
-        // source ref → ordinal 1 (the transfer), dest ref → emptyCurrency seed.
-        expectedBalances = SortedMap(source -> Balance(NonNegLong(70L)), dest -> Balance(NonNegLong(30L)))(Address.OrderingInstance)
-        expectedTxRefs = SortedMap(
-          source -> transferRef,
-          dest -> TransactionReference(TransactionOrdinal(NonNegLong(0L)), mgIdentifier)
-        )(Address.OrderingInstance)
-        expectedInfo = priorInfo.copy(balances = expectedBalances, lastTxRefs = expectedTxRefs)
-        committedProof <- expectedInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+      // Compute the EXPECTED post-state Info the metagraph's ml0 would commit, and stamp its stateProof into the snapshot
+      // (exactly what `CurrencySnapshotAcceptanceManager` does: `csi.stateProof(ordinal)`). source 100−30=70, dest 0+30=30;
+      // source ref → ordinal 1 (the transfer), dest ref → emptyCurrency seed.
+      expectedBalances = SortedMap(source -> Balance(NonNegLong(70L)), dest -> Balance(NonNegLong(30L)))(Address.OrderingInstance)
+      expectedTxRefs = SortedMap(
+        source -> transferRef,
+        dest -> TransactionReference(TransactionOrdinal(NonNegLong(0L)), mgIdentifier)
+      )(Address.OrderingInstance)
+      expectedInfo = priorInfo.copy(balances = expectedBalances, lastTxRefs = expectedTxRefs)
+      committedProof <- expectedInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
 
-        secondIncremental <- signedIncremental(
-          2L,
-          firstHash,
-          None,
-          mgKeyPair,
-          blocks = SortedSet(block),
-          stateProof = committedProof
-        )
-        secondBinary <- binaryOf(secondIncremental, firstHash, mgKeyPair)
-        adopted = SortedMap(mgAddr -> NonEmptyList.of(secondBinary))(Address.OrderingInstance)
+      secondIncremental <- signedIncremental(
+        2L,
+        firstHash,
+        None,
+        mgKeyPair,
+        blocks = SortedSet(block),
+        stateProof = committedProof
+      )
+      secondBinary <- binaryOf(secondIncremental, firstHash, mgKeyPair)
+      adopted = SortedMap(mgAddr -> NonEmptyList.of(secondBinary))(Address.OrderingInstance)
 
-        adoptResult <- processor.processCurrencySnapshots(
-          ordinal,
-          SortedMap.empty[Address, Balance],
-          prior,
-          adopted,
-          _ => None.pure[IO],
-          CurrencyAdoptionMode.AdoptFromSignedFields
-        )
-        result = committedInfo(adoptResult, mgAddr)
-      } yield
-        expect.all(
-          // Commitment advanced to ordinal 2 (freeze stays dead).
-          result.map(_._1) == Some(SnapshotOrdinal(NonNegLong(2L))),
-          // Balances are MAINTAINED and CORRECT — not empty. This is the cl1-bootstrap fix.
-          result.map(_._2.balances) == Some(expectedBalances),
-          // lastTxRefs maintained: source advanced to the transfer's ref, fresh dest seeded with emptyCurrency.
-          result.map(_._2.lastTxRefs) == Some(expectedTxRefs),
-          // The whole derived Info equals what the metagraph committed (root matched → derived adopted verbatim).
-          result.map(_._2) == Some(expectedInfo)
-        )
+      adoptResult <- processor.processCurrencySnapshots(
+        ordinal,
+        SortedMap.empty[Address, Balance],
+        prior,
+        adopted,
+        _ => None.pure[IO],
+        CurrencyAdoptionMode.AdoptFromSignedFields
+      )
+      result = committedInfo(adoptResult, mgAddr)
+    } yield
+      expect.all(
+        // Commitment advanced to ordinal 2 (freeze stays dead).
+        result.map(_._1) == Some(SnapshotOrdinal(NonNegLong(2L))),
+        // Balances are MAINTAINED and CORRECT — not empty. This is the cl1-bootstrap fix.
+        result.map(_._2.balances) == Some(expectedBalances),
+        // lastTxRefs maintained: source advanced to the transfer's ref, fresh dest seeded with emptyCurrency.
+        result.map(_._2.lastTxRefs) == Some(expectedTxRefs),
+        // The whole derived Info equals what the metagraph committed (root matched → derived adopted verbatim).
+        result.map(_._2) == Some(expectedInfo)
+      )
   }
 
-  test("adopt path: derived-root verification — matches on valid stateProof, FALLS BACK to prior balances on tampered stateProof") {
-    res =>
-      implicit val (h, sp, j) = res
-      for {
-        processor <- mkProcessor
-        mgKeyPair <- KeyPairGenerator.makeKeyPair[IO]
-        mgAddr = PublicKeyOps(mgKeyPair.getPublic).toAddress
-        mgIdentifier <- TransactionReference.emptyCurrency[IO](mgAddr).map(_.hash)
+  test("adopt path: derived-root verification — matches on valid stateProof, FALLS BACK to prior balances on tampered stateProof") { res =>
+    implicit val (h, sp, j) = res
+    for {
+      processor <- mkProcessor
+      mgKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      mgAddr = PublicKeyOps(mgKeyPair.getPublic).toAddress
+      mgIdentifier <- TransactionReference.emptyCurrency[IO](mgAddr).map(_.hash)
 
-        sourceKp <- KeyPairGenerator.makeKeyPair[IO]
-        destKp <- KeyPairGenerator.makeKeyPair[IO]
-        source = PublicKeyOps(sourceKp.getPublic).toAddress
-        dest = PublicKeyOps(destKp.getPublic).toAddress
+      sourceKp <- KeyPairGenerator.makeKeyPair[IO]
+      destKp <- KeyPairGenerator.makeKeyPair[IO]
+      source = PublicKeyOps(sourceKp.getPublic).toAddress
+      dest = PublicKeyOps(destKp.getPublic).toAddress
 
-        priorBalances = SortedMap(source -> Balance(NonNegLong(100L)))(Address.OrderingInstance)
-        priorInfo = info(None).copy(balances = priorBalances)
-        firstIncremental <- signedIncremental(1L, Hash.empty, None, mgKeyPair)
-        firstHash <- firstIncremental.toHashed.map(_.hash)
-        prior: SortedMap[Address, CurrencySnapshotWithState] =
-          SortedMap(mgAddr -> (Right((firstIncremental, priorInfo)): CurrencySnapshotWithState))(Address.OrderingInstance)
+      priorBalances = SortedMap(source -> Balance(NonNegLong(100L)))(Address.OrderingInstance)
+      priorInfo = info(None).copy(balances = priorBalances)
+      firstIncremental <- signedIncremental(1L, Hash.empty, None, mgKeyPair)
+      firstHash <- firstIncremental.toHashed.map(_.hash)
+      prior: SortedMap[Address, CurrencySnapshotWithState] =
+        SortedMap(mgAddr -> (Right((firstIncremental, priorInfo)): CurrencySnapshotWithState))(Address.OrderingInstance)
 
-        transfer <- signedTransfer(source, dest, 30L, mgIdentifier, sourceKp)
-        block = blockOf(transfer)
-        transferRef <- TransactionReference.of[IO](transfer)
-        expectedBalances = SortedMap(source -> Balance(NonNegLong(70L)), dest -> Balance(NonNegLong(30L)))(Address.OrderingInstance)
-        expectedTxRefs = SortedMap(
-          source -> transferRef,
-          dest -> TransactionReference(TransactionOrdinal(NonNegLong(0L)), mgIdentifier)
-        )(Address.OrderingInstance)
-        expectedInfo = priorInfo.copy(balances = expectedBalances, lastTxRefs = expectedTxRefs)
-        validProof <- expectedInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+      transfer <- signedTransfer(source, dest, 30L, mgIdentifier, sourceKp)
+      block = blockOf(transfer)
+      transferRef <- TransactionReference.of[IO](transfer)
+      expectedBalances = SortedMap(source -> Balance(NonNegLong(70L)), dest -> Balance(NonNegLong(30L)))(Address.OrderingInstance)
+      expectedTxRefs = SortedMap(
+        source -> transferRef,
+        dest -> TransactionReference(TransactionOrdinal(NonNegLong(0L)), mgIdentifier)
+      )(Address.OrderingInstance)
+      expectedInfo = priorInfo.copy(balances = expectedBalances, lastTxRefs = expectedTxRefs)
+      validProof <- expectedInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
 
-        // VALID: stateProof matches the derived root → adopt the derived (correct) balances.
-        validInc <- signedIncremental(2L, firstHash, None, mgKeyPair, blocks = SortedSet(block), stateProof = validProof)
-        validBinary <- binaryOf(validInc, firstHash, mgKeyPair)
-        validResult <- processor.processCurrencySnapshots(
-          ordinal,
-          SortedMap.empty[Address, Balance],
-          prior,
-          SortedMap(mgAddr -> NonEmptyList.of(validBinary))(Address.OrderingInstance),
-          _ => None.pure[IO],
-          CurrencyAdoptionMode.AdoptFromSignedFields
-        )
-        validCommitted = committedInfo(validResult, mgAddr)
+      // VALID: stateProof matches the derived root → adopt the derived (correct) balances.
+      validInc <- signedIncremental(2L, firstHash, None, mgKeyPair, blocks = SortedSet(block), stateProof = validProof)
+      validBinary <- binaryOf(validInc, firstHash, mgKeyPair)
+      validResult <- processor.processCurrencySnapshots(
+        ordinal,
+        SortedMap.empty[Address, Balance],
+        prior,
+        SortedMap(mgAddr -> NonEmptyList.of(validBinary))(Address.OrderingInstance),
+        _ => None.pure[IO],
+        CurrencyAdoptionMode.AdoptFromSignedFields
+      )
+      validCommitted = committedInfo(validResult, mgAddr)
 
-        // TAMPERED: same accepted transfer, but the committed stateProof claims a different (lying) state root. The derived
-        // root will NOT match → gl0 falls back to the PRIOR balances (carry forward), still advancing the ordinal.
-        tamperedProof = validProof.copy(balancesProof = Hash("deadbeef" * 8))
-        tamperedInc <- signedIncremental(2L, firstHash, None, mgKeyPair, blocks = SortedSet(block), stateProof = tamperedProof)
-        tamperedBinary <- binaryOf(tamperedInc, firstHash, mgKeyPair)
-        tamperedResult <- processor.processCurrencySnapshots(
-          ordinal,
-          SortedMap.empty[Address, Balance],
-          prior,
-          SortedMap(mgAddr -> NonEmptyList.of(tamperedBinary))(Address.OrderingInstance),
-          _ => None.pure[IO],
-          CurrencyAdoptionMode.AdoptFromSignedFields
-        )
-        tamperedCommitted = committedInfo(tamperedResult, mgAddr)
-      } yield
-        expect.all(
-          // Valid: derived balances adopted.
-          validCommitted.map(_._1) == Some(SnapshotOrdinal(NonNegLong(2L))),
-          validCommitted.map(_._2.balances) == Some(expectedBalances),
-          // Tampered: ordinal STILL advances (freeze stays dead) ...
-          tamperedCommitted.map(_._1) == Some(SnapshotOrdinal(NonNegLong(2L))),
-          // ... but gl0 does NOT commit the unverified derived balances — it carries forward the prior (last verified) balances.
-          tamperedCommitted.map(_._2.balances) == Some(priorBalances),
-          tamperedCommitted.map(_._2.balances) != Some(expectedBalances)
-        )
+      // TAMPERED: same accepted transfer, but the committed stateProof claims a different (lying) state root. The derived
+      // root will NOT match → gl0 falls back to the PRIOR balances (carry forward), still advancing the ordinal.
+      tamperedProof = validProof.copy(balancesProof = Hash("deadbeef" * 8))
+      tamperedInc <- signedIncremental(2L, firstHash, None, mgKeyPair, blocks = SortedSet(block), stateProof = tamperedProof)
+      tamperedBinary <- binaryOf(tamperedInc, firstHash, mgKeyPair)
+      tamperedResult <- processor.processCurrencySnapshots(
+        ordinal,
+        SortedMap.empty[Address, Balance],
+        prior,
+        SortedMap(mgAddr -> NonEmptyList.of(tamperedBinary))(Address.OrderingInstance),
+        _ => None.pure[IO],
+        CurrencyAdoptionMode.AdoptFromSignedFields
+      )
+      tamperedCommitted = committedInfo(tamperedResult, mgAddr)
+    } yield
+      expect.all(
+        // Valid: derived balances adopted.
+        validCommitted.map(_._1) == Some(SnapshotOrdinal(NonNegLong(2L))),
+        validCommitted.map(_._2.balances) == Some(expectedBalances),
+        // Tampered: ordinal STILL advances (freeze stays dead) ...
+        tamperedCommitted.map(_._1) == Some(SnapshotOrdinal(NonNegLong(2L))),
+        // ... but gl0 does NOT commit the unverified derived balances — it carries forward the prior (last verified) balances.
+        tamperedCommitted.map(_._2.balances) == Some(priorBalances),
+        tamperedCommitted.map(_._2.balances) != Some(expectedBalances)
+      )
   }
 }
