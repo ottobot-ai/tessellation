@@ -72,7 +72,13 @@ const verifyGl0SeesAllMetagraphs = async (ids) => {
     // activity yet is present in gl0 but ABSENT from lastCurrencySnapshots — a false negative
     // here. Real currency-state propagation is covered by the transfer/token-lock tests and the
     // per-metagraph token-tx-senders.) May be partial during early startup; retry briefly.
-    const maxAttempts = 30;
+    // Sharded cold-start budget (run-21): at numShards>1 the per-metagraph state reaches gl0's
+    // lastStateChannelSnapshotHashes via the shard-checkpoint pipeline (boot-grace + first committee
+    // quorum + chain-sync pull recovery for BOTH shards), which legitimately takes minutes — run-21 saw
+    // all nodes converge to 2/2 by ~ord 70, just after the old 150s budget. Give the sharded path a longer
+    // budget; the single-shard (non-sharded) path keeps the original 150s.
+    const numShards = parseInt(process.env.NAKAMOTO_NUM_SHARDS || '1', 10);
+    const maxAttempts = numShards > 1 ? 72 : 30; // 360s vs 150s @ 5s/attempt
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         try {
             const data = await fetchJson(`${gl0Url}/global-snapshots/latest/combined`);
