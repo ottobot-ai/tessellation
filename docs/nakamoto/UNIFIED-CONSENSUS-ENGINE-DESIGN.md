@@ -169,6 +169,39 @@ Solo extension remains the N=1 normal case and the N>1 degraded case (all higher
 8. **Genesis edge.** Window 0 anchors on the genesis timestamp; initial registry ships in metagraph genesis (balance-CSV pattern).
 9. **Observability is part of the engine.** Ship with: expected-producer gauge, rank-window countdown, countersign coverage, anchor lag, per-interval production source (rank). Every 2026-06 failure hid in unlogged state; the engine must not be able to fail silently.
 
+### 5.7 The staircase applied to shard-checkpoint leadership (gl0 side — run-10 "Gap A")
+
+Run-10 forensics (2026-06-11) measured a 51-slot shard-leader drought: once the LDD ramp passes (`gap > γ=15`), the
+shard-checkpoint VRF lottery's aggregate win rate is `1-(1-f_B)^Σσ ≈ 5%/slot` — an unbounded geometric tail (mean ~20
+slots, observed 51) that consumed 3.3 min of a 6.5-min allow-spend expiry budget. The same staircase primitive bounds
+this tail, with three differences from the ml0 instance:
+
+1. **Clock.** ml0 ranks open on the producer's LOCAL clock (unprovable ⇒ policy-only). Shard ranks open on the
+   **gl0 anchor ordinal** — a shared logical clock every committee member already observes, and the parent
+   checkpoint's `gl0AnchorOrdinal` is on the wire. Rank eligibility is therefore a **pure function of on-wire data**:
+   `rank_due = ⌊(anchor − parentAnchor − γ) / δ_shard⌋`, ranks ordered by `shuffle(committee(epoch), shardEta, shardOrd)`.
+   Unlike ml0, `verifyLeader` can deterministically *verify* (not just prefer) the fallback producer's eligibility.
+2. **Hybrid, not replacement.** The VRF ramp (`gap ≤ γ`) stays the primary path — unpredictability preserved in the
+   common case, where it resolves most intervals in a few slots. The staircase engages only past γ as the bounded
+   fallback. Worst-case inter-checkpoint becomes `γ + (K_S−1)·δ_shard` (deterministic) instead of unbounded.
+3. **δ floor is propagation-bound, not production-bound.** Checkpoint assembly is <1s (measured); the floor is
+   "rank-r+1 must usually SEE rank-r's checkpoint before its own window opens", or same-ord siblings are minted.
+   Siblings are SAFE (same-ord fork candidates; maxvalid-tk picks one and the canonical-chain attestation rule
+   concentrates attestations on the winner — the attestation-split failure mode is already closed) but wasteful.
+   Default **δ_shard = 10 slots (~65s)** while the sidecar delivery stagger (task #40: stragglers served by 60s
+   re-publish ticks, 107s worst observed) is unresolved; tighten to **3 slots (~20s)** after. HOCON:
+   `nakamoto.sharding.checkpoint.staircase-delta` (gl0-cluster-uniform — committee infra, not metagraph policy).
+
+**Safety argument** (why this needs no new trust): production eligibility is liveness-side. The safety bars are
+untouched — kQuorum distinct committee signatures, `verifyEmbedded`'s deterministic re-verification on every node,
+ancestor-first embedding, TRIM-ANCHOR adoption guard. Grinding is excluded (rank order keys on `shardEta`, frozen at
+the prior period's 2/3-mark). Pseudo-predictability is acceptable here because the schedule is a *duty assignment*,
+not a fork-choice tiebreaker — precomputing it lets an adversary target DoS at the on-duty node, and the staircase
+itself bounds that (next rank steps up after δ); it cannot bias chain selection. Censorship by a scheduled leader is
+bounded by the same (f+1)-window rotation argument as 5.6 §4. One hardening becomes more valuable: **GAP-1 / task #34
+(verify-before-attest)** — predictable leadership lets an adversary *prepare* a bad checkpoint for its window, so
+members must re-exec before signing before this ships beyond testnet.
+
 ## 6. Migration plan (hard fork LAST, per standing phase order)
 
 | Phase | Content | Risk gate |
