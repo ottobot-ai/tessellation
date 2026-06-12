@@ -30,6 +30,7 @@ import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInter
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
@@ -142,7 +143,6 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
       kesSigner = ShardCheckpointProducer.KesSigner.fixed[IO](period = 7, signatureBytes = fixedKesPayload),
       shardEtaFor = _ => IO.pure(fixedShardEta),
       sigmaInCommittee = Ratio.One,
-      slotForGl0Anchor = slotForGl0Anchor,
       slotGapFor = slotGapFor,
       lddConfig = LddConfig.Default,
       derivePerMgState = reExec,
@@ -160,10 +160,17 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
     def loop(attempt: Int): IO[Option[Signed[ShardCheckpoint]]] =
       if (attempt >= maxAttempts) IO.pure(None)
       else
-        producer.produce(pending, SnapshotOrdinal(NonNegLong.unsafeFrom(startOrd + attempt.toLong)), epochZero).flatMap {
-          case s @ Some(_) => IO.pure(s)
-          case None        => loop(attempt + 1)
-        }
+        producer
+          .produce(
+            pending,
+            SnapshotOrdinal(NonNegLong.unsafeFrom(startOrd + attempt.toLong)),
+            epochZero,
+            SlotT.unsafeApply(startOrd + attempt.toLong)
+          )
+          .flatMap {
+            case s @ Some(_) => IO.pure(s)
+            case None        => loop(attempt + 1)
+          }
     loop(0)
   }
 
@@ -177,6 +184,7 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
             parentCheckpointHash = parent,
             shardOrdinal = ShardOrdinal(ord),
             gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(100L + ord)),
+            slot = SlotT.unsafeApply(100L + ord),
             derivedStateDelta = ShardDerivedStateDelta.empty,
             emittedReceipts = List.empty,
             committeeSignatures = NonEmptyList.of(

@@ -18,6 +18,7 @@ import io.constellationnetwork.schema.artifact.{SharedArtifact, SpendAction, Spe
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
@@ -185,6 +186,7 @@ object ShardCheckpointWireCodecsSuite extends MutableIOSuite {
       parentCheckpointHash = hash('p'),
       shardOrdinal = ShardOrdinal(42L),
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong(99L)),
+      slot = SlotT.unsafeApply(99L),
       derivedStateDelta = sampleDelta,
       emittedReceipts = List(sampleReceipt),
       committeeSignatures = NonEmptyList.of(mkSig(1, 7), mkSig(2, 8), mkSig(3, 9)),

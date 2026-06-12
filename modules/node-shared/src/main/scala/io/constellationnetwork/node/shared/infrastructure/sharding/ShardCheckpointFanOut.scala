@@ -10,6 +10,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardBinary
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.security.Hasher
@@ -95,6 +96,7 @@ object ShardCheckpointFanOut {
     shardBinaryBuffers: Map[ShardId, ShardBinaryBuffer[F]],
     producedOrd: SnapshotOrdinal,
     epoch: EtaPeriod,
+    currentSlot: Slot,
     shardProducers: Map[ShardId, ShardCheckpointProducer[F]],
     shardChainStores: Map[ShardId, ShardChainStore[F]],
     selfPeerId: PeerId,
@@ -133,18 +135,17 @@ object ShardCheckpointFanOut {
               }
             pendingF.flatMap { forShard =>
               producer
-                .produce(forShard, producedOrd, epoch)
+                .produce(forShard, producedOrd, epoch, currentSlot)
                 .flatMap {
                   case None             => Async[F].unit
                   case Some(checkpoint) =>
-                    // Recompute the producer's own (slot, vrfOutput) for the chain-store write.
-                    // `slotForGl0Anchor(gl0AnchorOrdinal) = Slot(gl0AnchorOrdinal.value)` — identical
-                    // pure mapping on producer + receiver so `maxvalid-tk` tiebreaks agree. vrfOutput is
-                    // derived from the producer's own committee VRF proof (first committee signature),
-                    // mirroring the receiver-side `vrfOutputFromProof` recovery so both writers store
-                    // byte-identical vrfOutput for the same checkpoint.
+                    // Chain-store write keyed on the envelope's WIRE slot (design §5.7) — the same value every
+                    // receiver stores, so `maxvalid-tk` tiebreaks agree byte-for-byte. vrfOutput is derived from
+                    // the producer's own committee VRF proof (first committee signature), mirroring the
+                    // receiver-side `vrfOutputFromProof` recovery so both writers store byte-identical vrfOutput
+                    // for the same checkpoint.
                     val cp = checkpoint.value
-                    val localSlot = cp.gl0AnchorOrdinal.value.value
+                    val localSlot = cp.slot.value.value
                     val vrfProofBytes = cp.committeeSignatures.head.vrfProof.toBytes
                     val vrfOut = vrfOutputFromProof(vrfProofBytes)
                     shardChainStores.get(sid) match {

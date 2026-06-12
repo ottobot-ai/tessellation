@@ -208,6 +208,7 @@ message ShardCheckpointWire {
   ShardDerivedStateDeltaWire derived_state_delta = 7;
   repeated CommitteeMemberSignatureWire committee_signatures = 8;
   bytes emitted_receipts_json = 9;       // JSON bytes for List[CrossShardReceipt]; empty == empty list
+  uint64 slot = 10;                      // wall-clock slot of the leader-lottery win (design §5.7); gl0_anchor_ordinal is chain-link data only
 }
 
 // Per-metagraph slice of `ShardDerivedStateDelta.includedSnapshots`. The

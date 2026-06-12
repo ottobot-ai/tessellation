@@ -120,11 +120,9 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         // threads the resolved eta into its VRF membership proof; rotation correctness is covered in ShardSlotLeaderSuite.
         shardEtaFor = (sid, _) => IO.pure(if (sid == shardZero) Some(shardEta) else None),
         sigmaInCommittee = Ratio(1, 4),
-        slotForGl0Anchor = ord => Slot.unsafeApply(ord.value.value),
-        slotGapFor = (cur, parentOpt) => parentOpt.fold(cur.value.value)(p => math.max(1L, cur.value.value - p.value.value)),
         lddConfig = LddConfig.Default
       )
-      _ <- emitter.emit(shardZero, checkpointHash, SnapshotOrdinal.unsafeApply(5L), EtaPeriod(0L), None)
+      _ <- emitter.emit(shardZero, checkpointHash, Slot.unsafeApply(5L), EtaPeriod(0L))
       wires <- published.get
       // Self-attestation recorded locally (excludeSelf=false to see it; default excludeSelf would hide it).
       selfCount <- tracker.attestationCountFor(checkpointHash, excludeSelf = false)
@@ -163,11 +161,9 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         tipTrackerFor = _ => Some(tracker),
         shardEtaFor = (_, _) => IO.pure(Option.empty[Array[Byte]]), // no eta for any shard ⇒ skip
         sigmaInCommittee = Ratio(1, 4),
-        slotForGl0Anchor = ord => Slot.unsafeApply(ord.value.value),
-        slotGapFor = (cur, _) => cur.value.value,
         lddConfig = LddConfig.Default
       )
-      _ <- emitter.emit(shardZero, checkpointHash, SnapshotOrdinal.unsafeApply(5L), EtaPeriod(0L), None)
+      _ <- emitter.emit(shardZero, checkpointHash, Slot.unsafeApply(5L), EtaPeriod(0L))
       wires <- published.get
       count <- tracker.attestationCountFor(checkpointHash, excludeSelf = false)
     } yield expect.all(wires.isEmpty, count == 0)

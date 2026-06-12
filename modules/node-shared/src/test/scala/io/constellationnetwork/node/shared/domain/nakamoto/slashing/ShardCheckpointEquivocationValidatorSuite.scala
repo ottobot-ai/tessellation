@@ -10,6 +10,7 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, KesRegistryEntry}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
@@ -99,6 +100,7 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
         parentCheckpointHash = parentCheckpointHash,
         shardOrdinal = shardOrdinal,
         gl0AnchorOrdinal = gl0AnchorOrdinal,
+        slot = SlotT.unsafeApply(gl0AnchorOrdinal.value.value),
         derivedStateDelta = ShardDerivedStateDelta.empty,
         emittedReceipts = List.empty,
         committeeSignatures = NonEmptyList.of(placeholderSig),

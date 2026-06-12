@@ -4,6 +4,7 @@ import cats.data.NonEmptyList
 
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.security.hash.Hash
 
 import derevo.cats.{eqv, show}
@@ -36,7 +37,13 @@ import derevo.derive
   * @param shardOrdinal
   *   monotonic per-shard sequence number (`parent.shardOrdinal.next`)
   * @param gl0AnchorOrdinal
-  *   loose coupling — the gl0 ord this checkpoint expects to ride into; gl0 accepts at this or any later ord (see §7.2)
+  *   loose coupling — the gl0 ord this checkpoint expects to ride into; gl0 accepts at this or any later ord (see §7.2). Chain-link DATA
+  *   only — NOT the lottery clock (that is [[slot]]; design §5.7, owner-corrected 2026-06-11)
+  * @param slot
+  *   the wall-clock slot (shared genesis-anchored grid, `slotDuration`-parametrized) at which the producer won the shard-leader lottery.
+  *   Signed (part of [[ShardCheckpointSigPreimage]]) so a relayer cannot alter it. Validity bounds at receive: strictly monotone vs the
+  *   parent checkpoint's slot; the full skew bound (`<= now + eps`) lands with the Slice-13 cryptographic `verifyLeader`. maxvalid-tk
+  *   prefers the LOWER slot on ties, so inflating the slot is self-defeating and deflating it is blocked by monotonicity
   * @param derivedStateDelta
   *   per-MG state contribution this shard produced for this checkpoint window
   * @param emittedReceipts
@@ -53,6 +60,7 @@ final case class ShardCheckpoint(
   parentCheckpointHash: Hash,
   shardOrdinal: ShardOrdinal,
   gl0AnchorOrdinal: SnapshotOrdinal,
+  slot: Slot,
   derivedStateDelta: ShardDerivedStateDelta,
   emittedReceipts: List[CrossShardReceipt],
   committeeSignatures: NonEmptyList[CommitteeMemberSignature],
@@ -75,6 +83,7 @@ final case class ShardCheckpoint(
       parentCheckpointHash = parentCheckpointHash,
       shardOrdinal = shardOrdinal,
       gl0AnchorOrdinal = gl0AnchorOrdinal,
+      slot = slot,
       derivedStateDelta = derivedStateDelta,
       emittedReceipts = emittedReceipts,
       epoch = epoch
@@ -97,6 +106,7 @@ final case class ShardCheckpointSigPreimage(
   parentCheckpointHash: Hash,
   shardOrdinal: ShardOrdinal,
   gl0AnchorOrdinal: SnapshotOrdinal,
+  slot: Slot,
   derivedStateDelta: ShardDerivedStateDelta,
   emittedReceipts: List[CrossShardReceipt],
   epoch: EtaPeriod

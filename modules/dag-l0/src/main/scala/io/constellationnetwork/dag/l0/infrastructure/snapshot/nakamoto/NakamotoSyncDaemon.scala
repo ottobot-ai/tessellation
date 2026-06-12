@@ -1599,74 +1599,12 @@ object NakamotoSyncDaemon {
         case _ => Async[F].unit
       }
 
-      // ─── Hierarchical-shard-checkpoints v1 — per-ord producer fan-out (decoupled from gl0-leader win) ──
-      // EVERY node drives its per-shard producers for this canonical gl0 ord, INSIDE the becameBestTip
-      // gate. This is what decouples shard-checkpoint production from the gl0-slot win: the gl0 leader
-      // produced the snapshot, but any node that received it as its best tip (including non-leaders) fans
-      // out the shard checkpoints here — so a shard whose committee leader is NOT the gl0 leader still
-      // produces. The gl0 leader itself fans out for its own ord via `SnapshotLeaderLoop.onSlotWon`
-      // (GossipSub doesn't echo a publisher its own message), so together these fire exactly once per
-      // canonical ord per node. `ShardChainStore.store` is idempotent by hash, so an accidental double on
-      // the same checkpoint dedups.
-      //
-      // MUST gate on becameBestTip — NEVER the `storeForkBranch` / `becameBest == false` path. A checkpoint
-      // anchored to a non-canonical gl0 ord is a bug (it would chain off a gl0 ord that never committed).
-      // `signedSnapshot` carries the canonical snapshot here; its `stateChannelSnapshots` are the binaries
-      // partitioned per shard (an empty shard this ord ⇒ `produce` returns `None` ⇒ no empty checkpoint).
-      //
-      // ─── Slice S6 — OFF the snapshot-processing critical path ───────────────────────────────────────
-      // S3 made this fan-out HEAVY: `ShardCheckpointFanOut.run` → `producer.produce` → `derivePerMgState`
-      // now runs a full `processCurrencySnapshots` re-execution per shard per ord. Running that inline
-      // here — while `processValidSnapshotInner`'s caller holds `snapshotSemaphore.permit` — added that
-      // re-exec latency to every node every ordinal, so a straggler fell ~13 ords behind and tripped the
-      // ±3 cluster-sync check. We launch it on the app-scoped `Supervisor` instead of inline (and instead
-      // of a bare `Async.start`, which previously leaked a fiber that outlived the daemon — see the
-      // backfill seam at the bottom of this object). The fiber is lifetime-scoped to the daemon.
-      //
-      // DETERMINISM (why moving this async is safe for the gl0 snapshot):
-      //   1. Inputs captured BY VALUE here — `stateChannelSnapshots`, `producedOrd`, `epoch` are bound
-      //      to immutable `val`s before `supervise`, so the fiber sees the canonical snapshot for THIS
-      //      ordinal, never a later mutated reference. `signed.value.stateChannelSnapshots` is itself an
-      //      immutable `SortedMap`, so the capture is a stable snapshot of the binaries for this ord.
-      //   2. The gl0 snapshot is ALREADY committed by the time we get here — the canonical-storage writes
-      //      above (setHeadForRecovery / setForRecovery) and the chainStore best-tip have already run for
-      //      this becameBestTip ord. The fan-out only SELF-stores its produced checkpoint into the
-      //      per-shard `ShardChainStore` and publishes it; it never feeds back into the gl0 snapshot being
-      //      processed. So whether it runs inline or on a fiber cannot change the gl0 snapshot's bytes.
-      //   3. `ShardChainStore.store` is idempotent by hash (per FanOut scaladoc) and monotonic by shard
-      //      ordinal, so the async write racing the NEXT ord's fan-out read is safe — an echo of the same
-      //      checkpoint dedups.
-      //
-      // EMPTY / `None` at numShards=1 ⇒ `whenA(false)` ⇒ nothing is captured or supervised (byte-identical
-      // to the pre-S6 inline path, which was itself `whenA(false)` there). Regression bar preserved.
-      _ <- Async[F].whenA(becameBestTip && shardProducers.nonEmpty && shardAssignment.isDefined) {
-        signedSnapshot match {
-          // R-1: the fan-out no longer reads the produced snapshot's `stateChannelSnapshots` (the inversion);
-          // it reads each shard's `shardBinaryBuffers`. We still gate on a canonical (`Some`) signed snapshot —
-          // only fan out for a committed best-tip ord, never a fork branch — but no longer capture its SC map.
-          case Some(_) =>
-            val producedOrd = SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal))
-            val rotationPeriod = EtaCalculation.rotationPeriod(snap.ordinal, etaRotationSnapshots)
-            val epoch = EtaPeriod(rotationPeriod)
-            supervisor
-              .supervise(
-                HasherSelector[F].withCurrent { implicit hasher =>
-                  io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointFanOut.run[F](
-                    shardBinaryBuffers = shardBinaryBuffers,
-                    producedOrd = producedOrd,
-                    epoch = epoch,
-                    shardProducers = shardProducers,
-                    shardChainStores = shardChainStores,
-                    selfPeerId = selfId,
-                    committeeMembership = shardCommitteeMembership,
-                    logger = logger
-                  )
-                }.handleErrorWith(e => logger.warn(e)(s"🧩 Shard producer fan-out failed for ord=${snap.ordinal}"))
-              )
-              .void
-          case None => Async[F].unit
-        }
-      }
+      // ─── Shard-checkpoint fan-out: MOVED to the per-slot tick in SnapshotLeaderLoop (design §5.7,
+      // 2026-06-12). The becameBestTip hook that lived here was the second half of the run-10 Gap-A
+      // cadence inversion: it sampled the shard-leader lottery once per canonical gl0 ORD (the gl0-leader
+      // onSlotWon self-call was the first half), so shards drew ~6.5× slower than gl0's slot grid. The
+      // lottery now draws every wall-clock slot on every node, with the envelope carrying its production
+      // `slot` (signed). Nothing to do on the snapshot-receive path.
 
       // Record in TipTracker (snapshot producer attests to their own tip).
       // `attestedAt` is OUR wall-clock receive time (epoch ms via Clock[F].realTime,
@@ -2205,140 +2143,149 @@ object NakamotoSyncDaemon {
                 }
                 val proofSet = cats.data.NonEmptySet.of(proofs.head, proofs.tail: _*)
                 val signedCheckpoint = Signed(checkpoint, proofSet)
-                // Reconstruct slot + vrfOutput deterministically (the wire drops both).
-                val localSlot = checkpoint.gl0AnchorOrdinal.value.value
+                // Slot = the envelope's WIRE slot (design §5.7) — the signed lottery clock, byte-identical on every
+                // node (the old anchor-derived reconstruction downsampled the lottery to gl0-snapshot cadence).
+                // vrfOutput is still reconstructed from the producer's committee VRF proof (the wire drops it).
+                val localSlot = checkpoint.slot.value.value
                 val vrfOut = vrfOutputFromProof(checkpoint.committeeSignatures.head.vrfProof.toBytes)
                 HasherSelector[F].withCurrent { implicit hasher =>
                   hasher.hash(checkpoint.signingPreimage).flatMap { checkpointHash =>
-                    // S3 — FIX THE ATTESTATION INVERSION. Mirror the global chain's gate
-                    // (validate-by-replay → adopt as best-tip → emitAttestation): re-exec/validate the checkpoint FIRST, and
-                    // only adopt it into the fork DAG + count its signers' attestations + emit OUR own attestation if the
-                    // derivation matched. Previously the emit fired on `becameBestTip` BEFORE `evaluate`, so a node could attest
-                    // (and adopt) a checkpoint whose derivation it had not re-run. `evaluate` runs the committee re-execution
-                    // (`reExecuteDerivation`) on the degraded `T_depth1_shard` path; on the `T_count_shard` fast path it is
-                    // quorum-attested (already cryptographically pre-checked). A `Rejected`/`RejectedReExecutionMismatch` result
-                    // is DROPPED — not stored as adoptable, signers NOT counted, NO attestation emitted (a re-exec deviator must
-                    // not have its checkpoint adopted nor be rewarded with our attestation). Per Q4 the handler stays
-                    // `Async.start`-ed off the gossip thread (see the caller), but WITHIN it the emit is gated on re-exec success.
-                    deps.acceptanceManager.evaluate(checkpoint).flatMap { result =>
-                      // Inversion gate (see `shardCheckpointAdmissible`): adopt + count signers + emit ONLY on a non-rejecting result.
-                      val admissible = shardCheckpointAdmissible(result)
-                      val adoptAndAttest =
-                        entry.chainStore
-                          .store(signedCheckpoint, checkpoint.parentCheckpointHash, checkpoint.shardOrdinal, localSlot, vrfOut)
-                          .flatMap { stored =>
-                            // Became-best-tip gate — byte-identical to the gl0 `becameBest = isNew && bestTipOpt.exists(_.hash ===
-                            // thisHash)` seam. `store` returns `isNew`; if the (re-exec-validated) checkpoint is now the canonical
-                            // bestTip (per ShardChainStore maxvalid-tk fork choice), THIS node attests once for this winning hash.
-                            entry.chainStore.bestTip.flatMap { bestTipOpt =>
-                              val becameBestTip = stored && bestTipOpt.exists(_.hash === checkpointHash)
-                              // Record every committee signer (the producer's own sig seeds 1 attestation) into the tip tracker —
-                              // only now that re-exec validated the checkpoint (so a wrong-derivation envelope never inflates quorum).
-                              checkpoint.committeeSignatures.toList
-                                .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId, sig)) >>
-                                // T_count_shard quorum closure: sign + gossip OUR attestations so every OTHER node's tracker
-                                // crosses ⌈2·K_S/3⌉. Self-exclusion (P-11b) keeps them out of our own threshold count. `None`
-                                // emitter (numShards=1 regression bar) ⇒ no emit. Background-fire so the multi-step sign+publish
-                                // never blocks this handler (the handler is already inside an `Async.start`).
-                                //
-                                // ATTEST ON EVERY ADMISSIBLE RECEIPT, not only on becameBestTip (2026-06-11, run bc5a17r12):
-                                // the best-tip-only gate + the tip-triggered ancestor walk still missed OUT-OF-ORDER arrivals —
-                                // when ord 12 gossips in before ord 11, 12 becomes best tip while 11 is unknown (the ancestor
-                                // walk hits getByHash=None and stops), and when 11 lands later it is NOT a new best tip, so no
-                                // emit ever fires for it. Checkpoints 11/12 then sat below quorum for ~3 min (19 consecutive
-                                // embed-none ords) — the admission plateaus that expired DoubleUse's allow-spend mid-flight.
-                                // The canonical-chain walk below starts from the CURRENT best tip on every receipt and attests
-                                // anything stored + not yet self-attested, so a late-arriving parent is attested the moment it
-                                // lands. Idempotent (tracker self-record) and cheap (≤16 tracker lookups per received envelope).
-                                Async[F]
-                                  .whenA(true) {
-                                    shardCheckpointAttestationEmitter match {
-                                      case None          => Async[F].unit
-                                      case Some(emitter) =>
-                                        // EXECUTION-SHARDING Task 2 attest gate: emit OUR attestation only if THIS node is in shard
-                                        // `s`'s committee for the checkpoint's epoch. A non-member's attestation is rejected by every
-                                        // verifier's `verifyEmbedded` membership pre-check (so it can't count toward quorum) — gating
-                                        // here skips the wasted sign+gossip. The SAME deterministic draw the verifier admits against.
-                                        deps.committeeMembership(checkpoint.shardId, checkpoint.epoch).flatMap { committee =>
-                                          if (!committee.contains(selfId))
-                                            logger.debug(
-                                              s"🧩 ShardCheckpoint attest: self not in committee for shard=${checkpoint.shardId.value.value} " +
-                                                s"epoch=${checkpoint.epoch.value}; skipping attestation"
-                                            )
-                                          else {
+                    // §5.7 slot validity bound — strictly monotone vs the parent's wire slot (when the parent is
+                    // known; orphans are bounded retroactively when the parent connects via the chain-store's
+                    // connectivity gate). Deflating the slot is the only profitable direction (maxvalid-tk prefers
+                    // LOWER slot on ties) and this check closes it; inflating is self-defeating. The wall-clock skew
+                    // bound (`slot <= now + eps`) lands with the Slice-13 cryptographic verifyLeader.
+                    entry.chainStore.getByHash(checkpoint.parentCheckpointHash).flatMap { parentOpt =>
+                      val slotMonotone = parentOpt.forall(_.signed.value.slot.value.value < checkpoint.slot.value.value)
+                      if (!slotMonotone)
+                        logger.warn(
+                          s"🧩 ShardCheckpoint REJECTED (slot not monotone vs parent): shard=${checkpoint.shardId.value.value} " +
+                            s"shardOrd=${checkpoint.shardOrdinal.value} slot=${checkpoint.slot.value.value} " +
+                            s"parentSlot=${parentOpt.map(_.signed.value.slot.value.value).getOrElse(-1L)}"
+                        )
+                      else
+                        // S3 — FIX THE ATTESTATION INVERSION. Mirror the global chain's gate
+                        // (validate-by-replay → adopt as best-tip → emitAttestation): re-exec/validate the checkpoint FIRST, and
+                        // only adopt it into the fork DAG + count its signers' attestations + emit OUR own attestation if the
+                        // derivation matched. Previously the emit fired on `becameBestTip` BEFORE `evaluate`, so a node could attest
+                        // (and adopt) a checkpoint whose derivation it had not re-run. `evaluate` runs the committee re-execution
+                        // (`reExecuteDerivation`) on the degraded `T_depth1_shard` path; on the `T_count_shard` fast path it is
+                        // quorum-attested (already cryptographically pre-checked). A `Rejected`/`RejectedReExecutionMismatch` result
+                        // is DROPPED — not stored as adoptable, signers NOT counted, NO attestation emitted (a re-exec deviator must
+                        // not have its checkpoint adopted nor be rewarded with our attestation). Per Q4 the handler stays
+                        // `Async.start`-ed off the gossip thread (see the caller), but WITHIN it the emit is gated on re-exec success.
+                        deps.acceptanceManager.evaluate(checkpoint).flatMap { result =>
+                          // Inversion gate (see `shardCheckpointAdmissible`): adopt + count signers + emit ONLY on a non-rejecting result.
+                          val admissible = shardCheckpointAdmissible(result)
+                          val adoptAndAttest =
+                            entry.chainStore
+                              .store(signedCheckpoint, checkpoint.parentCheckpointHash, checkpoint.shardOrdinal, localSlot, vrfOut)
+                              .flatMap { stored =>
+                                // Became-best-tip gate — byte-identical to the gl0 `becameBest = isNew && bestTipOpt.exists(_.hash ===
+                                // thisHash)` seam. `store` returns `isNew`; if the (re-exec-validated) checkpoint is now the canonical
+                                // bestTip (per ShardChainStore maxvalid-tk fork choice), THIS node attests once for this winning hash.
+                                entry.chainStore.bestTip.flatMap { bestTipOpt =>
+                                  val becameBestTip = stored && bestTipOpt.exists(_.hash === checkpointHash)
+                                  // Record every committee signer (the producer's own sig seeds 1 attestation) into the tip tracker —
+                                  // only now that re-exec validated the checkpoint (so a wrong-derivation envelope never inflates quorum).
+                                  checkpoint.committeeSignatures.toList
+                                    .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId, sig)) >>
+                                    // T_count_shard quorum closure: sign + gossip OUR attestations so every OTHER node's tracker
+                                    // crosses ⌈2·K_S/3⌉. Self-exclusion (P-11b) keeps them out of our own threshold count. `None`
+                                    // emitter (numShards=1 regression bar) ⇒ no emit. Background-fire so the multi-step sign+publish
+                                    // never blocks this handler (the handler is already inside an `Async.start`).
+                                    //
+                                    // ATTEST ON EVERY ADMISSIBLE RECEIPT, not only on becameBestTip (2026-06-11, run bc5a17r12):
+                                    // the best-tip-only gate + the tip-triggered ancestor walk still missed OUT-OF-ORDER arrivals —
+                                    // when ord 12 gossips in before ord 11, 12 becomes best tip while 11 is unknown (the ancestor
+                                    // walk hits getByHash=None and stops), and when 11 lands later it is NOT a new best tip, so no
+                                    // emit ever fires for it. Checkpoints 11/12 then sat below quorum for ~3 min (19 consecutive
+                                    // embed-none ords) — the admission plateaus that expired DoubleUse's allow-spend mid-flight.
+                                    // The canonical-chain walk below starts from the CURRENT best tip on every receipt and attests
+                                    // anything stored + not yet self-attested, so a late-arriving parent is attested the moment it
+                                    // lands. Idempotent (tracker self-record) and cheap (≤16 tracker lookups per received envelope).
+                                    Async[F]
+                                      .whenA(true) {
+                                        shardCheckpointAttestationEmitter match {
+                                          case None          => Async[F].unit
+                                          case Some(emitter) =>
+                                            // EXECUTION-SHARDING Task 2 attest gate: emit OUR attestation only if THIS node is in shard
+                                            // `s`'s committee for the checkpoint's epoch. A non-member's attestation is rejected by every
+                                            // verifier's `verifyEmbedded` membership pre-check (so it can't count toward quorum) — gating
+                                            // here skips the wasted sign+gossip. The SAME deterministic draw the verifier admits against.
+                                            deps.committeeMembership(checkpoint.shardId, checkpoint.epoch).flatMap { committee =>
+                                              if (!committee.contains(selfId))
+                                                logger.debug(
+                                                  s"🧩 ShardCheckpoint attest: self not in committee for shard=${checkpoint.shardId.value.value} " +
+                                                    s"epoch=${checkpoint.epoch.value}; skipping attestation"
+                                                )
+                                              else {
 
-                                            // ATTEST THE CHAIN, NOT JUST THE TIP (2026-06-11, run bp4wrh5zq): members previously attested
-                                            // only the checkpoint that was the best tip AT THE MOMENT IT ARRIVED. During bootstrap, nodes
-                                            // join the shard topics staggered over minutes while the producer keeps extending, so early
-                                            // shardOrds scroll past before most members are listening — the genesis checkpoint sat at
-                                            // signers=1 for 7+ minutes, and because gl0 embedding is ancestor-first, the WHOLE shard chain's
-                                            // admission was blocked behind the under-attested ancestor (the run-6 DoubleUse spend-action
-                                            // timeout). On becoming best tip, also attest every stored canonical ancestor this node has not
-                                            // yet attested (walk bounded; per-ancestor committee gate on the ancestor's OWN epoch). More
-                                            // attestations are always safe — verifiers dedupe by peerId and check membership — and quorum
-                                            // closes retroactively, unblocking ancestor-first embedding.
-                                            def attestMissingAncestors(h: Hash, remaining: Int): F[Unit] =
-                                              if (remaining <= 0 || h === Hash.empty) Async[F].unit
-                                              else
-                                                entry.chainStore.getByHash(h).flatMap {
-                                                  case None => Async[F].unit // deeper than our stored view — stop
-                                                  case Some(anc) =>
-                                                    val ancCp = anc.signed.value
-                                                    entry.tipTracker.signaturesFor(anc.hash).flatMap { sigs =>
-                                                      Async[F].whenA(!sigs.contains(selfId)) {
-                                                        deps.committeeMembership(ancCp.shardId, ancCp.epoch).flatMap { ancCommittee =>
-                                                          Async[F].whenA(ancCommittee.contains(selfId)) {
-                                                            entry.chainStore.getByHash(ancCp.parentCheckpointHash).flatMap { gpOpt =>
-                                                              logger.info(
-                                                                s"🧩 ShardCheckpoint attest-ancestor: shard=${ancCp.shardId.value.value} " +
-                                                                  s"shardOrd=${ancCp.shardOrdinal.value} gl0Anchor=${ancCp.gl0AnchorOrdinal.value.value} " +
-                                                                  s"— retroactive attestation (chain-not-tip)"
-                                                              ) >>
-                                                                emitter.emit(
-                                                                  ancCp.shardId,
-                                                                  anc.hash,
-                                                                  ancCp.gl0AnchorOrdinal,
-                                                                  ancCp.epoch,
-                                                                  gpOpt.map(_.signed.value.gl0AnchorOrdinal)
-                                                                )
+                                                // ATTEST THE CHAIN, NOT JUST THE TIP (2026-06-11, run bp4wrh5zq): members previously attested
+                                                // only the checkpoint that was the best tip AT THE MOMENT IT ARRIVED. During bootstrap, nodes
+                                                // join the shard topics staggered over minutes while the producer keeps extending, so early
+                                                // shardOrds scroll past before most members are listening — the genesis checkpoint sat at
+                                                // signers=1 for 7+ minutes, and because gl0 embedding is ancestor-first, the WHOLE shard chain's
+                                                // admission was blocked behind the under-attested ancestor (the run-6 DoubleUse spend-action
+                                                // timeout). On becoming best tip, also attest every stored canonical ancestor this node has not
+                                                // yet attested (walk bounded; per-ancestor committee gate on the ancestor's OWN epoch). More
+                                                // attestations are always safe — verifiers dedupe by peerId and check membership — and quorum
+                                                // closes retroactively, unblocking ancestor-first embedding.
+                                                def attestMissingAncestors(h: Hash, remaining: Int): F[Unit] =
+                                                  if (remaining <= 0 || h === Hash.empty) Async[F].unit
+                                                  else
+                                                    entry.chainStore.getByHash(h).flatMap {
+                                                      case None => Async[F].unit // deeper than our stored view — stop
+                                                      case Some(anc) =>
+                                                        val ancCp = anc.signed.value
+                                                        entry.tipTracker.signaturesFor(anc.hash).flatMap { sigs =>
+                                                          Async[F].whenA(!sigs.contains(selfId)) {
+                                                            deps.committeeMembership(ancCp.shardId, ancCp.epoch).flatMap { ancCommittee =>
+                                                              Async[F].whenA(ancCommittee.contains(selfId)) {
+                                                                logger.info(
+                                                                  s"🧩 ShardCheckpoint attest-ancestor: shard=${ancCp.shardId.value.value} " +
+                                                                    s"shardOrd=${ancCp.shardOrdinal.value} slot=${ancCp.slot.value.value} " +
+                                                                    s"— retroactive attestation (chain-not-tip)"
+                                                                ) >>
+                                                                  emitter.emit(ancCp.shardId, anc.hash, ancCp.slot, ancCp.epoch)
+                                                              }
                                                             }
-                                                          }
+                                                          } >> attestMissingAncestors(ancCp.parentCheckpointHash, remaining - 1)
                                                         }
-                                                      } >> attestMissingAncestors(ancCp.parentCheckpointHash, remaining - 1)
                                                     }
-                                                }
 
-                                            // Walk from the CURRENT canonical tip (not the received envelope): covers the received
-                                            // checkpoint when it IS the tip, late-arriving ancestors when it is not, and any other
-                                            // unattested canonical entries in between.
-                                            entry.chainStore.bestTip.flatMap {
-                                              case None      => Async[F].unit
-                                              case Some(tip) => attestMissingAncestors(tip.hash, MaxAncestorAttestWalk)
+                                                // Walk from the CURRENT canonical tip (not the received envelope): covers the received
+                                                // checkpoint when it IS the tip, late-arriving ancestors when it is not, and any other
+                                                // unattested canonical entries in between.
+                                                entry.chainStore.bestTip.flatMap {
+                                                  case None      => Async[F].unit
+                                                  case Some(tip) => attestMissingAncestors(tip.hash, MaxAncestorAttestWalk)
+                                                }
+                                              }
                                             }
-                                          }
                                         }
-                                    }
-                                  }
-                                  .as(becameBestTip)
+                                      }
+                                      .as(becameBestTip)
+                                }
+                              }
+                          val logSkipped =
+                            logger
+                              .info(
+                                s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
+                                  s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
+                                  s"signers=${checkpoint.committeeSignatures.size} evaluate=$result — NOT adopted/attested (re-exec/pre-check reject)"
+                              )
+                              .as(false)
+                          (if (admissible) adoptAndAttest else logSkipped).flatMap { becameBestTip =>
+                            Async[F].whenA(admissible) {
+                              logger.info(
+                                s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
+                                  s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
+                                  s"signers=${checkpoint.committeeSignatures.size} becameBestTip=$becameBestTip evaluate=$result (re-exec validated)"
+                              )
                             }
                           }
-                      val logSkipped =
-                        logger
-                          .info(
-                            s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
-                              s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
-                              s"signers=${checkpoint.committeeSignatures.size} evaluate=$result — NOT adopted/attested (re-exec/pre-check reject)"
-                          )
-                          .as(false)
-                      (if (admissible) adoptAndAttest else logSkipped).flatMap { becameBestTip =>
-                        Async[F].whenA(admissible) {
-                          logger.info(
-                            s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
-                              s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
-                              s"signers=${checkpoint.committeeSignatures.size} becameBestTip=$becameBestTip evaluate=$result (re-exec validated)"
-                          )
                         }
-                      }
                     }
                   }
                 }

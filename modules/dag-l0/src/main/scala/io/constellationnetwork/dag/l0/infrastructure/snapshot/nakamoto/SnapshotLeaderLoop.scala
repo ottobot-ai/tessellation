@@ -417,6 +417,9 @@ object SnapshotLeaderLoop {
     // call site (replaces the prior `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read; project rule:
     // HOCON over scattered sys.env). Drives the depth-k finality gate (`ConfirmationDepthK` below).
     confirmationDepthK: Long = 255L,
+    // Slot duration ms — threaded from `sharedCfg.nakamoto.slotDurationMs.value` at the call site (§5.7: the
+    // consensus time UNIT; replaces the prior `sys.env.get("NAKAMOTO_SLOT_DURATION_MS")` read here).
+    slotDurationMs: Long = 1000L,
     lastKnownSlotRef: Ref[F, Option[Long]],
     epochStateRef: Ref[F, SharedEpochState],
     genesisTimeMs: Long = 0L,
@@ -673,146 +676,193 @@ object SnapshotLeaderLoop {
           attempt
         }
 
-        // Slot duration is fixed at 1s by default. Tests can override via `NAKAMOTO_SLOT_DURATION_MS`
-        // (e.g. 500ms for faster bigset cadence). Tick rate and slot derivation share the same value
-        // so cluster nodes agree on slot index for the same wall-clock instant.
-        val slotDurationMs: Long =
-          sys.env.get("NAKAMOTO_SLOT_DURATION_MS").flatMap(_.toLongOption).getOrElse(1000L)
-        val slotTick: Stream[F, Unit] = Stream
-          .awakeEvery[F](FiniteDuration(slotDurationMs, MILLISECONDS))
-          .evalMap { _ =>
-            for {
-              // Only produce when node is Ready and past genesis time
-              nodeState <- nodeStorage.getNodeState
-              state <- stateRef.get
-              wallClockMs = System.currentTimeMillis()
-              currentSlot = (wallClockMs - state.genesisTimeMs) / slotDurationMs
-              gateOpen <- productionGate.isOpen
-              _ <-
-                if (nodeState =!= NodeState.Ready) Async[F].unit
-                else if (!gateOpen) {
-                  Async[F].whenA(currentSlot % 30 == 0) {
-                    productionGate.pauseReasons
-                      .flatMap(reasons => logger.debug(s"Slot $currentSlot: production paused (${reasons.mkString(", ")})"))
-                  }
-                } else if (currentSlot < 0) {
-                  // Still waiting for coordinated genesis time
-                  Async[F].whenA(currentSlot % 10 == 0)(logger.info(s"⏳ Waiting for genesis (${-currentSlot}s remaining)"))
-                } else
-                  for {
-                    // Slot gap from last stored chain tip. Used for LDD eligibility:
-                    // higher gap = more likely to be eligible (compensates for missed slots).
-                    // Clamped to minimum 1 to prevent negative eligibility thresholds that
-                    // can occur when catch-up sets lastKnownSlotRef to a future network slot.
-                    lastFinalizedSlot <- lastKnownSlotRef.get
-                    slotGap = Math.max(1L, lastFinalizedSlot.fold(currentSlot)(currentSlot - _))
+        // Slot duration: the consensus time UNIT (§5.7 — a parameter, not a constant; 1000 ms prod,
+        // 500 ms fast-test). Threaded from HOCON `nakamoto.slot-duration-ms` (env override applies at
+        // the conf layer via ${?NAKAMOTO_SLOT_DURATION_MS}) — migrated off the sys.env read here per
+        // the project HOCON rule. Tick rate and slot derivation share the same value so cluster nodes
+        // agree on slot index for the same wall-clock instant.
+        // `shardFanOutGate` (design §5.7): at most ONE shard-checkpoint fan-out in flight per node. The per-slot
+        // lottery can win consecutive slots (LDD ramp); without the gate two overlapping fan-out fibers would read
+        // the same shard tip and mint two same-ord sibling checkpoints from the SAME producer — self-equivocation.
+        // tryAcquire-skip (not block): a missed tick is just a lottery draw deferred to the next slot.
+        val slotTick: Stream[F, Unit] = Stream.eval(cats.effect.std.Semaphore[F](1)).flatMap { shardFanOutGate =>
+          Stream
+            .awakeEvery[F](FiniteDuration(slotDurationMs, MILLISECONDS))
+            .evalMap { _ =>
+              for {
+                // Only produce when node is Ready and past genesis time
+                nodeState <- nodeStorage.getNodeState
+                state <- stateRef.get
+                wallClockMs = System.currentTimeMillis()
+                currentSlot = (wallClockMs - state.genesisTimeMs) / slotDurationMs
+                gateOpen <- productionGate.isOpen
+                _ <-
+                  if (nodeState =!= NodeState.Ready) Async[F].unit
+                  else if (!gateOpen) {
+                    Async[F].whenA(currentSlot % 30 == 0) {
+                      productionGate.pauseReasons
+                        .flatMap(reasons => logger.debug(s"Slot $currentSlot: production paused (${reasons.mkString(", ")})"))
+                    }
+                  } else if (currentSlot < 0) {
+                    // Still waiting for coordinated genesis time
+                    Async[F].whenA(currentSlot % 10 == 0)(logger.info(s"⏳ Waiting for genesis (${-currentSlot}s remaining)"))
+                  } else
+                    for {
+                      // Slot gap from last stored chain tip. Used for LDD eligibility:
+                      // higher gap = more likely to be eligible (compensates for missed slots).
+                      // Clamped to minimum 1 to prevent negative eligibility thresholds that
+                      // can occur when catch-up sets lastKnownSlotRef to a future network slot.
+                      lastFinalizedSlot <- lastKnownSlotRef.get
+                      slotGap = Math.max(1L, lastFinalizedSlot.fold(currentSlot)(currentSlot - _))
 
-                    slotRefined = Slot(NonNegLong.unsafeFrom(Math.max(0L, currentSlot)))
+                      slotRefined = Slot(NonNegLong.unsafeFrom(Math.max(0L, currentSlot)))
 
-                    // §3 NIPoPoW S0.4 — N-2 epoch staggering: relative stake is read from the
-                    // distribution recorded at the boundary of `currentEtaPeriod - 2`, NOT from the
-                    // current GSI. This matches Cardano's mark/set/go pipeline: snapshot at the end
-                    // of period N is used for slot eligibility in period N+2. The 2-period gap gives
-                    // finality time for the snapshot to lock in before consensus relies on it.
-                    //
-                    // Fall-through semantics (in `StakeRegistry.relativeStakeAt`): for negative
-                    // lookback periods (the first 2 eta periods after genesis) and for periods that
-                    // EpochStakeHistory hasn't yet recorded (e.g., post-restart before backfill), the
-                    // impl falls back to the current GSI — correct because the genesis distribution
-                    // is unchanged during warmup.
-                    lastChainOrdinal <- chainStore.bestTipOrdinal.map(_.getOrElse(0L))
-                    currentPeriod = EtaCalculation.rotationPeriod(lastChainOrdinal, etaRotationSnapshots)
-                    lookbackPeriod = EtaPeriod(currentPeriod - 2L)
-                    myStake <- stakeRegistry.relativeStakeAt(selfId, lookbackPeriod)
+                      // §3 NIPoPoW S0.4 — N-2 epoch staggering: relative stake is read from the
+                      // distribution recorded at the boundary of `currentEtaPeriod - 2`, NOT from the
+                      // current GSI. This matches Cardano's mark/set/go pipeline: snapshot at the end
+                      // of period N is used for slot eligibility in period N+2. The 2-period gap gives
+                      // finality time for the snapshot to lock in before consensus relies on it.
+                      //
+                      // Fall-through semantics (in `StakeRegistry.relativeStakeAt`): for negative
+                      // lookback periods (the first 2 eta periods after genesis) and for periods that
+                      // EpochStakeHistory hasn't yet recorded (e.g., post-restart before backfill), the
+                      // impl falls back to the current GSI — correct because the genesis distribution
+                      // is unchanged during warmup.
+                      lastChainOrdinal <- chainStore.bestTipOrdinal.map(_.getOrElse(0L))
+                      currentPeriod = EtaCalculation.rotationPeriod(lastChainOrdinal, etaRotationSnapshots)
+                      lookbackPeriod = EtaPeriod(currentPeriod - 2L)
+                      myStake <- stakeRegistry.relativeStakeAt(selfId, lookbackPeriod)
 
-                    // Chain-derived eta: deterministic from stored chain, no in-memory accumulator.
-                    // Period 0: genesis eta (constant). Period N>=1: derived from VRF outputs in period N-1.
-                    // All nodes seeing the same chain derive the same eta — no divergence.
-                    //
-                    // Rotation period is keyed on **ordinal**, not slot — slots are LDD-paced and lumpy;
-                    // ordinals are 1:1 with snapshots and give a stable R that satisfies the R ≥ 3·k₁
-                    // bound. See `docs/nakamoto/attestation-and-finality.md` §1.
-                    genesisEta <- epochStateRef.get.map(_.genesisEta)
-                    eta <-
-                      if (currentPeriod <= 0) {
-                        Async[F].pure(genesisEta)
-                      } else {
-                        chainStore.vrfOutputsForPeriod(currentPeriod - 1, etaRotationSnapshots).map { chainOutputs =>
-                          if (chainOutputs.nonEmpty) {
-                            EtaCalculation.computeEta(genesisEta, currentPeriod, chainOutputs.map(_._2))
-                          } else {
-                            // No chain data yet for previous period — stay on genesis eta
-                            genesisEta
+                      // Chain-derived eta: deterministic from stored chain, no in-memory accumulator.
+                      // Period 0: genesis eta (constant). Period N>=1: derived from VRF outputs in period N-1.
+                      // All nodes seeing the same chain derive the same eta — no divergence.
+                      //
+                      // Rotation period is keyed on **ordinal**, not slot — slots are LDD-paced and lumpy;
+                      // ordinals are 1:1 with snapshots and give a stable R that satisfies the R ≥ 3·k₁
+                      // bound. See `docs/nakamoto/attestation-and-finality.md` §1.
+                      genesisEta <- epochStateRef.get.map(_.genesisEta)
+                      eta <-
+                        if (currentPeriod <= 0) {
+                          Async[F].pure(genesisEta)
+                        } else {
+                          chainStore.vrfOutputsForPeriod(currentPeriod - 1, etaRotationSnapshots).map { chainOutputs =>
+                            if (chainOutputs.nonEmpty) {
+                              EtaCalculation.computeEta(genesisEta, currentPeriod, chainOutputs.map(_._2))
+                            } else {
+                              // No chain data yet for previous period — stay on genesis eta
+                              genesisEta
+                            }
                           }
                         }
+
+                      // Raw VRF-trial counter (incremented BEFORE win/loss check) — pairs with `dag_nakamoto_slots_won` to surface silently-degraded validators (clock skew, missing eta, bad keystore) that would otherwise vanish from finality counters; Prometheus scrapes per node so {node} is added by the collector.
+                      _ <- Metrics[F].incrementCounter("dag_nakamoto_slots_trialed_total")
+
+                      result <- eligibilityChecker.checkEligibility(
+                        vrfSK = vrfSeed,
+                        slot = slotRefined,
+                        slotGap = slotGap,
+                        eta = eta,
+                        relativeStake = myStake,
+                        config = lddConfig
+                      )
+
+                      _ <- result match {
+                        case Some((proof, vrfOutput)) =>
+                          snapshotSemaphore.permit.use { _ =>
+                            onSlotWon(
+                              stateRef,
+                              consensusFns,
+                              snapshotStorage,
+                              chainStore,
+                              eventMempool,
+                              sidecarClient,
+                              tipTracker,
+                              stakeRegistry,
+                              lastGlobalSnapshotStorage,
+                              lastNGlobalSnapshotStorage,
+                              keyPair,
+                              selfId,
+                              vrfSeed,
+                              vrfPK,
+                              proof,
+                              vrfOutput,
+                              eta,
+                              currentSlot,
+                              slotGap,
+                              slotRefined,
+                              lddConfig,
+                              etaRotationSnapshots,
+                              lastKnownSlotRef,
+                              epochStateRef,
+                              productionGate,
+                              productionTimestamps,
+                              nakamotoFinalizedOrdinalRef,
+                              mptStore,
+                              mptOverlay,
+                              operationalKeyMaker,
+                              shardProducers,
+                              shardChainStores,
+                              shardBinaryBuffers,
+                              shardAssignment,
+                              shardCommitteeMembership,
+                              pendingAccumulatorsRef,
+                              logger
+                            )
+                          } // snapshotSemaphore.permit
+
+                        case None =>
+                          // Periodic debug log + gauge
+                          Metrics[F].updateGauge("dag_nakamoto_slot", currentSlot) >>
+                            Async[F].whenA(currentSlot % 30 == 0) {
+                              logger.debug(s"Slot $currentSlot: not eligible (gap=$slotGap, stake=$myStake)")
+                            }
                       }
 
-                    // Raw VRF-trial counter (incremented BEFORE win/loss check) — pairs with `dag_nakamoto_slots_won` to surface silently-degraded validators (clock skew, missing eta, bad keystore) that would otherwise vanish from finality counters; Prometheus scrapes per node so {node} is added by the collector.
-                    _ <- Metrics[F].incrementCounter("dag_nakamoto_slots_trialed_total")
-
-                    result <- eligibilityChecker.checkEligibility(
-                      vrfSK = vrfSeed,
-                      slot = slotRefined,
-                      slotGap = slotGap,
-                      eta = eta,
-                      relativeStake = myStake,
-                      config = lddConfig
-                    )
-
-                    _ <- result match {
-                      case Some((proof, vrfOutput)) =>
-                        snapshotSemaphore.permit.use { _ =>
-                          onSlotWon(
-                            stateRef,
-                            consensusFns,
-                            snapshotStorage,
-                            chainStore,
-                            eventMempool,
-                            sidecarClient,
-                            tipTracker,
-                            stakeRegistry,
-                            lastGlobalSnapshotStorage,
-                            lastNGlobalSnapshotStorage,
-                            keyPair,
-                            selfId,
-                            vrfSeed,
-                            vrfPK,
-                            proof,
-                            vrfOutput,
-                            eta,
-                            currentSlot,
-                            slotGap,
-                            slotRefined,
-                            lddConfig,
-                            etaRotationSnapshots,
-                            lastKnownSlotRef,
-                            epochStateRef,
-                            productionGate,
-                            productionTimestamps,
-                            nakamotoFinalizedOrdinalRef,
-                            mptStore,
-                            mptOverlay,
-                            operationalKeyMaker,
-                            shardProducers,
-                            shardChainStores,
-                            shardBinaryBuffers,
-                            shardAssignment,
-                            shardCommitteeMembership,
-                            pendingAccumulatorsRef,
-                            logger
+                      // ─── §5.7 per-SLOT shard-checkpoint fan-out (owner-corrected 2026-06-11) ─────────────
+                      // The shard-leader lottery draws EVERY slot on the shared wall-clock grid — independent of
+                      // gl0 snapshot production (each slot is a chance at a shard checkpoint or a global snapshot;
+                      // independent draws). This replaces the anchor-driven triggers (gl0-leader onSlotWon self-call
+                      // + daemon becameBestTip hook), which sampled the lottery once per gl0 SNAPSHOT (~6.5 slots
+                      // observed mean) — the run-10 Gap-A cadence inversion: shards ticked ~6.5× slower than the
+                      // layer they feed. Anchoring data: `producedOrd` = current canonical tip ord (the checkpoint
+                      // rides into this or any later gl0 ord per §7.2); the lottery clock is `slotRefined`, carried
+                      // on the envelope's `slot` field. Supervised + gated: heavy on a WIN only (derivePerMgState);
+                      // the skip paths (not-leader / awaiting-embed / empty) are cheap Ref reads + one VRF eval.
+                      _ <- Async[F].whenA(shardProducers.nonEmpty && shardAssignment.isDefined) {
+                        val anchorOrd = SnapshotOrdinal(NonNegLong.unsafeFrom(lastChainOrdinal))
+                        val shardEpoch = EtaPeriod(currentPeriod)
+                        supervisor
+                          .supervise(
+                            shardFanOutGate.tryAcquire.flatMap {
+                              case false => Async[F].unit // previous fan-out still running — skip this slot's draw
+                              case true =>
+                                cats.effect
+                                  .MonadCancel[F]
+                                  .guarantee(
+                                    HasherSelector[F].withCurrent { implicit hasher =>
+                                      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointFanOut.run[F](
+                                        shardBinaryBuffers = shardBinaryBuffers,
+                                        producedOrd = anchorOrd,
+                                        epoch = shardEpoch,
+                                        currentSlot = slotRefined,
+                                        shardProducers = shardProducers,
+                                        shardChainStores = shardChainStores,
+                                        selfPeerId = selfId,
+                                        committeeMembership = shardCommitteeMembership,
+                                        logger = logger
+                                      )
+                                    }.handleErrorWith(e => logger.warn(e)(s"🧩 Shard fan-out failed at slot=$currentSlot")),
+                                    shardFanOutGate.release
+                                  )
+                            }
                           )
-                        } // snapshotSemaphore.permit
-
-                      case None =>
-                        // Periodic debug log + gauge
-                        Metrics[F].updateGauge("dag_nakamoto_slot", currentSlot) >>
-                          Async[F].whenA(currentSlot % 30 == 0) {
-                            logger.debug(s"Slot $currentSlot: not eligible (gap=$slotGap, stake=$myStake)")
-                          }
-                    }
-                  } yield ()
-            } yield ()
-          }
+                          .void
+                      }
+                    } yield ()
+              } yield ()
+            }
+        }
 
         // Dual finality: attestation weight (fast) OR confirmation depth k (safety fallback)
         //
@@ -1793,71 +1843,11 @@ object SnapshotLeaderLoop {
                       }
                   }
 
-                  // ─── Gap A — shard-checkpoint producer fan-out (gl0-leader self-call) ───────────
-                  // After the gl0 snapshot is produced (+ published when the gate stayed open), drive each
-                  // per-shard checkpoint producer for THIS leader's own produced ord, via the shared
-                  // `ShardCheckpointFanOut.run` body (the SAME body the daemon invokes for gossip-received
-                  // ords — see `NakamotoSyncDaemon.processValidSnapshotInner`).
-                  //
-                  // '''Why this self-call is required, not redundant.''' GossipSub does NOT echo a publisher
-                  // its own message, so the gl0 leader never sees its own produced ord arrive on the daemon's
-                  // gossip path. Without this seam the leader would skip producing shard checkpoints for every
-                  // ord it produced. Together with the daemon's per-ord hook this fires the fan-out exactly
-                  // once per canonical ord per node (leader here for its own ord; everyone else via the daemon).
-                  //
-                  // EMPTY map at `numShards = 1` ⇒ `whenA(false)` ⇒ this is never entered (regression bar).
-                  // `produce(...)` returns `None` unless THIS node won the shard slot lottery, and `None` on
-                  // an empty per-shard slice (§15.5 content-only), so it's a no-op on non-leader shards /
-                  // empty shards.
-                  //
-                  // Gated on `stillOpen` so we only fan out when the gl0 snapshot was actually published +
-                  // chain-stored — abandoning gl0 production (gate closed pre-publish, MPT rolled back) must
-                  // NOT produce a shard checkpoint anchored to a gl0 ord that never committed.
-                  //
-                  // ─── Slice S6 — OFF the snapshot-processing critical path ───────────────────────────
-                  // `onSlotWon` runs INSIDE `snapshotSemaphore.permit.use` (see the call site in `run`). After
-                  // S3 the fan-out → `producer.produce` → `derivePerMgState` runs a full
-                  // `processCurrencySnapshots` re-execution per shard per ord — heavy. Running it inline under
-                  // the permit serialized that re-exec into every leader's per-ord production window and made
-                  // straggler nodes lag (one fell ~13 ords behind, tripping the ±3 cluster-sync check). We
-                  // launch it on the app-scoped `Supervisor` (lifetime-scoped — NOT a bare `Async.start`,
-                  // which previously leaked a fiber outliving its owner).
-                  //
-                  // DETERMINISM (why async is safe for the gl0 snapshot):
-                  //   1. Inputs captured BY VALUE here (`capturedStateChannelSnapshots`, `producedOrd`,
-                  //      `epoch`) before `supervise`, so the fiber sees the snapshot for THIS produced ord,
-                  //      not a later one. `signed.value.stateChannelSnapshots` is an immutable `SortedMap`.
-                  //   2. We're past the gl0 publish + chainStore write here (`stillOpen` confirms the gl0
-                  //      snapshot committed). The fan-out only SELF-stores its checkpoint into the per-shard
-                  //      `ShardChainStore` and publishes it — it never feeds back into the gl0 snapshot just
-                  //      produced, so inline-vs-fiber cannot change the gl0 snapshot's bytes.
-                  //   3. `ShardChainStore.store` is idempotent by hash + monotonic by shard ordinal, so the
-                  //      async write racing the next ord's read dedups safely.
-                  _ <- Async[F].whenA(stillOpen && shardProducers.nonEmpty && shardAssignment.isDefined) {
-                    // R-1: the fan-out reads each shard's `shardBinaryBuffers` (the inversion), NOT the just-produced
-                    // snapshot's `stateChannelSnapshots`. We still only fan out when the gl0 snapshot actually
-                    // committed (`stillOpen`), so a checkpoint is never anchored to a gl0 ord that never committed.
-                    val producedOrd =
-                      SnapshotOrdinal(NonNegLong.unsafeFrom(producedOrdinal))
-                    val rotationPeriod = EtaCalculation.rotationPeriod(producedOrdinal, etaRotationSnapshots)
-                    val epoch = EtaPeriod(rotationPeriod)
-                    supervisor
-                      .supervise(
-                        HasherSelector[F].withCurrent { implicit hasher =>
-                          io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointFanOut.run[F](
-                            shardBinaryBuffers = shardBinaryBuffers,
-                            producedOrd = producedOrd,
-                            epoch = epoch,
-                            shardProducers = shardProducers,
-                            shardChainStores = shardChainStores,
-                            selfPeerId = selfId,
-                            committeeMembership = shardCommitteeMembership,
-                            logger = logger
-                          )
-                        }.handleErrorWith(e => logger.warn(e)(s"🧩 Shard producer fan-out failed for ord=$producedOrdinal"))
-                      )
-                      .void
-                  }
+                  // ─── Shard-checkpoint fan-out: MOVED to the per-slot tick (design §5.7, 2026-06-12) ───
+                  // The gl0-leader self-call that lived here sampled the shard lottery once per PRODUCED gl0 ord —
+                  // half of the run-10 Gap-A cadence inversion (the daemon's becameBestTip hook was the other
+                  // half). The lottery now draws every wall-clock slot in the slot-tick loop above, on every node,
+                  // gated by committee membership + the pipeline-depth watermark. Nothing to do here.
                 } yield ()
             }
 

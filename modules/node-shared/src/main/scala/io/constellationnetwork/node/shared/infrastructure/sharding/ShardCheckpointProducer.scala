@@ -174,7 +174,8 @@ trait ShardCheckpointProducer[F[_]] {
   def produce(
     pendingSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
     gl0AnchorOrdinal: SnapshotOrdinal,
-    epoch: EtaPeriod
+    epoch: EtaPeriod,
+    currentSlot: Slot
   ): F[Option[Signed[ShardCheckpoint]]]
 }
 
@@ -251,10 +252,6 @@ object ShardCheckpointProducer {
     * @param sigmaInCommittee
     *   this operator's stake share within the shard committee. Per v1 stable-σ rule (`[[project-216-committee-stake-drift-fix]]`) this is
     *   `1 / K_S`. Production wiring passes the typed value; tests inject directly.
-    * @param slotForGl0Anchor
-    *   pure function mapping `(gl0AnchorOrdinal)` to the per-shard `Slot` used in the leader VRF draw + maxvalid-tk tiebreaks. The simplest
-    *   production wiring is `ord => Slot.unsafeApply(ord.value.value * snapshotsPerSecond)` — the exact mapping is the caller's choice and
-    *   depends on the slot-cadence convention. Tests pass identity-ish functions.
     * @param slotGapFor
     *   pure function from `(currentSlot, parentSlotOpt)` returning the LDD slot-gap. Genesis case (no parent): caller supplies a sensible
     *   default — typically the slot itself (matches `EligibilityChecker`'s "first wins always" semantics at the chain seed).
@@ -282,7 +279,6 @@ object ShardCheckpointProducer {
     kesSigner: KesSigner[F],
     shardEtaFor: EtaPeriod => F[Array[Byte]],
     sigmaInCommittee: Ratio,
-    slotForGl0Anchor: SnapshotOrdinal => Slot,
     slotGapFor: (Slot, Option[Slot]) => Long,
     lddConfig: LddConfig,
     derivePerMgState: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash],
@@ -307,7 +303,8 @@ object ShardCheckpointProducer {
       def produce(
         pendingSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         gl0AnchorOrdinal: SnapshotOrdinal,
-        epoch: EtaPeriod
+        epoch: EtaPeriod,
+        currentSlot: Slot
       ): F[Option[Signed[ShardCheckpoint]]] =
         // Slice 8 v1: empty input ⇒ nothing to checkpoint. T_alive liveness pings (which permit empty payloads) are deferred to a future
         // slice that introduces an explicit `forceEmptyAlive: Boolean` flag — slice 8 keeps the contract simple.
@@ -334,7 +331,7 @@ object ShardCheckpointProducer {
                       s"adoptedShardOrd=${adoptedOrdOpt.map(_.value).getOrElse(0L)}"
                   )
                   .as(None: Option[Signed[ShardCheckpoint]])
-              } else produceInner(bestTipOpt, perMgTip, pendingSnapshots, gl0AnchorOrdinal, epoch)
+              } else produceInner(bestTipOpt, perMgTip, pendingSnapshots, gl0AnchorOrdinal, epoch, currentSlot)
           }
         }
 
@@ -343,18 +340,17 @@ object ShardCheckpointProducer {
         perMgTip: SortedMap[Address, Hash],
         pendingSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         gl0AnchorOrdinal: SnapshotOrdinal,
-        epoch: EtaPeriod
+        epoch: EtaPeriod,
+        currentSlot: Slot
       ): F[Option[Signed[ShardCheckpoint]]] = {
         val parentHash: Hash = bestTipOpt.map(_.hash).getOrElse(Hash.empty)
         val parentOrd: ShardOrdinal = bestTipOpt.map(_.signed.value.shardOrdinal).getOrElse(ShardOrdinal.Genesis)
-        // Parent slot derivation:
-        //   - Genesis case: no parent slot (caller's `slotGapFor` handles `None`).
-        //   - Non-genesis: the parent envelope itself doesn't carry the parent's slot; we approximate by reading the parent's
-        //     `gl0AnchorOrdinal` and applying the same `slotForGl0Anchor` mapping the producer uses for `currentSlot`. This keeps
-        //     slot-derivation routed through one pure function rather than scattering Slot ⇄ ord conversions across the codebase.
-        val parentSlotOpt: Option[Slot] = bestTipOpt.map(t => slotForGl0Anchor(t.signed.value.gl0AnchorOrdinal))
+        // Parent slot = the parent envelope's WIRE slot (design §5.7, owner-corrected 2026-06-11): the lottery clock is the
+        // shared wall-clock slot grid, carried on the envelope and signed. The old anchor-derived approximation
+        // (`slotForGl0Anchor(parent.gl0AnchorOrdinal)`) downsampled the lottery to gl0-snapshot cadence — the run-10 Gap-A
+        // cadence inversion.
+        val parentSlotOpt: Option[Slot] = bestTipOpt.map(_.signed.value.slot)
         val nextShardOrdinal: ShardOrdinal = parentOrd.next
-        val currentSlot: Slot = slotForGl0Anchor(gl0AnchorOrdinal)
         val slotGap: Long = slotGapFor(currentSlot, parentSlotOpt)
 
         // R-2: chain-link-order the buffered binaries off the shard's OWN tip (NOT gl0's). MGs with no admissible chain this round
@@ -400,6 +396,7 @@ object ShardCheckpointProducer {
                         parentCheckpointHash = parentHash,
                         shardOrdinal = nextShardOrdinal,
                         gl0AnchorOrdinal = gl0AnchorOrdinal,
+                        slot = currentSlot,
                         derivedStateDelta = delta,
                         emittedReceipts = List.empty,
                         // Placeholder — populated below by replacing with the real committee-member sig. NonEmptyList requires at

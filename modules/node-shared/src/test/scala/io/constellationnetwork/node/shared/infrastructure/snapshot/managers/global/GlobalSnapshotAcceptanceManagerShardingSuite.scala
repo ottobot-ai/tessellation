@@ -37,6 +37,7 @@ import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendBlock}
@@ -158,6 +159,7 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       parentCheckpointHash = genesisHash,
       shardOrdinal = ShardOrdinal(shardOrd),
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(gl0Anchor)),
+      slot = SlotT.unsafeApply(gl0Anchor),
       derivedStateDelta = delta,
       emittedReceipts = receipts,
       committeeSignatures = NonEmptyList.of(placeholderSig),

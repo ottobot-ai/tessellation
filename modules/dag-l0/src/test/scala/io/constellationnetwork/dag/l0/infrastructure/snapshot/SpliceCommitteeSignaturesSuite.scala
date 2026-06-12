@@ -4,6 +4,7 @@ import cats.data.NonEmptyList
 
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
@@ -48,6 +49,7 @@ object SpliceCommitteeSignaturesSuite extends SimpleIOSuite {
       parentCheckpointHash = Hash("0" * 64),
       shardOrdinal = ShardOrdinal(1L),
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(5L)),
+      slot = SlotT.unsafeApply(5L),
       derivedStateDelta = ShardDerivedStateDelta.empty,
       emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(sig(producer)),
@@ -61,10 +63,14 @@ object SpliceCommitteeSignaturesSuite extends SimpleIOSuite {
       Map(pD -> sig(pD), pB -> sig(pB), pA -> sig(pA), pC -> sig(pC))
     val out = GlobalSnapshotConsensusFunctions.spliceCommitteeSignatures(cp, collected)
     val peers = out.committeeSignatures.toList.map(_.peerId)
-    expect(out.committeeSignatures.size == 4) and       // pB + {pA, pC, pD}; pB NOT doubled
-      expect(peers.toSet == Set(pA, pB, pC, pD)) and
-      expect(peers.head == pB) and                      // producer head preserved (not re-sorted)
-      expect(peers.tail == List(pA, pC, pD))            // appended signers sorted by peerId hex
+    expect(out.committeeSignatures.size == 4)
+      .and( // pB + {pA, pC, pD}; pB NOT doubled
+        expect(peers.toSet == Set(pA, pB, pC, pD))
+      )
+      .and(expect(peers.head == pB))
+      .and( // producer head preserved (not re-sorted)
+        expect(peers.tail == List(pA, pC, pD))
+      ) // appended signers sorted by peerId hex
   }
 
   pureTest("leaves the signing preimage (canonical checkpoint-hash bytes) UNCHANGED") {

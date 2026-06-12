@@ -10,6 +10,7 @@ import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOp
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.Hasher
@@ -101,6 +102,7 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       parentCheckpointHash = parent,
       shardOrdinal = ShardOrdinal(ord),
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(gl0Anchor)),
+      slot = SlotT.unsafeApply(gl0Anchor),
       derivedStateDelta = ShardDerivedStateDelta.empty,
       emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(mkCommitteeSig(peerByte)),

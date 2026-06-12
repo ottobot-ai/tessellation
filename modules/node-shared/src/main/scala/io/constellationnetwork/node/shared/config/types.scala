@@ -97,6 +97,10 @@ object types {
     // mainnet 1024 / testnet 255 / integrationnet 255 / dev 33, dev overridable via `${?NAKAMOTO_CONFIRMATION_DEPTH}`). Resolve for the
     // active env via the `confirmationDepthK(env)` accessor below — R and k₂ DERIVE from the resolved value (see the `def`s in the body).
     confirmationDepthKByEnv: Map[AppEnvironment, PosLong],
+    // Slot duration in ms — the consensus time unit (§5.7: a PARAMETER, not a constant; 1000 prod / 500 fast-test).
+    // Drives the gl0 SnapshotLeaderLoop slot tick AND the per-slot shard-checkpoint lottery. Migrated from the
+    // `NAKAMOTO_SLOT_DURATION_MS` sys.env read in SnapshotLeaderLoop (project rule: HOCON over scattered env reads).
+    slotDurationMs: PosLong,
     // #259 active-recovery: caps on the metagraph orphan buffer + recent-admission cache. Migrated from the
     // `NAKAMOTO_ORPHAN_BUFFER_CAP` / `NAKAMOTO_RECENT_ADMIT_CAP` env reads to typed HOCON (project rule: no scattered
     // sys.env). `recentAdmitCap` is kept proportionally larger (4×) — see `MetagraphOrphanBuffer.DefaultAdmissionsCap`.

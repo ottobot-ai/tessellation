@@ -14,6 +14,7 @@ import io.constellationnetwork.schema.artifact.{SharedArtifact, SpendAction, Spe
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
 import io.constellationnetwork.schema.swap.{CurrencyId, SwapAmount}
@@ -176,6 +177,7 @@ object ShardingCodecsSuite extends FunSuite {
       parentCheckpointHash = hash('p'),
       shardOrdinal = sampleShardOrdinal,
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong(99L)),
+      slot = SlotT.unsafeApply(99L),
       derivedStateDelta = sampleDelta,
       emittedReceipts = List(sampleReceipt),
       committeeSignatures = NonEmptyList.of(mkSig(1, 7), mkSig(2, 8), mkSig(3, 9)),

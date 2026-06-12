@@ -1430,11 +1430,10 @@ object GlobalSnapshotConsensus {
               val shardVrfSk = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
                 .deriveVrfKeys(keyPair)
                 ._1
-              // Shard-local slot mapping (MUST be identical on producer + receiver so the leader VRF
-              // verify agrees): the gl0 anchor ordinal IS the shard-local slot index. NOT gl0 wall-clock
-              // slot — the shard chain advances at gl0-ordinal cadence, one anchor per gl0 ord.
-              val slotForGl0Anchor: SnapshotOrdinal => io.constellationnetwork.schema.nakamoto.slot.Slot =
-                (ord: SnapshotOrdinal) => io.constellationnetwork.schema.nakamoto.slot.Slot.unsafeApply(ord.value.value)
+              // §5.7 (owner-corrected 2026-06-11): the lottery clock is the WALL-CLOCK slot grid — the producer
+              // receives `currentSlot` per fan-out tick and stamps it on the envelope (signed); no anchor→slot
+              // mapping exists anymore (the old `slotForGl0Anchor` identity map downsampled the lottery to
+              // gl0-snapshot cadence — the run-10 Gap-A inversion).
               // LDD slot-gap: genesis (no parent) → the slot itself (EligibilityChecker "first wins"
               // seed); else currentSlot - parentSlot clamped to ≥ 1 (mirrors the gl0 loop's clamp).
               val slotGapFor
@@ -1472,7 +1471,6 @@ object GlobalSnapshotConsensus {
                       kesSigner = shardKesSigner,
                       shardEtaFor = shardEtaFor,
                       sigmaInCommittee = sigmaInCommittee,
-                      slotForGl0Anchor = slotForGl0Anchor,
                       slotGapFor = slotGapFor,
                       lddConfig = lddConfig,
                       // S3: the SAME committee re-execution closure the verifier uses (built from the shared
@@ -1521,13 +1519,7 @@ object GlobalSnapshotConsensus {
               val shardVrfSk = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
                 .deriveVrfKeys(keyPair)
                 ._1
-              // MUST be byte-identical to the producer's mappings (above) so the attester's VRF message + slot-gap
-              // match the producer's. The gl0 anchor ordinal IS the shard-local slot index.
-              val slotForGl0Anchor: SnapshotOrdinal => io.constellationnetwork.schema.nakamoto.slot.Slot =
-                (ord: SnapshotOrdinal) => io.constellationnetwork.schema.nakamoto.slot.Slot.unsafeApply(ord.value.value)
-              val slotGapFor
-                : (io.constellationnetwork.schema.nakamoto.slot.Slot, Option[io.constellationnetwork.schema.nakamoto.slot.Slot]) => Long =
-                (cur, parentOpt) => parentOpt.fold(cur.value.value)(p => math.max(1L, cur.value.value - p.value.value))
+              // §5.7: the attester reads the checkpoint's WIRE slot directly — no anchor→slot mapping.
               // Shard slot-leader's relative stake for PRODUCE election — mirrors the committee DRAW denominator (committee size ≈ kDraw),
               // so it uses `nakamoto.committee.kDraw` (the same cluster-uniform param the shard committee `committeeFor` draw uses).
               val sigmaInCommittee =
@@ -1563,8 +1555,6 @@ object GlobalSnapshotConsensus {
                       tipTrackerFor = tipTrackerFor,
                       shardEtaFor = shardEtaFor,
                       sigmaInCommittee = sigmaInCommittee,
-                      slotForGl0Anchor = slotForGl0Anchor,
-                      slotGapFor = slotGapFor,
                       lddConfig = lddConfig
                     )
                   ): Option[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]]
@@ -1596,6 +1586,7 @@ object GlobalSnapshotConsensus {
                   // k₁ — typed HOCON `nakamoto.confirmation-depth-k` (replaces the prior
                   // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read inside the loop).
                   confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value,
+                  slotDurationMs = sharedCfg.nakamoto.slotDurationMs.value,
                   lastKnownSlotRef = lastKnownSlotRef,
                   epochStateRef = epochStateRef,
                   genesisTimeMs = pureGenesisTimeMs,

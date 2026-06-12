@@ -17,6 +17,7 @@ import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOp
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security._
@@ -147,6 +148,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       parentCheckpointHash = genesisHash,
       shardOrdinal = ShardOrdinal(shardOrd),
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(gl0Anchor)),
+      slot = SlotT.unsafeApply(gl0Anchor),
       derivedStateDelta = delta,
       emittedReceipts = List.empty,
       // Placeholder — overwritten downstream once the real signature is computed.
@@ -225,6 +227,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
             parentCheckpointHash = parent,
             shardOrdinal = ShardOrdinal(ord),
             gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(100L + ord)),
+            slot = SlotT.unsafeApply(100L + ord),
             derivedStateDelta = ShardDerivedStateDelta.empty,
             emittedReceipts = List.empty,
             committeeSignatures = NonEmptyList.of(

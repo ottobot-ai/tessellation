@@ -19,6 +19,7 @@ import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInter
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
@@ -231,7 +232,6 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       // producer threads the resolved eta through its leader draw, so a constant is sufficient.
       shardEtaFor = _ => IO.pure(shardEta),
       sigmaInCommittee = sigma,
-      slotForGl0Anchor = slotForGl0Anchor,
       slotGapFor = slotGapFor,
       lddConfig = LddConfig.Default,
       derivePerMgState = derive,
@@ -285,7 +285,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       // σ=0 ⇒ EligibilityChecker.threshold returns 0 ⇒ no slot ever wins (contract documented in EligibilityChecker.threshold).
       producer <- makeProducer(ssl, rig, Ratio.Zero, shardEta)
       // Try several gl0 anchors — must all return None.
-      attempts <- (1L to 10L).toList.traverse(i => producer.produce(mkPendingSnapshots(2), mkOrd(i), EtaPeriod(0L)))
+      attempts <- (1L to 10L).toList.traverse(i => producer.produce(mkPendingSnapshots(2), mkOrd(i), EtaPeriod(0L), Slot.unsafeApply(i)))
       recorded <- rig.recorded
     } yield expect.all(attempts.forall(_.isEmpty), recorded.isEmpty)
   }
@@ -301,7 +301,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       gl0Eta = randomGl0Eta()
       shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
       producer <- makeProducer(ssl, rig, Ratio.One, shardEta)
-      out <- producer.produce(SortedMap.empty, mkOrd(1L), EtaPeriod(0L))
+      out <- producer.produce(SortedMap.empty, mkOrd(1L), EtaPeriod(0L), Slot.unsafeApply(1L))
       recorded <- rig.recorded
     } yield expect.all(out.isEmpty, recorded.isEmpty)
   }
@@ -507,7 +507,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     def loop(attempt: Int): IO[Option[Signed[ShardCheckpoint]]] =
       if (attempt >= maxAttempts) IO.pure(None)
       else
-        producer.produce(pending, mkOrd(startOrd + attempt.toLong), epoch).flatMap {
+        producer.produce(pending, mkOrd(startOrd + attempt.toLong), epoch, Slot.unsafeApply(startOrd + attempt.toLong)).flatMap {
           case s @ Some(_) => IO.pure(s)
           case None        => loop(attempt + 1)
         }
@@ -543,6 +543,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       parentCheckpointHash = Hash.empty,
       shardOrdinal = ShardOrdinal(ord),
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(0L)),
+      slot = SlotT.unsafeApply(0L),
       derivedStateDelta = ShardDerivedStateDelta.empty,
       emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(

@@ -10,6 +10,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.schema.sharding._
@@ -129,6 +130,7 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
       parentCheckpointHash = hash('p'),
       shardOrdinal = ShardOrdinal(42L),
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(99L)),
+      slot = SlotT.unsafeApply(99L),
       derivedStateDelta = mkDelta(mgAddr, lockHolderAmount),
       emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(mkCommitteeSig(1, 7), mkCommitteeSig(2, 8)),

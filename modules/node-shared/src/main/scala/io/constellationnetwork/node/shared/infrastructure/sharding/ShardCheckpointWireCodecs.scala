@@ -12,6 +12,7 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.schema.{SnapshotOrdinal, address}
@@ -258,7 +259,8 @@ object ShardCheckpointWireCodecs {
         includedSnapshots = included,
         derivedStateDelta = Some(derivedDelta),
         committeeSignatures = cp.committeeSignatures.toList.map(committeeSignatureToWire),
-        emittedReceiptsJson = receiptsJson
+        emittedReceiptsJson = receiptsJson,
+        slot = cp.slot.value.value
       )
 
   def shardCheckpointFromWire[F[_]: Async: JsonSerializer](
@@ -266,16 +268,21 @@ object ShardCheckpointWireCodecs {
   ): F[ShardCheckpoint] = {
     val shardIdOpt = ShardId(w.shardId)
     val gl0OrdOpt = NonNegLong.from(w.gl0AnchorOrdinal).toOption.map(SnapshotOrdinal(_))
-    (shardIdOpt, gl0OrdOpt) match {
-      case (None, _) =>
+    val slotOpt = Slot(w.slot)
+    (shardIdOpt, gl0OrdOpt, slotOpt) match {
+      case (None, _, _) =>
         Async[F].raiseError[ShardCheckpoint](
           new RuntimeException(s"ShardCheckpointWire: invalid shard_id ${w.shardId} (must be non-negative)")
         )
-      case (_, None) =>
+      case (_, None, _) =>
         Async[F].raiseError[ShardCheckpoint](
           new RuntimeException(s"ShardCheckpointWire: invalid gl0_anchor_ordinal ${w.gl0AnchorOrdinal} (must be non-negative)")
         )
-      case (Some(sid), Some(gl0Ord)) =>
+      case (_, _, None) =>
+        Async[F].raiseError[ShardCheckpoint](
+          new RuntimeException(s"ShardCheckpointWire: invalid slot ${w.slot} (must be non-negative)")
+        )
+      case (Some(sid), Some(gl0Ord), Some(slotV)) =>
         for {
           // The derived-state-delta wire is required; a None is wire-shape-level invalid.
           deltaWire <- w.derivedStateDelta
@@ -305,6 +312,7 @@ object ShardCheckpointWireCodecs {
             parentCheckpointHash = bytesToHash(w.parentCheckpointHash),
             shardOrdinal = ShardOrdinal(w.shardOrdinal),
             gl0AnchorOrdinal = gl0Ord,
+            slot = slotV,
             derivedStateDelta = delta,
             emittedReceipts = receipts,
             committeeSignatures = sigsNel,

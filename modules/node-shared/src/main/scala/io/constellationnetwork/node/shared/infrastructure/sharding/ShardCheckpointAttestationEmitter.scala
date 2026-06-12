@@ -79,24 +79,19 @@ trait ShardCheckpointAttestationEmitter[F[_]] {
     * @param checkpointHash
     *   canonical `Hasher[F](ShardCheckpointSigPreimage)` hash — the bytes every committee member signs (design doc §3.3). The caller
     *   already computed this to key the chain store, so it's passed in rather than re-derived.
-    * @param gl0AnchorOrdinal
-    *   the checkpoint's gl0 anchor ordinal. Mapped to the shard-local slot via the same `slotForGl0Anchor` the producer uses, so the VRF
-    *   message `(shardEta, slot)` is byte-equivalent on producer + attester.
+    * @param slot
+    *   the checkpoint's WIRE slot (design §5.7 — the signed lottery clock carried on the envelope). The VRF message `(shardEta, slot)` is
+    *   byte-equivalent on producer + attester because both read the SAME wire field.
     * @param epoch
     *   the checkpoint's sortition epoch (the wire-carried `checkpoint.epoch`). Slice S4: load-bearing — it is the key for the
     *   shard-leader-VRF eta lookup (`shardEtaFor(shardId, epoch)`). The producer signed its leader proof under the eta of THIS epoch, so
     *   the attester MUST resolve the eta for the SAME epoch (not a wall-clock period) to compute a byte-equivalent VRF message.
-    * @param parentGl0AnchorOpt
-    *   the parent checkpoint's gl0 anchor ordinal (genesis ⇒ `None`). The emitter maps it through the same `slotForGl0Anchor` to recover
-    *   the parent's shard-local slot for the LDD `slotGap`, mirroring `ShardCheckpointProducer`'s parent-slot derivation. Passing the
-    *   ordinal (not the slot) keeps the slot mapping owned entirely by the emitter, so the caller never needs `slotForGl0Anchor`.
     */
   def emit(
     shardId: ShardId,
     checkpointHash: Hash,
-    gl0AnchorOrdinal: SnapshotOrdinal,
-    epoch: EtaPeriod,
-    parentGl0AnchorOpt: Option[SnapshotOrdinal]
+    slot: Slot,
+    epoch: EtaPeriod
   ): F[Unit]
 }
 
@@ -134,10 +129,6 @@ object ShardCheckpointAttestationEmitter {
     * @param sigmaInCommittee
     *   this operator's stake share within the shard committee (v1 stable-σ rule: `1 / K_S`). Not load-bearing for the proof bytes (the
     *   proof is over `(shardEta, slot)` only) but carried for symmetry / future threshold use.
-    * @param slotForGl0Anchor
-    *   pure `SnapshotOrdinal => Slot` mapping — MUST be identical to the producer's so the VRF message + maxvalid-tk tiebreaks agree.
-    * @param slotGapFor
-    *   pure `(currentSlot, parentSlotOpt) => Long` LDD slot-gap — identical to the producer's.
     * @param lddConfig
     *   per-shard LDD config (production uses `LddConfig.Default`). Carried for symmetry; unused by `vrfProofForSlot` itself.
     */
@@ -151,8 +142,6 @@ object ShardCheckpointAttestationEmitter {
     tipTrackerFor: ShardId => Option[ShardTipTracker[F]],
     shardEtaFor: (ShardId, EtaPeriod) => F[Option[Array[Byte]]],
     sigmaInCommittee: Ratio,
-    slotForGl0Anchor: SnapshotOrdinal => Slot,
-    slotGapFor: (Slot, Option[Slot]) => Long,
     lddConfig: LddConfig
   ): ShardCheckpointAttestationEmitter[F] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointAttestationEmitter")
@@ -165,9 +154,8 @@ object ShardCheckpointAttestationEmitter {
       def emit(
         shardId: ShardId,
         checkpointHash: Hash,
-        gl0AnchorOrdinal: SnapshotOrdinal,
-        epoch: EtaPeriod,
-        parentGl0AnchorOpt: Option[SnapshotOrdinal]
+        slot: Slot,
+        epoch: EtaPeriod
       ): F[Unit] =
         // Slice S4: resolve the shard-leader-VRF eta keyed on the CHECKPOINT'S epoch (the wire-carried `checkpoint.epoch`, passed in as
         // `epoch`), NOT a wall-clock period. The producer signed its leader proof under `computeShardEta(shardId, etaForPeriod(epoch))`;
@@ -180,13 +168,10 @@ object ShardCheckpointAttestationEmitter {
             // same "shard not tracked locally" disposition the acceptance side uses; we simply don't attest.
             logger.debug(s"emit: shard=${shardId.value.value} has no shardEta (not a tracked committee shard); skipping attestation")
           case Some(shardEta) =>
-            val currentSlot: Slot = slotForGl0Anchor(gl0AnchorOrdinal)
-            val parentSlotOpt: Option[Slot] = parentGl0AnchorOpt.map(slotForGl0Anchor)
-            val slotGap: Long = slotGapFor(currentSlot, parentSlotOpt)
+            val currentSlot: Slot = slot // the envelope's wire slot (design §5.7) — same field every verifier reads
             // The canonical hash bytes every committee member signs (design doc §3.3). UTF-8 of the hex Hash string — identical to the
             // producer's `preimageHash.getBytes` path.
             val msgBytes = checkpointHash.value.getBytes(StandardCharsets.UTF_8)
-            val _ = slotGap // slotGap is part of the membership-draw context; v1 proof is over (shardEta, slot).
             for {
               // VRF membership proof over `(shardEta, slot)` — the SAME message the slot-leader lottery draws from. Deterministic +
               // verifiable later via `ShardSlotLeader.verifyLeader`. NOT a leadership claim: a non-leader still has a valid proof of having
@@ -221,7 +206,7 @@ object ShardCheckpointAttestationEmitter {
                   if (resp.ok)
                     logger.info(
                       s"🧩 ShardCheckpointAttestation emit: shard=${shardId.value.value} " +
-                        s"checkpoint=${checkpointHash.value.take(12)} gl0Anchor=${gl0AnchorOrdinal.value.value} kesStep=$kesStep"
+                        s"checkpoint=${checkpointHash.value.take(12)} slot=${slot.value.value} kesStep=$kesStep"
                     )
                   else
                     logger.warn(

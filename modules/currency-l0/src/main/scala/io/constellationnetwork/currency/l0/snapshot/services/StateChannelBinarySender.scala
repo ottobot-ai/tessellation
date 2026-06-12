@@ -230,18 +230,21 @@ object StateChannelBinarySender {
       // small floor: checkpoint windows are capped at exactly this batch size (the producer can only
       // window what has been SENT contiguously), so floor 16 → 16-binary windows at ~1 adoption/min =
       // +9/min catch-up — the genesis backlog took 10+ min to drain and allow-spend windows expired
-      // mid-lag (NoActiveAllowSpend). Floor 64 → 64-binary windows ≈ ~10× production, draining any
-      // warmup backlog in ~1-2 adoptions. The burst only fires while pending > floor (transient);
-      // re-sending binaries gl0 already buffered is cheap: the shard binary buffer dedupes by hash.
-      val retryBatchFloor = 64
-      val effectiveCap = Math.max(cap, retryBatchFloor)
-      tracker.getPendingToRetry(effectiveCap * 16).flatMap { allPending =>
-        val sortedAsc = allPending.sortBy(_.currencySnapshotOrdinal.value.value)
-        val toRetry = sortedAsc.take(effectiveCap)
+      // mid-lag (NoActiveAllowSpend). Floor 64 had the same shape one octave up (run 10 / design §5.8):
+      // ANY per-tick cap becomes the window-size ceiling, so the sender — not the protocol — ends up
+      // governing how much chain one fold can advance. UN-CAPPED (owner, 2026-06-12): ship the FULL
+      // contiguous pending prefix every tick; checkpoint windows are variable-length by design and the
+      // window is what absorbs bursts (bulk-service queue). The fetch ceiling below (1024) is a
+      // concurrency bound on in-flight HTTP posts per tick, not a throughput policy — at 1024 binaries
+      // per fold it is far above any cadence the EventTrigger can produce. Re-sending binaries gl0
+      // already buffered stays cheap: the shard binary buffer dedupes by hash.
+      val inflightCeiling = 1024
+      tracker.getPendingToRetry(inflightCeiling).flatMap { allPending =>
+        val toRetry = allPending.sortBy(_.currencySnapshotOrdinal.value.value)
         if (toRetry.nonEmpty) {
           logger.info(
-            s"[RetryMode] Processing ${toRetry.size} binaries (cap=$cap, effectiveCap=$effectiveCap, " +
-              s"mix=contiguous-oldest-prefix, totalPending=${allPending.size})"
+            s"[RetryMode] Processing ${toRetry.size} binaries (cap=$cap, " +
+              s"mix=contiguous-oldest-prefix-uncapped, totalPending=${allPending.size})"
           ) >>
             toRetry.traverse_(p => sendBinaryInBackground(p, signers))
         } else {

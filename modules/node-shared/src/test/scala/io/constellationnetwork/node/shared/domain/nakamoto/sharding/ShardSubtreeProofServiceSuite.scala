@@ -16,6 +16,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security._
@@ -118,6 +119,7 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
       parentCheckpointHash = Hash.empty,
       shardOrdinal = ShardOrdinal(0L),
       gl0AnchorOrdinal = testOrdinal,
+      slot = SlotT.unsafeApply(testOrdinal.value.value),
       derivedStateDelta = ShardDerivedStateDelta(
         perMetagraphMptRoots = perMgRoots,
         includedSnapshots = SortedMap.empty,
