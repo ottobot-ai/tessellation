@@ -657,11 +657,14 @@ object NakamotoSyncDaemon {
             // Shared state (pendingParentRef, stateRef, chainSyncManager) survives.
             def gossipStream: fs2.Stream[F, Unit] =
               fs2.Stream
-                .eval(Ref.of[F, Long](System.currentTimeMillis()))
+                // Idle-watchdog clock: MONOTONIC via the Clock typeclass (never System.currentTimeMillis — an NTP step
+                // would fire or suppress the idle timeout spuriously, and the typeclass keeps the effect lawful/testable;
+                // cats-idiomatic time rule, owner 2026-06-12).
+                .eval(Clock[F].monotonic.map(_.toMillis).flatMap(Ref.of[F, Long](_)))
                 .flatMap { lastMsgRef =>
                   fs2.Stream.eval(cats.effect.std.Queue.bounded[F, pb.Snapshot](1024)).flatMap { snapshotIntakeQ =>
                     val watchdog = fs2.Stream.fixedRate[F](30.seconds).evalMap { _ =>
-                      Async[F].delay(System.currentTimeMillis()).flatMap { now =>
+                      Clock[F].monotonic.map(_.toMillis).flatMap { now =>
                         lastMsgRef.get.flatMap { lastMsg =>
                           val idleMs = now - lastMsg
                           if (idleMs > 120000L)
@@ -732,7 +735,7 @@ object NakamotoSyncDaemon {
                     val gossip = GossipStream
                       .subscribe[F](channel)
                       .evalMap { msg =>
-                        lastMsgRef.set(System.currentTimeMillis()) >>
+                        Clock[F].monotonic.map(_.toMillis).flatMap(lastMsgRef.set) >>
                           (msg.body match {
                             case pb.GossipMessage.Body.Snapshot(snap) =>
                               // INTAKE DEMUX (run-16 post-mortem, 2026-06-12): snapshot processing is seconds-to-minutes during

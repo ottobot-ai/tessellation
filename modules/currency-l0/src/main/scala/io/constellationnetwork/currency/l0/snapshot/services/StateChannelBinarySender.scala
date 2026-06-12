@@ -78,11 +78,13 @@ object StateChannelBinarySender {
         customPeersAllowanceList,
         tracker
       )
+      retryTickR <- cats.effect.Ref.of[F, Long](0L)
       sender = new StateChannelBinarySenderImpl[F](
         tracker,
         poster,
         lastGlobalSnapshotStorage,
         identifierStorage,
+        retryTickR,
         logger
       )
       _ <- startBackgroundWorker(sender, lastGlobalSnapshotStorage, logger)
@@ -122,13 +124,11 @@ object StateChannelBinarySender {
     poster: BinaryPoster[F],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     identifierStorage: IdentifierStorage[F],
+    // RetryMode tick counter — drives the re-send cadence gate (see processRetryMode). Ref (cats-idiomatic), allocated in `make`.
+    retryTickCounter: cats.effect.Ref[F, Long],
     logger: org.typelevel.log4cats.SelfAwareStructuredLogger[F]
   )(implicit S: Supervisor[F])
       extends StateChannelBinarySender[F] {
-
-    // RetryMode tick counter — drives the re-send cadence gate (see processRetryMode). Plain unsynchronized
-    // monotone counter; the worker is a single fs2 stream so increments never race.
-    private val retryTickCounter = new java.util.concurrent.atomic.AtomicLong(0L)
 
     def enqueue(
       binary: Hashed[StateChannelSnapshotBinary],
@@ -248,20 +248,21 @@ object StateChannelBinarySender {
       // every RESEND_EVERY_TICKS-th tick (~30s — matched to the checkpoint confirmation RTT).
       val inflightCeiling = 1024
       val ResendEveryTicks = 6L
-      val tick = retryTickCounter.getAndIncrement()
-      val fullResendDue = tick % ResendEveryTicks === 0L
-      tracker.getPendingToRetry(inflightCeiling).flatMap { allPending =>
-        val sortedAsc = allPending.sortBy(_.currencySnapshotOrdinal.value.value)
-        val toRetry = if (fullResendDue) sortedAsc else sortedAsc.filter(_.sendsSoFar.value === 0L)
-        if (toRetry.nonEmpty) {
-          logger.info(
-            s"[RetryMode] Processing ${toRetry.size} binaries (cap=$cap, " +
-              s"mix=${if (fullResendDue) "contiguous-prefix-full-resend" else "unsent-only"}, " +
-              s"totalPending=${allPending.size})"
-          ) >>
-            toRetry.traverse_(p => sendBinaryInBackground(p, signers))
-        } else {
-          Applicative[F].unit
+      retryTickCounter.getAndUpdate(_ + 1L).flatMap { tick =>
+        val fullResendDue = tick % ResendEveryTicks === 0L
+        tracker.getPendingToRetry(inflightCeiling).flatMap { allPending =>
+          val sortedAsc = allPending.sortBy(_.currencySnapshotOrdinal.value.value)
+          val toRetry = if (fullResendDue) sortedAsc else sortedAsc.filter(_.sendsSoFar.value === 0L)
+          if (toRetry.nonEmpty) {
+            logger.info(
+              s"[RetryMode] Processing ${toRetry.size} binaries (cap=$cap, " +
+                s"mix=${if (fullResendDue) "contiguous-prefix-full-resend" else "unsent-only"}, " +
+                s"totalPending=${allPending.size})"
+            ) >>
+              toRetry.traverse_(p => sendBinaryInBackground(p, signers))
+          } else {
+            Applicative[F].unit
+          }
         }
       }
     }
