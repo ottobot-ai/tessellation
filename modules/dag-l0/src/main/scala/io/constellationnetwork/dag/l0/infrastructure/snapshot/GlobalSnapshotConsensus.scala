@@ -1472,7 +1472,13 @@ object GlobalSnapshotConsensus {
                       shardEtaFor = shardEtaFor,
                       sigmaInCommittee = sigmaInCommittee,
                       slotGapFor = slotGapFor,
-                      lddConfig = lddConfig,
+                      // §5.7 retune: shard-specific LDD (slot-density-scaled clock params), NOT gl0's.
+                      lddConfig = io.constellationnetwork.schema.nakamoto.LddConfig.fromDoubles(
+                        lddCutoff = deps.shardingConfig.checkpoint.ldd.cutoff,
+                        offset = deps.shardingConfig.checkpoint.ldd.offset,
+                        baselineDifficulty = deps.shardingConfig.checkpoint.ldd.baseline,
+                        amplitude = deps.shardingConfig.checkpoint.ldd.amplitude
+                      ),
                       // S3: the SAME committee re-execution closure the verifier uses (built from the shared
                       // `shardScEventsProcessor`), so the producer's `perMetagraphMptRoots` are recomputed
                       // byte-identically by every verifier's `reExecuteDerivation`.
