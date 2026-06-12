@@ -212,6 +212,35 @@ TRIM-ANCHOR adoption guard) are untouched. The new wire `slot` adds the same ske
 carry. Same-ord siblings from near-simultaneous wins resolve via maxvalid-tk + canonical-chain attestation (the
 attestation-split mode is closed).
 
+### 5.8 High-traffic metagraphs — spreading levers (owner-reviewed 2026-06-12)
+
+The structural fact that sorts all options: **a metagraph's binary chain is sequential** (parent-hash chain), so a
+single hot metagraph cannot be striped across shards — its lever is *batch size per fold*, never shard-parallelism.
+Shard-parallelism spreads *many* metagraphs across lanes, not one metagraph across many.
+
+Our embed lane is variable-width: each shard folds ≤ 1 checkpoint per gl0 ord, but the checkpoint's per-MG **window**
+(`includedSnapshots: mg → NonEmptyList[binary]`) is an arbitrary-length contiguous chain segment. (Contrast Polkadot:
+its lane unit — a core — carries a *fixed-size* parachain block, so hot chains must rent MORE cores; ours widens.)
+Levers, in activation order — each conditional on a pressure we do not yet have:
+
+1. **NOW**: per-slot lottery (§5.7) + remove the sender batch ceiling (`StateChannelBinarySender` RetryMode ships the
+   full contiguous backlog, not 64/tick) so windows actually absorb bursts. The shard layer is then a bulk-service
+   queue: throughput = window size × fold rate, stable for any arrival rate below wire bandwidth.
+2. **IF a window cap is ever introduced** (wire size / committee verify cost): deterministic fair packing —
+   round-robin water-fill across MGs in address order until the cap (a pure function of the buffer ⇒ byte-verifiable
+   by re-exec; no persistent deficit state). Protects light MGs co-located with a hot one. Until a cap exists there
+   is nothing to ration.
+3. **IF MG-count ≫ shards or hot/light co-location hurts**: epoch-keyed load-aware assignment —
+   `shardIdFor(address, epoch)` computed identically by all nodes from finalized per-MG traffic counts (mirror
+   ordinal deltas), greedy heaviest-first packing; hot MG gets an isolated shard. Today `ShardAssignment.shardIdFor`
+   is static `SHA-256(address) mod numShards` — this lever is a real workstream (every `shardIdFor` call site becomes
+   epoch-aware + boundary handoff). Migration-safe: a moved MG's first window on its new shard chains off gl0's SC
+   tip (the existing unseeded-MG fallback).
+4. **IF both a window cap AND a hot MG**: fold k consecutive same-shard checkpoints (parent-linked, order preserved)
+   in one gl0 ord — the Polkadot elastic-scaling analog. Escape hatch only; meaningless while windows are uncapped.
+5. **IF adversarial congestion**: collateral-weighted bandwidth shares (stake-weighted QoS). Economic policy, owner
+   call, not a correctness mechanism.
+
 ## 6. Migration plan (hard fork LAST, per standing phase order)
 
 | Phase | Content | Risk gate |
