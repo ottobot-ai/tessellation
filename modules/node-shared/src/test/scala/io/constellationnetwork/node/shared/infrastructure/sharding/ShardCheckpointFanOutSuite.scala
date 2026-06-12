@@ -139,6 +139,10 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
   // returns a committee containing it for every shard, so the gate passes and the existing produce/store assertions are unchanged.
   // The producer's OWN selfPeerId (from its keypair) is independent of the gate — the gate consults only the fan-out's `selfPeerId`.
   private val gateSelf: PeerId = PeerId(io.constellationnetwork.security.hex.Hex("ee" * 64))
+  // Staircase note: the producer's duty schedule runs over THIS committee, so it must contain the producers'
+  // own peerId (rig keypair) as well as the fan-out gate identity.
+  private def committeeOf(rig: Rig): (ShardId, EtaPeriod) => IO[Set[PeerId]] =
+    (_, _) => IO.pure(Set(gateSelf, rig.selfPeerId))
   private val allowAllCommittee: (ShardId, EtaPeriod) => IO[Set[PeerId]] = (_, _) => IO.pure(Set(gateSelf))
   private val denyAllCommittee: (ShardId, EtaPeriod) => IO[Set[PeerId]] = (_, _) => IO.pure(Set.empty[PeerId])
 
@@ -163,9 +167,8 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
       // Slice S4: epoch-keyed eta resolver; the fan-out tests don't exercise eta rotation, so a constant precomputed
       // shardEta (independent of epoch) keeps the slot-leader draw deterministic.
       shardEtaFor = _ => IO.pure(shardEta),
-      sigmaInCommittee = sigma,
       slotGapFor = slotGapFor,
-      lddConfig = LddConfig.Default,
+      staircaseDeltaSlots = 5,
       derivePerMgState = deterministicDerive,
       lastAdoptedOrd = cats.effect.IO.pure(None),
       pipelineDepth = Int.MaxValue
@@ -176,7 +179,8 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
     assignment: ShardAssignment[IO],
     producers: Map[ShardId, ShardCheckpointProducer[IO]],
     chainStores: Map[ShardId, ShardChainStore[IO]],
-    buffers: Map[ShardId, ShardBinaryBuffer[IO]]
+    buffers: Map[ShardId, ShardBinaryBuffer[IO]],
+    selfPeerId: PeerId
   )
 
   private def freshRig(
@@ -198,6 +202,7 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
       }
     } yield
       Rig(
+        selfPeerId = PeerId.fromPublic(keyPair.getPublic),
         assignment = assignment,
         producers = perShard.map { case (sid, p, _, _) => sid -> p }.toMap,
         chainStores = perShard.map { case (sid, _, s, _) => sid -> s }.toMap,
@@ -291,7 +296,7 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
           shardProducers = rig.producers,
           shardChainStores = rig.chainStores,
           selfPeerId = gateSelf,
-          committeeMembership = allowAllCommittee,
+          committeeMembership = committeeOf(rig),
           logger = logger
         )
       }

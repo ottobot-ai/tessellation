@@ -231,9 +231,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       // epoch — the producer/verifier-agreement property is exercised in ShardSlotLeaderSuite; here we only assert the
       // producer threads the resolved eta through its leader draw, so a constant is sufficient.
       shardEtaFor = _ => IO.pure(shardEta),
-      sigmaInCommittee = sigma,
       slotGapFor = slotGapFor,
-      lddConfig = LddConfig.Default,
+      staircaseDeltaSlots = 5,
       derivePerMgState = derive,
       lastAdoptedOrd = cats.effect.IO.pure(None),
       pipelineDepth = Int.MaxValue
@@ -255,7 +254,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       producer <- makeProducer(ssl, rig, Ratio.One, shardEta)
       // We may need to try several gl0 anchors until we find one where this node wins the lottery; σ=1 should hit on the first try in
       // recovery regime, but a defensive loop covers the rare miss.
-      result <- tryProduceUntilSome(producer, startOrd = 1000L, EtaPeriod(0L), maxAttempts = 100)
+      result <- tryProduceUntilSome(producer, startOrd = 1000L, EtaPeriod(0L), maxAttempts = 100, committee = Set(rig.selfPeerId))
       produced <- IO.fromOption(result)(new RuntimeException("happy path: σ=1 producer should win within 100 attempts"))
       recorded <- rig.recorded
     } yield
@@ -276,16 +275,19 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
   // Test 2 — Skip when not leader
   // ===========================================================================
 
-  test("skip when not leader: σ=0 ⇒ produce returns None, publisher not called") { res =>
+  test("skip when not on duty: committee excludes self ⇒ produce returns None, publisher not called") { res =>
     implicit val (h, sp, ssl) = res
     for {
       rig <- freshRig
       gl0Eta = randomGl0Eta()
       shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
-      // σ=0 ⇒ EligibilityChecker.threshold returns 0 ⇒ no slot ever wins (contract documented in EligibilityChecker.threshold).
+      // Staircase: the duty schedule is over the COMMITTEE; a committee that excludes self ⇒ self is never on duty.
       producer <- makeProducer(ssl, rig, Ratio.Zero, shardEta)
+      stranger = PeerId(Hex("ab" * 64))
       // Try several gl0 anchors — must all return None.
-      attempts <- (1L to 10L).toList.traverse(i => producer.produce(mkPendingSnapshots(2), mkOrd(i), EtaPeriod(0L), Slot.unsafeApply(i)))
+      attempts <- (1L to 10L).toList.traverse(i =>
+        producer.produce(mkPendingSnapshots(2), mkOrd(i), EtaPeriod(0L), Slot.unsafeApply(i), Set(stranger))
+      )
       recorded <- rig.recorded
     } yield expect.all(attempts.forall(_.isEmpty), recorded.isEmpty)
   }
@@ -301,7 +303,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       gl0Eta = randomGl0Eta()
       shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
       producer <- makeProducer(ssl, rig, Ratio.One, shardEta)
-      out <- producer.produce(SortedMap.empty, mkOrd(1L), EtaPeriod(0L), Slot.unsafeApply(1L))
+      out <- producer.produce(SortedMap.empty, mkOrd(1L), EtaPeriod(0L), Slot.unsafeApply(1L), Set(rig.selfPeerId))
       recorded <- rig.recorded
     } yield expect.all(out.isEmpty, recorded.isEmpty)
   }
@@ -320,10 +322,11 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       // Produce one — its binaries are genesis-anchored (Hash.empty), then insert it into the chain store so the next produce sees a
       // non-empty tip. (R-2: the FIRST round's pending must chain off the empty perMgTip ⇒ Hash.empty-anchored binaries.)
       first <- tryProduceUntilSome(
-        producer,
+        producer = producer,
         startOrd = 2000L,
-        EtaPeriod(0L),
+        epoch = EtaPeriod(0L),
         maxAttempts = 100,
+        committee = Set(rig.selfPeerId),
         pending = mkPendingChainedOff(SortedMap.empty, round = 0)
       )
       firstCp <- IO.fromOption(first)(new RuntimeException("produce-1 should win at σ=1 within 100 attempts"))
@@ -334,10 +337,11 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       // hashes), or the producer's chain-link gate omits them and produce returns None.
       perMgTipAfterFirst <- rig.chainStore.perMgTip
       second <- tryProduceUntilSome(
-        producer,
+        producer = producer,
         startOrd = 2100L,
-        EtaPeriod(0L),
+        epoch = EtaPeriod(0L),
         maxAttempts = 100,
+        committee = Set(rig.selfPeerId),
         pending = mkPendingChainedOff(perMgTipAfterFirst, round = 1)
       )
       secondCp <- IO.fromOption(second)(new RuntimeException("produce-2 should win at σ=1 within 100 attempts"))
@@ -368,10 +372,11 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
             for {
               perMgTip <- rig.chainStore.perMgTip
               produced <- tryProduceUntilSome(
-                producer,
+                producer = producer,
                 startOrd = 3000L + i * 100L,
-                EtaPeriod(0L),
+                epoch = EtaPeriod(0L),
                 maxAttempts = 100,
+                committee = Set(rig.selfPeerId),
                 pending = mkPendingChainedOff(perMgTip, round = i)
               )
               cp <- IO.fromOption(produced)(new RuntimeException(s"produce-${i + 1} should win at σ=1 within 100 attempts"))
@@ -397,7 +402,14 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       seen <- cats.effect.kernel.Ref.of[IO, List[Address]](List.empty)
       producer <- makeProducer(ssl, rig, Ratio.One, shardEta, derive = recordingDerive(seen))
       pending = mkPendingSnapshots(numMgs = 4)
-      result <- tryProduceUntilSome(producer, startOrd = 4000L, EtaPeriod(0L), pending = pending, maxAttempts = 100)
+      result <- tryProduceUntilSome(
+        producer,
+        startOrd = 4000L,
+        EtaPeriod(0L),
+        pending = pending,
+        maxAttempts = 100,
+        committee = Set(rig.selfPeerId)
+      )
       cp <- IO.fromOption(result)(new RuntimeException("produce should win at σ=1 within 100 attempts"))
       seenList <- seen.get
     } yield
@@ -429,7 +441,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       gl0Eta = randomGl0Eta()
       shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
       producer <- makeProducer(ssl, rig, Ratio.One, shardEta)
-      result <- tryProduceUntilSome(producer, startOrd = 5000L, EtaPeriod(0L), maxAttempts = 100)
+      result <- tryProduceUntilSome(producer, startOrd = 5000L, EtaPeriod(0L), maxAttempts = 100, committee = Set(rig.selfPeerId))
       cp <- IO.fromOption(result)(new RuntimeException("produce should win at σ=1 within 100 attempts"))
       // Re-derive the canonical preimage hash (Hasher of ShardCheckpointSigPreimage) — this is the bytes the inner committee sig covers.
       preimageHash <- Hasher[IO].hash(cp.value.signingPreimage)
@@ -502,15 +514,18 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     startOrd: Long,
     epoch: EtaPeriod,
     maxAttempts: Int,
+    committee: Set[PeerId],
     pending: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] = mkPendingSnapshots(2)
   ): IO[Option[Signed[ShardCheckpoint]]] = {
     def loop(attempt: Int): IO[Option[Signed[ShardCheckpoint]]] =
       if (attempt >= maxAttempts) IO.pure(None)
       else
-        producer.produce(pending, mkOrd(startOrd + attempt.toLong), epoch, Slot.unsafeApply(startOrd + attempt.toLong)).flatMap {
-          case s @ Some(_) => IO.pure(s)
-          case None        => loop(attempt + 1)
-        }
+        producer
+          .produce(pending, mkOrd(startOrd + attempt.toLong), epoch, Slot.unsafeApply(startOrd + attempt.toLong), committee)
+          .flatMap {
+            case s @ Some(_) => IO.pure(s)
+            case None        => loop(attempt + 1)
+          }
     loop(0)
   }
 

@@ -7,7 +7,8 @@ import io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot.Slot
-import io.constellationnetwork.schema.sharding.ShardId
+import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.schema.sharding.{ShardId, ShardOrdinal}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hex.Hex
 
@@ -77,6 +78,28 @@ trait ShardSlotLeader[F[_]] {
     lddConfig: LddConfig,
     proof: Array[Byte]
   ): F[Boolean]
+
+  /** Shuffled-staircase duty order (owner, 2026-06-12 — replaces the per-slot LDD lottery for shard-checkpoint PRODUCTION; design §5.7 rev
+    * 2). Returns the committee deterministically ordered for `(shardEta, shardOrdinal)`: rank r proposes during slot window `[parentSlot +
+    * 1 + r·δ, parentSlot + 1 + (r+1)·δ)`, wrapping modulo the committee size so liveness needs only ONE live member.
+    *
+    * The ordering is a hash-sort: each member's position is `Hasher[F](StaircaseRankInput(tag, shardEta, shardOrdinal, peerId))`, sorted
+    * lexicographically. Pure function of `(eta, ordinal, membership)` — every committee member and every verifier derives the identical
+    * order, and the eta (frozen at the prior period's 2/3-mark) makes it unbiasable by the participants. Run-13/14 evidence for WHY a
+    * lottery cannot work here: at per-slot draws a small committee forks at genesis (everyone is instantly eligible at unbounded gap) and
+    * siblings under any quorum lag — duty assignment is the only shape with a UNIQUE producer per window.
+    */
+  def dutyOrder(
+    committee: List[PeerId],
+    shardEta: Array[Byte],
+    shardOrdinal: ShardOrdinal
+  )(implicit hasher: Hasher[F]): F[List[PeerId]]
+
+  /** VRF membership proof over `(shardEta, slot)` — the SAME primitive the attestation emitter uses (`vrfProofForSlot`). Carried on the
+    * produced envelope's `CommitteeMemberSignature.vrfProof`. NOT a lottery-win claim under the staircase — it proves the producer
+    * evaluated the VRF at this slot under this eta (structural check at Slice 9; Slice 13 elevates verification).
+    */
+  def membershipProof(vrfSk: Array[Byte], shardEta: Array[Byte], slot: Slot): F[Array[Byte]]
 }
 
 object ShardSlotLeader {
@@ -108,6 +131,24 @@ object ShardSlotLeader {
 
   object ShardEtaInput {
     implicit val encoder: Encoder[ShardEtaInput] = deriveEncoder
+  }
+
+  /** Domain-separation tag for the staircase rank hash — distinct from [[DomainTag]] and `CommitteeSortition`'s `"committee"`. */
+  private val StaircaseTag: String = "shard-staircase-rank"
+
+  /** Canonical hash input for a member's staircase rank at one shard ordinal. `shardEta` as 64-char hex (same convention as
+    * [[ShardEtaInput]]); rank = lexicographic order of the resulting hashes. Frozen-shape consensus contract (same discipline as
+    * [[io.constellationnetwork.schema.sharding.ShardCheckpointSigPreimage]]).
+    */
+  final case class StaircaseRankInput(
+    tag: String,
+    shardEta: Hex,
+    shardOrdinal: ShardOrdinal,
+    peerId: PeerId
+  )
+
+  object StaircaseRankInput {
+    implicit val encoder: Encoder[StaircaseRankInput] = deriveEncoder
   }
 
   /** Build a [[ShardSlotLeader]] backed by the supplied [[EligibilityChecker]]. Callers MUST pass the same `EligibilityChecker[F]` instance
@@ -158,5 +199,20 @@ object ShardSlotLeader {
       proof: Array[Byte]
     ): F[Boolean] =
       eligibilityChecker.verifyEligibility(vrfVk, slot, slotGap, shardEta, sigmaInCommittee, lddConfig, proof)
+
+    def dutyOrder(
+      committee: List[PeerId],
+      shardEta: Array[Byte],
+      shardOrdinal: ShardOrdinal
+    )(implicit hasher: Hasher[F]): F[List[PeerId]] =
+      committee.traverse { p =>
+        hasher.hash(StaircaseRankInput(StaircaseTag, Hex.fromBytes(shardEta), shardOrdinal, p)).map(h => (h.value, p))
+      }
+        // Lexicographic sort on the canonical hex hash; ties impossible (distinct peerIds hash distinctly modulo SHA-256
+        // collisions). Deterministic across JVMs: same Hasher, same String ordering.
+        .map(_.sortBy(_._1).map(_._2))
+
+    def membershipProof(vrfSk: Array[Byte], shardEta: Array[Byte], slot: Slot): F[Array[Byte]] =
+      Sync[F].delay(eligibilityChecker.vrfProofForSlot(vrfSk, slot, shardEta))
   }
 }

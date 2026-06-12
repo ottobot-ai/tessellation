@@ -142,9 +142,8 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
       selfVrfSk = fixedVrfSk,
       kesSigner = ShardCheckpointProducer.KesSigner.fixed[IO](period = 7, signatureBytes = fixedKesPayload),
       shardEtaFor = _ => IO.pure(fixedShardEta),
-      sigmaInCommittee = Ratio.One,
       slotGapFor = slotGapFor,
-      lddConfig = LddConfig.Default,
+      staircaseDeltaSlots = 5,
       derivePerMgState = reExec,
       lastAdoptedOrd = cats.effect.IO.pure(None),
       pipelineDepth = Int.MaxValue
@@ -155,6 +154,7 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
     producer: ShardCheckpointProducer[IO],
     pending: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
     startOrd: Long,
+    committee: Set[PeerId],
     maxAttempts: Int = 100
   ): IO[Option[Signed[ShardCheckpoint]]] = {
     def loop(attempt: Int): IO[Option[Signed[ShardCheckpoint]]] =
@@ -165,7 +165,8 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
             pending,
             SnapshotOrdinal(NonNegLong.unsafeFrom(startOrd + attempt.toLong)),
             epochZero,
-            SlotT.unsafeApply(startOrd + attempt.toLong)
+            SlotT.unsafeApply(startOrd + attempt.toLong),
+            committee
           )
           .flatMap {
             case s @ Some(_) => IO.pure(s)
@@ -246,7 +247,12 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
       // PRODUCER builds the checkpoint with a REAL per-MG root via the shared closure.
       store <- ShardChainStore.make[IO](shardZero)
       producer <- mkRealProducer(ssl, store, opKeyPair, reExec)
-      producedOpt <- produceUntilSome(producer, pending, startOrd = anchorOrd.value.value)
+      producedOpt <- produceUntilSome(
+        producer,
+        pending,
+        startOrd = anchorOrd.value.value,
+        committee = Set(PeerId.fromPublic(opKeyPair.getPublic))
+      )
       produced <- IO.fromOption(producedOpt)(new RuntimeException("σ=1 producer should win within 100 attempts"))
       producedRoot = produced.value.derivedStateDelta.perMetagraphMptRoots(mgAddr)
 
@@ -285,7 +291,12 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
 
       store <- ShardChainStore.make[IO](shardZero)
       producer <- mkRealProducer(ssl, store, opKeyPair, reExec)
-      producedOpt <- produceUntilSome(producer, pending, startOrd = anchorOrd.value.value)
+      producedOpt <- produceUntilSome(
+        producer,
+        pending,
+        startOrd = anchorOrd.value.value,
+        committee = Set(PeerId.fromPublic(opKeyPair.getPublic))
+      )
       produced <- IO.fromOption(producedOpt)(new RuntimeException("σ=1 producer should win within 100 attempts"))
       producedRoot = produced.value.derivedStateDelta.perMetagraphMptRoots(mgAddr)
       sentinel <- Hasher[IO].hash(mgAddr)
@@ -317,7 +328,12 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
 
       store <- ShardChainStore.make[IO](shardZero)
       producer <- mkRealProducer(ssl, store, opKeyPair, reExec)
-      producedOpt <- produceUntilSome(producer, pending, startOrd = anchorOrd.value.value)
+      producedOpt <- produceUntilSome(
+        producer,
+        pending,
+        startOrd = anchorOrd.value.value,
+        committee = Set(PeerId.fromPublic(opKeyPair.getPublic))
+      )
       produced <- IO.fromOption(producedOpt)(new RuntimeException("σ=1 producer should win within 100 attempts"))
 
       // TAMPER: overwrite the per-MG root with a wrong value, modelling a MALICIOUS producer that computed a WRONG derivation

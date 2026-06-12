@@ -175,7 +175,8 @@ trait ShardCheckpointProducer[F[_]] {
     pendingSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
     gl0AnchorOrdinal: SnapshotOrdinal,
     epoch: EtaPeriod,
-    currentSlot: Slot
+    currentSlot: Slot,
+    committee: Set[PeerId]
   ): F[Option[Signed[ShardCheckpoint]]]
 }
 
@@ -249,14 +250,12 @@ object ShardCheckpointProducer {
     * producer + every verifier must derive the SAME shard-leader eta or `verifyLeader` disagrees and the shard chain stalls. The eta for
     * the checkpoint's epoch is always knowable here: `epoch == rotationPeriod(gl0AnchorOrdinal)` and `eta_N` is fixed at the 2/3-mark of
     * period `N-1` (per `EtaCalculation`), strictly before any ordinal in period `N`.
-    * @param sigmaInCommittee
-    *   this operator's stake share within the shard committee. Per v1 stable-σ rule (`[[project-216-committee-stake-drift-fix]]`) this is
-    *   `1 / K_S`. Production wiring passes the typed value; tests inject directly.
+    * @param staircaseDeltaSlots
+    *   width of each staircase rank's proposal window, in slots (design §5.7 rev 2; owner default 5). HOCON
+    *   `nakamoto.sharding.checkpoint.staircase-delta-slots`.
     * @param slotGapFor
     *   pure function from `(currentSlot, parentSlotOpt)` returning the LDD slot-gap. Genesis case (no parent): caller supplies a sensible
     *   default — typically the slot itself (matches `EligibilityChecker`'s "first wins always" semantics at the chain seed).
-    * @param lddConfig
-    *   per-shard LDD config. Production wiring uses `LddConfig.Default` (matches gl0) unless a per-shard tuning is later introduced.
     * @param derivePerMgState
     *   injectable per-MG derivation `(metagraphAddress, includedChain, gl0AnchorOrdinal) => F[Hash]` that re-runs the metagraph's currency
     *   derivation over its full included SC-binary chain and returns the canonical per-MG MPT root. The `gl0AnchorOrdinal` (the
@@ -278,9 +277,8 @@ object ShardCheckpointProducer {
     selfVrfSk: Array[Byte],
     kesSigner: KesSigner[F],
     shardEtaFor: EtaPeriod => F[Array[Byte]],
-    sigmaInCommittee: Ratio,
+    staircaseDeltaSlots: Int,
     slotGapFor: (Slot, Option[Slot]) => Long,
-    lddConfig: LddConfig,
     derivePerMgState: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash],
     /** Bounded checkpoint pipeline (2026-06-11, run bpc2yyegf): highest shard ordinal gl0 has ADOPTED for this shard on this node (the
       * acceptance manager's watermark). Production POLICY input only — never a validity condition.
@@ -304,7 +302,8 @@ object ShardCheckpointProducer {
         pendingSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         gl0AnchorOrdinal: SnapshotOrdinal,
         epoch: EtaPeriod,
-        currentSlot: Slot
+        currentSlot: Slot,
+        committee: Set[PeerId]
       ): F[Option[Signed[ShardCheckpoint]]] =
         // Slice 8 v1: empty input ⇒ nothing to checkpoint. T_alive liveness pings (which permit empty payloads) are deferred to a future
         // slice that introduces an explicit `forceEmptyAlive: Boolean` flag — slice 8 keeps the contract simple.
@@ -331,7 +330,7 @@ object ShardCheckpointProducer {
                       s"adoptedShardOrd=${adoptedOrdOpt.map(_.value).getOrElse(0L)}"
                   )
                   .as(None: Option[Signed[ShardCheckpoint]])
-              } else produceInner(bestTipOpt, perMgTip, pendingSnapshots, gl0AnchorOrdinal, epoch, currentSlot)
+              } else produceInner(bestTipOpt, perMgTip, pendingSnapshots, gl0AnchorOrdinal, epoch, currentSlot, committee)
           }
         }
 
@@ -341,7 +340,8 @@ object ShardCheckpointProducer {
         pendingSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         gl0AnchorOrdinal: SnapshotOrdinal,
         epoch: EtaPeriod,
-        currentSlot: Slot
+        currentSlot: Slot,
+        committee: Set[PeerId]
       ): F[Option[Signed[ShardCheckpoint]]] = {
         val parentHash: Hash = bestTipOpt.map(_.hash).getOrElse(Hash.empty)
         val parentOrd: ShardOrdinal = bestTipOpt.map(_.signed.value.shardOrdinal).getOrElse(ShardOrdinal.Genesis)
@@ -375,20 +375,28 @@ object ShardCheckpointProducer {
             // wire-carried `checkpoint.epoch` — derives byte-identical bytes. This is the load-bearing determinism invariant: if
             // producer + verifier disagreed on shardEta, `ShardSlotLeader.verifyLeader` would reject and the shard chain stalls.
             shardEtaFor(epoch).flatMap { shardEta =>
-              slotLeader
-                .isLeader(selfVrfSk, shardEta, currentSlot, slotGap, sigmaInCommittee, lddConfig)
-                .flatMap {
-                  case None =>
-                    // Not the slot leader — per design doc §6.3, other committee members attest later via gossip (slice 14).
-                    logger
-                      .info(
-                        s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=not-leader " +
-                          s"slot=${currentSlot.value.value} gap=$slotGap chainedMgs=${orderedSnapshots.size}"
-                      )
-                      .as(None: Option[Signed[ShardCheckpoint]])
-
-                  case Some((vrfProof, _)) =>
-                    // Won the lottery — build the checkpoint, sign it, publish it.
+              // ─── SHUFFLED STAIRCASE (owner, 2026-06-12; design §5.7 rev 2 — replaces the LDD lottery) ───
+              // Deterministic duty schedule: the committee is hash-sorted per (shardEta, NEXT shardOrdinal); rank r
+              // is on duty for delta slots starting 1 slot after the parent's wire slot, wrapping modulo committee
+              // size (liveness needs ONE live member; censorship bounded by rotation). UNIQUE producer per window —
+              // genesis included — which is what a lottery can never give a small committee at per-slot draws
+              // (run-13/14: genesis forks + same-ord sibling lineages split attestations below kQuorum).
+              // slotGap >= 1 by construction (slotGapFor clamps); window index = (slotGap - 1) / delta.
+              slotLeader.dutyOrder(committee.toList.sortBy(_.value.value), shardEta, nextShardOrdinal).flatMap { ordered =>
+                val k = math.max(1, ordered.size)
+                val dutyIdx = (((slotGap - 1L) / math.max(1L, staircaseDeltaSlots.toLong)) % k.toLong).toInt
+                val onDuty = ordered(dutyIdx)
+                if (onDuty =!= selfPeerId)
+                  logger
+                    .info(
+                      s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=not-on-duty " +
+                        s"slot=${currentSlot.value.value} gap=$slotGap dutyRank=$dutyIdx " +
+                        s"onDuty=${onDuty.value.value.take(12)} chainedMgs=${orderedSnapshots.size}"
+                    )
+                    .as(None: Option[Signed[ShardCheckpoint]])
+                else
+                  slotLeader.membershipProof(selfVrfSk, shardEta, currentSlot).flatMap { vrfProof =>
+                    // On duty — build the checkpoint, sign it, publish it.
                     for {
                       delta <- assembleDelta(orderedSnapshots, gl0AnchorOrdinal)
                       checkpoint = ShardCheckpoint(
@@ -432,7 +440,8 @@ object ShardCheckpointProducer {
                           s"slot=${currentSlot.value.value} mgs=${orderedSnapshots.keys.size} kesStep=$kesStep"
                       )
                     } yield Some(signedCheckpoint): Option[Signed[ShardCheckpoint]]
-                }
+                  }
+              }
             }
         }
       }

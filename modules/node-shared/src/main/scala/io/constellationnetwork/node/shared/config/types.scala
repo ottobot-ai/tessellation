@@ -238,20 +238,11 @@ object types {
       * batch into one bigger window (catch-up margin — see ShardCheckpointProducer).
       */
     pipelineDepth: Int = 2,
-    /** Shard-leader LDD for the per-SLOT lottery (design §5.7, run-13 retune). Same linear-ramp SHAPE as gl0's, but the clock params
-      * (offset/cutoff) are stretched for slot-density: reusing gl0's psi=1/gamma=15 at per-slot draws produced the run-13 same-ord sibling
-      * forest (every node won within seconds of quorum lag; attestations split below kQuorum). Doubles are converted once via
-      * `LddConfig.fromDoubles` at the use site (exact-rational from there on, consensus rule).
+    /** Shuffled-staircase proposal window width in slots (design §5.7 rev 2, owner 2026-06-12; default 5). Per shard ordinal the committee
+      * is hash-sorted under the epoch eta; rank r proposes for this many slots, wrapping modulo committee size. Replaces the per-slot LDD
+      * lottery (run-13/14: genesis forks + same-ord sibling lineages split attestations below kQuorum at ANY density).
       */
-    ldd: ShardLddConfig = ShardLddConfig()
-  )
-
-  /** HOCON shape for the shard-leader LDD (see [[ShardCheckpointConfig.ldd]]). */
-  case class ShardLddConfig(
-    offset: Int = 5,
-    cutoff: Int = 45,
-    amplitude: Double = 0.4,
-    baseline: Double = 0.02
+    staircaseDeltaSlots: Int = 5
   )
 
   /** Slice 19 observability tunables (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §13 row 19 + §9.4).

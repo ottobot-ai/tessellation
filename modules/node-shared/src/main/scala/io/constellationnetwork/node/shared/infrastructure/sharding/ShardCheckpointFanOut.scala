@@ -135,7 +135,7 @@ object ShardCheckpointFanOut {
               }
             pendingF.flatMap { forShard =>
               producer
-                .produce(forShard, producedOrd, epoch, currentSlot)
+                .produce(forShard, producedOrd, epoch, currentSlot, committee)
                 .flatMap {
                   case None             => Async[F].unit
                   case Some(checkpoint) =>

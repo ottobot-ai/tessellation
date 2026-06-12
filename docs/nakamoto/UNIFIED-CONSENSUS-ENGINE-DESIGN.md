@@ -185,10 +185,21 @@ triggered once per anchor. That was a determinism shortcut from the sharding sli
 needs no wall-clock trust), NOT a discussed design decision — and it inverted the intended cadence: the shard lottery
 gets one draw per global snapshot (~6.5 slot-durations observed mean inter-snapshot time) while gl0 draws every slot,
 so shards tick ~6.5× SLOWER than the layer they feed. Run-10's "Gap A" (51 anchor-draws ≈ 3.3 min without a shard
-leader, consuming half a 6.5-min allow-spend budget) is this inversion, not a fat lottery tail: drawn per slot, the
-identical LDD parameters give ramp resolution within ~γ slots and baseline droughts of ~20-slot mean — seconds at any
-sane slotDuration. No staircase is needed at the shard layer — **the
-staircase is ml0-only (5.1)**; shards keep the normal linear-ramp LDD, evaluated against real slots.
+leader, consuming half a 6.5-min allow-spend budget) is this inversion, not a fat lottery tail.
+
+**REV 2 (owner, 2026-06-12): shard production = SHUFFLED STAIRCASE, not a lottery.** Runs 13–14 showed that at
+per-slot draws a small committee forks at GENESIS (everyone instantly eligible at unbounded gap) and siblings under
+any quorum lag — at ANY LDD density (a ψ=5/γ=45 retune still forested; run 14 had ZERO quorum-Accepted receipts).
+Only a unique-producer-per-window schedule avoids it. Polkadot reaches the same split: the relay chain runs a
+lottery (BABE) over the open validator set while parachains author via **Aura round-robin** over their small
+registered collator sets — and relay cadence ≥ parachain cadence, because the parent chain is the inclusion clock.
+Ours mirrors both: gl0 keeps Taktikos; the shard committee is hash-sorted per `(shardEta, shardOrdinal)`
+(`ShardSlotLeader.dutyOrder`), rank r proposes for `staircase-delta-slots` (default 5) slots starting one slot after
+the parent's wire slot, wrapping modulo committee size (liveness = ONE live member; censorship bounded by rotation).
+Duty is a pure function of on-wire data (parent slot + current slot + epoch eta + membership) — deterministically
+verifiable. Shard chain growth stays structurally ≤ gl0 growth (the 1-checkpoint/shard/gl0-ord embed lane + the
+pipeline gate are the throughput governors); the staircase's job is mint LATENCY — rank-0 produces within ~1 slot of
+the lane opening. Client-facing finality speed lives in the ml0 countersign rail (5.2), not in shard cadence.
 
 **Mechanics of the correction:**
   - The `ShardCheckpoint` envelope carries its production **`slot`** explicitly (greenfield schema change; today the
@@ -198,8 +209,8 @@ staircase is ml0-only (5.1)**; shards keep the normal linear-ramp LDD, evaluated
   - `gl0AnchorOrdinal` REMAINS on the envelope as chain-link data (epoch/eta resolution, adoption anchoring) — it is
     no longer the lottery clock.
   - The producer trigger moves from the anchor-update path (`ShardCheckpointFanOut` per gl0 ord) onto the slot
-    tick. `slotGap` = slots since the parent checkpoint's wire slot; LDD params unchanged (ψ=1, γ=15, fA=0.5,
-    fB=0.05 — the ramp now spans γ slots of real time, slotDuration-scaled).
+    tick. `slotGap` = slots since the parent checkpoint's wire slot; under rev 2 it indexes the staircase window
+    (`(slotGap − 1) / δ mod K`), not an LDD threshold.
   - Every gl0 node has the slot clock — moving the shard lottery onto it costs nothing (owner: "all the gl0 will
     have the clock available"). Production remains throughput-governed by the existing pipeline gate
     (`awaiting-embed`, depth 2) and the 1-checkpoint/shard/gl0-ord embed rule — per-slot eligibility means a winner
