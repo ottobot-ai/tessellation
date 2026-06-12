@@ -259,7 +259,11 @@ object types {
       * is hash-sorted under the epoch eta; rank r proposes for this many slots, wrapping modulo committee size. Replaces the per-slot LDD
       * lottery (run-13/14: genesis forks + same-ord sibling lineages split attestations below kQuorum at ANY density).
       */
-    staircaseDeltaSlots: Int = 5
+    staircaseDeltaSlots: Int = 5,
+    /** Boot grace (run-17): no shard duty until Ready for this many slots — late-booting ranks must drain intake before taking (especially
+      * genesis) duty, or they seed rival lineages while blind.
+      */
+    bootGraceSlots: Int = 30
   )
 
   /** Slice 19 observability tunables (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §13 row 19 + §9.4).

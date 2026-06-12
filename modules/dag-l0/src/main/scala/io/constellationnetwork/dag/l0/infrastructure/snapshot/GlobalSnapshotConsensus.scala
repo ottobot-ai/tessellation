@@ -1592,6 +1592,7 @@ object GlobalSnapshotConsensus {
                   // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read inside the loop).
                   confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value,
                   slotDurationMs = sharedCfg.nakamoto.slotDurationMs.value,
+                  shardBootGraceSlots = shardAcceptanceDeps.map(_.shardingConfig.checkpoint.bootGraceSlots.toLong).getOrElse(30L),
                   lastKnownSlotRef = lastKnownSlotRef,
                   epochStateRef = epochStateRef,
                   genesisTimeMs = pureGenesisTimeMs,
