@@ -206,21 +206,11 @@ object Main
           io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO].pure[IO].asResource
       }
 
-      // Slice S1: VRF-VK registry from the SAME L0 genesis JSON the KES registry above reads. Each operator's
-      // `vrfPublicKey` was populated by the generator via `VrfKeyDeriver.deriveVrfKeyPair`, the SAME derivation
-      // the gl0 leader loop applies — so the loaded VKs byte-match each operator's runtime VRF identity. Empty
-      // for non-JSON bootstrap paths (rollback / join / CSV-genesis). Threaded into Services → consensus →
-      // ShardCheckpointWiring as an AVAILABLE-but-unconsumed dependency this slice (no behavior change).
-      vrfRegistry <- (method.genesisPath, method.genesisPath.exists(_.extName == ".json")) match {
-        case (Some(gPath), true) =>
-          GenesisLoader
-            .make[IO, GlobalSnapshot]
-            .loadL0Genesis(gPath)
-            .flatMap(L0GenesisLoader.buildVrfRegistry[IO])
-            .asResource
-        case _ =>
-          io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[IO].pure[IO].asResource
-      }
+      // Task #44: the gl0-leader produce path no longer loads its own VRF-VK registry. The committee-sortition
+      // registry is loaded once via `nakamotoShardRegistries` (above, in `TessellationIOApp`) and threaded into
+      // `SharedServices.make`; `GlobalSnapshotConsensus.make` reuses that single `shardAcceptanceDeps`, so the
+      // former second genesis parse + `vrfRegistry` thread-through here is gone (the KES registry below stays —
+      // the gl0 leader loop / sync daemon still consume it directly).
 
       services <- Services
         .make[IO, RunNakamoto](
@@ -245,7 +235,6 @@ object Main
           globalFollowSliceServiceRef,
           globalChangeSetServiceRef,
           kesRegistry,
-          vrfRegistry,
           // Split-safety (#261, eta axis): install the leader's chain-walk into the follower / `createContext`
           // GSAM's deferred committee-eta resolver (the Ref created in `TessellationIOApp.make`, exposed on
           // `NodeShared`). `GlobalSnapshotConsensus.make` invokes this once the chain store exists so the

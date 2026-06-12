@@ -252,12 +252,10 @@ object GlobalSnapshotConsensus {
     // on every incoming attestation/snapshot to confirm the sender's KES signature against the
     // genesis-registered VK without trusting the sender to ship its own VK in-band.
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
-    // Slice S1: (peerId → VRF verification key) registry loaded from L0 genesis (`operators[].vrfPublicKey`,
-    // derived via the SAME `VrfKeyDeriver.deriveVrfKeyPair` the gl0 leader loop uses). Threaded as an
-    // AVAILABLE dependency into `ShardCheckpointWiring.acceptanceDeps` so a later slice (S2) can do real
-    // per-signer committee sortition. NOT consumed in S1 — committee membership is still full-set, so this
-    // is a no-op at every `numShards`. Empty for the CSV-genesis bootstrap path.
-    vrfRegistry: io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[F],
+    // Task #44: the VRF-VK registry the shard committee sortition consumes is now loaded ONCE (via
+    // `nakamotoShardRegistries`) and threaded into `SharedServices.make`, whose single `shardAcceptanceDeps`
+    // this make() reuses. The former separate `vrfRegistry` param here fed a SECOND, now-deleted acceptanceDeps
+    // build, so it has been removed (the genesis VRF registry still reaches the committee draw via SharedServices).
     // Split-safety (#261, eta axis): the deferred chain-walk handle the follower / `createContext` GSAM's
     // committee-eta resolver reads (created in `TessellationIOApp.make`, threaded here via `Services.make`).
     // Set ONCE below — right after the leader's own `chainStoreForLookupRef` — to the SAME
@@ -436,21 +434,13 @@ object GlobalSnapshotConsensus {
         .map(_.publisher)
         .getOrElse(io.constellationnetwork.node.shared.infrastructure.local_events.LocalEventsPublisher.noop[F])
 
-      // Hierarchical-shard-checkpoints v1 — ACCEPTANCE-side production wiring (priority 1). Gated on
-      // `sharedCfg.nakamoto.sharding.numShards > 1`. At the production default `numShards = 1` this returns
-      // `None` (constructs nothing) and the GSAM `make` below passes `None` for all three sharding params —
-      // byte-identical to the pre-wiring call (the regression bar). See `ShardCheckpointWiring` scaladoc.
-      //
-      // This is the gl0-leader produce path, so the genesis-loaded `kesRegistry` (the make() param) IS in
-      // scope here — passed through so the acceptance manager verifies each checkpoint signer's KES product
-      // sig against the registered master VK. The active-validator set is the seedlist minus `metagraph-op`
-      // aliases (same derivation as `validatorPeers` in the inner block), falling back to `{selfId}`.
-      //
-      // S3 committee re-execution: the SAME `GlobalSnapshotStateChannelEventsProcessor` gl0 uses for metagraph
-      // snapshots is built once here and shared by (a) GSAM acceptance, (b) the shard verifier's
-      // `reExecuteDerivation`, and (c) the shard producer's `derivePerMgState`. Sharing one instance is what
-      // guarantees producer + verifier run the IDENTICAL currency derivation — the byte-identity contract that
-      // prevents false-slashing (see `GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot`).
+      // S3 committee re-execution processor: the SAME `GlobalSnapshotStateChannelEventsProcessor` gl0 uses for
+      // metagraph snapshots, built once here and shared by (a) THIS GSAM's acceptance and (b) the shard
+      // producer's `derivePerMgState` (the call site further below). Running the IDENTICAL currency derivation
+      // on producer + verifier is the byte-identity contract that prevents false-slashing (see
+      // `GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot`). The shard VERIFIER's re-exec now lives
+      // in the unified acceptance manager built in `SharedServices.make` (see `shardAcceptanceDeps` below); it is
+      // byte-identical because the derivation is a pure function of its inputs, not of the processor instance.
       shardScEventsProcessor = GlobalSnapshotStateChannelEventsProcessor.make[F](
         validators.stateChannelValidator,
         globalStateChannelManager,
@@ -459,37 +449,18 @@ object GlobalSnapshotConsensus {
         io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
       )
 
-      // `reExecuteDerivation` = the real S3 committee re-execution closure (replaces the
-      // `ShardCheckpointWiring.noReExecDerivation` fail-closed stub). On the `T_depth1_shard` degraded path the
-      // verifier re-runs each MG's derivation over its included chain at the wire-carried `gl0AnchorOrdinal` and
-      // rejects (+ surfaces slash signers) on a byte-mismatch. S3 wires re-exec → reject; APPLYING the slash
-      // penalty stays a separate slice (S2.0) — `adoptShardCheckpoints` still only logs the signer list.
-      shardAcceptanceDeps <- ShardCheckpointWiring
-        .acceptanceDeps[F](
-          cfg = sharedCfg.nakamoto.sharding,
-          // Draw/quorum decouple — the SAME cluster-uniform `nakamoto.committee` params the per-metagraph gate uses. kDraw sizes the
-          // shard committee DRAW (`committeeFor`); kQuorum is the shard admit count (`verifyEmbedded` / `tCountShard`).
-          kDraw = sharedCfg.nakamoto.committee.kDraw,
-          kQuorum = sharedCfg.nakamoto.committee.kQuorum,
-          selfPeerId = selfId,
-          kesRegistry = kesRegistry,
-          // EXECUTION-SHARDING: genesis-loaded VRF-VK registry — the per-operator seed for the real shard-committee sortition.
-          vrfRegistry = vrfRegistry,
-          activeValidators = Async[F].pure(
-            seedlist
-              .map(_.collect { case e if !e.alias.exists(_.value.value == "metagraph-op") => e.peerId })
-              .getOrElse(Set(selfId))
-          ),
-          // Per-period eta for `committeeFor`: the SAME `EtaStateManager.getEta` resolver the GSAM boundary writer uses, decoded
-          // from the hex `Hash` to the 32 raw eta bytes (mirrors `gl0EtaBytesForPeriod` below). MPT-committed ⇒ byte-identical
-          // cluster-wide, keyed on the wire-carried `checkpoint.epoch`.
-          etaForEpoch = (epoch: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
-            etaForPeriodCallback(epoch).map(h => io.constellationnetwork.security.hex.Hex(h.value).toBytes),
-          reExecuteDerivation = Some(
-            ShardCheckpointWiring.reExecDerivation[F](shardScEventsProcessor)(Async[F], HasherSelector[F].getCurrent)
-          )
-        )(Async[F], HasherSelector[F].getCurrent, implicitly[SecurityProvider[F]], implicitly[Metrics[F]])
-        .toResource
+      // Task #44 — UNIFY shard acceptance deps to ONE instance per node. The stateful registry (per-shard chain
+      // stores, tip trackers, finality triggers, binary buffers, committee cache, adopted watermarks) is built
+      // ONCE in `SharedServices.make` and reused here instead of being constructed a SECOND time. Both sites took
+      // byte-identical inputs (same genesis KES/VRF registries, same kDraw/kQuorum, same seedlist, same
+      // MPT-committed eta resolver — the #261 split-safety contract), so the deterministic side is unchanged. What
+      // was BROKEN was the duplicated STATE: follower adoptions (this node's SharedServices verify-GSAM) landed in
+      // one registry while the leader-produce GSAM + shard producers + sync daemon read a DISJOINT registry — so
+      // `deps.acceptanceManager.lastAdoptedOrd` never advanced for the producers, embeds stalled in eternal
+      // awaiting-embed, and the #42 ANCHOR-REORG healer fired against a dead anchor Ref (0× in 17/18 runs). Sharing
+      // the one instance makes adopt ↔ produce ↔ heal observe the same state. `None` at numShards <= 1 (regression
+      // bar) — the GSAM below then passes `None` for all sharding params, byte-identical to the pre-wiring call.
+      shardAcceptanceDeps = sharedServices.shardAcceptanceDeps
 
       // §3 NIPoPoW historical-commitment SMT store — gl0-only (this produce/verify GSAM has the finalized global-snapshot chain
       // via `getGlobalSnapshotByOrdinalWithFallback`, which accept() reads to derive each finalized ordinal's commitment). In-memory
@@ -528,8 +499,9 @@ object GlobalSnapshotConsensus {
           etaForPeriod = Some(etaForPeriodCallback),
           localEventsPublisher = Some(localEventsPublisher),
           // Hierarchical-shard-checkpoints v1 acceptance-side deps. `None` at `numShards = 1` (regression bar);
-          // `Some(...)` activates the shard-checkpoint admission path inside `accept()`. Mirrors the SharedServices
-          // GSAM construction so the gl0-leader-produce and verify paths stay consistent.
+          // `Some(...)` activates the shard-checkpoint admission path inside `accept()`. Task #44: this is the
+          // SAME `shardAcceptanceDeps` instance the SharedServices verify-GSAM uses (`sharedServices.shardAcceptanceDeps`),
+          // so the leader-produce and verify paths now share ONE acceptance manager + registry, not two mirrored ones.
           shardingConfig = shardAcceptanceDeps.map(_.shardingConfig),
           shardCheckpointAcceptanceManager = shardAcceptanceDeps.map(_.acceptanceManager),
           shardAssignment = shardAcceptanceDeps.map(_.shardAssignment),
@@ -1481,8 +1453,7 @@ object GlobalSnapshotConsensus {
                       // S3: the SAME committee re-execution closure the verifier uses (built from the shared
                       // `shardScEventsProcessor`), so the producer's `perMetagraphMptRoots` are recomputed
                       // byte-identically by every verifier's `reExecuteDerivation`.
-                      derivePerMgState = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
-                        .reExecDerivation[F](shardScEventsProcessor)(Async[F], shardHasher),
+                      derivePerMgState = ShardCheckpointWiring.reExecDerivation[F](shardScEventsProcessor)(Async[F], shardHasher),
                       // Bounded checkpoint pipeline (2026-06-11): gl0's adopted-watermark from the acceptance
                       // manager gates new window production so pending batches while embedding catches up.
                       lastAdoptedOrd = deps.acceptanceManager.lastAdoptedOrd(shardId),

@@ -350,7 +350,14 @@ object SharedServices {
         updateNodeParametersAcceptanceManager = updateNodeParametersAcceptanceManager,
         updateDelegatedStakeAcceptanceManager = updateDelegatedStakeAcceptanceManager,
         updateNodeCollateralAcceptanceManager = updateNodeCollateralAcceptanceManager,
-        priceStateUpdater = priceStateUpdater
+        priceStateUpdater = priceStateUpdater,
+        // Task #44 — the SINGLE per-node shard acceptance deps (the stateful registry: per-shard chain stores,
+        // tip trackers, finality triggers, binary buffers, committee cache, adopted watermarks). Built ONCE here
+        // and reused by the gl0-leader produce path: `GlobalSnapshotConsensus.make` reads
+        // `sharedServices.shardAcceptanceDeps` instead of constructing a second, disjoint instance. With one
+        // instance the follower verify-GSAM (this module), the leader-produce GSAM, the shard producers, the
+        // sync daemon, and the #42 ANCHOR-REORG healer all observe ONE registry. `None` at numShards <= 1.
+        shardAcceptanceDeps = shardAcceptanceDeps
       ) {}
 }
 
@@ -367,5 +374,8 @@ sealed abstract class SharedServices[F[_], A <: CliMethod] private (
   val updateNodeParametersAcceptanceManager: UpdateNodeParametersAcceptanceManager[F],
   val updateDelegatedStakeAcceptanceManager: UpdateDelegatedStakeAcceptanceManager[F],
   val updateNodeCollateralAcceptanceManager: UpdateNodeCollateralAcceptanceManager[F],
-  val priceStateUpdater: PriceStateUpdater[F]
+  val priceStateUpdater: PriceStateUpdater[F],
+  // Task #44 — the single per-node shard acceptance deps, owned here and threaded into the gl0-leader
+  // produce path (`GlobalSnapshotConsensus.make`) so adopt ↔ produce ↔ heal share ONE registry.
+  val shardAcceptanceDeps: Option[ShardCheckpointWiring.AcceptanceDeps[F]]
 )

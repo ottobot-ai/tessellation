@@ -99,10 +99,9 @@ object Services {
     // §1.2 Slice 3c: KesRegistry loaded from L0 genesis (or empty for CSV-genesis). Threaded
     // through to GlobalSnapshotConsensus.make.
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
-    // Slice S1: VrfRegistry loaded from L0 genesis (`operators[].vrfPublicKey`) or empty for CSV-genesis.
-    // Threaded through to GlobalSnapshotConsensus.make → ShardCheckpointWiring.acceptanceDeps as an
-    // AVAILABLE dependency. Unconsumed in S1 (committee membership is still full-set) — no-op at any numShards.
-    vrfRegistry: io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[F],
+    // Task #44: the genesis VRF-VK registry the shard committee draw consumes is now loaded once and threaded
+    // straight into `SharedServices.make` (via `nakamotoShardRegistries`); the single `shardAcceptanceDeps` it
+    // builds is reused by `GlobalSnapshotConsensus.make`. The former `vrfRegistry` pass-through here is gone.
     // Split-safety (#261, eta axis): setter for the follower / `createContext` GSAM's deferred committee-eta
     // chain walk (the Ref lives on `NodeShared`, created in `TessellationIOApp.make`). Flowed straight into
     // `GlobalSnapshotConsensus.make`, which calls it once the chain store is built so the follower
@@ -300,7 +299,6 @@ object Services {
             enqueueTokenLockBlock,
             sidecarClient,
             kesRegistry,
-            vrfRegistry,
             setFollowerEtaChainWalk
           )
       }

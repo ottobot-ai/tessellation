@@ -32,8 +32,16 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *
   * Constructs the per-shard consumer/admission infrastructure once, in a single place, so the TWO `GlobalSnapshotAcceptanceManager.make`
   * call sites — `SharedServices.make` (verify path) and `GlobalSnapshotConsensus.make` (gl0-leader produce path) — stay byte-consistent.
-  * Both sites call [[acceptanceDeps]] and forward the returned `Option`-tuple straight into the three GSAM sharding parameters
-  * (`shardingConfig`, `shardCheckpointAcceptanceManager`, `shardAssignment`).
+  *
+  * '''ONE instance per node (task #44).''' [[acceptanceDeps]] is invoked EXACTLY ONCE per node, inside `SharedServices.make`, which now
+  * exposes the result on `SharedServices.shardAcceptanceDeps`. The gl0-leader produce path (`GlobalSnapshotConsensus.make`) REUSES that
+  * same instance rather than building a second one. Both GSAMs then forward the SAME `Option`-tuple into the three sharding parameters
+  * (`shardingConfig`, `shardCheckpointAcceptanceManager`, `shardAssignment`), and the shard producers / sync daemon project off the SAME
+  * `registry`. This matters because [[AcceptanceDeps]] carries STATEFUL Refs (per-shard chain stores, tip trackers, finality triggers,
+  * binary buffers, the committee cache, and the adopted watermarks) — two instances meant the follower's adoptions landed in a registry the
+  * producers/daemon/#42-ANCHOR-REORG-healer never read (eternal awaiting-embed). The deterministic inputs were always identical (#261
+  * split-safety: same genesis KES/VRF registries, same `kDraw`/`kQuorum`, same seedlist, same MPT-committed eta resolver), so collapsing to
+  * one instance changes nothing deterministic — it only makes adopt ↔ produce ↔ heal share the SAME state.
   *
   * '''numShards = 1 regression bar.''' [[acceptanceDeps]] returns `None` whenever `cfg.numShards <= 1` (the production default). At `None`
   * the two GSAM call sites pass `None` for all three sharding params — exactly today's call — so `accept()` is byte-identical to the
