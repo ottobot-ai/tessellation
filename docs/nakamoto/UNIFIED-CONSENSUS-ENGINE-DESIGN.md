@@ -169,38 +169,44 @@ Solo extension remains the N=1 normal case and the N>1 degraded case (all higher
 8. **Genesis edge.** Window 0 anchors on the genesis timestamp; initial registry ships in metagraph genesis (balance-CSV pattern).
 9. **Observability is part of the engine.** Ship with: expected-producer gauge, rank-window countdown, countersign coverage, anchor lag, per-interval production source (rank). Every 2026-06 failure hid in unlogged state; the engine must not be able to fail silently.
 
-### 5.7 The staircase applied to shard-checkpoint leadership (gl0 side — run-10 "Gap A")
+### 5.7 Shard-checkpoint leadership runs per SLOT, not per global snapshot (owner-corrected 2026-06-11; run-10 "Gap A")
 
-Run-10 forensics (2026-06-11) measured a 51-slot shard-leader drought: once the LDD ramp passes (`gap > γ=15`), the
-shard-checkpoint VRF lottery's aggregate win rate is `1-(1-f_B)^Σσ ≈ 5%/slot` — an unbounded geometric tail (mean ~20
-slots, observed 51) that consumed 3.3 min of a 6.5-min allow-spend expiry budget. The same staircase primitive bounds
-this tail, with three differences from the ml0 instance:
+**The clock taxonomy (owner, 2026-06-11).** One wall-clock slot grid (1s, genesis-anchored — `SnapshotLeaderLoop`'s
+existing grid) drives ALL production lotteries. Every slot is a chance to make a shard checkpoint or a global
+snapshot — independent draws on the same grid. The ONLY snapshot-keyed evaluation in the protocol is the **NIPoPoW
+tower election** (level-µ, evaluated once per snapshot). Everything else — gl0 snapshot eligibility, shard-checkpoint
+eligibility — is slot-keyed.
 
-1. **Clock.** ml0 ranks open on the producer's LOCAL clock (unprovable ⇒ policy-only). Shard ranks open on the
-   **gl0 anchor ordinal** — a shared logical clock every committee member already observes, and the parent
-   checkpoint's `gl0AnchorOrdinal` is on the wire. Rank eligibility is therefore a **pure function of on-wire data**:
-   `rank_due = ⌊(anchor − parentAnchor − γ) / δ_shard⌋`, ranks ordered by `shuffle(committee(epoch), shardEta, shardOrd)`.
-   Unlike ml0, `verifyLeader` can deterministically *verify* (not just prefer) the fallback producer's eligibility.
-2. **Hybrid, not replacement.** The VRF ramp (`gap ≤ γ`) stays the primary path — unpredictability preserved in the
-   common case, where it resolves most intervals in a few slots. The staircase engages only past γ as the bounded
-   fallback. Worst-case inter-checkpoint becomes `γ + (K_S−1)·δ_shard` (deterministic) instead of unbounded.
-3. **δ floor is propagation-bound, not production-bound.** Checkpoint assembly is <1s (measured); the floor is
-   "rank-r+1 must usually SEE rank-r's checkpoint before its own window opens", or same-ord siblings are minted.
-   Siblings are SAFE (same-ord fork candidates; maxvalid-tk picks one and the canonical-chain attestation rule
-   concentrates attestations on the winner — the attestation-split failure mode is already closed) but wasteful.
-   Default **δ_shard = 10 slots (~65s)** while the sidecar delivery stagger (task #40: stragglers served by 60s
-   re-publish ticks, 107s worst observed) is unresolved; tighten to **3 slots (~20s)** after. HOCON:
-   `nakamoto.sharding.checkpoint.staircase-delta` (gl0-cluster-uniform — committee infra, not metagraph policy).
+**The defect this corrects.** The current implementation maps the shard-local "slot" to the **gl0 anchor ordinal**
+(`GlobalSnapshotConsensus.scala`: "the gl0 anchor ordinal IS the shard-local slot index"), and the producer is
+triggered once per anchor. That was a determinism shortcut from the sharding slices (anchor is on-wire ⇒ `verifyLeader`
+needs no wall-clock trust), NOT a discussed design decision — and it inverted the intended cadence: the shard lottery
+gets one draw per global snapshot (~6.5s observed mean) while gl0 gets one per second, so shards tick ~6.5× SLOWER
+than the layer they feed. Run-10's "Gap A" (51 anchor-draws ≈ 3.3 min without a shard leader, consuming half a
+6.5-min allow-spend budget) is this inversion, not a fat lottery tail: at 1s slots the identical LDD parameters give
+ramp resolution in seconds and baseline droughts of ~20 s mean. No staircase is needed at the shard layer — **the
+staircase is ml0-only (5.1)**; shards keep the normal linear-ramp LDD, evaluated against real slots.
 
-**Safety argument** (why this needs no new trust): production eligibility is liveness-side. The safety bars are
-untouched — kQuorum distinct committee signatures, `verifyEmbedded`'s deterministic re-verification on every node,
-ancestor-first embedding, TRIM-ANCHOR adoption guard. Grinding is excluded (rank order keys on `shardEta`, frozen at
-the prior period's 2/3-mark). Pseudo-predictability is acceptable here because the schedule is a *duty assignment*,
-not a fork-choice tiebreaker — precomputing it lets an adversary target DoS at the on-duty node, and the staircase
-itself bounds that (next rank steps up after δ); it cannot bias chain selection. Censorship by a scheduled leader is
-bounded by the same (f+1)-window rotation argument as 5.6 §4. One hardening becomes more valuable: **GAP-1 / task #34
-(verify-before-attest)** — predictable leadership lets an adversary *prepare* a bad checkpoint for its window, so
-members must re-exec before signing before this ships beyond testnet.
+**Mechanics of the correction:**
+  - The `ShardCheckpoint` envelope carries its production **`slot`** explicitly (greenfield schema change; today the
+    slot is derived from `gl0AnchorOrdinal`). `verifyLeader` verifies the VRF against the wire-carried slot under the
+    same validity bounds gl0 snapshots use: slot strictly monotone vs parent, `≤ now + ε` (skew bound). Determinism
+    is preserved — verification reads only on-wire data plus the shared slot grid.
+  - `gl0AnchorOrdinal` REMAINS on the envelope as chain-link data (epoch/eta resolution, adoption anchoring) — it is
+    no longer the lottery clock.
+  - The producer trigger moves from the anchor-update path (`ShardCheckpointFanOut` per gl0 ord) onto the 1s slot
+    tick. `slotGap` = slots since the parent checkpoint's wire slot; LDD params unchanged (ψ=1, γ=15, fA=0.5,
+    fB=0.05 — now meaning a 15-SECOND ramp).
+  - Production remains throughput-governed by the existing pipeline gate (`awaiting-embed`, depth 2) and the
+    1-checkpoint/shard/gl0-ord embed rule — per-slot eligibility means a winner is FOUND within seconds whenever the
+    pipeline has room; it does not flood gl0. Shard cadence is naturally ≥ global cadence, restoring the intended
+    frequency ordering (shards fast, global aggregates).
+
+**Safety**: unchanged from today — the lottery still keys on `shardEta` (frozen at the prior period's 2/3-mark; no
+grinding), and the safety bars (kQuorum committee signatures, deterministic `verifyEmbedded`, ancestor-first embed,
+TRIM-ANCHOR adoption guard) are untouched. The new wire `slot` adds the same skew-bound trust gl0 snapshots already
+carry. Same-ord siblings from near-simultaneous wins resolve via maxvalid-tk + canonical-chain attestation (the
+attestation-split mode is closed).
 
 ## 6. Migration plan (hard fork LAST, per standing phase order)
 
