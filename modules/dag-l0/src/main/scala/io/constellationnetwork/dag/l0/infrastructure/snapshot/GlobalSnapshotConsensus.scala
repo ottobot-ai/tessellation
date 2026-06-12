@@ -1789,6 +1789,14 @@ object GlobalSnapshotConsensus {
           )
           _ <- nakLogger.info("🔗 ChainSyncInbound gRPC server started on port 50053").toResource
 
+          // Chain-sync recovery (run-20, task #A): the per-node HTTP puller for missed shard checkpoints. `None`
+          // at numShards=1 (no deps). Constructed here where `client` + `clusterStorage` are in scope, then threaded
+          // into the daemon's T2 absence stream.
+          shardCheckpointFetcher <- shardAcceptanceDeps.traverse { deps =>
+            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ShardCheckpointFetcher
+              .make[F](client, clusterStorage, deps.shardingConfig.checkpoint.pullDedupCooldownMs)
+          }.toResource
+
           // Start NakamotoSyncDaemon: receives snapshots + attestations from gossip
           _ <- supervisor
             .supervise(
@@ -1862,6 +1870,8 @@ object GlobalSnapshotConsensus {
                   // Gap-A producers use, so the chain stores incoming checkpoints land in are the ones
                   // the producers + finality triggers read.
                   shardAcceptanceDeps = shardAcceptanceDeps,
+                  // Chain-sync recovery (run-20, task #A): the HTTP puller driving the T2 absence stream.
+                  shardCheckpointFetcher = shardCheckpointFetcher,
                   // T_count_shard quorum closure: on best-tip receipt, sign + gossip our own attestation so
                   // peers cross ⌈2·K_S/3⌉. `None` at numShards=1 (regression bar) ⇒ no emit.
                   shardCheckpointAttestationEmitter = shardCheckpointAttestationEmitter,

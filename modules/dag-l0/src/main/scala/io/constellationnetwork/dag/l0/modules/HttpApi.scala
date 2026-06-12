@@ -275,6 +275,11 @@ sealed abstract class HttpApi[
   private val globalFollowRoutes =
     GlobalFollowRoutes[F](services.globalFollowSliceServiceRef, services.globalChangeSetServiceRef)
 
+  // Chain-sync recovery (run-20, task #A): read-only serve of shard checkpoints so a peer that missed one can
+  // PULL it instead of waiting for GossipSub re-gossip. `services.shardAcceptanceDeps` is `None` at numShards=1.
+  private val shardCheckpointRoutes =
+    io.constellationnetwork.dag.l0.http.routes.ShardCheckpointRoutes[F](services.shardAcceptanceDeps)
+
   private val walletRoutes = WalletRoutes[F, GlobalIncrementalSnapshot]("/dag", services.address)
   private val consensusInfoRoutes =
     HasherSelector[F].withCurrent { implicit hasher =>
@@ -315,6 +320,7 @@ sealed abstract class HttpApi[
                 finalityTriggersRoutes.publicRoutes <+>
                 nipopowRoutes.publicRoutes <+>
                 globalFollowRoutes.publicRoutes <+>
+                shardCheckpointRoutes.publicRoutes <+>
                 walletRoutes.publicRoutes <+>
                 nodeRoutes.publicRoutes <+>
                 consensusInfoRoutes.publicRoutes <+>

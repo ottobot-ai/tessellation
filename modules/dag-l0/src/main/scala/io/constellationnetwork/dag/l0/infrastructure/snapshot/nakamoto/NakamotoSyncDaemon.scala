@@ -487,6 +487,11 @@ object NakamotoSyncDaemon {
     shardAcceptanceDeps: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[F]
     ] = None,
+    // Chain-sync recovery (run-20, task #A): pull a missed shard checkpoint from a peer over HTTP instead of
+    // waiting minutes for GossipSub re-gossip (which dedups Tier-1's identical re-publish bytes). Drives the T1
+    // orphan trigger (missing parent on receipt) + the T2 absence stream (stuck/empty tip ⇒ pull tip+1; an empty
+    // store pulls ordinal 1, the genesis-miss case). `None` at numShards=1 (regression bar) ⇒ no pull machinery.
+    shardCheckpointFetcher: Option[ShardCheckpointFetcher[F]] = None,
     // Hierarchical-shard-checkpoints v1 — `T_count_shard` quorum closure. When a received `ShardCheckpoint`
     // becomes this node's best tip, `handleShardCheckpoint` invokes this emitter to sign + gossip a
     // `ShardCheckpointAttestation` (mirrors the gl0 `emitAttestation` becameBestTip seam). `None` at
@@ -976,7 +981,68 @@ object NakamotoSyncDaemon {
                   ) ++ fs2.Stream.sleep_[F](30.seconds) ++ stuckDetectionStream
                 }
 
-            gossipStream.concurrently(stuckDetectionStream)
+            // ─── Shard-checkpoint chain-sync: T2 absence detection (run-20, task #A) ───────────────────────────
+            // Per active shard, every `absenceTickIntervalMs`, if the local tip has not advanced for ≥ `stuckMs`
+            // (an EMPTY store counts as stuck at ordinal 0), PULL `tip+1` from a peer (empty ⇒ ordinal 1, the
+            // genesis-miss case) and re-feed it through the normal accept path. This is what gossip alone cannot
+            // do: a missed checkpoint can't be re-gossip-recovered (Tier-1 re-publishes identical bytes that
+            // GossipSub dedups), so it waited minutes for the seen-cache TTL — the run-20 stall. The fetcher's
+            // own `(shard, ordinal)` cooldown rate-limits re-requests, so firing `due` every tick is safe.
+            def shardAbsenceStream: fs2.Stream[F, Unit] =
+              (shardAcceptanceDeps, shardCheckpointFetcher) match {
+                case (Some(deps), Some(fetcher)) if deps.registry.nonEmpty =>
+                  val cfg = deps.shardingConfig.checkpoint
+                  fs2.Stream
+                    .eval(Ref.of[F, Map[io.constellationnetwork.schema.sharding.ShardId, (Long, Long)]](Map.empty))
+                    .flatMap { stallRef =>
+                      fs2.Stream.fixedRate[F](cfg.absenceTickIntervalMs.millis).evalMap { _ =>
+                        Async[F].realTimeInstant.map(_.toEpochMilli).flatMap { now =>
+                          deps.registry.toList.traverse_ {
+                            case (shardId, entry) =>
+                              entry.chainStore.bestTip.flatMap { tipOpt =>
+                                val curOrd = tipOpt.map(_.signed.value.shardOrdinal.value).getOrElse(0L)
+                                stallRef.modify { m =>
+                                  val (lastOrd, lastAdvance) = m.getOrElse(shardId, (curOrd, now))
+                                  if (curOrd > lastOrd) (m.updated(shardId, (curOrd, now)), false) // advanced — reset
+                                  else (m.updated(shardId, (lastOrd, lastAdvance)), (now - lastAdvance) >= cfg.stuckMs)
+                                }.flatMap { due =>
+                                  Async[F].whenA(due) {
+                                    val nextOrd = io.constellationnetwork.schema.sharding.ShardOrdinal(curOrd + 1L)
+                                    Async[F]
+                                      .start(
+                                        fetcher.fetchByOrdinal(shardId, nextOrd).flatMap {
+                                          case Some(signed) =>
+                                            io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWireCodecs
+                                              .signedShardCheckpointToWire[F](signed)
+                                              .flatMap(w =>
+                                                handleShardCheckpoint(
+                                                  w,
+                                                  shardAcceptanceDeps,
+                                                  shardCheckpointAttestationEmitter,
+                                                  selfId,
+                                                  logger
+                                                )
+                                              )
+                                          case None => Async[F].unit
+                                        }
+                                      )
+                                      .void
+                                  }
+                                }
+                              }
+                          }
+                        }
+                      }
+                    }
+                    .handleErrorWith { e =>
+                      fs2.Stream.eval(
+                        logger.warn(s"shard absence-detection tick error: ${e.getMessage}. Restarting in 30s...")
+                      ) ++ fs2.Stream.sleep_[F](30.seconds) ++ shardAbsenceStream
+                    }
+                case _ => fs2.Stream.empty
+              }
+
+            gossipStream.concurrently(stuckDetectionStream).concurrently(shardAbsenceStream)
           }
       }
     }

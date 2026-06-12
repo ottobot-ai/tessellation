@@ -335,7 +335,10 @@ object Services {
         globalFollowSliceServiceRef = globalFollowSliceServiceRef,
         globalChangeSetServiceRef = globalChangeSetServiceRef,
         pendingReader = pendingReader,
-        mutableKesRegistry = mutableKesRegistry
+        mutableKesRegistry = mutableKesRegistry,
+        // Chain-sync (task #A): re-expose the single per-node shard acceptance deps so the serve route
+        // (`ShardCheckpointRoutes`) can read the per-shard chain stores. `None` at numShards=1.
+        shardAcceptanceDeps = sharedServices.shardAcceptanceDeps
       ) {}
 }
 
@@ -382,5 +385,9 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   // §1.2 Slice 10 (#179): Runtime-mutable KES registry overlay shared by the HTTP intake
   // (KesRegistrationCertRoutes) and the GSAM accept-pipeline (wave 2). Backed by an in-memory
   // overlay until the MPT migration lands; reads fall through to the genesis-frozen base.
-  val mutableKesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.kes.MutableKesRegistry[F]
+  val mutableKesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.kes.MutableKesRegistry[F],
+  // Chain-sync (task #A): the single per-node shard acceptance deps, exposed for `ShardCheckpointRoutes` serve.
+  val shardAcceptanceDeps: Option[
+    io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[F]
+  ]
 )

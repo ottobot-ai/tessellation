@@ -269,7 +269,16 @@ object types {
       * instead of re-minting with a fresh gl0Anchor+slot. Re-minting churned the checkpoint hash every tick (run-19: 34 variants for one
       * ordinal) and split attestations below kQuorum. ~6 ticks ≈ confirmation RTT (mirrors the run-12 §5.8 sender cadence-gate).
       */
-    republishEveryTicks: Int = 6
+    republishEveryTicks: Int = 6,
+    /** Chain-sync recovery (run-20, task #A). A shard checkpoint missed at boot / dropped by gossip cannot be healed by re-gossip —
+      * GossipSub dedups Tier-1's identical re-publish bytes by msgid until the seen-cache TTL expires (minutes). So a node PULLS the
+      * missing checkpoint from a peer over the p2p port (served read-only from the peer's ShardChainStore). `stuckMs` = how long the
+      * per-shard tip may stall before the absence tick pulls `tip+1` (an EMPTY store ⇒ pull ordinal 1, the genesis-miss case);
+      * `absenceTickIntervalMs` = the absence-detection cadence; `pullDedupCooldownMs` suppresses re-requesting the same `(shard, key)`.
+      */
+    stuckMs: Long = 5000,
+    absenceTickIntervalMs: Long = 2000,
+    pullDedupCooldownMs: Long = 30000
   )
 
   /** Slice 19 observability tunables (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §13 row 19 + §9.4).
