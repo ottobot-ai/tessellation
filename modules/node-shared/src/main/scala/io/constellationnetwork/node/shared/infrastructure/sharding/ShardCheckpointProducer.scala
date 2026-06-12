@@ -384,7 +384,15 @@ object ShardCheckpointProducer {
               // slotGap >= 1 by construction (slotGapFor clamps); window index = (slotGap - 1) / delta.
               slotLeader.dutyOrder(committee.toList.sortBy(_.value.value), shardEta, nextShardOrdinal).flatMap { ordered =>
                 val k = math.max(1, ordered.size)
-                val dutyIdx = (((slotGap - 1L) / math.max(1L, staircaseDeltaSlots.toLong)) % k.toLong).toInt
+                // GENESIS WINDOW WIDENING (run-15 post-mortem): at genesis (no parent) the duty windows are 12x wider.
+                // At boot the gossip meshes are still forming — the first checkpoint can take tens of seconds to reach
+                // peers — and a 5-slot handoff let ranks 1 and 2 mint rival genesis checkpoints before rank-0's arrived
+                // (three ord-1s at slots 0/6/11 = the run-15 genesis fork). Slot-grid sync makes the wide handoff exact;
+                // rotation still wraps, so liveness needs one live member even at genesis.
+                val effectiveDelta: Long =
+                  if (parentSlotOpt.isEmpty) math.max(1L, staircaseDeltaSlots.toLong) * 12L
+                  else math.max(1L, staircaseDeltaSlots.toLong)
+                val dutyIdx = (((slotGap - 1L) / effectiveDelta) % k.toLong).toInt
                 val onDuty = ordered(dutyIdx)
                 if (onDuty =!= selfPeerId)
                   logger

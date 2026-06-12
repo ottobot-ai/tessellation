@@ -131,10 +131,15 @@ trait ShardCheckpointGl0AcceptanceManager[F[_]] {
     * re-runs) never move the watermark backwards. Node-local observability; never read by any consensus-deterministic decision (the
     * producer consumes it as a PRODUCTION POLICY gate — bounded pipeline depth).
     */
-  def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal): F[Unit]
+  def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal, checkpointHash: Hash): F[Unit]
 
   /** Highest shard ordinal adopted into a global snapshot for `shardId` on this node (None before the first adoption). */
   def lastAdoptedOrd(shardId: ShardId): F[Option[ShardOrdinal]]
+
+  /** Anchor-compatibility (task #42): canonical hash of the most recently adopted checkpoint for `shardId` — the fork-choice anchor the
+    * daemon feeds into [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore.noteAnchor]].
+    */
+  def lastAdoptedAnchor(shardId: ShardId): F[Option[Hash]]
 }
 
 object ShardCheckpointGl0AcceptanceManager {
@@ -200,17 +205,20 @@ object ShardCheckpointGl0AcceptanceManager {
 
     val logger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointGl0AcceptanceManager")
 
-    cats.effect.Ref.of[F, Map[ShardId, Long]](Map.empty).map { lastAdoptedR =>
+    cats.effect.Ref.of[F, Map[ShardId, (Long, Hash)]](Map.empty).map { lastAdoptedR =>
       new ShardCheckpointGl0AcceptanceManager[F] {
 
-        def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal): F[Unit] =
+        def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal, checkpointHash: Hash): F[Unit] =
           lastAdoptedR.update { m =>
-            val cur = m.getOrElse(shardId, 0L)
-            if (shardOrdinal.value > cur) m.updated(shardId, shardOrdinal.value) else m
+            val cur = m.get(shardId).map(_._1).getOrElse(0L)
+            if (shardOrdinal.value > cur) m.updated(shardId, (shardOrdinal.value, checkpointHash)) else m
           }
 
         def lastAdoptedOrd(shardId: ShardId): F[Option[ShardOrdinal]] =
-          lastAdoptedR.get.map(_.get(shardId).map(ShardOrdinal(_)))
+          lastAdoptedR.get.map(_.get(shardId).map { case (o, _) => ShardOrdinal(o) })
+
+        def lastAdoptedAnchor(shardId: ShardId): F[Option[Hash]] =
+          lastAdoptedR.get.map(_.get(shardId).map(_._2))
 
         def evaluate(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult] =
           // Step 1: pre-checks. Run on every signer; fail-fast at the first signer that doesn't pass all four predicates.

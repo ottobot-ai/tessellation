@@ -74,6 +74,15 @@ trait ShardChainStore[F[_]] {
     vrfOutput: Array[Byte]
   ): F[Boolean]
 
+  /** Anchor-compatibility (task #42, 2026-06-12): record the canonical hash of the checkpoint gl0 most recently ADOPTED for this shard.
+    * Fork choice then puts anchor-ancestry FIRST: a connected candidate whose ancestry contains the anchor beats any that doesn't, before
+    * length/slot/VRF. gl0 is the finality gadget — once it commits a lineage, every honest node must follow it; without this rule runs
+    * 14/15 showed nodes sitting canonical on an un-adopted branch forever (embed-none / frozen watermark), because the pipeline gate
+    * freezes the length race the longest-chain rule would otherwise win by. Idempotent; max-monotone by the adopted checkpoint's shard
+    * ordinal (an older anchor never replaces a newer one).
+    */
+  def noteAnchor(anchorHash: Hash): F[Unit]
+
   /** Current canonical tip per Taktikos `maxvalid-tk`. None when the store is empty or all entries have been pruned. */
   def bestTip: F[Option[Hashed[ShardCheckpoint]]]
 
@@ -178,11 +187,15 @@ object ShardChainStore {
       */
     connected: Set[Hash],
     /** Child index for the connectivity cascade: parentHash → stored child hashes. */
-    byParent: Map[Hash, Set[Hash]]
+    byParent: Map[Hash, Set[Hash]],
+    /** Anchor-compatibility (task #42): canonical hash of gl0's most recently adopted checkpoint for this shard (None until the first
+      * adoption lands). Fork choice prefers candidates whose ancestry contains it — see [[ShardChainStore.noteAnchor]].
+      */
+    anchorHash: Option[Hash]
   )
 
   object ChainState {
-    val empty: ChainState = ChainState(Map.empty, None, ShardOrdinal.Genesis, Set.empty, Map.empty)
+    val empty: ChainState = ChainState(Map.empty, None, ShardOrdinal.Genesis, Set.empty, Map.empty, None)
   }
 
   /** Construct a per-shard chain store.
@@ -271,14 +284,16 @@ object ShardChainStore {
                   val resolvedBest: Option[StoredShardCheckpoint] =
                     state.bestTipHash.flatMap(state.byHash.get)
 
-                  // Best tip = maxvalid-tk over CONNECTED entries only. Fold every newly-connected entry (the incoming one plus any
-                  // reconnected descendants) against the current best; an orphan store leaves the tip untouched.
+                  // Best tip = anchor-compatibility FIRST (task #42), then maxvalid-tk — over CONNECTED entries only. Fold every
+                  // newly-connected entry (the incoming one plus any reconnected descendants) against the current best; an orphan
+                  // store leaves the tip untouched.
                   val newBestTipHash: Hash = {
                     val candidates = newlyConnected.toList.flatMap(newByHash.get)
                     val seed = resolvedBest
                     candidates.foldLeft(seed) {
-                      case (None, cand)       => Some(cand)
-                      case (Some(best), cand) => if (compareMaxvalidTk(cand, best) > 0) Some(cand) else Some(best)
+                      case (None, cand) => Some(cand)
+                      case (Some(best), cand) =>
+                        if (compareAnchoredMaxvalid(newByHash, state.anchorHash, cand, best) > 0) Some(cand) else Some(best)
                     } match {
                       case Some(best) => best.hash
                       case None       => snapshotHash // unreachable in practice: first store is genesis-connected
@@ -326,6 +341,41 @@ object ShardChainStore {
                 }
               }.flatten
           }
+
+        def noteAnchor(anchorHash: Hash): F[Unit] =
+          stateRef.modify { state =>
+            if (state.anchorHash.contains(anchorHash)) (state, Async[F].unit)
+            else {
+              val curOrdOpt = state.anchorHash.flatMap(state.byHash.get).map(_.shardOrdinal.value)
+              val newOrdOpt = state.byHash.get(anchorHash).map(_.shardOrdinal.value)
+              val advance = (curOrdOpt, newOrdOpt) match {
+                case (Some(c), Some(n)) => n >= c
+                case (None, _)          => true
+                case (Some(_), None)    => false // never replace a known anchor with a not-yet-stored hash
+              }
+              if (!advance) (state, Async[F].unit)
+              else {
+                // Re-run fork choice over ALL connected entries under the new anchor — this is the heal: a node canonical on an
+                // un-adopted branch REORGS here the moment gl0 commits the other lineage.
+                val candidates = state.connected.toList.flatMap(state.byHash.get)
+                val newBest = candidates
+                  .reduceOption((x, y) => if (compareAnchoredMaxvalid(state.byHash, Some(anchorHash), x, y) >= 0) x else y)
+                  .map(_.hash)
+                  .orElse(state.bestTipHash)
+                val reorged = newBest =!= state.bestTipHash
+                val ns = state.copy(anchorHash = Some(anchorHash), bestTipHash = newBest)
+                val log =
+                  if (reorged)
+                    logger.info(
+                      s"noteAnchor: anchor=${anchorHash.value.take(12)} ord=${newOrdOpt.getOrElse(-1L)} ANCHOR-REORG " +
+                        s"bestTip → ${newBest.map(_.value.take(12)).getOrElse("none")}"
+                    )
+                  else
+                    logger.debug(s"noteAnchor: anchor=${anchorHash.value.take(12)} ord=${newOrdOpt.getOrElse(-1L)} bestTip unchanged")
+                (ns, log)
+              }
+            }
+          }.flatten
 
         def bestTip: F[Option[Hashed[ShardCheckpoint]]] =
           stateRef.get.map { state =>
@@ -494,6 +544,48 @@ object ShardChainStore {
           * method is `private` on the gl0 `ChainSelection` impl so we replicate the algorithm here rather than refactoring the public
           * surface of `ChainSelection`. If a future refactor exposes a shared comparator, this site should re-route through it.
           */
+        /** Walk `from`'s ancestry (parent links) looking for `target`. Bounded by the in-memory retention window; a miss (evicted/orphan
+          * ancestry) is fail-closed `false` — an un-walkable candidate is treated as NOT anchored.
+          */
+        private def ancestryContains(byHash: Map[Hash, StoredShardCheckpoint], from: Hash, target: Hash): Boolean = {
+          var cur = from
+          var found = false
+          var done = false
+          var steps = 0
+          while (!done && steps < 1000000) {
+            if (cur === target) { found = true; done = true }
+            else if (cur === Hash.empty) done = true
+            else
+              byHash.get(cur) match {
+                case Some(e) => cur = e.parentHash
+                case None    => done = true
+              }
+            steps += 1
+          }
+          found
+        }
+
+        /** Anchor-compatibility FIRST (task #42): when gl0 has adopted a checkpoint for this shard, a candidate carrying that adoption in
+          * its ancestry beats any candidate that doesn't — gl0 is the finality gadget, so its adopted lineage is canon. Within the same
+          * anchor class, fall through to plain maxvalid-tk. Runs 14/15 showed why this is load-bearing: the awaiting-embed pipeline gate
+          * freezes the length race during a fork, so longest-chain alone cannot heal a split — nodes sat canonical on un-adopted branches
+          * indefinitely (embed-none, frozen watermark, split attestations).
+          */
+        private def compareAnchoredMaxvalid(
+          byHash: Map[Hash, StoredShardCheckpoint],
+          anchorOpt: Option[Hash],
+          a: StoredShardCheckpoint,
+          b: StoredShardCheckpoint
+        ): Int =
+          anchorOpt match {
+            case None => compareMaxvalidTk(a, b)
+            case Some(anchor) =>
+              val aAnchored = a.hash === anchor || ancestryContains(byHash, a.hash, anchor)
+              val bAnchored = b.hash === anchor || ancestryContains(byHash, b.hash, anchor)
+              if (aAnchored != bAnchored) { if (aAnchored) 1 else -1 }
+              else compareMaxvalidTk(a, b)
+          }
+
         private def compareMaxvalidTk(a: StoredShardCheckpoint, b: StoredShardCheckpoint): Int =
           if (a.shardOrdinal.value != b.shardOrdinal.value) {
             // Longer chain wins

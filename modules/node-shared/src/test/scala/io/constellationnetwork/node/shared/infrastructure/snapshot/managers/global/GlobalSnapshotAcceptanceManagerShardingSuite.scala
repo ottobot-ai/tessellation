@@ -257,9 +257,17 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       callsRef.update(_ :+ checkpoint).as(decision(checkpoint))
     override def verifyEmbedded(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
       callsRef.update(_ :+ checkpoint).as(decision(checkpoint))
-    override def noteAdopted(shardId: io.constellationnetwork.schema.sharding.ShardId, shardOrdinal: ShardOrdinal): IO[Unit] =
+    override def noteAdopted(
+      shardId: io.constellationnetwork.schema.sharding.ShardId,
+      shardOrdinal: ShardOrdinal,
+      checkpointHash: io.constellationnetwork.security.hash.Hash
+    ): IO[Unit] =
       IO.unit
     override def lastAdoptedOrd(shardId: io.constellationnetwork.schema.sharding.ShardId): IO[Option[ShardOrdinal]] =
+      IO.pure(None)
+    override def lastAdoptedAnchor(
+      shardId: io.constellationnetwork.schema.sharding.ShardId
+    ): IO[Option[io.constellationnetwork.security.hash.Hash]] =
       IO.pure(None)
   }
 

@@ -646,10 +646,13 @@ object GlobalSnapshotAcceptanceManager {
                             s"ACCEPTED adopt mgs=${chainContinuous.size} binaries=${chainContinuous.values.map(_.size).sum} " +
                             s"deferredMgs=${deferred.size} receipts=${newReceipts.size}"
                         ) >>
-                      // Bounded-pipeline watermark (2026-06-11, run bpc2yyegf): record the adopted shard ordinal so the
-                      // producer can gate new window production on embed progress (max-monotone, node-local policy input).
-                      checkpointManager
-                        .noteAdopted(shardId, cp.shardOrdinal)
+                      // Bounded-pipeline watermark (2026-06-11) + fork-choice anchor (task #42): record the adopted shard
+                      // ordinal AND the adopted checkpoint's canonical hash. The ordinal gates producer windows (pipeline
+                      // depth); the hash is the anchor the daemon feeds into ShardChainStore.noteAnchor so every node's
+                      // shard fork choice follows gl0's adopted lineage (the run-14/15 heal).
+                      Hasher[F]
+                        .hash(cp.signingPreimage)
+                        .flatMap(cpHash => checkpointManager.noteAdopted(shardId, cp.shardOrdinal, cpHash))
                         .as((adoptedAcc ++ chainContinuous, receiptsAcc ++ newReceipts))
 
                   case ShardCheckpointAcceptResult.PendingMoreAttestations =>
