@@ -171,8 +171,10 @@ Solo extension remains the N=1 normal case and the N>1 degraded case (all higher
 
 ### 5.7 Shard-checkpoint leadership runs per SLOT, not per global snapshot (owner-corrected 2026-06-11; run-10 "Gap A")
 
-**The clock taxonomy (owner, 2026-06-11).** One wall-clock slot grid (1s, genesis-anchored — `SnapshotLeaderLoop`'s
-existing grid) drives ALL production lotteries. Every slot is a chance to make a shard checkpoint or a global
+**The clock taxonomy (owner, 2026-06-11).** One wall-clock slot grid (genesis-anchored — `SnapshotLeaderLoop`'s
+existing grid) drives ALL production lotteries. **The slot is a parametrized unit of time, NOT a fixed constant** —
+`slotDuration` (today `NAKAMOTO_SLOT_DURATION_MS`, default 1000 ms; 500 ms for fast-cadence testing; migrate to HOCON
+`nakamoto.slot-duration` per standing rule). 1 s is a *choice*; nothing below may assume it. Every slot is a chance to make a shard checkpoint or a global
 snapshot — independent draws on the same grid. The ONLY snapshot-keyed evaluation in the protocol is the **NIPoPoW
 tower election** (level-µ, evaluated once per snapshot). Everything else — gl0 snapshot eligibility, shard-checkpoint
 eligibility — is slot-keyed.
@@ -181,10 +183,11 @@ eligibility — is slot-keyed.
 (`GlobalSnapshotConsensus.scala`: "the gl0 anchor ordinal IS the shard-local slot index"), and the producer is
 triggered once per anchor. That was a determinism shortcut from the sharding slices (anchor is on-wire ⇒ `verifyLeader`
 needs no wall-clock trust), NOT a discussed design decision — and it inverted the intended cadence: the shard lottery
-gets one draw per global snapshot (~6.5s observed mean) while gl0 gets one per second, so shards tick ~6.5× SLOWER
-than the layer they feed. Run-10's "Gap A" (51 anchor-draws ≈ 3.3 min without a shard leader, consuming half a
-6.5-min allow-spend budget) is this inversion, not a fat lottery tail: at 1s slots the identical LDD parameters give
-ramp resolution in seconds and baseline droughts of ~20 s mean. No staircase is needed at the shard layer — **the
+gets one draw per global snapshot (~6.5 slot-durations observed mean inter-snapshot time) while gl0 draws every slot,
+so shards tick ~6.5× SLOWER than the layer they feed. Run-10's "Gap A" (51 anchor-draws ≈ 3.3 min without a shard
+leader, consuming half a 6.5-min allow-spend budget) is this inversion, not a fat lottery tail: drawn per slot, the
+identical LDD parameters give ramp resolution within ~γ slots and baseline droughts of ~20-slot mean — seconds at any
+sane slotDuration. No staircase is needed at the shard layer — **the
 staircase is ml0-only (5.1)**; shards keep the normal linear-ramp LDD, evaluated against real slots.
 
 **Mechanics of the correction:**
@@ -194,12 +197,13 @@ staircase is ml0-only (5.1)**; shards keep the normal linear-ramp LDD, evaluated
     is preserved — verification reads only on-wire data plus the shared slot grid.
   - `gl0AnchorOrdinal` REMAINS on the envelope as chain-link data (epoch/eta resolution, adoption anchoring) — it is
     no longer the lottery clock.
-  - The producer trigger moves from the anchor-update path (`ShardCheckpointFanOut` per gl0 ord) onto the 1s slot
+  - The producer trigger moves from the anchor-update path (`ShardCheckpointFanOut` per gl0 ord) onto the slot
     tick. `slotGap` = slots since the parent checkpoint's wire slot; LDD params unchanged (ψ=1, γ=15, fA=0.5,
-    fB=0.05 — now meaning a 15-SECOND ramp).
-  - Production remains throughput-governed by the existing pipeline gate (`awaiting-embed`, depth 2) and the
-    1-checkpoint/shard/gl0-ord embed rule — per-slot eligibility means a winner is FOUND within seconds whenever the
-    pipeline has room; it does not flood gl0. Shard cadence is naturally ≥ global cadence, restoring the intended
+    fB=0.05 — the ramp now spans γ slots of real time, slotDuration-scaled).
+  - Every gl0 node has the slot clock — moving the shard lottery onto it costs nothing (owner: "all the gl0 will
+    have the clock available"). Production remains throughput-governed by the existing pipeline gate
+    (`awaiting-embed`, depth 2) and the 1-checkpoint/shard/gl0-ord embed rule — per-slot eligibility means a winner
+    is FOUND within a few slots whenever the pipeline has room; it does not flood gl0. Shard cadence is naturally ≥ global cadence, restoring the intended
     frequency ordering (shards fast, global aggregates).
 
 **Safety**: unchanged from today — the lottery still keys on `shardEta` (frozen at the prior period's 2/3-mark; no
