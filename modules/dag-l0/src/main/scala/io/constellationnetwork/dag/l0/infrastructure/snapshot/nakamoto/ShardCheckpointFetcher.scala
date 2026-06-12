@@ -27,14 +27,14 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * checkpoint is judged byte-identically.
   *
   * '''Best-effort + deduped.''' Every fetch is best-effort: any error logs at debug and returns `None` (the next absence/orphan tick
-  * retries). A per-`(shard, key)` cooldown (`pullDedupCooldownMs`) suppresses re-requesting the same checkpoint inside the window, mirroring
-  * `ChainSyncManager.requestMissing`'s `inflightRef`. Peer selection is a time-rotated pick over `getResponsivePeers` (the committee is a
-  * subset of responsive gl0 peers; the serve is read-only, so any peer that holds the checkpoint is a valid source).
+  * retries). A per-`(shard, key)` cooldown (`pullDedupCooldownMs`) suppresses re-requesting the same checkpoint inside the window,
+  * mirroring `ChainSyncManager.requestMissing`'s `inflightRef`. Peer selection is a time-rotated pick over `getResponsivePeers` (the
+  * committee is a subset of responsive gl0 peers; the serve is read-only, so any peer that holds the checkpoint is a valid source).
   */
 trait ShardCheckpointFetcher[F[_]] {
 
-  /** Pull the canonical checkpoint at `(shardId, ordinal)` from a peer. Used by the absence tick (T2) — including the genesis-miss case
-    * (an empty store pulls ordinal 1). `None` ⇒ suppressed by cooldown, no peer, or the pull failed.
+  /** Pull the canonical checkpoint at `(shardId, ordinal)` from a peer. Used by the absence tick (T2) — including the genesis-miss case (an
+    * empty store pulls ordinal 1). `None` ⇒ suppressed by cooldown, no peer, or the pull failed.
     */
   def fetchByOrdinal(shardId: ShardId, ordinal: ShardOrdinal): F[Option[Signed[ShardCheckpoint]]]
 

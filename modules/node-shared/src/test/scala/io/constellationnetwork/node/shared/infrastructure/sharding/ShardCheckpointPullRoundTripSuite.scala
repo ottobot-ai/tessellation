@@ -24,14 +24,14 @@ import weaver.MutableIOSuite
   * `docs/nakamoto/SHARD-CHECKPOINT-CHAINSYNC-DESIGN.md`).
   *
   * The serve route returns a `Signed[ShardCheckpoint]` as JSON; the puller decodes it and the daemon converts it to the wire form before
-  * re-feeding it through `handleShardCheckpoint` (which decodes the wire and hashes the `signingPreimage`). For a pulled checkpoint to reach
-  * the SAME canonical hash a gossiped one does — the hard requirement for attestations to concentrate and quorum to form — both round-trips
-  * must preserve the checkpoint identity:
-  *   1. JSON encode → decode (the serve route ↔ puller transport), and
-  *   2. `signedShardCheckpointToWire` → `shardCheckpointFromWire` (the gossip transport, already proven hash-stable in production).
+  * re-feeding it through `handleShardCheckpoint` (which decodes the wire and hashes the `signingPreimage`). For a pulled checkpoint to
+  * reach the SAME canonical hash a gossiped one does — the hard requirement for attestations to concentrate and quorum to form — both
+  * round-trips must preserve the checkpoint identity:
+  *   1. JSON encode → decode (the serve route ↔ puller transport), and 2. `signedShardCheckpointToWire` → `shardCheckpointFromWire` (the
+  *      gossip transport, already proven hash-stable in production).
   *
-  * This asserts the FULL pull path `signed → JSON → signed → wire → checkpoint` recomputes the identical `signingPreimage` hash. A regression
-  * here would silently fork a pulled checkpoint into a different `byHash` key and the pull would never help quorum.
+  * This asserts the FULL pull path `signed → JSON → signed → wire → checkpoint` recomputes the identical `signingPreimage` hash. A
+  * regression here would silently fork a pulled checkpoint into a different `byHash` key and the pull would never help quorum.
   */
 object ShardCheckpointPullRoundTripSuite extends MutableIOSuite {
 
@@ -56,7 +56,11 @@ object ShardCheckpointPullRoundTripSuite extends MutableIOSuite {
       kesTreeStep = 3
     )
 
-  private def mkSignedCheckpoint(ord: Long, parent: io.constellationnetwork.security.hash.Hash, gl0Anchor: Long): Signed[ShardCheckpoint] = {
+  private def mkSignedCheckpoint(
+    ord: Long,
+    parent: io.constellationnetwork.security.hash.Hash,
+    gl0Anchor: Long
+  ): Signed[ShardCheckpoint] = {
     val cp = ShardCheckpoint(
       shardId = ShardId.unsafeApply(1),
       parentCheckpointHash = parent,

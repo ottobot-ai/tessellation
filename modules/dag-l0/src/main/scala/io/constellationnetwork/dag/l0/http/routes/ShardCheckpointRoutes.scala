@@ -17,10 +17,10 @@ import org.http4s.circe.CirceEntityCodec.circeEntityEncoder
 import org.http4s.dsl.Http4sDsl
 import org.http4s.{HttpRoutes, Response}
 
-/** Read-only serve side of the shard-checkpoint chain-sync (run-20, task #A — see
-  * `docs/nakamoto/SHARD-CHECKPOINT-CHAINSYNC-DESIGN.md`). A peer that missed a checkpoint (boot window / gossip drop) PULLS it from a node
-  * tracking that shard, instead of waiting minutes for GossipSub re-gossip (which dedups Tier-1's identical re-publish bytes). This is the
-  * shard analogue of the global `ChainSyncServer.serveSnapshots`/`serveMetagraphBinaries`.
+/** Read-only serve side of the shard-checkpoint chain-sync (run-20, task #A — see `docs/nakamoto/SHARD-CHECKPOINT-CHAINSYNC-DESIGN.md`). A
+  * peer that missed a checkpoint (boot window / gossip drop) PULLS it from a node tracking that shard, instead of waiting minutes for
+  * GossipSub re-gossip (which dedups Tier-1's identical re-publish bytes). This is the shard analogue of the global
+  * `ChainSyncServer.serveSnapshots`/`serveMetagraphBinaries`.
   *
   * '''Endpoints''' (served on the public app — response-signed so the puller's `responseVerifierMiddleware` authenticates the source; the
   * checkpoint is self-authenticating regardless, via its committee signatures + the puller's `evaluate` re-check on re-feed):
