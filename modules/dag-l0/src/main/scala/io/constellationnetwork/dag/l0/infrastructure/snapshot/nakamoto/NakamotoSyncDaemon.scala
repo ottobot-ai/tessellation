@@ -756,7 +756,13 @@ object NakamotoSyncDaemon {
                               }
 
                             case pb.GossipMessage.Body.Attestation(att) =>
-                              handleAttestation(att, tipTracker, kesRegistry, etaRotationSnapshots, logger)
+                              // Background-fire (intake demux completion, run-20): KES + Ed25519 verify per attestation is
+                              // tens of ms; inline on the single gossip `evalMap` thread it serializes EVERY later message —
+                              // during the boot attestation burst that is the exact head-of-line the demux was meant to remove
+                              // (the same skew-rejection failure the MetagraphBinary case documents below, and the channel by
+                              // which a shard genesis checkpoint queued behind the burst waited MINUTES in run-20). The
+                              // `tipTracker` tally is `Ref`-backed (concurrent-safe), so order-independence holds.
+                              Async[F].start(handleAttestation(att, tipTracker, kesRegistry, etaRotationSnapshots, logger)).void
 
                             case pb.GossipMessage.Body.MetagraphBinary(mb) =>
                               // Background-fire: the gate's `attestAndAdmit` blocks up to gateTimeoutMs
@@ -809,14 +815,18 @@ object NakamotoSyncDaemon {
                                 )
                                 .void
 
+                            // Background-fire (intake demux completion, run-20): these handlers `enqueue*` into a mempool
+                            // queue (a possibly-bounded `offer`); inline on the gossip `evalMap` a full queue blocks EVERY
+                            // later message behind it (the head-of-line the demux removes for the metagraph/shard cases).
+                            // Block acceptance reorders by parent ref downstream, so a per-fiber enqueue race is harmless.
                             case pb.GossipMessage.Body.AllowSpendBlock(asb) =>
-                              handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)
+                              Async[F].start(handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)).void
 
                             case pb.GossipMessage.Body.DagBlock(blk) =>
-                              handleDAGBlock(blk, enqueueDAGBlock, logger)
+                              Async[F].start(handleDAGBlock(blk, enqueueDAGBlock, logger)).void
 
                             case pb.GossipMessage.Body.TokenLockBlock(blk) =>
-                              handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)
+                              Async[F].start(handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)).void
 
                             // Gap B: shard-checkpoint envelope + attestation gossip routing (load-bearing cross-node
                             // reconstruction). `shardAcceptanceDeps = None` (numShards=1, regression bar) ⇒ both
