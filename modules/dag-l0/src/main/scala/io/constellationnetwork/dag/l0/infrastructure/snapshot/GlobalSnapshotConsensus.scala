@@ -1449,6 +1449,16 @@ object GlobalSnapshotConsensus {
                         import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax.MptStoreReadOps
                         mptStore.getAllLastStateChannelSnapshotHashes
                       },
+                      // NEWNESS GATE (S2-deadlock fix, runs 19-22): gl0's ADOPT tip = the latest PRODUCED global snapshot's per-MG
+                      // `lastStateChannelSnapshotHashes` — AHEAD of the depth-k finalized base above (`getCombined` holds the latest
+                      // produced GSI, ahead of the finalized watermark). The producer omits any MG whose finalized-base-anchored window
+                      // holds nothing PAST this tip (a stale re-include gl0's embed-match would defer), so it never advances the shard
+                      // bestTip past `adoptedShardOrd` with an un-embeddable checkpoint — the run-19..22 permanent pipeline freeze.
+                      adoptedPerMgTip = lastNGlobalSnapshotStorage.getCombined.map(
+                        _.fold(SortedMap.empty[Address, io.constellationnetwork.security.hash.Hash](Address.OrderingInstance))(
+                          _._2.lastStateChannelSnapshotHashes
+                        )
+                      ),
                       slotLeader = shardSlotLeader,
                       publisher = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointPublisher
                         .sidecar[F](sidecarClient),

@@ -292,6 +292,20 @@ object ShardCheckpointProducer {
       * available for legacy chain-link admission elsewhere; it is NO LONGER the producer's window anchor.
       */
     finalizedBasePerMgTip: F[SortedMap[Address, Hash]],
+    /** '''NEWNESS GATE — gl0 ADOPT tip (S2-deadlock fix, 2026-06-15).''' Per-MG gl0 ADOPT-advanced SC tip — the latest PRODUCED global
+      * snapshot's `lastStateChannelSnapshotHashes` (`lastNGlobalSnapshotStorage.getCombined`, ahead of the depth-k finalized watermark).
+      * Used SOLELY to decide WHETHER an MG has content gl0 has not yet adopted; it does NOT anchor the window (that stays on
+      * [[finalizedBasePerMgTip]] for §4 diff-correctness). The producer OMITS any MG whose finalized-base-anchored window does not extend
+      * PAST this adopt tip (i.e. contains no binary carrying `lastSnapshotHash == adoptTip(mg)` — the adopt tip's child). Such an MG is a
+      * "stale re-include": every binary in its window is already adopted, so gl0's embed-match (which keys on the SAME adopt tip,
+      * `GlobalSnapshotConsensusFunctions` `pick`) can find no continuation and DEFERS it — yet the checkpoint still advanced the shard
+      * bestTip past `adoptedShardOrd`, tripping the `pipelineDepth` gate into a permanent freeze (run-19..22 deadlock; verified live: ord16
+      * mgs=1 minted in the 0.6s post-adoption gossip race, frozen ~1.5h while ml0 kept producing). The adopt tip is authoritative per-MG
+      * and NEVER reverts when a checkpoint omits an MG — unlike `chainStore.perMgTip` (bestTip-derived), whose revert-to-genesis under
+      * partial checkpoints is the run-27e regress wedge. Tests wire this == `finalizedBasePerMgTip` so the gate is a no-op (adoptTip ==
+      * windowAnchor ⇒ the window head is already the adopt tip's child).
+      */
+    adoptedPerMgTip: F[SortedMap[Address, Hash]],
     slotLeader: ShardSlotLeader[F],
     publisher: ShardCheckpointPublisher[F],
     selfPeerId: PeerId,
@@ -350,8 +364,8 @@ object ShardCheckpointProducer {
           // (parent = Hash.empty, parent ord = Genesis). `perMgTip` is derived from the SAME best tip so the chain-link anchor and
           // the parent envelope are read consistently.
           tickRef.updateAndGet(_ + 1L).flatMap { tick =>
-            (chainStore.bestTip, finalizedBasePerMgTip, lastAdoptedOrd, heldRef.get).tupled.flatMap {
-              case (bestTipOpt, windowAnchorTips, adoptedOrdOpt, heldOpt) =>
+            (chainStore.bestTip, finalizedBasePerMgTip, adoptedPerMgTip, lastAdoptedOrd, heldRef.get).tupled.flatMap {
+              case (bestTipOpt, windowAnchorTips, adoptedTips, adoptedOrdOpt, heldOpt) =>
                 val parentHash: Hash = bestTipOpt.map(_.hash).getOrElse(Hash.empty)
                 val nextShardOrdinal: ShardOrdinal =
                   bestTipOpt.map(_.signed.value.shardOrdinal).getOrElse(ShardOrdinal.Genesis).next
@@ -406,6 +420,7 @@ object ShardCheckpointProducer {
                         produceInner(
                           bestTipOpt,
                           windowAnchorTips,
+                          adoptedTips,
                           pendingSnapshots,
                           gl0AnchorOrdinal,
                           epoch,
@@ -424,6 +439,7 @@ object ShardCheckpointProducer {
       private def produceInner(
         bestTipOpt: Option[io.constellationnetwork.security.Hashed[ShardCheckpoint]],
         windowAnchorTips: SortedMap[Address, Hash],
+        adoptedTips: SortedMap[Address, Hash],
         pendingSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         gl0AnchorOrdinal: SnapshotOrdinal,
         epoch: EtaPeriod,
@@ -444,11 +460,34 @@ object ShardCheckpointProducer {
         // are omitted; if NOTHING chains off the tip, there is nothing to checkpoint → return None (don't emit an empty checkpoint
         // and don't burn the slot lottery on it). This is the inversion's core: the admissible set comes from the shard's prior
         // checkpoint, not gl0's post-chain-link `stateChannelSnapshots`.
-        chainLinkOrder(pendingSnapshots, windowAnchorTips).flatMap { orderedSnapshots =>
-          if (orderedSnapshots.isEmpty)
+        chainLinkOrder(pendingSnapshots, windowAnchorTips).flatMap { chained =>
+          // ── NEWNESS GATE (S2-deadlock fix, 2026-06-15; runs 19-22) ───────────────────────────────────────────────────────────
+          // Keep only MGs whose finalized-base-anchored window EXTENDS PAST gl0's adopt tip — i.e. carries a binary whose
+          // `lastSnapshotHash == adoptTip(mg)` (the adopt tip's child = genuine new content gl0 hasn't adopted). An MG that fails
+          // this is a STALE RE-INCLUDE: every binary in its window is already adopted, so gl0's embed-match (`pick`, keyed on the
+          // SAME adopt tip) finds no continuation and DEFERS it — yet minting it advances the shard bestTip past `adoptedShardOrd`
+          // and trips the `pipelineDepth` gate into a permanent freeze (verified live: ord16 mgs=1 minted in the 0.6s post-adoption
+          // gossip race, frozen ~1.5h while ml0 kept producing). The window for surviving MGs is UNCHANGED (full base->latest, §4
+          // diff intact) — the gate only decides inclusion, never trims. `adoptTip` defaults to `Hash.empty` at genesis, where the
+          // window head IS the genesis binary so the gate passes. Omitting a no-new-content MG cannot regress it (gl0 keeps its tip)
+          // and is NOT the run-27e hazard (which omitted a DERIVABLE-new MG on a genesis-derive race — caught later in assembleDelta).
+          val orderedSnapshots = chained.filter {
+            case (mg, nel) => nel.exists(_.value.lastSnapshotHash === adoptedTips.getOrElse(mg, Hash.empty))
+          }
+          val staleOmitted: List[Address] = (chained.keySet -- orderedSnapshots.keySet).toList
+          val logStaleOmit: F[Unit] =
             logger
               .info(
-                s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=no-chain-link " +
+                s"produce: newness-gate omitted ${staleOmitted.size} stale-re-include mg(s) (window already fully adopted by gl0) " +
+                  s"gl0Anchor=${gl0AnchorOrdinal.value.value} omittedMgs=${staleOmitted.map(_.value.value.take(8)).mkString(",")} " +
+                  s"adoptTips=${adoptedTips.toList.map { case (mg, h) => s"${mg.value.value.take(8)}:${h.value.take(8)}" }.mkString(",")}"
+              )
+              .whenA(staleOmitted.nonEmpty)
+          if (orderedSnapshots.isEmpty)
+            logStaleOmit *> logger
+              .info(
+                s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} " +
+                  s"reason=${if (chained.isEmpty) "no-chain-link" else "nothing-new-past-adopt-tip"} " +
                   s"pendingMgs=${pendingSnapshots.size} " +
                   s"pendingCounts=${pendingSnapshots.toList.map { case (mg, nel) => s"${mg.value.value.take(8)}:${nel.size}" }
                       .mkString(",")} " +
@@ -456,93 +495,94 @@ object ShardCheckpointProducer {
               )
               .as(None: Option[Signed[ShardCheckpoint]])
           else
-            // Slice S4: resolve the shard-leader-VRF eta for the CHECKPOINT'S OWN `epoch` (the one stamped on the envelope below),
-            // NOT a wall-clock period. `epoch == rotationPeriod(gl0AnchorOrdinal)`, and `eta_epoch` is fixed at the 2/3-mark of the
-            // prior period (`EtaCalculation`), so it is knowable here and every verifier — who keys the same lookup on the
-            // wire-carried `checkpoint.epoch` — derives byte-identical bytes. This is the load-bearing determinism invariant: if
-            // producer + verifier disagreed on shardEta, `ShardSlotLeader.verifyLeader` would reject and the shard chain stalls.
-            shardEtaFor(epoch).flatMap { shardEta =>
-              // ─── SHUFFLED STAIRCASE (owner, 2026-06-12; design §5.7 rev 2 — replaces the LDD lottery) ───
-              // Deterministic duty schedule: the committee is hash-sorted per (shardEta, NEXT shardOrdinal); rank r
-              // is on duty for delta slots starting 1 slot after the parent's wire slot, wrapping modulo committee
-              // size (liveness needs ONE live member; censorship bounded by rotation). UNIQUE producer per window —
-              // genesis included — which is what a lottery can never give a small committee at per-slot draws
-              // (run-13/14: genesis forks + same-ord sibling lineages split attestations below kQuorum).
-              // slotGap >= 1 by construction (slotGapFor clamps); window index = (slotGap - 1) / delta.
-              slotLeader.dutyOrder(committee.toList.sortBy(_.value.value), shardEta, nextShardOrdinal).flatMap { ordered =>
-                val k = math.max(1, ordered.size)
-                // GENESIS WINDOW WIDENING (run-15 post-mortem): at genesis (no parent) the duty windows are 12x wider.
-                // At boot the gossip meshes are still forming — the first checkpoint can take tens of seconds to reach
-                // peers — and a 5-slot handoff let ranks 1 and 2 mint rival genesis checkpoints before rank-0's arrived
-                // (three ord-1s at slots 0/6/11 = the run-15 genesis fork). Slot-grid sync makes the wide handoff exact;
-                // rotation still wraps, so liveness needs one live member even at genesis.
-                val effectiveDelta: Long =
-                  if (parentSlotOpt.isEmpty) math.max(1L, staircaseDeltaSlots.toLong) * 12L
-                  else math.max(1L, staircaseDeltaSlots.toLong)
-                val dutyIdx = (((slotGap - 1L) / effectiveDelta) % k.toLong).toInt
-                val onDuty = ordered(dutyIdx)
-                if (onDuty =!= selfPeerId)
-                  logger
-                    .info(
-                      s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=not-on-duty " +
-                        s"slot=${currentSlot.value.value} gap=$slotGap dutyRank=$dutyIdx " +
-                        s"onDuty=${onDuty.value.value.take(12)} chainedMgs=${orderedSnapshots.size}"
-                    )
-                    .as(None: Option[Signed[ShardCheckpoint]])
-                else
-                  slotLeader.membershipProof(selfVrfSk, shardEta, currentSlot).flatMap { vrfProof =>
-                    // On duty — build the checkpoint, sign it, publish it.
-                    assembleDelta(orderedSnapshots, gl0AnchorOrdinal).flatMap {
-                      case None =>
-                        // assembleDelta already logged the omit-defer reason; mint NOTHING this round.
-                        (None: Option[Signed[ShardCheckpoint]]).pure[F]
-                      case Some(delta) =>
-                        val checkpoint = ShardCheckpoint(
-                          shardId = shardId,
-                          parentCheckpointHash = parentHash,
-                          shardOrdinal = nextShardOrdinal,
-                          gl0AnchorOrdinal = gl0AnchorOrdinal,
-                          slot = currentSlot,
-                          derivedStateDelta = delta,
-                          emittedReceipts = List.empty,
-                          // Placeholder — populated below by replacing with the real committee-member sig. NonEmptyList requires at
-                          // least one element to construct; we use a throwaway sentinel and overwrite in `.copy(...)`. Cleaner than
-                          // threading the signing into the case-class constructor.
-                          committeeSignatures = NonEmptyList.of(placeholderSig),
-                          epoch = epoch
-                        )
-                        for {
-                          // Compute the canonical preimage hash via Hasher[F]. This is the bytes every committee member signs (§3.3).
-                          preimageHash <- Hasher[F].hash(checkpoint.signingPreimage)
-                          // Sign with Ed25519 long-term + KES product. Both sign the canonical preimage hash's UTF-8 bytes (`getBytes`
-                          // matches `MetagraphCommitteeGate.messageBytes` — Hasher result's UTF-8 byte form is what other sign paths use).
-                          msgBytes = preimageHash.getBytes
-                          edSig <- Signing.signData[F](msgBytes)(selfKeyPair.getPrivate)
-                          kesStep <- kesSigner.currentPeriod
-                          kesSig <- kesSigner.signAt(kesStep, msgBytes)
-                          committeeSig = CommitteeMemberSignature(
-                            peerId = selfPeerId,
-                            vrfProof = Hex.fromBytes(vrfProof),
-                            ed25519Sig = Hex.fromBytes(edSig),
-                            kesProductSig = Hex.fromBytes(kesSig),
-                            kesTreeStep = kesStep
+            logStaleOmit *>
+              // Slice S4: resolve the shard-leader-VRF eta for the CHECKPOINT'S OWN `epoch` (the one stamped on the envelope below),
+              // NOT a wall-clock period. `epoch == rotationPeriod(gl0AnchorOrdinal)`, and `eta_epoch` is fixed at the 2/3-mark of the
+              // prior period (`EtaCalculation`), so it is knowable here and every verifier — who keys the same lookup on the
+              // wire-carried `checkpoint.epoch` — derives byte-identical bytes. This is the load-bearing determinism invariant: if
+              // producer + verifier disagreed on shardEta, `ShardSlotLeader.verifyLeader` would reject and the shard chain stalls.
+              shardEtaFor(epoch).flatMap { shardEta =>
+                // ─── SHUFFLED STAIRCASE (owner, 2026-06-12; design §5.7 rev 2 — replaces the LDD lottery) ───
+                // Deterministic duty schedule: the committee is hash-sorted per (shardEta, NEXT shardOrdinal); rank r
+                // is on duty for delta slots starting 1 slot after the parent's wire slot, wrapping modulo committee
+                // size (liveness needs ONE live member; censorship bounded by rotation). UNIQUE producer per window —
+                // genesis included — which is what a lottery can never give a small committee at per-slot draws
+                // (run-13/14: genesis forks + same-ord sibling lineages split attestations below kQuorum).
+                // slotGap >= 1 by construction (slotGapFor clamps); window index = (slotGap - 1) / delta.
+                slotLeader.dutyOrder(committee.toList.sortBy(_.value.value), shardEta, nextShardOrdinal).flatMap { ordered =>
+                  val k = math.max(1, ordered.size)
+                  // GENESIS WINDOW WIDENING (run-15 post-mortem): at genesis (no parent) the duty windows are 12x wider.
+                  // At boot the gossip meshes are still forming — the first checkpoint can take tens of seconds to reach
+                  // peers — and a 5-slot handoff let ranks 1 and 2 mint rival genesis checkpoints before rank-0's arrived
+                  // (three ord-1s at slots 0/6/11 = the run-15 genesis fork). Slot-grid sync makes the wide handoff exact;
+                  // rotation still wraps, so liveness needs one live member even at genesis.
+                  val effectiveDelta: Long =
+                    if (parentSlotOpt.isEmpty) math.max(1L, staircaseDeltaSlots.toLong) * 12L
+                    else math.max(1L, staircaseDeltaSlots.toLong)
+                  val dutyIdx = (((slotGap - 1L) / effectiveDelta) % k.toLong).toInt
+                  val onDuty = ordered(dutyIdx)
+                  if (onDuty =!= selfPeerId)
+                    logger
+                      .info(
+                        s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=not-on-duty " +
+                          s"slot=${currentSlot.value.value} gap=$slotGap dutyRank=$dutyIdx " +
+                          s"onDuty=${onDuty.value.value.take(12)} chainedMgs=${orderedSnapshots.size}"
+                      )
+                      .as(None: Option[Signed[ShardCheckpoint]])
+                  else
+                    slotLeader.membershipProof(selfVrfSk, shardEta, currentSlot).flatMap { vrfProof =>
+                      // On duty — build the checkpoint, sign it, publish it.
+                      assembleDelta(orderedSnapshots, gl0AnchorOrdinal).flatMap {
+                        case None =>
+                          // assembleDelta already logged the omit-defer reason; mint NOTHING this round.
+                          (None: Option[Signed[ShardCheckpoint]]).pure[F]
+                        case Some(delta) =>
+                          val checkpoint = ShardCheckpoint(
+                            shardId = shardId,
+                            parentCheckpointHash = parentHash,
+                            shardOrdinal = nextShardOrdinal,
+                            gl0AnchorOrdinal = gl0AnchorOrdinal,
+                            slot = currentSlot,
+                            derivedStateDelta = delta,
+                            emittedReceipts = List.empty,
+                            // Placeholder — populated below by replacing with the real committee-member sig. NonEmptyList requires at
+                            // least one element to construct; we use a throwaway sentinel and overwrite in `.copy(...)`. Cleaner than
+                            // threading the signing into the case-class constructor.
+                            committeeSignatures = NonEmptyList.of(placeholderSig),
+                            epoch = epoch
                           )
-                          finalCheckpoint = checkpoint.copy(committeeSignatures = NonEmptyList.of(committeeSig))
-                          // Wrap in Signed envelope. The outer Signed contract uses the operator's long-term Ed25519 signature over the
-                          // envelope's value bytes; this is the canonical "this operator authored this message" attestation that gl0 and
-                          // other peers use to authenticate the gossip path. Mirrors how `GlobalIncrementalSnapshot` is signed.
-                          proof <- SignatureProof.fromHash(selfKeyPair, preimageHash)
-                          signedCheckpoint = Signed(finalCheckpoint, NonEmptySet.of(proof))
-                          _ <- publisher.publish(signedCheckpoint)
-                          _ <- logger.info(
-                            s"produce: emitted shardOrdinal=${nextShardOrdinal.value} gl0Anchor=${gl0AnchorOrdinal.value.value} " +
-                              s"slot=${currentSlot.value.value} mgs=${orderedSnapshots.keys.size} kesStep=$kesStep"
-                          )
-                        } yield Some(signedCheckpoint): Option[Signed[ShardCheckpoint]]
+                          for {
+                            // Compute the canonical preimage hash via Hasher[F]. This is the bytes every committee member signs (§3.3).
+                            preimageHash <- Hasher[F].hash(checkpoint.signingPreimage)
+                            // Sign with Ed25519 long-term + KES product. Both sign the canonical preimage hash's UTF-8 bytes (`getBytes`
+                            // matches `MetagraphCommitteeGate.messageBytes` — Hasher result's UTF-8 byte form is what other sign paths use).
+                            msgBytes = preimageHash.getBytes
+                            edSig <- Signing.signData[F](msgBytes)(selfKeyPair.getPrivate)
+                            kesStep <- kesSigner.currentPeriod
+                            kesSig <- kesSigner.signAt(kesStep, msgBytes)
+                            committeeSig = CommitteeMemberSignature(
+                              peerId = selfPeerId,
+                              vrfProof = Hex.fromBytes(vrfProof),
+                              ed25519Sig = Hex.fromBytes(edSig),
+                              kesProductSig = Hex.fromBytes(kesSig),
+                              kesTreeStep = kesStep
+                            )
+                            finalCheckpoint = checkpoint.copy(committeeSignatures = NonEmptyList.of(committeeSig))
+                            // Wrap in Signed envelope. The outer Signed contract uses the operator's long-term Ed25519 signature over the
+                            // envelope's value bytes; this is the canonical "this operator authored this message" attestation that gl0 and
+                            // other peers use to authenticate the gossip path. Mirrors how `GlobalIncrementalSnapshot` is signed.
+                            proof <- SignatureProof.fromHash(selfKeyPair, preimageHash)
+                            signedCheckpoint = Signed(finalCheckpoint, NonEmptySet.of(proof))
+                            _ <- publisher.publish(signedCheckpoint)
+                            _ <- logger.info(
+                              s"produce: emitted shardOrdinal=${nextShardOrdinal.value} gl0Anchor=${gl0AnchorOrdinal.value.value} " +
+                                s"slot=${currentSlot.value.value} mgs=${orderedSnapshots.keys.size} kesStep=$kesStep"
+                            )
+                          } yield Some(signedCheckpoint): Option[Signed[ShardCheckpoint]]
+                      }
                     }
-                  }
+                }
               }
-            }
         }
       }
 

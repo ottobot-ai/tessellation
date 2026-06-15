@@ -223,12 +223,16 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     republishEveryTicks: Int = 1,
     // S2: the finalized-base per-MG window anchor. `None` ⇒ the shard's `perMgTip` (so the pre-S2 cases keep their perMgTip-anchored
     // behavior); the dedicated base-anchored case passes a DISTINCT (lower) tip to prove the window re-includes base->latest.
-    finalizedBaseTip: Option[IO[SortedMap[Address, Hash]]] = None
+    finalizedBaseTip: Option[IO[SortedMap[Address, Hash]]] = None,
+    // Newness-gate (S2-deadlock fix): gl0's ADOPT tip. `None` ⇒ == the window anchor, so the gate is a NO-OP (every existing test
+    // sees identical behavior). The dedicated newness-gate case passes a DISTINCT (higher) adopt tip to exercise stale-re-include omit.
+    adoptedTip: Option[IO[SortedMap[Address, Hash]]] = None
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     ShardCheckpointProducer.make[IO](
       shardId = shardZero,
       chainStore = rig.chainStore,
       finalizedBasePerMgTip = finalizedBaseTip.getOrElse(rig.chainStore.perMgTip),
+      adoptedPerMgTip = adoptedTip.getOrElse(finalizedBaseTip.getOrElse(rig.chainStore.perMgTip)),
       slotLeader = ssl,
       publisher = rig.publisher,
       selfPeerId = rig.selfPeerId,
@@ -418,6 +422,71 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         perMgTipAfter.get(mg).contains(b0Hash),
         // Base-anchored window RE-INCLUDES b0 AND b1 (perMgTip-anchoring at hash(b0) would yield ONLY b1).
         included.size == 2,
+        included.map(_.value.lastSnapshotHash) == List(Hash.empty, b0Hash)
+      )
+  }
+
+  // ===========================================================================
+  // Test 4b — Newness gate (S2-deadlock fix, runs 19-22): omit stale re-includes (window fully adopted by gl0)
+  // ===========================================================================
+
+  test(
+    "newness gate: an MG whose base-anchored window holds NOTHING past gl0's adopt tip is OMITTED (stale re-include) ⇒ produce-skip; " +
+      "an adopt tip BEHIND the tail ⇒ included with the full base->latest window"
+  ) { res =>
+    implicit val (h, sp, ssl) = res
+    import io.constellationnetwork.security.signature.Signed.SignedOps
+    for {
+      rig <- freshRig
+      gl0Eta = randomGl0Eta()
+      shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
+      mg = mkAddress("mg-0")
+      // Base = genesis ⇒ chainLinkOrder unfolds the window [b0, b1]: b0 off genesis, b1 off b0.
+      b0 = mkSignedBinary("mg-0", 0, parent = Hash.empty)
+      b0Hash <- SignedOps(b0).toHashed[IO].map(_.hash)
+      b1 = mkSignedBinary("mg-0", 1, parent = b0Hash)
+      b1Hash <- SignedOps(b1).toHashed[IO].map(_.hash)
+      pending = SortedMap(mg -> NonEmptyList.of(b0, b1))(Address.OrderingInstance)
+      base = SortedMap.empty[Address, Hash](Address.OrderingInstance) // finalized base = genesis
+      // committee={self} ⇒ staircase duty (k=1) always lands on self, so a None return is UNAMBIGUOUSLY the newness gate, never a lost
+      // duty draw. STALE: gl0 has already adopted up to b1 (the window's TAIL) ⇒ no binary in [b0,b1] carries lastSnapshotHash==hash(b1)
+      // ⇒ the sole MG is omitted ⇒ produce-skip (nothing-new-past-adopt-tip) on every slot.
+      staleProducer <- makeProducer(
+        ssl,
+        rig,
+        Ratio.One,
+        shardEta,
+        finalizedBaseTip = Some(IO.pure(base)),
+        adoptedTip = Some(IO.pure(SortedMap(mg -> b1Hash)(Address.OrderingInstance)))
+      )
+      staleAttempts <- (1L to 12L).toList.traverse { i =>
+        staleProducer.produce(pending, mkOrd(2200L + i), EtaPeriod(0L), Slot.unsafeApply(2200L + i), Set(rig.selfPeerId))
+      }
+      // CONTROL / NEW: gl0 adopted only up to b0 ⇒ b1 (lastSnapshotHash==hash(b0)) is genuinely new ⇒ the MG is included, and the window
+      // STILL re-includes b0 (base-anchored, §4 diff intact). Same buffer/base/committee/slots — only the adopt tip differs from STALE.
+      newProducer <- makeProducer(
+        ssl,
+        rig,
+        Ratio.One,
+        shardEta,
+        finalizedBaseTip = Some(IO.pure(base)),
+        adoptedTip = Some(IO.pure(SortedMap(mg -> b0Hash)(Address.OrderingInstance)))
+      )
+      newResult <- tryProduceUntilSome(
+        producer = newProducer,
+        startOrd = 2300L,
+        epoch = EtaPeriod(0L),
+        maxAttempts = 100,
+        committee = Set(rig.selfPeerId),
+        pending = pending
+      )
+      newCp <- IO.fromOption(newResult)(new RuntimeException("newness gate (new): should win at σ=1 within 100 attempts"))
+      included = newCp.value.derivedStateDelta.includedSnapshots.get(mg).map(_.toList).getOrElse(Nil)
+    } yield
+      expect.all(
+        // STALE: every slot returns None — the sole MG's window is fully adopted, nothing past the adopt tip for gl0 to embed.
+        staleAttempts.forall(_.isEmpty),
+        // NEW: the MG is included AND the window still re-includes b0->b1 (proving the gate decides inclusion only, never trims §4 content).
         included.map(_.value.lastSnapshotHash) == List(Hash.empty, b0Hash)
       )
   }

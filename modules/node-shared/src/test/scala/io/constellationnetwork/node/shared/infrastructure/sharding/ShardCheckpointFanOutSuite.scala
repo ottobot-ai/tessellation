@@ -160,6 +160,7 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
       shardId = shardId,
       chainStore = chainStore,
       finalizedBasePerMgTip = chainStore.perMgTip, // fan-out tests assert perMgTip-anchored chain-linking (pre-S2 parity)
+      adoptedPerMgTip = chainStore.perMgTip, // == window anchor ⇒ newness gate is a no-op here (S2-deadlock fix, 2026-06-15)
       slotLeader = ssl,
       publisher = ShardCheckpointPublisher.noop[IO],
       selfPeerId = PeerId.fromPublic(keyPair.getPublic),
