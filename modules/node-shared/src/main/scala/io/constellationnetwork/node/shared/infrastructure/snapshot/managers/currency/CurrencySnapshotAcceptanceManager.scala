@@ -311,7 +311,13 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
         lastSnapshotContext.snapshotInfo.globalSnapshotSyncView,
         globalSnapshotSyncsForAcceptance,
         lastSnapshotContext.address,
-        facilitators
+        facilitators,
+        // FORCED-OVERRIDE (#259 currency-consensus determinism): `forcedGlobalSyncView` is set ONLY on the follower/validator
+        // RECOMPUTE path (CurrencySnapshotValidator passes `expected.globalSyncView`), never on produce. On that path the
+        // available `facilitators` is `artifact.proofs` (2/3 signers) — too narrow to reproduce the producer's committed
+        // `globalSnapshotSyncView` (accepted under the full committee), so trust the committed syncs instead of re-gating
+        // membership. Verified single-ml0 (committee={ml0}, no asymmetry) wedges 0× vs 837× multi-ml0.
+        trustCommitted = forcedGlobalSyncView.isDefined
       )
     ).parMapN((messages, syncs) => (messages, syncs))
 

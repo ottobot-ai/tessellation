@@ -116,7 +116,9 @@ class MessageValidationOpsManager[F[_]: Async](
     lastGlobalSnapshotSyncView: Option[SortedMap[PeerId, Signed[GlobalSnapshotSync]]],
     globalSnapshotSyncsForAcceptance: List[Signed[GlobalSnapshotSync]],
     metagraphId: Address,
-    facilitators: Set[PeerId]
+    facilitators: Set[PeerId],
+    // FORCED-OVERRIDE (#259 currency-consensus determinism — set on the follower recompute path; see `effectiveFacilitators` below).
+    trustCommitted: Boolean = false
   )(implicit hs: Hasher[F]): F[GlobalSnapshotSyncAcceptanceResult] = {
     val ordering = Order
       .whenEqual[Signed[GlobalSnapshotSync]](
@@ -124,6 +126,20 @@ class MessageValidationOpsManager[F[_]: Async](
         Order[Signed[GlobalSnapshotSync]]
       )
       .toOrdering
+
+    // FORCED-OVERRIDE (#259 currency-consensus determinism). On the follower's `createContext` RECOMPUTE path `trustCommitted` is
+    // set (by `CurrencySnapshotAcceptanceManager.accept` iff `forcedGlobalSyncView` is forced). There the only available
+    // `facilitators` is `artifact.proofs` (the 2/3 SIGNERS) — a strict subset of the consensus committee the PRODUCER accepted
+    // syncs under. A `GlobalSnapshotSync` from a participating-but-non-signing facilitator is in the 2/3-attested committed
+    // `globalSnapshotSyncView` yet would be `NotSignedByFacilitator`-rejected here → the recomputed map differs →
+    // `SnapshotDifferentThanExpected` → `CannotCreateContext` wedge (verified: 837x multi-ml0 vs 0x single-ml0). Trust the committed
+    // set by admitting its signers into the membership check; signature/seedlist/chain checks still gate every sync. This expansion
+    // is LOCAL to this fold — it does NOT alter `accept()`'s `facilitators` that feeds `maxProposalSizeInBytes`, so there is no
+    // event-cut/size-budget perturbation. Never set on the producer/proposal path (forcedGlobalSyncView=None), so produce-time
+    // committee membership stays fully enforced.
+    val effectiveFacilitators: Set[PeerId] =
+      if (trustCommitted) facilitators ++ globalSnapshotSyncsForAcceptance.map(_.proofs.head.id.toPeerId).toSet
+      else facilitators
 
     globalSnapshotSyncsForAcceptance
       .sorted(ordering)
@@ -135,7 +151,7 @@ class MessageValidationOpsManager[F[_]: Async](
         )
       ) {
         case ((lastSyncs, toAdd, toReject), sync) =>
-          globalSnapshotSyncValidator.validate(sync, metagraphId, facilitators, lastSyncs).map {
+          globalSnapshotSyncValidator.validate(sync, metagraphId, effectiveFacilitators, lastSyncs).map {
             case Validated.Valid(_) =>
               val peerId = sync.proofs.head.id.toPeerId
               val updatedLastSyncs = lastSyncs.updated(peerId, sync)
