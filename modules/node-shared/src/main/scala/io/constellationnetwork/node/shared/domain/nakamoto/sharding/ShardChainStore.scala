@@ -12,6 +12,7 @@ import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId, ShardO
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher}
+import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
@@ -98,6 +99,20 @@ trait ShardChainStore[F[_]] {
     * `GlobalSnapshotStateChannelAcceptanceManager`'s `priorLastStateChannelSnapshotHashes.getOrElse(address, Hash.empty)`).
     */
   def perMgTip: F[SortedMap[Address, Hash]]
+
+  /** CHAIN-WIDE per-metagraph checkpoint frontier — for each in-shard MG, the hash of the last included SC binary in the MOST RECENT
+    * checkpoint (walking the bestTip ancestry from tip toward genesis) that includes that MG.
+    *
+    * Unlike [[perMgTip]] (which reads ONLY the bestTip checkpoint and therefore REVERTS to `Hash.empty` for any MG the latest checkpoint
+    * omits — the run-27e regress hazard), this walks back until it finds each MG, so a partial (mgs<all) bestTip does not lose an MG's
+    * frontier. Because bestTip follows `noteAnchor` (gl0's adopted lineage), the frontier is REORG-SAFE and is at-or-ahead of gl0's per-MG
+    * adopt tip (gl0 only adopts checkpoints this chain has minted) — never behind it. That makes it the correct reference for the
+    * producer's NEWNESS GATE: requiring the next window to extend PAST this frontier guarantees it also extends past gl0's adopt tip, so
+    * gl0's embed-match can always find the continuation (it can never be a stale re-include gl0 would defer — the S2 ord-16/26 freeze). The
+    * latest-PRODUCED global GSI (`getCombined`) is NOT usable here: it lags the in-flight per-MG adoptions, so it is BEHIND the adopt tip
+    * and lets a stale re-include slip the gate (verified live: ord-26 re-freeze). Returns an EMPTY map at genesis (no best tip).
+    */
+  def lastCheckpointedPerMgTip: F[SortedMap[Address, Hash]]
 
   /** Walk back `depth` parents from `hash`. Returns the chain in tip-first order (head of the returned list is the entry at `hash`, tail
     * walks toward genesis). Stops early if the chain breaks (parent not in `byHash`) or if `depth` entries have been collected.
@@ -395,6 +410,29 @@ object ShardChainStore {
                   SignedOps(binaries.last).toHashed[F].map(h => mg -> h.hash)
               }
                 .map(pairs => SortedMap.from(pairs)(Address.OrderingInstance))
+          }
+
+        def lastCheckpointedPerMgTip: F[SortedMap[Address, Hash]] =
+          stateRef.get.flatMap { state =>
+            import io.constellationnetwork.security.signature.Signed.SignedOps
+            // Walk bestTip -> genesis via parentHash; per MG keep the FIRST (nearest-bestTip) included binary's tip. bestTip follows
+            // noteAnchor (gl0's adopted lineage), so this frontier is reorg-safe and at-or-ahead of gl0's per-MG adopt tip — never behind
+            // it (gl0 only adopts checkpoints this chain minted). `byHash.size + 1` bounds the walk (the stored DAG is acyclic — a binary's
+            // parentHash is fixed at signing — but the bound is a defensive backstop against a malformed parent ring).
+            val firstSeen = scala.collection.mutable.LinkedHashMap.empty[Address, Signed[StateChannelSnapshotBinary]]
+            var cur: Option[StoredShardCheckpoint] = state.bestTipHash.flatMap(state.byHash.get)
+            var steps = 0
+            val maxSteps = state.byHash.size + 1
+            while (cur.isDefined && steps < maxSteps) {
+              val c = cur.get
+              c.signedCheckpoint.value.derivedStateDelta.includedSnapshots.foreach {
+                case (mg, binaries) => if (!firstSeen.contains(mg)) firstSeen.update(mg, binaries.last)
+              }
+              cur = state.byHash.get(c.parentHash)
+              steps += 1
+            }
+            firstSeen.toList.traverse { case (mg, bin) => SignedOps(bin).toHashed[F].map(h => mg -> h.hash) }
+              .map(pairs => SortedMap.from(pairs)(Address.OrderingInstance))
           }
 
         def walkBackTo(hash: Hash, depth: Long): F[List[Hashed[ShardCheckpoint]]] =

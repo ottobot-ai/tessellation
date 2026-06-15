@@ -6,11 +6,13 @@ import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
 
+import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.SnapshotOrdinal
+import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
@@ -20,6 +22,7 @@ import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
+import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
@@ -118,6 +121,33 @@ object ShardChainStoreSuite extends MutableIOSuite {
   /** Build deterministic VRF output bytes from an int seed. Used for fork tiebreaks. */
   private def vrf(seed: Int): Array[Byte] = Array.fill[Byte](32)(seed.toByte)
 
+  /** Build an Address from a label — for the chain-wide-frontier tests. */
+  private def mkAddr(label: String): Address = Address.fromBytes(label.getBytes("UTF-8"))
+
+  /** Build a stub `Signed[StateChannelSnapshotBinary]` chaining off `parent`, with distinct content per `(label, idx)` so distinct
+    * canonical hashes.
+    */
+  private def mkBinary(label: String, idx: Int, parent: Hash): Signed[StateChannelSnapshotBinary] =
+    mkSigned(
+      StateChannelSnapshotBinary(
+        lastSnapshotHash = parent,
+        content = s"$label:$idx".getBytes("UTF-8"),
+        fee = SnapshotFee(NonNegLong.unsafeFrom(0L))
+      )
+    )
+
+  /** `mkCheckpoint` carrying a non-empty per-MG `includedSnapshots` window — for [[ShardChainStore.lastCheckpointedPerMgTip]] tests. */
+  private def mkSignedCheckpointIncl(
+    ord: Long,
+    parent: Hash,
+    peerByte: Int,
+    included: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]
+  ): Signed[ShardCheckpoint] =
+    mkSigned(
+      mkCheckpoint(ord, parent, peerByte, gl0Anchor = 100L)
+        .copy(derivedStateDelta = ShardDerivedStateDelta.empty.copy(includedSnapshots = included))
+    )
+
   // ===========================================================================
   // Test 1: single-chain insertion + bestTip + walkBackTo
   // ===========================================================================
@@ -145,6 +175,49 @@ object ShardChainStoreSuite extends MutableIOSuite {
         walkB.head.signed.value.shardOrdinal == ShardOrdinal(1L),
         walkB(1).signed.value.shardOrdinal == ShardOrdinal(0L),
         walkB.head.hash =!= walkB(1).hash
+      )
+  }
+
+  // ===========================================================================
+  // Test 1b: lastCheckpointedPerMgTip — chain-wide, non-reverting (the ord-26 re-freeze fix)
+  // ===========================================================================
+
+  test(
+    "lastCheckpointedPerMgTip walks back across a PARTIAL bestTip: an MG omitted by the latest checkpoint keeps its frontier from the " +
+      "last checkpoint that included it (perMgTip reverts; lastCheckpointedPerMgTip does not)"
+  ) { hasher =>
+    implicit val h: Hasher[IO] = hasher
+    import io.constellationnetwork.security.signature.Signed.SignedOps
+    val mgX = mkAddr("mg-X")
+    val mgY = mkAddr("mg-Y")
+    val x1 = mkBinary("X", 0, Hash.empty)
+    for {
+      store <- ShardChainStore.make[IO](shardZero)
+      x1h <- SignedOps(x1).toHashed[IO].map(_.hash)
+      x2 = mkBinary("X", 1, x1h)
+      x2h <- SignedOps(x2).toHashed[IO].map(_.hash)
+      y1 = mkBinary("Y", 0, Hash.empty)
+      y1h <- SignedOps(y1).toHashed[IO].map(_.hash)
+      // A (ord 0): includes BOTH MGs.
+      aIncl = SortedMap(mgX -> NonEmptyList.of(x1), mgY -> NonEmptyList.of(y1))(Address.OrderingInstance)
+      signedA = mkSignedCheckpointIncl(0L, Hash.empty, peerByte = 1, included = aIncl)
+      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(0L), slot = 1L, vrfOutput = vrf(1))
+      hashA <- store.bestTip.map(_.get.hash)
+      // B (ord 1, child of A): includes ONLY mgX, OMITS mgY — the partial bestTip that reverts perMgTip(mgY).
+      bIncl = SortedMap(mgX -> NonEmptyList.of(x2))(Address.OrderingInstance)
+      signedB = mkSignedCheckpointIncl(1L, hashA, peerByte = 2, included = bIncl)
+      _ <- store.store(signedB, parentHash = hashA, shardOrdinal = ShardOrdinal(1L), slot = 2L, vrfOutput = vrf(2))
+      perMg <- store.perMgTip
+      frontier <- store.lastCheckpointedPerMgTip
+    } yield
+      expect.all(
+        // perMgTip reads ONLY bestTip=B: mgX present (x2), mgY ABSENT — reverted (the run-27e hazard the gate must not depend on).
+        perMg.get(mgX).contains(x2h),
+        !perMg.contains(mgY),
+        // lastCheckpointedPerMgTip walks back: mgX from B (x2), mgY from A (y1) — NON-REVERT. This is what makes the newness gate
+        // omit a stale re-include of mgY instead of minting it (the ord-26 freeze) when bestTip is a partial checkpoint.
+        frontier.get(mgX).contains(x2h),
+        frontier.get(mgY).contains(y1h)
       )
   }
 

@@ -1449,16 +1449,14 @@ object GlobalSnapshotConsensus {
                         import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax.MptStoreReadOps
                         mptStore.getAllLastStateChannelSnapshotHashes
                       },
-                      // NEWNESS GATE (S2-deadlock fix, runs 19-22): gl0's ADOPT tip = the latest PRODUCED global snapshot's per-MG
-                      // `lastStateChannelSnapshotHashes` — AHEAD of the depth-k finalized base above (`getCombined` holds the latest
-                      // produced GSI, ahead of the finalized watermark). The producer omits any MG whose finalized-base-anchored window
-                      // holds nothing PAST this tip (a stale re-include gl0's embed-match would defer), so it never advances the shard
-                      // bestTip past `adoptedShardOrd` with an un-embeddable checkpoint — the run-19..22 permanent pipeline freeze.
-                      adoptedPerMgTip = lastNGlobalSnapshotStorage.getCombined.map(
-                        _.fold(SortedMap.empty[Address, io.constellationnetwork.security.hash.Hash](Address.OrderingInstance))(
-                          _._2.lastStateChannelSnapshotHashes
-                        )
-                      ),
+                      // NEWNESS GATE (S2-deadlock fix, runs 19-22 + ord-26 re-freeze): the gate reference is this chain's CHAIN-WIDE
+                      // per-MG checkpoint frontier (the latest binary minted per MG across the noteAnchor-followed bestTip ancestry), NOT
+                      // the latest-PRODUCED global GSI. `getCombined` LAGS the in-flight per-MG adoptions, so it sits BEHIND gl0's true
+                      // adopt tip and let a stale re-include slip the gate → ord-26 re-froze (verified live). The chain-wide frontier is
+                      // reorg-safe and at-or-AHEAD of gl0's adopt tip (gl0 only adopts what this chain minted), so requiring the next
+                      // window to extend past it guarantees gl0's embed-match can continue — the producer never advances bestTip past
+                      // adoptedShardOrd with an un-embeddable checkpoint (the permanent pipeline freeze).
+                      adoptedPerMgTip = entry.chainStore.lastCheckpointedPerMgTip,
                       slotLeader = shardSlotLeader,
                       publisher = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointPublisher
                         .sidecar[F](sidecarClient),

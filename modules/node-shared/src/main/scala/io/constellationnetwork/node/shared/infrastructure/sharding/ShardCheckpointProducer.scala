@@ -292,18 +292,25 @@ object ShardCheckpointProducer {
       * available for legacy chain-link admission elsewhere; it is NO LONGER the producer's window anchor.
       */
     finalizedBasePerMgTip: F[SortedMap[Address, Hash]],
-    /** '''NEWNESS GATE — gl0 ADOPT tip (S2-deadlock fix, 2026-06-15).''' Per-MG gl0 ADOPT-advanced SC tip — the latest PRODUCED global
-      * snapshot's `lastStateChannelSnapshotHashes` (`lastNGlobalSnapshotStorage.getCombined`, ahead of the depth-k finalized watermark).
-      * Used SOLELY to decide WHETHER an MG has content gl0 has not yet adopted; it does NOT anchor the window (that stays on
+    /** '''NEWNESS GATE — chain-wide per-MG checkpoint frontier (S2-deadlock fix, 2026-06-15; ord-26 re-freeze fix).''' Per-MG the latest
+      * binary this chain has CHECKPOINTED across the noteAnchor-followed bestTip ancestry (`chainStore.lastCheckpointedPerMgTip`). Used
+      * SOLELY to decide WHETHER an MG has content gl0 has not yet adopted; it does NOT anchor the window (that stays on
       * [[finalizedBasePerMgTip]] for §4 diff-correctness). The producer OMITS any MG whose finalized-base-anchored window does not extend
-      * PAST this adopt tip (i.e. contains no binary carrying `lastSnapshotHash == adoptTip(mg)` — the adopt tip's child). Such an MG is a
-      * "stale re-include": every binary in its window is already adopted, so gl0's embed-match (which keys on the SAME adopt tip,
-      * `GlobalSnapshotConsensusFunctions` `pick`) can find no continuation and DEFERS it — yet the checkpoint still advanced the shard
-      * bestTip past `adoptedShardOrd`, tripping the `pipelineDepth` gate into a permanent freeze (run-19..22 deadlock; verified live: ord16
-      * mgs=1 minted in the 0.6s post-adoption gossip race, frozen ~1.5h while ml0 kept producing). The adopt tip is authoritative per-MG
-      * and NEVER reverts when a checkpoint omits an MG — unlike `chainStore.perMgTip` (bestTip-derived), whose revert-to-genesis under
-      * partial checkpoints is the run-27e regress wedge. Tests wire this == `finalizedBasePerMgTip` so the gate is a no-op (adoptTip ==
-      * windowAnchor ⇒ the window head is already the adopt tip's child).
+      * PAST this frontier (i.e. contains no binary carrying `lastSnapshotHash == frontier(mg)` — the frontier's child). Such an MG is a
+      * "stale re-include": every binary in its window was already checkpointed (hence already adopted by gl0), so gl0's embed-match
+      * (`GlobalSnapshotConsensusFunctions` `pick`, keyed on gl0's adopt tip) finds no continuation and DEFERS it — yet the checkpoint still
+      * advanced the shard bestTip past `adoptedShardOrd`, tripping the `pipelineDepth` gate into a permanent freeze (run-19..22 ord16, then
+      * ord26; verified live).
+      *
+      * '''Why the chain-wide frontier and NOT `lastNGlobalSnapshotStorage.getCombined`.''' The frontier is at-or-AHEAD of gl0's per-MG
+      * adopt tip (gl0 only adopts checkpoints THIS chain minted, so minted ≥ adopted), is reorg-safe (bestTip follows `noteAnchor` = gl0's
+      * adopted lineage), and does NOT revert when a checkpoint omits an MG (it walks back to the most recent checkpoint including that MG —
+      * unlike `chainStore.perMgTip`, which reads only bestTip and reverts to genesis under a partial checkpoint, the run-27e regress
+      * hazard). The latest-PRODUCED global GSI (`getCombined`) instead LAGS the in-flight per-MG adoptions, so it sits BEHIND the adopt tip
+      * and lets a stale re-include slip the gate — the ord-26 re-freeze (the producer minted a window ending at gl0's just-advanced adopt
+      * tip because `getCombined` had not caught up). Requiring the window to extend past the (≥ adopt-tip) frontier makes gl0's embed-match
+      * continuation a guarantee, not a race. Tests wire this == `finalizedBasePerMgTip` so the gate is a no-op (frontier == windowAnchor ⇒
+      * the window head is already the frontier's child).
       */
     adoptedPerMgTip: F[SortedMap[Address, Hash]],
     slotLeader: ShardSlotLeader[F],
