@@ -62,26 +62,34 @@ import weaver.MutableIOSuite
   * gl0 follower APPLY-prior — must all read the SAME finalized base. On HEAD the follower apply-prior reads the BRANCH-aware reader
   * (`GlobalSnapshotAcceptanceManager.accept` builds `priorLastCurrencySnapshots` through the branch-aware `mpt` reader, and
   * `deriveAdoptedCurrencyState`'s `priorInfoOf` reads from that map), while the committee cuts its diff over the FINALIZED BASE. When the
-  * branch carries an intervening committed incremental ahead of the base (`branch != base`), the follower reconstructs
-  * `reconstructInfoFromDiff(branchPrior, diff_over_base)` whose per-MG root does NOT equal the committee-attested root, and the MG is
+  * branch carries an intervening committed incremental ahead of the base (`branch != base`), the HEAD follower reconstructed
+  * `reconstructInfoFromDiff(branchPrior, diff_over_base)` whose per-MG root did NOT equal the committee-attested root, and the MG was
   * '''DROPPED''' (`[ACCEPTANCE/ADOPT-VERIFY] ... MISMATCH ... DROPPING`). That asymmetry — drop at `branch != base`, adopt at `branch ==
-  * base`, '''with the identical checkpoint''' — IS the run-24→27 disease. This suite reproduces it as an executable regression that is
-  * RED-on-HEAD-by-design (test (A) asserts the CURRENT drop; (C) is the S1+S2 green target, marked pending).
+  * base`, '''with the identical checkpoint''' — IS the run-24→27 disease.
+  *
+  * '''S1 STATE (this revision).''' The follower now base-anchors BOTH halves for sharded MGs: (i) its apply-prior info reads the finalized
+  * base (`GlobalSnapshotAcceptanceManager.accept`'s `shardedInfoMode`), and (ii) its per-MG currency-WRITE removal-prior reads that same
+  * base (`AcceptanceMptStateChanges.applyStateChanges(currencyInfoRemovalPrior = Some(baseReader))`) so the `Mg*` removal set matches the
+  * accumulator-delta verify-replay (which carries no `Mg*` info removals) and the #107 writer self-check still holds. With both halves on
+  * base, a `branch != base` MG now ADOPTS. Tests (A) and (C) are the GREEN guards (both assert adopt); (A) additionally keeps the
+  * prior-level §4-mechanism asserts (recompute-over-base === attested, recompute-over-branch != attested) proving the follower reads base
+  * despite the branch diverging. (B) is the unchanged branch==base control. These pass at pipelineDepth=1; deeper windows are S2's job.
   *
   * '''Two make-or-break construction constraints''' (each verified against HEAD; miss either ⇒ a false-green that proves nothing):
   *
   *   1. '''The MG MUST be in the Right (incremental) arm WITH a carried diff.''' The Left(genesis)/None arms return `emptyInfo` regardless
   *      of branch depth, so `branchPrior == basePrior == emptyInfo`, recompute === attested, NO drop — GREEN-on-HEAD (the trap). Here the
   *      finalized base already holds the MG's `CurrencySnapshotInfo` (the unrolled `Mg*` entries + the `LastIncrementalCurrencySnapshots`
-  *      key + the `LastCurrencySnapshots` active-address index), so `priorLastCurrencySnapshots(mg)` resolves to a `Right((inc, info))`, and
-  *      the checkpoint carries a NON-EMPTY diff over that base prior. (See `seedBaseAndRoundTrip` + `writeRightArm` + `mkRightArmCheckpoint`.)
+  *      key + the `LastCurrencySnapshots` active-address index), so `priorLastCurrencySnapshots(mg)` resolves to a `Right((inc, info))`,
+  *      and the checkpoint carries a NON-EMPTY diff over that base prior. (See `seedBaseAndRoundTrip` + `writeRightArm` +
+  *      `mkRightArmCheckpoint`.)
   *
-  *   2. '''The harness drives the PRODUCTION MultiBranch overlay with a NON-passthrough child `BranchId` threaded as `accept(parentTip =
-  *      ...)`.''' `GlobalSnapshotAcceptanceManagerShardingSuite` builds `MptOverlay.passthrough` and passes `parentTip =
-  *      BranchId.passthrough` (== base == `BranchId(Hash.empty)`) — structurally incapable of `branch > base`. Here the overlay is
-  *      `MptOverlay.make(OverlayMode.MultiBranch(...))`; an INTERVENING per-MG incremental+info is written into a checked-out child branch
-  *      (`childTip`) so its branch reader returns a DIFFERENT prior than the base `MptStore`; that `childTip` is threaded as `parentTip`.
-  *      (See `mkOverlayWithBranch`.)
+  * 2. '''The harness drives the PRODUCTION MultiBranch overlay with a NON-passthrough child `BranchId` threaded as `accept(parentTip =
+  * ...)`.''' `GlobalSnapshotAcceptanceManagerShardingSuite` builds `MptOverlay.passthrough` and passes `parentTip = BranchId.passthrough`
+  * (== base == `BranchId(Hash.empty)`) — structurally incapable of `branch > base`. Here the overlay is
+  * `MptOverlay.make(OverlayMode.MultiBranch(...))`; an INTERVENING per-MG incremental+info is written into a checked-out child branch
+  * (`childTip`) so its branch reader returns a DIFFERENT prior than the base `MptStore`; that `childTip` is threaded as `parentTip`. (See
+  * `mkOverlayWithBranch`.)
   *
   * '''Producer-truth.''' The carried diff and the committee-attested per-MG root are computed with the EXACT production functions the
   * follower recomputes against (`ChangeSet.currencyInfoChangeSet`, `ChangeSet.reconstructInfoFromDiff`,
@@ -185,9 +193,9 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     )
 
   /** Build a checkpoint whose `derivedStateDelta` carries, for `mg`: the head binary (`includedSnapshots`), the committee byte-diff
-    * (`perMetagraphStateDiff`), and the committee-attested per-MG root (`perMetagraphMptRoots`). The diff + root are PRODUCER-TRUTH: computed
-    * over `basePriorRT` (the round-tripped base prior) so that `reconstructInfoFromDiff(basePriorRT, diff) === nextInfo` and the attested
-    * root === `hash(currencySnapshotFieldRoots(mg -> Right((inc, nextInfo))))`.
+    * (`perMetagraphStateDiff`), and the committee-attested per-MG root (`perMetagraphMptRoots`). The diff + root are PRODUCER-TRUTH:
+    * computed over `basePriorRT` (the round-tripped base prior) so that `reconstructInfoFromDiff(basePriorRT, diff) === nextInfo` and the
+    * attested root === `hash(currencySnapshotFieldRoots(mg -> Right((inc, nextInfo))))`.
     */
   private def mkRightArmCheckpoint(
     mg: Address,
@@ -218,9 +226,9 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   // Producer-truth diff + attested root (the EXACT functions the follower recomputes against)
   // ============================================================================
 
-  /** Compute the committee byte-diff over `basePrior` and the PIN-1 attested per-MG root over `next`, using the production functions. By the
-    * `reconstructInfoFromDiff` round-trip invariant, every gl0 follower whose APPLY-prior equals `basePrior` recomputes `next` and matches
-    * the root (ADOPT); a follower whose prior differs (the branch) reconstructs a different info and mismatches (DROP).
+  /** Compute the committee byte-diff over `basePrior` and the PIN-1 attested per-MG root over `next`, using the production functions. By
+    * the `reconstructInfoFromDiff` round-trip invariant, every gl0 follower whose APPLY-prior equals `basePrior` recomputes `next` and
+    * matches the root (ADOPT); a follower whose prior differs (the branch) reconstructs a different info and mismatches (DROP).
     */
   private def producerTruth(
     mg: Address,
@@ -258,8 +266,8 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   // ============================================================================
 
   /** Write the full Right-arm prior for `mg` (`info`) into the supplied `CurrencyInfoMpt` writer via the SAME production writer gl0 uses
-    * (`GlobalStateConverter.writeCurrencyInfo`), PLUS the `LastIncrementalCurrencySnapshots` fieldId-5 key. This is exactly the on-disk shape
-    * `accept()`'s `priorLastCurrencySnapshots` build reads back: a present fieldId-5 incremental ⇒ the `Right` arm, with the info
+    * (`GlobalStateConverter.writeCurrencyInfo`), PLUS the `LastIncrementalCurrencySnapshots` fieldId-5 key. This is exactly the on-disk
+    * shape `accept()`'s `priorLastCurrencySnapshots` build reads back: a present fieldId-5 incremental ⇒ the `Right` arm, with the info
     * reconstructed from the unrolled `Mg*` prefix.
     */
   private def writeRightArm(
@@ -282,9 +290,9 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       store <- MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
     } yield store
 
-  /** Seed the BASE store directly with: the Right-arm info (`basePrior`) for `mg`, the fieldId-5 incremental, and the `LastCurrencySnapshots`
-    * active-address index marking `mg` (so `accept()`'s `priorLastCurrencySnapshots` keyset includes it). Returns the round-tripped base
-    * prior the GSAM will actually read back, so the producer diff is cut over the BYTE-IDENTICAL prior.
+  /** Seed the BASE store directly with: the Right-arm info (`basePrior`) for `mg`, the fieldId-5 incremental, and the
+    * `LastCurrencySnapshots` active-address index marking `mg` (so `accept()`'s `priorLastCurrencySnapshots` keyset includes it). Returns
+    * the round-tripped base prior the GSAM will actually read back, so the producer diff is cut over the BYTE-IDENTICAL prior.
     */
   private def seedBaseAndRoundTrip(
     store: MptStore[IO, GlobalStateKey],
@@ -345,11 +353,15 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   // ============================================================================
 
   /** A processor whose `processCurrencySnapshots` emits, per adopted MG, a single `(binary, Some(Right((inc, seedInfo))))` pair. The GSAM
-    * adopt path then sees `calculatedCurrencyState(mg) = Right((inc, seedInfo))` (so `derivedState.isLeft == false` and the apply-and-verify
-    * runs with `lastIncremental = inc`), and OVERRIDES `seedInfo` with the verified `reconstructInfoFromDiff(priorInfoOf(mg), diff)`. The
-    * base-path `process` is never load-bearing here (sharded MGs are filtered out by CHANGE-3; we pass no raw scEvents).
+    * adopt path then sees `calculatedCurrencyState(mg) = Right((inc, seedInfo))` (so `derivedState.isLeft == false` and the
+    * apply-and-verify runs with `lastIncremental = inc`), and OVERRIDES `seedInfo` with the verified
+    * `reconstructInfoFromDiff(priorInfoOf(mg), diff)`. The base-path `process` is never load-bearing here (sharded MGs are filtered out by
+    * CHANGE-3; we pass no raw scEvents).
     */
-  private def derivingProcessor(inc: Signed[CurrencyIncrementalSnapshot], seedInfo: CurrencySnapshotInfo): GlobalSnapshotStateChannelEventsProcessor[IO] =
+  private def derivingProcessor(
+    inc: Signed[CurrencyIncrementalSnapshot],
+    seedInfo: CurrencySnapshotInfo
+  ): GlobalSnapshotStateChannelEventsProcessor[IO] =
     new GlobalSnapshotStateChannelEventsProcessor[IO] {
       override def process(
         snapshotOrdinal: SnapshotOrdinal,
@@ -578,7 +590,9 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
         epochProgress: EpochProgress
       )(implicit hasher: Hasher[IO]): IO[SortedMap[priceOracle.TokenPair, priceOracle.PriceRecord]] =
         SortedMap.empty[priceOracle.TokenPair, priceOracle.PriceRecord].pure[IO]
-      override def materializePriceStateFromMpt(implicit hasher: Hasher[IO]): IO[SortedMap[priceOracle.TokenPair, priceOracle.PriceRecord]] =
+      override def materializePriceStateFromMpt(
+        implicit hasher: Hasher[IO]
+      ): IO[SortedMap[priceOracle.TokenPair, priceOracle.PriceRecord]] =
         SortedMap.empty[priceOracle.TokenPair, priceOracle.PriceRecord].pure[IO]
     }
 
@@ -736,45 +750,53 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   }
 
   // ============================================================================
-  // (A) THE SPINE — RED-on-HEAD-by-design: branch > base ⇒ MG DROPPED.
+  // (A) THE SPINE — S1 GREEN guard: branch > base, the follower base-anchors its apply-prior AND its currency write ⇒ MG ADOPTED.
   // ============================================================================
 
-  test("(A) SPINE [RED-on-HEAD by design]: MG past first-incremental, branch != base, committee diff cut over BASE ⇒ MG is DROPPED") { res =>
-    implicit val (h, sp, j) = res
-    for {
-      store <- freshStore
-      // Constraint 1 (Right-arm-with-diff): seed the FINALIZED BASE with the MG's prior currency info (`basePriorRT`).
-      basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
-      // Producer-truth: diff cut over the BASE prior; attested root over `nextInfo`. (reconstructInfoFromDiff(basePriorRT, diff) === next.)
-      truth <- producerTruth(mg, inc, basePriorRT, nextInfo)
-      (wireDiff, attestedRoot) = truth
-      checkpoint = mkRightArmCheckpoint(mg, headBinary, wireDiff, attestedRoot)
-      // Constraint 2 (branch > base): commit an INTERVENING incremental+info into a child branch so its reader returns `branchPrior`.
-      ob <- mkOverlayWithBranch(store, mg, inc, basePriorRT, branchPrior = Some(branchPriorRaw))
-      (overlay, childTip) = ob
-      // The round-tripped branch prior the follower's `priorInfoOf` will actually read at `parentTip = childTip`.
-      branchPriorRT <- GlobalStateConverter.reconstructCurrencyInfoFrom[IO](mg, CurrencyInfoMptAdapters.readerFor(GlobalStateReader.fromOverlay[IO](overlay, childTip)))
-      // Producer-truth at the PRIOR level (the §4 mechanism in isolation): recompute the PIN-1 root the GSAM follower would, over each prior.
-      recomputedOverBase <- followerRecomputeRoot(mg, inc, basePriorRT, wireDiff)
-      recomputedOverBranch <- followerRecomputeRoot(mg, inc, branchPriorRT, wireDiff)
-      callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
-      mgr <- mkManager(overlay, derivingProcessor(inc, basePriorRT), StubAcceptanceManager(callsRef))
-      // The follower APPLY-prior reads the CHILD BRANCH (parentTip = childTip), which holds `branchPrior` != `basePrior`.
-      gsi <- runAccept(mgr, checkpoint, parentTip = childTip, lastSnapshotInfo = gsiWith(mg, inc, branchPriorRaw))
-      calls <- callsRef.get
-    } yield
-      expect.all(
-        // The checkpoint was verified (the adopt path ran) ...
-        calls.size == 1,
-        // §4 mechanism, in isolation: the committee cut the diff over BASE, so recompute-over-base === attested (would adopt), but
-        // recompute-over-BRANCH (what the HEAD follower actually does at parentTip) != attested (drops). This is the asymmetry's source.
-        recomputedOverBase == attestedRoot,
-        recomputedOverBranch != attestedRoot,
-        // ... and end-to-end the MG was DROPPED — its committed currency did NOT advance to `nextInfo`. This asserts the CURRENT (buggy)
-        // behavior: reconstruct(branchPrior, diff_over_base) != attestedRoot ⇒ the `[ACCEPTANCE/ADOPT-VERIFY] ... MISMATCH ... DROPPING`
-        // path fires. RED-on-HEAD-by-design: documents the run-24→27 disease (§4 third-reference violation). S1+S2 flip this to (C)'s adopt.
-        !advancedTo(gsi, mg, nextInfo)
-      )
+  // Was RED-on-HEAD-by-design (it asserted the run-24→27 DROP); after S1 the follower reads BOTH its apply-prior info and its currency-write
+  // removal-prior from the FINALIZED BASE, so an MG whose branch runs ahead of base now reconstructs `reconstructInfoFromDiff(basePrior,
+  // diff_over_base)` === attested and ADOPTS. The prior-level §4-MECHANISM asserts are KEPT verbatim — they prove the follower reads the
+  // base DESPITE the branch diverging: recompute-over-BASE === attested (adopt) while recompute-over-BRANCH != attested (the drop the HEAD
+  // code made). The end-to-end assert FLIPS from `!advancedTo` to `advancedTo`: this is now the permanent S1 regression guard that the
+  // base-anchored follower converges where the branch-anchored follower forked.
+  test("(A) SPINE [S1 GREEN]: MG past first-incremental, branch != base, follower base-anchors apply-prior + currency write ⇒ MG ADOPTS") {
+    res =>
+      implicit val (h, sp, j) = res
+      for {
+        store <- freshStore
+        // Constraint 1 (Right-arm-with-diff): seed the FINALIZED BASE with the MG's prior currency info (`basePriorRT`).
+        basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
+        // Producer-truth: diff cut over the BASE prior; attested root over `nextInfo`. (reconstructInfoFromDiff(basePriorRT, diff) === next.)
+        truth <- producerTruth(mg, inc, basePriorRT, nextInfo)
+        (wireDiff, attestedRoot) = truth
+        checkpoint = mkRightArmCheckpoint(mg, headBinary, wireDiff, attestedRoot)
+        // Constraint 2 (branch > base): commit an INTERVENING incremental+info into a child branch so its reader returns `branchPrior`.
+        ob <- mkOverlayWithBranch(store, mg, inc, basePriorRT, branchPrior = Some(branchPriorRaw))
+        (overlay, childTip) = ob
+        // The round-tripped branch prior the follower's `priorInfoOf` WOULD read at `parentTip = childTip` if it anchored on the branch.
+        branchPriorRT <- GlobalStateConverter
+          .reconstructCurrencyInfoFrom[IO](mg, CurrencyInfoMptAdapters.readerFor(GlobalStateReader.fromOverlay[IO](overlay, childTip)))
+        // Producer-truth at the PRIOR level (the §4 mechanism in isolation): recompute the PIN-1 root the GSAM follower would, over each prior.
+        recomputedOverBase <- followerRecomputeRoot(mg, inc, basePriorRT, wireDiff)
+        recomputedOverBranch <- followerRecomputeRoot(mg, inc, branchPriorRT, wireDiff)
+        callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+        mgr <- mkManager(overlay, derivingProcessor(inc, basePriorRT), StubAcceptanceManager(callsRef))
+        // The follower runs at `parentTip = childTip` (branch > base); S1 makes its apply-prior + write read the BASE despite that.
+        gsi <- runAccept(mgr, checkpoint, parentTip = childTip, lastSnapshotInfo = gsiWith(mg, inc, branchPriorRaw))
+        calls <- callsRef.get
+      } yield
+        expect.all(
+          // The checkpoint was verified (the adopt path ran) ...
+          calls.size == 1,
+          // §4 mechanism, in isolation (KEPT from the RED spine): the committee cut the diff over BASE, so recompute-over-base === attested
+          // (adopt), but recompute-over-BRANCH != attested (the drop the HEAD follower made). This proves the asymmetry is branch-vs-base.
+          recomputedOverBase == attestedRoot,
+          recomputedOverBranch != attestedRoot,
+          // ... and end-to-end the MG ADOPTED — its committed currency ADVANCED to `nextInfo`. The follower base-anchored its apply-prior
+          // (reconstruct over BASE === attested) AND its currency write (the `Mg*` removal set anchored at base, so `postBytes ==`
+          // verify-replay `expectedBytes`, no #107 writer divergence). This is the S1 fix: diff-prior == apply-prior == write, all on base.
+          advancedTo(gsi, mg, nextInfo)
+        )
   }
 
   // ============================================================================
@@ -806,16 +828,16 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   }
 
   // ============================================================================
-  // (C) THE CONVERGENCE TARGET — pending: should ADOPT once the apply-prior reads base (S1+S2). Placeholder, not a failure.
+  // (C) THE CONVERGENCE TARGET — now GREEN under S1: a minimal branch > base adopt, asserted purely end-to-end.
   // ============================================================================
 
-  // Same construction as (A) (branch > base, diff cut over base), but asserts the POST-FIX outcome: the MG ADOPTS. On HEAD this would FAIL
-  // (the apply-prior reads the branch ⇒ mismatch ⇒ drop — exactly what (A) asserts as current behavior), so it is marked `.ignore` to be a
-  // forward-looking placeholder rather than a red test. After S1 (the follower apply-prior reads the finalized base for sharded MGs) + S2
-  // (the base-anchored re-including producer window), the follower reconstructs `reconstructInfoFromDiff(basePrior, diff)` for ANY branch
-  // depth ⇒ recompute === attested ⇒ ADOPT, and this `.ignore` flips to a `test(...)` as the S1/S2 green gate.
+  // Same construction as (A) (branch > base, diff cut over base), asserting the POST-S1 outcome: the MG ADOPTS. On HEAD this FAILED (the
+  // apply-prior read the branch ⇒ mismatch ⇒ drop), so it was `.ignore`d as a forward-looking placeholder. After S1 — the follower reads
+  // BOTH its apply-prior info AND its currency-write removal-prior from the finalized base for sharded MGs — the follower reconstructs
+  // `reconstructInfoFromDiff(basePrior, diff)` === attested at any branch depth (at pipelineDepth=1; deeper windows are S2's producer job)
+  // ⇒ recompute === attested ⇒ ADOPT, with no #107 writer divergence. Un-ignored as the S1 green gate (a leaner end-to-end twin of (A)).
   test(
-    "(C) CONVERGENCE [pending — S1+S2 green target]: branch != base SHOULD still ADOPT once the follower apply-prior reads the finalized base".ignore
+    "(C) CONVERGENCE [S1 GREEN]: branch != base ADOPTS now that the follower apply-prior + currency write read the finalized base"
   ) { res =>
     implicit val (h, sp, j) = res
     for {
@@ -829,6 +851,6 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
       mgr <- mkManager(overlay, derivingProcessor(inc, basePriorRT), StubAcceptanceManager(callsRef))
       gsi <- runAccept(mgr, checkpoint, parentTip = childTip, lastSnapshotInfo = gsiWith(mg, inc, branchPriorRaw))
-    } yield expect(advancedTo(gsi, mg, nextInfo)) // GREEN only after S1+S2 — RED on HEAD (hence `.ignore`).
+    } yield expect(advancedTo(gsi, mg, nextInfo)) // GREEN under S1 (base-anchored follower); was RED on HEAD (branch-anchored).
   }
 }

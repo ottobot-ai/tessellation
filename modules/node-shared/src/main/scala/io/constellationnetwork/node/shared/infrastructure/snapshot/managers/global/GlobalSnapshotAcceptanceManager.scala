@@ -1558,6 +1558,15 @@ object GlobalSnapshotAcceptanceManager {
                 // accept() reads/writes it at a time.
                 _ <- branchTipRef.set(parentTip)
 
+                // S1 (VERSION-MODEL §4): the sharded-MG follower reads BOTH its apply-prior INFO and its currency-WRITE removal-prior from
+                // the FINALIZED BASE (`mptStore = overlay.base`), not the branch-aware `mpt`, so `diff-prior == apply-prior == write` all
+                // anchor at the same finalized base the committee cut the diff over. Hoisted here (depends only on the constructor
+                // `shardingConfig`/`shardAssignment` + the base store) so the SAME predicate + base reader feed the apply-prior split
+                // (`priorLastCurrencySnapshots`) AND the write (`applyStateChanges`). At numShards=1 / pipelineDepth=1, base==branch, so
+                // every read+write is byte-identical to the branch path (production-safety).
+                shardedInfoMode = shardingConfig.exists(_.numShards > 1) && shardAssignment.isDefined
+                baseCurrencyInfoReader = GlobalStateConverter.CurrencyInfoMpt.fromMptStore[F](mptStore)
+
                 (allowSpendBlockAcceptanceResult, tokenLockBlockAcceptanceResult) <-
                   acceptAllowSpendAndTokenLockBlocks(
                     ordinal,
@@ -1739,6 +1748,15 @@ object GlobalSnapshotAcceptanceManager {
                     // metagraph with no fieldId-5 incremental has no currency state → emit nothing and let the GSI fallback below cover
                     // it. Reconstruction is `F`, so the per-address build is a `flatTraverse`.
                     infoReader = CurrencyInfoMptAdapters.mptFor(mpt)
+                    // S1 (VERSION-MODEL §4): for sharded MGs the apply-prior INFO must read the FINALIZED BASE — mirroring the
+                    // producer's diff-prior `getCurrencySnapshotInfo` over `fromMptStore` (ShardCheckpointWiring) — NOT the branch
+                    // (`mpt`). The committee cuts the per-MG diff over the finalized base; reconstructing the apply-prior over the
+                    // branch makes `reconstructInfoFromDiff(branchPrior, diff_over_base)` diverge from the committee-attested root
+                    // for an MG whose branch is ahead of base, wrongly DROPPING it (the §4 violation pinned by
+                    // GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite). At numShards=1 / pipelineDepth=1 base==branch ⇒ no-op.
+                    // Structural diff-prior==apply-prior alignment; sound at pipelineDepth=1 until S2 base-anchors the window.
+                    // `shardedInfoMode` + `baseCurrencyInfoReader` are hoisted at the accept() top (after the parentTip checkout).
+                    baseInfoReader = baseCurrencyInfoReader
                     mptEntries <- addrList.flatTraverse { addr =>
                       val leftKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots)
                       val incKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
@@ -1749,7 +1767,7 @@ object GlobalSnapshotAcceptanceManager {
                           incs.get(incKey) match {
                             case Some(inc) =>
                               GlobalStateConverter
-                                .reconstructCurrencyInfoFrom[F](addr, infoReader)
+                                .reconstructCurrencyInfoFrom[F](addr, if (shardedInfoMode) baseInfoReader else infoReader)
                                 .map(info => List(addr -> (Right((inc, info)): StateChannelAcceptanceResult.CurrencySnapshotWithState)))
                             case None =>
                               Async[F].pure(List.empty[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)])
@@ -2480,7 +2498,13 @@ object GlobalSnapshotAcceptanceManager {
                 // per-branch ChangeSet). Field/insert order, sidecar maintenance and removal-key
                 // derivation mirror legacy `mptStore.syncFromStateChanges` byte-for-byte —
                 // `GsamWritePathParitySuite` (#107) is the regression contract.
-                _ <- AcceptanceMptStateChanges.applyStateChanges[F](mpt, stateChangesAccumulator)
+                // S1: for sharded MGs, anchor the per-MG currency-WRITE removal-prior at the FINALIZED BASE (the same base the apply-prior
+                // above read), so `writeCurrencyInfo`'s `Mg*` removal set matches what the accumulator-delta verify-replay expects (which
+                // carries NO `Mg*` info removals). Without this, a branch-only `Mg*` key would be removed from `postBytes` by the write but
+                // retained in the replay's `expectedBytes`, tripping the #107 writer self-check at branch>base. At branch==base (numShards=1 /
+                // pipelineDepth=1) base==branch, so the removal set — and every written byte — is identical to the default branch path.
+                currencyWriteRemovalPrior = if (shardedInfoMode) Some(baseCurrencyInfoReader) else None
+                _ <- AcceptanceMptStateChanges.applyStateChanges[F](mpt, stateChangesAccumulator, currencyWriteRemovalPrior)
                 // Pull the post-write byte view from the overlay (Phase J). Under Passthrough this
                 // collapses to `overlay.base.allEntriesAsBytes` (writes already committed inline);
                 // under MultiBranch it composes parent-chain pending entries with this handle's
