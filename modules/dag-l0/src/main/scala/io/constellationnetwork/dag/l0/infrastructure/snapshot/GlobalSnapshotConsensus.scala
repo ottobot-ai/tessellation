@@ -1440,6 +1440,15 @@ object GlobalSnapshotConsensus {
                     .make[F](
                       shardId = shardId,
                       chainStore = entry.chainStore,
+                      // S2 — BASE-ANCHORED window (VERSION-MODEL §4): the producer's `chainLinkOrder` anchors each MG's binary window on the
+                      // gl0 DEPTH-K-FINALIZED base's per-MG `lastStateChannelSnapshotHashes` — the SAME finalized base `derivePerMgState`'s
+                      // diff-prior reads (`fromMptStore(mptStore)` below). So window-anchor == diff-prior == follower apply-prior (S1), all on
+                      // the finalized base; the window RE-INCLUDES base->adopted binaries at pipelineDepth>1 and advances on gl0 finalization
+                      // (NOT the bestTip-derived `chainStore.perMgTip`, which ran ahead of base — the run-24..27 §4 window-anchor violation).
+                      finalizedBasePerMgTip = {
+                        import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax.MptStoreReadOps
+                        mptStore.getAllLastStateChannelSnapshotHashes
+                      },
                       slotLeader = shardSlotLeader,
                       publisher = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointPublisher
                         .sidecar[F](sidecarClient),

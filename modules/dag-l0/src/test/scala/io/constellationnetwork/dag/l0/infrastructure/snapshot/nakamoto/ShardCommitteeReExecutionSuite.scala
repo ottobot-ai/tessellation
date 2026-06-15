@@ -136,6 +136,7 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
     ShardCheckpointProducer.make[IO](
       shardId = shardZero,
       chainStore = chainStore,
+      finalizedBasePerMgTip = chainStore.perMgTip, // re-exec suite asserts perMgTip-anchored chain-linking (pre-S2 parity)
       slotLeader = ssl,
       publisher = ShardCheckpointPublisher.noop[IO],
       selfPeerId = PeerId.fromPublic(keyPair.getPublic),

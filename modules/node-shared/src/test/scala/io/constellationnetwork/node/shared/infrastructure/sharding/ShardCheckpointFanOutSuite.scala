@@ -159,6 +159,7 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
     ShardCheckpointProducer.make[IO](
       shardId = shardId,
       chainStore = chainStore,
+      finalizedBasePerMgTip = chainStore.perMgTip, // fan-out tests assert perMgTip-anchored chain-linking (pre-S2 parity)
       slotLeader = ssl,
       publisher = ShardCheckpointPublisher.noop[IO],
       selfPeerId = PeerId.fromPublic(keyPair.getPublic),

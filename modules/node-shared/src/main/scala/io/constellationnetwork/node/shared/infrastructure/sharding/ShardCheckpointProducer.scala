@@ -283,6 +283,15 @@ object ShardCheckpointProducer {
   def make[F[_]: Async: Hasher: SecurityProvider](
     shardId: ShardId,
     chainStore: ShardChainStore[F],
+    /** '''S2 — BASE-ANCHORED window (VERSION-MODEL §4).''' Per-MG gl0 DEPTH-K-FINALIZED SC tip — the finalized base's
+      * `lastStateChannelSnapshotHashes` (`mptStore.getAllLastStateChannelSnapshotHashes`), the SAME finalized base `derivePerMgState`'s
+      * diff-prior reads. `chainLinkOrder` anchors each MG's binary window here (NOT `chainStore.perMgTip`, which is bestTip-derived and
+      * runs AHEAD of base at pipelineDepth>1), so the window covers base->latest — RE-INCLUDING adopted-but-unfinalized binaries — and the
+      * producer's window-anchor, its diff-prior, and the follower's apply-prior (S1) all read the same finalized base. The window-anchor
+      * advances on gl0 depth-k FINALIZATION (reorg-safe), dissolving the perMgTip self-referential fixed point. `chainStore.perMgTip` stays
+      * available for legacy chain-link admission elsewhere; it is NO LONGER the producer's window anchor.
+      */
+    finalizedBasePerMgTip: F[SortedMap[Address, Hash]],
     slotLeader: ShardSlotLeader[F],
     publisher: ShardCheckpointPublisher[F],
     selfPeerId: PeerId,
@@ -341,8 +350,8 @@ object ShardCheckpointProducer {
           // (parent = Hash.empty, parent ord = Genesis). `perMgTip` is derived from the SAME best tip so the chain-link anchor and
           // the parent envelope are read consistently.
           tickRef.updateAndGet(_ + 1L).flatMap { tick =>
-            (chainStore.bestTip, chainStore.perMgTip, lastAdoptedOrd, heldRef.get).tupled.flatMap {
-              case (bestTipOpt, perMgTip, adoptedOrdOpt, heldOpt) =>
+            (chainStore.bestTip, finalizedBasePerMgTip, lastAdoptedOrd, heldRef.get).tupled.flatMap {
+              case (bestTipOpt, windowAnchorTips, adoptedOrdOpt, heldOpt) =>
                 val parentHash: Hash = bestTipOpt.map(_.hash).getOrElse(Hash.empty)
                 val nextShardOrdinal: ShardOrdinal =
                   bestTipOpt.map(_.signed.value.shardOrdinal).getOrElse(ShardOrdinal.Genesis).next
@@ -396,7 +405,7 @@ object ShardCheckpointProducer {
                       else
                         produceInner(
                           bestTipOpt,
-                          perMgTip,
+                          windowAnchorTips,
                           pendingSnapshots,
                           gl0AnchorOrdinal,
                           epoch,
@@ -414,7 +423,7 @@ object ShardCheckpointProducer {
 
       private def produceInner(
         bestTipOpt: Option[io.constellationnetwork.security.Hashed[ShardCheckpoint]],
-        perMgTip: SortedMap[Address, Hash],
+        windowAnchorTips: SortedMap[Address, Hash],
         pendingSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         gl0AnchorOrdinal: SnapshotOrdinal,
         epoch: EtaPeriod,
@@ -435,7 +444,7 @@ object ShardCheckpointProducer {
         // are omitted; if NOTHING chains off the tip, there is nothing to checkpoint → return None (don't emit an empty checkpoint
         // and don't burn the slot lottery on it). This is the inversion's core: the admissible set comes from the shard's prior
         // checkpoint, not gl0's post-chain-link `stateChannelSnapshots`.
-        chainLinkOrder(pendingSnapshots, perMgTip).flatMap { orderedSnapshots =>
+        chainLinkOrder(pendingSnapshots, windowAnchorTips).flatMap { orderedSnapshots =>
           if (orderedSnapshots.isEmpty)
             logger
               .info(
@@ -443,7 +452,7 @@ object ShardCheckpointProducer {
                   s"pendingMgs=${pendingSnapshots.size} " +
                   s"pendingCounts=${pendingSnapshots.toList.map { case (mg, nel) => s"${mg.value.value.take(8)}:${nel.size}" }
                       .mkString(",")} " +
-                  s"tips=${perMgTip.toList.map { case (mg, h) => s"${mg.value.value.take(8)}:${h.value.take(8)}" }.mkString(",")}"
+                  s"baseTips=${windowAnchorTips.toList.map { case (mg, h) => s"${mg.value.value.take(8)}:${h.value.take(8)}" }.mkString(",")}"
               )
               .as(None: Option[Signed[ShardCheckpoint]])
           else
@@ -544,9 +553,9 @@ object ShardCheckpointProducer {
         * `perMetagraphArtifacts`, `perMetagraphSyncDataDelta`) are left empty — those per-MG derivations migrate from gl0 to the shard in a
         * later slice.
         *
-        * '''Input is pre-ordered (R-2).''' `orderedSnapshots` has already been chain-link-ordered by [[chainLinkOrder]] off the shard's own
-        * `perMgTip`, so each MG's `NonEmptyList` is strictly parent→child. `derivePerMgState` is therefore re-executed over a correct
-        * chain, and `includedSnapshots` carries the SAME ordered chain gl0 adopts / re-derives.
+        * '''Input is pre-ordered (R-2).''' `orderedSnapshots` has already been chain-link-ordered by [[chainLinkOrder]] off the gl0
+        * FINALIZED-base per-MG tip (S2), so each MG's `NonEmptyList` is strictly parent→child from base->latest. `derivePerMgState` is
+        * therefore re-executed over a correct chain, and `includedSnapshots` carries the SAME ordered chain gl0 adopts / re-derives.
         */
       private def assembleDelta(
         orderedSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
@@ -595,14 +604,16 @@ object ShardCheckpointProducer {
           }
         }
 
-      /** Chain-link-order the buffered binaries off the shard's own prior-checkpoint per-MG tip (EXECUTION-SHARDING design R-2).
+      /** Chain-link-order the buffered binaries off the gl0 DEPTH-K-FINALIZED-base per-MG tip (S2; EXECUTION-SHARDING design R-2).
         *
-        * For each metagraph, anchored on `perMgTip.getOrElse(mg, Hash.empty)` (genesis = `Hash.empty`), unfold the longest parent→child
-        * chain over `pendingSnapshots(mg)`: the first binary must carry `lastSnapshotHash == anchor`, the next must reference the first's
-        * `Hasher[F]` hash, and so on. This is the SAME unfold `GlobalSnapshotStateChannelAcceptanceManager.selectStateChannels` runs, but
-        * (a) on raw `Signed[StateChannelSnapshotBinary]` rather than gl0's `StateChannelOutputWithHash`, and (b) anchored on the SHARD'S
-        * own tip, NOT gl0's `lastStateChannelSnapshotHashes`. The node-local firstSeen / pull-delay registry is intentionally NOT brought
-        * over — single leader, no multi-proposer convergence needed (see [[ShardBinaryBuffer]] determinism note).
+        * For each metagraph, anchored on `windowAnchorTips.getOrElse(mg, Hash.empty)` (genesis = `Hash.empty`), unfold the longest
+        * parent→child chain over `pendingSnapshots(mg)`: the first binary must carry `lastSnapshotHash == anchor`, the next must reference
+        * the first's `Hasher[F]` hash, and so on. This is the SAME unfold `GlobalSnapshotStateChannelAcceptanceManager.selectStateChannels`
+        * runs, but (a) on raw `Signed[StateChannelSnapshotBinary]` rather than gl0's `StateChannelOutputWithHash`, and (b) anchored on
+        * gl0's FINALIZED-base `lastStateChannelSnapshotHashes` (S2 — VERSION-MODEL §4), so the window covers base->latest and RE-INCLUDES
+        * adopted-but-unfinalized binaries. (Before S2 the anchor was the bestTip-derived shard `perMgTip`, which ran AHEAD of base at
+        * pipelineDepth>1 and skipped the base->adopted span — the §4 window-anchor violation.) The node-local firstSeen / pull-delay
+        * registry is intentionally NOT brought over — single leader, no multi-proposer convergence needed (see [[ShardBinaryBuffer]]).
         *
         * A metagraph with no binary chaining off its tip this round is OMITTED from the result. When multiple binaries share the same
         * parent (honest metagraphs produce a linear chain, so this is rare), the one with the most signatures wins, ties broken by lowest
@@ -610,12 +621,12 @@ object ShardCheckpointProducer {
         */
       private def chainLinkOrder(
         pendingSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-        perMgTip: SortedMap[Address, Hash]
+        windowAnchorTips: SortedMap[Address, Hash]
       ): F[SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]] = {
         import io.constellationnetwork.security.signature.Signed.SignedOps
         pendingSnapshots.toList.traverse {
           case (mg, binaries) =>
-            val anchor = perMgTip.getOrElse(mg, Hash.empty)
+            val anchor = windowAnchorTips.getOrElse(mg, Hash.empty)
             // Hash each candidate once, then group by the parent it references (its `lastSnapshotHash`).
             binaries.toList
               .traverse(b => SignedOps(b).toHashed[F].map(h => (h.hash, b)))

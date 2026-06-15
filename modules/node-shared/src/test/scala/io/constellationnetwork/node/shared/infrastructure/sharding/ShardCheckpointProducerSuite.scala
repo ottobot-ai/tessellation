@@ -220,11 +220,15 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     shardEta: Array[Byte],
     derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Option[(Hash, ChangeSet)]] =
       deterministicDerive,
-    republishEveryTicks: Int = 1
+    republishEveryTicks: Int = 1,
+    // S2: the finalized-base per-MG window anchor. `None` ⇒ the shard's `perMgTip` (so the pre-S2 cases keep their perMgTip-anchored
+    // behavior); the dedicated base-anchored case passes a DISTINCT (lower) tip to prove the window re-includes base->latest.
+    finalizedBaseTip: Option[IO[SortedMap[Address, Hash]]] = None
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     ShardCheckpointProducer.make[IO](
       shardId = shardZero,
       chainStore = rig.chainStore,
+      finalizedBasePerMgTip = finalizedBaseTip.getOrElse(rig.chainStore.perMgTip),
       slotLeader = ssl,
       publisher = rig.publisher,
       selfPeerId = rig.selfPeerId,
@@ -355,6 +359,66 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         firstCp.value.parentCheckpointHash == Hash.empty, // genesis
         secondCp.value.parentCheckpointHash == firstHash,
         secondCp.value.shardOrdinal == ShardOrdinal(2L)
+      )
+  }
+
+  // ===========================================================================
+  // Test 4b — S2 BASE-ANCHORED window (VERSION-MODEL §4): chainLinkOrder anchors
+  // on the gl0 FINALIZED-base per-MG tip (not the bestTip-derived perMgTip), so
+  // the window covers base->latest, RE-INCLUDING adopted-but-unfinalized binaries.
+  // ===========================================================================
+
+  test("S2 base-anchored window: anchors on finalizedBasePerMgTip (NOT perMgTip) ⇒ re-includes base->latest binaries") { res =>
+    implicit val (h, sp, ssl) = res
+    import io.constellationnetwork.security.signature.Signed.SignedOps
+    for {
+      rig <- freshRig
+      gl0Eta = randomGl0Eta()
+      shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
+      mg = mkAddress("mg-0")
+      // Chain b0 (off genesis) -> b1 (off b0); both buffered in round 1.
+      b0 = mkSignedBinary("mg-0", 0, parent = Hash.empty)
+      b0Hash <- SignedOps(b0).toHashed[IO].map(_.hash)
+      b1 = mkSignedBinary("mg-0", 1, parent = b0Hash)
+      // Producer with the FINALIZED base STUCK at genesis (empty ⇒ Hash.empty anchor) — DISTINCT from (below) perMgTip after round 0.
+      producer <- makeProducer(
+        ssl,
+        rig,
+        Ratio.One,
+        shardEta,
+        finalizedBaseTip = Some(IO.pure(SortedMap.empty[Address, Hash](Address.OrderingInstance)))
+      )
+      // Round 0: mint a genesis checkpoint including b0, insert it ⇒ chainStore.perMgTip = hash(b0).
+      first <- tryProduceUntilSome(
+        producer = producer,
+        startOrd = 2000L,
+        epoch = EtaPeriod(0L),
+        maxAttempts = 100,
+        committee = Set(rig.selfPeerId),
+        pending = SortedMap(mg -> NonEmptyList.of(b0))(Address.OrderingInstance)
+      )
+      firstCp <- IO.fromOption(first)(new RuntimeException("produce-1 should win at σ=1 within 100 attempts"))
+      _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty, slot = 1L)
+      perMgTipAfter <- rig.chainStore.perMgTip
+      // Round 1: the buffer RE-INCLUDES b0 (already at perMgTip) plus the new b1. A perMgTip-anchored producer (anchor = hash(b0)) would
+      // unfold ONLY [b1]; the base-anchored producer (anchor = genesis Hash.empty) unfolds [b0, b1] — re-including b0.
+      second <- tryProduceUntilSome(
+        producer = producer,
+        startOrd = 2100L,
+        epoch = EtaPeriod(0L),
+        maxAttempts = 100,
+        committee = Set(rig.selfPeerId),
+        pending = SortedMap(mg -> NonEmptyList.of(b0, b1))(Address.OrderingInstance)
+      )
+      secondCp <- IO.fromOption(second)(new RuntimeException("produce-2 should win at σ=1 within 100 attempts"))
+      included = secondCp.value.derivedStateDelta.includedSnapshots.get(mg).map(_.toList).getOrElse(Nil)
+    } yield
+      expect.all(
+        // perMgTip advanced to hash(b0) after round 0 — proves the base tip (genesis) we passed is DISTINCT from perMgTip.
+        perMgTipAfter.get(mg).contains(b0Hash),
+        // Base-anchored window RE-INCLUDES b0 AND b1 (perMgTip-anchoring at hash(b0) would yield ONLY b1).
+        included.size == 2,
+        included.map(_.value.lastSnapshotHash) == List(Hash.empty, b0Hash)
       )
   }
 
