@@ -175,12 +175,15 @@ object ShardCheckpointGl0AcceptanceManager {
     *   on the strength of the Ed25519 signature alone (Slice 10 will introduce runtime registration; this carve-out covers the bootstrap
     *   window).
     * @param reExecuteDerivation
-    *   `(metagraphAddress, includedChain) => F[Hash]`. Called only on the T_depth1-only path. Production wiring (S3) passes the closure
-    *   that re-runs the existing `GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot` (the SAME currency derivation gl0 uses for
-    *   metagraph snapshots) over the metagraph's full included SC-binary chain to compute the local per-MG MPT root, then compares it
-    *   byte-for-byte against the committee-signed `perMetagraphMptRoots(mg)`. This is the committee re-execution heart of S3 — an
-    *   attestation means "I independently re-ran this metagraph's derivation and got result R". For tests: stub the callback to return a
-    *   known hash (matching or not matching the checkpoint delta) per scenario.
+    *   `(metagraphAddress, includedChain, gl0AnchorOrdinal) => F[Hash]`. Called only on the sub-quorum `T_depth1`-only failover
+    *   ([[reExecPath]]). Production wiring (STEP 6) passes the closure that re-runs `ShardCheckpointWiring.reExecDerivationWithDiff` (the
+    *   SAME committee derivation the producer uses, seeded from this node's adopted `S(N)`) and returns its per-MG root — the PIN-1
+    *   `Hasher.hash((incrementalRoot, infoRoot))` encoding — which is then compared byte-for-byte against the committee-signed
+    *   `perMetagraphMptRoots(mg)` (the SAME encoding). The `ChangeSet` half of the derivation is discarded here (this Byzantine failover
+    *   only needs the Hash to decide accept/slash; the authoritative apply-and-verify of the carried diff happens in
+    *   `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`). An attestation means "I independently re-derived this metagraph's
+    *   state and got root R". For tests: stub the callback to return a known hash (matching or not matching the checkpoint root) per
+    *   scenario.
     */
   def make[F[_]: Async: Hasher: SecurityProvider: Metrics](
     finalityTriggers: ShardId => F[Option[ShardFinalityTriggers[F]]],

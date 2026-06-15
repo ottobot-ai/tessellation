@@ -250,9 +250,11 @@ object StateChannel {
             canonical <- services.globalL0.pullLatestSnapshot
             (canonicalSnapshot, canonicalState) = canonical
             _ <- ensureMptInitialized(canonicalSnapshot.ordinal, canonicalState)
-            recomputedRoot <- sharedStorages.mptStore.underlying
-              .getRootHashForOrdinal(canonicalSnapshot.ordinal)
-              .map(_.map(_.value))
+            // The signed global `mptRoot` excludes path-dependent SystemNamespace sidecars
+            // (`GlobalSnapshotInfo.mptStateProofFromBytes`); recompute the rebuilt store's root sidecar-free
+            // (NOT `getRootHashForOrdinal`, which includes them) so this resync gate matches the signed root.
+            afterBytes <- sharedStorages.mptStore.underlying.entries
+            recomputedRoot <- io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes).map(_.some)
             signedRoot = canonicalSnapshot.signed.value.stateProof.mptRoot
             result <-
               if (recomputedRoot === signedRoot)

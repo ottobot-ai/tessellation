@@ -132,6 +132,7 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   private def mkDelta(mg: Address, binary: Signed[StateChannelSnapshotBinary]): ShardDerivedStateDelta =
     ShardDerivedStateDelta(
       perMetagraphMptRoots = SortedMap(mg -> Hash("11" * 32)),
+      perMetagraphStateDiff = SortedMap.empty,
       includedSnapshots = SortedMap(mg -> NonEmptyList.of(binary)),
       tokenLockBalancesDelta = SortedMap.empty,
       perMetagraphArtifacts = SortedMap.empty,

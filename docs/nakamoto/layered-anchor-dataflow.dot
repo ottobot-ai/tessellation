@@ -1,0 +1,67 @@
+digraph anchor_dataflow {
+  rankdir=TB;
+  nodesep=0.85;
+  ranksep=2.0;
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.20,0.12"];
+  edge [fontname="Helvetica", fontsize=10, arrowsize=0.8];
+
+  // ============ gl0 lane (TOP) ============
+  g95 [label="gl0 95", fillcolor="#D4EDDA"];
+  g96 [label="gl0 96", fillcolor="#D4EDDA"];
+  g97 [label="gl0 97", fillcolor="#D4EDDA", color="#0066CC", penwidth=2.0];
+  gF  [label=<gl0 98 = F<BR/><FONT POINT-SIZE="8">finalized frontier<BR/>→ pending → tip</FONT>>, fillcolor="#FFF3CD", color="#E67E00", penwidth=1.8];
+  { rank=same; g95; g96; g97; gF; }
+  g95 -> g96 -> g97 -> gF [color="#555555", arrowsize=0.5];
+
+  // ============ ml0 lane (MIDDLE) — column-aligned under the gl0 anchors ============
+  cs6 [label="cs6", fillcolor="#E8F4FD"];
+  cs7 [label="cs7", fillcolor="#E8F4FD"];
+  cs8 [label="cs8", fillcolor="#E8F4FD"];
+  { rank=same; cs6; cs7; cs8; }
+  cs6 -> cs7 -> cs8 [color="#555555", arrowsize=0.5];
+  g95 -> cs6 [style=invis];
+  g96 -> cs7 [style=invis];
+  g97 -> cs8 [style=invis];
+  // blue: each currency snapshot's gl0Anchor — short vertical, ONE label
+  cs6 -> g95 [style=dashed, color="#0066CC", constraint=false];
+  cs7 -> g96 [style=dashed, color="#0066CC", constraint=false];
+  cs8 -> g97 [style=dashed, color="#0066CC", fontcolor="#0066CC", constraint=false, label="gl0Anchor\n(fee-cutover only)"];
+
+  // ============ shard checkpoint chain (BOTTOM) — column-aligned under the window ============
+  cpNm1 [label=<<B>cp N−1</B><BR/><FONT POINT-SIZE="9">⟹ S(N−1)</FONT>>, fillcolor="#EDEDED", color="#777777"];
+  cpN   [label=<<B>cp N</B><BR/><FONT POINT-SIZE="9">the diff base<BR/>⟹ S(N) cumulative</FONT>>, fillcolor="#D4EDDA", color="#1a7f37", penwidth=2.0];
+  cpN1  [label=<<B>cp N+1</B> (new)<BR/><FONT POINT-SIZE="9">diff = exec(window) − S(N)<BR/>⟹ S(N+1) = S(N) ⊕ diff</FONT>>, fillcolor="#F0F0F0", color="#333333"];
+  { rank=same; cpNm1; cpN; cpN1; }
+  cpNm1 -> cpN -> cpN1 [color="#555555", arrowsize=0.7];
+  cs6 -> cpNm1 [style=invis];
+  cs7 -> cpN   [style=invis];
+  cs8 -> cpN1  [style=invis];
+
+  // green: ONE arrow up to the window
+  cpN1 -> cs8 [color="#1a7f37", fontcolor="#1a7f37", constraint=false, label="execs the window\n{cs6,cs7,cs8}"];
+  // red: diff base = prior checkpoint's cumulative result (back-arrow within the lane)
+  cpN1 -> cpN [color="#CC0000", fontcolor="#CC0000", penwidth=2.0, constraint=false, label="diff base = S(N)"];
+
+  // chain-link clarifier (plaintext under the chain, no overlap)
+  cl [shape=plaintext, fontsize=9, fontcolor="#555555", label="↑ chain-link: applied strictly in order, hash-pinned (no out-of-order writes)"];
+  cpNm1 -> cl [style=invis];
+
+  // ============ note + legend (bottom, no overlap) ============
+  note [shape=note, style=filled, fillcolor="#FFFFFF", color="#999999", fontsize=10, fontname="Helvetica",
+        label=<<B>What guarantees correctness</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="9">• Cumulative: each diff is taken against the FULL prior result S(N) ⇒ allow-spends / token-locks accumulate.<BR ALIGN="LEFT"/>• In order: N+1 chains off N by hash ⇒ no node applies N+1 before N.<BR ALIGN="LEFT"/>• Committee + every verifier already adopted N, so S(N) is in their overlay — nothing reconstructed.<BR ALIGN="LEFT"/>• Re-exec happens once (producer); everyone else just applies the diff.<BR ALIGN="LEFT"/>• gl0Anchor = fee-cutover context only, never the diff base.<BR ALIGN="LEFT"/>• Undo journal is reorg-recovery only — steady state never touches it.</FONT>>];
+  cl -> note [style=invis];
+
+  Legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="4">
+    <TR><TD COLSPAN="2"><B>Legend</B></TD></TR>
+    <TR><TD BGCOLOR="#D4EDDA">  </TD><TD ALIGN="LEFT">gl0 finalized / checkpoint adopted-and-validated (shared on every node)</TD></TR>
+    <TR><TD BGCOLOR="#FFF3CD">  </TD><TD ALIGN="LEFT">gl0 finalized frontier F (= tip − k)</TD></TR>
+    <TR><TD BGCOLOR="#E8F4FD">  </TD><TD ALIGN="LEFT">ml0 currency incremental in the checkpoint window</TD></TR>
+    <TR><TD><FONT COLOR="#0066CC">⇠</FONT></TD><TD ALIGN="LEFT">gl0Anchor: per-snapshot fee-cutover context (NOT the diff base)</TD></TR>
+    <TR><TD><FONT COLOR="#1a7f37">→</FONT></TD><TD ALIGN="LEFT">checkpoint executes its metagraph window</TD></TR>
+    <TR><TD><FONT COLOR="#CC0000">→</FONT></TD><TD ALIGN="LEFT">diff base = the PRIOR checkpoint's cumulative result (chain-link)</TD></TR>
+    <TR><TD><FONT COLOR="#555555">→</FONT></TD><TD ALIGN="LEFT">checkpoint chain-link (in-order, hash-pinned)</TD></TR>
+    </TABLE>
+  >];
+  note -> Legend [style=invis];
+}

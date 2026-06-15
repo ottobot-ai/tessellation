@@ -14,11 +14,12 @@ import io.constellationnetwork.node.shared.domain.statechannel.{FeeCalculator, F
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.currencyMessage.fetchStakingAddress
+import io.constellationnetwork.security.Hasher
 
 import eu.timepit.refined.types.numeric.{NonNegInt, NonNegLong}
 
 trait SnapshotBinaryFeeCalculator[F[_]] {
-  def calculateFee(event: StateChannelEvent, ordinal: SnapshotOrdinal): F[NonNegLong]
+  def calculateFee(event: StateChannelEvent, ordinal: SnapshotOrdinal)(implicit hasher: Hasher[F]): F[NonNegLong]
 }
 
 object SnapshotBinaryFeeCalculator {
@@ -37,19 +38,21 @@ object SnapshotBinaryFeeCalculator {
     feeCalculator: FeeCalculator[F],
     reader: GlobalStateReader[F]
   ): SnapshotBinaryFeeCalculator[F] =
-    (event: StateChannelEvent, ordinal: SnapshotOrdinal) =>
-      for {
-        maybeCurrencyInfo <- reader.getCurrencySnapshotInfo(event.value.address)
-        stakingAddr = maybeCurrencyInfo.flatMap(fetchStakingAddress)
-        balance <- stakingAddr.fold(Balance.empty.pure[F]) { addr =>
-          reader.getBalance(addr).map(_.getOrElse(Balance.empty))
-        }
-        result <- {
-          val binary = event.value.snapshotBinary.value
-          val kbytes = NonNegInt.unsafeFrom(binary.content.length / 1024)
-          feeCalculator
-            .calculateRecommendedFee(Some(ordinal))(balance, kbytes, binary.fee.value)
-            .map(_.value)
-        }
-      } yield result
+    new SnapshotBinaryFeeCalculator[F] {
+      def calculateFee(event: StateChannelEvent, ordinal: SnapshotOrdinal)(implicit hasher: Hasher[F]): F[NonNegLong] =
+        for {
+          maybeCurrencyInfo <- reader.getCurrencySnapshotInfo(event.value.address)
+          stakingAddr = maybeCurrencyInfo.flatMap(fetchStakingAddress)
+          balance <- stakingAddr.fold(Balance.empty.pure[F]) { addr =>
+            reader.getBalance(addr).map(_.getOrElse(Balance.empty))
+          }
+          result <- {
+            val binary = event.value.snapshotBinary.value
+            val kbytes = NonNegInt.unsafeFrom(binary.content.length / 1024)
+            feeCalculator
+              .calculateRecommendedFee(Some(ordinal))(balance, kbytes, binary.fee.value)
+              .map(_.value)
+          }
+        } yield result
+    }
 }

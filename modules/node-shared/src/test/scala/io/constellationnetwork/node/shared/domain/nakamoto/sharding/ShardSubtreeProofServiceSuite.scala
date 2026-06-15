@@ -122,6 +122,7 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
       slot = SlotT.unsafeApply(testOrdinal.value.value),
       derivedStateDelta = ShardDerivedStateDelta(
         perMetagraphMptRoots = perMgRoots,
+        perMetagraphStateDiff = SortedMap.empty,
         includedSnapshots = SortedMap.empty,
         tokenLockBalancesDelta = SortedMap.empty,
         perMetagraphArtifacts = SortedMap.empty,

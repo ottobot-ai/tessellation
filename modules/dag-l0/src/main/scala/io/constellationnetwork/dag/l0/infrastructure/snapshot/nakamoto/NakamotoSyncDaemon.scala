@@ -2334,13 +2334,51 @@ object NakamotoSyncDaemon {
                           // is DROPPED — not stored as adoptable, signers NOT counted, NO attestation emitted (a re-exec deviator must
                           // not have its checkpoint adopted nor be rewarded with our attestation). Per Q4 the handler stays
                           // `Async.start`-ed off the gossip thread (see the caller), but WITHIN it the emit is gated on re-exec success.
-                          // Anchor-compatibility sync (task #42): pull gl0's latest adopted-checkpoint hash for this shard into the
-                          // chain store's fork choice BEFORE evaluating/storing this receipt. Receipt-piggybacked (checkpoint traffic
-                          // is continuous), idempotent, max-monotone inside noteAnchor — this is the heal that reorgs a node off an
-                          // un-adopted branch the moment gl0 commits the other lineage.
-                          deps.acceptanceManager
-                            .lastAdoptedAnchor(checkpoint.shardId)
-                            .flatMap(_.fold(Async[F].unit)(entry.chainStore.noteAnchor)) >>
+                          // S1 — gl0-FINALITY HARD ANCHOR (run-24; docs/nakamoto/SHARD-FINALITY-ANCHOR-DESIGN.md).
+                          // Pull gl0's latest phase-2-finalized checkpoint hash for this shard into the fork choice. When the
+                          // finalized anchor IS in the local store, `noteAnchor` reorgs onto it (the #42 heal). When it is
+                          // ABSENT — this node followed a divergent LONGER tine and never received the finalized one (the run-24
+                          // freeze: gl0 finalized C7A on tine α while local maxvalid-tk kept extending tine β) — `noteAnchor`
+                          // silently REFUSES a not-yet-stored hash (`ShardChainStore`: "never replace a known anchor with a
+                          // not-yet-stored hash"), so the anchor can never bite and the longer rogue tine wins forever. Fix:
+                          // background-FETCH the finalized anchor by hash and re-feed it; the re-feed recursively pulls its
+                          // ancestry via the T1 trigger above until it connects, and the NEXT receipt's `noteAnchor` then succeeds
+                          // and `compareAnchoredMaxvalid` collapses the fork onto the finalized tine. Receipt-piggybacked +
+                          // idempotent; the fetch is best-effort/deduped in `ShardCheckpointFetcher`.
+                          deps.acceptanceManager.lastAdoptedAnchor(checkpoint.shardId).flatMap {
+                            case None => Async[F].unit
+                            case Some(anchorHash) =>
+                              entry.chainStore.getByHash(anchorHash).flatMap {
+                                case Some(_) => entry.chainStore.noteAnchor(anchorHash)
+                                case None =>
+                                  shardCheckpointFetcher.fold(Async[F].unit) { fetcher =>
+                                    Async[F]
+                                      .start(
+                                        fetcher.fetchByHash(checkpoint.shardId, anchorHash).flatMap {
+                                          case Some(anchorSigned) =>
+                                            logger.info(
+                                              s"🧩 ShardCheckpoint finality-anchor FETCH: shard=${checkpoint.shardId.value.value} " +
+                                                s"anchor=${anchorHash.value.take(12)} absent locally — pulling gl0-finalized tine (run-24 S1)"
+                                            ) >>
+                                              io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWireCodecs
+                                                .signedShardCheckpointToWire[F](anchorSigned)
+                                                .flatMap(w =>
+                                                  handleShardCheckpoint(
+                                                    w,
+                                                    shardAcceptanceDeps,
+                                                    shardCheckpointAttestationEmitter,
+                                                    shardCheckpointFetcher,
+                                                    selfId,
+                                                    logger
+                                                  )
+                                                )
+                                          case None => Async[F].unit
+                                        }
+                                      )
+                                      .void
+                                  }
+                              }
+                          } >>
                             deps.acceptanceManager.evaluate(checkpoint).flatMap { result =>
                               // Inversion gate (see `shardCheckpointAdmissible`): adopt + count signers + emit ONLY on a non-rejecting result.
                               val admissible = shardCheckpointAdmissible(result)

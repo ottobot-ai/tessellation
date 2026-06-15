@@ -1450,10 +1450,34 @@ object GlobalSnapshotConsensus {
                       shardEtaFor = shardEtaFor,
                       staircaseDeltaSlots = deps.shardingConfig.checkpoint.staircaseDeltaSlots,
                       slotGapFor = slotGapFor,
-                      // S3: the SAME committee re-execution closure the verifier uses (built from the shared
-                      // `shardScEventsProcessor`), so the producer's `perMetagraphMptRoots` are recomputed
-                      // byte-identically by every verifier's `reExecuteDerivation`.
-                      derivePerMgState = ShardCheckpointWiring.reExecDerivation[F](shardScEventsProcessor)(Async[F], shardHasher),
+                      // S3 + step 6: the producer re-executes each MG's currency derivation against the PRIOR shard-checkpoint's
+                      // cumulative state S(N) and emits BOTH the per-MG MPT root AND the minimal `CurrencySnapshotInfo` byte-diff vs
+                      // S(N). Built from the SAME shared `shardScEventsProcessor`; the diff travels in `perMetagraphStateDiff` and
+                      // every gl0 verifier APPLIES-and-verifies it against the attested `perMetagraphMptRoots` (no re-derive — the
+                      // run-24/26 allow-spends accumulation fix).
+                      //
+                      // S(N) READER = FINALIZED `fromMptStore(mptStore)`, NOT `pendingReader` (run-27 freeze fix). The diff prior MUST
+                      // be byte-identical to the prior gl0's apply side diffs against, and gl0 reads the PARENT branch's COMMITTED
+                      // state (`GlobalSnapshotAcceptanceManager.accept`'s branch-aware reader off the parent tip — which equals the
+                      // finalized base AT pipeline depth 1, since the producer holds after one unadopted window so the branch never
+                      // runs ahead of base for an MG's currency partitions). `pendingReader` (`GlobalStateReader.pending`, best-tip
+                      // overlay) instead bakes in this node's LOCAL pending state — un-adopted snapshots, advanced lastTxRefs /
+                      // sync-view / allow-spend-expiry — produced by the local metagraph FOLD, a DIFFERENT code path than gl0's
+                      // diff-APPLY. So best-tip S(N) ≠ adopted S(N) even in the happy path: a minimal 1-upsert diff cut over a
+                      // best-tip prior recomputes, on every gl0, a root NO node finalizes → permanent per-MG mismatch + drop (run-26:
+                      // ~890 ADOPT-VERIFY/node, all 8 nodes agree bit-for-bit on the recomputed root; only the producer's attested
+                      // root diverged — proving gl0's prior is deterministic-finalized and the producer was the lone outlier).
+                      derivePerMgState = ShardCheckpointWiring
+                        .reExecDerivationWithDiff[F](
+                          shardScEventsProcessor,
+                          io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore)
+                        )(
+                          Async[F],
+                          Parallel[F],
+                          shardHasher,
+                          implicitly[io.constellationnetwork.json.JsonSerializer[F]],
+                          globalStateProofSelector
+                        ),
                       // Bounded checkpoint pipeline (2026-06-11): gl0's adopted-watermark from the acceptance
                       // manager gates new window production so pending batches while embedding catches up.
                       lastAdoptedOrd = deps.acceptanceManager.lastAdoptedOrd(shardId),

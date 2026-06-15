@@ -118,6 +118,7 @@ object ShardMetricsSuite extends MutableIOSuite {
   private def mkDelta(mg: Address, root: Hash, binary: Signed[StateChannelSnapshotBinary]): ShardDerivedStateDelta =
     ShardDerivedStateDelta(
       perMetagraphMptRoots = SortedMap(mg -> root),
+      perMetagraphStateDiff = SortedMap.empty,
       includedSnapshots = SortedMap(mg -> NonEmptyList.of(binary)),
       tokenLockBalancesDelta = SortedMap.empty,
       perMetagraphArtifacts = SortedMap.empty,

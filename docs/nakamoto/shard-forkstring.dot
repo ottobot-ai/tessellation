@@ -1,0 +1,72 @@
+digraph G {
+  rankdir=LR;
+  bgcolor="white";
+  fontname="Helvetica"; fontsize=17;
+  labelloc="t";
+  label=<<b>Shard-checkpoint sub-chain &#8212; GKL fork strings (shard 1, run-24)</b><br/><font point-size="11">node = shard checkpoint C&#8345; at shardOrd k &#160;&#183;&#160; "win&#8594;b&#8345;" = the ml0 binary that checkpoint's window ends on &#160;&#183;&#160; edge = chains-to-parent</font>>;
+  node [fontname="Helvetica", fontsize=11, shape=box, style="filled,rounded", penwidth=1.4, margin="0.12,0.07"];
+  edge [fontname="Helvetica", fontsize=9, penwidth=1.5, arrowsize=0.7];
+
+  /* force A above B with an invisible backbone edge */
+  a_anchor [style=invis, shape=point, width=0.01];
+  b_anchor [style=invis, shape=point, width=0.01];
+  a_anchor -> b_anchor [style=invis];
+
+  /* ============ Panel A : HEALTHY ============ */
+  subgraph cluster_A {
+    label=<<b>A &#183; HEALTHY GROWTH</b> &#8212; sub-chain re-bases on gl0's phase-2 finalized ancestor; a transient rotation sibling dies harmlessly>;
+    fontcolor="#1b5e20"; color="#66bb6a"; style="rounded"; penwidth=2; bgcolor="#f2f8f2";
+
+    aG [label="genesis", fillcolor="#c8e6c9", color="#2e7d32"];
+    a1 [label="C1\nwin&#8594;b1", fillcolor="#e8f5e9", color="#2e7d32"];
+    a2 [label="C2\nwin&#8594;b2", fillcolor="#e8f5e9", color="#2e7d32"];
+    a3 [label="C3\nwin&#8594;b3\n&#9650; gl0 FINAL", fillcolor="#bbdefb", color="#1565c0", penwidth=2.2];
+    a4 [label="C4\nwin&#8594;b4", fillcolor="#e8f5e9", color="#2e7d32"];
+    a5 [label="C5\nwin&#8594;b5\n&#9650; bestTip", fillcolor="#e1bee7", color="#6a1b9a"];
+    aG -> a1 -> a2 -> a3 -> a4 -> a5;
+
+    a3s [label="C3'\nwin&#8594;b3\n(rotation sibling,\ncleanly abandoned)", fillcolor="#fffde7", color="#f9a825", style="filled,rounded,dashed"];
+    a2 -> a3s [style=dashed, color="#f9a825"];
+
+    aG -> a_anchor [style=invis];
+  }
+
+  /* ============ Panel B : DIVERGENCE ============ */
+  subgraph cluster_B {
+    label=<<b>B &#183; RUN-24 DIVERGENCE</b> &#8212; gl0 finalizes C7A, but the sub-chain's maxvalid-tk extends C7B &#8594; orphaned SC tip + mutual freeze>;
+    fontcolor="#b71c1c"; color="#ef5350"; style="rounded"; penwidth=2; bgcolor="#fdf2f2";
+
+    bG [label="genesis", fillcolor="#ffcdd2", color="#c62828"];
+    b1 [label="C1\nwin&#8594;b1", fillcolor="#ffebee", color="#c62828"];
+    b2 [label="C2\nwin&#8594;b2", fillcolor="#ffebee", color="#c62828"];
+    b4 [label="C4\nwin&#8594;b4", fillcolor="#ffebee", color="#c62828"];
+    b7a [label="C7A\nwin&#8594;b5 = a240a5fe\n&#9632; gl0 FINALIZED", fillcolor="#bbdefb", color="#1565c0", penwidth=2.6];
+    bG -> b1 -> b2 -> b4 -> b7a;
+
+    b7b [label="C7B\nwin&#8594;b6'", fillcolor="#ffe0b2", color="#ef6c00"];
+    b8 [label="C8\nwin&#8594;b7'", fillcolor="#ffe0b2", color="#ef6c00"];
+    b9 [label="C9", fillcolor="#ffe0b2", color="#ef6c00"];
+    b10 [label="C10\n&#9650; shard bestTip\n(maxvalid-tk)", fillcolor="#e1bee7", color="#6a1b9a"];
+    b4 -> b7b [color="#ef6c00"];
+    b7b -> b8 -> b9 -> b10 [color="#ef6c00"];
+
+    remit [label="ml0 re-emit (BFT state S):\nb5 and b6' = SAME final state,\nDIFFERENT binary hash", shape=note, fillcolor="#fff3e0", color="#ef6c00", fontcolor="#bf360c", fontsize=10];
+    remit -> b7a [style=dotted, color="#ef6c00", arrowhead=none, constraint=false];
+    remit -> b7b [style=dotted, color="#ef6c00", arrowhead=none, constraint=false];
+
+    froze [label="&#10007; FROZEN: no live binary chains off a240a5fe\n(every incoming parent &#8800; a240a5fe &#8658; fail-closed)\nproducer stuck: awaiting-embed", shape=note, fillcolor="#fff8e1", color="#c62828", fontcolor="#b71c1c", fontsize=10];
+    b7a -> froze [style=dotted, color="#c62828", arrowhead=none, constraint=false];
+
+    b_anchor -> bG [style=invis];
+  }
+
+  /* ============ legend ============ */
+  subgraph cluster_L {
+    label="legend"; fontsize=10; color="#9e9e9e"; style="rounded";
+    lg [label="gl0 phase-2 FINALIZED", fillcolor="#bbdefb", color="#1565c0", fontsize=9];
+    lt [label="local bestTip (maxvalid-tk)", fillcolor="#e1bee7", color="#6a1b9a", fontsize=9];
+    ld [label="divergent / re-emit branch", fillcolor="#ffe0b2", color="#ef6c00", fontsize=9];
+    ls [label="abandoned rotation sibling", fillcolor="#fffde7", color="#f9a825", style="filled,rounded,dashed", fontsize=9];
+    lg -> lt [style=invis]; lt -> ld [style=invis]; ld -> ls [style=invis];
+  }
+}

@@ -37,6 +37,7 @@ import io.constellationnetwork.syntax.sortedCollection.{sortedMapSyntax, sortedS
 
 import eu.timepit.refined.auto.autoUnwrap
 import fs2.concurrent.SignallingRef
+import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 trait CurrencySnapshotAcceptanceManager[F[_]] {
   def accept(
@@ -201,6 +202,9 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
   balanceOps: BalanceOpsManager[F]
 )(implicit currencyStateProofSelector: CurrencyStateProofSelector)
     extends CurrencySnapshotAcceptanceManager[F] {
+
+  // [OVERPRUNE-DIAG] (2026-06-13, REMOVE after e2e): only used by the epoch-divergence diagnostic in `accept`.
+  private val logger = Slf4jLogger.getLoggerFromName[F]("CurrencySnapshotAcceptanceManager")
 
   def accept(
     blocksForAcceptance: List[Signed[Block]],
@@ -390,6 +394,20 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
             lastSyncGlobalSnapshot.epochProgress
           )
         )
+    )
+
+    // [OVERPRUNE-DIAG/ml0] (2026-06-13, REMOVE after e2e): the smoking gun for run-26 divergence #1. ml0 EXPIRES allow-spends/
+    // token-locks with `lastGlobalSnapshotEpochProgress` (the synced snapshot's epoch at `ordinalToFetch`), but ADVERTISES
+    // `globalSyncView.epochProgress` (monotonic-clamped, can be the higher prior view when peer-sync backstepped below it). gl0's
+    // mirror reads the advertised epoch → over-prunes when these diverge. This fires ONLY on divergence; absence ⇒ #1 didn't fire.
+    _ <- Async[F].whenA(globalSyncView.epochProgress =!= lastGlobalSnapshotEpochProgress)(
+      logger.info(
+        s"[OVERPRUNE-DIAG/ml0] mg=${metagraphId.show.take(10)} cl0Ord=${snapshotOrdinal.show} EPOCH-DIVERGENCE " +
+          s"expiryEpoch=${lastGlobalSnapshotEpochProgress.value.value} advertisedEpoch=${globalSyncView.epochProgress.value.value} " +
+          s"syncedOrd=${lastSyncGlobalSnapshot.ordinal.show} advertisedOrd=${globalSyncView.ordinal.show} " +
+          s"peerSync=${maybeSnapshotOrdinalSync.map(_.show).getOrElse("none")} " +
+          s"prior=${maybeLastGlobalSyncView.map(_.ordinal.show).getOrElse("none")} fallback=${fallbackOrdinal.show}"
+      )
     )
 
     blockAcceptanceResults <- (

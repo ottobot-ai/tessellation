@@ -166,4 +166,41 @@ object CurrencySnapshotInfoCodecs {
 
   implicit val currencySnapshotInfoImmutableCodec: ImmutableCodec[CurrencySnapshotInfo] =
     ImmutableCodec.fromScodecCodec(currencySnapshotInfoCodec)
+
+  // ---- UNROLLED per-metagraph CurrencySnapshotInfo sub-field value codecs ---------------------------------------
+  // (docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md) Each unrolled `Mg*` partition stores one entry per
+  // account/holder/messageType/peer. The MPT key hashes that entry key (lossy — `toHex` over `AddressNamespace`), so the VALUE carries the
+  // typed entry key as `(EntryKey, FieldValue)`; reconstruction recovers the logical key from the value via a prefix scan (the
+  // value-carries-key pattern, cf. `getAllUpdateNodeParameters`). `activeAllowSpends` is NOT unrolled here — it stays in fieldId-7.
+
+  private def entryTupleCodec[A, B](ca: Codec[A], cb: Codec[B]): Codec[(A, B)] =
+    (ca :: cb).xmap[(A, B)]({ case a :: b :: HNil => (a, b) }, { case (a, b) => a :: b :: HNil })
+
+  /** `MgBalances` (fieldId 25) value: `(account, balance)`. */
+  implicit val mgBalanceEntryImmutableCodec: ImmutableCodec[(Address, Balance)] =
+    ImmutableCodec.fromScodecCodec(entryTupleCodec(addressCodec, Codec[Balance]))
+
+  /** `MgLastTxRefs` (26) AND `MgLastFeeTxRefs` (27) value: `(account, ref)` — same shape, one codec serves both partitions. */
+  implicit val mgTxRefEntryImmutableCodec: ImmutableCodec[(Address, TransactionReference)] =
+    ImmutableCodec.fromScodecCodec(entryTupleCodec(addressCodec, transactionReferenceCodec))
+
+  /** `MgLastAllowSpendRefs` (28) value: `(account, ref)`. */
+  implicit val mgAllowSpendRefEntryImmutableCodec: ImmutableCodec[(Address, AllowSpendReference)] =
+    ImmutableCodec.fromScodecCodec(entryTupleCodec(addressCodec, allowSpendRefCodec))
+
+  /** `MgLastTokenLockRefs` (29) value: `(account, ref)`. */
+  implicit val mgTokenLockRefEntryImmutableCodec: ImmutableCodec[(Address, TokenLockReference)] =
+    ImmutableCodec.fromScodecCodec(entryTupleCodec(addressCodec, tokenLockRefCodec))
+
+  /** `MgActiveTokenLocks` (30) value: `(holder, locks)`. */
+  implicit val mgActiveTokenLocksEntryImmutableCodec: ImmutableCodec[(Address, SortedSet[Signed[TokenLock]])] =
+    ImmutableCodec.fromScodecCodec(entryTupleCodec(addressCodec, sortedSet(signedTokenLockCodec)))
+
+  /** `MgLastMessages` (31) value: `(messageType, signedMessage)`. */
+  implicit val mgLastMessagesEntryImmutableCodec: ImmutableCodec[(MessageType, Signed[CurrencyMessage])] =
+    ImmutableCodec.fromScodecCodec(entryTupleCodec(messageTypeCodec, signedCurrencyMessageCodec))
+
+  /** `MgGlobalSnapshotSyncView` (32) value: `(peerId, signedSync)`. */
+  implicit val mgGlobalSyncEntryImmutableCodec: ImmutableCodec[(PeerId, Signed[GlobalSnapshotSync])] =
+    ImmutableCodec.fromScodecCodec(entryTupleCodec(peerIdCodec, signedGlobalSyncCodec))
 }

@@ -3,19 +3,45 @@ package io.constellationnetwork.schema.sharding
 import cats.Show
 import cats.data.NonEmptyList
 
-import scala.collection.immutable.SortedMap
+import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.SharedArtifact
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import derevo.cats.eqv
 import derevo.circe.magnolia.{decoder, encoder}
 import derevo.derive
+
+/** Wire form of an MPT `ChangeSet` (the `node-shared` overlay type, which can't live in `shared`): a per-metagraph byte-diff over gl0's
+  * finalized base trie. `upserts` maps the canonical MPT key (`GlobalStateKey.toHex`) to the pre-serialized value bytes (Hex-encoded);
+  * `removals` is the set of keys to delete. The committee computes this delta by re-executing the metagraph's `accept()` against the
+  * finalized base (deterministic, shared across all committee members); every gl0 node APPLIES it via `MerklePatriciaTrie.withChanges`
+  * against the same finalized base and verifies the resulting per-MG root against the committee-attested
+  * [[ShardDerivedStateDelta.perMetagraphMptRoots]].
+  *
+  * '''Why a byte-diff, not the value.''' The recipient never re-derives and never recovers an address from a key — the `Hex` key applies
+  * directly, and the `ActiveAddressIndex` updates (which carry the addresses as their VALUE) ride inside the same diff. So this is the
+  * complete, self-sufficient delta: small (changed entries only), lossless on the wire, applied-and-verified, never re-executed downstream
+  * (`docs/nakamoto/COMMITTEE-STATE-DIFF-ADOPTION-DESIGN.md`).
+  *
+  * '''SortedMap/SortedSet''' for deterministic encoding — the whole structure is inside the `ShardCheckpointSigPreimage`, so its bytes are
+  * consensus-load-bearing and must be byte-identical on every committee member.
+  */
+@derive(encoder, decoder, eqv)
+final case class ShardCurrencyStateDiff(
+  upserts: SortedMap[Hex, Hex],
+  removals: SortedSet[Hex]
+)
+
+object ShardCurrencyStateDiff {
+  val empty: ShardCurrencyStateDiff = ShardCurrencyStateDiff(SortedMap.empty, SortedSet.empty)
+}
 
 /** The per-shard contribution to gl0-derived state for one checkpoint cycle.
   *
@@ -37,10 +63,16 @@ import derevo.derive
   *
   * @param perMetagraphMptRoots
   *   per-MG MPT subtree root: this shard's contribution to the metagraph-tree-of-trees (see SHARDABILITY-MAP.md §3.7). gl0 stitches these
-  *   into the global stateProof
+  *   into the global stateProof. This is the committee-attested commitment the carried diff is verified against.
+  * @param perMetagraphStateDiff
+  *   per-MG MPT byte-diff (`ChangeSet` wire form) over gl0's finalized base — the OUTPUT of the committee's re-execution (`accept()`
+  *   anchored at the finalized base). gl0 APPLIES this directly (`MerklePatriciaTrie.withChanges`) and verifies the resulting per-MG root
+  *   equals `perMetagraphMptRoots`. Adopt-and-verify, never re-derive (replaces the `AdoptFromSignedFields` re-derive + per-field gate).
+  *   See `docs/nakamoto/COMMITTEE-STATE-DIFF-ADOPTION-DESIGN.md`.
   * @param includedSnapshots
-  *   per-MG accepted SC binary chain (chain-linked from the prior checkpoint's tip). Mirrors the per-MG NonEmptyList from today's
-  *   `stateChannelSnapshots`; carried inside the checkpoint so gl0 doesn't re-run chain-link, only checks the envelope sig
+  *   per-MG accepted SC binary chain (chain-linked from the prior checkpoint's tip). Retained for the SC-tip advance + chain-link +
+  *   embed-selection only — NO LONGER the source of gl0's currency derivation (that's `perMetagraphStateDiff` now). Candidate for shrinking
+  *   to the last-binary-hash in a follow-up
   * @param tokenLockBalancesDelta
   *   per-MG token-lock balance delta (per `TokenLockStateManager.updateTokenLockBalances`). Outer key = metagraphAddress; inner key =
   *   holderAddress; value = new Balance after this checkpoint
@@ -54,6 +86,7 @@ import derevo.derive
 @derive(encoder, decoder, eqv)
 final case class ShardDerivedStateDelta(
   perMetagraphMptRoots: SortedMap[Address, Hash],
+  perMetagraphStateDiff: SortedMap[Address, ShardCurrencyStateDiff],
   includedSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
   tokenLockBalancesDelta: SortedMap[Address, SortedMap[Address, Balance]],
   perMetagraphArtifacts: SortedMap[Address, List[SharedArtifact]],
@@ -69,6 +102,7 @@ object ShardDerivedStateDelta {
   val empty: ShardDerivedStateDelta =
     ShardDerivedStateDelta(
       perMetagraphMptRoots = SortedMap.empty,
+      perMetagraphStateDiff = SortedMap.empty,
       includedSnapshots = SortedMap.empty,
       tokenLockBalancesDelta = SortedMap.empty,
       perMetagraphArtifacts = SortedMap.empty,

@@ -594,26 +594,44 @@ else
     cd ../../
   done
 
-  # Wait for GL0 to be ready before starting metagraph nodes
+  # Wait for GL0 to be ready before starting metagraph nodes.
+  #
+  # TWO-STAGE readiness (run-27 seeding-race fix). It is NOT enough that gl0's cluster
+  # has formed (/cluster/info); gl0 consensus must be actively FINALIZING global
+  # snapshots (latest ordinal >= 2) before any metagraph boots. Why: a metagraph's ml0
+  # sends its genesis-FULL CurrencySnapshot to gl0 exactly ONCE, un-retried, moments
+  # after it starts. If gl0's head is not yet available then (finalizedOrd=0, so
+  # `StateChannelRoutes` returns ServiceUnavailable), that genesis-full is LOST — and
+  # recoverable only from a peer that happens to hold it. Under a solo / under-replicated
+  # metagraph cohort none do ("ChainSync: no peer had parent=..."), so the metagraph
+  # never seeds into gl0's mirror and the shard-checkpoint chain wedges at genesis
+  # (embed-none / genesis-window-guard; the run-27 token-lock failure). Holding metagraph
+  # startup until gl0 is finalizing closes the window so the one-shot genesis-full lands.
   if [ -n "$METAGRAPH" ] && [ "$NUM_GL0_NODES" -gt 0 ]; then
-    echo "Waiting for GL0 to be ready before starting metagraph..."
+    echo "Waiting for GL0 to be ready (cluster formed + finalizing snapshots) before starting metagraph..."
     gl0_url="${TEST_HOST:-http://localhost}:${DAG_L0_PORT_PREFIX}00"
     gl0_ready=false
-    for attempt in $(seq 1 60); do
+    for attempt in $(seq 1 90); do
+      node_count=0
       cluster_info=$(curl -s "${gl0_url}/cluster/info" 2>/dev/null || echo "")
       if [ -n "$cluster_info" ] && echo "$cluster_info" | jq 'length' >/dev/null 2>&1; then
         node_count=$(echo "$cluster_info" | jq 'length')
-        if [ "$node_count" -ge 1 ]; then
-          echo "GL0 is ready with $node_count node(s)"
-          gl0_ready=true
-          break
-        fi
       fi
-      echo "GL0 not ready yet (attempt $attempt/60), waiting..."
+      latest_ord=0
+      ordinal_resp=$(curl -sf "${gl0_url}/global-snapshots/latest/ordinal" 2>/dev/null || echo "")
+      if [ -n "$ordinal_resp" ]; then
+        latest_ord=$(echo "$ordinal_resp" | jq -r 'if type == "object" then .value else . end' 2>/dev/null || echo "0")
+      fi
+      if [ "$node_count" -ge 1 ] && [ "$latest_ord" -ge 2 ] 2>/dev/null; then
+        echo "GL0 is ready: $node_count node(s), latest finalized ordinal=$latest_ord"
+        gl0_ready=true
+        break
+      fi
+      echo "GL0 not ready yet (attempt $attempt/90): nodes=$node_count finalizedOrd=$latest_ord, waiting..."
       sleep 5
     done
     if [ "$gl0_ready" = "false" ]; then
-      echo "ERROR: GL0 did not become ready in time"
+      echo "ERROR: GL0 did not become ready (cluster formed + finalizing) in time"
       docker logs gl0-0 || true
       exit 1
     fi

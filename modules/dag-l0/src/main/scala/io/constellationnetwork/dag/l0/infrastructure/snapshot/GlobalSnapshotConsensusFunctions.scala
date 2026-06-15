@@ -621,13 +621,34 @@ object GlobalSnapshotConsensusFunctions {
                                   // caught up (normal: every window already adopted, tips == newest tail) AND on an
                                   // adoption-side stall — the reader disambiguates by whether the shard chain height
                                   // keeps growing while this line repeats with unchanged tips.
+                                  //
+                                  // INSTRUMENTATION (run-24 genesis-seam): when nothing matches, dump per-MG the SC tip we
+                                  // match against vs the ACTUAL window parent-refs across the whole ancestry. If matched=false
+                                  // and the parentRefs never contain scTip, the producer's window anchoring (its own perMgTip)
+                                  // has diverged from gl0's adopted SC tip — the suspected freeze. Remove after diagnosis.
+                                  val anchorDiag = chainTipFirst
+                                    .flatMap(_.signed.value.derivedStateDelta.includedSnapshots.keys.toList)
+                                    .distinct
+                                    .map { mg =>
+                                      val tip = scTips.getOrElse(mg, Hash.empty)
+                                      val parentRefs = chainTipFirst.flatMap { hh =>
+                                        hh.signed.value.derivedStateDelta.includedSnapshots
+                                          .get(mg)
+                                          .toList
+                                          .flatMap(_.toList.map(_.value.lastSnapshotHash))
+                                      }.distinct
+                                      s"${mg.value.value.take(8)}{scTip=${tip.value.take(8)} matched=${parentRefs
+                                          .contains(tip)} parentRefs=[${parentRefs.map(_.value.take(8)).mkString(",")}]}"
+                                    }
+                                    .mkString(" ")
                                   logger
                                     .info(
                                       s"🧩 embed-none shard=${shardId.value.value} " +
                                         s"chainLen=${chainTipFirst.size} qualifyingOrd=${qualifyingOrd.value} " +
                                         s"tips=${snapshotContext.lastStateChannelSnapshotHashes.toList.map {
                                             case (mg, hh) => s"${mg.value.value.take(8)}:${hh.value.take(8)}"
-                                          }.mkString(",")}"
+                                          }.mkString(",")} " +
+                                        s"anchorDiag=$anchorDiag"
                                     )
                                     .as(
                                       none[

@@ -13,6 +13,7 @@ import scala.concurrent.duration._
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.ChangeSet
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardBinaryBuffer, ShardChainStore, ShardSlotLeader}
 import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, ShardAssignment}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
@@ -128,9 +129,9 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
     mg: Address,
     snaps: NonEmptyList[Signed[StateChannelSnapshotBinary]],
     anchor: SnapshotOrdinal
-  ): IO[Hash] = {
+  ): IO[Option[(Hash, ChangeSet)]] = {
     val _ = anchor
-    IO.pure(hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}"))
+    IO.pure(Some((hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}"), ChangeSet.empty)))
   }
 
   private def mkOrd(value: Long): SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(value))

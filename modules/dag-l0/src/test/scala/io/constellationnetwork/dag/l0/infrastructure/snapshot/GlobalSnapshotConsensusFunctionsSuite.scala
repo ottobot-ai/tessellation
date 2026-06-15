@@ -376,7 +376,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       override def calculateFee(
         event: StateChannelEvent,
         ordinal: SnapshotOrdinal
-      ): IO[NonNegLong] =
+      )(implicit hasher: Hasher[IO]): IO[NonNegLong] =
         event.value.snapshotBinary.value.fee.value.pure[IO]
     }
 

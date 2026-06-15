@@ -14,6 +14,7 @@ import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.ChangeSet
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding._
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.node.shared.infrastructure.sharding.{
@@ -144,7 +145,12 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
       shardEtaFor = _ => IO.pure(fixedShardEta),
       slotGapFor = slotGapFor,
       staircaseDeltaSlots = 5,
-      derivePerMgState = reExec,
+      // Step-6 signature: `derivePerMgState` now returns `Option[(Hash, ChangeSet)]` (`None` ⇒ OMIT the MG). This suite injects its
+      // own Hash-only `reExec` closure to exercise the producer's root plumbing (producer faithfully forwards the closure's Hash into
+      // `perMetagraphMptRoots`); the carried diff is not under test here, so pair it with an empty `ChangeSet` and always `Some` (this
+      // re-exec stub never omits). The production root encoding (`reExecDerivationWithDiff` ⇒ `hash((incRoot, infoRoot))`) and the
+      // verifier's apply-and-verify reconciliation are exercised by the step-6 wiring/apply suites, not this re-exec-parity suite.
+      derivePerMgState = (mg, snaps, ord) => reExec(mg, snaps, ord).map(h => Some((h, ChangeSet.empty))),
       lastAdoptedOrd = cats.effect.IO.pure(None),
       pipelineDepth = Int.MaxValue,
       republishEveryTicks = 1

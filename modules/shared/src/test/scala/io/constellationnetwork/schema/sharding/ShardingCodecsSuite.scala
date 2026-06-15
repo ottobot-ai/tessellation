@@ -116,6 +116,7 @@ object ShardingCodecsSuite extends FunSuite {
         mgAddrA -> hash('a'),
         mgAddrB -> hash('b')
       ),
+      perMetagraphStateDiff = SortedMap.empty,
       includedSnapshots = SortedMap(
         mgAddrA -> NonEmptyList.of(mkSignedBinary('1', 0x01, 10L), mkSignedBinary('2', 0x02, 20L)),
         mgAddrB -> NonEmptyList.of(mkSignedBinary('3', 0x03, 30L))

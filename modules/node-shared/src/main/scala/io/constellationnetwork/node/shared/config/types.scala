@@ -252,9 +252,10 @@ object types {
     tBurst: Int,
     binaryBufferCap: Int,
     /** Bounded checkpoint pipeline (2026-06-11): max unadopted windows in flight before the producer holds production so pending binaries
-      * batch into one bigger window (catch-up margin — see ShardCheckpointProducer).
+      * batch into one bigger window (catch-up margin — see ShardCheckpointProducer). MUST be 1 (run-27): the producer diffs each window
+      * against the FINALIZED base S(N); at depth>1 a 2nd in-flight window is diffed against a stale base the verifier never matches.
       */
-    pipelineDepth: Int = 2,
+    pipelineDepth: Int = 1,
     /** Shuffled-staircase proposal window width in slots (design §5.7 rev 2, owner 2026-06-12; default 5). Per shard ordinal the committee
       * is hash-sorted under the epoch eta; rank r proposes for this many slots, wrapping modulo committee size. Replaces the per-slot LDD
       * lottery (run-13/14: genesis forks + same-ord sibling lineages split attestations below kQuorum at ANY density).

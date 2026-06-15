@@ -7,11 +7,13 @@ import cats.{Order, Parallel}
 import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot, CurrencySnapshotInfo}
+import io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSnapshotSync
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.merkletree.Proof
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
+import io.constellationnetwork.schema.currencyMessage.{CurrencyMessage, MessageType}
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.MptStore
@@ -19,6 +21,7 @@ import io.constellationnetwork.schema.mpt.PartitionNamespace.{AddressNamespace, 
 import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
+import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
 import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
 import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendReference}
@@ -34,7 +37,7 @@ import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
 import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
-import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs._
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutable}
 import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmutableCodec
@@ -312,8 +315,13 @@ object GlobalStateConverter {
               _ <- mptStore.underlying.remove(hexRem.toList).whenA(hexRem.nonEmpty)
               _ <- mptStore.underlying.insertBytes(hexUp).whenA(hexUp.nonEmpty)
               _ <- mptStore.underlying.buildForOrdinal(ordinal)
-              newRoot <- mptStore.underlying.getRootHashForOrdinal(ordinal)
-              matches = newRoot.map(_.value).contains(expectedRoot)
+              // `expectedRoot` (the signed `mptRoot`) excludes path-dependent SystemNamespace sidecars
+              // (`GlobalSnapshotInfo.mptStateProofFromBytes`); `getRootHashForOrdinal` is the producer's root over
+              // ALL stored bytes (sidecars included). Recompute sidecar-free so this adopt-verify gate compares
+              // apples-to-apples — otherwise EVERY ChangeSet delta adoption would mismatch and fall back.
+              afterBytes <- mptStore.underlying.entries
+              newRoot <- io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes)
+              matches = newRoot === expectedRoot
               out <-
                 if (matches)
                   // On the verified-match branch ONLY, do the SAME tail work the retained
@@ -448,22 +456,20 @@ object GlobalStateConverter {
   ): F[Map[GlobalStateKey, Json]] =
     data.toSeq.parTraverse {
       case (metagraphAddr, Left(fullSnapshot)) =>
-        CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value).map { currencyIncrementalSnapshot =>
-          List(
-            GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastIncrementalCurrencySnapshots) -> Signed(
-              currencyIncrementalSnapshot,
-              fullSnapshot.proofs
-            ).asJson,
-            GlobalStateKey
-              .metagraph(metagraphAddr, GlobalStateFieldId.LastCurrencySnapshotInfo) -> fullSnapshot.info.toCurrencySnapshotInfo.asJson
-          )
-        }
+        for {
+          currencyIncrementalSnapshot <- CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value)
+          infoEntries <- infoEntryJson[F](metagraphAddr, fullSnapshot.info.toCurrencySnapshotInfo)
+        } yield
+          (GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastIncrementalCurrencySnapshots) -> Signed(
+            currencyIncrementalSnapshot,
+            fullSnapshot.proofs
+          ).asJson) :: infoEntries
 
       case (metagraphAddr, Right((incrementalSnapshot, snapshotInfo))) =>
-        List(
-          GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastIncrementalCurrencySnapshots) -> incrementalSnapshot.asJson,
-          GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastCurrencySnapshotInfo) -> snapshotInfo.asJson
-        ).pure[F]
+        infoEntryJson[F](metagraphAddr, snapshotInfo).map { infoEntries =>
+          (GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastIncrementalCurrencySnapshots) ->
+            incrementalSnapshot.asJson) :: infoEntries
+        }
     }
       .map(_.flatten.toMap)
 
@@ -590,7 +596,6 @@ object GlobalStateConverter {
     import io.constellationnetwork.serde.ImmutableCodec
     import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
     import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
-    import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
     import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
     import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutable}
     import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmutableCodec
@@ -795,7 +800,6 @@ object GlobalStateConverter {
     import io.constellationnetwork.serde.ImmutableCodec
     import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
     import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
-    import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
     import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
     import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutable}
     import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmutableCodec
@@ -856,19 +860,17 @@ object GlobalStateConverter {
 
     val currencyEntriesF = acc.lastCurrencySnapshots.toList.parTraverse {
       case (metagraphAddr, Left(fullSnapshot)) =>
-        CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value).map { inc =>
-          List(
-            GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) ->
-              enc[Signed[CurrencyIncrementalSnapshot]](Signed(inc, fullSnapshot.proofs)),
-            GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) ->
-              enc[CurrencySnapshotInfo](fullSnapshot.info.toCurrencySnapshotInfo)
-          )
-        }
+        for {
+          inc <- CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value)
+          infoEntries <- infoEntryBytes[F](metagraphAddr, fullSnapshot.info.toCurrencySnapshotInfo)
+        } yield
+          (GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) ->
+            enc[Signed[CurrencyIncrementalSnapshot]](Signed(inc, fullSnapshot.proofs))) :: infoEntries
       case (metagraphAddr, Right((inc, snInfo))) =>
-        List(
-          GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> enc[Signed[CurrencyIncrementalSnapshot]](inc),
-          GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> enc[CurrencySnapshotInfo](snInfo)
-        ).pure[F]
+        infoEntryBytes[F](metagraphAddr, snInfo).map { infoEntries =>
+          (GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) ->
+            enc[Signed[CurrencyIncrementalSnapshot]](inc)) :: infoEntries
+        }
     }
 
     val updateNodeParametersF: F[List[(GlobalStateKey, Array[Byte])]] =
@@ -1147,11 +1149,97 @@ object GlobalStateConverter {
     if (fieldEntries.isEmpty) Hash.empty.pure[F]
     else MerklePatriciaTrie.makeParallelFromBytes[F](fieldEntries).map(_.rootHash.value)
 
+  /** Emit the UNROLLED per-entry MPT key→bytes for ONE metagraph's `CurrencySnapshotInfo` — the 8 `Mg*` sub-field partitions that REPLACE
+    * the monolithic fieldId-6 blob (`docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md`). One entry per account / holder / messageType
+    * / peer, keyed `metagraphEntry(mgAddr, MgXxx, key)`; each value carries its own typed entry key `(key, value)` because `toHex` HASHES
+    * the entry key (lossy), so reconstruction recovers the logical key from the value via a prefix scan.
+    *
+    * '''`activeAllowSpends` is NOT emitted here''' — it stays in the fieldId-7 `ActiveAllowSpends` partition (written from the GSI's
+    * top-level `activeAllowSpends`, already per-MG unrolled + read cross-shard by `SpendActionValidator`). So `infoRoot` covers these 8
+    * sub-fields; `activeAllowSpends` is committed separately via the fieldId-7 `activeAllowSpends` state-proof slot.
+    *
+    * '''Single source of truth.''' This is the ONE encoder for the unrolled info bytes; every writer (full-state bytes/JSON, bootstrap
+    * seed, incremental delta, overlay) routes through it so the bytes — and therefore `infoRoot` — are byte-identical on every path
+    * (split-safety).
+    */
+  def infoEntryBytes[F[_]: Sync: Hasher](
+    mgAddr: Address,
+    info: CurrencySnapshotInfo
+  ): F[List[(GlobalStateKey, Array[Byte])]] = {
+    import GlobalStateFieldId._
+    def enc[V](v: V)(implicit c: ImmutableCodec[V]): Array[Byte] = c.immutableBytes(v).toArray
+    def opt[K, V](m: Option[SortedMap[K, V]]): List[(K, V)] = m.fold(List.empty[(K, V)])(_.toList)
+
+    // Address-keyed sub-fields — `metagraphEntry` is pure (hashing deferred to `toHex`). The value type drives implicit codec resolution.
+    val addressKeyed: List[(GlobalStateKey, Array[Byte])] =
+      info.balances.toList.map { case (a, b) => GlobalStateKey.metagraphEntry(mgAddr, MgBalances, a) -> enc((a, b)) } ++
+        info.lastTxRefs.toList.map { case (a, r) => GlobalStateKey.metagraphEntry(mgAddr, MgLastTxRefs, a) -> enc((a, r)) } ++
+        opt(info.lastFeeTxRefs).map { case (a, r) => GlobalStateKey.metagraphEntry(mgAddr, MgLastFeeTxRefs, a) -> enc((a, r)) } ++
+        opt(info.lastAllowSpendRefs).map {
+          case (a, r) => GlobalStateKey.metagraphEntry(mgAddr, MgLastAllowSpendRefs, a) -> enc((a, r))
+        } ++
+        opt(info.lastTokenLockRefs).map {
+          case (a, r) => GlobalStateKey.metagraphEntry(mgAddr, MgLastTokenLockRefs, a) -> enc((a, r))
+        } ++
+        opt(info.activeTokenLocks).map { case (a, s) => GlobalStateKey.metagraphEntry(mgAddr, MgActiveTokenLocks, a) -> enc((a, s)) }
+
+    // Non-Address-keyed sub-fields — `metagraphEntryHashed` folds the canonical-string entry key into the user slot (needs F to hash).
+    val messagesF: F[List[(GlobalStateKey, Array[Byte])]] =
+      opt(info.lastMessages).traverse {
+        case (mt, m) => GlobalStateKey.metagraphEntryHashed[F](mgAddr, MgLastMessages, mt.value).map(_ -> enc((mt, m)))
+      }
+    val syncViewF: F[List[(GlobalStateKey, Array[Byte])]] =
+      opt(info.globalSnapshotSyncView).traverse {
+        case (p, s) => GlobalStateKey.metagraphEntryHashed[F](mgAddr, MgGlobalSnapshotSyncView, p.value.value).map(_ -> enc((p, s)))
+      }
+
+    (messagesF, syncViewF).mapN((m, s) => addressKeyed ++ m ++ s)
+  }
+
+  /** JSON twin of [[infoEntryBytes]] for the legacy `Map[GlobalStateKey, Json]` full-state path ([[convertCurrencySnapshots]] →
+    * [[toAllStateKeyValuePairs]] → `MptBuilderOps.buildMpt`). Emits the IDENTICAL `Mg*` keys (one entry per account / holder / messageType
+    * / peer) with each value as the same typed `(entryKey, value)` tuple, `.asJson`. The JSON build path is a separate root computation
+    * (NOT byte-compared against the typed `insert[V]` root — see `syncFromGlobalSnapshotInfo`'s scaladoc), so this need only key-mirror the
+    * bytes encoder for consistency; the key construction is structurally identical so the two cannot drift. `activeAllowSpends` stays
+    * fieldId-7.
+    */
+  def infoEntryJson[F[_]: Sync: Hasher](
+    mgAddr: Address,
+    info: CurrencySnapshotInfo
+  ): F[List[(GlobalStateKey, Json)]] = {
+    import GlobalStateFieldId._
+    def opt[K, V](m: Option[SortedMap[K, V]]): List[(K, V)] = m.fold(List.empty[(K, V)])(_.toList)
+
+    val addressKeyed: List[(GlobalStateKey, Json)] =
+      info.balances.toList.map { case (a, b) => GlobalStateKey.metagraphEntry(mgAddr, MgBalances, a) -> (a, b).asJson } ++
+        info.lastTxRefs.toList.map { case (a, r) => GlobalStateKey.metagraphEntry(mgAddr, MgLastTxRefs, a) -> (a, r).asJson } ++
+        opt(info.lastFeeTxRefs).map { case (a, r) => GlobalStateKey.metagraphEntry(mgAddr, MgLastFeeTxRefs, a) -> (a, r).asJson } ++
+        opt(info.lastAllowSpendRefs).map {
+          case (a, r) => GlobalStateKey.metagraphEntry(mgAddr, MgLastAllowSpendRefs, a) -> (a, r).asJson
+        } ++
+        opt(info.lastTokenLockRefs).map {
+          case (a, r) => GlobalStateKey.metagraphEntry(mgAddr, MgLastTokenLockRefs, a) -> (a, r).asJson
+        } ++
+        opt(info.activeTokenLocks).map { case (a, s) => GlobalStateKey.metagraphEntry(mgAddr, MgActiveTokenLocks, a) -> (a, s).asJson }
+
+    val messagesF: F[List[(GlobalStateKey, Json)]] =
+      opt(info.lastMessages).traverse {
+        case (mt, m) => GlobalStateKey.metagraphEntryHashed[F](mgAddr, MgLastMessages, mt.value).map(_ -> (mt, m).asJson)
+      }
+    val syncViewF: F[List[(GlobalStateKey, Json)]] =
+      opt(info.globalSnapshotSyncView).traverse {
+        case (p, s) => GlobalStateKey.metagraphEntryHashed[F](mgAddr, MgGlobalSnapshotSyncView, p.value.value).map(_ -> (p, s).asJson)
+      }
+
+    (messagesF, syncViewF).mapN((m, s) => addressKeyed ++ m ++ s)
+  }
+
   /** Canonical typed MPT entries for the `lastCurrencySnapshots` GSI field — the EXACT producer encoding gl0 writes in
-    * [[toAllStateKeyValueBytes]] / [[convertCurrencySnapshots]]: each `Address` entry expands to TWO `metagraph`-namespaced keys,
-    * `LastIncrementalCurrencySnapshots` (fieldId 5, the `Signed[CurrencyIncrementalSnapshot]`) and `LastCurrencySnapshotInfo` (fieldId 6,
-    * the `CurrencySnapshotInfo`), each encoded via its canonical `ImmutableCodec`. A `Left` (genesis full snapshot) is reduced to its
-    * incremental form exactly as gl0 does (`CurrencyIncrementalSnapshot.fromCurrencySnapshot` + `info.toCurrencySnapshotInfo`).
+    * [[toAllStateKeyValueBytes]] / [[convertCurrencySnapshots]]: each `Address` entry expands to `LastIncrementalCurrencySnapshots`
+    * (fieldId 5, the `Signed[CurrencyIncrementalSnapshot]`) PLUS the UNROLLED per-entry `Mg*` info sub-fields (via [[infoEntryBytes]],
+    * replacing the old monolithic `LastCurrencySnapshotInfo` blob). A `Left` (genesis full snapshot) is reduced to its incremental form
+    * exactly as gl0 does (`CurrencyIncrementalSnapshot.fromCurrencySnapshot` + `info.toCurrencySnapshotInfo`), then its info unrolls the
+    * same way.
     *
     * Factored out of [[toAllStateKeyValueBytes]] so the gl1-style follow verifier
     * ([[io.constellationnetwork.schema.nakamoto.follow.FollowVerifyCore.verifyFieldRoots]]) recomputes the currency-snapshot subtree roots
@@ -1159,10 +1247,9 @@ object GlobalStateConverter {
     * depends on (see `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`). `toAllStateKeyValueBytes`'s inline `currencyEntriesF` MUST stay
     * in lockstep with this method.
     *
-    * Unlike the five hypergraph-namespaced consumed fields (each a single `Hash`), `lastCurrencySnapshots` SPLITS into two MPT partition
-    * roots, carried together in the signed `GlobalSnapshotStateProof` field-4 slot `lastCurrencySnapshotsProof`
-    * (`CurrencySnapshotMptRoots`); they are also covered transitively by the global `mptRoot`. This callable exists so the follower can
-    * deterministically recompute the cl1/dl1-consumed currency-snapshot bytes byte-identically to gl0.
+    * `lastCurrencySnapshots` SPLITS into the signed `GlobalSnapshotStateProof` field-4 slot `lastCurrencySnapshotsProof`
+    * (`CurrencySnapshotMptRoots`): `incrementalRoot` (fieldId 5) + `infoRoot` (the UNION over the 8 `Mg*` `infoSubFields`); both are also
+    * covered transitively by the global `mptRoot`. This callable exists so the follower can recompute those bytes byte-identically to gl0.
     */
   def currencySnapshotEntryBytes[F[_]: Async: Parallel: Hasher: JsonSerializer](
     data: SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
@@ -1172,30 +1259,27 @@ object GlobalStateConverter {
     def enc[V](v: V)(implicit c: ImmutableCodec[V]): Array[Byte] = c.immutableBytes(v).toArray
     data.toList.parTraverse {
       case (metagraphAddr, Left(fullSnapshot)) =>
-        CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value).map { inc =>
-          List(
-            GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastIncrementalCurrencySnapshots) ->
-              enc[Signed[CurrencyIncrementalSnapshot]](Signed(inc, fullSnapshot.proofs)),
-            GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastCurrencySnapshotInfo) ->
-              enc[CurrencySnapshotInfo](fullSnapshot.info.toCurrencySnapshotInfo)
-          )
-        }
+        for {
+          inc <- CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value)
+          infoEntries <- infoEntryBytes[F](metagraphAddr, fullSnapshot.info.toCurrencySnapshotInfo)
+        } yield
+          (GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastIncrementalCurrencySnapshots) ->
+            enc[Signed[CurrencyIncrementalSnapshot]](Signed(inc, fullSnapshot.proofs))) :: infoEntries
       case (metagraphAddr, Right((inc, snInfo))) =>
-        List(
-          GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastIncrementalCurrencySnapshots) ->
-            enc[Signed[CurrencyIncrementalSnapshot]](inc),
-          GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastCurrencySnapshotInfo) ->
-            enc[CurrencySnapshotInfo](snInfo)
-        ).pure[F]
+        infoEntryBytes[F](metagraphAddr, snInfo).map { infoEntries =>
+          (GlobalStateKey.metagraph(metagraphAddr, GlobalStateFieldId.LastIncrementalCurrencySnapshots) ->
+            enc[Signed[CurrencyIncrementalSnapshot]](inc)) :: infoEntries
+        }
     }.map(_.flatten.toMap)
 
   }
 
-  /** The pair of MPT subtree roots `(LastIncrementalCurrencySnapshots, LastCurrencySnapshotInfo)` for a `lastCurrencySnapshots` map,
-    * computed by encoding via [[currencySnapshotEntryBytes]] (gl0's exact producer bytes), grouping by `fieldId`, hexing the keys, and
-    * routing each group through [[fieldRootFromBytes]] — the SAME callable that backs every other per-field root. Empty map ⇒ `(Hash.empty,
-    * Hash.empty)` (the [[fieldRootFromBytes]] empty convention). Used by the follow verifier to recompute-match the cl1/dl1-consumed
-    * `lastCurrencySnapshots` field deterministically.
+  /** The pair of MPT subtree roots for a `lastCurrencySnapshots` map: `incrementalRoot` (fieldId 5) and `infoRoot` (the UNION over the 8
+    * `Mg*` `infoSubFields`), computed by encoding via [[currencySnapshotEntryBytes]] (gl0's exact producer bytes), grouping by `fieldId`,
+    * hexing the keys, and routing each group through [[fieldRootFromBytes]] — the SAME callable that backs every other per-field root.
+    * Empty info ⇒ `infoRoot = Hash.empty` (the [[fieldRootFromBytes]] empty convention). Used by the follow verifier to recompute-match the
+    * cl1/dl1-consumed `lastCurrencySnapshots` field deterministically. The union grouping MUST stay identical to the producer-side
+    * `GlobalSnapshotInfo.stateProofBuilder` / `mptStateProofFromBytes` infoRoot computation.
     */
   def currencySnapshotFieldRoots[F[_]: Async: Parallel: Hasher: JsonSerializer](
     data: SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
@@ -1203,15 +1287,162 @@ object GlobalStateConverter {
     implicit stateProofSelector: StateProofSelector
   ): F[(Hash, Hash)] =
     currencySnapshotEntryBytes[F](data).flatMap { typed =>
-      def rootForField(fieldId: GlobalStateFieldId): F[Hash] =
-        typed.toList.filter { case (k, _) => k.fieldId == fieldId }.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }
+      def rootForFields(pred: GlobalStateFieldId => Boolean): F[Hash] =
+        typed.toList.filter { case (k, _) => pred(k.fieldId) }.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }
           .map(_.toMap)
           .flatMap(fieldRootFromBytes[F])
       (
-        rootForField(GlobalStateFieldId.LastIncrementalCurrencySnapshots),
-        rootForField(GlobalStateFieldId.LastCurrencySnapshotInfo)
+        rootForFields(_ == GlobalStateFieldId.LastIncrementalCurrencySnapshots),
+        rootForFields(GlobalStateFieldId.infoSubFields.contains)
       ).tupled
     }
+
+  /** Read-only capability over the unrolled per-metagraph `CurrencySnapshotInfo` partitions — just the prefix scan
+    * [[reconstructCurrencyInfoFrom]] needs. Split out from [[CurrencyInfoMpt]] so read-only callers (reconstruction, getAll*) take only
+    * this and cannot reach the write methods (compile-time bypass-proof). Both `MptStore` and `GlobalStateReader` already expose
+    * `getAllForPrefix`; adapt via [[CurrencyInfoMpt.fromMptStore]] (here, also a reader) / `CurrencyInfoMptAdapters.readerFor`
+    * (node-shared).
+    */
+  trait CurrencyInfoReader[F[_]] {
+    def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]]
+  }
+
+  /** Minimal read+write capability over the unrolled per-metagraph `CurrencySnapshotInfo` partitions, shared by BOTH the `MptStore` writers
+    * (`syncFromStateChanges` / `syncFromGlobalSnapshotInfo`, shared) and the overlay `AcceptanceMpt` writer (`applyStateChanges`,
+    * node-shared) so the reconstruction + write + removal logic lives in ONE place (docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md
+    * §6). Extends [[CurrencyInfoReader]] with the two write methods. Both `MptStore` and `AcceptanceMpt` already expose these three
+    * methods; adapt via [[CurrencyInfoMpt.fromMptStore]] (here) / `CurrencyInfoMptAdapters.mptFor` (node-shared).
+    */
+  trait CurrencyInfoMpt[F[_]] extends CurrencyInfoReader[F] {
+    def insert[V: ImmutableCodec](entries: Map[GlobalStateKey, V]): F[Unit]
+    def remove(keys: List[GlobalStateKey]): F[Unit]
+  }
+
+  object CurrencyInfoMpt {
+    def fromMptStore[F[_]](store: MptStore[F, GlobalStateKey]): CurrencyInfoMpt[F] = new CurrencyInfoMpt[F] {
+      def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] = store.getAllForPrefix[V](prefix)
+      def insert[V: ImmutableCodec](entries: Map[GlobalStateKey, V]): F[Unit] = store.insert[V](entries)
+      def remove(keys: List[GlobalStateKey]): F[Unit] = store.remove(keys)
+    }
+  }
+
+  /** Standalone reconstruction (the inverse of [[infoEntryBytes]]) over any [[CurrencyInfoMpt]] — see the `MptStoreReadOps`
+    * `reconstructCurrencySnapshotInfo` scaladoc for the per-field / Option-emptiness / fieldId-7 contract.
+    */
+  def reconstructCurrencyInfoFrom[F[_]: Sync: Hasher](
+    metagraphAddress: Address,
+    reader: CurrencyInfoReader[F]
+  ): F[CurrencySnapshotInfo] = {
+    import GlobalStateFieldId._
+    def scan[K, V](sub: GlobalStateFieldId)(implicit c: ImmutableCodec[(K, V)], o: Ordering[K]): F[SortedMap[K, V]] =
+      GlobalStateKey
+        .metagraphFieldPrefix[F](metagraphAddress, sub)
+        .flatMap(reader.getAllForPrefix[(K, V)])
+        .map(e => SortedMap.from(e.values))
+    for {
+      balances <- scan[Address, Balance](MgBalances)
+      lastTxRefs <- scan[Address, TransactionReference](MgLastTxRefs)
+      lastFeeTxRefs <- scan[Address, TransactionReference](MgLastFeeTxRefs)
+      lastAllowSpendRefs <- scan[Address, AllowSpendReference](MgLastAllowSpendRefs)
+      lastTokenLockRefs <- scan[Address, TokenLockReference](MgLastTokenLockRefs)
+      activeTokenLocks <- scan[Address, SortedSet[Signed[TokenLock]]](MgActiveTokenLocks)
+      lastMessages <- scan[MessageType, Signed[CurrencyMessage]](MgLastMessages)
+      globalSyncView <- scan[PeerId, Signed[GlobalSnapshotSync]](MgGlobalSnapshotSyncView)
+      activeAllowSpends <- GlobalStateKey
+        .hypergraphFieldPrefix[F](ActiveAllowSpends, metagraphAddress.some)
+        .flatMap(reader.getAllForPrefix[SortedSet[Signed[AllowSpend]]])
+        .map(e => SortedMap.from(e.values.toList.flatMap(s => s.headOption.map(_.value.source -> s))))
+    } yield
+      CurrencySnapshotInfo(
+        lastTxRefs = lastTxRefs,
+        balances = balances,
+        lastMessages = lastMessages.some,
+        lastFeeTxRefs = lastFeeTxRefs.some,
+        lastAllowSpendRefs = lastAllowSpendRefs.some,
+        activeAllowSpends = activeAllowSpends.some,
+        globalSnapshotSyncView = globalSyncView.some,
+        lastTokenLockRefs = lastTokenLockRefs.some,
+        activeTokenLocks = activeTokenLocks.some
+      )
+  }
+
+  /** The `Mg*` keys present in `prior` but absent in `next` — the per-entry removals the delta writers must issue so an entry dropped from
+    * the info (expired allow-spend, pruned balance) does not leave a stale unrolled key (the I5 invariant). `activeAllowSpends` is EXCLUDED
+    * — its fieldId-7 removals are the existing `removedAllowSpendKeys` accumulator path, not this one.
+    */
+  def infoRemovalKeys[F[_]: Sync: Hasher](
+    metagraphAddress: Address,
+    prior: CurrencySnapshotInfo,
+    next: CurrencySnapshotInfo
+  ): F[List[GlobalStateKey]] = {
+    import GlobalStateFieldId._
+    def addrRem[A, B](sub: GlobalStateFieldId, p: SortedMap[Address, A], n: SortedMap[Address, B]): List[GlobalStateKey] =
+      (p.keySet -- n.keySet).toList.map(a => GlobalStateKey.metagraphEntry(metagraphAddress, sub, a))
+    def optRem[A, B](sub: GlobalStateFieldId, p: Option[SortedMap[Address, A]], n: Option[SortedMap[Address, B]]): List[GlobalStateKey] =
+      addrRem(sub, p.getOrElse(SortedMap.empty[Address, A]), n.getOrElse(SortedMap.empty[Address, B]))
+    val pureRem =
+      addrRem(MgBalances, prior.balances, next.balances) ++
+        addrRem(MgLastTxRefs, prior.lastTxRefs, next.lastTxRefs) ++
+        optRem(MgLastFeeTxRefs, prior.lastFeeTxRefs, next.lastFeeTxRefs) ++
+        optRem(MgLastAllowSpendRefs, prior.lastAllowSpendRefs, next.lastAllowSpendRefs) ++
+        optRem(MgLastTokenLockRefs, prior.lastTokenLockRefs, next.lastTokenLockRefs) ++
+        optRem(MgActiveTokenLocks, prior.activeTokenLocks, next.activeTokenLocks)
+    val removedMsgs = prior.lastMessages.getOrElse(SortedMap.empty[MessageType, Signed[CurrencyMessage]]).keySet --
+      next.lastMessages.getOrElse(SortedMap.empty[MessageType, Signed[CurrencyMessage]]).keySet
+    val removedSync = prior.globalSnapshotSyncView.getOrElse(SortedMap.empty[PeerId, Signed[GlobalSnapshotSync]]).keySet --
+      next.globalSnapshotSyncView.getOrElse(SortedMap.empty[PeerId, Signed[GlobalSnapshotSync]]).keySet
+    for {
+      msgRem <- removedMsgs.toList.traverse(mt => GlobalStateKey.metagraphEntryHashed[F](metagraphAddress, MgLastMessages, mt.value))
+      syncRem <- removedSync.toList.traverse(p =>
+        GlobalStateKey.metagraphEntryHashed[F](metagraphAddress, MgGlobalSnapshotSyncView, p.value.value)
+      )
+    } yield pureRem ++ msgRem ++ syncRem
+  }
+
+  /** Write one MG's unrolled `CurrencySnapshotInfo`: upsert the 8 `Mg*` partitions (typed inserts — byte-identical to [[infoEntryBytes]]
+    * via the same codecs; unchanged entries are MPT no-ops) and remove the dropped entries ([[infoRemovalKeys]] vs `priorInfo`). Does NOT
+    * touch `activeAllowSpends` (fieldId-7, the existing accumulator path) nor the incremental (fieldId-5). The SINGLE typed write path for
+    * `applyStateChanges` / `syncFromStateChanges` / `syncFromGlobalSnapshotInfo`.
+    */
+  def writeCurrencyInfo[F[_]: Sync: Hasher](
+    metagraphAddress: Address,
+    newInfo: CurrencySnapshotInfo,
+    priorInfo: CurrencySnapshotInfo,
+    mpt: CurrencyInfoMpt[F]
+  ): F[Unit] = {
+    import GlobalStateFieldId._
+    def addrMap[V](sub: GlobalStateFieldId, m: SortedMap[Address, V]): Map[GlobalStateKey, (Address, V)] =
+      m.iterator.map { case (a, v) => GlobalStateKey.metagraphEntry(metagraphAddress, sub, a) -> ((a, v)) }.toMap
+    def optMap[V](sub: GlobalStateFieldId, m: Option[SortedMap[Address, V]]): Map[GlobalStateKey, (Address, V)] =
+      addrMap(sub, m.getOrElse(SortedMap.empty[Address, V]))
+    for {
+      msgEntries <- newInfo.lastMessages
+        .getOrElse(SortedMap.empty[MessageType, Signed[CurrencyMessage]])
+        .toList
+        .traverse {
+          case (mt, m) => GlobalStateKey.metagraphEntryHashed[F](metagraphAddress, MgLastMessages, mt.value).map(_ -> ((mt, m)))
+        }
+        .map(_.toMap)
+      syncEntries <- newInfo.globalSnapshotSyncView
+        .getOrElse(SortedMap.empty[PeerId, Signed[GlobalSnapshotSync]])
+        .toList
+        .traverse {
+          case (p, s) =>
+            GlobalStateKey.metagraphEntryHashed[F](metagraphAddress, MgGlobalSnapshotSyncView, p.value.value).map(_ -> ((p, s)))
+        }
+        .map(_.toMap)
+      removals <- infoRemovalKeys[F](metagraphAddress, priorInfo, newInfo)
+      _ <- mpt.insert[(Address, Balance)](addrMap(MgBalances, newInfo.balances))
+      _ <- mpt.insert[(Address, TransactionReference)](addrMap(MgLastTxRefs, newInfo.lastTxRefs))
+      _ <- mpt.insert[(Address, TransactionReference)](optMap(MgLastFeeTxRefs, newInfo.lastFeeTxRefs))
+      _ <- mpt.insert[(Address, AllowSpendReference)](optMap(MgLastAllowSpendRefs, newInfo.lastAllowSpendRefs))
+      _ <- mpt.insert[(Address, TokenLockReference)](optMap(MgLastTokenLockRefs, newInfo.lastTokenLockRefs))
+      _ <- mpt.insert[(Address, SortedSet[Signed[TokenLock]])](optMap(MgActiveTokenLocks, newInfo.activeTokenLocks))
+      _ <- mpt.insert[(MessageType, Signed[CurrencyMessage])](msgEntries)
+      _ <- mpt.insert[(PeerId, Signed[GlobalSnapshotSync])](syncEntries)
+      _ <- if (removals.nonEmpty) mpt.remove(removals) else Sync[F].unit
+    } yield ()
+  }
 
   object syntax {
     implicit class GlobalSnapshotInfoMptOps(val info: GlobalSnapshotInfo) extends AnyVal {
@@ -1386,9 +1617,30 @@ object GlobalStateConverter {
             GlobalStateKey.metagraph(metagraphAddress, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
           )
 
-      def getCurrencySnapshotInfo(metagraphAddress: Address): F[Option[CurrencySnapshotInfo]] =
+      /** Reconstruct a metagraph's `CurrencySnapshotInfo` from the UNROLLED per-entry `Mg*` partitions — the inverse of [[infoEntryBytes]],
+        * replacing the monolithic fieldId-6 blob read (docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md). Each `Mg*` partition is
+        * prefix-scanned (`metagraphFieldPrefix`); the entry key is recovered from the VALUE (the value-carries-key layout, since `toHex`
+        * hashes the key). `activeAllowSpends` is NOT an `Mg*` partition — it is read from the fieldId-7 `ActiveAllowSpends` metagraph-scope
+        * partition, recovering each holder from its allow-spends' `source`.
+        *
+        * '''Option-emptiness:''' the seven optional fields reconstruct as `Some(scanned)` (the post-tess3 always-`Some` convention — an
+        * empty scan ⇒ `Some(empty)`). This is MPT-invisible (an empty optional encodes to zero entries, same as `None`) and read-safe
+        * (consumers use `.getOrElse`); for the steady-state post-tess3 producer it round-trips exactly (the I1 invariant).
+        */
+      def reconstructCurrencySnapshotInfo(metagraphAddress: Address)(implicit H: Hasher[F]): F[CurrencySnapshotInfo] =
+        reconstructCurrencyInfoFrom[F](metagraphAddress, CurrencyInfoMpt.fromMptStore(store))
+
+      /** A metagraph has currency state iff its incremental-snapshot partition (fieldId 5) is present (written in lockstep with the info on
+        * every path), so this gates `None`/`Some` exactly as the old blob-presence read did, then reconstructs from the unrolled
+        * partitions.
+        */
+      def getCurrencySnapshotInfo(metagraphAddress: Address)(implicit H: Hasher[F]): F[Option[CurrencySnapshotInfo]] =
         store
-          .get[CurrencySnapshotInfo](GlobalStateKey.metagraph(metagraphAddress, GlobalStateFieldId.LastCurrencySnapshotInfo))
+          .contains(GlobalStateKey.metagraph(metagraphAddress, GlobalStateFieldId.LastIncrementalCurrencySnapshots))
+          .flatMap {
+            case true  => reconstructCurrencySnapshotInfo(metagraphAddress).map(_.some)
+            case false => none[CurrencySnapshotInfo].pure[F]
+          }
 
       def getCurrencySnapshotProof(metagraphAddress: Address): F[Option[Proof]] =
         store
@@ -1433,24 +1685,38 @@ object GlobalStateConverter {
           addrList = addrSet.toList
           leftKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots))
           incKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots))
-          infoKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshotInfo))
           lefts <- store.getMany[Signed[CurrencySnapshot]](leftKeys)
           incs <- store.getMany[Signed[CurrencyIncrementalSnapshot]](incKeys)
-          infos <- store.getMany[CurrencySnapshotInfo](infoKeys)
-        } yield
-          SortedMap.from(addrList.flatMap { addr =>
+          // Right-arm info is RECONSTRUCTED from the unrolled `Mg*` partitions (per-MG, hence the traverse — the O(MGs)×O(entries)
+          // materialization cost is the tracked lazy-reads follow-up; see UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md §11).
+          entries <- addrList.traverse { addr =>
             val leftKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots)
             val incKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
-            val infoKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshotInfo)
             lefts.get(leftKey) match {
-              case Some(snap) => List(addr -> Left(snap))
+              case Some(snap) =>
+                Option(
+                  addr -> Left(snap): (
+                    Address,
+                    Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
+                  )
+                ).pure[F]
               case None =>
-                (incs.get(incKey), infos.get(infoKey)) match {
-                  case (Some(inc), Some(info)) => List(addr -> Right((inc, info)))
-                  case _                       => Nil
+                incs.get(incKey) match {
+                  case Some(inc) =>
+                    reconstructCurrencySnapshotInfo(addr).map(info =>
+                      Option(
+                        addr -> Right((inc, info)): (
+                          Address,
+                          Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
+                        )
+                      )
+                    )
+                  case None =>
+                    none[(Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)])].pure[F]
                 }
             }
-          })
+          }
+        } yield SortedMap.from(entries.flatten)
 
       def getUpdateNodeParameters(
         id: Id
@@ -1505,7 +1771,6 @@ object GlobalStateConverter {
         import io.constellationnetwork.security.hash.Hash
         import io.constellationnetwork.security.signature.Signed
         import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
-        import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
         import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
         import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutable}
         import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmutableCodec
@@ -1540,11 +1805,12 @@ object GlobalStateConverter {
           }.toMap
 
         // Currency snapshots — Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
-        // is stored as two separate keys (LastIncrementalCurrencySnapshots + LastCurrencySnapshotInfo).
+        // splits into the fieldId-5 incremental key PLUS the UNROLLED per-entry `Mg*` info partitions. The incremental map is
+        // inserted here; each MG's `CurrencySnapshotInfo` is written via `writeCurrencyInfo` (drops the monolithic fieldId-6 blob).
         def buildCurrencySnapshotEntries: F[
           (
             Map[GlobalStateKey, Signed[io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot]],
-            Map[GlobalStateKey, io.constellationnetwork.currency.schema.currency.CurrencySnapshotInfo]
+            List[(Address, io.constellationnetwork.currency.schema.currency.CurrencySnapshotInfo)]
           )
         ] =
           info.lastCurrencySnapshots.toList.parTraverse {
@@ -1554,17 +1820,17 @@ object GlobalStateConverter {
                 .map { inc =>
                   (
                     GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> Signed(inc, fullSnapshot.proofs),
-                    GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> fullSnapshot.info.toCurrencySnapshotInfo
+                    metagraphAddr -> fullSnapshot.info.toCurrencySnapshotInfo
                   )
                 }
             case (metagraphAddr, Right((inc, snInfo))) =>
               (
                 (GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> inc) ->
-                  (GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> snInfo)
+                  (metagraphAddr -> snInfo)
               ).pure[F]
           }.map { paired =>
             val snapshotEntries = paired.map(_._1).toMap
-            val infoEntries = paired.map(_._2).toMap
+            val infoEntries = paired.map(_._2)
             (snapshotEntries, infoEntries)
           }
 
@@ -1759,7 +2025,14 @@ object GlobalStateConverter {
           _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
           _ <- store.insert[Balance](balances)
           _ <- store.insert[Signed[io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot]](currency._1)
-          _ <- store.insert[io.constellationnetwork.currency.schema.currency.CurrencySnapshotInfo](currency._2)
+          // Unrolled per-metagraph info — the 8 `Mg*` partitions replace the monolithic fieldId-6 blob. `store.clear` above leaves an
+          // empty store, so the reconstructed prior is empty ⇒ no removals; the upserts are the full info per MG.
+          _ <- currency._2.traverse_ {
+            case (metagraphAddr, newInfo) =>
+              reconstructCurrencyInfoFrom[F](metagraphAddr, CurrencyInfoMpt.fromMptStore(store)).flatMap { priorInfo =>
+                writeCurrencyInfo[F](metagraphAddr, newInfo, priorInfo, CurrencyInfoMpt.fromMptStore(store))
+              }
+          }
           _ <- store.insert[io.constellationnetwork.merkletree.Proof](currencyProofs)
           _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](activeAllowSpends)
           _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](activeTokenLocks)
@@ -1883,10 +2156,13 @@ object GlobalStateConverter {
             case (addr, p) => GlobalStateKey.metagraph(addr, LastCurrencySnapshotsProofs) -> p
           }.toMap
 
+        // fieldId-5 incremental map + the typed per-MG `CurrencySnapshotInfo` (written via `writeCurrencyInfo` into the unrolled `Mg*`
+        // partitions — the monolithic fieldId-6 blob is dropped). The info write is delta-aware: it reconstructs the prior info and
+        // removes entries dropped this ordinal (`infoRemovalKeys`), so a node converges to the same `infoRoot` as the producer.
         def buildCurrencySnapshotEntries: F[
           (
             Map[GlobalStateKey, Signed[CurrencyIncrementalSnapshot]],
-            Map[GlobalStateKey, CurrencySnapshotInfo]
+            List[(Address, CurrencySnapshotInfo)]
           )
         ] =
           acc.lastCurrencySnapshots.toList.parTraverse {
@@ -1896,16 +2172,16 @@ object GlobalStateConverter {
                 .map { inc =>
                   (
                     GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> Signed(inc, fullSnapshot.proofs),
-                    GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> fullSnapshot.info.toCurrencySnapshotInfo
+                    metagraphAddr -> fullSnapshot.info.toCurrencySnapshotInfo
                   )
                 }
             case (metagraphAddr, Right((inc, snInfo))) =>
               (
                 (GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> inc) ->
-                  (GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> snInfo)
+                  (metagraphAddr -> snInfo)
               ).pure[F]
           }.map { paired =>
-            (paired.map(_._1).toMap, paired.map(_._2).toMap)
+            (paired.map(_._1).toMap, paired.map(_._2))
           }
 
         val activeAllowSpends: Map[GlobalStateKey, SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]] =
@@ -2006,7 +2282,15 @@ object GlobalStateConverter {
           _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
           _ <- store.insert[Balance](balances)
           _ <- store.insert[Signed[CurrencyIncrementalSnapshot]](currency._1)
-          _ <- store.insert[CurrencySnapshotInfo](currency._2)
+          // Unrolled per-metagraph info: reconstruct the prior `Mg*` state, then upsert the new info + remove dropped entries
+          // (`writeCurrencyInfo` → `infoRemovalKeys`). Replaces the monolithic fieldId-6 blob insert. fieldId-7 `activeAllowSpends`
+          // is untouched here (its removals are the accumulator's `removedAllowSpendKeys`, applied in `keysToRemove` above).
+          _ <- currency._2.traverse_ {
+            case (metagraphAddr, newInfo) =>
+              reconstructCurrencyInfoFrom[F](metagraphAddr, CurrencyInfoMpt.fromMptStore(store)).flatMap { priorInfo =>
+                writeCurrencyInfo[F](metagraphAddr, newInfo, priorInfo, CurrencyInfoMpt.fromMptStore(store))
+              }
+          }
           _ <- store.insert[io.constellationnetwork.merkletree.Proof](currencyProofs)
           _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](activeAllowSpends)
           _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](activeTokenLocksEntries)

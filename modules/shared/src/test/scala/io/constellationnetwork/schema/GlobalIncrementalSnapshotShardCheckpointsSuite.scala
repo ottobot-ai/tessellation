@@ -107,6 +107,7 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
   private def mkDelta(mgAddr: Address, lockHolderAmount: Long): ShardDerivedStateDelta =
     ShardDerivedStateDelta(
       perMetagraphMptRoots = SortedMap(mgAddr -> hash('a')),
+      perMetagraphStateDiff = SortedMap.empty,
       includedSnapshots = SortedMap(mgAddr -> NonEmptyList.of(mkSignedBinary('s'))),
       tokenLockBalancesDelta = SortedMap(
         mgAddr -> SortedMap(

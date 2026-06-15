@@ -1,0 +1,47 @@
+digraph R {
+  graph [splines=line, fontname="Helvetica"];
+  node  [fontname="Helvetica", fontsize=11];
+  edge  [arrowsize=0.6, penwidth=1.6];
+  labelloc="t"; fontsize=15;
+  label="RUN-24  —  w = 0 0 0 0 1 1 1 1 1 1  (honest rotation + ml0 re-emit fork every slot after d4)";
+
+  g  [pos="0,0!",    shape=square, style=filled, fillcolor="#9e9e9e", label="g\nd0"];
+  c1 [pos="1.4,0!",  shape=circle, style=filled, fillcolor="#455a64", fontcolor=white, label="d1"];
+  c2 [pos="2.8,0!",  shape=circle, style=filled, fillcolor="#455a64", fontcolor=white, label="d2"];
+  c3 [pos="4.2,0!",  shape=circle, style=filled, fillcolor="#455a64", fontcolor=white, label="d3"];
+  c4 [pos="5.6,0!",  shape=circle, style=filled, fillcolor="#455a64", fontcolor=white, label="d4"];
+  g->c1->c2->c3->c4 [color="#455a64"];
+
+  // tine alpha (gl0-finalized, shorter)
+  a5 [pos="7.0,1.3!",  shape=circle, style=filled, fillcolor="#90caf9", label="d5"];
+  a6 [pos="8.4,1.3!",  shape=circle, style=filled, fillcolor="#90caf9", label="d6"];
+  a7 [pos="9.8,1.3!",  shape=doublecircle, style=filled, fillcolor="#1565c0", fontcolor=white, label="C7A\nd7\nFINAL"];
+  c4->a5->a6->a7 [color="#1565c0"];
+
+  // tine beta (maxvalid-tk bestTip, longer)
+  b5 [pos="7.3,-1.3!",  shape=circle, style=filled, fillcolor="#ffcc80", label="d5"];
+  b6 [pos="8.7,-1.3!",  shape=circle, style=filled, fillcolor="#ffcc80", label="d6"];
+  b7 [pos="10.1,-1.3!", shape=circle, style=filled, fillcolor="#ffcc80", label="d7"];
+  b8 [pos="11.5,-1.3!", shape=circle, style=filled, fillcolor="#ffcc80", label="d8"];
+  b9 [pos="12.9,-1.3!", shape=circle, style=filled, fillcolor="#ffcc80", label="d9"];
+  b10[pos="14.3,-1.3!", shape=doublecircle, style=filled, fillcolor="#6a1b9a", fontcolor=white, label="C10\nd10\ntip"];
+  c4->b5->b6->b7->b8->b9->b10 [color="#ef6c00"];
+
+  // characteristic string
+  ww [pos="0,-3.0!",    shape=plaintext, label="w:"];
+  x1 [pos="1.4,-3.0!",  shape=plaintext, label="0"];
+  x2 [pos="2.8,-3.0!",  shape=plaintext, label="0"];
+  x3 [pos="4.2,-3.0!",  shape=plaintext, label="0"];
+  x4 [pos="5.6,-3.0!",  shape=plaintext, label="0"];
+  x5 [pos="7.1,-3.0!",  shape=plaintext, fontcolor="#c62828", label="1"];
+  x6 [pos="8.5,-3.0!",  shape=plaintext, fontcolor="#c62828", label="1"];
+  x7 [pos="9.9,-3.0!",  shape=plaintext, fontcolor="#c62828", label="1"];
+  x8 [pos="11.5,-3.0!", shape=plaintext, fontcolor="#c62828", label="1"];
+  x9 [pos="12.9,-3.0!", shape=plaintext, fontcolor="#c62828", label="1"];
+  x10[pos="14.3,-3.0!", shape=plaintext, fontcolor="#c62828", label="1"];
+
+  n1 [pos="5.0,-3.8!", shape=plaintext, fontsize=10, fontcolor="#c62828",
+      label="two long tines share only prefix g..d4  ·  gl0 FINALIZED the SHORTER tine (C7A, d7)  ·  maxvalid-tk picks the LONGER (C10, d10)"];
+  n2 [pos="5.0,-4.4!", shape=plaintext, fontsize=10, fontcolor="#1565c0",
+      label="finalized vertex C7A is NOT on the winning tine -> SC tip a240a5fe orphaned -> gl0 frozen.  Anchor (should pin to C7A) never fired."];
+}

@@ -3,7 +3,7 @@ package io.constellationnetwork.node.shared.modules
 import java.security.KeyPair
 
 import cats.Parallel
-import cats.data.NonEmptySet
+import cats.data.{NonEmptyList, NonEmptySet}
 import cats.effect.Async
 import cats.effect.std.Supervisor
 import cats.syntax.all._
@@ -48,7 +48,9 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.generation.Generation
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hasher, HasherSelector, SecurityProvider}
+import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import fs2.concurrent.SignallingRef
 
@@ -284,11 +286,33 @@ object SharedServices {
         // boundary writer uses, decoded to 32 raw bytes. MPT-committed ⇒ byte-identical to the gl0 produce path's `etaForEpoch`.
         etaForEpoch = (epoch: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
           sharedEtaForPeriod(epoch).map(h => io.constellationnetwork.security.hex.Hex(h.value).toBytes),
-        // S3: real committee re-execution closure (replaces the `noReExecDerivation` fail-closed stub). Same shared
-        // processor as GSAM so producer↔verifier roots are byte-identical.
-        reExecuteDerivation = Some(
-          ShardCheckpointWiring.reExecDerivation[F](shardScEventsProcessor)(Async[F], HasherSelector[F].getCurrent)
-        )
+        // STEP 6: the sub-quorum re-exec failover (`ShardCheckpointGl0AcceptanceManager.reExecPath`) byte-compares the recomputed
+        // per-MG root against the committee-attested `perMetagraphMptRoots(mg)`, which is now the PIN-1
+        // `Hasher.hash((incrementalRoot, infoRoot))` encoding (NOT the old `hash((mg,state))`). So the verifier re-exec MUST produce
+        // the SAME encoding — `reExecDerivationWithDiff(...)._1` is exactly that root (it seeds the derivation from this node's
+        // adopted S(N) via the finalized `GlobalStateReader`, identical to the producer's). We discard its `ChangeSet` half (the
+        // sub-quorum compare only needs the Hash; the authoritative apply-and-verify of the diff happens in
+        // `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`). Same shared processor as GSAM ⇒ producer↔verifier roots
+        // byte-identical.
+        reExecuteDerivation = Some {
+          implicit val h: Hasher[F] = HasherSelector[F].getCurrent
+          val priorStateReader = io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+            .fromMptStore[F](storages.mptStore)
+          val withDiff =
+            ShardCheckpointWiring.reExecDerivationWithDiff[F](shardScEventsProcessor, priorStateReader)(
+              Async[F],
+              Parallel[F],
+              h,
+              implicitly[JsonSerializer[F]],
+              globalStateProofSelector
+            )
+          (mg: Address, binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]], anchor: SnapshotOrdinal) =>
+            // OMIT-ON-CAN'T-DERIVE: `reExecDerivationWithDiff` now returns `None` when it cannot derive a real state (it OMITS the MG
+            // rather than emit an empty-state sentinel). On the sub-quorum re-exec failover we map that to `Hash.empty` — the same
+            // fail-closed sentinel `noReExecDerivation` uses — so a non-derivable MG yields a deterministic mismatch (the degraded
+            // checkpoint is rejected, never falsely admitted) rather than a spurious empty-state-root match.
+            withDiff(mg, binaries, anchor).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
+        }
       )(Async[F], HasherSelector[F].getCurrent, implicitly[SecurityProvider[F]], implicitly[Metrics[F]])
       globalSnapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager.make(
         cfg.fieldsAddedOrdinals,

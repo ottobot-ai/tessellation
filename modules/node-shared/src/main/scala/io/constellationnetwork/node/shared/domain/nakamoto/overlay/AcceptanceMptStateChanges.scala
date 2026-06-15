@@ -28,7 +28,6 @@ import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
-import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutable}
 import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmutableCodec
@@ -109,10 +108,13 @@ object AcceptanceMptStateChanges {
         case (addr, p) => GlobalStateKey.metagraph(addr, LastCurrencySnapshotsProofs) -> p
       }.toMap
 
+    // fieldId-5 incremental entries (unchanged) PLUS the per-MG `(mgAddr, newInfo)` the unrolled `Mg*` info
+    // write needs (HARD RULE 3: `Right` -> the carried `snInfo`; `Left`/genesis -> `info.toCurrencySnapshotInfo`).
+    // The monolithic fieldId-6 `LastCurrencySnapshotInfo` blob is NO LONGER written — see `writeCurrencyInfo` below.
     def buildCurrencySnapshotEntries: F[
       (
         Map[GlobalStateKey, Signed[CurrencyIncrementalSnapshot]],
-        Map[GlobalStateKey, CurrencySnapshotInfo]
+        List[(Address, CurrencySnapshotInfo)]
       )
     ] =
       acc.lastCurrencySnapshots.toList.parTraverse {
@@ -122,16 +124,16 @@ object AcceptanceMptStateChanges {
             .map { inc =>
               (
                 GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> Signed(inc, fullSnapshot.proofs),
-                GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> fullSnapshot.info.toCurrencySnapshotInfo
+                metagraphAddr -> fullSnapshot.info.toCurrencySnapshotInfo
               )
             }
         case (metagraphAddr, Right((inc, snInfo))) =>
           (
             (GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) -> inc) ->
-              (GlobalStateKey.metagraph(metagraphAddr, LastCurrencySnapshotInfo) -> snInfo)
+              (metagraphAddr -> snInfo)
           ).pure[F]
       }.map { paired =>
-        (paired.map(_._1).toMap, paired.map(_._2).toMap)
+        (paired.map(_._1).toMap, paired.map(_._2))
       }
 
     val activeAllowSpends: Map[GlobalStateKey, SortedSet[Signed[AllowSpend]]] =
@@ -195,7 +197,17 @@ object AcceptanceMptStateChanges {
       _ <- mpt.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
       _ <- mpt.insert[Balance](balances)
       _ <- mpt.insert[Signed[CurrencyIncrementalSnapshot]](currency._1)
-      _ <- mpt.insert[CurrencySnapshotInfo](currency._2)
+      // fieldId-6 monolithic blob REPLACED by the unrolled per-entry `Mg*` partitions (UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN §6):
+      // for each MG, reconstruct the prior info from the branch-aware overlay view (the same `getAllForPrefix` the writer accumulates
+      // into), then upsert the 8 `Mg*` entries + remove dropped ones via the shared `writeCurrencyInfo` (byte-identical to `infoEntryBytes`).
+      // Does NOT touch fieldId-5 (above) nor activeAllowSpends/fieldId-7 (the `removedAllowSpendKeys` path).
+      _ <- currency._2.traverse_ {
+        case (metagraphAddr, newInfo) =>
+          val infoMpt = CurrencyInfoMptAdapters.mptFor[F](mpt)
+          GlobalStateConverter
+            .reconstructCurrencyInfoFrom[F](metagraphAddr, infoMpt)
+            .flatMap(priorInfo => GlobalStateConverter.writeCurrencyInfo[F](metagraphAddr, newInfo, priorInfo, infoMpt))
+      }
       _ <- mpt.insert[Proof](currencyProofs)
       _ <- mpt.insert[SortedSet[Signed[AllowSpend]]](activeAllowSpends)
       _ <- mpt.insert[SortedSet[Signed[TokenLock]]](activeTokenLocksEntries)

@@ -12,6 +12,7 @@ import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.ChangeSet
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardSlotLeader}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.numerics.Ratio
@@ -155,16 +156,17 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       }
     )
 
-  /** Deterministic `derivePerMgState` that returns a `Hash` derived from `(mg, headBinary.lastSnapshotHash)`. Lets tests assert on the
-    * per-MG hash values present in the produced `derivedStateDelta.perMetagraphMptRoots`.
+  /** Deterministic `derivePerMgState` that returns a `Hash` derived from `(mg, headBinary.lastSnapshotHash)` paired with an empty
+    * `ChangeSet` (step-6 signature). The diff content is exercised by the ChangeSet/wiring suites; here the tests only assert on the per-MG
+    * hash values present in the produced `derivedStateDelta.perMetagraphMptRoots`, so an empty diff is sufficient.
     */
   private def deterministicDerive(
     mg: Address,
     snaps: NonEmptyList[Signed[StateChannelSnapshotBinary]],
     anchor: SnapshotOrdinal
-  ): IO[Hash] = {
+  ): IO[Option[(Hash, ChangeSet)]] = {
     val _ = anchor
-    IO.pure(hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}"))
+    IO.pure(Some((hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}"), ChangeSet.empty)))
   }
 
   /** A `derivePerMgState` callback that records which MGs it was invoked for. The test uses this to assert callback invocation count and
@@ -172,7 +174,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     */
   private def recordingDerive(
     seen: cats.effect.kernel.Ref[IO, List[Address]]
-  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] =
+  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Option[(Hash, ChangeSet)]] =
     (mg, snaps, anchor) => seen.update(_ :+ mg) >> deterministicDerive(mg, snaps, anchor)
 
   // Simple slot mapping: 1 slot per gl0 ord. Matches the e2e default cadence in spirit (slot-cadence is per-shard config; for tests,
@@ -216,7 +218,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     rig: TestRig,
     sigma: Ratio,
     shardEta: Array[Byte],
-    derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] = deterministicDerive,
+    derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Option[(Hash, ChangeSet)]] =
+      deterministicDerive,
     republishEveryTicks: Int = 1
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     ShardCheckpointProducer.make[IO](
@@ -428,6 +431,59 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         cp.value.derivedStateDelta.perMetagraphArtifacts.isEmpty,
         cp.value.derivedStateDelta.perMetagraphSyncDataDelta.isEmpty
       )
+  }
+
+  test(
+    "defer-the-whole-checkpoint-on-OMIT: any active MG that can't derive (None) ⇒ the producer defers the WHOLE checkpoint (produce=None), never a partial one (run-27d deadlock fix); with all MGs derivable it mints a complete checkpoint"
+  ) { res =>
+    implicit val (h, sp, ssl) = res
+    for {
+      rigA <- freshRig
+      gl0Eta = randomGl0Eta()
+      shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
+      pending = mkPendingSnapshots(numMgs = 4)
+      omittedMg = mkAddress("mg-1") // "can't derive" this round ⇒ None (the genesis-bootstrap adopt-vs-derive race)
+      // (A) one un-derivable MG ⇒ DEFER the whole checkpoint (a partial OMITting checkpoint could win fork-choice and wedge the MG)
+      producerDefer <- makeProducer(
+        ssl,
+        rigA,
+        Ratio.One,
+        shardEta,
+        derive =
+          (mg, snaps, anchor) => if (mg == omittedMg) IO.pure(None: Option[(Hash, ChangeSet)]) else deterministicDerive(mg, snaps, anchor)
+      )
+      deferred <- tryProduceUntilSome(
+        producerDefer,
+        startOrd = 4100L,
+        EtaPeriod(0L),
+        pending = pending,
+        maxAttempts = 20,
+        committee = Set(rigA.selfPeerId)
+      )
+      // (B) all MGs derivable ⇒ COMPLETE checkpoint
+      rigB <- freshRig
+      producerAll <- makeProducer(ssl, rigB, Ratio.One, shardEta, derive = deterministicDerive)
+      complete <- tryProduceUntilSome(
+        producerAll,
+        startOrd = 4100L,
+        EtaPeriod(0L),
+        pending = pending,
+        maxAttempts = 100,
+        committee = Set(rigB.selfPeerId)
+      )
+      cp <- IO.fromOption(complete)(new RuntimeException("produce should win at σ=1 when all MGs derive"))
+    } yield {
+      val d = cp.value.derivedStateDelta
+      expect.all(
+        // (A) on-duty (σ=1) but one MG can't derive ⇒ the producer mints NOTHING (defer), so produce returns None on every attempt
+        deferred.isEmpty,
+        // (B) all derived ⇒ a COMPLETE checkpoint: all 4 MGs present in all three per-MG fields
+        d.perMetagraphMptRoots.keys.toSet == pending.keys.toSet,
+        d.perMetagraphStateDiff.keys.toSet == pending.keys.toSet,
+        d.includedSnapshots.keys.toSet == pending.keys.toSet,
+        d.perMetagraphMptRoots.size == 4
+      )
+    }
   }
 
   // ===========================================================================

@@ -1,6 +1,7 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 
 import cats.effect.Async
+import cats.syntax.all._
 
 import scala.collection.immutable.SortedSet
 
@@ -8,12 +9,12 @@ import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnap
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
+import io.constellationnetwork.schema.mpt.{GlobalStateConverter, GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.tokenLock.TokenLock
+import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutableCodec}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
@@ -53,8 +54,24 @@ object GlobalStateReaderOps {
     def getActiveTokenLocks(address: Address): F[Option[SortedSet[Signed[TokenLock]]]] =
       reader.get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, address))
 
-    def getCurrencySnapshotInfo(metagraphAddress: Address): F[Option[CurrencySnapshotInfo]] =
-      reader.get[CurrencySnapshotInfo](GlobalStateKey.metagraph(metagraphAddress, GlobalStateFieldId.LastCurrencySnapshotInfo))
+    /** Reconstruct a metagraph's `CurrencySnapshotInfo` from the UNROLLED per-entry `Mg*` partitions (+ fieldId-7 allow-spends), gated on
+      * the presence of the fieldId-5 incremental so a metagraph still at its genesis (`LastCurrencySnapshots` Left partition, no
+      * incremental written yet) reads `None` — byte-for-byte the same `Some`/`None` distinction the old direct blob read produced. NEVER
+      * reads the legacy `LastCurrencySnapshotInfo` blob (it is no longer written; see GlobalStateConverter unroll,
+      * UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md).
+      */
+    def getCurrencySnapshotInfo(metagraphAddress: Address)(implicit hasher: Hasher[F]): F[Option[CurrencySnapshotInfo]] =
+      reader
+        .get[Signed[CurrencyIncrementalSnapshot]](
+          GlobalStateKey.metagraph(metagraphAddress, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
+        )
+        .map(_.isDefined)
+        .ifM(
+          GlobalStateConverter
+            .reconstructCurrencyInfoFrom[F](metagraphAddress, CurrencyInfoMptAdapters.readerFor(reader))
+            .map(_.some),
+          none[CurrencySnapshotInfo].pure[F]
+        )
 
     /** Hash of the most-recently-accepted state-channel binary for a metagraph — the "binary chain" tip used by
       * `Signed[StateChannelSnapshotBinary].lastSnapshotHash` for parent-chain validation. A new incoming binary's `parentHash` MUST equal

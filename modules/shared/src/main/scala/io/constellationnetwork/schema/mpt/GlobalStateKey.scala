@@ -248,6 +248,41 @@ object GlobalStateFieldId {
     */
   case object ShardNonParticipation extends GlobalStateFieldId { def toInt: Int = 24 }
 
+  /** Per-metagraph UNROLLED `CurrencySnapshotInfo` sub-fields (`docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md`). These REPLACE the
+    * monolithic `LastCurrencySnapshotInfo` blob (fieldId 6): instead of one `metagraph(mgAddr, LastCurrencySnapshotInfo) ->
+    * CurrencySnapshotInfo` key per MG (O(N) rewrite on any change), each `CurrencySnapshotInfo` field becomes per-ENTRY keys under the MG's
+    * own `MetagraphNamespace` — `metagraphEntry(mgAddr, MgXxx, entryKey) -> value` — so the per-ordinal MPT diff and the committee
+    * state-diff are O(changed entries), not O(N) (scalability is the primary driver — the blob is a state-diff dead-end). The 8 sub-fields
+    * cover all of `CurrencySnapshotInfo` EXCEPT `activeAllowSpends`, which stays in the existing `ActiveAllowSpends` (fieldId 7)
+    * metagraph-scope partition (already per-MG unrolled, already read cross-shard by `SpendActionValidator`). `infoRoot` (in
+    * `CurrencySnapshotMptRoots`) is the single MPT root over the UNION of these 8 sub-field partitions (producer + follower compute it
+    * identically via `currencySnapshotEntryBytes`).
+    */
+  case object MgBalances extends GlobalStateFieldId { def toInt: Int = 25 }
+  case object MgLastTxRefs extends GlobalStateFieldId { def toInt: Int = 26 }
+  case object MgLastFeeTxRefs extends GlobalStateFieldId { def toInt: Int = 27 }
+  case object MgLastAllowSpendRefs extends GlobalStateFieldId { def toInt: Int = 28 }
+  case object MgLastTokenLockRefs extends GlobalStateFieldId { def toInt: Int = 29 }
+  case object MgActiveTokenLocks extends GlobalStateFieldId { def toInt: Int = 30 }
+  case object MgLastMessages extends GlobalStateFieldId { def toInt: Int = 31 }
+  case object MgGlobalSnapshotSyncView extends GlobalStateFieldId { def toInt: Int = 32 }
+
+  /** The 8 unrolled per-metagraph `CurrencySnapshotInfo` sub-fields whose UNION is committed by `CurrencySnapshotMptRoots.infoRoot`. Used
+    * by `GlobalStateConverter.currencySnapshotFieldRoots` / `GlobalSnapshotInfo.mptStateProofFromBytes` to group these entries into the
+    * single `infoRoot` (replacing the `fieldId == LastCurrencySnapshotInfo` filter). MUST stay in sync with the `Mg*` case objects above.
+    */
+  val infoSubFields: Set[GlobalStateFieldId] =
+    Set(
+      MgBalances,
+      MgLastTxRefs,
+      MgLastFeeTxRefs,
+      MgLastAllowSpendRefs,
+      MgLastTokenLockRefs,
+      MgActiveTokenLocks,
+      MgLastMessages,
+      MgGlobalSnapshotSyncView
+    )
+
   implicit val ordering: Ordering[GlobalStateFieldId] = Ordering.by(_.toInt)
   implicit val show: Show[GlobalStateFieldId] = Show.show(_.toInt.toString)
 
@@ -282,6 +317,14 @@ object GlobalStateFieldId {
     case 22 => Some(KesRegistrationCerts)
     case 23 => Some(LastKesRegistrationRefs)
     case 24 => Some(ShardNonParticipation)
+    case 25 => Some(MgBalances)
+    case 26 => Some(MgLastTxRefs)
+    case 27 => Some(MgLastFeeTxRefs)
+    case 28 => Some(MgLastAllowSpendRefs)
+    case 29 => Some(MgLastTokenLockRefs)
+    case 30 => Some(MgActiveTokenLocks)
+    case 31 => Some(MgLastMessages)
+    case 32 => Some(MgGlobalSnapshotSyncView)
     case _  => None
   }
 }
@@ -298,6 +341,38 @@ object GlobalStateKey {
 
   def metagraph(addr: Address, fieldId: GlobalStateFieldId): GlobalStateKey =
     GlobalStateKey(MetagraphNamespace(addr), fieldId, EmptyNamespace, EmptyNamespace)
+
+  /** Per-entry key into an UNROLLED per-metagraph `CurrencySnapshotInfo` sub-field (`GlobalStateFieldId.infoSubFields`, see
+    * `docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md`). The MG owns the partition (`MetagraphNamespace` in the network slot); the
+    * per-entry account/holder goes in the user slot — mirrors `hypergraph(field, contract, user)` but MG-scoped so it never collides with
+    * the DAG-scoped global partitions. One MPT entry per `(mgAddr, subField, account)`.
+    *
+    * '''Value carries the entry key.''' `toHex` HASHES `AddressNamespace(account)` (it is lossy — you cannot recover the account from the
+    * key), so the stored VALUE is `(Address, V)` and reconstruction recovers the logical key from the value via a prefix scan (the same
+    * value-carries-key pattern as `getAllUpdateNodeParameters`). The user-slot hash only provides per-entry uniqueness.
+    */
+  def metagraphEntry(mgAddr: Address, subField: GlobalStateFieldId, account: Address): GlobalStateKey =
+    GlobalStateKey(MetagraphNamespace(mgAddr), subField, EmptyNamespace, AddressNamespace(account))
+
+  /** As [[metagraphEntry]] for an unrolled sub-field whose entry key is NOT an `Address` (`MgLastMessages` → `MessageType`,
+    * `MgGlobalSnapshotSyncView` → `PeerId`): the canonical-string entry key is hashed into the user-namespace slot for uniqueness (same as
+    * `updateNodeParametersKey`/`priceStateKey`). The stored value still carries the typed key for reconstruction.
+    */
+  def metagraphEntryHashed[F[_]: Sync: Hasher](mgAddr: Address, subField: GlobalStateFieldId, entryKey: String): F[GlobalStateKey] =
+    Hasher[F].hash(entryKey).map { h =>
+      GlobalStateKey(MetagraphNamespace(mgAddr), subField, EmptyNamespace, HashNamespace(h))
+    }
+
+  /** Hex prefix matching every per-entry key under one unrolled per-metagraph sub-field for `mgAddr` (pairs with `MptStore.getAllForPrefix`
+    * to reconstruct that field's full map). Layout: `<metagraph keyType+addrHash> + <subField 8 hex> + <empty contract (00)>` — stops short
+    * of the user-namespace component, so it matches every `(account)` entry under that `(mgAddr, subField)` pair.
+    */
+  def metagraphFieldPrefix[F[_]: Sync: Hasher](mgAddr: Address, subField: GlobalStateFieldId): F[Hex] =
+    for {
+      networkPart <- serializeNamespace[F](MetagraphNamespace(mgAddr))
+      fieldPart = f"${subField.toInt}%08x"
+      contractPart <- serializeNamespace[F](EmptyNamespace)
+    } yield Hex(networkPart + fieldPart + contractPart)
 
   def hypergraph(fieldId: GlobalStateFieldId, user: Address): GlobalStateKey =
     GlobalStateKey(HypergraphNamespace, fieldId, EmptyNamespace, AddressNamespace(user))
@@ -352,6 +427,33 @@ object GlobalStateKey {
     Hasher[F].hash(epoch.show).map { h =>
       GlobalStateKey(SystemNamespace(label), GlobalStateFieldId.SystemIndex, EmptyNamespace, HashNamespace(h))
     }
+
+  /** Hex prefix that every `SystemNamespace` (sidecar) entry carries: the `PKTSystem` keyType byte `0x03` serialized as `"03"` at offset 0
+    * (see `PartitionKeyType.PKTSystem` and `toHex`). Sidecar partitions — `ActiveAddressIndex`, the AllowSpend / TokenLock / NodeCollateral
+    * expiry buckets — are the ONLY partitions under this prefix; all user-field partitions are `00`/`01`/`02`.
+    */
+  val systemNamespaceHexPrefix: String = "03"
+
+  /** True iff `hex` is a `SystemNamespace` (sidecar) entry. O(1) prefix check — no fieldId parse.
+    *
+    * '''Consensus contract''': sidecar entries are local read-acceleration indices, NOT consensus state. The `ActiveAddressIndex` partition
+    * in particular is maintained '''append-only''' on the incremental accept path (`applyActiveAddressIndexDelta` is always called with
+    * `removed = Set.empty`), so its contents are a function of the per-ordinal delta '''history''', not of the current KV state — two
+    * honest nodes that processed different (but equivalent-final) ordinal streams accumulate different index sets, and a rebuild from
+    * current keysets yields yet another value. Folding such a path-dependent partition into the consensus global `mptRoot` makes the root
+    * non-deterministic across nodes (surfaces as `stateProof[mptRoot]`-only divergence: every per-field proof matches because sidecars have
+    * no per-field proof slot, but the global root differs). The global root MUST therefore exclude every `SystemNamespace` entry — use
+    * `nonSystemNamespaceEntries` at every consensus-root computation site.
+    */
+  def isSystemNamespaceHex(hex: Hex): Boolean =
+    hex.value.startsWith(systemNamespaceHexPrefix)
+
+  /** Drop every `SystemNamespace` (sidecar) entry from a hex-keyed byte map. The surviving entries are exactly the user-field partitions
+    * that constitute the consensus state. Apply this immediately before any global-`mptRoot` `makeParallelFromBytes` so the root is a pure
+    * function of the user-field KV set (see `isSystemNamespaceHex`).
+    */
+  def nonSystemNamespaceEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
+    entries.filterNot { case (hex, _) => isSystemNamespaceHex(hex) }
 
   /** Slice 17 — key into the per-(shard, peer, epoch) [[GlobalStateFieldId.ShardNonParticipation]] partition. The composite tuple is folded
     * into a single hash so each `(shardId, peerId, epoch)` triple maps to one MPT entry under the hypergraph namespace.

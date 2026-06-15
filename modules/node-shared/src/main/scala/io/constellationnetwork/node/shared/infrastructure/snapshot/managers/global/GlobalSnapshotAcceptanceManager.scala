@@ -571,15 +571,23 @@ object GlobalSnapshotAcceptanceManager {
           // wedges the MG (the seeding flake's root cause). Pure function of (embedded checkpoint, prior GSI) — every
           // node reaches the same adopt/defer decision.
           priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash]
-        )(implicit hasher: Hasher[F]): F[SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]] =
+        )(implicit hasher: Hasher[F]): F[
+          (
+            SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+            SortedMap[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash)]
+          )
+        ] =
           shardCheckpoints.toList
             .foldM(
               (
                 SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-                List.empty[io.constellationnetwork.schema.sharding.CrossShardReceipt]
+                List.empty[io.constellationnetwork.schema.sharding.CrossShardReceipt],
+                // Per-adopted-MG committee `(byte-diff, attested per-MG root)` — STEP 6 ADOPT-AND-VERIFY input to
+                // `deriveAdoptedCurrencyState`. Only populated for MGs whose accepted checkpoint carried a diff for them.
+                SortedMap.empty[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash)]
               )
             ) {
-              case ((adoptedAcc, receiptsAcc), (shardId, cp)) =>
+              case ((adoptedAcc, receiptsAcc, diffAcc), (shardId, cp)) =>
                 // DETERMINISTIC adopt-verifier — NOT node-local `evaluate`. `verifyEmbedded` decides purely from the checkpoint bytes +
                 // the committee membership for `(shardId, epoch)`, so the leader (produce), the follower (`createContext`), and every gl0
                 // peer (`validateArtifact`) reach a byte-identical adopt decision + committed state. Using `evaluate` here (which reads the
@@ -621,6 +629,17 @@ object GlobalSnapshotAcceptanceManager {
                     val adopted = trimResults.collect { case Right(r) => r }
                     val chainContinuous: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] =
                       SortedMap.from(adopted.map { case (mg, suffix, _) => mg -> suffix })(Address.OrderingInstance)
+                    // STEP 6: the committee's per-MG `(byte-diff, attested per-MG root)` for each adopted MG — fed to
+                    // `deriveAdoptedCurrencyState` to APPLY-and-verify the committed currency info (PIN-1 root, PIN-3 minimal diff). Only
+                    // for MGs that have BOTH a carried diff and a carried root in this checkpoint's `derivedStateDelta`; a pure-genesis
+                    // window (empty diff/root) is simply absent ⇒ `deriveAdoptedCurrencyState` keeps the decoded info verbatim there.
+                    val newDiffs: SortedMap[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash)] =
+                      SortedMap.from(chainContinuous.keys.toList.flatMap { mg =>
+                        (
+                          cp.derivedStateDelta.perMetagraphStateDiff.get(mg),
+                          cp.derivedStateDelta.perMetagraphMptRoots.get(mg)
+                        ).tupled.map(mg -> _)
+                      })(Address.OrderingInstance)
                     val newReceipts: List[io.constellationnetwork.schema.sharding.CrossShardReceipt] = cp.emittedReceipts
                     deferred.traverse_ {
                       case (mg, nel) =>
@@ -653,7 +672,7 @@ object GlobalSnapshotAcceptanceManager {
                       Hasher[F]
                         .hash(cp.signingPreimage)
                         .flatMap(cpHash => checkpointManager.noteAdopted(shardId, cp.shardOrdinal, cpHash))
-                        .as((adoptedAcc ++ chainContinuous, receiptsAcc ++ newReceipts))
+                        .as((adoptedAcc ++ chainContinuous, receiptsAcc ++ newReceipts, diffAcc ++ newDiffs))
 
                   case ShardCheckpointAcceptResult.PendingMoreAttestations =>
                     loggerBundle.app
@@ -661,7 +680,7 @@ object GlobalSnapshotAcceptanceManager {
                         s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                           s"PENDING — will retry next gl0 ord"
                       )
-                      .as((adoptedAcc, receiptsAcc))
+                      .as((adoptedAcc, receiptsAcc, diffAcc))
 
                   case ShardCheckpointAcceptResult.Rejected(reason) =>
                     // Logged at info (not warn) because a Rejected checkpoint can be a legitimate operator-level transient
@@ -672,7 +691,7 @@ object GlobalSnapshotAcceptanceManager {
                         s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                           s"REJECTED reason=$reason"
                       )
-                      .as((adoptedAcc, receiptsAcc))
+                      .as((adoptedAcc, receiptsAcc, diffAcc))
 
                   case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, slashSigners) =>
                     // Wrong-derivation result. Slashing evidence emission lands in Slice 16/17 (signer list surfaced here
@@ -682,34 +701,48 @@ object GlobalSnapshotAcceptanceManager {
                         s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                           s"REJECTED-REEXEC-MISMATCH reason=$reason slashSigners=${slashSigners.size}"
                       )
-                      .as((adoptedAcc, receiptsAcc))
+                      .as((adoptedAcc, receiptsAcc, diffAcc))
                 }
             }
             .flatMap {
-              case (adopted, receipts) =>
+              case (adopted, receipts, diffs) =>
                 // Side-effect: drain the union of cross-shard receipts into the shared MetagraphSyncManager accumulator.
                 // The manager's internal seen-set gate makes the apply idempotent — duplicate receipts (operator replay,
                 // gossip duplication, or repeat-evaluation in a re-acceptance turn) are silently dropped after first sight.
-                metagraphSyncManager.consumeReceipts(receipts).as(adopted)
+                metagraphSyncManager.consumeReceipts(receipts).as((adopted, diffs))
             }
 
-        /** Axis 1a (#259). Derive the per-metagraph accepted-currency-snapshot view from ADOPTED shard-checkpoint SC-snapshot chains,
-          * BYPASSING `onlyPossibleReferences` (the chain-link unfold inside `GlobalSnapshotStateChannelAcceptanceManager.accept`) while
-          * running the IDENTICAL currency derivation the standard `process()` path runs on its chain-linked output.
+        /** Axis 1a (#259) + STEP 6 committee-state-diff ADOPT-AND-VERIFY. Derive the per-metagraph accepted-currency-snapshot view from
+          * ADOPTED shard-checkpoint SC-snapshot chains, BYPASSING `onlyPossibleReferences` (the chain-link unfold inside
+          * `GlobalSnapshotStateChannelAcceptanceManager.accept`).
           *
-          * '''Byte-exactness contract.''' The standard path is `process = chainLink(scEvents) → processCurrencySnapshots → calculate`. This
-          * method is the `process` tail with the chain-link stage replaced by the committee's already-verified `adoptedScSnapshots`. It
-          * calls the EXACT same `stateChannelEventsProcessor.processCurrencySnapshots` and replicates the EXACT four derivations the
-          * processor's private `calculateLastCurrencySnapshots` + result assembly perform (see
-          * [[GlobalSnapshotStateChannelEventsProcessor.process]] computing `finalScSnapshots` / `lastCurrencyStates` / `balanceUpdates` /
-          * `incomingCurrencyState`). Because `processCurrencySnapshots` is a pure function of `(adoptedScSnapshots,
-          * priorLastCurrencySnapshots, currentBalances, ordinal)`, the result is byte-identical to what re-executing those same binaries
-          * produces — which is exactly what the shard committee computed and signed.
+          * '''The committed per-MG `CurrencySnapshotInfo` is APPLIED, not re-derived (the run-24/26 fix).''' Every gl0 node previously
+          * re-ran `processCurrencySnapshots(AdoptFromSignedFields)` and independently DERIVED each MG's info via the per-field
+          * economic-security gate — which diverged across nodes (a field gl0 couldn't reproduce, e.g. `balances`/`activeAllowSpends`,
+          * carried EMPTY prior on one node and the real value on another) and froze `lastCurrencySnapshots` while silently dropping
+          * allow-spends. Now the SHARD COMMITTEE re-execs ONCE and carries the MINIMAL per-MG byte-diff
+          * (`cp.derivedStateDelta.perMetagraphStateDiff(mg)`); EVERY gl0 node here APPLIES that diff onto its OWN copy of the prior
+          * cumulative state `S(N)` (= `priorLastCurrencySnapshots(mg)`, the adopted chain-linked best-tip — PIN-4) via
+          * [[ChangeSet.reconstructInfoFromDiff]], recomputes the per-MG root, and REQUIRES it `===` the committee-attested
+          * `perMetagraphMptRoots(mg)` (PIN-1, `Hasher.hash((incrementalRoot, infoRoot))` over the post-apply state). On match it ADOPTS the
+          * reconstructed `next` info; on mismatch (its `S(N)` lags the producer's — trim/reorg) it DROPS that MG's currency advance (never
+          * adopt unverified) and the leader re-offers later. Because the diff is the producer's authoritative output, every node lands on
+          * the byte-identical `next` — no per-node gate divergence, allow-spends/token-locks ACCUMULATE.
           *
-          * `returned` is empty: an adopted snapshot is never "returned to the metagraph" (it was committee-accepted, not gl0-rejected).
+          * '''Why `processCurrencySnapshots` still runs.''' It decodes the adopted binaries to produce the structural shell of the result
+          * the rest of `accept()` consumes: the accepted SC-binary `NonEmptyList` (SC-tip advance), the per-binary `incomingCurrencyState`
+          * list (each binary's `SharedArtifact`s — SpendActions / PricingUpdates — read off the Signed incremental, NOT the info), and the
+          * fee `balanceUpdate`. ONLY the FINAL committed per-MG `CurrencySnapshotInfo` (`calculatedCurrencyState[mg]`, the value written to
+          * the MPT + read by `currencyBalances` / `updateTokenLockBalances` / `activeAllowSpendsFromCurrencySnapshots` / cl1 bootstrap) is
+          * OVERRIDDEN by the verified diff-apply — the intermediate infos are consensus-irrelevant. The
+          * `Signed[CurrencyIncrementalSnapshot]` half of the overridden `Right` tuple is the one `processCurrencySnapshots` derived (the
+          * last binary's incremental — byte-identical to the producer's), so the recomputed `incrementalRoot` matches.
           *
-          * N1: the result assembly is the SINGLE shared `GlobalSnapshotStateChannelEventsProcessor.assembleAcceptanceResult` — the EXACT
-          * same construction the standard `process()` tail uses — so there is no hand-copied replica to keep in lockstep.
+          * @param perMgDiffAndRoot
+          *   per-adopted-MG `(committee byte-diff, committee-attested per-MG root)` extracted from the accepted checkpoints by
+          *   `adoptShardCheckpoints`. An MG present in `adoptedScSnapshots` but ABSENT here (no diff carried — e.g. a pure genesis window
+          *   or a legacy empty-diff checkpoint) keeps the binary-decoded info verbatim (no override). PIN-1 root + PIN-3 minimal diff are
+          *   the producer's; this method only applies + verifies.
           */
         private def deriveAdoptedCurrencyState(
           ordinal: SnapshotOrdinal,
@@ -718,6 +751,7 @@ object GlobalSnapshotAcceptanceManager {
             CurrencySnapshot
           ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
           adoptedScSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+          perMgDiffAndRoot: SortedMap[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash)],
           getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
         )(implicit hasher: Hasher[F]): F[StateChannelAcceptanceResult] =
           stateChannelEventsProcessor
@@ -735,15 +769,96 @@ object GlobalSnapshotAcceptanceManager {
               // OLDEST hash.
               adoptedScSnapshots.map { case (mg, nel) => mg -> nel.reverse },
               getGlobalSnapshotByOrdinal,
-              // #259 adopt: DERIVE each MG's commitment by replaying the committee-attested signed binary's own already-accepted
-              // events onto the prior Info (NOT `createContext`), ordinal taken from the binary, root verified against the committed
-              // `stateProof` — so `lastCurrencySnapshots` advances past genesis instead of freezing while gl0 maintains + validates
-              // the full per-MG currency state (cl1 bootstraps from it). See the `CurrencyAdoptionMode` scaladoc.
+              // Decode the adopted binaries to build the result shell (accepted NEL + per-binary artifacts + fee balanceUpdate). The
+              // FINAL per-MG info this derivation produces is OVERRIDDEN below by the verified committee diff-apply, so the choice of
+              // adoption mode does not affect the committed currency state — `AdoptFromSignedFields` is kept because it replays the
+              // signed binary's events with ZERO global-snapshot lookups (no `createContext` 31s-retry stall), matching the producer's
+              // own re-exec (`ShardCheckpointWiring.reExecDerivationWithDiff`).
               GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode.AdoptFromSignedFields
             )
-            .map { accepted =>
+            .flatMap { accepted =>
               // `returned = Set.empty` — adopted snapshots are committee-accepted, never gl0-returned.
-              stateChannelEventsProcessor.assembleAcceptanceResult(accepted, priorLastCurrencySnapshots, Set.empty[StateChannelOutput])
+              val baseResult =
+                stateChannelEventsProcessor.assembleAcceptanceResult(accepted, priorLastCurrencySnapshots, Set.empty[StateChannelOutput])
+
+              // S(N) info for an MG — the prior cumulative currency state the committee diffed against (PIN-4). This MUST be
+              // byte-for-byte the SAME prior the producer diffed against (`ShardCheckpointWiring.reExecDerivationWithDiff`), or the
+              // apply-and-verify root diverges and that MG freezes. The producer's DIFF prior is `getCurrencySnapshotInfo` — gated on the
+              // fieldId-5 incremental, so at a post-genesis pre-first-incremental window it returns `emptyInfo` (the genesis info is NOT
+              // yet in the unrolled `Mg*` partitions; the first incremental writes it). We therefore mirror that EXACTLY here:
+              //   - `Right((_, info))` — the reconstructed cumulative info: producer reads the identical bytes back via the same gate.
+              //   - `Left(genesis)`  — post-genesis pre-incremental: producer's diff prior is `emptyInfo`, NOT `genesis.info`. Using the
+              //                        genesis embedded info (which carries the non-empty genesis `balances`) here would desync the apply:
+              //                        a genesis-funded address fully drained in window-0 (key dropped in `next`) would survive in this
+              //                        prior but be absent from the producer's diff (which has no removal for it, since the producer's
+              //                        prior is empty), so the recomputed infoRoot would carry the stale key and never match the attested
+              //                        root — a permanent per-MG genesis-seam freeze. So this arm returns `emptyInfo`.
+              //   - `None`           — never seen by gl0: empty prior (the window's binaries seed it). Matches producer's `getOrElse`.
+              val emptyInfo: CurrencySnapshotInfo =
+                CurrencySnapshotInfo(SortedMap.empty, SortedMap.empty, None, None, None, None, None, None, None)
+              def priorInfoOf(mg: Address): CurrencySnapshotInfo =
+                priorLastCurrencySnapshots.get(mg) match {
+                  case Some(Right((_, info))) => info
+                  case Some(Left(_))          => emptyInfo
+                  case None                   => emptyInfo
+                }
+
+              // APPLY-AND-VERIFY the committee diff over each adopted MG whose checkpoint carried one, OVERRIDING the final committed info.
+              // The incremental half stays as `processCurrencySnapshots` decoded it (the last binary's incremental — matches the producer).
+              baseResult.calculatedCurrencyState.toList.traverse {
+                case (mg, derivedState) =>
+                  perMgDiffAndRoot.get(mg) match {
+                    // No carried diff (genesis / legacy empty) — keep the decoded state verbatim; nothing to apply or verify.
+                    case None => Async[F].pure((mg -> derivedState).some)
+                    // A carried diff applies only to the `Right` (incremental) arm — a `Left` (still-genesis) MG has no info-diff
+                    // semantics; keep it verbatim (the producer emits an empty diff for a pure-genesis window).
+                    case Some(_) if derivedState.isLeft => Async[F].pure((mg -> derivedState).some)
+                    case Some((wireDiff, attestedRoot)) =>
+                      val lastIncremental = derivedState.toOption.get._1 // safe: isLeft handled above
+                      val diff = ChangeSet.fromWire(wireDiff)
+                      for {
+                        nextInfo <- ChangeSet.reconstructInfoFromDiff[F](mg, priorInfoOf(mg), diff)
+                        nextState = Right((lastIncremental, nextInfo)): StateChannelAcceptanceResult.CurrencySnapshotWithState
+                        roots <- GlobalStateConverter.currencySnapshotFieldRoots[F](SortedMap(mg -> nextState))
+                        recomputed <- hasher.hash(roots) // (incrementalRoot, infoRoot) → single Some/None-invisible Hash (PIN-1)
+                        out <-
+                          if (recomputed === attestedRoot)
+                            (mg -> nextState).some.pure[F]
+                          else
+                            loggerBundle.app
+                              .warn(
+                                s"[ACCEPTANCE/ADOPT-VERIFY] ordinal=$ordinal mg=${mg.value.value.take(8)} per-MG root MISMATCH: " +
+                                  s"attested=${attestedRoot.value.take(16)}... recomputed=${recomputed.value.take(16)}... — " +
+                                  s"DROPPING this MG's currency advance (S(N) lags the committee producer's; leader re-offers). " +
+                                  s"diff(upserts=${diff.upserts.size},removals=${diff.removals.size})"
+                              )
+                              .as(none[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)])
+                      } yield out
+                  }
+              }.map { verifiedPerMg =>
+                // `keptStates` already spans EVERY MG in `calculatedCurrencyState` (prior-only pass-throughs + adopted) minus the
+                // mismatched ones (which became `none`), with each adopted-with-diff MG OVERRIDDEN by its verified `next` — so it is the
+                // complete rebuilt map; no union with the base needed.
+                val keptStates = verifiedPerMg.flatten
+                // An MG whose per-MG root MISMATCHED is fully DEFERRED: also dropped from `incomingCurrencySnapshotsWithState` AND
+                // `accepted`, so neither its currency state NOR its SC tip advances this ordinal (the downstream
+                // `updatedLastCurrencySnapshots = priorLastCurrencySnapshots ++ currencySnapshots` merge then holds the prior verified
+                // state; the SC tip stays at prior). This is the only edge where a checkpoint that passed `verifyEmbedded` is partially
+                // withheld — under chain-linked in-order adoption every honest verifier shares the producer's S(N), so a mismatch flags a
+                // Byzantine producer (drop, safe) or a transient lag (defer + re-pull, safe).
+                val mismatchedMgs: Set[Address] = perMgDiffAndRoot.keySet -- keptStates.map(_._1).toSet
+                val rebuiltCalculated: SortedMap[Address, StateChannelAcceptanceResult.CurrencySnapshotWithState] =
+                  SortedMap.from(keptStates)(Address.OrderingInstance)
+                val rebuiltIncoming = baseResult.incomingCurrencySnapshotsWithState.filterNot {
+                  case (mg, _) => mismatchedMgs.contains(mg)
+                }
+                val rebuiltAccepted = baseResult.accepted.filterNot { case (mg, _) => mismatchedMgs.contains(mg) }
+                baseResult.copy(
+                  accepted = rebuiltAccepted,
+                  calculatedCurrencyState = rebuiltCalculated,
+                  incomingCurrencySnapshotsWithState = rebuiltIncoming
+                )
+              }
             }
 
         private def calculateRewards(
@@ -1616,23 +1731,32 @@ object GlobalSnapshotAcceptanceManager {
                     addrList = addrSet.toList
                     leftKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots))
                     incKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots))
-                    infoKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshotInfo))
                     lefts <- mpt.getMany[Signed[CurrencySnapshot]](leftKeys)
                     incs <- mpt.getMany[Signed[CurrencyIncrementalSnapshot]](incKeys)
-                    infos <- mpt.getMany[CurrencySnapshotInfo](infoKeys)
-                    mptResult = SortedMap.from(addrList.flatMap { addr =>
+                    // fieldId-6 (`LastCurrencySnapshotInfo`) is no longer a single blob — the `CurrencySnapshotInfo` for the Right
+                    // arm is reconstructed from the unrolled `Mg*` per-entry partitions via `reconstructCurrencyInfoFrom` (branch-aware
+                    // `mpt` reader). The Left (genesis) arm still reads fieldId-3, and the fieldId-5 incremental read is unchanged. A
+                    // metagraph with no fieldId-5 incremental has no currency state → emit nothing and let the GSI fallback below cover
+                    // it. Reconstruction is `F`, so the per-address build is a `flatTraverse`.
+                    infoReader = CurrencyInfoMptAdapters.mptFor(mpt)
+                    mptEntries <- addrList.flatTraverse { addr =>
                       val leftKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots)
                       val incKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
-                      val infoKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshotInfo)
                       lefts.get(leftKey) match {
-                        case Some(snap) => List(addr -> Left(snap))
+                        case Some(snap) =>
+                          Async[F].pure(List(addr -> (Left(snap): StateChannelAcceptanceResult.CurrencySnapshotWithState)))
                         case None =>
-                          (incs.get(incKey), infos.get(infoKey)) match {
-                            case (Some(inc), Some(info)) => List(addr -> Right((inc, info)))
-                            case _                       => Nil
+                          incs.get(incKey) match {
+                            case Some(inc) =>
+                              GlobalStateConverter
+                                .reconstructCurrencyInfoFrom[F](addr, infoReader)
+                                .map(info => List(addr -> (Right((inc, info)): StateChannelAcceptanceResult.CurrencySnapshotWithState)))
+                            case None =>
+                              Async[F].pure(List.empty[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)])
                           }
                       }
-                    })
+                    }
+                    mptResult = SortedMap.from(mptEntries)
                     // Per-address fallback: if MPT has no value but the GSI does, use the GSI's value.
                     // Steady-state this loop is a no-op (every addrSet member has an MPT value).
                     result = lastSnapshotContext.lastCurrencySnapshots.foldLeft(mptResult) {
@@ -1646,13 +1770,22 @@ object GlobalSnapshotAcceptanceManager {
                 // AND (b) the caller actually supplied a non-empty `shardCheckpoints` map for this ord. All three conditions
                 // must hold; otherwise `adoptedScSnapshots` is empty, the standard chain-link path runs on the raw `scEvents`
                 // verbatim, and the rest of `accept()` is byte-identical to today (the regression bar — see make()'s
-                // shardingConfig scaladoc).
-                adoptedScSnapshots <-
+                // shardingConfig scaladoc). `adoptedDiffs` carries the committee per-MG `(byte-diff, attested root)` consumed by
+                // `deriveAdoptedCurrencyState` for STEP 6 apply-and-verify (empty on the no-op fast-path).
+                adoptedResult <-
                   (shardingConfig, shardCheckpointAcceptanceManager) match {
                     case (Some(cfg), Some(scMgr)) if cfg.numShards > 1 && shardCheckpoints.nonEmpty =>
                       adoptShardCheckpoints(ordinal, shardCheckpoints, scMgr, priorLastStateChannelSnapshotHashes)
-                    case _ => Async[F].pure(SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]])
+                    case _ =>
+                      Async[F].pure(
+                        (
+                          SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+                          SortedMap.empty[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash)]
+                        )
+                      )
                   }
+                adoptedScSnapshots = adoptedResult._1
+                adoptedDiffs = adoptedResult._2
 
                 // CHANGE 3 — partition the raw `scEvents` by the deterministic static shard assignment. When sharding is
                 // active (`numShards > 1` AND `shardAssignment` wired), a metagraph address that maps to a shard flows ONLY
@@ -1710,6 +1843,7 @@ object GlobalSnapshotAcceptanceManager {
                       updatedGlobalBalances,
                       priorLastCurrencySnapshots,
                       adoptedScSnapshots,
+                      adoptedDiffs,
                       getGlobalSnapshotByOrdinal
                     ).map { adoptedAcceptance =>
                       StateChannelAcceptanceResult(
@@ -2417,8 +2551,14 @@ object GlobalSnapshotAcceptanceManager {
                         .toAccumulatorHexDelta[F](stateChangesAccumulator, preSyncBytes)
                       (deltaUpserts, deltaRemoves) = deltaPair
                       expectedBytes = (preSyncBytes -- deltaRemoves) ++ deltaUpserts
+                      // The consensus global root excludes SystemNamespace sidecars (path-dependent
+                      // ActiveAddressIndex / expiry buckets — see `GlobalStateKey.isSystemNamespaceHex`
+                      // and `mptStateProofFromBytes`). `incrementalProof.mptRoot` is computed sidecar-free;
+                      // the independent verify-replay must drop the same `03…` entries before rebuilding so
+                      // a clean writer yields MATCH (a true writer bug on user fields still surfaces DIVERGED).
+                      verifyEntries = io.constellationnetwork.schema.mpt.GlobalStateKey.nonSystemNamespaceEntries(expectedBytes)
                       verifyTrie <- io.constellationnetwork.security.mpt.MerklePatriciaTrie
-                        .makeParallelFromBytes[F](expectedBytes)
+                        .makeParallelFromBytes[F](verifyEntries)
                       verifyRoot = verifyTrie.rootHash.value.show
                       result <-
                         if (incrementalRoot == verifyRoot) {

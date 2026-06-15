@@ -11,7 +11,7 @@ import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSnapshotSync
 import io.constellationnetwork.ext.cats.syntax.validated.validatedSyntax
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{CurrencyInfoMptAdapters, GlobalStateReader}
 import io.constellationnetwork.node.shared.domain.statechannel.StateChannelAcceptanceResult.CurrencySnapshotWithState
 import io.constellationnetwork.node.shared.domain.statechannel.StateChannelValidator.{StateChannelValidationError, getFeeAddresses}
 import io.constellationnetwork.node.shared.domain.statechannel._
@@ -21,7 +21,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
 import io.constellationnetwork.schema.currencyMessage._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
+import io.constellationnetwork.schema.mpt.{GlobalStateConverter, GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.schema.tokenLock._
@@ -32,7 +32,7 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.security.{Hashed, Hasher}
-import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelSnapshotBinary, StateChannelValidationType}
 
@@ -205,7 +205,7 @@ object GlobalSnapshotStateChannelEventsProcessor {
       def buildSnapshotFeesInfo(
         event: StateChannelOutput,
         allFeesAddresses: Map[Address, Set[Address]]
-      ): F[SnapshotFeesInfo] =
+      )(implicit hasher: Hasher[F]): F[SnapshotFeesInfo] =
         event.snapshotBinary.value.lastSnapshotHash match {
           case hash if hash == Hash.empty => SnapshotFeesInfo.empty.pure // genesis
           case _ =>
@@ -215,9 +215,20 @@ object GlobalSnapshotStateChannelEventsProcessor {
                   SnapshotFeesInfo.empty.pure
               case Some(snapshot) =>
                 for {
-                  maybeCurrencyInfo <- reader.get[CurrencySnapshotInfo](
-                    GlobalStateKey.metagraph(event.address, GlobalStateFieldId.LastCurrencySnapshotInfo)
-                  )
+                  // Reconstruct from the UNROLLED per-entry `Mg*` partitions (the `LastCurrencySnapshotInfo` blob is no longer written;
+                  // see GlobalStateConverter unroll). Gate on the fieldId-5 incremental so a genesis-only metagraph reads `None` — the same
+                  // `Some`/`None` distinction the old blob read produced; the surrounding `fetchStakingAddress`/None-handling is unchanged.
+                  hasIncremental <- reader
+                    .get[Signed[CurrencyIncrementalSnapshot]](
+                      GlobalStateKey.metagraph(event.address, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
+                    )
+                    .map(_.isDefined)
+                  maybeCurrencyInfo <-
+                    if (hasIncremental)
+                      GlobalStateConverter
+                        .reconstructCurrencyInfoFrom[F](event.address, CurrencyInfoMptAdapters.readerFor(reader))
+                        .map(_.some)
+                    else none[CurrencySnapshotInfo].pure[F]
                   stakingAddr = maybeCurrencyInfo.flatMap(fetchStakingAddress)
                   stakingBalance <- stakingAddr.fold(Balance.empty.pure[F]) { addr =>
                     reader.get[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr)).map(_.getOrElse(Balance.empty))
@@ -591,6 +602,31 @@ object GlobalSnapshotStateChannelEventsProcessor {
                 s"not reproducible from pure replay). committed=${committedProof.show} derived=${derivedProof.show}"
             )
           )
+          // [OVERPRUNE-DIAG] (2026-06-13, REMOVE after e2e): disambiguate the run-26 allow-spend drop — expiry over-prune
+          // (divergence #1: gl0 syncEpoch > ml0's expiry epoch) vs empty-window extraction vs compounding-empty-prior. Logs gl0's
+          // syncEpoch, the prior/incoming/after-expiry/adopted allow-spend counts, whether the per-field gate matched (false =
+          // carry-forward fired), and the lastValidEpochProgress of anything the expiry filter cut (to see if syncEpoch is anomalously
+          // high vs the allow-spend deadlines). Pairs with the ml0-side [OVERPRUNE-DIAG/ml0] epoch-divergence line.
+          _ <- {
+            def asCount(m: SortedMap[Address, SortedSet[Signed[AllowSpend]]]): Int = m.values.map(_.size).sum
+            val priorAs = asCount(priorActiveAllowSpends)
+            val incAs = asCount(incomingAllowSpends)
+            val afterExpiryAs = asCount(nextActiveAllowSpends)
+            val adoptedAs = adopted.activeAllowSpends.fold(0)(asCount)
+            val droppedByExpiry = (priorActiveAllowSpends |+| incomingAllowSpends).values.flatten.toList
+              .filter(a => syncEpoch.exists(e => a.value.lastValidEpochProgress < e))
+              .map(_.value.lastValidEpochProgress.value.value)
+            Async[F].whenA(priorAs + incAs > 0 || adoptedAs > 0)(
+              logger.info(
+                s"[OVERPRUNE-DIAG/gl0] mg=${address.show.take(10)} ord=${artifact.ordinal.show} " +
+                  s"syncEpoch=${syncEpoch.map(_.value.value.toString).getOrElse("none")} " +
+                  s"allowSpends[prior=$priorAs inc=$incAs afterExpiry=$afterExpiryAs adopted=$adoptedAs] " +
+                  s"asGateMatch=${derivedProof.activeAllowSpends === committedProof.activeAllowSpends} " +
+                  s"droppedByExpiry=${droppedByExpiry.size}${if (droppedByExpiry.nonEmpty) droppedByExpiry.take(3).mkString("(lve=", ",", ")")
+                    else ""}"
+              )
+            )
+          }
         } yield adopted
       }
 

@@ -1,13 +1,17 @@
 package io.constellationnetwork.node.shared.infrastructure.sharding
 
+import cats.Parallel
 import cats.data.NonEmptyList
 import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
-import scala.collection.immutable.Map
+import scala.collection.immutable.{Map, SortedMap}
 
+import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot, CurrencySnapshotInfo}
+import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types.ShardingConfig
 import io.constellationnetwork.node.shared.domain.nakamoto._
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding._
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
@@ -16,10 +20,12 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.glob
 }
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.balance.Balance
+import io.constellationnetwork.schema.mpt.GlobalStateConverter
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal}
+import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal, StateProofSelector}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher, SecurityProvider}
@@ -163,6 +169,171 @@ object ShardCheckpointWiring {
 
     (mg: Address, binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]], gl0AnchorOrdinal: SnapshotOrdinal) =>
       processor.deriveMetagraphRoot(mg, binaries, gl0AnchorOrdinal, noGlobalSnapshotLookup)(Hasher[F])
+  }
+
+  /** The PRODUCER-side per-MG derivation (step 6 of the unroll workstream). Same SHAPE as [[reExecDerivation]] but returns the per-MG MPT
+    * root PAIRED with the MINIMAL `CurrencySnapshotInfo` byte-diff against the prior shard-checkpoint's cumulative state `S(N)`. The
+    * producer carries the diff in `ShardCheckpoint.derivedStateDelta.perMetagraphStateDiff` and gl0 verifiers APPLY-and-verify it (no
+    * re-exec) — the fix for the run-24/26 allow-spends accumulation bug (`docs/nakamoto/COMMITTEE-STATE-DIFF-ADOPTION-DESIGN.md` +
+    * `docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md`).
+    *
+    * '''Diff base = `S(N)` from the adopted, chain-linked best-tip (PIN-4 — NOT empty-prior, NOT the undo journal).''' The committee +
+    * every verifier are gl0 nodes that ALREADY adopted checkpoint N (the chain-link guard enforces in-order adoption), so `S(N)` — the
+    * prior checkpoint's cumulative per-MG currency state — is already in their overlay best-tip. `priorStateReader` is exactly that
+    * best-tip `GlobalStateReader`; `S(N)` is reconstructed from it via [[GlobalStateConverter.reconstructCurrencyInfoFrom]] (8 `Mg*` +
+    * fieldId-7 allow-spends) and the fieldId-5 incremental. Diffs apply IN ORDER (chain-link) ⇒ cumulative state ⇒ allow-spends/token-locks
+    * accumulate. The per-currency-snapshot `gl0AnchorOrdinal` is the metagraph's fee-cutover/exec CONTEXT only — never the diff base.
+    *
+    * '''Derivation (the empty→S(N) swap is the core fix).''' Runs the SAME
+    * [[GlobalSnapshotStateChannelEventsProcessor.processCurrencySnapshots]] derivation [[reExecDerivation]] uses — identical
+    * `noGlobalSnapshotLookup` (pure `None`, split-safe) and identical `AdoptFromSignedFields` adoption mode — but seeds
+    * `priorLastCurrencySnapshots` with `S(N)` (`Right((priorInc, S(N)))`, or `Left(genesis)` at the metagraph's genesis window, or absent
+    * for a never-seen MG) INSTEAD of `SortedMap.empty`. The LAST resulting per-MG `CurrencySnapshotWithState` is `next` (mirrors
+    * `calculateLastCurrencySnapshots`).
+    *
+    * '''Root (PIN-1).''' `root = Hasher.hash((incrementalRoot, infoRoot))` where `(incrementalRoot, infoRoot) =
+    * GlobalStateConverter.currencySnapshotFieldRoots(SortedMap(mg -> next))` — the Some/None-INVISIBLE MPT pair, NOT the
+    * Some/None-SENSITIVE `hash((mg, state))` that [[reExecDerivation]] emits. The single combined `Hash` is what `perMetagraphMptRoots(mg)`
+    * carries (that field is `SortedMap[Address, Hash]`); the gl0 verifier recomputes the IDENTICAL `Hasher.hash((incrementalRoot,
+    * infoRoot))` over its post-apply state. '''TaskB must match this exact encoding.'''
+    *
+    * '''Diff (PIN-2 + PIN-3).''' `ChangeSet.currencyInfoChangeSet(mg, priorInfo, next.info)` — the 8 `Mg*` ⊕ fieldId-7 allow-spends,
+    * minimal (changed/new upserts + removed keys). `priorInfo` is the info half of `S(N)` (empty when absent).
+    */
+  def reExecDerivationWithDiff[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    processor: GlobalSnapshotStateChannelEventsProcessor[F],
+    priorStateReader: GlobalStateReader[F]
+  )(
+    implicit stateProofSelector: StateProofSelector
+  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Option[(Hash, ChangeSet)]] = {
+    import GlobalStateReaderOps._
+    type CurrencyState = Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
+
+    // Pure-by-construction global-snapshot lookup — identical to `reExecDerivation`'s (NEVER reads storage; the split-safety contract
+    // forbids node-local global reads in the derivation, so producer + every verifier derive byte-identical results).
+    val noGlobalSnapshotLookup: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]] =
+      (_: SnapshotOrdinal) => Async[F].pure(Option.empty[Hashed[GlobalIncrementalSnapshot]])
+
+    val emptyInfo: CurrencySnapshotInfo =
+      CurrencySnapshotInfo(SortedMap.empty, SortedMap.empty, None, None, None, None, None, None, None)
+
+    // [REEXEC-DIAG] (2026-06-13, REMOVE after e2e): pin why the producer emits the empty-state fallback (96271a6c) for every MG —
+    // priorState/getCurrencySnapshotInfo values, the lastStateOpt=None branch, and the SWALLOWED handleErrorWith exception.
+    val reExecDiagLogger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointWiring.reExecDiag")
+    def descPrior(p: Option[CurrencyState]): String = p match {
+      case None                     => "None"
+      case Some(Left(g))            => s"Left(genesis@${g.value.ordinal.value.value})"
+      case Some(Right((inc, info))) => s"Right(inc@${inc.value.ordinal.value.value},bal=${info.balances.size})"
+    }
+
+    /** S(N) for this MG from the adopted best-tip: `Right((priorInc, info))` (has an incremental), `Left(genesis)` (post-genesis
+      * pre-first-incremental window), or `None` (never seen by gl0 ⇒ empty prior; the genesis binary in the window seeds it).
+      */
+    def priorState(mg: Address): F[Option[CurrencyState]] =
+      priorStateReader.getLastIncrementalCurrencySnapshot(mg).flatMap {
+        case Some(inc) =>
+          priorStateReader
+            .getCurrencySnapshotInfo(mg)
+            .map {
+              case Some(info) => Right((inc, info)): CurrencyState
+              case None       => Right((inc, emptyInfo)): CurrencyState // defensive: incremental present but info empty
+            }
+            .map(_.some)
+        case None =>
+          priorStateReader.getLastCurrencySnapshot(mg).map(_.map(g => Left(g): CurrencyState))
+      }
+
+    def infoOf(state: CurrencyState): CurrencySnapshotInfo =
+      state.fold(_.value.info.toCurrencySnapshotInfo, _._2)
+
+    (mg: Address, binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]], gl0AnchorOrdinal: SnapshotOrdinal) =>
+      // The DERIVATION prior is the full S(N) CurrencyState (the genesis `Left` is needed to seed the state fold). The DIFF prior, by
+      // contrast, MUST be what is actually RECONSTRUCTIBLE from the unrolled MPT base the apply side (TaskB) diffs against — i.e.
+      // `getCurrencySnapshotInfo` (gated on the fieldId-5 incremental: `None` at a not-yet-unrolled genesis ⇒ `emptyInfo`). Using the
+      // genesis snapshot's embedded info as the diff prior would desync the apply (the genesis info is NOT in the unrolled `Mg*`
+      // partitions until the first incremental writes it), so the two priors are deliberately resolved by different reads.
+      (priorState(mg), priorStateReader.getCurrencySnapshotInfo(mg)).tupled.flatMap {
+        case (priorOpt, priorInfoOpt) =>
+          val priorInfo: CurrencySnapshotInfo = priorInfoOpt.getOrElse(emptyInfo)
+          val priorMap: SortedMap[Address, CurrencyState] =
+            priorOpt.fold(SortedMap.empty[Address, CurrencyState])(p => SortedMap(mg -> p))
+
+          reExecDiagLogger.info(
+            s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} anchor=${gl0AnchorOrdinal.value.value} windowSize=${binaries.size} " +
+              s"priorOpt=${descPrior(priorOpt)} priorInfoOpt=${priorInfoOpt.fold("None")(i => s"Some(bal=${i.balances.size})")}"
+          ) >>
+            // SAME derivation as reExecDerivation (AdoptFromSignedFields, noGlobalSnapshotLookup), but with the S(N) prior instead of empty.
+            // ORDER CONTRACT (mirrors deriveMetagraphRoot): processCurrencySnapshots expects NEWEST-FIRST; checkpoint windows arrive
+            // OLDEST-FIRST (chainLinkOrder unfolds anchor→tip), so reverse here.
+            processor
+              .processCurrencySnapshots(
+                gl0AnchorOrdinal,
+                SortedMap.empty[Address, Balance],
+                priorMap,
+                SortedMap(mg -> binaries.reverse),
+                noGlobalSnapshotLookup,
+                GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode.AdoptFromSignedFields
+              )(Hasher[F])
+              .flatMap { accepted =>
+                // Mirror calculateLastCurrencySnapshots: the LAST resulting state across the re-executed chain is `next`.
+                val lastStateOpt: Option[CurrencyState] =
+                  accepted.get(mg).flatMap { case (pairs, _) => pairs.toList.flatMap(_._2).lastOption }
+                lastStateOpt match {
+                  case Some(next) =>
+                    // CONTIGUITY GATE (I3 / run-27b). The window MUST chain from the FINALIZED base prior. `AdoptFromSignedFields`
+                    // accumulates `next` OVER `priorInfo` (the base, read via `fromMptStore`). The window anchors at the shard chain's
+                    // `bestTip` (`perMgTip`), so for an ACTIVE MG whose adopted checkpoints have not yet finalized (`bestTip > base`),
+                    // the window's binaries chain from `bestTip`, NOT base — folding them onto base silently DROPS the base→bestTip
+                    // events and yields a WRONG `next`. Every gl0 then recomputes the real root over the same base, mismatches the
+                    // attested (wrong) root, and WITHHOLDS the MG ⇒ permanent freeze (run-27b DAG5L1ez). Detect the gap by ordinal: a
+                    // window that chains from base advances `base.ordinal` by EXACTLY `windowSize`. On a gap, OMIT (defer) — base catches
+                    // up when the in-flight checkpoints finalize, then the next checkpoint covers `base→latest` in ONE contiguous burst
+                    // and the MG self-heals (mirror stays current: gl0 adopts the burst to `latest`). Genesis priors (`Left`/`None`) are
+                    // seeded by the window itself, so the gate only constrains an incremental (`Right`) base. Deterministic: base + the
+                    // signed window are identical on every committee member, so the OMIT decision is cluster-uniform.
+                    val contiguousWithBase: Boolean = (priorOpt, next) match {
+                      case (Some(Right((priorInc, _))), Right((nextInc, _))) =>
+                        nextInc.value.ordinal.value.value === priorInc.value.ordinal.value.value + binaries.size.toLong
+                      case _ => true
+                    }
+                    if (!contiguousWithBase)
+                      reExecDiagLogger
+                        .warn(
+                          s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} window NOT contiguous with finalized base " +
+                            s"(${descPrior(priorOpt)} windowSize=${binaries.size} nextOrd=${next.toOption
+                                .map(_._1.value.ordinal.value.value)
+                                .getOrElse(-1L)}) — bestTip>base, OMIT (defer until base finalizes)"
+                        )
+                        .as(None: Option[(Hash, ChangeSet)])
+                    else
+                      for {
+                        roots <- GlobalStateConverter.currencySnapshotFieldRoots[F](SortedMap(mg -> next))
+                        root <- Hasher[F].hash(roots) // (incrementalRoot, infoRoot) pair → single Some/None-invisible Hash (PIN-1)
+                        diff <- ChangeSet.currencyInfoChangeSet[F](mg, priorInfo, infoOf(next))
+                      } yield Some((root, diff)): Option[(Hash, ChangeSet)]
+                  case None =>
+                    // OMIT-ON-CAN'T-DERIVE (2026-06-13). The derivation produced NO state — the genesis-bootstrap race: this MG's
+                    // genesis was already consumed by an earlier shard checkpoint (perMgTip advanced past it) BUT this producer node's
+                    // best-tip prior reader has not yet seen gl0 ADOPT that genesis (the ~6-min embed/quorum warmup), so `priorOpt=None`
+                    // AND the window head is a non-genesis incremental → `processCurrencySnapshots`'s AdoptFromSignedFields genesis-window
+                    // guard drops the window. We must NOT commit an empty-state root + empty diff: once committee-quorumed that
+                    // "couldn't-derive" sentinel is a PERMANENT lie — every gl0 later recomputes the real non-empty root from its
+                    // now-adopted S(N), mismatches the attested empty sentinel forever, and drops the MG's currency advance (the run-26
+                    // freeze). Instead OMIT this MG: its binaries stay pending, `perMgTip` does not advance, and it re-derives correctly
+                    // on a later checkpoint once the prior is adopted (the pipeline self-heals).
+                    reExecDiagLogger
+                      .warn(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} lastStateOpt=None — OMIT (defer until prior adopted)")
+                      .as(None: Option[(Hash, ChangeSet)])
+                }
+              }
+              .handleErrorWith { e =>
+                // A derivation crash is likewise NOT a committable state — OMIT this MG (defer) rather than attest an empty-state root
+                // every verifier would mismatch. The MG re-derives cleanly on a later checkpoint over the same chain.
+                reExecDiagLogger
+                  .warn(e)(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} DERIVATION CRASH → OMIT (defer)")
+                  .as(None: Option[(Hash, ChangeSet)])
+              }
+      }
   }
 
   /** Build the acceptance-side sharding dependencies, gated on `cfg.numShards > 1`.
