@@ -57,6 +57,18 @@ object ShardMetrics {
   /** Gauge — per-shard `lastFinalizedOrdinal`. Labels: `shard_id`. */
   val ChainFinalizedOrdinal: MetricKey = "dag_nakamoto_shard_chain_finalized_ordinal"
 
+  /** Gauge — per-shard [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer]] occupancy (distinct buffered
+    * binaries across all in-shard MGs). Labels: `shard_id`. Emitted on every successful `bufferBinary` and every `pruneFinalized`. The S3
+    * freeze signal: this gauge PLATEAUS once finalize-keyed pruning bounds the buffer; it climbing toward the cap is the slow-freeze.
+    */
+  val BufferSize: MetricKey = "dag_nakamoto_shard_buffer_size"
+
+  /** Counter — one increment when [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer.bufferBinary]] rejects a
+    * NEW distinct binary because the buffer is at cap AND holds no finalized binary to evict (genuine overload — un-finalized binaries
+    * only). Labels: `shard_id`. A LOUD signal (not just a warn) per the prom-metrics-not-logs SOP.
+    */
+  val BufferOverflowTotal: MetricKey = "dag_nakamoto_shard_buffer_overflow_total"
+
   // ---- Label names ---------------------------------------------------------
 
   private val ShardIdLabel: LabelName = "shard_id"
@@ -159,6 +171,18 @@ object ShardMetrics {
   /** Set [[ChainFinalizedOrdinal]]`{shard_id}` to `ord`. Call from `ShardChainStore.finalize` after advancing `lastFinalizedOrdinal`. */
   def setChainFinalized[F[_]: Async: Metrics](shardId: ShardId, ord: ShardOrdinal): F[Unit] =
     Metrics[F].updateGauge(ChainFinalizedOrdinal, ord.value, shardIdTag(shardId))
+
+  /** Set [[BufferSize]]`{shard_id}` to `size`. Call from `ShardBinaryBuffer` after every successful `bufferBinary` and every
+    * `pruneFinalized` (S3).
+    */
+  def setBufferSize[F[_]: Async: Metrics](shardId: ShardId, size: Int): F[Unit] =
+    Metrics[F].updateGauge(BufferSize, size, shardIdTag(shardId))
+
+  /** Increment [[BufferOverflowTotal]]`{shard_id}`. Call from `ShardBinaryBuffer.bufferBinary` when the buffer is at cap and holds no
+    * finalized binary to evict (genuine un-finalized overload — S3).
+    */
+  def incrementBufferOverflow[F[_]: Async: Metrics](shardId: ShardId): F[Unit] =
+    Metrics[F].incrementCounter(BufferOverflowTotal, shardIdTag(shardId))
 
   /** Internal helper exposed so unit tests can build the same `TagSeq` the production emit path uses without re-exporting the constants. */
   private[sharding] def labelNameShardId: LabelName = ShardIdLabel
