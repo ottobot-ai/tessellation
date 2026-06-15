@@ -39,8 +39,8 @@ import weaver.MutableIOSuite
 /** Step-2 guard for `docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md`: the unrolled per-metagraph `CurrencySnapshotInfo` `infoRoot`
   * (the union over the 8 `Mg*` infoSubFields) is byte-identical across the THREE paths that compute it:
   *   - producer `GlobalSnapshotInfo.mptStateProofFromBytes` — union from the actual `entries` (`perFieldGrouping`),
-  *   - follower `GlobalStateConverter.currencySnapshotFieldRoots` — union from the SHARED `currencySnapshotEntryBytes` encoder.
-  * These are DIFFERENT code paths; this suite proves they agree (the I2 split-safety invariant — the consensus-critical core of step 2).
+  *   - follower `GlobalStateConverter.currencySnapshotFieldRoots` — union from the SHARED `currencySnapshotEntryBytes` encoder. These are
+  *     DIFFERENT code paths; this suite proves they agree (the I2 split-safety invariant — the consensus-critical core of step 2).
   *
   * Also asserts the encoder DROPPED the monolithic `LastCurrencySnapshotInfo` blob (fieldId 6) and now emits per-entry `Mg*` keys.
   */
@@ -96,7 +96,9 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
       activeTokenLocks = SortedMap(holder -> SortedSet(mkTokenLock(holder, "x"))).some
     )
 
-  private def signedIncremental(snapOrdinal: Long)(implicit sp: SecurityProvider[IO], h: Hasher[IO]): IO[Signed[CurrencyIncrementalSnapshot]] = {
+  private def signedIncremental(
+    snapOrdinal: Long
+  )(implicit sp: SecurityProvider[IO], h: Hasher[IO]): IO[Signed[CurrencyIncrementalSnapshot]] = {
     val snapshot = CurrencyIncrementalSnapshot(
       ordinal = SnapshotOrdinal.unsafeApply(snapOrdinal),
       height = Height.MinValue,
@@ -125,9 +127,10 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
       mgAddr <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
       holder <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
       inc <- signedIncremental(7L)
-    } yield GlobalSnapshotInfo.empty.copy(
-      lastCurrencySnapshots = SortedMap(mgAddr -> (inc, richInfo(holder)).asRight[Signed[CurrencySnapshot]])
-    )
+    } yield
+      GlobalSnapshotInfo.empty.copy(
+        lastCurrencySnapshots = SortedMap(mgAddr -> (inc, richInfo(holder)).asRight[Signed[CurrencySnapshot]])
+      )
 
   test("infoRoot: producer mptStateProof (union-from-entries) === follower currencySnapshotFieldRoots (shared encoder)") { res =>
     implicit val (h, sp, js) = res
@@ -217,7 +220,9 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
     for {
       _ <- info.balances.toList.traverse_ { case (a, b) => store.insert(GlobalStateKey.metagraphEntry(mgAddr, MgBalances, a), (a, b)) }
       _ <- info.lastTxRefs.toList.traverse_ { case (a, r) => store.insert(GlobalStateKey.metagraphEntry(mgAddr, MgLastTxRefs, a), (a, r)) }
-      _ <- opt(info.lastFeeTxRefs).traverse_ { case (a, r) => store.insert(GlobalStateKey.metagraphEntry(mgAddr, MgLastFeeTxRefs, a), (a, r)) }
+      _ <- opt(info.lastFeeTxRefs).traverse_ {
+        case (a, r) => store.insert(GlobalStateKey.metagraphEntry(mgAddr, MgLastFeeTxRefs, a), (a, r))
+      }
       _ <- opt(info.lastAllowSpendRefs).traverse_ {
         case (a, r) => store.insert(GlobalStateKey.metagraphEntry(mgAddr, MgLastAllowSpendRefs, a), (a, r))
       }
@@ -231,7 +236,8 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
         case (mt, m) => GlobalStateKey.metagraphEntryHashed[IO](mgAddr, MgLastMessages, mt.value).flatMap(store.insert(_, (mt, m)))
       }
       _ <- opt(info.globalSnapshotSyncView).traverse_ {
-        case (p, s) => GlobalStateKey.metagraphEntryHashed[IO](mgAddr, MgGlobalSnapshotSyncView, p.value.value).flatMap(store.insert(_, (p, s)))
+        case (p, s) =>
+          GlobalStateKey.metagraphEntryHashed[IO](mgAddr, MgGlobalSnapshotSyncView, p.value.value).flatMap(store.insert(_, (p, s)))
       }
       _ <- opt(info.activeAllowSpends).traverse_ {
         case (holder, set) => store.insert(GlobalStateKey.hypergraph(ActiveAllowSpends, mgAddr.some, holder), set)

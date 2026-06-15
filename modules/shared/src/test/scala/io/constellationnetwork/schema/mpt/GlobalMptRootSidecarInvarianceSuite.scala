@@ -23,8 +23,8 @@ import weaver.MutableIOSuite
   *
   * Root cause: the consensus global `mptRoot` was a full MPT build over EVERY stored byte, including the `SystemNamespace` sidecar
   * partitions (`ActiveAddressIndex`, expiry buckets). The `ActiveAddressIndex` partition is maintained '''append-only''' on the accept path
-  * (`applyActiveAddressIndexDelta(..., removed = Set.empty)`), so its contents are a function of the per-ordinal delta '''history''', not the
-  * current KV state — two honest nodes that processed different (but equivalent-final) ordinal streams, or a node that rebuilt via
+  * (`applyActiveAddressIndexDelta(..., removed = Set.empty)`), so its contents are a function of the per-ordinal delta '''history''', not
+  * the current KV state — two honest nodes that processed different (but equivalent-final) ordinal streams, or a node that rebuilt via
   * `syncFromGlobalSnapshotInfo` (which seeds the index from current keysets), end up with different sidecar entry sets for IDENTICAL
   * user-field state. Because the sidecar has no per-field stateProof slot, the divergence surfaced as `stateProof[mptRoot]`-ONLY rejection
   * (every per-field root matched, only the rolled-up root differed) → tentative branch → reorg → re-exec → same divergence → storm.

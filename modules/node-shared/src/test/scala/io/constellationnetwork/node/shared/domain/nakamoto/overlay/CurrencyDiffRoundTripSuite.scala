@@ -108,8 +108,8 @@ object CurrencyDiffRoundTripSuite extends MutableIOSuite {
   private def addrs(implicit sp: SecurityProvider[IO]): IO[(Address, Address)] =
     (KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress), KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)).tupled
 
-  /** The PIN-1 infoRoot PREIMAGE for one MG's info as a structurally-comparable map (`Array[Byte]` is reference-equal, so key to Hex
-    * string and value to `Seq[Byte]`). This is exactly the 8 `Mg*` byte set `currencySnapshotFieldRoots` hashes into the infoRoot, so equal
+  /** The PIN-1 infoRoot PREIMAGE for one MG's info as a structurally-comparable map (`Array[Byte]` is reference-equal, so key to Hex string
+    * and value to `Seq[Byte]`). This is exactly the 8 `Mg*` byte set `currencySnapshotFieldRoots` hashes into the infoRoot, so equal
     * preimage ⇔ equal infoRoot; and it is Some/None-invisible (`infoEntryBytes.opt`), so the all-`Some` reconstruction normal form is OK.
     */
   private def bytesKeyed(mgAddr: Address, info: CurrencySnapshotInfo)(implicit h: Hasher[IO]): IO[Map[String, Seq[Byte]]] =
@@ -203,10 +203,11 @@ object CurrencyDiffRoundTripSuite extends MutableIOSuite {
     * `GSAM.deriveAdoptedCurrencyState.priorInfoOf` resolves the `Left(genesis)` arm to `emptyInfo` too — NOT the genesis snapshot's
     * embedded `CurrencySnapshotInfo` (which carries the non-empty genesis `balances`).
     *
-    * This test models a genesis-funded `holder` FULLY DRAINED in window-0 (absent from `next`). The producer's diff (vs `emptyInfo`) has
-    * NO removal for `holder` (its prior was empty). Applying it onto the genesis prior (non-empty `balances` at `holder`) leaves the stale
+    * This test models a genesis-funded `holder` FULLY DRAINED in window-0 (absent from `next`). The producer's diff (vs `emptyInfo`) has NO
+    * removal for `holder` (its prior was empty). Applying it onto the genesis prior (non-empty `balances` at `holder`) leaves the stale
     * `holder` balance in the reconstruction ⇒ `=!= next` ⇒ PIN-1 infoRoot mismatch ⇒ permanent per-MG freeze. Applying it onto `emptyInfo`
-    * (the fix) ⇒ `=== next`. So this asserts BOTH: the correct (empty) prior agrees, and the genesis prior would NOT — pinning the contract.
+    * (the fix) ⇒ `=== next`. So this asserts BOTH: the correct (empty) prior agrees, and the genesis prior would NOT — pinning the
+    * contract.
     */
   test("PIN-4 genesis-seam: apply-prior MUST mirror the producer's emptyInfo diff-prior, not the genesis embedded info") { res =>
     implicit val (h, sp, _) = res
