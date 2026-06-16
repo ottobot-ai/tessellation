@@ -267,9 +267,19 @@ object GlobalStateFieldId {
   case object MgLastMessages extends GlobalStateFieldId { def toInt: Int = 31 }
   case object MgGlobalSnapshotSyncView extends GlobalStateFieldId { def toInt: Int = 32 }
 
-  /** The 8 unrolled per-metagraph `CurrencySnapshotInfo` sub-fields whose UNION is committed by `CurrencySnapshotMptRoots.infoRoot`. Used
-    * by `GlobalStateConverter.currencySnapshotFieldRoots` / `GlobalSnapshotInfo.mptStateProofFromBytes` to group these entries into the
-    * single `infoRoot` (replacing the `fieldId == LastCurrencySnapshotInfo` filter). MUST stay in sync with the `Mg*` case objects above.
+  /** The unrolled per-metagraph `CurrencySnapshotInfo` sub-fields whose UNION is committed by `CurrencySnapshotMptRoots.infoRoot`. Used by
+    * `GlobalStateConverter.currencySnapshotFieldRoots` / `GlobalSnapshotInfo.mptStateProofFromBytes` to group these entries into the single
+    * `infoRoot` (replacing the `fieldId == LastCurrencySnapshotInfo` filter). MUST stay in sync with the `Mg*` case objects above.
+    *
+    * '''`MgGlobalSnapshotSyncView` (field 32) is DELIBERATELY EXCLUDED''' (cause-2, the sharded-mirror m1 freeze). The per-peer
+    * `globalSnapshotSyncView` is OBSERVATION-DEPENDENT: the metagraph producer accumulates it under the FULL consensus committee, a
+    * re-deriving gl0 verifier (and the currency-layer follower) under only the 2/3 signers (#259), so honest nodes hold DIFFERENT per-peer
+    * maps. In the shard-checkpoint diff/apply that drift is UNRECONCILABLE — a removals-free minimal diff cannot evict a peer present only
+    * in the follower's prior, so the verifier's recomputed `infoRoot` mismatches the committee-attested root EVERY ordinal and the MG
+    * freezes out of gl0 adoption forever (run-2x: gl0 ord 465+, `diff(upserts=1,removals=0)`, attested≠recomputed). gl0 does NOT consume a
+    * metagraph's view of gl0-syncs, so the field is excluded from the consensus root (the #116 pattern: path-dependent state stays STORED +
+    * diffed + reconstructed, but leaves the root). The metagraph's OWN `CurrencySnapshotInfo.stateProof` still commits to it independently.
+    * See `CurrencyDiffRoundTripSuite` (freeze-repro + fix guard) and `ShardCheckpointWiring.reExecDerivationWithDiff`.
     */
   val infoSubFields: Set[GlobalStateFieldId] =
     Set(
@@ -279,8 +289,7 @@ object GlobalStateFieldId {
       MgLastAllowSpendRefs,
       MgLastTokenLockRefs,
       MgActiveTokenLocks,
-      MgLastMessages,
-      MgGlobalSnapshotSyncView
+      MgLastMessages
     )
 
   implicit val ordering: Ordering[GlobalStateFieldId] = Ordering.by(_.toInt)
