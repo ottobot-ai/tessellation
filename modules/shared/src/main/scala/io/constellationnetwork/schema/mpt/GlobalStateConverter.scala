@@ -923,7 +923,12 @@ object GlobalStateConverter {
     */
   def toAccumulatorHexDelta[F[_]: Async: Parallel: Hasher: JsonSerializer](
     acc: StateChangesAccumulator,
-    preSyncBytes: Map[Hex, Array[Byte]]
+    preSyncBytes: Map[Hex, Array[Byte]],
+    // S1 BASE-ANCHORING for the `Mg*` removal set — MUST mirror the writer's `AcceptanceMptStateChanges.applyStateChanges`
+    // `currencyInfoRemovalPrior` (GSAM passes `Some(overlay.base.allEntriesAsBytes)` in `shardedInfoMode`, else `None`). The per-MG
+    // `Mg*` removals are computed against THIS prior (the FINALIZED BASE), not `preSyncBytes` (the branch tip). `None` ⇒ branch==base
+    // (pipelineDepth=1 / numShards=1, the production regime), where it equals `preSyncBytes`.
+    mgRemovalPriorBytes: Option[Map[Hex, Array[Byte]]] = None
   )(implicit stateProofSelector: StateProofSelector): F[(Map[Hex, Array[Byte]], Set[Hex])] =
     for {
       typedUpserts <- toAccumulatorBytesDelta[F](acc)
@@ -989,12 +994,38 @@ object GlobalStateConverter {
         acc.removedTokenLockBalanceKeys,
         preSyncBytes
       )
+      // [Mg* REMOVAL PARITY] Mirror the incremental writer's per-MG `CurrencySnapshotInfo` sub-entry removals in the verify-replay.
+      // `writeCurrencyInfo` removes the `Mg*` keys dropped this ordinal (`infoRemovalKeys` vs the prior info — e.g. an
+      // `MgActiveTokenLocks` entry when an in-metagraph token-lock expires). `toAccumulatorRemovalKeys` above emits only the TOP-LEVEL
+      // global removals, so without this the replay keeps the stale `Mg*` entry and `(preSyncBytes -- removes) ++ upserts` diverges from
+      // the (correct) incremental `postBytes` → false-positive `mptConsistency=DIVERGED` crash (proven live: ord-372/435
+      // `divergedFields=[MgActiveTokenLocks:1]`). Computed as a pure HEX-KEY-SET DIFF (no decode / reconstruction — robust): for each MG,
+      // its `Mg*` keys present in `preSyncBytes` but ABSENT from the new upserts (`upsertsHex`, written via the single `infoEntryBytes`
+      // encoder) are exactly the dropped sub-entries — the same set `infoRemovalKeys` computes, without re-decoding the prior bytes.
+      // `activeAllowSpends` (fieldId-7) is intentionally excluded — its removals are the top-level `removedAllowSpendKeys` path, matching
+      // `infoRemovalKeys`'s exclusion. Verify-side only — no consensus bytes move (the writer / `postBytes` were always correct).
+      infoRemovalsHex <- acc.lastCurrencySnapshots.keys.toList.parTraverse { mgAddr =>
+        List(
+          GlobalStateFieldId.MgBalances,
+          GlobalStateFieldId.MgLastTxRefs,
+          GlobalStateFieldId.MgLastFeeTxRefs,
+          GlobalStateFieldId.MgLastAllowSpendRefs,
+          GlobalStateFieldId.MgLastTokenLockRefs,
+          GlobalStateFieldId.MgActiveTokenLocks,
+          GlobalStateFieldId.MgLastMessages,
+          GlobalStateFieldId.MgGlobalSnapshotSyncView
+        ).traverse(sub => GlobalStateKey.metagraphFieldPrefix[F](mgAddr, sub)).map { prefixes =>
+          val isMgEntry = (k: Hex) => prefixes.exists(p => k.value.startsWith(p.value))
+          // Anchor the prior `Mg*` key set on the SAME prior the writer used (base in shardedInfoMode, else branch==preSyncBytes).
+          mgRemovalPriorBytes.getOrElse(preSyncBytes).keySet.filter(isMgEntry) -- upsertsHex.keySet.filter(isMgEntry)
+        }
+      }.map(_.flatten.toSet)
     } yield
       (
         upsertsHex ++ asExp._1 ++ tlExp._1 ++ ncwExp._1 ++ asAddrIdx._1 ++ tlAddrIdx._1 ++ txAddrIdx._1 ++ balAddrIdx._1 ++
           scHashesAddrIdx._1 ++ currSnapsAddrIdx._1 ++ tlbAddrPairIdx._1,
         removalsHex ++ asExp._2 ++ tlExp._2 ++ ncwExp._2 ++ asAddrIdx._2 ++ tlAddrIdx._2 ++ txAddrIdx._2 ++ balAddrIdx._2 ++
-          scHashesAddrIdx._2 ++ currSnapsAddrIdx._2 ++ tlbAddrPairIdx._2
+          scHashesAddrIdx._2 ++ currSnapsAddrIdx._2 ++ tlbAddrPairIdx._2 ++ infoRemovalsHex
       )
 
   /** Mirror of `applyActiveAddressIndexDelta`'s read-modify-write for the verify replay path. Decode the pre-sync sidecar entry, apply

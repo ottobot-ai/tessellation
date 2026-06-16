@@ -6,6 +6,7 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
@@ -15,6 +16,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.{SpendTransaction, TokenUnlock}
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt._
@@ -416,6 +418,98 @@ object IncrementalVsRebuildEarlyRemovalParitySuite extends MutableIOSuite {
         clue(onlyInInc).isEmpty,
         clue(onlyInRebuild).isEmpty,
         clue(orphanBucket).isEmpty
+      )
+    }
+  }
+
+  // ===========================================================================
+  // CurrencySnapshotInfo `Mg*` sub-entry EARLY removal: incremental `syncFromStateChanges` ===
+  // delta-replay `toAccumulatorHexDelta` (the GSAM `mptConsistency` self-check path — NOT the
+  // from-GSI rebuild the tests above use). A token-lock expiring INSIDE a metagraph's
+  // CurrencySnapshotInfo drops an `MgActiveTokenLocks` entry: the incremental writer
+  // (`writeCurrencyInfo` -> `infoRemovalKeys`) removes the stale `Mg*` MPT entry, but the delta-replay
+  // (`toAccumulatorHexDelta` -> `toAccumulatorRemovalKeys`) historically omitted the `Mg*` removals, so
+  // `(preSyncBytes -- removes) ++ upserts` kept the stale entry -> false-positive `mptConsistency=DIVERGED`
+  // -> producer crash -> global halt (the ord-435 token-lock-expiry crash). RED before the replay learns the
+  // `Mg*` removals; GREEN after.
+  // ===========================================================================
+
+  private def mkIncremental(ordinal: Long)(implicit sp: SecurityProvider[IO], h: Hasher[IO]): IO[Signed[CurrencyIncrementalSnapshot]] =
+    KeyPairGenerator.makeKeyPair[IO].flatMap { kp =>
+      Signed.forAsyncHasher[IO, CurrencyIncrementalSnapshot](
+        CurrencyIncrementalSnapshot(
+          SnapshotOrdinal.unsafeApply(ordinal),
+          Height.MinValue,
+          SubHeight.MinValue,
+          Hash.empty,
+          SortedSet.empty,
+          SortedSet.empty,
+          SnapshotTips(SortedSet.empty, SortedSet.empty),
+          CurrencySnapshotStateProof(Hash.empty, Hash.empty, None, None, None, None, None, None, None),
+          EpochProgress.MinValue,
+          None,
+          None,
+          None,
+          None,
+          None,
+          None,
+          None,
+          None
+        ),
+        kp
+      )
+    }
+
+  test(
+    "CurrencySnapshotInfo Mg* removal (in-metagraph token-lock expiry): incremental syncFromStateChanges === " +
+      "delta-replay toAccumulatorHexDelta — no stale MgActiveTokenLocks survives the replay"
+  ) { res =>
+    implicit val (h, sp, js) = res
+    type CurrencyArm = Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
+    val ord1 = SnapshotOrdinal(NonNegLong(1L))
+    val ord2 = SnapshotOrdinal(NonNegLong(2L))
+    for {
+      kpMg <- KeyPairGenerator.makeKeyPair[IO]
+      kpHolder <- KeyPairGenerator.makeKeyPair[IO]
+      mgAddr = kpMg.getPublic.toAddress
+      holder = kpHolder.getPublic.toAddress
+      priorInfo = CurrencySnapshotInfo(
+        lastTxRefs = SortedMap.empty,
+        balances = SortedMap.empty,
+        lastMessages = None,
+        lastFeeTxRefs = None,
+        lastAllowSpendRefs = None,
+        activeAllowSpends = None,
+        globalSnapshotSyncView = None,
+        lastTokenLockRefs = None,
+        activeTokenLocks = SortedMap(holder -> SortedSet(mkTokenLock(holder, None, "lock1"))).some
+      )
+      // Next ordinal: the holder's lock has expired -> dropped from activeTokenLocks (an MgActiveTokenLocks removal).
+      nextInfo = priorInfo.copy(activeTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]].some)
+      inc1 <- mkIncremental(1L)
+      inc2 <- mkIncremental(2L)
+      accPrior = StateChangesAccumulator(lastCurrencySnapshots = SortedMap[Address, CurrencyArm](mgAddr -> Right((inc1, priorInfo))))
+      accNext = StateChangesAccumulator(lastCurrencySnapshots = SortedMap[Address, CurrencyArm](mgAddr -> Right((inc2, nextInfo))))
+      store <- freshStore
+      _ <- store.syncFromStateChanges(accPrior, ord1)
+      preSyncBytes <- store.allEntriesAsBytes
+      // INCREMENTAL writer: drops the stale MgActiveTokenLocks entry (correct).
+      _ <- store.syncFromStateChanges(accNext, ord2)
+      postBytes <- store.allEntriesAsBytes
+      // DELTA-REPLAY (the GSAM self-check path): (preSyncBytes -- removes) ++ upserts.
+      delta <- GlobalStateConverter.toAccumulatorHexDelta[IO](accNext, preSyncBytes)
+      (deltaUpserts, deltaRemoves) = delta
+      expectedBytes = (preSyncBytes -- deltaRemoves) ++ deltaUpserts
+      postNonSys = GlobalStateKey.nonSystemNamespaceEntries(postBytes).view.mapValues(_.toVector).toMap
+      replNonSys = GlobalStateKey.nonSystemNamespaceEntries(expectedBytes).view.mapValues(_.toVector).toMap
+    } yield {
+      // Keys the replay KEEPS but the (correct) incremental writer dropped — must be empty.
+      val staleInReplay = replNonSys.keySet -- postNonSys.keySet
+      val missingInReplay = postNonSys.keySet -- replNonSys.keySet
+      expect.all(
+        clue(staleInReplay).isEmpty,
+        clue(missingInReplay).isEmpty,
+        clue(replNonSys) == clue(postNonSys)
       )
     }
   }

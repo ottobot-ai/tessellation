@@ -2571,8 +2571,15 @@ object GlobalSnapshotAcceptanceManager {
                       // Independent byte derivation: take pre-sync bytes, apply the accumulator's
                       // upserts + removes via `toAccumulatorHexDelta` (scodec per-field encoding,
                       // no `GlobalSnapshotInfo` involved). This is the MPT-as-primary verify path.
+                      // S1 base-anchoring (mirror the writer's `currencyWriteRemovalPrior` above): in shardedInfoMode the writer computes
+                      // per-MG `Mg*` removals against the FINALIZED BASE (`overlay.base`), so the verify-replay MUST anchor them there too
+                      // — otherwise branch!=base re-trips the #107 `mptConsistency=DIVERGED` self-check on a CORRECT writer. Else
+                      // (branch==base, the pipelineDepth=1/numShards=1 production regime) the default (`preSyncBytes`) is exact.
+                      mgRemovalPrior <-
+                        if (shardedInfoMode) overlay.base.allEntriesAsBytes.map(_.some)
+                        else Option.empty[Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]].pure[F]
                       deltaPair <- io.constellationnetwork.schema.mpt.GlobalStateConverter
-                        .toAccumulatorHexDelta[F](stateChangesAccumulator, preSyncBytes)
+                        .toAccumulatorHexDelta[F](stateChangesAccumulator, preSyncBytes, mgRemovalPrior)
                       (deltaUpserts, deltaRemoves) = deltaPair
                       expectedBytes = (preSyncBytes -- deltaRemoves) ++ deltaUpserts
                       // The consensus global root excludes SystemNamespace sidecars (path-dependent
@@ -2597,13 +2604,37 @@ object GlobalSnapshotAcceptanceManager {
                           // Writer divergence — `syncFromStateChanges` produced bytes that don't
                           // match the expected `prev ⊖ removes ⊕ upserts` replay. This is a writer
                           // bug; fail acceptance so it surfaces in tests instead of silently healing.
+                          // [WRITER-DIVERGE-DIAG] Name the diverging field(s) + per-key byte shape so any future writer-vs-replay gap is
+                          // pinned to the exact encoder immediately (incr=absent ⇒ writer removed it / repl=absent ⇒ replay kept it),
+                          // not just the opaque roots. (This is how the run-372/435 `MgActiveTokenLocks` removal asymmetry was proven.)
+                          val diagPostNonSys = io.constellationnetwork.schema.mpt.GlobalStateKey.nonSystemNamespaceEntries(postBytes)
+                          val diagDivergedKeys = (diagPostNonSys.keySet ++ verifyEntries.keySet)
+                            .filter(k => diagPostNonSys.get(k).map(_.toList) != verifyEntries.get(k).map(_.toList))
+                          val diagByField = diagDivergedKeys.toList
+                            .groupBy(k =>
+                              io.constellationnetwork.schema.mpt.GlobalStateKey.fieldIdFromHex(k).map(_.toString).getOrElse("UNKNOWN")
+                            )
+                            .map { case (fid, ks) => s"$fid:${ks.size}" }
+                            .mkString(",")
+                          val diagSample = diagDivergedKeys.toList
+                            .take(6)
+                            .map { k =>
+                              val fid = io.constellationnetwork.schema.mpt.GlobalStateKey.fieldIdFromHex(k).map(_.toString).getOrElse("?")
+                              s"${k.value.take(18)}{f=$fid,incr=${diagPostNonSys.get(k).fold("absent")(b => s"${b.length}b")}," +
+                                s"repl=${verifyEntries.get(k).fold("absent")(b => s"${b.length}b")}}"
+                            }
+                            .mkString(" ")
                           loggerBundle.app.error(
-                            s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptConsistency=DIVERGED " +
-                              s"incremental=${incrementalRoot.take(12)} replay=${verifyRoot.take(12)} " +
-                              s"entries=${expectedBytes.size} " +
-                              s"deltaUpserts=${deltaUpserts.size} deltaRemoves=${deltaRemoves.size} " +
-                              s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
+                            s"[WRITER-DIVERGE-DIAG] ordinal=$ordinal divergedFields=[$diagByField] " +
+                              s"divergedKeyCount=${diagDivergedKeys.size} sample=[$diagSample]"
                           ) >>
+                            loggerBundle.app.error(
+                              s"[ACCEPTANCE] ordinal=$ordinal stateProof: mptConsistency=DIVERGED " +
+                                s"incremental=${incrementalRoot.take(12)} replay=${verifyRoot.take(12)} " +
+                                s"entries=${expectedBytes.size} " +
+                                s"deltaUpserts=${deltaUpserts.size} deltaRemoves=${deltaRemoves.size} " +
+                                s"gsi.balances=${gsi.balances.size} gsi.currSnapshots=${gsi.lastCurrencySnapshots.size}"
+                            ) >>
                             Async[F].raiseError[GlobalSnapshotStateProof](
                               new RuntimeException(
                                 s"MPT writer divergence at ordinal $ordinal: incremental=$incrementalRoot replay=$verifyRoot"
