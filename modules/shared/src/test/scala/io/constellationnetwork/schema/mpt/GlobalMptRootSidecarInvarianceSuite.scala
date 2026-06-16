@@ -147,4 +147,27 @@ object GlobalMptRootSidecarInvarianceSuite extends MutableIOSuite {
         expect(sidecar.keys.forall(GlobalStateKey.isSystemNamespaceHex)) &&
         expect(filtered.forall { case (k, _) => !GlobalStateKey.isSystemNamespaceHex(k) })
   }
+
+  /** cause-2 / Tier-3 catch-up wedge guard: `consensusRootEntries` ALSO drops the observation-dependent `MgGlobalSnapshotSyncView` (field
+    * 32) — which `nonSystemNamespaceEntries` KEEPS (it is a MetagraphNamespace `01…` entry, not a `03…` sidecar). Every OTHER user field
+    * survives, so the consensus global `mptRoot` is invariant to a metagraph's per-peer gl0-sync-view (which honest nodes can't reproduce
+    * byte-for-byte and the catch-up gate re-encodes divergently). See `GlobalStateKey.consensusRootEntries`.
+    */
+  test("consensusRootEntries drops MgGlobalSnapshotSyncView (field 32) that nonSystemNamespaceEntries keeps") { res =>
+    implicit val (h, _, j) = res
+    val gsi = sampleGsi
+    val mgAddr = gsi.balances.keySet.head
+    for {
+      base <- userBytes(gsi)
+      syncKey <- GlobalStateKey.metagraphEntryHashed[IO](mgAddr, GlobalStateFieldId.MgGlobalSnapshotSyncView, "peer-1")
+      syncHex <- GlobalStateKey.toHex[IO](syncKey)
+      withSync = base + (syncHex -> Array[Byte](1, 2, 3))
+      consensus = GlobalStateKey.consensusRootEntries(withSync)
+      nonSystem = GlobalStateKey.nonSystemNamespaceEntries(withSync)
+    } yield
+      expect(withSync.contains(syncHex)) && // the field-32 entry is present in the raw set
+        expect(nonSystem.contains(syncHex)) && // nonSystemNamespaceEntries KEEPS it (not a 03… sidecar)
+        expect(!consensus.contains(syncHex)) && // consensusRootEntries DROPS it (observation-dependent, no per-field slot)
+        expect.same(consensus.keySet, base.keySet) // every other user field survives untouched
+  }
 }

@@ -311,7 +311,7 @@ object GlobalSnapshotInfo {
     // the current state) and differ across nodes that processed different-but-equivalent ordinal streams or that
     // rebuilt from current keysets. Folding them into the global root produced `stateProof[mptRoot]`-only
     // divergence. Excluding every `03…` entry makes the root deterministic. See `GlobalStateKey.isSystemNamespaceHex`.
-    val userEntries = io.constellationnetwork.schema.mpt.GlobalStateKey.nonSystemNamespaceEntries(entries)
+    val userEntries = io.constellationnetwork.schema.mpt.GlobalStateKey.consensusRootEntries(entries)
 
     for {
       // Compute the global mptRoot and per-fieldId subtree roots in parallel from the same byte map.
@@ -376,17 +376,17 @@ object GlobalSnapshotInfo {
     }
   }
 
-  /** Recompute the consensus global `mptRoot` from a hex-keyed byte map, EXCLUDING the path-dependent SystemNamespace sidecars — the EXACT
-    * global-root computation `mptStateProofFromBytes` performs (`makeParallelFromBytes(nonSystemNamespaceEntries(...))`). Use at every
-    * adopt/verify site that compares a locally-rebuilt store root against a signed `stateProof.mptRoot`, so the comparison stays
-    * apples-to-apples now that sidecars are excluded from the signed root. Keep in lockstep with the `userEntries` global-root line in
-    * `mptStateProofFromBytes`.
+  /** Recompute the consensus global `mptRoot` from a hex-keyed byte map, EXCLUDING the path-dependent SystemNamespace sidecars AND the
+    * observation-dependent `MgGlobalSnapshotSyncView` (`GlobalStateKey.consensusRootEntries`) — the EXACT global-root computation
+    * `mptStateProofFromBytes` performs (`makeParallelFromBytes(consensusRootEntries(...))`). Use at every adopt/verify site that compares a
+    * locally-rebuilt store root against a signed `stateProof.mptRoot`, so the comparison stays apples-to-apples. Keep in lockstep with the
+    * `userEntries` global-root line in `mptStateProofFromBytes`.
     */
   def sidecarFreeMptRoot[F[_]: Async: Parallel: Hasher: JsonSerializer](
     entries: Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]
   ): F[Hash] =
     io.constellationnetwork.security.mpt.MerklePatriciaTrie
-      .makeParallelFromBytes[F](io.constellationnetwork.schema.mpt.GlobalStateKey.nonSystemNamespaceEntries(entries))
+      .makeParallelFromBytes[F](io.constellationnetwork.schema.mpt.GlobalStateKey.consensusRootEntries(entries))
       .map(_.rootHash.value)
 
   def legacyStateProof[F[_]: Parallel: Sync: Hasher](
