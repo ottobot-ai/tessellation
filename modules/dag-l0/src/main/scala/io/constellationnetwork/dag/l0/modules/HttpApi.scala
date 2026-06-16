@@ -254,6 +254,11 @@ sealed abstract class HttpApi[
 
   private val tokenLockRoutes = GL0TokenLockRoutes(storages.globalSnapshot, services.pendingReader)
 
+  // Exposes per-metagraph (CL1) currency-token balances gl0 mirrors in its MPT (`MgBalances`) but no longer keeps in the
+  // `lastCurrencySnapshots` blob under roots-only sharding — so global peers can READ a metagraph-token balance (e.g. a data-application
+  // fee that lands in the metagraph token). The verifiable inclusion proof is `ShardProofRoutes`' job (not yet wired — follow-up).
+  private val currencyBalanceRoutes = GL0CurrencyBalanceRoutes(storages.globalSnapshot, services.pendingReader)
+
   // Chain-quality / finality-triggers observable (#138). Reads the FinalityTriggerView Ref
   // populated by SnapshotLeaderLoop after trigger construction. Pure observability — no
   // consensus semantics change.
@@ -325,6 +330,7 @@ sealed abstract class HttpApi[
                 nodeRoutes.publicRoutes <+>
                 consensusInfoRoutes.publicRoutes <+>
                 tokenLockRoutes.publicRoutes <+>
+                currencyBalanceRoutes.publicRoutes <+>
                 nodeParametersRoutes.publicRoutes <+>
                 delegatedStakesRoutes.publicRoutes <+>
                 nodeCollateralsRoutes.publicRoutes <+>

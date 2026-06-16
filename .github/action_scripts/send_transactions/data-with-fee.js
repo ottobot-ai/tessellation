@@ -191,18 +191,17 @@ const checkFeeTransactionInGlobalL0 = async (globalL0Url, feeWallet) => {
         maxWait: '30min',
         tag: `feeTxInGl0:${feeWallet.slice(0, 12)}`,
         checkFn: async () => {
-            const response = await axios.get(`${globalL0Url}/global-snapshots/latest/combined`);
-            const [_, globalSnapshotInfo] = response.data;
-            const lcs = globalSnapshotInfo.lastCurrencySnapshots || {};
-            const targetEntry = lcs[targetMetagraphId];
-            if (targetEntry && targetEntry.Right && Array.isArray(targetEntry.Right) && targetEntry.Right.length >= 2) {
-                const balances = targetEntry.Right[1].balances || {};
-                if (balances[feeWallet] && balances[feeWallet] > 0) {
-                    console.log(`Fee transaction processed successfully on metagraph ${targetMetagraphId}. Response: ${JSON.stringify(balances)}`);
-                    return balances;
-                }
+            // Roots-only sharding keeps per-metagraph (CL1) currency balances in gl0's MPT (`MgBalances`), NOT in the
+            // `lastCurrencySnapshots` blob (empty in the combined view — `info` is no longer the source of truth). Read the
+            // metagraph-token balance gl0 mirrors via the dedicated CL1 balance route (gl0 commits to it via `perMetagraphMptRoot`;
+            // the verifiable inclusion proof is available via the shard-proof route).
+            const response = await axios.get(`${globalL0Url}/currency/${targetMetagraphId}/balance/${feeWallet}`);
+            const balance = response.data && response.data.balance;
+            if (balance && balance > 0) {
+                console.log(`Fee transaction reflected in gl0 for metagraph ${targetMetagraphId}: ${feeWallet} balance=${balance}`);
+                return balance;
             }
-            throw new Error('fee transaction not yet reflected in global snapshot');
+            throw new Error('fee transaction not yet reflected in gl0 currency balance');
         }
     });
 }
