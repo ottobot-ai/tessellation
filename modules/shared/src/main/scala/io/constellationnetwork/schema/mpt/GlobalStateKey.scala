@@ -464,6 +464,26 @@ object GlobalStateKey {
   def nonSystemNamespaceEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
     entries.filterNot { case (hex, _) => isSystemNamespaceHex(hex) }
 
+  /** The entry set that constitutes the CONSENSUS global `mptRoot`: [[nonSystemNamespaceEntries]] (drop path-dependent SystemNamespace
+    * sidecars) MINUS the observation-dependent per-metagraph `MgGlobalSnapshotSyncView` (fieldId 32).
+    *
+    * '''Why also drop field 32.''' `globalSnapshotSyncView` is a per-peer `Signed[GlobalSnapshotSync]` map the metagraph producer
+    * accumulates under the FULL consensus committee, whereas a re-deriving gl0 node sees only the 2/3 signers (#259 / cause-2). Honest
+    * nodes therefore hold DIFFERENT field-32 byte sets, and — unlike every other `Mg*` field — it has NO per-field proof slot
+    * (`GlobalStateFieldId.infoSubFields` excludes it), so a divergence surfaces ONLY in the global `mptRoot` (every per-field root
+    * matches). Folding it into the consensus root makes the root non-deterministic across nodes: it froze the sharded per-MG adoption (the
+    * cause-2 ADOPT-VERIFY freeze, since fixed by excluding it from `infoSubfields`) AND — because the producer commits `mptRoot` from the
+    * overlay `postBytes` while the Tier-3 catch-up gate re-encodes from `info.allStateEntriesAsBytes` — it makes a lagging node's catch-up
+    * stateProof check ALWAYS mismatch on `mptRoot`, wedging recovery forever. gl0 never consumes a metagraph's view of gl0-syncs, so the
+    * field stays STORED + diffed + reconstructed (the mirror is unchanged) but leaves the consensus root. The metagraph's OWN
+    * `CurrencySnapshotInfo.stateProof` still commits to it. Apply at EVERY global-`mptRoot` site (producer + follower + catch-up + the #107
+    * self-check) so producer and verifier compute the byte-identical root. See `infoSubFields`.
+    */
+  def consensusRootEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
+    nonSystemNamespaceEntries(entries).filterNot {
+      case (hex, _) => fieldIdFromHex(hex).contains(GlobalStateFieldId.MgGlobalSnapshotSyncView)
+    }
+
   /** Slice 17 — key into the per-(shard, peer, epoch) [[GlobalStateFieldId.ShardNonParticipation]] partition. The composite tuple is folded
     * into a single hash so each `(shardId, peerId, epoch)` triple maps to one MPT entry under the hypergraph namespace.
     *
