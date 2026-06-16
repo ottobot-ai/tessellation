@@ -2575,8 +2575,13 @@ object GlobalSnapshotAcceptanceManager {
                       // per-MG `Mg*` removals against the FINALIZED BASE (`overlay.base`), so the verify-replay MUST anchor them there too
                       // — otherwise branch!=base re-trips the #107 `mptConsistency=DIVERGED` self-check on a CORRECT writer. Else
                       // (branch==base, the pipelineDepth=1/numShards=1 production regime) the default (`preSyncBytes`) is exact.
+                      // PERF: the base read is needed ONLY when a currency snapshot actually changes this ordinal (no
+                      // `lastCurrencySnapshots` delta ⇒ no `Mg*` removals possible ⇒ the prior is unused). Gating on `nonEmpty` keeps the
+                      // full `overlay.base.allEntriesAsBytes` off the common (no-currency-change) accept path, where it otherwise slowed
+                      // consensus and worsened the gl0-tip-lag committee-gate fail-close.
                       mgRemovalPrior <-
-                        if (shardedInfoMode) overlay.base.allEntriesAsBytes.map(_.some)
+                        if (shardedInfoMode && stateChangesAccumulator.lastCurrencySnapshots.nonEmpty)
+                          overlay.base.allEntriesAsBytes.map(_.some)
                         else Option.empty[Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]].pure[F]
                       deltaPair <- io.constellationnetwork.schema.mpt.GlobalStateConverter
                         .toAccumulatorHexDelta[F](stateChangesAccumulator, preSyncBytes, mgRemovalPrior)
