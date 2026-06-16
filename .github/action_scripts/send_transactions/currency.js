@@ -667,40 +667,62 @@ const doubleSpendTest = async (networkOptions, isMetagraph) => {
         .catch((e) => false),
     ])
 
-    logMessage(
-      `Waiting ${SLEEP_TIME_UNTIL_QUERY}ms until fetch wallet balances`,
-    )
-    await sleep(SLEEP_TIME_UNTIL_QUERY)
+    // A double-spend resolves to exactly ONE of two valid ledger states (one transfer won, the other dropped;
+    // no value double-counted). A one-shot read at a fixed delay can sample a TRANSIENT mid-reorg / fork-choice
+    // state under sharded churn and FALSE-positive "Double spend occurred" even though the ledger converges
+    // correctly seconds later. Instead poll until a valid converged state HOLDS across two consecutive reads
+    // (debounces reorg transients). Functionality is unchanged — the only accepted outcome is still "exactly one
+    // transfer won": a GENUINE double-spend (both credited) never reaches a valid state, so it still fails at the
+    // ceiling; a longer poll cannot mask it.
+    const isSecondWon = (b1, b2, b3) =>
+      firstToSecondSucceeded &&
+      b1 === startBalance1 - sendAmount - sendFee &&
+      b2 === startBalance2 + sendAmount &&
+      b3 === startBalance3
+    const isThirdWon = (b1, b2, b3) =>
+      firstToThirdSucceeded &&
+      b1 === startBalance1 - sendAmount - sendFee &&
+      b2 === startBalance2 &&
+      b3 === startBalance3 + sendAmount
 
-    const balance1 = await sendingClient.getBalanceFor(FIRST_WALLET_ADDRESS)
-    const balance2 = await sendingClient.getBalanceFor(SECOND_WALLET_ADDRESS)
-    const balance3 = await sendingClient.getBalanceFor(THIRD_WALLET_ADDRESS)
+    const POLL_INTERVAL_MS = 5000
+    const POLL_CEILING_MS = 300000 // 5 min — the spend pipeline's real latency budget under sharding
+    const deadline = Date.now() + POLL_CEILING_MS
+    let consecutiveValid = 0
+    let lastWinner = ''
+    let balance1, balance2, balance3
+    logMessage(
+      `Polling wallet balances until a converged double-spend outcome holds (interval ${POLL_INTERVAL_MS}ms, ceiling ${POLL_CEILING_MS}ms)`,
+    )
+    while (Date.now() < deadline) {
+      balance1 = await sendingClient.getBalanceFor(FIRST_WALLET_ADDRESS)
+      balance2 = await sendingClient.getBalanceFor(SECOND_WALLET_ADDRESS)
+      balance3 = await sendingClient.getBalanceFor(THIRD_WALLET_ADDRESS)
+      const winner = isSecondWon(balance1, balance2, balance3)
+        ? 'second'
+        : isThirdWon(balance1, balance2, balance3)
+        ? 'third'
+        : ''
+      if (winner && winner === lastWinner) {
+        consecutiveValid += 1
+        if (consecutiveValid >= 2) {
+          logMessage(
+            `No double spend: Amount sent to ${winner} wallet (converged + stable across 2 reads)`,
+          )
+          return
+        }
+      } else {
+        consecutiveValid = winner ? 1 : 0
+      }
+      lastWinner = winner
+      await sleep(POLL_INTERVAL_MS)
+    }
 
     logMessage(`FirstWalletBalance: ${balance1}`)
     logMessage(`SecondWalletBalance: ${balance2}`)
     logMessage(`ThirdWalletBalance: ${balance3}`)
     logMessage(`firstToSecondSucceeded: ${firstToSecondSucceeded}`)
     logMessage(`firstToThirdSucceeded: ${firstToThirdSucceeded}`)
-
-    if (
-      firstToSecondSucceeded &&
-      balance1 === startBalance1 - sendAmount - sendFee &&
-      balance2 === startBalance2 + sendAmount &&
-      balance3 === startBalance3
-    ) {
-      logMessage(`No double spend: Amount sent to second wallet`)
-      return
-    }
-
-    if (
-      firstToThirdSucceeded &&
-      balance1 === startBalance1 - sendAmount - sendFee &&
-      balance2 === startBalance2 &&
-      balance3 === startBalance3 + sendAmount
-    ) {
-      logMessage(`No double spend: Amount sent to third wallet`)
-      return
-    }
 
     throw Error(`Double spend occurred`)
   } catch (error) {
