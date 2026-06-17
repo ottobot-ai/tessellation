@@ -20,9 +20,8 @@ import org.http4s.circe.CirceEntityCodec.circeEntityEncoder
 import org.http4s.dsl.Http4sDsl
 
 /** Exposes a metagraph's (CL1) currency-token balance for an address as KNOWN + queryable by global peers — read straight from gl0's MPT
-  * (`MgBalances`, reconstructed via
-  * [[io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps.getCurrencySnapshotInfo]]), the per-metagraph state
-  * gl0 mirrors and commits to via the shard checkpoint `perMetagraphMptRoot`.
+  * (`MgBalances`, reconstructed via [[io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps.getCurrencySnapshotInfo]]),
+  * the per-metagraph state gl0 mirrors and commits to via the shard checkpoint `perMetagraphMptRoot`.
   *
   * '''Why this route exists.''' Under roots-only sharding the per-MG currency state lives in the MPT, NOT in the
   * `GlobalSnapshotInfo.lastCurrencySnapshots` blob (which is being eliminated — `info` is no longer the source of truth and is empty in the
@@ -53,9 +52,10 @@ final case class GL0CurrencyBalanceRoutes[F[_]: Async: HasherSelector](
       // unrolled `Mg*` MPT partitions, so the balance reflects exactly what gl0 committed to in `perMetagraphMptRoot`.
       snapshotStorage.head.flatMap {
         case Some(_) =>
-          HasherSelector[F].withCurrent { implicit hasher =>
-            reader.getCurrencySnapshotInfo(metagraphId)
-          }
+          HasherSelector[F]
+            .withCurrent { implicit hasher =>
+              reader.getCurrencySnapshotInfo(metagraphId)
+            }
             .map(_.flatMap(_.balances.get(address)).getOrElse(Balance.empty))
             .flatMap { balance =>
               Ok(

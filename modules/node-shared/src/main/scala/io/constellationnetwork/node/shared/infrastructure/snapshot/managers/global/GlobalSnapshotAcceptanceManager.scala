@@ -2587,11 +2587,12 @@ object GlobalSnapshotAcceptanceManager {
                         .toAccumulatorHexDelta[F](stateChangesAccumulator, preSyncBytes, mgRemovalPrior)
                       (deltaUpserts, deltaRemoves) = deltaPair
                       expectedBytes = (preSyncBytes -- deltaRemoves) ++ deltaUpserts
-                      // The consensus global root excludes SystemNamespace sidecars (path-dependent ActiveAddressIndex / expiry buckets)
-                      // AND the observation-dependent `MgGlobalSnapshotSyncView` (`GlobalStateKey.consensusRootEntries`).
-                      // `incrementalProof.mptRoot` is computed over that same set; the independent verify-replay must drop the same entries
-                      // before rebuilding so a clean writer yields MATCH (a true writer bug on user fields still surfaces DIVERGED).
-                      verifyEntries = io.constellationnetwork.schema.mpt.GlobalStateKey.consensusRootEntries(expectedBytes)
+                      // The consensus global root excludes SystemNamespace sidecars (path-dependent
+                      // ActiveAddressIndex / expiry buckets — see `GlobalStateKey.isSystemNamespaceHex`
+                      // and `mptStateProofFromBytes`). `incrementalProof.mptRoot` is computed sidecar-free;
+                      // the independent verify-replay must drop the same `03…` entries before rebuilding so
+                      // a clean writer yields MATCH (a true writer bug on user fields still surfaces DIVERGED).
+                      verifyEntries = io.constellationnetwork.schema.mpt.GlobalStateKey.nonSystemNamespaceEntries(expectedBytes)
                       verifyTrie <- io.constellationnetwork.security.mpt.MerklePatriciaTrie
                         .makeParallelFromBytes[F](verifyEntries)
                       verifyRoot = verifyTrie.rootHash.value.show

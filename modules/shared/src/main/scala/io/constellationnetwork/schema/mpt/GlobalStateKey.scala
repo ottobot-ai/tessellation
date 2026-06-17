@@ -267,19 +267,9 @@ object GlobalStateFieldId {
   case object MgLastMessages extends GlobalStateFieldId { def toInt: Int = 31 }
   case object MgGlobalSnapshotSyncView extends GlobalStateFieldId { def toInt: Int = 32 }
 
-  /** The unrolled per-metagraph `CurrencySnapshotInfo` sub-fields whose UNION is committed by `CurrencySnapshotMptRoots.infoRoot`. Used by
-    * `GlobalStateConverter.currencySnapshotFieldRoots` / `GlobalSnapshotInfo.mptStateProofFromBytes` to group these entries into the single
-    * `infoRoot` (replacing the `fieldId == LastCurrencySnapshotInfo` filter). MUST stay in sync with the `Mg*` case objects above.
-    *
-    * '''`MgGlobalSnapshotSyncView` (field 32) is DELIBERATELY EXCLUDED''' (cause-2, the sharded-mirror m1 freeze). The per-peer
-    * `globalSnapshotSyncView` is OBSERVATION-DEPENDENT: the metagraph producer accumulates it under the FULL consensus committee, a
-    * re-deriving gl0 verifier (and the currency-layer follower) under only the 2/3 signers (#259), so honest nodes hold DIFFERENT per-peer
-    * maps. In the shard-checkpoint diff/apply that drift is UNRECONCILABLE — a removals-free minimal diff cannot evict a peer present only
-    * in the follower's prior, so the verifier's recomputed `infoRoot` mismatches the committee-attested root EVERY ordinal and the MG
-    * freezes out of gl0 adoption forever (run-2x: gl0 ord 465+, `diff(upserts=1,removals=0)`, attested≠recomputed). gl0 does NOT consume a
-    * metagraph's view of gl0-syncs, so the field is excluded from the consensus root (the #116 pattern: path-dependent state stays STORED +
-    * diffed + reconstructed, but leaves the root). The metagraph's OWN `CurrencySnapshotInfo.stateProof` still commits to it independently.
-    * See `CurrencyDiffRoundTripSuite` (freeze-repro + fix guard) and `ShardCheckpointWiring.reExecDerivationWithDiff`.
+  /** The 8 unrolled per-metagraph `CurrencySnapshotInfo` sub-fields whose UNION is committed by `CurrencySnapshotMptRoots.infoRoot`. Used
+    * by `GlobalStateConverter.currencySnapshotFieldRoots` / `GlobalSnapshotInfo.mptStateProofFromBytes` to group these entries into the
+    * single `infoRoot` (replacing the `fieldId == LastCurrencySnapshotInfo` filter). MUST stay in sync with the `Mg*` case objects above.
     */
   val infoSubFields: Set[GlobalStateFieldId] =
     Set(
@@ -289,7 +279,8 @@ object GlobalStateFieldId {
       MgLastAllowSpendRefs,
       MgLastTokenLockRefs,
       MgActiveTokenLocks,
-      MgLastMessages
+      MgLastMessages,
+      MgGlobalSnapshotSyncView
     )
 
   implicit val ordering: Ordering[GlobalStateFieldId] = Ordering.by(_.toInt)
@@ -463,26 +454,6 @@ object GlobalStateKey {
     */
   def nonSystemNamespaceEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
     entries.filterNot { case (hex, _) => isSystemNamespaceHex(hex) }
-
-  /** The entry set that constitutes the CONSENSUS global `mptRoot`: [[nonSystemNamespaceEntries]] (drop path-dependent SystemNamespace
-    * sidecars) MINUS the observation-dependent per-metagraph `MgGlobalSnapshotSyncView` (fieldId 32).
-    *
-    * '''Why also drop field 32.''' `globalSnapshotSyncView` is a per-peer `Signed[GlobalSnapshotSync]` map the metagraph producer
-    * accumulates under the FULL consensus committee, whereas a re-deriving gl0 node sees only the 2/3 signers (#259 / cause-2). Honest
-    * nodes therefore hold DIFFERENT field-32 byte sets, and — unlike every other `Mg*` field — it has NO per-field proof slot
-    * (`GlobalStateFieldId.infoSubFields` excludes it), so a divergence surfaces ONLY in the global `mptRoot` (every per-field root
-    * matches). Folding it into the consensus root makes the root non-deterministic across nodes: it froze the sharded per-MG adoption (the
-    * cause-2 ADOPT-VERIFY freeze, since fixed by excluding it from `infoSubfields`) AND — because the producer commits `mptRoot` from the
-    * overlay `postBytes` while the Tier-3 catch-up gate re-encodes from `info.allStateEntriesAsBytes` — it makes a lagging node's catch-up
-    * stateProof check ALWAYS mismatch on `mptRoot`, wedging recovery forever. gl0 never consumes a metagraph's view of gl0-syncs, so the
-    * field stays STORED + diffed + reconstructed (the mirror is unchanged) but leaves the consensus root. The metagraph's OWN
-    * `CurrencySnapshotInfo.stateProof` still commits to it. Apply at EVERY global-`mptRoot` site (producer + follower + catch-up + the #107
-    * self-check) so producer and verifier compute the byte-identical root. See `infoSubFields`.
-    */
-  def consensusRootEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
-    nonSystemNamespaceEntries(entries).filterNot {
-      case (hex, _) => fieldIdFromHex(hex).contains(GlobalStateFieldId.MgGlobalSnapshotSyncView)
-    }
 
   /** Slice 17 — key into the per-(shard, peer, epoch) [[GlobalStateFieldId.ShardNonParticipation]] partition. The composite tuple is folded
     * into a single hash so each `(shardId, peerId, epoch)` triple maps to one MPT entry under the hypergraph namespace.
