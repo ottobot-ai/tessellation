@@ -843,8 +843,20 @@ object SnapshotLeaderLoop {
                           case s @ Some(v) => (s, v)
                         }
                         bootGraceElapsed = (currentSlot - readySince) >= shardBootGraceSlots
+                        // PHASE-2 ANCHOR (2026-06-17): the shard checkpoint MUST anchor to the FINALIZED gl0 ordinal,
+                        // NOT `chainStore.bestTipOrdinal` (phase-1, reorgable). `gl0AnchorOrdinal` is the re-exec
+                        // derivation CONTEXT and part of each per-MG root (ShardCheckpointWiring §6); a best-tip anchor
+                        // that REORGS before it finalizes strands the derived metagraph state on a dead branch — the
+                        // `parentHash` mismatch + "parent NOT in chain store" + orphan-buffer wedge. Followers (ml0)
+                        // already consume only finalized gl0 snapshots (40dc4c2b2's finality gate), so anchoring here to
+                        // finalized RESTORES the phase-2-only invariant (design §7.2) and aligns the anchor with the
+                        // binaries it derives over. The §7.2 acceptance window is upper-bounded only (checkpoint rides
+                        // into anchor-or-later), so an older finalized anchor is never rejected as stale. Regression
+                        // introduced by 86ee3dbef (per-slot best-tip fan-out); `lastChainOrdinal`/best-tip is retained
+                        // above only for the eta rotation-period (VRF), which is intentionally tip-paced.
+                        nakamotoFinalizedAnchor <- nakamotoFinalizedOrdinalRef.get
                         _ <- Async[F].whenA(shardProducers.nonEmpty && shardAssignment.isDefined && bootGraceElapsed) {
-                          val anchorOrd = SnapshotOrdinal(NonNegLong.unsafeFrom(lastChainOrdinal))
+                          val anchorOrd = nakamotoFinalizedAnchor
                           val shardEpoch = EtaPeriod(currentPeriod)
                           supervisor
                             .supervise(
