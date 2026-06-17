@@ -169,8 +169,24 @@ object StateChannel {
 
     // Typed-scodec initialization — writes per-field `ImmutableCodec[V]` bytes consistent
     // with `mptStateProof` and typed reads. No JSON blob intermediate.
+    //
+    // BOOTSTRAP-ONLY (`handleInitialSnapshot`): the bootstrap Left tuple carries only `(snapshot, GSI)` — no served byte
+    // map — and the bootstrap path has NO verify gate (it adopts the majority-hash-verified snapshot directly, then pulls
+    // forward). So the `syncFromGlobalSnapshotInfo` re-encode here cannot wedge the cluster: the `recomputed ≠ signed`
+    // drift only bites the resync/follow VERIFY gate, and the very next forward tick that resyncs uses the verbatim
+    // `ensureMptFromSignedBytes` path below. Steady-state state advancement is the lossless incremental
+    // `syncFromStateChanges` (accept) path; this is reached only on cold bootstrap.
     def ensureMptInitialized(ordinal: SnapshotOrdinal, state: GlobalSnapshotInfo): F[Unit] =
       sharedStorages.mptStore.syncFromGlobalSnapshotInfo(state, ordinal)
+
+    // 3c-A — store gl0's SIGNED MPT byte map VERBATIM at `ordinal` (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A).
+    // Unlike `ensureMptInitialized`, which re-encodes a GSI through the per-field codecs (a DIFFERENT byte path than the
+    // producer's own `p.entries` that was actually signed), this is the exact bytes gl0 signed — so after this the resync
+    // verify gate `sidecarFreeMptRoot(store.entries) === signed mptRoot` holds BY CONSTRUCTION (no re-encode, no drift). A
+    // genuinely corrupt/truncated transfer is still caught by that gate (the only failure mode left). `loadBytes` does the
+    // clear→insert→persist→build→bookkeep tail without the codec round-trip.
+    def ensureMptFromSignedBytes(ordinal: SnapshotOrdinal, entries: Map[Hex, Array[Byte]]): F[Unit] =
+      sharedStorages.mptStore.loadBytes(entries, ordinal)
 
     def persistGlobalSnapshot(snapshot: Hashed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo): F[Unit] =
       for {
@@ -247,12 +263,24 @@ object StateChannel {
       ) >>
         1.tailRecM[F, Unit] { attempt =>
           for {
-            canonical <- services.globalL0.pullLatestSnapshot
-            (canonicalSnapshot, canonicalState) = canonical
-            _ <- ensureMptInitialized(canonicalSnapshot.ordinal, canonicalState)
+            // 3c-A: pull gl0's SIGNED MPT byte map (+ snapshot + GSI) and store the bytes VERBATIM when served. The GSI rides
+            // along ONLY for `setForRecovery` (`adoptCanonical`); on the verbatim `Some` branch it is NEVER re-encoded into the
+            // MPT — that re-encode was the drift. The bytes are OPTIONAL: gl0's byte route 404s at a sparse combined-checkpoint
+            // ordinal, in which case `pullLatestMptEntries` already degraded to the legacy `pullLatestSnapshot` and returns `None`
+            // here. On `None` we fall back to the legacy `ensureMptInitialized` (= `syncFromGlobalSnapshotInfo`); the verify gate
+            // BELOW is unchanged and still gates the legacy recompute (corruption backstop). On `Some` the gate passes by
+            // construction.
+            canonical <- services.globalL0.pullLatestMptEntries
+            (canonicalSnapshot, canonicalState, canonicalEntries) = canonical
+            _ <- canonicalEntries match {
+              case Some(bytes) => ensureMptFromSignedBytes(canonicalSnapshot.ordinal, bytes)
+              case None        => ensureMptInitialized(canonicalSnapshot.ordinal, canonicalState)
+            }
             // The signed global `mptRoot` excludes path-dependent SystemNamespace sidecars
             // (`GlobalSnapshotInfo.mptStateProofFromBytes`); recompute the rebuilt store's root sidecar-free
-            // (NOT `getRootHashForOrdinal`, which includes them) so this resync gate matches the signed root.
+            // (NOT `getRootHashForOrdinal`, which includes them) so this resync gate matches the signed root. With the
+            // verbatim `loadBytes` above this now passes BY CONSTRUCTION on honest input, but the gate STAYS — it still
+            // catches a corrupt/truncated transfer (re-pull/idle, never adopt).
             afterBytes <- sharedStorages.mptStore.underlying.entries
             recomputedRoot <- io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes).map(_.some)
             signedRoot = canonicalSnapshot.signed.value.stateProof.mptRoot

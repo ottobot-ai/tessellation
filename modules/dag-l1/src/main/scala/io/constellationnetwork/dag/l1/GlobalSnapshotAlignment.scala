@@ -214,17 +214,32 @@ class GlobalSnapshotAlignment[F[
     val ref = SnapshotReference.fromHashedSnapshot(failedSnapshot).show
     val recovery = HasherSelector[F].withCurrent { implicit hasher =>
       for {
-        canonical <- services.globalL0.pullLatestSnapshot
-        (canonicalSnapshot, canonicalState) = canonical
+        // 3c-A: pull gl0's SIGNED MPT byte map (+ snapshot + GSI) and store the bytes VERBATIM via `loadBytes` (no
+        // `syncFromGlobalSnapshotInfo` re-encode → no `recomputed ≠ signed` drift). The GSI rides along ONLY for
+        // `setForRecovery`; it is never re-encoded into the MPT.
+        canonical <- services.globalL0.pullLatestMptEntries
+        (canonicalSnapshot, canonicalState, canonicalEntries) = canonical
         _ <- logger.info(
           s"DL1 #117 DIAG recoverFromOrphan failed=$ref pulled canonical ord=${canonicalSnapshot.ordinal.show} " +
             s"hash=${canonicalSnapshot.hash.show.take(12)} balances.size=${canonicalState.balances.size} " +
             s"scHashes.size=${canonicalState.lastStateChannelSnapshotHashes.size}"
         )
-        _ <- sharedStorages.mptStore.syncFromGlobalSnapshotInfo(canonicalState, canonicalSnapshot.ordinal)
-        postSyncRoot <- sharedStorages.mptStore.underlying.getRootHashForOrdinal(canonicalSnapshot.ordinal)
+        // The bytes are OPTIONAL: gl0's byte route 404s at a sparse combined-checkpoint ordinal, in which case
+        // `pullLatestMptEntries` already degraded to legacy `pullLatestSnapshot` and returns `None`. On `Some` load the SIGNED
+        // bytes VERBATIM; on `None` fall back to legacy `syncFromGlobalSnapshotInfo`. The post-load root recompute BELOW is
+        // DIAG-only on this path — preserved unchanged either way.
+        _ <- canonicalEntries match {
+          case Some(bytes) => sharedStorages.mptStore.loadBytes(bytes, canonicalSnapshot.ordinal)
+          case None        => sharedStorages.mptStore.syncFromGlobalSnapshotInfo(canonicalState, canonicalSnapshot.ordinal)
+        }
+        // DIAG: recompute sidecar-free (apples-to-apples with the signed `stateProof.mptRoot`), NOT `getRootHashForOrdinal`
+        // (which includes the path-dependent SystemNamespace sidecars). With the verbatim `loadBytes` this equals the
+        // signed root by construction on honest input.
+        afterBytes <- sharedStorages.mptStore.underlying.entries
+        postSyncRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes)
         _ <- logger.info(
-          s"DL1 #117 DIAG post-sync mptRoot=${postSyncRoot.map(_.value.show.take(12)).getOrElse("none")} at ord=${canonicalSnapshot.ordinal.show}"
+          s"DL1 #117 DIAG post-load sidecar-free mptRoot=${postSyncRoot.show.take(12)} at ord=${canonicalSnapshot.ordinal.show} " +
+            s"(signed=${canonicalSnapshot.signed.value.stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")})"
         )
         _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
         _ <- sharedStorages.lastNGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)

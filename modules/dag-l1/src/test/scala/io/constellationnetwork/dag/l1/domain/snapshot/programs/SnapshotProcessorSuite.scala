@@ -373,6 +373,14 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
 
                   override def pullLatestSnapshotFromRandomPeer: IO[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)] = ???
 
+                  override def pullLatestMptEntries: IO[
+                    (
+                      Hashed[GlobalIncrementalSnapshot],
+                      GlobalSnapshotInfo,
+                      Option[Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]]
+                    )
+                  ] = ???
+
                   override def pullGlobalSnapshots
                     : IO[Either[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo), List[Hashed[GlobalIncrementalSnapshot]]]] = ???
 

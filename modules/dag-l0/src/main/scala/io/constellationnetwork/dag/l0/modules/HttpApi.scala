@@ -68,45 +68,54 @@ object HttpApi {
     l0Seedlist: Option[Set[SeedlistEntry]],
     getLocalChainTip: Option[F[Option[ChainTip]]] = None,
     maybeMarkSeen: Option[Hash => F[Unit]] = None
-  ): F[HttpApi[F, R]] = {
+  ): F[HttpApi[F, R]] =
     // GL0 runs Nakamoto consensus — head may run ahead of the attestation-finalized ordinal held in `FinalityGate`. The
     // `FinalizedSnapshotReader.nakamoto` variant serves `/latest/combined` and its kin from the on-disk checkpoint at-or-below
     // finalized, so tentative (pre-finality) state never leaves the node via HTTP — that channel is reserved for sidecar gossip.
-    val finalizedReader = FinalizedSnapshotReader.nakamoto[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
-      FinalityGate[F],
-      combinedSnapshotCheckpointFileSystemStorage
-    )
-    SnapshotRoutes
-      .make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
-        storages.globalSnapshot,
-        storages.fullGlobalSnapshot.some,
-        "/global-snapshots",
-        storages.node,
-        HasherSelector[F],
-        sharedConfig.snapshotTimeoutsConfig,
-        finalizedReader
+    //
+    // 3c-A serve side (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A): a READ-ONLY `MptStateStorage` pointed at the SAME
+    // `mptSnapshotInfoPath` the `SharedStorages` MPT producer persists to (`mpt_snapshot_info/<ordinal>`). It backs the additive
+    // `/latest/combined/mpt-entries` route, serving gl0's SIGNED MPT byte map at the finalized ordinal VERBATIM (no re-encode). Read-only
+    // access to the persisted, finality-gated files is race-free with the producer's writes. NOTE: era-gate is a follow-up — the route is
+    // purely additive (new endpoint), so it always serves for now.
+    FinalizedSnapshotReader
+      .nakamotoF[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
+        FinalityGate[F],
+        combinedSnapshotCheckpointFileSystemStorage,
+        sharedConfig.mptSnapshotInfoPath
       )
-      .map { snapshotRoutes =>
-        new HttpApi[F, R](
-          storages,
-          queues,
-          services,
-          programs,
-          privateKey,
-          environment,
-          selfId,
-          nodeVersion,
-          httpCfg,
-          sharedValidators,
-          delegatedStakingWithdrawalTimeLimit,
-          sharedConfig,
-          snapshotRoutes,
-          l0Seedlist,
-          getLocalChainTip,
-          maybeMarkSeen
-        ) {}
+      .flatMap { finalizedReader =>
+        SnapshotRoutes
+          .make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
+            storages.globalSnapshot,
+            storages.fullGlobalSnapshot.some,
+            "/global-snapshots",
+            storages.node,
+            HasherSelector[F],
+            sharedConfig.snapshotTimeoutsConfig,
+            finalizedReader
+          )
+          .map { snapshotRoutes =>
+            new HttpApi[F, R](
+              storages,
+              queues,
+              services,
+              programs,
+              privateKey,
+              environment,
+              selfId,
+              nodeVersion,
+              httpCfg,
+              sharedValidators,
+              delegatedStakingWithdrawalTimeLimit,
+              sharedConfig,
+              snapshotRoutes,
+              l0Seedlist,
+              getLocalChainTip,
+              maybeMarkSeen
+            ) {}
+          }
       }
-  }
 }
 
 sealed abstract class HttpApi[
