@@ -1,6 +1,36 @@
 # Unroll the per-metagraph `CurrencySnapshotInfo` blob → per-entry MPT keys
 
-**Status:** DESIGN (2026-06-13). Prereq for `COMMITTEE-STATE-DIFF-ADOPTION-DESIGN.md`. Greenfield — no wire/on-disk compat (`[[feedback-greenfield-no-wire-compat]]`).
+**Status:** LANDED (2026-06-17). Prereq for `COMMITTEE-STATE-DIFF-ADOPTION-DESIGN.md`. Greenfield — no wire/on-disk compat (`[[feedback-greenfield-no-wire-compat]]`).
+
+## Implemented (verified against code 2026-06-17, branch `feature/serde-typeclass-shim`)
+
+The unroll **shipped on this branch** (the design doc itself first landed in `85be66a6a`). Ground-truth confirmation:
+
+- **The 8 `Mg*` `GlobalStateFieldId`s** (`shared/.../schema/mpt/GlobalStateKey.scala:261-268`, `fromInt` map at :320-327):
+
+  | field | case object | int |
+  |---|---|---|
+  | `balances` | `MgBalances` | 25 |
+  | `lastTxRefs` | `MgLastTxRefs` | 26 |
+  | `lastFeeTxRefs` | `MgLastFeeTxRefs` | 27 |
+  | `lastAllowSpendRefs` | `MgLastAllowSpendRefs` | 28 |
+  | `lastTokenLockRefs` | `MgLastTokenLockRefs` | 29 |
+  | `activeTokenLocks` | `MgActiveTokenLocks` | 30 |
+  | `lastMessages` | `MgLastMessages` | 31 |
+  | `globalSnapshotSyncView` | `MgGlobalSnapshotSyncView` | 32 |
+
+- **`infoSubFields` union site.** `val infoSubFields: Set[GlobalStateFieldId]` = exactly those 8 (`GlobalStateKey.scala:274-284`). It is consumed at the two load-bearing sites the design named:
+  - producer: `GlobalStateConverter.currencySnapshotFieldRoots` → `rootForFields(GlobalStateFieldId.infoSubFields.contains)` (`GlobalStateConverter.scala:1327`);
+  - follower / byte-rebuild: `GlobalSnapshotInfo.mptStateProofFromBytes` (`GlobalSnapshotInfo.scala:332-337`) computes `infoRoot = fieldRootFromBytes(UNION over FId.infoSubFields)` instead of the old `fieldId == LastCurrencySnapshotInfo` lookup. Both route through `currencySnapshotEntryBytes` (`GlobalStateConverter.scala:1285`), so producer↔follower byte-identity is by construction (invariant I2).
+  - `lastCurrencySnapshotsProof = Some(CurrencySnapshotMptRoots(fieldRoot(LastIncrementalCurrencySnapshots), currencyInfoRoot))` (`GlobalSnapshotInfo.scala:353-355`) — stateProof shape unchanged (I3 holds), only the key-set under `infoRoot` changed.
+
+- **Decision (b) confirmed verbatim:** `activeAllowSpends` stays in fieldId-7 (`ActiveAllowSpends`, `Some(mgId)`) — it is **NOT** emitted by `currencySnapshotEntryBytes` and there is **no** `MgActiveAllowSpends`. Explicit scaladoc at `GlobalStateConverter.scala:1188-1190`: "`activeAllowSpends` is NOT emitted here — it stays in the fieldId-7 `ActiveAllowSpends` partition … So `infoRoot` covers these 8 sub-fields; `activeAllowSpends` is committed separately via the fieldId-7 `activeAllowSpends` state-proof slot." Reconstruction reads it back from the fieldId-7 mg-scope prefix (`GlobalStateConverter.scala:1382-1393`). `SpendActionValidator`'s cross-shard read path is untouched, as the design intended.
+
+- **Reconstruction** rebuilds `CurrencySnapshotInfo` per MG by prefix-scanning the `Mg*` partitions then re-reading fieldId-7 for `activeAllowSpends` (`GlobalStateConverter.scala` `getAllLastCurrencySnapshots` region, :1382-1393).
+
+**Deviation flagged (doc-internal, not code):** §9 "Increment plan" step 1 says *"add the 9 `Mg*` `GlobalStateFieldId`s"* — the shipped count is **8** (no `MgActiveAllowSpends`), consistent with §3/§10-Q1 decision (b) and the table in §3. The "9" in step 1 is a stale leftover from before decision (b) was taken; the rest of the doc and the code agree on 8. No code change needed; treat §9 step 1's "9" as "8".
+
+**Persistence read-compat note (greenfield):** per `[[feedback-greenfield-no-wire-compat]]` only on-disk state needs read-compat. The unroll changes the MPT key layout (new `Mg*` partitions replace the fieldId-6 blob) and was applied atomically cluster-wide — no dual-codec read path; pre-unroll on-disk `mpt_snapshot_info` dumps from older runs are not forward-read.
 
 ## 1. Motivation — SCALABILITY is the primary driver (not cleanup)
 
