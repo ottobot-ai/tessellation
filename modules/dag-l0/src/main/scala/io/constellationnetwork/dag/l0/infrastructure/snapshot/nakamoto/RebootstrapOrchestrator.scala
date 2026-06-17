@@ -93,14 +93,8 @@ object RebootstrapOrchestrator {
       .flatMap(_.toLongOption)
       .getOrElse(30000L)
 
-  /** Master switch. Default `false`. Production deployments turn this on per-node once iter- level e2e proves it doesn't spuriously fire
-    * under normal small-cluster operation.
-    */
-  val Enabled: Boolean =
-    sys.env
-      .get("NAKAMOTO_REBOOTSTRAP_ENABLED")
-      .flatMap(_.toBooleanOption)
-      .getOrElse(false)
+  // Master switch migrated to typed HOCON (`SharedConfig.nakamoto.rebootstrapEnabled`, default TRUE) — passed as the
+  // `enabled` param to `run` below. Was `NAKAMOTO_REBOOTSTRAP_ENABLED` (default false); see types.scala / application.conf.
 
   /** Well-known pause reason for the ProductionGate. */
   val RebootstrapInProgress: String = "rebootstrap-in-progress"
@@ -164,6 +158,7 @@ object RebootstrapOrchestrator {
     * validates the trigger is precise.
     */
   def run[F[_]: Async: Metrics](
+    enabled: Boolean,
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     tipTracker: TipTracker[F],
     mptOverlay: MptOverlay[F, io.constellationnetwork.schema.mpt.GlobalStateKey],
@@ -171,7 +166,7 @@ object RebootstrapOrchestrator {
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("RebootstrapOrchestrator")
 
-    if (!Enabled)
+    if (!enabled)
       Stream.eval(
         logger.info(
           "RebootstrapOrchestrator is DISABLED via NAKAMOTO_REBOOTSTRAP_ENABLED=false (default). " +

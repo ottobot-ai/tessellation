@@ -1931,13 +1931,15 @@ object GlobalSnapshotConsensus {
 
           // P-11 (#141): re-bootstrap orchestrator. Periodic ticker that detects when this
           // node has self-finalized a divergent fork and got locked out of canonical recovery
-          // (the "fork-recovery deadlock"). Gated by `NAKAMOTO_REBOOTSTRAP_ENABLED` (default
-          // FALSE) — production deployments turn it on per-node once iter e2e validates no
-          // spurious fires. Disabled: emits a single INFO at startup and otherwise no-op.
+          // (the "fork-recovery deadlock"). Gated by `sharedCfg.nakamoto.rebootstrapEnabled` (typed
+          // HOCON, default TRUE; env override `NAKAMOTO_REBOOTSTRAP_ENABLED`) — without it a node that
+          // self-finalized a divergent branch forks the global mptRoot forever (sharded reorg storm).
+          // Disabled: emits a single INFO at startup and otherwise no-op.
           _ <- supervisor
             .supervise(
               io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.RebootstrapOrchestrator
                 .run[F](
+                  enabled = sharedCfg.nakamoto.rebootstrapEnabled,
                   chainStore = chainStore,
                   tipTracker = tipTracker,
                   mptOverlay = mptOverlay,

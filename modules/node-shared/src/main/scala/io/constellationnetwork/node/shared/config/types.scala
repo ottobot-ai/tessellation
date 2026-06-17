@@ -115,6 +115,13 @@ object types {
     // sys.env). `recentAdmitCap` is kept proportionally larger (4×) — see `MetagraphOrphanBuffer.DefaultAdmissionsCap`.
     orphanBufferCap: PosInt,
     recentAdmitCap: PosInt,
+    // Fork-recovery master switch for `RebootstrapOrchestrator`: a node that self-finalized a divergent branch and now
+    // refuses canonical peers self-heals (pause production → reset chain store / overlay / tip-tracker → re-seed from
+    // gossip). Migrated from the `NAKAMOTO_REBOOTSTRAP_ENABLED` env read to typed HOCON (project rule: no scattered
+    // sys.env). Default TRUE: with it OFF a locked-out node forks the global mptRoot indefinitely (the sharded
+    // data-app-fee reorg storm — gl0-4 self-finalized 857 while peers held 819-822). The refuse-counter trigger is
+    // conservative (K sustained different-hash writes at-or-below finalized; no false-positive scenario for the gate).
+    rebootstrapEnabled: Boolean,
     // ml0 gl0-follow changeset transport (task #12). `changesetRingDepth` bounds the gl0 producer's SERVED ring of
     // recent finalized per-ordinal accumulators (`GlobalChangeSetService` / `SnapshotLeaderLoop.ringInsertTrimmed`) —
     // a follower more than this many finalized ordinals behind falls back to a heavy full-GSI resync, so widening it
