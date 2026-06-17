@@ -180,15 +180,26 @@ object NakamotoSyncDaemon {
         case Left(_) =>
           (CatchUpVerdict.RejectedInvalidSignature: CatchUpVerdict).pure[F]
         case Right(hashed) =>
-          // Gate 2: rebuild the state proof from the carried GSI (no producer ⇒ pure, no live-store access) and compare against the
-          // snapshot's committed `stateProof` via the shared symmetric comparison.
-          StateProofValidator
-            .forGlobal[F](None)
-            .validate(hashed, context)
-            .map {
-              case cats.data.Validated.Valid(_)   => CatchUpVerdict.Accept(hashed)
-              case cats.data.Validated.Invalid(_) => CatchUpVerdict.RejectedStateProofMismatch(hashed)
-            }
+          // Gate 2 (roots-only catch-up): rebuild the state proof from the carried GSI (no producer ⇒ pure, no live-store access) and
+          // require it equivalent to the snapshot's committed `stateProof` — BUT normalize away the per-MG-MPT-derived roots a
+          // catching-up (parent-missing) node structurally CANNOT reproduce under roots-only sharding:
+          //   - `lastCurrencySnapshotsProof`: the producer commits the per-MG `infoRoot` from its MPT (populated by shard-checkpoint
+          //     adoption); the carried GSI's `lastCurrencySnapshots` is stale/empty under roots-only (`info` is no longer the source of
+          //     truth), so a GSI-only rebuild diverges (the run-2x catch-up wedge: committed infoRoot ≠ rebuilt ⇒ a node >k behind rejects
+          //     every catch-up snapshot ⇒ never recovers ⇒ the finalization split).
+          //   - `mptRoot`: hashes over the full byte map INCLUDING the per-MG `Mg*` entries, so it diverges for the same reason.
+          //   - `smtRoot`: already not recomputable on this path (see `StateProofComparison`).
+          // The remaining global-DAG per-field roots (balances, txRefs, allow-spends, token-locks, stakes, …) + Gate-1 signature bind the
+          // snapshot to real finalized consensus output; the per-MG state is re-verified deterministically as the node adopts shard
+          // checkpoints AFTER catch-up. The proper root fix — make gl0's re-exec reproduce the metagraph `lastTxRefs` so the GSI rebuild
+          // matches — is a tracked #259-class follow-up.
+          GlobalSnapshotInfo.stateProofBuilder[F](None).buildProof(context, hashed.ordinal).map { rebuilt =>
+            val committed = hashed.signed.value.stateProof
+            def globalOnly(p: GlobalSnapshotStateProof): GlobalSnapshotStateProof =
+              p.copy(lastCurrencySnapshotsProof = None, mptRoot = None, smtRoot = None)
+            if (globalOnly(rebuilt) === globalOnly(committed)) CatchUpVerdict.Accept(hashed)
+            else CatchUpVerdict.RejectedStateProofMismatch(hashed)
+          }
       }
     }
 
