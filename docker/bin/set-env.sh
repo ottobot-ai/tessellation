@@ -336,12 +336,58 @@ for arg in "$@"; do
         exit 1
       fi
       ;;
+    --grind-metagraph-shards)
+      # Force-ON the metagraph genesis-key grind (compose-runner.sh): regenerate
+      # each metagraph's genesis key until shardIdFor(addr) == k mod M so the K
+      # metagraphs spread evenly across the M shards. Auto-enabled below when
+      # num-shards>1 AND metagraphs>1; this flag overrides that decision ON.
+      export NAKAMOTO_GRIND_METAGRAPH_SHARDS=true
+      ;;
+    --no-grind-metagraph-shards)
+      # Force-OFF the metagraph shard-grind even when the auto-enable heuristic
+      # (num-shards>1 AND metagraphs>1) would have turned it on.
+      export NAKAMOTO_GRIND_METAGRAPH_SHARDS=false
+      ;;
     *)
       echo "Unknown argument: $arg"
       exit 1
       ;;
   esac
 done
+
+# --- Hard topology caps (operator-confirmed maxima) ---
+# Error out early on an over-large topology rather than wedge the cluster /
+# exhaust RAM mid-run. These are the maxima the harness is validated for.
+if [ "${NUM_METAGRAPHS:-1}" -gt 5 ]; then
+  echo "ERROR: --metagraphs=${NUM_METAGRAPHS} exceeds the supported maximum of 5."
+  exit 1
+fi
+if [ "${NUM_GL0_NODES:-3}" -gt 16 ]; then
+  echo "ERROR: --num-gl0=${NUM_GL0_NODES} exceeds the supported maximum of 16."
+  exit 1
+fi
+if [ "${NAKAMOTO_NUM_SHARDS:-1}" -gt 5 ]; then
+  echo "ERROR: --num-shards=${NAKAMOTO_NUM_SHARDS} exceeds the supported maximum of 5."
+  exit 1
+fi
+
+# --- Metagraph shard-grind auto-enable ---
+# When there is more than one shard AND more than one metagraph, the raw
+# SHA256(addr) mod M assignment frequently clumps several metagraphs onto the
+# same shard, overloading that shard's committee and collapsing throughput
+# (the data-with-fee e2e then fails). Default the genesis-key grind ON in that
+# regime so metagraphs spread evenly (compose-runner.sh grinds each genesis key
+# until shardIdFor(addr) == k mod M). Single-shard or single-metagraph runs gain
+# nothing from the grind, so it stays OFF there. Explicit
+# --grind-metagraph-shards / --no-grind-metagraph-shards (parsed above) win.
+if [ -z "${NAKAMOTO_GRIND_METAGRAPH_SHARDS:-}" ]; then
+  if [ "${NAKAMOTO_NUM_SHARDS:-1}" -gt 1 ] && [ "${NUM_METAGRAPHS:-1}" -gt 1 ]; then
+    export NAKAMOTO_GRIND_METAGRAPH_SHARDS=true
+    echo "[set-env] auto-enabled NAKAMOTO_GRIND_METAGRAPH_SHARDS=true (num-shards=${NAKAMOTO_NUM_SHARDS} > 1, metagraphs=${NUM_METAGRAPHS} > 1)"
+  else
+    export NAKAMOTO_GRIND_METAGRAPH_SHARDS=false
+  fi
+fi
 
 # Committee sizing: scale K_DRAW/K_QUORUM with the actual gl0 count unless explicitly
 # provided. The compose overlay defaults (8/6) are the 8-node testnet constants; running

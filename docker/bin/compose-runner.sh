@@ -131,6 +131,152 @@ cur_dir=$(pwd)
 export PROJECT_ROOT=$cur_dir
 echo "Running in top level directory $cur_dir"
 
+# ============================================================================
+# Nakamoto seedlist construction (factored — single source of truth)
+# ============================================================================
+# build_nakamoto_seedlist sets the global NAKAMOTO_JVM_SEEDLIST (5-field CSV:
+# peerId,ip,p2pPort,alias,bias) from the CURRENT gl0 peer_ids + metagraph-op
+# peer_ids. It is the ONE place the per-node IP/port arithmetic lives so the
+# initial bringup and any later refresh (refresh_gl0_seedlist_and_restart, used
+# by the shard-grind) cannot drift. All vars it reads (NET_PREFIX, GL0_IP_BASE,
+# GL0_PORT_BASE, NET_BASE, ML0_PORT_PREFIX, NUM_GL0_NODES, NUM_METAGRAPHS,
+# MAX_METAGRAPH_NODES/MAX_NODES, METAGRAPH) are resolved at CALL time (after
+# set-env.sh + key setup), so defining the function up here is fine.
+#
+# IMPORTANT: this arithmetic MUST match the bound IP / internal-P2P port written
+# by docker-env-setup.sh (CL_DOCKER_GL0_IPV4 / CL_DOCKER_INTERNAL_GL0_P2P).
+# Do NOT hand-roll a second copy of it anywhere — reuse this function.
+build_nakamoto_seedlist() {
+  NAKAMOTO_JVM_SEEDLIST=""
+  local j
+  for j in $(seq 0 $((NUM_GL0_NODES - 1))); do
+    local PEER_ID
+    PEER_ID=$(cat ./nodes/$j/peer_id 2>/dev/null || echo "")
+    if [ -z "$PEER_ID" ]; then
+      echo "ERROR: missing peer_id for node $j (expected at ./nodes/$j/peer_id)"
+      exit 1
+    fi
+    # Compute per-node IP and P2P port from the test cluster layout. ARITHMETIC
+    # (bases exported by set-env.sh) — MUST match the bound IP/internal-P2P port
+    # written by docker-env-setup.sh (CL_DOCKER_GL0_IPV4 / CL_DOCKER_INTERNAL_GL0_P2P),
+    # since gl0 nodes dial each other at this address. Byte-identical to the legacy
+    # "${NET_PREFIX}.1${j}" / "${DAG_L0_PORT_PREFIX}${j}1" string-concat for j<10.
+    local NODE_IP="${NET_PREFIX}.$((GL0_IP_BASE + j))"
+    local NODE_P2P_PORT="$((GL0_PORT_BASE + j*10 + 1))"
+    NAKAMOTO_JVM_SEEDLIST="${NAKAMOTO_JVM_SEEDLIST}${PEER_ID},${NODE_IP},${NODE_P2P_PORT},,\n"
+  done
+
+  # Append per-metagraph operator peer IDs with alias=metagraph-op so gl0 will
+  # accept their state-channel binary signatures (validateSignaturesWithSeedlist
+  # requires at least one signer to be in the seedlist). The "metagraph-op"
+  # marker is filtered out of StakeRegistry validators in
+  # GlobalSnapshotConsensus.scala so VRF stake stays at 1/N over hg validators
+  # only — adding metagraph signers would otherwise dilute it.
+  if [ -n "$METAGRAPH" ]; then
+    local k i
+    for k in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
+      local M_PREFIX="${NET_BASE}.$((k + 1))"
+      local M_ML0_PORT_PREFIX=$((ML0_PORT_PREFIX - k*10))
+      for i in $(seq 0 $((${MAX_METAGRAPH_NODES:-$MAX_NODES} - 1))); do
+        local M_PEER_FILE="./nodes/m${k}-${i}/peer_id"
+        if [ -f "$M_PEER_FILE" ]; then
+          local M_PEER_ID
+          M_PEER_ID=$(cat "$M_PEER_FILE")
+          local M_NODE_IP="${M_PREFIX}.3${i}"
+          local M_NODE_P2P_PORT="${M_ML0_PORT_PREFIX}${i}1"
+          NAKAMOTO_JVM_SEEDLIST="${NAKAMOTO_JVM_SEEDLIST}${M_PEER_ID},${M_NODE_IP},${M_NODE_P2P_PORT},metagraph-op,\n"
+        fi
+      done
+    done
+  fi
+}
+
+# ============================================================================
+# Shard-sortition metagraph key-grinding for EVEN shard distribution
+# ============================================================================
+# The runtime fan-out routes each metagraph's state-channel binaries to
+# ShardAssignment.shardIdFor(metagraphAddress) = SHA256(addr) mod M
+# (modules/.../domain/nakamoto/ShardAssignment.scala). Under the raw hash, K
+# metagraphs clump unevenly across M shards (2 mgs / 2 shards often BOTH land on
+# the same shard → that shard's committee overloads → throughput collapses → the
+# data-with-fee e2e fails). To get an even spread we GRIND each metagraph's
+# genesis keypair: regenerate m${k}-0 + re-derive its genesis until
+# shardIdFor(genesis.address) == (k mod M).
+#
+# shard_id_of_address <address> <num_shards>  → echoes the integer shardId, or
+# returns non-zero on a bad address / oracle failure. The oracle is
+# `tools.jar shard-id`, which calls the SAME production ShardAssignment code path
+# (the brotli+circe+sha256 chain is not reproducible in bash).
+shard_id_of_address() {
+  local addr="$1" m="$2"
+  local out
+  out=$(java -jar "$PROJECT_ROOT/docker/jars/tools.jar" shard-id --address "$addr" --num-shards "$m" 2>/dev/null) || return 1
+  # Oracle prints exactly one "shardId=<n>" line; extract <n>.
+  echo "$out" | sed -n 's/^shardId=\([0-9][0-9]*\)$/\1/p' | head -n1
+}
+
+# regenerate_metagraph_genesis_key <k> — mint a FRESH genesis-operator keypair
+# for metagraph k (nodes/m${k}-0), refreshing the derived address + peer_id.
+# Used by the grind loop to draw a new candidate when the current genesis lands
+# on the wrong shard. Runs in a subshell so the keytool/wallet invocations'
+# working dir + any env do not leak into the caller.
+regenerate_metagraph_genesis_key() {
+  local k="$1"
+  (
+    cd "$PROJECT_ROOT/nodes/m${k}-0"
+    # MUST source .envrc first (mirrors generate_keys in node-key-env-setup.sh): it exports
+    # CL_KEYSTORE/CL_KEYALIAS/CL_PASSWORD, which keytool + wallet require to write/read key.p12.
+    # Without it keytool blocks on an interactive password prompt → the grind retry hangs until
+    # the run watchdog SIGTERMs it ("Terminated"). The first grind run never hit this (it landed
+    # on attempt 1, so regenerate was never called); a miss exposes it.
+    source .envrc
+    # Clear the prior keypair so `generate` always starts clean (avoids any overwrite balk on the
+    # pre-existing key.p12, which under `set -e` would abort the whole run).
+    rm -f key.p12 id_ecdsa.hex 2>/dev/null || true
+    java -jar ../keytool.jar generate >/dev/null 2>&1
+    java -jar ../wallet.jar show-address > address 2>/dev/null
+    java -jar ../wallet.jar show-id > peer_id 2>/dev/null
+    java -jar ../keytool.jar export >/dev/null 2>&1
+  )
+}
+
+# refresh_gl0_seedlist_and_restart — rebuild every gl0 node's seedlist.csv from
+# the CURRENT (post-grind) gl0 + metagraph peer_ids and restart the gl0
+# containers so they reload it. Needed after a grind changes an m${k}-0 peer_id:
+# gl0 loads its seedlist once at startup and only accepts state-channel binaries
+# signed by a seedlisted peer (StateChannelValidator.validateSignaturesWithSeedlist),
+# so the new signer must be in the seedlist BEFORE that metagraph's ml0 produces
+# snapshots.
+#
+# CRITICAL: this reuses build_nakamoto_seedlist (the SAME arithmetic the initial
+# bringup uses) and the SAME `printf "$NAKAMOTO_JVM_SEEDLIST" > seedlist.csv`
+# write — it does NOT hand-roll any IP/port arithmetic. That hand-rolled second
+# copy is exactly what broke gl1 peering when an earlier version of this helper
+# was reverted; do not reintroduce it.
+refresh_gl0_seedlist_and_restart() {
+  build_nakamoto_seedlist
+  local j
+  for j in $(seq 0 $((NUM_GL0_NODES - 1))); do
+    printf "$NAKAMOTO_JVM_SEEDLIST" > ./nodes/$j/seedlist.csv
+  done
+  echo "[grind] refreshed gl0 seedlist with post-grind metagraph peer_ids; restarting gl0 containers"
+  for j in $(seq 0 $((NUM_GL0_NODES - 1))); do
+    docker restart "gl0-$j" >/dev/null 2>&1 || true
+  done
+  # Wait for gl0-0 to be reachable again before continuing (the next metagraph's
+  # genesis container needs gl0 up, and metagraph SC binaries need a healthy gl0).
+  local gl0_url="${TEST_HOST:-http://localhost}:${DAG_L0_PORT_PREFIX}00"
+  local a
+  for a in $(seq 1 60); do
+    if curl -s "${gl0_url}/cluster/info" 2>/dev/null | jq 'length' >/dev/null 2>&1; then
+      echo "[grind] gl0 healthy again after seedlist refresh (attempt $a)"
+      return 0
+    fi
+    sleep 3
+  done
+  echo "[grind] WARN: gl0 did not report healthy within ~180s after seedlist refresh"
+}
+
 
 source ./docker/bin/set-env.sh "$@"
 
@@ -470,44 +616,11 @@ else
     # the full validator set. Same file works for ALL layers since each node
     # shares one key across gl0/gl1/ml0/cl1/dl1 in the test environment.
     echo "Generating Nakamoto seedlist from gl0 peer IDs..."
-    NAKAMOTO_JVM_SEEDLIST=""
-    for j in $(seq 0 $((NUM_GL0_NODES - 1))); do
-      PEER_ID=$(cat ./nodes/$j/peer_id 2>/dev/null || echo "")
-      if [ -z "$PEER_ID" ]; then
-        echo "ERROR: missing peer_id for node $j (expected at ./nodes/$j/peer_id)"
-        exit 1
-      fi
-      # Compute per-node IP and P2P port from the test cluster layout. ARITHMETIC
-      # (bases exported by set-env.sh) — MUST match the bound IP/internal-P2P port
-      # written by docker-env-setup.sh (CL_DOCKER_GL0_IPV4 / CL_DOCKER_INTERNAL_GL0_P2P),
-      # since gl0 nodes dial each other at this address. Byte-identical to the legacy
-      # "${NET_PREFIX}.1${j}" / "${DAG_L0_PORT_PREFIX}${j}1" string-concat for j<10.
-      NODE_IP="${NET_PREFIX}.$((GL0_IP_BASE + j))"
-      NODE_P2P_PORT="$((GL0_PORT_BASE + j*10 + 1))"
-      NAKAMOTO_JVM_SEEDLIST="${NAKAMOTO_JVM_SEEDLIST}${PEER_ID},${NODE_IP},${NODE_P2P_PORT},,\n"
-    done
-
-    # Append per-metagraph operator peer IDs with alias=metagraph-op so gl0 will
-    # accept their state-channel binary signatures (validateSignaturesWithSeedlist
-    # requires at least one signer to be in the seedlist). The "metagraph-op"
-    # marker is filtered out of StakeRegistry validators in
-    # GlobalSnapshotConsensus.scala so VRF stake stays at 1/N over hg validators
-    # only — adding metagraph signers would otherwise dilute it.
-    if [ -n "$METAGRAPH" ]; then
-      for k in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
-        M_PREFIX="${NET_BASE}.$((k + 1))"
-        M_ML0_PORT_PREFIX=$((ML0_PORT_PREFIX - k*10))
-        for i in $(seq 0 $((${MAX_METAGRAPH_NODES:-$MAX_NODES} - 1))); do
-          M_PEER_FILE="./nodes/m${k}-${i}/peer_id"
-          if [ -f "$M_PEER_FILE" ]; then
-            M_PEER_ID=$(cat "$M_PEER_FILE")
-            M_NODE_IP="${M_PREFIX}.3${i}"
-            M_NODE_P2P_PORT="${M_ML0_PORT_PREFIX}${i}1"
-            NAKAMOTO_JVM_SEEDLIST="${NAKAMOTO_JVM_SEEDLIST}${M_PEER_ID},${M_NODE_IP},${M_NODE_P2P_PORT},metagraph-op,\n"
-          fi
-        done
-      done
-    fi
+    # Build NAKAMOTO_JVM_SEEDLIST via the factored single-source-of-truth helper
+    # (defined near the top of this script). The refresh used by the shard-grind
+    # calls the SAME function, so the seedlist arithmetic can never drift between
+    # the initial build and a post-grind refresh.
+    build_nakamoto_seedlist
 
     for i in $(seq 0 $((NUM_GL0_NODES - 1))); do
       # Write the JVM seedlist file into each node directory
@@ -640,6 +753,97 @@ else
   if [ -n "$METAGRAPH" ]; then
     metagraph_args="-f docker-compose.metagraph.yaml -f docker-compose.metagraph-test.yaml"
 
+    # One genesis-generation attempt for the CURRENT $M_PREFIX (m${k}): run the
+    # ML0 genesis container (gl0 must be up — it supplies the embedded
+    # GlobalSyncView), then lift the produced genesis.snapshot + genesis.address
+    # into the node root. Reads $metagraph_args + $M_PREFIX at CALL time and MUST
+    # be invoked from inside nodes/${M_PREFIX}-0/. Factored to function scope so
+    # the grind pre-pass and the in-loop non-grind genesis path share ONE copy of
+    # the genesis-gen docker commands (no duplication / drift).
+    _gen_genesis_attempt() {
+      cp .env .env.bak
+      echo "CL_ML0_GENERATE_GENESIS=true" >> .env
+      docker compose $metagraph_args -f docker-compose.metagraph-genesis.yaml --profile ml0 up
+      docker stop ml0-${M_PREFIX}-0 2>/dev/null || true
+      docker rm ml0-${M_PREFIX}-0 2>/dev/null || true
+      cp ml0-data/genesis.snapshot .
+      cp ml0-data/genesis.address .
+      mv .env.bak .env
+    }
+
+    # ========================================================================
+    # GRIND PRE-PASS (only when NAKAMOTO_GRIND_METAGRAPH_SHARDS=true)
+    # ========================================================================
+    # Grind EVERY metagraph's m${k}-0 genesis key FIRST — before any metagraph's
+    # production ML0/CL1/DL1 starts — then refresh the gl0 seedlist + restart gl0
+    # exactly ONCE. This is the fix for the in-loop variant, where restarting gl0
+    # for metagraph k+1's grind broke metagraph k's already-running L1↔gl0
+    # alignment (the earlier metagraph then saw gl0 finalized=0 and POST /data
+    # returned HTTP 500). Doing all the grinding up front means the single gl0
+    # restart happens while NO metagraph production node is running, so nothing
+    # can be disrupted. After this pre-pass the in-loop genesis-generation is
+    # naturally skipped (genesis.snapshot already exists), so the startup loop
+    # only starts ML0/CL1/DL1 against the already-restarted, stable gl0.
+    if [ "${NAKAMOTO_GRIND_METAGRAPH_SHARDS:-false}" = "true" ]; then
+      echo "================================================"
+      echo "[grind] PRE-PASS: grinding all ${NUM_METAGRAPHS:-1} metagraph genesis keys before any metagraph start"
+      echo "================================================"
+      for k in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
+        M_PREFIX="m${k}"
+        if [ ! -d "$PROJECT_ROOT/nodes/${M_PREFIX}-0" ]; then
+          continue
+        fi
+        cd "$PROJECT_ROOT/nodes/${M_PREFIX}-0/"
+        if [ -f "./genesis.snapshot" ]; then
+          # clean-data leaves ./genesis.snapshot in the node root; an existing one
+          # was already ground on a prior run — keep it (skip the grind).
+          echo "[grind] metagraph $k already has genesis.snapshot — skipping grind"
+          cd "$PROJECT_ROOT"
+          continue
+        fi
+        # Grind m${k}-0 + re-derive genesis until shardIdFor(genesis.address) ==
+        # (k mod NAKAMOTO_NUM_SHARDS), so the K metagraphs spread evenly across the
+        # M shards. The genesis address is f(m${k}-0 signature, gl0 GlobalSyncView)
+        # so it MUST be checked live, per attempt. NAKAMOTO_NUM_SHARDS is guaranteed
+        # set + > 1 whenever this gate is on (set-env.sh only enables the grind then).
+        target_shard=$(( k % NAKAMOTO_NUM_SHARDS ))
+        max_attempts=${NAKAMOTO_GRIND_MAX_ATTEMPTS:-60}
+        echo "[grind] metagraph $k → target shard $target_shard (M=$NAKAMOTO_NUM_SHARDS), up to $max_attempts attempts"
+        attempt=0
+        while :; do
+          attempt=$((attempt + 1))
+          _gen_genesis_attempt
+          cand_addr=$(head -n 1 genesis.address)
+          cand_shard=$(shard_id_of_address "$cand_addr" "$NAKAMOTO_NUM_SHARDS" || echo "")
+          echo "[grind] metagraph $k attempt $attempt: addr=$cand_addr shard=${cand_shard:-ERR} (want $target_shard)"
+          if [ "$cand_shard" = "$target_shard" ]; then
+            echo "[grind] metagraph $k landed on shard $target_shard after $attempt attempt(s)"
+            break
+          fi
+          if [ "$attempt" -ge "$max_attempts" ]; then
+            echo "ERROR: [grind] metagraph $k failed to hit shard $target_shard in $max_attempts attempts"
+            exit 1
+          fi
+          # Miss: draw a fresh genesis keypair and clear stale genesis artifacts
+          # so the next container run re-derives from the new key. The helper uses
+          # absolute $PROJECT_ROOT paths, so cd back to the node dir after.
+          cd "$PROJECT_ROOT"
+          regenerate_metagraph_genesis_key "$k"
+          cd "$PROJECT_ROOT/nodes/${M_PREFIX}-0/"
+          rm -f genesis.snapshot genesis.address ml0-data/genesis.snapshot ml0-data/genesis.address 2>/dev/null || true
+        done
+        cd "$PROJECT_ROOT"
+      done
+      # All metagraph genesis keys are now ground. Refresh the gl0 seedlist with
+      # the (possibly new) m${k}-0 peer_ids + restart gl0 exactly ONCE — while NO
+      # metagraph production node is running — so gl0 accepts binaries signed by
+      # the ground signers before any ML0 produces snapshots. Helper uses absolute
+      # paths; we are at $PROJECT_ROOT (cwd the startup loop expects).
+      cd "$PROJECT_ROOT"
+      refresh_gl0_seedlist_and_restart
+      cd "$PROJECT_ROOT"
+    fi
+
     # Per-metagraph startup. Each metagraph k has its own operator dirs at
     # nodes/m${k}-${i} with distinct keystore. Genesis is m${k}-0; its
     # genesis.address gives the metagraph's address (METAGRAPH_ID).
@@ -658,15 +862,14 @@ else
         cd ./nodes/${M_PREFIX}-${i}/
 
         if [ ! -f "./genesis.snapshot" ] && [ "$i" -eq 0 ]; then
+          # Generate this metagraph's genesis snapshot. With the shard grind ON
+          # this is already done by the GRIND PRE-PASS above (genesis.snapshot
+          # exists), so this branch only runs in the NON-grind case — a single
+          # plain genesis attempt, no grind, no gl0 restart. _gen_genesis_attempt
+          # is defined at metagraph-block scope and reads $M_PREFIX/$metagraph_args
+          # at call time; cwd here is nodes/${M_PREFIX}-0/ ($i==0), as it expects.
           echo "Generating metagraph $k genesis snapshot"
-          cp .env .env.bak
-          echo "CL_ML0_GENERATE_GENESIS=true" >> .env
-          docker compose $metagraph_args -f docker-compose.metagraph-genesis.yaml --profile ml0 up
-          docker stop ml0-${M_PREFIX}-0
-          docker rm ml0-${M_PREFIX}-0
-          cp ml0-data/genesis.snapshot .
-          cp ml0-data/genesis.address .
-          mv .env.bak .env
+          _gen_genesis_attempt
         fi
         # Ensure genesis.snapshot is in ml0-data (clean-data wipes ml0-data/ but
         # leaves ./genesis.snapshot in the node root, so regeneration is skipped)
