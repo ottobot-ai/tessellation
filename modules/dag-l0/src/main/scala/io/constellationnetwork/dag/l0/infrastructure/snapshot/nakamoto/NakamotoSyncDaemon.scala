@@ -2598,7 +2598,7 @@ object NakamotoSyncDaemon {
     * just-admitted parent. Defining the closure top-level (rather than nested inside `handleMetagraphBinary`) lets the finalize-hook
     * callable share the exact same shape — same orphan buffer, same admission cache, same recursive drain.
     */
-  def makeMetagraphBinaryProcessor[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector](
+  def makeMetagraphBinaryProcessor[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector: Metrics](
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
     committeeGate: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate[F],
     // #213/#290: CONTENT-DERIVED parent-ordinal resolver (`MetagraphParentOrdinalResolver.resolveFromBinary`).
@@ -2680,9 +2680,14 @@ object NakamotoSyncDaemon {
                 resolveParent(address, parentHash, signed.value.content).flatMap {
                   case None =>
                     orphanBuffer.record(address, parentHash, bytes).flatMap { sz =>
-                      logger.info(
-                        s"📦 Orphan-buffered mg=$address parent=${parentHash.value.take(12)}... (parent not yet admitted) bufferSize=$sz"
-                      )
+                      // Occupancy gauge (eval-instrumentation): the orphan backlog is the leading indicator
+                      // of a metagraph that can't get its binaries admitted (committee-gate timeout cascade
+                      // → chain-link break → orphans pile up). Watch this approach `nakamoto.orphan-buffer-cap`
+                      // (default 1024) — a monotonic climb is the "buffer filling up" wedge.
+                      Metrics[F].updateGauge("dag_nakamoto_orphan_buffer_size", sz) >>
+                        logger.info(
+                          s"📦 Orphan-buffered mg=$address parent=${parentHash.value.take(12)}... (parent not yet admitted) bufferSize=$sz"
+                        )
                     }
                   case Some(parentOrdinal) =>
                     for {
@@ -2780,7 +2785,7 @@ object NakamotoSyncDaemon {
     *
     * Only invoked when `shardBinaryBuffers.nonEmpty` (`numShards > 1`); at `numShards = 1` the caller's `whenA` gate makes this a no-op.
     */
-  private def bufferReceivedBinaryForShard[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector](
+  private def bufferReceivedBinaryForShard[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector: Metrics](
     mb: pb.MetagraphBinary,
     shardBinaryBuffers: Map[
       io.constellationnetwork.schema.sharding.ShardId,
@@ -2809,13 +2814,25 @@ object NakamotoSyncDaemon {
             case Right(signed) =>
               HasherSelector[F].withCurrent { implicit hasher =>
                 assignment.shardIdFor(address).flatMap { sid =>
-                  shardBinaryBuffers.get(sid) match {
-                    case Some(buffer) => buffer.bufferBinary(address, signed)
-                    case None         =>
-                      // Address maps to a shard this operator doesn't track a buffer for — drop quietly (the
-                      // legacy admission path still ran). Expected only if numShards/registry disagree.
-                      logger.debug(s"R-1 shard-buffer: no buffer for shard=${sid.value.value} (mg=$address); skipping")
-                  }
+                  // Metagraph→shard mapping gauge (eval-instrumentation): emit one series per (mg, shard) so
+                  // `count by (shard_id) (dag_nakamoto_metagraph_shard_assignment)` shows the per-shard
+                  // metagraph load at a glance — a shard carrying >1 mg while another sits idle is the
+                  // imbalance that overloads one committee (the data-with-fee wedge). Idempotent (value 1).
+                  Metrics[F].updateGauge(
+                    "dag_nakamoto_metagraph_shard_assignment",
+                    1,
+                    Seq(
+                      Metrics.unsafeLabelName("shard_id") -> sid.value.value.toString,
+                      Metrics.unsafeLabelName("metagraph") -> address.value.value
+                    )
+                  ) >>
+                    (shardBinaryBuffers.get(sid) match {
+                      case Some(buffer) => buffer.bufferBinary(address, signed)
+                      case None         =>
+                        // Address maps to a shard this operator doesn't track a buffer for — drop quietly (the
+                        // legacy admission path still ran). Expected only if numShards/registry disagree.
+                        logger.debug(s"R-1 shard-buffer: no buffer for shard=${sid.value.value} (mg=$address); skipping")
+                    })
                 }
               }
           }

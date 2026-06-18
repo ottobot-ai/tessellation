@@ -9,6 +9,7 @@ import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.{MetagraphCommitteeGate, MetagraphOrphanBuffer, MetagraphParentOrdinalResolver}
+import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
@@ -47,6 +48,10 @@ import weaver.MutableIOSuite
   * value-hash can ONLY resolve through the admission cache. Pre-fix, the child would orphan-buffer; post-fix it resolves.
   */
 object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
+
+  // makeMetagraphBinaryProcessor now carries a `Metrics` context bound (orphan-buffer occupancy +
+  // metagraph→shard gauges). The admission-lag logic under test is metrics-agnostic, so a no-op sink suffices.
+  implicit val metrics: Metrics[IO] = NoOpMetrics.make
 
   override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO], HasherSelector[IO])
 
