@@ -271,6 +271,8 @@ object NakamotoSyncDaemon {
       F,
       Map[Hash, (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)]
     ],
+    // 3c-A enabler — signed-bytes staging map, threaded alongside `pendingAccumulatorsRef` (rides with it; never feeds back into logic).
+    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
@@ -338,6 +340,7 @@ object NakamotoSyncDaemon {
               mptStore,
               mptOverlay,
               pendingAccumulatorsRef,
+              pendingPostBytesRef,
               eventMempool,
               chainSyncManager,
               channel,
@@ -400,6 +403,8 @@ object NakamotoSyncDaemon {
       F,
       Map[Hash, (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)]
     ],
+    // 3c-A enabler — signed-bytes staging map, threaded alongside `pendingAccumulatorsRef` (rides with it; never feeds back into logic).
+    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     dataDir: java.nio.file.Path,
     // (#196) Sink for inbound AllowSpendBlock gossip — same queue
@@ -619,6 +624,7 @@ object NakamotoSyncDaemon {
                                 mptStore,
                                 mptOverlay,
                                 pendingAccumulatorsRef,
+                                pendingPostBytesRef,
                                 eventMempool,
                                 csm,
                                 channel,
@@ -718,6 +724,7 @@ object NakamotoSyncDaemon {
                                   mptStore,
                                   mptOverlay,
                                   pendingAccumulatorsRef,
+                                  pendingPostBytesRef,
                                   eventMempool,
                                   chainSyncManager,
                                   channel,
@@ -1096,6 +1103,8 @@ object NakamotoSyncDaemon {
       F,
       Map[Hash, (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)]
     ],
+    // 3c-A enabler — signed-bytes staging map, threaded alongside `pendingAccumulatorsRef` (rides with it; never feeds back into logic).
+    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
@@ -1257,7 +1266,8 @@ object NakamotoSyncDaemon {
                   }
                 },
                 mptOverlay = mptOverlay,
-                pendingAccumulatorsRef = pendingAccumulatorsRef
+                pendingAccumulatorsRef = pendingAccumulatorsRef,
+                pendingPostBytesRef = pendingPostBytesRef
               )
             case None =>
               // Parent not in chain store. Three-tier gap handling:
@@ -1410,6 +1420,7 @@ object NakamotoSyncDaemon {
               mptStore,
               mptOverlay,
               pendingAccumulatorsRef,
+              pendingPostBytesRef,
               eventMempool,
               chainSyncManager,
               channel,

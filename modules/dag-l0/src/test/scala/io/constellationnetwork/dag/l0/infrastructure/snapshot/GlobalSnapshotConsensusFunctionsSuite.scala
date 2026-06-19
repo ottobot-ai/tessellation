@@ -442,6 +442,13 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       ]](
         Map.empty
       )
+      // 3c-A enabler — sibling signed-bytes staging Ref (empty for this unit suite; rides alongside pendingAccumulatorsRef).
+      pendingPostBytesRef <- Ref.of[IO, Map[
+        Hash,
+        (SnapshotOrdinal, Map[io.constellationnetwork.security.hex.Hex, Array[Byte]])
+      ]](
+        Map.empty
+      )
       globalSnapshotConsensusFunction = GlobalSnapshotConsensusFunctions
         .make[IO](
           snapshotAcceptanceManager,
@@ -457,7 +464,8 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           mptStore,
           mptOverlay,
           shardAcceptanceDeps,
-          pendingAccumulatorsRef
+          pendingAccumulatorsRef,
+          pendingPostBytesRef
         )
     } yield globalSnapshotConsensusFunction
   }

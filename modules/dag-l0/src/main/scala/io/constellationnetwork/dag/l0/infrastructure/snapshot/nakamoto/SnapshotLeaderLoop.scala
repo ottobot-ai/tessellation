@@ -33,6 +33,7 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.storages.MptStateStorage
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.vrf.VrfKeyDeriver
 
@@ -125,6 +126,20 @@ object SnapshotLeaderLoop {
     rawHash: Hash,
     withCertHash: Hash
   ): Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)] =
+    staged
+      .get(rawHash)
+      .fold(staged)(entry => (staged - rawHash).updated(withCertHash, entry))
+
+  /** 3c-A enabler — the signed-bytes analogue of [[rekeyStagedAccumulator]]. The signed `postBytes` are staged under the RAW artifact hash
+    * at the `overlay.commit` site; the finalize-sink promotion looks them up under the with-cert canonical hash. Move `rawHash →
+    * withCertHash` (no-op if nothing staged). MUST be called everywhere `rekeyStagedAccumulator` is, against `pendingPostBytesRef`, or the
+    * bytes never promote (the served store stays empty and the byte route falls back to legacy — safe but inert).
+    */
+  def rekeyStagedPostBytes(
+    staged: Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])],
+    rawHash: Hash,
+    withCertHash: Hash
+  ): Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])] =
     staged
       .get(rawHash)
       .fold(staged)(entry => (staged - rawHash).updated(withCertHash, entry))
@@ -477,6 +492,16 @@ object SnapshotLeaderLoop {
     // ordinal for the finalize-sink watermark prune. Same instance `GlobalSnapshotConsensus.make` injects into the
     // consensus functions AND the sync daemon.
     pendingAccumulatorsRef: Ref[F, Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)]],
+    // 3c-A enabler — STAGING map for the signed MPT byte map (the SAME Ref the consensus functions stage into at the
+    // `overlay.commit` site). `recordFinalizedAccumulator` promotes the finalized hash's bytes into `signedBytesStore`
+    // and watermark-prunes. Same `(ordinal, value)` shape as `pendingAccumulatorsRef`.
+    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
+    // 3c-A enabler — the SERVED authoritative signed-bytes store (`mpt_signed_snapshot_info/<ordinal>`). At each
+    // finalize sink the promoted SIGNED `postBytes` for the finalized hash are written here at the finalized ordinal,
+    // so the byte map served to followers reproduces the signed `mptRoot` BY CONSTRUCTION — kept SEPARATE from the
+    // producer's own `mpt_snapshot_info` re-fold store (which the producer writes async at finalize and can diverge
+    // from the signed bytes under MultiBranch).
+    signedBytesStore: MptStateStorage[F],
     // Task #12 slice 2b — the SERVED bounded ring of recent FINALIZED per-ordinal accumulators keyed by
     // ordinal (the ml0-side analogue of `recentFollowProjectionsRef`). Promoted at BOTH finalize sinks from
     // `pendingAccumulatorsRef`, trimmed to the last `GlobalChangeSetService.recentAccumulatorsToKeep` (= 256,
@@ -623,7 +648,21 @@ object SnapshotLeaderLoop {
         case Some(acc) =>
           recentFinalizedAccumulatorsRef.update(ring => ringInsertTrimmed(ring, ordinal, acc, changesetRingDepth))
         case None => Async[F].unit
-      }
+      } >>
+        // 3c-A enabler: mirror the promote+watermark-prune for the SIGNED byte map. Promote the finalized hash's staged
+        // signed bytes into the served signed-bytes store at `ordinal`; watermark-prune the rest (keep only entries
+        // strictly above the finalized tip — drains `finalizedHash` + dead forks). Only a FINALIZED branch's signed
+        // bytes ever reach the store, so a follower's `sidecarFreeMptRoot(served) === signed mptRoot` holds by
+        // construction. Absent (this node didn't stage this hash) ⇒ skip; the follower's byte route 404s and falls
+        // back to the legacy GSI path (best-effort transport, never an incorrect adopt).
+        pendingPostBytesRef.modify { staged =>
+          val promoted = staged.get(finalizedHash).map { case (_, bytes) => bytes }
+          val pruned = staged.filter { case (_, (o, _)) => o.value.value > ordinal.value.value }
+          (pruned, promoted)
+        }.flatMap {
+          case Some(bytes) => signedBytesStore.writeState(ordinal, bytes)
+          case None        => Async[F].unit
+        }
 
     // Task #12 staging-completeness fix — promote the accumulator of EVERY ordinal that this finalize tick made
     // final, not just the single highest one. Both finalize sinks jump straight to a single `finalizeAtOrdinal`
@@ -812,6 +851,7 @@ object SnapshotLeaderLoop {
                                 shardAssignment,
                                 shardCommitteeMembership,
                                 pendingAccumulatorsRef,
+                                pendingPostBytesRef,
                                 logger
                               )
                             } // snapshotSemaphore.permit
@@ -1536,6 +1576,8 @@ object SnapshotLeaderLoop {
     // produce path below rekeys the staged accumulator raw->with-cert alongside the overlay rekey so the
     // finalize-sink promotion (`recordFinalizedAccumulator`, in `run`) can find it under the canonical hash.
     pendingAccumulatorsRef: Ref[F, Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)]],
+    // 3c-A enabler — signed-bytes staging, rekeyed raw->with-cert alongside `pendingAccumulatorsRef` on the produce path.
+    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
     logger: org.typelevel.log4cats.Logger[F]
   )(
     // Slice S6: app-scoped Supervisor for the off-critical-path producer fan-out (see Gap A below).
@@ -1720,7 +1762,10 @@ object SnapshotLeaderLoop {
                           // for self-produced snapshots — the same raw->with-cert problem the overlay rekey beside
                           // it already solves.
                           mptOverlay.rekey(BranchId(rawArtifactHash), BranchId(snapshotHashedForStorage.hash)) >>
-                            pendingAccumulatorsRef.update(rekeyStagedAccumulator(_, rawArtifactHash, snapshotHashedForStorage.hash))
+                            pendingAccumulatorsRef.update(rekeyStagedAccumulator(_, rawArtifactHash, snapshotHashedForStorage.hash)) >>
+                            // 3c-A enabler — mirror the rekey for the signed-bytes staging so the finalize sink finds it under the
+                            // with-cert canonical hash.
+                            pendingPostBytesRef.update(rekeyStagedPostBytes(_, rawArtifactHash, snapshotHashedForStorage.hash))
                         else
                           // Abandoned fork: drop both the overlay branch and its staged accumulator.
                           mptOverlay.discardBranch(BranchId(rawArtifactHash)) >>

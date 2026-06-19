@@ -75,7 +75,10 @@ object NakamotoSnapshotValidator {
     pendingAccumulatorsRef: Ref[
       F,
       Map[Hash, (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)]
-    ]
+    ],
+    // 3c-A enabler — the signed-bytes staging map (same Ref). REKEY/DROP it alongside `pendingAccumulatorsRef` on the
+    // validator-adopt paths so a NON-producer's signed bytes promote on finalize (else the served store stays empty).
+    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]]
   ): F[ValidationResult] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoValidator")
     val producerHex = Hex(producerIdBytes.map("%02x".format(_)).mkString)
@@ -192,6 +195,10 @@ object NakamotoSnapshotValidator {
                             _ <- pendingAccumulatorsRef.update(
                               SnapshotLeaderLoop.rekeyStagedAccumulator(_, strippedHash, canonicalHash)
                             )
+                            // 3c-A enabler — mirror the rekey for the signed-bytes staging (stripped -> canonical).
+                            _ <- pendingPostBytesRef.update(
+                              SnapshotLeaderLoop.rekeyStagedPostBytes(_, strippedHash, canonicalHash)
+                            )
                             _ <- logger.debug(s"✅ Full content validation passed: slot=$slot ordinal=${signedSnapshot.ordinal}")
                           } yield Valid(signedSnapshot, validatedContext): ValidationResult
                         case Left(err) =>
@@ -264,6 +271,8 @@ object NakamotoSnapshotValidator {
                             // `strippedHash` for this rejected (mismatched) candidate so it doesn't sit in staging
                             // until the watermark prune. Mirrors the producer's abandoned-fork `_ - rawArtifactHash`.
                             _ <- pendingAccumulatorsRef.update(_ - strippedHash)
+                            // 3c-A enabler — symmetric drop of the rejected candidate's staged signed bytes.
+                            _ <- pendingPostBytesRef.update(_ - strippedHash)
                             result <-
                               if (logMsg._2)
                                 logger.info(logMsg._1).as(Valid(signedSnapshot, context): ValidationResult)

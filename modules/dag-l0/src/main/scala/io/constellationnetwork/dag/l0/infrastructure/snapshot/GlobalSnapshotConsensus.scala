@@ -322,6 +322,23 @@ object GlobalSnapshotConsensus {
           (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)
         ]](Map.empty)
         .toResource
+      // 3c-A enabler — STAGING map for the signed MPT byte map (mirrors `pendingAccumulatorsRef`). The producer stages
+      // the EXACT signed `postBytes` here keyed by snapshot hash at the `overlay.commit` site; `SnapshotLeaderLoop`
+      // promotes the FINALIZED hash's bytes into `signedBytesStore` below. Same instance injected into BOTH the
+      // consensus functions (stage) AND `SnapshotLeaderLoop` (promote/drain).
+      pendingPostBytesRef <- cats.effect.kernel.Ref
+        .of[F, Map[
+          io.constellationnetwork.security.hash.Hash,
+          (SnapshotOrdinal, Map[io.constellationnetwork.security.hex.Hex, Array[Byte]])
+        ]](Map.empty)
+        .toResource
+      // 3c-A enabler — the authoritative SERVED signed-bytes store, a sibling of the producer's `mpt_snapshot_info`
+      // (`<...>_signed`). ONLY the finalize sink writes it (the signed bytes of a FINALIZED branch), so the byte map
+      // served to followers reproduces the signed `mptRoot` BY CONSTRUCTION — never the producer's async finalize-time
+      // re-fold (which can diverge under MultiBranch). The 3c-A serve route reads from this store.
+      signedBytesStore <- io.constellationnetwork.security.mpt.storages.MptStateStorage
+        .make[F](fs2.io.file.Path(sharedCfg.mptSnapshotInfoPath.toString + "_signed"))
+        .toResource
       // SERVED ring: bounded ordinal-keyed ring of recent FINALIZED per-ordinal accumulators (the ml0-side
       // analogue of `recentFollowProjectionsRef`). `SnapshotLeaderLoop` promotes into it at the SAME finalize
       // sinks, trimmed to the last `GlobalChangeSetService.recentAccumulatorsToKeep`. A later slice wires
@@ -553,6 +570,9 @@ object GlobalSnapshotConsensus {
           // per-ordinal delta here; `SnapshotLeaderLoop` (same Ref, injected below) promotes the finalized
           // ones into `recentFinalizedAccumulatorsRef`. Additive — never feeds back into consensus.
           pendingAccumulatorsRef = pendingAccumulatorsRef,
+          // 3c-A enabler — the signed-bytes STAGING map (same Ref injected into `SnapshotLeaderLoop` below). Producer
+          // stages the EXACT signed `postBytes` keyed by snapshot hash at the `overlay.commit` site.
+          pendingPostBytesRef = pendingPostBytesRef,
           // Task #19 — staging-map backstop cap (typed HOCON, default 2048 = 2× the served ring), bumped from
           // the prior hardcoded 512 so a burst of never-finalizing forks between two finalize ticks cannot evict
           // a higher-ordinal staged entry about to finalize (which would force ml0 into a full-GSI resync).
@@ -1626,6 +1646,10 @@ object GlobalSnapshotConsensus {
                   // Task #12 slice 2b: the SAME staging map the consensus functions fill (above), read here at
                   // both finalize sinks to promote the finalized snapshot's accumulator into the served ring.
                   pendingAccumulatorsRef = pendingAccumulatorsRef,
+                  // 3c-A enabler — signed-bytes staging (same Ref the consensus functions stage into) + the served
+                  // signed-bytes store the finalize sink promotes into.
+                  pendingPostBytesRef = pendingPostBytesRef,
+                  signedBytesStore = signedBytesStore,
                   // Task #12 slice 2b: the served changeset ring the loop fills at both finalize sinks; a later
                   // slice wires `GlobalChangeSetService.make(recentFinalizedAccumulatorsRef.get)` to serve it.
                   recentFinalizedAccumulatorsRef = recentFinalizedAccumulatorsRef,
@@ -1871,6 +1895,7 @@ object GlobalSnapshotConsensus {
                   // Lets the daemon's validator-adopt path rekey a NON-producer's staged accumulator
                   // stripped->canonical so it promotes on finalize (complete served changeset ring).
                   pendingAccumulatorsRef = pendingAccumulatorsRef,
+                  pendingPostBytesRef = pendingPostBytesRef,
                   eventMempool = eventMempool,
                   dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data")),
                   enqueueAllowSpendBlock = enqueueAllowSpendBlock,

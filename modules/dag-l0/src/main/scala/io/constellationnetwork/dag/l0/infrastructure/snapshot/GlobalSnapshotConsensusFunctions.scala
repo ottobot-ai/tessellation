@@ -46,6 +46,7 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.transaction.Transaction
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelValidationType}
 import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
@@ -158,6 +159,14 @@ object GlobalSnapshotConsensusFunctions {
     // than the earlier arbitrary `.drop` size eviction that could discard a not-yet-finalized entry under the
     // depth-k (255) retention window + reorg churn (esp. now that EVERY node stages via the validator adopt path).
     pendingAccumulatorsRef: Ref[F, Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)]],
+    // 3c-A enabler (seal-time signed-bytes persistence) — STAGING map for the signed MPT byte map, mirroring
+    // `pendingAccumulatorsRef`. At the `overlay.commit` site the EXACT signed `postBytes` (the same
+    // `allEntriesAsBytesWithHandle(handle, ordinal)` `accept()` derived the signed `mptRoot` from) are staged keyed by
+    // `currentSnapshotHash`; `SnapshotLeaderLoop.recordFinalizedAccumulator` promotes the FINALIZED hash's bytes into
+    // the served signed-bytes store and watermark-prunes the rest. Same `(ordinal, value)` shape + cap eviction as the
+    // accumulator staging. Required param (no default — `Ref.of` is effectful): cl0/dl1/test sites pass
+    // `Ref.of(Map.empty)`; production passes the shared Ref from `GlobalSnapshotConsensus.make`.
+    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
     // Task #19 — backstop size cap on `pendingAccumulatorsRef`. Typed `nakamoto.staging-accumulators-cap` HOCON
     // value (`SharedConfig.nakamoto.stagingAccumulatorsCap`, default 2048 = 2× the served ring), threaded from
     // `GlobalSnapshotConsensus.make`. The steady-state bound is the finalize-sink watermark prune; this only caps a
@@ -843,6 +852,13 @@ object GlobalSnapshotConsensusFunctions {
         // it; under Passthrough this is a no-op (writes already committed inline). Failing to commit
         // here would leak the handle's accumulator (MultiBranch eviction would never see it).
         currentSnapshotHash <- hasher.hash(globalSnapshot)
+        // 3c-A enabler (seal-time postBytes): capture the EXACT signed byte map from the UNCOMMITTED handle — the same
+        // `allEntriesAsBytesWithHandle(handle, ordinal)` `accept()` derived the signed `mptRoot` from (GSAM:postBytes)
+        // — BEFORE `overlay.commit` below registers the branch. Staged keyed by `currentSnapshotHash` after the commit;
+        // only the FINALIZED hash's bytes are promoted to the served signed-bytes store, so a follower's
+        // `sidecarFreeMptRoot(served)` reproduces the signed root BY CONSTRUCTION (the finalize-time `mpt_snapshot_info`
+        // re-fold can diverge under MultiBranch — the 3c-A gap this closes).
+        stagedPostBytes <- overlay.allEntriesAsBytesWithHandle(overlayHandle, currentOrdinal)
         _ <- overlay.commit(
           overlayHandle,
           io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(currentSnapshotHash),
@@ -870,6 +886,21 @@ object GlobalSnapshotConsensusFunctions {
           val updated = staged.updated(currentSnapshotHash, (currentOrdinal, stateChangesAccumulator))
           if (updated.size > stagingAccumulatorsCap) {
             // Drop the `excess` entries with the smallest ordinal (ties broken by hash for determinism).
+            val excess = updated.size - stagingAccumulatorsCap
+            val toEvict = updated.toList.sortBy { case (h, (o, _)) => (o.value.value, h.value) }
+              .take(excess)
+              .map(_._1)
+              .toSet
+            updated.filterNot { case (h, _) => toEvict.contains(h) }
+          } else updated
+        }
+        // 3c-A enabler: stage the captured SIGNED bytes keyed by `currentSnapshotHash`, mirroring the accumulator
+        // staging above (same lowest-ordinal eviction backstop, same cap). `SnapshotLeaderLoop.recordFinalizedAccumulator`
+        // promotes the finalized hash's bytes to the served signed-bytes store and watermark-prunes the rest — so only a
+        // FINALIZED branch's signed bytes are ever served (a reorg loser's bytes never promote).
+        _ <- pendingPostBytesRef.update { staged =>
+          val updated = staged.updated(currentSnapshotHash, (currentOrdinal, stagedPostBytes))
+          if (updated.size > stagingAccumulatorsCap) {
             val excess = updated.size - stagingAccumulatorsCap
             val toEvict = updated.toList.sortBy { case (h, (o, _)) => (o.value.value, h.value) }
               .take(excess)
