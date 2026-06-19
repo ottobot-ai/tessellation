@@ -757,6 +757,15 @@ const testWithdrawDelegatedStake = async (urls, account, stakeHash) => {
     {
       globalL0Url: urls.globalL0Url,
       name: 'assertDelegatedStakeMovedToPending',
+      // WithdrawDelegatedStake events sit ~11+ ordinals in the consensus event-mempool before a
+      // producer drains them (asymmetric vs creates, which land in ~1 ordinal). The default
+      // maxOrdinalMisses=10 gives up ~1 ordinal BEFORE the withdrawal lands → spurious
+      // "Expected 1 active stakes but got 2" (the transient pre-withdrawal active set observed
+      // mid-poll; the state machine moves it to pending correctly once drained). Match the budget
+      // the sibling withdraw/update helpers (testUpdateDelegatedStake, waitForStakeWithdrawal) use.
+      maxOrdinalMisses: 40,
+      maxStalledChecks: 120,
+      interval: 5000,
     },
   )
   logWorkflow.info('Stake withdraw verified pending')
