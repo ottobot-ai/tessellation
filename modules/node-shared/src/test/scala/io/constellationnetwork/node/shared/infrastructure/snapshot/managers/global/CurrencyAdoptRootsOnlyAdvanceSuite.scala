@@ -136,7 +136,8 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
     mgKeyPair: KeyPair,
     blocks: SortedSet[BlockAsActiveTip] = SortedSet.empty,
     rewards: SortedSet[io.constellationnetwork.schema.transaction.RewardTransaction] = SortedSet.empty,
-    stateProof: CurrencySnapshotStateProof = CurrencySnapshotStateProof(Hash.empty, Hash.empty, None, None, None, None, None, None, None)
+    stateProof: CurrencySnapshotStateProof = CurrencySnapshotStateProof(Hash.empty, Hash.empty, None, None, None, None, None, None, None),
+    feeTransactions: Option[SortedSet[Signed[io.constellationnetwork.currency.dataApplication.FeeTransaction]]] = None
   )(implicit sp: SecurityProvider[IO], h: Hasher[IO]): IO[Signed[CurrencyIncrementalSnapshot]] = {
     val snapshot = CurrencyIncrementalSnapshot(
       SnapshotOrdinal.unsafeApply(snapOrdinal),
@@ -151,7 +152,7 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
       None,
       messages,
       None,
-      None,
+      feeTransactions,
       None,
       None,
       None,
@@ -159,6 +160,28 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
     )
     forAsyncHasher[IO, CurrencyIncrementalSnapshot](snapshot, mgKeyPair)
   }
+
+  /** A signed `FeeTransaction` source → destination of `amount` — the data-application fee a metagraph's ml0 deducts via
+    * `BalanceOpsManager.acceptFeeTxs`. Carried on-wire in `CurrencyIncrementalSnapshot.feeTransactions`, so gl0's adopt derivation can
+    * replay it deterministically. Signed by the SOURCE key (the adopt derivation replays already-accepted events without re-validating
+    * signatures).
+    */
+  private def signedFeeTransaction(
+    source: Address,
+    destination: Address,
+    amount: Long,
+    dataUpdateRef: Hash,
+    sourceKeyPair: KeyPair
+  )(implicit sp: SecurityProvider[IO], h: Hasher[IO]): IO[Signed[io.constellationnetwork.currency.dataApplication.FeeTransaction]] =
+    forAsyncHasher[IO, io.constellationnetwork.currency.dataApplication.FeeTransaction](
+      io.constellationnetwork.currency.dataApplication.FeeTransaction(
+        source = source,
+        destination = destination,
+        amount = io.constellationnetwork.schema.balance.Amount(NonNegLong.unsafeFrom(amount)),
+        dataUpdateRef = dataUpdateRef
+      ),
+      sourceKeyPair
+    )
 
   /** A signed plain transfer `source → destination` of `amount` (fee 0), parented at `emptyCurrency(metagraphIdentifier)` so the source ref
     * advances to ordinal 1 — the on-disk shape a fresh metagraph wallet's first tx carries. Signed by the SOURCE key (irrelevant to the
@@ -405,6 +428,99 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
         // The whole derived Info equals what the metagraph committed (root matched → derived adopted verbatim).
         result.map(_._2) == Some(expectedInfo)
       )
+  }
+
+  /** DATA-WITH-FEE correctness + determinism (the committee-state-diff / field-25 `MgBalances` fix).
+    *
+    * The metagraph's committed `balances` reflect a data-application FEE deducted by ml0 (`BalanceOpsManager.acceptFeeTxs`) — an effect gl0
+    * previously did NOT replay, so its `derivedBalancesProof =!= committedBalancesProof`, the per-field gate
+    * (`GlobalSnapshotStateChannelEventsProcessor.deriveAdoptedCurrencyInfo`) carried the node's OWN prior `balances` forward, and the fee
+    * never mirrored (data-with-fee shard imbalance). The fee tx IS on the wire (`CurrencyIncrementalSnapshot.feeTransactions`), so gl0 can
+    * now replay it deterministically and ADOPT the true fee-deducted balances.
+    *
+    * This asserts BOTH halves of the goal:
+    *   - (b) CORRECTNESS — gl0 commits the metagraph's TRUE fee-deducted `balances` (== the committed `balancesProof`), NOT the stale
+    *     prior.
+    *   - (a) CONSISTENCY / no path-dependence — the derivation is a pure function of (signed binary, prior). We run it twice with the SAME
+    *     finalized base prior but DIFFERENT node-local histories injected as the `currentBalances` accumulator (the only per-node-varying
+    *     input to `processCurrencySnapshots`); both nodes commit the byte-identical fee-deducted `balances`. (The pre-fix behavior would
+    *     instead commit each node's own carried-forward prior — here the prior is shared, but the regression guard below proves the gate
+    *     ADOPTS the derived value rather than the prior, i.e. the carry-forward path is no longer taken for the fee case.)
+    */
+  test("adopt path (data-with-fee): a metagraph FeeTransaction is replayed; gl0 ADOPTS the fee-deducted balances deterministically") {
+    res =>
+      implicit val (h, sp, j) = res
+      for {
+        processor <- mkProcessor
+        mgKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+        mgAddr = PublicKeyOps(mgKeyPair.getPublic).toAddress
+
+        sourceKp <- KeyPairGenerator.makeKeyPair[IO]
+        feeDestKp <- KeyPairGenerator.makeKeyPair[IO]
+        source = PublicKeyOps(sourceKp.getPublic).toAddress
+        feeDest = PublicKeyOps(feeDestKp.getPublic).toAddress
+
+        // Prior `Right` at ordinal 1 with a FUNDED source — gl0's pre-fee mirror of the metagraph balances.
+        priorBalances = SortedMap(source -> Balance(NonNegLong(100L)))(Address.OrderingInstance)
+        priorInfo = info(None).copy(balances = priorBalances)
+        firstIncremental <- signedIncremental(1L, Hash.empty, None, mgKeyPair)
+        firstHash <- firstIncremental.toHashed.map(_.hash)
+        prior: SortedMap[Address, CurrencySnapshotWithState] =
+          SortedMap(mgAddr -> (Right((firstIncremental, priorInfo)): CurrencySnapshotWithState))(Address.OrderingInstance)
+
+        // The adopted second incremental carries ONLY a data-application fee transaction (NO blocks/rewards) — the exact case the
+        // block/reward-only replay could not reproduce. ml0 deducted fee 40: source 100−40=60, feeDest 0+40=40.
+        feeTx <- signedFeeTransaction(source, feeDest, 40L, Hash("da7a" * 16), sourceKp)
+        expectedBalances = SortedMap(source -> Balance(NonNegLong(60L)), feeDest -> Balance(NonNegLong(40L)))(Address.OrderingInstance)
+        expectedInfo = priorInfo.copy(balances = expectedBalances)
+        committedProof <- expectedInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+
+        secondIncremental <- signedIncremental(
+          2L,
+          firstHash,
+          None,
+          mgKeyPair,
+          stateProof = committedProof,
+          feeTransactions = SortedSet(feeTx).some
+        )
+        secondBinary <- binaryOf(secondIncremental, firstHash, mgKeyPair)
+        adopted = SortedMap(mgAddr -> NonEmptyList.of(secondBinary))(Address.OrderingInstance)
+
+        // "Producer-role" node: derive with one node-local accumulator state.
+        producerResult <- processor.processCurrencySnapshots(
+          ordinal,
+          SortedMap(source -> Balance(NonNegLong(999L)))(Address.OrderingInstance), // node-local accumulator A (irrelevant to per-MG info)
+          prior,
+          adopted,
+          _ => None.pure[IO],
+          CurrencyAdoptionMode.AdoptFromSignedFields
+        )
+        // "Follower-role" node: SAME finalized base prior + SAME signed binary, DIFFERENT node-local accumulator state.
+        followerResult <- processor.processCurrencySnapshots(
+          ordinal,
+          SortedMap.empty[Address, Balance], // node-local accumulator B
+          prior,
+          adopted,
+          _ => None.pure[IO],
+          CurrencyAdoptionMode.AdoptFromSignedFields
+        )
+        producerCommitted = committedInfo(producerResult, mgAddr)
+        followerCommitted = committedInfo(followerResult, mgAddr)
+      } yield
+        expect.all(
+          // Commitment advanced to ordinal 2 (freeze stays dead).
+          producerCommitted.map(_._1) == Some(SnapshotOrdinal(NonNegLong(2L))),
+          // (b) CORRECTNESS: gl0 ADOPTED the metagraph's TRUE fee-deducted balances — the fee mirrored.
+          producerCommitted.map(_._2.balances) == Some(expectedBalances),
+          // The whole derived Info equals what the metagraph committed (root matched → adopted verbatim, not carried-forward).
+          producerCommitted.map(_._2) == Some(expectedInfo),
+          // REGRESSION GUARD: the committed balances are NOT the stale prior — the carry-forward path was NOT taken for the fee case.
+          producerCommitted.map(_._2.balances) != Some(priorBalances),
+          // (a) CONSISTENCY / no path-dependence: producer-role and follower-role nodes commit BYTE-IDENTICAL per-MG balances
+          // despite different node-local accumulator histories.
+          producerCommitted.map(_._2.balances) == followerCommitted.map(_._2.balances),
+          producerCommitted.map(_._2) == followerCommitted.map(_._2)
+        )
   }
 
   test("adopt path: derived-root verification — matches on valid stateProof, FALLS BACK to prior balances on tampered stateProof") { res =>

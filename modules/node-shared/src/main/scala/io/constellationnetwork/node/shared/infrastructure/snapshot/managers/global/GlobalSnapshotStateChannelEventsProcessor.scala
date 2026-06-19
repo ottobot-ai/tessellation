@@ -7,6 +7,7 @@ import cats.{Order, Parallel}
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.currency.dataApplication.FeeTransaction
 import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSnapshotSync
 import io.constellationnetwork.ext.cats.syntax.validated.validatedSyntax
@@ -369,9 +370,12 @@ object GlobalSnapshotStateChannelEventsProcessor {
         * and broke cl1 bootstrap — cl1 aligns its first currency state to gl0's `lastCurrencySnapshots(identifier)` Info,
         * `CurrencySnapshotProcessor.scala:355-373`, and cannot bootstrap from an empty balance map), gl0 now holds the FULL per-MG state:
         *   - `balances` — replay each accepted block's transactions (per-source `−amount −fee`, per-destination `+amount`, mirroring
-        *     `BlockAcceptanceLogic.processBalances`) then add the snapshot's GIVEN `rewards` (per-destination `+amount`, mirroring
-        *     `BalanceOpsManager.acceptRewardTxs`). Rewards are taken AS-GIVEN from `snapshot.value.rewards` — NOT recomputed; reward
-        *     recomputation is the consensus-derived divergence that froze the recreate path.
+        *     `BlockAcceptanceLogic.processBalances`), then the snapshot's GIVEN `rewards` (per-destination `+amount`, mirroring
+        *     `BalanceOpsManager.acceptRewardTxs`), then the snapshot's GIVEN `feeTransactions` (per-source `−amount`, per-destination
+        *     `+amount`, mirroring `BalanceOpsManager.acceptFeeTxs` — the data-with-fee effect). Rewards AND fee txs are taken AS-GIVEN from
+        *     the signed `snapshot.value` — NOT recomputed; recomputation is the consensus-derived divergence that froze the recreate path.
+        *     Replaying the on-wire fee txs is what lets the gate ADOPT the metagraph's true fee-deducted balances rather than carry a stale
+        *     prior. (Token-lock/allow-spend/cross-shard-spend balance effects still need data gl0 lacks — see `derivedBalancesE`.)
         *   - `lastTxRefs` — the last (highest-ordinal) `TransactionReference` per source across accepted blocks; fresh destinations seed
         *     `emptyCurrency(identifier)` (mirrors `BlockAcceptanceOpsManager.acceptTransactionRefs`).
         *   - `activeTokenLocks` / `lastTokenLockRefs` — accepted token-locks grouped by source, merged into prior, then EXPIRED locks
@@ -439,10 +443,16 @@ object GlobalSnapshotStateChannelEventsProcessor {
           artifact.tokenLockBlocks.toList.flatMap(_.toList).flatMap(_.value.tokenLocks.toSortedSet.toList)
         val acceptedAllowSpends: List[Signed[AllowSpend]] =
           artifact.allowSpendBlocks.toList.flatMap(_.toList).flatMap(_.value.transactions.toSortedSet.toList)
+        // Data-application fee transactions carried in the signed snapshot. These ARE on the wire
+        // (`CurrencyIncrementalSnapshot.feeTransactions`), so gl0 can replay them DETERMINISTICALLY — the missing piece
+        // for the data-with-fee balance effect (see `derivedBalancesE` below + `BalanceOpsManager.acceptFeeTxs`).
+        val acceptedFeeTxs: List[FeeTransaction] =
+          artifact.feeTransactions.toList.flatMap(_.toList).map(_.value)
 
-        // Balances: replay accepted block txs (BlockAcceptanceLogic.processBalances semantics) then GIVEN rewards
-        // (BalanceOpsManager.acceptRewardTxs semantics). Exact Amount arithmetic; on underflow/overflow the result will not
-        // match the committed stateProof and we fall back (see below) — we never throw here.
+        // Balances: replay accepted block txs (BlockAcceptanceLogic.processBalances semantics), then GIVEN rewards
+        // (BalanceOpsManager.acceptRewardTxs semantics), then GIVEN fee transactions (BalanceOpsManager.acceptFeeTxs
+        // semantics). Exact Amount arithmetic; on underflow/overflow the result will not match the committed stateProof
+        // and we fall back (see below) — we never throw here.
         def applyDelta(
           balances: Either[BalanceArithmeticError, SortedMap[Address, Balance]],
           addr: Address,
@@ -462,15 +472,27 @@ object GlobalSnapshotStateChannelEventsProcessor {
             val withDebit = applyDelta(applyDelta(acc, tx.source, _.minus(amount)), tx.source, _.minus(fee))
             applyDelta(withDebit, tx.destination, _.plus(amount))
           }
-          // NOTE: token-lock / allow-spend / unlock / fee-tx / cross-shard-spend BALANCE effects are intentionally
-          // NOT reproduced here. Matching ml0's `balances` byte-for-byte would mean re-running its FULL acceptance
-          // (currency-id filtering, epoch-based expiry, cross-shard spend-action data gl0 does not hold) — the thing
-          // execution-sharding exists to avoid. Instead the gate below adopts PER FIELD: gl0 commits each field it
-          // CAN reproduce (token-locks/allow-spends/refs/sync-view/messages — every one verified against the
-          // committee-attested proof) and carries `balances` forward for the ordinals it can't reproduce them.
-          artifact.rewards.foldLeft(afterTxs) { (acc, reward) =>
+          val afterRewards = artifact.rewards.foldLeft(afterTxs) { (acc, reward) =>
             val rewardAmount: Amount = reward.amount
             applyDelta(acc, reward.destination, _.plus(rewardAmount))
+          }
+          // GIVEN fee transactions (the data-with-fee effect). Mirror `BalanceOpsManager.acceptFeeTxs`: per-source
+          // `−amount`, per-destination `+amount`, taken AS-GIVEN from the signed `feeTransactions` (NOT re-derived from
+          // data updates — that is the metagraph's job; gl0 only replays the already-accepted, committed fee txs). Replaying
+          // these on-wire txs is what lets the per-field gate ADOPT the metagraph's true (fee-deducted) `balances` instead
+          // of carrying a stale prior forward — the fix for "data-with-fee never mirrors". Pure function of the signed
+          // binary + prior ⇒ split-safe (every gl0 node replays the identical fee txs).
+          //
+          // NOTE: token-lock / allow-spend / unlock / cross-shard-spend BALANCE effects remain intentionally NOT
+          // reproduced here — they need epoch-based expiry + cross-shard spend-action data gl0 does not hold (the thing
+          // execution-sharding exists to avoid). For a metagraph using ONLY transfers/rewards/fee-txs, `derivedBalances`
+          // now MATCHES the committed `balancesProof` and the gate adopts it; for one that ALSO moves balances via
+          // token-locks/allow-spends/spends, the gate still carries `balances` forward (last verified) for the ordinals it
+          // cannot reproduce — the pre-existing, documented boundary (no regression).
+          acceptedFeeTxs.foldLeft(afterRewards) { (acc, feeTx) =>
+            val feeAmount: Amount = feeTx.amount
+            val withDebit = applyDelta(acc, feeTx.source, _.minus(feeAmount))
+            applyDelta(withDebit, feeTx.destination, _.plus(feeAmount))
           }
         }
 
