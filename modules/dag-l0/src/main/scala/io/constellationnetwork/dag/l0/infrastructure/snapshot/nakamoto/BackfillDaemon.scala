@@ -114,18 +114,29 @@ object BackfillDaemon {
     def parseSnapshotWithContext(snap: pb.Snapshot): F[Option[(Signed[GlobalIncrementalSnapshot], Option[GlobalSnapshotInfo])]] =
       Async[F].delay {
         if (snap.payload.size() > 0) {
-          val payloadStr = snap.payload.toByteArray.map(_.toChar).mkString
-          (for {
-            json <- io.circe.parser.parse(payloadStr)
-            snapshotJson <- json.hcursor.get[io.circe.Json]("snapshot")
-            snapshot <- snapshotJson.as[Signed[GlobalIncrementalSnapshot]]
-          } yield {
-            val contextOpt = for {
-              ctxJson <- json.hcursor.get[io.circe.Json]("context").toOption
-              ctx <- ctxJson.as[GlobalSnapshotInfo].toOption
-            } yield ctx
-            (snapshot, contextOpt)
-          }).toOption
+          // Serve side encodes UTF-8 (ChainSyncServer); decode UTF-8 (a `map(_.toChar)` Latin-1 read
+          // corrupts any byte >= 0x80).
+          val payloadStr = new String(snap.payload.toByteArray, java.nio.charset.StandardCharsets.UTF_8)
+          io.circe.parser.parse(payloadStr).toOption.flatMap { json =>
+            // In-memory hits serve the `{"snapshot":…, "context":…}` envelope (ChainSyncServer ~L78);
+            // the disk/evicted fallback (~L126) and serveByRange serve the BARE
+            // `Signed[GlobalIncrementalSnapshot]`. Backfill walks into evicted history, which is
+            // disk-served slim — so we MUST tolerate both, or the cursor stalls at the first evicted
+            // snapshot and the node can never catch up (3-3 finalized fork via stalled backfill).
+            val wrapped = for {
+              snapshotJson <- json.hcursor.get[io.circe.Json]("snapshot").toOption
+              snapshot <- snapshotJson.as[Signed[GlobalIncrementalSnapshot]].toOption
+            } yield {
+              val contextOpt = for {
+                ctxJson <- json.hcursor.get[io.circe.Json]("context").toOption
+                ctx <- ctxJson.as[GlobalSnapshotInfo].toOption
+              } yield ctx
+              (snapshot, contextOpt)
+            }
+            wrapped.orElse(
+              json.as[Signed[GlobalIncrementalSnapshot]].toOption.map(s => (s, None: Option[GlobalSnapshotInfo]))
+            )
+          }
         } else None
       }
 
@@ -169,7 +180,7 @@ object BackfillDaemon {
     // Parse a BackfillSnapshot proto into domain types.
     def parseBackfillSnapshot(snap: pb.BackfillSnapshot): Option[Signed[GlobalIncrementalSnapshot]] =
       if (snap.payload.size() > 0) {
-        val payloadStr = snap.payload.toByteArray.map(_.toChar).mkString
+        val payloadStr = new String(snap.payload.toByteArray, java.nio.charset.StandardCharsets.UTF_8)
         io.circe.parser.decode[Signed[GlobalIncrementalSnapshot]](payloadStr).toOption
       } else None
 
