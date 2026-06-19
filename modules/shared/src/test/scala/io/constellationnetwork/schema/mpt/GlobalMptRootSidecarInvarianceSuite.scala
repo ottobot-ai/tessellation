@@ -13,6 +13,7 @@ import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.generators.addressGen
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.addressSetImmutableCodec
 
@@ -169,5 +170,27 @@ object GlobalMptRootSidecarInvarianceSuite extends MutableIOSuite {
         expect(nonSystem.contains(syncHex)) && // nonSystemNamespaceEntries KEEPS it (not a 03… sidecar)
         expect(!consensus.contains(syncHex)) && // consensusRootEntries DROPS it (observation-dependent, no per-field slot)
         expect.same(consensus.keySet, base.keySet) // every other user field survives untouched
+  }
+
+  /** 3c-A primitive guard (`MptStore.loadBytes`). Storing gl0's SIGNED byte map verbatim makes a follower's
+    * `sidecarFreeMptRoot(store.allEntriesAsBytes)` equal the producer's signed `stateProof.mptRoot` BY CONSTRUCTION — the property that
+    * makes the follow/resync verify gate tautological on honest input, replacing the drift-prone `syncFromGlobalSnapshotInfo` re-encode.
+    * See `docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A.
+    */
+  test("loadBytes stores signed bytes verbatim ⇒ sidecarFreeMptRoot(store) === signed mptRoot, by construction") { res =>
+    implicit val (h, _, j) = res
+    val gsi = sampleGsi
+    val ord = SnapshotOrdinal(NonNegLong(1L))
+    for {
+      signedBytes <- userBytes(gsi)
+      signedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](signedBytes)
+      producer <- InMemoryMerklePatriciaProducer.make[IO]()
+      store <- MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
+      _ <- store.loadBytes(signedBytes, ord)
+      stored <- store.allEntriesAsBytes
+      recomputed <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](stored)
+    } yield
+      expect.same(stored.keySet, signedBytes.keySet) && // verbatim: same key set, no codec re-encode
+        expect.same(recomputed, signedRoot) // ⇒ recomputed root === signed root, BY CONSTRUCTION (the 3c-A invariant)
   }
 }

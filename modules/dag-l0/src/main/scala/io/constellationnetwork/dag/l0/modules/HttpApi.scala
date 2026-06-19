@@ -68,45 +68,58 @@ object HttpApi {
     l0Seedlist: Option[Set[SeedlistEntry]],
     getLocalChainTip: Option[F[Option[ChainTip]]] = None,
     maybeMarkSeen: Option[Hash => F[Unit]] = None
-  ): F[HttpApi[F, R]] = {
+  ): F[HttpApi[F, R]] =
     // GL0 runs Nakamoto consensus — head may run ahead of the attestation-finalized ordinal held in `FinalityGate`. The
     // `FinalizedSnapshotReader.nakamoto` variant serves `/latest/combined` and its kin from the on-disk checkpoint at-or-below
     // finalized, so tentative (pre-finality) state never leaves the node via HTTP — that channel is reserved for sidecar gossip.
-    val finalizedReader = FinalizedSnapshotReader.nakamoto[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
-      FinalityGate[F],
-      combinedSnapshotCheckpointFileSystemStorage
-    )
-    SnapshotRoutes
-      .make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
-        storages.globalSnapshot,
-        storages.fullGlobalSnapshot.some,
-        "/global-snapshots",
-        storages.node,
-        HasherSelector[F],
-        sharedConfig.snapshotTimeoutsConfig,
-        finalizedReader
+    //
+    // 3c-A serve side (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A): a READ-ONLY `MptStateStorage` pointed at the SIGNED byte store
+    // (`<mptSnapshotInfoPath>_signed`, i.e. `mpt_snapshot_info_signed/<ordinal>`) — the SAME sibling directory the finalize sink in
+    // `GlobalSnapshotConsensus` writes (`signedBytesStore`; this `_signed` suffix MUST stay in sync with the writer there). NOT the
+    // producer's `mpt_snapshot_info/<ordinal>`: that store is the async finalize-time re-fold that can diverge from the signed root under
+    // MultiBranch, whereas the `_signed` store holds the EXACT bytes `accept()` derived the signed `mptRoot` from — so the served map
+    // reproduces the signed root BY CONSTRUCTION and the follower's verify gate passes without falling back to the legacy re-encode. It
+    // backs the additive `/latest/combined/mpt-entries` route, serving gl0's SIGNED MPT byte map at the finalized ordinal VERBATIM (no
+    // re-encode). Read-only access to the finality-gated files is race-free with the sink's writes. NOTE: era-gate is a follow-up — the
+    // route is purely additive (new endpoint), so it always serves for now.
+    FinalizedSnapshotReader
+      .nakamotoF[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
+        FinalityGate[F],
+        combinedSnapshotCheckpointFileSystemStorage,
+        fs2.io.file.Path(sharedConfig.mptSnapshotInfoPath.toString + "_signed")
       )
-      .map { snapshotRoutes =>
-        new HttpApi[F, R](
-          storages,
-          queues,
-          services,
-          programs,
-          privateKey,
-          environment,
-          selfId,
-          nodeVersion,
-          httpCfg,
-          sharedValidators,
-          delegatedStakingWithdrawalTimeLimit,
-          sharedConfig,
-          snapshotRoutes,
-          l0Seedlist,
-          getLocalChainTip,
-          maybeMarkSeen
-        ) {}
+      .flatMap { finalizedReader =>
+        SnapshotRoutes
+          .make[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
+            storages.globalSnapshot,
+            storages.fullGlobalSnapshot.some,
+            "/global-snapshots",
+            storages.node,
+            HasherSelector[F],
+            sharedConfig.snapshotTimeoutsConfig,
+            finalizedReader
+          )
+          .map { snapshotRoutes =>
+            new HttpApi[F, R](
+              storages,
+              queues,
+              services,
+              programs,
+              privateKey,
+              environment,
+              selfId,
+              nodeVersion,
+              httpCfg,
+              sharedValidators,
+              delegatedStakingWithdrawalTimeLimit,
+              sharedConfig,
+              snapshotRoutes,
+              l0Seedlist,
+              getLocalChainTip,
+              maybeMarkSeen
+            ) {}
+          }
       }
-  }
 }
 
 sealed abstract class HttpApi[

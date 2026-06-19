@@ -80,6 +80,15 @@ trait MptStore[F[_], K] {
     * compare roots. Byte-stream is the MPT canonical form; no decoding required.
     */
   def allEntriesAsBytes: F[Map[Hex, Array[Byte]]]
+
+  /** Load a pre-signed hex-keyed byte map VERBATIM at `ordinal` — the 3c-A "MPT is the state" primitive
+    * (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A). Unlike [[sync]]/[[syncFull]], which re-encode a typed `Map[K,V]` through the
+    * per-field `ImmutableCodec`, this stores the exact bytes that were signed (no re-encode). So a follower that loads gl0's served
+    * `stateProof`-bytes and recomputes `GlobalSnapshotInfo.sidecarFreeMptRoot(entries)` obtains the producer's signed `mptRoot` BY
+    * CONSTRUCTION — eliminating the `recomputed ≠ signed` drift the `syncFromGlobalSnapshotInfo` re-encode path exhibits. Mirrors
+    * [[syncFull]]'s clear→insert→persist→build→bookkeep tail, minus the codec round-trip.
+    */
+  def loadBytes(entries: Map[Hex, Array[Byte]], ordinal: SnapshotOrdinal): F[Unit]
   def deleteAbove(ordinal: SnapshotOrdinal): F[Unit]
 
   /** Capture a snapshot of all internal state (producer state + last synced ordinal). The returned savepoint can restore the store to this
@@ -280,6 +289,23 @@ object MptStore {
           _ <- producer.insertBytes(newEntries).void
           _ <- persistAsync(ordinal)
           _ <- build(ordinal)
+          _ <- lastSyncedOrdinalRef.set(Some(ordinal))
+        } yield ()
+
+    override def loadBytes(entries: Map[Hex, Array[Byte]], ordinal: SnapshotOrdinal): F[Unit] =
+      // 3c-A: store the SIGNED byte map verbatim — same clear→insert→persist→build→bookkeep tail as `syncFull`, but the input is the
+      // already-encoded `(Hex → bytes)` map (NO `toHexEntries` codec round-trip). `producer.insertBytes(...).void` matches `syncFull`;
+      // a partial/corrupt load is caught downstream by the follower's `sidecarFreeMptRoot(entries) === signed mptRoot` verify gate.
+      if (entries.isEmpty)
+        logger.info(s"[MptStore] loadBytes empty at ordinal=$ordinal, clearing") >>
+          clear >> lastSyncedOrdinalRef.set(Some(ordinal))
+      else
+        for {
+          _ <- logger.info(s"[MptStore] loadBytes ${entries.size} signed entries VERBATIM at ordinal=$ordinal (no re-encode)")
+          _ <- clear
+          _ <- producer.insertBytes(entries).void
+          _ <- persistAsync(ordinal)
+          _ <- build(ordinal).void
           _ <- lastSyncedOrdinalRef.set(Some(ordinal))
         } yield ()
 

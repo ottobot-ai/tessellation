@@ -10,6 +10,8 @@ import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo, SnapshotMetadata}
 import io.constellationnetwork.security.SecurityProvider
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.storages.MptStateStorage
 import io.constellationnetwork.security.signature.Signed
 
 import fs2.text
@@ -82,6 +84,45 @@ abstract class SnapshotClient[
           } yield tuple
         }
     }
+
+  /** 3c-A — fetch gl0's SIGNED MPT byte map at its latest finalized ordinal alongside the snapshot + its GSI
+    * (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A). The route returns the JSON triple `[ Signed[snapshot], snapshotInfo (GSI), Map[Hex,
+    * Array[Byte]] ]`. A follower loads the third element VERBATIM via `MptStore.loadBytes` (no re-encode), so its
+    * `sidecarFreeMptRoot(entries) === signed mptRoot` verify gate passes BY CONSTRUCTION — eliminating the `recomputed ≠ signed` drift the
+    * `syncFromGlobalSnapshotInfo` re-encode path exhibits. The GSI is carried through ONLY for `setForRecovery` (do NOT re-derive the root
+    * from it). Mirrors [[getLatest]]'s stream decode with a third element decoded by `MptStateStorage.mptEntriesDecoder` (the shared
+    * byte-map codec anchor).
+    */
+  def getLatestMptEntries: PeerResponse[F, (Signed[S], SI, Map[Hex, Array[Byte]])] = {
+    implicit val entriesDecoder: Decoder[Map[Hex, Array[Byte]]] = MptStateStorage.mptEntriesDecoder
+
+    PeerResponse.stream[F, (Signed[S], SI, Map[Hex, Array[Byte]])](uri => uri.addPath(s"$urlPrefix/latest/combined/mpt-entries"))(
+      client,
+      optionalSession
+    ) { body =>
+      body
+        .through(text.utf8.decode)
+        .compile
+        .string
+        .flatMap { json =>
+          for {
+            arr <- Async[F].fromEither(parser.decode[List[Json]](json))
+            tuple <- arr match {
+              case List(snapshotJson, stateJson, entriesJson) =>
+                for {
+                  snapshot <- Async[F].fromEither(snapshotJson.as[Signed[S]])
+                  state <- Async[F].fromEither(stateJson.as[SI])
+                  entries <- Async[F].fromEither(entriesJson.as[Map[Hex, Array[Byte]]])
+                } yield (snapshot, state, entries)
+              case other =>
+                Async[F].raiseError[(Signed[S], SI, Map[Hex, Array[Byte]])](
+                  new RuntimeException(s"Unexpected combined mpt-entries JSON structure: $other")
+                )
+            }
+          } yield tuple
+        }
+    }
+  }
 
   def get(ordinal: SnapshotOrdinal): PeerResponse[F, Signed[S]] = {
     import org.http4s.circe.CirceEntityCodec.circeEntityDecoder
