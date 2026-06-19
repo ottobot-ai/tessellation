@@ -454,7 +454,6 @@ object GlobalSnapshotAcceptanceManager {
 
             unexpiredStakes <- delegatedStakeStateManager
               .processExistingDelegatedStakes(
-                lastSnapshotContext,
                 epochProgress,
                 acceptedGlobalTokenLocks,
                 withdrawalTimeLimit

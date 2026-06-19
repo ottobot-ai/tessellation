@@ -23,7 +23,6 @@ import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
 
 trait DelegatedStakeStateManager[F[_]] {
   def processExistingDelegatedStakes(
-    lastSnapshotContext: GlobalSnapshotInfo,
     epochProgress: EpochProgress,
     acceptedTokenLocks: List[Signed[TokenLock]],
     withdrawalTimeLimit: EpochProgress
@@ -63,7 +62,6 @@ object DelegatedStakeStateManager {
   def make[F[_]: Async](reader: GlobalStateReader[F]): DelegatedStakeStateManager[F] = new DelegatedStakeStateManager[F] {
 
     override def processExistingDelegatedStakes(
-      lastSnapshotContext: GlobalSnapshotInfo,
       epochProgress: EpochProgress,
       acceptedTokenLocks: List[Signed[TokenLock]],
       withdrawalTimeLimit: EpochProgress
@@ -71,15 +69,18 @@ object DelegatedStakeStateManager {
       def isWithdrawalExpired(withdrawalEpoch: EpochProgress): Boolean =
         (withdrawalEpoch |+| withdrawalTimeLimit) <= epochProgress
 
-      val existingDelegatedStakes = lastSnapshotContext.activeDelegatedStakes.getOrElse(
-        SortedMap.empty[Address, SortedSet[DelegatedStakeRecord]]
-      )
-
-      val existingWithdrawals = lastSnapshotContext.delegatedStakesWithdrawals.getOrElse(
-        SortedMap.empty[Address, SortedSet[PendingDelegatedStakeWithdrawal]]
-      )
-
       for {
+        // §G5/#11 — read existing active stakes + withdrawals from the MPT (not the GSI
+        // `lastSnapshotContext.activeDelegatedStakes` / `.delegatedStakesWithdrawals`). This completes
+        // the GSI→MPT migration: the `existing` records returned here feed the active-REMOVAL half
+        // (`getUpdatedCreateDelegatedStakes`, via `PartitionedStakeUpdates.unexpiredCreateDelegatedStakes`),
+        // so it now reads the SAME MPT source as the sibling pending-withdrawal half
+        // (`getUpdatedWithdrawalDelegatedStakes`, which already point-reads `ActiveDelegatedStakes` from
+        // the MPT). When GSI≠MPT for an updated stake, the two halves operated on different record-sets,
+        // so an accepted withdrawal was never removed from the active set (active stayed at 2).
+        existingDelegatedStakes <- materializeActiveDelegatedStakesFromMpt
+        existingWithdrawals <- materializeDelegatedStakeWithdrawalsFromMpt
+
         hashedReplacementTokenLocks <- acceptedTokenLocks.filter(_.replaceTokenLockRef.isDefined).traverse(_.toHashed)
         replacementTokenLocks = hashedReplacementTokenLocks.mapFilter(tl => tl.replaceTokenLockRef.tupleRight(tl)).toMap
 

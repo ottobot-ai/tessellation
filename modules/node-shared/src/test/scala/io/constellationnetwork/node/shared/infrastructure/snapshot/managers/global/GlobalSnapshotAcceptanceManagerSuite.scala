@@ -146,6 +146,13 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
 
     for {
       keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      // Bind `address1` to this test's keypair so the seeded `delegatedStakesWithdrawals` map key matches the
+      // withdrawal records' `event.source`. The MPT-primary read path (`materializeDelegatedStakeWithdrawalsFromMpt`,
+      // post G5/#11) re-derives the per-address key from `record.event.value.source` (the staker), which is the same
+      // key the writer uses; the suite-level hardcoded `address1` differs from `keyPair.toAddress`, so leaving it
+      // unbound seeds internally-inconsistent data (map keyed by hardcoded addr, record sourced from keypair addr)
+      // that no production path produces. Mirrors every sibling test in this suite (e.g. "multiple addresses").
+      address1 = keyPair.getPublic.toAddress
 
       // Create token lock
       tokenLock <- mkTokenLock(keyPair, TokenLockAmount(100L), replaceTokenLockRef = None)
