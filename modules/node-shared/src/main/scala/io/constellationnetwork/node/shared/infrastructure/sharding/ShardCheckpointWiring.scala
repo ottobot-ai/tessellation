@@ -309,6 +309,10 @@ object ShardCheckpointWiring {
                       for {
                         roots <- GlobalStateConverter.currencySnapshotFieldRoots[F](SortedMap(mg -> next))
                         root <- Hasher[F].hash(roots) // (incrementalRoot, infoRoot) pair → single Some/None-invisible Hash (PIN-1)
+                        // DIAG: committee's attested per-sub-field root breakdown — match `root=` here to gl0's
+                        // `[ACCEPTANCE/ADOPT-VERIFY] attested=` line to pin the diverging half (inc vs info) + `Mg*` sub-field.
+                        cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> next))
+                        _ <- reExecDiagLogger.info(s"[REEXEC-FIELDS] mg=${mg.value.value.take(10)} root=${root.value.take(16)} $cmtDiag")
                         diff <- ChangeSet.currencyInfoChangeSet[F](mg, priorInfo, infoOf(next))
                       } yield Some((root, diff)): Option[(Hash, ChangeSet)]
                   case None =>

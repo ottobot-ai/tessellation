@@ -825,14 +825,17 @@ object GlobalSnapshotAcceptanceManager {
                           if (recomputed === attestedRoot)
                             (mg -> nextState).some.pure[F]
                           else
-                            loggerBundle.app
-                              .warn(
+                            for {
+                              // DIAG: gl0's reconstructed per-sub-field root breakdown — match `attested=` here to the committee's
+                              // `[REEXEC-FIELDS] root=` line to pin the exact diverging half (inc vs info) + `Mg*` sub-field.
+                              gl0Diag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> nextState))
+                              _ <- loggerBundle.app.warn(
                                 s"[ACCEPTANCE/ADOPT-VERIFY] ordinal=$ordinal mg=${mg.value.value.take(8)} per-MG root MISMATCH: " +
                                   s"attested=${attestedRoot.value.take(16)}... recomputed=${recomputed.value.take(16)}... — " +
                                   s"DROPPING this MG's currency advance (S(N) lags the committee producer's; leader re-offers). " +
-                                  s"diff(upserts=${diff.upserts.size},removals=${diff.removals.size})"
+                                  s"diff(upserts=${diff.upserts.size},removals=${diff.removals.size}) gl0Fields[$gl0Diag]"
                               )
-                              .as(none[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)])
+                            } yield none[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)]
                       } yield out
                   }
               }.map { verifiedPerMg =>

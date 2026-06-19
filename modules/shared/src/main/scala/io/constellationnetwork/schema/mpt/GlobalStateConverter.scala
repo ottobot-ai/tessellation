@@ -1328,6 +1328,33 @@ object GlobalStateConverter {
       ).tupled
     }
 
+  /** DIAGNOSTIC-ONLY (version-model per-MG-root debug): per-sub-field root breakdown of a per-MG currency root, so an ADOPT-VERIFY /
+    * re-exec root MISMATCH can be pinned to the EXACT diverging half (incremental vs info) and `Mg*` sub-field. NOT consensus — pure
+    * logging. Mirrors [[currencySnapshotFieldRoots]]'s byte path so committee + gl0 outputs are directly comparable.
+    */
+  def currencySnapshotFieldRootsDiag[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    data: SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
+  )(
+    implicit stateProofSelector: StateProofSelector
+  ): F[String] =
+    currencySnapshotEntryBytes[F](data).flatMap { typed =>
+      val entries = typed.toList
+      def rootFor(pred: GlobalStateFieldId => Boolean): F[Hash] =
+        entries.filter { case (k, _) => pred(k.fieldId) }.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }
+          .map(_.toMap)
+          .flatMap(fieldRootFromBytes[F])
+      def cnt(pred: GlobalStateFieldId => Boolean): Int = entries.count { case (k, _) => pred(k.fieldId) }
+      for {
+        incR <- rootFor(_ == GlobalStateFieldId.LastIncrementalCurrencySnapshots)
+        infoR <- rootFor(GlobalStateFieldId.infoSubFields.contains)
+        perSub <- GlobalStateFieldId.infoSubFields.toList.sortBy(_.toInt).traverse { s =>
+          rootFor(_ == s).map(r => s"${s.toInt}=${r.value.take(8)}(${cnt(_ == s)})")
+        }
+      } yield
+        s"inc=${incR.value.take(8)}(${cnt(_ == GlobalStateFieldId.LastIncrementalCurrencySnapshots)}) " +
+          s"info=${infoR.value.take(8)} | ${perSub.mkString(" ")}"
+    }
+
   /** Read-only capability over the unrolled per-metagraph `CurrencySnapshotInfo` partitions — just the prefix scan
     * [[reconstructCurrencyInfoFrom]] needs. Split out from [[CurrencyInfoMpt]] so read-only callers (reconstruction, getAll*) take only
     * this and cannot reach the write methods (compile-time bypass-proof). Both `MptStore` and `GlobalStateReader` already expose
