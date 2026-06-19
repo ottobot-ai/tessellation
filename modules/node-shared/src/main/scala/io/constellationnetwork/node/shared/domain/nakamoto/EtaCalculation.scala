@@ -6,9 +6,10 @@ import org.bouncycastle.crypto.digests.Blake2bDigest
 
 /** Chain-derived eta calculation following Bifrost/Cardano pattern.
   *
-  * Eta for rotation period N is derived from VRF outputs in the first 2/3 of rotation period N-1. Genesis eta is used for rotation period 0
-  * only (no predecessor period to derive from); period 1 derives from period 0's VRF outputs (the COMPUTED convention, #259). When the
-  * predecessor period has no VRF outputs yet (the period 0 → 1 warmup window) the derivation degenerates back to genesis eta.
+  * Eta for rotation period N>=2 is derived from VRF outputs in the first 2/3 of rotation period N-1. Periods 0 AND 1 use the
+  * genesis-derivable bootstrap eta `Blake2b(genesisEta ‖ period)` (distinct per period, no VRF-output dependency) — the Cardano/Praos
+  * bootstrap convention — so the first eta rotation (period 0 → 1) cannot fork on disagreement about period 0's still-unsettled VRF
+  * outputs. First VRF-folded eta is period 2.
   *
   * Rotation periods are keyed on **snapshot ordinal**, not slot — slots are LDD-paced and lumpy; ordinals are 1:1 with snapshots and give a
   * stable R that satisfies the Praos R ≥ 3·k₁ stability bound. See `docs/nakamoto/attestation-and-finality.md` §1.
@@ -44,14 +45,14 @@ object EtaCalculation {
 
   /** Determine which eta to use for a given ordinal.
     *
-    *   - Period 0: genesis eta (no predecessor period to derive from)
-    *   - Period N (N >= 1): eta derived from VRF outputs in first 2/3 of period N-1; falls back to genesis eta when period N-1 has no VRF
-    *     outputs yet (the period 0 → 1 warmup window or bootstrap edge cases)
+    *   - Periods 0 and 1: genesis-derivable bootstrap eta [[bootstrapEta]] = `Blake2b(genesisEta ‖ period)` (distinct, no VRF dependency)
+    *   - Period N (N >= 2): eta derived from VRF outputs in first 2/3 of period N-1; degenerate empty-source case falls back to
+    *     [[bootstrapEta]]
     *
-    * #259 — COMPUTED period-1 convention: period 1 is NOT special-cased to genesis. It computes `computeEta(genesisEta, 1,
-    * vrfOutputsForPeriod(0))` so this reference function agrees byte-for-byte with the canonical per-period eta resolved by
-    * [[EtaStateManager.getEta]] (which keys on `period <= 0`) and the wire / eligibility eta in `SnapshotLeaderLoop`. There is now a single
-    * eta convention across producer record, committee draw, wire, and follower adoption.
+    * Cardano/Praos bootstrap (supersedes the #259 "COMPUTED period-1" convention): periods 0 and 1 fold NO VRF outputs, so every node
+    * computes them identically from genesis and the first eta rotation cannot fork. This reference must agree byte-for-byte with the
+    * canonical per-period eta at every other site — [[EtaStateManager.getEta]], the producer/validator eta in `SnapshotLeaderLoop` /
+    * `NakamotoSyncDaemon`, and the committee draw — all of which now key on `period <= 1` and route periods 0/1 through [[bootstrapEta]].
     *
     * The caller must supply the VRF outputs from the chain for the relevant period. This method only handles the "which period and what
     * inputs" logic.
@@ -64,19 +65,23 @@ object EtaCalculation {
   ): Array[Byte] = {
     val period = rotationPeriod(ordinal, etaRotationSnapshots)
 
-    if (period <= 0) {
-      // Period 0 uses genesis eta (no predecessor period)
-      genesisEta
+    if (period <= 1) {
+      // Cardano/Praos bootstrap: periods 0 AND 1 are derived purely from genesis (no dependency on any
+      // period's VRF outputs), but DISTINCT per period via the folded period number. The first VRF-folded
+      // eta is period 2 — by then period 1 is deeply finalized and its first-2/3 VRF outputs are agreed
+      // cluster-wide, so the rotation cannot fork. (The prior #259 "COMPUTED period-1" convention folded
+      // period 0's UNSETTLED outputs here and forked at the 0→1 boundary — the ord≈R finalization stall.)
+      bootstrapEta(genesisEta, period)
     } else {
-      // Period N (>= 1): derive from VRF outputs in first 2/3 of period N-1
+      // Period N (>= 2): derive from VRF outputs in first 2/3 of period N-1
       val sourcePeriod = period - 1
       val vrfOutputs = lookupVrfOutputsForPeriod(sourcePeriod)
 
       if (vrfOutputs.isEmpty) {
-        // No blocks in source period — use genesis eta (degenerate / warmup case).
-        // Matches `SnapshotLeaderLoop`'s empty-`vrfOutputsForPeriod(period-1)` branch and
-        // `EtaStateManager.getEta`'s empty-chain-walk fallback.
-        genesisEta
+        // Source period has no VRF outputs — should not happen for N>=2 in a healthy chain (the source is
+        // finalized before this is read). Use the per-period genesis-derivable value, NOT raw genesisEta:
+        // a lagging node must not substitute a value a caught-up node won't reproduce.
+        bootstrapEta(genesisEta, period)
       } else {
         computeEta(genesisEta, period, vrfOutputs)
       }
@@ -106,6 +111,16 @@ object EtaCalculation {
     digest.doFinal(result, 0)
     result
   }
+
+  /** Bootstrap eta for the genesis-derivable rotation periods (0 and 1): `Blake2b-256(genesisEta ‖ period)` with NO VRF-output dependency.
+    * Distinct per period via the folded period number, yet computable by every node from genesis alone — so the first eta rotation (period
+    * 0 → 1) cannot fork on disagreement about period 0's (still-unsettled) VRF outputs. Implemented as [[computeEta]] with an empty output
+    * list, so it is byte-identical to the period >= 2 fold base. This is the Cardano/Praos bootstrap convention (first VRF-folded nonce at
+    * period 2). Callers MUST route periods 0 and 1 through this at EVERY eta site (producer, validator, committee draw, follower adopt,
+    * boundary write) or the cluster forks — see the per-site list in `docs/nakamoto/attestation-and-finality.md` §1.
+    */
+  def bootstrapEta(genesisEta: Array[Byte], period: Long): Array[Byte] =
+    computeEta(genesisEta, period, List.empty)
 
   /** Extract VRF outputs from a chain segment for a specific rotation period's first 2/3.
     *

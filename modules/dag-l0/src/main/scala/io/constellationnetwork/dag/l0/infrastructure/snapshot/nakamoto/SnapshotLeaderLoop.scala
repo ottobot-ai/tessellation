@@ -787,23 +787,27 @@ object SnapshotLeaderLoop {
                         myStake <- stakeRegistry.relativeStakeAt(selfId, lookbackPeriod)
 
                         // Chain-derived eta: deterministic from stored chain, no in-memory accumulator.
-                        // Period 0: genesis eta (constant). Period N>=1: derived from VRF outputs in period N-1.
-                        // All nodes seeing the same chain derive the same eta — no divergence.
+                        // Periods 0 and 1: genesis-derivable bootstrapEta (distinct per period, no VRF
+                        // dependency). Period N>=2: derived from VRF outputs in period N-1. All nodes
+                        // seeing the same chain derive the same eta — no divergence.
                         //
                         // Rotation period is keyed on **ordinal**, not slot — slots are LDD-paced and lumpy;
                         // ordinals are 1:1 with snapshots and give a stable R that satisfies the R ≥ 3·k₁
                         // bound. See `docs/nakamoto/attestation-and-finality.md` §1.
                         genesisEta <- epochStateRef.get.map(_.genesisEta)
                         eta <-
-                          if (currentPeriod <= 0) {
-                            Async[F].pure(genesisEta)
+                          if (currentPeriod <= 1) {
+                            // Cardano/Praos bootstrap: periods 0 and 1 are genesis-derivable (distinct, no
+                            // VRF-output dependency). First VRF-folded eta is period 2. Removes the period
+                            // 0→1 boundary fork (#259 folded period 0's unsettled outputs here).
+                            Async[F].pure(EtaCalculation.bootstrapEta(genesisEta, currentPeriod))
                           } else {
                             chainStore.vrfOutputsForPeriod(currentPeriod - 1, etaRotationSnapshots).map { chainOutputs =>
                               if (chainOutputs.nonEmpty) {
                                 EtaCalculation.computeEta(genesisEta, currentPeriod, chainOutputs.map(_._2))
                               } else {
-                                // No chain data yet for previous period — stay on genesis eta
-                                genesisEta
+                                // No chain data yet for previous period (>= 1) — per-period bootstrap value
+                                EtaCalculation.bootstrapEta(genesisEta, currentPeriod)
                               }
                             }
                           }

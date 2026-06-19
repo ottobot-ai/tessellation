@@ -36,10 +36,10 @@ import weaver.MutableIOSuite
   * etaStateManager.getEta(period.value).map(etaBytesToHash))` backed by a real [[EtaStateManager]] (MPT cache + chain-walk fallback). This
   * suite exercises the GSAM accept pipeline with both arrangements:
   *
-  *   1. `etaForPeriod = None` — reproduces the bug; eta = `Hash.empty`. 2. `etaForPeriod = Some(EtaStateManager-backed)` for period 0 — eta
-  *      \= `etaBytesToHash(genesisEta)` (NOT `Hash.empty`). 3. `etaForPeriod = Some(EtaStateManager-backed)` for period 1 (COMPUTED
-  *      convention, #259) and period 2 with non-empty chain walk — eta = `etaBytesToHash(EtaCalculation.computeEta(genesisEta, period,
-  *      vrfOutputs))` (NOT `Hash.empty`, NOT `etaBytesToHash(genesisEta)`).
+  *   1. `etaForPeriod = None` — reproduces the bug; eta = `Hash.empty`. 2. `etaForPeriod = Some(EtaStateManager-backed)` for periods 0 AND
+  *      1 (Cardano/Praos bootstrap) — eta = `etaBytesToHash(EtaCalculation.bootstrapEta(genesisEta, period))` (NOT `Hash.empty`, NOT raw
+  *      genesisEta, NOT a fold of period-0 outputs). 3. `etaForPeriod = Some(EtaStateManager-backed)` for period 2 with non-empty chain
+  *      walk — eta = `etaBytesToHash(EtaCalculation.computeEta(genesisEta, 2, vrfOutputs))` (the first VRF-folded eta).
   *
   * Arrangement (1) is load-bearing: it FAILS the post-fix expectation `eta != Hash.empty` if anyone re-introduces `etaForPeriod = None` at
   * a production GSAM construction site (caught by `expect.all(... !entry.map(_.eta).contains(Hash.empty))` in arrangements 2-3 if paired
@@ -67,9 +67,9 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
   // Small rotation period so the boundary fires at low ordinals.
   private val R: Long = 10L
 
-  // 5 synthetic VRF outputs for the chain-walk fallback. For period 0 / 1 the EtaStateManager
-  // bypasses the walk (returns genesisEta directly); for period ≥ 2 the walk feeds
-  // `EtaCalculation.computeEta` over these bytes.
+  // 5 synthetic VRF outputs for the chain-walk fallback. For periods 0 / 1 the EtaStateManager
+  // bypasses the walk (returns bootstrapEta(genesisEta, period) directly); for period ≥ 2 the walk
+  // feeds `EtaCalculation.computeEta` over these bytes.
   private val syntheticVrfOutputs: List[(Long, Array[Byte])] =
     (0L until 5L).toList.map(i => (i, Array.fill[Byte](16)((i * 17 + 1).toByte)))
 
@@ -146,13 +146,14 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
       )
   }
 
-  test("post-fix period 0: EtaStateManager-backed callback writes etaBytesToHash(genesisEta) at the boundary") { res =>
+  test("post-fix period 0: EtaStateManager-backed callback writes etaBytesToHash(bootstrapEta(genesisEta, 0)) at the boundary") { res =>
     implicit val (h, sp) = res
     // For period 0 (boundary ord 9) the EtaStateManager bypasses the chain walk and returns
-    // genesisEta directly per `EtaCalculation` convention. The wiring still goes through
-    // `etaBytesToHash` so the resulting Hash is the hex encoding of the 32-byte genesisEta —
-    // distinctly NOT `Hash.empty`.
+    // bootstrapEta(genesisEta, 0) per the Cardano/Praos bootstrap convention. The wiring still goes
+    // through `etaBytesToHash` so the resulting Hash is the hex encoding of that 32-byte value —
+    // distinctly NOT `Hash.empty` and NOT raw genesisEta.
     val chainWalk: Long => IO[List[(Long, Array[Byte])]] = (_: Long) => IO.pure(syntheticVrfOutputs)
+    val expectedEtaHash = SharedServices.etaBytesToHash(EtaCalculation.bootstrapEta(genesisEta, 0L))
     for {
       etaMgr <- EtaStateManager.make[IO](
         genesisEta = genesisEta,
@@ -167,24 +168,25 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
         entry.isDefined,
         // eta is NOT the sentinel `Hash.empty` — the wiring landed a real value.
         !entry.map(_.eta).contains(Hash.empty),
-        // For period 0 the EtaStateManager returns `genesisEta` (bypass per `EtaCalculation`); the
-        // boundary write packs it through `etaBytesToHash` so the hex matches the genesis seed.
-        entry.map(_.eta).contains(SharedServices.etaBytesToHash(genesisEta))
+        // For period 0 the EtaStateManager returns `bootstrapEta(genesisEta, 0)` (bypass per
+        // `EtaCalculation`); the boundary write packs it through `etaBytesToHash`.
+        entry.map(_.eta).contains(expectedEtaHash)
       )
   }
 
-  test("post-fix period 1 (COMPUTED convention #259): callback writes computeEta(genesisEta, 1, chainOutputs)") { res =>
+  test("post-fix period 1 (Cardano/Praos bootstrap): callback writes etaBytesToHash(bootstrapEta(genesisEta, 1))") { res =>
     implicit val (h, sp) = res
-    // R=10, ord 19 = period 1 closing boundary (19/10 == 1, 19 % 10 == 9 == R-1). #259 unification:
-    // period 1 is NOT special-cased to genesis — the EtaStateManager falls through to
-    // `chainWalkFallback(0L)` (source-period = currentPeriod-1 = 0) and computes
-    // `EtaCalculation.computeEta(genesisEta, 1, syntheticVrfOutputs.map(_._2))`. This is the byte-exact
-    // value the wire / eligibility / committee eta also computes for period 1, so producer record ==
-    // committee == wire == follower-adopt at period 1 (the divergence #259 closes).
+    // R=10, ord 19 = period 1 closing boundary (19/10 == 1, 19 % 10 == 9 == R-1). Bootstrap convention:
+    // period 1 is genesis-derivable and BYPASSES the chain walk — the EtaStateManager returns
+    // `EtaCalculation.bootstrapEta(genesisEta, 1)` (folds NO VRF outputs), even though `chainWalkFallback(0L)`
+    // would return non-empty period-0 outputs. This is the byte-exact value the wire / eligibility /
+    // committee eta also compute for period 1, so producer record == committee == wire == follower-adopt at
+    // period 1 — and the first eta rotation (0 → 1) cannot fork on period 0's still-unsettled outputs.
     val chainWalk: Long => IO[List[(Long, Array[Byte])]] =
       (sourcePeriod: Long) => if (sourcePeriod == 0L) IO.pure(syntheticVrfOutputs) else IO.pure(List.empty)
-    val expectedEtaBytes = EtaCalculation.computeEta(genesisEta, 1L, syntheticVrfOutputs.map(_._2))
-    val expectedEtaHash = SharedServices.etaBytesToHash(expectedEtaBytes)
+    val expectedEtaHash = SharedServices.etaBytesToHash(EtaCalculation.bootstrapEta(genesisEta, 1L))
+    // The value a period-0-output fold WOULD produce — period 1 must NOT equal this (proves the walk is bypassed).
+    val foldedFromPeriod0Hash = SharedServices.etaBytesToHash(EtaCalculation.computeEta(genesisEta, 1L, syntheticVrfOutputs.map(_._2)))
 
     for {
       etaMgr <- EtaStateManager.make[IO](
@@ -200,9 +202,11 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
         entry.isDefined,
         // eta is NOT `Hash.empty`.
         !entry.map(_.eta).contains(Hash.empty),
-        // eta is NOT the genesis fall-through — period 1 now computes from period-0 outputs.
+        // eta is NOT raw genesisEta — bootstrapEta(g,1) is distinct.
         !entry.map(_.eta).contains(SharedServices.etaBytesToHash(genesisEta)),
-        // eta is the deterministic `computeEta(genesisEta, 1, chainOutputs)` — the unified value.
+        // eta is NOT a fold of period-0 outputs — the walk is bypassed for period 1.
+        !entry.map(_.eta).contains(foldedFromPeriod0Hash),
+        // eta IS the deterministic genesis-derivable `bootstrapEta(genesisEta, 1)`.
         entry.map(_.eta).contains(expectedEtaHash)
       )
   }
@@ -251,15 +255,21 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
   // matches gl0's by construction.
   //
   // These two tests share one setup that reproduces the divergence: the period-2 boundary with an
-  // `etaForPeriod` callback whose chain walk is EMPTY (the follower's reality) ⇒ recompute yields
-  // `genesisEta`. gl0's authoritative value is the real `computeEta` output. The contrast is the whole
-  // bug: recompute (None) lands the wrong value; adopt (Some) lands gl0's.
+  // `etaForPeriod` callback whose chain walk is EMPTY (the follower's reality) ⇒ the N>=2 degenerate
+  // fallback yields `bootstrapEta(genesisEta, 2)`. gl0's authoritative value is the real `computeEta`
+  // output. The contrast is the whole bug: recompute (None) lands the wrong value; adopt (Some) lands gl0's.
 
   // gl0's authoritative period-2 eta (what a real producer with the VRF chain computes + commits).
   private val gl0AuthoritativeEtaHash: Hash =
     SharedServices.etaBytesToHash(EtaCalculation.computeEta(genesisEta, 2L, syntheticVrfOutputs.map(_._2)))
 
-  // A follower's `etaForPeriod`: empty chain walk ⇒ EtaStateManager falls through to `genesisEta`,
+  // The follower's divergent period-2 recompute value: empty chain walk ⇒ EtaStateManager's N>=2
+  // empty-source fallback returns bootstrapEta(genesisEta, 2), which is NOT gl0's authoritative value —
+  // this is the source of the #259 divergence.
+  private val followerBootstrapEta2Hash: Hash =
+    SharedServices.etaBytesToHash(EtaCalculation.bootstrapEta(genesisEta, 2L))
+
+  // A follower's `etaForPeriod`: empty chain walk ⇒ EtaStateManager falls through to bootstrapEta(genesisEta, 2),
   // which is NOT gl0's authoritative value for period ≥ 2 — this is the source of the #259 divergence.
   private def followerEtaCallback(implicit h: Hasher[IO]): IO[EtaPeriod => IO[Hash]] = {
     val emptyChainWalk: Long => IO[List[(Long, Array[Byte])]] = (_: Long) => IO.pure(List.empty)
@@ -270,7 +280,7 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
 
   test("#259 contrast: follower recompute (adoptedBoundaryEta=None) DIVERGES from gl0 at the period-2 boundary") { res =>
     implicit val (h, sp) = res
-    // R=10, ord 29 = period 2 closing boundary. Follower callback ⇒ empty walk ⇒ genesisEta.
+    // R=10, ord 29 = period 2 closing boundary. Follower callback ⇒ empty walk ⇒ bootstrapEta(genesisEta, 2).
     for {
       callback <- followerEtaCallback
       mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
@@ -278,8 +288,8 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
     } yield
       expect.all(
         entry.isDefined,
-        // The follower's recomputed eta is the genesis fall-through...
-        entry.map(_.eta).contains(SharedServices.etaBytesToHash(genesisEta)),
+        // The follower's recomputed eta is the N>=2 empty-source bootstrap fall-through...
+        entry.map(_.eta).contains(followerBootstrapEta2Hash),
         // ...which does NOT match gl0's authoritative value → this is exactly the divergence that
         // produced StateProofMismatch every period before the fix.
         !entry.map(_.eta).contains(gl0AuthoritativeEtaHash)
@@ -288,9 +298,9 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
 
   test("#259 fix: follower adopting gl0's eta (adoptedBoundaryEta=Some) MATCHES gl0 at the period-2 boundary") { res =>
     implicit val (h, sp) = res
-    // Same follower setup (empty walk ⇒ recompute would yield genesisEta), but now the verifier-replay
-    // path supplies gl0's authoritative eta from the artifact's wire field. The boundary entry must take
-    // the adopted value verbatim — overriding the (wrong) recompute — so the entry matches gl0's.
+    // Same follower setup (empty walk ⇒ recompute would yield bootstrapEta(genesisEta, 2)), but now the
+    // verifier-replay path supplies gl0's authoritative eta from the artifact's wire field. The boundary
+    // entry must take the adopted value verbatim — overriding the (wrong) recompute — so the entry matches gl0's.
     for {
       callback <- followerEtaCallback
       mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
@@ -300,9 +310,9 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
         entry.isDefined,
         // The boundary entry adopted gl0's authoritative eta...
         entry.map(_.eta).contains(gl0AuthoritativeEtaHash),
-        // ...and did NOT fall through to the follower's divergent genesis recompute. (genesisEta != the
-        // period-2 computeEta output, so these are distinct hashes — the adoption is load-bearing.)
-        !entry.map(_.eta).contains(SharedServices.etaBytesToHash(genesisEta))
+        // ...and did NOT fall through to the follower's divergent bootstrap recompute. (bootstrapEta(g,2) !=
+        // the period-2 computeEta output, so these are distinct hashes — the adoption is load-bearing.)
+        !entry.map(_.eta).contains(followerBootstrapEta2Hash)
       )
   }
 }

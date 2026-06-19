@@ -1185,15 +1185,18 @@ object NakamotoSyncDaemon {
       // (= bestTipOrdinal at production time, = N-1 for snap N) is the divisor input.
       // Period assignment must be a function of the snapshot itself so every honest
       // verifier reaches the same conclusion regardless of where their local bestTip is.
-      // Using `snap.ordinal` directly causes an off-by-one at every R boundary: the
-      // producer of ord=R uses (R-1)/R = period (R-1)/R → 0, but a naive verifier
-      // computes R/R = 1, expecting derived eta where the SlotCertificate carries
-      // genesisEta. This caused iter35's finalization stall at ord=99 (R=100 boundary).
-      // See `docs/nakamoto/attestation-and-finality.md` §1.
+      // Key on the PARENT ordinal (snap.ordinal - 1) to match the producer, which keys on
+      // its bestTip (= parent) ordinal — using `snap.ordinal` directly causes an off-by-one
+      // at every R boundary. Combined with the Cardano/Praos bootstrap (periods 0 and 1 =
+      // bootstrapEta, no VRF fold), the first rotation no longer depends on period-0 outputs
+      // at all. See `docs/nakamoto/attestation-and-finality.md` §1.
       currentPeriod = EtaCalculation.rotationPeriod(math.max(0L, snap.ordinal - 1), etaRotationSnapshots)
       eta <-
-        if (currentPeriod <= 0) {
-          Async[F].pure(genesisEta)
+        if (currentPeriod <= 1) {
+          // Cardano/Praos bootstrap: periods 0 and 1 are genesis-derivable (distinct, no VRF dependency).
+          // Every honest verifier computes the identical value with no chain-walk, so the period 0→1
+          // boundary can't fork on disagreement about period 0's VRF outputs (the ord≈R / iter35 wedge).
+          Async[F].pure(EtaCalculation.bootstrapEta(genesisEta, currentPeriod))
         } else {
           chainStore.vrfOutputsForPeriodFrom(currentPeriod - 1, etaRotationSnapshots, parentHash).flatMap { chainOutputs =>
             if (chainOutputs.nonEmpty) {
@@ -1215,8 +1218,8 @@ object NakamotoSyncDaemon {
                     )
                     .as(decoded)
                 case None =>
-                  // No embedded eta and no chain data — use genesis
-                  Async[F].pure(genesisEta)
+                  // No embedded eta and no chain data (period >= 2) — per-period bootstrap value
+                  Async[F].pure(EtaCalculation.bootstrapEta(genesisEta, currentPeriod))
               }
             }
           }

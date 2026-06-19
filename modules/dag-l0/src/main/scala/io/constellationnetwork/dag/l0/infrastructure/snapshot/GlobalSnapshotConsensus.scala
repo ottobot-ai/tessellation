@@ -1246,7 +1246,12 @@ object GlobalSnapshotConsensus {
           committeeEtaForOrdinal: (Long => F[Array[Byte]]) = (parentOrdinal: Long) => {
             val currentPeriod = io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
               .rotationPeriod(parentOrdinal, etaRotationSnapshots.toLong)
-            if (currentPeriod <= 0) epochStateRef.get.map(_.genesisEta)
+            // Cardano/Praos bootstrap: periods 0 and 1 genesis-derivable via bootstrapEta. The committee
+            // draw eta MUST match the producer/validator eta exactly — same convention, same sites.
+            if (currentPeriod <= 1)
+              epochStateRef.get.map(g =>
+                io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation.bootstrapEta(g.genesisEta, currentPeriod)
+              )
             else
               for {
                 genesis <- epochStateRef.get.map(_.genesisEta)
@@ -1255,7 +1260,8 @@ object GlobalSnapshotConsensus {
                 if (chainOutputs.nonEmpty)
                   io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
                     .computeEta(genesis, currentPeriod, chainOutputs.map(_._2))
-                else genesis
+                else
+                  io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation.bootstrapEta(genesis, currentPeriod)
           }
 
           _ <- nakLogger

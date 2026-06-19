@@ -30,33 +30,38 @@ object EtaCalculationSuite extends SimpleIOSuite {
     expect(EtaCalculation.twoThirdsCutoff(1, etaRotation) == 1000L)
   }
 
-  pureTest("period 0 uses genesis eta") {
+  pureTest("period 0 uses bootstrap eta (Cardano/Praos bootstrap)") {
+    // Period 0 is the genesis-derivable bootstrap eta `bootstrapEta(genesisEta, 0)` =
+    // computeEta(genesisEta, 0, List.empty) — NOT raw genesisEta — and folds NO VRF outputs.
     val eta = EtaCalculation.etaForOrdinal(100, etaRotation, genesisEta, _ => Nil)
-    expect(eta.sameElements(genesisEta))
-  }
-
-  pureTest("period 1 with empty period-0 outputs falls back to genesis eta (warmup)") {
-    // #259 COMPUTED convention: period 1 is no longer hard-coded to genesis; it derives from period 0's
-    // VRF outputs. With NO period-0 outputs the derivation degenerates back to genesis (warmup window).
-    val eta = EtaCalculation.etaForOrdinal(700, etaRotation, genesisEta, _ => Nil)
-    expect(eta.sameElements(genesisEta))
-  }
-
-  pureTest("period 1 derives from period 0 VRF outputs (COMPUTED convention, #259)") {
-    // Period 1 = ordinals [600, 1200); its source period is period 0 = [0, 600). With non-empty
-    // period-0 outputs the eta is `computeEta(genesisEta, 1, outputs)` — NOT genesis — matching the
-    // wire / eligibility / committee eta the rest of the system computes for period 1.
-    val fakeVrfOutputs = List(Array.fill(64)(0x01.toByte), Array.fill(64)(0x02.toByte))
-    val eta = EtaCalculation.etaForOrdinal(
-      700, // period 1
-      etaRotation,
-      genesisEta,
-      period => if (period == 0) fakeVrfOutputs else Nil
-    )
-    val expected = EtaCalculation.computeEta(genesisEta, 1, fakeVrfOutputs)
+    expect(eta.sameElements(EtaCalculation.bootstrapEta(genesisEta, 0))) &&
     expect(!eta.sameElements(genesisEta)) &&
-    expect(eta.sameElements(expected)) &&
     expect(eta.length == 32)
+  }
+
+  pureTest("period 1 uses bootstrap eta (Cardano/Praos bootstrap)") {
+    // Period 1 is also genesis-derivable: `bootstrapEta(genesisEta, 1)` = computeEta(genesisEta, 1,
+    // List.empty), with NO VRF-output dependency and DISTINCT from period 0 (H(g‖0) ≠ H(g‖1)).
+    val eta = EtaCalculation.etaForOrdinal(700, etaRotation, genesisEta, _ => Nil)
+    expect(eta.sameElements(EtaCalculation.bootstrapEta(genesisEta, 1))) &&
+    expect(!eta.sameElements(genesisEta)) &&
+    expect(!eta.sameElements(EtaCalculation.bootstrapEta(genesisEta, 0))) &&
+    expect(eta.length == 32)
+  }
+
+  pureTest("period 1 is INDEPENDENT of period 0 VRF outputs (bootstrap convention)") {
+    // The key new invariant (inverse of the old #259 COMPUTED-period-1 test): period 1 folds NO VRF
+    // outputs, so feeding DIFFERENT period-0 outputs leaves the period-1 eta UNCHANGED — it always
+    // equals `bootstrapEta(genesisEta, 1)`. This is what makes the first eta rotation (0 → 1) fork-proof.
+    val outputsA = List(Array.fill(64)(0x01.toByte), Array.fill(64)(0x02.toByte))
+    val outputsB = List(Array.fill(64)(0xaa.toByte), Array.fill(64)(0xbb.toByte))
+    val etaA = EtaCalculation.etaForOrdinal(700, etaRotation, genesisEta, period => if (period == 0) outputsA else Nil)
+    val etaB = EtaCalculation.etaForOrdinal(700, etaRotation, genesisEta, period => if (period == 0) outputsB else Nil)
+    val expected = EtaCalculation.bootstrapEta(genesisEta, 1)
+    expect(etaA.sameElements(expected)) &&
+    expect(etaB.sameElements(expected)) &&
+    expect(etaA.sameElements(etaB)) && // period 1 is invariant under period-0 outputs
+    expect(etaA.length == 32)
   }
 
   pureTest("period 2 derives from period 1 VRF outputs") {
@@ -72,9 +77,12 @@ object EtaCalculationSuite extends SimpleIOSuite {
     expect(eta.length == 32)
   }
 
-  pureTest("period 2 with no blocks in period 1 falls back to genesis eta") {
+  pureTest("period 2 with no blocks in period 1 falls back to bootstrap eta (not raw genesis)") {
+    // Degenerate empty-source case for N>=2: falls back to the per-period bootstrapEta(genesisEta, 2),
+    // NOT raw genesisEta — a lagging node must not substitute a value a caught-up node won't reproduce.
     val eta = EtaCalculation.etaForOrdinal(1300, etaRotation, genesisEta, _ => Nil)
-    expect(eta.sameElements(genesisEta))
+    expect(eta.sameElements(EtaCalculation.bootstrapEta(genesisEta, 2))) &&
+    expect(!eta.sameElements(genesisEta))
   }
 
   pureTest("computeEta is deterministic") {
@@ -152,23 +160,24 @@ object EtaCalculationSuite extends SimpleIOSuite {
     expect(eta.length == 32)
   }
 
-  pureTest("full flow: period 0 → 1 → 2 with chain data (COMPUTED convention, #259)") {
+  pureTest("full flow: period 0 → 1 → 2 with chain data (Cardano/Praos bootstrap)") {
     // Simulate chain: some snapshots in period 0, some in period 1
     val period0Outputs = (0 until 10).map(i => (i * 50L, Array.fill(64)(i.toByte))).toList
     val period1Outputs = (0 until 8).map(i => ((600 + i * 50).toLong, Array.fill(64)((i + 100).toByte))).toList
     val allOutputs = period0Outputs ++ period1Outputs
     val lookup: Long => List[Array[Byte]] = period => EtaCalculation.extractVrfOutputsForPeriod(allOutputs, period, etaRotation)
 
-    // Period 0: genesis eta (no predecessor). Period 1: derived from period 0's first 2/3 outputs
-    // (the #259 unification — no longer genesis). Period 2: derived from period 1's first 2/3 outputs.
+    // Periods 0 AND 1: genesis-derivable bootstrapEta (fold NO VRF outputs, distinct per period) — so
+    // the first rotation cannot fork on period 0's still-unsettled outputs. Period 2: first VRF-folded
+    // eta, derived from period 1's first 2/3 outputs.
     val eta0 = EtaCalculation.etaForOrdinal(100, etaRotation, genesisEta, lookup)
     val eta1 = EtaCalculation.etaForOrdinal(700, etaRotation, genesisEta, lookup)
     val eta2 = EtaCalculation.etaForOrdinal(1300, etaRotation, genesisEta, lookup)
-    expect(eta0.sameElements(genesisEta)) &&
-    expect(!eta1.sameElements(genesisEta)) &&
-    expect(eta1.sameElements(EtaCalculation.computeEta(genesisEta, 1, lookup(0)))) &&
+    expect(eta0.sameElements(EtaCalculation.bootstrapEta(genesisEta, 0))) &&
+    expect(eta1.sameElements(EtaCalculation.bootstrapEta(genesisEta, 1))) &&
+    expect(!eta0.sameElements(eta1)) && // distinct per period (H(g‖0) ≠ H(g‖1))
     expect(eta1.length == 32) &&
-    expect(!eta2.sameElements(genesisEta)) &&
+    expect(eta2.sameElements(EtaCalculation.computeEta(genesisEta, 2, lookup(1)))) &&
     expect(!eta2.sameElements(eta1)) &&
     expect(eta2.length == 32)
   }

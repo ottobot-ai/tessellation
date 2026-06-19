@@ -99,17 +99,15 @@ object EtaStateManager {
       new EtaStateManager[F] {
 
         def getEta(period: Long)(implicit hasher: Hasher[F]): F[Array[Byte]] =
-          // Unified per-period eta — COMPUTED convention (#259). Only period 0 is the true genesis
-          // case (no predecessor period to derive from). Period 1 falls through to the MPT-lookup →
-          // chain-walk path so it computes `EtaCalculation.computeEta(genesisEta, 1, vrfOutputsForPeriod(0))`
-          // BYTE-IDENTICALLY to the wire / eligibility eta in `SnapshotLeaderLoop` (which keys on
-          // `currentPeriod <= 0`) and to the committee draw. This makes producer-record == committee ==
-          // wire == follower-adopt at EVERY period: gl0 followers verifying the `historicalStakeSnapshots`
-          // boundary entry now reproduce gl0's committed eta at period 1 instead of diverging to genesis.
-          // The empty-chain-walk fallback below still returns `genesisEta`, matching `SnapshotLeaderLoop`'s
-          // empty-`vrfOutputsForPeriod(0)` branch — so the first eta rotation (period 0 → 1) is consistent
-          // across all sources even before any period-0 VRF outputs exist.
-          if (period <= 0L) genesisEta.pure[F]
+          // Cardano/Praos bootstrap (supersedes #259): periods 0 AND 1 are genesis-derivable via
+          // `EtaCalculation.bootstrapEta` (= Blake2b(genesisEta ‖ period), no VRF-output dependency), so
+          // every node computes them identically and the first eta rotation (period 0 → 1) cannot fork.
+          // Period >= 2 folds period N-1's VRF outputs (MPT-lookup → chain-walk), BYTE-IDENTICALLY to the
+          // wire / eligibility eta in `SnapshotLeaderLoop` / `NakamotoSyncDaemon` (which now key on
+          // `currentPeriod <= 1`) and to the committee draw — producer-record == committee == wire ==
+          // follower-adopt at EVERY period. The boundary writer materializes bootstrapEta for periods 0/1,
+          // so the MPT-hit branch (reachable for period >= 2 only now) stays consistent.
+          if (period <= 1L) EtaCalculation.bootstrapEta(genesisEta, period).pure[F]
           else {
             val etaPeriod = EtaPeriod(period)
             historicalStakeReader.lookup(etaPeriod).flatMap {
@@ -129,13 +127,16 @@ object EtaStateManager {
                     case None =>
                       chainWalkFallback(period - 1L).flatMap { chainOutputs =>
                         if (chainOutputs.isEmpty) {
-                          // Source-period not yet in store. Fall through to genesis — same
-                          // semantic as [[EtaCalculation.etaForOrdinal]]'s degenerate-case branch.
+                          // Source period (>= 1) not yet in store — should not happen for period >= 2 in a
+                          // healthy chain (the source is finalized before this is read). Fall back to the
+                          // per-period bootstrapEta, matching [[EtaCalculation.etaForOrdinal]]'s degenerate
+                          // branch. WARN (not debug): a silent genesis substitution here is exactly how a
+                          // lagging node diverges from a caught-up one.
                           logger
-                            .debug(
-                              s"getEta period=$period: MPT miss + empty chain walk for source=${period - 1L} — returning genesisEta"
+                            .warn(
+                              s"getEta period=$period: MPT miss + empty chain walk for source=${period - 1L} — falling back to bootstrapEta(period)"
                             )
-                            .as(genesisEta)
+                            .as(EtaCalculation.bootstrapEta(genesisEta, period))
                         } else {
                           val computed = EtaCalculation.computeEta(genesisEta, period, chainOutputs.map(_._2))
                           walkCacheRef.update(_.updated(etaPeriod, computed)) >>

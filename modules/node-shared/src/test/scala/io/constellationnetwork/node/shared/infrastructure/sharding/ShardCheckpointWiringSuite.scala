@@ -191,7 +191,7 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   // a no-op walk. During the ACTIVE window of period P (before the boundary MPT write at `ord % R == R-1`), the MPT lookup
   // MISSES on both paths, so:
   //   - leader  getEta(P≥2) = computeEta(genesis, P, realVrfOutputs)   (non-genesis)
-  //   - buggy follower getEta(P≥2) = genesisEta                        (empty walk → genesis)
+  //   - buggy follower getEta(P≥2) = bootstrapEta(genesis, P)          (empty walk → per-period bootstrap)
   // ⇒ different eta ⇒ different `shardDrawValue` ⇒ different committee SET ⇒ a follower (gl0 Download / RollbackLoader /
   // fork-recovery rebuild) ADOPTS / REJECTS checkpoints differently than the leader ⇒ StateProofMismatch split.
   //
@@ -237,9 +237,8 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   }
 
   // The leader's chain-walk fallback: returns the REAL VRF outputs for ANY source period ≥ 1 (so periods ≥ 2 compute a
-  // non-genesis eta), and empty for source period 0. With an empty source-period-0 walk period 1 falls back to genesisEta
-  // (the warmup branch — #259 COMPUTED convention: period 1 derives from period 0, which is empty here). Period 0 is the
-  // only intrinsic genesis case (short-circuits before the walk).
+  // non-genesis eta), and empty for source period 0. Periods 0 AND 1 are genesis-derivable bootstrapEta (Cardano/Praos
+  // bootstrap — they short-circuit before the walk and fold NO VRF outputs), so the chain walk only matters for period ≥ 2.
   private val realChainWalk: Long => IO[List[(Long, Array[Byte])]] = (sourcePeriod: Long) =>
     if (sourcePeriod >= 1L) IO.pure(realVrfOutputs) else IO.pure(List.empty[(Long, Array[Byte])])
 
@@ -275,12 +274,14 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
       buggy <- etaResolver(noopChainWalk)
       leaderEta2 <- leader(EtaPeriod(2L))
       buggyEta2 <- buggy(EtaPeriod(2L))
-      // The leader's period-2 eta IS the chain-walk recompute (not genesis); the buggy follower's IS genesis.
+      // The leader's period-2 eta IS the chain-walk recompute; the buggy follower's empty walk falls back
+      // to the per-period bootstrapEta(genesis, 2) (the N>=2 degenerate fallback — NOT raw genesis).
       expectedLeaderEta2 = EtaCalculation.computeEta(symmetryGenesisEta, 2L, realVrfOutputs.map(_._2))
+      expectedBuggyEta2 = EtaCalculation.bootstrapEta(symmetryGenesisEta, 2L)
     } yield
       expect.all(
         leaderEta2.sameElements(expectedLeaderEta2),
-        buggyEta2.sameElements(symmetryGenesisEta),
+        buggyEta2.sameElements(expectedBuggyEta2),
         !leaderEta2.sameElements(buggyEta2) // the asymmetry that drives the committee split
       )
   }
@@ -332,8 +333,11 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
     } yield expect(leaderSets == fixedSets, s"committee sets must match per shard: leader=$leaderSets fixed=$fixedSets")
   }
 
-  test("#261 eta axis — GENESIS-SAFE: leader, buggy follower, and fixed follower all agree at epochs 0 and 1") { res =>
+  test("#261 eta axis — BOOTSTRAP-SAFE: leader, buggy follower, and fixed follower all agree at epochs 0 and 1") { res =>
     implicit val (h, _sp) = res
+    // Cardano/Praos bootstrap: periods 0 AND 1 are genesis-derivable bootstrapEta(genesis, p) (fold NO VRF
+    // outputs, bypass the chain walk), so all three resolvers — regardless of their walk — agree byte-for-byte
+    // and draw identical committees. This is what makes the first eta rotation (0 → 1) fork-proof.
     for {
       leader <- etaResolver(realChainWalk)
       buggy <- etaResolver(noopChainWalk)
@@ -351,10 +355,11 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
     } yield
       checks.foldLeft(success) {
         case (acc, (p, le, be, fe, lc, bc, fc)) =>
+          val expectedBootstrap = EtaCalculation.bootstrapEta(symmetryGenesisEta, p)
           acc
-            .and(expect(le.sameElements(symmetryGenesisEta), s"leader eta at genesis period $p must be genesisEta"))
-            .and(expect(be.sameElements(symmetryGenesisEta), s"buggy follower eta at genesis period $p must be genesisEta"))
-            .and(expect(fe.sameElements(symmetryGenesisEta), s"fixed follower eta at genesis period $p must be genesisEta"))
+            .and(expect(le.sameElements(expectedBootstrap), s"leader eta at genesis period $p must be bootstrapEta(genesis, $p)"))
+            .and(expect(be.sameElements(expectedBootstrap), s"buggy follower eta at genesis period $p must be bootstrapEta(genesis, $p)"))
+            .and(expect(fe.sameElements(expectedBootstrap), s"fixed follower eta at genesis period $p must be bootstrapEta(genesis, $p)"))
             .and(expect(lc == bc && bc == fc, s"all committees must agree at genesis period $p: $lc / $bc / $fc"))
       }
   }
