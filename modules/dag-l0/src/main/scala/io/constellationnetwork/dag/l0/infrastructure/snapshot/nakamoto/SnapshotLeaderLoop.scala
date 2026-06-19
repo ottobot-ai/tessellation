@@ -156,6 +156,15 @@ object SnapshotLeaderLoop {
   ): Map[Hash, (SnapshotOrdinal, StateChangesAccumulator)] =
     staged.filter { case (_, (o, _)) => o.value.value > finalizedOrdinal.value.value }
 
+  /** 3c-A enabler — signed-bytes analogue of [[pruneStagedAtOrBelow]]. Keep only staged byte maps STRICTLY ABOVE the finalized tip (a reorg
+    * loser at-or-below the finalized height is dead and dropped). Pure; idempotent; never errors.
+    */
+  def pruneStagedPostBytesAtOrBelow(
+    staged: Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])],
+    finalizedOrdinal: SnapshotOrdinal
+  ): Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])] =
+    staged.filter { case (_, (o, _)) => o.value.value > finalizedOrdinal.value.value }
+
   /** Finalize-sink ring insert: put `acc` at `ordinal` into the served ordinal-keyed ring, trimmed to the last `recentAccumulatorsToKeep`
     * (dropping the lowest ordinals). The cap is the typed `nakamoto.changeset-ring-depth` HOCON value
     * (`SharedConfig.nakamoto.changesetRingDepth`, default 1024), threaded in from `GlobalSnapshotConsensus.make` — a pure transport memory
@@ -657,7 +666,7 @@ object SnapshotLeaderLoop {
         // back to the legacy GSI path (best-effort transport, never an incorrect adopt).
         pendingPostBytesRef.modify { staged =>
           val promoted = staged.get(finalizedHash).map { case (_, bytes) => bytes }
-          val pruned = staged.filter { case (_, (o, _)) => o.value.value > ordinal.value.value }
+          val pruned = pruneStagedPostBytesAtOrBelow(staged, ordinal)
           (pruned, promoted)
         }.flatMap {
           case Some(bytes) => signedBytesStore.writeState(ordinal, bytes)
