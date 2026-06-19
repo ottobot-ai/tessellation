@@ -133,49 +133,82 @@ object FinalizedSnapshotReader {
           }
       }
 
-    // 3c-A: append the signed MPT byte map to the SAME finalized combined pair `/latest/combined` serves. We resolve the servable
-    // checkpoint ordinal with the IDENTICAL fallback (`getLatestOrdinalAtOrBelow(finalized)`), read that checkpoint file's raw JSON
-    // (the 2-array `[snapshot, state]` — `fileStorage` holds Encoders only, so we splice the JSON verbatim rather than re-encode S/SI),
-    // and read `mptStateStorage.readState(thatSameOrdinal)`. All three elements are pinned to ONE ordinal so the follower's
-    // `loadBytes(entries, ord)` → `sidecarFreeMptRoot === snapshot.stateProof.mptRoot` holds by construction. `None` (→ 404, same as the
-    // combined path) when no store is wired, no servable checkpoint exists, or the signed byte file for that ordinal is absent.
+    // 3c-A: append the signed MPT byte map to the SAME finalized combined pair `/latest/combined` serves. Build the
+    // `[snapshot, state, entries]` triple at a SINGLE ordinal so the follower's `loadBytes(entries, ord)` →
+    // `sidecarFreeMptRoot === snapshot.stateProof.mptRoot` holds by construction. Reads the checkpoint file's raw JSON
+    // (the 2-array `[snapshot, state]` — `fileStorage` holds Encoders only, so we splice the JSON verbatim rather than
+    // re-encode S/SI) and `byteStore.readState(thatSameOrdinal)`. `None` when either file is absent at `ordinal`.
+    def buildTripleAt(byteStore: MptStateStorage[F], ordinal: SnapshotOrdinal): F[Option[Response[F]]] =
+      (fileStorage.getAsStream(ordinal), byteStore.readState(ordinal)).tupled.flatMap {
+        case (Some(combinedStream), Some(entries)) =>
+          combinedStream
+            .through(text.utf8.decode)
+            .compile
+            .string
+            .flatMap { combinedJson =>
+              Async[F].fromEither(parser.decode[List[Json]](combinedJson)).flatMap {
+                // The combined checkpoint file is the JSON 2-array `[snapshot, state]`. Append the signed entries as the
+                // third element to form the `[snapshot, state, entries]` triple the client (`SnapshotClient.getLatestMptEntries`)
+                // decodes positionally. The entries element uses the shared anchor codec so wire == on-disk byte-form.
+                case snapshotAndState if snapshotAndState.sizeIs == 2 =>
+                  val entriesJson: Json = entries.asJson(MptStateStorage.mptEntriesEncoder)
+                  val triple = Json.arr((snapshotAndState :+ entriesJson): _*)
+                  (respOf(triple).some: Option[Response[F]]).pure[F]
+                case other =>
+                  Async[F].raiseError[Option[Response[F]]](
+                    new RuntimeException(
+                      s"Unexpected combined checkpoint JSON structure at ordinal=$ordinal: expected a 2-element [snapshot, state] array, got ${other.size} elements"
+                    )
+                  )
+              }
+            }
+        // Either the combined checkpoint or the signed byte file is missing at this ordinal.
+        case _ => Option.empty[Response[F]].pure[F]
+      }
+
+    // Highest ordinal at-or-below `ceiling` that is present in BOTH the combined-checkpoint store AND the signed-bytes
+    // store. Belt-and-suspenders for `latestMptEntriesResponse`: the resolved checkpoint ordinal's signed bytes are
+    // guaranteed present by the signed store's contiguous retention on the HAPPY path, but a node that never staged that
+    // exact ordinal (mid-reorg gap) would otherwise 404. Walking down to the latest COMMON ordinal keeps the
+    // snapshot↔entries pairing intact (both served from the same ordinal) while letting the fast path still fire. Bounded:
+    // checkpoint ordinals are sparse (≤ `maxCheckpointsStored`) and signed ordinals are a contiguous recent window.
+    def latestCommonOrdinalAtOrBelow(byteStore: MptStateStorage[F], ceiling: SnapshotOrdinal): F[Option[SnapshotOrdinal]] =
+      (
+        fileStorage.listStoredOrdinals.flatMap(_.compile.toList),
+        byteStore.listStoredOrdinals
+      ).tupled.map {
+        case (checkpointOrdinals, signedOrdinals) =>
+          val signedSet = signedOrdinals.toSet
+          checkpointOrdinals
+            .filter(o => o.value.value <= ceiling.value.value && signedSet.contains(o))
+            .maxOption
+      }
+
     def latestMptEntriesResponse: F[Option[Response[F]]] =
       mptStateStorage match {
         case None => Option.empty[Response[F]].pure[F]
         case Some(byteStore) =>
           finalityGate.finalizedOrdinal.flatMap {
-            case None => Option.empty[Response[F]].pure[F]
+            case None            => Option.empty[Response[F]].pure[F]
             case Some(finalized) =>
+              // Resolve the servable checkpoint ordinal IDENTICALLY to `/latest/combined`
+              // (`getLatestOrdinalAtOrBelow(finalized)`), then build the triple there.
               fileStorage.getLatestOrdinalAtOrBelow(finalized).flatMap {
                 case None => Option.empty[Response[F]].pure[F]
                 case Some(servableOrdinal) =>
-                  (fileStorage.getAsStream(servableOrdinal), byteStore.readState(servableOrdinal)).tupled.flatMap {
-                    case (Some(combinedStream), Some(entries)) =>
-                      combinedStream
-                        .through(text.utf8.decode)
-                        .compile
-                        .string
-                        .flatMap { combinedJson =>
-                          Async[F].fromEither(parser.decode[List[Json]](combinedJson)).flatMap {
-                            // The combined checkpoint file is the JSON 2-array `[snapshot, state]`. Append the signed entries as the
-                            // third element to form the `[snapshot, state, entries]` triple the client (`SnapshotClient.getLatestMptEntries`)
-                            // decodes positionally. The entries element uses the shared anchor codec so wire == on-disk byte-form.
-                            case snapshotAndState if snapshotAndState.sizeIs == 2 =>
-                              val entriesJson: Json = entries.asJson(MptStateStorage.mptEntriesEncoder)
-                              val triple = Json.arr((snapshotAndState :+ entriesJson): _*)
-                              (respOf(triple).some: Option[Response[F]]).pure[F]
-                            case other =>
-                              Async[F].raiseError[Option[Response[F]]](
-                                new RuntimeException(
-                                  s"Unexpected combined checkpoint JSON structure at ordinal=$servableOrdinal: expected a 2-element [snapshot, state] array, got ${other.size} elements"
-                                )
-                              )
-                          }
-                        }
-                    // Either the combined checkpoint or the signed byte file is missing at the resolved ordinal (e.g. MPT cutoff pruned
-                    // the bytes while the checkpoint survives, or vice versa). Fail not-servable — the follower falls back to the legacy
-                    // combined path. The verify gate downstream NEVER adopts unverified state, so this is safe.
-                    case _ => Option.empty[Response[F]].pure[F]
+                  buildTripleAt(byteStore, servableOrdinal).flatMap {
+                    case some @ Some(_) => (some: Option[Response[F]]).pure[F]
+                    // The signed bytes (or the combined file) for the resolved checkpoint ordinal are absent — instead of
+                    // 404ing the follower onto the legacy (drift-prone) GSI path, walk DOWN to the latest ordinal present
+                    // in BOTH stores at-or-below `servableOrdinal` and serve that pair (same-ordinal, still finality-gated:
+                    // any common ordinal ≤ servableOrdinal ≤ finalized). The follower's verify gate is unchanged. Only if
+                    // NO common ordinal exists do we fail not-servable (then the legacy fallback applies, as before).
+                    case None =>
+                      latestCommonOrdinalAtOrBelow(byteStore, servableOrdinal).flatMap {
+                        case Some(commonOrdinal) if commonOrdinal =!= servableOrdinal => buildTripleAt(byteStore, commonOrdinal)
+                        // commonOrdinal == servableOrdinal would have already succeeded above; None ⇒ no coverage.
+                        case _ => Option.empty[Response[F]].pure[F]
+                      }
                   }
               }
           }

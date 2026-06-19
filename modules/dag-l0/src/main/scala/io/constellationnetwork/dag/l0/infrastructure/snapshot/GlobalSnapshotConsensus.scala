@@ -88,6 +88,19 @@ object GlobalSnapshotConsensus {
   // GL0 is Nakamoto-only. No env var check needed — the run-nakamoto CLI command
   // is the single source of truth. Tunables come from NAKAMOTO_* env vars below.
 
+  /** Contiguous-window retention depth (in ordinals) for the 3c-A SERVED signed-bytes store (`mpt_snapshot_info_signed`).
+    *
+    * The store is written at every finalized ordinal; without a cutoff it grows unbounded. We retain a CONTIGUOUS recent window (not the
+    * default logarithmic, which is gappy below the head) so the serve route's resolved ordinal — the latest combined checkpoint at-or-below
+    * finalized, hence recent — is always present and the 3c-A fast path never 404s into the legacy GSI re-encode path.
+    *
+    * 512 comfortably exceeds the head→finality gap (k₁ = 255 prod / 32 dev) plus one `checkpointIntervalEpochs` (=5) of ordinals (the most
+    * the resolved checkpoint can lag finalized), with margin for several ordinals per epoch. It also covers the combined store's own
+    * `maxCheckpointsStored × checkpointIntervalEpochs` = 320-epoch retention envelope. Byte maps are bounded, so 512 files is cheap. Not a
+    * consensus parameter — a follower past the window falls back to the legacy path, whose verify gate rejects any inconsistent base.
+    */
+  val signedBytesRetentionDepth: Int = 512
+
   /** Genesis time of the Nakamoto chain — Unix epoch milliseconds at which slot 0 starts.
     *
     * This is a per-cluster constant: every node in the same Nakamoto cluster MUST agree on the same value, otherwise their slot clocks
@@ -336,8 +349,27 @@ object GlobalSnapshotConsensus {
       // (`<...>_signed`). ONLY the finalize sink writes it (the signed bytes of a FINALIZED branch), so the byte map
       // served to followers reproduces the signed `mptRoot` BY CONSTRUCTION — never the producer's async finalize-time
       // re-fold (which can diverge under MultiBranch). The 3c-A serve route reads from this store.
+      //
+      // Retention: this store is written at EVERY finalized ordinal (one file per finalized ordinal) and was previously
+      // left to grow UNBOUNDED. We instead bound it with a CONTIGUOUS recent window rather than the default
+      // `LogarithmicOrdinalCutoff` (whose kept set has geometric GAPS below the head). The 3c-A serve route
+      // (`FinalizedSnapshotReader.latestMptEntriesResponse`) resolves the latest combined checkpoint AT-OR-BELOW the
+      // finalized ordinal (`CombinedSnapshotCheckpointFileSystemStorage.getLatestOrdinalAtOrBelow`) and reads that EXACT
+      // ordinal's signed bytes — a logarithmic gap at that resolved ordinal yields a 404 and forces followers onto the
+      // legacy (drift-prone) `syncFromGlobalSnapshotInfo` path. A contiguous window guarantees the resolved ordinal is
+      // present so the fast path always fires.
+      //
+      // Depth = `signedBytesRetentionDepth` (512). The resolved checkpoint ordinal is at-or-below `finalized` and at-most
+      // one `checkpointIntervalEpochs` (=5) behind it, so the window must cover the head→finality gap (k₁ = 32 dev / 255
+      // prod ordinals) plus a checkpoint interval, with margin. 512 > prod k₁ (255) + several `checkpointIntervalEpochs`
+      // worth of ordinals (ordinals can be multiple per epoch), comfortably covering the combined store's own
+      // `maxCheckpointsStored × checkpointIntervalEpochs` = 320-epoch retention envelope. Byte maps are bounded, so 512
+      // files is cheap. (`LogarithmicOrdinalCutoff` stays the default for all OTHER `MptStateStorage` users.)
       signedBytesStore <- io.constellationnetwork.security.mpt.storages.MptStateStorage
-        .make[F](fs2.io.file.Path(sharedCfg.mptSnapshotInfoPath.toString + "_signed"))
+        .make[F](
+          fs2.io.file.Path(sharedCfg.mptSnapshotInfoPath.toString + "_signed"),
+          io.constellationnetwork.cutoff.ContiguousOrdinalCutoff.make(GlobalSnapshotConsensus.signedBytesRetentionDepth)
+        )
         .toResource
       // SERVED ring: bounded ordinal-keyed ring of recent FINALIZED per-ordinal accumulators (the ml0-side
       // analogue of `recentFollowProjectionsRef`). `SnapshotLeaderLoop` promotes into it at the SAME finalize

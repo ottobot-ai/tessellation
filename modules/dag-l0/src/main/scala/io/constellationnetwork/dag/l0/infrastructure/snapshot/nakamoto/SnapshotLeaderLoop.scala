@@ -669,8 +669,18 @@ object SnapshotLeaderLoop {
           val pruned = pruneStagedPostBytesAtOrBelow(staged, ordinal)
           (pruned, promoted)
         }.flatMap {
-          case Some(bytes) => signedBytesStore.writeState(ordinal, bytes)
-          case None        => Async[F].unit
+          // Write the finalized signed bytes, then prune the store to its contiguous recent window. The store is written at every
+          // finalized ordinal and was previously UNBOUNDED — `MptStateStorage.writeState` does not self-prune. `applyCutoff` here is
+          // the ONLY prune site for the signed store; it uses the store's `ContiguousOrdinalCutoff` (wired in `GlobalSnapshotConsensus`)
+          // so the kept set is the contiguous `{ordinal-depth+1 .. ordinal}` window — guaranteeing the 3c-A serve route's resolved
+          // (recent) ordinal stays present while bounding disk growth. Prune is best-effort: a cutoff failure must not abort finalize,
+          // so it is swallowed (the next finalized ordinal retries).
+          case Some(bytes) =>
+            signedBytesStore.writeState(ordinal, bytes) >>
+              signedBytesStore
+                .applyCutoff(ordinal)
+                .handleErrorWith(e => logger.warn(e)(s"[3c-A] signed-bytes store cutoff failed at ordinal=$ordinal (non-fatal)"))
+          case None => Async[F].unit
         }
 
     // Task #12 staging-completeness fix — promote the accumulator of EVERY ordinal that this finalize tick made
