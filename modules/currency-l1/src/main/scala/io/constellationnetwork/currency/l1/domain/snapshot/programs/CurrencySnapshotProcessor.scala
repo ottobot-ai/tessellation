@@ -184,26 +184,11 @@ object CurrencySnapshotProcessor {
                         ) >>
                         1.tailRecM[F, SnapshotProcessingResult] { attempt =>
                           for {
-                            // 3c-A: pull gl0's SIGNED MPT byte map (+ snapshot + GSI) and store the bytes VERBATIM via
-                            // `loadBytes` (no `syncFromGlobalSnapshotInfo` re-encode → no `recomputed ≠ signed` drift). The
-                            // GSI rides along ONLY for `setForRecovery`. The verify gate STAYS as the corruption backstop;
-                            // it is folded onto `sidecarFreeMptRoot` (the SAME sidecar-free recompute the signed root uses)
-                            // instead of `getRootHashForOrdinal` (which includes the path-dependent SystemNamespace
-                            // sidecars), so the compare is apples-to-apples with the signed `stateProof.mptRoot`.
-                            canonical <- l0Service.pullLatestMptEntries
-                            (canonicalSnapshot, canonicalState, canonicalEntries) = canonical
+                            canonical <- l0Service.pullLatestSnapshot
+                            (canonicalSnapshot, canonicalState) = canonical
                             canonicalRef = SnapshotReference.fromHashedSnapshot(canonicalSnapshot)
-                            // The bytes are OPTIONAL: gl0's byte route 404s at a sparse combined-checkpoint ordinal, in which
-                            // case `pullLatestMptEntries` already degraded to legacy `pullLatestSnapshot` and returns `None`.
-                            // On `Some` load the SIGNED bytes VERBATIM (gate below passes by construction); on `None` fall back
-                            // to legacy `syncFromGlobalSnapshotInfo`. The verify gate BELOW stays unchanged as the corruption
-                            // backstop for the legacy recompute.
-                            _ <- canonicalEntries match {
-                              case Some(bytes) => mptStore.loadBytes(bytes, canonicalSnapshot.ordinal)
-                              case None        => mptStore.syncFromGlobalSnapshotInfo(canonicalState, canonicalSnapshot.ordinal)
-                            }
-                            afterBytes <- mptStore.underlying.entries
-                            recomputedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes).map(_.some)
+                            _ <- mptStore.syncFromGlobalSnapshotInfo(canonicalState, canonicalSnapshot.ordinal)
+                            recomputedRoot <- mptStore.underlying.getRootHashForOrdinal(canonicalSnapshot.ordinal).map(_.map(_.value))
                             signedRoot = canonicalSnapshot.signed.value.stateProof.mptRoot
                             result <-
                               if (recomputedRoot === signedRoot)

@@ -87,22 +87,6 @@ class MptStateStorage[F[_]: Async: JsonSerializer](
 
 object MptStateStorage {
 
-  /** Shared Circe codec for the MPT byte map `Map[Hex, Array[Byte]]` — the 3c-A wire contract. The gl0 serve route (`/latest/combined/
-    * mpt-entries`) encodes the signed entries with this; the follower client decodes them with this; so producer↔follower wire bytes are
-    * codec-identical to the on-disk persisted form (`stateEncoder`/`stateDecoder` use the same shape — hex-string key, Circe's native
-    * `Array[Byte]` JSON-number-array value, sorted by hex for determinism). Loading the decoded map via `MptStore.loadBytes` then makes a
-    * follower's `sidecarFreeMptRoot(store) === signed mptRoot` hold BY CONSTRUCTION. See `docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A.
-    */
-  implicit val mptEntriesEncoder: Encoder[Map[Hex, Array[Byte]]] =
-    Encoder.instance { map =>
-      Json.obj(map.toList.sortBy(_._1.value).map { case (hex, bytes) => hex.value -> bytes.asJson }: _*)
-    }
-
-  implicit val mptEntriesDecoder: Decoder[Map[Hex, Array[Byte]]] =
-    Decoder.instance { cursor =>
-      cursor.as[Map[String, Array[Byte]]].map(_.map { case (k, v) => Hex(k) -> v })
-    }
-
   def make[F[_]: Async: JsonSerializer](path: Path): F[MptStateStorage[F]] =
     new MptStateStorage[F](path).pure[F].flatTap(_.createDirectoryIfNotExists().rethrowT)
 

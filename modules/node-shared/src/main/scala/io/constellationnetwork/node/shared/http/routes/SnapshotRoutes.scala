@@ -153,20 +153,6 @@ final case class SnapshotRoutes[F[_]: Async: FinalityGate, S <: Snapshot: Encode
             }
           }
 
-        case GET -> Root / "latest" / "combined" / "mpt-entries" =>
-          // 3c-A serve side (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A). Sibling of `/latest/combined`: serves the JSON triple
-          // `[ Signed[S], SI, Map[Hex, Array[Byte]] ]` — the finalized snapshot, its GSI, and gl0's SIGNED MPT byte map at that SAME
-          // finalized ordinal, read VERBATIM (no re-encode). Finality-gated identically to `/latest/combined` via the reader; `None`
-          // (→ NotFound) when no servable snapshot exists, the signed byte file for that ordinal is absent, or on non-global layers
-          // (the reader returns `None` when it has no MPT byte store). A follower loads the third element through `MptStore.loadBytes`,
-          // so its `sidecarFreeMptRoot(entries) === signed mptRoot` verify gate passes by construction.
-          whenNodeReady {
-            finalizedReader.latestMptEntriesResponse.flatMap {
-              case Some(resp) => resp.pure[F]
-              case None       => NotFound()
-            }
-          }
-
         case GET -> Root / "latest" / "combined" / "checkpoint" / "info" =>
           // Checkpoint metadata is always disk-backed (even in BFT it points at the preserved on-disk checkpoint consumers pin to).
           // Nakamoto gates the response through finality; BFT returns unconditionally via the reader.

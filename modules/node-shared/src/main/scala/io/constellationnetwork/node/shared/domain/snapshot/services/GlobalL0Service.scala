@@ -28,7 +28,6 @@ import io.constellationnetwork.schema.nakamoto.follow.{GlobalChangeSetResponse, 
 import io.constellationnetwork.schema.peer.{L0Peer, PeerId}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
-import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 import io.constellationnetwork.validator.StateProofValidator
@@ -40,24 +39,6 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 trait GlobalL0Service[F[_]] {
   type LatestSnapshotTuple = (Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)
-
-  /** 3c-A — the latest finalized snapshot, its GSI, AND (when gl0 served them) gl0's SIGNED MPT byte map at that ordinal
-    * (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A). When present, the byte map is what gl0 actually signed; a follower stores it
-    * VERBATIM via `MptStore.loadBytes`, so its `sidecarFreeMptRoot(entries) === signed mptRoot` verify gate holds BY CONSTRUCTION (no
-    * `syncFromGlobalSnapshotInfo` re-encode → no `recomputed ≠ signed` drift). The GSI rides along ONLY for `setForRecovery`; never
-    * re-derive the root from it. Same majority-peer resolution as [[pullLatestSnapshot]].
-    *
-    * The bytes are `Option`: the served byte file (`mpt_snapshot_info/<ordinal>`, dense-but-log-pruned) may be ABSENT at the served
-    * combined-checkpoint ordinal (sparse) → the byte route 404s. On ANY error/404 [[pullLatestMptEntries]] degrades GRACEFULLY — it falls
-    * back to [[pullLatestSnapshot]] for `(snapshot, GSI)` and returns `None` for the bytes, so the consumer takes the legacy
-    * `syncFromGlobalSnapshotInfo` path (which still passes the verify gate by recompute). A 404 must NOT raise — that would abort the
-    * resync `tailRecM` and wedge recovery (every tick re-hits the same 404). This is a strict improvement: verbatim fast path when bytes
-    * are available, legacy otherwise.
-    */
-  type LatestMptEntriesTuple =
-    (Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo, Option[Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]])
-  def pullLatestMptEntries: F[LatestMptEntriesTuple]
-
   def pullLatestSnapshot: F[LatestSnapshotTuple]
   def pullLatestSnapshotFromRandomPeer: F[LatestSnapshotTuple]
   def pullGlobalSnapshots: F[Either[LatestSnapshotTuple, List[Hashed[GlobalIncrementalSnapshot]]]]
@@ -161,37 +142,6 @@ object GlobalL0Service {
 
       def pullLatestSnapshotFromRandomPeer: F[LatestSnapshotTuple] =
         globalL0ClusterStorage.getRandomPeer >>= pullLatestSnapshotFromPeer
-
-      // 3c-A — fetch the SIGNED MPT byte map (+ snapshot + GSI) from a majority-aligned peer when one is configured, else a
-      // random peer (same resolution rationale as `getChangeSetSince`: a majority peer's finalized state holds the served
-      // bytes for the ordinal the follower is converging to). The consumer's `sidecarFreeMptRoot(entries) === signed mptRoot`
-      // verify gate is the safety backstop — a peer serving bytes inconsistent with its own signed root is caught there and
-      // re-pulled, never adopted. The snapshot signature is checked here (`toHashedWithSignatureCheck`) exactly as the
-      // snapshot-only pull does.
-      //
-      // The served byte file (`mpt_snapshot_info/<ordinal>`, dense-but-log-pruned) may be ABSENT at the served combined-checkpoint
-      // ordinal (sparse) → the route 404s. So the byte-route fetch is wrapped in `handleErrorWith` EXACTLY like the sibling fetches
-      // (`getLatestFollowSlice`/`pullGlobalSnapshot`): on ANY error/404 we DO NOT raise (that would abort the consumer's resync
-      // `tailRecM` and deterministically wedge recovery — every tick re-hits the same 404). Instead we degrade to the legacy path:
-      // `pullLatestSnapshot` supplies `(snapshot, GSI)` and the bytes become `None`, so the consumer rebuilds the MPT via
-      // `syncFromGlobalSnapshotInfo` (its verify gate then recomputes the corruption backstop). On success the bytes are `Some`.
-      def pullLatestMptEntries: F[LatestMptEntriesTuple] =
-        resolveFollowFetchPeer.flatMap { l0Peer =>
-          l0GlobalSnapshotClient.getLatestMptEntries(l0Peer).flatMap {
-            case (snapshot, state, entries) =>
-              HasherSelector[F].withCurrent { implicit hasher =>
-                snapshot.toHashedWithSignatureCheck
-              }
-                .flatMap(_.liftTo[F])
-                .map((_, state, entries.some))
-          }
-        }.handleErrorWith { e =>
-          logger
-            .warn(e)(
-              "Failure pulling latest MPT byte map (route absent/404 at sparse ordinal?), falling back to legacy pullLatestSnapshot"
-            ) >>
-            pullLatestSnapshot.map { case (snapshot, state) => (snapshot, state, none[Map[Hex, Array[Byte]]]) }
-        }
 
       def pullGlobalSnapshot(hash: Hash): F[Option[Hashed[GlobalIncrementalSnapshot]]] =
         pullGlobalSnapshot(l0GlobalSnapshotClient.get(hash)).handleErrorWith { e =>
@@ -393,19 +343,13 @@ object GlobalL0Service {
         ).forallM(identity)
       }
 
-      private def stateProofValidation(
-        snapshot: Hashed[GlobalIncrementalSnapshot],
-        info: GlobalSnapshotInfo,
-        entries: Map[Hex, Array[Byte]]
-      )(
+      private def stateProofValidation(snapshot: Hashed[GlobalIncrementalSnapshot], info: GlobalSnapshotInfo)(
         implicit hasher: Hasher[F]
       ): F[Boolean] =
-        // 3c-A: load the SIGNED byte map VERBATIM (no `syncFromGlobalSnapshotInfo` re-encode), then validate. The validator
-        // uses the stateful producer which requires the trie to be built at the correct ordinal; `loadBytes` does that
-        // (clear→insert→build→commit). Since the stored bytes ARE what was signed, the validator's recomputed root matches
-        // the snapshot's signed `stateProof.mptRoot` by construction on honest input — a corrupt/truncated transfer still
-        // fails here. The GSI `info` is the validator's expected-state input only; it is never re-encoded into the store.
-        mptStore.loadBytes(entries, snapshot.ordinal) >>
+        // Sync the MPT store to match the snapshot's state (typed scodec — no JSON blob
+        // intermediate), then validate. Validator uses the stateful producer which requires
+        // the trie to be built at the correct ordinal.
+        mptStore.syncFromGlobalSnapshotInfo(info, snapshot.ordinal) >>
           validator
             .validate(snapshot, info)
             .flatTap(v => logger.debug(s"Failed StateProofValidation: $v").whenA(v.isInvalid))
