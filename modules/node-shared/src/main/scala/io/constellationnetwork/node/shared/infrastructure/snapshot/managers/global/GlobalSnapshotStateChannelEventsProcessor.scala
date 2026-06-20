@@ -19,6 +19,7 @@ import io.constellationnetwork.node.shared.domain.statechannel._
 import io.constellationnetwork.node.shared.infrastructure.snapshot.CurrencySnapshotContextFunctions
 import io.constellationnetwork.schema.ID.{Id, IdOps}
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.artifact.TokenUnlock
 import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
 import io.constellationnetwork.schema.currencyMessage._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
@@ -369,13 +370,23 @@ object GlobalSnapshotStateChannelEventsProcessor {
         * '''gl0 MAINTAINS + VALIDATES the metagraph currency state.''' Unlike the earlier roots-only variant (which emptied balances/refs
         * and broke cl1 bootstrap — cl1 aligns its first currency state to gl0's `lastCurrencySnapshots(identifier)` Info,
         * `CurrencySnapshotProcessor.scala:355-373`, and cannot bootstrap from an empty balance map), gl0 now holds the FULL per-MG state:
-        *   - `balances` — replay each accepted block's transactions (per-source `−amount −fee`, per-destination `+amount`, mirroring
-        *     `BlockAcceptanceLogic.processBalances`), then the snapshot's GIVEN `rewards` (per-destination `+amount`, mirroring
-        *     `BalanceOpsManager.acceptRewardTxs`), then the snapshot's GIVEN `feeTransactions` (per-source `−amount`, per-destination
-        *     `+amount`, mirroring `BalanceOpsManager.acceptFeeTxs` — the data-with-fee effect). Rewards AND fee txs are taken AS-GIVEN from
-        *     the signed `snapshot.value` — NOT recomputed; recomputation is the consensus-derived divergence that froze the recreate path.
-        *     Replaying the on-wire fee txs is what lets the gate ADOPT the metagraph's true fee-deducted balances rather than carry a stale
-        *     prior. (Token-lock/allow-spend/cross-shard-spend balance effects still need data gl0 lacks — see `derivedBalancesE`.)
+        *   - `balances` — replay, in the metagraph's `CurrencySnapshotAcceptanceManager.accept` order: each accepted block's transactions
+        *     (per-source `−amount −fee`, per-destination `+amount`, mirroring `BlockAcceptanceLogic.processBalances`), then the snapshot's
+        *     GIVEN `rewards` (per-destination `+amount`, mirroring `BalanceOpsManager.acceptRewardTxs`), then the snapshot's GIVEN
+        *     `feeTransactions` (per-source `−amount`, per-destination `+amount`, mirroring `BalanceOpsManager.acceptFeeTxs` — the
+        *     data-with-fee effect), then the snapshot's GIVEN token-locks + token-unlocks (per-source `−(TokenLockAmount + TokenLockFee)`
+        *     for each newly-accepted lock, `+TokenLockAmount` refund for each prior lock now expired and for each manual `TokenUnlock`,
+        *     mirroring `TokenLockOpsManager.updateBalancesByTokenLocks`), then the snapshot's GIVEN allow-spends (per-source `−(SwapAmount
+        *     + AllowSpendFee)` for each unexpired incoming/prior allow-spend, `+SwapAmount` refund for each expired one, mirroring
+        *     `AllowSpendOpsManager.updateCurrencyBalancesByAllowSpends`). Rewards, fee txs, token-locks, unlocks AND allow-spends are taken
+        *     AS-GIVEN from the signed `snapshot.value` — NOT re-validated, NOT recomputed; recomputation is the consensus-derived
+        *     divergence that froze the recreate path. Replaying these on-wire events is what lets the gate ADOPT the metagraph's true
+        *     balances rather than carry a stale prior — the fix that unfreezes shard adoption at the token-locks workflow. The expiry epoch
+        *     is the GIVEN `globalSyncView.epochProgress` (== ml0's `lastGlobalSnapshotEpochProgress`), so it is split-safe. DOCUMENTED
+        *     RESIDUAL: cross-shard SPEND-TRANSACTION balance effects are intentionally NOT replayed — the spend input is
+        *     global-snapshot-sourced (not in this MG's own incremental), so reproducing it here would break the pure `(snapshot, prior)`
+        *     split-safety; `balances` carries forward (last verified) only for the ordinals a spend-action shaped (see
+        *     `derivedBalancesWithLocksAndSpendsE`).
         *   - `lastTxRefs` — the last (highest-ordinal) `TransactionReference` per source across accepted blocks; fresh destinations seed
         *     `emptyCurrency(identifier)` (mirrors `BlockAcceptanceOpsManager.acceptTransactionRefs`).
         *   - `activeTokenLocks` / `lastTokenLockRefs` — accepted token-locks grouped by source, merged into prior, then EXPIRED locks
@@ -398,9 +409,10 @@ object GlobalSnapshotStateChannelEventsProcessor {
         * `snapshot.value.stateProof` FIELD BY FIELD. Each of the 9 fields is adopted iff ITS proof component matches; on a per-field
         * mismatch that field alone is carried forward from `lastState` (kept at its last VERIFIED value) and a LOUD warn logs the
         * committed-vs-derived proof pair. This keeps fields gl0 CAN reproduce (tx-refs, token-locks, messages, sync-view) fresh even when a
-        * field it CANNOT fully reproduce (`balances` shaped by cross-shard spend-actions / fee deduction) diverges. The ordinal still
-        * advances at the call site (`processCurrencySnapshots` commits `Right((snapshot, info))`, ordinal taken from `snapshot`), so the
-        * freeze stays dead while gl0 never commits an UNVERIFIED field value. The global snapshot is never crashed.
+        * field it CANNOT fully reproduce (`balances` shaped by cross-shard SPEND-ACTIONS — the documented residual; fee deduction,
+        * token-locks and allow-spends ARE now reproduced) diverges. The ordinal still advances at the call site (`processCurrencySnapshots`
+        * commits `Right((snapshot, info))`, ordinal taken from `snapshot`), so the freeze stays dead while gl0 never commits an UNVERIFIED
+        * field value. The global snapshot is never crashed.
         *
         * CONSUMER CAVEAT: downstream consensus readers treat parts of this mirror as authoritative — `si.balances` feeds cross-metagraph
         * spend-action validation (`GlobalSnapshotAcceptanceManager.currencyBalances`), `activeTokenLocks` feeds token-lock balance deltas
@@ -448,6 +460,11 @@ object GlobalSnapshotStateChannelEventsProcessor {
         // for the data-with-fee balance effect (see `derivedBalancesE` below + `BalanceOpsManager.acceptFeeTxs`).
         val acceptedFeeTxs: List[FeeTransaction] =
           artifact.feeTransactions.toList.flatMap(_.toList).map(_.value)
+        // Manual token-unlocks carried in the signed snapshot's `artifacts` (the exact `tokenUnlocks` collect ml0 runs in
+        // `CurrencySnapshotAcceptanceManager.accept`). On the wire (`CurrencyIncrementalSnapshot.artifacts`), so gl0 replays
+        // their `+TokenLockAmount` refund DETERMINISTICALLY (see `updateBalancesByTokenLocks` mirror below).
+        val acceptedTokenUnlocksAll: SortedSet[TokenUnlock] =
+          SortedSet.from(artifact.artifacts.toList.flatMap(_.toList).collect { case tu: TokenUnlock => tu })
 
         // Balances: replay accepted block txs (BlockAcceptanceLogic.processBalances semantics), then GIVEN rewards
         // (BalanceOpsManager.acceptRewardTxs semantics), then GIVEN fee transactions (BalanceOpsManager.acceptFeeTxs
@@ -483,12 +500,11 @@ object GlobalSnapshotStateChannelEventsProcessor {
           // of carrying a stale prior forward — the fix for "data-with-fee never mirrors". Pure function of the signed
           // binary + prior ⇒ split-safe (every gl0 node replays the identical fee txs).
           //
-          // NOTE: token-lock / allow-spend / unlock / cross-shard-spend BALANCE effects remain intentionally NOT
-          // reproduced here — they need epoch-based expiry + cross-shard spend-action data gl0 does not hold (the thing
-          // execution-sharding exists to avoid). For a metagraph using ONLY transfers/rewards/fee-txs, `derivedBalances`
-          // now MATCHES the committed `balancesProof` and the gate adopts it; for one that ALSO moves balances via
-          // token-locks/allow-spends/spends, the gate still carries `balances` forward (last verified) for the ordinals it
-          // cannot reproduce — the pre-existing, documented boundary (no regression).
+          // This `val` covers blocks → rewards → fees only (no `F` needed). The remaining metagraph balance steps
+          // (token-locks/unlocks, then allow-spends) need epoch-based expiry from the GIVEN `globalSyncView` AND a hashed
+          // token-unlock filter, so they are folded onto THIS result inside the `for` comprehension below
+          // (`derivedBalancesWithLocksAndSpendsE`), in the metagraph's `accept` order. Cross-shard SPEND-TRANSACTION effects
+          // remain the documented residual (global-snapshot-sourced input ⇒ not split-safe to replay here).
           acceptedFeeTxs.foldLeft(afterRewards) { (acc, feeTx) =>
             val feeAmount: Amount = feeTx.amount
             val withDebit = applyDelta(acc, feeTx.source, _.minus(feeAmount))
@@ -550,6 +566,101 @@ object GlobalSnapshotStateChannelEventsProcessor {
             case (addr, as) => addr -> as.filter(a => syncEpoch.forall(e => a.value.lastValidEpochProgress >= e))
           }.filter { case (_, s) => s.nonEmpty }
 
+          // BALANCE effects of GIVEN token-locks/unlocks then allow-spends, folded onto `derivedBalancesE` (blocks → rewards
+          // → fees) in the metagraph's `CurrencySnapshotAcceptanceManager.accept` order (blocks → rewards → fees → token-locks
+          // → allow-spends → spends → unlocks). Pure replay of already-accepted, signed events — NOT re-validated, NOT
+          // recomputed — using the GIVEN `syncEpoch` (== ml0's `lastGlobalSnapshotEpochProgress`) for expiry, so every gl0 node
+          // derives byte-identical balances (split-safe). When `syncEpoch` is absent (pre-sync genesis snapshots, which carry no
+          // locks/allow-spends) the folds are no-ops. Cross-shard SPEND-TRANSACTION effects are the DOCUMENTED RESIDUAL: their
+          // input is global-snapshot-sourced (not in this MG's own incremental), so replaying them here would break the pure
+          // `(snapshot, prior)` split-safety — `balances` carries forward (last verified) for the ordinals a spend shaped, the
+          // pre-existing boundary the per-field gate handles.
+          //
+          // Token-locks + token-unlocks — mirror `TokenLockOpsManager.updateBalancesByTokenLocks` exactly (epoch
+          // `lastGlobalSnapshotEpochProgress`). `acceptedTokenLocks` (the debited new locks) is the UNEXPIRED-filtered incoming
+          // grouped by source — byte-identical to `accept`'s `incomingTokenLocks.filter(unlockEpoch.forall(_ >= e)).groupBy`.
+          // `expiredLocks` is prior-active locks with `unlockEpoch.exists(_ < e)`. `acceptedTokenUnlocks` is the SAME filtered
+          // set ml0 commits (`acceptTokenUnlocks`: the unlock's `tokenLockRef` is in the active-lock refs AND not in the expired
+          // hashes), so the refund set matches the committed proof. Per address (lastActive ++ accepted ++ expired keys):
+          // `−(TokenLockAmount + TokenLockFee)` for each new lock, `+TokenLockAmount` for each expired prior lock, then
+          // `+TokenLockAmount` for each manual unlock whose `source == addr`.
+          derivedBalancesAfterTokenLocksE <- syncEpoch match {
+            case None => derivedBalancesE.pure[F]
+            case Some(epoch) =>
+              val acceptedTokenLocksForBalance: SortedMap[Address, SortedSet[Signed[TokenLock]]] =
+                incomingTokenLocks.map { case (addr, locks) => addr -> locks.filter(_.value.unlockEpoch.forall(_ >= epoch)) }.filter {
+                  case (_, s) => s.nonEmpty
+                }
+              val expiredLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]] =
+                priorActiveTokenLocks.flatMap {
+                  case (addr, locks) =>
+                    val expired = locks.filter(_.value.unlockEpoch.exists(_ < epoch))
+                    if (expired.nonEmpty) Some(addr -> expired) else None
+                }
+              for {
+                // Mirror `acceptTokenUnlocks`: keep only unlocks referencing a (still-tracked, non-expired) active lock.
+                allLockRefs <-
+                  (incomingTokenLocks.values.flatten.toList ++ priorActiveTokenLocks.values.flatten.toList)
+                    .traverse(_.toHashed.map(_.hash))
+                expiredLockHashes <-
+                  (incomingTokenLocks.values.flatten.toList ++ priorActiveTokenLocks.values.flatten.toList)
+                    .filter(_.value.unlockEpoch.exists(_ < epoch))
+                    .traverse(_.toHashed.map(_.hash))
+                acceptedTokenUnlocks = acceptedTokenUnlocksAll.filter { tu =>
+                  allLockRefs.contains(tu.tokenLockRef) && !expiredLockHashes.contains(tu.tokenLockRef)
+                }
+                allAddresses = priorActiveTokenLocks.keySet ++ acceptedTokenLocksForBalance.keySet ++ expiredLocks.keySet
+              } yield
+                allAddresses.foldLeft(derivedBalancesE) {
+                  case (acc, addr) =>
+                    val newLocks = acceptedTokenLocksForBalance.getOrElse(addr, SortedSet.empty[Signed[TokenLock]])
+                    val expiredForAddr = expiredLocks.getOrElse(addr, SortedSet.empty[Signed[TokenLock]])
+                    val manualUnlocks = acceptedTokenUnlocks.filter(_.source == addr)
+                    val afterNewLocks = newLocks.foldLeft(acc) { (a, tl) =>
+                      val amount: Amount = TokenLockAmount.toAmount(tl.value.amount)
+                      val fee: Amount = TokenLockFee.toAmount(tl.value.fee)
+                      applyDelta(applyDelta(a, addr, _.minus(amount)), addr, _.minus(fee))
+                    }
+                    val afterExpiredRefunds = expiredForAddr.foldLeft(afterNewLocks) { (a, tl) =>
+                      applyDelta(a, addr, _.plus(TokenLockAmount.toAmount(tl.value.amount)))
+                    }
+                    manualUnlocks.foldLeft(afterExpiredRefunds) { (a, tu) =>
+                      applyDelta(a, addr, _.plus(TokenLockAmount.toAmount(tu.amount)))
+                    }
+                }
+          }
+
+          // Allow-spends — mirror `AllowSpendOpsManager.updateCurrencyBalancesByAllowSpends` (epoch
+          // `lastGlobalSnapshotEpochProgress`). The fold iterates `(incomingAllowSpends |+| expiredAllowSpends)`, where
+          // `expiredAllowSpends` is prior-active allow-spends with `lastValidEpochProgress < e`. Per address:
+          // `−(SwapAmount + AllowSpendFee)` for each entry with `lastValidEpochProgress >= e`, `+SwapAmount` refund for each
+          // with `lastValidEpochProgress < e`. (gl0 has no spend-transactions in scope — the documented residual — so the
+          // expired set is purely the `< e` prior allow-spends, byte-identical to `filterExpiredAllowSpends` with an empty
+          // spend-tx list.)
+          derivedBalancesWithLocksAndSpendsE = syncEpoch match {
+            case None => derivedBalancesAfterTokenLocksE
+            case Some(epoch) =>
+              val expiredAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]] =
+                priorActiveAllowSpends.flatMap {
+                  case (addr, as) =>
+                    val expired = as.filter(_.value.lastValidEpochProgress < epoch)
+                    if (expired.nonEmpty) Some(addr -> expired) else None
+                }
+              (incomingAllowSpends |+| expiredAllowSpends).foldLeft(derivedBalancesAfterTokenLocksE) {
+                case (acc, (addr, allowSpends)) =>
+                  val unexpired = allowSpends.filter(_.value.lastValidEpochProgress >= epoch)
+                  val expired = allowSpends.filter(_.value.lastValidEpochProgress < epoch)
+                  val afterUnexpired = unexpired.foldLeft(acc) { (a, sas) =>
+                    val amount: Amount = SwapAmount.toAmount(sas.value.amount)
+                    val fee: Amount = AllowSpendFee.toAmount(sas.value.fee)
+                    applyDelta(applyDelta(a, addr, _.minus(amount)), addr, _.minus(fee))
+                  }
+                  expired.foldLeft(afterUnexpired) { (a, sas) =>
+                    applyDelta(a, addr, _.plus(SwapAmount.toAmount(sas.value.amount)))
+                  }
+              }
+          }
+
           // globalSnapshotSyncView: prior view + this snapshot's accepted globalSnapshotSyncs, keyed by the signer's PeerId,
           // byte-identical to MessageValidationOpsManager.acceptGlobalSnapshotSyncs (sort by parentOrdinal asc then default
           // Signed order so latest-per-peer wins). The metagraph UPDATES this every snapshot, so the prior code's plain
@@ -571,7 +682,7 @@ object GlobalSnapshotStateChannelEventsProcessor {
           // proof per field so it matches both eras; the replayed map is the content, the economic-security gate below verifies
           // the hash. (Prior `if (nextX.isEmpty) lastState.X else Some(nextX)` produced `None`/stale on the empty case, which
           // never matched the metagraph's post-migration `Some(empty)`.)
-          derivedBalances = derivedBalancesE.getOrElse(lastState.balances)
+          derivedBalances = derivedBalancesWithLocksAndSpendsE.getOrElse(lastState.balances)
           committedProof = artifact.stateProof
           candidate = CurrencySnapshotInfo(
             lastTxRefs = nextLastTxRefs,

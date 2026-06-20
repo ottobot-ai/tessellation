@@ -137,7 +137,11 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
     blocks: SortedSet[BlockAsActiveTip] = SortedSet.empty,
     rewards: SortedSet[io.constellationnetwork.schema.transaction.RewardTransaction] = SortedSet.empty,
     stateProof: CurrencySnapshotStateProof = CurrencySnapshotStateProof(Hash.empty, Hash.empty, None, None, None, None, None, None, None),
-    feeTransactions: Option[SortedSet[Signed[io.constellationnetwork.currency.dataApplication.FeeTransaction]]] = None
+    feeTransactions: Option[SortedSet[Signed[io.constellationnetwork.currency.dataApplication.FeeTransaction]]] = None,
+    artifacts: Option[SortedSet[io.constellationnetwork.schema.artifact.SharedArtifact]] = None,
+    tokenLockBlocks: Option[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLockBlock]]] = None,
+    allowSpendBlocks: Option[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpendBlock]]] = None,
+    globalSyncView: Option[io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSyncView] = None
   )(implicit sp: SecurityProvider[IO], h: Hasher[IO]): IO[Signed[CurrencyIncrementalSnapshot]] = {
     val snapshot = CurrencyIncrementalSnapshot(
       SnapshotOrdinal.unsafeApply(snapOrdinal),
@@ -153,10 +157,10 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
       messages,
       None,
       feeTransactions,
-      None,
-      None,
-      None,
-      None
+      artifacts,
+      allowSpendBlocks,
+      tokenLockBlocks,
+      globalSyncView
     )
     forAsyncHasher[IO, CurrencyIncrementalSnapshot](snapshot, mgKeyPair)
   }
@@ -216,6 +220,46 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
         tx.proofs
       ),
       NonNegLong(0L)
+    )
+
+  /** A signed `TokenLock` from `source` locking `amount` (+ `fee`), expiring at `unlockAt`. Carried on-wire in a
+    * `CurrencyIncrementalSnapshot.tokenLockBlocks` block; the metagraph's ml0 debits `−(amount + fee)` from the source via
+    * `TokenLockOpsManager.updateBalancesByTokenLocks`, so gl0's adopt derivation replays the identical debit. Signed by the SOURCE key (the
+    * adopt derivation replays already-accepted events without re-validating signatures).
+    */
+  private def signedTokenLock(
+    source: Address,
+    amount: Long,
+    fee: Long,
+    unlockAt: Option[EpochProgress],
+    sourceKeyPair: KeyPair
+  )(implicit sp: SecurityProvider[IO], h: Hasher[IO]): IO[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]] =
+    forAsyncHasher[IO, io.constellationnetwork.schema.tokenLock.TokenLock](
+      io.constellationnetwork.schema.tokenLock.TokenLock(
+        source = source,
+        amount = io.constellationnetwork.schema.tokenLock.TokenLockAmount(PosLong.unsafeFrom(amount)),
+        fee = io.constellationnetwork.schema.tokenLock.TokenLockFee(NonNegLong.unsafeFrom(fee)),
+        parent = io.constellationnetwork.schema.tokenLock
+          .TokenLockReference(io.constellationnetwork.schema.tokenLock.TokenLockOrdinal(NonNegLong(0L)), Hash.empty),
+        currencyId = None,
+        unlockEpoch = unlockAt,
+        replaceTokenLockRef = None
+      ),
+      sourceKeyPair
+    )
+
+  /** Wrap a signed token-lock into a `TokenLockBlock` (the on-wire shape `CurrencyIncrementalSnapshot.tokenLockBlocks` carries). The
+    * roundId is arbitrary — the adopt derivation reads only the block's token-locks.
+    */
+  private def tokenLockBlockOf(
+    tl: Signed[io.constellationnetwork.schema.tokenLock.TokenLock]
+  ): Signed[io.constellationnetwork.schema.tokenLock.TokenLockBlock] =
+    Signed(
+      io.constellationnetwork.schema.tokenLock.TokenLockBlock(
+        io.constellationnetwork.schema.round.RoundId(new java.util.UUID(0L, 0L)),
+        NonEmptySet.one(tl)
+      ),
+      tl.proofs
     )
 
   /** Serialize a signed incremental into an SC binary (the on-wire shape `processCurrencySnapshots` decodes). */
@@ -521,6 +565,186 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
           producerCommitted.map(_._2.balances) == followerCommitted.map(_._2.balances),
           producerCommitted.map(_._2) == followerCommitted.map(_._2)
         )
+  }
+
+  /** TOKEN-LOCK correctness + determinism (extends the data-with-fee fix to the token-locks workflow — the freeze this commit unblocks).
+    *
+    * The metagraph's committed `balances` reflect a TOKEN-LOCK debit (`−(TokenLockAmount + TokenLockFee)`) applied by ml0
+    * (`TokenLockOpsManager.updateBalancesByTokenLocks`) — an effect gl0 previously did NOT replay, so its `derivedBalancesProof =!=
+    * committedBalancesProof`, the per-field gate carried the node's OWN prior `balances` forward, AND (worse) the token-lock-shaped fields
+    * never advanced → shard adoption FROZE at the token-locks workflow. The token-lock IS on the wire
+    * (`CurrencyIncrementalSnapshot.tokenLockBlocks`) and the expiry epoch rides in `globalSyncView`, so gl0 can now replay it
+    * deterministically and ADOPT the true token-locked balances + the active-lock set.
+    *
+    * Setup that makes "block/reward/fee replay cannot reproduce" CONCRETE: the adopted incremental carries NO blocks/rewards/fee-txs — ONLY
+    * a token-lock. The pre-token-lock derivation would leave `balances` at the prior (100), the active-lock set absent, and BOTH proofs
+    * would diverge from the committed (65 + the active lock) → carry-forward. With the fold, gl0 derives 65 + the active lock and adopts.
+    */
+  test("adopt path (token-lock): a metagraph token-lock is replayed; gl0 ADOPTS the locked balances + active locks deterministically") {
+    res =>
+      implicit val (h, sp, j) = res
+      for {
+        processor <- mkProcessor
+        mgKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+        mgAddr = PublicKeyOps(mgKeyPair.getPublic).toAddress
+
+        sourceKp <- KeyPairGenerator.makeKeyPair[IO]
+        source = PublicKeyOps(sourceKp.getPublic).toAddress
+
+        // Prior `Right` at ordinal 1 with a FUNDED source — gl0's pre-token-lock mirror of the metagraph balances.
+        priorBalances = SortedMap(source -> Balance(NonNegLong(100L)))(Address.OrderingInstance)
+        priorInfo = info(None).copy(balances = priorBalances)
+        firstIncremental <- signedIncremental(1L, Hash.empty, None, mgKeyPair)
+        firstHash <- firstIncremental.toHashed.map(_.hash)
+        prior: SortedMap[Address, CurrencySnapshotWithState] =
+          SortedMap(mgAddr -> (Right((firstIncremental, priorInfo)): CurrencySnapshotWithState))(Address.OrderingInstance)
+
+        // The adopted second incremental carries ONLY a token-lock (amount 30, fee 5), NOT yet expired (unlockEpoch 600 > syncEpoch 100) —
+        // the exact case block/reward/fee replay cannot reproduce. ml0 debited source 100 − 30 − 5 = 65 and tracked the lock as active.
+        syncEpoch = EpochProgress(NonNegLong(100L))
+        unlockEpoch = EpochProgress(NonNegLong(600L))
+        gsv = io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSyncView(
+          SnapshotOrdinal(NonNegLong(1L)),
+          Hash.empty,
+          syncEpoch
+        )
+        lock <- signedTokenLock(source, 30L, 5L, Some(unlockEpoch), sourceKp)
+        lockBlock = tokenLockBlockOf(lock)
+        lockRef <- io.constellationnetwork.schema.tokenLock.TokenLockReference.of[IO](lock)
+
+        // The exact post-state Info ml0 commits: balances debited, the lock now active, its ref recorded.
+        expectedBalances = SortedMap(source -> Balance(NonNegLong(65L)))(Address.OrderingInstance)
+        expectedActiveLocks = SortedMap(source -> SortedSet(lock))(Address.OrderingInstance)
+        expectedLockRefs = SortedMap(source -> lockRef)(Address.OrderingInstance)
+        expectedInfo = priorInfo.copy(
+          balances = expectedBalances,
+          activeTokenLocks = Some(expectedActiveLocks),
+          lastTokenLockRefs = Some(expectedLockRefs)
+        )
+        committedProof <- expectedInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+
+        secondIncremental <- signedIncremental(
+          2L,
+          firstHash,
+          None,
+          mgKeyPair,
+          stateProof = committedProof,
+          tokenLockBlocks = SortedSet(lockBlock).some,
+          globalSyncView = gsv.some
+        )
+        secondBinary <- binaryOf(secondIncremental, firstHash, mgKeyPair)
+        adopted = SortedMap(mgAddr -> NonEmptyList.of(secondBinary))(Address.OrderingInstance)
+
+        // Run twice with DIFFERENT node-local accumulator histories — the per-MG derived state must be byte-identical (split-safe).
+        producerResult <- processor.processCurrencySnapshots(
+          ordinal,
+          SortedMap(source -> Balance(NonNegLong(999L)))(Address.OrderingInstance),
+          prior,
+          adopted,
+          _ => None.pure[IO],
+          CurrencyAdoptionMode.AdoptFromSignedFields
+        )
+        followerResult <- processor.processCurrencySnapshots(
+          ordinal,
+          SortedMap.empty[Address, Balance],
+          prior,
+          adopted,
+          _ => None.pure[IO],
+          CurrencyAdoptionMode.AdoptFromSignedFields
+        )
+        producerCommitted = committedInfo(producerResult, mgAddr)
+        followerCommitted = committedInfo(followerResult, mgAddr)
+      } yield
+        expect.all(
+          // Commitment advanced to ordinal 2 (the token-locks-workflow freeze is broken).
+          producerCommitted.map(_._1) == Some(SnapshotOrdinal(NonNegLong(2L))),
+          // CORRECTNESS: gl0 ADOPTED the metagraph's TRUE token-locked balances (100 − 30 − 5 = 65) — the lock debit mirrored.
+          producerCommitted.map(_._2.balances) == Some(expectedBalances),
+          // The active-lock set + refs are MAINTAINED (the lock is now tracked).
+          producerCommitted.flatMap(_._2.activeTokenLocks) == Some(expectedActiveLocks),
+          producerCommitted.flatMap(_._2.lastTokenLockRefs) == Some(expectedLockRefs),
+          // The whole derived Info equals what the metagraph committed (root matched → adopted verbatim, not carried-forward).
+          producerCommitted.map(_._2) == Some(expectedInfo),
+          // REGRESSION GUARD: the committed balances are NOT the stale prior — the carry-forward path was NOT taken for the lock case.
+          // (Removing the token-lock balance fold reverts `balances` to the prior 100 here, failing this expectation.)
+          producerCommitted.map(_._2.balances) != Some(priorBalances),
+          // DETERMINISM: producer-role and follower-role nodes commit BYTE-IDENTICAL per-MG state despite different accumulators.
+          producerCommitted.map(_._2) == followerCommitted.map(_._2)
+        )
+  }
+
+  /** TOKEN-LOCK EXPIRY-REFUND correctness — the other half of `updateBalancesByTokenLocks`. A prior active lock whose `unlockEpoch` is now
+    * PAST `syncEpoch` is refunded (`+TokenLockAmount`) and dropped from the active set, exactly as ml0 does. Block/reward/fee replay cannot
+    * reproduce this (no on-wire event at all describes the refund — it is a pure function of the prior active set + the GIVEN syncEpoch).
+    */
+  test("adopt path (token-lock): an expired prior lock is REFUNDED + dropped; gl0 ADOPTS the refunded balances deterministically") { res =>
+    implicit val (h, sp, j) = res
+    for {
+      processor <- mkProcessor
+      mgKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      mgAddr = PublicKeyOps(mgKeyPair.getPublic).toAddress
+
+      sourceKp <- KeyPairGenerator.makeKeyPair[IO]
+      source = PublicKeyOps(sourceKp.getPublic).toAddress
+
+      // A prior active lock (amount 30) that expires at epoch 50; the incoming snapshot synced to epoch 100 ⇒ it is now expired.
+      priorLockUnlock = EpochProgress(NonNegLong(50L))
+      priorLock <- signedTokenLock(source, 30L, 0L, Some(priorLockUnlock), sourceKp)
+      priorActiveLocks = SortedMap(source -> SortedSet(priorLock))(Address.OrderingInstance)
+
+      // Prior balances already reflect the earlier debit (the source is "down" 30 from the lock). On expiry ml0 refunds +30.
+      priorBalances = SortedMap(source -> Balance(NonNegLong(70L)))(Address.OrderingInstance)
+      priorInfo = info(None).copy(balances = priorBalances, activeTokenLocks = Some(priorActiveLocks))
+      firstIncremental <- signedIncremental(1L, Hash.empty, None, mgKeyPair)
+      firstHash <- firstIncremental.toHashed.map(_.hash)
+      prior: SortedMap[Address, CurrencySnapshotWithState] =
+        SortedMap(mgAddr -> (Right((firstIncremental, priorInfo)): CurrencySnapshotWithState))(Address.OrderingInstance)
+
+      // The adopted second incremental carries NO new locks — only the synced epoch (100), which expires the prior lock.
+      syncEpoch = EpochProgress(NonNegLong(100L))
+      gsv = io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSyncView(
+        SnapshotOrdinal(NonNegLong(1L)),
+        Hash.empty,
+        syncEpoch
+      )
+
+      // ml0 refunds source +30 (back to 100) and drops the expired lock from the active set (→ empty, shape Some(empty)).
+      expectedBalances = SortedMap(source -> Balance(NonNegLong(100L)))(Address.OrderingInstance)
+      expectedActiveLocks = SortedMap.empty[Address, SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]]
+      expectedInfo = priorInfo.copy(balances = expectedBalances, activeTokenLocks = Some(expectedActiveLocks))
+      committedProof <- expectedInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+
+      secondIncremental <- signedIncremental(
+        2L,
+        firstHash,
+        None,
+        mgKeyPair,
+        stateProof = committedProof,
+        globalSyncView = gsv.some
+      )
+      secondBinary <- binaryOf(secondIncremental, firstHash, mgKeyPair)
+      adopted = SortedMap(mgAddr -> NonEmptyList.of(secondBinary))(Address.OrderingInstance)
+
+      adoptResult <- processor.processCurrencySnapshots(
+        ordinal,
+        SortedMap.empty[Address, Balance],
+        prior,
+        adopted,
+        _ => None.pure[IO],
+        CurrencyAdoptionMode.AdoptFromSignedFields
+      )
+      result = committedInfo(adoptResult, mgAddr)
+    } yield
+      expect.all(
+        result.map(_._1) == Some(SnapshotOrdinal(NonNegLong(2L))),
+        // CORRECTNESS: the expired lock was refunded (70 + 30 = 100) — block/reward/fee replay alone would leave balances at 70.
+        result.map(_._2.balances) == Some(expectedBalances),
+        // The expired lock was dropped from the active set.
+        result.flatMap(_._2.activeTokenLocks) == Some(expectedActiveLocks),
+        result.map(_._2) == Some(expectedInfo),
+        // REGRESSION GUARD: NOT the stale prior balances (removing the expiry-refund fold reverts to 70 here).
+        result.map(_._2.balances) != Some(priorBalances)
+      )
   }
 
   test("adopt path: derived-root verification — matches on valid stateProof, FALLS BACK to prior balances on tampered stateProof") { res =>
