@@ -157,7 +157,18 @@ const waitForGL0MetagraphAlignment = async (gl0Url, metagraphAddress, ordinalBef
 // Fail LOUDLY on timeout (do NOT "proceed anyway"): a currency that never goes live is
 // a real seeding regression and must surface as the cause, not be masked by the
 // downstream send error.
-const waitForMetagraphCurrencyLive = async (gl0Url, metagraphId) => {
+//
+// GATE 1 (gl0 seeded) is necessary but NOT sufficient: gl0 having the currency in
+// `lastCurrencySnapshots` says nothing about whether cl1's OWN follower has caught up.
+// Post-#122 finality-gating, cl1 follows gl0 through GlobalSnapshotAlignment.pullFinalityGated,
+// and its mempool tx-validator reads sourceBalance from cl1's own materialized view. If that
+// follower lags the snapshot where the genesis balances materialize, the FIRST metagraph
+// transfer fails `InsufficientBalance{balance=0}` even though account1 is genesis-funded (the
+// cl1 catch-up lag transient). So GATE 2 additionally polls the metagraph's OWN currency-balance
+// endpoint (l0MetagraphUrl `/currency/<addr>/balance` — the ml0/cl1 materialized view) for the
+// genesis-funded funding account until it reports a NON-ZERO balance, i.e. the metagraph itself
+// has materialized balances and is genuinely transactable.
+const waitForMetagraphCurrencyLive = async (gl0Url, metagraphId, l0MetagraphUrl) => {
   const timeoutMs = 8 * 60 * 1000
   const intervalMs = 5000
   const start = Date.now()
@@ -173,15 +184,52 @@ const waitForMetagraphCurrencyLive = async (gl0Url, metagraphId) => {
       const lcs = (info && info.lastCurrencySnapshots) || {}
       if (Object.prototype.hasOwnProperty.call(lcs, metagraphId)) {
         logMessage(`Metagraph currency live on GL0 (in lastCurrencySnapshots) after ${Math.round((Date.now() - start) / 1000)}s`)
-        return
+        break
       }
     } catch (_) { /* gl0 transient — retry */ }
     await sleep(intervalMs)
   }
+  if (Date.now() - start >= timeoutMs) {
+    throw new Error(
+      `Metagraph currency ${metagraphId} never appeared in GL0 lastCurrencySnapshots within ${timeoutMs / 1000}s — ` +
+      `currency seeding (mg → shard-checkpoint → gl0 verifyEmbedded-adopt) did not complete. ` +
+      `Inspect gl0 ShardCheckpointGl0AcceptanceManager (verifyEmbedded accept/reject) + the per-shard binary buffer.`
+    )
+  }
+
+  // GATE 2: wait until the metagraph's OWN view has materialized the genesis balances —
+  // i.e. cl1's finality-gated follower (GlobalSnapshotAlignment.pullFinalityGated) has caught
+  // up far enough that the funding account reads non-zero on the ml0 currency-balance route
+  // (the same source cl1's mempool tx-validator reads sourceBalance from). Generous budget,
+  // matching the gl0 gate above (~120 attempts × 5s ≈ 10m ceiling): the cl1 catch-up lag can
+  // run minutes at cold start under depth-k finality. Fail LOUDLY on timeout — a funding
+  // account that never materializes on the metagraph's own view is a real follower regression.
+  if (!l0MetagraphUrl) {
+    logMessage(`waitForMetagraphCurrencyLive: no l0MetagraphUrl provided — skipping metagraph-own-view balance gate`)
+    return
+  }
+  const balTimeoutMs = 10 * 60 * 1000
+  const balStart = Date.now()
+  const fundingAddress = FIRST_WALLET_ADDRESS
+  const balanceUrl = `${l0MetagraphUrl}/currency/${fundingAddress}/balance`
+  logMessage(`Waiting for metagraph-own-view balance to materialize (cl1 follower catch-up): ${fundingAddress.slice(0, 12)}... non-zero on ${balanceUrl} (timeout ${balTimeoutMs / 60000}m)...`)
+  while (Date.now() - balStart < balTimeoutMs) {
+    try {
+      // ml0 `/currency/<addr>/balance` returns L0AddressBalance { balance: number, ordinal }.
+      const res = await fetchJson(balanceUrl)
+      const balance = res && res.balance
+      if (typeof balance === 'number' && balance > 0) {
+        logMessage(`Metagraph-own-view balance materialized (cl1 caught up): ${fundingAddress.slice(0, 12)}... balance=${balance} after ${Math.round((Date.now() - balStart) / 1000)}s`)
+        return
+      }
+    } catch (_) { /* ml0 transient (e.g. balance route 503 before first currency snapshot) — retry */ }
+    await sleep(intervalMs)
+  }
   throw new Error(
-    `Metagraph currency ${metagraphId} never appeared in GL0 lastCurrencySnapshots within ${timeoutMs / 1000}s — ` +
-    `currency seeding (mg → shard-checkpoint → gl0 verifyEmbedded-adopt) did not complete. ` +
-    `Inspect gl0 ShardCheckpointGl0AcceptanceManager (verifyEmbedded accept/reject) + the per-shard binary buffer.`
+    `Metagraph funding account ${fundingAddress} never reported a non-zero balance on the metagraph's own view ` +
+    `(${balanceUrl}) within ${balTimeoutMs / 1000}s — cl1's finality-gated follower ` +
+    `(GlobalSnapshotAlignment.pullFinalityGated) did not catch up to where genesis balances materialize. ` +
+    `This is the cl1 catch-up lag that surfaces downstream as InsufficientBalance{balance=0} on the first transfer.`
   )
 }
 
@@ -294,8 +342,20 @@ const batchMetagraphTransaction = async (
   num = 100,
   cl1Url = null,
 ) => {
-  const maxAttempts = 3
+  // Stale-parent races resolve in one or two re-queries — keep that budget tight (3).
+  // The transient zero-balance (InsufficientBalance{balance=0}) on the metagraph path is a
+  // DIFFERENT, slower transient: post-#122 finality-gating, cl1's mempool tx-validator reads
+  // sourceBalance from its OWN finality-gated follower (GlobalSnapshotAlignment.pullFinalityGated),
+  // which at cold start can lag the snapshot where genesis balances materialize by minutes — well
+  // past the old 3-attempt / ~10s budget. So give the balance transient a much larger budget
+  // (~40 attempts × 5s ≈ a few minutes), matching the other finality-sensitive gates in this file,
+  // while leaving the stale-parent path unchanged. The loop runs up to the larger ceiling; the
+  // stale-parent branch self-limits via maxStaleParentAttempts so its semantics don't change.
+  const maxStaleParentAttempts = 3
+  const maxBalanceAttempts = 40
+  const maxAttempts = maxBalanceAttempts
   const retryDelayMs = 1000
+  const balanceRetryDelayMs = 5000
   let lastError = null
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -336,20 +396,24 @@ const batchMetagraphTransaction = async (
       return hashes
     } catch (e) {
       lastError = e
-      if (isSdkStaleParentError(e) && attempt < maxAttempts) {
+      // Stale-parent: tight budget — re-querying lastRef once or twice resolves it.
+      if (isSdkStaleParentError(e) && attempt < maxStaleParentAttempts) {
         logMessage(
-          `batchMetagraphTransaction: stale-parent race on attempt ${attempt}/${maxAttempts} ` +
+          `batchMetagraphTransaction: stale-parent race on attempt ${attempt}/${maxStaleParentAttempts} ` +
           `(${e.message || e}). Retrying with fresh lastRef.`
         )
         await sleep(retryDelayMs)
         continue
       }
-      if (isTransientInsufficientBalance(e) && attempt < maxAttempts) {
+      // Transient zero-balance: wide budget — cl1's finality-gated follower catch-up lag
+      // (post-#122) can exceed the stale-parent budget by minutes on the first transfer.
+      if (isTransientInsufficientBalance(e) && attempt < maxBalanceAttempts) {
         logMessage(
-          `batchMetagraphTransaction: transient zero-balance (finality lag) on attempt ${attempt}/${maxAttempts} ` +
-          `(${e.message || e}). Retrying after delay for finality to catch up.`
+          `batchMetagraphTransaction: transient zero-balance (cl1 finality-gated follower catch-up lag) ` +
+          `on attempt ${attempt}/${maxBalanceAttempts} (${e.message || e}). ` +
+          `Retrying after delay for cl1 to catch up.`
         )
-        await sleep(5000)
+        await sleep(balanceRetryDelayMs)
         continue
       }
       throw Error(`Error when sending batch transaction: ${e}`)
@@ -861,8 +925,15 @@ const sendTransactionsUsingUrls = async (networkOptions) => {
 
   // Metagraph — gate on the currency being LIVE on gl0 first (seeding-race fix):
   // under sharding the genesis currency takes minutes to travel mg → shard-checkpoint
-  // → gl0 adopt, and cl1 can't validate currency txs until gl0 has seeded it.
-  await waitForMetagraphCurrencyLive(networkOptions.l0GlobalUrl, networkOptions.metagraphId)
+  // → gl0 adopt, and cl1 can't validate currency txs until gl0 has seeded it. Then
+  // additionally gate on the metagraph's OWN view materializing balances (cl1 follower
+  // catch-up) — without this the first transfer races cl1's finality-gated follower and
+  // fails InsufficientBalance{balance=0} despite account1 being genesis-funded.
+  await waitForMetagraphCurrencyLive(
+    networkOptions.l0GlobalUrl,
+    networkOptions.metagraphId,
+    networkOptions.l0MetagraphUrl,
+  )
   await transferTest(account1, account2, 10, 0, 1, networkOptions)
   await transferTest(account2, account1, 10, 0, 1, networkOptions)
 
