@@ -4,6 +4,8 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.schema._
+import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.security.hash.Hash
@@ -11,6 +13,7 @@ import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotCodecs._
 import io.constellationnetwork.serde.implicits._
 
 import eu.timepit.refined.api.Refined
+import eu.timepit.refined.auto._
 import eu.timepit.refined.string.MatchesRegex
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.FunSuite
@@ -80,7 +83,15 @@ object CurrencySnapshotCodecsSuite extends FunSuite {
       feeTransactions = Some(SortedSet.empty),
       artifacts = Some(SortedSet.empty),
       allowSpendBlocks = Some(SortedSet.empty),
-      tokenLockBlocks = Some(SortedSet.empty)
+      tokenLockBlocks = Some(SortedSet.empty),
+      authoritativeBalances = Some(SortedMap.empty[Address, Balance])
+    )
+    expect(sample.immutableBytes.fromImmutableBytes[CurrencyIncrementalSnapshot] == Right(sample))
+  }
+
+  test("Current CurrencyIncrementalSnapshot round-trips with a populated authoritativeBalances map (scodec wires the new field)") {
+    val sample = minimalCurrent.copy(
+      authoritativeBalances = Some(SortedMap(Address("DAG2AUdecqFwEGcgAcH1ac2wrsg8acrgGwrQojzw") -> Balance(100L)))
     )
     expect(sample.immutableBytes.fromImmutableBytes[CurrencyIncrementalSnapshot] == Right(sample))
   }

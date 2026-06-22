@@ -293,7 +293,12 @@ object CurrencySnapshotCreator {
             if (currencySnapshotAcceptanceResult.lastGlobalSnapshotToCheckFields < tessellation3MigrationStartingOrdinal) none
             else currencySnapshotAcceptanceResult.tokenLockBlock.accepted.toSortedSet.some,
             if (currencySnapshotAcceptanceResult.lastGlobalSnapshotToCheckFields < tessellation3MigrationStartingOrdinal) none
-            else currencySnapshotAcceptanceResult.globalSyncView.some
+            else currencySnapshotAcceptanceResult.globalSyncView.some,
+            // authoritativeBalances — the metagraph's OWN cumulative balance map. This is the EXACT `info.balances` that
+            // `currencySnapshotAcceptanceResult.stateProof.balancesProof` (committed above) is hashed over (`csi.stateProof` in
+            // `CurrencySnapshotAcceptanceManager`), so the field and the proof are byte-consistent — the security anchor gl0 verifies
+            // before adopting it under roots-only sharding (no balance re-derive carry-forward).
+            currencySnapshotAcceptanceResult.info.balances.some
           )
 
           artifactSize: Int <- JsonSerializer[F].serialize(artifact).map(_.length)

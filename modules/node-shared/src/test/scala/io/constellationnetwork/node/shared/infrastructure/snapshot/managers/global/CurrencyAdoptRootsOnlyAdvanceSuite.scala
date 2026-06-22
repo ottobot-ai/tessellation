@@ -141,7 +141,8 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
     artifacts: Option[SortedSet[io.constellationnetwork.schema.artifact.SharedArtifact]] = None,
     tokenLockBlocks: Option[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLockBlock]]] = None,
     allowSpendBlocks: Option[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpendBlock]]] = None,
-    globalSyncView: Option[io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSyncView] = None
+    globalSyncView: Option[io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSyncView] = None,
+    authoritativeBalances: Option[SortedMap[Address, Balance]] = None
   )(implicit sp: SecurityProvider[IO], h: Hasher[IO]): IO[Signed[CurrencyIncrementalSnapshot]] = {
     val snapshot = CurrencyIncrementalSnapshot(
       SnapshotOrdinal.unsafeApply(snapOrdinal),
@@ -160,7 +161,8 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
       artifacts,
       allowSpendBlocks,
       tokenLockBlocks,
-      globalSyncView
+      globalSyncView,
+      authoritativeBalances
     )
     forAsyncHasher[IO, CurrencyIncrementalSnapshot](snapshot, mgKeyPair)
   }
@@ -565,6 +567,120 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
           producerCommitted.map(_._2.balances) == followerCommitted.map(_._2.balances),
           producerCommitted.map(_._2) == followerCommitted.map(_._2)
         )
+  }
+
+  /** DATA-WITH-FEE via AUTHORITATIVE BALANCES + GAP-1 verify-by-proof (the committee-state-diff fix's load-bearing half).
+    *
+    * The previous fee test reproduced the fee by REPLAYING `feeTransactions`. But the general data-with-fee case is HISTORICAL: by the time
+    * gl0 adopts a window, the fee is already BAKED INTO the metagraph's committed cumulative `balances` and the window tip carries NO
+    * `feeTransactions`/blocks/rewards to replay (the fee was deducted in an earlier, already-finalized snapshot). Re-derivation alone
+    * leaves gl0's `balances` at the stale prior ⇒ the carry-forward gate keeps the un-fee'd map ⇒ the fee never mirrors. The fix: the
+    * metagraph PUSHES its authoritative balance map on the signed incremental (`CurrencyIncrementalSnapshot.authoritativeBalances`), and
+    * gl0 ADOPTS it after verifying it hashes to the metagraph's OWN signed `balancesProof` (GAP-1 verify-by-proof).
+    *
+    * Asserts BOTH directions:
+    *   - CORRECTNESS / regression guard: the fee-deducted authoritative map is mirrored ({source:60, feeDest:40}), NOT the stale prior
+    *     ({source:100}). This MUST FAIL on current HEAD (no `authoritativeBalances` field ⇒ the carry-forward keeps {source:100}).
+    *   - GAP-1: a TAMPERED authoritative map whose hash != the metagraph-signed `balancesProof` is REJECTED — the MG is dropped
+    *     (fail-closed), never adopted.
+    */
+  test(
+    "adopt path (data-with-fee HISTORICAL): a fee baked into committed balances with NO feeTransactions is mirrored via " +
+      "authoritativeBalances + verified against balancesProof; a tampered map is dropped"
+  ) { res =>
+    implicit val (h, sp, j) = res
+    for {
+      processor <- mkProcessor
+      mgKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      mgAddr = PublicKeyOps(mgKeyPair.getPublic).toAddress
+
+      sourceKp <- KeyPairGenerator.makeKeyPair[IO]
+      feeDestKp <- KeyPairGenerator.makeKeyPair[IO]
+      source = PublicKeyOps(sourceKp.getPublic).toAddress
+      feeDest = PublicKeyOps(feeDestKp.getPublic).toAddress
+
+      // Prior `Right` at ordinal 1 — gl0's FROZEN base mirror, still carrying the pre-fee balances (no fee reflected).
+      priorBalances = SortedMap(source -> Balance(NonNegLong(100L)))(Address.OrderingInstance)
+      priorInfo = info(None).copy(balances = priorBalances)
+      firstIncremental <- signedIncremental(1L, Hash.empty, None, mgKeyPair)
+      firstHash <- firstIncremental.toHashed.map(_.hash)
+      prior: SortedMap[Address, CurrencySnapshotWithState] =
+        SortedMap(mgAddr -> (Right((firstIncremental, priorInfo)): CurrencySnapshotWithState))(Address.OrderingInstance)
+
+      // The adopted window TIP carries NO feeTransactions/blocks/rewards — the fee is already baked into the metagraph's authoritative
+      // balances ({source:60, feeDest:40}). The committed `stateProof.balancesProof` is the hash of THAT authoritative map (the anchor).
+      authoritativeBalances = SortedMap(source -> Balance(NonNegLong(60L)), feeDest -> Balance(NonNegLong(40L)))(Address.OrderingInstance)
+      expectedInfo = priorInfo.copy(balances = authoritativeBalances)
+      committedProof <- expectedInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+
+      goodIncremental <- signedIncremental(
+        2L,
+        firstHash,
+        None,
+        mgKeyPair,
+        stateProof = committedProof,
+        authoritativeBalances = authoritativeBalances.some
+      )
+      goodBinary <- binaryOf(goodIncremental, firstHash, mgKeyPair)
+      goodAdopted = SortedMap(mgAddr -> NonEmptyList.of(goodBinary))(Address.OrderingInstance)
+
+      // Run twice with DIFFERENT node-local accumulator histories — the adopted authoritative map must be byte-identical (split-safe).
+      producerResult <- processor.processCurrencySnapshots(
+        ordinal,
+        SortedMap(source -> Balance(NonNegLong(999L)))(Address.OrderingInstance),
+        prior,
+        goodAdopted,
+        _ => None.pure[IO],
+        CurrencyAdoptionMode.AdoptFromSignedFields
+      )
+      followerResult <- processor.processCurrencySnapshots(
+        ordinal,
+        SortedMap.empty[Address, Balance],
+        prior,
+        goodAdopted,
+        _ => None.pure[IO],
+        CurrencyAdoptionMode.AdoptFromSignedFields
+      )
+      producerCommitted = committedInfo(producerResult, mgAddr)
+      followerCommitted = committedInfo(followerResult, mgAddr)
+
+      // GAP-1: the authoritative map is TAMPERED (claims {source:60, feeDest:41}) but the signed `balancesProof` still commits to the
+      // honest {60,40}. hash(tampered) != signed proof ⇒ gl0 fails closed and DROPS the MG (its commitment does not advance).
+      tamperedBalances = SortedMap(source -> Balance(NonNegLong(60L)), feeDest -> Balance(NonNegLong(41L)))(Address.OrderingInstance)
+      tamperedIncremental <- signedIncremental(
+        2L,
+        firstHash,
+        None,
+        mgKeyPair,
+        stateProof = committedProof, // still commits to the HONEST {60,40} balancesProof
+        authoritativeBalances = tamperedBalances.some
+      )
+      tamperedBinary <- binaryOf(tamperedIncremental, firstHash, mgKeyPair)
+      tamperedResult <- processor.processCurrencySnapshots(
+        ordinal,
+        SortedMap.empty[Address, Balance],
+        prior,
+        SortedMap(mgAddr -> NonEmptyList.of(tamperedBinary))(Address.OrderingInstance),
+        _ => None.pure[IO],
+        CurrencyAdoptionMode.AdoptFromSignedFields
+      )
+      tamperedCommitted = committedInfo(tamperedResult, mgAddr)
+    } yield
+      expect.all(
+        // Commitment advanced to ordinal 2 (freeze stays dead).
+        producerCommitted.map(_._1) == Some(SnapshotOrdinal(NonNegLong(2L))),
+        // CORRECTNESS / regression guard: gl0 mirrored the metagraph's TRUE fee-deducted balances via the authoritative map.
+        // (On current HEAD — no `authoritativeBalances` field — the carry-forward keeps {source:100}, so this expectation FAILS.)
+        producerCommitted.map(_._2.balances) == Some(authoritativeBalances),
+        producerCommitted.map(_._2) == Some(expectedInfo),
+        // NOT the stale prior — the carry-forward path was NOT taken for balances.
+        producerCommitted.map(_._2.balances) != Some(priorBalances),
+        // DETERMINISM: producer-role and follower-role nodes commit BYTE-IDENTICAL per-MG balances despite different accumulators.
+        producerCommitted.map(_._2.balances) == followerCommitted.map(_._2.balances),
+        producerCommitted.map(_._2) == followerCommitted.map(_._2),
+        // GAP-1: tampered authoritative map ⇒ MG DROPPED (not adopted) — fail-closed, never silently carried forward.
+        tamperedCommitted == None
+      )
   }
 
   /** TOKEN-LOCK correctness + determinism (extends the data-with-fee fix to the token-locks workflow — the freeze this commit unblocks).

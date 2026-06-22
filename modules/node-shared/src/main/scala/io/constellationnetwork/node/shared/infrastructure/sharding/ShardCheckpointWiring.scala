@@ -305,16 +305,32 @@ object ShardCheckpointWiring {
                                 .getOrElse(-1L)}) — bestTip>base, OMIT (defer until base finalizes)"
                         )
                         .as(None: Option[(Hash, ChangeSet)])
-                    else
+                    else {
+                      // AUTHORITATIVE BALANCES (committee-state-diff / data-with-fee fix). The metagraph pushes its OWN cumulative
+                      // balance map on the signed incremental (`CurrencyIncrementalSnapshot.authoritativeBalances`) — the exact map its
+                      // `stateProof.balancesProof` is hashed over. gl0's re-exec derivation (`infoOf(next)`) cannot reproduce that map
+                      // for a path-dependent metagraph (fee/token-lock/spend effects over a base gl0 never executed), so for the SHARDED
+                      // adopt path we OVERRIDE the derived `balances` with the metagraph's authoritative map BEFORE computing both the
+                      // attested per-MG root and the committee diff. The DESERIALIZED incremental is in `next` (the `Right._1`); read it
+                      // there, NOT by re-parsing `binaries.head` (those are serialized `StateChannelSnapshotBinary`). Genesis (`Left`)
+                      // carries no `authoritativeBalances` ⇒ `next` is left as-is (its `infoOf` reads the genesis embedded balances).
+                      // gl0's apply side then re-verifies hash(authoritativeBalances) === the metagraph-signed `balancesProof` before
+                      // committing (GAP-1 verify-by-proof in `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`).
+                      val authBal: Option[SortedMap[Address, Balance]] = next.toOption.flatMap(_._1.value.authoritativeBalances)
+                      val nextInfo: CurrencySnapshotInfo = authBal.fold(infoOf(next))(b => infoOf(next).copy(balances = b))
+                      // Carry the authoritative balances on BOTH the attested root and the diff (consistency): build a `next` whose info
+                      // half has `balances = authBal` so `currencySnapshotFieldRoots` commits to the authoritative map, matching the diff.
+                      val nextAuth: CurrencyState = next.map { case (inc, _) => (inc, nextInfo) }
                       for {
-                        roots <- GlobalStateConverter.currencySnapshotFieldRoots[F](SortedMap(mg -> next))
+                        roots <- GlobalStateConverter.currencySnapshotFieldRoots[F](SortedMap(mg -> nextAuth))
                         root <- Hasher[F].hash(roots) // (incrementalRoot, infoRoot) pair → single Some/None-invisible Hash (PIN-1)
                         // DIAG: committee's attested per-sub-field root breakdown — match `root=` here to gl0's
                         // `[ACCEPTANCE/ADOPT-VERIFY] attested=` line to pin the diverging half (inc vs info) + `Mg*` sub-field.
-                        cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> next))
+                        cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> nextAuth))
                         _ <- reExecDiagLogger.info(s"[REEXEC-FIELDS] mg=${mg.value.value.take(10)} root=${root.value.take(16)} $cmtDiag")
-                        diff <- ChangeSet.currencyInfoChangeSet[F](mg, priorInfo, infoOf(next))
+                        diff <- ChangeSet.currencyInfoChangeSet[F](mg, priorInfo, nextInfo)
                       } yield Some((root, diff)): Option[(Hash, ChangeSet)]
+                    }
                   case None =>
                     // OMIT-ON-CAN'T-DERIVE (2026-06-13). The derivation produced NO state — the genesis-bootstrap race: this MG's
                     // genesis was already consumed by an earlier shard checkpoint (perMgTip advanced past it) BUT this producer node's

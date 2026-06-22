@@ -237,6 +237,13 @@ object currency {
     allowSpendBlocks: Option[SortedSet[Signed[AllowSpendBlock]]],
     tokenLockBlocks: Option[SortedSet[Signed[TokenLockBlock]]],
     globalSyncView: Option[GlobalSyncView],
+    // The metagraph's OWN authoritative cumulative balance map — the EXACT `CurrencySnapshotInfo.balances` the signed
+    // `stateProof.balancesProof` is computed over (so the field and the proof are byte-consistent: hash(authoritativeBalances) ===
+    // stateProof.balancesProof is the security anchor). Under roots-only sharding gl0 cannot reproduce this map by re-deriving from its
+    // path-dependent base, so ml0 PUSHES it here; the producer puts it in the per-MG checkpoint diff and gl0 ADOPTS it after verifying it
+    // against the metagraph-signed `balancesProof` (no re-derive carry-forward for balances in the sharded path). `None` for genesis and
+    // pre-this-field snapshots (greenfield: Option, no wire back-compat — all nodes rebuild together).
+    authoritativeBalances: Option[SortedMap[Address, Balance]] = None,
     version: SnapshotVersion = SnapshotVersion("0.0.1")
   ) extends IncrementalSnapshot[CurrencySnapshotStateProof]
 
@@ -263,6 +270,7 @@ object currency {
           None,
           None,
           None,
+          None, // authoritativeBalances — None for the genesis→first-incremental transition (populated by the production creator)
           snapshot.version
         )
       }
@@ -301,6 +309,7 @@ object currency {
         None,
         None,
         None,
+        None, // authoritativeBalances — legacy V1 carries no authoritative balance map
         version
       )
   }
@@ -367,6 +376,7 @@ object currency {
           None,
           None,
           genesis.globalSyncView,
+          None, // authoritativeBalances — genesis→first-incremental; the production creator populates it on subsequent incrementals
           genesis.version
         )
       }

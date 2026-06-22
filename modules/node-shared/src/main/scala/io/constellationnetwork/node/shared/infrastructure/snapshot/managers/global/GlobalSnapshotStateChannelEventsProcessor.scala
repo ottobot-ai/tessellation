@@ -684,9 +684,18 @@ object GlobalSnapshotStateChannelEventsProcessor {
           // never matched the metagraph's post-migration `Some(empty)`.)
           derivedBalances = derivedBalancesWithLocksAndSpendsE.getOrElse(lastState.balances)
           committedProof = artifact.stateProof
+          // AUTHORITATIVE BALANCES (committee-state-diff / data-with-fee fix). The metagraph pushes its OWN cumulative balance map on the
+          // signed incremental (`CurrencyIncrementalSnapshot.authoritativeBalances`) — the exact map its `stateProof.balancesProof` is
+          // hashed over. This method runs ONLY on the SHARDED adopt path (`AdoptFromSignedFields`), so when the artifact carries that map
+          // gl0 ADOPTS it directly (verified-by-proof below) rather than carrying the prior forward — `balances` are now authoritative-
+          // sourced, NOT re-derived, in sharded mode. The fee/token-lock/allow-spend replay folds above still compute `derivedBalances`,
+          // but it is only the FALLBACK for a snapshot that carries no authoritative map (pre-this-field / genesis); the authoritative map
+          // OVERRIDES it when present (harmless overlap). The producer reads THIS adopted `balances` back from `infoOf(next)`.
+          authoritativeBalances = artifact.authoritativeBalances
+          candidateBalances = authoritativeBalances.getOrElse(derivedBalances)
           candidate = CurrencySnapshotInfo(
             lastTxRefs = nextLastTxRefs,
-            balances = derivedBalances,
+            balances = candidateBalances,
             lastMessages = nextLastMessagesOpt,
             lastFeeTxRefs = None,
             lastAllowSpendRefs = committedProof.lastAllowSpendRefsProof.map(_ => nextAllowSpendRefs),
@@ -703,10 +712,33 @@ object GlobalSnapshotStateChannelEventsProcessor {
           // field. This replaces the prior all-or-nothing fallback that discarded EVERY verified field (token-locks,
           // refs, sync-view) the moment `balances` diverged — which froze lastCurrencySnapshots at the seed.
           derivedProof <- candidate.stateProof[F](artifact.ordinal)
+          // GAP-1 verify-by-proof for the authoritative balance map: when the metagraph pushed `authoritativeBalances`, it MUST hash to
+          // the metagraph's OWN signed `balancesProof` (`candidate.balances` is the authoritative map here, so `derivedProof.balancesProof`
+          // is its hash). FAIL-CLOSED on mismatch — a fabricated/tampered authoritative map is rejected by RAISING, which the caller's
+          // `handleErrorWith` turns into dropping this binary (the MG's commitment does not advance), never silently carrying a stale value
+          // while claiming authority. (When no authoritative map is carried, the per-field gate below keeps the existing carry-forward.)
+          _ <- Async[F].whenA(
+            authoritativeBalances.isDefined && derivedProof.balancesProof =!= committedProof.balancesProof
+          )(
+            logger.warn(
+              s"[ADOPT-VERIFY] address=${address.show} ordinal=${artifact.ordinal.show} authoritativeBalances != metagraph-signed " +
+                s"balancesProof — DROP (authoritative=${derivedProof.balancesProof.show} signed=${committedProof.balancesProof.show})"
+            ) >> Async[F].raiseError[Unit](
+              new RuntimeException(
+                s"authoritativeBalances for ${address.show} at ordinal ${artifact.ordinal.show} does not match the signed balancesProof"
+              )
+            )
+          )
           adopted = CurrencySnapshotInfo(
             lastTxRefs =
               if (derivedProof.lastTxRefsProof === committedProof.lastTxRefsProof) candidate.lastTxRefs else lastState.lastTxRefs,
-            balances = if (derivedProof.balancesProof === committedProof.balancesProof) candidate.balances else lastState.balances,
+            // Balances are AUTHORITATIVE-sourced in sharded mode: when the metagraph pushed `authoritativeBalances`, adopt it directly
+            // (already verified-by-proof above — no carry-forward). Otherwise fall back to the existing per-field gate (carry the prior
+            // forward when the re-derived balances cannot be verified against the committed proof).
+            balances =
+              if (authoritativeBalances.isDefined) candidate.balances
+              else if (derivedProof.balancesProof === committedProof.balancesProof) candidate.balances
+              else lastState.balances,
             lastMessages =
               if (derivedProof.lastMessagesProof === committedProof.lastMessagesProof) candidate.lastMessages else lastState.lastMessages,
             lastFeeTxRefs =

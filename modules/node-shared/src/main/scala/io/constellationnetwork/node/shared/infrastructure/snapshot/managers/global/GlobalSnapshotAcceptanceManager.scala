@@ -813,7 +813,8 @@ object GlobalSnapshotAcceptanceManager {
                     // semantics; keep it verbatim (the producer emits an empty diff for a pure-genesis window).
                     case Some(_) if derivedState.isLeft => Async[F].pure((mg -> derivedState).some)
                     case Some((wireDiff, attestedRoot)) =>
-                      val lastIncremental = derivedState.toOption.get._1 // safe: isLeft handled above
+                      val lastIncremental = derivedState.toOption.get._1 // safe: isLeft handled above (window TIP — newest incremental,
+                      //                                                    whose cumulative balances == the producer's authoritativeBalances)
                       val diff = ChangeSet.fromWire(wireDiff)
                       for {
                         nextInfo <- ChangeSet.reconstructInfoFromDiff[F](mg, priorInfoOf(mg), diff)
@@ -822,7 +823,31 @@ object GlobalSnapshotAcceptanceManager {
                         recomputed <- hasher.hash(roots) // (incrementalRoot, infoRoot) → single Some/None-invisible Hash (PIN-1)
                         out <-
                           if (recomputed === attestedRoot)
-                            (mg -> nextState).some.pure[F]
+                            // GAP-1 verify-by-proof (committee-state-diff / authoritativeBalances), gated to the AUTHORITATIVE-balances path:
+                            // when the metagraph PUSHED `authoritativeBalances`, the per-MG root matching the committee attestation only ties
+                            // the reconstructed balances to the PRODUCER's claim, so ALSO verify they hash to the METAGRAPH's OWN signed
+                            // `balancesProof` (on the tip incremental's signed `stateProof`) — gl0 adopts the authoritative map only if it is
+                            // the one the metagraph itself signed, never a value a Byzantine producer fabricated and attested. FAIL-CLOSED on
+                            // mismatch (drop, do NOT adopt). When NO authoritative map is carried (legacy / pre-this-field snapshots), the
+                            // balances came from the re-derived committee diff and there is no metagraph-signed map to verify against — the
+                            // `recomputed === attestedRoot` check above is the guarantee, so adopt directly (byte-unchanged from before).
+                            // `balancesProof` is exactly `balances.hash` (`CurrencySnapshotInfo.stateProof` / `stateProofBuilder`), so we hash
+                            // `nextInfo.balances` directly — selector-independent and free of the method-level `globalStateProofSelector`.
+                            if (lastIncremental.value.authoritativeBalances.isDefined)
+                              hasher.hash(nextInfo.balances).flatMap { reconstructedBalancesProof =>
+                                val metagraphSignedBalancesProof = lastIncremental.value.stateProof.balancesProof
+                                if (reconstructedBalancesProof === metagraphSignedBalancesProof)
+                                  (mg -> nextState).some.pure[F]
+                                else
+                                  loggerBundle.app
+                                    .warn(
+                                      s"[ADOPT-VERIFY] ordinal=$ordinal mg=${mg.value.value.take(8)} balances != metagraph-signed " +
+                                        s"balancesProof — DROP (reconstructed=${reconstructedBalancesProof.value.take(16)}... " +
+                                        s"metagraphSigned=${metagraphSignedBalancesProof.value.take(16)}...)"
+                                    )
+                                    .as(none[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)])
+                              }
+                            else (mg -> nextState).some.pure[F]
                           else
                             for {
                               // DIAG: gl0's reconstructed per-sub-field root breakdown — match `attested=` here to the committee's

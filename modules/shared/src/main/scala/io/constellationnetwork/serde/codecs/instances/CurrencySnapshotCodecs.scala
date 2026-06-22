@@ -1,12 +1,14 @@
 package io.constellationnetwork.serde.codecs.instances
 
-import scala.collection.immutable.SortedSet
+import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.currency.dataApplication.FeeTransaction
 import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSnapshotSync
 import io.constellationnetwork.schema._
+import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.SharedArtifact
+import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.currencyMessage.CurrencyMessage
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
@@ -18,7 +20,9 @@ import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.OptionCodec.option
+import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMap
 import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSet
+import io.constellationnetwork.serde.codecs.instances.AddressCodec.{codec => addressCodec}
 import io.constellationnetwork.serde.codecs.instances.CurrencyAtomCodecs._
 import io.constellationnetwork.serde.codecs.instances.CurrencyRecordCodecs._
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs._
@@ -106,6 +110,11 @@ object CurrencySnapshotCodecs {
   private val optArtifactsCodec = option(sortedSet(sharedArtifactCodec))
   private val optAllowSpendBlocksCodec = option(sortedSet(signedAllowSpendBlockCodec))
   private val optTokenLockBlocksCodec = option(sortedSet(signedTokenLockBlockCodec))
+  // The metagraph's authoritative cumulative balance map (the roots-only sharding security anchor — see
+  // `CurrencyIncrementalSnapshot.authoritativeBalances`). Reuses the same `SortedMap[Address, Balance]` encoding as
+  // `CurrencySnapshotInfo.balances` so the on-disk/scodec form stays byte-consistent with the Circe form.
+  private val authoritativeBalancesMapCodec: Codec[SortedMap[Address, Balance]] = sortedMap(addressCodec, Codec[Balance])
+  private val optAuthoritativeBalancesCodec = option(authoritativeBalancesMapCodec)
 
   implicit val currencyIncrementalSnapshotCodec: Codec[CurrencyIncrementalSnapshot] =
     (ordinalCodec ::
@@ -125,12 +134,13 @@ object CurrencySnapshotCodecs {
       optAllowSpendBlocksCodec ::
       optTokenLockBlocksCodec ::
       optGlobalSyncViewCodec ::
+      optAuthoritativeBalancesCodec ::
       versionCodec)
       .xmap[CurrencyIncrementalSnapshot](
         {
           case o :: h :: sh :: lsh :: blks :: rws :: tp :: sp :: ep ::
               da :: msgs :: syncs :: fees :: artifacts :: asb :: tlb ::
-              gsv :: v :: HNil =>
+              gsv :: authBal :: v :: HNil =>
             CurrencyIncrementalSnapshot(
               o,
               h,
@@ -149,6 +159,7 @@ object CurrencySnapshotCodecs {
               asb,
               tlb,
               gsv,
+              authBal,
               v
             )
         },
@@ -170,6 +181,7 @@ object CurrencySnapshotCodecs {
             s.allowSpendBlocks ::
             s.tokenLockBlocks ::
             s.globalSyncView ::
+            s.authoritativeBalances ::
             s.version ::
             HNil
       )
