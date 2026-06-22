@@ -298,7 +298,14 @@ object CurrencySnapshotCreator {
             // `currencySnapshotAcceptanceResult.stateProof.balancesProof` (committed above) is hashed over (`csi.stateProof` in
             // `CurrencySnapshotAcceptanceManager`), so the field and the proof are byte-consistent — the security anchor gl0 verifies
             // before adopting it under roots-only sharding (no balance re-derive carry-forward).
-            currencySnapshotAcceptanceResult.info.balances.some
+            currencySnapshotAcceptanceResult.info.balances.some,
+            // authoritativeActiveAllowSpends / authoritativeActiveTokenLocks — the metagraph's OWN active-set maps. These are the EXACT
+            // `info.activeAllowSpends` / `info.activeTokenLocks` that `stateProof.activeAllowSpends` / `stateProof.activeTokenLocks`
+            // (committed above) are hashed over (`csi.stateProof`), so the field and the proof are byte-consistent — the security anchor gl0
+            // verifies before adopting them under roots-only sharding (these are reduced by cross-shard spends gl0 cannot replay). Already
+            // Option-shaped (`None` pre-migration, `Some(map)` post-migration) — pass through as-is.
+            currencySnapshotAcceptanceResult.info.activeAllowSpends,
+            currencySnapshotAcceptanceResult.info.activeTokenLocks
           )
 
           artifactSize: Int <- JsonSerializer[F].serialize(artifact).map(_.length)

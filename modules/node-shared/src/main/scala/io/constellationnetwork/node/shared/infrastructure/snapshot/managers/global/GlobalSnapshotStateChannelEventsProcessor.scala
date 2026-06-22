@@ -693,16 +693,27 @@ object GlobalSnapshotStateChannelEventsProcessor {
           // OVERRIDES it when present (harmless overlap). The producer reads THIS adopted `balances` back from `infoOf(next)`.
           authoritativeBalances = artifact.authoritativeBalances
           candidateBalances = authoritativeBalances.getOrElse(derivedBalances)
+          // AUTHORITATIVE ACTIVE SETS (committee-state-diff follow-up): same anchor as balances. These active-set maps are reduced by
+          // cross-shard SPEND transactions whose input gl0 cannot see, so gl0's re-derived `nextActiveAllowSpends` / `nextActiveTokenLocks`
+          // RETAIN an allow-spend/token-lock the metagraph already consumed. When the metagraph pushes its authoritative (reduced) set, gl0
+          // ADOPTS it directly (verified-by-proof below); otherwise (`None` / pre-this-field) it falls back to the derived set whose SHAPE is
+          // driven off the committed proof (`None -> None`, `Some -> Some(map)`), keeping the existing per-field gate behavior.
+          authoritativeActiveAllowSpends = artifact.authoritativeActiveAllowSpends
+          authoritativeActiveTokenLocks = artifact.authoritativeActiveTokenLocks
+          candidateActiveAllowSpends = authoritativeActiveAllowSpends.orElse(
+            committedProof.activeAllowSpends.map(_ => nextActiveAllowSpends)
+          )
+          candidateActiveTokenLocks = authoritativeActiveTokenLocks.orElse(committedProof.activeTokenLocks.map(_ => nextActiveTokenLocks))
           candidate = CurrencySnapshotInfo(
             lastTxRefs = nextLastTxRefs,
             balances = candidateBalances,
             lastMessages = nextLastMessagesOpt,
             lastFeeTxRefs = None,
             lastAllowSpendRefs = committedProof.lastAllowSpendRefsProof.map(_ => nextAllowSpendRefs),
-            activeAllowSpends = committedProof.activeAllowSpends.map(_ => nextActiveAllowSpends),
+            activeAllowSpends = candidateActiveAllowSpends,
             globalSnapshotSyncView = committedProof.globalSnapshotSync.map(_ => nextGlobalSnapshotSyncView),
             lastTokenLockRefs = committedProof.lastTokenLockRefsProof.map(_ => nextTokenLockRefs),
-            activeTokenLocks = committedProof.activeTokenLocks.map(_ => nextActiveTokenLocks)
+            activeTokenLocks = candidateActiveTokenLocks
           )
 
           // Economic-security gate, PER FIELD: commit each derived field whose hash matches the committee-attested
@@ -729,6 +740,34 @@ object GlobalSnapshotStateChannelEventsProcessor {
               )
             )
           )
+          // GAP-1 verify-by-proof for the authoritative active-allow-spend set (committee-state-diff follow-up): when the metagraph pushed
+          // `authoritativeActiveAllowSpends`, its Option[Hash] (`derivedProof.activeAllowSpends`, the candidate's hash) MUST equal the
+          // metagraph's OWN signed `activeAllowSpends` proof. FAIL-CLOSED on mismatch (RAISE → caller drops the binary, MG does not advance).
+          _ <- Async[F].whenA(
+            authoritativeActiveAllowSpends.isDefined && derivedProof.activeAllowSpends =!= committedProof.activeAllowSpends
+          )(
+            logger.warn(
+              s"[ADOPT-VERIFY] address=${address.show} ordinal=${artifact.ordinal.show} activeAllowSpends != metagraph-signed " +
+                s"proof — DROP (authoritative=${derivedProof.activeAllowSpends.show} signed=${committedProof.activeAllowSpends.show})"
+            ) >> Async[F].raiseError[Unit](
+              new RuntimeException(
+                s"authoritativeActiveAllowSpends for ${address.show} at ordinal ${artifact.ordinal.show} does not match the signed proof"
+              )
+            )
+          )
+          // GAP-1 verify-by-proof for the authoritative active-token-lock set — same shape as activeAllowSpends above.
+          _ <- Async[F].whenA(
+            authoritativeActiveTokenLocks.isDefined && derivedProof.activeTokenLocks =!= committedProof.activeTokenLocks
+          )(
+            logger.warn(
+              s"[ADOPT-VERIFY] address=${address.show} ordinal=${artifact.ordinal.show} activeTokenLocks != metagraph-signed " +
+                s"proof — DROP (authoritative=${derivedProof.activeTokenLocks.show} signed=${committedProof.activeTokenLocks.show})"
+            ) >> Async[F].raiseError[Unit](
+              new RuntimeException(
+                s"authoritativeActiveTokenLocks for ${address.show} at ordinal ${artifact.ordinal.show} does not match the signed proof"
+              )
+            )
+          )
           adopted = CurrencySnapshotInfo(
             lastTxRefs =
               if (derivedProof.lastTxRefsProof === committedProof.lastTxRefsProof) candidate.lastTxRefs else lastState.lastTxRefs,
@@ -747,8 +786,11 @@ object GlobalSnapshotStateChannelEventsProcessor {
             lastAllowSpendRefs =
               if (derivedProof.lastAllowSpendRefsProof === committedProof.lastAllowSpendRefsProof) candidate.lastAllowSpendRefs
               else lastState.lastAllowSpendRefs,
+            // activeAllowSpends are AUTHORITATIVE-sourced in sharded mode: when the metagraph pushed `authoritativeActiveAllowSpends`, adopt
+            // it directly (already verified-by-proof above — no carry-forward). Otherwise fall back to the existing per-field gate.
             activeAllowSpends =
-              if (derivedProof.activeAllowSpends === committedProof.activeAllowSpends) candidate.activeAllowSpends
+              if (authoritativeActiveAllowSpends.isDefined) candidate.activeAllowSpends
+              else if (derivedProof.activeAllowSpends === committedProof.activeAllowSpends) candidate.activeAllowSpends
               else lastState.activeAllowSpends,
             globalSnapshotSyncView =
               if (derivedProof.globalSnapshotSync === committedProof.globalSnapshotSync) candidate.globalSnapshotSyncView
@@ -756,8 +798,10 @@ object GlobalSnapshotStateChannelEventsProcessor {
             lastTokenLockRefs =
               if (derivedProof.lastTokenLockRefsProof === committedProof.lastTokenLockRefsProof) candidate.lastTokenLockRefs
               else lastState.lastTokenLockRefs,
+            // activeTokenLocks are AUTHORITATIVE-sourced in sharded mode — same as activeAllowSpends above.
             activeTokenLocks =
-              if (derivedProof.activeTokenLocks === committedProof.activeTokenLocks) candidate.activeTokenLocks
+              if (authoritativeActiveTokenLocks.isDefined) candidate.activeTokenLocks
+              else if (derivedProof.activeTokenLocks === committedProof.activeTokenLocks) candidate.activeTokenLocks
               else lastState.activeTokenLocks
           )
           _ <- Async[F].whenA(derivedProof =!= committedProof)(

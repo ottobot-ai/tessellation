@@ -5,7 +5,7 @@ import cats.data.NonEmptyList
 import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
-import scala.collection.immutable.{Map, SortedMap}
+import scala.collection.immutable.{Map, SortedMap, SortedSet}
 
 import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot, CurrencySnapshotInfo}
 import io.constellationnetwork.json.JsonSerializer
@@ -25,6 +25,8 @@ import io.constellationnetwork.schema.mpt.GlobalStateConverter
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
+import io.constellationnetwork.schema.swap.AllowSpend
+import io.constellationnetwork.schema.tokenLock.TokenLock
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal, StateProofSelector}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
@@ -317,7 +319,18 @@ object ShardCheckpointWiring {
                       // gl0's apply side then re-verifies hash(authoritativeBalances) === the metagraph-signed `balancesProof` before
                       // committing (GAP-1 verify-by-proof in `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`).
                       val authBal: Option[SortedMap[Address, Balance]] = next.toOption.flatMap(_._1.value.authoritativeBalances)
-                      val nextInfo: CurrencySnapshotInfo = authBal.fold(infoOf(next))(b => infoOf(next).copy(balances = b))
+                      // Active-allow-spend / active-token-lock authoritative maps (committee-state-diff follow-up): same anchor as balances,
+                      // but Option-shaped, so OVERRIDE only when the metagraph pushed a value (`orElse` falls back to the derived set when
+                      // the metagraph carried `None`). Reduced by cross-shard spends gl0 cannot replay, so the derived set would be stale.
+                      val authAS: Option[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
+                        next.toOption.flatMap(_._1.value.authoritativeActiveAllowSpends)
+                      val authTL: Option[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
+                        next.toOption.flatMap(_._1.value.authoritativeActiveTokenLocks)
+                      val nextInfo: CurrencySnapshotInfo = infoOf(next).copy(
+                        balances = authBal.getOrElse(infoOf(next).balances),
+                        activeAllowSpends = authAS.orElse(infoOf(next).activeAllowSpends),
+                        activeTokenLocks = authTL.orElse(infoOf(next).activeTokenLocks)
+                      )
                       // Carry the authoritative balances on BOTH the attested root and the diff (consistency): build a `next` whose info
                       // half has `balances = authBal` so `currencySnapshotFieldRoots` commits to the authoritative map, matching the diff.
                       val nextAuth: CurrencyState = next.map { case (inc, _) => (inc, nextInfo) }

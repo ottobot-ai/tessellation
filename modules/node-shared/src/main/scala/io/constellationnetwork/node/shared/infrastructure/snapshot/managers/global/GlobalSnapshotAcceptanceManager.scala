@@ -823,31 +823,45 @@ object GlobalSnapshotAcceptanceManager {
                         recomputed <- hasher.hash(roots) // (incrementalRoot, infoRoot) → single Some/None-invisible Hash (PIN-1)
                         out <-
                           if (recomputed === attestedRoot)
-                            // GAP-1 verify-by-proof (committee-state-diff / authoritativeBalances), gated to the AUTHORITATIVE-balances path:
-                            // when the metagraph PUSHED `authoritativeBalances`, the per-MG root matching the committee attestation only ties
-                            // the reconstructed balances to the PRODUCER's claim, so ALSO verify they hash to the METAGRAPH's OWN signed
-                            // `balancesProof` (on the tip incremental's signed `stateProof`) — gl0 adopts the authoritative map only if it is
-                            // the one the metagraph itself signed, never a value a Byzantine producer fabricated and attested. FAIL-CLOSED on
-                            // mismatch (drop, do NOT adopt). When NO authoritative map is carried (legacy / pre-this-field snapshots), the
-                            // balances came from the re-derived committee diff and there is no metagraph-signed map to verify against — the
-                            // `recomputed === attestedRoot` check above is the guarantee, so adopt directly (byte-unchanged from before).
-                            // `balancesProof` is exactly `balances.hash` (`CurrencySnapshotInfo.stateProof` / `stateProofBuilder`), so we hash
-                            // `nextInfo.balances` directly — selector-independent and free of the method-level `globalStateProofSelector`.
-                            if (lastIncremental.value.authoritativeBalances.isDefined)
-                              hasher.hash(nextInfo.balances).flatMap { reconstructedBalancesProof =>
-                                val metagraphSignedBalancesProof = lastIncremental.value.stateProof.balancesProof
-                                if (reconstructedBalancesProof === metagraphSignedBalancesProof)
+                            // GAP-1 verify-by-proof (committee-state-diff / authoritative* fields), gated PER FIELD to the AUTHORITATIVE path:
+                            // when the metagraph PUSHED `authoritativeBalances` / `authoritativeActiveAllowSpends` / `authoritativeActiveTokenLocks`,
+                            // the per-MG root matching the committee attestation only ties the reconstructed value to the PRODUCER's claim, so
+                            // ALSO verify each hashes to the METAGRAPH's OWN signed proof (on the tip incremental's signed `stateProof`) — gl0
+                            // adopts an authoritative value only if it is the one the metagraph itself signed, never a value a Byzantine producer
+                            // fabricated and attested. FAIL-CLOSED on any present-and-mismatched field (drop, do NOT adopt — ALL present fields
+                            // must pass). When a field carries NO authoritative value (legacy / pre-this-field snapshots) it came from the
+                            // re-derived committee diff and has no metagraph-signed map to verify against — `recomputed === attestedRoot` is the
+                            // guarantee, so it is left out of this check (byte-unchanged from before). `balancesProof` is exactly `balances.hash`
+                            // and the active-set proofs are `active*.traverse(_.hash)` (`CurrencySnapshotInfo.stateProof` / `stateProofBuilder`),
+                            // so we hash `nextInfo.{balances,activeAllowSpends,activeTokenLocks}` directly — selector-independent.
+                            (
+                              hasher.hash(nextInfo.balances),
+                              nextInfo.activeAllowSpends.traverse(hasher.hash(_)),
+                              nextInfo.activeTokenLocks.traverse(hasher.hash(_))
+                            ).tupled.flatMap {
+                              case (reconstructedBalancesProof, reconstructedActiveAllowSpends, reconstructedActiveTokenLocks) =>
+                                val balancesOk =
+                                  !lastIncremental.value.authoritativeBalances.isDefined ||
+                                    reconstructedBalancesProof === lastIncremental.value.stateProof.balancesProof
+                                val activeAllowSpendsOk =
+                                  !lastIncremental.value.authoritativeActiveAllowSpends.isDefined ||
+                                    reconstructedActiveAllowSpends === lastIncremental.value.stateProof.activeAllowSpends
+                                val activeTokenLocksOk =
+                                  !lastIncremental.value.authoritativeActiveTokenLocks.isDefined ||
+                                    reconstructedActiveTokenLocks === lastIncremental.value.stateProof.activeTokenLocks
+                                if (balancesOk && activeAllowSpendsOk && activeTokenLocksOk)
                                   (mg -> nextState).some.pure[F]
                                 else
                                   loggerBundle.app
                                     .warn(
-                                      s"[ADOPT-VERIFY] ordinal=$ordinal mg=${mg.value.value.take(8)} balances != metagraph-signed " +
-                                        s"balancesProof — DROP (reconstructed=${reconstructedBalancesProof.value.take(16)}... " +
-                                        s"metagraphSigned=${metagraphSignedBalancesProof.value.take(16)}...)"
+                                      s"[ADOPT-VERIFY] ordinal=$ordinal mg=${mg.value.value.take(8)} authoritative field != metagraph-signed " +
+                                        s"proof — DROP (balancesOk=$balancesOk activeAllowSpendsOk=$activeAllowSpendsOk " +
+                                        s"activeTokenLocksOk=$activeTokenLocksOk reconstructedBalancesProof=${reconstructedBalancesProof.value
+                                            .take(16)}... metagraphSignedBalancesProof=${lastIncremental.value.stateProof.balancesProof.value
+                                            .take(16)}...)"
                                     )
                                     .as(none[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)])
-                              }
-                            else (mg -> nextState).some.pure[F]
+                            }
                           else
                             for {
                               // DIAG: gl0's reconstructed per-sub-field root breakdown — match `attested=` here to the committee's

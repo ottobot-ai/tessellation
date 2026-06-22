@@ -244,6 +244,16 @@ object currency {
     // against the metagraph-signed `balancesProof` (no re-derive carry-forward for balances in the sharded path). `None` for genesis and
     // pre-this-field snapshots (greenfield: Option, no wire back-compat — all nodes rebuild together).
     authoritativeBalances: Option[SortedMap[Address, Balance]] = None,
+    // The metagraph's OWN authoritative active-allow-spend / active-token-lock maps — the EXACT
+    // `CurrencySnapshotInfo.activeAllowSpends` / `activeTokenLocks` the signed `stateProof.activeAllowSpends` /
+    // `stateProof.activeTokenLocks` (`activeAllowSpends.traverse(_.hash)` / `activeTokenLocks.traverse(_.hash)`) are computed over (so
+    // each field and its proof are byte-consistent — the security anchor). These are reduced by cross-shard SPEND transactions whose
+    // input is global-snapshot-sourced (empty in gl0's split-safe replay), so gl0's re-derivation RETAINS an allow-spend/token-lock the
+    // metagraph already consumed; ml0 PUSHES the authoritative (reduced) sets here, the producer puts them in the per-MG checkpoint diff,
+    // and gl0 ADOPTS them after verifying each against the metagraph-signed proof (no re-derive carry-forward for these in the sharded
+    // path). `None` for genesis and pre-this-field snapshots (greenfield: Option, no wire back-compat — all nodes rebuild together).
+    authoritativeActiveAllowSpends: Option[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] = None,
+    authoritativeActiveTokenLocks: Option[SortedMap[Address, SortedSet[Signed[TokenLock]]]] = None,
     version: SnapshotVersion = SnapshotVersion("0.0.1")
   ) extends IncrementalSnapshot[CurrencySnapshotStateProof]
 
@@ -271,6 +281,8 @@ object currency {
           None,
           None,
           None, // authoritativeBalances — None for the genesis→first-incremental transition (populated by the production creator)
+          None, // authoritativeActiveAllowSpends — None for the genesis→first-incremental transition
+          None, // authoritativeActiveTokenLocks — None for the genesis→first-incremental transition
           snapshot.version
         )
       }
@@ -310,6 +322,8 @@ object currency {
         None,
         None,
         None, // authoritativeBalances — legacy V1 carries no authoritative balance map
+        None, // authoritativeActiveAllowSpends — legacy V1 carries no authoritative active-allow-spend map
+        None, // authoritativeActiveTokenLocks — legacy V1 carries no authoritative active-token-lock map
         version
       )
   }
@@ -377,6 +391,8 @@ object currency {
           None,
           genesis.globalSyncView,
           None, // authoritativeBalances — genesis→first-incremental; the production creator populates it on subsequent incrementals
+          None, // authoritativeActiveAllowSpends — genesis→first-incremental; populated on subsequent incrementals
+          None, // authoritativeActiveTokenLocks — genesis→first-incremental; populated on subsequent incrementals
           genesis.version
         )
       }

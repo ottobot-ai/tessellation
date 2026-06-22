@@ -142,7 +142,9 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
     tokenLockBlocks: Option[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLockBlock]]] = None,
     allowSpendBlocks: Option[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpendBlock]]] = None,
     globalSyncView: Option[io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSyncView] = None,
-    authoritativeBalances: Option[SortedMap[Address, Balance]] = None
+    authoritativeBalances: Option[SortedMap[Address, Balance]] = None,
+    authoritativeActiveAllowSpends: Option[SortedMap[Address, SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]]] = None,
+    authoritativeActiveTokenLocks: Option[SortedMap[Address, SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]]] = None
   )(implicit sp: SecurityProvider[IO], h: Hasher[IO]): IO[Signed[CurrencyIncrementalSnapshot]] = {
     val snapshot = CurrencyIncrementalSnapshot(
       SnapshotOrdinal.unsafeApply(snapOrdinal),
@@ -162,7 +164,9 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
       allowSpendBlocks,
       tokenLockBlocks,
       globalSyncView,
-      authoritativeBalances
+      authoritativeBalances,
+      authoritativeActiveAllowSpends,
+      authoritativeActiveTokenLocks
     )
     forAsyncHasher[IO, CurrencyIncrementalSnapshot](snapshot, mgKeyPair)
   }
@@ -262,6 +266,33 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
         NonEmptySet.one(tl)
       ),
       tl.proofs
+    )
+
+  /** A signed `AllowSpend` from `source` → `destination` of `amount` (+ `fee`), valid through `lastValidEpoch`. Lives in
+    * `CurrencySnapshotInfo.activeAllowSpends` once accepted by ml0. The adopt derivation replays already-accepted events without
+    * re-validating signatures, so the SOURCE key is sufficient.
+    */
+  private def signedAllowSpend(
+    source: Address,
+    destination: Address,
+    amount: Long,
+    fee: Long,
+    lastValidEpoch: EpochProgress,
+    sourceKeyPair: KeyPair
+  )(implicit sp: SecurityProvider[IO], h: Hasher[IO]): IO[Signed[io.constellationnetwork.schema.swap.AllowSpend]] =
+    forAsyncHasher[IO, io.constellationnetwork.schema.swap.AllowSpend](
+      io.constellationnetwork.schema.swap.AllowSpend(
+        source = source,
+        destination = destination,
+        currencyId = None,
+        amount = io.constellationnetwork.schema.swap.SwapAmount(PosLong.unsafeFrom(amount)),
+        fee = io.constellationnetwork.schema.swap.AllowSpendFee(NonNegLong.unsafeFrom(fee)),
+        parent = io.constellationnetwork.schema.swap
+          .AllowSpendReference(io.constellationnetwork.schema.swap.AllowSpendOrdinal(NonNegLong(0L)), Hash.empty),
+        lastValidEpochProgress = lastValidEpoch,
+        approvers = List.empty
+      ),
+      sourceKeyPair
     )
 
   /** Serialize a signed incremental into an SC binary (the on-wire shape `processCurrencySnapshots` decodes). */
@@ -679,6 +710,123 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
         producerCommitted.map(_._2.balances) == followerCommitted.map(_._2.balances),
         producerCommitted.map(_._2) == followerCommitted.map(_._2),
         // GAP-1: tampered authoritative map ⇒ MG DROPPED (not adopted) — fail-closed, never silently carried forward.
+        tamperedCommitted == None
+      )
+  }
+
+  /** ACTIVE-ALLOW-SPEND reduction via AUTHORITATIVE active sets + GAP-1 verify-by-proof (the committee-state-diff follow-up).
+    *
+    * `activeAllowSpends` / `activeTokenLocks` are reduced by cross-shard SPEND transactions whose input is global-snapshot-sourced — gl0's
+    * split-safe replay sees NO such spend, so its re-derivation RETAINS an allow-spend the metagraph already consumed. (Here: the prior
+    * `Right` info carries an active allow-spend, the window tip carries NO allow-spend blocks and NO `globalSyncView`, so gl0's add-only
+    * merge keeps the stale `Some({source -> {as}})`.) The metagraph's authoritative set has REMOVED it (`Some(empty)` — the cross-shard
+    * spend consumed it). The fix: ml0 PUSHES `authoritativeActiveAllowSpends`, and gl0 ADOPTS it after verifying it hashes to the
+    * metagraph's OWN signed `stateProof.activeAllowSpends` (an Option[Hash] comparison).
+    *
+    * Asserts BOTH directions:
+    *   - CORRECTNESS / regression guard: gl0 mirrors the metagraph's reduced `Some(empty)`, NOT the re-derived stale `Some({source ->
+    *     {as}})`. This MUST FAIL without the authoritative field (the per-field gate carries the stale prior forward).
+    *   - GAP-1: a TAMPERED authoritative set whose hash != the metagraph-signed `activeAllowSpends` proof is REJECTED — the MG is dropped.
+    */
+  test(
+    "adopt path (cross-shard spend): a consumed allow-spend gl0's replay would RETAIN is mirrored as the metagraph's reduced " +
+      "authoritativeActiveAllowSpends + verified against the signed proof; a tampered set is dropped"
+  ) { res =>
+    implicit val (h, sp, j) = res
+    for {
+      processor <- mkProcessor
+      mgKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      mgAddr = PublicKeyOps(mgKeyPair.getPublic).toAddress
+
+      sourceKp <- KeyPairGenerator.makeKeyPair[IO]
+      destKp <- KeyPairGenerator.makeKeyPair[IO]
+      source = PublicKeyOps(sourceKp.getPublic).toAddress
+      dest = PublicKeyOps(destKp.getPublic).toAddress
+
+      // The allow-spend gl0's base still tracks as active (the metagraph already consumed it via a cross-shard spend gl0 cannot see).
+      staleAllowSpend <- signedAllowSpend(source, dest, amount = 10L, fee = 1L, lastValidEpoch = EpochProgress.MaxValue, sourceKp)
+      staleActiveAllowSpends: SortedMap[Address, SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]] =
+        SortedMap(source -> SortedSet(staleAllowSpend))(Address.OrderingInstance)
+
+      // Prior `Right` at ordinal 1 — gl0's base mirror still carrying the not-yet-consumed allow-spend.
+      priorInfo = info(None).copy(activeAllowSpends = staleActiveAllowSpends.some)
+      firstIncremental <- signedIncremental(1L, Hash.empty, None, mgKeyPair)
+      firstHash <- firstIncremental.toHashed.map(_.hash)
+      prior: SortedMap[Address, CurrencySnapshotWithState] =
+        SortedMap(mgAddr -> (Right((firstIncremental, priorInfo)): CurrencySnapshotWithState))(Address.OrderingInstance)
+
+      // The metagraph's authoritative active set has the allow-spend REMOVED (`Some(empty)`). The window tip carries NO allow-spend
+      // blocks/globalSyncView, so gl0's re-derivation would keep the stale `Some({source -> {as}})`; the committed proof commits to the
+      // reduced authoritative set (the anchor).
+      reducedActiveAllowSpends: SortedMap[Address, SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]] =
+        SortedMap.empty[Address, SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](Address.OrderingInstance)
+      expectedInfo = priorInfo.copy(activeAllowSpends = reducedActiveAllowSpends.some)
+      committedProof <- expectedInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+
+      goodIncremental <- signedIncremental(
+        2L,
+        firstHash,
+        None,
+        mgKeyPair,
+        stateProof = committedProof,
+        authoritativeActiveAllowSpends = reducedActiveAllowSpends.some
+      )
+      goodBinary <- binaryOf(goodIncremental, firstHash, mgKeyPair)
+      goodAdopted = SortedMap(mgAddr -> NonEmptyList.of(goodBinary))(Address.OrderingInstance)
+
+      // Run twice with DIFFERENT node-local accumulator histories — the adopted authoritative set must be byte-identical (split-safe).
+      producerResult <- processor.processCurrencySnapshots(
+        ordinal,
+        SortedMap(source -> Balance(NonNegLong(999L)))(Address.OrderingInstance),
+        prior,
+        goodAdopted,
+        _ => None.pure[IO],
+        CurrencyAdoptionMode.AdoptFromSignedFields
+      )
+      followerResult <- processor.processCurrencySnapshots(
+        ordinal,
+        SortedMap.empty[Address, Balance],
+        prior,
+        goodAdopted,
+        _ => None.pure[IO],
+        CurrencyAdoptionMode.AdoptFromSignedFields
+      )
+      producerCommitted = committedInfo(producerResult, mgAddr)
+      followerCommitted = committedInfo(followerResult, mgAddr)
+
+      // GAP-1: the authoritative set is TAMPERED (claims the allow-spend is still active) but the signed proof commits to the reduced
+      // `Some(empty)`. hash(tampered) != signed proof ⇒ gl0 fails closed and DROPS the MG (its commitment does not advance).
+      tamperedIncremental <- signedIncremental(
+        2L,
+        firstHash,
+        None,
+        mgKeyPair,
+        stateProof = committedProof, // still commits to the reduced (honest) Some(empty) proof
+        authoritativeActiveAllowSpends = staleActiveAllowSpends.some
+      )
+      tamperedBinary <- binaryOf(tamperedIncremental, firstHash, mgKeyPair)
+      tamperedResult <- processor.processCurrencySnapshots(
+        ordinal,
+        SortedMap.empty[Address, Balance],
+        prior,
+        SortedMap(mgAddr -> NonEmptyList.of(tamperedBinary))(Address.OrderingInstance),
+        _ => None.pure[IO],
+        CurrencyAdoptionMode.AdoptFromSignedFields
+      )
+      tamperedCommitted = committedInfo(tamperedResult, mgAddr)
+    } yield
+      expect.all(
+        // Commitment advanced to ordinal 2.
+        producerCommitted.map(_._1) == Some(SnapshotOrdinal(NonNegLong(2L))),
+        // CORRECTNESS / regression guard: gl0 mirrored the metagraph's reduced (empty) authoritative active set.
+        producerCommitted.flatMap(_._2.activeAllowSpends) == Some(reducedActiveAllowSpends),
+        producerCommitted.map(_._2) == Some(expectedInfo),
+        // NOT the stale prior — the carry-forward path was NOT taken for activeAllowSpends.
+        producerCommitted.flatMap(_._2.activeAllowSpends) != Some(staleActiveAllowSpends),
+        // DETERMINISM: producer-role and follower-role nodes commit BYTE-IDENTICAL per-MG active sets despite different accumulators.
+        producerCommitted.flatMap(_._2.activeAllowSpends) == followerCommitted.flatMap(_._2.activeAllowSpends),
+        producerCommitted.map(_._2) == followerCommitted.map(_._2),
+        // GAP-1: tampered authoritative active set ⇒ MG DROPPED (not adopted) — fail-closed.
         tamperedCommitted == None
       )
   }
