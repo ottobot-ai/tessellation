@@ -817,7 +817,25 @@ object GlobalSnapshotAcceptanceManager {
                       //                                                    whose cumulative balances == the producer's authoritativeBalances)
                       val diff = ChangeSet.fromWire(wireDiff)
                       for {
-                        nextInfo <- ChangeSet.reconstructInfoFromDiff[F](mg, priorInfoOf(mg), diff)
+                        nextInfoRaw <- ChangeSet.reconstructInfoFromDiff[F](mg, priorInfoOf(mg), diff)
+                        // BASE-INDEPENDENT AUTHORITATIVE OVERRIDE (multi-mg per-MG-root determinism). The committee
+                        // `perMetagraphStateDiff` is a DELTA over the PRODUCER's finalized base; when gl0's OWN base S(N)
+                        // lags the producer's (slower catch-up at multi-mg / cross-shard), applying the delta onto gl0's base
+                        // reconstructs the WRONG value for any field with a non-empty base (notably `balances` — the 14 genesis
+                        // keys) → gl0's per-MG root != the committee-attested root → the MG's currency advance is DROPPED in a
+                        // stuck "S(N) lags" deadlock (gl0 can't adopt → its base never catches up → every re-offer mismatches).
+                        // The metagraph PUSHES its authoritative CUMULATIVE balances/active-sets on the signed incremental, so
+                        // OVERRIDE the reconstructed values with them (base-INDEPENDENT) before computing BOTH the per-MG root and
+                        // the committed `nextInfo`. This matches the producer (which commits the same authoritative values via
+                        // `ShardCheckpointWiring`'s `nextAuth`), so the root agrees REGARDLESS of base lag, and the served
+                        // `MgBalances` (built from this committed `nextInfo`) is the authoritative map. The GAP-1 verify below
+                        // still confirms each value hashes to the metagraph's OWN signed proof. Absent (legacy / pre-this-field)
+                        // ⇒ keep the reconstructed value (byte-unchanged). Re-derivable fields (refs, sync-view) stay base+diff.
+                        nextInfo = nextInfoRaw.copy(
+                          balances = lastIncremental.value.authoritativeBalances.getOrElse(nextInfoRaw.balances),
+                          activeAllowSpends = lastIncremental.value.authoritativeActiveAllowSpends.orElse(nextInfoRaw.activeAllowSpends),
+                          activeTokenLocks = lastIncremental.value.authoritativeActiveTokenLocks.orElse(nextInfoRaw.activeTokenLocks)
+                        )
                         nextState = Right((lastIncremental, nextInfo)): StateChannelAcceptanceResult.CurrencySnapshotWithState
                         roots <- GlobalStateConverter.currencySnapshotFieldRoots[F](SortedMap(mg -> nextState))
                         recomputed <- hasher.hash(roots) // (incrementalRoot, infoRoot) → single Some/None-invisible Hash (PIN-1)
