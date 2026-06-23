@@ -277,6 +277,36 @@ refresh_gl0_seedlist_and_restart() {
   echo "[grind] WARN: gl0 did not report healthy within ~180s after seedlist refresh"
 }
 
+# refresh_metagraph_cohort_join_ids <k> — after a grind regenerates m${k}-0's identity,
+# re-sync the cohort's ML0/CL1/DL1 join + peer ids in every operator's .env to the NEW
+# m${k}-0/peer_id. docker-env-setup.sh writes CL_DOCKER_ML0_PEER_ID / *_JOIN_ID from the
+# PRE-grind peer_id; the grind never rewrites them, so the cohort dials ml0-m${k}-0 with a
+# stale id -> registration handshake mismatch -> 401 Unauthorized / SessionDoesNotExist and
+# the whole m${k} cohort (ml0-1, cl1-*, dl1-*) fails to form. IP/port targets are IP-based
+# (regen-independent) and stay correct, so ONLY the ids change. Idempotent: sets ids to the
+# current peer_id, so it is a no-op for a non-ground metagraph (its .env already matches).
+refresh_metagraph_cohort_join_ids() {
+  local k="$1"
+  local new_id
+  new_id=$(cat "$PROJECT_ROOT/nodes/m${k}-0/peer_id" 2>/dev/null || echo "")
+  if [ -z "$new_id" ]; then
+    echo "[grind] WARN: no peer_id for m${k}-0; cannot refresh cohort join ids"
+    return 0
+  fi
+  local i env_file
+  for i in $(seq 0 $((${MAX_METAGRAPH_NODES:-$MAX_NODES} - 1))); do
+    env_file="$PROJECT_ROOT/nodes/m${k}-${i}/.env"
+    [ -f "$env_file" ] || continue
+    sed -i -E \
+      -e "s#^(CL_DOCKER_ML0_PEER_ID=).*#\1${new_id}#" \
+      -e "s#^(CL_DOCKER_ML0_JOIN_ID=).*#\1${new_id}#" \
+      -e "s#^(CL_DOCKER_CL1_JOIN_ID=).*#\1${new_id}#" \
+      -e "s#^(CL_DOCKER_DL1_JOIN_ID=).*#\1${new_id}#" \
+      "$env_file"
+  done
+  echo "[grind] refreshed m${k} cohort join ids -> ${new_id:0:16}... (ml0-m${k}-0)"
+}
+
 
 source ./docker/bin/set-env.sh "$@"
 
@@ -841,6 +871,15 @@ else
       # paths; we are at $PROJECT_ROOT (cwd the startup loop expects).
       cd "$PROJECT_ROOT"
       refresh_gl0_seedlist_and_restart
+      # SYMMETRIC to the gl0-seedlist refresh: a grind regen rewrites m${k}-0's identity
+      # AFTER docker-env-setup wrote the cohort .env join/peer ids from the PRE-grind
+      # peer_id, so the cohort would dial ml0-m${k}-0 with a stale id -> 401 /
+      # SessionDoesNotExist (the whole m${k} cohort fails to form). Re-sync every cohort's
+      # .env join ids to its final m${k}-0/peer_id BEFORE any metagraph container starts.
+      # Idempotent (no-op for non-ground metagraphs whose .env already matches).
+      for k in $(seq 0 $((${NUM_METAGRAPHS:-1} - 1))); do
+        refresh_metagraph_cohort_join_ids "$k"
+      done
       cd "$PROJECT_ROOT"
     fi
 
