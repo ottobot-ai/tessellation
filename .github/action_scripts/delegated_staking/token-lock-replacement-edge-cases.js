@@ -506,14 +506,21 @@ const setupNodeParameters = async (urls) => {
   )
   checkOk(ur2)
 
-  // Wait for node-params to be included in a snapshot (up to 120s = ~3 consensus rounds at 43s each)
-  let nodeParams = []
-  for (let attempt = 1; attempt <= 12; attempt++) {
-    await sleep(10000)
-    nodeParams = await getNodeParams(urls)
-    logWorkflow.info(`Node parameters configured: ${nodeParams.length} nodes (attempt ${attempt}/12)`)
-    if (nodeParams.length >= 2) break
-  }
+  const nodeParams = await withRetryOrdinal(
+    async () => {
+      const params = await getNodeParams(urls)
+      logWorkflow.info(`Node parameters configured: ${params.length} nodes`)
+      if (params.length >= 2) return params
+      throw new Error(`node-params not yet visible (have ${params.length}/2)`)
+    },
+    {
+      globalL0Url: urls.globalL0Url,
+      name: 'setupNodeParameters',
+      maxOrdinalMisses: 40,
+      maxStalledChecks: 120,
+      interval: 3000,
+    }
+  )
 
   return nodeParams
 }

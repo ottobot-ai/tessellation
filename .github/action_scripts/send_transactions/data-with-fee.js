@@ -8,8 +8,7 @@ const { z } = require('zod');
 // (exit 7) AND did not normalize keys, so it never matched the node preimage. The SDK helper is the
 // same one the (passing) currency-tx path signs with, so the node accepts these bytes.
 const { serializeBrotli } = require('@stardust-collective/dag4-keystore');
-const {parseSharedArgs, withRetry} = require('../shared');
-const { pollWithEventKick } = require('../lib/awaitChainEvent');
+const {parseSharedArgs, withRetry, withRetryOrdinal} = require('../shared');
 
 const CliArgsSchema = z.object({
     privateKey: z.string()
@@ -153,17 +152,9 @@ const sendDataTransactionsUsingUrls = async (
     return [account.address, estimateFeeResponse];
 };
 
-// Reactive (event-kicked) wait: subscribe to gl0's LocalEvents stream and re-run the
-// metagraph-L0 REST check on every cluster-progress tick (SNAPSHOT_FINALIZED /
-// METAGRAPH_SNAPSHOT_ACCEPTED) instead of a fixed 120×1s wall-clock poll. Robust to ml0
-// recovery latency — it wakes on actual cluster progress, with a generous 30min safety
-// timeout that dumps the last 10 events on failure. Mirrors the token-locks migration.
-const checkDataTransactionInMetagraphL0 = async (metagraphL0Url, address) => {
-    await pollWithEventKick({
-        endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
-        maxWait: '30min',
-        tag: `dataTxInMl0:${address.slice(0, 12)}`,
-        checkFn: async () => {
+const checkDataTransactionInMetagraphL0 = async (globalL0Url, metagraphL0Url, address) => {
+    await withRetryOrdinal(
+        async () => {
             const response = await axios.get(`${metagraphL0Url}/data-application/addresses/${address}`);
             const responseData = response.data;
             if (Object.keys(responseData).length > 0) {
@@ -171,8 +162,15 @@ const checkDataTransactionInMetagraphL0 = async (metagraphL0Url, address) => {
                 return responseData;
             }
             throw new Error('data-application state not updated yet');
+        },
+        {
+            globalL0Url,
+            name: `dataTxInMl0:${address.slice(0, 12)}`,
+            maxOrdinalMisses: 40,
+            maxStalledChecks: 120,
+            interval: 3000,
         }
-    });
+    );
 }
 
 const checkFeeTransactionInGlobalL0 = async (globalL0Url, feeWallet) => {
@@ -185,12 +183,8 @@ const checkFeeTransactionInGlobalL0 = async (globalL0Url, feeWallet) => {
     if (!targetMetagraphId) {
         throw new Error('METAGRAPH_ID env var not set — cannot identify target metagraph');
     }
-    // Reactive event-kicked wait (see checkDataTransactionInMetagraphL0).
-    await pollWithEventKick({
-        endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
-        maxWait: '30min',
-        tag: `feeTxInGl0:${feeWallet.slice(0, 12)}`,
-        checkFn: async () => {
+    await withRetryOrdinal(
+        async () => {
             // Roots-only sharding keeps per-metagraph (CL1) currency balances in gl0's MPT (`MgBalances`), NOT in the
             // `lastCurrencySnapshots` blob (empty in the combined view — `info` is no longer the source of truth). Read the
             // metagraph-token balance gl0 mirrors via the dedicated CL1 balance route (gl0 commits to it via `perMetagraphMptRoot`;
@@ -202,8 +196,15 @@ const checkFeeTransactionInGlobalL0 = async (globalL0Url, feeWallet) => {
                 return balance;
             }
             throw new Error('fee transaction not yet reflected in gl0 currency balance');
+        },
+        {
+            globalL0Url,
+            name: `feeTxInGl0:${feeWallet.slice(0, 12)}`,
+            maxOrdinalMisses: 40,
+            maxStalledChecks: 120,
+            interval: 3000,
         }
-    });
+    );
 }
 
 
@@ -217,7 +218,7 @@ const sendDataTransaction = async () => {
 
     const [address, estimateFeeResponse] = await sendDataTransactionsUsingUrls(globalL0Url, metagraphL1DataUrl, privateKey);
 
-    await checkDataTransactionInMetagraphL0(metagraphL0Url, address);
+    await checkDataTransactionInMetagraphL0(globalL0Url, metagraphL0Url, address);
     await checkFeeTransactionInGlobalL0(globalL0Url, estimateFeeResponse.address);
 };
 

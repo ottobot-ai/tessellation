@@ -1,7 +1,6 @@
 const http = require('http')
 const { dag4 } = require('@stardust-collective/dag4')
-const { parseSharedArgs, logWorkflow, isStaleParentError } = require('../shared')
-const { pollWithEventKick } = require('../lib/awaitChainEvent')
+const { parseSharedArgs, logWorkflow, isStaleParentError, withRetryOrdinal } = require('../shared')
 
 const createConfig = () => {
   const args = process.argv.slice(2)
@@ -16,7 +15,21 @@ const createConfig = () => {
   return { ...sharedArgs }
 }
 
-const SLEEP_TIME_UNTIL_QUERY = 180 * 1000
+// Balance-settle / alignment waits are PACE-INDEPENDENT: they are bounded by ORDINAL
+// PROGRESS (via withRetryOrdinal), never by a wall-clock budget. The global chain cadence
+// is being deliberately tuned (e.g. LDD cutoff raised → slower s/ordinal), so any fixed-
+// seconds timeout is wrong — a slow-but-progressing chain must converge, just later, and
+// must not fail the test. withRetryOrdinal gives up only after the gl0 chain advances
+// `maxOrdinalMisses` ordinals without the expected result (a real stall) or stays put for
+// `maxStalledChecks` consecutive polls. These counts are pace-independent (ordinals, not
+// seconds), so they need no NUM_METAGRAPHS scaling. Bounds match the sibling deleg helpers
+// (40 / 120). gl0 is used as the progress clock (its `latest` ordinal advancing IS chain
+// progress); the metagraph balance/last-ref the checkFn reads is downstream of gl0
+// finalizing the metagraph's snapshots, so "gl0 advanced N ordinals but the metagraph
+// result never appeared" is exactly the real-stall signal we want to fail on.
+const SETTLE_ORDINAL_MISSES = 40
+const SETTLE_STALLED_CHECKS = 120
+const SETTLE_POLL_INTERVAL_MS = 3000
 
 const FIRST_WALLET_SEED_PHRASE =
   'right off artist rare copy zebra shuffle excite evidence mercy isolate raise'
@@ -59,28 +72,29 @@ const fetchJson = (urlString) => {
 //
 // Poll CL1 until the sender's last-reference hash changes from its pre-transfer
 // value, which means CL1 has processed the snapshot containing the transfer.
-const waitForCL1Alignment = async (l1MetagraphUrl, address, beforeHash) => {
-  const timeoutMs = SLEEP_TIME_UNTIL_QUERY
-  logMessage(`Waiting for CL1 alignment (${address.slice(0, 12)}..., timeout ${timeoutMs / 1000}s)...`)
-  const pollStart = Date.now()
+const waitForCL1Alignment = async (gl0Url, l1MetagraphUrl, address, beforeHash) => {
+  logMessage(`Waiting for CL1 alignment (${address.slice(0, 12)}..., ordinal-bounded)...`)
   try {
-    await pollWithEventKick({
-      endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
-      maxWait: timeoutMs,
-      tag: `cl1Alignment:${address.slice(0, 12)}`,
-      kickFilter: { kinds: ['METAGRAPH_SNAPSHOT_ACCEPTED', 'SNAPSHOT_FINALIZED'] },
-      checkFn: async () => {
+    await withRetryOrdinal(
+      async () => {
         const ref = await fetchJson(`${l1MetagraphUrl}/transactions/last-reference/${address}`)
-        if (ref.hash !== beforeHash) {
-          return ref
+        if (ref.hash === beforeHash) {
+          throw new Error(`CL1 lastRef still ${beforeHash.slice(0, 12)}.. (not advanced)`)
         }
-        throw new Error(`CL1 lastRef still ${beforeHash.slice(0, 12)}.. (not advanced)`)
+        return ref
+      },
+      {
+        globalL0Url: gl0Url,
+        name: `cl1Alignment:${address.slice(0, 12)}`,
+        maxOrdinalMisses: SETTLE_ORDINAL_MISSES,
+        maxStalledChecks: SETTLE_STALLED_CHECKS,
+        interval: SETTLE_POLL_INTERVAL_MS,
       }
-    })
-    logMessage(`CL1 aligned after ${Math.round((Date.now() - pollStart) / 1000)}s`)
+    )
+    logMessage(`CL1 aligned`)
   } catch (_) {
-    // Preserve legacy "proceed anyway" semantic — log the timeout and continue.
-    logMessage(`CL1 alignment timeout — proceeding anyway`)
+    // Preserve legacy "proceed anyway" semantic — log the give-up and continue.
+    logMessage(`CL1 alignment gave up (gl0 advanced without CL1 catching up) — proceeding anyway`)
   }
 }
 
@@ -114,28 +128,27 @@ const getMetagraphOrdinalOnGL0 = async (gl0Url, metagraphAddress) => {
 // absorbed at least one post-transfer CL0 snapshot — preventing the next transfer
 // from racing ahead of CL0's globalSyncView catch-up.
 const waitForGL0MetagraphAlignment = async (gl0Url, metagraphAddress, ordinalBefore) => {
-  const timeoutMs = SLEEP_TIME_UNTIL_QUERY
-  logMessage(`Waiting for GL0 to advance ${metagraphAddress.slice(0, 12)}... past ord ${ordinalBefore} (timeout ${timeoutMs / 1000}s)...`)
-  const pollStart = Date.now()
+  logMessage(`Waiting for GL0 to advance ${metagraphAddress.slice(0, 12)}... past ord ${ordinalBefore} (ordinal-bounded)...`)
   try {
-    await pollWithEventKick({
-      endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
-      maxWait: timeoutMs,
-      tag: `gl0MgAlignment:${metagraphAddress.slice(0, 12)}`,
-      // Wake on either a gl0 snapshot finalization OR a metagraph snapshot acceptance
-      // — both are points at which GL0's view of this metagraph could have advanced.
-      kickFilter: { kinds: ['METAGRAPH_SNAPSHOT_ACCEPTED', 'SNAPSHOT_FINALIZED'] },
-      checkFn: async () => {
+    await withRetryOrdinal(
+      async () => {
         const current = await getMetagraphOrdinalOnGL0(gl0Url, metagraphAddress)
-        if (current > ordinalBefore) {
-          return current
+        if (current <= ordinalBefore) {
+          throw new Error(`GL0 metagraph ord ${current} <= ${ordinalBefore}`)
         }
-        throw new Error(`GL0 metagraph ord ${current} <= ${ordinalBefore}`)
+        return current
+      },
+      {
+        globalL0Url: gl0Url,
+        name: `gl0MgAlignment:${metagraphAddress.slice(0, 12)}`,
+        maxOrdinalMisses: SETTLE_ORDINAL_MISSES,
+        maxStalledChecks: SETTLE_STALLED_CHECKS,
+        interval: SETTLE_POLL_INTERVAL_MS,
       }
-    })
-    logMessage(`GL0 advanced ${metagraphAddress.slice(0, 12)}... past ord ${ordinalBefore} after ${Math.round((Date.now() - pollStart) / 1000)}s`)
+    )
+    logMessage(`GL0 advanced ${metagraphAddress.slice(0, 12)}... past ord ${ordinalBefore}`)
   } catch (_) {
-    logMessage(`GL0 metagraph alignment timeout — proceeding anyway`)
+    logMessage(`GL0 metagraph alignment gave up (gl0 advanced without this metagraph's view advancing) — proceeding anyway`)
   }
 }
 
@@ -423,6 +436,7 @@ const batchMetagraphTransaction = async (
 }
 
 const handleBatchTransactions = async (
+  gl0Url,
   networkOptions,
   origin,
   destination,
@@ -452,41 +466,42 @@ const handleBatchTransactions = async (
     const expectedOriginBalance = startOriginBalance + expectedOriginDelta
     const expectedDestBalance = startDestBalance + expectedDestDelta
 
-    // Reactive replacement for the prior 5s-interval wall-clock poll. Each gl0
-    // SNAPSHOT_FINALIZED event (and METAGRAPH_SNAPSHOT_ACCEPTED for completeness)
-    // kicks a fresh balance check — same correctness as the legacy polling but
-    // wakes only on actual cluster progress. The full 100-tx batch is required
-    // to land (this was the original semantic — break-on-first-change was the bug
-    // the polling block fixed). On 3min timeout we fall through into the diagnostic
-    // block below.
+    // PACE-INDEPENDENT settle: bound by gl0 ORDINAL PROGRESS, not wall-clock. We re-read
+    // both balances each poll and succeed when the full batch has settled; we give up only
+    // after gl0 advances `maxOrdinalMisses` ordinals without settlement (a real stall) — the
+    // full 100-tx batch landing is still required (break-on-first-change was the original bug).
+    // On give-up we fall through to the diagnostic block + the caller's final assertion (we do
+    // NOT throw here — prior "proceed and let the assertion surface the mismatch" semantic).
     let originBalance = startOriginBalance
     let destinationBalance = startDestBalance
-    const startTime = Date.now()
-    logMessage(`Polling for balance settlement via event stream (timeout ${SLEEP_TIME_UNTIL_QUERY}ms, expect ${expectedOriginDelta}/${expectedDestDelta} delta)...`)
+    logMessage(`Polling for balance settlement (ordinal-bounded, expect ${expectedOriginDelta}/${expectedDestDelta} delta)...`)
     try {
-      await pollWithEventKick({
-        endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
-        maxWait: SLEEP_TIME_UNTIL_QUERY,
-        tag: `dagBatchSettle:${origin.address.slice(0, 12)}->${destination.address.slice(0, 12)}`,
-        checkFn: async () => {
+      await withRetryOrdinal(
+        async () => {
           originBalance = await origin.getBalance()
           destinationBalance = await destination.getBalance()
           if (originBalance === expectedOriginBalance && destinationBalance === expectedDestBalance) {
             return { originBalance, destinationBalance }
           }
           throw new Error(`not settled yet: origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance}`)
+        },
+        {
+          globalL0Url: gl0Url,
+          name: `dagBatchSettle:${origin.address.slice(0, 12)}->${destination.address.slice(0, 12)}`,
+          maxOrdinalMisses: SETTLE_ORDINAL_MISSES,
+          maxStalledChecks: SETTLE_STALLED_CHECKS,
+          interval: SETTLE_POLL_INTERVAL_MS,
         }
-      })
-      logMessage(`Balance settled after ${Math.round((Date.now() - startTime) / 1000)}s`)
+      )
+      logMessage(`Balance settled`)
     } catch (_) {
-      // Timeout — fall through into the diagnostic dump below (preserves prior behavior:
-      // we do NOT throw here, we continue and let the caller's final assertion surface
-      // the mismatch with full context). The structured event-timeout error message is
-      // logged so post-mortem analysis sees the last 10 cluster events.
-      logMessage(`pollWithEventKick timed out; falling through to legacy diagnostic block.`)
+      // Gave up after gl0 progressed without settlement — fall through into the diagnostic
+      // dump below (preserves prior behavior: we do NOT throw here, we continue and let the
+      // caller's final assertion surface the mismatch with full context).
+      logMessage(`balance settle gave up (gl0 advanced without settlement); falling through to diagnostic block.`)
     }
     if (originBalance !== expectedOriginBalance || destinationBalance !== expectedDestBalance) {
-      logMessage(`Balance did not fully settle after ${SLEEP_TIME_UNTIL_QUERY / 1000}s — origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance} (falling through to final check)`)
+      logMessage(`Balance did not fully settle (gl0 ordinal-bounded) — origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance} (falling through to final check)`)
       // Diagnostic dump: post-failure lastReference for both wallets on gl1 lets
       // us tell whether more txs landed than we sent (chain ordinal advanced
       // beyond expected) vs balance-endpoint staleness (ordinal as expected,
@@ -517,6 +532,7 @@ const handleBatchTransactions = async (
 }
 
 const handleMetagraphBatchTransactions = async (
+  gl0Url,
   networkOptions,
   origin,
   destination,
@@ -579,36 +595,38 @@ const handleMetagraphBatchTransactions = async (
     const expectedOriginBalance = startOriginBalance + expectedOriginDelta
     const expectedDestBalance = startDestBalance + expectedDestDelta
 
-    // Reactive replacement for the prior 5s-interval wall-clock poll. Driven off
-    // METAGRAPH_SNAPSHOT_ACCEPTED + SNAPSHOT_FINALIZED kicks; the L0 token batch
-    // (count=100) e2e test was the one that flaked in retry #2 — moving to event-kicked
-    // settles lets the test wake immediately when the cluster makes progress, instead
-    // of sleeping a fixed 5s past each tick.
+    // PACE-INDEPENDENT settle: bound by gl0 ORDINAL PROGRESS, not wall-clock. The metagraph
+    // balance is downstream of gl0 finalizing this metagraph's snapshots, so gl0 advancing is
+    // a valid progress clock — we give up only after gl0 advances `maxOrdinalMisses` ordinals
+    // without the full batch settling (a real stall). On give-up we fall through to the
+    // diagnostic block + caller's final assertion (we do NOT throw here).
     let originBalance = startOriginBalance, destinationBalance = startDestBalance
-    const startTime = Date.now()
-    logMessage(`Polling for L0 token balance settlement via event stream (timeout ${SLEEP_TIME_UNTIL_QUERY}ms, expect ${expectedOriginDelta}/${expectedDestDelta} delta)...`)
+    logMessage(`Polling for L0 token balance settlement (ordinal-bounded, expect ${expectedOriginDelta}/${expectedDestDelta} delta)...`)
     try {
-      await pollWithEventKick({
-        endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
-        maxWait: SLEEP_TIME_UNTIL_QUERY,
-        tag: `mgBatchSettle:${origin.address.slice(0, 12)}->${destination.address.slice(0, 12)}`,
-        kickFilter: { kinds: ['METAGRAPH_SNAPSHOT_ACCEPTED', 'SNAPSHOT_FINALIZED'] },
-        checkFn: async () => {
+      await withRetryOrdinal(
+        async () => {
           originBalance = await metagraphTokenClient.getBalance()
           destinationBalance = await metagraphTokenClient.getBalanceFor(destination.address)
           if (originBalance === expectedOriginBalance && destinationBalance === expectedDestBalance) {
             return { originBalance, destinationBalance }
           }
           throw new Error(`not settled yet: origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance}`)
+        },
+        {
+          globalL0Url: gl0Url,
+          name: `mgBatchSettle:${origin.address.slice(0, 12)}->${destination.address.slice(0, 12)}`,
+          maxOrdinalMisses: SETTLE_ORDINAL_MISSES,
+          maxStalledChecks: SETTLE_STALLED_CHECKS,
+          interval: SETTLE_POLL_INTERVAL_MS,
         }
-      })
-      logMessage(`L0 token balance settled after ${Math.round((Date.now() - startTime) / 1000)}s`)
+      )
+      logMessage(`L0 token balance settled`)
     } catch (_) {
       // Fall through; the caller's final assertion will report the mismatch.
-      logMessage(`pollWithEventKick timed out; falling through to legacy diagnostic block.`)
+      logMessage(`L0 token balance settle gave up (gl0 advanced without settlement); falling through to diagnostic block.`)
     }
     if (originBalance !== expectedOriginBalance || destinationBalance !== expectedDestBalance) {
-      logMessage(`L0 token balance did not fully settle after ${SLEEP_TIME_UNTIL_QUERY / 1000}s — origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance} (falling through to final check)`)
+      logMessage(`L0 token balance did not fully settle (gl0 ordinal-bounded) — origin=${originBalance}/${expectedOriginBalance} dest=${destinationBalance}/${expectedDestBalance} (falling through to final check)`)
       // Diagnostic dump: post-failure cl1 lastReference for both wallets +
       // gl0 metagraph ord. If origin's cl1 ord advanced > expected, more txs
       // landed than we sent (dag4-SDK / cl1 race). If ord matches expected,
@@ -635,6 +653,7 @@ const handleMetagraphBatchTransactions = async (
     // last-reference state from CL1 and build a transaction whose parent hash
     // disagrees with CL0's lastTxRefs.
     await waitForCL1Alignment(
+      gl0Url,
       networkOptions.l1MetagraphUrl,
       origin.address,
       originRefBefore.hash
@@ -840,6 +859,7 @@ const waitForReadSourceCatchUp = async (getFromBal, getToBal, expectedFrom, expe
 }
 
 const transferTest = async (
+  gl0Url,
   fromAccount,
   toAccount,
   amount,
@@ -875,6 +895,7 @@ const transferTest = async (
     : handleBatchTransactions
 
   const { originBalance, destinationBalance } = await batchFunc(
+    gl0Url,
     metagraphOpts,
     fromAccount,
     toAccount,
@@ -916,12 +937,14 @@ const sendTransactionsUsingUrls = async (networkOptions) => {
   account2.loginSeedPhrase(SECOND_WALLET_SEED_PHRASE)
   account2.connect(dagConfig)
 
-  // DAG
-  await transferTest(account1, account2, 10, 0, 1)
-  await transferTest(account2, account1, 10, 0, 1)
+  const gl0Url = networkOptions.l0GlobalUrl
 
-  await transferTest(account1, account2, 10, 0.02, 100)
-  await transferTest(account2, account1, 10, 0.02, 100)
+  // DAG
+  await transferTest(gl0Url, account1, account2, 10, 0, 1)
+  await transferTest(gl0Url, account2, account1, 10, 0, 1)
+
+  await transferTest(gl0Url, account1, account2, 10, 0.02, 100)
+  await transferTest(gl0Url, account2, account1, 10, 0.02, 100)
 
   // Metagraph — gate on the currency being LIVE on gl0 first (seeding-race fix):
   // under sharding the genesis currency takes minutes to travel mg → shard-checkpoint
@@ -934,11 +957,11 @@ const sendTransactionsUsingUrls = async (networkOptions) => {
     networkOptions.metagraphId,
     networkOptions.l0MetagraphUrl,
   )
-  await transferTest(account1, account2, 10, 0, 1, networkOptions)
-  await transferTest(account2, account1, 10, 0, 1, networkOptions)
+  await transferTest(gl0Url, account1, account2, 10, 0, 1, networkOptions)
+  await transferTest(gl0Url, account2, account1, 10, 0, 1, networkOptions)
 
-  await transferTest(account1, account2, 10, 0.02, 100, networkOptions)
-  await transferTest(account2, account1, 10, 0.02, 100, networkOptions)
+  await transferTest(gl0Url, account1, account2, 10, 0.02, 100, networkOptions)
+  await transferTest(gl0Url, account2, account1, 10, 0.02, 100, networkOptions)
 
   // Double spends
   await doubleSpendTest(networkOptions, false)

@@ -2,7 +2,7 @@ const { dag4 } = require('@stardust-collective/dag4');
 const jsSha256 = require('js-sha256');
 const axios = require('axios');
 const { z } = require('zod');
-const { parseSharedArgs, withRetry } = require('../shared');
+const { parseSharedArgs, withRetry, withRetryOrdinal } = require('../shared');
 
 const CliArgsSchema = z.object({
     privateKey: z.string()
@@ -109,28 +109,24 @@ const sendDataTransaction = async () => {
 
     const address = await sendDataTransactionsUsingUrls(globalL0Url, metagraphL1DataUrl, privateKey);
 
-    const maxAttempts = 120
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
+    await withRetryOrdinal(
+        async () => {
             const response = await axios.get(`${metagraphL0Url}/data-application/addresses/${address}`);
             const responseData = response.data;
-
             if (Object.keys(responseData).length > 0) {
                 console.log(`Transaction processed successfully. Response: ${JSON.stringify(responseData)}`);
-                return;
+                return responseData;
             }
-
-            console.log(`Data transaction not processed yet. Retrying in 1 seconds (${attempt}/${maxAttempts})`);
-        } catch (error) {
-            console.error(`Attempt ${attempt} failed: ${error.message}`);
+            throw new Error('data-application state not updated yet');
+        },
+        {
+            globalL0Url,
+            name: `dataTxInMl0:${address.slice(0, 12)}`,
+            maxOrdinalMisses: 40,
+            maxStalledChecks: 120,
+            interval: 3000,
         }
-
-        if (attempt === maxAttempts) {
-            throw new Error(`Max attempts reached. Could not get state updated after sending data transaction. Please check the logs.`);
-        }
-
-        await sleep(1000);
-    }
+    );
 };
 
 sendDataTransaction();

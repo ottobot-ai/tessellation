@@ -263,30 +263,46 @@ const fetchStakeWithRewardsBalance = async (
 // gl1's last-reference advances on gl1's OWN follow/accept clock — it mirrors gl0's FINALIZED
 // `lastTokenLockRefs` via the inclusion-proof follow — which lags gl0's stake-acceptance clock
 // that the rest of this test polls. Used as the chain-parent precondition for replacements.
+//
+// PACE-INDEPENDENT bound (no wall-clock budget): the global chain cadence is being
+// deliberately tuned (e.g. LDD cutoff raised → slower s/ordinal), so any fixed-seconds
+// timeout is wrong — a slow-but-progressing chain must not fail the test. Instead we bound
+// by ORDINAL PROGRESS via `withRetryOrdinal`: give up only after the gl0 chain advances
+// `maxOrdinalMisses` ordinals without the last-ref matching (a real stall), or stays put for
+// `maxStalledChecks` consecutive polls — never after N seconds. Counts are pace-independent
+// (ordinals, not seconds), so they need no NUM_METAGRAPHS scaling. Bounds match the sibling
+// deleg helpers (assertDelegatedStakeMovedToPending: 40 / 120).
 const waitForTokenLockLastRef = async (urls, address, expectedHash, options = {}) => {
-  const maxAttempts = options.maxAttempts || 90
-  const intervalMs = options.interval || 2000
-  let lastSeen = null
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const response = await axios.get(
-      `${urls.dagL1Url}/token-locks/last-reference/${address}?t=${Date.now()}`,
-      {
-        headers: {
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
-          Pragma: 'no-cache',
-          Expires: '0',
-        },
+  return withRetryOrdinal(
+    async () => {
+      const response = await axios.get(
+        `${urls.dagL1Url}/token-locks/last-reference/${address}?t=${Date.now()}`,
+        {
+          headers: {
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            Pragma: 'no-cache',
+            Expires: '0',
+          },
+        }
+      )
+      checkOk(response)
+      const lastSeen = response.data && response.data.hash
+      if (lastSeen !== expectedHash) {
+        throw new Error(
+          `gl1 token-lock last-reference for ${address.substring(0, 12)}... not yet ` +
+            `${expectedHash.substring(0, 16)}... (last seen: ${(lastSeen || 'none').substring(0, 16)}...)`
+        )
       }
-    )
-    checkOk(response)
-    lastSeen = response.data && response.data.hash
-    if (lastSeen === expectedHash) return response.data
-    await new Promise(r => setTimeout(r, intervalMs))
-  }
-  throw new Error(
-    `gl1 token-lock last-reference for ${address.substring(0, 12)}... did not advance to ` +
-      `${expectedHash.substring(0, 16)}... within ${(maxAttempts * intervalMs) / 1000}s ` +
-      `(last seen: ${(lastSeen || 'none').substring(0, 16)}...)`
+      return response.data
+    },
+    {
+      globalL0Url: urls.globalL0Url,
+      name: 'waitForTokenLockLastRef',
+      maxOrdinalMisses: 40,
+      maxStalledChecks: 120,
+      interval: 2000,
+      ...options,
+    }
   )
 }
 

@@ -8,6 +8,7 @@ const {
     generateProof,
     sleep,
     withRetry,
+    withRetryOrdinal,
     createAndConnectAccount,
     createNetworkConfig,
     getEpochProgress,
@@ -15,7 +16,6 @@ const {
     SerializerType,
     createSerializer
 } = require('../shared');
-const { pollWithEventKick } = require('../lib/awaitChainEvent');
 
 const CONSTANTS = {
     ...sharedConstants,
@@ -293,43 +293,56 @@ const verifyTokenLockExpiration = async (address, hash, initialBalance, urls, un
     const snapshotUrl = `${l0Url}/snapshots/latest/combined`;
 
     // Replaces the previous two-stage wall-clock polling (interval = 10s × 600 attempts
-    // each) with a SINGLE reactive subscription to gl0's LocalEvents stream. Each
-    // gl0 snapshot finalization OR metagraph snapshot acceptance kicks our REST check;
-    // the structured timeout fires at 30min (well past observed worst-case) with a
-    // diagnostic dump of the last 10 cluster events.
+    // each) with ordinal-aware retry (withRetryOrdinal). Checks only advance when the
+    // global L0 ordinal progresses, so network stalls never burn budget.
     //
-    // The combined check rolled into one pollWithEventKick:
+    // The combined check:
     //   (a) epoch progress on currency L0 has advanced past unlockEpoch
     //   (b) the lock has been evicted from activeTokenLocks (or is no longer matchable)
     //   (c) the source balance has been reverted to `initialBalance`
     //
     // The original code asserted (c) at the end as a non-retried failure; we KEEP that
     // semantic by failing the predicate at (c)-success rather than retry, so a balance
-    // mismatch surfaces as the structured event-timeout error if the cluster never
-    // reaches the expected state in 30min.
-    let lastReason = null;
-    const snapshot = await pollWithEventKick({
-        endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
-        maxWait: '30min',
-        tag: `tokenLockExpiration:${address.slice(0, 12)}`,
-        checkFn: async () => {
+    // mismatch surfaces as the structured ordinal-exhaustion error if the cluster never
+    // reaches the expected state.
+    //
+    // EPOCH-GATED wait: epochProgress advances ~1:1 with the gl0 ordinal, so the wait
+    // legitimately spans (unlockEpoch − currentEpochProgress) ordinals. Giving it the
+    // same maxOrdinalMisses=40 as a TX-SETTLE wait means it always times out long before
+    // epochProgress reaches unlockEpoch. Instead, read the current epochProgress once
+    // up-front and compute a dynamic miss budget: cover the epoch delta + 100 ordinals
+    // of margin, with a floor of 60 to handle the case where unlockEpoch is already
+    // nearly reached when we start.
+    const currentEpochProgressUpfront = await getEpochProgress(l0Url, true);
+    const epochDeltaMisses = Math.max(60, (unlockEpoch - currentEpochProgressUpfront) + 100);
+    console.log(
+        `verifyTokenLockExpiration: currentEpochProgress=${currentEpochProgressUpfront}, ` +
+        `unlockEpoch=${unlockEpoch}, maxOrdinalMisses=${epochDeltaMisses}`
+    );
+    const snapshot = await withRetryOrdinal(
+        async () => {
             const currentEpochProgress = await getEpochProgress(l0Url, true);
             if (currentEpochProgress <= unlockEpoch) {
-                lastReason = `Current epoch progress (${currentEpochProgress}) has not passed unlockEpoch (${unlockEpoch})`;
-                throw new Error(lastReason);
+                throw new Error(`Current epoch progress (${currentEpochProgress}) has not passed unlockEpoch (${unlockEpoch})`);
             }
             const snap = await getCombinedSnapshot(snapshotUrl);
             const activeTokenLocks = snap[1]?.activeTokenLocks?.[address];
             if (activeTokenLocks && activeTokenLocks.length > 0) {
                 const hasMatchingHash = await findMatchingHash(activeTokenLocks, hash);
                 if (hasMatchingHash) {
-                    lastReason = 'Token lock still active after expiration';
-                    throw new Error(lastReason);
+                    throw new Error('Token lock still active after expiration');
                 }
             }
             return snap;
+        },
+        {
+            globalL0Url: urls.globalL0Url,
+            name: `tokenLockExpiration:${address.slice(0, 12)}`,
+            maxOrdinalMisses: epochDeltaMisses,
+            maxStalledChecks: 120,
+            interval: 3000,
         }
-    });
+    );
 
     const currentBalance = snapshot[1]?.balances?.[address] || 0;
     const expectedBalance = initialBalance;
@@ -348,23 +361,25 @@ const verifyTriggerTokenUnlock = async (address, initialBalance, urls) => {
     const snapshotUrl = `${l0Url}/snapshots/latest/combined`;
 
     // Replaces the previous wall-clock-only `withRetry` (600 attempts × 10s = 100 min)
-    // with reactive event-kicked polling. We still hit the metagraph's REST endpoint
-    // for the source of truth (gl0 emits TOKEN_LOCK_STATE_CHANGE only for GLOBAL
-    // token-locks; this test uses a CURRENCY token-lock, so we drive the check off
-    // gl0's snapshot/metagraph-snapshot kicks).
-    const snapshot = await pollWithEventKick({
-        endpoint: process.env.LOCAL_EVENTS_ENDPOINT,
-        maxWait: '30min',
-        tag: `tokenUnlockTrigger:${address.slice(0, 12)}`,
-        checkFn: async () => {
+    // with ordinal-aware retry (withRetryOrdinal). Checks advance when the global L0
+    // ordinal progresses; network stalls don't burn the miss budget.
+    const snapshot = await withRetryOrdinal(
+        async () => {
             const snap = await getCombinedSnapshot(snapshotUrl);
             const activeTokenLocks = snap[1]?.activeTokenLocks?.[address];
             if (activeTokenLocks && Object.keys(activeTokenLocks).length > 0) {
                 throw new Error(`TokenLock still active`);
             }
             return snap;
+        },
+        {
+            globalL0Url: urls.globalL0Url,
+            name: `tokenUnlockTrigger:${address.slice(0, 12)}`,
+            maxOrdinalMisses: 40,
+            maxStalledChecks: 120,
+            interval: 3000,
         }
-    });
+    );
 
     const currentBalance = snapshot[1]?.balances?.[address] || 0;
     const expectedBalance = initialBalance;
