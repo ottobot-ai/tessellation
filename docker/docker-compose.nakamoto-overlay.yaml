@@ -34,6 +34,35 @@ services:
       # so they resolve k₁=32 → R=99, exercising the eta rotation many times per run (tests aren't
       # adversarial, small k₁ is fine). No NAKAMOTO_CONFIRMATION_DEPTH override needed — the conf's
       # per-env value is authoritative. See `docs/nakamoto/attestation-and-finality.md` §1.3.
+      # LDD snowplow leader election (EligibilityChecker.threshold). Per slot, validator v is eligible iff
+      # VRF(eta‖slot) < threshold_v = 1 − (1 − f(δ))^relativeStake_v, where δ = slots since the last snapshot.
+      # Because validator relative-stakes sum to 1, the CLUSTER per-slot production probability collapses to
+      # exactly f(δ): P(someone wins) = 1 − ∏_v (1−f)^stake_v = 1 − (1−f)^Σstake = 1 − (1−f) = f(δ). So f IS the
+      # cluster hazard rate and the inter-snapshot GAP is a renewal process driven by it. Shape of f(δ):
+      #   δ < offset            : 0            (dead zone — no same-slot/instant re-production)
+      #   offset ≤ δ < cutoff    : (δ−offset)/(cutoff−offset) · amplitude   (linear ramp 0 → amplitude)
+      #   δ ≥ cutoff            : baselineDifficulty                        (drops to the slow recovery floor)
+      # ⇒ probability mass concentrates on the ramp window [offset,cutoff); a thin tail spills past cutoff at the
+      # low baseline rate. survival-to-cutoff (prob no winner by the deadline) ≈ exp(−½·amplitude·(cutoff−offset)).
+      #
+      # How the stationary gap distribution moves with each knob:
+      #   cutoff ↑ → wider window, LOWER per-slot hazard → SLOWER rate (longer mean gap) AND LIGHTER tail (more
+      #              integrated ramp-hazard before the deadline ⇒ far less spill into the slow floor).
+      #   cutoff ↓ → faster median but HEAVIER tail (more spill → long stalls) — counterproductive, do not.
+      #   amplitude ↑ → fires earlier + lighter spill (faster) but raises same-slot multi-winner (FORK) rate.
+      #   baseline  ↑ → faster recovery from a rare past-cutoff stall (lighter tail), low fork cost.
+      #
+      # DECISION (2026-06-23) — cutoff=16 KEPT. The 2mg/2shard run validated cutoff=16 CLEAN: genuine 2-shard
+      # occupancy, ContentMismatch=0 (no MPT divergence), ~13 reorgs/min UNIFORM (benign LDD churn, not a storm),
+      # cadence ~7.5 ord/min, sync held via the metagraph-caught-up readiness gate (NOT by slowing the chain).
+      # DEFENSIVE OPTION cutoff=30 (documented, NOT active): widens the window → mean gap ~8→~18-20 slots, cutting
+      # the reorg churn + tail spill (survival-to-cutoff 2.3%→0.07%) and buying sync headroom for LARGER topologies
+      # (16/5/5) — at ~2× slower runs (~3-4 ord/min). Bring it in only if churn/sync degrade at scale. Harness waits
+      # are ordinal-reactive (pace-independent) so either cutoff is safe test-side. CAVEAT for cutoff=30: slower
+      # ordinals shift the ordinals-per-epoch ratio (epoch=60 SLOTS not ordinals) → watch epoch-windowed logic
+      # (token-lock-replacement WithdrawalTimeLimit).
+      # Test-only (overlay); mainnet uses the application.conf `nakamoto.ldd` defaults. amplitude/baseline are the
+      # "go faster" knobs (NOT cutoff↓) if throughput is ever wanted; left at defaults here since the goal is sync headroom.
       - NAKAMOTO_LDD_CUTOFF=${NAKAMOTO_LDD_CUTOFF:-16}
       - NAKAMOTO_LDD_OFFSET=${NAKAMOTO_LDD_OFFSET:-1}
       - NAKAMOTO_LDD_BASELINE=${NAKAMOTO_LDD_BASELINE:-0.05}

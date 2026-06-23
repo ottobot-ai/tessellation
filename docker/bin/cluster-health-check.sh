@@ -172,6 +172,67 @@ verify_healthy() {
           fi
           sleep 3
         done
+
+        # Metagraph-caught-up readiness gate (2mg load-sensitivity fix).
+        # ordinal>=1 above only proves ml0 produced ONE snapshot — under heavy
+        # multi-metagraph load (e.g. 6gl0/2mg/2shard at host load 15+), ml0 can
+        # then fall BEHIND gl0 ("ml0 resynced to canonical ord=N; will resume
+        # pulling forward" / "Skipping non-next global snapshot") and sit there
+        # resyncing. Starting the first (currency) test against a lagging ml0
+        # makes the metagraph unable to settle a transfer → "Balance did not
+        # fully settle after 180s" → FAIL, even though consensus is healthy.
+        #
+        # Gate: require ml0's latest ordinal to ADVANCE by >= 2 across checks,
+        # which proves it is actively PRODUCING (draining forward), not stuck
+        # resyncing. We don't hard-require ml0 to be within a fixed lag of gl0's
+        # finalized ordinal — at 2mg the metagraph legitimately trails the global
+        # by a variable amount — only that it is making forward progress; we log
+        # the gl0 finalized ordinal alongside for diagnostic context (lag visibility).
+        # Generous budget (120 × 5s = 10m) so a slow-but-progressing metagraph is
+        # never failed by the gate; this is purely test-only readiness.
+        if [ "$NUM_ML0_NODES" -gt 0 ]; then
+          local gl0_fin_url="${host}:${DAG_L0_PORT_PREFIX}00"
+          echo "Waiting for metagraph $k ML0 to be CAUGHT UP / progressing (not stuck resyncing)..."
+          local caught_up=false
+          local prev_ml0_ord=-1
+          local start_ml0_ord=-1
+          for cu_attempt in $(seq 1 120); do
+            ml0_ord_resp=$(curl -s --connect-timeout 3 --max-time 5 "${ml0_ordinal_url}/snapshots/latest/ordinal" 2>/dev/null || echo "")
+            cur_ml0_ord=-1
+            if [ -n "$ml0_ord_resp" ] && echo "$ml0_ord_resp" | jq -e '.value >= 0' >/dev/null 2>&1; then
+              cur_ml0_ord=$(echo "$ml0_ord_resp" | jq '.value')
+            fi
+            # gl0 finalized ordinal — diagnostic context only (lag = gl0_fin - ml0).
+            gl0_fin_resp=$(curl -s --connect-timeout 3 --max-time 5 "${gl0_fin_url}/global-snapshots/latest/finalized-ordinal" 2>/dev/null || echo "")
+            gl0_fin_ord=-1
+            if [ -n "$gl0_fin_resp" ] && echo "$gl0_fin_resp" | jq -e '.value >= 0' >/dev/null 2>&1; then
+              gl0_fin_ord=$(echo "$gl0_fin_resp" | jq '.value')
+            fi
+
+            if [ "$start_ml0_ord" -lt 0 ] 2>/dev/null && [ "$cur_ml0_ord" -ge 0 ] 2>/dev/null; then
+              start_ml0_ord=$cur_ml0_ord
+            fi
+            # Caught-up == ml0 advanced by >= 2 ordinals since we started watching
+            # (proves it is draining forward, i.e. producing not stuck resyncing).
+            if [ "$start_ml0_ord" -ge 0 ] 2>/dev/null && [ "$cur_ml0_ord" -ge 0 ] 2>/dev/null \
+               && [ "$((cur_ml0_ord - start_ml0_ord))" -ge 2 ] 2>/dev/null; then
+              echo "Metagraph $k ML0 progressing: ordinal ${start_ml0_ord}->${cur_ml0_ord} (gl0 finalized=${gl0_fin_ord}); proceeding"
+              caught_up=true
+              break
+            fi
+            if [ "$((cu_attempt % 6))" -eq 0 ]; then
+              echo "Metagraph $k ML0 not yet confirmed progressing (attempt $cu_attempt/120): ml0 ord=${cur_ml0_ord} (start ${start_ml0_ord}), gl0 finalized=${gl0_fin_ord}..."
+            fi
+            prev_ml0_ord=$cur_ml0_ord
+            sleep 5
+          done
+          if [ "$caught_up" != "true" ]; then
+            # Do NOT hard-fail: a metagraph that produced >=1 but never advanced by
+            # +2 within 10m is unusual, but the downstream test assertions give a
+            # far better diagnostic than a generic health-check abort. Warn loudly.
+            echo "WARN: metagraph $k ML0 did not confirm forward progress (+2 ordinals) within ~10m — proceeding; downstream test will surface any real stall."
+          fi
+        fi
       fi
     done
 
