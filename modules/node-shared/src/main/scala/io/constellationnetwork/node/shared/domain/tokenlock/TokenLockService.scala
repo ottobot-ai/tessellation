@@ -6,6 +6,7 @@ import cats.effect.Async
 import cats.syntax.all._
 
 import scala.collection.immutable.SortedSet
+import scala.concurrent.duration._
 
 import io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot
 import io.constellationnetwork.ext.cats.syntax.validated.validatedSyntax
@@ -23,8 +24,6 @@ import io.constellationnetwork.schema.tokenLock.TokenLock
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher}
-
-import fs2.Stream
 
 trait TokenLockService[F[_]] {
   def offer(tokenLock: Hashed[TokenLock])(implicit hasher: Hasher[F]): F[Either[NonEmptyList[ContextualTokenLockValidationError], Hash]]
@@ -68,33 +67,50 @@ object TokenLockService {
           .map(_.errorMap(NonContextualValidationError))
           .flatMap {
             case Valid(_) =>
-              // Wait for the first real snapshot rather than defaulting to
-              // (MinValue, Balance.empty). Pre-MPT-primary migration node startup
-              // was fast enough that the stream's first emission was usually
-              // Some(...) by the time submissions arrived; post-migration the
-              // bigger accept() pipeline lands cl1's first currency snapshot
-              // later than fast clients (e.g. token-locks test posting right
-              // after cluster-ready), so a None first emission would be
-              // substituted to Balance.empty and `.head` would consume that as
-              // the answer — producing InsufficientBalance{balance:0} for
-              // genesis-funded addresses. Mirror of the e7a8daa8 fix in
-              // dag-l1 TransactionService: drop None emissions via `collect`,
-              // then read (balance, activeTokenLocks) from the first Some(si).
-              lastSnapshotStorage.getCombinedStream.collect {
-                case Some(value) => value
-              }.map {
-                case (s, si) =>
-                  val (balance, activeTokenLocks) = getBalanceAndTokenLocks(si, tokenLock.source)
-                  (s.ordinal, balance, activeTokenLocks)
-              }.changes.switchMap {
-                case (latestOrdinal, balance, activeTokenLocks) =>
-                  Stream.eval(tokenLockStorage.tryPut(tokenLock, latestOrdinal, lastGlobalEpochProgress, balance, activeTokenLocks))
-              }.head.compile.last.flatMap {
-                case Some(value) => value.pure[F]
-                case None =>
-                  new Exception(s"Unexpected state, stream should always emit the first snapshot")
-                    .raiseError[F, Either[NonEmptyList[ContextualTokenLockValidationError], Hash]]
-              }
+              // Take the FIRST real (Some) combined snapshot, then run `tryPut` exactly ONCE so it
+              // completes uninterrupted. The prior `.changes.switchMap(tryPut).head` re-ran tryPut on
+              // every combined-snapshot emission (one per adopted gl0 ordinal) and CANCELLED the
+              // in-flight tryPut when the next emission arrived; if tryPut couldn't finish within one
+              // inter-snapshot interval it never resolved and `POST /token-locks` hung forever (observed:
+              // the 2nd token-lock submission wedged cl1 indefinitely). Dropping the None prefix via
+              // `collect` keeps the original e7a8daa8 fix (don't validate against a None→Balance.empty
+              // substitution that yields InsufficientBalance{balance:0} for genesis-funded addresses).
+              //
+              // Bound the first-snapshot wait with a timeout (mirror of dag-l1 TransactionService.offer):
+              // if an upstream issue keeps `lastSnapshotStorage` empty forever (no currency snapshot to
+              // validate against), `.head` blocks forever and a hung POST masks the real cluster bug until
+              // the test's outer timeout — surface it loudly after a bounded wait instead.
+              val firstSnapshotTimeout = 90.seconds
+              val waitForFirstSnapshot: F[Option[Either[NonEmptyList[ContextualTokenLockValidationError], Hash]]] =
+                lastSnapshotStorage.getCombinedStream.collect {
+                  case Some(value) => value
+                }.head.compile.last.flatMap {
+                  case Some((s, si)) =>
+                    val (balance, activeTokenLocks) = getBalanceAndTokenLocks(si, tokenLock.source)
+                    tokenLockStorage
+                      .tryPut(tokenLock, s.ordinal, lastGlobalEpochProgress, balance, activeTokenLocks)
+                      .map(_.some)
+                  case None =>
+                    none[Either[NonEmptyList[ContextualTokenLockValidationError], Hash]].pure[F]
+                }
+              Async[F]
+                .timeoutTo(
+                  waitForFirstSnapshot,
+                  firstSnapshotTimeout,
+                  new Exception(
+                    s"Timed out after ${firstSnapshotTimeout.toSeconds}s waiting for the first currency snapshot — " +
+                      s"the node has no currency snapshot to validate the token lock against (lastSnapshotStorage empty). " +
+                      s"Upstream cause is typically gl0 rejecting all metagraph SC binaries (chain-link rejection or " +
+                      s"forcedGlobalSyncView mismatch); inspect gl0 logs for [SCAcceptance] warnings or " +
+                      s"GlobalSnapshotStateChannelEventsProcessor errors."
+                  ).raiseError[F, Option[Either[NonEmptyList[ContextualTokenLockValidationError], Hash]]]
+                )
+                .flatMap {
+                  case Some(value) => value.pure[F]
+                  case None =>
+                    new Exception(s"Unexpected state, stream should always emit the first snapshot")
+                      .raiseError[F, Either[NonEmptyList[ContextualTokenLockValidationError], Hash]]
+                }
 
             case Invalid(e) =>
               e.toNonEmptyList.asLeft[Hash].leftWiden[NonEmptyList[ContextualTokenLockValidationError]].pure[F]
