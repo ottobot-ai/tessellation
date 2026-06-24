@@ -341,6 +341,11 @@ const verifyTokenLockExpiration = async (address, hash, initialBalance, urls, un
             maxOrdinalMisses: epochDeltaMisses,
             maxStalledChecks: 120,
             interval: 3000,
+            // This wait legitimately spans ~(unlockEpoch − current) epochs (EPOCH_PROGRESS_BUFFER_EXPIRATION_TEST,
+            // ~27min at a healthy 2mg cadence) — well over withRetryOrdinal's 15min default ceiling. Give it a
+            // generous 60min ceiling so a healthy-but-slow run isn't false-failed, while still capping a finality
+            // stall (or torn-down cluster) here at minutes, not the multi-hour hang we hit before.
+            maxWallClockMs: 3600000,
         }
     );
 

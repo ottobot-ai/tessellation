@@ -108,6 +108,13 @@ const withRetryOrdinal = async (checkFn, {
     // Tolerates ~99.9th-percentile LDD gap at r=1 (see docs/nakamoto/attestation-and-finality.md §5; closed form: P(gap ≥ K) = Π(1 − f(δ)))
     maxStalledChecks = 75,
     interval = 3000,
+    // ABSOLUTE wall-clock ceiling (ms). The ordinal/stall counters key off the HEAD ordinal
+    // (getLatestSnapshotInfo → /global-snapshots/latest), which keeps ADVANCING on a forking chain even when
+    // finality has stalled — so on a degraded chain neither counter trips and the loop would wait indefinitely
+    // (a 4mg fork-storm hung token-locks ~4h before an external timeout caught it). This ceiling makes a degraded
+    // run fail in minutes, not hours, while staying pace-independent UP TO the ceiling. Default 15min covers the
+    // common short settle waits; long epoch-gated waits (e.g. token-lock expiration) pass a larger value.
+    maxWallClockMs = 900000,
     onOrdinalMiss = null,
     onStalled = null,
 } = {}) => {
@@ -115,6 +122,7 @@ const withRetryOrdinal = async (checkFn, {
         throw new Error('withRetryOrdinal requires globalL0Url');
     }
 
+    const startTime = Date.now();
     let prevOrdinal = null;
     let ordinalMisses = 0;  // Times ordinal progressed but check still failed
     let stalledChecks = 0;  // Times ordinal didn't progress
@@ -123,12 +131,36 @@ const withRetryOrdinal = async (checkFn, {
     while (true) {
         totalChecks++;
 
+        // Wall-clock backstop: HEAD-ordinal progress (the signal below) keeps ticking on a forking chain even
+        // when finality has STALLED, so the ordinal-miss / stalled counters can fail to trip. Hard-fail once the
+        // ceiling is hit so a degraded run fails in minutes, not hours.
+        const elapsedMs = Date.now() - startTime;
+        if (elapsedMs > maxWallClockMs) {
+            throw new Error(
+                `${name}: wall-clock ceiling exceeded (${Math.round(elapsedMs / 1000)}s > ${Math.round(maxWallClockMs / 1000)}s) ` +
+                `after ${totalChecks} checks (ordinalMisses=${ordinalMisses}, stalledChecks=${stalledChecks}). ` +
+                `Chain likely degraded — HEAD advancing but not finalizing.`
+            );
+        }
+
         // Get current ordinal
         let currentSnapshot;
         try {
             currentSnapshot = await getLatestSnapshotInfo(globalL0Url);
         } catch (error) {
-            logWorkflow.warning(`${name}: Failed to fetch snapshot ordinal: ${error.message}`);
+            // GL0 unreachable (cluster torn down / node crashed). Previously this `continue`d WITHOUT counting —
+            // so a gone cluster looped forever (the multi-hour hang). Treat a persistent fetch failure as a stall
+            // so it fails in ~maxStalledChecks·interval, not indefinitely (the wall-clock ceiling above is the
+            // final backstop).
+            stalledChecks++;
+            logWorkflow.warning(
+                `${name}: Failed to fetch snapshot ordinal (stalled ${stalledChecks}/${maxStalledChecks}): ${error.message}`
+            );
+            if (stalledChecks >= maxStalledChecks) {
+                throw new Error(
+                    `${name}: GL0 unreachable for ${stalledChecks} consecutive checks (${error.message}) — cluster likely down.`
+                );
+            }
             await sleep(interval);
             continue;
         }
