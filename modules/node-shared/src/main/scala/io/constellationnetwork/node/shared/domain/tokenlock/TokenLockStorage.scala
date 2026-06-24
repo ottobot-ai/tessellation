@@ -75,6 +75,14 @@ class TokenLockStorage[F[_]: Async: Hasher](
         tokenLocksR(address).set(initial.some)
     }
 
+  // Full reset to EXACTLY `refs` for an authoritative adopt: clear ALL addresses first, then set the
+  // authoritative refs. `replaceByRefs` only sets ref-addresses, leaving any whose lock expired/withdrew
+  // between adopted ordinals as a STALE MajorityTokenLock (chainable off); `initByRefs` throws on a non-empty
+  // slot ("Storage should be empty before download"). The cl1 cutover routes EVERY forward adopt through the
+  // download path (onDownload), not just a cold sync — so it needs this idempotent full reset.
+  def clearAndReplaceByRefs(refs: Map[Address, TokenLockReference], snapshotOrdinal: SnapshotOrdinal): F[Unit] =
+    tokenLocksR.clear >> replaceByRefs(refs, snapshotOrdinal)
+
   def advanceMajorityRefs(refs: Map[Address, TokenLockReference], snapshotOrdinal: SnapshotOrdinal): F[Unit] =
     refs.toList.traverse_ {
       case (source, majorityTxRef) =>

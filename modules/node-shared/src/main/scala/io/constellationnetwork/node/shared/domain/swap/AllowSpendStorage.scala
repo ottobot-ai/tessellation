@@ -79,6 +79,12 @@ class AllowSpendStorage[F[_]: Async](
         allowSpendsR(address).set(initial.some)
     }
 
+  // Full reset to EXACTLY `refs` for an authoritative adopt — see TokenLockStorage.clearAndReplaceByRefs.
+  // Clears stale addresses (whose allow-spend was consumed between adopted ordinals) then sets the refs;
+  // required because the cl1 cutover routes every forward adopt through the download path (onDownload).
+  def clearAndReplaceByRefs(refs: Map[Address, AllowSpendReference], snapshotOrdinal: SnapshotOrdinal): F[Unit] =
+    allowSpendsR.clear >> replaceByRefs(refs, snapshotOrdinal)
+
   def advanceMajorityRefs(refs: Map[Address, AllowSpendReference], snapshotOrdinal: SnapshotOrdinal): F[Unit] =
     refs.toList.traverse_ {
       case (source, majorityTxRef) =>

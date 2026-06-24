@@ -389,8 +389,15 @@ object CurrencySnapshotProcessor {
         ).raiseError[F, CurrencySnapshotInfo]
 
       override def onDownload(snapshot: Hashed[CurrencyIncrementalSnapshot], state: CurrencySnapshotInfo): F[Unit] =
-        allowSpendStorage.initByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
-          tokenLockStorage.initByRefs(state.lastTokenLockRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal)
+        // CUTOVER: processCurrencySnapshots routes EVERY forward adopt through the download path (onDownload),
+        // not just a one-time cold sync. So the consumed-field storages must be FULLY RESET to the adopted
+        // snapshot's refs on each adopt. `initByRefs` (the cold-download primitive) asserts each address slot is
+        // empty and throws "Storage should be empty before download" once a token-lock/allow-spend lands; that
+        // wedges GlobalSnapshotAlignment -> currency lastSnapshotStorage stalls -> token-lock POST times out.
+        // `clearAndReplaceByRefs` clears stale addresses (locks expired/withdrawn since the prior adopt) then
+        // sets the authoritative refs — idempotent on repeated adopts.
+        allowSpendStorage.clearAndReplaceByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
+          tokenLockStorage.clearAndReplaceByRefs(state.lastTokenLockRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal)
 
       override def onRedownload(snapshot: Hashed[CurrencyIncrementalSnapshot], state: CurrencySnapshotInfo): F[Unit] =
         // Defense-in-depth (#122): cl1 consumes gl0 snapshots via finality-gating in
@@ -407,8 +414,10 @@ object CurrencySnapshotProcessor {
           // CUTOVER: a redownload/recovery rebuilds the follower's consumed-field storage, so the diff mirror's held
           // `(tip, state)` is no longer a valid base — RESET it so the next follow tick re-fetches a FULL from-empty slice.
           followMirrorRef.set(none) >>
-          allowSpendStorage.replaceByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
-          tokenLockStorage.replaceByRefs(state.lastTokenLockRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal)
+          // Full reset (clear stale addresses then set) — a redownload rebuilds the consumed-field storage from
+          // scratch, so leftover addresses absent from the new refs must not survive.
+          allowSpendStorage.clearAndReplaceByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
+          tokenLockStorage.clearAndReplaceByRefs(state.lastTokenLockRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal)
 
       // PURE MPT-AS-PRIMARY seed (3c-A): populate the global MPT for the currency adopt from gl0's SIGNED MPT BYTES — NEVER from a
       // materialized `GlobalSnapshotInfo` (`syncFromGlobalSnapshotInfo`). Pulls gl0's finalized `(snapshot, GSI, signed-byte-map)` via
