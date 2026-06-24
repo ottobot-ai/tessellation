@@ -63,7 +63,7 @@ services:
       # (token-lock-replacement WithdrawalTimeLimit).
       # Test-only (overlay); mainnet uses the application.conf `nakamoto.ldd` defaults. amplitude/baseline are the
       # "go faster" knobs (NOT cutoff↓) if throughput is ever wanted; left at defaults here since the goal is sync headroom.
-      - NAKAMOTO_LDD_CUTOFF=${NAKAMOTO_LDD_CUTOFF:-16}
+      - NAKAMOTO_LDD_CUTOFF=${NAKAMOTO_LDD_CUTOFF:-30}
       - NAKAMOTO_LDD_OFFSET=${NAKAMOTO_LDD_OFFSET:-1}
       - NAKAMOTO_LDD_BASELINE=${NAKAMOTO_LDD_BASELINE:-0.05}
       - NAKAMOTO_LDD_AMPLITUDE=${NAKAMOTO_LDD_AMPLITUDE:-0.5}

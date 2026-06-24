@@ -39,7 +39,12 @@ object NakamotoSnapshotValidator {
   case object ParentBuffered extends Invalid
   final case class VrfFailed(slot: Long, detail: String) extends Invalid
   final case class SignatureInvalid(ordinal: Long) extends Invalid
-  final case class ContentMismatch(detail: String) extends Invalid
+  // `selfHealable` (Driver B): the mismatch's ONLY divergence is in consensus-derived / path-dependent
+  // partitions that a node with a transiently fork-diverged base cannot reproduce — the delegated-stake
+  // reward-accrual partitions (`DelegatedStakeRecord.rewards` is a running sum) and/or the rolled-up
+  // mptRoot — while EVERY reproducible field (balances/txRefs/currSnapshots/...) matches. The daemon then
+  // adopts the producer's signed-authentic state to re-align the base instead of churning a fork.
+  final case class ContentMismatch(detail: String, selfHealable: Boolean = false) extends Invalid
   final case class VrfOnlyFailed(slot: Long) extends Invalid
 
   def validate[F[_]: Async: SecurityProvider: HasherSelector](
@@ -249,11 +254,21 @@ object NakamotoSnapshotValidator {
                               // mptRoot is deterministic from the same MPT producer state. If undo-journal
                               // fork rollback ever produces a transient mptRoot diff, ContentMismatch will
                               // surface it as a catch-up signal — which is the correct response.
-                              val _ = spDiffList
+                              // Driver B self-heal signal: the ONLY divergence is the consensus-derived
+                              // delegated-stake reward-accrual partition(s) (`DelegatedStakeRecord.rewards` is a
+                              // running sum a node with a transiently fork-diverged base cannot reproduce) and/or
+                              // the rolled-up mptRoot, while every reproducible field matches. Conservative — any
+                              // non-accrual stateProof diff (balances/currSnapshots/…) or any top-level diff
+                              // (ordinal/epoch/rewards/tips) disqualifies, so a genuine fork takes the normal path.
+                              val rewardAccrualFields = Set("delegStakes", "delegWithdraw")
+                              val selfHealable =
+                                spDiffList.nonEmpty &&
+                                  spDiffList.toSet.subsetOf(rewardAccrualFields + "mptRoot") &&
+                                  diffList.size == 1
                               val msg = s"❌ Content REJECTED: slot=$slot diffs=[$diffStr]"
-                              (msg, false)
+                              (msg, false, selfHealable)
                             case _ =>
-                              (s"❌ Content validation fail: slot=$slot err=$err", false)
+                              (s"❌ Content validation fail: slot=$slot err=$err", false, false)
                           }
                           // Discard the orphan branch left behind by `validateArtifact`'s internal
                           // call to `createProposalArtifact(strippedReceived)` (#113). On the Right
@@ -277,7 +292,7 @@ object NakamotoSnapshotValidator {
                               if (logMsg._2)
                                 logger.info(logMsg._1).as(Valid(signedSnapshot, context): ValidationResult)
                               else
-                                logger.warn(logMsg._1).as(ContentMismatch(logMsg._1): ValidationResult)
+                                logger.warn(logMsg._1).as(ContentMismatch(logMsg._1, logMsg._3): ValidationResult)
                           } yield result
                       }
                 }

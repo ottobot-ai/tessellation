@@ -1456,82 +1456,114 @@ object NakamotoSyncDaemon {
             dataDir,
             logger
           )
-        case _: NakamotoSnapshotValidator.ContentMismatch =>
-          // Content mismatch — could be normal fork or restart scenario.
-          // Only catch up if incoming ordinal is significantly ahead of our canonical tip.
-          snapshotStorage.head.flatMap {
-            case Some((localTip, _)) =>
-              val localOrd = localTip.ordinal.value.value
-              val gap = snap.ordinal - localOrd
-              if (gap >= CatchUpThreshold) {
-                logger.warn(
-                  s"\uD83D\uDD04 Content mismatch with ordinal gap=$gap (local=$localOrd, incoming=${snap.ordinal}). Triggering catch-up."
-                ) >>
-                  catchUpFromGossip(
-                    snap,
-                    parsed,
-                    stateRef,
-                    chainStore,
-                    snapshotStorage,
-                    lastGlobalSnapshotStorage,
-                    lastNGlobalSnapshotStorage,
-                    lastKnownSlotRef,
-                    mptStore,
-                    eventMempool,
-                    productionGate,
-                    channel,
-                    dataDir,
-                    logger
-                  )
-              } else {
-                // Normal Nakamoto fork — store the snapshot as an alternative branch in
-                // chainStore WITHOUT updating canonical state (snapshotStorage,
-                // lastGlobalSnapshotStorage, MPT). Content hasn't been validated against
-                // this fork's parent state yet — validation is deferred to reorg time.
-                //
-                // VRF + signature + slot-cert are already validated (proof of eligibility).
-                // Content validation (state proof match) requires the fork's parent context
-                // which we don't have locally. If ChainSelection later picks this fork as
-                // denser (reorg), we validate by triggering catch-up which resets state to
-                // the fork's context + MPT self-healing.
-                logger.info(
-                  s"🔀 Fork at ordinal=${snap.ordinal} slot=${snap.slot} (gap=$gap). Storing as tentative branch (deferred validation)."
-                ) >>
-                  Metrics[F].incrementCounter("dag_nakamoto_forks_stored") >>
-                  storeForkBranch(
-                    snap,
-                    stateRef,
-                    chainStore,
-                    tipTracker,
-                    snapshotStorage,
-                    lastGlobalSnapshotStorage,
-                    lastNGlobalSnapshotStorage,
-                    lastKnownSlotRef,
-                    mptStore,
-                    mptOverlay,
-                    eventMempool,
-                    productionGate,
-                    logger
-                  )
-              }
-            case None =>
-              catchUpFromGossip(
-                snap,
-                parsed,
-                stateRef,
-                chainStore,
-                snapshotStorage,
-                lastGlobalSnapshotStorage,
-                lastNGlobalSnapshotStorage,
-                lastKnownSlotRef,
-                mptStore,
-                eventMempool,
-                productionGate,
-                channel,
-                dataDir,
-                logger
-              )
-          }
+        case cm: NakamotoSnapshotValidator.ContentMismatch =>
+          // Content mismatch — could be normal fork, restart, or (Driver B) a self-healable consensus-derived
+          // reward-sum/root drift our fork-diverged base can't reproduce. Try the self-heal adopt first; on any
+          // verification failure or non-self-healable mismatch, fall back to the normal fork/catch-up handling.
+          val normalMismatchHandling: F[Unit] =
+            snapshotStorage.head.flatMap {
+              case Some((localTip, _)) =>
+                val localOrd = localTip.ordinal.value.value
+                val gap = snap.ordinal - localOrd
+                if (gap >= CatchUpThreshold) {
+                  logger.warn(
+                    s"\uD83D\uDD04 Content mismatch with ordinal gap=$gap (local=$localOrd, incoming=${snap.ordinal}). Triggering catch-up."
+                  ) >>
+                    catchUpFromGossip(
+                      snap,
+                      parsed,
+                      stateRef,
+                      chainStore,
+                      snapshotStorage,
+                      lastGlobalSnapshotStorage,
+                      lastNGlobalSnapshotStorage,
+                      lastKnownSlotRef,
+                      mptStore,
+                      eventMempool,
+                      productionGate,
+                      channel,
+                      dataDir,
+                      logger
+                    )
+                } else {
+                  // Normal Nakamoto fork — store the snapshot as an alternative branch in
+                  // chainStore WITHOUT updating canonical state (snapshotStorage,
+                  // lastGlobalSnapshotStorage, MPT). Content hasn't been validated against
+                  // this fork's parent state yet — validation is deferred to reorg time.
+                  //
+                  // VRF + signature + slot-cert are already validated (proof of eligibility).
+                  // Content validation (state proof match) requires the fork's parent context
+                  // which we don't have locally. If ChainSelection later picks this fork as
+                  // denser (reorg), we validate by triggering catch-up which resets state to
+                  // the fork's context + MPT self-healing.
+                  logger.info(
+                    s"🔀 Fork at ordinal=${snap.ordinal} slot=${snap.slot} (gap=$gap). Storing as tentative branch (deferred validation)."
+                  ) >>
+                    Metrics[F].incrementCounter("dag_nakamoto_forks_stored") >>
+                    storeForkBranch(
+                      snap,
+                      stateRef,
+                      chainStore,
+                      tipTracker,
+                      snapshotStorage,
+                      lastGlobalSnapshotStorage,
+                      lastNGlobalSnapshotStorage,
+                      lastKnownSlotRef,
+                      mptStore,
+                      mptOverlay,
+                      eventMempool,
+                      productionGate,
+                      logger
+                    )
+                }
+              case None =>
+                catchUpFromGossip(
+                  snap,
+                  parsed,
+                  stateRef,
+                  chainStore,
+                  snapshotStorage,
+                  lastGlobalSnapshotStorage,
+                  lastNGlobalSnapshotStorage,
+                  lastKnownSlotRef,
+                  mptStore,
+                  eventMempool,
+                  productionGate,
+                  channel,
+                  dataDir,
+                  logger
+                )
+            }
+
+          // Driver B self-heal: only when the validator flagged the mismatch as `selfHealable` (consensus-derived
+          // reward-sum/root drift, every reproducible field matching), we hold the producer's gossiped GSI, AND the
+          // snapshot is a direct forward extension of our canonical tip (gap == 1). Otherwise fall through to the
+          // normal fork/catch-up handling.
+          val realignAttempt: F[Boolean] =
+            (cm.selfHealable, parsed) match {
+              case (true, Some((signedSnapshot, context))) =>
+                snapshotStorage.head.flatMap {
+                  case Some((localTip, _)) if snap.ordinal == localTip.ordinal.value.value + 1 =>
+                    realignFromAuthoritativeContext(
+                      snap,
+                      signedSnapshot,
+                      context,
+                      parentHash,
+                      chainStore,
+                      snapshotStorage,
+                      lastGlobalSnapshotStorage,
+                      lastNGlobalSnapshotStorage,
+                      mptStore,
+                      eventMempool,
+                      productionGate,
+                      logger
+                    )
+                  case _ => false.pure[F]
+                }
+              case _ => false.pure[F]
+            }
+
+          realignAttempt.ifM(Async[F].unit, normalMismatchHandling)
         case NakamotoSnapshotValidator.ParentBuffered =>
           // Already buffered for validation when parent arrives — nothing more to do
           Async[F].unit
@@ -2975,6 +3007,91 @@ object NakamotoSyncDaemon {
     * construction, so we reset our canonical storage + MPT and subsequent gossip messages WILL have parents we recognize. See
     * [[verifyCatchUpSnapshot]] for why majority-hash (gate 3) and VRF/slot-cert (gate 4) are NOT enforced on this path.
     */
+  /** Driver B reward-sum self-heal — adopt a producer's signed-authentic state for a single forward ordinal.
+    *
+    * When `NakamotoSnapshotValidator` flags a `ContentMismatch` as `selfHealable` (the ONLY divergence is the consensus-derived
+    * delegated-stake reward-accrual partition(s) — `DelegatedStakeRecord.rewards` is a running sum a node with a transiently fork-diverged
+    * base cannot reproduce — and/or the rolled-up mptRoot, while every reproducible field matches), our local re-derivation is wrong but
+    * the producer's signed snapshot carries the correct state. Storing a fork (the small-gap default) never re-aligns the base, so the next
+    * ordinal mismatches again — the fork storm. Instead we adopt the producer's gossiped GSI for THIS ordinal, re-aligning the base so
+    * subsequent ordinals validate.
+    *
+    * Safety is identical to deep catch-up: gate adoption on the two parent-free deterministic checks (`verifyCatchUpSnapshot` — envelope
+    * signature + carried GSI === committed `stateProof` incl. mptRoot), so the only state we can install is real, validly-signed consensus
+    * output (not a fabrication). Reuses catch-up's audited adopt primitives but WITHOUT the cooldown or backfill: the parent is present and
+    * this is a 1-ordinal forward adopt, not a deep resync. Returns true on adopt; false on verification failure (caller falls back to the
+    * normal fork/catch-up handling).
+    */
+  private def realignFromAuthoritativeContext[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
+    snap: pb.Snapshot,
+    signedSnapshot: Signed[GlobalIncrementalSnapshot],
+    context: GlobalSnapshotInfo,
+    // The already-decoded parent hash from `handleSnapshot` (single canonical decode of `snap.parentHash`).
+    parentHash: Hash,
+    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
+    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
+    mptStore: MptStore[F, GlobalStateKey],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
+    productionGate: ProductionGate[F],
+    logger: org.typelevel.log4cats.Logger[F]
+  )(
+    implicit globalStateProofSelector: GlobalStateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): F[Boolean] =
+    verifyCatchUpSnapshot[F](signedSnapshot, context).flatMap {
+      case CatchUpVerdict.Accept(verifiedHashed) =>
+        val adopt =
+          for {
+            _ <- chainStore.store(
+              signedSnapshot,
+              context,
+              snap.ordinal,
+              snap.slot,
+              parentHash,
+              vrfOutputFromProof(snap.vrfProof.toByteArray)
+            )
+            // setHeadForRecovery advances ALL canonical storages to this ordinal so the leader loop's
+            // parent read sees the re-aligned tip (same primitives catch-up uses; here it is a +1 forward step).
+            _ <- HasherSelector[F].withCurrent { implicit hasher =>
+              snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
+                lastGlobalSnapshotStorage.setForRecovery(verifiedHashed, context) >>
+                lastNGlobalSnapshotStorage.setForRecovery(verifiedHashed, context)
+            }
+            // Re-seed the MPT from the producer's authoritative GSI — its committed reward-sum replaces our
+            // diverged re-derivation, so the per-ordinal stateProof re-derives correctly from here on.
+            _ <- HasherSelector[F].withCurrent { implicit hasher =>
+              mptStore.syncFromGlobalSnapshotInfo(context, SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)))
+            }
+            _ <- reconcileMempool(eventMempool, context, logger)
+          } yield ()
+        for {
+          _ <- logger.info(
+            s"🩹 REWARD-SUM REALIGN: adopting producer's signed-authentic state at ordinal=${snap.ordinal} " +
+              s"slot=${snap.slot} (consensus-derived reward-sum/root diverged from a fork-diverged base; all " +
+              s"reproducible fields match; signature + stateProof verified)."
+          )
+          _ <- productionGate.pause("reward-sum-realign")
+          _ <- cats.effect.MonadCancel[F].guarantee(adopt, productionGate.resume("reward-sum-realign"))
+          _ <- Metrics[F].incrementCounter("dag_nakamoto_reward_sum_realign")
+        } yield true
+      case CatchUpVerdict.RejectedInvalidSignature =>
+        logger
+          .warn(
+            s"⛔ Reward-sum realign REJECTED ordinal=${snap.ordinal}: invalid envelope signature. " +
+              s"Falling back to normal fork handling."
+          )
+          .as(false)
+      case CatchUpVerdict.RejectedStateProofMismatch(_) =>
+        logger
+          .warn(
+            s"⛔ Reward-sum realign REJECTED ordinal=${snap.ordinal}: gossiped GlobalSnapshotInfo does not " +
+              s"match the snapshot's committed stateProof. Falling back to normal fork handling."
+          )
+          .as(false)
+    }
+
   private def catchUpFromGossip[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
     snap: pb.Snapshot,
     parsed: Option[(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)],
