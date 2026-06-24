@@ -169,7 +169,6 @@ abstract class CurrencyL1App(
         sharedStorages.lastNGlobalSnapshot,
         storages.lastSnapshot,
         storages.transaction,
-        sharedServices.currencySnapshotContextFns,
         cfg.transactionLimit,
         sharedConfig.allowSpends,
         sharedConfig.tokenLocks,

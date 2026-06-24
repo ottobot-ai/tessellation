@@ -1,11 +1,11 @@
 package io.constellationnetwork.currency.l1.domain.snapshot.programs
 
+import cats.Parallel
 import cats.data.{NonEmptyList, Validated, ValidatedNel}
 import cats.effect.Async
 import cats.effect.kernel.Ref
 import cats.effect.std.Random
 import cats.syntax.all._
-import cats.{Applicative, Parallel}
 
 import scala.collection.immutable.SortedMap
 
@@ -21,9 +21,11 @@ import io.constellationnetwork.json.{JsonBrotliBinarySerializer, JsonSerializer}
 import io.constellationnetwork.node.shared.config.types.{AllowSpendsConfig, LastGlobalSnapshotsSyncConfig, TokenLocksConfig}
 import io.constellationnetwork.node.shared.domain.globalAlignment.GlobalL0AlignmentStorage
 import io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowMirrorVerifier
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
+import io.constellationnetwork.node.shared.domain.snapshot.Validator
 import io.constellationnetwork.node.shared.domain.snapshot.services.GlobalL0Service
 import io.constellationnetwork.node.shared.domain.snapshot.storage._
-import io.constellationnetwork.node.shared.domain.snapshot.{SnapshotContextFunctions, Validator}
 import io.constellationnetwork.node.shared.domain.swap.{AllowSpendStorage, ContextualAllowSpendValidator}
 import io.constellationnetwork.node.shared.domain.tokenlock.{ContextualTokenLockValidator, TokenLockStorage}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.LastSnapshotStorage
@@ -61,7 +63,6 @@ object CurrencySnapshotProcessor {
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     lastCurrencySnapshotStorage: LastSnapshotStorage[F, CurrencyIncrementalSnapshot, CurrencySnapshotInfo],
     transactionStorage: TransactionStorage[F],
-    currencySnapshotContextFns: SnapshotContextFunctions[F, CurrencyIncrementalSnapshot, CurrencySnapshotContext],
     transactionLimitConfig: TransactionLimitConfig,
     allowSpendsConfig: AllowSpendsConfig,
     tokenLocksConfig: TokenLocksConfig,
@@ -97,13 +98,15 @@ object CurrencySnapshotProcessor {
             val globalSnapshotReference = SnapshotReference.fromHashedSnapshot(globalSnapshot)
             lastGlobalSnapshotStorage.getCombined.flatMap {
               case None =>
-                // Populate MPT with the bootstrap GSI BEFORE processCurrencySnapshots runs
-                // — processAlignment reads the MPT during checkAlignment, so the seed must
-                // happen first. Without it, accept() on the next incremental snapshot reads
-                // from an empty MPT and produces a state proof that diverges from the
-                // leader's claimed root (StateProofMismatch at ordinal 2). Uses scodec-typed
-                // syncFromGlobalSnapshotInfo to match the bytes syncFromStateChanges writes
-                // during accept(). Same pattern as dag-l0/Main.scala bootstrap paths.
+                // COLD BOOTSTRAP. The MPT is seeded by `processCurrencySnapshots` from gl0's SIGNED MPT BYTES (`loadBytes`, PURE) —
+                // NOT from a materialized GSI — inside its `Some(Valid(hashedSnapshots))` branch, BEFORE the adopt's `gl0CurrencyView`
+                // MPT read AND before `processAlignment` reads the MPT during `checkAlignment`/`DownloadNeeded`. That single seed point
+                // (`seedMptFromSignedBytesForAdopt`) covers this cold-bootstrap path AND the steady-state path uniformly. On a
+                // sparse-ordinal 404 the seed IDLES (no `syncFromGlobalSnapshotInfo` fallback) and the global follow still advances; the
+                // first currency-carrying non-sparse ordinal seeds the MPT and the adopt lands then. Post-cutover the currency path no
+                // longer runs `accept()`/`createContext` (re-execution was removed), so the old "accept() reads an empty MPT →
+                // StateProofMismatch at ordinal 2" concern does not apply to currency — the adopt only ever READS the loadBytes-populated
+                // MPT via the finalized `GlobalStateReader`.
                 val setGlobalSnapshot = lastGlobalSnapshotStorage
                   .setInitial(globalSnapshot, globalState)
                   .as[SnapshotProcessingResult](DownloadPerformed(globalSnapshotReference, Set.empty, Set.empty))
@@ -111,15 +114,14 @@ object CurrencySnapshotProcessor {
                   .setInitialFetchingGL0(globalSnapshot, globalState, l0Service.asLeft.some, none)
                   .as[SnapshotProcessingResult](DownloadPerformed(globalSnapshotReference, Set.empty, Set.empty))
 
-                mptStore.syncFromGlobalSnapshotInfo(globalState, globalSnapshot.ordinal) >>
-                  processCurrencySnapshots(
-                    globalSnapshot,
-                    globalState,
-                    globalSnapshotReference,
-                    setGlobalSnapshot,
-                    setNGlobalSnapshots,
-                    getGlobalSnapshotByOrdinal
-                  )
+                processCurrencySnapshots(
+                  globalSnapshot,
+                  globalState,
+                  globalSnapshotReference,
+                  setGlobalSnapshot,
+                  setNGlobalSnapshots,
+                  getGlobalSnapshotByOrdinal
+                )
 
               case _ => (new Throwable("unexpected state")).raiseError[F, SnapshotProcessingResult]
             }
@@ -262,8 +264,13 @@ object CurrencySnapshotProcessor {
       // `getFollowSliceSince`), VERIFIES it by field-root equality against the signed snapshot AT THE SLICE'S OWN ordinal (resolved
       // from cl1/dl1's OWN local lastN store — no peer re-pull), and BUILDS a partial `GlobalSnapshotInfo` populated with the SIX
       // fields cl1/dl1 read: the five Address-keyed consumed fields (balances, lastTxRefs, lastAllowSpendRefs, lastTokenLockRefs,
-      // activeTokenLocks) PLUS `lastCurrencySnapshots` (the metagraph's own currency-genesis bootstrap reads
-      // `globalState.lastCurrencySnapshots.get(identifier)` in `processCurrencySnapshots`). All other GSI fields stay empty.
+      // activeTokenLocks) PLUS `lastCurrencySnapshots`. This partial GSI is the GLOBAL-FOLLOW `state` — it is written to the global
+      // storage sink (`lastGlobalSnapshotStorage.set` / `lastNGlobalSnapshotStorage.set`), NOT into the MPT. Post-cutover the MPT used by
+      // the currency adopt is seeded SEPARATELY and PURELY from gl0's SIGNED MPT BYTES (`processCurrencySnapshots` →
+      // `seedMptFromSignedBytesForAdopt` → `loadBytes`), so the per-MG `Mg*` + fieldId-5 currency partitions come from gl0's signed bytes,
+      // NOT from this partial GSI (no `syncFromGlobalSnapshotInfo` transit). The 6th field stays PRESENT here only so the global storage
+      // sink and any global-state consumer carry the field-root-verified currency map; the currency adopt never reads it. All other GSI
+      // fields stay empty.
       //
       // The 6th field carries its SIGNED per-field roots in the live MPT-format `GlobalSnapshotStateProof` field-4 slot
       // (`lastCurrencySnapshotsProof`, the two MPT subtree roots — `LastIncrementalCurrencySnapshots` + `LastCurrencySnapshotInfo`, also
@@ -347,20 +354,39 @@ object CurrencySnapshotProcessor {
         }
       }
 
+      // CUTOVER (mirrors gl1's `DAGSnapshotProcessor.applyGlobalSnapshotFn` for the CURRENCY-snapshot path): cl1/dl1 no longer
+      // RE-EXECUTE each finalized currency snapshot (`currencySnapshotContextFns.createContext → CurrencySnapshotValidator`) to
+      // re-derive its `CurrencySnapshotInfo`. That node-local re-derivation could DIVERGE from the metagraph-signed result (a
+      // reward-timing balance recompute → `CannotCreateContext` → the gl0 ordinal carrying that currency ordinal is skipped →
+      // permanent NotNext freeze → `globalSyncView` stuck at genesis → allow-spends rejected `TooFarLastValidEpochProgress`).
+      //
+      // Instead `processCurrencySnapshots` ADOPTS the AUTHORITATIVE currency state from the MPT (PURE MPT-as-primary — NEVER from a
+      // materialized `GlobalSnapshotInfo`): it seeds the MPT VERBATIM from gl0's SIGNED MPT BYTES (`pullLatestMptEntries` → `loadBytes`,
+      // `seedMptFromSignedBytesForAdopt`) — NO `syncFromGlobalSnapshotInfo` — then reads the metagraph-SIGNED `CurrencySnapshotInfo` +
+      // signed incremental from THAT MPT via the finalized `GlobalStateReader` (`getCurrencySnapshotInfo` /
+      // `getLastIncrementalCurrencySnapshot`). The adopted state is already
+      // (1) finality-gated (#122 — `pullLatestMptEntries` is gl0's depth-k-finalized signed store) and
+      // (2) verified-by-construction: `loadBytes` stores the signed bytes verbatim and the seed asserts
+      //     `sidecarFreeMptRoot(entries) === signed stateProof.mptRoot` (the corruption backstop). The currency binaries themselves are
+      //     metagraph-signature-checked in `fetchCurrencySnapshots` (`toHashedWithSignatureCheck`).
+      // So cl1's follower currency state is no longer re-computed but trusted-and-adopted from the signed-bytes MPT, exactly as the
+      // global cutover (and symmetric with how ml0/dl1 already loadBytes on the resync path).
+      //
+      // `applySnapshotFn` (the trait re-execution seam, invoked only by `checkAlignment`'s `NextSubHeight`/`NextHeight` branch)
+      // is therefore DEAD on cl1's flow: the rewritten `processCurrencySnapshots` routes every adopt through the
+      // download/`setInitial` path (`checkAlignment` with a `Left((snapshot, authoritativeInfo))`), never `checkAlignment(Right)`.
+      // It is kept only to satisfy the abstract trait member and raises the same retryable, no-recovery-storm error the global
+      // follow uses if it is ever reached (it must not be) — never silently re-executing or fabricating state.
       def applySnapshotFn(
         lastState: CurrencySnapshotInfo,
         lastSnapshot: Signed[CurrencyIncrementalSnapshot],
         snapshot: Signed[CurrencyIncrementalSnapshot],
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(implicit hasher: Hasher[F]): F[CurrencySnapshotInfo] =
-        currencySnapshotContextFns
-          .createContext(
-            CurrencySnapshotContext(identifier, lastState),
-            lastSnapshot,
-            snapshot,
-            getGlobalSnapshotByOrdinal
-          )
-          .map(_.snapshotInfo)
+        FollowSliceVerificationError(
+          s"cl1 applySnapshotFn (currency re-execution) is disabled post-cutover but was reached at currency ord=" +
+            s"${snapshot.value.ordinal.show}; currency state is adopted authoritatively in processCurrencySnapshots — investigate"
+        ).raiseError[F, CurrencySnapshotInfo]
 
       override def onDownload(snapshot: Hashed[CurrencyIncrementalSnapshot], state: CurrencySnapshotInfo): F[Unit] =
         allowSpendStorage.initByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
@@ -384,6 +410,57 @@ object CurrencySnapshotProcessor {
           allowSpendStorage.replaceByRefs(state.lastAllowSpendRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal) >>
           tokenLockStorage.replaceByRefs(state.lastTokenLockRefs.map(_.toMap).getOrElse(Map.empty), snapshot.ordinal)
 
+      // PURE MPT-AS-PRIMARY seed (3c-A): populate the global MPT for the currency adopt from gl0's SIGNED MPT BYTES — NEVER from a
+      // materialized `GlobalSnapshotInfo` (`syncFromGlobalSnapshotInfo`). Pulls gl0's finalized `(snapshot, GSI, signed-byte-map)` via
+      // `pullLatestMptEntries` and, when the bytes are served, stores them VERBATIM with `loadBytes` so the recomputed
+      // `sidecarFreeMptRoot(entries)` equals the producer's signed `mptRoot` BY CONSTRUCTION (no re-encode drift). The signed byte map is
+      // gl0's FULL `mpt_snapshot_info_signed/<ordinal>` store — it includes the per-MG `Mg*` currency partitions + the fieldId-5
+      // `LastIncrementalCurrencySnapshots` signed snapshot — so `getCurrencySnapshotInfo` / `getLastIncrementalCurrencySnapshot` read it back
+      // after `loadBytes`. Returns the canonical ordinal that was loaded on success; `None` when the MPT was NOT seeded this tick, in which
+      // case the caller IDLES the currency adopt (advancing only the global follow) — purity over a one-tick delay; the next non-sparse
+      // finalized ordinal carries bytes. The two idle cases:
+      //   - byte route 404'd at a sparse combined-checkpoint ordinal ⇒ `pullLatestMptEntries` degraded to `pullLatestSnapshot` and returned
+      //     `None` for the bytes. We DO NOT fall back to `syncFromGlobalSnapshotInfo` here (that is the materialized-GSI transit the
+      //     MPT-as-primary rule forbids) — we idle.
+      //   - bytes were served but the recomputed root ≠ the signed `stateProof.mptRoot` (corrupt/truncated transfer): NEVER adopt
+      //     inconsistent state — idle and re-pull next tick (the gate is the corruption backstop, identical to the NotNext resync gate).
+      // `globalState` is intentionally UNUSED: the MPT is sourced ONLY from gl0's signed bytes, never the materialized GSI of THIS gl0
+      // snapshot. The global-follow sink (`lastGlobalSnapshotStorage`, written via the captured `setGlobalSnapshot`/`setNGlobalSnapshot`
+      // thunks) is a SEPARATE store and is left to carry `globalState`; `loadBytes` only writes the MPT.
+      private def seedMptFromSignedBytesForAdopt(implicit hasher: Hasher[F]): F[Option[SnapshotOrdinal]] =
+        l0Service.pullLatestMptEntries.flatMap {
+          case (canonicalSnapshot, _, canonicalEntries) =>
+            canonicalEntries match {
+              case None =>
+                Slf4jLogger
+                  .getLogger[F]
+                  .info(
+                    s"cl1 currency-adopt: gl0 served no signed MPT bytes at canonical ord=${canonicalSnapshot.ordinal.show} " +
+                      s"(sparse combined-checkpoint 404) — IDLING the currency adopt this tick (NO syncFromGlobalSnapshotInfo); next non-sparse ordinal seeds the MPT"
+                  )
+                  .as(none[SnapshotOrdinal])
+              case Some(bytes) =>
+                for {
+                  _ <- mptStore.loadBytes(bytes, canonicalSnapshot.ordinal)
+                  afterBytes <- mptStore.underlying.entries
+                  recomputedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes).map(_.some)
+                  signedRoot = canonicalSnapshot.signed.value.stateProof.mptRoot
+                  result <-
+                    if (recomputedRoot === signedRoot)
+                      canonicalSnapshot.ordinal.some.pure[F]
+                    else
+                      Slf4jLogger
+                        .getLogger[F]
+                        .error(
+                          s"cl1 currency-adopt: gl0 served signed MPT bytes inconsistent with its OWN signed mptRoot at " +
+                            s"ord=${canonicalSnapshot.ordinal.show} (recomputed=${recomputedRoot.map(_.show.take(12)).getOrElse("none")} " +
+                            s"≠ signed=${signedRoot.map(_.show.take(12)).getOrElse("none")}); NOT adopting — IDLING, re-pull next tick"
+                        )
+                        .as(none[SnapshotOrdinal])
+                } yield result
+            }
+        }
+
       private def processCurrencySnapshots(
         globalSnapshot: Hashed[GlobalIncrementalSnapshot],
         globalState: GlobalSnapshotInfo,
@@ -396,64 +473,94 @@ object CurrencySnapshotProcessor {
         stateProofSelector: StateProofSelector,
         withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
       ): F[SnapshotProcessingResult] =
+        // MPT-AS-PRIMARY (PURE): the MPT is NO LONGER seeded every tick via `syncFromGlobalSnapshotInfo(globalState, …)` — that routed the
+        // adopt through a MATERIALIZED `GlobalSnapshotInfo`, the transit the MPT-as-primary rule forbids. Instead we seed the MPT from gl0's
+        // SIGNED MPT BYTES (`loadBytes`) ONLY when this gl0 snapshot actually carries currency activity for THIS metagraph — i.e. only inside
+        // the `Some(Valid(hashedSnapshots))` branch below (`fetchCurrencySnapshots` is computed independently of the MPT, so the decision is
+        // made without reading the stale MPT). `loadBytes` is FULL (no incremental signed-bytes path exists), so this bounds the cost: it
+        // fires on a currency-carrying tick, NOT every ~10s global tick. The seed happens BEFORE the `gl0CurrencyView*` MPT reads and BEFORE
+        // `processAlignment` reads the MPT during `checkAlignment`/`DownloadNeeded`, so both the steady-state and cold-bootstrap (the `process`
+        // Left branch funnels here too) adopts read the just-loaded signed bytes. In steady state nothing else seeds cl1's global MPT (the
+        // currency `processAlignment` is a no-op for the global MPT: its `state` is a `CurrencySnapshotInfo`, not a `GlobalSnapshotInfo`, so
+        // its `updateMptStorage` type-match hits the `case _ => unit` branch). On a sparse-ordinal 404 (or a corrupt-byte verify mismatch) the
+        // seed returns `None` and we IDLE the currency adopt this tick (advancing only the global follow) — see `seedMptFromSignedBytesForAdopt`.
         fetchCurrencySnapshots(globalSnapshot).flatMap {
           case Some(Validated.Valid(hashedSnapshots)) =>
-            prepareIntermediateStorages(
-              addressStorage,
-              blockStorage,
-              lastCurrencySnapshotStorage,
-              transactionStorage,
-              allowSpendStorage,
-              tokenLockStorage
-            ).flatMap {
-              case (as, bs, lcss, ts, als, tls) =>
-                type Success = NonEmptyList[Alignment]
-                type Agg = (NonEmptyList[Hashed[CurrencyIncrementalSnapshot]], List[Alignment])
-                type Result = Option[Success]
+            seedMptFromSignedBytesForAdopt.flatMap {
+              case None =>
+                // gl0's signed MPT bytes are unavailable (sparse-ordinal 404) or failed the verify gate this tick. Do NOT fall back to
+                // `syncFromGlobalSnapshotInfo` (materialized-GSI transit forbidden). IDLE the currency adopt — still ADVANCE the global
+                // follow so the follow pointer never stalls; the next non-sparse finalized ordinal seeds the MPT and the forward-only adopt
+                // catches up (the authoritative currency tip advances monotonically, so a one-tick delay loses nothing).
+                setGlobalSnapshot >> setNGlobalSnapshot
+              case Some(_) =>
+                prepareIntermediateStorages(
+                  addressStorage,
+                  blockStorage,
+                  lastCurrencySnapshotStorage,
+                  transactionStorage,
+                  allowSpendStorage,
+                  tokenLockStorage
+                ).flatMap {
+                  // Only the block + last-snapshot intermediate copies (`bs`, `lcss`) are needed to COMPUTE the `DownloadNeeded`
+                  // alignment; the adopt is then committed against the REAL storages in the outer `processAlignment` below. The
+                  // address / transaction / allow-spend / token-lock copies are unused on this adopt-only path (the prior
+                  // re-execution loop applied intermediate alignments to them; the cutover does not).
+                  case (_, bs, lcss, _, _, _) =>
+                    type Success = NonEmptyList[Alignment]
 
-                lastCurrencySnapshotStorage.getCombined.flatMap {
-                  case None =>
                     val snapshotToDownload = hashedSnapshots.last
 
-                    // Bootstrap (cl1 has no local currency snapshot yet): download the metagraph's state from gl0's view of
-                    // this metagraph. gl0's view can legitimately be at one of three states, all of which must be handled
-                    // WITHOUT crashing the alignment stream (a `raiseError` here propagates up to `globalSnapshotProcessing`'s
-                    // `handleErrorWith` → "Global snapshot processing stream failed, restarting" → restart-loop; cl1 then never
-                    // establishes a currency snapshot and the first metagraph tx send dies).
-                    def bootstrapFrom(stateToDownload: CurrencySnapshotInfo): F[Option[Success]] = {
-                      val toPass = (snapshotToDownload, stateToDownload).asLeft[Hashed[CurrencyIncrementalSnapshot]]
-
-                      checkAlignment(
-                        toPass,
-                        bs,
-                        lcss,
-                        txHasher,
-                        getGlobalSnapshotByOrdinal,
-                        globalL0AlignmentStorage
-                      ).map { alignment =>
-                        NonEmptyList.one(alignment).some
+                    // MPT-AS-PRIMARY (PURE): gl0's finalized, field-root-VERIFIED view of THIS metagraph's AUTHORITATIVE latest currency
+                    // state, with the authoritative ordinal it sits at (paired so the adopt is strictly forward-only). Sourced from the MPT
+                    // just seeded VERBATIM from gl0's SIGNED MPT BYTES (`seedMptFromSignedBytesForAdopt` → `loadBytes`) via the finalized
+                    // `GlobalStateReader` — NOT from any materialized `GlobalSnapshotInfo` (the eliminated `globalState.lastCurrencySnapshots`
+                    // read). Two cases:
+                    //   - non-genesis: `getLastIncrementalCurrencySnapshot` gives the metagraph-signed `Signed[CurrencyIncrementalSnapshot]`
+                    //     whose `.value.ordinal` IS the authoritative ordinal, and `getCurrencySnapshotInfo` reconstructs the matching
+                    //     `CurrencySnapshotInfo` from the unrolled `Mg*` partitions (SAME ordinal — both read the just-loaded signed-bytes MPT,
+                    //     fixing the latent old-code bug of pairing the info with `hashedSnapshots.last`, a possibly-different ordinal).
+                    //   - genesis: gl0's signed bytes carry a metagraph at its genesis (`Left`) in the SAME fieldId-5 incremental partition
+                    //     (`fromCurrencySnapshot`), so `getLastIncrementalCurrencySnapshot` already returns `Some` at the genesis ordinal and
+                    //     `getCurrencySnapshotInfo` returns `Some`; the explicit `getLastCurrencySnapshot.info.toCurrencySnapshotInfo` fallback
+                    //     below covers the pre-incremental window where only the `LastCurrencySnapshots` Left key exists.
+                    // `None` from every reader ⇒ the metagraph isn't in the MPT at this gl0 ordinal yet — NOT an error (retry next tick).
+                    val reader: GlobalStateReader[F] = GlobalStateReader.finalized[F](mptStore)
+                    val gl0CurrencyViewF: F[Option[(SnapshotOrdinal, CurrencySnapshotInfo)]] =
+                      (reader.getLastIncrementalCurrencySnapshot(identifier), reader.getCurrencySnapshotInfo(identifier)).tupled.flatMap {
+                        case (Some(signedIncremental), Some(stateToAdopt)) =>
+                          (signedIncremental.value.ordinal, stateToAdopt).some.pure[F]
+                        case _ =>
+                          reader
+                            .getLastCurrencySnapshot(identifier)
+                            .map(_.map { genesisFullSnapshot =>
+                              (genesisFullSnapshot.value.ordinal, genesisFullSnapshot.value.info.toCurrencySnapshotInfo)
+                            })
                       }
-                    }
 
-                    globalState.lastCurrencySnapshots.get(identifier) match {
-                      // gl0 has adopted a non-genesis incremental for this metagraph — bootstrap from the carried info.
-                      case Some(Right((_, stateToDownload))) => bootstrapFrom(stateToDownload)
+                    // Build a download alignment that ADOPTS the authoritative currency state carried in gl0's finalized view onto
+                    // `snapshotToDownload` — NO re-execution. `checkAlignment` on an EMPTY `lcss` (the intermediate copy) yields
+                    // `DownloadNeeded`, whose `processAlignment` calls `setInitial` + rebuilds balances / lastTxRefs / allow-spend /
+                    // token-lock refs from the adopted `CurrencySnapshotInfo`. `lcss.clear` empties ONLY the intermediate copy; the
+                    // real `lastCurrencySnapshotStorage` is committed by the outer `processAlignment` (line below) once the
+                    // `DownloadNeeded` is produced.
+                    //
+                    // FIX B (ActiveTipAddingError wedge): the produced `DownloadNeeded`'s `processAlignment` calls
+                    // `blockStorage.adjustToMajority(activeTipsToAdd/deprecatedTipsToAdd = snapshot.tips, …)` on the REAL `blockStorage`.
+                    // `addActiveTips`/`addDeprecatedTips` accept a tip only when its hash is `WaitingBlock`/`PostponedBlock`/`None` —
+                    // but on a running L1 the genesis block (and any cl1-produced blocks) are already `MajorityBlock`, so re-adding the
+                    // genesis tip throws `BlockStorage$ActiveTipAddingError` (observed 31× on cl1-m0 + dl1-m0) → the alignment is
+                    // skipped → the follow wedges → L0-token send fails. The cutover already clears `lastCurrencySnapshotStorage` so its
+                    // `setInitial` lands; the block storage was the missing reset. Clearing it here restores the COLD-BOOTSTRAP
+                    // precondition (empty block storage) the `DownloadNeeded` path assumes. In-flight self-produced blocks are dropped —
+                    // acceptable: they live on ml0 and the follower re-syncs to the authoritative tip carried by `snapshot.tips` (which
+                    // `adjustToMajority` re-adds as the fresh `MajorityBlock` set). The intermediate `bs` copy is untouched (a non-empty
+                    // `bs` only contributes to `obsoleteToRemove`/`postponedToWaiting`, both empty for a genesis-tip-only reconciliation).
+                    def adoptForwardTo(stateToAdopt: CurrencySnapshotInfo): F[Option[Success]] = {
+                      val toPass = (snapshotToDownload, stateToAdopt).asLeft[Hashed[CurrencyIncrementalSnapshot]]
 
-                      // gl0's view is still the metagraph's genesis FULL snapshot (gl0 lagging the metagraph). The full
-                      // snapshot carries the complete `CurrencySnapshotInfo` (as the V1 `info`), so cl1 CAN bootstrap from it
-                      // and then catches up by following ml0's incrementals forward.
-                      case Some(Left(genesisFullSnapshot)) => bootstrapFrom(genesisFullSnapshot.value.info.toCurrencySnapshotInfo)
-
-                      // The metagraph isn't in gl0's `lastCurrencySnapshots` at this gl0 ordinal yet — NOT an error. Return
-                      // `none` (no alignment this round) so the stream retries on the next gl0 snapshot, rather than crashing.
-                      case None => none[Success].pure[F]
-                    }
-
-                  case Some((_, _)) =>
-                    (hashedSnapshots, List.empty[Alignment]).tailRecM {
-                      case (NonEmptyList(snapshot, nextSnapshots), agg) =>
-                        val toPass = snapshot.asRight[(Hashed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
-
+                      blockStorage.clear >>
+                        lcss.clear >>
                         checkAlignment(
                           toPass,
                           bs,
@@ -461,46 +568,78 @@ object CurrencySnapshotProcessor {
                           txHasher,
                           getGlobalSnapshotByOrdinal,
                           globalL0AlignmentStorage
-                        ).flatMap {
-                          case _: Ignore =>
-                            Applicative[F].pure(none[Success].asRight[Agg])
-                          case alignment =>
-                            processAlignment(alignment, bs, ts, als, tls, lcss, as, mptStore).as {
-                              val updatedAgg = agg :+ alignment
-
-                              NonEmptyList.fromList(nextSnapshots) match {
-                                case Some(next) =>
-                                  (next, updatedAgg).asLeft[Result]
-                                case None =>
-                                  NonEmptyList
-                                    .fromList(updatedAgg)
-                                    .asRight[Agg]
-                              }
-                            }
-                        }
-
+                        ).map(alignment => NonEmptyList.one(alignment).some)
                     }
+
+                    gl0CurrencyViewF.flatMap { gl0CurrencyView =>
+                      lastCurrencySnapshotStorage.getCombined.flatMap {
+                        case None =>
+                          // Bootstrap (cl1 has no local currency snapshot yet): adopt the metagraph's authoritative state from gl0's
+                          // (MPT-sourced) view. `None` (metagraph not yet in the MPT at this gl0 ordinal) is NOT an error — return `none`
+                          // so the stream retries next gl0 snapshot (a `raiseError` here would restart `globalSnapshotProcessing` and the
+                          // first metagraph tx send would die before cl1 ever establishes a currency snapshot).
+                          gl0CurrencyView match {
+                            case Some((_, stateToAdopt)) => adoptForwardTo(stateToAdopt)
+                            case None                    => none[Success].pure[F]
+                          }
+
+                        case Some((lastCurrencySnapshot, _)) =>
+                          // CUTOVER normal path: ADOPT gl0's authoritative currency view forward, monotonically — NO re-execution, NO
+                          // chain-link `Validator.compare` (the brittle check that, with the old re-execution, produced
+                          // `CannotCreateContext` → skip → permanent NotNext freeze). We adopt ONLY when gl0's authoritative ordinal is
+                          // strictly AHEAD of our local tip (forward-only / never regress). Because gl0 advances the currency tip
+                          // monotonically per metagraph (chain-linked at acceptance) and most ~10s gl0 ticks carry NO new currency
+                          // ordinal, the common case is "no new ordinal ⇒ ignore" — no clear/re-download churn — and a fresh authoritative
+                          // ordinal triggers exactly one forward adopt (full `setInitial` rebuild; acceptable at the slow finalized cadence).
+                          gl0CurrencyView match {
+                            case Some((authoritativeOrdinal, stateToAdopt)) if authoritativeOrdinal > lastCurrencySnapshot.ordinal =>
+                              Slf4jLogger
+                                .getLogger[F]
+                                .info(
+                                  s"cl1 adopting authoritative currency state ord=${authoritativeOrdinal.show} " +
+                                    s"(local tip ord=${lastCurrencySnapshot.ordinal.show}, gl0 ord=${globalSnapshot.ordinal.show}) " +
+                                    s"— MPT-sourced, field-root-verified, no re-execution"
+                                ) >>
+                                // Clear the REAL tip so the produced `DownloadNeeded` lands via `setInitial` (requires empty storage)
+                                // when the outer `processAlignment` commits it (block storage is reset inside `adoptForwardTo`).
+                                lastCurrencySnapshotStorage.clear >>
+                                adoptForwardTo(stateToAdopt)
+
+                            // gl0 carries no NEW currency ordinal (at/behind our tip) — nothing to adopt this tick. Leave the tip
+                            // untouched and idle (no churn); a later gl0 snapshot with a fresh currency ordinal will advance us.
+                            case _ => none[Success].pure[F]
+                          }
+                      }
+                    }
+                }.flatMap {
+                  case Some(alignments) =>
+                    alignments.traverse { alignment =>
+                      processAlignment(
+                        alignment,
+                        blockStorage,
+                        transactionStorage,
+                        allowSpendStorage,
+                        tokenLockStorage,
+                        lastCurrencySnapshotStorage,
+                        addressStorage,
+                        mptStore
+                      )
+                    }.flatMap { results =>
+                      setGlobalSnapshot >>
+                        setNGlobalSnapshot
+                          .map(BatchResult(_, results))
+                    }
+                  // No currency alignment this tick (nothing new to adopt for this metagraph — gl0's authoritative currency view is
+                  // at/behind cl1's local tip). This is NOT a stall: still ADVANCE the global follow pointer (`setGlobalSnapshot` /
+                  // `setNGlobalSnapshot`), exactly as the "gl0 snapshot carried no currency binaries" branch below. Decoupling global
+                  // advancement from currency work is REQUIRED post-cutover — otherwise a gl0 snapshot that re-serves an already-adopted
+                  // currency ordinal would freeze the global follow (the re-execution path masked this by always producing an alignment
+                  // on a clean forward chain).
+                  case None =>
+                    setGlobalSnapshot >>
+                      setNGlobalSnapshot
                 }
-            }.flatMap {
-              case Some(alignments) =>
-                alignments.traverse { alignment =>
-                  processAlignment(
-                    alignment,
-                    blockStorage,
-                    transactionStorage,
-                    allowSpendStorage,
-                    tokenLockStorage,
-                    lastCurrencySnapshotStorage,
-                    addressStorage,
-                    mptStore
-                  )
-                }.flatMap { results =>
-                  setGlobalSnapshot >>
-                    setNGlobalSnapshot
-                      .map(BatchResult(_, results))
-                }
-              case None => Applicative[F].pure(SnapshotIgnored(globalSnapshotReference))
-            }
+            } // end seedMptFromSignedBytesForAdopt.flatMap (Some(_) currency-activity branch)
 
           case Some(Validated.Invalid(_)) =>
             Slf4jLogger
@@ -599,10 +738,12 @@ object CurrencySnapshotProcessor {
 
   /** Build a `GlobalSnapshotInfo` populated with the SIX fields cl1/dl1 consume from a verified [[ConsumedFieldState]]; every other field
     * stays at `GlobalSnapshotInfo.empty`'s value. The five Address-keyed consumed fields match gl1's
-    * `DAGSnapshotProcessor.consumedFieldsToGlobalSnapshotInfo`; the cl1/dl1 ADDITION is `lastCurrencySnapshots`, which
-    * `processCurrencySnapshots` reads (`globalState.lastCurrencySnapshots.get(identifier)`) for the metagraph's own currency-genesis
-    * bootstrap. `lastCurrencySnapshotsProofs` is left empty — the MPT-format proof carries no such field root and cl1/dl1 never read the
-    * proofs map (only the snapshot+info value via `.get(identifier)`).
+    * `DAGSnapshotProcessor.consumedFieldsToGlobalSnapshotInfo`; the cl1/dl1 ADDITION is `lastCurrencySnapshots`. This partial GSI is the
+    * GLOBAL-FOLLOW `state`: it feeds the global storage sink (`lastGlobalSnapshotStorage`), NOT the MPT. Post-cutover the currency adopt's
+    * MPT is seeded PURELY from gl0's SIGNED MPT BYTES (`processCurrencySnapshots` → `loadBytes`), so the per-MG `Mg*` + fieldId-5 currency
+    * partitions come from gl0's signed bytes — there is no `syncFromGlobalSnapshotInfo` transit of this partial GSI. The 6th field stays
+    * populated here only so the global storage carries the field-root-verified currency map; the currency adopt never reads it.
+    * `lastCurrencySnapshotsProofs` is left empty — the MPT-format proof carries no such field root and cl1/dl1 never read the proofs map.
     */
   private def consumedFieldsToGlobalSnapshotInfo(state: ConsumedFieldState): GlobalSnapshotInfo =
     // Five UNIFORM consumed fields single-sourced via the registry; the 6th (`lastCurrencySnapshots`, the bespoke

@@ -35,6 +35,18 @@ class BlockStorage[F[_]: Sync: Random](blocks: MapRef[F, ProofsHash, Option[Stor
   def getState(): F[Map[ProofsHash, StoredBlock]] =
     blocks.toMap
 
+  /** Reset block storage to empty — every `ProofsHash` entry set to `None`. Used by the cl1/dl1 follower currency-adopt path
+    * (`CurrencySnapshotProcessor.processCurrencySnapshots`): when the follower ADOPTS gl0's authoritative currency tip it re-runs the
+    * cold-bootstrap `DownloadNeeded` → `setInitial` + `adjustToMajority(activeTipsToAdd/deprecatedTipsToAdd = …)` path, which assumes EMPTY
+    * block storage (`addActiveTips`/`addDeprecatedTips` accept only `WaitingBlock`/`PostponedBlock`/`None`). On a running L1 the genesis
+    * block is already a `MajorityBlock`, so re-adding the same tip throws `ActiveTipAddingError`; clearing first restores the
+    * cold-bootstrap precondition. Any in-flight self-produced blocks are dropped — acceptable because they live on ml0 and the follower
+    * re-syncs to the authoritative tip carried by the adopted snapshot's `tips`. Same `MapRefOps.clear` the `LastSnapshotStorage`/MPT
+    * resets use.
+    */
+  def clear: F[Unit] =
+    blocks.clear
+
   private[block] def accept(hashedBlock: Hashed[Block]): F[Unit] =
     blocks(hashedBlock.proofsHash).modify {
       case Some(WaitingBlock(_)) => (AcceptedBlock(hashedBlock).some, hashedBlock.asRight)
