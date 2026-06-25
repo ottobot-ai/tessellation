@@ -1,7 +1,13 @@
+// WITHIN-A-SINGLE-gl0-NODE component architecture (network/consensus/state/storage layers
+// INSIDE one Nakamoto gl0 process). This is NOT the docker cluster/network topology — for
+// container wiring, IP/port bands, and how gl0/gl1/ml0/cl1/dl1 + sidecars interconnect, see
+// docs/nakamoto/e2e-cluster-topology.dot and docs/nakamoto/E2E-CLUSTER-TOPOLOGY.md.
 digraph NakamotoArchitecture {
   rankdir=TB;
   compound=true;
   fontname="Helvetica";
+  labelloc="t";
+  label="Nakamoto gl0 — WITHIN-NODE architecture (one process)\nfor cluster/network topology see E2E-CLUSTER-TOPOLOGY.md";
   node [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled", fillcolor="#f0f0f0"];
   edge [fontname="Helvetica", fontsize=9];
 

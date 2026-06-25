@@ -4,6 +4,8 @@
 
 Verified live against the 5gl0/2mg/2shard stack on 2026-06-09. Adjust container names/ports for other topologies (`gl0-<i>` API port = `9000 + 10·i`; metagraph k port band shifts −1000 per k: m0=92xx/93xx/94xx, m1=82xx/83xx/84xx).
 
+> **Topology/wiring reference:** this runbook is monitoring-focused. For the docker-network layout, IP/port bands, the `just→compose-runner→entrypoint` chain, and how gl0/gl1/ml0/cl1/dl1 + sidecars interconnect, see **[E2E-CLUSTER-TOPOLOGY.md](./E2E-CLUSTER-TOPOLOGY.md)**.
+
 ## Endpoints
 
 | What | Where |

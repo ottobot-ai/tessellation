@@ -14,6 +14,10 @@ can also use `./docker/run.sh` to automatically install just and run commands wi
 All environment variables and arguments for justfile commands are exposed in `bin/set-env.sh` for the 
 main `compose-runner.sh` script. Below are listed the most common commands you might run during development.
 
+> **Cluster/network topology:** for the docker-network layout, IP/port allocation, layer wiring
+> (gl0/gl1/ml0/cl1/dl1 + sidecars), startup order, and the run/debug SOP, see
+> **[docs/nakamoto/E2E-CLUSTER-TOPOLOGY.md](../docs/nakamoto/E2E-CLUSTER-TOPOLOGY.md)**.
+
 
 ## Frequently Used Developer Commands
 

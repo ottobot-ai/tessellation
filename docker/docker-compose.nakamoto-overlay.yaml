@@ -52,15 +52,15 @@ services:
       #   amplitude ↑ → fires earlier + lighter spill (faster) but raises same-slot multi-winner (FORK) rate.
       #   baseline  ↑ → faster recovery from a rare past-cutoff stall (lighter tail), low fork cost.
       #
-      # DECISION (2026-06-23) — cutoff=16 KEPT. The 2mg/2shard run validated cutoff=16 CLEAN: genuine 2-shard
-      # occupancy, ContentMismatch=0 (no MPT divergence), ~13 reorgs/min UNIFORM (benign LDD churn, not a storm),
-      # cadence ~7.5 ord/min, sync held via the metagraph-caught-up readiness gate (NOT by slowing the chain).
-      # DEFENSIVE OPTION cutoff=30 (documented, NOT active): widens the window → mean gap ~8→~18-20 slots, cutting
-      # the reorg churn + tail spill (survival-to-cutoff 2.3%→0.07%) and buying sync headroom for LARGER topologies
-      # (16/5/5) — at ~2× slower runs (~3-4 ord/min). Bring it in only if churn/sync degrade at scale. Harness waits
-      # are ordinal-reactive (pace-independent) so either cutoff is safe test-side. CAVEAT for cutoff=30: slower
-      # ordinals shift the ordinals-per-epoch ratio (epoch=60 SLOTS not ordinals) → watch epoch-windowed logic
-      # (token-lock-replacement WithdrawalTimeLimit).
+      # DECISION (2026-06-24, commit 8c55c6341) — cutoff=30 ACTIVE (the `:-30` default below). Raising 16→30
+      # was half of the gl0 fork-storm fix: it widens the LDD eligibility window → mean inter-snapshot gap
+      # ~8 → ~18-20 slots, cutting same-slot multi-winner FORKS + tail spill (survival-to-cutoff 2.3% → 0.07%)
+      # and buying sync headroom for larger topologies (up to 16/5/5) — at ~2× slower runs (~3-4 ord/min).
+      # HISTORY: the prior 2026-06-23 decision KEPT cutoff=16 after a clean 2mg/2shard run (ContentMismatch=0,
+      # ~13 reorgs/min uniform); the fork storm at larger scale superseded it the next day. Harness waits are
+      # ordinal-reactive (pace-independent) so either cutoff is safe test-side. CAVEAT: slower ordinals shift
+      # the ordinals-per-epoch ratio (epoch=60 SLOTS, not ordinals) → watch epoch-windowed logic
+      # (token-lock-replacement WithdrawalTimeLimit). See docs/nakamoto/E2E-CLUSTER-TOPOLOGY.md §7.
       # Test-only (overlay); mainnet uses the application.conf `nakamoto.ldd` defaults. amplitude/baseline are the
       # "go faster" knobs (NOT cutoff↓) if throughput is ever wanted; left at defaults here since the goal is sync headroom.
       - NAKAMOTO_LDD_CUTOFF=${NAKAMOTO_LDD_CUTOFF:-30}
@@ -73,14 +73,13 @@ services:
       # cases flake — the WithdrawalTimeLimit window closes before the L1 syncs the
       # new lock. If we want faster slots we'd need to scale slots-per-epoch too.
       - NAKAMOTO_SLOT_DURATION_MS=${NAKAMOTO_SLOT_DURATION_MS:-1000}
-      # Committee-sortition target size. Unset → gate is degenerate (K=N, all
-      # validators in committee, sortition is a no-op). Set to a value < N for
-      # genuine sortition: each metagraph binary requires ceil(2K/3) attestations
-      # from the K-sized committee. Plumbed by `--shards=N` in set-env.sh.
-      # Default MUST mirror the HOCON default (committee-k-target = 4): HOCON's
-      # `${?NAKAMOTO_COMMITTEE_K_TARGET}` treats a present-but-empty env var as the
-      # string "" (not absent), which fails NUMBER parsing. A bare `:-` empty
-      # default crashes config load on any run that doesn't pass --shards.
+      # ⚠ DEAD KNOB — kept only so a present-but-empty env can't crash HOCON NUMBER parse.
+      # `NAKAMOTO_COMMITTEE_K_TARGET` (set by `--shards=N` in set-env.sh) is read by NOTHING:
+      # there is no `${?NAKAMOTO_COMMITTEE_K_TARGET}` substitution in application.conf and no
+      # Scala read. The single overloaded `committeeKTarget` was decoupled into the live
+      # k-draw / k-quorum knobs below in commit 396ca81b0 (2026-06-04; see types.scala:234).
+      # Size the committee with --num-gl0 (auto k-draw=N, k-quorum=⌈2N/3⌉ in set-env.sh) or
+      # explicit K_DRAW/K_QUORUM. `--shards` has NO effect. See docs/nakamoto/E2E-CLUSTER-TOPOLOGY.md §7.
       - NAKAMOTO_COMMITTEE_K_TARGET=${NAKAMOTO_COMMITTEE_K_TARGET:-4}
       # Committee draw/quorum (COMMITTEE-SORTITION-DESIGN.md §5; decoupled from the dead K_TARGET above).
       # k-draw sizes the committee draw (= N saturates ⇒ committee = all); k-quorum is the admit count.

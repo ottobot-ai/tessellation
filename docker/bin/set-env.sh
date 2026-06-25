@@ -314,9 +314,11 @@ for arg in "$@"; do
       export STAKE_DIST_SPEC="${arg#*=}"
       ;;
     --shards=*)
-      # Committee-sortition target size K. Exports NAKAMOTO_COMMITTEE_K_TARGET,
-      # which docker-compose.nakamoto-overlay.yaml forwards to gl0 containers.
-      # Validated after NUM_GL0_NODES is known (must be 1 ≤ K ≤ N).
+      # ⚠ DEPRECATED NO-OP. Exports NAKAMOTO_COMMITTEE_K_TARGET, which NOTHING reads (no HOCON
+      # substitution, no Scala read; decoupled into k-draw/k-quorum in commit 396ca81b0). Kept
+      # only so existing run commands don't error. Size the committee with --num-gl0 (auto-derives
+      # K_DRAW=N, K_QUORUM=⌈2N/3⌉ below) or explicit NAKAMOTO_COMMITTEE_K_{DRAW,QUORUM}.
+      # See docs/nakamoto/E2E-CLUSTER-TOPOLOGY.md §7.
       export NAKAMOTO_COMMITTEE_K_TARGET="${arg#*=}"
       if ! [[ "$NAKAMOTO_COMMITTEE_K_TARGET" =~ ^[1-9][0-9]*$ ]]; then
         echo "Error: --shards must be a positive integer (got: $NAKAMOTO_COMMITTEE_K_TARGET)"
@@ -617,15 +619,15 @@ if [ -z "$METAGRAPH" ]; then
     export NUM_DL1_NODES="0"
 fi
 
-# --shards=K validation now that NUM_GL0_NODES is known. K=N is the degenerate
-# committee (sortition no-op). K<N gives genuine per-metagraph sortition; the
-# gate requires ceil(2K/3) attestations from a K-sized committee.
+# --shards=K bound-check now that NUM_GL0_NODES is known. NOTE: K_TARGET is a DEAD knob (read by
+# nothing — committee sizing lives in k-draw/k-quorum). We keep the 1≤K≤N guard so a bad value still
+# fails fast, but warn loudly that --shards has no effect on the actual committee.
 if [ -n "${NAKAMOTO_COMMITTEE_K_TARGET:-}" ]; then
     if [ "$NAKAMOTO_COMMITTEE_K_TARGET" -gt "$NUM_GL0_NODES" ]; then
         echo "Error: --shards=$NAKAMOTO_COMMITTEE_K_TARGET exceeds --num-gl0=$NUM_GL0_NODES"
         exit 1
     fi
-    echo "[set-env] --shards=$NAKAMOTO_COMMITTEE_K_TARGET → NAKAMOTO_COMMITTEE_K_TARGET=$NAKAMOTO_COMMITTEE_K_TARGET (gate is real sortition since K<N=$NUM_GL0_NODES is $([ "$NAKAMOTO_COMMITTEE_K_TARGET" -lt "$NUM_GL0_NODES" ] && echo true || echo "false — gate is degenerate K=N"))"
+    echo "[set-env] ⚠ --shards=$NAKAMOTO_COMMITTEE_K_TARGET is a DEPRECATED NO-OP (K_TARGET is read by nothing). Committee = k-draw/k-quorum; set those or --num-gl0. See docs/nakamoto/E2E-CLUSTER-TOPOLOGY.md §7."
 fi
 
 # Remote host: default to 1 gl0 node, 1 gl1 node, 0 metagraph nodes for health check

@@ -55,3 +55,8 @@ docker/snapshot-streaming/block-explorer/
 test-runs/
 iter-*/
 nodes/
+
+# JVM crash dumps / heap dumps (build + e2e leftovers, never source)
+hs_err_pid*.log
+*.hprof
+replay_pid*.log

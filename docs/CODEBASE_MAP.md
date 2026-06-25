@@ -412,5 +412,5 @@ just down                    # Stop environment
 3. `release.yml` - Version, tag, build JARs, publish SDK
 
 ### Deployment Targets
-- **Test clusters**: `just` recipes bring up Docker-based multi-node clusters (`just test`, `just up`, `just down`)
+- **Test clusters**: `just` recipes bring up Docker-based multi-node clusters (`just test`, `just up`, `just down`). For the full docker-network topology, IP/port bands, layer wiring (gl0/gl1/ml0/cl1/dl1 + sidecars), startup order, and run/debug SOP, see **[docs/nakamoto/E2E-CLUSTER-TOPOLOGY.md](nakamoto/E2E-CLUSTER-TOPOLOGY.md)**.
 - **Production**: bare JARs run as standalone Java processes (no container orchestration)

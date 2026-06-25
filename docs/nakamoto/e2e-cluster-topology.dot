@@ -1,0 +1,73 @@
+// E2E cluster topology — container / network / port wiring.
+// Companion to docs/nakamoto/E2E-CLUSTER-TOPOLOGY.md (the prose owns the citations).
+// Render: dot -Tpng e2e-cluster-topology.dot -o e2e-cluster-topology.png
+//
+// Shows the single `tessellation_common` bridge net (172.32.0.0/16), the static IP
+// bands, and every gRPC / libp2p / HTTP edge. NOT a within-node diagram — see
+// docs/nakamoto-architecture.dot for gl0's internal consensus components.
+digraph e2e_cluster_topology {
+  rankdir=LR;
+  fontname="Helvetica"; labelloc="t";
+  label="Tessellation e2e cluster — tessellation_common (bridge, 172.32.0.0/16)\ndynamic IPs pinned to 172.32.128.0/17; static assignments below";
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10];
+  edge [fontname="Helvetica", fontsize=8];
+
+  // ---------- Host side ----------
+  subgraph cluster_host {
+    label="host (localhost)"; style=dashed; color=gray50;
+    tests   [label="JS e2e suite\n.github/action_scripts", fillcolor="#fff2cc"];
+    prom    [label="prometheus\nhost :19090 → :9090", fillcolor="#fce5cd"];
+    graf    [label="grafana :3000", fillcolor="#fce5cd"];
+  }
+
+  // ---------- Hypergraph (172.32.0.x) ----------
+  subgraph cluster_hg {
+    label="hypergraph operators  ·  172.32.0.x"; style=filled; color="#d9ead3";
+    gl0_0   [label="gl0-0  (Nakamoto L0)\n.10  :9000/1/2  lev:50054\nrun-nakamoto", fillcolor="#b6d7a8"];
+    gl0_1   [label="gl0-1\n.11  :9010/1/2", fillcolor="#b6d7a8"];
+    side_0  [label="sidecar-0 (Go libp2p)\ngRPC :50051  libp2p :9500\nmetrics :9501", fillcolor="#a4c2f4"];
+    side_1  [label="sidecar-1\n:50051 / :9500 / :9501", fillcolor="#a4c2f4"];
+    gl1_0   [label="gl1-0  (BFT L1)\n.30  int :9100  host :9600\nrun-validator", fillcolor="#93c47d"];
+  }
+
+  // ---------- Metagraph 0 (172.32.1.x, ports 92/93/94) ----------
+  subgraph cluster_m0 {
+    label="metagraph m0  ·  172.32.1.x  ·  ports 92/93/94"; style=filled; color="#d0e0e3";
+    ml0_0   [label="ml0-m0-0 (BFT L0)\n.30  :9200  run-genesis", fillcolor="#76a5af"];
+    cl1_0   [label="cl1-m0-0 (currency L1)\n.40  :9300", fillcolor="#a2c4c9"];
+    dl1_0   [label="dl1-m0-0 (data L1)\n.50  :9400", fillcolor="#a2c4c9"];
+  }
+
+  // ---------- Metagraph 1 (172.32.2.x, ports 82/83/84) ----------
+  subgraph cluster_m1 {
+    label="metagraph m1  ·  172.32.2.x  ·  ports 82/83/84"; style=filled; color="#d9d2e9";
+    ml0_1   [label="ml0-m1-0\n.30  :8200", fillcolor="#8e7cc3"];
+    l1_1    [label="cl1-m1-0 .40 :8300\ndl1-m1-0 .50 :8400", fillcolor="#b4a7d6"];
+  }
+
+  // ---------- gl0 <-> sidecar (two gRPC dirs) + libp2p mesh ----------
+  gl0_0 -> side_0 [label="publish gRPC :50051", color="#1155cc"];
+  side_0 -> gl0_0 [label="deliver gossip gRPC :50053", color="#1155cc", style=dashed];
+  gl0_1 -> side_1 [label=":50051", color="#1155cc"];
+  side_1 -> gl0_1 [label=":50053", color="#1155cc", style=dashed];
+  side_0 -> side_1 [label="libp2p GossipSub :9500", dir=both, color="#674ea7", penwidth=2];
+
+  // ---------- gl1 -> gl0 (BFT join) + gl1 -> sidecar (block forward #196/#197) ----------
+  gl1_0 -> gl0_0  [label="BFT join / L0 peer :9000", color="#38761d"];
+  gl1_0 -> side_0 [label="forward DAG/AllowSpend/TokenLock\nblocks gRPC :50051 (#196/#197)", color="#38761d", style=dashed];
+
+  // ---------- metagraph -> gl0 (global L0) + intra-metagraph ----------
+  ml0_0 -> gl0_0 [label="global L0 + SC binaries :9000", color="#990000"];
+  cl1_0 -> ml0_0 [label="L0 peer :9200", color="#674ea7"];
+  dl1_0 -> ml0_0 [label="L0 peer :9200", color="#674ea7"];
+  ml0_1 -> gl0_0 [label=":9000", color="#990000"];
+  l1_1  -> ml0_1 [label=":8200", color="#674ea7"];
+
+  // ---------- observability + test driver ----------
+  prom -> gl0_0  [label="/metrics :90X0", color=gray40, style=dotted];
+  prom -> side_0 [label=":9501", color=gray40, style=dotted];
+  graf -> prom   [color=gray40, style=dotted];
+  tests -> gl0_0 [label="HTTP :9000 + LocalEvents :50054", color="#bf9000"];
+  tests -> ml0_0 [label="HTTP :9200", color="#bf9000"];
+  tests -> cl1_0 [label="HTTP :9300", color="#bf9000"];
+}
