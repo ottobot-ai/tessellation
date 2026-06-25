@@ -1900,6 +1900,22 @@ object GlobalSnapshotConsensus {
               .make[F](client, clusterStorage, deps.shardingConfig.checkpoint.pullDedupCooldownMs)
           }.toResource
 
+          // Byte-faithful deep-catch-up source (root fix #116): a thunk that pulls gl0's latest FINALIZED signed MPT byte map from a
+          // responsive `clusterStorage` peer via the `/latest/combined/mpt-entries` route gl0 already serves, over its own
+          // `L0GlobalSnapshotClient` (built on the in-scope `client`). Threaded into the daemon so `catchUpFromGossip` adopts the producer's
+          // signed MPT VERBATIM (gated on `sidecarFreeMptRoot === signed mptRoot`) instead of the doomed gossiped-GSI re-encode.
+          // NO session (`None`, not `session.some`): the `/latest/combined/mpt-entries` route is public (unauthenticated GET serves it),
+          // and a node deep enough behind to need catch-up has a STALE session its peers reject (→ empty body / `exhausted input` → the pull
+          // fell back to the legacy GSI re-encode, the wedge). Adopted-byte integrity comes from the `sidecarFreeMptRoot === signed mptRoot`
+          // gate + the snapshot signature, NOT the transport, so an unauthenticated pull is safe here.
+          pullLatestMptEntries = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon
+            .pullLatestMptEntriesFromPeer[F](
+              io.constellationnetwork.node.shared.http.p2p.clients.L0GlobalSnapshotClient
+                .make[F](client, None, sharedCfg.snapshotTimeoutsConfig),
+              clusterStorage,
+              org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("NakamotoSyncDaemon")
+            )
+
           // Start NakamotoSyncDaemon: receives snapshots + attestations from gossip
           _ <- supervisor
             .supervise(
@@ -1985,7 +2001,8 @@ object GlobalSnapshotConsensus {
                   // The daemon derives `shardChainStores` in-daemon from `shardAcceptanceDeps.registry`. EMPTY /
                   // `None` at numShards=1 (regression bar) ⇒ the per-ord hook is `whenA(false)`.
                   shardProducers = shardProducers,
-                  shardAssignment = shardAcceptanceDeps.map(_.shardAssignment)
+                  shardAssignment = shardAcceptanceDeps.map(_.shardAssignment),
+                  pullLatestMptEntries = pullLatestMptEntries
                 )
                 .compile
                 .drain

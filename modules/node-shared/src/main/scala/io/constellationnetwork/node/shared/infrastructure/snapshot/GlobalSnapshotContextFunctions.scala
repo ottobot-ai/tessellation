@@ -446,55 +446,18 @@ object GlobalSnapshotContextFunctions {
   // mismatch log identifies WHICH subtree diverged, not just that the top-level mptRoot differs. This is a
   // pure helper — extracted so the unit tests (and operators reading logs) can correlate divergence to a
   // specific manager. Adding a new GlobalSnapshotStateProof field requires adding a row here.
+  /** Per-field breakdown of a state-proof mismatch, delegating to the shared single source of truth
+    * ([[io.constellationnetwork.validator.StateProofComparison.globalSnapshotStateProofFieldDiffs]]) so this live-follower log and the
+    * catch-up validator (`StateProofValidator.validateProof`) name fields identically (`field(c=<computed>,l=<claimed/signed>)`).
+    *
+    * Note on `smtRoot`: it appears in the breakdown as DIAGNOSTIC only. The follower mismatch above compares only the consensus-canonical
+    * `mptRoot`, and `smtRoot` is gl0-maintained — non-gl0 followers (cl0/dl1) run accept() WITHOUT the HistoricalCommitmentSmtStore, so
+    * their `computed.smtRoot` is None while the gl0-signed `claimed.smtRoot` is Some. That asymmetry is EXPECTED; gl0-producer↔gl0-peer
+    * agreement is enforced separately on the accept-with-store path.
+    */
   private[snapshot] def perFieldRootDiffs(
     computed: GlobalSnapshotStateProof,
     claimed: GlobalSnapshotStateProof
-  ): List[String] = {
-    def shortHash(h: io.constellationnetwork.security.hash.Hash): String = h.show.take(12)
-    def shortCurrencyRoots(r: io.constellationnetwork.schema.CurrencySnapshotMptRoots): String = r.show.take(12)
-    def diffHash(
-      label: String,
-      a: io.constellationnetwork.security.hash.Hash,
-      b: io.constellationnetwork.security.hash.Hash
-    ): Option[String] =
-      if (a === b) None else Some(s"$label(c=${shortHash(a)},l=${shortHash(b)})")
-    def diffOptHash(
-      label: String,
-      a: Option[io.constellationnetwork.security.hash.Hash],
-      b: Option[io.constellationnetwork.security.hash.Hash]
-    ): Option[String] =
-      if (a === b) None else Some(s"$label(c=${a.map(shortHash).getOrElse("none")},l=${b.map(shortHash).getOrElse("none")})")
-    def diffOptCurrencyRoots(
-      label: String,
-      a: Option[io.constellationnetwork.schema.CurrencySnapshotMptRoots],
-      b: Option[io.constellationnetwork.schema.CurrencySnapshotMptRoots]
-    ): Option[String] =
-      if (a === b) None
-      else Some(s"$label(c=${a.map(shortCurrencyRoots).getOrElse("none")},l=${b.map(shortCurrencyRoots).getOrElse("none")})")
-    List(
-      diffHash("lastStateChannelSnapshotHashes", computed.lastStateChannelSnapshotHashesProof, claimed.lastStateChannelSnapshotHashesProof),
-      diffHash("lastTxRefs", computed.lastTxRefsProof, claimed.lastTxRefsProof),
-      diffHash("balances", computed.balancesProof, claimed.balancesProof),
-      diffOptCurrencyRoots("lastCurrencySnapshots", computed.lastCurrencySnapshotsProof, claimed.lastCurrencySnapshotsProof),
-      diffOptHash("activeAllowSpends", computed.activeAllowSpends, claimed.activeAllowSpends),
-      diffOptHash("activeTokenLocks", computed.activeTokenLocks, claimed.activeTokenLocks),
-      diffOptHash("tokenLockBalances", computed.tokenLockBalances, claimed.tokenLockBalances),
-      diffOptHash("lastAllowSpendRefs", computed.lastAllowSpendRefs, claimed.lastAllowSpendRefs),
-      diffOptHash("lastTokenLockRefs", computed.lastTokenLockRefs, claimed.lastTokenLockRefs),
-      diffOptHash("updateNodeParameters", computed.updateNodeParameters, claimed.updateNodeParameters),
-      diffOptHash("activeDelegatedStakes", computed.activeDelegatedStakes, claimed.activeDelegatedStakes),
-      diffOptHash("delegatedStakesWithdrawals", computed.delegatedStakesWithdrawals, claimed.delegatedStakesWithdrawals),
-      diffOptHash("activeNodeCollaterals", computed.activeNodeCollaterals, claimed.activeNodeCollaterals),
-      diffOptHash("nodeCollateralWithdrawals", computed.nodeCollateralWithdrawals, claimed.nodeCollateralWithdrawals),
-      diffOptHash("priceState", computed.priceState, claimed.priceState),
-      diffOptHash("lastGlobalSnapshotsWithCurrency", computed.lastGlobalSnapshotsWithCurrency, claimed.lastGlobalSnapshotsWithCurrency),
-      diffOptHash("historicalStakeSnapshots", computed.historicalStakeSnapshots, claimed.historicalStakeSnapshots),
-      // §3 NIPoPoW historical-commitment SMT root. DIAGNOSTIC ONLY here: the live-follower mismatch (above) deliberately compares only the
-      // consensus-canonical `mptRoot`, and `smtRoot` is gl0-maintained — non-gl0 followers (cl0/dl1) run accept() WITHOUT the
-      // HistoricalCommitmentSmtStore, so their `computed.smtRoot` is None while the gl0-signed `claimed.smtRoot` is Some. That asymmetry is
-      // EXPECTED (the same reason the 16 legacy per-field roots aren't the follower's source of truth). gl0-producer↔gl0-peer agreement is
-      // enforced separately on the accept-with-store path. This row only surfaces the value in the diff log.
-      diffOptHash("smtRoot", computed.smtRoot, claimed.smtRoot)
-    ).flatten
-  }
+  ): List[String] =
+    io.constellationnetwork.validator.StateProofComparison.globalSnapshotStateProofFieldDiffs(computed, claimed)
 }

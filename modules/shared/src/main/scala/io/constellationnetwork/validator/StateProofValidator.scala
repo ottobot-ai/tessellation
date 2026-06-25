@@ -99,9 +99,13 @@ object StateProofValidator {
 
     result match {
       case Invalid(_) =>
+        // Name the diverging field(s) (`field(c=<rebuilt>,l=<committed>)`) instead of forcing a positional parse of the two full proof
+        // dumps. `stateProof` is what THIS node rebuilt (c), `expectedStateProof` is what the signed snapshot commits to (l).
+        val diffs = StateProofComparison[P].fieldDiffs(stateProof, expectedStateProof)
+        val diffSuffix = if (diffs.isEmpty) "" else s" — diffs: ${diffs.mkString(", ")}"
         logger
           .error(
-            s"StateProof Broken at ordinal ${snapshot.ordinal}. " +
+            s"StateProof Broken at ordinal ${snapshot.ordinal}.$diffSuffix " +
               s"Expected: $expectedStateProof, Found: $stateProof"
           )
           .as(result)

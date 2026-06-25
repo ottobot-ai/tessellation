@@ -192,6 +192,121 @@ object NakamotoSyncDaemon {
       }
     }
 
+  /** Byte-faithful MPT seeding for deep catch-up — the gl0 analog of `currency-l0 StateChannel.resyncToCanonical`'s verify gate, and the
+    * root fix for the recurring catch-up wedge (the rebuild-from-GSI path structurally cannot reproduce the producer's per-MG currency
+    * `infoRoot`/`mptRoot` under roots-only sharding, because the producer commits those from its live MPT — populated by shard-checkpoint
+    * adoption — while the carried GSI's `lastCurrencySnapshots` is empty; the GSI is no longer the source of truth).
+    *
+    * Adopts the producer's SIGNED MPT byte map directly (`MptStore.loadBytes`, verbatim, no codec round-trip) and gates on
+    * `sidecarFreeMptRoot(store) === snapshot.stateProof.mptRoot` (the SAME sidecar-/observation-free root the producer signs over). On the
+    * fast (`Some(bytes)`) path the root is recomputed from the bytes BEFORE any store write, so a corrupt/truncated transfer can never
+    * clobber the live MPT — it just returns `false` and the caller re-pulls/idles. On a byte-route 404 (`None`, only at a sparse
+    * combined-checkpoint ordinal) it falls back to the legacy `syncFromGlobalSnapshotInfo` re-encode and gates write-then-verify; that
+    * branch can still legitimately diverge for the sharded-currency partition, so a mismatch there also returns `false` (do NOT adopt).
+    *
+    * @return
+    *   `true` iff the MPT now holds state whose sidecar-free root equals the snapshot's SIGNED `mptRoot` (safe to adopt as canonical);
+    *   `false` => the transfer was corrupt or the GSI fallback diverged — the caller must NOT adopt canonical state (re-pull / idle).
+    */
+  private[nakamoto] def seedMptByteFaithful[F[_]: Async: cats.Parallel: JsonSerializer: Hasher](
+    snapshot: Hashed[GlobalIncrementalSnapshot],
+    gsi: GlobalSnapshotInfo,
+    signedBytes: Option[Map[Hex, Array[Byte]]],
+    mptStore: MptStore[F, GlobalStateKey],
+    logger: org.typelevel.log4cats.Logger[F]
+  )(
+    implicit stateProofSelector: io.constellationnetwork.schema.StateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): F[Boolean] = {
+    val ordinal = snapshot.signed.value.ordinal
+    val signedRoot = snapshot.signed.value.stateProof.mptRoot
+    def shortOpt(h: Option[Hash]): String = h.map(_.show.take(12)).getOrElse("none")
+    signedBytes match {
+      case Some(bytes) =>
+        // FAST PATH: recompute the sidecar-free root from the SIGNED bytes (pure — no store write) and adopt VERBATIM only on match.
+        GlobalSnapshotInfo.sidecarFreeMptRoot[F](bytes).flatMap { recomputed =>
+          if (recomputed.some === signedRoot)
+            logger.info(
+              s"🔄 CATCH-UP byte-faithful: adopting ${bytes.size} SIGNED MPT entries VERBATIM at ord=${ordinal.show} " +
+                s"(sidecar-free root=${recomputed.show.take(12)} === signed mptRoot — verified)"
+            ) >> mptStore.loadBytes(bytes, ordinal).as(true)
+          else
+            logger
+              .warn(
+                s"⛔ CATCH-UP byte-faithful: served SIGNED MPT bytes recompute to ${recomputed.show.take(12)} ≠ signed mptRoot " +
+                  s"${shortOpt(signedRoot)} at ord=${ordinal.show} (corrupt/truncated transfer). NOT adopting; will re-pull."
+              )
+              .as(false)
+        }
+      case None =>
+        // LEGACY FALLBACK (byte route 404 at a sparse combined-checkpoint ordinal): re-encode the GSI into the MPT, then gate. This
+        // branch CAN still diverge for the sharded-currency partition (GSI not source of truth); on mismatch we do NOT adopt.
+        logger.info(
+          s"🔄 CATCH-UP byte-faithful: byte route unavailable at ord=${ordinal.show}, falling back to GSI re-encode (gated)"
+        ) >>
+          mptStore.syncFromGlobalSnapshotInfo(gsi, ordinal) >>
+          mptStore.underlying.entries
+            .flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[F])
+            .flatMap { recomputed =>
+              if (recomputed.some === signedRoot)
+                true.pure[F]
+              else
+                logger
+                  .warn(
+                    s"⛔ CATCH-UP byte-faithful: GSI re-encode root ${recomputed.show.take(12)} ≠ signed mptRoot " +
+                      s"${shortOpt(signedRoot)} at ord=${ordinal.show} (GSI inconsistent with signed root). NOT adopting; will re-pull."
+                  )
+                  .as(false)
+            }
+    }
+  }
+
+  /** The latest-finalized triple a catching-up gl0 node pulls from a peer for byte-faithful adoption: the signed snapshot (hashed +
+    * signature-checked), its `GlobalSnapshotInfo`, and the producer's SIGNED MPT byte map (`Some` when `/latest/combined/mpt-entries`
+    * served, `None` on a sparse-ordinal 404 → `seedMptByteFaithful` uses its GSI fallback).
+    */
+  private[snapshot] type LatestMptEntries =
+    (Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo, Option[Map[Hex, Array[Byte]]])
+
+  /** Pull gl0's latest FINALIZED [[LatestMptEntries]] from a responsive peer over the HTTP `/latest/combined/mpt-entries` route gl0 already
+    * serves — the gl0↔gl0 analog of node-shared `GlobalL0Service.pullLatestMptEntries` (gl0 has its own `ClusterStorage`, not the
+    * follower-side `L0ClusterStorage`). The pulled snapshot's envelope signature is verified (`toHashedWithSignatureCheck`) before return;
+    * the byte-faithful root gate (`sidecarFreeMptRoot === signed mptRoot`) is applied by the caller (`seedMptByteFaithful`). Tries
+    * responsive peers in turn; returns `None` on total failure (no peers / transport error / bad signature) so deep catch-up idles +
+    * re-pulls next wave rather than crashing the loop.
+    *
+    * Why a PULL, not the gossiped tuple: the signed byte store holds only FINALIZED ordinals (bytes are produced at finalize), whereas the
+    * gossiped catch-up tip is unfinalized — so the signed bytes must come from a peer's latest-finalized HTTP response, not the push
+    * payload.
+    */
+  private[snapshot] def pullLatestMptEntriesFromPeer[F[_]: Async: SecurityProvider: HasherSelector: JsonSerializer](
+    l0GlobalSnapshotClient: io.constellationnetwork.node.shared.http.p2p.clients.L0GlobalSnapshotClient[F],
+    clusterStorage: io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage[F],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Option[LatestMptEntries]] = {
+    def tryPeers(remaining: List[io.constellationnetwork.schema.peer.Peer]): F[Option[LatestMptEntries]] =
+      remaining match {
+        case Nil => (None: Option[LatestMptEntries]).pure[F]
+        case p :: tail =>
+          l0GlobalSnapshotClient.getLatestMptEntries
+            .run(io.constellationnetwork.schema.peer.L0Peer.fromPeer(p))
+            .flatMap {
+              case (snapshot, state, entries) =>
+                HasherSelector[F]
+                  .withCurrent(implicit hasher => snapshot.toHashedWithSignatureCheck)
+                  .flatMap(_.liftTo[F])
+                  .map(hashed => Some((hashed, state, entries.some)): Option[LatestMptEntries])
+            }
+            .handleErrorWith { e =>
+              logger.warn(e)(s"byte-faithful catch-up: MPT-entries pull from peer ${p.id.show} failed, trying next") >>
+                tryPeers(tail)
+            }
+      }
+    clusterStorage.getResponsivePeers
+      .flatMap(peers => tryPeers(peers.toList))
+      .handleErrorWith(e => logger.warn(e)("byte-faithful catch-up: could not pull MPT entries from any peer").as(None))
+  }
+
   /** Ethereum-style mempool reconciliation after catch-up/reorg.
     *
     * Evicts DAG blocks whose transactions reference a lastTxRef that no longer matches the new context. Keeps events whose transactions are
@@ -301,7 +416,8 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.schema.nakamoto.EtaPeriod
     ) => F[Set[peer.PeerId]],
-    logger: org.typelevel.log4cats.Logger[F]
+    logger: org.typelevel.log4cats.Logger[F],
+    pullLatestMptEntries: F[Option[LatestMptEntries]]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -352,7 +468,8 @@ object NakamotoSyncDaemon {
               shardBinaryBuffers,
               shardAssignment,
               shardCommitteeMembership,
-              logger
+              logger,
+              pullLatestMptEntries
             )
           }
     }
@@ -517,7 +634,11 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[F]
     ] = Map.empty,
-    shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]] = None
+    shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]] = None,
+    // Byte-faithful deep-catch-up source: pulls gl0's latest FINALIZED signed MPT bytes from a peer (built from `client` + `clusterStorage`
+    // at the GlobalSnapshotConsensus call site via `pullLatestMptEntriesFromPeer`). Threaded into `catchUpFromGossip` so a >k-behind node
+    // adopts the producer's signed MPT VERBATIM (gated on `sidecarFreeMptRoot === signed mptRoot`) instead of the doomed GSI re-encode.
+    pullLatestMptEntries: F[Option[LatestMptEntries]]
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -636,7 +757,8 @@ object NakamotoSyncDaemon {
                                 shardBinaryBuffers,
                                 shardAssignment,
                                 shardCommitteeMembership,
-                                logger
+                                logger,
+                                pullLatestMptEntries
                               )
                             }
                           case None => Async[F].unit
@@ -736,7 +858,8 @@ object NakamotoSyncDaemon {
                                   shardBinaryBuffers,
                                   shardAssignment,
                                   shardCommitteeMembership,
-                                  logger
+                                  logger,
+                                  pullLatestMptEntries
                                 )
                               } >>
                               productionGate.resume(ProductionGate.BetterGossipReceived)
@@ -1133,7 +1256,8 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.schema.nakamoto.EtaPeriod
     ) => F[Set[peer.PeerId]],
-    logger: org.typelevel.log4cats.Logger[F]
+    logger: org.typelevel.log4cats.Logger[F],
+    pullLatestMptEntries: F[Option[LatestMptEntries]]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -1435,7 +1559,8 @@ object NakamotoSyncDaemon {
               shardBinaryBuffers,
               shardAssignment,
               shardCommitteeMembership,
-              logger
+              logger,
+              pullLatestMptEntries
             )
           }
         case NakamotoSnapshotValidator.ParentNotFound =>
@@ -1454,7 +1579,8 @@ object NakamotoSyncDaemon {
             productionGate,
             channel,
             dataDir,
-            logger
+            logger,
+            pullLatestMptEntries
           )
         case cm: NakamotoSnapshotValidator.ContentMismatch =>
           // Content mismatch — could be normal fork, restart, or (Driver B) a self-healable consensus-derived
@@ -1483,7 +1609,8 @@ object NakamotoSyncDaemon {
                       productionGate,
                       channel,
                       dataDir,
-                      logger
+                      logger,
+                      pullLatestMptEntries
                     )
                 } else {
                   // Normal Nakamoto fork — store the snapshot as an alternative branch in
@@ -1531,7 +1658,8 @@ object NakamotoSyncDaemon {
                   productionGate,
                   channel,
                   dataDir,
-                  logger
+                  logger,
+                  pullLatestMptEntries
                 )
             }
 
@@ -3106,7 +3234,8 @@ object NakamotoSyncDaemon {
     productionGate: ProductionGate[F],
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
-    logger: org.typelevel.log4cats.Logger[F]
+    logger: org.typelevel.log4cats.Logger[F],
+    pullLatestMptEntries: F[Option[LatestMptEntries]]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -3121,126 +3250,211 @@ object NakamotoSyncDaemon {
             s"skipping ordinal=${snap.ordinal}"
         )
       } else {
-        parsed match {
-          case Some((signedSnapshot, context)) =>
-            val parentHash = Hash(new String(snap.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
-            for {
-              _ <- stateRef.update(_.copy(lastCatchUpAttemptMs = now))
-              // SECURITY: the parent is missing here, so `NakamotoSnapshotValidator.validate` (VRF + slot-cert) cannot run. Adopting an
-              // UNVERIFIED gossiped tuple as the entire canonical gl0 state would let any single peer reset our balances/txRefs/stakes/
-              // locks. Gate adoption on the two parent-free, deterministic checks (`verifyCatchUpSnapshot`) BEFORE touching any canonical
-              // storage or the MPT: a forged-signature tuple (gate 1) or a GSI inconsistent with the signed `stateProof` (gate 2) is
-              // rejected and nothing is written; the node retries on a later gossip wave (the 10s cooldown rate-limits). An HONEST
-              // snapshot (valid sig + GSI matching its committed stateProof) passes both gates by construction, so legitimate catch-up
-              // still recovers.
-              verdict <- verifyCatchUpSnapshot[F](signedSnapshot, context)
-              _ <- verdict match {
-                case CatchUpVerdict.RejectedInvalidSignature =>
-                  logger.warn(
-                    s"⛔ Rejecting catch-up snapshot ordinal=${snap.ordinal} slot=${snap.slot}: INVALID envelope signature. " +
-                      s"Not adopting (no canonical/MPT write). Will retry on next gossip wave."
-                  ) >>
-                    Metrics[F].incrementCounter(
-                      "dag_nakamoto_catchup_rejected",
-                      Seq(Metrics.unsafeLabelName("reason") -> "invalid_signature")
-                    )
-                case CatchUpVerdict.RejectedStateProofMismatch(rejectedHashed) =>
-                  logger.warn(
-                    s"⛔ Rejecting catch-up snapshot ordinal=${snap.ordinal} slot=${snap.slot} " +
-                      s"hash=${rejectedHashed.hash.value.take(12)}: carried GlobalSnapshotInfo does NOT match the snapshot's " +
-                      s"committed stateProof (state-proof mismatch). Not adopting (no canonical/MPT write). Retrying on next gossip wave."
-                  ) >>
-                    Metrics[F].incrementCounter(
-                      "dag_nakamoto_catchup_rejected",
-                      Seq(Metrics.unsafeLabelName("reason") -> "state_proof_mismatch")
-                    )
-                case CatchUpVerdict.Accept(verifiedHashed) =>
-                  for {
-                    _ <- logger.warn(
-                      s"\uD83D\uDD04 CATCH-UP: No parent found for ordinal=${snap.ordinal} slot=${snap.slot} " +
-                        s"(verified: signature OK, stateProof matches). Resetting local state to network tip."
-                    )
-                    _ <- productionGate.pause("catch-up-sync")
-
-                    // Store in chain store (seed this snapshot as our new starting point)
-                    _ <- chainStore.store(
-                      signedSnapshot,
-                      context,
-                      snap.ordinal,
-                      snap.slot,
-                      parentHash,
-                      vrfOutputFromProof(snap.vrfProof.toByteArray)
-                    )
-
-                    // Update ALL canonical storages — snapshotStorage is what SnapshotLeaderLoop
-                    // reads for its parent. Without this, the leader loop produces at the OLD ordinal
-                    // after catch-up, causing the node to fall behind again immediately. Reuse the
-                    // signature-verified `Hashed` from `verifyCatchUpSnapshot` rather than re-hashing
-                    // via the no-signature-check `toHashed` (`setHeadForRecovery` needs the implicit Hasher).
-                    _ <- HasherSelector[F].withCurrent { implicit hasher =>
-                      snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
-                        lastGlobalSnapshotStorage.setForRecovery(verifiedHashed, context) >>
-                        lastNGlobalSnapshotStorage.setForRecovery(verifiedHashed, context)
-                    }
-
-                    // MPT full sync from the context we received — critical for
-                    // the acceptance manager to validate subsequent snapshots
-                    _ <- logger.info(s"\uD83D\uDD04 CATCH-UP: Syncing MPT from received context...")
-                    _ <- HasherSelector[F].withCurrent { implicit hasher =>
-                      mptStore.syncFromGlobalSnapshotInfo(context, SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)))
-                    }
-                    // Don't overwrite lastKnownSlotRef with the gossip slot — it may be
-                    // ahead of our wall clock, making slotGap negative and blocking VRF
-                    // eligibility. Production will update it after its next successful store.
-
-                    // Reconcile event mempool — evict DAG blocks whose transactions are
-                    // already consumed in the new context's lastTxRefs (prevents double-spend).
-                    // Keep events whose transactions are still unconfirmed (prevents starvation).
-                    _ <- reconcileMempool(eventMempool, context, logger)
-
-                    _ <- stateRef.update(
-                      _.copy(
-                        networkTipOrdinal = snap.ordinal,
-                        networkTipHash = Some(Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))),
-                        localTipOrdinal = snap.ordinal
+        // BYTE-FAITHFUL DEEP CATCH-UP (root fix #116): rebuilding the snapshot's state from the gossiped GSI structurally CANNOT reproduce
+        // the producer's per-MG currency `infoRoot`/`mptRoot` under roots-only sharding (the producer commits those from its live MPT —
+        // populated by shard-checkpoint adoption — while the carried GSI's `lastCurrencySnapshots` is empty; the GSI is no longer the source
+        // of truth). PRIMARY path: pull gl0's latest FINALIZED signed MPT byte map from a peer and adopt it VERBATIM, gated on
+        // `sidecarFreeMptRoot === signed mptRoot` (`seedMptByteFaithful`); the gossiped `snap` is only the trigger. FALLBACK (no peer / pull
+        // failed): the legacy gossip-tuple adoption, behaviorally unchanged.
+        val legacyGossipAdopt: F[Unit] =
+          parsed match {
+            case Some((signedSnapshot, context)) =>
+              val parentHash = Hash(new String(snap.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
+              for {
+                _ <- stateRef.update(_.copy(lastCatchUpAttemptMs = now))
+                // SECURITY: the parent is missing here, so `NakamotoSnapshotValidator.validate` (VRF + slot-cert) cannot run. Adopting an
+                // UNVERIFIED gossiped tuple as the entire canonical gl0 state would let any single peer reset our balances/txRefs/stakes/
+                // locks. Gate adoption on the two parent-free, deterministic checks (`verifyCatchUpSnapshot`) BEFORE touching any canonical
+                // storage or the MPT: a forged-signature tuple (gate 1) or a GSI inconsistent with the signed `stateProof` (gate 2) is
+                // rejected and nothing is written; the node retries on a later gossip wave (the 10s cooldown rate-limits). An HONEST
+                // snapshot (valid sig + GSI matching its committed stateProof) passes both gates by construction, so legitimate catch-up
+                // still recovers.
+                verdict <- verifyCatchUpSnapshot[F](signedSnapshot, context)
+                _ <- verdict match {
+                  case CatchUpVerdict.RejectedInvalidSignature =>
+                    logger.warn(
+                      s"⛔ Rejecting catch-up snapshot ordinal=${snap.ordinal} slot=${snap.slot}: INVALID envelope signature. " +
+                        s"Not adopting (no canonical/MPT write). Will retry on next gossip wave."
+                    ) >>
+                      Metrics[F].incrementCounter(
+                        "dag_nakamoto_catchup_rejected",
+                        Seq(Metrics.unsafeLabelName("reason") -> "invalid_signature")
                       )
-                    )
-
-                    _ <- productionGate.resume("catch-up-sync")
-                    _ <- Metrics[F].incrementCounter("dag_nakamoto_catchups")
-                    _ <- logger.info(
-                      s"\u2705 CATCH-UP complete: now at ordinal=${snap.ordinal} slot=${snap.slot}. " +
-                        s"Subsequent gossip should find parents."
-                    )
-
-                    // Start backfill daemon in background to fill the gap from caught-up tip down to genesis.
-                    // The parent hash of the caught-up snapshot is the starting point for the walk-back.
-                    _ <- {
-                      val cursor = BackfillDaemon.BackfillCursor(
-                        nextHashToFetch = parentHash.value,
-                        targetOrdinal = 1L,
-                        currentOrdinal = snap.ordinal,
-                        startedAtOrdinal = snap.ordinal,
-                        completedChunks = Set.empty,
-                        createdAtMs = System.currentTimeMillis()
+                  case CatchUpVerdict.RejectedStateProofMismatch(rejectedHashed) =>
+                    logger.warn(
+                      s"⛔ Rejecting catch-up snapshot ordinal=${snap.ordinal} slot=${snap.slot} " +
+                        s"hash=${rejectedHashed.hash.value.take(12)}: carried GlobalSnapshotInfo does NOT match the snapshot's " +
+                        s"committed stateProof (state-proof mismatch). Not adopting (no canonical/MPT write). Retrying on next gossip wave."
+                    ) >>
+                      Metrics[F].incrementCounter(
+                        "dag_nakamoto_catchup_rejected",
+                        Seq(Metrics.unsafeLabelName("reason") -> "state_proof_mismatch")
                       )
-                      // Scope the backfill fiber to the app Supervisor so shutdown cancels cleanly.
-                      // Previously a raw Async.start leaked a fiber that outlived the owning daemon.
-                      supervisor
-                        .supervise(
-                          BackfillDaemon
-                            .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
-                            .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
+                  case CatchUpVerdict.Accept(verifiedHashed) =>
+                    for {
+                      _ <- logger.warn(
+                        s"\uD83D\uDD04 CATCH-UP: No parent found for ordinal=${snap.ordinal} slot=${snap.slot} " +
+                          s"(verified: signature OK, stateProof matches). Resetting local state to network tip."
+                      )
+                      _ <- productionGate.pause("catch-up-sync")
+
+                      // Store in chain store (seed this snapshot as our new starting point)
+                      _ <- chainStore.store(
+                        signedSnapshot,
+                        context,
+                        snap.ordinal,
+                        snap.slot,
+                        parentHash,
+                        vrfOutputFromProof(snap.vrfProof.toByteArray)
+                      )
+
+                      // Update ALL canonical storages — snapshotStorage is what SnapshotLeaderLoop
+                      // reads for its parent. Without this, the leader loop produces at the OLD ordinal
+                      // after catch-up, causing the node to fall behind again immediately. Reuse the
+                      // signature-verified `Hashed` from `verifyCatchUpSnapshot` rather than re-hashing
+                      // via the no-signature-check `toHashed` (`setHeadForRecovery` needs the implicit Hasher).
+                      _ <- HasherSelector[F].withCurrent { implicit hasher =>
+                        snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
+                          lastGlobalSnapshotStorage.setForRecovery(verifiedHashed, context) >>
+                          lastNGlobalSnapshotStorage.setForRecovery(verifiedHashed, context)
+                      }
+
+                      // MPT full sync from the context we received — critical for
+                      // the acceptance manager to validate subsequent snapshots
+                      _ <- logger.info(s"\uD83D\uDD04 CATCH-UP: Syncing MPT from received context...")
+                      _ <- HasherSelector[F].withCurrent { implicit hasher =>
+                        mptStore.syncFromGlobalSnapshotInfo(context, SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)))
+                      }
+                      // Don't overwrite lastKnownSlotRef with the gossip slot — it may be
+                      // ahead of our wall clock, making slotGap negative and blocking VRF
+                      // eligibility. Production will update it after its next successful store.
+
+                      // Reconcile event mempool — evict DAG blocks whose transactions are
+                      // already consumed in the new context's lastTxRefs (prevents double-spend).
+                      // Keep events whose transactions are still unconfirmed (prevents starvation).
+                      _ <- reconcileMempool(eventMempool, context, logger)
+
+                      _ <- stateRef.update(
+                        _.copy(
+                          networkTipOrdinal = snap.ordinal,
+                          networkTipHash = Some(Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))),
+                          localTipOrdinal = snap.ordinal
                         )
-                        .void
-                    }
-                  } yield ()
-              }
-            } yield ()
+                      )
+
+                      _ <- productionGate.resume("catch-up-sync")
+                      _ <- Metrics[F].incrementCounter("dag_nakamoto_catchups")
+                      _ <- logger.info(
+                        s"\u2705 CATCH-UP complete: now at ordinal=${snap.ordinal} slot=${snap.slot}. " +
+                          s"Subsequent gossip should find parents."
+                      )
+
+                      // Start backfill daemon in background to fill the gap from caught-up tip down to genesis.
+                      // The parent hash of the caught-up snapshot is the starting point for the walk-back.
+                      _ <- {
+                        val cursor = BackfillDaemon.BackfillCursor(
+                          nextHashToFetch = parentHash.value,
+                          targetOrdinal = 1L,
+                          currentOrdinal = snap.ordinal,
+                          startedAtOrdinal = snap.ordinal,
+                          completedChunks = Set.empty,
+                          createdAtMs = System.currentTimeMillis()
+                        )
+                        // Scope the backfill fiber to the app Supervisor so shutdown cancels cleanly.
+                        // Previously a raw Async.start leaked a fiber that outlived the owning daemon.
+                        supervisor
+                          .supervise(
+                            BackfillDaemon
+                              .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
+                              .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
+                          )
+                          .void
+                      }
+                    } yield ()
+                }
+              } yield ()
+            case None =>
+              logger.warn(
+                s"\u274c No parent found for ordinal=${snap.ordinal} and no payload to catch up from"
+              )
+          }
+
+        // Adopt gl0's latest FINALIZED state byte-faithfully: seed the MPT from the SIGNED bytes (verified === signed mptRoot) and swap all
+        // canonical refs to the PULLED snapshot (the gossiped tip is only the trigger). On a root-gate failure (corrupt transfer / GSI-
+        // fallback divergence) we adopt NOTHING and re-pull next wave.
+        def byteFaithfulAdopt(triple: LatestMptEntries): F[Unit] = {
+          val (pulledHashed, pulledGsi, pulledBytes) = triple
+          val pOrdinal = pulledHashed.signed.value.ordinal
+          val pOrdinalL = pOrdinal.value.value
+          val pSlot = pulledHashed.signed.value.slotCertificate.map(_.slot.value.value).getOrElse(0L)
+          val pParentHash = pulledHashed.signed.value.lastSnapshotHash
+          val pVrfOutput =
+            vrfOutputFromProof(pulledHashed.signed.value.slotCertificate.map(_.vrfProof.toBytes).getOrElse(Array.empty[Byte]))
+          HasherSelector[F]
+            .withCurrent(implicit hasher => seedMptByteFaithful[F](pulledHashed, pulledGsi, pulledBytes, mptStore, logger))
+            .flatMap {
+              case false =>
+                logger.warn(
+                  s"\u26d4 CATCH-UP byte-faithful: pulled latest finalized ord=${pOrdinal.show} but sidecarFreeMptRoot \u2260 signed mptRoot " +
+                    s"(corrupt transfer / GSI-fallback divergence). Not adopting; will re-pull next wave."
+                ) >>
+                  Metrics[F].incrementCounter(
+                    "dag_nakamoto_catchup_rejected",
+                    Seq(Metrics.unsafeLabelName("reason") -> "byte_faithful_root_mismatch")
+                  )
+              case true =>
+                for {
+                  _ <- logger.warn(
+                    s"\ud83d\udd04 CATCH-UP byte-faithful: adopting gl0's latest FINALIZED ord=${pOrdinal.show} " +
+                      s"(MPT seeded VERBATIM from signed bytes, verified === signed mptRoot). Resetting local state to network tip."
+                  )
+                  _ <- productionGate.pause("catch-up-sync")
+                  _ <- chainStore.store(pulledHashed.signed, pulledGsi, pOrdinalL, pSlot, pParentHash, pVrfOutput)
+                  _ <- HasherSelector[F].withCurrent { implicit hasher =>
+                    snapshotStorage.setHeadForRecovery(pulledHashed.signed, pulledGsi) >>
+                      lastGlobalSnapshotStorage.setForRecovery(pulledHashed, pulledGsi) >>
+                      lastNGlobalSnapshotStorage.setForRecovery(pulledHashed, pulledGsi)
+                  }
+                  // MPT already seeded byte-faithfully above \u2014 do NOT re-seed from the GSI (that re-encode was the wedge).
+                  _ <- reconcileMempool(eventMempool, pulledGsi, logger)
+                  _ <- stateRef.update(
+                    _.copy(
+                      networkTipOrdinal = pOrdinalL,
+                      networkTipHash = Some(pulledHashed.hash),
+                      localTipOrdinal = pOrdinalL
+                    )
+                  )
+                  _ <- productionGate.resume("catch-up-sync")
+                  _ <- Metrics[F].incrementCounter("dag_nakamoto_catchups")
+                  _ <- logger.info(
+                    s"\u2705 CATCH-UP byte-faithful complete: now at ordinal=${pOrdinal.show}. Subsequent gossip should find parents."
+                  )
+                  _ <- {
+                    val cursor = BackfillDaemon.BackfillCursor(
+                      nextHashToFetch = pParentHash.value,
+                      targetOrdinal = 1L,
+                      currentOrdinal = pOrdinalL,
+                      startedAtOrdinal = pOrdinalL,
+                      completedChunks = Set.empty,
+                      createdAtMs = System.currentTimeMillis()
+                    )
+                    supervisor
+                      .supervise(
+                        BackfillDaemon
+                          .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
+                          .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
+                      )
+                      .void
+                  }
+                } yield ()
+            }
+        }
+
+        pullLatestMptEntries.flatMap {
+          case Some(triple) =>
+            stateRef.update(_.copy(lastCatchUpAttemptMs = now)) >> byteFaithfulAdopt(triple)
           case None =>
-            logger.warn(
-              s"\u274c No parent found for ordinal=${snap.ordinal} and no payload to catch up from"
-            )
+            legacyGossipAdopt
         }
       }
     }
