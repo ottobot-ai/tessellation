@@ -141,3 +141,18 @@ case class InvalidNodeType(message: String) extends MerklePatriciaProofError {
 case class ProofGenerationError(message: String) extends MerklePatriciaProofError {
   override def getMessage: String = message
 }
+
+/** Raised by [[MerklePatriciaAbsenceProver]] when asked to prove absence of a key that is in fact PRESENT. Callers must use
+  * [[MerklePatriciaSingleInclusionProver]] for present keys.
+  */
+case class KeyIsPresent(message: String) extends MerklePatriciaProofError {
+  override def getMessage: String = message
+}
+
+/** Raised by [[MerklePatriciaAbsenceProver]] when the key's nibble path is exhausted exactly at a branch node. This trie encoding never
+  * stores a value at a branch, so this is a degenerate shape that does not arise for fixed-length keys; surfaced explicitly rather than
+  * fabricating an absence witness.
+  */
+case class PathTerminatesAtBranch(message: String) extends MerklePatriciaProofError {
+  override def getMessage: String = message
+}
