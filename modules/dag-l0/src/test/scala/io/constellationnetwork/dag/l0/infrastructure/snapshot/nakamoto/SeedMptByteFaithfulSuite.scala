@@ -29,13 +29,13 @@ import eu.timepit.refined.types.numeric.NonNegLong
 import org.typelevel.log4cats.noop.NoOpLogger
 import weaver.MutableIOSuite
 
-/** Pins the byte-faithful catch-up MPT seeder ([[NakamotoSyncDaemon.seedMptByteFaithful]]) — the gl0 analog of ml0's
-  * `resyncToCanonical` verify gate, and the root fix for the catch-up wedge. The contract:
+/** Pins the byte-faithful catch-up MPT seeder ([[NakamotoSyncDaemon.seedMptByteFaithful]]) — the gl0 analog of ml0's `resyncToCanonical`
+  * verify gate, and the root fix for the catch-up wedge. The contract:
   *
   *   - '''Some(signed bytes) matching the signed mptRoot → adopt VERBATIM, return true''' — the MPT ends up with exactly the served bytes
   *     (sidecar-free root === signed). This is the path that, unlike the old GSI rebuild, reproduces the producer's per-MG currency root.
-  *   - '''Some(bytes) whose root ≠ signed mptRoot → return false AND leave the MPT untouched''' — the recompute happens BEFORE any write, so
-  *     a corrupt/truncated transfer never clobbers the live store.
+  *   - '''Some(bytes) whose root ≠ signed mptRoot → return false AND leave the MPT untouched''' — the recompute happens BEFORE any write,
+  *     so a corrupt/truncated transfer never clobbers the live store.
   *   - '''None (byte route 404) + GSI that rebuilds to the signed root → return true''' (legacy fallback gate passes).
   *   - '''None + signed mptRoot the GSI rebuild can't reproduce → return false''' (fallback gate rejects rather than adopt-divergent).
   */
@@ -64,7 +64,8 @@ object SeedMptByteFaithfulSuite extends MutableIOSuite {
     } yield store
 
   /** A non-trivial post-state: one balance entry. The exact contents are irrelevant — only that the producer (`syncFromStateChanges`) and
-    * the rebuild (`syncFromGlobalSnapshotInfo`) land the same sidecar-free root (the #107 byte-equivalence contract the parity suite proves).
+    * the rebuild (`syncFromGlobalSnapshotInfo`) land the same sidecar-free root (the #107 byte-equivalence contract the parity suite
+    * proves).
     */
   private val acc: StateChangesAccumulator =
     StateChangesAccumulator(balances = SortedMap(addrA -> Balance(NonNegLong(100L))))
@@ -76,7 +77,22 @@ object SeedMptByteFaithfulSuite extends MutableIOSuite {
     signedRoot: Option[Hash]
   )(implicit h: Hasher[IO], j: JsonSerializer[IO], sp: SecurityProvider[IO]): IO[Hashed[GlobalIncrementalSnapshot]] = {
     val proof = GlobalSnapshotStateProof(
-      Hash.empty, Hash.empty, Hash.empty, None, None, None, None, None, None, None, None, None, None, None, None, None,
+      Hash.empty,
+      Hash.empty,
+      Hash.empty,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
+      None,
       signedRoot, // mptRoot (field 17)
       None, // historicalStakeSnapshots
       None // smtRoot
@@ -131,10 +147,7 @@ object SeedMptByteFaithfulSuite extends MutableIOSuite {
       ok <- NakamotoSyncDaemon.seedMptByteFaithful[IO](snapshot, GlobalSnapshotInfo.empty, entries.some, store, logger)
       after <- store.allEntriesAsBytes
       afterRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](after)
-    } yield
-      expect(ok) and
-        expect(afterRoot === root) and
-        expect(after.nonEmpty)
+    } yield expect(ok).and(expect(afterRoot === root)).and(expect(after.nonEmpty))
   }
 
   test("Some(bytes) whose root ≠ signed mptRoot → returns false AND does NOT clobber the MPT (verify-before-write)") { res =>
@@ -147,9 +160,7 @@ object SeedMptByteFaithfulSuite extends MutableIOSuite {
       store <- freshStore
       ok <- NakamotoSyncDaemon.seedMptByteFaithful[IO](snapshot, GlobalSnapshotInfo.empty, entries.some, store, logger)
       after <- store.allEntriesAsBytes
-    } yield
-      expect(!ok) and
-        expect(after.isEmpty) // never written — the gate failed before loadBytes
+    } yield expect(!ok).and(expect(after.isEmpty)) // never written — the gate failed before loadBytes
   }
 
   test("None (byte route 404) + GSI rebuilding to the signed root → legacy fallback gate passes, returns true") { res =>

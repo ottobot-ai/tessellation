@@ -10,8 +10,8 @@ import io.circe.syntax.EncoderOps
   *
   * Proves that a key `path` is ABSENT from the trie committed to by a trusted `mptRoot`. The proof carries the authenticated path of node
   * commitments from the root TOWARD `path` that TERMINATES without reaching a leaf for `path`. The verifier recomputes the root from the
-  * witness (exactly as for an inclusion proof) and confirms the terminal node witnesses non-existence in one of three structural ways
-  * (see [[AbsenceTermination]]).
+  * witness (exactly as for an inclusion proof) and confirms the terminal node witnesses non-existence in one of three structural ways (see
+  * [[AbsenceTermination]]).
   *
   * '''Witness ordering''' mirrors [[MerklePatriciaInclusionProof]]: the `witness` list is stored '''terminal-first''' (the node where the
   * walk terminates is `witness.head`, the root commitment is `witness.last`). The verifier reverses it to walk root→terminal, identical to
@@ -45,8 +45,8 @@ object AbsenceTermination {
   final case class BranchEmptySlot(missingNibble: Nibble) extends AbsenceTermination
 
   /** The terminal node is a [[MerklePatriciaCommitment.Extension]] whose `shared` segment DIVERGES from `path`'s remaining nibbles at this
-    * position (`path` reached the extension but does not continue along the extension's shared segment). The verifier confirms the divergence
-    * structurally.
+    * position (`path` reached the extension but does not continue along the extension's shared segment). The verifier confirms the
+    * divergence structurally.
     */
   case object ExtensionDivergence extends AbsenceTermination
 

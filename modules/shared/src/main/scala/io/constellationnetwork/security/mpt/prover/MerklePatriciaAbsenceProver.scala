@@ -15,11 +15,11 @@ import io.circe.syntax._
   *
   * Mirrors [[MerklePatriciaSingleInclusionProver]]'s walk: it descends from the root following the target key's nibble path, accumulating
   * the same [[MerklePatriciaCommitment]] witness chain (terminal-first ordering). Instead of terminating at a matching leaf, it terminates
-  * at the first node that proves the key cannot be present — an empty branch slot, a divergent extension, or a leaf bound to a different key
-  * (see [[AbsenceTermination]]).
+  * at the first node that proves the key cannot be present — an empty branch slot, a divergent extension, or a leaf bound to a different
+  * key (see [[AbsenceTermination]]).
   *
-  * If the walk would actually reach a leaf bound to the target key, the key is PRESENT and `attestAbsence` returns
-  * [[KeyIsPresent]] — callers must use [[MerklePatriciaSingleInclusionProver]] for present keys.
+  * If the walk would actually reach a leaf bound to the target key, the key is PRESENT and `attestAbsence` returns [[KeyIsPresent]] —
+  * callers must use [[MerklePatriciaSingleInclusionProver]] for present keys.
   */
 trait MerklePatriciaAbsenceProver[F[_]] {
 
