@@ -479,7 +479,13 @@ object NakamotoSyncDaemon {
     networkTipHash: Option[Hash],
     localTipOrdinal: Long,
     isReady: Boolean,
-    lastCatchUpAttemptMs: Long = 0L
+    lastCatchUpAttemptMs: Long = 0L,
+    // Highest ordinal a Tier-3 catch-up has ADOPTED (max-monotone). A catch-up stores the pulled snapshot as an ORPHAN — its
+    // ancestors aren't in the chain store until the BackfillDaemon connects them — so `chainStore.bestTipOrdinal` keeps reporting the
+    // OLD connected tip (chain-selection prefers the connected chain over the orphan). The Tier-3 gap-check maxes bestTip with THIS so
+    // a just-adopted catch-up can't immediately re-fire Tier-3 over the same window (the orphan-adopt livelock); subsequent gossip
+    // falls to Tier-2 walk-back, which connects the gap, instead of re-teleporting forever.
+    lastCatchUpAdoptedOrdinal: Long = 0L
   )
 
   object SyncState {
@@ -1401,8 +1407,12 @@ object NakamotoSyncDaemon {
               // Tier 1 (<=6): buffer + ChainSync parent fetch (normal gossip latency)
               // Tier 2 (>6, <=k): sequential walk-back via ChainSync (moderate drift)
               // Tier 3 (>k): full catch-up — network finalized past us
-              chainStore.bestTipOrdinal.flatMap { localBestOrdinal =>
-                val localOrd = localBestOrdinal.getOrElse(0L)
+              (chainStore.bestTipOrdinal, stateRef.get).flatMapN { (localBestOrdinal, syncSt) =>
+                // Orphan-adopt livelock guard: a Tier-3 catch-up stores the pulled snapshot as an ORPHAN, so `bestTipOrdinal` keeps
+                // reporting the OLD connected tip until the BackfillDaemon links the ancestors. Max it with the highest ordinal a
+                // catch-up has already adopted so we DON'T re-teleport over the same window every gossip (the livelock observed under a
+                // gossip flood); once a catch-up has adopted ord M, the residual gap to the tip is closed by Tier-2 walk-back instead.
+                val localOrd = math.max(localBestOrdinal.getOrElse(0L), syncSt.lastCatchUpAdoptedOrdinal)
                 val gap = snap.ordinal - localOrd
                 if (gap > confirmationDepthK) {
                   logger.warn(
@@ -3334,11 +3344,13 @@ object NakamotoSyncDaemon {
                       // Keep events whose transactions are still unconfirmed (prevents starvation).
                       _ <- reconcileMempool(eventMempool, context, logger)
 
-                      _ <- stateRef.update(
-                        _.copy(
+                      _ <- stateRef.update(s =>
+                        s.copy(
                           networkTipOrdinal = snap.ordinal,
                           networkTipHash = Some(Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))),
-                          localTipOrdinal = snap.ordinal
+                          localTipOrdinal = snap.ordinal,
+                          // Same orphan-adopt livelock guard as the byte-faithful path: record the adopted ordinal for the gap-check.
+                          lastCatchUpAdoptedOrdinal = math.max(s.lastCatchUpAdoptedOrdinal, snap.ordinal)
                         )
                       )
 
@@ -3417,11 +3429,13 @@ object NakamotoSyncDaemon {
                   }
                   // MPT already seeded byte-faithfully above \u2014 do NOT re-seed from the GSI (that re-encode was the wedge).
                   _ <- reconcileMempool(eventMempool, pulledGsi, logger)
-                  _ <- stateRef.update(
-                    _.copy(
+                  _ <- stateRef.update(s =>
+                    s.copy(
                       networkTipOrdinal = pOrdinalL,
                       networkTipHash = Some(pulledHashed.hash),
-                      localTipOrdinal = pOrdinalL
+                      localTipOrdinal = pOrdinalL,
+                      // Record what we adopted so the Tier-3 gap-check won't re-teleport over this window while the orphan connects.
+                      lastCatchUpAdoptedOrdinal = math.max(s.lastCatchUpAdoptedOrdinal, pOrdinalL)
                     )
                   )
                   _ <- productionGate.resume("catch-up-sync")
