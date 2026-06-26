@@ -1597,11 +1597,18 @@ object NakamotoSyncDaemon {
           // reward-sum/root drift our fork-diverged base can't reproduce. Try the self-heal adopt first; on any
           // verification failure or non-self-healable mismatch, fall back to the normal fork/catch-up handling.
           val normalMismatchHandling: F[Unit] =
-            snapshotStorage.head.flatMap {
-              case Some((localTip, _)) =>
-                val localOrd = localTip.ordinal.value.value
+            (snapshotStorage.head, stateRef.get).flatMapN {
+              case (Some((localTip, _)), syncSt) =>
+                // Residual orphan-adopt livelock guard (companion to the Tier-3 gap-check fix). During/after a catch-up, the head
+                // (snapshotStorage) advances but a stream of forward gossip arrives content-mismatched at SMALL gap. Re-adopting on each
+                // (old `gap >= CatchUpThreshold=6`) resets setHeadForRecovery and starves the concurrent Tier-2 walk-back, so the chain
+                // never connects and FINALIZED stays pinned while head advances (observed: gl0-5 head\u2192121, finalized frozen@50, 6\u00D7
+                // re-adopt at gap=6). Fix: max the local ordinal with what a catch-up already adopted, and gate full resync on the SAME
+                // k threshold as Tier-3 \u2014 a small-gap mismatch is a normal fork, stored as a tentative branch (chain-selection resolves),
+                // NOT a reason to re-teleport. Only a genuinely-large (>k) divergence warrants a fresh catch-up.
+                val localOrd = math.max(localTip.ordinal.value.value, syncSt.lastCatchUpAdoptedOrdinal)
                 val gap = snap.ordinal - localOrd
-                if (gap >= CatchUpThreshold) {
+                if (gap > confirmationDepthK) {
                   logger.warn(
                     s"\uD83D\uDD04 Content mismatch with ordinal gap=$gap (local=$localOrd, incoming=${snap.ordinal}). Triggering catch-up."
                   ) >>
@@ -1653,7 +1660,7 @@ object NakamotoSyncDaemon {
                       logger
                     )
                 }
-              case None =>
+              case (None, _) =>
                 catchUpFromGossip(
                   snap,
                   parsed,
