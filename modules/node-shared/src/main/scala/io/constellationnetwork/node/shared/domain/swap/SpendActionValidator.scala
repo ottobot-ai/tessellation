@@ -41,6 +41,38 @@ trait SpendActionValidator[F[_]] {
 
 object SpendActionValidator {
 
+  /** W3c read-side EFFECTIVE-balance overlay seam for the CROSS-SHARD balance path. A `(attestedScopeBalances, ownerScope) =>
+    * effectiveScopeBalances` function that the validator applies to the per-MG balance it PROVES from another shard
+    * ([[ShardSubtreeProofClient.fetchAndVerify]]) BEFORE the balance check, so a cross-shard no-`allowSpendRef` self-spend of a PHANTOM
+    * expiry-refund (the owner metagraph autonomously refunds a consumed-and-expired allow-spend's source) is rejected on the cross-shard
+    * path just like the same-shard path.
+    *
+    * '''Why a function and not the manager.''' The arithmetic is REUSED verbatim — the wiring site closes over the gl0-finalized
+    * `ConsumedAllowSpends` spent-set + the consensus-pinned epochs and calls `ConsumedAllowSpendStateManager.effectiveCurrencyBalances`.
+    * The validator (a `domain.swap` type) is handed only the bound `(balances, scope)` function so it does NOT depend on the
+    * `infrastructure.snapshot` manager, and the spent-set / epoch SOURCING (which must be consensus-deterministic) stays the wiring site's
+    * responsibility. `ownerScope` is the proven balance's OWNER metagraph (`Some(M)` for the cross-shard balance path); the function
+    * filters the spent-set to that scope, so passing the proven `(M′ -> balance)` singleton under `Some(M)` re-subtracts the marker whose
+    * `source == M′` once expired.
+    *
+    * '''Determinism.''' The spent-set is gl0-finalized (cluster-uniform) and `effectiveCurrencyBalances` is deterministic + SATURATING
+    * (never raises), so every honest validating node computes the same effective balance — provided the wiring supplies a consensus epoch
+    * (gl0 `epochProgress` is always ≥ M's pinned `globalSyncView.epochProgress`, so firing the re-debit on it is conservative: it cancels
+    * the phantom at-or-before it appears, never after).
+    *
+    * '''`numShards = 1`.''' Unreachable — the cross-shard balance path is gated behind `Cross(...)` classification, which never fires at
+    * `numShards = 1` (every MG hashes to shard 0). The default [[noEffectiveBalanceOverlay]] is the IDENTITY, so even if it were reached
+    * the behaviour is byte-identical (the proven balance is used as-is).
+    */
+  type CrossShardEffectiveBalanceOverlay =
+    (SortedMap[Address, Balance], Option[Address]) => SortedMap[Address, Balance]
+
+  /** Identity overlay — the proven cross-shard balance is checked as-is. The default for every same-shard / unsharded / pre-W3c-wiring call
+    * site; keeps `numShards = 1` and the test/legacy paths byte-identical.
+    */
+  val noEffectiveBalanceOverlay: CrossShardEffectiveBalanceOverlay =
+    (balances, _) => balances
+
   /** Same-shard / unsharded default constructor — preserved for backwards-compat with existing call sites (gl0 / dag-l1 / sdk wiring at
     * `SharedValidators.scala:100` and tests) that don't have a [[ShardSubtreeProofClient]] / [[ShardAssignment]] in scope. Equivalent to
     * `make(ShardSubtreeProofClient.noop, ShardAssignment.make(numShards = 1))` — i.e. the cross-shard branch is unreachable because every
@@ -49,7 +81,7 @@ object SpendActionValidator {
     * Production sharding wiring uses the [[ShardSubtreeProofClient]]-aware overload below.
     */
   def make[F[_]: Async: Hasher]: SpendActionValidator[F] =
-    make(ShardSubtreeProofClient.noop[F], ShardAssignment.make[F](numShards = 1))
+    make(ShardSubtreeProofClient.noop[F], ShardAssignment.make[F](numShards = 1), noEffectiveBalanceOverlay)
 
   /** Sharding-aware constructor — Slice 11 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §8.2.
     *
@@ -78,10 +110,15 @@ object SpendActionValidator {
     *   (Slice 10). Single-shard / test clusters pass [[ShardSubtreeProofClient.noop]] — the same-shard fast path then covers every read.
     * @param shardAssignment
     *   the cluster-wide static metagraph→shard map (Slice 3). Used to classify each `currencyId` as same-shard or cross-shard.
+    * @param crossShardEffectiveBalanceOverlay
+    *   W3c read-side EFFECTIVE-balance overlay applied to the PROVEN cross-shard per-MG balance before the no-`allowSpendRef` balance check
+    *   (see [[CrossShardEffectiveBalanceOverlay]]). Defaults to the IDENTITY ([[noEffectiveBalanceOverlay]]) — same-shard / `numShards = 1`
+    *   / pre-W3c-wiring call sites are byte-identical. The sharded wiring supplies the spent-set-aware overlay.
     */
   def make[F[_]: Async: Hasher](
     proofClient: ShardSubtreeProofClient[F],
-    shardAssignment: ShardAssignment[F]
+    shardAssignment: ShardAssignment[F],
+    crossShardEffectiveBalanceOverlay: CrossShardEffectiveBalanceOverlay = noEffectiveBalanceOverlay
   ): SpendActionValidator[F] = new SpendActionValidator[F] {
 
     def validateReturningAcceptedAndRejected(
@@ -406,6 +443,19 @@ object SpendActionValidator {
       // SpendAction's amount, per the no-allowSpendRef branch's semantics.)
       val key = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, targetMg, currencyId)
 
+      // W3c proof-path inflation residual: the proven `balance` is the RAW committee-attested
+      // `MgBalances[targetMg][currencyId]` value, which — once a cross-shard allow-spend targetMg never
+      // witnessed expires — includes the PHANTOM refund targetMg autonomously credited its source. Apply
+      // the gl0-finalized `ConsumedAllowSpends` spent-set overlay (the same `effectiveCurrencyBalances`
+      // the same-shard path uses) BEFORE the balance check: scope the proven value as the singleton
+      // `{ currencyId -> balance }` under the OWNER metagraph (`Some(targetMg)`) so a marker whose
+      // `source == currencyId` (= this spender) re-subtracts the refund once expired. So a no-allowSpendRef
+      // self-spend of the phantom-refunded amount is rejected on the cross-shard path too. The overlay is
+      // the IDENTITY unless the sharded wiring supplies a non-empty spent-set ⇒ byte-identical otherwise.
+      def effectiveBalanceFor(provenBalance: Balance): Balance =
+        crossShardEffectiveBalanceOverlay(SortedMap(currencyId -> provenBalance), targetMg.some)
+          .getOrElse(currencyId, provenBalance)
+
       proofClient.fetchAndVerify(targetShard, targetMg, key).flatMap {
         case None =>
           (CrossShardProofUnavailable(
@@ -415,14 +465,15 @@ object SpendActionValidator {
         case Some((None, _)) =>
           // Proof of non-membership → balance is 0 (absent key in the Balances partition is
           // semantically the empty balance, matching the same-shard `getOrElse(_, Balance.empty)`).
-          checkBalanceAndSource(spendTransaction, Balance.empty, currencyId).pure[F]
+          // The overlay still applies (a marker may CREDIT `currencyId` even with a 0 attested base).
+          checkBalanceAndSource(spendTransaction, effectiveBalanceFor(Balance.empty), currencyId).pure[F]
 
         case Some((Some(valueBytes), _)) =>
           decodeCrossShardBalance(valueBytes) match {
             case Left(err) =>
               (err: SpendActionValidationError).invalidNec[SpendTransaction].pure[F]
             case Right(balance) =>
-              checkBalanceAndSource(spendTransaction, balance, currencyId).pure[F]
+              checkBalanceAndSource(spendTransaction, effectiveBalanceFor(balance), currencyId).pure[F]
           }
       }
     }

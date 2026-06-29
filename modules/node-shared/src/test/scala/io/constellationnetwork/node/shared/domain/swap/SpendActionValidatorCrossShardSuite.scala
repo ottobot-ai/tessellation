@@ -11,12 +11,11 @@ import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardSubtreeProof, ShardSubtreeProofClient}
-import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator.{
-  AllowSpendNotFound,
-  CrossShardProofTampered,
-  CrossShardProofUnavailable
-}
+import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator._
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ConsumedAllowSpendStateManager
+import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.{SpendAction, SpendTransaction}
 import io.constellationnetwork.schema.balance.Balance
@@ -513,6 +512,183 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
         result.isValid,
         // numShards=1 ⇒ every MG is same-shard ⇒ proofClient is unreachable.
         calls.isEmpty
+      )
+  }
+
+  // ===========================================================================
+  // Test 8 (W3c FORCING FUNCTION): cross-shard balance-spend of a PHANTOM expiry-refund is
+  //   REJECTED under the EFFECTIVE-balance overlay but ACCEPTED under the raw attested balance —
+  //   proving the overlay is load-bearing on the CROSS-SHARD path (mirrors the same-shard forcing
+  //   function in ConsumedAllowSpendSettlementSuite, routed through validateBalanceCrossShard).
+  // ===========================================================================
+
+  /** Refined helper — refined macros need literals, so build from `Long`. */
+  private def swapAmt(v: Long): SwapAmount = SwapAmount(eu.timepit.refined.types.numeric.PosLong.unsafeFrom(v))
+
+  test(
+    "cross-shard balance-spend of a phantom expiry-refund: REJECTED under effective overlay, ACCEPTED under raw attested (W3c forcing function)"
+  ) { res =>
+    implicit val (_, hs, sp) = res
+
+    for {
+      // M = owner metagraph (holds the reserved funds + autonomously refunds on expiry); the cross-shard
+      // balance proof is fetched from M's shard. M′ = currentMg = the spender AND the source of the
+      // consumed-and-expired allow-spend (so its `Balances[M][M′]` entry is the one the refund inflated).
+      mKp <- KeyPairGenerator.makeKeyPair[IO]
+      mPrimeKp <- KeyPairGenerator.makeKeyPair[IO]
+      destKp <- KeyPairGenerator.makeKeyPair[IO]
+      m = mKp.getPublic.toAddress // owner metagraph M (= targetMg of the cross-shard fetch)
+      mPrime = mPrimeKp.getPublic.toAddress // spender M′ (= validator's currentMg, also the marker source)
+      dest = destKp.getPublic.toAddress
+
+      // Split M and M′ across different shards ⇒ the no-allowSpendRef balance check routes through
+      // validateBalanceCrossShard (the proof path) rather than the in-process same-shard map.
+      numShards <- findNumShardsSplitting(m, mPrime)
+      shardAssignment = ShardAssignment.make[IO](numShards)
+      targetShardId <- shardAssignment.shardIdFor(m)
+
+      // The gl0-finalized ConsumedAllowSpends spent-set: M′'s earlier cross-shard consume of an
+      // allow-spend on M (X=100, expiry E=200), now EXPIRED (pinned/live epoch 250 > 200) so M has
+      // refunded M′ a phantom +X. Marker.currencyId = Some(M) (owner scope), marker.source = M′.
+      x = 100L
+      expiry = 200L
+      asHash = Hash("ab".padTo(64, '0').take(64))
+      spentSet: SortedMap[Hash, ConsumedAllowSpend] = SortedMap(
+        asHash -> ConsumedAllowSpend(
+          allowSpendHash = asHash,
+          source = mPrime,
+          destination = dest,
+          currencyId = CurrencyId(m).some,
+          amount = swapAmt(x),
+          lastValidEpochProgress = EpochProgress(NonNegLong.unsafeFrom(expiry)),
+          consumedAtOrdinal = SnapshotOrdinal(NonNegLong(1L)),
+          consumingSpendRef = asHash
+        )
+      )
+
+      // M's ATTESTED per-MG balance for M′ AFTER the refund = exactly X (phantom): the only thing that
+      // could fund the self-spend is the refund. Real spendable = X − X = 0.
+      provenAttestedBalance = Balance(NonNegLong.unsafeFrom(x))
+      provenValue = provenAttestedBalance.asJson.noSpaces.getBytes("UTF-8")
+
+      // The overlay closure REUSES ConsumedAllowSpendStateManager.effectiveCurrencyBalances verbatim,
+      // closing over the finalized spent-set + the (post-expiry) epoch. Empty pinned map ⇒ epochFor(M)
+      // = liveEpoch = 250 > 200 ⇒ the marker's source-debit fires ⇒ M′'s effective balance = 0.
+      mgr = ConsumedAllowSpendStateManager.make[IO](GlobalStateReader.empty[IO])
+      effectiveOverlay: SpendActionValidator.CrossShardEffectiveBalanceOverlay =
+        (attested, scope) =>
+          mgr.effectiveCurrencyBalances(
+            attested,
+            scope,
+            spentSet,
+            Map.empty[Address, EpochProgress],
+            EpochProgress(NonNegLong.unsafeFrom(250L))
+          )
+
+      callsRef <- Ref.of[IO, List[FetchCall]](List.empty)
+      proofClient = mkMockClient(
+        callsRef,
+        _ => IO.pure(Some((Some(provenValue), sentinelProof(Hex.fromBytes(provenValue).some))))
+      )
+      // Two validators: one with the effective overlay (W3c), one with the IDENTITY default (the raw path).
+      effectiveValidator = SpendActionValidator.make[IO](proofClient, shardAssignment, effectiveOverlay)
+      rawValidator = SpendActionValidator.make[IO](proofClient, shardAssignment)
+
+      // A no-allowSpendRef self-spend by M′ of X against currency M: source = M′ (= validator's
+      // currencyId/currentMg), currencyId = Some(M) ⇒ Cross(M, mShard) ⇒ balance fetched from M's shard.
+      selfSpend = SpendTransaction(none[Hash], CurrencyId(m).some, swapAmt(x), mPrime, dest)
+      spendAction = SpendAction(NonEmptyList.of(selfSpend))
+      activeAllowSpends = SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+      balances = Map.empty[Option[Address], SortedMap[Address, Balance]]
+
+      resEffective <- effectiveValidator.validate(spendAction, activeAllowSpends, balances, mPrime)
+      effectiveCalls <- callsRef.get
+      _ <- callsRef.set(List.empty)
+      resRaw <- rawValidator.validate(spendAction, activeAllowSpends, balances, mPrime)
+    } yield
+      expect.all(
+        // The cross-shard fetch DID happen, against M's shard + the (M, M′) Balances key.
+        effectiveCalls.length === 1,
+        effectiveCalls.head.targetShardId === targetShardId,
+        effectiveCalls.head.metagraphAddress === m,
+        effectiveCalls.head.key === GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, m, mPrime),
+        // Under the EFFECTIVE overlay (M′ effective balance = X − X = 0) ⇒ REJECTED for insufficient balance.
+        resEffective.isInvalid,
+        resEffective.toEither.left.exists(_.exists {
+          case NotEnoughCurrencyIdBalance(_) => true
+          case _                             => false
+        }),
+        // …but ACCEPTED under the raw attested (phantom-refunded) balance ⇒ the overlay is load-bearing
+        // on the cross-shard path. (Same forcing-function shape as the same-shard ConsumedAllowSpendSettlementSuite.)
+        resRaw.isValid
+      )
+  }
+
+  // ===========================================================================
+  // Test 9 (W3c numShards=1 IDENTITY): the cross-shard balance overlay seam is unreachable at
+  //   numShards=1 — proofClient is never invoked and the result matches the same spend validated
+  //   against the in-process attested balance, even when an overlay is wired. Byte-identical.
+  // ===========================================================================
+
+  test("numShards=1: cross-shard balance overlay is unreachable ⇒ behaviour byte-identical to the in-process attested path") { res =>
+    implicit val (_, hs, sp) = res
+
+    for {
+      mKp <- KeyPairGenerator.makeKeyPair[IO]
+      destKp <- KeyPairGenerator.makeKeyPair[IO]
+      m = mKp.getPublic.toAddress
+      dest = destKp.getPublic.toAddress
+
+      // numShards=1 ⇒ every MG hashes to shard 0 ⇒ the no-allowSpendRef balance check uses the SAME-SHARD
+      // in-process map and the cross-shard overlay seam is never consulted.
+      shardAssignment = ShardAssignment.make[IO](numShards = 1)
+
+      x = 100L
+      // An overlay that WOULD debit if reached (marker source = m), proving it is NOT reached at numShards=1.
+      asHash = Hash("cd".padTo(64, '0').take(64))
+      spentSet: SortedMap[Hash, ConsumedAllowSpend] = SortedMap(
+        asHash -> ConsumedAllowSpend(
+          allowSpendHash = asHash,
+          source = m,
+          destination = dest,
+          currencyId = CurrencyId(m).some,
+          amount = swapAmt(x),
+          lastValidEpochProgress = EpochProgress(NonNegLong.unsafeFrom(200L)),
+          consumedAtOrdinal = SnapshotOrdinal(NonNegLong(1L)),
+          consumingSpendRef = asHash
+        )
+      )
+      mgr = ConsumedAllowSpendStateManager.make[IO](GlobalStateReader.empty[IO])
+      neverReachedOverlay: SpendActionValidator.CrossShardEffectiveBalanceOverlay =
+        (attested, scope) =>
+          mgr.effectiveCurrencyBalances(
+            attested,
+            scope,
+            spentSet,
+            Map.empty[Address, EpochProgress],
+            EpochProgress(NonNegLong.unsafeFrom(250L))
+          )
+
+      callsRef <- Ref.of[IO, List[FetchCall]](List.empty)
+      proofClient = mkMockClient(callsRef, _ => IO.pure(None))
+      validator = SpendActionValidator.make[IO](proofClient, shardAssignment, neverReachedOverlay)
+
+      // Source = m (the validator's currencyId), currencyId = Some(m) (same MG) ⇒ Same ⇒ in-process map.
+      // Attested in-process balance = X ⇒ the self-spend of X is ACCEPTED (the overlay, if it had been
+      // reached, would have debited it to 0 and rejected — but it is NOT reached at numShards=1).
+      selfSpend = SpendTransaction(none[Hash], CurrencyId(m).some, swapAmt(x), m, dest)
+      spendAction = SpendAction(NonEmptyList.of(selfSpend))
+      activeAllowSpends = SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+      inProcessBalances = Map(m.some -> (SortedMap(m -> Balance(NonNegLong.unsafeFrom(x))): SortedMap[Address, Balance]))
+
+      result <- validator.validate(spendAction, activeAllowSpends, inProcessBalances, m)
+      calls <- callsRef.get
+    } yield
+      expect.all(
+        // proofClient never consulted ⇒ the cross-shard overlay seam is dead at numShards=1.
+        calls.isEmpty,
+        // Accepted off the in-process attested balance, unaffected by the (unreached) overlay.
+        result.isValid
       )
   }
 }
