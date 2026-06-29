@@ -2,11 +2,23 @@ package io.constellationnetwork.node.shared.domain.nakamoto.sharding
 
 import cats.Applicative
 import cats.effect.Async
+import cats.effect.kernel.Ref
 import cats.syntax.all._
 
+import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
+import io.constellationnetwork.node.shared.http.p2p.PeerResponse
+import io.constellationnetwork.node.shared.http.p2p.middlewares.PeerAuthMiddleware
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.mpt.GlobalStateKey
-import io.constellationnetwork.schema.sharding.ShardId
+import io.constellationnetwork.schema.peer.{P2PContext, Peer}
+import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId}
+import io.constellationnetwork.security.SecurityProvider
+import io.constellationnetwork.security.signature.Signed
+
+import org.http4s.Method.POST
+import org.http4s.client.Client
+import org.http4s.{Request, Uri}
+import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Cross-shard read client — Slice 11 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §8.2/§8.6.
   *
@@ -79,28 +91,175 @@ object ShardSubtreeProofClient {
       Applicative[F].pure(none[(Option[Array[Byte]], ShardSubtreeProof)])
   }
 
-  /** Production HTTP implementation stub — TODO: wire to the Slice 10 HTTP route `POST /shard/{shardId}/proof?metagraph={addr}` once the
-    * inter-gl0 peer discovery for shard-owning peers is wired (Slice 14 territory). v1 of Slice 11 stops at the trait integration in
-    * [[io.constellationnetwork.node.shared.domain.swap.SpendActionValidator]]; the on-wire fetch is the responsibility of the
-    * network-plumbing slice.
+  /** Resolves gl0's last-finalized [[ShardCheckpoint]] for a given shard, lifted into a [[Signed]] envelope so it can drive
+    * [[ShardSubtreeProofService.verifyProof]]. Production wiring reads the checkpoint off the latest-finalized
+    * `GlobalIncrementalSnapshot.shardCheckpoints[shardId]` (the field gl0 carries on every finalized snapshot) and wraps it in the
+    * enclosing snapshot's own signature proofs — those proofs are inert for `verifyProof` (which re-derives the canonical hash from the
+    * checkpoint's `signingPreimage` and never inspects the envelope's `proofs`), they exist only to satisfy the `Signed` type. The
+    * checkpoint VALUE is the trust anchor: a peer's proof is accepted iff it anchors at the SAME checkpoint gl0 finalized AND its per-MG
+    * root matches what gl0 finalized.
     *
-    * The intended shape:
-    *   - `peerSelector(shardId)` resolves a peer URL hosting that shard's committee proof route. Production wiring would consult
-    *     [[io.constellationnetwork.node.shared.domain.cluster.services.Cluster]] filtered to peers whose advertised shard set includes
-    *     `shardId`.
-    *   - Issue `POST /shard/{shardId}/proof?metagraph={mgAddress}` with the [[GlobalStateKey]] as the JSON body (matching the Slice 10
-    *     route's request shape — see `ShardProofRoutes` scaladoc).
-    *   - Decode the response `ShardSubtreeProof` via the standard Circe instance.
-    *   - Extract `value` from `proof.value.map(_.toBytes)` for the consumer.
-    *
-    * The implementation also needs to (re)verify the proof end-to-end against the checkpoint hash recorded in gl0's last finalized
-    * snapshot's `shardCheckpoints[shardId]` before surfacing the value — that's defence against a misbehaving peer returning a
-    * structurally-valid but semantically-mismatched proof. The verify step uses the same primitives Slice 10 exposes via
-    * [[ShardSubtreeProofService.verifyProof]].
-    *
-    * Stubbed in this slice because (a) the trait integration in `SpendActionValidator` is the load-bearing test of the design and (b) peer
-    * discovery for shard-owning peers is a separate workstream. Returns `None` so any premature production wiring fails closed (validator
-    * rejects the cross-shard SpendAction for retry).
+    * Returns `None` when the finalized snapshot has no checkpoint for `shardId` (bootstrap, paused shard, pre-sharding window). The client
+    * maps that to "no trusted anchor ⇒ cannot verify ⇒ unavailable", same fail-closed default as a network miss.
     */
-  def httpStub[F[_]: Async]: ShardSubtreeProofClient[F] = noop[F]
+  type FinalizedShardCheckpointLookup[F[_]] = ShardId => F[Option[Signed[ShardCheckpoint]]]
+
+  /** Production HTTP implementation of the cross-shard read client — Slice 11 transport plumbing of
+    * `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §8.6.
+    *
+    * '''Flow''' (mirrors `ShardCheckpointFetcher`, the read-only shard-checkpoint pull, point-for-point):
+    *   1. Resolve gl0's last-finalized checkpoint for `targetShardId` via `finalizedCheckpoint`. NO finalized anchor ⇒ return `None`
+    *      (fail-closed: there is no trusted root to verify against). This read happens BEFORE any network call so an offline shard / a
+    *      pre-sharding snapshot short-circuits without touching a peer. 2. Select a peer over `clusterStorage.getResponsivePeers` with the
+    *      SAME time-rotated pick `ShardCheckpointFetcher` uses (the shard committee is a subset of responsive gl0 peers and the serve is
+    *      read-only, so any responsive peer that holds the checkpoint is a valid prover — there is no advertised-shard-set discovery yet;
+    *      that is the future hardening the trait scaladoc references). 3. `POST /shard/{shardId}/proof?metagraph={mgAddress}` against the
+    *      peer's PUBLIC port with the [[GlobalStateKey]] as the JSON body (the route's request shape — see `ShardProofRoutes`). The public
+    *      app is response-signed, so the response runs through `responseVerifierMiddleware` to authenticate the peer authored it —
+    *      identical to the `ShardCheckpointFetcher` public-port pull. 4. Decode the response as [[ShardSubtreeProof]] (standard Circe
+    *      instance). 5. (Re)verify the proof end-to-end against gl0's FINALIZED checkpoint via [[ShardSubtreeProofService.verifyProof]] —
+    *      this is the defence against a misbehaving peer returning a structurally-valid but semantically-mismatched proof: `verifyProof`
+    *      rejects unless the proof's `perMgMptRoot` equals the per-MG root gl0 finalized AND the proof's `shardCheckpointHash` equals the
+    *      canonical hash of gl0's finalized checkpoint AND the MPT witness chain validates against that root. A failed verify ⇒ `None` (the
+    *      `Tampered` / semantically-mismatched case; the validator surfaces it as `CrossShardProofUnavailable` — it rejects the SpendAction
+    *      for retry, the conservative outcome).
+    *
+    * '''Return semantics''' (per the trait contract):
+    *   - verify passes ⇒ `Some((proof.value.map(_.toBytes), proof))`. The value bytes ride alongside the proof on the wire (the serve side
+    *     populates `ShardSubtreeProof.value`); the consumer decodes them per-call. A membership proof whose serve side did not populate the
+    *     value surfaces as `Some((None, proof))` — proven-present-but-no-value, which the validator treats as "state not present" (the same
+    *     effect as an absent key).
+    *   - any failure (no finalized anchor, no responsive peer, HTTP error, decode failure, verify=false) ⇒ `None`. This collapses the
+    *     `CrossShardProofUnavailable` and `Tampered` cases into the single fail-closed `None` the trait specifies — refusing to validate
+    *     beats validating against stale or fabricated state.
+    *
+    * '''Best-effort + deduped.''' A per-`(shard, key)` cooldown (`pullDedupCooldownMs`) suppresses re-requesting the same proof inside the
+    * window (mirrors `ShardCheckpointFetcher`'s `cooldownRef`). Within the cooldown the client returns `None` (the validator retries on the
+    * next gl0 ord). Every network/verify failure logs at debug and returns `None`.
+    *
+    * '''Inert at `numShards = 1`.''' This constructor is only wired into the validator on the sharding-active path; at `numShards = 1` the
+    * validator is built with [[noop]] and the same-shard fast path covers every read, so this client is never invoked. The serve route it
+    * talks to can still be mounted and answer — it just has no caller until the cross-shard validator is wired.
+    *
+    * '''HOCON rule''' (per `[[feedback-prefer-hocon-over-sysenv]]`): no `sys.env.get` — `pullDedupCooldownMs` is threaded from typed
+    * `SharedConfig.nakamoto.sharding.*` config at the wiring site.
+    *
+    * @param client
+    *   the shared http4s client (same instance the other gl0→gl0 clients use).
+    * @param clusterStorage
+    *   peer source for the time-rotated responsive-peer pick.
+    * @param proofService
+    *   the prover/verifier primitive — only `verifyProof` is used here, against gl0's finalized checkpoint.
+    * @param finalizedCheckpoint
+    *   resolver for gl0's last-finalized checkpoint per shard (the trust anchor).
+    * @param pullDedupCooldownMs
+    *   per-`(shard, key)` request-suppression window (mirrors `ShardCheckpointFetcher.pullDedupCooldownMs`).
+    */
+  def http[F[_]: Async: SecurityProvider](
+    client: Client[F],
+    clusterStorage: ClusterStorage[F],
+    proofService: ShardSubtreeProofService[F],
+    finalizedCheckpoint: FinalizedShardCheckpointLookup[F],
+    pullDedupCooldownMs: Long
+  ): F[ShardSubtreeProofClient[F]] =
+    Ref.of[F, Map[String, Long]](Map.empty).map { cooldownRef =>
+      val logger = Slf4jLogger.getLoggerFromName[F]("ShardSubtreeProofClient")
+
+      // JSON over the response-signed public GET/POST — the same `circeEntityCodec` path `ShardCheckpointFetcher` uses.
+      import org.http4s.circe.CirceEntityCodec.{circeEntityDecoder, circeEntityEncoder}
+
+      new ShardSubtreeProofClient[F] {
+        def fetchAndVerify(
+          targetShardId: ShardId,
+          metagraphAddress: Address,
+          key: GlobalStateKey
+        ): F[Option[(Option[Array[Byte]], ShardSubtreeProof)]] = {
+          val dedupKey = s"${targetShardId.value.value}-${metagraphAddress.value.value}-${key.toString}"
+          val unavailable: Option[(Option[Array[Byte]], ShardSubtreeProof)] =
+            none[(Option[Array[Byte]], ShardSubtreeProof)]
+
+          // 1. Trust anchor first — gl0's last-finalized checkpoint for the target shard. No anchor ⇒ fail closed BEFORE any network call.
+          finalizedCheckpoint(targetShardId).flatMap {
+            case None =>
+              logger
+                .debug(
+                  s"🧩 cross-shard proof: no finalized checkpoint for shard=${targetShardId.value.value} (no trust anchor) — unavailable"
+                )
+                .as(unavailable)
+
+            case Some(anchorCheckpoint) =>
+              // Cooldown gate — suppress re-requesting the same (shard, mg, key) inside the window.
+              Async[F].realTime.map(_.toMillis).flatMap { now =>
+                cooldownRef.modify { m =>
+                  m.get(dedupKey) match {
+                    case Some(t) if now - t < pullDedupCooldownMs => (m, true) // within cooldown — suppress
+                    case _                                        => (m.updated(dedupKey, now), false)
+                  }
+                }.flatMap { suppressed =>
+                  if (suppressed) unavailable.pure[F]
+                  else
+                    clusterStorage.getResponsivePeers.flatMap { peers =>
+                      val peerList = peers.toList
+                      if (peerList.isEmpty)
+                        logger
+                          .debug(s"🧩 cross-shard proof: no responsive peers (shard=${targetShardId.value.value}, key=$dedupKey)")
+                          .as(unavailable)
+                      else {
+                        // 2. Time-rotated peer pick — identical to ShardCheckpointFetcher.
+                        val peer: Peer = peerList((now % peerList.size.toLong).toInt)
+                        // 3. POST against the peer's PUBLIC port. `openRoutes` is response-signed (verified below) but requires no request
+                        //    token — the proof is anchored against gl0's own finalized root, so a wrong/forged proof fails `verifyProof`.
+                        val ctx = P2PContext(peer.ip, peer.publicPort, peer.id)
+                        val path = s"shard/${targetShardId.value.value}/proof"
+                        val uri = (u: Uri) => u.addPath(path).withQueryParam("metagraph", metagraphAddress.value.value)
+                        val verified = PeerAuthMiddleware.responseVerifierMiddleware[F](peer.id)(client)
+                        PeerResponse[F, F, ShardSubtreeProof](uri, POST)(verified) { (req: Request[F], c: Client[F]) =>
+                          c.expect[ShardSubtreeProof](req.withEntity(key))
+                        }.run(ctx)
+                          .flatMap { proof =>
+                            // 4a. Envelope cross-check: the peer MUST have answered for exactly the (MG, key) we asked. Without this a peer
+                            //     could return a structurally-valid proof for a DIFFERENT MG/key whose per-MG root also exists in gl0's
+                            //     finalized checkpoint, and `verifyProof` (which keys its root lookup on the proof's OWN `metagraphAddress`)
+                            //     would accept it — surfacing the wrong MG's value to the validator. Reject the substitution here.
+                            if (proof.metagraphAddress =!= metagraphAddress || proof.key =!= key)
+                              logger
+                                .warn(
+                                  s"🧩 cross-shard proof MG/key SUBSTITUTION: shard=${targetShardId.value.value} " +
+                                    s"asked mg=${metagraphAddress.value.value.take(8)} got mg=${proof.metagraphAddress.value.value
+                                        .take(8)} from=${peer.id.value.value.take(8)} — rejecting"
+                                )
+                                .as(unavailable)
+                            else
+                              // 4b. + 5. Re-verify END-TO-END against gl0's finalized checkpoint (NOT the proof's self-claimed checkpoint):
+                              //     catches a peer that proxies a structurally-valid proof for a different/forged checkpoint or root.
+                              proofService.verifyProof(anchorCheckpoint, proof).flatMap { ok =>
+                                if (ok)
+                                  logger
+                                    .info(
+                                      s"🧩 cross-shard proof OK: shard=${targetShardId.value.value} mg=${metagraphAddress.value.value
+                                          .take(8)} from=${peer.id.value.value.take(8)} hasValue=${proof.value.isDefined}"
+                                    )
+                                    .as((proof.value.map(_.toBytes), proof).some)
+                                else
+                                  logger
+                                    .warn(
+                                      s"🧩 cross-shard proof TAMPERED/mismatch: shard=${targetShardId.value.value} mg=${metagraphAddress.value.value
+                                          .take(8)} from=${peer.id.value.value.take(8)} — verifyProof=false, rejecting"
+                                    )
+                                    .as(unavailable)
+                              }
+                          }
+                          .handleErrorWith { e =>
+                            logger
+                              .debug(s"🧩 cross-shard proof failed: shard=${targetShardId.value.value} key=$dedupKey: ${e.getMessage}")
+                              .as(unavailable)
+                          }
+                      }
+                    }
+                }
+              }
+          }
+        }
+      }
+    }
 }

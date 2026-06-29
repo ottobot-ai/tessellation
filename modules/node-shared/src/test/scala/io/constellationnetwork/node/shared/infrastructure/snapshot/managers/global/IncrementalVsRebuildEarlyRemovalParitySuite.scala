@@ -166,7 +166,8 @@ object IncrementalVsRebuildEarlyRemovalParitySuite extends MutableIOSuite {
         SortedMap.empty[Address, SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
         SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]],
         SortedMap(Option.empty[Address] -> lastActiveGlobal),
-        List(spendTx)
+        List(spendTx),
+        Map.empty[Address, EpochProgress]
       )
 
       // Post-state full active map (what the rebuild will index from): the source's set is now empty → dropped.
@@ -371,7 +372,8 @@ object IncrementalVsRebuildEarlyRemovalParitySuite extends MutableIOSuite {
         SortedMap.empty[Address, SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
         SortedMap(src -> SortedSet(as)), // incoming global allow-spend
         SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
-        List.empty
+        List.empty,
+        Map.empty[Address, EpochProgress]
       )
       _ <- prodStore.syncFromStateChanges(
         StateChangesAccumulator(
@@ -391,7 +393,8 @@ object IncrementalVsRebuildEarlyRemovalParitySuite extends MutableIOSuite {
         SortedMap.empty[Address, SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
         SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]],
         SortedMap(Option.empty[Address] -> SortedMap(src -> SortedSet(as))), // last active = the record added at ord2
-        List(spendTx)
+        List(spendTx),
+        Map.empty[Address, EpochProgress]
       )
       _ <- prodStore.syncFromStateChanges(
         StateChangesAccumulator(

@@ -74,6 +74,12 @@ object SidecarClient {
       */
     def publishShardCheckpointAttestation(msg: ShardCheckpointAttestationWire): F[PublishResponse]
 
+    /** WATCHTOWER: publish a fraud proof on the gl0-wide `fraud-proof` topic. The wire payload is a proto-encoded `FraudProofEnvelopeWire`
+      * produced via `FraudProofWireCodecs.toWire`; the sidecar gossips it to every gl0 so each independently re-runs the deterministic
+      * dispute verdict. Failures are swallowed by the caller (the watchtower must not block the accept path on a publish failure).
+      */
+    def publishFraudProof(msg: FraudProofEnvelopeWire): F[PublishResponse]
+
     /** Ack to the sidecar that the listed message ids on `topic` have reached Phase-3 finality and may be dropped from the outbox. Each id
       * is the sha256 (first 32 bytes) of the same payload bytes the JVM published.
       *
@@ -111,6 +117,11 @@ object SidecarClient {
       * mesh once and process both.
       */
     val ShardCheckpointAttestation = "shard-checkpoint-attestation"
+
+    /** WATCHTOWER: gl0-wide fraud-proof topic. Unlike the per-shard checkpoint topics, fraud proofs gossip to EVERY gl0 (every node must
+      * independently re-run the dispute verdict + apply the slash), so this is a single cluster-wide topic with no shard-id suffix.
+      */
+    val FraudProof = "fraud-proof"
   }
 
   /** Create a gRPC client Resource that opens a channel and cleans up on release. */
@@ -166,6 +177,9 @@ object SidecarClient {
 
       def publishShardCheckpointAttestation(msg: ShardCheckpointAttestationWire): F[PublishResponse] =
         liftFuture(stub.publishShardCheckpointAttestation(msg))
+
+      def publishFraudProof(msg: FraudProofEnvelopeWire): F[PublishResponse] =
+        liftFuture(stub.publishFraudProof(msg))
 
       def confirmFinalized(topic: String, msgIds: List[Array[Byte]]): F[ConfirmFinalizedResponse] =
         liftFuture(

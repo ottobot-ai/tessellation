@@ -9,14 +9,19 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot
+import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.ChangeSet
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardSlotLeader}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.artifact.{SharedArtifact, SpendAction}
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
+import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.signature.SignatureProof
@@ -272,7 +277,7 @@ object ShardCheckpointProducer {
     *   byte-diff vs `S(N)` (step 6 of the unroll workstream). The `gl0AnchorOrdinal` (the checkpoint's own anchor) feeds the fee-required
     *   cutover so the producer + verifier agree. Production wiring (S3) closes over `ShardCheckpointWiring.reExecDerivationWithDiff` (built
     *   from the SAME `GlobalSnapshotStateChannelEventsProcessor` gl0 uses for metagraph snapshots + the best-tip `GlobalStateReader`), so
-    *   the `Hash` (a Some/None-INVISIBLE `Hasher.hash((incrementalRoot, infoRoot))` over `currencySnapshotFieldRoots`) feeds
+    *   the `Hash` (the COMPONENT-ADDRESSABLE `GlobalStateConverter.currencySnapshotMgRoot` — the per-MG sub-trie rootHash) feeds
     *   `perMetagraphMptRoots` and the `ChangeSet` (8 `Mg*` ⊕ fieldId-7 allow-spends, minimal) feeds `perMetagraphStateDiff`. The gl0
     *   verifier APPLIES the diff and recomputes the IDENTICAL root over its post-apply state. For tests, pass a fake closure that returns a
     *   deterministic stub `(Hash, ChangeSet)` per MG.
@@ -280,9 +285,18 @@ object ShardCheckpointProducer {
     * The implicit `Hasher[F]` is required for the canonical preimage hash; `SecurityProvider[F]` is required for the Ed25519 sign path
     * (`Signing.signData`).
     */
-  def make[F[_]: Async: Hasher: SecurityProvider](
+  def make[F[_]: Async: Hasher: SecurityProvider: JsonSerializer](
     shardId: ShardId,
     chainStore: ShardChainStore[F],
+    /** Cluster-wide static metagraph→shard map (Slice 3). Used by [[assembleDelta]] to classify each cross-MG `SpendAction` target: a
+      * `SpendTransaction` whose `currencyId` resolves to a metagraph in a DIFFERENT shard than this producer's [[shardId]] is a cross-shard
+      * write, surfaced as a [[CrossShardReceipt.MetagraphSyncDataWrite]] in `emittedReceipts` (design §8.4). MUST be constructed from the
+      * SAME `cfg.nakamoto.sharding.numShards` every operator runs — the assignment is consensus-load-bearing here because `emittedReceipts`
+      * is inside the signed `ShardCheckpointSigPreimage`, so a `numShards` disagreement would split the committee's receipt list. At
+      * `numShards = 1` every target maps to shard 0 == this shard ⇒ no cross-shard target ⇒ `emittedReceipts` stays empty (byte-identical
+      * to the pre-receipts path).
+      */
+    shardAssignment: ShardAssignment[F],
     /** '''S2 — BASE-ANCHORED window (VERSION-MODEL §4).''' Per-MG gl0 DEPTH-K-FINALIZED SC tip — the finalized base's
       * `lastStateChannelSnapshotHashes` (`mptStore.getAllLastStateChannelSnapshotHashes`), the SAME finalized base `derivePerMgState`'s
       * diff-prior reads. `chainLinkOrder` anchors each MG's binary window here (NOT `chainStore.perMgTip`, which is bestTip-derived and
@@ -539,11 +553,11 @@ object ShardCheckpointProducer {
                   else
                     slotLeader.membershipProof(selfVrfSk, shardEta, currentSlot).flatMap { vrfProof =>
                       // On duty — build the checkpoint, sign it, publish it.
-                      assembleDelta(orderedSnapshots, gl0AnchorOrdinal).flatMap {
+                      assembleDelta(orderedSnapshots, gl0AnchorOrdinal, parentHash).flatMap {
                         case None =>
                           // assembleDelta already logged the omit-defer reason; mint NOTHING this round.
                           (None: Option[Signed[ShardCheckpoint]]).pure[F]
-                        case Some(delta) =>
+                        case Some((delta, emittedReceipts)) =>
                           val checkpoint = ShardCheckpoint(
                             shardId = shardId,
                             parentCheckpointHash = parentHash,
@@ -551,7 +565,7 @@ object ShardCheckpointProducer {
                             gl0AnchorOrdinal = gl0AnchorOrdinal,
                             slot = currentSlot,
                             derivedStateDelta = delta,
-                            emittedReceipts = List.empty,
+                            emittedReceipts = emittedReceipts,
                             // Placeholder — populated below by replacing with the real committee-member sig. NonEmptyList requires at
                             // least one element to construct; we use a throwaway sentinel and overwrite in `.copy(...)`. Cleaner than
                             // threading the signing into the case-class constructor.
@@ -583,7 +597,8 @@ object ShardCheckpointProducer {
                             _ <- publisher.publish(signedCheckpoint)
                             _ <- logger.info(
                               s"produce: emitted shardOrdinal=${nextShardOrdinal.value} gl0Anchor=${gl0AnchorOrdinal.value.value} " +
-                                s"slot=${currentSlot.value.value} mgs=${orderedSnapshots.keys.size} kesStep=$kesStep"
+                                s"slot=${currentSlot.value.value} mgs=${orderedSnapshots.keys.size} " +
+                                s"crossShardReceipts=${emittedReceipts.size} kesStep=$kesStep"
                             )
                           } yield Some(signedCheckpoint): Option[Signed[ShardCheckpoint]]
                       }
@@ -593,12 +608,19 @@ object ShardCheckpointProducer {
         }
       }
 
-      /** Build the [[ShardDerivedStateDelta]] from the already chain-link-ordered per-MG snapshots.
+      /** Build the [[ShardDerivedStateDelta]] AND the `emittedReceipts` list from the already chain-link-ordered per-MG snapshots.
         *
         * '''Scope''': `perMetagraphMptRoots` AND `perMetagraphStateDiff` (both from the injectable re-exec callback's `(Hash, ChangeSet)`
-        * pair) and `includedSnapshots` (the chain-ordered chains) are populated. The other fields (`tokenLockBalancesDelta`,
+        * pair) and `includedSnapshots` (the chain-ordered chains) are populated. The other delta fields (`tokenLockBalancesDelta`,
         * `perMetagraphArtifacts`, `perMetagraphSyncDataDelta`) are left empty — those per-MG derivations migrate from gl0 to the shard in a
-        * later slice.
+        * later slice. The SECOND tuple element is `emittedReceipts` (design §8.4 — see [[crossShardReceipts]]).
+        *
+        * '''Cross-shard receipts (§8.4).''' Alongside the per-MG roots/diffs we scan each MG's included `SpendAction`s for cross-shard
+        * writes: a `SpendTransaction` whose `currencyId` resolves (via [[shardAssignment]]) to a metagraph in a DIFFERENT shard than this
+        * producer's [[shardId]] is a cross-shard `MetagraphSyncData` write the source shard cannot apply directly (the target's MPT subtree
+        * is the target shard's authority). It is recorded as a [[CrossShardReceipt.MetagraphSyncDataWrite]] for gl0 to drain into the
+        * target's pending sync-data (`MetagraphSyncManager.consumeReceipts`). At `numShards = 1` every target maps to this same shard ⇒ the
+        * receipt list is empty ⇒ the produced envelope is byte-identical to the pre-receipts path.
         *
         * '''Input is pre-ordered (R-2).''' `orderedSnapshots` has already been chain-link-ordered by [[chainLinkOrder]] off the gl0
         * FINALIZED-base per-MG tip (S2), so each MG's `NonEmptyList` is strictly parent→child from base->latest. `derivePerMgState` is
@@ -606,8 +628,9 @@ object ShardCheckpointProducer {
         */
       private def assembleDelta(
         orderedSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-        gl0AnchorOrdinal: SnapshotOrdinal
-      ): F[Option[ShardDerivedStateDelta]] =
+        gl0AnchorOrdinal: SnapshotOrdinal,
+        parentCheckpointHash: Hash
+      ): F[Option[(ShardDerivedStateDelta, List[CrossShardReceipt])]] =
         // For each MG, call the injectable `derivePerMgState(mg, includedChain, gl0AnchorOrdinal)` over the FULL per-MG chain (S3). The
         // closure re-runs the metagraph's currency derivation against the prior shard-checkpoint's cumulative state S(N) (from the adopted
         // best-tip) and returns BOTH the canonical per-MG MPT root AND the minimal `CurrencySnapshotInfo` byte-diff (`ChangeSet`) vs S(N).
@@ -636,10 +659,10 @@ object ShardCheckpointProducer {
                 s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=omit-defer (cannot derive every active MG — not minting a " +
                   s"partial checkpoint) omittedMgs=${omittedMgs.map(_.value.value.take(8)).mkString(",")} totalMgs=${orderedSnapshots.size}"
               )
-              .as(none[ShardDerivedStateDelta])
+              .as(none[(ShardDerivedStateDelta, List[CrossShardReceipt])])
           else {
             val perMg: List[(Address, (Hash, ChangeSet))] = perMgPairs.collect { case (mg, Some(rootDiff)) => mg -> rootDiff }
-            ShardDerivedStateDelta(
+            val delta = ShardDerivedStateDelta(
               perMetagraphMptRoots = SortedMap.from(perMg.map { case (mg, (root, _)) => mg -> root }),
               perMetagraphStateDiff = SortedMap.from(perMg.map { case (mg, (_, diff)) => mg -> ChangeSet.toWire(diff) }),
               // No omission reached this branch — every MG in `orderedSnapshots` derived — so include them all.
@@ -647,9 +670,101 @@ object ShardCheckpointProducer {
               tokenLockBalancesDelta = SortedMap.empty,
               perMetagraphArtifacts = SortedMap.empty,
               perMetagraphSyncDataDelta = SortedMap.empty
-            ).some.pure[F]
+            )
+            crossShardReceipts(orderedSnapshots, gl0AnchorOrdinal, parentCheckpointHash).map(receipts => (delta, receipts).some)
           }
         }
+
+      /** Detect cross-shard `MetagraphSyncData` writes in this checkpoint's included snapshots and build the `emittedReceipts` list (design
+        * §8.4 — `MetagraphSyncManager.updateFromSpendActions` under sharding).
+        *
+        * '''Source of `SpendAction`s.''' Each MG's included `Signed[StateChannelSnapshotBinary]` chain is decoded to
+        * `Signed[CurrencyIncrementalSnapshot]` (the SAME `JsonSerializer[F].deserialize` over `binary.value.content` the gl0 acceptance
+        * path uses at `GlobalSnapshotAcceptanceManager` line ~1959), and its `artifacts` are read off — byte-equivalent to what an
+        * unsharded gl0 op reads. A binary that does not decode as a currency incremental contributes no artifacts (tolerant — mirrors the
+        * processor's `deserialize(...).map(_.toOption)`), so a non-currency / malformed binary simply yields no receipts (never a crash,
+        * never a stall).
+        *
+        * '''Cross-shard predicate.''' A `SpendTransaction` carries `currencyId: Option[CurrencyId]`. `None` ⇒ DAG-hypergraph scope (no
+        * metagraph target ⇒ never a cross-shard MG write). `Some(M_y)` ⇒ the write targets metagraph `M_y`'s sync-data; it is cross-shard
+        * iff `shardAssignment.shardIdFor(M_y) =!= shardId` (this producer's own shard). The source MG is the included-chain key (`mg`),
+        * which belongs to this shard by construction (the shard-scoped binary buffer + newness gate). Same-shard targets are NOT emitted as
+        * receipts: gl0 still applies them via the in-shard `perMetagraphSyncDataDelta` path (a later slice) exactly as today's
+        * `updateFromSpendActions` does for co-located MGs.
+        *
+        * '''Increment shape (consumer-merge-compatible).''' The consumer folds each receipt via `MetagraphSyncManager.mergeSyncDataInfo`:
+        * monotone-max on the two scalar watermarks, UNION on `unappliedGlobalChangeOrdinals`. The unsharded `updateFromSpendActions`
+        * touches ONLY `unappliedGlobalChangeOrdinals` (adding the current global ordinal; the two scalars carry forward from the target's
+        * prior info). So the producer-side increment carries exactly the new information: `MetagraphSyncDataInfo.empty` (both scalars at
+        * `MinValue`) with `unappliedGlobalChangeOrdinals = SortedSet(gl0AnchorOrdinal)`. Under the consumer's max+union merge this adds
+        * `gl0AnchorOrdinal` to the target's set and leaves its scalars at their (larger) prior values — byte-identical end state to the
+        * unsharded path, and idempotent (re-applying the same set element is a no-op).
+        *
+        * '''Determinism (the §3.3 split invariant).''' `emittedReceipts` is inside the signed `ShardCheckpointSigPreimage`, so every
+        * committee member MUST produce the identical list. Every input is cluster-uniform: the decoded artifacts (a pure function of the
+        * signed binaries every member re-includes), `shardAssignment` (the cluster-wide `numShards` map), `gl0AnchorOrdinal` and
+        * `parentCheckpointHash` (both fixed on the envelope). The result is emitted one receipt per `(sourceMg, targetMg)` cross-shard
+        * pair, sorted canonically by `(sourceMg, targetMg)` so the list bytes are order-independent of map/iteration order.
+        * `sourceCheckpointHash` is set to `parentCheckpointHash` — a deterministic chain-link identifier for traceability (the receipt's
+        * `sourceCheckpointHash` is explicitly NOT consensus-load-bearing per the schema scaladoc; it cannot be this checkpoint's own hash
+        * because that hash is computed OVER `emittedReceipts`).
+        */
+      private def crossShardReceipts(
+        orderedSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+        gl0AnchorOrdinal: SnapshotOrdinal,
+        parentCheckpointHash: Hash
+      ): F[List[CrossShardReceipt]] = {
+        // The only new information this cross-shard write contributes to the target's sync-data: `gl0AnchorOrdinal` joins the target's
+        // `unappliedGlobalChangeOrdinals`. Empty scalars (MinValue) are absorbed by the consumer's monotone-max merge — see scaladoc.
+        val increment: MetagraphSyncDataInfo =
+          MetagraphSyncDataInfo.empty.copy(unappliedGlobalChangeOrdinals = SortedSet(gl0AnchorOrdinal))
+
+        orderedSnapshots.toList.flatTraverse {
+          case (sourceMg, snaps) =>
+            // Decode each binary to its currency incremental, read the SpendAction artifacts, and collect the cross-shard target MGs.
+            // `decodeArtifacts` is tolerant: a binary that is not a currency incremental yields no artifacts (no crash, no stall).
+            snaps.toList.flatTraverse(decodeArtifacts).flatMap { artifacts =>
+              val targets: List[Address] =
+                artifacts.collect { case sa: SpendAction => sa }.flatMap(_.spendTransactions.toList).flatMap(_.currencyId).map(_.value)
+              // Dedup target MGs per source — multiple SpendTransactions to the same target collapse to ONE receipt (the consumer groups
+              // by target anyway; one receipt per (source, target) keeps source traceability without redundant receipts).
+              targets.distinct.traverse { targetMg =>
+                (shardAssignment.shardIdFor(sourceMg), shardAssignment.shardIdFor(targetMg)).mapN { (srcShard, tgtShard) =>
+                  // Cross-shard iff the target metagraph lives in a DIFFERENT shard than this producing shard. Use the producer's own
+                  // `shardId` for the source side (the source MG belongs to this shard by construction); `srcShard` is computed only to
+                  // populate the receipt's `sourceShardId` and is == `shardId` here.
+                  Option.when(tgtShard =!= shardId) {
+                    CrossShardReceipt.MetagraphSyncDataWrite(
+                      sourceShardId = srcShard,
+                      sourceMetagraph = sourceMg,
+                      sourceCheckpointHash = parentCheckpointHash,
+                      targetShardId = tgtShard,
+                      targetMetagraph = targetMg,
+                      increment = increment
+                    )
+                  }
+                }
+              }.map(_.flatten)
+            }
+        }.map { writes =>
+          // CANONICAL ORDER (§3.3 determinism): sort by (sourceMg, targetMg) so the list bytes are independent of decode / iteration order.
+          // Every committee member sorts the same key tuple over the same receipt set ⇒ byte-identical `emittedReceipts`. Sorting the
+          // concrete `MetagraphSyncDataWrite` (the only `CrossShardReceipt` variant the producer emits) before widening keeps the sort key
+          // total — no sealed-trait match in total-function position.
+          writes.sortBy(w => (w.sourceMetagraph.value.value, w.targetMetagraph.value.value)): List[CrossShardReceipt]
+        }
+      }
+
+      /** Decode one included `Signed[StateChannelSnapshotBinary]` to its `Signed[CurrencyIncrementalSnapshot]` and return its
+        * `SharedArtifact`s (empty when the binary does not decode as a currency incremental — e.g. a genesis full-snapshot binary or a test
+        * stub). Mirrors `GlobalSnapshotStateChannelEventsProcessor.deserialize`
+        * (`JsonSerializer[F].deserialize[A](binary.value.content).map(_.toOption)`), so the producer reads byte-equivalent artifacts to the
+        * gl0 acceptance path.
+        */
+      private def decodeArtifacts(binary: Signed[StateChannelSnapshotBinary]): F[List[SharedArtifact]] =
+        JsonSerializer[F]
+          .deserialize[Signed[CurrencyIncrementalSnapshot]](binary.value.content)
+          .map(_.toOption.fold(List.empty[SharedArtifact])(_.value.artifacts.fold(List.empty[SharedArtifact])(_.toList)))
 
       /** Chain-link-order the buffered binaries off the gl0 DEPTH-K-FINALIZED-base per-MG tip (S2; EXECUTION-SHARDING design R-2).
         *

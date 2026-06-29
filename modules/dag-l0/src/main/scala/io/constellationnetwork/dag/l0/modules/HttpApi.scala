@@ -269,7 +269,7 @@ sealed abstract class HttpApi[
 
   // Exposes per-metagraph (CL1) currency-token balances gl0 mirrors in its MPT (`MgBalances`) but no longer keeps in the
   // `lastCurrencySnapshots` blob under roots-only sharding — so global peers can READ a metagraph-token balance (e.g. a data-application
-  // fee that lands in the metagraph token). The verifiable inclusion proof is `ShardProofRoutes`' job (not yet wired — follow-up).
+  // fee that lands in the metagraph token). The verifiable inclusion proof is `ShardProofRoutes`' job (now mounted below).
   private val currencyBalanceRoutes = GL0CurrencyBalanceRoutes(storages.globalSnapshot, services.pendingReader)
 
   // Chain-quality / finality-triggers observable (#138). Reads the FinalityTriggerView Ref
@@ -297,6 +297,14 @@ sealed abstract class HttpApi[
   // PULL it instead of waiting for GossipSub re-gossip. `services.shardAcceptanceDeps` is `None` at numShards=1.
   private val shardCheckpointRoutes =
     io.constellationnetwork.dag.l0.http.routes.ShardCheckpointRoutes[F](services.shardAcceptanceDeps)
+
+  // Slice 10/11 (cross-shard read transport): serve side of `POST /shard/{shardId}/proof` — generates an MPT
+  // inclusion proof for a (metagraph, key) under the shard's subtree, anchored at the shard's last committee-signed
+  // checkpoint's per-MG root. Reads `services.shardProofServiceRef`, populated by GlobalSnapshotConsensus.make ONLY
+  // on the sharding-active path; the route serves 503 while the Ref is `None` (numShards=1 / pre-startup). Mirrors
+  // `nipopowRoutes` / `globalFollowRoutes`: pure observability — never feeds back into consensus.
+  private val shardProofRoutes =
+    io.constellationnetwork.dag.l0.http.routes.ShardProofRoutes[F](services.shardProofServiceRef)
 
   private val walletRoutes = WalletRoutes[F, GlobalIncrementalSnapshot]("/dag", services.address)
   private val consensusInfoRoutes =
@@ -339,6 +347,7 @@ sealed abstract class HttpApi[
                 nipopowRoutes.publicRoutes <+>
                 globalFollowRoutes.publicRoutes <+>
                 shardCheckpointRoutes.publicRoutes <+>
+                shardProofRoutes.publicRoutes <+>
                 walletRoutes.publicRoutes <+>
                 nodeRoutes.publicRoutes <+>
                 consensusInfoRoutes.publicRoutes <+>

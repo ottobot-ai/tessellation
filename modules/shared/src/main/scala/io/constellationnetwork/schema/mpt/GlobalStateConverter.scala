@@ -1328,6 +1328,66 @@ object GlobalStateConverter {
       ).tupled
     }
 
+  /** True iff a `GlobalStateKey.fieldId` belongs to the per-MG shard-checkpoint commitment ([[currencySnapshotMgEntries]] /
+    * [[currencySnapshotMgRoot]]): the fieldId-5 incremental PLUS the 8 `infoSubFields` `Mg*` partitions — i.e. the SAME field set the flat
+    * `(incrementalRoot, infoRoot)` pair covered (`incrementalRoot` = fieldId-5, `infoRoot` = UNION over `infoSubFields`). DELIBERATELY
+    * excludes `MgGlobalSnapshotSyncView` (fieldId 32): it is NOT in `infoSubFields` and is observation-dependent (the producer accumulates
+    * it under the full committee, a re-deriving verifier under only the 2/3 signers — #259/cause-2), so folding it into the consensus root
+    * makes the root non-deterministic across nodes and re-froze the sharded per-MG adoption. Keeping the field set identical to
+    * `currencySnapshotFieldRoots` is what preserves PIN-1's determinism contract under the new commitment shape. See `infoSubFields`.
+    */
+  private def isCurrencyMgCommitmentField(fieldId: GlobalStateFieldId): Boolean =
+    fieldId == GlobalStateFieldId.LastIncrementalCurrencySnapshots || GlobalStateFieldId.infoSubFields.contains(fieldId)
+
+  /** The hex-keyed component entries committed by the per-MG shard-checkpoint root ([[currencySnapshotMgRoot]]). Encodes via
+    * [[currencySnapshotEntryBytes]] (gl0's EXACT producer bytes — the single byte source `currencySnapshotFieldRoots` also uses), hexes
+    * each key through `GlobalStateKey.toHex`, and keeps ONLY the [[isCurrencyMgCommitmentField]] entries (fieldId-5 incremental + the 8
+    * `infoSubFields` `Mg*` sub-fields; field-32 sync-view dropped for determinism). Each surviving entry is a distinct full-length MPT key
+    * — one leaf per `(metagraphAddr, subField, account)` plus the per-MG incremental — so the resulting trie is COMPONENT-ADDRESSABLE: a
+    * single account in a single field is an independently-provable leaf.
+    *
+    * This is the single source of truth for the bytes that back BOTH the committed root (producer + follower) AND the inclusion-proof trie
+    * (`ShardSubtreeProofService.generateProofForMetagraph` builds the proof over a trie made from these SAME bytes) — byte-identity by
+    * construction, not by two implementations kept in lockstep.
+    */
+  def currencySnapshotMgEntries[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    data: SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
+  )(
+    implicit stateProofSelector: StateProofSelector
+  ): F[Map[Hex, Array[Byte]]] =
+    currencySnapshotEntryBytes[F](data).flatMap { typed =>
+      typed.toList.filter { case (k, _) => isCurrencyMgCommitmentField(k.fieldId) }.parTraverse {
+        case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v)
+      }
+        .map(_.toMap)
+    }
+
+  /** PIN-1 component-addressable per-MG shard-checkpoint root: the `rootHash` of a standalone MPT built from [[currencySnapshotMgEntries]]
+    * (the MG's fieldId-5 incremental + `infoSubFields` `Mg*` entries, one leaf per account). This REPLACES the layer-mismatched flat
+    * `Hasher.hash((incrementalRoot, infoRoot))` that `perMetagraphMptRoots(mg)` previously carried: that flat 2-tuple hash could not back a
+    * single-leaf inclusion proof (the proof's witness chain hashes up to an MPT root, not to a hash-of-a-pair), so
+    * `ShardSubtreeProofService.verifyProof` could never witness a leaf against it. The new root IS a real MPT root, so a standard
+    * `MerklePatriciaInclusionProof` over the MG sub-trie witnesses any single `(field, account)` leaf against it — and the per-field
+    * subtree root is an internal node digest committed transitively, so the spec's "a single field-root (and a single account within it)"
+    * holds in ONE proof.
+    *
+    * '''Determinism (the byte-identity contract).''' Routes through [[fieldRootFromBytes]] — the SAME
+    * `MerklePatriciaTrie.makeParallelFromBytes` build + `Hash.empty`-on-empty convention every other per-field / global root uses — over
+    * [[currencySnapshotMgEntries]] (gl0's exact producer bytes, field-32-filtered). No node-local state enters, so producer + every
+    * verifier compute the byte-identical root. The THREE PIN-1 sites (producer `ShardCheckpointWiring.reExecDerivationWithDiff`, follower
+    * `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`, proof verifier/generator `ShardSubtreeProofService`) MUST all call THIS
+    * method so they stay byte-identical.
+    *
+    * '''numShards = 1 is untouched.''' At the production default `numShards = 1` gl0 re-executes and never builds `perMetagraphMptRoots`
+    * (`ShardCheckpointWiring.acceptanceDeps` returns `None`); this method is on the sharded path only.
+    */
+  def currencySnapshotMgRoot[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    data: SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
+  )(
+    implicit stateProofSelector: StateProofSelector
+  ): F[Hash] =
+    currencySnapshotMgEntries[F](data).flatMap(fieldRootFromBytes[F])
+
   /** DIAGNOSTIC-ONLY (version-model per-MG-root debug): per-sub-field root breakdown of a per-MG currency root, so an ADOPT-VERIFY /
     * re-exec root MISMATCH can be pinned to the EXACT diverging half (incremental vs info) and `Mg*` sub-field. NOT consensus — pure
     * logging. Mirrors [[currencySnapshotFieldRoots]]'s byte path so committee + gl0 outputs are directly comparable.

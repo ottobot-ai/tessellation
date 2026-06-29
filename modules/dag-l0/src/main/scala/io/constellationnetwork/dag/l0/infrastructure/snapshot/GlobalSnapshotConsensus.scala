@@ -239,6 +239,14 @@ object GlobalSnapshotConsensus {
     globalChangeSetServiceRef: Ref[F, Option[
       io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService[F]
     ]],
+    // Slice 10/11 (cross-shard read transport) — backing seam for `ShardProofRoutes` (`POST /shard/{id}/proof`).
+    // Populated below ONLY on the sharding-active path (`shardAcceptanceDeps = Some`), where the per-shard chain
+    // stores (the prover's checkpoint lookup) + the global MPT proof service are in scope. At numShards=1 it stays
+    // `None` and the route serves 503. Read by `ShardProofRoutes` (mounted in HttpApi). ADDITIVE / serve-only — a
+    // pure read of MPT + finalized shard-checkpoint state, never feeds back into consensus.
+    shardProofServiceRef: Ref[F, Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService[F]
+    ]],
     // Invoked by NakamotoSyncDaemon when a metagraph-binary arrives via gossip.
     // Routes the binary through the same pipeline as the HTTP endpoint (stateChannelService.process).
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
@@ -1417,6 +1425,61 @@ object GlobalSnapshotConsensus {
             globalChangeSetServiceRef.set(Some(changeSetService))
           }.toResource
 
+          // ─── Slice 10/11 — cross-shard subtree proof SERVE side (`POST /shard/{id}/proof`) ────
+          // Construct the `ShardSubtreeProofService` and publish it on `shardProofServiceRef` so `ShardProofRoutes`
+          // (mounted in HttpApi) can answer cross-shard proof queries. ONLY on the sharding-active path
+          // (`shardAcceptanceDeps = Some`); at numShards=1 the Ref stays `None` and the route serves 503.
+          //
+          // Wiring:
+          //   - prover MPT primitive = `HistoricalMptProofService(mptStore, mptOverlay)` — the SAME global-MPT
+          //     substrate the rest of gl0 proves against (v1 reuses the global trie; the per-MG subtree root in
+          //     the checkpoint is the verification anchor — design §8.5).
+          //   - shard-ownership oracle = `deps.shardAssignment` (the cluster-wide static map).
+          //   - checkpoint lookup = `ShardChainStore.bestTip` per shard, lifted to its `Signed[ShardCheckpoint]`
+          //     (the prover's scaladoc specifies exactly this — the shard's last committee-signed checkpoint).
+          //   - generation anchor = `(BranchId.base, finalizedOrdinal)`: the read-only serve anchors at gl0's
+          //     FINALIZED base trie (matches the route's "serve finalized state" contract + the §8.3 one-snapshot
+          //     read-after-write staleness bound). The ordinal is captured once here; the consumer re-verifies
+          //     every proof against gl0's OWN finalized `shardCheckpoints[shardId]` root regardless, so a slightly
+          //     stale generation anchor cannot widen the trust surface (a v2 refinement would make the anchor a
+          //     per-request callback once the service surface supports it).
+          // ADDITIVE / serve-only — a pure read of MPT + finalized shard-checkpoint state, never feeds back into
+          // consensus.
+          _ <- shardAcceptanceDeps match {
+            case None => Async[F].unit.toResource
+            case Some(deps) =>
+              implicit val shardHasher: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+              val lookupShardCheckpoint
+                : io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService.ShardCheckpointLookup[F] =
+                (sid: io.constellationnetwork.schema.sharding.ShardId) =>
+                  deps.registry.get(sid) match {
+                    case None =>
+                      Async[F].pure(
+                        none[io.constellationnetwork.security.signature.Signed[io.constellationnetwork.schema.sharding.ShardCheckpoint]]
+                      )
+                    case Some(entry) => entry.chainStore.bestTip.map(_.map(_.signed))
+                  }
+              // PIN-1: the proof is now built over the per-MG SUB-TRIE (component-addressable root), so the service needs a
+              // `perMgEntriesFor` that reconstructs `GlobalStateConverter.currencySnapshotMgEntries` from gl0's finalized state for the MG.
+              // DEFERRED to the cross-shard SpendAction-validator wiring (Wave 3, which also makes the proof value-bearing): until then this
+              // returns None, so the serve route 404s. Inert + matches the validator's still-noop proof client — nothing reads these proofs
+              // yet, and the whole arm is behind the `numShards > 1` (`Some(deps)`) gate.
+              val perMgEntriesFor
+                : io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService.PerMgEntriesLookup[F] =
+                (_: io.constellationnetwork.schema.address.Address) =>
+                  Async[F].pure(Option.empty[Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]])
+              val proofService = io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService.make[F](
+                shardAssignment = deps.shardAssignment,
+                lookupShardCheckpoint = lookupShardCheckpoint,
+                perMgEntriesFor = perMgEntriesFor
+              )
+              (shardProofServiceRef.set(Some(proofService)) >>
+                nakLogger.info(
+                  "sharding ACTIVE: ShardSubtreeProofService published (serve route POST /shard/{id}/proof live; " +
+                    "perMgEntriesFor deferred to cross-shard validator wiring ⇒ proofs 404 until then)"
+                )).toResource
+          }
+
           // ─── Gap A — per-shard checkpoint producers ──────────────────────────────────────────
           // Build one `ShardCheckpointProducer` per shard the operator tracks, REUSING the SAME
           // per-shard `ShardChainStore` the acceptance side (`shardAcceptanceDeps.registry`) reads —
@@ -1498,6 +1561,9 @@ object GlobalSnapshotConsensus {
                     .make[F](
                       shardId = shardId,
                       chainStore = entry.chainStore,
+                      // T7 (cross-shard receipts producer): the cluster-wide shard map so the producer can detect a
+                      // SpendAction whose target metagraph maps to a DIFFERENT shard and emit the cross-shard receipt.
+                      shardAssignment = deps.shardAssignment,
                       // S2 — BASE-ANCHORED window (VERSION-MODEL §4): the producer's `chainLinkOrder` anchors each MG's binary window on the
                       // gl0 DEPTH-K-FINALIZED base's per-MG `lastStateChannelSnapshotHashes` — the SAME finalized base `derivePerMgState`'s
                       // diff-prior reads (`fromMptStore(mptStore)` below). So window-anchor == diff-prior == follower apply-prior (S1), all on
@@ -1638,6 +1704,75 @@ object GlobalSnapshotConsensus {
                   ): Option[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]]
                 )
                 .flatTap(_ => nakLogger.info("🧩 Shard checkpoint attestation emitter built (numShards>1 active)"))
+                .toResource
+          }
+
+          // ─── WATCHTOWER fraud-proof wiring (numShards>1 AND watchtower-enabled) ────────────────────────────
+          // The PIN-1 per-MG re-derivation closure — IDENTICAL encoding to the sub-quorum re-exec the acceptance
+          // manager uses (`reExecDerivationWithDiff(...)._1`, finalized base reader), so the recomputed root is
+          // byte-comparable against the committee-attested `perMetagraphMptRoots`. Built here from the SAME shared
+          // `shardScEventsProcessor` + `mptStore` the produce path's `derivePerMgState` uses. This is BOTH the
+          // emitter's trigger basis (via the acceptance manager's `watchtowerReExec`) AND the on-chain verdict's
+          // re-derivation, so producer/watchtower/verdict all compute byte-identical roots.
+          watchtowerReDerive = {
+            implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+            val priorStateReader =
+              io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore)
+            val withDiff = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+              .reExecDerivationWithDiff[F](shardScEventsProcessor, priorStateReader)(
+                Async[F],
+                Parallel[F],
+                h,
+                implicitly[io.constellationnetwork.json.JsonSerializer[F]],
+                globalStateProofSelector
+              )
+            (
+              mg: io.constellationnetwork.schema.address.Address,
+              binaries: cats.data.NonEmptyList[
+                io.constellationnetwork.security.signature.Signed[io.constellationnetwork.statechannel.StateChannelSnapshotBinary]
+              ],
+              anchor: io.constellationnetwork.schema.SnapshotOrdinal
+            ) => withDiff(mg, binaries, anchor).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
+          }
+          watchtowerFraudProofEmitter <- (shardAcceptanceDeps, sharedCfg.nakamoto.invaliditySlashing.watchtowerEnabled) match {
+            case (Some(deps), true) =>
+              implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+              Async[F]
+                .pure(
+                  Some(
+                    io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofEmitter.make[F](
+                      selfPeerId = selfId,
+                      selfKeyPair = keyPair,
+                      acceptanceManager = deps.acceptanceManager,
+                      sidecarClient = sidecarClient
+                    )
+                  ): Option[io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofEmitter[F]]
+                )
+                .flatTap(_ => nakLogger.info("🛡️ Watchtower fraud-proof emitter built (numShards>1 + watchtower-enabled)"))
+                .toResource
+            case _ =>
+              Async[F]
+                .pure(Option.empty[io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofEmitter[F]])
+                .toResource
+          }
+          invalidStateProofValidator <- shardAcceptanceDeps match {
+            case Some(_) =>
+              implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+              Async[F]
+                .pure(
+                  Some(
+                    io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[F](
+                      reDerivePerMgRoot = watchtowerReDerive,
+                      slashedReader =
+                        io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader.neverSlashed[F]
+                    )
+                  ): Option[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
+                )
+                .flatTap(_ => nakLogger.info("🛡️ Invalid-state-proof dispute validator built (numShards>1 active)"))
+                .toResource
+            case None =>
+              Async[F]
+                .pure(Option.empty[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]])
                 .toResource
           }
 
@@ -1995,6 +2130,11 @@ object GlobalSnapshotConsensus {
                   // T_count_shard quorum closure: on best-tip receipt, sign + gossip our own attestation so
                   // peers cross ⌈2·K_S/3⌉. `None` at numShards=1 (regression bar) ⇒ no emit.
                   shardCheckpointAttestationEmitter = shardCheckpointAttestationEmitter,
+                  // WATCHTOWER (fraud-proof part 1 + 2): re-execute each adopted checkpoint on the quorum path +
+                  // gossip a FraudProofEnvelope on a per-MG root mismatch; the validator re-runs the deterministic
+                  // verdict on inbound fraud proofs. `None` at numShards=1 / watchtower-disabled.
+                  watchtowerFraudProofEmitter = watchtowerFraudProofEmitter,
+                  invalidStateProofValidator = invalidStateProofValidator,
                   // Per-ord producer fan-out (decoupled from gl0-leader win): EVERY node fans out shard
                   // checkpoints for each canonical (best-tip) gl0 ord it receives via gossip. Reuses the
                   // SAME `shardProducers` the leader loop uses + the `shardAssignment` off `shardAcceptanceDeps`.

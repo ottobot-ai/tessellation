@@ -693,12 +693,24 @@ object GlobalSnapshotAcceptanceManager {
                       .as((adoptedAcc, receiptsAcc, diffAcc))
 
                   case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, slashSigners) =>
-                    // Wrong-derivation result. Slashing evidence emission lands in Slice 16/17 (signer list surfaced here
-                    // for the future hook). This slice logs the rejection at warn so operators can spot the deviation.
+                    // Wrong-derivation result (sub-quorum re-exec path). The committee signers deviated from determinism and are the
+                    // 100% `InvalidStateProof` slash targets (§10.2). The deterministic LEDGER EFFECT is
+                    // `io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashManager.applySlash`
+                    // (stake reduction ×(1−slashFraction) + cooldown registry entry + bounty/burn), the SAME sink the WATCHTOWER quorum-path
+                    // dispute feeds via an on-chain `InvalidStateProofEvidence`.
+                    //
+                    // TODO(invalidity-slash durable application): apply `applySlash` here against the GSI `activeDelegatedStakes` /
+                    // `activeNodeCollaterals` maps being built and persist the slashed-registry entries to the `slashings` MPT partition
+                    // (fieldId 33) + thread the same write into the rebuild path (or the delta-path vs rebuild-path mptRoot diverges — the
+                    // known footgun). That write touches the 2800-line accept() comprehension + GlobalStateConverter + the rebuild path, so
+                    // it is sequenced as a dedicated follow-up rather than half-wired here. Until then the slash is COMPUTED + surfaced
+                    // (targets + reason) but the irreversible map mutation + MPT partition write are deferred. The pure manager + the
+                    // deterministic verdict + the watchtower detection are all in place; this is the remaining durable-ledger seam.
                     loggerBundle.app
                       .warn(
                         s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                          s"REJECTED-REEXEC-MISMATCH reason=$reason slashSigners=${slashSigners.size}"
+                          s"REJECTED-REEXEC-MISMATCH reason=$reason slashSigners=${slashSigners.size} " +
+                          s"(InvalidStateProof 100% tier — slash computed via InvalidStateProofSlashManager; durable MPT write = TODO)"
                       )
                       .as((adoptedAcc, receiptsAcc, diffAcc))
                 }
@@ -723,10 +735,11 @@ object GlobalSnapshotAcceptanceManager {
           * (`cp.derivedStateDelta.perMetagraphStateDiff(mg)`); EVERY gl0 node here APPLIES that diff onto its OWN copy of the prior
           * cumulative state `S(N)` (= `priorLastCurrencySnapshots(mg)`, the adopted chain-linked best-tip — PIN-4) via
           * [[ChangeSet.reconstructInfoFromDiff]], recomputes the per-MG root, and REQUIRES it `===` the committee-attested
-          * `perMetagraphMptRoots(mg)` (PIN-1, `Hasher.hash((incrementalRoot, infoRoot))` over the post-apply state). On match it ADOPTS the
-          * reconstructed `next` info; on mismatch (its `S(N)` lags the producer's — trim/reorg) it DROPS that MG's currency advance (never
-          * adopt unverified) and the leader re-offers later. Because the diff is the producer's authoritative output, every node lands on
-          * the byte-identical `next` — no per-node gate divergence, allow-spends/token-locks ACCUMULATE.
+          * `perMetagraphMptRoots(mg)` (PIN-1, `GlobalStateConverter.currencySnapshotMgRoot` — the component-addressable MG-sub-trie root —
+          * over the post-apply state). On match it ADOPTS the reconstructed `next` info; on mismatch (its `S(N)` lags the producer's —
+          * trim/reorg) it DROPS that MG's currency advance (never adopt unverified) and the leader re-offers later. Because the diff is the
+          * producer's authoritative output, every node lands on the byte-identical `next` — no per-node gate divergence,
+          * allow-spends/token-locks ACCUMULATE.
           *
           * '''Why `processCurrencySnapshots` still runs.''' It decodes the adopted binaries to produce the structural shell of the result
           * the rest of `accept()` consumes: the accepted SC-binary `NonEmptyList` (SC-tip advance), the per-binary `incomingCurrencyState`
@@ -837,8 +850,11 @@ object GlobalSnapshotAcceptanceManager {
                           activeTokenLocks = lastIncremental.value.authoritativeActiveTokenLocks.orElse(nextInfoRaw.activeTokenLocks)
                         )
                         nextState = Right((lastIncremental, nextInfo)): StateChannelAcceptanceResult.CurrencySnapshotWithState
-                        roots <- GlobalStateConverter.currencySnapshotFieldRoots[F](SortedMap(mg -> nextState))
-                        recomputed <- hasher.hash(roots) // (incrementalRoot, infoRoot) → single Some/None-invisible Hash (PIN-1)
+                        // PIN-1: recompute the COMPONENT-ADDRESSABLE per-MG root over the post-apply state via the SAME shared
+                        // `currencySnapshotMgRoot` the committee producer used (MG sub-trie rootHash over fieldId-5 + `infoSubFields` `Mg*`
+                        // entries) and REQUIRE it === the attested `perMetagraphMptRoots(mg)`. Byte-identical to the producer by construction
+                        // (one helper, same field-32-filtered bytes). Replaces the old flat `hash((incrementalRoot, infoRoot))`.
+                        recomputed <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> nextState))
                         out <-
                           if (recomputed === attestedRoot)
                             // GAP-1 verify-by-proof (committee-state-diff / authoritative* fields), gated PER FIELD to the AUTHORITATIVE path:
@@ -2058,6 +2074,19 @@ object GlobalSnapshotAcceptanceManager {
                 activeAllowSpendsFromCurrencySnapshots = currencySnapshots
                   .mapFilter(_.toOption.flatMap { case (_, info) => info.activeAllowSpends })
 
+                // Per-metagraph PINNED global epoch: the epoch each metagraph used to expire its OWN
+                // allow-spends/token-locks (`CurrencySnapshotAcceptanceManager.lastGlobalSnapshotEpochProgress =
+                // lastSyncGlobalSnapshot.epochProgress`), surfaced on the signed snapshot as `globalSyncView.epochProgress`.
+                // Sourced from the SAME `currencySnapshots` the allow-spends are folded from, so it's the deterministic,
+                // consensus-pinned, signed value every gl0 node sees identically. Threaded into the metagraph-scoped allow-spend
+                // expiry so a metagraph trailing the global tip is NOT over-pruned against gl0's live global epoch (the "m0
+                // frozen" wedge). `Left`/full (genesis) and `Right`/incremental both carry `globalSyncView`; `None` ⇒ omitted,
+                // and the manager falls back to the live epoch for that metagraph.
+                metagraphPinnedEpochProgresses: Map[Address, EpochProgress] = currencySnapshots.toList.mapFilter {
+                  case (metagraphId, Left(signed))       => signed.value.globalSyncView.map(gsv => metagraphId -> gsv.epochProgress)
+                  case (metagraphId, Right((signed, _))) => signed.value.globalSyncView.map(gsv => metagraphId -> gsv.epochProgress)
+                }.toMap
+
                 globalAllowSpends = acceptedGlobalAllowSpends
                   .groupBy(_.value.source)
                   .view
@@ -2099,7 +2128,8 @@ object GlobalSnapshotAcceptanceManager {
                   globalAllowSpends,
                   globalActiveAllowSpends,
                   allAcceptedSpendTxns,
-                  expiredAllowSpendsHoisted
+                  expiredAllowSpendsHoisted,
+                  metagraphPinnedEpochProgresses
                 )
                 updatedAllowSpends = allowSpendAcceptanceResult.fullState
                 allowSpendsDeltas = allowSpendAcceptanceResult.deltas

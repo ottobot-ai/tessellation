@@ -29,8 +29,9 @@ import org.http4s.dsl.Http4sDsl
   * combined view). So a metagraph-token balance — e.g. a data-application fee that lands in the metagraph token — is held by gl0 but had no
   * read surface. This is that surface: "whatever touches CL1 is tessellation-level, so the global layer knows it." This serves the value
   * (the "known" half); the VERIFIABLE half — an MPT inclusion proof of the `MgBalances` key against the shard checkpoint root — is what
-  * [[ShardProofRoutes]] (`POST /shard/{shardId}/proof`) is built for, though that route + its `ShardSubtreeProofService` are not yet wired
-  * into the gl0 server (follow-up).
+  * [[ShardProofRoutes]] (`POST /shard/{shardId}/proof`) is built for. That route + its `ShardSubtreeProofService` are now wired into the
+  * gl0 server on the sharding-active path (`numShards > 1`); at `numShards = 1` the proof route serves 503 (no shard committees to prove
+  * against).
   *
   * '''Endpoint''': `GET /currency/{metagraphId}/balance/{address}` → `{ "metagraphId", "address", "balance": <long> }`. Balance is `0` when
   * the metagraph or address is absent (no proof-of-absence in v1 — `0` is the read default). `503` before the snapshot head exists

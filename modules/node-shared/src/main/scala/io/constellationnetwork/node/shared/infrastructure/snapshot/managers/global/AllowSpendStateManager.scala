@@ -41,7 +41,8 @@ trait AllowSpendStateManager[F[_]] {
     activeAllowSpendsFromCurrencySnapshots: SortedMap[Address, SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
     globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
     lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
-    allAcceptedSpendTxns: List[SpendTransaction]
+    allAcceptedSpendTxns: List[SpendTransaction],
+    metagraphPinnedEpochProgresses: Map[Address, EpochProgress]
   )(implicit hasher: Hasher[F]): F[AllowSpendAcceptanceResult]
 
   /** Hoisted variant of `acceptAllowSpends` that takes a pre-computed `expiredGlobalAllowSpends` set, avoiding the redundant
@@ -51,6 +52,14 @@ trait AllowSpendStateManager[F[_]] {
     *
     * Behavioural equivalent of `acceptAllowSpends(...)` when the passed `expiredGlobalAllowSpends` matches
     * `findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress)`.
+    *
+    * `metagraphPinnedEpochProgresses` maps a metagraph address to the epoch the metagraph itself used when it expired its OWN allow-spends
+    * — its pinned `globalSyncView.epochProgress` (the SAME value `CurrencySnapshotAcceptanceManager` reads as
+    * `lastGlobalSnapshotEpochProgress
+    * \= lastSyncGlobalSnapshot.epochProgress`). The METAGRAPH-scoped expiry filter (`processMetagraphAllowSpends`) uses this pinned epoch
+    * per `Some(mg)`, NOT the live global `epochProgress`, so a metagraph trailing the global tip doesn't have its allow-spends over-pruned
+    * (the "m0 frozen" wedge). A metagraph absent from the map (genesis / pre-`globalSyncView` snapshot) falls back to the live
+    * `epochProgress` — the prior behaviour. The DAG-global scope (`None`) is unaffected and keeps the live global `epochProgress`.
     */
   def acceptAllowSpendsWithExpired(
     epochProgress: EpochProgress,
@@ -58,7 +67,8 @@ trait AllowSpendStateManager[F[_]] {
     globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
     lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
     allAcceptedSpendTxns: List[SpendTransaction],
-    expiredGlobalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]]
+    expiredGlobalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
+    metagraphPinnedEpochProgresses: Map[Address, EpochProgress]
   )(implicit hasher: Hasher[F]): F[AllowSpendAcceptanceResult]
 
   def acceptAllowSpendRefs(
@@ -133,7 +143,8 @@ object AllowSpendStateManager {
       activeAllowSpendsFromCurrencySnapshots: SortedMap[Address, SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
       globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
       lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
-      allAcceptedSpendTxns: List[SpendTransaction]
+      allAcceptedSpendTxns: List[SpendTransaction],
+      metagraphPinnedEpochProgresses: Map[Address, EpochProgress]
     )(implicit hasher: Hasher[F]): F[AllowSpendAcceptanceResult] =
       findExpiredGlobalAllowSpendsViaIndexFromMpt(previousEpochProgress, epochProgress).flatMap { expired =>
         acceptAllowSpendsWithExpired(
@@ -142,7 +153,8 @@ object AllowSpendStateManager {
           globalAllowSpends,
           lastActiveAllowSpends,
           allAcceptedSpendTxns,
-          expired
+          expired,
+          metagraphPinnedEpochProgresses
         )
       }
 
@@ -152,7 +164,8 @@ object AllowSpendStateManager {
       globalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
       lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
       allAcceptedSpendTxns: List[SpendTransaction],
-      expiredGlobalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]]
+      expiredGlobalAllowSpends: SortedMap[Address, SortedSet[Signed[AllowSpend]]],
+      metagraphPinnedEpochProgresses: Map[Address, EpochProgress]
     )(implicit hasher: Hasher[F]): F[AllowSpendAcceptanceResult] = {
       val allAcceptedSpendTxnsAllowSpendsRefs =
         allAcceptedSpendTxns
@@ -195,12 +208,18 @@ object AllowSpendStateManager {
           val lastActiveMetagraphAllowSpends =
             accAllowSpends.getOrElse(metagraphId.some, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
 
+          // Expire this metagraph's allow-spends against the epoch the METAGRAPH itself pinned (its
+          // `globalSyncView.epochProgress`, == ml0's `lastGlobalSnapshotEpochProgress`), NOT gl0's live global epoch.
+          // A metagraph trailing the global tip pins a LOWER epoch; using the live (higher) epoch over-prunes its
+          // active allow-spends and wedges its currency fold. Absent (genesis / pre-`globalSyncView`) ⇒ live epoch.
+          val metagraphEpochProgress = metagraphPinnedEpochProgresses.getOrElse(metagraphId, epochProgress)
+
           metagraphAllowSpends.toList.traverse {
             case (address, addressAllowSpends) =>
               val lastAddressAllowSpends = lastActiveMetagraphAllowSpends.getOrElse(address, SortedSet.empty[Signed[AllowSpend]])
 
               val unexpired = (lastAddressAllowSpends ++ addressAllowSpends)
-                .filter(_.lastValidEpochProgress >= epochProgress)
+                .filter(_.lastValidEpochProgress >= metagraphEpochProgress)
 
               val unexpiredWithoutSpendTransactions = unexpired.toList
                 .traverse(_.toHashed)

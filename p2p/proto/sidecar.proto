@@ -277,6 +277,37 @@ message ShardCheckpointAttestationWire {
   CommitteeMemberSignatureWire attester_signature = 3;
 }
 
+// ─── WATCHTOWER fraud-proof wire format ─────────────────────────────
+//
+// A non-committee gl0 node's challenge to a quorum-signed shard checkpoint
+// whose attested per-MG derivation it could not reproduce. Mirrors the Scala
+// `io.constellationnetwork.schema.sharding.FraudProofEnvelope` (a small
+// fixed-field message — all fields are structured, no opaque JSON, because the
+// dispute consumer needs them typed to recompute the verdict). Gossipped on the
+// gl0-wide `fraud-proof` topic so EVERY gl0 receives + independently re-runs the
+// deterministic verdict (WATCHTOWER-FRAUD-PROOF-DESIGN.md §10.2).
+//
+// Wire-format conventions follow the existing patterns:
+//   - Hash / hex fields: UTF-8 of the canonical hex (`Hash.getBytes`), matching
+//     `ShardCheckpointAttestationWire.checkpoint_hash`.
+//   - `submitter_id`: raw PeerId bytes (receiver hex-encodes back), matching
+//     `CommitteeMemberSignatureWire.peer_id`.
+//   - sig/witness fields: raw bytes (`.toBytes` / `Hex.fromBytes`).
+//
+// Greenfield: field set/numbers pinned to v1; add `FraudProofEnvelopeWire2` to
+// evolve rather than mutating in place.
+message FraudProofEnvelopeWire {
+  uint32 shard_id = 1;
+  bytes disputed_checkpoint_hash = 2;    // UTF-8 of canonical Hasher[F] of ShardCheckpointSigPreimage
+  string metagraph_address = 3;          // DAG base58 string
+  uint64 gl0_anchor_ordinal = 4;
+  bytes claimed_derivation = 5;          // UTF-8 of committee-attested per-MG root hex (hint, untrusted)
+  bytes challenger_derivation = 6;       // UTF-8 of challenger's honest reference root hex (hint, untrusted)
+  bytes reexecution_witness = 7;         // raw witness bytes
+  bytes challenger_signature = 8;        // raw Ed25519 over FraudProofSigPreimage
+  bytes submitter_id = 9;                // raw PeerId bytes; receiver hex-encodes back
+}
+
 // Envelope for GossipSub messages.
 message GossipMessage {
   oneof body {
@@ -290,6 +321,7 @@ message GossipMessage {
     TokenLockBlock token_lock_block = 8;
     ShardCheckpointWire shard_checkpoint = 9;                  // Slice 14
     ShardCheckpointAttestationWire shard_checkpoint_attestation = 10;  // Slice 14
+    FraudProofEnvelopeWire fraud_proof = 11;                   // WATCHTOWER fraud-proof
   }
 }
 
@@ -340,6 +372,11 @@ service SidecarService {
   // envelope. Receivers tally toward the per-checkpoint `≥ ⌈2/3 K_S⌉` quorum
   // (see Slice 9's `ShardCheckpointGl0AcceptanceManager`).
   rpc PublishShardCheckpointAttestation(ShardCheckpointAttestationWire) returns (PublishResponse);
+
+  // WATCHTOWER: publish a fraud proof on the gl0-wide `fraud-proof` topic. EVERY
+  // gl0 receives it and independently re-runs the deterministic verdict over the
+  // disputed checkpoint's own bytes (WATCHTOWER-FRAUD-PROOF-DESIGN.md §10.2).
+  rpc PublishFraudProof(FraudProofEnvelopeWire) returns (PublishResponse);
 
   // JVM tells sidecar that the listed message_ids on `topic` reached Phase-3
   // finality. The sidecar drops the corresponding outbox entries; until this

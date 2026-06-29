@@ -55,6 +55,27 @@ object ShardCheckpointAcceptResult {
   final case class RejectedReExecutionMismatch(reason: String, slashSigners: List[PeerId]) extends ShardCheckpointAcceptResult
 }
 
+/** WATCHTOWER approval-check finding — one per metagraph whose committee-attested per-MG root the watchtower re-execution did NOT
+  * reproduce.
+  *
+  * Emitted by [[ShardCheckpointGl0AcceptanceManager.watchtowerReExec]], which runs the per-MG re-derivation on the QUORUM-accepted path
+  * (the whole point: catch a quorum-signed WRONG root that `verifyEmbedded` admitted on signatures alone, without re-execution). The daemon
+  * turns each mismatch into a [[io.constellationnetwork.schema.sharding.FraudProofEnvelope]] it signs + gossips.
+  *
+  * @param metagraphAddress
+  *   the metagraph whose derivation diverged
+  * @param attestedRoot
+  *   the committee-signed `perMetagraphMptRoots(metagraphAddress)` (the claim)
+  * @param reDerivedRoot
+  *   the root this node re-derived (the honest value) — same PIN-1 encoding as the attested root (the closure is the SAME one the
+  *   sub-quorum re-exec uses, so the comparison is byte-meaningful)
+  */
+final case class WatchtowerMismatch(
+  metagraphAddress: io.constellationnetwork.schema.address.Address,
+  attestedRoot: Hash,
+  reDerivedRoot: Hash
+)
+
 /** gl0-side admission of [[ShardCheckpoint]]s — Slice 9 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §7 (especially §7.3).
   *
   * Sits between the shard committee's checkpoint gossip and the gl0 leader's per-ord accept loop. For each candidate checkpoint included in
@@ -126,6 +147,30 @@ trait ShardCheckpointGl0AcceptanceManager[F[_]] {
     */
   def verifyEmbedded(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult]
 
+  /** WATCHTOWER approval-check (fraud-proof part 1) — re-execute the per-MG derivation for an ADOPTED/finalized checkpoint and surface
+    * every metagraph whose committee-attested `perMetagraphMptRoots` this node did NOT reproduce.
+    *
+    * '''Why this exists separately from [[verifyEmbedded]].''' `verifyEmbedded` admits on `kQuorum` distinct committee signatures WITHOUT
+    * re-execution (the common path) — so a corrupt committee that reaches quorum can attest a WRONG root and have it adopted. This method
+    * runs the re-execution EVEN WHEN QUORUM WAS MET (the whole point): a non-committee gl0 node calls it for each adopted checkpoint, and a
+    * mismatch is the fraud-proof trigger. It reuses the EXACT `reExecuteDerivation` closure the sub-quorum re-exec path uses
+    * (`ShardCheckpointWiring.reExecDerivationWithDiff(...)._1`, PIN-1 encoding, seeded from this node's FINALIZED base), so the recomputed
+    * root is byte-comparable against the attested one.
+    *
+    * '''Determinism / no-false-positive contract.''' The closure reads only the FINALIZED base for the `S(N)` prior + the checkpoint's own
+    * binaries (no live snapshot lookup). Run on a node that has ADOPTED the checkpoint's base (the in-order chain-hole-guard invariant
+    * guarantees the adopting node's finalized `S(N)` equals the producer's diff base), so an honest checkpoint re-derives to the SAME root
+    * ⇒ no mismatch ⇒ no fraud proof. A node still catching up (its `S(N)` lags) may transiently mismatch; the closure already maps a
+    * non-derivable/contiguity-gap MG to `Hash.empty` (the `reExecDerivationWithDiff` OMIT path), so a lag yields `Hash.empty` rather than a
+    * spurious wrong root — the caller filters `reDerivedRoot == Hash.empty` to avoid disputing on incomplete local state (a missing
+    * re-derivation is "I can't check this", NOT "the committee is wrong"). The on-chain VERDICT
+    * ([[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator]]) is the deterministic adjudicator; this
+    * method is the node-local TRIGGER and may be conservative.
+    *
+    * Empty `includedSnapshots` (a T_alive liveness ping) ⇒ no MGs to re-execute ⇒ empty list.
+    */
+  def watchtowerReExec(checkpoint: ShardCheckpoint): F[List[WatchtowerMismatch]]
+
   /** Record that a checkpoint at `shardOrdinal` for `shardId` was ADOPTED into a global snapshot on this node's accept path (leader-create
     * AND follower-validate both call it via `adoptShardCheckpoints`). Max-monotone — replays of earlier ordinals (proposal/validation/reorg
     * re-runs) never move the watermark backwards. Node-local observability; never read by any consensus-deterministic decision (the
@@ -178,12 +223,12 @@ object ShardCheckpointGl0AcceptanceManager {
     *   `(metagraphAddress, includedChain, gl0AnchorOrdinal) => F[Hash]`. Called only on the sub-quorum `T_depth1`-only failover
     *   ([[reExecPath]]). Production wiring (STEP 6) passes the closure that re-runs `ShardCheckpointWiring.reExecDerivationWithDiff` (the
     *   SAME committee derivation the producer uses, seeded from this node's adopted `S(N)`) and returns its per-MG root — the PIN-1
-    *   `Hasher.hash((incrementalRoot, infoRoot))` encoding — which is then compared byte-for-byte against the committee-signed
-    *   `perMetagraphMptRoots(mg)` (the SAME encoding). The `ChangeSet` half of the derivation is discarded here (this Byzantine failover
-    *   only needs the Hash to decide accept/slash; the authoritative apply-and-verify of the carried diff happens in
-    *   `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`). An attestation means "I independently re-derived this metagraph's
-    *   state and got root R". For tests: stub the callback to return a known hash (matching or not matching the checkpoint root) per
-    *   scenario.
+    *   COMPONENT-ADDRESSABLE `GlobalStateConverter.currencySnapshotMgRoot` (the MG-sub-trie rootHash) — which is then compared
+    *   byte-for-byte against the committee-signed `perMetagraphMptRoots(mg)` (the SAME root). The `ChangeSet` half of the derivation is
+    *   discarded here (this Byzantine failover only needs the Hash to decide accept/slash; the authoritative apply-and-verify of the
+    *   carried diff happens in `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`). An attestation means "I independently
+    *   re-derived this metagraph's state and got root R". For tests: stub the callback to return a known hash (matching or not matching the
+    *   checkpoint root) per scenario.
     */
   def make[F[_]: Async: Hasher: SecurityProvider: Metrics](
     finalityTriggers: ShardId => F[Option[ShardFinalityTriggers[F]]],
@@ -336,6 +381,38 @@ object ShardCheckpointGl0AcceptanceManager {
                 }
               }
           }
+
+        def watchtowerReExec(checkpoint: ShardCheckpoint): F[List[WatchtowerMismatch]] = {
+          val included = checkpoint.derivedStateDelta.includedSnapshots
+          val claimedRoots = checkpoint.derivedStateDelta.perMetagraphMptRoots
+          // Re-derive every MG's per-MG root via the SAME closure the sub-quorum re-exec uses (PIN-1 encoding, finalized base). This runs
+          // unconditionally — even when quorum was met — which is the whole point of the watchtower: catch a quorum-signed wrong root.
+          included.toList.traverse {
+            case (mg, snaps) =>
+              reExecuteDerivation(mg, snaps, checkpoint.gl0AnchorOrdinal).map { reDerived =>
+                claimedRoots.get(mg) match {
+                  // `Hash.empty` from the closure = "this node can't derive this MG yet" (contiguity gap / lagging S(N) / OMIT path), NOT
+                  // "the committee is wrong" — filter it out so the watchtower never disputes on incomplete local state.
+                  case _ if reDerived === Hash.empty            => None
+                  case Some(attested) if attested === reDerived => None
+                  case Some(attested)                           => Some(WatchtowerMismatch(mg, attested, reDerived))
+                  // Included binaries but no attested root for this MG — structurally invalid; surface with Hash.empty as the attested
+                  // sentinel so the daemon can raise a dispute (the verdict's `None`-attested branch upholds it).
+                  case None => Some(WatchtowerMismatch(mg, Hash.empty, reDerived))
+                }
+              }
+          }
+            .map(_.flatten)
+            .flatTap { mismatches =>
+              Async[F].whenA(mismatches.nonEmpty) {
+                logger.warn(
+                  s"🛡️ WATCHTOWER re-exec MISMATCH: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} " +
+                    s"mismatchedMgs=${mismatches.map(_.metagraphAddress.value.value.take(10)).mkString(",")} " +
+                    s"(quorum-signed root not reproduced — raising fraud proof)"
+                )
+              }
+            }
+        }
 
         /** Pre-check pipeline: for each `CommitteeMemberSignature` in `checkpoint.committeeSignatures`, run four predicates in order
           * (cheapest first):

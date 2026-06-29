@@ -287,9 +287,10 @@ object SharedServices {
         etaForEpoch = (epoch: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
           sharedEtaForPeriod(epoch).map(h => io.constellationnetwork.security.hex.Hex(h.value).toBytes),
         // STEP 6: the sub-quorum re-exec failover (`ShardCheckpointGl0AcceptanceManager.reExecPath`) byte-compares the recomputed
-        // per-MG root against the committee-attested `perMetagraphMptRoots(mg)`, which is now the PIN-1
-        // `Hasher.hash((incrementalRoot, infoRoot))` encoding (NOT the old `hash((mg,state))`). So the verifier re-exec MUST produce
-        // the SAME encoding — `reExecDerivationWithDiff(...)._1` is exactly that root (it seeds the derivation from this node's
+        // per-MG root against the committee-attested `perMetagraphMptRoots(mg)`, which is now the PIN-1 COMPONENT-ADDRESSABLE
+        // `GlobalStateConverter.currencySnapshotMgRoot` (the MG-sub-trie rootHash; NOT the old flat `hash((incrementalRoot, infoRoot))`,
+        // and NOT the `hash((mg,state))` `deriveMetagraphRoot` emits). So the verifier re-exec MUST produce the SAME root —
+        // `reExecDerivationWithDiff(...)._1` is exactly that root (it seeds the derivation from this node's
         // adopted S(N) via the finalized `GlobalStateReader`, identical to the producer's). We discard its `ChangeSet` half (the
         // sub-quorum compare only needs the Hash; the authoritative apply-and-verify of the diff happens in
         // `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`). Same shared processor as GSAM ⇒ producer↔verifier roots

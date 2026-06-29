@@ -51,10 +51,13 @@ object FraudProofEnvelopeWireSuite extends FunSuite {
     FraudProofEnvelope(
       shardId = ShardId.unsafeApply(3),
       disputedCheckpointHash = hash('d'),
+      metagraphAddress = io.constellationnetwork.schema.address.Address.fromBytes("mg-fraud-wire".getBytes("UTF-8")),
+      gl0AnchorOrdinal = io.constellationnetwork.schema.SnapshotOrdinal.unsafeApply(7L),
       claimedDerivation = hash('c'),
       challengerDerivation = hash('x'),
       reexecutionWitness = hex("dead" * 32),
-      challengerSignature = hex("beef" * 32)
+      challengerSignature = hex("beef" * 32),
+      submitterId = io.constellationnetwork.schema.peer.PeerId(io.constellationnetwork.security.hex.Hex("ab" * 64))
     )
 
   // The set of required JSON keys for [[FraudProofEnvelope]]. Pinned here (rather than read from the encoder's output) so that a typo or

@@ -270,6 +270,8 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       shardId: io.constellationnetwork.schema.sharding.ShardId
     ): IO[Option[io.constellationnetwork.security.hash.Hash]] =
       IO.pure(None)
+    override def watchtowerReExec(checkpoint: ShardCheckpoint): IO[List[WatchtowerMismatch]] =
+      IO.pure(List.empty[WatchtowerMismatch])
   }
 
   /** Build the manager-under-test with the Slice 13 sharding deps, using the captor processor (records `process` events + adopted

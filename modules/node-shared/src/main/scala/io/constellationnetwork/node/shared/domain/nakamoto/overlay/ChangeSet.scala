@@ -143,9 +143,10 @@ object ChangeSet {
     *
     * '''Round-trip invariant (the step-6 determinism core).''' `reconstructInfoFromDiff(mg, prior, currencyInfoChangeSet(mg, prior, next))
     * \=== next` for every `(prior, next)` — so every gl0 verifier that holds the SAME `S(N)` as the producer reconstructs the
-    * byte-identical `next`, and its `currencySnapshotFieldRoots` infoRoot equals the committee-attested `perMetagraphMptRoots` (PIN-1). A
-    * verifier whose `S(N)` DIFFERS (trim / reorg — its best-tip lags the producer's) reconstructs a DIFFERENT `next`, the root mismatches,
-    * and the checkpoint is rejected (never adopt unverified) — self-healing via defer + re-pull, no double-count, no split.
+    * byte-identical `next`, and its `GlobalStateConverter.currencySnapshotMgRoot` equals the committee-attested `perMetagraphMptRoots`
+    * (PIN-1, the component-addressable per-MG sub-trie root). A verifier whose `S(N)` DIFFERS (trim / reorg — its best-tip lags the
+    * producer's) reconstructs a DIFFERENT `next`, the root mismatches, and the checkpoint is rejected (never adopt unverified) —
+    * self-healing via defer + re-pull, no double-count, no split.
     */
   def reconstructInfoFromDiff[F[_]: Sync: Hasher](
     mgAddr: Address,

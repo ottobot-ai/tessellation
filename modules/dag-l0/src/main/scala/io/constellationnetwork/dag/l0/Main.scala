@@ -169,6 +169,14 @@ object Main
       globalChangeSetServiceRef <- Ref
         .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService[IO]]](None)
         .asResource
+      // Slice 10/11 (cross-shard read transport) — backing seam for `ShardProofRoutes`
+      // (`POST /shard/{shardId}/proof`). Populated inside GlobalSnapshotConsensus.make once the per-shard
+      // chain stores + MPT proof service are wired (only on the sharding-active path; stays `None` at
+      // numShards=1, so the route serves 503). Shared between Services and HttpApi exactly like
+      // `globalFollowSliceServiceRef`; it IS the Ref the route reads.
+      shardProofServiceRef <- Ref
+        .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService[IO]]](None)
+        .asResource
       storages <- Storages
         .make[IO](
           sharedStorages,
@@ -234,6 +242,7 @@ object Main
           nipopowProofProviderRef,
           globalFollowSliceServiceRef,
           globalChangeSetServiceRef,
+          shardProofServiceRef,
           kesRegistry,
           // Split-safety (#261, eta axis): install the leader's chain-walk into the follower / `createContext`
           // GSAM's deferred committee-eta resolver (the Ref created in `TessellationIOApp.make`, exposed on

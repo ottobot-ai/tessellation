@@ -191,10 +191,13 @@ object ShardingCodecsSuite extends FunSuite {
     FraudProofEnvelope(
       shardId = shardZero,
       disputedCheckpointHash = hash('d'),
+      metagraphAddress = io.constellationnetwork.schema.address.Address.fromBytes("mg-fraud-codec".getBytes("UTF-8")),
+      gl0AnchorOrdinal = io.constellationnetwork.schema.SnapshotOrdinal.unsafeApply(7L),
       claimedDerivation = hash('c'),
       challengerDerivation = hash('x'),
       reexecutionWitness = hex("dead" * 32),
-      challengerSignature = hex("beef" * 32)
+      challengerSignature = hex("beef" * 32),
+      submitterId = io.constellationnetwork.schema.peer.PeerId(io.constellationnetwork.security.hex.Hex("ab" * 64))
     )
 
   // ---- Generic round-trip helper -------------------------------------------

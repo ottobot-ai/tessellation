@@ -92,6 +92,7 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
       def publishShardCheckpoint(msg: ShardCheckpointWire) = IO.pure(PublishResponse(ok = true))
       def publishShardCheckpointAttestation(msg: ShardCheckpointAttestationWire) =
         ref.update(msg :: _).as(PublishResponse(ok = true))
+      def publishFraudProof(msg: FraudProofEnvelopeWire) = IO.pure(PublishResponse(ok = true))
       def confirmFinalized(topic: String, msgIds: List[Array[Byte]]) = IO.pure(ConfirmFinalizedResponse(dropped = msgIds.size))
       def health = IO.pure(HealthResponse(healthy = true))
       def peers = IO.pure(PeerCountResponse(total = 0))

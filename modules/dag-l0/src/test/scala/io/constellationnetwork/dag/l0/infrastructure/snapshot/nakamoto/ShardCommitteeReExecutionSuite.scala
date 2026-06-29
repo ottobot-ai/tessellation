@@ -13,9 +13,9 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotStat
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.ChangeSet
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding._
+import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, ShardAssignment}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.node.shared.infrastructure.sharding.{
   ShardCheckpointProducer,
@@ -132,10 +132,13 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
     chainStore: ShardChainStore[IO],
     keyPair: KeyPair,
     reExec: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash]
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
+  )(implicit h: Hasher[IO], sp: SecurityProvider[IO], j: JsonSerializer[IO]): IO[ShardCheckpointProducer[IO]] =
     ShardCheckpointProducer.make[IO](
       shardId = shardZero,
       chainStore = chainStore,
+      // Single-shard (only shardZero exists in this suite) ⇒ every target maps to shardZero ⇒ no cross-shard receipts. The real
+      // currency-genesis binaries decode (full snapshots, no artifacts) and opaque binaries don't ⇒ `emittedReceipts` stays empty.
+      shardAssignment = ShardAssignment.make[IO](numShards = 1),
       finalizedBasePerMgTip = chainStore.perMgTip, // re-exec suite asserts perMgTip-anchored chain-linking (pre-S2 parity)
       adoptedPerMgTip = chainStore.perMgTip, // == window anchor ⇒ newness gate is a no-op here (S2-deadlock fix, 2026-06-15)
       slotLeader = ssl,

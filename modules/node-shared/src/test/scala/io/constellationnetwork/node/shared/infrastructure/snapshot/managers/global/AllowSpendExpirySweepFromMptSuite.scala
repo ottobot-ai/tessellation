@@ -247,7 +247,8 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
         emptyCurrencySnapshots,
         emptyGlobalAllowSpends,
         lastActiveOuter,
-        emptySpendTxns
+        emptySpendTxns,
+        Map.empty[Address, EpochProgress]
       )
       // Expected post-state: addr1 keeps only asValidA (asExpiredA is swept), addr2 keeps asValidB.
       expectedGlobal = SortedMap(
@@ -298,7 +299,8 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
         emptyCurrencySnapshots,
         emptyGlobalAllowSpends,
         lastActiveOuter,
-        emptySpendTxns
+        emptySpendTxns,
+        Map.empty[Address, EpochProgress]
       )
       expectedHashed <- asExpiredA.toHashed
       expectedKey = AllowSpendExpiryKey(None, addr1, expectedHashed.hash)

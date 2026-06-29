@@ -267,6 +267,27 @@ object GlobalStateFieldId {
   case object MgLastMessages extends GlobalStateFieldId { def toInt: Int = 31 }
   case object MgGlobalSnapshotSyncView extends GlobalStateFieldId { def toInt: Int = 32 }
 
+  /** Cross-shard single-use SPENT-SET for consumed allow-spends — the global, hypergraph-namespaced "nullifier" partition keyed by the
+    * allow-spend '''hash'''. Where [[ActiveAllowSpends]] (fieldId 7) holds the still-spendable allow-spends keyed by source `Address`
+    * (`SortedSet[Signed[AllowSpend]]` per `(Option[metagraph], source)`), this partition records that a specific allow-spend has ALREADY
+    * been consumed, so a cross-shard SPEND cannot replay it on a second shard. The marker is keyed by the allow-spend's content `Hash` (the
+    * single-use identity that is stable across shards), '''not''' by the holder address — hence the dedicated
+    * [[GlobalStateKey.consumedAllowSpendKey]] hash-in-user-slot constructor rather than the `Address`-keyed `hypergraph` builders that
+    * `ActiveAllowSpends` uses.
+    *
+    * '''Value: a minimal presence/consuming-reference record.''' Membership alone is the single-use evidence; the value carries the minimal
+    * consuming reference (e.g. the consuming spend/snapshot reference) for auditability, mirroring how `LastAllowSpendRefs` stores a small
+    * `AllowSpendReference` rather than the full event. Append-only in spirit (a consumed hash never un-consumes), so the partition is a
+    * monotonically growing set under retention by the eventual producer.
+    *
+    * '''Why hypergraph-namespaced (DAG-scoped), not system-namespaced.''' This is consensus-load-bearing single-use state read cross-shard
+    * by the spend path — the exact role `ActiveAllowSpends` already plays — so it belongs in the consensus global `mptRoot`
+    * ([[consensusRootEntries]] keeps it; it is neither a path-dependent `SystemNamespace` sidecar nor an observation-dependent `Mg*`
+    * sub-field). SCHEMA + KEY PLUMBING ONLY: no producer writes and no consumer reads this partition yet — the acceptance-fold wiring that
+    * populates/checks the spent-set is a separate later task.
+    */
+  case object ConsumedAllowSpends extends GlobalStateFieldId { def toInt: Int = 33 }
+
   /** The unrolled per-metagraph `CurrencySnapshotInfo` sub-fields whose UNION is committed by `CurrencySnapshotMptRoots.infoRoot`. Used by
     * `GlobalStateConverter.currencySnapshotFieldRoots` / `GlobalSnapshotInfo.mptStateProofFromBytes` to group these entries into the single
     * `infoRoot` (replacing the `fieldId == LastCurrencySnapshotInfo` filter). MUST stay in sync with the `Mg*` case objects above.
@@ -334,6 +355,7 @@ object GlobalStateFieldId {
     case 30 => Some(MgActiveTokenLocks)
     case 31 => Some(MgLastMessages)
     case 32 => Some(MgGlobalSnapshotSyncView)
+    case 33 => Some(ConsumedAllowSpends)
     case _  => None
   }
 }
@@ -512,6 +534,16 @@ object GlobalStateKey {
     Hasher[F].hash(period.value.toString).map { h =>
       GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.HistoricalStakeSnapshots, EmptyNamespace, HashNamespace(h))
     }
+
+  /** Key into the [[GlobalStateFieldId.ConsumedAllowSpends]] cross-shard single-use spent-set, keyed by the allow-spend's content `Hash`.
+    * The hash IS the single-use identity (stable across shards), so it goes DIRECTLY into the user-namespace `HashNamespace` slot — unlike
+    * `priceStateKey` / `kesRegistrationCertsKey`, which `Hasher[F].hash(...)` a canonical-string identity first. `HashNamespace` serializes
+    * its hash verbatim in `serializeNamespace` (no re-hash), so the marker for a given allow-spend is reproducible from its hash alone,
+    * with no `F[_]`/`Hasher` needed. Mirrors the `ActiveAllowSpends` (fieldId 7) hypergraph scope but addressed by hash rather than by
+    * source `Address`. SCHEMA/KEY PLUMBING ONLY — no producer/consumer is wired yet (separate later task).
+    */
+  def consumedAllowSpendKey(allowSpendHash: Hash): GlobalStateKey =
+    GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.ConsumedAllowSpends, EmptyNamespace, HashNamespace(allowSpendHash))
 
   /** Key into the `ActiveAddressIndex` partition for a given user-visible field. `userNamespace` carries a hash of the fieldId's integer
     * code, so each field gets its own MPT entry under the same partition.

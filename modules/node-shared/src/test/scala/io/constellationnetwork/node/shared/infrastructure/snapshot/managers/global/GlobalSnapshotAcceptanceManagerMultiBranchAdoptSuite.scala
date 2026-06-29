@@ -92,9 +92,9 @@ import weaver.MutableIOSuite
   * `mkOverlayWithBranch`.)
   *
   * '''Producer-truth.''' The carried diff and the committee-attested per-MG root are computed with the EXACT production functions the
-  * follower recomputes against (`ChangeSet.currencyInfoChangeSet`, `ChangeSet.reconstructInfoFromDiff`,
-  * `GlobalStateConverter.currencySnapshotFieldRoots`, then the PIN-1 `hasher.hash((incrementalRoot, infoRoot))`), so producer and verifier
-  * agree by construction and the only thing that flips drop↔adopt is which prior the follower reads (branch vs base).
+  * follower recomputes against (`ChangeSet.currencyInfoChangeSet`, `ChangeSet.reconstructInfoFromDiff`, the PIN-1
+  * `GlobalStateConverter.currencySnapshotMgRoot` — the component-addressable per-MG sub-trie root), so producer and verifier agree by
+  * construction and the only thing that flips drop↔adopt is which prior the follower reads (branch vs base).
   */
 object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSuite {
 
@@ -195,7 +195,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   /** Build a checkpoint whose `derivedStateDelta` carries, for `mg`: the head binary (`includedSnapshots`), the committee byte-diff
     * (`perMetagraphStateDiff`), and the committee-attested per-MG root (`perMetagraphMptRoots`). The diff + root are PRODUCER-TRUTH:
     * computed over `basePriorRT` (the round-tripped base prior) so that `reconstructInfoFromDiff(basePriorRT, diff) === nextInfo` and the
-    * attested root === `hash(currencySnapshotFieldRoots(mg -> Right((inc, nextInfo))))`.
+    * attested root === `currencySnapshotMgRoot(mg -> Right((inc, nextInfo)))`.
     */
   private def mkRightArmCheckpoint(
     mg: Address,
@@ -240,13 +240,14 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       changeSet <- ChangeSet.currencyInfoChangeSet[IO](mg, basePrior, next)
       wireDiff = ChangeSet.toWire(changeSet)
       nextState = Right((inc, next)): CurrencySnapshotWithState
-      roots <- GlobalStateConverter.currencySnapshotFieldRoots[IO](SortedMap(mg -> nextState))
-      attestedRoot <- h.hash(roots)
+      // PIN-1: the attested per-MG root is the COMPONENT-ADDRESSABLE `currencySnapshotMgRoot` (MG-sub-trie rootHash), the exact root the
+      // GSAM follower recomputes in `deriveAdoptedCurrencyState`.
+      attestedRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(mg -> nextState))
     } yield (wireDiff, attestedRoot)
 
-  /** Recompute the per-MG PIN-1 root EXACTLY as the GSAM follower does (`reconstructInfoFromDiff(prior, diff)` →
-    * `currencySnapshotFieldRoots` → `hash((incrementalRoot, infoRoot))`), for an arbitrary `prior`. Lets a test assert, at the prior level,
-    * that the recompute === attested over the BASE prior but != attested over the BRANCH prior — i.e. the drop is exactly the §4 mechanism.
+  /** Recompute the per-MG PIN-1 root EXACTLY as the GSAM follower does (`reconstructInfoFromDiff(prior, diff)` → `currencySnapshotMgRoot` —
+    * the component-addressable per-MG sub-trie root), for an arbitrary `prior`. Lets a test assert, at the prior level, that the recompute
+    * \=== attested over the BASE prior but != attested over the BRANCH prior — i.e. the drop is exactly the §4 mechanism.
     */
   private def followerRecomputeRoot(
     mg: Address,
@@ -257,8 +258,8 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     for {
       nextInfo <- ChangeSet.reconstructInfoFromDiff[IO](mg, prior, ChangeSet.fromWire(wireDiff))
       nextState = Right((inc, nextInfo)): CurrencySnapshotWithState
-      roots <- GlobalStateConverter.currencySnapshotFieldRoots[IO](SortedMap(mg -> nextState))
-      recomputed <- h.hash(roots)
+      // PIN-1: recompute the component-addressable per-MG root EXACTLY as the GSAM follower does.
+      recomputed <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(mg -> nextState))
     } yield recomputed
 
   // ============================================================================
@@ -433,6 +434,8 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     override def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal, checkpointHash: Hash): IO[Unit] = IO.unit
     override def lastAdoptedOrd(shardId: ShardId): IO[Option[ShardOrdinal]] = IO.pure(None)
     override def lastAdoptedAnchor(shardId: ShardId): IO[Option[Hash]] = IO.pure(None)
+    override def watchtowerReExec(checkpoint: ShardCheckpoint): IO[List[WatchtowerMismatch]] =
+      IO.pure(List.empty[WatchtowerMismatch])
   }
 
   // ============================================================================

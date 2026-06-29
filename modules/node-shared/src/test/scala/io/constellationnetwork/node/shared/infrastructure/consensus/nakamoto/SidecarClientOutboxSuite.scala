@@ -58,6 +58,7 @@ object SidecarClientOutboxSuite extends SimpleIOSuite {
     // is now total over the trait and the stub must implement every method to construct.
     def publishShardCheckpoint(msg: ShardCheckpointWire) = IO.pure(PublishResponse(ok = true))
     def publishShardCheckpointAttestation(msg: ShardCheckpointAttestationWire) = IO.pure(PublishResponse(ok = true))
+    def publishFraudProof(msg: FraudProofEnvelopeWire) = IO.pure(PublishResponse(ok = true))
     def confirmFinalized(topic: String, msgIds: List[Array[Byte]]) =
       ref
         .update(s => s.copy(confirmCalls = (topic, msgIds) :: s.confirmCalls))

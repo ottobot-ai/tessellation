@@ -57,9 +57,9 @@ import weaver.MutableIOSuite
   *   - Real [[ShardAssignment]] via `ShardAssignment.make`; tests scan `numShards` to ensure two test MG addresses split across different
   *     shards (same trick the Slice 10 suite uses via `findNumShardsSplitting`).
   *   - Mock [[ShardSubtreeProofClient]] backed by a `Ref` so each test can (a) seed a response and (b) assert on the invocation count after
-  *     the fact. The mock doesn't run any verification — the production `httpStub` would, but the validator's contract here is to trust the
-  *     client's return value and decode the bytes; tampering is exercised via "value bytes that decode to the wrong type", which the
-  *     validator catches structurally.
+  *     the fact. The mock doesn't run any verification — the production `ShardSubtreeProofClient.http` would, but the validator's contract
+  *     here is to trust the client's return value and decode the bytes; tampering is exercised via "value bytes that decode to the wrong
+  *     type", which the validator catches structurally.
   *   - Real Circe encoding for the proof's value bytes: `SortedSet[Signed[AllowSpend]].asJson` serialized as UTF-8 — the same shape the
   *     validator decodes via `io.circe.parser`. This gives end-to-end byte-fidelity coverage of the cross-shard wire path without dragging
   *     in the full MPT-prover infrastructure (which is Slice 10's concern, separately covered).
@@ -108,8 +108,8 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
 
   /** A sentinel [[ShardSubtreeProof]] — value-bearing field is only the `value` (the validator uses it to extract bytes); the rest are
     * placeholders. The validator does NOT re-run MPT verification against the proof envelope; that's the client implementation's
-    * responsibility (the production `httpStub` would verify before surfacing). The mock simulates a verified proof by always returning
-    * Some(_).
+    * responsibility (the production `ShardSubtreeProofClient.http` would verify before surfacing). The mock simulates a verified proof by
+    * always returning Some(_).
     */
   private def sentinelProof(value: Option[Hex]): ShardSubtreeProof =
     ShardSubtreeProof(

@@ -135,7 +135,8 @@ object types {
     commitmentSmt: CommitmentSmtConfig,
     localEvents: LocalEventsConfig,
     committee: CommitteeConfig,
-    sharding: ShardingConfig
+    sharding: ShardingConfig,
+    invaliditySlashing: InvalidStateProofSlashingConfig
   ) {
     // k₁ for the active environment. Resolved once at the use site from `SharedConfig.environment`. Falls back to the dev value
     // (`NakamotoConfig.DefaultConfirmationDepthK`, 32) for any env absent from the HOCON block — same neutral-default convention as
@@ -212,6 +213,35 @@ object types {
       this
     }
   }
+
+  /** WATCHTOWER invalid-state-proof slashing — the 100% `InvalidStateProof` tier (`docs/nakamoto/SLASHING-DESIGN.md` §6;
+    * `docs/nakamoto/WATCHTOWER-FRAUD-PROOF-DESIGN.md`). Distinct from the per-shard NON-participation slashing in [[ShardSlashingConfig]]
+    * (`nakamoto.sharding.slashing`): that is a soft, rate-based, least-severe tier; THIS is the hard, evidence-based total-loss tier for a
+    * committee that signed a checkpoint with a wrong per-MG derivation.
+    *
+    *   - `watchtowerEnabled`: master switch for the watchtower approval-check (the per-checkpoint re-execution + fraud-proof gossip).
+    *     Default `true` at `numShards > 1`; INERT at `numShards = 1` (no committee checkpoints exist). Turning it off disables fraud-proof
+    *     emission (the dispute consumer + slash still run if an envelope arrives, but no node produces one).
+    *   - `slashFraction`: fraction of the offender's combined (delegated + collateral) stake destroyed. Default `1.0` (total loss — the
+    *     `InvalidStateProof` tier is the maximum severity; a single proven wrong derivation = total loss). A value `< 1.0` reduces
+    *     delegated stake proportionally and still fully removes collateral (collateral has no partial-amount slot — conservative).
+    *   - `bountyFraction`: fraction of the slashed pool credited to the fraud-proof submitter; the remainder burns. Default `0.05` (5%) —
+    *     enough to incentivise running a watchtower, not enough for a self-attacker to recover via self-submission (95% burns).
+    *   - `cooldownEpochs`: epochs the slashed operator is excluded from the active set (cannot rejoin a committee / contribute to quorum).
+    *     Default `100`, matching the equivocation cooldown in `SLASHING-DESIGN.md` §6.
+    *
+    * '''Challenge window.''' A checkpoint's economic effects are not irreversible until `confirmationDepthK` (k₁) finalized ordinals after
+    * adoption — the window in which a fraud proof can land and revert it. The window is NOT a separate knob: it is the existing
+    * `nakamoto.confirmation-depth-k`, so the slashable/irreversible point is gated at depth-k₁ (the same depth all other finality gates
+    * use). The GSAM accept path only applies the irreversible slash for an upheld dispute whose disputed checkpoint is still within k₁ of
+    * the tip.
+    */
+  case class InvalidStateProofSlashingConfig(
+    watchtowerEnabled: Boolean,
+    slashFraction: Double,
+    bountyFraction: Double,
+    cooldownEpochs: Long
+  )
 
   /** §3 NIPoPoW historical-commitment SMT tunables. The tree is unbounded; `versionRootRetention` bounds only how many recent historical
     * ROOTS stay queryable for past-ordinal inclusion proofs (separate from the `confirmationDepthK` finalized lag). Must be >= 1.

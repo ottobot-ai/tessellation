@@ -193,11 +193,13 @@ object ShardCheckpointWiring {
     * for a never-seen MG) INSTEAD of `SortedMap.empty`. The LAST resulting per-MG `CurrencySnapshotWithState` is `next` (mirrors
     * `calculateLastCurrencySnapshots`).
     *
-    * '''Root (PIN-1).''' `root = Hasher.hash((incrementalRoot, infoRoot))` where `(incrementalRoot, infoRoot) =
-    * GlobalStateConverter.currencySnapshotFieldRoots(SortedMap(mg -> next))` — the Some/None-INVISIBLE MPT pair, NOT the
-    * Some/None-SENSITIVE `hash((mg, state))` that [[reExecDerivation]] emits. The single combined `Hash` is what `perMetagraphMptRoots(mg)`
-    * carries (that field is `SortedMap[Address, Hash]`); the gl0 verifier recomputes the IDENTICAL `Hasher.hash((incrementalRoot,
-    * infoRoot))` over its post-apply state. '''TaskB must match this exact encoding.'''
+    * '''Root (PIN-1).''' `root = GlobalStateConverter.currencySnapshotMgRoot(SortedMap(mg -> next))` — the COMPONENT-ADDRESSABLE per-MG MPT
+    * root (the `rootHash` of the standalone trie over the MG's fieldId-5 incremental + `infoSubFields` `Mg*` entries, one leaf per
+    * account), NOT the old flat `Hasher.hash((incrementalRoot, infoRoot))` (which could not back a single-leaf inclusion proof) and NOT the
+    * Some/None-SENSITIVE `hash((mg, state))` that [[reExecDerivation]] emits. This `Hash` is what `perMetagraphMptRoots(mg)` carries (that
+    * field is `SortedMap[Address, Hash]`); the gl0 verifier recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply state,
+    * and `ShardSubtreeProofService` witnesses a single `(field, account)` leaf against it. '''All three PIN-1 sites + TaskB must route
+    * through `currencySnapshotMgRoot`.'''
     *
     * '''Diff (PIN-2 + PIN-3).''' `ChangeSet.currencyInfoChangeSet(mg, priorInfo, next.info)` — the 8 `Mg*` ⊕ fieldId-7 allow-spends,
     * minimal (changed/new upserts + removed keys). `priorInfo` is the info half of `S(N)` (empty when absent).
@@ -332,11 +334,15 @@ object ShardCheckpointWiring {
                         activeTokenLocks = authTL.orElse(infoOf(next).activeTokenLocks)
                       )
                       // Carry the authoritative balances on BOTH the attested root and the diff (consistency): build a `next` whose info
-                      // half has `balances = authBal` so `currencySnapshotFieldRoots` commits to the authoritative map, matching the diff.
+                      // half has `balances = authBal` so the per-MG root commits to the authoritative map, matching the diff.
                       val nextAuth: CurrencyState = next.map { case (inc, _) => (inc, nextInfo) }
                       for {
-                        roots <- GlobalStateConverter.currencySnapshotFieldRoots[F](SortedMap(mg -> nextAuth))
-                        root <- Hasher[F].hash(roots) // (incrementalRoot, infoRoot) pair → single Some/None-invisible Hash (PIN-1)
+                        // PIN-1: COMPONENT-ADDRESSABLE per-MG root — the rootHash of the MG sub-trie over the fieldId-5 incremental + the
+                        // `infoSubFields` `Mg*` entries (one leaf per account), via the shared `currencySnapshotMgRoot`. REPLACES the old flat
+                        // `hash((incrementalRoot, infoRoot))` so a single-field/single-account inclusion proof verifies against it
+                        // (ShardSubtreeProofService). The gl0 follower recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply
+                        // state — all three PIN-1 sites route through that one helper, so the bytes are identical by construction.
+                        root <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> nextAuth))
                         // DIAG: committee's attested per-sub-field root breakdown — match `root=` here to gl0's
                         // `[ACCEPTANCE/ADOPT-VERIFY] attested=` line to pin the diverging half (inc vs info) + `Mg*` sub-field.
                         cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> nextAuth))

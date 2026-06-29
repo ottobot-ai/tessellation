@@ -96,6 +96,13 @@ object Services {
     globalChangeSetServiceRef: Ref[F, Option[
       io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService[F]
     ]],
+    // Slice 10/11 (cross-shard read transport) — backing seam for `ShardProofRoutes`. Mirrors
+    // `globalFollowSliceServiceRef`: created in Main, populated inside GlobalSnapshotConsensus.make (where the
+    // per-shard chain stores + MPT proof service are in scope), read by HttpApi to build the route. `None` at
+    // numShards=1, so the route serves 503 (no caller until the cross-shard validator is wired).
+    shardProofServiceRef: Ref[F, Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService[F]
+    ]],
     // §1.2 Slice 3c: KesRegistry loaded from L0 genesis (or empty for CSV-genesis). Threaded
     // through to GlobalSnapshotConsensus.make.
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
@@ -293,6 +300,7 @@ object Services {
             nipopowProofProviderRef,
             globalFollowSliceServiceRef,
             globalChangeSetServiceRef,
+            shardProofServiceRef,
             processMetagraphBinary,
             enqueueAllowSpendBlock,
             enqueueDAGBlock,
@@ -334,6 +342,7 @@ object Services {
         nipopowProofProviderRef = nipopowProofProviderRef,
         globalFollowSliceServiceRef = globalFollowSliceServiceRef,
         globalChangeSetServiceRef = globalChangeSetServiceRef,
+        shardProofServiceRef = shardProofServiceRef,
         pendingReader = pendingReader,
         mutableKesRegistry = mutableKesRegistry,
         // Chain-sync (task #A): re-expose the single per-node shard acceptance deps so the serve route
@@ -377,6 +386,12 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   // build GlobalFollowRoutes. The route returns 503 while the service is still `None`.
   val globalChangeSetServiceRef: Ref[F, Option[
     io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService[F]
+  ]],
+  // Slice 10/11 (cross-shard read transport) — backing seam for `ShardProofRoutes` (`POST /shard/{id}/proof`).
+  // Populated inside GlobalSnapshotConsensus.make on the sharding-active path; read by HttpApi to build the
+  // route. `None` at numShards=1 ⇒ the route serves 503. ADDITIVE / serve-only — never feeds back into consensus.
+  val shardProofServiceRef: Ref[F, Option[
+    io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService[F]
   ]],
   // #117/#118 Phase 2: branch-aware reader for gl0 HTTP routes / read paths. Resolves to the
   // chain's bestTip under MultiBranch so reads pick up the chain's pending writes, falling

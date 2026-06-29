@@ -284,26 +284,45 @@ object NakamotoSyncDaemon {
     clusterStorage: io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Option[LatestMptEntries]] = {
-    def tryPeers(remaining: List[io.constellationnetwork.schema.peer.Peer]): F[Option[LatestMptEntries]] =
+    def pullFrom(p: io.constellationnetwork.schema.peer.Peer): F[Option[LatestMptEntries]] =
+      l0GlobalSnapshotClient.getLatestMptEntries
+        .run(io.constellationnetwork.schema.peer.L0Peer.fromPeer(p))
+        .flatMap {
+          case (snapshot, state, entries) =>
+            HasherSelector[F]
+              .withCurrent(implicit hasher => snapshot.toHashedWithSignatureCheck)
+              .flatMap(_.liftTo[F])
+              .map(hashed => Some((hashed, state, entries.some)): Option[LatestMptEntries])
+        }
+        .handleErrorWith { e =>
+          logger.warn(e)(s"byte-faithful catch-up: MPT-entries pull from peer ${p.id.show} failed, trying next") >>
+            (None: Option[LatestMptEntries]).pure[F]
+        }
+
+    def tryInOrder(remaining: List[io.constellationnetwork.schema.peer.Peer]): F[Option[LatestMptEntries]] =
       remaining match {
         case Nil => (None: Option[LatestMptEntries]).pure[F]
         case p :: tail =>
-          l0GlobalSnapshotClient.getLatestMptEntries
-            .run(io.constellationnetwork.schema.peer.L0Peer.fromPeer(p))
-            .flatMap {
-              case (snapshot, state, entries) =>
-                HasherSelector[F]
-                  .withCurrent(implicit hasher => snapshot.toHashedWithSignatureCheck)
-                  .flatMap(_.liftTo[F])
-                  .map(hashed => Some((hashed, state, entries.some)): Option[LatestMptEntries])
-            }
-            .handleErrorWith { e =>
-              logger.warn(e)(s"byte-faithful catch-up: MPT-entries pull from peer ${p.id.show} failed, trying next") >>
-                tryPeers(tail)
-            }
+          pullFrom(p).flatMap {
+            case some @ Some(_) => (some: Option[LatestMptEntries]).pure[F]
+            case None           => tryInOrder(tail)
+          }
       }
-    clusterStorage.getResponsivePeers
-      .flatMap(peers => tryPeers(peers.toList))
+
+    // D2 fix: do NOT pull from the first responsive peer — a single lagging peer strands the whole catch-up (the gl0-4 wedge,
+    // where the first peer served ord 375 while others held 674+). Rank responsive peers by their advertised latest FINALIZED
+    // ordinal (cheap probe) and pull the MPT from the FRESHEST first, falling back down the ranking on failure. (A peer that
+    // can't answer the probe sorts last via ordinal 0.) The strictly-ahead guard in byteFaithfulAdopt is the backstop.
+    clusterStorage.getResponsivePeers.flatMap { peers =>
+      peers.toList.traverse { p =>
+        l0GlobalSnapshotClient.getLatestFinalizedOrdinal
+          .run(io.constellationnetwork.schema.peer.L0Peer.fromPeer(p))
+          .map(ord => (p, ord.value.value))
+          .handleError(_ => (p, 0L))
+      }.flatMap { ranked =>
+        tryInOrder(ranked.sortBy { case (_, ord) => -ord }.map { case (p, _) => p })
+      }
+    }
       .handleErrorWith(e => logger.warn(e)("byte-faithful catch-up: could not pull MPT entries from any peer").as(None))
   }
 
@@ -627,6 +646,19 @@ object NakamotoSyncDaemon {
     // gl0-leader-produce path (`GlobalSnapshotConsensus.make`), where the operator's signing material lives.
     shardCheckpointAttestationEmitter: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]
+    ] = None,
+    // WATCHTOWER (fraud-proof part 1): re-execute each ADOPTED checkpoint on the quorum path and gossip a
+    // FraudProofEnvelope on a per-MG root mismatch (catches a quorum-signed wrong root). `None` at numShards=1
+    // or `watchtower-enabled=false`. Built on the gl0-leader-produce path where the operator's signing material
+    // + the SAME acceptance manager (its PIN-1 re-exec closure) live.
+    watchtowerFraudProofEmitter: Option[
+      io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofEmitter[F]
+    ] = None,
+    // WATCHTOWER (fraud-proof part 2): DETERMINISTIC dispute verdict. On receiving a `FraudProofEnvelope`, every
+    // gl0 INDEPENDENTLY re-runs this over the disputed checkpoint's OWN bytes (never trusting the challenger) and
+    // decides UPHELD iff attested ≠ honest-re-derived. `None` at numShards=1.
+    invalidStateProofValidator: Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]
     ] = None,
     // ─── Hierarchical-shard-checkpoints v1 — per-ord producer fan-out (decoupled from gl0-leader win) ──
     // Per-shard checkpoint producers + the static metagraph→shard assignment, threaded so EVERY node fans
@@ -985,6 +1017,7 @@ object NakamotoSyncDaemon {
                                     cp,
                                     shardAcceptanceDeps,
                                     shardCheckpointAttestationEmitter,
+                                    watchtowerFraudProofEmitter,
                                     shardCheckpointFetcher,
                                     selfId,
                                     logger
@@ -994,6 +1027,13 @@ object NakamotoSyncDaemon {
 
                             case pb.GossipMessage.Body.ShardCheckpointAttestation(att) =>
                               Async[F].start(handleShardCheckpointAttestation(att, shardAcceptanceDeps, logger)).void
+
+                            case pb.GossipMessage.Body.FraudProof(fp) =>
+                              // WATCHTOWER dispute consumer (part 2): background-fire the DETERMINISTIC verdict. Every gl0 runs the
+                              // identical re-derivation over the disputed checkpoint's own bytes; the verdict is recomputed, never trusted.
+                              Async[F]
+                                .start(handleFraudProof(fp, shardAcceptanceDeps, invalidStateProofValidator, logger))
+                                .void
 
                             case _: pb.GossipMessage.Body.Rumor =>
                               Async[F].unit
@@ -1169,6 +1209,7 @@ object NakamotoSyncDaemon {
                                                   w,
                                                   shardAcceptanceDeps,
                                                   shardCheckpointAttestationEmitter,
+                                                  watchtowerFraudProofEmitter,
                                                   shardCheckpointFetcher,
                                                   selfId,
                                                   logger
@@ -2427,6 +2468,12 @@ object NakamotoSyncDaemon {
     shardCheckpointAttestationEmitter: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]
     ],
+    // WATCHTOWER (fraud-proof part 1): re-execute each adopted checkpoint EVEN on the quorum path and gossip a
+    // FraudProofEnvelope on a per-MG root mismatch. `None` at numShards=1 or when watchtower-enabled=false ⇒ no
+    // approval-check. Fired on the became-best-tip adopt seam (same gate as the attestation emitter).
+    watchtowerFraudProofEmitter: Option[
+      io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofEmitter[F]
+    ],
     // T1 orphan-by-hash chain-sync (task #A): drives the parent-pull below — a received checkpoint whose parent is
     // absent pulls the missing parent and re-feeds it through THIS method, converging a divergent-sibling node onto
     // canonical. `None` ⇒ no pull (numShards=1 or unwired).
@@ -2493,6 +2540,7 @@ object NakamotoSyncDaemon {
                                           w,
                                           shardAcceptanceDeps,
                                           shardCheckpointAttestationEmitter,
+                                          watchtowerFraudProofEmitter,
                                           shardCheckpointFetcher,
                                           selfId,
                                           logger
@@ -2558,6 +2606,7 @@ object NakamotoSyncDaemon {
                                                     w,
                                                     shardAcceptanceDeps,
                                                     shardCheckpointAttestationEmitter,
+                                                    watchtowerFraudProofEmitter,
                                                     shardCheckpointFetcher,
                                                     selfId,
                                                     logger
@@ -2582,10 +2631,22 @@ object NakamotoSyncDaemon {
                                     // bestTip (per ShardChainStore maxvalid-tk fork choice), THIS node attests once for this winning hash.
                                     entry.chainStore.bestTip.flatMap { bestTipOpt =>
                                       val becameBestTip = stored && bestTipOpt.exists(_.hash === checkpointHash)
-                                      // Record every committee signer (the producer's own sig seeds 1 attestation) into the tip tracker —
-                                      // only now that re-exec validated the checkpoint (so a wrong-derivation envelope never inflates quorum).
-                                      checkpoint.committeeSignatures.toList
-                                        .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId, sig)) >>
+                                      // WATCHTOWER approval-check (fraud-proof part 1): on adopting this checkpoint as canonical best tip,
+                                      // re-execute its per-MG derivations EVEN THOUGH it was quorum-admitted (the whole point — catch a
+                                      // quorum-signed wrong root) and gossip a FraudProofEnvelope on any mismatch. Background-fire so the
+                                      // multi-step re-exec + sign + publish never blocks this handler; `None` (numShards=1 / watchtower
+                                      // disabled) ⇒ skipped. Only on becameBestTip: a non-canonical sibling is not adopted, so its effects
+                                      // are never applied — no need to dispute it (and re-deriving it against our S(N) could false-mismatch).
+                                      Async[F].whenA(becameBestTip) {
+                                        watchtowerFraudProofEmitter match {
+                                          case None          => Async[F].unit
+                                          case Some(emitter) => Async[F].start(emitter.emit(checkpoint)).void
+                                        }
+                                      } >>
+                                        // Record every committee signer (the producer's own sig seeds 1 attestation) into the tip tracker —
+                                        // only now that re-exec validated the checkpoint (so a wrong-derivation envelope never inflates quorum).
+                                        checkpoint.committeeSignatures.toList
+                                          .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId, sig)) >>
                                         // T_count_shard quorum closure: sign + gossip OUR attestations so every OTHER node's tracker
                                         // crosses ⌈2·K_S/3⌉. Self-exclusion (P-11b) keeps them out of our own threshold count. `None`
                                         // emitter (numShards=1 regression bar) ⇒ no emit. Background-fire so the multi-step sign+publish
@@ -2756,6 +2817,87 @@ object NakamotoSyncDaemon {
           .handleErrorWith { err =>
             logger.warn(s"⚠️ Failed to handle ShardCheckpointAttestation: ${err.getMessage}")
           }
+    }
+
+  /** WATCHTOWER dispute consumer (fraud-proof part 2) — handle an incoming `FraudProofEnvelopeWire`.
+    *
+    * '''Deterministic verdict, recomputed not trusted.''' Decode the envelope, resolve the disputed `ShardCheckpoint` from the local
+    * per-shard chain store BY HASH (the checkpoint the committee signed — its bytes are the verdict's inputs), build the
+    * [[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence]], and run
+    * [[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator]] — which re-derives the honest per-MG root
+    * from the checkpoint's OWN `includedSnapshots` (pure / finalized-base) and upholds iff it differs from the committee-attested root. The
+    * verdict is identical on every gl0 because it recomputes; the challenger's claimed roots in the envelope are never read for the
+    * verdict.
+    *
+    * '''On UPHELD''': log loudly (this slice surfaces the verdict + the slash-target committee). The AUTHORITATIVE 100% slash is applied by
+    * the GSAM accept path when an `InvalidStateProofEvidence` (carrying the full checkpoint) lands in a global snapshot — submitting that
+    * evidence to the L0 mempool is the remaining wiring (see the GSAM `InvalidStateProofSlashManager` sink + its TODO). On NOT-upheld (the
+    * honest-committee floor) / any rejection, log + drop — a frivolous or forged fraud proof has no effect.
+    *
+    * '''Checkpoint not in local store''': we cannot re-derive (the checkpoint may have been pruned, or we never tracked this shard). Drop
+    * with a debug log — the on-chain evidence path carries the full checkpoint and does NOT depend on local availability.
+    *
+    * `None` deps / validator (numShards=1) ⇒ drop with a debug log.
+    */
+  private def handleFraudProof[F[_]: Async: JsonSerializer: HasherSelector: SecurityProvider: Metrics](
+    fpWire: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar.FraudProofEnvelopeWire,
+    shardAcceptanceDeps: Option[
+      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[F]
+    ],
+    invalidStateProofValidator: Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]
+    ],
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] =
+    (shardAcceptanceDeps, invalidStateProofValidator) match {
+      case (Some(deps), Some(validator)) =>
+        io.constellationnetwork.node.shared.infrastructure.sharding.FraudProofWireCodecs
+          .fromWire[F](fpWire)
+          .flatMap { fp =>
+            deps.registry.get(fp.shardId) match {
+              case None =>
+                logger.debug(s"🛡️ FraudProof for untracked shard=${fp.shardId.value.value}; dropping")
+              case Some(entry) =>
+                entry.chainStore.getByHash(fp.disputedCheckpointHash).flatMap {
+                  case None =>
+                    logger.debug(
+                      s"🛡️ FraudProof: disputed checkpoint ${fp.disputedCheckpointHash.value.take(12)} not in local store " +
+                        s"(shard=${fp.shardId.value.value}); cannot re-derive verdict locally — dropping (on-chain evidence carries it)"
+                    )
+                  case Some(hashedCp) =>
+                    val cp = hashedCp.signed.value
+                    val attested = cp.derivedStateDelta.perMetagraphMptRoots
+                      .get(fp.metagraphAddress)
+                      .getOrElse(io.constellationnetwork.security.hash.Hash.empty)
+                    val evidence = io.constellationnetwork.schema.slashing.InvalidStateProofEvidence(
+                      shardId = fp.shardId,
+                      disputedCheckpoint = cp,
+                      metagraphAddress = fp.metagraphAddress,
+                      attestedRoot = attested,
+                      fraudProof = fp
+                    )
+                    validator.validate(evidence).flatMap {
+                      case Right(_) =>
+                        logger.warn(
+                          s"🛡️ WATCHTOWER dispute UPHELD: shard=${fp.shardId.value.value} " +
+                            s"checkpoint=${fp.disputedCheckpointHash.value.take(12)} mg=${fp.metagraphAddress.value.value.take(10)} " +
+                            s"slashTargets=${evidence.slashTargets.size} — committee signed a wrong derivation (100% InvalidStateProof slash " +
+                            s"applies on-chain via InvalidStateProofEvidence)"
+                        )
+                      case Left(rejection) =>
+                        logger.info(
+                          s"🛡️ WATCHTOWER dispute NOT upheld (no slash): shard=${fp.shardId.value.value} " +
+                            s"checkpoint=${fp.disputedCheckpointHash.value.take(12)} reason=$rejection"
+                        )
+                    }
+                }
+            }
+          }
+          .handleErrorWith { err =>
+            logger.warn(s"⚠️ Failed to handle FraudProof: ${err.getMessage}")
+          }
+      case _ =>
+        logger.debug("Received FraudProof but sharding/watchtower inactive (numShards=1); dropping")
     }
 
   /** Route an incoming state channel binary from gossip into the [[MetagraphCommitteeGate]] (Slice S3, load-bearing) — the gate computes
@@ -3409,66 +3551,85 @@ object NakamotoSyncDaemon {
           val pParentHash = pulledHashed.signed.value.lastSnapshotHash
           val pVrfOutput =
             vrfOutputFromProof(pulledHashed.signed.value.slotCertificate.map(_.vrfProof.toBytes).getOrElse(Array.empty[Byte]))
-          HasherSelector[F]
-            .withCurrent(implicit hasher => seedMptByteFaithful[F](pulledHashed, pulledGsi, pulledBytes, mptStore, logger))
-            .flatMap {
-              case false =>
-                logger.warn(
-                  s"\u26d4 CATCH-UP byte-faithful: pulled latest finalized ord=${pOrdinal.show} but sidecarFreeMptRoot \u2260 signed mptRoot " +
-                    s"(corrupt transfer / GSI-fallback divergence). Not adopting; will re-pull next wave."
-                ) >>
-                  Metrics[F].incrementCounter(
-                    "dag_nakamoto_catchup_rejected",
-                    Seq(Metrics.unsafeLabelName("reason") -> "byte_faithful_root_mismatch")
-                  )
-              case true =>
-                for {
-                  _ <- logger.warn(
-                    s"\ud83d\udd04 CATCH-UP byte-faithful: adopting gl0's latest FINALIZED ord=${pOrdinal.show} " +
-                      s"(MPT seeded VERBATIM from signed bytes, verified === signed mptRoot). Resetting local state to network tip."
-                  )
-                  _ <- productionGate.pause("catch-up-sync")
-                  _ <- chainStore.store(pulledHashed.signed, pulledGsi, pOrdinalL, pSlot, pParentHash, pVrfOutput)
-                  _ <- HasherSelector[F].withCurrent { implicit hasher =>
-                    snapshotStorage.setHeadForRecovery(pulledHashed.signed, pulledGsi) >>
-                      lastGlobalSnapshotStorage.setForRecovery(pulledHashed, pulledGsi) >>
-                      lastNGlobalSnapshotStorage.setForRecovery(pulledHashed, pulledGsi)
-                  }
-                  // MPT already seeded byte-faithfully above \u2014 do NOT re-seed from the GSI (that re-encode was the wedge).
-                  _ <- reconcileMempool(eventMempool, pulledGsi, logger)
-                  _ <- stateRef.update(s =>
-                    s.copy(
-                      networkTipOrdinal = pOrdinalL,
-                      networkTipHash = Some(pulledHashed.hash),
-                      localTipOrdinal = pOrdinalL,
-                      // Record what we adopted so the Tier-3 gap-check won't re-teleport over this window while the orphan connects.
-                      lastCatchUpAdoptedOrdinal = math.max(s.lastCatchUpAdoptedOrdinal, pOrdinalL)
+          // GUARD (D1/D4): never adopt a pulled state at-or-below our own tip. A lagging/holed peer can serve a STALE finalized
+          // snapshot; chain-selection would then refuse to switch to the older snapshot, pinning the canonical tip while Tier-3
+          // re-fires every gossip forever (the gl0-4 ord-375-below-409 livelock). `performAdopt` runs only when strictly ahead.
+          def performAdopt: F[Unit] =
+            HasherSelector[F]
+              .withCurrent(implicit hasher => seedMptByteFaithful[F](pulledHashed, pulledGsi, pulledBytes, mptStore, logger))
+              .flatMap {
+                case false =>
+                  logger.warn(
+                    s"\u26d4 CATCH-UP byte-faithful: pulled latest finalized ord=${pOrdinal.show} but sidecarFreeMptRoot \u2260 signed mptRoot " +
+                      s"(corrupt transfer / GSI-fallback divergence). Not adopting; will re-pull next wave."
+                  ) >>
+                    Metrics[F].incrementCounter(
+                      "dag_nakamoto_catchup_rejected",
+                      Seq(Metrics.unsafeLabelName("reason") -> "byte_faithful_root_mismatch")
                     )
-                  )
-                  _ <- productionGate.resume("catch-up-sync")
-                  _ <- Metrics[F].incrementCounter("dag_nakamoto_catchups")
-                  _ <- logger.info(
-                    s"\u2705 CATCH-UP byte-faithful complete: now at ordinal=${pOrdinal.show}. Subsequent gossip should find parents."
-                  )
-                  _ <- {
-                    val cursor = BackfillDaemon.BackfillCursor(
-                      nextHashToFetch = pParentHash.value,
-                      targetOrdinal = 1L,
-                      currentOrdinal = pOrdinalL,
-                      startedAtOrdinal = pOrdinalL,
-                      completedChunks = Set.empty,
-                      createdAtMs = System.currentTimeMillis()
+                case true =>
+                  for {
+                    _ <- logger.warn(
+                      s"\ud83d\udd04 CATCH-UP byte-faithful: adopting gl0's latest FINALIZED ord=${pOrdinal.show} " +
+                        s"(MPT seeded VERBATIM from signed bytes, verified === signed mptRoot). Resetting local state to network tip."
                     )
-                    supervisor
-                      .supervise(
-                        BackfillDaemon
-                          .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
-                          .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
+                    _ <- productionGate.pause("catch-up-sync")
+                    _ <- chainStore.store(pulledHashed.signed, pulledGsi, pOrdinalL, pSlot, pParentHash, pVrfOutput)
+                    _ <- HasherSelector[F].withCurrent { implicit hasher =>
+                      snapshotStorage.setHeadForRecovery(pulledHashed.signed, pulledGsi) >>
+                        lastGlobalSnapshotStorage.setForRecovery(pulledHashed, pulledGsi) >>
+                        lastNGlobalSnapshotStorage.setForRecovery(pulledHashed, pulledGsi)
+                    }
+                    // MPT already seeded byte-faithfully above \u2014 do NOT re-seed from the GSI (that re-encode was the wedge).
+                    _ <- reconcileMempool(eventMempool, pulledGsi, logger)
+                    _ <- stateRef.update(s =>
+                      s.copy(
+                        networkTipOrdinal = pOrdinalL,
+                        networkTipHash = Some(pulledHashed.hash),
+                        localTipOrdinal = pOrdinalL,
+                        // Record what we adopted so the Tier-3 gap-check won't re-teleport over this window while the orphan connects.
+                        lastCatchUpAdoptedOrdinal = math.max(s.lastCatchUpAdoptedOrdinal, pOrdinalL)
                       )
-                      .void
-                  }
-                } yield ()
-            }
+                    )
+                    _ <- productionGate.resume("catch-up-sync")
+                    _ <- Metrics[F].incrementCounter("dag_nakamoto_catchups")
+                    _ <- logger.info(
+                      s"\u2705 CATCH-UP byte-faithful complete: now at ordinal=${pOrdinal.show}. Subsequent gossip should find parents."
+                    )
+                    _ <- {
+                      val cursor = BackfillDaemon.BackfillCursor(
+                        nextHashToFetch = pParentHash.value,
+                        targetOrdinal = 1L,
+                        currentOrdinal = pOrdinalL,
+                        startedAtOrdinal = pOrdinalL,
+                        completedChunks = Set.empty,
+                        createdAtMs = System.currentTimeMillis()
+                      )
+                      supervisor
+                        .supervise(
+                          BackfillDaemon
+                            .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
+                            .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
+                        )
+                        .void
+                    }
+                  } yield ()
+              }
+
+          (chainStore.bestTipOrdinal, stateRef.get).flatMapN { (bestTipOpt, syncSt) =>
+            val localOrd = math.max(bestTipOpt.getOrElse(0L), syncSt.lastCatchUpAdoptedOrdinal)
+            if (pOrdinalL <= localOrd)
+              logger.warn(
+                s"⛔ CATCH-UP byte-faithful: pulled finalized ord=$pOrdinalL is NOT ahead of local tip=$localOrd " +
+                  s"(a peer served a STALE finalized state); refusing to teleport the canonical tip backward. Re-pulling a fresher peer next wave."
+              ) >>
+                Metrics[F].incrementCounter(
+                  "dag_nakamoto_catchup_rejected",
+                  Seq(Metrics.unsafeLabelName("reason") -> "stale_pull_at_or_below_tip")
+                )
+            else
+              performAdopt
+          }
         }
 
         pullLatestMptEntries.flatMap {

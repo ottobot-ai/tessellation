@@ -154,29 +154,35 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
     chainStore: ShardChainStore[IO],
     keyPair: KeyPair,
     sigma: Ratio,
-    shardEta: Array[Byte]
+    shardEta: Array[Byte],
+    assignment: ShardAssignment[IO]
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
-    ShardCheckpointProducer.make[IO](
-      shardId = shardId,
-      chainStore = chainStore,
-      finalizedBasePerMgTip = chainStore.perMgTip, // fan-out tests assert perMgTip-anchored chain-linking (pre-S2 parity)
-      adoptedPerMgTip = chainStore.perMgTip, // == window anchor ⇒ newness gate is a no-op here (S2-deadlock fix, 2026-06-15)
-      slotLeader = ssl,
-      publisher = ShardCheckpointPublisher.noop[IO],
-      selfPeerId = PeerId.fromPublic(keyPair.getPublic),
-      selfKeyPair = keyPair,
-      selfVrfSk = randomVrfSk(),
-      kesSigner = stubKesSigner,
-      // Slice S4: epoch-keyed eta resolver; the fan-out tests don't exercise eta rotation, so a constant precomputed
-      // shardEta (independent of epoch) keeps the slot-leader draw deterministic.
-      shardEtaFor = _ => IO.pure(shardEta),
-      slotGapFor = slotGapFor,
-      staircaseDeltaSlots = 5,
-      derivePerMgState = deterministicDerive,
-      lastAdoptedOrd = cats.effect.IO.pure(None),
-      pipelineDepth = Int.MaxValue,
-      republishEveryTicks = 1
-    )
+    JsonSerializer.forAsync[IO].flatMap { implicit json =>
+      ShardCheckpointProducer.make[IO](
+        shardId = shardId,
+        chainStore = chainStore,
+        // The SAME cluster-wide assignment the fan-out / buffers use, so the producer classifies cross-shard SpendAction targets
+        // identically. The stub binaries don't decode as currency snapshots ⇒ no artifacts ⇒ no cross-shard receipts here regardless.
+        shardAssignment = assignment,
+        finalizedBasePerMgTip = chainStore.perMgTip, // fan-out tests assert perMgTip-anchored chain-linking (pre-S2 parity)
+        adoptedPerMgTip = chainStore.perMgTip, // == window anchor ⇒ newness gate is a no-op here (S2-deadlock fix, 2026-06-15)
+        slotLeader = ssl,
+        publisher = ShardCheckpointPublisher.noop[IO],
+        selfPeerId = PeerId.fromPublic(keyPair.getPublic),
+        selfKeyPair = keyPair,
+        selfVrfSk = randomVrfSk(),
+        kesSigner = stubKesSigner,
+        // Slice S4: epoch-keyed eta resolver; the fan-out tests don't exercise eta rotation, so a constant precomputed
+        // shardEta (independent of epoch) keeps the slot-leader draw deterministic.
+        shardEtaFor = _ => IO.pure(shardEta),
+        slotGapFor = slotGapFor,
+        staircaseDeltaSlots = 5,
+        derivePerMgState = deterministicDerive,
+        lastAdoptedOrd = cats.effect.IO.pure(None),
+        pipelineDepth = Int.MaxValue,
+        republishEveryTicks = 1
+      )
+    }
 
   /** Per-shard rig: a chain store + a raw-binary buffer + a producer for every shard `0 .. numShards-1`, sharing one keypair + σ. */
   private case class Rig(
@@ -201,7 +207,7 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
           store <- ShardChainStore.make[IO](sid)
           buffer <- ShardBinaryBuffer.make[IO](sid, cap = 4096)
           shardEta <- ssl.computeShardEta(sid, gl0Eta)
-          producer <- makeProducer(ssl, sid, store, keyPair, sigma, shardEta)
+          producer <- makeProducer(ssl, sid, store, keyPair, sigma, shardEta, assignment)
         } yield (sid, producer, store, buffer)
       }
     } yield
