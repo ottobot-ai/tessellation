@@ -425,14 +425,18 @@ object GlobalSnapshotAcceptanceManager {
     // spent-set, and the per-accept context is materialized identically on every node (gated `numShards > 1`); the
     // validator constructor is a pure closure factory (no Ref/F), so binding it per-accept is split-safe.
     //
-    // `None` (the default — `ShardSubtreeProofClient.noop` semantics) ⇒ every cross-shard fetch deterministically
-    // returns `None` ⇒ a cross-shard spend is rejected-for-retry uniformly on every node (safe, no fork). NOTE: wiring a
-    // LIVE `ShardSubtreeProofClient.http` here is OUT OF SCOPE — a peer-fetch result is node-local (network/cooldown/
-    // peer-pick), and the spend-action accept result feeds the consensus mptRoot, so a live HTTP client on the accept
-    // path needs a determinism-reconciled anchor (e.g. a LOCAL read of gl0's own finalized `shardCheckpoints` root, not a
-    // peer round-trip) — a separate slice. The W3c forcing function (the OVERLAY) is fully active + deterministic
-    // regardless of the client. At `numShards = 1` (or `shardAssignment = None`) the injected unsharded
-    // `spendActionValidator` is used verbatim ⇒ the cross-shard branch is unreachable ⇒ byte-identical to today.
+    // `None` (the default) ⇒ accept() supplies the DETERMINISTIC `ShardSubtreeProofClient.gl0Local` read source, built from this
+    // accept's consensus-pinned `branchAwareReader` (the SAME accept-`parentTip`-bound reader every per-manager prior-state read
+    // uses). gl0 is the GLOBAL mirror — it holds the finalized state of every shard's metagraphs — so the cross-shard
+    // `AllowSpend`/`Balance` the validator needs is read DIRECTLY off gl0's own finalized state: every gl0 node reads the
+    // byte-identical value for the same key at the same ordinal ⇒ the cross-shard spend-action result feeds the consensus mptRoot
+    // identically (no fork). This REPLACES the prior fail-closed `noop` default (which rejected every cross-shard spend for retry).
+    // A live `ShardSubtreeProofClient.http` here would STILL be out of scope — a peer fetch is node-local (network/cooldown/
+    // peer-pick) and would fork — but the gl0-local read needs no peer because gl0 already holds all shards' state. An explicit
+    // `Some(client)` (e.g. a test mock) overrides the gl0-local default. The W3c forcing function (the OVERLAY) wraps the read on
+    // top of whichever client is used. At `numShards = 1` (or `shardAssignment = None`) the injected unsharded
+    // `spendActionValidator` is used verbatim ⇒ the cross-shard branch is unreachable, the gl0-local client is never constructed
+    // ⇒ byte-identical to today.
     crossShardSpendProofClient: Option[ShardSubtreeProofClient[F]] = None,
     // §3 NIPoPoW historical-commitment SMT. `Some(store)` is wired ONLY at the gl0 produce/verify GSAM
     // (`GlobalSnapshotConsensus.make`) — that path has the finalized global-snapshot chain (`getGlobalSnapshotByOrdinal`)
@@ -2330,10 +2334,11 @@ object GlobalSnapshotAcceptanceManager {
                 // cross-shard phantom-refund self-spend is rejected exactly as same-shard). The overlay's `(att, scope)` shape
                 // closes over the per-accept spent-set/epochs; `effectiveCurrencyBalances` is pure+saturating and the spent-set is
                 // gl0-finalized (cluster-uniform), so every honest node computes byte-identical effective balances. The proof
-                // client defaults to `noop` (cross-shard fetch deterministically unavailable ⇒ reject-for-retry uniformly) — see
-                // the `crossShardSpendProofClient` param scaladoc for why a live HTTP client on the accept path is a separate slice.
+                // client defaults to the DETERMINISTIC `gl0Local` reader (cross-shard value read off gl0's own consensus-pinned
+                // finalized mirror, built from `branchAwareReader` below) — every gl0 node reads the byte-identical value ⇒ no
+                // fork; see the `crossShardSpendProofClient` param scaladoc for why a peer-fetch HTTP client is NOT used here.
                 // At `numShards = 1` / `shardAssignment = None` we reuse the injected unsharded `spendActionValidator` verbatim ⇒
-                // the cross-shard branch is unreachable ⇒ byte-identical to the pre-W3c path.
+                // the cross-shard branch is unreachable, the gl0-local client is never constructed ⇒ byte-identical to the pre-W3c path.
                 spendValidatorForAccept = (shardingConfig, shardAssignment) match {
                   case (Some(cfg), Some(assignment)) if cfg.numShards > 1 =>
                     val crossShardOverlay: SpendActionValidator.CrossShardEffectiveBalanceOverlay =
@@ -2345,8 +2350,18 @@ object GlobalSnapshotAcceptanceManager {
                           metagraphPinnedEpochProgresses,
                           epochProgress
                         )
+                    // GL0-LOCAL cross-shard read source (W3c read-source activation). gl0 is the GLOBAL mirror — it holds the
+                    // finalized state of EVERY shard's metagraphs — so a cross-shard `AllowSpend`/`Balance` the validator needs is
+                    // read DIRECTLY off gl0's own consensus-pinned reader (`branchAwareReader`, the SAME accept-`parentTip`-bound
+                    // reader every per-manager prior-state read uses this accept), NOT via a peer round-trip. DETERMINISM: the
+                    // accept's prior state is the cluster-uniform finalized snapshot, so every gl0 node's reader returns the
+                    // byte-identical value for the same key ⇒ the cross-shard spend-action result feeds the consensus mptRoot
+                    // identically on every node (a live `ShardSubtreeProofClient.http` here would be node-local ⇒ fork). An explicit
+                    // `crossShardSpendProofClient` (e.g. a test mock) still overrides; production leaves it `None` ⇒ gl0-local.
+                    val crossShardClient: ShardSubtreeProofClient[F] =
+                      crossShardSpendProofClient.getOrElse(ShardSubtreeProofClient.gl0Local[F](branchAwareReader))
                     SpendActionValidator.make[F](
-                      crossShardSpendProofClient.getOrElse(ShardSubtreeProofClient.noop[F]),
+                      crossShardClient,
                       assignment,
                       crossShardOverlay
                     )

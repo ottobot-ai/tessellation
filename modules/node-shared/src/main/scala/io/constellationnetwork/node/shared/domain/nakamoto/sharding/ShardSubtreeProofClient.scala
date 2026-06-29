@@ -2,19 +2,29 @@ package io.constellationnetwork.node.shared.domain.nakamoto.sharding
 
 import cats.Applicative
 import cats.effect.Async
-import cats.effect.kernel.Ref
+import cats.effect.kernel.{Ref, Sync}
 import cats.syntax.all._
 
+import scala.collection.immutable.SortedSet
+
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.http.p2p.PeerResponse
 import io.constellationnetwork.node.shared.http.p2p.middlewares.PeerAuthMiddleware
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.mpt.GlobalStateKey
+import io.constellationnetwork.schema.balance.Balance
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.peer.{P2PContext, Peer}
 import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId}
+import io.constellationnetwork.schema.swap.AllowSpend
 import io.constellationnetwork.security.SecurityProvider
+import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.prover.attestation.MerklePatriciaInclusionProof
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.signedAllowSpendSetCodec
+import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
+import io.circe.syntax._
 import org.http4s.Method.POST
 import org.http4s.client.Client
 import org.http4s.{Request, Uri}
@@ -89,6 +99,105 @@ object ShardSubtreeProofClient {
       key: GlobalStateKey
     ): F[Option[(Option[Array[Byte]], ShardSubtreeProof)]] =
       Applicative[F].pure(none[(Option[Array[Byte]], ShardSubtreeProof)])
+  }
+
+  /** GL0-LOCAL cross-shard read client — the DETERMINISTIC cross-shard read source for the gl0 acceptance path
+    * (`GlobalSnapshotAcceptanceManager.accept`, W3c activation).
+    *
+    * '''Why a local read, not a peer fetch.''' gl0 is the GLOBAL mirror — it already holds the finalized state of EVERY shard's metagraphs
+    * in its own MPT. The cross-shard value a `SpendActionValidator` needs (an `AllowSpend` set under `ActiveAllowSpends[targetMg][source]`,
+    * or a `Balance` under `Balances[targetMg][currencyId]`) is therefore readable directly from gl0's own consensus-pinned state — no
+    * committee round-trip required. The HTTP client ([[http]]) is the SHARD-COMMITTEE read path (one shard committee asking another's
+    * prover); on the gl0 accept path a peer fetch would be NODE-LOCAL (network/peer-pick/cooldown) and its result feeds the consensus
+    * `mptRoot`, which would FORK the cluster. This local reader eliminates that non-determinism: every gl0 node reads the SAME key off the
+    * SAME consensus-pinned reader and gets the byte-identical value.
+    *
+    * '''The deterministic anchor.''' `reader` MUST be the consensus-pinned prior-finalized reader the accept is already extending —
+    * i.e. the SAME `GlobalStateReader` (branch-aware, bound to the accept's `parentTip`) the per-manager prior-state reads use
+    * (`materializeActiveAllowSpendsFromMpt`, the `Balances` partition read, the `ConsumedAllowSpends` spent-set read). Because the accept's
+    * prior state is cluster-uniform (it is the finalized snapshot every node agreed on), every gl0 node's reader returns the byte-identical
+    * value for the same key. NEVER pass a pending/best-tip/peer view here.
+    *
+    * '''Return semantics''' (per the trait contract):
+    *   - membership ⇒ `Some((Some(jsonBytes), selfProof))`. `jsonBytes` are the Circe-JSON encoding of the typed value
+    *     (`SortedSet[Signed[AllowSpend]]` for [[GlobalStateFieldId.ActiveAllowSpends]], `Balance` for [[GlobalStateFieldId.Balances]]) —
+    *     the EXACT shape `SpendActionValidator.decodeCrossShardAllowSpends` / `decodeCrossShardBalance` decode (UTF-8 JSON). The value is
+    *     read TYPED off the MPT and re-encoded as JSON so it round-trips through the validator's existing decoders verbatim.
+    *   - absent key ⇒ `Some((None, selfProof))`. gl0 holds all shards' state, so an absent key is a PROVEN absence at the finalized anchor
+    *     (the validator treats it as "AllowSpend not found" / `Balance.empty`, identical to the same-shard `getOrElse` default) — NOT
+    *     "couldn't fetch". This is the key difference from the HTTP client, whose `None` means "unavailable, retry".
+    *   - unsupported `key.fieldId` (anything other than the two the validator reads) ⇒ `None` (unavailable). Defensive: the validator only
+    *     ever asks for `ActiveAllowSpends` / `Balances`, so this is unreachable in practice.
+    *
+    * '''The self proof is inert.''' The `SpendActionValidator` cross-shard paths consume ONLY the value bytes (the proof half of the tuple
+    * is discarded — `case Some((Some(bytes), _))`); the validator re-decodes the bytes and re-applies the W3c effective-balance overlay
+    * itself. There is no peer to mistrust on the gl0-local path (the value comes from gl0's OWN finalized state), so there is nothing to
+    * verify — the returned [[ShardSubtreeProof]] is a deterministic placeholder carrying the requested `(metagraphAddress, key, value)` and
+    * empty roots/witness. It exists only to satisfy the trait's tuple type.
+    *
+    * '''`numShards = 1`.''' Never constructed there — the gl0 accept path builds this client ONLY inside the `numShards > 1`
+    * sharded-validator branch, and at `numShards = 1` the injected unsharded validator is used (cross-shard path unreachable) ⇒
+    * byte-identical.
+    *
+    * @param reader
+    *   the consensus-pinned (branch-aware, accept-`parentTip`) finalized-state reader of gl0's global mirror. The determinism anchor.
+    */
+  def gl0Local[F[_]: Sync](reader: GlobalStateReader[F]): ShardSubtreeProofClient[F] = new ShardSubtreeProofClient[F] {
+
+    // Deterministic placeholder proof for the gl0-local path. The validator discards the proof half of the tuple (it consumes only
+    // the value bytes and re-applies the overlay itself), so this self proof is never inspected — it carries the request identity +
+    // value and empty roots/witness only to satisfy the `(Option[Array[Byte]], ShardSubtreeProof)` tuple type.
+    private def selfProof(metagraphAddress: Address, key: GlobalStateKey, value: Option[Array[Byte]]): ShardSubtreeProof =
+      ShardSubtreeProof(
+        shardCheckpointHash = io.constellationnetwork.security.hash.Hash.empty,
+        metagraphAddress = metagraphAddress,
+        perMgMptRoot = io.constellationnetwork.security.hash.Hash.empty,
+        key = key,
+        value = value.map(Hex.fromBytes(_)),
+        mptProof = MerklePatriciaInclusionProof(path = Hex(""), witness = List.empty)
+      )
+
+    def fetchAndVerify(
+      targetShardId: ShardId,
+      metagraphAddress: Address,
+      key: GlobalStateKey
+    ): F[Option[(Option[Array[Byte]], ShardSubtreeProof)]] = {
+
+      // Encode the typed value as Circe JSON UTF-8 bytes — the EXACT shape the SpendActionValidator decodes
+      // (`io.circe.parser.decode[V](new String(bytes, UTF-8))`).
+      def jsonBytes[A: io.circe.Encoder](a: A): Array[Byte] =
+        a.asJson.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+
+      def present(bytes: Array[Byte]): Option[(Option[Array[Byte]], ShardSubtreeProof)] =
+        (bytes.some, selfProof(metagraphAddress, key, bytes.some)).some
+
+      val absent: Option[(Option[Array[Byte]], ShardSubtreeProof)] =
+        (none[Array[Byte]], selfProof(metagraphAddress, key, none[Array[Byte]])).some
+
+      val unavailable: Option[(Option[Array[Byte]], ShardSubtreeProof)] =
+        none[(Option[Array[Byte]], ShardSubtreeProof)]
+
+      key.fieldId match {
+        case GlobalStateFieldId.ActiveAllowSpends =>
+          reader
+            .get[SortedSet[Signed[AllowSpend]]](key)
+            .map {
+              case Some(set) if set.nonEmpty => present(jsonBytes(set))
+              case _                         => absent
+            }
+
+        case GlobalStateFieldId.Balances =>
+          reader
+            .get[Balance](key)
+            .map {
+              case Some(balance) => present(jsonBytes(balance))
+              case None          => absent
+            }
+
+        // The validator only ever asks for the two partitions above; anything else is unsupported ⇒ fail-closed unavailable.
+        case _ => unavailable.pure[F]
+      }
+    }
   }
 
   /** Resolves gl0's last-finalized [[ShardCheckpoint]] for a given shard, lifted into a [[Signed]] envelope so it can drive
