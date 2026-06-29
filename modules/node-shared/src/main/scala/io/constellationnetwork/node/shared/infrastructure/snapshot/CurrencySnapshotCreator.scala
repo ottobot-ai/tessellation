@@ -305,7 +305,13 @@ object CurrencySnapshotCreator {
             // verifies before adopting them under roots-only sharding (these are reduced by cross-shard spends gl0 cannot replay). Already
             // Option-shaped (`None` pre-migration, `Some(map)` post-migration) — pass through as-is.
             currencySnapshotAcceptanceResult.info.activeAllowSpends,
-            currencySnapshotAcceptanceResult.info.activeTokenLocks
+            currencySnapshotAcceptanceResult.info.activeTokenLocks,
+            // authoritativeLastTxRefs — the metagraph's OWN cumulative last-tx-reference map. This is the EXACT `info.lastTxRefs` that
+            // `currencySnapshotAcceptanceResult.stateProof.lastTxRefsProof` (committed above) is hashed over (`csi.stateProof`), so the field
+            // and the proof are byte-consistent — the security anchor gl0 verifies before adopting it under roots-only sharding. gl0's
+            // per-incremental `AdoptFromSignedFields` replay cannot reproduce the cumulative ref map onto its path-dependent prior, so ml0
+            // PUSHES it here (no re-derive carry-forward for lastTxRefs in the sharded path).
+            currencySnapshotAcceptanceResult.info.lastTxRefs.some
           )
 
           artifactSize: Int <- JsonSerializer[F].serialize(artifact).map(_.length)

@@ -15,7 +15,7 @@ import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendBlock}
 import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockBlock}
-import io.constellationnetwork.schema.transaction.RewardTransaction
+import io.constellationnetwork.schema.transaction.{RewardTransaction, TransactionReference}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
@@ -33,6 +33,7 @@ import io.constellationnetwork.serde.codecs.instances.RewardTransactionCodec.{co
 import io.constellationnetwork.serde.codecs.instances.SharedArtifactCodec.sharedArtifactCodec
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
 import io.constellationnetwork.serde.codecs.instances.TokenLockCodec.{codec => tokenLockCodec}
+import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.{codec => transactionReferenceCodec}
 
 import scodec.Codec
 import shapeless.{::, HNil}
@@ -129,6 +130,11 @@ object CurrencySnapshotCodecs {
     sortedMap(addressCodec, sortedSet(signedTokenLockCodec))
   private val optAuthoritativeActiveAllowSpendsCodec = option(authoritativeActiveAllowSpendsMapCodec)
   private val optAuthoritativeActiveTokenLocksCodec = option(authoritativeActiveTokenLocksMapCodec)
+  // The metagraph's authoritative cumulative last-tx-ref map (`CurrencyIncrementalSnapshot.authoritativeLastTxRefs`). Reuse the SAME
+  // `SortedMap[Address, TransactionReference]` encoding as `CurrencySnapshotInfo.lastTxRefs` so the scodec form stays byte-consistent.
+  private val authoritativeLastTxRefsMapCodec: Codec[SortedMap[Address, TransactionReference]] =
+    sortedMap(addressCodec, transactionReferenceCodec)
+  private val optAuthoritativeLastTxRefsCodec = option(authoritativeLastTxRefsMapCodec)
 
   implicit val currencyIncrementalSnapshotCodec: Codec[CurrencyIncrementalSnapshot] =
     (ordinalCodec ::
@@ -151,12 +157,13 @@ object CurrencySnapshotCodecs {
       optAuthoritativeBalancesCodec ::
       optAuthoritativeActiveAllowSpendsCodec ::
       optAuthoritativeActiveTokenLocksCodec ::
+      optAuthoritativeLastTxRefsCodec ::
       versionCodec)
       .xmap[CurrencyIncrementalSnapshot](
         {
           case o :: h :: sh :: lsh :: blks :: rws :: tp :: sp :: ep ::
               da :: msgs :: syncs :: fees :: artifacts :: asb :: tlb ::
-              gsv :: authBal :: authAS :: authTL :: v :: HNil =>
+              gsv :: authBal :: authAS :: authTL :: authTxRefs :: v :: HNil =>
             CurrencyIncrementalSnapshot(
               o,
               h,
@@ -178,6 +185,7 @@ object CurrencySnapshotCodecs {
               authBal,
               authAS,
               authTL,
+              authTxRefs,
               v
             )
         },
@@ -202,6 +210,7 @@ object CurrencySnapshotCodecs {
             s.authoritativeBalances ::
             s.authoritativeActiveAllowSpends ::
             s.authoritativeActiveTokenLocks ::
+            s.authoritativeLastTxRefs ::
             s.version ::
             HNil
       )

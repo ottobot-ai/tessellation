@@ -254,6 +254,17 @@ object currency {
     // path). `None` for genesis and pre-this-field snapshots (greenfield: Option, no wire back-compat — all nodes rebuild together).
     authoritativeActiveAllowSpends: Option[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] = None,
     authoritativeActiveTokenLocks: Option[SortedMap[Address, SortedSet[Signed[TokenLock]]]] = None,
+    // The metagraph's OWN authoritative cumulative last-transaction-reference map — the EXACT `CurrencySnapshotInfo.lastTxRefs` the signed
+    // `stateProof.lastTxRefsProof` is computed over (so the field and the proof are byte-consistent — the security anchor). `lastTxRefs` is a
+    // CUMULATIVE per-source map carried across the metagraph's whole history; under roots-only sharding gl0 only sees the per-incremental
+    // `AdoptFromSignedFields` replay (the blocks in THIS signed incremental), so it cannot reproduce a ref set onto its own path-dependent
+    // carry-forward prior — once gl0 carries a stale `lastTxRefs` forward, every later per-incremental derive compounds the divergence and
+    // `lastTxRefsProof` never re-converges (the cl1 `/transactions/last-reference` freeze: derivedProof.lastTxRefsProof never equals the
+    // committed proof, so the per-field gate carries the prior forever). ml0 PUSHES the authoritative map here, the producer puts it in the
+    // per-MG checkpoint diff, and gl0 ADOPTS it after verifying it against the metagraph-signed `lastTxRefsProof` (no re-derive carry-forward
+    // for lastTxRefs in the sharded path — symmetric with `authoritativeBalances`). `None` for genesis and pre-this-field snapshots
+    // (greenfield: Option, no wire back-compat — all nodes rebuild together).
+    authoritativeLastTxRefs: Option[SortedMap[Address, TransactionReference]] = None,
     version: SnapshotVersion = SnapshotVersion("0.0.1")
   ) extends IncrementalSnapshot[CurrencySnapshotStateProof]
 
@@ -283,6 +294,7 @@ object currency {
           None, // authoritativeBalances — None for the genesis→first-incremental transition (populated by the production creator)
           None, // authoritativeActiveAllowSpends — None for the genesis→first-incremental transition
           None, // authoritativeActiveTokenLocks — None for the genesis→first-incremental transition
+          None, // authoritativeLastTxRefs — None for the genesis→first-incremental transition
           snapshot.version
         )
       }
@@ -324,6 +336,7 @@ object currency {
         None, // authoritativeBalances — legacy V1 carries no authoritative balance map
         None, // authoritativeActiveAllowSpends — legacy V1 carries no authoritative active-allow-spend map
         None, // authoritativeActiveTokenLocks — legacy V1 carries no authoritative active-token-lock map
+        None, // authoritativeLastTxRefs — legacy V1 carries no authoritative last-tx-ref map
         version
       )
   }
@@ -393,6 +406,7 @@ object currency {
           None, // authoritativeBalances — genesis→first-incremental; the production creator populates it on subsequent incrementals
           None, // authoritativeActiveAllowSpends — genesis→first-incremental; populated on subsequent incrementals
           None, // authoritativeActiveTokenLocks — genesis→first-incremental; populated on subsequent incrementals
+          None, // authoritativeLastTxRefs — genesis→first-incremental; populated on subsequent incrementals
           genesis.version
         )
       }

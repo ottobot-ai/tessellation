@@ -27,6 +27,7 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.schema.swap.AllowSpend
 import io.constellationnetwork.schema.tokenLock.TokenLock
+import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal, StateProofSelector}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
@@ -330,10 +331,16 @@ object ShardCheckpointWiring {
                         next.toOption.flatMap(_._1.value.authoritativeActiveAllowSpends)
                       val authTL: Option[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
                         next.toOption.flatMap(_._1.value.authoritativeActiveTokenLocks)
+                      // Authoritative cumulative last-tx-refs (committee-state-diff / cl1-lastRef-freeze fix): same anchor as balances. The
+                      // re-exec `infoOf(next)` rebuilds a per-incremental ref set that diverges from the metagraph's CUMULATIVE map, so OVERRIDE
+                      // it on BOTH the attested root and the diff — keeping the committee producer and the gl0 adopt side byte-identical.
+                      val authTxRefs: Option[SortedMap[Address, TransactionReference]] =
+                        next.toOption.flatMap(_._1.value.authoritativeLastTxRefs)
                       val nextInfo: CurrencySnapshotInfo = infoOf(next).copy(
                         balances = authBal.getOrElse(infoOf(next).balances),
                         activeAllowSpends = authAS.orElse(infoOf(next).activeAllowSpends),
-                        activeTokenLocks = authTL.orElse(infoOf(next).activeTokenLocks)
+                        activeTokenLocks = authTL.orElse(infoOf(next).activeTokenLocks),
+                        lastTxRefs = authTxRefs.getOrElse(infoOf(next).lastTxRefs)
                       )
                       // Carry the authoritative balances on BOTH the attested root and the diff (consistency): build a `next` whose info
                       // half has `balances = authBal` so the per-MG root commits to the authoritative map, matching the diff.

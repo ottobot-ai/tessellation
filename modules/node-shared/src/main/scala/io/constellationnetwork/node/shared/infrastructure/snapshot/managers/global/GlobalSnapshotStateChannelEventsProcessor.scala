@@ -704,8 +704,16 @@ object GlobalSnapshotStateChannelEventsProcessor {
             committedProof.activeAllowSpends.map(_ => nextActiveAllowSpends)
           )
           candidateActiveTokenLocks = authoritativeActiveTokenLocks.orElse(committedProof.activeTokenLocks.map(_ => nextActiveTokenLocks))
+          // AUTHORITATIVE LAST-TX-REFS (committee-state-diff / sharded cl1-lastRef-freeze fix). `lastTxRefs` is a CUMULATIVE per-source map;
+          // gl0's per-incremental `AdoptFromSignedFields` replay rebuilds it from THIS incremental's blocks merged onto gl0's OWN carry-forward
+          // prior (`lastState.lastTxRefs ++ txRefUpdates`), so once a single ordinal diverges (the ref landed in a block gl0 didn't replay into
+          // this incremental — e.g. genesis-seeded or a prior window), the per-field gate carries the stale prior forward and `lastTxRefsProof`
+          // NEVER re-converges → cl1's `/transactions/last-reference` stays frozen and metagraph txs Conflict forever. When the metagraph pushes
+          // its authoritative cumulative map, gl0 ADOPTS it directly (verified-by-proof below) instead of re-deriving — symmetric with balances.
+          authoritativeLastTxRefs = artifact.authoritativeLastTxRefs
+          candidateLastTxRefs = authoritativeLastTxRefs.getOrElse(nextLastTxRefs)
           candidate = CurrencySnapshotInfo(
-            lastTxRefs = nextLastTxRefs,
+            lastTxRefs = candidateLastTxRefs,
             balances = candidateBalances,
             lastMessages = nextLastMessagesOpt,
             lastFeeTxRefs = None,
@@ -768,9 +776,30 @@ object GlobalSnapshotStateChannelEventsProcessor {
               )
             )
           )
+          // Verify-by-proof for the authoritative last-tx-refs map: when the metagraph pushed `authoritativeLastTxRefs`, `candidate.lastTxRefs`
+          // IS that map, so `derivedProof.lastTxRefsProof` is its hash and MUST equal the metagraph's OWN signed `lastTxRefsProof`. FAIL-CLOSED
+          // on mismatch (RAISE → the caller drops the binary; the MG does not advance) — a fabricated/tampered authoritative map is rejected,
+          // never silently adopted while claiming authority. Same shape as the authoritativeBalances gate above.
+          _ <- Async[F].whenA(
+            authoritativeLastTxRefs.isDefined && derivedProof.lastTxRefsProof =!= committedProof.lastTxRefsProof
+          )(
+            logger.warn(
+              s"[ADOPT-VERIFY] address=${address.show} ordinal=${artifact.ordinal.show} authoritativeLastTxRefs != metagraph-signed " +
+                s"lastTxRefsProof — DROP (authoritative=${derivedProof.lastTxRefsProof.show} signed=${committedProof.lastTxRefsProof.show})"
+            ) >> Async[F].raiseError[Unit](
+              new RuntimeException(
+                s"authoritativeLastTxRefs for ${address.show} at ordinal ${artifact.ordinal.show} does not match the signed lastTxRefsProof"
+              )
+            )
+          )
           adopted = CurrencySnapshotInfo(
+            // lastTxRefs are AUTHORITATIVE-sourced in sharded mode: when the metagraph pushed `authoritativeLastTxRefs`, adopt it directly
+            // (already verified-by-proof above — no carry-forward). Otherwise fall back to the existing per-field gate (carry the prior forward
+            // when the per-incremental re-derived refs cannot be verified against the committed proof).
             lastTxRefs =
-              if (derivedProof.lastTxRefsProof === committedProof.lastTxRefsProof) candidate.lastTxRefs else lastState.lastTxRefs,
+              if (authoritativeLastTxRefs.isDefined) candidate.lastTxRefs
+              else if (derivedProof.lastTxRefsProof === committedProof.lastTxRefsProof) candidate.lastTxRefs
+              else lastState.lastTxRefs,
             // Balances are AUTHORITATIVE-sourced in sharded mode: when the metagraph pushed `authoritativeBalances`, adopt it directly
             // (already verified-by-proof above — no carry-forward). Otherwise fall back to the existing per-field gate (carry the prior
             // forward when the re-derived balances cannot be verified against the committed proof).

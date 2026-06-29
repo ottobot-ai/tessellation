@@ -1029,10 +1029,17 @@ object GlobalSnapshotAcceptanceManager {
                         // `MgBalances` (built from this committed `nextInfo`) is the authoritative map. The GAP-1 verify below
                         // still confirms each value hashes to the metagraph's OWN signed proof. Absent (legacy / pre-this-field)
                         // ⇒ keep the reconstructed value (byte-unchanged). Re-derivable fields (refs, sync-view) stay base+diff.
+                        // `lastTxRefs` is ALSO authoritative-overridden: it is a CUMULATIVE per-source ref map that the base+diff
+                        // reconstruction cannot reproduce when gl0's base lags the producer's (the same base-lag hazard as `balances`),
+                        // so applying the delta onto gl0's base yields the WRONG refs → per-MG root diverges → MG advance dropped, and
+                        // (the symptom) cl1's `/transactions/last-reference` freezes. OVERRIDE with the metagraph's pushed authoritative
+                        // cumulative refs (base-INDEPENDENT, matches the producer's `nextAuth`); the GAP-1 verify below ties it to the
+                        // metagraph's OWN signed `lastTxRefsProof`. Absent (legacy / pre-this-field) ⇒ keep the reconstructed value.
                         nextInfo = nextInfoRaw.copy(
                           balances = lastIncremental.value.authoritativeBalances.getOrElse(nextInfoRaw.balances),
                           activeAllowSpends = lastIncremental.value.authoritativeActiveAllowSpends.orElse(nextInfoRaw.activeAllowSpends),
-                          activeTokenLocks = lastIncremental.value.authoritativeActiveTokenLocks.orElse(nextInfoRaw.activeTokenLocks)
+                          activeTokenLocks = lastIncremental.value.authoritativeActiveTokenLocks.orElse(nextInfoRaw.activeTokenLocks),
+                          lastTxRefs = lastIncremental.value.authoritativeLastTxRefs.getOrElse(nextInfoRaw.lastTxRefs)
                         )
                         nextState = Right((lastIncremental, nextInfo)): StateChannelAcceptanceResult.CurrencySnapshotWithState
                         // PIN-1: recompute the COMPONENT-ADDRESSABLE per-MG root over the post-apply state via the SAME shared
@@ -1056,9 +1063,15 @@ object GlobalSnapshotAcceptanceManager {
                             (
                               hasher.hash(nextInfo.balances),
                               nextInfo.activeAllowSpends.traverse(hasher.hash(_)),
-                              nextInfo.activeTokenLocks.traverse(hasher.hash(_))
+                              nextInfo.activeTokenLocks.traverse(hasher.hash(_)),
+                              hasher.hash(nextInfo.lastTxRefs)
                             ).tupled.flatMap {
-                              case (reconstructedBalancesProof, reconstructedActiveAllowSpends, reconstructedActiveTokenLocks) =>
+                              case (
+                                    reconstructedBalancesProof,
+                                    reconstructedActiveAllowSpends,
+                                    reconstructedActiveTokenLocks,
+                                    reconstructedLastTxRefsProof
+                                  ) =>
                                 val balancesOk =
                                   !lastIncremental.value.authoritativeBalances.isDefined ||
                                     reconstructedBalancesProof === lastIncremental.value.stateProof.balancesProof
@@ -1068,14 +1081,19 @@ object GlobalSnapshotAcceptanceManager {
                                 val activeTokenLocksOk =
                                   !lastIncremental.value.authoritativeActiveTokenLocks.isDefined ||
                                     reconstructedActiveTokenLocks === lastIncremental.value.stateProof.activeTokenLocks
-                                if (balancesOk && activeAllowSpendsOk && activeTokenLocksOk)
+                                // `lastTxRefsProof` is a non-Option `Hash` = `lastTxRefs.hash` (`CurrencySnapshotInfo.stateProof`), so hash
+                                // `nextInfo.lastTxRefs` directly and tie the authoritative map to the metagraph's OWN signed proof.
+                                val lastTxRefsOk =
+                                  !lastIncremental.value.authoritativeLastTxRefs.isDefined ||
+                                    reconstructedLastTxRefsProof === lastIncremental.value.stateProof.lastTxRefsProof
+                                if (balancesOk && activeAllowSpendsOk && activeTokenLocksOk && lastTxRefsOk)
                                   (mg -> nextState).some.pure[F]
                                 else
                                   loggerBundle.app
                                     .warn(
                                       s"[ADOPT-VERIFY] ordinal=$ordinal mg=${mg.value.value.take(8)} authoritative field != metagraph-signed " +
                                         s"proof — DROP (balancesOk=$balancesOk activeAllowSpendsOk=$activeAllowSpendsOk " +
-                                        s"activeTokenLocksOk=$activeTokenLocksOk reconstructedBalancesProof=${reconstructedBalancesProof.value
+                                        s"activeTokenLocksOk=$activeTokenLocksOk lastTxRefsOk=$lastTxRefsOk reconstructedBalancesProof=${reconstructedBalancesProof.value
                                             .take(16)}... metagraphSignedBalancesProof=${lastIncremental.value.stateProof.balancesProof.value
                                             .take(16)}...)"
                                     )
