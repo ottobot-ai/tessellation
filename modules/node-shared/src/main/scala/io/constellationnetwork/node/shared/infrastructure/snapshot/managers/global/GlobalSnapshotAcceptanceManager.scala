@@ -24,6 +24,8 @@ import io.constellationnetwork.node.shared.domain.delegatedStake.{
   UpdateDelegatedStakeAcceptanceResult
 }
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
+import io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashManager.SlashedRegistryEntry
+import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{InvalidStateProofSlashManager, InvalidStateProofSlashedReader}
 import io.constellationnetwork.node.shared.domain.nakamoto.{NodeStakeAggregator, ShardAssignment}
 import io.constellationnetwork.node.shared.domain.node.UpdateNodeParametersAcceptanceManager
 import io.constellationnetwork.node.shared.domain.nodeCollateral.{
@@ -234,6 +236,104 @@ object GlobalSnapshotAcceptanceManager {
 
   private case object InvalidMerkleTree extends NoStackTrace
 
+  /** One upheld invalid-state-proof dispute surfaced from `adoptShardCheckpoints` — the durable-slash request the accept path applies. The
+    * reachable producer is the gl0-deterministic sub-quorum re-exec mismatch (`ShardCheckpointAcceptResult.RejectedReExecutionMismatch`),
+    * which carries no fraud-proof submitter ⇒ `submitter = None` ⇒ the full slashed amount BURNS (no bounty recipient). The `submitter`
+    * slot is `Option` so the watchtower-quorum dispute path (an `InvalidStateProofEvidence` carrying `fraudProof.submitterId`), when later
+    * wired into accept, credits the bounty by passing `Some(submitterAddress)`.
+    *
+    * @param shardId
+    *   the shard whose committee signed the wrong derivation (double-slash key half + registry-entry field).
+    * @param disputedCheckpointHash
+    *   `Hasher(cp.signingPreimage)` — the disputed checkpoint's canonical identity (double-slash key half + evidence digest).
+    * @param slashSigners
+    *   the committee signers to slash (every signer attested the wrong derivation; §10.2), deduplicated by the helper.
+    * @param submitter
+    *   the bounty recipient if this dispute arrived via a watchtower fraud proof; `None` for the gl0 self-detected re-exec path (burn all).
+    */
+  final case class WatchtowerSlashRequest(
+    shardId: ShardId,
+    disputedCheckpointHash: Hash,
+    slashSigners: List[PeerId],
+    submitter: Option[Address]
+  )
+
+  /** The deterministic outcome of folding every [[WatchtowerSlashRequest]] for one ordinal — the post-slash (pre-clean) stake maps that
+    * replace the accept path's `updatedCreateDelegatedStakes` / `updatedCreateNodeCollaterals`, the per-operator audit records to durably
+    * write into the `Slashings` MPT partition, the bounty credits to fold into balances (empty when no submitter), and the burned total.
+    */
+  final case class WatchtowerSlashApplication(
+    slashedDelegatedStakes: SortedMap[Address, SortedSet[DelegatedStakeRecord]],
+    slashedNodeCollaterals: SortedMap[Address, SortedSet[NodeCollateralRecord]],
+    registryEntries: List[SlashedRegistryEntry],
+    bountyBalanceDelta: SortedMap[Address, Balance],
+    totalBurned: Long
+  )
+
+  /** Apply every upheld invalid-state-proof dispute for one ordinal as a PURE, deterministic fold (consensus-state — every honest node
+    * computes the byte-identical post-state). Requests are processed in `(shardId, disputedCheckpointHash)` sort order; each
+    * [[InvalidStateProofSlashManager.applySlash]] is pure and its post-slash maps seed the next request's prior, so the accumulated maps +
+    * registry entries + burn are order-deterministic. Bounty credit: when a request carries a `submitter`, `bountyAmount` is credited to
+    * that address via `creditBalance` over its prior balance (`priorBalances` + any earlier credit this fold); otherwise the whole slashed
+    * pool burns. `disputedCheckpointHash` doubles as the registry entry's `evidenceDigest` (it is the canonical identity of the disputed
+    * checkpoint).
+    *
+    * Returns the prior maps verbatim + empty deltas when `requests` is empty — the no-op fast path that keeps `numShards = 1` (where no
+    * request is ever produced) byte-identical.
+    */
+  def applyWatchtowerSlashes(
+    requests: List[WatchtowerSlashRequest],
+    priorDelegatedStakes: SortedMap[Address, SortedSet[DelegatedStakeRecord]],
+    priorNodeCollaterals: SortedMap[Address, SortedSet[NodeCollateralRecord]],
+    priorBalances: SortedMap[Address, Balance],
+    eventOrdinal: SnapshotOrdinal,
+    currentEpoch: EpochProgress,
+    config: InvalidStateProofSlashingConfig
+  ): WatchtowerSlashApplication =
+    if (requests.isEmpty)
+      WatchtowerSlashApplication(priorDelegatedStakes, priorNodeCollaterals, Nil, SortedMap.empty[Address, Balance], 0L)
+    else
+      requests
+        .sortBy(r => (r.shardId.value.value, r.disputedCheckpointHash.value))
+        .foldLeft(
+          WatchtowerSlashApplication(priorDelegatedStakes, priorNodeCollaterals, Nil, SortedMap.empty[Address, Balance], 0L)
+        ) { (acc, req) =>
+          val res = InvalidStateProofSlashManager.applySlash(
+            slashTargets = req.slashSigners.toSet,
+            priorDelegatedStakes = acc.slashedDelegatedStakes,
+            priorNodeCollaterals = acc.slashedNodeCollaterals,
+            eventOrdinal = eventOrdinal,
+            currentEpoch = currentEpoch,
+            shardId = req.shardId,
+            disputedCheckpointHash = req.disputedCheckpointHash,
+            evidenceDigest = req.disputedCheckpointHash,
+            slashFraction = config.slashFraction,
+            bountyFraction = config.bountyFraction,
+            cooldownEpochs = config.cooldownEpochs
+          )
+          // Bounty credit ONLY when a submitter is present (watchtower-quorum path). The re-exec path passes `None` ⇒ no credit ⇒ the
+          // `bountyAmount` portion also burns (it is never returned to any balance). Read the running balance from the prior map folded with
+          // any earlier credit this same fold so two requests crediting the same submitter accumulate.
+          val nextBountyDelta: SortedMap[Address, Balance] = req.submitter match {
+            case Some(addr) if res.bountyAmount > 0L =>
+              val current = acc.bountyBalanceDelta.getOrElse(addr, priorBalances.getOrElse(addr, Balance.empty))
+              acc.bountyBalanceDelta.updated(addr, InvalidStateProofSlashManager.creditBalance(current, res.bountyAmount))
+            case _ => acc.bountyBalanceDelta
+          }
+          // Burn = the slashed pool minus whatever was actually credited as bounty. With no submitter the credit is 0 ⇒ burn = total.
+          val creditedThisStep: Long = req.submitter match {
+            case Some(_) => res.bountyAmount
+            case None    => 0L
+          }
+          WatchtowerSlashApplication(
+            slashedDelegatedStakes = res.slashedDelegatedStakes,
+            slashedNodeCollaterals = res.slashedNodeCollaterals,
+            registryEntries = acc.registryEntries ++ res.newRegistryEntries,
+            bountyBalanceDelta = nextBountyDelta,
+            totalBurned = acc.totalBurned + (res.totalSlashedAmount - creditedThisStep)
+          )
+        }
+
   def make[F[_]: Async: Parallel: HasherSelector: SecurityProvider: JsonSerializer: Metrics](
     fieldsAddedOrdinals: FieldsAddedOrdinals,
     metagraphsSyncConfig: MetagraphsSyncConfig,
@@ -318,7 +418,18 @@ object GlobalSnapshotAcceptanceManager {
     // The existing confirmation depth k (`ConfirmationDepthK`). The cutoff ordinal committed at accept(N) is `N − k`. Defaults
     // to 255 (the production default) but the gl0 wiring passes the same value the leader loop / sync daemon read, so producer
     // and verifier agree. Only consulted when `historicalCommitmentSmtStore` is `Some`.
-    confirmationDepthK: Long = 255L
+    confirmationDepthK: Long = 255L,
+    // WATCHTOWER invalid-state-proof slashing config (slashing part 3): slashFraction / bountyFraction / cooldownEpochs / watchtowerEnabled
+    // — typed HOCON, NOT a `sys.env` read (project rule). Threaded into the `applyWatchtowerSlashes` fold at the upheld-dispute sink. Default
+    // mirrors `application.conf`'s `nakamoto.invalidity-slashing` (100% tier, 5% bounty, 100-epoch cooldown, watchtower ON) so the durable
+    // slash applies at `numShards > 1`. PRODUCTION WIRING threads `SharedConfig.nakamoto.invaliditySlashing` from the single HOCON source
+    // at the sole GSAM construction site (`SharedServices.make`), so the operator-configured, cluster-uniform fraction/cooldown/bounty are
+    // used; this default mirrors `application.conf` and serves only as the test/fallback value.
+    // NOTE: `watchtowerEnabled = false` makes the sink inert (no slash + no `Slashings` write), keeping the mptRoot pre-slash. The slash is
+    // ONLY reachable at `numShards > 1` regardless (the adopt path that surfaces the request never runs at `numShards = 1`), so the
+    // `numShards = 1` byte-identical regression bar is independent of this config.
+    invaliditySlashingConfig: InvalidStateProofSlashingConfig =
+      InvalidStateProofSlashingConfig(watchtowerEnabled = true, slashFraction = 1.0d, bountyFraction = 0.05d, cooldownEpochs = 100L)
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): F[GlobalSnapshotAcceptanceManager[F]] = {
@@ -573,7 +684,12 @@ object GlobalSnapshotAcceptanceManager {
         )(implicit hasher: Hasher[F]): F[
           (
             SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-            SortedMap[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash)]
+            SortedMap[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash)],
+            // WATCHTOWER durable-slash requests (slashing part 3): one per upheld invalid-state-proof dispute surfaced this ordinal — the
+            // gl0-deterministic sub-quorum re-exec mismatch (`RejectedReExecutionMismatch`). Consumed by the accept path's pure
+            // `applyWatchtowerSlashes` fold (post-slash stake maps + `Slashings` MPT records + burn). Empty on the common all-accept path
+            // and ALWAYS empty at `numShards = 1` (this method never runs there) ⇒ the regression bar is preserved.
+            List[WatchtowerSlashRequest]
           )
         ] =
           shardCheckpoints.toList
@@ -583,10 +699,11 @@ object GlobalSnapshotAcceptanceManager {
                 List.empty[io.constellationnetwork.schema.sharding.CrossShardReceipt],
                 // Per-adopted-MG committee `(byte-diff, attested per-MG root)` — STEP 6 ADOPT-AND-VERIFY input to
                 // `deriveAdoptedCurrencyState`. Only populated for MGs whose accepted checkpoint carried a diff for them.
-                SortedMap.empty[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash)]
+                SortedMap.empty[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash)],
+                List.empty[WatchtowerSlashRequest]
               )
             ) {
-              case ((adoptedAcc, receiptsAcc, diffAcc), (shardId, cp)) =>
+              case ((adoptedAcc, receiptsAcc, diffAcc, slashAcc), (shardId, cp)) =>
                 // DETERMINISTIC adopt-verifier — NOT node-local `evaluate`. `verifyEmbedded` decides purely from the checkpoint bytes +
                 // the committee membership for `(shardId, epoch)`, so the leader (produce), the follower (`createContext`), and every gl0
                 // peer (`validateArtifact`) reach a byte-identical adopt decision + committed state. Using `evaluate` here (which reads the
@@ -671,7 +788,7 @@ object GlobalSnapshotAcceptanceManager {
                       Hasher[F]
                         .hash(cp.signingPreimage)
                         .flatMap(cpHash => checkpointManager.noteAdopted(shardId, cp.shardOrdinal, cpHash))
-                        .as((adoptedAcc ++ chainContinuous, receiptsAcc ++ newReceipts, diffAcc ++ newDiffs))
+                        .as((adoptedAcc ++ chainContinuous, receiptsAcc ++ newReceipts, diffAcc ++ newDiffs, slashAcc))
 
                   case ShardCheckpointAcceptResult.PendingMoreAttestations =>
                     loggerBundle.app
@@ -679,7 +796,7 @@ object GlobalSnapshotAcceptanceManager {
                         s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                           s"PENDING — will retry next gl0 ord"
                       )
-                      .as((adoptedAcc, receiptsAcc, diffAcc))
+                      .as((adoptedAcc, receiptsAcc, diffAcc, slashAcc))
 
                   case ShardCheckpointAcceptResult.Rejected(reason) =>
                     // Logged at info (not warn) because a Rejected checkpoint can be a legitimate operator-level transient
@@ -690,37 +807,47 @@ object GlobalSnapshotAcceptanceManager {
                         s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                           s"REJECTED reason=$reason"
                       )
-                      .as((adoptedAcc, receiptsAcc, diffAcc))
+                      .as((adoptedAcc, receiptsAcc, diffAcc, slashAcc))
 
                   case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, slashSigners) =>
                     // Wrong-derivation result (sub-quorum re-exec path). The committee signers deviated from determinism and are the
                     // 100% `InvalidStateProof` slash targets (§10.2). The deterministic LEDGER EFFECT is
-                    // `io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashManager.applySlash`
-                    // (stake reduction ×(1−slashFraction) + cooldown registry entry + bounty/burn), the SAME sink the WATCHTOWER quorum-path
-                    // dispute feeds via an on-chain `InvalidStateProofEvidence`.
+                    // `InvalidStateProofSlashManager.applySlash` (stake reduction ×(1−slashFraction) + cooldown registry entry +
+                    // bounty/burn), the SAME sink the WATCHTOWER quorum-path dispute feeds via an on-chain `InvalidStateProofEvidence`.
                     //
-                    // TODO(invalidity-slash durable application): apply `applySlash` here against the GSI `activeDelegatedStakes` /
-                    // `activeNodeCollaterals` maps being built and persist the slashed-registry entries to the `slashings` MPT partition
-                    // (fieldId 33) + thread the same write into the rebuild path (or the delta-path vs rebuild-path mptRoot diverges — the
-                    // known footgun). That write touches the 2800-line accept() comprehension + GlobalStateConverter + the rebuild path, so
-                    // it is sequenced as a dedicated follow-up rather than half-wired here. Until then the slash is COMPUTED + surfaced
-                    // (targets + reason) but the irreversible map mutation + MPT partition write are deferred. The pure manager + the
-                    // deterministic verdict + the watchtower detection are all in place; this is the remaining durable-ledger seam.
-                    loggerBundle.app
-                      .warn(
-                        s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                          s"REJECTED-REEXEC-MISMATCH reason=$reason slashSigners=${slashSigners.size} " +
-                          s"(InvalidStateProof 100% tier — slash computed via InvalidStateProofSlashManager; durable MPT write = TODO)"
-                      )
-                      .as((adoptedAcc, receiptsAcc, diffAcc))
+                    // DURABLE WIRING (slashing part 3): surface a `WatchtowerSlashRequest` here — the canonical disputed-checkpoint hash
+                    // (`Hasher(cp.signingPreimage)`) + the slash-target signers. The accept path's pure `applyWatchtowerSlashes` fold then
+                    // (a) reduces/removes the targets' `activeDelegatedStakes` / `activeNodeCollaterals` BEFORE `cleanStateMaps` (so the
+                    // existing removal-key derivation + GSI + accumulator stay consistent), and (c) writes each `SlashedRegistryEntry` into
+                    // the `Slashings` MPT partition (fieldId 34) — both the writer-algebra view AND the #107 verify-replay set — after
+                    // `applyStateChanges`. This path carries NO fraud-proof submitter (gl0 self-detected via re-exec), so the bounty has no
+                    // recipient ⇒ the whole slashed pool burns (`submitter = None`). The decision is reached identically by leader/follower/
+                    // peer (deterministic re-exec inside `accept()`), so the durable write is consensus-safe.
+                    val slashTargets = slashSigners.distinct
+                    Hasher[F].hash(cp.signingPreimage).flatMap { cpHash =>
+                      loggerBundle.app
+                        .warn(
+                          s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
+                            s"REJECTED-REEXEC-MISMATCH reason=$reason slashSigners=${slashTargets.size} " +
+                            s"checkpoint=${cpHash.value.take(12)} (InvalidStateProof 100% tier — durable slash + Slashings MPT write queued)"
+                        )
+                        .as(
+                          (
+                            adoptedAcc,
+                            receiptsAcc,
+                            diffAcc,
+                            slashAcc :+ WatchtowerSlashRequest(shardId, cpHash, slashTargets, submitter = None)
+                          )
+                        )
+                    }
                 }
             }
             .flatMap {
-              case (adopted, receipts, diffs) =>
+              case (adopted, receipts, diffs, slashRequests) =>
                 // Side-effect: drain the union of cross-shard receipts into the shared MetagraphSyncManager accumulator.
                 // The manager's internal seen-set gate makes the apply idempotent — duplicate receipts (operator replay,
                 // gossip duplication, or repeat-evaluation in a re-acceptance turn) are silently dropped after first sight.
-                metagraphSyncManager.consumeReceipts(receipts).as((adopted, diffs))
+                metagraphSyncManager.consumeReceipts(receipts).as((adopted, diffs, slashRequests))
             }
 
         /** Axis 1a (#259) + STEP 6 committee-state-diff ADOPT-AND-VERIFY. Derive the per-metagraph accepted-currency-snapshot view from
@@ -1873,12 +2000,18 @@ object GlobalSnapshotAcceptanceManager {
                       Async[F].pure(
                         (
                           SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-                          SortedMap.empty[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash)]
+                          SortedMap.empty[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash)],
+                          List.empty[WatchtowerSlashRequest]
                         )
                       )
                   }
                 adoptedScSnapshots = adoptedResult._1
                 adoptedDiffs = adoptedResult._2
+                // WATCHTOWER durable-slash requests surfaced by the adopt path (empty unless an upheld re-exec mismatch this ordinal; ALWAYS
+                // empty at numShards=1 since `adoptShardCheckpoints` never runs there). Applied to the stake maps below, before cleaning.
+                // The `watchtowerEnabled` config gate makes the durable slash inert when off (drop the requests ⇒ `applyWatchtowerSlashes` is
+                // a no-op ⇒ stake maps + `Slashings` partition + mptRoot unchanged) — a single deterministic kill-switch read at one site.
+                adoptedSlashRequests = if (invaliditySlashingConfig.watchtowerEnabled) adoptedResult._3 else Nil
 
                 // CHANGE 3 — partition the raw `scEvents` by the deterministic static shard assignment. When sharding is
                 // active (`numShards > 1` AND `shardAssignment` wired), a metagraph address that maps to a shard flows ONLY
@@ -2313,13 +2446,39 @@ object GlobalSnapshotAcceptanceManager {
                 priorDelegatedStakeWithdrawalKeys <- delegatedStakeStateManager.materializeDelegatedStakeWithdrawalAddressesFromMpt
                 priorNodeCollateralKeys <- nodeCollateralStateManager.materializeActiveNodeCollateralAddressesFromMpt
                 priorNodeCollateralWithdrawalKeys <- nodeCollateralStateManager.materializeNodeCollateralWithdrawalAddressesFromMpt
+
+                // WATCHTOWER durable slash (slashing part 3): apply every upheld invalid-state-proof dispute as a PURE deterministic fold
+                // BEFORE `cleanStateMaps`, so the existing cleaning + removed-key derivation + GSI + accumulator all consume the post-slash
+                // maps with no second code path. `applyWatchtowerSlashes` reduces/removes the slash targets' delegated-stake + collateral
+                // records (100% tier ⇒ full removal), yields one `SlashedRegistryEntry` per `(operator, shard, checkpoint)` for the
+                // `Slashings` MPT write, and (re-exec path: `submitter = None`) burns the entire pool (no bounty credit). Empty `requests`
+                // (the common path; ALWAYS empty at numShards=1) ⇒ the prior maps verbatim + empty deltas ⇒ byte-identical to pre-slash.
+                slashApplication = applyWatchtowerSlashes(
+                  adoptedSlashRequests,
+                  updatedCreateDelegatedStakes,
+                  updatedCreateNodeCollaterals,
+                  priorBalances,
+                  ordinal,
+                  epochProgress,
+                  invaliditySlashingConfig
+                )
+                slashRegistryEntries = slashApplication.registryEntries
+                slashBountyBalanceDelta = slashApplication.bountyBalanceDelta
+                _ <- Async[F].whenA(slashRegistryEntries.nonEmpty)(
+                  loggerBundle.app.warn(
+                    s"[ACCEPTANCE/SLASHING] ordinal=$ordinal applied watchtower invalid-state-proof slash: " +
+                      s"records=${slashRegistryEntries.size} burned=${slashApplication.totalBurned} " +
+                      s"bountyCredits=${slashBountyBalanceDelta.size}"
+                  )
+                )
+
                 cleanedMapsResult = cleanStateMaps(
                   updatedAllowSpends,
                   updatedTokenLockBalances,
                   updatedGlobalTokenLocks,
-                  updatedCreateDelegatedStakes,
+                  slashApplication.slashedDelegatedStakes,
                   updatedWithdrawDelegatedStakes,
-                  updatedCreateNodeCollaterals,
+                  slashApplication.slashedNodeCollaterals,
                   updatedWithdrawNodeCollaterals,
                   priorDelegatedStakeKeys,
                   priorDelegatedStakeWithdrawalKeys,
@@ -2364,7 +2523,9 @@ object GlobalSnapshotAcceptanceManager {
                   initialData.blockResult,
                   updatedLastStateChannelSnapshotHashes,
                   (priorLastTxRefs ++ transactionsRefsDeltas).toSortedMap,
-                  priorBalances ++ updatedBalancesBySpendTransactions,
+                  // `slashBountyBalanceDelta` already carries the submitter's FINAL credited balance (creditBalance over its prior), so the
+                  // right-biased merge sets it authoritatively. Empty on the reachable re-exec path (no submitter) ⇒ byte-identical.
+                  priorBalances ++ updatedBalancesBySpendTransactions ++ slashBountyBalanceDelta,
                   updatedLastCurrencySnapshots,
                   updatedLastCurrencySnapshotProofs,
                   updatedAllowSpendsCleaned,
@@ -2389,7 +2550,10 @@ object GlobalSnapshotAcceptanceManager {
                     rewardBalancesDelta ++
                     updatedBalancesByAllowSpendsDeltas ++
                     updatedBalancesByTokenLocksDeltas ++
-                    updatedBalancesBySpendTransactionsDeltas
+                    updatedBalancesBySpendTransactionsDeltas ++
+                    // WATCHTOWER slash bounty credit (final balance per submitter). Empty on the reachable re-exec path (no submitter) ⇒ the
+                    // accumulator `balances` delta — and thus the MPT Balances partition + mptRoot — is byte-identical to pre-slash.
+                    slashBountyBalanceDelta
 
                 currencySnapshotsDeltas = incomingCurrencySnapshots.collect {
                   case (address, snapshots) if snapshots.nonEmpty => address -> snapshots.last
@@ -2594,6 +2758,33 @@ object GlobalSnapshotAcceptanceManager {
                 // pipelineDepth=1) base==branch, so the removal set — and every written byte — is identical to the default branch path.
                 currencyWriteRemovalPrior = if (shardedInfoMode) Some(baseCurrencyInfoReader) else None
                 _ <- AcceptanceMptStateChanges.applyStateChanges[F](mpt, stateChangesAccumulator, currencyWriteRemovalPrior)
+
+                // WATCHTOWER slash ledger MPT write (slashing part 3). The `Slashings` partition (fieldId 34) is NOT carried by
+                // `StateChangesAccumulator` (whose shape lives in `GlobalStateConverter`, out of this change's scope), so write it DIRECTLY
+                // through the same branch-aware writer algebra (`mpt.insert`) right after `applyStateChanges`. Encode the value via the
+                // canonical `InvalidStateProofSlashedReader.entryCodec` — the SAME codec the reader decodes with — so the bytes are
+                // deterministic and reproducible. Keys are the `(peerId, shardId, disputedCheckpointHash)` composite hash (sorted by the
+                // entry tuple for a deterministic, order-independent write set). The matching entries are folded into the #107
+                // verify-replay `expectedBytes` below so the writer-path `postBytes` and the replay agree (no false DIVERGED). EMPTY on the
+                // reachable common path / always at numShards=1 ⇒ no key written ⇒ mptRoot byte-identical to the pre-slash path.
+                slashingsMptEntries <- slashRegistryEntries
+                  .sortBy(e => (e.peerId.value.value, e.shardId.value.value, e.disputedCheckpointHash.value))
+                  .traverse { entry =>
+                    GlobalStateKey
+                      .slashingsKey[F](entry.peerId, entry.shardId, entry.disputedCheckpointHash)
+                      .map(_ -> entry)
+                  }
+                _ <- Async[F].whenA(slashingsMptEntries.nonEmpty)(
+                  mpt.insert[SlashedRegistryEntry](slashingsMptEntries.toMap)(InvalidStateProofSlashedReader.entryCodec)
+                )
+                // Hex-keyed byte view of the slash entries for the verify-replay fold (computed via the SAME `toHex` + `entryCodec` the
+                // writer used, so the bytes are identical to those now in `postBytes`).
+                slashingsReplayBytes <- slashingsMptEntries.traverse {
+                  case (key, entry) =>
+                    GlobalStateKey
+                      .toHex[F](key)
+                      .map(hex => hex -> InvalidStateProofSlashedReader.entryCodec.immutableBytes(entry).toArray)
+                }.map(_.toMap)
                 // Pull the post-write byte view from the overlay (Phase J). Under Passthrough this
                 // collapses to `overlay.base.allEntriesAsBytes` (writes already committed inline);
                 // under MultiBranch it composes parent-chain pending entries with this handle's
@@ -2675,7 +2866,11 @@ object GlobalSnapshotAcceptanceManager {
                       deltaPair <- io.constellationnetwork.schema.mpt.GlobalStateConverter
                         .toAccumulatorHexDelta[F](stateChangesAccumulator, preSyncBytes, mgRemovalPrior)
                       (deltaUpserts, deltaRemoves) = deltaPair
-                      expectedBytes = (preSyncBytes -- deltaRemoves) ++ deltaUpserts
+                      // Fold the directly-written `Slashings` entries into the replay set: they are written via `mpt.insert` (not the
+                      // accumulator), so `toAccumulatorHexDelta` does not see them — without this fold the writer-path `postBytes` would carry
+                      // them while the replay would not, falsely tripping the #107 DIVERGED self-check. Right-biased `++` after the accumulator
+                      // delta (the slash partition keys never collide with any accumulator key). Empty on the reachable path ⇒ no-op.
+                      expectedBytes = ((preSyncBytes -- deltaRemoves) ++ deltaUpserts) ++ slashingsReplayBytes
                       // The consensus global root excludes SystemNamespace sidecars (path-dependent ActiveAddressIndex / expiry buckets)
                       // AND the observation-dependent `MgGlobalSnapshotSyncView` (`GlobalStateKey.consensusRootEntries`).
                       // `incrementalProof.mptRoot` is computed over that same set; the independent verify-replay must drop the same entries

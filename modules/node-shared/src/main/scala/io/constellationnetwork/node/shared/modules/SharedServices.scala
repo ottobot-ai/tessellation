@@ -349,7 +349,12 @@ object SharedServices {
         // `ShardCheckpointWiring.acceptanceDeps` result feeds both GSAM construction sites so they stay consistent.
         shardingConfig = shardAcceptanceDeps.map(_.shardingConfig),
         shardCheckpointAcceptanceManager = shardAcceptanceDeps.map(_.acceptanceManager),
-        shardAssignment = shardAcceptanceDeps.map(_.shardAssignment)
+        shardAssignment = shardAcceptanceDeps.map(_.shardAssignment),
+        // WATCHTOWER invalid-state-proof slashing (slashing part 3): thread the typed HOCON config from the single
+        // `nakamoto.invalidity-slashing` source (NOT the GSAM-make hardcoded default) so the slash fraction/cooldown/bounty —
+        // which feed the post-slash stake maps committed into the global mptRoot — are the operator-configured, cluster-uniform
+        // values. This is the sole GSAM construction site, so threading here covers the whole acceptance path.
+        invaliditySlashingConfig = cfg.nakamoto.invaliditySlashing
       )
       globalSnapshotContextFns = GlobalSnapshotContextFunctions.make(
         globalSnapshotAcceptanceManager,

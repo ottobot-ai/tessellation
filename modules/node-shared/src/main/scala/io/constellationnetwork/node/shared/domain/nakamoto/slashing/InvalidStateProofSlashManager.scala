@@ -20,11 +20,11 @@ import eu.timepit.refined.types.numeric.NonNegLong
 /** WATCHTOWER invalid-state-proof LEDGER EFFECT (slashing part 3) — the 100% `InvalidStateProof` slash tier of
   * `docs/nakamoto/SLASHING-DESIGN.md` §5/§6.
   *
-  * '''Pure + deterministic.''' Given the slash targets (the committee that signed the wrong checkpoint), the prior
-  * `activeDelegatedStakes` / `activeNodeCollaterals` maps, and the config, [[applySlash]] computes the post-slash maps + the slash records +
-  * the burned/bounty amounts as a PURE function — every honest node applying the same upheld evidence to the same prior state computes the
-  * byte-identical result. No I/O, no clock, no env (config is threaded). Same safety + determinism discipline as the
-  * `SlashableEvidence`/equivocation ledger effects (`feedback_slashing_safety_bar`).
+  * '''Pure + deterministic.''' Given the slash targets (the committee that signed the wrong checkpoint), the prior `activeDelegatedStakes`
+  * / `activeNodeCollaterals` maps, and the config, [[applySlash]] computes the post-slash maps + the slash records + the burned/bounty
+  * amounts as a PURE function — every honest node applying the same upheld evidence to the same prior state computes the byte-identical
+  * result. No I/O, no clock, no env (config is threaded). Same safety + determinism discipline as the `SlashableEvidence`/equivocation
+  * ledger effects (`feedback_slashing_safety_bar`).
   *
   * '''What it does''' (per `SLASHING-DESIGN.md` §5, adapted — NOT a new primitive):
   *   1. '''Stake reduction''' — for every `(delegator, record)` whose `record.event.value.nodeId` is a slash target, reduce the staked
@@ -37,9 +37,9 @@ import eu.timepit.refined.types.numeric.NonNegLong
   *   1. '''Bounty + burn''' — `bountyFraction` of the slashed amount is credited to the submitter; the remainder is BURNED (removed from
   *      circulating supply, no minter).
   *
-  * '''Reused, not invented.''' The schema mirrors `SLASHING-DESIGN.md` §5's table 1:1 (stake ×(1−fraction), `slashedRegistry` entry,
-  * bounty credit, burn). The detection (watchtower re-exec) + the deterministic verdict ([[InvalidStateProofValidator]]) supply the
-  * evidence; this manager is the §5 ledger sink.
+  * '''Reused, not invented.''' The schema mirrors `SLASHING-DESIGN.md` §5's table 1:1 (stake ×(1−fraction), `slashedRegistry` entry, bounty
+  * credit, burn). The detection (watchtower re-exec) + the deterministic verdict ([[InvalidStateProofValidator]]) supply the evidence; this
+  * manager is the §5 ledger sink.
   */
 object InvalidStateProofSlashManager {
 
@@ -71,8 +71,8 @@ object InvalidStateProofSlashManager {
   /** Apply the 100%-tier (default) invalid-state-proof slash purely.
     *
     * '''Partial-fraction caveat (documented constraint).''' `DelegatedStakeRecord` has a `currentAmount` slot so a partial delegated-stake
-    * slash IS representable (reduce in place). `NodeCollateralRecord` has NO mutable-amount slot, so a partial COLLATERAL slash would need a
-    * schema change; this manager therefore supports a partial fraction for delegated stake but only FULL removal for collateral. At the
+    * slash IS representable (reduce in place). `NodeCollateralRecord` has NO mutable-amount slot, so a partial COLLATERAL slash would need
+    * a schema change; this manager therefore supports a partial fraction for delegated stake but only FULL removal for collateral. At the
     * production default `slashFraction = 1.0` both are full removal — the supported, exercised path. A configured `slashFraction < 1.0`
     * reduces delegated stake proportionally and still fully removes collateral (conservative — never under-slashes the offender).
     *
@@ -188,9 +188,9 @@ object InvalidStateProofSlashManager {
   def creditBalance(prior: Balance, bounty: Long): Balance =
     Balance(NonNegLong.unsafeFrom(math.max(0L, prior.value.value + math.max(0L, bounty))))
 
-  /** The reason an operator was slashed — the audit discriminator on [[SlashedRegistryEntry]]. Sealed ADT (per `feedback_no_string_matching`):
-    * the slash tier is typed, not a string. `InvalidStateProof` is the 100% tier (this manager); future tiers (equivocation,
-    * non-participation) slot in here when their ledger sinks land.
+  /** The reason an operator was slashed — the audit discriminator on [[SlashedRegistryEntry]]. Sealed ADT (per
+    * `feedback_no_string_matching`): the slash tier is typed, not a string. `InvalidStateProof` is the 100% tier (this manager); future
+    * tiers (equivocation, non-participation) slot in here when their ledger sinks land.
     */
   @derive(decoder, encoder, eqv, show)
   sealed trait SlashReason extends Product with Serializable
@@ -201,8 +201,10 @@ object InvalidStateProofSlashManager {
     case object NonParticipation extends SlashReason
   }
 
-  /** One slashed-operator audit + cooldown record — the `slashedRegistry` entry of `SLASHING-DESIGN.md` §5. Written to the `slashings` MPT
-    * partition (fieldId 33) and read by the active-set gate (cooldown) + the double-slash guard ([[InvalidStateProofSlashedReader]]).
+  /** One slashed-operator audit + cooldown record — the `slashedRegistry` entry of `SLASHING-DESIGN.md` §5. Written to the
+    * [[io.constellationnetwork.schema.mpt.GlobalStateFieldId.Slashings]] MPT partition (fieldId 34 — fieldId 33 is `ConsumedAllowSpends`),
+    * keyed by `GlobalStateKey.slashingsKey(peerId, shardId, disputedCheckpointHash)`, and read by the active-set gate (cooldown) + the
+    * double-slash guard ([[InvalidStateProofSlashedReader]]).
     *
     * @param peerId
     *   the slashed operator.

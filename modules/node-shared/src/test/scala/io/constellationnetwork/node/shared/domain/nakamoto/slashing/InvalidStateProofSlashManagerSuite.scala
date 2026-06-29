@@ -119,7 +119,17 @@ object InvalidStateProofSlashManagerSuite extends FunSuite {
 
   test("determinism: applySlash is a pure function — two runs over identical inputs are byte-identical") {
     def run = InvalidStateProofSlashManager.applySlash(
-      Set(offender), priorStakes, priorCollaterals, ord, epoch, shardZero, cpHash, evidenceDigest, 1.0d, 0.05d, 100L
+      Set(offender),
+      priorStakes,
+      priorCollaterals,
+      ord,
+      epoch,
+      shardZero,
+      cpHash,
+      evidenceDigest,
+      1.0d,
+      0.05d,
+      100L
     )
     val a = run
     val b = run
@@ -160,7 +170,17 @@ object InvalidStateProofSlashManagerSuite extends FunSuite {
 
   test("no targets ⇒ no-op: maps unchanged, total zero, no registry entries") {
     val res = InvalidStateProofSlashManager.applySlash(
-      Set.empty[PeerId], priorStakes, priorCollaterals, ord, epoch, shardZero, cpHash, evidenceDigest, 1.0d, 0.05d, 100L
+      Set.empty[PeerId],
+      priorStakes,
+      priorCollaterals,
+      ord,
+      epoch,
+      shardZero,
+      cpHash,
+      evidenceDigest,
+      1.0d,
+      0.05d,
+      100L
     )
     expect.all(
       res.slashedDelegatedStakes == priorStakes,
