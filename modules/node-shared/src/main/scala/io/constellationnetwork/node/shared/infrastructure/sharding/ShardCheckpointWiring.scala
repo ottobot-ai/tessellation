@@ -71,12 +71,14 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * so only a metagraph's shard committee re-executes it (genuine execution segmentation). The draw is a deterministic pseudo-random
   * sortition keyed on each operator's registered VRF *VK* + the epoch eta + the shardId (see [[committeeFor]] scaladoc for the determinism
   * argument and `CommitteeSortition.isInShardCommittee` for why a VK-seeded PRF, not a true per-operator VRF eval, is the only
-  * enumerable-by-a-non-member option). The structural VRF-proof check + Ed25519 + KES product sig per signer still authenticate "did this
-  * specific peer sign"; the sortitioned set gates "is this peer even in shard S's committee". v1 trade-off (acceptable per design §10 —
-  * honest-testnet, slashing is the v2 backstop): the committee is PREDICTABLE because VKs are public; Algorand player-replaceability is a
-  * v2 hardening (would require carrying a true per-operator VRF proof on each `CommitteeMemberSignature` and verifying it with
-  * `CommitteeSortition.verifyMembership`, plus the producer/emitter signing a committee-VRF proof rather than the leader-VRF proof they
-  * sign today).
+  * enumerable-by-a-non-member option). The per-signer predicates then authenticate "did this specific peer sign": Ed25519 + KES product sig
+  * over the checkpoint hash, AND a REAL `EcVrf25519` verify of each `CommitteeMemberSignature.vrfProof` under the signer's registered VRF
+  * VK (`vrfRegistry`) over the canonical `(shardEta(shardId, epoch), checkpoint.slot)` message — the SAME proof the producer's
+  * `ShardCheckpointAttestationEmitter`/`ShardSlotLeader.membershipProof` computes; the sortitioned `committeeFor` set gates "is this peer
+  * even in shard S's committee". v1 trade-off (acceptable per design §10 — honest-testnet, slashing is the v2 backstop): the committee SET
+  * is PREDICTABLE because VKs are public (the per-signer VRF proof binds each signature to its drawn member, but does not hide the draw);
+  * Algorand player-replaceability (a per-`(shard, epoch)` membership VRF whose output is unknowable from the VK alone, verified with
+  * `CommitteeSortition.verifyMembership`) is a v2 hardening.
   *
   * '''reExecuteDerivation — caller-supplied (S3: real committee re-execution).''' The `T_depth1_shard` degraded path re-runs each MG's
   * derivation and compares the recomputed `mptRoot` byte-for-byte against the committee-signed value. The closure is supplied as a
@@ -404,7 +406,10 @@ object ShardCheckpointWiring {
     *   resolves the 32 raw eta-randomness bytes for a given eta-period — the SAME `EtaStateManager.getEta`-backed resolver the GSAM
     *   boundary writer uses (returns a hex [[Hash]] at the call site; decode to 32 bytes via `Hex(h.value).toBytes`). Feeds
     *   [[committeeFor]] keyed on the wire-carried `checkpoint.epoch`, so producer + every verifier draw the SAME committee for the SAME
-    *   epoch even across an eta boundary. MPT-committed ⇒ byte-identical cluster-wide.
+    *   epoch even across an eta boundary. MPT-committed ⇒ byte-identical cluster-wide. ALSO feeds the per-shard `shardEtaFor` resolver
+    *   built below (the gl0 eta → `ShardSlotLeader.computeShardEta(shardId, gl0Eta)` chain) that the acceptance manager's real
+    *   committee-VRF verify consumes — so the eta the committee was DRAWN under and the eta each signer's VRF proof is VERIFIED under share
+    *   one source.
     * @param reExecuteDerivation
     *   the `T_depth1_shard` re-exec derivation closure `(metagraphAddress, includedChain) => F[Hash]`. `Some(...)` (S3 wiring) ⇒ the real
     *   `GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot` closure — committee re-execution that recomputes the per-MG root and
@@ -457,6 +462,14 @@ object ShardCheckpointWiring {
                 }
             }
           }
+        // Per-shard leader-VRF eta resolver for the acceptance manager's REAL committee-VRF verify. Same `etaForEpoch` source the committee
+        // DRAW (`committeeFor`) reads, fed through the SAME `ShardSlotLeader.computeShardEta(shardId, gl0Eta)` derivation the producer's
+        // `ShardCheckpointAttestationEmitter` uses — so the eta a signer's `vrfProof` is VERIFIED under byte-matches the eta the producer
+        // SIGNED under, across an eta boundary (keyed on the wire-carried `checkpoint.epoch`). `computeShardEta` is Hasher-only (no
+        // EligibilityChecker needed here). MPT-committed eta ⇒ cluster-uniform. Returns `Some(_)` always on the active path (the eta is
+        // always resolvable once the boundary is written); the manager's `None` branch is the bootstrap carve-out for layers without it.
+        shardEtaFor = (sid: ShardId, epoch: EtaPeriod) =>
+          etaForEpoch(epoch).flatMap(gl0Eta => ShardSlotLeader.computeShardEta[F](sid, gl0Eta)).map(_.some)
         acceptanceManager <- ShardCheckpointGl0AcceptanceManager.make[F](
           finalityTriggers = (sid: ShardId) => Async[F].pure(registry.get(sid).map(_.finalityTriggers)),
           chainStore = (sid: ShardId) => Async[F].pure(registry.get(sid).map(_.chainStore)),
@@ -465,6 +478,8 @@ object ShardCheckpointWiring {
           kQuorum = kQuorum,
           selfPeerId = selfPeerId,
           kesRegistry = kesRegistry,
+          vrfRegistry = vrfRegistry,
+          shardEtaFor = shardEtaFor,
           reExecuteDerivation = reExec
         )
         shardAssignment = ShardAssignment.make[F](cfg.numShards)

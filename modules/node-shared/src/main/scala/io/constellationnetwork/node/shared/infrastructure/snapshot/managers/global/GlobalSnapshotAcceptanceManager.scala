@@ -24,6 +24,7 @@ import io.constellationnetwork.node.shared.domain.delegatedStake.{
   UpdateDelegatedStakeAcceptanceResult
 }
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
+import io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofClient
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashManager.SlashedRegistryEntry
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{InvalidStateProofSlashManager, InvalidStateProofSlashedReader}
 import io.constellationnetwork.node.shared.domain.nakamoto.{NodeStakeAggregator, ShardAssignment}
@@ -413,6 +414,26 @@ object GlobalSnapshotAcceptanceManager {
     shardingConfig: Option[ShardingConfig] = None,
     shardCheckpointAcceptanceManager: Option[ShardCheckpointGl0AcceptanceManager[F]] = None,
     shardAssignment: Option[ShardAssignment[F]] = None,
+    // W3c ACTIVATION — the CROSS-SHARD read client for the sharded `SpendActionValidator`. When sharding is active
+    // (`shardingConfig.numShards > 1 ∧ shardAssignment.isDefined`), accept() builds a PER-ACCEPT cross-shard-capable
+    // `SpendActionValidator` (the `SpendActionValidator.make(proofClient, shardAssignment, overlay)` overload) whose
+    // W3c `CrossShardEffectiveBalanceOverlay` is BOUND to THIS accept's already-materialized consensus context
+    // (`consumedSpentSetForValidation` + `metagraphPinnedEpochProgresses` + `epochProgress`) via
+    // `ConsumedAllowSpendStateManager.effectiveCurrencyBalances` — so a cross-shard no-`allowSpendRef` self-spend of a
+    // PHANTOM expiry-refund is REJECTED on the cross-shard path exactly as on the same-shard path. DETERMINISM: the
+    // overlay reuses the deterministic+saturating `effectiveCurrencyBalances` over the gl0-finalized (cluster-uniform)
+    // spent-set, and the per-accept context is materialized identically on every node (gated `numShards > 1`); the
+    // validator constructor is a pure closure factory (no Ref/F), so binding it per-accept is split-safe.
+    //
+    // `None` (the default — `ShardSubtreeProofClient.noop` semantics) ⇒ every cross-shard fetch deterministically
+    // returns `None` ⇒ a cross-shard spend is rejected-for-retry uniformly on every node (safe, no fork). NOTE: wiring a
+    // LIVE `ShardSubtreeProofClient.http` here is OUT OF SCOPE — a peer-fetch result is node-local (network/cooldown/
+    // peer-pick), and the spend-action accept result feeds the consensus mptRoot, so a live HTTP client on the accept
+    // path needs a determinism-reconciled anchor (e.g. a LOCAL read of gl0's own finalized `shardCheckpoints` root, not a
+    // peer round-trip) — a separate slice. The W3c forcing function (the OVERLAY) is fully active + deterministic
+    // regardless of the client. At `numShards = 1` (or `shardAssignment = None`) the injected unsharded
+    // `spendActionValidator` is used verbatim ⇒ the cross-shard branch is unreachable ⇒ byte-identical to today.
+    crossShardSpendProofClient: Option[ShardSubtreeProofClient[F]] = None,
     // §3 NIPoPoW historical-commitment SMT. `Some(store)` is wired ONLY at the gl0 produce/verify GSAM
     // (`GlobalSnapshotConsensus.make`) — that path has the finalized global-snapshot chain (`getGlobalSnapshotByOrdinal`)
     // needed to derive the per-ordinal commitment for the eligible finalized ordinal `N − confirmationDepthK`. When present,
@@ -1181,10 +1202,14 @@ object GlobalSnapshotAcceptanceManager {
           lastActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
           currencyBalances: Map[Option[Address], SortedMap[Address, Balance]],
           globalBalances: Map[Option[Address], SortedMap[Address, Balance]],
-          lastSnapshotContext: GlobalSnapshotInfo
+          lastSnapshotContext: GlobalSnapshotInfo,
+          // W3c ACTIVATION: the spend-action validator for THIS accept. At `numShards > 1 ∧ shardAssignment.isDefined`
+          // this is a per-accept CROSS-SHARD-capable validator whose effective-balance overlay is bound to this accept's
+          // context (built at the call site); otherwise it is the injected unsharded `spendActionValidator` (byte-identical).
+          spendValidatorForAccept: SpendActionValidator[F]
         ): F[ArtifactValidationResult] =
           for {
-            (acceptedSpend, rejectedSpend) <- spendActionValidator.validateReturningAcceptedAndRejected(
+            (acceptedSpend, rejectedSpend) <- spendValidatorForAccept.validateReturningAcceptedAndRejected(
               spendActions,
               lastActiveAllowSpends,
               currencyBalances ++ globalBalances
@@ -2295,6 +2320,39 @@ object GlobalSnapshotAcceptanceManager {
                         )
                     }
 
+                // ── W3c ACTIVATION — the per-accept CROSS-SHARD-capable SpendActionValidator ───────────────────────────────────
+                // The same-shard balance path reads `effectiveCurrencyBalances` (overlay applied above). The CROSS-shard balance
+                // path (a SpendTransaction whose `currencyId` is an MG on a DIFFERENT shard) reads the per-MG balance PROVEN from
+                // that shard via the proof client, which the unsharded default validator can never reach. At `numShards > 1 ∧
+                // shardAssignment.isDefined` build the sharded `SpendActionValidator` overload and BIND its W3c overlay to THIS
+                // accept's consensus context — so the proven cross-shard balance is run through the SAME deterministic
+                // `effectiveCurrencyBalances(spent-set, pinned-epochs, epochProgress)` correction before the balance check (a
+                // cross-shard phantom-refund self-spend is rejected exactly as same-shard). The overlay's `(att, scope)` shape
+                // closes over the per-accept spent-set/epochs; `effectiveCurrencyBalances` is pure+saturating and the spent-set is
+                // gl0-finalized (cluster-uniform), so every honest node computes byte-identical effective balances. The proof
+                // client defaults to `noop` (cross-shard fetch deterministically unavailable ⇒ reject-for-retry uniformly) — see
+                // the `crossShardSpendProofClient` param scaladoc for why a live HTTP client on the accept path is a separate slice.
+                // At `numShards = 1` / `shardAssignment = None` we reuse the injected unsharded `spendActionValidator` verbatim ⇒
+                // the cross-shard branch is unreachable ⇒ byte-identical to the pre-W3c path.
+                spendValidatorForAccept = (shardingConfig, shardAssignment) match {
+                  case (Some(cfg), Some(assignment)) if cfg.numShards > 1 =>
+                    val crossShardOverlay: SpendActionValidator.CrossShardEffectiveBalanceOverlay =
+                      (attestedScopeBalances, ownerScope) =>
+                        consumedAllowSpendStateManager.effectiveCurrencyBalances(
+                          attestedScopeBalances,
+                          ownerScope,
+                          consumedSpentSetForValidation,
+                          metagraphPinnedEpochProgresses,
+                          epochProgress
+                        )
+                    SpendActionValidator.make[F](
+                      crossShardSpendProofClient.getOrElse(ShardSubtreeProofClient.noop[F]),
+                      assignment,
+                      crossShardOverlay
+                    )
+                  case _ => spendActionValidator
+                }
+
                 ArtifactValidationResult(
                   acceptedSpendActions,
                   rejectedSpendActions,
@@ -2307,7 +2365,8 @@ object GlobalSnapshotAcceptanceManager {
                   lastActiveAllowSpends,
                   effectiveCurrencyBalances,
                   globalBalances,
-                  lastSnapshotContext
+                  lastSnapshotContext,
+                  spendValidatorForAccept
                 )
                 acceptedSpendActionsMessage =
                   s"[CONSENSUS:PROPOSAL] [ORDINAL=$ordinal] Accepted spend actions: ${acceptedSpendActions.show}"

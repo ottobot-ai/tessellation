@@ -11,9 +11,10 @@ import scala.collection.immutable.SortedMap
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry
-import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardFinalityTriggers, ShardTipTracker}
+import io.constellationnetwork.node.shared.domain.nakamoto.sharding._
+import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, KesRegistry, VrfRegistry}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
+import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
@@ -25,6 +26,7 @@ import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.security.signature.{Signed, Signing}
+import io.constellationnetwork.security.vrf.VrfKeyDeriver
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -46,8 +48,10 @@ import weaver.MutableIOSuite
   *   - Build the `Signed[ShardCheckpoint]` envelopes with REAL `KeyPair`s for the committee signers so the Ed25519 pre-check verifies
   *     against the recovered public key from each `PeerId`. The KES sig is structurally valid (8-byte placeholder); the manager's KES
   *     verify reads from the injected `KesRegistry` and uses the "no registry entry → accept" carve-out for tests.
-  *   - VRF proof bytes use the structural minimum length (80 bytes per `EcVrf25519`); the Slice 9 manager runs a structural check only —
-  *     full cryptographic VRF verify ships in Slice 13 when the VRF VK registry is wired.
+  *   - The LEGACY pre-check tests use 80-byte structural VRF proof bytes + the default empty `VrfRegistry` / `None` shardEta, which drives
+  *     the manager's registry-/eta-absent bootstrap carve-out (structural length check) — so their accept/reject outcomes are unchanged.
+  *     The dedicated "real VRF verify" tests below register a real VRF VK + a real shardEta and exercise the REAL `EcVrf25519` verify
+  *     (accept a valid member's proof; reject forged / wrong-epoch / impersonated proofs).
   *   - `ShardFinalityTriggers` is built fresh per test off a `ShardChainStore` + `ShardTipTracker` pair so we control which trigger
   *     qualifies which ordinal exactly.
   */
@@ -104,6 +108,48 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         kesProductSig = Hex.fromBytes(Array.fill[Byte](32)(0x43.toByte)), // non-empty; registry-absent carve-out → accept
         kesTreeStep = 0
       )
+
+  // ── Real-VRF fixtures (committee-VRF verify tests) ─────────────────────────────────────────────────────────────────
+  // A deterministic 32-byte stand-in for the per-shard leader-VRF eta (`ShardSlotLeader.computeShardEta` output). The
+  // acceptance manager only needs the SAME bytes the producer used; the tests inject this both into the manager's
+  // `shardEtaFor` AND into the proof-construction message, so producer + verifier agree by construction.
+  private val realShardEta: Array[Byte] = Array.tabulate[Byte](32)(i => (i * 7 + 1).toByte)
+
+  /** Build a `ShardSlotLeader[IO]` (for `vrfProofForSlot`) over a real LDD-arithmetic `EligibilityChecker`. */
+  private def mkSlotLeader: IO[ShardSlotLeader[IO]] =
+    for {
+      log1p <- Log1pInterpreter.make[IO](maxIterations = 10000, precision = 8)
+      exp <- ExpInterpreter.make[IO](maxIterations = 10000, precision = 38)
+    } yield ShardSlotLeader.make[IO](EligibilityChecker.make[IO](log1p, exp))
+
+  /** Build a committee-member sig whose VRF proof is a REAL `EcVrf25519` proof of `(shardEta, checkpoint.slot)` under the operator's VRF SK
+    * (derived from its long-term keypair via the SAME `VrfKeyDeriver` the runtime + genesis use). The Ed25519 sig also really verifies. The
+    * returned `vrfVk` is what the test registers in the `VrfRegistry` for this peer — so the manager's real verify succeeds.
+    */
+  private def mkRealVrfSig(
+    checkpoint: ShardCheckpoint,
+    kp: KeyPair,
+    peerId: PeerId,
+    slotLeader: ShardSlotLeader[IO],
+    shardEta: Array[Byte]
+  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[(CommitteeMemberSignature, Array[Byte])] = {
+    val (vrfSeed, vrfVk) = VrfKeyDeriver.deriveVrfKeyPair(kp)
+    for {
+      preimageHash <- Hasher[IO].hash(checkpoint.signingPreimage)
+      edSig <- Signing.signData[IO](preimageHash.getBytes)(kp.getPrivate)
+      vrfProof <- slotLeader.membershipProof(vrfSeed, shardEta, checkpoint.slot)
+    } yield
+      (
+        CommitteeMemberSignature(
+          peerId = peerId,
+          vrfProof = Hex.fromBytes(vrfProof),
+          ed25519Sig = Hex.fromBytes(edSig),
+          kesProductSig = Hex.fromBytes(Array.fill[Byte](32)(0x43.toByte)), // non-empty; registry-absent KES carve-out → accept
+          kesTreeStep = 0
+        ),
+        vrfVk
+      )
+  }
 
   /** Dummy `CommitteeMemberSignature` used to satisfy the 3-arg `recordAttestation` signature in tests that only care about peerId-based
     * counting. The tracker stores/counts by the explicit `peerId` argument, not by the sig's internal peerId.
@@ -271,6 +317,12 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
     kQuorum: Int = 4,
     selfId: PeerId,
     kesRegistry: KesRegistry[IO] = KesRegistry.empty[IO],
+    // Committee-VRF verify seam. The DEFAULTS (empty VRF registry + None shardEta) drive the registry-/eta-absent
+    // bootstrap carve-out, so the legacy tests' 80-byte structural proofs still pass — preserving their accept/reject
+    // outcomes. The dedicated VRF tests below override these with a real registry + a real shardEta to exercise the REAL
+    // EcVrf25519 verify (accept a valid member's proof; reject a non-member / forged / wrong-epoch proof).
+    vrfRegistry: VrfRegistry[IO] = VrfRegistry.empty[IO],
+    shardEtaFor: (ShardId, EtaPeriod) => IO[Option[Array[Byte]]] = (_, _) => IO.pure(none[Array[Byte]]),
     reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] = (_, _, _) =>
       IO.pure(Hash("0" * 64))
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointGl0AcceptanceManager[IO]] =
@@ -282,6 +334,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       kQuorum = kQuorum,
       selfPeerId = selfId,
       kesRegistry = kesRegistry,
+      vrfRegistry = vrfRegistry,
+      shardEtaFor = shardEtaFor,
       reExecuteDerivation = reExecuteDerivation
     )
 
@@ -758,6 +812,179 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         case ShardCheckpointAcceptResult.Rejected(reason) => expect(reason.contains("not in committee"))
         case other                                        => failure(s"Expected Rejected(not in committee), got $other")
       }
+  }
+
+  // ============================================================================
+  // REAL committee-VRF membership verify (Slice 13 — replaced verifyVrfStructural)
+  // ============================================================================
+
+  /** Build a fully-wired checkpoint + a manager whose `shardEtaFor` resolves to `realShardEta` and whose `vrfRegistry` maps the signer to
+    * the supplied VK, then run the DETERMINISTIC `verifyEmbedded` adopt-verifier with `kQuorum = 1` — so the single signer meets quorum and
+    * the ONLY thing that can flip Accepted→Rejected is the per-signer pre-check (where the committee-VRF verify lives). This isolates the
+    * VRF verify as the decision under test (a valid proof ⇒ Accepted; a forged/wrong-epoch/impersonated proof ⇒ Rejected at pre-check).
+    */
+  private def mkVrfScenario(
+    sigForCheckpoint: (ShardCheckpoint, ShardSlotLeader[IO]) => IO[(CommitteeMemberSignature, Array[Byte])],
+    registryVkFor: (PeerId, Array[Byte]) => Map[PeerId, Array[Byte]],
+    managerShardEta: (ShardId, EtaPeriod) => IO[Option[Array[Byte]]],
+    signerPeer: PeerId,
+    selfPeer: PeerId
+  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointAcceptResult] =
+    for {
+      slotLeader <- mkSlotLeader
+      mg = Address.fromBytes("mg-vrf".getBytes("UTF-8"))
+      binary = mkSignedBinary("binary-content".getBytes("UTF-8"))
+      delta = mkDelta(mg, Hash("11" * 32), binary)
+      shell = mkCheckpointShell(shardOrd = 1L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer)
+      (sig, vrfVk) <- sigForCheckpoint(shell, slotLeader)
+      checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig))
+      (_, triggers) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 100L, chainLength = 5, selfId = selfPeer)
+      mgr <- mkManager(
+        finalityTriggers = Map(shardZero -> triggers),
+        committeeMembership = Set(signerPeer),
+        kQuorum = 1,
+        selfId = selfPeer,
+        vrfRegistry = VrfRegistry.make[IO](registryVkFor(signerPeer, vrfVk)),
+        shardEtaFor = managerShardEta
+      )
+      result <- mgr.verifyEmbedded(checkpoint)
+    } yield result
+
+  test("real VRF verify: valid committee member's proof (registered VK, correct (shardEta, slot)) → Accepted") { res =>
+    implicit val (h, sp, _) = res
+    for {
+      (signerKp, signerPeer) <- mkSigner
+      (_, selfPeer) <- mkSigner
+      result <- mkVrfScenario(
+        // Real proof over the SAME `realShardEta` the manager resolves; signer's real VK registered.
+        sigForCheckpoint = (shell, slotLeader) => mkRealVrfSig(shell, signerKp, signerPeer, slotLeader, realShardEta),
+        registryVkFor = (peer, vk) => Map(peer -> vk),
+        managerShardEta = (_, _) => IO.pure(realShardEta.some),
+        signerPeer = signerPeer,
+        selfPeer = selfPeer
+      )
+    } yield expect.same(ShardCheckpointAcceptResult.Accepted, result)
+  }
+
+  test("real VRF verify: forged (garbage) VRF proof under a registered VK → Rejected") { res =>
+    implicit val (h, sp, _) = res
+    for {
+      (signerKp, signerPeer) <- mkSigner
+      (_, selfPeer) <- mkSigner
+      result <- mkVrfScenario(
+        // Registered VK, but the 80-byte proof is garbage (structurally length-valid so it passes the old placeholder, but the REAL
+        // EcVrf25519 verify must reject it). Use the signer's real VK so membership + the registry lookup both pass and only the
+        // cryptographic verify can fail.
+        sigForCheckpoint = (shell, _) =>
+          for {
+            preimageHash <- Hasher[IO].hash(shell.signingPreimage)
+            edSig <- Signing.signData[IO](preimageHash.getBytes)(signerKp.getPrivate)
+            (_, vrfVk) = VrfKeyDeriver.deriveVrfKeyPair(signerKp)
+          } yield
+            (
+              CommitteeMemberSignature(
+                peerId = signerPeer,
+                vrfProof = Hex.fromBytes(Array.fill[Byte](80)(0x42.toByte)), // 80 bytes (passes structural) but NOT a valid proof
+                ed25519Sig = Hex.fromBytes(edSig),
+                kesProductSig = Hex.fromBytes(Array.fill[Byte](32)(0x43.toByte)),
+                kesTreeStep = 0
+              ),
+              vrfVk
+            ),
+        registryVkFor = (peer, vk) => Map(peer -> vk),
+        managerShardEta = (_, _) => IO.pure(realShardEta.some),
+        signerPeer = signerPeer,
+        selfPeer = selfPeer
+      )
+    } yield
+      result match {
+        case ShardCheckpointAcceptResult.Rejected(reason) => expect(reason.contains("committee-VRF proof verify failed"))
+        case other                                        => failure(s"Expected Rejected(committee-VRF ...), got $other")
+      }
+  }
+
+  test("real VRF verify: wrong-epoch eta (proof over a DIFFERENT shardEta than the manager resolves) → Rejected") { res =>
+    implicit val (h, sp, _) = res
+    // Producer signed under one epoch's eta; the manager resolves a DIFFERENT epoch's eta (a wrong-epoch replay). The VRF message
+    // differs ⇒ the cryptographic verify fails. This is the load-bearing cross-epoch-replay guard.
+    val otherEta: Array[Byte] = Array.tabulate[Byte](32)(i => (i * 13 + 5).toByte)
+    for {
+      (signerKp, signerPeer) <- mkSigner
+      (_, selfPeer) <- mkSigner
+      result <- mkVrfScenario(
+        sigForCheckpoint = (shell, slotLeader) => mkRealVrfSig(shell, signerKp, signerPeer, slotLeader, otherEta), // proof over otherEta
+        registryVkFor = (peer, vk) => Map(peer -> vk),
+        managerShardEta = (_, _) => IO.pure(realShardEta.some), // manager resolves realShardEta ≠ otherEta
+        signerPeer = signerPeer,
+        selfPeer = selfPeer
+      )
+    } yield
+      result match {
+        case ShardCheckpointAcceptResult.Rejected(reason) => expect(reason.contains("committee-VRF proof verify failed"))
+        case other                                        => failure(s"Expected Rejected(committee-VRF ...), got $other")
+      }
+  }
+
+  test("real VRF verify: impersonation — registry maps the signer to a DIFFERENT VK than signed the proof → Rejected") { res =>
+    implicit val (h, sp, _) = res
+    for {
+      (signerKp, signerPeer) <- mkSigner
+      (otherKp, _) <- mkSigner
+      (_, selfPeer) <- mkSigner
+      // The registry binds `signerPeer` to a STRANGER's VK; the proof is a real proof under the signer's OWN VK. The verify under the
+      // registered (wrong) VK fails — a peer cannot pass off another operator's committee slot.
+      (otherVrfVk: Array[Byte]) = VrfKeyDeriver.deriveVrfKeyPair(otherKp)._2
+      result <- mkVrfScenario(
+        sigForCheckpoint = (shell, slotLeader) => mkRealVrfSig(shell, signerKp, signerPeer, slotLeader, realShardEta),
+        registryVkFor = (peer, _) => Map(peer -> otherVrfVk), // wrong VK for this peer
+        managerShardEta = (_, _) => IO.pure(realShardEta.some),
+        signerPeer = signerPeer,
+        selfPeer = selfPeer
+      )
+    } yield
+      result match {
+        case ShardCheckpointAcceptResult.Rejected(reason) => expect(reason.contains("committee-VRF proof verify failed"))
+        case other                                        => failure(s"Expected Rejected(committee-VRF ...), got $other")
+      }
+  }
+
+  test("real VRF verify: determinism — two managers (same registry + eta) reach the SAME verdict for the same checkpoint") { res =>
+    implicit val (h, sp, _) = res
+    // The verify is a pure function of (vrfRegistry, shardEtaFor, proof bytes). Two managers built with byte-identical registry + eta
+    // resolve identically — the #261 split-safety property for the consensus-gating pre-check.
+    for {
+      (signerKp, signerPeer) <- mkSigner
+      (_, selfA) <- mkSigner
+      (_, selfB) <- mkSigner
+      slotLeader <- mkSlotLeader
+      mg = Address.fromBytes("mg-vrf-det".getBytes("UTF-8"))
+      delta = mkDelta(mg, Hash("11" * 32), mkSignedBinary("c".getBytes("UTF-8")))
+      shell = mkCheckpointShell(shardOrd = 1L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer)
+      (sig, vrfVk) <- mkRealVrfSig(shell, signerKp, signerPeer, slotLeader, realShardEta)
+      checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig))
+      registry = VrfRegistry.make[IO](Map(signerPeer -> vrfVk))
+      etaFor = (_: ShardId, _: EtaPeriod) => IO.pure(realShardEta.some)
+      (_, triggersA) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 100L, chainLength = 5, selfId = selfA)
+      (_, triggersB) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 100L, chainLength = 5, selfId = selfB)
+      mgrA <- mkManager(
+        finalityTriggers = Map(shardZero -> triggersA),
+        committeeMembership = Set(signerPeer),
+        kQuorum = 1,
+        selfId = selfA,
+        vrfRegistry = registry,
+        shardEtaFor = etaFor
+      )
+      mgrB <- mkManager(
+        finalityTriggers = Map(shardZero -> triggersB),
+        committeeMembership = Set(signerPeer),
+        kQuorum = 1,
+        selfId = selfB,
+        vrfRegistry = registry,
+        shardEtaFor = etaFor
+      )
+      rA <- mgrA.verifyEmbedded(checkpoint)
+      rB <- mgrB.verifyEmbedded(checkpoint)
+    } yield expect.same(ShardCheckpointAcceptResult.Accepted, rA) && expect.same(rA, rB)
   }
 
   // ============================================================================

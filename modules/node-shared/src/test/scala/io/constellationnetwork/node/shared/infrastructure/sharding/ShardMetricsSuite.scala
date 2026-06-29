@@ -11,8 +11,8 @@ import scala.collection.immutable.SortedMap
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardFinalityTriggers, ShardTipTracker}
+import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, VrfRegistry}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{CountingMetrics, Metrics}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
   ShardCheckpointAcceptResult,
@@ -230,6 +230,10 @@ object ShardMetricsSuite extends MutableIOSuite {
         kQuorum = 1,
         selfPeerId = selfPeer,
         kesRegistry = KesRegistry.empty[IO],
+        // Empty VRF registry + None shardEta ⇒ the committee-VRF verify falls back to the structural proof-length carve-out
+        // (these metric tests use 80-byte structural proofs), so the accept/reject paths under test are unchanged.
+        vrfRegistry = VrfRegistry.empty[IO],
+        shardEtaFor = (_, _) => IO.pure(None),
         reExecuteDerivation = (_, _, _) => IO.pure(Hash("ff" * 32))
       )
 
@@ -278,6 +282,10 @@ object ShardMetricsSuite extends MutableIOSuite {
         kQuorum = 1000,
         selfPeerId = selfPeer,
         kesRegistry = KesRegistry.empty[IO],
+        // Empty VRF registry + None shardEta ⇒ the committee-VRF verify falls back to the structural proof-length carve-out
+        // (these metric tests use 80-byte structural proofs), so the accept/reject paths under test are unchanged.
+        vrfRegistry = VrfRegistry.empty[IO],
+        shardEtaFor = (_, _) => IO.pure(None),
         reExecuteDerivation = (_, _, _) => IO.pure(mptRoot)
       )
 
@@ -327,6 +335,10 @@ object ShardMetricsSuite extends MutableIOSuite {
         kQuorum = 1,
         selfPeerId = selfPeer,
         kesRegistry = KesRegistry.empty[IO],
+        // Empty VRF registry + None shardEta ⇒ the committee-VRF verify falls back to the structural proof-length carve-out
+        // (these metric tests use 80-byte structural proofs), so the accept/reject paths under test are unchanged.
+        vrfRegistry = VrfRegistry.empty[IO],
+        shardEtaFor = (_, _) => IO.pure(None),
         reExecuteDerivation = (_, _, _) => IO.pure(Hash("0" * 64))
       )
 
@@ -374,6 +386,10 @@ object ShardMetricsSuite extends MutableIOSuite {
         kQuorum = 1000,
         selfPeerId = selfPeer,
         kesRegistry = KesRegistry.empty[IO],
+        // Empty VRF registry + None shardEta ⇒ the committee-VRF verify falls back to the structural proof-length carve-out
+        // (these metric tests use 80-byte structural proofs), so the accept/reject paths under test are unchanged.
+        vrfRegistry = VrfRegistry.empty[IO],
+        shardEtaFor = (_, _) => IO.pure(None),
         reExecuteDerivation = (_, _, _) => IO.pure(Hash("ff" * 32))
       )
 

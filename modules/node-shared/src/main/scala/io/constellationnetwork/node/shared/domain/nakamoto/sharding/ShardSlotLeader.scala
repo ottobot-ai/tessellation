@@ -133,6 +133,28 @@ object ShardSlotLeader {
     implicit val encoder: Encoder[ShardEtaInput] = deriveEncoder
   }
 
+  /** Standalone `(shardId, gl0Eta) => shardEta` derivation — the SINGLE byte-definition of the per-shard leader-VRF eta, shared by the
+    * [[ShardSlotLeader]] instance method [[ShardSlotLeader.computeShardEta]] AND by any consensus-critical verifier that needs the eta
+    * WITHOUT an [[EligibilityChecker]] in scope (e.g.
+    * [[io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointGl0AcceptanceManager]]'s real
+    * committee-VRF membership verify, wired from
+    * [[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.acceptanceDeps]]). Co-locating the derivation here
+    * — instead of duplicating the `ShardEtaInput` hashing at the verifier — guarantees the producer's
+    * `ShardCheckpointAttestationEmitter.shardEtaFor` and the verifier resolve byte-identical eta bytes (the determinism invariant: a
+    * divergent shardEta forks the committee-VRF verify).
+    *
+    * `gl0Eta` MUST be 32 bytes (gl0 epoch randomness); enforced here so a wrong-shape eta fails fast rather than silently shifting the
+    * shard VRF domain. Returns the 32 raw SHA-256 digest bytes of the canonical JSON encoding of [[ShardEtaInput]] (decode of the hex hash,
+    * matching the byte shape `EligibilityChecker.vrfProofForSlot` requires).
+    */
+  def computeShardEta[F[_]: Sync](shardId: ShardId, gl0Eta: Array[Byte])(implicit hasher: Hasher[F]): F[Array[Byte]] =
+    Sync[F].delay {
+      require(gl0Eta.length == EtaLength, s"gl0Eta must be $EtaLength bytes, got ${gl0Eta.length}")
+      ShardEtaInput(DomainTag, shardId, Hex.fromBytes(gl0Eta))
+    }.flatMap { input =>
+      hasher.hash(input).map(h => Hex(h.value).toBytes)
+    }
+
   /** Domain-separation tag for the staircase rank hash — distinct from [[DomainTag]] and `CommitteeSortition`'s `"committee"`. */
   private val StaircaseTag: String = "shard-staircase-rank"
 
@@ -160,24 +182,11 @@ object ShardSlotLeader {
   def make[F[_]: Sync](eligibilityChecker: EligibilityChecker[F]): ShardSlotLeader[F] = new ShardSlotLeader[F] {
 
     def computeShardEta(shardId: ShardId, gl0Eta: Array[Byte])(implicit hasher: Hasher[F]): F[Array[Byte]] =
-      // `Sync[F].delay` lifts the eager `require` into the F context — without it the IllegalArgumentException escapes the F
-      // suspension and a caller can't recover via `.attempt` / `MonadError.handleError`. Matches the convention used by
-      // `EligibilityChecker.vrfProofForSlot` callers (the underlying `require` there fires inside the synchronous proof step,
-      // which `checkEligibility` already wraps in F).
-      Sync[F].delay {
-        require(gl0Eta.length == EtaLength, s"gl0Eta must be $EtaLength bytes, got ${gl0Eta.length}")
-        ShardEtaInput(DomainTag, shardId, Hex.fromBytes(gl0Eta))
-      }.flatMap { input =>
-        hasher.hash(input).map { h =>
-          // `Hash.value` is a 64-char hex string of a 32-byte SHA-256 digest. Decode the hex back to the 32 raw digest bytes — this
-          // is exactly the byte shape `EligibilityChecker.checkEligibility` requires for `eta` (vrfProofForSlot asserts
-          // `eta.length == 32`). Using `h.getBytes` (UTF-8 of the 64-char hex string ⇒ 64 bytes) would NOT satisfy that invariant
-          // and would fail at the checkEligibility boundary, so we mirror the `ShardAssignment.shardIdFor` decode pattern instead.
-          // `CommitteeSortition.message` can use the 64-byte UTF-8 hex form because the EcVrf25519 input is variable-length; here
-          // the downstream invariant is fixed.
-          Hex(h.value).toBytes
-        }
-      }
+      // Delegates to the standalone `ShardSlotLeader.computeShardEta` so the producer (this instance method, via the attestation
+      // emitter) and the consensus-critical committee-VRF verifier (which calls the static helper directly, without an
+      // EligibilityChecker in scope) derive byte-identical eta bytes from the SAME single definition. `Sync[F].delay` lifts the eager
+      // length `require` into the F context so a wrong-shape eta is recoverable via `.attempt` rather than escaping the suspension.
+      ShardSlotLeader.computeShardEta[F](shardId, gl0Eta)
 
     def isLeader(
       vrfSk: Array[Byte],

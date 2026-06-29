@@ -236,6 +236,10 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
         kQuorum = 1000,
         selfPeerId = selfId,
         kesRegistry = io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO],
+        // Empty VRF registry + None shardEta ⇒ the committee-VRF verify uses the structural carve-out (this re-exec suite
+        // signs 80-byte structural proofs), so the re-exec mismatch/accept paths under test are unaffected.
+        vrfRegistry = io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[IO],
+        shardEtaFor = (_, _) => IO.pure(None),
         reExecuteDerivation = reExec
       )
     } yield mgr

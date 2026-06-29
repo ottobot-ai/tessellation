@@ -4,18 +4,20 @@ import cats.data.NonEmptyList
 import cats.effect.kernel.Async
 import cats.syntax.all._
 
-import io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardFinalityTriggers}
+import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, VrfRegistry}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.sharding.ShardMetrics
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.kes.OperationalKeyMaker
 import io.constellationnetwork.security.signature.{Signed, Signing}
+import io.constellationnetwork.security.vrf.EcVrf25519
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
@@ -83,7 +85,8 @@ final case class WatchtowerMismatch(
   *
   *   1. '''Pre-checks''' (always): every committee signer must be (a) in the committee for `(shardId, epoch)`, (b) verifiable by their
   *      registered long-term Ed25519 VK, (c) verifiable by their KES product VK at the embedded tree-internal step, (d) prove committee
-  *      membership via VRF. Failure on ANY signer ⇒ `Rejected("invalid pre-check ...")`.
+  *      membership with a REAL `EcVrf25519` proof verified under their registered VRF VK over the canonical `(shardEta, slot)` message.
+  *      Failure on ANY signer ⇒ `Rejected("invalid pre-check ...")`.
   *
   *   1. '''Finality phase''' (per §7.3): look up the shard's [[ShardFinalityTriggers]] composite. If the per-shard `tCountShard` has
   *      qualified `checkpoint.shardOrdinal` ⇒ fast `Accepted`. If only `tDepth1Shard` qualifies (degraded liveness — no quorum) ⇒ re-exec
@@ -132,8 +135,8 @@ trait ShardCheckpointGl0AcceptanceManager[F[_]] {
     * [[ShardFinalityTriggers]] (see its scaladoc) — two honest nodes would diverge and the cluster would split.
     *
     * '''Decision (deterministic, count-based quorum — no triggers).'''
-    *   1. Run the SAME [[evaluate]] pre-checks (committee membership + Ed25519 + KES + VRF-structural per signer) — fully deterministic.
-    *      `Left` ⇒ [[ShardCheckpointAcceptResult.Rejected]].
+    *   1. Run the SAME [[evaluate]] pre-checks (committee membership + Ed25519 + KES + REAL committee-VRF verify per signer) — fully
+    *      deterministic. `Left` ⇒ [[ShardCheckpointAcceptResult.Rejected]].
     *   1. Compare the distinct (deduplicated-by-peerId) embedded-signature count against the cluster-uniform admit quorum `kQuorum`
     *      (`nakamoto.committee.kQuorum`), DECOUPLED from the committee draw target `kDraw` (the draw enumerates the membership the
     *      pre-check validates against; the quorum is an independent count). The pre-check already proved every embedded signature is a
@@ -204,8 +207,10 @@ object ShardCheckpointGl0AcceptanceManager {
     *   actually a committee member at the claimed epoch. Empty set ⇒ any signer fails the membership pre-check ⇒ reject.
     * @param kDraw
     *   committee DRAW target (`K_S` in design doc §5). Wired from `cfg.nakamoto.committee.kDraw`. v1 stable-σ rule treats every committee
-    *   member as uniform 1/N; the threshold check inside `CommitteeSortition.verifyMembership` uses `K_draw · σ` so this is the `K_draw`
-    *   factor (the future cryptographic VRF pre-check at Slice 13 consumes it). Reserved for forward compatibility today.
+    *   member as uniform 1/N; the threshold check inside `CommitteeSortition.isInShardCommittee` uses `K_draw · σ` to ENUMERATE the
+    *   committee set (`ShardCheckpointWiring.committeeFor`, consumed by `committeeMembership`). The per-signer VRF verify below does NOT
+    *   re-assert that threshold (the set-membership pre-check already gates it); it cryptographically binds each signature to its committee
+    *   member. Carried for diagnostic logging.
     * @param kQuorum
     *   committee ADMIT quorum — the cluster-uniform count (`cfg.nakamoto.committee.kQuorum`) `verifyEmbedded` requires of distinct embedded
     *   committee signers. DECOUPLED from `kDraw`: the draw sizes the committee, the quorum is the independent admit count (no 2/3
@@ -219,6 +224,22 @@ object ShardCheckpointGl0AcceptanceManager {
     *   [[io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate]]'s receiver path: registry-absent peers are accepted
     *   on the strength of the Ed25519 signature alone (Slice 10 will introduce runtime registration; this carve-out covers the bootstrap
     *   window).
+    * @param vrfRegistry
+    *   registered per-operator VRF verification keys (the SAME genesis/seedlist-loaded registry `ShardCheckpointWiring.committeeFor` draws
+    *   the committee from). Consumed by the REAL committee-VRF membership verify ([[ShardCheckpointGl0AcceptanceManager]] pre-check step
+    *   4): each `CommitteeMemberSignature.vrfProof` must verify under the signer's registered VRF VK over the canonical `(shardEta(shardId,
+    *   epoch), checkpoint.slot)` message — the SAME message the producer's `ShardCheckpointAttestationEmitter` /
+    *   `ShardSlotLeader.membershipProof` signed (`vrfProofForSlot`). The "no registry entry" carve-out MIRRORS the `kesRegistry` path: a
+    *   signer absent from the VRF registry falls back to the structural proof-length check (bootstrap window — runtime VRF-VK registration
+    *   is the follow-up). MUST be byte-identical cluster-wide on every path that runs `verifyEmbedded` (produce + validateArtifact +
+    *   follower createContext) or the committee-VRF verify diverges and the cluster splits (#261).
+    * @param shardEtaFor
+    *   `(shardId, epoch) => F[Option[Array[Byte]]]` — resolves the 32-byte per-shard leader-VRF eta (`ShardSlotLeader.computeShardEta`) for
+    *   the GIVEN eta-period, keyed on the WIRE-CARRIED `checkpoint.epoch`. The SAME resolver the producer's emitter (`shardEtaFor` at the
+    *   `ShardCheckpointAttestationEmitter.make` call site) uses, so producer + verifier derive byte-identical eta bytes across an eta
+    *   boundary. `None` ⇒ the shard's eta is not resolvable locally (bootstrap / not a tracked committee shard) ⇒ the VRF verify falls back
+    *   to the structural proof-length check rather than failing closed (a missing eta is "I can't cryptographically check this yet", same
+    *   disposition as the registry-absent carve-out). MPT-committed eta ⇒ byte-identical cluster-wide.
     * @param reExecuteDerivation
     *   `(metagraphAddress, includedChain, gl0AnchorOrdinal) => F[Hash]`. Called only on the sub-quorum `T_depth1`-only failover
     *   ([[reExecPath]]). Production wiring (STEP 6) passes the closure that re-runs `ShardCheckpointWiring.reExecDerivationWithDiff` (the
@@ -238,14 +259,17 @@ object ShardCheckpointGl0AcceptanceManager {
     kQuorum: Int,
     selfPeerId: PeerId,
     kesRegistry: KesRegistry[F],
+    vrfRegistry: VrfRegistry[F],
+    shardEtaFor: (ShardId, EtaPeriod) => F[Option[Array[Byte]]],
     reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash]
   ): F[ShardCheckpointGl0AcceptanceManager[F]] = {
 
     // chainStore + selfPeerId + kDraw are reserved for forward compatibility (see scaladoc on the parameters); reference once to
     // avoid unused-warnings. Slice 13 wiring uses chainStore for the depth-k1 ancestor lookup in production accept loops; selfPeerId
-    // is used by diagnostic logging to surface which gl0 op spotted a slashable deviation; kDraw feeds the VRF threshold check
-    // when the real VRF VK registry is wired (Slice 13). For Slice 9 the VRF predicate is a non-empty proof bytes structural check
-    // (the VK registry doesn't exist yet — see scaladoc on `verifyVrfStructural`). kQuorum IS consumed below by `verifyEmbedded`.
+    // is used by diagnostic logging to surface which gl0 op spotted a slashable deviation; kDraw sizes the committee DRAW the
+    // `committeeMembership` set is enumerated from (the per-signer VRF verify binds each sig to its drawn member; it does NOT re-assert
+    // the draw threshold here). kQuorum IS consumed below by `verifyEmbedded`. The committee-VRF membership verify NOW reads
+    // `vrfRegistry` + `shardEtaFor` (the real EcVrf25519 verify replaced the Slice-9 structural-only placeholder).
     val _unusedChainStore = chainStore
     val _unusedSelfPeerId = selfPeerId
     val _unusedKDraw = kDraw
@@ -420,7 +444,8 @@ object ShardCheckpointGl0AcceptanceManager {
           *   1. Ed25519 sig verifies under the signer's long-term VK
           *   1. KES product sig verifies under the registered master VK at the embedded tree-internal step (registry-absent ⇒ accept per
           *      the carve-out)
-          *   1. VRF proof verifies as committee membership for `(checkpoint.shardId, checkpoint.epoch, ...)`
+          *   1. VRF proof verifies under the signer's registered VRF VK over the canonical `(shardEta(shardId, epoch), checkpoint.slot)`
+          *      message — REAL `EcVrf25519` verify (registry-/eta-absent ⇒ structural carve-out per [[verifyVrf]])
           *
           * Returns `Right(())` if every signer passes every predicate, `Left(reason)` on the first failure. Reason is a short diagnostic
           * string (signer index + which predicate failed) — diagnostic only, never parsed for control flow (per
@@ -477,27 +502,25 @@ object ShardCheckpointGl0AcceptanceManager {
                                     ]
                                   )
                                 else
-                                  // (4) VRF — confirms the signer was actually elected to the committee at the time of the
-                                  // sortition draw. The full cryptographic check requires the signer's VRF VK, which Slice 9 does
-                                  // NOT have access to — there's no VRF VK registry in the constructor signature yet (the spec is
-                                  // prescriptive: only `kesRegistry`, no VrfRegistry). Slice 13's GSAM rewire will introduce the
-                                  // VRF VK registry and replace this stub with the real `CommitteeSortition.verifyMembership` call.
-                                  //
-                                  // For Slice 9 the VRF predicate degenerates to a structural check (non-empty proof bytes with
-                                  // the right minimum length). This is sound because: (a) the membership pre-check above already
-                                  // confirms the peerId is in the expected committee — that's the strongest authoritative signal
-                                  // we have at this layer; (b) the Ed25519 pre-check confirms the bytes were signed by the peer's
-                                  // long-term key — that's the second strongest signal; (c) the KES pre-check confirms forward
-                                  // security. The remaining "did this peer actually win the VRF lottery for this slot" check is
-                                  // wire-shape-only at slice 9. Slice 13 elevates it to cryptographic.
-                                  Async[F].pure(verifyVrfStructural(sig.vrfProof.toBytes)).map { vrfOk =>
-                                    if (!vrfOk)
-                                      Left(
-                                        s"signer[$idx] peerId=${sig.peerId.value.value
-                                            .take(16)}... VRF proof structural check failed for shardId=${checkpoint.shardId} epoch=${checkpoint.epoch.value}"
-                                      ): Either[String, Unit]
-                                    else
-                                      Right(()): Either[String, Unit]
+                                  // (4) VRF — confirms the signer holds the VRF SK matching its REGISTERED VRF VK, by verifying the
+                                  // wire-carried `vrfProof` (a real EcVrf25519 proof the producer computed via
+                                  // `ShardSlotLeader.membershipProof` / `EligibilityChecker.vrfProofForSlot`) under the signer's
+                                  // `vrfRegistry` VK over the canonical `(shardEta(shardId, epoch), checkpoint.slot)` message. This
+                                  // cryptographically BINDS the signature to the committee member (a forged/replayed/wrong-epoch proof
+                                  // fails). Layered on top of: (a) the set-membership pre-check (peerId ∈ the VRF-VK-sortitioned
+                                  // committee for this `(shard, epoch)`), (b) Ed25519 over the checkpoint hash, (c) KES forward security.
+                                  // We do NOT re-assert the LDD/draw threshold here — committee SET membership is the (a) predicate; this
+                                  // is the membership/evaluation proof per `ShardCheckpointAttestationEmitter` §VRF. Registry-/eta-absent
+                                  // peers fall back to the structural length check (bootstrap carve-out, mirroring the KES path).
+                                  verifyVrf(checkpoint.shardId, checkpoint.epoch, checkpoint.slot, sig.peerId, sig.vrfProof.toBytes).map {
+                                    vrfOk =>
+                                      if (!vrfOk)
+                                        Left(
+                                          s"signer[$idx] peerId=${sig.peerId.value.value
+                                              .take(16)}... committee-VRF proof verify failed for shardId=${checkpoint.shardId} epoch=${checkpoint.epoch.value} slot=${checkpoint.slot.value.value}"
+                                        ): Either[String, Unit]
+                                      else
+                                        Right(()): Either[String, Unit]
                                   }
                               }
                         } yield step2
@@ -622,17 +645,55 @@ object ShardCheckpointGl0AcceptanceManager {
                   }
             }
 
-        /** Structural VRF proof check — non-empty bytes at the EcVrf25519 minimum proof length (80 bytes per the EcVrf25519 wire format).
-          * This is the Slice 9 placeholder; Slice 13's GSAM rewire will swap in the full `CommitteeSortition.verifyMembership` check once
-          * the VRF VK registry is wired through the constructor.
+        /** REAL committee-VRF membership verify — confirms the signer's wire-carried `vrfProof` is a valid `EcVrf25519` proof under its
+          * REGISTERED VRF VK over the canonical `(shardEta(shardId, epoch), slot)` message (the SAME message the producer's
+          * `ShardCheckpointAttestationEmitter` / `ShardSlotLeader.membershipProof` signs via `EligibilityChecker.vrfProofForSlot`).
           *
-          * Why a method on the manager rather than a static helper: the production replacement will need access to `Hasher[F]` + the VRF VK
-          * registry, both already in scope at the manager level. Keeping this as a method now means the slice-13 swap touches one method
-          * body instead of unwinding helper plumbing.
+          * '''The message (byte-identical with the producer).''' `EligibilityChecker.vrfProofForSlot` proves over `shardEta (32) || slot
+          * (8, big-endian)`. We reconstruct that exact preimage: `shardEta = shardEtaFor(shardId, epoch)` (the SAME resolver the emitter
+          * uses — `ShardSlotLeader.computeShardEta` over the epoch's gl0 eta) and `slotBytes = ByteBuffer.putLong(slot.value)`. The verify
+          * is `EcVrf25519.vrfVerify(vk, msg, proof)` — pure, deterministic, no LDD/threshold re-assertion (committee SET membership is the
+          * separate set-lookup pre-check (1); this binds the signature to its drawn member).
+          *
+          * '''Determinism (the #261 split invariant).''' Every input is cluster-uniform: `vrfRegistry` (genesis/seedlist-loaded VKs),
+          * `shardEtaFor` (MPT-committed eta + `Hasher`-based `computeShardEta`), `EcVrf25519.vrfVerify` (pure). So every honest gl0 node
+          * reaches the same verdict for the same signer.
+          *
+          * '''Carve-out (bootstrap window, mirrors the KES `verifyKes` path).''' If the signer has NO registered VRF VK
+          * (`vrfRegistry.getVrfVk = None`) OR the shard eta is not resolvable locally (`shardEtaFor = None`), we fall back to the
+          * structural proof-length check ([[verifyVrfStructural]]) rather than failing closed — a missing VK/eta is "I cannot
+          * cryptographically check this yet" (runtime VRF-VK registration is the follow-up), NOT "the signer is forged". Empty proof bytes
+          * are always rejected (wire-shape violation regardless of registry state). A malformed VK or proof that throws inside `vrfVerify`
+          * is caught and treated as a failed verify (we never crash the gl0 accept loop on a corrupt wire field).
+          */
+        private def verifyVrf(
+          shardId: ShardId,
+          epoch: EtaPeriod,
+          slot: Slot,
+          peerId: PeerId,
+          proofBytes: Array[Byte]
+        ): F[Boolean] =
+          if (proofBytes.isEmpty) Async[F].pure(false)
+          else
+            (shardEtaFor(shardId, epoch), vrfRegistry.getVrfVk(peerId)).tupled.map {
+              case (Some(shardEta), Some(vrfVk)) if shardEta.length == 32 =>
+                // Real cryptographic verify. Reconstruct the producer's exact `(shardEta || slot)` message
+                // (EligibilityChecker.vrfProofForSlot byte shape) and verify the proof under the registered VK.
+                val slotBytes = java.nio.ByteBuffer.allocate(8).putLong(slot.value.value).array()
+                val msg = shardEta ++ slotBytes
+                try EcVrf25519.default.vrfVerify(vrfVk, msg, proofBytes)
+                catch { case _: Throwable => false }
+              case _ =>
+                // Registry-absent / eta-unresolvable / wrong-shape eta ⇒ bootstrap carve-out: structural length check only.
+                verifyVrfStructural(proofBytes)
+            }
+
+        /** Structural VRF proof check — the EcVrf25519 wire minimum (80 bytes = Gamma(32) ‖ c(16) ‖ s(32)). Used ONLY as the
+          * registry-/eta-absent bootstrap carve-out inside [[verifyVrf]] (the real cryptographic verify runs whenever the VK + eta are
+          * available). Rejects anything shorter as malformed.
           */
         private def verifyVrfStructural(proofBytes: Array[Byte]): Boolean = {
-          // EcVrf25519 proofs are 80 bytes per `EcVrf25519` scaladoc. Reject anything shorter as malformed.
-          val MinProofLength = 80
+          val MinProofLength = EcVrf25519.ProofBytes // 80
           proofBytes.length >= MinProofLength
         }
       }

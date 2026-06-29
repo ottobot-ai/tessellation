@@ -306,10 +306,20 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
     // double-slash guard reads what accept() wrote). `_ => None` for the existing tests (no slash path).
     mkInvalidStateProofValidator: MptStore[IO, GlobalStateKey] => Option[
       io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[IO]
-    ] = _ => None
+    ] = _ => None,
+    spendActionValidatorOverride: Option[SpendActionValidator[IO]] = None,
+    crossShardSpendProofClient: Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofClient[IO]
+    ] = None
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[GlobalSnapshotAcceptanceManager[IO]] =
-    mkSuiteManagerWithProcessorAndStore(shardingConfig, checkpointManager, stateChannelEventsProcessor, mkInvalidStateProofValidator)
-      .map(_._1)
+    mkSuiteManagerWithProcessorAndStore(
+      shardingConfig,
+      checkpointManager,
+      stateChannelEventsProcessor,
+      mkInvalidStateProofValidator,
+      spendActionValidatorOverride,
+      crossShardSpendProofClient
+    ).map(_._1)
 
   /** Like [[mkSuiteManagerWithProcessor]] but ALSO returns the internal `mptStore` — needed by the W3a watchtower tests to read back the
     * `Slashings` partition the GSAM wrote (the double-slash guard's authoritative source).
@@ -320,7 +330,14 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
     stateChannelEventsProcessor: GlobalSnapshotStateChannelEventsProcessor[IO],
     mkInvalidStateProofValidator: MptStore[IO, GlobalStateKey] => Option[
       io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[IO]
-    ] = _ => None
+    ] = _ => None,
+    // W3c ACTIVATION test seam: override the INJECTED `spendActionValidator` (the spy used to prove the GSAM uses the
+    // sharded overload at numShards>1 and the injected one at numShards=1) + supply a deterministic cross-shard proof
+    // client. `None` ⇒ the default mock validator + `noop` client (every existing test is unchanged).
+    spendActionValidatorOverride: Option[SpendActionValidator[IO]] = None,
+    crossShardSpendProofClient: Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofClient[IO]
+    ] = None
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[(GlobalSnapshotAcceptanceManager[IO], MptStore[IO, GlobalStateKey])] = {
     // Mock dependencies — same shape as `Mocks.scala` for the existing GSAM tests, just inlined here so this suite is self-contained
     // and can swap in the captor processor without coupling to Mocks's mockStateChannelEventsProcessor.
@@ -525,7 +542,7 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
                     updateNodeParametersAcceptanceManager = mockUpdateNodeParametersAcceptanceManager,
                     updateDelegatedStakeAcceptanceManager = updateDelegatedStakeAcceptanceManager,
                     updateNodeCollateralAcceptanceManager = mockUpdateNodeCollateralAcceptanceManager,
-                    spendActionValidator = mockSpendActionValidator,
+                    spendActionValidator = spendActionValidatorOverride.getOrElse(mockSpendActionValidator),
                     pricingUpdateValidator = mockPricingUpdateValidator,
                     priceStateUpdater = mockPriceStateUpdater,
                     collateral = Amount.empty,
@@ -537,7 +554,9 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
                     shardAssignment = Some(ShardAssignment.make[IO](numShards = shardingConfig.map(_.numShards).getOrElse(1))),
                     // W3a — the dispute validator built over the internal `mptStore` (so its double-slash guard reads the `Slashings`
                     // partition this same GSAM writes). `None` for non-watchtower tests.
-                    invalidStateProofValidator = mkInvalidStateProofValidator(mptStore)
+                    invalidStateProofValidator = mkInvalidStateProofValidator(mptStore),
+                    // W3c ACTIVATION — the cross-shard proof client for the per-accept sharded SpendActionValidator.
+                    crossShardSpendProofClient = crossShardSpendProofClient
                   )
               } yield (mgr, mptStore)
             }
@@ -788,6 +807,84 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
         capturedAdopted.get(mgC).map(_.toList.map(_.value.content.toSeq)) == Some(List(binaryC.value.content.toSeq)),
         capturedAdopted.get(mgD).map(_.toList.map(_.value.content.toSeq)) == Some(List(binaryD.value.content.toSeq))
       )
+  }
+
+  // ============================================================================
+  // Test 4b (W3c ACTIVATION): at numShards>1 the GSAM builds + uses the PER-ACCEPT sharded SpendActionValidator
+  //   (cross-shard-capable, overlay bound to this accept's spent-set/epochs) — so the INJECTED unsharded validator
+  //   spy is NOT consulted. At numShards=1 the GSAM uses the INJECTED validator verbatim (the cross-shard branch is
+  //   unreachable ⇒ byte-identical). This is the activation forcing-function: it proves accept() selects the
+  //   sharded overload exactly when sharding is active. (The cross-shard phantom-refund REJECTION the sharded
+  //   validator performs is proven deterministically end-to-end in SpendActionValidatorCrossShardSuite Test 8/9 —
+  //   the SAME `effectiveCurrencyBalances`-bound overlay this GSAM wiring constructs.)
+  // ============================================================================
+
+  /** A spy `SpendActionValidator` that records whether `validateReturningAcceptedAndRejected` was invoked. `validateArtifacts` calls it
+    * unconditionally (even with an empty spend-action map), so the call-flag is a clean signal of WHICH validator the GSAM used.
+    */
+  private def mkSpyValidator(calledRef: Ref[IO, Boolean]): SpendActionValidator[IO] = new SpendActionValidator[IO] {
+    override def validate(
+      spendAction: SpendAction,
+      activeAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+      allBalances: Map[Option[Address], SortedMap[Address, Balance]],
+      currencyId: Address
+    ): IO[SpendActionValidationErrorOr[SpendAction]] = spendAction.validNec.pure[IO]
+
+    override def validateReturningAcceptedAndRejected(
+      spendActions: Map[Address, List[SpendAction]],
+      activeAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+      allBalances: Map[Option[Address], SortedMap[Address, Balance]]
+    ): IO[(Map[Address, List[SpendAction]], Map[Address, List[(SpendAction, List[SpendActionValidator.SpendActionValidationError])]])] =
+      calledRef
+        .set(true)
+        .as(
+          (
+            Map.empty[Address, List[SpendAction]],
+            Map.empty[Address, List[(SpendAction, List[SpendActionValidator.SpendActionValidationError])]]
+          )
+        )
+  }
+
+  test("W3c activation: numShards>1 ⇒ GSAM uses the per-accept SHARDED validator (injected spy NOT consulted)") { res =>
+    implicit val (h, sp) = res
+    for {
+      checkpointCallsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+      capturedRef <- Ref.of[IO, List[StateChannelOutput]](List.empty)
+      capturedAdoptedRef <- Ref.of[IO, SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]](SortedMap.empty)
+      spyCalledRef <- Ref.of[IO, Boolean](false)
+      stubMgr = StubAcceptanceManager(checkpointCallsRef, _ => ShardCheckpointAcceptResult.Accepted)
+      mgr <- mkSuiteManagerWithProcessor(
+        Some(mkShardingConfig(numShards = 4)),
+        Some(stubMgr),
+        mkCaptorProcessor(capturedRef, capturedAdoptedRef),
+        spendActionValidatorOverride = Some(mkSpyValidator(spyCalledRef))
+      )
+      _ <- invokeAccept(mgr, scEvents = List.empty, shardCheckpoints = SortedMap.empty, lastSnapshotInfo = emptyGsi)
+      spyCalled <- spyCalledRef.get
+    } yield
+      // The injected (unsharded) spy is NOT the validator the accept path ran — GSAM built the per-accept sharded
+      // overload (bound to this accept's spent-set/epochs) instead. This is the W3c activation.
+      expect(!spyCalled)
+  }
+
+  test("W3c numShards=1 byte-identity: GSAM uses the INJECTED validator verbatim (cross-shard branch unreachable)") { res =>
+    implicit val (h, sp) = res
+    for {
+      capturedRef <- Ref.of[IO, List[StateChannelOutput]](List.empty)
+      capturedAdoptedRef <- Ref.of[IO, SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]](SortedMap.empty)
+      spyCalledRef <- Ref.of[IO, Boolean](false)
+      // numShards=1 ⇒ no checkpoint manager needed (the adopt path never fires); the selection falls to the injected validator.
+      mgr <- mkSuiteManagerWithProcessor(
+        Some(mkShardingConfig(numShards = 1)),
+        None,
+        mkCaptorProcessor(capturedRef, capturedAdoptedRef),
+        spendActionValidatorOverride = Some(mkSpyValidator(spyCalledRef))
+      )
+      _ <- invokeAccept(mgr, scEvents = List.empty, shardCheckpoints = SortedMap.empty, lastSnapshotInfo = emptyGsi)
+      spyCalled <- spyCalledRef.get
+    } yield
+      // At numShards=1 the injected validator IS the one accept() runs — byte-identical to the pre-W3c path.
+      expect(spyCalled)
   }
 
   // ============================================================================
