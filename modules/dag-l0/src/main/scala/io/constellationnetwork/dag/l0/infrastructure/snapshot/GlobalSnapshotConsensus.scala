@@ -1459,15 +1459,75 @@ object GlobalSnapshotConsensus {
                       )
                     case Some(entry) => entry.chainStore.bestTip.map(_.map(_.signed))
                   }
-              // PIN-1: the proof is now built over the per-MG SUB-TRIE (component-addressable root), so the service needs a
-              // `perMgEntriesFor` that reconstructs `GlobalStateConverter.currencySnapshotMgEntries` from gl0's finalized state for the MG.
-              // DEFERRED to the cross-shard SpendAction-validator wiring (Wave 3, which also makes the proof value-bearing): until then this
-              // returns None, so the serve route 404s. Inert + matches the validator's still-noop proof client — nothing reads these proofs
-              // yet, and the whole arm is behind the `numShards > 1` (`Some(deps)`) gate.
+              // PIN-1: the proof is built over the per-MG SUB-TRIE (component-addressable root), so the service needs a `perMgEntriesFor`
+              // that reconstructs `GlobalStateConverter.currencySnapshotMgEntries` from gl0's FINALIZED state for the MG. We reuse the
+              // EXACT byte-production path the follower (`MptStoreReadOps.getAllLastCurrencySnapshots`) + producer
+              // (`ShardCheckpointWiring`) commit through, so the rebuilt sub-trie's `rootHash === perMetagraphMptRoots(mg)` by
+              // construction (the generate path's CONSISTENCY GUARD fails SAFE → 404 on any drift, never emits a wrong proof):
+              //   - reader = `GlobalStateReader.fromMptStore[F](mptStore)` — the SAME FINALIZED base reader the produce/watchtower
+              //     re-exec sites use at ~1614/1720. The serve anchor is gl0's finalized base (matches the §8.3 one-snapshot
+              //     read-after-write staleness bound; the §8.5 service comment above).
+              //   - per-MG `data` entry mirrors `getAllLastCurrencySnapshots` scoped to ONE MG (disjoint Left/Right partitions per
+              //     address): the genesis `LastCurrencySnapshots` (Left) partition first, else the `(Signed[CurrencyIncrementalSnapshot]
+              //     (fieldId-5), reconstructed CurrencySnapshotInfo)` (Right) pair. `getCurrencySnapshotInfo` reconstructs the info from
+              //     the unrolled `Mg*` partitions gated on the fieldId-5 incremental — the SAME inverse of `infoEntryBytes` the committed
+              //     root commits to.
+              //   - `None` when the MG has no reconstructible finalized currency state (never-seen / pre-genesis) ⇒ legitimate 404.
+              // Routed through `GlobalStateConverter.currencySnapshotMgEntries` (gl0's exact field-32-filtered producer bytes) with the
+              // SAME `globalStateProofSelector` the other PIN-1 sites pass. `shardHasher` (in scope above) drives all hashing; behind the
+              // `numShards > 1` (`Some(deps)`) gate, so numShards=1 stays byte-identical (the Ref stays `None`, route serves 503).
               val perMgEntriesFor
                 : io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService.PerMgEntriesLookup[F] =
-                (_: io.constellationnetwork.schema.address.Address) =>
-                  Async[F].pure(Option.empty[Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]])
+                (mg: io.constellationnetwork.schema.address.Address) => {
+                  import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps.GlobalStateReaderTypedOps
+                  val finalizedReader =
+                    io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore)
+                  finalizedReader
+                    .getLastCurrencySnapshot(mg)
+                    .flatMap {
+                      case Some(genesis) =>
+                        (Left(genesis): Either[
+                          io.constellationnetwork.security.signature.Signed[
+                            io.constellationnetwork.currency.schema.currency.CurrencySnapshot
+                          ],
+                          (
+                            io.constellationnetwork.security.signature.Signed[
+                              io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot
+                            ],
+                            io.constellationnetwork.currency.schema.currency.CurrencySnapshotInfo
+                          )
+                        ]).some.pure[F]
+                      case None =>
+                        (finalizedReader.getLastIncrementalCurrencySnapshot(mg), finalizedReader.getCurrencySnapshotInfo(mg)).tupled.map {
+                          case (Some(inc), Some(info)) =>
+                            (Right((inc, info)): Either[
+                              io.constellationnetwork.security.signature.Signed[
+                                io.constellationnetwork.currency.schema.currency.CurrencySnapshot
+                              ],
+                              (
+                                io.constellationnetwork.security.signature.Signed[
+                                  io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot
+                                ],
+                                io.constellationnetwork.currency.schema.currency.CurrencySnapshotInfo
+                              )
+                            ]).some
+                          case _ => None
+                        }
+                    }
+                    .flatMap {
+                      case None => Async[F].pure(Option.empty[Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]])
+                      case Some(stateEither) =>
+                        io.constellationnetwork.schema.mpt.GlobalStateConverter
+                          .currencySnapshotMgEntries[F](SortedMap(mg -> stateEither))(
+                            Async[F],
+                            Parallel[F],
+                            shardHasher,
+                            implicitly[io.constellationnetwork.json.JsonSerializer[F]],
+                            globalStateProofSelector
+                          )
+                          .map(_.some)
+                    }
+                }
               val proofService = io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService.make[F](
                 shardAssignment = deps.shardAssignment,
                 lookupShardCheckpoint = lookupShardCheckpoint,
@@ -1476,7 +1536,9 @@ object GlobalSnapshotConsensus {
               (shardProofServiceRef.set(Some(proofService)) >>
                 nakLogger.info(
                   "sharding ACTIVE: ShardSubtreeProofService published (serve route POST /shard/{id}/proof live; " +
-                    "perMgEntriesFor deferred to cross-shard validator wiring ⇒ proofs 404 until then)"
+                    "perMgEntriesFor LIVE — reconstructs per-MG currency state off the FINALIZED GlobalStateReader via " +
+                    "currencySnapshotMgEntries; proofs emit when the rebuilt sub-trie root === the committee-attested " +
+                    "perMetagraphMptRoots(mg), else 404 fail-safe)"
                 )).toResource
           }
 
