@@ -465,7 +465,9 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           mptOverlay,
           shardAcceptanceDeps,
           pendingAccumulatorsRef,
-          pendingPostBytesRef
+          pendingPostBytesRef,
+          // W3a — no-op fraud-proof pool (this suite does not exercise the watchtower path).
+          fraudProofPool = io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofPool.noop[IO]
         )
     } yield globalSnapshotConsensusFunction
   }

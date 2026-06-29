@@ -129,7 +129,16 @@ case class GlobalIncrementalSnapshot(
   nodeCollateralWithdrawals: Option[SortedMap[Address, List[Signed[UpdateNodeCollateral.Withdraw]]]],
   version: SnapshotVersion = SnapshotVersion("0.0.1"),
   slotCertificate: Option[io.constellationnetwork.schema.nakamoto.slot.SlotCertificate] = None,
-  eta: Option[io.constellationnetwork.security.hash.Hash] = None
+  eta: Option[io.constellationnetwork.security.hash.Hash] = None,
+  // WATCHTOWER fraud proofs carried as a CONSENSUS ARTIFACT (W3a) — a canonical `SortedSet` of fully-validated (UPHELD)
+  // `InvalidStateProofEvidence`, each carrying the full disputed `ShardCheckpoint` + the challenger's `FraudProofEnvelope`. The set's
+  // `Order` is keyed by the `(shardId, disputedCheckpointHash)` double-slash identity, so it serializes byte-deterministically and two
+  // disputes over the SAME wrong checkpoint coalesce. Carried EXACTLY like `shardCheckpoints` (a dedicated field, NOT the `artifacts`
+  // SharedArtifact set): the gl0 leader sources candidates from its node-local validated-fraud-proof pool, embeds the UPHELD subset here,
+  // and the follower/peer threads `signedArtifact.fraudProofs` back through `accept()` (NOT re-sourcing node-local gossip) so the byte-exact
+  // `recreatedArtifact === artifact` round-trip holds and EVERY node folds the SAME slash. Empty set = no disputes this ord; ALWAYS empty at
+  // `numShards = 1` (no committees ⇒ no fraud proofs) ⇒ mptRoot byte-identical to the pre-watchtower path.
+  fraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence] = SortedSet.empty
 ) extends IncrementalSnapshot[GlobalSnapshotStateProof]
 
 object GlobalIncrementalSnapshot {
@@ -185,6 +194,11 @@ object GlobalIncrementalSnapshot {
       version <- c.downField("version").as[Option[SnapshotVersion]].map(_.getOrElse(SnapshotVersion("0.0.1")))
       slotCertificate <- c.downField("slotCertificate").as[Option[io.constellationnetwork.schema.nakamoto.slot.SlotCertificate]]
       eta <- c.downField("eta").as[Option[io.constellationnetwork.security.hash.Hash]]
+      // WATCHTOWER fraud proofs (W3a) — forgiving like `shardCheckpoints`: absent in pre-watchtower fixtures ⇒ empty set.
+      fraudProofs <- c
+        .downField("fraudProofs")
+        .as[Option[SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence]]]
+        .map(_.getOrElse(SortedSet.empty[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence]))
     } yield
       GlobalIncrementalSnapshot(
         ordinal,
@@ -211,7 +225,8 @@ object GlobalIncrementalSnapshot {
         nodeCollateralWithdrawals,
         version,
         slotCertificate,
-        eta
+        eta,
+        fraudProofs
       )
   }
 

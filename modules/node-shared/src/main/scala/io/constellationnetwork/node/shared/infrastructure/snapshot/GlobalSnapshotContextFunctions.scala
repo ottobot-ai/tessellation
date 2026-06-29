@@ -243,7 +243,11 @@ object GlobalSnapshotContextFunctions {
               // encoding, same period = closingOrdinal / R). Pre-boundary / pre-S0.4 artifacts carry
               // `eta = None`, which only matters at boundary ordinals — at a boundary the producer always
               // populated it (`SnapshotLeaderLoop` sets `eta = Some(etaHash)` on every produced snapshot).
-              adoptedBoundaryEta = signedArtifact.eta
+              adoptedBoundaryEta = signedArtifact.eta,
+              // WATCHTOWER fraud proofs (W3a) — thread the signed snapshot's `fraudProofs` consensus field so this `createContext` GSAM
+              // re-validates each carried dispute and applies the SAME slash the producer did, reproducing the signed mptRoot. Empty at
+              // numShards=1 (the artifact carries an empty map) ⇒ byte-identical regression bar.
+              fraudProofs = signedArtifact.fraudProofs
             )
             .flatMap {
               case (

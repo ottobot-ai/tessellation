@@ -66,10 +66,13 @@ object FraudProofEnvelopeWireSuite extends FunSuite {
   private val requiredFields: List[String] = List(
     "shardId",
     "disputedCheckpointHash",
+    "metagraphAddress",
+    "gl0AnchorOrdinal",
     "claimedDerivation",
     "challengerDerivation",
     "reexecutionWitness",
-    "challengerSignature"
+    "challengerSignature",
+    "submitterId"
   )
 
   // ===========================================================================

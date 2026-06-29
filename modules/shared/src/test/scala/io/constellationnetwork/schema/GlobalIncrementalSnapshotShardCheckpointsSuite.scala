@@ -296,4 +296,72 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
       decoded.shardCheckpoints.keys.toList
     )
   }
+
+  // ===========================================================================
+  // W3a — WATCHTOWER fraud-proof field round-trip: the `fraudProofs` consensus artifact follows the EXACT `shardCheckpoints` contract
+  //   (a dedicated, defaulted, forgiving-decoded field), so the same three properties hold: non-empty round-trip, missing-key → empty
+  //   (pre-watchtower wire compat), and the encoder always emits the key.
+  // ===========================================================================
+
+  private def mkFraudProofEnvelope(shard: ShardId, cpHash: Hash, mgAddr: Address): FraudProofEnvelope =
+    FraudProofEnvelope(
+      shardId = shard,
+      disputedCheckpointHash = cpHash,
+      metagraphAddress = mgAddr,
+      gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(99L)),
+      claimedDerivation = hash('a'),
+      challengerDerivation = hash('b'),
+      reexecutionWitness = hex("dd" * 32),
+      challengerSignature = hex("ee" * 64),
+      submitterId = peerOne
+    )
+
+  private def mkEvidence(
+    shard: ShardId,
+    mgAddr: Address,
+    cpHashSeed: Char
+  ): io.constellationnetwork.schema.slashing.InvalidStateProofEvidence = {
+    val cp = mkCheckpoint(shard, mgAddr, 100L)
+    io.constellationnetwork.schema.slashing.InvalidStateProofEvidence(
+      shardId = shard,
+      disputedCheckpoint = cp,
+      metagraphAddress = mgAddr,
+      attestedRoot = hash('a'),
+      fraudProof = mkFraudProofEnvelope(shard, hash(cpHashSeed), mgAddr)
+    )
+  }
+
+  test("GlobalIncrementalSnapshot.fraudProofs — non-empty SortedSet round-trips through Circe") {
+    val proofs = SortedSet(mkEvidence(shardZero, mgAddrA, 'x'), mkEvidence(shardOne, mgAddrB, 'y'))
+    val snapshot = mkSnapshot(SortedMap.empty).copy(fraudProofs = proofs)
+    val jsonStr = snapshot.asJson.noSpaces
+    val decoded = decodeSnapshot(jsonStr)
+    expect.all(
+      cats.Eq[GlobalIncrementalSnapshot].eqv(decoded, snapshot),
+      decoded.fraudProofs.size == 2,
+      decoded.fraudProofs.map(_.shardId).toList == List(shardZero, shardOne)
+    )
+  }
+
+  test("GlobalIncrementalSnapshot.fraudProofs — missing key in JSON decodes to SortedSet.empty (pre-watchtower wire compat)") {
+    val snapshot = mkSnapshot(SortedMap.empty) // fraudProofs defaults to empty
+    val jsonStr = snapshot.asJson.noSpaces
+    val parsedJson = parse(jsonStr).fold(err => throw new AssertionError(s"parse failed: ${err.getMessage}"), identity)
+    val strippedJson = parsedJson.hcursor
+      .downField("fraudProofs")
+      .delete
+      .top
+      .getOrElse(throw new AssertionError("could not strip fraudProofs key from JSON"))
+    val strippedStr = strippedJson.noSpaces
+    expect.all(
+      !strippedStr.contains("fraudProofs"),
+      decode[GlobalIncrementalSnapshot](strippedStr).map(_.fraudProofs.isEmpty) == Right(true)
+    )
+  }
+
+  test("GlobalIncrementalSnapshot encoder always emits a `fraudProofs` JSON key (even when empty)") {
+    val snapshot = mkSnapshot(SortedMap.empty)
+    val jsonStr = snapshot.asJson.noSpaces
+    expect(jsonStr.contains("\"fraudProofs\""))
+  }
 }

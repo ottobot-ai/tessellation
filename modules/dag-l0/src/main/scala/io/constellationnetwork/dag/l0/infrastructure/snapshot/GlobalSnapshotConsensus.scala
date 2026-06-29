@@ -529,6 +529,54 @@ object GlobalSnapshotConsensus {
           .inMemory[F](sharedCfg.nakamoto.commitmentSmt.versionRootRetention.value)
       }.toResource
 
+      // ─── WATCHTOWER fraud-proof re-derivation closure (W3a) — hoisted ABOVE the GSAM so the on-chain verdict can use it ───
+      // The PIN-1 per-MG re-derivation — IDENTICAL encoding to the sub-quorum re-exec the acceptance manager uses
+      // (`reExecDerivationWithDiff(...)._1`, finalized base reader), so the recomputed root is byte-comparable against the committee-attested
+      // `perMetagraphMptRoots`. Built from the SAME shared `shardScEventsProcessor` + `mptStore` the produce path's `derivePerMgState` uses.
+      // This single closure is the basis of (a) the on-chain GSAM dispute verdict below, (b) the daemon's dispute verdict, and (c) the
+      // emitter's `watchtowerReExec` trigger — so producer / watchtower / verdict all compute byte-identical roots.
+      watchtowerReDerive = {
+        implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+        val priorStateReader =
+          io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore)
+        val withDiff = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+          .reExecDerivationWithDiff[F](shardScEventsProcessor, priorStateReader)(
+            Async[F],
+            Parallel[F],
+            h,
+            implicitly[io.constellationnetwork.json.JsonSerializer[F]],
+            globalStateProofSelector
+          )
+        (
+          mg: io.constellationnetwork.schema.address.Address,
+          binaries: cats.data.NonEmptyList[
+            io.constellationnetwork.security.signature.Signed[io.constellationnetwork.statechannel.StateChannelSnapshotBinary]
+          ],
+          anchor: io.constellationnetwork.schema.SnapshotOrdinal
+        ) => withDiff(mg, binaries, anchor).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
+      }
+
+      // ─── WATCHTOWER on-chain dispute verdict for the GSAM accept path (W3a) ──────────────────────────────
+      // The SAME deterministic validator the daemon uses, but reading the DURABLE `Slashings` MPT partition for the double-slash guard (so a
+      // checkpoint already slashed in a prior ordinal yields `AlreadySlashed` ⇒ NOT upheld ⇒ no double slash). Built with the PIN-1
+      // `watchtowerReDerive` closure (hoisted above) so the recomputed root matches the committee-attested `perMetagraphMptRoots`
+      // byte-for-byte. `None` at `numShards = 1` (`shardAcceptanceDeps = None`) ⇒ carried fraud proofs (always empty there) are ignored ⇒
+      // byte-identical regression bar. Passed into BOTH this gl0 GSAM (leader-produce + `validateArtifact`) below; the SharedServices
+      // `createContext` GSAM gets its own via the same recipe (so all three mptRoot-computing paths slash identically).
+      gsamInvalidStateProofValidator = shardAcceptanceDeps match {
+        case Some(_) =>
+          implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+          Some(
+            io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[F](
+              reDerivePerMgRoot = watchtowerReDerive,
+              slashedReader =
+                io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader.fromMptStore[F](mptStore)
+            )
+          ): Option[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
+        case None =>
+          Option.empty[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
+      }
+
       snapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager
         .make[F](
           sharedCfg.fieldsAddedOrdinals,
@@ -565,7 +613,10 @@ object GlobalSnapshotConsensus {
           // §3 NIPoPoW historical-commitment SMT: wire the gl0 store + the confirmation-depth cutoff so accept() anchors
           // `smtRoot(N)`. Same k the leader loop / sync daemon use (`nakamoto.confirmation-depth-k`, default 255).
           historicalCommitmentSmtStore = Some(historicalCommitmentSmtStore),
-          confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value
+          confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value,
+          // WATCHTOWER on-chain dispute verdict (W3a): re-validate carried fraud proofs + surface the bounty slash. SAME instance the
+          // leader-produce and `validateArtifact` paths share (this single GSAM). `None` at numShards=1.
+          invalidStateProofValidator = gsamInvalidStateProofValidator
         )
         .toResource
 
@@ -581,6 +632,18 @@ object GlobalSnapshotConsensus {
           GlobalConsensusKind
         ](appConfig.snapshot.consensus)
         .toResource
+
+      // WATCHTOWER fraud-proof POOL (W3a) — the single shared node-local staging area. The daemon's `handleFraudProof` OFFERS
+      // locally-UPHELD disputes into it; the gl0 leader producer PEEKS it to embed the `fraudProofs` consensus field. `noop` at
+      // numShards=1 (no shard deps) ⇒ always-empty ⇒ no fraud proofs embedded ⇒ byte-identical regression bar.
+      fraudProofPool <- shardAcceptanceDeps match {
+        case Some(_) =>
+          io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofPool.make[F]().toResource
+        case None =>
+          Async[F]
+            .pure(io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofPool.noop[F])
+            .toResource
+      }
 
       consensusFunctions =
         GlobalSnapshotConsensusFunctions.make[F](
@@ -616,7 +679,10 @@ object GlobalSnapshotConsensus {
           // Task #19 — staging-map backstop cap (typed HOCON, default 2048 = 2× the served ring), bumped from
           // the prior hardcoded 512 so a burst of never-finalizing forks between two finalize ticks cannot evict
           // a higher-ordinal staged entry about to finalize (which would force ml0 into a full-GSI resync).
-          stagingAccumulatorsCap = sharedCfg.nakamoto.stagingAccumulatorsCap.value
+          stagingAccumulatorsCap = sharedCfg.nakamoto.stagingAccumulatorsCap.value,
+          // WATCHTOWER fraud-proof POOL (W3a) — the leader-produce path peeks this to embed the `fraudProofs` consensus field. SAME instance
+          // the daemon offers into below. `noop` at numShards=1 ⇒ byte-identical regression bar.
+          fraudProofPool = fraudProofPool
         )
 
       stateAdvancer =
@@ -1770,32 +1836,8 @@ object GlobalSnapshotConsensus {
           }
 
           // ─── WATCHTOWER fraud-proof wiring (numShards>1 AND watchtower-enabled) ────────────────────────────
-          // The PIN-1 per-MG re-derivation closure — IDENTICAL encoding to the sub-quorum re-exec the acceptance
-          // manager uses (`reExecDerivationWithDiff(...)._1`, finalized base reader), so the recomputed root is
-          // byte-comparable against the committee-attested `perMetagraphMptRoots`. Built here from the SAME shared
-          // `shardScEventsProcessor` + `mptStore` the produce path's `derivePerMgState` uses. This is BOTH the
-          // emitter's trigger basis (via the acceptance manager's `watchtowerReExec`) AND the on-chain verdict's
-          // re-derivation, so producer/watchtower/verdict all compute byte-identical roots.
-          watchtowerReDerive = {
-            implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
-            val priorStateReader =
-              io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore)
-            val withDiff = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
-              .reExecDerivationWithDiff[F](shardScEventsProcessor, priorStateReader)(
-                Async[F],
-                Parallel[F],
-                h,
-                implicitly[io.constellationnetwork.json.JsonSerializer[F]],
-                globalStateProofSelector
-              )
-            (
-              mg: io.constellationnetwork.schema.address.Address,
-              binaries: cats.data.NonEmptyList[
-                io.constellationnetwork.security.signature.Signed[io.constellationnetwork.statechannel.StateChannelSnapshotBinary]
-              ],
-              anchor: io.constellationnetwork.schema.SnapshotOrdinal
-            ) => withDiff(mg, binaries, anchor).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
-          }
+          // `watchtowerReDerive` is hoisted to the OUTER for-comprehension (above the GSAM) so the on-chain GSAM dispute verdict can use the
+          // SAME closure; it is in lexical scope here for the emitter + the daemon's validator.
           watchtowerFraudProofEmitter <- (shardAcceptanceDeps, sharedCfg.nakamoto.invaliditySlashing.watchtowerEnabled) match {
             case (Some(deps), true) =>
               implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
@@ -2204,7 +2246,11 @@ object GlobalSnapshotConsensus {
                   // `None` at numShards=1 (regression bar) ⇒ the per-ord hook is `whenA(false)`.
                   shardProducers = shardProducers,
                   shardAssignment = shardAcceptanceDeps.map(_.shardAssignment),
-                  pullLatestMptEntries = pullLatestMptEntries
+                  pullLatestMptEntries = pullLatestMptEntries,
+                  // WATCHTOWER fraud-proof POOL (W3a): on a locally-UPHELD inbound dispute, `handleFraudProof` OFFERS the validated evidence
+                  // here so the gl0 leader producer embeds it in the next snapshot's `fraudProofs` consensus field. SAME instance the producer
+                  // peeks. `noop` at numShards=1 ⇒ no staging ⇒ byte-identical regression bar.
+                  fraudProofPool = fraudProofPool
                 )
                 .compile
                 .drain

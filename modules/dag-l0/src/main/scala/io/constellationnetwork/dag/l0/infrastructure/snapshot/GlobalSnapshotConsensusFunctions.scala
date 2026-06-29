@@ -172,7 +172,16 @@ object GlobalSnapshotConsensusFunctions {
     // `GlobalSnapshotConsensus.make`. The steady-state bound is the finalize-sink watermark prune; this only caps a
     // burst of never-finalizing forks staged BETWEEN two finalize ticks. The default mirrors `pendingAccumulatorsToKeep`
     // so the unit suite (and any caller relying on the default) is unaffected; production overrides it via HOCON.
-    stagingAccumulatorsCap: Int = GlobalSnapshotConsensusFunctions.pendingAccumulatorsToKeep
+    stagingAccumulatorsCap: Int = GlobalSnapshotConsensusFunctions.pendingAccumulatorsToKeep,
+    // WATCHTOWER fraud-proof POOL (W3a) — the node-local staging area the gossip dispute consumer (`NakamotoSyncDaemon.handleFraudProof`)
+    // offers locally-UPHELD `InvalidStateProofEvidence` into. On the LEADER produce path (`sourceShardCheckpoints = true`) the producer
+    // peeks the pool and embeds its contents in the produced snapshot's `fraudProofs` consensus field AND threads them into `accept(...)`
+    // so the slash is folded; the FOLLOWER/validator path threads the leader's embedded `artifact.fraudProofs` instead (split-safety — never
+    // re-sources its own pool), so the byte-exact `recreatedArtifact === artifact` round-trip holds. `noop` (cl0/dl1/tests/`numShards = 1`)
+    // ⇒ `peekAll` is always empty ⇒ no fraud proofs embedded ⇒ byte-identical to the pre-watchtower path (the regression bar). Required (no
+    // default — `noop` needs `Sync[F]` which a default-arg site can't summon); the sole production wiring passes the shared instance, and the
+    // `numShards = 1` wiring passes `WatchtowerFraudProofPool.noop[F]` explicitly.
+    fraudProofPool: io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofPool[F]
   ): GlobalSnapshotConsensusFunctions[F] = new GlobalSnapshotConsensusFunctions[F] {
 
     private val logger = Slf4jLogger.getLoggerFromClass[F](getClass)
@@ -261,7 +270,9 @@ object GlobalSnapshotConsensusFunctions {
         // `shardCheckpoints` field equals `artifact.shardCheckpoints` and `recreatedArtifact === artifact`
         // holds. The leader already filtered these to the `verifyEmbedded`-accepted subset, so the
         // follower's `verifyEmbedded` re-accepts all of them (deterministic) and the embedded set round-trips.
-        incomingShardCheckpoints = artifact.shardCheckpoints
+        incomingShardCheckpoints = artifact.shardCheckpoints,
+        // Split-safety (W3a): thread the leader's embedded fraud proofs so the follower folds the SAME slash and re-embeds the SAME map.
+        incomingFraudProofs = artifact.fraudProofs
       )
 
       // The §3 NIPoPoW historical-commitment `smtRoot` is gl0-maintained and PATH-DEPENDENT: it folds the locally-resolved
@@ -334,7 +345,9 @@ object GlobalSnapshotConsensusFunctions {
         getGlobalSnapshotByOrdinal,
         sourceShardCheckpoints = true,
         // Produce path sources its own candidate checkpoints from the per-shard chain stores below; nothing incoming.
-        incomingShardCheckpoints = SortedMap.empty
+        incomingShardCheckpoints = SortedMap.empty,
+        // Produce path peeks its own `fraudProofPool` below; nothing incoming.
+        incomingFraudProofs = SortedSet.empty
       )
 
     /** Implementation of [[createProposalArtifact]] with an explicit `sourceShardCheckpoints` gate.
@@ -372,7 +385,12 @@ object GlobalSnapshotConsensusFunctions {
       incomingShardCheckpoints: SortedMap[
         io.constellationnetwork.schema.sharding.ShardId,
         io.constellationnetwork.schema.sharding.ShardCheckpoint
-      ]
+      ],
+      // WATCHTOWER fraud proofs (W3a). On the FOLLOWER/validator re-derivation path (`sourceShardCheckpoints = false`) this is the leader's
+      // embedded `artifact.fraudProofs`, threaded back unchanged so the recreated artifact's `fraudProofs` field round-trips byte-identically.
+      // On the PRODUCE path (`sourceShardCheckpoints = true`) it is ignored — the producer peeks its node-local `fraudProofPool` instead.
+      // Empty at `numShards = 1` / `noop` pool ⇒ byte-identical to the pre-watchtower path on both paths.
+      incomingFraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence]
     )(implicit hasher: Hasher[F]): F[(GlobalSnapshotArtifact, GlobalSnapshotContext, Set[GlobalSnapshotEvent])] = {
       val scEventsBeforeCut = events.collect { case sc: StateChannelEvent => sc }
       val dagEventsBeforeCut = events.collect { case d: DAGEvent => d }
@@ -724,6 +742,15 @@ object GlobalSnapshotConsensusFunctions {
               .pure[F]
         }
 
+        // WATCHTOWER fraud proofs (W3a). PRODUCE path (`sourceShardCheckpoints = true`): peek the node-local `fraudProofPool` — the disputes
+        // the gossip consumer staged locally — and embed them. FOLLOWER/validator path: thread the leader's embedded `incomingFraudProofs`
+        // unchanged (split-safety — never re-source the local pool, so the recreated artifact's `fraudProofs` field round-trips byte-exactly).
+        // GSAM's accept() re-validates each carried evidence DETERMINISTICALLY and slashes on UPHELD, so the leader/follower/peer fold the
+        // SAME slash regardless of whose pool sourced it. Empty at `numShards = 1` / `noop` pool ⇒ byte-identical to the pre-watchtower path.
+        effectiveFraudProofs <-
+          if (sourceShardCheckpoints) fraudProofPool.peekAll
+          else incomingFraudProofs.pure[F]
+
         acceptStartMs <- Async[F].monotonic.map(_.toMillis)
         (
           acceptanceResult,
@@ -776,7 +803,10 @@ object GlobalSnapshotConsensusFunctions {
               // `verifyEmbedded` and adopts each into `scSnapshots`; passing the already-accepted subset makes the
               // adopt-won `stateChannelSnapshots` correspond exactly to the embedded `shardCheckpoints` field below.
               // Empty at numShards=1 (regression bar): the adopt path only fires when `numShards > 1 && nonEmpty`.
-              shardCheckpoints = adoptableShardCheckpoints
+              shardCheckpoints = adoptableShardCheckpoints,
+              // WATCHTOWER fraud-proof artifact (W3a) — folded into the slash sink; the SAME map is embedded in the snapshot below so the
+              // follower/validator threading `artifact.fraudProofs` recreates this call identically. Empty at numShards=1 / noop pool.
+              fraudProofs = effectiveFraudProofs
             )
         acceptEndMs <- Async[F].monotonic.map(_.toMillis)
         _ <- ConsensusLog.info(
@@ -854,7 +884,12 @@ object GlobalSnapshotConsensusFunctions {
           acceptedDelegatedStakeCreates.some,
           acceptedDelegatedStakeWithdrawals.some,
           acceptedNnodeCollateralCreates.some,
-          acceptedNnodeCollateralWithdrawals.some
+          acceptedNnodeCollateralWithdrawals.some,
+          // WATCHTOWER fraud-proof consensus field (W3a) — embed the SAME map fed to `accept(fraudProofs=…)` above, so a follower/validator
+          // threading `artifact.fraudProofs` back through accept() recreates this snapshot byte-identically (the `recreatedArtifact ===
+          // artifact` round-trip). Empty at numShards=1 / noop pool (regression bar). `version`/`slotCertificate`/`eta` keep their defaults
+          // here (SnapshotLeaderLoop `.copy(eta = …)`s eta later; that copy preserves this field).
+          fraudProofs = effectiveFraudProofs
         )
         // Phase J: commit the overlay handle once the artifact is built and we have the snapshot's
         // hash to use as the branch's `childTip`. Under MultiBranch this registers `currentSnapshotHash`

@@ -198,7 +198,15 @@ trait GlobalSnapshotAcceptanceManager[F[_]] {
     // the gl0-producer path (`GlobalSnapshotConsensusFunctions`) keeps the recompute-via-`etaForPeriod` behavior
     // unchanged — producers MUST keep computing it. Only consulted at boundary ordinals (`ord % R == R - 1`);
     // ignored otherwise.
-    adoptedBoundaryEta: Option[Hash] = None
+    adoptedBoundaryEta: Option[Hash] = None,
+    // WATCHTOWER fraud-proof CONSENSUS ARTIFACT (W3a). The canonical `SortedSet` of UPHELD fraud proofs the gl0 leader embedded in the
+    // produced snapshot's `fraudProofs` field, threaded back here on EVERY path (leader-produce, follower-`createContext`,
+    // peer-`validateArtifact`) so the slash is folded identically. Each entry is re-validated via the `invalidStateProofValidator`
+    // (deterministic recompute); on UPHELD a `WatchtowerSlashRequest(submitter = Some(challengerAddress))` is surfaced into the SAME
+    // `applyWatchtowerSlashes` fold the self-detected re-exec mismatch feeds (durable slash + bounty to the challenger + `Slashings` MPT
+    // write). The set is `(shardId, disputedCheckpointHash)`-ordered so the same wrong checkpoint appears at most once. Default
+    // `SortedSet.empty` (every test/cl0/dl1 call site) ⇒ no slash ⇒ byte-identical; ALWAYS empty at `numShards = 1` ⇒ the regression bar holds.
+    fraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence] = SortedSet.empty
   ): F[
     (
       BlockAcceptanceResult,
@@ -429,7 +437,20 @@ object GlobalSnapshotAcceptanceManager {
     // ONLY reachable at `numShards > 1` regardless (the adopt path that surfaces the request never runs at `numShards = 1`), so the
     // `numShards = 1` byte-identical regression bar is independent of this config.
     invaliditySlashingConfig: InvalidStateProofSlashingConfig =
-      InvalidStateProofSlashingConfig(watchtowerEnabled = true, slashFraction = 1.0d, bountyFraction = 0.05d, cooldownEpochs = 100L)
+      InvalidStateProofSlashingConfig(watchtowerEnabled = true, slashFraction = 1.0d, bountyFraction = 0.05d, cooldownEpochs = 100L),
+    // WATCHTOWER fraud-proof DETERMINISTIC dispute verdict (W3a). When `Some`, every fraud-proof artifact carried in `accept(fraudProofs=…)`
+    // is re-validated here via the SAME `InvalidStateProofValidator` the daemon uses (recomputes the honest per-MG root from the disputed
+    // checkpoint's OWN signed bytes; UPHELD iff attested ≠ honest — never trusts the challenger). On UPHELD a `WatchtowerSlashRequest` with
+    // `submitter = Some(challengerAddress)` is surfaced into the SAME `applyWatchtowerSlashes` fold the self-detected re-exec path feeds, so
+    // the leader/follower/peer reach a BYTE-IDENTICAL slash (the validator is pure given its inputs + the finalized base it reads). The
+    // production wiring (`GlobalSnapshotConsensus.make`) passes the validator built with the PIN-1 `watchtowerReDerive` closure + a
+    // `Slashings`-partition-backed `InvalidStateProofSlashedReader.fromMptStore` (so an already-slashed checkpoint yields `AlreadySlashed` ⇒
+    // NOT upheld ⇒ no double slash). `None` (cl0/dl1/tests passing no validator) ⇒ carried fraud proofs are ignored ⇒ no slash. The slash is
+    // additionally gated by `watchtowerEnabled` and is ONLY reachable at `numShards > 1` (no fraud proofs exist at `numShards = 1`), so the
+    // `numShards = 1` byte-identical regression bar is preserved independently of this validator.
+    invalidStateProofValidator: Option[
+      io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]
+    ] = None
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): F[GlobalSnapshotAcceptanceManager[F]] = {
@@ -1705,7 +1726,9 @@ object GlobalSnapshotAcceptanceManager {
           parentTip: BranchId,
           shardCheckpoints: SortedMap[ShardId, ShardCheckpoint] = SortedMap.empty,
           // #259 — see the trait scaladoc on this param. `Some` on verifier-replay (adopt gl0's eta), `None` on producers.
-          adoptedBoundaryEta: Option[Hash] = None
+          adoptedBoundaryEta: Option[Hash] = None,
+          // WATCHTOWER fraud-proof artifact (W3a) — see the trait scaladoc. Threaded identically on every path; folded into the slash sink.
+          fraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence] = SortedSet.empty
         ): F[
           (
             BlockAcceptanceResult,
@@ -2019,11 +2042,62 @@ object GlobalSnapshotAcceptanceManager {
                   }
                 adoptedScSnapshots = adoptedResult._1
                 adoptedDiffs = adoptedResult._2
-                // WATCHTOWER durable-slash requests surfaced by the adopt path (empty unless an upheld re-exec mismatch this ordinal; ALWAYS
-                // empty at numShards=1 since `adoptShardCheckpoints` never runs there). Applied to the stake maps below, before cleaning.
-                // The `watchtowerEnabled` config gate makes the durable slash inert when off (drop the requests ⇒ `applyWatchtowerSlashes` is
-                // a no-op ⇒ stake maps + `Slashings` partition + mptRoot unchanged) — a single deterministic kill-switch read at one site.
-                adoptedSlashRequests = if (invaliditySlashingConfig.watchtowerEnabled) adoptedResult._3 else Nil
+
+                // WATCHTOWER fraud-proof CONSENSUS ARTIFACT → durable slash (W3a). Re-validate EVERY carried fraud proof here via the SAME
+                // deterministic `InvalidStateProofValidator` the daemon uses (recomputes the honest per-MG root from the disputed checkpoint's
+                // OWN signed bytes; UPHELD iff attested ≠ honest — never trusts the challenger's claimed roots), and for each UPHELD dispute
+                // surface a `WatchtowerSlashRequest(submitter = Some(challengerAddress))`. Because the validator is a pure function of the
+                // evidence + the finalized base it reads (cluster-uniform below depth-k₁), the leader/follower/peer reach a BYTE-IDENTICAL
+                // verdict and thus the byte-identical slash. The honest-committee floor is enforced INSIDE the validator (`DisputeNotUpheld` on
+                // a frivolous/forged proof ⇒ skipped here). The double-slash guard is the validator's step-6 `slashedReader` (production:
+                // `Slashings`-partition-backed) PLUS `applyWatchtowerSlashes`'s per-`(shardId, checkpointHash)` registry dedup within the fold.
+                // `submitterId.toAddress` is the deterministic recover-public-key→address of the challenger (the bounty recipient).
+                // BYTE-IDENTITY GATE: explicitly require `numShards > 1` (the SAME gate `adoptShardCheckpoints` uses) so that even a forged
+                // `fraudProofs` artifact injected at `numShards = 1` is a hard no-op — no committees exist there, so no honest dispute is
+                // possible, and the slash must never touch the mptRoot. In production `fraudProofs` is also always empty at `numShards = 1`
+                // (the producer's pool is `noop`); this gate is defense-in-depth so the regression bar holds unconditionally.
+                fraudProofSlashRequests <-
+                  (shardingConfig, invalidStateProofValidator, invaliditySlashingConfig.watchtowerEnabled) match {
+                    case (Some(cfg), Some(validator), true) if cfg.numShards > 1 && fraudProofs.nonEmpty =>
+                      // Deterministic iteration order: the `SortedSet` is `(shardId, disputedCheckpointHash)`-ordered, so the produced list
+                      // order is identical on every node (it does not actually affect the result — `applyWatchtowerSlashes` re-sorts — but
+                      // keep it canonical). The double-slash key is read off the fraud proof (`disputedCheckpointHash`), the SAME hash the
+                      // validator binds the carried checkpoint to (step 4).
+                      fraudProofs.toList.flatTraverse { evidence =>
+                        val checkpointHash = evidence.fraudProof.disputedCheckpointHash
+                        validator.validate(evidence).flatMap {
+                          case Right(upheld) =>
+                            upheld.fraudProof.submitterId.toAddress[F].map { submitterAddr =>
+                              List(
+                                WatchtowerSlashRequest(
+                                  upheld.shardId,
+                                  checkpointHash,
+                                  upheld.slashTargets,
+                                  submitter = Some(submitterAddr)
+                                )
+                              )
+                            }
+                          case Left(rejection) =>
+                            // Honest-committee floor / frivolous / already-slashed / malformed — NO slash. Logged at info; no ledger effect.
+                            loggerBundle.app
+                              .info(
+                                s"[ACCEPTANCE/SLASHING] ordinal=$ordinal WATCHTOWER fraud-proof NOT upheld (no slash): " +
+                                  s"checkpoint=${checkpointHash.value.take(12)} shard=${evidence.shardId.value.value} " +
+                                  s"mg=${evidence.metagraphAddress.value.value.take(10)} reason=$rejection"
+                              )
+                              .as(List.empty[WatchtowerSlashRequest])
+                        }
+                      }
+                    case _ => Async[F].pure(List.empty[WatchtowerSlashRequest])
+                  }
+
+                // WATCHTOWER durable-slash requests = the gl0 self-detected sub-quorum re-exec mismatches (`submitter = None` ⇒ burn) UNION the
+                // upheld watchtower fraud-proof disputes (`submitter = Some` ⇒ bounty). Both are applied to the stake maps below, before
+                // cleaning, via the SAME pure `applyWatchtowerSlashes` fold. ALWAYS empty at numShards=1 (neither source produces a request
+                // there). The `watchtowerEnabled` config gate makes the durable slash inert when off (drop the requests ⇒ `applyWatchtowerSlashes`
+                // is a no-op ⇒ stake maps + `Slashings` partition + mptRoot unchanged) — a single deterministic kill-switch read at one site.
+                adoptedSlashRequests =
+                  if (invaliditySlashingConfig.watchtowerEnabled) adoptedResult._3 ++ fraudProofSlashRequests else Nil
 
                 // CHANGE 3 — partition the raw `scEvents` by the deterministic static shard assignment. When sharding is
                 // active (`numShards > 1` AND `shardAssignment` wired), a metagraph address that maps to a shard flows ONLY

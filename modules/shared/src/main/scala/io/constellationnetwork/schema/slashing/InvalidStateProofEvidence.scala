@@ -71,6 +71,20 @@ final case class InvalidStateProofEvidence(
     disputedCheckpoint.committeeSignatures.toList.map(_.peerId).distinct
 }
 
+object InvalidStateProofEvidence {
+
+  /** Canonical `Order` keyed by `(shardId, fraudProof.disputedCheckpointHash)` — the SAME `(shardId, disputedCheckpointHash)` double-slash
+    * identity the slash uses. A MANUAL instance (not `@derive(order)`) because the embedded [[ShardCheckpoint]] is not `Order` (and need
+    * not be — the dispute identity is the checkpoint HASH, carried on the fraud proof). This makes `SortedSet[InvalidStateProofEvidence]`
+    * canonical so the snapshot `fraudProofs` consensus field serializes byte-deterministically on every node, and two disputes over the
+    * SAME wrong checkpoint coalesce in the set (the on-chain double-slash guard handles cross-ordinal dedup).
+    */
+  implicit val order: cats.Order[InvalidStateProofEvidence] =
+    cats.Order.by(e => (e.shardId, e.fraudProof.disputedCheckpointHash))
+
+  implicit val ordering: scala.math.Ordering[InvalidStateProofEvidence] = order.toOrdering
+}
+
 /** Rejection reasons for `InvalidStateProofValidator` — one variant per validator step. Sealed ADT (per `feedback_no_string_matching`): the
   * validator returns the exact step that fired so the slasher audit-log / metrics name the failure without parsing a string. Mirrors
   * [[SlashingRejection]] / `ShardCheckpointEquivocationRejection`.

@@ -676,7 +676,13 @@ object NakamotoSyncDaemon {
     // Byte-faithful deep-catch-up source: pulls gl0's latest FINALIZED signed MPT bytes from a peer (built from `client` + `clusterStorage`
     // at the GlobalSnapshotConsensus call site via `pullLatestMptEntriesFromPeer`). Threaded into `catchUpFromGossip` so a >k-behind node
     // adopts the producer's signed MPT VERBATIM (gated on `sidecarFreeMptRoot === signed mptRoot`) instead of the doomed GSI re-encode.
-    pullLatestMptEntries: F[Option[LatestMptEntries]]
+    pullLatestMptEntries: F[Option[LatestMptEntries]],
+    // WATCHTOWER fraud-proof POOL (W3a): `handleFraudProof` OFFERS a locally-UPHELD inbound dispute here so the gl0 leader producer embeds it
+    // in the next snapshot's `fraudProofs` consensus field (where EVERY node re-validates + slashes it deterministically). The sole
+    // production wiring passes the shared instance; at `numShards = 1` it passes `WatchtowerFraudProofPool.noop[F]` ⇒ offers discard ⇒ no
+    // fraud proofs ever embedded ⇒ byte-identical regression bar. Required (no default — `noop` needs `Sync[F]`, not summonable at a
+    // default-arg site).
+    fraudProofPool: io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofPool[F]
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -1031,8 +1037,10 @@ object NakamotoSyncDaemon {
                             case pb.GossipMessage.Body.FraudProof(fp) =>
                               // WATCHTOWER dispute consumer (part 2): background-fire the DETERMINISTIC verdict. Every gl0 runs the
                               // identical re-derivation over the disputed checkpoint's own bytes; the verdict is recomputed, never trusted.
+                              // On a locally-UPHELD verdict the validated evidence is OFFERED into `fraudProofPool` so the gl0 leader embeds it
+                              // as the `fraudProofs` consensus artifact (W3a) — where the on-chain GSAM re-validates it + applies the slash.
                               Async[F]
-                                .start(handleFraudProof(fp, shardAcceptanceDeps, invalidStateProofValidator, logger))
+                                .start(handleFraudProof(fp, shardAcceptanceDeps, invalidStateProofValidator, fraudProofPool, logger))
                                 .void
 
                             case _: pb.GossipMessage.Body.Rumor =>
@@ -2847,6 +2855,7 @@ object NakamotoSyncDaemon {
     invalidStateProofValidator: Option[
       io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]
     ],
+    fraudProofPool: io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofPool[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
     (shardAcceptanceDeps, invalidStateProofValidator) match {
@@ -2877,13 +2886,18 @@ object NakamotoSyncDaemon {
                       fraudProof = fp
                     )
                     validator.validate(evidence).flatMap {
-                      case Right(_) =>
-                        logger.warn(
-                          s"🛡️ WATCHTOWER dispute UPHELD: shard=${fp.shardId.value.value} " +
-                            s"checkpoint=${fp.disputedCheckpointHash.value.take(12)} mg=${fp.metagraphAddress.value.value.take(10)} " +
-                            s"slashTargets=${evidence.slashTargets.size} — committee signed a wrong derivation (100% InvalidStateProof slash " +
-                            s"applies on-chain via InvalidStateProofEvidence)"
-                        )
+                      case Right(upheld) =>
+                        // UPHELD locally — OFFER the validated evidence into the node-local pool so the gl0 leader embeds it as the
+                        // `fraudProofs` consensus artifact (W3a). The on-chain GSAM accept path re-validates it DETERMINISTICALLY on every
+                        // node and applies the 100% slash + bounty to the challenger; this offer is a pure liveness aid (the authoritative
+                        // verdict + slash are the consensus fold, never this pool). The set keys on the dispute's `(shardId, checkpointHash)`.
+                        fraudProofPool.offer(upheld) >>
+                          logger.warn(
+                            s"🛡️ WATCHTOWER dispute UPHELD: shard=${fp.shardId.value.value} " +
+                              s"checkpoint=${fp.disputedCheckpointHash.value.take(12)} mg=${fp.metagraphAddress.value.value.take(10)} " +
+                              s"slashTargets=${evidence.slashTargets.size} — committee signed a wrong derivation (queued for on-chain 100% " +
+                              s"InvalidStateProof slash via the fraudProofs consensus artifact)"
+                          )
                       case Left(rejection) =>
                         logger.info(
                           s"🛡️ WATCHTOWER dispute NOT upheld (no slash): shard=${fp.shardId.value.value} " +

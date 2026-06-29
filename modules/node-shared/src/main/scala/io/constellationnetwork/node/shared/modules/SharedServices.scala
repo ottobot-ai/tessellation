@@ -315,6 +315,37 @@ object SharedServices {
             withDiff(mg, binaries, anchor).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
         }
       )(Async[F], HasherSelector[F].getCurrent, implicitly[SecurityProvider[F]], implicitly[Metrics[F]])
+      // WATCHTOWER on-chain dispute verdict for the `createContext` GSAM (W3a). gl0 followers re-derive the GSI via `createContext` and must
+      // reproduce the signed snapshot's mptRoot — which reflects any watchtower slash — so this GSAM must apply the SAME slash. Built with
+      // the PIN-1 re-derivation closure (mirroring the `reExecuteDerivation` above) + the DURABLE `Slashings`-backed double-slash reader. The
+      // `createContext` path threads `signedArtifact.fraudProofs` into accept(); this validator re-validates each one identically. `None` at
+      // `numShards = 1` (`shardAcceptanceDeps = None`) ⇒ carried fraud proofs (always empty there) ignored ⇒ byte-identical regression bar.
+      createContextInvalidStateProofValidator = shardAcceptanceDeps match {
+        case Some(_) =>
+          implicit val h: Hasher[F] = HasherSelector[F].getCurrent
+          val priorStateReader = io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+            .fromMptStore[F](storages.mptStore)
+          val withDiff =
+            ShardCheckpointWiring.reExecDerivationWithDiff[F](shardScEventsProcessor, priorStateReader)(
+              Async[F],
+              Parallel[F],
+              h,
+              implicitly[JsonSerializer[F]],
+              globalStateProofSelector
+            )
+          val reDerive =
+            (mg: Address, binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]], anchor: SnapshotOrdinal) =>
+              withDiff(mg, binaries, anchor).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
+          Some(
+            io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[F](
+              reDerivePerMgRoot = reDerive,
+              slashedReader = io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader
+                .fromMptStore[F](storages.mptStore)
+            )(Async[F], implicitly[SecurityProvider[F]], h)
+          ): Option[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
+        case None =>
+          Option.empty[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
+      }
       globalSnapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager.make(
         cfg.fieldsAddedOrdinals,
         cfg.metagraphsSync,
@@ -354,7 +385,10 @@ object SharedServices {
         // `nakamoto.invalidity-slashing` source (NOT the GSAM-make hardcoded default) so the slash fraction/cooldown/bounty —
         // which feed the post-slash stake maps committed into the global mptRoot — are the operator-configured, cluster-uniform
         // values. This is the sole GSAM construction site, so threading here covers the whole acceptance path.
-        invaliditySlashingConfig = cfg.nakamoto.invaliditySlashing
+        invaliditySlashingConfig = cfg.nakamoto.invaliditySlashing,
+        // WATCHTOWER on-chain dispute verdict (W3a): re-validate carried fraud proofs on the `createContext` path so gl0 followers slash
+        // identically and reproduce the signed mptRoot. `None` at numShards=1.
+        invalidStateProofValidator = createContextInvalidStateProofValidator
       )
       globalSnapshotContextFns = GlobalSnapshotContextFunctions.make(
         globalSnapshotAcceptanceManager,
