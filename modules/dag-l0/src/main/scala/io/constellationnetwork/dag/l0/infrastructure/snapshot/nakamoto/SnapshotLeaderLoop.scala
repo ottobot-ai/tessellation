@@ -1005,11 +1005,9 @@ object SnapshotLeaderLoop {
         // for them once they land.
         //
         // See `docs/nakamoto/attestation-and-finality.md` §0.3 for the formal target.
-        // k₂ = 100·k₁ — the archive/FREEZE depth, DERIVED from the single confirmation-depth knob (matches keepDepthBehindFinalized, so a
-        // branch stays retained right up to the depth it archives at). T_depth2 fires at tip − k₂ and now BOTH freezes chain selection
-        // (chainStore.archive) and prunes overlay history. Reorgs via density chain selection are allowed for k₁ ≤ depth < k₂; only at k₂
-        // does the chain freeze. (Was a hardcoded sys.env 65536 that didn't track k₁ and — worse — froze nothing, because the actual
-        // freeze was wrongly pinned to k₁ in the chain-store gate. Per project convention, derive from HOCON confirmationDepthK.)
+        // k₂-depth for T_depth2's overlay prune + archival-log marker. Derived from the single confirmation-depth knob (NO sys.env,
+        // per project config convention; the old NAKAMOTO_ARCHIVAL_DEPTH env read was a dead knob). NOTE: this is NOT a chain-selection
+        // freeze — after reverting 86f390130 the no-reorg freeze is back on the k1 finalized marker in NakamotoChainStore.store().
         val ArchivalDepthK: Long = 100L * confirmationDepthK
 
         // FinalityTrigger[F] construction (#135 / #136). T_weight, T_count and T_depth1
@@ -1480,11 +1478,6 @@ object SnapshotLeaderLoop {
                                   bestTip match {
                                     case Some(tip) =>
                                       lastArchivalOrdinalRef.set(archivalQualifying) >>
-                                        // PHASE 2 → PHASE 3 FREEZE (THE persistent-fork fix). Advance the chain-store ARCHIVE horizon:
-                                        // from here down the finality-safety store gate refuses different-hash writes (no more reorgs).
-                                        // ABOVE this (k₁ ≤ depth < k₂) density chain selection stays live, so a node on a losing branch
-                                        // can be overtaken by — and reorg onto — the denser majority instead of cementing a minority fork.
-                                        chainStore.archive(archivalQualifying.value.value) >>
                                         logger.info(
                                           s"ARCHIVAL-FINALIZED ordinal=${archivalQualifying.value.value} " +
                                             s"(tip ord=${tip.ordinal}, k₂=$ArchivalDepthK)"

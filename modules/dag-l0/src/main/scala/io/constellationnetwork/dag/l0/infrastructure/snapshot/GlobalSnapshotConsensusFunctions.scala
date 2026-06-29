@@ -264,10 +264,20 @@ object GlobalSnapshotConsensusFunctions {
         incomingShardCheckpoints = artifact.shardCheckpoints
       )
 
+      // The §3 NIPoPoW historical-commitment `smtRoot` is gl0-maintained and PATH-DEPENDENT: it folds the locally-resolved
+      // snapshot[N−k] into a SEPARATELY-maintained accumulating SMT (keyed by finalized ordinal, not in the GSI), so honest
+      // nodes provably cannot reproduce it in lockstep. It must NOT gate consensus acceptance — including it in this `===` made
+      // ~97% of freshly-won blocks fail content-validation against each other (the fork storm). Compare smtRoot-blind, matching
+      // the existing `StateProofComparison.equivalent` precedent (which already normalizes smtRoot away for exactly this reason).
+      // smtRoot integrity is covered by (a) its inclusion in the SIGNED snapshot and (b) the dedicated chain-replay check at the
+      // finalize sink — never by this re-derivation equality.
+      def smtRootBlind(a: GlobalSnapshotArtifact): GlobalSnapshotArtifact =
+        a.copy(stateProof = a.stateProof.copy(smtRoot = None))
+
       def check(result: F[(GlobalSnapshotArtifact, GlobalSnapshotContext, Set[GlobalSnapshotEvent])]) =
         result.map {
           case (recreatedArtifact, context, _) =>
-            if (recreatedArtifact === artifact)
+            if (smtRootBlind(recreatedArtifact) === smtRootBlind(artifact))
               (artifact, context).asRight[InvalidArtifact]
             else
               GlobalArtifactMismatch(artifact, recreatedArtifact).asLeft[(GlobalSnapshotArtifact, GlobalSnapshotContext)]

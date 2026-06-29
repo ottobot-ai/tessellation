@@ -132,14 +132,6 @@ object NakamotoChainStore {
       */
     def finalize(hash: Hash, ordinal: Long): F[Unit]
 
-    /** Mark snapshots at-or-below `ordinal` as ARCHIVED (Phase 3, depth ≥ k₂ = 100·k₁) — the no-reorg FREEZE. The finality-safety store
-      * gate refuses different-hash writes at-or-below the archived ordinal. This is SEPARATE from [[finalize]] (Phase 2, depth ≥ k₁), which
-      * is a SOFT confirm: it advances the served/state marker + prunes but does NOT freeze chain selection. Density chain selection stays
-      * live for k₁ ≤ depth < k₂, so a node on a losing branch can still reorg onto a denser one; only at-or-below k₂ does the chain freeze.
-      * Monotonic (max). Driven by T_depth2 at `tip − k₂`. Reset by `unsafe_clearFinality`.
-      */
-    def archive(ordinal: Long): F[Unit]
-
     /** Walk the canonical chain from `startHash` backward to find the hash at the given ordinal. */
     def walkBackTo(startHash: Hash, targetOrdinal: Long): F[Option[Hash]]
 
@@ -251,12 +243,6 @@ object NakamotoChainStore {
       // RebootstrapOrchestrator to detect that this node has self-finalized a divergent fork.
       divergentRefuseCounterRef <- Ref.of[F, Long](0L)
       divergentRefuseSampleRef <- Ref.of[F, Option[(Long, Hash)]](None)
-      // Phase-3 ARCHIVE horizon (k₂ = 100·k₁) — the no-reorg FREEZE point used by the finality-safety store gate. SEPARATE from
-      // `nakamotoFinalizedOrdinalRef` (the k₁ Phase-2 SOFT confirm, kept for serving/state). Set by `archive` (driven by T_depth2 at
-      // tip − k₂). Reorgs via density chain selection are allowed for k₁ ≤ depth < k₂; only at-or-below k₂ does the gate refuse a
-      // different-hash write. Freezing at k₁ here was the fork-cement bug: a node that depth-k₁-finalized a minority branch could never
-      // store (and thus never reorg onto) the denser majority below its own k₁ point.
-      nakamotoArchivedOrdinalRef <- Ref.of[F, Long](0L)
     } yield {
       new NakamotoChainStoreAlgebra[F] {
 
@@ -395,27 +381,25 @@ object NakamotoChainStore {
                 }
               }.flatten
 
-              nakamotoArchivedOrdinalRef.get.flatMap { archivedLong =>
-                // Finality-safety FREEZE at the Phase-3 ARCHIVE horizon (k₂ = 100·k₁), NOT the k₁ confirm point. Reorgs via density chain
-                // selection stay live for k₁ ≤ depth < k₂ (a losing branch can still be overtaken by a denser one); only at-or-below the
-                // archived ordinal is a different-hash write refused. (Previously gated on `nakamotoFinalizedOrdinalRef` = k₁, which froze
-                // chain selection at k₁ and cemented minority forks — a node that depth-k₁-finalized its own branch could never store, and
-                // thus never reorg onto, the denser majority below that point.)
-                if (ordinal <= archivedLong) {
+              nakamotoFinalizedOrdinalRef.get.flatMap { finalized =>
+                // Chain-store API is Long-indexed; compare against the finalized ordinal's Long value.
+                val finalizedLong = finalized.value.value
+                if (ordinal <= finalizedLong) {
                   stateRef.get.flatMap { state =>
                     state.byHash.values.find(_.ordinal == ordinal).map(_.hash) match {
                       case Some(existingHash) if existingHash =!= snapshotHash =>
-                        // P-11 (#141): the divergent-self-ARCHIVE trip-wire. We've already archived (Phase 3, k₂-deep) a different hash at
-                        // this ordinal; the incoming write IS the canonical chain trying to overwrite our archived fork. Increment the
-                        // signal counter + record the sample so the RebootstrapOrchestrator can detect the lock-out and trigger reset. This
-                        // is now a last-resort (k₂-deep) signal — phase-2 density reorgs should have converged the node long before k₂.
+                        // P-11 (#141): the divergent-self-finalize trip-wire. We've already finalized
+                        // a different hash at this ordinal; the incoming write IS the canonical chain
+                        // trying to overwrite our locally-finalized divergent fork. Increment the
+                        // signal counter + record the sample so the RebootstrapOrchestrator can detect
+                        // the lock-out and trigger reset.
                         divergentRefuseCounterRef.update(_ + 1L) >>
                           divergentRefuseSampleRef.set(Some((ordinal, snapshotHash))) >>
                           logger
                             .warn(
-                              s"REFUSED store: finality-safety violation — ordinal=$ordinal is at-or-below ARCHIVED=$archivedLong (k₂), " +
+                              s"REFUSED store: finality-safety violation — ordinal=$ordinal is at-or-below finalized=${finalized.show}, " +
                                 s"existing=${existingHash.value.take(12)}, new=${snapshotHash.value.take(12)}. " +
-                                s"Dropping write; this node has ARCHIVED (Phase 3) the existing snapshot and must not rewrite it. " +
+                                s"Dropping write; this node previously finalized the existing snapshot and must not rewrite it. " +
                                 s"[P-11 divergent-refuse counter incremented]"
                             )
                             .as(false)
@@ -736,11 +720,6 @@ object NakamotoChainStore {
             }
           }.flatten
 
-        // Phase-3 archive (k₂): advance the no-reorg freeze horizon read by the finality-safety store gate. Monotonic — never moves back.
-        // Distinct from `finalize` (k₁ soft confirm): archiving FREEZES chain selection below `ordinal`; finalize does not.
-        def archive(ordinal: Long): F[Unit] =
-          nakamotoArchivedOrdinalRef.update(prev => math.max(prev, ordinal))
-
         def walkBackTo(startHash: Hash, targetOrdinal: Long): F[Option[Hash]] =
           stateRef.get.flatMap { state =>
             // Walk in-memory chain first
@@ -812,7 +791,6 @@ object NakamotoChainStore {
             _ <- divergentRefuseCounterRef.set(0L)
             _ <- divergentRefuseSampleRef.set(None)
             _ <- nakamotoFinalizedOrdinalRef.set(SnapshotOrdinal.MinValue)
-            _ <- nakamotoArchivedOrdinalRef.set(0L)
             anyCleared = preChainSize > 0 || preFinalized > 0 || preBestTip.isDefined
             _ <-
               if (anyCleared)
