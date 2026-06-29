@@ -31,8 +31,8 @@ import weaver.MutableIOSuite
 /** WATCHTOWER fraud-proof — coverage for the DETERMINISTIC dispute verdict ([[InvalidStateProofValidator]]).
   *
   * The load-bearing properties under test (the safety + determinism non-negotiables):
-  *   - '''A single honest node catches a quorum-signed wrong root''': when the re-derivation does NOT reproduce the committee-attested root,
-  *     the verdict is UPHELD.
+  *   - '''A single honest node catches a quorum-signed wrong root''': when the re-derivation does NOT reproduce the committee-attested
+  *     root, the verdict is UPHELD.
   *   - '''An honest committee is never slashed''': when the re-derivation REPRODUCES the attested root, the verdict is NOT upheld
   *     (`DisputeNotUpheld`) — regardless of what the challenger CLAIMS in the envelope (the verdict recomputes, never trusts).
   *   - '''Determinism''': the verdict is a pure function of the evidence + the injected re-derivation; two runs over the same inputs agree.
@@ -140,7 +140,9 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       } yield expect(res.isRight)
   }
 
-  test("NOT upheld (honest-committee floor): re-derivation reproducing the attested root yields DisputeNotUpheld — even if the challenger LIES") {
+  test(
+    "NOT upheld (honest-committee floor): re-derivation reproducing the attested root yields DisputeNotUpheld — even if the challenger LIES"
+  ) {
     case (h0, sp0) =>
       implicit val h: Hasher[IO] = h0
       implicit val sp: SecurityProvider[IO] = sp0

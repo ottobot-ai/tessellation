@@ -13,11 +13,11 @@ import derevo.derive
   * §10.4 severity ordering, above equivocation and far above non-participation).
   *
   * '''Algebra.''' Companion to [[SlashableEvidence]] (metagraph equivocation) and `ShardCheckpointEquivocationEvidence` (checkpoint
-  * equivocation): the SAME "cryptographically verifiable proof of a deviation, byte-identical verdict on every honest node" discipline, here
-  * for a committee that signed a checkpoint whose per-MG derivation is WRONG. Unlike equivocation (two conflicting artefacts), the offence is
-  * a single checkpoint with a derivation that an honest re-execution does not reproduce — so the evidence carries the FULL disputed
-  * [[ShardCheckpoint]] envelope and the verdict RE-DERIVES from its own signed bytes (`InvalidStateProofValidator`), never trusting the
-  * challenger.
+  * equivocation): the SAME "cryptographically verifiable proof of a deviation, byte-identical verdict on every honest node" discipline,
+  * here for a committee that signed a checkpoint whose per-MG derivation is WRONG. Unlike equivocation (two conflicting artefacts), the
+  * offence is a single checkpoint with a derivation that an honest re-execution does not reproduce — so the evidence carries the FULL
+  * disputed [[ShardCheckpoint]] envelope and the verdict RE-DERIVES from its own signed bytes (`InvalidStateProofValidator`), never
+  * trusting the challenger.
   *
   * '''Why the full envelope, not just a hash.''' The deterministic verdict must re-run `deriveMetagraphRoot` over the checkpoint's
   * `includedSnapshots(metagraphAddress)`; those bytes live inside the envelope. Carrying the full `ShardCheckpoint` makes the evidence
@@ -33,8 +33,8 @@ import derevo.derive
   * binds the submitter). The GSAM accept-path credits the bounty to `fraudProof.submitterId`.
   *
   * '''Determinism contract.''' Same as [[SlashableEvidenceValidator]]: every honest node computing `InvalidStateProofValidator` over the
-  * same `(evidence)` returns byte-equivalent accept/reject — the re-derivation is pure (`noGlobalSnapshotLookup`, empty prior). No clock, no
-  * env reads, no node-local consensus state.
+  * same `(evidence)` returns byte-equivalent accept/reject — the re-derivation is pure (`noGlobalSnapshotLookup`, empty prior). No clock,
+  * no env reads, no node-local consensus state.
   *
   * '''Frozen wire shape.''' Fields are consensus-load-bearing (they are the bytes a gl0 snapshot serializes when it slashes). Adding /
   * reordering / wrapping a field silently changes the encoding; bump explicitly (`InvalidStateProofEvidenceV2`) and version the validator
@@ -52,8 +52,8 @@ import derevo.derive
   *   the committee-attested per-MG root (`disputedCheckpoint.derivedStateDelta.perMetagraphMptRoots(metagraphAddress)`) carried redundantly
   *   for the MPT slash record; the validator reads the authoritative value off the envelope, not this field.
   * @param fraudProof
-  *   the watchtower's [[FraudProofEnvelope]] — carries the submitter identity (`submitterId`) + the replay-binding `challengerSignature` the
-  *   validator verifies, plus the challenger's (untrusted) reference roots for triage.
+  *   the watchtower's [[FraudProofEnvelope]] — carries the submitter identity (`submitterId`) + the replay-binding `challengerSignature`
+  *   the validator verifies, plus the challenger's (untrusted) reference roots for triage.
   */
 @derive(decoder, encoder, eqv, show)
 final case class InvalidStateProofEvidence(
@@ -110,16 +110,17 @@ object InvalidStateProofRejection {
     */
   case object InvalidChallengerSignature extends InvalidStateProofRejection
 
-  /** The double-slash guard fired — a slash record already exists for `(shardId, disputedCheckpointHash)`. Only the first invalid-state-proof
-    * for a given wrong checkpoint slashes; subsequent submissions are rejected here.
+  /** The double-slash guard fired — a slash record already exists for `(shardId, disputedCheckpointHash)`. Only the first
+    * invalid-state-proof for a given wrong checkpoint slashes; subsequent submissions are rejected here.
     */
   @derive(eqv, show)
   final case class AlreadySlashed(shardId: io.constellationnetwork.schema.sharding.ShardId, disputedCheckpointHash: Hash)
       extends InvalidStateProofRejection
 
   /** '''The load-bearing rejection''': the dispute is NOT upheld — the honest re-derivation REPRODUCED the committee-attested root, so the
-    * committee did NOT deviate. A frivolous / forged fraud proof lands here. Carries both roots for the audit log. This is the safety floor:
-    * an honest committee can never be slashed because the verdict recomputes the honest root and only upholds on a genuine divergence.
+    * committee did NOT deviate. A frivolous / forged fraud proof lands here. Carries both roots for the audit log. This is the safety
+    * floor: an honest committee can never be slashed because the verdict recomputes the honest root and only upholds on a genuine
+    * divergence.
     */
   @derive(eqv, show)
   final case class DisputeNotUpheld(honestReDerivedRoot: Hash, attestedRoot: Hash) extends InvalidStateProofRejection

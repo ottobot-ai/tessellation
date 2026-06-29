@@ -34,8 +34,8 @@ import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
   *      validator (the validator itself stays pure given its inputs; the window gate is the caller's contract — same shape as
   *      [[SlashableEvidenceValidator]]'s `currentEpoch`/`eventEpoch` caller contract).
   *
-  * '''Why re-derive from the checkpoint's OWN signed bytes, not the challenger's claim.''' The committee SIGNED `disputedCheckpoint`
-  * (its `committeeSignatures` cover the `ShardCheckpointSigPreimage`, which includes `derivedStateDelta.includedSnapshots` and
+  * '''Why re-derive from the checkpoint's OWN signed bytes, not the challenger's claim.''' The committee SIGNED `disputedCheckpoint` (its
+  * `committeeSignatures` cover the `ShardCheckpointSigPreimage`, which includes `derivedStateDelta.includedSnapshots` and
   * `perMetagraphMptRoots`). So the inputs to the honest re-derivation (`includedSnapshots(mg)`, `gl0AnchorOrdinal`) AND the committee's
   * attested root (`perMetagraphMptRoots(mg)`) are both read off the cryptographically-bound envelope — the challenger cannot move them. The
   * [[io.constellationnetwork.schema.sharding.FraudProofEnvelope.challengerDerivation]] / `claimedDerivation` fields are HINTS only; this
@@ -55,8 +55,9 @@ trait InvalidStateProofValidator[F[_]] {
     *   the candidate invalid-state-proof.
     * @return
     *   `Right(evidence)` iff the dispute is UPHELD (the committee signed a wrong derivation, every signer is a slash target) — the GSAM
-    *   accept path then applies the 100% ledger effect. `Left(rejection)` names the exact step that failed; [[InvalidStateProofRejection.DisputeNotUpheld]]
-    *   is the "honest committee" floor (re-derivation reproduced the attested root ⇒ no slash).
+    *   accept path then applies the 100% ledger effect. `Left(rejection)` names the exact step that failed;
+    *   [[InvalidStateProofRejection.DisputeNotUpheld]] is the "honest committee" floor (re-derivation reproduced the attested root ⇒ no
+    *   slash).
     */
   def validate(evidence: InvalidStateProofEvidence): F[Either[InvalidStateProofRejection, InvalidStateProofEvidence]]
 }
@@ -154,27 +155,25 @@ object InvalidStateProofValidator {
       val pureUnit: F[Either[InvalidStateProofRejection, Unit]] = Async[F].pure(Right(()))
       def lift(e: Either[InvalidStateProofRejection, Unit]): F[Either[InvalidStateProofRejection, Unit]] = Async[F].pure(e)
 
-      (lift(step1), lift(step2)).tupled
-        .flatMap {
-          case (Left(r), _) => Async[F].pure(Left(r): Either[InvalidStateProofRejection, Unit])
-          case (_, Left(r)) => Async[F].pure(Left(r): Either[InvalidStateProofRejection, Unit])
-          case _            => pureUnit
-        }
-        .flatMap {
-          case Left(r) => Async[F].pure(Left(r): Either[InvalidStateProofRejection, Unit])
-          case Right(_) =>
-            step3 match {
-              case Left(r) => Async[F].pure(Left(r): Either[InvalidStateProofRejection, Unit])
-              case Right(binaries) =>
-                List(step4, step5, step6, step7(binaries))
-                  .foldLeft(pureUnit) { (acc, next) =>
-                    acc.flatMap {
-                      case Left(r)  => Async[F].pure(Left(r): Either[InvalidStateProofRejection, Unit])
-                      case Right(_) => next
-                    }
+      (lift(step1), lift(step2)).tupled.flatMap {
+        case (Left(r), _) => Async[F].pure(Left(r): Either[InvalidStateProofRejection, Unit])
+        case (_, Left(r)) => Async[F].pure(Left(r): Either[InvalidStateProofRejection, Unit])
+        case _            => pureUnit
+      }.flatMap {
+        case Left(r) => Async[F].pure(Left(r): Either[InvalidStateProofRejection, Unit])
+        case Right(_) =>
+          step3 match {
+            case Left(r) => Async[F].pure(Left(r): Either[InvalidStateProofRejection, Unit])
+            case Right(binaries) =>
+              List(step4, step5, step6, step7(binaries))
+                .foldLeft(pureUnit) { (acc, next) =>
+                  acc.flatMap {
+                    case Left(r)  => Async[F].pure(Left(r): Either[InvalidStateProofRejection, Unit])
+                    case Right(_) => next
                   }
-            }
-        }
+                }
+          }
+      }
         .map(_.map(_ => evidence))
     }
   }

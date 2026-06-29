@@ -17,8 +17,8 @@ import com.google.protobuf.ByteString
 import eu.timepit.refined.refineV
 import eu.timepit.refined.types.numeric.NonNegLong
 
-/** Scala ⇄ protobuf wire codec for WATCHTOWER [[FraudProofEnvelope]] gossip — the analog of [[ShardCheckpointWireCodecs]] for the
-  * gl0-wide `fraud-proof` topic.
+/** Scala ⇄ protobuf wire codec for WATCHTOWER [[FraudProofEnvelope]] gossip — the analog of [[ShardCheckpointWireCodecs]] for the gl0-wide
+  * `fraud-proof` topic.
   *
   * '''All fields structured (no opaque JSON).''' Unlike the checkpoint codec (which carries heavy `Signed[SCSB]`/delta JSON), the fraud
   * proof is a small fixed-field message; the dispute consumer needs every field typed to recompute the verdict, so each maps to a proto
@@ -59,7 +59,11 @@ object FraudProofWireCodecs {
     )
 
   def fromWire[F[_]: Async](w: pb.FraudProofEnvelopeWire): F[FraudProofEnvelope] =
-    (ShardId(w.shardId), NonNegLong.from(w.gl0AnchorOrdinal).toOption.map(SnapshotOrdinal(_)), addressFromString(w.metagraphAddress)) match {
+    (
+      ShardId(w.shardId),
+      NonNegLong.from(w.gl0AnchorOrdinal).toOption.map(SnapshotOrdinal(_)),
+      addressFromString(w.metagraphAddress)
+    ) match {
       case (None, _, _) =>
         Async[F].raiseError[FraudProofEnvelope](
           new RuntimeException(s"FraudProofEnvelopeWire: invalid shard_id ${w.shardId} (must be non-negative)")

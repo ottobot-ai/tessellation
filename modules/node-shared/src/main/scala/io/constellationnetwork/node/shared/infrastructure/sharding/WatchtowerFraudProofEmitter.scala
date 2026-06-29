@@ -17,21 +17,21 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** WATCHTOWER fraud-proof EMITTER (fraud-proof part 1, producer side) — the approval-check seam.
   *
-  * '''What it does.''' For an ADOPTED/finalized [[ShardCheckpoint]] (the daemon invokes [[emit]] on the became-best-tip adopt path, the same
-  * seam the [[ShardCheckpointAttestationEmitter]] fires on), it runs [[ShardCheckpointGl0AcceptanceManager.watchtowerReExec]] — the per-MG
-  * re-derivation that runs EVEN WHEN QUORUM WAS MET (the whole point: catch a quorum-signed wrong root that `verifyEmbedded` admitted on
-  * signatures alone). For each mismatch it builds, signs, and gossips a [[FraudProofEnvelope]] on the gl0-wide `fraud-proof` topic. Every
-  * gl0 then INDEPENDENTLY re-runs the deterministic verdict
+  * '''What it does.''' For an ADOPTED/finalized [[ShardCheckpoint]] (the daemon invokes [[emit]] on the became-best-tip adopt path, the
+  * same seam the [[ShardCheckpointAttestationEmitter]] fires on), it runs [[ShardCheckpointGl0AcceptanceManager.watchtowerReExec]] — the
+  * per-MG re-derivation that runs EVEN WHEN QUORUM WAS MET (the whole point: catch a quorum-signed wrong root that `verifyEmbedded`
+  * admitted on signatures alone). For each mismatch it builds, signs, and gossips a [[FraudProofEnvelope]] on the gl0-wide `fraud-proof`
+  * topic. Every gl0 then INDEPENDENTLY re-runs the deterministic verdict
   * (`io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator`) and slashes the committee on UPHELD.
   *
   * '''Mirrors the proven flow''' (per the slashing / standard-patterns rules — do NOT invent):
-  *   - '''Adopt-time gate.''' Invoked by the daemon only for a checkpoint that became this node's canonical best tip — byte-identical to the
-  *     attestation emitter's gate. So the watchtower runs on the SAME adopted checkpoints, on a node whose finalized `S(N)` equals the
+  *   - '''Adopt-time gate.''' Invoked by the daemon only for a checkpoint that became this node's canonical best tip — byte-identical to
+  *     the attestation emitter's gate. So the watchtower runs on the SAME adopted checkpoints, on a node whose finalized `S(N)` equals the
   *     producer's diff base (the in-order chain-hole-guard invariant) ⇒ an honest checkpoint never mismatches.
   *   - '''Signing.''' Ed25519 (long-term key) over the canonical `FraudProofSigPreimage` hash — the same key + Hasher discipline the
   *     attestation emitter uses, so the on-chain verdict recovers the submitter VK from `submitterId` and verifies.
-  *   - '''Failure model.''' Re-exec / publish failures are logged + swallowed; the adopt path MUST NOT block on the watchtower. A persistent
-  *     failure is observable as "no fraud proofs despite a wrong root", not as a crashed receive path.
+  *   - '''Failure model.''' Re-exec / publish failures are logged + swallowed; the adopt path MUST NOT block on the watchtower. A
+  *     persistent failure is observable as "no fraud proofs despite a wrong root", not as a crashed receive path.
   *
   * '''numShards = 1 no-op / disabled.''' Constructed only on the activated path (`numShards > 1` AND `watchtower-enabled`); the daemon
   * receives `None` otherwise and never emits.
