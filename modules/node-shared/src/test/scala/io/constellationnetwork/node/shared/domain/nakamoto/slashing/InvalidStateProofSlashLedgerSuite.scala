@@ -39,8 +39,8 @@ import weaver.MutableIOSuite
   * Properties under test:
   *   - the `SlashedRegistryEntry` MPT value codec round-trips AND is byte-deterministic (the consensus-byte determinism bar);
   *   - `GlobalStateKey.slashingsKey` is deterministic per `(peer, shard, checkpoint)` and distinct across any differing component;
-  *   - `applyWatchtowerSlashes` is a pure deterministic fold: removes the offenders' stake/collateral, emits one record per
-  *     `(operator, shard, checkpoint)`, burns the full pool when there is no submitter, and credits the bounty when there is;
+  *   - `applyWatchtowerSlashes` is a pure deterministic fold: removes the offenders' stake/collateral, emits one record per `(operator,
+  *     shard, checkpoint)`, burns the full pool when there is no submitter, and credits the bounty when there is;
   *   - an end-to-end MPT write of the produced records is read back correctly by `InvalidStateProofSlashedReader.fromMptStore.wasSlashed`
   *     (true for a written `(shard, checkpoint)`; false for an un-slashed one) — the double-slash guard the validator consults.
   */

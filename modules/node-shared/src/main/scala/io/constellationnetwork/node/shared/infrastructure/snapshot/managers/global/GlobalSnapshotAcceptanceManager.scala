@@ -464,6 +464,18 @@ object GlobalSnapshotAcceptanceManager {
       val tipUsageManager = TipUsageManager.make[F]()
       val rewardAcceptanceManager = RewardAcceptanceManager.make[F](branchAwareReader)
       val allowSpendStateManager = AllowSpendStateManager.make[F](branchAwareReader)
+      // ATOMIC CROSS-SHARD ALLOW-SPEND SETTLEMENT (I-ONCE, Option A). Reads/writes the `ConsumedAllowSpends` spent-set (fieldId 33) via the
+      // SAME branch-aware reader so the spent-set view is consistent with every other per-manager prior-state read. Only consulted at
+      // `numShards > 1 ∧ shardAssignment.isDefined`; at `numShards = 1` the classification yields no cross-shard consume ⇒ the spent-set
+      // stays empty ⇒ the reservation-adjustment overlay is the identity ⇒ the mptRoot is byte-identical to the pre-change path.
+      val consumedAllowSpendStateManager = ConsumedAllowSpendStateManager.make[F](branchAwareReader)
+      // Generic cross-shard-message nullifier seam (thin): one handler per cross-shard message TYPE, each owning its own distinct nullifier
+      // partition. Instance 1 = allow-spend consume over `ConsumedAllowSpends` (fieldId 33). A future type (cross-shard token-lock,
+      // transfer, data-app message) adds another handler here over its own fieldId; the generic `CrossShardMessageEngine` writes them all
+      // through one uniform `mpt.insert` path. The allow-spend STATE EFFECT (the read-side effective-currency-balance overlay) is applied
+      // separately at the validator/route read sites, NOT in this list.
+      val crossShardMessageHandlers: List[CrossShardMessageHandler[F]] =
+        List(AllowSpendConsumeHandler[F](consumedAllowSpendStateManager))
       val tokenLockStateManager = TokenLockStateManager.make[F](branchAwareReader)
       val spendTransactionBalanceManager = SpendTransactionBalanceManager.make[F](branchAwareReader)
       val delegatedStakeStateManager = DelegatedStakeStateManager.make[F](branchAwareReader)
@@ -2174,6 +2186,41 @@ object GlobalSnapshotAcceptanceManager {
 
                 lastActiveAllowSpends <- allowSpendStateManager.materializeActiveAllowSpendsFromMpt
 
+                // Per-metagraph PINNED global epoch (the epoch each MG used to expire its OWN allow-spends — its `globalSyncView.epochProgress`).
+                // Hoisted here (pure fn of `currencySnapshots`) so it feeds BOTH the cross-shard effective-balance overlay below AND the
+                // metagraph-scoped allow-spend expiry further down.
+                metagraphPinnedEpochProgresses: Map[Address, EpochProgress] = currencySnapshots.toList.mapFilter {
+                  case (metagraphId, Left(signed))       => signed.value.globalSyncView.map(gsv => metagraphId -> gsv.epochProgress)
+                  case (metagraphId, Right((signed, _))) => signed.value.globalSyncView.map(gsv => metagraphId -> gsv.epochProgress)
+                }.toMap
+
+                // ── ATOMIC CROSS-SHARD ALLOW-SPEND SETTLEMENT — W3e (read-side EFFECTIVE-balance overlay at the validator) ──────────────────
+                // The SpendActionValidator's same-shard balance check reads `currencyBalances` (the Some(M) attested per-MG balances). A
+                // source whose EARLIER cross-shard consume of an allow-spend has expired sees M autonomously refund it (phantom +amount) — so
+                // the attested balance would let it DOUBLE-CONSUME. Overlay the already-committed cross-shard spent-set onto each Some(M)
+                // scope so the validator sees the ECONOMICALLY-EFFECTIVE balance (source still debited, destination credited). Derived from
+                // committed consensus state (the nullifier partition); SATURATING (never raises). EMPTY spent-set (always at numShards=1) ⇒
+                // effective == attested ⇒ validator input byte-identical. Gated `numShards > 1` so the spent-set read is skipped otherwise.
+                consumedSpentSetForValidation <-
+                  (shardingConfig, shardAssignment) match {
+                    case (Some(cfg), Some(_)) if cfg.numShards > 1 =>
+                      consumedAllowSpendStateManager.materializeConsumedAllowSpendsFromMpt
+                    case _ => SortedMap.empty[Hash, ConsumedAllowSpend].pure[F]
+                  }
+                effectiveCurrencyBalances =
+                  if (consumedSpentSetForValidation.isEmpty) currencyBalances
+                  else
+                    currencyBalances.map {
+                      case (scope, attested) =>
+                        scope -> consumedAllowSpendStateManager.effectiveCurrencyBalances(
+                          attested,
+                          scope,
+                          consumedSpentSetForValidation,
+                          metagraphPinnedEpochProgresses,
+                          epochProgress
+                        )
+                    }
+
                 ArtifactValidationResult(
                   acceptedSpendActions,
                   rejectedSpendActions,
@@ -2184,7 +2231,7 @@ object GlobalSnapshotAcceptanceManager {
                   spendActions,
                   pricingUpdates,
                   lastActiveAllowSpends,
-                  currencyBalances,
+                  effectiveCurrencyBalances,
                   globalBalances,
                   lastSnapshotContext
                 )
@@ -2207,18 +2254,8 @@ object GlobalSnapshotAcceptanceManager {
                 activeAllowSpendsFromCurrencySnapshots = currencySnapshots
                   .mapFilter(_.toOption.flatMap { case (_, info) => info.activeAllowSpends })
 
-                // Per-metagraph PINNED global epoch: the epoch each metagraph used to expire its OWN
-                // allow-spends/token-locks (`CurrencySnapshotAcceptanceManager.lastGlobalSnapshotEpochProgress =
-                // lastSyncGlobalSnapshot.epochProgress`), surfaced on the signed snapshot as `globalSyncView.epochProgress`.
-                // Sourced from the SAME `currencySnapshots` the allow-spends are folded from, so it's the deterministic,
-                // consensus-pinned, signed value every gl0 node sees identically. Threaded into the metagraph-scoped allow-spend
-                // expiry so a metagraph trailing the global tip is NOT over-pruned against gl0's live global epoch (the "m0
-                // frozen" wedge). `Left`/full (genesis) and `Right`/incremental both carry `globalSyncView`; `None` ⇒ omitted,
-                // and the manager falls back to the live epoch for that metagraph.
-                metagraphPinnedEpochProgresses: Map[Address, EpochProgress] = currencySnapshots.toList.mapFilter {
-                  case (metagraphId, Left(signed))       => signed.value.globalSyncView.map(gsv => metagraphId -> gsv.epochProgress)
-                  case (metagraphId, Right((signed, _))) => signed.value.globalSyncView.map(gsv => metagraphId -> gsv.epochProgress)
-                }.toMap
+                // `metagraphPinnedEpochProgresses` (the per-MG pinned `globalSyncView.epochProgress`) is hoisted above (before
+                // `validateArtifacts`) so the cross-shard effective-balance overlay and the metagraph-scoped allow-spend expiry share it.
 
                 globalAllowSpends = acceptedGlobalAllowSpends
                   .groupBy(_.value.source)
@@ -2283,6 +2320,35 @@ object GlobalSnapshotAcceptanceManager {
                 (updatedBalancesByAllowSpends, updatedBalancesByAllowSpendsDeltas) <- Async[F].fromEither(
                   allowSpendBalancesResult
                     .leftMap(ex => new RuntimeException(s"Balance arithmetic error updating balances by allow spends: $ex"))
+                )
+
+                // ── ATOMIC CROSS-SHARD MESSAGE SETTLEMENT — W3d (generic nullifier engine) ─────────────────────────────────────────────────
+                // Run the registered `CrossShardMessageHandler`s (instance 1 = allow-spend consume over `ConsumedAllowSpends` fieldId 33).
+                // Each handler classifies its cross-shard instances (owner-shard ≠ producing-shard), rejects double-consume/replay/admit
+                // failures, and emits its nullifier markers. The engine UNIONS them; the markers are WRITTEN later (after `applyStateChanges`)
+                // through the same `mpt.insert` path as the watchtower `Slashings` partition, and folded into the #107 verify-replay. The
+                // allow-spend STATE EFFECT (the read-side effective-balance overlay) was already applied at the validator above; this region
+                // is purely the nullifier bookkeeping.
+                //
+                // GATING: only `numShards > 1 ∧ shardAssignment.isDefined`. At `numShards = 1` every MG maps to shard 0 ⇒ no instance is
+                // cross-shard ⇒ EMPTY markers ⇒ no partition written ⇒ mptRoot byte-identical to the pre-change path.
+                crossShardEngineResult <-
+                  (shardingConfig, shardAssignment) match {
+                    case (Some(cfg), Some(assignment)) if cfg.numShards > 1 =>
+                      CrossShardMessageEngine.settle[F](
+                        crossShardMessageHandlers,
+                        acceptedSpendActions.toSortedMap,
+                        assignment,
+                        ordinal
+                      )
+                    case _ => CrossShardMessageEngine.EngineResult.empty.pure[F]
+                  }
+                crossShardMarkers = crossShardEngineResult.markers
+                _ <- Async[F].whenA(crossShardMarkers.nonEmpty || crossShardEngineResult.rejected.nonEmpty)(
+                  loggerBundle.app.info(
+                    s"[ACCEPTANCE/X-SHARD] ordinal=$ordinal cross-shard message settlement: " +
+                      s"newMarkers=${crossShardMarkers.size} rejected=${crossShardEngineResult.rejected.size}"
+                  )
                 )
 
                 unexpiredNodeCollateralsRaw <- nodeCollateralStateManager.acceptNodeCollaterals(
@@ -2785,6 +2851,13 @@ object GlobalSnapshotAcceptanceManager {
                       .toHex[F](key)
                       .map(hex => hex -> InvalidStateProofSlashedReader.entryCodec.immutableBytes(entry).toArray)
                 }.map(_.toMap)
+
+                // ATOMIC CROSS-SHARD MESSAGE SETTLEMENT — marker WRITE (generic engine). Every registered handler's nullifier markers (their
+                // partitions are NOT carried by `StateChangesAccumulator`) are written DIRECTLY through the same branch-aware writer algebra
+                // (`mpt.insert`) right after `applyStateChanges` — exactly as the watchtower `Slashings` partition above — and the hex-keyed
+                // byte view is folded into the #107 verify-replay `expectedBytes` below so the writer-path `postBytes` and the replay agree.
+                // EMPTY at numShards=1 ⇒ no key written ⇒ mptRoot byte-identical to the pre-change path.
+                consumedAllowSpendReplayBytes <- CrossShardMessageEngine.write[F](crossShardMarkers, mpt)
                 // Pull the post-write byte view from the overlay (Phase J). Under Passthrough this
                 // collapses to `overlay.base.allEntriesAsBytes` (writes already committed inline);
                 // under MultiBranch it composes parent-chain pending entries with this handle's
@@ -2870,7 +2943,13 @@ object GlobalSnapshotAcceptanceManager {
                       // accumulator), so `toAccumulatorHexDelta` does not see them — without this fold the writer-path `postBytes` would carry
                       // them while the replay would not, falsely tripping the #107 DIVERGED self-check. Right-biased `++` after the accumulator
                       // delta (the slash partition keys never collide with any accumulator key). Empty on the reachable path ⇒ no-op.
-                      expectedBytes = ((preSyncBytes -- deltaRemoves) ++ deltaUpserts) ++ slashingsReplayBytes
+                      // Fold BOTH directly-written partitions (watchtower `Slashings` + cross-shard `ConsumedAllowSpends`) into the replay
+                      // set: each is written via `mpt.insert` (not the accumulator), so `toAccumulatorHexDelta` doesn't see them — without
+                      // this fold the writer-path `postBytes` would carry them while the replay would not, falsely tripping the #107 DIVERGED
+                      // self-check. Keys in both partitions never collide with any accumulator key. Both EMPTY on the reachable common path
+                      // (always at numShards=1) ⇒ no-op.
+                      expectedBytes =
+                        ((preSyncBytes -- deltaRemoves) ++ deltaUpserts) ++ slashingsReplayBytes ++ consumedAllowSpendReplayBytes
                       // The consensus global root excludes SystemNamespace sidecars (path-dependent ActiveAddressIndex / expiry buckets)
                       // AND the observation-dependent `MgGlobalSnapshotSyncView` (`GlobalStateKey.consensusRootEntries`).
                       // `incrementalProof.mptRoot` is computed over that same set; the independent verify-replay must drop the same entries

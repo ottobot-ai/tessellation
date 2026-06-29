@@ -3,13 +3,18 @@ package io.constellationnetwork.dag.l0.http.routes
 import cats.effect.Async
 import cats.syntax.all._
 
+import scala.collection.immutable.SortedMap
+
 import io.constellationnetwork.ext.http4s.AddressVar
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ConsumedAllowSpendStateManager
 import io.constellationnetwork.routes.internal._
 import io.constellationnetwork.schema._
+import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
+import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.security.HasherSelector
 
 import eu.timepit.refined.auto._
@@ -47,26 +52,50 @@ final case class GL0CurrencyBalanceRoutes[F[_]: Async: HasherSelector](
 
   protected val prefixPath: InternalUrlPrefix = "/"
 
+  private val consumedAllowSpendStateManager: ConsumedAllowSpendStateManager[F] =
+    ConsumedAllowSpendStateManager.make[F](reader)
+
   override protected val public: HttpRoutes[F] = HttpRoutes.of[F] {
     case GET -> Root / "currency" / AddressVar(metagraphId) / "balance" / AddressVar(address) =>
       // Read the chain's pending-tip view via `pendingReader` (matches GL0TokenLockRoutes); the snapshot-storage head is the sentinel so we
       // never serve state before genesis converges. `getCurrencySnapshotInfo` reconstructs the metagraph's `CurrencySnapshotInfo` from the
       // unrolled `Mg*` MPT partitions, so the balance reflects exactly what gl0 committed to in `perMetagraphMptRoot`.
+      //
+      // ECONOMIC-TRUTH overlay (cross-shard I-ONCE, read-side W3e): the ATTESTED `MgBalances` value reflects what the metagraph M pushed —
+      // which, AFTER a cross-shard allow-spend it never witnessed expires, REFUNDS the source a phantom +amount. So this serving route
+      // applies the same effective-balance overlay the SpendActionValidator uses (derived from the already-committed `ConsumedAllowSpends`
+      // spent-set), so the served balance is the economically-truthful one (source still debited, destination credited). `epochFor(M)` uses
+      // gl0's head `epochProgress` (the route has no per-MG pinned map) — monotonic-safe: it may show the source's debit slightly earlier
+      // than the consensus pinned epoch, NEVER later, so it never serves a phantom-refunded (over-stated) balance. Empty spent-set (always
+      // at numShards=1) ⇒ effective == attested ⇒ byte-identical to the pre-change route.
       snapshotStorage.head.flatMap {
-        case Some(_) =>
+        case Some((headSigned, _)) =>
+          val liveEpoch: EpochProgress = headSigned.value.epochProgress
           HasherSelector[F].withCurrent { implicit hasher =>
-            reader.getCurrencySnapshotInfo(metagraphId)
-          }
-            .map(_.flatMap(_.balances.get(address)).getOrElse(Balance.empty))
-            .flatMap { balance =>
-              Ok(
-                Json.obj(
-                  "metagraphId" -> metagraphId.asJson,
-                  "address" -> address.asJson,
-                  "balance" -> Json.fromLong(balance.value.value)
-                )
+            (
+              reader.getCurrencySnapshotInfo(metagraphId),
+              consumedAllowSpendStateManager.materializeConsumedAllowSpendsFromMpt
+            ).tupled
+          }.map {
+            case (maybeInfo, spentSet) =>
+              val attested: SortedMap[Address, Balance] = maybeInfo.map(_.balances).getOrElse(SortedMap.empty[Address, Balance])
+              val effective = consumedAllowSpendStateManager.effectiveCurrencyBalances(
+                attested,
+                metagraphId.some,
+                spentSet,
+                Map.empty[Address, EpochProgress],
+                liveEpoch
               )
-            }
+              effective.getOrElse(address, Balance.empty)
+          }.flatMap { balance =>
+            Ok(
+              Json.obj(
+                "metagraphId" -> metagraphId.asJson,
+                "address" -> address.asJson,
+                "balance" -> Json.fromLong(balance.value.value)
+              )
+            )
+          }
         case None => ServiceUnavailable()
       }
   }

@@ -100,6 +100,41 @@ object swap {
     implicit object OrderingInstance extends OrderBasedOrdering[AllowSpend]
   }
 
+  /** Value record stored in the cross-shard single-use SPENT-SET (`GlobalStateFieldId.ConsumedAllowSpends`, fieldId 33), keyed by the
+    * allow-spend's content `Hash` (`GlobalStateKey.consumedAllowSpendKey`). Records that a specific allow-spend has ALREADY been consumed
+    * by a CROSS-SHARD spend (a spend processed in metagraph M′ that consumed an allow-spend living on a different shard's metagraph M).
+    *
+    * '''Why the record is self-contained (extends the scaladoc's "minimal consuming reference").''' The gl0 reservation-adjustment fold
+    * (`AllowSpendStateManager`/the cross-shard settlement) corrects the source's adopted balance from the spent-set ALONE — by the time the
+    * fold runs, the allow-spend may already be gone from M's active set (M autonomously expired it and refunded the source). The fold must
+    * therefore reconstruct everything it needs from this record without any other lookup:
+    *   - `source` + `amount`: the reservation to re-subtract once M refunds it on expiry (the permanent-debit overlay).
+    *   - `destination` + `amount`: the cross-shard credit re-applied every ordinal (neither M nor M′ re-pushes it — it is a pure gl0
+    *     protocol-primitive overlay), so the destination is credited `+amount` for as long as the marker lives.
+    *   - `currencyId`: the OWNER metagraph M whose pinned `globalSyncView.epochProgress` the expiry test reads (consistent with the R1
+    *     fix); the fold subtracts `amount` from the source iff `currentEpoch(M) > lastValidEpochProgress`.
+    *   - `lastValidEpochProgress`: the allow-spend's expiry — the boundary at which M refunds and the fold begins re-subtracting.
+    *   - `consumedAtOrdinal` + `consumingSpendRef`: audit trail (which gl0 snapshot folded it, which spend consumed it).
+    *
+    * Append-only in spirit (a consumed hash never un-consumes). Membership alone is the single-use (I-ONCE) evidence checked by the
+    * absence-gate; the carried fields drive the balance fold and auditability.
+    */
+  @derive(decoder, encoder, order, show)
+  case class ConsumedAllowSpend(
+    allowSpendHash: Hash,
+    source: Address,
+    destination: Address,
+    currencyId: Option[CurrencyId],
+    amount: SwapAmount,
+    lastValidEpochProgress: EpochProgress,
+    consumedAtOrdinal: SnapshotOrdinal,
+    consumingSpendRef: Hash
+  )
+
+  object ConsumedAllowSpend {
+    implicit object OrderingInstance extends OrderBasedOrdering[ConsumedAllowSpend]
+  }
+
   @derive(encoder)
   case class AllowSpendView(
     transaction: AllowSpend,
