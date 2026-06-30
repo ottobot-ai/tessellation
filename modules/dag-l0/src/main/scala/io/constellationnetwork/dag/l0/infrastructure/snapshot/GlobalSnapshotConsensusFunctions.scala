@@ -21,6 +21,7 @@ import io.constellationnetwork.node.shared.domain.block.processing._
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions.InvalidArtifact
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
 import io.constellationnetwork.node.shared.domain.event.EventCutter
+import io.constellationnetwork.node.shared.domain.nakamoto.ShardReanchor
 import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.domain.snapshot.services.GlobalL0Service
 import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog
@@ -648,8 +649,14 @@ object GlobalSnapshotConsensusFunctions {
                                 cp.derivedStateDelta.includedSnapshots.nonEmpty &&
                                 cp.derivedStateDelta.includedSnapshots.exists {
                                   case (mg, nel) =>
-                                    val tip = scTips.getOrElse(mg, Hash.empty)
-                                    nel.exists(_.value.lastSnapshotHash === tip)
+                                    // ORPHANED-TIP REANCHOR (2026-06-29): byte-identical to the GSAM adopt-guard via the shared
+                                    // `ShardReanchor` — a checkpoint qualifies if a window continues gl0's SC tip OR (the freeze fix)
+                                    // gl0's tip was orphaned by a same-ordinal reorg and this is the genesis-rooted canonical lineage.
+                                    ShardReanchor.classify(
+                                      nel,
+                                      scTips.getOrElse(mg, Hash.empty),
+                                      ShardReanchor.tipOrdinalFor(snapshotContext.lastCurrencySnapshots, mg)
+                                    ) != ShardReanchor.Defer
                                 }
                               }
                               pick match {
