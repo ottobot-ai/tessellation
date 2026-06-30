@@ -21,12 +21,13 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.glob
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
+import io.constellationnetwork.schema.currencyMessage.{CurrencyMessage, MessageType}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
-import io.constellationnetwork.schema.swap.AllowSpend
-import io.constellationnetwork.schema.tokenLock.TokenLock
+import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendReference}
+import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
 import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal, StateProofSelector}
 import io.constellationnetwork.security.hash.Hash
@@ -336,11 +337,26 @@ object ShardCheckpointWiring {
                       // it on BOTH the attested root and the diff — keeping the committee producer and the gl0 adopt side byte-identical.
                       val authTxRefs: Option[SortedMap[Address, TransactionReference]] =
                         next.toOption.flatMap(_._1.value.authoritativeLastTxRefs)
+                      // The OTHER authoritative cumulative ref-maps (lastFeeTxRefs / lastAllowSpendRefs / lastTokenLockRefs / lastMessages):
+                      // same anchor as lastTxRefs. OVERRIDE each on BOTH the attested root and the diff so the producer and the gl0 adopt side
+                      // commit byte-identical per-MG roots regardless of base lag.
+                      val authFeeTxRefs: Option[SortedMap[Address, TransactionReference]] =
+                        next.toOption.flatMap(_._1.value.authoritativeLastFeeTxRefs)
+                      val authAllowSpendRefs: Option[SortedMap[Address, AllowSpendReference]] =
+                        next.toOption.flatMap(_._1.value.authoritativeLastAllowSpendRefs)
+                      val authTokenLockRefs: Option[SortedMap[Address, TokenLockReference]] =
+                        next.toOption.flatMap(_._1.value.authoritativeLastTokenLockRefs)
+                      val authMessages: Option[SortedMap[MessageType, Signed[CurrencyMessage]]] =
+                        next.toOption.flatMap(_._1.value.authoritativeLastMessages)
                       val nextInfo: CurrencySnapshotInfo = infoOf(next).copy(
                         balances = authBal.getOrElse(infoOf(next).balances),
                         activeAllowSpends = authAS.orElse(infoOf(next).activeAllowSpends),
                         activeTokenLocks = authTL.orElse(infoOf(next).activeTokenLocks),
-                        lastTxRefs = authTxRefs.getOrElse(infoOf(next).lastTxRefs)
+                        lastTxRefs = authTxRefs.getOrElse(infoOf(next).lastTxRefs),
+                        lastFeeTxRefs = authFeeTxRefs.orElse(infoOf(next).lastFeeTxRefs),
+                        lastAllowSpendRefs = authAllowSpendRefs.orElse(infoOf(next).lastAllowSpendRefs),
+                        lastTokenLockRefs = authTokenLockRefs.orElse(infoOf(next).lastTokenLockRefs),
+                        lastMessages = authMessages.orElse(infoOf(next).lastMessages)
                       )
                       // Carry the authoritative balances on BOTH the attested root and the diff (consistency): build a `next` whose info
                       // half has `balances = authBal` so the per-MG root commits to the authoritative map, matching the diff.

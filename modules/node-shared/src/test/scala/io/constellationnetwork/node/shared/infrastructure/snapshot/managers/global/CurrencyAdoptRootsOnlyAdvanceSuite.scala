@@ -353,7 +353,13 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
         CurrencyMessage(MessageType.Owner, mgAddr, mgAddr, MessageOrdinal.MinValue),
         mgKeyPair
       )
-      secondIncremental <- signedIncremental(2L, firstHash, Some(SortedSet(ownerMsg)), mgKeyPair)
+      // Stamp the matching `stateProof` (lastMessagesProof = hash of the Owner-carrying lastMessages map), exactly as
+      // `CurrencySnapshotAcceptanceManager` does (`csi.stateProof(ordinal)`). The adopt path's per-field gate only commits a
+      // derived field when its hash equals the committed proof, so the fixture must carry the proof its `messages` imply.
+      expectedMessages: SortedMap[MessageType, Signed[CurrencyMessage]] = SortedMap(MessageType.Owner -> ownerMsg)
+      expectedInfo = info(Some(expectedMessages))
+      committedProof <- expectedInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+      secondIncremental <- signedIncremental(2L, firstHash, Some(SortedSet(ownerMsg)), mgKeyPair, stateProof = committedProof)
       secondBinary <- binaryOf(secondIncremental, firstHash, mgKeyPair)
       adopted = SortedMap(mgAddr -> NonEmptyList.of(secondBinary))(Address.OrderingInstance)
 

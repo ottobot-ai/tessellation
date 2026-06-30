@@ -9,12 +9,12 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.SharedArtifact
 import io.constellationnetwork.schema.balance.Balance
-import io.constellationnetwork.schema.currencyMessage.CurrencyMessage
+import io.constellationnetwork.schema.currencyMessage.{CurrencyMessage, MessageType}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.semver.SnapshotVersion
-import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendBlock}
-import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockBlock}
+import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendBlock, AllowSpendReference}
+import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockBlock, TokenLockReference}
 import io.constellationnetwork.schema.transaction.{RewardTransaction, TransactionReference}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
@@ -24,6 +24,7 @@ import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMap
 import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSet
 import io.constellationnetwork.serde.codecs.instances.AddressCodec.{codec => addressCodec}
 import io.constellationnetwork.serde.codecs.instances.AllowSpendCodec.{codec => allowSpendCodec}
+import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{codec => allowSpendRefCodec}
 import io.constellationnetwork.serde.codecs.instances.CurrencyAtomCodecs._
 import io.constellationnetwork.serde.codecs.instances.CurrencyRecordCodecs._
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs._
@@ -33,6 +34,7 @@ import io.constellationnetwork.serde.codecs.instances.RewardTransactionCodec.{co
 import io.constellationnetwork.serde.codecs.instances.SharedArtifactCodec.sharedArtifactCodec
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
 import io.constellationnetwork.serde.codecs.instances.TokenLockCodec.{codec => tokenLockCodec}
+import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{codec => tokenLockRefCodec}
 import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.{codec => transactionReferenceCodec}
 
 import scodec.Codec
@@ -135,6 +137,20 @@ object CurrencySnapshotCodecs {
   private val authoritativeLastTxRefsMapCodec: Codec[SortedMap[Address, TransactionReference]] =
     sortedMap(addressCodec, transactionReferenceCodec)
   private val optAuthoritativeLastTxRefsCodec = option(authoritativeLastTxRefsMapCodec)
+  // The metagraph's authoritative cumulative last-fee-tx-ref / last-allow-spend-ref / last-token-lock-ref / last-message maps
+  // (`CurrencyIncrementalSnapshot.authoritativeLast{FeeTxRefs,AllowSpendRefs,TokenLockRefs,Messages}`). Reuse the SAME element codecs and
+  // `SortedMap[...]` encoding as the matching `CurrencySnapshotInfo` fields so the scodec form stays byte-consistent with the Circe form.
+  private val authoritativeLastFeeTxRefsMapCodec: Codec[SortedMap[Address, TransactionReference]] = authoritativeLastTxRefsMapCodec
+  private val authoritativeLastAllowSpendRefsMapCodec: Codec[SortedMap[Address, AllowSpendReference]] =
+    sortedMap(addressCodec, allowSpendRefCodec)
+  private val authoritativeLastTokenLockRefsMapCodec: Codec[SortedMap[Address, TokenLockReference]] =
+    sortedMap(addressCodec, tokenLockRefCodec)
+  private val authoritativeLastMessagesMapCodec: Codec[SortedMap[MessageType, Signed[CurrencyMessage]]] =
+    sortedMap(messageTypeCodec, signedCurrencyMessageCodec)
+  private val optAuthoritativeLastFeeTxRefsCodec = option(authoritativeLastFeeTxRefsMapCodec)
+  private val optAuthoritativeLastAllowSpendRefsCodec = option(authoritativeLastAllowSpendRefsMapCodec)
+  private val optAuthoritativeLastTokenLockRefsCodec = option(authoritativeLastTokenLockRefsMapCodec)
+  private val optAuthoritativeLastMessagesCodec = option(authoritativeLastMessagesMapCodec)
 
   implicit val currencyIncrementalSnapshotCodec: Codec[CurrencyIncrementalSnapshot] =
     (ordinalCodec ::
@@ -158,12 +174,17 @@ object CurrencySnapshotCodecs {
       optAuthoritativeActiveAllowSpendsCodec ::
       optAuthoritativeActiveTokenLocksCodec ::
       optAuthoritativeLastTxRefsCodec ::
+      optAuthoritativeLastFeeTxRefsCodec ::
+      optAuthoritativeLastAllowSpendRefsCodec ::
+      optAuthoritativeLastTokenLockRefsCodec ::
+      optAuthoritativeLastMessagesCodec ::
       versionCodec)
       .xmap[CurrencyIncrementalSnapshot](
         {
           case o :: h :: sh :: lsh :: blks :: rws :: tp :: sp :: ep ::
               da :: msgs :: syncs :: fees :: artifacts :: asb :: tlb ::
-              gsv :: authBal :: authAS :: authTL :: authTxRefs :: v :: HNil =>
+              gsv :: authBal :: authAS :: authTL :: authTxRefs ::
+              authFeeTxRefs :: authAllowSpendRefs :: authTokenLockRefs :: authMessages :: v :: HNil =>
             CurrencyIncrementalSnapshot(
               o,
               h,
@@ -186,6 +207,10 @@ object CurrencySnapshotCodecs {
               authAS,
               authTL,
               authTxRefs,
+              authFeeTxRefs,
+              authAllowSpendRefs,
+              authTokenLockRefs,
+              authMessages,
               v
             )
         },
@@ -211,6 +236,10 @@ object CurrencySnapshotCodecs {
             s.authoritativeActiveAllowSpends ::
             s.authoritativeActiveTokenLocks ::
             s.authoritativeLastTxRefs ::
+            s.authoritativeLastFeeTxRefs ::
+            s.authoritativeLastAllowSpendRefs ::
+            s.authoritativeLastTokenLockRefs ::
+            s.authoritativeLastMessages ::
             s.version ::
             HNil
       )

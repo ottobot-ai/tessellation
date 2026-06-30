@@ -311,7 +311,14 @@ object CurrencySnapshotCreator {
             // and the proof are byte-consistent — the security anchor gl0 verifies before adopting it under roots-only sharding. gl0's
             // per-incremental `AdoptFromSignedFields` replay cannot reproduce the cumulative ref map onto its path-dependent prior, so ml0
             // PUSHES it here (no re-derive carry-forward for lastTxRefs in the sharded path).
-            currencySnapshotAcceptanceResult.info.lastTxRefs.some
+            currencySnapshotAcceptanceResult.info.lastTxRefs.some,
+            // authoritativeLast{FeeTxRefs,AllowSpendRefs,TokenLockRefs,Messages} — same anchor as lastTxRefs, for the OTHER cumulative
+            // ref-maps that gl0's per-incremental replay also cannot reproduce. These `info` fields are already Option-shaped, so push as-is
+            // (the field and its `stateProof.*Proof` are byte-consistent); gl0 verifies each against the metagraph-signed proof before adopting.
+            currencySnapshotAcceptanceResult.info.lastFeeTxRefs,
+            currencySnapshotAcceptanceResult.info.lastAllowSpendRefs,
+            currencySnapshotAcceptanceResult.info.lastTokenLockRefs,
+            currencySnapshotAcceptanceResult.info.lastMessages
           )
 
           artifactSize: Int <- JsonSerializer[F].serialize(artifact).map(_.length)

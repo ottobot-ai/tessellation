@@ -712,17 +712,37 @@ object GlobalSnapshotStateChannelEventsProcessor {
           // its authoritative cumulative map, gl0 ADOPTS it directly (verified-by-proof below) instead of re-deriving — symmetric with balances.
           authoritativeLastTxRefs = artifact.authoritativeLastTxRefs
           candidateLastTxRefs = authoritativeLastTxRefs.getOrElse(nextLastTxRefs)
-          candidate = CurrencySnapshotInfo(
+          // AUTHORITATIVE OTHER REF-MAPS (committee-state-diff follow-up): same anchor + hazard as lastTxRefs, for the remaining cumulative
+          // ref-maps. When the metagraph pushed each, adopt it directly (verified-by-proof below); else fall back to the derived value whose
+          // SHAPE is driven off the committed proof (`None -> None`, `Some -> Some(map)`), keeping the existing per-field gate behavior.
+          authoritativeLastFeeTxRefs = artifact.authoritativeLastFeeTxRefs
+          authoritativeLastAllowSpendRefs = artifact.authoritativeLastAllowSpendRefs
+          authoritativeLastTokenLockRefs = artifact.authoritativeLastTokenLockRefs
+          authoritativeLastMessages = artifact.authoritativeLastMessages
+          // gl0 does not re-derive `lastFeeTxRefs` in this replay (the original candidate hardcoded `None`), so absent an authoritative push
+          // the fallback stays `None` — byte-unchanged from before. When the metagraph pushes it, the verify+adopt below uses it.
+          candidateLastFeeTxRefs = authoritativeLastFeeTxRefs
+          candidateLastAllowSpendRefs = authoritativeLastAllowSpendRefs.orElse(
+            committedProof.lastAllowSpendRefsProof.map(_ => nextAllowSpendRefs)
+          )
+          candidateLastTokenLockRefs = authoritativeLastTokenLockRefs.orElse(
+            committedProof.lastTokenLockRefsProof.map(_ => nextTokenLockRefs)
+          )
+          candidateLastMessages = authoritativeLastMessages.orElse(nextLastMessagesOpt)
+          // NOTE: this is a `<-` (not `=`) deliberately — it inserts a flatMap boundary that resets the for-comprehension's batched
+          // consecutive-`=` tuple, which otherwise hits Scala 2.13's 22-element TupleN ceiling once these authoritative ref-map bindings
+          // are added (the `x$NN` desugar failure). `.pure[F]` is a no-op; behavior is identical to a `=` binding.
+          candidate <- CurrencySnapshotInfo(
             lastTxRefs = candidateLastTxRefs,
             balances = candidateBalances,
-            lastMessages = nextLastMessagesOpt,
-            lastFeeTxRefs = None,
-            lastAllowSpendRefs = committedProof.lastAllowSpendRefsProof.map(_ => nextAllowSpendRefs),
+            lastMessages = candidateLastMessages,
+            lastFeeTxRefs = candidateLastFeeTxRefs,
+            lastAllowSpendRefs = candidateLastAllowSpendRefs,
             activeAllowSpends = candidateActiveAllowSpends,
             globalSnapshotSyncView = committedProof.globalSnapshotSync.map(_ => nextGlobalSnapshotSyncView),
-            lastTokenLockRefs = committedProof.lastTokenLockRefsProof.map(_ => nextTokenLockRefs),
+            lastTokenLockRefs = candidateLastTokenLockRefs,
             activeTokenLocks = candidateActiveTokenLocks
-          )
+          ).pure[F]
 
           // Economic-security gate, PER FIELD: commit each derived field whose hash matches the committee-attested
           // committed proof (verified, safe); carry the prior value forward for any field gl0 cannot reproduce
@@ -792,6 +812,57 @@ object GlobalSnapshotStateChannelEventsProcessor {
               )
             )
           )
+          // Verify-by-proof for the OTHER authoritative cumulative ref-maps — same fail-closed shape as lastTxRefs/balances. Each `*Proof` is
+          // `Option[Hash]`; when the metagraph pushed the map, `candidate.<field>` IS it, so `derivedProof.<field>Proof` is its hash and MUST
+          // equal the metagraph's OWN signed `<field>Proof`. RAISE on mismatch ⇒ the caller drops the binary; the MG does not advance.
+          _ <- Async[F].whenA(
+            authoritativeLastFeeTxRefs.isDefined && derivedProof.lastFeeTxRefsProof =!= committedProof.lastFeeTxRefsProof
+          )(
+            logger.warn(
+              s"[ADOPT-VERIFY] address=${address.show} ordinal=${artifact.ordinal.show} authoritativeLastFeeTxRefs != metagraph-signed " +
+                s"lastFeeTxRefsProof — DROP (authoritative=${derivedProof.lastFeeTxRefsProof.show} signed=${committedProof.lastFeeTxRefsProof.show})"
+            ) >> Async[F].raiseError[Unit](
+              new RuntimeException(
+                s"authoritativeLastFeeTxRefs for ${address.show} at ordinal ${artifact.ordinal.show} does not match the signed lastFeeTxRefsProof"
+              )
+            )
+          )
+          _ <- Async[F].whenA(
+            authoritativeLastAllowSpendRefs.isDefined && derivedProof.lastAllowSpendRefsProof =!= committedProof.lastAllowSpendRefsProof
+          )(
+            logger.warn(
+              s"[ADOPT-VERIFY] address=${address.show} ordinal=${artifact.ordinal.show} authoritativeLastAllowSpendRefs != metagraph-signed " +
+                s"lastAllowSpendRefsProof — DROP (authoritative=${derivedProof.lastAllowSpendRefsProof.show} signed=${committedProof.lastAllowSpendRefsProof.show})"
+            ) >> Async[F].raiseError[Unit](
+              new RuntimeException(
+                s"authoritativeLastAllowSpendRefs for ${address.show} at ordinal ${artifact.ordinal.show} does not match the signed lastAllowSpendRefsProof"
+              )
+            )
+          )
+          _ <- Async[F].whenA(
+            authoritativeLastTokenLockRefs.isDefined && derivedProof.lastTokenLockRefsProof =!= committedProof.lastTokenLockRefsProof
+          )(
+            logger.warn(
+              s"[ADOPT-VERIFY] address=${address.show} ordinal=${artifact.ordinal.show} authoritativeLastTokenLockRefs != metagraph-signed " +
+                s"lastTokenLockRefsProof — DROP (authoritative=${derivedProof.lastTokenLockRefsProof.show} signed=${committedProof.lastTokenLockRefsProof.show})"
+            ) >> Async[F].raiseError[Unit](
+              new RuntimeException(
+                s"authoritativeLastTokenLockRefs for ${address.show} at ordinal ${artifact.ordinal.show} does not match the signed lastTokenLockRefsProof"
+              )
+            )
+          )
+          _ <- Async[F].whenA(
+            authoritativeLastMessages.isDefined && derivedProof.lastMessagesProof =!= committedProof.lastMessagesProof
+          )(
+            logger.warn(
+              s"[ADOPT-VERIFY] address=${address.show} ordinal=${artifact.ordinal.show} authoritativeLastMessages != metagraph-signed " +
+                s"lastMessagesProof — DROP (authoritative=${derivedProof.lastMessagesProof.show} signed=${committedProof.lastMessagesProof.show})"
+            ) >> Async[F].raiseError[Unit](
+              new RuntimeException(
+                s"authoritativeLastMessages for ${address.show} at ordinal ${artifact.ordinal.show} does not match the signed lastMessagesProof"
+              )
+            )
+          )
           adopted = CurrencySnapshotInfo(
             // lastTxRefs are AUTHORITATIVE-sourced in sharded mode: when the metagraph pushed `authoritativeLastTxRefs`, adopt it directly
             // (already verified-by-proof above — no carry-forward). Otherwise fall back to the existing per-field gate (carry the prior forward
@@ -807,13 +878,19 @@ object GlobalSnapshotStateChannelEventsProcessor {
               if (authoritativeBalances.isDefined) candidate.balances
               else if (derivedProof.balancesProof === committedProof.balancesProof) candidate.balances
               else lastState.balances,
+            // lastMessages / lastFeeTxRefs / lastAllowSpendRefs are AUTHORITATIVE-sourced in sharded mode when the metagraph pushed them
+            // (already verified-by-proof above — no carry-forward); else fall back to the existing per-field gate.
             lastMessages =
-              if (derivedProof.lastMessagesProof === committedProof.lastMessagesProof) candidate.lastMessages else lastState.lastMessages,
+              if (authoritativeLastMessages.isDefined) candidate.lastMessages
+              else if (derivedProof.lastMessagesProof === committedProof.lastMessagesProof) candidate.lastMessages
+              else lastState.lastMessages,
             lastFeeTxRefs =
-              if (derivedProof.lastFeeTxRefsProof === committedProof.lastFeeTxRefsProof) candidate.lastFeeTxRefs
+              if (authoritativeLastFeeTxRefs.isDefined) candidate.lastFeeTxRefs
+              else if (derivedProof.lastFeeTxRefsProof === committedProof.lastFeeTxRefsProof) candidate.lastFeeTxRefs
               else lastState.lastFeeTxRefs,
             lastAllowSpendRefs =
-              if (derivedProof.lastAllowSpendRefsProof === committedProof.lastAllowSpendRefsProof) candidate.lastAllowSpendRefs
+              if (authoritativeLastAllowSpendRefs.isDefined) candidate.lastAllowSpendRefs
+              else if (derivedProof.lastAllowSpendRefsProof === committedProof.lastAllowSpendRefsProof) candidate.lastAllowSpendRefs
               else lastState.lastAllowSpendRefs,
             // activeAllowSpends are AUTHORITATIVE-sourced in sharded mode: when the metagraph pushed `authoritativeActiveAllowSpends`, adopt
             // it directly (already verified-by-proof above — no carry-forward). Otherwise fall back to the existing per-field gate.
@@ -825,7 +902,8 @@ object GlobalSnapshotStateChannelEventsProcessor {
               if (derivedProof.globalSnapshotSync === committedProof.globalSnapshotSync) candidate.globalSnapshotSyncView
               else lastState.globalSnapshotSyncView,
             lastTokenLockRefs =
-              if (derivedProof.lastTokenLockRefsProof === committedProof.lastTokenLockRefsProof) candidate.lastTokenLockRefs
+              if (authoritativeLastTokenLockRefs.isDefined) candidate.lastTokenLockRefs
+              else if (derivedProof.lastTokenLockRefsProof === committedProof.lastTokenLockRefsProof) candidate.lastTokenLockRefs
               else lastState.lastTokenLockRefs,
             // activeTokenLocks are AUTHORITATIVE-sourced in sharded mode — same as activeAllowSpends above.
             activeTokenLocks =

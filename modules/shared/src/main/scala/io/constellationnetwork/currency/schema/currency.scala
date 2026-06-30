@@ -265,6 +265,20 @@ object currency {
     // for lastTxRefs in the sharded path — symmetric with `authoritativeBalances`). `None` for genesis and pre-this-field snapshots
     // (greenfield: Option, no wire back-compat — all nodes rebuild together).
     authoritativeLastTxRefs: Option[SortedMap[Address, TransactionReference]] = None,
+    // The metagraph's OWN authoritative cumulative last-fee-tx-ref / last-allow-spend-ref / last-token-lock-ref / last-message maps —
+    // the EXACT `CurrencySnapshotInfo.{lastFeeTxRefs, lastAllowSpendRefs, lastTokenLockRefs, lastMessages}` the signed
+    // `stateProof.{lastFeeTxRefsProof, lastAllowSpendRefsProof, lastTokenLockRefsProof, lastMessagesProof}` are hashed over (so each field
+    // and its proof are byte-consistent — the security anchor). Like `authoritativeLastTxRefs`, these are CUMULATIVE per-source / per-type
+    // maps carried across the metagraph's whole history; gl0's per-incremental `AdoptFromSignedFields` replay rebuilds them onto its OWN
+    // path-dependent carry-forward prior, so once a single ordinal's events (fee-txs / allow-spends / token-locks / messages) land outside
+    // the incremental gl0 replays, the per-field gate carries a stale prior and the proof never re-converges. ml0 PUSHES the authoritative
+    // maps here, the producer puts them in the per-MG checkpoint diff, and gl0 ADOPTS each after verifying it against the metagraph-signed
+    // proof (no re-derive carry-forward in the sharded path). Each is Option-shaped exactly like the corresponding `CurrencySnapshotInfo`
+    // field (`None` pre-migration / when empty). `None` for genesis and pre-this-field snapshots (greenfield: Option, no wire back-compat).
+    authoritativeLastFeeTxRefs: Option[SortedMap[Address, TransactionReference]] = None,
+    authoritativeLastAllowSpendRefs: Option[SortedMap[Address, AllowSpendReference]] = None,
+    authoritativeLastTokenLockRefs: Option[SortedMap[Address, TokenLockReference]] = None,
+    authoritativeLastMessages: Option[SortedMap[MessageType, Signed[CurrencyMessage]]] = None,
     version: SnapshotVersion = SnapshotVersion("0.0.1")
   ) extends IncrementalSnapshot[CurrencySnapshotStateProof]
 
@@ -295,6 +309,10 @@ object currency {
           None, // authoritativeActiveAllowSpends — None for the genesis→first-incremental transition
           None, // authoritativeActiveTokenLocks — None for the genesis→first-incremental transition
           None, // authoritativeLastTxRefs — None for the genesis→first-incremental transition
+          None, // authoritativeLastFeeTxRefs — None for the genesis→first-incremental transition
+          None, // authoritativeLastAllowSpendRefs — None for the genesis→first-incremental transition
+          None, // authoritativeLastTokenLockRefs — None for the genesis→first-incremental transition
+          None, // authoritativeLastMessages — None for the genesis→first-incremental transition
           snapshot.version
         )
       }
@@ -337,6 +355,10 @@ object currency {
         None, // authoritativeActiveAllowSpends — legacy V1 carries no authoritative active-allow-spend map
         None, // authoritativeActiveTokenLocks — legacy V1 carries no authoritative active-token-lock map
         None, // authoritativeLastTxRefs — legacy V1 carries no authoritative last-tx-ref map
+        None, // authoritativeLastFeeTxRefs — legacy V1 carries no authoritative last-fee-tx-ref map
+        None, // authoritativeLastAllowSpendRefs — legacy V1 carries no authoritative last-allow-spend-ref map
+        None, // authoritativeLastTokenLockRefs — legacy V1 carries no authoritative last-token-lock-ref map
+        None, // authoritativeLastMessages — legacy V1 carries no authoritative last-message map
         version
       )
   }
@@ -407,6 +429,10 @@ object currency {
           None, // authoritativeActiveAllowSpends — genesis→first-incremental; populated on subsequent incrementals
           None, // authoritativeActiveTokenLocks — genesis→first-incremental; populated on subsequent incrementals
           None, // authoritativeLastTxRefs — genesis→first-incremental; populated on subsequent incrementals
+          None, // authoritativeLastFeeTxRefs — genesis→first-incremental; populated on subsequent incrementals
+          None, // authoritativeLastAllowSpendRefs — genesis→first-incremental; populated on subsequent incrementals
+          None, // authoritativeLastTokenLockRefs — genesis→first-incremental; populated on subsequent incrementals
+          None, // authoritativeLastMessages — genesis→first-incremental; populated on subsequent incrementals
           genesis.version
         )
       }
