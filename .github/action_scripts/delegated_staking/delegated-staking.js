@@ -459,6 +459,11 @@ const testCreateDelegatedStake = async (urls, account, nodeIds) => {
     {
       globalL0Url: urls.globalL0Url,
       name: 'assertDelegatedStakeCreated',
+      // Default maxOrdinalMisses=10 gives up ~1 ordinal short: a delegated-stake CREATE drains from the
+      // consensus event mempool on TimeTrigger cadence, and on a multi-producer cluster better-gossip
+      // pre-emption pushes the flush ~15-25 ordinals out (the create finalizes intact — observed at ord 55
+      // vs the test giving up at ord 47). Budget to 40 to match the sibling asserts at :596/:684.
+      maxOrdinalMisses: 40,
     },
   )
   logWorkflow.info('Stake creation verified')
@@ -501,6 +506,8 @@ const testCreateDelegatedStake = async (urls, account, nodeIds) => {
     {
       globalL0Url: urls.globalL0Url,
       name: 'assertDelegatedStake2Created',
+      // Same event-mempool drain latency as the first-create assert (:426) — budget 40 like the siblings.
+      maxOrdinalMisses: 40,
     },
   )
 
