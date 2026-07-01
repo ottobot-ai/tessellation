@@ -128,9 +128,10 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
   private def deterministicDerive(
     mg: Address,
     snaps: NonEmptyList[Signed[StateChannelSnapshotBinary]],
-    anchor: SnapshotOrdinal
+    anchor: SnapshotOrdinal,
+    diffBase: SnapshotOrdinal
   ): IO[Option[(Hash, ChangeSet)]] = {
-    val _ = anchor
+    val _ = (anchor, diffBase)
     IO.pure(Some((hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}"), ChangeSet.empty)))
   }
 
@@ -178,6 +179,7 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
         slotGapFor = slotGapFor,
         staircaseDeltaSlots = 5,
         derivePerMgState = deterministicDerive,
+        diffBaseOrdinalF = cats.effect.IO.pure(SnapshotOrdinal.MinValue),
         lastAdoptedOrd = cats.effect.IO.pure(None),
         pipelineDepth = Int.MaxValue,
         republishEveryTicks = 1

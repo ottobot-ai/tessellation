@@ -53,6 +53,16 @@ import derevo.derive
   *   protocol-violation signal — keep the wire shape forbid it
   * @param epoch
   *   sortition epoch this committee was drawn from (so verifiers can look up the right active set for VRF verification)
+  * @param diffBaseOrdinal
+  *   '''Track-1 diff-base-pin.''' The cluster-uniform gl0 finalized ordinal the committee cut `derivedStateDelta.perMetagraphStateDiff`
+  *   over — the producer's `mptStore.lastPersistedOrdinal` captured ATOMICALLY with its diff-prior read. Carried so every byteDiff-adopter
+  *   (`GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`) and every re-executor (committee `reExecDerivationWithDiff`,
+  *   watchtower) reads the per-MG prior `S(N)` at THE SAME pinned ordinal, instead of each node's own (per-node-lagging) `overlay.base`.
+  *   This is what removes the `S(N)-lags` drop-deadlock the authoritative-override masking currently papers over. NOT [[gl0AnchorOrdinal]]
+  *   (that is the exec/fee-cutover CONTEXT for the metagraph derivation — a future ordinal the checkpoint rides INTO, not the base the diff
+  *   was cut FROM). Consensus-load-bearing: part of the signed [[ShardCheckpointSigPreimageV2]]. `numShards = 1` never builds checkpoints,
+  *   so the default ([[io.constellationnetwork.schema.SnapshotOrdinal.MinValue]], used only by the pre-sharding regression bar and unit
+  *   fixtures) is byte-neutral there.
   */
 @derive(encoder, decoder, eqv, show)
 final case class ShardCheckpoint(
@@ -64,7 +74,8 @@ final case class ShardCheckpoint(
   derivedStateDelta: ShardDerivedStateDelta,
   emittedReceipts: List[CrossShardReceipt],
   committeeSignatures: NonEmptyList[CommitteeMemberSignature],
-  epoch: EtaPeriod
+  epoch: EtaPeriod,
+  diffBaseOrdinal: SnapshotOrdinal = SnapshotOrdinal.MinValue
 ) {
 
   /** Pure projection: strip the signatures field and yield the canonical pre-image used for [[committeeSignatures]] and chain-linking.
@@ -77,8 +88,8 @@ final case class ShardCheckpoint(
     * sites — there's no path where one would build the preimage independently. Co-locating the projection on the envelope keeps the "what
     * bytes get signed" contract one method-call away from the envelope itself.
     */
-  def signingPreimage: ShardCheckpointSigPreimage =
-    ShardCheckpointSigPreimage(
+  def signingPreimage: ShardCheckpointSigPreimageV2 =
+    ShardCheckpointSigPreimageV2(
       shardId = shardId,
       parentCheckpointHash = parentCheckpointHash,
       shardOrdinal = shardOrdinal,
@@ -86,7 +97,8 @@ final case class ShardCheckpoint(
       slot = slot,
       derivedStateDelta = derivedStateDelta,
       emittedReceipts = emittedReceipts,
-      epoch = epoch
+      epoch = epoch,
+      diffBaseOrdinal = diffBaseOrdinal
     )
 }
 
@@ -110,4 +122,24 @@ final case class ShardCheckpointSigPreimage(
   derivedStateDelta: ShardDerivedStateDelta,
   emittedReceipts: List[CrossShardReceipt],
   epoch: EtaPeriod
+)
+
+/** '''V2 canonical pre-image (Track-1 diff-base-pin — greenfield HARD CUTOVER).''' Identical to [[ShardCheckpointSigPreimage]] plus the
+  * consensus-load-bearing [[ShardCheckpoint.diffBaseOrdinal]], appended as the last field. Per the frozen-shape discipline documented on
+  * [[ShardCheckpointSigPreimage]], the `diffBaseOrdinal` field is NOT added to V1 in place (that would silently mutate the V1 signed
+  * bytes); it is bumped into this V2 case class and [[ShardCheckpoint.signingPreimage]] is repointed here. Greenfield (no wire-compat):
+  * there is NO dual-codec / version discriminator — the whole cluster hashes V2, so every committee member signs and every verifier
+  * verifies the V2-encoded bytes. V1 is retained only for the round-trip fixture test; nothing in the produce/verify path references it.
+  */
+@derive(encoder, decoder, eqv, show)
+final case class ShardCheckpointSigPreimageV2(
+  shardId: ShardId,
+  parentCheckpointHash: Hash,
+  shardOrdinal: ShardOrdinal,
+  gl0AnchorOrdinal: SnapshotOrdinal,
+  slot: Slot,
+  derivedStateDelta: ShardDerivedStateDelta,
+  emittedReceipts: List[CrossShardReceipt],
+  epoch: EtaPeriod,
+  diffBaseOrdinal: SnapshotOrdinal
 )

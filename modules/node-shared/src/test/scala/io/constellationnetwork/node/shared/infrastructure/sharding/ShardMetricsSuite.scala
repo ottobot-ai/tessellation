@@ -234,7 +234,7 @@ object ShardMetricsSuite extends MutableIOSuite {
         // (these metric tests use 80-byte structural proofs), so the accept/reject paths under test are unchanged.
         vrfRegistry = VrfRegistry.empty[IO],
         shardEtaFor = (_, _) => IO.pure(None),
-        reExecuteDerivation = (_, _, _) => IO.pure(Hash("ff" * 32))
+        reExecuteDerivation = (_, _, _, _) => IO.pure(Hash("ff" * 32))
       )
 
       _ <- mgr.evaluate(checkpoint)
@@ -286,7 +286,7 @@ object ShardMetricsSuite extends MutableIOSuite {
         // (these metric tests use 80-byte structural proofs), so the accept/reject paths under test are unchanged.
         vrfRegistry = VrfRegistry.empty[IO],
         shardEtaFor = (_, _) => IO.pure(None),
-        reExecuteDerivation = (_, _, _) => IO.pure(mptRoot)
+        reExecuteDerivation = (_, _, _, _) => IO.pure(mptRoot)
       )
 
       result <- mgr.evaluate(checkpoint)
@@ -339,7 +339,7 @@ object ShardMetricsSuite extends MutableIOSuite {
         // (these metric tests use 80-byte structural proofs), so the accept/reject paths under test are unchanged.
         vrfRegistry = VrfRegistry.empty[IO],
         shardEtaFor = (_, _) => IO.pure(None),
-        reExecuteDerivation = (_, _, _) => IO.pure(Hash("0" * 64))
+        reExecuteDerivation = (_, _, _, _) => IO.pure(Hash("0" * 64))
       )
 
       _ <- mgr.evaluate(checkpoint)
@@ -390,7 +390,7 @@ object ShardMetricsSuite extends MutableIOSuite {
         // (these metric tests use 80-byte structural proofs), so the accept/reject paths under test are unchanged.
         vrfRegistry = VrfRegistry.empty[IO],
         shardEtaFor = (_, _) => IO.pure(None),
-        reExecuteDerivation = (_, _, _) => IO.pure(Hash("ff" * 32))
+        reExecuteDerivation = (_, _, _, _) => IO.pure(Hash("ff" * 32))
       )
 
       _ <- mgr.evaluate(checkpoint)

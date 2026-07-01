@@ -76,7 +76,10 @@ object InvalidStateProofValidator {
     *   pre-MPT-partition wiring.
     */
   def make[F[_]: Async: SecurityProvider: Hasher](
-    reDerivePerMgRoot: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash],
+    // Track-1 diff-base-pin: the 4th arg is the disputed checkpoint's `diffBaseOrdinal`, so the honest re-derivation reads S(N) at the
+    // SAME pinned base the committee diffed over (call site passes `cp.diffBaseOrdinal`) — a watchtower that read its own live base would
+    // recompute a different root and false-slash an honest checkpoint whose base lags the watchtower's.
+    reDerivePerMgRoot: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash],
     slashedReader: InvalidStateProofSlashedReader[F]
   ): InvalidStateProofValidator[F] = new InvalidStateProofValidator[F] {
 
@@ -135,7 +138,7 @@ object InvalidStateProofValidator {
       // committee-attested root read off the signed envelope. UPHELD iff they differ. Never trusts the challenger's carried roots.
       def step7(binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]]): F[Either[InvalidStateProofRejection, Unit]] = {
         val attested: Option[Hash] = cp.derivedStateDelta.perMetagraphMptRoots.get(mg)
-        reDerivePerMgRoot(mg, binaries, cp.gl0AnchorOrdinal).map { honest =>
+        reDerivePerMgRoot(mg, binaries, cp.gl0AnchorOrdinal, cp.diffBaseOrdinal).map { honest =>
           attested match {
             case Some(attestedRoot) if attestedRoot === honest =>
               // Honest re-derivation reproduced the attested root ⇒ committee did NOT deviate ⇒ NOT upheld. The "honest committee" floor.

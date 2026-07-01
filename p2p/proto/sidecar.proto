@@ -209,6 +209,7 @@ message ShardCheckpointWire {
   repeated CommitteeMemberSignatureWire committee_signatures = 8;
   bytes emitted_receipts_json = 9;       // JSON bytes for List[CrossShardReceipt]; empty == empty list
   uint64 slot = 10;                      // wall-clock slot of the leader-lottery win (design §5.7); gl0_anchor_ordinal is chain-link data only
+  uint64 diff_base_ordinal = 11;         // Track-1 diff-base-pin: gl0 finalized ordinal the perMetagraphStateDiff was cut over (in the V2 sig preimage)
 }
 
 // Per-metagraph slice of `ShardDerivedStateDelta.includedSnapshots`. The

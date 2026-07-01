@@ -131,7 +131,7 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
     ssl: ShardSlotLeader[IO],
     chainStore: ShardChainStore[IO],
     keyPair: KeyPair,
-    reExec: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash]
+    reExec: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash]
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO], j: JsonSerializer[IO]): IO[ShardCheckpointProducer[IO]] =
     ShardCheckpointProducer.make[IO](
       shardId = shardZero,
@@ -155,7 +155,9 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
       // `perMetagraphMptRoots`); the carried diff is not under test here, so pair it with an empty `ChangeSet` and always `Some` (this
       // re-exec stub never omits). The production root encoding (`reExecDerivationWithDiff` ⇒ `hash((incRoot, infoRoot))`) and the
       // verifier's apply-and-verify reconciliation are exercised by the step-6 wiring/apply suites, not this re-exec-parity suite.
-      derivePerMgState = (mg, snaps, ord) => reExec(mg, snaps, ord).map(h => Some((h, ChangeSet.empty))),
+      derivePerMgState = (mg, snaps, ord, diffBase) => reExec(mg, snaps, ord, diffBase).map(h => Some((h, ChangeSet.empty))),
+      // Track-1 diff-base-pin: the diff base is irrelevant to this Hash-only re-exec-parity suite; wire MinValue.
+      diffBaseOrdinalF = cats.effect.IO.pure(SnapshotOrdinal.MinValue),
       lastAdoptedOrd = cats.effect.IO.pure(None),
       pipelineDepth = Int.MaxValue,
       republishEveryTicks = 1
@@ -217,7 +219,7 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
     * + the checkpoint's signer as a committee member.
     */
   private def mkDepth1Manager(
-    reExec: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash],
+    reExec: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash],
     committee: Set[PeerId],
     selfId: PeerId
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointGl0AcceptanceManager[IO]] =
@@ -272,8 +274,8 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
       produced <- IO.fromOption(producedOpt)(new RuntimeException("σ=1 producer should win within 100 attempts"))
       producedRoot = produced.value.derivedStateDelta.perMetagraphMptRoots(mgAddr)
 
-      // Independently recompute via the SAME closure over the SAME chain + the checkpoint's own gl0AnchorOrdinal.
-      verifierRoot <- reExec(mgAddr, NonEmptyList.of(binary), produced.value.gl0AnchorOrdinal)
+      // Independently recompute via the SAME closure over the SAME chain + the checkpoint's own gl0AnchorOrdinal + diffBaseOrdinal.
+      verifierRoot <- reExec(mgAddr, NonEmptyList.of(binary), produced.value.gl0AnchorOrdinal, produced.value.diffBaseOrdinal)
 
       // Sanity: the real full-snapshot leaf is NOT the address-only sentinel (i.e. the meaningful branch ran).
       sentinel <- Hasher[IO].hash(mgAddr)

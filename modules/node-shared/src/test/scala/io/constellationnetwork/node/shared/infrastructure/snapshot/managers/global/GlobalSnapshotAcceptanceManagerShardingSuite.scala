@@ -1229,7 +1229,7 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
     sp: SecurityProvider[IO]
   ): io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[IO] =
     io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[IO](
-      reDerivePerMgRoot = (_, _, _) => IO.pure(honestRoot),
+      reDerivePerMgRoot = (_, _, _, _) => IO.pure(honestRoot),
       slashedReader = io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader.fromMptStore[IO](store)
     )
 

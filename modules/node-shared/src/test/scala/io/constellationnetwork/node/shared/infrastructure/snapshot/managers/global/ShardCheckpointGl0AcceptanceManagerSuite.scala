@@ -323,8 +323,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
     // EcVrf25519 verify (accept a valid member's proof; reject a non-member / forged / wrong-epoch proof).
     vrfRegistry: VrfRegistry[IO] = VrfRegistry.empty[IO],
     shardEtaFor: (ShardId, EtaPeriod) => IO[Option[Array[Byte]]] = (_, _) => IO.pure(none[Array[Byte]]),
-    reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] = (_, _, _) =>
-      IO.pure(Hash("0" * 64))
+    reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
+      (_, _, _, _) => IO.pure(Hash("0" * 64))
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointGl0AcceptanceManager[IO]] =
     ShardCheckpointGl0AcceptanceManager.make[IO](
       finalityTriggers = sid => IO.pure(finalityTriggers.get(sid)),
@@ -452,11 +452,13 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         (
           _: Address,
           _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+          _: SnapshotOrdinal,
           _: SnapshotOrdinal
         ) => reExecCalledRef.set(true).as(Hash("ff" * 32))
       ): (
         Address,
         NonEmptyList[Signed[StateChannelSnapshotBinary]],
+        SnapshotOrdinal,
         SnapshotOrdinal
       ) => IO[Hash]
 
@@ -501,9 +503,17 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         selfId = selfPeer
       )
       // Re-exec returns the SAME mptRoot the delta claims → all-match path → Accepted.
-      reExecCb = ((_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal) => IO.pure(mptRoot)): (
+      reExecCb = (
+        (
+          _: Address,
+          _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+          _: SnapshotOrdinal,
+          _: SnapshotOrdinal
+        ) => IO.pure(mptRoot)
+      ): (
         Address,
         NonEmptyList[Signed[StateChannelSnapshotBinary]],
+        SnapshotOrdinal,
         SnapshotOrdinal
       ) => IO[Hash]
 
@@ -548,9 +558,17 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       )
       // Re-exec returns a WRONG hash for the MG — the manager should detect mismatch.
       wrongRoot = Hash("ff" * 32)
-      reExecCb = ((_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal) => IO.pure(wrongRoot)): (
+      reExecCb = (
+        (
+          _: Address,
+          _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+          _: SnapshotOrdinal,
+          _: SnapshotOrdinal
+        ) => IO.pure(wrongRoot)
+      ): (
         Address,
         NonEmptyList[Signed[StateChannelSnapshotBinary]],
+        SnapshotOrdinal,
         SnapshotOrdinal
       ) => IO[Hash]
 
@@ -721,9 +739,10 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         (
           _: Address,
           _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+          _: SnapshotOrdinal,
           _: SnapshotOrdinal
         ) => reExecCalledRef.set(true).as(Hash("ff" * 32))
-      ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[
+      ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[
         Hash
       ]
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig1, sig2, sig3))
@@ -756,9 +775,17 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig1))
 
       // re-exec returns a WRONG root vs the delta's claimed root ⇒ RejectedReExecutionMismatch, deterministically.
-      reExecWrong = ((_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal) => IO.pure(Hash("ff" * 32))): (
+      reExecWrong = (
+        (
+          _: Address,
+          _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+          _: SnapshotOrdinal,
+          _: SnapshotOrdinal
+        ) => IO.pure(Hash("ff" * 32))
+      ): (
         Address,
         NonEmptyList[Signed[StateChannelSnapshotBinary]],
+        SnapshotOrdinal,
         SnapshotOrdinal
       ) => IO[Hash]
 

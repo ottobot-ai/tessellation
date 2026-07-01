@@ -337,7 +337,9 @@ object ShardingCodecsSuite extends FunSuite {
       preimage.gl0AnchorOrdinal === sampleCheckpoint.gl0AnchorOrdinal,
       preimage.derivedStateDelta === sampleCheckpoint.derivedStateDelta,
       preimage.emittedReceipts === sampleCheckpoint.emittedReceipts,
-      preimage.epoch === sampleCheckpoint.epoch
+      preimage.epoch === sampleCheckpoint.epoch,
+      // Track-1 diff-base-pin: the V2 preimage carries `diffBaseOrdinal` (the base the diff was cut over) so it is signed + verified.
+      preimage.diffBaseOrdinal === sampleCheckpoint.diffBaseOrdinal
     )
   }
 

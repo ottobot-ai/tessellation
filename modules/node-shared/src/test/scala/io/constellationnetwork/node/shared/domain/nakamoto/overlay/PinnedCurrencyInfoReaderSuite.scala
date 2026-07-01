@@ -265,4 +265,79 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
       } yield expect(root.value.nonEmpty) && expect(got.isEmpty)
     }
   }
+
+  // ===========================================================================
+  // Track-1 diff-base-pin: readAtOrdinal + pinnedReaderAt (SELF-RESOLVING — no independently-carried pin hash)
+  // ===========================================================================
+
+  test("diff-base-pin readAtOrdinal HAPPY: self-resolves the pin (no expected hash) ⇒ == readAt(pinned.hash) == oracle") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, root, oracle) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        _ <- byteStore.writeState(ord(10L), bytes)
+        pinned <- mkHashed(10L, Some(root))
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        // The adopter's read: no carried hash — the reader resolves the finalized snapshot at ord(10) itself and pins to it.
+        got <- reader.readAtOrdinal(ord(10L), mg)
+      } yield
+        expect(oracle.isDefined) &&
+          expect.same(got, oracle) // byte-identical to a hash-carrying readAt / a live finalized read at the pinned base
+    }
+  }
+
+  test("diff-base-pin readAtOrdinal NO-SNAPSHOT: base not resolvable on this chain ⇒ None (never a head fallback)") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, _, _) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        _ <- byteStore.writeState(ord(10L), bytes)
+        resolver = (_: SnapshotOrdinal) => none[Hashed[GlobalIncrementalSnapshot]].pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        got <- reader.readAtOrdinal(ord(10L), mg)
+      } yield expect(got.isEmpty)
+    }
+  }
+
+  test("diff-base-pin pinnedReaderAt HAPPY: whole-global reader over the pinned bytes reconstructs mg's Info == oracle") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, root, oracle) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        _ <- byteStore.writeState(ord(10L), bytes)
+        pinned <- mkHashed(10L, Some(root))
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        // The committee/watchtower `reExecDerivationWithDiff` prior reader — a full GlobalStateReader pinned at the diff base.
+        pinnedReaderOpt <- reader.pinnedReaderAt(ord(10L))
+        gotInfo <- pinnedReaderOpt.traverse(_.getCurrencySnapshotInfo(mg))
+      } yield
+        expect(pinnedReaderOpt.isDefined) &&
+          expect.same(gotInfo.flatten, oracle)
+    }
+  }
+
+  test("diff-base-pin pinnedReaderAt ROOT-MISMATCH: retained bytes don't reproduce the pinned committed root ⇒ None") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, root, _) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        _ <- byteStore.writeState(ord(10L), bytes)
+        wrongRoot = Hash("00" * 32)
+        pinned <- mkHashed(10L, Some(wrongRoot))
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        got <- reader.pinnedReaderAt(ord(10L))
+      } yield expect(wrongRoot =!= root) && expect(got.isEmpty)
+    }
+  }
 }

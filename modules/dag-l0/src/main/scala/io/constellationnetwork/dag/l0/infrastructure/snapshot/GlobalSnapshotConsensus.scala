@@ -563,18 +563,41 @@ object GlobalSnapshotConsensus {
           .inMemory[F](sharedCfg.nakamoto.commitmentSmt.versionRootRetention.value)
       }.toResource
 
+      // ─── Track-1 diff-base-pin: the shared gl0 PinnedCurrencyInfoReader (over the CONTIGUOUS k₂ `signedBytesStore`) + the by-ordinal
+      // finalized-reader FACTORY used by the produce/watchtower `reExecDerivationWithDiff`. Hoisted here so the watchtower (below), the
+      // producer (`derivePerMgState`, far below), and the GSAM `pinnedCurrencyInfoReader` param all reuse the SAME instance.
+      gl0PinnedReader = {
+        implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+        io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader
+          .make[F](signedBytesStore, getGlobalSnapshotByOrdinalWithFallback)
+      }
+      // Resolve the finalized state reader AT a pinned ordinal: FAST PATH = the live base reader when the ordinal IS the current
+      // `lastPersistedOrdinal` (the producer's common case — no byte-map materialization); otherwise a version-retained pinned reader over
+      // `signedBytesStore` (the watchtower's historical case). `None` ⇒ the anchor can't be served (evicted below k₂ / not on this chain).
+      finalizedReaderAt = { (ord: io.constellationnetwork.schema.SnapshotOrdinal) =>
+        mptStore.lastPersistedOrdinal.flatMap {
+          case Some(live) if live.value.value == ord.value.value =>
+            Async[F].pure(
+              Some(io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore))
+            )
+          case _ => gl0PinnedReader.pinnedReaderAt(ord)
+        }
+      }: (
+        io.constellationnetwork.schema.SnapshotOrdinal => F[
+          Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[F]]
+        ]
+      )
+
       // ─── WATCHTOWER fraud-proof re-derivation closure (W3a) — hoisted ABOVE the GSAM so the on-chain verdict can use it ───
       // The PIN-1 per-MG re-derivation — IDENTICAL encoding to the sub-quorum re-exec the acceptance manager uses
-      // (`reExecDerivationWithDiff(...)._1`, finalized base reader), so the recomputed root is byte-comparable against the committee-attested
-      // `perMetagraphMptRoots`. Built from the SAME shared `shardScEventsProcessor` + `mptStore` the produce path's `derivePerMgState` uses.
-      // This single closure is the basis of (a) the on-chain GSAM dispute verdict below, (b) the daemon's dispute verdict, and (c) the
-      // emitter's `watchtowerReExec` trigger — so producer / watchtower / verdict all compute byte-identical roots.
+      // (`reExecDerivationWithDiff(...)._1`), so the recomputed root is byte-comparable against the committee-attested
+      // `perMetagraphMptRoots`. Track-1 diff-base-pin: it re-derives at the DISPUTED checkpoint's `diffBaseOrdinal` (the 4th closure arg,
+      // resolved via `finalizedReaderAt` — pinned to the checkpoint's base, NOT this node's live base), so a watchtower whose base runs
+      // ahead of the checkpoint's does NOT recompute a different root and false-slash an honest checkpoint.
       watchtowerReDerive = {
         implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
-        val priorStateReader =
-          io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore)
         val withDiff = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
-          .reExecDerivationWithDiff[F](shardScEventsProcessor, priorStateReader)(
+          .reExecDerivationWithDiff[F](shardScEventsProcessor, finalizedReaderAt)(
             Async[F],
             Parallel[F],
             h,
@@ -586,8 +609,9 @@ object GlobalSnapshotConsensus {
           binaries: cats.data.NonEmptyList[
             io.constellationnetwork.security.signature.Signed[io.constellationnetwork.statechannel.StateChannelSnapshotBinary]
           ],
-          anchor: io.constellationnetwork.schema.SnapshotOrdinal
-        ) => withDiff(mg, binaries, anchor).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
+          anchor: io.constellationnetwork.schema.SnapshotOrdinal,
+          diffBaseOrdinal: io.constellationnetwork.schema.SnapshotOrdinal
+        ) => withDiff(mg, binaries, anchor, diffBaseOrdinal).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
       }
 
       // ─── WATCHTOWER on-chain dispute verdict for the GSAM accept path (W3a) ──────────────────────────────
@@ -660,11 +684,9 @@ object GlobalSnapshotConsensus {
           // resolver `getGlobalSnapshotByOrdinalWithFallback` (carries the pin hash + committed mptRoot). Reachable in `accept()` for the
           // follow-up I-PIN consumer; not read yet. RETENTION: S2 raised the gl0 disk window to k₂, so anchors within k₂ of the finalized tip
           // resolve; only anchors deeper than k₂ (beyond the absolute floor) hard-reject.
-          pinnedCurrencyInfoReader = Some {
-            implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
-            io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader
-              .make[F](signedBytesStore, getGlobalSnapshotByOrdinalWithFallback)
-          }
+          // Track-1 diff-base-pin: REUSE the hoisted `gl0PinnedReader` (also feeds the produce/watchtower `finalizedReaderAt`) — the adopter
+          // reads each MG's diff prior at the checkpoint's `diffBaseOrdinal` via this reader's `readAtOrdinal`.
+          pinnedCurrencyInfoReader = Some(gl0PinnedReader)
         )
         .toResource
 
@@ -1805,10 +1827,13 @@ object GlobalSnapshotConsensus {
                       // best-tip prior recomputes, on every gl0, a root NO node finalizes → permanent per-MG mismatch + drop (run-26:
                       // ~890 ADOPT-VERIFY/node, all 8 nodes agree bit-for-bit on the recomputed root; only the producer's attested
                       // root diverged — proving gl0's prior is deterministic-finalized and the producer was the lone outlier).
+                      // Track-1 diff-base-pin: the diff prior is resolved AT the per-checkpoint `diffBaseOrdinal` (4th closure arg) via the
+                      // hoisted `finalizedReaderAt` (fast-path live reader when the ordinal is the current base — the common case — else a
+                      // version-retained pinned reader). The producer passes `diffBaseOrdinalF`'s captured savepoint as that ordinal.
                       derivePerMgState = ShardCheckpointWiring
                         .reExecDerivationWithDiff[F](
                           shardScEventsProcessor,
-                          io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore)
+                          finalizedReaderAt
                         )(
                           Async[F],
                           Parallel[F],
@@ -1816,6 +1841,9 @@ object GlobalSnapshotConsensus {
                           implicitly[io.constellationnetwork.json.JsonSerializer[F]],
                           globalStateProofSelector
                         ),
+                      // Track-1 diff-base-pin ATOMIC SAVEPOINT: the finalized base ordinal the producer stamps + cuts every per-MG diff over.
+                      diffBaseOrdinalF =
+                        mptStore.lastPersistedOrdinal.map(_.getOrElse(io.constellationnetwork.schema.SnapshotOrdinal.MinValue)),
                       // Bounded checkpoint pipeline (2026-06-11): gl0's adopted-watermark from the acceptance
                       // manager gates new window production so pending batches while embedding catches up.
                       lastAdoptedOrd = deps.acceptanceManager.lastAdoptedOrd(shardId),

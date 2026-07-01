@@ -320,22 +320,34 @@ object SharedServices {
         // byte-identical.
         reExecuteDerivation = Some {
           implicit val h: Hasher[F] = HasherSelector[F].getCurrent
-          val priorStateReader = io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
-            .fromMptStore[F](storages.mptStore)
+          // Track-1 diff-base-pin: the follower has no CONTIGUOUS k₂ store (its retention is logarithmic), and this degraded-path
+          // sub-quorum re-exec ROOT is base-INDEPENDENT (authoritative-override fields + sync-view excluded from the per-MG root), so read
+          // the LIVE finalized base (ignore the pinned ordinal) — pinning to a historical `diffBaseOrdinal` would MISS on the logarithmic
+          // store and spuriously OMIT/reject. The gl0 rail (contiguous `signedBytesStore`) is the one that pins historically.
+          val liveReaderAt: SnapshotOrdinal => F[Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[F]]] =
+            (_: SnapshotOrdinal) =>
+              Async[F].pure(
+                Some(io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](storages.mptStore))
+              )
           val withDiff =
-            ShardCheckpointWiring.reExecDerivationWithDiff[F](shardScEventsProcessor, priorStateReader)(
+            ShardCheckpointWiring.reExecDerivationWithDiff[F](shardScEventsProcessor, liveReaderAt)(
               Async[F],
               Parallel[F],
               h,
               implicitly[JsonSerializer[F]],
               globalStateProofSelector
             )
-          (mg: Address, binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]], anchor: SnapshotOrdinal) =>
+          (
+            mg: Address,
+            binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+            anchor: SnapshotOrdinal,
+            diffBaseOrdinal: SnapshotOrdinal
+          ) =>
             // OMIT-ON-CAN'T-DERIVE: `reExecDerivationWithDiff` now returns `None` when it cannot derive a real state (it OMITS the MG
             // rather than emit an empty-state sentinel). On the sub-quorum re-exec failover we map that to `Hash.empty` — the same
             // fail-closed sentinel `noReExecDerivation` uses — so a non-derivable MG yields a deterministic mismatch (the degraded
             // checkpoint is rejected, never falsely admitted) rather than a spurious empty-state-root match.
-            withDiff(mg, binaries, anchor).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
+            withDiff(mg, binaries, anchor, diffBaseOrdinal).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
         }
       )(Async[F], HasherSelector[F].getCurrent, implicitly[SecurityProvider[F]], implicitly[Metrics[F]])
       // WATCHTOWER on-chain dispute verdict for the `createContext` GSAM (W3a). gl0 followers re-derive the GSI via `createContext` and must
@@ -346,10 +358,15 @@ object SharedServices {
       createContextInvalidStateProofValidator = shardAcceptanceDeps match {
         case Some(_) =>
           implicit val h: Hasher[F] = HasherSelector[F].getCurrent
-          val priorStateReader = io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
-            .fromMptStore[F](storages.mptStore)
+          // Track-1 diff-base-pin: LIVE base reader (same rationale as `reExecuteDerivation` above — follower has no contiguous k₂ store,
+          // and the re-derived root is base-independent).
+          val liveReaderAt: SnapshotOrdinal => F[Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[F]]] =
+            (_: SnapshotOrdinal) =>
+              Async[F].pure(
+                Some(io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](storages.mptStore))
+              )
           val withDiff =
-            ShardCheckpointWiring.reExecDerivationWithDiff[F](shardScEventsProcessor, priorStateReader)(
+            ShardCheckpointWiring.reExecDerivationWithDiff[F](shardScEventsProcessor, liveReaderAt)(
               Async[F],
               Parallel[F],
               h,
@@ -357,8 +374,13 @@ object SharedServices {
               globalStateProofSelector
             )
           val reDerive =
-            (mg: Address, binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]], anchor: SnapshotOrdinal) =>
-              withDiff(mg, binaries, anchor).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
+            (
+              mg: Address,
+              binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+              anchor: SnapshotOrdinal,
+              diffBaseOrdinal: SnapshotOrdinal
+            ) =>
+              withDiff(mg, binaries, anchor, diffBaseOrdinal).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
           Some(
             io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[F](
               reDerivePerMgRoot = reDerive,

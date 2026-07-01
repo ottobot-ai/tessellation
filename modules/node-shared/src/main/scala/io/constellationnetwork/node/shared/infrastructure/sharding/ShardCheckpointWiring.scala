@@ -146,8 +146,9 @@ object ShardCheckpointWiring {
     *     (the slash penalty is a separate slice, S2.0). So the worst case is "degraded-shard non-quorum checkpoints are not admitted until
     *     quorum returns", never "honest signers slashed".
     */
-  def noReExecDerivation[F[_]: Async]: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash] =
-    (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal) => Async[F].pure(Hash.empty)
+  def noReExecDerivation[F[_]: Async]
+    : (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash] =
+    (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal, _: SnapshotOrdinal) => Async[F].pure(Hash.empty)
 
   /** S3 committee re-execution closure — the SINGLE definition of "re-run this metagraph's derivation and compute its per-MG root", shared
     * by the producer (`ShardCheckpointProducer.derivePerMgState`) and the gl0 verifier
@@ -168,12 +169,14 @@ object ShardCheckpointWiring {
     */
   def reExecDerivation[F[_]: Async: Hasher](
     processor: GlobalSnapshotStateChannelEventsProcessor[F]
-  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash] = {
+  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash] = {
     // Pure-by-construction global-snapshot lookup: NEVER reads storage, so the derivation cannot pick up a node-local view.
     val noGlobalSnapshotLookup: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]] =
       (_: SnapshotOrdinal) => Async[F].pure(Option.empty[Hashed[GlobalIncrementalSnapshot]])
 
-    (mg: Address, binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]], gl0AnchorOrdinal: SnapshotOrdinal) =>
+    // `deriveMetagraphRoot` seeds from an EMPTY prior (not S(N)), so this root is base-INDEPENDENT — the wire-carried `diffBaseOrdinal`
+    // (4th arg) is accepted for signature parity with `reExecDerivationWithDiff` but not read here.
+    (mg: Address, binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]], gl0AnchorOrdinal: SnapshotOrdinal, _: SnapshotOrdinal) =>
       processor.deriveMetagraphRoot(mg, binaries, gl0AnchorOrdinal, noGlobalSnapshotLookup)(Hasher[F])
   }
 
@@ -210,10 +213,15 @@ object ShardCheckpointWiring {
     */
   def reExecDerivationWithDiff[F[_]: Async: Parallel: Hasher: JsonSerializer](
     processor: GlobalSnapshotStateChannelEventsProcessor[F],
-    priorStateReader: GlobalStateReader[F]
+    // Track-1 diff-base-pin: the prior reader is resolved PER CALL at the checkpoint's `diffBaseOrdinal` (the 4th closure arg), NOT fixed
+    // at construction to the node-local live base. This is what makes the producer's diff-prior + derivation-prior and every re-executor's
+    // (committee/watchtower) read the SAME pinned base `S(N)`. `None` ⇒ this node cannot resolve the pinned base (evicted below retention,
+    // or not reached) ⇒ OMIT (defer) rather than derive over a WRONG base. Callers wire the fast-path (live reader when the ordinal is the
+    // current `lastPersistedOrdinal`) + version-retained fallback.
+    priorReaderAt: SnapshotOrdinal => F[Option[GlobalStateReader[F]]]
   )(
     implicit stateProofSelector: StateProofSelector
-  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Option[(Hash, ChangeSet)]] = {
+  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Option[(Hash, ChangeSet)]] = {
     import GlobalStateReaderOps._
     type CurrencyState = Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
 
@@ -237,7 +245,7 @@ object ShardCheckpointWiring {
     /** S(N) for this MG from the adopted best-tip: `Right((priorInc, info))` (has an incremental), `Left(genesis)` (post-genesis
       * pre-first-incremental window), or `None` (never seen by gl0 ⇒ empty prior; the genesis binary in the window seeds it).
       */
-    def priorState(mg: Address): F[Option[CurrencyState]] =
+    def priorState(priorStateReader: GlobalStateReader[F], mg: Address): F[Option[CurrencyState]] =
       priorStateReader.getLastIncrementalCurrencySnapshot(mg).flatMap {
         case Some(inc) =>
           priorStateReader
@@ -254,150 +262,170 @@ object ShardCheckpointWiring {
     def infoOf(state: CurrencyState): CurrencySnapshotInfo =
       state.fold(_.value.info.toCurrencySnapshotInfo, _._2)
 
-    (mg: Address, binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]], gl0AnchorOrdinal: SnapshotOrdinal) =>
-      // The DERIVATION prior is the full S(N) CurrencyState (the genesis `Left` is needed to seed the state fold). The DIFF prior, by
-      // contrast, MUST be what is actually RECONSTRUCTIBLE from the unrolled MPT base the apply side (TaskB) diffs against — i.e.
-      // `getCurrencySnapshotInfo` (gated on the fieldId-5 incremental: `None` at a not-yet-unrolled genesis ⇒ `emptyInfo`). Using the
-      // genesis snapshot's embedded info as the diff prior would desync the apply (the genesis info is NOT in the unrolled `Mg*`
-      // partitions until the first incremental writes it), so the two priors are deliberately resolved by different reads.
-      (priorState(mg), priorStateReader.getCurrencySnapshotInfo(mg)).tupled.flatMap {
-        case (priorOpt, priorInfoOpt) =>
-          val priorInfo: CurrencySnapshotInfo = priorInfoOpt.getOrElse(emptyInfo)
-          val priorMap: SortedMap[Address, CurrencyState] =
-            priorOpt.fold(SortedMap.empty[Address, CurrencyState])(p => SortedMap(mg -> p))
+    (
+      mg: Address,
+      binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+      gl0AnchorOrdinal: SnapshotOrdinal,
+      diffBaseOrdinal: SnapshotOrdinal
+    ) =>
+      // Track-1 diff-base-pin: resolve the prior reader AT `diffBaseOrdinal` (the producer's stamped base, cluster-uniform). A `None`
+      // means this node cannot serve the pinned base (below retention, or not yet reached) — OMIT (defer) rather than seed the derivation
+      // from a WRONG base and attest a root no honest verifier reproduces.
+      priorReaderAt(diffBaseOrdinal).flatMap {
+        case None =>
+          reExecDiagLogger
+            .warn(
+              s"[diff-base-pin] mg=${mg.value.value.take(10)} cannot resolve pinned diff-base ord=${diffBaseOrdinal.value.value} " +
+                s"(evicted/not-reached) — OMIT (defer)"
+            )
+            .as(None: Option[(Hash, ChangeSet)])
+        case Some(priorStateReader) =>
+          // The DERIVATION prior is the full S(N) CurrencyState (the genesis `Left` is needed to seed the state fold). The DIFF prior, by
+          // contrast, MUST be what is actually RECONSTRUCTIBLE from the unrolled MPT base the apply side (TaskB) diffs against — i.e.
+          // `getCurrencySnapshotInfo` (gated on the fieldId-5 incremental: `None` at a not-yet-unrolled genesis ⇒ `emptyInfo`). Using the
+          // genesis snapshot's embedded info as the diff prior would desync the apply (the genesis info is NOT in the unrolled `Mg*`
+          // partitions until the first incremental writes it), so the two priors are deliberately resolved by different reads.
+          (priorState(priorStateReader, mg), priorStateReader.getCurrencySnapshotInfo(mg)).tupled.flatMap {
+            case (priorOpt, priorInfoOpt) =>
+              val priorInfo: CurrencySnapshotInfo = priorInfoOpt.getOrElse(emptyInfo)
+              val priorMap: SortedMap[Address, CurrencyState] =
+                priorOpt.fold(SortedMap.empty[Address, CurrencyState])(p => SortedMap(mg -> p))
 
-          reExecDiagLogger.info(
-            s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} anchor=${gl0AnchorOrdinal.value.value} windowSize=${binaries.size} " +
-              s"priorOpt=${descPrior(priorOpt)} priorInfoOpt=${priorInfoOpt.fold("None")(i => s"Some(bal=${i.balances.size})")}"
-          ) >>
-            // SAME derivation as reExecDerivation (AdoptFromSignedFields, noGlobalSnapshotLookup), but with the S(N) prior instead of empty.
-            // ORDER CONTRACT (mirrors deriveMetagraphRoot): processCurrencySnapshots expects NEWEST-FIRST; checkpoint windows arrive
-            // OLDEST-FIRST (chainLinkOrder unfolds anchor→tip), so reverse here.
-            processor
-              .processCurrencySnapshots(
-                gl0AnchorOrdinal,
-                SortedMap.empty[Address, Balance],
-                priorMap,
-                SortedMap(mg -> binaries.reverse),
-                noGlobalSnapshotLookup,
-                GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode.AdoptFromSignedFields
-              )(Hasher[F])
-              .flatMap { accepted =>
-                // Mirror calculateLastCurrencySnapshots: the LAST resulting state across the re-executed chain is `next`.
-                val lastStateOpt: Option[CurrencyState] =
-                  accepted.get(mg).flatMap { case (pairs, _) => pairs.toList.flatMap(_._2).lastOption }
-                lastStateOpt match {
-                  case Some(next) =>
-                    // CONTIGUITY GATE (I3 / run-27b). The window MUST chain from the FINALIZED base prior. `AdoptFromSignedFields`
-                    // accumulates `next` OVER `priorInfo` (the base, read via `fromMptStore`). The window anchors at the shard chain's
-                    // `bestTip` (`perMgTip`), so for an ACTIVE MG whose adopted checkpoints have not yet finalized (`bestTip > base`),
-                    // the window's binaries chain from `bestTip`, NOT base — folding them onto base silently DROPS the base→bestTip
-                    // events and yields a WRONG `next`. Every gl0 then recomputes the real root over the same base, mismatches the
-                    // attested (wrong) root, and WITHHOLDS the MG ⇒ permanent freeze (run-27b DAG5L1ez). Detect the gap by ordinal: a
-                    // window that chains from base advances `base.ordinal` by EXACTLY `windowSize`. On a gap, OMIT (defer) — base catches
-                    // up when the in-flight checkpoints finalize, then the next checkpoint covers `base→latest` in ONE contiguous burst
-                    // and the MG self-heals (mirror stays current: gl0 adopts the burst to `latest`). Genesis priors (`Left`/`None`) are
-                    // seeded by the window itself, so the gate only constrains an incremental (`Right`) base. Deterministic: base + the
-                    // signed window are identical on every committee member, so the OMIT decision is cluster-uniform.
-                    val contiguousWithBase: Boolean = (priorOpt, next) match {
-                      case (Some(Right((priorInc, _))), Right((nextInc, _))) =>
-                        nextInc.value.ordinal.value.value === priorInc.value.ordinal.value.value + binaries.size.toLong
-                      case _ => true
+              reExecDiagLogger.info(
+                s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} anchor=${gl0AnchorOrdinal.value.value} windowSize=${binaries.size} " +
+                  s"priorOpt=${descPrior(priorOpt)} priorInfoOpt=${priorInfoOpt.fold("None")(i => s"Some(bal=${i.balances.size})")}"
+              ) >>
+                // SAME derivation as reExecDerivation (AdoptFromSignedFields, noGlobalSnapshotLookup), but with the S(N) prior instead of empty.
+                // ORDER CONTRACT (mirrors deriveMetagraphRoot): processCurrencySnapshots expects NEWEST-FIRST; checkpoint windows arrive
+                // OLDEST-FIRST (chainLinkOrder unfolds anchor→tip), so reverse here.
+                processor
+                  .processCurrencySnapshots(
+                    gl0AnchorOrdinal,
+                    SortedMap.empty[Address, Balance],
+                    priorMap,
+                    SortedMap(mg -> binaries.reverse),
+                    noGlobalSnapshotLookup,
+                    GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode.AdoptFromSignedFields
+                  )(Hasher[F])
+                  .flatMap { accepted =>
+                    // Mirror calculateLastCurrencySnapshots: the LAST resulting state across the re-executed chain is `next`.
+                    val lastStateOpt: Option[CurrencyState] =
+                      accepted.get(mg).flatMap { case (pairs, _) => pairs.toList.flatMap(_._2).lastOption }
+                    lastStateOpt match {
+                      case Some(next) =>
+                        // CONTIGUITY GATE (I3 / run-27b). The window MUST chain from the FINALIZED base prior. `AdoptFromSignedFields`
+                        // accumulates `next` OVER `priorInfo` (the base, read via `fromMptStore`). The window anchors at the shard chain's
+                        // `bestTip` (`perMgTip`), so for an ACTIVE MG whose adopted checkpoints have not yet finalized (`bestTip > base`),
+                        // the window's binaries chain from `bestTip`, NOT base — folding them onto base silently DROPS the base→bestTip
+                        // events and yields a WRONG `next`. Every gl0 then recomputes the real root over the same base, mismatches the
+                        // attested (wrong) root, and WITHHOLDS the MG ⇒ permanent freeze (run-27b DAG5L1ez). Detect the gap by ordinal: a
+                        // window that chains from base advances `base.ordinal` by EXACTLY `windowSize`. On a gap, OMIT (defer) — base catches
+                        // up when the in-flight checkpoints finalize, then the next checkpoint covers `base→latest` in ONE contiguous burst
+                        // and the MG self-heals (mirror stays current: gl0 adopts the burst to `latest`). Genesis priors (`Left`/`None`) are
+                        // seeded by the window itself, so the gate only constrains an incremental (`Right`) base. Deterministic: base + the
+                        // signed window are identical on every committee member, so the OMIT decision is cluster-uniform.
+                        val contiguousWithBase: Boolean = (priorOpt, next) match {
+                          case (Some(Right((priorInc, _))), Right((nextInc, _))) =>
+                            nextInc.value.ordinal.value.value === priorInc.value.ordinal.value.value + binaries.size.toLong
+                          case _ => true
+                        }
+                        if (!contiguousWithBase)
+                          reExecDiagLogger
+                            .warn(
+                              s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} window NOT contiguous with finalized base " +
+                                s"(${descPrior(priorOpt)} windowSize=${binaries.size} nextOrd=${next.toOption
+                                    .map(_._1.value.ordinal.value.value)
+                                    .getOrElse(-1L)}) — bestTip>base, OMIT (defer until base finalizes)"
+                            )
+                            .as(None: Option[(Hash, ChangeSet)])
+                        else {
+                          // AUTHORITATIVE BALANCES (committee-state-diff / data-with-fee fix). The metagraph pushes its OWN cumulative
+                          // balance map on the signed incremental (`CurrencyIncrementalSnapshot.authoritativeBalances`) — the exact map its
+                          // `stateProof.balancesProof` is hashed over. gl0's re-exec derivation (`infoOf(next)`) cannot reproduce that map
+                          // for a path-dependent metagraph (fee/token-lock/spend effects over a base gl0 never executed), so for the SHARDED
+                          // adopt path we OVERRIDE the derived `balances` with the metagraph's authoritative map BEFORE computing both the
+                          // attested per-MG root and the committee diff. The DESERIALIZED incremental is in `next` (the `Right._1`); read it
+                          // there, NOT by re-parsing `binaries.head` (those are serialized `StateChannelSnapshotBinary`). Genesis (`Left`)
+                          // carries no `authoritativeBalances` ⇒ `next` is left as-is (its `infoOf` reads the genesis embedded balances).
+                          // gl0's apply side then re-verifies hash(authoritativeBalances) === the metagraph-signed `balancesProof` before
+                          // committing (GAP-1 verify-by-proof in `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`).
+                          val authBal: Option[SortedMap[Address, Balance]] = next.toOption.flatMap(_._1.value.authoritativeBalances)
+                          // Active-allow-spend / active-token-lock authoritative maps (committee-state-diff follow-up): same anchor as balances,
+                          // but Option-shaped, so OVERRIDE only when the metagraph pushed a value (`orElse` falls back to the derived set when
+                          // the metagraph carried `None`). Reduced by cross-shard spends gl0 cannot replay, so the derived set would be stale.
+                          val authAS: Option[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
+                            next.toOption.flatMap(_._1.value.authoritativeActiveAllowSpends)
+                          val authTL: Option[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
+                            next.toOption.flatMap(_._1.value.authoritativeActiveTokenLocks)
+                          // Authoritative cumulative last-tx-refs (committee-state-diff / cl1-lastRef-freeze fix): same anchor as balances. The
+                          // re-exec `infoOf(next)` rebuilds a per-incremental ref set that diverges from the metagraph's CUMULATIVE map, so OVERRIDE
+                          // it on BOTH the attested root and the diff — keeping the committee producer and the gl0 adopt side byte-identical.
+                          val authTxRefs: Option[SortedMap[Address, TransactionReference]] =
+                            next.toOption.flatMap(_._1.value.authoritativeLastTxRefs)
+                          // The OTHER authoritative cumulative ref-maps (lastFeeTxRefs / lastAllowSpendRefs / lastTokenLockRefs / lastMessages):
+                          // same anchor as lastTxRefs. OVERRIDE each on BOTH the attested root and the diff so the producer and the gl0 adopt side
+                          // commit byte-identical per-MG roots regardless of base lag.
+                          val authFeeTxRefs: Option[SortedMap[Address, TransactionReference]] =
+                            next.toOption.flatMap(_._1.value.authoritativeLastFeeTxRefs)
+                          val authAllowSpendRefs: Option[SortedMap[Address, AllowSpendReference]] =
+                            next.toOption.flatMap(_._1.value.authoritativeLastAllowSpendRefs)
+                          val authTokenLockRefs: Option[SortedMap[Address, TokenLockReference]] =
+                            next.toOption.flatMap(_._1.value.authoritativeLastTokenLockRefs)
+                          val authMessages: Option[SortedMap[MessageType, Signed[CurrencyMessage]]] =
+                            next.toOption.flatMap(_._1.value.authoritativeLastMessages)
+                          val nextInfo: CurrencySnapshotInfo = infoOf(next).copy(
+                            balances = authBal.getOrElse(infoOf(next).balances),
+                            activeAllowSpends = authAS.orElse(infoOf(next).activeAllowSpends),
+                            activeTokenLocks = authTL.orElse(infoOf(next).activeTokenLocks),
+                            lastTxRefs = authTxRefs.getOrElse(infoOf(next).lastTxRefs),
+                            lastFeeTxRefs = authFeeTxRefs.orElse(infoOf(next).lastFeeTxRefs),
+                            lastAllowSpendRefs = authAllowSpendRefs.orElse(infoOf(next).lastAllowSpendRefs),
+                            lastTokenLockRefs = authTokenLockRefs.orElse(infoOf(next).lastTokenLockRefs),
+                            lastMessages = authMessages.orElse(infoOf(next).lastMessages)
+                          )
+                          // Carry the authoritative balances on BOTH the attested root and the diff (consistency): build a `next` whose info
+                          // half has `balances = authBal` so the per-MG root commits to the authoritative map, matching the diff.
+                          val nextAuth: CurrencyState = next.map { case (inc, _) => (inc, nextInfo) }
+                          for {
+                            // PIN-1: COMPONENT-ADDRESSABLE per-MG root — the rootHash of the MG sub-trie over the fieldId-5 incremental + the
+                            // `infoSubFields` `Mg*` entries (one leaf per account), via the shared `currencySnapshotMgRoot`. REPLACES the old flat
+                            // `hash((incrementalRoot, infoRoot))` so a single-field/single-account inclusion proof verifies against it
+                            // (ShardSubtreeProofService). The gl0 follower recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply
+                            // state — all three PIN-1 sites route through that one helper, so the bytes are identical by construction.
+                            root <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> nextAuth))
+                            // DIAG: committee's attested per-sub-field root breakdown — match `root=` here to gl0's
+                            // `[ACCEPTANCE/ADOPT-VERIFY] attested=` line to pin the diverging half (inc vs info) + `Mg*` sub-field.
+                            cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> nextAuth))
+                            _ <- reExecDiagLogger.info(
+                              s"[REEXEC-FIELDS] mg=${mg.value.value.take(10)} root=${root.value.take(16)} $cmtDiag"
+                            )
+                            diff <- ChangeSet.currencyInfoChangeSet[F](mg, priorInfo, nextInfo)
+                          } yield Some((root, diff)): Option[(Hash, ChangeSet)]
+                        }
+                      case None =>
+                        // OMIT-ON-CAN'T-DERIVE (2026-06-13). The derivation produced NO state — the genesis-bootstrap race: this MG's
+                        // genesis was already consumed by an earlier shard checkpoint (perMgTip advanced past it) BUT this producer node's
+                        // best-tip prior reader has not yet seen gl0 ADOPT that genesis (the ~6-min embed/quorum warmup), so `priorOpt=None`
+                        // AND the window head is a non-genesis incremental → `processCurrencySnapshots`'s AdoptFromSignedFields genesis-window
+                        // guard drops the window. We must NOT commit an empty-state root + empty diff: once committee-quorumed that
+                        // "couldn't-derive" sentinel is a PERMANENT lie — every gl0 later recomputes the real non-empty root from its
+                        // now-adopted S(N), mismatches the attested empty sentinel forever, and drops the MG's currency advance (the run-26
+                        // freeze). Instead OMIT this MG: its binaries stay pending, `perMgTip` does not advance, and it re-derives correctly
+                        // on a later checkpoint once the prior is adopted (the pipeline self-heals).
+                        reExecDiagLogger
+                          .warn(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} lastStateOpt=None — OMIT (defer until prior adopted)")
+                          .as(None: Option[(Hash, ChangeSet)])
                     }
-                    if (!contiguousWithBase)
-                      reExecDiagLogger
-                        .warn(
-                          s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} window NOT contiguous with finalized base " +
-                            s"(${descPrior(priorOpt)} windowSize=${binaries.size} nextOrd=${next.toOption
-                                .map(_._1.value.ordinal.value.value)
-                                .getOrElse(-1L)}) — bestTip>base, OMIT (defer until base finalizes)"
-                        )
-                        .as(None: Option[(Hash, ChangeSet)])
-                    else {
-                      // AUTHORITATIVE BALANCES (committee-state-diff / data-with-fee fix). The metagraph pushes its OWN cumulative
-                      // balance map on the signed incremental (`CurrencyIncrementalSnapshot.authoritativeBalances`) — the exact map its
-                      // `stateProof.balancesProof` is hashed over. gl0's re-exec derivation (`infoOf(next)`) cannot reproduce that map
-                      // for a path-dependent metagraph (fee/token-lock/spend effects over a base gl0 never executed), so for the SHARDED
-                      // adopt path we OVERRIDE the derived `balances` with the metagraph's authoritative map BEFORE computing both the
-                      // attested per-MG root and the committee diff. The DESERIALIZED incremental is in `next` (the `Right._1`); read it
-                      // there, NOT by re-parsing `binaries.head` (those are serialized `StateChannelSnapshotBinary`). Genesis (`Left`)
-                      // carries no `authoritativeBalances` ⇒ `next` is left as-is (its `infoOf` reads the genesis embedded balances).
-                      // gl0's apply side then re-verifies hash(authoritativeBalances) === the metagraph-signed `balancesProof` before
-                      // committing (GAP-1 verify-by-proof in `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`).
-                      val authBal: Option[SortedMap[Address, Balance]] = next.toOption.flatMap(_._1.value.authoritativeBalances)
-                      // Active-allow-spend / active-token-lock authoritative maps (committee-state-diff follow-up): same anchor as balances,
-                      // but Option-shaped, so OVERRIDE only when the metagraph pushed a value (`orElse` falls back to the derived set when
-                      // the metagraph carried `None`). Reduced by cross-shard spends gl0 cannot replay, so the derived set would be stale.
-                      val authAS: Option[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
-                        next.toOption.flatMap(_._1.value.authoritativeActiveAllowSpends)
-                      val authTL: Option[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
-                        next.toOption.flatMap(_._1.value.authoritativeActiveTokenLocks)
-                      // Authoritative cumulative last-tx-refs (committee-state-diff / cl1-lastRef-freeze fix): same anchor as balances. The
-                      // re-exec `infoOf(next)` rebuilds a per-incremental ref set that diverges from the metagraph's CUMULATIVE map, so OVERRIDE
-                      // it on BOTH the attested root and the diff — keeping the committee producer and the gl0 adopt side byte-identical.
-                      val authTxRefs: Option[SortedMap[Address, TransactionReference]] =
-                        next.toOption.flatMap(_._1.value.authoritativeLastTxRefs)
-                      // The OTHER authoritative cumulative ref-maps (lastFeeTxRefs / lastAllowSpendRefs / lastTokenLockRefs / lastMessages):
-                      // same anchor as lastTxRefs. OVERRIDE each on BOTH the attested root and the diff so the producer and the gl0 adopt side
-                      // commit byte-identical per-MG roots regardless of base lag.
-                      val authFeeTxRefs: Option[SortedMap[Address, TransactionReference]] =
-                        next.toOption.flatMap(_._1.value.authoritativeLastFeeTxRefs)
-                      val authAllowSpendRefs: Option[SortedMap[Address, AllowSpendReference]] =
-                        next.toOption.flatMap(_._1.value.authoritativeLastAllowSpendRefs)
-                      val authTokenLockRefs: Option[SortedMap[Address, TokenLockReference]] =
-                        next.toOption.flatMap(_._1.value.authoritativeLastTokenLockRefs)
-                      val authMessages: Option[SortedMap[MessageType, Signed[CurrencyMessage]]] =
-                        next.toOption.flatMap(_._1.value.authoritativeLastMessages)
-                      val nextInfo: CurrencySnapshotInfo = infoOf(next).copy(
-                        balances = authBal.getOrElse(infoOf(next).balances),
-                        activeAllowSpends = authAS.orElse(infoOf(next).activeAllowSpends),
-                        activeTokenLocks = authTL.orElse(infoOf(next).activeTokenLocks),
-                        lastTxRefs = authTxRefs.getOrElse(infoOf(next).lastTxRefs),
-                        lastFeeTxRefs = authFeeTxRefs.orElse(infoOf(next).lastFeeTxRefs),
-                        lastAllowSpendRefs = authAllowSpendRefs.orElse(infoOf(next).lastAllowSpendRefs),
-                        lastTokenLockRefs = authTokenLockRefs.orElse(infoOf(next).lastTokenLockRefs),
-                        lastMessages = authMessages.orElse(infoOf(next).lastMessages)
-                      )
-                      // Carry the authoritative balances on BOTH the attested root and the diff (consistency): build a `next` whose info
-                      // half has `balances = authBal` so the per-MG root commits to the authoritative map, matching the diff.
-                      val nextAuth: CurrencyState = next.map { case (inc, _) => (inc, nextInfo) }
-                      for {
-                        // PIN-1: COMPONENT-ADDRESSABLE per-MG root — the rootHash of the MG sub-trie over the fieldId-5 incremental + the
-                        // `infoSubFields` `Mg*` entries (one leaf per account), via the shared `currencySnapshotMgRoot`. REPLACES the old flat
-                        // `hash((incrementalRoot, infoRoot))` so a single-field/single-account inclusion proof verifies against it
-                        // (ShardSubtreeProofService). The gl0 follower recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply
-                        // state — all three PIN-1 sites route through that one helper, so the bytes are identical by construction.
-                        root <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> nextAuth))
-                        // DIAG: committee's attested per-sub-field root breakdown — match `root=` here to gl0's
-                        // `[ACCEPTANCE/ADOPT-VERIFY] attested=` line to pin the diverging half (inc vs info) + `Mg*` sub-field.
-                        cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> nextAuth))
-                        _ <- reExecDiagLogger.info(s"[REEXEC-FIELDS] mg=${mg.value.value.take(10)} root=${root.value.take(16)} $cmtDiag")
-                        diff <- ChangeSet.currencyInfoChangeSet[F](mg, priorInfo, nextInfo)
-                      } yield Some((root, diff)): Option[(Hash, ChangeSet)]
-                    }
-                  case None =>
-                    // OMIT-ON-CAN'T-DERIVE (2026-06-13). The derivation produced NO state — the genesis-bootstrap race: this MG's
-                    // genesis was already consumed by an earlier shard checkpoint (perMgTip advanced past it) BUT this producer node's
-                    // best-tip prior reader has not yet seen gl0 ADOPT that genesis (the ~6-min embed/quorum warmup), so `priorOpt=None`
-                    // AND the window head is a non-genesis incremental → `processCurrencySnapshots`'s AdoptFromSignedFields genesis-window
-                    // guard drops the window. We must NOT commit an empty-state root + empty diff: once committee-quorumed that
-                    // "couldn't-derive" sentinel is a PERMANENT lie — every gl0 later recomputes the real non-empty root from its
-                    // now-adopted S(N), mismatches the attested empty sentinel forever, and drops the MG's currency advance (the run-26
-                    // freeze). Instead OMIT this MG: its binaries stay pending, `perMgTip` does not advance, and it re-derives correctly
-                    // on a later checkpoint once the prior is adopted (the pipeline self-heals).
+                  }
+                  .handleErrorWith { e =>
+                    // A derivation crash is likewise NOT a committable state — OMIT this MG (defer) rather than attest an empty-state root
+                    // every verifier would mismatch. The MG re-derives cleanly on a later checkpoint over the same chain.
                     reExecDiagLogger
-                      .warn(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} lastStateOpt=None — OMIT (defer until prior adopted)")
+                      .warn(e)(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} DERIVATION CRASH → OMIT (defer)")
                       .as(None: Option[(Hash, ChangeSet)])
-                }
-              }
-              .handleErrorWith { e =>
-                // A derivation crash is likewise NOT a committable state — OMIT this MG (defer) rather than attest an empty-state root
-                // every verifier would mismatch. The MG re-derives cleanly on a later checkpoint over the same chain.
-                reExecDiagLogger
-                  .warn(e)(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} DERIVATION CRASH → OMIT (defer)")
-                  .as(None: Option[(Hash, ChangeSet)])
-              }
-      }
+                  }
+          }
+      } // close priorReaderAt(diffBaseOrdinal).flatMap
   }
 
   /** Build the acceptance-side sharding dependencies, gated on `cfg.numShards > 1`.
@@ -450,10 +478,12 @@ object ShardCheckpointWiring {
     vrfRegistry: VrfRegistry[F],
     activeValidators: F[Set[PeerId]],
     etaForEpoch: EtaPeriod => F[Array[Byte]],
-    reExecuteDerivation: Option[(Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash]] = None
+    reExecuteDerivation: Option[
+      (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash]
+    ] = None
   ): F[Option[AcceptanceDeps[F]]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointWiring")
-    val reExec: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash] =
+    val reExec: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash] =
       reExecuteDerivation.getOrElse(noReExecDerivation[F])
 
     if (cfg.numShards <= 1)

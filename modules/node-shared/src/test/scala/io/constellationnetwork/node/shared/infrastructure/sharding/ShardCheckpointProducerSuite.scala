@@ -214,9 +214,10 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
   private def deterministicDerive(
     mg: Address,
     snaps: NonEmptyList[Signed[StateChannelSnapshotBinary]],
-    anchor: SnapshotOrdinal
+    anchor: SnapshotOrdinal,
+    diffBase: SnapshotOrdinal
   ): IO[Option[(Hash, ChangeSet)]] = {
-    val _ = anchor
+    val _ = (anchor, diffBase)
     IO.pure(Some((hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}"), ChangeSet.empty)))
   }
 
@@ -225,8 +226,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     */
   private def recordingDerive(
     seen: cats.effect.kernel.Ref[IO, List[Address]]
-  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Option[(Hash, ChangeSet)]] =
-    (mg, snaps, anchor) => seen.update(_ :+ mg) >> deterministicDerive(mg, snaps, anchor)
+  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[(Hash, ChangeSet)]] =
+    (mg, snaps, anchor, diffBase) => seen.update(_ :+ mg) >> deterministicDerive(mg, snaps, anchor, diffBase)
 
   // Simple slot mapping: 1 slot per gl0 ord. Matches the e2e default cadence in spirit (slot-cadence is per-shard config; for tests,
   // identity-ish keeps the slot value bounded so the LDD ramp parameters are predictable).
@@ -269,7 +270,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     rig: TestRig,
     sigma: Ratio,
     shardEta: Array[Byte],
-    derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Option[(Hash, ChangeSet)]] =
+    derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[(Hash, ChangeSet)]] =
       deterministicDerive,
     republishEveryTicks: Int = 1,
     // S2: the finalized-base per-MG window anchor. `None` ⇒ the shard's `perMgTip` (so the pre-S2 cases keep their perMgTip-anchored
@@ -302,6 +303,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         slotGapFor = slotGapFor,
         staircaseDeltaSlots = 5,
         derivePerMgState = derive,
+        diffBaseOrdinalF = cats.effect.IO.pure(SnapshotOrdinal.MinValue),
         lastAdoptedOrd = cats.effect.IO.pure(None),
         pipelineDepth = Int.MaxValue,
         republishEveryTicks = republishEveryTicks
@@ -639,8 +641,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         rigA,
         Ratio.One,
         shardEta,
-        derive =
-          (mg, snaps, anchor) => if (mg == omittedMg) IO.pure(None: Option[(Hash, ChangeSet)]) else deterministicDerive(mg, snaps, anchor)
+        derive = (mg, snaps, anchor, diffBase) =>
+          if (mg == omittedMg) IO.pure(None: Option[(Hash, ChangeSet)]) else deterministicDerive(mg, snaps, anchor, diffBase)
       )
       deferred <- tryProduceUntilSome(
         producerDefer,

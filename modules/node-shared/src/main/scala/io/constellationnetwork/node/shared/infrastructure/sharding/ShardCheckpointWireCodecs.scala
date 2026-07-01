@@ -260,7 +260,10 @@ object ShardCheckpointWireCodecs {
         derivedStateDelta = Some(derivedDelta),
         committeeSignatures = cp.committeeSignatures.toList.map(committeeSignatureToWire),
         emittedReceiptsJson = receiptsJson,
-        slot = cp.slot.value.value
+        slot = cp.slot.value.value,
+        // Track-1 diff-base-pin: the finalized ordinal the committee cut the byte-diff over. In the V2 signing preimage, so it MUST
+        // round-trip byte-faithfully or the receiver's `signingPreimage` hash (and every committee-sig verify) diverges.
+        diffBaseOrdinal = cp.diffBaseOrdinal.value.value
       )
 
   def shardCheckpointFromWire[F[_]: Async: JsonSerializer](
@@ -316,7 +319,10 @@ object ShardCheckpointWireCodecs {
             derivedStateDelta = delta,
             emittedReceipts = receipts,
             committeeSignatures = sigsNel,
-            epoch = EtaPeriod(w.epoch)
+            epoch = EtaPeriod(w.epoch),
+            // Track-1 diff-base-pin (wire field 11). A negative uint64 (> Long.MAX) is not a valid ordinal ⇒ fall back to MinValue (the
+            // pre-sharding regression-bar default); the signing-preimage hash verify downstream rejects any genuinely wrong value.
+            diffBaseOrdinal = NonNegLong.from(w.diffBaseOrdinal).toOption.map(SnapshotOrdinal(_)).getOrElse(SnapshotOrdinal.MinValue)
           )
     }
   }

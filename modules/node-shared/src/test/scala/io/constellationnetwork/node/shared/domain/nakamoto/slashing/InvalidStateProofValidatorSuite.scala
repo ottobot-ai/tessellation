@@ -130,8 +130,8 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       implicit val sp: SecurityProvider[IO] = sp0
       val cp = mkCheckpoint(attested, nSigners = 6)
       // reDerive returns a DIFFERENT root than attested ⇒ committee deviated ⇒ upheld.
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] =
-        (_, _, _) => IO.pure(honestDifferent)
+      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
+        (_, _, _, _) => IO.pure(honestDifferent)
       val validator = InvalidStateProofValidator.make[IO](reDerive, InvalidStateProofSlashedReader.neverSlashed[IO])
       for {
         (kp, pid) <- challengerSetup
@@ -149,8 +149,8 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       val cp = mkCheckpoint(attested, nSigners = 6)
       // Honest re-derivation REPRODUCES the attested root ⇒ committee did NOT deviate. The challenger still CLAIMS a different
       // root (honestDifferent) in the envelope — the verdict must ignore that claim and recompute ⇒ NOT upheld.
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] =
-        (_, _, _) => IO.pure(attested)
+      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
+        (_, _, _, _) => IO.pure(attested)
       val validator = InvalidStateProofValidator.make[IO](reDerive, InvalidStateProofSlashedReader.neverSlashed[IO])
       for {
         (kp, pid) <- challengerSetup
@@ -164,8 +164,8 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       implicit val h: Hasher[IO] = h0
       implicit val sp: SecurityProvider[IO] = sp0
       val cp = mkCheckpoint(attested, nSigners = 6)
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] =
-        (_, _, _) => IO.pure(honestDifferent)
+      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
+        (_, _, _, _) => IO.pure(honestDifferent)
       val validator = InvalidStateProofValidator.make[IO](reDerive, InvalidStateProofSlashedReader.neverSlashed[IO])
       for {
         (kp, pid) <- challengerSetup
@@ -180,8 +180,8 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       implicit val h: Hasher[IO] = h0
       implicit val sp: SecurityProvider[IO] = sp0
       val cp = mkCheckpoint(attested, nSigners = 6)
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] =
-        (_, _, _) => IO.pure(honestDifferent)
+      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
+        (_, _, _, _) => IO.pure(honestDifferent)
       val validator = InvalidStateProofValidator.make[IO](reDerive, InvalidStateProofSlashedReader.neverSlashed[IO])
       for {
         (kp, pid) <- challengerSetup
@@ -197,8 +197,8 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       implicit val h: Hasher[IO] = h0
       implicit val sp: SecurityProvider[IO] = sp0
       val cp = mkCheckpoint(attested, nSigners = 6)
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] =
-        (_, _, _) => IO.pure(honestDifferent)
+      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
+        (_, _, _, _) => IO.pure(honestDifferent)
       val validator = InvalidStateProofValidator.make[IO](reDerive, InvalidStateProofSlashedReader.neverSlashed[IO])
       for {
         (kp, pid) <- challengerSetup
@@ -218,8 +218,8 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       implicit val h: Hasher[IO] = h0
       implicit val sp: SecurityProvider[IO] = sp0
       val cp = mkCheckpoint(attested, nSigners = 6)
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => IO[Hash] =
-        (_, _, _) => IO.pure(honestDifferent)
+      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
+        (_, _, _, _) => IO.pure(honestDifferent)
       for {
         (kp, pid) <- challengerSetup
         ev <- mkEvidence(cp, kp, pid, claimed = attested, challengerRoot = honestDifferent)

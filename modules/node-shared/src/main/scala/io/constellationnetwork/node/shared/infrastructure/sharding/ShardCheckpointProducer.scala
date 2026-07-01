@@ -336,7 +336,21 @@ object ShardCheckpointProducer {
     shardEtaFor: EtaPeriod => F[Array[Byte]],
     staircaseDeltaSlots: Int,
     slotGapFor: (Slot, Option[Slot]) => Long,
-    derivePerMgState: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Option[(Hash, ChangeSet)]],
+    derivePerMgState: (
+      Address,
+      NonEmptyList[Signed[StateChannelSnapshotBinary]],
+      SnapshotOrdinal,
+      SnapshotOrdinal
+    ) => F[Option[(Hash, ChangeSet)]],
+    /** '''Track-1 diff-base-pin — the atomic savepoint source.''' Reads the gl0 finalized base's `mptStore.lastPersistedOrdinal` (defaulted
+      * to [[io.constellationnetwork.schema.SnapshotOrdinal.MinValue]] before any finalization). Captured ONCE at the top of `produceInner`,
+      * threaded into every per-MG [[derivePerMgState]] (as its 4th arg — the pinned diff base), and stamped into
+      * [[io.constellationnetwork.schema.sharding.ShardCheckpoint.diffBaseOrdinal]]. After the derivation, `produceInner` re-reads this and
+      * DEFERS (mints nothing) if the base folded forward mid-derivation — so the stamped `diffBaseOrdinal` is guaranteed to name the exact
+      * base the diff was cut over (adopters that read at that ordinal reconstruct the byte-identical prior; a stale stamp would fail-close
+      * them). Tests wire `Async[F].pure(SnapshotOrdinal.MinValue)` (the diff base is irrelevant to producer-plumbing coverage).
+      */
+    diffBaseOrdinalF: F[SnapshotOrdinal],
     /** Bounded checkpoint pipeline (2026-06-11, run bpc2yyegf): highest shard ordinal gl0 has ADOPTED for this shard on this node (the
       * acceptance manager's watermark). Production POLICY input only — never a validity condition.
       */
@@ -466,7 +480,10 @@ object ShardCheckpointProducer {
         epoch: EtaPeriod,
         currentSlot: Slot,
         committee: Set[PeerId]
-      ): F[Option[Signed[ShardCheckpoint]]] = {
+      ): F[Option[Signed[ShardCheckpoint]]] = diffBaseOrdinalF.flatMap { diffBaseOrdinal =>
+        // Track-1 diff-base-pin ATOMIC SAVEPOINT: capture the gl0 finalized base ordinal ONCE here, thread it into every per-MG
+        // `derivePerMgState` (so all diffs are cut over THIS exact base), stamp it on the checkpoint, and re-check it after the derivation
+        // (below) — deferring if the base folded forward mid-produce so the stamp can never name a base the diff was not cut over.
         val parentHash: Hash = bestTipOpt.map(_.hash).getOrElse(Hash.empty)
         val parentOrd: ShardOrdinal = bestTipOpt.map(_.signed.value.shardOrdinal).getOrElse(ShardOrdinal.Genesis)
         // Parent slot = the parent envelope's WIRE slot (design §5.7, owner-corrected 2026-06-11): the lottery clock is the
@@ -553,54 +570,72 @@ object ShardCheckpointProducer {
                   else
                     slotLeader.membershipProof(selfVrfSk, shardEta, currentSlot).flatMap { vrfProof =>
                       // On duty — build the checkpoint, sign it, publish it.
-                      assembleDelta(orderedSnapshots, gl0AnchorOrdinal, parentHash).flatMap {
+                      assembleDelta(orderedSnapshots, gl0AnchorOrdinal, parentHash, diffBaseOrdinal).flatMap {
                         case None =>
                           // assembleDelta already logged the omit-defer reason; mint NOTHING this round.
                           (None: Option[Signed[ShardCheckpoint]]).pure[F]
                         case Some((delta, emittedReceipts)) =>
-                          val checkpoint = ShardCheckpoint(
-                            shardId = shardId,
-                            parentCheckpointHash = parentHash,
-                            shardOrdinal = nextShardOrdinal,
-                            gl0AnchorOrdinal = gl0AnchorOrdinal,
-                            slot = currentSlot,
-                            derivedStateDelta = delta,
-                            emittedReceipts = emittedReceipts,
-                            // Placeholder — populated below by replacing with the real committee-member sig. NonEmptyList requires at
-                            // least one element to construct; we use a throwaway sentinel and overwrite in `.copy(...)`. Cleaner than
-                            // threading the signing into the case-class constructor.
-                            committeeSignatures = NonEmptyList.of(placeholderSig),
-                            epoch = epoch
-                          )
-                          for {
-                            // Compute the canonical preimage hash via Hasher[F]. This is the bytes every committee member signs (§3.3).
-                            preimageHash <- Hasher[F].hash(checkpoint.signingPreimage)
-                            // Sign with Ed25519 long-term + KES product. Both sign the canonical preimage hash's UTF-8 bytes (`getBytes`
-                            // matches `MetagraphCommitteeGate.messageBytes` — Hasher result's UTF-8 byte form is what other sign paths use).
-                            msgBytes = preimageHash.getBytes
-                            edSig <- Signing.signData[F](msgBytes)(selfKeyPair.getPrivate)
-                            kesStep <- kesSigner.currentPeriod
-                            kesSig <- kesSigner.signAt(kesStep, msgBytes)
-                            committeeSig = CommitteeMemberSignature(
-                              peerId = selfPeerId,
-                              vrfProof = Hex.fromBytes(vrfProof),
-                              ed25519Sig = Hex.fromBytes(edSig),
-                              kesProductSig = Hex.fromBytes(kesSig),
-                              kesTreeStep = kesStep
-                            )
-                            finalCheckpoint = checkpoint.copy(committeeSignatures = NonEmptyList.of(committeeSig))
-                            // Wrap in Signed envelope. The outer Signed contract uses the operator's long-term Ed25519 signature over the
-                            // envelope's value bytes; this is the canonical "this operator authored this message" attestation that gl0 and
-                            // other peers use to authenticate the gossip path. Mirrors how `GlobalIncrementalSnapshot` is signed.
-                            proof <- SignatureProof.fromHash(selfKeyPair, preimageHash)
-                            signedCheckpoint = Signed(finalCheckpoint, NonEmptySet.of(proof))
-                            _ <- publisher.publish(signedCheckpoint)
-                            _ <- logger.info(
-                              s"produce: emitted shardOrdinal=${nextShardOrdinal.value} gl0Anchor=${gl0AnchorOrdinal.value.value} " +
-                                s"slot=${currentSlot.value.value} mgs=${orderedSnapshots.keys.size} " +
-                                s"crossShardReceipts=${emittedReceipts.size} kesStep=$kesStep"
-                            )
-                          } yield Some(signedCheckpoint): Option[Signed[ShardCheckpoint]]
+                          // Track-1 diff-base-pin ATOMICITY GUARD: re-read the finalized base. If it folded forward while the per-MG diffs
+                          // were being cut, the diffs are over `diffBaseOrdinal` but the store now reflects a LATER base — minting a
+                          // checkpoint stamped `diffBaseOrdinal` would be honest, BUT the derivation `priorReaderAt(diffBaseOrdinal)` may
+                          // have observed the moved base (the producer wires a live reader), so the two could disagree. DEFER (mint nothing)
+                          // — a single-leader whether-to-mint decision, no split/determinism risk; the next slot re-attempts on a stable base.
+                          diffBaseOrdinalF.flatMap { afterOrd =>
+                            if (afterOrd =!= diffBaseOrdinal)
+                              logger
+                                .info(
+                                  s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=diff-base-moved " +
+                                    s"(${diffBaseOrdinal.value.value} -> ${afterOrd.value.value}); defer to next slot"
+                                )
+                                .as(None: Option[Signed[ShardCheckpoint]])
+                            else {
+                              val checkpoint = ShardCheckpoint(
+                                shardId = shardId,
+                                parentCheckpointHash = parentHash,
+                                shardOrdinal = nextShardOrdinal,
+                                gl0AnchorOrdinal = gl0AnchorOrdinal,
+                                slot = currentSlot,
+                                derivedStateDelta = delta,
+                                emittedReceipts = emittedReceipts,
+                                // Placeholder — populated below by replacing with the real committee-member sig. NonEmptyList requires at
+                                // least one element to construct; we use a throwaway sentinel and overwrite in `.copy(...)`. Cleaner than
+                                // threading the signing into the case-class constructor.
+                                committeeSignatures = NonEmptyList.of(placeholderSig),
+                                epoch = epoch,
+                                // Track-1 diff-base-pin: the base the committee cut `perMetagraphStateDiff` over (verified stable just above).
+                                diffBaseOrdinal = diffBaseOrdinal
+                              )
+                              for {
+                                // Compute the canonical preimage hash via Hasher[F]. This is the bytes every committee member signs (§3.3).
+                                preimageHash <- Hasher[F].hash(checkpoint.signingPreimage)
+                                // Sign with Ed25519 long-term + KES product. Both sign the canonical preimage hash's UTF-8 bytes (`getBytes`
+                                // matches `MetagraphCommitteeGate.messageBytes` — Hasher result's UTF-8 byte form is what other sign paths use).
+                                msgBytes = preimageHash.getBytes
+                                edSig <- Signing.signData[F](msgBytes)(selfKeyPair.getPrivate)
+                                kesStep <- kesSigner.currentPeriod
+                                kesSig <- kesSigner.signAt(kesStep, msgBytes)
+                                committeeSig = CommitteeMemberSignature(
+                                  peerId = selfPeerId,
+                                  vrfProof = Hex.fromBytes(vrfProof),
+                                  ed25519Sig = Hex.fromBytes(edSig),
+                                  kesProductSig = Hex.fromBytes(kesSig),
+                                  kesTreeStep = kesStep
+                                )
+                                finalCheckpoint = checkpoint.copy(committeeSignatures = NonEmptyList.of(committeeSig))
+                                // Wrap in Signed envelope. The outer Signed contract uses the operator's long-term Ed25519 signature over the
+                                // envelope's value bytes; this is the canonical "this operator authored this message" attestation that gl0 and
+                                // other peers use to authenticate the gossip path. Mirrors how `GlobalIncrementalSnapshot` is signed.
+                                proof <- SignatureProof.fromHash(selfKeyPair, preimageHash)
+                                signedCheckpoint = Signed(finalCheckpoint, NonEmptySet.of(proof))
+                                _ <- publisher.publish(signedCheckpoint)
+                                _ <- logger.info(
+                                  s"produce: emitted shardOrdinal=${nextShardOrdinal.value} gl0Anchor=${gl0AnchorOrdinal.value.value} " +
+                                    s"slot=${currentSlot.value.value} mgs=${orderedSnapshots.keys.size} " +
+                                    s"crossShardReceipts=${emittedReceipts.size} kesStep=$kesStep"
+                                )
+                              } yield Some(signedCheckpoint): Option[Signed[ShardCheckpoint]]
+                            } // close else (diff-base stable)
+                          } // close diffBaseOrdinalF.flatMap (atomicity re-check)
                       }
                     }
                 }
@@ -629,7 +664,10 @@ object ShardCheckpointProducer {
       private def assembleDelta(
         orderedSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         gl0AnchorOrdinal: SnapshotOrdinal,
-        parentCheckpointHash: Hash
+        parentCheckpointHash: Hash,
+        // Track-1 diff-base-pin: the finalized ordinal the per-MG diffs are cut over (captured atomically in produceInner), passed to every
+        // `derivePerMgState` so its prior reader resolves S(N) at THIS base — the same base every adopter/re-executor reads at.
+        diffBaseOrdinal: SnapshotOrdinal
       ): F[Option[(ShardDerivedStateDelta, List[CrossShardReceipt])]] =
         // For each MG, call the injectable `derivePerMgState(mg, includedChain, gl0AnchorOrdinal)` over the FULL per-MG chain (S3). The
         // closure re-runs the metagraph's currency derivation against the prior shard-checkpoint's cumulative state S(N) (from the adopted
@@ -640,7 +678,7 @@ object ShardCheckpointProducer {
         // and gl0 APPLIES-and-verifies it against `perMetagraphMptRoots(mg)` — no re-derive (step 6 of the unroll workstream).
         orderedSnapshots.toList.traverse {
           case (mg, snaps) =>
-            derivePerMgState(mg, snaps, gl0AnchorOrdinal).map(mg -> _)
+            derivePerMgState(mg, snaps, gl0AnchorOrdinal, diffBaseOrdinal).map(mg -> _)
         }.flatMap { perMgPairs =>
           // DEFER-THE-WHOLE-CHECKPOINT-ON-OMIT (run-27e, 2026-06-14 — review-workflow root cause). `derivePerMgState` returns `None` for an
           // ACTIVE MG (one with pending binaries in this window) whose currency state can't be derived this round: the genesis-bootstrap

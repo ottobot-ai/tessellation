@@ -261,7 +261,9 @@ object ShardCheckpointGl0AcceptanceManager {
     kesRegistry: KesRegistry[F],
     vrfRegistry: VrfRegistry[F],
     shardEtaFor: (ShardId, EtaPeriod) => F[Option[Array[Byte]]],
-    reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal) => F[Hash]
+    // Track-1 diff-base-pin: the 4th arg is the checkpoint's `diffBaseOrdinal`, so the sub-quorum re-exec seeds S(N) at the SAME pinned
+    // base the producer diffed over (call sites pass `checkpoint.diffBaseOrdinal`).
+    reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash]
   ): F[ShardCheckpointGl0AcceptanceManager[F]] = {
 
     // chainStore + selfPeerId + kDraw are reserved for forward compatibility (see scaladoc on the parameters); reference once to
@@ -413,7 +415,7 @@ object ShardCheckpointGl0AcceptanceManager {
           // unconditionally — even when quorum was met — which is the whole point of the watchtower: catch a quorum-signed wrong root.
           included.toList.traverse {
             case (mg, snaps) =>
-              reExecuteDerivation(mg, snaps, checkpoint.gl0AnchorOrdinal).map { reDerived =>
+              reExecuteDerivation(mg, snaps, checkpoint.gl0AnchorOrdinal, checkpoint.diffBaseOrdinal).map { reDerived =>
                 claimedRoots.get(mg) match {
                   // `Hash.empty` from the closure = "this node can't derive this MG yet" (contiguity gap / lagging S(N) / OMIT path), NOT
                   // "the committee is wrong" — filter it out so the watchtower never disputes on incomplete local state.
@@ -551,7 +553,7 @@ object ShardCheckpointGl0AcceptanceManager {
               // the producer derives the per-MG root off the whole included chain at the same anchor ordinal, and the gl0 verifier re-runs
               // the SAME derivation off the SAME chain + ordinal. Byte-identical inputs ⇒ byte-identical roots (the S3 no-false-slashing
               // contract).
-              reExecuteDerivation(mg, snaps, checkpoint.gl0AnchorOrdinal).map { actual =>
+              reExecuteDerivation(mg, snaps, checkpoint.gl0AnchorOrdinal, checkpoint.diffBaseOrdinal).map { actual =>
                 claimedRoots.get(mg) match {
                   case Some(claimed) if claimed === actual => Right(mg)
                   case Some(claimed) =>
