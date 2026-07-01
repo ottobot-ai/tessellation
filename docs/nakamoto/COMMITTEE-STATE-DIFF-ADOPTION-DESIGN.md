@@ -2,6 +2,8 @@
 
 **Status:** DESIGN (2026-06-13). Replaces the `AdoptFromSignedFields` per-field re-derive in the sharded gl0 currency mirror. Greenfield (no wire compat per `[[feedback-greenfield-no-wire-compat]]`).
 
+> **CORRECTION (2026-06-30):** this adopt-and-verify-at-the-**finalized-base** model (I3: *never bestTip*) is the design of record and is now being completed. NOTE on as-shipped status: the path that actually shipped at `numShards>1` kept `AdoptFromSignedFields` (it is the re-derive `deriveAdoptedCurrencyInfo`, which verifies vs `stateProof`) but then **overrode** the re-derived token fields with an ml0 *authoritative-balance push* — that override is being REMOVED so re-execution (`reExecRoot === stateProof`) becomes the **primary** token-model gate, exactly as this doc intends. The committee diff base is the FINALIZED base (`fromMptStore`), per §4/I3. See CURRENCY-APP-TOKEN-ENFORCEMENT.md + SHARDING-PRODUCTION-READINESS-PLAN.md.
+
 ## 1. The trust model (one line)
 
 **Single executor, adopt-and-verify everywhere.** The shard committee (a gl0 subset) re-executes the metagraph's currency `accept()` **once**, anchored at the *finalized* base, and emits the resulting **MPT byte-diff** (change-set) in the checkpoint. Every other gl0 node **applies the diff** to its finalized base and verifies the resulting per-MG root against the committee-attested root. No node re-derives the state independently; no `createContext`; no per-field fallback. GL0 holds the full metagraph state (economic-security anchor); ML0 pushes, GL0 never reaches into ML0.

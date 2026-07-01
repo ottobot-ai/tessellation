@@ -4,6 +4,8 @@
 **Decision:** chosen over Option (i) (gl0-holds-full-state). Rationale below.
 **Supersedes:** the Slice-1 framing in [`UNIFIED-STATE-PROPAGATION.md`](./UNIFIED-STATE-PROPAGATION.md) — this is the concrete realization of that doc's (ii) branch.
 
+> **CORRECTION (2026-06-30):** Slice 5's "dark infra" status is STALE — `ShardSubtreeProofService` + `ShardProofRoutes` are BUILT AND WIRED (`8ac7ce04f..0b7902d69`), and PIN-1 component-addressable per-MG roots back the inclusion/absence proofs (no longer "verify against an opaque leaf hash"). Also note the §3.4 "mirror is consensus-load-bearing as authoritative" caution (line ~129) is being resolved the right way: the framework **token model is RE-EXECUTED and enforced** (`reExecRoot === stateProof`), not trusted via the authoritative push — the authoritative override is being REMOVED. The roots-only fold deletion (Slice 2) remains a future hard fork. See CURRENCY-APP-TOKEN-ENFORCEMENT.md + SHARDING-PRODUCTION-READINESS-PLAN.md.
+
 ---
 
 ## 0. Why (ii), and why now
@@ -107,7 +109,7 @@ No gl0 HTTP balance route reads currency state (currency balances are already ml
 
 **Slice 4 — reshape the readers.** Genesis bootstrap → proof-verified fetch; `getFeeAddresses`/`StateChannelValidator` → config summary; shrink the MPT partitions.
 
-**Slice 5 — wire/replace the dark infra.** `ShardSubtreeProofService` + `ShardProofRoutes` are built but **unwired** (not in `HttpApi`) and internally inconsistent (verify against an opaque leaf hash, not a tree root). Either retarget them to the LC-SMT model or delete and replace with the Slice-1/2 routes.
+**Slice 5 — ~~wire/replace the dark infra~~ DONE (proof transport wired, 2026-06).** ~~`ShardSubtreeProofService` + `ShardProofRoutes` are built but **unwired** (not in `HttpApi`) and internally inconsistent (verify against an opaque leaf hash, not a tree root).~~ **[STALE — BUILT (`8ac7ce04f..0b7902d69`): proof transport is wired and PIN-1 component-addressable per-MG roots replace the opaque-leaf-hash verify.]**
 
 ---
 

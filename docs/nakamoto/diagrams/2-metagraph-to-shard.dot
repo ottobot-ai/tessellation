@@ -1,0 +1,59 @@
+// Diagram 2 — METAGRAPH ml0 snapshots embed INSIDE one shard checkpoint
+// ======================================================================
+// From schema/sharding/ShardDerivedStateDelta.scala + ShardCheckpoint.scala:
+//   ShardCheckpoint.derivedStateDelta.includedSnapshots
+//       : SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]
+//   → ONE checkpoint carries the ml0 binaries of the MULTIPLE metagraphs
+//     assigned to that shard (shardAssignment = static Address->ShardId map),
+//     keyed by metagraph Address; plus per-MG derived mptRoot + stateDiff.
+//   Each metagraph runs its OWN ml0 currency chain at its own pace; the
+//   committee batches whatever binaries landed in the checkpoint window
+//   (NonEmptyList: a busy MG contributes several, a quiet one exactly one).
+//
+// Render: dot -Tpng -Gdpi=150 2-metagraph-to-shard.dot -o 2-metagraph-to-shard.png
+
+digraph metagraph_to_shard {
+  rankdir=TB;
+  ranksep=0.75; nodesep=0.45;
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.14,0.08"];
+  edge [fontname="Helvetica", fontsize=9, arrowsize=0.8];
+  graph [fontname="Helvetica", labelloc=t, fontsize=14,
+    label=<<B>2 &middot; Metagraph ml0 snapshots embed inside ONE shard checkpoint</B><BR/><FONT POINT-SIZE="10">many metagraphs share a shard (shardAssignment) &middot; their ml0 binaries ride in checkpoint.includedSnapshots[mgAddress]</FONT><BR/> >];
+
+  // ===== Metagraph A — its own ml0 currency chain (own pace) =====
+  tagMA [shape=plaintext, label=<<B>METAGRAPH&nbsp;A</B><BR/><FONT POINT-SIZE="8">ml0 currency chain</FONT>>];
+  mA1 [label=<m<SUB>A</SUB>(i&minus;1)>, fillcolor="#E3F2FD", color="#1565C0"];
+  mA2 [label=<m<SUB>A</SUB>(i)>,        fillcolor="#E3F2FD", color="#1565C0"];
+  mA3 [label=<m<SUB>A</SUB>(i+1)>,      fillcolor="#E3F2FD", color="#1565C0"];
+  { rank=same; tagMA; mA1; mA2; mA3; }
+  mA1 -> mA2 -> mA3 [color="#1565C0", penwidth=1.8, label="lastSnapshotHash", fontcolor="#1565C0"];
+
+  // ===== Metagraph B — different pace =====
+  tagMB [shape=plaintext, label=<<B>METAGRAPH&nbsp;B</B><BR/><FONT POINT-SIZE="8">own ml0 pace</FONT>>];
+  mB1 [label=<m<SUB>B</SUB>(j&minus;1)>, fillcolor="#FCE4EC", color="#AD1457"];
+  mB2 [label=<m<SUB>B</SUB>(j)>,         fillcolor="#FCE4EC", color="#AD1457"];
+  { rank=same; tagMB; mB1; mB2; }
+  mB1 -> mB2 [color="#AD1457", penwidth=1.8];
+
+  // spacer so the checkpoint sits clearly below both MG lanes
+  tagMA -> tagMB [style=invis];
+
+  // ===== ONE shard checkpoint that EMBEDS both metagraphs' binaries =====
+  subgraph cluster_ckpt {
+    label=<<B>ShardCheckpoint&nbsp;C<SUB>A</SUB></B>&nbsp;&nbsp;<FONT POINT-SIZE="9">(shard A &middot; shardOrd k &middot; committee &ge; &lceil;2/3&middot;K<SUB>S</SUB>&rceil; sigs)</FONT>>;
+    labeljust=l; style="rounded,filled"; fillcolor="#F3E5F5"; color="#6A3D9A"; fontcolor="#6A3D9A"; penwidth=2;
+    fontname="Helvetica"; fontsize=11;
+    incA [label=<<B>includedSnapshots[A]</B><BR/><FONT POINT-SIZE="8">[ m<SUB>A</SUB>(i), m<SUB>A</SUB>(i+1) ]</FONT><BR/><FONT POINT-SIZE="8">+ perMetagraphMptRoots[A]<BR/>+ perMetagraphStateDiff[A]</FONT>>, fillcolor="#FFFFFF", color="#1565C0"];
+    incB [label=<<B>includedSnapshots[B]</B><BR/><FONT POINT-SIZE="8">[ m<SUB>B</SUB>(j) ]</FONT><BR/><FONT POINT-SIZE="8">+ perMetagraphMptRoots[B]<BR/>+ perMetagraphStateDiff[B]</FONT>>, fillcolor="#FFFFFF", color="#AD1457"];
+    incA -> incB [style=invis];
+  }
+
+  // embedding edges: each ml0 binary in this window drops into its per-MG slot
+  mA2 -> incA [style=dashed, color="#1565C0", penwidth=1.5, label="embed", fontcolor="#1565C0"];
+  mA3 -> incA [style=dashed, color="#1565C0", penwidth=1.5];
+  mB2 -> incB [style=dashed, color="#AD1457", penwidth=1.5, label="embed", fontcolor="#AD1457"];
+
+  Note [shape=note, fillcolor="#FFFDE7", style=filled, color="#999999", fontsize=9, fontname="Helvetica",
+    label=<<B>read it as</B><BR ALIGN="LEFT"/>&bull; each metagraph produces its own ml0 chain at its own pace<BR ALIGN="LEFT"/>&bull; shardAssignment (static Address&rarr;ShardId) puts A and B in the SAME shard<BR ALIGN="LEFT"/>&bull; so ONE checkpoint carries BOTH, keyed by metagraph Address<BR ALIGN="LEFT"/>&bull; the committee derives per-MG mptRoot + stateDiff from the embedded binaries>];
+  incB -> Note [style=invis];
+}

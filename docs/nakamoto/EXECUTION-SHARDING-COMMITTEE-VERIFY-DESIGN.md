@@ -9,6 +9,8 @@ metagraphs; **only the committee re-executes** that bucket's state transitions; 
 node and downstream consumer does **crypto verification only** and **trusts the claimed state**;
 **slashing is added later** to harden the trust.
 
+> **CORRECTION (2026-06-30):** the §7 "member verifies via re-execution" contract is now IMPLEMENTED, and the "slashing is added later" caveat is closed for the invalidity tier. As of `8ac7ce04f..0b7902d69`: an ALWAYS-RUN `watchtowerReExec` re-derives every MG's per-MG root and disputes via a real `FraudProofEnvelope`; an upheld dispute writes a durable slash (`Slashings` fieldId 34); committee-VRF membership verify is real (`verifyVrf` / `CommitteeSortition.verifyShardMembership`, with `verifyVrfStructural` only the registry-absent fallback); the cross-shard single-use spent-set (`ConsumedAllowSpends` 33) is wired. Refinement of the trust model: the framework **token model is RE-EXECUTED and enforced** (`reExecRoot === stateProof`) — non-committee gl0 does NOT merely "trust the claimed state" for token primitives; only arbitrary state channels + the data-app sub-state are adopted authoritatively. See CURRENCY-APP-TOKEN-ENFORCEMENT.md + SHARDING-PRODUCTION-READINESS-PLAN.md.
+
 ---
 
 ## 1. Why this doc exists (what last night's e2e proved)

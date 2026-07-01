@@ -5,6 +5,8 @@
 
 **Supersedes** the replay-with-fallback half of [[project_roots_only_sharding_ii_decision]]; **is** the metagraph→gl0 mirror of [[project_ml0_diff_adopt_design]] (#12 / slices #14-19).
 
+> **CORRECTION (2026-06-30):** the "S6 — proof service built but dark/unwired" status below is STALE — the proof transport (`ShardSubtreeProofService` + routes + `ShardSubtreeProofClient`) is BUILT AND WIRED (`8ac7ce04f..0b7902d69`), and PIN-1 component-addressable per-MG roots back real inclusion/absence proofs. Note the broader direction shift: gl0 does not merely *adopt* the metagraph's committed delta on trust for the token model — the framework **token model is RE-EXECUTED and enforced** (`reExecRoot === stateProof`); only arbitrary state channels + the data-app sub-state are adopted authoritatively. See CURRENCY-APP-TOKEN-ENFORCEMENT.md + SHARDING-PRODUCTION-READINESS-PLAN.md.
+
 ---
 
 ## 0. Why
@@ -111,14 +113,14 @@ The delta-adopt is the **write** leg (metagraphs push state up to gl0). The **re
 
 **Mechanism (deterministic + trustless):**
 1. **Commit provably** — the metagraph commits its balances in a **per-address MPT** (the `BalanceMpt` / `Hasher.forCanonicalJson` tree the light client already verifies), root in `CurrencySnapshotStateProof.balancesProof` (today a flat hash — promote it to the MPT root). gl0 holds it via the delta-adopt.
-2. **gl0 serves inclusion proofs** over it — `ShardSubtreeProofService` (built but currently **unwired**); proof = `{metagraphB, addressX, valueV, mptProof}` against gl0's committed per-MG root.
+2. **gl0 serves inclusion proofs** over it — `ShardSubtreeProofService` (~~built but currently **unwired**~~ **built AND wired, 2026-06**); proof = `{metagraphB, addressX, valueV, mptProof}` against gl0's committed per-MG root.
 3. **Proof-carrying cross-shard tx** — `ml0_A`'s tx carries `(V, gl0_ordinal_N, proof)`; every `ml0_A` validator verifies it against the gl0 snapshot N it **already follows** (same committee-signed root → deterministic), then reads `V` locally. This is [[project_cross_shard_message_passing_direction]].
 
 **Scoping boundary:** an inclusion proof gives *visibility* ("at gl0 ord N, B had V"). A full **atomic** cross-shard transfer also needs B to authorize + A to consume — the **allow-spend → spend-action** handshake, whose primitives (`activeAllowSpends`, cross-shard `spend-actions`) the delta-adopt already carries. Read (visibility) + allow-spend/spend-action (atomic move) = full cross-shard tx.
 
 **Additional slices (after S1-S4):**
 - **S5** — promote `balancesProof` flat-hash → per-address `BalanceMpt` root; gl0 commits/holds it via the delta.
-- **S6** — wire `ShardSubtreeProofService` → a `GET /…/balance/proof`-style route (already written, just dark).
+- **S6** — ~~wire `ShardSubtreeProofService` → a `GET /…/balance/proof`-style route (already written, just dark)~~ **DONE — proof transport wired (`8ac7ce04f..0b7902d69`)**.
 - **S7** — cross-shard-dependency tx format `(value, gl0_ordinal, inclusionProof)` + admission-time verification against the follower's gl0 root (Scala mirror of `mptVerifier.ts`).
 
 Net: **one per-address MPT commitment**, **one inclusion-proof verifier**, two consumers (light client + sibling metagraph). The write leg (delta-adopt) and read leg (inclusion proof) together are the complete cross-shard state architecture.

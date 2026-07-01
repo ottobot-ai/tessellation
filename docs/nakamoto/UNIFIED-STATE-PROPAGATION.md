@@ -3,6 +3,8 @@
 **Status:** DRAFT — 2026-06-04
 **Motivation:** the gl0 metagraph-currency-fold **freeze** blocking the 8gl0+4mg+4shard e2e (balance-assertion failure), plus the standing goal to stop re-executing state we can instead *adopt-and-verify*.
 
+> **CORRECTION (2026-06-30):** the "doesn't yet commit the state behind the verified root" / "built, zero L1 callers / promote into use" status below is STALE. The checkpoint now carries the executed snapshots (`ShardDerivedStateDelta.includedSnapshots`) and gl0 adopts-and-verifies the per-MG state (not just the root); the inclusion-proof transport (`ShardSubtreeProofService` + routes) is BUILT AND WIRED, backed by PIN-1 component-addressable per-MG roots (`8ac7ce04f..0b7902d69`). The framework token model is RE-EXECUTED and enforced (`reExecRoot === stateProof`). See CURRENCY-APP-TOKEN-ENFORCEMENT.md + SHARDING-PRODUCTION-READINESS-PLAN.md.
+
 ---
 
 ## 1. Problem
@@ -60,7 +62,7 @@ This is already proven on the L1→gl0 path and seeded by the `SyncedField` regi
 | shard checkpoint → gl0 (`ShardCheckpointGl0AcceptanceManager.verifyEmbedded`) | per-MG root **byte-compare** vs committee-signed `perMetagraphMptRoots` (adopt, verbatim binaries) | no | extend to commit *state*, not just verify root |
 | cross-shard / light client | inclusion proof (`FollowVerifyCore.verifyConsumedFields`, `ShardSubtreeProofService`) — **built, zero L1 callers** | no | promote into use |
 
-**The two surviving re-execution sites are the same disease** and the metagraph→gl0 one is the live freeze. The shard checkpoint already *verifies* the per-MG root via the byte-diff/attestation path — it just doesn't yet *commit the state behind that verified root*; it hands the binaries to the same re-executing `createContext`.
+**The two surviving re-execution sites are the same disease** and the metagraph→gl0 one is the live freeze. The shard checkpoint already *verifies* the per-MG root via the byte-diff/attestation path — ~~it just doesn't yet *commit the state behind that verified root*; it hands the binaries to the same re-executing `createContext`.~~ **[STALE (2026-06-30): the checkpoint now carries the executed snapshots (`ShardDerivedStateDelta.includedSnapshots`) and gl0 adopts-and-verifies the committed per-MG state via the `deriveAdoptedCurrencyInfo` re-derive (verified vs `stateProof`) at `numShards>1` — not the live-global `createContext`.]**
 
 ---
 

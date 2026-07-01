@@ -1,0 +1,76 @@
+// Diagram 3 — RESOLUTION: metagraph -> shard checkpoint -> gl0, finality INHERITED from the embedding ordinal
+// =========================================================================================================
+// Reads top->bottom = the containment. gl0 (bottom) is the ONE finality ladder, color-banded by maturity.
+// All from source:
+//   - ml0 binary  in  checkpoint.includedSnapshots  ;  checkpoint rides into gl0 at gl0AnchorOrdinal (near tip)
+//   - checkpoint carries BOTH (ShardCheckpointProducer:614-682):
+//       includedSnapshots = currency incremental snapshots = re-exec INPUT
+//       perMetagraphStateDiff/MptRoots = the CLAIM to check against
+//   - VRF-sampled WATCHTOWER re-execs includedSnapshots over the depth-k1 finalized base, disputes if
+//       derived-root != claim, WITHIN the k1 challenge window (types.scala:236 ; InvalidStateProofValidator:31)
+//   - finality INHERITED: a checkpoint's finality = the gl0 ordinal that embeds it (GENESIS-DENSITY-PHASE2-REORG-AUDIT §4)
+//   - gl0 ladder: tip(proposed) -> operational-k1 (max-of{T_count,T_weight,T_depth1}) -> SETTLED-k2 (only k2 absolute;
+//       (k2,k1] stays density-revertable via maxvalid-bg; a reorg is deterministic replay of the embedded bytes)
+//
+// Render: dot -Tpng -Gdpi=150 3-combined-resolution-and-finality.dot -o 3-combined-resolution-and-finality.png
+
+digraph combined {
+  rankdir=TB;
+  ranksep=0.8; nodesep=0.5;
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.15,0.09"];
+  edge [fontname="Helvetica", fontsize=9, arrowsize=0.8];
+  graph [fontname="Helvetica", labelloc=t, fontsize=14,
+    label=<<B>3 &middot; metagraph &rarr; shard checkpoint &rarr; gl0 &mdash; finality is INHERITED from the gl0 ordinal that embeds it</B><BR/><FONT POINT-SIZE="10">the checkpoint carries the incremental snapshot (re-exec input) AND the bytes-diff claim, so a watchtower can re-exec &amp; dispute within k&#8321;</FONT><BR/> >];
+
+  // ========== METAGRAPH (top) ==========
+  tagM [shape=plaintext, label=<<B>METAGRAPH</B><BR/><FONT POINT-SIZE="8">ml0 chain</FONT>>];
+  m1 [label=<m(i&minus;1)>, fillcolor="#E3F2FD", color="#1565C0"];
+  m2 [label=<m(i)>,         fillcolor="#E3F2FD", color="#1565C0"];
+  { rank=same; tagM; m1; m2; }
+  m1 -> m2 [color="#1565C0", penwidth=1.8];
+
+  // ========== SHARD CHECKPOINT (middle) — the container ==========
+  subgraph cluster_ckpt {
+    label=<<B>ShardCheckpoint</B> <FONT POINT-SIZE="9">&middot; committee &ge; &lceil;2/3&middot;K<SUB>S</SUB>&rceil; sigs</FONT>>;
+    labeljust=l; style="rounded,filled"; fillcolor="#F3E5F5"; color="#6A3D9A"; fontcolor="#6A3D9A"; penwidth=2;
+    fontname="Helvetica"; fontsize=11;
+    inc   [label=<<B>includedSnapshots</B><BR/><FONT POINT-SIZE="8">the currency incremental snapshots<BR/>&mdash; re-exec INPUT</FONT>>, fillcolor="#FFFFFF", color="#1565C0"];
+    claim [label=<<B>perMetagraphStateDiff&nbsp;+&nbsp;MptRoots</B><BR/><FONT POINT-SIZE="8">upserts/removals + root<BR/>&mdash; the committee&rsquo;s CLAIM</FONT>>, fillcolor="#FFFFFF", color="#AD1457"];
+    inc -> claim [style=invis];
+  }
+  m2 -> inc [color="#1565C0", penwidth=1.6, label="embed", fontcolor="#1565C0"];
+
+  // ========== HYPERGRAPH gl0 (bottom) — the ONE finality ladder, tip on the RIGHT ==========
+  tagG  [shape=plaintext, label=<<B>HYPERGRAPH&nbsp;gl0</B><BR/><FONT POINT-SIZE="8">master chain &middot; the only ladder</FONT>>];
+  Gset  [label=<<B>S(n&minus;k&#8322;)</B><BR/><FONT POINT-SIZE="8">SETTLED &middot; T_depth2</FONT>>, fillcolor="#D7E9FC", color="#0b5394", penwidth=1.8];
+  d1    [shape=plaintext, label=<<FONT POINT-SIZE="16" COLOR="#888888">&hellip;</FONT>>];
+  Gop   [label=<<B>S(n&minus;k&#8321;)</B><BR/><FONT POINT-SIZE="8">operational &middot; max-of</FONT>>, fillcolor="#D4EDDA", color="#1a7f37", penwidth=1.8];
+  d2    [shape=plaintext, label=<<FONT POINT-SIZE="16" COLOR="#888888">&hellip;</FONT>>];
+  Gtip  [label=<<B>S(n)&nbsp;tip</B><BR/><FONT POINT-SIZE="8">proposed</FONT>>, fillcolor="#F8D7DA", color="#721c24", penwidth=2.4];
+  { rank=same; tagG; Gset; d1; Gop; d2; Gtip; }
+  Gset -> d1 -> Gop -> d2 -> Gtip [color="#1a5fb4", penwidth=2.6, arrowhead=none];
+
+  // vertical containment spine (invisible) so metagraph / checkpoint sit above the TIP
+  tagM -> tagG [style=invis];
+  m2 -> inc [style=invis];
+  inc -> Gtip [style=invis, weight=10];
+
+  // the RIDE-IN: checkpoint claim --gl0AnchorOrdinal--> gl0 tip  (one clean edge)
+  claim -> Gtip [constraint=false, style=dashed, color="#6A3D9A", penwidth=2.0, fontcolor="#6A3D9A",
+                 label="rides into gl0\n@ gl0AnchorOrdinal"];
+
+  // maturation is carried by the band colors (blue SETTLED / green operational / red tip) + the legend.
+
+  // ========== WATCHTOWER (left) — re-exec / verify loop ==========
+  W [shape=octagon, fillcolor="#FFF3CD", color="#E67E00", penwidth=2, fontsize=10,
+     label=<<B>WATCHTOWER</B><BR/><FONT POINT-SIZE="8">VRF-sampled, rotating</FONT>>];
+  { rank=same; W; }
+  W -> inc   [constraint=false, color="#E67E00", penwidth=1.7, label="re-exec included\nsnapshots over the\ndepth-k₁ finalized base", fontcolor="#E67E00"];
+  W -> claim [constraint=false, color="#C62828", penwidth=1.7, arrowhead=diamond,
+              label="derived root != claim ?\n→ fraud proof (must land within k₁)", fontcolor="#C62828"];
+
+  // legend
+  Legend [shape=note, style=filled, fillcolor="#FFFFFF", color="#999999", fontsize=9, fontname="Helvetica",
+    label=<<B>resolution, bottom-up</B><BR ALIGN="LEFT"/>1&nbsp; metagraph ml0 snapshot &rarr; embedded in the checkpoint (includedSnapshots)<BR ALIGN="LEFT"/>2&nbsp; checkpoint &rarr; rides into gl0 at gl0AnchorOrdinal (near the tip)<BR ALIGN="LEFT"/>3&nbsp; its finality = the gl0 ordinal it embeds into (no parallel ladder)<BR ALIGN="LEFT"/>4&nbsp; watchtower re-execs includedSnapshots vs the claim; dispute must land within k&#8321;<BR ALIGN="LEFT"/><BR ALIGN="LEFT"/><B>only k&#8322; is absolute</B> &mdash; the (k&#8322;,k&#8321;] band stays density-revertable (maxvalid-bg); a gl0 reorg = deterministic replay>];
+  Gset -> Legend [style=invis];
+}

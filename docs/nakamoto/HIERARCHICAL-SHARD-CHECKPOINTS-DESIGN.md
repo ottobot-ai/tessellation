@@ -3,6 +3,8 @@
 **Status:** draft for critic review. No code commitment. Written 2026-05-23 against
 `feature/serde-typeclass-shim` at HEAD `6e49b7d5`.
 
+> **CORRECTION (2026-06-30):** the v1/v2 fraud-proof phasing below is STALE. The fraud-proof + dispute path is BUILT (commits `8ac7ce04f..0b7902d69`), not "wire-shape reserved in v1, dispute handler ships in v2 / record-and-WARN." An ALWAYS-RUN `watchtowerReExec` re-derives every MG's per-MG root from the checkpoint's `includedSnapshots`, raises a real `FraudProofEnvelope`/`fraudProofs` consensus artifact on divergence, and an upheld dispute writes a **durable slash** to the `Slashings` MPT partition (fieldId 34) via `InvalidStateProofEvidence`. The cross-shard single-use spent-set (`ConsumedAllowSpends` 33) and PIN-1 component-addressable per-MG roots are also built. (Independently: §6/§12 here are superseded by EXECUTION-SHARDING-COMMITTEE-VERIFY-DESIGN.md.) See CURRENCY-APP-TOKEN-ENFORCEMENT.md + SHARDING-PRODUCTION-READINESS-PLAN.md.
+
 **Scope:** spec for a sharded gl0 execution architecture in which a sortitioned
 subset of gl0 operators (a *shard committee*) re-runs per-metagraph derivations,
 signs a *shard checkpoint*, and gl0 accepts the checkpoint via signature
@@ -308,7 +310,7 @@ final case class ShardCheckpoint(
 ### §3.2 Fraud-proof envelope (reserved wire format)
 
 ```scala
-/** Fraud-proof envelope — wire shape reserved in v1, dispute handler ships in v2.
+/** Fraud-proof envelope — BUILT 2026-06 (dispute handler shipped; NOT v2-deferred — see top banner).
   *
   * Purpose: a challenger that re-executes the shard committee's derivations and
   * gets a different result submits this envelope as a slashing-evidence tx (see
@@ -1118,7 +1120,7 @@ final case class WrongDerivationEvidence(
 ```
 
 **v1**: the wire format ships (per §3.2 / §11.3) so we have the bytes in the
-binary. **The dispute handler itself ships in v2**. Reason: re-execution
+binary. ~~**The dispute handler itself ships in v2**~~ **[STALE — BUILT 2026-06 (`8ac7ce04f..0b7902d69`); see top banner]**. Reason: re-execution
 witness sizes for the various derivation paths (`processCurrencySnapshots`,
 `updateTokenLockBalances`, artifact extraction) need empirical sizing under
 production load before we can finalise the witness shape; the handler design
@@ -1126,10 +1128,10 @@ will also benefit from v1 operating data on how often divergences occur (none
 expected in healthy operation; the value comes from the deterrent).
 
 Honest committee members observing divergence in v1 (between their local
-re-execution and a signed checkpoint they received) record the divergence in a
+re-execution and a signed checkpoint they received) ~~record the divergence in a
 local audit log and WARN. They do NOT yet submit slashing evidence — they
 *could* but the handler isn't there to accept it. The local audit log is the
-data we need to size the v2 witness format.
+data we need to size the v2 witness format.~~ **[STALE — BUILT 2026-06: each node's always-run `watchtowerReExec` raises a real `FraudProofEnvelope` on divergence, and an upheld dispute writes a durable slash (`Slashings` 34). No longer record-and-WARN-only.]**
 
 ### §10.3 Non-participation accumulator
 
