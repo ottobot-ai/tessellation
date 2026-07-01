@@ -56,11 +56,15 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * `NakamotoSyncDaemon.handleSnapshot` catch-up path is responsible for those once a canonical snapshot is delivered. Resetting them here
   * would race the daemon's own canonical-rewrite path.
   *
-  * ==Default-OFF==
+  * ==Enablement (currently ON; target OFF once density-past-k₁ (S3) lands + is e2e-validated)==
   *
-  * Gated by env `NAKAMOTO_REBOOTSTRAP_ENABLED` (default `false`). False positives are costly (full chain resync), so we ship the recovery
-  * path itself in production but leave it OFF until iter-level e2e validates it doesn't spuriously fire. Operators can flip it ON per- node
-  * by setting the env to `true`.
+  * Gated by typed HOCON `SharedConfig.nakamoto.rebootstrapEnabled` (`application.conf` `rebootstrap-enabled`, default `true`; env
+  * override `${?NAKAMOTO_REBOOTSTRAP_ENABLED}`), passed as the `enabled` param to `run`. It ships ON because a locked-out node otherwise
+  * forks the global mptRoot forever (the sharded data-app-fee reorg storm) — so this is the PRIMARY divergent-self-finalize recovery
+  * TODAY. TARGET STATE = OFF: once the density-past-k₁ deep-reorg path (Track-3 S3, flag `band-density-reorg-enabled`) lands and is
+  * e2e-validated, band-density reorg SUPERSEDES this node-level reset as the primary recovery and the default flips to `false` — the
+  * orchestrator is then RETAINED as a manual last-resort escape hatch (operators flip ON per-node via the env override). Do NOT flip the
+  * default until S3+S4 are e2e-green and the deep-fork sim passes (Track-3 S5 gate).
   */
 object RebootstrapOrchestrator {
 
@@ -154,8 +158,9 @@ object RebootstrapOrchestrator {
     * The post-reset chain re-seed is the responsibility of `NakamotoSyncDaemon.handleSnapshot`: the next gossip snapshot will trigger its
     * catch-up path (parent-not-found → Tier 3 → `catchUpFromGossip` → full state resync).
     *
-    * When `Enabled == false`, returns an empty Stream — the orchestrator is wired but dormant. This is the safe default until production
-    * validates the trigger is precise.
+    * When `enabled == false`, returns an empty Stream — the orchestrator is wired but dormant. NOTE: `false` is NOT the current default
+    * (live default is `true`; see the enablement note above) — dormant-mode is the TARGET state once density-past-k₁ (Track-3 S3)
+    * supersedes this path as primary recovery and is e2e-validated.
     */
   def run[F[_]: Async: Metrics](
     enabled: Boolean,
@@ -169,7 +174,7 @@ object RebootstrapOrchestrator {
     if (!enabled)
       Stream.eval(
         logger.info(
-          "RebootstrapOrchestrator is DISABLED via NAKAMOTO_REBOOTSTRAP_ENABLED=false (default). " +
+          "RebootstrapOrchestrator is DISABLED via rebootstrap-enabled=false (NON-default; live default is true). " +
             "Divergent self-finalize will surface as REFUSED store warnings without triggering reset."
         )
       ) ++ Stream.empty

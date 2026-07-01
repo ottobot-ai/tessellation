@@ -100,7 +100,7 @@ described in §5.5.
 
 | Trigger | Test | Source |
 |---|---|---|
-| `T_depth2` | `bestTipOrdinal - k₂` qualifies; default `k₂ = 2¹⁶ = 65536` | `TDepth2Trigger.make` (`SnapshotLeaderLoop.ArchivalDepthK` / `NAKAMOTO_ARCHIVAL_DEPTH`) |
+| `T_depth2` | `bestTipOrdinal - k₂` qualifies; `k₂ = 100·k₁` | `TDepth2Trigger.make` (single accessor `NakamotoConfig.keepDepthBehindFinalized` = 100·k₁; Track-3 S1 — the old `ArchivalDepthK` inline / `NAKAMOTO_ARCHIVAL_DEPTH` env are gone) |
 
 `T_depth2` is the cryptographic-equivalent "never rollback" bound (Cardano-
 equivalent CP-violation < 10⁻¹²). Wired via commit `06455f98` (#137): the
@@ -132,7 +132,7 @@ subsystem has a well-defined active phase range:
 | MPT overlay `finalizeBranch` (fold into base) | at Phase 2 boundary | fires on Phase 1 → 2 transition |
 | G1 follower consumption (dl1/cl1/ml0 pull) | from Phase 2 | `pullFinalityGated` |
 | Eta-rotation use of period j VRF outputs | from Phase 2 | the first 2/3 of period j must reach Phase 2 before period j+1 begins |
-| Depth trigger `T_depth2` | 2 → advances to 3 | archival depth gate (default `k₂` = 65536) |
+| Depth trigger `T_depth2` | 2 → advances to 3 | archival depth gate (`k₂` = 100·k₁) |
 | Undo journal pruning, overlay history shedding | from Phase 3 | **resolved** — `MptOverlay.pruneBelow(ord)` driven by `T_depth2.latestQualifyingOrdinal` (commit `173e6a7d`, #139) |
 | Aggregate-signature certificate (Mithril-equivalent) | from Phase 3 | *reserved* — light-client trust anchor |
 
@@ -141,7 +141,7 @@ shortcut; see `GENESIS-DENSITY-PHASE2-REORG-AUDIT.md`).** Phase 1→2 (k₁, via
 T_count/T_weight/T_depth1 — whichever fires first) is **operational finality**:
 maxvalid-tk can never revert past it, followers consume it, and the residual
 reorg probability is ~10⁻¹¹ per attempt (sims). It is NOT an absolute floor:
-until a snapshot is k₂ deep (Phase 3 / SETTLED, k₂ = 10·k₁), the Ouroboros
+until a snapshot is k₂ deep (Phase 3 / SETTLED, k₂ = 100·k₁), the Ouroboros
 Genesis **density rule remains the lawful — and only — adjudicator** for a
 deeper fork (the rare deep-fork/bootstrap-recovery event). Only k₂ is the
 absolute, common-prefix floor; past it no chain-selection rule applies and
@@ -464,8 +464,9 @@ which wraps
   by `state.selfId` BEFORE the canonical-hash filter. Without this, a node
   can self-finalize a divergent fork and the `chainStore.finalize`
   finality-safety gate then refuses the canonical hash — the "fork-recovery
-  deadlock" of #119 (P-11b partial mitigation; full re-bootstrap is in
-  progress as task #141). See the doc-comment on
+  deadlock" of #119 (P-11b partial mitigation; full re-bootstrap landed as
+  task #141, default-ON — superseded-as-primary by density-past-k₁ / Track-3
+  S3, retained as manual last-resort). See the doc-comment on
   `TipTracker.highestFinalizedOrdinal` for the full rationale.
 - For each remaining `(peerId, att)`: looks up `canonicalHashAt(att.tipOrdinal)` —
   the hash on **our** canonical chain at that ordinal. If it matches
@@ -491,14 +492,14 @@ to proactively pull the better chain.
 
 ~~Not yet wired.~~ **Wired via commit `06455f98`** (task #137). Built by
 `TDepth2Trigger.make(ArchivalDepthK)` — structurally identical to
-`TDepth1Trigger`, only the constant differs (`k₂` default 65536 vs
-`k₁` default 255, env `NAKAMOTO_ARCHIVAL_DEPTH`).
+`TDepth1Trigger`, only the constant differs (`k₂` = 100·k₁ vs
+`k₁` per-env, both from `NakamotoConfig.keepDepthBehindFinalized` / `confirmationDepthK`; Track-3 S1).
 
 When `tDepth2.latestQualifyingOrdinal` strictly outruns the local archival
 watermark `lastArchivalOrdinalRef`, `finalityMonitor`:
 
 - Advances `lastArchivalOrdinalRef` to the new qualifying ordinal.
-- Logs at INFO: `ARCHIVAL-FINALIZED ordinal=N (tip ord=M, k₂=65536)`.
+- Logs at INFO: `ARCHIVAL-FINALIZED ordinal=N (tip ord=M, k₂=<100·k₁>)`.
 - Increments `dag_nakamoto_archival_finalized` counter, updates
   `dag_nakamoto_archival_ordinal` gauge.
 - Calls `mptOverlay.pruneBelow(archivalQualifying)` — the Phase-3
@@ -584,8 +585,9 @@ weight sum.
 - ~~**`emitAttestation`-on-peer-receive** is currently unconditional
   (commit `6e49b7d5`).~~ — **resolved** (commit `728cffaf`). See §4.1.
 - **`NakamotoChainStore.store` finality-safety gate** refuses to write a
-  different hash at an already-finalized ordinal
-  (`NakamotoChainStore.scala:290-303`). Combined with `chainStore.finalize`
+  different hash at-or-below the store-gate floor — k₁ finalized by default,
+  or the k₂ settled marker when `band-density-reorg-enabled` (Track-3 S3)
+  (`NakamotoChainStore.scala:409-438`). Combined with `chainStore.finalize`
   driven by 2/3 weight, a small-cluster node could previously self-finalize
   a divergent fork and then refuse the canonical chain's hash — the
   "fork-recovery deadlock" of #119.
@@ -603,10 +605,15 @@ weight sum.
     `dag_nakamoto_rebootstrap_initiated_total`, and lets the existing
     `NakamotoSyncDaemon` Tier-3 catch-up path re-seed canonical state.
     A 5-minute cooldown (`NAKAMOTO_REBOOTSTRAP_COOLDOWN_MS`) prevents flap.
-    **Default-OFF via `NAKAMOTO_REBOOTSTRAP_ENABLED=false`** — the recovery
-    path ships dormant until iter-level e2e proves it doesn't spuriously
-    fire under normal small-cluster operation; operators flip it on per
-    node.
+    **Default-ON** via typed HOCON `nakamoto.rebootstrap-enabled = true`
+    (`application.conf`; env override `${?NAKAMOTO_REBOOTSTRAP_ENABLED}`) —
+    this is the PRIMARY divergent-self-finalize recovery today.
+    **SUPERSEDED-as-primary** by density-past-k₁ deep reorg (Track-3 S3,
+    flag `band-density-reorg-enabled`): once S3 is e2e-validated, band-density
+    reorg adjudicates the divergent branch and this node-level reset is
+    demoted to a manual last-resort escape hatch — at which point the default
+    flips to `false` (Track-3 S5 gate, HARD-GATED on S3+S4 e2e-green + a
+    deep-fork sim; not yet flipped).
 - **Undo journal (#121)** plugs base-write contamination on reorg-replace
   but only operates when `finalizeBranch` is called with a different
   hash at an already-finalized ordinal. Does NOT cover the case where a
@@ -624,10 +631,10 @@ weight sum.
 |---|---|
 | `modules/dag-l0/.../nakamoto/SnapshotLeaderLoop.scala` | Slot tick, eligibility, onSlotWon production path, finalityMonitor (5s tick — constructs the four `FinalityTrigger[F]` instances; drives T_weight + T_count + T_depth1 finalize paths, T_depth2 archival watermark, §5.1 visibility ticker, `emitChainQuality` gauge + counters). |
 | `modules/dag-l0/.../nakamoto/NakamotoSyncDaemon.scala` | Inbound gossip: `processValidSnapshot`, `handleAttestation`. Outbound: unified `emitAttestation` / `emitTipAttestation`. |
-| `modules/dag-l0/.../nakamoto/NakamotoChainStore.scala` | Fork-DAG of tips. `bestTip`, `store`, `finalize`, `walkBackTo`. Finality-safety gate at `:290-303`. `vrfOutputsForPeriod` for §1's eta rotation inputs. |
+| `modules/dag-l0/.../nakamoto/NakamotoChainStore.scala` | Fork-DAG of tips. `bestTip`, `store`, `finalize`, `walkBackTo`. Finality-safety gate at `:409-438` (floor = k₁ finalized by default, k₂ settled under `band-density-reorg-enabled`). `vrfOutputsForPeriod` for §1's eta rotation inputs. |
 | `modules/node-shared/.../nakamoto/FinalityTrigger.scala` | `FinalityTrigger[F]` typeclass + `Kind` ADT + `triggersFor` / `maxLatestQualifyingOrdinal` lookup helpers + `fromRef` factory. Concrete builders: `TWeightTrigger`, `TCountTrigger`, `TDepth1Trigger`, `TDepth2Trigger`. Also defines `FinalityTriggerView[F]` (observability seam consumed by the HTTP route). Commits `30a2fa73` (typeclass), `7003be21` (T_count), `06455f98` (T_depth2). |
 | `modules/dag-l0/.../http/routes/FinalityTriggersRoutes.scala` | HTTP route `GET /global-snapshots/{ord}/finality-triggers` — reads a `Ref[F, Option[FinalityTriggerView[F]]]` populated by `SnapshotLeaderLoop` at startup; 503 until populated. Pure observability (commit `866cd598`, task #138). |
-| `modules/dag-l0/.../nakamoto/RebootstrapOrchestrator.scala` | fs2.Stream ticker (default 30s) consuming `chainStore.divergentRefuseCount` + cooldown to detect lock-out and call `unsafe_reset` on TipTracker/Overlay + `unsafe_clearFinality` on chainStore. Default-OFF via `NAKAMOTO_REBOOTSTRAP_ENABLED`. Pure `decide` function for unit testing. Commit `01ebcca6` (#141). |
+| `modules/dag-l0/.../nakamoto/RebootstrapOrchestrator.scala` | fs2.Stream ticker (default 30s) consuming `chainStore.divergentRefuseCount` + cooldown to detect lock-out and call `unsafe_reset` on TipTracker/Overlay + `unsafe_clearFinality` on chainStore. Default-ON via typed HOCON `nakamoto.rebootstrap-enabled = true`; SUPERSEDED-as-primary by density-past-k₁ (Track-3 S3, `band-density-reorg-enabled`), retained as manual last-resort (S5 true→false flip pending, gated on S3+S4 e2e-green). Pure `decide` function for unit testing. Commit `01ebcca6` (#141). |
 | `modules/node-shared/.../nakamoto/TipTracker.scala` | `Map[PeerId, TipAttestation]`. Newer-wins via `attestedAt`. `recordAttestation` enforces ±`MaxAttestationSkewMs` skew bound (env `NAKAMOTO_MAX_ATTESTATION_SKEW_MS`, default 60s — commit `422e1a6b`). `highestFinalizedOrdinal(selfId, …)` takes `selfId` parameter for #133 self-exclusion (commit `95471c7f`). Source for `T_weight` and `T_count`. `unsafe_reset` leaf primitive called only by `RebootstrapOrchestrator` (#141, commit `01ebcca6`). |
 | `modules/node-shared/.../nakamoto/overlay/MptOverlay.scala` | Branch-aware MPT: `pendingRef`, `BranchHandle`, `checkout/commit`, `finalizeBranch` (#56). Phase 0/1 writes live here; Phase 2 transition triggers `finalizeBranch`. Phase-3 `pruneBelow(ord)` (commit `173e6a7d`, #139) drops `undoJournalRef` and `finalizedRef` entries strictly below the archival watermark; idempotent and irreversible. `unsafe_reset` leaf primitive called only by `RebootstrapOrchestrator` (#141). |
 | `modules/node-shared/.../nakamoto/ChainSelection.scala` | Taktikos maxvalid-tk (short forks, Phase 0/1) + Ouroboros Genesis maxvalid-bg density rule (deep forks; per the approved design also the Phase-2 band adjudicator down to k₂ — implementation pending, currently clamped at k₁). |
