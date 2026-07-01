@@ -799,10 +799,14 @@ object ShardCheckpointProducer {
         * (`JsonSerializer[F].deserialize[A](binary.value.content).map(_.toOption)`), so the producer reads byte-equivalent artifacts to the
         * gl0 acceptance path.
         */
+      // A binary whose content is not a decodable currency incremental snapshot yields NO artifacts, never a
+      // crash: `handleError` collapses a RAISED deserialize (e.g. malformed/non-snapshot bytes NPE-ing the JSON
+      // layer) to empty, mirroring how the `Left` case already folds to empty.
       private def decodeArtifacts(binary: Signed[StateChannelSnapshotBinary]): F[List[SharedArtifact]] =
         JsonSerializer[F]
           .deserialize[Signed[CurrencyIncrementalSnapshot]](binary.value.content)
           .map(_.toOption.fold(List.empty[SharedArtifact])(_.value.artifacts.fold(List.empty[SharedArtifact])(_.toList)))
+          .handleError(_ => List.empty[SharedArtifact])
 
       /** Chain-link-order the buffered binaries off the gl0 DEPTH-K-FINALIZED-base per-MG tip (S2; EXECUTION-SHARDING design R-2).
         *

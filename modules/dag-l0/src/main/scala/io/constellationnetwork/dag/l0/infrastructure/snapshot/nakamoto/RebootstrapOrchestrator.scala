@@ -58,13 +58,13 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *
   * ==Enablement (currently ON; target OFF once density-past-k₁ (S3) lands + is e2e-validated)==
   *
-  * Gated by typed HOCON `SharedConfig.nakamoto.rebootstrapEnabled` (`application.conf` `rebootstrap-enabled`, default `true`; env
-  * override `${?NAKAMOTO_REBOOTSTRAP_ENABLED}`), passed as the `enabled` param to `run`. It ships ON because a locked-out node otherwise
-  * forks the global mptRoot forever (the sharded data-app-fee reorg storm) — so this is the PRIMARY divergent-self-finalize recovery
-  * TODAY. TARGET STATE = OFF: once the density-past-k₁ deep-reorg path (Track-3 S3, flag `band-density-reorg-enabled`) lands and is
-  * e2e-validated, band-density reorg SUPERSEDES this node-level reset as the primary recovery and the default flips to `false` — the
-  * orchestrator is then RETAINED as a manual last-resort escape hatch (operators flip ON per-node via the env override). Do NOT flip the
-  * default until S3+S4 are e2e-green and the deep-fork sim passes (Track-3 S5 gate).
+  * Gated by typed HOCON `SharedConfig.nakamoto.rebootstrapEnabled` (`application.conf` `rebootstrap-enabled`, default `true`; env override
+  * `${?NAKAMOTO_REBOOTSTRAP_ENABLED}`), passed as the `enabled` param to `run`. It ships ON because a locked-out node otherwise forks the
+  * global mptRoot forever (the sharded data-app-fee reorg storm) — so this is the PRIMARY divergent-self-finalize recovery TODAY. TARGET
+  * STATE = OFF: once the density-past-k₁ deep-reorg path (Track-3 S3, flag `band-density-reorg-enabled`) lands and is e2e-validated,
+  * band-density reorg SUPERSEDES this node-level reset as the primary recovery and the default flips to `false` — the orchestrator is then
+  * RETAINED as a manual last-resort escape hatch (operators flip ON per-node via the env override). Do NOT flip the default until S3+S4 are
+  * e2e-green and the deep-fork sim passes (Track-3 S5 gate).
   */
 object RebootstrapOrchestrator {
 

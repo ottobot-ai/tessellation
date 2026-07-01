@@ -45,8 +45,8 @@ import weaver.MutableIOSuite
 /** Track-1 I-PIN determinism forcing-test (TDD target-lock).
   *
   * THE PROPERTY under test: two invocations of `CurrencySnapshotAcceptanceManager.accept` that differ ONLY in the node-local GL0 head
-  * (`lastGlobalSnapshotStorage`) but carry the SAME recorded/pinned `globalSyncView` (validator path, `forcedGlobalSyncView`) must produce a
-  * BYTE-IDENTICAL `stateProof`. `CurrencySnapshotStateProof` has a derevo-derived `Eq` over its all-`Hash` fields, so structural `Eq` ==
+  * (`lastGlobalSnapshotStorage`) but carry the SAME recorded/pinned `globalSyncView` (validator path, `forcedGlobalSyncView`) must produce
+  * a BYTE-IDENTICAL `stateProof`. `CurrencySnapshotStateProof` has a derevo-derived `Eq` over its all-`Hash` fields, so structural `Eq` ==
   * byte identity; `expect.eql(rA.stateProof, rB.stateProof)` is therefore an exact byte-equality assertion.
   *
   * WHY IT IS RED TODAY (the I-PIN impurity): `accept` reads the node-local head at `CurrencySnapshotAcceptanceManager` (`getCombined` →
@@ -54,8 +54,8 @@ import weaver.MutableIOSuite
   * head-sourced `metagraphSyncData` gates which unapplied cross-shard global ordinals are folded into `metagraphIdSpendTransactions`
   * (CSAM:467), whose SpendActions MOVE balances via `updateCurrencyBalancesBySpendTransactions` (CSAM:565) — and the balances land in
   * `csi.balances`, hence `stateProof.balancesProof`. So a node whose local head advertises an unapplied cross-shard ordinal computes a
-  * DIFFERENT `stateProof` than a node whose local head does not — even though both pin the SAME anchor. That is the impurity I-PIN removes by
-  * rerouting the read to the pinned anchor; once it lands, both invocations fold identical cross-shard state and this test goes GREEN.
+  * DIFFERENT `stateProof` than a node whose local head does not — even though both pin the SAME anchor. That is the impurity I-PIN removes
+  * by rerouting the read to the pinned anchor; once it lands, both invocations fold identical cross-shard state and this test goes GREEN.
   *
   * FORCING LEVER (per spec precondition #5): the reliable lever is the SpendAction VALUE carried via `metagraphSyncData` divergence, NOT a
   * bare head-ordinal difference (which spuriously passes pre-fix). Head A's `metagraphSyncData` names an unapplied global ordinal (= the
@@ -64,14 +64,13 @@ import weaver.MutableIOSuite
   *
   * LOAD-BEARING PRECONDITIONS honored below:
   *   1. The SpendAction moves a REAL balance and `source` is FUNDED (`ctx.snapshotInfo.balances(source) >= amount`) so `Balance.minus`
-  *      (CSAM:571 path) does not underflow-and-raise — the test asserts RED, it must not ERROR.
-  *   2. `forcedGlobalSyncView` hash-pins the anchor that `getGlobalSnapshotByOrdinal` resolves, so the forced-view hash guard (CSAM:376-386)
-  *      passes instead of raising.
-  *   3. `getGlobalSnapshotByOrdinal` (and the empty `getLastN`) are IDENTICAL across both managers — ONLY `lastGlobalSnapshotStorage` differs.
-  *   4. The SAME `Hasher` instance is threaded to both snapshot builders and both `accept` calls.
-  *   5. `FieldsAddedOrdinals` is all-empty ⇒ every threshold is `SnapshotOrdinal.MinValue`, so both head ordinals (150, 120) clear the
-  *      tessellation-3 migration boundary and BOTH emit the extended `csi` fields — the field-gating head-leak (`snapshotOrdinalToCheckFields
-  *      = lastUnsyncGlobalSnapshot.ordinal`, CSAM:577) is INERT and cannot spuriously flip a field. The ONLY effective difference is balances.
+  *      (CSAM:571 path) does not underflow-and-raise — the test asserts RED, it must not ERROR. 2. `forcedGlobalSyncView` hash-pins the
+  *      anchor that `getGlobalSnapshotByOrdinal` resolves, so the forced-view hash guard (CSAM:376-386) passes instead of raising. 3.
+  *      `getGlobalSnapshotByOrdinal` (and the empty `getLastN`) are IDENTICAL across both managers — ONLY `lastGlobalSnapshotStorage`
+  *      differs. 4. The SAME `Hasher` instance is threaded to both snapshot builders and both `accept` calls. 5. `FieldsAddedOrdinals` is
+  *      all-empty ⇒ every threshold is `SnapshotOrdinal.MinValue`, so both head ordinals (150, 120) clear the tessellation-3 migration
+  *      boundary and BOTH emit the extended `csi` fields — the field-gating head-leak (`snapshotOrdinalToCheckFields
+  * \= lastUnsyncGlobalSnapshot.ordinal`, CSAM:577) is INERT and cannot spuriously flip a field. The ONLY effective difference is balances.
   *
   * TWO SEPARATE managers: the head-storage `set()` guard forbids swapping divergent heads on one storage, and separate managers keep the
   * `globalSnapshotsAlreadyProcessed` cache from contaminating call 2.
@@ -137,19 +136,19 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
       SortedMap.empty, // balances
       SortedMap.empty, // lastCurrencySnapshots
       SortedMap.empty, // lastCurrencySnapshotsProofs
-      None,            // activeAllowSpends
-      None,            // activeTokenLocks
-      None,            // tokenLockBalances
-      None,            // lastAllowSpendRefs
-      None,            // lastTokenLockRefs
+      None, // activeAllowSpends
+      None, // activeTokenLocks
+      None, // tokenLockBalances
+      None, // lastAllowSpendRefs
+      None, // lastTokenLockRefs
       Some(SortedMap.empty), // updateNodeParameters
       Some(SortedMap.empty), // activeDelegatedStakes
       Some(SortedMap.empty), // delegatedStakesWithdrawals
       Some(SortedMap.empty), // activeNodeCollaterals
       Some(SortedMap.empty), // nodeCollateralWithdrawals
       Some(SortedMap.empty), // priceState
-      metagraphSyncData,     // metagraphSyncData  <-- the node-local head leak lever
-      SortedMap.empty        // historicalStakeSnapshots
+      metagraphSyncData, // metagraphSyncData  <-- the node-local head leak lever
+      SortedMap.empty // historicalStakeSnapshots
     )
 
   /** Build a `Hashed[GlobalIncrementalSnapshot]` at `ordinal` carrying `spendActions`. Mirrors
@@ -178,13 +177,13 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
           stateProof = sp,
           Some(SortedSet.empty), // allowSpendBlocks
           Some(SortedSet.empty), // tokenLockBlocks
-          spendActions,          // spendActions  <-- cross-shard SpendAction injected here
+          spendActions, // spendActions  <-- cross-shard SpendAction injected here
           Some(SortedMap.empty), // updateNodeParameters
           Some(SortedSet.empty), // artifacts
           Some(SortedMap.empty), // activeDelegatedStakes
           Some(SortedMap.empty), // delegatedStakesWithdrawals
           Some(SortedMap.empty), // activeNodeCollaterals
-          Some(SortedMap.empty)  // nodeCollateralWithdrawals
+          Some(SortedMap.empty) // nodeCollateralWithdrawals
         ),
         NonEmptySet.fromSetUnsafe(SortedSet(SignatureProof(ID.Id(Hex("")), Signature(Hex("")))))
       ).toHashed[IO]
@@ -197,7 +196,12 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
     environment: AppEnvironment,
     fieldsAddedOrdinals: FieldsAddedOrdinals,
     head: (Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)
-  )(implicit h: Hasher[IO], j: JsonSerializer[IO], ks: KryoSerializer[IO], sp: SecurityProvider[IO]): IO[CurrencySnapshotAcceptanceManager[IO]] = {
+  )(
+    implicit h: Hasher[IO],
+    j: JsonSerializer[IO],
+    ks: KryoSerializer[IO],
+    sp: SecurityProvider[IO]
+  ): IO[CurrencySnapshotAcceptanceManager[IO]] = {
     implicit val csps: CurrencyStateProofSelector = CurrencyStateProofSelector.instance
 
     val validators = SharedValidators
@@ -323,7 +327,9 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
       // Head A: local head at ord=150 whose metagraphSyncData advertises the anchor ordinal as an UNAPPLIED cross-shard change.
       headA <- mkGlobalSnapshot(
         headAOrdinal,
-        mkGlobalInfo(Some(SortedMap(metagraphId -> MetagraphSyncDataInfo(anchorOrdinal, EpochProgress.MinValue, SortedSet(anchorOrdinal))))),
+        mkGlobalInfo(
+          Some(SortedMap(metagraphId -> MetagraphSyncDataInfo(anchorOrdinal, EpochProgress.MinValue, SortedSet(anchorOrdinal))))
+        ),
         None
       )
       headAInfo = mkGlobalInfo(
@@ -385,8 +391,8 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
 
   /** BLOCKER-1b: with a FIXED pinned anchor and two divergent heads that STRADDLE a fields-added boundary, the recomputed `stateProof` must
     * be byte-identical — proving the I-PIN re-key made `snapshotOrdinalToCheckFields` (the optional-CSI-field emission gate, CSAM ~621) a
-    * pure function of the RECORDED `globalSyncView.ordinal`, NOT the node-local head. If it were still head-keyed, a head below the boundary
-    * and a head above it would emit a different optional-field set at the SAME anchor and diverge. numShards=1 (no cross-shard).
+    * pure function of the RECORDED `globalSyncView.ordinal`, NOT the node-local head. If it were still head-keyed, a head below the
+    * boundary and a head above it would emit a different optional-field set at the SAME anchor and diverge. numShards=1 (no cross-shard).
     */
   private def runTwoHeadsAtAnchor(
     anchorOrd: SnapshotOrdinal,
@@ -437,8 +443,7 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
       (ord(4915255L), ord(4915250L), ord(4915260L)) // anchor just above metagraphSyncData
     )
 
-    cases
-      .traverse { case (a, hA, hB) => runTwoHeadsAtAnchor(a, hA, hB).map { case (rA, rB) => expect.eql(rA, rB) } }
+    cases.traverse { case (a, hA, hB) => runTwoHeadsAtAnchor(a, hA, hB).map { case (rA, rB) => expect.eql(rA, rB) } }
       .map(_.combineAll)
   }
 }
