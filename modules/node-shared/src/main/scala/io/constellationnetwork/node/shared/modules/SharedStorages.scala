@@ -23,8 +23,9 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.{Last
 import io.constellationnetwork.node.shared.snapshot.currency.CurrencySnapshotEvent
 import io.constellationnetwork.schema.cluster.ClusterId
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo}
+import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security.Hasher
+import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.FileSystemMerklePatriciaProducer
 
 object SharedStorages {
@@ -83,6 +84,17 @@ object SharedStorages {
       bestTipFnRef <- Ref.of[F, F[Option[BranchId]]](
         lastGlobalSnapshotStorage.get.map(_.map(hashed => BranchId(hashed.hash)))
       )
+      // Track-3 S4 revert-executor deferred wiring (same lazy-bind pattern as `bestTipsFn`):
+      //   - `deepStateReaderRef`: the disk tier `MptOverlay.revertToOrdinal` reads for a below-RAM-window (DEEP)
+      //     revert. Default = "no deep tier" → a below-window revert fails closed. dag-l0 overrides via
+      //     `setDeepStateReader(signedBytesStore.readState)` once `GlobalSnapshotConsensus` builds the contiguous k₂ store.
+      //   - `onBaseRevertRef`: the base-revert hook fired inside every reverting overlay path. Default = no-op;
+      //     `SharedServices` overrides via `setOnBaseRevert(etaStateManager.forgetUncommitted)` once the eta manager
+      //     is built, so a reverted base drops the stale in-process eta walk cache.
+      deepStateReaderRef <- Ref.of[F, SnapshotOrdinal => F[Option[Map[Hex, Array[Byte]]]]]((_: SnapshotOrdinal) =>
+        Async[F].pure(none[Map[Hex, Array[Byte]]])
+      )
+      onBaseRevertRef <- Ref.of[F, F[Unit]](Async[F].unit)
       mptOverlay <- MptOverlay.make[F, GlobalStateKey](
         // Phase J landed two of three prerequisites for MultiBranch:
         //   1. ✅ `overlay.commit(handle, BranchId(snapshotHash), ordinal)` is now called by the proposer
@@ -112,7 +124,9 @@ object SharedStorages {
         underlying = mptStore,
         pcTree = mptOverlayParentChildTree,
         toHex = GlobalStateKey.toHex[F],
-        bestTipsFn = bestTipsFnRef.get.flatten
+        bestTipsFn = bestTipsFnRef.get.flatten,
+        deepStateReader = Some((ord: SnapshotOrdinal) => deepStateReaderRef.get.flatMap(_(ord))),
+        onBaseRevert = Some(onBaseRevertRef.get.flatten)
       )
     } yield
       new SharedStorages[F](
@@ -128,7 +142,9 @@ object SharedStorages {
         mptOverlay = mptOverlay,
         setBestTipsFn = bestTipsFnRef.set,
         bestTipFn = bestTipFnRef.get.flatten,
-        setBestTipFn = bestTipFnRef.set
+        setBestTipFn = bestTipFnRef.set,
+        setDeepStateReader = deepStateReaderRef.set,
+        setOnBaseRevert = onBaseRevertRef.set
       ) {}
 }
 
@@ -154,5 +170,13 @@ sealed abstract class SharedStorages[F[_]] private (
   // `setBestTipsFn` pattern: dag-l0 overrides via `setBestTipFn(chainStore.bestTip...)` once
   // `NakamotoChainStore` is built. The default reads `lastGlobalSnapshot.get.hash`.
   val bestTipFn: F[Option[BranchId]],
-  val setBestTipFn: F[Option[BranchId]] => F[Unit]
+  val setBestTipFn: F[Option[BranchId]] => F[Unit],
+  // Track-3 S4: override the DEEP revert-executor's disk reader. dag-l0 sets this to `signedBytesStore.readState`
+  // (the contiguous k₂ signed-bytes tier) once `GlobalSnapshotConsensus` builds it; other layers leave the
+  // default (no deep tier → a below-RAM-window `revertToOrdinal` fails closed rather than under-reverting).
+  val setDeepStateReader: (SnapshotOrdinal => F[Option[Map[Hex, Array[Byte]]]]) => F[Unit],
+  // Track-3 S4: override the overlay's base-revert hook. `SharedServices` sets this to
+  // `etaStateManager.forgetUncommitted` once the eta manager is built, so every reverting overlay path (the
+  // finalize reorg-replace arms + `revertToOrdinal`) drops the stale in-process eta walk cache.
+  val setOnBaseRevert: F[Unit] => F[Unit]
 )

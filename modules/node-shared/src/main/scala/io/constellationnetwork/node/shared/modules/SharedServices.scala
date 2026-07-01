@@ -260,6 +260,11 @@ object SharedServices {
           chainWalkFallback = nakamotoEtaChainWalkFallback.getOrElse(SharedServices.noopEtaChainWalk[F])
         )
       sharedEtaForPeriod = SharedServices.etaForPeriodCallback[F](etaStateManager)
+      // Track-3 S4: wire the overlay's base-revert hook to drop the eta walk cache on every base revert
+      // (`MptOverlay.finalizeBranch` reorg-replace arms + `MptOverlay.revertToOrdinal`). After the drop,
+      // `getEta` re-derives over the now-canonical chain via the MPT-lookup → chain-walk fallback
+      // (bootstrap-equivalence) — there is no parallel eta-revert.
+      _ <- storages.setOnBaseRevert(etaStateManager.forgetUncommitted)
       // Hierarchical-shard-checkpoints v1 — ACCEPTANCE-side production wiring (priority 1). Gated on
       // `cfg.nakamoto.sharding.numShards > 1`. At the production default `numShards = 1` this returns
       // `None` (constructs nothing) and the GSAM call below passes `None` for all three sharding params —
@@ -437,6 +442,10 @@ object SharedServices {
         updateDelegatedStakeAcceptanceManager = updateDelegatedStakeAcceptanceManager,
         updateNodeCollateralAcceptanceManager = updateNodeCollateralAcceptanceManager,
         priceStateUpdater = priceStateUpdater,
+        // Track-3 S4: exposed so the follower resync-to-canonical paths (currency-l0 `StateChannel`, currency-l1
+        // `CurrencySnapshotProcessor`) can drop the eta walk cache when they realign the MPT base to gl0's canonical
+        // GSI — the follower analog of the gl0 overlay's base-revert hook.
+        etaStateManager = etaStateManager,
         // Task #44 — the SINGLE per-node shard acceptance deps (the stateful registry: per-shard chain stores,
         // tip trackers, finality triggers, binary buffers, committee cache, adopted watermarks). Built ONCE here
         // and reused by the gl0-leader produce path: `GlobalSnapshotConsensus.make` reads
@@ -461,6 +470,9 @@ sealed abstract class SharedServices[F[_], A <: CliMethod] private (
   val updateDelegatedStakeAcceptanceManager: UpdateDelegatedStakeAcceptanceManager[F],
   val updateNodeCollateralAcceptanceManager: UpdateNodeCollateralAcceptanceManager[F],
   val priceStateUpdater: PriceStateUpdater[F],
+  // Track-3 S4: the per-layer eta resolver. Exposed so follower resync-to-canonical paths can call
+  // `forgetUncommitted` on a base revert (the follower analog of the gl0 overlay's base-revert hook).
+  val etaStateManager: io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager[F],
   // Task #44 — the single per-node shard acceptance deps, owned here and threaded into the gl0-leader
   // produce path (`GlobalSnapshotConsensus.make`) so adopt ↔ produce ↔ heal share ONE registry.
   val shardAcceptanceDeps: Option[ShardCheckpointWiring.AcceptanceDeps[F]]

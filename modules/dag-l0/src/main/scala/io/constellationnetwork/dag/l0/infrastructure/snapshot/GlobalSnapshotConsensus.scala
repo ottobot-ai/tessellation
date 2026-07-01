@@ -198,6 +198,11 @@ object GlobalSnapshotConsensus {
     // tentative fork head). Wired below once `chainStore` exists; the default in SharedStorages
     // reads `lastGlobalSnapshot.head.hash` which lags during fork recovery, hence the override.
     setBestTipFn: F[Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId]] => F[Unit],
+    // Track-3 S4: setter on `SharedStorages` for the DEEP revert-executor's disk reader. Wired below to
+    // `signedBytesStore.readState` (the contiguous k₂ signed-bytes tier) so `MptOverlay.revertToOrdinal` can rebuild
+    // the base from disk for a fork ordinal below the in-memory RAM undo-journal window. The default in SharedStorages
+    // is "no deep tier" (a below-window revert fails closed); only gl0 retains the deep tier, so only gl0 overrides.
+    setDeepStateReader: (SnapshotOrdinal => F[Option[Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]]]) => F[Unit],
     // #117/#118 Phase 2: branch-aware reader used by the snapshot binary fee calculator (and
     // any consensus-internal call site that needs read access at the chain's bestTip). Under
     // MultiBranch this picks up the chain's pending writes; the legacy `mptStore` path saw
@@ -403,6 +408,11 @@ object GlobalSnapshotConsensus {
           )
         )
         .toResource
+      // Track-3 S4: point the overlay's DEEP revert-executor at this contiguous k₂ signed-bytes tier. When a density
+      // reorg (S3) reverts to a fork ordinal below the in-memory RAM undo-journal window, `MptOverlay.revertToOrdinal`
+      // reads the signed bytes here (`deleteAbove(fork)` + `loadBytes(readState(fork))`) to rebuild a byte-identical
+      // base; a fork deeper than the retained window returns `None` → fail-closed `RevertGapError`.
+      _ <- setDeepStateReader(signedBytesStore.readState).toResource
       // SERVED ring: bounded ordinal-keyed ring of recent FINALIZED per-ordinal accumulators (the ml0-side
       // analogue of `recentFollowProjectionsRef`). `SnapshotLeaderLoop` promotes into it at the SAME finalize
       // sinks, trimmed to the last `GlobalChangeSetService.recentAccumulatorsToKeep`. A later slice wires

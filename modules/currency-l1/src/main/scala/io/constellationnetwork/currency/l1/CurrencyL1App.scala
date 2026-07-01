@@ -179,7 +179,10 @@ abstract class CurrencyL1App(
         services.globalL0,
         storages.globalL0Alignment,
         sharedStorages.mptStore,
-        followMirrorRef
+        followMirrorRef,
+        // Track-3 S4: drop the eta walk cache on the resync-to-canonical base realign (follower analog of the gl0
+        // overlay base-revert hook). Inert-and-redundant on cl1/dl1 (no-op eta walk + MPT-primary getEta).
+        sharedServices.etaStateManager.forgetUncommitted
       )
       programs = Programs
         .make[IO, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotInfo, Run](

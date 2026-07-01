@@ -63,6 +63,18 @@ trait EtaStateManager[F[_]] {
     *     bootstrap edge cases). Period 1 follows the COMPUTED convention (#259) so it byte-matches the wire / eligibility / committee eta.
     */
   def getEta(period: Long)(implicit hasher: Hasher[F]): F[Array[Byte]]
+
+  /** Drop the in-process chain-walk recompute-suppression cache (`walkCacheRef`). Track-3 S4: invoked on EVERY base-reverting path (the MPT
+    * base revert `MptOverlay.revertToOrdinal` / finalize reorg-replace arms, and the follower resync-to-canonical) so a
+    * subsequently-adopted CANONICAL branch does not read a stale eta that was computed by walking the REVERTED (pre-reorg) chain.
+    *
+    * There is deliberately NO parallel eta-revert: after the cache is dropped, [[getEta]] re-derives via the existing MPT-lookup →
+    * `chainWalkFallback` path over the now-canonical chain — bootstrap-equivalent to a fresh peer that never held the stale entry. The
+    * durable per-period eta record lives in the MPT (written at each period boundary) and is reverted WITH the base by the very same
+    * `deleteAbove`/`readState`/re-fold machinery, so clearing only the in-process suppression cache is sufficient and safe. Idempotent:
+    * clearing an already-empty cache is a no-op.
+    */
+  def forgetUncommitted: F[Unit]
 }
 
 object EtaStateManager {
@@ -97,6 +109,11 @@ object EtaStateManager {
     // map churn is at-most one entry per boundary crossing.
     Ref.of[F, SortedMap[EtaPeriod, Array[Byte]]](SortedMap.empty[EtaPeriod, Array[Byte]]).map { walkCacheRef =>
       new EtaStateManager[F] {
+
+        // Track-3 S4: drop the recompute-suppression cache so post-revert `getEta` re-derives over the
+        // canonical chain (bootstrap-equivalence). `:93` promised this hatch; here is the implementation.
+        def forgetUncommitted: F[Unit] =
+          walkCacheRef.set(SortedMap.empty[EtaPeriod, Array[Byte]])
 
         def getEta(period: Long)(implicit hasher: Hasher[F]): F[Array[Byte]] =
           // Cardano/Praos bootstrap (supersedes #259): periods 0 AND 1 are genesis-derivable via

@@ -277,7 +277,9 @@ abstract class CurrencyL0App(
                       dataApplicationService,
                       keyPair,
                       mkCell,
-                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value
+                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value,
+                      // Track-3 S4: follower base-revert hook — drop the eta walk cache on resync-to-canonical.
+                      sharedServices.etaStateManager.forgetUncommitted
                     )
                   } >>
                   gossipDaemon.startAsRegularValidator >>
@@ -311,7 +313,9 @@ abstract class CurrencyL0App(
                       dataApplicationService,
                       keyPair,
                       mkCell,
-                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value
+                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value,
+                      // Track-3 S4: follower base-revert hook — drop the eta walk cache on resync-to-canonical.
+                      sharedServices.etaStateManager.forgetUncommitted
                     )
                   } >>
                   programs.globalL0PeerDiscovery.discoverFrom(cfg.globalL0Peer) >>
@@ -359,7 +363,9 @@ abstract class CurrencyL0App(
                       dataApplicationService,
                       keyPair,
                       mkCell,
-                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value
+                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value,
+                      // Track-3 S4: follower base-revert hook — drop the eta walk cache on resync-to-canonical.
+                      sharedServices.etaStateManager.forgetUncommitted
                     )
                   } >>
                   storages.node.tryModifyState(
@@ -459,7 +465,9 @@ abstract class CurrencyL0App(
                       dataApplicationService,
                       keyPair,
                       mkCell,
-                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value
+                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value,
+                      // Track-3 S4: follower base-revert hook — drop the eta walk cache on resync-to-canonical.
+                      sharedServices.etaStateManager.forgetUncommitted
                     )
                     _ <-
                       if (cfg.environment =!= AppEnvironment.Dev) {
@@ -562,7 +570,9 @@ abstract class CurrencyL0App(
                   dataApplicationService,
                   keyPair,
                   mkCell,
-                  sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value
+                  sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value,
+                  // Track-3 S4: follower base-revert hook — drop the eta walk cache on resync-to-canonical.
+                  sharedServices.etaStateManager.forgetUncommitted
                 )
                 .compile
                 .drain

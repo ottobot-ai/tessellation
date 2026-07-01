@@ -255,4 +255,41 @@ object EtaStateManagerSuite extends MutableIOSuite {
       out <- mgr.getEta(2L)
     } yield expect.same(true, out.sameElements(mptEtaBytes))
   }
+
+  // Track-3 S4 eta gate: after a base revert drops the in-process walk cache via `forgetUncommitted`,
+  // `getEta` must re-derive over the now-canonical chain — byte-identical to a fresh bootstrap peer that
+  // never held the stale (pre-reorg) entry. There is no parallel eta-revert; the MPT-lookup → chain-walk
+  // path is the single source of truth.
+  test("forgetUncommitted: drops the walk cache so getEta re-derives over the canonical chain (=== fresh bootstrap peer)") { res =>
+    implicit val (h, _) = res
+    // Pre-reorg chain outputs vs the canonical (post-reorg) chain outputs — deliberately different so a
+    // stale cache is observable.
+    val preReorg = List[(Long, Array[Byte])]((0L, Array.fill[Byte](16)(0x01.toByte)))
+    val canonical = List[(Long, Array[Byte])]((0L, Array.fill[Byte](16)(0x09.toByte)))
+    for {
+      mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
+      walkRef <- Ref.of[IO, List[(Long, Array[Byte])]](preReorg)
+      reader = stubReader(mptRef)
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, _ => walkRef.get)
+      // Populate the walk cache from the PRE-reorg chain.
+      staleComputed <- mgr.getEta(2L)
+      // Reorg the underlying chain to the canonical branch. Without a cache drop the suppression cache
+      // still serves the pre-reorg eta.
+      _ <- walkRef.set(canonical)
+      stillStale <- mgr.getEta(2L)
+      // S4 base-revert hook: drop the cache → getEta re-derives over the canonical chain.
+      _ <- mgr.forgetUncommitted
+      reDerived <- mgr.getEta(2L)
+      // A fresh bootstrap peer that only ever saw the canonical chain.
+      freshMgr <- EtaStateManager.make[IO](genesisEta, reader, _ => IO.pure(canonical))
+      freshEta <- freshMgr.getEta(2L)
+    } yield
+      expect.all(
+        staleComputed.sameElements(EtaCalculation.computeEta(genesisEta, 2L, preReorg.map(_._2))),
+        stillStale.sameElements(staleComputed), // cache suppressed the re-walk (stale value served)
+        reDerived.sameElements(EtaCalculation.computeEta(genesisEta, 2L, canonical.map(_._2))),
+        !reDerived.sameElements(stillStale), // the drop actually changed the answer
+        reDerived.sameElements(freshEta) // === fresh bootstrap peer's eta
+      )
+  }
 }

@@ -299,6 +299,7 @@ object Services {
             sharedStorages.mptOverlay,
             sharedStorages.setBestTipsFn,
             sharedStorages.setBestTipFn,
+            sharedStorages.setDeepStateReader,
             pendingReader,
             eventMempoolService,
             eventGossipClient,

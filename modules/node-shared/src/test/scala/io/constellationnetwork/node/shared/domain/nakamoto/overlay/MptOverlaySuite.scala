@@ -1,6 +1,6 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 
-import cats.effect.{IO, Resource}
+import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
@@ -1946,5 +1946,246 @@ object MptOverlaySuite extends MutableIOSuite {
       _ <- overlay.unsafe_reset
       readAfter <- overlay.get[Balance](BranchId.base, key)
     } yield expect(readAfter.contains(Balance(NonNegLong(7L))))
+  }
+
+  // ============================================================
+  // Track-3 S4 — revertToOrdinal (revert-executor) determinism gates
+  // ============================================================
+
+  private def ord(n: Long): SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(n))
+
+  // Compare two raw byte maps for structural (byte-level) equality — `Array[Byte]` has reference
+  // equality, so `==` on the maps is NOT sufficient. This is the byte-determinism assertion primitive.
+  private def sameBytes(a: Map[Hex, Array[Byte]], b: Map[Hex, Array[Byte]]): Boolean =
+    a.keySet == b.keySet && a.forall { case (k, v) => b.get(k).exists(java.util.Arrays.equals(_, v)) }
+
+  // Snapshot the base's raw bytes, deep-copying each value so later folds can't mutate the captured view.
+  private def snapshotBytes(store: MptStore[IO, GlobalStateKey]): IO[Map[Hex, Array[Byte]]] =
+    store.allEntriesAsBytes.map(_.map { case (k, v) => k -> v.clone() })
+
+  // Fold one key→value into base at `ordN` via the ordinary commit/finalize path (the SAME fold path
+  // the re-fold uses), building the RAM undo journal entry at that ordinal. Each block checks out from
+  // the base (`parentP`) because `finalizeBranch` clears pending.
+  private def foldAt(
+    overlay: MptOverlay[IO, GlobalStateKey],
+    tip: BranchId,
+    ordN: Long,
+    key: GlobalStateKey,
+    value: Balance
+  ): IO[Unit] =
+    for {
+      h <- overlay.checkout(parentP)
+      _ <- h.insert[Balance](key, value)
+      _ <- overlay.commit(h, tip, ord(ordN))
+      _ <- overlay.finalizeBranch(tip, ord(ordN))
+    } yield ()
+
+  private def bid(c: Char): BranchId = BranchId(Hash(c.toString * 64))
+
+  private def mkMultiBranchDeep(
+    diskRef: Ref[IO, Map[Long, Map[Hex, Array[Byte]]]],
+    onRevertRef: Ref[IO, Int]
+  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[(MptStore[IO, GlobalStateKey], MptOverlay[IO, GlobalStateKey])] =
+    for {
+      store <- mkStore
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.productionDefault,
+        store,
+        pcTree,
+        GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId]),
+        deepStateReader = Some((o: SnapshotOrdinal) => diskRef.get.map(_.get(o.value.value))),
+        onBaseRevert = Some(onRevertRef.update(_ + 1))
+      )
+    } yield (store, overlay)
+
+  test("S4 SHALLOW: revertToOrdinal replays the RAM undo journal to a BYTE-IDENTICAL base; re-fold reproduces; idempotent") { res =>
+    implicit val (h, _, js) = res
+    val k1 = gskBalance(40001)
+    val k2 = gskBalance(40002)
+    val k3 = gskBalance(40003)
+    val k4 = gskBalance(40004)
+    val k5 = gskBalance(40005)
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+      _ <- store.insert[Balance](gskBalance(40000), Balance(NonNegLong(1L))) // genesis so base never empty
+
+      _ <- foldAt(overlay, bid('1'), 1L, k1, Balance(NonNegLong(11L)))
+      _ <- foldAt(overlay, bid('2'), 2L, k2, Balance(NonNegLong(22L)))
+      _ <- foldAt(overlay, bid('3'), 3L, k3, Balance(NonNegLong(33L)))
+      baseAt3 <- snapshotBytes(store)
+      rootAt3 <- store.build(ord(3L)).map(_.toOption.map(_.rootHash))
+
+      _ <- foldAt(overlay, bid('4'), 4L, k4, Balance(NonNegLong(44L)))
+      _ <- foldAt(overlay, bid('5'), 5L, k5, Balance(NonNegLong(55L)))
+      baseAt5 <- snapshotBytes(store)
+      rootAt5 <- store.build(ord(5L)).map(_.toOption.map(_.rootHash))
+
+      // Fork ordinal 3 is inside the RAM window (journal holds 4,5) → SHALLOW.
+      outcome <- overlay.revertToOrdinal(ord(3L))
+      afterRevert <- snapshotBytes(store)
+      rootAfterRevert <- store.build(ord(3L)).map(_.toOption.map(_.rootHash))
+
+      // Re-fold the SAME denser branch (ords 4,5) through the ordinary fold path.
+      _ <- foldAt(overlay, bid('a'), 4L, k4, Balance(NonNegLong(44L)))
+      _ <- foldAt(overlay, bid('b'), 5L, k5, Balance(NonNegLong(55L)))
+      afterRefold <- snapshotBytes(store)
+      rootAfterRefold <- store.build(ord(5L)).map(_.toOption.map(_.rootHash))
+
+      // Idempotent: a second revert to 3 (base already advanced to 5 via re-fold, journal repopulated) then
+      // an immediate repeat lands NoOp with an unchanged base.
+      _ <- overlay.revertToOrdinal(ord(3L))
+      idemFirst <- snapshotBytes(store)
+      idemSecond <- overlay.revertToOrdinal(ord(3L))
+      idemAfter <- snapshotBytes(store)
+    } yield
+      expect.all(
+        outcome == RevertOutcome.Shallow(2),
+        sameBytes(afterRevert, baseAt3), // byte-identical revert
+        rootAfterRevert == rootAt3,
+        sameBytes(afterRefold, baseAt5), // re-fold reproduces the byte-identical dense base
+        rootAfterRefold == rootAt5,
+        idemSecond == RevertOutcome.NoOp, // second call idempotent
+        sameBytes(idemAfter, idemFirst)
+      )
+  }
+
+  test("S4 DEEP: below-window revert rebuilds a BYTE-IDENTICAL base from disk readState; re-fold reproduces; hook fires") { res =>
+    implicit val (h, _, js) = res
+    val k1 = gskBalance(41001)
+    val k2 = gskBalance(41002)
+    val k3 = gskBalance(41003)
+    val k4 = gskBalance(41004)
+    val k5 = gskBalance(41005)
+    for {
+      diskRef <- Ref.of[IO, Map[Long, Map[Hex, Array[Byte]]]](Map.empty)
+      onRevertRef <- Ref.of[IO, Int](0)
+      pair <- mkMultiBranchDeep(diskRef, onRevertRef)
+      (store, overlay) = pair
+      _ <- store.insert[Balance](gskBalance(41000), Balance(NonNegLong(1L)))
+
+      _ <- foldAt(overlay, bid('1'), 1L, k1, Balance(NonNegLong(11L)))
+      _ <- foldAt(overlay, bid('2'), 2L, k2, Balance(NonNegLong(22L)))
+      // Capture the disk-retained signed bytes at the (deep) fork ordinal 2 — the S2 contiguous tier analog.
+      baseAt2 <- snapshotBytes(store)
+      rootAt2 <- store.build(ord(2L)).map(_.toOption.map(_.rootHash))
+      _ <- diskRef.update(_.updated(2L, baseAt2))
+
+      _ <- foldAt(overlay, bid('3'), 3L, k3, Balance(NonNegLong(33L)))
+      _ <- foldAt(overlay, bid('4'), 4L, k4, Balance(NonNegLong(44L)))
+      _ <- foldAt(overlay, bid('5'), 5L, k5, Balance(NonNegLong(55L)))
+      baseAt5 <- snapshotBytes(store)
+
+      // Simulate the RAM window bound: prune the in-memory journal below 4, so ordinal 3 (needed to walk
+      // back to fork 2) is gone → the shallow path can't reach fork 2 → DEEP disk path.
+      _ <- overlay.pruneBelow(ord(4L))
+      outcome <- overlay.revertToOrdinal(ord(2L))
+      revertCount <- onRevertRef.get
+      afterRevert <- snapshotBytes(store)
+      rootAfterRevert <- store.build(ord(2L)).map(_.toOption.map(_.rootHash))
+
+      // Re-fold the denser branch (ords 3,4,5) → reproduces the byte-identical dense base.
+      _ <- foldAt(overlay, bid('c'), 3L, k3, Balance(NonNegLong(33L)))
+      _ <- foldAt(overlay, bid('d'), 4L, k4, Balance(NonNegLong(44L)))
+      _ <- foldAt(overlay, bid('e'), 5L, k5, Balance(NonNegLong(55L)))
+      afterRefold <- snapshotBytes(store)
+
+      // Idempotent: revert to 2 again (the re-fold repopulated the journal, so this lands via the SHALLOW path
+      // this time) → base@2, then an immediate repeat is a NoOp with an unchanged base.
+      _ <- overlay.revertToOrdinal(ord(2L))
+      idemBase <- snapshotBytes(store)
+      idemSecond <- overlay.revertToOrdinal(ord(2L))
+      idemAfter <- snapshotBytes(store)
+    } yield
+      expect.all(
+        outcome == RevertOutcome.Deep(baseAt2.size),
+        revertCount >= 1, // onBaseRevert (eta forgetUncommitted) hook fired
+        sameBytes(afterRevert, baseAt2), // byte-identical disk-rebuilt base
+        rootAfterRevert == rootAt2,
+        sameBytes(afterRefold, baseAt5), // re-fold reproduces the byte-identical dense base
+        idemSecond == RevertOutcome.NoOp,
+        sameBytes(idemAfter, idemBase)
+      )
+  }
+
+  test("S4 GAP: a fork below BOTH the RAM window and the disk tier fails closed (RevertGapError), never under-reverts") { res =>
+    implicit val (h, _, js) = res
+    for {
+      diskRef <- Ref.of[IO, Map[Long, Map[Hex, Array[Byte]]]](Map.empty) // disk tier retains NOTHING at fork 2
+      onRevertRef <- Ref.of[IO, Int](0)
+      pair <- mkMultiBranchDeep(diskRef, onRevertRef)
+      (store, overlay) = pair
+      _ <- store.insert[Balance](gskBalance(42000), Balance(NonNegLong(1L)))
+      _ <- foldAt(overlay, bid('1'), 1L, gskBalance(42001), Balance(NonNegLong(11L)))
+      _ <- foldAt(overlay, bid('2'), 2L, gskBalance(42002), Balance(NonNegLong(22L)))
+      _ <- foldAt(overlay, bid('3'), 3L, gskBalance(42003), Balance(NonNegLong(33L)))
+      _ <- foldAt(overlay, bid('4'), 4L, gskBalance(42004), Balance(NonNegLong(44L)))
+      _ <- foldAt(overlay, bid('5'), 5L, gskBalance(42005), Balance(NonNegLong(55L)))
+      baseBefore <- snapshotBytes(store)
+
+      _ <- overlay.pruneBelow(ord(4L)) // journal window floor now 4 → fork 2 unreachable in RAM
+      // deepStateReader(2) returns None (disk empty) → must fail closed.
+      attempted <- overlay.revertToOrdinal(ord(2L)).attempt
+      baseAfter <- snapshotBytes(store)
+    } yield
+      expect.all(
+        attempted match {
+          case Left(_: RevertGapError) => true
+          case _                       => false
+        },
+        // Fail-closed means NO under-revert: the base is untouched by the aborted attempt.
+        sameBytes(baseAfter, baseBefore)
+      )
+  }
+
+  test("S4 cross-node convergence: two overlays that revert then re-fold the same denser branch reach an IDENTICAL mptRoot") { res =>
+    implicit val (h, _, js) = res
+    val k1 = gskBalance(43001)
+    val k2 = gskBalance(43002)
+    val k3 = gskBalance(43003)
+    // denser branch keys (different from the reverted-away 4,5)
+    val kd4 = gskBalance(43104)
+    val kd5 = gskBalance(43105)
+    def buildFoldRevertRefold(store: MptStore[IO, GlobalStateKey], overlay: MptOverlay[IO, GlobalStateKey]) =
+      for {
+        _ <- store.insert[Balance](gskBalance(43000), Balance(NonNegLong(1L)))
+        _ <- foldAt(overlay, bid('1'), 1L, k1, Balance(NonNegLong(11L)))
+        _ <- foldAt(overlay, bid('2'), 2L, k2, Balance(NonNegLong(22L)))
+        _ <- foldAt(overlay, bid('3'), 3L, k3, Balance(NonNegLong(33L)))
+        // original branch at 4,5 (reverted away)
+        _ <- foldAt(overlay, bid('4'), 4L, gskBalance(43004), Balance(NonNegLong(44L)))
+        _ <- foldAt(overlay, bid('5'), 5L, gskBalance(43005), Balance(NonNegLong(55L)))
+        _ <- overlay.revertToOrdinal(ord(3L))
+        // re-fold the DENSER canonical branch (same deltas on both nodes)
+        _ <- foldAt(overlay, bid('a'), 4L, kd4, Balance(NonNegLong(444L)))
+        _ <- foldAt(overlay, bid('b'), 5L, kd5, Balance(NonNegLong(555L)))
+        root <- store.build(ord(5L)).map(_.toOption.map(_.rootHash))
+      } yield root
+    for {
+      p1 <- mkMultiBranch
+      (store1, overlay1) = p1
+      p2 <- mkMultiBranch
+      (store2, overlay2) = p2
+      root1 <- buildFoldRevertRefold(store1, overlay1)
+      root2 <- buildFoldRevertRefold(store2, overlay2)
+    } yield expect.all(root1.isDefined, root1 == root2)
+  }
+
+  test("S4 Passthrough: revertToOrdinal is always NoOp") { res =>
+    implicit val (h, _, js) = res
+    for {
+      store <- mkStore
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.Passthrough,
+        store,
+        pcTree,
+        GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+      r <- overlay.revertToOrdinal(ord(7L))
+    } yield expect(r == RevertOutcome.NoOp)
   }
 }

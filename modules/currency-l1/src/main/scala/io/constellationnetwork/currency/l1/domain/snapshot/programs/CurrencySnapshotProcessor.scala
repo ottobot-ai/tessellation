@@ -77,7 +77,12 @@ object CurrencySnapshotProcessor {
     // for the gl0 own-slice follow path (#287 "send diffs"). Created ONCE at the cl1/dl1 construction site (`CurrencyL1App`).
     // `None` on cold start ⇒ next tick fetches the FULL slice; thereafter the incremental diff since the held tip. ANY verify
     // failure RESETS it to `None` so the next tick re-fetches a full from-empty slice — never regresses the safety invariant.
-    followMirrorRef: Ref[F, Option[(SnapshotOrdinal, ConsumedFieldState)]]
+    followMirrorRef: Ref[F, Option[(SnapshotOrdinal, ConsumedFieldState)]],
+    // Track-3 S4: the per-layer `EtaStateManager.forgetUncommitted` effect. Fired on the resync-to-canonical base
+    // realign so the in-process eta walk cache does not survive a base revert. On cl1/dl1 (no-op eta chain walk +
+    // MPT-primary getEta) it is inert-and-redundant, but keeps the follower symmetric with the gl0 overlay's
+    // base-revert hook and future-proofs a follower that later gains a real chain walk.
+    etaForgetUncommitted: F[Unit]
   )(
     // Captured in the processor instance so `applyGlobalSnapshotFn` can build the cl1/dl1 6th-field (`lastCurrencySnapshots`)
     // check closure, which needs it for `CurrencyIncrementalSnapshot.fromCurrencySnapshot` (genesis `Left` case). The trait's
@@ -204,6 +209,9 @@ object CurrencySnapshotProcessor {
                               case Some(bytes) => mptStore.loadBytes(bytes, canonicalSnapshot.ordinal)
                               case None        => mptStore.syncFromGlobalSnapshotInfo(canonicalState, canonicalSnapshot.ordinal)
                             }
+                            // Track-3 S4: the MPT base was just realigned to gl0's canonical GSI — drop the eta walk
+                            // cache so getEta re-derives over the canonical chain (bootstrap-equivalence).
+                            _ <- etaForgetUncommitted
                             afterBytes <- mptStore.underlying.entries
                             recomputedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes).map(_.some)
                             signedRoot = canonicalSnapshot.signed.value.stateProof.mptRoot

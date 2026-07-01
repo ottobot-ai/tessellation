@@ -76,7 +76,10 @@ object StateChannel {
     // the adopt path to derive the eligible ordinal `N − k` whose commitment the carried inclusion proof reveals, so it
     // can verify the signed smtRoot by construction. Sourced from `SharedConfig.nakamoto.confirmationDepthK(env)`
     // (resolved for the active `SharedConfig.environment` at the call site).
-    confirmationDepthK: Long
+    confirmationDepthK: Long,
+    // Track-3 S4: threaded straight into `performGlobalL0SnapshotProcess` (which owns `resyncToCanonical`) so the eta
+    // walk cache is dropped on a follower base revert. See that method's param for rationale (inert-and-redundant on ml0).
+    etaForgetUncommitted: F[Unit]
   )(
     implicit S: Supervisor[F],
     stateProofSelector: GlobalStateProofSelector,
@@ -95,7 +98,8 @@ object StateChannel {
             dataApplicationService,
             selfKeyPair,
             enqueueConsensusEventFn,
-            confirmationDepthK
+            confirmationDepthK,
+            etaForgetUncommitted
           ).handleErrorWith { error =>
             logger.error(error)("Error during global L0 snapshot processing")
           }
@@ -121,7 +125,11 @@ object StateChannel {
     selfKeyPair: KeyPair,
     enqueueConsensusEventFn: CurrencySnapshotEvent => Cell[F, StackF, _, Either[CellError, Ω], _],
     // Slice B — confirmation-depth cutoff `k`; see `run`. Used by `deriveFollowContext` to verify the signed smtRoot.
-    confirmationDepthK: Long
+    confirmationDepthK: Long,
+    // Track-3 S4: the `EtaStateManager.forgetUncommitted` effect. Fired inside `resyncToCanonical` after the MPT base is
+    // realigned to gl0's canonical GSI, so the in-process eta walk cache does not survive a base revert. Inert-and-redundant
+    // on ml0 (no-op eta chain walk + MPT-primary getEta), but keeps the follower symmetric with the gl0 base-revert hook.
+    etaForgetUncommitted: F[Unit]
   )(
     implicit S: Supervisor[F],
     stateProofSelector: GlobalStateProofSelector,
@@ -236,6 +244,9 @@ object StateChannel {
     def resyncToCanonical(failedOrdinal: SnapshotOrdinal, reason: String, clearPendingBinaries: Boolean): F[Unit] = {
       def adoptCanonical(canonicalSnapshot: Hashed[GlobalIncrementalSnapshot], canonicalState: GlobalSnapshotInfo): F[Unit] =
         for {
+          // Track-3 S4: the MPT base was just realigned to gl0's canonical GSI (loadBytes / syncFromGlobalSnapshotInfo
+          // above) — drop the eta walk cache so getEta re-derives over the canonical chain (bootstrap-equivalence).
+          _ <- etaForgetUncommitted
           _ <- storages.lastSyncGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
           _ <- sharedStorages.lastNGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)
           _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)

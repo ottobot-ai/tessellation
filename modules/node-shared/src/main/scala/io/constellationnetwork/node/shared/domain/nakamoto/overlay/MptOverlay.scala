@@ -60,6 +60,46 @@ object FinalizationOutcome {
   case object NoOp extends FinalizationOutcome
 }
 
+/** Outcome of `MptOverlay.revertToOrdinal` (Track-3 S4 revert-executor). Reverting the on-disk base to a fork ordinal so a denser branch
+  * can be re-folded takes ONE of two disjoint mechanical paths, distinguished here for telemetry / the caller's re-fold bookkeeping:
+  */
+sealed trait RevertOutcome
+object RevertOutcome {
+
+  /** SHALLOW path: the fork ordinal was inside the in-memory `undoJournalRef` window, so the base was reverted by replaying the per-ordinal
+    * reverse deltas in DESCENDING (LIFO) order — `undoStepsApplied` counts the reverse deltas applied (one per reverted ordinal). Each
+    * reverse delta was captured against the base as it stood at ITS OWN fold, so descending order is load-bearing.
+    */
+  final case class Shallow(undoStepsApplied: Int) extends RevertOutcome
+
+  /** DEEP path: the fork ordinal was below the in-memory RAM window (the journal could not reach it), so the base was rebuilt from the
+    * disk-retained signed bytes at the fork ordinal — `deleteAbove(fork)` + `loadBytes(readState(fork))`. `baseEntriesLoaded` counts the
+    * entries in the loaded byte map. Requires the disk tier (Track-3 S2 contiguous `signedBytesStore` to k₂) to hold `fork`.
+    */
+  final case class Deep(baseEntriesLoaded: Int) extends RevertOutcome
+
+  /** Nothing to revert: the base is already at-or-below the fork ordinal (idempotent second call, or a fork at/above the current tip). In
+    * passthrough mode this is ALWAYS returned (there is no overlay base to revert).
+    */
+  case object NoOp extends RevertOutcome
+}
+
+/** Fail-closed error raised by `MptOverlay.revertToOrdinal` when the fork ordinal is reachable via NEITHER the in-memory undo journal (the
+  * journal has been pruned below it) NOR the disk tier (the contiguous signed-bytes store no longer retains `forkOrdinal` — it is deeper
+  * than k₂, or the deep reader is unwired). Raising (rather than silently under-reverting to the nearest reachable ordinal) is deliberate:
+  * a base that reverted LESS than requested would re-fold the denser branch onto a mismatched anchor and silently diverge — the exact
+  * consensus-safety hazard S4 exists to prevent.
+  */
+final case class RevertGapError(
+  forkOrdinal: SnapshotOrdinal,
+  currentTip: Option[SnapshotOrdinal],
+  reason: String
+) extends RuntimeException(
+      s"MptOverlay.revertToOrdinal: cannot reach fork ordinal=${forkOrdinal.value.value} " +
+        s"(current base tip=${currentTip.map(_.value.value).map(_.toString).getOrElse("none")}); $reason. " +
+        s"Failing closed rather than under-reverting."
+    )
+
 /** Mutable handle for accumulating writes against a checked-out branch.
   *
   * In passthrough mode the writes go straight to the underlying `MptStore`. In multi-branch mode the writes accumulate into a `ChangeSet`
@@ -238,6 +278,30 @@ trait MptOverlay[F[_], K] {
     * Multi-branch: clears all four Refs. Passthrough: no-op (no per-branch state to reset).
     */
   def unsafe_reset: F[Unit]
+
+  /** Track-3 S4 revert-executor. Revert the on-disk base to the state as of `forkOrdinal` so a denser branch (deep density reorg in the
+    * `(k₂, k₁]` band, S3) can be re-folded onto it. This method ONLY reverts the base + clears pending overlay state; the RE-FOLD itself is
+    * performed by the caller re-driving the denser branch's snapshots through the ordinary `commit` / `finalizeBranch` fold path, so the
+    * follower-verified sidecar-free `mptRoot` matches by construction (no bespoke re-apply).
+    *
+    * Two disjoint mechanical paths, chosen by whether `forkOrdinal` is reachable from the IN-MEMORY reverse-delta journal:
+    *   - '''SHALLOW''' — `forkOrdinal` is within the bounded RAM `undoJournalRef` window (Heap-leak Fix A keeps it to the operational k₁):
+    *     replay the per-ordinal reverse deltas for every ordinal above `forkOrdinal` in DESCENDING (LIFO) order via the byte-deterministic
+    *     `applyUndoAt`. Descending order is load-bearing — each reverse delta was captured against the base at ITS OWN fold.
+    *   - '''DEEP''' — `forkOrdinal` is below the RAM window (journal pruned, cannot reach): rebuild the base from the disk tier — prune the
+    *     producer's on-disk state above `forkOrdinal` (`deleteAbove`), read the disk-retained signed bytes at `forkOrdinal` (Track-3 S2's
+    *     contiguous `signedBytesStore` to k₂), and load them VERBATIM as the base (`loadBytes`, same primitive follower resync uses, so the
+    *     recomputed root equals the signed root by construction).
+    *
+    * '''Fail-closed''': if `forkOrdinal` is reachable via NEITHER path (journal pruned below it AND the disk tier no longer retains it —
+    * deeper than k₂ or the deep reader is unwired), this raises [[RevertGapError]] rather than silently under-reverting to the nearest
+    * reachable ordinal (which would re-fold onto a mismatched anchor and diverge).
+    *
+    * After reverting, `pendingRef` is cleared and `lastCommittedBranchRef` is reset (mirroring the finalize reorg-replace arms) so the
+    * subsequent re-fold starts from a clean overlay, and the base-revert hook (eta `forgetUncommitted`) fires. Runs under the same mutex as
+    * `finalizeBranch` / `pruneBelow`. Passthrough: always [[RevertOutcome.NoOp]] (no overlay base to revert).
+    */
+  def revertToOrdinal(forkOrdinal: SnapshotOrdinal): F[RevertOutcome]
 }
 
 object MptOverlay {
@@ -315,11 +379,30 @@ object MptOverlay {
     underlying: MptStore[F, K],
     pcTree: ParentChildTree[F],
     toHex: K => F[Hex],
-    bestTipsFn: F[Set[BranchId]]
+    bestTipsFn: F[Set[BranchId]],
+    // Track-3 S4 DEEP revert-executor source: the disk tier that retains the signed per-ordinal byte map CONTIGUOUSLY to k₂ (production =
+    // `signedBytesStore.readState`, wired post-construction from `GlobalSnapshotConsensus`). `revertToOrdinal(fork)` uses it when `fork`
+    // is below the RAM undo-journal window. `None` = "no deep tier" (a below-window revert fails closed), which keeps the passthrough /
+    // follower / test wiring byte-identical to before S4. (`Option` rather than a defaulted function because a default value cannot see the
+    // method's own `Async[F]` implicit — the concrete "always-None" reader is materialized below where `Async` is in scope.)
+    deepStateReader: Option[SnapshotOrdinal => F[Option[Map[Hex, Array[Byte]]]]] = None,
+    // Track-3 S4 base-revert hook: fired inside every base-reverting overlay path (`revertToOrdinal` + the finalize reorg-replace arms).
+    // Production wiring passes `etaStateManager.forgetUncommitted` (deferred, set post-construction from `SharedServices`) so a reverted
+    // base drops the stale in-process eta walk cache. `None` = no-op (byte-identical to pre-S4).
+    onBaseRevert: Option[F[Unit]] = None
   ): F[MptOverlay[F, K]] =
     mode match {
-      case OverlayMode.Passthrough             => Async[F].pure(passthrough(underlying, pcTree))
-      case OverlayMode.MultiBranch(maxPending) => MultiBranch[F, K](underlying, pcTree, toHex, maxPending, bestTipsFn)
+      case OverlayMode.Passthrough => Async[F].pure(passthrough(underlying, pcTree))
+      case OverlayMode.MultiBranch(maxPending) =>
+        MultiBranch[F, K](
+          underlying,
+          pcTree,
+          toHex,
+          maxPending,
+          bestTipsFn,
+          deepStateReader.getOrElse((_: SnapshotOrdinal) => Async[F].pure(none[Map[Hex, Array[Byte]]])),
+          onBaseRevert.getOrElse(Async[F].unit)
+        )
     }
 
   /** Single-branch passthrough — correctness-equivalent to using `MptStore` directly. The `BranchId` argument on every method is ignored.
@@ -399,6 +482,12 @@ object MptOverlay {
         // Passthrough has no in-memory state to drop; writes already landed in `underlying`.
         // The base `MptStore` reset is the caller's responsibility (`syncFromGlobalSnapshotInfo`).
         Async[F].unit
+
+      def revertToOrdinal(forkOrdinal: SnapshotOrdinal): F[RevertOutcome] =
+        // Passthrough keeps no per-branch overlay state and no reverse-delta journal — there is nothing for the
+        // executor to revert. Base realignment on the passthrough path is the caller's job (follower resync via
+        // `syncFromGlobalSnapshotInfo` / `loadBytes`). Always NoOp, mirroring `finalizeBranch`.
+        Async[F].pure(RevertOutcome.NoOp: RevertOutcome)
     }
 
   private final class PassthroughHandle[F[_], K](
@@ -495,7 +584,9 @@ object MptOverlay {
       pcTree: ParentChildTree[F],
       toHex: K => F[Hex],
       maxPendingBranches: Int,
-      bestTipsFn: F[Set[BranchId]]
+      bestTipsFn: F[Set[BranchId]],
+      deepStateReader: SnapshotOrdinal => F[Option[Map[Hex, Array[Byte]]]],
+      onBaseRevert: F[Unit]
     ): F[MptOverlay[F, K]] =
       (
         Ref.of[F, Map[BranchId, BranchEntry]](Map.empty),
@@ -527,7 +618,9 @@ object MptOverlay {
           undoJournalRef,
           mutex,
           maxPendingBranches,
-          bestTipsFn
+          bestTipsFn,
+          deepStateReader,
+          onBaseRevert
         ): MptOverlay[F, K]
       }
 
@@ -541,7 +634,9 @@ object MptOverlay {
       undoJournalRef: Ref[F, SortedMap[Long, ChangeSet]],
       mutex: Semaphore[F],
       maxPendingBranches: Int,
-      bestTipsFn: F[Set[BranchId]]
+      bestTipsFn: F[Set[BranchId]],
+      deepStateReader: SnapshotOrdinal => F[Option[Map[Hex, Array[Byte]]]],
+      onBaseRevert: F[Unit]
     ) extends MptOverlay[F, K] {
 
       private val logger = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
@@ -784,6 +879,9 @@ object MptOverlay {
                         // `parentTip=canonical` (overlay walks pending→empty→base, sees the rejected bytes).
                         undoApplied <- applyUndoAt(ordinal.value.value, ordinal)
                         _ <- cleanup
+                        // Track-3 S4: base just reverted (prior canonical's fold undone) — drop the stale eta walk cache
+                        // so the adopted canonical's eta re-derives over the reverted chain (bootstrap-equivalence).
+                        _ <- onBaseRevert
                         _ <- finalizedRef.update(_.updated(ordinal, canonical))
                         _ <-
                           if (droppedCount > 0)
@@ -812,6 +910,9 @@ object MptOverlay {
                         // Without this, keys that the OLD canonical wrote but the NEW canonical doesn't touch
                         // would retain the OLD canonical's bytes after the fold, causing silent state divergence.
                         undoApplied <- applyUndoAt(ordinal.value.value, ordinal)
+                        // Track-3 S4: prior canonical's writes just reverted from base — drop the stale eta walk cache
+                        // so the new canonical's eta re-derives over the reverted-then-refolded chain (bootstrap-equivalence).
+                        _ <- onBaseRevert
                         _ <- foldIntoBase(merged, ordinal)
                         _ <- pendingRef.set(Map.empty)
                         _ <- lastCommittedBranchRef.set(none)
@@ -939,6 +1040,97 @@ object MptOverlay {
             )
           } yield ()
         }
+
+      /** Track-3 S4 revert-executor (see the trait scaladoc). Shallow (RAM journal) / deep (disk readState) / gap (fail-closed). Runs under
+        * the same `mutex` as `finalizeBranch` / `pruneBelow` so the revert is atomic w.r.t. concurrent commits/folds.
+        */
+      def revertToOrdinal(forkOrdinal: SnapshotOrdinal): F[RevertOutcome] =
+        mutex.permit.use { _ =>
+          val forkLong = forkOrdinal.value.value
+          for {
+            journal <- undoJournalRef.get
+            tipOpt <- underlying.lastPersistedOrdinal
+            outcome <- tipOpt.map(_.value.value) match {
+              case Some(tip) if tip > forkLong =>
+                // Need to revert the band (forkLong, tip]. SHALLOW iff the RAM journal holds EVERY ordinal in that
+                // band (contiguous down to forkLong+1); otherwise the journal was pruned below the fork → DEEP.
+                val needed: Seq[Long] = (forkLong + 1L) to tip
+                if (needed.forall(journal.contains)) {
+                  // SHALLOW: replay the per-ordinal reverse deltas DESCENDING (LIFO). Each was captured against the
+                  // base at ITS OWN fold, so descending order is load-bearing. `applyUndoAt` consumes (removes) each
+                  // journal entry it replays and commits at `forkOrdinal`, so after the loop the base state AND its
+                  // persisted-ordinal label are exactly `forkOrdinal`, and no journal entry above the fork survives.
+                  val descending = journal.keySet.filter(_ > forkLong).toList.sorted.reverse
+                  for {
+                    _ <- descending.traverse_(o => applyUndoAt(o, forkOrdinal))
+                    _ <- postRevertCleanup(forkLong)
+                    _ <- logger.info(
+                      s"[MptOverlay] SHALLOW revert to ordinal=$forkLong: replayed ${descending.size} RAM undo-journal " +
+                        s"reverse-delta(s) descending from tip=$tip. Base reverted; pending cleared for re-fold."
+                    )
+                  } yield RevertOutcome.Shallow(descending.size): RevertOutcome
+                } else
+                  deepRevert(forkOrdinal, forkLong, tipOpt)
+              case other =>
+                // Base already at-or-below the fork — nothing above the fork to revert. Still clear pending overlay
+                // state + drop the eta cache so an idempotent second call / a redundant caller lands cleanly.
+                for {
+                  _ <- postRevertCleanup(forkLong)
+                  _ <- logger.debug(
+                    s"[MptOverlay] revertToOrdinal($forkLong) NoOp: base tip=${other.map(_.toString).getOrElse("none")} " +
+                      s"at-or-below fork (nothing above fork to revert). Pending cleared."
+                  )
+                } yield RevertOutcome.NoOp: RevertOutcome
+            }
+          } yield outcome
+        }
+
+      /** DEEP path of `revertToOrdinal`: the RAM journal cannot reach `forkOrdinal`, so rebuild the base from the disk tier. Prune the
+        * producer's on-disk state above the fork, read the disk-retained signed bytes at the fork (Track-3 S2's contiguous
+        * `signedBytesStore` to k₂ in production, via the injected `deepStateReader`), and load them VERBATIM (`loadBytes` — same primitive
+        * follower resync uses, so the recomputed root equals the signed root by construction). Fail closed if the disk tier no longer
+        * retains the fork.
+        */
+      private def deepRevert(
+        forkOrdinal: SnapshotOrdinal,
+        forkLong: Long,
+        tipOpt: Option[SnapshotOrdinal]
+      ): F[RevertOutcome] =
+        deepStateReader(forkOrdinal).flatMap {
+          case Some(state) =>
+            for {
+              _ <- underlying.deleteAbove(forkOrdinal)
+              _ <- underlying.loadBytes(state, forkOrdinal)
+              // The RAM journal entries above the fork are now stale (base was rebuilt from disk, not unwound), so drop
+              // them; entries at-or-below the fork stay as valid undo info for any subsequent shallower revert.
+              _ <- undoJournalRef.update(_.rangeTo(forkLong))
+              _ <- postRevertCleanup(forkLong)
+              _ <- logger.info(
+                s"[MptOverlay] DEEP revert to ordinal=$forkLong: RAM journal could not reach it; rebuilt base from " +
+                  s"${state.size} disk-retained signed entries (deleteAbove + loadBytes). Pending cleared for re-fold."
+              )
+            } yield RevertOutcome.Deep(state.size): RevertOutcome
+          case None =>
+            logger.error(
+              s"[MptOverlay] revertToOrdinal($forkLong) GAP: fork ordinal is below the RAM undo-journal window AND " +
+                s"absent from the disk-retained signed-bytes tier (deeper than k₂ or deep reader unwired). Failing closed."
+            ) >>
+              (RevertGapError(
+                forkOrdinal,
+                tipOpt,
+                "fork ordinal reachable via neither the RAM undo journal nor the disk signed-bytes tier"
+              ): Throwable).raiseError[F, RevertOutcome]
+        }
+
+      /** Common tail for every `revertToOrdinal` arm: clear pending overlay state so the re-fold starts clean (mirroring the finalize
+        * reorg-replace arms), drop finalized markers strictly above the fork (so the re-fold re-finalizes those ordinals via the clean
+        * `case None` path rather than a spurious reorg-replace), and fire the base-revert hook (eta `forgetUncommitted`).
+        */
+      private def postRevertCleanup(forkLong: Long): F[Unit] =
+        pendingRef.set(Map.empty) >>
+          lastCommittedBranchRef.set(none) >>
+          finalizedRef.update(_.filter { case (o, _) => o.value.value <= forkLong }) >>
+          onBaseRevert
 
       /** Atomically apply the merged chain delta to the underlying base store.
         *
