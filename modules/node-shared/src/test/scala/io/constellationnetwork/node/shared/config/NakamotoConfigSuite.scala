@@ -38,7 +38,11 @@ object NakamotoConfigSuite extends SimpleIOSuite {
       nakamoto.keepDepthBehindFinalized(Dev).value == 3200L,
       // mainnet k₁=1024 → R=round(3174.4)=3174, k₂=102400
       nakamoto.etaRotationSnapshots(Mainnet).value == 3174L,
-      nakamoto.keepDepthBehindFinalized(Mainnet).value == 102400L
+      nakamoto.keepDepthBehindFinalized(Mainnet).value == 102400L,
+      // testnet / integrationnet k₁=256 → k₂=25600. `keepDepthBehindFinalized` is THE single canonical k₂ accessor
+      // (Track-3 S1 removed the duplicate inline `ArchivalDepthK = 100·k₁` in SnapshotLeaderLoop); guard it across every env.
+      nakamoto.keepDepthBehindFinalized(Testnet).value == 25600L,
+      nakamoto.keepDepthBehindFinalized(Integrationnet).value == 25600L
     )
   }
 

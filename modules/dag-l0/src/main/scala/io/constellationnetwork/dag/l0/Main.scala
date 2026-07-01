@@ -147,6 +147,11 @@ object Main
       finalityTriggerViewRef <- Ref
         .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[IO]]](None)
         .asResource
+      // Track-3 S1: injected settled (k₂-archival) marker, promoted out of SnapshotLeaderLoop's fiber-local ref so
+      // FinalityTriggersRoutes can serve `GET /global-snapshots/settled`. G1 (critical): a FRESH tracker with its OWN Ref —
+      // NEVER aliased to `nakamotoFinalizedOrdinalRef` (k₁), which would report k₁ as "settled" and let a route corrupt the
+      // k₁ production floor. Same lifetime + Main→Services→HttpApi sharing pattern as `finalityTriggerViewRef`.
+      settledOrdinalTracker <- io.constellationnetwork.node.shared.domain.nakamoto.SettledOrdinalTracker.make[IO].asResource
       // §3 NIPoPoW S5 — light-client proof + verify HTTP routes. Populated inside
       // GlobalSnapshotConsensus.make once the tower store and snapshot storage are wired.
       // Shared between Services and HttpApi the same way as `finalityTriggerViewRef`.
@@ -239,6 +244,7 @@ object Main
           nodeShared.loggerBundle,
           nakamotoFinalizedOrdinalRef,
           finalityTriggerViewRef,
+          settledOrdinalTracker,
           nipopowProofProviderRef,
           globalFollowSliceServiceRef,
           globalChangeSetServiceRef,

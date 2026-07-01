@@ -7,6 +7,7 @@ import cats.syntax.all._
 import io.constellationnetwork.node.shared.domain.nakamoto.{FinalityTrigger, FinalityTriggerView}
 import io.constellationnetwork.node.shared.ext.http4s.SnapshotOrdinalVar
 import io.constellationnetwork.routes.internal._
+import io.constellationnetwork.schema.SnapshotOrdinal
 
 import eu.timepit.refined.auto._
 import io.circe.Encoder
@@ -28,13 +29,28 @@ import org.http4s.dsl.Http4sDsl
   * Pure observability — never feeds back into consensus.
   */
 final case class FinalityTriggersRoutes[F[_]: Async](
-  viewRef: Ref[F, Option[FinalityTriggerView[F]]]
+  viewRef: Ref[F, Option[FinalityTriggerView[F]]],
+  // Track-3 S1 — read-only settled (k₂-archival) marker + the configured k₂ depth for `GET /global-snapshots/settled`.
+  // `settledOrdinal` is `SnapshotOrdinal.MinValue` (0) until the chain first advances past k₂ (cold start); `k2Depth` = 100·k₁.
+  settledOrdinal: F[SnapshotOrdinal],
+  k2Depth: Long
 ) extends Http4sDsl[F]
     with PublicRoutes[F] {
 
   protected val prefixPath: InternalUrlPrefix = "/global-snapshots"
 
   protected val public: HttpRoutes[F] = HttpRoutes.of[F] {
+    // Track-3 S1: the k₂ "settled" (Phase 2 → Phase 3 archival) marker. Read-only observability — NOT in
+    // GlobalSnapshotInfo / stateProof (G3). `settled_ordinal` = MinValue (0) at cold start, then tracks the T_depth2 sink.
+    case GET -> Root / "settled" =>
+      settledOrdinal.flatMap { ord =>
+        Ok(
+          FinalityTriggersRoutes
+            .SettledPayload(settled_ordinal = ord.value.value, k2_depth = k2Depth)
+            .asJson
+        )
+      }
+
     case GET -> Root / SnapshotOrdinalVar(ordinal) / "finality-triggers" =>
       viewRef.get.flatMap {
         case None =>
@@ -64,6 +80,23 @@ final case class FinalityTriggersRoutes[F[_]: Async](
 }
 
 object FinalityTriggersRoutes {
+
+  /** Response payload for `GET /global-snapshots/settled` (Track-3 S1):
+    *   - `settled_ordinal` — the deepest ordinal past the k₂ archival gate (Phase 2 → Phase 3 "settled"). `MinValue` (0) at cold start,
+    *     then tracks the `T_depth2` sink (`bestTip − k₂` once `bestTip > k₂`).
+    *   - `k2_depth` — the configured archival depth k₂ = 100·k₁ (the single canonical `NakamotoConfig.keepDepthBehindFinalized`).
+    *
+    * G3: RESPONSE-JSON ONLY — this is NOT part of `GlobalSnapshotInfo` / the stateProof consensus root (the field-32 syncView regression
+    * class); it is pure observability derived from a node-local marker.
+    */
+  final case class SettledPayload(
+    settled_ordinal: Long,
+    k2_depth: Long
+  )
+
+  object SettledPayload {
+    implicit val encoder: Encoder[SettledPayload] = deriveEncoder
+  }
 
   /** Response payload sub-object. Mirrors the design in task #138:
     *   - `phase_1_to_2_count` — count of qualifying Phase 1→2 triggers (`t_weight`, `t_count`, `t_depth1`); range 0..3.

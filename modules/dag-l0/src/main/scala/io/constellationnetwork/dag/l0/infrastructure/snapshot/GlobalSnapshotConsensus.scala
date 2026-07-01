@@ -208,6 +208,10 @@ object GlobalSnapshotConsensus {
     // "which triggers qualified ord N?" without owning trigger references. Empty until the
     // leader-loop fiber has started — the route handles `None` as a 503.
     finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
+    // Track-3 S1: the injected settled (k₂-archival) marker (a NEW ref, never the k₁ `nakamotoFinalizedOrdinalRef`). Threaded straight
+    // into `SnapshotLeaderLoop.run` (whose T_depth2 sink is its only writer) and read by `FinalityTriggersRoutes`. DI shape mirrors
+    // `finalityTriggerViewRef`.
+    settledOrdinalTracker: io.constellationnetwork.node.shared.domain.nakamoto.SettledOrdinalTracker[F],
     // §3 NIPoPoW S5 — observability seam for the NipopowRoutes light-client endpoints. Populated
     // here in the resource block once the local `TowerStore` and snapshot storage are available.
     // Read by `NipopowRoutes` to answer GET /nakamoto/nipopow/proof and POST /nakamoto/nipopow/verify
@@ -1904,6 +1908,9 @@ object GlobalSnapshotConsensus {
                   // k₁ — typed HOCON `nakamoto.confirmation-depth-k` (replaces the prior
                   // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read inside the loop).
                   confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value,
+                  // k₂ = 100·k₁ — the single canonical accessor `NakamotoConfig.keepDepthBehindFinalized` (DERIVED from the per-env
+                  // `nakamoto.confirmation-depth-k`, Track-3 S1). Replaces the loop's former inline `100L * confirmationDepthK`.
+                  archivalDepthK = sharedCfg.nakamoto.keepDepthBehindFinalized(sharedCfg.environment).value,
                   slotDurationMs = sharedCfg.nakamoto.slotDurationMs.value,
                   shardBootGraceSlots = shardAcceptanceDeps.map(_.shardingConfig.checkpoint.bootGraceSlots.toLong).getOrElse(30L),
                   lastKnownSlotRef = lastKnownSlotRef,
@@ -1936,6 +1943,7 @@ object GlobalSnapshotConsensus {
                   changesetRingDepth = sharedCfg.nakamoto.changesetRingDepth.value,
                   chainSyncRequestQueue = chainSyncRequestQueue,
                   finalityTriggerViewRef = finalityTriggerViewRef,
+                  settledOrdinalTracker = settledOrdinalTracker,
                   // §1.2 Slice 5/6: parallel-sign attestations + snapshots with KES.
                   operationalKeyMaker = operationalKeyMaker,
                   // Slice S3: drop aggregator entries for `(mg, parent)` pairs in the finalized

@@ -244,12 +244,14 @@ object TDepth1Trigger {
   * aggregate-signature certificates, light-client trust anchor publication) become eligible to run. Today the wiring in
   * `SnapshotLeaderLoop.finalityMonitor` only emits a log line + Prometheus counter when `T_depth2` advances — no downstream effects yet.
   *
-  * See `docs/nakamoto/attestation-and-finality.md` §0.3 for the rationale and `k₂ = 2¹⁶ = 65536` target.
+  * See `docs/nakamoto/attestation-and-finality.md` §0.3 for the rationale. k₂ = 100·k₁ (mainnet 102400 / dev 3200) — the single canonical
+  * `NakamotoConfig.keepDepthBehindFinalized` accessor.
   */
 object TDepth2Trigger {
 
   /** @param k2
-    *   archival depth (typically `NAKAMOTO_ARCHIVAL_DEPTH`, default 65536). Distinct from `k₁` (default 255).
+    *   archival depth k₂ = 100·k₁ (mainnet 102400 / dev 3200), threaded from the single canonical
+    *   `NakamotoConfig.keepDepthBehindFinalized`. Distinct from `k₁` (mainnet 1024 / dev 32).
     */
   def make[F[_]: Sync](k2: Long): F[FinalityTrigger[F]] =
     FinalityTrigger.fromRef[F](FinalityTrigger.Kind.TDepth2, SnapshotOrdinal.MinValue) { state =>

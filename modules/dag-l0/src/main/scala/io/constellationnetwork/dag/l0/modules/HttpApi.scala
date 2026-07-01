@@ -275,7 +275,13 @@ sealed abstract class HttpApi[
   // Chain-quality / finality-triggers observable (#138). Reads the FinalityTriggerView Ref
   // populated by SnapshotLeaderLoop after trigger construction. Pure observability — no
   // consensus semantics change.
-  private val finalityTriggersRoutes = FinalityTriggersRoutes[F](services.finalityTriggerViewRef)
+  private val finalityTriggersRoutes = FinalityTriggersRoutes[F](
+    services.finalityTriggerViewRef,
+    // Track-3 S1: read-only settled (k₂-archival) marker + the configured k₂ depth (= 100·k₁, the single canonical
+    // `NakamotoConfig.keepDepthBehindFinalized` accessor) for `GET /global-snapshots/settled`.
+    services.settledOrdinalTracker.settledOrdinal,
+    sharedConfig.nakamoto.keepDepthBehindFinalized(environment).value
+  )
 
   // §3 NIPoPoW S5 — light-client proof + verify routes. Reads the NipopowProofProvider Ref
   // populated by GlobalSnapshotConsensus.make once the tower store and snapshot storage are

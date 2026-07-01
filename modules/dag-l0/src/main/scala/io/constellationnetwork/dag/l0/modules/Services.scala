@@ -74,6 +74,10 @@ object Services {
     loggerBundle: LoggerBundle[F],
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
     finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
+    // Track-3 S1: injected settled (k₂-archival) marker — a NEW instance created in Main (never the k₁ `nakamotoFinalizedOrdinalRef`),
+    // threaded into GlobalSnapshotConsensus.make (the leader loop is its only writer) and re-exposed as a field for HttpApi →
+    // FinalityTriggersRoutes (`GET /global-snapshots/settled`).
+    settledOrdinalTracker: io.constellationnetwork.node.shared.domain.nakamoto.SettledOrdinalTracker[F],
     // §3 NIPoPoW S5 — observability seam for the NipopowRoutes light-client endpoints. Mirrors
     // `finalityTriggerViewRef`; populated inside GlobalSnapshotConsensus.make once the tower store
     // and snapshot storage are wired. The route handles `None` as a 503 (pre-startup).
@@ -297,6 +301,7 @@ object Services {
             queues.rumor,
             nakamotoFinalizedOrdinalRef,
             finalityTriggerViewRef,
+            settledOrdinalTracker,
             nipopowProofProviderRef,
             globalFollowSliceServiceRef,
             globalChangeSetServiceRef,
@@ -339,6 +344,7 @@ object Services {
         eventMempool = eventMempoolService,
         sidecarClient = sidecarClient,
         finalityTriggerViewRef = finalityTriggerViewRef,
+        settledOrdinalTracker = settledOrdinalTracker,
         nipopowProofProviderRef = nipopowProofProviderRef,
         globalFollowSliceServiceRef = globalFollowSliceServiceRef,
         globalChangeSetServiceRef = globalChangeSetServiceRef,
@@ -369,6 +375,9 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   // SnapshotLeaderLoop after trigger construction; read by FinalityTriggersRoutes. The
   // route returns 503 while the Ref is empty (pre-startup window).
   val finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
+  // Track-3 S1: settled (k₂-archival) marker. HttpApi hands its read-only `settledOrdinal` to FinalityTriggersRoutes for
+  // `GET /global-snapshots/settled`. Backed by its own Ref — never the k₁ `nakamotoFinalizedOrdinalRef`.
+  val settledOrdinalTracker: io.constellationnetwork.node.shared.domain.nakamoto.SettledOrdinalTracker[F],
   // §3 NIPoPoW S5 — observability seam for /nakamoto/nipopow/* routes. Populated inside
   // GlobalSnapshotConsensus.make once the tower store + snapshot storage are wired. The
   // route returns 503 while the Ref is empty (pre-startup window).

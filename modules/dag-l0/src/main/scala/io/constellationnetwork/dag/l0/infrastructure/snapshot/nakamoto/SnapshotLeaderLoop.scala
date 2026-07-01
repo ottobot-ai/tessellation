@@ -192,7 +192,7 @@ object SnapshotLeaderLoop {
     * would create a circular dep on the metric refinement).
     *
     * T_depth2 is intentionally not emitted as a fired counter here — that's the Phase 2→3 archival trigger and gets its own
-    * `dag_nakamoto_archival_finalized` counter from the lastArchivalOrdinalRef branch below.
+    * `dag_nakamoto_archival_finalized` counter from the settled-ordinal (T_depth2) branch below.
     *
     * '''Per-ordinal companion counters.''' If `finalizedOrdinal` is supplied, ALSO emits `*_per_ordinal_total` counters tagged with
     * `snapshot_ordinal`. The original (unlabelled) counters stay so existing alerts continue to fire. Per-ordinal cardinality is bounded —
@@ -431,7 +431,7 @@ object SnapshotLeaderLoop {
     selfId: PeerId,
     lddConfig: LddConfig,
     eligibilityChecker: EligibilityChecker[F],
-    // The three consensus-time params below are REQUIRED — no source-level default. The sole runtime caller
+    // The four consensus-time params below are REQUIRED — no source-level default. The sole runtime caller
     // (`GlobalSnapshotConsensus.make`) threads each from the per-env HOCON config; a stale literal here would silently
     // diverge from that config for any future caller (k is our primary security knob — it must never default). Zero
     // test callers construct `run` (tests exercise the static helpers only), so requiring them is safe.
@@ -443,6 +443,11 @@ object SnapshotLeaderLoop {
     // (replaces the prior `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read; HOCON over scattered sys.env). Drives the
     // depth-k finality gate (`ConfirmationDepthK` below).
     confirmationDepthK: Long,
+    // Archival depth k₂ (= 100·k₁) — threaded from `sharedCfg.nakamoto.keepDepthBehindFinalized(sharedCfg.environment).value`
+    // at the call site (Track-3 S1). Replaces the prior inline `val ArchivalDepthK = 100L * confirmationDepthK` derivation
+    // below, so k₂ now has a single canonical source (`NakamotoConfig.keepDepthBehindFinalized`). Feeds `TDepth2Trigger`
+    // (the Phase 2 → Phase 3 archival gate). REQUIRED — no default (same no-value-defaults rule as k₁ above).
+    archivalDepthK: Long,
     // Slot duration ms — threaded from `sharedCfg.nakamoto.slotDurationMs.value` at the call site (§5.7: the
     // consensus time UNIT; replaces the prior `sys.env.get("NAKAMOTO_SLOT_DURATION_MS")` read here).
     slotDurationMs: Long,
@@ -543,6 +548,11 @@ object SnapshotLeaderLoop {
     // creates the Ref before HttpApi wiring; we set it once at startup. Pure
     // observability — never feeds back into consensus.
     finalityTriggerViewRef: Ref[F, Option[FinalityTriggerView[F]]],
+    // Track-3 S1: injected, write-restricted marker for the k₂ "settled" (Phase 2 → Phase 3 archival) ordinal — promoted out of the
+    // fiber-local `lastArchivalOrdinalRef` below so `FinalityTriggersRoutes` (`GET /global-snapshots/settled`) can read it. DI shape
+    // mirrors `finalityTriggerViewRef`. G1: its backing Ref is a NEW one — NEVER the k₁ `nakamotoFinalizedOrdinalRef` (aliasing would
+    // report k₁ as "settled" and let a route corrupt the k₁ production floor). Only writer is the `T_depth2` sink below (`markSettled`).
+    settledOrdinalTracker: SettledOrdinalTracker[F],
     // §1.2 Slice 5/6: KES parallel-signing for attestations + snapshots. `operationalKeyMaker`
     // signs the attestation hash + snapshot hash at the period derived from the rotation
     // function; `etaRotationSnapshots` is already in this signature above so we don't add it.
@@ -994,9 +1004,9 @@ object SnapshotLeaderLoop {
 
         // Archival depth k₂ — Phase 2 → Phase 3 boundary (`T_depth2`, task #137).
         //
-        // Where ConfirmationDepthK (k₁ ≈ 255) is the operational "you'll never see a reorg
+        // Where ConfirmationDepthK (k₁) is the operational "you'll never see a reorg
         // past this point" finality gate, k₂ is the cryptographic "common prefix violation
-        // is negligibly unlikely" archival gate. At k₂ = 2¹⁶ = 65536 snapshots, CP-violation
+        // is negligibly unlikely" archival gate. At k₂ = 100·k₁ (mainnet 102400) snapshots, CP-violation
         // probability under a 1/3 adversary is well below 10⁻¹² (Cardano-equivalent),
         // making it safe to prune the undo journal, emit aggregate-signature certificates
         // (future Mithril-equivalent), and publish light-client trust anchors.
@@ -1007,10 +1017,10 @@ object SnapshotLeaderLoop {
         // for them once they land.
         //
         // See `docs/nakamoto/attestation-and-finality.md` §0.3 for the formal target.
-        // k₂-depth for T_depth2's overlay prune + archival-log marker. Derived from the single confirmation-depth knob (NO sys.env,
-        // per project config convention; the old NAKAMOTO_ARCHIVAL_DEPTH env read was a dead knob). NOTE: this is NOT a chain-selection
-        // freeze — after reverting 86f390130 the no-reorg freeze is back on the k1 finalized marker in NakamotoChainStore.store().
-        val ArchivalDepthK: Long = 100L * confirmationDepthK
+        // k₂-depth for T_depth2's overlay prune + archival-log marker. Track-3 S1: NO longer derived inline here — threaded in as the
+        // `archivalDepthK` run parameter, sourced from the single canonical `NakamotoConfig.keepDepthBehindFinalized` (= 100·k₁) at the
+        // `GlobalSnapshotConsensus.make` call site (NO sys.env; the old NAKAMOTO_ARCHIVAL_DEPTH env read was a dead knob). NOTE: this is
+        // NOT a chain-selection freeze — the no-reorg freeze is on the k₁ finalized marker in NakamotoChainStore.store().
 
         // FinalityTrigger[F] construction (#135 / #136). T_weight, T_count and T_depth1
         // are built ONCE per leader-loop instance; each one wraps a `Ref[F, SnapshotOrdinal]`
@@ -1040,7 +1050,7 @@ object SnapshotLeaderLoop {
         Stream.eval(TWeightTrigger.make[F](tipTracker, TipTracker.FinalityThreshold)).flatMap { tWeight =>
           Stream.eval(TCountTrigger.make[F](tipTracker, stakeRegistry, TipTracker.FinalityThreshold)).flatMap { tCount =>
             Stream.eval(TDepth1Trigger.make[F](ConfirmationDepthK)).flatMap { tDepth1 =>
-              Stream.eval(TDepth2Trigger.make[F](ArchivalDepthK)).flatMap { tDepth2 =>
+              Stream.eval(TDepth2Trigger.make[F](archivalDepthK)).flatMap { tDepth2 =>
                 // Phase 1→2 triggers — used both for the chain-quality gauge sample (sized
                 // 1..3 at finalize time) and the per-kind "fired" counter increments. T_depth2
                 // is Phase 2→3 archival and is intentionally excluded here.
@@ -1054,17 +1064,17 @@ object SnapshotLeaderLoop {
                       .set(Some(FinalityTriggerView.fromTriggers[F](List(tWeight, tCount, tDepth1, tDepth2))))
                   )
                   .flatMap { _ =>
-                    // Highest Phase-3 (ARCHIVAL) qualifying ordinal seen so far. Driven by
-                    // `tDepth2` and advanced strictly forward — Phase-3 sinks (overlay history
-                    // pruning #139, future Mithril cert, future light-client anchor) will read
-                    // this Ref to decide what's safe to prune / publish.
+                    // Highest Phase-3 (ARCHIVAL / "settled") qualifying ordinal seen so far. Driven by
+                    // `tDepth2` and advanced strictly forward — Phase-3 sinks (overlay history pruning
+                    // #139, future Mithril cert, future light-client anchor) read it to decide what's
+                    // safe to prune / publish.
                     //
-                    // TODO(#139): expose this Ref to the rest of the system once overlay
-                    // history pruning lands. For now it's local to the leader loop's scope —
-                    // adding it to the SnapshotLeaderLoop signature today would just be dead
-                    // plumbing. The Ref is constructed inside this Stream so its lifetime
-                    // matches the leader loop's fiber.
-                    Stream.eval(Ref.of[F, SnapshotOrdinal](SnapshotOrdinal.MinValue)).flatMap { lastArchivalOrdinalRef =>
+                    // Track-3 S1: this was a fiber-local Ref; it is now the INJECTED
+                    // `settledOrdinalTracker` (a NEW ref, never the k₁ `nakamotoFinalizedOrdinalRef`) so
+                    // `FinalityTriggersRoutes` (`GET /global-snapshots/settled`) can read it. Its ONLY
+                    // writer is the `T_depth2` sink below, via `markSettled`. The trivial `Stream.eval`
+                    // keeps the surrounding stream structure unchanged.
+                    Stream.eval(Async[F].unit).flatMap { _ =>
                       // Heap-leak Fix A: operational-k₁ overlay-prune watermark. Drives
                       // `mptOverlay.pruneBelow` once per advance of `T_depth1.latestQualifyingOrdinal`
                       // (the operational k₁ finality trigger). Decoupling from the k₂ archival watermark
@@ -1475,14 +1485,14 @@ object SnapshotLeaderLoop {
                               // is still self-contained — adding Mithril / light-client sinks later won't
                               // need to coordinate with the operational-prune block.
                               archivalQualifying <- tDepth2.latestQualifyingOrdinal
-                              _ <- lastArchivalOrdinalRef.get.flatMap { prev =>
+                              _ <- settledOrdinalTracker.settledOrdinal.flatMap { prev =>
                                 if (archivalQualifying.value.value > prev.value.value)
                                   bestTip match {
                                     case Some(tip) =>
-                                      lastArchivalOrdinalRef.set(archivalQualifying) >>
+                                      settledOrdinalTracker.markSettled(archivalQualifying) >>
                                         logger.info(
                                           s"ARCHIVAL-FINALIZED ordinal=${archivalQualifying.value.value} " +
-                                            s"(tip ord=${tip.ordinal}, k₂=$ArchivalDepthK)"
+                                            s"(tip ord=${tip.ordinal}, k₂=$archivalDepthK)"
                                         ) >>
                                         Metrics[F].incrementCounter("dag_nakamoto_archival_finalized") >>
                                         Metrics[F].updateGauge("dag_nakamoto_archival_ordinal", archivalQualifying.value.value) >>
@@ -1523,9 +1533,9 @@ object SnapshotLeaderLoop {
                                     case None =>
                                       // Trigger advanced without a tip — shouldn't happen because the
                                       // trigger's evaluator returns MinValue when bestTip is None.
-                                      // Still, advance the Ref idempotently so we don't re-log on the
+                                      // Still, advance the marker idempotently so we don't re-log on the
                                       // next tick.
-                                      lastArchivalOrdinalRef.set(archivalQualifying)
+                                      settledOrdinalTracker.markSettled(archivalQualifying)
                                   }
                                 else Async[F].unit
                               }

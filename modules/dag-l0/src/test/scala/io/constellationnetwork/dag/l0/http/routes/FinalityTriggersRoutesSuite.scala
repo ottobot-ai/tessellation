@@ -31,8 +31,16 @@ object FinalityTriggersRoutesSuite extends HttpSuite {
         IO.pure(kindsByOrd.getOrElse(ord.value.value, Set.empty))
     }
 
-  private def mkRoutes(view: Option[FinalityTriggerView[IO]]) =
-    Ref.of[IO, Option[FinalityTriggerView[IO]]](view).map(FinalityTriggersRoutes[IO](_).publicRoutes)
+  // Dev k₂ = 100·k₁(=32) = 3200 — the value HttpApi passes from `NakamotoConfig.keepDepthBehindFinalized`.
+  private val TestK2Depth = 3200L
+
+  private def mkRoutes(
+    view: Option[FinalityTriggerView[IO]],
+    settled: SnapshotOrdinal = SnapshotOrdinal.MinValue
+  ) =
+    Ref
+      .of[IO, Option[FinalityTriggerView[IO]]](view)
+      .map(FinalityTriggersRoutes[IO](_, IO.pure(settled), TestK2Depth).publicRoutes)
 
   test("returns 503 when the view ref is empty (pre-startup)") {
     val req = GET(uri"/global-snapshots/100/finality-triggers")
@@ -128,6 +136,33 @@ object FinalityTriggersRoutesSuite extends HttpSuite {
     )
     for {
       routes <- mkRoutes(Some(view))
+      result <- expectHttpBodyAndStatus(routes, req)(expected, Status.Ok)
+    } yield result
+  }
+
+  // ── Track-3 S1: GET /global-snapshots/settled ────────────────────────────────────────────────
+
+  test("/settled returns MinValue and the configured k₂ depth at cold start") {
+    val req = GET(uri"/global-snapshots/settled")
+    val expected = Json.obj(
+      "settled_ordinal" -> 0L.asJson, // SnapshotOrdinal.MinValue
+      "k2_depth" -> TestK2Depth.asJson
+    )
+    for {
+      // The FinalityTriggerView ref being empty is irrelevant to /settled — the marker is a separate seam.
+      routes <- mkRoutes(None)
+      result <- expectHttpBodyAndStatus(routes, req)(expected, Status.Ok)
+    } yield result
+  }
+
+  test("/settled tracks the settled marker once it advances") {
+    val req = GET(uri"/global-snapshots/settled")
+    val expected = Json.obj(
+      "settled_ordinal" -> 4200L.asJson,
+      "k2_depth" -> TestK2Depth.asJson
+    )
+    for {
+      routes <- mkRoutes(None, settled = SnapshotOrdinal.unsafeApply(4200L))
       result <- expectHttpBodyAndStatus(routes, req)(expected, Status.Ok)
     } yield result
   }

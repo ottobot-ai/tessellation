@@ -78,7 +78,7 @@ object types {
     *
     *   - k₁ = `confirmationDepthK(env)` — confirmation depth (fork-race statistical finality). Loaded from HOCON PER-ENVIRONMENT
     *     (`nakamoto.confirmation-depth-k` is a `{ mainnet, testnet, integrationnet, dev }` block, mirroring `last-kryo-hash-ordinal`) and
-    *     resolved ONCE for the active `AppEnvironment` at the use site — mainnet 1024, test/integration nets 255, dev 33 (with the
+    *     resolved ONCE for the active `AppEnvironment` at the use site — mainnet 1024, test/integration nets 256, dev 32 (with the
     *     `${?NAKAMOTO_CONFIRMATION_DEPTH}` override applied to the dev value only). REUSED by the §3 NIPoPoW historical-commitment SMT as
     *     its finalized cutoff (`smtRoot(N)` commits ordinals i ≤ N − k₁), and by `SnapshotLeaderLoop` / `NakamotoSyncDaemon`.
     *   - R = `etaRotationSnapshots(env)` = round(3.1·k₁) — eta-rotation period. Ouroboros: the eta nonce uses the first 2/3 of the period's
@@ -95,7 +95,7 @@ object types {
     */
   case class NakamotoConfig(
     // Confirmation depth k₁ — the single loaded consensus-depth knob, now PER-ENVIRONMENT (`nakamoto.confirmation-depth-k` block:
-    // mainnet 1024 / testnet 255 / integrationnet 255 / dev 33, dev overridable via `${?NAKAMOTO_CONFIRMATION_DEPTH}`). Resolve for the
+    // mainnet 1024 / testnet 256 / integrationnet 256 / dev 32, dev overridable via `${?NAKAMOTO_CONFIRMATION_DEPTH}`). Resolve for the
     // active env via the `confirmationDepthK(env)` accessor below — R and k₂ DERIVE from the resolved value (see the `def`s in the body).
     confirmationDepthKByEnv: Map[AppEnvironment, PosLong],
     // Slot duration in ms — the consensus time unit (§5.7: a PARAMETER, not a constant; 1000 prod / 500 fast-test).
@@ -150,8 +150,10 @@ object types {
     // Derived from the per-env k₁, NOT loaded — keeps the eta-rotation period in lockstep with the confirmation depth.
     def etaRotationSnapshots(env: AppEnvironment): PosLong =
       PosLong.unsafeFrom(math.round(3.1d * confirmationDepthK(env).value))
-    // k₂ = 100·k₁ — historical-archive / phase-3 retention (tower moving checkpoint). Deep deliberately: prod keeps a long, slow,
-    // stable consensus history (≈8 days at k₁=1024 / 7s snapshots). Derived from the per-env k₁, NOT loaded.
+    // k₂ = 100·k₁ — historical-archive / phase-3 retention (tower moving checkpoint) AND the "settled" (Phase 2 → Phase 3 archival)
+    // depth. Deep deliberately: prod keeps a long, slow, stable consensus history (≈8 days at k₁=1024 / 7s snapshots). Derived from the
+    // per-env k₁, NOT loaded. This is THE single canonical k₂ accessor (Track-3 S1): the former duplicate inline `ArchivalDepthK =
+    // 100 * confirmationDepthK` in `SnapshotLeaderLoop` is gone — k₂ is threaded from here (`GlobalSnapshotConsensus` → `archivalDepthK`).
     def keepDepthBehindFinalized(env: AppEnvironment): PosLong =
       PosLong.unsafeFrom(100L * confirmationDepthK(env).value)
   }

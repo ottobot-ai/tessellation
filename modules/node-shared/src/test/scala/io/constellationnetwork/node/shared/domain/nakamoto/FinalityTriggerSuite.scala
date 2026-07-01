@@ -300,7 +300,7 @@ object FinalityTriggerSuite extends SimpleIOSuite {
 
   test("TDepth2: evaluates to bestTipOrdinal - k₂") {
     // Mirrors TDepth1 structurally: pure subtraction of bestTipOrdinal minus the depth constant.
-    // Use a small k₂ here for test ergonomics; the production default is 65536.
+    // Use a small k₂ here for test ergonomics; production k₂ = 100·k₁ (mainnet 102400 / dev 3200).
     val self = pid("self")
     val tipHash = hash("tip")
     val k2 = 1000L
@@ -312,11 +312,11 @@ object FinalityTriggerSuite extends SimpleIOSuite {
   }
 
   test("TDepth2: returns MinValue when chain is shorter than k₂") {
-    // At the production k₂ = 65536 the chain will be shorter than k₂ for the first ~tens of thousands
-    // of ordinals; clamp to MinValue so Phase-3 sinks never see a wraparound or negative ordinal.
+    // At the production k₂ = 100·k₁ (mainnet 102400) the chain will be shorter than k₂ for the first ~hundred
+    // thousand ordinals; clamp to MinValue so Phase-3 sinks never see a wraparound or negative ordinal.
     val self = pid("self")
     val tipHash = hash("tip")
-    val k2 = 65536L
+    val k2 = 102400L
     for {
       trigger <- TDepth2Trigger.make[IO](k2)
       st = state(self, 100L, tipHash) // bestTip far below k₂
@@ -324,27 +324,28 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     } yield expect.same(SnapshotOrdinal.MinValue, result)
   }
 
-  test("TDepth2 with k₂=65536 fires later than TDepth1 with k=255 (Phase 2 → Phase 3 strictly after Phase 1 → Phase 2)") {
+  test("TDepth2 with k₂=102400 fires later than TDepth1 with k₁=1024 (Phase 2 → Phase 3 strictly after Phase 1 → Phase 2)") {
     // The 4-phase finality model requires that ARCHIVAL (Phase 3) qualification trails SETTLED
     // (Phase 2) qualification — once a snapshot is depth-k₂ deep, it has trivially been depth-k₁
     // deep for tens of thousands of snapshots already. This is the structural invariant that lets
     // Phase-3 sinks (overlay history pruning, future Mithril cert, light-client anchor) safely
     // assume Phase 2 finality has already fired. Sanity-check: at any bestTip > k₂, the TDepth1
-    // qualifying ordinal strictly exceeds the TDepth2 qualifying ordinal.
+    // qualifying ordinal strictly exceeds the TDepth2 qualifying ordinal. Uses the mainnet
+    // pair k₁=1024 / k₂=100·k₁=102400.
     val self = pid("self")
     val tipHash = hash("tip")
-    val k1 = 255L
-    val k2 = 65536L
+    val k1 = 1024L
+    val k2 = 102400L
     for {
       tDepth1 <- TDepth1Trigger.make[IO](k1)
       tDepth2 <- TDepth2Trigger.make[IO](k2)
       // bestTip well beyond k₂ so both triggers produce a real ordinal.
-      st = state(self, 100000L, tipHash)
+      st = state(self, 200000L, tipHash)
       depth1Result <- tDepth1.evaluate(st)
       depth2Result <- tDepth2.evaluate(st)
     } yield
-      expect.same(ord(99745L), depth1Result) &&
-        expect.same(ord(34464L), depth2Result) &&
+      expect.same(ord(198976L), depth1Result) &&
+        expect.same(ord(97600L), depth2Result) &&
         // Strict ordering: TDepth2 qualifies a LOWER ordinal (older snapshots), which is the same as
         // saying TDepth2 "fires later" in time — for any given snapshot N, we cross k₁ depth before
         // we cross k₂ depth.
